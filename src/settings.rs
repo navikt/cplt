@@ -24,9 +24,9 @@ use ratatui::{
 
 use crate::config::{
     self, ConfigKeyInfo, ConfigLayer, ConfigValueType, RepoKeyTarget, Resolved, all_config_keys,
-    append_value_in_doc, get_value_from_doc, repo_key_target, security_confirmation,
-    set_repo_value_in_doc, set_value_in_doc, unset_value_in_doc, validate_global_document,
-    write_document_atomically, write_repo_document_atomically,
+    append_value_in_doc, get_value_from_doc, repo_key_rejection_reason, repo_key_target,
+    security_confirmation, set_repo_value_in_doc, set_value_in_doc, unset_value_in_doc,
+    validate_global_document, write_document_atomically, write_repo_document_atomically,
 };
 use crate::{repo_config, trust};
 
@@ -116,8 +116,9 @@ impl SettingsApp {
             editing_filter: false,
             editing_value: false,
             value_input: String::new(),
-            status: "Use / to search, Tab to change scope, Enter to edit, Ctrl+S to save."
-                .to_string(),
+            status:
+                "Use / to search, Tab to change scope, Enter to toggle or edit, Ctrl+S to save."
+                    .to_string(),
             pending: Vec::new(),
             global_doc,
             global_path,
@@ -246,7 +247,20 @@ impl SettingsApp {
         }
         if self.scope == Scope::Repository {
             let Some(RepoKeyTarget::ProposeBool) = repo_key_target(key) else {
-                self.status = "Repository deny and list values are edited with Enter.".to_string();
+                // "edited with Enter" was circular once Enter started routing
+                // booleans here. Say what is actually true of this key: either
+                // repo config will not take it at all, or it is not a boolean
+                // proposal and needs the value editor.
+                self.status = if repo_key_target(key).is_none() {
+                    format!(
+                        "{}.{} is not valid in repo config: {}",
+                        key.section,
+                        key.key,
+                        repo_key_rejection_reason(key)
+                    )
+                } else {
+                    "Repository deny and list values are edited in the value field.".to_string()
+                };
                 return;
             };
             let preview = self.preview_repo_doc();
@@ -737,6 +751,7 @@ fn repo_value_is_unset(doc: &toml_edit::DocumentMut, key: &ConfigKeyInfo) -> boo
         Some(RepoKeyTarget::ProposeBool) => !repo_proposal_enabled(doc, key),
         Some(RepoKeyTarget::ProposeAllow(name)) => nested_repo_value(doc, "propose", "allow", name),
         Some(RepoKeyTarget::ProposeProxy(name)) => nested_repo_value(doc, "propose", "proxy", name),
+        Some(RepoKeyTarget::ProposeStrArray(name)) => direct_repo_value(doc, "propose", name),
         Some(RepoKeyTarget::Deny(name)) => direct_repo_value(doc, "deny", name),
         None => true,
     }
@@ -913,7 +928,20 @@ fn run_loop(
                 app.selected = (app.selected + 1).min(app.visible_keys().len().saturating_sub(1));
             }
             KeyCode::Char(' ') => app.toggle_selected(),
-            KeyCode::Enter => app.begin_value_edit(),
+            // Enter on a boolean flips it rather than opening a text field to
+            // type `true` or `false` into. There are two values and the editor
+            // asks the reader to spell one — Space already did the right thing,
+            // and Enter is the key someone presses first.
+            KeyCode::Enter => {
+                if app
+                    .selected_key()
+                    .is_some_and(|key| key.value_type == ConfigValueType::Bool)
+                {
+                    app.toggle_selected();
+                } else {
+                    app.begin_value_edit();
+                }
+            }
             KeyCode::Char('r') => {
                 if let Some(key) = app.selected_key() {
                     if app.scope == Scope::Effective {
@@ -1056,7 +1084,7 @@ fn render(frame: &mut ratatui::Frame, app: &mut SettingsApp) {
         },
     );
     let footer = format!(
-        "{}\nFilter: {}{}  Pending: {}  [/] search [Tab] scope [Space] toggle [Enter] edit [R] reset [Ctrl+S] save [Q] quit",
+        "{}\nFilter: {}{}  Pending: {}  [/] search [Tab] scope [Enter] toggle/edit [R] reset [Ctrl+S] save [Q] quit",
         app.status,
         app.filter,
         if app.editing_filter { "▌" } else { "" },

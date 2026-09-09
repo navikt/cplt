@@ -797,6 +797,48 @@ pub struct RepoSummaryRow {
     /// Where the root was named: `launch repository`, `--repo-dir`, or
     /// `local config`.
     pub source: &'static str,
+    /// Whether `name` is a real `owner/name` from a GitHub origin.
+    ///
+    /// A root whose origin is not a GitHub URL is a named root for files,
+    /// `[deny]`, the audit and the git guard, and is **not** in the gh scope —
+    /// the launch says so, and anything else describing the root has to agree
+    /// or the agent is told it can target a repository `gh` will refuse.
+    pub github: bool,
+    /// What naming the root changed about file access.
+    ///
+    /// A root nested inside the project directory already inherited the
+    /// project's grant, so naming it adds identity, not access. A root outside
+    /// it is a new read/write/execute tree — a second place the agent can drop
+    /// a binary and run it — and the summary has to say which of the two the
+    /// operator is looking at, because they are the same row otherwise.
+    pub grant: RepoGrant,
+}
+
+/// Whether a named root's grant is new, or inherited from the project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepoGrant {
+    /// The launch repository. Its grant is the project grant.
+    Launch,
+    /// Inside the project directory: no file access this session did not
+    /// already have.
+    Inherited,
+    /// Outside the project directory: read, write and execute on a tree the
+    /// session would not otherwise reach.
+    NewTree,
+}
+
+impl RepoGrant {
+    /// The summary's third column. Empty for the launch repository, whose
+    /// source column already says what it is.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            RepoGrant::Launch => "",
+            RepoGrant::Inherited => "inside the project directory, no new file access",
+            RepoGrant::NewTree => "new read/write/exec tree",
+        }
+    }
 }
 
 /// Resolved configuration after merging config file + CLI flags.

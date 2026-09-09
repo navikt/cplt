@@ -527,6 +527,30 @@ pub fn display_config(loaded: Option<&LoadedConfig>, local: Option<&LoadedConfig
             c.sandbox.keychain_substitute.is_some()
         )
     );
+    // The brief and its AGENTS.md layer had no rows at all, so a user who set
+    // `sandbox.brief = true` saw nothing here and had to reach for
+    // `config get` to confirm it. A key that changes behaviour and is absent
+    // from the command whose job is to report effective configuration is the
+    // same defect as a key that reports the wrong value.
+    let brief = c.sandbox.brief.unwrap_or(false);
+    println!(
+        "{blue}[cplt]{nc}    brief                 = {}{} {dim}(experimental){nc}",
+        brief,
+        src("sandbox", "brief", c.sandbox.brief.is_some())
+    );
+    // Gated on the brief, so say when it is set and inert rather than printing
+    // a `true` the launch will not act on.
+    let agents_md = c.sandbox.agents_md.unwrap_or(false);
+    println!(
+        "{blue}[cplt]{nc}    agents_md             = {}{}{} {dim}(experimental){nc}",
+        agents_md,
+        if agents_md && !brief {
+            " (inert: needs brief)"
+        } else {
+            ""
+        },
+        src("sandbox", "agents_md", c.sandbox.agents_md.is_some())
+    );
     let scratch = c.sandbox.scratch_dir.unwrap_or(true);
     println!(
         "{blue}[cplt]{nc}    scratch_dir           = {}{}",
@@ -598,6 +622,14 @@ fn local_mode_is_set(local: &Config, section: &str, key: &str) -> bool {
 /// `false`. Reusing the table makes that class of bug unrepresentable, and
 /// picks up the deprecated `sandbox.gh_proxy` / `sandbox.git_push_prevention`
 /// spellings for free, since the registry folds them in at the config layer.
+/// The `⚠ DANGEROUS` suffix for a key that is on and that `config set` refuses
+/// without `--force`. Plain text, not coloured: these rows are built as strings
+/// and coloured by the caller, and a marker that only appears in a terminal is
+/// not one a user can paste into a support thread.
+fn danger_suffix(on: bool) -> &'static str {
+    if on { " ⚠ DANGEROUS" } else { "" }
+}
+
 fn guard_lines(global: &Config, local: Option<&Config>) -> Vec<String> {
     let c = match local {
         Some(l) => global.overlay(l),
@@ -658,9 +690,13 @@ fn guard_lines(global: &Config, local: Option<&Config>) -> Vec<String> {
                 c.gh_guard.block_auth_token.is_some()
             )
         ),
+        // Marked when on, because `config set` refuses both of these without
+        // `--force`. A tool that demands a force-confirm to enable something
+        // and then lists it as unremarkable is telling the reader two things.
         format!(
-            "    inject_token          = {}{}",
+            "    inject_token          = {}{}{}",
             b.gh_inject_token,
+            danger_suffix(b.gh_inject_token),
             src(
                 "gh_guard",
                 "inject_token",
@@ -679,8 +715,9 @@ fn guard_lines(global: &Config, local: Option<&Config>) -> Vec<String> {
             )
         ),
         format!(
-            "    allow_api_write       = {}{}",
+            "    allow_api_write       = {}{}{}",
             b.gh_allow_api_write,
+            danger_suffix(b.gh_allow_api_write),
             src(
                 "gh_guard",
                 "allow_api_write",

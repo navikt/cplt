@@ -216,9 +216,17 @@ pub fn explain_path(
     } else {
         (
             "not covered by any allow rule, so it is denied by default.".to_string(),
+            // `--repo-dir` is named because the other two do not cover the
+            // case they look like they cover: a write grant is deliberately
+            // non-executable, so following this advice for another repository
+            // makes its files editable and its build still fail. Named without
+            // probing the path — `explain_path` stays pure, and the sentence is
+            // true whether or not this particular path is a repository.
             Some(
                 "grant access with --allow-read <PATH> (read) or --allow-write <PATH> (read+write), \
-                 or add it under [allow] read/write in config."
+                 or add it under [allow] read/write in config. If it is another git repository \
+                 you also need to build, test or push in, name it with --repo-dir <DIR> instead: \
+                 a write grant is not executable, so its build will not run under --allow-write."
                     .to_string(),
             ),
         )
@@ -560,11 +568,25 @@ impl<'a> ExecContext<'a> {
 
 /// Static explanation of whether a command would run under the resolved policy.
 #[derive(Debug, Clone, Serialize)]
+// A field added here is a breaking change for anything matching the struct
+// exhaustively; `objection` was the second. Marked so the next one is not.
+#[non_exhaustive]
 pub struct ExecExplain {
     pub decision: Decision,
     pub reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fix: Option<String>,
+    /// Set when the command runs *despite* a guard objecting — warn and audit
+    /// mode.
+    ///
+    /// Three states exist and `decision` can express two: blocked, allowed and
+    /// uncontested, allowed over an objection. The third is what a team running
+    /// warn mode before switching to block wants to count, and it was
+    /// recoverable only by parsing English out of `reason`, which is not a
+    /// contract worth relying on (#441). It reaches `--json` through
+    /// `CheckItem.note`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub objection: Option<String>,
 }
 
 /// The file-name (last component) of a command word, lowercased.
@@ -587,7 +609,7 @@ fn command_basename(cmd: &str) -> String {
 /// defect (#431).
 fn refusal_decision(
     mode: crate::config::EnforcementMode,
-    msg: &str,
+    refusal: &crate::gh_proxy::Refusal,
     blocked_fix: &str,
     guard: &str,
 ) -> ExecExplain {
@@ -595,30 +617,35 @@ fn refusal_decision(
     match mode {
         EnforcementMode::Block => ExecExplain {
             decision: Decision::Blocked,
-            reason: first_line(msg),
+            reason: refusal.banner_line(),
             // The guard's own guidance when it carries some, the generic line
             // otherwise. The guards write remedies specific to the command that
             // was refused — which repository to name, which spelling is allowed
-            // — and `first_line` was dropping all of it, so `check exec` told
+            // — and this surface used to show only the first line, so it told
             // the reader less than the launch would have. It is the surface
             // someone consults deliberately; it should not be the poorer one.
-            fix: Some(guidance(msg).unwrap_or_else(|| blocked_fix.to_string())),
+            // Flattened to one line for the `Fix:` column; the lines addressed
+            // to the agent are not in this field to begin with.
+            fix: Some(if refusal.guidance.is_empty() {
+                blocked_fix.to_string()
+            } else {
+                refusal
+                    .guidance
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }),
+            objection: None,
         },
         // The command runs. Saying "allowed" alone would hide that the policy
         // objected, so the reason carries the objection and the fix says how to
-        // make it bite.
+        // make it bite. The headline, not the banner: "BLOCKED by sandbox"
+        // inside a line that says ALLOWED is the contradiction this exists to
+        // remove.
         EnforcementMode::Warn | EnforcementMode::Audit => {
-            // The policy message is written for block mode and leads with
-            // "BLOCKED by sandbox"; stacking that inside a line that says
-            // ALLOWED is the contradiction this fix exists to remove. The
-            // launch strips the same prefix for the same reason. Bound once:
-            // `first_line` allocates, and calling it inside the format to
-            // strip a prefix off its own temporary reads as a puzzle.
-            let line = first_line(msg);
-            let objection = line
-                .strip_prefix("⚠️ BLOCKED by sandbox:")
-                .unwrap_or(&line)
-                .trim();
+            let objection = refusal.headline.as_str();
             let mode_name = match mode {
                 EnforcementMode::Warn => "warn",
                 _ => "audit",
@@ -632,6 +659,11 @@ fn refusal_decision(
                 fix: Some(format!(
                     "set {guard}_guard.mode = \"block\" to enforce this."
                 )),
+                // The structured half of the same fact. `decision` says the
+                // command runs; this says the policy objected, so a consumer
+                // counting what block mode would stop does not have to parse
+                // the prose above (#441).
+                objection: Some(objection.to_string()),
             }
         }
     }
@@ -651,6 +683,7 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
             decision: Decision::Inconclusive,
             reason: "no command given.".to_string(),
             fix: None,
+            objection: None,
         };
     };
     let base = command_basename(first);
@@ -666,6 +699,7 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
                 decision: Decision::Allowed,
                 reason: "Docker access is enabled (allow_docker=on).".to_string(),
                 fix: None,
+                objection: None,
             }
         } else {
             ExecExplain {
@@ -678,6 +712,7 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
                     "--allow-docker, or [sandbox] allow_docker = true (or --preset full-trust)."
                         .to_string(),
                 ),
+                objection: None,
             }
         };
     }
@@ -689,6 +724,7 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
                 decision: Decision::Allowed,
                 reason: "git runs; push prevention is not enabled for this run.".to_string(),
                 fix: None,
+                objection: None,
             };
         }
         if !ctx.scratch_dir {
@@ -699,6 +735,7 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
                          however it is configured."
                     .to_string(),
                 fix: Some("remove `sandbox.scratch_dir = false` to let the guard run.".to_string()),
+                objection: None,
             };
         }
         return match crate::gh_proxy::gate_git(
@@ -717,6 +754,7 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
                 decision: Decision::Allowed,
                 reason: "allowed by the git guard.".to_string(),
                 fix: None,
+                objection: None,
             },
             Err(msg) => refusal_decision(
                 ctx.git_guard.mode,
@@ -735,6 +773,7 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
                 decision: Decision::Allowed,
                 reason: "gh runs; the gh guard is not enabled for this run.".to_string(),
                 fix: None,
+                objection: None,
             };
         }
         // The launch serves this from the cached token file rather than
@@ -748,6 +787,7 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
                          being an environment variable every child process can read."
                     .to_string(),
                 fix: None,
+                objection: None,
             };
         }
         if !ctx.scratch_dir {
@@ -758,6 +798,7 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
                          however it is configured."
                     .to_string(),
                 fix: Some("remove `sandbox.scratch_dir = false` to let the guard run.".to_string()),
+                objection: None,
             };
         }
         let policy = crate::gh_proxy::GatePolicy {
@@ -792,6 +833,7 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
                 decision: Decision::Allowed,
                 reason: "allowed by the gh guard.".to_string(),
                 fix: None,
+                objection: None,
             },
             Err(msg) => refusal_decision(
                 ctx.gh_guard.mode,
@@ -814,6 +856,7 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
             fix: Some(
                 "--allow-tmp-exec, or [sandbox] allow_tmp_exec = true (dangerous).".to_string(),
             ),
+            objection: None,
         };
     }
 
@@ -823,41 +866,12 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
                  filesystem, network, and env policy."
             .to_string(),
         fix: None,
+        objection: None,
     }
 }
 
 fn looks_like_tmp_path(cmd: &str) -> bool {
     cmd.starts_with("/tmp/") || cmd.starts_with("/private/tmp/") || cmd.starts_with("/var/tmp/")
-}
-
-/// The guard's own "way forward" lines, if its message carries any.
-///
-/// Both guards put the headline on the first line and the remedy below it. The
-/// tail also holds boilerplate addressed to the agent ("make a note of this for
-/// the human operator") and the escape hatch, neither of which belongs in a
-/// `Fix:` line an operator reads — so this takes the guidance and leaves those.
-fn guidance(msg: &str) -> Option<String> {
-    // `Reason:` stays. It looked like boilerplate, but some guards put the
-    // remedy there and nowhere else — the token-exfiltration refusal's "Use the
-    // GH_TOKEN env var instead" is on that line — so dropping it threw away
-    // exactly what this function exists to keep.
-    const NOISE: &[&str] = &["This operation is restricted", "Please make a note"];
-    let lines: Vec<&str> = msg
-        .lines()
-        .skip(1)
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .filter(|l| !NOISE.iter().any(|n| l.starts_with(n)))
-        .collect();
-    (!lines.is_empty()).then(|| lines.join(" "))
-}
-
-fn first_line(s: &str) -> String {
-    s.lines()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or(s)
-        .trim()
-        .to_string()
 }
 
 // ── Report assembly & rendering ────────────────────────────────
@@ -1161,7 +1175,16 @@ mod tests {
         let e = explain_path(&p, home, proj, Path::new("/opt/other"));
         assert_eq!(e.read_decision(), Decision::Blocked);
         assert!(!e.credential);
-        assert!(e.fix.as_deref().unwrap().contains("--allow-read"));
+        let fix = e.fix.as_deref().unwrap();
+        assert!(fix.contains("--allow-read"));
+        // The two grants named first do not cover the case they look like they
+        // cover: `--allow-write` is deliberately non-executable, so a reader who
+        // follows it for another repository gets editable files and a build that
+        // still will not run. The narrow remedy has to be in the same sentence.
+        assert!(
+            fix.contains("--repo-dir") && fix.contains("not executable"),
+            "the fix must name the remedy that actually works for a repository: {fix}"
+        );
     }
 
     // ── explain_domain ──
@@ -1335,28 +1358,80 @@ mod tests {
         );
     }
 
+    /// Three states, and `decision` can express two. A consumer counting what
+    /// block mode would stop needs the third without parsing prose (#441).
+    #[test]
+    fn warn_mode_marks_the_objection_structurally() {
+        let gh = GhGuardPolicy::default();
+        let git = GitGuardPolicy {
+            enabled: true,
+            mode: crate::config::EnforcementMode::Warn,
+            ..GitGuardPolicy::default()
+        };
+        let ctx = exec_ctx(&gh, &git, false);
+
+        let objected = explain_exec(
+            &["git".into(), "push".into(), "origin".into(), "main".into()],
+            &ctx,
+        );
+        assert_eq!(objected.decision, Decision::Allowed, "warn mode runs it");
+        assert!(
+            objected.objection.is_some(),
+            "but the policy objected, and that must be recoverable without \
+             reading the reason text"
+        );
+
+        // A command nothing objects to must not carry one, or the field says
+        // nothing.
+        let clean = explain_exec(&["node".into(), "app.js".into()], &ctx);
+        assert_eq!(clean.decision, Decision::Allowed);
+        assert!(clean.objection.is_none());
+    }
+
     /// A guard that writes its own remedy must have it reach the reader. The
     /// generic fix is the fallback, not the default — `check exec` used to show
     /// only the first line and drop everything the guard said after it.
     #[test]
     fn a_refusal_carries_the_guards_own_guidance() {
-        let msg = "⚠️ BLOCKED by sandbox: 'gh api' targets 'other/repo'.\n\
-                   Reason: token exfiltration prevention. Use the GH_TOKEN env var instead.\n\
-                   This operation is restricted by the cplt sandbox environment.\n\
-                   Please make a note of this for the human operator.";
-        let out = guidance(msg).expect("the message carries guidance");
-        assert!(
-            out.contains("Use the GH_TOKEN env var"),
-            "the remedy on the Reason line must survive: {out}"
+        use crate::config::EnforcementMode;
+        let refusal = crate::gh_proxy::Refusal {
+            headline: "'gh api' targets 'other/repo'.".to_string(),
+            guidance: "Reason: token exfiltration prevention.\n\
+                       Use the GH_TOKEN env var instead."
+                .to_string(),
+            agent_note: &["Please make a note of this for the human operator."],
+        };
+        let out = refusal_decision(EnforcementMode::Block, &refusal, "generic", "gh");
+        assert_eq!(
+            out.reason,
+            "⚠️ BLOCKED by sandbox: 'gh api' targets 'other/repo'."
         );
-        assert!(
-            !out.contains("make a note") && !out.contains("This operation is restricted"),
-            "but the lines addressed to the agent must not: {out}"
+        let fix = out.fix.expect("a blocked verdict carries a fix");
+        assert_eq!(
+            fix, "Reason: token exfiltration prevention. Use the GH_TOKEN env var instead.",
+            "the guard's guidance, flattened to one line, and nothing addressed to the agent"
         );
-        assert!(
-            guidance("⚠️ BLOCKED by sandbox: no further detail.").is_none(),
-            "a message with nothing after the headline falls back to the generic fix"
+
+        let bare = crate::gh_proxy::Refusal {
+            guidance: String::new(),
+            ..refusal.clone()
+        };
+        let out = refusal_decision(EnforcementMode::Block, &bare, "generic", "gh");
+        assert_eq!(
+            out.fix.as_deref(),
+            Some("generic"),
+            "a refusal with nothing beyond the headline falls back to the generic fix"
         );
+
+        // Warn mode reports the headline as the objection, without the banner
+        // that would contradict ALLOWED.
+        let out = refusal_decision(EnforcementMode::Warn, &refusal, "generic", "gh");
+        assert_eq!(out.decision, Decision::Allowed);
+        assert_eq!(
+            out.objection.as_deref(),
+            Some("'gh api' targets 'other/repo'.")
+        );
+        assert!(!out.reason.contains("BLOCKED"), "{}", out.reason);
     }
 
     // ── Report verdict & JSON ──

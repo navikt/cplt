@@ -324,10 +324,24 @@ pub fn linux_docker_socket_paths(
     paths
 }
 
-/// Sensitive file patterns in the project directory that are denied by default.
-/// These often contain secrets (API keys, database passwords, private keys).
-/// A rogue agent could read and exfiltrate these via HTTPS.
-/// Override with `--allow-env-files` if Copilot genuinely needs them.
+/// Sensitive file patterns denied by default. These often contain secrets (API
+/// keys, database passwords, private keys), which a rogue agent could read and
+/// exfiltrate over HTTPS. Override with `--allow-env-files`.
+///
+/// **Emitted as unanchored regexes, so they apply EVERYWHERE the sandbox can
+/// reach, not only in the project directory** — see `emit_sensitive_project_denies`.
+/// The name says "project" because that is the threat these were written for;
+/// the rule is wider, and the difference is not academic. Dependency caches
+/// carry package content matching these patterns: `gotenv` ships a `.env`
+/// fixture, so `go mod verify` — which hashes every file in the module cache —
+/// aborts on a read it cannot make. That is collateral, not protection: the
+/// content is public, content-addressed and came from a registry rather than
+/// from the user.
+///
+/// [`DEPENDENCY_SOURCE_TREES`] carves the read side back out for the two
+/// extracted stores, which is as far as this is narrowed: scoping the whole
+/// rule to writable roots would let a broad `allow.read` expose real `.env`
+/// files. Documented in `docs/known-impacts.md`.
 pub const SENSITIVE_PROJECT_PATTERNS: &[&str] = &[
     // .env files — the #1 source of leaked secrets in project dirs
     r"\.env$",
@@ -339,6 +353,31 @@ pub const SENSITIVE_PROJECT_PATTERNS: &[&str] = &[
     r"\.pfx$",
     r"\.jks$",
 ];
+
+/// Dependency trees where [`SENSITIVE_PROJECT_PATTERNS`] is collateral rather
+/// than protection.
+///
+/// Each entry is a [`HOME_TOOL_DIRS`] path plus the subpath under it that holds
+/// **extracted** sources, because the two do not coincide: `go/pkg` is the tool
+/// dir and the module cache is `go/pkg/mod` beneath it. Naming the tool dir is
+/// what makes a relocated `CARGO_HOME` / `GOPATH` / `GOMODCACHE` resolve with
+/// the rest of the policy — matching on `go/pkg/mod` directly finds no entry
+/// and silently falls back to the default location.
+///
+/// These are the stores that hold **extracted** package sources: a `.env` under
+/// one of them is a file some library shipped, not a secret of the user's.
+/// `gotenv` ships one as a test fixture, and `go mod verify` hashes every file
+/// in the module cache, so a read it cannot make aborts the whole command
+/// (#477). The same is true of a `.pem` test fixture in any dependency.
+///
+/// Read is re-allowed here, never write. The properties that make this safe are
+/// the ones these trees have and a user directory does not: the content is
+/// content-addressed, verified against a checksum, and came from a registry
+/// rather than from the person running cplt. Anything without all three stays
+/// denied — which is why this is a short explicit list and not a heuristic.
+///
+/// macOS only, like the denies themselves: Landlock cannot express either side.
+pub const DEPENDENCY_SOURCE_TREES: &[(&str, &str)] = &[(".cargo/registry", ""), ("go/pkg", "mod")];
 
 /// Prefixes of ~/Library/Caches/ subdirectories to deny (non-dev caches).
 /// Uses reverse-domain bundle IDs which are stable across app versions.

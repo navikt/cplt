@@ -1391,20 +1391,23 @@ fn out_of_scope_cwd_error(
     invocation_repo: &str,
     scope: &[String],
     hint: &str,
-) -> String {
+) -> Refusal {
     let startup_repo = scope_label(scope);
-    format!(
-        "⚠️ BLOCKED by sandbox: 'gh {}{}' was invoked from repository '{invocation_repo}' outside the startup repo '{startup_repo}'.\n\
-         Reason: implicit repository targets must resolve to the repository captured at sandbox startup.\n\
-         {hint}\n\
-         This operation is restricted by the cplt sandbox environment.\n\
-         Please make a note of this for the human operator and continue with your remaining work.",
-        cmd.command,
-        cmd.subcommand
-            .as_deref()
-            .map(|s| format!(" {s}"))
-            .unwrap_or_default(),
-    )
+    Refusal {
+        headline: format!(
+            "'gh {}{}' was invoked from repository '{invocation_repo}' outside the startup repo '{startup_repo}'.",
+            cmd.command,
+            cmd.subcommand
+                .as_deref()
+                .map(|s| format!(" {s}"))
+                .unwrap_or_default(),
+        ),
+        guidance: format!(
+            "Reason: implicit repository targets must resolve to the repository captured at sandbox startup.\n\
+             {hint}"
+        ),
+        agent_note: &[RESTRICTED, NOTE],
+    }
 }
 
 /// Approval for an Allow-tier (read-only) command.
@@ -1423,7 +1426,7 @@ fn allow_tier_approval(
     policy: &GatePolicy,
     resolve_scope: impl FnOnce() -> Result<Vec<String>, String>,
     real_git: Option<&Path>,
-) -> Result<GateApproval, String> {
+) -> Result<GateApproval, Refusal> {
     if !policy.scope_check {
         return Ok(GateApproval::default());
     }
@@ -1699,6 +1702,62 @@ pub enum UnknownCommandDecision {
     Allow,
 }
 
+/// A guard's refusal, built once where the guard decides.
+///
+/// Every reader renders the part it needs from these fields: the launch prints
+/// the whole thing (`Display`, then its escape hatch), warn mode restates it
+/// under a banner that does not claim the command was stopped ([`Self::warning`]),
+/// and `cplt check exec` shows the headline and the guidance. Nothing re-parses
+/// the rendered text, so a remedy a guard writes reaches every surface or none —
+/// `check exec` used to keep the first line and drop the rest, then grew a
+/// filter that matched prose by prefix (#457).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    /// What was refused, one line, without the `BLOCKED by sandbox` banner.
+    pub headline: String,
+    /// Why, and the way forward — the lines an operator reads. Empty when the
+    /// headline says it all.
+    pub guidance: String,
+    /// Closing lines addressed to the agent that hit the block: that the
+    /// sandbox restricts this, to make a note and carry on. The launch prints
+    /// them; `check exec`, read by the operator, does not.
+    pub agent_note: &'static [&'static str],
+}
+
+const RESTRICTED: &str = "This operation is restricted by the cplt sandbox environment.";
+const NOTE: &str =
+    "Please make a note of this for the human operator and continue with your remaining work.";
+
+impl Refusal {
+    /// The first line as the launch prints it.
+    #[must_use]
+    pub fn banner_line(&self) -> String {
+        format!("⚠️ BLOCKED by sandbox: {}", self.headline)
+    }
+
+    /// The refusal restated for warn mode, where the command runs: the same
+    /// body under a label that says so, instead of "WARNING … BLOCKED".
+    #[must_use]
+    pub fn warning(&self) -> String {
+        self.render(format!("⚠️  WARNING (would block): {}", self.headline))
+    }
+
+    fn render(&self, first: String) -> String {
+        let mut lines = vec![first];
+        if !self.guidance.is_empty() {
+            lines.push(self.guidance.clone());
+        }
+        lines.extend(self.agent_note.iter().map(|l| (*l).to_string()));
+        lines.join("\n")
+    }
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.render(self.banner_line()))
+    }
+}
+
 /// Information established by the guard and required when invoking `gh`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GateApproval {
@@ -1761,7 +1820,7 @@ pub fn gate(
     args: &[&str],
     project_dir: &Path,
     policy: &GatePolicy,
-) -> Result<GateApproval, String> {
+) -> Result<GateApproval, Refusal> {
     // Trusted, not PATH (#250). The only caller is `cplt check`, which runs in
     // the UNSANDBOXED parent, so a `git` planted in a write+exec directory on
     // PATH would execute as the user. `gate_with_git` documents its parameter
@@ -1801,7 +1860,7 @@ pub fn gate_with_git(
     project_dir: &Path,
     policy: &GatePolicy,
     real_git: &Path,
-) -> Result<GateApproval, String> {
+) -> Result<GateApproval, Refusal> {
     gate_with_scope_resolver(
         args,
         policy,
@@ -1821,7 +1880,7 @@ pub fn gate_with_repo_scope(
     policy: &GatePolicy,
     repo_scope: &[String],
     real_git: Option<&Path>,
-) -> Result<GateApproval, String> {
+) -> Result<GateApproval, Refusal> {
     gate_with_scope_resolver(
         args,
         policy,
@@ -1841,7 +1900,7 @@ fn gate_with_scope_resolver(
     policy: &GatePolicy,
     resolve_scope: impl FnOnce() -> Result<Vec<String>, String>,
     real_git: Option<&Path>,
-) -> Result<GateApproval, String> {
+) -> Result<GateApproval, Refusal> {
     let Some(cmd) = parse_command(args) else {
         // No command parsed — this happens for `gh --help`, `gh --version`, `gh help`, etc.
         // These are read-only informational invocations — always allow.
@@ -1865,13 +1924,15 @@ fn gate_with_scope_resolver(
         && cmd.command == "auth"
         && (cmd.subcommand.as_deref() == Some("token") || reveals_token_via_status)
     {
-        return Err(
-            "⚠️ BLOCKED by sandbox: revealing the GitHub token is not allowed in this environment.\n\
-             Reason: token exfiltration prevention. Use the GH_TOKEN env var instead.\n\
-             This operation is restricted by the cplt sandbox to prevent credential leaks.\n\
-             Please make a note of this for the human operator and continue with your remaining work."
+        return Err(Refusal {
+            headline: "revealing the GitHub token is not allowed in this environment.".to_string(),
+            guidance: "Reason: token exfiltration prevention. Use the GH_TOKEN env var instead."
                 .to_string(),
-        );
+            agent_note: &[
+                "This operation is restricted by the cplt sandbox to prevent credential leaks.",
+                NOTE,
+            ],
+        });
     }
 
     let result = evaluate_with_policy(&cmd, policy.allow_api_write);
@@ -1881,26 +1942,26 @@ fn gate_with_scope_resolver(
             && let Some(endpoint) = cmd.api_endpoint.as_deref()
             && github_api_endpoint_path(endpoint).is_err()
         {
-            return Err(
-                "⚠️ BLOCKED by sandbox: 'gh api' targets an endpoint outside \
-                 'https://api.github.com'.\n\
-                 This operation is restricted by the cplt sandbox environment.\n\
-                 Please make a note of this for the human operator and continue with your remaining work."
+            return Err(Refusal {
+                headline: "'gh api' targets an endpoint outside 'https://api.github.com'."
                     .to_string(),
-            );
+                guidance: String::new(),
+                agent_note: &[RESTRICTED, NOTE],
+            });
         }
 
         if let Some(hostname) = requested_hostname(args)
             && hostname != "github.com"
         {
-            return Err(format!(
-                "⚠️ BLOCKED by sandbox: 'gh {} {}' targets GitHub host '{hostname}', \
-                 outside the approved host 'github.com'.\n\
-                 This operation is restricted by the cplt sandbox environment.\n\
-                 Please make a note of this for the human operator and continue with your remaining work.",
-                cmd.command,
-                cmd.subcommand.as_deref().unwrap_or("")
-            ));
+            return Err(Refusal {
+                headline: format!(
+                    "'gh {} {}' targets GitHub host '{hostname}', outside the approved host 'github.com'.",
+                    cmd.command,
+                    cmd.subcommand.as_deref().unwrap_or("")
+                ),
+                guidance: String::new(),
+                agent_note: &[RESTRICTED, NOTE],
+            });
         }
     }
 
@@ -1911,31 +1972,31 @@ fn gate_with_scope_resolver(
                 return Ok(GateApproval::default());
             }
 
-            let scope = resolve_scope().map_err(|reason| {
-                format!(
-                    "⚠️ BLOCKED by sandbox: 'gh {} {}' cannot verify target repository scope.\n\
-                     Reason: {reason}.\n\
-                     This operation is restricted by the cplt sandbox environment.\n\
-                     Please make a note of this for the human operator and continue with your remaining work.",
+            let scope = resolve_scope().map_err(|reason| Refusal {
+                headline: format!(
+                    "'gh {} {}' cannot verify target repository scope.",
                     cmd.command,
                     cmd.subcommand.as_deref().unwrap_or("")
-                )
+                ),
+                guidance: format!("Reason: {reason}."),
+                agent_note: &[RESTRICTED, NOTE],
             })?;
 
             let invocation_repo = if requires_invocation_repo_check(&cmd) {
-                Some(resolve_invocation_repo(real_git).map_err(|reason| {
-                    format!(
-                        "⚠️ BLOCKED by sandbox: 'gh {}{}' cannot verify the repository for its implicit target.\n\
-                         Reason: {reason}.\n\
-                         The invocation cwd must resolve to the repository captured at sandbox startup.\n\
-                         This operation is restricted by the cplt sandbox environment.\n\
-                         Please make a note of this for the human operator and continue with your remaining work.",
+                Some(resolve_invocation_repo(real_git).map_err(|reason| Refusal {
+                    headline: format!(
+                        "'gh {}{}' cannot verify the repository for its implicit target.",
                         cmd.command,
                         cmd.subcommand
                             .as_deref()
                             .map(|s| format!(" {s}"))
                             .unwrap_or_default(),
-                    )
+                    ),
+                    guidance: format!(
+                        "Reason: {reason}.\n\
+                         The invocation cwd must resolve to the repository captured at sandbox startup."
+                    ),
+                    agent_note: &[RESTRICTED, NOTE],
                 })?)
             } else {
                 None
@@ -1961,62 +2022,91 @@ fn gate_with_scope_resolver(
                 // session that hit this concluded it was blocked when a
                 // supported command would have worked (#403). The higher-level
                 // read commands really are allowed cross-repo with an explicit
-                // `-R`, and a repository checked out inside the project can be
+                // `-R`, and another repository the user works in can be
                 // named into the scope set.
-                Err(format!(
-                    "⚠️ BLOCKED by sandbox: 'gh {}{}' targets '{}' which is outside the startup repo '{}'.\n\
-                     Reason: {}\n\
-                     Ways forward: read-only commands take an explicit repository — \
-                     `gh pr view -R <owner>/<repo> <number>`, `gh pr diff -R <owner>/<repo> \
-                     <number>`, `gh issue view -R <owner>/<repo> <number>` — and are allowed \
-                     against any repository. Raw `gh api` is not. If the agent \
-                     works in that repository too and it is checked out inside this one, name it \
-                     with `cplt config set --local sandbox.repo_dirs <DIR>` and it joins the \
-                     scope set. Otherwise relaunch cplt against that repository.\n\
-                     This operation is restricted by the cplt sandbox environment.\n\
-                    Please make a note of this for the human operator and continue with your remaining work.",
-                    cmd.command,
-                    cmd.subcommand
-                        .as_deref()
-                        .map(|s| format!(" {s}"))
-                        .unwrap_or_default(),
-                    cmd.repo_flag
-                        .as_deref()
-                        .or(cmd.api_endpoint.as_deref())
-                        .unwrap_or("unknown"),
-                    scope_label(&scope),
-                    result.reason,
-                ))
+                Err(Refusal {
+                    headline: format!(
+                        "'gh {}{}' targets '{}' which is outside the startup repo '{}'.",
+                        cmd.command,
+                        cmd.subcommand
+                            .as_deref()
+                            .map(|s| format!(" {s}"))
+                            .unwrap_or_default(),
+                        cmd.repo_flag
+                            .as_deref()
+                            .or(cmd.api_endpoint.as_deref())
+                            .unwrap_or("unknown"),
+                        scope_label(&scope),
+                    ),
+                    guidance: format!(
+                        "Reason: {}\n\
+                         Ways forward: read-only commands take an explicit repository — \
+                         `gh pr view -R <owner>/<repo> <number>`, `gh pr diff -R <owner>/<repo> \
+                         <number>`, `gh issue view -R <owner>/<repo> <number>` — and are allowed \
+                         against any repository. Raw `gh api` is not. If the agent \
+                         works in that repository too and it is checked out on this machine, \
+                         name it with `cplt config set --local sandbox.repo_dirs <DIR>` and it \
+                         joins the scope set — beside this repository or inside it, either \
+                         works. Otherwise relaunch cplt against that repository.",
+                        result.reason,
+                    ),
+                    agent_note: &[RESTRICTED, NOTE],
+                })
             }
         }
 
-        Decision::Block => Err(format!(
-            "⚠️ BLOCKED by sandbox: 'gh {}{}' is not allowed in this environment.\n\
-             Reason: {}\n\
-             This operation is restricted by the cplt sandbox to prevent unintended changes.\n\
-             Please make a note of this for the human operator and continue with your remaining work.",
-            cmd.command,
-            cmd.subcommand
-                .as_deref()
-                .map(|s| format!(" {s}"))
-                .unwrap_or_default(),
-            result.reason,
-        )),
-        Decision::Unknown => match policy.unknown_command {
-            UnknownCommandDecision::Allow => {
-                allow_tier_approval(&cmd, policy, resolve_scope, real_git)
-            }
-            UnknownCommandDecision::Block => Err(format!(
-                "⚠️ BLOCKED by sandbox: 'gh {}{}' is not recognized by the policy table.\n\
-                     This command may have been added in a newer gh CLI version.\n\
-                     This operation is restricted by the cplt sandbox (default-deny for unknown commands).\n\
-                     Please make a note of this for the human operator and continue with your remaining work.",
+        Decision::Block => Err(Refusal {
+            headline: format!(
+                "'gh {}{}' is not allowed in this environment.",
                 cmd.command,
                 cmd.subcommand
                     .as_deref()
                     .map(|s| format!(" {s}"))
                     .unwrap_or_default(),
-            )),
+            ),
+            // A raw API write has a narrow key of its own, and a refusal that
+            // names only the blanket escape hatch is how a session ends up with
+            // the whole guard off: one reached for `gh_guard.mode = "warn"` for
+            // exactly this, which also drops the repository scope check. Say
+            // the small thing that opens this one command.
+            guidance: if result.reason.starts_with("gh api with") {
+                format!(
+                    "Reason: {}. Raw API writes are off by default because they bypass the \
+                     per-command policy the guard rests on; the higher-level commands \
+                     (`gh pr comment`, `gh issue comment`, `gh pr review`) are allowed and \
+                     scope-checked. If the raw call is genuinely needed, \
+                     `cplt config set gh_guard.allow_api_write true` opens writes to \
+                     repositories in scope and nothing else — it is far narrower than \
+                     turning the guard off. `gh api DELETE` stays refused either way.",
+                    result.reason
+                )
+            } else {
+                format!("Reason: {}", result.reason)
+            },
+            agent_note: &[
+                "This operation is restricted by the cplt sandbox to prevent unintended changes.",
+                NOTE,
+            ],
+        }),
+        Decision::Unknown => match policy.unknown_command {
+            UnknownCommandDecision::Allow => {
+                allow_tier_approval(&cmd, policy, resolve_scope, real_git)
+            }
+            UnknownCommandDecision::Block => Err(Refusal {
+                headline: format!(
+                    "'gh {}{}' is not recognized by the policy table.",
+                    cmd.command,
+                    cmd.subcommand
+                        .as_deref()
+                        .map(|s| format!(" {s}"))
+                        .unwrap_or_default(),
+                ),
+                guidance: "This command may have been added in a newer gh CLI version.".to_string(),
+                agent_note: &[
+                    "This operation is restricted by the cplt sandbox (default-deny for unknown commands).",
+                    NOTE,
+                ],
+            }),
         },
     }
 }
@@ -2596,7 +2686,7 @@ fn symbolic_ref_writes_remote_head(sub_args: &[&str]) -> bool {
     })
 }
 
-/// Evaluate a git command. Returns Ok(()) if allowed, Err with message if blocked.
+/// Evaluate a git command. Returns Ok(()) if allowed, Err with the [`Refusal`] if blocked.
 ///
 /// Used by the `cplt git-gate` subcommand.
 /// `prevent_push` controls whether push/request-pull/send-pack are blocked.
@@ -2612,7 +2702,7 @@ pub fn gate_git(
     allow_push_rules: &[crate::config::ResolvedPushRule],
     real_git: Option<&Path>,
     repo_facts: &RepoFacts,
-) -> Result<(), String> {
+) -> Result<(), Refusal> {
     // If push prevention is entirely disabled, allow everything
     if !prevent_push && !prevent_force_push {
         return Ok(());
@@ -2657,14 +2747,17 @@ pub fn gate_git(
     if (prevent_push || prevent_force_push)
         && let Some((flag, key)) = injected_sensitive_config_key(args)
     {
-        return Err(format!(
-            "⚠️ BLOCKED by sandbox: 'git {flag} {key}=…' is not allowed while push prevention is active.\n\
-             Command-line config that can redirect a push (remote.*, url.*, push.*, branch.*) or\n\
-             redefine a subcommand (alias.*) is refused, because the guard would authorize against\n\
-             different configuration than the push actually runs under.\n\
-             Configure the remote in the repository instead, and push to it by name.\n\
-             Please make a note of this for the human operator and continue with your remaining work."
-        ));
+        return Err(Refusal {
+            headline: format!(
+                "'git {flag} {key}=…' is not allowed while push prevention is active."
+            ),
+            guidance: "Command-line config that can redirect a push (remote.*, url.*, push.*, branch.*) or\n\
+                       redefine a subcommand (alias.*) is refused, because the guard would authorize against\n\
+                       different configuration than the push actually runs under.\n\
+                       Configure the remote in the repository instead, and push to it by name."
+                .to_string(),
+            agent_note: &[NOTE],
+        });
     }
 
     let Some(sub) = subcommand else {
@@ -2686,13 +2779,14 @@ pub fn gate_git(
     // to another repository. `git remote`/`git config` are otherwise allowed
     // (read-only inspection), so this must be intercepted explicitly.
     if is_remote_scope_mutation(sub, sub_args) {
-        return Err(format!(
-            "⚠️ BLOCKED by sandbox: 'git {sub}' would change a remote's URL.\n\
-             The gh-guard derives the enforced repository scope from the 'origin' remote;\n\
-             rewriting it could redirect in-scope operations to another repository.\n\
-             Read-only inspection (git remote -v, git config --get remote.origin.url) is still allowed.\n\
-             Please make a note of this for the human operator and continue with your remaining work."
-        ));
+        return Err(Refusal {
+            headline: format!("'git {sub}' would change a remote's URL."),
+            guidance: "The gh-guard derives the enforced repository scope from the 'origin' remote;\n\
+                       rewriting it could redirect in-scope operations to another repository.\n\
+                       Read-only inspection (git remote -v, git config --get remote.origin.url) is still allowed."
+                .to_string(),
+            agent_note: &[NOTE],
+        });
     }
 
     // `git remote set-head` writes `refs/remotes/<remote>/HEAD` — the very ref
@@ -2704,15 +2798,15 @@ pub fn gate_git(
     // and the `symbolic-ref` write block below (backend-independent).
     if prevent_push && sub == "remote" && remote_verb(sub_args).map(|(_, v)| v) == Some("set-head")
     {
-        return Err(
-            "⚠️ BLOCKED by sandbox: 'git remote set-head' is not allowed in this environment.\n\
-             It rewrites refs/remotes/<remote>/HEAD, the record of which branch is the protected\n\
-             default one. The push guard reads that fact from before this session started, so\n\
-             rewriting it changes nothing it decides — but nothing legitimate needs it here either.\n\
-             Run it OUTSIDE the sandbox if the recorded default branch is wrong.\n\
-             Please make a note of this for the human operator and continue with your remaining work."
+        return Err(Refusal {
+            headline: "'git remote set-head' is not allowed in this environment.".to_string(),
+            guidance: "It rewrites refs/remotes/<remote>/HEAD, the record of which branch is the protected\n\
+                       default one. The push guard reads that fact from before this session started, so\n\
+                       rewriting it changes nothing it decides — but nothing legitimate needs it here either.\n\
+                       Run it OUTSIDE the sandbox if the recorded default branch is wrong."
                 .to_string(),
-        );
+            agent_note: &[NOTE],
+        });
     }
 
     // `git symbolic-ref refs/remotes/<remote>/HEAD <target>` writes the same ref
@@ -2728,27 +2822,28 @@ pub fn gate_git(
     // backend-independent. The read form stays allowed — git internals and the
     // launch-time fact capture both use it.
     if prevent_push && sub == "symbolic-ref" && symbolic_ref_writes_remote_head(sub_args) {
-        return Err(
-            "⚠️ BLOCKED by sandbox: writing refs/remotes/<remote>/HEAD is not allowed in this environment.\n\
-             That symref records which branch is the protected default one, and the push guard reads it\n\
-             when a session starts — so rewriting it here would retarget the guard at the next launch.\n\
-             Reading it (git symbolic-ref [--short] <ref>) is still allowed.\n\
-             Run the write OUTSIDE the sandbox if the recorded default branch is wrong.\n\
-             Please make a note of this for the human operator and continue with your remaining work."
+        return Err(Refusal {
+            headline: "writing refs/remotes/<remote>/HEAD is not allowed in this environment."
                 .to_string(),
-        );
+            guidance: "That symref records which branch is the protected default one, and the push guard reads it\n\
+                       when a session starts — so rewriting it here would retarget the guard at the next launch.\n\
+                       Reading it (git symbolic-ref [--short] <ref>) is still allowed.\n\
+                       Run the write OUTSIDE the sandbox if the recorded default branch is wrong."
+                .to_string(),
+            agent_note: &[NOTE],
+        });
     }
 
     // `git subtree push` is a remote write — block it like a bare push while
     // leaving the local subtree forms (add/pull/split/merge) allowed.
     if prevent_push && sub == "subtree" && is_subtree_push(sub_args) {
-        return Err(
-            "⚠️ BLOCKED by sandbox: 'git subtree push' is not allowed in this environment.\n\
-             Push prevention is enabled — 'subtree push' performs a remote write.\n\
-             Local subtree operations (add/pull/split/merge) are still allowed.\n\
-             Please make a note of this for the human operator and continue with your remaining work."
+        return Err(Refusal {
+            headline: "'git subtree push' is not allowed in this environment.".to_string(),
+            guidance: "Push prevention is enabled — 'subtree push' performs a remote write.\n\
+                       Local subtree operations (add/pull/split/merge) are still allowed."
                 .to_string(),
-        );
+            agent_note: &[NOTE],
+        });
     }
 
     // Fail closed on any push option the guard cannot bind exactly. Git's
@@ -2762,15 +2857,17 @@ pub fn gate_git(
     if sub == "push"
         && let Some(opt) = unbindable_push_option(sub_args)
     {
-        return Err(format!(
-            "⚠️ BLOCKED by sandbox: 'git push {opt}' is not allowed in this environment.\n\
-             '{opt}' is not an exact 'git push' option. Git resolves abbreviations ('--rep' for '--repo')\n\
-             and bundled short flags ('-vo'), but the guard binds options by exact spelling, so an option\n\
-             it cannot bind is refused instead of misparsed — a misparse moves the push destination or\n\
-             hides '--force'.\n\
-             Spell the option out in full, one flag per token: `git push --repo=<url>`, `-o <option>`, `-v -o <option>`.\n\
-             Please make a note of this for the human operator and continue with your remaining work."
-        ));
+        return Err(Refusal {
+            headline: format!("'git push {opt}' is not allowed in this environment."),
+            guidance: format!(
+                "'{opt}' is not an exact 'git push' option. Git resolves abbreviations ('--rep' for '--repo')\n\
+                 and bundled short flags ('-vo'), but the guard binds options by exact spelling, so an option\n\
+                 it cannot bind is refused instead of misparsed — a misparse moves the push destination or\n\
+                 hides '--force'.\n\
+                 Spell the option out in full, one flag per token: `git push --repo=<url>`, `-o <option>`, `-v -o <option>`."
+            ),
+            agent_note: &[NOTE],
+        });
     }
 
     // A destination that is not a configured remote — `--repo=<url>`, or the
@@ -2783,13 +2880,15 @@ pub fn gate_git(
         && sub == "push"
         && let Some(dest) = push_destination_override(sub_args, real_git, &repo_args)
     {
-        return Err(format!(
-            "⚠️ BLOCKED by sandbox: 'git push {dest}' is not allowed while push prevention is active.\n\
-             '{dest}' is not a configured remote of this repository, so it redirects the push past remote-based\n\
-             authorization — branch protection and allow_push rules bind to the remote, not to this argument.\n\
-             Push to a configured remote by name instead: `git push <remote> <branch>`.\n\
-             Please make a note of this for the human operator and continue with your remaining work."
-        ));
+        return Err(Refusal {
+            headline: format!("'git push {dest}' is not allowed while push prevention is active."),
+            guidance: format!(
+                "'{dest}' is not a configured remote of this repository, so it redirects the push past remote-based\n\
+                 authorization — branch protection and allow_push rules bind to the remote, not to this argument.\n\
+                 Push to a configured remote by name instead: `git push <remote> <branch>`."
+            ),
+            agent_note: &[NOTE],
+        });
     }
 
     if prevent_push && GIT_BLOCKED_SUBCOMMANDS.contains(&sub) {
@@ -2885,12 +2984,13 @@ pub fn gate_git(
                 if prevent_force_push {
                     let has_force = push_is_force(push_args);
                     if has_force {
-                        return Err(
-                            "⚠️ BLOCKED by sandbox: 'git push --force' is not allowed in this environment.\n\
-                             Force push prevention is enabled — regular push to feature branches is allowed but force push is blocked.\n\
-                             Please make a note of this for the human operator and continue with your remaining work."
+                        return Err(Refusal {
+                            headline: "'git push --force' is not allowed in this environment."
                                 .to_string(),
-                        );
+                            guidance: "Force push prevention is enabled — regular push to feature branches is allowed but force push is blocked."
+                                .to_string(),
+                            agent_note: &[NOTE],
+                        });
                     }
                 }
                 return Ok(());
@@ -2951,20 +3051,67 @@ pub fn gate_git(
             // multi-refspec beyond the glob, config-driven destinations) is
             // never authorized — the operator's `branches` filter cannot bound
             // it, so it fails closed (H-10).
-            let authorized = match push_target_branches(push_args, real_git, &repo_args) {
-                PushTargets::Branches(branches) if !branches.is_empty() => {
-                    branches.iter().all(|b| {
-                        matches_allow_push_rule(allow_push_rules, &dest_urls, Some(b), has_force)
-                    })
-                }
-                _ => false,
-            };
+            // #424: an allow_push rule carries launch/named-root identity, not
+            // bare URL identity. The destination URL must be one pinned at
+            // launch AND the push must run in a repository this session has in
+            // scope. Without the second half the two halves of the guard
+            // disagree about what a repository is:
+            // `protect_default_branch_only` judges the repository the push runs
+            // in, while allow_push would authorize from anywhere — including a
+            // clone the agent made underneath the project, whose `origin` an
+            // operator writing `remote = "origin"` was never thinking about.
+            //
+            // The requirement needs the session to KNOW its repositories. When
+            // no facts were captured at launch — git unavailable in the parent
+            // — there is nothing to compare against, and the rule falls back to
+            // the URL identity that shipped rather than refusing every push
+            // with a reason the operator cannot act on. That condition is
+            // decided parent-side at launch and warned about there; the agent
+            // cannot bring it about.
+            // "Known" means at least one repository was IDENTIFIED, not that a
+            // list was non-empty. A named root whose common dir could not be
+            // read is a member the gate can never match, so counting it as
+            // known left every `allow_push` refused while the launch warning
+            // said the rules fell back to matching by URL alone. The condition
+            // here and the one that warns at launch are now each other's
+            // negation.
+            let scope_known = !repo_facts.git_common_dir.is_empty()
+                || repo_facts
+                    .named
+                    .iter()
+                    .any(|n| !n.git_common_dir.is_empty());
+            let in_scope = !scope_known || repo_facts.describes(&repo_args, real_git);
+            let authorized = in_scope
+                && match push_target_branches(push_args, real_git, &repo_args) {
+                    PushTargets::Branches(branches) if !branches.is_empty() => {
+                        branches.iter().all(|b| {
+                            matches_allow_push_rule(
+                                allow_push_rules,
+                                &dest_urls,
+                                Some(b),
+                                has_force,
+                            )
+                        })
+                    }
+                    _ => false,
+                };
             if authorized {
                 return Ok(());
             }
             // A rule naming a remote that could not be pinned to a URL at
             // launch matches nothing (see `matches_allow_push_rule`). Say so,
             // or the operator sees a rule that looks like it should apply.
+            if !in_scope {
+                block_hints.push(
+                    "This push does not run in a repository this session has in scope — not \
+                     the launch repository, and not one named with `--repo-dir`. An allow_push \
+                     rule authorizes a destination FROM the repositories the session was given, \
+                     so that a rule written for this project cannot authorize a push from a \
+                     clone made underneath it. Push from a repository in scope, or name this \
+                     one with `--repo-dir` and start a new session."
+                        .to_string(),
+                );
+            }
             if let Some(name) = allow_push_rules
                 .iter()
                 .find(|r| r.remote.is_some() && r.url.is_none())
@@ -2987,12 +3134,28 @@ pub fn gate_git(
         } else {
             format!("\n{}", block_hints.join("\n"))
         };
-        return Err(format!(
-            "⚠️ BLOCKED by sandbox: 'git {sub}' is not allowed in this environment.\n\
-             Push prevention is enabled — commit your changes locally.\n\
-             This operation is restricted by the cplt sandbox to prevent unintended pushes.{hints}\n\
-             Please make a note of this for the human operator and continue with your remaining work."
-        ));
+        // Name the repository the push targets, but only where "which
+        // repository?" is a live question: a session spanning several, or a
+        // push that landed outside all of them. In a one-repository session
+        // there is nothing to disambiguate and the path is noise in every
+        // refusal.
+        let target = match repo_facts.target(&repo_args, real_git) {
+            Some(member) if !repo_facts.named.is_empty() => {
+                format!(" in {}", member.project_dir)
+            }
+            None if !repo_facts.git_common_dir.is_empty() || !repo_facts.named.is_empty() => {
+                " in a repository this session does not have in scope".to_string()
+            }
+            _ => String::new(),
+        };
+        return Err(Refusal {
+            headline: format!("'git {sub}'{target} is not allowed in this environment."),
+            guidance: format!("Push prevention is enabled — commit your changes locally.{hints}"),
+            agent_note: &[
+                "This operation is restricted by the cplt sandbox to prevent unintended pushes.",
+                NOTE,
+            ],
+        });
     }
 
     // If only force push prevention is active (prevent_push=false, prevent_force_push=true),
@@ -3001,12 +3164,12 @@ pub fn gate_git(
         let push_args = &args[i + 1..];
         let has_force = push_is_force(push_args);
         if has_force {
-            return Err(
-                "⚠️ BLOCKED by sandbox: 'git push --force' is not allowed in this environment.\n\
-                 Force push prevention is enabled — regular push is allowed but force push is blocked.\n\
-                 Please make a note of this for the human operator and continue with your remaining work."
+            return Err(Refusal {
+                headline: "'git push --force' is not allowed in this environment.".to_string(),
+                guidance: "Force push prevention is enabled — regular push is allowed but force push is blocked."
                     .to_string(),
-            );
+                agent_note: &[NOTE],
+            });
         }
     }
 
@@ -3030,13 +3193,16 @@ pub fn gate_git(
     // allowed to reach git (a plain `git push` is legal there), so they must not
     // be swept up here as unrecognized.
     if (prevent_push || prevent_force_push) && !GIT_BLOCKED_SUBCOMMANDS.contains(&sub) {
-        return Err(format!(
-            "⚠️ BLOCKED by sandbox: 'git {sub}' is not a recognized subcommand.\n\
-             Push prevention is active — only known git subcommands are allowed.\n\
-             An unrecognized subcommand may be an alias that expands to a push inside git,\n\
-             after this guard has already decided, so it is refused rather than guessed at.\n\
-             If this is a legitimate command, please ask the human operator to allow it."
-        ));
+        return Err(Refusal {
+            headline: format!("'git {sub}' is not a recognized subcommand."),
+            guidance: "Push prevention is active — only known git subcommands are allowed.\n\
+                       An unrecognized subcommand may be an alias that expands to a push inside git,\n\
+                       after this guard has already decided, so it is refused rather than guessed at."
+                .to_string(),
+            agent_note: &[
+                "If this is a legitimate command, please ask the human operator to allow it.",
+            ],
+        });
     }
 
     Ok(())
@@ -3503,6 +3669,17 @@ pub struct RepoFacts {
     /// Remote name → its default branch, from `refs/remotes/<remote>/HEAD`.
     #[serde(default)]
     pub default_branches: std::collections::BTreeMap<String, String>,
+    /// The same facts for each repository named with `--repo-dir`, captured at
+    /// the same moment from the same trusted git.
+    ///
+    /// A named root is a repository the session works in, so a push there has
+    /// to be judged by ITS default branch. Without these the guard had no baked
+    /// answer for a named root and failed closed on every push in one — right
+    /// direction, wrong reason, and a refusal that talked about the launch
+    /// repository. Members carry no `named` of their own; the nesting is one
+    /// level by construction.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub named: Vec<RepoFacts>,
 }
 
 impl RepoFacts {
@@ -3527,7 +3704,28 @@ impl RepoFacts {
     /// same time. An unknown common dir on either side means "cannot tell", and
     /// that fails closed rather than treating every repository as the launch
     /// one.
+    /// The member of this session's repositories that `repo_args` targets: the
+    /// launch repository, one of the named roots, or none.
+    ///
+    /// "None" is the fail-closed answer and covers both "outside every
+    /// repository in scope" and "cannot tell", deliberately: a guard that
+    /// cannot identify where a push runs must not fall back to judging it by
+    /// the launch repository's yardstick (#416).
+    fn target(&self, repo_args: &[&str], real_git: Option<&Path>) -> Option<&RepoFacts> {
+        if self.describes_self(repo_args, real_git) {
+            return Some(self);
+        }
+        self.named
+            .iter()
+            .find(|n| n.describes_self(repo_args, real_git))
+    }
+
+    /// Whether the push runs in a repository this session has in scope.
     fn describes(&self, repo_args: &[&str], real_git: Option<&Path>) -> bool {
+        self.target(repo_args, real_git).is_some()
+    }
+
+    fn describes_self(&self, repo_args: &[&str], real_git: Option<&Path>) -> bool {
         if repo_args.is_empty() {
             let (Some(git), false) = (real_git, self.git_common_dir.is_empty()) else {
                 return false;
@@ -3570,10 +3768,12 @@ impl RepoFacts {
         repo_args: &[&str],
         real_git: Option<&Path>,
     ) -> Option<&str> {
-        if !self.describes(repo_args, real_git) {
-            return None;
-        }
-        self.default_branches.get(remote).map(String::as_str)
+        // The targeted repository's own answer, not the launch repository's: a
+        // named root whose default branch is `trunk` must be judged by `trunk`.
+        self.target(repo_args, real_git)?
+            .default_branches
+            .get(remote)
+            .map(String::as_str)
     }
 }
 
@@ -3731,23 +3931,48 @@ fn push_dest_remote(push_args: &[&str], real_git: Option<&Path>, repo_args: &[&s
 #[must_use]
 pub fn resolve_push_rule_urls(
     real_git: &Path,
-    project_dir: &Path,
+    repos: &[&Path],
     rules: &[crate::config::ResolvedPushRule],
 ) -> Vec<crate::config::ResolvedPushRule> {
-    let dir = project_dir.to_string_lossy().into_owned();
-    let repo_args = ["-C", dir.as_str()];
-    rules
-        .iter()
-        .map(|rule| {
-            let mut rule = rule.clone();
-            if rule.url.is_none()
-                && let Some(name) = rule.remote.as_deref()
-            {
-                rule.url = resolve_remote_url(real_git, &repo_args, name);
+    let mut out: Vec<crate::config::ResolvedPushRule> = Vec::new();
+    for rule in rules {
+        // Branches-only by the operator's choice: no name to pin, one copy.
+        let Some(name) = rule.remote.as_deref() else {
+            out.push(rule.clone());
+            continue;
+        };
+        if rule.url.is_some() {
+            out.push(rule.clone());
+            continue;
+        }
+        // A rule naming a remote is expanded into one pinned rule per
+        // repository the session has in scope. `allow_push = [{remote =
+        // "origin", ...}]` written for a session spanning two repositories
+        // means the origin of a repository in THIS session, not a remote name
+        // that matches anywhere — expanding it keeps `url` a single repository
+        // identity, which is the property #215 rests on, while letting the rule
+        // reach the named roots the user put in scope (#424).
+        let mut seen: Vec<String> = Vec::new();
+        for dir in repos {
+            let d = dir.to_string_lossy().into_owned();
+            let Some(url) = resolve_remote_url(real_git, &["-C", d.as_str()], name) else {
+                continue;
+            };
+            if seen.contains(&url) {
+                continue;
             }
-            rule
-        })
-        .collect()
+            seen.push(url.clone());
+            let mut pinned = rule.clone();
+            pinned.url = Some(url);
+            out.push(pinned);
+        }
+        // Unresolvable in every repository: keep the unpinned rule so it still
+        // authorizes nothing AND the launch warning still finds it.
+        if seen.is_empty() {
+            out.push(rule.clone());
+        }
+    }
+    out
 }
 
 /// Check if a push matches any allow_push exception rule.
@@ -3860,7 +4085,14 @@ pub fn generate_git_wrapper_script(
     };
     // The launch-time repository facts, baked in exactly like the gh guard's
     // `--repo-scope`. Absent when nothing could be captured, which fails closed.
-    let repo_facts_flag = if repo_facts.default_branches.is_empty() {
+    // Baked whenever there is anything to bake. It used to be gated on
+    // `default_branches` alone, which is now too narrow: the identity of the
+    // repositories in scope is itself a fact the gate needs (#424), and a
+    // repository with no recorded `refs/remotes/*/HEAD` still has one.
+    let repo_facts_flag = if repo_facts.default_branches.is_empty()
+        && repo_facts.named.is_empty()
+        && repo_facts.git_common_dir.is_empty()
+    {
         String::new()
     } else {
         let json = serde_json::to_string(repo_facts).unwrap_or_default();
@@ -3887,6 +4119,46 @@ exec {cplt_escaped} git-gate --real-git {git_escaped} {mode_flag} {prevent_push_
 mod tests {
     use super::*;
 
+    /// One object, three renderings: the launch prints the block form, warn
+    /// mode the same body under a label that does not say BLOCKED, and the
+    /// agent-addressed lines close both. Nothing here is derived from text.
+    #[test]
+    fn a_refusal_renders_from_its_fields() {
+        let refusal = Refusal {
+            headline: "'gh pr merge' is not allowed.".to_string(),
+            guidance: "Reason: needs a human.\nAsk for a review instead.".to_string(),
+            agent_note: &[RESTRICTED, NOTE],
+        };
+        assert_eq!(
+            refusal.to_string(),
+            "⚠️ BLOCKED by sandbox: 'gh pr merge' is not allowed.\n\
+             Reason: needs a human.\n\
+             Ask for a review instead.\n\
+             This operation is restricted by the cplt sandbox environment.\n\
+             Please make a note of this for the human operator and continue with your remaining work."
+        );
+        let warned = refusal.warning();
+        assert!(
+            !warned.contains("BLOCKED"),
+            "warn mode must not tell the user the command was blocked: {warned}"
+        );
+        assert!(warned.starts_with("⚠️  WARNING (would block): 'gh pr merge' is not allowed.\n"));
+        assert!(
+            warned.ends_with(NOTE),
+            "the body must survive under the other label: {warned}"
+        );
+        // No guidance: the agent lines follow the headline directly, with no
+        // blank line where the guidance would have been.
+        let bare = Refusal {
+            guidance: String::new(),
+            ..refusal
+        };
+        assert_eq!(
+            bare.to_string(),
+            format!("{}\n{RESTRICTED}\n{NOTE}", bare.banner_line())
+        );
+    }
+
     /// Test shim: the single-repository scope these cases were written for.
     fn in_scope(cmd: &ParsedCommand, repo: &str, invocation_repo: Option<&str>) -> bool {
         is_repo_in_scope(cmd, &[repo.to_string()], invocation_repo).is_some()
@@ -3904,7 +4176,7 @@ mod tests {
         protect_default_branch_only: bool,
         allow_push_rules: &[crate::config::ResolvedPushRule],
         real_git: Option<&Path>,
-    ) -> Result<(), String> {
+    ) -> Result<(), Refusal> {
         let dir = args
             .iter()
             .position(|a| *a == "-C")
@@ -4884,7 +5156,8 @@ mod tests {
 
         // The reported bypass, both spellings of the injection.
         let err = force_only(&["-c", "alias.p=push --force", "p", "origin", "feature"])
-            .expect_err("-c alias.* must be refused under force-push-only");
+            .expect_err("-c alias.* must be refused under force-push-only")
+            .to_string();
         assert!(
             err.contains("is not allowed while push prevention is active"),
             "{err}"
@@ -4913,7 +5186,8 @@ mod tests {
         // The alias's landing pad: an unrecognized subcommand is what git would
         // expand, so it is refused rather than approved on the way past.
         let err = force_only(&["p", "origin", "feature"])
-            .expect_err("an unknown subcommand must be refused under force-push-only");
+            .expect_err("an unknown subcommand must be refused under force-push-only")
+            .to_string();
         assert!(err.contains("is not a recognized subcommand"), "{err}");
 
         // Abbreviated and bundled force spellings. `unbindable_push_option` is
@@ -5183,7 +5457,7 @@ mod tests {
     // ── protect_default_branch_only tests ──
 
     /// `gate_git` for a push inside `repo`, under `protect_default_branch_only`.
-    fn gate_push_in(git: &Path, repo: &str, push_args: &[&str]) -> Result<(), String> {
+    fn gate_push_in(git: &Path, repo: &str, push_args: &[&str]) -> Result<(), Refusal> {
         let mut args = vec!["-C", repo];
         args.extend_from_slice(push_args);
         gate_git_t(&args, true, true, true, &[], Some(git))
@@ -5274,7 +5548,8 @@ mod tests {
         let git = which_git().unwrap();
         let dir = repo.to_string_lossy().into_owned();
         let msg = gate_push_in(&git, &dir, &["push", "origin", "main"])
-            .expect_err("a push to the default branch must be refused");
+            .expect_err("a push to the default branch must be refused")
+            .to_string();
         assert!(msg.contains("'main' is the protected branch"), "{msg}");
         assert!(msg.contains("git push origin <branch>"), "{msg}");
         // The hint is wrapped in source with `\` continuations. Without them the
@@ -5816,7 +6091,7 @@ mod tests {
                 url: None,
             },
         ];
-        let resolved = resolve_push_rule_urls(&git, &repo, &rules);
+        let resolved = resolve_push_rule_urls(&git, &[repo.as_path()], &rules);
         assert_eq!(resolved[0].url.as_deref(), Some("github.com/navikt/cplt"));
         assert_eq!(resolved[1].url, None);
     }
@@ -5854,7 +6129,7 @@ mod tests {
             force: false,
             url: None,
         }];
-        let resolved = resolve_push_rule_urls(&git, &repo, &rules);
+        let resolved = resolve_push_rule_urls(&git, &[repo.as_path()], &rules);
         assert_eq!(
             resolved[0].url.as_deref(),
             Some("github.com/evil/elsewhere"),
@@ -7000,7 +7275,8 @@ mod tests {
             &["symbolic-ref", "-z", "v", "refs/remotes/origin/HEAD"][..],
         ] {
             let err = gate_git(args, true, true, false, &[], None, &RepoFacts::default())
-                .expect_err("writing the remote HEAD symref retargets the guard next launch");
+                .expect_err("writing the remote HEAD symref retargets the guard next launch")
+                .to_string();
             assert!(err.contains("refs/remotes/<remote>/HEAD"), "got: {err}");
         }
         // The read form must keep working: git internals and the launch-time
@@ -7055,7 +7331,8 @@ mod tests {
             &["remote", "-v", "set-head", "origin", "-d"][..],
         ] {
             let err = gate_git(args, true, true, false, &[], None, &RepoFacts::default())
-                .expect_err("set-head rewrites the recorded default branch");
+                .expect_err("set-head rewrites the recorded default branch")
+                .to_string();
             assert!(err.contains("set-head"), "got: {err}");
         }
         // Only while a push guard is active, and only `set-head`.
@@ -7566,10 +7843,333 @@ mod tests {
             Some(&git),
             &facts,
         )
-        .expect_err("no baked default branch must refuse, not fall back to allowing");
+        .expect_err("no baked default branch must refuse, not fall back to allowing")
+        .to_string();
         assert!(
             err.contains("could not be determined when this session started"),
             "the refusal must name the missing launch-time fact, got: {err}"
+        );
+    }
+
+    /// A push inside a `--repo-dir` root is judged by THAT repository's default
+    /// branch, not the launch repository's.
+    ///
+    /// Before the named roots' facts were baked, a named root had no baked
+    /// answer at all, so every push in one failed closed with a refusal that
+    /// talked about the launch repository. The right direction for the wrong
+    /// reason, and unusable: the feature exists so the agent can work in that
+    /// repository.
+    #[test]
+    fn a_push_in_a_named_root_is_judged_by_its_own_default_branch() {
+        let Some((_tmp, launch)) =
+            scratch_repo_with_default("main", "https://github.com/o/launch.git", "main")
+        else {
+            return; // no git available
+        };
+        let Some((_tmp2, named)) =
+            scratch_repo_with_default("trunk", "https://github.com/o/named.git", "trunk")
+        else {
+            return;
+        };
+        let git = which_git().unwrap();
+        make_branches(&git, &named, &["feature/x"]);
+
+        let mut facts = capture_repo_facts(&git, &launch);
+        facts.named = vec![capture_repo_facts(&git, &named)];
+        let dir = named.to_string_lossy().into_owned();
+
+        // `trunk` is the named repository's protected branch, and the launch
+        // repository has no branch by that name — so blocking it can only come
+        // from the named root's own facts.
+        gate_git(
+            &["-C", dir.as_str(), "push", "origin", "trunk"],
+            true,
+            true,
+            true,
+            &[],
+            Some(&git),
+            &facts,
+        )
+        .expect_err("the named repository's own default branch must be protected");
+
+        // And a feature branch there is allowed, which is what fails when the
+        // named root has no baked facts: no default branch, nothing proven to
+        // be a feature branch, refuse.
+        gate_git(
+            &["-C", dir.as_str(), "push", "origin", "feature/x"],
+            true,
+            true,
+            true,
+            &[],
+            Some(&git),
+            &facts,
+        )
+        .expect("a feature branch in the named repository is allowed");
+
+        // Falsifiable by construction: drop the named facts and the same push
+        // is refused.
+        let launch_only = RepoFacts {
+            named: Vec::new(),
+            ..facts.clone()
+        };
+        gate_git(
+            &["-C", dir.as_str(), "push", "origin", "feature/x"],
+            true,
+            true,
+            true,
+            &[],
+            Some(&git),
+            &launch_only,
+        )
+        .expect_err("without the named root's facts there is no yardstick, so it fails closed");
+    }
+
+    /// A named root the guard could not identify must not make the scope count
+    /// as known.
+    ///
+    /// `scope_known` gated the #424 in-scope requirement, and read
+    /// `!named.is_empty()`. A root whose common dir could not be captured is a
+    /// member nothing can ever match, so a session with only such roots and no
+    /// launch-repository identity refused every `allow_push` while the launch
+    /// warning said the rules had fallen back to matching by URL alone. The
+    /// operator was told one thing and got another.
+    #[test]
+    fn an_unidentifiable_named_root_does_not_count_as_a_known_scope() {
+        let Some((_tmp, repo)) =
+            scratch_repo_with_default("main", "https://github.com/o/o.git", "main")
+        else {
+            return; // no git available
+        };
+        let git = which_git().unwrap();
+        make_branches(&git, &repo, &["agent/x"]);
+        let rules = resolve_push_rule_urls(
+            &git,
+            &[repo.as_path()],
+            &[crate::config::ResolvedPushRule {
+                remote: Some("origin".to_string()),
+                branches: vec!["agent/*".to_string()],
+                force: false,
+                url: None,
+            }],
+        );
+        assert!(rules.iter().any(|r| r.url.is_some()), "the rule must pin");
+
+        // Nothing identified: no launch common dir, and one named member whose
+        // own capture failed. That is the state the launch warns about, and the
+        // gate must agree with the warning.
+        let facts = RepoFacts {
+            named: vec![RepoFacts::default()],
+            ..RepoFacts::default()
+        };
+        let dir = repo.to_string_lossy().into_owned();
+        gate_git(
+            &["-C", dir.as_str(), "push", "origin", "agent/x"],
+            true,
+            true,
+            false,
+            &rules,
+            Some(&git),
+            &facts,
+        )
+        .expect("with nothing identified the rule falls back to URL identity, as the launch says");
+    }
+
+    /// A raw API write must be told about its own key, not just the blanket
+    /// escape hatch.
+    ///
+    /// A field session hit this and worked around it with
+    /// `gh_guard.mode = "warn"`, which also drops the repository scope check.
+    /// The refusal named only the escape hatch, so that is what the agent
+    /// relayed. `allow_api_write` opens writes to repositories in scope and
+    /// nothing else.
+    #[test]
+    fn a_raw_api_write_refusal_names_allow_api_write() {
+        let policy = GatePolicy {
+            mode: crate::config::EnforcementMode::Block,
+            scope_check: true,
+            block_auth_token: true,
+            unknown_command: UnknownCommandDecision::Block,
+            allow_api_write: false,
+        };
+        let scope = || Ok(vec!["o/r".to_string()]);
+        let err = gate_with_scope_resolver(
+            &[
+                "api",
+                "-X",
+                "POST",
+                "repos/o/r/pulls/1/comments",
+                "-f",
+                "body=x",
+            ],
+            &policy,
+            scope,
+            None,
+        )
+        .expect_err("raw API writes are off by default")
+        .to_string();
+        assert!(
+            err.contains("gh_guard.allow_api_write"),
+            "the narrow key must be named: {err}"
+        );
+        assert!(
+            err.contains("gh pr comment"),
+            "the supported route must be named too: {err}"
+        );
+        // A read must not carry the write advice.
+        assert!(
+            gate_with_scope_resolver(
+                &["api", "repos/o/r/pulls/1"],
+                &policy,
+                || Ok(vec!["o/r".to_string()]),
+                None,
+            )
+            .is_ok(),
+            "a GET is scope-checked, not refused"
+        );
+    }
+
+    /// With several repositories in scope, "not allowed" without a subject
+    /// leaves an agent unable to tell "wrong repository" from "no rule
+    /// matched". The gh side has named the target since #230; the push side
+    /// did not.
+    #[test]
+    fn a_push_refusal_names_the_repository_when_there_is_a_choice() {
+        let Some((_tmp, launch)) =
+            scratch_repo_with_default("main", "https://github.com/o/launch.git", "main")
+        else {
+            return; // no git available
+        };
+        let Some((_tmp2, named)) =
+            scratch_repo_with_default("main", "https://github.com/o/named.git", "main")
+        else {
+            return;
+        };
+        let git = which_git().unwrap();
+        let dir = named.to_string_lossy().into_owned();
+
+        // One repository in scope, pushing in it: nothing to disambiguate, so
+        // the headline stays the shared one rather than carrying a path into
+        // every refusal.
+        let alone = capture_repo_facts(&git, &launch);
+        let launch_dir = launch.to_string_lossy().into_owned();
+        let err = gate_git(
+            &["-C", launch_dir.as_str(), "push", "origin", "main"],
+            true,
+            true,
+            false,
+            &[],
+            Some(&git),
+            &alone,
+        )
+        .expect_err("push prevention refuses")
+        .to_string();
+        assert!(
+            err.contains("'git push' is not allowed"),
+            "a single-repository session needs no subject: {err}"
+        );
+
+        // Pushing somewhere the session was never given, with one repository in
+        // scope: the subject is what makes that legible at all.
+        let err = gate_git(
+            &["-C", dir.as_str(), "push", "origin", "main"],
+            true,
+            true,
+            false,
+            &[],
+            Some(&git),
+            &alone,
+        )
+        .expect_err("push prevention refuses")
+        .to_string();
+        assert!(
+            err.contains("does not have in scope"),
+            "an out-of-scope push must say so: {err}"
+        );
+
+        // Two in scope, pushing in the named one: say which.
+        let mut facts = alone.clone();
+        facts.named = vec![capture_repo_facts(&git, &named)];
+        let err = gate_git(
+            &["-C", dir.as_str(), "push", "origin", "main"],
+            true,
+            true,
+            false,
+            &[],
+            Some(&git),
+            &facts,
+        )
+        .expect_err("push prevention refuses")
+        .to_string();
+        assert!(
+            err.contains(&facts.named[0].project_dir),
+            "the refusal must name the targeted repository: {err}"
+        );
+    }
+
+    /// #424: an allow_push rule carries launch/named-root identity. The
+    /// destination URL must be pinned AND the push must run in a repository the
+    /// session has in scope, so a rule written for this project cannot
+    /// authorize a push from a clone made underneath it.
+    #[test]
+    fn an_allow_push_rule_does_not_reach_a_repository_outside_the_scope() {
+        let Some((_tmp, launch)) =
+            scratch_repo_with_default("main", "https://github.com/o/launch.git", "main")
+        else {
+            return; // no git available
+        };
+        let Some((_tmp2, outside)) =
+            scratch_repo_with_default("main", "https://github.com/o/launch.git", "main")
+        else {
+            return;
+        };
+        let git = which_git().unwrap();
+        make_branches(&git, &outside, &["agent/x"]);
+        make_branches(&git, &launch, &["agent/x"]);
+        let facts = capture_repo_facts(&git, &launch);
+
+        // The same origin URL, so the URL pin alone would authorize both.
+        let rules = resolve_push_rule_urls(
+            &git,
+            &[launch.as_path()],
+            &[crate::config::ResolvedPushRule {
+                remote: Some("origin".to_string()),
+                branches: vec!["agent/*".to_string()],
+                force: false,
+                url: None,
+            }],
+        );
+        assert!(
+            rules.iter().any(|r| r.url.is_some()),
+            "test premise: the rule must pin"
+        );
+
+        let launch_dir = launch.to_string_lossy().into_owned();
+        gate_git(
+            &["-C", launch_dir.as_str(), "push", "origin", "agent/x"],
+            true,
+            true,
+            false,
+            &rules,
+            Some(&git),
+            &facts,
+        )
+        .expect("the launch repository is in scope");
+
+        let outside_dir = outside.to_string_lossy().into_owned();
+        let err = gate_git(
+            &["-C", outside_dir.as_str(), "push", "origin", "agent/x"],
+            true,
+            true,
+            false,
+            &rules,
+            Some(&git),
+            &facts,
+        )
+        .expect_err("a repository outside the scope is not authorized by the rule")
+        .to_string();
+        assert!(
+            err.contains("does not run in a repository this session has in scope"),
+            "the refusal must say which half failed, got: {err}"
         );
     }
 
@@ -7655,7 +8255,8 @@ mod tests {
             Some(&git),
             &facts,
         )
-        .expect_err("another repository has no baked default branch");
+        .expect_err("another repository has no baked default branch")
+        .to_string();
         assert!(
             err.contains("redirects git elsewhere"),
             "the refusal must say the facts do not cover that repository, got: {err}"

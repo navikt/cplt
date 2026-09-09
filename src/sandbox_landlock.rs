@@ -402,17 +402,29 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     let mut fs_rules = Vec::new();
     let home = config.home_dir;
 
-    // ── Project directory: full access ──
-    fs_rules.push(FsRule {
-        path: config.project_dir.to_path_buf(),
-        access: FsAccess {
-            read: true,
-            write: true,
-            execute: true,
-            ioctl: false,
-            create_dirs: false,
-        },
-    });
+    // ── Project directory and every named repository: full access ──
+    //
+    // A named root gets exactly the project's grant, which is what separates it
+    // from an `allow.write` tree: those are read+write and deliberately NOT
+    // executable (#319), so a sibling granted that way can be edited but its
+    // own build cannot run. A repository the user named is a place to work.
+    //
+    // A nested root is redundant here — it already sits under the project rule
+    // — and harmless: Landlock unions rules, and the access is identical.
+    for root in
+        std::iter::once(config.project_dir).chain(config.named_roots.iter().map(PathBuf::as_path))
+    {
+        fs_rules.push(FsRule {
+            path: root.to_path_buf(),
+            access: FsAccess {
+                read: true,
+                write: true,
+                execute: true,
+                ioctl: false,
+                create_dirs: false,
+            },
+        });
+    }
 
     // ── System read paths ──
     for &p in LINUX_SYSTEM_READ_PATHS {
@@ -592,8 +604,17 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         });
     }
 
-    // ── Git worktree common dir: read + write ──
-    if let Some(p) = config.git_common_dir {
+    // ── Git worktree common dirs: read + write ──
+    //
+    // The project's own, plus every named root whose repository data does not
+    // live at `<root>/.git`. Without the second set, `git` inside a named
+    // linked worktree fails with `not a git repository`: the tree is granted
+    // and the directory holding its objects and refs is not.
+    for p in config
+        .git_common_dir
+        .into_iter()
+        .chain(config.named_root_git_dirs.iter().map(PathBuf::as_path))
+    {
         fs_rules.push(FsRule {
             path: p.to_path_buf(),
             access: FsAccess {
@@ -2302,6 +2323,8 @@ mod tests {
             extra_exec: &[],
             extra_socket: &[],
             extra_deny: &[],
+            named_roots: &[],
+            named_root_git_dirs: &[],
             existing_home_tool_dirs: None,
             existing_app_dirs: None,
             extra_ports: &[],

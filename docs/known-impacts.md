@@ -2,9 +2,51 @@
 
 The sandbox is kernel-enforced, so **all restrictions apply to every process spawned inside it**: dev servers, test runners, build tools, package managers. That is deliberate, since a sandboxed agent could otherwise escape by spawning a child process. It does affect some workflows.
 
+## Branch tracking is silently dropped
+
+**macOS only.** `.git/config` is write-denied there (it is a `core.hooksPath`
+and `url.*.insteadOf` vector). Landlock cannot deny a file inside a writable
+directory, so on Linux the file stays writable and branch tracking is recorded
+normally — the whole of this section applies to macOS sessions.
+
+The commands that record branch tracking write to that file, and git treats the
+failure as non-fatal: it prints the error, prints a success line that is
+**false**, and exits 0.
+
+```
+error: could not write config file .git/config: Operation not permitted
+branch 'feat' set up to track 'origin/main'.
+```
+
+An agent reading the summary line, or checking the exit code, is told the
+tracking was recorded. It was not.
+
+| Command | What happens |
+| --- | --- |
+| `git push -u origin <branch>` | Push succeeds, upstream **not** recorded, exit 0 |
+| `git checkout -b <branch> origin/<base>` | Branch created, tracking **not** recorded, exit 0 |
+| `git branch --set-upstream-to=origin/<base>` | Records nothing, exit 0 |
+| `git config user.name <x>` | Fails loudly, exit 4 |
+| `git switch -c <branch>` (no tracking) | Clean, nothing to record |
+
+**The shape that works**, and what to tell an agent to do: push with an explicit
+refspec and open the PR with an explicit head, so nothing needs local config.
+
+```bash
+git push origin HEAD:my-branch
+gh pr create -R <owner>/<repo> --head my-branch
+```
+
+On macOS this applies to every writable root, the launch repository included,
+not only to repositories named with `--repo-dir`. Tracked in
+[#402](https://github.com/navikt/cplt/issues/402), which also covers whether
+the guard should intercept these forms and fail loudly instead.
+
 ## `.env` file blocking
 
-`.env*`, `.pem`, `.key`, `.p12`, `.pfx`, `.jks` files in the project directory are **blocked from reading** by default. This stops a rogue agent exfiltrating secrets, but it has side effects:
+`.env*`, `.pem`, `.key`, `.p12`, `.pfx`, `.jks` files are **blocked from reading** by default. This stops a rogue agent exfiltrating secrets, but it has side effects.
+
+**The rule is a pattern on the file name, not a location**, so it applies everywhere the sandbox can reach. The two extracted dependency stores are carved back out for *reading* (#477), because a `.env` there is package content; everywhere else the name is enough to deny it:
 
 | Operation                      | Impact     | Why                                                                   |
 | ------------------------------ | ---------- | --------------------------------------------------------------------- |
@@ -16,6 +58,8 @@ The sandbox is kernel-enforced, so **all restrictions apply to every process spa
 | TLS dev servers (`.pem` certs) | ⚠️ Blocked  | Local HTTPS certs in `.pem`/`.key` files can't be read                |
 | `.env.example`                 | ⚠️ Blocked  | Matches the `.env.*` pattern; use `--allow-env-files` if needed       |
 | Writing `.env` files           | ✅ Works    | Only read is denied; Copilot can create `.env` from templates         |
+| `go mod verify`, `cargo` over an extracted crate | ✅ Works | Read is re-allowed under `~/go/pkg/mod` and `~/.cargo/registry`: a `.env` there is a library's test fixture (`gotenv` ships one), not your secret, and the content is checksum-verified and came from a registry. Write stays denied |
+| A `.env` in another dependency store | ⚠️ Blocked | The carve-out is a short explicit list, not a heuristic — only trees that are content-addressed, verified and registry-sourced |
 
 **Fix:**
 
@@ -385,11 +429,11 @@ Some git operations are blocked to prevent persistence attacks that would surviv
 | `git checkout/merge/rebase/branch` | ✅ Works     | Branch operations work normally                                   |
 | `git fetch/pull/push` (HTTPS)      | ✅ Works, except a default-branch push | Port 443 allowed, `gh auth git-credential` provides credentials. The git guard refuses pushes to `main`/`master` and every force push, see [Git workflow](#git-workflow-commit--push) |
 | `git fetch/pull/push` (SSH)        | ❌ Blocked on macOS | SSH agent socket denied, use HTTPS. On Linux only `SSH_AUTH_SOCK` is withheld |
-| `git config` (local)               | ❌ Blocked on macOS | `.git/config` is write-protected on macOS, which prevents `url.*.insteadOf` hijacking. Applies to the project, to every `allow.write` grant, and to any repository nested under one. Landlock cannot deny a file inside a writable root, so it stays writable on Linux |
+| `git config` (local)               | ❌ Blocked on macOS | `.git/config` is write-protected on macOS, which prevents `url.*.insteadOf` hijacking. Applies to the project, to every named repository (`--repo-dir`), to every `allow.write` grant, and to any repository nested under one. Landlock cannot deny a file inside a writable root, so it stays writable on Linux |
 | `git config --global`              | ❌ Blocked   | Git config and `~/.gitignore_global` are read-only                 |
 | `git remote set-url`               | ❌ Blocked on macOS | Writes to `.git/config`, which stays writable on Linux |
 | `git submodule add`                | ❌ Blocked on macOS | `.gitmodules` is write-protected on macOS. Writable on Linux, same Landlock limit (supply chain vector) |
-| Creating git hooks                 | ❌ Blocked   | `.git/hooks/` is write-protected in the project, in every `allow.write` grant, and in any repository nested under one, hooks run unsandboxed. On Linux this needs the Bubblewrap layer, see [security.md](security.md) |
+| Creating git hooks                 | ❌ Blocked   | `.git/hooks/` is write-protected in the project, in every named repository (`--repo-dir`), in every `allow.write` grant, and in any repository nested under one, hooks run unsandboxed. On Linux this needs the Bubblewrap layer, see [security.md](security.md) |
 | `git init` / `git clone`           | ❌ Blocked on macOS | Both write `.git/config` and `.git/hooks/`, which are protected anywhere under a writable root. Clone outside the sandbox, then point cplt at the result. Writable on Linux, same Landlock limit |
 | `mv` / `rm -rf` of `.git`, `.github`, `.agents`, `.claude`, `.opencode`, `.pi` | ❌ Blocked   | A path deny only holds while the path still denotes what it protects. Moving one of these directories aside, writing `hooks/`, `plugins/` or `settings.json` under the new name and moving it back planted a file that runs on the host, unsandboxed, in a later session (GHSA-39xf-9j26-f82m). The directories themselves stay writable — only renaming and removing the directory is refused. macOS uses `file-write-unlink`; on Linux this needs the Bubblewrap layer, which makes each a mountpoint so `rename`/`rmdir` return `EBUSY` |
 | `mv` / `rm -rf` of `~/Library/Caches/copilot`, `~/.cache/opencode` | ❌ Blocked   | Same shape, one tree over: both hold binaries the host executes later (`copilot/pkg`, `opencode/bin`), and both sit in a writable cache, so a rename would let an agent swap the contents out from under the write-deny that protects them (GHSA-8qmv-wxp3-526v, GHSA-7mcc-xg5v-hv8v). The caches stay fully writable — managed binaries still download, extract and update — only the directory name is pinned. macOS uses `file-write-unlink`; on Linux this needs the Bubblewrap layer, which makes each a mountpoint so `rename`/`rmdir` return `EBUSY` |

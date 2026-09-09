@@ -98,36 +98,102 @@ A flag *adds to* the persisted set rather than replacing it, so a one-off
 
 ### What naming a repository does, and what it does not
 
-**It declares identity, not access.** A nested repository already sits inside
-the project directory, so the agent could always read and write those files —
-the project directory is granted as one subtree. What `--repo-dir` adds is that
-`gh` may target it: `gh pr create -R navikt/sykepenger-model` is allowed, the
-gh scope set includes it, and `GH_REPO` pinning accounts for it.
+**For a repository nested inside the project, it declares identity, not
+access.** A nested checkout already sits inside the project directory, so the
+agent could always read, write and build there — the project directory is
+granted as one subtree. What `--repo-dir` adds is that `gh` may target it:
+`gh pr create -R navikt/sykepenger-model` is allowed, the gh scope set includes
+it, and `GH_REPO` pinning accounts for it.
 
-The consequence is the rule that surprises people most:
+It also decides what the post-session audit measures. Each named repository is
+audited on its own lines, against its own baseline:
 
-**Only repositories nested inside the project directory can be named.** A
-sibling checkout — `~/src/spleis` and `~/src/sykepenger-model` side by side —
-is refused, because naming it would be a real path grant and not just an
-identity. What works today:
-
-```bash
-# Edit-only access to the sibling: files yes, gh identity no
-cplt --allow-write ~/src/sykepenger-model exec -- ./gradlew build
+```
+[cplt] Session ended (exit 0, 41s)
+[cplt] Project changes: 2 files (+18 -3)
+[cplt]   src/main.rs  +18 -3
+[cplt] Changes in ~/src/spleis/libs/sykepenger-model: 1 file (+4 -0)
+[cplt]   src/Vedtaksperiode.kt  +4 -0
 ```
 
-The agent can then build against and edit the sibling, but `gh` still refuses to
-target it — which is usually what you want, since the pull request belongs to the
-repository you launched in.
+That report is the reason to name a repository even when the agent could
+already write to it. A checkout keeps its own git history, so the launch
+repository's `git status` sees it as a single entry — or, when it is
+gitignored, as nothing at all. Before it had a report of its own, a session
+that edited only the nested repository printed `no project file changes`.
+
+**For a repository beside the launch one, it declares access as well.** A
+sibling checkout — `~/src/spleis` and `~/src/sykepenger-model` side by side —
+is not reachable at all unless you name it, and naming it grants read, write
+and execute on that tree:
+
+```bash
+cd ~/src/spleis
+cplt --repo-dir ~/src/sykepenger-model
+```
+
+The startup summary distinguishes the two cases, because they are the same row
+otherwise:
+
+```
+ Repositories:
+   navikt/spleis            ~/src/spleis                 launch repository
+   navikt/sykepenger-model  ~/src/sykepenger-model       --repo-dir   new read/write/exec tree
+```
+
+Execute is the part that needed a feature. `--allow-write` has always given a
+sibling read and write, but a write grant is deliberately **not** executable —
+a tree that is both is where an agent drops a binary and runs it. So this works
+for editing and fails for building:
+
+```bash
+# Edit-only: files yes, build no, gh identity no
+cplt --allow-write ~/src/sykepenger-model exec -- $EDITOR
+```
+
+Use `--allow-write` when the sibling only needs to be edited, and `--repo-dir`
+when its own build, tests or pull requests have to run.
+
+If you have `allow.write` over a directory that holds checkouts, cplt says so at
+launch and names the repositories it found. That grant looks like "let the agent
+work in these" and is not: a script there fails with `bad interpreter: Operation
+not permitted`, which names neither cplt nor the grant, and reads like a problem
+with the project. Naming the repositories is the fix. A named root is a
+second writable-and-executable tree, with the same protected paths as the
+project: `.git/hooks`, `.git/config`, `.cplt.toml` and the rest stay unwritable
+in it, so a hook cannot be planted to run outside the sandbox later.
+
+**The git guard follows the set too.** A `git push` inside a named repository is
+judged by *that* repository's default branch, captured at launch — so a
+repository whose default branch is `trunk` protects `trunk`, not the launch
+repository's `main`. An `allow_push` rule naming a remote is pinned to that
+remote's URL in every repository in scope, and it authorizes a push only when
+the push also runs in one of them: a rule written for this session cannot
+authorize a push from a clone the agent made underneath the project, whose
+`origin` you were never thinking about
+([#424](https://github.com/navikt/cplt/issues/424)).
+
+**A named repository's `[deny]` applies too.** `[deny]` can only tighten, so it
+needs no approval, no trust entry and no content hash — there is no grant a
+second repository could open with it. Paths anchor to the repository that wrote
+them, so each repository's deny applies inside itself. `deny.env` is the
+exception and is process-wide: a named repository stripping a variable strips it
+for the session, and cplt says so at launch.
+
+`[propose]` is launch-repository only. A named repository that proposes
+something gets one line saying it was not consulted; approving proposals per
+repository is [#206](https://github.com/navikt/cplt/issues/206)'s decision to
+make first. A `.cplt.toml` in a named repository that cannot be parsed **stops
+the launch** rather than being skipped: the file exists, so a restriction its
+owner wrote is missing, and a missing restriction is not a warning to scroll
+past.
 
 Launching from the parent (`--project-dir ~/src`) grants the whole tree and is a
-much wider grant than one repository. It also does **not** let you name the two
-checkouts: `--repo-dir` requires the launch directory to be a git repository
+much wider grant than naming two repositories. It also does **not** let you name
+the checkouts: `--repo-dir` requires the launch directory to be a git repository
 toplevel, and a plain directory holding repositories is not one, so the
 combination is refused rather than quietly granting identity to everything under
 it.
-
-Sibling support proper is [#344](https://github.com/navikt/cplt/issues/344).
 
 ### Which layer it can be set in
 
@@ -150,7 +216,7 @@ old and the tree it names is agent-writable. An entry is refused — the launch
 stops, it is not silently dropped — when it:
 
 - is not a git repository toplevel (a subdirectory of one is not a repository),
-- is not nested inside the project directory,
+- contains the launch repository (launch from it and name the inner one),
 - has a symlink as its **final** component (a symlink planted there last session
   would redirect the identity this launch pins; a symlinked *ancestor* is fine,
   it is just the path you took to get there),
@@ -164,8 +230,9 @@ Refusals name the source, so a persisted root says which file to fix rather
 than blaming a flag nobody passed:
 
 ```
-[cplt] sandbox.repo_dirs entry ~/src/spleis/libs/model in
-       ~/.config/cplt/local/3291….toml is outside the project directory
+[cplt] sandbox.repo_dirs entry ~/src/spleis/libs in
+       ~/.config/cplt/local/3291….toml is not a git repository; for a plain
+       directory use `--allow-write`.
 ```
 
 ### Everyday recipes
@@ -268,6 +335,8 @@ Each toggle resolves in this order: explicit CLI flag, then explicit config valu
 
 Project-specific sandbox permissions belong in `.cplt.toml`, approved with `cplt trust`. That covers `sandbox.allow_jvm_attach`, `sandbox.allow_msbuild`, `sandbox.allow_docker`, `sandbox.allow_localhost_any`, and `allow.ports`. Machine-specific paths such as `allow.read ~/.gitconfig` go in `~/.config/cplt/config.toml`.
 
+`sandbox.pass_env` is the exception among the environment settings: a project can propose the variables its build needs (`NODE_ENV`, `TZ`, `SPRING_PROFILES_ACTIVE`), because it names them one at a time and a reviewer sees the list in the diff. The value still comes from whoever launches the agent, never from the file, and each developer approves once with `cplt trust`. `sandbox.inherit_env` stays refused — it passes the whole environment, so there is nothing for a reviewer to review.
+
 The settings below are machine-specific or local CLI preferences, so `.cplt.toml` does not support them at all. `cplt config set --repo <key>` rejects each one with an explanation. Set them globally instead.
 
 | Key | Why |
@@ -281,7 +350,6 @@ The settings below are machine-specific or local CLI preferences, so `.cplt.toml
 | `sandbox.brief` | local agent-context preference |
 | `sandbox.agents_md` | a repo must not be able to make cplt write into its own `AGENTS.md` |
 | `sandbox.use_bubblewrap` | depends on bwrap being installed on the machine |
-| `sandbox.pass_env` | machine-specific env passthrough |
 | `sandbox.audit` | local output preference, not project sandbox policy |
 | `sandbox.gradle_init` | writes to the machine's Gradle user home, not project policy |
 | `sandbox.inherit_env` | too dangerous for repo config, it would affect every team member |
@@ -346,14 +414,42 @@ For arrays of objects, multi-line values, and other complex configuration, edit 
 An agent inside the sandbox has no way of knowing it is sandboxed: it hits
 `EPERM`, assumes a bug, and retries. cplt can hand it the answer up front, in
 two layers. Both are off by default — cplt writing files that an agent then
-reads is a behaviour change, so you ask for it.
+reads is a behaviour change, so you ask for it. Running `cplt check` from
+outside the sandbox reports the same policy either way, and is what to reach
+for when you have not opted in.
 
-**`sandbox.brief` (default `false`)** — writes `CPLT_BRIEF.md` into the
-per-session scratch directory (the one `$TMPDIR` points at inside the sandbox).
-It is rendered from the resolved policy for *that* launch — network mode,
-`.env` handling, credential denies — and disappears with the scratch dir when
-the session ends. It never touches your project. Turn it on for one run with
-`--brief`, or for good with `cplt config set sandbox.brief true`.
+**`sandbox.brief` (default `false`)** — writes two files into the per-session
+scratch directory (the one `$TMPDIR` points at inside the sandbox):
+
+| File | For | Named by |
+| --- | --- | --- |
+| `CPLT_BRIEF.md` | the agent to read | `$CPLT_BRIEF` |
+| `CPLT_BRIEF.json` | a tool to parse | `$CPLT_BRIEF_JSON` |
+
+Both are rendered from the resolved policy for *that* launch — the repositories
+in scope, network mode, `.env` handling, credential denies — and disappear with
+the scratch dir when the session ends. Neither touches your project.
+
+The two environment variables are set only when the files exist, so an agent can
+test for `$CPLT_BRIEF` rather than guessing a path, and a variable never names a
+file that is not there. That means neither is set with `sandbox.brief = false`,
+and neither is set with `--no-scratch-dir` (or `sandbox.scratch_dir = false`)
+either: the brief lives in the scratch dir and nowhere else, so cplt warns and
+writes nothing.
+
+The JSON carries a little more than the prose: the `allow.read` / `allow.write`
+/ `allow.exec` path lists, the port numbers, and every repository in scope even
+for a single-repository session, where the prose omits the section because it
+would restate what the rest of the brief assumes. Both come from one captured
+set of facts, so they cannot describe different sessions.
+
+Turn it on for one run with `--brief`, or for good with
+`cplt config set sandbox.brief true`.
+
+There is nothing about the brief that only works for some projects, so if you
+want your agents to have it, turn it on in your global config. Turning it on is
+also what makes the `## Repositories` section reach the agent: the list of what
+a multi-repository session actually spans exists only here.
 
 **`sandbox.agents_md` (default `false`)** — additionally injects a managed
 block into `<project>/AGENTS.md`, creating the file if it does not exist. This

@@ -474,7 +474,11 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         section: "gh_guard",
         key: "inject_token",
         value_type: ConfigValueType::Bool,
-        dangerous: false,
+        // `config set` already refuses this without `--force` (see
+        // `security_confirmation`), so leaving it unmarked here meant the tool
+        // demanded a force-confirm to enable it and then displayed it as
+        // unremarkable. A user hit exactly that and asked why.
+        dangerous: true,
         default_display: "false",
         description: "Pre-extract GH_TOKEN before sandbox launch (only for Copilot agent).",
     },
@@ -490,7 +494,8 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         section: "gh_guard",
         key: "allow_api_write",
         value_type: ConfigValueType::Bool,
-        dangerous: false,
+        // Same disagreement, same fix.
+        dangerous: true,
         default_display: "false",
         description: "Allow 'gh api' write operations (POST/PATCH/PUT and input flags). Writes are scope-checked to the current repo. GraphQL is always blocked.",
     },

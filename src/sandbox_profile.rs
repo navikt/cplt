@@ -21,12 +21,12 @@ macro_rules! sbpl {
 
 use super::SandboxConfig;
 use super::policy::{
-    DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS, EXEC_IN_WRITABLE,
-    GPG_SIGNING_ALLOW_FILES, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected,
-    ResolvedToolDir, SENSITIVE_PROJECT_PATTERNS, SYSTEM_READ_FILES, TOOL_READ_DIRS,
-    XCODE_SELECT_LINK, active_tool_dirs, ancestor_alternation, app_dirs, escape_regex,
-    nested_alternation, path_bin_dirs, playwright_runtime_intent, rel_is_glob, rel_regex,
-    validate_playwright_socket_dir, validate_sbpl_path,
+    DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS,
+    DEPENDENCY_SOURCE_TREES, EXEC_IN_WRITABLE, GPG_SIGNING_ALLOW_FILES, PROTECTED_IN_GITDIR,
+    PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir, SENSITIVE_PROJECT_PATTERNS,
+    SYSTEM_READ_FILES, TOOL_READ_DIRS, XCODE_SELECT_LINK, active_tool_dirs, ancestor_alternation,
+    app_dirs, escape_regex, nested_alternation, path_bin_dirs, playwright_runtime_intent,
+    rel_is_glob, rel_regex, validate_playwright_socket_dir, validate_sbpl_path,
 };
 
 /// Device nodes a sandboxed process may open for writing, by exact path.
@@ -84,6 +84,18 @@ pub fn generate_profile_with_playwright_socket_dir(
     let mut sb = String::with_capacity(4096);
     let home = config.home_dir.to_string_lossy();
     let project = config.project_dir.to_string_lossy();
+    // The project directory plus every `--repo-dir` root: the trees that get a
+    // project-grade grant, and therefore the trees every per-root deny table
+    // has to cover. Order puts the project first so the profile reads the way
+    // it did before named roots existed.
+    let project_roots: Vec<String> = std::iter::once(project.clone().into_owned())
+        .chain(
+            config
+                .named_roots
+                .iter()
+                .map(|r| r.to_string_lossy().into_owned()),
+        )
+        .collect();
 
     // Detect Chromium browser runtime: the user has opted in to executing
     // Playwright's Chromium binaries from ~/Library/Caches/ via allow_cache_exec.
@@ -109,7 +121,7 @@ pub fn generate_profile_with_playwright_socket_dir(
 
     emit_header(&mut sb, &project);
     emit_process_rules(&mut sb);
-    emit_project_access(&mut sb, &project);
+    emit_project_access(&mut sb, &project_roots);
     emit_home_access(
         &mut sb,
         &home,
@@ -118,7 +130,7 @@ pub fn generate_profile_with_playwright_socket_dir(
         config.keychain_substitute.is_some(),
     );
     emit_git_hooks(&mut sb, config.git_hooks_path);
-    emit_git_worktree(&mut sb, config.git_common_dir);
+    emit_git_worktree(&mut sb, config.git_common_dir, config.named_root_git_dirs);
     emit_system_access(
         &mut sb,
         &home,
@@ -185,16 +197,18 @@ pub fn generate_profile_with_playwright_socket_dir(
     // would override the .env deny if emitted before it.
     emit_sensitive_project_denies(
         &mut sb,
-        &project,
+        &project_roots,
         config.extra_write,
         config.allow_env_files,
+        &home,
+        config.existing_home_tool_dirs,
     );
     // Same reason, and one more: the worktree common-dir allow is emitted early
     // (so DENIED_DOTFILES still wins over it), which would leave its denies
     // reopenable by any later allow if they were emitted alongside it.
     emit_git_persistence_denies(
         &mut sb,
-        &project,
+        &project_roots,
         config.extra_write,
         config.git_common_dir,
         extra_git_dirs,
@@ -221,7 +235,7 @@ pub fn generate_profile_with_playwright_socket_dir(
     emit_user_write_exec_denies(
         &mut sb,
         &home,
-        &project,
+        &project_roots,
         config.extra_write,
         config.scratch_dir,
     );
@@ -325,14 +339,25 @@ fn emit_process_rules(sb: &mut String) {
     sbpl!(sb);
 }
 
-fn emit_project_access(sb: &mut String, project: &str) {
-    // Project directory — full access
-    // file-map-executable needed for native Node addons in node_modules
-    // (e.g. @next/swc-*, sharp, better-sqlite3 loaded via dlopen)
+/// Full access on the project directory and on every repository the user named.
+///
+/// `file-map-executable` is needed for native Node addons in `node_modules`
+/// (`@next/swc-*`, `sharp`, `better-sqlite3`, all loaded via `dlopen`).
+/// `process-exec` is not emitted here: it is granted profile-wide by
+/// `emit_process_rules`, and `emit_user_write_exec_denies` carves these roots
+/// back out of the deny it lays over the `allow.write` trees.
+///
+/// A named root gets the project's grant rather than the `allow.write` one
+/// precisely because the latter is non-executable by design (#319): a sibling
+/// granted with `allow.write` can be edited but cannot run its own build. That
+/// is the capability `--repo-dir` adds for a repository outside the project.
+fn emit_project_access(sb: &mut String, roots: &[String]) {
     sbpl!(sb, ";; Project directory — full read/write");
-    sbpl!(sb, "(allow file-read* (subpath \"{project}\"))");
-    sbpl!(sb, "(allow file-write* (subpath \"{project}\"))");
-    sbpl!(sb, "(allow file-map-executable (subpath \"{project}\"))");
+    for root in roots {
+        sbpl!(sb, "(allow file-read* (subpath \"{root}\"))");
+        sbpl!(sb, "(allow file-write* (subpath \"{root}\"))");
+        sbpl!(sb, "(allow file-map-executable (subpath \"{root}\"))");
+    }
     sbpl!(sb);
 }
 
@@ -353,8 +378,8 @@ fn emit_project_access(sb: &mut String, project: &str) {
 /// covered by `emit_nested_gitdir_denies` instead (#247), which is a regex and
 /// therefore macOS only: on Linux that gap stays open outside bubblewrap, the
 /// same limitation already documented for the root case.
-fn writable_roots(project: &str, extra_write: &[PathBuf]) -> Vec<String> {
-    let mut roots = vec![project.to_string()];
+fn writable_roots(project_roots: &[String], extra_write: &[PathBuf]) -> Vec<String> {
+    let mut roots = project_roots.to_vec();
     for p in extra_write {
         let s = p.to_string_lossy().into_owned();
         if !roots.contains(&s) {
@@ -366,16 +391,18 @@ fn writable_roots(project: &str, extra_write: &[PathBuf]) -> Vec<String> {
 
 fn emit_sensitive_project_denies(
     sb: &mut String,
-    project: &str,
+    project_roots: &[String],
     extra_write: &[PathBuf],
     allow_env_files: bool,
+    home: &str,
+    tool_dirs: Option<&[ResolvedToolDir]>,
 ) {
     // All security-critical project denies are emitted LAST in the profile.
     // SBPL uses last-match-wins, so these must come after all user-configured
     // allows (e.g. `allow.write = ["~/Repos"]`) to guarantee they cannot be
     // overridden by broad parent-path allows.
 
-    let roots = writable_roots(project, extra_write);
+    let roots = writable_roots(project_roots, extra_write);
 
     // Paths inside every writable root that must stay unwritable. The list is
     // [`PROTECTED_IN_ROOT`]; this only chooses the SBPL shape for each entry.
@@ -438,11 +465,58 @@ fn emit_sensitive_project_denies(
         for pattern in SENSITIVE_PROJECT_PATTERNS {
             // SBPL regex matches against the full path, so we anchor to
             // any directory separator to avoid matching path components.
+            //
+            // Anchored to a separator and NOTHING ELSE: this is a global rule,
+            // not a project-scoped one, whatever the constant is called. It
+            // reaches `~/go/pkg/mod/.../gotenv@v1.6.0/.env` as readily as
+            // `<project>/.env`, which is why `go mod verify` fails in a session
+            // that never went near a secret. See the constant's docs.
             sbpl!(sb, "(deny file-read* (regex #\"/{pattern}\"))");
             sbpl!(sb, "(deny file-write* (regex #\"/{pattern}\"))");
         }
+        // Re-allow READ inside the extracted dependency stores, after the deny,
+        // because SBPL is last-match-wins. Write stays denied: nothing should be
+        // writing a `.env` into a module cache.
+        //
+        // These files are package content, not the user's secrets — `gotenv`
+        // ships a `.env` as a test fixture — and `go mod verify` hashes every
+        // file in the cache, so one unreadable fixture aborts the command
+        // (#477). Scoped to a short explicit list rather than a heuristic: the
+        // properties that make it safe (content-addressed, checksum-verified,
+        // from a registry) are ones only these trees have.
+        for tree in dependency_source_trees(home, tool_dirs) {
+            if validate_sbpl_path(Path::new(&tree)).is_err() {
+                continue;
+            }
+            let t = escape_regex(&tree);
+            for pattern in SENSITIVE_PROJECT_PATTERNS {
+                sbpl!(sb, "(allow file-read* (regex #\"^{t}/.*/{pattern}\"))");
+            }
+        }
         sbpl!(sb);
     }
+}
+
+/// Absolute paths of [`DEPENDENCY_SOURCE_TREES`], honouring a relocated
+/// `CARGO_HOME` / `GOPATH` when the host probe resolved one.
+fn dependency_source_trees(home: &str, tool_dirs: Option<&[ResolvedToolDir]>) -> Vec<String> {
+    DEPENDENCY_SOURCE_TREES
+        .iter()
+        .map(|(tool_dir, sub)| {
+            let base = tool_dirs
+                .and_then(|dirs| {
+                    dirs.iter()
+                        .find(|d| d.dir.path == *tool_dir)
+                        .map(|d| d.path.to_string_lossy().into_owned())
+                })
+                .unwrap_or_else(|| format!("{home}/{tool_dir}"));
+            if sub.is_empty() {
+                base
+            } else {
+                format!("{base}/{sub}")
+            }
+        })
+        .collect()
 }
 
 fn emit_home_access(
@@ -788,14 +862,28 @@ fn emit_git_hooks(sb: &mut String, git_hooks_path: Option<&Path>) {
 /// so denies placed here could be re-opened by a later user allow (a broad
 /// `allow.write = ["~/Repos"]` covering the main repo would have done exactly
 /// that).
-fn emit_git_worktree(sb: &mut String, git_common_dir: Option<&Path>) {
-    if let Some(common) = git_common_dir {
+/// Grant the shared git directories: the project's own worktree common dir,
+/// and the resolved gitdir of every named root that does not keep one at
+/// `<root>/.git`.
+///
+/// The second set is what makes a named linked worktree usable. Its tree is
+/// granted; without this its objects and refs are not, and `git` there fails
+/// with `not a git repository`.
+fn emit_git_worktree(sb: &mut String, git_common_dir: Option<&Path>, named: &[PathBuf]) {
+    let dirs: Vec<&Path> = git_common_dir
+        .into_iter()
+        .chain(named.iter().map(PathBuf::as_path))
+        .collect();
+    if dirs.is_empty() {
+        return;
+    }
+    sbpl!(sb, ";; Git worktree shared directories");
+    for common in dirs {
         let p = common.to_string_lossy();
-        sbpl!(sb, ";; Git worktree shared directory");
         sbpl!(sb, "(allow file-read* (subpath \"{p}\"))");
         sbpl!(sb, "(allow file-write* (subpath \"{p}\"))");
-        sbpl!(sb);
     }
+    sbpl!(sb);
 }
 
 /// Deny every path inside a git directory that names content git will later
@@ -958,12 +1046,12 @@ fn emit_host_persistence_denies(sb: &mut String, agent: Agent, agent_dirs: &[Age
 
 fn emit_git_persistence_denies(
     sb: &mut String,
-    project: &str,
+    project_roots: &[String],
     extra_write: &[PathBuf],
     git_common_dir: Option<&Path>,
     extra_git_dirs: &[PathBuf],
 ) {
-    let mut gitdirs: Vec<String> = writable_roots(project, extra_write)
+    let mut gitdirs: Vec<String> = writable_roots(project_roots, extra_write)
         .iter()
         .map(|root| format!("{root}/.git"))
         .collect();
@@ -1004,7 +1092,7 @@ fn emit_git_persistence_denies(
     sbpl!(sb, "(deny file-write* (regex #\"/config\\.worktree$\"))");
     sbpl!(sb);
 
-    for root in writable_roots(project, extra_write) {
+    for root in writable_roots(project_roots, extra_write) {
         emit_nested_gitdir_denies(sb, &root);
     }
 }
@@ -1755,9 +1843,9 @@ fn emit_exec_write_denies(sb: &mut String, extra_exec: &[PathBuf]) {
 /// a granted tree — an unconditional re-allow would override the `/private/tmp`
 /// exec deny for a project or scratch dir that lives there:
 ///
-/// - the project directory, which is writable and executable by design, and
-///   which an `allow.write` on a parent (`~/Repos`) would otherwise silently
-///   stop running its own build output;
+/// - the project directory and every `--repo-dir` root, which are writable and
+///   executable by design, and which an `allow.write` on a parent (`~/Repos`)
+///   would otherwise silently stop running their own build output;
 /// - the scratch dir, which is write+exec by design;
 /// - the [`EXEC_IN_WRITABLE`] trees, which were already write+execute before
 ///   the grant. The deny exists to stop a grant *creating* that pair, not to
@@ -1768,7 +1856,7 @@ fn emit_exec_write_denies(sb: &mut String, extra_exec: &[PathBuf]) {
 fn emit_user_write_exec_denies(
     sb: &mut String,
     home: &str,
-    project: &str,
+    project_roots: &[String],
     extra_write: &[PathBuf],
     scratch_dir: Option<&Path>,
 ) {
@@ -1784,7 +1872,7 @@ fn emit_user_write_exec_denies(
         sbpl!(sb, "(deny process-exec (subpath \"{p}\"))");
     }
     let granted = |p: &Path| extra_write.iter().any(|w| p.starts_with(w));
-    let mut carve_outs: Vec<PathBuf> = vec![PathBuf::from(project)];
+    let mut carve_outs: Vec<PathBuf> = project_roots.iter().map(PathBuf::from).collect();
     carve_outs.extend(scratch_dir.map(Path::to_path_buf));
     carve_outs.extend(
         EXEC_IN_WRITABLE
@@ -2612,6 +2700,8 @@ mod tests {
             extra_exec: &[],
             extra_socket: &[],
             extra_deny: &[],
+            named_roots: &[],
+            named_root_git_dirs: &[],
             existing_home_tool_dirs: None,
             existing_app_dirs: None,
             extra_ports: &[],

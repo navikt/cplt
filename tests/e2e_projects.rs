@@ -1505,6 +1505,280 @@ fi
         );
     }
 
+    /// The same #214 shape one level down, and the one `--repo-dir` creates:
+    /// a named repository is nested inside the project, so the project's own
+    /// `git status` reports it as one untracked entry or — gitignored, as here
+    /// — as nothing at all. Every edit inside it was invisible, and the session
+    /// still printed "no project file changes". It now gets its own report.
+    #[test]
+    fn audit_reports_a_nested_named_repository_on_its_own_lines() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+        // Gitignored BEFORE the outer commit, so the outer status is genuinely
+        // clean and the report cannot be clean for any other reason.
+        project.write_file(".gitignore", "lib/\n");
+        project.write_file("lib/README.md", "# lib\n");
+        project.git_init();
+        let lib = project.canonical_path().join("lib");
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["add", "."],
+            vec!["commit", "-m", "lib", "--allow-empty"],
+        ] {
+            git_cmd(&lib)
+                .args(&args)
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output()
+                .expect("git command");
+        }
+        let lib_path = lib.to_string_lossy().to_string();
+
+        // The agent touches ONLY the named repository.
+        let script = r#"
+if echo tampered > lib/README.md 2>/dev/null; then
+    echo "RESULT:named_write:OK"
+else
+    echo "RESULT:named_write:FAIL"
+fi
+"#;
+        let fake_dir = create_fake_copilot(&project, script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &["--repo-dir", &lib_path]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, &stderr, "named_write");
+        assert!(
+            stderr.contains("no project file changes"),
+            "test premise: the project must be reported clean.\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("Changes in {lib_path}:")),
+            "the named repository's changes must be reported against it.\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("README.md"),
+            "the file the agent actually rewrote must be listed.\nstderr: {stderr}"
+        );
+        // The session line belongs to the session, not to each root.
+        assert_eq!(
+            stderr.matches("Session ended").count(),
+            1,
+            "one session, one session line.\nstderr: {stderr}"
+        );
+    }
+
+    /// The capability siblings needed a feature for (#344). `--allow-write`
+    /// already gave a sibling read and write; it is deliberately
+    /// non-executable (#319), so the sibling's own build could never run.
+    /// `--repo-dir` makes it a project-grade root: read, write AND execute.
+    ///
+    /// Both grants are exercised in one test so the difference is asserted
+    /// rather than assumed — the write-only case is the control.
+    #[test]
+    fn a_named_sibling_repository_is_readable_writable_and_executable() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+        project.git_init();
+        let sibling = TempProject::new("repo-dir-sibling");
+        sibling.write_file("f.txt", "content\n");
+        sibling.write_file("run.sh", "#!/bin/sh\necho ran\n");
+        sibling.git_init();
+        let sibling_path = sibling.canonical_path().to_string_lossy().to_string();
+        let script_path = format!("{sibling_path}/run.sh");
+        std::fs::set_permissions(
+            &script_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("chmod the sibling script");
+
+        let script = format!(
+            r#"
+if cat "{sibling_path}/f.txt" >/dev/null 2>&1; then echo "RESULT:read:OK"; else echo "RESULT:read:FAIL"; fi
+if echo w > "{sibling_path}/w.txt" 2>/dev/null; then echo "RESULT:write:OK"; else echo "RESULT:write:FAIL"; fi
+if "{script_path}" >/dev/null 2>&1; then echo "RESULT:exec:OK"; else echo "RESULT:exec:FAIL"; fi
+if echo h > "{sibling_path}/.git/hooks/pre-commit" 2>/dev/null; then echo "RESULT:hook:OK"; else echo "RESULT:hook:FAIL"; fi
+"#
+        );
+        let fake_dir = create_fake_copilot(&project, &script);
+
+        let (stdout, stderr, success) =
+            run_cplt(&project, &fake_dir, &["--repo-dir", &sibling_path]);
+        assert!(
+            success,
+            "a sibling repository is a valid named root.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, &stderr, "read");
+        assert_result_ok(&stdout, &stderr, "write");
+        assert_result_ok(&stdout, &stderr, "exec");
+        // The protected-path table follows the grant: hooks run OUTSIDE the
+        // sandbox on the user's next git operation in that repository.
+        assert_result_fail(&stdout, "hook");
+
+        // The control: the same tree under `allow.write` is editable and NOT
+        // executable. If this ever passes, `--repo-dir` grants nothing new and
+        // the assertion above proves nothing.
+        let (stdout, stderr, success) =
+            run_cplt(&project, &fake_dir, &["--allow-write", &sibling_path]);
+        assert!(success, "stdout: {stdout}\nstderr: {stderr}");
+        assert_result_ok(&stdout, &stderr, "write");
+        assert_result_fail(&stdout, "exec");
+    }
+
+    /// A linked worktree keeps its objects and refs in the main checkout's
+    /// gitdir, which is outside the worktree. Granting only the tree leaves
+    /// `git` there failing with `not a git repository` — reachable files, no
+    /// repository. The shared gitdir is granted, and the persistence denies
+    /// still win over that grant.
+    #[test]
+    fn a_named_worktree_can_run_git_and_still_cannot_plant_a_hook() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+        project.git_init();
+        let main = TempProject::new("repo-dir-worktree-main");
+        main.write_file("f.txt", "content\n");
+        main.git_init();
+        let main_path = main.canonical_path();
+        // Inside a second TempProject rather than beside the first: a linked
+        // worktree is a real directory `git worktree remove` may fail to clean
+        // (an early return, a git that refuses), and a test must not leave one
+        // behind in the developer's checkout. The guard removes this one either
+        // way.
+        let holder = TempProject::new("repo-dir-worktree-holder");
+        let worktree = holder.canonical_path().join("wt");
+        let added = git_cmd(&main_path)
+            .args(["worktree", "add", "-b", "wt"])
+            .arg(&worktree)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .expect("git worktree add");
+        if !added.status.success() {
+            return; // no usable git here; the other tests already say so
+        }
+        let wt = fs::canonicalize(&worktree).expect("canonicalize the worktree");
+        let wt_path = wt.to_string_lossy().to_string();
+        let hook = main_path.join(".git/hooks/pre-commit");
+
+        let script = format!(
+            r#"
+cd "{wt_path}" || exit 0
+if git status --porcelain >/dev/null 2>&1; then echo "RESULT:git:OK"; else echo "RESULT:git:FAIL"; fi
+if echo h > "{}" 2>/dev/null; then echo "RESULT:hook:OK"; else echo "RESULT:hook:FAIL"; fi
+"#,
+            hook.display()
+        );
+        let fake_dir = create_fake_copilot(&project, &script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &["--repo-dir", &wt_path]);
+
+        assert!(success, "stdout: {stdout}\nstderr: {stderr}");
+        assert_result_ok(&stdout, &stderr, "git");
+        // The gitdir is granted write, and the persistence denies are emitted
+        // after every allow so they still win. If this ever passes, the grant
+        // has opened a hook that runs outside the sandbox.
+        assert_result_fail(&stdout, "hook");
+
+        let _ = git_cmd(&main_path)
+            .args(["worktree", "remove", "--force"])
+            .arg(&wt)
+            .output();
+    }
+
+    /// A named repository's `[deny]` applies, and applies to ITS tree.
+    ///
+    /// `[deny]` can only tighten, so it needs no approval, no trust entry and
+    /// no content hash — there is no grant channel for a second repository to
+    /// open. Paths anchor to the repository that wrote them, so the union of N
+    /// repositories' denies is exactly "each one's deny applies inside itself";
+    /// the launch repository keeping its own `secrets/` readable is what
+    /// proves the anchoring rather than a blanket deny on the name.
+    #[test]
+    fn a_named_repositorys_deny_applies_only_inside_it() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+        project.write_file("secrets/k.txt", "launch\n");
+        project.git_init();
+        let named = TempProject::new("repo-dir-deny");
+        named.write_file("secrets/k.txt", "named\n");
+        named.write_file(".cplt.toml", "[deny]\npaths = [\"secrets\"]\n");
+        named.git_init();
+        let named_path = named.canonical_path().to_string_lossy().to_string();
+
+        let script = format!(
+            r#"
+if cat "{named_path}/secrets/k.txt" >/dev/null 2>&1; then echo "RESULT:named_secret:OK"; else echo "RESULT:named_secret:FAIL"; fi
+if cat secrets/k.txt >/dev/null 2>&1; then echo "RESULT:launch_secret:OK"; else echo "RESULT:launch_secret:FAIL"; fi
+"#
+        );
+        let fake_dir = create_fake_copilot(&project, &script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &["--repo-dir", &named_path]);
+
+        assert!(success, "stdout: {stdout}\nstderr: {stderr}");
+        assert_result_fail(&stdout, "named_secret");
+        assert_result_ok(&stdout, &stderr, "launch_secret");
+    }
+
+    /// A `.cplt.toml` that exists and cannot be parsed means a restriction its
+    /// owner wrote is missing. That must stop the launch, not become a warning
+    /// the operator scrolls past on the way to a session that runs anyway.
+    #[test]
+    fn an_unparseable_cplt_toml_in_a_named_repository_stops_the_launch() {
+        let project = TempProject::scaffold_node();
+        project.git_init();
+        let named = TempProject::new("repo-dir-bad-toml");
+        named.write_file(".cplt.toml", "this is not = = toml [[[\n");
+        named.git_init();
+        let named_path = named.canonical_path().to_string_lossy().to_string();
+
+        let output = cplt_cmd()
+            .args(["--yes", "--no-validate"])
+            .args(["--project-dir", &project.canonical_path().to_string_lossy()])
+            .args(["--repo-dir", &named_path])
+            .args(["--", "--version"])
+            .env("CPLT_CONFIG", "/dev/null/nonexistent")
+            .output()
+            .expect("cplt should run");
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        assert!(!output.status.success(), "stderr: {stderr}");
+        assert!(
+            stderr.contains("Its [deny] section cannot be applied"),
+            "the refusal must say what is missing.\nstderr: {stderr}"
+        );
+    }
+
+    /// A tree the session was never given stays unreachable. Without this the
+    /// two assertions above could both hold in a sandbox that grants
+    /// everything.
+    #[test]
+    fn an_unnamed_sibling_repository_is_not_reachable_at_all() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+        project.git_init();
+        let sibling = TempProject::new("unnamed-sibling");
+        sibling.write_file("f.txt", "content\n");
+        sibling.git_init();
+        let sibling_path = sibling.canonical_path().to_string_lossy().to_string();
+
+        let script = format!(
+            r#"
+if cat "{sibling_path}/f.txt" >/dev/null 2>&1; then echo "RESULT:read:OK"; else echo "RESULT:read:FAIL"; fi
+if echo w > "{sibling_path}/w.txt" 2>/dev/null; then echo "RESULT:write:OK"; else echo "RESULT:write:FAIL"; fi
+"#
+        );
+        let fake_dir = create_fake_copilot(&project, &script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &[]);
+        assert!(success, "stdout: {stdout}\nstderr: {stderr}");
+        assert_result_fail(&stdout, "read");
+        assert_result_fail(&stdout, "write");
+    }
+
     // ============================================================
     // Mode combination tests
     // ============================================================
@@ -1654,6 +1928,65 @@ allow_env_files = true
         );
         // Config enables allow_env_files, so .env should be readable
         assert_result_ok(&stdout, &stderr, "_env");
+    }
+
+    /// #261 refused a `CPLT_CONFIG` inside the project directory: repository
+    /// content deciding the sandbox that governs it. A named root is
+    /// project-grade and agent-writable, so the same file one repository over
+    /// is the same confused deputy — and the project check cannot see it,
+    /// because it runs before the local layer the named set comes from.
+    #[test]
+    fn cplt_config_inside_a_named_repository_is_refused() {
+        let project = TempProject::scaffold_node();
+        project.git_init();
+        let named = TempProject::new("cplt-config-named-root");
+        named.write_file("config.toml", "[sandbox]\nallow_env_files = true\n");
+        named.git_init();
+        let named_path = named.canonical_path();
+        let config_path = named_path.join("config.toml");
+
+        let output = cplt_cmd()
+            .args(["--yes", "--no-validate"])
+            .args(["--project-dir", &project.canonical_path().to_string_lossy()])
+            .args(["--repo-dir", &named_path.to_string_lossy()])
+            .args(["--", "--version"])
+            .env("CPLT_CONFIG", config_path.to_string_lossy().as_ref())
+            .output()
+            .expect("cplt should run");
+
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        assert!(
+            !output.status.success(),
+            "the launch must stop.\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("CPLT_CONFIG points inside a named repository"),
+            "the refusal must name the reason.\nstderr: {stderr}"
+        );
+
+        // The same file spelled with `~`. `config_path()` expands the tilde
+        // before opening it, so a check on the raw value refuses the absolute
+        // spelling and waves this one through to the same file — the shell is
+        // not the only thing that sets this variable (direnv, mise, .envrc).
+        let home = std::env::var("HOME").expect("HOME");
+        let Ok(rel) = config_path.strip_prefix(&home) else {
+            return; // the temp dir is not under $HOME here; nothing to spell
+        };
+        let tilde = format!("~/{}", rel.display());
+        let output = cplt_cmd()
+            .args(["--yes", "--no-validate"])
+            .args(["--project-dir", &project.canonical_path().to_string_lossy()])
+            .args(["--repo-dir", &named_path.to_string_lossy()])
+            .args(["--", "--version"])
+            .env("CPLT_CONFIG", &tilde)
+            .output()
+            .expect("cplt should run");
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        assert!(
+            !output.status.success()
+                && stderr.contains("CPLT_CONFIG points inside a named repository"),
+            "the tilde spelling names the same file and must be refused too.\nstderr: {stderr}"
+        );
     }
 
     #[test]

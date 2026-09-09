@@ -126,11 +126,12 @@ struct Cli {
     project_dir: Option<PathBuf>,
 
     /// Name another git repository the agent works in, as a first-class
-    /// repository alongside the launch one: `gh` commands may target it.
-    /// Must be a repository toplevel inside the project directory — a nested
-    /// clone already has the project directory's file access, so this declares
-    /// its identity, not new access. Siblings are not supported yet; for
-    /// edit-only access to one, use --allow-write.
+    /// repository alongside the launch one: `gh` commands may target it, and
+    /// it is granted read, write and execute, so its own build and tests run.
+    /// Must be a repository toplevel. One nested inside the project directory
+    /// already has that file access and gains only identity; one beside it is
+    /// a new read/write/execute tree, which the startup summary says. For
+    /// edit-only access to a tree, --allow-write grants files without execute.
     /// Can be specified multiple times.
     #[arg(long = "repo-dir", value_name = "DIR")]
     repo_dirs: Vec<PathBuf>,
@@ -1394,16 +1395,6 @@ fn validate_repo_dirs(
                  `--allow-write`."
             ),
         }
-        if !dir.starts_with(project_dir) {
-            bail!(
-                "{named_as} is outside the project directory\n  {}\n  \
-                 Only repositories checked out inside the project directory can be \
-                 named. For one that lives elsewhere, `--allow-write <DIR>` grants \
-                 read and write on its files — but not execute, so a build script \
-                 inside that tree will not run, and `gh` will not target it.",
-                project_dir.display()
-            );
-        }
         // Dedup rather than refuse across sources: naming with `--repo-dir` a
         // root the local file already carries is how a user re-states the set,
         // not an error. Two spellings of the same root within one source are
@@ -1587,38 +1578,58 @@ fn merge_tool_path_env_overrides(resolved: &mut config::Resolved, home: &Path) -
 
 /// The `Repositories:` rows for the startup summary.
 ///
-/// Empty when nothing but the launch repository is in scope: the summary's
-/// `Project:` line already says that, and a one-row block restating it is noise.
+/// Always includes the launch repository, so a consumer that reads this as "the
+/// repositories in scope" gets a true answer for a single-repository session
+/// too. Whether a one-row block is worth PRINTING is the caller's decision: the
+/// startup summary skips it because its `Project:` line already says that, and
+/// a block restating it is noise.
 ///
 /// `owner/name` comes from the trusted git in the unsandboxed parent, the same
 /// source and the same moment the gh scope set is captured from. A root whose
-/// origin is not a GitHub URL has no `owner/name`; it is still in the set for
-/// files, `[deny]` and the audit, so it is shown by its directory name with the
-/// gh consequence spelled out rather than dropped from the block.
+/// origin is not a GitHub URL has no `owner/name`; it is still a named root for
+/// every other purpose, so it is shown by its directory name with the gh
+/// consequence spelled out rather than dropped from the block.
 fn repo_summary_rows(project_dir: &Path, roots: &[RepoRoot]) -> Vec<config::RepoSummaryRow> {
-    if roots.is_empty() {
-        return Vec::new();
-    }
     let real_git = cplt::git::trusted_git();
-    let name_of = |dir: &Path| {
-        real_git
-            .and_then(|git| gh_proxy::detect_current_repo(git, dir).ok())
-            .unwrap_or_else(|| {
+    // Returns the name AND whether it is a real `owner/name`: everything that
+    // describes a root downstream has to agree with the launch about whether
+    // `gh` can target it, and the fallback string is not a fact to re-derive by
+    // looking for a parenthesis.
+    let name_of =
+        |dir: &Path| match real_git.and_then(|git| gh_proxy::detect_current_repo(git, dir).ok()) {
+            Some(repo) => (repo, true),
+            None => (
                 format!(
                     "{} (no GitHub origin)",
                     dir.file_name().unwrap_or_default().to_string_lossy()
-                )
-            })
-    };
+                ),
+                false,
+            ),
+        };
+    let (launch_name, launch_github) = name_of(project_dir);
     let mut rows = vec![config::RepoSummaryRow {
-        name: name_of(project_dir),
+        name: launch_name,
+        github: launch_github,
         path: project_dir.to_path_buf(),
         source: "launch repository",
+        grant: config::RepoGrant::Launch,
     }];
-    rows.extend(roots.iter().map(|root| config::RepoSummaryRow {
-        name: name_of(&root.dir),
-        path: root.dir.clone(),
-        source: root.source.label(),
+    rows.extend(roots.iter().map(|root| {
+        let (name, github) = name_of(&root.dir);
+        config::RepoSummaryRow {
+            name,
+            github,
+            path: root.dir.clone(),
+            source: root.source.label(),
+            // A nested root inherits the project grant; a sibling is a tree the
+            // session could not otherwise reach at all. Same row, very different
+            // thing to have agreed to.
+            grant: if root.dir.starts_with(project_dir) {
+                config::RepoGrant::Inherited
+            } else {
+                config::RepoGrant::NewTree
+            },
+        }
     }));
     rows
 }
@@ -1674,6 +1685,125 @@ fn warn_exec_tool_dir_shadowing(
 ) {
     for w in resolved.exec_tool_dir_warnings(home_dir, agent) {
         ui::warn(&w);
+    }
+}
+
+/// Repositories reachable only through an `allow.write` grant, which is
+/// writable and deliberately **not** executable.
+///
+/// A grant like `allow.write = ["~/src"]` over a directory of checkouts reads
+/// as "let the agent work in these", and it is not: since #319 a write grant
+/// carries no execute, because a tree that is both is where an agent drops a
+/// binary and runs it. The launch project directory is carved back out of that
+/// deny; a repository beside it under the same grant is not. So `./gradlew` in
+/// the project works and `cd ../other && ./gradlew` fails with
+/// `bad interpreter: Operation not permitted` — a message that names neither
+/// cplt nor the grant, and that a reader reasonably attributes to native
+/// binaries or to their own project.
+///
+/// Reported by a user whose two repositories sat side by side under one grant.
+/// Nothing at launch said so, and the answer (`sandbox.repo_dirs`) is one
+/// config line.
+///
+/// Repositories inside the project directory are excluded: the project's own
+/// `process-exec` allow is emitted after the deny and covers its whole subtree,
+/// so those trees really are executable. So are repositories already named,
+/// which is the remedy this points at.
+fn write_granted_repos_without_exec(
+    allow_write: &[PathBuf],
+    project_dir: &Path,
+    named_roots: &[PathBuf],
+) -> Vec<(PathBuf, Vec<PathBuf>)> {
+    /// Entries examined per grant.
+    const SCAN_LIMIT: usize = 256;
+    let is_repo = |d: &Path| d.join(".git").exists();
+    let mut out = Vec::new();
+    for grant in allow_write {
+        let mut repos: Vec<PathBuf> = Vec::new();
+        if is_repo(grant) {
+            repos.push(grant.clone());
+        } else if let Ok(entries) = std::fs::read_dir(grant) {
+            // One level only, and bounded. A grant over a directory of
+            // checkouts is the shape that bites; walking deeper would cost a
+            // launch-time scan of an arbitrary tree to find cases nobody has
+            // hit. The entry cap matters because the grant is arbitrary: it can
+            // name a home directory or a network mount, and a `.git` probe per
+            // entry is a stat per entry. Stopping early can only under-report,
+            // and this is advice, not enforcement.
+            for entry in entries.flatten().take(SCAN_LIMIT) {
+                let path = entry.path();
+                if path.is_dir() && is_repo(&path) {
+                    repos.push(path);
+                }
+            }
+        }
+        // The project directory and anything under it are covered by the
+        // project's own `process-exec` allow, which is emitted after the deny.
+        // Listing the launch repository as un-executable would be false, and
+        // false in the direction that makes the whole warning easy to dismiss.
+        repos.retain(|r| {
+            !r.starts_with(project_dir)
+                && !project_dir.starts_with(r)
+                && !named_roots.iter().any(|n| n == r)
+        });
+        if !repos.is_empty() {
+            repos.sort();
+            out.push((grant.clone(), repos));
+        }
+    }
+    out
+}
+
+/// Warn about them. Not gated on `quiet`: the failure it explains is a build
+/// that does not run, with an error naming neither cplt nor the grant, and the
+/// session that reported it had `quiet = true`. Same reasoning as the
+/// trusted-binary warning above.
+fn warn_write_granted_repos(
+    resolved: &config::Resolved,
+    project_dir: &Path,
+    named_roots: &[PathBuf],
+) {
+    for (grant, repos) in
+        write_granted_repos_without_exec(&resolved.allow_write, project_dir, named_roots)
+    {
+        // Bounded: a grant over a directory of many checkouts would otherwise
+        // put every path into one warning line, which is the fastest way to
+        // make a warning unreadable and therefore unread.
+        /// Repositories named in one warning line.
+        const LIST_LIMIT: usize = 5;
+        let shown = repos.len().min(LIST_LIMIT);
+        let mut names = repos
+            .iter()
+            .take(shown)
+            .map(|r| r.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if repos.len() > shown {
+            use std::fmt::Write as _;
+            let _ = write!(names, " and {} more", repos.len() - shown);
+        }
+        let subject = if repos.len() == 1 && repos[0] == grant {
+            format!(
+                "allow.write grants {}, which is a git repository",
+                grant.display()
+            )
+        } else {
+            format!(
+                "allow.write grants {}, which contains the git repositor{} {names}",
+                grant.display(),
+                if repos.len() == 1 { "y" } else { "ies" }
+            )
+        };
+        ui::warn(&format!(
+            "{subject}. A write grant is deliberately not executable, so its build and \
+             tests will not run there: a script fails with `bad interpreter: Operation not \
+             permitted`, which names neither cplt nor this grant. To work in it, name it \
+             instead — `cplt config set --local sandbox.repo_dirs <DIR>`, or `--repo-dir \
+             <DIR>` for one run — which grants read, write and execute, and, when its \
+             origin is a GitHub URL, puts it in the `gh` and push scope. That is a real \
+             widening: a named repository is another tree the agent can drop a binary \
+             into and run."
+        ));
     }
 }
 
@@ -1810,6 +1940,37 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         &project_dir,
         &home_dir,
     )?;
+
+    // The `CPLT_CONFIG` containment check above ran against the project
+    // directory only, and it had to: it decides which config file to load, and
+    // the named set comes out of the local layer that load produces. A named
+    // root is agent-writable and project-grade, so a config file inside one is
+    // the same confused deputy #261 closed — the agent writing the file that
+    // decides its own sandbox. Applied here, once the set is known.
+    if let Some(custom) = std::env::var("CPLT_CONFIG").ok().filter(|s| !s.is_empty()) {
+        for root in &repo_roots {
+            // `expand_tilde` for the same reason the project-directory check
+            // uses it: `config_path()` expands `~` before opening the file, so
+            // a check on the raw value refuses `/home/me/lib/x.toml` and waves
+            // `~/lib/x.toml` through to the same file.
+            if let config::CustomConfigVerdict::InsideProject(p) =
+                config::classify_custom_config(&config::expand_tilde(&custom), &home_dir, &root.dir)
+            {
+                bail!(
+                    "CPLT_CONFIG points inside a named repository:\n  \
+                     {}\n  \
+                     {} is granted read, write and execute this session, so that file is \
+                     content the agent can rewrite — and it would replace your whole cplt \
+                     config, sandbox settings included. Refusing.\n  \
+                     Unset CPLT_CONFIG (check .envrc / mise config), or drop the repository \
+                     from the named set, and re-run.",
+                    p.display(),
+                    root.dir.display()
+                );
+            }
+        }
+    }
+
     let cli_flags = config::CliFlags {
         preset: cli.preset,
         proxy: config::FeatureToggle::from_pair(cli.with_proxy, cli.no_proxy),
@@ -1982,6 +2143,58 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             ui::warn(&format!("Failed to load .cplt.toml: {e}"));
         }
     }
+
+    // ── `[deny]` from every named repository ─────────────────────
+    //
+    // Only `[deny]`. A named repository never proposes: `[propose]` widens, and
+    // approving it per root multiplies #206's bypass class by the size of the
+    // set. `[deny]` can only tighten, so there is no grant channel to open and
+    // no trust entry to key — which is why this needs neither approval nor a
+    // content hash, and why `--accept-repo-config` alongside `--repo-dir` is
+    // NOT refused: nothing here is ambiguous about what it applies to.
+    for root in &repo_roots {
+        match repo_config::load_repo_config(&root.dir) {
+            Ok(Some(loaded)) => {
+                if !resolved.quiet {
+                    let proposed = repo_config::proposed_keys(&loaded.config.propose);
+                    if !proposed.is_empty() {
+                        ui::warn(&format!(
+                            "{} proposes {} in its .cplt.toml. Only the launch repository may \
+                             propose, so those are not consulted; its [deny] does \
+                             apply.",
+                            root.dir.display(),
+                            proposed.join(", ")
+                        ));
+                    }
+                    if !loaded.config.deny.env.is_empty() {
+                        // The one part of a named repository's deny that is not
+                        // scoped to its own tree: env is process-wide, so this
+                        // strips the variable for the whole session.
+                        ui::info(&format!(
+                            "{} denies {} for the whole session.",
+                            root.dir.display(),
+                            loaded.config.deny.env.join(", ")
+                        ));
+                    }
+                }
+                resolved.apply_repo_deny(&loaded.config, &loaded.dir);
+            }
+            // No `.cplt.toml` is the ordinary case and says nothing.
+            Ok(None) => {}
+            // Unlike the launch repository's, this is fatal. The file exists
+            // and cannot be read, so a restriction its owner wrote is missing —
+            // and a missing restriction must never be a warning the operator
+            // scrolls past on the way to a session that runs anyway.
+            Err(e) => bail!(
+                "Failed to load .cplt.toml from the named repository {}: {e}\n  \
+                 Its [deny] section cannot be applied, so the session would be \
+                 less restricted than that repository asks for. Fix the file, or \
+                 drop the repository from the named set.",
+                root.dir.display()
+            ),
+        }
+    }
+
     if !resolved.quiet {
         warn_repo_config_discrepancy(&project_dir);
     }
@@ -2524,6 +2737,8 @@ fn write_session_sandbox_brief(
     active_agent: agent::Agent,
     scratch_path: Option<&Path>,
     home_dir: &Path,
+    repos: &[config::RepoSummaryRow],
+    observe_domains: bool,
 ) {
     if !resolved.brief {
         return;
@@ -2541,8 +2756,9 @@ fn write_session_sandbox_brief(
         );
         return;
     };
-    let content = brief::generate_session_brief(resolved, active_agent, home_dir);
-    if let Err(e) = brief::write_session_brief(scratch, &content) {
+    let facts =
+        brief::BriefFacts::capture(resolved, active_agent, home_dir, repos, observe_domains);
+    if let Err(e) = brief::write_session_brief(scratch, &facts) {
         ui::warn(&format!("Could not write sandbox brief: {e}"));
     }
 }
@@ -3187,8 +3403,13 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     } = resolve_context(&cli, false)?;
 
     let repo_paths: Vec<PathBuf> = repo_roots.iter().map(|r| r.dir.clone()).collect();
+    let repo_git_dirs = sandbox::named_root_git_dirs(&repo_paths);
+    // Built once: the brief, the startup summary and `doctor` must not each
+    // resolve the identities separately and risk disagreeing.
+    let repo_rows = repo_summary_rows(&project_dir, &repo_roots);
 
     warn_exec_tool_dir_shadowing(&resolved, &home_dir, active_agent);
+    warn_write_granted_repos(&resolved, &project_dir, &repo_paths);
 
     // Probe the host for everything the sandbox profile depends on.
     let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
@@ -3239,6 +3460,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         &probe,
         AssemblyOptions {
             agent: active_agent,
+            repos: NamedRepos::new(&repo_paths, &repo_git_dirs, &repo_rows),
             copilot_install_dir: copilot_install_dir.as_deref(),
             electron_app_dir: electron_app_dir.as_deref(),
             announce_scratch: true,
@@ -3326,12 +3548,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
 
     // Print comprehensive summary and confirm before launching Copilot
     if !resolved.quiet {
-        resolved.print_summary(
-            &project_dir,
-            &home_dir,
-            active_agent,
-            &repo_summary_rows(&project_dir, &repo_roots),
-        );
+        resolved.print_summary(&project_dir, &home_dir, active_agent, &repo_rows);
     }
     if let Err(e) = prompt_confirm(resolved.yes, resolved.quiet) {
         bail!("{e}");
@@ -3403,6 +3620,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     let (exit_code, snapshot) = audit::run(
         &project_dir,
         &resolved.allow_write,
+        &repo_paths,
         audit::AuditMode::for_run(audit_enabled, cli.observe_domains),
         &routing,
         || {
@@ -3500,12 +3718,6 @@ fn build_copilot_args(cli: &Cli, agent: &agent::Agent) -> Vec<String> {
     args
 }
 
-/// Restate a block-mode policy message for warn mode.
-///
-/// Policy errors are written for block mode and lead with `⚠️ BLOCKED by
-/// sandbox:`. In warn mode the command is allowed to run, so that prefix is
-/// swapped for the warning label instead of being stacked behind it — otherwise
-/// the user reads "WARNING … BLOCKED" for a command that just ran.
 /// The opt-out a refused command should name, for whichever guard refused it.
 ///
 /// #122/#147 make the guards default-on, and both issues call naming the exact
@@ -3519,13 +3731,6 @@ fn escape_hatch(name: &str) -> String {
          `{name}_guard.mode = \"warn\"` (or `{name}_guard.enabled = false`) in \
          your cplt config."
     )
-}
-
-fn warn_mode_message(msg: &str) -> String {
-    match msg.strip_prefix("⚠️ BLOCKED by sandbox:") {
-        Some(rest) => format!("⚠️  WARNING (would block):{rest}"),
-        None => format!("⚠️  WARNING (would block): {msg}"),
-    }
 }
 
 /// What a guard verdict means for this process, decided before anything runs.
@@ -3546,8 +3751,8 @@ enum GateEffect {
     ExecPlain { notice: Option<String> },
     /// Serve the cached token from the scratch dir instead of running `gh`.
     ServeCachedToken,
-    /// Refuse, printing this message.
-    Refuse(String),
+    /// Refuse, printing this refusal and the guard's escape hatch.
+    Refuse(gh_proxy::Refusal),
 }
 
 /// Decide what `cplt gh-gate` should do. Pure: no process is spawned here.
@@ -3590,13 +3795,13 @@ fn decide_gh_gate(
             Some(repo) => GateEffect::ExecScoped(repo),
             None => GateEffect::ExecPlain { notice: None },
         },
-        Err(msg) => match policy.mode {
-            config::EnforcementMode::Block => GateEffect::Refuse(msg),
+        Err(refusal) => match policy.mode {
+            config::EnforcementMode::Block => GateEffect::Refuse(refusal),
             config::EnforcementMode::Warn => GateEffect::ExecPlain {
-                notice: Some(warn_mode_message(&msg)),
+                notice: Some(refusal.warning()),
             },
             config::EnforcementMode::Audit => GateEffect::ExecPlain {
-                notice: Some(format!("[audit] gh-gate: would block: {msg}")),
+                notice: Some(format!("[audit] gh-gate: would block: {refusal}")),
             },
         },
     }
@@ -3628,8 +3833,8 @@ fn perform_gate_effect(
 ) -> ExitCode {
     match effect {
         GateEffect::ServeCachedToken => serve_cached_gh_token(),
-        GateEffect::Refuse(msg) => {
-            eprintln!("{msg}\n{}", escape_hatch(name));
+        GateEffect::Refuse(refusal) => {
+            eprintln!("{refusal}\n{}", escape_hatch(name));
             ExitCode::FAILURE
         }
         GateEffect::ExecScoped(repo) => exec_real(real_binary, name, args, Some(&repo)),
@@ -3751,13 +3956,13 @@ fn decide_git_gate(
         repo_facts,
     ) {
         Ok(()) => GateEffect::ExecPlain { notice: None },
-        Err(msg) => match mode {
-            config::EnforcementMode::Block => GateEffect::Refuse(msg),
+        Err(refusal) => match mode {
+            config::EnforcementMode::Block => GateEffect::Refuse(refusal),
             config::EnforcementMode::Warn => GateEffect::ExecPlain {
-                notice: Some(warn_mode_message(&msg)),
+                notice: Some(refusal.warning()),
             },
             config::EnforcementMode::Audit => GateEffect::ExecPlain {
-                notice: Some(format!("[audit] git-gate: would block: {msg}")),
+                notice: Some(format!("[audit] git-gate: would block: {refusal}")),
             },
         },
     }
@@ -3984,6 +4189,8 @@ fn accept_tool_dir(value: Option<String>, home_dir: &Path) -> Option<PathBuf> {
 /// run is identical whether an AI agent or a plain shell is being launched.
 struct AssemblyOptions<'a> {
     agent: agent::Agent,
+    /// The repositories named for this session.
+    repos: NamedRepos<'a>,
     /// The agent's install directory, granted read + map-exec. `None` for the
     /// shell and check paths, which have no agent binary to grant access to.
     copilot_install_dir: Option<&'a Path>,
@@ -4140,7 +4347,14 @@ fn assemble_sandbox(
     // AGENTS.md layer writes into the user's repo and must not run until the
     // launch is confirmed — see `apply_persistent_sandbox_brief`, which the
     // `exec` and `check` paths deliberately never call.
-    write_session_sandbox_brief(resolved, active_agent, scratch_path, home_dir);
+    write_session_sandbox_brief(
+        resolved,
+        active_agent,
+        scratch_path,
+        home_dir,
+        opts.repos.rows,
+        cli.observe_domains,
+    );
 
     // macOS-only, opt-in (sandbox.gradle_init): install the guarded Gradle
     // init script so sandboxed builds keep the preferIPv4Stack workaround for
@@ -4176,6 +4390,7 @@ fn assemble_sandbox(
         probe,
         active_agent,
         &agent_dirs,
+        opts.repos,
         SessionPaths {
             proxy_port: proxy_port_for_profile,
             scratch_dir: scratch_path,
@@ -4218,11 +4433,45 @@ struct SessionPaths<'a> {
 /// The one place a `SandboxConfig` is assembled from the resolved config and
 /// the host probe. The launch, `exec`, `check` and `doctor` all go through it,
 /// so a new input reaches every surface or none (#447).
+/// The repositories named with `--repo-dir` / `sandbox.repo_dirs`, already
+/// validated, together with their resolved gitdirs.
+///
+/// One value rather than two arguments because the halves must never diverge:
+/// a root granted without its gitdir is a linked worktree whose `git` fails
+/// with `not a git repository`. They are project-grade roots in the sandbox
+/// policy, so this has to reach every surface that builds one — the launch,
+/// `exec`, `check` and `doctor` — or a surface answers from fewer inputs than
+/// the launch (#447).
+#[derive(Clone, Copy, Default)]
+struct NamedRepos<'a> {
+    dirs: &'a [PathBuf],
+    git_dirs: &'a [PathBuf],
+    /// The same set as the startup summary renders it, with each repository's
+    /// `owner/name` and what its grant is. Carried here so the agent-facing
+    /// brief and the operator-facing summary cannot describe different scopes.
+    rows: &'a [config::RepoSummaryRow],
+}
+
+impl<'a> NamedRepos<'a> {
+    fn new(
+        dirs: &'a [PathBuf],
+        git_dirs: &'a [PathBuf],
+        rows: &'a [config::RepoSummaryRow],
+    ) -> Self {
+        Self {
+            dirs,
+            git_dirs,
+            rows,
+        }
+    }
+}
+
 fn build_sandbox_config<'a>(
     resolved: &'a config::Resolved,
     probe: &'a HostProbe,
     agent: agent::Agent,
     agent_dirs: &'a [agent::AgentDir],
+    repos: NamedRepos<'a>,
     session: SessionPaths<'a>,
     keychain_substitute: Option<agent::KeychainSubstitute>,
 ) -> sandbox::SandboxConfig<'a> {
@@ -4234,6 +4483,8 @@ fn build_sandbox_config<'a>(
         extra_exec: &resolved.allow_exec,
         extra_socket: &resolved.allow_socket,
         extra_deny: &resolved.deny_paths,
+        named_roots: repos.dirs,
+        named_root_git_dirs: repos.git_dirs,
         existing_home_tool_dirs: Some(&probe.existing_home_tool_dirs),
         existing_app_dirs: Some(&probe.existing_app_dirs),
         extra_ports: &resolved.allow_ports,
@@ -4272,6 +4523,7 @@ fn prepare_shell_sandbox(
     config_path: Option<&PathBuf>,
     home_dir: &Path,
     project_dir: &Path,
+    repos: NamedRepos<'_>,
 ) -> anyhow::Result<AssembledSandbox> {
     let probe = HostProbe::probe(resolved, home_dir, project_dir);
     assemble_sandbox(
@@ -4281,6 +4533,7 @@ fn prepare_shell_sandbox(
         &probe,
         AssemblyOptions {
             agent: agent::Agent::Shell,
+            repos,
             // shell/check have no agent install dir to grant special access to
             copilot_install_dir: None,
             electron_app_dir: None,
@@ -4335,6 +4588,10 @@ fn run_exec_command(
     } = resolve_context(cli, false)?;
 
     let repo_paths: Vec<PathBuf> = repo_roots.iter().map(|r| r.dir.clone()).collect();
+    let repo_git_dirs = sandbox::named_root_git_dirs(&repo_paths);
+    // Built once: the brief, the startup summary and `doctor` must not each
+    // resolve the identities separately and risk disagreeing.
+    let repo_rows = repo_summary_rows(&project_dir, &repo_roots);
 
     // exec defaults to quiet+yes (scripting UX). User can override with --no-quiet / --no-yes.
     if !cli.no_quiet {
@@ -4385,6 +4642,7 @@ fn run_exec_command(
     // profile, so a warning about another agent's directories would name an
     // effect this session cannot have (#343).
     warn_exec_tool_dir_shadowing(&resolved, &home_dir, active_agent);
+    warn_write_granted_repos(&resolved, &project_dir, &repo_paths);
 
     // Build the resolved Shell sandbox (discovery → proxy → prepare). Shared
     // with `cplt check`, which runs its probes under the identical policy.
@@ -4402,6 +4660,7 @@ fn run_exec_command(
         config_path.as_ref(),
         &home_dir,
         &project_dir,
+        NamedRepos::new(&repo_paths, &repo_git_dirs, &repo_rows),
     )?;
 
     // Resolve the binary and args to pass to the sandbox.
@@ -4447,12 +4706,7 @@ fn run_exec_command(
 
     // Summary (only shown with --no-quiet)
     if !resolved.quiet {
-        resolved.print_summary(
-            &project_dir,
-            &home_dir,
-            active_agent,
-            &repo_summary_rows(&project_dir, &repo_roots),
-        );
+        resolved.print_summary(&project_dir, &home_dir, active_agent, &repo_rows);
     }
     if let Err(e) = prompt_confirm(resolved.yes, resolved.quiet) {
         bail!("{e}");
@@ -4477,6 +4731,7 @@ fn run_exec_command(
     let (exit_code, snapshot) = audit::run(
         &project_dir,
         &resolved.allow_write,
+        &repo_paths,
         audit::AuditMode::for_run(audit_enabled, cli.observe_domains),
         &routing,
         || {
@@ -4839,9 +5094,17 @@ fn run_check_command(
     // scope while the launch allowed it, because these were discarded here with
     // `let _ = &repo_roots` (#447).
     let named_roots: Vec<&Path> = repo_roots.iter().map(|r| r.dir.as_path()).collect();
+    // The same set as owned paths, for the sandbox policy `check` probes
+    // against: `check` must build the policy the launch would build.
+    let repo_paths: Vec<PathBuf> = repo_roots.iter().map(|r| r.dir.clone()).collect();
+    let repo_git_dirs = sandbox::named_root_git_dirs(&repo_paths);
+    // Built once: the brief, the startup summary and `doctor` must not each
+    // resolve the identities separately and risk disagreeing.
+    let repo_rows = repo_summary_rows(&project_dir, &repo_roots);
 
     // Shell, not `active_agent`: `check` probes under the Shell profile.
     warn_exec_tool_dir_shadowing(&resolved, &home_dir, agent::Agent::Shell);
+    warn_write_granted_repos(&resolved, &project_dir, &repo_paths);
 
     // check prints its own report; never prompt.
     resolved.yes = true;
@@ -4879,6 +5142,7 @@ fn run_check_command(
         config_path.as_ref(),
         &home_dir,
         &project_dir,
+        NamedRepos::new(&repo_paths, &repo_git_dirs, &repo_rows),
     )?;
 
     let proxy_enabled = proxy_handle.is_some();
@@ -4894,6 +5158,7 @@ fn run_check_command(
             &disabled,
             &home_dir,
             &project_dir,
+            &repo_paths,
             active_agent,
             agent_name,
             preset_name,
@@ -5028,6 +5293,7 @@ fn build_battery(
     disabled: &[sandbox::HardeningCategory],
     home_dir: &Path,
     project_dir: &Path,
+    named_roots: &[PathBuf],
     agent: agent::Agent,
     agent_name: String,
     preset_name: Option<String>,
@@ -5102,6 +5368,48 @@ fn build_battery(
         fix: None,
         note: baseline_note(write_proj),
     });
+
+    // ── Named repositories ──
+    // A named root is a second read/write/EXECUTE tree, which is the whole
+    // point of naming it and also the cost. `check` reports what enforcement
+    // actually does, so it has to look there: probing only the project
+    // directory left the one command a user runs to confirm the sandbox silent
+    // about the grant they had just added.
+    for root in named_roots {
+        let label = root.file_name().map_or_else(
+            || root.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        let expl = check::explain_path(policy, home_dir, project_dir, root);
+        items.push(check::CheckItem {
+            name: format!("write named repo {label}"),
+            category: "filesystem".to_string(),
+            target: root.display().to_string(),
+            decision: probe_write(prepared, resolved, disabled, root),
+            expected: Some(check::Decision::Allowed),
+            reason: expl.reason.clone(),
+            fix: expl.fix.clone(),
+            note: None,
+        });
+        // The property that separates a named root from an ungoverned tree.
+        // Hooks run OUTSIDE the sandbox on the user's next git operation there,
+        // so this is the one that must stay blocked however wide the grant is.
+        let hooks = root.join(".git/hooks");
+        if hooks.is_dir() {
+            items.push(check::CheckItem {
+                name: format!("write {label}/.git/hooks"),
+                category: "filesystem".to_string(),
+                target: hooks.display().to_string(),
+                decision: probe_write(prepared, resolved, disabled, &hooks),
+                expected: Some(check::Decision::Blocked),
+                reason: "git hooks run outside the sandbox on the next git operation in \
+                         that repository, so they stay unwritable in every writable root."
+                    .to_string(),
+                fix: None,
+                note: None,
+            });
+        }
+    }
 
     // Protection: a credential path must be BLOCKED for read.
     let (prot_path, prot_label) = pick_protected_read(home_dir);
@@ -5406,6 +5714,12 @@ fn build_exec_check(
     // assembled field by field any more (#447).
     let ctx = check::ExecContext::for_launch(resolved, project_dir, named_roots);
     let expl = check::explain_exec(cmd, &ctx);
+    // `note` is the serialized field, so the objection reaches `--json` there
+    // rather than only inside the prose reason (#441).
+    let note = expl
+        .objection
+        .as_ref()
+        .map(|o| format!("the guard objected and was not enforcing: {o}"));
     let item = check::CheckItem {
         name: "exec".to_string(),
         category: "exec".to_string(),
@@ -5414,7 +5728,7 @@ fn build_exec_check(
         expected: None,
         reason: expl.reason,
         fix: expl.fix,
-        note: None,
+        note,
     };
     check::Report::new(agent_name, preset_name, false, vec![item])
 }
@@ -5490,10 +5804,17 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         config_path,
         home_dir,
         project_dir,
-        repo_roots: _,
+        repo_roots,
         active_agent,
         unapproved_proposals,
     } = ctx;
+    // `doctor` reports the policy a launch would build, so it has to carry the
+    // same named roots the launch would (#447).
+    let repo_paths: Vec<PathBuf> = repo_roots.iter().map(|r| r.dir.clone()).collect();
+    let repo_git_dirs = sandbox::named_root_git_dirs(&repo_paths);
+    // Built once: the brief, the startup summary and `doctor` must not each
+    // resolve the identities separately and risk disagreeing.
+    let repo_rows = repo_summary_rows(&project_dir, &repo_roots);
     let tilde = |p: &Path| doctor::tilde(p, &home_dir);
     let mut findings: Vec<Finding> = Vec::new();
     let mut ok: Vec<String> = Vec::new();
@@ -5669,6 +5990,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         &probe,
         active_agent,
         &agent_dirs,
+        NamedRepos::new(&repo_paths, &repo_git_dirs, &repo_rows),
         SessionPaths::default(),
         keychain_substitute,
     );
@@ -6388,6 +6710,28 @@ fn run_config_set(
         ui::ok(&format!("{key} = {}", value.unwrap()));
     }
 
+    // Config is read once, at launch. A session already running keeps the
+    // values it resolved then — deliberately for the ones it bakes, since the
+    // agent can rewrite the tree a re-read would consult (GHSA-cm6f). Nothing
+    // said so, and the surfaces that describe the file agreed with the person
+    // while the running session disagreed: `config show` listed the new value,
+    // `check exec` answered for a hypothetical new launch and said allowed,
+    // and the agent kept refusing. All three were right about different
+    // questions (#458).
+    // Also on `--unset`: removing a value needs a restart for exactly the same
+    // reason setting one does, and suppressing it there was the inconsistency
+    // this notice exists to remove.
+    {
+        let dim = ui::color(ui::DIM);
+        eprintln!(
+            "{}[cplt]{} {dim}Applies to the next launch. A session started before now keeps \
+             the settings it read at startup.{}",
+            ui::color(ui::BLUE),
+            ui::color(ui::RESET),
+            ui::color(ui::RESET)
+        );
+    }
+
     // Hint about repo config if .cplt.toml exists
     let project_dir = detect_project_root().or_else(|| std::env::current_dir().ok());
     if !local
@@ -6506,7 +6850,8 @@ fn run_config_set_repo(
         let section_name = match target {
             config::RepoKeyTarget::ProposeBool
             | config::RepoKeyTarget::ProposeAllow(_)
-            | config::RepoKeyTarget::ProposeProxy(_) => "propose",
+            | config::RepoKeyTarget::ProposeProxy(_)
+            | config::RepoKeyTarget::ProposeStrArray(_) => "propose",
             config::RepoKeyTarget::Deny(_) => "deny",
             _ => "unknown",
         };
@@ -6520,11 +6865,14 @@ fn run_config_set_repo(
     );
 
     // Remind about trust approval for propose keys
+    // Every `[propose]` shape, including the top-level arrays: a proposal the
+    // author is not told to approve is one that silently does nothing.
     if matches!(
         target,
         config::RepoKeyTarget::ProposeBool
             | config::RepoKeyTarget::ProposeAllow(_)
             | config::RepoKeyTarget::ProposeProxy(_)
+            | config::RepoKeyTarget::ProposeStrArray(_)
     ) && !unset
     {
         eprintln!(
@@ -7632,26 +7980,6 @@ mod tests {
     }
 
     #[test]
-    fn warn_mode_message_replaces_the_block_prefix() {
-        let blocked = "\u{26a0}\u{fe0f} BLOCKED by sandbox: 'gh pr merge' is not allowed.\nReason: needs a human.";
-        let warned = warn_mode_message(blocked);
-        assert!(
-            !warned.contains("BLOCKED"),
-            "warn mode must not tell the user the command was blocked: {warned}"
-        );
-        assert!(warned.starts_with("\u{26a0}\u{fe0f}  WARNING (would block): 'gh pr merge'"));
-        assert!(
-            warned.ends_with("Reason: needs a human."),
-            "the body must survive: {warned}"
-        );
-        // A message without the block prefix still gets labelled.
-        assert_eq!(
-            warn_mode_message("nope"),
-            "\u{26a0}\u{fe0f}  WARNING (would block): nope"
-        );
-    }
-
-    #[test]
     fn observe_domains_flags_parse() {
         let cli = parse(&["--observe-domains", "--observe-domains-out", "/tmp/obs.txt"]);
         assert!(cli.observe_domains);
@@ -8275,12 +8603,12 @@ mod tests {
             &["navikt/cplt".to_string()],
             None,
         );
-        let GateEffect::Refuse(msg) = effect else {
+        let GateEffect::Refuse(refusal) = effect else {
             panic!("block mode must refuse an out-of-scope write, got {effect:?}");
         };
         assert!(
-            msg.contains("someone/else"),
-            "message names the target: {msg}"
+            refusal.headline.contains("someone/else"),
+            "message names the target: {refusal}"
         );
     }
 
@@ -8758,8 +9086,68 @@ mod tests {
         assert!(err.contains(&inner.display().to_string()), "{err}");
     }
 
+    /// A repository beside the launch repository is the shape most checkouts
+    /// have, and it is now accepted. Every other rule still applies to it —
+    /// git toplevel, no symlinked leaf, not an unsafe root — and those are
+    /// asserted by their own tests; this one is about the location alone.
+    /// The shape a user hit: two repositories side by side under one
+    /// `allow.write`, and the agent `cd ..`s into the other one. The grant
+    /// makes it writable and not executable, so `./gradlew` there fails with
+    /// `bad interpreter: Operation not permitted` — an error naming neither
+    /// cplt nor the grant.
     #[test]
-    fn repo_dir_refuses_a_sibling_repository() {
+    fn a_write_grant_over_a_directory_of_checkouts_is_reported() {
+        let (_guard, root) = canonical_tempdir();
+        let parent = root.join("parent");
+        let project = parent.join("appA");
+        let sibling = parent.join("appB");
+        for d in [&project, &sibling] {
+            std::fs::create_dir_all(d.join(".git")).unwrap();
+        }
+        let found = write_granted_repos_without_exec(std::slice::from_ref(&parent), &project, &[]);
+        assert_eq!(found.len(), 1, "the grant is reported once: {found:?}");
+        // The launch repository is under the project's own exec allow, so
+        // listing it would be false — and false in the direction that makes the
+        // whole warning easy to dismiss.
+        assert_eq!(found[0].1, vec![sibling.clone()], "only the sibling");
+
+        // Naming it is the remedy, so it must silence the warning.
+        assert!(
+            write_granted_repos_without_exec(
+                std::slice::from_ref(&parent),
+                &project,
+                std::slice::from_ref(&sibling),
+            )
+            .is_empty()
+        );
+    }
+
+    /// The two shapes that must stay silent, or the warning becomes noise
+    /// nobody reads: an ordinary tool-cache grant, and a grant inside the
+    /// project directory (covered by the project's own exec allow).
+    #[test]
+    fn a_write_grant_with_no_unreachable_repository_is_silent() {
+        let (_guard, root) = canonical_tempdir();
+        let project = root.join("project");
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        let cache = root.join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        assert!(
+            write_granted_repos_without_exec(std::slice::from_ref(&cache), &project, &[])
+                .is_empty(),
+            "a grant with no repository in it says nothing"
+        );
+
+        let vendored = project.join("vendor/lib");
+        std::fs::create_dir_all(vendored.join(".git")).unwrap();
+        assert!(
+            write_granted_repos_without_exec(&[project.join("vendor")], &project, &[]).is_empty(),
+            "a grant inside the project is executable through the project's own allow"
+        );
+    }
+
+    #[test]
+    fn repo_dir_accepts_a_sibling_repository() {
         let (_guard, root) = canonical_tempdir();
         let project = root.join("project");
         let sibling = root.join("sibling");
@@ -8768,12 +9156,11 @@ mod tests {
         if !init_repo(&project) || !init_repo(&sibling) {
             return;
         }
-        let err = validate_flags(&[sibling], &project)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("Only repositories checked out inside the project directory"),
-            "{err}"
+        let roots = validate_flags(std::slice::from_ref(&sibling), &project)
+            .expect("a sibling repository is a valid named root");
+        assert_eq!(
+            roots.iter().map(|r| r.dir.clone()).collect::<Vec<_>>(),
+            vec![sibling]
         );
     }
 
@@ -8946,9 +9333,9 @@ mod tests {
         assert!(err.contains("/config/local/abc.toml"), "{err}");
     }
 
-    /// Stage 1 is nested-only for a persisted root exactly as for a flag.
+    /// A persisted root is accepted wherever a flag would be, sibling included.
     #[test]
-    fn a_local_root_outside_the_project_gets_the_sibling_message() {
+    fn a_local_root_outside_the_project_is_accepted() {
         let (_guard, root) = canonical_tempdir();
         let project = root.join("project");
         let sibling = root.join("sibling");
@@ -8957,14 +9344,12 @@ mod tests {
         if !init_repo(&project) || !init_repo(&sibling) {
             return;
         }
-        let err = validate_local(&[&sibling.display().to_string()], &project)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("Only repositories checked out inside the project directory"),
-            "{err}"
+        let roots = validate_local(&[&sibling.display().to_string()], &project)
+            .expect("a sibling repository is a valid persisted root");
+        assert_eq!(
+            roots.iter().map(|r| r.dir.clone()).collect::<Vec<_>>(),
+            vec![sibling]
         );
-        assert!(err.contains("sandbox.repo_dirs entry"), "{err}");
     }
 
     /// `~` is the one non-absolute spelling the local layer accepts, so the

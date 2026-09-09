@@ -18,7 +18,7 @@ use cplt::sandbox::{
     validate_playwright_socket_dir, validate_sbpl_path,
 };
 use cplt::sandbox::{ResolvedToolDir, ToolRoot, home_tool_dirs, relocatable_tool_prefix};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ============================================================
 // Unsafe root detection
@@ -794,6 +794,8 @@ fn landlock_policy_device_files_have_ioctl() {
         extra_exec: &[],
         extra_socket: &[],
         extra_deny: &[],
+        named_roots: &[],
+        named_root_git_dirs: &[],
         existing_home_tool_dirs: None,
         existing_app_dirs: None,
         extra_ports: &[],
@@ -1396,6 +1398,256 @@ fn fish_startup_files_are_write_denied_in_both_granted_dirs() {
     );
 }
 
+/// #477: the `.env` / `.pem` deny is a name pattern applied everywhere, so it
+/// also covers package content in the extracted dependency stores — where the
+/// file is a library's test fixture, not the user's secret. `go mod verify`
+/// hashes every file in the module cache, so one unreadable fixture aborts it.
+///
+/// Read is re-allowed there and nowhere else; write stays denied on both sides.
+#[test]
+fn the_env_deny_is_lifted_for_read_inside_dependency_stores_only() {
+    let profile = generate_profile(&base_profile_options(), &[]);
+    let home = "/Users/test";
+    // Escaped as the emitter escapes it: the leading dot of `.cargo` is a regex
+    // metacharacter, and a test that expected the raw path would fail on the
+    // one tree whose name has one.
+    for tree in ["go/pkg/mod", "\\.cargo/registry"] {
+        assert!(
+            profile.contains(&format!(
+                "(allow file-read* (regex #\"^{home}/{tree}/.*/\\.env$\"))"
+            )),
+            "read must be re-allowed under {tree}\n{profile}"
+        );
+        assert!(
+            !profile.contains(&format!(
+                "(allow file-write* (regex #\"^{home}/{tree}/.*/\\.env$\"))"
+            )),
+            "write must stay denied under {tree}\n{profile}"
+        );
+    }
+    // The deny itself is still there, and the carve-out comes after it —
+    // SBPL is last-match-wins, so the order is the whole mechanism.
+    let deny = profile
+        .find("(deny file-read* (regex #\"/\\.env$\"))")
+        .expect("the deny stands");
+    let allow = profile
+        .find("(allow file-read* (regex #\"^/Users/test/go/pkg/mod/")
+        .expect("the carve-out is emitted");
+    assert!(
+        allow > deny,
+        "last match wins, so the carve-out must be later"
+    );
+}
+
+/// A relocated `GOPATH` / `CARGO_HOME` must move the carve-out with it.
+///
+/// The trees are named by their `HOME_TOOL_DIRS` entry plus a subpath, because
+/// the two differ for Go: the tool dir is `go/pkg` and the module cache is
+/// `go/pkg/mod` under it. Matching `go/pkg/mod` directly finds no entry and
+/// falls back to the default location, which is the bug this pins — it would
+/// leave a user with a relocated `GOMODCACHE` still unable to run
+/// `go mod verify`, while the tests passed on a default machine.
+#[test]
+fn the_carve_out_follows_a_relocated_tool_root() {
+    use cplt::sandbox::{HOME_TOOL_DIRS, ResolvedToolDir};
+    let relocated: Vec<ResolvedToolDir> = HOME_TOOL_DIRS
+        .iter()
+        .filter(|d| d.path == "go/pkg" || d.path == ".cargo/registry")
+        .map(|d| ResolvedToolDir {
+            path: PathBuf::from(format!("/elsewhere/{}", d.path)),
+            dir: d,
+        })
+        .collect();
+    assert_eq!(relocated.len(), 2, "both tool dirs must exist to relocate");
+    let profile = generate_profile(
+        &SandboxConfig {
+            existing_home_tool_dirs: Some(&relocated),
+            ..base_profile_options()
+        },
+        &[],
+    );
+    for tree in ["/elsewhere/go/pkg/mod", "/elsewhere/\\.cargo/registry"] {
+        assert!(
+            profile.contains(&format!(
+                "(allow file-read* (regex #\"^{tree}/.*/\\.env$\"))"
+            )),
+            "the carve-out must follow the relocated root to {tree}\n{profile}"
+        );
+    }
+    assert!(
+        !profile.contains("(allow file-read* (regex #\"^/Users/test/go/pkg/mod/"),
+        "and must not also emit the default location\n{profile}"
+    );
+}
+
+/// With the deny lifted entirely there is nothing to carve out of, and
+/// emitting allows for a rule that is not there would be noise.
+#[test]
+fn the_dependency_store_carve_out_is_absent_when_env_files_are_allowed() {
+    let profile = generate_profile(
+        &SandboxConfig {
+            allow_env_files: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    assert!(
+        !profile.contains("go/pkg/mod/.*/\\.env$"),
+        "nothing to re-allow when nothing is denied\n{profile}"
+    );
+}
+
+// ============================================================
+// Named repositories (--repo-dir): project-grade roots (#344)
+// ============================================================
+
+/// The capability that separates a named root from an `allow.write` grant.
+/// A write grant is deliberately non-executable (#319), so a sibling granted
+/// that way can be edited but its own build cannot run. Naming it makes it a
+/// place to work, which is the whole reason siblings needed a feature rather
+/// than a documentation note.
+#[test]
+fn a_named_root_is_granted_read_write_and_execute() {
+    let named = [PathBuf::from("/elsewhere/lib")];
+    let profile = generate_profile(
+        &SandboxConfig {
+            named_roots: &named,
+            named_root_git_dirs: &[],
+            ..base_profile_options()
+        },
+        &[],
+    );
+    for rule in [
+        "(allow file-read* (subpath \"/elsewhere/lib\"))",
+        "(allow file-write* (subpath \"/elsewhere/lib\"))",
+        "(allow file-map-executable (subpath \"/elsewhere/lib\"))",
+    ] {
+        assert!(profile.contains(rule), "missing {rule}\n{profile}");
+    }
+    // Nothing takes execute back: `process-exec` is profile-wide, and the deny
+    // that covers `allow.write` trees must not cover this one.
+    assert!(
+        !profile.contains("(deny process-exec (subpath \"/elsewhere/lib\"))"),
+        "a named root must stay executable\n{profile}"
+    );
+}
+
+/// The protected-path tables are emitted per writable root. A named root that
+/// did not join that set would be a repository whose `.git/hooks` the agent
+/// could write — and hooks run OUTSIDE the sandbox on the user's next git
+/// operation there (#212, one tree over).
+#[test]
+fn a_named_root_carries_the_protected_paths() {
+    let named = [PathBuf::from("/elsewhere/lib")];
+    let profile = generate_profile(
+        &SandboxConfig {
+            named_roots: &named,
+            named_root_git_dirs: &[],
+            ..base_profile_options()
+        },
+        &[],
+    );
+    for rule in [
+        "(deny file-write* (subpath \"/elsewhere/lib/.git/hooks\"))",
+        "(deny file-write* (literal \"/elsewhere/lib/.git/config\"))",
+        "(deny file-write* (literal \"/elsewhere/lib/.cplt.toml\"))",
+    ] {
+        assert!(profile.contains(rule), "missing {rule}\n{profile}");
+    }
+}
+
+/// SBPL is last-match-wins, so the `allow.write` exec deny is emitted after
+/// every allow. An `allow.write` covering the parent of a named root would
+/// otherwise silently take back the execute the root exists to have — the same
+/// carve-out the project directory has always needed.
+#[test]
+fn an_allow_write_over_a_named_roots_parent_does_not_take_its_execute_back() {
+    let named = [PathBuf::from("/elsewhere/lib")];
+    let write = [PathBuf::from("/elsewhere")];
+    let profile = generate_profile(
+        &SandboxConfig {
+            named_roots: &named,
+            named_root_git_dirs: &[],
+            extra_write: &write,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    let deny = profile
+        .find("(deny process-exec (subpath \"/elsewhere\"))")
+        .expect("the allow.write tree loses execute");
+    let allow = profile
+        .find("(allow process-exec (subpath \"/elsewhere/lib\"))")
+        .expect("the named root keeps it");
+    assert!(
+        allow > deny,
+        "last match wins, so the carve-out must come after the deny\n{profile}"
+    );
+}
+
+/// Landlock has no last-match-wins and no sub-denies: the rule either grants
+/// execute on the tree or the build does not run. Asserted on the model rather
+/// than the kernel so it holds on every host.
+#[test]
+fn the_landlock_model_grants_a_named_root_the_project_access() {
+    let named = [PathBuf::from("/elsewhere/lib")];
+    let policy = generate_policy(&SandboxConfig {
+        named_roots: &named,
+        named_root_git_dirs: &[],
+        ..base_profile_options()
+    });
+    let rule = policy
+        .fs_rules
+        .iter()
+        .find(|r| r.path == Path::new("/elsewhere/lib"))
+        .expect("the named root must have a rule");
+    assert!(
+        rule.access.read && rule.access.write && rule.access.execute,
+        "a named root is project-grade: {:?}",
+        rule.access
+    );
+}
+
+/// A named root that is a linked worktree keeps its objects and refs in the
+/// main checkout's gitdir. Granting the tree without it leaves `git status`
+/// failing with `not a git repository` — the tree is reachable and the
+/// directory that makes it a repository is not.
+#[test]
+fn a_named_roots_shared_gitdir_is_granted() {
+    let named = [PathBuf::from("/elsewhere/lib-wt")];
+    let gitdirs = [PathBuf::from("/elsewhere/lib/.git/worktrees/wt")];
+    let profile = generate_profile(
+        &SandboxConfig {
+            named_roots: &named,
+            named_root_git_dirs: &gitdirs,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    for rule in [
+        "(allow file-read* (subpath \"/elsewhere/lib/.git/worktrees/wt\"))",
+        "(allow file-write* (subpath \"/elsewhere/lib/.git/worktrees/wt\"))",
+    ] {
+        assert!(profile.contains(rule), "missing {rule}\n{profile}");
+    }
+
+    let policy = generate_policy(&SandboxConfig {
+        named_roots: &named,
+        named_root_git_dirs: &gitdirs,
+        ..base_profile_options()
+    });
+    let rule = policy
+        .fs_rules
+        .iter()
+        .find(|r| r.path == Path::new("/elsewhere/lib/.git/worktrees/wt"))
+        .expect("the shared gitdir must have a rule");
+    assert!(
+        rule.access.read && rule.access.write && !rule.access.execute,
+        "read+write, never execute: {:?}",
+        rule.access
+    );
+}
+
 /// A default `SandboxConfig` for tests that only care about one or two fields.
 /// Every other test here spells the struct out; new ones need not.
 fn base_profile_options() -> SandboxConfig<'static> {
@@ -1407,6 +1659,8 @@ fn base_profile_options() -> SandboxConfig<'static> {
         extra_exec: &[],
         extra_socket: &[],
         extra_deny: &[],
+        named_roots: &[],
+        named_root_git_dirs: &[],
         existing_home_tool_dirs: None,
         existing_app_dirs: None,
         extra_ports: &[],
@@ -2758,6 +3012,8 @@ fn allow_localhost_any_affects_both_backends() {
         extra_exec: &[],
         extra_socket: &[],
         extra_deny: &[],
+        named_roots: &[],
+        named_root_git_dirs: &[],
         existing_home_tool_dirs: None,
         existing_app_dirs: None,
         extra_ports: &[],
@@ -2817,6 +3073,8 @@ fn config_options_parity_across_backends() {
         extra_exec: &[],
         extra_socket: &[],
         extra_deny: &[],
+        named_roots: &[],
+        named_root_git_dirs: &[],
         existing_home_tool_dirs: None,
         existing_app_dirs: None,
         extra_ports: &ports,
@@ -5053,6 +5311,8 @@ fn profile_gpg_signing_deny_path_wins() {
     let p = generate_profile(
         &SandboxConfig {
             extra_deny: &deny,
+            named_roots: &[],
+            named_root_git_dirs: &[],
             allow_gpg_signing: true,
             ..base_profile_options()
         },
@@ -6054,6 +6314,8 @@ fn profile_docker_withholds_the_overlapping_reallow() {
     let p = generate_profile(
         &SandboxConfig {
             extra_deny: &[std::path::PathBuf::from("/Users/test/.docker")],
+            named_roots: &[],
+            named_root_git_dirs: &[],
             allow_docker: true,
             ..base_profile_options()
         },
@@ -6121,6 +6383,8 @@ fn profile_socket_skipped_when_deny_path_overlaps() {
                 "/Users/test/.codex/codex-lsp/daemon/daemon.sock",
             )],
             extra_deny: &[std::path::PathBuf::from("/Users/test/.codex")],
+            named_roots: &[],
+            named_root_git_dirs: &[],
             ..base_profile_options()
         },
         &[],
@@ -6448,8 +6712,11 @@ fn repo_key_target_rejects_machine_specific_keys() {
         "sandbox.quiet",
         "sandbox.validate",
         "sandbox.scratch_dir",
+        // `inherit_env` stays rejected: it passes the whole environment, so a
+        // repo could not enumerate what it is asking for and a reviewer could
+        // not see it. `pass_env` names variables one at a time, which is why it
+        // moved to `[propose]` (#443) and is asserted below instead.
         "sandbox.inherit_env",
-        "sandbox.pass_env",
         "proxy.enabled",
         "proxy.port",
         "proxy.log_file",
@@ -6466,6 +6733,21 @@ fn repo_key_target_rejects_machine_specific_keys() {
             "{key_str} should be rejected in repo config"
         );
     }
+
+    // The deliberate exception (#443). The old refusal said environment
+    // variables are machine-specific and not project policy; plenty are the
+    // application's — NODE_ENV, TZ, SPRING_PROFILES_ACTIVE — and none of those
+    // is sensitive. The real hazard is that the name is resolved against the
+    // *parent's* environment, which is what `[propose]` plus a per-machine
+    // acceptance is for.
+    let pass_env = lookup_key("sandbox.pass_env").unwrap();
+    assert!(
+        matches!(
+            repo_key_target(pass_env),
+            Some(cplt::config::RepoKeyTarget::ProposeStrArray("pass_env"))
+        ),
+        "sandbox.pass_env is proposable, and nothing else changed about it"
+    );
 }
 
 #[test]
@@ -7831,6 +8113,8 @@ fn landlock_relocated_cargo_bin_is_exec_only_and_registry_is_precreated() {
         extra_exec: &[],
         extra_socket: &[],
         extra_deny: &[],
+        named_roots: &[],
+        named_root_git_dirs: &[],
         existing_home_tool_dirs: Some(&dirs),
         existing_app_dirs: None,
         extra_ports: &[],

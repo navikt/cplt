@@ -1047,14 +1047,33 @@ impl Resolved {
         // block restating it would be noise. With more than one, the source
         // column is the point — a root persisted in the local config is the one
         // nobody on this command line asked for.
-        if !repos.is_empty() {
+        // More than one: with a single repository the `Project:` line below
+        // already says it, and a one-row block restating it is noise. The rows
+        // themselves always carry the launch repository — the brief needs it —
+        // so the decision to skip belongs here rather than in the data.
+        if repos.len() > 1 {
             let width = repos.iter().map(|r| r.name.len()).max().unwrap_or(0);
+            let path_width = repos
+                .iter()
+                .map(|r| r.path.display().to_string().len())
+                .max()
+                .unwrap_or(0);
             eprintln!("{blue}[cplt]{nc}  {dim}Repositories:{nc}");
             for row in repos {
+                // The grant column is the one an operator has to read before
+                // agreeing: a sibling root is a second writable-and-executable
+                // tree, and it is otherwise indistinguishable from a nested one
+                // that added no access at all.
+                let grant = row.grant.label();
+                let grant = if grant.is_empty() {
+                    String::new()
+                } else {
+                    format!("   {dim}{grant}{nc}")
+                };
                 eprintln!(
-                    "{blue}[cplt]{nc}    {:width$}  {}   {dim}{}{nc}",
+                    "{blue}[cplt]{nc}    {:width$}  {:path_width$}   {dim}{}{nc}{grant}",
                     row.name,
-                    row.path.display(),
+                    row.path.display().to_string(),
                     row.source
                 );
             }
@@ -1433,13 +1452,26 @@ impl Resolved {
     /// the repo never named while looking perfectly enforced.
     ///
     /// Returns a list of unapproved proposal keys (for display to the user).
-    pub fn apply_repo_config(
+    /// Apply a repository's `[deny]` section, and nothing else.
+    ///
+    /// Separate from [`Self::apply_repo_config`] because it is the only half a
+    /// repository other than the launch one gets. `[deny]` can only tighten
+    /// (`SECURITY.md`), so it needs no approval, no trust entry and no content
+    /// hash — there is no grant channel to open, and #206's bypass class does
+    /// not multiply with the number of repositories in scope.
+    ///
+    /// `deny.paths` anchors to `config_dir`, so the union of N repositories'
+    /// deny paths is exactly "each repository's deny applies inside that
+    /// repository" — neither backend needs to tell the roots apart, and neither
+    /// can: rules are absolute paths in one process-wide policy. `deny.env` is
+    /// the exception and IS process-wide; a named repository stripping a
+    /// variable strips it for the session, which is tightening and therefore
+    /// allowed, but the caller says so out loud.
+    pub fn apply_repo_deny(
         &mut self,
         repo_config: &crate::repo_config::RepoConfig,
         config_dir: &std::path::Path,
-        approved_keys: &[&str],
-    ) -> Vec<String> {
-        // ── Deny section: applied automatically ──────────────────────────
+    ) {
         for path_str in &repo_config.deny.paths {
             let path = resolve_repo_path(path_str, config_dir);
             if !self.deny_paths.contains(&path) {
@@ -1447,11 +1479,20 @@ impl Resolved {
             }
         }
         // deny.env is stored separately — the caller must use it when building
-        // the sandbox environment (strip these vars). We store them on the resolved
-        // struct for that purpose.
+        // the sandbox environment (strip these vars). We store them on the
+        // resolved struct for that purpose.
         self.deny_env.extend(repo_config.deny.env.iter().cloned());
         self.deny_env.sort_unstable();
         self.deny_env.dedup();
+    }
+
+    pub fn apply_repo_config(
+        &mut self,
+        repo_config: &crate::repo_config::RepoConfig,
+        config_dir: &std::path::Path,
+        approved_keys: &[&str],
+    ) -> Vec<String> {
+        self.apply_repo_deny(repo_config, config_dir);
 
         // ── Propose section: only approved keys ──────────────────
         let is_approved = |key: &str| approved_keys.contains(&key);
@@ -1548,6 +1589,23 @@ impl Resolved {
                     self.allow_socket.push(path);
                 }
             }
+        }
+
+        // `pass_env` proposals (#443). The variable is read from the parent's
+        // environment at launch, so what a repo can express here is a *name*,
+        // never a value — and it does nothing until this machine's human has
+        // accepted it.
+        if is_approved("sandbox.pass_env") {
+            for name in &repo_config.propose.pass_env {
+                if !self.pass_env.contains(name) {
+                    self.pass_env.push(name.clone());
+                }
+            }
+            // The list is sorted and deduped when config and CLI are merged;
+            // appending here would leave it neither, and every other proposal
+            // that extends a list restores the invariant.
+            self.pass_env.sort();
+            self.pass_env.dedup();
         }
 
         // Port proposals

@@ -206,6 +206,23 @@ fn configure_command(
     // cplt will see this and bail before launching another sandbox.
     cmd.env("__CPLT_WRAPPED", "1");
 
+    // Point the agent at its own brief, so it does not have to know the
+    // `$TMPDIR/CPLT_BRIEF.md` convention to find it. Gated on the files
+    // actually existing: the brief is opt-in (`sandbox.brief`), and a variable
+    // naming a file that is not there is worse than no variable — it is the one
+    // thing the AGENTS.md block currently has to hedge about in prose.
+    if let Some(scratch) = scratch_dir {
+        for (var, name) in [
+            ("CPLT_BRIEF", crate::brief::BRIEF_MD),
+            ("CPLT_BRIEF_JSON", crate::brief::BRIEF_JSON),
+        ] {
+            let path = scratch.join(name);
+            if path.is_file() {
+                cmd.env(var, &path);
+            }
+        }
+    }
+
     // When proxy is enabled, tell Node.js (bundled in Copilot CLI) to route
     // traffic through our CONNECT proxy. NODE_USE_ENV_PROXY is required for
     // Node.js ≥24.5.0 to honor HTTP_PROXY/HTTPS_PROXY natively.
@@ -639,9 +656,19 @@ fn install_command_wrappers(
         // sandbox; that ref file is agent-writable, so the agent could rewrite
         // the guard's yardstick and push to the real default branch
         // (GHSA-cm6f-3wjh-x9qx). Same treatment as the gh guard's repo scope.
-        let repo_facts = crate::git::trusted_git()
+        // The launch repository's facts, plus one member per named root: a push
+        // inside a named root has to be judged by THAT repository's default
+        // branch, and before this it had no baked answer at all, so every push
+        // there failed closed with wording about the launch repository.
+        let mut repo_facts = crate::git::trusted_git()
             .map(|git| crate::gh_proxy::capture_repo_facts(git, project_dir))
             .unwrap_or_default();
+        if let Some(git) = crate::git::trusted_git() {
+            repo_facts.named = repo_dirs
+                .iter()
+                .map(|dir| crate::gh_proxy::capture_repo_facts(git, dir))
+                .collect();
+        }
         // Two conditions narrow this to the case the operator can act on.
         // `!quiet`, because `cplt exec` defaults to quiet and its stderr must
         // stay clean for pipes (`e2e_exec_no_output_contamination`) — the same
@@ -655,6 +682,10 @@ fn install_command_wrappers(
         if !quiet
             && git_guard.protect_default_branch_only
             && repo_facts.default_branches.is_empty()
+            && repo_facts
+                .named
+                .iter()
+                .all(|n| n.default_branches.is_empty())
             && crate::git::trusted_git()
                 .is_some_and(|git| crate::gh_proxy::has_remotes(git, project_dir))
         {
@@ -665,21 +696,40 @@ fn install_command_wrappers(
                  project repository and start a new session.",
             );
         }
+        // An allow_push rule also requires the push to run in a repository the
+        // session has in scope (#424). That needs the scope to have been
+        // captured; when it could not be, the rule falls back to URL identity
+        // alone. Say so rather than leaving the operator with a rule that is
+        // quieter than they think.
+        if !git_guard.allow_push.is_empty()
+            && repo_facts.git_common_dir.is_empty()
+            && repo_facts.named.iter().all(|n| n.git_common_dir.is_empty())
+            && !quiet
+        {
+            ui::warn(
+                "git guard: the repositories in scope could not be identified at launch, so \
+                 allow_push rules authorize by destination URL alone. A push from a clone \
+                 made inside the project to a URL a rule pins is then authorized too.",
+            );
+        }
         if !git_guard.allow_push.is_empty() {
             if let Some(trusted) = crate::git::trusted_git() {
-                git_guard.allow_push = crate::gh_proxy::resolve_push_rule_urls(
-                    trusted,
-                    project_dir,
-                    &git_guard.allow_push,
-                );
+                // Every repository in scope, not only the launch one: a rule
+                // naming `origin` is about the origin of a repository in THIS
+                // session, and a named root's origin is one of them (#424).
+                let scope: Vec<&Path> = std::iter::once(project_dir)
+                    .chain(repo_dirs.iter().map(PathBuf::as_path))
+                    .collect();
+                git_guard.allow_push =
+                    crate::gh_proxy::resolve_push_rule_urls(trusted, &scope, &git_guard.allow_push);
                 for rule in &git_guard.allow_push {
                     if rule.url.is_none()
                         && let Some(name) = rule.remote.as_deref()
                     {
                         ui::warn(&format!(
-                            "git guard: allow_push remote {name:?} does not exist in this \
-                             repository, so the rule cannot be pinned to a repository and \
-                             authorizes no push. Add the remote before launch \
+                            "git guard: allow_push remote {name:?} does not exist in any \
+                             repository in scope, so the rule cannot be pinned to a repository \
+                             and authorizes no push. Add the remote before launch \
                              (`git remote add {name} <url>`), or drop the rule."
                         ));
                     }

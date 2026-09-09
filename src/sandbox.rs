@@ -121,6 +121,31 @@ pub use landlock_mod::available_abi_version;
 /// fields that [`PreparedSandbox`] needs at execution time.
 pub struct SandboxConfig<'a> {
     pub project_dir: &'a Path,
+    /// Repositories named with `--repo-dir` / `sandbox.repo_dirs`.
+    ///
+    /// Project-grade roots: read, write and execute, with the same protected
+    /// paths as the project directory. That is what distinguishes them from an
+    /// `allow.write` grant, which is deliberately non-executable (#319) — a
+    /// repository the user named is a place to build and test, exactly as the
+    /// project directory is.
+    ///
+    /// A root nested inside `project_dir` already inherits the project grant,
+    /// so naming it adds no file access; listing it here is still load-bearing,
+    /// because the protected-path tables and the bubblewrap read-only binds are
+    /// emitted per root and a nested repository's `.git` was covered only by
+    /// the macOS-only nested regex before.
+    pub named_roots: &'a [PathBuf],
+    /// The real `.git` of each named root whose repository data does NOT live
+    /// at `<root>/.git` — a linked worktree, a bare checkout, or a root that
+    /// points inside a repository.
+    ///
+    /// Granted read+write for the same reason [`Self::git_common_dir`] is for
+    /// the project: without it `git status` in that root fails with `not a git
+    /// repository`, because the tree is reachable and the directory holding its
+    /// objects and refs is not. Resolved parent-side by
+    /// [`crate::sandbox::named_root_git_dirs`], so a surface that builds a
+    /// policy cannot forget it (#447).
+    pub named_root_git_dirs: &'a [PathBuf],
     pub home_dir: &'a Path,
     pub extra_read: &'a [PathBuf],
     pub extra_write: &'a [PathBuf],
@@ -266,7 +291,18 @@ pub fn prepare(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
     validate_playwright_socket_capability(config.playwright_socket_dir)?;
     validate_hard_denied_grants(config)?;
     validate_exec_grants(config)?;
-    prepare_impl(config, &extra_git_dirs(config.extra_write))
+    // The named roots' resolved gitdirs join the write grants' here: they are
+    // granted (see `named_root_git_dirs`) and therefore need the same
+    // persistence denies and the same bubblewrap read-only binds.
+    let mut git_dirs = extra_git_dirs(config.extra_write);
+    for dir in config.named_root_git_dirs {
+        if !git_dirs.contains(dir) {
+            git_dirs.push(dir.clone());
+        }
+    }
+    git_dirs.sort();
+    git_dirs.dedup();
+    prepare_impl(config, &git_dirs)
 }
 
 /// Refuse to launch when a grant names a hard-denied file or a credential
@@ -418,6 +454,14 @@ fn validate_exec_grants(config: &SandboxConfig) -> Result<(), String> {
 /// `--allow-cache-exec` exists to handle deliberately.
 fn writable_trees(config: &SandboxConfig) -> Vec<(PathBuf, &'static str)> {
     let mut trees = vec![(config.project_dir.to_path_buf(), "the project directory")];
+    // Project-grade, so write+exec by design and never a tree an `allow.exec`
+    // grant may overlap — the same rule the project directory carries.
+    trees.extend(
+        config
+            .named_roots
+            .iter()
+            .map(|r| (r.clone(), "the named repository")),
+    );
     trees.extend(
         config
             .extra_write
@@ -521,8 +565,8 @@ const SYSTEM_TEMP_DIRS: &[&str] = &["/tmp"];
 /// PARENT process, with the granted repo's config in scope — so it routes
 /// through the hardened invoker (`git::command`, #211) like every other
 /// parent-side git invocation.
-fn extra_git_dirs(extra_write: &[PathBuf]) -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = extra_write
+fn extra_git_dirs(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = roots
         .iter()
         .filter_map(|root| {
             let dir = crate::discover::git_dir_of(root)?;
@@ -535,6 +579,19 @@ fn extra_git_dirs(extra_write: &[PathBuf]) -> Vec<PathBuf> {
     dirs.sort();
     dirs.dedup();
     dirs
+}
+
+/// The real `.git` of every named root that does not keep it at `<root>/.git`.
+///
+/// The same resolution `extra_git_dirs` performs for write grants, exposed
+/// because the answer is *granted* for a named root rather than only denied:
+/// a linked worktree's objects and refs live in the main checkout's gitdir, and
+/// without it `git` inside the named root fails with `not a git repository`.
+/// Callers build the policy from it, so it is resolved once, parent-side,
+/// through the hardened invoker.
+#[must_use]
+pub fn named_root_git_dirs(roots: &[PathBuf]) -> Vec<PathBuf> {
+    extra_git_dirs(roots)
 }
 
 /// Human-readable representation of the sandbox policy.
@@ -693,6 +750,7 @@ fn git_roots<'a>(
     extra_git_dirs: &'a [PathBuf],
 ) -> (Vec<&'a Path>, Vec<&'a Path>) {
     let mut write_roots: Vec<&Path> = vec![config.project_dir];
+    write_roots.extend(config.named_roots.iter().map(PathBuf::as_path));
     write_roots.extend(config.extra_write.iter().map(PathBuf::as_path));
     let mut git_dirs: Vec<&Path> = config.git_common_dir.into_iter().collect();
     git_dirs.extend(extra_git_dirs.iter().map(PathBuf::as_path));
@@ -1045,6 +1103,12 @@ fn prepare_impl(
 #[cfg(target_os = "macos")]
 fn validate_config_paths(config: &SandboxConfig) -> Result<(), String> {
     policy::validate_sbpl_path(config.project_dir).map_err(|e| format!("Project dir: {e}"))?;
+    for root in config.named_roots {
+        policy::validate_sbpl_path(root).map_err(|e| format!("Named repository: {e}"))?;
+    }
+    for dir in config.named_root_git_dirs {
+        policy::validate_sbpl_path(dir).map_err(|e| format!("Named repository .git dir: {e}"))?;
+    }
     policy::validate_sbpl_path(config.home_dir).map_err(|e| format!("Home dir: {e}"))?;
 
     if let Some(dir) = config.copilot_install_dir {
@@ -1203,6 +1267,8 @@ mod tests {
             extra_exec: &[],
             extra_socket: &[],
             extra_deny: &[],
+            named_roots: &[],
+            named_root_git_dirs: &[],
             existing_home_tool_dirs: None,
             existing_app_dirs: None,
             extra_ports: &[],
