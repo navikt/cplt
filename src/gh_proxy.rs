@@ -3116,8 +3116,22 @@ pub fn gate_git(
         } else {
             format!("\n{}", block_hints.join("\n"))
         };
+        // Name the repository the push targets, but only where "which
+        // repository?" is a live question: a session spanning several, or a
+        // push that landed outside all of them. In a one-repository session
+        // there is nothing to disambiguate and the path is noise in every
+        // refusal.
+        let target = match repo_facts.target(&repo_args, real_git) {
+            Some(member) if !repo_facts.named.is_empty() => {
+                format!(" in {}", member.project_dir)
+            }
+            None if !repo_facts.git_common_dir.is_empty() || !repo_facts.named.is_empty() => {
+                " in a repository this session does not have in scope".to_string()
+            }
+            _ => String::new(),
+        };
         return Err(Refusal {
-            headline: format!("'git {sub}' is not allowed in this environment."),
+            headline: format!("'git {sub}'{target} is not allowed in this environment."),
             guidance: format!("Push prevention is enabled — commit your changes locally.{hints}"),
             agent_note: &[
                 "This operation is restricted by the cplt sandbox to prevent unintended pushes.",
@@ -7940,6 +7954,84 @@ mod tests {
             &facts,
         )
         .expect("with nothing identified the rule falls back to URL identity, as the launch says");
+    }
+
+    /// With several repositories in scope, "not allowed" without a subject
+    /// leaves an agent unable to tell "wrong repository" from "no rule
+    /// matched". The gh side has named the target since #230; the push side
+    /// did not.
+    #[test]
+    fn a_push_refusal_names_the_repository_when_there_is_a_choice() {
+        let Some((_tmp, launch)) =
+            scratch_repo_with_default("main", "https://github.com/o/launch.git", "main")
+        else {
+            return; // no git available
+        };
+        let Some((_tmp2, named)) =
+            scratch_repo_with_default("main", "https://github.com/o/named.git", "main")
+        else {
+            return;
+        };
+        let git = which_git().unwrap();
+        let dir = named.to_string_lossy().into_owned();
+
+        // One repository in scope, pushing in it: nothing to disambiguate, so
+        // the headline stays the shared one rather than carrying a path into
+        // every refusal.
+        let alone = capture_repo_facts(&git, &launch);
+        let launch_dir = launch.to_string_lossy().into_owned();
+        let err = gate_git(
+            &["-C", launch_dir.as_str(), "push", "origin", "main"],
+            true,
+            true,
+            false,
+            &[],
+            Some(&git),
+            &alone,
+        )
+        .expect_err("push prevention refuses")
+        .to_string();
+        assert!(
+            err.contains("'git push' is not allowed"),
+            "a single-repository session needs no subject: {err}"
+        );
+
+        // Pushing somewhere the session was never given, with one repository in
+        // scope: the subject is what makes that legible at all.
+        let err = gate_git(
+            &["-C", dir.as_str(), "push", "origin", "main"],
+            true,
+            true,
+            false,
+            &[],
+            Some(&git),
+            &alone,
+        )
+        .expect_err("push prevention refuses")
+        .to_string();
+        assert!(
+            err.contains("does not have in scope"),
+            "an out-of-scope push must say so: {err}"
+        );
+
+        // Two in scope, pushing in the named one: say which.
+        let mut facts = alone.clone();
+        facts.named = vec![capture_repo_facts(&git, &named)];
+        let err = gate_git(
+            &["-C", dir.as_str(), "push", "origin", "main"],
+            true,
+            true,
+            false,
+            &[],
+            Some(&git),
+            &facts,
+        )
+        .expect_err("push prevention refuses")
+        .to_string();
+        assert!(
+            err.contains(&facts.named[0].project_dir),
+            "the refusal must name the targeted repository: {err}"
+        );
     }
 
     /// #424: an allow_push rule carries launch/named-root identity. The

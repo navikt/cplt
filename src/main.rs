@@ -4970,6 +4970,7 @@ fn run_check_command(
             &disabled,
             &home_dir,
             &project_dir,
+            &repo_paths,
             active_agent,
             agent_name,
             preset_name,
@@ -5104,6 +5105,7 @@ fn build_battery(
     disabled: &[sandbox::HardeningCategory],
     home_dir: &Path,
     project_dir: &Path,
+    named_roots: &[PathBuf],
     agent: agent::Agent,
     agent_name: String,
     preset_name: Option<String>,
@@ -5178,6 +5180,48 @@ fn build_battery(
         fix: None,
         note: baseline_note(write_proj),
     });
+
+    // ── Named repositories ──
+    // A named root is a second read/write/EXECUTE tree, which is the whole
+    // point of naming it and also the cost. `check` reports what enforcement
+    // actually does, so it has to look there: probing only the project
+    // directory left the one command a user runs to confirm the sandbox silent
+    // about the grant they had just added.
+    for root in named_roots {
+        let label = root.file_name().map_or_else(
+            || root.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        let expl = check::explain_path(policy, home_dir, project_dir, root);
+        items.push(check::CheckItem {
+            name: format!("write named repo {label}"),
+            category: "filesystem".to_string(),
+            target: root.display().to_string(),
+            decision: probe_write(prepared, resolved, disabled, root),
+            expected: Some(check::Decision::Allowed),
+            reason: expl.reason.clone(),
+            fix: expl.fix.clone(),
+            note: None,
+        });
+        // The property that separates a named root from an ungoverned tree.
+        // Hooks run OUTSIDE the sandbox on the user's next git operation there,
+        // so this is the one that must stay blocked however wide the grant is.
+        let hooks = root.join(".git/hooks");
+        if hooks.is_dir() {
+            items.push(check::CheckItem {
+                name: format!("write {label}/.git/hooks"),
+                category: "filesystem".to_string(),
+                target: hooks.display().to_string(),
+                decision: probe_write(prepared, resolved, disabled, &hooks),
+                expected: Some(check::Decision::Blocked),
+                reason: "git hooks run outside the sandbox on the next git operation in \
+                         that repository, so they stay unwritable in every writable root."
+                    .to_string(),
+                fix: None,
+                note: None,
+            });
+        }
+    }
 
     // Protection: a credential path must be BLOCKED for read.
     let (prot_path, prot_label) = pick_protected_read(home_dir);
