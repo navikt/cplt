@@ -424,21 +424,26 @@ Both are rendered from the resolved policy for *that* launch — the repositorie
 in scope, network mode, `.env` handling, credential denies — and disappear with
 the scratch dir when the session ends. Neither touches your project.
 
-The two environment variables are set only when the files exist, so an agent
-can test for `$CPLT_BRIEF` rather than guessing a path, and a variable never
-names a file that is not there. The JSON carries a little more than the prose
-(the grant lists, the port numbers); both come from one captured set of facts,
-so they cannot describe different sessions.
+The two environment variables are set only when the files exist, so an agent can
+test for `$CPLT_BRIEF` rather than guessing a path, and a variable never names a
+file that is not there. That means neither is set with `sandbox.brief = false`,
+and neither is set with `--no-scratch-dir` (or `sandbox.scratch_dir = false`)
+either: the brief lives in the scratch dir and nowhere else, so cplt warns and
+writes nothing.
+
+The JSON carries a little more than the prose: the `allow.read` / `allow.write`
+/ `allow.exec` path lists, the port numbers, and every repository in scope even
+for a single-repository session, where the prose omits the section because it
+would restate what the rest of the brief assumes. Both come from one captured
+set of facts, so they cannot describe different sessions.
 
 Turn it on for one run with `--brief`, or for good with
 `cplt config set sandbox.brief true`.
 
-**Why it is off by default.** cplt writing files that an agent then reads is a
-behaviour change, and the format is not stable yet — see the note above. If you
-want your agents to have it, turn it on in your global config; there is nothing
-about it that only works for some projects. Note that turning it on is what
-makes the `## Repositories` section — the list of what a multi-repository
-session actually spans — reach the agent at all.
+There is nothing about the brief that only works for some projects, so if you
+want your agents to have it, turn it on in your global config. Turning it on is
+also what makes the `## Repositories` section reach the agent: the list of what
+a multi-repository session actually spans exists only here.
 
 **`sandbox.agents_md` (default `false`)** — additionally injects a managed
 block into `<project>/AGENTS.md`, creating the file if it does not exist. This

@@ -1047,7 +1047,11 @@ impl Resolved {
         // block restating it would be noise. With more than one, the source
         // column is the point — a root persisted in the local config is the one
         // nobody on this command line asked for.
-        if !repos.is_empty() {
+        // More than one: with a single repository the `Project:` line below
+        // already says it, and a one-row block restating it is noise. The rows
+        // themselves always carry the launch repository — the brief needs it —
+        // so the decision to skip belongs here rather than in the data.
+        if repos.len() > 1 {
             let width = repos.iter().map(|r| r.name.len()).max().unwrap_or(0);
             let path_width = repos
                 .iter()

@@ -48,6 +48,11 @@ pub const BLOCK_END: &str = "<!-- cplt:sandbox end -->";
 pub struct BriefFacts {
     /// The agent this session is sandboxing, by display name.
     pub agent: String,
+    /// Every repository in scope, launch repository included, whether or not
+    /// any were named. The Markdown omits the section for a single-repository
+    /// session because it would restate what the rest of the brief assumes;
+    /// this list does not, because a tool cannot tell an omitted section from
+    /// an empty scope.
     pub repositories: Vec<BriefRepo>,
     pub network: BriefNetwork,
     pub credentials: BriefCredentials,
@@ -62,8 +67,11 @@ pub struct BriefRepo {
     pub path: String,
     /// Where it was named: `launch repository`, `--repo-dir`, `local config`.
     pub source: String,
-    /// `launch`, `inherited` (nested, no new file access) or `new_tree`.
-    pub grant: &'static str,
+    /// The enum, not a string: the Markdown renderer matches on it, so a
+    /// fourth grant would fail to compile rather than be rendered silently
+    /// with the wording of whichever arm happened to be the catch-all.
+    /// Serialized as `launch`, `inherited` or `new_tree`.
+    pub grant: crate::config::RepoGrant,
     /// Whether `gh` may target it. False for an origin that is not a GitHub
     /// URL — the launch warns about exactly that root.
     pub in_gh_scope: bool,
@@ -74,11 +82,21 @@ pub struct BriefNetwork {
     pub proxy: bool,
     pub proxy_forced: bool,
     pub allow_all_domains: bool,
-    /// An allowlist is configured. It is only ENFORCED when `proxy` is also
-    /// true — the proxy is what applies it — which is why the two are separate
-    /// fields and `allowlist_in_force` is the one to read.
+    /// An allowlist is configured. It is only ENFORCED when the proxy is also
+    /// running (the proxy is what applies it) and nothing has switched domain
+    /// filtering off, which is why this and `allowlist_in_force` are separate
+    /// fields and the second is the one to read.
     pub default_allowlist: bool,
+    /// Domain filtering is actually applied this session.
+    ///
+    /// `default_allowlist && proxy` is not enough: `allow_all_domains` turns
+    /// filtering off, and the prose says so first. A JSON that reported an
+    /// allowlist "in force" while the agent could reach any domain would be
+    /// this file doing the one thing it must not do.
     pub allowlist_in_force: bool,
+    /// The ports `allow.ports` names. CONFIGURED, not effective: under
+    /// `proxy_forced` no direct socket is opened for any of them, which is why
+    /// `ssh` can read `blocked_by_port` while 22 is listed here.
     pub allow_ports: Vec<u16>,
     pub allow_localhost: Vec<u16>,
     pub allow_localhost_any: bool,
@@ -111,12 +129,24 @@ pub struct BriefPaths {
 impl BriefFacts {
     /// Decide every fact the brief states, from the resolved policy.
     #[must_use]
+    /// `observe_domains` is `--observe-domains`, which is NOT reflected in
+    /// `Resolved`: it forces the proxy on and empties the effective allowlist
+    /// through locals in the launcher, leaving `with_proxy` and
+    /// `default_allowlist` describing a session that is not the one running.
+    /// Without it the brief told the agent "the proxy refuses everything else"
+    /// during a run that permits everything, which is the exact failure this
+    /// file exists to avoid.
     pub fn capture(
         resolved: &Resolved,
         agent: Agent,
         home: &Path,
         repos: &[crate::config::RepoSummaryRow],
+        observe_domains: bool,
     ) -> Self {
+        // Derived once and reused, so the three facts that observe mode changes
+        // cannot be given three different answers.
+        let proxy = resolved.with_proxy || observe_domains;
+        let allow_all_domains = resolved.allow_all_domains || observe_domains;
         let strs = |v: &[std::path::PathBuf]| {
             v.iter()
                 .map(|p| p.display().to_string())
@@ -130,20 +160,16 @@ impl BriefFacts {
                     name: r.name.clone(),
                     path: r.path.display().to_string(),
                     source: r.source.to_string(),
-                    grant: match r.grant {
-                        crate::config::RepoGrant::Launch => "launch",
-                        crate::config::RepoGrant::Inherited => "inherited",
-                        crate::config::RepoGrant::NewTree => "new_tree",
-                    },
+                    grant: r.grant,
                     in_gh_scope: r.github,
                 })
                 .collect(),
             network: BriefNetwork {
-                proxy: resolved.with_proxy,
+                proxy,
                 proxy_forced: resolved.proxy_forced,
-                allow_all_domains: resolved.allow_all_domains,
+                allow_all_domains,
                 default_allowlist: resolved.default_allowlist,
-                allowlist_in_force: resolved.default_allowlist && resolved.with_proxy,
+                allowlist_in_force: resolved.default_allowlist && proxy && !allow_all_domains,
                 allow_ports: resolved.allow_ports.clone(),
                 allow_localhost: resolved.allow_localhost.clone(),
                 allow_localhost_any: resolved.allow_localhost_any,
@@ -179,7 +205,14 @@ impl BriefFacts {
 /// is a first-class use of it, and it is written once per session.
 #[must_use]
 pub fn generate_session_brief_json(facts: &BriefFacts) -> String {
-    serde_json::to_string_pretty(facts).unwrap_or_else(|_| "{}".to_string())
+    // Not `{}` on failure. An empty object parses, and a consumer reading it
+    // would see no repositories, no grants and no allowlist — a policy far
+    // wider than the real one, presented as fact. Serializing this struct
+    // cannot fail (no map keys, no floats), so this branch is unreachable; if
+    // it ever is reached, it must be unmistakable rather than plausible.
+    serde_json::to_string_pretty(facts).unwrap_or_else(|e| {
+        format!("{{\n  \"error\": \"cplt could not render the session brief: {e}\"\n}}\n")
+    })
 }
 
 /// Generate the per-session brief written to the scratch dir.
@@ -210,7 +243,11 @@ pub fn generate_session_brief(facts: &BriefFacts) -> String {
     // exactly that produced two recommendations to turn the gh guard off — the
     // refusal named an escape hatch and nothing narrower, so the model relayed
     // the only fix it was shown.
-    if !repos.is_empty() {
+    // More than one, for the prose only: telling an agent working in one
+    // repository that it is working in one repository earns no lines. The JSON
+    // carries the launch repository either way — a tool reading
+    // `"repositories": []` would conclude nothing is in scope.
+    if repos.len() > 1 {
         out.push_str("## Repositories\n\n");
         for row in repos {
             // `row.source` rather than a hard-coded `--repo-dir`: a root can
@@ -218,18 +255,18 @@ pub fn generate_session_brief(facts: &BriefFacts) -> String {
             // config, and naming a flag nobody passed is the same lie the
             // launch warnings already avoid.
             let what = match row.grant {
-                "launch" => {
+                crate::config::RepoGrant::Launch => {
                     "the launch repository: read, write, execute, and the repository `git push` \
                      targets by default"
                         .to_string()
                 }
-                "inherited" => format!(
+                crate::config::RepoGrant::Inherited => format!(
                     "named for this session ({}), inside the launch repository: you already had \
                      these files; naming it gives it its own audit and lets `git push` be judged \
                      by its own default branch",
                     row.source
                 ),
-                _ => format!(
+                crate::config::RepoGrant::NewTree => format!(
                     "named for this session ({}): read, write and execute on a tree outside the \
                      launch repository, audited, and `git push` judged by its own default branch",
                     row.source
@@ -530,8 +567,10 @@ pub fn write_session_brief(
 ) -> std::io::Result<std::path::PathBuf> {
     let path = scratch_dir.join(BRIEF_MD);
     std::fs::write(&path, generate_session_brief(facts))?;
-    // Written second and warned about separately: a JSON failure must not cost
-    // the agent the prose, which is the rendering it can always read.
+    // Written second, and its failure does NOT take the prose down with it: the
+    // Markdown is already on disk by the time this runs, and the environment
+    // variables are set per file that exists, so a missing JSON costs the agent
+    // nothing it had. The error is still returned so the caller warns.
     std::fs::write(
         scratch_dir.join(BRIEF_JSON),
         generate_session_brief_json(facts),
@@ -579,9 +618,9 @@ pub fn managed_block() -> String {
          `$CPLT_BRIEF` and `$CPLT_BRIEF_JSON` name them when they exist, so \
          check those rather than guessing the path. They are not always \
          present: this block is committed and outlives the flags that produced \
-         it, and `--no-brief` with `--agents-md` writes this file without \
-         those. `cplt check` reports the same policy from outside the sandbox \
-         either way.\n\
+         it, and `--no-brief` with `--agents-md` writes this block without \
+         the brief files or their variables. `cplt check` reports the same \
+         policy from outside the sandbox either way.\n\
          {BLOCK_END}"
     )
 }
@@ -858,6 +897,47 @@ mod tests {
         Path::new("/home/tester")
     }
 
+    /// Observe mode is not in `Resolved`, and the brief has to see it anyway.
+    ///
+    /// `--observe-domains` forces the proxy on and empties the effective
+    /// allowlist through locals in the launcher; `with_proxy` and
+    /// `default_allowlist` keep describing the session the user configured
+    /// rather than the one running. Before this the brief told the agent "the
+    /// proxy refuses everything else" during a run that permits everything, and
+    /// "no proxy is active" during a run with one.
+    #[test]
+    fn observe_mode_is_reported_as_the_session_that_is_actually_running() {
+        let mut resolved = base_resolved();
+        resolved.with_proxy = false;
+        resolved.default_allowlist = true;
+        resolved.allow_all_domains = false;
+        let facts = BriefFacts::capture(
+            &resolved,
+            crate::agent::Agent::Copilot,
+            std::path::Path::new("/projects/app"),
+            &[],
+            true,
+        );
+        assert!(facts.network.proxy, "observe mode forces the proxy on");
+        assert!(
+            facts.network.allow_all_domains,
+            "observe mode permits every domain"
+        );
+        assert!(
+            !facts.network.allowlist_in_force,
+            "an allowlist is configured but observe mode is not enforcing it"
+        );
+        let md = generate_session_brief(&facts);
+        assert!(
+            !md.contains("The proxy refuses everything"),
+            "the prose must not promise filtering during a discovery run:\n{md}"
+        );
+        assert!(
+            !md.contains("No proxy is active for this session"),
+            "a proxy IS running:\n{md}"
+        );
+    }
+
     /// The facts must match the policy they claim to describe.
     ///
     /// The agreement test above cannot see this: `BriefFacts` is the single
@@ -876,12 +956,16 @@ mod tests {
             resolved.proxy_forced = forced;
             resolved.allow_env_files = env_files;
             resolved.allow_all_domains = allow_all;
+            // On in every case, so the derived field is exercised against every
+            // combination of the two things that can switch filtering off.
+            resolved.default_allowlist = true;
             resolved.allow_ports = vec![443, 5432];
             let facts = BriefFacts::capture(
                 &resolved,
                 crate::agent::Agent::Copilot,
                 std::path::Path::new("/projects/app"),
                 &[],
+                false,
             );
             assert_eq!(facts.network.proxy, resolved.with_proxy);
             assert_eq!(facts.network.proxy_forced, resolved.proxy_forced);
@@ -891,13 +975,17 @@ mod tests {
                 facts.credentials.env_files_readable,
                 resolved.allow_env_files
             );
-            // The one derived field, and the reason it is derived: an allowlist
-            // is configured by `default_allowlist` but ENFORCED by the proxy,
-            // so claiming it is in force without one would be the brief telling
-            // the agent the opposite of the truth.
+            // The one derived field. Asserted against what "in force" MEANS,
+            // not against the expression that computes it: an assertion that
+            // restates the implementation cannot catch the implementation being
+            // wrong, and this one was. It read `default_allowlist && with_proxy`
+            // and so reported an allowlist in force under `--allow-all-domains`,
+            // which switches domain filtering off.
+            let filtering_applies =
+                resolved.default_allowlist && resolved.with_proxy && !resolved.allow_all_domains;
             assert_eq!(
-                facts.network.allowlist_in_force,
-                resolved.default_allowlist && resolved.with_proxy
+                facts.network.allowlist_in_force, filtering_applies,
+                "allowlist_in_force must mean domain filtering is applied"
             );
         }
     }
@@ -939,20 +1027,28 @@ mod tests {
         ];
         // Both sides of every branch the two renderings share, so neither is
         // asserted only in its default state.
-        for (proxy, forced, env_files) in [
-            (true, true, false),
-            (true, false, true),
-            (false, false, false),
+        for (proxy, forced, env_files, allow_all, allowlist) in [
+            (true, true, false, false, true),
+            (true, false, true, false, false),
+            (false, false, false, false, false),
+            // An allowlist configured with no proxy to enforce it.
+            (false, false, false, false, true),
+            // `--allow-all-domains` with an allowlist configured: the prose
+            // says filtering is off, and the JSON used to say it was in force.
+            (true, false, false, true, true),
         ] {
             let mut resolved = base_resolved();
             resolved.with_proxy = proxy;
             resolved.proxy_forced = forced;
             resolved.allow_env_files = env_files;
+            resolved.allow_all_domains = allow_all;
+            resolved.default_allowlist = allowlist;
             let facts = BriefFacts::capture(
                 &resolved,
                 crate::agent::Agent::Copilot,
                 std::path::Path::new("/projects/app"),
                 &rows,
+                false,
             );
             let md = generate_session_brief(&facts);
             let json = generate_session_brief_json(&facts);
@@ -961,23 +1057,44 @@ mod tests {
                 assert!(md.contains(&row.name), "markdown is missing {}", row.name);
                 assert!(json.contains(&row.name), "json is missing {}", row.name);
             }
-            // The gh-scope claim is the one that was wrong once already.
+            // The gh-scope claim is the one that was wrong once already (#471),
+            // so it is asserted PER ROW. A whole-document `contains` passes
+            // even with the renderer's two arms swapped: with one true row and
+            // one false row, both strings appear either way, and the test would
+            // wave through exactly the bug it exists to catch.
+            for row in &rows {
+                let line = md
+                    .lines()
+                    .find(|l| l.contains(&row.name))
+                    .unwrap_or_else(|| panic!("{} is not listed\n{md}", row.name));
+                assert_eq!(
+                    line.contains("NOT in the `gh` scope"),
+                    !row.github,
+                    "the row's gh-scope text does not match the row: {line}"
+                );
+            }
+            // The proxy claim. Keyed on the enforcement paragraph, which the
+            // prose emits exactly when the proxy runs — not on "No proxy is
+            // active", which is the last arm of a different chain and stays
+            // unsaid when an allowlist is configured without one.
+            let md_says_proxy =
+                md.contains("`proxy_forced` is on") || md.contains("`proxy_forced` is off this");
             assert_eq!(
-                md.contains("NOT in the `gh` scope"),
-                json.contains("\"in_gh_scope\": false"),
-                "the two renderings disagree about gh scope\n{md}\n{json}"
-            );
-            // The proxy claim: prose says "No proxy is active" exactly when the
-            // model says the proxy is off.
-            assert_eq!(
-                md.contains("No proxy is active for this session"),
-                json.contains("\"proxy\": false"),
+                md_says_proxy,
+                json.contains("\"proxy\": true"),
                 "the two renderings disagree about the proxy\n{md}\n{json}"
             );
             assert_eq!(
                 md.contains("`.env*` files are readable this session"),
                 json.contains("\"env_files_readable\": true"),
                 "the two renderings disagree about .env files\n{md}\n{json}"
+            );
+            // The prose branches on `allow_all_domains` FIRST, so "no allowlist
+            // this session" and "allowlist in force" must never both be said.
+            assert_eq!(
+                md.contains("Only the agent's built-in allowlist"),
+                json.contains("\"allowlist_in_force\": true"),
+                "the two renderings disagree about the allowlist\n{md}\n{json}"
             );
         }
     }
@@ -1025,6 +1142,7 @@ mod tests {
             crate::agent::Agent::Copilot,
             std::path::Path::new("/projects/app"),
             &rows,
+            false,
         ));
         assert!(brief.contains("## Repositories"), "{brief}");
         for expected in ["navikt/spleis", "navikt/model", "/w/model"] {
@@ -1070,6 +1188,7 @@ mod tests {
             crate::agent::Agent::Copilot,
             std::path::Path::new("/projects/app"),
             &[],
+            false,
         ));
         assert!(!plain.contains("## Repositories"), "{plain}");
     }
@@ -1078,13 +1197,23 @@ mod tests {
     fn brief_flips_env_files_warning_with_config() {
         let mut resolved = base_resolved();
         resolved.allow_env_files = false;
-        let brief =
-            generate_session_brief(&BriefFacts::capture(&resolved, Agent::Copilot, home(), &[]));
+        let brief = generate_session_brief(&BriefFacts::capture(
+            &resolved,
+            Agent::Copilot,
+            home(),
+            &[],
+            false,
+        ));
         assert!(brief.contains("also denied by default"));
 
         resolved.allow_env_files = true;
-        let brief =
-            generate_session_brief(&BriefFacts::capture(&resolved, Agent::Copilot, home(), &[]));
+        let brief = generate_session_brief(&BriefFacts::capture(
+            &resolved,
+            Agent::Copilot,
+            home(),
+            &[],
+            false,
+        ));
         assert!(!brief.contains("also denied"));
         assert!(brief.contains("readable this session"));
     }
@@ -1098,6 +1227,7 @@ mod tests {
             Agent::OpenCode,
             home(),
             &[],
+            false,
         ));
         assert!(!brief.contains("built-in allowlist"));
 
@@ -1107,6 +1237,7 @@ mod tests {
             Agent::OpenCode,
             home(),
             &[],
+            false,
         ));
         assert!(brief.contains("built-in allowlist"));
     }
@@ -1119,8 +1250,13 @@ mod tests {
         let mut resolved = base_resolved();
         resolved.default_allowlist = true;
         resolved.proxy_forced = false;
-        let brief =
-            generate_session_brief(&BriefFacts::capture(&resolved, Agent::Claude, home(), &[]));
+        let brief = generate_session_brief(&BriefFacts::capture(
+            &resolved,
+            Agent::Claude,
+            home(),
+            &[],
+            false,
+        ));
         assert!(
             !brief.contains("fails closed"),
             "plain proxy mode must not claim fail-closed:\n{brief}"
@@ -1128,16 +1264,26 @@ mod tests {
         assert!(brief.contains("direct `*:443` connections are still permitted"));
 
         resolved.proxy_forced = true;
-        let brief =
-            generate_session_brief(&BriefFacts::capture(&resolved, Agent::Claude, home(), &[]));
+        let brief = generate_session_brief(&BriefFacts::capture(
+            &resolved,
+            Agent::Claude,
+            home(),
+            &[],
+            false,
+        ));
         assert!(brief.contains("fails closed"));
     }
 
     #[test]
     fn brief_says_ssh_blocked_but_not_https_git() {
         let resolved = base_resolved();
-        let brief =
-            generate_session_brief(&BriefFacts::capture(&resolved, Agent::Claude, home(), &[]));
+        let brief = generate_session_brief(&BriefFacts::capture(
+            &resolved,
+            Agent::Claude,
+            home(),
+            &[],
+            false,
+        ));
         assert!(brief.contains("SSH is blocked"));
         // git_guard gates HTTPS push; the sandbox itself does not block
         // HTTPS remotes, and the brief must not claim otherwise.
@@ -1153,8 +1299,13 @@ mod tests {
         resolved.allow_read = vec![home().join(".ssh/id_ed25519")];
         resolved.pass_env = vec!["SSH_AUTH_SOCK".to_string()];
         resolved.allow_socket = vec![PathBuf::from("/private/tmp/x/Listeners")];
-        let brief =
-            generate_session_brief(&BriefFacts::capture(&resolved, Agent::Claude, home(), &[]));
+        let brief = generate_session_brief(&BriefFacts::capture(
+            &resolved,
+            Agent::Claude,
+            home(),
+            &[],
+            false,
+        ));
         assert!(brief.contains("SSH is blocked"), "{brief}");
         assert!(brief.contains("outbound TCP is limited to 443"), "{brief}");
     }
@@ -1166,8 +1317,13 @@ mod tests {
         let mut resolved = base_resolved();
         resolved.allow_ports = vec![22];
         resolved.allow_read = vec![home().join(".ssh/id_ed25519")];
-        let brief =
-            generate_session_brief(&BriefFacts::capture(&resolved, Agent::Claude, home(), &[]));
+        let brief = generate_session_brief(&BriefFacts::capture(
+            &resolved,
+            Agent::Claude,
+            home(),
+            &[],
+            false,
+        ));
         assert!(!brief.contains("SSH is blocked"), "{brief}");
         assert!(brief.contains("SSH may work this session"));
         // The blanket credentials claim needs the same treatment.
@@ -1185,16 +1341,26 @@ mod tests {
         resolved.allow_ports = vec![22];
         resolved.allow_read = vec![home().join(".ssh/id_ed25519")];
 
-        let default_mode =
-            generate_session_brief(&BriefFacts::capture(&resolved, Agent::Claude, home(), &[]));
+        let default_mode = generate_session_brief(&BriefFacts::capture(
+            &resolved,
+            Agent::Claude,
+            home(),
+            &[],
+            false,
+        ));
         assert!(
             default_mode.contains("SSH may work this session"),
             "default mode still opens port 22:\n{default_mode}"
         );
 
         resolved.proxy_forced = true;
-        let forced =
-            generate_session_brief(&BriefFacts::capture(&resolved, Agent::Claude, home(), &[]));
+        let forced = generate_session_brief(&BriefFacts::capture(
+            &resolved,
+            Agent::Claude,
+            home(),
+            &[],
+            false,
+        ));
         assert!(
             forced.contains("SSH is blocked"),
             "proxy.forced closes the direct path port 22 needs:\n{forced}"
@@ -1207,8 +1373,13 @@ mod tests {
     fn brief_blames_the_keys_when_the_port_is_open_but_nothing_authenticates() {
         let mut resolved = base_resolved();
         resolved.allow_ports = vec![22];
-        let brief =
-            generate_session_brief(&BriefFacts::capture(&resolved, Agent::Claude, home(), &[]));
+        let brief = generate_session_brief(&BriefFacts::capture(
+            &resolved,
+            Agent::Claude,
+            home(),
+            &[],
+            false,
+        ));
         assert!(
             brief.contains("the blocker is the keys, not the port"),
             "{brief}"
@@ -1231,8 +1402,13 @@ mod tests {
         resolved.pass_env = vec!["SSH_AUTH_SOCK".to_string()];
         resolved.allow_socket = vec![PathBuf::from("/private/tmp/x/Listeners")];
         resolved.inherit_env = true;
-        let brief =
-            generate_session_brief(&BriefFacts::capture(&resolved, Agent::Claude, home(), &[]));
+        let brief = generate_session_brief(&BriefFacts::capture(
+            &resolved,
+            Agent::Claude,
+            home(),
+            &[],
+            false,
+        ));
         assert!(
             brief.contains("the blocker is the keys, not the port"),
             "--inherit-env strips SSH_AUTH_SOCK even with --pass-env:\n{brief}"
@@ -1240,8 +1416,13 @@ mod tests {
 
         // Same config without inherit_env: the socket does arrive.
         resolved.inherit_env = false;
-        let brief =
-            generate_session_brief(&BriefFacts::capture(&resolved, Agent::Claude, home(), &[]));
+        let brief = generate_session_brief(&BriefFacts::capture(
+            &resolved,
+            Agent::Claude,
+            home(),
+            &[],
+            false,
+        ));
         assert!(brief.contains("SSH may work this session"), "{brief}");
     }
 
@@ -1254,8 +1435,13 @@ mod tests {
         let mut resolved = base_resolved();
         resolved.allow_ports = vec![22];
         resolved.allow_read = vec![home().join(".ssh")];
-        let brief =
-            generate_session_brief(&BriefFacts::capture(&resolved, Agent::Claude, home(), &[]));
+        let brief = generate_session_brief(&BriefFacts::capture(
+            &resolved,
+            Agent::Claude,
+            home(),
+            &[],
+            false,
+        ));
         assert!(
             brief.contains("the blocker is the keys, not the port"),
             "{brief}"
@@ -1276,8 +1462,13 @@ mod tests {
         let mut resolved = base_resolved();
         resolved.allow_ports = vec![22];
         resolved.allow_write = vec![home().join(".ssh/known_hosts")];
-        let brief =
-            generate_session_brief(&BriefFacts::capture(&resolved, Agent::Claude, home(), &[]));
+        let brief = generate_session_brief(&BriefFacts::capture(
+            &resolved,
+            Agent::Claude,
+            home(),
+            &[],
+            false,
+        ));
         assert!(
             brief.contains("Also writable this session"),
             "the credentials claim must name the write exception:\n{brief}"
@@ -1295,8 +1486,13 @@ mod tests {
         let mut resolved = base_resolved();
         resolved.allow_ports = vec![22];
         resolved.allow_read = vec![home().to_path_buf()];
-        let brief =
-            generate_session_brief(&BriefFacts::capture(&resolved, Agent::Claude, home(), &[]));
+        let brief = generate_session_brief(&BriefFacts::capture(
+            &resolved,
+            Agent::Claude,
+            home(),
+            &[],
+            false,
+        ));
         assert!(
             brief.contains("SSH may work this session"),
             "Landlock grants $HOME outright:\n{brief}"
@@ -1317,8 +1513,13 @@ mod tests {
         let mut resolved = base_resolved();
         resolved.allow_localhost_any = true;
         assert!(!resolved.allow_ports.contains(&22), "port 22 not listed");
-        let brief =
-            generate_session_brief(&BriefFacts::capture(&resolved, Agent::Claude, home(), &[]));
+        let brief = generate_session_brief(&BriefFacts::capture(
+            &resolved,
+            Agent::Claude,
+            home(),
+            &[],
+            false,
+        ));
         assert!(
             !brief.contains("outbound TCP is limited to 443"),
             "no connect restriction is in the ruleset at all:\n{brief}"
@@ -1338,6 +1539,7 @@ mod tests {
             Agent::Claude,
             home(),
             &[],
+            false,
         ));
         assert!(brief.contains("not readable from in here"), "{brief}");
         assert!(!brief.contains("read-only from in here"));
@@ -1348,8 +1550,13 @@ mod tests {
         let mut resolved = base_resolved();
         resolved.default_allowlist = true;
         resolved.allow_all_domains = true;
-        let brief =
-            generate_session_brief(&BriefFacts::capture(&resolved, Agent::Claude, home(), &[]));
+        let brief = generate_session_brief(&BriefFacts::capture(
+            &resolved,
+            Agent::Claude,
+            home(),
+            &[],
+            false,
+        ));
         assert!(
             !brief.contains("built-in allowlist"),
             "must not claim an allowlist applies under --allow-all-domains"
@@ -1542,6 +1749,7 @@ mod tests {
             crate::agent::Agent::Copilot,
             std::path::Path::new("/projects/app"),
             &[],
+            false,
         ));
         assert!(
             !brief.contains("The proxy refuses everything"),
@@ -1559,6 +1767,7 @@ mod tests {
             crate::agent::Agent::Copilot,
             std::path::Path::new("/projects/app"),
             &[],
+            false,
         ));
         assert!(brief.contains("The proxy refuses everything"));
     }

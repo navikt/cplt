@@ -1578,8 +1578,11 @@ fn merge_tool_path_env_overrides(resolved: &mut config::Resolved, home: &Path) -
 
 /// The `Repositories:` rows for the startup summary.
 ///
-/// Empty when nothing but the launch repository is in scope: the summary's
-/// `Project:` line already says that, and a one-row block restating it is noise.
+/// Always includes the launch repository, so a consumer that reads this as "the
+/// repositories in scope" gets a true answer for a single-repository session
+/// too. Whether a one-row block is worth PRINTING is the caller's decision: the
+/// startup summary skips it because its `Project:` line already says that, and
+/// a block restating it is noise.
 ///
 /// `owner/name` comes from the trusted git in the unsandboxed parent, the same
 /// source and the same moment the gh scope set is captured from. A root whose
@@ -1587,9 +1590,6 @@ fn merge_tool_path_env_overrides(resolved: &mut config::Resolved, home: &Path) -
 /// every other purpose, so it is shown by its directory name with the gh
 /// consequence spelled out rather than dropped from the block.
 fn repo_summary_rows(project_dir: &Path, roots: &[RepoRoot]) -> Vec<config::RepoSummaryRow> {
-    if roots.is_empty() {
-        return Vec::new();
-    }
     let real_git = cplt::git::trusted_git();
     // Returns the name AND whether it is a real `owner/name`: everything that
     // describes a root downstream has to agree with the launch about whether
@@ -2477,6 +2477,7 @@ fn write_session_sandbox_brief(
     scratch_path: Option<&Path>,
     home_dir: &Path,
     repos: &[config::RepoSummaryRow],
+    observe_domains: bool,
 ) {
     if !resolved.brief {
         return;
@@ -2494,7 +2495,8 @@ fn write_session_sandbox_brief(
         );
         return;
     };
-    let facts = brief::BriefFacts::capture(resolved, active_agent, home_dir, repos);
+    let facts =
+        brief::BriefFacts::capture(resolved, active_agent, home_dir, repos, observe_domains);
     if let Err(e) = brief::write_session_brief(scratch, &facts) {
         ui::warn(&format!("Could not write sandbox brief: {e}"));
     }
@@ -4075,6 +4077,7 @@ fn assemble_sandbox(
         scratch_path,
         home_dir,
         opts.repos.rows,
+        cli.observe_domains,
     );
 
     // macOS-only, opt-in (sandbox.gradle_init): install the guarded Gradle
