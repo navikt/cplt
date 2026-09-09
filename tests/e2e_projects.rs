@@ -1681,8 +1681,7 @@ if echo h > "{}" 2>/dev/null; then echo "RESULT:hook:OK"; else echo "RESULT:hook
         // has opened a hook that runs outside the sandbox.
         assert_result_fail(&stdout, "hook");
 
-        let _ = std::process::Command::new("git")
-            .current_dir(&main_path)
+        let _ = git_cmd(&main_path)
             .args(["worktree", "remove", "--force"])
             .arg(&wt)
             .output();
@@ -1897,6 +1896,30 @@ allow_env_files = true
         assert!(
             stderr.contains("CPLT_CONFIG points inside a named repository"),
             "the refusal must name the reason.\nstderr: {stderr}"
+        );
+
+        // The same file spelled with `~`. `config_path()` expands the tilde
+        // before opening it, so a check on the raw value refuses the absolute
+        // spelling and waves this one through to the same file — the shell is
+        // not the only thing that sets this variable (direnv, mise, .envrc).
+        let home = std::env::var("HOME").expect("HOME");
+        let Ok(rel) = config_path.strip_prefix(&home) else {
+            return; // the temp dir is not under $HOME here; nothing to spell
+        };
+        let tilde = format!("~/{}", rel.display());
+        let output = cplt_cmd()
+            .args(["--yes", "--no-validate"])
+            .args(["--project-dir", &project.canonical_path().to_string_lossy()])
+            .args(["--repo-dir", &named_path.to_string_lossy()])
+            .args(["--", "--version"])
+            .env("CPLT_CONFIG", &tilde)
+            .output()
+            .expect("cplt should run");
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        assert!(
+            !output.status.success()
+                && stderr.contains("CPLT_CONFIG points inside a named repository"),
+            "the tilde spelling names the same file and must be refused too.\nstderr: {stderr}"
         );
     }
 

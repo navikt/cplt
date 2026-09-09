@@ -1819,8 +1819,12 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
     // decides its own sandbox. Applied here, once the set is known.
     if let Some(custom) = std::env::var("CPLT_CONFIG").ok().filter(|s| !s.is_empty()) {
         for root in &repo_roots {
+            // `expand_tilde` for the same reason the project-directory check
+            // uses it: `config_path()` expands `~` before opening the file, so
+            // a check on the raw value refuses `/home/me/lib/x.toml` and waves
+            // `~/lib/x.toml` through to the same file.
             if let config::CustomConfigVerdict::InsideProject(p) =
-                config::classify_custom_config(Path::new(&custom), &home_dir, &root.dir)
+                config::classify_custom_config(&config::expand_tilde(&custom), &home_dir, &root.dir)
             {
                 bail!(
                     "CPLT_CONFIG points inside a named repository:\n  \
