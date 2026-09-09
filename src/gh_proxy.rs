@@ -3032,20 +3032,56 @@ pub fn gate_git(
             // multi-refspec beyond the glob, config-driven destinations) is
             // never authorized — the operator's `branches` filter cannot bound
             // it, so it fails closed (H-10).
-            let authorized = match push_target_branches(push_args, real_git, &repo_args) {
-                PushTargets::Branches(branches) if !branches.is_empty() => {
-                    branches.iter().all(|b| {
-                        matches_allow_push_rule(allow_push_rules, &dest_urls, Some(b), has_force)
-                    })
-                }
-                _ => false,
-            };
+            // #424: an allow_push rule carries launch/named-root identity, not
+            // bare URL identity. The destination URL must be one pinned at
+            // launch AND the push must run in a repository this session has in
+            // scope. Without the second half the two halves of the guard
+            // disagree about what a repository is:
+            // `protect_default_branch_only` judges the repository the push runs
+            // in, while allow_push would authorize from anywhere — including a
+            // clone the agent made underneath the project, whose `origin` an
+            // operator writing `remote = "origin"` was never thinking about.
+            //
+            // The requirement needs the session to KNOW its repositories. When
+            // no facts were captured at launch — git unavailable in the parent
+            // — there is nothing to compare against, and the rule falls back to
+            // the URL identity that shipped rather than refusing every push
+            // with a reason the operator cannot act on. That condition is
+            // decided parent-side at launch and warned about there; the agent
+            // cannot bring it about.
+            let scope_known = !repo_facts.git_common_dir.is_empty() || !repo_facts.named.is_empty();
+            let in_scope = !scope_known || repo_facts.describes(&repo_args, real_git);
+            let authorized = in_scope
+                && match push_target_branches(push_args, real_git, &repo_args) {
+                    PushTargets::Branches(branches) if !branches.is_empty() => {
+                        branches.iter().all(|b| {
+                            matches_allow_push_rule(
+                                allow_push_rules,
+                                &dest_urls,
+                                Some(b),
+                                has_force,
+                            )
+                        })
+                    }
+                    _ => false,
+                };
             if authorized {
                 return Ok(());
             }
             // A rule naming a remote that could not be pinned to a URL at
             // launch matches nothing (see `matches_allow_push_rule`). Say so,
             // or the operator sees a rule that looks like it should apply.
+            if !in_scope {
+                block_hints.push(
+                    "This push does not run in a repository this session has in scope — not \
+                     the launch repository, and not one named with `--repo-dir`. An allow_push \
+                     rule authorizes a destination FROM the repositories the session was given, \
+                     so that a rule written for this project cannot authorize a push from a \
+                     clone made underneath it. Push from a repository in scope, or name this \
+                     one with `--repo-dir` and start a new session."
+                        .to_string(),
+                );
+            }
             if let Some(name) = allow_push_rules
                 .iter()
                 .find(|r| r.remote.is_some() && r.url.is_none())
@@ -3589,6 +3625,17 @@ pub struct RepoFacts {
     /// Remote name → its default branch, from `refs/remotes/<remote>/HEAD`.
     #[serde(default)]
     pub default_branches: std::collections::BTreeMap<String, String>,
+    /// The same facts for each repository named with `--repo-dir`, captured at
+    /// the same moment from the same trusted git.
+    ///
+    /// A named root is a repository the session works in, so a push there has
+    /// to be judged by ITS default branch. Without these the guard had no baked
+    /// answer for a named root and failed closed on every push in one — right
+    /// direction, wrong reason, and a refusal that talked about the launch
+    /// repository. Members carry no `named` of their own; the nesting is one
+    /// level by construction.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub named: Vec<RepoFacts>,
 }
 
 impl RepoFacts {
@@ -3613,7 +3660,28 @@ impl RepoFacts {
     /// same time. An unknown common dir on either side means "cannot tell", and
     /// that fails closed rather than treating every repository as the launch
     /// one.
+    /// The member of this session's repositories that `repo_args` targets: the
+    /// launch repository, one of the named roots, or none.
+    ///
+    /// "None" is the fail-closed answer and covers both "outside every
+    /// repository in scope" and "cannot tell", deliberately: a guard that
+    /// cannot identify where a push runs must not fall back to judging it by
+    /// the launch repository's yardstick (#416).
+    fn target(&self, repo_args: &[&str], real_git: Option<&Path>) -> Option<&RepoFacts> {
+        if self.describes_self(repo_args, real_git) {
+            return Some(self);
+        }
+        self.named
+            .iter()
+            .find(|n| n.describes_self(repo_args, real_git))
+    }
+
+    /// Whether the push runs in a repository this session has in scope.
     fn describes(&self, repo_args: &[&str], real_git: Option<&Path>) -> bool {
+        self.target(repo_args, real_git).is_some()
+    }
+
+    fn describes_self(&self, repo_args: &[&str], real_git: Option<&Path>) -> bool {
         if repo_args.is_empty() {
             let (Some(git), false) = (real_git, self.git_common_dir.is_empty()) else {
                 return false;
@@ -3656,10 +3724,12 @@ impl RepoFacts {
         repo_args: &[&str],
         real_git: Option<&Path>,
     ) -> Option<&str> {
-        if !self.describes(repo_args, real_git) {
-            return None;
-        }
-        self.default_branches.get(remote).map(String::as_str)
+        // The targeted repository's own answer, not the launch repository's: a
+        // named root whose default branch is `trunk` must be judged by `trunk`.
+        self.target(repo_args, real_git)?
+            .default_branches
+            .get(remote)
+            .map(String::as_str)
     }
 }
 
@@ -3817,23 +3887,48 @@ fn push_dest_remote(push_args: &[&str], real_git: Option<&Path>, repo_args: &[&s
 #[must_use]
 pub fn resolve_push_rule_urls(
     real_git: &Path,
-    project_dir: &Path,
+    repos: &[&Path],
     rules: &[crate::config::ResolvedPushRule],
 ) -> Vec<crate::config::ResolvedPushRule> {
-    let dir = project_dir.to_string_lossy().into_owned();
-    let repo_args = ["-C", dir.as_str()];
-    rules
-        .iter()
-        .map(|rule| {
-            let mut rule = rule.clone();
-            if rule.url.is_none()
-                && let Some(name) = rule.remote.as_deref()
-            {
-                rule.url = resolve_remote_url(real_git, &repo_args, name);
+    let mut out: Vec<crate::config::ResolvedPushRule> = Vec::new();
+    for rule in rules {
+        // Branches-only by the operator's choice: no name to pin, one copy.
+        let Some(name) = rule.remote.as_deref() else {
+            out.push(rule.clone());
+            continue;
+        };
+        if rule.url.is_some() {
+            out.push(rule.clone());
+            continue;
+        }
+        // A rule naming a remote is expanded into one pinned rule per
+        // repository the session has in scope. `allow_push = [{remote =
+        // "origin", ...}]` written for a session spanning two repositories
+        // means the origin of a repository in THIS session, not a remote name
+        // that matches anywhere — expanding it keeps `url` a single repository
+        // identity, which is the property #215 rests on, while letting the rule
+        // reach the named roots the user put in scope (#424).
+        let mut seen: Vec<String> = Vec::new();
+        for dir in repos {
+            let d = dir.to_string_lossy().into_owned();
+            let Some(url) = resolve_remote_url(real_git, &["-C", d.as_str()], name) else {
+                continue;
+            };
+            if seen.contains(&url) {
+                continue;
             }
-            rule
-        })
-        .collect()
+            seen.push(url.clone());
+            let mut pinned = rule.clone();
+            pinned.url = Some(url);
+            out.push(pinned);
+        }
+        // Unresolvable in every repository: keep the unpinned rule so it still
+        // authorizes nothing AND the launch warning still finds it.
+        if seen.is_empty() {
+            out.push(rule.clone());
+        }
+    }
+    out
 }
 
 /// Check if a push matches any allow_push exception rule.
@@ -3946,7 +4041,14 @@ pub fn generate_git_wrapper_script(
     };
     // The launch-time repository facts, baked in exactly like the gh guard's
     // `--repo-scope`. Absent when nothing could be captured, which fails closed.
-    let repo_facts_flag = if repo_facts.default_branches.is_empty() {
+    // Baked whenever there is anything to bake. It used to be gated on
+    // `default_branches` alone, which is now too narrow: the identity of the
+    // repositories in scope is itself a fact the gate needs (#424), and a
+    // repository with no recorded `refs/remotes/*/HEAD` still has one.
+    let repo_facts_flag = if repo_facts.default_branches.is_empty()
+        && repo_facts.named.is_empty()
+        && repo_facts.git_common_dir.is_empty()
+    {
         String::new()
     } else {
         let json = serde_json::to_string(repo_facts).unwrap_or_default();
@@ -5945,7 +6047,7 @@ mod tests {
                 url: None,
             },
         ];
-        let resolved = resolve_push_rule_urls(&git, &repo, &rules);
+        let resolved = resolve_push_rule_urls(&git, &[repo.as_path()], &rules);
         assert_eq!(resolved[0].url.as_deref(), Some("github.com/navikt/cplt"));
         assert_eq!(resolved[1].url, None);
     }
@@ -5983,7 +6085,7 @@ mod tests {
             force: false,
             url: None,
         }];
-        let resolved = resolve_push_rule_urls(&git, &repo, &rules);
+        let resolved = resolve_push_rule_urls(&git, &[repo.as_path()], &rules);
         assert_eq!(
             resolved[0].url.as_deref(),
             Some("github.com/evil/elsewhere"),
@@ -7702,6 +7804,146 @@ mod tests {
         assert!(
             err.contains("could not be determined when this session started"),
             "the refusal must name the missing launch-time fact, got: {err}"
+        );
+    }
+
+    /// A push inside a `--repo-dir` root is judged by THAT repository's default
+    /// branch, not the launch repository's.
+    ///
+    /// Before the named roots' facts were baked, a named root had no baked
+    /// answer at all, so every push in one failed closed with a refusal that
+    /// talked about the launch repository. The right direction for the wrong
+    /// reason, and unusable: the feature exists so the agent can work in that
+    /// repository.
+    #[test]
+    fn a_push_in_a_named_root_is_judged_by_its_own_default_branch() {
+        let Some((_tmp, launch)) =
+            scratch_repo_with_default("main", "https://github.com/o/launch.git", "main")
+        else {
+            return; // no git available
+        };
+        let Some((_tmp2, named)) =
+            scratch_repo_with_default("trunk", "https://github.com/o/named.git", "trunk")
+        else {
+            return;
+        };
+        let git = which_git().unwrap();
+        make_branches(&git, &named, &["feature/x"]);
+
+        let mut facts = capture_repo_facts(&git, &launch);
+        facts.named = vec![capture_repo_facts(&git, &named)];
+        let dir = named.to_string_lossy().into_owned();
+
+        // `trunk` is the named repository's protected branch, and the launch
+        // repository has no branch by that name — so blocking it can only come
+        // from the named root's own facts.
+        gate_git(
+            &["-C", dir.as_str(), "push", "origin", "trunk"],
+            true,
+            true,
+            true,
+            &[],
+            Some(&git),
+            &facts,
+        )
+        .expect_err("the named repository's own default branch must be protected");
+
+        // And a feature branch there is allowed, which is what fails when the
+        // named root has no baked facts: no default branch, nothing proven to
+        // be a feature branch, refuse.
+        gate_git(
+            &["-C", dir.as_str(), "push", "origin", "feature/x"],
+            true,
+            true,
+            true,
+            &[],
+            Some(&git),
+            &facts,
+        )
+        .expect("a feature branch in the named repository is allowed");
+
+        // Falsifiable by construction: drop the named facts and the same push
+        // is refused.
+        let launch_only = RepoFacts {
+            named: Vec::new(),
+            ..facts.clone()
+        };
+        gate_git(
+            &["-C", dir.as_str(), "push", "origin", "feature/x"],
+            true,
+            true,
+            true,
+            &[],
+            Some(&git),
+            &launch_only,
+        )
+        .expect_err("without the named root's facts there is no yardstick, so it fails closed");
+    }
+
+    /// #424: an allow_push rule carries launch/named-root identity. The
+    /// destination URL must be pinned AND the push must run in a repository the
+    /// session has in scope, so a rule written for this project cannot
+    /// authorize a push from a clone made underneath it.
+    #[test]
+    fn an_allow_push_rule_does_not_reach_a_repository_outside_the_scope() {
+        let Some((_tmp, launch)) =
+            scratch_repo_with_default("main", "https://github.com/o/launch.git", "main")
+        else {
+            return; // no git available
+        };
+        let Some((_tmp2, outside)) =
+            scratch_repo_with_default("main", "https://github.com/o/launch.git", "main")
+        else {
+            return;
+        };
+        let git = which_git().unwrap();
+        make_branches(&git, &outside, &["agent/x"]);
+        make_branches(&git, &launch, &["agent/x"]);
+        let facts = capture_repo_facts(&git, &launch);
+
+        // The same origin URL, so the URL pin alone would authorize both.
+        let rules = resolve_push_rule_urls(
+            &git,
+            &[launch.as_path()],
+            &[crate::config::ResolvedPushRule {
+                remote: Some("origin".to_string()),
+                branches: vec!["agent/*".to_string()],
+                force: false,
+                url: None,
+            }],
+        );
+        assert!(
+            rules.iter().any(|r| r.url.is_some()),
+            "test premise: the rule must pin"
+        );
+
+        let launch_dir = launch.to_string_lossy().into_owned();
+        gate_git(
+            &["-C", launch_dir.as_str(), "push", "origin", "agent/x"],
+            true,
+            true,
+            false,
+            &rules,
+            Some(&git),
+            &facts,
+        )
+        .expect("the launch repository is in scope");
+
+        let outside_dir = outside.to_string_lossy().into_owned();
+        let err = gate_git(
+            &["-C", outside_dir.as_str(), "push", "origin", "agent/x"],
+            true,
+            true,
+            false,
+            &rules,
+            Some(&git),
+            &facts,
+        )
+        .expect_err("a repository outside the scope is not authorized by the rule")
+        .to_string();
+        assert!(
+            err.contains("does not run in a repository this session has in scope"),
+            "the refusal must say which half failed, got: {err}"
         );
     }
 
