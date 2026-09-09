@@ -157,6 +157,16 @@ second writable-and-executable tree, with the same protected paths as the
 project: `.git/hooks`, `.git/config`, `.cplt.toml` and the rest stay unwritable
 in it, so a hook cannot be planted to run outside the sandbox later.
 
+**The git guard follows the set too.** A `git push` inside a named repository is
+judged by *that* repository's default branch, captured at launch — so a
+repository whose default branch is `trunk` protects `trunk`, not the launch
+repository's `main`. An `allow_push` rule naming a remote is pinned to that
+remote's URL in every repository in scope, and it authorizes a push only when
+the push also runs in one of them: a rule written for this session cannot
+authorize a push from a clone the agent made underneath the project, whose
+`origin` you were never thinking about
+([#424](https://github.com/navikt/cplt/issues/424)).
+
 **A named repository's `[deny]` applies too.** `[deny]` can only tighten, so it
 needs no approval, no trust entry and no content hash — there is no grant a
 second repository could open with it. Paths anchor to the repository that wrote
