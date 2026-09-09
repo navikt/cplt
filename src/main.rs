@@ -2013,6 +2013,58 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             ui::warn(&format!("Failed to load .cplt.toml: {e}"));
         }
     }
+
+    // ── `[deny]` from every named repository ─────────────────────
+    //
+    // Only `[deny]`. A named repository never proposes: `[propose]` widens, and
+    // approving it per root multiplies #206's bypass class by the size of the
+    // set. `[deny]` can only tighten, so there is no grant channel to open and
+    // no trust entry to key — which is why this needs neither approval nor a
+    // content hash, and why `--accept-repo-config` alongside `--repo-dir` is
+    // NOT refused: nothing here is ambiguous about what it applies to.
+    for root in &repo_roots {
+        match repo_config::load_repo_config(&root.dir) {
+            Ok(Some(loaded)) => {
+                if !resolved.quiet {
+                    let proposed = repo_config::proposed_keys(&loaded.config.propose);
+                    if !proposed.is_empty() {
+                        ui::warn(&format!(
+                            "{} proposes {} in its .cplt.toml. Only the launch repository may \
+                             propose, so those are not consulted; its [deny] does \
+                             apply.",
+                            root.dir.display(),
+                            proposed.join(", ")
+                        ));
+                    }
+                    if !loaded.config.deny.env.is_empty() {
+                        // The one part of a named repository's deny that is not
+                        // scoped to its own tree: env is process-wide, so this
+                        // strips the variable for the whole session.
+                        ui::info(&format!(
+                            "{} denies {} for the whole session.",
+                            root.dir.display(),
+                            loaded.config.deny.env.join(", ")
+                        ));
+                    }
+                }
+                resolved.apply_repo_deny(&loaded.config, &loaded.dir);
+            }
+            // No `.cplt.toml` is the ordinary case and says nothing.
+            Ok(None) => {}
+            // Unlike the launch repository's, this is fatal. The file exists
+            // and cannot be read, so a restriction its owner wrote is missing —
+            // and a missing restriction must never be a warning the operator
+            // scrolls past on the way to a session that runs anyway.
+            Err(e) => bail!(
+                "Failed to load .cplt.toml from the named repository {}: {e}\n  \
+                 Its [deny] section cannot be applied, so the session would be \
+                 less restricted than that repository asks for. Fix the file, or \
+                 drop the repository from the named set.",
+                root.dir.display()
+            ),
+        }
+    }
+
     if !resolved.quiet {
         warn_repo_config_discrepancy(&project_dir);
     }

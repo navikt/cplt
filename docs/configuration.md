@@ -157,6 +157,21 @@ second writable-and-executable tree, with the same protected paths as the
 project: `.git/hooks`, `.git/config`, `.cplt.toml` and the rest stay unwritable
 in it, so a hook cannot be planted to run outside the sandbox later.
 
+**A named repository's `[deny]` applies too.** `[deny]` can only tighten, so it
+needs no approval, no trust entry and no content hash — there is no grant a
+second repository could open with it. Paths anchor to the repository that wrote
+them, so each repository's deny applies inside itself. `deny.env` is the
+exception and is process-wide: a named repository stripping a variable strips it
+for the session, and cplt says so at launch.
+
+`[propose]` is launch-repository only. A named repository that proposes
+something gets one line saying it was not consulted; approving proposals per
+repository is [#206](https://github.com/navikt/cplt/issues/206)'s decision to
+make first. A `.cplt.toml` in a named repository that cannot be parsed **stops
+the launch** rather than being skipped: the file exists, so a restriction its
+owner wrote is missing, and a missing restriction is not a warning to scroll
+past.
+
 Launching from the parent (`--project-dir ~/src`) grants the whole tree and is a
 much wider grant than naming two repositories. It also does **not** let you name
 the checkouts: `--repo-dir` requires the launch directory to be a git repository

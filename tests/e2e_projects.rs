@@ -1687,6 +1687,69 @@ if echo h > "{}" 2>/dev/null; then echo "RESULT:hook:OK"; else echo "RESULT:hook
             .output();
     }
 
+    /// A named repository's `[deny]` applies, and applies to ITS tree.
+    ///
+    /// `[deny]` can only tighten, so it needs no approval, no trust entry and
+    /// no content hash — there is no grant channel for a second repository to
+    /// open. Paths anchor to the repository that wrote them, so the union of N
+    /// repositories' denies is exactly "each one's deny applies inside itself";
+    /// the launch repository keeping its own `secrets/` readable is what
+    /// proves the anchoring rather than a blanket deny on the name.
+    #[test]
+    fn a_named_repositorys_deny_applies_only_inside_it() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+        project.write_file("secrets/k.txt", "launch\n");
+        project.git_init();
+        let named = TempProject::new("repo-dir-deny");
+        named.write_file("secrets/k.txt", "named\n");
+        named.write_file(".cplt.toml", "[deny]\npaths = [\"secrets\"]\n");
+        named.git_init();
+        let named_path = named.canonical_path().to_string_lossy().to_string();
+
+        let script = format!(
+            r#"
+if cat "{named_path}/secrets/k.txt" >/dev/null 2>&1; then echo "RESULT:named_secret:OK"; else echo "RESULT:named_secret:FAIL"; fi
+if cat secrets/k.txt >/dev/null 2>&1; then echo "RESULT:launch_secret:OK"; else echo "RESULT:launch_secret:FAIL"; fi
+"#
+        );
+        let fake_dir = create_fake_copilot(&project, &script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &["--repo-dir", &named_path]);
+
+        assert!(success, "stdout: {stdout}\nstderr: {stderr}");
+        assert_result_fail(&stdout, "named_secret");
+        assert_result_ok(&stdout, &stderr, "launch_secret");
+    }
+
+    /// A `.cplt.toml` that exists and cannot be parsed means a restriction its
+    /// owner wrote is missing. That must stop the launch, not become a warning
+    /// the operator scrolls past on the way to a session that runs anyway.
+    #[test]
+    fn an_unparseable_cplt_toml_in_a_named_repository_stops_the_launch() {
+        let project = TempProject::scaffold_node();
+        project.git_init();
+        let named = TempProject::new("repo-dir-bad-toml");
+        named.write_file(".cplt.toml", "this is not = = toml [[[\n");
+        named.git_init();
+        let named_path = named.canonical_path().to_string_lossy().to_string();
+
+        let output = cplt_cmd()
+            .args(["--yes", "--no-validate"])
+            .args(["--project-dir", &project.canonical_path().to_string_lossy()])
+            .args(["--repo-dir", &named_path])
+            .args(["--", "--version"])
+            .env("CPLT_CONFIG", "/dev/null/nonexistent")
+            .output()
+            .expect("cplt should run");
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        assert!(!output.status.success(), "stderr: {stderr}");
+        assert!(
+            stderr.contains("Its [deny] section cannot be applied"),
+            "the refusal must say what is missing.\nstderr: {stderr}"
+        );
+    }
+
     /// A tree the session was never given stays unreachable. Without this the
     /// two assertions above could both hold in a sandbox that grants
     /// everything.

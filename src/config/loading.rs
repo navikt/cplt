@@ -1448,13 +1448,26 @@ impl Resolved {
     /// the repo never named while looking perfectly enforced.
     ///
     /// Returns a list of unapproved proposal keys (for display to the user).
-    pub fn apply_repo_config(
+    /// Apply a repository's `[deny]` section, and nothing else.
+    ///
+    /// Separate from [`Self::apply_repo_config`] because it is the only half a
+    /// repository other than the launch one gets. `[deny]` can only tighten
+    /// (`SECURITY.md`), so it needs no approval, no trust entry and no content
+    /// hash — there is no grant channel to open, and #206's bypass class does
+    /// not multiply with the number of repositories in scope.
+    ///
+    /// `deny.paths` anchors to `config_dir`, so the union of N repositories'
+    /// deny paths is exactly "each repository's deny applies inside that
+    /// repository" — neither backend needs to tell the roots apart, and neither
+    /// can: rules are absolute paths in one process-wide policy. `deny.env` is
+    /// the exception and IS process-wide; a named repository stripping a
+    /// variable strips it for the session, which is tightening and therefore
+    /// allowed, but the caller says so out loud.
+    pub fn apply_repo_deny(
         &mut self,
         repo_config: &crate::repo_config::RepoConfig,
         config_dir: &std::path::Path,
-        approved_keys: &[&str],
-    ) -> Vec<String> {
-        // ── Deny section: applied automatically ──────────────────────────
+    ) {
         for path_str in &repo_config.deny.paths {
             let path = resolve_repo_path(path_str, config_dir);
             if !self.deny_paths.contains(&path) {
@@ -1462,11 +1475,20 @@ impl Resolved {
             }
         }
         // deny.env is stored separately — the caller must use it when building
-        // the sandbox environment (strip these vars). We store them on the resolved
-        // struct for that purpose.
+        // the sandbox environment (strip these vars). We store them on the
+        // resolved struct for that purpose.
         self.deny_env.extend(repo_config.deny.env.iter().cloned());
         self.deny_env.sort_unstable();
         self.deny_env.dedup();
+    }
+
+    pub fn apply_repo_config(
+        &mut self,
+        repo_config: &crate::repo_config::RepoConfig,
+        config_dir: &std::path::Path,
+        approved_keys: &[&str],
+    ) -> Vec<String> {
+        self.apply_repo_deny(repo_config, config_dir);
 
         // ── Propose section: only approved keys ──────────────────
         let is_approved = |key: &str| approved_keys.contains(&key);
