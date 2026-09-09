@@ -1643,10 +1643,13 @@ if echo h > "{sibling_path}/.git/hooks/pre-commit" 2>/dev/null; then echo "RESUL
         main.write_file("f.txt", "content\n");
         main.git_init();
         let main_path = main.canonical_path();
-        let worktree = main_path.parent().expect("a parent").join(format!(
-            "{}-wt",
-            main_path.file_name().expect("a name").to_string_lossy()
-        ));
+        // Inside a second TempProject rather than beside the first: a linked
+        // worktree is a real directory `git worktree remove` may fail to clean
+        // (an early return, a git that refuses), and a test must not leave one
+        // behind in the developer's checkout. The guard removes this one either
+        // way.
+        let holder = TempProject::new("repo-dir-worktree-holder");
+        let worktree = holder.canonical_path().join("wt");
         let added = git_cmd(&main_path)
             .args(["worktree", "add", "-b", "wt"])
             .arg(&worktree)
