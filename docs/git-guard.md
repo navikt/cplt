@@ -56,9 +56,12 @@ about what a repository is — `protect_default_branch_only` judges the
 repository the push runs in, while a URL-only rule would authorize from
 anywhere, including a clone the agent made underneath the project, whose
 `origin` an operator writing `remote = "origin"` was never thinking about. The
-in-scope half needs the scope to have been captured; when it could not be (no
-trusted git in the parent) the rule falls back to the URL alone and cplt says
-so at launch.
+in-scope half needs the scope to have been captured at launch: the launch
+repository's shared git directory, or at least one named root. When neither
+could be read — no trusted git in the parent, or a launch directory that is not
+a git repository and no `--repo-dir` — the rule falls back to the URL alone.
+cplt warns about that at launch, but the warning is suppressed in quiet mode,
+which `cplt exec` defaults to.
 
 Pinning needs a *trusted* git binary (the same one the gh guard uses to capture
 its repo scope), because it runs unsandboxed in the parent at launch. A rule
@@ -66,8 +69,8 @@ that cannot be pinned — no trusted git, or no such remote in any repository in
 scope — authorizes nothing at all, and cplt warns about it at launch. It
 does not fall back to matching the bare name: that fallback grants exactly the
 cross-repository authorization pinning exists to prevent, in every repository
-the agent can reach. Fix what the warning names — add the remote to the project
-repository, or fix the git installation — and the rule works again.
+the agent can reach. Fix what the warning names (add the remote to a repository
+in scope, or fix the git installation) and the rule works again.
 
 URLs are compared after normalization, so the spellings of one remote are one
 remote: `git@github.com:navikt/cplt.git`, `ssh://git@github.com/navikt/cplt`,
@@ -81,9 +84,9 @@ git reports.
 
 Nothing changes in the config file format, and a rule written against a remote
 name keeps working as long as the name resolves at launch: it then covers the
-repository that name pointed at when the session started, and only that one. A
-rule that names a remote which does not resolve covers nothing, and the block
-message says so.
+repositories that name pointed at when the session started, one pinned rule per
+repository in scope where it resolved, and no others. A rule that names a remote
+which resolves nowhere covers nothing, and the block message says so.
 
 <details>
 <summary>CLI flag (override for a single run)</summary>
@@ -154,16 +157,23 @@ A push with no branch in the arguments is not waved through. The guard shells
 out to the real git to resolve the current branch, and fails closed when it
 cannot: an unresolvable branch counts as protected and the push is blocked.
 
-That resolution follows the command. `-C`, `--git-dir` and `--work-tree` are
-forwarded to the guard's own git calls, so `git -C ../other-repo push` is judged
-by *that* repository's branch and *that* repository's default branch, not by the
-repository the session was launched in. For a repository in scope that branch is
-judged against a default branch captured for *it* at launch, so a named
-repository whose default is `trunk` protects `trunk` and not the launch
-repository's `main`. For a repository outside the scope there is no captured
-answer, so the guard cannot tell a feature branch from the protected one and
-refuses — the same fail-closed rule as a repository with no recorded default
-branch.
+That resolution follows the command: `-C`, `--git-dir` and `--work-tree` are
+forwarded to the guard's own git calls, so the *branch* is read from the
+repository the push actually targets, never from the launch repository.
+
+The *default branch* it is judged against is a separate question, and a stricter
+one, because that answer must come from launch time (it is captured in the
+parent, with the trusted git, and never re-read inside the sandbox). A single
+`-C <dir>` naming a repository in scope — the launch repository or a
+`--repo-dir` root — is judged against the default branch captured for that
+repository, so a named repository whose default is `trunk` protects `trunk` and
+not the launch repository's `main`.
+
+Everything else has no captured answer and so fails closed under
+`protect_default_branch_only`: a repository outside the scope, `--git-dir` or
+`--work-tree` in any form, several `-C` flags, and a `-C` into a *subdirectory*
+of an in-scope repository rather than its root. The block message says which of
+those happened.
 
 **Security note:** This mode is intentionally permissive about branches. The
 agent can push to any non-default branch, and the human review gate becomes the
