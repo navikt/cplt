@@ -98,6 +98,26 @@ forced = true
 
 The proxy supports both blocking (deny known-bad domains) and allowlisting (permit only known-good domains). You can use both lists together; the allowlist is checked first, then the blocklist.
 
+### How a domain entry matches
+
+**There is no wildcard syntax, and none is needed.** An entry matches the host
+itself and every subdomain under it, at any depth:
+
+| Entry | Matches | Does not match |
+| --- | --- | --- |
+| `cloud.nais.io` | `cloud.nais.io`, `foo.cloud.nais.io`, `a.b.cloud.nais.io` | `evilcloud.nais.io` |
+
+So write `cloud.nais.io`, not `*.cloud.nais.io`. A `*` is compared literally and
+matches nothing — and in an allowlist, where the file is the whole policy, that
+does not merely fail to help: it leaves the hosts you meant to permit blocked,
+with an entry on screen that looks right. cplt warns at startup about a `*` in a domain **file**
+(`--allowed-domains`, `--blocked-domains`, a subscription cache) rather than
+letting the session fail closed silently. Lists set as config arrays, such as
+`proxy.allow_private_domains`, are not checked yet.
+
+The same matching applies to the blocklist, `proxy.allow_private_domains` and
+`proxy.upstream_no_proxy`.
+
 ### Blocklist
 
 Block domains commonly used for data exfiltration. A default blocklist ships with cplt, built from real attack infrastructure observed in 2025 and 2026 supply chain incidents. It covers webhook capture services, paste sites, file sharing, tunneling services, and IP recon endpoints. See [`blocked-domains.txt`](../blocked-domains.txt) for the full list with sources.
