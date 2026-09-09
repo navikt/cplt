@@ -507,60 +507,98 @@ impl Baseline {
 }
 
 impl AuditReport {
-    /// Print the report to stderr via the shared `ui` helpers.
+    /// The launch repository's report: the session line, then the body.
     pub fn print(&self) {
-        match self {
+        let (duration, exit_code) = match self {
             AuditReport::Unavailable {
                 duration,
                 exit_code,
-            } => {
-                ui::info(&format!(
-                    "Session ended (exit {exit_code}, {})",
-                    human_duration(*duration)
-                ));
-                ui::warn(
+            }
+            | AuditReport::Incomplete {
+                duration,
+                exit_code,
+            }
+            | AuditReport::Available {
+                duration,
+                exit_code,
+                ..
+            } => (duration, exit_code),
+        };
+        ui::info(&format!(
+            "Session ended (exit {exit_code}, {})",
+            human_duration(*duration)
+        ));
+        self.print_body(None);
+    }
+
+    /// One named repository's report.
+    ///
+    /// No session line: the exit code and the duration belong to the session,
+    /// which is one thing however many repositories it spanned. Every line
+    /// carries the root instead, so a report cannot be read as the project's.
+    ///
+    /// SECURITY (GHSA-c47q-c3c8-7wrf): `dir` is escaped for the same reason the
+    /// unaudited list is. A named root can come from `sandbox.repo_dirs`, and
+    /// the directory name is chosen by whoever created it — the audit's own
+    /// output must not be forgeable from a path.
+    pub fn print_named(&self, dir: &Path) {
+        self.print_body(Some(&escape_path(&dir.display().to_string())));
+    }
+
+    /// The report itself. `root` is `None` for the launch repository, whose
+    /// wording says "project"; `Some(path)` names the repository on every line.
+    fn print_body(&self, root: Option<&str>) {
+        match self {
+            AuditReport::Unavailable { .. } => match root {
+                None => ui::warn(
                     "change audit unavailable: not a git repository, no commits yet, or git unavailable",
-                );
-            }
-            AuditReport::Incomplete {
-                duration,
-                exit_code,
-            } => {
-                ui::info(&format!(
-                    "Session ended (exit {exit_code}, {})",
-                    human_duration(*duration)
-                ));
-                // Distinct, honest outcome: a baseline existed but git could not
-                // measure the net changes. Never rendered as a clean session.
-                ui::warn("audit incomplete, cplt could not verify project changes");
-            }
+                ),
+                Some(path) => ui::warn(&format!(
+                    "change audit unavailable for {path}: not a git repository, no commits yet, or git unavailable"
+                )),
+            },
+            // Distinct, honest outcome: a baseline existed but git could not
+            // measure the net changes. Never rendered as a clean session.
+            AuditReport::Incomplete { .. } => match root {
+                None => ui::warn("audit incomplete, cplt could not verify project changes"),
+                Some(path) => ui::warn(&format!(
+                    "audit incomplete, cplt could not verify changes in {path}"
+                )),
+            },
             AuditReport::Available {
-                duration,
-                exit_code,
                 changes,
                 total_added,
                 total_deleted,
                 tracked_audited,
+                ..
             } => {
-                ui::info(&format!(
-                    "Session ended (exit {exit_code}, {})",
-                    human_duration(*duration)
-                ));
                 if !tracked_audited {
                     // No baseline commit: only untracked additions are shown.
-                    ui::warn(
-                        "tracked-change audit unavailable (no baseline commit); showing new untracked files only",
-                    );
+                    match root {
+                        None => ui::warn(
+                            "tracked-change audit unavailable (no baseline commit); showing new untracked files only",
+                        ),
+                        Some(path) => ui::warn(&format!(
+                            "tracked-change audit unavailable for {path} (no baseline commit); showing new untracked files only"
+                        )),
+                    }
                 }
                 if changes.is_empty() {
-                    ui::info("no project file changes");
+                    match root {
+                        None => ui::info("no project file changes"),
+                        Some(path) => ui::info(&format!("no file changes in {path}")),
+                    }
                     return;
                 }
-                ui::info(&format!(
-                    "Project changes: {} file{} (+{total_added} -{total_deleted})",
+                let count = format!(
+                    "{} file{} (+{total_added} -{total_deleted})",
                     changes.len(),
                     if changes.len() == 1 { "" } else { "s" },
-                ));
+                );
+                match root {
+                    None => ui::info(&format!("Project changes: {count}")),
+                    Some(path) => ui::info(&format!("Changes in {path}: {count}")),
+                }
                 for c in changes {
                     let counts = format_counts(c);
                     match c.sensitive {
@@ -570,6 +608,33 @@ impl AuditReport {
                 }
             }
         }
+    }
+
+    /// Drop the entries that name a repository reported separately.
+    ///
+    /// A named root keeps its own git history, so the launch repository's `git
+    /// status` renders it as a single `?? <dir>/` entry (git does not recurse
+    /// into another repository, even under `-uall`), and a tracked gitlink
+    /// shows up in the diff as one path. Reporting either as a changed file is
+    /// wrong twice: it is not a file, and what actually changed inside it is in
+    /// that root's own report.
+    fn drop_named_roots(&mut self, project_dir: &Path, named_roots: &[PathBuf]) {
+        let AuditReport::Available { changes, .. } = self else {
+            return;
+        };
+        // A root outside `project_dir` has no relative form and cannot appear
+        // in this repository's status at all, so there is nothing to drop.
+        let names: Vec<String> = named_roots
+            .iter()
+            .filter_map(|root| root.strip_prefix(project_dir).ok())
+            .map(|rel| rel.to_string_lossy().into_owned())
+            .filter(|rel| !rel.is_empty())
+            .collect();
+        changes.retain(|c| {
+            !names
+                .iter()
+                .any(|n| c.path == *n || c.path.strip_suffix('/') == Some(n.as_str()))
+        });
     }
 }
 
@@ -660,42 +725,27 @@ fn git_output(project_dir: &Path, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// Writable roots the audit does NOT measure: every `--repo-dir` root, plus
-/// every `allow.write` grant that falls outside `project_dir`.
+/// Writable roots the audit does NOT measure: every `allow.write` grant that
+/// falls outside `project_dir`.
 ///
-/// The audit runs git in `project_dir` alone, so a session that only touched a
-/// granted repository is reported as "no project file changes" — an absence of
-/// information rendered as a clean bill of health (#214). Naming the roots
-/// removes the false assurance; auditing them properly needs a per-root report
-/// format and belongs with the multi-repo work in #344.
+/// The audit runs git in each repository it was given, so a session that only
+/// touched a granted tree that is not one of them is reported as "no project
+/// file changes" — an absence of information rendered as a clean bill of health
+/// (#214). Naming the roots removes the false assurance.
 ///
-/// A named root is listed even though it sits *inside* `project_dir`: it keeps
-/// its own git history, so the project's `git status` renders it as a single
-/// `?? <dir>/` line, or as nothing at all when it is gitignored. That is the
-/// same absence of information one level down, and it is the case `--repo-dir`
-/// exists to create.
+/// A `--repo-dir` root is NOT listed here: it gets its own report from [`run`].
+/// It was listed while that report did not exist, which is what made a nested
+/// checkout's changes invisible rather than merely unmeasured.
 ///
-/// Other paths inside `project_dir` are omitted: the project's own `git status`
+/// Paths inside `project_dir` are omitted: the project's own `git status`
 /// already covers them. (A grant pointing at a git-ignored subdirectory is a
 /// residual — git does not report those either, and this function cannot tell.)
-fn unaudited_roots<'a>(
-    project_dir: &Path,
-    allow_write: &'a [PathBuf],
-    named_roots: &'a [PathBuf],
-) -> Vec<&'a Path> {
-    let mut roots: Vec<&Path> = named_roots.iter().map(PathBuf::as_path).collect();
-    for grant in allow_write
+fn unaudited_roots<'a>(project_dir: &Path, allow_write: &'a [PathBuf]) -> Vec<&'a Path> {
+    allow_write
         .iter()
         .map(PathBuf::as_path)
         .filter(|p| !p.starts_with(project_dir))
-    {
-        // A grant may name a root that `--repo-dir` already named; one line per
-        // path, or the count contradicts the list.
-        if !roots.contains(&grant) {
-            roots.push(grant);
-        }
-    }
-    roots
+        .collect()
 }
 
 /// The warning line naming the writable roots the audit did not measure, or
@@ -716,20 +766,12 @@ fn unaudited_warning(project_dir: &Path, unaudited: &[&Path]) -> Option<String> 
         .map(|p| escape_path(&p.display().to_string()))
         .collect::<Vec<_>>()
         .join(", ");
-    // Said only when a listed root is nested, because that is the line that
-    // otherwise reads as a contradiction: "audit covers /w/app only" followed
-    // by "/w/app/lib was NOT audited".
-    let nested = if unaudited.iter().any(|p| p.starts_with(project_dir)) {
-        " A repository checked out inside the project keeps its own git history, so its \
-         changes never appear in the project's git status."
-    } else {
-        ""
-    };
     Some(format!(
-        "audit covers {} only — {} writable path{} {} NOT audited: {list}.{nested}",
-        escape_path(&project_dir.display().to_string()),
+        "audit covers the repositories in scope — {} writable path{} outside {} {} NOT \
+         audited: {list}",
         unaudited.len(),
         if unaudited.len() == 1 { "" } else { "s" },
+        escape_path(&project_dir.display().to_string()),
         if unaudited.len() == 1 { "was" } else { "were" },
     ))
 }
@@ -920,25 +962,36 @@ pub fn run<F: FnOnce() -> u8>(
         return exec();
     }
     let baseline = Baseline::capture(project_dir);
-    // Armed AFTER the baseline, so only the session's own processes inherit the
-    // write end — the baseline's short-lived git children are already reaped.
+    // One baseline per named root, captured here for the same reason the
+    // project's is: in the parent, before the agent can touch the repository it
+    // describes. A root that is not readable degrades to `Unavailable` on its
+    // own line rather than taking the session's report down with it.
+    let named: Vec<(PathBuf, Baseline)> = named_roots
+        .iter()
+        .map(|dir| (dir.clone(), Baseline::capture(dir)))
+        .collect();
+    // Armed AFTER the baselines, so only the session's own processes inherit the
+    // write end — the baselines' short-lived git children are already reaped.
     let probe = SettleProbe::arm();
     let exit_code = exec();
     // `exec` returns when the DIRECT child is reaped; the sample must not be
     // taken until the rest of the tree is gone too (GHSA-c47q-c3c8-7wrf).
     let settled = probe.is_some_and(SettleProbe::settled);
-    baseline.finish(exit_code, settled).print();
+    let mut report = baseline.finish(exit_code, settled);
+    report.drop_named_roots(project_dir, named_roots);
+    report.print();
+    for (dir, baseline) in named {
+        baseline.finish(exit_code, settled).print_named(&dir);
+    }
     if !settled {
-        // Emitted next to the report rather than inside `AuditReport`: it is
-        // true of every variant and none of them has a place to put it.
+        // Emitted next to the reports rather than inside `AuditReport`: it is
+        // true of every variant, of every root, and none of them has a place to
+        // put it.
         ui::warn(
             "the session left processes running — anything they change from here on is NOT audited",
         );
     }
-    if let Some(line) = unaudited_warning(
-        project_dir,
-        &unaudited_roots(project_dir, allow_write, named_roots),
-    ) {
+    if let Some(line) = unaudited_warning(project_dir, &unaudited_roots(project_dir, allow_write)) {
         ui::warn(&line);
     }
     exit_code
@@ -1432,8 +1485,7 @@ mod tests {
         assert!(
             unaudited_roots(
                 &project,
-                &[PathBuf::from("/w/app/vendor"), PathBuf::from("/w/app")],
-                &[]
+                &[PathBuf::from("/w/app/vendor"), PathBuf::from("/w/app")]
             )
             .is_empty()
         );
@@ -1445,54 +1497,77 @@ mod tests {
                     PathBuf::from("/w/app/vendor"),
                     PathBuf::from("/w/lib"),
                     PathBuf::from("/w/app-tools"),
-                ],
-                &[]
+                ]
             ),
             vec![Path::new("/w/lib"), Path::new("/w/app-tools")]
         );
-        assert!(unaudited_roots(&project, &[], &[]).is_empty());
+        assert!(unaudited_roots(&project, &[]).is_empty());
     }
 
-    /// A `--repo-dir` root is nested inside the project by construction today,
-    /// so the "inside the project is already covered" rule would drop exactly
-    /// the roots this exists to name.
+    /// A named root is a repository reported on its own lines. The launch
+    /// repository sees it as ONE path — `?? inner/` in status, or `inner` in
+    /// the diff once a moved gitlink is committed (reachable wherever the
+    /// gitdir protection does not stop the commit, which is every
+    /// Landlock-only host). Reporting that as a changed file claims a file
+    /// changed that did not, and hides that a repository did.
     #[test]
-    fn unaudited_roots_names_a_nested_named_repository() {
-        let project = PathBuf::from("/w/app");
+    fn a_named_root_is_dropped_from_the_launch_repositorys_own_changes() {
+        let change = |path: &str| FileChange {
+            path: path.to_string(),
+            added: Some(1),
+            deleted: Some(1),
+            is_new_untracked: false,
+            sensitive: None,
+        };
+        let mut report = AuditReport::Available {
+            duration: Duration::from_secs(1),
+            exit_code: 0,
+            changes: vec![
+                change("inner"),
+                change("inner/"),
+                // Shares a prefix with the root and is a genuine project file.
+                change("innerfoo.rs"),
+                change("src/main.rs"),
+            ],
+            total_added: 4,
+            total_deleted: 4,
+            tracked_audited: true,
+        };
+        report.drop_named_roots(Path::new("/w/app"), &[PathBuf::from("/w/app/inner")]);
+        let AuditReport::Available { changes, .. } = &report else {
+            unreachable!("still Available");
+        };
         assert_eq!(
-            unaudited_roots(&project, &[], &[PathBuf::from("/w/app/lib")]),
-            vec![Path::new("/w/app/lib")],
-        );
-        // A grant that names a root `--repo-dir` already named is one path, not
-        // two: the count in the warning has to match the list.
-        assert_eq!(
-            unaudited_roots(
-                &project,
-                &[PathBuf::from("/w/lib")],
-                &[PathBuf::from("/w/lib")]
-            ),
-            vec![Path::new("/w/lib")],
+            changes.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(),
+            vec!["innerfoo.rs", "src/main.rs"],
         );
     }
 
-    /// "audit covers /w/app only" next to "/w/app/lib was NOT audited" reads as
-    /// a contradiction unless the reason is stated, and the reason is the whole
-    /// point: a nested checkout has its own history.
+    /// A root that is not under the launch repository cannot appear in its
+    /// status at all, so there is nothing to drop — and a `strip_prefix` that
+    /// silently yielded the whole path would drop by basename, which is how a
+    /// real change goes missing.
     #[test]
-    fn unaudited_warning_explains_a_nested_root_and_not_an_outside_one() {
-        let project = PathBuf::from("/w/app");
-        let nested = unaudited_warning(&project, &[Path::new("/w/app/lib")])
-            .expect("a named root is never covered");
-        assert!(
-            nested.contains("its own git history"),
-            "a nested root needs its reason: {nested:?}"
-        );
-        let outside =
-            unaudited_warning(&project, &[Path::new("/w/lib")]).expect("a grant outside it");
-        assert!(
-            !outside.contains("its own git history"),
-            "nothing is nested here, so the clause is noise: {outside:?}"
-        );
+    fn dropping_named_roots_leaves_a_root_outside_the_project_alone() {
+        let mut report = AuditReport::Available {
+            duration: Duration::from_secs(1),
+            exit_code: 0,
+            changes: vec![FileChange {
+                path: "lib".to_string(),
+                added: Some(1),
+                deleted: Some(0),
+                is_new_untracked: false,
+                sensitive: None,
+            }],
+            total_added: 1,
+            total_deleted: 0,
+            tracked_audited: true,
+        };
+        report.drop_named_roots(Path::new("/w/app"), &[PathBuf::from("/w/lib")]);
+        let AuditReport::Available { changes, .. } = &report else {
+            unreachable!("still Available");
+        };
+        assert_eq!(changes.len(), 1, "nothing to drop here");
     }
 
     #[test]
