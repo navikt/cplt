@@ -110,8 +110,10 @@ itself and every subdomain under it, at any depth:
 So write `cloud.nais.io`, not `*.cloud.nais.io`. A `*` is compared literally and
 matches nothing — and in an allowlist, where the file is the whole policy, that
 does not merely fail to help: it leaves the hosts you meant to permit blocked,
-with an entry on screen that looks right. cplt warns at startup about any entry
-containing a `*` rather than letting the session fail closed silently.
+with an entry on screen that looks right. cplt warns at startup about a `*` in a domain **file**
+(`--allowed-domains`, `--blocked-domains`, a subscription cache) rather than
+letting the session fail closed silently. Lists set as config arrays, such as
+`proxy.allow_private_domains`, are not checked yet.
 
 The same matching applies to the blocklist, `proxy.allow_private_domains` and
 `proxy.upstream_no_proxy`.

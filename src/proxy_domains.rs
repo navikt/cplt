@@ -394,26 +394,50 @@ pub fn parse_lines_file(path: &Path) -> Option<Vec<String>> {
 /// The user writes the glob they would write in any other tool and gets a
 /// fail-closed session with no explanation.
 fn warn_wildcard_entries(path: &Path, entries: &[String]) {
-    let bad: Vec<&str> = entries
+    if let Some(line) = wildcard_warning_line(path, entries) {
+        eprintln!(
+            "{}[proxy]{} {line}",
+            crate::ui::color(crate::ui::YELLOW),
+            crate::ui::color(crate::ui::RESET),
+        );
+    }
+}
+
+/// The warning text, or `None` when there is nothing to warn about.
+///
+/// Split from the printing so the escaping can be asserted on the bytes that
+/// would reach the terminal.
+///
+/// SECURITY: the file's contents are echoed, and nothing validates a line. A
+/// domain list can be a subscription, a shared team file, or something a
+/// repository asked the user to add, so a line carrying C1 or CSI bytes could
+/// rewrite what the rest of this warning says. Same reasoning and the same
+/// primitive as the audit report's paths (GHSA-c47q-c3c8-7wrf):
+/// `escape_debug` covers C0, C1, DEL, bidi overrides and zero-width
+/// formatters while leaving a legitimate internationalized domain readable.
+fn wildcard_warning_line(path: &Path, entries: &[String]) -> Option<String> {
+    let esc = |s: &str| s.escape_debug().to_string();
+    let bad: Vec<String> = entries
         .iter()
         .filter(|e| e.contains('*'))
-        .map(String::as_str)
+        .map(|e| esc(e))
         .collect();
     if bad.is_empty() {
-        return;
+        return None;
     }
-    let suggestion = bad
-        .first()
-        .map(|e| e.trim_start_matches('*').trim_start_matches('.'))
+    let suggestion = entries
+        .iter()
+        .find(|e| e.contains('*'))
+        .map(|e| esc(e.trim_start_matches('*').trim_start_matches('.')))
         .filter(|s| !s.is_empty())
-        .unwrap_or("example.com");
-    eprintln!(
-        "{}[proxy]{} Warning: {} contains wildcard entries ({}) which match no host. Matching is exact host plus subdomains, so write `{suggestion}` to cover `{suggestion}` and everything under it.",
-        crate::ui::color(crate::ui::YELLOW),
-        crate::ui::color(crate::ui::RESET),
-        path.display(),
+        .unwrap_or_else(|| "example.com".to_string());
+    Some(format!(
+        "Warning: {} contains wildcard entries ({}) which match no host. \
+Matching is exact host plus subdomains, so write `{suggestion}` to cover \
+`{suggestion}` and everything under it.",
+        esc(&path.display().to_string()),
         bad.join(", "),
-    );
+    ))
 }
 
 #[cfg(test)]
@@ -447,6 +471,9 @@ mod wildcard_tests {
     #[test]
     fn parsing_a_file_with_a_wildcard_still_returns_the_entries() {
         let dir = std::env::temp_dir().join(format!("cplt-wild-{}", std::process::id()));
+        // Removed first: a panic before the cleanup below would otherwise leave
+        // this directory behind and the next run would read stale state.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("domains.txt");
         std::fs::write(
@@ -466,6 +493,44 @@ github.com
             ])
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SECURITY (same class as GHSA-c47q-c3c8-7wrf): the warning echoes lines
+    /// from a file cplt did not write. A domain list can be a subscription, a
+    /// shared team file, or one a repository asked the user to add, so a line
+    /// carrying terminal control bytes must not be able to rewrite the warning
+    /// around it.
+    ///
+    /// Asserted on BYTES: a `contains("\\u{1b}")` check alone passes just as
+    /// happily on a line that ALSO still carries the raw ESC.
+    #[test]
+    fn the_wildcard_warning_escapes_terminal_control_bytes() {
+        let entries = vec![
+            "*.evil\u{1b}]0;pwned\u{7}.com".to_string(),
+            "*.høyre-æøå.no".to_string(),
+        ];
+        let rendered = wildcard_warning_line(std::path::Path::new("/w/list.txt"), &entries)
+            .expect("wildcards are present");
+        let raw: Vec<u8> = rendered
+            .bytes()
+            .filter(|b| *b < 0x20 || *b == 0x7f)
+            .collect();
+        assert!(
+            raw.is_empty(),
+            "control bytes {raw:?} reached: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("\\u{1b}") && rendered.contains("\\u{7}"),
+            "the attempt must survive as evidence: {rendered:?}"
+        );
+        // Lossless for a legitimate internationalized domain.
+        assert!(
+            rendered.contains("høyre-æøå.no"),
+            "a real IDN was mangled: {rendered:?}"
+        );
+        assert!(
+            wildcard_warning_line(std::path::Path::new("/w/x"), &["a.com".to_string()]).is_none()
+        );
     }
 }
 
