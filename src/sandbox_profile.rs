@@ -461,6 +461,12 @@ fn emit_sensitive_project_denies(
         for pattern in SENSITIVE_PROJECT_PATTERNS {
             // SBPL regex matches against the full path, so we anchor to
             // any directory separator to avoid matching path components.
+            //
+            // Anchored to a separator and NOTHING ELSE: this is a global rule,
+            // not a project-scoped one, whatever the constant is called. It
+            // reaches `~/go/pkg/mod/.../gotenv@v1.6.0/.env` as readily as
+            // `<project>/.env`, which is why `go mod verify` fails in a session
+            // that never went near a secret. See the constant's docs.
             sbpl!(sb, "(deny file-read* (regex #\"/{pattern}\"))");
             sbpl!(sb, "(deny file-write* (regex #\"/{pattern}\"))");
         }

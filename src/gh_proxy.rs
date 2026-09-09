@@ -2064,7 +2064,25 @@ fn gate_with_scope_resolver(
                     .map(|s| format!(" {s}"))
                     .unwrap_or_default(),
             ),
-            guidance: format!("Reason: {}", result.reason),
+            // A raw API write has a narrow key of its own, and a refusal that
+            // names only the blanket escape hatch is how a session ends up with
+            // the whole guard off: one reached for `gh_guard.mode = "warn"` for
+            // exactly this, which also drops the repository scope check. Say
+            // the small thing that opens this one command.
+            guidance: if result.reason.starts_with("gh api with") {
+                format!(
+                    "Reason: {}. Raw API writes are off by default because they bypass the \
+                     per-command policy the guard rests on; the higher-level commands \
+                     (`gh pr comment`, `gh issue comment`, `gh pr review`) are allowed and \
+                     scope-checked. If the raw call is genuinely needed, \
+                     `cplt config set gh_guard.allow_api_write true` opens writes to \
+                     repositories in scope and nothing else — it is far narrower than \
+                     turning the guard off. `gh api DELETE` stays refused either way.",
+                    result.reason
+                )
+            } else {
+                format!("Reason: {}", result.reason)
+            },
             agent_note: &[
                 "This operation is restricted by the cplt sandbox to prevent unintended changes.",
                 NOTE,
@@ -3116,8 +3134,22 @@ pub fn gate_git(
         } else {
             format!("\n{}", block_hints.join("\n"))
         };
+        // Name the repository the push targets, but only where "which
+        // repository?" is a live question: a session spanning several, or a
+        // push that landed outside all of them. In a one-repository session
+        // there is nothing to disambiguate and the path is noise in every
+        // refusal.
+        let target = match repo_facts.target(&repo_args, real_git) {
+            Some(member) if !repo_facts.named.is_empty() => {
+                format!(" in {}", member.project_dir)
+            }
+            None if !repo_facts.git_common_dir.is_empty() || !repo_facts.named.is_empty() => {
+                " in a repository this session does not have in scope".to_string()
+            }
+            _ => String::new(),
+        };
         return Err(Refusal {
-            headline: format!("'git {sub}' is not allowed in this environment."),
+            headline: format!("'git {sub}'{target} is not allowed in this environment."),
             guidance: format!("Push prevention is enabled — commit your changes locally.{hints}"),
             agent_note: &[
                 "This operation is restricted by the cplt sandbox to prevent unintended pushes.",
@@ -7940,6 +7972,138 @@ mod tests {
             &facts,
         )
         .expect("with nothing identified the rule falls back to URL identity, as the launch says");
+    }
+
+    /// A raw API write must be told about its own key, not just the blanket
+    /// escape hatch.
+    ///
+    /// A field session hit this and worked around it with
+    /// `gh_guard.mode = "warn"`, which also drops the repository scope check.
+    /// The refusal named only the escape hatch, so that is what the agent
+    /// relayed. `allow_api_write` opens writes to repositories in scope and
+    /// nothing else.
+    #[test]
+    fn a_raw_api_write_refusal_names_allow_api_write() {
+        let policy = GatePolicy {
+            mode: crate::config::EnforcementMode::Block,
+            scope_check: true,
+            block_auth_token: true,
+            unknown_command: UnknownCommandDecision::Block,
+            allow_api_write: false,
+        };
+        let scope = || Ok(vec!["o/r".to_string()]);
+        let err = gate_with_scope_resolver(
+            &[
+                "api",
+                "-X",
+                "POST",
+                "repos/o/r/pulls/1/comments",
+                "-f",
+                "body=x",
+            ],
+            &policy,
+            scope,
+            None,
+        )
+        .expect_err("raw API writes are off by default")
+        .to_string();
+        assert!(
+            err.contains("gh_guard.allow_api_write"),
+            "the narrow key must be named: {err}"
+        );
+        assert!(
+            err.contains("gh pr comment"),
+            "the supported route must be named too: {err}"
+        );
+        // A read must not carry the write advice.
+        assert!(
+            gate_with_scope_resolver(
+                &["api", "repos/o/r/pulls/1"],
+                &policy,
+                || Ok(vec!["o/r".to_string()]),
+                None,
+            )
+            .is_ok(),
+            "a GET is scope-checked, not refused"
+        );
+    }
+
+    /// With several repositories in scope, "not allowed" without a subject
+    /// leaves an agent unable to tell "wrong repository" from "no rule
+    /// matched". The gh side has named the target since #230; the push side
+    /// did not.
+    #[test]
+    fn a_push_refusal_names_the_repository_when_there_is_a_choice() {
+        let Some((_tmp, launch)) =
+            scratch_repo_with_default("main", "https://github.com/o/launch.git", "main")
+        else {
+            return; // no git available
+        };
+        let Some((_tmp2, named)) =
+            scratch_repo_with_default("main", "https://github.com/o/named.git", "main")
+        else {
+            return;
+        };
+        let git = which_git().unwrap();
+        let dir = named.to_string_lossy().into_owned();
+
+        // One repository in scope, pushing in it: nothing to disambiguate, so
+        // the headline stays the shared one rather than carrying a path into
+        // every refusal.
+        let alone = capture_repo_facts(&git, &launch);
+        let launch_dir = launch.to_string_lossy().into_owned();
+        let err = gate_git(
+            &["-C", launch_dir.as_str(), "push", "origin", "main"],
+            true,
+            true,
+            false,
+            &[],
+            Some(&git),
+            &alone,
+        )
+        .expect_err("push prevention refuses")
+        .to_string();
+        assert!(
+            err.contains("'git push' is not allowed"),
+            "a single-repository session needs no subject: {err}"
+        );
+
+        // Pushing somewhere the session was never given, with one repository in
+        // scope: the subject is what makes that legible at all.
+        let err = gate_git(
+            &["-C", dir.as_str(), "push", "origin", "main"],
+            true,
+            true,
+            false,
+            &[],
+            Some(&git),
+            &alone,
+        )
+        .expect_err("push prevention refuses")
+        .to_string();
+        assert!(
+            err.contains("does not have in scope"),
+            "an out-of-scope push must say so: {err}"
+        );
+
+        // Two in scope, pushing in the named one: say which.
+        let mut facts = alone.clone();
+        facts.named = vec![capture_repo_facts(&git, &named)];
+        let err = gate_git(
+            &["-C", dir.as_str(), "push", "origin", "main"],
+            true,
+            true,
+            false,
+            &[],
+            Some(&git),
+            &facts,
+        )
+        .expect_err("push prevention refuses")
+        .to_string();
+        assert!(
+            err.contains(&facts.named[0].project_dir),
+            "the refusal must name the targeted repository: {err}"
+        );
     }
 
     /// #424: an allow_push rule carries launch/named-root identity. The

@@ -152,7 +152,13 @@ cplt --allow-write ~/src/sykepenger-model exec -- $EDITOR
 ```
 
 Use `--allow-write` when the sibling only needs to be edited, and `--repo-dir`
-when its own build, tests or pull requests have to run. A named root is a
+when its own build, tests or pull requests have to run.
+
+If you have `allow.write` over a directory that holds checkouts, cplt says so at
+launch and names the repositories it found. That grant looks like "let the agent
+work in these" and is not: a script there fails with `bad interpreter: Operation
+not permitted`, which names neither cplt nor the grant, and reads like a problem
+with the project. Naming the repositories is the fix. A named root is a
 second writable-and-executable tree, with the same protected paths as the
 project: `.git/hooks`, `.git/config`, `.cplt.toml` and the rest stay unwritable
 in it, so a hook cannot be planted to run outside the sandbox later.
