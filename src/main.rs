@@ -1711,9 +1711,11 @@ fn warn_inject_token_without_guard(resolved: &config::Resolved) {
         ui::warn(
             "gh_guard.inject_token is set but gh_guard.enabled is false, so no token is \
              injected: the injection runs as part of installing the gh wrapper, which the \
-             guard owns. Turn the guard on to use it (`cplt config set gh_guard.enabled \
-             true`), or drop inject_token so the config does not claim something that is \
-             not happening.",
+             guard owns. Either turn the guard on to use it, with `cplt config set \
+             gh_guard.enabled true`, or remove the key so the config stops claiming \
+             something that is not happening: `cplt config set gh_guard.inject_token \
+             false`, or `cplt config set gh_guard.inject_token --unset` to drop the line \
+             entirely.",
         );
     }
 }
@@ -8748,10 +8750,6 @@ mod tests {
         assert!(err.contains(&inner.display().to_string()), "{err}");
     }
 
-    /// A repository beside the launch repository is the shape most checkouts
-    /// have, and it is now accepted. Every other rule still applies to it —
-    /// git toplevel, no symlinked leaf, not an unsafe root — and those are
-    /// asserted by their own tests; this one is about the location alone.
     /// A key that reads as true and does nothing is worse than one that is off:
     /// `config show` says `inject_token = true`, no token reaches the agent,
     /// and nothing connects the two.
@@ -8831,6 +8829,10 @@ mod tests {
         );
     }
 
+    /// A repository beside the launch repository is the shape most checkouts
+    /// have, and it is now accepted. Every other rule still applies to it —
+    /// git toplevel, no symlinked leaf, not an unsafe root — and those are
+    /// asserted by their own tests; this one is about the location alone.
     #[test]
     fn repo_dir_accepts_a_sibling_repository() {
         let (_guard, root) = canonical_tempdir();
