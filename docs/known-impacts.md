@@ -41,6 +41,43 @@ On macOS this applies to every writable root, the launch repository included,
 not only to repositories named with `--repo-dir`. Tracked in
 [#402](https://github.com/navikt/cplt/issues/402), which also covers whether
 the guard should intercept these forms and fail loudly instead.
+||||||| parent of fc464a5 (fix(gh-guard): inject_token did nothing with the guard off, and said nothing)
+
+## Linux: the system keyring is unreachable, so agents ask you to sign in again
+
+`gnome-keyring`, `kwallet` and anything else behind libsecret are reached over
+D-Bus. The sandbox masks the session bus socket (`$XDG_RUNTIME_DIR/bus`) and
+`/run/dbus/system_bus_socket`, and does not pass `DBUS_SESSION_BUS_ADDRESS`, so
+there is no Secret Service inside it. An agent that keeps its credential there
+finds no vault:
+
+```
+! System vault not available
+  The recommended secure storage (keychain, keyring, or credential manager)
+  could not be found or accessed.
+  Store token in plain text config file?
+```
+
+This is not a distribution problem, and it is not specific to Ubuntu. D-Bus is a
+broad IPC channel into the whole desktop session, which is why it is masked.
+
+**Fix:** authenticate on the host, where the keyring works, and let cplt pass
+the token in.
+
+```bash
+gh auth login                                   # outside cplt, once
+cplt config set gh_guard.inject_token true --force   # needs gh_guard.enabled
+```
+
+`--force` is required because putting the token in the environment is a real
+weakening: it is inherited by every process in the sandbox and readable from any
+of them, through `/proc/<pid>/environ` on Linux or `ps -E` on macOS. See
+[gh-guard.md](gh-guard.md). Answering "yes, store in plain text" also works and
+persists across sessions, at the cost of a token on disk in the agent's config
+directory.
+
+macOS is unaffected: the Keychain is granted (narrowed per agent by
+`keychain_substitute`).
 
 ## `.env` file blocking
 

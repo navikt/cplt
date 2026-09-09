@@ -272,6 +272,20 @@ variable. `gh auth token` inside such a sandbox returns nothing and no
 
 It falls back gracefully if `gh` is not installed or not authenticated.
 
+**On Linux this is often the only way to stay signed in.** The Secret Service
+(gnome-keyring, kwallet, anything behind libsecret) is reached over D-Bus, and
+the sandbox masks the session bus socket and does not pass
+`DBUS_SESSION_BUS_ADDRESS`. An agent that stores its credential in the system
+vault therefore finds none — the Copilot CLI reports `System vault not
+available` and offers to write the token to its config file in plain text — and
+asks you to sign in again every session. Authenticate on the host, where the
+keyring works, and let cplt hand the token in.
+
+`inject_token` requires `gh_guard.enabled`: the injection is part of installing
+the gh wrapper, which the guard owns. With the guard off it does nothing, and
+cplt says so at launch rather than leaving a key that reads as true and has no
+effect.
+
 If you prefer the token in the environment instead, set `inject_token = true`.
 `cplt config set` refuses it without `--force`, and `cplt config show` marks it
 `⚠ DANGEROUS`, because the token is then inherited by every process in the
