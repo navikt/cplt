@@ -21,12 +21,12 @@ macro_rules! sbpl {
 
 use super::SandboxConfig;
 use super::policy::{
-    DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS, EXEC_IN_WRITABLE,
-    GPG_SIGNING_ALLOW_FILES, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected,
-    ResolvedToolDir, SENSITIVE_PROJECT_PATTERNS, SYSTEM_READ_FILES, TOOL_READ_DIRS,
-    XCODE_SELECT_LINK, active_tool_dirs, ancestor_alternation, app_dirs, escape_regex,
-    nested_alternation, path_bin_dirs, playwright_runtime_intent, rel_is_glob, rel_regex,
-    validate_playwright_socket_dir, validate_sbpl_path,
+    DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS,
+    DEPENDENCY_SOURCE_TREES, EXEC_IN_WRITABLE, GPG_SIGNING_ALLOW_FILES, PROTECTED_IN_GITDIR,
+    PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir, SENSITIVE_PROJECT_PATTERNS,
+    SYSTEM_READ_FILES, TOOL_READ_DIRS, XCODE_SELECT_LINK, active_tool_dirs, ancestor_alternation,
+    app_dirs, escape_regex, nested_alternation, path_bin_dirs, playwright_runtime_intent,
+    rel_is_glob, rel_regex, validate_playwright_socket_dir, validate_sbpl_path,
 };
 
 /// Device nodes a sandboxed process may open for writing, by exact path.
@@ -200,6 +200,8 @@ pub fn generate_profile_with_playwright_socket_dir(
         &project_roots,
         config.extra_write,
         config.allow_env_files,
+        &home,
+        config.existing_home_tool_dirs,
     );
     // Same reason, and one more: the worktree common-dir allow is emitted early
     // (so DENIED_DOTFILES still wins over it), which would leave its denies
@@ -392,6 +394,8 @@ fn emit_sensitive_project_denies(
     project_roots: &[String],
     extra_write: &[PathBuf],
     allow_env_files: bool,
+    home: &str,
+    tool_dirs: Option<&[ResolvedToolDir]>,
 ) {
     // All security-critical project denies are emitted LAST in the profile.
     // SBPL uses last-match-wins, so these must come after all user-configured
@@ -470,8 +474,49 @@ fn emit_sensitive_project_denies(
             sbpl!(sb, "(deny file-read* (regex #\"/{pattern}\"))");
             sbpl!(sb, "(deny file-write* (regex #\"/{pattern}\"))");
         }
+        // Re-allow READ inside the extracted dependency stores, after the deny,
+        // because SBPL is last-match-wins. Write stays denied: nothing should be
+        // writing a `.env` into a module cache.
+        //
+        // These files are package content, not the user's secrets — `gotenv`
+        // ships a `.env` as a test fixture — and `go mod verify` hashes every
+        // file in the cache, so one unreadable fixture aborts the command
+        // (#477). Scoped to a short explicit list rather than a heuristic: the
+        // properties that make it safe (content-addressed, checksum-verified,
+        // from a registry) are ones only these trees have.
+        for tree in dependency_source_trees(home, tool_dirs) {
+            if validate_sbpl_path(Path::new(&tree)).is_err() {
+                continue;
+            }
+            let t = escape_regex(&tree);
+            for pattern in SENSITIVE_PROJECT_PATTERNS {
+                sbpl!(sb, "(allow file-read* (regex #\"^{t}/.*/{pattern}\"))");
+            }
+        }
         sbpl!(sb);
     }
+}
+
+/// Absolute paths of [`DEPENDENCY_SOURCE_TREES`], honouring a relocated
+/// `CARGO_HOME` / `GOPATH` when the host probe resolved one.
+fn dependency_source_trees(home: &str, tool_dirs: Option<&[ResolvedToolDir]>) -> Vec<String> {
+    DEPENDENCY_SOURCE_TREES
+        .iter()
+        .map(|(tool_dir, sub)| {
+            let base = tool_dirs
+                .and_then(|dirs| {
+                    dirs.iter()
+                        .find(|d| d.dir.path == *tool_dir)
+                        .map(|d| d.path.to_string_lossy().into_owned())
+                })
+                .unwrap_or_else(|| format!("{home}/{tool_dir}"));
+            if sub.is_empty() {
+                base
+            } else {
+                format!("{base}/{sub}")
+            }
+        })
+        .collect()
 }
 
 fn emit_home_access(
