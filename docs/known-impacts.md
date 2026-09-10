@@ -29,6 +29,14 @@ tracking was recorded. It was not.
 | `git config user.name <x>` | Fails loudly, exit 4 |
 | `git switch -c <branch>` (no tracking) | Clean, nothing to record |
 
+cplt says so when it can see the request coming: a `push`, `branch`, `checkout`
+or `switch` carrying `-u`, `--set-upstream`, `--set-upstream-to` or `--track`
+gets a note before the command runs, saying the success line will be false. That
+needs the git guard on, since the wrapper it prints from is the guard's. The
+implicit form, `git checkout -b <name> <remote>/<base>`, is named in the note
+rather than detected: it sets tracking from a positional that only git can tell
+from a pathspec.
+
 **The shape that works**, and what to tell an agent to do: push with an explicit
 refspec and open the PR with an explicit head, so nothing needs local config.
 

@@ -3850,6 +3850,55 @@ fn parse_allow_push_rules(json: &str) -> Vec<config::ResolvedPushRule> {
     serde_json::from_str(json).unwrap_or_default()
 }
 
+/// Whether this command asks git to record branch tracking, which the
+/// `.git/config` write deny will silently drop.
+///
+/// git treats the failed config write as non-fatal: it prints the error, prints
+/// `branch 'x' set up to track 'origin/y'.` — which is false — and exits 0. An
+/// agent reading the summary line or the exit code is told it worked (#402).
+/// A field agent read stderr and caught it; the next one may not.
+///
+/// macOS only, because that is where the deny is. Landlock cannot deny a file
+/// inside a writable directory, so on Linux `.git/config` stays writable and
+/// tracking is recorded normally — warning there would be the false statement.
+///
+/// Explicit tracking flags only. `git checkout -b feat origin/main` also sets
+/// tracking, from a positional that is only distinguishable from a pathspec by
+/// asking git, so the message names that form rather than this function
+/// guessing at it.
+fn tracking_flag(args: &[String]) -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+    let sub = args
+        .iter()
+        .find(|a| !a.starts_with('-'))
+        .map(String::as_str)
+        .unwrap_or_default();
+    if !matches!(sub, "push" | "branch" | "checkout" | "switch") {
+        return false;
+    }
+    args.iter().any(|a| {
+        a == "-u"
+            || a == "--set-upstream"
+            || a == "-t"
+            || a == "--track"
+            || a == "--set-upstream-to"
+            || a.starts_with("--set-upstream-to=")
+            || a.starts_with("--track=")
+    })
+}
+
+/// The note printed for such a command.
+const TRACKING_DROPPED_NOTICE: &str = concat!(
+    "cplt: this records branch tracking in .git/config, which the sandbox denies. ",
+    "git will print `set up to track` and exit 0 anyway \u{2014} that line is false ",
+    "and the upstream is NOT recorded. Push with an explicit refspec and name the ",
+    "branch when you need it: `git push origin HEAD:my-branch`, then ",
+    "`gh pr create -R <owner>/<repo> --head my-branch`. The same applies to ",
+    "`git checkout -b <name> <remote>/<base>`."
+);
+
 /// Decide what `cplt git-gate` should do. Pure: no process is spawned here.
 ///
 /// The git guard has no repository pin to apply, so an allowed command and a
@@ -3877,7 +3926,12 @@ fn decide_git_gate(
         Some(real_git),
         repo_facts,
     ) {
-        Ok(()) => GateEffect::ExecPlain { notice: None },
+        Ok(()) => GateEffect::ExecPlain {
+            // Only where nothing else is being said: a refusal or a warn-mode
+            // notice is the more urgent message, and two notices on one command
+            // is how both get skimmed.
+            notice: tracking_flag(args).then(|| TRACKING_DROPPED_NOTICE.to_string()),
+        },
         Err(refusal) => match mode {
             config::EnforcementMode::Block => GateEffect::Refuse(refusal),
             config::EnforcementMode::Warn => GateEffect::ExecPlain {
@@ -8793,6 +8847,46 @@ mod tests {
         }
         let err = validate_flags(&[sub], &project).unwrap_err().to_string();
         assert!(err.contains(&inner.display().to_string()), "{err}");
+    }
+
+    /// #402: git records branch tracking in `.git/config`, which the sandbox
+    /// denies on macOS. git prints the error, prints `set up to track` anyway,
+    /// and exits 0 — so an agent reading the summary line or the exit code is
+    /// told the tracking was saved. It was not.
+    #[test]
+    fn tracking_flags_are_noticed_and_ordinary_commands_are_not() {
+        let a = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        // Only meaningful where the deny is. On Linux `.git/config` stays
+        // writable, so warning would itself be the false statement.
+        let expected = cfg!(target_os = "macos");
+
+        for args in [
+            vec!["push", "-u", "origin", "feat"],
+            vec!["push", "--set-upstream", "origin", "feat"],
+            vec!["branch", "--set-upstream-to=origin/main", "feat"],
+            vec!["checkout", "-t", "origin/feat"],
+            vec!["switch", "--track", "origin/feat"],
+        ] {
+            assert_eq!(
+                tracking_flag(&a(&args)),
+                expected,
+                "should be noticed: {args:?}"
+            );
+        }
+
+        for args in [
+            vec!["push", "origin", "feat"],
+            vec!["push", "origin", "HEAD:feat"],
+            vec!["switch", "-c", "feat"],
+            vec!["status"],
+            // `-u` outside a tracking subcommand is a different flag entirely.
+            vec!["clean", "-u"],
+        ] {
+            assert!(
+                !tracking_flag(&a(&args)),
+                "must stay quiet, or the notice becomes noise: {args:?}"
+            );
+        }
     }
 
     /// A key that reads as true and does nothing is worse than one that is off:
