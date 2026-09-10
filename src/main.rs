@@ -777,7 +777,7 @@ QUICK START:
 
         /// Scan machine-level tools and generate personal config
         /// (~/.config/cplt/config.toml) instead of per-repo .cplt.toml.
-        #[arg(long)]
+        #[arg(long, short = 'g')]
         global: bool,
     },
 
@@ -1017,7 +1017,7 @@ enum ConfigAction {
     Path {
         /// Print the per-repo user config path for this project instead,
         /// whether or not the file exists.
-        #[arg(long)]
+        #[arg(long, short = 'l')]
         local: bool,
     },
 
@@ -1064,18 +1064,18 @@ enum ConfigAction {
 
         /// Write to the repo-local .cplt.toml (proposed/deny settings).
         /// Relaxations go under [propose], tightenings under [deny].
-        #[arg(long, conflicts_with = "global")]
+        #[arg(long, short = 'r', conflicts_with = "global")]
         repo: bool,
 
         /// Write to the global config (~/.config/cplt/config.toml).
         /// This is the default behavior.
-        #[arg(long, conflicts_with = "repo")]
+        #[arg(long, short = 'g', conflicts_with = "repo")]
         global: bool,
 
         /// Write to this project's per-repo user config, outside the
         /// repository, at ~/.config/cplt/local/<hash>.toml. Requires a git
         /// repository: the file is keyed on the checkout's canonical path.
-        #[arg(long, conflicts_with_all = ["repo", "global"])]
+        #[arg(long, short = 'l', conflicts_with_all = ["repo", "global"])]
         local: bool,
     },
 
@@ -6558,6 +6558,27 @@ fn run_config_set(
     } else {
         None
     };
+    // `../sibling` is how a person names the repository next door. The local
+    // layer stores absolute paths only — a relative entry there has no stable
+    // anchor — so resolve it here rather than making the user do it (#490).
+    let resolved_value;
+    let value = match (local_project.as_ref(), value) {
+        (Some(_), Some(v)) if config::is_local_path_key(key) => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            match config::resolve_path_entry(v, &cwd) {
+                Ok(abs) => {
+                    resolved_value = abs;
+                    Some(resolved_value.as_str())
+                }
+                Err(e) => {
+                    ui::error(&e.to_string());
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        _ => value,
+    };
+
     let op = match &local_project {
         Some(project_dir) => config::ConfigSetOp::new_local(key, project_dir),
         None => config::ConfigSetOp::new(key),
