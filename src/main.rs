@@ -741,6 +741,30 @@ QUICK START:
     #[command(name = "update-lists")]
     UpdateLists,
 
+    /// Put another repository in scope for this checkout, by name.
+    ///
+    /// `cplt link navikt/sykepenger-model` finds the checkout on this machine,
+    /// verifies its origin really is that repository, and records the path in
+    /// this project's local config as a named root. Equivalent to working out
+    /// the path yourself and running `cplt config set --local
+    /// sandbox.repo_dirs <dir>` — the difference is that cplt checks the
+    /// directory is the repository you named.
+    ///
+    /// A named root gets read, write AND execute, like the project directory.
+    /// Use `--allow-write` for a tree you only need to edit.
+    Link {
+        /// The repository, as `<owner>/<name>` (e.g. `navikt/cplt`).
+        repo: String,
+
+        /// The directory, when cplt should not go looking. Still verified
+        /// against the identity.
+        dir: Option<PathBuf>,
+
+        /// Remove the link instead of adding it.
+        #[arg(long)]
+        unlink: bool,
+    },
+
     /// Manage per-repo trust for .cplt.toml permissions.
     ///
     /// Shows, approves, or revokes trust for sandbox permissions
@@ -3270,6 +3294,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             },
             Command::Update { check, force } => run_update(check, force),
             Command::UpdateLists => run_update_lists(),
+            Command::Link { repo, dir, unlink } => run_link_command(&repo, dir.as_deref(), unlink),
             Command::Trust { action } => run_trust_command(action),
             Command::Init {
                 write,
@@ -7143,6 +7168,153 @@ fn run_init_global_command(write: bool, force: bool, quiet: bool) -> ExitCode {
         }
         cplt::init::GlobalInitResult::WriteFailed(path, err) => {
             eprintln!("error: failed to write {}: {err}", path.display());
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `cplt link <owner>/<name> [dir]` — put another repository in scope for this
+/// checkout, verified rather than guessed.
+///
+/// The write is an ordinary `sandbox.repo_dirs` entry in the local layer, so
+/// everything that already applies to one applies here: it is re-validated on
+/// every launch, it is refused if it stops being a git toplevel or acquires a
+/// symlinked leaf, and `cplt config set --local sandbox.repo_dirs` manages the
+/// same list. What this command adds is the identity check.
+fn run_link_command(repo: &str, dir: Option<&Path>, unlink: bool) -> ExitCode {
+    let Some(project_dir) = detect_project_root() else {
+        ui::error(NOT_A_REPOSITORY);
+        return ExitCode::FAILURE;
+    };
+    let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
+
+    if unlink {
+        // By identity, so a root can be dropped by the name it was added under
+        // — the path is an implementation detail the user should not have to
+        // remember. Resolution is not needed: the recorded paths are read and
+        // the one whose origin matches is removed.
+        return unlink_by_identity(&project_dir, repo);
+    }
+
+    let found = match dir {
+        Some(named) => match cplt::link::verify_named(named, repo) {
+            Ok(c) => c,
+            Err(e) => {
+                ui::error(&e);
+                return ExitCode::FAILURE;
+            }
+        },
+        None => match cplt::link::resolve(&project_dir, &home, repo) {
+            Ok(c) => c,
+            Err(e) => {
+                ui::error(&e.to_string());
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+
+    ui::info(&format!(
+        "{repo} → {} ({}, origin verified)",
+        found.dir.display(),
+        found.how.describe()
+    ));
+    if found.worktrees > 0 {
+        let n = found.worktrees;
+        eprintln!(
+            "  {}{n} linked worktree{} of it {} on this machine; this is the main checkout.{}",
+            ui::color(ui::DIM),
+            if n == 1 { "" } else { "s" },
+            if n == 1 { "is" } else { "are" },
+            ui::color(ui::RESET)
+        );
+    }
+    if !found.also.is_empty() {
+        // A separate clone of the same repository. Named rather than hidden:
+        // the choice between them is the operator's, and this is where they
+        // learn there was one.
+        eprintln!(
+            "  {}Also matched: {}{}",
+            ui::color(ui::DIM),
+            found
+                .also
+                .iter()
+                .map(|c| c.dir.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            ui::color(ui::RESET)
+        );
+        eprintln!(
+            "  {}Link one of those instead with: cplt link {repo} <dir>{}",
+            ui::color(ui::DIM),
+            ui::color(ui::RESET)
+        );
+    }
+    run_config_set(
+        "sandbox.repo_dirs",
+        Some(&found.dir.to_string_lossy()),
+        false,
+        false,
+        false,
+        false,
+        true,
+    )
+}
+
+/// Remove the named root whose origin is `identity`.
+fn unlink_by_identity(project_dir: &Path, identity: &str) -> ExitCode {
+    let Some(real_git) = cplt::git::trusted_git() else {
+        ui::error(
+            "No trusted git binary in the parent environment, so no repository's identity \
+             can be read. Remove it by path:\n  \
+             cplt config set --local sandbox.repo_dirs <DIR> --unset",
+        );
+        return ExitCode::FAILURE;
+    };
+    let linked: Vec<String> = config::load_local(project_dir)
+        .ok()
+        .flatten()
+        .map(|l| l.config.sandbox.repo_dirs.clone())
+        .unwrap_or_default();
+
+    let matching: Vec<&String> = linked
+        .iter()
+        .filter(|entry| {
+            let dir = config::expand_tilde(entry);
+            cplt::gh_proxy::detect_current_repo(real_git, &dir)
+                .is_ok_and(|found| cplt::gh_proxy::repos_match(&found, identity))
+        })
+        .collect();
+
+    match matching.as_slice() {
+        [] => {
+            ui::error(&format!(
+                "No repository linked here is {identity}.\n  \
+                 What is linked: cplt config get sandbox.repo_dirs"
+            ));
+            ExitCode::FAILURE
+        }
+        [entry] => run_config_set(
+            "sandbox.repo_dirs",
+            Some(entry),
+            false,
+            true,
+            false,
+            false,
+            true,
+        ),
+        // Two checkouts of one repository, both linked. Removing "the" one would
+        // be a guess about which.
+        many => {
+            ui::error(&format!(
+                "{} checkouts of {identity} are linked here, so cplt is not picking one:\n  {}\n  \
+                 Remove the one you mean:\n    \
+                 cplt config set --local sandbox.repo_dirs <DIR> --unset",
+                many.len(),
+                many.iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n  ")
+            ));
             ExitCode::FAILURE
         }
     }
