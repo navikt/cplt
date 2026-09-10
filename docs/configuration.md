@@ -577,6 +577,7 @@ Settings map to sections automatically. Permission requests go under `[propose]`
 - `[deny]` applies automatically and needs no approval, because it can only tighten the sandbox.
 - `[propose]` holds requested permissions and requires explicit approval via `cplt trust accept`. Approvals are additive: they can enable a feature such as `allow_docker = true`, never disable something CLI or global config set.
 - cplt reads the file from `git HEAD`, the committed state, so the agent cannot tamper with its own config mid-session.
+- An **uncommitted** `.cplt.toml` — untracked, gitignored, or edited but not committed — grants nothing, on both platforms, and the launch says so. Its `[deny]` keys still apply, and so does a `[propose]` key that only tightens (`gh_guard = true`, `git_push_prevention = true`), because those are `[deny]`-shaped and need no approval anywhere. A restriction needs no audit trail, and dropping it would remove something its author believed was in force; a relaxation needs one, and the commit is it. `--accept-repo-config` does not change this: it skips the prompt, not the commit.
 - Writing `.cplt.toml` is kernel-denied inside the sandbox.
 - Trust approvals are content-pinned. If the requested values change, the approvals are invalidated.
 

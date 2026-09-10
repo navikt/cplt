@@ -2131,6 +2131,29 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                 ui::info(&format!("Repo config: .cplt.toml{source_note}"));
             }
             warn_unknown_repo_config_keys(&loaded.config, ".cplt.toml");
+            if loaded.propose_dropped && !resolved.quiet {
+                // Said plainly, because the alternative is a session that quietly
+                // lacks a permission the file asks for and a developer who reads
+                // the file and believes it applies.
+                // "Commit it" is wrong advice in a directory that is not a git
+                // repository at all, and that case reaches here too — the
+                // working-tree load does not require git. `explain()` already
+                // distinguishes the two, so let it say which one this is.
+                let why = match repo_config::repo_config_state(&project_dir) {
+                    repo_config::RepoConfigState::NotAGitRepo { .. } => {
+                        "This is not a git repository, so the permissions .cplt.toml asks \
+                         for are ignored: cplt grants only what a commit contains."
+                    }
+                    _ => {
+                        "This .cplt.toml is not committed, so the permissions it asks for \
+                         are ignored. Commit it to propose them."
+                    }
+                };
+                ui::warn(&format!(
+                    "{why} Its [deny] keys apply either way, and so does a [propose] key \
+                     that only tightens."
+                ));
+            }
 
             // Determine approved keys
             let approved_keys: Vec<String> = if cli.accept_repo_config {
@@ -2257,17 +2280,40 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             }
             // No `.cplt.toml` is the ordinary case and says nothing.
             Ok(None) => {}
-            // Unlike the launch repository's, this is fatal. The file exists
-            // and cannot be read, so a restriction its owner wrote is missing —
-            // and a missing restriction must never be a warning the operator
-            // scrolls past on the way to a session that runs anyway.
-            Err(e) => bail!(
-                "Failed to load .cplt.toml from the named repository {}: {e}\n  \
-                 Its [deny] section cannot be applied, so the session would be \
-                 less restricted than that repository asks for. Fix the file, or \
-                 drop the repository from the named set.",
-                root.dir.display()
-            ),
+            // Unlike the launch repository's, a broken COMMITTED file is fatal.
+            // It exists and cannot be read, so a restriction its owner wrote is
+            // missing — and a missing restriction must never be a warning the
+            // operator scrolls past on the way to a session that runs anyway.
+            //
+            // An uncommitted one is not fatal, and the difference matters since
+            // #206 made Linux read the working tree here at all: a named root is
+            // agent-writable, `.cplt.toml` is not deniable inside it on Landlock,
+            // and `.git/info/exclude` hides a new file from `git status`. Fatal
+            // would hand a previous session a way to stop every later launch with
+            // a file the user cannot see. Nothing its author wrote is being
+            // dropped — there is no committed version to drop.
+            Err(e) => {
+                let state = repo_config::repo_config_state(&root.dir);
+                if matches!(
+                    state,
+                    repo_config::RepoConfigState::Committed | repo_config::RepoConfigState::Drifted
+                ) {
+                    bail!(
+                        "Failed to load .cplt.toml from the named repository {}: {e}\n  \
+                         Its [deny] section cannot be applied, so the session would be \
+                         less restricted than that repository asks for. Fix the file, or \
+                         drop the repository from the named set.",
+                        root.dir.display()
+                    );
+                }
+                ui::warn(&format!(
+                    "Ignoring an unreadable, uncommitted .cplt.toml in the named repository \
+                     {}: {e}\n  \
+                     Nothing committed is being dropped. If you wrote it, commit it; if you \
+                     did not, a previous session did.",
+                    root.dir.display()
+                ));
+            }
         }
     }
 
@@ -6342,7 +6388,15 @@ fn display_repo_config(loaded: &repo_config::LoadedRepoConfig, project_dir: &std
     // [propose]
     let proposed = repo_config::proposed_keys(&rc.propose);
     if proposed.is_empty() {
-        println!("{blue}[cplt]{nc}  {dim}No additional permissions requested.{nc}");
+        if loaded.propose_dropped {
+            // The file requests plenty; none of it reached this command.
+            println!(
+                "{blue}[cplt]{nc}  {dim}The permissions this file asks for are ignored while \
+                 it is uncommitted.{nc}"
+            );
+        } else {
+            println!("{blue}[cplt]{nc}  {dim}No additional permissions requested.{nc}");
+        }
     } else {
         let trust_entry = crate::trust::load_trust(project_dir);
 
@@ -7197,7 +7251,16 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
                 .is_some_and(|t| trust::is_key_approved(t, key))
         });
     if proposed.is_empty() {
-        println!("{blue}[cplt]{nc}  No additional permissions requested.");
+        if loaded.propose_dropped {
+            // "No additional permissions requested" would be false here: the
+            // file requests plenty, and none of it reached this command.
+            println!(
+                "{blue}[cplt]{nc}  The permissions this file asks for are ignored while it is \
+                 uncommitted."
+            );
+        } else {
+            println!("{blue}[cplt]{nc}  No additional permissions requested.");
+        }
     } else {
         let section_label = if all_approved {
             LABEL_ALLOW_APPROVED
@@ -7292,22 +7355,27 @@ fn trust_accept(
     keys: &[String],
     all: bool,
 ) -> ExitCode {
-    let proposed = repo_config::proposed_keys(&loaded.config.propose);
-
-    if proposed.is_empty() {
-        ui::info("No permissions requested in .cplt.toml, nothing to approve.");
-        return ExitCode::SUCCESS;
-    }
-
     // Guard: approve ONLY the committed config, so every granted permission is
     // auditable in git history and no process can inject permissions and
     // immediately accept them. Stated as "anything but Committed" on purpose —
     // enumerating the bad states is how the not-a-git-repo case slipped through,
     // and `git status` cannot see a gitignored .cplt.toml at all (#183).
+    //
+    // Before the emptiness check, not after: since #206 the loader strips
+    // `[propose]` from an uncommitted file, so asking "is anything proposed"
+    // first would answer "nothing to approve" for a file full of proposals and
+    // never mention the commit.
     let state = repo_config::repo_config_state(project_dir);
     if state != repo_config::RepoConfigState::Committed {
         ui::error(&state.explain().unwrap_or_default());
         return ExitCode::FAILURE;
+    }
+
+    let proposed = repo_config::proposed_keys(&loaded.config.propose);
+
+    if proposed.is_empty() {
+        ui::info("No permissions requested in .cplt.toml, nothing to approve.");
+        return ExitCode::SUCCESS;
     }
 
     let current_hash = trust::proposal_content_hash(&loaded.config.propose);

@@ -4365,6 +4365,76 @@ paths = [
         let _ = std::fs::remove_dir_all(&repo);
     }
 
+    /// #206: `--accept-repo-config` used to approve every proposed key with no
+    /// state check, so an uncommitted `.cplt.toml` was fully honoured for that
+    /// run. It is the third bypass of the same guard found one at a time — a
+    /// gitignored file and a non-git directory were the first two — which is
+    /// why the rule moved to the loader instead of being patched here.
+    ///
+    /// The flag still does what it is for: no prompt, no persistence. It just
+    /// cannot approve what a commit never contained.
+    #[test]
+    fn e2e_accept_repo_config_cannot_approve_an_uncommitted_proposal() {
+        require_sandbox!();
+        // Committed as deny-only, then a propose section added and left in the
+        // working tree — the shape a developer iterating on their config has.
+        let (repo, config_file) =
+            make_trust_repo("accept-flag-uncommitted", "[deny]\npaths = [\"secrets\"]\n");
+        // Untrack it, so HEAD has no .cplt.toml at all and the working-tree
+        // path is the one under test.
+        for args in [
+            vec!["rm", "--cached", "-q", ".cplt.toml"],
+            vec![
+                "-c",
+                "commit.gpgSign=false",
+                "commit",
+                "-m",
+                "untrack",
+                "--quiet",
+            ],
+        ] {
+            let out = git_cmd(&repo).args(&args).output().unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed, so this is not the fixture under test: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        std::fs::write(
+            repo.join(".cplt.toml"),
+            "[deny]\npaths = [\"secrets\"]\n\n[propose]\nallow_docker = true\n",
+        )
+        .expect("write working-tree config");
+
+        let output = cplt_cmd()
+            .args([
+                "--agent",
+                "shell",
+                "--yes",
+                "--no-validate",
+                "--accept-repo-config",
+                "--",
+                "-c",
+                "true",
+            ])
+            .current_dir(&repo)
+            .env("CPLT_CONFIG", config_file.to_str().unwrap())
+            .output()
+            .expect("should run");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("Docker:        ALLOWED"),
+            "an uncommitted proposal must not be granted by the flag:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("not committed, so the permissions it asks for are ignored"),
+            "and the run must say why it was ignored:\n{stderr}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
     #[test]
     fn e2e_trust_head_preferred_over_working_tree() {
         let (repo, config_file) =
