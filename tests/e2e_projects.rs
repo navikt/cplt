@@ -1745,11 +1745,15 @@ if cat secrets/k.txt >/dev/null 2>&1; then echo "RESULT:launch_secret:OK"; else 
         named.git_init();
         let named_path = named.canonical_path().to_string_lossy().to_string();
 
+        // `--agent shell` because the assertion is that the launch SUCCEEDS,
+        // and a CI runner has no AI agent installed — without it the exit code
+        // says "no supported agent in PATH" and the test reads that as the
+        // refusal it is checking for.
         let output = cplt_cmd()
-            .args(["--yes", "--no-validate"])
+            .args(["--yes", "--no-validate", "--agent", "shell"])
             .args(["--project-dir", &project.canonical_path().to_string_lossy()])
             .args(["--repo-dir", &named_path])
-            .args(["--", "--version"])
+            .args(["--", "-c", "true"])
             .env("CPLT_CONFIG", "/dev/null/nonexistent")
             .output()
             .expect("cplt should run");
