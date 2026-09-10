@@ -4763,9 +4763,11 @@ fn probe_shell(
     disabled: &[sandbox::HardeningCategory],
     script: &str,
 ) -> u8 {
-    let Ok(shell) = agent::Agent::Shell.resolve_binary() else {
-        return PROBE_SPAWN_FAILED;
-    };
+    // `/bin/sh`, never `$SHELL`: the probes are POSIX shell, and a user whose
+    // login shell is fish gets a syntax error instead of a verdict — `f=...`
+    // is not an assignment there, so the write probe exits non-zero and check
+    // reports the sandbox as not enforcing (#488).
+    let shell = PathBuf::from("/bin/sh");
     let args = vec!["-c".to_string(), script.to_string()];
     sandbox::exec_sandboxed(
         prepared,
