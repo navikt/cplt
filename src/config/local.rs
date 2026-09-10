@@ -398,6 +398,7 @@ impl Config {
                     socket: _,
                     ports: _,
                     localhost: _,
+                    domains: _,
                 },
             deny: super::types::DenyConfig { paths: _ },
             sandbox:
@@ -485,7 +486,8 @@ impl Config {
             exec,
             socket,
             ports,
-            localhost
+            localhost,
+            domains
         );
         union_lists!(out.deny, local.deny, paths);
         take_set!(

@@ -361,6 +361,20 @@ pub fn proposal_content_hash(propose: &crate::repo_config::ProposeSection) -> St
         hasher.update(format!("allow.localhost={port}\n").as_bytes());
     }
 
+    // Hashed like every other proposed array: changing the requested domains
+    // must invalidate an approval, or a repository could add a host after the
+    // user reviewed the list.
+    let mut allow_domains: Vec<&str> = propose
+        .allow
+        .domains
+        .iter()
+        .map(std::string::String::as_str)
+        .collect();
+    allow_domains.sort_unstable();
+    for d in &allow_domains {
+        hasher.update(format!("allow.domains={d}\n").as_bytes());
+    }
+
     let mut domains: Vec<&str> = propose
         .proxy
         .allow_private_domains

@@ -436,6 +436,20 @@ impl Config {
         allow_localhost.sort_unstable();
         allow_localhost.dedup();
 
+        // Allow-domains: config only, plus whatever the repo proposed and the
+        // user approved (added later, in `apply_repo_config`). Normalized the
+        // same way every other domain list is, so `Example.COM.` and
+        // `example.com` are one entry.
+        let mut allow_domains: Vec<String> = self
+            .allow
+            .domains
+            .iter()
+            .map(|d| crate::proxy::normalize_hostname(d))
+            .filter(|d| !d.is_empty())
+            .collect();
+        allow_domains.sort();
+        allow_domains.dedup();
+
         let allow_localhost_any = bools.allow_localhost_any;
 
         // Pass-env: merge config + CLI
@@ -610,6 +624,7 @@ impl Config {
             deny_paths,
             allow_ports,
             allow_localhost,
+            allow_domains,
             allow_localhost_any,
             allow_env_files,
             no_validate,
@@ -1617,6 +1632,20 @@ impl Resolved {
             }
             self.allow_ports.sort_unstable();
             self.allow_ports.dedup();
+        }
+        if is_approved("allow.domains") {
+            // Normalized and empty-filtered on the same rule as
+            // `proxy.allow_private_domains` below: `.cplt.toml` validation
+            // rejects "" but not "." or " ", which normalize to nothing.
+            for domain in &repo_config.propose.allow.domains {
+                let domain = crate::proxy::normalize_hostname(domain);
+                if domain.is_empty() || self.allow_domains.contains(&domain) {
+                    continue;
+                }
+                self.allow_domains.push(domain);
+            }
+            self.allow_domains.sort();
+            self.allow_domains.dedup();
         }
         if is_approved("allow.localhost") {
             for &port in &repo_config.propose.allow.localhost {

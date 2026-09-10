@@ -102,6 +102,15 @@ pub struct ProposeAllowSection {
     pub ports: Vec<u16>,
     #[serde(default)]
     pub localhost: Vec<u16>,
+    /// Domains the project asks to add to the proxy allowlist (#482).
+    ///
+    /// Proposable like the rest of `[propose.allow]`, and inert until
+    /// `cplt trust accept` on each machine. It widens an allowlist already in
+    /// force and cannot turn one on, so an approved entry can only let a
+    /// fail-closed session reach one more host — it can never open a session
+    /// that was not filtering to begin with.
+    #[serde(default)]
+    pub domains: Vec<String>,
 }
 
 /// Proposed proxy settings.
@@ -489,6 +498,9 @@ pub fn proposed_keys(propose: &ProposeSection) -> Vec<&'static str> {
     }
     if !propose.allow.localhost.is_empty() {
         keys.push("allow.localhost");
+    }
+    if !propose.allow.domains.is_empty() {
+        keys.push("allow.domains");
     }
     if !propose.proxy.allow_private_domains.is_empty() {
         keys.push("proxy.allow_private_domains");

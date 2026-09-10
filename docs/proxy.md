@@ -212,6 +212,32 @@ An IP literal cannot be waived — give the host a name. A repository may propos
 entries in `[propose.proxy]`, which is the only proxy key `.cplt.toml` can
 propose, and they apply only after `cplt trust accept`.
 
+### Adding hosts with `allow.domains`
+
+The allowlist file is the right shape for a long, shared or subscription-fed
+list. For the handful of hosts one person needs, `allow.domains` is a config
+list like every other:
+
+```bash
+cplt config set allow.domains cloud.nais.io
+cplt config set allow.domains cloud.nais.io --unset
+```
+
+**It widens an allowlist that is in force, and never turns one on.** Every other
+`allow.*` key adds a permission without taking one away — `allow.read` does not
+mean "only read this" — so this one does not get to be the exception that
+switches a session to fail-closed the first time you add a host. With no
+allowlist active the entries sit there doing nothing, and `cplt config show`
+says so rather than letting them look effective.
+
+A `*` is refused at the point of typing, with the working form given, because
+matching is exact host plus subdomains and a wildcard entry matches nothing.
+
+A repository may propose entries in `[propose.allow] domains`, inert until
+`cplt trust accept` on each machine. An approved entry can only let an already
+filtering session reach one more host; it cannot open a session that was not
+filtering.
+
 ### Allowlist
 
 Restrict connections to specific domains. When the allowlist is set, the proxy blocks everything not in it. An `allowed-domains.txt` for Copilot-only access looks like this:

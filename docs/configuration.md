@@ -13,7 +13,7 @@ Per-repo config (`.cplt.toml`) sits outside that hierarchy, as a separate layer 
 
 Sessions that span several repositories are configured separately again — see [Working across several repositories](#working-across-several-repositories---repo-dir).
 
-List values merge instead of replacing, so repeated `cplt config set` commands accumulate for `allow.read`, `allow.write`, `allow.ports`, `allow.localhost`, and `deny.paths`.
+List values merge instead of replacing, so repeated `cplt config set` commands accumulate for `allow.read`, `allow.write`, `allow.ports`, `allow.localhost`, `allow.domains`, and `deny.paths`.
 
 Point `CPLT_CONFIG` at another file to use it instead of the default location:
 
