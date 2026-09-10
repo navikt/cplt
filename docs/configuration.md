@@ -491,6 +491,40 @@ Both are global-only keys — a repository cannot ask cplt to write into its own
 
 ## Per-repo configuration (`.cplt.toml`)
 
+### Keys this cplt does not know
+
+A `.cplt.toml` may use keys a newer cplt understands. They are **ignored and
+reported**, not treated as errors, so a repository can adopt a key before every
+developer has upgraded:
+
+```
+[cplt] .cplt.toml uses a key this version of cplt does not understand
+       (propose.allow_future_thing), and it is ignored. That is usually a newer
+       cplt writing the file than the one reading it: upgrade, or check the
+       spelling if you wrote them by hand.
+```
+
+The two sections fail in opposite directions, and the warning says which:
+
+- An unknown key under `[propose]` grants nothing, so ignoring it **fails
+  closed**. This is also why a repository cannot smuggle in a key like `preset`
+  that a future version might honour: an unknown key does nothing here.
+- An unknown key under `[deny]` is a restriction its author expected and this
+  version will not apply. The warning calls that out explicitly, because
+  nothing else in the session will mention it.
+
+Everything the version *does* understand still applies. Before this, one unknown
+key failed the whole parse — the launch repository lost its `[deny]` along with
+it, and a named repository stopped the launch.
+
+Malformed TOML is a different thing and still an error: it is not version skew,
+and there is nothing to salvage from it.
+
+An unknown key does not invalidate an existing trust approval, because it
+proposes nothing. When you upgrade and the key becomes real, it starts counting
+towards the approval hash and you are asked to review it — approval tracks what
+the file can actually do on your machine.
+
 Commit a `.cplt.toml` to your repository for project-specific sandbox settings, so every developer does not have to configure the same CLI flags or global config. Global config stays the default, so pass `--repo` explicitly for project settings:
 
 ```bash

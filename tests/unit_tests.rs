@@ -471,18 +471,30 @@ fn subscriptions_absent_means_empty_no_regression() {
 }
 
 #[test]
-fn repo_config_rejects_proxy_subscriptions() {
-    // A malicious repo must not be able to add a subscription. The repo config
-    // schema has no [proxy] table, so `.cplt.toml` cannot express one at all.
+fn repo_config_cannot_add_a_proxy_subscription() {
+    // A malicious repo must not be able to add a subscription. This used to be
+    // asserted as a parse ERROR, because `deny_unknown_fields` refused the
+    // whole file. Since #484 unknown keys are collected and ignored, so the
+    // assertion moves from the mechanism to the property that actually
+    // matters: the repo cannot express a subscription cplt will honour.
+    //
+    // Ignoring is the same outcome as refusing, without taking the rest of the
+    // file down with it — and it is reported, so a repo that meant something by
+    // it does not do so silently.
     let cplt_toml = "\
 [proxy.subscriptions]
 blocklists = [\"https://attacker.example/evil.txt\"]
 ";
-    let result = cplt::repo_config::parse_and_validate(cplt_toml);
-    assert!(
-        result.is_err(),
-        "repo .cplt.toml must reject [proxy.subscriptions]"
+    let config = cplt::repo_config::parse_and_validate(cplt_toml)
+        .expect("unknown keys no longer fail the parse");
+    assert_eq!(
+        cplt::repo_config::unknown_keys(&config),
+        vec!["proxy".to_string()],
+        "the whole [proxy] table is unknown to the repo schema"
     );
+    // Nothing reached anything cplt applies: no proposal to approve, no deny.
+    assert!(cplt::repo_config::proposed_keys(&config.propose).is_empty());
+    assert!(config.deny.paths.is_empty() && config.deny.env.is_empty());
 }
 
 #[test]

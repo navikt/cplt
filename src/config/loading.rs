@@ -2919,6 +2919,7 @@ validate = false
             deny: crate::repo_config::DenySection {
                 paths: vec!["secrets".to_string()],
                 env: vec![],
+                ..Default::default()
             },
             propose: crate::repo_config::ProposeSection {
                 allow: crate::repo_config::ProposeAllowSection {
@@ -2929,6 +2930,7 @@ validate = false
                 },
                 ..Default::default()
             },
+            ..Default::default()
         };
 
         resolved.apply_repo_config(
@@ -3053,6 +3055,7 @@ validate = false
             deny: crate::repo_config::DenySection {
                 paths: vec!["~/secrets".to_string()],
                 env: vec!["MY_SECRET".to_string(), "VAULT_TOKEN".to_string()],
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -3217,6 +3220,7 @@ validate = false
                         "mimir.nav.cloud.nais.io.".to_string(),
                         ".".to_string(),
                     ],
+                    ..Default::default()
                 },
                 ..Default::default()
             },
