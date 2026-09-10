@@ -230,8 +230,11 @@ switches a session to fail-closed the first time you add a host. With no
 allowlist active the entries sit there doing nothing, and `cplt config show`
 says so rather than letting them look effective.
 
-A `*` is refused at the point of typing, with the working form given, because
-matching is exact host plus subdomains and a wildcard entry matches nothing.
+A `*` matches no host, because matching is exact host plus subdomains. Where
+cplt can catch that for you it does: `cplt config set` refuses it with the
+working form, and a `.cplt.toml` proposing one fails validation. A wildcard in
+an allowlist **file** is only warned about at launch, since nothing sees it
+until the file is read.
 
 A repository may propose entries in `[propose.allow] domains`, inert until
 `cplt trust accept` on each machine. An approved entry can only let an already

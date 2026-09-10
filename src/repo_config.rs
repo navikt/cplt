@@ -444,17 +444,38 @@ fn validate_repo_config(config: &RepoConfig) -> Result<(), String> {
         }
     }
 
-    // Validate private domains: must be non-empty, no whitespace
-    for domain in &config.propose.proxy.allow_private_domains {
-        if domain.is_empty() || domain.trim().is_empty() {
-            return Err(
-                "propose.proxy.allow_private_domains contains empty domain name".to_string(),
-            );
-        }
-        if domain.contains(char::is_whitespace) {
-            return Err(format!(
-                "propose.proxy.allow_private_domains entry {domain:?} contains whitespace"
-            ));
+    // Both domain lists get the same checks, and one they did not have before:
+    // a `*` matches no host, because matching is exact host plus subdomains.
+    // `cplt config set` refuses a wildcard while the user is still typing;
+    // a `.cplt.toml` is written in an editor, so the equivalent moment is here.
+    // Without it a repository proposes `*.example.com`, every developer
+    // approves it, and it reaches nothing on any of their machines.
+    for (label, domains) in [
+        (
+            "propose.proxy.allow_private_domains",
+            &config.propose.proxy.allow_private_domains,
+        ),
+        ("propose.allow.domains", &config.propose.allow.domains),
+    ] {
+        for domain in domains {
+            if domain.is_empty() || domain.trim().is_empty() {
+                return Err(format!("{label} contains empty domain name"));
+            }
+            if domain.contains(char::is_whitespace) {
+                return Err(format!("{label} entry {domain:?} contains whitespace"));
+            }
+            if let Some(bare) = domain.strip_prefix("*.") {
+                return Err(format!(
+                    "{label} entry {domain:?} matches no host. Matching is exact host plus \
+                     subdomains, so {bare:?} already covers it and everything under it"
+                ));
+            }
+            if domain.contains('*') {
+                return Err(format!(
+                    "{label} entry {domain:?} contains a wildcard, which matches no host. \
+                     Name the domain itself and every subdomain is covered"
+                ));
+            }
         }
     }
 
@@ -628,6 +649,26 @@ allow_network = true
 ";
         let err = parse_repo_config(toml).unwrap_err();
         assert!(err.contains("unknown field"), "got: {err}");
+    }
+
+    /// A repository proposing `*.example.com` would be approved by every
+    /// developer and reach nothing on any of their machines. `config set`
+    /// refuses a wildcard while the user is typing; a `.cplt.toml` is written
+    /// in an editor, so validation is the equivalent moment.
+    #[test]
+    fn validate_rejects_a_wildcard_in_either_domain_list() {
+        for toml in [
+            "[propose.allow]\ndomains = [\"*.example.com\"]\n",
+            "[propose.proxy]\nallow_private_domains = [\"*.intern.nav.no\"]\n",
+        ] {
+            let err = parse_and_validate(toml).unwrap_err();
+            assert!(
+                err.contains("matches no host"),
+                "must name the problem, got: {err}"
+            );
+        }
+        // The bare form is what works, and must still pass.
+        assert!(parse_and_validate("[propose.allow]\ndomains = [\"example.com\"]\n").is_ok());
     }
 
     #[test]
