@@ -2251,7 +2251,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                 }
                 warn_unknown_repo_config_keys(
                     &loaded.config,
-                    &format!("{}/.cplt.toml", root.dir.display()),
+                    &root.dir.join(".cplt.toml").display().to_string(),
                 );
                 resolved.apply_repo_deny(&loaded.config, &loaded.dir);
             }
