@@ -203,8 +203,27 @@ fn is_toplevel(dir: &Path) -> bool {
 }
 
 /// Verify one directory really is `identity`, and return it if so.
-fn verify(real_git: &Path, dir: &Path, identity: &str, how: Found) -> Option<Candidate> {
+///
+/// The containment check is here, **after** `canonicalize`, and not at the
+/// caller. Checked on the path as written, a sibling symlink
+/// `../sykepenger-model -> <project>/planted` passes it, resolves into the
+/// project tree, verifies against a planted origin, and wins the strongest
+/// rank — so cplt would report "origin verified" for a directory the agent
+/// authored while the user believes the real repository is in scope. Found by
+/// review of #495 and reproduced.
+fn verify(
+    real_git: &Path,
+    dir: &Path,
+    project_dir: &Path,
+    identity: &str,
+    how: Found,
+) -> Option<Candidate> {
     let dir = std::fs::canonicalize(dir).ok()?;
+    let project_dir =
+        std::fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
+    if dir.starts_with(&project_dir) {
+        return None;
+    }
     if !is_toplevel(&dir) {
         return None;
     }
@@ -289,13 +308,7 @@ pub fn resolve(project_dir: &Path, home: &Path, identity: &str) -> Result<Candid
     let mut found: Vec<Candidate> = Vec::new();
 
     for (dir, how) in by_name {
-        // A candidate inside the launch repository is refused, not verified: that
-        // tree is agent-writable, so a checkout planted there last session would
-        // be a repository of the agent's choosing wearing the right name.
-        if dir.starts_with(project_dir) {
-            continue;
-        }
-        if let Some(c) = verify(real_git, &dir, identity, how) {
+        if let Some(c) = verify(real_git, &dir, project_dir, identity, how) {
             found.push(c);
         }
     }
@@ -306,11 +319,8 @@ pub fn resolve(project_dir: &Path, home: &Path, identity: &str) -> Result<Candid
     // over the wrong tree. This costs one `git config` per sibling directory,
     // capped, on a command a person runs by hand.
     for dir in origin_scan_dirs(project_dir, home) {
-        if dir.starts_with(project_dir) {
-            continue;
-        }
         scanned += 1;
-        if let Some(c) = verify(real_git, &dir, identity, Found::RenamedClone) {
+        if let Some(c) = verify(real_git, &dir, project_dir, identity, Found::RenamedClone) {
             found.push(c);
         }
     }
@@ -332,9 +342,15 @@ pub fn resolve(project_dir: &Path, home: &Path, identity: &str) -> Result<Candid
     //
     // The weaker matches are printed rather than dropped, because the ranking is
     // a heuristic and the operator is the one who knows.
-    let best = found.iter().map(|c| c.how.rank()).min().unwrap_or(0);
+    // A directory whose `.git` is elsewhere is a linked worktree — or a decoy
+    // holding nothing but a `gitdir:` pointer at the real repository, which
+    // reads as one. Either way the main checkout is the better answer, so it
+    // outranks them before the name-vs-origin ranking is consulted.
+    let is_main = |c: &Candidate| common_dir(&c.dir).is_some_and(|g| g == c.dir.join(".git"));
+    let rank = |c: &Candidate| (u8::from(!is_main(c)), c.how.rank());
+    let best = found.iter().map(&rank).min().unwrap_or((0, 0));
     let (mut top, rest): (Vec<Candidate>, Vec<Candidate>) =
-        found.into_iter().partition(|c| c.how.rank() == best);
+        found.into_iter().partition(|c| rank(c) == best);
 
     if top.len() > 1 {
         top.extend(rest);
@@ -359,7 +375,7 @@ pub fn resolve(project_dir: &Path, home: &Path, identity: &str) -> Result<Candid
 ///
 /// # Errors
 /// If no trusted git is available, or the directory is not that repository.
-pub fn verify_named(dir: &Path, identity: &str) -> Result<Candidate, String> {
+pub fn verify_named(dir: &Path, project_dir: &Path, identity: &str) -> Result<Candidate, String> {
     if !is_valid_identity(identity) {
         return Err(ResolveError::BadIdentity(identity.to_string()).to_string());
     }
@@ -367,6 +383,18 @@ pub fn verify_named(dir: &Path, identity: &str) -> Result<Candidate, String> {
         crate::git::trusted_git().ok_or_else(|| ResolveError::NoTrustedGit.to_string())?;
     let canonical =
         std::fs::canonicalize(dir).map_err(|e| format!("Cannot resolve {}: {e}", dir.display()))?;
+    // Same rule as the search, for the same reason: a tree inside the launch
+    // repository is agent-writable, so linking it grants nothing new and
+    // vouches for an identity a previous session could have written.
+    let project = std::fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
+    if canonical.starts_with(&project) {
+        return Err(format!(
+            "{} is inside the launch repository, which is already in scope — and is \
+             writable from the sandbox, so a checkout there may be one a previous \
+             session created.",
+            canonical.display()
+        ));
+    }
     if !is_toplevel(&canonical) {
         return Err(format!(
             "{} is not the toplevel of a git repository.",
@@ -390,6 +418,63 @@ pub fn verify_named(dir: &Path, identity: &str) -> Result<Candidate, String> {
              A fork, a repository with no `origin`, or a non-GitHub remote all look like this.",
             canonical.display()
         )),
+    }
+}
+
+/// What `--unlink` should do with the recorded roots.
+#[derive(Debug, PartialEq)]
+pub enum Unlink {
+    /// Remove exactly this entry, as it is written in the config.
+    Remove(String),
+    /// Nothing recorded here is that repository.
+    NoMatch,
+    /// Several are. Removing "the" one would be a guess about which.
+    Several(Vec<String>),
+}
+
+/// Choose which recorded `sandbox.repo_dirs` entry `--unlink` removes.
+///
+/// `identity_of` reads a directory's origin; it is a parameter so this is
+/// testable without a git tree, and so the caller supplies the trusted binary.
+///
+/// Falls back to the directory's own name when no origin matches. Origin alone
+/// cannot remove the entries that most need removing: a directory that has been
+/// deleted or moved has no identity to read, and on Linux an agent can rewrite
+/// `.git/config` in a tree it was granted — so the strict form would answer "no
+/// repository linked here is navikt/foo" while the write+exec grant on that
+/// tree quietly stays. The name is weaker evidence, but this only ever removes
+/// a grant, and the entry it removes is printed.
+pub fn choose_unlink(
+    entries: &[String],
+    identity: &str,
+    identity_of: impl Fn(&Path) -> Option<String>,
+) -> Unlink {
+    let by_origin: Vec<&String> = entries
+        .iter()
+        .filter(|entry| {
+            identity_of(&crate::config::expand_tilde(entry))
+                .is_some_and(|found| crate::gh_proxy::repos_match(&found, identity))
+        })
+        .collect();
+
+    let chosen = if by_origin.is_empty() {
+        let name = identity.split('/').next_back().unwrap_or(identity);
+        entries
+            .iter()
+            .filter(|entry| {
+                Path::new(entry.as_str())
+                    .file_name()
+                    .is_some_and(|leaf| leaf.eq_ignore_ascii_case(name))
+            })
+            .collect()
+    } else {
+        by_origin
+    };
+
+    match chosen.as_slice() {
+        [] => Unlink::NoMatch,
+        [one] => Unlink::Remove((*one).clone()),
+        many => Unlink::Several(many.iter().map(|s| (*s).clone()).collect()),
     }
 }
 
@@ -439,6 +524,61 @@ mod tests {
             .expect("git runs")
             .success();
         assert!(ok, "git {args:?} failed");
+    }
+
+    /// `--unlink` by name has to work in the cases that matter most: a
+    /// directory that no longer exists has no origin to read, and on Linux an
+    /// agent can rewrite `.git/config` in a tree it was granted. Matching on
+    /// origin alone would answer "nothing linked here is navikt/foo" while the
+    /// write+exec grant stayed.
+    #[test]
+    fn unlink_falls_back_to_the_directory_name_when_no_origin_answers() {
+        let entries = vec![
+            "/src/sykepenger-model".to_string(),
+            "/src/spleis-testdata".to_string(),
+        ];
+        let none = |_: &Path| None;
+
+        assert_eq!(
+            choose_unlink(&entries, "navikt/sykepenger-model", none),
+            Unlink::Remove("/src/sykepenger-model".to_string())
+        );
+        assert_eq!(
+            choose_unlink(&entries, "navikt/not-linked", none),
+            Unlink::NoMatch
+        );
+    }
+
+    /// The origin is the stronger evidence and wins when it is readable — a
+    /// clone in a renamed directory is removed by the repository's name.
+    #[test]
+    fn unlink_prefers_the_origin_over_the_directory_name() {
+        let entries = vec![
+            "/src/model-wip".to_string(),
+            "/src/sykepenger-model".to_string(),
+        ];
+        let origins = |dir: &Path| {
+            (dir == Path::new("/src/model-wip")).then(|| "navikt/sykepenger-model".to_string())
+        };
+
+        assert_eq!(
+            choose_unlink(&entries, "navikt/sykepenger-model", origins),
+            Unlink::Remove("/src/model-wip".to_string()),
+            "the directory that IS the repository, not the one merely named after it"
+        );
+    }
+
+    /// Two checkouts of one repository, both linked. Removing "the" one is a
+    /// guess about which, and the answer is the operator's.
+    #[test]
+    fn unlink_refuses_when_several_answer_to_the_name() {
+        let entries = vec!["/src/model-a".to_string(), "/src/model-b".to_string()];
+        let both = |_: &Path| Some("navikt/sykepenger-model".to_string());
+
+        match choose_unlink(&entries, "navikt/sykepenger-model", both) {
+            Unlink::Several(many) => assert_eq!(many.len(), 2, "{many:?}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
     }
 
     /// The identity reaches path construction, and in #491 it is text a
@@ -613,16 +753,48 @@ mod tests {
 
     /// The launch repository is agent-writable, so a checkout planted inside it
     /// is a repository of the agent's choosing wearing the right name.
+    ///
+    /// Written as a **symlinked sibling**, because that is the only way a
+    /// candidate path lands inside the project: the search builds
+    /// `<parent>/<name>`, never a path under the project, so a plainly-nested
+    /// decoy is never even generated and a test using one passes with the
+    /// containment check deleted. That is what the first version of this test
+    /// did (#495 review), and why the check now runs after `canonicalize`.
     #[test]
-    fn a_candidate_inside_the_launch_repository_is_never_taken() {
+    fn a_symlinked_sibling_resolving_into_the_project_is_refused() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path().canonicalize().expect("canonical");
         let project = root.join("spleis");
         make_repo(&project, "navikt/spleis");
-        make_repo(&project.join("sykepenger-model"), "navikt/sykepenger-model");
+        let planted = project.join("planted");
+        make_repo(&planted, "navikt/sykepenger-model");
+        std::os::unix::fs::symlink(&planted, root.join("sykepenger-model")).expect("symlink");
 
-        let err = resolve(&project, &root, "navikt/sykepenger-model").expect_err("must refuse");
-        assert!(matches!(err, ResolveError::NotFound { .. }), "{err}");
+        let err = resolve(&project, &root.join("home"), "navikt/sykepenger-model")
+            .expect_err("must refuse");
+        assert!(
+            matches!(err, ResolveError::NotFound { .. }),
+            "a tree the agent could have written must not be linked as a repository: {err}"
+        );
+    }
+
+    /// The same rule for a directory the user names by hand — otherwise the
+    /// search refuses what the explicit form accepts.
+    #[test]
+    fn a_named_directory_inside_the_project_is_refused_too() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonical");
+        let project = root.join("spleis");
+        make_repo(&project, "navikt/spleis");
+        let planted = project.join("vendor").join("model");
+        make_repo(&planted, "navikt/sykepenger-model");
+
+        let err =
+            verify_named(&planted, &project, "navikt/sykepenger-model").expect_err("must refuse");
+        assert!(
+            err.contains("inside the launch repository"),
+            "and say why: {err}"
+        );
     }
 
     /// A directory the user named is still checked: "I meant this one" and
@@ -634,11 +806,13 @@ mod tests {
         let other = root.join("something-else");
         make_repo(&other, "someone-else/thing");
 
-        let err = verify_named(&other, "navikt/sykepenger-model").expect_err("must refuse");
+        let err = verify_named(&other, &root.join("spleis"), "navikt/sykepenger-model")
+            .expect_err("must refuse");
         assert!(
             err.contains("someone-else/thing"),
             "the error must name what it actually is: {err}"
         );
-        verify_named(&other, "someone-else/thing").expect("its own identity verifies");
+        verify_named(&other, &root.join("spleis"), "someone-else/thing")
+            .expect("its own identity verifies");
     }
 }

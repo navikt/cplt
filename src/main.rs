@@ -7197,7 +7197,7 @@ fn run_link_command(repo: &str, dir: Option<&Path>, unlink: bool) -> ExitCode {
     }
 
     let found = match dir {
-        Some(named) => match cplt::link::verify_named(named, repo) {
+        Some(named) => match cplt::link::verify_named(named, &project_dir, repo) {
             Ok(c) => c,
             Err(e) => {
                 ui::error(&e);
@@ -7260,60 +7260,51 @@ fn run_link_command(repo: &str, dir: Option<&Path>, unlink: bool) -> ExitCode {
     )
 }
 
-/// Remove the named root whose origin is `identity`.
+/// Remove the named root that is `identity`.
 fn unlink_by_identity(project_dir: &Path, identity: &str) -> ExitCode {
-    let Some(real_git) = cplt::git::trusted_git() else {
-        ui::error(
-            "No trusted git binary in the parent environment, so no repository's identity \
-             can be read. Remove it by path:\n  \
-             cplt config set --local sandbox.repo_dirs <DIR> --unset",
-        );
-        return ExitCode::FAILURE;
-    };
     let linked: Vec<String> = config::load_local(project_dir)
         .ok()
         .flatten()
         .map(|l| l.config.sandbox.repo_dirs.clone())
         .unwrap_or_default();
 
-    let matching: Vec<&String> = linked
-        .iter()
-        .filter(|entry| {
-            let dir = config::expand_tilde(entry);
-            cplt::gh_proxy::detect_current_repo(real_git, &dir)
-                .is_ok_and(|found| cplt::gh_proxy::repos_match(&found, identity))
-        })
-        .collect();
+    if linked.is_empty() {
+        ui::error("No repositories are linked for this checkout.");
+        return ExitCode::FAILURE;
+    }
 
-    match matching.as_slice() {
-        [] => {
-            ui::error(&format!(
-                "No repository linked here is {identity}.\n  \
-                 What is linked: cplt config get sandbox.repo_dirs"
-            ));
-            ExitCode::FAILURE
-        }
-        [entry] => run_config_set(
+    let read_identity = |dir: &Path| {
+        cplt::git::trusted_git().and_then(|git| cplt::gh_proxy::detect_current_repo(git, dir).ok())
+    };
+
+    match cplt::link::choose_unlink(&linked, identity, read_identity) {
+        cplt::link::Unlink::Remove(entry) => run_config_set(
             "sandbox.repo_dirs",
-            Some(entry),
+            Some(&entry),
             false,
             true,
             false,
             false,
             true,
         ),
-        // Two checkouts of one repository, both linked. Removing "the" one would
-        // be a guess about which.
-        many => {
+        cplt::link::Unlink::NoMatch => {
+            // The recorded list, not a pointer at another command: the user is
+            // here because they do not know what is linked.
             ui::error(&format!(
-                "{} checkouts of {identity} are linked here, so cplt is not picking one:\n  {}\n  \
+                "Nothing linked here is {identity}. Linked:\n  {}\n  \
+                 Remove one by path:\n    \
+                 cplt config set --local sandbox.repo_dirs <DIR> --unset",
+                linked.join("\n  ")
+            ));
+            ExitCode::FAILURE
+        }
+        cplt::link::Unlink::Several(many) => {
+            ui::error(&format!(
+                "More than one linked repository answers to {identity}, so cplt is not \
+                 picking one:\n  {}\n  \
                  Remove the one you mean:\n    \
                  cplt config set --local sandbox.repo_dirs <DIR> --unset",
-                many.len(),
-                many.iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n  ")
+                many.join("\n  ")
             ));
             ExitCode::FAILURE
         }

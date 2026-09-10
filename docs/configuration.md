@@ -231,9 +231,13 @@ Where it looks, in order: beside the launch repository; then across the forge
 directory, so `nais/unleash` is findable from `navikt/cplt` in a
 `<host>/<org>/<repo>` layout; then the origin of each directory beside the
 launch repository, capped, which finds a clone in a differently-named
-directory. A directory inside the launch repository is never a candidate — that
-tree is agent-writable, so a checkout planted there would be a repository of
-the agent's choosing wearing the right name.
+directory. A directory that resolves inside the launch repository is never a
+candidate — that tree is agent-writable, so a checkout planted there would be a
+repository of the agent's choosing wearing the right name. That check runs on
+the resolved path, so a symlinked sibling pointing back into the project does
+not get around it. Note the sibling directory itself is only as trustworthy as
+your machine: one `--project-dir <parent>` launch makes every directory beside
+the repository writable from the sandbox.
 
 Every candidate has its `origin` read by the trusted git **outside** the
 sandbox and must match the name you asked for. A directory called
@@ -251,7 +255,13 @@ instead. Linked worktrees of the chosen checkout are counted, not listed — the
 share one `.git`, so they all report the same origin.
 
 `cplt link <owner>/<name> --unlink` removes it again, so a root can be dropped
-by the name it was added under.
+by the name it was added under. It matches on the recorded directory's origin
+where it can read one, and falls back to the directory's own name where it
+cannot — a deleted directory has no identity to read, and neither does one whose
+`.git/config` was rewritten since. Without that fallback the entries most worth
+removing would be the ones the command refused to find. If more than one entry
+answers, it names them and removes none; `cplt config set --local
+sandbox.repo_dirs <DIR> --unset` is always available.
 
 What this writes is an ordinary `sandbox.repo_dirs` entry, so everything below
 applies to it unchanged. What it adds is the identity check. And note the
