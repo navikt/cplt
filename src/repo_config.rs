@@ -735,7 +735,11 @@ pub fn proposed_keys(propose: &ProposeSection) -> Vec<&'static str> {
 }
 
 /// Format the proposed values for a key for display.
-pub fn propose_key_detail(propose: &ProposeSection, key: &str) -> Option<String> {
+pub fn propose_key_detail(
+    propose: &ProposeSection,
+    key: &str,
+    limit: Option<usize>,
+) -> Option<String> {
     match key {
         "allow.read" if !propose.allow.read.is_empty() => Some(format!("{:?}", propose.allow.read)),
         "allow.write" if !propose.allow.write.is_empty() => {
@@ -759,19 +763,21 @@ pub fn propose_key_detail(propose: &ProposeSection, key: &str) -> Option<String>
         // entries themselves cannot carry escapes: `validate_repo_config`
         // refuses anything that is not `<owner>/<name>`.
         "repos" if !propose.repos.is_empty() => {
-            const SHOWN: usize = 5;
-            let shown = propose
+            // `limit` is None where consent is being asked for: a prompt that
+            // elides part of what it is approving is not consent (#496 review).
+            let shown = limit.unwrap_or(propose.repos.len()).max(1);
+            let listed = propose
                 .repos
                 .iter()
-                .take(SHOWN)
+                .take(shown)
                 .cloned()
                 .collect::<Vec<_>>();
-            let rest = propose.repos.len().saturating_sub(shown.len());
-            let listed = shown.join(", ");
+            let rest = propose.repos.len().saturating_sub(listed.len());
+            let listed = listed.join(", ");
             Some(if rest == 0 {
                 format!("{listed} (each resolved and origin-verified on this machine)")
             } else {
-                format!("{listed}, and {rest} more — see `cplt trust`")
+                format!("{listed}, and {rest} more — run `cplt trust` for the full list")
             })
         }
         _ => None,
@@ -1020,7 +1026,7 @@ preset = \"full-trust\"\n",
         .expect("parses");
         validate_repo_config(&cfg).expect("identities are valid");
 
-        let detail = propose_key_detail(&cfg.propose, "repos").expect("has a detail");
+        let detail = propose_key_detail(&cfg.propose, "repos", Some(5)).expect("has a detail");
         assert!(
             detail.len() < 200,
             "one line, not a wall: {} chars",
@@ -1030,6 +1036,27 @@ preset = \"full-trust\"\n",
             detail.contains("and 195 more"),
             "and it says how many: {detail}"
         );
+    }
+
+    /// The consent prompt must show everything it asks for. Truncating there
+    /// would ask the operator to approve two hundred trees while showing five.
+    #[test]
+    fn without_a_limit_every_proposed_repository_is_named() {
+        let many: Vec<String> = (0..40).map(|i| format!("navikt/repo-{i}")).collect();
+        let cfg = parse_repo_config(&format!(
+            "[propose]\nrepos = [{}]\n",
+            many.iter()
+                .map(|r| format!("{r:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+        .expect("parses");
+
+        let detail = propose_key_detail(&cfg.propose, "repos", None).expect("has a detail");
+        for repo in &many {
+            assert!(detail.contains(repo.as_str()), "{repo} must be shown");
+        }
+        assert!(!detail.contains("more"), "and nothing elided: {detail}");
     }
 
     /// It is a grant — it puts another repository in read/write/exec scope — so

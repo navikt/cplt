@@ -351,6 +351,7 @@ pub fn proposal_content_hash(propose: &crate::repo_config::ProposeSection) -> St
     // here simply hashes in its written order — stricter, never looser.
     let mut normalized = propose.clone();
     normalized.pass_env.sort_unstable();
+    normalized.repos.sort_unstable();
     normalized.allow.read.sort_unstable();
     normalized.allow.write.sort_unstable();
     normalized.allow.socket.sort_unstable();

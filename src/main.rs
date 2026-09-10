@@ -2440,7 +2440,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             unapproved_proposals.len()
         ));
         for key in &unapproved_proposals {
-            match repo_config::propose_key_detail(&repo_propose, key) {
+            match repo_config::propose_key_detail(&repo_propose, key, Some(5)) {
                 Some(detail) => eprintln!(
                     "  {}○{} {key}: {detail}",
                     ui::color(ui::YELLOW),
@@ -7486,6 +7486,19 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
         && !entry.accepted.approved_at.is_empty()
     {
         println!();
+        // The roots this approval created, which no other command showed. They
+        // are read/write/execute grants over whole other repositories, and the
+        // record is what `trust revoke repos` acts on — so it has to be
+        // inspectable (#496 review).
+        if !entry.accepted.linked.is_empty() {
+            println!(
+                "{blue}[cplt]{nc}  {green}Linked by this approval{nc} (read+write+exec, removed by `cplt trust revoke repos`):"
+            );
+            for repo in &entry.accepted.linked {
+                println!("{blue}[cplt]{nc}    {} → {}", repo.identity, repo.path);
+            }
+            println!();
+        }
         println!(
             "{blue}[cplt]{nc}  Last approved: {}",
             entry.accepted.approved_at
@@ -7570,7 +7583,12 @@ fn link_proposed_repos(project_dir: &Path, repos: &[String]) -> Vec<trust::Linke
                     .flatten()
                     .is_some_and(|l| l.config.sandbox.repo_dirs.contains(&path));
                 if already {
-                    println!("  • {identity} → {path} (already linked)");
+                    // Recorded by nobody: the root was already there, so the
+                    // approval did not create it and revoking must not remove
+                    // it. Claiming it would make `trust revoke repos` delete a
+                    // root the user linked by hand (#496 review).
+                    println!("  • {identity} → {path} (already linked; left as yours)");
+                    continue;
                 } else if run_config_set(
                     "sandbox.repo_dirs",
                     Some(&path),
@@ -7603,6 +7621,25 @@ fn link_proposed_repos(project_dir: &Path, repos: &[String]) -> Vec<trust::Linke
     linked
 }
 
+/// Union two sets of approval-created roots, keyed by path.
+///
+/// Records outlive the proposal that created them on purpose. A repository that
+/// drops an identity from `[propose] repos`, or an identity that stops
+/// resolving, must not take the record with it — the root is still in the
+/// config, and the record is the only thing that lets `revoke` remove it.
+fn merge_linked(
+    prior: Vec<trust::LinkedRepo>,
+    fresh: Vec<trust::LinkedRepo>,
+) -> Vec<trust::LinkedRepo> {
+    let mut out = prior;
+    for repo in fresh {
+        if !out.iter().any(|existing| existing.path == repo.path) {
+            out.push(repo);
+        }
+    }
+    out
+}
+
 /// Remove the named roots an approval created, and only those.
 ///
 /// A root the user added by hand — with `cplt link` or `config set --local` —
@@ -7617,9 +7654,26 @@ fn unlink_approved_repos(project_dir: &Path, linked: &[trust::LinkedRepo]) {
         .unwrap_or_default();
 
     for repo in linked {
-        if !recorded.contains(&repo.path) {
-            continue; // Already gone; nothing to say.
-        }
+        // Compared expanded, not as written: the local layer stores `~/…`
+        // verbatim while an approval records the canonical path, so a raw
+        // string compare would silently skip a root that is right there and
+        // report success (#496 review).
+        let wanted = config::expand_tilde(&repo.path);
+        let Some(entry) = recorded.iter().find(|e| config::expand_tilde(e) == wanted) else {
+            // Not "already gone" — revoke cannot tell removed from renamed, and
+            // asserting the safe reading is how a live grant gets reported as
+            // withdrawn.
+            ui::warn(&format!(
+                "{} is recorded as linked for {} but is not in this checkout's config. \
+                 If it is still in scope, remove it by path.",
+                repo.path, repo.identity
+            ));
+            continue;
+        };
+        let repo = trust::LinkedRepo {
+            identity: repo.identity.clone(),
+            path: entry.clone(),
+        };
         println!("  • unlinking {} ({})", repo.identity, repo.path);
         run_config_set(
             "sandbox.repo_dirs",
@@ -7715,6 +7769,16 @@ fn trust_accept(
     let hash_mismatch = stored
         .as_ref()
         .is_some_and(|t| trust::approval_is_stale(&t.accepted.content_hash, &current_hash));
+    // Kept regardless of hash staleness, unlike the approved keys: a stale hash
+    // means "re-review the values", not "those roots stopped existing". Bound
+    // to the checkout the same way approvals are, so a foreign entry's roots are
+    // never adopted.
+    let prior_linked = stored
+        .as_ref()
+        .filter(|t| trust::approved_path_matches(t, project_dir))
+        .map(|t| t.accepted.linked.clone())
+        .unwrap_or_default();
+
     let carried = stored.filter(|t| {
         trust::approved_path_matches(t, project_dir)
             && !trust::approval_is_stale(&t.accepted.content_hash, &current_hash)
@@ -7765,14 +7829,36 @@ no longer apply"
             // A user who approved before the repositories were on disk — or who
             // deleted a root by hand — must be able to run this again and get
             // them linked. Idempotent: an entry already recorded says so.
+            // Only identities this approval never linked. "Approved before the
+            // repository was cloned" is a real case; "the user removed this root
+            // on purpose with `cplt link --unlink`" is a different one, and a
+            // record is what tells them apart. Without this, a bare
+            // `cplt trust accept` silently undoes a deliberate removal — in
+            // scripts too, since this runs before the terminal check.
+            let unlinked_yet: Vec<String> = loaded
+                .config
+                .propose
+                .repos
+                .iter()
+                .filter(|identity| {
+                    !carried.as_ref().is_some_and(|t| {
+                        t.accepted
+                            .linked
+                            .iter()
+                            .any(|l| l.identity.as_str() == identity.as_str())
+                    })
+                })
+                .cloned()
+                .collect();
+
             if carried
                 .as_ref()
                 .is_some_and(|t| trust::is_key_approved(t, "repos"))
-                && !loaded.config.propose.repos.is_empty()
+                && !unlinked_yet.is_empty()
             {
-                let linked = link_proposed_repos(project_dir, &loaded.config.propose.repos);
+                let fresh = link_proposed_repos(project_dir, &unlinked_yet);
                 let mut entry = carried.unwrap_or_default();
-                entry.accepted.linked = linked;
+                entry.accepted.linked = merge_linked(entry.accepted.linked.clone(), fresh);
                 if let Err(e) = trust::save_trust(project_dir, &entry) {
                     ui::error(&format!("Failed to save trust: {e}"));
                     return ExitCode::FAILURE;
@@ -7793,7 +7879,7 @@ no longer apply"
         );
         println!();
         for &key in &pending {
-            let detail = repo_config::propose_key_detail(&loaded.config.propose, key);
+            let detail = repo_config::propose_key_detail(&loaded.config.propose, key, None);
             if let Some(d) = detail {
                 println!("  {yellow}•{nc} {key}: {d}");
             } else {
@@ -7870,8 +7956,18 @@ no longer apply"
     // `repos` is not a value the launch applies — approving it performs the
     // linking, here. Done before the entry is saved, so a failure to resolve
     // leaves no approval claiming repositories are linked.
+    //
+    // MERGED into what is already recorded, never replacing it. A record is the
+    // only way `revoke` can find a root an approval created, so dropping one
+    // while the root stands strands a read/write/execute grant that no command
+    // can then withdraw (#496 review). Three ordinary events cause it: the
+    // proposal shrinks, an identity stops resolving, or the hash goes stale and
+    // the user approves some other key.
     if keys_to_accept.iter().any(|k| k == "repos") {
-        entry.accepted.linked = link_proposed_repos(project_dir, &loaded.config.propose.repos);
+        let fresh = link_proposed_repos(project_dir, &loaded.config.propose.repos);
+        entry.accepted.linked = merge_linked(prior_linked, fresh);
+    } else {
+        entry.accepted.linked = prior_linked;
     }
 
     // Save
@@ -7958,13 +8054,16 @@ fn trust_revoke(
     entry.accepted.keys.retain(|k| !keys.contains(k));
     let removed = before_len - entry.accepted.keys.len();
 
-    if keys.iter().any(|k| k == "repos") {
-        unlink_approved_repos(project_dir, &std::mem::take(&mut entry.accepted.linked));
-    }
-
     if removed == 0 {
         ui::info("No matching keys found to revoke.");
         return ExitCode::SUCCESS;
+    }
+
+    // After the early return, never before it: unlinking and then returning
+    // without saving leaves the roots gone from the config and still recorded
+    // as linked, so the next `trust accept` puts them back (#496 review).
+    if keys.iter().any(|k| k == "repos") {
+        unlink_approved_repos(project_dir, &std::mem::take(&mut entry.accepted.linked));
     }
 
     if entry.accepted.keys.is_empty() {
@@ -8261,6 +8360,40 @@ fn start_denial_stream() -> Option<std::process::Child> {
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod tests {
+    /// The record of what an approval linked is the only way `trust revoke
+    /// repos` can find those roots again — the launch reads `sandbox.repo_dirs`
+    /// and never consults the trust store. Three ordinary events used to drop a
+    /// record while its root stood: the proposal shrinks, an identity stops
+    /// resolving, and a stale hash plus approving some other key (#496 review).
+    ///
+    /// This pins the merge that fixes all three. It does not cover the callers'
+    /// staleness handling, which the e2e does.
+    #[test]
+    fn a_record_of_a_linked_root_is_never_dropped_while_the_root_stands() {
+        let linked = |identity: &str, path: &str| super::trust::LinkedRepo {
+            identity: identity.to_string(),
+            path: path.to_string(),
+        };
+
+        let prior = vec![linked("navikt/a", "/src/a"), linked("navikt/b", "/src/b")];
+        // The proposal now names only `a`, so a fresh resolve produces one entry.
+        let fresh = vec![linked("navikt/a", "/src/a")];
+
+        let merged = super::merge_linked(prior, fresh);
+        assert_eq!(merged.len(), 2, "b's root is still linked: {merged:?}");
+        assert!(
+            merged.iter().any(|r| r.path == "/src/b"),
+            "and must stay revocable: {merged:?}"
+        );
+
+        // The same path from two identities is one root, not two records.
+        let merged = super::merge_linked(
+            vec![linked("navikt/a", "/src/a")],
+            vec![linked("navikt/renamed", "/src/a")],
+        );
+        assert_eq!(merged.len(), 1, "one root, one record: {merged:?}");
+    }
+
     /// The hand-written matcher must cover every pattern the profile denies.
     /// It cannot be derived from them — they are SBPL regex source and there is
     /// no regex engine linked — so this is the thing that stops the two

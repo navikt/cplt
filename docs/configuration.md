@@ -230,7 +230,10 @@ machine decides where those repositories live. A committed `.cplt.toml` cannot
 point cplt at a directory of its choosing — the most it can do is put a name in
 front of you.
 
-Approving is what turns names into paths, and it is a separate, explicit step:
+**What approving grants is not small.** Each linked repository becomes a named
+root: read, write **and execute** on that whole tree, the same posture as the
+project directory. A repository proposing five repositories is asking for five
+of those. Approving is therefore a separate, explicit step:
 
 ```
 $ cplt trust accept repos
@@ -245,9 +248,14 @@ repository named by a config file is a much larger decision than linking one
 you already have. Approving again re-links anything missing, so a repository
 you clone later needs no re-approval dance.
 
-`cplt trust revoke repos` removes the roots that approval created — and only
-those. A root you added yourself with `cplt link` or `config set --local` stays,
-because it is yours.
+`cplt trust revoke repos` removes the roots recorded at approval time, matched
+by path — and only those. A root you added yourself with `cplt link` or
+`config set --local` stays, because it is yours: if a proposal names a
+repository you had already linked, approving says so and leaves it alone rather
+than taking ownership of it. `cplt trust` lists what an approval linked, which
+is what revoke acts on; a recorded root that is no longer in your config is
+reported rather than assumed gone, because revoke cannot tell removed from
+renamed.
 
 Three properties worth knowing:
 
@@ -265,6 +273,21 @@ The approval binds to the path it resolved, which is then re-validated on every
 launch like any other named root. cplt does not re-resolve the identity each
 time: a later directory rename would otherwise redirect a grant you approved
 for a specific tree.
+
+**"Origin verified" describes the moment you approved.** On Linux an agent can
+rewrite `.git/config` in any tree it was already granted, and Landlock cannot
+carve that file out of a writable root — so a tree a previous session could
+write can claim to be the repository a proposal names. If the real checkout is
+absent, that claim is what gets linked, and the verification line will say so.
+It grants nothing the previous session did not already have, but it can make
+you believe the real repository is in scope when it is not. This matters more
+here than for `cplt link`, because what is being verified was chosen by a
+committed file rather than typed by you.
+
+Limits worth knowing: a second checkout of the same repository cannot approve
+`repos` at all, because trust is stored per origin; a fork reads as "not found",
+since its `origin` is the fork; a repository with no `origin`, or with only
+`upstream`, is invisible; and a monorepo can only be named whole.
 
 ### Naming a repository instead of a path
 

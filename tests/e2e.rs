@@ -3971,6 +3971,70 @@ paths = [
         let _ = std::fs::remove_dir_all(&mine);
     }
 
+    /// The user linked it first; the project happens to propose the same
+    /// repository. Approving must not take ownership of a root the user
+    /// created, because revoking would then delete it (#496 review).
+    #[test]
+    fn e2e_approving_does_not_claim_a_root_the_user_linked_first() {
+        let (repo, config_file) = make_trust_repo(
+            "propose-repos-claim",
+            "[propose]\nrepos = [\"navikt/e2e-claim\"]\n",
+        );
+        let _ = std::fs::remove_dir_all(config_file.parent().expect("cfg dir").join("trust"));
+        let parent = repo.parent().expect("parent").to_path_buf();
+        let model = parent.join("e2e-claim");
+        let _ = std::fs::remove_dir_all(&model);
+        std::fs::create_dir_all(&model).expect("mkdir");
+        for args in [
+            vec!["init", "--quiet"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:navikt/e2e-claim.git",
+            ],
+        ] {
+            let out = git_cmd(&model).args(&args).output().expect("git runs");
+            assert!(out.status.success(), "git {args:?} failed");
+        }
+
+        // The user's own link, before any approval.
+        let out = trust_cmd(&repo, &config_file)
+            .args(["link", "navikt/e2e-claim"])
+            .output()
+            .expect("link runs");
+        assert!(
+            out.status.success(),
+            "hand link failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let out = trust_cmd(&repo, &config_file)
+            .args(["trust", "accept", "repos"])
+            .output()
+            .expect("accept runs");
+        assert!(out.status.success(), "accept failed");
+
+        let out = trust_cmd(&repo, &config_file)
+            .args(["trust", "revoke", "repos"])
+            .output()
+            .expect("revoke runs");
+        assert!(out.status.success(), "revoke failed");
+
+        let out = trust_cmd(&repo, &config_file)
+            .args(["config", "get", "sandbox.repo_dirs"])
+            .output()
+            .expect("get runs");
+        let roots = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            roots.contains("e2e-claim"),
+            "the user's root must survive revoking a proposal that merely named it: {roots}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&model);
+    }
+
     /// `--accept-repo-config` approves for one run and persists nothing.
     /// Linking a repository is persistent, so it is the one proposal the flag
     /// cannot approve.
@@ -4031,10 +4095,13 @@ paths = [
         // test passes even with the filter removed, because approving `repos`
         // for one run does nothing observable — the linking only ever happens
         // in `trust accept`. What the filter buys is that the user is told.
+        // Asserted on the identity, not the word "repos": "repositories"
+        // contains it, and a `Named repositories` header exists elsewhere, so
+        // the loose form could pass for the wrong reason (#496 review).
         let stderr = String::from_utf8_lossy(&out2_stderr);
         assert!(
-            stderr.contains("unapproved permission") && stderr.contains("repos"),
-            "the launch must report repos as still unapproved:\n{stderr}"
+            stderr.contains("unapproved permission") && stderr.contains("navikt/e2e-flag-model"),
+            "the launch must report the proposal as still unapproved:\n{stderr}"
         );
 
         let _ = std::fs::remove_dir_all(&repo);
