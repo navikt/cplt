@@ -5786,6 +5786,10 @@ paths = [
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
+            output.status.success(),
+            "an enforcing battery exits 0:\n{stdout}"
+        );
+        assert!(
             stdout.contains("ENFORCING") && !stdout.contains("NOT ENFORCING"),
             "a user's login shell must not decide the verdict:\n{stdout}"
         );
