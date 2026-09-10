@@ -185,11 +185,13 @@ for the session, and cplt says so at launch.
 
 `[propose]` is launch-repository only. A named repository that proposes
 something gets one line saying it was not consulted; approving proposals per
-repository is [#206](https://github.com/navikt/cplt/issues/206)'s decision to
-make first. A `.cplt.toml` in a named repository that cannot be parsed **stops
-the launch** rather than being skipped: the file exists, so a restriction its
-owner wrote is missing, and a missing restriction is not a warning to scroll
-past.
+repository is a separate feature and is not built. A `.cplt.toml` in a named
+repository that cannot be parsed **warns and the launch continues**, which is
+what the launch repository's own unreadable config has always done. The warning
+says what it costs — that repository's `[deny]` is not applied, so the session
+is less restricted inside it than its config asks for. Only a tightening can go
+missing this way: a named repository's file grants nothing, because its
+`[propose]` is never consulted.
 
 Launching from the parent (`--project-dir ~/src`) grants the whole tree and is a
 much wider grant than naming two repositories. It also does **not** let you name
@@ -230,9 +232,10 @@ machine decides where those repositories live. A committed `.cplt.toml` cannot
 point cplt at a directory of its choosing — the most it can do is put a name in
 front of you.
 
-**What approving grants is not small.** Each linked repository becomes a named
-root: read, write **and execute** on that whole tree, the same posture as the
-project directory. A repository proposing five repositories is asking for five
+**What approving grants is not small.** Each repository it links becomes a
+*named repository* — the same thing `--repo-dir` and `sandbox.repo_dirs` name,
+with the same grant: read, write **and execute** on that whole tree, the same
+posture as the project directory. A repository proposing five repositories is asking for five
 of those. Approving is therefore a separate, explicit step:
 
 ```
@@ -292,7 +295,9 @@ since its `origin` is the fork; a repository with no `origin`, or with only
 ### Naming a repository instead of a path
 
 `cplt link` takes the repository, finds the checkout, and checks it really is
-that repository before writing the path:
+that repository before writing the path. What it writes is a `sandbox.repo_dirs`
+entry, so what you get is a *named repository* in exactly the sense above —
+"linking" is how you name one without knowing where it lives:
 
 ```bash
 cplt link navikt/sykepenger-model
