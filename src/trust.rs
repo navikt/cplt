@@ -278,30 +278,31 @@ pub fn now_iso8601() -> String {
 
     format!("{y:04}-{m:02}-{d:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
 }
-/// Unknown keys (see [`crate::repo_config::RepoConfig::unknown`]) are NOT
-/// hashed, and that is the behaviour to want. A key this cplt cannot see grants
-/// nothing, so an approval should not be invalidated by its presence — the
-/// repository added something inert as far as this version is concerned. When
-/// the user upgrades and the key becomes known, it starts feeding this hash,
-/// the approval goes stale, and they are asked to review it. Approval tracks
-/// what the file can actually do here, which is the property that matters.
-///
-/// Compute a stable content hash of the proposal section.
-///
-/// This hash captures the *values* of all proposals so that if the
-/// `.cplt.toml` changes (e.g. adding new paths to `allow.read`),
-/// existing approvals are invalidated and the user must re-approve.
-///
-/// Arrays are sorted before hashing so reordering entries does not
-/// invalidate approvals. Full SHA-256 hex is used (64 chars) for
+
 /// Hash of everything a repository proposes, pinning an approval to the exact
 /// values the user reviewed.
 ///
 /// A stored hash that no longer matches makes the approval stale
-/// ([`approval_is_stale`]), so the keys stop applying until the user approves
-/// again. That is the whole defence against a repository being approved for one
-/// thing and later committing another.
+/// ([`approval_is_stale`]), so the approved keys stop applying until the user
+/// reviews the file again. That is the whole defence against a repository being
+/// approved for one thing and later committing another.
 ///
+/// The full SHA-256 hex (64 chars) is stored, not a prefix: this pins content
+/// an adversary chooses, so collision resistance is the property being paid
+/// for.
+///
+/// Two behaviours worth knowing:
+///
+/// - **Arrays are sorted first**, so reordering a proposal is not a change and
+///   costs nobody a re-approval.
+/// - **Unknown keys are hashed** (see [`crate::repo_config::RepoConfig::unknown`]),
+///   which is a change from the hand-written hash this replaced. A key this
+///   version cannot see grants nothing, so hashing it means an inert addition
+///   costs one re-approval. The trade is deliberate: the alternative is a hash
+///   that ignores part of the file it is supposed to pin, and it was exactly
+///   that shape of exception — a field the hash did not cover — that let an
+///   approval for `pass_env = ["TZ"]` survive into
+///   `pass_env = ["AWS_SECRET_ACCESS_KEY"]` (#492).
 pub fn proposal_content_hash(propose: &crate::repo_config::ProposeSection) -> String {
     use sha2::{Digest, Sha256};
 
@@ -334,8 +335,12 @@ pub fn proposal_content_hash(propose: &crate::repo_config::ProposeSection) -> St
     normalized.allow.domains.sort_unstable();
     normalized.proxy.allow_private_domains.sort_unstable();
 
-    let canonical =
-        serde_json::to_string(&normalized).unwrap_or_else(|_| format!("{normalized:?}"));
+    // The fallback cannot collide with a real serialization: it is tagged, and
+    // it carries the error. `ProposeSection` is plain data, so this is not
+    // reachable today — but a hash that silently changed format would be a
+    // security boundary failing quietly, which is the one thing it must not do.
+    let canonical = serde_json::to_string(&normalized)
+        .unwrap_or_else(|e| format!("cplt-proposal-hash-fallback:{e}:{normalized:?}"));
 
     let mut hasher = Sha256::new();
     hasher.update(canonical.as_bytes());
