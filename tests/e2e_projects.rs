@@ -1730,14 +1730,14 @@ if cat secrets/k.txt >/dev/null 2>&1; then echo "RESULT:launch_secret:OK"; else 
     /// It used to stop the launch (#472). The argument for that was sound and
     /// applies just as much to the launch repository's own unreadable config,
     /// which has always warned; two answers to one question was the defect. A
-    /// typo in a linked repository must not stop work in the repository you are
+    /// typo in a named repository must not stop work in the repository you are
     /// actually in, and only a tightening can go missing this way — a named
     /// repository's `[propose]` is never consulted, so its file grants nothing.
     ///
     /// What the warning must not become is quiet. The assertion is on the cost
     /// being stated, not on the words "cannot be parsed".
     #[test]
-    fn an_unparseable_cplt_toml_in_a_linked_repository_warns_and_the_launch_continues() {
+    fn an_unparseable_cplt_toml_in_a_named_repository_warns_and_the_launch_continues() {
         let project = TempProject::scaffold_node();
         project.git_init();
         let named = TempProject::new("repo-dir-bad-toml");
@@ -1757,7 +1757,7 @@ if cat secrets/k.txt >/dev/null 2>&1; then echo "RESULT:launch_secret:OK"; else 
 
         assert!(
             output.status.success(),
-            "a broken config in a LINKED repository must not stop the launch.\nstderr: {stderr}"
+            "a broken config in a NAMED repository must not stop the launch.\nstderr: {stderr}"
         );
         assert!(
             stderr.contains("[deny] section is NOT applied"),

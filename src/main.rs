@@ -2330,10 +2330,10 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             // for, and the operator is told exactly that.
             Err(e) => {
                 ui::warn(&format!(
-                    "Cannot read .cplt.toml in the linked repository {}: {e}\n  \
+                    "Cannot read .cplt.toml in the named repository {}: {e}\n  \
                      Its [deny] section is NOT applied, so this session is less restricted \
                      inside that repository than its config asks for. Fix the file, or drop \
-                     the repository from the linked set.",
+                     the repository from the named set.",
                     root.dir.display()
                 ));
             }
