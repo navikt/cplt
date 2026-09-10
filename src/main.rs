@@ -2141,6 +2141,9 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
 
     // ── Load and apply per-repo config (.cplt.toml) ──────────────
     let mut unapproved_proposals: Vec<String> = Vec::new();
+    // Kept for the warning below, which names what each unapproved key would
+    // grant. `repos` in particular is opaque as a bare key name.
+    let mut repo_propose = repo_config::ProposeSection::default();
     match repo_config::load_repo_config(&project_dir) {
         Ok(Some(loaded)) => {
             if !resolved.quiet {
@@ -2181,9 +2184,14 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
 
             // Determine approved keys
             let approved_keys: Vec<String> = if cli.accept_repo_config {
-                // --accept-repo-config: approve everything
+                // --accept-repo-config approves for ONE run and persists
+                // nothing. `repos` is the opposite shape: approving it writes
+                // named roots into the local config, which outlives the run. A
+                // per-run flag must not leave a persistent grant behind, so it
+                // is the one proposal this flag cannot approve (#491).
                 repo_config::proposed_keys(&loaded.config.propose)
                     .iter()
+                    .filter(|key| **key != "repos")
                     .map(std::string::ToString::to_string)
                     .collect()
             } else {
@@ -2256,6 +2264,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                 .collect();
             unapproved_proposals =
                 resolved.apply_repo_config(&loaded.config, &loaded.dir, &approved_refs);
+            repo_propose = loaded.config.propose.clone();
         }
         Ok(None) => {} // No .cplt.toml in HEAD — warn_repo_config_discrepancy explains why
         Err(e) => {
@@ -2431,7 +2440,14 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             unapproved_proposals.len()
         ));
         for key in &unapproved_proposals {
-            eprintln!("  {}○{} {key}", ui::color(ui::YELLOW), ui::color(ui::RESET));
+            match propose_key_detail(&repo_propose, key) {
+                Some(detail) => eprintln!(
+                    "  {}○{} {key}: {detail}",
+                    ui::color(ui::YELLOW),
+                    ui::color(ui::RESET)
+                ),
+                None => eprintln!("  {}○{} {key}", ui::color(ui::YELLOW), ui::color(ui::RESET)),
+            }
         }
         eprintln!(
             "  Run: {}cplt trust accept --all{}  (or select specific keys)",
@@ -7530,6 +7546,93 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
     ExitCode::SUCCESS
 }
 
+/// Resolve and link the repositories a `.cplt.toml` proposes, and say what
+/// happened to each.
+///
+/// Approving is where the identities become paths. Each is resolved on this
+/// machine and its origin verified by the same code `cplt link` uses, so a
+/// repository can put a *name* in front of the user and only a path the user
+/// approved ever grants access.
+///
+/// A repository that is not on this machine is reported, not fetched: cloning a
+/// repository named by a config file is a much larger trust decision than
+/// linking one the user already has.
+fn link_proposed_repos(project_dir: &Path, repos: &[String]) -> Vec<trust::LinkedRepo> {
+    let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
+    let mut linked = Vec::new();
+
+    for identity in repos {
+        match cplt::link::resolve(project_dir, &home, identity) {
+            Ok(found) => {
+                let path = found.dir.to_string_lossy().into_owned();
+                let already = config::load_local(project_dir)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|l| l.config.sandbox.repo_dirs.contains(&path));
+                if already {
+                    println!("  • {identity} → {path} (already linked)");
+                } else if run_config_set(
+                    "sandbox.repo_dirs",
+                    Some(&path),
+                    false,
+                    false,
+                    false,
+                    false,
+                    true,
+                ) != ExitCode::SUCCESS
+                {
+                    // The write said why. Not recorded as linked, because it is
+                    // not: an approval must not claim a grant that is not there.
+                    continue;
+                }
+                linked.push(trust::LinkedRepo {
+                    identity: identity.clone(),
+                    path,
+                });
+            }
+            Err(e) => {
+                // One line per repository, then the reason indented: several
+                // failures in a row otherwise read as one paragraph.
+                ui::warn(&format!("{identity}: not linked"));
+                for line in e.to_string().lines() {
+                    eprintln!("  {line}");
+                }
+            }
+        }
+    }
+    linked
+}
+
+/// Remove the named roots an approval created, and only those.
+///
+/// A root the user added by hand — with `cplt link` or `config set --local` —
+/// is theirs, and revoking a repository's proposal must not take it away. That
+/// is why the approval records what it wrote rather than re-deriving it from
+/// the proposal, which may since have changed.
+fn unlink_approved_repos(project_dir: &Path, linked: &[trust::LinkedRepo]) {
+    let recorded: Vec<String> = config::load_local(project_dir)
+        .ok()
+        .flatten()
+        .map(|l| l.config.sandbox.repo_dirs.clone())
+        .unwrap_or_default();
+
+    for repo in linked {
+        if !recorded.contains(&repo.path) {
+            continue; // Already gone; nothing to say.
+        }
+        println!("  • unlinking {} ({})", repo.identity, repo.path);
+        run_config_set(
+            "sandbox.repo_dirs",
+            Some(&repo.path),
+            false,
+            true,
+            false,
+            false,
+            true,
+        );
+    }
+}
+
 fn trust_accept(
     project_dir: &std::path::Path,
     loaded: &repo_config::LoadedRepoConfig,
@@ -7657,6 +7760,25 @@ no longer apply"
             .collect();
 
         if pending.is_empty() {
+            // `repos` is the one proposal whose approval is an ACTION, not a
+            // value, so "already approved" is not the same as "already done".
+            // A user who approved before the repositories were on disk — or who
+            // deleted a root by hand — must be able to run this again and get
+            // them linked. Idempotent: an entry already recorded says so.
+            if carried
+                .as_ref()
+                .is_some_and(|t| trust::is_key_approved(t, "repos"))
+                && !loaded.config.propose.repos.is_empty()
+            {
+                let linked = link_proposed_repos(project_dir, &loaded.config.propose.repos);
+                let mut entry = carried.unwrap_or_default();
+                entry.accepted.linked = linked;
+                if let Err(e) = trust::save_trust(project_dir, &entry) {
+                    ui::error(&format!("Failed to save trust: {e}"));
+                    return ExitCode::FAILURE;
+                }
+                return ExitCode::SUCCESS;
+            }
             ui::info("All permissions are already approved.");
             return ExitCode::SUCCESS;
         }
@@ -7745,6 +7867,13 @@ no longer apply"
     // Pin content hash so changes to proposal values invalidate approval
     entry.accepted.content_hash = current_hash;
 
+    // `repos` is not a value the launch applies — approving it performs the
+    // linking, here. Done before the entry is saved, so a failure to resolve
+    // leaves no approval claiming repositories are linked.
+    if keys_to_accept.iter().any(|k| k == "repos") {
+        entry.accepted.linked = link_proposed_repos(project_dir, &loaded.config.propose.repos);
+    }
+
     // Save
     if let Err(e) = trust::save_trust(project_dir, &entry) {
         ui::error(&format!("Failed to save trust: {e}"));
@@ -7799,6 +7928,13 @@ fn propose_key_detail(propose: &repo_config::ProposeSection, key: &str) -> Optio
         "proxy.allow_private_domains" if !propose.proxy.allow_private_domains.is_empty() => {
             Some(format!("{:?}", propose.proxy.allow_private_domains))
         }
+        // Named, not counted: "repos" alone says nothing about what approving
+        // it would put in scope, and this is the one proposal whose effect is a
+        // whole other repository being read, written and executed in.
+        "repos" if !propose.repos.is_empty() => Some(format!(
+            "{} (each resolved and origin-verified on this machine)",
+            propose.repos.join(", ")
+        )),
         _ => None,
     }
 }
@@ -7810,10 +7946,17 @@ fn trust_revoke(
     all: bool,
 ) -> ExitCode {
     if all {
+        // Read before the entry is deleted: the paths an approval created live
+        // in it, and without them `repos` would be the only proposal key whose
+        // grant outlives its own revocation.
+        let linked = trust::load_trust(project_dir)
+            .map(|t| t.accepted.linked)
+            .unwrap_or_default();
         if let Err(e) = trust::revoke_trust(project_dir) {
             ui::error(&format!("Failed to revoke trust: {e}"));
             return ExitCode::FAILURE;
         }
+        unlink_approved_repos(project_dir, &linked);
         println!(
             "{}✓{} Revoked all trust for this repository.",
             ui::stdout_color(ui::GREEN),
@@ -7841,6 +7984,10 @@ fn trust_revoke(
     let before_len = entry.accepted.keys.len();
     entry.accepted.keys.retain(|k| !keys.contains(k));
     let removed = before_len - entry.accepted.keys.len();
+
+    if keys.iter().any(|k| k == "repos") {
+        unlink_approved_repos(project_dir, &std::mem::take(&mut entry.accepted.linked));
+    }
 
     if removed == 0 {
         ui::info("No matching keys found to revoke.");

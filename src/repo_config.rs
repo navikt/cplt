@@ -102,6 +102,22 @@ pub struct ProposeSection {
     #[serde(default)]
     pub pass_env: Vec<String>,
 
+    /// Repositories this project usually spans, as `<owner>/<name>` (#491).
+    ///
+    /// An identity, never a path: the repository states what the *project* is,
+    /// and the user's machine decides where that repository lives. Approving
+    /// resolves each one locally, verifies its origin, and records the path —
+    /// so what a repository can put in front of the user is a name, and what
+    /// grants access is a path the user approved.
+    ///
+    /// Unlike every other proposal, this one is not a value the launch applies.
+    /// `cplt trust accept repos` performs the linking; after that the entries
+    /// are ordinary `sandbox.repo_dirs` roots. Nothing here is consulted at
+    /// launch, which is also why `--accept-repo-config` cannot use it: a
+    /// per-run flag must not write a persistent grant.
+    #[serde(default)]
+    pub repos: Vec<String>,
+
     /// Proposed path/port expansions.
     #[serde(default)]
     pub allow: ProposeAllowSection,
@@ -148,6 +164,7 @@ impl ProposeSection {
             gh_guard,
             git_push_prevention,
             pass_env: _,
+            repos: _,
             allow: _,
             proxy: _,
             unknown: _,
@@ -549,6 +566,19 @@ fn validate_repo_config(config: &RepoConfig) -> Result<(), String> {
         crate::sandbox::validate_sbpl_path(&PathBuf::from(path))?;
     }
 
+    // `[propose] repos` entries are identities. The value reaches path
+    // construction on the user's machine — `<parent>/<name>` — so a `..` or a
+    // slash in the wrong place would have cplt look in a directory this file
+    // chose. Refused here, where the file is read, rather than at the resolver.
+    for repo in &config.propose.repos {
+        if !crate::link::is_valid_identity(repo) {
+            return Err(format!(
+                "propose.repos entry {repo:?} is not a repository identity. \
+                 Name repositories as <owner>/<name>, for example navikt/cplt."
+            ));
+        }
+    }
+
     // Validate deny env vars: must be non-empty alphanumeric/underscore identifiers
     for var in &config.deny.env {
         if var.is_empty() {
@@ -673,6 +703,9 @@ pub fn proposed_keys(propose: &ProposeSection) -> Vec<&'static str> {
         }
     }
 
+    if !propose.repos.is_empty() {
+        keys.push("repos");
+    }
     if !propose.allow.read.is_empty() {
         keys.push("allow.read");
     }
@@ -901,6 +934,38 @@ preset = \"full-trust\"\n",
         assert_eq!(loaded.source, RepoConfigSource::GitHead);
         assert_eq!(proposed_keys(&loaded.config.propose), vec!["allow_docker"]);
         assert!(!loaded.propose_dropped);
+    }
+
+    /// #491: a repository proposes *identities*, never paths. The value is
+    /// used to build paths on the user's machine, so a `..` or a stray slash
+    /// would have cplt look in a directory this file chose — and print the
+    /// result back to the operator as if it were a repository.
+    #[test]
+    fn a_proposed_repo_must_be_an_identity_not_a_path() {
+        for bad in [
+            "../../etc",
+            "navikt/../../etc",
+            "/absolute/path",
+            "navikt",
+            "navikt/cplt/extra",
+            "",
+        ] {
+            let cfg =
+                parse_repo_config(&format!("[propose]\nrepos = [\"{bad}\"]\n")).expect("parses");
+            let err = validate_repo_config(&cfg).expect_err("{bad} must be refused");
+            assert!(err.contains("identity"), "say what is wrong: {err}");
+        }
+
+        let cfg = parse_repo_config("[propose]\nrepos = [\"navikt/cplt\"]\n").expect("parses");
+        validate_repo_config(&cfg).expect("an identity is the point of the key");
+    }
+
+    /// It is a grant — it puts another repository in read/write/exec scope — so
+    /// an uncommitted file cannot make it (#206).
+    #[test]
+    fn proposed_repos_do_not_survive_an_uncommitted_file() {
+        let cfg = parse_repo_config("[propose]\nrepos = [\"navikt/cplt\"]\n").expect("parses");
+        assert!(cfg.propose.tightenings_only().repos.is_empty());
     }
 
     /// The deny sweep runs after cplt sets up the child's environment, so these

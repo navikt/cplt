@@ -216,6 +216,56 @@ table.
 The long forms are used throughout this document because they say which file is
 being written.
 
+### A project can name the repositories it spans
+
+A `.cplt.toml` may say which repositories a session usually needs:
+
+```toml
+[propose]
+repos = ["navikt/sykepenger-model", "navikt/spleis-testdata"]
+```
+
+Identities, never paths. The repository states what the *project* is; your
+machine decides where those repositories live. A committed `.cplt.toml` cannot
+point cplt at a directory of its choosing — the most it can do is put a name in
+front of you.
+
+Approving is what turns names into paths, and it is a separate, explicit step:
+
+```
+$ cplt trust accept repos
+[cplt] sandbox.repo_dirs = [/Users/you/src/sykepenger-model]
+[cplt] navikt/spleis-testdata: not linked
+  No checkout of that repository was found. Looked at: ...
+```
+
+Each identity is resolved and origin-verified exactly as `cplt link` does, and
+one that is not on your machine is reported, never fetched: cloning a
+repository named by a config file is a much larger decision than linking one
+you already have. Approving again re-links anything missing, so a repository
+you clone later needs no re-approval dance.
+
+`cplt trust revoke repos` removes the roots that approval created — and only
+those. A root you added yourself with `cplt link` or `config set --local` stays,
+because it is yours.
+
+Three properties worth knowing:
+
+- **An unapproved proposal grants nothing.** It shows up in the launch summary
+  naming the repositories, so you learn the link exists to be made, and that is
+  all it does.
+- **`--accept-repo-config` cannot approve it.** That flag approves for one run
+  and persists nothing; linking a repository is persistent. It is the one
+  proposal the flag skips.
+- **An uncommitted `.cplt.toml` cannot propose repositories at all.** It is a
+  grant, so it needs the audit trail a commit gives — see the repo-config
+  security model above.
+
+The approval binds to the path it resolved, which is then re-validated on every
+launch like any other named root. cplt does not re-resolve the identity each
+time: a later directory rename would otherwise redirect a grant you approved
+for a specific tree.
+
 ### Naming a repository instead of a path
 
 `cplt link` takes the repository, finds the checkout, and checks it really is

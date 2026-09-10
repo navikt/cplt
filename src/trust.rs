@@ -42,11 +42,35 @@ pub struct AcceptedProposals {
     /// When approval was last updated (ISO 8601).
     #[serde(default)]
     pub approved_at: String,
+    /// Repositories linked by approving `[propose] repos`, with the path each
+    /// identity resolved to at approval time (#491).
+    ///
+    /// Recorded so `cplt trust revoke repos` can remove exactly the roots this
+    /// approval created and leave the ones the user added by hand. Without it,
+    /// `repos` would be the only proposal key whose grant survives its own
+    /// revocation — the launch reads `sandbox.repo_dirs` and never consults the
+    /// trust store.
+    #[serde(default)]
+    pub linked: Vec<LinkedRepo>,
+
     /// SHA-256 hash of the proposal values at approval time.
     /// If the .cplt.toml proposals change, this hash won't match and
     /// approvals are invalidated (user must re-approve).
     #[serde(default)]
     pub content_hash: String,
+}
+
+/// One repository linked by an approval: the identity that was approved, and
+/// the path it resolved to on this machine.
+///
+/// The path is what the grant is. It is re-validated on every launch like any
+/// other named root, and never re-resolved from the identity — otherwise a
+/// later directory rename would silently redirect a grant the user approved for
+/// a specific tree.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct LinkedRepo {
+    pub identity: String,
+    pub path: String,
 }
 
 /// Compute a stable fingerprint for a repository.
@@ -636,6 +660,7 @@ mod tests {
                     "allow_jvm_attach".to_string(),
                 ],
                 approved_at: "2026-05-07T12:00:00Z".to_string(),
+                linked: Vec::new(),
                 content_hash: "a1b2c3d4e5f6a7b8".to_string(),
             },
         };
@@ -775,6 +800,7 @@ approved_at = "2026-05-01T12:00:00Z"
             gh_guard: _,
             git_push_prevention: _,
             pass_env: _,
+            repos: _,
             allow: _,
             proxy: _,
             unknown: _,
