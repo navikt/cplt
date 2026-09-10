@@ -7262,11 +7262,29 @@ fn run_link_command(repo: &str, dir: Option<&Path>, unlink: bool) -> ExitCode {
 
 /// Remove the named root that is `identity`.
 fn unlink_by_identity(project_dir: &Path, identity: &str) -> ExitCode {
-    let linked: Vec<String> = config::load_local(project_dir)
-        .ok()
-        .flatten()
-        .map(|l| l.config.sandbox.repo_dirs.clone())
-        .unwrap_or_default();
+    // Validated before it reaches any message: `--unlink` takes the same
+    // identity the other forms do, and an unvalidated string is printed back to
+    // the terminal.
+    if !cplt::link::is_valid_identity(identity) {
+        ui::error(&format!(
+            "{identity:?} is not a repository identity. Name it as <owner>/<name>, \
+             for example navikt/cplt."
+        ));
+        return ExitCode::FAILURE;
+    }
+
+    // A local config that cannot be read is an error, not an empty list. The
+    // launch fails loudly on the same file; answering "nothing is linked" here
+    // would tell the user their roots are gone when they are unreadable.
+    let linked: Vec<String> = match config::load_local(project_dir) {
+        Ok(loaded) => loaded
+            .map(|l| l.config.sandbox.repo_dirs.clone())
+            .unwrap_or_default(),
+        Err(e) => {
+            ui::error(&format!("Cannot read this checkout's local config: {e}"));
+            return ExitCode::FAILURE;
+        }
+    };
 
     if linked.is_empty() {
         ui::error("No repositories are linked for this checkout.");
