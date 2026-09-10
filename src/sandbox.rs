@@ -1021,11 +1021,14 @@ fn prepare_impl(
     // does not have. With bubblewrap, a truncated scan means a `.git/hooks`
     // deeper in that tree really did stay writable, and that is worth a line.
     if nested_capped && bwrap_wrapper.is_some() {
-        ui::warn(
-            "Stopped looking for repositories nested inside the writable roots after 20000 \
-             directories, so a .git/hooks deeper in one of them may stay writable. Name the \
+        ui::warn(&format!(
+            "Stopped looking for repositories nested inside the writable roots after {} \
+             directories, so a repository deeper in one of them gets none of the \
+             protections a nested repository should have: .git/hooks, .cplt.toml, \
+             .github/hooks and the agent auto-exec paths all stay writable there. Name the \
              repositories you work in with --repo-dir, or grant a narrower tree.",
-        );
+            bubblewrap::NESTED_SCAN_LIMIT
+        ));
     }
 
     // `AgentDir::create_dirs` (Pi's mkdir-based trust lock) needs

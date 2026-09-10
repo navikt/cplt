@@ -751,6 +751,12 @@ fn expand_rel(base: &Path, rel: &str) -> Vec<PathBuf> {
 /// each contributes the same gitdir-relative set. Non-existent paths are
 /// skipped downstream (see [`build_bwrap_args`]), and the result is
 /// deduplicated, so overlapping roots never double-bind.
+/// Directories examined in total by [`nested_repo_roots`], across all roots.
+///
+/// Public because the launch warning names it: a message with its own copy of
+/// the number is a message that will one day be wrong.
+pub(crate) const NESTED_SCAN_LIMIT: usize = 20_000;
+
 /// Repositories nested inside the writable roots, so their protected paths get
 /// the same treatment the roots' own do — read-only binds *and* rename pins.
 ///
@@ -764,7 +770,7 @@ fn expand_rel(base: &Path, rel: &str) -> Vec<PathBuf> {
 /// # What is bounded, and what that costs
 ///
 /// A writable root is arbitrary — it can be a home directory or a network
-/// mount — so the walk is bounded to `MAX_DEPTH` levels and `SCAN_LIMIT`
+/// mount — so the walk is bounded to `MAX_DEPTH` levels and [`NESTED_SCAN_LIMIT`]
 /// *directories* (files are not counted: an agent should not be able to spend
 /// the budget by touching files). Breadth-first, and each directory's entries
 /// sorted, so the same tree yields the same set on every launch and the
@@ -790,8 +796,7 @@ pub(crate) fn nested_repo_roots(roots: &[&Path]) -> (Vec<PathBuf>, bool) {
     /// covers the layouts people actually use, `~/src/<repo>` through
     /// `~/go/src/github.com/<org>/<repo>` when the grant is `~/go/src`.
     const MAX_DEPTH: usize = 3;
-    /// Directories examined in total, across all roots.
-    const SCAN_LIMIT: usize = 20_000;
+
     /// Not descended into: thousands of entries, and a `.git` inside one is
     /// vendored rather than worked in. They are still *tested* for being a
     /// repository — `~/src/build` may well be a checkout — only not walked.
@@ -811,7 +816,7 @@ pub(crate) fn nested_repo_roots(roots: &[&Path]) -> (Vec<PathBuf>, bool) {
     ];
 
     let mut found: Vec<PathBuf> = Vec::new();
-    let mut budget = SCAN_LIMIT;
+    let mut budget = NESTED_SCAN_LIMIT;
     let mut queue: std::collections::VecDeque<(PathBuf, usize)> =
         roots.iter().map(|r| ((*r).to_path_buf(), 0usize)).collect();
 
