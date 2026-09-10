@@ -8,7 +8,7 @@
 //! The file is read from `git HEAD` (committed state) to prevent the sandboxed
 //! agent from modifying its own config mid-session.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// The filename we look for in the project root.
@@ -67,7 +67,7 @@ pub struct DenySection {
 /// trusted on its own. A stray `preset` key lands in [`Self::unknown`] and is
 /// ignored, which is the same outcome `deny_unknown_fields` used to produce by
 /// refusing the file — without taking the rest of the config down with it.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct ProposeSection {
     pub allow_localhost_any: Option<bool>,
@@ -116,7 +116,7 @@ pub struct ProposeSection {
 }
 
 /// Proposed allow expansions (paths, ports).
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct ProposeAllowSection {
     #[serde(default)]
@@ -144,7 +144,7 @@ pub struct ProposeAllowSection {
 }
 
 /// Proposed proxy settings.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct ProposeProxySection {
     #[serde(default)]
