@@ -751,87 +751,120 @@ fn expand_rel(base: &Path, rel: &str) -> Vec<PathBuf> {
 /// each contributes the same gitdir-relative set. Non-existent paths are
 /// skipped downstream (see [`build_bwrap_args`]), and the result is
 /// deduplicated, so overlapping roots never double-bind.
-/// Repositories nested inside a writable root, so their protected paths get the
-/// same read-only binds the root's own do.
+/// Repositories nested inside the writable roots, so their protected paths get
+/// the same treatment the roots' own do — read-only binds *and* rename pins.
 ///
-/// macOS expresses the nested entries of [`PROTECTED_IN_ROOT`] as a regex that
+/// macOS expresses the `nested` entries of [`PROTECTED_IN_ROOT`] as a regex that
 /// matches at any depth. bubblewrap has no regex: it binds paths, so the paths
-/// have to be found. Until now they were not, and `<root>/x/.git/hooks` was
-/// writable on Linux while the identical path was denied on macOS — a hook
-/// planted there runs **unsandboxed** on the user's next git operation in that
-/// repository ([#344](https://github.com/navikt/cplt/issues/344),
-/// [#386](https://github.com/navikt/cplt/issues/386)).
+/// have to be found. Until they were, `<root>/x/.git/hooks` was writable on
+/// Linux while the identical path was denied on macOS — and a hook planted
+/// there runs **unsandboxed** on the user's next git operation in that
+/// repository ([#344](https://github.com/navikt/cplt/issues/344)).
 ///
-/// Bounded on purpose, because a writable root is arbitrary — it can be a home
-/// directory or a network mount:
+/// # What is bounded, and what that costs
 ///
-/// - `MAX_DEPTH` levels below the root. A checkout of checkouts is the shape
-///   that bites; deeper needs a full tree walk at every launch to catch cases
-///   nobody has reported.
-/// - `SCAN_LIMIT` directory entries in total, across the whole walk.
-/// - Dependency and build directories are skipped by name. They hold thousands
-///   of directories and a vendored `.git` in one of them is not a repository
-///   the user works in.
+/// A writable root is arbitrary — it can be a home directory or a network
+/// mount — so the walk is bounded to `MAX_DEPTH` levels and `SCAN_LIMIT`
+/// *directories* (files are not counted: an agent should not be able to spend
+/// the budget by touching files). Breadth-first, and each directory's entries
+/// sorted, so the same tree yields the same set on every launch and the
+/// shallowest repositories are found first.
 ///
-/// Stopping early under-protects rather than over-protects, which is the wrong
-/// direction — so the caller warns when the cap is hit rather than staying
-/// quiet about a limit that changed the outcome.
-fn nested_repo_roots(root: &Path) -> (Vec<PathBuf>, bool) {
-    /// How far below a writable root a nested repository is looked for.
+/// The cap is reachable by an agent that creates enough directories, and the
+/// caller says so rather than letting a silent truncation pass for coverage.
+/// The limit is generous — 20 000 directories is about 40 ms on a warm cache —
+/// because the failure mode of a small limit is lost protection, not lost time.
+///
+/// # Symlinks are not followed
+///
+/// `entry.file_type()` does not follow, deliberately. Following would let a
+/// symlink inside a granted tree pull a repository *outside* it into the bind
+/// set, and would make the walk vulnerable to cycles. It also keeps the bind
+/// destinations real directories: bubblewrap refuses to mount onto a symlink
+/// and fails the whole wrapper, which would downgrade the session to
+/// Landlock-only — a way for one session to remove bubblewrap from the next.
+///
+/// Returns the repositories found, and whether the walk stopped at its cap.
+pub(crate) fn nested_repo_roots(roots: &[&Path]) -> (Vec<PathBuf>, bool) {
+    /// How far below a writable root a nested repository is looked for. Three
+    /// covers the layouts people actually use, `~/src/<repo>` through
+    /// `~/go/src/github.com/<org>/<repo>` when the grant is `~/go/src`.
     const MAX_DEPTH: usize = 3;
-    /// Directory entries examined in total, per root.
-    const SCAN_LIMIT: usize = 4096;
-    /// Never descended into: thousands of entries, and a `.git` inside one is
-    /// vendored rather than worked in.
+    /// Directories examined in total, across all roots.
+    const SCAN_LIMIT: usize = 20_000;
+    /// Not descended into: thousands of entries, and a `.git` inside one is
+    /// vendored rather than worked in. They are still *tested* for being a
+    /// repository — `~/src/build` may well be a checkout — only not walked.
     const SKIP: &[&str] = &[
         ".git",
         "node_modules",
         "target",
         "vendor",
-        "build",
         "dist",
         ".venv",
         "venv",
         "__pycache__",
         ".gradle",
         ".terraform",
+        ".next",
+        ".cache",
     ];
 
-    let mut found = Vec::new();
+    let mut found: Vec<PathBuf> = Vec::new();
     let mut budget = SCAN_LIMIT;
-    let mut queue: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+    let mut queue: std::collections::VecDeque<(PathBuf, usize)> =
+        roots.iter().map(|r| ((*r).to_path_buf(), 0usize)).collect();
 
-    while let Some((dir, depth)) = queue.pop() {
+    while let Some((dir, depth)) = queue.pop_front() {
         if depth >= MAX_DEPTH {
             continue;
         }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
-        for entry in entries.flatten() {
+        // Sorted, so a truncated walk truncates the same way twice. An
+        // unsorted `read_dir` would protect different repositories on different
+        // launches of the same tree.
+        let mut dirs: Vec<PathBuf> = entries
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .map(|e| e.path())
+            .collect();
+        dirs.sort();
+
+        for path in dirs {
             if budget == 0 {
-                return (found, true);
+                return (dedup(found), true);
             }
             budget -= 1;
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if SKIP.contains(&name.as_ref()) {
-                continue;
-            }
-            // A worktree's `.git` is a file, not a directory, and its protected
-            // paths live in the shared gitdir — which the caller already binds
-            // through `git_dirs`. Either shape means "a repository is here".
+            // `.git` as a directory or as a file both mean a repository is
+            // here — but only the directory case is actually protected. A
+            // worktree or submodule keeps its hooks in the shared gitdir
+            // (`<super>/.git/modules/<name>/hooks`), which nothing resolves for
+            // a NESTED repository, so `<repo>/.git/hooks` does not exist and
+            // the bind is dropped downstream. A bare repository has no `.git`
+            // at all and is not found here. Both are recorded as uncovered in
+            // SECURITY.md rather than claimed (#498 review).
             if path.join(".git").exists() {
                 found.push(path.clone());
             }
-            queue.push((path, depth + 1));
+            let skipped = path
+                .file_name()
+                .is_some_and(|n| SKIP.contains(&n.to_string_lossy().as_ref()));
+            if !skipped {
+                queue.push_back((path, depth + 1));
+            }
         }
     }
-    (found, false)
+    (dedup(found), false)
+}
+
+/// Sort and deduplicate, so overlapping roots (a project inside an
+/// `allow.write` grant) contribute one entry rather than two.
+fn dedup(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 pub(crate) fn git_persistence_paths(write_roots: &[&Path], git_dirs: &[&Path]) -> Vec<PathBuf> {
@@ -848,37 +881,11 @@ pub(crate) fn git_persistence_paths(write_roots: &[&Path], git_dirs: &[&Path]) -
             .filter(|p| p.linux == LinuxCoverage::Bwrap)
             .map(|p| p.rel)
     };
-    // The subset the tables mark `nested`, which is exactly what the macOS
-    // regex matches at any depth. Read from the same table rather than a second
-    // list, so a new nested entry reaches both platforms.
-    let bwrap_nested = |set: &'static [Protected]| {
-        set.iter()
-            .filter(|p| p.linux == LinuxCoverage::Bwrap && p.nested)
-            .map(|p| p.rel)
-    };
     let under = |base: PathBuf, rel: &str| expand_rel(&base, rel);
     let mut paths: Vec<PathBuf> = Vec::new();
     for root in write_roots {
         paths.extend(bwrap(PROTECTED_IN_ROOT).flat_map(|rel| under(root.to_path_buf(), rel)));
         paths.extend(bwrap(PROTECTED_IN_GITDIR).flat_map(|rel| under(root.join(".git"), rel)));
-
-        // Repositories nested inside the root get the entries the tables mark
-        // `nested`, which is what macOS's any-depth regex covers and bubblewrap
-        // could not until the paths were enumerated.
-        let (nested, capped) = nested_repo_roots(root);
-        if capped {
-            crate::ui::warn(&format!(
-                "Stopped looking for repositories nested inside {} after {} entries, so a \
-                 `.git/hooks` deeper in that tree may stay writable. Name the repositories \
-                 you work in with --repo-dir, or grant a narrower tree.",
-                root.display(),
-                4096
-            ));
-        }
-        for repo in nested {
-            paths.extend(bwrap_nested(PROTECTED_IN_ROOT).flat_map(|rel| under(repo.clone(), rel)));
-            paths.extend(bwrap(PROTECTED_IN_GITDIR).flat_map(|rel| under(repo.join(".git"), rel)));
-        }
     }
     for dir in git_dirs {
         paths.extend(bwrap(PROTECTED_IN_GITDIR).flat_map(|rel| under(dir.to_path_buf(), rel)));
@@ -1872,14 +1879,12 @@ mod tests {
         let nested = root.path().join("libs").join("model");
         std::fs::create_dir_all(nested.join(".git/hooks")).expect("nested hooks");
         std::fs::write(nested.join(".cplt.toml"), "[deny]\n").expect("nested config");
-        // Deeper than the scan goes, and inside a skipped directory: both must
-        // be absent, so the bound is asserted rather than assumed.
-        let too_deep = root.path().join("a/b/c/d/repo");
-        std::fs::create_dir_all(too_deep.join(".git/hooks")).expect("deep hooks");
-        let vendored = root.path().join("node_modules/pkg");
-        std::fs::create_dir_all(vendored.join(".git/hooks")).expect("vendored hooks");
 
-        let paths = git_persistence_paths(&[root.path()], &[]);
+        let (repos, capped) = nested_repo_roots(&[root.path()]);
+        assert!(!capped, "a three-directory tree is not near the cap");
+        let mut roots = vec![root.path()];
+        roots.extend(repos.iter().map(PathBuf::as_path));
+        let paths = git_persistence_paths(&roots, &[]);
 
         assert!(
             paths.contains(&nested.join(".git/hooks")),
@@ -1889,14 +1894,107 @@ mod tests {
             paths.contains(&nested.join(".cplt.toml")),
             "and its cplt config, which steers the NEXT session: {paths:?}"
         );
+    }
+
+    /// `rename_pin_paths` treats a nested repository exactly like a root, which
+    /// is what makes the leaf binds mean something: a read-only bind pins
+    /// content, not the name.
+    ///
+    /// This covers the path arithmetic only. Whether the caller actually passes
+    /// the nested set to it is the thing that was broken (#498 review), and
+    /// that is asserted in `sandbox.rs` —
+    /// `a_nested_repository_reaches_both_the_binds_and_the_pins`.
+    #[test]
+    fn rename_pins_treat_a_nested_repository_like_a_root() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let nested = root.path().join("libs").join("model");
+        std::fs::create_dir_all(nested.join(".git/hooks")).expect("nested hooks");
+        std::fs::create_dir_all(nested.join(".claude")).expect("nested claude");
+        std::fs::write(nested.join(".claude/settings.json"), "{}").expect("settings");
+
+        let (repos, _) = nested_repo_roots(&[root.path()]);
+        let mut roots = vec![root.path()];
+        roots.extend(repos.iter().map(PathBuf::as_path));
+        let pins = rename_pin_paths(&roots, &[]);
+
         assert!(
-            !paths.contains(&too_deep.join(".git/hooks")),
-            "the depth bound is real, and its cost is stated in the docs: {paths:?}"
+            pins.contains(&nested.join(".git")),
+            "the nested .git must be a mountpoint, or the hooks bind is walk-aroundable: {pins:?}"
         );
         assert!(
-            !paths.contains(&vendored.join(".git/hooks")),
-            "a vendored checkout is not a repository the user works in: {paths:?}"
+            pins.contains(&nested.join(".claude")),
+            "same for the agent config directory: {pins:?}"
         );
+    }
+
+    /// The bounds are the security property here — a repository the scan misses
+    /// is one whose hooks stay writable — so they are asserted rather than
+    /// assumed, and the depth boundary is pinned at the exact level.
+    #[test]
+    fn the_scan_bounds_are_where_they_claim_to_be() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mk = |rel: &str| {
+            let p = root.path().join(rel);
+            std::fs::create_dir_all(p.join(".git/hooks")).expect("repo");
+            p
+        };
+        let level1 = mk("one");
+        let level3 = mk("a/b/three");
+        let level4 = mk("a/b/c/four");
+        // Not descended into, but still tested: `~/src/dist` may be a checkout.
+        let skipped_itself = mk("dist");
+        let inside_skipped = mk("node_modules/pkg");
+
+        let (repos, capped) = nested_repo_roots(&[root.path()]);
+        assert!(!capped);
+
+        assert!(repos.contains(&level1), "level 1: {repos:?}");
+        assert!(
+            repos.contains(&level3),
+            "level 3 is the deepest kept: {repos:?}"
+        );
+        assert!(
+            !repos.contains(&level4),
+            "level 4 is past the bound: {repos:?}"
+        );
+        assert!(
+            repos.contains(&skipped_itself),
+            "a skipped NAME is still tested for being a repository: {repos:?}"
+        );
+        assert!(
+            !repos.contains(&inside_skipped),
+            "but nothing inside it is walked: {repos:?}"
+        );
+    }
+
+    /// Symlinks are not followed. Following one would pull a repository outside
+    /// the granted tree into the bind set, and bubblewrap refuses to mount onto
+    /// a symlink — which fails the whole wrapper and downgrades the session to
+    /// Landlock-only, i.e. one session could remove bubblewrap from the next.
+    #[test]
+    fn a_symlinked_directory_is_not_walked() {
+        let outside = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(outside.path().join("secret/.git/hooks")).expect("outside repo");
+        let root = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink(outside.path(), root.path().join("link")).expect("symlink");
+
+        let (repos, _) = nested_repo_roots(&[root.path()]);
+        assert!(
+            repos.is_empty(),
+            "a symlink must not pull a tree outside the grant into the bind set: {repos:?}"
+        );
+    }
+
+    /// The cap is reachable by an agent that creates directories, so the caller
+    /// has to be told. Silence would read as "nothing nested here".
+    #[test]
+    fn hitting_the_cap_is_reported() {
+        let root = tempfile::tempdir().expect("tempdir");
+        for i in 0..20_050 {
+            std::fs::create_dir(root.path().join(format!("d{i:05}"))).expect("mkdir");
+        }
+        let (_, capped) = nested_repo_roots(&[root.path()]);
+        assert!(capped, "a truncated walk must say so");
     }
 
     #[test]
