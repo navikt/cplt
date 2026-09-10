@@ -209,6 +209,34 @@ it.
 Each refusal names the layer that does work, so you do not have to remember the
 table.
 
+`config set` takes `-g`, `-l` and `-r` for `--global`, `--local` and `--repo`.
+The long forms are used throughout this document because they say which file is
+being written.
+
+### Relative paths are resolved when you set them
+
+`../sibling` is how people name the repository next door, so `config set` takes
+it and stores what it resolves to:
+
+```bash
+cd ~/src/spleis
+cplt config set --local sandbox.repo_dirs ../sykepenger-model
+# [cplt] sandbox.repo_dirs = [/Users/you/src/sykepenger-model]
+```
+
+The file holds absolute paths only. A relative entry *in* the file has no
+stable anchor — it would mean different directories depending on where cplt was
+started — so what gets written is the resolved path, not what you typed. A
+`~/` entry is stored as typed: it is already anchor-independent, and expanding
+it would bake in one machine's home directory.
+
+The path has to exist when you set it. A relative entry cplt cannot resolve now
+is one the next launch would refuse anyway, and the error at write time names
+the directory you were standing in.
+
+Removing works the same way, so you can `--unset ../sykepenger-model` without
+looking up how it was stored.
+
 ### Rules that apply on every launch, not only when written
 
 A persisted entry is re-validated at each launch, because the file may be weeks

@@ -283,7 +283,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::StrArray,
         dangerous: false,
         default_display: "[]",
-        description: "Additional repositories this project spans (local config only: cplt config set --local). Absolute or ~/ paths, re-validated on every launch.",
+        description: "Additional repositories this project spans (local config only: cplt config set --local). Relative paths are resolved when set; stored absolute and re-validated on every launch.",
     },
     ConfigKeyInfo {
         section: "sandbox",

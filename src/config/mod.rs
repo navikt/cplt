@@ -27,8 +27,8 @@ pub use editing::{
 pub use error::ConfigError;
 pub use loading::exec_tool_dir_warning;
 pub use local::{
-    list_local, load_local, local_dir, local_path, parse_local_doc, stamp_local_header,
-    validate_local_document,
+    is_local_path_key, list_local, load_local, local_dir, local_path, parse_local_doc,
+    resolve_path_entry, stamp_local_header, validate_local_document,
 };
 pub(crate) use path::canonicalize_deepest;
 pub(crate) use path::lexically_normalized;

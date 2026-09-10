@@ -212,6 +212,49 @@ pub(super) fn parse_local(
     Ok(Some(config))
 }
 
+/// Whether `key` (dotted, e.g. `sandbox.repo_dirs`) holds paths in the local
+/// layer, and so must be stored absolute.
+///
+/// Kept next to [`path_valued`], which decides the same thing from the parsed
+/// config, so a new path key cannot be added to one and forgotten in the other.
+#[must_use]
+pub fn is_local_path_key(dotted: &str) -> bool {
+    path_valued(&Config::default())
+        .iter()
+        .any(|(key, _)| *key == dotted)
+}
+
+/// Resolve a relative path entry against `cwd` so it can be stored absolute.
+///
+/// `config set --local sandbox.repo_dirs ../sibling` is the natural way to say
+/// it, and refusing it made the user do path arithmetic cplt can do (#490).
+/// Storing the result rather than the input keeps the file's meaning
+/// independent of where it is read from — the reason relative entries are
+/// refused at load in the first place.
+///
+/// Canonicalized, so the stored entry survives a later `cd` and names the
+/// directory the user actually pointed at. `~/` is left alone: it is already
+/// anchor-independent, and expanding it would bake in a `$HOME` that differs
+/// between a Mac and a devcontainer.
+///
+/// # Errors
+/// If the path does not exist. A relative entry cplt cannot resolve now is one
+/// the launch would refuse anyway, and saying so here beats writing a file that
+/// fails at the next launch.
+pub fn resolve_path_entry(value: &str, cwd: &Path) -> Result<String, ConfigError> {
+    if value.starts_with('/') || value.starts_with('~') {
+        return Ok(value.to_string());
+    }
+    std::fs::canonicalize(cwd.join(value))
+        .map(|p| p.to_string_lossy().into_owned())
+        .map_err(|e| {
+            ConfigError::Validation(format!(
+                "cannot resolve {value:?} from {}: {e}",
+                cwd.display()
+            ))
+        })
+}
+
 /// Refuse relative path entries, at `config set --local` and again at load.
 ///
 /// In `config.toml` a relative path anchors to `~/.config/cplt/`, which is
@@ -737,6 +780,63 @@ mod tests {
             .unwrap();
         let err = validate_local_document(&doc).unwrap_err();
         assert!(err.to_string().contains("relative"), "{err}");
+    }
+
+    /// `config set --local sandbox.repo_dirs ../sibling` stores the absolute
+    /// path, so the file keeps its meaning wherever it is later read from —
+    /// which is the whole reason relative entries are refused at load.
+    #[test]
+    fn a_relative_entry_is_resolved_before_it_is_stored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sibling = dir.path().join("sibling");
+        let cwd = dir.path().join("launch");
+        std::fs::create_dir_all(&sibling).expect("sibling");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+
+        let stored = resolve_path_entry("../sibling", &cwd).expect("resolves");
+        assert_eq!(
+            std::fs::canonicalize(&sibling)
+                .expect("canonical")
+                .to_string_lossy(),
+            stored
+        );
+        // And the result is one the load-time rule accepts.
+        let cfg = Config::parse(&format!("[sandbox]\nrepo_dirs = [{stored:?}]\n")).expect("parses");
+        reject_relative_paths(&cfg, "local config").expect("absolute now");
+    }
+
+    /// Anchor-independent already, and expanding it would bake in one machine's
+    /// `$HOME`.
+    #[test]
+    fn absolute_and_tilde_entries_are_stored_as_typed() {
+        let cwd = Path::new("/nowhere");
+        assert_eq!(resolve_path_entry("/opt/src", cwd).unwrap(), "/opt/src");
+        assert_eq!(resolve_path_entry("~/code/x", cwd).unwrap(), "~/code/x");
+    }
+
+    /// Saying so at write time beats writing a file the next launch refuses.
+    #[test]
+    fn a_relative_entry_that_names_nothing_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = resolve_path_entry("../not-there", dir.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("cannot resolve"),
+            "should name the failure: {err}"
+        );
+    }
+
+    /// The two lists that decide "this key holds paths" must agree, or a new
+    /// path key gets resolved but not validated, or the reverse.
+    #[test]
+    fn the_path_keys_are_the_ones_the_load_rule_checks() {
+        for (key, _) in path_valued(&Config::default()) {
+            assert!(is_local_path_key(key), "{key} checked but not resolved");
+        }
+        assert!(!is_local_path_key("proxy.upstream"), "a URL is not a path");
+        assert!(
+            !is_local_path_key("sandbox.allow_cache_exec"),
+            "cache-dir names are not paths"
+        );
     }
 
     /// `sandbox.repo_dirs` is a path list, so the local layer's absolute-or-`~`
