@@ -2175,6 +2175,7 @@ mod tests {
             deny: crate::repo_config::DenySection {
                 paths: vec!["secrets".to_string()],
                 env: vec![],
+                ..Default::default()
             },
             ..Default::default()
         };

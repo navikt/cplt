@@ -1690,6 +1690,43 @@ fn warn_exec_tool_dir_shadowing(
     }
 }
 
+/// Report `.cplt.toml` keys this cplt does not understand.
+///
+/// Not gated on `quiet`, and deliberately: the whole point of ignoring an
+/// unknown key rather than refusing the file (#484) is that a repository can
+/// adopt a key before every developer has upgraded. The cost of that is a
+/// window where a key the author wrote is not applied, and the only thing
+/// standing between that and a silent surprise is this line.
+///
+/// A `[deny]` key gets the stronger wording. An ignored `[propose]` key costs
+/// the repository a relaxation it asked for, which surfaces as a build that
+/// cannot do something; an ignored `[deny]` key costs a restriction its author
+/// believed was in force, and nothing else in the session will mention it.
+fn warn_unknown_repo_config_keys(config: &repo_config::RepoConfig, label: &str) {
+    let unknown = repo_config::unknown_keys(config);
+    if unknown.is_empty() {
+        return;
+    }
+    let keys = unknown.join(", ");
+    let tightening = if repo_config::has_unknown_tightening_keys(config) {
+        " At least one is under [deny], so a restriction this repository asks \
+         for is NOT being applied."
+    } else {
+        ""
+    };
+    let (subject, verb) = if unknown.len() == 1 {
+        ("a key", "it is")
+    } else {
+        ("keys", "they are")
+    };
+    ui::warn(&format!(
+        "{label} uses {subject} this version of cplt does not understand \
+         ({keys}), and {verb} ignored.{tightening} That is usually a newer cplt \
+         writing the file than the one reading it: upgrade, or check the \
+         spelling if you wrote them by hand."
+    ));
+}
+
 /// `gh_guard.inject_token` does nothing while the guard is off.
 ///
 /// The injection happens inside the `gh_guard.enabled` branch of the wrapper
@@ -2093,6 +2130,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                 };
                 ui::info(&format!("Repo config: .cplt.toml{source_note}"));
             }
+            warn_unknown_repo_config_keys(&loaded.config, ".cplt.toml");
 
             // Determine approved keys
             let approved_keys: Vec<String> = if cli.accept_repo_config {
@@ -2211,6 +2249,10 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                         ));
                     }
                 }
+                warn_unknown_repo_config_keys(
+                    &loaded.config,
+                    &format!("{}/.cplt.toml", root.dir.display()),
+                );
                 resolved.apply_repo_deny(&loaded.config, &loaded.dir);
             }
             // No `.cplt.toml` is the ordinary case and says nothing.

@@ -278,7 +278,14 @@ pub fn now_iso8601() -> String {
 
     format!("{y:04}-{m:02}-{d:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
 }
-
+/// Unknown keys (see [`crate::repo_config::RepoConfig::unknown`]) are NOT
+/// hashed, and that is the behaviour to want. A key this cplt cannot see grants
+/// nothing, so an approval should not be invalidated by its presence — the
+/// repository added something inert as far as this version is concerned. When
+/// the user upgrades and the key becomes known, it starts feeding this hash,
+/// the approval goes stale, and they are asked to review it. Approval tracks
+/// what the file can actually do here, which is the property that matters.
+///
 /// Compute a stable content hash of the proposal section.
 ///
 /// This hash captures the *values* of all proposals so that if the

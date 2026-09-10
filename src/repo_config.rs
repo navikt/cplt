@@ -16,18 +16,34 @@ pub const REPO_CONFIG_FILE: &str = ".cplt.toml";
 
 /// Per-repo configuration parsed from `.cplt.toml`.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct RepoConfig {
     /// Keys that tighten the sandbox — applied automatically without approval.
     pub deny: DenySection,
     /// Keys that relax the sandbox — require user approval.
     pub propose: ProposeSection,
+    /// Top-level keys this version does not know.
+    ///
+    /// Collected rather than refused so a `.cplt.toml` can adopt a key a newer
+    /// cplt understands without breaking every developer who has not upgraded
+    /// yet (#484). Before this, one unknown key failed the whole parse: the
+    /// launch repository lost its `[deny]` too, and a named repository stopped
+    /// the launch outright.
+    ///
+    /// Ignoring is safe in the direction that matters. A `[propose]` key this
+    /// version cannot see grants nothing, so it fails closed — which is also
+    /// what makes a smuggled `preset` a non-event, the case
+    /// `deny_unknown_fields` was there for. A `[deny]` key that is ignored is a
+    /// restriction the author expected and did not get, which is why every
+    /// unknown key is reported rather than dropped in silence.
+    #[serde(flatten)]
+    pub unknown: std::collections::BTreeMap<String, toml::Value>,
 }
 
 /// Restrictive keys — can only tighten the sandbox.
 /// Applied unconditionally (the agent has no incentive to restrict itself).
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct DenySection {
     /// Additional paths to deny access to (beyond the default deny list).
     #[serde(default)]
@@ -35,6 +51,11 @@ pub struct DenySection {
     /// Environment variables to strip (beyond the default blocklist).
     #[serde(default)]
     pub env: Vec<String>,
+    /// See [`RepoConfig::unknown`]. An ignored deny is a restriction its author
+    /// expected, so this is the section whose unknown keys matter most to
+    /// report.
+    #[serde(flatten)]
+    pub unknown: std::collections::BTreeMap<String, toml::Value>,
 }
 
 /// Expansive keys — relax the sandbox. Require user trust approval.
@@ -43,9 +64,11 @@ pub struct DenySection {
 /// here. A preset composes several dangerous permissions at once (docker, tmp
 /// exec, ...) into a single opaque baseline, which would defeat the per-key
 /// trust review. Repos must request individual keys so each is reviewed and
-/// trusted on its own. `deny_unknown_fields` rejects a stray `preset` key.
+/// trusted on its own. A stray `preset` key lands in [`Self::unknown`] and is
+/// ignored, which is the same outcome `deny_unknown_fields` used to produce by
+/// refusing the file — without taking the rest of the config down with it.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct ProposeSection {
     pub allow_localhost_any: Option<bool>,
     pub allow_jvm_attach: Option<bool>,
@@ -86,11 +109,15 @@ pub struct ProposeSection {
     /// Proposed proxy settings.
     #[serde(default)]
     pub proxy: ProposeProxySection,
+    /// See [`RepoConfig::unknown`]. A `[propose]` key this version cannot see
+    /// grants nothing, so ignoring it fails closed.
+    #[serde(flatten)]
+    pub unknown: std::collections::BTreeMap<String, toml::Value>,
 }
 
 /// Proposed allow expansions (paths, ports).
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct ProposeAllowSection {
     #[serde(default)]
     pub read: Vec<String>,
@@ -111,14 +138,20 @@ pub struct ProposeAllowSection {
     /// that was not filtering to begin with.
     #[serde(default)]
     pub domains: Vec<String>,
+    /// See [`RepoConfig::unknown`].
+    #[serde(flatten)]
+    pub unknown: std::collections::BTreeMap<String, toml::Value>,
 }
 
 /// Proposed proxy settings.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct ProposeProxySection {
     #[serde(default)]
     pub allow_private_domains: Vec<String>,
+    /// See [`RepoConfig::unknown`].
+    #[serde(flatten)]
+    pub unknown: std::collections::BTreeMap<String, toml::Value>,
 }
 
 /// How the repo config was loaded — used for user-facing messages.
@@ -493,6 +526,46 @@ fn validate_repo_config(config: &RepoConfig) -> Result<(), String> {
 /// tightening as a pending relaxation. Filtering here fixes all of them at
 /// once. A consumer that wants "every boolean this file sets", such as
 /// `cplt init --merge`, must walk `PROPOSE_BOOLS` itself.
+/// Keys in a `.cplt.toml` that this cplt does not understand, dotted and
+/// sorted.
+///
+/// Reported rather than refused (#484). The two sections fail in opposite
+/// directions and the message says so: an unknown `[propose]` key grants
+/// nothing, while an unknown `[deny]` key is a restriction the author wrote and
+/// this version will not apply.
+#[must_use]
+pub fn unknown_keys(config: &RepoConfig) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |prefix: &str, map: &std::collections::BTreeMap<String, toml::Value>| {
+        for k in map.keys() {
+            out.push(if prefix.is_empty() {
+                k.clone()
+            } else {
+                format!("{prefix}.{k}")
+            });
+        }
+    };
+    push("", &config.unknown);
+    push("deny", &config.deny.unknown);
+    push("propose", &config.propose.unknown);
+    push("propose.allow", &config.propose.allow.unknown);
+    push("propose.proxy", &config.propose.proxy.unknown);
+    out.sort();
+    out
+}
+
+/// Whether any unknown key sits in a section that TIGHTENS the sandbox.
+///
+/// Worth separating because the consequence differs. An ignored `[propose]`
+/// key costs the repository a relaxation it asked for, which is a failure the
+/// user will notice as "my build cannot do X". An ignored `[deny]` key costs a
+/// restriction its author believed was in force, and nothing else in the
+/// session will ever mention it.
+#[must_use]
+pub fn has_unknown_tightening_keys(config: &RepoConfig) -> bool {
+    !config.deny.unknown.is_empty()
+}
+
 pub fn proposed_keys(propose: &ProposeSection) -> Vec<&'static str> {
     let mut keys = Vec::new();
 
@@ -532,6 +605,84 @@ pub fn proposed_keys(propose: &ProposeSection) -> Vec<&'static str> {
 
 #[cfg(test)]
 mod tests {
+
+    /// #484: a `.cplt.toml` must be able to use a key a newer cplt understands
+    /// without breaking every developer who has not upgraded. Before this, one
+    /// unknown key failed the whole parse — the launch repository lost its
+    /// `[deny]` too, and a named repository stopped the launch outright.
+    #[test]
+    fn an_unknown_key_is_collected_and_the_known_ones_still_parse() {
+        let cfg: RepoConfig = toml::from_str(
+            r#"
+future_top_level = 1
+
+[deny]
+paths = ["secrets"]
+future_deny = ["x"]
+
+[propose]
+allow_docker = true
+preset = "full-trust"
+
+[propose.allow]
+ports = [5432]
+future_allow = ["y"]
+
+[propose.proxy]
+allow_private_domains = ["intern.nav.no"]
+future_proxy = true
+"#,
+        )
+        .expect("unknown keys must not fail the parse");
+
+        // The known values are intact — this is what the old behaviour threw away.
+        assert_eq!(cfg.deny.paths, vec!["secrets".to_string()]);
+        assert_eq!(cfg.propose.allow_docker, Some(true));
+        assert_eq!(cfg.propose.allow.ports, vec![5432]);
+        assert_eq!(
+            cfg.propose.proxy.allow_private_domains,
+            vec!["intern.nav.no".to_string()]
+        );
+
+        // Every unknown is reported, dotted by section so the reader can find it.
+        assert_eq!(
+            unknown_keys(&cfg),
+            vec![
+                "deny.future_deny".to_string(),
+                "future_top_level".to_string(),
+                "propose.allow.future_allow".to_string(),
+                "propose.preset".to_string(),
+                "propose.proxy.future_proxy".to_string(),
+            ]
+        );
+        assert!(
+            has_unknown_tightening_keys(&cfg),
+            "a [deny] key that is ignored is the one worth saying loudly"
+        );
+    }
+
+    /// The security property `deny_unknown_fields` was there for: a repository
+    /// must not smuggle a `preset` past the per-key trust review. Ignoring it
+    /// achieves the same outcome as refusing the file, without taking the rest
+    /// of the config down with it.
+    #[test]
+    fn a_smuggled_preset_is_inert_rather_than_fatal() {
+        let cfg: RepoConfig = toml::from_str(
+            "[propose]
+preset = \"full-trust\"\n",
+        )
+        .expect("no longer fatal");
+        assert!(unknown_keys(&cfg).contains(&"propose.preset".to_string()));
+        // Nothing about a preset reached the proposal, so nothing can approve it.
+        assert!(proposed_keys(&cfg.propose).is_empty());
+        assert!(!has_unknown_tightening_keys(&cfg), "preset is not a deny");
+    }
+
+    /// Malformed TOML is not a version-skew problem and must stay an error.
+    #[test]
+    fn a_syntax_error_is_still_an_error() {
+        assert!(toml::from_str::<RepoConfig>("this is = = not toml [[[\n").is_err());
+    }
     use super::*;
 
     #[test]
@@ -633,22 +784,34 @@ allow_private_domains = ["intern.nav.no"]
     }
 
     #[test]
-    fn reject_unknown_top_level_key() {
+    /// Was `reject_unknown_top_level_key`. Unknown keys are collected and
+    /// reported rather than refused (#484), so a `.cplt.toml` can adopt a key a
+    /// newer cplt understands without breaking developers who have not
+    /// upgraded. The assertion moved from "this fails" to "this is visible".
+    fn collect_unknown_top_level_key() {
         let toml = r"
 unknown_key = true
 ";
-        let err = parse_repo_config(toml).unwrap_err();
-        assert!(err.contains("unknown field"), "got: {err}");
+        let config = parse_repo_config(toml).expect("no longer refused");
+        assert_eq!(unknown_keys(&config), vec!["unknown_key".to_string()]);
     }
 
     #[test]
-    fn reject_unknown_propose_key() {
+    /// Was `reject_unknown_propose_key`. An unknown `[propose]` key grants
+    /// nothing, so ignoring it fails closed — and `proposed_keys` must not
+    /// offer it for approval, or the trust prompt would list a permission cplt
+    /// cannot apply.
+    fn collect_unknown_propose_key() {
         let toml = r"
 [propose]
 allow_network = true
 ";
-        let err = parse_repo_config(toml).unwrap_err();
-        assert!(err.contains("unknown field"), "got: {err}");
+        let config = parse_repo_config(toml).expect("no longer refused");
+        assert_eq!(
+            unknown_keys(&config),
+            vec!["propose.allow_network".to_string()]
+        );
+        assert!(proposed_keys(&config.propose).is_empty());
     }
 
     /// A repository proposing `*.example.com` would be approved by every
