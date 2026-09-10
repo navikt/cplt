@@ -2709,21 +2709,8 @@ pub fn gate_git(
     }
 
     // Find the subcommand by skipping global flags.
-    let mut i = 0;
-    let mut subcommand = None;
-    while i < args.len() {
-        let arg = args[i];
-        if GIT_GLOBAL_FLAGS_WITH_VALUE.contains(&arg) {
-            i += 2; // skip flag and its value
-            continue;
-        }
-        if arg.starts_with('-') {
-            i += 1;
-            continue;
-        }
-        subcommand = Some(arg);
-        break;
-    }
+    let i = git_subcommand_index(args).unwrap_or(args.len());
+    let subcommand = args.get(i).copied();
 
     // Defense in depth: block command-line config (`-c` / `--config-env`) that
     // could redirect where a push lands or redefine what a subcommand does.
@@ -3393,6 +3380,26 @@ const GIT_GLOBAL_FLAGS_WITH_VALUE: &[&str] = &[
     "--super-prefix",
     "--config-env",
 ];
+
+/// Index of the git subcommand in `args`, skipping the global flags that
+/// precede it — including those that consume a following space-separated value,
+/// so `git -C /elsewhere push` finds `push` and not `/elsewhere`.
+pub fn git_subcommand_index<S: AsRef<str>>(args: &[S]) -> Option<usize> {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_ref();
+        if GIT_GLOBAL_FLAGS_WITH_VALUE.contains(&arg) {
+            i += 2; // skip flag and its value
+            continue;
+        }
+        if arg.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        return Some(i);
+    }
+    None
+}
 
 /// The `-C` / `--git-dir` / `--work-tree` arguments of a git invocation, in
 /// order, so the guard's own git calls resolve against the repository the

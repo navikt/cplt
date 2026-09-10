@@ -3870,15 +3870,16 @@ fn tracking_flag(args: &[String]) -> bool {
     if !cfg!(target_os = "macos") {
         return false;
     }
-    let sub = args
-        .iter()
-        .find(|a| !a.starts_with('-'))
-        .map(String::as_str)
-        .unwrap_or_default();
-    if !matches!(sub, "push" | "branch" | "checkout" | "switch") {
+    // Skip the global flags, and the values they take: `git -C /elsewhere push`
+    // must find `push`, not the path (#487 review).
+    let Some(i) = cplt::gh_proxy::git_subcommand_index(args) else {
+        return false;
+    };
+    if !matches!(args[i].as_str(), "push" | "branch" | "checkout" | "switch") {
         return false;
     }
-    args.iter().any(|a| {
+    // Only the subcommand's own arguments: a global flag's value is not a flag.
+    args[i + 1..].iter().any(|a| {
         a == "-u"
             || a == "--set-upstream"
             || a == "-t"
@@ -8866,6 +8867,16 @@ mod tests {
             vec!["branch", "--set-upstream-to=origin/main", "feat"],
             vec!["checkout", "-t", "origin/feat"],
             vec!["switch", "--track", "origin/feat"],
+            // Global flags, and the values they take, precede the subcommand.
+            vec!["-C", "/elsewhere", "push", "-u", "origin", "feat"],
+            vec![
+                "-c",
+                "core.pager=cat",
+                "push",
+                "--set-upstream",
+                "origin",
+                "feat",
+            ],
         ] {
             assert_eq!(
                 tracking_flag(&a(&args)),
