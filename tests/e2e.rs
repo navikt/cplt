@@ -4425,7 +4425,7 @@ paths = [
             "an uncommitted proposal must not be granted by the flag:\n{stderr}"
         );
         assert!(
-            stderr.contains("[propose] section of this uncommitted"),
+            stderr.contains("not committed, so the permissions it asks for are ignored"),
             "and the run must say why it was ignored:\n{stderr}"
         );
 

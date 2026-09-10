@@ -115,6 +115,54 @@ pub struct ProposeSection {
     pub unknown: std::collections::BTreeMap<String, toml::Value>,
 }
 
+impl ProposeSection {
+    /// The parts of a `[propose]` section that only ever make the sandbox
+    /// stricter, with every grant removed.
+    ///
+    /// `gh_guard = true` and `git_push_prevention = true` turn a guard **on**.
+    /// They are `[deny]`-shaped: they need no approval, no layer takes them
+    /// back off, and they survive `--no-gh-guard` (see `PROPOSE_BOOLS` and
+    /// `apply_repo_config`). Clearing the whole section for an uncommitted file
+    /// would therefore have been a silent *loosening* — the opposite of what
+    /// #206 is for, and invisible, since `proposed_keys` does not count them.
+    ///
+    /// Everything else is dropped, including the unknown keys: a key this
+    /// version cannot see may be a grant in the next one.
+    #[must_use]
+    pub fn tightenings_only(&self) -> Self {
+        // Destructured exhaustively: a new `[propose]` field breaks this to
+        // compile, which is the moment to decide which side of the line it is
+        // on. Getting that decision by default is how a grant would slip
+        // through an uncommitted file.
+        let Self {
+            allow_localhost_any: _,
+            allow_jvm_attach: _,
+            allow_msbuild: _,
+            gradle_init: _,
+            allow_docker: _,
+            allow_tmp_exec: _,
+            allow_gpg_signing: _,
+            allow_lifecycle_scripts: _,
+            allow_browser: _,
+            allow_env_files: _,
+            gh_guard,
+            git_push_prevention,
+            pass_env: _,
+            allow: _,
+            proxy: _,
+            unknown: _,
+        } = self;
+
+        Self {
+            // Only `Some(true)` is a tightening. `Some(false)` asks for the
+            // guard to be off, which is a grant, and is dropped with the rest.
+            gh_guard: gh_guard.filter(|on| *on),
+            git_push_prevention: git_push_prevention.filter(|on| *on),
+            ..Self::default()
+        }
+    }
+}
+
 /// Proposed allow expansions (paths, ports).
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
@@ -186,6 +234,22 @@ pub struct LoadedRepoConfig {
     pub propose_dropped: bool,
 }
 
+/// Environment variables a `.cplt.toml` may not deny, because cplt sets them
+/// for the agent itself. Prefix `__CPLT_` is refused separately.
+const RESERVED_DENY_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "NODE_EXTRA_CA_CERTS",
+    "REQUESTS_CA_BUNDLE",
+];
+
 /// Read `.cplt.toml` from the project directory.
 ///
 /// Read from git HEAD when the file is committed, so what grants permissions is
@@ -227,15 +291,15 @@ pub fn load_repo_config(project_dir: &Path) -> Result<Option<LoadedRepoConfig>, 
             .map_err(|e| format!("Failed to read {}: {e}", file_path.display()))?;
         let mut config = parse_repo_config(&content)?;
         validate_repo_config(&config)?;
-        // The proposals are removed HERE, at the boundary, rather than refused
-        // at each place that could approve them. Three separate holes were
-        // found one at a time in the old arrangement — a gitignored file, a
-        // non-git directory, and `--accept-repo-config` — because the guard
+        // The widening proposals are removed HERE, at the boundary, rather than
+        // refused at each place that could approve them. Three separate holes
+        // were found one at a time in the old arrangement — a gitignored file,
+        // a non-git directory, and `--accept-repo-config` — because the guard
         // lived in `trust_accept` and every other route around it had to
-        // remember the rule. A `[propose]` section that never leaves this
-        // function cannot be approved by a caller that forgets (#206).
+        // remember the rule. A grant that never leaves this function cannot be
+        // approved by a caller that forgets (#206).
         let propose_dropped = !proposed_keys(&config.propose).is_empty();
-        config.propose = ProposeSection::default();
+        config.propose = config.propose.tightenings_only();
         return Ok(Some(LoadedRepoConfig {
             config,
             source: RepoConfigSource::WorkingTree,
@@ -310,7 +374,8 @@ pub enum RepoConfigState {
     /// Committed, but the working tree copy differs — local edits are not in effect.
     Drifted,
     /// In the working tree only: untracked (possibly gitignored), or staged but
-    /// not committed. Never read by cplt on Linux, and never trustworthy.
+    /// not committed. Read for its `[deny]` on every platform since #206; never
+    /// a source of grants.
     Uncommitted,
     /// Not a git repository at all; `has_file` tells whether a `.cplt.toml` is
     /// sitting there being ignored.
@@ -321,8 +386,8 @@ pub enum RepoConfigState {
 
 /// What an uncommitted `.cplt.toml` actually does. One sentence, both
 /// platforms, since #206 — it used to be two, because the behaviour was two.
-const UNCOMMITTED_EFFECT: &str =
-    "Until then its [deny] keys apply and its [propose] section is ignored entirely.";
+const UNCOMMITTED_EFFECT: &str = "Until then it grants nothing. Its [deny] keys still apply, and so does a [propose] \
+     key that only tightens, such as gh_guard = true.";
 
 impl RepoConfigState {
     /// A user-facing explanation of why cplt is not treating the `.cplt.toml`
@@ -492,6 +557,20 @@ fn validate_repo_config(config: &RepoConfig) -> Result<(), String> {
         if !var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return Err(format!(
                 "deny.env variable {var:?} contains invalid characters (expected [A-Za-z0-9_])"
+            ));
+        }
+        // The deny sweep runs after cplt has set up the child's environment, so
+        // these names strip cplt's own wiring rather than the repository's
+        // secrets: `PATH` carries the guard shims, `__CPLT_TRUST_LOCKED` stops
+        // a nested session editing the trust store, and the proxy variables
+        // point the agent at the proxy. None of them is a secret a repository
+        // could want denied, and since #206 an agent-written uncommitted file
+        // reaches this list on Linux too.
+        if RESERVED_DENY_ENV.contains(&var.as_str()) || var.starts_with("__CPLT_") {
+            return Err(format!(
+                "deny.env may not name {var:?}: it is cplt's own, set for the agent \
+                 after this list is applied, so denying it removes a protection rather \
+                 than a secret."
             ));
         }
     }
@@ -764,6 +843,42 @@ preset = \"full-trust\"\n",
         );
     }
 
+    /// A tighten-only proposal is `[deny]`-shaped: `gh_guard = true` turns a
+    /// guard ON with no approval and survives `--no-gh-guard`. Clearing the
+    /// whole section for an uncommitted file would have switched a guard off
+    /// silently — and invisibly, since `proposed_keys` does not count these.
+    ///
+    /// Read from the registry rather than a second hand-written list, so the
+    /// two cannot drift: every `tighten_only` row must survive, every other
+    /// must not.
+    #[test]
+    fn an_uncommitted_file_keeps_the_proposals_that_only_tighten() {
+        for row in crate::config::PROPOSE_BOOLS {
+            // Set this row's field by round-tripping through TOML: the registry
+            // gives a reader, not a writer, and the key name is the field name.
+            let proposed: ProposeSection =
+                toml::from_str(&format!("{} = true\n", row.key)).expect("parses");
+            assert_eq!(
+                (row.propose)(&proposed),
+                Some(true),
+                "fixture did not set {}",
+                row.key
+            );
+
+            let kept = proposed.tightenings_only();
+            assert_eq!(
+                (row.propose)(&kept),
+                if row.tighten_only { Some(true) } else { None },
+                "{} survived an uncommitted file when it should not have, or the reverse",
+                row.key
+            );
+        }
+
+        // A guard asked OFF is a grant, whatever the row says.
+        let off: ProposeSection = toml::from_str("gh_guard = false\n").expect("parses");
+        assert_eq!(off.tightenings_only(), ProposeSection::default());
+    }
+
     /// The same file, committed, proposes normally — the guard is about where
     /// the bytes came from, not about the keys.
     #[test]
@@ -786,6 +901,24 @@ preset = \"full-trust\"\n",
         assert_eq!(loaded.source, RepoConfigSource::GitHead);
         assert_eq!(proposed_keys(&loaded.config.propose), vec!["allow_docker"]);
         assert!(!loaded.propose_dropped);
+    }
+
+    /// The deny sweep runs after cplt sets up the child's environment, so these
+    /// names would strip cplt's own wiring — the guard shims on `PATH`, the
+    /// trust soft-lock, the proxy variables — rather than a repository's
+    /// secrets. Since #206 an agent-written uncommitted file reaches this list
+    /// on Linux too, which is what made it worth refusing rather than noting.
+    #[test]
+    fn deny_env_may_not_name_cplts_own_variables() {
+        for name in ["PATH", "HOME", "HTTPS_PROXY", "__CPLT_TRUST_LOCKED"] {
+            let cfg = parse_repo_config(&format!("[deny]\nenv = [\"{name}\"]\n")).expect("parses");
+            let err = validate_repo_config(&cfg).expect_err("must be refused");
+            assert!(err.contains(name), "the error must name it: {err}");
+        }
+        // An ordinary secret is still deniable — this must not become a blanket
+        // refusal.
+        let cfg = parse_repo_config("[deny]\nenv = [\"VAULT_TOKEN\"]\n").expect("parses");
+        validate_repo_config(&cfg).expect("a real secret is the point of the key");
     }
 
     /// A `[deny]`-only uncommitted file is not "dropped proposals" — the notice
