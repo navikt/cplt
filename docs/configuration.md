@@ -82,6 +82,9 @@ cplt --repo-dir libs/sykepenger-model exec -- ./gradlew build
 
 # Persisted for this checkout, so every later launch picks it up with no flag
 cplt config set --local sandbox.repo_dirs ~/src/spleis/libs/sykepenger-model
+
+# Or name the repository and let cplt find and verify the checkout
+cplt link navikt/sykepenger-model
 ```
 
 The startup summary then lists what is in scope, and where each entry came
@@ -212,6 +215,60 @@ table.
 `config set` takes `-g`, `-l` and `-r` for `--global`, `--local` and `--repo`.
 The long forms are used throughout this document because they say which file is
 being written.
+
+### Naming a repository instead of a path
+
+`cplt link` takes the repository, finds the checkout, and checks it really is
+that repository before writing the path:
+
+```bash
+cplt link navikt/sykepenger-model
+# [cplt] navikt/sykepenger-model → /Users/you/src/sykepenger-model
+#        (beside this repository, origin verified)
+```
+
+Where it looks, in order: beside the launch repository; then across the forge
+directory, so `nais/unleash` is findable from `navikt/cplt` in a
+`<host>/<org>/<repo>` layout; then the origin of each directory beside the
+launch repository, capped, which finds a clone in a differently-named
+directory. A directory that resolves inside the launch repository is never a
+candidate — that tree is agent-writable, so a checkout planted there would be a
+repository of the agent's choosing wearing the right name. That check runs on
+the resolved path, so a symlinked sibling pointing back into the project does
+not get around it. Note the sibling directory itself is only as trustworthy as
+your machine: one `--project-dir <parent>` launch makes every directory beside
+the repository writable from the sandbox.
+
+Every candidate has its `origin` read by the trusted git **outside** the
+sandbox and must match the name you asked for. A directory called
+`sykepenger-model` that is some other repository is not linked, and a directory
+you name yourself is checked too:
+
+```bash
+cplt link navikt/sykepenger-model ~/elsewhere/model    # verified, not assumed
+```
+
+If two equally good candidates verify, cplt refuses and names both rather than
+picking. A directory named after the repository beats one matched only by its
+origin, and the weaker matches are printed so you can link one of those
+instead. Linked worktrees of the chosen checkout are counted, not listed — they
+share one `.git`, so they all report the same origin.
+
+`cplt link <owner>/<name> --unlink` removes it again, so a root can be dropped
+by the name it was added under. It matches on the recorded directory's origin
+where it can read one, and falls back to the directory's own name where it
+cannot — a deleted directory has no identity to read, and neither does one whose
+`.git/config` was rewritten since. Without that fallback the entries most worth
+removing would be the ones the command refused to find. If more than one entry
+answers, it names them and removes none; `cplt config set --local
+sandbox.repo_dirs <DIR> --unset` is always available.
+
+What this writes is an ordinary `sandbox.repo_dirs` entry, so everything below
+applies to it unchanged. What it adds is the identity check. And note the
+limit: **"origin verified" describes the moment you ran the command.** On Linux
+an agent can rewrite `.git/config` in any tree it was granted, and Landlock
+cannot carve that file out of a writable root — which is why the link is stored
+and re-validated as a path, never re-resolved from the name.
 
 ### Relative paths are resolved when you set them
 
