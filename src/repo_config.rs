@@ -177,14 +177,35 @@ pub struct LoadedRepoConfig {
     /// deny rule for a directory the repo never named — a plausible-looking
     /// absolute rule protecting the wrong place.
     pub dir: PathBuf,
+    /// The file was read from the working tree and had a `[propose]` section,
+    /// which was dropped before this value was returned (#206).
+    ///
+    /// Only for telling the user why nothing was proposed. The proposals are
+    /// already gone from `config` by the time anyone sees this — the boundary
+    /// removes them, so no caller can approve them by forgetting to check.
+    pub propose_dropped: bool,
 }
 
 /// Read `.cplt.toml` from the project directory.
 ///
-/// Prefers reading from git HEAD (committed state) for tamper-proofing.
-/// Falls back to the working tree if git is unavailable or the file isn't tracked
-/// (macOS only — on Linux/Landlock we cannot deny individual file writes within
-/// the project dir, so the fallback is skipped to prevent agent tampering).
+/// Read from git HEAD when the file is committed, so what grants permissions is
+/// what a reviewer saw and what git history records.
+///
+/// An uncommitted file is still read, on every platform, but **only its
+/// `[deny]` survives**: the `[propose]` section is stripped here, at the
+/// boundary. A tightening needs no audit trail — it can only reduce what the
+/// session may do, and dropping it would silently remove a restriction its
+/// author believed was in force. A relaxation needs one, and a commit is it.
+///
+/// This is one rule on both platforms. It used to be two: the fallback was
+/// skipped entirely on Linux, because Landlock cannot deny a write to a single
+/// file inside the project directory, so a sandboxed agent could rewrite
+/// `.cplt.toml` between sessions. The same file was therefore live on macOS and
+/// inert on Linux, and no single honest sentence described both (#206). The
+/// Landlock argument still holds, and it is the reason `[propose]` is dropped
+/// rather than trusted — but it argues for dropping grants, not for discarding
+/// a repository's restrictions on one platform only.
+///
 /// Returns `None` if no `.cplt.toml` exists.
 pub fn load_repo_config(project_dir: &Path) -> Result<Option<LoadedRepoConfig>, String> {
     // Try git HEAD first (tamper-proof source)
@@ -195,28 +216,33 @@ pub fn load_repo_config(project_dir: &Path) -> Result<Option<LoadedRepoConfig>, 
             config,
             source: RepoConfigSource::GitHead,
             dir: canonical(git_toplevel(project_dir).unwrap_or_else(|| project_dir.to_path_buf())),
+            propose_dropped: false,
         }));
     }
 
-    // On Linux, skip working tree fallback — Landlock cannot deny individual
-    // file writes within the project dir, so the agent could tamper with the file.
-    if cfg!(target_os = "linux") {
-        return Ok(None);
-    }
-
-    // Fallback: working tree (macOS only — SBPL denies .cplt.toml writes)
+    // Fallback: the working tree, on every platform, for `[deny]` only.
     let file_path = project_dir.join(REPO_CONFIG_FILE);
     if file_path.is_file() {
         let content = std::fs::read_to_string(&file_path)
             .map_err(|e| format!("Failed to read {}: {e}", file_path.display()))?;
-        let config = parse_repo_config(&content)?;
+        let mut config = parse_repo_config(&content)?;
         validate_repo_config(&config)?;
+        // The proposals are removed HERE, at the boundary, rather than refused
+        // at each place that could approve them. Three separate holes were
+        // found one at a time in the old arrangement — a gitignored file, a
+        // non-git directory, and `--accept-repo-config` — because the guard
+        // lived in `trust_accept` and every other route around it had to
+        // remember the rule. A `[propose]` section that never leaves this
+        // function cannot be approved by a caller that forgets (#206).
+        let propose_dropped = !proposed_keys(&config.propose).is_empty();
+        config.propose = ProposeSection::default();
         return Ok(Some(LoadedRepoConfig {
             config,
             source: RepoConfigSource::WorkingTree,
             // The working-tree fallback reads `<project_dir>/.cplt.toml`
             // literally, so here the project dir *is* the config's directory.
             dir: canonical(project_dir.to_path_buf()),
+            propose_dropped,
         }));
     }
 
@@ -293,17 +319,10 @@ pub enum RepoConfigState {
     Missing,
 }
 
-/// What an uncommitted `.cplt.toml` actually does — which differs by platform,
-/// so the message must too. Linux skips the working-tree fallback entirely; on
-/// macOS the file IS loaded (see [`load_repo_config`]), it just can never be
-/// approved. Claiming it is inert on macOS would be wrong in the permissive
-/// direction.
-const UNCOMMITTED_EFFECT: &str = if cfg!(target_os = "linux") {
-    "Until then cplt ignores it entirely."
-} else {
-    "Until then cplt loads it from the working tree unaudited, so its [deny] keys \
-     apply but its [propose] keys cannot be approved."
-};
+/// What an uncommitted `.cplt.toml` actually does. One sentence, both
+/// platforms, since #206 — it used to be two, because the behaviour was two.
+const UNCOMMITTED_EFFECT: &str =
+    "Until then its [deny] keys apply and its [propose] section is ignored entirely.";
 
 impl RepoConfigState {
     /// A user-facing explanation of why cplt is not treating the `.cplt.toml`
@@ -684,6 +703,112 @@ preset = \"full-trust\"\n",
         assert!(toml::from_str::<RepoConfig>("this is = = not toml [[[\n").is_err());
     }
     use super::*;
+
+    /// Runs a git command in `dir` with a fixed identity, for the loader tests.
+    #[allow(clippy::disallowed_methods)] // test fixture: PATH is the harness's, not an agent's
+    fn git_in(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@e.x")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@e.x")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("git runs")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    /// #206: an uncommitted `.cplt.toml` keeps its restrictions and loses its
+    /// requests, on every platform. The proposals are removed at the loader, so
+    /// no caller downstream — `trust accept`, the launch path,
+    /// `--accept-repo-config` — can approve them by forgetting the rule.
+    #[test]
+    fn an_uncommitted_file_keeps_its_deny_and_loses_its_propose() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().canonicalize().expect("canonical");
+        git_in(&path, &["init", "-q"]);
+        std::fs::write(path.join("seed"), "x").expect("seed");
+        git_in(&path, &["add", "seed"]);
+        git_in(&path, &["commit", "-qm", "init"]);
+        std::fs::write(
+            path.join(REPO_CONFIG_FILE),
+            "[propose]\nallow_docker = true\n\n[deny]\npaths = [\"secrets\"]\n",
+        )
+        .expect("write config");
+
+        let loaded = load_repo_config(&path)
+            .expect("loads")
+            .expect("file is there");
+
+        assert_eq!(loaded.source, RepoConfigSource::WorkingTree);
+        assert_eq!(
+            loaded.config.deny.paths,
+            vec!["secrets"],
+            "a tightening needs no commit: dropping it would remove a restriction \
+             its author believed was in force"
+        );
+        assert_eq!(
+            proposed_keys(&loaded.config.propose),
+            Vec::<&str>::new(),
+            "a relaxation needs an audit trail, and a commit is it"
+        );
+        assert!(
+            loaded.propose_dropped,
+            "the user must be told why nothing was proposed"
+        );
+    }
+
+    /// The same file, committed, proposes normally — the guard is about where
+    /// the bytes came from, not about the keys.
+    #[test]
+    fn the_same_file_committed_proposes_normally() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().canonicalize().expect("canonical");
+        git_in(&path, &["init", "-q"]);
+        std::fs::write(
+            path.join(REPO_CONFIG_FILE),
+            "[propose]\nallow_docker = true\n\n[deny]\npaths = [\"secrets\"]\n",
+        )
+        .expect("write config");
+        git_in(&path, &["add", REPO_CONFIG_FILE]);
+        git_in(&path, &["commit", "-qm", "cfg"]);
+
+        let loaded = load_repo_config(&path)
+            .expect("loads")
+            .expect("file is there");
+
+        assert_eq!(loaded.source, RepoConfigSource::GitHead);
+        assert_eq!(proposed_keys(&loaded.config.propose), vec!["allow_docker"]);
+        assert!(!loaded.propose_dropped);
+    }
+
+    /// A `[deny]`-only uncommitted file is not "dropped proposals" — the notice
+    /// would be noise, and a notice that appears when nothing happened is how
+    /// the real one stops being read.
+    #[test]
+    fn a_deny_only_uncommitted_file_reports_nothing_dropped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().canonicalize().expect("canonical");
+        git_in(&path, &["init", "-q"]);
+        std::fs::write(path.join("seed"), "x").expect("seed");
+        git_in(&path, &["add", "seed"]);
+        git_in(&path, &["commit", "-qm", "init"]);
+        std::fs::write(
+            path.join(REPO_CONFIG_FILE),
+            "[deny]\npaths = [\"secrets\"]\n",
+        )
+        .expect("write config");
+
+        let loaded = load_repo_config(&path).expect("loads").expect("there");
+        assert!(!loaded.propose_dropped);
+        assert_eq!(loaded.config.deny.paths, vec!["secrets"]);
+    }
 
     #[test]
     fn parse_empty_config() {

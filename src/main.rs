@@ -2131,6 +2131,15 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                 ui::info(&format!("Repo config: .cplt.toml{source_note}"));
             }
             warn_unknown_repo_config_keys(&loaded.config, ".cplt.toml");
+            if loaded.propose_dropped && !resolved.quiet {
+                // Said plainly, because the alternative is a session that quietly
+                // lacks a permission the file asks for and a developer who reads
+                // the file and believes it applies.
+                ui::warn(
+                    "The [propose] section of this uncommitted .cplt.toml is ignored. \
+                     Commit the file to propose permissions; its [deny] keys apply either way.",
+                );
+            }
 
             // Determine approved keys
             let approved_keys: Vec<String> = if cli.accept_repo_config {
@@ -7197,7 +7206,15 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
                 .is_some_and(|t| trust::is_key_approved(t, key))
         });
     if proposed.is_empty() {
-        println!("{blue}[cplt]{nc}  No additional permissions requested.");
+        if loaded.propose_dropped {
+            // "No additional permissions requested" would be false here: the
+            // file requests plenty, and none of it reached this command.
+            println!(
+                "{blue}[cplt]{nc}  The [propose] section is ignored while the file is uncommitted."
+            );
+        } else {
+            println!("{blue}[cplt]{nc}  No additional permissions requested.");
+        }
     } else {
         let section_label = if all_approved {
             LABEL_ALLOW_APPROVED
@@ -7292,22 +7309,27 @@ fn trust_accept(
     keys: &[String],
     all: bool,
 ) -> ExitCode {
-    let proposed = repo_config::proposed_keys(&loaded.config.propose);
-
-    if proposed.is_empty() {
-        ui::info("No permissions requested in .cplt.toml, nothing to approve.");
-        return ExitCode::SUCCESS;
-    }
-
     // Guard: approve ONLY the committed config, so every granted permission is
     // auditable in git history and no process can inject permissions and
     // immediately accept them. Stated as "anything but Committed" on purpose —
     // enumerating the bad states is how the not-a-git-repo case slipped through,
     // and `git status` cannot see a gitignored .cplt.toml at all (#183).
+    //
+    // Before the emptiness check, not after: since #206 the loader strips
+    // `[propose]` from an uncommitted file, so asking "is anything proposed"
+    // first would answer "nothing to approve" for a file full of proposals and
+    // never mention the commit.
     let state = repo_config::repo_config_state(project_dir);
     if state != repo_config::RepoConfigState::Committed {
         ui::error(&state.explain().unwrap_or_default());
         return ExitCode::FAILURE;
+    }
+
+    let proposed = repo_config::proposed_keys(&loaded.config.propose);
+
+    if proposed.is_empty() {
+        ui::info("No permissions requested in .cplt.toml, nothing to approve.");
+        return ExitCode::SUCCESS;
     }
 
     let current_hash = trust::proposal_content_hash(&loaded.config.propose);
