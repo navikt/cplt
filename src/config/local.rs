@@ -242,8 +242,17 @@ pub fn is_local_path_key(dotted: &str) -> bool {
 /// the launch would refuse anyway, and saying so here beats writing a file that
 /// fails at the next launch.
 pub fn resolve_path_entry(value: &str, cwd: &Path) -> Result<String, ConfigError> {
-    if value.starts_with('/') || value.starts_with('~') {
+    // `~` and `~/…` only, matching `expand_tilde`: `~someone/repo` is not
+    // expanded anywhere in cplt, so storing it would leave an entry that reads
+    // as anchor-independent and is then treated as relative to wherever cplt
+    // was started (#490 review).
+    if value.starts_with('/') || value == "~" || value.starts_with("~/") {
         return Ok(value.to_string());
+    }
+    if value.starts_with('~') {
+        return Err(ConfigError::Validation(format!(
+            "{value:?} is not a path cplt expands: only ~ and ~/… name your home              directory. Write the path out."
+        )));
     }
     std::fs::canonicalize(cwd.join(value))
         .map(|p| p.to_string_lossy().into_owned())
@@ -264,7 +273,11 @@ pub fn resolve_path_entry(value: &str, cwd: &Path) -> Result<String, ConfigError
 fn reject_relative_paths(config: &Config, display: &str) -> Result<(), ConfigError> {
     for (key, values) in path_valued(config) {
         for value in values {
-            if !(value.starts_with('/') || value.starts_with('~')) {
+            // `~someone/repo` is not expanded by `expand_tilde`, so it would
+            // reach the launch as a relative path anchored to the working
+            // directory — the exact thing this rule exists to prevent (#490
+            // review). It is refused here rather than silently treated as one.
+            if !(value.starts_with('/') || *value == "~" || value.starts_with("~/")) {
                 return Err(ConfigError::Validation(format!(
                     "{display}: {key} entry {value:?} is relative — \
                      local config accepts absolute and ~/ paths only"
@@ -812,6 +825,25 @@ mod tests {
         let cwd = Path::new("/nowhere");
         assert_eq!(resolve_path_entry("/opt/src", cwd).unwrap(), "/opt/src");
         assert_eq!(resolve_path_entry("~/code/x", cwd).unwrap(), "~/code/x");
+    }
+
+    /// `expand_tilde` only knows `~` and `~/…`. Accepting `~someone/repo` as a
+    /// tilde path would store an entry that reads as anchor-independent and is
+    /// then handled as relative to wherever cplt was started — the invariant
+    /// this layer exists to hold.
+    #[test]
+    fn a_tilde_cplt_does_not_expand_is_not_a_path() {
+        let cwd = Path::new("/nowhere");
+        assert_eq!(resolve_path_entry("~", cwd).unwrap(), "~");
+        assert_eq!(resolve_path_entry("~/x", cwd).unwrap(), "~/x");
+        for bad in ["~someone/repo", "~root"] {
+            assert!(resolve_path_entry(bad, cwd).is_err(), "{bad} must not pass");
+            let cfg = Config::parse(&format!("[sandbox]\nrepo_dirs = [{bad:?}]\n")).unwrap();
+            assert!(
+                reject_relative_paths(&cfg, "local config").is_err(),
+                "{bad} must not load either"
+            );
+        }
     }
 
     /// Saying so at write time beats writing a file the next launch refuses.
