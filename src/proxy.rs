@@ -525,6 +525,9 @@ pub struct ProxyOptions {
     /// Initial allowed domains from CLI/config (used for startup validation).
     /// After startup, the file is the source of truth for dynamic reload.
     pub allowed_domains_initial: Vec<String>,
+    /// `allow.domains` plus trust-approved `[propose.allow] domains` (#482).
+    /// Widens an allowlist already in force; never activates one.
+    pub extra_allowed_domains: Vec<String>,
     /// Agent built-in default allowlist (issue #52). Empty = feature off
     /// (unchanged allow-all). When set, it is merged with `allowed_domains_file`
     /// to form the effective, fail-closed allowlist. Frozen at startup.
@@ -575,6 +578,7 @@ pub fn start(opts: ProxyOptions) -> Result<ProxyHandle, String> {
             subscription_blocklist: opts.subscription_blocklist,
             allowed_domains_file: opts.allowed_domains_file,
             allowed_domains_initial: opts.allowed_domains_initial,
+            extra_allowed_domains: opts.extra_allowed_domains,
             default_allowlist: opts.default_allowlist,
             cli_private_domains: opts.cli_private_domains,
             config_private_domains: opts.config_private_domains,
@@ -2378,6 +2382,7 @@ mod tests {
             allow_localhost_any: false,
             allowed_domains_file,
             allowed_domains_initial: Vec::new(),
+            extra_allowed_domains: Vec::new(),
             default_allowlist,
             subscription_blocklist: Vec::new(),
             cli_private_domains: Vec::new(),
@@ -2654,6 +2659,7 @@ mod tests {
             allow_localhost_any: false,
             allowed_domains_file: None,
             allowed_domains_initial: Vec::new(),
+            extra_allowed_domains: Vec::new(),
             default_allowlist: copilot_defaults(),
             subscription_blocklist: Vec::new(),
             cli_private_domains: Vec::new(),
@@ -2740,6 +2746,7 @@ mod tests {
             allow_localhost_any: false,
             allowed_domains_file: None,
             allowed_domains_initial: Vec::new(),
+            extra_allowed_domains: Vec::new(),
             default_allowlist: Vec::new(),
             subscription_blocklist: Vec::new(),
             cli_private_domains: Vec::new(),
@@ -2868,6 +2875,7 @@ mod tests {
             allow_localhost_any,
             allowed_domains_file: None,
             allowed_domains_initial: Vec::new(),
+            extra_allowed_domains: Vec::new(),
             default_allowlist: Vec::new(),
             subscription_blocklist: Vec::new(),
             cli_private_domains: Vec::new(),
@@ -3093,6 +3101,7 @@ mod tests {
             allow_localhost_any: false,
             allowed_domains_file: None,
             allowed_domains_initial: Vec::new(),
+            extra_allowed_domains: Vec::new(),
             default_allowlist: Vec::new(),
             subscription_blocklist: Vec::new(),
             cli_private_domains: Vec::new(), // NOT allow-listed
@@ -3154,6 +3163,7 @@ mod tests {
             allow_localhost_any: false,
             allowed_domains_file: None,
             allowed_domains_initial: Vec::new(),
+            extra_allowed_domains: Vec::new(),
             default_allowlist: Vec::new(),
             subscription_blocklist: Vec::new(),
             cli_private_domains: vec!["corp.internal".to_string()], // allow-listed
@@ -3606,6 +3616,7 @@ mod tests {
             allow_localhost_any: false,
             allowed_domains_file: None,
             allowed_domains_initial: Vec::new(),
+            extra_allowed_domains: Vec::new(),
             default_allowlist: Vec::new(),
             subscription_blocklist: Vec::new(),
             cli_private_domains: Vec::new(),
@@ -3817,6 +3828,7 @@ mod tests {
             allow_localhost_any: false,
             allowed_domains_file,
             allowed_domains_initial: Vec::new(),
+            extra_allowed_domains: Vec::new(),
             default_allowlist: Vec::new(),
             subscription_blocklist: Vec::new(),
             cli_private_domains,
@@ -4248,6 +4260,7 @@ mod tests {
             allow_localhost_any: false,
             allowed_domains_file: None,
             allowed_domains_initial: Vec::new(),
+            extra_allowed_domains: Vec::new(),
             default_allowlist: Vec::new(),
             subscription_blocklist: Vec::new(),
             cli_private_domains,

@@ -145,6 +145,17 @@ pub struct PolicySpec {
     /// The agent's built-in fail-closed allowlist (#52), frozen at startup.
     /// Empty = feature off (unchanged allow-all).
     pub default_allowlist: Vec<String>,
+    /// `allow.domains` from config, plus any `[propose.allow] domains` the user
+    /// approved for this repository (#482).
+    ///
+    /// Merged into the allowlist's contents and deliberately NOT into
+    /// [`DomainPolicy::allowlist_active`]. Every other `allow.*` key adds a
+    /// permission without taking one away — `allow.read` does not mean "only
+    /// read this" — so `allow.domains` must not be the one that silently
+    /// switches a session to fail-closed the first time someone adds a host to
+    /// it. It widens an allowlist that is already in force, and does nothing
+    /// when none is.
+    pub extra_allowed_domains: Vec<String>,
     /// Private domains from `--allow-private-domain`. Read once from argv.
     pub cli_private_domains: Vec<String>,
     /// Private domains that came from `config_file`'s own
@@ -210,6 +221,7 @@ impl DomainPolicy {
         // The intent bit: did anything ask for a domain allowlist this run?
         // Captured from the *sources*, before any of them is read, so an
         // allowlist that parses to zero domains still counts as active.
+        // `extra_allowed_domains` is absent here on purpose: see its docs.
         let allowlist_active = !spec.default_allowlist.is_empty()
             || spec.allowed_domains_file.is_some()
             || !spec.allowed_domains_initial.is_empty();
@@ -255,7 +267,10 @@ impl DomainPolicy {
                 now,
             ),
             allowed: DomainList::new(
-                spec.default_allowlist,
+                spec.default_allowlist
+                    .into_iter()
+                    .chain(spec.extra_allowed_domains)
+                    .collect(),
                 spec.allowed_domains_file,
                 parse_lines_file,
                 allowlist_initial,

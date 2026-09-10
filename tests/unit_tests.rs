@@ -1497,6 +1497,56 @@ fn the_dependency_store_carve_out_is_absent_when_env_files_are_allowed() {
     );
 }
 
+/// #482: `allow.domains` widens an allowlist that is in force and must never
+/// turn one on. Every other `allow.*` key adds a permission without removing
+/// one — `allow.read` does not mean "only read this" — so this must not be the
+/// key that silently switches a session to fail-closed the first time someone
+/// adds a host.
+#[test]
+fn allow_domains_widens_an_active_allowlist_and_never_activates_one() {
+    use cplt::proxy::{DomainPolicy, PolicySpec};
+    use std::time::Instant;
+
+    let spec = |default_allowlist: Vec<String>, extra: Vec<String>| PolicySpec {
+        blocked_file: PathBuf::from("/nonexistent-blocklist"),
+        subscription_blocklist: Vec::new(),
+        allowed_domains_file: None,
+        allowed_domains_initial: Vec::new(),
+        default_allowlist,
+        extra_allowed_domains: extra,
+        cli_private_domains: Vec::new(),
+        config_private_domains: Vec::new(),
+        repo_private_domains: Vec::new(),
+        config_file: None,
+        allowed_ports: Vec::new(),
+        allow_localhost_ports: Vec::new(),
+        allow_localhost_any: false,
+    };
+    let now = Instant::now();
+
+    // Alone: contents carried, allowlist NOT switched on.
+    let policy = DomainPolicy::build(spec(Vec::new(), vec!["cloud.nais.io".into()]), now)
+        .expect("valid spec");
+    assert!(
+        !policy.allowlist_active,
+        "adding a domain must not put the session into fail-closed mode"
+    );
+
+    // With an allowlist in force: merged in alongside it.
+    let policy = DomainPolicy::build(
+        spec(vec!["github.com".into()], vec!["cloud.nais.io".into()]),
+        now,
+    )
+    .expect("valid spec");
+    assert!(policy.allowlist_active);
+    let allowed = policy.allowed_domains(now);
+    assert!(
+        allowed.contains(&"github.com".to_string())
+            && allowed.contains(&"cloud.nais.io".to_string()),
+        "both halves must be reachable: {allowed:?}"
+    );
+}
+
 // ============================================================
 // Named repositories (--repo-dir): project-grade roots (#344)
 // ============================================================
@@ -7667,6 +7717,7 @@ exec = []
 socket = []
 ports = []
 localhost = []
+domains = []
 
 [deny]
 paths = []

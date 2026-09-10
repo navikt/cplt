@@ -857,6 +857,7 @@ mod tests {
             deny_paths: Vec::new(),
             allow_ports: Vec::new(),
             allow_localhost: Vec::new(),
+            allow_domains: Vec::new(),
             allow_localhost_any: false,
             allow_env_files: false,
             no_validate: false,

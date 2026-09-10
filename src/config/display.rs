@@ -364,6 +364,24 @@ pub fn display_config(loaded: Option<&LoadedConfig>, local: Option<&LoadedConfig
             c.allow.localhost
         );
     }
+    if c.allow.domains.is_empty() {
+        println!("{blue}[cplt]{nc}    domains          = {dim}[]{nc}");
+    } else {
+        // Says when the key is inert. It widens an allowlist already in force
+        // and turns none on, so with no allowlist active these entries change
+        // nothing — and a list sitting there looking effective is exactly the
+        // kind of thing that sends someone debugging the wrong layer.
+        let inert =
+            if c.proxy.default_allowlist.unwrap_or(false) || c.proxy.allowed_domains.is_some() {
+                String::new()
+            } else {
+                format!(" {dim}(no allowlist in force, so these add nothing yet){nc}")
+            };
+        println!(
+            "{blue}[cplt]{nc}    domains          = {:?}{inert}",
+            c.allow.domains
+        );
+    }
     println!();
 
     // [deny]

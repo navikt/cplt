@@ -81,6 +81,15 @@ fn parse_value_for_key(
 }
 
 /// Parse a single element value for appending to an array.
+/// Keys whose elements are hostnames, where a `*` is a mistake rather than a
+/// path component.
+fn is_domain_key(key_info: &ConfigKeyInfo) -> bool {
+    matches!(
+        (key_info.section, key_info.key),
+        ("allow", "domains") | ("proxy", "allow_private_domains") | ("proxy", "upstream_no_proxy")
+    )
+}
+
 fn parse_element_for_key(
     key_info: &ConfigKeyInfo,
     value: &str,
@@ -101,6 +110,28 @@ fn parse_element_for_key(
                     "value contains a comma. Add one value at a time:\n  \
                      cplt config set {}.{} <VALUE>",
                     key_info.section, key_info.key
+                )));
+            }
+            // A `*` in a domain matches nothing: matching is exact host plus
+            // subdomains, with no glob syntax (#481). For a file, cplt warns
+            // at launch; for a config array it can be refused at the point of
+            // typing, which is better — the user is right there, and the
+            // correction is mechanical.
+            if is_domain_key(key_info)
+                && let Some(bare) = value.strip_prefix("*.")
+            {
+                return Err(ConfigError::Validation(format!(
+                    "{value} is not a pattern cplt understands. Matching is exact host \
+                     plus subdomains, so `{bare}` already covers `{bare}` and everything \
+                     under it:\n  cplt config set {}.{} {bare}",
+                    key_info.section, key_info.key
+                )));
+            }
+            if is_domain_key(key_info) && value.contains('*') {
+                return Err(ConfigError::Validation(format!(
+                    "{value} contains a wildcard, which matches no host. Matching is exact \
+                     host plus subdomains — name the domain itself and every subdomain is \
+                     covered."
                 )));
             }
             // Expand ~ so stored values are always absolute paths.

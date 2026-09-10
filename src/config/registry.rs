@@ -173,6 +173,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "allow",
+        key: "domains",
+        value_type: ConfigValueType::StrArray,
+        dangerous: false,
+        default_display: "[]",
+        description: "Domains to add to the proxy allowlist. Adds to an allowlist already in force; does not turn one on.",
+    },
+    ConfigKeyInfo {
+        section: "allow",
         key: "ports",
         value_type: ConfigValueType::U16Array,
         dangerous: false,

@@ -2903,6 +2903,7 @@ fn start_proxy_if_enabled(
         allow_localhost_any: resolved.allow_localhost_any,
         allowed_domains_file,
         allowed_domains_initial: Vec::new(),
+        extra_allowed_domains: resolved.allow_domains.clone(),
         default_allowlist,
         cli_private_domains: cli.allow_private_domains.clone(),
         // Reloadable portion: what the config file itself supplied. The two

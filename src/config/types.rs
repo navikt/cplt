@@ -566,6 +566,13 @@ pub struct AllowConfig {
     pub ports: Vec<u16>,
     /// Localhost ports to allow (localhost is blocked by default).
     pub localhost: Vec<u16>,
+    /// Domains to add to the proxy allowlist (#482).
+    ///
+    /// Widens an allowlist that is already in force and does **not** turn one
+    /// on. Every other `allow.*` key adds a permission without removing one —
+    /// `allow.read` does not mean "only read this" — so this must not be the
+    /// key that silently switches a session to fail-closed.
+    pub domains: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -891,6 +898,10 @@ pub struct Resolved {
     pub deny_paths: Vec<PathBuf>,
     pub allow_ports: Vec<u16>,
     pub allow_localhost: Vec<u16>,
+    /// Domains added to the proxy allowlist by `allow.domains` and by any
+    /// trust-approved `[propose.allow] domains`. Widens an active allowlist;
+    /// never activates one.
+    pub allow_domains: Vec<String>,
     pub allow_localhost_any: bool,
     pub allow_env_files: bool,
     pub no_validate: bool,
