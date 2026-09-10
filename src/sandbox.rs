@@ -760,8 +760,16 @@ fn git_roots<'a>(
 /// Paths bind-mounted read-write onto themselves so they become mountpoints and
 /// can no longer be renamed or removed. See `bubblewrap::rename_pin_paths`.
 #[cfg(target_os = "linux")]
-fn pin_paths(config: &SandboxConfig, extra_git_dirs: &[PathBuf]) -> Vec<PathBuf> {
-    let (write_roots, git_dirs) = git_roots(config, extra_git_dirs);
+fn pin_paths(
+    config: &SandboxConfig,
+    extra_git_dirs: &[PathBuf],
+    nested_repos: &[PathBuf],
+) -> Vec<PathBuf> {
+    let (mut write_roots, git_dirs) = git_roots(config, extra_git_dirs);
+    // A nested repository is pinned exactly as a root is. Without this the
+    // read-only binds on its `.git/hooks` and `.claude/settings.json` are
+    // walk-aroundable by `mv .git g2 && mkdir .git`.
+    write_roots.extend(nested_repos.iter().map(PathBuf::as_path));
     let mut pins = bubblewrap::rename_pin_paths(&write_roots, &git_dirs);
     // GHSA-8qmv-wxp3-526v, Linux half. A read-only bind pins a path's content,
     // not its name: `~/.cache/copilot` sits inside the writable `~/.cache`
@@ -795,7 +803,11 @@ fn pin_paths(config: &SandboxConfig, extra_git_dirs: &[PathBuf]) -> Vec<PathBuf>
 }
 
 #[cfg(target_os = "linux")]
-fn ro_protect_paths(config: &SandboxConfig, extra_git_dirs: &[PathBuf]) -> Vec<PathBuf> {
+fn ro_protect_paths(
+    config: &SandboxConfig,
+    extra_git_dirs: &[PathBuf],
+    nested_repos: &[PathBuf],
+) -> Vec<PathBuf> {
     // Finding 1: Landlock cannot deny subpaths inside the writable project tree,
     // so the project's .git/hooks (and other git-persistence files) stay
     // writable — a persistence-escape vector. When Bubblewrap is active we
@@ -805,7 +817,10 @@ fn ro_protect_paths(config: &SandboxConfig, extra_git_dirs: &[PathBuf]) -> Vec<P
     //
     // #212: every writable granted path is a candidate too — a sibling repo's
     // .git/hooks was fully writable before, and hooks run unsandboxed.
-    let (write_roots, git_dirs) = git_roots(config, extra_git_dirs);
+    let (mut write_roots, git_dirs) = git_roots(config, extra_git_dirs);
+    // Nested repositories are ordinary roots to this table: macOS matches them
+    // with an any-depth regex, and bubblewrap needs the paths named.
+    write_roots.extend(nested_repos.iter().map(PathBuf::as_path));
     let mut ro_protect = bubblewrap::git_persistence_paths(&write_roots, &git_dirs);
 
     // #237: same class, different tree — the agent's own config dir is granted
@@ -949,8 +964,17 @@ fn prepare_impl(
     let mut policy = landlock_mod::generate_policy(config);
     let profile_text = landlock_mod::describe_policy(&policy);
 
-    let ro_protect = ro_protect_paths(config, extra_git_dirs);
-    let pins = pin_paths(config, extra_git_dirs);
+    // Repositories nested inside a writable root, found once and given to BOTH
+    // path sets. The leaf binds and the rename pins have to see the same list:
+    // a read-only bind pins content, not the name, so a nested `.git` that is
+    // bound but not pinned can be renamed aside and recreated writable —
+    // GHSA-39xf-9j26-f82m one directory down (#498 review).
+    let (nested_repos, nested_capped) = {
+        let (write_roots, _) = git_roots(config, extra_git_dirs);
+        bubblewrap::nested_repo_roots(&write_roots)
+    };
+    let ro_protect = ro_protect_paths(config, extra_git_dirs, &nested_repos);
+    let pins = pin_paths(config, extra_git_dirs, &nested_repos);
 
     // Deny-path masks: Landlock cannot deny subpaths within allowed
     // directories, but Bubblewrap can shadow them at the mount level — denied
@@ -991,6 +1015,21 @@ fn prepare_impl(
         },
         &deny_masks,
     )?;
+
+    // Said only where it is true: without bubblewrap none of these binds exist,
+    // so warning about a bounded scan there would imply a protection the host
+    // does not have. With bubblewrap, a truncated scan means a `.git/hooks`
+    // deeper in that tree really did stay writable, and that is worth a line.
+    if nested_capped && bwrap_wrapper.is_some() {
+        ui::warn(&format!(
+            "Stopped looking for repositories nested inside the writable roots after {} \
+             directories, so a repository deeper in one of them gets none of the \
+             protections a nested repository should have: .git/hooks, .cplt.toml, \
+             .github/hooks and the agent auto-exec paths all stay writable there. Name the \
+             repositories you work in with --repo-dir, or grant a narrower tree.",
+            bubblewrap::NESTED_SCAN_LIMIT
+        ));
+    }
 
     // `AgentDir::create_dirs` (Pi's mkdir-based trust lock) needs
     // MakeDir|RemoveDir on the parent, and Landlock cannot scope those to a
@@ -1332,6 +1371,37 @@ mod tests {
 
     /// The ro_protect set the bwrap overlay consumes, end to end.
     ///
+    /// A nested repository must reach BOTH assembled sets — the read-only binds
+    /// and the rename pins. A bind without a pin is walk-aroundable: a
+    /// read-only bind pins content, not the name, so `mv .git g2 && mkdir .git`
+    /// gives back a writable `.git/hooks` under a name no bind covers.
+    ///
+    /// Asserted on the assembled sets, not on the helpers: the first version of
+    /// this feature had correct helpers and passed the nested list to only one
+    /// of them (#498 review), and a test that calls `rename_pin_paths` directly
+    /// cannot see that — mine did not, which is why this one exists here.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_nested_repository_reaches_both_the_binds_and_the_pins() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let nested = repo.path().join("libs/model");
+        std::fs::create_dir_all(nested.join(".git/hooks")).expect("nested hooks");
+        let home = Path::new("/home/test");
+        let config = test_config(home, &[]);
+
+        let binds = super::ro_protect_paths(&config, &[], std::slice::from_ref(&nested));
+        assert!(
+            binds.contains(&nested.join(".git/hooks")),
+            "nested hooks must be bound read-only: {binds:?}"
+        );
+
+        let pins = super::pin_paths(&config, &[], std::slice::from_ref(&nested));
+        assert!(
+            pins.contains(&nested.join(".git")),
+            "and its .git must be a mountpoint, or the bind can be renamed around: {pins:?}"
+        );
+    }
+
     /// The helpers each had a test; the wiring that assembles them did not, and
     /// a mutation deleting the Copilot line from the caller passed Linux CI
     /// green. This asserts the assembled set, which is what the overlay
@@ -1342,7 +1412,7 @@ mod tests {
         let home = Path::new("/home/test");
         let mut config = test_config(home, &[]);
         config.agent = Agent::Copilot;
-        let paths = super::ro_protect_paths(&config, &[]);
+        let paths = super::ro_protect_paths(&config, &[], &[]);
         for expected in [home.join(".copilot/pkg"), home.join(".cache/copilot/pkg")] {
             assert!(
                 paths.contains(&expected),
@@ -1352,7 +1422,7 @@ mod tests {
         }
 
         config.agent = Agent::Claude;
-        let paths = super::ro_protect_paths(&config, &[]);
+        let paths = super::ro_protect_paths(&config, &[], &[]);
         assert!(
             !paths.iter().any(|p| p.starts_with(home.join(".copilot"))),
             "no Copilot package binds for a non-Copilot agent, got {paths:?}"
@@ -1381,7 +1451,7 @@ mod tests {
                 config.agent = agent;
                 config.agent_dirs = &agent_dirs;
 
-                let paths = super::ro_protect_paths(&config, &[]);
+                let paths = super::ro_protect_paths(&config, &[], &[]);
                 for sub in agent.host_persistence_denies() {
                     let expected = dir.join(sub);
                     assert!(
@@ -1410,7 +1480,7 @@ mod tests {
         config.agent = Agent::OpenCode;
         config.agent_dirs = &agent_dirs;
 
-        let paths = super::ro_protect_paths(&config, &[]);
+        let paths = super::ro_protect_paths(&config, &[], &[]);
         assert!(
             paths.contains(&home.join(".cache/opencode/bin")),
             "the managed-binary dir must be re-bound read-only, got {paths:?}"
