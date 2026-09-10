@@ -5754,6 +5754,47 @@ paths = [
         );
     }
 
+    /// The probes are POSIX shell, so they must run under `/bin/sh` and never
+    /// under `$SHELL`. A fish user got `fish: Unsupported use of '='` for the
+    /// write probe, which exits non-zero, so `check` reported a healthy sandbox
+    /// as NOT ENFORCING (#488).
+    ///
+    /// `$SHELL` here is a stub that fails whatever it is handed — the same
+    /// shape as fish refusing a POSIX assignment, without needing fish
+    /// installed. Falsified by restoring `Agent::Shell.resolve_binary()`: the
+    /// verdict flips to NOT ENFORCING.
+    #[test]
+    fn e2e_check_probes_ignore_a_hostile_user_shell() {
+        require_sandbox!();
+        let proj = check_project();
+        let stub = proj.path().join("not-a-posix-shell");
+        std::fs::write(&stub, "#!/bin/sh\nexit 127\n").expect("write stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+
+        let output = cplt_cmd()
+            .args(["--agent", "shell"])
+            .env("SHELL", &stub)
+            .arg("--project-dir")
+            .arg(proj.path())
+            .arg("check")
+            .output()
+            .expect("cplt check should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "an enforcing battery exits 0:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("ENFORCING") && !stdout.contains("NOT ENFORCING"),
+            "a user's login shell must not decide the verdict:\n{stdout}"
+        );
+    }
+
     #[test]
     fn e2e_check_battery_json_shape() {
         require_sandbox!();
