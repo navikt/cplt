@@ -2539,8 +2539,12 @@ if [ -z "${HTTPS_PROXY:-}" ]; then echo "RESULT:no_https_proxy:OK"; else echo "R
         let project = TempProject::scaffold_node();
         let port = next_proxy_port();
 
-        // Create an allowlist with only one domain
-        let allowlist_path = project.path().join("allowed-domains.txt");
+        // Create an allowlist with only one domain, OUTSIDE the project: a list
+        // file inside a tree the session can write is refused at launch, because
+        // the proxy re-reads it every few seconds and the agent could edit its
+        // own egress rules (#426).
+        let list_dir = tempfile::tempdir().expect("tempdir");
+        let allowlist_path = list_dir.path().join("allowed-domains.txt");
         std::fs::write(&allowlist_path, "only-this.example.com\n").unwrap();
 
         // Try to CONNECT to a domain NOT in the allowlist

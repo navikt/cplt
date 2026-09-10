@@ -2840,6 +2840,7 @@ fn start_proxy_if_enabled(
     cli: &Cli,
     config_path: Option<&PathBuf>,
     active_agent: agent::Agent,
+    project_dir: &Path,
 ) -> anyhow::Result<Option<proxy::ProxyHandle>> {
     // Proxy-forced (#53): the proxy is mandatory. `with_proxy` defaults to true,
     // so the only way it is false here is an explicit disable (--no-proxy or
@@ -2936,6 +2937,29 @@ fn start_proxy_if_enabled(
     } else {
         Vec::new()
     };
+
+    // An allowlist the agent can edit is not an allowlist (#426). Both list
+    // files are re-read every few seconds by design, so one inside the project
+    // directory or an `allow.write` grant lets the sandboxed process change its
+    // own egress rules and see the change take effect within the TTL. Refused
+    // at launch, naming the file and the grant: the same shape as `allow.exec`
+    // refusing a tree that overlaps a writable one, and the same reason.
+    for (key, file) in [
+        ("proxy.allowed_domains", allowed_domains_file.as_ref()),
+        ("proxy.blocked_domains", Some(&blocked_file)),
+    ] {
+        let Some(file) = file else { continue };
+        if let Some(root) = agent_writable_root(file, project_dir, &resolved.allow_write) {
+            bail!(
+                "{key} names {}, which is inside {} — a tree this session can write.\n  \
+                 The proxy re-reads that file every few seconds, so the agent could edit its \
+                 own egress rules and have them take effect mid-session. Move the file outside \
+                 the writable trees (for example ~/.config/cplt/), or drop the grant.",
+                file.display(),
+                root.display()
+            );
+        }
+    }
 
     // Validate domain allowlist file at startup (fail-closed: abort if
     // unreadable) and capture the user-configured domains for the policy report.
@@ -4426,7 +4450,13 @@ fn assemble_sandbox(
 
     // Start proxy (handle returned for RAII ownership). Before the profile is
     // built, so the actual ephemeral port can be embedded in it.
-    let proxy_handle = start_proxy_if_enabled(resolved, cli, config_path, active_agent)?;
+    let proxy_handle = start_proxy_if_enabled(
+        resolved,
+        cli,
+        config_path,
+        active_agent,
+        probe.project_dir.as_path(),
+    )?;
     let proxy_port_for_profile = proxy_handle.as_ref().map(|h| h.port);
 
     // #242: drop the whole-Keychain grant only when the agent can authenticate
@@ -7187,6 +7217,27 @@ fn run_init_global_command(write: bool, force: bool, quiet: bool) -> ExitCode {
 /// every launch, it is refused if it stops being a git toplevel or acquires a
 /// symlinked leaf, and `cplt config set --local sandbox.repo_dirs` manages the
 /// same list. What this command adds is the identity check.
+/// The writable tree `file` sits inside, if any.
+///
+/// Compared on canonicalized paths, because the grant and the configured file
+/// can spell the same directory differently — and a symlinked spelling that
+/// slipped past would be a bypass rather than a cosmetic miss. A path that
+/// cannot be canonicalized (it may not exist yet) falls back to its lexical
+/// form, which is what the launch will use for it anyway.
+fn agent_writable_root(
+    file: &Path,
+    project_dir: &Path,
+    allow_write: &[PathBuf],
+) -> Option<PathBuf> {
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let file = real(file);
+    std::iter::once(project_dir.to_path_buf())
+        .chain(allow_write.iter().cloned())
+        .map(|root| real(&root))
+        .find(|root| file.starts_with(root))
+}
+
+/// Where a candidate came from, for the line the user is shown.
 fn run_link_command(repo: &str, dir: Option<&Path>, unlink: bool) -> ExitCode {
     let Some(project_dir) = detect_project_root() else {
         ui::error(NOT_A_REPOSITORY);
@@ -8350,6 +8401,53 @@ fn start_denial_stream() -> Option<std::process::Child> {
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod tests {
+    /// #426: an allowlist the agent can edit is not an allowlist. Both proxy
+    /// list files are re-read every few seconds by design, so one inside the
+    /// project directory or an `allow.write` grant lets the sandboxed process
+    /// rewrite its own egress rules mid-session.
+    ///
+    /// Canonicalized on both sides, because the grant and the configured path
+    /// can spell the same directory differently — and a spelling that slipped
+    /// past would be the bypass itself, not a cosmetic miss.
+    #[test]
+    fn a_proxy_list_file_in_a_writable_tree_is_found() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project = tmp.path().join("project");
+        let grant = tmp.path().join("granted");
+        let elsewhere = tmp.path().join("elsewhere");
+        for d in [&project, &grant, &elsewhere] {
+            std::fs::create_dir_all(d).expect("mkdir");
+        }
+        let in_project = project.join("allow.txt");
+        let in_grant = grant.join("allow.txt");
+        let outside = elsewhere.join("allow.txt");
+        for f in [&in_project, &in_grant, &outside] {
+            std::fs::write(f, "example.com\n").expect("write");
+        }
+        let grants = vec![grant.clone()];
+
+        assert!(
+            super::agent_writable_root(&in_project, &project, &[]).is_some(),
+            "the project directory is writable by the session"
+        );
+        assert!(
+            super::agent_writable_root(&in_grant, &project, &grants).is_some(),
+            "so is an allow.write grant"
+        );
+        assert!(
+            super::agent_writable_root(&outside, &project, &grants).is_none(),
+            "a file outside every writable tree is the supported shape and must not be refused"
+        );
+
+        // The same file reached through a symlinked spelling of the grant.
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&grant, &link).expect("symlink");
+        assert!(
+            super::agent_writable_root(&link.join("allow.txt"), &project, &grants).is_some(),
+            "a symlinked spelling of a writable tree is still that tree"
+        );
+    }
+
     /// The record of what an approval linked is the only way `trust revoke
     /// repos` can find those roots again — the launch reads `sandbox.repo_dirs`
     /// and never consults the trust store. Three ordinary events used to drop a
