@@ -1725,10 +1725,19 @@ if cat secrets/k.txt >/dev/null 2>&1; then echo "RESULT:launch_secret:OK"; else 
     }
 
     /// A `.cplt.toml` that exists and cannot be parsed means a restriction its
-    /// owner wrote is missing. That must stop the launch, not become a warning
-    /// the operator scrolls past on the way to a session that runs anyway.
+    /// owner wrote is missing — and the launch continues anyway, saying so.
+    ///
+    /// It used to stop the launch (#472). The argument for that was sound and
+    /// applies just as much to the launch repository's own unreadable config,
+    /// which has always warned; two answers to one question was the defect. A
+    /// typo in a linked repository must not stop work in the repository you are
+    /// actually in, and only a tightening can go missing this way — a named
+    /// repository's `[propose]` is never consulted, so its file grants nothing.
+    ///
+    /// What the warning must not become is quiet. The assertion is on the cost
+    /// being stated, not on the words "cannot be parsed".
     #[test]
-    fn an_unparseable_cplt_toml_in_a_named_repository_stops_the_launch() {
+    fn an_unparseable_cplt_toml_in_a_linked_repository_warns_and_the_launch_continues() {
         let project = TempProject::scaffold_node();
         project.git_init();
         let named = TempProject::new("repo-dir-bad-toml");
@@ -1746,10 +1755,17 @@ if cat secrets/k.txt >/dev/null 2>&1; then echo "RESULT:launch_secret:OK"; else 
             .expect("cplt should run");
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-        assert!(!output.status.success(), "stderr: {stderr}");
         assert!(
-            stderr.contains("Its [deny] section cannot be applied"),
-            "the refusal must say what is missing.\nstderr: {stderr}"
+            output.status.success(),
+            "a broken config in a LINKED repository must not stop the launch.\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("[deny] section is NOT applied"),
+            "and the warning must say what it costs.\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("less restricted"),
+            "in terms of what the session can now do.\nstderr: {stderr}"
         );
     }
 

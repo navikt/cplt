@@ -185,11 +185,13 @@ for the session, and cplt says so at launch.
 
 `[propose]` is launch-repository only. A named repository that proposes
 something gets one line saying it was not consulted; approving proposals per
-repository is [#206](https://github.com/navikt/cplt/issues/206)'s decision to
-make first. A `.cplt.toml` in a named repository that cannot be parsed **stops
-the launch** rather than being skipped: the file exists, so a restriction its
-owner wrote is missing, and a missing restriction is not a warning to scroll
-past.
+repository is a separate feature and is not built. A `.cplt.toml` in a named
+repository that cannot be parsed **warns and the launch continues**, which is
+what the launch repository's own unreadable config has always done. The warning
+says what it costs — that repository's `[deny]` is not applied, so the session
+is less restricted inside it than its config asks for. Only a tightening can go
+missing this way: a named repository's file grants nothing, because its
+`[propose]` is never consulted.
 
 Launching from the parent (`--project-dir ~/src`) grants the whole tree and is a
 much wider grant than naming two repositories. It also does **not** let you name

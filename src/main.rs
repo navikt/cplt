@@ -2313,37 +2313,27 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             }
             // No `.cplt.toml` is the ordinary case and says nothing.
             Ok(None) => {}
-            // Unlike the launch repository's, a broken COMMITTED file is fatal.
-            // It exists and cannot be read, so a restriction its owner wrote is
-            // missing — and a missing restriction must never be a warning the
-            // operator scrolls past on the way to a session that runs anyway.
+            // Warned, not fatal — the same as the launch repository's own
+            // unreadable `.cplt.toml` (#472). It used to stop the launch, on the
+            // argument that a restriction its owner wrote is missing and a
+            // missing restriction must not be a warning the operator scrolls
+            // past. That argument is real, and it applies just as much to the
+            // launch repository, which has always warned. Two answers to one
+            // question is the thing worth fixing; a typo in a linked
+            // repository's config should not stop work in the repository you
+            // are actually in.
             //
-            // An uncommitted one is not fatal, and the difference matters since
-            // #206 made Linux read the working tree here at all: a named root is
-            // agent-writable, `.cplt.toml` is not deniable inside it on Landlock,
-            // and `.git/info/exclude` hides a new file from `git status`. Fatal
-            // would hand a previous session a way to stop every later launch with
-            // a file the user cannot see. Nothing its author wrote is being
-            // dropped — there is no committed version to drop.
+            // What makes warning defensible is that this file grants nothing:
+            // `[propose]` from a named root is never consulted, so the only
+            // thing lost is a tightening, and the loss is stated in the same
+            // breath. The session is less restricted than that repository asked
+            // for, and the operator is told exactly that.
             Err(e) => {
-                let state = repo_config::repo_config_state(&root.dir);
-                if matches!(
-                    state,
-                    repo_config::RepoConfigState::Committed | repo_config::RepoConfigState::Drifted
-                ) {
-                    bail!(
-                        "Failed to load .cplt.toml from the named repository {}: {e}\n  \
-                         Its [deny] section cannot be applied, so the session would be \
-                         less restricted than that repository asks for. Fix the file, or \
-                         drop the repository from the named set.",
-                        root.dir.display()
-                    );
-                }
                 ui::warn(&format!(
-                    "Ignoring an unreadable, uncommitted .cplt.toml in the named repository \
-                     {}: {e}\n  \
-                     Nothing committed is being dropped. If you wrote it, commit it; if you \
-                     did not, a previous session did.",
+                    "Cannot read .cplt.toml in the linked repository {}: {e}\n  \
+                     Its [deny] section is NOT applied, so this session is less restricted \
+                     inside that repository than its config asks for. Fix the file, or drop \
+                     the repository from the linked set.",
                     root.dir.display()
                 ));
             }
