@@ -294,105 +294,51 @@ pub fn now_iso8601() -> String {
 ///
 /// Arrays are sorted before hashing so reordering entries does not
 /// invalidate approvals. Full SHA-256 hex is used (64 chars) for
-/// collision resistance.
+/// Hash of everything a repository proposes, pinning an approval to the exact
+/// values the user reviewed.
+///
+/// A stored hash that no longer matches makes the approval stale
+/// ([`approval_is_stale`]), so the keys stop applying until the user approves
+/// again. That is the whole defence against a repository being approved for one
+/// thing and later committing another.
+///
 pub fn proposal_content_hash(propose: &crate::repo_config::ProposeSection) -> String {
     use sha2::{Digest, Sha256};
 
+    // Serialized whole, never field by field. The hand-written version listed
+    // the fields it knew about, and `pass_env` was added to `[propose]` in #443
+    // and never added here: an approval granted for `pass_env = ["TZ"]` went on
+    // covering `pass_env = ["AWS_SECRET_ACCESS_KEY"]` with no re-prompt, because
+    // the hash did not change. `gradle_init` was missing the same way. A list
+    // that has to be updated in a second file every time a proposal is added is
+    // a list that will be out of date again.
+    //
+    // JSON rather than TOML: `unknown` is a flattened map, and TOML refuses a
+    // value emitted after a table, so a future key would make this fail to
+    // serialize. Serialization order is the struct's declaration order and, for
+    // `unknown`, the `BTreeMap`'s — both stable across runs and builds.
+    //
+    // `unknown` is included deliberately. A key this version cannot see grants
+    // nothing, but the next version may understand it, and an approval given
+    // when it was inert must not survive into a cplt that acts on it.
+    // Lists are sorted first, so reordering a proposal is not a change and does
+    // not cost the user a re-approval. A future list field that is not sorted
+    // here simply hashes in its written order — stricter, never looser.
+    let mut normalized = propose.clone();
+    normalized.pass_env.sort_unstable();
+    normalized.allow.read.sort_unstable();
+    normalized.allow.write.sort_unstable();
+    normalized.allow.socket.sort_unstable();
+    normalized.allow.ports.sort_unstable();
+    normalized.allow.localhost.sort_unstable();
+    normalized.allow.domains.sort_unstable();
+    normalized.proxy.allow_private_domains.sort_unstable();
+
+    let canonical =
+        serde_json::to_string(&normalized).unwrap_or_else(|_| format!("{normalized:?}"));
+
     let mut hasher = Sha256::new();
-
-    // Boolean proposals — sorted by key name for stability
-    let bools: &[(&str, Option<bool>)] = &[
-        ("allow_browser", propose.allow_browser),
-        ("allow_docker", propose.allow_docker),
-        ("allow_env_files", propose.allow_env_files),
-        ("allow_gpg_signing", propose.allow_gpg_signing),
-        ("allow_jvm_attach", propose.allow_jvm_attach),
-        ("allow_lifecycle_scripts", propose.allow_lifecycle_scripts),
-        ("allow_localhost_any", propose.allow_localhost_any),
-        ("allow_msbuild", propose.allow_msbuild),
-        ("allow_tmp_exec", propose.allow_tmp_exec),
-    ];
-    for (name, val) in bools {
-        if let Some(v) = val {
-            hasher.update(format!("{name}={v}\n").as_bytes());
-        }
-    }
-
-    // Path/port proposals — sorted for order-independence
-    let mut read: Vec<&str> = propose
-        .allow
-        .read
-        .iter()
-        .map(std::string::String::as_str)
-        .collect();
-    read.sort_unstable();
-    for p in &read {
-        hasher.update(format!("allow.read={p}\n").as_bytes());
-    }
-
-    let mut write: Vec<&str> = propose
-        .allow
-        .write
-        .iter()
-        .map(std::string::String::as_str)
-        .collect();
-    write.sort_unstable();
-    for p in &write {
-        hasher.update(format!("allow.write={p}\n").as_bytes());
-    }
-
-    // Unix-socket proposals are proposable AND applied (apply_repo_config), and a
-    // socket like /var/run/docker.sock is a host-escape vector. They MUST be part
-    // of the pinned content so a trusted repo cannot later add or change
-    // `[propose.allow] socket=[…]` without re-approval.
-    let mut socket: Vec<&str> = propose
-        .allow
-        .socket
-        .iter()
-        .map(std::string::String::as_str)
-        .collect();
-    socket.sort_unstable();
-    for p in &socket {
-        hasher.update(format!("allow.socket={p}\n").as_bytes());
-    }
-
-    let mut ports: Vec<u16> = propose.allow.ports.clone();
-    ports.sort_unstable();
-    for port in &ports {
-        hasher.update(format!("allow.ports={port}\n").as_bytes());
-    }
-
-    let mut localhost: Vec<u16> = propose.allow.localhost.clone();
-    localhost.sort_unstable();
-    for port in &localhost {
-        hasher.update(format!("allow.localhost={port}\n").as_bytes());
-    }
-
-    // Hashed like every other proposed array: changing the requested domains
-    // must invalidate an approval, or a repository could add a host after the
-    // user reviewed the list.
-    let mut allow_domains: Vec<&str> = propose
-        .allow
-        .domains
-        .iter()
-        .map(std::string::String::as_str)
-        .collect();
-    allow_domains.sort_unstable();
-    for d in &allow_domains {
-        hasher.update(format!("allow.domains={d}\n").as_bytes());
-    }
-
-    let mut domains: Vec<&str> = propose
-        .proxy
-        .allow_private_domains
-        .iter()
-        .map(std::string::String::as_str)
-        .collect();
-    domains.sort_unstable();
-    for d in &domains {
-        hasher.update(format!("proxy.allow_private_domains={d}\n").as_bytes());
-    }
-
+    hasher.update(canonical.as_bytes());
     let hash = hasher.finalize();
     // Full SHA-256 hex (64 chars) — collision-resistant content pinning
     hash.iter().map(|b| format!("{b:02x}")).collect()
@@ -797,6 +743,245 @@ approved_at = "2026-05-01T12:00:00Z"
             ..Default::default()
         };
         assert!(!approved_path_matches(&entry, Path::new(missing)));
+    }
+
+    /// The bug this hash exists to prevent, in the shape it actually shipped:
+    /// `pass_env` was added to `[propose]` in #443 and never added to the
+    /// hand-written hash, so an approval for `["TZ"]` covered a later
+    /// `["AWS_SECRET_ACCESS_KEY"]` with no re-prompt. Verified end to end
+    /// before the fix: the variable reached the agent.
+    #[test]
+    fn every_proposed_field_is_pinned() {
+        use crate::repo_config::{ProposeAllowSection, ProposeProxySection, ProposeSection};
+
+        // Destructured exhaustively: a new field added to `[propose]` breaks
+        // this test to compile, which is the moment to check it is covered.
+        let ProposeSection {
+            allow_localhost_any: _,
+            allow_jvm_attach: _,
+            allow_msbuild: _,
+            gradle_init: _,
+            allow_docker: _,
+            allow_tmp_exec: _,
+            allow_gpg_signing: _,
+            allow_lifecycle_scripts: _,
+            allow_browser: _,
+            allow_env_files: _,
+            gh_guard: _,
+            git_push_prevention: _,
+            pass_env: _,
+            allow: _,
+            proxy: _,
+            unknown: _,
+        } = ProposeSection::default();
+
+        let base = ProposeSection::default();
+        let variants: Vec<(&str, ProposeSection)> = vec![
+            (
+                "allow_localhost_any",
+                ProposeSection {
+                    allow_localhost_any: Some(true),
+                    ..Default::default()
+                },
+            ),
+            (
+                "allow_jvm_attach",
+                ProposeSection {
+                    allow_jvm_attach: Some(true),
+                    ..Default::default()
+                },
+            ),
+            (
+                "allow_msbuild",
+                ProposeSection {
+                    allow_msbuild: Some(true),
+                    ..Default::default()
+                },
+            ),
+            (
+                "gradle_init",
+                ProposeSection {
+                    gradle_init: Some(true),
+                    ..Default::default()
+                },
+            ),
+            (
+                "allow_docker",
+                ProposeSection {
+                    allow_docker: Some(true),
+                    ..Default::default()
+                },
+            ),
+            (
+                "allow_tmp_exec",
+                ProposeSection {
+                    allow_tmp_exec: Some(true),
+                    ..Default::default()
+                },
+            ),
+            (
+                "allow_gpg_signing",
+                ProposeSection {
+                    allow_gpg_signing: Some(true),
+                    ..Default::default()
+                },
+            ),
+            (
+                "allow_lifecycle_scripts",
+                ProposeSection {
+                    allow_lifecycle_scripts: Some(true),
+                    ..Default::default()
+                },
+            ),
+            (
+                "allow_browser",
+                ProposeSection {
+                    allow_browser: Some(true),
+                    ..Default::default()
+                },
+            ),
+            (
+                "allow_env_files",
+                ProposeSection {
+                    allow_env_files: Some(true),
+                    ..Default::default()
+                },
+            ),
+            (
+                "gh_guard",
+                ProposeSection {
+                    gh_guard: Some(false),
+                    ..Default::default()
+                },
+            ),
+            (
+                "git_push_prevention",
+                ProposeSection {
+                    git_push_prevention: Some(false),
+                    ..Default::default()
+                },
+            ),
+            (
+                "pass_env",
+                ProposeSection {
+                    pass_env: vec!["AWS_SECRET_ACCESS_KEY".to_string()],
+                    ..Default::default()
+                },
+            ),
+            (
+                "allow.read",
+                ProposeSection {
+                    allow: ProposeAllowSection {
+                        read: vec!["/etc".to_string()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "allow.write",
+                ProposeSection {
+                    allow: ProposeAllowSection {
+                        write: vec!["/etc".to_string()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "allow.socket",
+                ProposeSection {
+                    allow: ProposeAllowSection {
+                        socket: vec!["/var/run/docker.sock".to_string()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "allow.ports",
+                ProposeSection {
+                    allow: ProposeAllowSection {
+                        ports: vec![8080],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "allow.localhost",
+                ProposeSection {
+                    allow: ProposeAllowSection {
+                        localhost: vec![8080],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "allow.domains",
+                ProposeSection {
+                    allow: ProposeAllowSection {
+                        domains: vec!["evil.example".to_string()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "proxy.allow_private_domains",
+                ProposeSection {
+                    proxy: ProposeProxySection {
+                        allow_private_domains: vec!["evil.internal".to_string()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "unknown",
+                ProposeSection {
+                    unknown: [("future_key".to_string(), toml::Value::Boolean(true))]
+                        .into_iter()
+                        .collect(),
+                    ..Default::default()
+                },
+            ),
+        ];
+
+        let base_hash = proposal_content_hash(&base);
+        let mut seen = std::collections::BTreeSet::new();
+        for (name, variant) in &variants {
+            let hash = proposal_content_hash(variant);
+            assert_ne!(
+                base_hash, hash,
+                "{name} is not pinned: an approval survives a change to it"
+            );
+            assert!(
+                seen.insert(hash),
+                "{name} collides with another field's change"
+            );
+        }
+    }
+
+    /// Changing one entry of a list must invalidate, not just adding one.
+    #[test]
+    fn a_changed_pass_env_value_invalidates_the_approval() {
+        use crate::repo_config::ProposeSection;
+
+        let approved = ProposeSection {
+            pass_env: vec!["TZ".to_string()],
+            ..Default::default()
+        };
+        let later = ProposeSection {
+            pass_env: vec!["AWS_SECRET_ACCESS_KEY".to_string()],
+            ..Default::default()
+        };
+
+        assert!(approval_is_stale(
+            &proposal_content_hash(&approved),
+            &proposal_content_hash(&later)
+        ));
     }
 
     #[test]
