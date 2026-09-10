@@ -600,6 +600,15 @@ mod tests {
             "..",
             "nav ikt/cplt",
             "navikt/./cplt",
+            // Two components, and one of them walks up. `name_candidates` joins
+            // the name onto the parent directory, so this is the shape that
+            // reaches `parent.join("..")` — and it is the one the earlier list
+            // missed, because every other bad case was refused by the arity
+            // check alone (#496 review).
+            "navikt/..",
+            "../cplt",
+            "./cplt",
+            "navikt/.",
         ] {
             assert!(!is_valid_identity(bad), "{bad:?} must be refused");
         }

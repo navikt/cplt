@@ -102,6 +102,22 @@ pub struct ProposeSection {
     #[serde(default)]
     pub pass_env: Vec<String>,
 
+    /// Repositories this project usually spans, as `<owner>/<name>` (#491).
+    ///
+    /// An identity, never a path: the repository states what the *project* is,
+    /// and the user's machine decides where that repository lives. Approving
+    /// resolves each one locally, verifies its origin, and records the path —
+    /// so what a repository can put in front of the user is a name, and what
+    /// grants access is a path the user approved.
+    ///
+    /// Unlike every other proposal, this one is not a value the launch applies.
+    /// `cplt trust accept repos` performs the linking; after that the entries
+    /// are ordinary `sandbox.repo_dirs` roots. Nothing here is consulted at
+    /// launch, which is also why `--accept-repo-config` cannot use it: a
+    /// per-run flag must not write a persistent grant.
+    #[serde(default)]
+    pub repos: Vec<String>,
+
     /// Proposed path/port expansions.
     #[serde(default)]
     pub allow: ProposeAllowSection,
@@ -148,6 +164,7 @@ impl ProposeSection {
             gh_guard,
             git_push_prevention,
             pass_env: _,
+            repos: _,
             allow: _,
             proxy: _,
             unknown: _,
@@ -549,6 +566,19 @@ fn validate_repo_config(config: &RepoConfig) -> Result<(), String> {
         crate::sandbox::validate_sbpl_path(&PathBuf::from(path))?;
     }
 
+    // `[propose] repos` entries are identities. The value reaches path
+    // construction on the user's machine — `<parent>/<name>` — so a `..` or a
+    // slash in the wrong place would have cplt look in a directory this file
+    // chose. Refused here, where the file is read, rather than at the resolver.
+    for repo in &config.propose.repos {
+        if !crate::link::is_valid_identity(repo) {
+            return Err(format!(
+                "propose.repos entry {repo:?} is not a repository identity. \
+                 Name repositories as <owner>/<name>, for example navikt/cplt."
+            ));
+        }
+    }
+
     // Validate deny env vars: must be non-empty alphanumeric/underscore identifiers
     for var in &config.deny.env {
         if var.is_empty() {
@@ -673,6 +703,9 @@ pub fn proposed_keys(propose: &ProposeSection) -> Vec<&'static str> {
         }
     }
 
+    if !propose.repos.is_empty() {
+        keys.push("repos");
+    }
     if !propose.allow.read.is_empty() {
         keys.push("allow.read");
     }
@@ -699,6 +732,56 @@ pub fn proposed_keys(propose: &ProposeSection) -> Vec<&'static str> {
     }
 
     keys
+}
+
+/// Format the proposed values for a key for display.
+pub fn propose_key_detail(
+    propose: &ProposeSection,
+    key: &str,
+    limit: Option<usize>,
+) -> Option<String> {
+    match key {
+        "allow.read" if !propose.allow.read.is_empty() => Some(format!("{:?}", propose.allow.read)),
+        "allow.write" if !propose.allow.write.is_empty() => {
+            Some(format!("{:?}", propose.allow.write))
+        }
+        "allow.ports" if !propose.allow.ports.is_empty() => {
+            Some(format!("{:?}", propose.allow.ports))
+        }
+        "allow.localhost" if !propose.allow.localhost.is_empty() => {
+            Some(format!("{:?}", propose.allow.localhost))
+        }
+        "proxy.allow_private_domains" if !propose.proxy.allow_private_domains.is_empty() => {
+            Some(format!("{:?}", propose.proxy.allow_private_domains))
+        }
+        // Named, not counted: "repos" alone says nothing about what approving
+        // it would put in scope, and this is the one proposal whose effect is a
+        // whole other repository being read, written and executed in.
+        // Named, but bounded. The list is a repository's committed text, and a
+        // file proposing two hundred repositories would otherwise print one
+        // 3 KB line — which is how the whole warning stops being read. The
+        // entries themselves cannot carry escapes: `validate_repo_config`
+        // refuses anything that is not `<owner>/<name>`.
+        "repos" if !propose.repos.is_empty() => {
+            // `limit` is None where consent is being asked for: a prompt that
+            // elides part of what it is approving is not consent (#496 review).
+            let shown = limit.unwrap_or(propose.repos.len()).max(1);
+            let listed = propose
+                .repos
+                .iter()
+                .take(shown)
+                .cloned()
+                .collect::<Vec<_>>();
+            let rest = propose.repos.len().saturating_sub(listed.len());
+            let listed = listed.join(", ");
+            Some(if rest == 0 {
+                format!("{listed} (each resolved and origin-verified on this machine)")
+            } else {
+                format!("{listed}, and {rest} more — run `cplt trust` for the full list")
+            })
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -901,6 +984,87 @@ preset = \"full-trust\"\n",
         assert_eq!(loaded.source, RepoConfigSource::GitHead);
         assert_eq!(proposed_keys(&loaded.config.propose), vec!["allow_docker"]);
         assert!(!loaded.propose_dropped);
+    }
+
+    /// #491: a repository proposes *identities*, never paths. The value is
+    /// used to build paths on the user's machine, so a `..` or a stray slash
+    /// would have cplt look in a directory this file chose — and print the
+    /// result back to the operator as if it were a repository.
+    #[test]
+    fn a_proposed_repo_must_be_an_identity_not_a_path() {
+        for bad in [
+            "../../etc",
+            "navikt/../../etc",
+            "/absolute/path",
+            "navikt",
+            "navikt/cplt/extra",
+            "",
+        ] {
+            let cfg =
+                parse_repo_config(&format!("[propose]\nrepos = [\"{bad}\"]\n")).expect("parses");
+            let err = validate_repo_config(&cfg).expect_err("{bad} must be refused");
+            assert!(err.contains("identity"), "say what is wrong: {err}");
+        }
+
+        let cfg = parse_repo_config("[propose]\nrepos = [\"navikt/cplt\"]\n").expect("parses");
+        validate_repo_config(&cfg).expect("an identity is the point of the key");
+    }
+
+    /// The launch names the repositories an unapproved `repos` would put in
+    /// scope, and the list is a repository's committed text. Bounded, because a
+    /// warning that prints a 3 KB line is a warning nobody reads.
+    #[test]
+    fn a_long_repos_proposal_is_summarised_not_dumped() {
+        let many: Vec<String> = (0..200).map(|i| format!("navikt/repo-{i}")).collect();
+        let cfg = parse_repo_config(&format!(
+            "[propose]\nrepos = [{}]\n",
+            many.iter()
+                .map(|r| format!("{r:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+        .expect("parses");
+        validate_repo_config(&cfg).expect("identities are valid");
+
+        let detail = propose_key_detail(&cfg.propose, "repos", Some(5)).expect("has a detail");
+        assert!(
+            detail.len() < 200,
+            "one line, not a wall: {} chars",
+            detail.len()
+        );
+        assert!(
+            detail.contains("and 195 more"),
+            "and it says how many: {detail}"
+        );
+    }
+
+    /// The consent prompt must show everything it asks for. Truncating there
+    /// would ask the operator to approve two hundred trees while showing five.
+    #[test]
+    fn without_a_limit_every_proposed_repository_is_named() {
+        let many: Vec<String> = (0..40).map(|i| format!("navikt/repo-{i}")).collect();
+        let cfg = parse_repo_config(&format!(
+            "[propose]\nrepos = [{}]\n",
+            many.iter()
+                .map(|r| format!("{r:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+        .expect("parses");
+
+        let detail = propose_key_detail(&cfg.propose, "repos", None).expect("has a detail");
+        for repo in &many {
+            assert!(detail.contains(repo.as_str()), "{repo} must be shown");
+        }
+        assert!(!detail.contains("more"), "and nothing elided: {detail}");
+    }
+
+    /// It is a grant — it puts another repository in read/write/exec scope — so
+    /// an uncommitted file cannot make it (#206).
+    #[test]
+    fn proposed_repos_do_not_survive_an_uncommitted_file() {
+        let cfg = parse_repo_config("[propose]\nrepos = [\"navikt/cplt\"]\n").expect("parses");
+        assert!(cfg.propose.tightenings_only().repos.is_empty());
     }
 
     /// The deny sweep runs after cplt sets up the child's environment, so these
