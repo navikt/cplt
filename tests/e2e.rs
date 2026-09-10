@@ -4382,21 +4382,24 @@ paths = [
             make_trust_repo("accept-flag-uncommitted", "[deny]\npaths = [\"secrets\"]\n");
         // Untrack it, so HEAD has no .cplt.toml at all and the working-tree
         // path is the one under test.
-        git_cmd(&repo)
-            .args(["rm", "--cached", "-q", ".cplt.toml"])
-            .output()
-            .unwrap();
-        git_cmd(&repo)
-            .args([
+        for args in [
+            vec!["rm", "--cached", "-q", ".cplt.toml"],
+            vec![
                 "-c",
                 "commit.gpgSign=false",
                 "commit",
                 "-m",
                 "untrack",
                 "--quiet",
-            ])
-            .output()
-            .unwrap();
+            ],
+        ] {
+            let out = git_cmd(&repo).args(&args).output().unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed, so this is not the fixture under test: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
         std::fs::write(
             repo.join(".cplt.toml"),
             "[deny]\npaths = [\"secrets\"]\n\n[propose]\nallow_docker = true\n",

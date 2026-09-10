@@ -2135,11 +2135,24 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                 // Said plainly, because the alternative is a session that quietly
                 // lacks a permission the file asks for and a developer who reads
                 // the file and believes it applies.
-                ui::warn(
-                    "This .cplt.toml is not committed, so the permissions it asks for are \
-                     ignored. Commit it to propose them. Its [deny] keys apply either way, \
-                     and so does a [propose] key that only tightens.",
-                );
+                // "Commit it" is wrong advice in a directory that is not a git
+                // repository at all, and that case reaches here too — the
+                // working-tree load does not require git. `explain()` already
+                // distinguishes the two, so let it say which one this is.
+                let why = match repo_config::repo_config_state(&project_dir) {
+                    repo_config::RepoConfigState::NotAGitRepo { .. } => {
+                        "This is not a git repository, so the permissions .cplt.toml asks \
+                         for are ignored: cplt grants only what a commit contains."
+                    }
+                    _ => {
+                        "This .cplt.toml is not committed, so the permissions it asks for \
+                         are ignored. Commit it to propose them."
+                    }
+                };
+                ui::warn(&format!(
+                    "{why} Its [deny] keys apply either way, and so does a [propose] key \
+                     that only tightens."
+                ));
             }
 
             // Determine approved keys
