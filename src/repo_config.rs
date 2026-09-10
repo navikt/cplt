@@ -734,6 +734,50 @@ pub fn proposed_keys(propose: &ProposeSection) -> Vec<&'static str> {
     keys
 }
 
+/// Format the proposed values for a key for display.
+pub fn propose_key_detail(propose: &ProposeSection, key: &str) -> Option<String> {
+    match key {
+        "allow.read" if !propose.allow.read.is_empty() => Some(format!("{:?}", propose.allow.read)),
+        "allow.write" if !propose.allow.write.is_empty() => {
+            Some(format!("{:?}", propose.allow.write))
+        }
+        "allow.ports" if !propose.allow.ports.is_empty() => {
+            Some(format!("{:?}", propose.allow.ports))
+        }
+        "allow.localhost" if !propose.allow.localhost.is_empty() => {
+            Some(format!("{:?}", propose.allow.localhost))
+        }
+        "proxy.allow_private_domains" if !propose.proxy.allow_private_domains.is_empty() => {
+            Some(format!("{:?}", propose.proxy.allow_private_domains))
+        }
+        // Named, not counted: "repos" alone says nothing about what approving
+        // it would put in scope, and this is the one proposal whose effect is a
+        // whole other repository being read, written and executed in.
+        // Named, but bounded. The list is a repository's committed text, and a
+        // file proposing two hundred repositories would otherwise print one
+        // 3 KB line — which is how the whole warning stops being read. The
+        // entries themselves cannot carry escapes: `validate_repo_config`
+        // refuses anything that is not `<owner>/<name>`.
+        "repos" if !propose.repos.is_empty() => {
+            const SHOWN: usize = 5;
+            let shown = propose
+                .repos
+                .iter()
+                .take(SHOWN)
+                .cloned()
+                .collect::<Vec<_>>();
+            let rest = propose.repos.len().saturating_sub(shown.len());
+            let listed = shown.join(", ");
+            Some(if rest == 0 {
+                format!("{listed} (each resolved and origin-verified on this machine)")
+            } else {
+                format!("{listed}, and {rest} more — see `cplt trust`")
+            })
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -958,6 +1002,34 @@ preset = \"full-trust\"\n",
 
         let cfg = parse_repo_config("[propose]\nrepos = [\"navikt/cplt\"]\n").expect("parses");
         validate_repo_config(&cfg).expect("an identity is the point of the key");
+    }
+
+    /// The launch names the repositories an unapproved `repos` would put in
+    /// scope, and the list is a repository's committed text. Bounded, because a
+    /// warning that prints a 3 KB line is a warning nobody reads.
+    #[test]
+    fn a_long_repos_proposal_is_summarised_not_dumped() {
+        let many: Vec<String> = (0..200).map(|i| format!("navikt/repo-{i}")).collect();
+        let cfg = parse_repo_config(&format!(
+            "[propose]\nrepos = [{}]\n",
+            many.iter()
+                .map(|r| format!("{r:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+        .expect("parses");
+        validate_repo_config(&cfg).expect("identities are valid");
+
+        let detail = propose_key_detail(&cfg.propose, "repos").expect("has a detail");
+        assert!(
+            detail.len() < 200,
+            "one line, not a wall: {} chars",
+            detail.len()
+        );
+        assert!(
+            detail.contains("and 195 more"),
+            "and it says how many: {detail}"
+        );
     }
 
     /// It is a grant — it puts another repository in read/write/exec scope — so

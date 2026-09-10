@@ -2440,7 +2440,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             unapproved_proposals.len()
         ));
         for key in &unapproved_proposals {
-            match propose_key_detail(&repo_propose, key) {
+            match repo_config::propose_key_detail(&repo_propose, key) {
                 Some(detail) => eprintln!(
                     "  {}○{} {key}: {detail}",
                     ui::color(ui::YELLOW),
@@ -7793,7 +7793,7 @@ no longer apply"
         );
         println!();
         for &key in &pending {
-            let detail = propose_key_detail(&loaded.config.propose, key);
+            let detail = repo_config::propose_key_detail(&loaded.config.propose, key);
             if let Some(d) = detail {
                 println!("  {yellow}•{nc} {key}: {d}");
             } else {
@@ -7909,33 +7909,6 @@ fn warn_repo_config_discrepancy(project_dir: &std::path::Path) {
     }
     if let Some(msg) = state.explain() {
         ui::warn(&msg);
-    }
-}
-
-/// Format the proposed values for a key for display.
-fn propose_key_detail(propose: &repo_config::ProposeSection, key: &str) -> Option<String> {
-    match key {
-        "allow.read" if !propose.allow.read.is_empty() => Some(format!("{:?}", propose.allow.read)),
-        "allow.write" if !propose.allow.write.is_empty() => {
-            Some(format!("{:?}", propose.allow.write))
-        }
-        "allow.ports" if !propose.allow.ports.is_empty() => {
-            Some(format!("{:?}", propose.allow.ports))
-        }
-        "allow.localhost" if !propose.allow.localhost.is_empty() => {
-            Some(format!("{:?}", propose.allow.localhost))
-        }
-        "proxy.allow_private_domains" if !propose.proxy.allow_private_domains.is_empty() => {
-            Some(format!("{:?}", propose.proxy.allow_private_domains))
-        }
-        // Named, not counted: "repos" alone says nothing about what approving
-        // it would put in scope, and this is the one proposal whose effect is a
-        // whole other repository being read, written and executed in.
-        "repos" if !propose.repos.is_empty() => Some(format!(
-            "{} (each resolved and origin-verified on this machine)",
-            propose.repos.join(", ")
-        )),
-        _ => None,
     }
 }
 
