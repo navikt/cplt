@@ -4108,6 +4108,52 @@ paths = [
         let _ = std::fs::remove_dir_all(&model);
     }
 
+    /// #306: `config set` must refuse what the launch refuses. The tool used
+    /// to accept `allow.read ~/.netrc`, print the updated list, and exit 0 —
+    /// and then refuse it at every launch after.
+    #[test]
+    fn e2e_config_set_refuses_a_grant_no_launch_can_honour() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let cfg_dir = home.path().join(".config/cplt");
+        std::fs::create_dir_all(&cfg_dir).expect("config dir");
+        let cfg = cfg_dir.join("config.toml");
+
+        let set = |key: &str, value: &str| {
+            cplt_cmd()
+                .args(["config", "set", key, value])
+                .env("HOME", home.path())
+                .env("CPLT_CONFIG", &cfg)
+                .output()
+                .expect("config set runs")
+        };
+
+        let out = set("allow.read", "~/.netrc");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success(),
+            "a hard-denied grant must be refused at write time: {stderr}"
+        );
+        assert!(
+            stderr.contains("hard-deny"),
+            "with the launch's own reason: {stderr}"
+        );
+
+        // And the config file must be unchanged — a refusal that still writes
+        // is worse than no refusal, because the message says it did not.
+        let written = std::fs::read_to_string(&cfg).unwrap_or_default();
+        assert!(
+            !written.contains(".netrc"),
+            "the refused entry must not be in the file: {written}"
+        );
+
+        let out = set("allow.read", "/opt");
+        assert!(
+            out.status.success(),
+            "an ordinary grant still works: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     #[test]
     fn e2e_trust_show_displays_proposals() {
         let (repo, config_file) = make_trust_repo(

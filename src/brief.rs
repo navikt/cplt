@@ -511,19 +511,19 @@ fn ssh_key_readable(allow_read: &[std::path::PathBuf], home: &Path) -> bool {
 /// `build_sandbox_env`'s sanitized branch, which never consults
 /// `ENV_ALWAYS_DENY`.
 ///
-/// `--inherit-env` takes the other branch, which pushes every `ENV_ALWAYS_DENY`
-/// entry — `SSH_AUTH_SOCK` among them — onto `remove`, and never looks at
-/// `extra_pass_env`. So inherit does not merely fail to help: it *cancels*
-/// `--pass-env SSH_AUTH_SOCK`. Nothing conflicts the two flags, and
-/// `sandbox.pass_env` in config makes the combination easy to hit by accident.
+/// `--inherit-env` takes the other branch, which strips every
+/// `ENV_ALWAYS_DENY` entry — `SSH_AUTH_SOCK` among them — **except the ones
+/// named in `extra_pass_env`**. It used to strip them all, so inherit did not
+/// merely fail to help: it cancelled `--pass-env SSH_AUTH_SOCK` silently, and
+/// `sandbox.pass_env` in config made the combination easy to hit months apart
+/// (#307). The explicit instruction wins now, in both branches.
 ///
 /// On macOS the variable alone is still not enough. The socket lives at
 /// `/private/tmp/com.apple.launchd.*/Listeners`, and the profile grants no
 /// `network-outbound unix-socket` for it — deliberately, which is why the JVM
 /// carve-out is regex-pinned to `.java_pid`. It also takes an `allow.socket`.
 fn ssh_agent_reaches(resolved: &Resolved) -> bool {
-    !resolved.inherit_env
-        && resolved.pass_env.iter().any(|v| v == "SSH_AUTH_SOCK")
+    resolved.pass_env.iter().any(|v| v == "SSH_AUTH_SOCK")
         && (!cfg!(target_os = "macos") || !resolved.allow_socket.is_empty())
 }
 
@@ -1391,13 +1391,16 @@ mod tests {
         );
     }
 
-    /// `--inherit-env` takes the branch that sweeps ENV_ALWAYS_DENY (which
-    /// lists SSH_AUTH_SOCK) and never reads extra_pass_env — so it does not
-    /// merely fail to help, it cancels `--pass-env SSH_AUTH_SOCK`. Nothing in
-    /// clap conflicts the two, and `sandbox.pass_env` makes the pair easy to
-    /// hit.
+    /// `--inherit-env` used to cancel `--pass-env SSH_AUTH_SOCK`: its branch
+    /// swept every `ENV_ALWAYS_DENY` entry and never read `extra_pass_env`, so
+    /// a user who asked for the agent socket did not get it and the brief said
+    /// so — correctly, about behaviour that was itself the bug (#307).
+    ///
+    /// The explicit instruction wins in both branches now, so the brief reports
+    /// the socket arriving either way. This test kept the old behaviour honest
+    /// and now keeps the new one: the pair must agree, whichever way it is.
     #[test]
-    fn brief_does_not_count_the_agent_socket_under_inherit_env() {
+    fn the_agent_socket_arrives_with_pass_env_whether_or_not_env_is_inherited() {
         let mut resolved = base_resolved();
         resolved.allow_ports = vec![22];
         resolved.pass_env = vec!["SSH_AUTH_SOCK".to_string()];
@@ -1411,11 +1414,11 @@ mod tests {
             false,
         ));
         assert!(
-            brief.contains("the blocker is the keys, not the port"),
-            "--inherit-env strips SSH_AUTH_SOCK even with --pass-env:\n{brief}"
+            brief.contains("SSH may work this session"),
+            "an explicit --pass-env survives --inherit-env now:\n{brief}"
         );
 
-        // Same config without inherit_env: the socket does arrive.
+        // And without inherit_env, unchanged.
         resolved.inherit_env = false;
         let brief = generate_session_brief(&BriefFacts::capture(
             &resolved,

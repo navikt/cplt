@@ -340,6 +340,8 @@ struct Cli {
     /// Disables env sanitization. Cloud credentials, npm tokens, database URLs,
     /// and all other env vars will be visible to the sandboxed process.
     /// Only use when --pass-env is insufficient for debugging.
+    /// A handful of variables are stripped even here (SSH_AUTH_SOCK among
+    /// them); --pass-env keeps any of those you name.
     #[arg(long)]
     inherit_env: bool,
 
@@ -6688,6 +6690,52 @@ fn run_config_set(
     } else {
         None
     };
+    // A grant no launch can honour is refused here, with the same words the
+    // launch would have used (#306). Accepting it at write time and refusing it
+    // at read time is the same question answered twice, differently — and the
+    // user finds out at the next launch, about a line they added and have
+    // probably forgotten.
+    if matches!(
+        key,
+        "allow.read" | "allow.write" | "allow.exec" | "allow.socket"
+    ) && let Some(val) = value
+        && !unset
+    {
+        let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
+        let path = config::expand_tilde(val);
+        if let Err(e) = sandbox::validate_grant_path(key, &path, &home) {
+            ui::error(&e);
+            return ExitCode::FAILURE;
+        }
+        // The exec-overlap refusal needs the resolved config the launch builds,
+        // so this is the part of it that a single grant can be judged against:
+        // the trees that are writable whatever else is configured. An overlap
+        // with an `allow.write` the user adds LATER still surfaces at launch.
+        if key == "allow.exec" {
+            let writable =
+                sandbox::session_writable_roots(Path::new("/nonexistent-project"), &[], &[], None);
+            let tool_dirs: Vec<PathBuf> = sandbox::HOME_TOOL_DIRS
+                .iter()
+                .filter(|d| d.write)
+                .map(|d| home.join(d.path))
+                .collect();
+            if let Some(tree) = writable
+                .iter()
+                .chain(tool_dirs.iter())
+                .find(|t| path.starts_with(t) || t.starts_with(&path))
+            {
+                ui::error(&format!(
+                    "allow.exec {val} overlaps {}, which is writable in every session.\n  \
+                     A tree that is both writable and executable lets the agent drop a binary \
+                     and run it, and neither backend can subtract the write from the exec — so \
+                     the launch refuses the pair. Exec grants belong on read-only tool prefixes.",
+                    tree.display()
+                ));
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
     // A proxy list file the session can write is refused at launch (#426), so
     // it is refused here too. `config set` accepting a value every launch then
     // rejects is the shape #306 is about, and the golden suite enforces the

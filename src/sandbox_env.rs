@@ -142,8 +142,20 @@ pub fn build_sandbox_env(
     };
 
     if inherit_env {
-        // Legacy mode: inherit everything, strip known-bad vars
+        // Legacy mode: inherit everything, strip known-bad vars — except the
+        // ones the user named explicitly.
+        //
+        // `--pass-env SSH_AUTH_SOCK` used to be cancelled by `--inherit-env`
+        // without a word (#307): this branch never read `extra_pass_env`, so a
+        // variable the user asked for was stripped anyway. The combination does
+        // not have to appear on one command line — `sandbox.pass_env` lives in
+        // config, so adding `--inherit-env` months later silently dropped an
+        // earlier setting. The specific instruction outranks the blanket one,
+        // which is also what the sanitized branch below already does.
         for var in ENV_ALWAYS_DENY {
+            if extra_pass_env.iter().any(|p| p == var) {
+                continue;
+            }
             env.remove.push(var.to_string());
         }
         // Also strip agent-specific vars in inherit mode
@@ -473,4 +485,56 @@ fn strip_dangerous_node_flags(value: &str) -> String {
         i += 1;
     }
     result.join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #307: `--inherit-env` silently cancelled `--pass-env`. The inherit
+    /// branch stripped every `ENV_ALWAYS_DENY` entry without consulting the
+    /// list the user had named, so `--pass-env SSH_AUTH_SOCK` — the supported
+    /// way to reach an SSH agent from inside the sandbox — did nothing.
+    ///
+    /// It bites without both appearing on one command line: `sandbox.pass_env`
+    /// lives in config, so adding `--inherit-env` months later dropped the
+    /// earlier setting with no message.
+    #[test]
+    fn inherit_env_no_longer_cancels_an_explicit_pass_env() {
+        // Both are in `ENV_ALWAYS_DENY`, which is what inherit mode strips.
+        // (Secrets are NOT on that list — `--inherit-env` passes them on
+        // purpose, which is why it is documented as dangerous.)
+        let parent = vec![
+            ("SSH_AUTH_SOCK".to_string(), "/tmp/agent.sock".to_string()),
+            ("SSH_AGENT_PID".to_string(), "1234".to_string()),
+        ];
+
+        let asked = build_sandbox_env(
+            &parent,
+            &["SSH_AUTH_SOCK".to_string()],
+            true,
+            &[],
+            None,
+            None,
+            Agent::Shell,
+        );
+        assert!(
+            !asked.remove.iter().any(|v| v == "SSH_AUTH_SOCK"),
+            "a variable the user named explicitly must survive: {:?}",
+            asked.remove
+        );
+        assert!(
+            asked.remove.iter().any(|v| v == "SSH_AGENT_PID"),
+            "and everything they did not name is still stripped: {:?}",
+            asked.remove
+        );
+
+        // Without the explicit ask, inherit mode strips it exactly as before.
+        let not_asked = build_sandbox_env(&parent, &[], true, &[], None, None, Agent::Shell);
+        assert!(
+            not_asked.remove.iter().any(|v| v == "SSH_AUTH_SOCK"),
+            "the default is unchanged: {:?}",
+            not_asked.remove
+        );
+    }
 }
