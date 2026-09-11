@@ -575,8 +575,10 @@ const SKIPPED: &[(&str, &str)] = &[
         "allow.exec",
         "every directory a test can create is under the system temp dir or the \
      project dir, both of which the sandbox makes writable, and cplt refuses a \
-     tree that is both writable and executable. A value that would launch \
-     cannot be constructed here; `e2e.rs` covers the grant itself.",
+     tree that is both writable and executable. Since #306 `config set` refuses \
+     it too, so the invariant this suite checks — what `set` accepts must \
+     launch — holds with nothing left to launch. `e2e.rs` covers the grant \
+     itself.",
     ),
 ];
 

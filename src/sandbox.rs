@@ -337,35 +337,54 @@ fn validate_hard_denied_grants(config: &SandboxConfig) -> Result<(), String> {
         ("allow.socket", config.extra_socket),
     ] {
         for p in paths {
-            if let Some(dir) = policy::cplt_state_dir_grant(config.home_dir, p) {
-                return Err(format!(
-                    "{key} names {} — inside cplt's own state directory ({}). Nothing in there \
-                     can be granted, not even a single file: it holds the config, the trust \
-                     store, the blocklist cache and the per-repo local files, which decide what \
-                     the next launch allows. Reading them tells an agent exactly which \
-                     protections to work around; writing them lets it approve its own next \
-                     launch. Remove it from your config or command line.",
-                    p.display(),
-                    dir.display()
-                ));
-            }
-            if let Some(file) = policy::hard_denied_file(config.home_dir, p) {
-                return Err(format!(
-                    "{key} names {} (~/{file}), which is on the hard-deny list and cannot be granted explicitly. Remove it from your config or command line.",
-                    p.display()
-                ));
-            }
-            if let Some(dir) = policy::denied_dotfile_dir(config.home_dir, p) {
-                return Err(format!(
-                    "{key} names {} (~/{dir}), a credential directory that cannot be granted \
-                     whole: macOS denies it whatever the grant says, so honouring it on Linux \
-                     alone would mean the same config opens every key in it on one platform \
-                     and nothing on the other. Name the specific path you need inside it \
-                     instead, e.g. ~/{dir}/<file> — that grant works on both.",
-                    p.display()
-                ));
-            }
+            validate_grant_path(key, p, config.home_dir)?;
         }
+    }
+    Ok(())
+}
+
+/// Refuse one grant that no launch can honour, with the reason.
+///
+/// Shared with `cplt config set` (#306). The tool used to accept
+/// `allow.read ~/.netrc` at write time and refuse it at every launch after —
+/// the same question answered in two places, differently, which is the actual
+/// defect. One predicate now, so a check added here reaches both.
+///
+/// Only the checks that need nothing but the path and `$HOME` live here.
+/// Whether an exec grant overlaps a writable tree depends on the resolved
+/// config (tool dirs, `allow.write`, named repositories), so it stays in
+/// [`validate_exec_grants`] and `config set` approximates it separately.
+///
+/// # Errors
+/// The refusal text, ready to print.
+pub fn validate_grant_path(key: &str, p: &Path, home_dir: &Path) -> Result<(), String> {
+    if let Some(dir) = policy::cplt_state_dir_grant(home_dir, p) {
+        return Err(format!(
+            "{key} names {} — inside cplt's own state directory ({}). Nothing in there \
+             can be granted, not even a single file: it holds the config, the trust \
+             store, the blocklist cache and the per-repo local files, which decide what \
+             the next launch allows. Reading them tells an agent exactly which \
+             protections to work around; writing them lets it approve its own next \
+             launch. Remove it from your config or command line.",
+            p.display(),
+            dir.display()
+        ));
+    }
+    if let Some(file) = policy::hard_denied_file(home_dir, p) {
+        return Err(format!(
+            "{key} names {} (~/{file}), which is on the hard-deny list and cannot be granted explicitly. Remove it from your config or command line.",
+            p.display()
+        ));
+    }
+    if let Some(dir) = policy::denied_dotfile_dir(home_dir, p) {
+        return Err(format!(
+            "{key} names {} (~/{dir}), a credential directory that cannot be granted \
+             whole: macOS denies it whatever the grant says, so honouring it on Linux \
+             alone would mean the same config opens every key in it on one platform \
+             and nothing on the other. Name the specific path you need inside it \
+             instead, e.g. ~/{dir}/<file> — that grant works on both.",
+            p.display()
+        ));
     }
     Ok(())
 }
@@ -1434,6 +1453,28 @@ mod tests {
     /// a mutation deleting the Copilot line from the caller passed Linux CI
     /// green. This asserts the assembled set, which is what the overlay
     /// actually re-binds.
+    /// #306: the same question must not be answered twice, differently.
+    /// `cplt config set allow.read ~/.netrc` used to succeed and then be
+    /// refused at every launch, so the user found out later, about a line they
+    /// had forgotten writing. One predicate serves both now.
+    #[test]
+    fn a_grant_no_launch_can_honour_is_refused_by_one_predicate() {
+        let home = Path::new("/home/test");
+
+        for (key, path) in [
+            ("allow.read", home.join(".netrc")),
+            ("allow.write", home.join(".ssh")),
+            ("allow.read", home.join(".config/cplt/config.toml")),
+        ] {
+            let err =
+                super::validate_grant_path(key, &path, home).expect_err("{path:?} must be refused");
+            assert!(err.contains(key), "the refusal names the key: {err}");
+        }
+
+        super::validate_grant_path("allow.read", Path::new("/opt/homebrew"), home)
+            .expect("an ordinary grant is the point of the feature");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn ro_protect_set_carries_the_copilot_package_dirs_for_copilot_only() {
