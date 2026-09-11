@@ -2841,6 +2841,7 @@ fn start_proxy_if_enabled(
     config_path: Option<&PathBuf>,
     active_agent: agent::Agent,
     project_dir: &Path,
+    named_roots: &[PathBuf],
 ) -> anyhow::Result<Option<proxy::ProxyHandle>> {
     // Proxy-forced (#53): the proxy is mandatory. `with_proxy` defaults to true,
     // so the only way it is false here is an explicit disable (--no-proxy or
@@ -2944,12 +2945,25 @@ fn start_proxy_if_enabled(
     // own egress rules and see the change take effect within the TTL. Refused
     // at launch, naming the file and the grant: the same shape as `allow.exec`
     // refusing a tree that overlaps a writable one, and the same reason.
+    // Every tree this session can write, not just the project and `allow.write`:
+    // a named repository, the scratch dir and the system temp dirs are writable
+    // too, and a list file in any of them is one the agent can rewrite between
+    // reloads (#499 review).
+    let scratch_base = std::env::var("HOME")
+        .ok()
+        .map(|h| scratch::ScratchDir::base(Path::new(&h)));
+    let writable = sandbox::session_writable_roots(
+        project_dir,
+        named_roots,
+        &resolved.allow_write,
+        scratch_base.as_deref(),
+    );
     for (key, file) in [
         ("proxy.allowed_domains", allowed_domains_file.as_ref()),
         ("proxy.blocked_domains", Some(&blocked_file)),
     ] {
         let Some(file) = file else { continue };
-        if let Some(root) = agent_writable_root(file, project_dir, &resolved.allow_write) {
+        if let Some(root) = agent_writable_root(file, &writable) {
             bail!(
                 "{key} names {}, which is inside {} — a tree this session can write.\n  \
                  The proxy re-reads that file every few seconds, so the agent could edit its \
@@ -4456,6 +4470,7 @@ fn assemble_sandbox(
         config_path,
         active_agent,
         probe.project_dir.as_path(),
+        opts.repos.dirs,
     )?;
     let proxy_port_for_profile = proxy_handle.as_ref().map(|h| h.port);
 
@@ -6673,6 +6688,44 @@ fn run_config_set(
     } else {
         None
     };
+    // A proxy list file the session can write is refused at launch (#426), so
+    // it is refused here too. `config set` accepting a value every launch then
+    // rejects is the shape #306 is about, and the golden suite enforces the
+    // invariant: what `set` accepts must be launchable.
+    if matches!(key, "proxy.allowed_domains" | "proxy.blocked_domains")
+        && let Some(val) = value
+        && !unset
+    {
+        let project = detect_project_root().unwrap_or_else(|| PathBuf::from("."));
+        let grants: Vec<PathBuf> = config::Config::load_file()
+            .ok()
+            .flatten()
+            .map(|c| {
+                c.config
+                    .allow
+                    .write
+                    .iter()
+                    .map(|w| config::expand_tilde(w))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let scratch_base = std::env::var("HOME")
+            .ok()
+            .map(|h| scratch::ScratchDir::base(Path::new(&h)));
+        let writable =
+            sandbox::session_writable_roots(&project, &[], &grants, scratch_base.as_deref());
+        if let Some(root) = agent_writable_root(Path::new(val), &writable) {
+            ui::error(&format!(
+                "{key} = {val} is inside {} — a tree a session can write.\n  \
+                 The proxy re-reads that file every few seconds, so the agent could edit its \
+                 own egress rules mid-session, and the launch refuses it. Put the list \
+                 somewhere the session cannot write, such as ~/.config/cplt/.",
+                root.display()
+            ));
+            return ExitCode::FAILURE;
+        }
+    }
+
     // `../sibling` is how a person names the repository next door. The local
     // layer stores absolute paths only — a relative entry there has no stable
     // anchor — so resolve it here rather than making the user do it (#490).
@@ -7209,6 +7262,38 @@ fn run_init_global_command(write: bool, force: bool, quiet: bool) -> ExitCode {
     }
 }
 
+/// The writable tree `file` sits inside, if any.
+///
+/// `roots` comes from [`sandbox::session_writable_roots`], so this sees every
+/// tree the session can write — not only the project directory and
+/// `allow.write`, but named repositories, the scratch dir and the system temp
+/// dirs, which are writable by construction with no grant to withdraw
+/// (#499 review).
+///
+/// **Both spellings of the file are tested.** Canonicalizing first and checking
+/// only the target misses `<project>/list.txt -> /elsewhere/list.txt`: the
+/// target reads as safe at launch, the proxy re-reads through the configured
+/// path, and the agent swaps the symlink mid-session. The path as written
+/// catches that one; the canonical form catches a symlinked spelling of the
+/// *tree*.
+fn agent_writable_root(file: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let absolute = std::path::absolute(file).unwrap_or_else(|_| file.to_path_buf());
+    // The leaf left unresolved, the directories above it resolved. That is what
+    // "where the configured path lives" means: a symlinked spelling of the tree
+    // must still match, while a symlinked *leaf* must be judged by where it
+    // sits, not by where it currently points — it is the thing an agent swaps.
+    let as_written = match (absolute.parent(), absolute.file_name()) {
+        (Some(parent), Some(name)) => real(parent).join(name),
+        _ => absolute.clone(),
+    };
+    let resolved = real(file);
+    roots
+        .iter()
+        .map(|root| real(root))
+        .find(|root| as_written.starts_with(root) || resolved.starts_with(root))
+}
+
 /// `cplt link <owner>/<name> [dir]` — put another repository in scope for this
 /// checkout, verified rather than guessed.
 ///
@@ -7217,27 +7302,6 @@ fn run_init_global_command(write: bool, force: bool, quiet: bool) -> ExitCode {
 /// every launch, it is refused if it stops being a git toplevel or acquires a
 /// symlinked leaf, and `cplt config set --local sandbox.repo_dirs` manages the
 /// same list. What this command adds is the identity check.
-/// The writable tree `file` sits inside, if any.
-///
-/// Compared on canonicalized paths, because the grant and the configured file
-/// can spell the same directory differently — and a symlinked spelling that
-/// slipped past would be a bypass rather than a cosmetic miss. A path that
-/// cannot be canonicalized (it may not exist yet) falls back to its lexical
-/// form, which is what the launch will use for it anyway.
-fn agent_writable_root(
-    file: &Path,
-    project_dir: &Path,
-    allow_write: &[PathBuf],
-) -> Option<PathBuf> {
-    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    let file = real(file);
-    std::iter::once(project_dir.to_path_buf())
-        .chain(allow_write.iter().cloned())
-        .map(|root| real(&root))
-        .find(|root| file.starts_with(root))
-}
-
-/// Where a candidate came from, for the line the user is shown.
 fn run_link_command(repo: &str, dir: Option<&Path>, unlink: bool) -> ExitCode {
     let Some(project_dir) = detect_project_root() else {
         ui::error(NOT_A_REPOSITORY);
@@ -8424,27 +8488,70 @@ mod tests {
         for f in [&in_project, &in_grant, &outside] {
             std::fs::write(f, "example.com\n").expect("write");
         }
-        let grants = vec![grant.clone()];
+        let roots = vec![project.clone(), grant.clone()];
 
         assert!(
-            super::agent_writable_root(&in_project, &project, &[]).is_some(),
+            super::agent_writable_root(&in_project, &roots).is_some(),
             "the project directory is writable by the session"
         );
         assert!(
-            super::agent_writable_root(&in_grant, &project, &grants).is_some(),
+            super::agent_writable_root(&in_grant, &roots).is_some(),
             "so is an allow.write grant"
         );
         assert!(
-            super::agent_writable_root(&outside, &project, &grants).is_none(),
+            super::agent_writable_root(&outside, &roots).is_none(),
             "a file outside every writable tree is the supported shape and must not be refused"
         );
 
-        // The same file reached through a symlinked spelling of the grant.
+        // A symlinked spelling of the writable TREE.
         let link = tmp.path().join("link");
         std::os::unix::fs::symlink(&grant, &link).expect("symlink");
         assert!(
-            super::agent_writable_root(&link.join("allow.txt"), &project, &grants).is_some(),
+            super::agent_writable_root(&link.join("allow.txt"), &roots).is_some(),
             "a symlinked spelling of a writable tree is still that tree"
+        );
+
+        // The dangerous direction: the configured path is INSIDE a writable
+        // tree and points out of it. Canonicalizing first makes that read as
+        // safe, and the agent then swaps the symlink between reloads — so the
+        // path as written has to be tested too (#499 review).
+        let escape = project.join("escape.txt");
+        std::os::unix::fs::symlink(&outside, &escape).expect("symlink");
+        assert!(
+            super::agent_writable_root(&escape, &roots).is_some(),
+            "a symlink inside a writable tree is swappable, wherever it points today"
+        );
+    }
+
+    /// The writable set must carry the trees no grant creates. A list file in
+    /// the system temp dir is as editable as one in the project.
+    #[test]
+    fn the_writable_set_includes_trees_no_grant_creates() {
+        let roots = cplt::sandbox::session_writable_roots(
+            Path::new("/src/project"),
+            &[PathBuf::from("/src/model")],
+            &[PathBuf::from("/src/granted")],
+            Some(Path::new("/home/u/.cache/cplt/tmp")),
+        );
+        for expected in [
+            "/src/project",
+            "/src/model",
+            "/src/granted",
+            "/home/u/.cache/cplt/tmp",
+        ] {
+            assert!(
+                roots.contains(&PathBuf::from(expected)),
+                "{expected} must be in the writable set: {roots:?}"
+            );
+        }
+        let temp_covered = roots.iter().any(|r| {
+            r.starts_with("/private/tmp")
+                || r.starts_with("/private/var/folders")
+                || r == Path::new("/tmp")
+        });
+        assert!(
+            temp_covered,
+            "the system temp dirs are writable too: {roots:?}"
         );
     }
 
