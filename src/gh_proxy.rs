@@ -2448,6 +2448,63 @@ fn injected_sensitive_config_key(args: &[&str]) -> Option<(&'static str, String)
     None
 }
 
+/// The first sensitive config key injected through the **environment**, if any.
+///
+/// `-c` is not the only way to set config for one command. `GIT_CONFIG_PARAMETERS`
+/// carries the same settings in git's own quoted form, and
+/// `GIT_CONFIG_COUNT` + `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>` carry them
+/// as numbered pairs. Both reach the config that decides where a push lands, so
+/// refusing only the flag left the check cosmetic against an agent that knows
+/// the variable (#409):
+///
+/// ```text
+/// git -c remote.origin.pushurl=<other> push origin feature   → refused
+/// GIT_CONFIG_PARAMETERS="'remote.origin.pushurl=<other>'" \
+///     git push origin feature                                → pushed to <other>
+/// ```
+///
+/// Inspected rather than stripped, because cplt sets `GIT_CONFIG_KEY_*` itself
+/// to turn off commit and tag signing (the private keys are denied), and those
+/// keys are not sensitive. Stripping the variables wholesale would re-enable
+/// signing inside the sandbox and fail every commit.
+///
+/// The parsing is deliberately loose: `GIT_CONFIG_PARAMETERS` is
+/// single-quoted-and-escaped, and a parser that disagrees with git's about an
+/// exotic spelling would be a bypass. Every `=`-bearing token is treated as a
+/// key, so a quoting trick can only ever produce *more* matches, never fewer.
+fn env_injected_sensitive_config_key(vars: &[(String, String)]) -> Option<String> {
+    let sensitive = |key: &str| -> Option<String> {
+        let lower = key.trim_matches(['\'', '"', ' ']).to_ascii_lowercase();
+        SENSITIVE_CONFIG_PREFIXES
+            .iter()
+            .any(|p| lower.starts_with(p))
+            .then_some(lower)
+    };
+
+    for (name, value) in vars {
+        match name.as_str() {
+            "GIT_CONFIG_PARAMETERS" => {
+                for token in value.split_whitespace() {
+                    if let Some(key) = token.split('=').next()
+                        && let Some(hit) = sensitive(key)
+                    {
+                        return Some(hit);
+                    }
+                }
+            }
+            // The numbered form. The value half cannot name a key, so only
+            // KEY_<n> is inspected.
+            n if n.starts_with("GIT_CONFIG_KEY_") => {
+                if let Some(hit) = sensitive(value) {
+                    return Some(hit);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// The push destination that escapes remote-based authorization, if any.
 ///
 /// Two forms redirect a push away from the remote the guard authorizes against:
@@ -2731,6 +2788,23 @@ pub fn gate_git(
     // did not recognize as a push, and the force push landed (#408). Every
     // reason this check exists applies whenever the guard has any push verdict
     // to protect.
+    if (prevent_push || prevent_force_push)
+        && let Some(key) = env_injected_sensitive_config_key(&std::env::vars().collect::<Vec<_>>())
+    {
+        return Err(Refusal {
+            headline: format!(
+                "Config injected through the environment ({key}=…) is not allowed while push \
+                 prevention is active."
+            ),
+            guidance: "GIT_CONFIG_PARAMETERS and GIT_CONFIG_KEY_<n> set the same configuration as\n\
+                       `git -c`, which is refused here for the same reason: the guard would authorize\n\
+                       against different configuration than the push actually runs under.\n\
+                       Unset the variable, configure the remote in the repository, and push to it by name."
+                .to_string(),
+            agent_note: &[NOTE],
+        });
+    }
+
     if (prevent_push || prevent_force_push)
         && let Some((flag, key)) = injected_sensitive_config_key(args)
     {
@@ -6558,6 +6632,66 @@ mod tests {
             gate_git_t(&["-C", &d3, "push"], true, true, false, &rules, Some(&git)).is_err(),
             "push.default=upstream must block a bare push"
         );
+    }
+
+    /// #409: `-c remote.origin.pushurl=…` was refused while the identical
+    /// setting in `GIT_CONFIG_PARAMETERS` pushed to the diverted destination.
+    /// The guard refused one spelling of a setting it allowed through another
+    /// channel, which made the `-c` check cosmetic against an agent that knows
+    /// the variable.
+    #[test]
+    fn config_injected_through_the_environment_is_caught_like_c() {
+        let env = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect()
+        };
+
+        for vars in [
+            vec![(
+                "GIT_CONFIG_PARAMETERS",
+                "'remote.origin.pushurl=https://evil'",
+            )],
+            vec![(
+                "GIT_CONFIG_PARAMETERS",
+                "'url.https://evil/.pushInsteadOf=https://github.com/'",
+            )],
+            vec![("GIT_CONFIG_PARAMETERS", "'push.default=matching'")],
+            vec![("GIT_CONFIG_PARAMETERS", "'alias.p=push --force'")],
+            // The numbered form sets exactly the same config.
+            vec![
+                ("GIT_CONFIG_COUNT", "1"),
+                ("GIT_CONFIG_KEY_0", "remote.origin.pushurl"),
+                ("GIT_CONFIG_VALUE_0", "https://evil"),
+            ],
+            // A key hiding behind an innocuous one.
+            vec![(
+                "GIT_CONFIG_PARAMETERS",
+                "'core.pager=cat' 'branch.main.pushRemote=evil'",
+            )],
+        ] {
+            assert!(
+                env_injected_sensitive_config_key(&env(&vars)).is_some(),
+                "must be refused: {vars:?}"
+            );
+        }
+
+        // cplt sets these itself, to turn off signing whose keys the sandbox
+        // denies. Refusing them would make every commit inside the sandbox fail
+        // — which is why the variables are inspected rather than stripped.
+        let ours = env(&[
+            ("GIT_CONFIG_COUNT", "2"),
+            ("GIT_CONFIG_KEY_0", "commit.gpgsign"),
+            ("GIT_CONFIG_VALUE_0", "false"),
+            ("GIT_CONFIG_KEY_1", "tag.gpgsign"),
+            ("GIT_CONFIG_VALUE_1", "false"),
+        ]);
+        assert!(
+            env_injected_sensitive_config_key(&ours).is_none(),
+            "cplt's own signing overrides are not a push-redirect"
+        );
+        assert!(env_injected_sensitive_config_key(&env(&[])).is_none());
     }
 
     #[test]
