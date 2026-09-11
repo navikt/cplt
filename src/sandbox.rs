@@ -532,6 +532,34 @@ fn writable_trees(config: &SandboxConfig) -> Vec<(PathBuf, &'static str)> {
     trees
 }
 
+/// Every tree a session can write, for callers that need the answer **before**
+/// a [`SandboxConfig`] exists.
+///
+/// `writable_trees` is the full version and runs at profile build time. The
+/// proxy starts earlier than that and has to know the same thing: a domain list
+/// file inside any of these is one the agent can rewrite between reloads
+/// (#426). Kept next to `writable_trees` so the two cannot drift on the trees
+/// that are writable by construction rather than by config — the system temp
+/// dirs and `/dev/shm`, which no grant creates and none can withdraw.
+#[must_use]
+pub fn session_writable_roots(
+    project_dir: &Path,
+    named_roots: &[PathBuf],
+    allow_write: &[PathBuf],
+    scratch_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut roots = vec![project_dir.to_path_buf()];
+    roots.extend(named_roots.iter().cloned());
+    roots.extend(allow_write.iter().cloned());
+    roots.extend(scratch_dir.map(Path::to_path_buf));
+    roots.extend(SYSTEM_TEMP_DIRS.iter().map(PathBuf::from));
+    #[cfg(not(target_os = "macos"))]
+    roots.push(PathBuf::from("/dev/shm"));
+    #[cfg(not(target_os = "macos"))]
+    roots.push(PathBuf::from("/tmp"));
+    roots
+}
+
 /// Names the temp-dir collision in the refusal, and selects its remedy: a temp
 /// dir is writable with no grant to withdraw, so "narrow one of the two" is not
 /// advice a user can act on there.

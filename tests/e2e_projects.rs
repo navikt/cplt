@@ -2539,8 +2539,21 @@ if [ -z "${HTTPS_PROXY:-}" ]; then echo "RESULT:no_https_proxy:OK"; else echo "R
         let project = TempProject::scaffold_node();
         let port = next_proxy_port();
 
-        // Create an allowlist with only one domain
-        let allowlist_path = project.path().join("allowed-domains.txt");
+        // An allowlist with one domain, in a tree the session CANNOT write: a
+        // list file inside a writable tree is refused at launch, because the
+        // proxy re-reads it every few seconds and the agent could rewrite its
+        // own egress rules (#426).
+        //
+        // Not `tempfile::tempdir()` — that lands in the system temp dir, which
+        // the sandbox makes writable by construction, so it is the refused
+        // shape too (#499 review). Under `$HOME`, which is deny-by-default and
+        // granted nothing here, is a tree the session cannot touch; the proxy
+        // reads the file in the unsandboxed parent, so reading it still works.
+        let home = std::env::var("HOME").expect("HOME");
+        let list_dir =
+            std::path::Path::new(&home).join(format!(".cplt-e2e-lists-{}", std::process::id()));
+        std::fs::create_dir_all(&list_dir).expect("list dir");
+        let allowlist_path = list_dir.join("allowed-domains.txt");
         std::fs::write(&allowlist_path, "only-this.example.com\n").unwrap();
 
         // Try to CONNECT to a domain NOT in the allowlist
@@ -2568,6 +2581,8 @@ if echo "$RESP" | grep -q "403"; then echo "RESULT:blocked_unlisted:OK"; else ec
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
         assert_result_ok(&stdout, &stderr, "blocked_unlisted");
+
+        let _ = std::fs::remove_dir_all(&list_dir);
     }
 
     #[test]

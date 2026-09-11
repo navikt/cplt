@@ -212,6 +212,24 @@ An IP literal cannot be waived — give the host a name. A repository may propos
 entries in `[propose.proxy]`, which is the only proxy key `.cplt.toml` can
 propose, and they apply only after `cplt trust accept`.
 
+### Where the list files may live
+
+A list file is re-read every few seconds, which is what makes an edit take
+effect without restarting the session. That is the right design for a person
+editing an allowlist and the wrong one for a file the sandboxed agent can reach
+— so cplt **refuses to launch** when `proxy.allowed_domains` or
+`proxy.blocked_domains` names a path inside the project directory or any
+`allow.write` grant, naming both the file and the tree:
+
+```
+[cplt] proxy.allowed_domains names allow.txt, which is inside ~/src/myproject
+       — a tree this session can write.
+```
+
+An allowlist the agent can edit is not an allowlist. Keep the file somewhere the
+session cannot write; `~/.config/cplt/` is the obvious place, and grants inside
+cplt's own state directory are refused for the same reason.
+
 ### Adding hosts with `allow.domains`
 
 The allowlist file is the right shape for a long, shared or subscription-fed

@@ -100,6 +100,16 @@ impl ScratchDir {
         Ok(ScratchDir { path: session_dir })
     }
 
+    /// The directory every scratch dir is created under, whether or not one
+    /// exists yet.
+    ///
+    /// Callers that must know what the session can write — the proxy list-file
+    /// check (#426) — need the tree, not this run's instance.
+    #[must_use]
+    pub fn base(home_dir: &Path) -> PathBuf {
+        home_dir.join(SCRATCH_BASE)
+    }
+
     /// Path to the scratch directory.
     pub fn path(&self) -> &Path {
         &self.path
