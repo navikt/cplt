@@ -14,17 +14,15 @@
 //! `git checkout` inside the session cannot hide its net changes, because we
 //! always diff the real working tree against the exact commit it started from.
 //!
-//! # Scope (Phase 1)
+//! # Scope
 //!
-//! Git working-tree changes plus session timing only. Network and denial
-//! auditing are deliberately **out of scope** here — they are strictly weaker
-//! than the sandbox (network is incomplete unless proxy-forced; Linux emits no
-//! denial log) and belong to later phases with explicit honesty caveats. This
-//! module never claims more than git + timing can prove.
+//! Git working-tree changes, session timing, and bounded proxy CONNECT evidence.
+//! Network visibility remains partial, including under forced routing.
+//! Denial-log collection and exclusive process attribution remain out of scope.
 
-use crate::ui;
+use crate::{proxy, ui};
 use std::collections::BTreeSet;
-use std::io::Read;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -46,6 +44,12 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// and then it is short — a legitimate background process the user wanted is
 /// left running and named in the report, not killed.
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Maximum time used to stop proxy admission and classify accepted clients.
+pub const SNAPSHOT_DRAIN_BUDGET: Duration = Duration::from_millis(500);
+
+/// Maximum number of retained hosts printed by the explicit domain diagnostic.
+pub const DOMAIN_DISPLAY_LIMIT: usize = 20;
 
 /// A matcher against a changed path, used to classify sensitive files.
 ///
@@ -359,7 +363,11 @@ impl Baseline {
     /// may still be writing: the sample is then a snapshot, not a verdict, and
     /// an empty one must never be rendered as a clean bill of health.
     pub fn finish(self, exit_code: u8, settled: bool) -> AuditReport {
-        let duration = self.start.elapsed();
+        self.finish_at(exit_code, settled, Instant::now())
+    }
+
+    fn finish_at(self, exit_code: u8, settled: bool, finished_at: Instant) -> AuditReport {
+        let duration = finished_at.saturating_duration_since(self.start);
 
         // The after-untracked query. `None` means the git command FAILED (git
         // gone, corrupt repo, timeout) — genuinely distinct from `Some(empty)`
@@ -636,6 +644,188 @@ impl AuditReport {
                 .any(|n| c.path == *n || c.path.strip_suffix('/') == Some(n.as_str()))
         });
     }
+}
+
+/// Write the network report to a caller-owned writer.
+///
+/// The report describes proxy-observed CONNECT verdicts, including blocked
+/// requests. It does not infer DNS success, transport success, application
+/// requests, or exclusive agent attribution from those records.
+///
+/// The caller must ignore a write error when preserving the child exit status
+/// is required. A report failure is independent from the child result.
+pub fn write_network_report<W: Write>(
+    writer: &mut W,
+    snapshot: Option<&proxy::ProxySnapshot>,
+    routing: &str,
+) -> io::Result<()> {
+    let Some(snapshot) = snapshot else {
+        writeln!(
+            writer,
+            "[cplt] Network observations unavailable: the session proxy was disabled."
+        )?;
+        writeln!(writer, "[cplt] Network visibility: partial.")?;
+        writeln!(writer, "[cplt] Routing: {routing}.")?;
+        return Ok(());
+    };
+
+    write_snapshot_status(writer, snapshot, "[cplt]")?;
+
+    match &snapshot.availability {
+        proxy::SnapshotAvailability::Available => {
+            writeln!(
+                writer,
+                "[cplt] Proxy-observed CONNECT attempts recorded: {}.",
+                snapshot.recorded_attempts
+            )?;
+            if snapshot.recorded_attempts == 0 {
+                writeln!(
+                    writer,
+                    "[cplt] A result of zero recorded CONNECT attempts does not prove that no networking occurred."
+                )?;
+            }
+
+            let retained_hosts = snapshot.domains.len();
+            let blocked_hosts = snapshot
+                .domains
+                .iter()
+                .filter(|entry| entry.verdict == proxy::DomainVerdict::Blocked)
+                .count();
+            writeln!(
+                writer,
+                "[cplt] Hosts retained: {retained_hosts}. Hosts with blocked activity: {blocked_hosts}."
+            )?;
+
+            if snapshot.unretained_observations > 0 {
+                writeln!(
+                    writer,
+                    "[cplt] Observations omitted from host breakdown: {}.",
+                    snapshot.unretained_observations
+                )?;
+                writeln!(
+                    writer,
+                    "[cplt] Retained-host and blocked-host counts are lower bounds."
+                )?;
+                writeln!(
+                    writer,
+                    "[cplt] Host retention limits: {} entries and {} bytes per host key.",
+                    snapshot.retained_host_limit, snapshot.host_key_byte_limit
+                )?;
+            }
+        }
+        proxy::SnapshotAvailability::Failed(_) => {
+            writeln!(
+                writer,
+                "[cplt] CONNECT records retained before collection failure: {}.",
+                snapshot.recorded_attempts
+            )?;
+            if !snapshot.domains.is_empty() {
+                writeln!(
+                    writer,
+                    "[cplt] Retained host evidence before collection failure: {} entries.",
+                    snapshot.domains.len()
+                )?;
+            }
+        }
+    }
+
+    writeln!(writer, "[cplt] Network visibility: partial.")?;
+    writeln!(writer, "[cplt] Routing: {routing}.")?;
+    writeln!(
+        writer,
+        "[cplt] Window: proxy start through snapshot cutoff at +{}.",
+        network_duration(
+            snapshot
+                .cutoff_at
+                .saturating_duration_since(snapshot.collection_started_at)
+        )
+    )?;
+    writeln!(
+        writer,
+        "[cplt] Scope: CONNECT records only. Payloads and exclusive process attribution are unavailable."
+    )?;
+    writeln!(
+        writer,
+        "[cplt] Excludes application requests, kernel-denied attempts, DNS, UDP, inbound traffic, delegated services, and activity after the cutoff."
+    )?;
+    Ok(())
+}
+
+/// Write collection, completion, and integrity status for one proxy snapshot.
+pub fn write_snapshot_status<W: Write>(
+    writer: &mut W,
+    snapshot: &proxy::ProxySnapshot,
+    prefix: &str,
+) -> io::Result<()> {
+    match &snapshot.availability {
+        proxy::SnapshotAvailability::Available => {
+            writeln!(writer, "{prefix} Collection: available.")?;
+        }
+        proxy::SnapshotAvailability::Failed(reason) => {
+            writeln!(
+                writer,
+                "{prefix} Collection: failed ({}). Any retained evidence is partial.",
+                snapshot_failure_text(reason)
+            )?;
+        }
+    }
+
+    match snapshot.completion {
+        proxy::SnapshotCompletion::Settled => {
+            writeln!(writer, "{prefix} Classification: settled.")?;
+        }
+        proxy::SnapshotCompletion::DeadlineExceeded {
+            pending_clients,
+            admission,
+        } => {
+            writeln!(
+                writer,
+                "{prefix} Classification deadline reached. Pending proxy clients: {pending_clients}."
+            )?;
+            writeln!(
+                writer,
+                "{prefix} Admission at snapshot: {}.",
+                admission_status_text(admission)
+            )?;
+            writeln!(
+                writer,
+                "{prefix} Pending clients may not contain CONNECT requests. Later records are outside this snapshot."
+            )?;
+        }
+    }
+
+    if snapshot.integrity.collector_poisoned {
+        writeln!(
+            writer,
+            "{prefix} Collection integrity: collector state was poisoned. Counts are partial."
+        )?;
+    }
+    if snapshot.integrity.handler_accounting_failed {
+        writeln!(
+            writer,
+            "{prefix} Collection integrity: handler accounting failed. Counts are partial."
+        )?;
+    }
+    Ok(())
+}
+
+pub fn snapshot_failure_text(reason: &proxy::SnapshotFailure) -> &'static str {
+    match reason {
+        proxy::SnapshotFailure::CollectorPoisoned => "collector state was poisoned",
+        proxy::SnapshotFailure::AcceptThreadPanicked => "proxy accept thread panicked",
+        proxy::SnapshotFailure::HandlerAccountingFailed => "handler accounting failed",
+    }
+}
+
+pub fn admission_status_text(status: proxy::AdmissionStatus) -> &'static str {
+    match status {
+        proxy::AdmissionStatus::Closed => "closed",
+        proxy::AdmissionStatus::Open => "open",
+    }
+}
+
+fn network_duration(duration: Duration) -> String {
+    format!("{}.{:03}s", duration.as_secs(), duration.subsec_millis())
 }
 
 /// Format the per-file `+adds -dels` (or `new file`) suffix for a change line.
@@ -941,6 +1131,25 @@ impl SettleProbe {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AuditMode {
+    Disabled,
+    ObserveOnly,
+    Enabled,
+}
+
+impl AuditMode {
+    pub fn for_run(audit_enabled: bool, observe_domains: bool) -> Self {
+        if audit_enabled {
+            Self::Enabled
+        } else if observe_domains {
+            Self::ObserveOnly
+        } else {
+            Self::Disabled
+        }
+    }
+}
+
 /// Wrap a sandboxed exec with the audit lifecycle: capture the baseline just
 /// before the closure runs the agent, then generate and print the report after
 /// it exits. Both `main.rs` exec sites call this so the wiring cannot diverge.
@@ -949,52 +1158,65 @@ impl SettleProbe {
 /// `project_dir` is named after the report so the session is never presented as
 /// clean on the strength of a measurement that never looked there (#214).
 ///
-/// When `enabled` is false (`--no-audit`, `--quiet`, or config `audit = false`)
-/// the closure runs with no measurement or output at all.
-pub fn run<F: FnOnce() -> u8>(
+/// Observe-only runs retain descendant settling without printing the audit.
+/// Disabled runs still perform ordinary proxy cleanup through the callback.
+pub fn run<F: FnOnce() -> u8, C: FnOnce() -> Option<proxy::ProxySnapshot>>(
     project_dir: &Path,
     allow_write: &[PathBuf],
     named_roots: &[PathBuf],
-    enabled: bool,
+    mode: AuditMode,
+    routing: &str,
     exec: F,
-) -> u8 {
-    if !enabled {
-        return exec();
-    }
-    let baseline = Baseline::capture(project_dir);
-    // One baseline per named root, captured here for the same reason the
-    // project's is: in the parent, before the agent can touch the repository it
-    // describes. A root that is not readable degrades to `Unavailable` on its
-    // own line rather than taking the session's report down with it.
-    let named: Vec<(PathBuf, Baseline)> = named_roots
-        .iter()
-        .map(|dir| (dir.clone(), Baseline::capture(dir)))
-        .collect();
-    // Armed AFTER the baselines, so only the session's own processes inherit the
-    // write end — the baselines' short-lived git children are already reaped.
-    let probe = SettleProbe::arm();
+    finalize: C,
+) -> (u8, Option<proxy::ProxySnapshot>) {
+    let baseline = (mode == AuditMode::Enabled).then(|| Baseline::capture(project_dir));
+    let named: Vec<(PathBuf, Baseline)> = if mode == AuditMode::Enabled {
+        named_roots
+            .iter()
+            .map(|dir| (dir.clone(), Baseline::capture(dir)))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // Armed AFTER the baseline, so only the session's own processes inherit the
+    // write end. Baseline git children are already reaped.
+    let probe = if mode == AuditMode::Disabled {
+        None
+    } else {
+        SettleProbe::arm()
+    };
     let exit_code = exec();
-    // `exec` returns when the DIRECT child is reaped; the sample must not be
-    // taken until the rest of the tree is gone too (GHSA-c47q-c3c8-7wrf).
+    // `exec` returns when the direct child is reaped. The sample must wait for
+    // the existing descendant probe before freezing the proxy snapshot.
     let settled = probe.is_some_and(SettleProbe::settled);
-    let mut report = baseline.finish(exit_code, settled);
-    report.drop_named_roots(project_dir, named_roots);
-    report.print();
-    for (dir, baseline) in named {
-        baseline.finish(exit_code, settled).print_named(&dir);
+    // Preserve the existing project-audit timing boundary. Proxy drain time is
+    // reported by the network window and does not extend session duration.
+    let project_audit_finished_at = Instant::now();
+    let snapshot = finalize();
+
+    if let Some(baseline) = baseline {
+        let mut report = baseline.finish_at(exit_code, settled, project_audit_finished_at);
+        report.drop_named_roots(project_dir, named_roots);
+        report.print();
+        for (dir, baseline) in named {
+            baseline
+                .finish_at(exit_code, settled, project_audit_finished_at)
+                .print_named(&dir);
+        }
+        let mut stderr = io::stderr().lock();
+        let _ = write_network_report(&mut stderr, snapshot.as_ref(), routing);
+        if let Some(line) =
+            unaudited_warning(project_dir, &unaudited_roots(project_dir, allow_write))
+        {
+            ui::warn(&line);
+        }
     }
-    if !settled {
-        // Emitted next to the reports rather than inside `AuditReport`: it is
-        // true of every variant, of every root, and none of them has a place to
-        // put it.
+    if mode != AuditMode::Disabled && !settled {
         ui::warn(
-            "the session left processes running — anything they change from here on is NOT audited",
+            "the session left processes running — anything they change from here on is NOT audited; network activity after the cutoff is excluded",
         );
     }
-    if let Some(line) = unaudited_warning(project_dir, &unaudited_roots(project_dir, allow_write)) {
-        ui::warn(&line);
-    }
-    exit_code
+    (exit_code, snapshot)
 }
 
 #[cfg(test)]
@@ -1849,5 +2071,150 @@ mod tests {
             AuditReport::Incomplete { exit_code, .. } => assert_eq!(exit_code, 0),
             other => panic!("expected Incomplete (untrustworthy delta), got {other:?}"),
         }
+    }
+
+    fn test_snapshot(
+        availability: proxy::SnapshotAvailability,
+        completion: proxy::SnapshotCompletion,
+    ) -> proxy::ProxySnapshot {
+        let now = Instant::now();
+        proxy::ProxySnapshot {
+            availability,
+            collection_started_at: now,
+            admission_closed_at: Some(now),
+            cutoff_at: now,
+            completion,
+            recorded_attempts: 3,
+            unretained_observations: 0,
+            domains: vec![proxy::ObservedDomain {
+                host: "safe.example".to_string(),
+                verdict: proxy::DomainVerdict::Blocked,
+                count: 3,
+            }],
+            integrity: proxy::SnapshotIntegrity::default(),
+            retained_host_limit: 1024,
+            host_key_byte_limit: 1024,
+        }
+    }
+
+    fn render_network_report(snapshot: Option<&proxy::ProxySnapshot>, routing: &str) -> String {
+        let mut out = Vec::new();
+        write_network_report(&mut out, snapshot, routing)
+            .expect("writing a network report to memory cannot fail");
+        String::from_utf8(out).expect("network report must be UTF-8")
+    }
+
+    #[test]
+    fn network_report_separates_counts_completion_and_partial_visibility() {
+        let snapshot = test_snapshot(
+            proxy::SnapshotAvailability::Available,
+            proxy::SnapshotCompletion::Settled,
+        );
+        let report = render_network_report(Some(&snapshot), "forced proxy on Linux");
+        assert!(report.contains("Proxy-observed CONNECT attempts recorded: 3."));
+        assert!(report.contains("Hosts retained: 1. Hosts with blocked activity: 1."));
+        assert!(report.contains("Classification: settled."));
+        assert!(report.contains("Network visibility: partial."));
+        assert!(report.contains("exclusive process attribution are unavailable"));
+        assert!(!report.contains("successful connections"));
+        assert!(report.contains("Excludes application requests, kernel-denied attempts, DNS, UDP, inbound traffic, delegated services, and activity after the cutoff."));
+    }
+
+    #[test]
+    fn network_report_discloses_retention_loss() {
+        let mut snapshot = test_snapshot(
+            proxy::SnapshotAvailability::Available,
+            proxy::SnapshotCompletion::Settled,
+        );
+        snapshot.recorded_attempts = u64::MAX;
+        snapshot.unretained_observations = 7;
+        let report = render_network_report(Some(&snapshot), "proxy enabled");
+        assert!(report.contains(&format!("attempts recorded: {}.", u64::MAX)));
+        assert!(report.contains("Observations omitted from host breakdown: 7."));
+        assert!(report.contains("blocked-host counts are lower bounds."));
+        assert!(report.contains("1024 entries and 1024 bytes per host key."));
+        assert!(!report.contains("does not prove"));
+    }
+
+    #[test]
+    fn network_report_marks_deadline_and_failed_collection_independently() {
+        let snapshot = test_snapshot(
+            proxy::SnapshotAvailability::Failed(proxy::SnapshotFailure::CollectorPoisoned),
+            proxy::SnapshotCompletion::DeadlineExceeded {
+                pending_clients: 2,
+                admission: proxy::AdmissionStatus::Closed,
+            },
+        );
+        let report = render_network_report(Some(&snapshot), "proxy enabled");
+        assert!(report.contains(
+            "Collection: failed (collector state was poisoned). Any retained evidence is partial."
+        ));
+        assert!(report.contains("CONNECT records retained before collection failure: 3."));
+        assert!(report.contains("Classification deadline reached. Pending proxy clients: 2."));
+        assert!(report.contains("Admission at snapshot: closed."));
+        assert!(report.contains("Network visibility: partial."));
+    }
+
+    #[test]
+    fn network_report_write_error_is_returned() {
+        struct Fails;
+        impl Write for Fails {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "test"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut writer = Fails;
+        let error = write_network_report(&mut writer, None, "proxy disabled").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn network_report_distinguishes_healthy_empty_from_failed_empty() {
+        let mut healthy = test_snapshot(
+            proxy::SnapshotAvailability::Available,
+            proxy::SnapshotCompletion::Settled,
+        );
+        healthy.recorded_attempts = 0;
+        healthy.domains.clear();
+        let healthy_report = render_network_report(Some(&healthy), "proxy enabled");
+        assert!(healthy_report.contains("Collection: available."));
+        assert!(healthy_report.contains("CONNECT attempts recorded: 0."));
+        assert!(healthy_report.contains("does not prove that no networking occurred"));
+
+        let mut failed = healthy;
+        failed.availability =
+            proxy::SnapshotAvailability::Failed(proxy::SnapshotFailure::CollectorPoisoned);
+        let failed_report = render_network_report(Some(&failed), "proxy enabled");
+        assert!(failed_report.contains("Collection: failed"));
+        assert!(failed_report.contains("CONNECT records retained before collection failure: 0."));
+        assert!(!failed_report.contains("does not prove that no networking occurred"));
+    }
+
+    #[test]
+    fn disabled_audit_still_runs_finalization_after_exec() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (exit_code, snapshot) = run(
+            dir.path(),
+            &[],
+            &[],
+            AuditMode::Disabled,
+            "proxy disabled",
+            || {
+                events.borrow_mut().push("exec");
+                37
+            },
+            || {
+                events.borrow_mut().push("finalize");
+                None
+            },
+        );
+        assert_eq!(exit_code, 37);
+        assert!(snapshot.is_none());
+        assert_eq!(*events.borrow(), ["exec", "finalize"]);
     }
 }

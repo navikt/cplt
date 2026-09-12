@@ -2,14 +2,14 @@
 
 ## Proxy
 
-The proxy is enabled by default. All outbound traffic (Copilot CLI, `gh`, `curl`) routes through a localhost CONNECT proxy via `HTTP_PROXY`/`HTTPS_PROXY` and `NODE_USE_ENV_PROXY=1`. It listens on an OS-assigned ephemeral port, so nothing conflicts.
+The proxy is enabled by default. cplt directs proxy-aware tools through a localhost CONNECT proxy with `HTTP_PROXY`/`HTTPS_PROXY` and `NODE_USE_ENV_PROXY=1`. It listens on an OS-assigned ephemeral port. The proxy observes only activity that reaches it.
 
 What that buys you:
 
-- **Connection logging.** Every domain Copilot connects to, in real time.
+- **Connection logging.** CONNECT decisions made by the proxy, in real time.
 - **Domain blocking.** Known exfiltration infrastructure: paste sites, webhook services, and so on.
 - **Domain allowlisting.** Connections restricted to known-safe domains.
-- **Audit log.** A persistent file log of every connection, for post-session review.
+- **Audit log.** A persistent file log of proxy decisions, for post-session review.
 - **Port enforcement.** The proxy applies the same port restrictions as the sandbox (443 plus `--allow-port`).
 
 Turn it off for one run, or permanently:
@@ -36,7 +36,7 @@ cplt config set proxy.log_file "~/.config/cplt/proxy.log"
 | --------------------------- | ------------------------------------------------------------------------------------------------ |
 | `--with-proxy`              | Explicitly enable the proxy (no-op when proxy is already on by default).                         |
 | `--no-proxy`                | Disable the proxy for this run.                                                                  |
-| `--proxy-forced` / `--no-proxy-forced` | Force **all** egress through the proxy (opt-in, default off): make the proxy mandatory and restrict kernel egress to the proxy port. Fails closed; conflicts with `--no-proxy`. See [Proxy-forced mode](#proxy-forced-mode). |
+| `--proxy-forced` / `--no-proxy-forced` | Make the proxy mandatory and restrict direct routing where the platform supports it (opt-in, default off). Conflicts with `--no-proxy`. See [Proxy-forced mode](#proxy-forced-mode) and [network snapshot coverage](#network-snapshot). |
 | `--proxy-port <PORT>`       | Which port the proxy listens on (default: 0, OS-assigned ephemeral).                             |
 | `--blocked-domains <FILE>`  | Domains to block, one per line. Re-read every ~5s, so you can edit it live. |
 | `--allowed-domains <FILE>`  | Domains to allow. Setting it turns the allowlist on, and only listed domains can connect — an empty file therefore blocks everything, and a missing file is a startup error. Re-read every ~5s. |
@@ -53,6 +53,58 @@ cplt config set proxy.log_file "~/.config/cplt/proxy.log"
 > **Localhost traffic** (MCP servers, dev servers) bypasses the proxy via `NO_PROXY` and will not appear in the audit log.
 >
 > **Quiet mode** (`-q` / `sandbox.quiet = true`) suppresses the startup banner. Proxy stderr output is controlled separately by `--proxy-log-level`, which defaults to `none`. Use `--proxy-log` to capture all connections to a file.
+
+## Network snapshot
+
+The parent includes a network snapshot in the post-session audit. Both agent execution and `cplt exec` use the same capture lifecycle.
+
+Use `--no-quiet` to display the audit with `cplt exec`, which defaults to quiet. `--no-audit`, `--quiet`, and `sandbox.audit = false` suppress the audit.
+
+Collection uses the existing proxy observer. It does not enable `--observe-domains`, change domain policy, or require a proxy log file.
+
+| Reported value | Meaning |
+| --- | --- |
+| Recorded CONNECT attempts | CONNECT verdict records committed before the snapshot cutoff. |
+| Retained hosts | Distinct normalized host keys retained by the collector. |
+| Hosts with blocked activity | Retained hosts with at least one blocked verdict. |
+| Pending proxy clients | Admitted clients without a completed classification at the cutoff. Some may not have sent CONNECT requests. |
+| Unretained observations | Records counted in the total but omitted from the host breakdown because of storage limits or malformed user information in the authority. |
+
+An allowed verdict means that cplt permitted an attempt. DNS, transport, or upstream proxy failure can still prevent connection establishment.
+
+A blocked verdict is sticky per host. Allowed, blocked, and allowed observations for one host produce three records and one host with blocked activity.
+
+The report does not derive blocked-attempt or successful-connection totals from those aggregates. A CONNECT tunnel can carry many application requests.
+
+Collection starts with the proxy, before child execution. The proxy remains available during the existing bounded descendant wait.
+
+The parent then stops admission and allows up to 500 milliseconds for pending classification. This drain budget also covers admission shutdown. Snapshot acquisition uses a short in-memory lock; scheduling and lock acquisition are not hard real-time guarantees.
+
+The snapshot cutoff freezes one consistent state. Classification can settle while established tunnels remain open. The audit does not wait for tunnel closure or terminate descendants.
+
+The existing descendant wait can add two seconds. Git inspection and scheduling add time beyond these wait budgets.
+
+The collector retains at most 1,024 hosts, with at most 1,024 bytes per stored key. It continues counting records when host storage reaches a limit.
+
+Host counts become lower bounds when records lack host entries. Collection failures are reported with the retained evidence.
+
+Unavailable collection is not reported as zero activity. Zero recorded attempts do not prove absence of networking.
+
+**Network visibility remains partial.** Routing facts are reported separately:
+
+- Without forced mode, direct traffic can bypass the proxy.
+- On macOS, forced mode restricts direct remote routing through the local proxy. Local and delegated service activity remains outside the observation scope.
+- On Linux, Landlock cannot restrict an allowed TCP port to localhost. Older kernels may lack TCP restriction support entirely.
+- Under current forced mode, `--allow-port` extends proxy policy without opening that port for direct remote access.
+- Corporate upstream and `upstream_no_proxy` paths remain observable when their CONNECT requests enter cplt's proxy.
+
+The snapshot does not record payloads, application requests, kernel-denied attempts, DNS, UDP, inbound traffic, or activity after its cutoff.
+
+Proxy clients are not authenticated by process identity. The report cannot establish exclusive attribution to the sandboxed child.
+
+The explicit `--observe-domains` diagnostic uses the same snapshot. Its terminal list displays at most 20 entries and discloses omitted entries.
+
+`--observe-domains-out` writes retained allowed hosts, including when collection is incomplete. Leading `# incomplete:` comments disclose collection failures, pending clients, and omitted observations. Invalid host entries, including escaped control characters, are omitted and counted in a comment. The allowlist parser ignores these comments. The parent opens the output destination before the session without following a destination symlink, then writes through that pinned handle. Replacing the path during the session cannot redirect the parent write.
 
 ## Proxy-forced mode
 
@@ -330,7 +382,7 @@ cplt config set proxy.default_allowlist true         # permanently
 
 ### Verifying and generating an agent's allowlist
 
-Per-agent default allowlists should be observed empirically, not guessed. `--observe-domains` runs the session with the proxy in allow-all mode, records every domain the agent contacts, and prints the set as a ready-to-paste allowlist.
+Per-agent default allowlists should be observed empirically, not guessed. `--observe-domains` runs the session with the proxy in allow-all mode, captures bounded CONNECT evidence, and prints retained hosts for allowlist review.
 
 ```bash
 # Capture what the agent contacts while doing a representative task.
@@ -339,12 +391,15 @@ cplt --agent copilot --observe-domains -- -p "add tests for the parser and run t
 
 `--observe-domains`:
 
-- **Forces the proxy on and in allow-all mode for this run.** It overrides `--preset strict`, `--default-allowlist`, `proxy.default_allowlist`, and any configured `allowed_domains`, so nothing is blocked and you observe the full set the agent would contact. cplt prints a one-line notice and a warning that this run does not enforce domain filtering. Do not treat an observe run as a protected session.
-- **Records every CONNECT** regardless of `--proxy-log` and `--proxy-log-level`, then emits the sorted, deduplicated host list to stderr, always, even under `--quiet`:
+- **Forces the proxy on and in allow-all mode for this run.** It overrides `--preset strict`, `--default-allowlist`, `proxy.default_allowlist`, and any configured `allowed_domains`, while blocklists, port policy, and private-address restrictions continue to apply. cplt prints a one-line notice and a warning that this run does not enforce domain filtering. Do not treat an observe run as a protected session.
+- **Counts committed CONNECT records** regardless of `--proxy-log` and `--proxy-log-level`. It displays up to 20 sorted retained hosts on stderr, even under `--quiet`:
 
 ```
-[cplt] observe-domains: 14 domains contacted by Copilot this session
-# add to allowed_domains (or src/agent.rs default_allowed_domains):
+[cplt] observe-domains: 14 proxy-observed retained CONNECT hosts
+[cplt] observe-domains: Collection: available.
+[cplt] observe-domains: Classification: settled.
+[cplt] observe-domains: network visibility: partial.
+# retained host evidence for review before updating allowed_domains:
 # bare hosts, exact-or-subdomain match; collapse subdomains to a parent by hand
 # e.g. api.githubcopilot.com + proxy.githubcopilot.com -> githubcopilot.com
 api.github.com
@@ -354,10 +409,10 @@ registry.npmjs.org
 ...
 ```
 
-- **`--observe-domains-out <FILE>`** also writes the bare domain list, one per line, to `FILE` for scripting.
+- **`--observe-domains-out <FILE>`** writes retained allowed hosts to `FILE`. Incomplete snapshots include leading `# incomplete:` comments. Invalid host entries are omitted and disclosed. See [Network snapshot](#network-snapshot).
 - **Works for `cplt exec` too:** `cplt --agent claude --observe-domains exec -- npm test`.
 
-To make it representative, exercise the workflows you care about in one session: resume a chat, build, run tests, install a dependency. The emitted hosts are the raw observed set. Subdomains are not auto-collapsed, since that needs a public-suffix heuristic that risks over-broadening. Because the matcher is exact-or-subdomain, fold related subdomains to a parent by hand, turning `api.githubcopilot.com` and `proxy.githubcopilot.com` into `githubcopilot.com`.
+To make it representative, exercise the workflows you care about in one session: resume a chat, build, run tests, install a dependency. The emitted hosts are the retained proxy evidence, subject to the stated limits. Subdomains are not auto-collapsed, since that needs a public-suffix heuristic that risks over-broadening. Because the matcher is exact-or-subdomain, fold related subdomains to a parent by hand, turning `api.githubcopilot.com` and `proxy.githubcopilot.com` into `githubcopilot.com`.
 
 **Updating the allowlist.** Paste the observed hosts into either:
 

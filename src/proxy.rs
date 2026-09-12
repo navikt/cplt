@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use crate::ui;
@@ -86,6 +86,12 @@ fn is_blocked_status(status: &str) -> bool {
 
 const MAX_CONNECTIONS: usize = 64;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Maximum number of normalized host records retained in one proxy snapshot.
+pub const OBSERVED_HOST_LIMIT: usize = 1_024;
+
+/// Maximum UTF-8 byte length of one normalized host key retained in a snapshot.
+pub const OBSERVED_HOST_KEY_BYTE_LIMIT: usize = 1_024;
 
 /// Idle ceiling for an established CONNECT tunnel.
 ///
@@ -357,8 +363,7 @@ impl DomainVerdict {
 }
 
 /// One host the proxy observed a CONNECT for, with its verdict and how many
-/// CONNECTs targeted it. Returned (sorted by host) from
-/// [`ProxyHandle::observed_domains`].
+/// CONNECTs targeted it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObservedDomain {
     /// Normalized host (lowercase, trailing dot stripped).
@@ -375,17 +380,237 @@ struct DomainObservation {
     count: u64,
 }
 
-/// Thread-safe map of normalized host → observation, keyed for stable sorted
-/// output. Held behind an `Arc` so the connection threads and the
-/// [`ProxyHandle`] share one collector and results can be read after the
-/// session ends.
-///
-/// This is the generic capture substrate for BOTH `--observe-domains` and audit
-/// Phase 2 network reporting — it records EVERY CONNECT verdict regardless of
-/// the stderr log level or whether a `--proxy-log` file is configured. A lock
-/// per connection is intentionally acceptable: at cplt's scale (`MAX_CONNECTIONS`
-/// = 64) the CONNECT path is not hot.
-type DomainCollector = Mutex<BTreeMap<String, DomainObservation>>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdmissionStatus {
+    Closed,
+    Open,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotCompletion {
+    Settled,
+    DeadlineExceeded {
+        pending_clients: usize,
+        admission: AdmissionStatus,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotFailure {
+    CollectorPoisoned,
+    AcceptThreadPanicked,
+    HandlerAccountingFailed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotAvailability {
+    Available,
+    Failed(SnapshotFailure),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SnapshotIntegrity {
+    pub collector_poisoned: bool,
+    pub handler_accounting_failed: bool,
+}
+
+/// Immutable proxy evidence captured at one cutoff.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProxySnapshot {
+    pub availability: SnapshotAvailability,
+    pub collection_started_at: Instant,
+    /// The actual accept-loop stop time. `None` means admission did not stop
+    /// before the snapshot cutoff.
+    pub admission_closed_at: Option<Instant>,
+    pub cutoff_at: Instant,
+    pub completion: SnapshotCompletion,
+    pub recorded_attempts: u64,
+    pub unretained_observations: u64,
+    pub domains: Vec<ObservedDomain>,
+    pub integrity: SnapshotIntegrity,
+    pub retained_host_limit: usize,
+    pub host_key_byte_limit: usize,
+}
+
+struct CollectorState {
+    domains: BTreeMap<String, DomainObservation>,
+    recorded_attempts: u64,
+    unretained_observations: u64,
+    pending_clients: usize,
+    admission_closed_at: Option<Instant>,
+    frozen: bool,
+    collector_poisoned: bool,
+    accept_thread_panicked: bool,
+    handler_accounting_failed: bool,
+}
+
+impl CollectorState {
+    fn new() -> Self {
+        Self {
+            domains: BTreeMap::new(),
+            recorded_attempts: 0,
+            unretained_observations: 0,
+            pending_clients: 0,
+            admission_closed_at: None,
+            frozen: false,
+            collector_poisoned: false,
+            accept_thread_panicked: false,
+            handler_accounting_failed: false,
+        }
+    }
+
+    fn record(&mut self, host: &str, verdict: DomainVerdict) {
+        if self.frozen {
+            return;
+        }
+
+        self.recorded_attempts = self.recorded_attempts.saturating_add(1);
+        if host.contains('@') {
+            self.unretained_observations = self.unretained_observations.saturating_add(1);
+            return;
+        }
+        let key = normalize_hostname(host);
+        if let Some(entry) = self.domains.get_mut(&key) {
+            entry.count = entry.count.saturating_add(1);
+            if verdict == DomainVerdict::Blocked {
+                entry.verdict = DomainVerdict::Blocked;
+            }
+            return;
+        }
+
+        if key.is_empty()
+            || key.len() > OBSERVED_HOST_KEY_BYTE_LIMIT
+            || self.domains.len() >= OBSERVED_HOST_LIMIT
+        {
+            self.unretained_observations = self.unretained_observations.saturating_add(1);
+            return;
+        }
+
+        self.domains
+            .insert(key, DomainObservation { verdict, count: 1 });
+    }
+}
+
+/// One bounded collector shared by the accept loop, connection workers, and handle.
+struct DomainCollector {
+    state: Mutex<CollectorState>,
+    wake_tx: mpsc::SyncSender<()>,
+}
+
+impl DomainCollector {
+    fn new() -> (Arc<Self>, mpsc::Receiver<()>) {
+        let (wake_tx, wake_rx) = mpsc::sync_channel(1);
+        (
+            Arc::new(Self {
+                state: Mutex::new(CollectorState::new()),
+                wake_tx,
+            }),
+            wake_rx,
+        )
+    }
+
+    fn notify(&self) {
+        let _ = self.wake_tx.try_send(());
+    }
+
+    fn lock_recovering(&self) -> std::sync::MutexGuard<'_, CollectorState> {
+        match self.state.lock() {
+            Ok(state) => state,
+            Err(error) => {
+                let mut state = error.into_inner();
+                state.collector_poisoned = true;
+                state
+            }
+        }
+    }
+
+    fn admit(self: &Arc<Self>) -> Option<ClassificationGuard> {
+        let mut state = self.lock_recovering();
+        if state.frozen || state.admission_closed_at.is_some() {
+            return None;
+        }
+        let Some(pending) = state.pending_clients.checked_add(1) else {
+            state.handler_accounting_failed = true;
+            return None;
+        };
+        state.pending_clients = pending;
+        Some(ClassificationGuard {
+            collector: self.clone(),
+            completed: false,
+        })
+    }
+
+    fn close_admission(&self, at: Instant, accept_thread_panicked: bool) {
+        let mut state = self.lock_recovering();
+        state.admission_closed_at.get_or_insert(at);
+        state.accept_thread_panicked |= accept_thread_panicked;
+        drop(state);
+        self.notify();
+    }
+
+    #[cfg(test)]
+    fn mark_handler_accounting_failed(&self) {
+        let mut state = self.lock_recovering();
+        state.handler_accounting_failed = true;
+        drop(state);
+        self.notify();
+    }
+
+    #[cfg(test)]
+    fn record_without_admission(&self, host: &str, verdict: DomainVerdict) {
+        self.lock_recovering().record(host, verdict);
+        self.notify();
+    }
+}
+
+struct ClassificationGuard {
+    collector: Arc<DomainCollector>,
+    completed: bool,
+}
+
+impl ClassificationGuard {
+    fn complete(&mut self, observation: Option<(&str, DomainVerdict)>) {
+        self.complete_with_integrity(observation, false);
+    }
+
+    fn complete_with_integrity(
+        &mut self,
+        observation: Option<(&str, DomainVerdict)>,
+        handler_accounting_failed: bool,
+    ) {
+        debug_assert!(
+            !self.completed,
+            "CONNECT classification guard completed more than once"
+        );
+        if self.completed {
+            return;
+        }
+
+        let mut state = self.collector.lock_recovering();
+        if let Some((host, verdict)) = observation {
+            state.record(host, verdict);
+        }
+        state.handler_accounting_failed |= handler_accounting_failed;
+        if state.pending_clients == 0 {
+            state.handler_accounting_failed = true;
+        } else {
+            state.pending_clients -= 1;
+        }
+        self.completed = true;
+        drop(state);
+        self.collector.notify();
+    }
+}
+
+impl Drop for ClassificationGuard {
+    fn drop(&mut self) {
+        // Every successful handler path explicitly completes classification.
+        // An unfinished guard indicates lost evidence, even without a panic.
+        if !self.completed {
+            self.complete_with_integrity(None, true);
+        }
+    }
+}
 
 /// Shared proxy state holding cached domain lists and config paths.
 /// Wrapped in `Arc` and shared across connection threads.
@@ -414,11 +639,8 @@ pub struct ProxyState {
     // (exact + subdomain), like the other domain lists.
     upstream_no_proxy: Vec<String>,
 
-    // Observed-domains collector: records every CONNECT target host and whether
-    // policy allowed or blocked it. Shared (Arc) with the ProxyHandle so the set
-    // can be read after the session. Always present (cheap at cplt's scale);
-    // `--observe-domains` merely reads it and forces allow-all so the full set
-    // is captured. Foundation for audit Phase 2 network reporting.
+    // Bounded CONNECT collector shared with the final snapshot handle. It keeps
+    // aggregate totals even when a host record exceeds a retention limit.
     domain_collector: Arc<DomainCollector>,
 
     // Test-only: injectable DNS resolver to simulate fake DNS responses.
@@ -434,22 +656,10 @@ impl ProxyState {
     /// to a single entry. `Blocked` is sticky: once a host is seen blocked it
     /// stays blocked even if a later attempt is allowed, so the observed list
     /// always surfaces anything policy refused.
+    #[cfg(test)]
     fn record_observation(&self, host: &str, verdict: DomainVerdict) {
-        let key = normalize_hostname(host);
-        if key.is_empty() {
-            return;
-        }
-        let mut map = self
-            .domain_collector
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let entry = map
-            .entry(key)
-            .or_insert(DomainObservation { verdict, count: 0 });
-        entry.count = entry.count.saturating_add(1);
-        if verdict == DomainVerdict::Blocked {
-            entry.verdict = DomainVerdict::Blocked;
-        }
+        self.domain_collector
+            .record_without_admission(host, verdict);
     }
 
     /// The effective private-domain waiver list right now (TTL-refreshed).
@@ -472,9 +682,17 @@ pub struct ProxyHandle {
     /// the OS assigns an ephemeral port; this field reflects the real value.
     pub port: u16,
     /// Shared observation collector (see [`ProxyState::domain_collector`]).
-    /// Cloned from the state so the observed set can be read after the session
-    /// via [`ProxyHandle::observed_domains`].
+    /// The finalizer moves its retained records into one immutable snapshot.
     domain_collector: Arc<DomainCollector>,
+    collection_started_at: Instant,
+    accept_done_rx: mpsc::Receiver<AcceptLoopOutcome>,
+    classification_wake_rx: mpsc::Receiver<()>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcceptLoopOutcome {
+    Closed(Instant),
+    Panicked(Instant),
 }
 
 impl ProxyHandle {
@@ -485,23 +703,128 @@ impl ProxyHandle {
         // the flag within ~50ms without needing a wake-up connection.
     }
 
-    /// Snapshot every host the proxy saw a CONNECT for this session, sorted by
-    /// host, each with its verdict (`Allowed`/`Blocked`) and CONNECT count.
-    ///
-    /// Backs `--observe-domains` (and, later, audit Phase 2 network reporting).
-    /// The `BTreeMap` yields hosts already sorted and deduplicated.
+    /// Test reader for the live collector before snapshot finalization.
+    #[cfg(test)]
     pub fn observed_domains(&self) -> Vec<ObservedDomain> {
-        let map = self
-            .domain_collector
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.iter()
+        let state = self.domain_collector.lock_recovering();
+        state
+            .domains
+            .iter()
             .map(|(host, obs)| ObservedDomain {
                 host: host.clone(),
                 verdict: obs.verdict,
                 count: obs.count,
             })
             .collect()
+    }
+
+    /// Stop admission and freeze one immutable snapshot within `budget`.
+    ///
+    /// The budget covers both accept-loop shutdown and pending CONNECT
+    /// classification. Established relay lifetime is deliberately excluded.
+    pub fn finalize_snapshot(self, budget: Duration) -> ProxySnapshot {
+        self.shutdown();
+        let deadline = Instant::now()
+            .checked_add(budget)
+            .unwrap_or_else(Instant::now);
+
+        let accept_outcome = if budget.is_zero() {
+            self.accept_done_rx.try_recv().ok()
+        } else {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            self.accept_done_rx.recv_timeout(remaining).ok()
+        };
+        match accept_outcome {
+            Some(AcceptLoopOutcome::Closed(at)) => {
+                self.domain_collector.close_admission(at, false);
+            }
+            Some(AcceptLoopOutcome::Panicked(at)) => {
+                self.domain_collector.close_admission(at, true);
+            }
+            None => {}
+        }
+
+        loop {
+            let mut state = self.domain_collector.lock_recovering();
+            let cutoff_at = Instant::now();
+            let deadline_reached = cutoff_at >= deadline;
+            let settled = state.admission_closed_at.is_some() && state.pending_clients == 0;
+            if settled || deadline_reached {
+                return freeze_snapshot(&mut state, self.collection_started_at, cutoff_at);
+            }
+            drop(state);
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                continue;
+            }
+            let _ = self.classification_wake_rx.recv_timeout(remaining);
+        }
+    }
+}
+
+fn snapshot_failure(state: &CollectorState) -> Option<SnapshotFailure> {
+    if state.collector_poisoned {
+        Some(SnapshotFailure::CollectorPoisoned)
+    } else if state.accept_thread_panicked {
+        Some(SnapshotFailure::AcceptThreadPanicked)
+    } else if state.handler_accounting_failed {
+        Some(SnapshotFailure::HandlerAccountingFailed)
+    } else {
+        None
+    }
+}
+
+fn snapshot_completion(state: &CollectorState) -> SnapshotCompletion {
+    if state.admission_closed_at.is_some() && state.pending_clients == 0 {
+        SnapshotCompletion::Settled
+    } else {
+        SnapshotCompletion::DeadlineExceeded {
+            pending_clients: state.pending_clients,
+            admission: if state.admission_closed_at.is_some() {
+                AdmissionStatus::Closed
+            } else {
+                AdmissionStatus::Open
+            },
+        }
+    }
+}
+
+fn freeze_snapshot(
+    state: &mut CollectorState,
+    collection_started_at: Instant,
+    cutoff_at: Instant,
+) -> ProxySnapshot {
+    state.frozen = true;
+    let availability = snapshot_failure(state).map_or(
+        SnapshotAvailability::Available,
+        SnapshotAvailability::Failed,
+    );
+    let completion = snapshot_completion(state);
+    let integrity = SnapshotIntegrity {
+        collector_poisoned: state.collector_poisoned,
+        handler_accounting_failed: state.handler_accounting_failed,
+    };
+    let domains = std::mem::take(&mut state.domains)
+        .into_iter()
+        .map(|(host, observation)| ObservedDomain {
+            host,
+            verdict: observation.verdict,
+            count: observation.count,
+        })
+        .collect();
+    ProxySnapshot {
+        availability,
+        collection_started_at,
+        admission_closed_at: state.admission_closed_at,
+        cutoff_at,
+        completion,
+        recorded_attempts: state.recorded_attempts,
+        unretained_observations: state.unretained_observations,
+        domains,
+        integrity,
+        retained_host_limit: OBSERVED_HOST_LIMIT,
+        host_key_byte_limit: OBSERVED_HOST_KEY_BYTE_LIMIT,
     }
 }
 
@@ -608,8 +931,9 @@ pub fn start(opts: ProxyOptions) -> Result<ProxyHandle, String> {
         .port();
 
     // Observation collector, shared between the connection threads (via state)
-    // and the returned handle so observed domains can be read after shutdown.
-    let domain_collector: Arc<DomainCollector> = Arc::new(Mutex::new(BTreeMap::new()));
+    // and the returned handle so one final snapshot can freeze the session.
+    let collection_started_at = Instant::now();
+    let (domain_collector, classification_wake_rx) = DomainCollector::new();
 
     let state = Arc::new(ProxyState {
         policy,
@@ -630,11 +954,27 @@ pub fn start(opts: ProxyOptions) -> Result<ProxyHandle, String> {
     let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = shutdown_flag.clone();
     let active_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let accept_collector = domain_collector.clone();
+    let (accept_done_tx, accept_done_rx) = mpsc::sync_channel(1);
 
     std::thread::Builder::new()
         .name("proxy-accept".into())
         .spawn(move || {
-            accept_loop(listener, flag, state, active_count);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                accept_loop(listener, flag, state, active_count);
+            }));
+            let closed_at = Instant::now();
+            let panicked = outcome.is_err();
+            // Publish both facts under the collector lock before the completion
+            // message. A zero-budget finalizer cannot observe a healthy close
+            // between these two state changes.
+            accept_collector.close_admission(closed_at, panicked);
+            let outcome = if panicked {
+                AcceptLoopOutcome::Panicked(closed_at)
+            } else {
+                AcceptLoopOutcome::Closed(closed_at)
+            };
+            let _ = accept_done_tx.send(outcome);
         })
         .map_err(|e| format!("spawn proxy thread: {e}"))?;
 
@@ -644,6 +984,9 @@ pub fn start(opts: ProxyOptions) -> Result<ProxyHandle, String> {
         shutdown_flag,
         port: actual_port,
         domain_collector,
+        collection_started_at,
+        accept_done_rx,
+        classification_wake_rx,
     })
 }
 
@@ -678,10 +1021,15 @@ fn accept_loop(
         // Connection limit
         let count = active_count.load(std::sync::atomic::Ordering::SeqCst);
         if count >= MAX_CONNECTIONS {
-            log_connection(&state, "REJECT", "connection limit", "LIMIT");
+            log_connection(&state, None, "REJECT", "connection limit", "LIMIT");
             drop(stream);
             continue;
         }
+
+        let Some(classification) = state.domain_collector.admit() else {
+            drop(stream);
+            continue;
+        };
 
         active_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let conn_state = state.clone();
@@ -690,26 +1038,47 @@ fn accept_loop(
         if let Err(e) = std::thread::Builder::new()
             .name("proxy-conn".into())
             .spawn(move || {
-                handle_connection(stream, &conn_state);
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handle_connection(stream, &conn_state, classification);
+                }));
                 counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             })
         {
             active_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            log_connection(&state, "INTERNAL", "thread-spawn", &format!("FAIL:{e}"));
+            // On spawn failure, dropping the unstarted guard marks failure and
+            // decrements pending in one collector transaction. Admission stays
+            // open until this accept-loop iteration finishes.
+            log_connection(
+                &state,
+                None,
+                "INTERNAL",
+                "thread-spawn",
+                &format!("FAIL:{e}"),
+            );
         }
     }
 }
 
-fn handle_connection(mut client: TcpStream, state: &ProxyState) {
+fn handle_connection(
+    mut client: TcpStream,
+    state: &ProxyState,
+    mut classification: ClassificationGuard,
+) {
     client.set_read_timeout(Some(state.timeout)).ok();
     client.set_write_timeout(Some(state.timeout)).ok();
 
     // Read the request line
     let mut buf = [0u8; 8192];
     let n = match client.read(&mut buf) {
-        Ok(0) => return,
+        Ok(0) => {
+            classification.complete(None);
+            return;
+        }
         Ok(n) => n,
-        Err(_) => return,
+        Err(_) => {
+            classification.complete(None);
+            return;
+        }
     };
 
     let request = String::from_utf8_lossy(&buf[..n]);
@@ -718,6 +1087,7 @@ fn handle_connection(mut client: TcpStream, state: &ProxyState) {
     // Parse method and target
     let parts: Vec<&str> = first_line.split_whitespace().collect();
     if parts.len() < 2 {
+        classification.complete(None);
         return;
     }
 
@@ -725,11 +1095,12 @@ fn handle_connection(mut client: TcpStream, state: &ProxyState) {
     let target = parts[1];
 
     if method.eq_ignore_ascii_case("CONNECT") {
-        handle_connect(client, target, state);
+        handle_connect(client, target, state, &mut classification);
     } else {
         // For non-CONNECT, send a simple error — the sandbox should force
         // CONNECT via proxy env vars for HTTPS traffic
-        log_connection(state, method, target, "UNSUPPORTED");
+        classification.complete(None);
+        log_connection(state, None, method, target, "UNSUPPORTED");
         let _ = client.write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n");
     }
 }
@@ -901,7 +1272,12 @@ pub fn classify_connect(policy: &NetPolicy, host: &str, port: u16) -> NetVerdict
 /// `allow_private_domains` entry. This is the exact policy the direct-connect
 /// path enforces inline; the upstream-forward path reuses it so both modes
 /// treat a resolvable host identically.
-fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
+fn handle_connect(
+    mut client: TcpStream,
+    target: &str,
+    state: &ProxyState,
+    classification: &mut ClassificationGuard,
+) {
     // Parse host:port
     let (host, port) = match target.rsplit_once(':') {
         Some((h, p)) => (h.to_string(), p.parse::<u16>().unwrap_or(443)),
@@ -946,29 +1322,47 @@ fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
     // Every arm routes through `log_connection(state, ...)`, which is the single
     // choke point that also records the observation into `domain_collector`
     // (issue #143). So the merged path yields the SAME verdict `classify_connect`
-    // computes AND records every contacted host — a blocked verdict is logged and
+    // computes AND records each CONNECT verdict — a blocked verdict is logged and
     // recorded here, an `Allowed` verdict falls through to be recorded downstream
     // when the connection reaches CONNECTED / a post-DNS block.
     let snapshot = state.net_policy();
     match classify_connect(&snapshot, &host, port) {
         NetVerdict::BlockedPort => {
-            log_connection(state, "CONNECT", target, "BLOCKED-PORT");
+            log_connection(
+                state,
+                Some(classification),
+                "CONNECT",
+                target,
+                "BLOCKED-PORT",
+            );
             let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nPort not allowed\r\n");
             return;
         }
         NetVerdict::BlockedAllowlist => {
-            log_connection(state, "CONNECT", target, "BLOCKED-ALLOWLIST");
+            log_connection(
+                state,
+                Some(classification),
+                "CONNECT",
+                target,
+                "BLOCKED-ALLOWLIST",
+            );
             let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nDomain not in allowlist\r\n");
             return;
         }
         NetVerdict::Blocked => {
-            log_connection(state, "CONNECT", target, "BLOCKED");
+            log_connection(state, Some(classification), "CONNECT", target, "BLOCKED");
             let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nBlocked by cplt\r\n");
             let _ = client.shutdown(std::net::Shutdown::Both);
             return;
         }
         NetVerdict::BlockedPrivate => {
-            log_connection(state, "CONNECT", target, "BLOCKED-PRIVATE");
+            log_connection(
+                state,
+                Some(classification),
+                "CONNECT",
+                target,
+                "BLOCKED-PRIVATE",
+            );
             let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nPrivate target blocked by cplt. For a trusted internal host, add its DNS name to proxy.allow_private_domains (or pass --allow-private-domain). An IP-literal target cannot be allowed: give the host a name.\r\n");
             let _ = client.shutdown(std::net::Shutdown::Both);
             return;
@@ -1014,7 +1408,13 @@ fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
 
     match route {
         ConnectRoute::Refuse(refusal) => {
-            log_connection(state, "CONNECT", target, refusal.status());
+            log_connection(
+                state,
+                Some(classification),
+                "CONNECT",
+                target,
+                refusal.status(),
+            );
             let _ = client.write_all(refusal.response());
             if refusal.shuts_down_socket() {
                 let _ = client.shutdown(std::net::Shutdown::Both);
@@ -1023,10 +1423,12 @@ fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
         ConnectRoute::Upstream => {
             // `via_upstream` is only true when `state.upstream` is `Some`.
             if let Some(upstream) = state.upstream.as_ref() {
-                connect_via_upstream(client, &host, port, target, upstream, state);
+                connect_via_upstream(client, &host, port, target, upstream, state, classification);
             }
         }
-        ConnectRoute::Direct(socket_addr) => connect_direct(client, socket_addr, target, state),
+        ConnectRoute::Direct(socket_addr) => {
+            connect_direct(client, socket_addr, target, state, classification);
+        }
     }
 }
 
@@ -1043,6 +1445,7 @@ fn connect_direct(
     socket_addr: std::net::SocketAddr,
     target: &str,
     state: &ProxyState,
+    classification: &mut ClassificationGuard,
 ) {
     let remote = match TcpStream::connect_timeout(&socket_addr, CONNECT_TIMEOUT) {
         Ok(s) => {
@@ -1050,14 +1453,20 @@ fn connect_direct(
             s
         }
         Err(e) => {
-            log_connection(state, "CONNECT", target, &format!("CONNECT-FAIL:{e}"));
+            log_connection(
+                state,
+                Some(classification),
+                "CONNECT",
+                target,
+                &format!("CONNECT-FAIL:{e}"),
+            );
             let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
             return;
         }
     };
 
     // Log after TCP connect succeeds — this is the audit-relevant event.
-    log_connection(state, "CONNECT", target, "CONNECTED");
+    log_connection(state, Some(classification), "CONNECT", target, "CONNECTED");
 
     // Send 200 to client
     if client
@@ -1085,6 +1494,7 @@ fn connect_via_upstream(
     target: &str,
     upstream: &UpstreamProxy,
     state: &ProxyState,
+    classification: &mut ClassificationGuard,
 ) {
     // Connect to the upstream proxy itself (not the target).
     let upstream_addr = upstream.socket_addr();
@@ -1093,7 +1503,13 @@ fn connect_via_upstream(
         .ok()
         .and_then(|mut a| a.next())
     else {
-        log_connection(state, "CONNECT", target, "CONNECT-FAIL:upstream-dns");
+        log_connection(
+            state,
+            Some(classification),
+            "CONNECT",
+            target,
+            "CONNECT-FAIL:upstream-dns",
+        );
         let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
         return;
     };
@@ -1105,6 +1521,7 @@ fn connect_via_upstream(
         Err(e) => {
             log_connection(
                 state,
+                Some(classification),
                 "CONNECT",
                 target,
                 &format!("CONNECT-FAIL:upstream:{e}"),
@@ -1119,7 +1536,13 @@ fn connect_via_upstream(
     // Ask the upstream to open a tunnel to the real target.
     let request = upstream.connect_request(host, port);
     if remote.write_all(request.as_bytes()).is_err() {
-        log_connection(state, "CONNECT", target, "CONNECT-FAIL:upstream-write");
+        log_connection(
+            state,
+            Some(classification),
+            "CONNECT",
+            target,
+            "CONNECT-FAIL:upstream-write",
+        );
         let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
         return;
     }
@@ -1129,12 +1552,24 @@ fn connect_via_upstream(
     match read_upstream_connect_status(&mut remote) {
         Ok(true) => {}
         Ok(false) => {
-            log_connection(state, "CONNECT", target, "CONNECT-FAIL:upstream-refused");
+            log_connection(
+                state,
+                Some(classification),
+                "CONNECT",
+                target,
+                "CONNECT-FAIL:upstream-refused",
+            );
             let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
             return;
         }
         Err(_) => {
-            log_connection(state, "CONNECT", target, "CONNECT-FAIL:upstream-read");
+            log_connection(
+                state,
+                Some(classification),
+                "CONNECT",
+                target,
+                "CONNECT-FAIL:upstream-read",
+            );
             let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
             return;
         }
@@ -1143,7 +1578,7 @@ fn connect_via_upstream(
     // Log as CONNECTED — identical audit/stats semantics to a direct connect,
     // so the allowed connection is recorded the same way whether or not an
     // upstream is in use.
-    log_connection(state, "CONNECT", target, "CONNECTED");
+    log_connection(state, Some(classification), "CONNECT", target, "CONNECTED");
 
     // Tell the client its tunnel is established, then splice bytes as usual.
     if client
@@ -1790,16 +2225,31 @@ fn is_v4_mapped_private(ip: &std::net::Ipv6Addr) -> bool {
     }
 }
 
-fn log_connection(state: &ProxyState, method: &str, target: &str, status: &str) {
+fn log_connection(
+    state: &ProxyState,
+    classification: Option<&mut ClassificationGuard>,
+    method: &str,
+    target: &str,
+    status: &str,
+) {
     let log_file = state.log_file.as_deref();
     let level = state.log_level;
+
+    // CONNECT userinfo is malformed for this proxy and can contain a password.
+    // Redact it before any terminal, file, or collector sink sees the target.
+    let redacted_target = method.eq_ignore_ascii_case("CONNECT").then(|| {
+        target.rsplit_once('@').map_or_else(
+            || target.to_string(),
+            |(_, authority)| format!("***@{authority}"),
+        )
+    });
+    let target = redacted_target.as_deref().unwrap_or(target);
 
     // SECURITY: `method` and `target` are agent-controlled. Both are sliced
     // straight out of the CONNECT request line in `handle_connection`, and this
     // function is the ONE sink they reach: the stderr verdict line below, the
-    // `--proxy-log` audit file, and — via `record_observation` — the observed
-    // host set that `--observe-domains-out` writes as a ready-to-paste
-    // allowlist. Escaping here therefore covers all three.
+    // `--proxy-log` audit file, and the retained host evidence used by
+    // `--observe-domains-out`. Escaping here therefore covers all three.
     //
     // `lines()` + `split_whitespace()` upstream already make CR/LF (and every
     // other whitespace class, incl. VT/FF/NEL/U+2028) unforgeable, so the
@@ -1822,9 +2272,9 @@ fn log_connection(state: &ProxyState, method: &str, target: &str, status: &str) 
 
     // Record the observation for every CONNECT verdict, regardless of the stderr
     // log level or whether a --proxy-log file is set. This is the single choke
-    // point every verdict flows through, so the collector sees the FULL set of
-    // hosts the agent contacted. Only CONNECT targets are hostnames; REJECT /
-    // INTERNAL / non-CONNECT-method log lines carry no host and are skipped.
+    // point every verdict flows through, so the collector counts each committed
+    // proxy CONNECT verdict. Host retention is bounded, and records have proxy
+    // client attribution only. REJECT / INTERNAL / non-CONNECT lines are skipped.
     if method.eq_ignore_ascii_case("CONNECT") {
         let host = target.rsplit_once(':').map_or(target, |(h, _)| h);
         let verdict = if status.starts_with("BLOCKED") {
@@ -1832,7 +2282,11 @@ fn log_connection(state: &ProxyState, method: &str, target: &str, status: &str) 
         } else {
             DomainVerdict::Allowed
         };
-        state.record_observation(host, verdict);
+        if let Some(classification) = classification {
+            classification.complete(Some((host, verdict)));
+        } else {
+            debug_assert!(false, "CONNECT logging requires classification accounting");
+        }
     }
 
     if level.should_log(status) {
@@ -2237,10 +2691,22 @@ mod tests {
         );
     }
 
+    /// Skip guard for tests that make real TCP connections.
+    /// These tests require localhost TCP access, which is blocked inside the cplt sandbox.
+    macro_rules! require_localhost_tcp {
+        () => {
+            if std::env::var("__CPLT_WRAPPED").is_ok() {
+                eprintln!("SKIPPED: proxy CONNECT tests require localhost TCP (blocked inside cplt sandbox)");
+                return;
+            }
+        };
+    }
+
     /// A minimal `ProxyState` for tests that exercise something other than
     /// policy (the observation collector). Policy itself is tested as a value
     /// in [`crate::proxy::domains`], with no `ProxyState` and no socket.
     fn bare_state() -> ProxyState {
+        let (domain_collector, _) = DomainCollector::new();
         ProxyState {
             policy: DomainPolicy::build(PolicySpec::default(), Instant::now()).unwrap(),
             log_file: None,
@@ -2248,8 +2714,28 @@ mod tests {
             timeout: Duration::from_mins(1),
             upstream: None,
             upstream_no_proxy: Vec::new(),
-            domain_collector: Arc::new(Mutex::new(BTreeMap::new())),
+            domain_collector,
             resolver: None,
+        }
+    }
+
+    fn closed_test_handle(
+        collector: Arc<DomainCollector>,
+        classification_wake_rx: mpsc::Receiver<()>,
+    ) -> ProxyHandle {
+        let closed_at = Instant::now();
+        collector.close_admission(closed_at, false);
+        let (accept_done_tx, accept_done_rx) = mpsc::sync_channel(1);
+        accept_done_tx
+            .send(AcceptLoopOutcome::Closed(closed_at))
+            .unwrap();
+        ProxyHandle {
+            shutdown_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            port: 0,
+            domain_collector: collector,
+            collection_started_at: Instant::now(),
+            accept_done_rx,
+            classification_wake_rx,
         }
     }
 
@@ -2274,20 +2760,21 @@ mod tests {
         state.record_observation("API.GitHub.com.", DomainVerdict::Allowed);
         state.record_observation("evil.example", DomainVerdict::Blocked);
 
-        let map = state
-            .domain_collector
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let map = state.domain_collector.lock_recovering();
         assert_eq!(
-            map.len(),
+            map.domains.len(),
             2,
             "case/trailing-dot variants must collapse to one host"
         );
-        let gh = map.get("api.github.com").expect("host recorded normalized");
+        let gh = map
+            .domains
+            .get("api.github.com")
+            .expect("host recorded normalized");
         assert_eq!(gh.verdict, DomainVerdict::Allowed);
         assert_eq!(gh.count, 2, "repeat CONNECTs must increment the count");
         assert_eq!(
-            map.get("evil.example")
+            map.domains
+                .get("evil.example")
                 .expect("blocked host recorded")
                 .verdict,
             DomainVerdict::Blocked
@@ -2304,11 +2791,8 @@ mod tests {
         state.record_observation("x.example", DomainVerdict::Blocked);
         state.record_observation("x.example", DomainVerdict::Allowed);
 
-        let map = state
-            .domain_collector
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let entry = map.get("x.example").expect("host recorded");
+        let map = state.domain_collector.lock_recovering();
+        let entry = map.domains.get("x.example").expect("host recorded");
         assert_eq!(
             entry.verdict,
             DomainVerdict::Blocked,
@@ -2318,20 +2802,406 @@ mod tests {
     }
 
     #[test]
+    fn collector_bounds_hosts_and_keys_without_losing_total_attempts() {
+        let (collector, wake_rx) = DomainCollector::new();
+        collector.record_without_admission(
+            &"k".repeat(OBSERVED_HOST_KEY_BYTE_LIMIT),
+            DomainVerdict::Allowed,
+        );
+        for index in 0..(OBSERVED_HOST_LIMIT - 1) {
+            collector
+                .record_without_admission(&format!("host-{index}.example"), DomainVerdict::Allowed);
+        }
+        collector.record_without_admission("host-0.example", DomainVerdict::Blocked);
+        collector.record_without_admission("overflow.example", DomainVerdict::Allowed);
+        collector.record_without_admission(
+            &"x".repeat(OBSERVED_HOST_KEY_BYTE_LIMIT + 1),
+            DomainVerdict::Allowed,
+        );
+
+        let snapshot =
+            closed_test_handle(collector, wake_rx).finalize_snapshot(Duration::from_millis(100));
+        assert_eq!(snapshot.availability, SnapshotAvailability::Available);
+        assert_eq!(snapshot.domains.len(), OBSERVED_HOST_LIMIT);
+        assert_eq!(snapshot.recorded_attempts, 1_027);
+        assert_eq!(snapshot.unretained_observations, 2);
+        assert_eq!(snapshot.domains[0].verdict, DomainVerdict::Blocked);
+        assert!(
+            snapshot
+                .domains
+                .iter()
+                .any(|domain| domain.host.len() == OBSERVED_HOST_KEY_BYTE_LIMIT)
+        );
+        let retained: u64 = snapshot.domains.iter().map(|domain| domain.count).sum();
+        assert_eq!(retained + 2, 1_027);
+    }
+
+    #[test]
+    fn finalizer_waits_for_pending_classification() {
+        let (collector, wake_rx) = DomainCollector::new();
+        let mut classification = collector.admit().unwrap();
+        let handle = closed_test_handle(collector, wake_rx);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let worker_barrier = barrier.clone();
+        let worker = std::thread::spawn(move || {
+            worker_barrier.wait();
+            classification.complete(Some(("pending.example", DomainVerdict::Allowed)));
+        });
+
+        barrier.wait();
+        let snapshot = handle.finalize_snapshot(Duration::from_millis(500));
+        worker.join().unwrap();
+        assert_eq!(snapshot.completion, SnapshotCompletion::Settled);
+        assert_eq!(snapshot.recorded_attempts, 1);
+        assert_eq!(snapshot.domains[0].host, "pending.example");
+    }
+
+    #[test]
+    fn live_finalizer_waits_for_gated_resolver_classification() {
+        require_localhost_tcp!();
+        use std::io::{BufRead as _, BufReader, Write as _};
+
+        let (resolver_entered_tx, resolver_entered_rx) = mpsc::channel();
+        let (resolver_release_tx, resolver_release_rx) = mpsc::channel();
+        let resolver_release_rx = Arc::new(Mutex::new(resolver_release_rx));
+        let resolver: ResolverFn = Arc::new(move |_host: &str, _port: u16| {
+            resolver_entered_tx.send(()).unwrap();
+            resolver_release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+            None
+        });
+        let proxy = make_proxy_with_resolver(Vec::new(), false, Some(resolver));
+        let proxy_port = proxy.port;
+        let collector = proxy.domain_collector.clone();
+        let client = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(("127.0.0.1", proxy_port)).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            write!(
+                stream,
+                "CONNECT gated.example:443 HTTP/1.1\r\nHost: gated.example:443\r\n\r\n"
+            )
+            .unwrap();
+            let mut status = String::new();
+            let _ = BufReader::new(stream).read_line(&mut status);
+        });
+        resolver_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+
+        let (snapshot_tx, snapshot_rx) = mpsc::channel();
+        let finalizer = std::thread::spawn(move || {
+            snapshot_tx
+                .send(proxy.finalize_snapshot(Duration::from_millis(500)))
+                .unwrap();
+        });
+        let wait_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if collector.lock_recovering().admission_closed_at.is_some() {
+                break;
+            }
+            assert!(
+                Instant::now() < wait_deadline,
+                "accept loop did not publish its admission boundary"
+            );
+            std::thread::yield_now();
+        }
+        assert!(
+            snapshot_rx.try_recv().is_err(),
+            "snapshot must wait while CONNECT classification is pending"
+        );
+
+        resolver_release_tx.send(()).unwrap();
+        let snapshot = snapshot_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        finalizer.join().unwrap();
+        client.join().unwrap();
+        assert_eq!(snapshot.completion, SnapshotCompletion::Settled);
+        assert_eq!(snapshot.recorded_attempts, 1);
+        assert_eq!(snapshot.domains[0].host, "gated.example");
+    }
+
+    #[test]
+    fn live_finalizer_bounds_a_stalled_resolver() {
+        require_localhost_tcp!();
+        use std::io::Write as _;
+
+        let (resolver_entered_tx, resolver_entered_rx) = mpsc::channel();
+        let (resolver_release_tx, resolver_release_rx) = mpsc::channel();
+        let resolver_release_rx = Arc::new(Mutex::new(resolver_release_rx));
+        let resolver: ResolverFn = Arc::new(move |_host: &str, _port: u16| {
+            resolver_entered_tx.send(()).unwrap();
+            resolver_release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+            None
+        });
+        let proxy = make_proxy_with_resolver(Vec::new(), false, Some(resolver));
+        let proxy_port = proxy.port;
+        let client = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(("127.0.0.1", proxy_port)).unwrap();
+            write!(
+                stream,
+                "CONNECT stalled.example:443 HTTP/1.1\r\nHost: stalled.example:443\r\n\r\n"
+            )
+            .unwrap();
+        });
+        resolver_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+
+        let started = Instant::now();
+        let snapshot = proxy.finalize_snapshot(Duration::from_millis(100));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            snapshot.completion,
+            SnapshotCompletion::DeadlineExceeded {
+                pending_clients: 1,
+                admission: AdmissionStatus::Closed,
+            }
+        );
+        assert_eq!(snapshot.recorded_attempts, 0);
+
+        resolver_release_tx.send(()).unwrap();
+        client.join().unwrap();
+        assert_eq!(snapshot.recorded_attempts, 0);
+        assert!(snapshot.domains.is_empty());
+    }
+
+    #[test]
+    fn live_snapshot_does_not_wait_for_established_relay() {
+        require_localhost_tcp!();
+        use std::io::{BufRead as _, BufReader, Write as _};
+
+        let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+        origin.set_nonblocking(true).unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        let origin_port = origin_addr.port();
+        let (origin_connected_tx, origin_connected_rx) = mpsc::channel();
+        let (origin_release_tx, origin_release_rx) = mpsc::channel();
+        let origin_worker = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let _stream = loop {
+                match origin.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return Err("proxy did not connect to origin".to_string());
+                        }
+                        std::thread::yield_now();
+                    }
+                    Err(error) => return Err(format!("origin accept failed: {error}")),
+                }
+            };
+            origin_connected_tx
+                .send(())
+                .map_err(|error| format!("origin connect signal failed: {error}"))?;
+            origin_release_rx
+                .recv_timeout(Duration::from_secs(2))
+                .map_err(|error| format!("origin release signal failed: {error}"))?;
+            Ok::<(), String>(())
+        });
+        let resolver: ResolverFn = Arc::new(move |_host: &str, _port: u16| Some(origin_addr));
+        let proxy = make_proxy_with_resolver(vec![origin_port], false, Some(resolver));
+        let mut client = TcpStream::connect(("127.0.0.1", proxy.port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        write!(
+            client,
+            "CONNECT localhost:{origin_port} HTTP/1.1\r\nHost: localhost:{origin_port}\r\n\r\n"
+        )
+        .unwrap();
+        let mut status = String::new();
+        BufReader::new(client.try_clone().unwrap())
+            .read_line(&mut status)
+            .unwrap();
+        let origin_connected = origin_connected_rx.recv_timeout(Duration::from_secs(2));
+
+        let snapshot = proxy.finalize_snapshot(Duration::from_millis(500));
+        drop(client);
+        let _ = origin_release_tx.send(());
+        let origin_result = origin_worker.join();
+
+        assert_eq!(status, "HTTP/1.1 200 Connection Established\r\n");
+        origin_connected.expect("proxy did not signal an origin connection");
+        origin_result
+            .expect("origin worker panicked")
+            .expect("origin worker failed");
+        assert_eq!(snapshot.completion, SnapshotCompletion::Settled);
+        assert_eq!(snapshot.recorded_attempts, 1);
+        assert_eq!(snapshot.domains[0].host, "localhost");
+    }
+
+    #[test]
+    fn classified_client_does_not_wait_for_open_relay_lifetime() {
+        let (collector, wake_rx) = DomainCollector::new();
+        let mut classification = collector.admit().unwrap();
+        let handle = closed_test_handle(collector, wake_rx);
+        let (classified_tx, classified_rx) = mpsc::channel();
+        let (relay_close_tx, relay_close_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            classification.complete(Some(("relay.example", DomainVerdict::Allowed)));
+            classified_tx.send(()).unwrap();
+            relay_close_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        });
+        classified_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let snapshot = handle.finalize_snapshot(Duration::from_millis(100));
+        assert_eq!(snapshot.completion, SnapshotCompletion::Settled);
+        assert_eq!(snapshot.recorded_attempts, 1);
+        relay_close_tx.send(()).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn late_record_cannot_change_frozen_snapshot() {
+        let (collector, wake_rx) = DomainCollector::new();
+        let mut classification = collector.admit().unwrap();
+        let handle = closed_test_handle(collector, wake_rx);
+
+        let snapshot = handle.finalize_snapshot(Duration::ZERO);
+        assert_eq!(
+            snapshot.completion,
+            SnapshotCompletion::DeadlineExceeded {
+                pending_clients: 1,
+                admission: AdmissionStatus::Closed,
+            }
+        );
+        assert_eq!(snapshot.recorded_attempts, 0);
+        classification.complete(Some(("late.example", DomainVerdict::Blocked)));
+        assert_eq!(snapshot.recorded_attempts, 0);
+        assert!(snapshot.domains.is_empty());
+    }
+
+    #[test]
+    fn uncompleted_guard_marks_failed_classification() {
+        let (collector, wake_rx) = DomainCollector::new();
+        let classification = collector.admit().unwrap();
+        drop(classification);
+
+        let snapshot =
+            closed_test_handle(collector, wake_rx).finalize_snapshot(Duration::from_millis(100));
+        assert_eq!(snapshot.completion, SnapshotCompletion::Settled);
+        assert_eq!(
+            snapshot.availability,
+            SnapshotAvailability::Failed(SnapshotFailure::HandlerAccountingFailed)
+        );
+        assert_eq!(snapshot.recorded_attempts, 0);
+    }
+
+    #[test]
+    fn unstarted_guard_marks_spawn_failure_in_its_drop_transaction() {
+        let (collector, wake_rx) = DomainCollector::new();
+        let classification = collector.admit().unwrap();
+        drop(classification);
+
+        let snapshot =
+            closed_test_handle(collector, wake_rx).finalize_snapshot(Duration::from_millis(100));
+        assert_eq!(snapshot.completion, SnapshotCompletion::Settled);
+        assert_eq!(
+            snapshot.availability,
+            SnapshotAvailability::Failed(SnapshotFailure::HandlerAccountingFailed)
+        );
+    }
+
+    #[test]
+    fn panicking_guard_marks_failure_before_pending_reaches_zero() {
+        let (collector, wake_rx) = DomainCollector::new();
+        let classification = collector.admit().unwrap();
+        let _ = std::thread::spawn(move || {
+            let _classification = classification;
+            panic!("panic before classification for test");
+        })
+        .join();
+
+        let snapshot =
+            closed_test_handle(collector, wake_rx).finalize_snapshot(Duration::from_millis(100));
+        assert_eq!(snapshot.completion, SnapshotCompletion::Settled);
+        assert_eq!(
+            snapshot.availability,
+            SnapshotAvailability::Failed(SnapshotFailure::HandlerAccountingFailed)
+        );
+    }
+
+    #[test]
+    fn accept_panic_is_published_with_admission_close() {
+        let (collector, classification_wake_rx) = DomainCollector::new();
+        let closed_at = Instant::now();
+        collector.close_admission(closed_at, true);
+        let (_, accept_done_rx) = mpsc::sync_channel(1);
+        let handle = ProxyHandle {
+            shutdown_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            port: 0,
+            domain_collector: collector,
+            collection_started_at: Instant::now(),
+            accept_done_rx,
+            classification_wake_rx,
+        };
+
+        let snapshot = handle.finalize_snapshot(Duration::ZERO);
+        assert_eq!(snapshot.admission_closed_at, Some(closed_at));
+        assert_eq!(
+            snapshot.availability,
+            SnapshotAvailability::Failed(SnapshotFailure::AcceptThreadPanicked)
+        );
+    }
+
+    #[test]
+    fn poisoned_collector_returns_retained_evidence_as_failed() {
+        let (collector, wake_rx) = DomainCollector::new();
+        collector.record_without_admission("before-poison.example", DomainVerdict::Allowed);
+        let poison_collector = collector.clone();
+        let _ = std::thread::spawn(move || {
+            let _state = poison_collector.state.lock().unwrap();
+            panic!("poison collector for test");
+        })
+        .join();
+
+        let snapshot =
+            closed_test_handle(collector, wake_rx).finalize_snapshot(Duration::from_millis(100));
+        assert_eq!(
+            snapshot.availability,
+            SnapshotAvailability::Failed(SnapshotFailure::CollectorPoisoned)
+        );
+        assert!(snapshot.integrity.collector_poisoned);
+        assert_eq!(snapshot.recorded_attempts, 1);
+        assert_eq!(snapshot.domains[0].host, "before-poison.example");
+    }
+
+    #[test]
+    fn handler_accounting_failure_prevents_exact_claim() {
+        let (collector, wake_rx) = DomainCollector::new();
+        collector.mark_handler_accounting_failed();
+        let snapshot =
+            closed_test_handle(collector, wake_rx).finalize_snapshot(Duration::from_millis(100));
+        assert_eq!(
+            snapshot.availability,
+            SnapshotAvailability::Failed(SnapshotFailure::HandlerAccountingFailed)
+        );
+        assert!(snapshot.integrity.handler_accounting_failed);
+    }
+
+    #[test]
     fn observed_domains_sorted_and_unique() {
         // observed_domains() returns hosts sorted and deduplicated (the BTreeMap
         // key ordering) with verdict + count, ready for a paste-able allowlist.
-        let collector: Arc<DomainCollector> = Arc::new(Mutex::new(BTreeMap::new()));
+        let (collector, classification_wake_rx) = DomainCollector::new();
         {
-            let mut map = collector.lock().unwrap();
-            map.insert(
+            let mut state = collector.state.lock().unwrap();
+            state.domains.insert(
                 "b.example".to_string(),
                 DomainObservation {
                     verdict: DomainVerdict::Allowed,
                     count: 3,
                 },
             );
-            map.insert(
+            state.domains.insert(
                 "a.example".to_string(),
                 DomainObservation {
                     verdict: DomainVerdict::Blocked,
@@ -2339,27 +3209,20 @@ mod tests {
                 },
             );
         }
+        let (_, accept_done_rx) = mpsc::sync_channel(1);
         let handle = ProxyHandle {
             shutdown_flag: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             port: 0,
             domain_collector: collector,
+            collection_started_at: Instant::now(),
+            accept_done_rx,
+            classification_wake_rx,
         };
         let observed = handle.observed_domains();
         let hosts: Vec<&str> = observed.iter().map(|o| o.host.as_str()).collect();
         assert_eq!(hosts, vec!["a.example", "b.example"], "must be sorted");
         assert_eq!(observed[0].verdict, DomainVerdict::Blocked);
         assert_eq!(observed[1].count, 3);
-    }
-
-    /// Skip guard for tests that make real TCP connections.
-    /// These tests require localhost TCP access, which is blocked inside the cplt sandbox.
-    macro_rules! require_localhost_tcp {
-        () => {
-            if std::env::var("__CPLT_WRAPPED").is_ok() {
-                eprintln!("SKIPPED: proxy CONNECT tests require localhost TCP (blocked inside cplt sandbox)");
-                return;
-            }
-        };
     }
 
     /// Start a proxy with a default allowlist for end-to-end CONNECT tests.
@@ -2585,7 +3448,8 @@ mod tests {
         // The `--observe-domains` override forces the proxy into allow-all mode
         // (main.rs passes an empty allowlist). A host that WOULD be blocked under
         // a configured allowlist must instead be permitted AND recorded here, so
-        // the observed set is exhaustive rather than pre-filtered.
+        // the observed set is not pre-filtered by domain policy. Retention
+        // limits still apply.
         require_localhost_tcp!();
         let up = spawn_fake_upstream();
         let upstream = UpstreamProxy::parse(&format!("http://127.0.0.1:{}", up.port)).unwrap();
@@ -2714,12 +3578,62 @@ mod tests {
         }
     }
 
+    /// Userinfo in a malformed CONNECT authority must not reach evidence sinks.
+    #[test]
+    fn malformed_connect_userinfo_is_omitted_and_redacted() {
+        require_localhost_tcp!();
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("proxy.log");
+        let resolver: ResolverFn = Arc::new(|_host: &str, _port: u16| None);
+        let proxy = start(ProxyOptions {
+            port: 0,
+            blocked_file: PathBuf::from("/dev/null"),
+            subscription_blocklist: Vec::new(),
+            allowed_ports: vec![443],
+            allow_localhost_ports: Vec::new(),
+            allow_localhost_any: false,
+            allowed_domains_file: None,
+            allowed_domains_initial: Vec::new(),
+            default_allowlist: Vec::new(),
+            cli_private_domains: Vec::new(),
+            config_private_domains: Vec::new(),
+            repo_private_domains: Vec::new(),
+            config_file: None,
+            log_file: Some(log.clone()),
+            log_level: ProxyLogLevel::None,
+            timeout: Duration::from_secs(2),
+            upstream: None,
+            upstream_no_proxy: Vec::new(),
+            resolver: Some(resolver),
+        })
+        .unwrap();
+
+        for target in [
+            "user:secret@example.invalid:443",
+            "alice:secret://user@example.invalid:443",
+            "s3cret:x@example.invalid:443",
+        ] {
+            let _ = proxy_connect(proxy.port, target);
+        }
+        let snapshot = proxy.finalize_snapshot(Duration::from_millis(500));
+        let logged = std::fs::read_to_string(log).unwrap();
+
+        assert_eq!(snapshot.recorded_attempts, 3);
+        assert_eq!(snapshot.unretained_observations, 3);
+        assert!(snapshot.domains.is_empty());
+        assert!(!logged.contains("secret"));
+        assert!(!logged.contains("s3cret"));
+        assert_eq!(logged.matches("***@example.invalid:443").count(), 3);
+        assert!(!format!("{snapshot:?}").contains("secret"));
+    }
+
     /// A control character in the agent's request line must never reach a log
     /// sink verbatim.
     ///
     /// Drives the REAL path — raw request lines over TCP into a live proxy —
     /// and inspects both sinks `log_connection` feeds: the `--proxy-log` audit
-    /// file and the observed-host set behind `--observe-domains-out`. The
+    /// file and the retained host evidence behind `--observe-domains-out`. The
     /// stderr verdict line is formatted from the same two escaped locals, so
     /// the file assertion covers it too.
     ///
