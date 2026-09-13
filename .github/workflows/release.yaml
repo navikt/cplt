@@ -225,7 +225,7 @@ jobs:
             echo "Or with mise, or apt on Debian/Ubuntu:"
             echo ""
             echo '```bash'
-            echo "mise use -g 'github:navikt/cplt'"
+            echo "mise use -g 'github:navikt/cplt@${TAG}'"
             echo "sudo apt install ./cplt_${TAG}_amd64.deb"
             echo '```'
             echo ""

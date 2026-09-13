@@ -233,11 +233,15 @@ brew install navikt/tap/cplt
 ### mise
 
 ```bash
-mise use -g 'github:navikt/cplt'
+mise use -g 'github:navikt/cplt@<version>'
 ```
 
 mise picks the right release asset for your platform and verifies its build
 provenance attestation.
+
+Pin the version. Our version strings are not comparable semver — they carry
+leading zeros and two hyphens — so `mise latest` can resolve to an older
+release than the newest one ([navikt/copilot#818](https://github.com/navikt/copilot/issues/818)).
 
 ### apt (Debian/Ubuntu)
 
