@@ -105,9 +105,73 @@ jobs:
           name: cplt-${{ matrix.target }}
           path: cplt-${{ matrix.target }}.tar.gz
 
+  deb:
+    name: Build .deb (${{ matrix.arch }})
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            target: x86_64-unknown-linux-gnu
+          - arch: arm64
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # ratchet:actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          sparse-checkout: LICENSE
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # ratchet:actions/download-artifact@v8.0.1
+        with:
+          name: cplt-${{ matrix.target }}
+
+      # dpkg-deb is on the runner, so a one-binary package needs no packaging
+      # tool. The release tarball already holds the attested binary, so unpack
+      # that rather than rebuilding. The version carries hyphens, which dpkg
+      # reads as the upstream / revision split: 2026.09.13-120000-abc1234 is
+      # upstream 2026.09.13-120000 at revision abc1234. Both halves sort the way
+      # apt expects.
+      - name: Build package
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          tar xzf "cplt-${TARGET}.tar.gz"
+          root="pkg/cplt"
+          mkdir -p "$root/DEBIAN" "$root/usr/bin" "$root/usr/share/doc/cplt"
+          install -m 0755 cplt "$root/usr/bin/cplt"
+          cat > "$root/DEBIAN/control" <<CONTROL
+          Package: cplt
+          Version: ${VERSION}
+          Architecture: ${ARCH}
+          Maintainer: Nav <navikt@nav.no>
+          Section: devel
+          Priority: optional
+          Homepage: https://github.com/navikt/cplt
+          Description: Sandbox wrapper for GitHub Copilot CLI
+           cplt confines the Copilot CLI with Landlock LSM and seccomp-BPF on
+           Linux, so an agent only reaches the files and hosts you allow.
+          CONTROL
+          sed -i 's/^          //' "$root/DEBIAN/control"
+          cp LICENSE "$root/usr/share/doc/cplt/copyright"
+          dpkg-deb --root-owner-group --build "$root" "cplt_${VERSION}_${ARCH}.deb"
+          dpkg-deb --info "cplt_${VERSION}_${ARCH}.deb"
+          dpkg-deb --contents "cplt_${VERSION}_${ARCH}.deb"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # ratchet:actions/upload-artifact@v7.0.1
+        with:
+          name: cplt-deb-${{ matrix.arch }}
+          path: cplt_*.deb
+
   release:
     name: Publish release
-    needs: [version, build]
+    needs: [version, build, deb]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -125,7 +189,7 @@ jobs:
       - name: Generate checksums
         run: |
           cd artifacts
-          sha256sum cplt-* > SHA256SUMS
+          sha256sum cplt-* cplt_*.deb > SHA256SUMS
           cat SHA256SUMS
 
       - name: Generate release notes
@@ -158,6 +222,13 @@ jobs:
             echo "curl -fsSL https://github.com/navikt/cplt/releases/download/${TAG}/cplt-aarch64-unknown-linux-gnu.tar.gz | tar xz"
             echo '```'
             echo ""
+            echo "Or with mise, or apt on Debian/Ubuntu:"
+            echo ""
+            echo '```bash'
+            echo "mise use -g 'github:navikt/cplt'"
+            echo "sudo apt install ./cplt_${TAG}_amd64.deb"
+            echo '```'
+            echo ""
             if [ -n "$PREV_TAG" ]; then
               echo "### Changes since ${PREV_TAG##*/}"
               echo ""
@@ -179,4 +250,5 @@ jobs:
           make_latest: true
           files: |
             artifacts/cplt-*
+            artifacts/cplt_*.deb
             artifacts/SHA256SUMS
