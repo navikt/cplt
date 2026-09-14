@@ -1266,6 +1266,19 @@ The update mechanism downloads releases from GitHub, verifies SHA256 checksums, 
 
 The Homebrew install path (`brew install navikt/tap/cplt`) uses Homebrew's own verification and is preferred on macOS.
 
+The apt path ([navikt/apt](https://navikt.github.io/apt/)) is preferred on Debian
+and Ubuntu. `apt` verifies the archive's OpenPGP signature on `InRelease` and the
+package hashes chained from it, and refuses the archive outright if either fails.
+Note what that does and does not buy: the signature covers the archive, and the
+`.deb` in it is copied from the same GitHub release the checksums above come
+from, so it attests that you got the bytes the archive publisher published, not
+that the release itself is independently trustworthy.
+
+`cplt update` recognises a Homebrew-managed binary and refuses to touch it, but
+it has no equivalent check for a dpkg-managed one. On an apt install, upgrade
+with `sudo apt upgrade`; `cplt update` would replace `/usr/bin/cplt` without
+dpkg knowing.
+
 ### Install script security (`install.sh`)
 
 The install script downloads from GitHub Releases and verifies SHA256 checksums.

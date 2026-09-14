@@ -50,7 +50,7 @@ cplt gives you kernel-level enforcement with team-configurable policy:
 ## Quick start
 
 ```bash
-brew install navikt/tap/cplt
+brew install navikt/tap/cplt   # macOS. On Debian or Ubuntu, see apt below
 cplt --shell-install        # make 'copilot' run sandboxed (persistent)
 cplt doctor                 # check your environment
 cplt -- -p "fix the tests"  # run Copilot in sandbox
@@ -244,16 +244,39 @@ Pin the version. Our version strings are not comparable semver — they carry
 leading zeros and two hyphens — so `mise latest` can resolve to an older
 release than the newest one ([navikt/copilot#818](https://github.com/navikt/copilot/issues/818)).
 
-### apt (Debian/Ubuntu)
+### apt (Debian/Ubuntu, recommended on Linux)
 
-Every release ships a `.deb` for amd64 and arm64. Download it from the
-[latest release](https://github.com/navikt/cplt/releases/latest) and install it:
+[navikt/apt](https://navikt.github.io/apt/) is a signed archive served over
+GitHub Pages, carrying cplt and nav-pilot for amd64 and arm64:
 
 ```bash
+curl -fsSL https://navikt.github.io/apt/keyring/navikt-archive-keyring.gpg \
+  | sudo tee /usr/share/keyrings/navikt-archive-keyring.gpg >/dev/null
+echo "deb [signed-by=/usr/share/keyrings/navikt-archive-keyring.gpg] https://navikt.github.io/apt stable main" \
+  | sudo tee /etc/apt/sources.list.d/navikt.list
+sudo apt update && sudo apt install cplt
+```
+
+It is a plain apt repository mirroring our releases, not a distribution package
+with its own maintainer. Its publish job runs hourly and pulls the newest `.deb`
+from each tool's latest release, so a release cut minutes ago takes up to an
+hour to become installable that way.
+
+The package puts the binary at `/usr/bin/cplt`, and upgrades ride
+`sudo apt upgrade` from then on. Do not use `cplt update` on an apt install:
+it replaces the binary behind dpkg's back, and the next `apt` run will
+overwrite whatever it put there.
+
+Without the archive, the same `.deb` is a release asset:
+
+```bash
+gh release download --repo navikt/cplt --pattern '*_amd64.deb'
 sudo apt install ./cplt_<version>_amd64.deb
 ```
 
 ### curl | bash
+
+For distributions that are not Debian derivatives, and for CI:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/navikt/cplt/main/install.sh | bash
@@ -355,9 +378,13 @@ gh auth login
 # 3. The agent, installed in the distro, never on the Windows side
 npm install -g @github/copilot
 
-# 4. cplt
-curl -fsSL https://raw.githubusercontent.com/navikt/cplt/main/install.sh | bash
-# (or: brew install navikt/tap/cplt, if you use Homebrew on Linux)
+# 4. cplt, from the apt archive. The default distro is Ubuntu, so this is
+#    the same route as on any other Debian derivative.
+curl -fsSL https://navikt.github.io/apt/keyring/navikt-archive-keyring.gpg \
+  | sudo tee /usr/share/keyrings/navikt-archive-keyring.gpg >/dev/null
+echo "deb [signed-by=/usr/share/keyrings/navikt-archive-keyring.gpg] https://navikt.github.io/apt stable main" \
+  | sudo tee /etc/apt/sources.list.d/navikt.list
+sudo apt update && sudo apt install cplt
 
 # 5. Check the result
 cplt doctor
