@@ -102,6 +102,9 @@ EXAMPLES:
 
   eval \"$(cplt --shell-setup)\"
     Add to your shell rc so 'copilot' runs the sandboxed version
+
+  cplt --shell-install --agent opencode
+    Same, for 'opencode'. Any agent, alongside the ones already installed
 "
 )]
 struct Cli {
@@ -581,14 +584,17 @@ actually on screen, then turn it back off."
     init_config: bool,
 
     /// Print shell setup code for your shell rc file.
-    /// Usage: eval "$(cplt --shell-setup)"
-    /// Creates a 'copilot' alias that transparently runs cplt.
+    /// Usage: eval "$(cplt --shell-setup --agent opencode)"
+    /// Creates an alias for that agent's command that transparently runs cplt.
+    /// Without --agent you get copilot.
     #[arg(long)]
     shell_setup: bool,
 
     /// Install the shell alias permanently into your shell rc file.
-    /// Detects your shell (zsh/bash/fish) and appends the setup line.
-    /// Safe to run multiple times. It will not add duplicates.
+    /// Detects your shell (zsh/bash/fish) and appends the setup line for the
+    /// agent named by --agent, copilot if you do not name one. Installing a
+    /// second agent keeps the first. Safe to run multiple times. It will not
+    /// add duplicates.
     #[arg(long)]
     shell_install: bool,
 
@@ -3266,15 +3272,23 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         return Ok(init_config());
     }
 
-    // Handle --shell-setup: print alias definition and exit
-    if cli.shell_setup {
-        println!("alias copilot=cplt");
-        return Ok(ExitCode::SUCCESS);
-    }
-
-    // Handle --shell-install: append setup line to shell rc file
-    if cli.shell_install {
-        return Ok(shell_install());
+    // Handle --shell-setup and --shell-install: both alias the agent named by
+    // --agent, defaulting to copilot.
+    if cli.shell_setup || cli.shell_install {
+        let agent = match shell_alias_agent(cli.agent.as_deref()) {
+            Ok(agent) => agent,
+            Err(e) => {
+                ui::error(&e);
+                return Ok(ExitCode::FAILURE);
+            }
+        };
+        if cli.shell_setup {
+            for line in alias_lines(agent, false) {
+                println!("{line}");
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
+        return Ok(shell_install(agent));
     }
 
     // Handle `cplt exec` before consuming cli.command so resolve_context
@@ -8373,11 +8387,61 @@ fn do_update(tag: &str, expected_version: &str) -> ExitCode {
     }
 }
 
-/// Install the cplt shell alias into the user's shell rc file.
+/// The agent whose command `--shell-setup` / `--shell-install` should alias.
 ///
-/// Detects the current shell from $SHELL, picks the right rc file,
-/// and appends an eval line. Idempotent — won't add duplicates.
-fn shell_install() -> ExitCode {
+/// No `--agent` means copilot, which is what every existing rc line already
+/// means — changing that silently would move an installed alias off the agent
+/// the user set it up for.
+fn shell_alias_agent(flag: Option<&str>) -> Result<agent::Agent, String> {
+    let agent = match flag {
+        Some(name) => name.parse::<agent::Agent>()?,
+        None => agent::Agent::Copilot,
+    };
+    if agent == agent::Agent::Shell {
+        return Err(
+            "The shell agent has no command to alias — there is no `shell` binary to \
+                    shadow. Run `cplt --agent shell` for a sandboxed shell, or \
+                    `cplt exec -- <command>` to sandbox a single command."
+                .to_string(),
+        );
+    }
+    Ok(agent)
+}
+
+/// The alias definitions that make an agent's own command run sandboxed.
+///
+/// Each alias pins `--agent`. Without the pin, the aliased command runs plain
+/// `cplt`, which falls back to auto-detection and launches whichever agent it
+/// finds first — copilot, ahead of the one whose name you typed (#509). An
+/// alias that sandboxes a different agent than the command promises is worse
+/// than no alias, because nothing tells you.
+fn alias_lines(agent: agent::Agent, fish: bool) -> Vec<String> {
+    let flag = agent.binary_name();
+    agent
+        .binary_names()
+        .iter()
+        .map(|name| {
+            if fish {
+                format!("alias {name} 'cplt --agent {flag}'")
+            } else {
+                format!("alias {name}='cplt --agent {flag}'")
+            }
+        })
+        .collect()
+}
+
+/// Whether `line` is already one of the lines in `contents`.
+fn has_line(contents: &str, line: &str) -> bool {
+    contents.lines().any(|l| l.trim() == line)
+}
+
+/// Install the shell alias for `agent` into the user's shell rc file.
+///
+/// Detects the current shell from $SHELL, picks the right rc file, and appends
+/// the lines that are not there yet. Idempotent, and additive: installing a
+/// second agent leaves the first agent's alias in place, because sandboxing
+/// more than one agent is the normal case.
+fn shell_install(agent: agent::Agent) -> ExitCode {
     let shell = std::env::var("SHELL").unwrap_or_default();
     let home = if let Ok(h) = std::env::var("HOME") {
         PathBuf::from(h)
@@ -8386,35 +8450,88 @@ fn shell_install() -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    let (rc_file, setup_line) = if shell.ends_with("/fish") {
+    let fish = shell.ends_with("/fish");
+    let (rc_file, mut wanted) = if fish {
         (
             home.join(".config/fish/conf.d/cplt.fish"),
-            "alias copilot cplt\n",
+            alias_lines(agent, true),
         )
-    } else if shell.ends_with("/bash") {
-        (home.join(".bashrc"), "eval \"$(cplt --shell-setup)\"\n")
     } else {
-        // Default to zsh (macOS default)
-        (home.join(".zshrc"), "eval \"$(cplt --shell-setup)\"\n")
+        let rc = if shell.ends_with("/bash") {
+            home.join(".bashrc")
+        } else {
+            // Default to zsh (macOS default)
+            home.join(".zshrc")
+        };
+        // One `eval` per agent, so the alias text stays owned by the binary and
+        // an upgrade can change it without rewriting anyone's rc file.
+        (
+            rc,
+            vec![format!(
+                "eval \"$(cplt --shell-setup --agent {})\"",
+                agent.binary_name()
+            )],
+        )
     };
 
-    // Check if already installed
-    if rc_file.exists() {
+    let mut contents = if rc_file.exists() {
         match std::fs::read_to_string(&rc_file) {
-            Ok(contents) if contents.contains("cplt") => {
-                ui::ok(&format!("Already installed in {}", rc_file.display()));
-                return ExitCode::SUCCESS;
-            }
-            Ok(_) => {}
+            Ok(c) => c,
             Err(e) => {
                 ui::error(&format!("Cannot read {}: {e}", rc_file.display()));
                 return ExitCode::FAILURE;
             }
         }
+    } else {
+        String::new()
+    };
+
+    // Lines written by cplt before aliases were per-agent. They mean copilot.
+    // The POSIX one re-runs `cplt --shell-setup` on every shell start, so it
+    // picks up the pinned alias by itself; fish's is a literal alias that would
+    // stay unpinned forever, so rewrite it in place.
+    let legacy_posix = "eval \"$(cplt --shell-setup)\"";
+    let legacy_fish = "alias copilot cplt";
+    if fish && has_line(&contents, legacy_fish) {
+        let pinned = &alias_lines(agent::Agent::Copilot, true)[0];
+        contents = contents
+            .lines()
+            .map(|l| {
+                if l.trim() == legacy_fish {
+                    pinned.as_str()
+                } else {
+                    l
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        if let Err(e) = std::fs::write(&rc_file, &contents) {
+            ui::error(&format!("Cannot write to {}: {e}", rc_file.display()));
+            return ExitCode::FAILURE;
+        }
+        ui::ok(&format!(
+            "Pinned the existing 'copilot' alias to --agent copilot in {}",
+            rc_file.display()
+        ));
+    }
+    if !fish && agent == agent::Agent::Copilot && has_line(&contents, legacy_posix) {
+        // Already covered, and it resolves to the pinned alias at shell start.
+        wanted.clear();
+    }
+
+    wanted.retain(|line| !has_line(&contents, line));
+    if wanted.is_empty() {
+        ui::ok(&format!(
+            "{} alias already installed in {}",
+            agent.display_name(),
+            rc_file.display()
+        ));
+        return ExitCode::SUCCESS;
     }
 
     // For fish, ensure the conf.d directory exists
-    if shell.ends_with("/fish")
+    if fish
         && let Some(parent) = rc_file.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
     {
@@ -8422,7 +8539,6 @@ fn shell_install() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // Append the setup line
     let mut file = match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -8436,20 +8552,27 @@ fn shell_install() -> ExitCode {
     };
 
     use std::io::Write;
-    // Add a newline before our line if the file doesn't end with one
-    let needs_newline = rc_file.exists()
-        && std::fs::read_to_string(&rc_file).is_ok_and(|c| !c.is_empty() && !c.ends_with('\n'));
-
-    let content = if needs_newline {
-        format!("\n{setup_line}")
-    } else {
-        setup_line.to_string()
-    };
+    // Add a newline before our lines if the file doesn't end with one
+    let mut content = String::new();
+    if !contents.is_empty() && !contents.ends_with('\n') {
+        content.push('\n');
+    }
+    for line in &wanted {
+        content.push_str(line);
+        content.push('\n');
+    }
 
     match file.write_all(content.as_bytes()) {
         Ok(()) => {
+            let all = agent.binary_names();
+            let names = all
+                .iter()
+                .map(|n| format!("'{n}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let noun = if all.len() > 1 { "aliases" } else { "alias" };
             ui::ok(&format!(
-                "Installed 'copilot' alias in {}",
+                "Installed {names} {noun} in {}",
                 rc_file.display()
             ));
             ui::info(&format!(

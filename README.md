@@ -52,6 +52,7 @@ cplt gives you kernel-level enforcement with team-configurable policy:
 ```bash
 brew install navikt/tap/cplt   # macOS. On Debian or Ubuntu, see apt below
 cplt --shell-install        # make 'copilot' run sandboxed (persistent)
+                            # --agent opencode for any other agent
 cplt doctor                 # check your environment
 cplt -- -p "fix the tests"  # run Copilot in sandbox
 ```
@@ -415,13 +416,26 @@ cplt --shell-install
 
 That detects your shell, appends the alias to your rc file, and prints what it did. Run it as many times as you like, it will not add duplicates.
 
-| Shell | File modified | What's added |
+`--agent` picks which command gets the alias, and every agent cplt can launch is available:
+
+```bash
+cplt --shell-install --agent opencode   # 'opencode' runs sandboxed
+cplt --shell-install --agent claude     # and 'claude', alongside the others
+```
+
+Each install adds to your rc file rather than replacing what is there, so you can sandbox as many agents as you use. Without `--agent` you get `copilot`, which is what the flag has always installed.
+
+| Shell | File modified | What's added (for `--agent opencode`) |
 |-------|--------------|--------------|
-| zsh (macOS default) | `~/.zshrc` | `eval "$(cplt --shell-setup)"` |
-| bash | `~/.bashrc` | `eval "$(cplt --shell-setup)"` |
-| fish | `~/.config/fish/conf.d/cplt.fish` | `alias copilot cplt` |
+| zsh (macOS default) | `~/.zshrc` | `eval "$(cplt --shell-setup --agent opencode)"` |
+| bash | `~/.bashrc` | `eval "$(cplt --shell-setup --agent opencode)"` |
+| fish | `~/.config/fish/conf.d/cplt.fish` | `alias opencode 'cplt --agent opencode'` |
+
+`--agent antigravity` installs aliases for both `antigravity` and `agy`, since either name starts the same agent.
 
 Restart your shell or `source` the file to activate.
+
+There is no alias for `--agent shell`: there is no `shell` binary to shadow. Type `cplt --agent shell` for a sandboxed shell, or `cplt exec -- <command>` for a single command.
 
 <details>
 <summary>Manual setup (alternative)</summary>
@@ -430,14 +444,16 @@ If you would rather not use `--shell-install`, add the line yourself:
 
 ```bash
 # zsh / bash
-eval "$(cplt --shell-setup)"
+eval "$(cplt --shell-setup --agent opencode)"
 
 # fish
-alias copilot cplt
+alias opencode 'cplt --agent opencode'
 ```
 
 Same pattern mise, direnv, and starship use.
 </details>
+
+**Why each alias names its agent.** `alias opencode=cplt` would not do what it looks like. Plain `cplt` picks its agent from `--agent`, then the config file, then whatever it finds in PATH — and PATH detection prefers `copilot`. Typing `opencode` would sandbox Copilot instead, with nothing on screen to say so. The alias passes `--agent` so the command you type is the agent you get.
 
 **Why an alias instead of a symlink?** cplt and Copilot CLI install into the same Homebrew bin directory (`/opt/homebrew/bin/`), and only one file named `copilot` can live there, so a symlink would conflict. An alias sidesteps that. The real `copilot` binary stays in PATH where cplt can find and wrap it, and the alias redirects your command.
 

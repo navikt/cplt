@@ -1746,7 +1746,9 @@ mod e2e_tests {
 
         assert!(output.status.success(), "cplt --shell-setup should succeed");
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert_eq!(stdout.trim(), "alias copilot=cplt");
+        // No --agent means copilot, the historical default. The alias pins
+        // --agent so it cannot auto-detect its way to a different agent.
+        assert_eq!(stdout.trim(), "alias copilot='cplt --agent copilot'");
     }
 
     #[test]
@@ -1794,6 +1796,206 @@ mod e2e_tests {
         );
 
         // Cleanup
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    /// Every agent cplt can launch must get an alias for its own command.
+    ///
+    /// `--shell-install --agent opencode` used to install a `copilot` alias
+    /// (#509): the user believes `opencode` runs sandboxed and it does not.
+    #[test]
+    fn e2e_shell_setup_aliases_the_requested_agent() {
+        for (flag, binaries) in [
+            ("copilot", &["copilot"][..]),
+            ("opencode", &["opencode"][..]),
+            ("antigravity", &["antigravity", "agy"][..]),
+            ("pi", &["pi"][..]),
+            ("claude", &["claude"][..]),
+            ("goose", &["goose"][..]),
+        ] {
+            let output = cplt_cmd()
+                .arg("--shell-setup")
+                .args(["--agent", flag])
+                .output()
+                .expect("binary should run");
+
+            assert!(
+                output.status.success(),
+                "--shell-setup --agent {flag} should succeed.\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let expected: Vec<String> = binaries
+                .iter()
+                .map(|b| format!("alias {b}='cplt --agent {flag}'"))
+                .collect();
+            assert_eq!(
+                stdout.lines().collect::<Vec<_>>(),
+                expected,
+                "--shell-setup --agent {flag} should alias {binaries:?}"
+            );
+        }
+    }
+
+    /// The shell agent has no host command to shadow, so aliasing it would
+    /// write a line that protects nothing. Refuse instead of pretending.
+    #[test]
+    fn e2e_shell_setup_refuses_shell_agent() {
+        let output = cplt_cmd()
+            .arg("--shell-setup")
+            .args(["--agent", "shell"])
+            .output()
+            .expect("binary should run");
+
+        assert!(
+            !output.status.success(),
+            "--shell-setup --agent shell should fail"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("no command to alias"),
+            "error should explain why.\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Sandboxing two agents is a normal setup, so a second install must
+    /// accumulate rather than replace, and a repeat must not duplicate.
+    #[test]
+    fn e2e_shell_install_accumulates_per_agent() {
+        let fake_home =
+            std::env::temp_dir().join(format!("cplt-test-accum-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&fake_home);
+        std::fs::create_dir_all(&fake_home).expect("create fake home");
+        let zshrc = fake_home.join(".zshrc");
+
+        let install = |agent: Option<&str>| {
+            let mut cmd = cplt_cmd();
+            cmd.arg("--shell-install")
+                .env("HOME", &fake_home)
+                .env("SHELL", "/bin/zsh");
+            if let Some(a) = agent {
+                cmd.args(["--agent", a]);
+            }
+            let out = cmd.output().expect("binary should run");
+            assert!(
+                out.status.success(),
+                "--shell-install {agent:?} should succeed.\nstderr: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        install(None);
+        install(Some("opencode"));
+        install(Some("opencode"));
+
+        let contents = std::fs::read_to_string(&zshrc).expect("zshrc should exist");
+        assert_eq!(
+            contents
+                .matches("cplt --shell-setup --agent copilot")
+                .count(),
+            1,
+            "copilot line should appear once.\ncontents: {contents}"
+        );
+        assert_eq!(
+            contents
+                .matches("cplt --shell-setup --agent opencode")
+                .count(),
+            1,
+            "opencode should be added once alongside copilot.\ncontents: {contents}"
+        );
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    /// An rc file written by an older cplt carries the unpinned line. It still
+    /// means "copilot", so a copilot install must recognise it instead of
+    /// stacking a second line, and a different agent must still be added.
+    #[test]
+    fn e2e_shell_install_recognises_legacy_line() {
+        let fake_home =
+            std::env::temp_dir().join(format!("cplt-test-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&fake_home);
+        std::fs::create_dir_all(&fake_home).expect("create fake home");
+        let zshrc = fake_home.join(".zshrc");
+        std::fs::write(&zshrc, "eval \"$(cplt --shell-setup)\"\n").expect("seed zshrc");
+
+        let mut cmd = cplt_cmd();
+        let out = cmd
+            .arg("--shell-install")
+            .env("HOME", &fake_home)
+            .env("SHELL", "/bin/zsh")
+            .output()
+            .expect("binary should run");
+        assert!(out.status.success(), "--shell-install should succeed");
+
+        let contents = std::fs::read_to_string(&zshrc).expect("zshrc should exist");
+        assert_eq!(
+            contents.matches("cplt --shell-setup").count(),
+            1,
+            "legacy line already covers copilot.\ncontents: {contents}"
+        );
+
+        let mut cmd = cplt_cmd();
+        let out = cmd
+            .arg("--shell-install")
+            .args(["--agent", "opencode"])
+            .env("HOME", &fake_home)
+            .env("SHELL", "/bin/zsh")
+            .output()
+            .expect("binary should run");
+        assert!(
+            out.status.success(),
+            "--shell-install opencode should succeed"
+        );
+
+        let contents = std::fs::read_to_string(&zshrc).expect("zshrc should exist");
+        assert!(
+            contents.contains("cplt --shell-setup --agent opencode"),
+            "opencode should be appended next to the legacy line.\ncontents: {contents}"
+        );
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    /// fish gets literal alias lines, not an `eval`, so a stale unpinned line
+    /// cannot fix itself the way the POSIX `eval` does. Rewrite it in place.
+    #[test]
+    fn e2e_shell_install_fish_repins_legacy_alias() {
+        let fake_home = std::env::temp_dir().join(format!("cplt-test-fish-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&fake_home);
+        let conf_d = fake_home.join(".config/fish/conf.d");
+        std::fs::create_dir_all(&conf_d).expect("create fish conf.d");
+        let rc = conf_d.join("cplt.fish");
+        std::fs::write(&rc, "alias copilot cplt\n").expect("seed fish config");
+
+        let mut cmd = cplt_cmd();
+        let out = cmd
+            .arg("--shell-install")
+            .args(["--agent", "opencode"])
+            .env("HOME", &fake_home)
+            .env("SHELL", "/usr/local/bin/fish")
+            .output()
+            .expect("binary should run");
+        assert!(
+            out.status.success(),
+            "--shell-install should succeed.\nstderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let contents = std::fs::read_to_string(&rc).expect("fish config should exist");
+        assert!(
+            contents.contains("alias copilot 'cplt --agent copilot'"),
+            "legacy fish alias should be re-pinned.\ncontents: {contents}"
+        );
+        assert!(
+            !contents.lines().any(|l| l.trim() == "alias copilot cplt"),
+            "unpinned fish alias should be gone.\ncontents: {contents}"
+        );
+        assert!(
+            contents.contains("alias opencode 'cplt --agent opencode'"),
+            "opencode alias should be installed.\ncontents: {contents}"
+        );
+
         let _ = std::fs::remove_dir_all(&fake_home);
     }
 

@@ -239,6 +239,23 @@ impl Agent {
         }
     }
 
+    /// Every binary name this agent can be invoked as in PATH.
+    ///
+    /// Antigravity ships both `antigravity` and `agy`. Anything that shadows an
+    /// agent — PATH lookup, the shell alias — has to cover every name, or the
+    /// uncovered one silently runs unsandboxed (#509).
+    pub fn binary_names(&self) -> &'static [&'static str] {
+        match self {
+            Agent::Antigravity => &["antigravity", "agy"],
+            Agent::Copilot => &["copilot"],
+            Agent::OpenCode => &["opencode"],
+            Agent::Pi => &["pi"],
+            Agent::Claude => &["claude"],
+            Agent::Goose => &["goose"],
+            Agent::Shell => &["shell"],
+        }
+    }
+
     /// Human-readable display name.
     pub fn display_name(&self) -> &'static str {
         match self {
@@ -1560,10 +1577,7 @@ impl Agent {
             return Err(format!("Shell not found: {shell}"));
         }
 
-        let binary_names: &[&str] = match self {
-            Agent::Antigravity => &["antigravity", "agy"],
-            _ => &[self.binary_name()],
-        };
+        let binary_names: &[&str] = self.binary_names();
         let self_exe = std::env::current_exe()
             .ok()
             .and_then(|p| std::fs::canonicalize(&p).ok());
