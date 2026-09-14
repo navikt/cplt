@@ -263,9 +263,9 @@ from each tool's latest release, so a release cut minutes ago takes up to an
 hour to become installable that way.
 
 The package puts the binary at `/usr/bin/cplt`, and upgrades ride
-`sudo apt upgrade` from then on. Do not use `cplt update` on an apt install:
-it replaces the binary behind dpkg's back, and the next `apt` run will
-overwrite whatever it put there.
+`sudo apt upgrade` from then on. `cplt update` refuses to touch an apt install
+and points at `sudo apt upgrade` instead: replacing the binary behind dpkg's
+back would be undone by the next `apt` run.
 
 Without the archive, the same `.deb` is a release asset:
 

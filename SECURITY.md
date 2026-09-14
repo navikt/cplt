@@ -1265,7 +1265,7 @@ The update mechanism downloads releases from GitHub, verifies SHA256 checksums, 
 - The `--version` probe runs the freshly downloaded binary **unsandboxed**. The inode is pinned across that step, so it is the file cplt validated, but its provenance rests entirely on the SHA256 check above.
 - On the sudo install path the binary is handed to `sudo install` by path, not by descriptor. The inode is re-checked immediately before, but the staging directory being private is what closes that window.
 
-The Homebrew install path (`brew install navikt/tap/cplt`) uses Homebrew's own verification and is preferred on macOS. On Debian derivatives `sudo apt upgrade cplt` is the route that keeps dpkg's database honest. The `.deb` itself carries no signature and no checksum list, so its integrity rests on the archive signature or on the GitHub release it was downloaded from, not on dpkg.
+The Homebrew install path (`brew install navikt/tap/cplt`) uses Homebrew's own verification and is preferred on macOS.
 
 The apt path ([navikt/apt](https://navikt.github.io/apt/)) is preferred on Debian
 and Ubuntu. `apt` verifies the archive's OpenPGP signature on `InRelease` and the
@@ -1275,10 +1275,12 @@ Note what that does and does not buy: the signature covers the archive, and the
 from, so it attests that you got the bytes the archive publisher published, not
 that the release itself is independently trustworthy.
 
-`cplt update` recognises a Homebrew-managed binary and refuses to touch it, but
-it has no equivalent check for a dpkg-managed one. On an apt install, upgrade
-with `sudo apt upgrade`; `cplt update` would replace `/usr/bin/cplt` without
-dpkg knowing.
+`cplt update` recognises a Homebrew- or dpkg-managed binary, refuses to touch
+it, and prints that manager's upgrade command. On an apt install, upgrade with
+`sudo apt upgrade cplt`; that is the route that keeps dpkg's database honest.
+The `.deb` itself carries no signature and no checksum list, so its integrity
+rests on the archive signature above, or on the GitHub release it was
+downloaded from, not on dpkg.
 
 ### Install script security (`install.sh`)
 
