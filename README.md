@@ -270,8 +270,9 @@ overwrite whatever it put there.
 Without the archive, the same `.deb` is a release asset:
 
 ```bash
-gh release download --repo navikt/cplt --pattern '*_amd64.deb'
-sudo apt install ./cplt_<version>_amd64.deb
+arch=$(dpkg --print-architecture)   # amd64 or arm64
+gh release download --repo navikt/cplt --pattern "*_${arch}.deb"
+sudo apt install ./cplt_*_"${arch}".deb
 ```
 
 ### curl | bash
