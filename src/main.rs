@@ -720,7 +720,8 @@ QUICK START:
     /// Downloads the latest release from GitHub, verifies the SHA256
     /// checksum, and replaces the current binary atomically.
     ///
-    /// If installed via Homebrew, directs you to use `brew upgrade` instead.
+    /// If a package manager owns the binary — Homebrew, or apt via the `.deb`
+    /// — directs you to that manager's upgrade command instead.
     Update {
         /// Only check if an update is available (don't download or install).
         #[arg(long)]
@@ -8273,12 +8274,15 @@ fn trust_revoke(
 }
 
 fn run_update(check_only: bool, force: bool) -> ExitCode {
-    // Check for Homebrew-managed install
-    if update::is_homebrew_managed() {
-        ui::info("cplt is managed by Homebrew.");
+    // Refuse to write over a package-manager-owned binary: the manager's
+    // database would still describe the old version, and its next upgrade
+    // would silently revert ours.
+    if let Some(manager) = update::managing_package_manager() {
+        ui::info(&format!("cplt is managed by {}.", manager.name()));
         println!(
-            "  Run: {}brew upgrade navikt/tap/cplt{}",
+            "  Run: {}{}{}",
             ui::stdout_color(ui::GREEN),
+            manager.upgrade_command(),
             ui::stdout_color(ui::RESET)
         );
         return ExitCode::SUCCESS;

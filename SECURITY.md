@@ -1258,13 +1258,14 @@ The update mechanism downloads releases from GitHub, verifies SHA256 checksums, 
 - Staging happens in `~/.config/cplt/update/<128 random bits>`, not the system temp directory. Sandboxed agents can write throughout `/tmp` and `/var/folders`; `~/.config/cplt` is a hard deny (`DENIED_DOTFILES`), so a sandboxed process cannot reach the staged files at all
 - The staging directory is created with `mkdir(2)` at mode 0700, which fails with `EEXIST` rather than adopting a directory that is already there
 - The extracted binary is held open, and its `(dev, ino)` is re-checked before the unsandboxed `--version` probe and again before install. The install copies from that descriptor, so the bytes that are validated are the bytes that land on disk even if the path is repointed
+- A package-manager-owned binary is never replaced. `cplt update` resolves its own path and refuses when Homebrew owns it (`/Cellar/`, `/homebrew/`) or, on Linux, when dpkg does — a path under `/usr` outside `/usr/local`, confirmed by `dpkg-query -S`. It prints that manager's upgrade command instead. Overwriting a managed binary leaves the package database describing a version that is no longer on disk, and the manager's next upgrade reverts the update without saying so. The dpkg probe fails open: a missing `dpkg-query`, an error, or a timeout all read as unmanaged, so a hand-installed `/usr/bin/cplt` still self-updates rather than being stranded with no upgrade path
 
 **Not verified:**
 - There is no cryptographic signature, neither GPG nor Sigstore. `SHA256SUMS` and the binary come from the same GitHub release, so a compromised release controls both. This matches most Go/Rust CLI tools but is weaker than signed package managers.
 - The `--version` probe runs the freshly downloaded binary **unsandboxed**. The inode is pinned across that step, so it is the file cplt validated, but its provenance rests entirely on the SHA256 check above.
 - On the sudo install path the binary is handed to `sudo install` by path, not by descriptor. The inode is re-checked immediately before, but the staging directory being private is what closes that window.
 
-The Homebrew install path (`brew install navikt/tap/cplt`) uses Homebrew's own verification and is preferred on macOS.
+The Homebrew install path (`brew install navikt/tap/cplt`) uses Homebrew's own verification and is preferred on macOS. On Debian derivatives the `.deb` carries dpkg's own checksum verification, and `sudo apt upgrade cplt` is the route that keeps dpkg's database honest.
 
 The apt path ([navikt/apt](https://navikt.github.io/apt/)) is preferred on Debian
 and Ubuntu. `apt` verifies the archive's OpenPGP signature on `InRelease` and the

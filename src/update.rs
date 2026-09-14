@@ -10,6 +10,11 @@ use std::process::Command;
 const RELEASES_API: &str = "https://api.github.com/repos/navikt/cplt/releases";
 const DOWNLOAD_BASE: &str = "https://github.com/navikt/cplt/releases/download";
 
+/// Ceiling on the `dpkg-query` ownership probe. A local database answers in
+/// milliseconds; this only bounds a pathological one.
+#[cfg(target_os = "linux")]
+const DPKG_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum UpdateError {
@@ -307,18 +312,108 @@ pub fn perform_update(
     Ok(target_path.display().to_string())
 }
 
-/// Check if the current binary is managed by Homebrew.
-pub fn is_homebrew_managed() -> bool {
+/// A package manager that owns the installed binary.
+///
+/// Self-update must refuse for every variant here: writing a new binary over
+/// a managed install desynchronises the manager's database from the file on
+/// disk, and the next `brew upgrade` or `apt upgrade` silently reverts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageManager {
+    Homebrew,
+    Apt,
+}
+
+impl PackageManager {
+    /// Name as shown to the user.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Homebrew => "Homebrew",
+            Self::Apt => "apt",
+        }
+    }
+
+    /// The command that upgrades cplt under this manager.
+    pub fn upgrade_command(self) -> &'static str {
+        match self {
+            Self::Homebrew => "brew upgrade navikt/tap/cplt",
+            Self::Apt => "sudo apt upgrade cplt",
+        }
+    }
+}
+
+/// Which package manager owns the running binary, if any.
+pub fn managing_package_manager() -> Option<PackageManager> {
     let exe = std::env::current_exe()
         .ok()
-        .and_then(|p| std::fs::canonicalize(p).ok());
-    match exe {
-        Some(p) => {
-            let s = p.to_string_lossy();
-            s.contains("/Cellar/") || s.contains("/homebrew/")
-        }
-        None => false,
+        .and_then(|p| std::fs::canonicalize(p).ok())?;
+    package_manager_for(&exe, dpkg_owns)
+}
+
+/// Classify a resolved executable path. `dpkg_owns` is injected so the tests
+/// can drive both answers without a dpkg database.
+fn package_manager_for(exe: &Path, dpkg_owns: impl Fn(&Path) -> bool) -> Option<PackageManager> {
+    let s = exe.to_string_lossy();
+    if s.contains("/Cellar/") || s.contains("/homebrew/") {
+        return Some(PackageManager::Homebrew);
     }
+    // The path alone proves nothing — someone may have dropped a binary into
+    // /usr/bin by hand, and telling *them* to run `apt upgrade` while refusing
+    // to self-update would leave no upgrade path at all. dpkg has the final
+    // say; the path check only keeps the probe off the common installs.
+    if looks_dpkg_owned(&s) && dpkg_owns(exe) {
+        return Some(PackageManager::Apt);
+    }
+    None
+}
+
+/// dpkg owns `/usr`, but the FHS reserves `/usr/local` for locally installed
+/// software — which is where `install.sh`, `mise` and `~/.local/bin` put cplt.
+/// Everything else skips the subprocess entirely, macOS included.
+fn looks_dpkg_owned(path: &str) -> bool {
+    path.starts_with("/usr/") && !path.starts_with("/usr/local/")
+}
+
+/// Ask dpkg whether it owns `path`. Exit status 0 means it does.
+///
+/// Any other outcome — no dpkg-query, a broken database, a hang — is "not
+/// managed", so the failure mode is the behaviour we had before this guard
+/// existed and never a refusal that strands a hand-installed binary.
+#[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_methods)] // /usr/bin/dpkg-query, an absolute system path
+fn dpkg_owns(path: &Path) -> bool {
+    use std::time::{Duration, Instant};
+
+    // Absolute path: this runs outside the sandbox, so no bare PATH lookup.
+    let Ok(mut child) = Command::new("/usr/bin/dpkg-query")
+        .arg("-S")
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+
+    let deadline = Instant::now() + DPKG_QUERY_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn dpkg_owns(_path: &Path) -> bool {
+    false
 }
 
 /// Construct the asset filename for the current platform and architecture.
@@ -1171,15 +1266,72 @@ mod tests {
         assert_eq!(asset_name("x86_64"), "cplt-x86_64-unknown-linux-gnu.tar.gz");
     }
 
+    /// A dpkg probe that must never be called, and records it if it is.
+    fn never_probed(_: &Path) -> bool {
+        panic!("dpkg-query probed for a path that cannot be dpkg-owned");
+    }
+
     #[test]
     fn homebrew_detection_cellar_path() {
-        // Can't easily test is_homebrew_managed() since it reads current_exe,
-        // but we can verify the logic conceptually via path patterns
-        let cellar_path = "/opt/homebrew/Cellar/cplt/2026.04.13/bin/cplt";
-        assert!(cellar_path.contains("/Cellar/") || cellar_path.contains("/homebrew/"));
+        let cellar = Path::new("/opt/homebrew/Cellar/cplt/2026.04.13/bin/cplt");
+        assert_eq!(
+            package_manager_for(cellar, never_probed),
+            Some(PackageManager::Homebrew)
+        );
 
-        let direct_path = "/usr/local/bin/cplt";
-        assert!(!direct_path.contains("/Cellar/"));
+        let direct = Path::new("/usr/local/bin/cplt");
+        assert_eq!(package_manager_for(direct, never_probed), None);
+    }
+
+    #[test]
+    fn homebrew_upgrade_command_unchanged() {
+        assert_eq!(PackageManager::Homebrew.name(), "Homebrew");
+        assert_eq!(
+            PackageManager::Homebrew.upgrade_command(),
+            "brew upgrade navikt/tap/cplt"
+        );
+    }
+
+    /// The .deb installs to /usr/bin. Self-updating over it desynchronises
+    /// dpkg's database, and the next `apt upgrade` reverts the update.
+    #[test]
+    fn dpkg_owned_binary_is_apt_managed() {
+        let deb = Path::new("/usr/bin/cplt");
+        assert_eq!(
+            package_manager_for(deb, |_| true),
+            Some(PackageManager::Apt)
+        );
+        assert_eq!(
+            PackageManager::Apt.upgrade_command(),
+            "sudo apt upgrade cplt"
+        );
+        assert_eq!(PackageManager::Apt.name(), "apt");
+    }
+
+    /// A hand-installed binary in /usr/bin that dpkg disowns keeps working:
+    /// refusing there would leave it with no upgrade path at all.
+    #[test]
+    fn hand_installed_usr_bin_binary_still_self_updates() {
+        assert_eq!(
+            package_manager_for(Path::new("/usr/bin/cplt"), |_| false),
+            None
+        );
+    }
+
+    /// The probe is a subprocess. It must not run for paths dpkg never owns —
+    /// every macOS install, and the common /usr/local and ~/.local installs.
+    #[test]
+    fn common_install_paths_skip_the_dpkg_probe() {
+        for path in [
+            "/usr/local/bin/cplt",
+            "/opt/homebrew/bin/cplt",
+            "/home/alice/.local/bin/cplt",
+            "/Users/alice/.local/bin/cplt",
+        ] {
+            let _ = package_manager_for(Path::new(path), never_probed);
+        }
+        assert!(!looks_dpkg_owned("/usr/local/bin/cplt"));
+        assert!(looks_dpkg_owned("/usr/bin/cplt"));
     }
 
     #[test]
