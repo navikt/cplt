@@ -1265,7 +1265,7 @@ The update mechanism downloads releases from GitHub, verifies SHA256 checksums, 
 - The `--version` probe runs the freshly downloaded binary **unsandboxed**. The inode is pinned across that step, so it is the file cplt validated, but its provenance rests entirely on the SHA256 check above.
 - On the sudo install path the binary is handed to `sudo install` by path, not by descriptor. The inode is re-checked immediately before, but the staging directory being private is what closes that window.
 
-The Homebrew install path (`brew install navikt/tap/cplt`) uses Homebrew's own verification and is preferred on macOS. On Debian derivatives the `.deb` carries dpkg's own checksum verification, and `sudo apt upgrade cplt` is the route that keeps dpkg's database honest.
+The Homebrew install path (`brew install navikt/tap/cplt`) uses Homebrew's own verification and is preferred on macOS. On Debian derivatives `sudo apt upgrade cplt` is the route that keeps dpkg's database honest. The `.deb` itself carries no signature and no checksum list, so its integrity rests on the archive signature or on the GitHub release it was downloaded from, not on dpkg.
 
 The apt path ([navikt/apt](https://navikt.github.io/apt/)) is preferred on Debian
 and Ubuntu. `apt` verifies the archive's OpenPGP signature on `InRelease` and the

@@ -384,7 +384,10 @@ fn dpkg_owns(path: &Path) -> bool {
     use std::time::{Duration, Instant};
 
     // Absolute path: this runs outside the sandbox, so no bare PATH lookup.
+    // Empty environment: `DPKG_ROOT` / `DPKG_ADMINDIR` would point the query
+    // at another database, and this guard is about the host's.
     let Ok(mut child) = Command::new("/usr/bin/dpkg-query")
+        .env_clear()
         .arg("-S")
         .arg(path)
         .stdin(std::process::Stdio::null())
