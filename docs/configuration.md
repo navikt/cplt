@@ -369,8 +369,26 @@ The path has to exist when you set it. A relative entry cplt cannot resolve now
 is one the next launch would refuse anyway, and the error at write time names
 the directory you were standing in.
 
-Removing works the same way, so you can `--unset ../sykepenger-model` without
-looking up how it was stored.
+Removing does not. `--unset ../sykepenger-model` still works after you have
+deleted the checkout, which is when you are most likely to be typing it. The
+two directions differ on purpose: a path that resolves to nothing cannot be
+written, but it can be removed. cplt resolves it the usual way where the
+filesystem still answers, and otherwise works the `.` and `..` out on the
+string alone and looks the result up in what is stored.
+
+Nothing stored under it is a no-op, and says so. A stored entry with the same
+final component is named rather than removed on a guess — the same as `cplt
+link --unlink`:
+
+```
+[cplt] sandbox.repo_dirs: /Users/you/src/sykepenger-model is not set, nothing removed
+  One entry has that name:
+    /Users/you/work/sykepenger-model
+  Remove that one:
+    cplt config set --local sandbox.repo_dirs /Users/you/work/sykepenger-model --unset
+```
+
+When several share it, all of them are named and none is removed.
 
 ### Rules that apply on every launch, not only when written
 

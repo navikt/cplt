@@ -2794,6 +2794,201 @@ mod e2e_tests {
         let _ = std::fs::remove_dir_all(&fake_home);
     }
 
+    /// A git repository at `parent/<name>`, whose `origin` is
+    /// `navikt/<last segment>`. `temp_repo` makes an isolated tempdir, and
+    /// `../sibling` only means anything when two repositories share a parent.
+    fn sibling_repo(parent: &Path, name: &str) -> PathBuf {
+        let dir = parent.join(name);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let leaf = name.rsplit('/').next().expect("a name");
+        assert!(git_ok(&dir, &["init", "--quiet"]));
+        assert!(git_ok(
+            &dir,
+            &[
+                "remote",
+                "add",
+                "origin",
+                &format!("https://github.com/navikt/{leaf}.git"),
+            ]
+        ));
+        assert!(git_ok(
+            &dir,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ]
+        ));
+        std::fs::canonicalize(&dir).expect("canonical")
+    }
+
+    /// The cleanup trap: `--unset ../sibling` resolved through `canonicalize`,
+    /// so it failed once the directory was gone — the exact moment a person
+    /// reaches for it. Removing by the stored absolute path already worked,
+    /// because that form never reaches `canonicalize` at all; only the words
+    /// that added the entry were rejected.
+    #[test]
+    fn e2e_local_repo_dirs_unset_survives_the_directory_being_deleted() {
+        let fake_home = make_config_home("repo-dirs-unset-gone");
+        let parent = tempfile::tempdir().expect("tempdir");
+        let launch = sibling_repo(parent.path(), "launch");
+        let run = |args: &[&str]| {
+            let out = cplt_local(&fake_home, &launch)
+                .args(args)
+                .output()
+                .expect("should run");
+            (
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+                out.status.success(),
+            )
+        };
+
+        for removal in ["../unleasherator", "<absolute>"] {
+            let sibling = sibling_repo(parent.path(), "unleasherator");
+            let (err, ok) = run(&[
+                "config",
+                "set",
+                "--local",
+                "sandbox.repo_dirs",
+                "../unleasherator",
+            ]);
+            assert!(ok, "adding it must work: {err}");
+            std::fs::remove_dir_all(&sibling).expect("delete the checkout");
+
+            let absolute = sibling.to_string_lossy().into_owned();
+            let value = if removal == "<absolute>" {
+                absolute.as_str()
+            } else {
+                removal
+            };
+            let (err, ok) = run(&[
+                "config",
+                "set",
+                "--local",
+                "sandbox.repo_dirs",
+                value,
+                "--unset",
+            ]);
+            assert!(
+                ok,
+                "--unset {value} must not need the directory to still exist: {err}"
+            );
+            assert!(
+                err.contains(&format!("removed {absolute}")),
+                "--unset {value} must name what it removed: {err}"
+            );
+            assert!(
+                local_file(&fake_home).is_none_or(|f| !std::fs::read_to_string(f)
+                    .unwrap()
+                    .contains("unleasherator")),
+                "--unset {value} must actually remove the entry"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    /// Removing something that is not there is a no-op, and has to read as one.
+    /// When a stored entry has the same final component it is named rather than
+    /// guessed at — the user is mid-cleanup and wants the string `--unset`
+    /// takes — and when several do, all of them are named and none is removed.
+    #[test]
+    fn e2e_local_repo_dirs_unset_names_the_entry_it_did_not_remove() {
+        let fake_home = make_config_home("repo-dirs-unset-hint");
+        let parent = tempfile::tempdir().expect("tempdir");
+        let launch = sibling_repo(parent.path(), "launch");
+        let first = sibling_repo(parent.path(), "unleasherator");
+        let run = |args: &[&str]| {
+            let out = cplt_local(&fake_home, &launch)
+                .args(args)
+                .output()
+                .expect("should run");
+            (
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+                out.status.success(),
+            )
+        };
+
+        let (err, ok) = run(&[
+            "config",
+            "set",
+            "--local",
+            "sandbox.repo_dirs",
+            "../unleasherator",
+        ]);
+        assert!(ok, "adding it must work: {err}");
+
+        // Nothing like it: say so, and do not dress it up as a removal.
+        let (err, ok) = run(&[
+            "config",
+            "set",
+            "--local",
+            "sandbox.repo_dirs",
+            "../no-such-checkout",
+            "--unset",
+        ]);
+        assert!(ok, "{err}");
+        assert!(
+            err.contains("is not set, nothing removed"),
+            "a no-op removal must say it removed nothing: {err}"
+        );
+        assert!(
+            !err.contains("One entry has that name"),
+            "nothing shares that name, so nothing should be suggested: {err}"
+        );
+
+        // One entry shares the final component: name the stored string.
+        let (err, ok) = run(&[
+            "config",
+            "set",
+            "--local",
+            "sandbox.repo_dirs",
+            "./elsewhere/unleasherator",
+            "--unset",
+        ]);
+        assert!(ok, "{err}");
+        assert!(
+            err.contains("One entry has that name")
+                && err.contains(&first.to_string_lossy().into_owned()),
+            "the stored entry must be named, not silently missed: {err}"
+        );
+
+        // Two do: name both, remove neither.
+        let second = sibling_repo(parent.path(), "nested/unleasherator");
+        let (err, ok) = run(&[
+            "config",
+            "set",
+            "--local",
+            "sandbox.repo_dirs",
+            "../nested/unleasherator",
+        ]);
+        assert!(ok, "adding the second must work: {err}");
+        let (err, ok) = run(&[
+            "config",
+            "set",
+            "--local",
+            "sandbox.repo_dirs",
+            "./elsewhere/unleasherator",
+            "--unset",
+        ]);
+        assert!(ok, "{err}");
+        assert!(
+            err.contains("More than one entry has that name")
+                && err.contains(&first.to_string_lossy().into_owned())
+                && err.contains(&second.to_string_lossy().into_owned()),
+            "both must be named: {err}"
+        );
+        let content =
+            std::fs::read_to_string(local_file(&fake_home).expect("a local file")).expect("read");
+        assert!(
+            content.contains(&first.to_string_lossy().into_owned())
+                && content.contains(&second.to_string_lossy().into_owned()),
+            "an ambiguous removal must remove nothing: {content}"
+        );
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
     /// Every value `config show` takes from the local file must say so. The
     /// dangerous-true booleans printed no marker at all, and `repo_dirs` — the
     /// one key whose whole job is naming a repository the user has forgotten —

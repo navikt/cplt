@@ -258,6 +258,24 @@ pub fn remove_array_element_in_doc(
     Ok(removed)
 }
 
+/// The string elements of an array-valued key, exactly as they are stored.
+///
+/// [`get_value_from_doc`] renders an array for display; this is for matching
+/// against what the user typed, so it must not.
+#[must_use]
+pub fn array_entries_in_doc(doc: &toml_edit::DocumentMut, key_info: &ConfigKeyInfo) -> Vec<String> {
+    doc.get(key_info.section)
+        .and_then(|section| section.as_table())
+        .and_then(|table| table.get(key_info.key))
+        .and_then(|item| item.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(ToString::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Check if a TOML array contains a value (by semantic equality).
 fn array_contains(arr: &toml_edit::Array, value: &toml_edit::Value) -> bool {
     array_index_of(arr, value).is_some()

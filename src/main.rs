@@ -6781,7 +6781,15 @@ fn run_config_set(
     let value = match (local_project.as_ref(), value) {
         (Some(_), Some(v)) if config::is_local_path_key(key) => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            match config::resolve_path_entry(v, &cwd) {
+            // A removal deliberately does not require the directory to still
+            // exist: the entry naming a checkout you already deleted is the one
+            // most worth removing, and refusing to resolve it left it stuck.
+            let resolved = if unset {
+                config::resolve_path_entry_for_removal(v, &cwd)
+            } else {
+                config::resolve_path_entry(v, &cwd)
+            };
+            match resolved {
                 Ok(abs) => {
                     resolved_value = abs;
                     Some(resolved_value.as_str())
@@ -6883,13 +6891,35 @@ fn run_config_set(
         }
     }
 
-    // Skip writing when nothing changed (unset element that wasn't present)
+    // Skip writing when nothing changed (unset element that wasn't present).
+    // Say which, and say it is a no-op: a removal that printed nothing read as
+    // a removal. A stored entry with the same final component is almost always
+    // what was meant — the checkout moved, or was reached by a different path —
+    // so name the stored string, which is what `--unset` actually takes. Same
+    // shape as `cplt link --unlink`: one candidate is named, several are all
+    // named, and neither removes anything.
     if let Some(val) = value
         && !element_removed
         && unset
         && op.key_info.value_type.is_array()
     {
-        ui::warn(&format!("{key}: {val} is not set"));
+        let scope = if local { "--local " } else { "" };
+        let stored = config::array_entries_in_doc(&doc, op.key_info);
+        // No origin reader: these are config entries, not linked repositories,
+        // so the final component is the only evidence there is.
+        let hint = match cplt::link::choose_unlink(&stored, val, |_: &Path| None) {
+            cplt::link::Unlink::NoMatch => String::new(),
+            cplt::link::Unlink::Remove(entry) => format!(
+                "\n  One entry has that name:\n    {entry}\n  \
+                 Remove that one:\n    cplt config set {scope}{key} {entry} --unset"
+            ),
+            cplt::link::Unlink::Several(many) => format!(
+                "\n  More than one entry has that name, so cplt is not picking one:\n    {}\n  \
+                 Remove the one you mean:\n    cplt config set {scope}{key} <VALUE> --unset",
+                many.join("\n    ")
+            ),
+        };
+        ui::warn(&format!("{key}: {val} is not set, nothing removed{hint}"));
         return ExitCode::SUCCESS;
     }
 

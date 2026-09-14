@@ -240,7 +240,8 @@ pub fn is_local_path_key(dotted: &str) -> bool {
 /// # Errors
 /// If the path does not exist. A relative entry cplt cannot resolve now is one
 /// the launch would refuse anyway, and saying so here beats writing a file that
-/// fails at the next launch.
+/// fails at the next launch. That justification is about *writing*, so removal
+/// goes through [`resolve_path_entry_for_removal`] instead.
 pub fn resolve_path_entry(value: &str, cwd: &Path) -> Result<String, ConfigError> {
     // `~` and `~/…` only, matching `expand_tilde`: `~someone/repo` is not
     // expanded anywhere in cplt, so storing it would leave an entry that reads
@@ -262,6 +263,56 @@ pub fn resolve_path_entry(value: &str, cwd: &Path) -> Result<String, ConfigError
                 cwd.display()
             ))
         })
+}
+
+/// Resolve a relative path entry for a `--unset`, which must work after the
+/// directory is gone.
+///
+/// [`resolve_path_entry`] canonicalizes, so `config set --local
+/// sandbox.repo_dirs ../sibling --unset` failed for the one checkout most worth
+/// removing: a deleted one. The stored entry was written by canonicalizing the
+/// same words, so canonicalization is exactly what would have matched it — and
+/// exactly what stops existing. The asymmetry was visible already: a value
+/// starting with `/` or `~/` returns as typed, so removal by the stored
+/// absolute path always worked. Only the relative form was unremovable.
+///
+/// So canonicalize first — a symlinked path still has to match what was stored
+/// — and fall back to anchoring the value to `cwd` lexically. Nothing is read
+/// from disk on that path, and nothing is written: the caller looks the result
+/// up in the entries it already has, and says so when it finds none.
+///
+/// # Errors
+/// If `value` is a `~someone/…` path. That refusal is about what the value
+/// *means*, not about what is on disk, so it holds for removal too.
+pub fn resolve_path_entry_for_removal(value: &str, cwd: &Path) -> Result<String, ConfigError> {
+    match resolve_path_entry(value, cwd) {
+        Ok(resolved) => Ok(resolved),
+        // The only non-existence refusal `resolve_path_entry` raises.
+        Err(e) if value.starts_with('~') => Err(e),
+        Err(_) => Ok(lexically_anchored(cwd, value)
+            .to_string_lossy()
+            .into_owned()),
+    }
+}
+
+/// Join `value` to `cwd` and fold `.` and `..` away without touching the disk.
+///
+/// `..` is folded off the built-up path, which is only the same directory
+/// canonicalization would name when no symlink sits above the `..` — hence the
+/// canonicalize-first order in [`resolve_path_entry_for_removal`]. `cwd` comes
+/// from `getcwd`, which is already symlink-free.
+fn lexically_anchored(cwd: &Path, value: &str) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in cwd.join(value).components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Refuse relative path entries, at `config set --local` and again at load.
@@ -855,6 +906,58 @@ mod tests {
             err.to_string().contains("cannot resolve"),
             "should name the failure: {err}"
         );
+    }
+
+    /// The trap this fixes: the entry naming a checkout you have already
+    /// deleted is the one most worth removing, and it was the one `--unset`
+    /// could not resolve. The lexical fallback must land on exactly the string
+    /// canonicalization wrote while the directory was still there.
+    #[test]
+    fn a_removal_resolves_a_relative_entry_whose_directory_is_gone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonical");
+        let sibling = root.join("sibling");
+        let cwd = root.join("launch");
+        std::fs::create_dir_all(&sibling).expect("sibling");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+
+        let stored = resolve_path_entry("../sibling", &cwd).expect("resolves while it exists");
+        std::fs::remove_dir_all(&sibling).expect("delete it");
+
+        assert!(
+            resolve_path_entry("../sibling", &cwd).is_err(),
+            "writing one must still require it to exist"
+        );
+        assert_eq!(
+            resolve_path_entry_for_removal("../sibling", &cwd).expect("removal resolves anyway"),
+            stored,
+            "the fallback must name what was stored, or the entry stays stuck"
+        );
+        // And `.` and `..` are folded, not carried into the comparison — a
+        // stored entry never contains either.
+        assert_eq!(
+            resolve_path_entry_for_removal("./../../sibling", &cwd.join("deeper"))
+                .expect("resolves"),
+            stored
+        );
+    }
+
+    /// Anchor-independent values never reached `canonicalize` in the first
+    /// place, which is why removing by the stored absolute path already worked;
+    /// the leniency must not change what they mean.
+    #[test]
+    fn a_removal_leaves_absolute_and_tilde_values_alone() {
+        let cwd = Path::new("/nowhere");
+        assert_eq!(
+            resolve_path_entry_for_removal("/opt/gone", cwd).unwrap(),
+            "/opt/gone"
+        );
+        assert_eq!(
+            resolve_path_entry_for_removal("~/code/gone", cwd).unwrap(),
+            "~/code/gone"
+        );
+        // Not an existence question, so it is refused for removal too.
+        assert!(resolve_path_entry_for_removal("~someone/repo", cwd).is_err());
     }
 
     /// The two lists that decide "this key holds paths" must agree, or a new
