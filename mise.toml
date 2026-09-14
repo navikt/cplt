@@ -71,6 +71,10 @@ run = "cargo test --test integration"
 description = "Run Linux Landlock integration tests — Linux only (kernel 5.13+)"
 run = "cargo test --test integration_linux"
 
+[tasks."test:network-audit"]
+description = "Run network audit command-path tests on macOS or Linux"
+run = "cargo test --test network_audit"
+
 [tasks."test:e2e"]
 description = "Run E2E tests — macOS only, sandbox-safe"
 run = "cargo test --test e2e"
@@ -85,7 +89,7 @@ run = "cargo test --test e2e -- --ignored"
 
 [tasks."test:all"]
 description = "Run all test suites except live smoke tests — macOS only, sandbox-safe"
-depends = ["test:unit", "test:lib", "test:integration", "test:e2e", "test:e2e-projects"]
+depends = ["test:unit", "test:lib", "test:integration", "test:e2e", "test:e2e-projects", "test:network-audit"]
 
 [tasks."test:everything"]
 description = "Run ALL tests including live smoke tests — macOS only, NOT sandbox-safe"

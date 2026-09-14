@@ -16,6 +16,7 @@ Always run `mise run check` at the end of a coding session.
 | `mise run test:lib` | lib (modules) | ✅ | ✅ | ✅ | None |
 | `mise run test:integration` | integration | ✅ | ❌ | ✅ | macOS `sandbox-exec` |
 | `mise run test:integration-linux` | integration_linux | ❌ | ✅ | ❌ | Linux with Landlock (5.13+) |
+| `mise run test:network-audit` | network_audit | ✅ | ❌ | ✅ | macOS or Linux; binds localhost TCP |
 | `mise run test:e2e` | e2e | ✅ | ❌ | ✅ | macOS + `copilot` in PATH; checkout not under `/tmp` or `/var/folders` |
 | `mise run test:e2e-projects` | e2e_projects | ✅ | ❌ | ✅ | macOS `sandbox-exec`; checkout not under `/tmp` or `/var/folders` |
 | `mise run test:e2e-live` | e2e (ignored), 6 smoke tests | ❌ | ❌ | ⚠️ | macOS + Copilot auth + network |
