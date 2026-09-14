@@ -1707,6 +1707,13 @@ mod tests {
     /// The per-file grant is the supported route and must survive: refusing it
     /// would close the only door SSH has left on macOS, `~/.ssh/known_hosts`
     /// included.
+    ///
+    /// `~/.nav-pilot` is in the list for a different reason and the same rule
+    /// carries it: the directory is refused because the consent record and the
+    /// pinned revisions in it decide what the next launch does, but a Tier 2
+    /// nav-pilot launch hands cplt `--allow-read` on the one pinned payload it
+    /// is about to run, and that grant has to reach the ruleset
+    /// (navikt/copilot#858).
     #[test]
     fn prepare_accepts_a_grant_inside_a_denied_dotfile_directory() {
         let home = Path::new("/home/test");
@@ -1714,6 +1721,7 @@ mod tests {
             home.join(".ssh/id_ed25519"),
             home.join(".ssh/known_hosts"),
             home.join(".config/gcloud/application_default_credentials.json"),
+            home.join(".nav-pilot/pakker/nais-pilot/abc123/copilot/full"),
         ];
 
         let mut config = test_config(home, &granted);

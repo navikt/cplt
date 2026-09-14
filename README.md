@@ -115,6 +115,7 @@ The sandbox blocks access to credentials and secrets in the kernel. Command guar
 | Read `~/.kube`, `~/.docker`, `~/.nais` | 🔒 Kernel-blocked | |
 | Read `~/.password-store`, `~/.terraform.d` | 🔒 Kernel-blocked | |
 | Read `~/.config/gcloud`, `~/.config/op` | 🔒 Kernel-blocked | Individual files are overridable with `--allow-read`. See [Cloud credentials](docs/known-impacts.md#cloud-credential-directories) |
+| Read or write `~/.config/cplt`, `~/.nav-pilot` | 🔒 Kernel-blocked | Tool state that decides what the *next* launch may do. `~/.config/cplt` is un-overridable as a whole subtree; inside `~/.nav-pilot`, a named path stays grantable so a pinned agentpakke payload can be read |
 | Read `~/.netrc`, `~/.pypirc`, `~/.vault-token` | 🔒 Kernel-blocked | Un-overridable on both platforms. Naming one in `allow.read` is a startup error |
 | Read `~/.gem/credentials` | 🔒 Kernel-blocked | Un-overridable on both platforms. Naming one in `allow.read` is a startup error |
 | `gh` CLI destructive operations (merge, delete, release) | 🔒 Command-gated (on by default) | Opt out with `--no-gh-guard`. See [gh guard](docs/gh-guard.md) |

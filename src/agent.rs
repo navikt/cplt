@@ -608,7 +608,11 @@ impl Agent {
     ///   the CLI spawns, `extensions/` runs Node modules, and `pkg` holds the
     ///   native `.node` addons. `installed-plugins/` carries the same three
     ///   routes inside a plugin, and is denied with an unresolved cost — see
-    ///   the match arm.
+    ///   the match arm. `skills/` is the one entry that does not fire at
+    ///   launch: it steers what the agent does in the *next* session, and a
+    ///   skill body's usual payload is a `bash <path>` line, so writing one is
+    ///   writing the argument to a later shell command. It is denied here and
+    ///   left writable for Claude Code, and the match arm says why.
     /// - Shell (fish): `config.fish` and `conf.d/` are sourced at every shell
     ///   startup, `functions/` autoload on command-name invocation, and
     ///   `completions/` on tab-completion; `vendor_conf.d/` (sourced at every
@@ -633,6 +637,10 @@ impl Agent {
     ///   `.pi/extensions`, `.pi/settings.json` `packages` — on the next host
     ///   run. Same class as the rest of the list: nothing legitimate writes it
     ///   mid-session, `/trust` is a deliberate act to perform outside cplt.
+    ///   `skills/` is Copilot's entry one tree over: same "instructions for the
+    ///   next session that name a script to run" argument. It also loses its
+    ///   write grant in `config_dirs`, so on Linux it is read-only under plain
+    ///   Landlock rather than only under bubblewrap.
     ///
     /// Cost: for Pi this breaks package management and every in-session
     /// setting that persists to `settings.json` — `/model` Ctrl+S,
@@ -648,7 +656,14 @@ impl Agent {
     pub fn host_persistence_denies(&self) -> &'static [&'static str] {
         match self {
             Agent::Claude => &["statusline.sh", "plugins", "settings.json"],
-            Agent::Pi => &["settings.json", "trust.json", "extensions", "npm", "git"],
+            Agent::Pi => &[
+                "settings.json",
+                "trust.json",
+                "extensions",
+                "npm",
+                "git",
+                "skills",
+            ],
             // Antigravity's grants are ~/.gemini/config and
             // ~/.gemini/antigravity-cli, not ~/.gemini itself, so Gemini's own
             // entries would not match; these are its equivalents. Each name is
@@ -707,6 +722,23 @@ impl Agent {
             // `installed-plugins/` is touched at startup. Documented in
             // SECURITY.md so the next person finds the answer rather than
             // repeating the investigation.
+            //
+            // `skills/` is the eighth, and it is here for a different reason
+            // than the other seven: nothing under it fires at launch. A skill
+            // is instructions the model is offered in the *next* session, and
+            // the way a skill does real work is by naming a script for the
+            // agent to run — `bash "$SKILLS_DIR/<skill>/<script>.sh"` is the
+            // documented shape. Writing a skill is therefore writing the
+            // argument to a later shell command, not prompt content, and
+            // SECURITY.md said the opposite until now.
+            //
+            // What makes it cheap here and expensive for Claude Code (#366) is
+            // where skills come from. `~/.copilot/skills/` is filled by an
+            // install — `copilot` plugin install, or `nav-pilot install`, both
+            // of which refuse to run inside cplt anyway — not by hand during a
+            // session. Copilot's in-session authoring surface is `agents/` and
+            // `instructions/`, and both stay writable. Claude Code's is
+            // `skills/` itself, which is why that default is still open.
             Agent::Copilot => &[
                 "settings.json",
                 "hooks",
@@ -715,10 +747,25 @@ impl Agent {
                 "extensions",
                 "installed-plugins",
                 "pkg",
+                "skills",
             ],
             // goose needs no entries: its ONLY auto-execution vector is
             // config.yaml's `extensions:` list, and its config dir is granted
-            // read-only, so there is nothing writable left to deny. (These
+            // read-only, so there is nothing writable left to deny.
+            //
+            // OpenCode needs none either, and skills are the case that makes
+            // it worth saying (navikt/copilot#858). OpenCode reads skills out
+            // of its config dir — `~/.config/opencode`, or wherever
+            // `OPENCODE_CONFIG_DIR` points — and that `AgentDir` is granted
+            // `write: false`, so a skill directory there is already read-only
+            // on both backends with no deny entry and no bubblewrap. The
+            // writable grants are the data, state and cache dirs, which hold
+            // sessions, logs and downloaded binaries and no skills; the one
+            // exec-bearing path among them, `~/.cache/opencode/bin`, is its own
+            // read-only `AgentDir`. A relocated `OPENCODE_CONFIG_DIR` inherits
+            // the same posture — nav-pilot points it at a pinned payload and
+            // hands cplt `--allow-read` on it, which is read-only by
+            // construction. (These
             // denies are joined onto writable dirs only, so an entry here would
             // be inert anyway.) The data and state dirs hold sessions, logs and
             // downloaded model weights — nothing goose auto-executes.
@@ -1060,10 +1107,14 @@ impl Agent {
                 // (`getSessionsDir`, `getPromptsDir`, `getCustomThemesDir`,
                 // `getToolsDir`, `getBinDir`), `dist/core/resource-loader.js`
                 // (`skills`) and the extension staging dir `tmp/extensions`.
-                // `npm/`, `git/` and `extensions/` are deliberately absent:
-                // they are `host_persistence_denies` entries, so read-only is
-                // what they are meant to be, and `bin/` is absent because it is
-                // the whole point of the narrowing.
+                // `npm/`, `git/`, `extensions/` and `skills/` are
+                // deliberately absent: they are `host_persistence_denies`
+                // entries, so read-only is what they are meant to be, and
+                // `bin/` is absent because it is the whole point of the
+                // narrowing. `skills/` was writable until navikt/copilot#858 —
+                // dropping the grant, rather than relying on the tail deny
+                // alone, is what makes it read-only on a Linux host with no
+                // bubblewrap.
                 //
                 // Cost: Pi can no longer create a NEW top-level entry under
                 // ~/.pi/agent mid-session, except the one named lock directory
@@ -1124,7 +1175,6 @@ impl Agent {
                     writable(agent.join("sessions")),
                     writable(agent.join("prompts")),
                     writable(agent.join("themes")),
-                    writable(agent.join("skills")),
                     writable(agent.join("tools")),
                     writable(agent.join("tmp")),
                     AgentDir {
@@ -2409,7 +2459,15 @@ mod tests {
             // trust.json is the project trust store: a bare per-directory
             // decision with no fingerprint, so writing it pre-trusts a project
             // and unlocks its `.pi/` auto-load paths on the next host run.
-            ["settings.json", "trust.json", "extensions", "npm", "git"]
+            // skills/ steers the next session and names the scripts it runs.
+            [
+                "settings.json",
+                "trust.json",
+                "extensions",
+                "npm",
+                "git",
+                "skills"
+            ]
         );
         assert_eq!(
             Agent::Antigravity.host_persistence_denies(),
@@ -2427,7 +2485,8 @@ mod tests {
                 "lsp-config.json",
                 "extensions",
                 "installed-plugins",
-                "pkg"
+                "pkg",
+                "skills"
             ],
         );
         assert!(
@@ -2477,6 +2536,7 @@ mod tests {
                 home.join(".pi/agent/extensions"),
                 home.join(".pi/agent/npm"),
                 home.join(".pi/agent/git"),
+                home.join(".pi/agent/skills"),
             ],
             "the denies belong to the ~/.pi/agent root — the nested grants \
              (sessions/, bin/, …) must contribute nothing, and the read-only \
@@ -2821,6 +2881,32 @@ mod tests {
             dirs.iter()
                 .any(|d| d.write && d.path == home.join(".pi/agent/sessions")),
             "{dirs:?}"
+        );
+    }
+
+    /// `~/.pi/agent/skills/` is inside no writable grant (navikt/copilot#858).
+    ///
+    /// It used to have one. A skill is what the agent is offered in the next
+    /// session and it names the scripts that session runs, so it belongs with
+    /// `extensions/`, `npm/` and `git/`: absent from the writable set *and* a
+    /// `host_persistence_denies` entry. The grant is what matters on Linux —
+    /// the deny needs bubblewrap, the missing grant does not.
+    #[test]
+    fn pi_skills_dir_is_inside_no_writable_grant() {
+        let home = Path::new("/Users/test");
+        let dirs = Agent::Pi.config_dirs(home);
+        let skills = home.join(".pi/agent/skills");
+
+        for dir in dirs.iter().filter(|d| d.write) {
+            assert!(
+                !skills.starts_with(&dir.path),
+                "{} is writable and contains skills/ — an agent could rewrite                  the instructions its own next session is offered",
+                dir.path.display()
+            );
+        }
+        assert!(
+            Agent::Pi.host_persistence_denies().contains(&"skills"),
+            "the tail deny must hold too, so a user allow.write on              ~/.pi/agent cannot reopen it on macOS"
         );
     }
 

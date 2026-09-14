@@ -1028,6 +1028,11 @@ fn pi_profile_denies_the_project_trust_store() {
         p.contains("(deny file-write* (subpath \"/Users/test/.pi/agent/trust.json\"))"),
         "the trust store must be denied alongside settings.json:\n{p}"
     );
+    assert!(
+        p.contains("(deny file-write* (subpath \"/Users/test/.pi/agent/skills\"))"),
+        "skills/ steers the next session and names the scripts it runs \
+         (navikt/copilot#858):\n{p}"
+    );
 }
 
 /// H-13/H-05: an agent's managed-binary dir must not sit inside a writable
@@ -1071,6 +1076,20 @@ fn pi_managed_binaries_are_not_inside_a_writable_linux_grant() {
         cplt::check::writable_tree_over(&policy, home, &home.join(".pi/agent/sessions/x.jsonl")),
         Some(home.join(".pi/agent/sessions")),
         "narrowing must not cost Pi its session directory"
+    );
+
+    // Same narrowing, same reason, one directory over (navikt/copilot#858):
+    // skills/ lost its write grant, so Landlock alone holds it read-only — the
+    // tail deny and the bwrap re-bind are belt, this is the braces.
+    assert_eq!(
+        cplt::check::writable_tree_over(
+            &policy,
+            home,
+            &home.join(".pi/agent/skills/evil/SKILL.md")
+        ),
+        None,
+        "no rule may make ~/.pi/agent/skills writable — it is what the agent's \
+         next session is offered, and it names the scripts that session runs"
     );
 }
 
@@ -1278,14 +1297,16 @@ fn host_persistence_denies_survive_a_later_user_allow_write() {
     }
 }
 
-/// Copilot's seven host-persistence denies.
+/// Copilot's eight host-persistence denies.
 ///
 /// `~/.copilot` is granted write for the session store, the permissions file
 /// and the logs Copilot rewrites every run, so the persistence guard has to be
-/// file-level. These seven auto-execute on the next host launch. Six are never
-/// written by the CLI in normal operation; `installed-plugins/` may be, at
-/// session start, which is the one unresolved cost in the set — see
-/// SECURITY.md.
+/// file-level. Seven auto-execute on the next host launch. Six of those are
+/// never written by the CLI in normal operation; `installed-plugins/` may be,
+/// at session start, which is the one unresolved cost in the set — see
+/// SECURITY.md. `skills/` is the eighth and does not auto-execute: it is the
+/// instructions the model is offered next session, and a skill body's payload
+/// is a `bash <path>` line (navikt/copilot#858).
 #[test]
 fn copilot_execution_bearing_paths_are_write_denied_and_survive_a_user_allow() {
     let home = std::path::Path::new("/Users/test");
@@ -1313,6 +1334,7 @@ fn copilot_execution_bearing_paths_are_write_denied_and_survive_a_user_allow() {
         "extensions",
         "installed-plugins",
         "pkg",
+        "skills",
     ] {
         let line = format!("(deny file-write* (subpath \"/Users/test/.copilot/{sub}\"))");
         let deny = p
@@ -1330,6 +1352,18 @@ fn copilot_execution_bearing_paths_are_write_denied_and_survive_a_user_allow() {
             && !p.contains("(deny file-write* (subpath \"/Users/test/.copilot/config.json\"))"),
         "the CLI's own mutable state must not be caught by the persistence denies"
     );
+
+    // Copilot's in-session authoring surface stays writable: the deny is on
+    // skills/, which arrives by install, not on the directories a session
+    // legitimately writes.
+    for sub in ["agents", "instructions"] {
+        assert!(
+            !p.contains(&format!(
+                "(deny file-write* (subpath \"/Users/test/.copilot/{sub}\"))"
+            )),
+            "{sub}/ is authored in-session and must stay writable"
+        );
+    }
 }
 
 /// fish's auto-executing files are write-denied in BOTH granted dirs, and
@@ -1963,6 +1997,10 @@ fn profile_denies_sensitive_dirs() {
         ".config/gcloud",
         ".config/op",
         ".terraform.d",
+        // Not a credential dir: nav-pilot's state. It holds the consent record
+        // for the sandbox waivers a pakke asks for, and an agent that can write
+        // it approves its own waiver for the next launch (navikt/copilot#858).
+        ".nav-pilot",
     ] {
         assert!(
             p.contains(&format!(
@@ -1977,6 +2015,75 @@ fn profile_denies_sensitive_dirs() {
             "should deny write to {dir}"
         );
     }
+}
+
+/// nav-pilot's state is write-denied, and the pinned payload it hands cplt
+/// stays readable (navikt/copilot#858).
+///
+/// `~/.nav-pilot/` holds `config.toml`, the pinned agentpakke revisions under
+/// `pakker/`, and the record of which sandbox waivers the user approved for a
+/// pakke. An agent that can write that record approves its own waiver for the
+/// next launch, which is the whole point of asking — so the directory goes in
+/// `DENIED_DOTFILES` and the deny outlives a user `allow.write` on `$HOME`.
+///
+/// The one path that must survive is a Tier 2 launch: nav-pilot passes
+/// `--allow-read ~/.nav-pilot/pakker/<owner>-<repo>/<sha>/<client>/<context>`
+/// for the payload it is about to run. That is a grant *inside* the directory,
+/// which is the supported override — the deny refuses the directory itself.
+#[test]
+fn nav_pilot_state_is_denied_and_the_pinned_payload_stays_readable() {
+    let home = std::path::Path::new("/Users/test");
+    let payload = home.join(".nav-pilot/pakker/nais-pilot/abc123/copilot/full");
+    let whole_home = home.to_path_buf();
+    let granted = [payload.clone()];
+    let p = generate_profile(
+        &SandboxConfig {
+            extra_read: &granted,
+            // The case the deny exists for: a user allow.write wide enough to
+            // cover ~/.nav-pilot. Last-match-wins would reopen it without the
+            // deny being emitted after the allow.
+            extra_write: std::slice::from_ref(&whole_home),
+            ..base_profile_options()
+        },
+        &[],
+    );
+
+    let allow = p
+        .rfind("(allow file-write* (subpath \"/Users/test\"))")
+        .expect("the user allow.write must be emitted");
+    for verb in ["file-read*", "file-write*"] {
+        let line = format!("(deny {verb} (subpath \"/Users/test/.nav-pilot\"))");
+        let deny = p
+            .find(&line)
+            .unwrap_or_else(|| panic!("{line} must be emitted:\n{p}"));
+        assert!(
+            deny > allow,
+            "{line} must come AFTER the user allow.write, or last-match-wins \
+             reopens the consent record"
+        );
+    }
+
+    // The payload the launch is about to run is re-allowed after the deny, as
+    // a subtree — read only, and nothing else in ~/.nav-pilot with it.
+    let payload_allow = p
+        .rfind(&format!(
+            "(allow file-read* (subpath \"{}\"))",
+            payload.display()
+        ))
+        .expect("the pinned payload read grant must reach the profile");
+    let deny = p
+        .find("(deny file-read* (subpath \"/Users/test/.nav-pilot\"))")
+        .unwrap();
+    assert!(
+        payload_allow > deny,
+        "the payload re-allow must come after the blanket deny, or a Tier 2 \
+         launch cannot read the tree it is about to run"
+    );
+    assert!(
+        !p.contains("/Users/test/.nav-pilot/config.toml")
+            && !p.contains("(allow file-write* (subpath \"/Users/test/.nav-pilot"),
+        "the grant must not reach beyond the payload it names:\n{p}"
+    );
 }
 
 #[test]

@@ -1819,6 +1819,140 @@ mod macos_tests {
         );
     }
 
+    // ── nav-pilot state and skill directory denial ────────────────
+
+    /// `~/.nav-pilot/` is unwritable from inside a session, and the one pinned
+    /// payload a launch grants stays readable (navikt/copilot#858).
+    ///
+    /// The record of which sandbox waivers the user approved for an agentpakke
+    /// lives here. An agent that can write it approves its own waiver for the
+    /// next launch, so the directory is a `DENIED_DOTFILES` entry. A Tier 2
+    /// launch still has to read the revision it is about to run, which arrives
+    /// as `--allow-read` on the payload subtree — the per-subpath override.
+    ///
+    /// Driven against a temp `$HOME` rather than the real one: the deny has to
+    /// be observed on a directory that exists, and creating `~/.nav-pilot` in
+    /// the developer's home to prove a point is not this test's business.
+    ///
+    /// The profile carries an explicit `allow.write` on that home, which is the
+    /// vector the deny exists for and keeps the result from resting on the
+    /// temp-dir grant a `$TMPDIR` home gets for free. In a default session with
+    /// no such grant the directory is unreachable already, by `(deny default)`
+    /// on macOS and by Landlock being grant-only on Linux; what this pins is
+    /// that one line of user config cannot undo that.
+    #[test]
+    fn real_profile_blocks_nav_pilot_state_write() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let temp_home = tempfile::tempdir().unwrap();
+        let home = fs::canonicalize(temp_home.path()).unwrap();
+
+        let state = home.join(".nav-pilot");
+        let payload = state.join("pakker/nais-pilot/abc123/copilot/full");
+        fs::create_dir_all(&payload).unwrap();
+        let consent = state.join("consent.json");
+        fs::write(&consent, "{\"approved\":false}\n").unwrap();
+        let skill = payload.join("SKILL.md");
+        fs::write(&skill, "PINNED_PAYLOAD_BODY\n").unwrap();
+
+        let granted = [payload.clone()];
+        let home_grant = [home.clone()];
+        let mut opts = default_opts(&project, &home);
+        opts.extra_read = &granted;
+        opts.extra_write = &home_grant;
+        let profile = write_real_profile(&opts);
+
+        let write_consent = format!(
+            "echo '{{\"approved\":true}}' > '{}' 2>&1; echo EXIT:$?",
+            consent.display()
+        );
+        let (write_output, _) = run_sandboxed(&profile, &write_consent);
+        let (read_output, _) =
+            run_sandboxed(&profile, &format!("cat '{}' 2>&1", consent.display()));
+        let (payload_output, payload_success) =
+            run_sandboxed(&profile, &format!("cat '{}' 2>&1", skill.display()));
+        let write_payload = format!("echo tampered >> '{}' 2>&1; echo EXIT:$?", skill.display());
+        let (write_payload_output, _) = run_sandboxed(&profile, &write_payload);
+
+        fs::remove_file(&profile).ok();
+        assert!(
+            write_output.contains("Operation not permitted") || write_output.contains("EXIT:1"),
+            "the consent record must not be writable from inside a session: {write_output}"
+        );
+        assert!(
+            !read_output.contains("approved"),
+            "~/.nav-pilot is denied read as well as write: {read_output}"
+        );
+        assert!(
+            payload_success && payload_output.contains("PINNED_PAYLOAD_BODY"),
+            "the granted payload subtree must stay readable, or a Tier 2 launch \
+             cannot read the revision it is about to run: {payload_output}"
+        );
+        assert!(
+            write_payload_output.contains("Operation not permitted")
+                || write_payload_output.contains("EXIT:1"),
+            "the read grant must not hand back write: {write_payload_output}"
+        );
+    }
+
+    /// `~/.copilot/skills/` is unwritable, and `~/.copilot/agents/` still is not
+    /// (navikt/copilot#858).
+    ///
+    /// A skill is the instructions the model is offered in the next session and
+    /// it names the scripts that session runs, so an agent that can edit one
+    /// edits its own future instructions. Skills arrive by install, which
+    /// refuses to run inside cplt anyway; `agents/` and `instructions/` are
+    /// Copilot's in-session authoring surface and keep the dir-wide grant.
+    #[test]
+    fn real_profile_blocks_copilot_skills_write_but_not_agents() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let temp_home = tempfile::tempdir().unwrap();
+        let home = fs::canonicalize(temp_home.path()).unwrap();
+
+        let skill = home.join(".copilot/skills/nais-observability");
+        let agents = home.join(".copilot/agents");
+        fs::create_dir_all(&skill).unwrap();
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(skill.join("SKILL.md"), "original\n").unwrap();
+
+        let agent_dirs = cplt::agent::Agent::Copilot.config_dirs(&home);
+        let mut opts = default_opts(&project, &home);
+        opts.agent_dirs = &agent_dirs;
+        let profile = write_real_profile(&opts);
+
+        let overwrite = format!(
+            "echo 'run this instead' > '{}' 2>&1; echo EXIT:$?",
+            skill.join("SKILL.md").display()
+        );
+        let (skill_output, _) = run_sandboxed(&profile, &overwrite);
+        let plant = format!(
+            "echo body > '{}' 2>&1; echo EXIT:$?",
+            skill.join("planted.sh").display()
+        );
+        let (plant_output, _) = run_sandboxed(&profile, &plant);
+        let author = format!(
+            "echo body > '{}' 2>&1; echo EXIT:$?",
+            agents.join("cplt-test-agent.md").display()
+        );
+        let (agent_output, agent_success) = run_sandboxed(&profile, &author);
+
+        fs::remove_file(&profile).ok();
+        assert!(
+            skill_output.contains("Operation not permitted") || skill_output.contains("EXIT:1"),
+            "an existing skill must not be rewritable from inside a session: {skill_output}"
+        );
+        assert!(
+            plant_output.contains("Operation not permitted") || plant_output.contains("EXIT:1"),
+            "a new file must not be plantable in a skill directory: {plant_output}"
+        );
+        assert!(
+            agent_success && agent_output.contains("EXIT:0"),
+            "agents/ is Copilot's in-session authoring surface and stays \
+             writable — the deny is on skills/ alone: {agent_output}"
+        );
+    }
+
     // ── .env file read denial ─────────────────────────────────────
 
     #[test]

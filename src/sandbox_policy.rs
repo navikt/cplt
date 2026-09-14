@@ -30,10 +30,27 @@ pub const DENIED_DOTFILES: &[&str] = &[
     // Unlike every other entry, no per-file override is allowed either — see
     // [`cplt_state_dir_grant`].
     CPLT_STATE_DIR,
+    // nav-pilot's state, same class as the entry above and not a credential
+    // directory: `config.toml`, the pinned agentpakke revisions under `pakker/`,
+    // and the consent record for the sandbox waivers a pakke asks for
+    // (navikt/copilot#858). An agent that can write the consent record approves
+    // its own waiver for the next launch, which is the whole point of asking.
+    // The pinned trees are the same argument one level down — they are what the
+    // next launch runs.
+    //
+    // Unlike `CPLT_STATE_DIR` this is an ordinary entry, so a grant *inside* it
+    // still works. That is deliberate and load-bearing: a Tier 2 launch hands
+    // cplt `--allow-read ~/.nav-pilot/pakker/<owner>-<repo>/<sha>/<client>/<ctx>`
+    // for the payload it is about to run, and that grant has to survive. A grant
+    // on the directory itself is refused, as for every entry here.
+    NAV_PILOT_STATE_DIR,
 ];
 
 /// cplt's own state directory, relative to `$HOME`.
 pub const CPLT_STATE_DIR: &str = ".config/cplt";
+
+/// nav-pilot's state directory, relative to `$HOME`.
+pub const NAV_PILOT_STATE_DIR: &str = ".nav-pilot";
 
 /// Sensitive files under $HOME that are always denied.
 pub const DENIED_FILES: &[&str] = &[".netrc", ".pypirc", ".gem/credentials", ".vault-token"];
