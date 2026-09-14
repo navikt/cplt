@@ -2897,7 +2897,9 @@ mod e2e_tests {
         let fake_home = make_config_home("repo-dirs-unset-hint");
         let parent = tempfile::tempdir().expect("tempdir");
         let launch = sibling_repo(parent.path(), "launch");
-        let first = sibling_repo(parent.path(), "unleasherator");
+        // A space in the stored path: the suggested command below has to be
+        // quoted or pasting it removes nothing and argues with the shell.
+        let first = sibling_repo(parent.path(), "my checkouts/unleasherator");
         let run = |args: &[&str]| {
             let out = cplt_local(&fake_home, &launch)
                 .args(args)
@@ -2914,7 +2916,7 @@ mod e2e_tests {
             "set",
             "--local",
             "sandbox.repo_dirs",
-            "../unleasherator",
+            "../my checkouts/unleasherator",
         ]);
         assert!(ok, "adding it must work: {err}");
 
@@ -2951,6 +2953,13 @@ mod e2e_tests {
             err.contains("One entry has that name")
                 && err.contains(&first.to_string_lossy().into_owned()),
             "the stored entry must be named, not silently missed: {err}"
+        );
+        assert!(
+            err.contains(&format!(
+                "cplt config set --local sandbox.repo_dirs '{}' --unset",
+                first.display()
+            )),
+            "the suggested command must quote the path, or pasting it splits on the space: {err}"
         );
 
         // Two do: name both, remove neither.

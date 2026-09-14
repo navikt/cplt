@@ -6911,7 +6911,8 @@ fn run_config_set(
             cplt::link::Unlink::NoMatch => String::new(),
             cplt::link::Unlink::Remove(entry) => format!(
                 "\n  One entry has that name:\n    {entry}\n  \
-                 Remove that one:\n    cplt config set {scope}{key} {entry} --unset"
+                 Remove that one:\n    cplt config set {scope}{key} {} --unset",
+                sh_quote(&entry)
             ),
             cplt::link::Unlink::Several(many) => format!(
                 "\n  More than one entry has that name, so cplt is not picking one:\n    {}\n  \

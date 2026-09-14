@@ -472,7 +472,7 @@ pub enum CustomConfigVerdict {
 ///
 /// Without this, `<project>/sub/../cplt.toml` and
 /// `~/.config/cplt/sub/../../../evil.toml` both dodge a plain `starts_with`.
-fn fully_resolved(path: &Path, relative_anchor: &Path) -> PathBuf {
+pub(super) fn fully_resolved(path: &Path, relative_anchor: &Path) -> PathBuf {
     let anchored = if path.is_relative() {
         relative_anchor.join(path)
     } else {

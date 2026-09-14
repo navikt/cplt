@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use super::error::ConfigError;
-use super::path::config_dir;
+use super::path::{config_dir, fully_resolved};
 use super::types::{Config, LoadedConfig};
 use crate::ui;
 
@@ -276,10 +276,13 @@ pub fn resolve_path_entry(value: &str, cwd: &Path) -> Result<String, ConfigError
 /// starting with `/` or `~/` returns as typed, so removal by the stored
 /// absolute path always worked. Only the relative form was unremovable.
 ///
-/// So canonicalize first — a symlinked path still has to match what was stored
-/// — and fall back to anchoring the value to `cwd` lexically. Nothing is read
-/// from disk on that path, and nothing is written: the caller looks the result
-/// up in the entries it already has, and says so when it finds none.
+/// So canonicalize first, and fall back to [`fully_resolved`], which resolves
+/// the longest prefix that still exists and appends the rest. Folding `.` and
+/// `..` on the string alone would not do: `../link/gone` with `link -> real`
+/// was stored as `…/real/gone`, and a syntactic fold answers `…/link/gone` —
+/// the same entry, still unremovable, one directory further along. Nothing is
+/// written either way; the caller looks the result up in the entries it already
+/// has, and says so when it finds none.
 ///
 /// # Errors
 /// If `value` is a `~someone/…` path. That refusal is about what the value
@@ -289,30 +292,10 @@ pub fn resolve_path_entry_for_removal(value: &str, cwd: &Path) -> Result<String,
         Ok(resolved) => Ok(resolved),
         // The only non-existence refusal `resolve_path_entry` raises.
         Err(e) if value.starts_with('~') => Err(e),
-        Err(_) => Ok(lexically_anchored(cwd, value)
+        Err(_) => Ok(fully_resolved(Path::new(value), cwd)
             .to_string_lossy()
             .into_owned()),
     }
-}
-
-/// Join `value` to `cwd` and fold `.` and `..` away without touching the disk.
-///
-/// `..` is folded off the built-up path, which is only the same directory
-/// canonicalization would name when no symlink sits above the `..` — hence the
-/// canonicalize-first order in [`resolve_path_entry_for_removal`]. `cwd` comes
-/// from `getcwd`, which is already symlink-free.
-fn lexically_anchored(cwd: &Path, value: &str) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in cwd.join(value).components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other),
-        }
-    }
-    out
 }
 
 /// Refuse relative path entries, at `config set --local` and again at load.
@@ -939,6 +922,34 @@ mod tests {
             resolve_path_entry_for_removal("./../../sibling", &cwd.join("deeper"))
                 .expect("resolves"),
             stored
+        );
+    }
+
+    /// A syntactic fold would move the trap rather than close it: `../link/gone`
+    /// with `link -> real` was stored as `…/real/gone`, so folding the string
+    /// alone answers `…/link/gone` and the entry is still unremovable.
+    #[test]
+    fn a_removal_keeps_the_symlinked_ancestors_canonicalization_resolved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonical");
+        let cwd = root.join("launch");
+        let real = root.join("real");
+        std::fs::create_dir_all(real.join("gone")).expect("real/gone");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        std::os::unix::fs::symlink(&real, root.join("link")).expect("symlink");
+
+        let stored = resolve_path_entry("../link/gone", &cwd).expect("resolves while it exists");
+        assert_eq!(
+            stored,
+            real.join("gone").to_string_lossy(),
+            "the symlink is resolved away when it is stored"
+        );
+
+        std::fs::remove_dir(real.join("gone")).expect("delete the leaf");
+        assert_eq!(
+            resolve_path_entry_for_removal("../link/gone", &cwd).expect("removal resolves anyway"),
+            stored,
+            "the ancestor symlink must still be resolved, or the entry stays stuck"
         );
     }
 
