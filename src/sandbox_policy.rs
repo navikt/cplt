@@ -713,6 +713,12 @@ pub const ENV_ALLOWLIST: &[&str] = &[
     // Claude Code — config root override (path, not a secret). Must reach the
     // child so it uses the same dir Agent::Claude.config_dirs() grants.
     "CLAUDE_CONFIG_DIR",
+    // DeepSeek Harness — harness-home override (path, not a secret). Same
+    // contract as CLAUDE_CONFIG_DIR: it must reach the child so dsh resolves the
+    // root Agent::Dsh.config_dirs() grants, and `first_unsafe_agent_dir` refuses
+    // a value that is too broad. `dsh` itself treats `$DSH_HOME` as
+    // bootstrap-only, so the launching environment is the only place it reads.
+    "DSH_HOME",
 ];
 
 /// Environment variable prefixes safe to pass through.

@@ -159,6 +159,14 @@ const ANTHROPIC_DOMAINS: &[&str] = &[
 /// BARE domains, matched exact-or-subdomain — see `COPILOT_INFRA_DOMAINS`.
 const OPENCODE_DOMAINS: &[&str] = &["opencode.ai", "models.dev"];
 
+/// DeepSeek Harness (`dsh`) infrastructure. The shipped `dsh-llm-deepseek`
+/// adapter defaults to `https://api.deepseek.com` (its `PUBLIC_BASE_URL`), so
+/// the bare registrable domain `deepseek.com` covers the API host and any
+/// sibling host the adapter reaches.
+///
+/// BARE domain — see `COPILOT_INFRA_DOMAINS` for the no-glob convention.
+const DEEPSEEK_DOMAINS: &[&str] = &["deepseek.com"];
+
 /// A credential an agent can use instead of the macOS login Keychain (#242).
 ///
 /// Returned by [`Agent::credential_outside_keychain`]. The variants exist
@@ -210,6 +218,8 @@ pub enum Agent {
     Claude,
     /// goose — open-source AI agent (github.com/aaif-goose/goose).
     Goose,
+    /// DeepSeek Harness (`dsh`) — the DeepSeek AI agent harness.
+    Dsh,
     /// Plain sandboxed shell — no AI agent, just a secure shell session.
     Shell,
 }
@@ -223,6 +233,7 @@ impl Agent {
         Agent::Pi,
         Agent::Claude,
         Agent::Goose,
+        Agent::Dsh,
         Agent::Shell,
     ];
 
@@ -235,6 +246,7 @@ impl Agent {
             Agent::Pi => "pi",
             Agent::Claude => "claude",
             Agent::Goose => "goose",
+            Agent::Dsh => "dsh",
             Agent::Shell => "shell",
         }
     }
@@ -252,6 +264,10 @@ impl Agent {
             Agent::Pi => &["pi"],
             Agent::Claude => &["claude"],
             Agent::Goose => &["goose"],
+            // `dsh` only. `deepseek` and `deepseek-harness` are cplt's own
+            // spellings for `--agent`; neither is a command the harness
+            // installs, so aliasing them would shadow nothing.
+            Agent::Dsh => &["dsh"],
             Agent::Shell => &["shell"],
         }
     }
@@ -265,6 +281,7 @@ impl Agent {
             Agent::Pi => "Pi",
             Agent::Claude => "Claude Code",
             Agent::Goose => "goose",
+            Agent::Dsh => "DeepSeek Harness",
             Agent::Shell => "Shell",
         }
     }
@@ -286,6 +303,7 @@ impl Agent {
             | Agent::Pi
             | Agent::Claude
             | Agent::Goose
+            | Agent::Dsh
             | Agent::Shell => &[],
         }
     }
@@ -412,9 +430,10 @@ impl Agent {
                 }
                 // --remote has no goose equivalent; dropped.
             }
-            // Pi and Shell have no recognized session flags, so they get no
-            // explicit translation here.
-            Agent::Pi | Agent::Shell => {}
+            // Dsh, Pi and Shell have no recognized session flags, so they get
+            // no explicit translation here. dsh forwards recognized app flags
+            // after the launcher flags unchanged.
+            Agent::Dsh | Agent::Pi | Agent::Shell => {}
         }
         args
     }
@@ -819,6 +838,17 @@ impl Agent {
                 "vendor_functions.d",
                 "vendor_completions.d",
             ],
+            // DSH rewrites `~/.dsh/profiles/<p>/cordis.yml` — a constant
+            // include-root stub — on every boot, so the `profiles` subtree
+            // must stay writable. The boot-read overlay that can carry code is
+            // the home-level `~/.dsh/cordis.patch.yml`, which DSH reads via
+            // `loadOptionalPatches` and never writes: write-denying it closes
+            // that layer at no boot cost. Residual: a per-profile
+            // `cordis.patch.yml` and installed plugins under `profiles/`
+            // remain agent-writable. Do profile/plugin edits outside cplt, and
+            // always launch dsh through cplt so any planted code still runs
+            // sandboxed. See docs/known-impacts.md.
+            Agent::Dsh => &["cordis.patch.yml"],
             Agent::Goose | Agent::OpenCode => &[],
         }
     }
@@ -892,6 +922,7 @@ impl Agent {
             Agent::Antigravity => &[GOOGLE_AI_DOMAINS, ANTIGRAVITY_DOMAINS],
             Agent::Claude => &[ANTHROPIC_DOMAINS],
             Agent::OpenCode => &[OPENCODE_DOMAINS],
+            Agent::Dsh => &[DEEPSEEK_DOMAINS],
             // goose gets the package-registry base and NOTHING else. This is
             // an observed result, not an omission: `cplt --agent goose
             // --observe-domains -- run -t "…"` with goose 1.48.0 on 2026-09-03
@@ -1323,6 +1354,30 @@ impl Agent {
                     },
                 ]
             }
+            Agent::Dsh => {
+                // DSH keeps all user data under one home root, resolved as
+                // `$DSH_HOME` then `~/.dsh` (`home-paths`: `resolveDshHome`):
+                // sessions, settings, cache, and the profile store. The root is
+                // granted writable so sessions and settings persist mid-run;
+                // `host_persistence_denies` write-denies the home-level
+                // `cordis.patch.yml`, the boot-read overlay that can carry code.
+                //
+                // The grant must be the *same* root the child resolves, which is
+                // why it goes through `dsh_home` and not `home.join(".dsh")`:
+                // `DSH_HOME` is in `ENV_ALLOWLIST`, so a user-set value reaches
+                // the child. Granting the default while the child uses the
+                // override would leave it writing sessions outside the sandbox's
+                // writable set, with no error naming the cause ("No silent
+                // grants"). Mirrors `CLAUDE_CONFIG_DIR` above.
+                vec![AgentDir {
+                    path: dsh_home(home),
+                    write: true,
+                    map_exec: false,
+                    process_exec: false,
+                    write_files: vec![],
+                    create_dirs: vec![],
+                }]
+            }
         }
     }
 
@@ -1353,6 +1408,8 @@ impl Agent {
             // `configure` stores the provider key in the OS keyring; there is
             // no goose account to log into.
             Agent::Pi | Agent::Goose => false,
+            // DeepSeek API key from the environment or `$DSH_HOME/.env`.
+            Agent::Dsh => false,
             // Not an AI agent: no auth of its own.
             Agent::Shell => false,
         }
@@ -1374,7 +1431,7 @@ impl Agent {
             // Device flow: a code and a URL, no browser required from here.
             Agent::Copilot | Agent::OpenCode | Agent::Claude => false,
             // Not OAuth-first at all.
-            Agent::Pi | Agent::Goose | Agent::Shell => false,
+            Agent::Dsh | Agent::Pi | Agent::Goose | Agent::Shell => false,
         }
     }
 
@@ -1552,6 +1609,14 @@ impl Agent {
                 // AWS Bedrock (bearer token auth)
                 "AWS_BEARER_TOKEN_BEDROCK",
             ],
+            // DeepSeek Harness reads its key from the environment or
+            // `$DSH_HOME/.env`. Credential names ONLY: `main.rs` reads this list
+            // as "did the user pass a provider key", so an endpoint override
+            // here would suppress the missing-key warning and be offered as the
+            // `--pass-env` value instead of the key. `DEEPSEEK_BASE_URL` is a
+            // route, not a credential — pass it explicitly if you need a
+            // gateway, and see `docs/proxy.md` for the domain it then needs.
+            Agent::Dsh => &["DEEPSEEK_API_KEY"],
             Agent::Shell => &[],
         }
     }
@@ -1675,6 +1740,10 @@ impl Agent {
                 "Install Claude Code: npm i -g @anthropic-ai/claude-code, \
                  or see https://docs.anthropic.com/en/docs/claude-code"
             }
+            Agent::Dsh => {
+                "Install DeepSeek Harness and put its `dsh` launcher in PATH, \
+                 or launch it through `cplt exec -- node <path-to-dsh-bin>`"
+            }
             Agent::Shell => unreachable!("Shell is resolved via $SHELL above"),
         };
 
@@ -1790,9 +1859,10 @@ impl FromStr for Agent {
             "pi" => Ok(Agent::Pi),
             "claude" | "cc" | "claude-code" => Ok(Agent::Claude),
             "goose" => Ok(Agent::Goose),
+            "dsh" | "deepseek" | "deepseek-harness" => Ok(Agent::Dsh),
             "shell" | "sh" | "bash" | "zsh" => Ok(Agent::Shell),
             _ => Err(format!(
-                "Unknown agent '{s}'. Supported: copilot, opencode, gemini, antigravity, pi, claude, goose, shell"
+                "Unknown agent '{s}'. Supported: copilot, opencode, gemini, antigravity, pi, claude, goose, dsh, shell"
             )),
         }
     }
@@ -1845,6 +1915,42 @@ pub struct AgentDir {
     pub create_dirs: Vec<&'static str>,
 }
 
+/// The root `dsh` will resolve for its Harness home, mirroring the harness's
+/// own `resolveDshHome` (`@deepseek-ai/dsh-home-paths`).
+///
+/// Precedence is `$DSH_HOME` then `~/.dsh`. `$DSH_HOME` is accepted with a
+/// leading `~`/`~/` (the `expandHomePath` forms), a blank or whitespace-only
+/// value is treated as unset, and a relative value resolves against the launch
+/// cwd exactly as Node's `path.resolve` does. Every one of those rules is the
+/// harness's, not cplt's: the grant emitted for `Agent::Dsh` must name the same
+/// directory the child writes to, and `DSH_HOME` reaches the child because it is
+/// in `ENV_ALLOWLIST`.
+///
+/// A value that resolves to a system root or `$HOME` is not filtered here —
+/// `first_unsafe_agent_dir` refuses it loudly before launch, the same veto
+/// `CLAUDE_CONFIG_DIR` and the `XDG_*` bases go through.
+fn dsh_home(home: &Path) -> PathBuf {
+    let Ok(raw) = std::env::var("DSH_HOME") else {
+        return home.join(".dsh");
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return home.join(".dsh");
+    }
+    let expanded = if raw == "~" {
+        home.to_path_buf()
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        home.join(rest)
+    } else {
+        PathBuf::from(raw)
+    };
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        std::env::current_dir().map_or(expanded.clone(), |cwd| cwd.join(&expanded))
+    }
+}
+
 /// Resolve each agent dir to its real path, in place.
 ///
 /// Both backends match on the *resolved* path — Seatbelt resolves symlinks
@@ -1869,10 +1975,10 @@ pub fn canonicalize_agent_dirs(dirs: &mut [AgentDir]) {
 
 /// The first agent config dir that resolves to a system root or `$HOME`, if any.
 ///
-/// A config dir is externally influenced: `CLAUDE_CONFIG_DIR` (used raw, no
-/// subdirectory appended) and the `XDG_*` bases both come from the ambient
-/// environment. An attacker-set or fat-fingered `CLAUDE_CONFIG_DIR=/` or
-/// `=$HOME` turns into an `AgentDir { write: true }` over the whole tree. The
+/// A config dir is externally influenced: `CLAUDE_CONFIG_DIR` and `DSH_HOME`
+/// (both used raw, no subdirectory appended) and the `XDG_*` bases all come from
+/// the ambient environment. An attacker-set or fat-fingered `CLAUDE_CONFIG_DIR=/`
+/// or `=$HOME` turns into an `AgentDir { write: true }` over the whole tree. The
 /// sandbox backends are purely additive — Landlock has no deny, and macOS's
 /// late credential/persistence denies only re-cover their enumerated paths — so
 /// such a grant cannot be clawed back and everything under it degrades to
@@ -2095,13 +2201,14 @@ mod tests {
 
     /// Every `Agent` variant, for the tests that must cover all of them.
     /// `all_agents_covers_every_variant` keeps this honest.
-    const ALL_AGENTS: [Agent; 7] = [
+    const ALL_AGENTS: [Agent; 8] = [
         Agent::Copilot,
         Agent::OpenCode,
         Agent::Antigravity,
         Agent::Pi,
         Agent::Claude,
         Agent::Goose,
+        Agent::Dsh,
         Agent::Shell,
     ];
 
@@ -2119,6 +2226,7 @@ mod tests {
                 | Agent::Pi
                 | Agent::Claude
                 | Agent::Goose
+                | Agent::Dsh
                 | Agent::Shell => {}
             }
         }
@@ -2283,6 +2391,14 @@ mod tests {
         assert_eq!(Agent::from_str("agy").unwrap(), Agent::Antigravity);
         assert_eq!(Agent::from_str("goose").unwrap(), Agent::Goose);
         assert_eq!(Agent::from_str("Goose").unwrap(), Agent::Goose);
+        // The three documented DSH spellings, and that the match is
+        // case-insensitive for each — the README advertises all three.
+        assert_eq!(Agent::from_str("dsh").unwrap(), Agent::Dsh);
+        assert_eq!(Agent::from_str("DSH").unwrap(), Agent::Dsh);
+        assert_eq!(Agent::from_str("deepseek").unwrap(), Agent::Dsh);
+        assert_eq!(Agent::from_str("DeepSeek").unwrap(), Agent::Dsh);
+        assert_eq!(Agent::from_str("deepseek-harness").unwrap(), Agent::Dsh);
+        assert_eq!(Agent::from_str("DeepSeek-Harness").unwrap(), Agent::Dsh);
         assert!(Agent::from_str("unknown").is_err());
     }
 
@@ -2435,15 +2551,16 @@ mod tests {
                 Agent::Pi => 3,
                 Agent::Claude => 4,
                 Agent::Goose => 5,
-                Agent::Shell => 6,
+                Agent::Dsh => 6,
+                Agent::Shell => 7,
             }
         }
-        assert_eq!(Agent::ALL.len(), 7, "add the new variant to Agent::ALL");
+        assert_eq!(Agent::ALL.len(), 8, "add the new variant to Agent::ALL");
         let mut seen: Vec<u8> = Agent::ALL.iter().copied().map(tag).collect();
         seen.sort_unstable();
         assert_eq!(
             seen,
-            (0..7).collect::<Vec<u8>>(),
+            (0..8).collect::<Vec<u8>>(),
             "Agent::ALL has a gap or a duplicate"
         );
     }
@@ -2532,6 +2649,18 @@ mod tests {
         );
         assert!(Agent::Goose.host_persistence_denies().is_empty());
         assert!(Agent::OpenCode.host_persistence_denies().is_empty());
+        assert_eq!(
+            Agent::Dsh.host_persistence_denies(),
+            ["cordis.patch.yml"],
+            "the home-level boot overlay is the code-carrying layer; it is read \
+             at boot and never written, so write-denying it is free"
+        );
+        assert!(
+            !Agent::Dsh.host_persistence_denies().contains(&"profiles"),
+            "`profiles/` stays writable on purpose — DSH rewrites each profile's \
+             cordis.yml on boot. It is a documented residual, not a deny. If \
+             this ever changes, known-impacts.md and SECURITY.md must change too"
+        );
     }
 
     /// `host_persistence_paths` is what BOTH backends consume — Seatbelt turns
@@ -2728,6 +2857,7 @@ mod tests {
                 Agent::Claude => true,      // subscription OAuth token
                 Agent::Pi => false,         // provider API keys only
                 Agent::Goose => false,      // provider API keys in the keyring
+                Agent::Dsh => false,        // DeepSeek API key from env or ~/.dsh/.env
                 Agent::Shell => false,      // not an AI agent, no auth
             }
         }
@@ -2784,7 +2914,7 @@ mod tests {
                 Agent::Antigravity => &[],
                 Agent::Claude => &["CLAUDE_CODE_OAUTH_TOKEN"],
                 // Agents that never wanted the grant have nothing to trade.
-                Agent::OpenCode | Agent::Pi | Agent::Shell => &[],
+                Agent::OpenCode | Agent::Pi | Agent::Dsh | Agent::Shell => &[],
             }
         }
         for agent in ALL_AGENTS {
@@ -3185,6 +3315,122 @@ mod tests {
                 "~/.claude and ~/.claude.json must never be vetoed"
             );
         });
+    }
+
+    // ── DeepSeek Harness home (DSH_HOME) ──────────────────────
+    //
+    // `DSH_HOME` is in `ENV_ALLOWLIST`, so the child resolves the override. The
+    // grant must follow it: handing dsh a root the sandbox never opened leaves
+    // it writing sessions and settings outside its writable set, with no error
+    // naming the cause. `dsh_home` is the single resolver both sides use.
+
+    #[test]
+    fn dsh_config_dirs_default_root() {
+        temp_env::with_var_unset("DSH_HOME", || {
+            let home = Path::new("/Users/test");
+            let dirs = Agent::Dsh.config_dirs(home);
+            assert_eq!(dirs.len(), 1, "DSH keeps all user data under one root");
+            assert_eq!(dirs[0].path, home.join(".dsh"));
+            assert!(dirs[0].write, "the home root must stay writable");
+            assert!(!dirs[0].process_exec && !dirs[0].map_exec);
+        });
+    }
+
+    #[test]
+    fn dsh_config_dirs_follow_the_override() {
+        temp_env::with_var("DSH_HOME", Some("/custom/dsh"), || {
+            let home = Path::new("/Users/test");
+            let dirs = Agent::Dsh.config_dirs(home);
+            assert_eq!(dirs.len(), 1);
+            assert_eq!(dirs[0].path, PathBuf::from("/custom/dsh"));
+            assert!(dirs[0].write);
+        });
+    }
+
+    /// DSH's `expandHomePath` accepts `~` and `~/…`; the grant must expand the
+    /// same way or it names a literal `~/…` directory that never exists.
+    #[test]
+    fn dsh_config_dirs_expand_tilde() {
+        temp_env::with_var("DSH_HOME", Some("~/custom-dsh"), || {
+            let home = Path::new("/Users/test");
+            assert_eq!(
+                Agent::Dsh.config_dirs(home)[0].path,
+                home.join("custom-dsh")
+            );
+        });
+        temp_env::with_var("DSH_HOME", Some("~"), || {
+            let home = Path::new("/Users/test");
+            assert_eq!(Agent::Dsh.config_dirs(home)[0].path, home);
+        });
+    }
+
+    /// A blank override is "unset" to both DSH and cplt — never the cwd.
+    #[test]
+    fn dsh_config_dirs_blank_override_falls_back() {
+        temp_env::with_var("DSH_HOME", Some("   "), || {
+            let home = Path::new("/Users/test");
+            assert_eq!(Agent::Dsh.config_dirs(home)[0].path, home.join(".dsh"));
+        });
+    }
+
+    /// A relative value resolves against the cwd, matching Node's `path.resolve`
+    /// in the harness. The grant is then absolute, not the literal relative path.
+    #[test]
+    fn dsh_config_dirs_resolve_relative_against_cwd() {
+        temp_env::with_var("DSH_HOME", Some("relative-dsh"), || {
+            let home = Path::new("/Users/test");
+            let path = Agent::Dsh.config_dirs(home)[0].path.clone();
+            assert!(path.is_absolute(), "got {path:?}");
+            assert!(path.ends_with("relative-dsh"), "got {path:?}");
+        });
+    }
+
+    /// Same C-02 veto as `CLAUDE_CONFIG_DIR`: a `DSH_HOME` at a system root or
+    /// `$HOME` must be refused before it becomes a writable grant over the tree.
+    #[test]
+    fn dsh_config_dir_at_filesystem_root_is_vetoed() {
+        temp_env::with_var("DSH_HOME", Some("/"), || {
+            let home = Path::new("/Users/test");
+            let dirs = Agent::Dsh.config_dirs(home);
+            assert_eq!(dirs[0].path, PathBuf::from("/"));
+            assert!(dirs[0].write, "the grant first_unsafe_agent_dir must veto");
+            assert!(
+                first_unsafe_agent_dir(&dirs, home).is_some(),
+                "DSH_HOME=/ must be vetoed"
+            );
+        });
+    }
+
+    #[test]
+    fn dsh_config_dir_at_home_is_vetoed() {
+        temp_env::with_var("DSH_HOME", Some("/Users/test"), || {
+            let home = Path::new("/Users/test");
+            let dirs = Agent::Dsh.config_dirs(home);
+            assert!(
+                first_unsafe_agent_dir(&dirs, home).is_some(),
+                "$HOME itself must be vetoed"
+            );
+        });
+    }
+
+    #[test]
+    fn default_dsh_config_dir_passes_the_veto() {
+        temp_env::with_var_unset("DSH_HOME", || {
+            let home = Path::new("/Users/test");
+            let dirs = Agent::Dsh.config_dirs(home);
+            assert!(first_unsafe_agent_dir(&dirs, home).is_none());
+        });
+    }
+
+    /// The grant above is only the same root the child resolves because
+    /// `DSH_HOME` reaches it. Drop it from the allowlist and the override
+    /// silently vanishes inside the sandbox again.
+    #[test]
+    fn dsh_home_reaches_the_sandbox_environment() {
+        assert!(
+            crate::sandbox::ENV_ALLOWLIST.contains(&"DSH_HOME"),
+            "DSH_HOME must reach the child so dsh resolves the root cplt grants"
+        );
     }
 
     /// The fish branch of `config_dirs`, asserted without touching `$SHELL`.
@@ -3608,6 +3854,42 @@ mod tests {
             !domains.contains(&"api.anthropic.com")
                 && !domains.contains(&"generativelanguage.googleapis.com"),
             "OpenCode must not assume a specific model provider"
+        );
+    }
+
+    /// DSH ships one adapter, `dsh-llm-deepseek`, whose default `PUBLIC_BASE_URL`
+    /// is `https://api.deepseek.com`. The generic all-agent test only checks that
+    /// the list is non-empty and glob-free, so it would pass with the entry
+    /// misspelled or dropped; this pins the domain and that it reaches the
+    /// proxy's decision, the way the Copilot registry test does.
+    #[test]
+    fn dsh_default_domains_include_deepseek_and_nothing_else() {
+        let domains = Agent::Dsh.default_allowed_domains();
+        assert!(
+            domains.contains(&"deepseek.com"),
+            "DSH must include the DeepSeek API domain"
+        );
+        assert!(domains.contains(&"registry.npmjs.org"));
+        assert!(
+            !domains.contains(&"api.anthropic.com") && !domains.contains(&"api.openai.com"),
+            "DSH must not assume another provider's endpoint"
+        );
+
+        let policy = crate::proxy::NetPolicy {
+            allowed_ports: vec![443],
+            allowed_domains: domains.iter().map(|d| (*d).to_string()).collect(),
+            allowlist_active: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            crate::proxy::classify_connect(&policy, "api.deepseek.com", 443),
+            crate::proxy::NetVerdict::Allowed,
+            "the adapter's default host must be reachable under the allowlist"
+        );
+        assert_eq!(
+            crate::proxy::classify_connect(&policy, "evil.example.com", 443),
+            crate::proxy::NetVerdict::BlockedAllowlist,
+            "an unrelated host must stay blocked"
         );
     }
 

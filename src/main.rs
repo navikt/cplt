@@ -110,7 +110,7 @@ EXAMPLES:
 struct Cli {
     /// Which AI coding agent to sandbox. This flag wins over the sandbox.agent
     /// config key, which wins over auto-detection from PATH.
-    /// Supported: copilot, opencode, gemini, antigravity, pi, claude, goose, shell
+    /// Supported: copilot, opencode, gemini, antigravity, pi, claude, goose, dsh, shell
     #[arg(long, value_name = "AGENT")]
     agent: Option<String>,
 
@@ -2514,7 +2514,9 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                              [cplt]   Antigravity: https://antigravity.google/docs/cli-getting-started\n\
                              [cplt]   Pi:          npm i -g @earendil-works/pi-coding-agent\n\
                              [cplt]   Claude Code: npm i -g @anthropic-ai/claude-code\n\
-                             [cplt] Or specify explicitly: cplt --agent copilot|opencode|antigravity|pi|claude|shell"
+                             [cplt]   goose:       brew install block-goose-cli\n\
+                             [cplt]   DSH:         put the DeepSeek Harness `dsh` launcher in PATH\n\
+                             [cplt] Or specify explicitly: cplt --agent copilot|opencode|antigravity|pi|claude|goose|dsh|shell"
                         );
                     }
                 }
@@ -4446,7 +4448,7 @@ fn assemble_sandbox(
             "cplt refuses to grant the agent the config directory derived from the \
              environment, '{}', it is too broad (a system root, your home directory, \
              or an ancestor of it). Point the relevant variable (CLAUDE_CONFIG_DIR, \
-             or an XDG_* base) at a dedicated subdirectory such as '{}'.",
+             DSH_HOME, or an XDG_* base) at a dedicated subdirectory such as '{}'.",
             bad.path.display(),
             home_dir.join(".claude").display(),
         );
@@ -5955,7 +5957,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
             println!("agent:       none (nothing on PATH, no --agent, no sandbox.agent)");
             findings.push(Finding::blocking(
                 "No supported agent found: cplt will refuse to launch.",
-                "install one (copilot, opencode, antigravity, pi, claude, goose) or pass \
+                "install one (copilot, opencode, antigravity, pi, claude, goose, dsh) or pass \
                  --agent <name> / set sandbox.agent",
             ));
         }

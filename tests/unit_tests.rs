@@ -972,7 +972,10 @@ fn profile_grants_claude_config_access() {
 /// profile as write-denies under each of its writable config-dir grants.
 #[test]
 fn profile_denies_host_persistence_paths_for_every_agent() {
-    temp_env::with_var_unset("CLAUDE_CONFIG_DIR", || {
+    // `DSH_HOME` relocates Agent::Dsh's single grant, so the deny would be
+    // joined onto whatever root the developer's shell happens to name.
+    // `CLAUDE_CONFIG_DIR` does the same for Claude.
+    temp_env::with_vars_unset(["CLAUDE_CONFIG_DIR", "DSH_HOME"], || {
         let home = std::path::Path::new("/Users/test");
         for agent in [
             cplt::agent::Agent::Copilot,
@@ -981,6 +984,7 @@ fn profile_denies_host_persistence_paths_for_every_agent() {
             cplt::agent::Agent::Pi,
             cplt::agent::Agent::Claude,
             cplt::agent::Agent::Goose,
+            cplt::agent::Agent::Dsh,
             cplt::agent::Agent::Shell,
         ] {
             let agent_dirs = agent.config_dirs(home);

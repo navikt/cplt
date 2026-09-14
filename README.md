@@ -6,7 +6,7 @@
 ![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
 ![Linux](https://img.shields.io/badge/platform-Linux-lightgrey)
 
-**Kernel-enforced sandbox for AI coding agents.** cplt wraps GitHub Copilot CLI, OpenCode, Gemini CLI, Antigravity CLI, Pi, Claude Code, goose, or any shell, so the agent can write code but cannot steal credentials, push to main, merge PRs, or exfiltrate secrets.
+**Kernel-enforced sandbox for AI coding agents.** cplt wraps GitHub Copilot CLI, OpenCode, Gemini CLI, Antigravity CLI, Pi, Claude Code, goose, DeepSeek Harness, or any shell, so the agent can write code but cannot steal credentials, push to main, merge PRs, or exfiltrate secrets.
 
 - **macOS**: Apple Seatbelt/SBPL via `sandbox-exec`
 - **Linux**: Landlock LSM + seccomp-BPF + optional Bubblewrap namespace isolation (kernel 5.13+, full network filtering on 6.7+)
@@ -137,7 +137,7 @@ For the full security model, threat analysis, and test strategy, read [SECURITY.
 | Environment handling | Allowlist plus hardening env injection | More basic pass-through model |
 | Secret file protection | Deny patterns such as `.env*`, `.pem`, `.key` inside the repo | Primarily directory-scoped access |
 | Repo policy | [`.cplt.toml`](docs/configuration.md#per-repo-configuration-cplttoml) with an explicit trust/approval flow | No repo-level policy file |
-| Agent support | Copilot, OpenCode, Gemini CLI, Antigravity CLI, Pi, Claude Code, goose, or shell | Codex only |
+| Agent support | Copilot, OpenCode, Gemini CLI, Antigravity CLI, Pi, Claude Code, goose, DeepSeek Harness, or shell | Codex only |
 
 cplt is not stronger everywhere. Codex CLI has Linux namespace isolation today, and it already exposes explicit sandbox modes such as read-only and workspace-write. cplt does not yet have that mode matrix.
 
@@ -176,7 +176,7 @@ Tools such as VS Code agent mode rely mainly on UI permissions. cplt enforces it
 | Network proxy | HTTP CONNECT + domain allow/block | HTTP + SOCKS5 + experimental TLS MITM |
 | SSH git | Blocked at kernel on macOS (agent socket denied); on Linux only `SSH_AUTH_SOCK` is withheld | Proxied via SOCKS5 |
 | Package manager scripts | Blocked by default (`npm_config_ignore_scripts`) | Not blocked |
-| Agent support | Copilot, OpenCode, Gemini, Antigravity, Pi, Claude Code, goose, Shell | Claude Code |
+| Agent support | Copilot, OpenCode, Gemini, Antigravity, Pi, Claude Code, goose, DSH, Shell | Claude Code |
 | Config | TOML (global + per-repo) | JSON (global only) + `--control-fd` live updates |
 | Library API | ❌ Binary only | ✅ Embeddable TypeScript library |
 
@@ -465,7 +465,7 @@ Same pattern mise, direnv, and starship use.
 cplt [OPTIONS] [-- <AGENT_ARGS>...]
 ```
 
-Everything after `--` goes straight to the agent process (copilot, opencode, gemini, antigravity, pi, claude, goose, or shell).
+Everything after `--` goes straight to the agent process (copilot, opencode, gemini, antigravity, pi, claude, goose, dsh, or shell).
 
 ### Policy presets
 
@@ -622,9 +622,10 @@ Pick one with `--agent <name>`, or make it the default with `cplt config set san
 | [Antigravity CLI](https://github.com/google-antigravity/antigravity-cli) | `antigravity`, aliases `agy` and `agi` | yes, priority 3 | Google OAuth in the browser |
 | [Pi](https://github.com/earendil-works/pi) | `pi` | no | `--pass-env ANTHROPIC_API_KEY` and friends |
 | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | `claude`, aliases `cc` and `claude-code` | no | Subscription OAuth in `~/.claude` or the Keychain, `CLAUDE_CODE_OAUTH_TOKEN` (drops the Keychain grant), or `--pass-env ANTHROPIC_API_KEY` |
+| [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) | `dsh`, aliases `deepseek` and `deepseek-harness` | no | `--pass-env DEEPSEEK_API_KEY`, or `$DSH_HOME/.env` (`~/.dsh/.env`) |
 | Your shell | `shell` | no | none |
 
-- **Pi and Claude Code are never auto-detected.** `pi` is a generic binary name that could collide with something else on your machine, and Claude Code has to be chosen on purpose.
+- **Pi, Claude Code, goose, and DeepSeek Harness are never auto-detected.** `pi` and `dsh` are generic binary names that could collide with something else on your machine, and Claude Code has to be chosen on purpose.
 - **Third-party API keys are opt-in.** `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN` and the Bedrock/Vertex routing vars (`CLAUDE_CODE_USE_BEDROCK`, `AWS_BEARER_TOKEN_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `ANTHROPIC_VERTEX_PROJECT_ID`, `GOOGLE_CLOUD_PROJECT`) never pass through unless you name them with `--pass-env`.
 - **Subscription auth needs no env var.** OpenCode's `/connect` device flow stores its token in `~/.local/share/opencode/auth.json`, and Claude Code's OAuth token lives in `~/.claude` (`.credentials.json` on Linux) or the macOS Keychain. Both are reachable inside the sandbox, so cplt does not nag about a missing API key for either.
 - **OAuth browser flows need `--allow-browser`** when a sign-in prompt appears. That covers Antigravity; every other agent here uses a device flow that prints a code and a URL and needs no browser. The flag lets the agent launch any application outside the sandbox and cannot be narrowed to URLs, so turn it on for the sign-in and off again — see the [flag table](#sandbox-toggles) and [docs/security.md](docs/security.md#--allow-browser-is-a-sandbox-escape-and-cannot-be-scoped).
@@ -661,6 +662,29 @@ cplt config set sandbox.agent goose
 - **Config dir is read-only**: `~/.config/goose/config.yaml` declares `extensions:` entries whose `cmd` goose spawns on every session start, so a writable config dir is a host-persistence vector. Normal sessions do not write it; `/mode` changes and persisted tool permissions do not survive a sandboxed run. Reconfigure with `goose configure` outside cplt
 - goose's data (`~/.local/share/goose/`) and state (`~/.local/state/goose/`) dirs are writable, with exec denied. goose uses these XDG paths on macOS too, and honours the `XDG_*` overrides there
 - `--continue` and bare `--resume` map to `goose session --resume`; `--resume=ID` to `goose session --resume --session-id ID`; `--name X` to `goose session --name X`. These are subcommand flags, so cplt injects the `session` subcommand with them. `--remote` is ignored (no goose equivalent)
+
+### DeepSeek Harness support
+
+cplt can sandbox [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (binary `dsh`), the plugin-oriented agent harness from DeepSeek. Upstream ships it as a developer preview and its own [SAFETY.md](https://github.com/deepseek-ai/deepseek-harness/blob/main/SAFETY.md) says not to rely on its controls as the only boundary, which is the case cplt exists for.
+
+```bash
+# Run DSH (must be explicit — not auto-detected)
+cplt --agent dsh
+
+# Pass the API key, or keep it in $DSH_HOME/.env
+cplt --agent dsh --pass-env DEEPSEEK_API_KEY
+
+# Set DSH as your default agent
+cplt config set sandbox.agent dsh
+```
+
+**Security notes for DSH:**
+- **Not auto-detected**: select it with `--agent dsh` (aliases `deepseek`, `deepseek-harness`) or set `sandbox.agent = "dsh"`. `dsh` is a short, generic command name that could belong to something else on your machine
+- **Turn DSH's own sandbox off inside cplt**: DSH wraps every shell and file tool call in its own process sandbox — Seatbelt on macOS, bwrap or Landlock on Linux. Neither nests inside cplt. macOS does not support nested `sandbox-exec` calls (the same limitation that makes cplt turn Gradle's inner sandbox off, see [Limitations](#limitations)), and bwrap builds its namespace with `unshare`, which cplt's seccomp filter denies. cplt is the enforcing boundary either way, so pick DSH's shipped `danger-full-access` permission preset for sandboxed sessions. Leave the inner runner on and tool calls fail with a sandbox runner error rather than a task error
+- **One home root, and cplt follows the override**: DSH keeps sessions, settings, cache and profiles under `$DSH_HOME` (`~/.dsh` by default). `DSH_HOME` is on the env allowlist, so the child resolves the same root cplt grants. A value pointing at a system root or your home directory is refused before launch, the same veto `CLAUDE_CONFIG_DIR` goes through
+- **Host-persistence guard**: `$DSH_HOME/cordis.patch.yml`, the home-level overlay the Loader reads at boot, is write-denied. `$DSH_HOME/profiles/` stays writable because DSH rewrites each profile's `cordis.yml` include-root on every boot, so a per-profile `cordis.patch.yml` and installed plugins are a documented residual — do profile and `dsh plugin` edits outside cplt, and always launch `dsh` through cplt so anything planted still runs sandboxed
+- **Default domains**: `deepseek.com` only. The shipped `dsh-llm-deepseek` adapter defaults to `https://api.deepseek.com`. Point `DEEPSEEK_BASE_URL` at a gateway and you have to add that gateway's domain via `allowed_domains`
+- **Auth**: pass the key with `--pass-env DEEPSEEK_API_KEY`, or keep it in `$DSH_HOME/.env`. A key saved through DSH's own models UI lands in `$DSH_HOME/.credentials.yaml`, inside the same writable root. The macOS Keychain is denied, so `git push` over HTTPS needs `gh`'s token in `hosts.yml` or `--pass-env GH_TOKEN`
 
 ### Shell mode
 

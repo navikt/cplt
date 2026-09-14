@@ -143,7 +143,7 @@ pub fn default_config_contents() -> String {
 # ─── Sandbox behavior ───────────────────────────────────────
 [sandbox]
 # Preferred AI coding agent. Auto-detected from PATH if not set.
-# Supported: copilot, opencode, gemini, antigravity, pi, claude, goose, shell
+# Supported: copilot, opencode, gemini, antigravity, pi, claude, goose, dsh, shell
 # agent = "copilot"
 #
 # Named policy preset. Sets a baseline for the five sandbox toggles below
