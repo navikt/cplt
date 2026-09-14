@@ -1995,8 +1995,36 @@ mod e2e_tests {
             contents.contains("alias opencode 'cplt --agent opencode'"),
             "opencode alias should be installed.\ncontents: {contents}"
         );
+        // The rewrite does not reach a shell that is already running.
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("Restart your shell"),
+            "re-pinning should tell you to reload.\nstderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
 
         let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    /// The pin in each alias is not overridable. `--agent` is not a repeatable
+    /// clap argument, so `opencode --agent claude` — the alias plus a second
+    /// `--agent` — is a hard error rather than a quiet switch to another agent.
+    #[test]
+    fn e2e_agent_flag_cannot_be_given_twice() {
+        let output = cplt_cmd()
+            .args(["--agent", "opencode", "--agent", "claude"])
+            .arg("--print-profile")
+            .output()
+            .expect("binary should run");
+
+        assert!(
+            !output.status.success(),
+            "a second --agent should be refused, not silently applied"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("cannot be used multiple times"),
+            "error should name the duplicate flag.\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     // ── Config subcommand e2e tests ─────────────────────────

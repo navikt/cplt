@@ -8492,6 +8492,7 @@ fn shell_install(agent: agent::Agent) -> ExitCode {
     // stay unpinned forever, so rewrite it in place.
     let legacy_posix = "eval \"$(cplt --shell-setup)\"";
     let legacy_fish = "alias copilot cplt";
+    let mut rewrote = false;
     if fish && has_line(&contents, legacy_fish) {
         let pinned = &alias_lines(agent::Agent::Copilot, true)[0];
         contents = contents
@@ -8514,6 +8515,7 @@ fn shell_install(agent: agent::Agent) -> ExitCode {
             "Pinned the existing 'copilot' alias to --agent copilot in {}",
             rc_file.display()
         ));
+        rewrote = true;
     }
     if !fish && agent == agent::Agent::Copilot && has_line(&contents, legacy_posix) {
         // Already covered, and it resolves to the pinned alias at shell start.
@@ -8527,6 +8529,14 @@ fn shell_install(agent: agent::Agent) -> ExitCode {
             agent.display_name(),
             rc_file.display()
         ));
+        // The rc file is current either way, but a shell started before the
+        // rewrite still holds the old alias, and only a reload replaces it.
+        if rewrote {
+            ui::info(&format!(
+                "Restart your shell or run: source {}",
+                rc_file.display()
+            ));
+        }
         return ExitCode::SUCCESS;
     }
 
