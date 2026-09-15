@@ -351,23 +351,81 @@ const GH_TOKEN_VARS: &[&str] = &["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOK
 /// for the wrong host. The token vars are stripped from the subprocess so `gh`
 /// answers from its own credential store rather than echoing back an ambient
 /// value.
-#[allow(clippy::disallowed_methods)] // gh resolved by trusted_gh() above
 fn extract_gh_token() -> Option<String> {
-    let gh = trusted_gh()?;
-    let mut cmd = std::process::Command::new(&gh);
+    gh_auth_token(&trusted_gh()?, GH_AUTH_TOKEN_TIMEOUT)
+}
+
+/// Ceiling on the `gh auth token` handover. A local credential store answers in
+/// milliseconds; this only bounds a `gh` that never answers at all.
+///
+/// Unbounded, this was the single blocking wait between the startup banner and
+/// exec: `configure_command` reaches it on every Copilot launch (the gh guard's
+/// `block_auth_token` defaults on), so a wedged `gh` hung cplt itself with the
+/// banner as the last thing on screen and nothing pointing at the cause.
+const GH_AUTH_TOKEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Run `gh auth token` and return what it printed, or `None` on any failure —
+/// a non-zero exit, unreadable output, or a `gh` that outlives `timeout`.
+///
+/// Degrading is the whole point: no token means the agent's GitHub API calls
+/// fail, which is recoverable and visible. A hang means cplt never starts.
+///
+/// Bounded the same way as [`crate::audit`]'s git probe: stdout is drained on a
+/// helper thread so `gh` can never block writing into a full pipe while the
+/// main thread polls, and on timeout the child is killed and reaped. The reader
+/// is detached rather than joined there — joining a thread that reads a pipe a
+/// surviving grandchild could still hold open would reinstate the hang this
+/// exists to remove.
+///
+/// `stdin` is closed explicitly. `Command::output` gave the child a null stdin
+/// for free; a spawned child inherits the terminal instead, and a `gh` that
+/// decides to prompt would then block on a read nobody answers.
+#[allow(clippy::disallowed_methods)] // gh resolved by trusted_gh() at the call site
+fn gh_auth_token(gh: &Path, timeout: std::time::Duration) -> Option<String> {
+    use std::io::Read as _;
+    use std::time::{Duration, Instant};
+
+    let mut cmd = std::process::Command::new(gh);
     cmd.args(["auth", "token", "--hostname", "github.com"]);
     for var in GH_TOKEN_VARS {
         cmd.env_remove(var);
     }
-    let output = cmd
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .output()
+        .spawn()
         .ok()?;
-    if !output.status.success() {
+
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                drop(reader);
+                return None;
+            }
+        }
+    };
+
+    // The child is gone, so its write end is closed and the reader has hit EOF.
+    let buf = reader.join().ok()?;
+    if !status.success() {
         return None;
     }
-    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let token = String::from_utf8_lossy(&buf).trim().to_string();
     (!token.is_empty()).then_some(token)
 }
 
@@ -1445,6 +1503,59 @@ fn read_confirm_byte(fd: i32) -> ConfirmResult {
 #[cfg(test)]
 mod gh_token_extraction_tests {
     use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A `gh` stub at `dir/gh` running `body`, executable.
+    fn gh_stub(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let gh = dir.join("gh");
+        std::fs::write(&gh, format!("#!/bin/sh\n{body}\n")).expect("write gh stub");
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        gh
+    }
+
+    /// The launch must survive a `gh` that never answers.
+    ///
+    /// This call sits between the "Starting … in sandbox" banner and exec, and
+    /// it runs on every Copilot launch. Unbounded it took the whole process
+    /// down with it: cplt printed the banner and then waited forever, with
+    /// nothing on screen naming `gh` as the thing being waited on.
+    #[test]
+    fn a_gh_that_never_answers_does_not_block_the_launch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let gh = gh_stub(dir.path(), "sleep 300");
+
+        let started = Instant::now();
+        let token = gh_auth_token(&gh, Duration::from_millis(200));
+        let waited = started.elapsed();
+
+        assert_eq!(token, None, "a wedged gh has no token to hand over");
+        assert!(
+            waited < Duration::from_secs(30),
+            "the wait must be bounded by the timeout, not by gh; waited {waited:?}"
+        );
+    }
+
+    /// The bound must not cost the feature it bounds: a `gh` that answers still
+    /// gets its token read, through the draining reader rather than `output()`.
+    #[test]
+    fn a_gh_that_answers_still_hands_the_token_over() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let gh = gh_stub(dir.path(), "echo ghp_fromstub");
+        assert_eq!(
+            gh_auth_token(&gh, Duration::from_secs(10)),
+            Some("ghp_fromstub".to_string())
+        );
+    }
+
+    /// A `gh` that fails hands over nothing — including when it prints to
+    /// stdout on the way out, which `.trim()` alone would have accepted.
+    #[test]
+    fn a_failing_gh_hands_over_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let gh = gh_stub(dir.path(), "echo not-a-token; exit 1");
+        assert_eq!(gh_auth_token(&gh, Duration::from_secs(10)), None);
+    }
 
     /// A repo `deny.env` on a token var used to leave the child with NO token:
     /// the parent's value suppressed the extraction, then the deny stripped the
