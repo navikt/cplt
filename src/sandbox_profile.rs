@@ -601,14 +601,8 @@ fn emit_home_access(
     // GitHub CLI auth — Copilot spawns `gh auth token` which reads these specific files.
     // OpenCode may also use `gh` for auth. Allow for all agents.
     sbpl!(sb, ";; GitHub CLI auth (specific files only)");
-    sbpl!(
-        sb,
-        "(allow file-read* (literal \"{home}/.config/gh/hosts.yml\"))"
-    );
-    sbpl!(
-        sb,
-        "(allow file-read* (literal \"{home}/.config/gh/config.yml\"))"
-    );
+    emit_home_config_read(sb, home, ".config/gh/hosts.yml");
+    emit_home_config_read(sb, home, ".config/gh/config.yml");
     sbpl!(sb);
 
     // Microsoft DeviceID — telemetry device identifier
@@ -638,6 +632,39 @@ fn emit_home_access(
         );
     }
     sbpl!(sb);
+}
+
+/// Allow read on one home config file, following a dotfiles symlink to its
+/// target.
+///
+/// An SBPL `literal` rule matches the path the kernel resolves, not the path
+/// the process opened. A home where `~/.gitconfig` is a symlink into a
+/// dotfiles repo — stow, chezmoi, yadm, a hand-rolled `ln -s` — therefore gets
+/// nothing from a rule naming `~/.gitconfig`, and every git command in the
+/// session dies with `unable to access '~/.gitconfig': Operation not
+/// permitted` (#515). The same mismatch already bit `~/.npmrc` (`resolved()`
+/// below exists for it).
+///
+/// Both forms are emitted: the `$HOME` one because the matching write denies
+/// in [`emit_deny_rules`] name `$HOME` and the pair has to line up, the
+/// resolved one because that is what the kernel actually checks.
+///
+/// This grants the file the user already pointed the tool at, nowhere else,
+/// and it is emitted *before* [`emit_deny_rules`], so a link whose target sits
+/// in `~/.ssh`, `~/.aws` or any other denied path is still denied — SBPL is
+/// last-match-wins. The config *names* credentials — `credential.helper =
+/// store` points at `~/.git-credentials`, `url.<base>.insteadOf` can embed a
+/// token — but naming is all it does: `~/.git-credentials` is a hard deny in
+/// [`DENIED_FILES`], and an `include.path` outside these exceptions is not
+/// granted by any of them.
+fn emit_home_config_read(sb: &mut String, home: &str, rel: &str) {
+    sbpl!(sb, "(allow file-read* (literal \"{home}/{rel}\"))");
+    let named = Path::new(home).join(rel);
+    let target = resolved(named.clone());
+    if target != named && validate_sbpl_path(&target).is_ok() {
+        let p = target.display();
+        sbpl!(sb, "(allow file-read* (literal \"{p}\"))");
+    }
 }
 
 fn emit_system_access(
@@ -815,24 +842,15 @@ fn emit_system_access(
 
     // Git config (read-only)
     sbpl!(sb, ";; Git config (read-only)");
-    sbpl!(sb, "(allow file-read* (literal \"{home}/.gitconfig\"))");
-    sbpl!(
-        sb,
-        "(allow file-read* (literal \"{home}/.gitconfig.local\"))"
-    );
-    sbpl!(
-        sb,
-        "(allow file-read* (literal \"{home}/.gitignore_global\"))"
-    );
-    sbpl!(
-        sb,
-        "(allow file-read* (literal \"{home}/.config/git/config\"))"
-    );
+    emit_home_config_read(sb, home, ".gitconfig");
+    emit_home_config_read(sb, home, ".gitconfig.local");
+    emit_home_config_read(sb, home, ".gitignore_global");
+    emit_home_config_read(sb, home, ".config/git/config");
     sbpl!(sb);
 
     // Tool version files — mise/asdf read these to determine tool versions
     sbpl!(sb, ";; Tool version files (mise/asdf, read-only)");
-    sbpl!(sb, "(allow file-read* (literal \"{home}/.tool-versions\"))");
+    emit_home_config_read(sb, home, ".tool-versions");
     sbpl!(sb);
 }
 

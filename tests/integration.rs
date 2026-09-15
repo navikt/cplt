@@ -1297,6 +1297,81 @@ mod macos_tests {
         );
     }
 
+    /// Kernel truth for #515: a dotfiles-managed home, where `~/.gitconfig` is
+    /// a symlink into a repo the user stows from. The SBPL rule names the link;
+    /// the kernel checks the target. Before the fix every git command inside the
+    /// sandbox died with `unable to access '~/.gitconfig': Operation not
+    /// permitted`, which made `git status` — the first thing an agent runs —
+    /// impossible.
+    ///
+    /// The same run proves `~/.git-credentials` stays denied. `credential.helper
+    /// = store` puts plaintext tokens there, and reading the config names that
+    /// file; it must not hand it over.
+    #[test]
+    fn real_profile_allows_a_symlinked_global_git_config() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let temp_home = tempfile::tempdir().unwrap();
+        let home = fs::canonicalize(temp_home.path()).unwrap();
+
+        let dotfiles = home.join("dotfiles");
+        fs::create_dir_all(&dotfiles).unwrap();
+        let target = dotfiles.join("gitconfig");
+        fs::write(
+            &target,
+            "[user]\nname = cplt-symlink-user\n[credential]\nhelper = store\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&target, home.join(".gitconfig")).unwrap();
+        fs::write(
+            home.join(".git-credentials"),
+            "https://x-access-token:ghp_cplt_test@github.com\n",
+        )
+        .unwrap();
+
+        let opts = default_opts(&project, &home);
+        let profile = write_real_profile(&opts);
+
+        let name_cmd = format!("HOME='{}' git config --get user.name 2>&1", home.display());
+        let (name_output, name_success) = run_sandboxed(&profile, &name_cmd);
+        let creds_cmd = format!("cat '{}' 2>&1", home.join(".git-credentials").display());
+        let (creds_output, creds_success) = run_sandboxed(&profile, &creds_cmd);
+
+        fs::remove_file(&profile).ok();
+        assert!(
+            name_success && name_output.contains("cplt-symlink-user"),
+            "a symlinked ~/.gitconfig must be readable: {name_output}"
+        );
+        assert!(
+            !creds_success && !creds_output.contains("ghp_cplt_test"),
+            "~/.git-credentials must stay denied: {creds_output}"
+        );
+    }
+
+    /// The other half of the reverse case: no `~/.gitconfig` at all. Git must
+    /// run clean rather than trip over a rule naming a path that is not there.
+    #[test]
+    fn real_profile_runs_git_without_a_global_config() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let temp_home = tempfile::tempdir().unwrap();
+        let home = fs::canonicalize(temp_home.path()).unwrap();
+
+        let opts = default_opts(&project, &home);
+        let profile = write_real_profile(&opts);
+        let cmd = format!(
+            "HOME='{}' git config --get user.name; echo EXIT:$?",
+            home.display()
+        );
+        let (output, _) = run_sandboxed(&profile, &cmd);
+
+        fs::remove_file(&profile).ok();
+        assert!(
+            output.contains("EXIT:1") && !output.contains("Operation not permitted"),
+            "an absent ~/.gitconfig is 'key not found' (exit 1), not a denial: {output}"
+        );
+    }
+
     // ── Git persistence prevention ────────────────────────────────
 
     #[test]
@@ -2149,6 +2224,9 @@ mod macos_tests {
         // live inside otherwise-allowed tool dirs (the real last-match-wins case).
         let planted: &[(&str, &str)] = &[
             (".ssh/id_rsa", "SENTINEL_SSH_PRIVATE_KEY_c0ffee"),
+            // `credential.helper = store`. Sits directly under $HOME with no
+            // enclosing tool-dir allow, so only the DENIED_FILES deny stops it.
+            (".git-credentials", "SENTINEL_GIT_CREDENTIAL_token_abcd"),
             (".aws/credentials", "SENTINEL_AWS_SECRET_deadbeef"),
             (".m2/settings.xml", "SENTINEL_M2_REGISTRY_PASSWORD_1234"),
             (".gradle/gradle.properties", "SENTINEL_GRADLE_TOKEN_5678"),

@@ -924,6 +924,123 @@ fn profile_grants_project_access() {
     );
 }
 
+/// `~/.gitconfig` symlinked into a dotfiles repo (stow, chezmoi, yadm, plain
+/// `ln -s`). An SBPL `literal` rule matches the resolved path, so a rule naming
+/// `$HOME/.gitconfig` covers nothing and every git command in the session fails
+/// with `unable to access '~/.gitconfig': Operation not permitted` (#515).
+#[test]
+fn profile_follows_symlinked_home_git_config() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let home_dir = std::fs::canonicalize(home.path()).expect("canonicalize home");
+    let target = home_dir.join("dotfiles/gitconfig");
+    std::fs::create_dir_all(target.parent().unwrap()).expect("mkdir dotfiles");
+    std::fs::write(&target, "[user]\n\tname = cplt\n").expect("write target");
+    std::os::unix::fs::symlink(&target, home_dir.join(".gitconfig")).expect("symlink");
+
+    let p = generate_profile(
+        &SandboxConfig {
+            home_dir: &home_dir,
+            ..base_profile_options()
+        },
+        &[],
+    );
+
+    assert!(
+        p.contains(&format!(
+            "(allow file-read* (literal \"{}\"))",
+            home_dir.join(".gitconfig").display()
+        )),
+        "the $HOME path must stay granted, the write deny is paired with it:\n{p}"
+    );
+    assert!(
+        p.contains(&format!(
+            "(allow file-read* (literal \"{}\"))",
+            target.display()
+        )),
+        "the link target is what the kernel checks and must be granted too:\n{p}"
+    );
+}
+
+/// The overwhelmingly common case: no `~/.gitconfig` at all. `canonicalize`
+/// fails, the fallback must emit the plain `$HOME` rule and nothing else — no
+/// panic, no second literal naming a path that does not exist.
+#[test]
+fn profile_tolerates_a_missing_home_git_config() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let home_dir = std::fs::canonicalize(home.path()).expect("canonicalize home");
+
+    let p = generate_profile(
+        &SandboxConfig {
+            home_dir: &home_dir,
+            ..base_profile_options()
+        },
+        &[],
+    );
+
+    let rule = format!(
+        "(allow file-read* (literal \"{}\"))",
+        home_dir.join(".gitconfig").display()
+    );
+    assert_eq!(
+        p.matches(&rule).count(),
+        1,
+        "an absent ~/.gitconfig gets exactly one rule:\n{p}"
+    );
+}
+
+/// A symlink must not tunnel out of a hard deny. `~/.gitconfig -> ~/.ssh/config`
+/// resolves into a denied directory; the grant is emitted before the deny block
+/// and SBPL is last-match-wins, so the deny still has the last word.
+#[test]
+fn symlinked_git_config_cannot_escape_a_denied_directory() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let home_dir = std::fs::canonicalize(home.path()).expect("canonicalize home");
+    let target = home_dir.join(".ssh/config");
+    std::fs::create_dir_all(target.parent().unwrap()).expect("mkdir .ssh");
+    std::fs::write(&target, "Host *\n").expect("write ssh config");
+    std::os::unix::fs::symlink(&target, home_dir.join(".gitconfig")).expect("symlink");
+
+    let p = generate_profile(
+        &SandboxConfig {
+            home_dir: &home_dir,
+            ..base_profile_options()
+        },
+        &[],
+    );
+
+    let allow = format!("(allow file-read* (literal \"{}\"))", target.display());
+    let deny = format!(
+        "(deny file-read* (subpath \"{}\"))",
+        home_dir.join(".ssh").display()
+    );
+    let deny_at = p
+        .rfind(&deny)
+        .unwrap_or_else(|| panic!("~/.ssh deny missing:\n{p}"));
+    if let Some(allow_at) = p.find(&allow) {
+        assert!(
+            allow_at < deny_at,
+            "the ~/.ssh deny must come last, SBPL is last-match-wins:\n{p}"
+        );
+    }
+}
+
+/// `~/.git-credentials` holds plaintext tokens for `credential.helper = store`,
+/// and a readable `~/.gitconfig` names it. `$HOME` is deny-by-default, so a real
+/// home already hides it — but a hard deny holds it shut under every grant shape
+/// too, the way `.netrc` already is.
+#[test]
+fn profile_hard_denies_git_credentials() {
+    let p = generate_profile(&base_profile_options(), &[]);
+    assert!(
+        p.contains("(deny file-read* (literal \"/Users/test/.git-credentials\"))"),
+        "~/.git-credentials must be denied outright:\n{p}"
+    );
+    assert!(
+        !p.contains("(allow file-read* (literal \"/Users/test/.git-credentials\"))"),
+        "nothing may allow ~/.git-credentials:\n{p}"
+    );
+}
+
 #[test]
 fn profile_grants_copilot_config_access() {
     let agent_dirs = copilot_agent_dirs();

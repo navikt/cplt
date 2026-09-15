@@ -53,7 +53,19 @@ pub const CPLT_STATE_DIR: &str = ".config/cplt";
 pub const NAV_PILOT_STATE_DIR: &str = ".nav-pilot";
 
 /// Sensitive files under $HOME that are always denied.
-pub const DENIED_FILES: &[&str] = &[".netrc", ".pypirc", ".gem/credentials", ".vault-token"];
+pub const DENIED_FILES: &[&str] = &[
+    ".netrc",
+    // `credential.helper = store` writes host/user/token in cleartext here.
+    // `~/.gitconfig` is readable so git works at all (#515), and the config
+    // *names* this file — so the read grant would tell an agent exactly where
+    // the token lives. Denying it keeps that a signpost rather than a leak, and
+    // it lines up with `.netrc`, git's other cleartext credential store, which
+    // has been on this list from the start.
+    ".git-credentials",
+    ".pypirc",
+    ".gem/credentials",
+    ".vault-token",
+];
 
 /// The [`DENIED_FILES`] entry `path` names, if any.
 ///
