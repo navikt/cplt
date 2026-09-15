@@ -424,33 +424,25 @@ pub fn approval_is_stale(stored_hash: &str, current_hash: &str) -> bool {
 /// dangerous permissions with no re-prompt — a classic confused-deputy
 /// escalation. An origin-URL match is therefore NOT sufficient authentication.
 ///
-/// To defeat this we additionally bind every approval to the absolute *local
-/// checkout path* where it was granted (recorded in `repo.path`). Presenting a
-/// trusted fingerprint from a DIFFERENT on-disk location no longer auto-applies
-/// — the user must re-approve. An attacker cannot place their repo at the
-/// victim's exact path without already controlling that location.
+/// To defeat this, every approval is also bound to the **repository** it was
+/// granted in: the shared git directory behind the checkout, recorded in
+/// `repo.git_dir`. Presenting a trusted fingerprint from a different repository
+/// does not auto-apply, and the user must re-approve. An attacker's clone is a
+/// different repository whatever it names as `origin`, and it cannot become the
+/// victim's without already controlling that repository.
 ///
-/// Both sides are canonicalized (resolving symlinks / `.` / `..`) so cosmetic
-/// path differences don't force spurious re-approval — the same repo at the
-/// same path stays trusted. A legacy entry with an empty `path` (written before
-/// path binding existed) matches nothing, forcing a one-time re-approval that
-/// records the real path.
+/// # Why the repository and not the checkout (#516)
 ///
-/// # Worktrees (#516)
+/// The bind used to be the absolute checkout path. `git worktree` gives one
+/// repository several checkouts, and one entry per origin can record only one
+/// path — so the second worktree was refused ("already trusted for a different
+/// checkout") and, once approved, took the entry from the first. Trust
+/// ping-ponged between worktrees for as long as the workflow lasted.
 ///
-/// The bind is to the *repository*, not to one working tree. `git worktree`
-/// gives one repository several checkouts, and the trust store holds one entry
-/// per origin with one recorded path — so the second worktree was refused
-/// ("already trusted for a different checkout") and, once approved, took the
-/// entry from the first. Trust ping-ponged between worktrees forever.
-///
-/// So an entry also matches when the shared git dir behind `project_dir` is the
-/// one the approval was granted at. Every worktree of a repository reports the
-/// main checkout's `.git` (that is what [`crate::discover::git_dir_of`]
-/// returns, and it is already how the git push gate decides that a worktree is
-/// the launch repository), while a separate clone reports its own. The spoofed
-/// origin above therefore still fails: the attacker's checkout is a different
-/// repository, whatever it names as `origin`.
+/// Every worktree of a repository reports the main checkout's `.git`, which is
+/// what [`crate::discover::git_dir_of`] returns and already how the git push
+/// gate decides that a worktree is the launch repository. One approval
+/// therefore covers them all, and a separate clone still has to approve.
 ///
 /// Anything git itself considers the same repository is the same repository
 /// here, including a directory whose `.git` file points at one. That directory
@@ -467,36 +459,46 @@ pub fn approval_is_stale(stored_hash: &str, current_hash: &str) -> bool {
 /// worktrees land in separate trust files and each approves once. Nothing
 /// overwrites anything there, which is why it is left alone.
 ///
-/// The git dir is recorded rather than re-derived from `repo.path` because a
-/// worktree workflow deletes checkouts: the recorded path is whichever one
-/// approved last, and once it is gone a derived bind takes every other worktree
-/// down with it. The derivation is kept for entries written before the field,
-/// which have nothing else to go on.
+/// # Legacy entries
+///
+/// An entry written before `repo.git_dir` existed has only `repo.path`, so the
+/// repository is resolved from that path instead — same property, and an
+/// existing approval covers its worktrees without a re-approval. When the path
+/// is not in a repository (or the entry predates path binding and is empty),
+/// the comparison falls back to the recorded path itself, canonicalized on both
+/// sides so cosmetic differences don't force a spurious re-approval.
+///
+/// A recorded git dir is **authoritative**: it never falls back to the path.
+/// The path record churns — it is whichever checkout approved last, and a
+/// worktree workflow deletes those routinely — so a fallback would let a
+/// different clone dropped at a since-removed worktree's path inherit the
+/// approval.
 ///
 /// # Fail-closed
 ///
-/// This is a security gate, so canonicalization failure MUST be treated as a
-/// mismatch, never as a match. If *either* the stored approved path or the
-/// current project path cannot be canonicalized (missing, unreadable, symlink
-/// loop, …) the comparison of raw strings could be spoofed or could silently
-/// pass on non-normalized input, so we return `false` (not trusted → re-approval
-/// required) rather than falling back to a lexical comparison.
+/// This is a security gate, so a failure to resolve either side MUST be treated
+/// as a mismatch, never as a match. A recorded git dir that no longer
+/// canonicalizes, a project directory that is in no repository, a stored path
+/// that is missing or unreadable: each returns `false` (not trusted →
+/// re-approval required) rather than falling back to a lexical comparison,
+/// which could pass on non-normalized or spoofed input.
 pub fn approved_path_matches(entry: &TrustEntry, project_dir: &Path) -> bool {
-    // Fail closed the same way: an unresolvable approved repository, or a
-    // project directory that is not in one, is a mismatch, not a match.
-    // A legacy entry has no recorded git dir, so ask the repository at the
-    // recorded checkout path instead — same property, and it means an approval
-    // written before this existed covers its worktrees without a re-approval.
-    let approved_repo = if entry.repo.git_dir.is_empty() {
-        crate::discover::git_dir_of(Path::new(&entry.repo.path))
-    } else {
-        std::fs::canonicalize(Path::new(&entry.repo.git_dir)).ok()
-    };
-    if approved_repo.is_some() && crate::discover::git_dir_of(project_dir) == approved_repo {
-        return true;
+    // A recorded repository is the whole answer, match or not: falling back to
+    // the churning path record would re-open what the binding closes.
+    if !entry.repo.git_dir.is_empty() {
+        let Ok(approved_repo) = std::fs::canonicalize(Path::new(&entry.repo.git_dir)) else {
+            return false;
+        };
+        return crate::discover::git_dir_of(project_dir) == Some(approved_repo);
     }
     if entry.repo.path.is_empty() {
         return false;
+    }
+    // Legacy entry: resolve the repository from the recorded checkout path.
+    if let Some(approved_repo) = crate::discover::git_dir_of(Path::new(&entry.repo.path))
+        && crate::discover::git_dir_of(project_dir) == Some(approved_repo)
+    {
+        return true;
     }
     // Fail closed: a canonicalize error on either side means "not trusted".
     let (Ok(stored), Ok(current)) = (
@@ -506,6 +508,31 @@ pub fn approved_path_matches(entry: &TrustEntry, project_dir: &Path) -> bool {
         return false;
     };
     stored == current
+}
+
+/// Whether the repository an approval was granted in can no longer be resolved
+/// on disk, so the entry is orphaned and another checkout may take it over.
+///
+/// The counterpart to [`approved_path_matches`] on the write side, and it has
+/// to ask the same question: a worktree workflow deletes checkouts, so the
+/// recorded *path* going missing says nothing about whether the approval is
+/// still live. Only the recorded repository does. Judging by the path would let
+/// a foreign clone claiming the same origin overwrite an entry that still
+/// covers the main checkout and every other worktree of it.
+///
+/// Fails closed in the direction that matters here: an entry that still
+/// resolves is never treated as orphaned, so a live approval cannot be taken
+/// over. The other direction is deliberate — an unresolvable repository (moved,
+/// deleted, unmounted, unreadable ancestor) leaves the owner to re-approve,
+/// which is denial of service, never an inherited grant.
+#[must_use]
+pub fn approval_is_orphaned(entry: &TrustEntry) -> bool {
+    let recorded = if entry.repo.git_dir.is_empty() {
+        &entry.repo.path
+    } else {
+        &entry.repo.git_dir
+    };
+    std::fs::canonicalize(Path::new(recorded)).is_err()
 }
 
 #[cfg(test)]
@@ -1229,6 +1256,11 @@ approved_at = "2026-05-01T12:00:00Z"
             let ok = std::process::Command::new("git")
                 .args(args)
                 .current_dir(cwd)
+                // The machine's own git config must not decide whether the
+                // fixture builds: `commit.gpgsign` and `core.hooksPath` both
+                // can (tests/common/mod.rs, issue #245).
+                .env_remove("GIT_CONFIG_GLOBAL")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("GIT_AUTHOR_NAME", "t")
                 .env("GIT_AUTHOR_EMAIL", "t@e")
                 .env("GIT_COMMITTER_NAME", "t")
@@ -1300,6 +1332,42 @@ approved_at = "2026-05-01T12:00:00Z"
         assert!(
             !approved_path_matches(&legacy, &other),
             "and still does not reach a different repository"
+        );
+
+        // A recorded repository is authoritative. The path record churns — it
+        // is whichever checkout approved last, and a worktree workflow deletes
+        // those — so a different clone dropped where a removed worktree stood
+        // must not inherit the approval through the path fallback.
+        let churned = TrustEntry {
+            repo: RepoIdentity {
+                path: other.to_string_lossy().into_owned(),
+                ..entry.repo.clone()
+            },
+            ..Default::default()
+        };
+        assert!(
+            !approved_path_matches(&churned, &other),
+            "a recorded repository never falls back to the recorded path"
+        );
+        assert!(
+            approved_path_matches(&churned, &wt),
+            "and still covers the repository it names"
+        );
+        // Which also means the entry is not up for grabs just because the
+        // checkout it was approved at is gone.
+        assert!(
+            !approval_is_orphaned(&entry),
+            "an approval whose repository still resolves is not orphaned"
+        );
+        assert!(
+            approval_is_orphaned(&TrustEntry {
+                repo: RepoIdentity {
+                    git_dir: base.path().join("gone/.git").to_string_lossy().into_owned(),
+                    ..entry.repo.clone()
+                },
+                ..Default::default()
+            }),
+            "an approval whose repository is gone is"
         );
 
         // A directory that is not a repository at all resolves to nothing, and

@@ -8102,29 +8102,34 @@ fn trust_accept(
 
     // Finding 4, write side: the trust file is keyed on the git origin URL alone,
     // which any repo can forge (`git remote set-url origin <victim>`). The launch
-    // path binds an approval to the local checkout path; this one must too, or
-    // accepting one innocuous key here would both retain the victim's approved
-    // keys (laundering a foreign approval into this checkout) and overwrite their
-    // entry. Refuse while their recorded path still resolves — trust is one entry
-    // per origin, so there is nowhere else to put ours. A path that cannot be
-    // resolved (moved, deleted, unmounted, unreadable ancestor) leaves the entry
-    // orphaned, and an empty one is a legacy entry, so both may be taken over.
+    // path binds an approval to the repository it was granted in; this one must
+    // too, or accepting one innocuous key here would both retain the victim's
+    // approved keys (laundering a foreign approval into this checkout) and
+    // overwrite their entry. Refuse while their recorded repository still
+    // resolves — trust is one entry per origin, so there is nowhere else to put
+    // ours. A repository that cannot be resolved (moved, deleted, unmounted,
+    // unreadable ancestor) leaves the entry orphaned and up for grabs.
+    //
+    // The repository, not the recorded checkout path: a worktree workflow
+    // deletes checkouts routinely, and judging liveness by the path would hand a
+    // foreign clone an entry that still covers the main checkout and every other
+    // worktree of it (#516).
     //
     // The escape hatch is not what makes this safe: `carried` below drops the
     // stored keys whenever `approved_path_matches` fails, and that fails closed on
-    // any canonicalize error. So making the recorded path unresolvable — including
-    // by racing this check against the save — yields an entry holding only the keys
-    // the user approves right now. That is denial of service plus a forced
-    // re-approval for the owner, never an inherited grant.
+    // any resolution error. So making the recorded repository unresolvable —
+    // including by racing this check against the save — yields an entry holding
+    // only the keys the user approves right now. That is denial of service plus a
+    // forced re-approval for the owner, never an inherited grant.
     //
-    // The recovery advice depends on `trust_revoke` having NO path check: revoking
+    // The recovery advice depends on `trust_revoke` having NO such check: revoking
     // here deletes this origin's entry whatever checkout it was granted at. Adding
-    // a path check there would strand the user, so don't. Pathless revoke is safe
-    // in its own right — it only ever de-escalates, and the owner re-approves
-    // against their own current proposal.
+    // one there would strand the user, so don't. Unconditional revoke is safe in
+    // its own right — it only ever de-escalates, and the owner re-approves against
+    // their own current proposal.
     if let Some(t) = &stored
         && !trust::approved_path_matches(t, project_dir)
-        && std::fs::canonicalize(&t.repo.path).is_ok()
+        && !trust::approval_is_orphaned(t)
     {
         ui::error(&format!(
             "This origin is already trusted for a different repository, checked out at {}.\n  \
