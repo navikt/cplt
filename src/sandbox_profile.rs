@@ -25,8 +25,9 @@ use super::policy::{
     DEPENDENCY_SOURCE_TREES, EXEC_IN_WRITABLE, GPG_SIGNING_ALLOW_FILES, PROTECTED_IN_GITDIR,
     PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir, SENSITIVE_PROJECT_PATTERNS,
     SYSTEM_READ_FILES, TOOL_READ_DIRS, XCODE_SELECT_LINK, active_tool_dirs, ancestor_alternation,
-    app_dirs, escape_regex, nested_alternation, path_bin_dirs, playwright_runtime_intent,
-    rel_is_glob, rel_regex, validate_playwright_socket_dir, validate_sbpl_path,
+    app_dirs, escape_regex, grant_is_refused, nested_alternation, path_bin_dirs,
+    playwright_runtime_intent, rel_is_glob, rel_regex, validate_playwright_socket_dir,
+    validate_sbpl_path,
 };
 
 /// Device nodes a sandboxed process may open for writing, by exact path.
@@ -649,22 +650,30 @@ fn emit_home_access(
 /// in [`emit_deny_rules`] name `$HOME` and the pair has to line up, the
 /// resolved one because that is what the kernel actually checks.
 ///
-/// This grants the file the user already pointed the tool at, nowhere else,
-/// and it is emitted *before* [`emit_deny_rules`], so a link whose target sits
-/// in `~/.ssh`, `~/.aws` or any other denied path is still denied — SBPL is
-/// last-match-wins. The config *names* credentials — `credential.helper =
+/// This grants the file the user already pointed the tool at, nowhere else. A
+/// link resolving onto a hard-denied file or a credential directory is refused
+/// outright by `grant_is_refused`, the same filter a user grant goes through,
+/// so `~/.gitconfig -> ~/.git-credentials` never becomes a rule. The `$HOME`
+/// literal that remains loses to [`emit_deny_rules`] anyway, SBPL being
+/// last-match-wins — the check is what keeps macOS and Linux answering alike,
+/// since Landlock is grant-only and has no deny to fall back on. The config *names* credentials — `credential.helper =
 /// store` points at `~/.git-credentials`, `url.<base>.insteadOf` can embed a
 /// token — but naming is all it does: `~/.git-credentials` is a hard deny in
 /// [`DENIED_FILES`], and an `include.path` outside these exceptions is not
 /// granted by any of them.
 fn emit_home_config_read(sb: &mut String, home: &str, rel: &str) {
     sbpl!(sb, "(allow file-read* (literal \"{home}/{rel}\"))");
-    let named = Path::new(home).join(rel);
+    let home_path = Path::new(home);
+    let named = home_path.join(rel);
     let target = resolved(named.clone());
-    if target != named && validate_sbpl_path(&target).is_ok() {
-        let p = target.display();
-        sbpl!(sb, "(allow file-read* (literal \"{p}\"))");
+    if target == named
+        || grant_is_refused(home_path, &target)
+        || validate_sbpl_path(&target).is_err()
+    {
+        return;
     }
+    let p = target.display();
+    sbpl!(sb, "(allow file-read* (literal \"{p}\"))");
 }
 
 fn emit_system_access(

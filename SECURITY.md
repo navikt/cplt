@@ -874,7 +874,7 @@ Directories explicitly allowed (read-only):
 Files always denied (hard blocks):
 
 - `~/.netrc` (HTTP credentials)
-- `~/.git-credentials` (cleartext tokens from `credential.helper = store`)
+- `~/.git-credentials` (cleartext tokens from `credential.helper = store`; a read-only exception that symlinks onto it, such as a dotfiles `~/.gitconfig`, is refused rather than granted)
 - `~/.pypirc` (PyPI credentials)
 - `~/.gem/credentials` (RubyGems credentials)
 - `~/.vault-token` (HashiCorp Vault)

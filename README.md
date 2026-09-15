@@ -101,7 +101,7 @@ The sandbox blocks access to credentials and secrets in the kernel. Command guar
 | Read `~/.config/gh/hosts.yml` + `config.yml` | ✅ Allowed (read-only) | Only these two files. The rest of `.config/gh` is blocked |
 | Read `~/.config/mise` | ✅ Allowed (read-only) | Tool versions and PATH, no secrets |
 | Read `~/.gitconfig`, `~/.config/git/config` | ✅ Allowed (read-only) | A dotfiles symlink is followed to its target, so a stowed `~/.gitconfig` works |
-| Read `~/.git-credentials` | 🔒 Kernel-blocked | `credential.helper = store` keeps cleartext tokens here. Not overridable, like `~/.netrc` |
+| Read `~/.git-credentials` | 🔒 Kernel-blocked | `credential.helper = store` keeps cleartext tokens here. No `--allow-read` reopens it, like `~/.netrc`. **Linux:** a grant on an *ancestor* (`$HOME` itself) still exposes it, because Landlock cannot deny a subpath inside an allowed tree |
 | Read global git hooks (`core.hooksPath`) | ✅ Allowed (read-only, write-denied) | Auto-detected. Must be under `$HOME` with depth ≥3. Writes are explicitly blocked |
 | Commit/tag signing (`commit.gpgsign`, `tag.gpgsign`) | 🔒 Disabled | Private keys in `~/.ssh` and `~/.gnupg` are blocked, so signing is disabled via an env var override |
 | Read `~/Library/Application Support/Microsoft` | ✅ Allowed (read-only) | Device ID for telemetry |

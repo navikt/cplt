@@ -1016,12 +1016,56 @@ fn symlinked_git_config_cannot_escape_a_denied_directory() {
     let deny_at = p
         .rfind(&deny)
         .unwrap_or_else(|| panic!("~/.ssh deny missing:\n{p}"));
-    if let Some(allow_at) = p.find(&allow) {
-        assert!(
-            allow_at < deny_at,
-            "the ~/.ssh deny must come last, SBPL is last-match-wins:\n{p}"
-        );
-    }
+    let allow_at = p
+        .find(&allow)
+        .unwrap_or_else(|| panic!("the resolved target must be granted:\n{p}"));
+    assert!(
+        allow_at < deny_at,
+        "the ~/.ssh deny must come last, SBPL is last-match-wins:\n{p}"
+    );
+}
+
+/// `~/.gitconfig -> ~/.git-credentials`. The link target is a hard deny, so the
+/// resolved grant must never be emitted — on macOS the later deny would win
+/// anyway, but Landlock is grant-only and has no deny to fall back on, so the
+/// refusal has to happen where both backends read it.
+#[test]
+fn symlinked_git_config_onto_a_hard_denied_file_is_refused() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let home_dir = std::fs::canonicalize(home.path()).expect("canonicalize home");
+    let creds = home_dir.join(".git-credentials");
+    std::fs::write(&creds, "https://x:tok@github.com\n").expect("write credentials");
+    std::os::unix::fs::symlink(&creds, home_dir.join(".gitconfig")).expect("symlink");
+
+    let p = generate_profile(
+        &SandboxConfig {
+            home_dir: &home_dir,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    assert!(
+        !p.contains(&format!(
+            "(allow file-read* (literal \"{}\"))",
+            creds.display()
+        )),
+        "a symlink onto ~/.git-credentials must not produce a grant:\n{p}"
+    );
+
+    let policy = cplt::sandbox::generate_policy(&SandboxConfig {
+        home_dir: &home_dir,
+        ..base_profile_options()
+    });
+    let leaking: Vec<_> = policy
+        .fs_rules
+        .iter()
+        .map(|r| &r.path)
+        .filter(|path| std::fs::canonicalize(path).is_ok_and(|c| c == creds))
+        .collect();
+    assert!(
+        leaking.is_empty(),
+        "no Landlock rule may resolve onto ~/.git-credentials: {leaking:?}"
+    );
 }
 
 /// `~/.git-credentials` holds plaintext tokens for `credential.helper = store`,
