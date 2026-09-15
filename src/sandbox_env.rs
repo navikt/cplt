@@ -413,6 +413,48 @@ pub fn playwright_mcp_sandbox_disabled(
             .any(|var| var == "PLAYWRIGHT_MCP_SANDBOX")
 }
 
+/// Whether to tell Copilot CLI that this host cannot sandbox commands.
+///
+/// Copilot CLI has had a command sandbox of its own since 1.0.83, and on Linux
+/// it cannot start inside cplt's. Its changelog for 1.0.83-5 states the
+/// requirement plainly — "Linux sandboxing now needs slirp4netns, nsenter,
+/// iptables, ip6tables, iptables-restore and ip6tables-restore on PATH" — and
+/// 1.0.83-2 adds that "Linux sandboxes now restrict network egress to the
+/// configured proxy", which cplt walks straight into: it sets `HTTP_PROXY` and
+/// `HTTPS_PROXY` for the child, so Copilot takes the proxy path whether or not
+/// the user asked for it. That path builds a network namespace, and cplt's
+/// seccomp filter denies `unshare` and `setns` with `EPERM` — the same wall
+/// Chromium's sandbox, the Gradle daemon and DSH's inner runner hit.
+///
+/// `COPILOT_CLI_SANDBOX_SUPPORT_OVERRIDE=unsupported` is the CLI's own escape
+/// hatch, read in its native runtime before the host-support probe is cached.
+/// Two things follow: Copilot disables its sandbox for the session and says so
+/// on stderr, leaving `sandbox.enabled` in the user's `settings.json`
+/// untouched; and the probe itself never runs, which on Linux is a `bwrap`
+/// subprocess spawned from inside cplt's sandbox.
+///
+/// Set for Copilot on every platform. macOS refuses a nested `sandbox-exec` the
+/// same way, so a Copilot sandbox turned on there fails for the same reason —
+/// it has simply not bitten yet, because `sandbox.enabled` defaults to off.
+///
+/// The trade is the one the Playwright and DSH entries already make: cplt is
+/// then the only boundary. It is also the only boundary that works here, since
+/// the inner one cannot start.
+///
+/// An explicit `--pass-env COPILOT_CLI_SANDBOX_SUPPORT_OVERRIDE` hands the
+/// choice back to the caller, exactly as `PLAYWRIGHT_MCP_SANDBOX` does.
+///
+/// What this does NOT cover: an enterprise managed policy that requires the
+/// sandbox. Copilot floors the setting on then, refuses `--no-sandbox`, and no
+/// environment variable lifts the floor — including the fail-closed case where
+/// the policy could not be read at all.
+pub fn copilot_sandbox_support_overridden(extra_pass_env: &[String], agent: Agent) -> bool {
+    agent == Agent::Copilot
+        && !extra_pass_env
+            .iter()
+            .any(|var| var == "COPILOT_CLI_SANDBOX_SUPPORT_OVERRIDE")
+}
+
 /// Keys in `parent_env` that name the same npm setting as `NPM_CONFIG_USERCONFIG`
 /// but are spelled differently, and so must be dropped when the override is injected.
 ///

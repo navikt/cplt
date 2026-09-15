@@ -278,6 +278,54 @@ Or for a single run: `cplt --allow-cache-exec ms-playwright --allow-cache-exec p
 > Chromium launcher still needs `--no-sandbox` of its own. Note that the MCP's
 > README documents an environment variable name the shipped code does not read.
 
+## Copilot CLI's own command sandbox (1.0.83+)
+
+Copilot CLI sandboxes shell commands itself since 1.0.83, and that sandbox
+cannot start inside cplt's. Two changelog entries in that release set the
+requirement:
+
+> Linux sandboxes now restrict network egress to the configured proxy; proxy
+> mode requires slirp4netns, util-linux 2.35+, iptables, and /dev/net/tun access
+> — 1.0.83-2
+
+> Linux sandboxing now needs slirp4netns, nsenter, iptables, ip6tables,
+> iptables-restore and ip6tables-restore on PATH — 1.0.83-5
+
+cplt sets `HTTP_PROXY` and `HTTPS_PROXY` for the child, so Copilot takes the
+proxy path whether or not the user asked for it. That path builds a network
+namespace, and cplt's seccomp filter denies `unshare` and `setns` with `EPERM` —
+the same wall Chromium's sandbox, the Gradle daemon and DSH's inner runner hit.
+macOS refuses a nested `sandbox-exec` for the same reason it refuses Chromium's.
+
+**cplt therefore sets `COPILOT_CLI_SANDBOX_SUPPORT_OVERRIDE=unsupported` for the
+child.** That is Copilot's own escape hatch, read in its native runtime before
+the host-support probe runs. Copilot disables its sandbox for the session and
+says so on stderr:
+
+> Sandboxing is disabled for this session because this host does not support it.
+> Shell commands and sandboxed services will run unsandboxed. Your
+> `sandbox.enabled` setting remains unchanged.
+
+Nothing is written to your `settings.json`: the next Copilot session outside cplt
+sandboxes exactly as it did before. Skipping the probe is worth something on its
+own — on Linux the probe spawns `bwrap` from inside cplt's sandbox.
+
+**cplt is then the only boundary.** That is the same trade the Playwright and DSH
+entries above make, and here it is not really a trade: the inner sandbox cannot
+start, so the alternative is not two boundaries but a launch that hangs.
+
+Hand the choice back with `--pass-env COPILOT_CLI_SANDBOX_SUPPORT_OVERRIDE`, and
+set the variable yourself, if you have the Linux prerequisites installed and want
+Copilot's sandbox inside cplt's.
+
+**One case this does not cover.** An enterprise managed policy can require the
+sandbox. Copilot then floors the setting on, refuses `--no-sandbox`, and no
+environment variable lifts the floor. That includes the fail-closed case where
+the policy could not be *read* — Copilot turns the sandbox on and says
+"Sandboxing is enabled because your organization's managed policy couldn't be
+read". If a session under cplt hangs right after the startup banner and your
+organization manages Copilot, that is the first thing to check.
+
 ## Localhost blocking
 
 Localhost outbound is blocked by default on macOS, so sandboxed processes cannot connect to local services. On Linux, Landlock rules are port numbers only and cannot pin to localhost, so a local service on an allowed port is reachable; use `--with-proxy` for SSRF protection, and see [Linux limitations](../SECURITY.md#linux-specific-limitations).

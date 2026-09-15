@@ -159,6 +159,15 @@ fn configure_command(
         cmd.env("PLAYWRIGHT_MCP_SANDBOX", "false");
     }
 
+    // Copilot CLI 1.0.83 gave itself a command sandbox that cannot start inside
+    // cplt's: on Linux it builds a network namespace, and cplt's seccomp filter
+    // denies `unshare`/`setns`. Copilot's own opt-out tells it the host has no
+    // sandbox support, so it stands down for the session, says so, and leaves
+    // the user's saved setting alone. See `copilot_sandbox_support_overridden`.
+    if super::env::copilot_sandbox_support_overridden(extra_pass_env, agent) {
+        cmd.env("COPILOT_CLI_SANDBOX_SUPPORT_OVERRIDE", "unsupported");
+    }
+
     // Default DOTNET_CLI_HOME to the already-resolved, already-validated sandbox
     // home dir. Newer .NET SDKs no longer fall back to $HOME when resolving
     // their CLI home directory, and their fallback (a getpwuid-based lookup)

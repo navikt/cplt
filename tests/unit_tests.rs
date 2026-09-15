@@ -5580,6 +5580,38 @@ fn playwright_socket_dir_override_uses_only_the_automatic_path() {
     assert_eq!(playwright_sockets_dir_override(&[], None), None);
 }
 
+/// Copilot CLI 1.0.83 sandboxes commands itself, and on Linux that sandbox
+/// builds a network namespace cplt's seccomp filter denies with `EPERM`. The
+/// override is what makes Copilot stand down instead of hanging on a sandbox it
+/// cannot start, so it has to reach exactly the agent that needs it.
+#[test]
+fn copilot_sandbox_support_override_is_scoped_to_copilot() {
+    use cplt::agent::Agent;
+    use cplt::sandbox::copilot_sandbox_support_overridden;
+
+    assert!(
+        copilot_sandbox_support_overridden(&[], Agent::Copilot),
+        "Copilot's own sandbox cannot start inside cplt's, so it must be told the host has none"
+    );
+    for agent in [Agent::Claude, Agent::OpenCode, Agent::Shell, Agent::Dsh] {
+        assert!(
+            !copilot_sandbox_support_overridden(&[], agent),
+            "{agent:?} does not read this variable; cplt must not set it for them"
+        );
+    }
+    assert!(
+        !copilot_sandbox_support_overridden(
+            &["COPILOT_CLI_SANDBOX_SUPPORT_OVERRIDE".to_string()],
+            Agent::Copilot
+        ),
+        "an explicit pass-through returns the choice to the caller"
+    );
+    assert!(
+        copilot_sandbox_support_overridden(&["UNRELATED".to_string()], Agent::Copilot),
+        "an unrelated pass-through must not suppress the default"
+    );
+}
+
 #[test]
 fn playwright_mcp_sandbox_is_disabled_only_for_runtime_intent() {
     use cplt::sandbox::playwright_mcp_sandbox_disabled;
