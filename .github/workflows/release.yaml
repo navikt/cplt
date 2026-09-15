@@ -141,6 +141,23 @@ jobs:
       # reads as the upstream / revision split: 2026.09.13-120000-abc1234 is
       # upstream 2026.09.13-120000 at revision abc1234. Both halves sort the way
       # apt expects.
+      #
+      # `Recommends: bubblewrap`, not `Depends:`. Landlock plus seccomp is the
+      # whole sandbox and holds on its own, so a hard dependency would both be
+      # untrue and make `apt install cplt` fail outright on a host where
+      # bubblewrap is unavailable. But without `bwrap` the namespace layer is
+      # gone and several controls documented in SECURITY.md go with it — the
+      # mise shim overlay, the `.git/hooks` read-only binds, the D-Bus masks —
+      # and cplt falls back to Landlock-only with a warning nobody reads at
+      # install time. apt installs recommendations by default, so the package
+      # now arrives complete unless the user opts out with
+      # `--no-install-recommends`. That is the whole point: the difference
+      # should be a choice, not a discovery.
+      #
+      # navikt/apt needs no change to carry this. It indexes the pool with
+      # `dpkg-scanpackages`, which copies the control fields straight out of
+      # the .deb, so `Recommends` appears in `dists/stable/main/binary-*/
+      # Packages` on the next hourly rebuild.
       - name: Build package
         env:
           VERSION: ${{ needs.version.outputs.version }}
@@ -159,6 +176,7 @@ jobs:
           Maintainer: Nav <navikt@nav.no>
           Section: devel
           Priority: optional
+          Recommends: bubblewrap
           Homepage: https://github.com/navikt/cplt
           Description: Sandbox wrapper for GitHub Copilot CLI
            cplt confines the Copilot CLI with Landlock LSM and seccomp-BPF on
