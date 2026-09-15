@@ -1188,6 +1188,38 @@ mod e2e_tests {
         );
     }
 
+    /// Copilot CLI 1.0.83 sandboxes commands itself, and on Linux that sandbox
+    /// builds a network namespace cplt's seccomp filter denies with `EPERM`.
+    /// cplt tells Copilot the host has no sandbox support, so it stands down
+    /// for the session instead of hanging on one it cannot start.
+    #[test]
+    fn e2e_env_tells_copilot_this_host_cannot_sandbox() {
+        require_sandbox!();
+        let (stdout, stderr) = run_with_fake_copilot(&[], &[]);
+
+        assert!(
+            stdout.contains("COPILOT_CLI_SANDBOX_SUPPORT_OVERRIDE=unsupported"),
+            "Copilot's nested sandbox must be turned off for the child.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+
+    /// The way back to Copilot's own sandbox, for anyone who has the Linux
+    /// prerequisites and wants it. Same escape hatch `PLAYWRIGHT_MCP_SANDBOX`
+    /// has.
+    #[test]
+    fn e2e_env_copilot_sandbox_override_yields_to_an_explicit_pass_env() {
+        require_sandbox!();
+        let (stdout, stderr) = run_with_fake_copilot(
+            &["--pass-env", "COPILOT_CLI_SANDBOX_SUPPORT_OVERRIDE"],
+            &[("COPILOT_CLI_SANDBOX_SUPPORT_OVERRIDE", "supported")],
+        );
+
+        assert!(
+            stdout.contains("COPILOT_CLI_SANDBOX_SUPPORT_OVERRIDE=supported"),
+            "an explicit pass-through must not be overwritten by cplt's default.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+
     #[test]
     fn e2e_env_passes_safe_vars() {
         require_sandbox!();

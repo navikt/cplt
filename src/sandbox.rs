@@ -88,8 +88,8 @@ pub use profile::{generate_profile, generate_profile_with_playwright_socket_dir}
 
 // Environment construction — already platform-agnostic.
 pub use env::{
-    SandboxEnv, build_sandbox_env, npmrc_explicitly_allowed, npmrc_userconfig_override,
-    npmrc_userconfig_stale_variants, playwright_mcp_sandbox_disabled,
+    SandboxEnv, build_sandbox_env, copilot_sandbox_support_overridden, npmrc_explicitly_allowed,
+    npmrc_userconfig_override, npmrc_userconfig_stale_variants, playwright_mcp_sandbox_disabled,
     playwright_sockets_dir_override,
 };
 
