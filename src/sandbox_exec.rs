@@ -972,13 +972,81 @@ fn seal_inherited_fds(cmd: &mut Command, keep: Vec<std::os::unix::io::RawFd>) {
     }
 }
 
-/// One past the highest descriptor [`seal_fds`] has to touch.
+/// One past the highest descriptor [`seal_fds`] has to touch when it cannot use
+/// `close_range`.
 ///
-/// The soft `RLIMIT_NOFILE`, which is what the sweep has always used.
+/// `getdtablesize()` is the soft `RLIMIT_NOFILE` verbatim, and on Linux that is
+/// whatever started cplt says it is: `LimitNOFILE=infinity` makes it
+/// 1073741816, and a sweep that long is minutes of `fcntl` between fork and
+/// exec with nothing on screen (#525). `/proc/self/fd` is the kernel's own
+/// answer to what is open, and nothing above its highest entry can need
+/// sealing.
+///
+/// Darwin needs no such help: `getdtablesize()` there is clamped to
+/// `kern.maxfilesperproc` (61440 by default), so it cannot run away.
+///
+/// This is a parent-side snapshot, so a descriptor opened between here and the
+/// fork is outside it. That is sound for what this bounds: the descriptors the
+/// seal exists to catch are the caller's, which predate the process, and
+/// everything cplt opens for itself is `O_CLOEXEC` already — the deliberate
+/// exceptions, the settle probe and the bwrap pipes, exist before this runs and
+/// travel in `keep`. The `close_range` path in [`seal_fds`] has no window at
+/// all, and it is the one that runs on any kernel from 5.11.
 fn fd_sweep_ceiling() -> libc::c_int {
     // SAFETY: getdtablesize() takes no arguments, touches no memory, and has no
     // failure mode.
-    unsafe { libc::getdtablesize() }
+    let table = unsafe { libc::getdtablesize() };
+
+    #[cfg(target_os = "linux")]
+    if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
+        let highest = entries
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name();
+                name.to_str()?.parse::<libc::c_int>().ok()
+            })
+            .max();
+        if let Some(highest) = highest {
+            return highest.saturating_add(1).min(table);
+        }
+    }
+
+    table
+}
+
+/// Set `FD_CLOEXEC` on every descriptor from 3 up, in one syscall.
+///
+/// `false` when the kernel will not do it — `ENOSYS` before 5.9, `EINVAL` for
+/// the flag before 5.11 — which leaves the caller to sweep instead. Any failure
+/// is that same answer, so no errno read is needed to tell them apart.
+///
+/// The raw syscall rather than glibc's `close_range()` wrapper: the wrapper is
+/// glibc 2.34+, and linking it would put a versioned symbol in the binary that
+/// makes it refuse to start on anything older. Release binaries are built on
+/// Ubuntu 22.04 and run wherever people put them. A syscall number asks nothing
+/// of libc at runtime.
+///
+/// Called between fork and exec: one `syscall(2)`, no allocation, no locks.
+#[cfg(target_os = "linux")]
+fn close_range_cloexec() -> bool {
+    // `c_long` arguments, not `c_uint`: `syscall` is variadic and reads each
+    // argument as a `long`, and an `unsigned int` is not promoted to one. The
+    // kernel takes three `unsigned int` and ignores the upper half of each.
+    // SAFETY: a syscall with three scalar arguments; it touches no memory here.
+    unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            libc::c_long::from(3_u32),
+            libc::c_long::from(libc::c_uint::MAX),
+            libc::c_long::from(libc::CLOSE_RANGE_CLOEXEC),
+        ) == 0
+    }
+}
+
+/// No `close_range` outside Linux; [`seal_fds`] sweeps.
+#[cfg(not(target_os = "linux"))]
+fn close_range_cloexec() -> bool {
+    false
 }
 
 /// The seal itself, as it runs between fork and exec.
@@ -986,14 +1054,21 @@ fn fd_sweep_ceiling() -> libc::c_int {
 /// Named rather than inlined into the hook so a test can call the code that
 /// actually ships and measure what it costs.
 ///
-/// Async-signal-safe: `fcntl` only, no allocation, no locks.
+/// `keep` is cleared last, and that is what keeps the settle probe alive:
+/// `CLOSE_RANGE_CLOEXEC` cannot skip a descriptor in the middle of its range,
+/// so the probe is sealed with everything else and then un-sealed by name —
+/// the same order, and the same exemption, as the sweep it replaces.
+///
+/// Async-signal-safe: one `syscall` and some `fcntl`, no allocation, no locks.
 fn seal_fds(max: libc::c_int, keep: &[std::os::unix::io::RawFd]) {
     // stdin/stdout/stderr are already dup2'd into place by std before pre_exec
     // hooks run, so 0..=2 are ours and must stay.
-    for fd in 3..max {
-        // EBADF on an unused descriptor is expected and ignored.
-        // SAFETY: `fcntl` with a scalar argument; an invalid fd returns EBADF.
-        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    if !close_range_cloexec() {
+        for fd in 3..max {
+            // EBADF on an unused descriptor is expected and ignored.
+            // SAFETY: `fcntl` with a scalar argument; an invalid fd returns EBADF.
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        }
     }
     for &fd in keep {
         // SAFETY: as above.
@@ -2091,7 +2166,10 @@ mod inherited_fd_tests {
         }
 
         let (original, hard) = nofile();
-        let low = 4096;
+        // 1024 rather than something closer to `high`: GitHub's Linux runners
+        // cap the hard limit at 65536, and the premise below needs the two
+        // limits to be far enough apart to tell scaling from noise.
+        let low = 1024;
         let high = hard.min(1 << 20);
 
         let (table_low, ceiling_low, old_low, new_low) = measure(low, hard);
@@ -2117,8 +2195,12 @@ mod inherited_fd_tests {
             "the sweep this replaced did not visibly scale — {report}"
         );
 
+        // Against the limit-derived bound, not against `ceiling_low`: the suite
+        // runs in parallel and other tests open and close descriptors between
+        // the two measurements, so the ceiling drifts by a few either way. What
+        // must not happen is it tracking the limit.
         assert!(
-            ceiling_high <= ceiling_low.saturating_mul(2) + 16,
+            i64::from(ceiling_high) * 16 <= i64::from(table_high),
             "the seal's ceiling still follows RLIMIT_NOFILE — {report}"
         );
         assert!(
