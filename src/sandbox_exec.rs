@@ -947,14 +947,8 @@ fn spawn_error_message(e: &std::io::Error) -> String {
 fn seal_inherited_fds(cmd: &mut Command, keep: Vec<std::os::unix::io::RawFd>) {
     use std::os::unix::process::CommandExt as _;
 
-    // The upper bound is the soft RLIMIT_NOFILE, read here in the parent so the
-    // hook itself is nothing but `fcntl`. A machine with a very high limit pays
-    // a linear sweep once per agent launch (~250ms at 2^20); Linux
-    // `close_range(.., CLOSE_RANGE_CLOEXEC)` would fix that if it ever shows up
-    // in a profile.
-    // SAFETY: getdtablesize() takes no arguments, touches no memory, and has no
-    // failure mode.
-    let max = unsafe { libc::getdtablesize() };
+    // Read in the parent so the hook itself is nothing but `fcntl`.
+    let max = fd_sweep_ceiling();
 
     // The audit's settle probe is the one descriptor that is *meant* to reach
     // the session: cplt created the pipe, holds the only read end, and detects
@@ -968,21 +962,117 @@ fn seal_inherited_fds(cmd: &mut Command, keep: Vec<std::os::unix::io::RawFd>) {
         keep.push(probe);
     }
 
-    // SAFETY: the closure runs between fork and exec. It makes only `fcntl`
-    // calls — no allocation, no locks, async-signal-safe.
+    // SAFETY: the closure runs between fork and exec. `seal_fds` makes only
+    // `fcntl` calls — no allocation, no locks, async-signal-safe.
     unsafe {
         cmd.pre_exec(move || {
-            // stdin/stdout/stderr are already dup2'd into place by std before
-            // pre_exec hooks run, so 0..=2 are ours and must stay.
-            for fd in 3..max {
-                // EBADF on an unused descriptor is expected and ignored.
-                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-            }
-            for &fd in &keep {
-                libc::fcntl(fd, libc::F_SETFD, 0);
-            }
+            seal_fds(max, &keep);
             Ok(())
         });
+    }
+}
+
+/// One past the highest descriptor [`seal_fds`] has to touch when it cannot use
+/// `close_range`.
+///
+/// `getdtablesize()` is the soft `RLIMIT_NOFILE` verbatim, and on Linux that is
+/// whatever started cplt says it is: `LimitNOFILE=infinity` makes it
+/// 1073741816, and a sweep that long is minutes of `fcntl` between fork and
+/// exec with nothing on screen (#525). `/proc/self/fd` is the kernel's own
+/// answer to what is open, and nothing above its highest entry can need
+/// sealing.
+///
+/// Darwin needs no such help: `getdtablesize()` there is clamped to
+/// `kern.maxfilesperproc` (61440 by default), so it cannot run away.
+///
+/// This is a parent-side snapshot, so a descriptor opened between here and the
+/// fork is outside it. That is sound for what this bounds: the descriptors the
+/// seal exists to catch are the caller's, which predate the process, and
+/// everything cplt opens for itself is `O_CLOEXEC` already — the deliberate
+/// exceptions, the settle probe and the bwrap pipes, exist before this runs and
+/// travel in `keep`. The `close_range` path in [`seal_fds`] has no window at
+/// all, and it is the one that runs on any kernel from 5.11.
+fn fd_sweep_ceiling() -> libc::c_int {
+    // SAFETY: getdtablesize() takes no arguments, touches no memory, and has no
+    // failure mode.
+    let table = unsafe { libc::getdtablesize() };
+
+    #[cfg(target_os = "linux")]
+    if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
+        let highest = entries
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name();
+                name.to_str()?.parse::<libc::c_int>().ok()
+            })
+            .max();
+        if let Some(highest) = highest {
+            return highest.saturating_add(1).min(table);
+        }
+    }
+
+    table
+}
+
+/// Set `FD_CLOEXEC` on every descriptor from 3 up, in one syscall.
+///
+/// `false` when the kernel will not do it — `ENOSYS` before 5.9, `EINVAL` for
+/// the flag before 5.11 — which leaves the caller to sweep instead. Any failure
+/// is that same answer, so no errno read is needed to tell them apart.
+///
+/// The raw syscall rather than glibc's `close_range()` wrapper: the wrapper is
+/// glibc 2.34+, and linking it would put a versioned symbol in the binary that
+/// makes it refuse to start on anything older. Release binaries are built on
+/// Ubuntu 22.04 and run wherever people put them. A syscall number asks nothing
+/// of libc at runtime.
+///
+/// Called between fork and exec: one `syscall(2)`, no allocation, no locks.
+#[cfg(target_os = "linux")]
+fn close_range_cloexec() -> bool {
+    // `c_long` arguments, not `c_uint`: `syscall` is variadic and reads each
+    // argument as a `long`, and an `unsigned int` is not promoted to one. The
+    // kernel takes three `unsigned int` and ignores the upper half of each.
+    // SAFETY: a syscall with three scalar arguments; it touches no memory here.
+    unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            libc::c_long::from(3_u32),
+            libc::c_long::from(libc::c_uint::MAX),
+            libc::c_long::from(libc::CLOSE_RANGE_CLOEXEC),
+        ) == 0
+    }
+}
+
+/// No `close_range` outside Linux; [`seal_fds`] sweeps.
+#[cfg(not(target_os = "linux"))]
+fn close_range_cloexec() -> bool {
+    false
+}
+
+/// The seal itself, as it runs between fork and exec.
+///
+/// Named rather than inlined into the hook so a test can call the code that
+/// actually ships and measure what it costs.
+///
+/// `keep` is cleared last, and that is what keeps the settle probe alive:
+/// `CLOSE_RANGE_CLOEXEC` cannot skip a descriptor in the middle of its range,
+/// so the probe is sealed with everything else and then un-sealed by name —
+/// the same order, and the same exemption, as the sweep it replaces.
+///
+/// Async-signal-safe: one `syscall` and some `fcntl`, no allocation, no locks.
+fn seal_fds(max: libc::c_int, keep: &[std::os::unix::io::RawFd]) {
+    // stdin/stdout/stderr are already dup2'd into place by std before pre_exec
+    // hooks run, so 0..=2 are ours and must stay.
+    if !close_range_cloexec() {
+        for fd in 3..max {
+            // EBADF on an unused descriptor is expected and ignored.
+            // SAFETY: `fcntl` with a scalar argument; an invalid fd returns EBADF.
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        }
+    }
+    for &fd in keep {
+        // SAFETY: as above.
+        unsafe { libc::fcntl(fd, libc::F_SETFD, 0) };
     }
 }
 
@@ -1846,26 +1936,37 @@ mod inherited_fd_tests {
     /// rather than proving anything. Pinning it also matches how the leak was
     /// demonstrated.
     fn read_through_fd(source: RawFd, keep_fd3: bool, seal: bool) -> String {
+        read_through_fd_at(source, 3, |cmd| {
+            if seal {
+                seal_inherited_fds(cmd, if keep_fd3 { vec![3] } else { Vec::new() });
+            }
+        })
+    }
+
+    /// [`read_through_fd`] with the descriptor number and the sealing step
+    /// chosen by the caller, so a test can decide what `keep` holds — and when
+    /// — rather than taking the two cases the bool pair offers.
+    ///
+    /// `target` stays a single digit for dash's sake, as above.
+    fn read_through_fd_at(source: RawFd, target: RawFd, seal: impl FnOnce(&mut Command)) -> String {
         use std::os::unix::process::CommandExt as _;
 
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c")
-            .arg("cat <&3")
+            .arg(format!("cat <&{target}"))
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         // SAFETY: dup2 only, between fork and exec. Registered before the seal
-        // so fd 3 exists by the time the sweep runs.
+        // so the descriptor exists by the time the sweep runs.
         unsafe {
             cmd.pre_exec(move || {
-                if libc::dup2(source, 3) < 0 {
+                if libc::dup2(source, target) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
             });
         }
-        if seal {
-            seal_inherited_fds(&mut cmd, if keep_fd3 { vec![3] } else { Vec::new() });
-        }
+        seal(&mut cmd);
         let out = cmd.output().expect("spawn /bin/sh");
         format!(
             "{}{}",
@@ -1943,6 +2044,172 @@ mod inherited_fd_tests {
         assert!(
             cmd.output().is_err(),
             "a failed execve must still surface as a spawn error"
+        );
+    }
+
+    /// GHSA-c47q-c3c8-7wrf: the audit's settle probe is the one descriptor the
+    /// session is *meant* to inherit, and the seal is the single place that can
+    /// take it away. Sealing it is silent — the read end sees EOF immediately
+    /// and every session reports itself settled — so the exemption needs a test
+    /// that fails when it stops working, not a comment.
+    ///
+    /// The probe is published to a process-global, which `seal_inherited_fds`
+    /// reads once, in the parent, on the way in. Store and retract around that
+    /// call alone: the audit's own tests arm real probes in this same binary,
+    /// and a wider window would trade one flake for another.
+    #[test]
+    fn the_settle_probe_survives_sealing() {
+        use std::sync::atomic::Ordering;
+
+        // Not fd 3: the other tests here assert on 3, and the exemption is a
+        // global they would see.
+        const PROBE: RawFd = 9;
+
+        let file = secret_file();
+        let held = leak(&file);
+        let got = read_through_fd_at(held.as_raw_fd(), PROBE, |cmd| {
+            crate::audit::SETTLE_PROBE_FD.store(PROBE, Ordering::Relaxed);
+            seal_inherited_fds(cmd, Vec::new());
+            crate::audit::SETTLE_PROBE_FD.store(-1, Ordering::Relaxed);
+        });
+
+        assert!(
+            got.contains(SECRET),
+            "the settle probe was sealed shut, so every session would report \
+             itself settled (GHSA-c47q-c3c8-7wrf): {got}"
+        );
+    }
+
+    /// The seal must not cost more because the host raised `RLIMIT_NOFILE`.
+    ///
+    /// `getdtablesize()` is the soft limit, and a unit with
+    /// `LimitNOFILE=infinity` makes that 1073741816 — roughly a billion `fcntl`
+    /// calls between fork and exec, pinning a core with no output, no timeout
+    /// and nothing on screen after "Starting <agent> in sandbox…" (#525).
+    ///
+    /// Measured rather than compared against a constant: the property is the
+    /// scaling, and the absolute numbers belong to whatever host runs this.
+    ///
+    /// Linux only. Darwin clamps `getdtablesize()` to `kern.maxfilesperproc`
+    /// (61440 by default), so the ceiling cannot follow the limit up there and
+    /// this test would be measuring the clamp instead of the fix.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_seal_does_not_scale_with_rlimit_nofile() {
+        use std::time::{Duration, Instant};
+
+        /// The shape this replaced: one `fcntl` per descriptor number, all the
+        /// way to the ceiling. Written out here rather than kept in production
+        /// so the comparison below has something honest to beat.
+        fn sweep_every_number(max: libc::c_int) {
+            for fd in 3..max {
+                // SAFETY: scalar `fcntl`; an unused descriptor returns EBADF.
+                unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+            }
+        }
+
+        fn nofile() -> (u64, u64) {
+            let mut r = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: `r` is a valid rlimit the kernel fills in.
+            assert_eq!(
+                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut r) },
+                0
+            );
+            (r.rlim_cur, r.rlim_max)
+        }
+
+        fn set_nofile(soft: u64, hard: u64) {
+            let r = libc::rlimit {
+                rlim_cur: soft,
+                rlim_max: hard,
+            };
+            // SAFETY: `r` is a valid rlimit; soft never exceeds hard here.
+            assert_eq!(
+                unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const r) },
+                0,
+                "could not set RLIMIT_NOFILE soft={soft}"
+            );
+        }
+
+        /// Repetitions per measurement. The suite runs in parallel, so a single
+        /// sample can be a scheduling artefact; the minimum of a few is not.
+        const REPS: u32 = 5;
+
+        /// Fastest of `reps`: noise only ever adds time, so the minimum is the
+        /// closest this gets to the cost itself.
+        fn fastest(reps: u32, mut f: impl FnMut()) -> Duration {
+            (0..reps)
+                .map(|_| {
+                    let start = Instant::now();
+                    f();
+                    start.elapsed()
+                })
+                .min()
+                .expect("at least one rep")
+        }
+
+        /// What the sweep costs, and what bound it used, at one soft limit.
+        fn measure(soft: u64, hard: u64) -> (libc::c_int, libc::c_int, Duration, Duration) {
+            set_nofile(soft, hard);
+            // SAFETY: no arguments, no memory, no failure mode.
+            let table = unsafe { libc::getdtablesize() };
+            let ceiling = fd_sweep_ceiling();
+            (
+                table,
+                ceiling,
+                fastest(REPS, || sweep_every_number(table)),
+                fastest(REPS, || seal_fds(ceiling, &[])),
+            )
+        }
+
+        let (original, hard) = nofile();
+        // 1024 rather than something closer to `high`: GitHub's Linux runners
+        // cap the hard limit at 65536, and the premise below needs the two
+        // limits to be far enough apart to tell scaling from noise.
+        let low = 1024;
+        let high = hard.min(1 << 20);
+
+        let (table_low, ceiling_low, old_low, new_low) = measure(low, hard);
+        let (table_high, ceiling_high, old_high, new_high) = measure(high, hard);
+        set_nofile(original, hard);
+
+        let report = format!(
+            "soft {low} → {high} (hard {hard}): table {table_low} → {table_high}, \
+             ceiling {ceiling_low} → {ceiling_high}, old sweep {old_low:?} → {old_high:?}, \
+             seal {new_low:?} → {new_high:?}"
+        );
+
+        // Premises. Without both of these the comparison proves nothing: the
+        // limit has to actually move the old bound, and moving it has to
+        // actually cost time.
+        assert!(
+            table_high >= table_low * 16,
+            "this host will not raise RLIMIT_NOFILE far enough to demonstrate \
+             anything — {report}"
+        );
+        assert!(
+            old_high >= old_low * 8,
+            "the sweep this replaced did not visibly scale — {report}"
+        );
+
+        // Against the limit-derived bound, not against `ceiling_low`: the suite
+        // runs in parallel and other tests open and close descriptors between
+        // the two measurements, so the ceiling drifts by a few either way. What
+        // must not happen is it tracking the limit.
+        assert!(
+            i64::from(ceiling_high) * 16 <= i64::from(table_high),
+            "the seal's ceiling still follows RLIMIT_NOFILE — {report}"
+        );
+        assert!(
+            new_high <= new_low * 4 + Duration::from_millis(1),
+            "the seal still costs more at a higher RLIMIT_NOFILE — {report}"
+        );
+        assert!(
+            new_high * 20 <= old_high,
+            "the seal is no cheaper than the sweep it replaced — {report}"
         );
     }
 }
