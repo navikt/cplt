@@ -31,6 +31,32 @@ pub struct RepoIdentity {
     /// Absolute path on disk (for repos without remotes).
     #[serde(default)]
     pub path: String,
+    /// Canonical shared git directory of the checkout the approval was granted
+    /// at — `<repo>/.git`, which every `git worktree` of that repository
+    /// reports as its own (#516).
+    ///
+    /// This is what binds an approval to a repository rather than to one
+    /// working tree. Empty for a legacy entry, or for a project directory that
+    /// is not a git repository; [`approved_path_matches`] then falls back to
+    /// [`RepoIdentity::path`].
+    #[serde(default)]
+    pub git_dir: String,
+}
+
+/// Record where an approval is being granted: the checkout path, the shared git
+/// dir behind it, and the normalized origin.
+///
+/// One place, so the launch gate and `cplt trust accept` can never disagree
+/// about what an approval is bound to.
+#[must_use]
+pub fn approved_identity(project_dir: &Path, remote: &str) -> RepoIdentity {
+    RepoIdentity {
+        remote: remote.to_string(),
+        path: project_dir.to_string_lossy().into_owned(),
+        git_dir: crate::discover::git_dir_of(project_dir)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    }
 }
 
 /// Which proposal keys have been approved.
@@ -387,7 +413,7 @@ pub fn approval_is_stale(stored_hash: &str, current_hash: &str) -> bool {
     stored_hash != current_hash
 }
 
-/// Check whether a trust entry was approved at the current local checkout path.
+/// Check whether a trust entry applies to the repository at `project_dir`.
 ///
 /// # Why (Finding 4 — trust identity is a spoofable git origin URL)
 ///
@@ -410,6 +436,43 @@ pub fn approval_is_stale(stored_hash: &str, current_hash: &str) -> bool {
 /// path binding existed) matches nothing, forcing a one-time re-approval that
 /// records the real path.
 ///
+/// # Worktrees (#516)
+///
+/// The bind is to the *repository*, not to one working tree. `git worktree`
+/// gives one repository several checkouts, and the trust store holds one entry
+/// per origin with one recorded path — so the second worktree was refused
+/// ("already trusted for a different checkout") and, once approved, took the
+/// entry from the first. Trust ping-ponged between worktrees forever.
+///
+/// So an entry also matches when the shared git dir behind `project_dir` is the
+/// one the approval was granted at. Every worktree of a repository reports the
+/// main checkout's `.git` (that is what [`crate::discover::git_dir_of`]
+/// returns, and it is already how the git push gate decides that a worktree is
+/// the launch repository), while a separate clone reports its own. The spoofed
+/// origin above therefore still fails: the attacker's checkout is a different
+/// repository, whatever it names as `origin`.
+///
+/// Anything git itself considers the same repository is the same repository
+/// here, including a directory whose `.git` file points at one. That directory
+/// gets the victim's committed `.cplt.toml` too — `[propose]` is read from
+/// `HEAD`, not the working tree — so it can only ever inherit an approval for
+/// the exact values the user reviewed, which is the guarantee the content hash
+/// already carries.
+///
+/// The value pinning is untouched and does the per-branch work the worktree
+/// workflow needs: a worktree on a branch that *changed* `[propose]` has a
+/// different content hash, so it is stale and prompts, approval or not.
+///
+/// A repository with no `origin` is fingerprinted by its checkout path, so its
+/// worktrees land in separate trust files and each approves once. Nothing
+/// overwrites anything there, which is why it is left alone.
+///
+/// The git dir is recorded rather than re-derived from `repo.path` because a
+/// worktree workflow deletes checkouts: the recorded path is whichever one
+/// approved last, and once it is gone a derived bind takes every other worktree
+/// down with it. The derivation is kept for entries written before the field,
+/// which have nothing else to go on.
+///
 /// # Fail-closed
 ///
 /// This is a security gate, so canonicalization failure MUST be treated as a
@@ -419,6 +482,19 @@ pub fn approval_is_stale(stored_hash: &str, current_hash: &str) -> bool {
 /// pass on non-normalized input, so we return `false` (not trusted → re-approval
 /// required) rather than falling back to a lexical comparison.
 pub fn approved_path_matches(entry: &TrustEntry, project_dir: &Path) -> bool {
+    // Fail closed the same way: an unresolvable approved repository, or a
+    // project directory that is not in one, is a mismatch, not a match.
+    // A legacy entry has no recorded git dir, so ask the repository at the
+    // recorded checkout path instead — same property, and it means an approval
+    // written before this existed covers its worktrees without a re-approval.
+    let approved_repo = if entry.repo.git_dir.is_empty() {
+        crate::discover::git_dir_of(Path::new(&entry.repo.path))
+    } else {
+        std::fs::canonicalize(Path::new(&entry.repo.git_dir)).ok()
+    };
+    if approved_repo.is_some() && crate::discover::git_dir_of(project_dir) == approved_repo {
+        return true;
+    }
     if entry.repo.path.is_empty() {
         return false;
     }
@@ -654,6 +730,7 @@ mod tests {
             repo: RepoIdentity {
                 remote: "github.com/navikt/spleis".to_string(),
                 path: "/home/user/spleis".to_string(),
+                git_dir: String::new(),
             },
             accepted: AcceptedProposals {
                 keys: vec![
@@ -716,6 +793,7 @@ approved_at = "2026-05-01T12:00:00Z"
             repo: RepoIdentity {
                 remote: "github.com/navikt/spleis".to_string(),
                 path: dir.to_string_lossy().into_owned(),
+                git_dir: String::new(),
             },
             ..Default::default()
         };
@@ -731,6 +809,7 @@ approved_at = "2026-05-01T12:00:00Z"
             repo: RepoIdentity {
                 remote: "github.com/navikt/spleis".to_string(),
                 path: "/home/victim/spleis".to_string(),
+                git_dir: String::new(),
             },
             ..Default::default()
         };
@@ -748,6 +827,7 @@ approved_at = "2026-05-01T12:00:00Z"
             repo: RepoIdentity {
                 remote: "github.com/navikt/spleis".to_string(),
                 path: String::new(),
+                git_dir: String::new(),
             },
             ..Default::default()
         };
@@ -770,6 +850,7 @@ approved_at = "2026-05-01T12:00:00Z"
             repo: RepoIdentity {
                 remote: "github.com/navikt/spleis".to_string(),
                 path: missing.to_string(),
+                git_dir: String::new(),
             },
             ..Default::default()
         };
@@ -1130,6 +1211,104 @@ approved_at = "2026-05-01T12:00:00Z"
         assert_eq!(
             proposal_content_hash(&propose1),
             proposal_content_hash(&propose2)
+        );
+    }
+
+    /// #516: `git worktree` gives one repository several checkouts, and each
+    /// one used to need its own approval — which the single stored path could
+    /// not hold, so approving in the second worktree took the entry from the
+    /// first and trust ping-ponged between them.
+    ///
+    /// The bind is to the repository, so every worktree of it matches, and a
+    /// separate clone still does not.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
+    fn approval_covers_every_worktree_of_the_approved_repository() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let git = |args: &[&str], cwd: &Path| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@e")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@e")
+                .output()
+                .expect("run git")
+                .status
+                .success();
+            assert!(ok, "git {args:?} should succeed");
+        };
+
+        let repo = base.path().join("repo");
+        std::fs::create_dir(&repo).expect("mkdir");
+        git(&["init", "--quiet"], &repo);
+        git(&["commit", "--quiet", "--allow-empty", "-m", "x"], &repo);
+
+        let entry = TrustEntry {
+            repo: approved_identity(&repo, "github.com/navikt/repo"),
+            ..Default::default()
+        };
+        assert!(
+            approved_path_matches(&entry, &repo),
+            "the checkout the approval was granted at still matches"
+        );
+
+        let wt = base.path().join("wt");
+        git(
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "b2",
+                wt.to_str().expect("utf-8"),
+            ],
+            &repo,
+        );
+        assert!(
+            approved_path_matches(&entry, &wt),
+            "a worktree of the approved repository is the approved repository"
+        );
+
+        // A separate clone with the same (forgeable) origin is a different
+        // repository, and must still be re-approved.
+        let other = base.path().join("other");
+        std::fs::create_dir(&other).expect("mkdir");
+        git(&["init", "--quiet"], &other);
+        git(&["commit", "--quiet", "--allow-empty", "-m", "x"], &other);
+        assert!(
+            !approved_path_matches(&entry, &other),
+            "a different repository must never inherit the approval"
+        );
+
+        // An entry written before the git dir was recorded has only the
+        // checkout path, and must cover that repository's worktrees too rather
+        // than make every existing approval re-run the ping-pong once.
+        let legacy = TrustEntry {
+            repo: RepoIdentity {
+                remote: "github.com/navikt/repo".to_string(),
+                path: repo.to_string_lossy().into_owned(),
+                git_dir: String::new(),
+            },
+            ..Default::default()
+        };
+        assert!(
+            approved_path_matches(&legacy, &wt),
+            "a legacy approval resolves its repository from the recorded path"
+        );
+        assert!(
+            !approved_path_matches(&legacy, &other),
+            "and still does not reach a different repository"
+        );
+
+        // A directory that is not a repository at all resolves to nothing, and
+        // the gate has to fail closed on that.
+        let plain = base.path().join("plain");
+        std::fs::create_dir(&plain).expect("mkdir");
+        assert!(
+            !approved_path_matches(&entry, &plain),
+            "an unresolvable repository must fail closed"
         );
     }
 

@@ -778,6 +778,12 @@ cplt trust revoke --all                   # Revoke all trust for this repo
 
 Trust decisions live in `~/.config/cplt/trust/`, protected from the sandbox.
 
+An approval covers the repository it was granted in, so every `git worktree` of
+it is approved too. A worktree on a branch that changed `[propose]` is not: the
+approval is pinned to the values you reviewed, and different values need a fresh
+`cplt trust accept`. A separate clone is a separate repository and approves on
+its own, even when its `.cplt.toml` is identical.
+
 In CI and scripts, where interactive approval is not possible:
 
 ```bash
