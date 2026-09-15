@@ -364,18 +364,28 @@ fn extract_gh_token() -> Option<String> {
 /// banner as the last thing on screen and nothing pointing at the cause.
 const GH_AUTH_TOKEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long to wait for the drained stdout after `gh` has already exited.
+///
+/// Everything `gh` wrote is in the pipe by then, so the reader reaches EOF at
+/// once — unless a descendant `gh` left behind still holds the write end, which
+/// is the one case this bounds.
+const GH_AUTH_TOKEN_EOF_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Run `gh auth token` and return what it printed, or `None` on any failure —
 /// a non-zero exit, unreadable output, or a `gh` that outlives `timeout`.
 ///
 /// Degrading is the whole point: no token means the agent's GitHub API calls
 /// fail, which is recoverable and visible. A hang means cplt never starts.
 ///
-/// Bounded the same way as [`crate::audit`]'s git probe: stdout is drained on a
-/// helper thread so `gh` can never block writing into a full pipe while the
-/// main thread polls, and on timeout the child is killed and reaped. The reader
-/// is detached rather than joined there — joining a thread that reads a pipe a
-/// surviving grandchild could still hold open would reinstate the hang this
-/// exists to remove.
+/// Bounded in the same shape as [`crate::audit`]'s git probe: stdout is drained
+/// on a helper thread so `gh` can never block writing into a full pipe while the
+/// main thread polls, and on timeout the child is killed and reaped.
+///
+/// The reader is never joined, on either path. A descendant that outlives `gh`
+/// keeps the write end of the pipe open, so the reader sees no EOF even once
+/// `try_wait` reports the child gone — joining there would reinstate exactly the
+/// hang this exists to remove. It hands its buffer over a channel instead, and
+/// both the wait for the child and the wait for that buffer are bounded.
 ///
 /// `stdin` is closed explicitly. `Command::output` gave the child a null stdin
 /// for free; a spawned child inherits the terminal instead, and a `gh` that
@@ -398,10 +408,11 @@ fn gh_auth_token(gh: &Path, timeout: std::time::Duration) -> Option<String> {
         .ok()?;
 
     let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = stdout.read_to_end(&mut buf);
-        buf
+        let _ = tx.send(buf);
     });
 
     let deadline = Instant::now() + timeout;
@@ -414,14 +425,15 @@ fn gh_auth_token(gh: &Path, timeout: std::time::Duration) -> Option<String> {
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                drop(reader);
                 return None;
             }
         }
     };
 
-    // The child is gone, so its write end is closed and the reader has hit EOF.
-    let buf = reader.join().ok()?;
+    // The child is gone, so its own write end is closed. A descendant it left
+    // behind may still hold the other one, which is why this wait is bounded
+    // too: an unbounded one here is the same hang in a different place.
+    let buf = rx.recv_timeout(GH_AUTH_TOKEN_EOF_GRACE).ok()?;
     if !status.success() {
         return None;
     }
@@ -1525,14 +1537,42 @@ mod gh_token_extraction_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let gh = gh_stub(dir.path(), "sleep 300");
 
+        let timeout = Duration::from_millis(200);
         let started = Instant::now();
-        let token = gh_auth_token(&gh, Duration::from_millis(200));
+        let token = gh_auth_token(&gh, timeout);
         let waited = started.elapsed();
 
         assert_eq!(token, None, "a wedged gh has no token to hand over");
+        // Measured against the timeout that was passed, not against some
+        // generous outer bound: an assertion loose enough to pass on a
+        // materially weaker bound proves nothing about the bound. The margin
+        // covers process spawn and the 20 ms poll granularity on a loaded CI
+        // box.
         assert!(
-            waited < Duration::from_secs(30),
-            "the wait must be bounded by the timeout, not by gh; waited {waited:?}"
+            waited < timeout + Duration::from_secs(2),
+            "the wait must be bounded by the {timeout:?} timeout, not by gh; waited {waited:?}"
+        );
+    }
+
+    /// The child exiting is not the same as its stdout reaching EOF: a
+    /// descendant `gh` leaves behind holds the write end open, and the reader
+    /// never sees EOF. Waiting on that unbounded is the same launch hang one
+    /// step further along, so the post-exit read is bounded too.
+    #[test]
+    fn a_descendant_holding_stdout_open_does_not_block_the_launch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // `gh` exits at once; the backgrounded child inherits stdout and keeps
+        // the pipe open well past it.
+        let gh = gh_stub(dir.path(), "sleep 300 &\necho ghp_leaked");
+
+        let started = Instant::now();
+        let token = gh_auth_token(&gh, Duration::from_secs(10));
+        let waited = started.elapsed();
+
+        assert_eq!(token, None, "no EOF means no token to trust");
+        assert!(
+            waited < Duration::from_secs(5),
+            "the post-exit read must be bounded by the EOF grace; waited {waited:?}"
         );
     }
 
