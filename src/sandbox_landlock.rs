@@ -891,9 +891,21 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     // Landlock PathBeneath rules are always recursive — a rule on $HOME
     // would grant read to the entire home tree including ~/.ssh, ~/.gnupg.
     // Instead, enumerate the specific config files/dirs that tools need.
+    //
+    // A rule path is opened with `O_PATH` and no `O_NOFOLLOW`, so Landlock binds
+    // it to whatever the symlink resolves to. A dotfiles home that points
+    // `~/.gitconfig` at `~/.git-credentials` or `~/.netrc` would hand the agent
+    // that inode through a rule that names something harmless, and Landlock is
+    // grant-only, so there is no deny to lose to. `grant_is_refused` is the same
+    // filter `extra_read` goes through below, and it canonicalizes, so the
+    // symlink is what gets tested.
     for &file in LINUX_HOME_CONFIG_FILES {
+        let path = home.join(file);
+        if policy::grant_is_refused(home, &path) {
+            continue;
+        }
         fs_rules.push(FsRule {
-            path: home.join(file),
+            path,
             access: FsAccess {
                 read: true,
                 write: false,

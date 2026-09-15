@@ -736,7 +736,9 @@ By default `cplt` clears the child process environment and re-adds only safe var
 
 **Deliberately blocked:** `AWS_*`, `AZURE_*`, `NPM_TOKEN`, `DATABASE_URL`, `VAULT_TOKEN`, `SSH_AUTH_SOCK`, Docker vars, CI tokens.
 
-**Git configuration:** `~/.gitconfig`, `~/.gitconfig.local`, and `~/.gitignore_global` are exact read-only exceptions, so normal Git and `gh` workflows can load conventional user configuration. The standard XDG Git config is read-only too (the whole `~/.config/git` directory on Linux, because Landlock rules are recursive). Other include files stay blocked unless explicitly allowed. These files should not contain plaintext credentials; credential directories and SSH/GPG private keys remain denied.
+**Git configuration:** `~/.gitconfig`, `~/.gitconfig.local`, and `~/.gitignore_global` are exact read-only exceptions, so normal Git and `gh` workflows can load conventional user configuration. The standard XDG Git config is read-only too (the whole `~/.config/git` directory on Linux, because Landlock rules are recursive). Each exception follows a symlink to its target, because a dotfiles-managed home points `~/.gitconfig` at a stowed repo and the kernel checks the resolved path, not the one git opened. Other include files stay blocked unless explicitly allowed — an `include.path` outside the exceptions aborts the git command rather than being skipped.
+
+The config is readable; the credentials it names are not. `credential.helper = store` puts cleartext tokens in `~/.git-credentials`, which is a hard deny no grant can reopen, and `url.<base>.insteadOf` rewrites or a `core.sshCommand` path only tell an agent where a secret lives — `~/.ssh`, `~/.gnupg` and every credential directory stay denied, and a symlinked exception whose target resolves into one of them is still denied, because the deny block is emitted after the grant and SBPL is last-match-wins.
 
 **Escape hatch:** `--inherit-env` disables sanitization and inherits all env vars, still stripping `ENV_ALWAYS_DENY`. This is dangerous. Use it only for debugging.
 
@@ -874,6 +876,7 @@ Directories explicitly allowed (read-only):
 Files always denied (hard blocks):
 
 - `~/.netrc` (HTTP credentials)
+- `~/.git-credentials` (cleartext tokens from `credential.helper = store`; a read-only exception that symlinks onto it, such as a dotfiles `~/.gitconfig`, is refused rather than granted)
 - `~/.pypirc` (PyPI credentials)
 - `~/.gem/credentials` (RubyGems credentials)
 - `~/.vault-token` (HashiCorp Vault)
