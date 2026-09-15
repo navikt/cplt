@@ -4620,6 +4620,173 @@ paths = [
         );
     }
 
+    /// #516: `git worktree` gives one repository several checkouts, and trust
+    /// is one entry per origin holding one path — so the second worktree was
+    /// refused, and once approved it took the entry from the first. Trust
+    /// ping-ponged between worktrees for as long as the workflow lasted.
+    ///
+    /// One approval now covers every worktree of the repository, while the two
+    /// things that must still prompt do: a branch that changed `[propose]`, and
+    /// a different repository claiming the same (forgeable) origin.
+    #[test]
+    fn e2e_trust_approval_covers_every_worktree_of_the_repository() {
+        let (repo, config_file) =
+            make_trust_repo("worktree", "[propose]\nallow_localhost_any = true\n");
+        // The store is keyed on the origin URL, so this shape only arises for a
+        // repository that has one.
+        let origin = "git@github.com:navikt/e2e-worktree.git";
+        git_cmd(&repo)
+            .args(["remote", "add", "origin", origin])
+            .output()
+            .expect("git remote add");
+        // The fixture paths are stable per label, so an earlier run's entry
+        // would make this one start out approved.
+        let _ = std::fs::remove_dir_all(config_file.parent().expect("cfg dir").join("trust"));
+
+        let parent = repo.parent().expect("parent").to_path_buf();
+        let same = parent.join("e2e-worktree-same");
+        let changed = parent.join("e2e-worktree-changed");
+        let twin = parent.join("e2e-worktree-twin");
+        for dir in [&same, &changed, &twin] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        for (branch, dir) in [("wt-same", &same), ("wt-changed", &changed)] {
+            git_cmd(&repo)
+                .args(["worktree", "add", "--quiet", "-b", branch])
+                .arg(dir)
+                .output()
+                .expect("git worktree add");
+        }
+
+        // The other worktree's branch asks for something else, so its committed
+        // proposals hash differently.
+        std::fs::write(
+            changed.join(".cplt.toml"),
+            "[propose]\nallow_docker = true\n",
+        )
+        .expect("write .cplt.toml");
+        git_cmd(&changed)
+            .args(["add", ".cplt.toml"])
+            .output()
+            .expect("git add");
+        git_cmd(&changed)
+            .args([
+                "-c",
+                "commit.gpgSign=false",
+                "commit",
+                "-m",
+                "change proposals",
+                "--quiet",
+            ])
+            .output()
+            .expect("git commit");
+
+        // A separate repository that forges the same origin and commits the
+        // same proposals — the confused-deputy case the path binding exists for.
+        std::fs::create_dir_all(&twin).expect("mkdir");
+        for args in [
+            vec!["init", "--quiet"],
+            vec!["config", "user.email", "test@test.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["remote", "add", "origin", origin],
+        ] {
+            git_cmd(&twin).args(&args).output().expect("git setup");
+        }
+        std::fs::write(
+            twin.join(".cplt.toml"),
+            "[propose]\nallow_localhost_any = true\n",
+        )
+        .expect("write .cplt.toml");
+        git_cmd(&twin)
+            .args(["add", ".cplt.toml"])
+            .output()
+            .expect("git add");
+        git_cmd(&twin)
+            .args([
+                "-c",
+                "commit.gpgSign=false",
+                "commit",
+                "-m",
+                "init",
+                "--quiet",
+            ])
+            .output()
+            .expect("git commit");
+
+        let show = |dir: &Path| {
+            let out = trust_cmd(dir, &config_file)
+                .args(["trust"])
+                .output()
+                .expect("run cplt trust");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let status_of = |stdout: &str, key: &str| {
+            stdout
+                .lines()
+                .find(|l| l.contains(key))
+                .unwrap_or_default()
+                .to_string()
+        };
+
+        let out = trust_cmd(&repo, &config_file)
+            .args(["trust", "accept", "--all"])
+            .output()
+            .expect("run cplt trust accept");
+        assert!(
+            out.status.success(),
+            "accept in the main checkout should succeed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // The worktree on the same proposals is already covered.
+        let stdout = show(&same);
+        let line = status_of(&stdout, "allow_localhost_any");
+        assert!(
+            line.contains('✓') || line.contains("approved"),
+            "a worktree of the approved repository must inherit the approval: {stdout}"
+        );
+        assert!(
+            !stdout.contains("not auto-trusted here"),
+            "and must not be reported as a foreign checkout: {stdout}"
+        );
+
+        // ... and approving there is a no-op, not the old refusal.
+        let out = trust_cmd(&same, &config_file)
+            .args(["trust", "accept", "--all"])
+            .output()
+            .expect("run cplt trust accept");
+        assert!(
+            out.status.success(),
+            "approving in a worktree must not be refused: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // A branch that changed the proposals still has to be reviewed.
+        let stdout = show(&changed);
+        let line = status_of(&stdout, "allow_docker");
+        assert!(
+            line.contains('○') || line.contains("pending"),
+            "a worktree whose proposals differ must still prompt: {stdout}"
+        );
+
+        // A different repository claiming the same origin must not inherit it,
+        // even though its proposals are byte-identical.
+        let stdout = show(&twin);
+        let line = status_of(&stdout, "allow_localhost_any");
+        assert!(
+            line.contains('○') || line.contains("pending"),
+            "a different repository must not inherit the approval: {stdout}"
+        );
+        assert!(
+            stdout.contains("not auto-trusted here"),
+            "and must be told why: {stdout}"
+        );
+
+        for dir in [&same, &changed, &twin, &repo] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
     #[test]
     fn e2e_trust_show_displays_proposals() {
         let (repo, config_file) = make_trust_repo(

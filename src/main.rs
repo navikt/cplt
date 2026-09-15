@@ -2221,9 +2221,9 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                                 t.repo.path.clone()
                             };
                             ui::warn(&format!(
-                                ".cplt.toml for this remote was approved at a different path \
-                                 ({where_approved}), so cplt is not auto-trusting it here. \
-                                 Re-approve with `cplt trust accept`.",
+                                ".cplt.toml for this remote was approved in a different \
+                                 repository ({where_approved}), so cplt is not auto-trusting \
+                                 it here. Re-approve with `cplt trust accept`.",
                             ));
                         }
                         Vec::new()
@@ -7802,6 +7802,14 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
         println!();
     }
 
+    // Whether the stored entry applies to the repository in front of us. The
+    // launch gate drops every key when it does not, so showing them as approved
+    // — which this did, above a warning saying they were not auto-trusted —
+    // told the user the opposite of what the next run would do.
+    let entry_applies = trust_entry
+        .as_ref()
+        .is_some_and(|t| trust::approved_path_matches(t, project_dir));
+
     // Check if proposals have changed since approval (content hash mismatch)
     let hash_mismatch = trust_entry.as_ref().is_some_and(|t| {
         !t.accepted.content_hash.is_empty() && {
@@ -7812,6 +7820,7 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
 
     // Proposals
     let all_approved = !hash_mismatch
+        && entry_applies
         && !proposed.is_empty()
         && proposed.iter().all(|&key| {
             trust_entry
@@ -7838,6 +7847,7 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
         println!("{blue}[cplt]{nc}  {yellow}[allow]{nc} {section_label}");
         for &key in &proposed {
             let approved = !hash_mismatch
+                && entry_applies
                 && trust_entry
                     .as_ref()
                     .is_some_and(|t| trust::is_key_approved(t, key));
@@ -7884,12 +7894,12 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
             }
         }
 
-        // Finding 4: approval is bound to the local checkout path. If this repo's
-        // origin matches a trusted entry but sits at a different path, the keys
-        // shown above will NOT auto-apply — surface that honestly.
-        if !trust::approved_path_matches(entry, project_dir) {
+        // Finding 4: approval is bound to the repository it was granted in. If
+        // this origin matches a trusted entry but the checkout belongs to some
+        // other repository, the keys above will NOT auto-apply — say so.
+        if !entry_applies {
             println!(
-                "{blue}[cplt]{nc}  {red}⚠ Approved at a different path ({}), not auto-trusted here.{nc}",
+                "{blue}[cplt]{nc}  {red}⚠ Approved in a different repository ({}), not auto-trusted here.{nc}",
                 if entry.repo.path.is_empty() {
                     "unrecorded"
                 } else {
@@ -7898,7 +7908,7 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
             );
             if blocked.is_none() {
                 println!(
-                    "{blue}[cplt]{nc}  {red}  Run `cplt trust accept` to approve at this path.{nc}"
+                    "{blue}[cplt]{nc}  {red}  Run `cplt trust accept` to approve this repository.{nc}"
                 );
             }
         }
@@ -8092,35 +8102,42 @@ fn trust_accept(
 
     // Finding 4, write side: the trust file is keyed on the git origin URL alone,
     // which any repo can forge (`git remote set-url origin <victim>`). The launch
-    // path binds an approval to the local checkout path; this one must too, or
-    // accepting one innocuous key here would both retain the victim's approved
-    // keys (laundering a foreign approval into this checkout) and overwrite their
-    // entry. Refuse while their recorded path still resolves — trust is one entry
-    // per origin, so there is nowhere else to put ours. A path that cannot be
-    // resolved (moved, deleted, unmounted, unreadable ancestor) leaves the entry
-    // orphaned, and an empty one is a legacy entry, so both may be taken over.
+    // path binds an approval to the repository it was granted in; this one must
+    // too, or accepting one innocuous key here would both retain the victim's
+    // approved keys (laundering a foreign approval into this checkout) and
+    // overwrite their entry. Refuse while their recorded repository still
+    // resolves — trust is one entry per origin, so there is nowhere else to put
+    // ours. A repository that cannot be resolved (moved, deleted, unmounted,
+    // unreadable ancestor) leaves the entry orphaned and up for grabs.
+    //
+    // The repository, not the recorded checkout path: a worktree workflow
+    // deletes checkouts routinely, and judging liveness by the path would hand a
+    // foreign clone an entry that still covers the main checkout and every other
+    // worktree of it (#516).
     //
     // The escape hatch is not what makes this safe: `carried` below drops the
     // stored keys whenever `approved_path_matches` fails, and that fails closed on
-    // any canonicalize error. So making the recorded path unresolvable — including
-    // by racing this check against the save — yields an entry holding only the keys
-    // the user approves right now. That is denial of service plus a forced
-    // re-approval for the owner, never an inherited grant.
+    // any resolution error. So making the recorded repository unresolvable —
+    // including by racing this check against the save — yields an entry holding
+    // only the keys the user approves right now. That is denial of service plus a
+    // forced re-approval for the owner, never an inherited grant.
     //
-    // The recovery advice depends on `trust_revoke` having NO path check: revoking
+    // The recovery advice depends on `trust_revoke` having NO such check: revoking
     // here deletes this origin's entry whatever checkout it was granted at. Adding
-    // a path check there would strand the user, so don't. Pathless revoke is safe
-    // in its own right — it only ever de-escalates, and the owner re-approves
-    // against their own current proposal.
+    // one there would strand the user, so don't. Unconditional revoke is safe in
+    // its own right — it only ever de-escalates, and the owner re-approves against
+    // their own current proposal.
     if let Some(t) = &stored
         && !trust::approved_path_matches(t, project_dir)
-        && std::fs::canonicalize(&t.repo.path).is_ok()
+        && !trust::approval_is_orphaned(t)
     {
         ui::error(&format!(
-            "This repository's origin is already trusted for a different checkout ({}).\n  \
+            "This origin is already trusted for a different repository, checked out at {}.\n  \
              Approvals are stored per origin, so approving here would overwrite that one.\n  \
-             To approve here instead, drop that approval first: run `cplt trust revoke --all`\n  \
-             here, or in that checkout if it is still the repository you approved.",
+             Worktrees of the approved repository do not need this — they are already\n  \
+             covered. To approve here instead, drop that approval first: run\n  \
+             `cplt trust revoke --all` here, or in that checkout if it is still the\n  \
+             repository you approved.",
             t.repo.path
         ));
         return ExitCode::FAILURE;
@@ -8302,16 +8319,18 @@ no longer apply"
     // carried — so the accepted set is then exactly `keys_to_accept`.
     let mut entry = carried.unwrap_or_default();
 
-    // Set identity
-    entry.repo.path = project_dir.to_string_lossy().into_owned();
-    if entry.repo.remote.is_empty()
+    // Set identity. The git dir is re-recorded on every approval, so an entry
+    // whose repository moved is re-bound by the approval that follows.
+    let mut remote = entry.repo.remote.clone();
+    if remote.is_empty()
         && let Some(output) = cplt::git::command(project_dir, &["remote", "get-url", "origin"])
             .and_then(|mut c| c.output().ok())
         && output.status.success()
         && let Ok(url) = String::from_utf8(output.stdout)
     {
-        entry.repo.remote = trust::normalize_remote_url(url.trim());
+        remote = trust::normalize_remote_url(url.trim());
     }
+    entry.repo = trust::approved_identity(project_dir, &remote);
 
     // Add new keys (don't duplicate)
     for key in &keys_to_accept {
