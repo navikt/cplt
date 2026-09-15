@@ -62,6 +62,23 @@ const PACKAGE_REGISTRY_DOMAINS: &[&str] = &[
 /// the issue's `*.githubcopilot.com` intends — and `actions.githubusercontent.com`
 /// covers `*.actions.githubusercontent.com`. Do not add a leading `*.`; the
 /// matcher does not interpret glob syntax.
+///
+/// MCP is already covered, and deliberately has no entry of its own. Checked
+/// against the shipped Copilot CLI 1.0.83 (`app.js` and the native
+/// `prebuilds/<platform>/runtime.node`), which carries exactly three MCP hosts:
+///
+/// - `api.mcp.github.com` — the MCP Registry client's base URL
+///   (`https://api.mcp.github.com/v0.1`, plus an `/enterprise` variant). A
+///   subdomain of `github.com`, so the bare entry below already matches it.
+/// - `api.githubcopilot.com/mcp` — the built-in `github-mcp-server`, a remote
+///   server rather than a local process. Under `githubcopilot.com`.
+/// - `api.enterprise.githubcopilot.com/mcp` — its GHEC variant. Same entry.
+///
+/// This is why there is no `mcp-proxy.anthropic.com` equivalent here: Anthropic
+/// puts its connector proxy on a host outside every other entry, GitHub does
+/// not. Removing the bare `github.com` entry, or narrowing it to
+/// `api.github.com`, would take the registry with it — hence the assertions in
+/// `copilot_default_domains_cover_subdomains_via_matcher`.
 const COPILOT_INFRA_DOMAINS: &[&str] = &[
     "githubcopilot.com",
     "api.github.com",
@@ -3812,6 +3829,23 @@ mod tests {
         ));
         assert!(crate::proxy::is_domain_match("github.com", &domains));
         assert!(!crate::proxy::is_domain_match("evil.com", &domains));
+
+        // Copilot's MCP hosts, read out of the shipped CLI 1.0.83. The registry
+        // is verified at startup and the built-in `github-mcp-server` is a
+        // remote server, so both are on the path to a working session — and
+        // both ride existing entries rather than entries of their own. Narrowing
+        // the bare `github.com` entry to `api.github.com` would silently take
+        // the registry away, which is what these pin.
+        for host in [
+            "api.mcp.github.com",
+            "api.githubcopilot.com",
+            "api.enterprise.githubcopilot.com",
+        ] {
+            assert!(
+                crate::proxy::is_domain_match(host, &domains),
+                "Copilot reaches {host} for MCP; the default allowlist must cover it"
+            );
+        }
     }
 
     #[test]
