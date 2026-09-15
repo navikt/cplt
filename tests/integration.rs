@@ -1297,6 +1297,26 @@ mod macos_tests {
         );
     }
 
+    /// A shell command that runs `git` against a fixture `$HOME` and nothing else
+    /// on the machine.
+    ///
+    /// Three sources have to be shut off, not just `$HOME`. `cd` leaves the
+    /// checkout, because `actions/checkout` writes an `[include]` into its
+    /// `.git/config` naming a credentials file under the runner's `_temp`, and a
+    /// `git` started inside the checkout follows it and dies on a path this
+    /// profile has no reason to grant. `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` and
+    /// `GIT_CONFIG_NOSYSTEM` close the env and `/etc` routes to the same thing.
+    /// Same rule as `git_cmd` in tests/common: the machine must not decide what
+    /// the fixture proves (#245).
+    fn git_in_fixture_home(home: &Path, git_cmd: &str) -> String {
+        format!(
+            "cd '{}' && env -u GIT_CONFIG_GLOBAL -u GIT_CONFIG_SYSTEM \
+             GIT_CONFIG_NOSYSTEM=1 HOME='{}' {git_cmd}",
+            home.display(),
+            home.display()
+        )
+    }
+
     /// Kernel truth for #515: a dotfiles-managed home, where `~/.gitconfig` is
     /// a symlink into a repo the user stows from. The SBPL rule names the link;
     /// the kernel checks the target. Before the fix every git command inside the
@@ -1332,7 +1352,7 @@ mod macos_tests {
         let opts = default_opts(&project, &home);
         let profile = write_real_profile(&opts);
 
-        let name_cmd = format!("HOME='{}' git config --get user.name 2>&1", home.display());
+        let name_cmd = git_in_fixture_home(&home, "git config --get user.name 2>&1");
         let (name_output, name_success) = run_sandboxed(&profile, &name_cmd);
         let creds_cmd = format!("cat '{}' 2>&1", home.join(".git-credentials").display());
         let (creds_output, creds_success) = run_sandboxed(&profile, &creds_cmd);
@@ -1359,10 +1379,7 @@ mod macos_tests {
 
         let opts = default_opts(&project, &home);
         let profile = write_real_profile(&opts);
-        let cmd = format!(
-            "HOME='{}' git config --get user.name; echo EXIT:$?",
-            home.display()
-        );
+        let cmd = git_in_fixture_home(&home, "git config --get user.name; echo EXIT:$?");
         let (output, _) = run_sandboxed(&profile, &cmd);
 
         fs::remove_file(&profile).ok();
