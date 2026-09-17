@@ -203,7 +203,9 @@ fn pnpm_has_store_alias(home_dir: &Path, pnpm: &Path) -> Result<bool, String> {
 fn pnpm_has_store_alias_in(pnpm: &Path, roots: &[PathBuf]) -> Result<bool, String> {
     use std::os::unix::fs::MetadataExt;
 
-    let source = std::fs::metadata(pnpm)
+    let pnpm = std::fs::canonicalize(pnpm)
+        .map_err(|e| format!("Cannot resolve pnpm executable {}: {e}", pnpm.display()))?;
+    let source = std::fs::metadata(&pnpm)
         .map_err(|e| format!("Cannot inspect pnpm executable {}: {e}", pnpm.display()))?;
     if !source.is_file() {
         return Ok(false);

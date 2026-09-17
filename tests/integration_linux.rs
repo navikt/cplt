@@ -218,7 +218,10 @@ mod linux_tests {
         use std::os::unix::fs::PermissionsExt;
 
         let project = create_test_project();
-        let home = tempfile::tempdir().expect("create fake home");
+        let home = tempfile::Builder::new()
+            .prefix(".cplt-pnpm-home-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("create fake home");
         let pnpm_home = home.path().join(".local/share/pnpm");
         let store = pnpm_home.join("store/v10/links/package");
         let package_manager_store = pnpm_home.join("package-manager-store/v10");
