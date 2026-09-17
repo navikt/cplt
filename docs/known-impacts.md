@@ -993,15 +993,14 @@ cplt                  # then work inside
 
 `mise x`, `mise exec` and an already-activated toolchain keep working — reading and executing what is already on disk was never restricted.
 
-**Relocated homes are followed, `XDG_DATA_HOME` for pnpm is not.** A custom `$PNPM_HOME` gets the same split posture (read-only top level, writable `store/`) through the same mechanism that keeps `$CARGO_HOME/bin` exec-only. But pnpm's store carve-out is spelled at the two default locations, so if you have moved `XDG_DATA_HOME` and use pnpm, add the store back explicitly:
+**Relocated homes are followed, `XDG_DATA_HOME` for pnpm is not.** A custom `$PNPM_HOME` gets the same split posture through the same mechanism that keeps `$CARGO_HOME/bin` exec-only: a read-only top level, writable non-executable `store/`, and writable executable `package-manager-store/`. If pnpm follows a custom `XDG_DATA_HOME`, set `PNPM_HOME` to that pnpm directory before launching cplt so all three rules move together:
 
-```toml
-# .cplt.toml
-[allow]
-write = ["~/my-xdg-data/pnpm/store"]   # only `~/` expands, not env vars
+```bash
+export PNPM_HOME="$XDG_DATA_HOME/pnpm"
+cplt
 ```
 
-**pnpm has two distinct execution paths.** If the `pnpm` on `PATH` shares an inode with `$PNPM_HOME/store/v*/links/*/pnpm`, cplt copies it to a per-session read-only shadow and puts that copy first on `PATH`. The writable content-addressable store remains non-executable; invoking its original absolute path is still denied. Separately, pnpm downloads and runs `packageManager`-pinned versions from `$PNPM_HOME/package-manager-store/`; that cache is deliberately writable and executable on both backends.
+**pnpm has two distinct execution paths.** cplt grants existing PATH executables under `$PNPM_HOME` individually instead of making the whole directory executable. If the selected `pnpm` shares an inode with `$PNPM_HOME/store/v*/links/*/pnpm`, cplt copies it to a per-session read-only shadow and uses that copy for PATH and direct invocations. The writable content-addressable store remains non-executable. Separately, pnpm downloads and runs `packageManager`-pinned versions from `$PNPM_HOME/package-manager-store/`; that cache is deliberately writable and executable on both backends.
 
 **Linux is weaker than macOS here.** For `~/.bun` and `~/.deno` it is not: those are enforced by *not granting* write to the parent, which Landlock expresses natively. mise is the other exception — its `shims/` and `installs/` sit inside a data dir that has to stay writable, and Landlock cannot deny a subpath inside an allowed tree. They are carried by the bubblewrap read-only overlay instead, so they hold only when `bwrap` is installed and only for directories that already exist. Without bubblewrap, the mise pair is unenforced on Linux. The two platforms deny the same tree: bwrap binds paths and takes no globs, which is where the whole-tree shape came from, and macOS now matches it.
 

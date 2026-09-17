@@ -1149,8 +1149,11 @@ pub const APP_DIRS: &[AppDir] = &[
         qualifier: "",
         organization: "",
         application: "pnpm",
-        process_exec: &[AppDirKind::Data, AppDirKind::DataLocal],
-        map_exec: &[AppDirKind::Data, AppDirKind::DataLocal],
+        // A recursive execute grant here would also make the writable `store/`
+        // executable under Landlock. The resolved pnpm binary gets an exact
+        // file grant, or a read-only shadow when it is hardlinked into store.
+        process_exec: &[],
+        map_exec: &[],
         // Config/Preference dirs (~/.config/pnpm, ~/Library/Preferences/pnpm) are
         // writable: pnpm reads and writes its settings (hoisting, virtual store state)
         // there during normal operation. These dirs contain no credentials.
@@ -1479,15 +1482,15 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
         map_exec: false,
         write: true,
     },
-    // pnpm global dir ($PNPM_HOME): the global shims sit directly in it and
-    // `pnpm setup` prepends it to PATH, so the top level is read-only. The
-    // content-addressable store one level down stays writable — every ordinary
-    // `pnpm install` hardlinks packages out of it, sandboxed or not.
+    // pnpm global dir ($PNPM_HOME): read-only and non-executable as a tree.
+    // The resolved pnpm executable gets an exact file grant, or a read-only
+    // shadow when it is hardlinked into store. The content-addressable store
+    // one level down stays writable for ordinary `pnpm install`.
     // macOS-native path not following conventions set out by AppDirs.
     HomeToolDir {
         path: "Library/pnpm",
-        process_exec: true,
-        map_exec: true,
+        process_exec: false,
+        map_exec: false,
         write: false,
     },
     // Must follow `Library/pnpm` (last-match-wins / ancestor union).

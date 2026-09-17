@@ -3693,6 +3693,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             copilot_install_dir: copilot_install_dir.as_deref(),
             electron_app_dir: electron_app_dir.as_deref(),
             announce_scratch: true,
+            pnpm_candidate: None,
         },
     )?;
 
@@ -4295,10 +4296,10 @@ fn resolve_exec_binary(name: &str) -> anyhow::Result<PathBuf> {
         let canonical = std::fs::canonicalize(&p).with_context(|| {
             format!("exec: binary not found or not accessible: {}", p.display())
         })?;
-        if canonical.is_file() {
+        if cplt::git::is_executable_file(&canonical) {
             return Ok(canonical);
         }
-        bail!("exec: not a file: {}", canonical.display());
+        bail!("exec: not an executable file: {}", canonical.display());
     }
     // Relative path (e.g. `./vendor-script.sh`) — resolve against cwd, not PATH.
     if name.contains('/') {
@@ -4306,16 +4307,25 @@ fn resolve_exec_binary(name: &str) -> anyhow::Result<PathBuf> {
         let canonical = std::fs::canonicalize(cwd.join(name)).with_context(|| {
             format!("exec: relative binary not found or not accessible: {name}")
         })?;
-        if canonical.is_file() {
+        if cplt::git::is_executable_file(&canonical) {
             return Ok(canonical);
         }
-        bail!("exec: not a file: {}", canonical.display());
+        bail!("exec: not an executable file: {}", canonical.display());
     }
-    let path_var = std::env::var("PATH").unwrap_or_default();
-    for dir in path_var.split(':') {
-        let candidate = PathBuf::from(dir).join(name);
-        if candidate.is_file() {
-            return Ok(candidate);
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    resolve_exec_binary_in_path(name, &path_var)
+}
+
+fn resolve_exec_binary_in_path(name: &str, path_var: &std::ffi::OsStr) -> anyhow::Result<PathBuf> {
+    for dir in std::env::split_paths(path_var) {
+        let candidate = dir.join(name);
+        if cplt::git::is_executable_file(&candidate) {
+            return std::fs::canonicalize(&candidate).with_context(|| {
+                format!(
+                    "exec: cannot resolve executable candidate {}",
+                    candidate.display()
+                )
+            });
         }
     }
     bail!("exec: '{name}' not found in PATH")
@@ -4484,6 +4494,8 @@ struct AssemblyOptions<'a> {
     /// Announce the scratch directory. The agent launch prints a summary; `exec`
     /// and `check` must keep their output clean for scripts and `--json`.
     announce_scratch: bool,
+    /// A pnpm path explicitly requested by `cplt exec`, if any.
+    pnpm_candidate: Option<&'a Path>,
 }
 
 /// A fully-built sandbox plus the live resources it depends on.
@@ -4586,9 +4598,13 @@ fn assemble_sandbox(
         None
     };
     let scratch_path = scratch_guard.as_ref().map(cplt::scratch::ScratchDir::path);
-    let pnpm_shadow_guard = resolve_exec_binary("pnpm")
-        .ok()
-        .map(|pnpm| scratch::PnpmShadowDir::create_if_needed(home_dir, &pnpm))
+    let pnpm = opts
+        .pnpm_candidate
+        .map(Path::to_path_buf)
+        .or_else(|| resolve_exec_binary("pnpm").ok());
+    let pnpm_shadow_guard = pnpm
+        .as_ref()
+        .map(|pnpm| scratch::PnpmShadowDir::create_if_needed(home_dir, pnpm))
         .transpose()
         .map_err(|error| anyhow::anyhow!("Cannot prepare pnpm executable: {error}"))?
         .flatten();
@@ -4688,7 +4704,16 @@ fn assemble_sandbox(
     );
 
     let mut extra_exec = resolved.allow_exec.clone();
+    extra_exec.extend(scratch::pnpm_path_executables(home_dir));
+    if pnpm_shadow_guard.is_none()
+        && let Some(pnpm) = pnpm
+        && scratch::pnpm_needs_exec_grant(home_dir, &pnpm)
+    {
+        extra_exec.push(pnpm);
+    }
     extra_exec.extend(pnpm_shadow_path.map(Path::to_path_buf));
+    extra_exec.sort();
+    extra_exec.dedup();
     let sandbox_config = build_sandbox_config(
         resolved,
         probe,
@@ -4846,6 +4871,7 @@ fn prepare_shell_sandbox(
             copilot_install_dir: None,
             electron_app_dir: None,
             announce_scratch: false,
+            pnpm_candidate: None,
         },
     )
 }
@@ -4882,6 +4908,16 @@ fn run_exec_command(
              Or:    cplt exec -c \"cmd && cmd\""
         );
     }
+
+    let requested_binary = if shell_cmd.is_none() {
+        Some(resolve_exec_binary(&cmd[0])?)
+    } else {
+        None
+    };
+    let pnpm_candidate = requested_binary.as_deref().filter(|path| {
+        path.file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("pnpm"))
+    });
 
     // Resolve config, paths, project dir — same pipeline as the main agent launch
     let ResolvedContext {
@@ -4965,14 +5001,23 @@ fn run_exec_command(
         #[cfg(target_os = "macos")]
             playwright_socket_guard: _playwright_socket_guard,
         ..
-    } = prepare_shell_sandbox(
-        cli,
-        &mut resolved,
-        config_path.as_ref(),
-        &home_dir,
-        &project_dir,
-        NamedRepos::new(&repo_paths, &repo_git_dirs, &repo_rows),
-    )?;
+    } = {
+        let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
+        assemble_sandbox(
+            cli,
+            &mut resolved,
+            config_path.as_ref(),
+            &probe,
+            AssemblyOptions {
+                agent: agent::Agent::Shell,
+                repos: NamedRepos::new(&repo_paths, &repo_git_dirs, &repo_rows),
+                copilot_install_dir: None,
+                electron_app_dir: None,
+                announce_scratch: false,
+                pnpm_candidate,
+            },
+        )?
+    };
 
     // Resolve the binary and args to pass to the sandbox.
     //
@@ -4991,18 +5036,18 @@ fn run_exec_command(
     } else {
         let bin = redirect_to_guard_shim(
             &cmd[0],
-            resolve_exec_binary(&cmd[0])?,
+            requested_binary.expect("non-shell exec resolved before sandbox assembly"),
             scratch_guard.as_ref().map(cplt::scratch::ScratchDir::path),
             resolved.gh_guard.enabled,
             resolved.git_guard.enabled,
         );
-        let bin = if cmd[0] == "pnpm" {
-            pnpm_shadow_guard
-                .as_ref()
-                .map_or(bin, cplt::scratch::PnpmShadowDir::binary)
-        } else {
-            bin
-        };
+        let bin = pnpm_shadow_guard.as_ref().map_or(bin.clone(), |shadow| {
+            if shadow.shadows(&bin) {
+                shadow.binary()
+            } else {
+                bin
+            }
+        });
         (bin, cmd[1..].to_vec())
     };
 
@@ -9088,6 +9133,26 @@ mod tests {
 
     fn parse(args: &[&str]) -> Cli {
         Cli::parse_from(std::iter::once("cplt").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn exec_path_lookup_skips_non_executable_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let blocked = first.path().join("pnpm");
+        let executable = second.path().join("pnpm");
+        std::fs::write(&blocked, "#!/bin/sh\n").unwrap();
+        std::fs::write(&executable, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = std::env::join_paths([first.path(), second.path()]).unwrap();
+
+        assert_eq!(
+            resolve_exec_binary_in_path("pnpm", &path).unwrap(),
+            executable.canonicalize().unwrap()
+        );
     }
 
     #[test]

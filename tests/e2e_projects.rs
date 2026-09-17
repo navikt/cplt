@@ -441,7 +441,8 @@ fun main() {
             .expect("write fake pnpm");
         fs::set_permissions(&pnpm, fs::Permissions::from_mode(0o755))
             .expect("make fake pnpm executable");
-        fs::hard_link(&pnpm, links.join("pnpm")).expect("hardlink pnpm into store");
+        let store_pnpm = links.join("pnpm");
+        fs::hard_link(&pnpm, &store_pnpm).expect("hardlink pnpm into store");
         let path = format!("{}:/usr/bin:/bin", global.display());
 
         for args in [vec!["exec", "--", "pnpm"], vec!["exec", "-c", "pnpm"]] {
@@ -463,6 +464,28 @@ fun main() {
             assert!(
                 stdout.contains("RESULT:pnpm:") && stdout.contains(".cplt-pnpm-shadow"),
                 "pnpm must resolve to the cplt-owned shadow: {stdout}"
+            );
+        }
+
+        for direct in [&pnpm, &store_pnpm] {
+            let output = cplt_cmd()
+                .args(["--yes", "--no-validate", "--quiet"])
+                .args(["--project-dir", &project.canonical_path().to_string_lossy()])
+                .args(["exec", "--", &direct.to_string_lossy()])
+                .current_dir(project.path())
+                .env("HOME", home.path())
+                .env("PATH", "/usr/bin:/bin")
+                .output()
+                .expect("cplt should run direct pnpm path");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "direct pnpm path should run through its shadow.\nstdout: {stdout}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                stdout.contains(".cplt-pnpm-shadow"),
+                "direct pnpm path must resolve to the cplt-owned shadow: {stdout}"
             );
         }
     }
@@ -518,6 +541,41 @@ fun main() {
             stdout.contains("RESULT:pinned:OK"),
             "custom package-manager-store must remain executable: {stdout}"
         );
+    }
+
+    #[test]
+    fn pnpm_home_binary_gets_an_exact_execute_grant() {
+        require_sandbox!();
+        use std::os::unix::fs::PermissionsExt;
+
+        let project = TempProject::scaffold_node();
+        let home = tempfile::Builder::new()
+            .prefix(".cplt-e2e-pnpm-exec-home-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("create home");
+        let pnpm_home = home.path().join("Library/pnpm");
+        fs::create_dir_all(&pnpm_home).expect("create pnpm home");
+        let pnpm = pnpm_home.join("pnpm");
+        fs::write(&pnpm, "#!/bin/sh\nprintf 'RESULT:pnpm:OK\\n'\n").expect("write pnpm");
+        fs::set_permissions(&pnpm, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let output = cplt_cmd()
+            .args(["--yes", "--no-validate", "--quiet"])
+            .args(["--project-dir", &project.canonical_path().to_string_lossy()])
+            .args(["exec", "-c", "pnpm"])
+            .current_dir(project.path())
+            .env("HOME", home.path())
+            .env("PNPM_HOME", &pnpm_home)
+            .env("PATH", format!("{}:/usr/bin:/bin", pnpm_home.display()))
+            .output()
+            .expect("cplt should run pnpm");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "pnpm should run through its exact file grant.\nstdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(stdout.contains("RESULT:pnpm:OK"), "{stdout}");
     }
 
     // ── File operations script builder ─────────────────────────────

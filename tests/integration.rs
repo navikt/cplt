@@ -505,8 +505,14 @@ mod macos_tests {
     #[test]
     fn real_profile_runs_pnpm_shadow_without_executing_the_store() {
         require_sandbox!();
-        let project = tempfile::tempdir().expect("create project");
-        let home = tempfile::tempdir().expect("create home");
+        let project = tempfile::Builder::new()
+            .prefix(".cplt-pnpm-project-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("create project");
+        let home = tempfile::Builder::new()
+            .prefix(".cplt-pnpm-home-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("create home");
         let global = home.path().join("Library/pnpm/global/v11");
         let store = home
             .path()

@@ -3886,6 +3886,12 @@ fn profile_keeps_the_sibling_package_and_cache_trees_writable() {
 #[test]
 fn profile_keeps_pnpm_store_non_executable_and_allows_version_store() {
     let p = default_profile();
+    for path in ["/Users/test/Library/pnpm", "/Users/test/.local/share/pnpm"] {
+        assert!(
+            !p.contains(&format!("(allow process-exec (subpath \"{path}\"))")),
+            "{path} must not recursively grant execution into its writable store"
+        );
+    }
     for path in [
         "/Users/test/Library/pnpm/store",
         "/Users/test/.local/share/pnpm/store",
@@ -3981,6 +3987,10 @@ fn pnpm_app_dir_does_not_grant_write_to_its_data_dir() {
     assert!(
         pnpm.read_paths(home).contains(&data),
         "the pnpm data dir must stay readable"
+    );
+    assert!(
+        !pnpm.process_exec_paths(home).contains(&data),
+        "a parent execute grant would make the writable store executable under Landlock"
     );
 }
 
@@ -8458,7 +8468,7 @@ fn resolve_reroots_split_pnpm_permissions() {
 
     let pnpm_home = tool_dir("Library/pnpm").resolve(home, &roots);
     assert_eq!(pnpm_home.path, root);
-    assert!(pnpm_home.dir.process_exec && !pnpm_home.dir.write);
+    assert!(!pnpm_home.dir.process_exec && !pnpm_home.dir.write);
 
     let store = tool_dir("Library/pnpm/store").resolve(home, &roots);
     assert_eq!(store.path, root.join("store"));

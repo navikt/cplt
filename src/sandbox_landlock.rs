@@ -2967,15 +2967,23 @@ mod tests {
         let project = PathBuf::from("/home/user/project");
         let home = PathBuf::from("/home/user");
         let policy = generate_policy(&test_config(&project, &home));
-
-        for rel in ["Library/pnpm/store", ".local/share/pnpm/store"] {
-            let rule = policy
+        let effective_access = |path: &Path| {
+            policy
                 .fs_rules
                 .iter()
-                .find(|r| r.path == home.join(rel))
-                .unwrap_or_else(|| panic!("{rel} must be in the policy"));
+                .filter(|rule| path.starts_with(&rule.path))
+                .fold(FsAccess::default(), |mut access, rule| {
+                    access.read |= rule.access.read;
+                    access.write |= rule.access.write;
+                    access.execute |= rule.access.execute;
+                    access
+                })
+        };
+
+        for rel in ["Library/pnpm/store", ".local/share/pnpm/store"] {
+            let access = effective_access(&home.join(rel));
             assert!(
-                rule.access.read && rule.access.write && !rule.access.execute,
+                access.read && access.write && !access.execute,
                 "{rel} must remain writable but non-executable"
             );
         }
@@ -2983,13 +2991,9 @@ mod tests {
             "Library/pnpm/package-manager-store",
             ".local/share/pnpm/package-manager-store",
         ] {
-            let rule = policy
-                .fs_rules
-                .iter()
-                .find(|r| r.path == home.join(rel))
-                .unwrap_or_else(|| panic!("{rel} must be in the policy"));
+            let access = effective_access(&home.join(rel));
             assert!(
-                rule.access.read && rule.access.write && rule.access.execute,
+                access.read && access.write && access.execute,
                 "{rel} must be writable and executable for pnpm self-management"
             );
         }

@@ -61,6 +61,9 @@ pub struct PnpmShadowDir {
     path: PathBuf,
     device: u64,
     inode: u64,
+    source_device: u64,
+    source_inode: u64,
+    _lock: std::fs::File,
 }
 
 impl PnpmShadowDir {
@@ -69,6 +72,9 @@ impl PnpmShadowDir {
         if !pnpm_has_store_alias(home_dir, pnpm)? {
             return Ok(None);
         }
+        use std::os::unix::fs::MetadataExt;
+        let source = std::fs::metadata(pnpm)
+            .map_err(|e| format!("Cannot inspect pnpm executable {}: {e}", pnpm.display()))?;
 
         let base = home_dir.join(PNPM_SHADOW_BASE);
         match base.symlink_metadata() {
@@ -98,7 +104,9 @@ impl PnpmShadowDir {
                 canonical_home.join(PNPM_SHADOW_BASE).display()
             ));
         }
-        validate_dir_safety(&canonical_base, "pnpm shadow base")?;
+        let base_identity = secure_dir_identity(&canonical_base, "pnpm shadow base")?;
+        let base_file = lock_pnpm_shadow_base(&canonical_base, base_identity)?;
+        gc_stale_pnpm_shadows(&canonical_base, &base_file);
 
         let session_dir = canonical_base.join(generate_session_id()?);
         create_secure_dir(&session_dir, "pnpm shadow dir")?;
@@ -109,13 +117,30 @@ impl PnpmShadowDir {
             return Err(error);
         }
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&session_dir, std::fs::Permissions::from_mode(0o500))
-            .map_err(|e| format!("Cannot make pnpm shadow read-only: {e}"))?;
+        if let Err(error) =
+            std::fs::set_permissions(&session_dir, std::fs::Permissions::from_mode(0o500))
+        {
+            let _ = std::fs::remove_dir_all(&session_dir);
+            return Err(format!("Cannot make pnpm shadow read-only: {error}"));
+        }
+        let session_lock = match lock_pnpm_shadow_session(&session_dir, identity) {
+            Ok(lock) => lock,
+            Err(error) => {
+                let _ =
+                    std::fs::set_permissions(&session_dir, std::fs::Permissions::from_mode(0o700));
+                let _ = std::fs::remove_dir_all(&session_dir);
+                return Err(error);
+            }
+        };
+        drop(base_file);
 
         Ok(Some(Self {
             path: session_dir,
             device: identity.0,
             inode: identity.1,
+            source_device: source.dev(),
+            source_inode: source.ino(),
+            _lock: session_lock,
         }))
     }
 
@@ -127,6 +152,17 @@ impl PnpmShadowDir {
     /// Copied pnpm executable used for direct `cplt exec -- pnpm` launches.
     pub fn binary(&self) -> PathBuf {
         self.path.join("pnpm")
+    }
+
+    /// Whether `path` names the source inode copied into this shadow.
+    pub fn shadows(&self, path: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+
+        std::fs::metadata(path).is_ok_and(|metadata| {
+            metadata.is_file()
+                && metadata.dev() == self.source_device
+                && metadata.ino() == self.source_inode
+        })
     }
 }
 
@@ -157,21 +193,10 @@ fn copy_executable(source: &Path, destination: &Path) -> Result<(), String> {
 }
 
 fn pnpm_has_store_alias(home_dir: &Path, pnpm: &Path) -> Result<bool, String> {
-    let mut roots = vec![
-        home_dir.join("Library/pnpm/store"),
-        home_dir.join(".local/share/pnpm/store"),
-    ];
-    if let Some(pnpm_home) = std::env::var_os("PNPM_HOME").filter(|value| !value.is_empty()) {
-        let pnpm_home = PathBuf::from(pnpm_home);
-        let pnpm_home = if pnpm_home.is_absolute() {
-            pnpm_home
-        } else {
-            home_dir.join(pnpm_home)
-        };
-        roots.push(pnpm_home.join("store"));
-    }
-    roots.sort();
-    roots.dedup();
+    let roots: Vec<PathBuf> = pnpm_home_roots(home_dir)
+        .into_iter()
+        .filter_map(|root| std::fs::canonicalize(root.join("store")).ok())
+        .collect();
     pnpm_has_store_alias_in(pnpm, &roots)
 }
 
@@ -180,11 +205,17 @@ fn pnpm_has_store_alias_in(pnpm: &Path, roots: &[PathBuf]) -> Result<bool, Strin
 
     let source = std::fs::metadata(pnpm)
         .map_err(|e| format!("Cannot inspect pnpm executable {}: {e}", pnpm.display()))?;
-    if !source.is_file() || source.nlink() < 2 {
+    if !source.is_file() {
         return Ok(false);
     }
 
     for root in roots {
+        if pnpm.starts_with(root) {
+            return Ok(true);
+        }
+        if source.nlink() < 2 {
+            continue;
+        }
         let Ok(versions) = std::fs::read_dir(root) else {
             continue;
         };
@@ -212,6 +243,252 @@ fn pnpm_has_store_alias_in(pnpm: &Path, roots: &[PathBuf]) -> Result<bool, Strin
         }
     }
     Ok(false)
+}
+
+fn lock_pnpm_shadow_base(
+    base: &Path,
+    expected_identity: (u64, u64),
+) -> Result<std::fs::File, String> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let base_file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(base)
+        .map_err(|error| format!("Cannot open pnpm shadow base {}: {error}", base.display()))?;
+    let metadata = base_file.metadata().map_err(|error| {
+        format!(
+            "Cannot inspect pnpm shadow base {}: {error}",
+            base.display()
+        )
+    })?;
+    if (metadata.dev(), metadata.ino()) != expected_identity {
+        return Err(format!(
+            "pnpm shadow base {} changed while it was being opened",
+            base.display()
+        ));
+    }
+    // SAFETY: `base_file` owns a valid descriptor. The advisory lock is
+    // released automatically when the file is dropped.
+    if unsafe { libc::flock(base_file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(format!(
+            "Cannot lock pnpm shadow base {}: {}",
+            base.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(base_file)
+}
+
+fn lock_pnpm_shadow_session(
+    path: &Path,
+    expected_identity: (u64, u64),
+) -> Result<std::fs::File, String> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let session = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| format!("Cannot open pnpm shadow {}: {error}", path.display()))?;
+    let metadata = session
+        .metadata()
+        .map_err(|error| format!("Cannot inspect pnpm shadow {}: {error}", path.display()))?;
+    if (metadata.dev(), metadata.ino()) != expected_identity {
+        return Err(format!(
+            "pnpm shadow {} changed while it was being opened",
+            path.display()
+        ));
+    }
+    // SAFETY: `session` owns a valid descriptor. Keeping this shared lock for
+    // the guard's lifetime prevents garbage collection of a live shadow.
+    if unsafe { libc::flock(session.as_raw_fd(), libc::LOCK_SH) } != 0 {
+        return Err(format!(
+            "Cannot lock pnpm shadow {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(session)
+}
+
+fn gc_stale_pnpm_shadows(base: &Path, base_file: &std::fs::File) {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
+    };
+    let now = SystemTime::now();
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if !is_session_id(name_str) {
+            continue;
+        }
+        let Ok(c_name) = std::ffi::CString::new(name.as_bytes()) else {
+            continue;
+        };
+        // SAFETY: `base_file` remains open for the call, `c_name` is
+        // NUL-terminated, and openat returns a new owned descriptor on success.
+        let child_fd = unsafe {
+            libc::openat(
+                base_file.as_raw_fd(),
+                c_name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if child_fd < 0 {
+            continue;
+        }
+        // SAFETY: `child_fd` was returned by openat and ownership transfers to File.
+        let child = unsafe { std::fs::File::from_raw_fd(child_fd) };
+        // SAFETY: `child` owns a valid descriptor. A live shadow keeps a
+        // shared lock, so cleanup skips it even after the stale-age threshold.
+        if unsafe { libc::flock(child.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            continue;
+        }
+        let Ok(metadata) = child.metadata() else {
+            continue;
+        };
+        if metadata.uid() != unsafe { libc::getuid() } {
+            continue;
+        }
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+        if age <= STALE_AGE {
+            continue;
+        }
+        if child
+            .set_permissions(std::fs::Permissions::from_mode(0o700))
+            .is_err()
+        {
+            continue;
+        }
+
+        let pnpm = c"pnpm";
+        // SAFETY: both descriptors and C strings are valid for the calls. All
+        // operations are anchored to the validated directory descriptors, so
+        // replacing the base pathname cannot redirect cleanup elsewhere.
+        unsafe {
+            libc::unlinkat(child.as_raw_fd(), pnpm.as_ptr(), 0);
+        }
+        // SAFETY: same as above; AT_REMOVEDIR removes only the opened base's
+        // immediate UUID-named child and fails if unexpected entries remain.
+        let removed =
+            unsafe { libc::unlinkat(base_file.as_raw_fd(), c_name.as_ptr(), libc::AT_REMOVEDIR) };
+        if removed != 0 {
+            ui::warn(&format!(
+                "Warning: cannot remove stale pnpm shadow {}",
+                base.join(name).display()
+            ));
+        }
+    }
+}
+
+/// pnpm data roots that can contain executable shims and writable stores.
+pub fn pnpm_home_roots(home_dir: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![
+        home_dir.join("Library/pnpm"),
+        home_dir.join(".local/share/pnpm"),
+    ];
+    if let Some(xdg_data_home) = std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty())
+    {
+        let xdg_data_home = PathBuf::from(xdg_data_home);
+        roots.push(if xdg_data_home.is_absolute() {
+            xdg_data_home.join("pnpm")
+        } else {
+            home_dir.join(xdg_data_home).join("pnpm")
+        });
+    }
+    if let Some(pnpm_home) = std::env::var_os("PNPM_HOME").filter(|value| !value.is_empty()) {
+        let pnpm_home = PathBuf::from(pnpm_home);
+        roots.push(if pnpm_home.is_absolute() {
+            pnpm_home
+        } else {
+            home_dir.join(pnpm_home)
+        });
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+/// Whether a pnpm executable needs an exact file-level execute grant.
+pub fn pnpm_needs_exec_grant(home_dir: &Path, pnpm: &Path) -> bool {
+    let roots: Vec<PathBuf> = pnpm_home_roots(home_dir)
+        .into_iter()
+        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .collect();
+    pnpm_exec_grant_allowed(pnpm, &roots)
+}
+
+fn pnpm_exec_grant_allowed(pnpm: &Path, roots: &[PathBuf]) -> bool {
+    if roots.iter().any(|root| {
+        pnpm.starts_with(root.join("store")) || pnpm.starts_with(root.join("package-manager-store"))
+    }) {
+        return false;
+    }
+    roots.iter().any(|root| pnpm.starts_with(root))
+}
+
+/// Existing PATH executables inside pnpm homes that can be granted exactly.
+///
+/// Directory-wide execution would also cover the writable content store.
+/// Hardlinked files and targets inside either writable store are excluded.
+pub fn pnpm_path_executables(home_dir: &Path) -> Vec<PathBuf> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    pnpm_path_executables_in(home_dir, &path)
+}
+
+fn pnpm_path_executables_in(home_dir: &Path, path: &std::ffi::OsStr) -> Vec<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+
+    let roots: Vec<PathBuf> = pnpm_home_roots(home_dir)
+        .into_iter()
+        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .collect();
+    let mut executables = Vec::new();
+
+    for dir in std::env::split_paths(path) {
+        let Ok(dir) = std::fs::canonicalize(dir) else {
+            continue;
+        };
+        if !roots.iter().any(|root| dir.starts_with(root)) {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let candidate = entry.path();
+            if !crate::git::is_executable_file(&candidate) {
+                continue;
+            }
+            let Ok(candidate) = std::fs::canonicalize(candidate) else {
+                continue;
+            };
+            if !pnpm_exec_grant_allowed(&candidate, &roots) {
+                continue;
+            }
+            let Ok(metadata) = std::fs::metadata(&candidate) else {
+                continue;
+            };
+            if metadata.nlink() == 1 && !executables.contains(&candidate) {
+                executables.push(candidate);
+            }
+        }
+    }
+    executables
 }
 
 impl ScratchDir {
@@ -692,9 +969,30 @@ mod tests {
                 & 0o777,
             0o500
         );
+        assert!(shadow.shadows(&pnpm));
+        assert!(shadow.shadows(&links.join("pnpm")));
+        assert!(!shadow.shadows(&shadow_path));
         let session_path = shadow.path().to_path_buf();
         drop(shadow);
         assert!(!session_path.exists());
+    }
+
+    #[test]
+    fn pnpm_executed_directly_from_store_always_uses_a_shadow() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let store = home.path().join("Library/pnpm/store/v10/links/package");
+        std::fs::create_dir_all(&store).unwrap();
+        let pnpm = store.join("pnpm");
+        std::fs::write(&pnpm, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&pnpm, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            PnpmShadowDir::create_if_needed(home.path(), &pnpm)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -740,6 +1038,57 @@ mod tests {
     }
 
     #[test]
+    fn pnpm_shadow_removes_only_stale_owned_sessions() {
+        let home = tempfile::tempdir().unwrap();
+        let base = home.path().join(PNPM_SHADOW_BASE);
+        create_secure_dir(&base, "pnpm shadow base").unwrap();
+        let identity = secure_dir_identity(&base, "pnpm shadow base").unwrap();
+        let stale = base.join("0123456789abcdef0123456789abcdef");
+        let fresh = base.join("fedcba9876543210fedcba9876543210");
+        create_secure_dir(&stale, "stale shadow").unwrap();
+        create_secure_dir(&fresh, "fresh shadow").unwrap();
+        std::fs::write(stale.join("pnpm"), b"stale").unwrap();
+        std::fs::write(fresh.join("pnpm"), b"fresh").unwrap();
+        let stale_time = SystemTime::now() - STALE_AGE - Duration::from_secs(1);
+        std::fs::File::open(&stale)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(stale_time))
+            .unwrap();
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o500)).unwrap();
+        std::fs::set_permissions(&fresh, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let base_file = lock_pnpm_shadow_base(&base, identity).unwrap();
+        gc_stale_pnpm_shadows(&base, &base_file);
+
+        assert!(!stale.exists());
+        assert!(fresh.exists());
+    }
+
+    #[test]
+    fn pnpm_shadow_keeps_a_locked_live_session_past_stale_age() {
+        let home = tempfile::tempdir().unwrap();
+        let base = home.path().join(PNPM_SHADOW_BASE);
+        create_secure_dir(&base, "pnpm shadow base").unwrap();
+        let base_identity = secure_dir_identity(&base, "pnpm shadow base").unwrap();
+        let live = base.join("0123456789abcdef0123456789abcdef");
+        create_secure_dir(&live, "live shadow").unwrap();
+        std::fs::write(live.join("pnpm"), b"live").unwrap();
+        let live_identity = secure_dir_identity(&live, "live shadow").unwrap();
+        let _live_lock = lock_pnpm_shadow_session(&live, live_identity).unwrap();
+        let stale_time = SystemTime::now() - STALE_AGE - Duration::from_secs(1);
+        std::fs::File::open(&live)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(stale_time))
+            .unwrap();
+        std::fs::set_permissions(&live, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let base_file = lock_pnpm_shadow_base(&base, base_identity).unwrap();
+        gc_stale_pnpm_shadows(&base, &base_file);
+
+        assert!(live.exists());
+    }
+
+    #[test]
     fn pnpm_shadow_follows_custom_pnpm_home() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -758,6 +1107,85 @@ mod tests {
             pnpm_has_store_alias_in(&pnpm, &[pnpm_home.join("store")]).unwrap(),
             "a custom PNPM_HOME store alias must be detected"
         );
+    }
+
+    #[test]
+    fn pnpm_path_grants_only_non_hardlinked_executables() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let pnpm_home = home.path().join("Library/pnpm");
+        let bin = pnpm_home.join("global/bin");
+        let store = pnpm_home.join("store/v10/links/package");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&store).unwrap();
+
+        let safe = bin.join("safe-tool");
+        let linked = bin.join("linked-tool");
+        std::fs::write(&safe, b"#!/bin/sh\n").unwrap();
+        std::fs::write(&linked, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&safe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&linked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::hard_link(&linked, store.join("linked-tool")).unwrap();
+        let path = std::env::join_paths([&bin]).unwrap();
+
+        let grants = pnpm_path_executables_in(home.path(), &path);
+
+        assert_eq!(grants, vec![safe.canonicalize().unwrap()]);
+    }
+
+    #[test]
+    fn pnpm_exec_grants_reject_nested_stores_and_external_symlink_targets() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let home = tempfile::tempdir().unwrap();
+        let outer = home.path().join("Library/pnpm");
+        let nested = outer.join("custom");
+        let nested_store = nested.join("store/v10");
+        let external = home.path().join("external");
+        std::fs::create_dir_all(&nested_store).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        let stored = nested_store.join("pnpm");
+        let outside = external.join("pnpm");
+        std::fs::write(&stored, b"#!/bin/sh\n").unwrap();
+        std::fs::write(&outside, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&stored, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&outside, nested.join("external-pnpm")).unwrap();
+
+        let roots = vec![
+            outer.canonicalize().unwrap(),
+            nested.canonicalize().unwrap(),
+        ];
+        assert!(!pnpm_exec_grant_allowed(
+            &stored.canonicalize().unwrap(),
+            &roots
+        ));
+        assert!(!pnpm_exec_grant_allowed(
+            &nested.join("external-pnpm").canonicalize().unwrap(),
+            &roots
+        ));
+    }
+
+    #[test]
+    fn package_manager_store_does_not_need_an_extra_exec_grant() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("Library/pnpm");
+        let global = root.join("global/v11/pnpm");
+        let managed = root.join("package-manager-store/v10/pnpm");
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        std::fs::write(&global, b"pnpm").unwrap();
+        std::fs::write(&managed, b"pnpm").unwrap();
+
+        assert!(pnpm_needs_exec_grant(
+            home.path(),
+            &global.canonicalize().unwrap()
+        ));
+        assert!(!pnpm_needs_exec_grant(
+            home.path(),
+            &managed.canonicalize().unwrap()
+        ));
     }
 
     #[test]

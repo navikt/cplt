@@ -897,7 +897,8 @@ Home tool directories (`~/.cargo`, `~/.nvm`, and friends) use a per-directory pe
 
 | Directory                                                                                     | process-exec | file-map-executable | file-write | Rationale |
 |-----------------------------------------------------------------------------------------------|---|---|---|---|
-| `.local/bin`, `.mise`, `.nvm`, `.pyenv`, `.cargo`, `.rustup`, `.sdkman`, `go/bin`, `Library/pnpm` | ✅ | ✅ | varies | Contain executable binaries and shims |
+| `.local/bin`, `.mise`, `.nvm`, `.pyenv`, `.cargo`, `.rustup`, `.sdkman`, `go/bin` | ✅ | ✅ | varies | Contain executable binaries and shims |
+| `Library/pnpm`, `.local/share/pnpm` | ❌ | ❌ | ❌ | PATH-visible executables receive exact file grants; recursive execution would also open the writable `store/` |
 | `.gradle`, `.m2`, `.konan`, `go/pkg`                                                          | ❌ | ✅ | varies | JNI/cgo/Kotlin native libs loaded via dlopen, no direct executables |
 | `.yarn`                                                                                       | ❌ | ❌ | ✅ | Yarn Berry global cache, JavaScript packages only, no native binaries |
 | `Library/Caches`                                                                              | ❌ | ❌* | ✅ | Broad allow for dev tool caches; browser/app caches denied via regex prefix rules (com.apple.*, com.google.*, org.mozilla.*, etc.), with Xcode dev tools (com.apple.dt.*) re-allowed |
@@ -1080,7 +1081,7 @@ Linux-specific tool directories use XDG-style paths:
 | Directory | Permissions | Rationale |
 |-----------|------------|-----------|
 | `~/.cache` | read+write | XDG cache dir (pip, go-build, etc.) |
-| `~/.local/share/pnpm` | read+exec; `store/` read+write; `package-manager-store/` read+write+exec | A hardlinked pnpm executable is copied to a per-session read-only shadow before launch, so the content-addressable store remains non-executable. `package-manager-store/` deliberately downloads and runs packageManager-pinned versions |
+| `~/.local/share/pnpm` | read-only root with exact grants for existing PATH executables; `store/` read+write; `package-manager-store/` read+write+exec | A hardlinked pnpm executable is copied to a per-session read-only shadow before launch, so the content-addressable store remains non-executable. `package-manager-store/` deliberately downloads and runs packageManager-pinned versions |
 | `~/.local/bin` | read+exec | User-installed binaries |
 | `~/.local/share/mise` | read+write+exec | mise tool installations |
 
