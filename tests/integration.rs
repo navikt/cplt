@@ -540,6 +540,8 @@ mod macos_tests {
         let shadow = cplt::scratch::PnpmShadowDir::create_if_needed(home.path(), &source)
             .expect("create pnpm shadow")
             .expect("hardlinked pnpm must use a shadow");
+        fs::remove_dir_all(&package_manager_store)
+            .expect("reset package-manager-store for first-use sandbox test");
         let extra_exec = vec![shadow.path().to_path_buf(), standalone.clone()];
         let mut opts = default_opts(project.path(), home.path());
         opts.extra_exec = &extra_exec;

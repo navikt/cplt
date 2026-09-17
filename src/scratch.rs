@@ -69,6 +69,7 @@ pub struct PnpmShadowDir {
 impl PnpmShadowDir {
     /// Copy `pnpm` when it shares an inode with a pnpm store hardlink.
     pub fn create_if_needed(home_dir: &Path, pnpm: &Path) -> Result<Option<Self>, String> {
+        ensure_pnpm_package_manager_stores(home_dir)?;
         if !pnpm_requires_shadow(home_dir, pnpm)? {
             return Ok(None);
         }
@@ -170,6 +171,53 @@ impl Drop for PnpmShadowDir {
     fn drop(&mut self) {
         remove_owned_dir(&self.path, self.device, self.inode, "pnpm shadow dir");
     }
+}
+
+fn ensure_pnpm_package_manager_stores(home_dir: &Path) -> Result<(), String> {
+    let canonical_home = std::fs::canonicalize(home_dir)
+        .map_err(|e| format!("Cannot canonicalize home dir {}: {e}", home_dir.display()))?;
+    for root in pnpm_home_roots(home_dir) {
+        if !root.is_dir() {
+            continue;
+        }
+        let canonical_root = std::fs::canonicalize(&root)
+            .map_err(|e| format!("Cannot resolve pnpm home {}: {e}", root.display()))?;
+        if let Ok(relative) = root.strip_prefix(home_dir) {
+            let expected = canonical_home.join(relative);
+            if canonical_root != expected {
+                return Err(format!(
+                    "pnpm home {} resolves through a symlink to {}",
+                    root.display(),
+                    canonical_root.display()
+                ));
+            }
+        }
+        let store = canonical_root.join("package-manager-store");
+        match store.symlink_metadata() {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(format!(
+                    "pnpm package-manager-store {} must be a real directory",
+                    store.display()
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&store).map_err(|e| {
+                    format!(
+                        "Cannot create pnpm package-manager-store {}: {e}",
+                        store.display()
+                    )
+                })?;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Cannot inspect pnpm package-manager-store {}: {error}",
+                    store.display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn copy_executable(source: &Path, destination: &Path) -> Result<(), String> {
@@ -892,6 +940,31 @@ mod tests {
         assert!(!is_session_id("0123456789abcdef0123456789abcde")); // 31 chars
         assert!(!is_session_id("0123456789abcdef0123456789abcdefg")); // 33 chars
         assert!(!is_session_id("0123456789abcdef0123456789abcdeg")); // non-hex
+    }
+
+    #[test]
+    fn creates_missing_pnpm_package_manager_store() {
+        let home = tempfile::tempdir().unwrap();
+        let pnpm_home = home.path().join(".local/share/pnpm");
+        std::fs::create_dir_all(&pnpm_home).unwrap();
+
+        ensure_pnpm_package_manager_stores(home.path()).unwrap();
+
+        assert!(pnpm_home.join("package-manager-store").is_dir());
+    }
+
+    #[test]
+    fn refuses_symlinked_pnpm_home_before_creating_version_store() {
+        let home = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".local/share")).unwrap();
+        std::os::unix::fs::symlink(target.path(), home.path().join(".local/share/pnpm")).unwrap();
+
+        let error =
+            ensure_pnpm_package_manager_stores(home.path()).expect_err("symlink must be refused");
+
+        assert!(error.contains("resolves through a symlink"));
+        assert!(!target.path().join("package-manager-store").exists());
     }
 
     #[test]
