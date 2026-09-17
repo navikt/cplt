@@ -1676,6 +1676,10 @@ struct ResolvedContext {
     config_path: Option<PathBuf>,
     home_dir: PathBuf,
     project_dir: PathBuf,
+    /// Pi resolves project-local prompts from its process cwd. Keep this inside
+    /// the sandbox project scope; an explicit project directory still anchors a
+    /// caller that invoked cplt from elsewhere.
+    launch_dir: PathBuf,
     /// Validated named roots: repositories the agent works in alongside the
     /// launch one, from `--repo-dir` and `sandbox.repo_dirs` in the per-repo
     /// local config. Empty unless one of the two named something.
@@ -1945,6 +1949,9 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             }
         }
     };
+    let invocation_dir = std::env::current_dir()
+        .and_then(std::fs::canonicalize)
+        .map_err(|e| anyhow::anyhow!("Cannot resolve cwd: {e}"))?;
 
     // ── CPLT_CONFIG sanity check (issue #261) ────────────────────
     // The env var replaces the whole user config, every [sandbox] key included,
@@ -2605,11 +2612,19 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         }
     }
 
+    let launch_dir = if active_agent == agent::Agent::Pi && invocation_dir.starts_with(&project_dir)
+    {
+        invocation_dir
+    } else {
+        project_dir.clone()
+    };
+
     Ok(ResolvedContext {
         resolved,
         config_path,
         home_dir,
         project_dir,
+        launch_dir,
         repo_roots,
         active_agent,
         unapproved_proposals,
@@ -3608,6 +3623,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         config_path,
         home_dir,
         project_dir,
+        launch_dir,
         repo_roots,
         active_agent,
         unapproved_proposals: _,
@@ -3662,6 +3678,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         policy,
         proxy_handle,
         scratch_guard: _scratch_guard,
+        pnpm_shadow_guard: _pnpm_shadow_guard,
         #[cfg(target_os = "macos")]
             playwright_socket_guard: _playwright_socket_guard,
         ..
@@ -3840,6 +3857,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
                 &prepared,
                 &agent_bin,
                 &copilot_args,
+                &launch_dir,
                 &repo_paths,
                 &resolved.pass_env,
                 resolved.inherit_env,
@@ -4480,6 +4498,7 @@ struct AssembledSandbox {
     policy: sandbox::LandlockPolicy,
     proxy_handle: Option<proxy::ProxyHandle>,
     scratch_guard: Option<scratch::ScratchDir>,
+    pnpm_shadow_guard: Option<scratch::PnpmShadowDir>,
     #[cfg(target_os = "macos")]
     playwright_socket_guard: Option<scratch::PlaywrightSocketDir>,
 }
@@ -4567,6 +4586,15 @@ fn assemble_sandbox(
         None
     };
     let scratch_path = scratch_guard.as_ref().map(cplt::scratch::ScratchDir::path);
+    let pnpm_shadow_guard = resolve_exec_binary("pnpm")
+        .ok()
+        .map(|pnpm| scratch::PnpmShadowDir::create_if_needed(home_dir, &pnpm))
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("Cannot prepare pnpm executable: {error}"))?
+        .flatten();
+    let pnpm_shadow_path = pnpm_shadow_guard
+        .as_ref()
+        .map(cplt::scratch::PnpmShadowDir::path);
 
     #[cfg(target_os = "macos")]
     let playwright_socket_guard = create_playwright_socket_dir(resolved)?;
@@ -4659,12 +4687,15 @@ fn assemble_sandbox(
         resolved.keychain_substitute,
     );
 
+    let mut extra_exec = resolved.allow_exec.clone();
+    extra_exec.extend(pnpm_shadow_path.map(Path::to_path_buf));
     let sandbox_config = build_sandbox_config(
         resolved,
         probe,
         active_agent,
         &agent_dirs,
         opts.repos,
+        &extra_exec,
         SessionPaths {
             proxy_port: proxy_port_for_profile,
             scratch_dir: scratch_path,
@@ -4685,6 +4716,7 @@ fn assemble_sandbox(
         policy,
         proxy_handle,
         scratch_guard,
+        pnpm_shadow_guard,
         #[cfg(target_os = "macos")]
         playwright_socket_guard,
     })
@@ -4740,12 +4772,14 @@ impl<'a> NamedRepos<'a> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_sandbox_config<'a>(
     resolved: &'a config::Resolved,
     probe: &'a HostProbe,
     agent: agent::Agent,
     agent_dirs: &'a [agent::AgentDir],
     repos: NamedRepos<'a>,
+    extra_exec: &'a [PathBuf],
     session: SessionPaths<'a>,
     keychain_substitute: Option<agent::KeychainSubstitute>,
 ) -> sandbox::SandboxConfig<'a> {
@@ -4754,7 +4788,7 @@ fn build_sandbox_config<'a>(
         home_dir: probe.home_dir.as_path(),
         extra_read: &resolved.allow_read,
         extra_write: &resolved.allow_write,
-        extra_exec: &resolved.allow_exec,
+        extra_exec,
         extra_socket: &resolved.allow_socket,
         extra_deny: &resolved.deny_paths,
         named_roots: repos.dirs,
@@ -4859,6 +4893,7 @@ fn run_exec_command(
         unapproved_proposals: _,
         // active_agent from resolve_context is ignored — exec always uses Shell
         active_agent: _,
+        launch_dir: _,
     } = resolve_context(cli, false)?;
 
     let repo_paths: Vec<PathBuf> = repo_roots.iter().map(|r| r.dir.clone()).collect();
@@ -4926,6 +4961,7 @@ fn run_exec_command(
         policy,
         proxy_handle,
         scratch_guard,
+        pnpm_shadow_guard,
         #[cfg(target_os = "macos")]
             playwright_socket_guard: _playwright_socket_guard,
         ..
@@ -4960,6 +4996,13 @@ fn run_exec_command(
             resolved.gh_guard.enabled,
             resolved.git_guard.enabled,
         );
+        let bin = if cmd[0] == "pnpm" {
+            pnpm_shadow_guard
+                .as_ref()
+                .map_or(bin, cplt::scratch::PnpmShadowDir::binary)
+        } else {
+            bin
+        };
         (bin, cmd[1..].to_vec())
     };
 
@@ -5014,6 +5057,7 @@ fn run_exec_command(
                 &prepared,
                 &exec_bin,
                 &exec_args,
+                &project_dir,
                 &repo_paths,
                 &resolved.pass_env,
                 resolved.inherit_env,
@@ -5090,6 +5134,7 @@ fn probe_shell(
         prepared,
         &shell,
         &args,
+        prepared.project_dir(),
         &[],
         &resolved.pass_env,
         resolved.inherit_env,
@@ -5371,6 +5416,7 @@ fn run_check_command(
         repo_roots,
         active_agent,
         unapproved_proposals: _,
+        launch_dir: _,
     } = resolve_context(cli, true)?;
     // The named roots, which `ExecContext::for_launch` turns into the gh scope
     // set. `check exec gh …` reported a named repository as outside the startup
@@ -5417,6 +5463,7 @@ fn run_check_command(
         policy,
         proxy_handle,
         scratch_guard: _scratch_guard,
+        pnpm_shadow_guard: _pnpm_shadow_guard,
         #[cfg(target_os = "macos")]
             playwright_socket_guard: _playwright_socket_guard,
     } = prepare_shell_sandbox(
@@ -6090,6 +6137,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         repo_roots,
         active_agent,
         unapproved_proposals,
+        launch_dir: _,
     } = ctx;
     // `doctor` reports the policy a launch would build, so it has to carry the
     // same named roots the launch would (#447).
@@ -6274,6 +6322,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         active_agent,
         &agent_dirs,
         NamedRepos::new(&repo_paths, &repo_git_dirs, &repo_rows),
+        &resolved.allow_exec,
         SessionPaths::default(),
         keychain_substitute,
     );

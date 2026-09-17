@@ -86,12 +86,14 @@ fn configure_command(
     cmd: &mut Command,
     copilot_args: &[String],
     project_dir: &Path,
+    launch_dir: &Path,
     repo_dirs: &[PathBuf],
     home_dir: &Path,
     extra_pass_env: &[String],
     inherit_env: bool,
     disabled_categories: &[HardeningCategory],
     scratch_dir: Option<&Path>,
+    pnpm_shadow_dir: Option<&Path>,
     proxy_port: Option<u16>,
     allow_localhost: &[u16],
     allow_localhost_any: bool,
@@ -113,7 +115,7 @@ fn configure_command(
         cmd.arg(arg);
     }
 
-    cmd.current_dir(project_dir);
+    cmd.current_dir(launch_dir);
 
     // Build and apply environment
     let parent_env: Vec<(String, String)> = std::env::vars().collect();
@@ -293,7 +295,10 @@ fn configure_command(
             gh_guard,
             git_guard,
             quiet,
+            pnpm_shadow_dir,
         );
+    } else if let Some(shadow) = pnpm_shadow_dir {
+        prepend_path(cmd, &[shadow]);
     }
 }
 
@@ -557,6 +562,7 @@ fn cache_gh_token_to_file(scratch_dir: &Path, agent: Agent, deny_env: &[String])
 /// Both wrappers follow the same pattern: intercept the command, call back to
 /// cplt for a policy decision, then exec the real binary or block.
 /// Policy is baked into the wrapper invocation — not re-read from config at gate time.
+#[allow(clippy::too_many_arguments)]
 fn install_command_wrappers(
     cmd: &mut Command,
     scratch_dir: &Path,
@@ -565,6 +571,7 @@ fn install_command_wrappers(
     gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
     quiet: bool,
+    pnpm_shadow_dir: Option<&Path>,
 ) {
     use std::os::unix::fs::PermissionsExt;
 
@@ -836,14 +843,25 @@ fn install_command_wrappers(
     }
 
     // Prepend {scratch}/bin to PATH so wrappers shadow the real binaries.
+    let mut prefixes = Vec::new();
     if installed_any {
-        let bin_dir_str = bin_dir.to_string_lossy().to_string();
-        let new_path = if let Some(current_path) = std::env::var_os("PATH") {
-            format!("{}:{}", bin_dir_str, current_path.to_string_lossy())
-        } else {
-            bin_dir_str
-        };
-        cmd.env("PATH", &new_path);
+        prefixes.push(bin_dir.as_path());
+    }
+    if let Some(shadow) = pnpm_shadow_dir {
+        prefixes.push(shadow);
+    }
+    if !prefixes.is_empty() {
+        prepend_path(cmd, &prefixes);
+    }
+}
+
+fn prepend_path(cmd: &mut Command, prefixes: &[&Path]) {
+    let mut paths: Vec<PathBuf> = prefixes.iter().map(|path| path.to_path_buf()).collect();
+    if let Some(current_path) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&current_path));
+    }
+    if let Ok(path) = std::env::join_paths(paths) {
+        cmd.env("PATH", path);
     }
 }
 
@@ -1189,6 +1207,7 @@ pub fn exec(
     sandbox: &super::PreparedSandbox,
     copilot_bin: &Path,
     copilot_args: &[String],
+    launch_dir: &Path,
     repo_dirs: &[PathBuf],
     extra_pass_env: &[String],
     inherit_env: bool,
@@ -1205,12 +1224,14 @@ pub fn exec(
         &mut cmd,
         copilot_args,
         &sandbox.project_dir,
+        launch_dir,
         repo_dirs,
         &sandbox.home_dir,
         extra_pass_env,
         inherit_env,
         disabled_categories,
         sandbox.scratch_dir.as_deref(),
+        sandbox.pnpm_shadow_dir.as_deref(),
         sandbox.proxy_port,
         &sandbox.allow_localhost,
         sandbox.allow_localhost_any,
@@ -1267,6 +1288,7 @@ pub fn exec(
     sandbox: &super::PreparedSandbox,
     copilot_bin: &Path,
     copilot_args: &[String],
+    launch_dir: &Path,
     repo_dirs: &[PathBuf],
     extra_pass_env: &[String],
     inherit_env: bool,
@@ -1285,6 +1307,7 @@ pub fn exec(
             wrapper,
             copilot_bin,
             copilot_args,
+            launch_dir,
             repo_dirs,
             extra_pass_env,
             inherit_env,
@@ -1330,12 +1353,14 @@ pub fn exec(
         &mut cmd,
         copilot_args,
         &sandbox.project_dir,
+        launch_dir,
         repo_dirs,
         &sandbox.home_dir,
         extra_pass_env,
         inherit_env,
         disabled_categories,
         sandbox.scratch_dir.as_deref(),
+        sandbox.pnpm_shadow_dir.as_deref(),
         sandbox.proxy_port,
         &sandbox.allow_localhost,
         sandbox.allow_localhost_any,
@@ -1397,6 +1422,7 @@ fn exec_bwrap(
     wrapper: &super::bubblewrap::BubblewrapWrapper,
     copilot_bin: &Path,
     copilot_args: &[String],
+    launch_dir: &Path,
     repo_dirs: &[PathBuf],
     extra_pass_env: &[String],
     inherit_env: bool,
@@ -1476,12 +1502,14 @@ fn exec_bwrap(
         &mut cmd,
         &[],
         &sandbox.project_dir,
+        launch_dir,
         repo_dirs,
         &sandbox.home_dir,
         extra_pass_env,
         inherit_env,
         disabled_categories,
         sandbox.scratch_dir.as_deref(),
+        sandbox.pnpm_shadow_dir.as_deref(),
         sandbox.proxy_port,
         &sandbox.allow_localhost,
         sandbox.allow_localhost_any,

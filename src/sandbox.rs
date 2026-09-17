@@ -238,6 +238,7 @@ pub struct PreparedSandbox {
     /// Linux: human-readable Landlock policy summary.
     profile_text: String,
     scratch_dir: Option<PathBuf>,
+    pnpm_shadow_dir: Option<PathBuf>,
     /// Exact automatic Playwright socket base authorized by the macOS profile.
     playwright_socket_dir: Option<PathBuf>,
     /// Explicit `ms-playwright` opt-in, the same intent that gates the browser
@@ -675,6 +676,7 @@ pub fn exec_sandboxed(
     sandbox: &PreparedSandbox,
     copilot_bin: &Path,
     copilot_args: &[String],
+    launch_dir: &Path,
     repo_dirs: &[PathBuf],
     extra_pass_env: &[String],
     inherit_env: bool,
@@ -688,6 +690,7 @@ pub fn exec_sandboxed(
         sandbox,
         copilot_bin,
         copilot_args,
+        launch_dir,
         repo_dirs,
         extra_pass_env,
         inherit_env,
@@ -727,6 +730,11 @@ fn prepare_impl(
         home_dir: config.home_dir.to_path_buf(),
         profile_text,
         scratch_dir: config.scratch_dir.map(Path::to_path_buf),
+        pnpm_shadow_dir: config
+            .extra_exec
+            .iter()
+            .find(|path| path.starts_with(config.home_dir.join(".cplt-pnpm-shadow")))
+            .cloned(),
         playwright_socket_dir: playwright_socket_dir.map(Path::to_path_buf),
         playwright_runtime: policy::playwright_runtime_intent(
             config.allow_cache_exec,
@@ -1156,6 +1164,11 @@ fn prepare_impl(
         home_dir: config.home_dir.to_path_buf(),
         profile_text,
         scratch_dir: config.scratch_dir.map(Path::to_path_buf),
+        pnpm_shadow_dir: config
+            .extra_exec
+            .iter()
+            .find(|path| path.starts_with(config.home_dir.join(".cplt-pnpm-shadow")))
+            .cloned(),
         // The automatic capability is macOS-only; direct Linux callers cannot
         // introduce a new /tmp path lifecycle or child environment override.
         playwright_socket_dir: None,

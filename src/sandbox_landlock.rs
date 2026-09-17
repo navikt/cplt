@@ -2891,8 +2891,6 @@ mod tests {
             ".m2",
             ".nuget",
             "go/pkg",
-            "Library/pnpm/store",
-            ".local/share/pnpm/store",
         ] {
             let dir = policy::home_tool_dirs()
                 .iter()
@@ -2962,6 +2960,39 @@ mod tests {
                 .any(|r| r.path == store && r.access.write),
             "pnpm's content-addressable store must stay writable for ordinary `pnpm install`"
         );
+    }
+
+    #[test]
+    fn pnpm_self_management_storage_has_its_required_effective_permissions() {
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let policy = generate_policy(&test_config(&project, &home));
+
+        for rel in ["Library/pnpm/store", ".local/share/pnpm/store"] {
+            let rule = policy
+                .fs_rules
+                .iter()
+                .find(|r| r.path == home.join(rel))
+                .unwrap_or_else(|| panic!("{rel} must be in the policy"));
+            assert!(
+                rule.access.read && rule.access.write && !rule.access.execute,
+                "{rel} must remain writable but non-executable"
+            );
+        }
+        for rel in [
+            "Library/pnpm/package-manager-store",
+            ".local/share/pnpm/package-manager-store",
+        ] {
+            let rule = policy
+                .fs_rules
+                .iter()
+                .find(|r| r.path == home.join(rel))
+                .unwrap_or_else(|| panic!("{rel} must be in the policy"));
+            assert!(
+                rule.access.read && rule.access.write && rule.access.execute,
+                "{rel} must be writable and executable for pnpm self-management"
+            );
+        }
     }
 
     /// The same class one tree over, where the structural fix does apply:

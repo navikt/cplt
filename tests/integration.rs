@@ -502,6 +502,97 @@ mod macos_tests {
         }
     }
 
+    #[test]
+    fn real_profile_runs_pnpm_shadow_without_executing_the_store() {
+        require_sandbox!();
+        let project = tempfile::tempdir().expect("create project");
+        let home = tempfile::tempdir().expect("create home");
+        let global = home.path().join("Library/pnpm/global/v11");
+        let store = home
+            .path()
+            .join("Library/pnpm/store/v10/links/test-package");
+        let package_manager_store = home.path().join("Library/pnpm/package-manager-store");
+        fs::create_dir_all(&global).expect("create pnpm global directory");
+        fs::create_dir_all(&store).expect("create pnpm hardlink directory");
+        fs::create_dir_all(&package_manager_store).expect("create pnpm version store");
+
+        let source = global.join("pnpm");
+        let pnpm = store.join("pnpm");
+        let other = store.join("not-pnpm");
+        let managed_pnpm = package_manager_store.join("v10/pnpm");
+        fs::create_dir_all(managed_pnpm.parent().unwrap()).expect("create managed pnpm directory");
+        fs::write(&source, "#!/bin/sh\nprintf 'pnpm hardlink ran\\n'\n").expect("write fake pnpm");
+        fs::write(
+            &managed_pnpm,
+            "#!/bin/sh\nprintf 'pnpm managed version ran\\n'\n",
+        )
+        .expect("write managed pnpm");
+        fs::hard_link(&source, &pnpm).expect("create pnpm hardlink");
+        fs::hard_link(&source, &other).expect("create non-pnpm hardlink");
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755))
+            .expect("make fake pnpm executable");
+        fs::set_permissions(&managed_pnpm, fs::Permissions::from_mode(0o755))
+            .expect("make managed pnpm executable");
+
+        let shadow = cplt::scratch::PnpmShadowDir::create_if_needed(home.path(), &source)
+            .expect("create pnpm shadow")
+            .expect("hardlinked pnpm must use a shadow");
+        let extra_exec = vec![shadow.path().to_path_buf()];
+        let mut opts = default_opts(project.path(), home.path());
+        opts.extra_exec = &extra_exec;
+        let profile = write_real_profile(&opts);
+        let command = format!(
+            "printf state > '{managed_state}' && '{managed_pnpm}' && \
+             PATH='{shadow}:/usr/bin:/bin' pnpm && \
+             printf compromised > '{pnpm}' && \
+             PATH='{shadow}:/usr/bin:/bin' pnpm",
+            managed_state = package_manager_store.join("state").display(),
+            managed_pnpm = managed_pnpm.display(),
+            shadow = shadow.path().display(),
+            pnpm = pnpm.display(),
+        );
+        let (output, success) = run_sandboxed(&profile, &command);
+
+        assert!(
+            success,
+            "pnpm's read-only shadow and version store must work: {output}"
+        );
+        assert!(
+            output.contains("pnpm managed version ran"),
+            "the pinned pnpm executable did not run: {output}"
+        );
+        assert_eq!(
+            output.matches("pnpm hardlink ran").count(),
+            2,
+            "mutating the store inode must not change the copied shadow: {output}"
+        );
+        let replacement = project.path().join("replacement");
+        fs::write(&replacement, "#!/bin/sh\n").expect("write replacement");
+        let shadow_mutation = format!(
+            "if printf forged > '{shadow}'; then exit 10; fi; \
+             if rm '{shadow}'; then exit 11; fi; \
+             if mv '{replacement}' '{shadow}'; then exit 12; fi",
+            shadow = shadow.binary().display(),
+            replacement = replacement.display(),
+        );
+        let (_, shadow_mutation_success) = run_sandboxed(&profile, &shadow_mutation);
+        let (pnpm_output, pnpm_success) = run_sandboxed(&profile, &pnpm.display().to_string());
+        let (other_output, other_success) = run_sandboxed(&profile, &other.display().to_string());
+        fs::remove_file(&profile).ok();
+        assert!(
+            shadow_mutation_success,
+            "overwrite, unlink, and replacement of the executable shadow must all be denied"
+        );
+        assert!(
+            !pnpm_success,
+            "the original store hardlink must remain non-executable: {pnpm_output}"
+        );
+        assert!(
+            !other_success,
+            "the writable store must not execute arbitrary hardlinks: {other_output}"
+        );
+    }
+
     /// A unique, grep-safe token embedded in the render probe document.
     ///
     /// Alphanumeric only so it survives DOM serialization verbatim and cannot

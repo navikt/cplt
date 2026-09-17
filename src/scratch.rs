@@ -36,6 +36,10 @@ const SCRATCH_BASE: &str = ".cache/cplt/tmp";
 /// Maximum age for stale scratch dirs before garbage collection.
 const STALE_AGE: Duration = Duration::from_hours(24);
 
+/// cplt-owned, per-session copies of pnpm executables whose inode is linked
+/// into pnpm's writable content-addressable store.
+const PNPM_SHADOW_BASE: &str = ".cplt-pnpm-shadow";
+
 /// A per-session scratch directory with write+exec permissions.
 ///
 /// Implements `Drop` to ensure cleanup on all exit paths (RAII guard).
@@ -43,6 +47,171 @@ const STALE_AGE: Duration = Duration::from_hours(24);
 #[derive(Debug)]
 pub struct ScratchDir {
     path: PathBuf,
+}
+
+/// A read-only executable copy of pnpm outside its writable store.
+///
+/// pnpm's standalone executable can be hardlinked into
+/// `$PNPM_HOME/store/v*/links/*/pnpm`. The kernel then evaluates execution
+/// against that writable store inode even when PATH names the global install.
+/// Copying the file breaks the hardlink relationship. The sandbox grants this
+/// unique directory read+execute, never write, and prepends it to PATH.
+#[derive(Debug)]
+pub struct PnpmShadowDir {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+impl PnpmShadowDir {
+    /// Copy `pnpm` when it shares an inode with a pnpm store hardlink.
+    pub fn create_if_needed(home_dir: &Path, pnpm: &Path) -> Result<Option<Self>, String> {
+        if !pnpm_has_store_alias(home_dir, pnpm)? {
+            return Ok(None);
+        }
+
+        let base = home_dir.join(PNPM_SHADOW_BASE);
+        match base.symlink_metadata() {
+            Ok(_) => validate_dir_safety(&base, "pnpm shadow base")?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                create_secure_dir(&base, "pnpm shadow base")?;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Cannot inspect pnpm shadow base {}: {error}",
+                    base.display()
+                ));
+            }
+        }
+        let canonical_home = std::fs::canonicalize(home_dir)
+            .map_err(|e| format!("Cannot canonicalize home dir {}: {e}", home_dir.display()))?;
+        let canonical_base = std::fs::canonicalize(&base).map_err(|e| {
+            format!(
+                "Cannot canonicalize pnpm shadow base {}: {e}",
+                base.display()
+            )
+        })?;
+        if canonical_base != canonical_home.join(PNPM_SHADOW_BASE) {
+            return Err(format!(
+                "pnpm shadow base resolved to {} but expected {}. An ancestor directory may be a symlink",
+                canonical_base.display(),
+                canonical_home.join(PNPM_SHADOW_BASE).display()
+            ));
+        }
+        validate_dir_safety(&canonical_base, "pnpm shadow base")?;
+
+        let session_dir = canonical_base.join(generate_session_id()?);
+        create_secure_dir(&session_dir, "pnpm shadow dir")?;
+        let identity = secure_dir_identity(&session_dir, "pnpm shadow dir")?;
+        let shadow = session_dir.join("pnpm");
+        if let Err(error) = copy_executable(pnpm, &shadow) {
+            let _ = std::fs::remove_dir_all(&session_dir);
+            return Err(error);
+        }
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&session_dir, std::fs::Permissions::from_mode(0o500))
+            .map_err(|e| format!("Cannot make pnpm shadow read-only: {e}"))?;
+
+        Ok(Some(Self {
+            path: session_dir,
+            device: identity.0,
+            inode: identity.1,
+        }))
+    }
+
+    /// Directory prepended to PATH and granted read+execute by the sandbox.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Copied pnpm executable used for direct `cplt exec -- pnpm` launches.
+    pub fn binary(&self) -> PathBuf {
+        self.path.join("pnpm")
+    }
+}
+
+impl Drop for PnpmShadowDir {
+    fn drop(&mut self) {
+        remove_owned_dir(&self.path, self.device, self.inode, "pnpm shadow dir");
+    }
+}
+
+fn copy_executable(source: &Path, destination: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut source_file = std::fs::File::open(source)
+        .map_err(|e| format!("Cannot open pnpm executable {}: {e}", source.display()))?;
+    let mut destination_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o500)
+        .open(destination)
+        .map_err(|e| format!("Cannot create pnpm shadow {}: {e}", destination.display()))?;
+    std::io::copy(&mut source_file, &mut destination_file)
+        .map_err(|e| format!("Cannot copy pnpm executable into shadow: {e}"))?;
+    destination_file
+        .sync_all()
+        .map_err(|e| format!("Cannot sync pnpm shadow {}: {e}", destination.display()))?;
+    std::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o500))
+        .map_err(|e| format!("Cannot set pnpm shadow permissions: {e}"))
+}
+
+fn pnpm_has_store_alias(home_dir: &Path, pnpm: &Path) -> Result<bool, String> {
+    let mut roots = vec![
+        home_dir.join("Library/pnpm/store"),
+        home_dir.join(".local/share/pnpm/store"),
+    ];
+    if let Some(pnpm_home) = std::env::var_os("PNPM_HOME").filter(|value| !value.is_empty()) {
+        let pnpm_home = PathBuf::from(pnpm_home);
+        let pnpm_home = if pnpm_home.is_absolute() {
+            pnpm_home
+        } else {
+            home_dir.join(pnpm_home)
+        };
+        roots.push(pnpm_home.join("store"));
+    }
+    roots.sort();
+    roots.dedup();
+    pnpm_has_store_alias_in(pnpm, &roots)
+}
+
+fn pnpm_has_store_alias_in(pnpm: &Path, roots: &[PathBuf]) -> Result<bool, String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let source = std::fs::metadata(pnpm)
+        .map_err(|e| format!("Cannot inspect pnpm executable {}: {e}", pnpm.display()))?;
+    if !source.is_file() || source.nlink() < 2 {
+        return Ok(false);
+    }
+
+    for root in roots {
+        let Ok(versions) = std::fs::read_dir(root) else {
+            continue;
+        };
+        for version in versions.flatten() {
+            let name = version.file_name();
+            if !name.to_string_lossy().starts_with('v') {
+                continue;
+            }
+            let links = version.path().join("links");
+            let Ok(packages) = std::fs::read_dir(links) else {
+                continue;
+            };
+            for package in packages.flatten() {
+                let candidate = package.path().join("pnpm");
+                let Ok(metadata) = candidate.symlink_metadata() else {
+                    continue;
+                };
+                if metadata.file_type().is_file()
+                    && metadata.dev() == source.dev()
+                    && metadata.ino() == source.ino()
+                {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
 }
 
 impl ScratchDir {
@@ -121,44 +290,53 @@ impl ScratchDir {
     /// Runs best-effort: errors are logged but don't prevent startup.
     pub fn gc_stale(home_dir: &Path) {
         let base = home_dir.join(SCRATCH_BASE);
-        if !base.exists() {
-            return;
+        gc_stale_session_dirs(&base);
+    }
+}
+
+fn gc_stale_session_dirs(base: &Path) {
+    if !base.exists() {
+        return;
+    }
+
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
+    };
+
+    let now = SystemTime::now();
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+
+        let Ok(metadata) = path.symlink_metadata() else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
         }
 
-        let Ok(entries) = std::fs::read_dir(&base) else {
-            return;
+        // Only delete entries that look like our session IDs (hex UUID)
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !is_session_id(&name) {
+            continue;
+        }
+
+        // Check age via directory modification time
+        let Ok(modified) = metadata.modified() else {
+            continue;
         };
 
-        let now = SystemTime::now();
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-
-            // Only process directories
-            if !path.is_dir() {
+        if let Ok(age) = now.duration_since(modified)
+            && age > STALE_AGE
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            if metadata.uid() != unsafe { libc::getuid() } {
                 continue;
             }
-
-            // Only delete entries that look like our session IDs (hex UUID)
-            let Ok(name) = entry.file_name().into_string() else {
-                continue;
-            };
-            if !is_session_id(&name) {
-                continue;
-            }
-
-            // Check age via directory modification time
-            let Ok(metadata) = entry.metadata() else {
-                continue;
-            };
-            let Ok(modified) = metadata.modified() else {
-                continue;
-            };
-
-            if let Ok(age) = now.duration_since(modified)
-                && age > STALE_AGE
-                && let Err(e) = std::fs::remove_dir_all(&path)
-            {
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
+            if let Err(e) = std::fs::remove_dir_all(&path) {
                 ui::warn(&format!(
                     "Warning: cannot remove stale scratch dir {}: {e}",
                     path.display()
@@ -323,7 +501,6 @@ pub(crate) fn create_secure_dir(path: &Path, label: &str) -> Result<(), String> 
         .map_err(|e| format!("Cannot create {label} {}: {e}", path.display()))
 }
 
-#[cfg(target_os = "macos")]
 fn secure_dir_identity(path: &Path, label: &str) -> Result<(u64, u64), String> {
     use std::os::unix::fs::MetadataExt;
 
@@ -334,7 +511,6 @@ fn secure_dir_identity(path: &Path, label: &str) -> Result<(u64, u64), String> {
     Ok((metadata.dev(), metadata.ino()))
 }
 
-#[cfg(target_os = "macos")]
 fn remove_owned_dir(path: &Path, expected_device: u64, expected_inode: u64, label: &str) {
     use std::os::unix::fs::MetadataExt;
 
@@ -356,6 +532,14 @@ fn remove_owned_dir(path: &Path, expected_device: u64, expected_inode: u64, labe
     {
         ui::warn(&format!(
             "Warning: refusing to cleanup replaced {label} {}",
+            path.display()
+        ));
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)) {
+        ui::warn(&format!(
+            "Warning: cannot make {label} {} removable during cleanup: {error}",
             path.display()
         ));
         return;
@@ -473,6 +657,107 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn pnpm_shadow_breaks_store_hardlink_and_cleans_up() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let home = tempfile::tempdir().unwrap();
+        let global = home.path().join("Library/pnpm/global/v11");
+        let links = home
+            .path()
+            .join("Library/pnpm/store/v10/links/pnpm-package");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::create_dir_all(&links).unwrap();
+        let pnpm = global.join("pnpm");
+        std::fs::write(&pnpm, b"#!/bin/sh\nprintf shadow\n").unwrap();
+        std::fs::set_permissions(&pnpm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::hard_link(&pnpm, links.join("pnpm")).unwrap();
+
+        let shadow = PnpmShadowDir::create_if_needed(home.path(), &pnpm)
+            .unwrap()
+            .expect("hardlinked pnpm needs a shadow");
+        let shadow_path = shadow.binary();
+        let source_meta = std::fs::metadata(&pnpm).unwrap();
+        let shadow_meta = std::fs::metadata(&shadow_path).unwrap();
+
+        assert_ne!(source_meta.ino(), shadow_meta.ino());
+        assert_eq!(shadow_meta.permissions().mode() & 0o777, 0o500);
+        assert_eq!(
+            std::fs::metadata(shadow.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o500
+        );
+        let session_path = shadow.path().to_path_buf();
+        drop(shadow);
+        assert!(!session_path.exists());
+    }
+
+    #[test]
+    fn pnpm_without_store_hardlink_needs_no_shadow() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let pnpm = home.path().join("pnpm");
+        std::fs::write(&pnpm, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&pnpm, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            PnpmShadowDir::create_if_needed(home.path(), &pnpm)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pnpm_shadow_rejects_a_symlinked_base_before_cleanup() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let home = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        symlink(target.path(), home.path().join(PNPM_SHADOW_BASE)).unwrap();
+
+        let global = home.path().join("Library/pnpm/global/v11");
+        let links = home.path().join("Library/pnpm/store/v10/links/package");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::create_dir_all(&links).unwrap();
+        let pnpm = global.join("pnpm");
+        std::fs::write(&pnpm, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&pnpm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::hard_link(&pnpm, links.join("pnpm")).unwrap();
+
+        let err = PnpmShadowDir::create_if_needed(home.path(), &pnpm)
+            .expect_err("a symlinked shadow base must be rejected");
+        assert!(err.contains("is a symlink"), "{err}");
+        assert!(
+            target.path().read_dir().unwrap().next().is_none(),
+            "the symlink target must not be traversed or modified"
+        );
+    }
+
+    #[test]
+    fn pnpm_shadow_follows_custom_pnpm_home() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let pnpm_home = home.path().join("custom-pnpm");
+        let global = pnpm_home.join("global/v11");
+        let links = pnpm_home.join("store/v10/links/pnpm-package");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::create_dir_all(&links).unwrap();
+        let pnpm = global.join("pnpm");
+        std::fs::write(&pnpm, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&pnpm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::hard_link(&pnpm, links.join("pnpm")).unwrap();
+
+        assert!(
+            pnpm_has_store_alias_in(&pnpm, &[pnpm_home.join("store")]).unwrap(),
+            "a custom PNPM_HOME store alias must be detected"
+        );
     }
 
     #[test]
