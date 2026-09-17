@@ -170,7 +170,7 @@ pub const TRUSTED_BIN_DIRS: &[&str] = &[
 /// unmounted before the spawn (TOCTOU), and nothing here proves the file is
 /// the binary it claims to be. Trust comes from the directory being read-only
 /// to the sandbox — see [`TRUSTED_BIN_DIRS`] — never from this call.
-pub fn is_executable_file(path: &Path) -> bool {
+pub(crate) fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
 
     // `X_OK` on its own would also accept a *searchable directory*, so the

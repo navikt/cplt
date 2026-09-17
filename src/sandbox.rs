@@ -289,9 +289,26 @@ impl PreparedSandbox {
 /// - A Playwright socket directory is supplied on a non-macOS platform
 /// - The platform does not support sandboxing
 pub fn prepare(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
+    prepare_with_pnpm_shadow(config, None)
+}
+
+/// Validate and compile a sandbox with a cplt-owned pnpm shadow.
+pub fn prepare_with_pnpm_shadow(
+    config: &SandboxConfig,
+    pnpm_shadow_dir: Option<&Path>,
+) -> Result<PreparedSandbox, String> {
     validate_playwright_socket_capability(config.playwright_socket_dir)?;
     validate_hard_denied_grants(config)?;
+    validate_pnpm_tool_dirs(config)?;
     validate_exec_grants(config)?;
+    if let Some(shadow) = pnpm_shadow_dir
+        && !config.extra_exec.iter().any(|path| path == shadow)
+    {
+        return Err(format!(
+            "pnpm shadow {} is not present in the executable grants",
+            shadow.display()
+        ));
+    }
     // The named roots' resolved gitdirs join the write grants' here: they are
     // granted (see `named_root_git_dirs`) and therefore need the same
     // persistence denies and the same bubblewrap read-only binds.
@@ -303,7 +320,51 @@ pub fn prepare(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
     }
     git_dirs.sort();
     git_dirs.dedup();
-    prepare_impl(config, &git_dirs)
+    prepare_impl(config, &git_dirs, pnpm_shadow_dir)
+}
+
+fn validate_pnpm_tool_dirs(config: &SandboxConfig) -> Result<(), String> {
+    let tool_dirs = policy::active_tool_dirs(config.home_dir, config.existing_home_tool_dirs);
+    for package_store in tool_dirs.iter().filter(|dir| {
+        Path::new(dir.dir.path)
+            .file_name()
+            .is_some_and(|name| name == "package-manager-store")
+    }) {
+        let resolved = crate::config::canonicalize_deepest(&package_store.path);
+        let expected = package_store
+            .path
+            .strip_prefix(config.home_dir)
+            .map_or_else(
+                |_| package_store.path.clone(),
+                |relative| crate::config::canonicalize_deepest(config.home_dir).join(relative),
+            );
+        if resolved != expected {
+            return Err(format!(
+                "pnpm package-manager-store {} resolves through a symlink to {}. \
+                 cplt refuses a writable executable store whose target differs from its \
+                 configured path.",
+                package_store.path.display(),
+                resolved.display()
+            ));
+        }
+        for writable in tool_dirs
+            .iter()
+            .filter(|dir| dir.dir.write && dir.path != package_store.path)
+        {
+            if package_store.path.starts_with(&writable.path)
+                || writable.path.starts_with(&package_store.path)
+            {
+                return Err(format!(
+                    "pnpm package-manager-store {} overlaps writable tool directory {}. \
+                     A nested writable executable store would let the agent drop and run \
+                     a binary; move PNPM_HOME outside writable cache trees.",
+                    package_store.path.display(),
+                    writable.path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Refuse to launch when a grant names a hard-denied file or a credential
@@ -708,6 +769,7 @@ pub fn exec_sandboxed(
 fn prepare_impl(
     config: &SandboxConfig,
     extra_git_dirs: &[PathBuf],
+    pnpm_shadow_dir: Option<&Path>,
 ) -> Result<PreparedSandbox, String> {
     validate_config_paths(config)?;
     // Interpolated into the profile like every other path — same injection check.
@@ -730,11 +792,7 @@ fn prepare_impl(
         home_dir: config.home_dir.to_path_buf(),
         profile_text,
         scratch_dir: config.scratch_dir.map(Path::to_path_buf),
-        pnpm_shadow_dir: config
-            .extra_exec
-            .iter()
-            .find(|path| path.starts_with(config.home_dir.join(".cplt-pnpm-shadow")))
-            .cloned(),
+        pnpm_shadow_dir: pnpm_shadow_dir.map(Path::to_path_buf),
         playwright_socket_dir: playwright_socket_dir.map(Path::to_path_buf),
         playwright_runtime: policy::playwright_runtime_intent(
             config.allow_cache_exec,
@@ -955,6 +1013,7 @@ fn ro_protect_paths(
 fn prepare_impl(
     config: &SandboxConfig,
     extra_git_dirs: &[PathBuf],
+    pnpm_shadow_dir: Option<&Path>,
 ) -> Result<PreparedSandbox, String> {
     // Warn about config options that Linux cannot enforce at kernel level.
     // (Deny paths are handled after bwrap resolution below — with Bubblewrap
@@ -1164,11 +1223,7 @@ fn prepare_impl(
         home_dir: config.home_dir.to_path_buf(),
         profile_text,
         scratch_dir: config.scratch_dir.map(Path::to_path_buf),
-        pnpm_shadow_dir: config
-            .extra_exec
-            .iter()
-            .find(|path| path.starts_with(config.home_dir.join(".cplt-pnpm-shadow")))
-            .cloned(),
+        pnpm_shadow_dir: pnpm_shadow_dir.map(Path::to_path_buf),
         // The automatic capability is macOS-only; direct Linux callers cannot
         // introduce a new /tmp path lifecycle or child environment override.
         playwright_socket_dir: None,
@@ -1398,6 +1453,76 @@ mod tests {
             allow_browser: false,
             use_bubblewrap: None,
         }
+    }
+
+    fn pnpm_tool_dir(path: &str) -> &'static HomeToolDir {
+        HOME_TOOL_DIRS
+            .iter()
+            .find(|dir| dir.path == path)
+            .expect("pnpm tool dir")
+    }
+
+    #[test]
+    fn pnpm_package_manager_store_must_not_overlap_a_writable_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let store = home.join(".local/share/pnpm/store");
+        let package_store = store.join("custom/package-manager-store");
+        std::fs::create_dir_all(&package_store).unwrap();
+        let dirs = [
+            ResolvedToolDir {
+                path: store,
+                dir: pnpm_tool_dir(".local/share/pnpm/store"),
+            },
+            ResolvedToolDir {
+                path: package_store,
+                dir: pnpm_tool_dir(".local/share/pnpm/package-manager-store"),
+            },
+        ];
+        let mut config = test_config(home, &[]);
+        config.existing_home_tool_dirs = Some(&dirs);
+
+        let error = validate_pnpm_tool_dirs(&config).expect_err("overlap must be refused");
+        assert!(error.contains("overlaps writable tool directory"));
+    }
+
+    #[test]
+    fn pnpm_package_manager_store_must_not_resolve_through_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let target = temp.path().join("target");
+        std::fs::create_dir_all(home.join(".local/share/pnpm")).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        let package_store = home.join(".local/share/pnpm/package-manager-store");
+        symlink(&target, &package_store).unwrap();
+        let dirs = [ResolvedToolDir {
+            path: package_store,
+            dir: pnpm_tool_dir(".local/share/pnpm/package-manager-store"),
+        }];
+        let mut config = test_config(&home, &[]);
+        config.existing_home_tool_dirs = Some(&dirs);
+
+        let error = validate_pnpm_tool_dirs(&config).expect_err("symlink must be refused");
+        assert!(error.contains("resolves through a symlink"));
+    }
+
+    #[test]
+    fn ordinary_exec_grant_is_not_treated_as_a_pnpm_shadow() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let project = temp.path().join("project");
+        let grant = home.join(".cplt-pnpm-shadow/user-selected");
+        std::fs::create_dir_all(&grant).unwrap();
+        std::fs::create_dir(&project).unwrap();
+        let grants = [grant];
+        let mut config = test_config(&home, &[]);
+        config.project_dir = &project;
+        config.extra_exec = &grants;
+
+        let prepared = prepare(&config).expect("ordinary grant must prepare");
+        assert_eq!(prepared.pnpm_shadow_dir, None);
     }
 
     /// Finding A: the agent's own writable data dirs are granted by the

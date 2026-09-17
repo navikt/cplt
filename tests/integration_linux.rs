@@ -226,22 +226,31 @@ mod linux_tests {
         let store = pnpm_home.join("store/v10/links/package");
         let package_manager_store = pnpm_home.join("package-manager-store/v10");
         fs::create_dir_all(&store).expect("create content store");
-        fs::create_dir_all(&package_manager_store).expect("create package manager store");
 
         let source = pnpm_home.join("pnpm");
+        let standalone = pnpm_home.join("standalone");
         let store_pnpm = store.join("pnpm");
+        let new_alias = store.join("new-alias");
         let managed_pnpm = package_manager_store.join("pnpm");
         fs::write(&source, "#!/bin/sh\nprintf 'shadow:OK\\n'\n").expect("write pnpm");
+        fs::write(&standalone, "#!/bin/sh\nprintf 'standalone:OK\\n'\n")
+            .expect("write standalone executable");
         fs::hard_link(&source, &store_pnpm).expect("hardlink pnpm into store");
-        fs::write(&managed_pnpm, "#!/bin/sh\nprintf 'managed:OK\\n'\n")
-            .expect("write managed pnpm");
         fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
-        fs::set_permissions(&managed_pnpm, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&standalone, fs::Permissions::from_mode(0o755)).unwrap();
 
         let script = format!(
-            "if '{store_pnpm}'; then printf 'store:FAIL\\n'; else printf 'store:OK\\n'; fi; \
+            "mkdir -p '{managed_dir}'; \
+             printf '#!/bin/sh\necho managed:OK\n' > '{managed_pnpm}'; \
+             chmod 755 '{managed_pnpm}'; \
+             if ln '{standalone}' '{new_alias}'; then printf 'link:FAIL\\n'; else printf 'link:OK\\n'; fi; \
+             '{standalone}'; \
+             if '{store_pnpm}'; then printf 'store:FAIL\\n'; else printf 'store:OK\\n'; fi; \
              '{managed_pnpm}'; pnpm",
             store_pnpm = store_pnpm.display(),
+            standalone = standalone.display(),
+            new_alias = new_alias.display(),
+            managed_dir = managed_pnpm.parent().unwrap().display(),
             managed_pnpm = managed_pnpm.display(),
         );
         let project_dir = project.path().to_string_lossy().into_owned();
@@ -268,6 +277,8 @@ mod linux_tests {
             "pnpm workflow should succeed.\nstdout: {stdout}\nstderr: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        assert!(stdout.contains("link:OK"), "{stdout}");
+        assert!(stdout.contains("standalone:OK"), "{stdout}");
         assert!(stdout.contains("store:OK"), "{stdout}");
         assert!(stdout.contains("managed:OK"), "{stdout}");
         assert!(stdout.contains("shadow:OK"), "{stdout}");

@@ -520,40 +520,43 @@ mod macos_tests {
         let package_manager_store = home.path().join("Library/pnpm/package-manager-store");
         fs::create_dir_all(&global).expect("create pnpm global directory");
         fs::create_dir_all(&store).expect("create pnpm hardlink directory");
-        fs::create_dir_all(&package_manager_store).expect("create pnpm version store");
 
         let source = global.join("pnpm");
+        let standalone = global.join("standalone");
         let pnpm = store.join("pnpm");
+        let new_alias = store.join("new-alias");
         let other = store.join("not-pnpm");
         let managed_pnpm = package_manager_store.join("v10/pnpm");
-        fs::create_dir_all(managed_pnpm.parent().unwrap()).expect("create managed pnpm directory");
         fs::write(&source, "#!/bin/sh\nprintf 'pnpm hardlink ran\\n'\n").expect("write fake pnpm");
-        fs::write(
-            &managed_pnpm,
-            "#!/bin/sh\nprintf 'pnpm managed version ran\\n'\n",
-        )
-        .expect("write managed pnpm");
+        fs::write(&standalone, "#!/bin/sh\nprintf 'standalone ran\\n'\n")
+            .expect("write standalone executable");
         fs::hard_link(&source, &pnpm).expect("create pnpm hardlink");
         fs::hard_link(&source, &other).expect("create non-pnpm hardlink");
         fs::set_permissions(&source, fs::Permissions::from_mode(0o755))
             .expect("make fake pnpm executable");
-        fs::set_permissions(&managed_pnpm, fs::Permissions::from_mode(0o755))
-            .expect("make managed pnpm executable");
+        fs::set_permissions(&standalone, fs::Permissions::from_mode(0o755))
+            .expect("make standalone executable");
 
         let shadow = cplt::scratch::PnpmShadowDir::create_if_needed(home.path(), &source)
             .expect("create pnpm shadow")
             .expect("hardlinked pnpm must use a shadow");
-        let extra_exec = vec![shadow.path().to_path_buf()];
+        let extra_exec = vec![shadow.path().to_path_buf(), standalone.clone()];
         let mut opts = default_opts(project.path(), home.path());
         opts.extra_exec = &extra_exec;
         let profile = write_real_profile(&opts);
         let command = format!(
-            "printf state > '{managed_state}' && '{managed_pnpm}' && \
+            "mkdir -p '{managed_dir}' && \
+             printf '#!/bin/sh\necho pnpm-managed-version-ran\n' > '{managed_pnpm}' && \
+             chmod 755 '{managed_pnpm}' && '{managed_pnpm}' && \
+             if ln '{standalone}' '{new_alias}'; then printf 'link:FAIL\n'; else printf 'link:OK\n'; fi && \
+             '{standalone}' && \
              PATH='{shadow}:/usr/bin:/bin' pnpm && \
              printf compromised > '{pnpm}' && \
              PATH='{shadow}:/usr/bin:/bin' pnpm",
-            managed_state = package_manager_store.join("state").display(),
+            managed_dir = managed_pnpm.parent().unwrap().display(),
             managed_pnpm = managed_pnpm.display(),
+            standalone = standalone.display(),
+            new_alias = new_alias.display(),
             shadow = shadow.path().display(),
             pnpm = pnpm.display(),
         );
@@ -564,8 +567,12 @@ mod macos_tests {
             "pnpm's read-only shadow and version store must work: {output}"
         );
         assert!(
-            output.contains("pnpm managed version ran"),
+            output.contains("pnpm-managed-version-ran"),
             "the pinned pnpm executable did not run: {output}"
+        );
+        assert!(
+            output.contains("link:OK") && output.contains("standalone ran"),
+            "a read-only executable must not be linkable into the writable store: {output}"
         );
         assert_eq!(
             output.matches("pnpm hardlink ran").count(),

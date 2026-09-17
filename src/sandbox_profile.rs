@@ -1590,7 +1590,18 @@ fn emit_path_bin_denies(sb: &mut String, home_dir: &Path) {
                     continue;
                 }
                 let r = escape_regex(&path.to_string_lossy());
-                sbpl!(sb, "(deny file-write* (regex #\"^{r}/[^/]+$\"))");
+                for kind in ["REGULAR-FILE", "SYMLINK"] {
+                    sbpl!(
+                        sb,
+                        "(deny file-write* (require-all (regex #\"^{r}/[^/]+$\") (vnode-type {kind})))"
+                    );
+                }
+                let p = path.display();
+                sbpl!(sb, "(deny process-exec (subpath \"{p}\"))");
+                sbpl!(
+                    sb,
+                    "(allow process-exec (subpath \"{p}/package-manager-store\"))"
+                );
             }
         }
     }
@@ -1849,6 +1860,7 @@ fn emit_exec_write_denies(sb: &mut String, extra_exec: &[PathBuf]) {
     sbpl!(sb, ";; allow.exec trees stay read-only (write-then-exec)");
     for path in extra_exec {
         let p = path.to_string_lossy();
+        sbpl!(sb, "(allow process-exec (subpath \"{p}\"))");
         sbpl!(sb, "(deny file-write* (subpath \"{p}\"))");
     }
     sbpl!(sb);

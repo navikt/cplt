@@ -3749,12 +3749,20 @@ const PATH_BIN_DENY_RULES: &[(&str, &str)] = &[
         r#"(deny file-write* (subpath "/Users/test/.deno/bin"))"#,
     ),
     (
-        "$PNPM_HOME (macOS default)",
-        r#"(deny file-write* (regex #"^/Users/test/Library/pnpm/[^/]+$"))"#,
+        "$PNPM_HOME regular files (macOS default)",
+        r#"(deny file-write* (require-all (regex #"^/Users/test/Library/pnpm/[^/]+$") (vnode-type REGULAR-FILE)))"#,
     ),
     (
-        "$PNPM_HOME (XDG default)",
-        r#"(deny file-write* (regex #"^/Users/test/\.local/share/pnpm/[^/]+$"))"#,
+        "$PNPM_HOME symlinks (macOS default)",
+        r#"(deny file-write* (require-all (regex #"^/Users/test/Library/pnpm/[^/]+$") (vnode-type SYMLINK)))"#,
+    ),
+    (
+        "$PNPM_HOME regular files (XDG default)",
+        r#"(deny file-write* (require-all (regex #"^/Users/test/\.local/share/pnpm/[^/]+$") (vnode-type REGULAR-FILE)))"#,
+    ),
+    (
+        "$PNPM_HOME symlinks (XDG default)",
+        r#"(deny file-write* (require-all (regex #"^/Users/test/\.local/share/pnpm/[^/]+$") (vnode-type SYMLINK)))"#,
     ),
     (
         "mise shims/",

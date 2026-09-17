@@ -69,7 +69,7 @@ pub struct PnpmShadowDir {
 impl PnpmShadowDir {
     /// Copy `pnpm` when it shares an inode with a pnpm store hardlink.
     pub fn create_if_needed(home_dir: &Path, pnpm: &Path) -> Result<Option<Self>, String> {
-        if !pnpm_has_store_alias(home_dir, pnpm)? {
+        if !pnpm_requires_shadow(home_dir, pnpm)? {
             return Ok(None);
         }
         use std::os::unix::fs::MetadataExt;
@@ -192,7 +192,8 @@ fn copy_executable(source: &Path, destination: &Path) -> Result<(), String> {
         .map_err(|e| format!("Cannot set pnpm shadow permissions: {e}"))
 }
 
-fn pnpm_has_store_alias(home_dir: &Path, pnpm: &Path) -> Result<bool, String> {
+/// Whether pnpm must run from a read-only shadow instead of its source inode.
+pub fn pnpm_requires_shadow(home_dir: &Path, pnpm: &Path) -> Result<bool, String> {
     let roots: Vec<PathBuf> = pnpm_home_roots(home_dir)
         .into_iter()
         .filter_map(|root| std::fs::canonicalize(root.join("store")).ok())
@@ -316,6 +317,40 @@ fn lock_pnpm_shadow_session(
     Ok(session)
 }
 
+/// Remove stale pnpm shadows even when the current pnpm does not need one.
+pub fn cleanup_stale_pnpm_shadows(home_dir: &Path) -> Result<(), String> {
+    let base = home_dir.join(PNPM_SHADOW_BASE);
+    match base.symlink_metadata() {
+        Ok(_) => validate_dir_safety(&base, "pnpm shadow base")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "Cannot inspect pnpm shadow base {}: {error}",
+                base.display()
+            ));
+        }
+    }
+    let canonical_home = std::fs::canonicalize(home_dir)
+        .map_err(|e| format!("Cannot canonicalize home dir {}: {e}", home_dir.display()))?;
+    let canonical_base = std::fs::canonicalize(&base).map_err(|e| {
+        format!(
+            "Cannot canonicalize pnpm shadow base {}: {e}",
+            base.display()
+        )
+    })?;
+    if canonical_base != canonical_home.join(PNPM_SHADOW_BASE) {
+        return Err(format!(
+            "pnpm shadow base resolved to {} but expected {}. An ancestor directory may be a symlink",
+            canonical_base.display(),
+            canonical_home.join(PNPM_SHADOW_BASE).display()
+        ));
+    }
+    let identity = secure_dir_identity(&canonical_base, "pnpm shadow base")?;
+    let base_file = lock_pnpm_shadow_base(&canonical_base, identity)?;
+    gc_stale_pnpm_shadows(&canonical_base, &base_file);
+    Ok(())
+}
+
 fn gc_stale_pnpm_shadows(base: &Path, base_file: &std::fs::File) {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
@@ -389,10 +424,7 @@ fn gc_stale_pnpm_shadows(base: &Path, base_file: &std::fs::File) {
         let removed =
             unsafe { libc::unlinkat(base_file.as_raw_fd(), c_name.as_ptr(), libc::AT_REMOVEDIR) };
         if removed != 0 {
-            ui::warn(&format!(
-                "Warning: cannot remove stale pnpm shadow {}",
-                base.join(name).display()
-            ));
+            ui::warn("Warning: cannot remove a stale pnpm shadow");
         }
     }
 }
@@ -1044,7 +1076,6 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let base = home.path().join(PNPM_SHADOW_BASE);
         create_secure_dir(&base, "pnpm shadow base").unwrap();
-        let identity = secure_dir_identity(&base, "pnpm shadow base").unwrap();
         let stale = base.join("0123456789abcdef0123456789abcdef");
         let fresh = base.join("fedcba9876543210fedcba9876543210");
         create_secure_dir(&stale, "stale shadow").unwrap();
@@ -1059,8 +1090,7 @@ mod tests {
         std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o500)).unwrap();
         std::fs::set_permissions(&fresh, std::fs::Permissions::from_mode(0o500)).unwrap();
 
-        let base_file = lock_pnpm_shadow_base(&base, identity).unwrap();
-        gc_stale_pnpm_shadows(&base, &base_file);
+        cleanup_stale_pnpm_shadows(home.path()).unwrap();
 
         assert!(!stale.exists());
         assert!(fresh.exists());
@@ -1071,7 +1101,6 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let base = home.path().join(PNPM_SHADOW_BASE);
         create_secure_dir(&base, "pnpm shadow base").unwrap();
-        let base_identity = secure_dir_identity(&base, "pnpm shadow base").unwrap();
         let live = base.join("0123456789abcdef0123456789abcdef");
         create_secure_dir(&live, "live shadow").unwrap();
         std::fs::write(live.join("pnpm"), b"live").unwrap();
@@ -1084,8 +1113,7 @@ mod tests {
             .unwrap();
         std::fs::set_permissions(&live, std::fs::Permissions::from_mode(0o500)).unwrap();
 
-        let base_file = lock_pnpm_shadow_base(&base, base_identity).unwrap();
-        gc_stale_pnpm_shadows(&base, &base_file);
+        cleanup_stale_pnpm_shadows(home.path()).unwrap();
 
         assert!(live.exists());
     }

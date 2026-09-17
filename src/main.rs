@@ -1951,7 +1951,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
     };
     let invocation_dir = std::env::current_dir()
         .and_then(std::fs::canonicalize)
-        .map_err(|e| anyhow::anyhow!("Cannot resolve cwd: {e}"))?;
+        .unwrap_or_else(|_| project_dir.clone());
 
     // ── CPLT_CONFIG sanity check (issue #261) ────────────────────
     // The env var replaces the whole user config, every [sandbox] key included,
@@ -4296,7 +4296,7 @@ fn resolve_exec_binary(name: &str) -> anyhow::Result<PathBuf> {
         let canonical = std::fs::canonicalize(&p).with_context(|| {
             format!("exec: binary not found or not accessible: {}", p.display())
         })?;
-        if cplt::git::is_executable_file(&canonical) {
+        if is_executable_file(&canonical) {
             return Ok(canonical);
         }
         bail!("exec: not an executable file: {}", canonical.display());
@@ -4307,7 +4307,7 @@ fn resolve_exec_binary(name: &str) -> anyhow::Result<PathBuf> {
         let canonical = std::fs::canonicalize(cwd.join(name)).with_context(|| {
             format!("exec: relative binary not found or not accessible: {name}")
         })?;
-        if cplt::git::is_executable_file(&canonical) {
+        if is_executable_file(&canonical) {
             return Ok(canonical);
         }
         bail!("exec: not an executable file: {}", canonical.display());
@@ -4319,7 +4319,7 @@ fn resolve_exec_binary(name: &str) -> anyhow::Result<PathBuf> {
 fn resolve_exec_binary_in_path(name: &str, path_var: &std::ffi::OsStr) -> anyhow::Result<PathBuf> {
     for dir in std::env::split_paths(path_var) {
         let candidate = dir.join(name);
-        if cplt::git::is_executable_file(&candidate) {
+        if is_executable_file(&candidate) {
             return std::fs::canonicalize(&candidate).with_context(|| {
                 format!(
                     "exec: cannot resolve executable candidate {}",
@@ -4329,6 +4329,35 @@ fn resolve_exec_binary_in_path(name: &str, path_var: &std::ffi::OsStr) -> anyhow
         }
     }
     bail!("exec: '{name}' not found in PATH")
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    path.metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+fn pnpm_exec_grants(
+    home_dir: &Path,
+    pnpm: Option<&Path>,
+    shadowed: bool,
+    project_dir: &Path,
+    named_roots: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut grants = scratch::pnpm_path_executables(home_dir);
+    if !shadowed
+        && let Some(pnpm) = pnpm
+        && scratch::pnpm_needs_exec_grant(home_dir, pnpm)
+    {
+        grants.push(pnpm.to_path_buf());
+    }
+    grants.retain(|path| {
+        !path.starts_with(project_dir) && !named_roots.iter().any(|root| path.starts_with(root))
+    });
+    grants.sort();
+    grants.dedup();
+    grants
 }
 
 /// Point a bare guarded command name at its guard shim instead of the real
@@ -4608,6 +4637,10 @@ fn assemble_sandbox(
         .transpose()
         .map_err(|error| anyhow::anyhow!("Cannot prepare pnpm executable: {error}"))?
         .flatten();
+    if pnpm_shadow_guard.is_none() {
+        scratch::cleanup_stale_pnpm_shadows(home_dir)
+            .map_err(|error| anyhow::anyhow!("Cannot clean stale pnpm shadows: {error}"))?;
+    }
     let pnpm_shadow_path = pnpm_shadow_guard
         .as_ref()
         .map(cplt::scratch::PnpmShadowDir::path);
@@ -4704,13 +4737,13 @@ fn assemble_sandbox(
     );
 
     let mut extra_exec = resolved.allow_exec.clone();
-    extra_exec.extend(scratch::pnpm_path_executables(home_dir));
-    if pnpm_shadow_guard.is_none()
-        && let Some(pnpm) = pnpm
-        && scratch::pnpm_needs_exec_grant(home_dir, &pnpm)
-    {
-        extra_exec.push(pnpm);
-    }
+    extra_exec.extend(pnpm_exec_grants(
+        home_dir,
+        pnpm.as_deref(),
+        pnpm_shadow_guard.is_some(),
+        probe.project_dir.as_path(),
+        opts.repos.dirs,
+    ));
     extra_exec.extend(pnpm_shadow_path.map(Path::to_path_buf));
     extra_exec.sort();
     extra_exec.dedup();
@@ -4734,7 +4767,8 @@ fn assemble_sandbox(
     let policy = sandbox::generate_policy(&sandbox_config);
     // Path validation (SBPL injection checks on macOS) is handled internally by
     // prepare(), so callers don't need to know about backend-specific risks.
-    let prepared = sandbox::prepare(&sandbox_config).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let prepared = sandbox::prepare_with_pnpm_shadow(&sandbox_config, pnpm_shadow_path)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     Ok(AssembledSandbox {
         prepared,
@@ -6361,13 +6395,27 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         &resolved.deny_env,
         resolved.keychain_substitute,
     );
+    let doctor_pnpm = resolve_exec_binary("pnpm").ok();
+    let doctor_pnpm_shadowed = doctor_pnpm
+        .as_ref()
+        .is_some_and(|pnpm| scratch::pnpm_requires_shadow(&home_dir, pnpm).unwrap_or(false));
+    let mut doctor_exec = resolved.allow_exec.clone();
+    doctor_exec.extend(pnpm_exec_grants(
+        &home_dir,
+        doctor_pnpm.as_deref(),
+        doctor_pnpm_shadowed,
+        &project_dir,
+        &repo_paths,
+    ));
+    doctor_exec.sort();
+    doctor_exec.dedup();
     let sandbox_config = build_sandbox_config(
         &resolved,
         &probe,
         active_agent,
         &agent_dirs,
         NamedRepos::new(&repo_paths, &repo_git_dirs, &repo_rows),
-        &resolved.allow_exec,
+        &doctor_exec,
         SessionPaths::default(),
         keychain_substitute,
     );
@@ -6395,6 +6443,12 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
     let mut tool_names: Vec<&str> = Vec::new();
     for (name, path) in &tools {
         let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+        if *name == "pnpm"
+            && doctor_pnpm_shadowed
+            && doctor_pnpm.as_ref().is_some_and(|pnpm| pnpm == &canon)
+        {
+            continue;
+        }
         if agent::is_wsl_interop_binary(&canon, wsl) {
             let critical = discover::WSL_CRITICAL_TOOLS.contains(name);
             let msg = format!(
@@ -9152,6 +9206,24 @@ mod tests {
         assert_eq!(
             resolve_exec_binary_in_path("pnpm", &path).unwrap(),
             executable.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn automatic_pnpm_exec_grants_skip_project_roots() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let project = home.join("Library/pnpm/project");
+        std::fs::create_dir_all(&project).unwrap();
+        let pnpm = project.join("pnpm");
+        std::fs::write(&pnpm, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&pnpm, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(
+            pnpm_exec_grants(home, Some(&pnpm), false, &project, &[]).is_empty(),
+            "the project grant already provides execution"
         );
     }
 

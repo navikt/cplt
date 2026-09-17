@@ -1510,8 +1510,8 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
         write: true,
     },
     // XDG spelling of the same store. The parent (~/.local/share/pnpm) is
-    // granted read+exec by the pnpm AppDir entry, which no longer grants write
-    // there — this is the carve-out that keeps `pnpm install` working.
+    // readable but non-executable; exact executable grants and the
+    // package-manager-store carve-out are emitted separately.
     HomeToolDir {
         path: ".local/share/pnpm/store",
         process_exec: false,
