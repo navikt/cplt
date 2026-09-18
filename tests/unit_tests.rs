@@ -2056,7 +2056,12 @@ fn write_exec_deny_comes_after_every_broad_exec_allow() {
         .expect("allow.write tree must get an exec-deny");
     // Every exec allow that is not one of the deliberate carve-outs re-issued
     // after the deny.
-    let carve_outs = ["/Users/test/.gradle/jdks", "/Users/test/.bun/install"];
+    let carve_outs = [
+        "/Users/test/.gradle/jdks",
+        "/Users/test/.bun/install",
+        "/Users/test/Library/pnpm/package-manager-store",
+        "/Users/test/.local/share/pnpm/package-manager-store",
+    ];
     const PREFIX: &str = "(allow process-exec (subpath \"";
     for (i, _) in p.match_indices(PREFIX) {
         let path = p[i + PREFIX.len()..].split('"').next().unwrap_or_default();
@@ -3745,11 +3750,11 @@ const PATH_BIN_DENY_RULES: &[(&str, &str)] = &[
     ),
     (
         "$PNPM_HOME (macOS default)",
-        r#"(deny file-write* (regex #"^/Users/test/Library/pnpm/[^/]+$"))"#,
+        r#"(deny file-write* (subpath "/Users/test/Library/pnpm"))"#,
     ),
     (
         "$PNPM_HOME (XDG default)",
-        r#"(deny file-write* (regex #"^/Users/test/\.local/share/pnpm/[^/]+$"))"#,
+        r#"(deny file-write* (subpath "/Users/test/.local/share/pnpm"))"#,
     ),
     (
         "mise shims/",
@@ -3862,11 +3867,48 @@ fn profile_keeps_the_sibling_package_and_cache_trees_writable() {
             r#"(allow file-write* (subpath "/Users/test/.local/share/pnpm/store"))"#,
         ),
         (
+            "pnpm's self-managed version store (macOS)",
+            r#"(allow file-write* (subpath "/Users/test/Library/pnpm/package-manager-store"))"#,
+        ),
+        (
+            "pnpm's self-managed version store (XDG)",
+            r#"(allow file-write* (subpath "/Users/test/.local/share/pnpm/package-manager-store"))"#,
+        ),
+        (
             "the mise data dir",
             r#"(allow file-write* (subpath "/Users/test/.local/share/mise"))"#,
         ),
     ] {
         assert!(p.contains(rule), "{what} must stay writable: {rule}");
+    }
+}
+
+#[test]
+fn profile_keeps_pnpm_store_non_executable_and_allows_version_store() {
+    let p = default_profile();
+    for path in ["/Users/test/Library/pnpm", "/Users/test/.local/share/pnpm"] {
+        assert!(
+            !p.contains(&format!("(allow process-exec (subpath \"{path}\"))")),
+            "{path} must not recursively grant execution into its writable store"
+        );
+    }
+    for path in [
+        "/Users/test/Library/pnpm/store",
+        "/Users/test/.local/share/pnpm/store",
+    ] {
+        assert!(
+            p.contains(&format!("(deny process-exec (subpath \"{path}\"))")),
+            "{path} must remain non-executable"
+        );
+    }
+    for path in [
+        "/Users/test/Library/pnpm/package-manager-store",
+        "/Users/test/.local/share/pnpm/package-manager-store",
+    ] {
+        assert!(
+            p.contains(&format!("(allow process-exec (subpath \"{path}\"))")),
+            "{path} must execute pnpm's pinned package-manager version"
+        );
     }
 }
 
@@ -3945,6 +3987,10 @@ fn pnpm_app_dir_does_not_grant_write_to_its_data_dir() {
     assert!(
         pnpm.read_paths(home).contains(&data),
         "the pnpm data dir must stay readable"
+    );
+    assert!(
+        !pnpm.process_exec_paths(home).contains(&data),
+        "a parent execute grant would make the writable store executable under Landlock"
     );
 }
 
@@ -8376,6 +8422,7 @@ fn relocatable_prefix_covers_split_trees_only() {
     assert_eq!(relocatable_tool_prefix("CARGO_HOME"), Some(".cargo"));
     assert_eq!(relocatable_tool_prefix("RUSTUP_HOME"), Some(".rustup"));
     assert_eq!(relocatable_tool_prefix("GOPATH"), Some("go"));
+    assert_eq!(relocatable_tool_prefix("PNPM_HOME"), Some("Library/pnpm"));
     // No HOME_TOOL_DIRS entry lives under go/pkg/mod → plain whole-tree grant.
     assert_eq!(relocatable_tool_prefix("GOMODCACHE"), None);
     assert_eq!(relocatable_tool_prefix("NODE_PATH"), None);
@@ -8408,6 +8455,32 @@ fn resolve_reroots_entries_under_relocated_home() {
         tool_dir(".cargo/bin").resolve(home, &[]).path,
         PathBuf::from("/home/tester/.cargo/bin")
     );
+}
+
+#[test]
+fn resolve_reroots_split_pnpm_permissions() {
+    let home = std::path::Path::new("/home/tester");
+    let root = PathBuf::from("/home/tester/custom-pnpm");
+    let roots = vec![ToolRoot {
+        default: "Library/pnpm",
+        root: root.clone(),
+    }];
+
+    let pnpm_home = tool_dir("Library/pnpm").resolve(home, &roots);
+    assert_eq!(pnpm_home.path, root);
+    assert!(!pnpm_home.dir.process_exec && !pnpm_home.dir.write);
+
+    let store = tool_dir("Library/pnpm/store").resolve(home, &roots);
+    assert_eq!(store.path, root.join("store"));
+    assert!(store.dir.write && !store.dir.process_exec);
+
+    let package_manager_store =
+        tool_dir("Library/pnpm/package-manager-store").resolve(home, &roots);
+    assert_eq!(
+        package_manager_store.path,
+        root.join("package-manager-store")
+    );
+    assert!(package_manager_store.dir.write && package_manager_store.dir.process_exec);
 }
 
 #[test]

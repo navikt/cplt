@@ -1676,6 +1676,10 @@ struct ResolvedContext {
     config_path: Option<PathBuf>,
     home_dir: PathBuf,
     project_dir: PathBuf,
+    /// Pi resolves project-local prompts from its process cwd. Keep this inside
+    /// the sandbox project scope; an explicit project directory still anchors a
+    /// caller that invoked cplt from elsewhere.
+    launch_dir: PathBuf,
     /// Validated named roots: repositories the agent works in alongside the
     /// launch one, from `--repo-dir` and `sandbox.repo_dirs` in the per-repo
     /// local config. Empty unless one of the two named something.
@@ -1945,6 +1949,9 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             }
         }
     };
+    let invocation_dir = std::env::current_dir()
+        .and_then(std::fs::canonicalize)
+        .unwrap_or_else(|_| project_dir.clone());
 
     // ── CPLT_CONFIG sanity check (issue #261) ────────────────────
     // The env var replaces the whole user config, every [sandbox] key included,
@@ -2605,11 +2612,19 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         }
     }
 
+    let launch_dir = if active_agent == agent::Agent::Pi && invocation_dir.starts_with(&project_dir)
+    {
+        invocation_dir
+    } else {
+        project_dir.clone()
+    };
+
     Ok(ResolvedContext {
         resolved,
         config_path,
         home_dir,
         project_dir,
+        launch_dir,
         repo_roots,
         active_agent,
         unapproved_proposals,
@@ -3608,6 +3623,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         config_path,
         home_dir,
         project_dir,
+        launch_dir,
         repo_roots,
         active_agent,
         unapproved_proposals: _,
@@ -3662,6 +3678,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         policy,
         proxy_handle,
         scratch_guard: _scratch_guard,
+        pnpm_shadow_guard: _pnpm_shadow_guard,
         #[cfg(target_os = "macos")]
             playwright_socket_guard: _playwright_socket_guard,
         ..
@@ -3676,6 +3693,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             copilot_install_dir: copilot_install_dir.as_deref(),
             electron_app_dir: electron_app_dir.as_deref(),
             announce_scratch: true,
+            pnpm_candidate: None,
         },
     )?;
 
@@ -3840,6 +3858,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
                 &prepared,
                 &agent_bin,
                 &copilot_args,
+                &launch_dir,
                 &repo_paths,
                 &resolved.pass_env,
                 resolved.inherit_env,
@@ -4277,10 +4296,10 @@ fn resolve_exec_binary(name: &str) -> anyhow::Result<PathBuf> {
         let canonical = std::fs::canonicalize(&p).with_context(|| {
             format!("exec: binary not found or not accessible: {}", p.display())
         })?;
-        if canonical.is_file() {
+        if is_executable_file(&canonical) {
             return Ok(canonical);
         }
-        bail!("exec: not a file: {}", canonical.display());
+        bail!("exec: not an executable file: {}", canonical.display());
     }
     // Relative path (e.g. `./vendor-script.sh`) — resolve against cwd, not PATH.
     if name.contains('/') {
@@ -4288,19 +4307,57 @@ fn resolve_exec_binary(name: &str) -> anyhow::Result<PathBuf> {
         let canonical = std::fs::canonicalize(cwd.join(name)).with_context(|| {
             format!("exec: relative binary not found or not accessible: {name}")
         })?;
-        if canonical.is_file() {
+        if is_executable_file(&canonical) {
             return Ok(canonical);
         }
-        bail!("exec: not a file: {}", canonical.display());
+        bail!("exec: not an executable file: {}", canonical.display());
     }
-    let path_var = std::env::var("PATH").unwrap_or_default();
-    for dir in path_var.split(':') {
-        let candidate = PathBuf::from(dir).join(name);
-        if candidate.is_file() {
-            return Ok(candidate);
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    resolve_exec_binary_in_path(name, &path_var)
+}
+
+fn resolve_exec_binary_in_path(name: &str, path_var: &std::ffi::OsStr) -> anyhow::Result<PathBuf> {
+    for dir in std::env::split_paths(path_var) {
+        let candidate = dir.join(name);
+        if is_executable_file(&candidate) {
+            return std::fs::canonicalize(&candidate).with_context(|| {
+                format!(
+                    "exec: cannot resolve executable candidate {}",
+                    candidate.display()
+                )
+            });
         }
     }
     bail!("exec: '{name}' not found in PATH")
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    path.metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+fn pnpm_exec_grants(
+    home_dir: &Path,
+    pnpm: Option<&Path>,
+    shadowed: bool,
+    project_dir: &Path,
+    named_roots: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut grants = scratch::pnpm_path_executables(home_dir);
+    if !shadowed
+        && let Some(pnpm) = pnpm
+        && scratch::pnpm_needs_exec_grant(home_dir, pnpm)
+    {
+        grants.push(pnpm.to_path_buf());
+    }
+    grants.retain(|path| {
+        !path.starts_with(project_dir) && !named_roots.iter().any(|root| path.starts_with(root))
+    });
+    grants.sort();
+    grants.dedup();
+    grants
 }
 
 /// Point a bare guarded command name at its guard shim instead of the real
@@ -4466,6 +4523,8 @@ struct AssemblyOptions<'a> {
     /// Announce the scratch directory. The agent launch prints a summary; `exec`
     /// and `check` must keep their output clean for scripts and `--json`.
     announce_scratch: bool,
+    /// A pnpm path explicitly requested by `cplt exec`, if any.
+    pnpm_candidate: Option<&'a Path>,
 }
 
 /// A fully-built sandbox plus the live resources it depends on.
@@ -4480,6 +4539,7 @@ struct AssembledSandbox {
     policy: sandbox::LandlockPolicy,
     proxy_handle: Option<proxy::ProxyHandle>,
     scratch_guard: Option<scratch::ScratchDir>,
+    pnpm_shadow_guard: Option<scratch::PnpmShadowDir>,
     #[cfg(target_os = "macos")]
     playwright_socket_guard: Option<scratch::PlaywrightSocketDir>,
 }
@@ -4567,6 +4627,23 @@ fn assemble_sandbox(
         None
     };
     let scratch_path = scratch_guard.as_ref().map(cplt::scratch::ScratchDir::path);
+    let pnpm = opts
+        .pnpm_candidate
+        .map(Path::to_path_buf)
+        .or_else(|| resolve_exec_binary("pnpm").ok());
+    let pnpm_shadow_guard = pnpm
+        .as_ref()
+        .map(|pnpm| scratch::PnpmShadowDir::create_if_needed(home_dir, pnpm))
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("Cannot prepare pnpm executable: {error}"))?
+        .flatten();
+    if pnpm_shadow_guard.is_none() {
+        scratch::cleanup_stale_pnpm_shadows(home_dir)
+            .map_err(|error| anyhow::anyhow!("Cannot clean stale pnpm shadows: {error}"))?;
+    }
+    let pnpm_shadow_path = pnpm_shadow_guard
+        .as_ref()
+        .map(cplt::scratch::PnpmShadowDir::path);
 
     #[cfg(target_os = "macos")]
     let playwright_socket_guard = create_playwright_socket_dir(resolved)?;
@@ -4659,12 +4736,24 @@ fn assemble_sandbox(
         resolved.keychain_substitute,
     );
 
+    let mut extra_exec = resolved.allow_exec.clone();
+    extra_exec.extend(pnpm_exec_grants(
+        home_dir,
+        pnpm.as_deref(),
+        pnpm_shadow_guard.is_some(),
+        probe.project_dir.as_path(),
+        opts.repos.dirs,
+    ));
+    extra_exec.extend(pnpm_shadow_path.map(Path::to_path_buf));
+    extra_exec.sort();
+    extra_exec.dedup();
     let sandbox_config = build_sandbox_config(
         resolved,
         probe,
         active_agent,
         &agent_dirs,
         opts.repos,
+        &extra_exec,
         SessionPaths {
             proxy_port: proxy_port_for_profile,
             scratch_dir: scratch_path,
@@ -4678,13 +4767,15 @@ fn assemble_sandbox(
     let policy = sandbox::generate_policy(&sandbox_config);
     // Path validation (SBPL injection checks on macOS) is handled internally by
     // prepare(), so callers don't need to know about backend-specific risks.
-    let prepared = sandbox::prepare(&sandbox_config).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let prepared = sandbox::prepare_with_pnpm_shadow(&sandbox_config, pnpm_shadow_path)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     Ok(AssembledSandbox {
         prepared,
         policy,
         proxy_handle,
         scratch_guard,
+        pnpm_shadow_guard,
         #[cfg(target_os = "macos")]
         playwright_socket_guard,
     })
@@ -4740,12 +4831,14 @@ impl<'a> NamedRepos<'a> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_sandbox_config<'a>(
     resolved: &'a config::Resolved,
     probe: &'a HostProbe,
     agent: agent::Agent,
     agent_dirs: &'a [agent::AgentDir],
     repos: NamedRepos<'a>,
+    extra_exec: &'a [PathBuf],
     session: SessionPaths<'a>,
     keychain_substitute: Option<agent::KeychainSubstitute>,
 ) -> sandbox::SandboxConfig<'a> {
@@ -4754,7 +4847,7 @@ fn build_sandbox_config<'a>(
         home_dir: probe.home_dir.as_path(),
         extra_read: &resolved.allow_read,
         extra_write: &resolved.allow_write,
-        extra_exec: &resolved.allow_exec,
+        extra_exec,
         extra_socket: &resolved.allow_socket,
         extra_deny: &resolved.deny_paths,
         named_roots: repos.dirs,
@@ -4812,6 +4905,7 @@ fn prepare_shell_sandbox(
             copilot_install_dir: None,
             electron_app_dir: None,
             announce_scratch: false,
+            pnpm_candidate: None,
         },
     )
 }
@@ -4849,6 +4943,16 @@ fn run_exec_command(
         );
     }
 
+    let requested_binary = if shell_cmd.is_none() {
+        Some(resolve_exec_binary(&cmd[0])?)
+    } else {
+        None
+    };
+    let pnpm_candidate = requested_binary.as_deref().filter(|path| {
+        path.file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("pnpm"))
+    });
+
     // Resolve config, paths, project dir — same pipeline as the main agent launch
     let ResolvedContext {
         mut resolved,
@@ -4859,6 +4963,7 @@ fn run_exec_command(
         unapproved_proposals: _,
         // active_agent from resolve_context is ignored — exec always uses Shell
         active_agent: _,
+        launch_dir: _,
     } = resolve_context(cli, false)?;
 
     let repo_paths: Vec<PathBuf> = repo_roots.iter().map(|r| r.dir.clone()).collect();
@@ -4926,17 +5031,27 @@ fn run_exec_command(
         policy,
         proxy_handle,
         scratch_guard,
+        pnpm_shadow_guard,
         #[cfg(target_os = "macos")]
             playwright_socket_guard: _playwright_socket_guard,
         ..
-    } = prepare_shell_sandbox(
-        cli,
-        &mut resolved,
-        config_path.as_ref(),
-        &home_dir,
-        &project_dir,
-        NamedRepos::new(&repo_paths, &repo_git_dirs, &repo_rows),
-    )?;
+    } = {
+        let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
+        assemble_sandbox(
+            cli,
+            &mut resolved,
+            config_path.as_ref(),
+            &probe,
+            AssemblyOptions {
+                agent: agent::Agent::Shell,
+                repos: NamedRepos::new(&repo_paths, &repo_git_dirs, &repo_rows),
+                copilot_install_dir: None,
+                electron_app_dir: None,
+                announce_scratch: false,
+                pnpm_candidate,
+            },
+        )?
+    };
 
     // Resolve the binary and args to pass to the sandbox.
     //
@@ -4955,11 +5070,18 @@ fn run_exec_command(
     } else {
         let bin = redirect_to_guard_shim(
             &cmd[0],
-            resolve_exec_binary(&cmd[0])?,
+            requested_binary.expect("non-shell exec resolved before sandbox assembly"),
             scratch_guard.as_ref().map(cplt::scratch::ScratchDir::path),
             resolved.gh_guard.enabled,
             resolved.git_guard.enabled,
         );
+        let bin = pnpm_shadow_guard.as_ref().map_or(bin.clone(), |shadow| {
+            if shadow.shadows(&bin) {
+                shadow.binary()
+            } else {
+                bin
+            }
+        });
         (bin, cmd[1..].to_vec())
     };
 
@@ -5014,6 +5136,7 @@ fn run_exec_command(
                 &prepared,
                 &exec_bin,
                 &exec_args,
+                &project_dir,
                 &repo_paths,
                 &resolved.pass_env,
                 resolved.inherit_env,
@@ -5090,6 +5213,7 @@ fn probe_shell(
         prepared,
         &shell,
         &args,
+        prepared.project_dir(),
         &[],
         &resolved.pass_env,
         resolved.inherit_env,
@@ -5371,6 +5495,7 @@ fn run_check_command(
         repo_roots,
         active_agent,
         unapproved_proposals: _,
+        launch_dir: _,
     } = resolve_context(cli, true)?;
     // The named roots, which `ExecContext::for_launch` turns into the gh scope
     // set. `check exec gh …` reported a named repository as outside the startup
@@ -5417,6 +5542,7 @@ fn run_check_command(
         policy,
         proxy_handle,
         scratch_guard: _scratch_guard,
+        pnpm_shadow_guard: _pnpm_shadow_guard,
         #[cfg(target_os = "macos")]
             playwright_socket_guard: _playwright_socket_guard,
     } = prepare_shell_sandbox(
@@ -6090,6 +6216,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         repo_roots,
         active_agent,
         unapproved_proposals,
+        launch_dir: _,
     } = ctx;
     // `doctor` reports the policy a launch would build, so it has to carry the
     // same named roots the launch would (#447).
@@ -6268,12 +6395,27 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         &resolved.deny_env,
         resolved.keychain_substitute,
     );
+    let doctor_pnpm = resolve_exec_binary("pnpm").ok();
+    let doctor_pnpm_shadowed = doctor_pnpm
+        .as_ref()
+        .is_some_and(|pnpm| scratch::pnpm_requires_shadow(&home_dir, pnpm).unwrap_or(false));
+    let mut doctor_exec = resolved.allow_exec.clone();
+    doctor_exec.extend(pnpm_exec_grants(
+        &home_dir,
+        doctor_pnpm.as_deref(),
+        doctor_pnpm_shadowed,
+        &project_dir,
+        &repo_paths,
+    ));
+    doctor_exec.sort();
+    doctor_exec.dedup();
     let sandbox_config = build_sandbox_config(
         &resolved,
         &probe,
         active_agent,
         &agent_dirs,
         NamedRepos::new(&repo_paths, &repo_git_dirs, &repo_rows),
+        &doctor_exec,
         SessionPaths::default(),
         keychain_substitute,
     );
@@ -6301,6 +6443,12 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
     let mut tool_names: Vec<&str> = Vec::new();
     for (name, path) in &tools {
         let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+        if *name == "pnpm"
+            && doctor_pnpm_shadowed
+            && doctor_pnpm.as_ref().is_some_and(|pnpm| pnpm == &canon)
+        {
+            continue;
+        }
         if agent::is_wsl_interop_binary(&canon, wsl) {
             let critical = discover::WSL_CRITICAL_TOOLS.contains(name);
             let msg = format!(
@@ -9039,6 +9187,44 @@ mod tests {
 
     fn parse(args: &[&str]) -> Cli {
         Cli::parse_from(std::iter::once("cplt").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn exec_path_lookup_skips_non_executable_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let blocked = first.path().join("pnpm");
+        let executable = second.path().join("pnpm");
+        std::fs::write(&blocked, "#!/bin/sh\n").unwrap();
+        std::fs::write(&executable, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = std::env::join_paths([first.path(), second.path()]).unwrap();
+
+        assert_eq!(
+            resolve_exec_binary_in_path("pnpm", &path).unwrap(),
+            executable.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn automatic_pnpm_exec_grants_skip_project_roots() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let project = home.join("Library/pnpm/project");
+        std::fs::create_dir_all(&project).unwrap();
+        let pnpm = project.join("pnpm");
+        std::fs::write(&pnpm, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&pnpm, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(
+            pnpm_exec_grants(home, Some(&pnpm), false, &project, &[]).is_empty(),
+            "the project grant already provides execution"
+        );
     }
 
     #[test]

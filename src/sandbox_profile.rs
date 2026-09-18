@@ -193,6 +193,10 @@ pub fn generate_profile_with_playwright_socket_dir(
         config.localhost_ports,
         config.proxy_forced,
     );
+    // Keep PATH-resolved bin and shim locations read-only after user allows.
+    // The pnpm rule re-allows its two writable stores, so all security denies
+    // below must remain later in the last-match-wins profile.
+    emit_path_bin_denies(&mut sb, config.home_dir);
     // Sensitive project file denies MUST come after all user-configured allows.
     // SBPL uses last-match-wins, so a user allow like `allow.read = ["~/Repos"]`
     // would override the .env deny if emitted before it.
@@ -224,12 +228,6 @@ pub fn generate_profile_with_playwright_socket_dir(
     // Same reason: keeps the exec-allowed Gradle toolchain dir non-writable
     // even when a user allow.write covers ~/.gradle (write-then-exec).
     emit_gradle_toolchain_write_deny(&mut sb, &home);
-    // Same reason: the PATH-resolved bin and shim directories are already
-    // read-only by construction (HOME_TOOL_DIRS grants write to the sibling
-    // cache, not the parent), but a user allow.write covering ~/.bun or
-    // $PNPM_HOME would reopen them, and mise's two live inside a tree that has
-    // to stay writable.
-    emit_path_bin_denies(&mut sb, config.home_dir);
     // Same reason, in the other direction: `process-exec` is granted
     // profile-wide, so an `allow.write` tree is executable unless something
     // says otherwise, and only a rule after every allow can say it.
@@ -1583,14 +1581,22 @@ fn emit_path_bin_denies(sb: &mut String, home_dir: &Path) {
                 let p = path.display();
                 sbpl!(sb, "(deny file-write* (subpath \"{p}\"))");
             }
-            // Anchored to a single path component so `store/` and everything
-            // under it keeps its write grant.
             PathBinDir::TopLevel(path) => {
                 if validate_sbpl_path(&path).is_err() {
                     continue;
                 }
-                let r = escape_regex(&path.to_string_lossy());
-                sbpl!(sb, "(deny file-write* (regex #\"^{r}/[^/]+$\"))");
+                let p = path.display();
+                sbpl!(sb, "(deny file-write* (subpath \"{p}\"))");
+                sbpl!(sb, "(allow file-write* (subpath \"{p}/store\"))");
+                sbpl!(
+                    sb,
+                    "(allow file-write* (subpath \"{p}/package-manager-store\"))"
+                );
+                sbpl!(sb, "(deny process-exec (subpath \"{p}\"))");
+                sbpl!(
+                    sb,
+                    "(allow process-exec (subpath \"{p}/package-manager-store\"))"
+                );
             }
         }
     }
@@ -1849,6 +1855,7 @@ fn emit_exec_write_denies(sb: &mut String, extra_exec: &[PathBuf]) {
     sbpl!(sb, ";; allow.exec trees stay read-only (write-then-exec)");
     for path in extra_exec {
         let p = path.to_string_lossy();
+        sbpl!(sb, "(allow process-exec (subpath \"{p}\"))");
         sbpl!(sb, "(deny file-write* (subpath \"{p}\"))");
     }
     sbpl!(sb);

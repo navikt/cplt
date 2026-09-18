@@ -1149,8 +1149,11 @@ pub const APP_DIRS: &[AppDir] = &[
         qualifier: "",
         organization: "",
         application: "pnpm",
-        process_exec: &[AppDirKind::Data, AppDirKind::DataLocal],
-        map_exec: &[AppDirKind::Data, AppDirKind::DataLocal],
+        // A recursive execute grant here would also make the writable `store/`
+        // executable under Landlock. The resolved pnpm binary gets an exact
+        // file grant, or a read-only shadow when it is hardlinked into store.
+        process_exec: &[],
+        map_exec: &[],
         // Config/Preference dirs (~/.config/pnpm, ~/Library/Preferences/pnpm) are
         // writable: pnpm reads and writes its settings (hoisting, virtual store state)
         // there during normal operation. These dirs contain no credentials.
@@ -1479,15 +1482,15 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
         map_exec: false,
         write: true,
     },
-    // pnpm global dir ($PNPM_HOME): the global shims sit directly in it and
-    // `pnpm setup` prepends it to PATH, so the top level is read-only. The
-    // content-addressable store one level down stays writable — every ordinary
-    // `pnpm install` hardlinks packages out of it, sandboxed or not.
+    // pnpm global dir ($PNPM_HOME): read-only and non-executable as a tree.
+    // The resolved pnpm executable gets an exact file grant, or a read-only
+    // shadow when it is hardlinked into store. The content-addressable store
+    // one level down stays writable for ordinary `pnpm install`.
     // macOS-native path not following conventions set out by AppDirs.
     HomeToolDir {
         path: "Library/pnpm",
-        process_exec: true,
-        map_exec: true,
+        process_exec: false,
+        map_exec: false,
         write: false,
     },
     // Must follow `Library/pnpm` (last-match-wins / ancestor union).
@@ -1497,12 +1500,27 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
         map_exec: true,
         write: true,
     },
+    // pnpm v10+ downloads and runs packageManager-pinned versions here. This
+    // deliberate write+exec cache is distinct from the content-addressable
+    // store, whose hardlinked pnpm executable is copied to a read-only shadow.
+    HomeToolDir {
+        path: "Library/pnpm/package-manager-store",
+        process_exec: true,
+        map_exec: true,
+        write: true,
+    },
     // XDG spelling of the same store. The parent (~/.local/share/pnpm) is
-    // granted read+exec by the pnpm AppDir entry, which no longer grants write
-    // there — this is the carve-out that keeps `pnpm install` working.
+    // readable but non-executable; exact executable grants and the
+    // package-manager-store carve-out are emitted separately.
     HomeToolDir {
         path: ".local/share/pnpm/store",
         process_exec: false,
+        map_exec: true,
+        write: true,
+    },
+    HomeToolDir {
+        path: ".local/share/pnpm/package-manager-store",
+        process_exec: true,
         map_exec: true,
         write: true,
     },
@@ -2652,6 +2670,26 @@ pub const EXEC_IN_WRITABLE: &[ExecInWritable] = &[
             "write+execute by design on both backends; recorded here so the pair is \
              reviewable rather than an absence. `.bun/bin`, the PATH-resolved half, is \
              write-denied separately.",
+        ),
+    },
+    // pnpm downloads and runs packageManager-pinned versions from this cache.
+    // Unlike `store/`, this unavoidable write+exec pair applies on macOS too.
+    ExecInWritable {
+        path: "Library/pnpm/package-manager-store",
+        macos: true,
+        why: "pnpm self-management downloads and runs packageManager-pinned versions",
+        linux: LinuxCoverage::Gap(
+            "write+execute is required for pnpm self-management on both backends; \
+             it is an explicit, reviewable exception rather than an inherited parent grant.",
+        ),
+    },
+    ExecInWritable {
+        path: ".local/share/pnpm/package-manager-store",
+        macos: true,
+        why: "pnpm self-management downloads and runs packageManager-pinned versions",
+        linux: LinuxCoverage::Gap(
+            "write+execute is required for pnpm self-management on both backends; \
+             it is an explicit, reviewable exception rather than an inherited parent grant.",
         ),
     },
     // The `.dotnet` HOME_TOOL_DIRS entry is `process_exec: false` because the

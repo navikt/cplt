@@ -212,6 +212,78 @@ mod linux_tests {
         )
     }
 
+    #[test]
+    fn pnpm_store_is_non_executable_but_shadow_and_version_store_run() {
+        require_landlock!();
+        use std::os::unix::fs::PermissionsExt;
+
+        let project = create_test_project();
+        let home = tempfile::Builder::new()
+            .prefix(".cplt-pnpm-home-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("create fake home");
+        let pnpm_home = home.path().join(".local/share/pnpm");
+        let store = pnpm_home.join("store/v10/links/package");
+        let package_manager_store = pnpm_home.join("package-manager-store/v10");
+        fs::create_dir_all(&store).expect("create content store");
+
+        let source = pnpm_home.join("pnpm");
+        let standalone = pnpm_home.join("standalone");
+        let store_pnpm = store.join("pnpm");
+        let new_alias = store.join("new-alias");
+        let managed_pnpm = package_manager_store.join("pnpm");
+        fs::write(&source, "#!/bin/sh\nprintf 'shadow:OK\\n'\n").expect("write pnpm");
+        fs::write(&standalone, "#!/bin/sh\nprintf 'standalone:OK\\n'\n")
+            .expect("write standalone executable");
+        fs::hard_link(&source, &store_pnpm).expect("hardlink pnpm into store");
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&standalone, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let script = format!(
+            "mkdir -p '{managed_dir}'; \
+             printf '#!/bin/sh\necho managed:OK\n' > '{managed_pnpm}'; \
+             chmod 755 '{managed_pnpm}'; \
+             if ln '{standalone}' '{new_alias}'; then printf 'link:FAIL\\n'; else printf 'link:OK\\n'; fi; \
+             '{standalone}'; \
+             if '{store_pnpm}'; then printf 'store:FAIL\\n'; else printf 'store:OK\\n'; fi; \
+             '{managed_pnpm}'; pnpm",
+            store_pnpm = store_pnpm.display(),
+            standalone = standalone.display(),
+            new_alias = new_alias.display(),
+            managed_dir = managed_pnpm.parent().unwrap().display(),
+            managed_pnpm = managed_pnpm.display(),
+        );
+        let project_dir = project.path().to_string_lossy().into_owned();
+        let output = cplt_cmd()
+            .args([
+                "--yes",
+                "--no-validate",
+                "--quiet",
+                "--agent",
+                "shell",
+                "--project-dir",
+                &project_dir,
+                "--",
+                "-c",
+                &script,
+            ])
+            .env("HOME", home.path())
+            .env("PATH", format!("{}:/usr/bin:/bin", pnpm_home.display()))
+            .output()
+            .expect("run cplt");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "pnpm workflow should succeed.\nstdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(stdout.contains("link:OK"), "{stdout}");
+        assert!(stdout.contains("standalone:OK"), "{stdout}");
+        assert!(stdout.contains("store:OK"), "{stdout}");
+        assert!(stdout.contains("managed:OK"), "{stdout}");
+        assert!(stdout.contains("shadow:OK"), "{stdout}");
+    }
+
     /// Create a fake HOME with populated sensitive directories for hermetic testing.
     fn create_fake_home_with_secrets() -> tempfile::TempDir {
         let fake_home = tempfile::tempdir().expect("Failed to create temp home");
