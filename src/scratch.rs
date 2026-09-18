@@ -1137,7 +1137,7 @@ mod tests {
 
         let err = PnpmShadowDir::create_if_needed(home.path(), &pnpm)
             .expect_err("a symlinked shadow base must be rejected");
-        assert!(err.contains("is a symlink"), "{err}");
+        assert!(err.contains("is a symlink"));
         assert!(
             target.path().read_dir().unwrap().next().is_none(),
             "the symlink target must not be traversed or modified"
