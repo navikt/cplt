@@ -1510,17 +1510,13 @@ mod tests {
 
     #[test]
     fn ordinary_exec_grant_is_not_treated_as_a_pnpm_shadow() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("home");
-        let project = temp.path().join("project");
+        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/home/user/project");
         let grant = home.join(".cplt-pnpm-shadow/user-selected");
-        std::fs::create_dir_all(&grant).unwrap();
-        std::fs::create_dir(&project).unwrap();
         let grants = [grant];
         let mut config = test_config(&home, &[]);
         config.project_dir = &project;
         config.extra_exec = &grants;
-        config.allow_tmp_exec = true;
 
         let prepared = prepare(&config).expect("ordinary grant must prepare");
         assert_eq!(prepared.pnpm_shadow_dir, None);
