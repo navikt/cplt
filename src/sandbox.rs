@@ -1520,6 +1520,7 @@ mod tests {
         let mut config = test_config(&home, &[]);
         config.project_dir = &project;
         config.extra_exec = &grants;
+        config.allow_tmp_exec = true;
 
         let prepared = prepare(&config).expect("ordinary grant must prepare");
         assert_eq!(prepared.pnpm_shadow_dir, None);
