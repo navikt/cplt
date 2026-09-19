@@ -84,6 +84,8 @@ The snapshot cutoff freezes one consistent state. Classification can settle whil
 
 The existing descendant wait can add two seconds. Git inspection and scheduling add time beyond these wait budgets.
 
+`--no-audit --observe-domains` suppresses the normal audit report but still arms the descendant settle probe. cplt waits up to two seconds after the direct child exits. It warns if it cannot establish that the session settled. Network activity after the cutoff is excluded. This wait is separate from the 500-millisecond classification drain.
+
 The collector retains at most 1,024 hosts, with at most 1,024 bytes per stored key. It continues counting records when host storage reaches a limit.
 
 Host counts become lower bounds when records lack host entries. Collection failures are reported with the retained evidence.
