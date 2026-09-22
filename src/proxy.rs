@@ -1346,7 +1346,7 @@ fn handle_connect(
                 target,
                 "BLOCKED-ALLOWLIST",
             );
-            let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nDomain not in allowlist. The allowlist is the agent's defaults (when enabled) plus allow.domains and the file named by proxy.allowed_domains; a preset or tool may have set these, not you. Inspect them with `cplt config get proxy.allowed_domains` and `cplt config get allow.domains`. To allow the host, add it to that file (re-read live) or run `cplt config set allow.domains HOST` and restart cplt.\r\n");
+            let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nDomain not in allowlist. The allowlist is the agent's defaults (when enabled) plus allow.domains and the file named by proxy.allowed_domains; a preset or tool may have set these, not you.\r\nInspect them with `cplt config get proxy.allowed_domains` and `cplt config get allow.domains`.\r\nTo allow the host, add it to that file (re-read live) or run `cplt config set allow.domains HOST` and restart cplt.\r\n");
             return;
         }
         NetVerdict::Blocked => {

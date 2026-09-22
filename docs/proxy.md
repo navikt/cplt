@@ -447,7 +447,7 @@ Every connection attempt is printed to stderr in real time:
 |---|---|---|
 | `CONNECTED` | Connection succeeded | none |
 | `BLOCKED` | Domain matched blocklist | Check `--blocked-domains` file |
-| `BLOCKED-ALLOWLIST` | Domain not in allowlist | Add domain to `--allowed-domains` file |
+| `BLOCKED-ALLOWLIST` | Domain not in allowlist | Add it to the file named by `proxy.allowed_domains` / `--allowed-domains` (re-read live), or `cplt config set allow.domains HOST` and restart |
 | `BLOCKED-PORT` | Port not in allowed list | Add with `--allow-port <PORT>` |
 | `BLOCKED-PRIVATE` | Pre-DNS private IP (`.local`, `127.*`, IP literals) | Use `--allow-localhost` for local ports |
 | `BLOCKED-PRIVATE-RESOLVED` | DNS resolved to a private IP | Use `--allow-private-domain <DOMAIN>` |
