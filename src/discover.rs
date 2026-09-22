@@ -1363,6 +1363,7 @@ pub fn git_common_dir(home_dir: &Path, project_dir: &Path) -> Option<PathBuf> {
     Some(resolved)
 }
 
+/// Find the Electron `.app/Contents` that a Copilot CLI shim runs under.
 ///
 /// When Copilot is installed via the VS Code extension, the `copilot` binary is a
 /// shell script shim that invokes VS Code's Electron runtime:
@@ -1376,7 +1377,10 @@ pub fn git_common_dir(home_dir: &Path, project_dir: &Path) -> Option<PathBuf> {
 /// from loading it, causing an immediate `SIGABRT`.
 ///
 /// Returns `<bundle>.app/Contents` (not the whole bundle) to limit scope.
-/// Also works for VS Code Insiders, Cursor, Windsurf, and other Electron editors.
+/// Only a shell script that references `copilotCLIShim.js` is matched. The
+/// editor bundle it points at can be any Electron app (VS Code, VS Code
+/// Insiders, or another editor that ships the Copilot shim), but this does not
+/// detect the editors themselves or other Electron-based tools.
 pub fn discover_electron_app(copilot_bin: &Path) -> Option<PathBuf> {
     // Only process shell scripts (text files), not compiled binaries
     let content = std::fs::read_to_string(copilot_bin).ok()?;
