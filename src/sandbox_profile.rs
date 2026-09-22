@@ -502,31 +502,27 @@ fn emit_sensitive_project_denies(
 fn dependency_source_trees(home: &str, tool_dirs: Option<&[ResolvedToolDir]>) -> Vec<String> {
     DEPENDENCY_SOURCE_TREES
         .iter()
-        .map(|(tool_dir, sub)| {
-            let base = tool_dirs
-                .and_then(|dirs| {
-                    dirs.iter()
-                        // A refused target is never granted, so it gets no
-                        // re-allow either.
-                        .find(|d| {
-                            d.dir.path == *tool_dir && d.refused_target(Path::new(home)).is_none()
-                        })
-                        // The target when symlinked: the re-allow is a regex
-                        // on the path the kernel resolves (#523).
-                        .map(|d| {
-                            d.target
-                                .as_ref()
-                                .unwrap_or(&d.path)
-                                .to_string_lossy()
-                                .into_owned()
-                        })
-                })
-                .unwrap_or_else(|| format!("{home}/{tool_dir}"));
-            if sub.is_empty() {
+        .filter_map(|(tool_dir, sub)| {
+            let found = tool_dirs.and_then(|dirs| dirs.iter().find(|d| d.dir.path == *tool_dir));
+            let base = match found {
+                // A refused target is never granted, so its tree gets no
+                // re-allow either.
+                Some(d) if d.refused_target(Path::new(home)).is_some() => return None,
+                // The target when symlinked: the re-allow is a regex on the
+                // path the kernel resolves (#523).
+                Some(d) => d
+                    .target
+                    .as_ref()
+                    .unwrap_or(&d.path)
+                    .to_string_lossy()
+                    .into_owned(),
+                None => format!("{home}/{tool_dir}"),
+            };
+            Some(if sub.is_empty() {
                 base
             } else {
                 format!("{base}/{sub}")
-            }
+            })
         })
         .collect()
 }

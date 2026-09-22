@@ -1150,6 +1150,65 @@ fn symlinked_tool_dir_containing_a_protected_path_under_a_symlinked_home_is_refu
     });
 }
 
+/// `~/.cache -> ~/dotfiles` with `~/.npmrc -> ~/dotfiles/npmrc`. The credential
+/// file's `$HOME` spelling is outside `~/.cache`, but its target is inside the
+/// one granted for it. Landlock cannot deny a file inside a granted tree, and
+/// the macOS deny at the resolved path is skipped when that path is unsafe for
+/// the profile, so the tool dir is refused. A credential under the tool dir's
+/// own name (`~/.m2/settings.xml` for a symlinked `~/.m2`) is the documented
+/// subpath deny instead, and does not refuse it.
+#[test]
+fn symlinked_tool_dir_containing_a_linked_credential_file_is_refused() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let home_dir = std::fs::canonicalize(home.path()).expect("canonicalize home");
+    let dotfiles = home_dir.join("dotfiles");
+    std::fs::create_dir_all(&dotfiles).expect("mkdir dotfiles");
+    std::fs::write(dotfiles.join("npmrc"), "//registry/:_authToken=x").expect("write npmrc");
+    std::os::unix::fs::symlink(&dotfiles, home_dir.join(".cache")).expect("symlink cache");
+    std::os::unix::fs::symlink(dotfiles.join("npmrc"), home_dir.join(".npmrc"))
+        .expect("symlink npmrc");
+
+    let p = generate_profile(
+        &SandboxConfig {
+            home_dir: &home_dir,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    let active = cplt::sandbox::active_tool_dirs(&home_dir, None);
+    assert!(
+        !active.iter().any(|d| d.dir.path == ".cache"),
+        "~/.npmrc resolves inside the ~/.cache target"
+    );
+    let grant = format!("(subpath \"{}\")", dotfiles.display());
+    assert!(!p.contains(&grant), "must not grant {grant}\n{p}");
+}
+
+/// `~/.cache -> "~/Backup (1)/cache"`. The profile cannot name that target, and
+/// Seatbelt matches the resolved path, so the entry is dropped with a warning
+/// rather than aborting the launch or emitting a grant that grants nothing.
+#[cfg(target_os = "macos")]
+#[test]
+fn symlinked_tool_dir_onto_an_unnameable_target_is_dropped_not_fatal() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let home_dir = std::fs::canonicalize(home.path()).expect("canonicalize home");
+    let target = home_dir.join("Backup (1)/cache");
+    std::fs::create_dir_all(&target).expect("mkdir target");
+    std::os::unix::fs::symlink(&target, home_dir.join(".cache")).expect("symlink cache");
+
+    let active = cplt::sandbox::active_tool_dirs(&home_dir, None);
+    assert!(!active.iter().any(|d| d.dir.path == ".cache"));
+    assert!(active.iter().any(|d| d.dir.path == ".rustup"));
+    let p = generate_profile(
+        &SandboxConfig {
+            home_dir: &home_dir,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    assert!(!p.contains("Backup (1)"), "{p}");
+}
+
 /// `~/.gitconfig -> ~/.git-credentials`. The link target is a hard deny, so the
 /// resolved grant must never be emitted — on macOS the later deny would win
 /// anyway, but Landlock is grant-only and has no deny to fall back on, so the

@@ -466,9 +466,11 @@ matches the resolved path. The `DENIED_HOME_SUBPATHS` credential denies
 (`~/.m2/settings.xml` and the rest) are emitted at the resolved path too, so
 following the link does not open them. A target is **refused**, with a warning
 and no grant at all, when it is inside or contains a credential directory or
-hard-denied file, lies in cplt's state directory, or is `/`, `$HOME`, an ancestor
-of `$HOME` or a platform system root — the same bar a relocated `CARGO_HOME`
-meets. Any other target is granted, including one outside `$HOME`. The
+hard-denied file, contains a `DENIED_HOME_SUBPATHS` file linked in from another
+name (`~/.cache -> ~/dotfiles` with `~/.npmrc -> ~/dotfiles/npmrc`), lies in
+cplt's state directory, or is `/`, `$HOME`, an ancestor of `$HOME` or a platform
+system root — the same bar a relocated `CARGO_HOME` meets. On macOS a target
+the profile cannot name (one containing `( ) " ; \`) is refused the same way. Any other target is granted, including one outside `$HOME`. The
 between-launches caveat above applies: whoever can replace a tool directory with
 a symlink chooses where its grant lands next time. None of cplt's default grants
 makes a tool directory's parent writable; an `allow.write` on one (say

@@ -379,12 +379,21 @@ pub fn discover_tools(home_dir: &Path, tool_roots: &[ToolRoot]) -> ToolDiscovery
         // as if the tool were broken.
         .filter(|d| match d.refused_target(home_dir) {
             Some(target) => {
-                ui::warn(&format!(
-                    "Not granting {}: it is a symlink to {}, which the sandbox never grants \
-                     (a credential path, $HOME or a parent of it, or a system root).",
-                    d.path.display(),
-                    target.display()
-                ));
+                let (link, to) = (d.path.display(), target.display());
+                let unnameable = cfg!(target_os = "macos")
+                    && crate::sandbox::validate_sbpl_path(target).is_err();
+                ui::warn(&if unnameable {
+                    format!(
+                        "Not granting {link}: it is a symlink to {to}, which the macOS sandbox \
+                         profile cannot name. Re-point the symlink, or set the tool's *_HOME, \
+                         to a path without ( ) \" ; or \\."
+                    )
+                } else {
+                    format!(
+                        "Not granting {link}: it is a symlink to {to}, which the sandbox never \
+                         grants (a credential path, $HOME or a parent of it, or a system root)."
+                    )
+                });
                 false
             }
             None => true,

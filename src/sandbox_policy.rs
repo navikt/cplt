@@ -1774,6 +1774,15 @@ impl ResolvedToolDir {
     ///   entry, compared canonicalized — `~/.cargo -> ~/.ssh/x`, or
     ///   `~/.cache -> ~/dotfiles` with `~/.ssh -> ~/dotfiles/ssh`. Landlock
     ///   cannot deny a subpath of a granted tree, so containment is a leak there;
+    /// - a target containing a [`DENIED_HOME_SUBPATHS`] file reached through
+    ///   another name — `~/.cache -> ~/dotfiles` with `~/.npmrc ->
+    ///   ~/dotfiles/npmrc`. One under the dir's own name (`~/.m2/settings.xml`
+    ///   for a symlinked `~/.m2`) is not refused: that is the subpath deny the
+    ///   list exists for, emitted at the resolved path on macOS and documented
+    ///   as unenforceable on Linux, as for an unsymlinked `~/.m2`;
+    /// - on macOS, a target the profile cannot name ([`validate_sbpl_path`]).
+    ///   Seatbelt matches the resolved path, so the `$HOME` spelling alone
+    ///   would grant nothing;
     /// - what a relocated `CARGO_HOME` is already held to,
     ///   [`tool_override_path_is_safe`]: not `/`, `$HOME`, an ancestor of
     ///   `$HOME`, or a platform system root.
@@ -1789,6 +1798,9 @@ impl ResolvedToolDir {
         let overlaps_denied = DENIED_DOTFILES.iter().chain(DENIED_FILES).any(|d| {
             let denied = canon(&home.join(d));
             denied.starts_with(target) || target.starts_with(&denied)
+        }) || DENIED_HOME_SUBPATHS.iter().any(|f| {
+            let named = home.join(f);
+            !named.starts_with(&self.path) && canon(&named).starts_with(target)
         });
         // `grant_is_refused` catches a target inside cplt's state directory;
         // one containing it (`CPLT_CONFIG` moved it out of `.config/cplt`) is
@@ -1800,6 +1812,7 @@ impl ResolvedToolDir {
         (overlaps_denied
             || contains_state
             || grant_is_refused(home, target)
+            || (cfg!(target_os = "macos") && validate_sbpl_path(target).is_err())
             || !tool_override_path_is_safe(target, &canon(home)))
         .then_some(target)
     }

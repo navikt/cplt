@@ -1276,9 +1276,6 @@ fn validate_config_paths(config: &SandboxConfig) -> Result<(), String> {
     }
     for d in config.existing_home_tool_dirs.unwrap_or(&[]) {
         policy::validate_sbpl_path(&d.path).map_err(|e| format!("Tool dir: {e}"))?;
-        if let Some(t) = &d.target {
-            policy::validate_sbpl_path(t).map_err(|e| format!("Tool dir target: {e}"))?;
-        }
     }
     if let Some(p) = config.git_hooks_path {
         policy::validate_sbpl_path(p).map_err(|e| format!("Git hooks path: {e}"))?;
