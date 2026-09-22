@@ -108,7 +108,7 @@ The sandbox blocks access to credentials and secrets in the kernel. Command guar
 | Access macOS Keychain | ⚠️ Allowed (read+write) for agents that store auth there | The grant cannot be scoped to one item, so it reaches every keychain entry the agent can unlock. Opt in to `sandbox.keychain_substitute` (EXPERIMENTAL, default off) to drop it on runs where the agent can authenticate without it — `CLAUDE_CODE_OAUTH_TOKEN` for Claude Code, an existing fallback token file for Antigravity. See [SECURITY.md](SECURITY.md#keychain-access-is-all-or-nothing) |
 | Outbound network (port 443) | ✅ Allowed | Every other port is blocked. Add extras with `--allow-port` |
 | Localhost outbound | 🔒 Kernel-blocked (macOS), ⚠️ port-based on Linux | Prevents local service access. Inbound still works for the proxy. **Linux:** Landlock rules are port numbers only and cannot tell `localhost:443` from `remote:443`, so a local service on an allowed port is reachable and there is no localhost-specific deny. Use `--with-proxy` for SSRF protection, see [Linux limitations](docs/security.md#linux) |
-| SSH agent (unix socket) | 🔒 Kernel-blocked (macOS), ⚠️ env-only on Linux | Prevents signing git operations or SSH to hosts. **Linux:** unix socket `connect()` is not gated, so the withheld `SSH_AUTH_SOCK` is the only barrier and an agent that sets it itself can use the loaded keys. `bwrap` hides the stock OpenSSH socket under `/tmp`, but not a gnome-keyring/gcr or systemd agent under `$XDG_RUNTIME_DIR`. See [Linux limitations](docs/security.md#linux) |
+| SSH agent (unix socket) | 🔒 Kernel-blocked (macOS), ⚠️ env-only on Linux | Prevents using your loaded keys for git or SSH. It does not block the network path: SSH servers on port 443, such as `ssh.github.com:443`, are reachable, see [SSH over port 443](docs/known-impacts.md#ssh-over-port-443). **Linux:** unix socket `connect()` is not gated, so the withheld `SSH_AUTH_SOCK` is the only barrier and an agent that sets it itself can use the loaded keys. `bwrap` hides the stock OpenSSH socket under `/tmp`, but not a gnome-keyring/gcr or systemd agent under `$XDG_RUNTIME_DIR`. See [Linux limitations](docs/security.md#linux) |
 | Developer tools (`~/.cargo`, `~/.gradle`, `~/.m2`, `~/.sdkman`, `~/.jenv`, `~/.pyenv`, `~/.konan`, etc.) | ✅ Allowed (read+write for caches) | Only dirs that exist on disk. Tightened at runtime by what `cplt doctor` detects |
 | Registry credential files (`~/.m2/settings.xml`, `~/.gradle/gradle.properties`, `~/.cargo/credentials`) | 🔒 Kernel-blocked on macOS. On Linux the parent tool dir stays readable | Override with `--allow-read`. See [Private registries](docs/known-impacts.md#private-registries) |
 | Read `~/.npmrc` | 🔒 Kernel-blocked (both platforms) | Override with `--allow-read`. Breaks yarn 1, see [yarn 1](docs/known-impacts.md#yarn-1-and-unreadable-home-rc-files) |
@@ -175,7 +175,7 @@ Tools such as VS Code agent mode rely mainly on UI permissions. cplt enforces it
 | Credential dir protection | 15+ dirs denied by default | User must configure manually |
 | DNS rebinding protection | ✅ Post-DNS IP checked against private ranges | ❌ Not implemented |
 | Network proxy | HTTP CONNECT + domain allow/block | HTTP + SOCKS5 + experimental TLS MITM |
-| SSH git | Blocked at kernel on macOS (agent socket denied); on Linux only `SSH_AUTH_SOCK` is withheld | Proxied via SOCKS5 |
+| SSH git | No key: agent socket denied at kernel on macOS, on Linux only `SSH_AUTH_SOCK` is withheld. The transport is not blocked, `ssh.github.com:443` is reachable | Proxied via SOCKS5 |
 | Package manager scripts | Blocked by default (`npm_config_ignore_scripts`) | Not blocked |
 | Agent support | Copilot, OpenCode, Gemini, Antigravity, Pi, Claude Code, goose, DSH, Shell | Claude Code |
 | Config | TOML (global + per-repo) | JSON (global only) + `--control-fd` live updates |
@@ -972,7 +972,7 @@ The sandbox blocks some workflows on purpose. The common ones and their fixes:
 | `go test` / `mise run` blocked (temp exec) | The scratch dir is on by default. If you still need it, `cplt config set sandbox.allow_tmp_exec true` |
 | Localhost connections blocked | `cplt config set allow.localhost 3000`, or `cplt config set sandbox.allow_localhost_any true` |
 | Docker blocked | `cplt config set sandbox.allow_docker true` ⚠️ |
-| SSH blocked | Use HTTPS remotes instead |
+| SSH fails (no key) | Use HTTPS remotes instead |
 | GPG signing disabled | `cplt config set sandbox.allow_gpg_signing true` |
 | JVM MockK/Mockito fails | `cplt config set sandbox.allow_jvm_attach true` |
 | `dotnet build` MSBuild worker nodes blocked | `cplt config set sandbox.allow_msbuild true` |

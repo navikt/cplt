@@ -144,6 +144,8 @@ forced = true
 
 **Raw-TCP tradeoff, by design.** Tools that are not proxy-aware, whether they ignore `HTTP_PROXY` or need a non-CONNECT or non-HTTPS protocol, lose direct network access under proxy-forced. That is the point of the mode: the only sanctioned path off the machine is the CONNECT proxy.
 
+**Proxy-forced constrains destinations, not protocols.** The proxy checks the host and port of a CONNECT request, then relays bytes without looking at them. A tool that tunnels through the proxy on its own, such as ssh with a CONNECT-speaking `ProxyCommand`, can carry any protocol to an allowed host. Allowlist entries match subdomains, so `github.com` also allows `ssh.github.com:443`. See [SSH over port 443](known-impacts.md#ssh-over-port-443).
+
 `--allow-port` is not a way around that. Outside proxy-forced it opens a direct kernel egress channel to any remote host on that port, unfiltered and absent from the proxy log; under proxy-forced that channel is not opened at all ([#297](https://github.com/navikt/cplt/issues/297)). The port is still added to the proxy's allowed-port policy, so `curl`, `npm` and anything else that honours `HTTPS_PROXY` reaches `remote:<PORT>` through a CONNECT tunnel, logged and domain-filtered. Only a raw socket loses the path. cplt warns at startup when `allow.ports` is set under proxy-forced, so the narrowing is never silent. If a tool genuinely needs its own socket to a remote host, run it without proxy-forced.
 
 ## Domain filtering

@@ -373,11 +373,13 @@ cplt --allow-docker
 
 ## SSH agent blocking
 
-SSH agent access is blocked on macOS (the agent socket is not reachable — the profile's `(deny default)` covers `network-outbound` to unix sockets) and `SSH_AUTH_SOCK` is stripped from the environment on both platforms. Which means:
+SSH agent access is blocked on macOS (the agent socket is not reachable — the profile's `(deny default)` covers `network-outbound` to unix sockets) and `SSH_AUTH_SOCK` is stripped from the environment on both platforms. `~/.ssh` is denied as well, so there is no key file to fall back on. Which means:
 
-- `git clone` over SSH fails. Use HTTPS clones instead
-- `ssh` commands spawned by the agent fail
+- `git clone` over SSH fails, because ssh has no key to authenticate with. Use HTTPS clones instead
+- `ssh` commands spawned by the agent fail to authenticate
 - `gh` CLI uses HTTPS by default and is unaffected
+
+**What is blocked is the key material, not SSH as a transport.** SSH to port 22 is closed by default, because outbound TCP is limited to port 443. But SSH servers that listen on 443 are reachable like any other host on 443. GitHub runs one at `ssh.github.com:443`, so `ssh -p 443 git@ssh.github.com` opens a connection with no configuration change. It then fails for lack of a key, not for lack of a route. See [SSH over port 443](#ssh-over-port-443) below.
 
 **Linux caveat — this is not kernel-enforced below kernel 7.1.** Landlock gains the unix-socket `connect()` right only at ABI v9, and the SSH agent socket is not in the set bubblewrap masks (see [Linux limitations](../SECURITY.md#linux-specific-limitations)), so the withheld `SSH_AUTH_SOCK` is the whole barrier: without bubblewrap `/tmp` is readable, so `ls /tmp/ssh-*/agent.*` finds a stock OpenSSH socket and `SSH_AUTH_SOCK=... ssh-add -l` uses the loaded keys. bubblewrap's private `/tmp` hides that one, but not a gnome-keyring or systemd agent at a fixed `$XDG_RUNTIME_DIR` path.
 
@@ -387,7 +389,7 @@ If your keys must be unusable by a compromised agent on Linux, unload them (`ssh
 
 ### If you do need SSH inside the sandbox
 
-Three things have to line up, and the same configuration works on both platforms:
+For a remote on the default port 22, three things have to line up, and the same configuration works on both platforms:
 
 ```bash
 cplt config set allow.ports 22                      # outbound is 443-only by default
@@ -395,11 +397,26 @@ cplt config set allow.read  "~/.ssh/id_ed25519"     # the key, by name
 cplt config set allow.write "~/.ssh/known_hosts"    # ssh appends on a first connection
 ```
 
-Port 22 is the first gate: without it no key grant matters, because the connection never opens. `~/.ssh/config` needs its own `allow.read` if you have one. `known_hosts` needs **write**, not read — under the default `StrictHostKeyChecking` a first connection to a host appends to it, and a read-only grant fails the connection.
+Port 22 is needed only for the default `github.com:22` endpoint. It is not a gate on SSH in general: the key grant alone is enough to reach GitHub over `ssh.github.com:443` (see below). `~/.ssh/config` needs its own `allow.read` if you have one. `known_hosts` needs **write**, not read — under the default `StrictHostKeyChecking` a first connection to a host appends to it, and a read-only grant fails the connection.
 
 **The directory itself cannot be granted.** `allow.read = "~/.ssh"` (or `~/.aws`, `~/.gnupg`, any of the credential directories) is refused at startup with an error naming the per-path route inside it. macOS never honoured such a grant — the blanket subpath deny beats it whatever the config says — while Linux granted it for real, so the same config file opened every key on one platform and nothing on the other. Refusing is the only answer both backends give alike.
 
 One gap remains on Linux, unchanged and the same limitation described under [private registries](#private-registries): a grant on a *parent* — `$HOME` itself — still exposes everything under it, because Landlock cannot deny a subpath inside an allowed directory.
+
+Granting the key file hands the agent the key itself: a file the agent can read, it can also copy out over 443. Treat the grant as exposing that key, not as a hardening step.
+
+### SSH over port 443
+
+cplt never inspects what travels over an allowed connection. Two paths reach an SSH server on 443:
+
+- **Default mode.** The sandbox allows outbound TCP to any host on port 443 (`(allow network-outbound (remote ip "*:443"))` on macOS, a port-443 Landlock rule on Linux with kernel 6.7+; older Linux kernels have no kernel port rule at all). `ssh` does not honour `HTTPS_PROXY`, so it connects directly and the proxy never sees it. Domain allowlists and blocklists do not apply to it.
+- **Proxy-forced mode** (`proxy.forced`, also set by `--preset strict`). Direct `:443` is closed in the kernel and `allow.ports` opens no kernel port either, so `ssh -p 22` and a direct `ssh -p 443` both fail. An ssh `ProxyCommand` that speaks HTTP CONNECT to cplt's proxy still gets through: the proxy accepts port 443, and its domain matching covers subdomains, so a `github.com` allowlist entry, which the Copilot default allowlist has, also allows `ssh.github.com`. The proxy forwards bytes without looking at them, so an SSH session inside the tunnel looks like any other.
+
+So neither port rules nor proxy-forced mode stop SSH to `ssh.github.com:443`. What stops it from being useful is that the agent has no key. On Linux below kernel 7.1 that is not guaranteed either: an agent that finds a loaded SSH agent socket (see above) has a key, and needs no configuration change to reach `ssh.github.com:443` with it. This is not specific to SSH: any protocol can run over an allowed 443 connection.
+
+**To block it deliberately,** turn on proxy-forced mode, so every connection goes through the proxy, and put `ssh.github.com` in your blocked-domains file. The blocklist is checked after the allowlist, so it wins over the `github.com` entry. This blocks that one host. It does not block SSH to another server listening on 443 under a domain you allow.
+
+**To allow it deliberately,** grant the key file as above. Port 22 is not needed if you point the remote at `ssh://git@ssh.github.com:443/org/repo.git`. Under proxy-forced mode you also need a `ProxyCommand` that tunnels through cplt's proxy.
 
 ## D-Bus and systemd (Linux) — the session manager is reachable
 
@@ -521,7 +538,7 @@ Some git operations are blocked to prevent persistence attacks that would surviv
 | `git add/commit/status/diff/log`   | ✅ Works, unless a protected file is tracked | Local operations, no writes to protected paths — but git hashes worktree files, so a **tracked** `.env*`/`.pem`/`.key` that has been modified aborts `add`, `diff`, `stash` and `commit -a`. See [A tracked protected file breaks git](#a-tracked-protected-file-breaks-git) |
 | `git checkout/merge/rebase/branch` | ✅ Works     | Branch operations work normally                                   |
 | `git fetch/pull/push` (HTTPS)      | ✅ Works, except a default-branch push | Port 443 allowed, `gh auth git-credential` provides credentials. The git guard refuses pushes to `main`/`master` and every force push, see [Git workflow](#git-workflow-commit--push) |
-| `git fetch/pull/push` (SSH)        | ❌ Blocked on macOS | SSH agent socket denied, use HTTPS. On Linux only `SSH_AUTH_SOCK` is withheld |
+| `git fetch/pull/push` (SSH)        | ❌ No key on macOS | SSH agent socket and `~/.ssh` denied, so authentication fails; use HTTPS. The network path is open on 443 (`ssh.github.com:443`), see [SSH over port 443](#ssh-over-port-443). On Linux only `SSH_AUTH_SOCK` is withheld |
 | `git config` (local)               | ❌ Blocked on macOS | `.git/config` is write-protected on macOS, which prevents `url.*.insteadOf` hijacking. Applies to the project, to every named repository (`--repo-dir`), to every `allow.write` grant, and to any repository nested under one. Landlock cannot deny a file inside a writable root, so it stays writable on Linux |
 | `git config --global`              | ❌ Blocked   | Git config and `~/.gitignore_global` are read-only                 |
 | `git remote set-url`               | ❌ Blocked on macOS | Writes to `.git/config`, which stays writable on Linux |
