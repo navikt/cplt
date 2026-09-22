@@ -1418,13 +1418,20 @@ fn emit_tool_dirs(
     }
 }
 
-/// Process-exec allow for exec-only agent dirs (`!write && process_exec`:
+/// Exec carve-out for exec-only agent dirs (`!write && process_exec`:
 /// OpenCode's `~/.cache/opencode/bin`, Pi's `~/.pi/agent/bin`).
 ///
+/// Both verbs, like the `~/Library/Caches/copilot/pkg` block and
+/// `allow_cache_exec`: `process-exec` alone lets `posix_spawn` through but a
+/// real Mach-O still faults when its `__TEXT` pages are mapped, so a managed
+/// `rg` or `fd` would keep failing under the broad
+/// `(deny file-map-executable ~/.cache)`.
+///
 /// Emitted after `emit_tool_dirs` because SBPL is last-match-wins and that
-/// function denies exec on broad writable trees such as `~/.cache` and
+/// function denies both verbs on broad writable trees such as `~/.cache` and
 /// `~/Library/Caches`, which contain these dirs (#537). Writes stay denied by
-/// `emit_host_persistence_denies` at the tail of the profile.
+/// `emit_host_persistence_denies` at the tail of the profile, which derives
+/// its write deny and rename pin from the same filter.
 fn emit_agent_exec_carveouts(sb: &mut String, agent_dirs: &[AgentDir]) {
     let exec_only: Vec<_> = agent_dirs
         .iter()
@@ -1433,6 +1440,7 @@ fn emit_agent_exec_carveouts(sb: &mut String, agent_dirs: &[AgentDir]) {
     for dir in &exec_only {
         let path = dir.path.display();
         sbpl!(sb, "(allow process-exec (subpath \"{path}\"))");
+        sbpl!(sb, "(allow file-map-executable (subpath \"{path}\"))");
     }
     if !exec_only.is_empty() {
         sbpl!(sb);

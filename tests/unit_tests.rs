@@ -7991,6 +7991,14 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
         "(allow process-exec (subpath \"/Users/test/.cache/opencode/bin\"))",
         "the bin exec allow must come after every exec deny covering it"
     );
+    // process-exec alone only gets `posix_spawn` past the gate; a real Mach-O
+    // still faults when its pages are mapped, so the map-exec allow has to
+    // land after `(deny file-map-executable ~/.cache)` too (#537).
+    assert_eq!(
+        last_rule("file-map-executable", "/Users/test/.cache/opencode/bin/rg"),
+        "(allow file-map-executable (subpath \"/Users/test/.cache/opencode/bin\"))",
+        "the bin map-exec allow must come after every map-exec deny covering it"
+    );
     assert_eq!(
         last_rule("process-exec", "/Users/test/.cache/opencode/node_modules/x"),
         "(deny process-exec (subpath \"/Users/test/.cache\"))",

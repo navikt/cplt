@@ -2168,13 +2168,19 @@ mod macos_tests {
             .unwrap();
         let home = fs::canonicalize(home.path()).unwrap();
         let cache = home.join(".cache/opencode");
-        let script = "#!/bin/sh\necho ran\n";
+        // A real Mach-O, not a `#!/bin/sh` script: exec'ing a script maps
+        // nothing from the dir, so it passes on `process-exec` alone and would
+        // miss a missing `file-map-executable` allow — which is exactly how
+        // OpenCode's managed `rg` failed (#537). Our own binary rather than a
+        // system one: copying a platform binary such as /bin/echo invalidates
+        // its signature and the copy is SIGKILLed even outside the sandbox.
         for dir in ["bin", "other"] {
             fs::create_dir_all(cache.join(dir)).unwrap();
             let tool = cache.join(dir).join("tool");
-            fs::write(&tool, script).unwrap();
+            fs::copy(env!("CARGO_BIN_EXE_cplt"), &tool).unwrap();
             fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
         }
+        let ran = format!("cplt {}", env!("CARGO_PKG_VERSION"));
 
         let agent_dir = |path: PathBuf, write: bool| cplt::agent::AgentDir {
             path,
@@ -2195,11 +2201,11 @@ mod macos_tests {
 
         let run = |cmd: String| run_sandboxed(&profile, &cmd).0;
         let bin_exec = run(format!(
-            "'{}' 2>&1; echo EXIT:$?",
+            "'{}' --version 2>&1; echo EXIT:$?",
             cache.join("bin/tool").display()
         ));
         let other_exec = run(format!(
-            "'{}' 2>&1; echo EXIT:$?",
+            "'{}' --version 2>&1; echo EXIT:$?",
             cache.join("other/tool").display()
         ));
         let bin_write = run(format!(
@@ -2209,11 +2215,11 @@ mod macos_tests {
         fs::remove_file(&profile).ok();
 
         assert!(
-            bin_exec.contains("ran") && bin_exec.contains("EXIT:0"),
+            bin_exec.contains(&ran) && bin_exec.contains("EXIT:0"),
             "~/.cache/opencode/bin must be executable: {bin_exec}"
         );
         assert!(
-            !other_exec.contains("ran") && !other_exec.contains("EXIT:0"),
+            !other_exec.contains(&ran) && !other_exec.contains("EXIT:0"),
             "~/.cache/opencode outside bin must not be executable: {other_exec}"
         );
         assert!(
