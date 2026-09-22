@@ -104,6 +104,8 @@ Proxy clients are not authenticated by process identity. The report cannot estab
 
 The explicit `--observe-domains` diagnostic uses the same snapshot. Its terminal list displays at most 20 entries and discloses omitted entries.
 
+When the audit is suppressed (`--no-audit`, `--quiet`, or `sandbox.audit = false`), `--observe-domains` still waits for descendants before the snapshot cutoff. cplt waits up to two seconds after the direct child exits, then applies the separate 500-millisecond classification drain. If it cannot establish that the process tree finished, it warns. A descendant that closes the inherited descriptor is not detected. Traffic after the cutoff is not in the host list or `--observe-domains-out`.
+
 `--observe-domains-out` writes retained allowed hosts, including when collection is incomplete. Leading `# incomplete:` comments disclose collection failures, pending clients, and omitted observations. Invalid host entries, including escaped control characters, are omitted and counted in a comment. The allowlist parser ignores these comments. The parent opens the output destination before the session without following a destination symlink, then writes through that pinned handle. Replacing the path during the session cannot redirect the parent write.
 
 ## Proxy-forced mode
