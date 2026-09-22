@@ -457,6 +457,23 @@ protection](#symlink-attack-protection) and its tests cover — but whether an
 is a different property, and nothing here tests it. Do not read the deny-side
 result as covering the allow side.
 
+**Symlinked tool directories are granted at their target, on both platforms.**
+A `HOME_TOOL_DIRS` entry that is a symlink, or sits under one (`~/.cargo ->
+/opt/cargo`, a dotfiles-managed home), is resolved at launch and its permissions
+are granted on the target: Landlock does this by following the link, and the
+macOS profile names the target next to the `$HOME` path, because Seatbelt
+matches the resolved path. The `DENIED_HOME_SUBPATHS` credential denies
+(`~/.m2/settings.xml` and the rest) are emitted at the resolved path too, so
+following the link does not open them. A target is **refused**, with a warning
+and no grant at all, when it is inside or contains a credential directory or
+hard-denied file, lies in cplt's state directory, or is `/`, `$HOME`, an ancestor
+of `$HOME` or a platform system root — the same bar a relocated `CARGO_HOME`
+meets. Any other target is granted, including one outside `$HOME`. The
+between-launches caveat above applies: whoever can replace a tool directory with
+a symlink chooses where its grant lands next time. None of cplt's default grants
+makes a tool directory's parent writable; an `allow.write` on one (say
+`~/.cargo`) hands that choice to the agent, within the bar above.
+
 **`~/.config/gh/hosts.yml` is readable.** With gh guard enabled (the default), Copilot gets its token through a one-time cached file that is deleted after the first read; with gh guard disabled, `gh auth token` works inside the sandbox. The file holds a GitHub OAuth token. Only `hosts.yml` and `config.yml` are readable, not the whole `.config/gh` directory. With outbound port 443 open, a compromised agent could exfiltrate this token, though the token grants access to GitHub, which Copilot is already connected to. To mitigate, use `--deny-path ~/.config/gh`; Copilot falls back to Keychain auth.
 
 **A protected config file does not protect the script it names.** The project-path denies cover the *declaration* — `.claude/settings.json`, `.mcp.json`, `opencode.json`, `.pi/settings.json`, `.github/hooks`, `.agents/plugins` — so on macOS an agent cannot introduce a hook or an MCP server that did not exist before. (On Linux under bubblewrap that holds only for paths present at launch, per the caveat above; a declaration file that does not exist yet is not protected until it does.) The denies do not cover what an existing declaration points at. A repository that already ships

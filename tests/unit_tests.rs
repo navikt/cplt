@@ -1025,6 +1025,90 @@ fn symlinked_git_config_cannot_escape_a_denied_directory() {
     );
 }
 
+/// `~/.cargo -> /opt/cargo`, the tool-dir half of #515 (#523). A `subpath` rule
+/// matches the resolved path, so granting only `~/.cargo/bin` left the real
+/// toolchain denied. The target must carry the tool dir's own permissions, and
+/// a credential file under it (`DENIED_HOME_SUBPATHS`) must stay denied at the
+/// target too, or granting the target would open it.
+#[test]
+fn profile_grants_a_symlinked_tool_dir_at_its_target() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let root = std::fs::canonicalize(root.path()).expect("canonicalize");
+    let home_dir = root.join("home");
+    let cargo = root.join("opt/cargo");
+    let m2 = root.join("opt/m2");
+    std::fs::create_dir_all(cargo.join("bin")).expect("mkdir cargo");
+    std::fs::create_dir_all(&m2).expect("mkdir m2");
+    std::fs::write(m2.join("settings.xml"), "<password/>").expect("write settings");
+    std::fs::create_dir_all(&home_dir).expect("mkdir home");
+    std::os::unix::fs::symlink(&cargo, home_dir.join(".cargo")).expect("symlink cargo");
+    std::os::unix::fs::symlink(&m2, home_dir.join(".m2")).expect("symlink m2");
+
+    let p = generate_profile(
+        &SandboxConfig {
+            home_dir: &home_dir,
+            ..base_profile_options()
+        },
+        &[],
+    );
+
+    let bin = cargo.join("bin");
+    for rule in ["file-read*", "process-exec", "file-map-executable"] {
+        let allow = format!("(allow {rule} (subpath \"{}\"))", bin.display());
+        assert!(
+            p.contains(&allow),
+            "the link target must be granted: {allow}\n{p}"
+        );
+    }
+    let settings = m2.join("settings.xml");
+    let grant = format!("(allow file-read* (subpath \"{}\"))", m2.display());
+    let deny = format!("(deny file-read* (literal \"{}\"))", settings.display());
+    let grant_at = p
+        .find(&grant)
+        .unwrap_or_else(|| panic!("m2 target missing:\n{p}"));
+    let deny_at = p
+        .rfind(&deny)
+        .unwrap_or_else(|| panic!("settings.xml must be denied at the target:\n{p}"));
+    assert!(grant_at < deny_at, "the deny must come last:\n{p}");
+}
+
+/// A tool-dir symlink must not become a way to grant a credential directory or
+/// an unsafe root. Landlock follows the link on its own, so the entry has to be
+/// dropped where both backends read the list, not just left out of the profile.
+#[test]
+fn symlinked_tool_dir_onto_a_sensitive_path_is_not_granted() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let home_dir = std::fs::canonicalize(home.path()).expect("canonicalize home");
+    let inside_ssh = home_dir.join(".ssh/cargo");
+    std::fs::create_dir_all(inside_ssh.join("bin")).expect("mkdir .ssh/cargo");
+    std::os::unix::fs::symlink(&inside_ssh, home_dir.join(".cargo")).expect("symlink cargo");
+    std::os::unix::fs::symlink("/", home_dir.join(".cache")).expect("symlink cache");
+
+    let active = cplt::sandbox::active_tool_dirs(&home_dir, None);
+    for refused in [".cargo/bin", ".cache"] {
+        assert!(
+            !active.iter().any(|d| d.dir.path == refused),
+            "{refused} resolves somewhere no grant may reach and must be dropped"
+        );
+    }
+    assert!(
+        active.iter().any(|d| d.dir.path == ".rustup"),
+        "unaffected tool dirs must still be granted"
+    );
+
+    let p = generate_profile(
+        &SandboxConfig {
+            home_dir: &home_dir,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    for leaked in [inside_ssh.join("bin"), PathBuf::from("/")] {
+        let allow = format!("(allow file-read* (subpath \"{}\"))", leaked.display());
+        assert!(!p.contains(&allow), "must not grant {allow}\n{p}");
+    }
+}
+
 /// `~/.gitconfig -> ~/.git-credentials`. The link target is a hard deny, so the
 /// resolved grant must never be emitted — on macOS the later deny would win
 /// anyway, but Landlock is grant-only and has no deny to fall back on, so the
@@ -1666,6 +1750,7 @@ fn the_carve_out_follows_a_relocated_tool_root() {
         .filter(|d| d.path == "go/pkg" || d.path == ".cargo/registry")
         .map(|d| ResolvedToolDir {
             path: PathBuf::from(format!("/elsewhere/{}", d.path)),
+            target: None,
             dir: d,
         })
         .collect();

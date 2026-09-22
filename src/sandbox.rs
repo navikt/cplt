@@ -1472,10 +1472,12 @@ mod tests {
         let dirs = [
             ResolvedToolDir {
                 path: store,
+                target: None,
                 dir: pnpm_tool_dir(".local/share/pnpm/store"),
             },
             ResolvedToolDir {
                 path: package_store,
+                target: None,
                 dir: pnpm_tool_dir(".local/share/pnpm/package-manager-store"),
             },
         ];
@@ -1499,6 +1501,7 @@ mod tests {
         symlink(&target, &package_store).unwrap();
         let dirs = [ResolvedToolDir {
             path: package_store,
+            target: None,
             dir: pnpm_tool_dir(".local/share/pnpm/package-manager-store"),
         }];
         let mut config = test_config(&home, &[]);

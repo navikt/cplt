@@ -374,6 +374,21 @@ pub fn discover_tools(home_dir: &Path, tool_roots: &[ToolRoot]) -> ToolDiscovery
         // and the profile must permit the write that creates the directory.
         // Non-writable dirs (tool runtimes) are pruned to existing only.
         .filter(|d| d.dir.write || d.path.exists())
+        // A symlinked tool dir is granted at its target; one pointing somewhere
+        // no grant may reach is dropped, and said so, rather than failing later
+        // as if the tool were broken.
+        .filter(|d| match d.refused_target(home_dir) {
+            Some(target) => {
+                ui::warn(&format!(
+                    "Not granting {}: it is a symlink to {}, which the sandbox never grants \
+                     (a credential path, $HOME or a parent of it, or a system root).",
+                    d.path.display(),
+                    target.display()
+                ));
+                false
+            }
+            None => true,
+        })
         .collect();
 
     // Writable app dirs are always included in this list because they potentially could be created on first use.

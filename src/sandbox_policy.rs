@@ -1747,7 +1747,49 @@ pub struct ToolRoot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedToolDir {
     pub path: PathBuf,
+    /// Where `path` resolves when a symlink sits on it (`~/.cargo -> /opt/cargo`,
+    /// a dotfiles-managed home), `None` when it resolves to itself.
+    ///
+    /// An SBPL `subpath` rule matches the path the kernel resolves, so a grant
+    /// naming only `path` never reaches the tree the tool actually uses (#523,
+    /// the tool-dir half of #515). macOS grants both; Landlock opens `path` and
+    /// follows the link on its own. Either way the target is what gets granted,
+    /// so [`ResolvedToolDir::refused_target`] vets it first.
+    pub target: Option<PathBuf>,
     pub dir: &'static HomeToolDir,
+}
+
+impl ResolvedToolDir {
+    /// The symlink target, when it is one no tool dir may be granted on.
+    ///
+    /// On Linux the grant follows the link whether the target is named or not,
+    /// so a refused target drops the whole entry ([`active_tool_dirs`]) rather
+    /// than only its target rule. Refused:
+    ///
+    /// - anything [`grant_is_refused`] refuses for a user grant: a hard-denied
+    ///   file, a credential directory, cplt's own state;
+    /// - a target inside or containing a [`DENIED_DOTFILES`] or [`DENIED_FILES`]
+    ///   entry, compared canonicalized — `~/.cargo -> ~/.ssh/x`, or
+    ///   `~/.cache -> ~/dotfiles` with `~/.ssh -> ~/dotfiles/ssh`. Landlock
+    ///   cannot deny a subpath of a granted tree, so containment is a leak there;
+    /// - what a relocated `CARGO_HOME` is already held to,
+    ///   [`tool_override_path_is_safe`]: not `/`, `$HOME`, an ancestor of
+    ///   `$HOME`, or a platform system root.
+    ///
+    /// A target outside `$HOME` is otherwise allowed, as it is for `CARGO_HOME`.
+    #[must_use]
+    pub fn refused_target(&self, home: &Path) -> Option<&Path> {
+        let target = self.target.as_deref()?;
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let overlaps_denied = DENIED_DOTFILES.iter().chain(DENIED_FILES).any(|d| {
+            let denied = canon(&home.join(d));
+            denied.starts_with(target) || target.starts_with(&denied)
+        });
+        (overlaps_denied
+            || grant_is_refused(home, target)
+            || !tool_override_path_is_safe(target, &canon(home)))
+        .then_some(target)
+    }
 }
 
 impl HomeToolDir {
@@ -1768,7 +1810,12 @@ impl HomeToolDir {
                 })
             })
             .unwrap_or_else(|| home.join(rel));
-        ResolvedToolDir { path, dir: self }
+        let target = std::fs::canonicalize(&path).ok().filter(|t| *t != path);
+        ResolvedToolDir {
+            path,
+            target,
+            dir: self,
+        }
     }
 }
 
@@ -1791,17 +1838,24 @@ pub fn relocatable_tool_prefix(name: &str) -> Option<&'static str> {
 
 /// Home tool dirs to grant: the discovered subset when available, else every
 /// entry at its default location under `home`.
+///
+/// An entry whose symlink target is refused
+/// ([`ResolvedToolDir::refused_target`]) is dropped here, where every backend
+/// reads the list, so no caller can grant one. Discovery warns about it.
 pub fn active_tool_dirs(
     home: &Path,
     discovered: Option<&[ResolvedToolDir]>,
 ) -> Vec<ResolvedToolDir> {
-    match discovered {
+    let dirs = match discovered {
         Some(dirs) => dirs.to_vec(),
         None => HOME_TOOL_DIRS
             .iter()
             .map(|d| d.resolve(home, &[]))
             .collect(),
-    }
+    };
+    dirs.into_iter()
+        .filter(|d| d.refused_target(home).is_none())
+        .collect()
 }
 
 // ── Tool-path environment variable overrides ───────────────────────────────
