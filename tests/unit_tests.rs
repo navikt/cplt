@@ -6786,20 +6786,29 @@ fn profile_docker_grants_running_colima_profiles_only_their_socket() {
         "~/.testcontainers.properties must be readable with --allow-docker"
     );
 
-    // No write allow may cover colima.yaml or the properties file, whether as
-    // a literal or as a subpath of an ancestor.
+    // No file allow may name the colima tree as a subpath: it holds lima's VM
+    // ssh key under `~/.colima/_lima`. And no write allow may cover colima.yaml
+    // or the properties file, as a literal or as a subpath of an ancestor,
+    // under any of the filters a multi-filter line carries.
+    let colima_subpath = format!(r#"subpath "{h}/.colima"#);
     let colima_yaml = profile.join("colima.yaml");
     let tc_props = home.path().join(".testcontainers.properties");
-    for line in p.lines().filter(|l| l.starts_with("(allow file-write")) {
-        let Some(quoted) = line.split('"').nth(1) else {
+    for line in p.lines().filter(|l| l.starts_with("(allow file-")) {
+        assert!(
+            !line.contains(&colima_subpath),
+            "the colima tree must not be granted as a subpath: {line}"
+        );
+        if !line.contains("file-write") {
             continue;
-        };
-        for target in [&colima_yaml, &tc_props] {
-            assert!(
-                !target.starts_with(quoted),
-                "{} must not be writable, but found: {line}",
-                target.display()
-            );
+        }
+        for quoted in line.split('"').skip(1).step_by(2) {
+            for target in [&colima_yaml, &tc_props] {
+                assert!(
+                    !target.starts_with(quoted),
+                    "{} must not be writable, but found: {line}",
+                    target.display()
+                );
+            }
         }
     }
 }

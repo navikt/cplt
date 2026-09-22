@@ -25,9 +25,9 @@ use super::policy::{
     DEPENDENCY_SOURCE_TREES, EXEC_IN_WRITABLE, GPG_SIGNING_ALLOW_FILES, HOME_CONFIG_FILES,
     PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir,
     SENSITIVE_PROJECT_PATTERNS, SYSTEM_READ_FILES, TOOL_READ_DIRS, XCODE_SELECT_LINK,
-    active_tool_dirs, ancestor_alternation, app_dirs, colima_socket_paths, escape_regex,
-    grant_is_refused, nested_alternation, path_bin_dirs, playwright_runtime_intent, rel_is_glob,
-    rel_regex,
+    active_tool_dirs, ancestor_alternation, app_dirs, colima_socket_paths, current_uid,
+    escape_regex, grant_is_refused, nested_alternation, path_bin_dirs, playwright_runtime_intent,
+    rel_is_glob, rel_regex,
     validate_playwright_socket_dir, validate_sbpl_path,
 };
 
@@ -2362,7 +2362,7 @@ fn emit_docker_rules(sb: &mut String, home: &str, allow_docker: bool, extra_deny
             format!("{home}/{sock}")
         }
     });
-    let colima = colima_socket_paths(Path::new(home))
+    let colima = colima_socket_paths(Path::new(home), current_uid())
         .into_iter()
         .map(|p| p.to_string_lossy().into_owned());
     let mut socks: Vec<String> = Vec::new();

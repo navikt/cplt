@@ -2477,6 +2477,39 @@ mod tests {
         );
     }
 
+    /// A running colima profile's socket, found by the on-disk scan, gets its
+    /// own read+write rule under `--allow-docker` (`ResolveUnix` rides on the
+    /// write branch), and is mount-masked without it (#209).
+    #[test]
+    fn colima_profile_socket_granted_with_docker_and_masked_without() {
+        let project = PathBuf::from("/home/user/project");
+        let home = tempfile::tempdir().unwrap();
+        let colima_home = tempfile::tempdir().unwrap();
+        let profile = colima_home.path().join("work");
+        std::fs::create_dir(&profile).unwrap();
+        let sock = profile.join("docker.sock");
+        let _l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+
+        let (policy, masks) = temp_env::with_var("COLIMA_HOME", Some(colima_home.path()), || {
+            let mut config = test_config(&project, home.path());
+            config.allow_docker = true;
+            let masks = policy::socket_mask_paths(home.path(), policy::current_uid(), None, false);
+            (generate_policy(&config), masks)
+        });
+
+        let rule = policy
+            .fs_rules
+            .iter()
+            .find(|r| r.path == sock)
+            .expect("the colima profile socket should be in the ruleset with --allow-docker");
+        assert!(rule.access.read && rule.access.write);
+        assert!(!rule.access.execute);
+        assert!(
+            masks.contains(&sock),
+            "without --allow-docker it must be masked"
+        );
+    }
+
     /// `~/.testcontainers.properties` is read-only under `--allow-docker` (#209).
     #[test]
     fn allow_docker_grants_testcontainers_properties_read_only() {
