@@ -67,6 +67,32 @@ pub const DENIED_FILES: &[&str] = &[
     ".vault-token",
 ];
 
+/// Home config files granted read-only on both backends, relative to `$HOME`.
+///
+/// One list so the backends cannot drift apart (#522): a config that works on
+/// Linux and fails on macOS, or the reverse, with nothing to say the platform
+/// is the difference. Each backend follows a dotfiles symlink to its target
+/// and refuses a target that is hard-denied (`grant_is_refused`), so a link
+/// into `~/.ssh` or onto `~/.git-credentials` never becomes a grant.
+///
+/// Exact files only. Linux used to grant the whole `~/.config/git` tree, which
+/// also holds `credentials`, git's XDG cleartext credential store; the shell
+/// rc files (`~/.zshrc` and friends) and `~/.node_repl_history` were
+/// Linux-only and routinely hold exported tokens. Neither backend grants them
+/// now. `~/.config/mise` is not here because the mise `AppDir` already covers
+/// it on both.
+pub const HOME_CONFIG_FILES: &[&str] = &[
+    ".gitconfig",
+    ".gitconfig.local",
+    ".gitignore_global",
+    ".config/git/config",
+    // GitHub CLI auth: Copilot and OpenCode spawn `gh auth token`.
+    ".config/gh/hosts.yml",
+    ".config/gh/config.yml",
+    // mise/asdf global tool versions.
+    ".tool-versions",
+];
+
 /// The [`DENIED_FILES`] entry `path` names, if any.
 ///
 /// Hard denies are absolute: unlike [`DENIED_HOME_SUBPATHS`], no `allow.read`
