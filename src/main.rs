@@ -5,8 +5,8 @@ use clap::{Parser, Subcommand};
 #[cfg(target_os = "macos")]
 use cplt::gradle_init;
 use cplt::{
-    agent, audit, brief, check, config, discover, gh_proxy, git, proxy, repo_config, sandbox,
-    scratch, subscriptions, trust, update,
+    agent, audit, brief, check, config, discover, gh_proxy, proxy, repo_config, sandbox, scratch,
+    subscriptions, trust, update,
 };
 use std::collections::BTreeSet;
 use std::io::{self, IsTerminal, Seek, Write};
@@ -2954,6 +2954,11 @@ fn write_session_sandbox_brief(
 /// early return (`--print-profile`, a declined prompt) must leave the project
 /// untouched.
 ///
+/// Written at the repository toplevel, not at `project_dir` (#252): with
+/// `--project-dir apps/web` the file agents read is the root `AGENTS.md`. A
+/// linked worktree or a submodule is its own toplevel, so the block lands in
+/// that checkout, never in the main checkout or the superproject.
+///
 /// Skipped outside a git work tree: a project checkout is the only place a
 /// committed AGENTS.md makes sense, and cplt should not leave a file behind in
 /// an arbitrary directory the user happened to point it at.
@@ -2963,10 +2968,9 @@ fn apply_persistent_sandbox_brief(resolved: &config::Resolved, project_dir: &Pat
     if !resolved.agents_md {
         return;
     }
-    if !in_git_work_tree(project_dir) {
+    let Some(agents_md) = agents_md_path(project_dir) else {
         return;
-    }
-    let agents_md = project_dir.join("AGENTS.md");
+    };
     match brief::upsert_managed_block(&agents_md) {
         Ok(brief::BlockOutcome::SkippedAmbiguous) => {
             ui::warn(&format!(
@@ -2988,21 +2992,11 @@ fn apply_persistent_sandbox_brief(resolved: &config::Resolved, project_dir: &Pat
     }
 }
 
-/// Is `dir` inside a git work tree?
-///
-/// Bare repos and plain directories both answer no: `--is-inside-work-tree`
-/// prints `false` for a bare repo and fails outright outside a repository.
-///
-/// Goes through the hardened parent-side invoker (`git::command`, #210/#211):
-/// this runs in the parent, before the sandbox exists, in a directory the
-/// untrusted project controls, so it must not be a raw `Command::new("git")`.
-/// `rev-parse` is on `CONTENT_FREE_SUBCOMMANDS`, so the invoker never has to
-/// consult the repo config to decide, and returns `None` only for refused
-/// args — which a fixed arg list is not.
-fn in_git_work_tree(dir: &Path) -> bool {
-    git::command(dir, &["rev-parse", "--is-inside-work-tree"])
-        .and_then(|mut cmd| cmd.output().ok())
-        .is_some_and(|o| o.status.success() && o.stdout.starts_with(b"true"))
+/// Where the managed block goes: `AGENTS.md` at the toplevel of the work tree
+/// containing `project_dir`. `None` outside a work tree — a plain directory, a
+/// bare repo, or inside `.git` — since `--show-toplevel` fails in all three.
+fn agents_md_path(project_dir: &Path) -> Option<PathBuf> {
+    git_toplevel(project_dir).map(|root| root.join("AGENTS.md"))
 }
 
 fn start_proxy_if_enabled(
@@ -10283,42 +10277,80 @@ mod tests {
         assert!(resolved_ip_block_item(&optin, "127.0.0.1", 443).is_none());
     }
 
+    /// Run git in `dir`; false when git is missing or the command fails, so the
+    /// caller can skip rather than fail on a machine without git.
+    fn git_ok(dir: &Path, args: &[&str]) -> bool {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
     /// A plain directory is not a work tree, so the persistent brief must not
     /// write there — an AGENTS.md only belongs in a project checkout.
     #[test]
-    fn in_git_work_tree_rejects_plain_directory() {
+    fn agents_md_path_skips_plain_directory() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(!in_git_work_tree(dir.path()));
+        assert_eq!(agents_md_path(dir.path()), None);
     }
 
+    /// `--project-dir apps/web` must update the root AGENTS.md, not create
+    /// `apps/web/AGENTS.md` (#252).
     #[test]
-    fn in_git_work_tree_accepts_initialised_repo() {
+    fn agents_md_path_is_repo_root_from_subdirectory() {
         let dir = tempfile::tempdir().unwrap();
-        let ok = std::process::Command::new("git")
-            .args(["init", "--quiet"])
-            .current_dir(dir.path())
-            .status()
-            .is_ok_and(|s| s.success());
-        if !ok {
+        if !git_ok(dir.path(), &["init", "--quiet"]) {
             return; // no git on this machine — nothing to assert
         }
-        assert!(in_git_work_tree(dir.path()));
+        let sub = dir.path().join("apps/web");
+        std::fs::create_dir_all(&sub).unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        assert_eq!(agents_md_path(&sub), Some(root.join("AGENTS.md")));
+        assert_eq!(agents_md_path(dir.path()), Some(root.join("AGENTS.md")));
+    }
+
+    /// A linked worktree is its own checkout: the block goes in the worktree,
+    /// never in the main checkout it shares a `.git` with.
+    #[test]
+    fn agents_md_path_is_worktree_root_in_linked_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        let ok = git_ok(&main, &["init", "--quiet"])
+            && git_ok(
+                &main,
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "commit",
+                    "--quiet",
+                    "--allow-empty",
+                    "-m",
+                    "init",
+                ],
+            )
+            && git_ok(&main, &["worktree", "add", "--quiet", "../wt"]);
+        if !ok {
+            return;
+        }
+        let wt = std::fs::canonicalize(dir.path().join("wt")).unwrap();
+        let sub = wt.join("src");
+        std::fs::create_dir(&sub).unwrap();
+        assert_eq!(agents_md_path(&sub), Some(wt.join("AGENTS.md")));
     }
 
     /// A bare repo has no work tree, so there is nothing to commit the managed
     /// block into.
     #[test]
-    fn in_git_work_tree_rejects_bare_repo() {
+    fn agents_md_path_skips_bare_repo() {
         let dir = tempfile::tempdir().unwrap();
-        let ok = std::process::Command::new("git")
-            .args(["init", "--bare", "--quiet"])
-            .current_dir(dir.path())
-            .status()
-            .is_ok_and(|s| s.success());
-        if !ok {
+        if !git_ok(dir.path(), &["init", "--bare", "--quiet"]) {
             return;
         }
-        assert!(!in_git_work_tree(dir.path()));
+        assert_eq!(agents_md_path(dir.path()), None);
     }
 
     // ── --repo-dir validation (#344, stage 1) ────────────────────────────
