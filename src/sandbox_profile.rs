@@ -22,12 +22,12 @@ macro_rules! sbpl {
 use super::SandboxConfig;
 use super::policy::{
     DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS,
-    DEPENDENCY_SOURCE_TREES, EXEC_IN_WRITABLE, GPG_SIGNING_ALLOW_FILES, PROTECTED_IN_GITDIR,
-    PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir, SENSITIVE_PROJECT_PATTERNS,
-    SYSTEM_READ_FILES, TOOL_READ_DIRS, XCODE_SELECT_LINK, active_tool_dirs, ancestor_alternation,
-    app_dirs, escape_regex, grant_is_refused, nested_alternation, path_bin_dirs,
-    playwright_runtime_intent, rel_is_glob, rel_regex, validate_playwright_socket_dir,
-    validate_sbpl_path,
+    DEPENDENCY_SOURCE_TREES, EXEC_IN_WRITABLE, GPG_SIGNING_ALLOW_FILES, HOME_CONFIG_FILES,
+    PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir,
+    SENSITIVE_PROJECT_PATTERNS, SYSTEM_READ_FILES, TOOL_READ_DIRS, XCODE_SELECT_LINK,
+    active_tool_dirs, ancestor_alternation, app_dirs, escape_regex, grant_is_refused,
+    nested_alternation, path_bin_dirs, playwright_runtime_intent, rel_is_glob, rel_regex,
+    validate_playwright_socket_dir, validate_sbpl_path,
 };
 
 /// Device nodes a sandboxed process may open for writing, by exact path.
@@ -602,13 +602,6 @@ fn emit_home_access(
         sbpl!(sb);
     }
 
-    // GitHub CLI auth — Copilot spawns `gh auth token` which reads these specific files.
-    // OpenCode may also use `gh` for auth. Allow for all agents.
-    sbpl!(sb, ";; GitHub CLI auth (specific files only)");
-    emit_home_config_read(sb, home, ".config/gh/hosts.yml");
-    emit_home_config_read(sb, home, ".config/gh/config.yml");
-    sbpl!(sb);
-
     // Microsoft DeviceID — telemetry device identifier
     sbpl!(sb, ";; Microsoft DeviceID");
     sbpl!(
@@ -852,17 +845,11 @@ fn emit_system_access(
     sbpl!(sb, "(allow file-read* (subpath \"/private/var/db/mds\"))");
     sbpl!(sb);
 
-    // Git config (read-only)
-    sbpl!(sb, ";; Git config (read-only)");
-    emit_home_config_read(sb, home, ".gitconfig");
-    emit_home_config_read(sb, home, ".gitconfig.local");
-    emit_home_config_read(sb, home, ".gitignore_global");
-    emit_home_config_read(sb, home, ".config/git/config");
-    sbpl!(sb);
-
-    // Tool version files — mise/asdf read these to determine tool versions
-    sbpl!(sb, ";; Tool version files (mise/asdf, read-only)");
-    emit_home_config_read(sb, home, ".tool-versions");
+    // Git, gh and tool-version config: the same list Landlock grants (#522)
+    sbpl!(sb, ";; Home config files (read-only)");
+    for rel in HOME_CONFIG_FILES {
+        emit_home_config_read(sb, home, rel);
+    }
     sbpl!(sb);
 }
 
@@ -1981,6 +1968,9 @@ fn emit_deny_rules(sb: &mut String, home: &str, extra_deny: &[PathBuf]) {
         ".gitconfig.local",
         ".gitignore_global",
         ".config/git/config",
+        // A writable global ignore would hide planted files from `git status`.
+        ".config/git/ignore",
+        ".config/git/attributes",
     ] {
         sbpl!(sb, "(deny file-write* (literal \"{home}/{file}\"))");
     }
@@ -2522,6 +2512,83 @@ mod tests {
         ] {
             assert!(p.contains(rule), "MISSING without git_common_dir: {rule}");
         }
+    }
+
+    /// #522: macOS grants exactly the shared home config list, the same one
+    /// Landlock grants (`home_config_files_are_readable` in sandbox_landlock),
+    /// and none of the entries Linux used to grant on its own.
+    #[test]
+    fn profile_grants_the_shared_home_config_files() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let p = generate_profile(&test_options(project, home), &[]);
+        // The section holds exactly the list: an entry chained onto this
+        // backend alone fails here.
+        let section: std::collections::BTreeSet<&str> = p
+            .split(";; Home config files (read-only)\n")
+            .nth(1)
+            .expect("home config section")
+            .lines()
+            .take_while(|l| !l.is_empty())
+            .map(|l| {
+                l.strip_prefix("(allow file-read* (literal \"/Users/test/")
+                    .and_then(|l| l.strip_suffix("\"))"))
+                    .unwrap_or_else(|| panic!("unexpected home config rule: {l}"))
+            })
+            .collect();
+        let expected: std::collections::BTreeSet<&str> =
+            HOME_CONFIG_FILES.iter().copied().collect();
+        assert_eq!(
+            section, expected,
+            "macOS home config grants drifted from the shared list"
+        );
+        // git's XDG ignore/attributes defaults: unreadable, git drops the
+        // global ignore rules with only a warning.
+        assert!(section.contains(".config/git/ignore"));
+        assert!(section.contains(".config/git/attributes"));
+        for rel in [
+            ".zshrc",
+            ".bashrc",
+            ".profile",
+            ".bash_profile",
+            ".zprofile",
+            ".node_repl_history",
+            ".config/git/credentials",
+        ] {
+            assert!(
+                !p.contains(&format!(
+                    "(allow file-read* (literal \"/Users/test/{rel}\"))"
+                )),
+                "{rel} is not in the shared list and must not be granted"
+            );
+        }
+    }
+
+    /// git's XDG cleartext credential store is a hard deny, like
+    /// `~/.git-credentials`: an `allow.read` on `~/.config/git` does not
+    /// re-open it, because the literal deny comes after the grant.
+    #[test]
+    fn profile_denies_xdg_git_credentials_under_a_granted_config_dir() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let granted = [PathBuf::from("/Users/test/.config/git")];
+        let mut opts = test_options(project, home);
+        opts.extra_read = &granted;
+        let p = generate_profile(&opts, &[]);
+        let grant = p
+            .find("(allow file-read* (subpath \"/Users/test/.config/git\"))")
+            .expect("allow.read ~/.config/git is emitted");
+        let deny = p
+            .rfind("(deny file-read* (literal \"/Users/test/.config/git/credentials\"))")
+            .expect("~/.config/git/credentials is denied");
+        assert!(
+            deny > grant,
+            "the deny must follow the grant (last match wins)"
+        );
+        assert!(grant_is_refused(
+            home,
+            &home.join(".config/git/credentials")
+        ));
     }
 
     /// Finding B: `allow.exec` inside a credential directory was emitted by

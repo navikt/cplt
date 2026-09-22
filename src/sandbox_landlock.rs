@@ -241,38 +241,6 @@ pub(super) const LINUX_TOOL_DIRS: &[&str] = &[
     "/home/linuxbrew/.linuxbrew", // Homebrew on Linux; /opt/homebrew counterpart in TOOL_READ_DIRS
 ];
 
-/// Individual home config files (and select config directories) that tools
-/// need read access to.
-///
-/// File entries grant access to a single file. Directory entries (e.g.
-/// `.config/mise`) grant recursive read access to the subtree — this is
-/// acceptable because these directories contain only tool configuration,
-/// not secrets.
-///
-/// Mirrors the macOS SBPL literal file allows in `emit_system_access()`.
-const LINUX_HOME_CONFIG_FILES: &[&str] = &[
-    // Git configuration (includes user-config, attributes, ignore, etc.)
-    ".gitconfig",
-    ".gitconfig.local",
-    ".gitignore_global",
-    ".config/git",
-    // GitHub CLI auth (specific files only)
-    ".config/gh/hosts.yml",
-    ".config/gh/config.yml",
-    // Tool version managers
-    ".tool-versions",
-    // mise config directory (tool versions, env settings — no secrets)
-    ".config/mise",
-    // Shell startup (tools source these for PATH)
-    ".bashrc",
-    ".zshrc",
-    ".profile",
-    ".bash_profile",
-    ".zprofile",
-    // Node.js REPL history
-    ".node_repl_history",
-];
-
 /// Device and pseudo-filesystem paths that Node.js and common tools need,
 /// granted read + write + ioctl.
 ///
@@ -899,7 +867,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     // grant-only, so there is no deny to lose to. `grant_is_refused` is the same
     // filter `extra_read` goes through below, and it canonicalizes, so the
     // symlink is what gets tested.
-    for &file in LINUX_HOME_CONFIG_FILES {
+    for &file in policy::HOME_CONFIG_FILES {
         let path = home.join(file);
         if policy::grant_is_refused(home, &path) {
             continue;
@@ -4005,7 +3973,7 @@ mod tests {
         let config = test_config(&project, &home);
         let policy = generate_policy(&config);
 
-        for &file in LINUX_HOME_CONFIG_FILES {
+        for &file in policy::HOME_CONFIG_FILES {
             let path = home.join(file);
             let rule = policy
                 .fs_rules
@@ -4015,6 +3983,52 @@ mod tests {
             assert!(rule.access.read, "{file} should have read");
             assert!(!rule.access.write, "{file} should NOT have write");
             assert!(!rule.access.execute, "{file} should NOT have execute");
+        }
+
+        // #522: the shared list is the whole grant. Every read-only home rule
+        // that no AppDir or tool dir accounts for must be a list entry, and
+        // every entry must be emitted, so an entry chained onto this backend
+        // alone fails here.
+        let app_paths: Vec<PathBuf> = policy::app_dirs()
+            .iter()
+            .flat_map(|d| d.all_paths(&home))
+            .chain(policy::HOME_TOOL_DIRS.iter().map(|d| home.join(d.path)))
+            .collect();
+        let emitted: std::collections::BTreeSet<&Path> = policy
+            .fs_rules
+            .iter()
+            .filter(|r| r.access.read && !r.access.write && !r.access.execute)
+            .filter(|r| !app_paths.contains(&r.path))
+            .filter_map(|r| r.path.strip_prefix(&home).ok())
+            .collect();
+        let expected: std::collections::BTreeSet<&Path> =
+            policy::HOME_CONFIG_FILES.iter().map(Path::new).collect();
+        assert_eq!(
+            emitted, expected,
+            "Landlock home config grants drifted from the shared list"
+        );
+        // git's XDG ignore/attributes defaults: unreadable, git drops the
+        // global ignore rules with only a warning.
+        assert!(emitted.contains(Path::new(".config/git/ignore")));
+        assert!(emitted.contains(Path::new(".config/git/attributes")));
+
+        // Nothing Linux used to grant on its own may come back, directly or
+        // through an ancestor (`~/.config/git` covered git's XDG `credentials`
+        // store).
+        for rel in [
+            ".zshrc",
+            ".bashrc",
+            ".profile",
+            ".bash_profile",
+            ".zprofile",
+            ".node_repl_history",
+            ".config/git/credentials",
+        ] {
+            let path = home.join(rel);
+            assert!(
+                !policy.fs_rules.iter().any(|r| path.starts_with(&r.path)),
+                "{rel} is not in the shared list and must not be granted"
+            );
         }
 
         // $HOME itself must NOT be in the ruleset (would grant recursive read)
@@ -4213,7 +4227,7 @@ mod tests {
         config.existing_app_dirs = Some(&nonexistent);
         let policy = generate_policy(&config);
 
-        // Some mise paths may appear from LINUX_HOME_CONFIG_FILES (read-only).
+        // Some mise paths may appear read-only (the Config kind is read-only).
         // The important property is that writable app-dir paths are excluded.
         let write_paths = policy::app_dirs()[0].write_paths(&home);
         for p in &write_paths {

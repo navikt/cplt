@@ -62,9 +62,45 @@ pub const DENIED_FILES: &[&str] = &[
     // it lines up with `.netrc`, git's other cleartext credential store, which
     // has been on this list from the start.
     ".git-credentials",
+    // The same store at git's XDG location: git reads it alongside
+    // `~/.git-credentials` and writes to it when only it exists. Listed so an
+    // `allow.read ~/.config/git` cannot re-open it on macOS.
+    ".config/git/credentials",
     ".pypirc",
     ".gem/credentials",
     ".vault-token",
+];
+
+/// Home config files granted read-only on both backends, relative to `$HOME`.
+///
+/// One list so the backends cannot drift apart (#522): a config that works on
+/// Linux and fails on macOS, or the reverse, with nothing to say the platform
+/// is the difference. Each backend follows a dotfiles symlink to its target
+/// and refuses a target that is hard-denied (`grant_is_refused`), so a link
+/// into `~/.ssh` or onto `~/.git-credentials` never becomes a grant.
+///
+/// Exact files only. Linux used to grant the whole `~/.config/git` tree, which
+/// also holds `credentials`, git's XDG cleartext credential store. `ignore`
+/// and `attributes` are git's XDG defaults for `core.excludesFile` and
+/// `core.attributesFile`; an unreadable default ignore file only makes git warn
+/// and carry on without it, so `git add -A` would stage what the user ignores
+/// globally. They hold patterns, not secrets. The shell
+/// rc files (`~/.zshrc` and friends) and `~/.node_repl_history` were
+/// Linux-only and routinely hold exported tokens. Neither backend grants them
+/// now. `~/.config/mise` is not here because the mise `AppDir` already covers
+/// it on both.
+pub const HOME_CONFIG_FILES: &[&str] = &[
+    ".gitconfig",
+    ".gitconfig.local",
+    ".gitignore_global",
+    ".config/git/config",
+    ".config/git/ignore",
+    ".config/git/attributes",
+    // GitHub CLI auth: Copilot and OpenCode spawn `gh auth token`.
+    ".config/gh/hosts.yml",
+    ".config/gh/config.yml",
+    // mise/asdf global tool versions.
+    ".tool-versions",
 ];
 
 /// The [`DENIED_FILES`] entry `path` names, if any.
