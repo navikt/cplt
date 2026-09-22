@@ -369,6 +369,7 @@ A curated blocklist of these domains ships in [`blocked-domains.txt`](blocked-do
 **Network is port-restricted, with optional domain filtering.** SBPL (Seatbelt Profile Language) has no domain-based filtering at the kernel level, and Copilot CLI connects to CDN-backed endpoints (`api.business.githubcopilot.com`) whose IPs change and cannot be enumerated. So we allow outbound TCP on port 443 only, with `--allow-port` for extras such as `--allow-port 80`. On macOS, SSH agent access and localhost outbound are blocked at the kernel level; on Linux neither is, see [Linux-specific limitations](#linux-specific-limitations). That leaves:
 
 - A compromised agent CAN make HTTPS requests to attacker-controlled servers on port 443
+- A compromised agent CAN speak any protocol on port 443, SSH included: `ssh.github.com:443` is reachable without `--allow-port 22`, and under proxy-forced mode through a CONNECT tunnel, because the proxy does not inspect tunnel contents and a `github.com` allowlist entry matches its subdomains. What stops SSH is the missing key, not the port, see [SSH over port 443](docs/known-impacts.md#ssh-over-port-443)
 - A compromised agent CANNOT exfiltrate cloud credentials from env vars (env is sanitized; only the safe allowlist passes through)
 - A compromised agent CAN exfiltrate project source code and Copilot auth tokens
 - A compromised agent CANNOT connect to local services (localhost is blocked on macOS; on Linux use `--with-proxy`, see [Linux-specific limitations](#linux-specific-limitations))
