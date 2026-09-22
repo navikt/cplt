@@ -1768,6 +1768,8 @@ impl ResolvedToolDir {
     ///
     /// - anything [`grant_is_refused`] refuses for a user grant: a hard-denied
     ///   file, a credential directory, cplt's own state;
+    /// - a target containing cplt's state directory, wherever `CPLT_CONFIG`
+    ///   puts it;
     /// - a target inside or containing a [`DENIED_DOTFILES`] or [`DENIED_FILES`]
     ///   entry, compared canonicalized — `~/.cargo -> ~/.ssh/x`, or
     ///   `~/.cache -> ~/dotfiles` with `~/.ssh -> ~/dotfiles/ssh`. Landlock
@@ -1780,12 +1782,23 @@ impl ResolvedToolDir {
     #[must_use]
     pub fn refused_target(&self, home: &Path) -> Option<&Path> {
         let target = self.target.as_deref()?;
-        let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        // Through the deepest existing ancestor: a denied entry that does not
+        // exist, under a `$HOME` spelled through a symlink, must still compare
+        // in canonical form against the canonical target.
+        let canon = config::canonicalize_deepest;
         let overlaps_denied = DENIED_DOTFILES.iter().chain(DENIED_FILES).any(|d| {
             let denied = canon(&home.join(d));
             denied.starts_with(target) || target.starts_with(&denied)
         });
+        // `grant_is_refused` catches a target inside cplt's state directory;
+        // one containing it (`CPLT_CONFIG` moved it out of `.config/cplt`) is
+        // caught only here.
+        let contains_state = [config::config_dir(), Some(home.join(CPLT_STATE_DIR))]
+            .into_iter()
+            .flatten()
+            .any(|dir| canon(&dir).starts_with(target));
         (overlaps_denied
+            || contains_state
             || grant_is_refused(home, target)
             || !tool_override_path_is_safe(target, &canon(home)))
         .then_some(target)

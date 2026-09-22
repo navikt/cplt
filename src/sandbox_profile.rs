@@ -506,7 +506,11 @@ fn dependency_source_trees(home: &str, tool_dirs: Option<&[ResolvedToolDir]>) ->
             let base = tool_dirs
                 .and_then(|dirs| {
                     dirs.iter()
-                        .find(|d| d.dir.path == *tool_dir)
+                        // A refused target is never granted, so it gets no
+                        // re-allow either.
+                        .find(|d| {
+                            d.dir.path == *tool_dir && d.refused_target(Path::new(home)).is_none()
+                        })
                         // The target when symlinked: the re-allow is a regex
                         // on the path the kernel resolves (#523).
                         .map(|d| {

@@ -1109,6 +1109,47 @@ fn symlinked_tool_dir_onto_a_sensitive_path_is_not_granted() {
     }
 }
 
+/// Containment has to hold when `$HOME` itself is reached through a symlink
+/// and the protected entry does not exist yet: `~/.cache -> ~/dotfiles`, with
+/// `~/.gem -> ~/dotfiles/gem` and no `credentials` in it, or with `CPLT_CONFIG`
+/// moving cplt's state directory into `~/dotfiles`. Granting the target would
+/// grant the file the moment it is created.
+#[test]
+fn symlinked_tool_dir_containing_a_protected_path_under_a_symlinked_home_is_refused() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let root = std::fs::canonicalize(root.path()).expect("canonicalize");
+    let real_home = root.join("real-home");
+    let dotfiles = real_home.join("dotfiles");
+    std::fs::create_dir_all(&dotfiles).expect("mkdir dotfiles");
+    let home_dir = root.join("home");
+    std::os::unix::fs::symlink(&real_home, &home_dir).expect("symlink home");
+    std::os::unix::fs::symlink(&dotfiles, home_dir.join(".cache")).expect("symlink cache");
+    let cache_granted = || {
+        cplt::sandbox::active_tool_dirs(&home_dir, None)
+            .iter()
+            .any(|d| d.dir.path == ".cache")
+    };
+
+    assert!(cache_granted(), "nothing protected is inside yet");
+
+    std::fs::create_dir_all(dotfiles.join("gem")).expect("mkdir gem");
+    std::os::unix::fs::symlink(dotfiles.join("gem"), home_dir.join(".gem")).expect("symlink gem");
+    assert!(
+        !cache_granted(),
+        "~/.gem/credentials would land inside the ~/.cache target"
+    );
+    std::fs::remove_file(home_dir.join(".gem")).expect("unlink gem");
+    assert!(cache_granted(), "only the credential link refused it");
+
+    let config = home_dir.join("dotfiles/cplt/config.toml");
+    temp_env::with_var("CPLT_CONFIG", Some(&config), || {
+        assert!(
+            !cache_granted(),
+            "the relocated cplt state directory is inside the ~/.cache target"
+        );
+    });
+}
+
 /// `~/.gitconfig -> ~/.git-credentials`. The link target is a hard deny, so the
 /// resolved grant must never be emitted — on macOS the later deny would win
 /// anyway, but Landlock is grant-only and has no deny to fall back on, so the
