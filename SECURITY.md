@@ -470,7 +470,12 @@ hard-denied file, contains a `DENIED_HOME_SUBPATHS` file linked in from another
 name (`~/.cache -> ~/dotfiles` with `~/.npmrc -> ~/dotfiles/npmrc`), lies in
 cplt's state directory, or is `/`, `$HOME`, an ancestor of `$HOME` or a platform
 system root — the same bar a relocated `CARGO_HOME` meets. On macOS a target
-the profile cannot name (one containing `( ) " ; \`) is refused the same way. Any other target is granted, including one outside `$HOME`. The
+the profile cannot name (one containing `( ) " ; \`) is refused the same way.
+When an executable tool directory's grant lands in the same tree as a writable
+one (`~/.cargo/bin` and `~/.cargo/registry` linked to one directory, or
+`CARGO_HOME=~/.cache/cargo`), cplt drops the executable one with a warning,
+because Landlock would combine the two grants into a writable, executable tree.
+Any other target is granted, including one outside `$HOME`. The
 between-launches caveat above applies: whoever can replace a tool directory with
 a symlink chooses where its grant lands next time. None of cplt's default grants
 makes a tool directory's parent writable; an `allow.write` on one (say
