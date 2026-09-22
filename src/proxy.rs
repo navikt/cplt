@@ -1346,7 +1346,7 @@ fn handle_connect(
                 target,
                 "BLOCKED-ALLOWLIST",
             );
-            let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nDomain not in allowlist\r\n");
+            let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nDomain not in allowlist. The allowlist is the agent's defaults (when enabled) plus allow.domains and the file named by proxy.allowed_domains; a preset or tool may have set these, not you. Inspect them with `cplt config get proxy.allowed_domains` and `cplt config get allow.domains`. To allow the host, add it to that file (re-read live) or run `cplt config set allow.domains HOST` and restart cplt.\r\n");
             return;
         }
         NetVerdict::Blocked => {
@@ -4834,6 +4834,31 @@ mod tests {
             status.contains("403"),
             "domain not in allowlist must be rejected; got: {status:?}"
         );
+
+        // The body must name where the list lives (#532): a bare "Domain not in
+        // allowlist" sends people hunting when a preset or tool set the list.
+        let body = {
+            use std::io::{Read as _, Write as _};
+            let mut conn =
+                std::net::TcpStream::connect(format!("127.0.0.1:{}", proxy.port)).unwrap();
+            let _ = write!(
+                conn,
+                "CONNECT notallowed.example.com:443 HTTP/1.1\r\nHost: notallowed.example.com:443\r\n\r\n"
+            );
+            let mut resp = String::new();
+            let _ = conn.read_to_string(&mut resp);
+            resp
+        };
+        for needle in [
+            "proxy.allowed_domains",
+            "allow.domains",
+            "cplt config get proxy.allowed_domains",
+        ] {
+            assert!(
+                body.contains(needle),
+                "403 body must mention {needle:?}; got: {body:?}"
+            );
+        }
 
         std::thread::sleep(Duration::from_millis(100));
         assert!(
