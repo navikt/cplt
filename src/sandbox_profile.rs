@@ -1968,6 +1968,9 @@ fn emit_deny_rules(sb: &mut String, home: &str, extra_deny: &[PathBuf]) {
         ".gitconfig.local",
         ".gitignore_global",
         ".config/git/config",
+        // A writable global ignore would hide planted files from `git status`.
+        ".config/git/ignore",
+        ".config/git/attributes",
     ] {
         sbpl!(sb, "(deny file-write* (literal \"{home}/{file}\"))");
     }
@@ -2519,10 +2522,30 @@ mod tests {
         let project = std::path::Path::new("/projects/app");
         let home = std::path::Path::new("/Users/test");
         let p = generate_profile(&test_options(project, home), &[]);
-        for rel in HOME_CONFIG_FILES {
-            let rule = format!("(allow file-read* (literal \"/Users/test/{rel}\"))");
-            assert!(p.contains(&rule), "MISSING shared home config: {rule}");
-        }
+        // The section holds exactly the list: an entry chained onto this
+        // backend alone fails here.
+        let section: std::collections::BTreeSet<&str> = p
+            .split(";; Home config files (read-only)\n")
+            .nth(1)
+            .expect("home config section")
+            .lines()
+            .take_while(|l| !l.is_empty())
+            .map(|l| {
+                l.strip_prefix("(allow file-read* (literal \"/Users/test/")
+                    .and_then(|l| l.strip_suffix("\"))"))
+                    .unwrap_or_else(|| panic!("unexpected home config rule: {l}"))
+            })
+            .collect();
+        let expected: std::collections::BTreeSet<&str> =
+            HOME_CONFIG_FILES.iter().copied().collect();
+        assert_eq!(
+            section, expected,
+            "macOS home config grants drifted from the shared list"
+        );
+        // git's XDG ignore/attributes defaults: unreadable, git drops the
+        // global ignore rules with only a warning.
+        assert!(section.contains(".config/git/ignore"));
+        assert!(section.contains(".config/git/attributes"));
         for rel in [
             ".zshrc",
             ".bashrc",
@@ -2533,10 +2556,39 @@ mod tests {
             ".config/git/credentials",
         ] {
             assert!(
-                !p.contains(&format!("\"/Users/test/{rel}\"))")),
+                !p.contains(&format!(
+                    "(allow file-read* (literal \"/Users/test/{rel}\"))"
+                )),
                 "{rel} is not in the shared list and must not be granted"
             );
         }
+    }
+
+    /// git's XDG cleartext credential store is a hard deny, like
+    /// `~/.git-credentials`: an `allow.read` on `~/.config/git` does not
+    /// re-open it, because the literal deny comes after the grant.
+    #[test]
+    fn profile_denies_xdg_git_credentials_under_a_granted_config_dir() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let granted = [PathBuf::from("/Users/test/.config/git")];
+        let mut opts = test_options(project, home);
+        opts.extra_read = &granted;
+        let p = generate_profile(&opts, &[]);
+        let grant = p
+            .find("(allow file-read* (subpath \"/Users/test/.config/git\"))")
+            .expect("allow.read ~/.config/git is emitted");
+        let deny = p
+            .rfind("(deny file-read* (literal \"/Users/test/.config/git/credentials\"))")
+            .expect("~/.config/git/credentials is denied");
+        assert!(
+            deny > grant,
+            "the deny must follow the grant (last match wins)"
+        );
+        assert!(grant_is_refused(
+            home,
+            &home.join(".config/git/credentials")
+        ));
     }
 
     /// Finding B: `allow.exec` inside a credential directory was emitted by

@@ -3985,9 +3985,36 @@ mod tests {
             assert!(!rule.access.execute, "{file} should NOT have execute");
         }
 
-        // #522: the shared list is the whole grant. Nothing Linux used to
-        // grant on its own may come back, directly or through an ancestor
-        // (`~/.config/git` covered git's XDG `credentials` store).
+        // #522: the shared list is the whole grant. Every read-only home rule
+        // that no AppDir or tool dir accounts for must be a list entry, and
+        // every entry must be emitted, so an entry chained onto this backend
+        // alone fails here.
+        let app_paths: Vec<PathBuf> = policy::app_dirs()
+            .iter()
+            .flat_map(|d| d.all_paths(&home))
+            .chain(policy::HOME_TOOL_DIRS.iter().map(|d| home.join(d.path)))
+            .collect();
+        let emitted: std::collections::BTreeSet<&Path> = policy
+            .fs_rules
+            .iter()
+            .filter(|r| r.access.read && !r.access.write && !r.access.execute)
+            .filter(|r| !app_paths.contains(&r.path))
+            .filter_map(|r| r.path.strip_prefix(&home).ok())
+            .collect();
+        let expected: std::collections::BTreeSet<&Path> =
+            policy::HOME_CONFIG_FILES.iter().map(Path::new).collect();
+        assert_eq!(
+            emitted, expected,
+            "Landlock home config grants drifted from the shared list"
+        );
+        // git's XDG ignore/attributes defaults: unreadable, git drops the
+        // global ignore rules with only a warning.
+        assert!(emitted.contains(Path::new(".config/git/ignore")));
+        assert!(emitted.contains(Path::new(".config/git/attributes")));
+
+        // Nothing Linux used to grant on its own may come back, directly or
+        // through an ancestor (`~/.config/git` covered git's XDG `credentials`
+        // store).
         for rel in [
             ".zshrc",
             ".bashrc",

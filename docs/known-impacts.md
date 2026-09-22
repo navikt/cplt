@@ -539,6 +539,28 @@ Some git operations are blocked to prevent persistence attacks that would surviv
 
 **Commit signing:** `~/.ssh` and `~/.gnupg` are blocked, so GPG/SSH signing would fail. Rather than open private key directories, cplt injects `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_N`/`GIT_CONFIG_VALUE_N` env vars that disable `commit.gpgsign` and `tag.gpgsign` inside the sandbox. Commits made by Copilot are unsigned, which is expected since users typically re-sign on merge or squash. Use `--allow-gpg-signing` to override this (see [GPG signing](#gpg-commit-signing)).
 
+## Linux: fewer home config files are readable (behaviour change)
+
+Linux used to grant a longer list of home config files than macOS. Both platforms now grant the same list, and Linux lost these:
+
+| No longer readable on Linux | What breaks |
+| --- | --- |
+| `~/.zshrc`, `~/.bashrc`, `~/.profile`, `~/.bash_profile`, `~/.zprofile` | Only an interactive `cplt --agent shell` session, which now starts without your aliases, prompt or `PATH` additions. Commands agents run through `$SHELL -c` never read these files. zsh does read `~/.zshenv` for `-c`, but that file was never granted on either platform |
+| `~/.node_repl_history` | Nothing that matters: the `node` REPL starts with an empty history |
+| Everything in `~/.config/git/` except `config`, `ignore` and `attributes`, for example `allowed_signers`, or an `includeIf` target such as `~/.config/git/work` | git **aborts** on an include it cannot read, so a `[includeIf "gitdir:~/work/"] path = ~/.config/git/work` in your config fails every git command in a matching repository |
+
+The rc files often export tokens. The rest of `~/.config/git/` can hold `credentials`, git's cleartext credential store, which is now hard-denied on both platforms, like `~/.git-credentials`. macOS already behaved this way.
+
+**Symptom:** `fatal: unable to access '/home/you/.config/git/work': Permission denied` from any git command.
+
+**Fix:** grant the file you need by name:
+
+```bash
+cplt config set allow.read "~/.config/git/work"
+```
+
+A grant on the whole `~/.config/git` directory works too, and `credentials` stays denied inside it on macOS. On Linux, Landlock cannot deny a file inside a granted directory, so the directory grant exposes `credentials` there. Grant individual files instead.
+
 ## GPG commit signing
 
 GPG commit and tag signing is **disabled by default** because `~/.gnupg` is blocked. Copilot commits are unsigned, and you re-sign on merge or squash.
