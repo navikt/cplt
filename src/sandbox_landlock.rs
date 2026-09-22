@@ -814,7 +814,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     //
     // Docker Desktop for Linux serves the daemon from inside that tree, at
     // `~/.docker/desktop/docker.sock`, so the socket list carries it too
-    // (#279). It has to be its own read+write rule: `ResolveUnix` — the right
+    // (#279), as it carries every running colima profile's socket (#209). It has to be its own read+write rule: `ResolveUnix` — the right
     // `connect(2)` needs from ABI v9 — is granted on the write branch of
     // `create_path_beneath_rule` alone, so the read-only parent grant below
     // leaves the socket unconnectable. Landlock unions the rights of every
@@ -853,6 +853,22 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 create_dirs: false,
             },
         });
+        // TestContainers' own config (`docker.host`), read-only like on
+        // macOS (#209). Filtered like HOME_CONFIG_FILES, since the rule
+        // follows a symlink.
+        let tc_props = home.join(".testcontainers.properties");
+        if !policy::grant_is_refused(home, &tc_props) {
+            fs_rules.push(FsRule {
+                path: tc_props,
+                access: FsAccess {
+                    read: true,
+                    write: false,
+                    execute: false,
+                    ioctl: false,
+                    create_dirs: false,
+                },
+            });
+        }
     }
 
     // ── Home config files: individual read-only rules ──
@@ -2459,6 +2475,25 @@ mod tests {
             !rule.access.execute,
             "~/.docker must not carry execute (Landlock execute is process-exec, #243)"
         );
+    }
+
+    /// `~/.testcontainers.properties` is read-only under `--allow-docker` (#209).
+    #[test]
+    fn allow_docker_grants_testcontainers_properties_read_only() {
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let mut config = test_config(&project, &home);
+        config.allow_docker = true;
+        let policy = generate_policy(&config);
+
+        let rule = policy
+            .fs_rules
+            .iter()
+            .find(|r| r.path == home.join(".testcontainers.properties"))
+            .expect("~/.testcontainers.properties should be in the ruleset with --allow-docker");
+        assert!(rule.access.read);
+        assert!(!rule.access.write, "it must not be writable");
+        assert!(!rule.access.execute);
     }
 
     /// Docker Desktop for Linux's socket sits at `~/.docker/desktop/docker.sock`,

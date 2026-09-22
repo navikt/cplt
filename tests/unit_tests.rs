@@ -6749,6 +6749,61 @@ fn profile_docker_withholds_the_overlapping_reallow() {
     );
 }
 
+/// A non-default colima profile (`colima start --profile work`) serves Docker at
+/// `~/.colima/work/docker.sock`, which no fixed list can name (#209). The grant
+/// is the socket alone: the profile's `colima.yaml` next to it stays
+/// unwritable, and `~/.testcontainers.properties` is readable but not writable.
+#[test]
+fn profile_docker_grants_running_colima_profiles_only_their_socket() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let profile = home.path().join(".colima").join("work");
+    std::fs::create_dir_all(&profile).unwrap();
+    std::fs::write(profile.join("colima.yaml"), "cpu: 2\n").unwrap();
+    let sock = profile.join("docker.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind socket");
+    let h = home.path().to_str().unwrap();
+
+    let p = temp_env::with_vars_unset(["COLIMA_HOME", "XDG_CONFIG_HOME"], || {
+        generate_profile(
+            &SandboxConfig {
+                home_dir: home.path(),
+                allow_docker: true,
+                ..base_profile_options()
+            },
+            &[],
+        )
+    });
+
+    let sock = sock.to_str().unwrap();
+    assert!(
+        p.contains(&format!(r#"(allow network-outbound (literal "{sock}"))"#)),
+        "the running non-default colima profile's socket must be granted"
+    );
+    assert!(
+        p.contains(&format!(
+            r#"(allow file-read* (literal "{h}/.testcontainers.properties"))"#
+        )),
+        "~/.testcontainers.properties must be readable with --allow-docker"
+    );
+
+    // No write allow may cover colima.yaml or the properties file, whether as
+    // a literal or as a subpath of an ancestor.
+    let colima_yaml = profile.join("colima.yaml");
+    let tc_props = home.path().join(".testcontainers.properties");
+    for line in p.lines().filter(|l| l.starts_with("(allow file-write")) {
+        let Some(quoted) = line.split('"').nth(1) else {
+            continue;
+        };
+        for target in [&colima_yaml, &tc_props] {
+            assert!(
+                !target.starts_with(quoted),
+                "{} must not be writable, but found: {line}",
+                target.display()
+            );
+        }
+    }
+}
+
 #[test]
 fn profile_socket_allows_rules() {
     let p = generate_profile(

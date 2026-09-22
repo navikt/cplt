@@ -386,7 +386,63 @@ pub fn linux_docker_socket_paths(
     );
     paths.push(PathBuf::from("/run/podman"));
     paths.push(home.join(".docker").join("desktop").join("docker.sock"));
+    paths.extend(colima_socket_paths(home));
     paths
+}
+
+/// Colima daemon sockets that exist right now, in every profile (#209).
+///
+/// `colima start --profile foo` serves Docker at `<colima dir>/foo/docker.sock`,
+/// so a fixed list can only ever name the default profile. The profile names
+/// are read from disk instead: each direct subdirectory of a colima dir, plus
+/// the root-level `<colima dir>/docker.sock`.
+///
+/// The colima dir is `$COLIMA_HOME` when set, else `~/.colima`, else the XDG
+/// location `$XDG_CONFIG_HOME/colima` (default `~/.config/colima`). All of them
+/// are scanned rather than guessing which one colima picked. That costs
+/// nothing, because only entries that `lstat` as a **socket** named
+/// `docker.sock` are returned: never a directory, a config file such as
+/// `colima.yaml`, or a symlink. A path carrying a character unsafe in SBPL is
+/// dropped as well. The symlink exclusion matters on Linux, where a
+/// Landlock rule follows links and would otherwise grant read+write to
+/// whatever the link names.
+///
+/// A profile started after cplt launched is not covered; the default-profile
+/// literals in the macOS profile still are.
+pub fn colima_socket_paths(home: &Path) -> Vec<PathBuf> {
+    let env_dir = |var: &str| {
+        std::env::var_os(var)
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+    };
+    let mut dirs: Vec<PathBuf> = env_dir("COLIMA_HOME").into_iter().collect();
+    dirs.push(home.join(".colima"));
+    dirs.push(
+        env_dir("XDG_CONFIG_HOME")
+            .unwrap_or_else(|| home.join(".config"))
+            .join("colima"),
+    );
+
+    let is_socket = |p: &Path| {
+        use std::os::unix::fs::FileTypeExt;
+        std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_socket())
+    };
+    let mut socks = Vec::new();
+    for dir in dirs {
+        let profiles = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path().join("docker.sock"));
+        for sock in std::iter::once(dir.join("docker.sock")).chain(profiles) {
+            // Profile names come from disk and end up in SBPL on macOS, so a
+            // name that could break out of a string literal is dropped.
+            if is_socket(&sock) && validate_sbpl_path(&sock).is_ok() && !socks.contains(&sock) {
+                socks.push(sock);
+            }
+        }
+    }
+    socks
 }
 
 /// Sensitive file patterns denied by default. These often contain secrets (API
@@ -2762,6 +2818,39 @@ pub const EXEC_IN_WRITABLE: &[ExecInWritable] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only live `docker.sock` sockets are returned, from every profile and from
+    /// `$COLIMA_HOME` -- never the profile's config, and never a symlink, which a
+    /// Landlock rule would follow to wherever it points (#209).
+    #[test]
+    fn colima_socket_paths_returns_only_real_sockets() {
+        use std::os::unix::net::UnixListener;
+        let home = tempfile::tempdir().unwrap();
+        let colima_home = tempfile::tempdir().unwrap();
+        let work = home.path().join(".colima/work");
+        let evil = home.path().join(".colima/evil");
+        let custom = colima_home.path().join("custom");
+        for d in [&work, &evil, &custom] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(work.join("colima.yaml"), "").unwrap();
+        let _a = UnixListener::bind(work.join("docker.sock")).unwrap();
+        let _b = UnixListener::bind(custom.join("docker.sock")).unwrap();
+        std::os::unix::fs::symlink(work.join("colima.yaml"), evil.join("docker.sock")).unwrap();
+
+        let got = temp_env::with_vars(
+            [
+                ("COLIMA_HOME", Some(colima_home.path().as_os_str())),
+                ("XDG_CONFIG_HOME", None),
+            ],
+            || colima_socket_paths(home.path()),
+        );
+        assert_eq!(
+            got,
+            vec![custom.join("docker.sock"), work.join("docker.sock")],
+            "expected exactly the two live sockets"
+        );
+    }
 
     #[test]
     fn resolve_rejects_relative_xdg_cache_home() {
