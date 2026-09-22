@@ -961,6 +961,58 @@ fn profile_follows_symlinked_home_git_config() {
     );
 }
 
+/// #524: the read grant follows the link, so the write deny must too. With the
+/// dotfiles repo as the project and its parent also under `allow.write`, the
+/// target is writable through both grants unless a deny naming the target
+/// comes after each of them (SBPL is last-match-wins). The directory above the
+/// target must keep its name, or `mv dotfiles d2 && mkdir dotfiles` walks
+/// around the literal.
+#[test]
+fn profile_denies_writes_at_a_symlinked_home_git_config_target() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+    let home_dir = root.join("home");
+    let project = root.join("project");
+    let target = project.join("dotfiles/gitconfig");
+    std::fs::create_dir_all(&home_dir).expect("mkdir home");
+    std::fs::create_dir_all(target.parent().unwrap()).expect("mkdir dotfiles");
+    std::fs::write(&target, "[user]\n\tname = cplt\n").expect("write target");
+    std::os::unix::fs::symlink(&target, home_dir.join(".gitconfig")).expect("symlink");
+    let extra_write = [project.join("dotfiles")];
+
+    let p = generate_profile(
+        &SandboxConfig {
+            home_dir: &home_dir,
+            project_dir: &project,
+            extra_write: &extra_write,
+            ..base_profile_options()
+        },
+        &[],
+    );
+
+    let deny = format!("(deny file-write* (literal \"{}\"))", target.display());
+    let deny_at = p
+        .rfind(&deny)
+        .unwrap_or_else(|| panic!("no write deny at the link target:\n{p}"));
+    for grant in [&project, &extra_write[0]] {
+        let allow = format!("(allow file-write* (subpath \"{}\"))", grant.display());
+        let allow_at = p
+            .rfind(&allow)
+            .unwrap_or_else(|| panic!("{allow} missing:\n{p}"));
+        assert!(
+            deny_at > allow_at,
+            "the target deny must follow {allow} (last-match-wins):\n{p}"
+        );
+    }
+    assert!(
+        p.contains(&format!(
+            "(deny file-write-unlink (literal \"{}\"))",
+            extra_write[0].display()
+        )),
+        "the directory holding the target must not be renamable:\n{p}"
+    );
+}
+
 /// The overwhelmingly common case: no `~/.gitconfig` at all. `canonicalize`
 /// fails, the fallback must emit the plain `$HOME` rule and nothing else — no
 /// panic, no second literal naming a path that does not exist.

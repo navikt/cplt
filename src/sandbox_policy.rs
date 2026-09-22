@@ -1790,6 +1790,39 @@ pub fn mise_ro_protect_paths(home: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// The home config files SECURITY.md documents as read-only: granted for
+/// reading, write-denied on macOS (both at `$HOME` and at the symlink target,
+/// see [`home_config_link_targets`]).
+pub const READ_ONLY_HOME_CONFIG: &[&str] = &[
+    ".gitconfig",
+    ".gitconfig.local",
+    ".gitignore_global",
+    ".config/git/config",
+    ".config/git/ignore",
+    ".config/git/attributes",
+];
+
+/// Where each [`READ_ONLY_HOME_CONFIG`] file really lives, for the ones that
+/// resolve somewhere other than `$HOME/<name>` — a dotfiles symlink (#524).
+///
+/// The read grant follows the link (#515), so the write deny has to as well:
+/// a deny naming only `$HOME/.gitconfig` says nothing about
+/// `~/dotfiles/gitconfig`, and when the dotfiles repo is the project (or sits
+/// under an `allow.write` grant) the "read-only" config was writable through
+/// that grant.
+///
+/// Resolved once, at launch. A link whose target does not exist yet resolves
+/// to nothing and is not covered.
+pub fn home_config_link_targets(home: &Path) -> Vec<PathBuf> {
+    READ_ONLY_HOME_CONFIG
+        .iter()
+        .filter_map(|rel| {
+            let named = home.join(rel);
+            std::fs::canonicalize(&named).ok().filter(|t| *t != named)
+        })
+        .collect()
+}
+
 /// Copilot's two package directories, which must be re-bound read-only by
 /// Bubblewrap on Linux.
 ///

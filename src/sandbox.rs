@@ -74,11 +74,11 @@ pub use policy::{
     PLAYWRIGHT_SOCKET_ROOT, PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX, PROTECTED_IN_GITDIR,
     PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir, SENSITIVE_PROJECT_PATTERNS,
     TOOL_PATH_ENV_VARS, ToolPathEnvVar, ToolPathOverride, ToolRoot, active_tool_dirs, app_dirs,
-    copilot_ro_protect_paths, current_uid, exec_write_conflicts, home_tool_dirs,
-    linux_docker_socket_paths, linux_runtime_dirs, mise_ro_protect_paths, nested_alternation,
-    path_bin_dirs, playwright_runtime_intent, relocatable_tool_prefix, socket_mask_paths,
-    tool_override_path_is_safe, tool_path_env_overrides, validate_playwright_socket_dir,
-    validate_sbpl_path, xdg_runtime_dir_env,
+    copilot_ro_protect_paths, current_uid, exec_write_conflicts, home_config_link_targets,
+    home_tool_dirs, linux_docker_socket_paths, linux_runtime_dirs, mise_ro_protect_paths,
+    nested_alternation, path_bin_dirs, playwright_runtime_intent, relocatable_tool_prefix,
+    socket_mask_paths, tool_override_path_is_safe, tool_path_env_overrides,
+    validate_playwright_socket_dir, validate_sbpl_path, xdg_runtime_dir_env,
 };
 
 // SBPL profile generation — kept public for unit tests.
@@ -525,6 +525,21 @@ fn validate_exec_grants(config: &SandboxConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Dotfiles targets of [`policy::READ_ONLY_HOME_CONFIG`] that resolve into a
+/// writable tree, with that tree's description (#524). On Linux these are
+/// read-only only under Bubblewrap; the caller warns when it is absent.
+#[cfg(any(target_os = "linux", test))]
+fn home_config_targets_in_writable_trees(config: &SandboxConfig) -> Vec<(PathBuf, &'static str)> {
+    let trees = writable_trees(config);
+    home_config_link_targets(config.home_dir)
+        .into_iter()
+        .filter_map(|t| {
+            let (_, why) = trees.iter().find(|(tree, _)| t.starts_with(tree))?;
+            Some((t, *why))
+        })
+        .collect()
+}
+
 /// Every tree the sandbox makes writable, paired with a name for the error.
 ///
 /// The `allow.write` grants include the ones `merge_tool_path_env_overrides`
@@ -910,6 +925,22 @@ fn pin_paths(
             .filter(|d| !d.write && d.process_exec)
             .filter_map(|d| d.path.parent().map(Path::to_path_buf)),
     );
+    // #524: the read-only bind on a dotfiles target pins its content, not
+    // its name — `mv git git.old && mkdir git` would leave `~/.gitconfig`
+    // resolving to a fresh, writable file. Pin every directory between the
+    // writable root and the target. The root is not pinned, as above.
+    let (roots, _) = git_roots(config, extra_git_dirs);
+    for target in home_config_link_targets(config.home_dir) {
+        for root in roots.iter().filter(|r| target.starts_with(r)) {
+            pins.extend(
+                target
+                    .ancestors()
+                    .skip(1)
+                    .take_while(|a| a != root)
+                    .map(Path::to_path_buf),
+            );
+        }
+    }
     pins.sort();
     pins.dedup();
     pins
@@ -1003,6 +1034,13 @@ fn ro_protect_paths(
     // executable. Only the bwrap overlay can take the write back. Empty for
     // every other agent.
     ro_protect.extend(copilot_ro_protect_paths(config.agent, config.home_dir));
+
+    // #524: a dotfiles-managed `~/.gitconfig` resolves to its target, and the
+    // target can sit inside the writable project. Landlock follows the link
+    // for the read grant and cannot subtract the write the project grant
+    // gives, so this bind is the only thing keeping the config read-only —
+    // and without bwrap nothing does (`prepare_impl` warns at launch).
+    ro_protect.extend(home_config_link_targets(config.home_dir));
 
     ro_protect.sort();
     ro_protect.dedup();
@@ -1143,6 +1181,21 @@ fn prepare_impl(
              repositories you work in with --repo-dir, or grant a narrower tree.",
             bubblewrap::NESTED_SCAN_LIMIT
         ));
+    }
+
+    // #524: the read-only bind on a dotfiles target is bwrap's; Landlock
+    // alone leaves it writable through the tree it sits in. Say so rather
+    // than let SECURITY.md's "read-only" stand for this run.
+    if bwrap_wrapper.is_none() {
+        for (target, tree) in home_config_targets_in_writable_trees(config) {
+            ui::warn(&format!(
+                "{} is the target of a home Git config symlink and sits inside {tree}. \
+                 cplt keeps that config read-only only with Bubblewrap, which is not active, \
+                 so the agent can edit it in this run. Install bubblewrap, or move the file \
+                 out of the writable tree.",
+                target.display()
+            ));
+        }
     }
 
     // `AgentDir::create_dirs` (Pi's mkdir-based trust lock) needs
@@ -1634,6 +1687,63 @@ mod tests {
             !paths.iter().any(|p| p.starts_with(home.join(".copilot"))),
             "no Copilot package binds for a non-Copilot agent, got {paths:?}"
         );
+    }
+
+    /// `~/.gitconfig -> <project>/dotfiles/gitconfig`: a dotfiles repo being
+    /// edited as the project (#524). Returns a canonical `(home, project,
+    /// target)` and keeps the tempdirs alive.
+    fn dotfiles_in_project() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let home = root.join("home");
+        let project = root.join("project");
+        let target = project.join("dotfiles/gitconfig");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        std::fs::create_dir_all(target.parent().unwrap()).expect("mkdir dotfiles");
+        std::fs::write(&target, "[user]\n\tname = cplt\n").expect("write target");
+        std::os::unix::fs::symlink(&target, home.join(".gitconfig")).expect("symlink");
+        (tmp, home, project, target)
+    }
+
+    /// The launch warning's predicate: a target inside the project is
+    /// reported as the project's, and stops being so once the project moves.
+    #[test]
+    fn home_config_target_in_the_project_is_reported_as_writable() {
+        let (_tmp, home, project, target) = dotfiles_in_project();
+        let mut config = test_config(&home, &[]);
+        config.project_dir = &project;
+        assert_eq!(
+            super::home_config_targets_in_writable_trees(&config),
+            vec![(target, "the project directory")]
+        );
+
+        // The tempdir is itself under a system temp dir, which is a writable
+        // tree too, so only the project attribution can be checked here.
+        config.project_dir = Path::new("/elsewhere");
+        let found = super::home_config_targets_in_writable_trees(&config);
+        assert!(
+            found.iter().all(|(_, why)| *why != "the project directory"),
+            "{found:?}"
+        );
+    }
+
+    /// Linux half of #524: Landlock cannot take the project's write back from
+    /// a file inside it, so the bwrap overlay must bind the target read-only
+    /// and pin the directory between it and the root against a rename.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ro_protect_set_carries_a_symlinked_home_git_config_target() {
+        let (_tmp, home, project, target) = dotfiles_in_project();
+        let mut config = test_config(&home, &[]);
+        config.project_dir = &project;
+        let ro = super::ro_protect_paths(&config, &[], &[]);
+        assert!(ro.contains(&target), "target missing from {ro:?}");
+        let pins = super::pin_paths(&config, &[], &[]);
+        assert!(
+            pins.contains(&project.join("dotfiles")),
+            "dotfiles dir missing from {pins:?}"
+        );
+        assert!(!pins.contains(&project), "the root is not pinned: {pins:?}");
     }
 
     /// The agent's own `host_persistence_denies` must reach the overlay too.
