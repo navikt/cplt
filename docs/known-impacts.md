@@ -968,7 +968,7 @@ Plenty of developer tools phone home with default-on usage analytics: build syst
 | `CHECKPOINT_DISABLE=1` | HashiCorp tools (terraform, vault, packer, nomad) |
 | `GATSBY_TELEMETRY_DISABLED=1` | Gatsby build telemetry |
 
-**Layer 2, proxy domain blocks** (in `blocked-domains.txt`):
+**Layer 2, proxy domain blocks** (in the built-in blocklist, `blocked-domains.txt`, which applies whenever the proxy runs):
 
 | Domain | Blocks |
 |--------|--------|
@@ -1048,28 +1048,19 @@ goose is the exception to the table's opening sentence: its config dir is grante
 AI agents and their third-party packages often send usage analytics and crash reports to external services such as PostHog and Sentry. cplt blocks these at two layers:
 
 1. **Env var injection.** cplt injects `OMO_DISABLE_POSTHOG=1` and `DO_NOT_TRACK=1` so agents opt out before making any network call.
-2. **Proxy blocklist.** `posthog.com` is in `blocked-domains.txt` as a fallback for tools that ignore env vars.
+2. **Proxy blocklist.** `posthog.com` is in the built-in blocklist (`blocked-domains.txt`) as a fallback for tools that ignore env vars. The built-in list is compiled into cplt and applies whenever the proxy runs.
 
 For the `oh-my-openagent` OpenCode plugin specifically, `OMO_DISABLE_POSTHOG=1` stops PostHog being initialised, so no network calls are made and no errors appear.
 
 > **oh-my-openagent transcripts:** the plugin's Claude Code hooks feature writes transcripts to `$CLAUDE_CONFIG_DIR/transcripts` (default `~/.claude`), which the sandbox denies for non-Claude agents. The write fails with `EACCES` and OpenCode aborts the prompt. cplt therefore injects `CLAUDE_CONFIG_DIR=<XDG_STATE_HOME>/opencode/claude-config` for OpenCode sessions, falling back to `~/.local/state/opencode/claude-config` when `XDG_STATE_HOME` is unset, which lands it in the write-allowed OpenCode state dir. If you set `CLAUDE_CONFIG_DIR` yourself, cplt respects it; add that path to `allow.write` if it lives outside the OpenCode dirs.
 
-**If you use `allowed_domains` (allowlist mode):** the proxy blocklist is not consulted in that mode, but the env var injection still suppresses telemetry silently.
+**If you use `allowed_domains` (allowlist mode):** telemetry hosts are blocked by the allowlist unless you list them, and the blocklist is still checked after it, so `posthog.com` stays blocked even if you add it. The env var injection still suppresses telemetry silently.
 
 **Impact:** none. Telemetry is non-essential and the agent works normally without it.
 
 **Why blocked?** Analytics events may include code context, prompt fragments, or usage patterns that amount to unintended data exfiltration from inside the sandbox.
 
-**If you want to allow telemetry** (not recommended):
-
-```toml
-# .cplt.toml
-[hardening]
-disabled_categories = ["telemetry_opt_out"]
-
-[proxy]
-blocked_domains = "none"   # disable the default blocklist entirely
-```
+**If you want to allow telemetry** (not recommended): there is no setting for it. The opt-out variables are always injected, and the built-in blocklist always applies while the proxy runs; `proxy.blocked_domains` only adds to it. Running without the proxy (`--no-proxy`) lets the connection through, at the cost of every other proxy protection.
 
 ## Terminal devices and allocating a PTY
 

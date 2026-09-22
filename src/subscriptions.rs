@@ -2,8 +2,9 @@
 //!
 //! A *blocklist subscription* keeps a local cache file fresh from a maintained
 //! upstream URL (e.g. cplt's own `blocked-domains.txt`). The cached domains are
-//! UNIONed into the effective blocklist alongside the local `blocked_domains`
-//! file and the built-in `blocked-domains.txt` — they are purely additive.
+//! UNIONed into the effective blocklist alongside the built-in list (compiled
+//! in from `blocked-domains.txt`) and the local `blocked_domains` file — they
+//! are purely additive.
 //!
 //! # Security model (why this is the low-risk tier)
 //!

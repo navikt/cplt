@@ -453,13 +453,19 @@ pub fn explain_domain(
                     .to_string(),
             ),
         ),
-        NetVerdict::Blocked => (
+        NetVerdict::Blocked if proxy::is_blocked_in_list(host, &proxy::builtin_blocklist()) => (
             Decision::Blocked,
-            "the host matches the proxy blocklist (blocked-domains).".to_string(),
+            "the host is on cplt's built-in blocklist.".to_string(),
             Some(
-                "if you trust it, remove it from the blocklist file (--blocked-domains)."
+                "the built-in blocklist has no per-host exemption; only --no-proxy bypasses it."
                     .to_string(),
             ),
+        ),
+        NetVerdict::Blocked => (
+            Decision::Blocked,
+            "the host matches your blocklist file (--blocked-domains) or a blocklist subscription."
+                .to_string(),
+            Some("if you trust it, remove it from that file or subscription.".to_string()),
         ),
         NetVerdict::BlockedPrivate => (
             Decision::Blocked,

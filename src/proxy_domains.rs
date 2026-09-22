@@ -12,10 +12,11 @@
 //!
 //! - **Sticky** entries come from a source that is read exactly once per
 //!   session — CLI argv, the trust-approved repo `.cplt.toml` (read from git
-//!   HEAD), a startup-frozen blocklist subscription cache, the agent's built-in
-//!   default allowlist. Nothing re-reads them, so they must survive every
-//!   refresh. Parking them in the reloadable cache is what made the 5-second
-//!   TTL wipe `--allow-private-domain` mid-session (#186).
+//!   HEAD), the built-in blocklist compiled into the binary, a startup-frozen
+//!   blocklist subscription cache, the agent's built-in default allowlist.
+//!   Nothing re-reads them, so they must survive every refresh. Parking them
+//!   in the reloadable cache is what made the 5-second TTL wipe
+//!   `--allow-private-domain` mid-session (#186).
 //! - **Reloadable** entries come from a file that is re-read every
 //!   [`RELOAD_TTL`], so editing that file adds *and revokes* entries live.
 //!
@@ -130,10 +131,11 @@ impl DomainList {
 /// exists so a test can name only the one list it cares about.
 #[derive(Default)]
 pub struct PolicySpec {
-    /// Blocklist file. Re-read every [`RELOAD_TTL`].
-    pub blocked_file: PathBuf,
+    /// The user's `proxy.blocked_domains` file. Re-read every [`RELOAD_TTL`].
+    /// Adds to the built-in list; never replaces it. `None` = no user file.
+    pub blocked_file: Option<PathBuf>,
     /// Domains from cached blocklist subscriptions (#144), frozen at startup.
-    /// UNIONed with `blocked_file`. Tighten-only: can only ever ADD blocks.
+    /// UNIONed with the built-in list and `blocked_file`. Tighten-only.
     pub subscription_blocklist: Vec<String>,
     /// User allowlist file. Re-read every [`RELOAD_TTL`]. Setting this makes
     /// the allowlist *active*: the file must exist at startup, and an empty one
@@ -226,17 +228,6 @@ impl DomainPolicy {
             || spec.allowed_domains_file.is_some()
             || !spec.allowed_domains_initial.is_empty();
 
-        let blocked_initial = if spec.blocked_file.exists() {
-            parse_lines_file(&spec.blocked_file).ok_or_else(|| {
-                format!(
-                    "Cannot read blocked domains file {}",
-                    spec.blocked_file.display()
-                )
-            })?
-        } else {
-            Vec::new()
-        };
-
         let allowlist_initial = match spec.allowed_domains_file.as_deref() {
             Some(path) if path.exists() => parse_lines_file(path)
                 .ok_or_else(|| format!("Cannot read allowed domains file {}", path.display()))?,
@@ -259,13 +250,7 @@ impl DomainPolicy {
         sticky_private.dedup();
 
         Ok(Self {
-            blocked: DomainList::new(
-                spec.subscription_blocklist,
-                Some(spec.blocked_file),
-                parse_lines_file,
-                blocked_initial,
-                now,
-            ),
+            blocked: blocklist(spec.blocked_file, spec.subscription_blocklist, now)?,
             allowed: DomainList::new(
                 spec.default_allowlist
                     .into_iter()
@@ -290,8 +275,8 @@ impl DomainPolicy {
         })
     }
 
-    /// Effective blocklist: the reloadable file UNION the frozen subscription
-    /// lists. Empty = block nothing.
+    /// Effective blocklist: the built-in list UNION the frozen subscription
+    /// lists UNION the reloadable user file. Never empty.
     #[must_use]
     pub fn blocked_domains(&self, now: Instant) -> Vec<String> {
         self.blocked.current(now)
@@ -357,6 +342,56 @@ pub fn missing_allowlist_error(path: &Path) -> String {
     )
 }
 
+/// The blocklist cplt ships, compiled into the binary so every install has it
+/// — a packaged binary has no `blocked-domains.txt` beside it to read.
+const BUILTIN_BLOCKLIST: &str = include_str!("../blocked-domains.txt");
+
+/// The built-in blocklist, parsed by the same rule as a user's file.
+#[must_use]
+pub fn builtin_blocklist() -> Vec<String> {
+    parse_lines(BUILTIN_BLOCKLIST)
+}
+
+/// The effective blocklist: built-in ∪ `subscriptions` (both frozen) ∪ the
+/// user's `file` (re-read every [`RELOAD_TTL`]).
+///
+/// The only constructor for it. The live proxy (via [`DomainPolicy::build`])
+/// and `cplt check net` both call this, so they cannot disagree about what is
+/// blocked. A user file adds to the built-in list and never replaces it.
+///
+/// A user file that exists but cannot be read is an error, so a corrupt file
+/// never silently shrinks the list; a missing one is not.
+pub fn blocklist(
+    file: Option<PathBuf>,
+    subscriptions: Vec<String>,
+    now: Instant,
+) -> Result<DomainList, String> {
+    let initial = match file.as_deref() {
+        Some(path) if path.exists() => parse_lines_file(path)
+            .ok_or_else(|| format!("Cannot read blocked domains file {}", path.display()))?,
+        _ => Vec::new(),
+    };
+    let mut sticky = builtin_blocklist();
+    sticky.extend(subscriptions);
+    Ok(DomainList::new(
+        sticky,
+        file,
+        parse_lines_file,
+        initial,
+        now,
+    ))
+}
+
+/// One domain per line; `#` comments and blank lines skipped; lowercased,
+/// trailing dot stripped.
+fn parse_lines(contents: &str) -> Vec<String> {
+    contents
+        .lines()
+        .map(|l| l.trim().to_lowercase().trim_end_matches('.').to_string())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect()
+}
+
 /// Parse a one-domain-per-line file (blocklist or allowlist format).
 /// Returns None on read failure (caller keeps last-good).
 ///
@@ -386,11 +421,7 @@ pub fn parse_lines_file(path: &Path) -> Option<Vec<String>> {
             return None;
         }
     };
-    let entries: Vec<String> = contents
-        .lines()
-        .map(|l| l.trim().to_lowercase().trim_end_matches('.').to_string())
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .collect();
+    let entries = parse_lines(&contents);
     warn_wildcard_entries(path, &entries);
     Some(entries)
 }
@@ -795,12 +826,12 @@ mod tests {
         let now = Instant::now();
         let policy = policy(
             PolicySpec {
-                blocked_file: blocked,
+                blocked_file: Some(blocked),
                 ..PolicySpec::default()
             },
             now,
         );
-        assert_eq!(policy.blocked_domains(now), vec!["test.com"]);
+        assert!(is_blocked_in_list("test.com", &policy.blocked_domains(now)));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -817,7 +848,7 @@ mod tests {
 
         let result = DomainPolicy::build(
             PolicySpec {
-                blocked_file: blocked,
+                blocked_file: Some(blocked),
                 allowed_domains_file: Some(allowlist_path),
                 ..PolicySpec::default()
             },
@@ -839,7 +870,7 @@ mod tests {
 
         let result = DomainPolicy::build(
             PolicySpec {
-                blocked_file: blocked,
+                blocked_file: Some(blocked),
                 ..PolicySpec::default()
             },
             Instant::now(),
@@ -875,12 +906,14 @@ mod tests {
         let now = Instant::now();
         let policy = policy(
             PolicySpec {
-                blocked_file: path,
+                blocked_file: Some(path),
                 ..PolicySpec::default()
             },
             now,
         );
-        assert_eq!(policy.blocked_domains(now), vec!["evil.com", "bad.org"]);
+        let eff = policy.blocked_domains(now);
+        assert!(is_blocked_in_list("evil.com", &eff));
+        assert!(is_blocked_in_list("bad.org", &eff));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -894,7 +927,7 @@ mod tests {
         let now = Instant::now();
         let policy = policy(
             PolicySpec {
-                blocked_file: path,
+                blocked_file: Some(path),
                 subscription_blocklist: vec!["sub.example".to_string()],
                 ..PolicySpec::default()
             },
@@ -915,8 +948,7 @@ mod tests {
 
     #[test]
     fn empty_subscription_blocklist_is_noop() {
-        // No-regression: empty subscription list → exactly the file domains,
-        // byte-identical to today's behaviour.
+        // Empty subscription list → exactly the built-in list plus the file.
         let dir = test_dir("subscription-noop");
         let path = dir.join("blocked.txt");
         std::fs::write(&path, "local.example\n").unwrap();
@@ -924,14 +956,60 @@ mod tests {
         let now = Instant::now();
         let policy = policy(
             PolicySpec {
-                blocked_file: path,
+                blocked_file: Some(path),
                 ..PolicySpec::default()
             },
             now,
         );
-        assert_eq!(
-            policy.blocked_domains(now),
-            vec!["local.example".to_string()]
+        let mut expected = builtin_blocklist();
+        expected.push("local.example".to_string());
+        expected.sort_unstable();
+        assert_eq!(policy.blocked_domains(now), expected);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn builtin_blocklist_applies_with_no_user_file() {
+        let now = Instant::now();
+        let eff = policy(PolicySpec::default(), now).blocked_domains(now);
+        assert!(is_blocked_in_list("webhook.site", &eff), "{eff:?}");
+        assert!(is_blocked_in_list("x.webhook.site", &eff));
+    }
+
+    #[test]
+    fn user_blocklist_adds_to_builtin_and_never_replaces_it() {
+        let dir = test_dir("user-adds-to-builtin");
+        let path = dir.join("blocked.txt");
+        std::fs::write(&path, "example.org\n").unwrap();
+
+        let now = Instant::now();
+        let policy = policy(
+            PolicySpec {
+                blocked_file: Some(path.clone()),
+                ..PolicySpec::default()
+            },
+            now,
+        );
+        let eff = policy.blocked_domains(now);
+        assert!(
+            is_blocked_in_list("webhook.site", &eff),
+            "built-in kept: {eff:?}"
+        );
+        assert!(is_blocked_in_list("example.org", &eff), "user entry added");
+
+        // Still a union after the live re-read of the user file.
+        std::fs::write(&path, "example.net\n").unwrap();
+        let later = now + RELOAD_TTL + Duration::from_secs(1);
+        let eff = policy.blocked_domains(later);
+        assert!(
+            is_blocked_in_list("webhook.site", &eff),
+            "built-in kept: {eff:?}"
+        );
+        assert!(is_blocked_in_list("example.net", &eff));
+        assert!(
+            !is_blocked_in_list("example.org", &eff),
+            "user edit revokes"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

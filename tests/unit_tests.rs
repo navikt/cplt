@@ -1719,7 +1719,7 @@ fn allow_domains_widens_an_active_allowlist_and_never_activates_one() {
     use std::time::Instant;
 
     let spec = |default_allowlist: Vec<String>, extra: Vec<String>| PolicySpec {
-        blocked_file: PathBuf::from("/nonexistent-blocklist"),
+        blocked_file: None,
         subscription_blocklist: Vec::new(),
         allowed_domains_file: None,
         allowed_domains_initial: Vec::new(),

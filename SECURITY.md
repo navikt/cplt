@@ -340,7 +340,7 @@ or patched file       env vars, OS info        .env, npm tokens        or DNS tu
 | **Cloudflare Workers** | `*.workers.dev` | Free hosting for C2 relays, resistant to takedown |
 | **Ethereum dead-drop** | Smart contract to Cloudflare-fronted domains | C2 URL rotation without code changes, impossible to take down |
 
-A curated blocklist of these domains ships in [`blocked-domains.txt`](blocked-domains.txt).
+cplt has a built-in blocklist covering most of these: [`blocked-domains.txt`](blocked-domains.txt), compiled into the binary and applied on every install whenever the proxy runs. `api.telegram.org` and `*.workers.dev` are not on it. Your own `proxy.blocked_domains` file adds to the built-in list; it does not replace it.
 
 ### What gets stolen (in order of attacker priority)
 
@@ -379,7 +379,7 @@ A curated blocklist of these domains ships in [`blocked-domains.txt`](blocked-do
 - A compromised agent CAN request GPG signatures but CANNOT exfiltrate private keys. On macOS this needs `--allow-gpg-signing`; on Linux the agent socket is reachable whether or not the flag is set, so the capability is there by default (see [Linux-specific limitations](#linux-specific-limitations))
 - The proxy logs and filters all outbound connections by default, including Copilot CLI traffic (via `NODE_USE_ENV_PROXY=1`), and enforces port restrictions matching the sandbox policy. Use `--no-proxy` to disable.
 
-*Mitigation:* `--allowed-domains allowed-domains.txt` restricts traffic to known Copilot endpoints, `--blocked-domains blocked-domains.txt` blocks known exfiltration infrastructure, and `--proxy-log proxy.log` gives a post-session audit trail. All traffic, Copilot's own Node.js connections included, routes through the proxy.
+*Mitigation:* `--allowed-domains allowed-domains.txt` restricts traffic to known Copilot endpoints, the built-in blocklist blocks known exfiltration infrastructure (add your own with `--blocked-domains`), and `--proxy-log proxy.log` gives a post-session audit trail. All traffic, Copilot's own Node.js connections included, routes through the proxy.
 
 **JVM IPv4 stack forcing.** macOS SBPL `"localhost"` filters do not match Java NIO's IPv4-mapped addresses (`::ffff:127.0.0.1`), because SBPL accepts only `*` or `localhost` as the host part and rejects literal IPs. cplt injects `-Djava.net.preferIPv4Stack=true` via `JAVA_TOOL_OPTIONS`, forcing the JVM onto pure AF_INET4 sockets, so connections to `127.0.0.1` stay IPv4 and `"localhost:PORT"` rules match. `--allow-localhost <PORT>` therefore works for Java, and the old `"*:*"` nuclear option is gone. Overriding `JAVA_TOOL_OPTIONS` via `--pass-env` loses this protection; fall back to `--allow-localhost-any`. On Linux (Landlock) the flag is not injected, as the kernel handles addresses differently.
 

@@ -38,7 +38,7 @@ cplt config set proxy.log_file "~/.config/cplt/proxy.log"
 | `--no-proxy`                | Disable the proxy for this run.                                                                  |
 | `--proxy-forced` / `--no-proxy-forced` | Make the proxy mandatory and restrict direct routing where the platform supports it (opt-in, default off). Conflicts with `--no-proxy`. See [Proxy-forced mode](#proxy-forced-mode) and [network snapshot coverage](#network-snapshot). |
 | `--proxy-port <PORT>`       | Which port the proxy listens on (default: 0, OS-assigned ephemeral).                             |
-| `--blocked-domains <FILE>`  | Domains to block, one per line. Re-read every ~5s, so you can edit it live. |
+| `--blocked-domains <FILE>`  | Domains to block, one per line, on top of the built-in list. Re-read every ~5s, so you can edit it live. |
 | `--allowed-domains <FILE>`  | Domains to allow. Setting it turns the allowlist on, and only listed domains can connect — an empty file therefore blocks everything, and a missing file is a startup error. Re-read every ~5s. |
 | `--default-allowlist`       | Enable the agent's built-in default allowlist for this run (opt-in, default off): restrict egress to the agent's fail-closed domain set merged with `--allowed-domains`. See [Default allowlist](#default-allowlist-fail-closed-networking). |
 | `--allow-all-domains`       | Escape hatch: disable the default allowlist for this run and allow all domains (blocklist still applies). Also ignores any `--allowed-domains` file. |
@@ -158,7 +158,7 @@ because only two of them are about permission at all.
 
 | List | The question it answers | Default | Reload |
 | --- | --- | --- | --- |
-| **Blocklist** (`--blocked-domains`) | "Never connect here." Exfiltration sinks: paste sites, webhook capture, tunnels. | A curated list ships with cplt | Live, ~5s |
+| **Blocklist** (`--blocked-domains`) | "Never connect here." Exfiltration sinks: paste sites, webhook capture, tunnels. | A curated list is built into cplt and always applies | Live, ~5s |
 | **Allowlist** (`--allowed-domains`, `--default-allowlist`) | "Connect *only* here." Everything not listed is refused. | Off | Live, ~5s |
 | **Private-domain waiver** (`proxy.allow_private_domains`) | "This name is a trusted internal service." Not about permission: it is the DNS-rebinding guard. | Empty | Live, ~5s |
 
@@ -205,11 +205,15 @@ The same matching applies to the blocklist, `proxy.allow_private_domains` and
 
 ### Blocklist
 
-Block domains commonly used for data exfiltration. A default blocklist ships with cplt, built from real attack infrastructure observed in 2025 and 2026 supply chain incidents. It covers webhook capture services, paste sites, file sharing, tunneling services, and IP recon endpoints. See [`blocked-domains.txt`](../blocked-domains.txt) for the full list with sources.
+Block domains commonly used for data exfiltration. cplt has a built-in blocklist, built from real attack infrastructure observed in 2025 and 2026 supply chain incidents. It covers webhook capture services, paste sites, file sharing, tunneling services, IP recon endpoints and a few telemetry hosts. See [`blocked-domains.txt`](../blocked-domains.txt) for the full list with sources.
+
+The list is compiled into the binary, so it applies on every install (Homebrew, apt, a release tarball, a source build) whenever the proxy is running. It is checked after the allowlist, so a host on both lists is blocked. There is no setting to turn it off or to exempt one of its hosts; the only way past it is running without the proxy (`--no-proxy`), which also drops every other proxy protection.
+
+`proxy.blocked_domains` (or `--blocked-domains`) adds your own file on top of the built-in list. It never replaces it. The file is re-read every ~5 seconds, so edits take effect mid-session.
 
 ### Subscribing to blocklists
 
-The threat landscape moves faster than cplt releases. A blocklist subscription keeps a local cache fresh from a maintained upstream list (issue #144, Phase 1). Cached subscription domains are UNIONed into the effective blocklist alongside your local `blocked_domains` file and the built-in `blocked-domains.txt`, so they only ever add blocks.
+The threat landscape moves faster than cplt releases. A blocklist subscription keeps a local cache fresh from a maintained upstream list (issue #144, Phase 1). Cached subscription domains are UNIONed into the effective blocklist alongside the built-in list and your local `blocked_domains` file, so they only ever add blocks.
 
 Subscriptions are global-only (`~/.config/cplt/config.toml`). A repo `.cplt.toml` cannot add one, so a malicious repository can never point cplt at an attacker-controlled list.
 
@@ -450,7 +454,7 @@ Every connection attempt is printed to stderr in real time:
 | Status | Meaning | Action |
 |---|---|---|
 | `CONNECTED` | Connection succeeded | none |
-| `BLOCKED` | Domain matched blocklist | Check `--blocked-domains` file |
+| `BLOCKED` | Domain matched blocklist | Check the built-in list (`blocked-domains.txt`), your `--blocked-domains` file and any subscription |
 | `BLOCKED-ALLOWLIST` | Domain not in allowlist | Add it to the file named by `proxy.allowed_domains` / `--allowed-domains` (re-read live), or `cplt config set allow.domains HOST` and restart |
 | `BLOCKED-PORT` | Port not in allowed list | Add with `--allow-port <PORT>` |
 | `BLOCKED-PRIVATE` | Pre-DNS private IP (`.local`, `127.*`, IP literals) | Use `--allow-localhost` for local ports |
