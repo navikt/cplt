@@ -1795,6 +1795,15 @@ impl ResolvedToolDir {
         // exist, under a `$HOME` spelled through a symlink, must still compare
         // in canonical form against the canonical target.
         let canon = config::canonicalize_deepest;
+        // Only `$HOME` itself is spelled through a symlink (`/home ->
+        // /System/Volumes/Data/home`): the grant lands where an unsymlinked
+        // dir's would, which is not vetted either. Also skips a few dozen
+        // realpath calls per dir, slow under an automounted `/home`.
+        if let Ok(rel) = self.path.strip_prefix(home)
+            && canon(home).join(rel) == target
+        {
+            return None;
+        }
         let overlaps_denied = DENIED_DOTFILES.iter().chain(DENIED_FILES).any(|d| {
             let denied = canon(&home.join(d));
             denied.starts_with(target) || target.starts_with(&denied)
@@ -1816,6 +1825,38 @@ impl ResolvedToolDir {
             || !tool_override_path_is_safe(target, &canon(home)))
         .then_some(target)
     }
+
+    /// Where the grant lands: the symlink target, else `path`.
+    fn granted_at(&self) -> &Path {
+        self.target.as_deref().unwrap_or(&self.path)
+    }
+}
+
+/// Pairs `(exec, writable)` of indexes into `dirs` whose grants land on the
+/// same tree, or one inside the other, where one entry is executable and the
+/// other writable and neither is both — `~/.cargo/bin` and `~/.cargo/registry`
+/// symlinked to one directory. Each passes [`ResolvedToolDir::refused_target`]
+/// alone, but Landlock unions the rules on the shared inode, so the agent could
+/// drop a binary and run it (macOS emits the exec deny last and holds). The
+/// executable entry is the one dropped: that is what macOS already enforced,
+/// and it keeps the writable store working.
+#[must_use]
+pub fn exec_write_conflicts(dirs: &[ResolvedToolDir]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for (x, exec) in dirs.iter().enumerate() {
+        for (w, writable) in dirs.iter().enumerate() {
+            let (a, b) = (exec.granted_at(), writable.granted_at());
+            if exec.dir.process_exec
+                && !exec.dir.write
+                && writable.dir.write
+                && !writable.dir.process_exec
+                && (a.starts_with(b) || b.starts_with(a))
+            {
+                out.push((x, w));
+            }
+        }
+    }
+    out
 }
 
 impl HomeToolDir {
@@ -1836,7 +1877,11 @@ impl HomeToolDir {
                 })
             })
             .unwrap_or_else(|| home.join(rel));
-        let target = std::fs::canonicalize(&path).ok().filter(|t| *t != path);
+        // Through the deepest existing ancestor: `~/.cargo -> /opt/cargo` with
+        // no `registry` yet must still name `/opt/cargo/registry`, or the cache
+        // stays denied until something outside the sandbox creates it. The
+        // missing tail is vetted with the rest by `refused_target`.
+        let target = Some(config::canonicalize_deepest(&path)).filter(|t| *t != path);
         ResolvedToolDir {
             path,
             target,
@@ -1867,7 +1912,8 @@ pub fn relocatable_tool_prefix(name: &str) -> Option<&'static str> {
 ///
 /// An entry whose symlink target is refused
 /// ([`ResolvedToolDir::refused_target`]) is dropped here, where every backend
-/// reads the list, so no caller can grant one. Discovery warns about it.
+/// reads the list, so no caller can grant one; so is the executable side of an
+/// [`exec_write_conflicts`] pair. Discovery warns about both.
 pub fn active_tool_dirs(
     home: &Path,
     discovered: Option<&[ResolvedToolDir]>,
@@ -1879,8 +1925,18 @@ pub fn active_tool_dirs(
             .map(|d| d.resolve(home, &[]))
             .collect(),
     };
-    dirs.into_iter()
+    let dirs: Vec<_> = dirs
+        .into_iter()
         .filter(|d| d.refused_target(home).is_none())
+        .collect();
+    let dropped: Vec<usize> = exec_write_conflicts(&dirs)
+        .into_iter()
+        .map(|(x, _)| x)
+        .collect();
+    dirs.into_iter()
+        .enumerate()
+        .filter(|(i, _)| !dropped.contains(i))
+        .map(|(_, d)| d)
         .collect()
 }
 

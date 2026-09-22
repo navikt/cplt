@@ -1209,6 +1209,102 @@ fn symlinked_tool_dir_onto_an_unnameable_target_is_dropped_not_fatal() {
     assert!(!p.contains("Backup (1)"), "{p}");
 }
 
+/// `~/.cargo/bin` (exec, read-only) and `~/.cargo/registry` (writable, no
+/// exec) symlinked onto one directory, or the registry onto a tree holding the
+/// bin dir. Each is fine alone; Landlock unions the two rules on the shared
+/// inode, which would be a writable, executable directory. The executable side
+/// is dropped for every backend.
+#[test]
+fn tool_dirs_resolving_onto_one_tree_do_not_combine_write_and_exec() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let root = std::fs::canonicalize(root.path()).expect("canonicalize");
+    let home_dir = root.join("home");
+    let shared = root.join("opt/shared");
+    std::fs::create_dir_all(shared.join("bin")).expect("mkdir shared");
+    std::fs::create_dir_all(home_dir.join(".cargo")).expect("mkdir .cargo");
+    let bin_at = |target: &Path| {
+        let _ = std::fs::remove_file(home_dir.join(".cargo/bin"));
+        std::os::unix::fs::symlink(target, home_dir.join(".cargo/bin")).expect("symlink bin");
+    };
+    std::os::unix::fs::symlink(&shared, home_dir.join(".cargo/registry")).expect("symlink reg");
+    let granted = |rel: &str| {
+        cplt::sandbox::active_tool_dirs(&home_dir, None)
+            .iter()
+            .any(|d| d.dir.path == rel)
+    };
+
+    for bin in [shared.clone(), shared.join("bin")] {
+        bin_at(&bin);
+        assert!(
+            !granted(".cargo/bin"),
+            "{} is inside the writable registry",
+            bin.display()
+        );
+        assert!(
+            granted(".cargo/registry"),
+            "the writable store stays granted"
+        );
+        let p = generate_profile(
+            &SandboxConfig {
+                home_dir: &home_dir,
+                ..base_profile_options()
+            },
+            &[],
+        );
+        let exec = format!("(allow process-exec (subpath \"{}\")", bin.display());
+        assert!(!p.contains(&exec), "must not grant {exec}\n{p}");
+    }
+
+    bin_at(&root.join("opt/elsewhere"));
+    std::fs::create_dir_all(root.join("opt/elsewhere")).expect("mkdir elsewhere");
+    assert!(granted(".cargo/bin"), "separate trees do not conflict");
+}
+
+/// `~/.cargo -> /opt/cargo` before cargo has created `registry`. The target is
+/// resolved through the deepest existing ancestor, or the profile names only
+/// `~/.cargo/registry`, which Seatbelt never matches, and the cache is denied
+/// until created from outside. A missing tail is vetted like any other target:
+/// `~/.cargo -> ~/.ssh` must not grant `~/.ssh/registry`.
+#[test]
+fn symlinked_parent_of_a_missing_tool_dir_is_granted_at_its_target() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let root = std::fs::canonicalize(root.path()).expect("canonicalize");
+    let home_dir = root.join("home");
+    let cargo = root.join("opt/cargo");
+    std::fs::create_dir_all(&cargo).expect("mkdir cargo");
+    std::fs::create_dir_all(&home_dir).expect("mkdir home");
+    std::os::unix::fs::symlink(&cargo, home_dir.join(".cargo")).expect("symlink cargo");
+
+    let registry = home_tool_dirs()
+        .iter()
+        .find(|d| d.path == ".cargo/registry")
+        .expect("registry entry")
+        .resolve(&home_dir, &[]);
+    assert_eq!(registry.target, Some(cargo.join("registry")));
+    let p = generate_profile(
+        &SandboxConfig {
+            home_dir: &home_dir,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    let reg = cargo.join("registry");
+    for rule in ["allow file-write*", "deny process-exec"] {
+        let r = format!("({rule} (subpath \"{}\"))", reg.display());
+        assert!(p.contains(&r), "missing {r}\n{p}");
+    }
+
+    std::fs::remove_file(home_dir.join(".cargo")).expect("unlink cargo");
+    std::fs::create_dir_all(home_dir.join(".ssh")).expect("mkdir ssh");
+    std::os::unix::fs::symlink(home_dir.join(".ssh"), home_dir.join(".cargo")).expect("symlink");
+    assert!(
+        !cplt::sandbox::active_tool_dirs(&home_dir, None)
+            .iter()
+            .any(|d| d.dir.path == ".cargo/registry"),
+        "~/.ssh/registry does not exist yet but is still inside ~/.ssh"
+    );
+}
+
 /// `~/.gitconfig -> ~/.git-credentials`. The link target is a hard deny, so the
 /// resolved grant must never be emitted — on macOS the later deny would win
 /// anyway, but Landlock is grant-only and has no deny to fall back on, so the

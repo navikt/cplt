@@ -399,6 +399,22 @@ pub fn discover_tools(home_dir: &Path, tool_roots: &[ToolRoot]) -> ToolDiscovery
             None => true,
         })
         .collect();
+    let conflicts = crate::sandbox::exec_write_conflicts(&existing_home_tool_dirs);
+    for &(x, w) in &conflicts {
+        ui::warn(&format!(
+            "Not granting {}: it resolves onto the same tree as the writable {}, and \
+             one directory both writable and executable would let the agent drop and run a \
+             binary. Point the two at separate directories.",
+            existing_home_tool_dirs[x].path.display(),
+            existing_home_tool_dirs[w].path.display(),
+        ));
+    }
+    let existing_home_tool_dirs: Vec<ResolvedToolDir> = existing_home_tool_dirs
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| !conflicts.iter().any(|&(x, _)| x == *i))
+        .map(|(_, d)| d)
+        .collect();
 
     // Writable app dirs are always included in this list because they potentially could be created on first use.
     // On Linux, Landlock does not support adding access to non-existent paths, so even if included here,
