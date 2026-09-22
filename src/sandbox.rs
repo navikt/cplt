@@ -185,6 +185,12 @@ pub struct SandboxConfig<'a> {
     pub git_hooks_path: Option<&'a Path>,
     /// Shared .git directory for git worktrees.
     pub git_common_dir: Option<&'a Path>,
+    /// `AGENTS.md` at the repository root when `--project-dir` is a
+    /// subdirectory and `sandbox.agents_md` is on (#252). cplt writes its
+    /// managed block there, and the project grant does not reach it, so both
+    /// backends grant read on this one file — never write, never the root.
+    /// `None` when the file is inside `project_dir` already.
+    pub root_agents_md: Option<&'a Path>,
     pub allow_gpg_signing: bool,
     pub deny_clipboard: bool,
     /// Allow JVM Attach API unix sockets in /tmp (.java_pid* pattern only).
@@ -1283,6 +1289,9 @@ fn validate_config_paths(config: &SandboxConfig) -> Result<(), String> {
     if let Some(p) = config.git_common_dir {
         policy::validate_sbpl_path(p).map_err(|e| format!("Git common dir: {e}"))?;
     }
+    if let Some(p) = config.root_agents_md {
+        policy::validate_sbpl_path(p).map_err(|e| format!("Root AGENTS.md: {e}"))?;
+    }
     if let Some(dir) = config.electron_app_dir {
         policy::validate_sbpl_path(dir).map_err(|e| format!("Electron app path: {e}"))?;
     }
@@ -1440,6 +1449,7 @@ mod tests {
             dotnet_root: None,
             git_hooks_path: None,
             git_common_dir: None,
+            root_agents_md: None,
             allow_gpg_signing: false,
             deny_clipboard: false,
             allow_jvm_attach: false,

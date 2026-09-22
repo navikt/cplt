@@ -595,6 +595,23 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         });
     }
 
+    // ── Repository-root AGENTS.md: read only, this one file (#252) ──
+    if let Some(p) = config
+        .root_agents_md
+        .filter(|p| !policy::grant_is_refused(home, p))
+    {
+        fs_rules.push(FsRule {
+            path: p.to_path_buf(),
+            access: FsAccess {
+                read: true,
+                write: false,
+                execute: false,
+                ioctl: false,
+                create_dirs: false,
+            },
+        });
+    }
+
     // ── Scratch directory: read + write + execute (always) ──
     // The scratch dir is the controlled alternative to /tmp for compile-then-exec
     // workflows (e.g. node-gyp, cargo). Execute is always allowed here regardless
@@ -2321,6 +2338,7 @@ mod tests {
             dotnet_root: None,
             git_hooks_path: None,
             git_common_dir: None,
+            root_agents_md: None,
             allow_gpg_signing: false,
             deny_clipboard: false,
             allow_jvm_attach: false,
@@ -3040,6 +3058,39 @@ mod tests {
         assert!(rule.access.read);
         assert!(!rule.access.write);
         assert!(!rule.access.execute);
+    }
+
+    /// `--project-dir <subdir>` with `sandbox.agents_md`: the root AGENTS.md
+    /// cplt writes is granted read-only as a single file, never its directory
+    /// (#252). A refused path (here a hard-denied file) gets no rule at all.
+    #[test]
+    fn root_agents_md_is_read_only_file_rule() {
+        let project = PathBuf::from("/home/user/repo/apps/web");
+        let home = PathBuf::from("/home/user");
+        let file = PathBuf::from("/home/user/repo/AGENTS.md");
+        let mut config = test_config(&project, &home);
+        config.root_agents_md = Some(&file);
+        let policy = generate_policy(&config);
+
+        let rule = policy
+            .fs_rules
+            .iter()
+            .find(|r| r.path == file)
+            .expect("root AGENTS.md should be in rules");
+        assert!(rule.access.read);
+        assert!(!rule.access.write && !rule.access.execute && !rule.access.create_dirs);
+        assert!(
+            !policy
+                .fs_rules
+                .iter()
+                .any(|r| r.path == Path::new("/home/user/repo")),
+            "the repository root itself must not be granted"
+        );
+
+        let refused = home.join(".netrc");
+        config.root_agents_md = Some(&refused);
+        let policy = generate_policy(&config);
+        assert!(!policy.fs_rules.iter().any(|r| r.path == refused));
     }
 
     #[test]

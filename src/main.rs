@@ -2999,6 +2999,13 @@ fn agents_md_path(project_dir: &Path) -> Option<PathBuf> {
     git_toplevel(project_dir).map(|root| root.join("AGENTS.md"))
 }
 
+/// [`agents_md_path`] when the project grant does not already cover it — the
+/// `--project-dir <subdir>` case, where the sandbox needs a read grant on that
+/// one file or the agent cannot see the block written for it.
+fn root_agents_md_outside(project_dir: &Path) -> Option<PathBuf> {
+    agents_md_path(project_dir).filter(|p| !p.starts_with(project_dir))
+}
+
 fn start_proxy_if_enabled(
     resolved: &mut config::Resolved,
     cli: &Cli,
@@ -4436,6 +4443,8 @@ struct HostProbe {
     existing_app_dirs: Vec<String>,
     git_hooks_path: Option<PathBuf>,
     git_common_dir: Option<PathBuf>,
+    /// See [`sandbox::SandboxConfig::root_agents_md`].
+    root_agents_md: Option<PathBuf>,
     java_home: Option<PathBuf>,
     dotnet_root: Option<PathBuf>,
 }
@@ -4458,6 +4467,10 @@ impl HostProbe {
             git_hooks_path: discover::git_hooks_path(home_dir),
             // Git worktree common directory (shared .git for worktrees).
             git_common_dir: discover::git_common_dir(home_dir, project_dir),
+            root_agents_md: resolved
+                .agents_md
+                .then(|| root_agents_md_outside(project_dir))
+                .flatten(),
             // JDK read access when installed outside TOOL_READ_DIRS. Covers
             // sdkman (~/.sdkman/candidates/java/), actions/setup-java
             // (hostedtoolcache), jabba, or any other manager under HOME.
@@ -4851,6 +4864,7 @@ fn build_sandbox_config<'a>(
         dotnet_root: probe.dotnet_root.as_deref(),
         git_hooks_path: probe.git_hooks_path.as_deref(),
         git_common_dir: probe.git_common_dir.as_deref(),
+        root_agents_md: probe.root_agents_md.as_deref(),
         allow_gpg_signing: resolved.allow_gpg_signing,
         deny_clipboard: resolved.deny_clipboard,
         allow_jvm_attach: resolved.allow_jvm_attach,
@@ -10277,14 +10291,23 @@ mod tests {
         assert!(resolved_ip_block_item(&optin, "127.0.0.1", 443).is_none());
     }
 
-    /// Run git in `dir`; false when git is missing or the command fails, so the
-    /// caller can skip rather than fail on a machine without git.
-    fn git_ok(dir: &Path, args: &[&str]) -> bool {
-        std::process::Command::new("git")
+    /// Run git in `dir` isolated from the caller's global and system config
+    /// (`commit.gpgsign`, `core.hooksPath`, init templates) with a fixed
+    /// identity, panicking on failure: a fixture that quietly failed would
+    /// leave the test asserting nothing.
+    fn git_in(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
             .args(args)
             .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
             .status()
-            .is_ok_and(|s| s.success())
+            .expect("git runs");
+        assert!(status.success(), "git {args:?} failed");
     }
 
     /// A plain directory is not a work tree, so the persistent brief must not
@@ -10300,14 +10323,25 @@ mod tests {
     #[test]
     fn agents_md_path_is_repo_root_from_subdirectory() {
         let dir = tempfile::tempdir().unwrap();
-        if !git_ok(dir.path(), &["init", "--quiet"]) {
-            return; // no git on this machine — nothing to assert
-        }
+        git_in(dir.path(), &["init", "--quiet"]);
         let sub = dir.path().join("apps/web");
         std::fs::create_dir_all(&sub).unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         assert_eq!(agents_md_path(&sub), Some(root.join("AGENTS.md")));
         assert_eq!(agents_md_path(dir.path()), Some(root.join("AGENTS.md")));
+    }
+
+    /// The sandbox read grant for the root AGENTS.md is needed only when the
+    /// project grant does not reach it: from a subdirectory, not from the root.
+    #[test]
+    fn root_agents_md_outside_only_from_subdirectory() {
+        let dir = tempfile::tempdir().unwrap();
+        git_in(dir.path(), &["init", "--quiet"]);
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let sub = root.join("apps/web");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert_eq!(root_agents_md_outside(&sub), Some(root.join("AGENTS.md")));
+        assert_eq!(root_agents_md_outside(&root), None);
     }
 
     /// A linked worktree is its own checkout: the block goes in the worktree,
@@ -10317,25 +10351,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let main = dir.path().join("main");
         std::fs::create_dir(&main).unwrap();
-        let ok = git_ok(&main, &["init", "--quiet"])
-            && git_ok(
-                &main,
-                &[
-                    "-c",
-                    "user.name=t",
-                    "-c",
-                    "user.email=t@t",
-                    "commit",
-                    "--quiet",
-                    "--allow-empty",
-                    "-m",
-                    "init",
-                ],
-            )
-            && git_ok(&main, &["worktree", "add", "--quiet", "../wt"]);
-        if !ok {
-            return;
-        }
+        git_in(&main, &["init", "--quiet"]);
+        git_in(&main, &["commit", "--quiet", "--allow-empty", "-m", "init"]);
+        git_in(&main, &["worktree", "add", "--quiet", "../wt"]);
         let wt = std::fs::canonicalize(dir.path().join("wt")).unwrap();
         let sub = wt.join("src");
         std::fs::create_dir(&sub).unwrap();
@@ -10347,9 +10365,7 @@ mod tests {
     #[test]
     fn agents_md_path_skips_bare_repo() {
         let dir = tempfile::tempdir().unwrap();
-        if !git_ok(dir.path(), &["init", "--bare", "--quiet"]) {
-            return;
-        }
+        git_in(dir.path(), &["init", "--bare", "--quiet"]);
         assert_eq!(agents_md_path(dir.path()), None);
     }
 
