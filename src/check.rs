@@ -1250,6 +1250,43 @@ mod tests {
         assert_eq!(e.status, "NO-PROXY");
     }
 
+    #[test]
+    fn builtin_blocklist_host_names_the_builtin_list() {
+        // webhook.site ships in blocked-domains.txt; put it in the policy's
+        // blocked_domains too (as the merged built-in ∪ user list would) so
+        // classify_connect actually returns Blocked for it.
+        let np = net_policy(&[], &["webhook.site"], &[443]);
+        let e = explain_domain(&np, "webhook.site", 443, true);
+        assert_eq!(e.decision, Decision::Blocked);
+        assert_eq!(e.status, "BLOCKED");
+        assert!(
+            e.reason.contains("built-in blocklist"),
+            "reason must attribute the block to the built-in list: {}",
+            e.reason
+        );
+        let fix = e.fix.as_deref().unwrap();
+        assert!(
+            fix.contains("no per-host exemption") && fix.contains("HTTPS_PROXY"),
+            "fix must say there is no per-host exemption and warn about clients \
+             bypassing HTTPS_PROXY outside proxy-forced mode: {fix}"
+        );
+    }
+
+    #[test]
+    fn user_file_blocklist_host_points_at_the_users_file() {
+        // example.org is not in blocked-domains.txt, so it can only be here
+        // via the user's --blocked-domains file / subscription.
+        let np = net_policy(&[], &["example.org"], &[443]);
+        let e = explain_domain(&np, "example.org", 443, true);
+        assert_eq!(e.decision, Decision::Blocked);
+        assert_eq!(e.status, "BLOCKED");
+        assert!(
+            e.reason.contains("--blocked-domains"),
+            "reason must point at the user's blocklist file: {}",
+            e.reason
+        );
+    }
+
     // ── explain_exec ──
 
     fn exec_ctx<'a>(
