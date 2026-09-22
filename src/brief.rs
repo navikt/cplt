@@ -722,6 +722,37 @@ fn write_replacing(path: &Path, content: &str) -> Result<(), String> {
     })
 }
 
+/// Is `path` safe for cplt to write, and for the sandbox to grant read on?
+///
+/// `Ok` when it does not exist yet (cplt creates it as a regular file) or is a
+/// regular file with exactly one name. A symlink, a hard link or anything that
+/// is not a regular file is refused: `AGENTS.md` is repository content, so a
+/// hostile clone can point it at `~/.aws/credentials`. One predicate for both
+/// the write in [`upsert_managed_block`] and the sandbox read grant, so they
+/// cannot disagree about what a safe file is.
+///
+/// Uses `symlink_metadata`, which does not follow the link, so it sees both
+/// kinds: `is_symlink` for the soft one, `nlink() > 1` for the hard one.
+///
+/// # Errors
+/// Why the path is refused, naming it.
+pub fn agents_md_is_plain(path: &Path) -> Result<(), String> {
+    let refuse = |what: &str| {
+        Err(format!(
+            "{} is {what} — refusing to use it (possible hostile repo)",
+            path.display()
+        ))
+    };
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("cannot inspect {}: {e}", path.display())),
+        Ok(meta) if meta.file_type().is_symlink() => refuse("a symlink"),
+        Ok(meta) if std::os::unix::fs::MetadataExt::nlink(&meta) > 1 => refuse("a hard link"),
+        Ok(meta) if !meta.is_file() => refuse("not a regular file"),
+        Ok(_) => Ok(()),
+    }
+}
+
 /// Insert or update the managed sandbox block in `path` (typically the
 /// project-root `AGENTS.md`).
 ///
@@ -747,21 +778,7 @@ pub fn upsert_managed_block(path: &Path) -> Result<BlockOutcome, String> {
     // The check is the diagnostic, not the barrier: `write_replacing` below
     // renames a fresh file over the path, which cannot follow either kind of
     // link, so nothing rides on this staying race-free.
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            return Err(format!(
-                "{} is a symlink — refusing to write (possible hostile repo)",
-                path.display()
-            ));
-        }
-        Ok(meta) if std::os::unix::fs::MetadataExt::nlink(&meta) > 1 => {
-            return Err(format!(
-                "{} is a hard link — refusing to write (possible hostile repo)",
-                path.display()
-            ));
-        }
-        Ok(_) | Err(_) => {} // real file, or doesn't exist yet — fine
-    }
+    agents_md_is_plain(path)?;
 
     let existing = match std::fs::read_to_string(path) {
         Ok(content) => content,
