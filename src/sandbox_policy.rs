@@ -1790,19 +1790,23 @@ pub fn mise_ro_protect_paths(home: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The home config files SECURITY.md documents as read-only: granted for
-/// reading, write-denied on macOS (both at `$HOME` and at the symlink target,
-/// see [`home_config_link_targets`]).
-pub const READ_ONLY_HOME_CONFIG: &[&str] = &[
-    ".gitconfig",
-    ".gitconfig.local",
-    ".gitignore_global",
-    ".config/git/config",
-    ".config/git/ignore",
-    ".config/git/attributes",
-];
+/// The [`HOME_CONFIG_FILES`] SECURITY.md documents as read-only: git's own
+/// config, ignore and attributes files, which git on the host trusts. They are
+/// write-denied on macOS, at `$HOME` and at a symlink target, and a symlink
+/// target is bound read-only by Bubblewrap on Linux
+/// (see [`home_config_link_targets`]).
+///
+/// Derived rather than listed, so a git file added to [`HOME_CONFIG_FILES`]
+/// gets the write deny too. The `gh` files and `.tool-versions` are readable
+/// but carry no read-only claim: they never had a `$HOME` write deny.
+pub fn read_only_home_config() -> impl Iterator<Item = &'static str> {
+    HOME_CONFIG_FILES
+        .iter()
+        .copied()
+        .filter(|f| f.starts_with(".git") || f.starts_with(".config/git/"))
+}
 
-/// Where each [`READ_ONLY_HOME_CONFIG`] file really lives, for the ones that
+/// Where each [`read_only_home_config`] file really lives, for the ones that
 /// resolve somewhere other than `$HOME/<name>` — a dotfiles symlink (#524).
 ///
 /// The read grant follows the link (#515), so the write deny has to as well:
@@ -1814,8 +1818,7 @@ pub const READ_ONLY_HOME_CONFIG: &[&str] = &[
 /// Resolved once, at launch. A link whose target does not exist yet resolves
 /// to nothing and is not covered.
 pub fn home_config_link_targets(home: &Path) -> Vec<PathBuf> {
-    READ_ONLY_HOME_CONFIG
-        .iter()
+    read_only_home_config()
         .filter_map(|rel| {
             let named = home.join(rel);
             if !links_inside_home(home, &named) {
@@ -1826,24 +1829,22 @@ pub fn home_config_link_targets(home: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// `ignore` and `attributes` beside `~/.config/git/config`, for the macOS
-/// write denies. Git reads `~/.config/git/ignore` as the default
-/// `core.excludesFile`, so when `~/.config/git` links into a writable tree the
-/// file there hides paths from `git status`. Unlike
-/// [`home_config_link_targets`], a missing file still resolves (through its
-/// directory), because the agent could otherwise create it.
+/// `ignore` and `attributes` in a linked `~/.config/git` that do not exist
+/// yet, for the macOS write denies. Git reads `~/.config/git/ignore` as the
+/// default `core.excludesFile`, so if the agent could create it in a writable
+/// tree it could hide paths from `git status`. Existing ones are already in
+/// [`home_config_link_targets`]; a missing one resolves through its directory.
+/// Linux cannot bind a file that does not exist, so it has no counterpart.
 pub fn xdg_git_link_targets(home: &Path) -> Vec<PathBuf> {
     let dir = home.join(".config/git");
     ["ignore", "attributes"]
         .iter()
         .filter_map(|f| {
             let named = dir.join(f);
-            if !links_inside_home(home, &named) {
+            if !links_inside_home(home, &named) || std::fs::canonicalize(&named).is_ok() {
                 return None;
             }
-            std::fs::canonicalize(&named)
-                .or_else(|_| std::fs::canonicalize(&dir).map(|d| d.join(f)))
-                .ok()
+            std::fs::canonicalize(&dir).map(|d| d.join(f)).ok()
         })
         .collect()
 }
@@ -3181,6 +3182,26 @@ mod tests {
         assert!(socket_owned_by(501, 1, 501));
         assert!(!socket_owned_by(0, 1, 501), "foreign owner");
         assert!(!socket_owned_by(501, 2, 501), "hardlinked socket");
+    }
+
+    /// The read-only files are git's, drawn from the shared read list (#524,
+    /// #547). Pinning the exact set makes a new entry a deliberate choice: a
+    /// git file joins it, `gh` and `.tool-versions` stay out.
+    #[test]
+    fn read_only_home_config_is_the_git_subset_of_home_config_files() {
+        let ro: Vec<&str> = read_only_home_config().collect();
+        assert!(ro.iter().all(|f| HOME_CONFIG_FILES.contains(f)), "{ro:?}");
+        assert_eq!(
+            ro,
+            [
+                ".gitconfig",
+                ".gitconfig.local",
+                ".gitignore_global",
+                ".config/git/config",
+                ".config/git/ignore",
+                ".config/git/attributes",
+            ]
+        );
     }
 
     #[test]

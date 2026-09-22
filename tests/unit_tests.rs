@@ -922,6 +922,12 @@ fn profile_grants_project_access() {
         p.contains("(deny file-write* (literal \"/Users/test/.config/git/config\"))"),
         "XDG Git config must remain read-only"
     );
+    // git's default excludes and attributes files: a writable `ignore` would
+    // hide planted files from `git status`.
+    for file in ["ignore", "attributes"] {
+        let rule = format!("(deny file-write* (literal \"/Users/test/.config/git/{file}\"))");
+        assert!(p.contains(&rule), "XDG Git {file} must remain read-only");
+    }
 }
 
 /// `~/.gitconfig` symlinked into a dotfiles repo (stow, chezmoi, yadm, plain

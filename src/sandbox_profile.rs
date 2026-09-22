@@ -23,11 +23,11 @@ use super::SandboxConfig;
 use super::policy::{
     DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS,
     DEPENDENCY_SOURCE_TREES, EXEC_IN_WRITABLE, GPG_SIGNING_ALLOW_FILES, HOME_CONFIG_FILES,
-    HomeToolDir, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected,
-    READ_ONLY_HOME_CONFIG, ResolvedToolDir, SENSITIVE_PROJECT_PATTERNS, SYSTEM_READ_FILES,
-    TOOL_READ_DIRS, XCODE_SELECT_LINK, active_tool_dirs, ancestor_alternation, app_dirs,
-    colima_socket_paths, current_uid, escape_regex, first_party_read_target, grant_is_refused,
-    home_config_link_targets, nested_alternation, path_bin_dirs, playwright_runtime_intent,
+    HomeToolDir, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir,
+    SENSITIVE_PROJECT_PATTERNS, SYSTEM_READ_FILES, TOOL_READ_DIRS, XCODE_SELECT_LINK,
+    active_tool_dirs, ancestor_alternation, app_dirs, colima_socket_paths, current_uid,
+    escape_regex, first_party_read_target, grant_is_refused, home_config_link_targets,
+    nested_alternation, path_bin_dirs, playwright_runtime_intent, read_only_home_config,
     rel_is_glob, rel_regex, validate_playwright_socket_dir, validate_sbpl_path,
     xdg_git_link_targets,
 };
@@ -1976,7 +1976,7 @@ fn emit_user_write_exec_denies(
     sbpl!(sb);
 }
 
-/// Keep the [`READ_ONLY_HOME_CONFIG`] files read-only, at `$HOME` and at the
+/// Keep the [`read_only_home_config`] files read-only, at `$HOME` and at the
 /// target a dotfiles symlink resolves to.
 ///
 /// The `$HOME` literal holds even when an overlapping path is writable (a
@@ -1985,9 +1985,9 @@ fn emit_user_write_exec_denies(
 /// <project>/gitconfig` only a rule naming the target stops the write, and it
 /// has to come after the project and `allow.write` grants, hence the tail.
 ///
-/// `ignore` and `attributes` in a linked `~/.config/git` are denied too
-/// ([`xdg_git_link_targets`]): they need no read grant, but git on the host
-/// reads the resolved `ignore` as its excludes file.
+/// `ignore` and `attributes` in a linked `~/.config/git` are denied even
+/// before they exist ([`xdg_git_link_targets`]): git on the host reads the
+/// resolved `ignore` as its excludes file.
 ///
 /// The target's ancestors get `file-write-unlink`, for the reason
 /// `emit_gitdir_denies` pins the gitdir's: a literal deny holds only while the
@@ -1999,7 +1999,7 @@ fn emit_home_config_write_denies(sb: &mut String, config: &SandboxConfig, home: 
         sb,
         ";; Home config files — read-only, at $HOME and link target"
     );
-    for file in READ_ONLY_HOME_CONFIG {
+    for file in read_only_home_config() {
         sbpl!(sb, "(deny file-write* (literal \"{home}/{file}\"))");
     }
     // A target the profile cannot name is skipped here; `prepare` refuses to
