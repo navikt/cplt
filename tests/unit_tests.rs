@@ -7962,6 +7962,45 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
         p.contains("(deny file-write* (subpath \"/Users/test/.cache/opencode/bin\"))"),
         "cache/bin should deny writes (exec-only dir)"
     );
+
+    // Presence is not enough: SBPL is last-match-wins, and the broad
+    // `(deny process-exec ~/.cache)` from the tool dirs used to land after the
+    // bin allow, so OpenCode's managed `rg` failed with EPERM (#537).
+    // Resolve each operation the way Seatbelt does: the last subpath rule that
+    // covers the path decides.
+    let last_rule = |op: &str, path: &str| {
+        p.lines()
+            .filter_map(|l| {
+                let (verdict, rest) = l.strip_prefix('(')?.split_once(' ')?;
+                let target = rest
+                    .strip_prefix(op)?
+                    .strip_prefix(" (subpath \"")?
+                    .strip_suffix("\"))")?;
+                (path == target || path.starts_with(&format!("{target}/")))
+                    .then(|| format!("({verdict} {op} (subpath \"{target}\"))"))
+            })
+            .next_back()
+            .unwrap_or_else(|| panic!("no {op} rule covers {path}"))
+    };
+    assert!(
+        p.contains("(deny process-exec (subpath \"/Users/test/.cache\"))"),
+        "the broad ~/.cache exec deny must still be present for this test to mean anything"
+    );
+    assert_eq!(
+        last_rule("process-exec", "/Users/test/.cache/opencode/bin/rg"),
+        "(allow process-exec (subpath \"/Users/test/.cache/opencode/bin\"))",
+        "the bin exec allow must come after every exec deny covering it"
+    );
+    assert_eq!(
+        last_rule("process-exec", "/Users/test/.cache/opencode/node_modules/x"),
+        "(deny process-exec (subpath \"/Users/test/.cache\"))",
+        "the rest of ~/.cache/opencode must stay non-executable"
+    );
+    assert_eq!(
+        last_rule("file-write*", "/Users/test/.cache/opencode/bin/rg"),
+        "(deny file-write* (subpath \"/Users/test/.cache/opencode/bin\"))",
+        "the bin write deny must come after every write allow covering it"
+    );
 }
 
 // ============================================================

@@ -149,6 +149,7 @@ pub fn generate_profile_with_playwright_socket_dir(
         config.allow_cache_exec_any,
         Path::new(XCODE_SELECT_LINK),
     );
+    emit_agent_exec_carveouts(&mut sb, config.agent_dirs);
     emit_copilot_install(&mut sb, config.copilot_install_dir);
     emit_gradle_toolchain_exec(&mut sb, &home);
     emit_java_home(&mut sb, config.java_home);
@@ -579,7 +580,11 @@ fn emit_home_access(
             if dir.map_exec {
                 sbpl!(sb, "(allow file-map-executable (subpath \"{path}\"))");
             }
-            if dir.process_exec {
+            // Exec-only dirs get their process-exec allow from
+            // `emit_agent_exec_carveouts`, after the broad tool/cache exec
+            // denies: emitted here, `(deny process-exec ~/.cache)` would win
+            // over OpenCode's `~/.cache/opencode/bin` (last-match-wins, #537).
+            if dir.process_exec && dir.write {
                 sbpl!(sb, "(allow process-exec (subpath \"{path}\"))");
             }
             // Explicitly deny exec on writable agent data dirs (write+exec = persistence risk)
@@ -1410,6 +1415,27 @@ fn emit_tool_dirs(
         if !allow_cache_exec.is_empty() {
             sbpl!(sb);
         }
+    }
+}
+
+/// Process-exec allow for exec-only agent dirs (`!write && process_exec`:
+/// OpenCode's `~/.cache/opencode/bin`, Pi's `~/.pi/agent/bin`).
+///
+/// Emitted after `emit_tool_dirs` because SBPL is last-match-wins and that
+/// function denies exec on broad writable trees such as `~/.cache` and
+/// `~/Library/Caches`, which contain these dirs (#537). Writes stay denied by
+/// `emit_host_persistence_denies` at the tail of the profile.
+fn emit_agent_exec_carveouts(sb: &mut String, agent_dirs: &[AgentDir]) {
+    let exec_only: Vec<_> = agent_dirs
+        .iter()
+        .filter(|d| !d.write && d.process_exec)
+        .collect();
+    for dir in &exec_only {
+        let path = dir.path.display();
+        sbpl!(sb, "(allow process-exec (subpath \"{path}\"))");
+    }
+    if !exec_only.is_empty() {
+        sbpl!(sb);
     }
 }
 
