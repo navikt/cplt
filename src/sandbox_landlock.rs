@@ -854,10 +854,10 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
             },
         });
         // TestContainers' own config (`docker.host`), read-only like on
-        // macOS (#209). Filtered like HOME_CONFIG_FILES, since the rule
-        // follows a symlink.
+        // macOS (#209). The rule follows a symlink, so the resolved target is
+        // checked too: a link into `~/.ssh` would otherwise grant the key.
         let tc_props = home.join(".testcontainers.properties");
-        if !policy::grant_is_refused(home, &tc_props) {
+        if policy::first_party_read_target(home, &tc_props).is_some() {
             fs_rules.push(FsRule {
                 path: tc_props,
                 access: FsAccess {
@@ -2527,6 +2527,26 @@ mod tests {
         assert!(rule.access.read);
         assert!(!rule.access.write, "it must not be writable");
         assert!(!rule.access.execute);
+    }
+
+    /// A `~/.testcontainers.properties` symlinked into `~/.ssh` gets no rule:
+    /// Landlock would follow the link and grant the key (#209).
+    #[test]
+    fn testcontainers_properties_linked_into_ssh_is_not_granted() {
+        let project = PathBuf::from("/home/user/project");
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join(".ssh")).unwrap();
+        std::fs::write(home.path().join(".ssh/id_ed25519"), "key").unwrap();
+        let link = home.path().join(".testcontainers.properties");
+        std::os::unix::fs::symlink(home.path().join(".ssh/id_ed25519"), &link).unwrap();
+        let mut config = test_config(&project, home.path());
+        config.allow_docker = true;
+
+        let policy = generate_policy(&config);
+        assert!(
+            !policy.fs_rules.iter().any(|r| r.path == link),
+            "a link into ~/.ssh must not become a read rule"
+        );
     }
 
     /// Docker Desktop for Linux's socket sits at `~/.docker/desktop/docker.sock`,

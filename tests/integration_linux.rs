@@ -125,6 +125,16 @@ mod linux_tests {
         extra_flags: &[&str],
         script: &str,
     ) -> (i32, String, String) {
+        run_sandboxed_with_flags_env(project_dir, extra_flags, &[], script)
+    }
+
+    /// [`run_sandboxed_with_flags`] with extra environment variables for cplt.
+    fn run_sandboxed_with_flags_env(
+        project_dir: &Path,
+        extra_flags: &[&str],
+        env: &[(&str, &Path)],
+        script: &str,
+    ) -> (i32, String, String) {
         let dir_str = project_dir.to_string_lossy().into_owned();
         let mut args: Vec<&str> = vec![
             "--yes",
@@ -141,6 +151,7 @@ mod linux_tests {
         let output = cplt_cmd()
             .args(&args)
             .env("HOME", home_dir())
+            .envs(env.iter().copied())
             .output()
             .expect("Failed to execute cplt");
 
@@ -1289,6 +1300,62 @@ except OSError as e:
             !masked_out.contains("CONNECTED"),
             "without --allow-docker, bubblewrap must mask {path_str} — Docker \
              Desktop's socket is a container daemon like any other.\n\
+             stdout: {masked_out}\nstderr: {masked_err}"
+        );
+    }
+
+    /// A colima profile socket found through `$COLIMA_HOME` (#209) gets the
+    /// same treatment as Docker Desktop's: connectable with `--allow-docker`,
+    /// mount-masked without it. The dir sits under the real $HOME, not /tmp,
+    /// for the reason given above: `build_deny_masks` skips /tmp.
+    #[test]
+    fn colima_home_socket_is_masked_by_default_and_granted_by_allow_docker() {
+        require_landlock!();
+        if !bwrap_available() {
+            assert!(
+                !require_sandbox_enforced(),
+                "Bubblewrap required by CPLT_TEST_REQUIRE_SANDBOX but unavailable"
+            );
+            eprintln!("SKIPPED: bwrap not available");
+            return;
+        }
+        if !have_python3() {
+            eprintln!("SKIPPED: python3 not available");
+            return;
+        }
+        let colima_home = home_dir().join(format!(".cplt-test-colima-{}", std::process::id()));
+        let dir = colima_home.join("work");
+        if fs::create_dir_all(&dir).is_err() {
+            eprintln!("SKIPPED: cannot create {}", dir.display());
+            return;
+        }
+        let _cleanup = RemoveDirOnDrop(Some(colima_home.clone()));
+        let sock = OutsideSocket::bind_at(dir.join("docker.sock"));
+        let path_str = sock.path.to_string_lossy().into_owned();
+        let project = create_test_project();
+        let env = [("COLIMA_HOME", colima_home.as_path())];
+
+        let (_, masked_out, masked_err) = run_sandboxed_with_flags_env(
+            project.path(),
+            &["--use-bubblewrap"],
+            &env,
+            &unix_connect_probe(&path_str),
+        );
+        let (_, granted_out, granted_err) = run_sandboxed_with_flags_env(
+            project.path(),
+            &["--use-bubblewrap", "--allow-docker"],
+            &env,
+            &unix_connect_probe(&path_str),
+        );
+
+        assert!(
+            granted_out.contains("CONNECTED"),
+            "--allow-docker must leave the colima socket {path_str} connectable.\n\
+             stdout: {granted_out}\nstderr: {granted_err}"
+        );
+        assert!(
+            !masked_out.contains("CONNECTED"),
+            "without --allow-docker, bubblewrap must mask the colima socket {path_str}.\n\
              stdout: {masked_out}\nstderr: {masked_err}"
         );
     }

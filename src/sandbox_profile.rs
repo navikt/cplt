@@ -26,9 +26,9 @@ use super::policy::{
     PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir,
     SENSITIVE_PROJECT_PATTERNS, SYSTEM_READ_FILES, TOOL_READ_DIRS, XCODE_SELECT_LINK,
     active_tool_dirs, ancestor_alternation, app_dirs, colima_socket_paths, current_uid,
-    escape_regex, grant_is_refused, nested_alternation, path_bin_dirs, playwright_runtime_intent,
-    rel_is_glob, rel_regex,
-    validate_playwright_socket_dir, validate_sbpl_path,
+    escape_regex, first_party_read_target, grant_is_refused, nested_alternation, path_bin_dirs,
+    playwright_runtime_intent, rel_is_glob, rel_regex, validate_playwright_socket_dir,
+    validate_sbpl_path,
 };
 
 /// Device nodes a sandboxed process may open for writing, by exact path.
@@ -2341,15 +2341,23 @@ fn emit_docker_rules(sb: &mut String, home: &str, allow_docker: bool, extra_deny
 
     // TestContainers reads `docker.host` and friends from this file (#209).
     // Read only: it would write back `docker.client.strategy`, and tolerates
-    // the refusal with a warning.
+    // the refusal with a warning. SBPL matches the resolved path, so a
+    // dotfiles symlink needs its target granted too, once it is known not to
+    // sit inside a denied directory such as `~/.ssh`.
     let tc_props = PathBuf::from(format!("{home}/.testcontainers.properties"));
-    if let Some(deny) = overlapping_deny(extra_deny, &tc_props) {
-        withhold_reallow(sb, "Docker", "~/.testcontainers.properties", deny);
-    } else {
-        sbpl!(
-            sb,
-            "(allow file-read* (literal \"{home}/.testcontainers.properties\"))"
-        );
+    if let Some(target) = first_party_read_target(Path::new(home), &tc_props) {
+        let mut lits = vec![tc_props.clone()];
+        if target != tc_props && validate_sbpl_path(&target).is_ok() {
+            lits.push(target);
+        }
+        // A deny on either spelling withholds both, or the other would win.
+        if let Some(deny) = lits.iter().find_map(|p| overlapping_deny(extra_deny, p)) {
+            withhold_reallow(sb, "Docker", "~/.testcontainers.properties", deny);
+        } else {
+            for p in lits {
+                sbpl!(sb, "(allow file-read* (literal \"{}\"))", p.display());
+            }
+        }
     }
 
     // Allow Docker/Podman daemon socket connections.

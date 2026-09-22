@@ -190,6 +190,33 @@ pub fn grant_is_refused(home: &Path, path: &Path) -> bool {
         || cplt_state_dir_grant(home, path).is_some()
 }
 
+/// Where a first-party read grant on the file `path` really lands, or `None`
+/// when it must not be emitted.
+///
+/// Stricter than [`grant_is_refused`], which lets a user grant a single file
+/// inside a [`DENIED_DOTFILES`] directory on purpose. A rule cplt adds on its
+/// own has no such intent behind it, and a symlink such as
+/// `~/.testcontainers.properties -> ~/.ssh/id_ed25519` would turn it into a
+/// grant on the key: Landlock follows the link. So the resolved target is
+/// refused when it lies anywhere inside a denied dotfile directory or is a
+/// [`DENIED_HOME_SUBPATHS`] entry. A path that does not resolve is returned as
+/// spelled, since there is nothing behind it to expose.
+#[must_use]
+pub fn first_party_read_target(home: &Path, path: &Path) -> Option<PathBuf> {
+    if grant_is_refused(home, path) {
+        return None;
+    }
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let in_denied_dir = DENIED_DOTFILES.iter().any(|d| {
+        let dir = home.join(d);
+        target.starts_with(&dir) || std::fs::canonicalize(&dir).is_ok_and(|c| target.starts_with(c))
+    });
+    if in_denied_dir || denied_entry(DENIED_HOME_SUBPATHS, home, &target).is_some() {
+        return None;
+    }
+    Some(target)
+}
+
 /// Exact-path membership of `path` in a `$HOME`-relative deny list, comparing
 /// the literal and the canonicalized form.
 fn denied_entry(list: &[&'static str], home: &Path, path: &Path) -> Option<&'static str> {
@@ -2901,6 +2928,45 @@ mod tests {
             scan(current_uid().wrapping_add(1)).is_empty(),
             "a socket owned by another uid must not be returned"
         );
+    }
+
+    /// A first-party read grant follows symlinks, so its resolved target is
+    /// refused anywhere inside a denied dotfile dir or on a
+    /// DENIED_HOME_SUBPATHS entry, and returned otherwise (#209).
+    #[test]
+    fn first_party_read_target_refuses_links_into_secrets() {
+        use std::os::unix::fs::symlink;
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        std::fs::create_dir_all(h.join(".ssh")).unwrap();
+        std::fs::create_dir_all(h.join(".m2")).unwrap();
+        std::fs::create_dir_all(h.join("dotfiles")).unwrap();
+        std::fs::write(h.join(".ssh/id_ed25519"), "key").unwrap();
+        std::fs::write(h.join(".m2/settings.xml"), "pw").unwrap();
+        std::fs::write(h.join("dotfiles/tc.properties"), "docker.host=x").unwrap();
+        let link = h.join(".testcontainers.properties");
+
+        symlink(h.join(".ssh/id_ed25519"), &link).unwrap();
+        assert_eq!(first_party_read_target(h, &link), None, "link into ~/.ssh");
+
+        std::fs::remove_file(&link).unwrap();
+        symlink(h.join(".m2/settings.xml"), &link).unwrap();
+        assert_eq!(
+            first_party_read_target(h, &link),
+            None,
+            "link to settings.xml"
+        );
+
+        std::fs::remove_file(&link).unwrap();
+        symlink(h.join("dotfiles/tc.properties"), &link).unwrap();
+        assert_eq!(
+            first_party_read_target(h, &link),
+            Some(std::fs::canonicalize(h.join("dotfiles/tc.properties")).unwrap()),
+            "a harmless dotfiles target is returned resolved"
+        );
+
+        let absent = h.join(".nothing-here");
+        assert_eq!(first_party_read_target(h, &absent), Some(absent.clone()));
     }
 
     /// A hardlink to some other socket, planted in a colima dir, is refused.

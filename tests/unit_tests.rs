@@ -6813,6 +6813,59 @@ fn profile_docker_grants_running_colima_profiles_only_their_socket() {
     }
 }
 
+/// SBPL matches the resolved path, so a `~/.testcontainers.properties`
+/// symlinked into a dotfiles repo needs its target granted as well. A link into
+/// `~/.ssh` gets neither literal, and a `--deny-path` on the target withholds
+/// both (#209).
+#[test]
+fn profile_docker_testcontainers_properties_follows_safe_symlinks_only() {
+    use std::os::unix::fs::symlink;
+    let home = tempfile::tempdir().expect("tempdir");
+    let h = home.path();
+    std::fs::create_dir_all(h.join("dotfiles")).unwrap();
+    std::fs::create_dir_all(h.join(".ssh")).unwrap();
+    std::fs::write(h.join("dotfiles/tc.properties"), "docker.host=x\n").unwrap();
+    std::fs::write(h.join(".ssh/id_ed25519"), "key").unwrap();
+    let link = h.join(".testcontainers.properties");
+    let lit = |p: &std::path::Path| format!(r#"(allow file-read* (literal "{}"))"#, p.display());
+    let profile = |deny: &[std::path::PathBuf]| {
+        temp_env::with_vars_unset(["COLIMA_HOME", "XDG_CONFIG_HOME"], || {
+            generate_profile(
+                &SandboxConfig {
+                    home_dir: h,
+                    allow_docker: true,
+                    extra_deny: deny,
+                    ..base_profile_options()
+                },
+                &[],
+            )
+        })
+    };
+
+    symlink(h.join("dotfiles/tc.properties"), &link).unwrap();
+    let target = std::fs::canonicalize(&link).unwrap();
+    let p = profile(&[]);
+    assert!(p.contains(&lit(&link)), "the literal path must be readable");
+    assert!(
+        p.contains(&lit(&target)),
+        "the symlink target must be readable"
+    );
+    let p = profile(std::slice::from_ref(&target));
+    assert!(
+        !p.contains(&lit(&link)) && !p.contains(&lit(&target)),
+        "a deny on the target must withhold both literals"
+    );
+
+    std::fs::remove_file(&link).unwrap();
+    symlink(h.join(".ssh/id_ed25519"), &link).unwrap();
+    let key = std::fs::canonicalize(&link).unwrap();
+    let p = profile(&[]);
+    assert!(
+        !p.contains(&lit(&link)) && !p.contains(&lit(&key)),
+        "a link into ~/.ssh must not be granted"
+    );
+}
+
 #[test]
 fn profile_socket_allows_rules() {
     let p = generate_profile(
