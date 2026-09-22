@@ -373,13 +373,13 @@ cplt --allow-docker
 
 ## SSH agent blocking
 
-SSH agent access is blocked on macOS (the agent socket is not reachable — the profile's `(deny default)` covers `network-outbound` to unix sockets) and `SSH_AUTH_SOCK` is stripped from the environment on both platforms. `~/.ssh` is denied as well, so there is no key file to fall back on. Which means:
+SSH agent access is blocked on macOS (the agent socket is not reachable — the profile's `(deny default)` covers `network-outbound` to unix sockets) and `SSH_AUTH_SOCK` is stripped from the environment on both platforms. `~/.ssh` is denied as well, so there is no key file to fall back on. Unless the agent reaches a loaded agent socket (possible on Linux, see the caveat below), this means:
 
 - `git clone` over SSH fails, because ssh has no key to authenticate with. Use HTTPS clones instead
 - `ssh` commands spawned by the agent fail to authenticate
 - `gh` CLI uses HTTPS by default and is unaffected
 
-**What is blocked is the key material, not SSH as a transport.** SSH to port 22 is closed by default, because outbound TCP is limited to port 443. But SSH servers that listen on 443 are reachable like any other host on 443. GitHub runs one at `ssh.github.com:443`, so `ssh -p 443 git@ssh.github.com` opens a connection with no configuration change. It then fails at host-key verification or authentication, not for lack of a route. See [SSH over port 443](#ssh-over-port-443) below.
+**What is blocked is the key material, not SSH as a transport.** SSH to port 22 is closed by default, because outbound TCP is limited to port 443. But SSH servers that listen on 443 are reachable like any other host on 443. GitHub runs one at `ssh.github.com:443`, so `ssh -p 443 git@ssh.github.com` opens a connection with no configuration change. Without a reachable key it then fails at host-key verification or authentication, not for lack of a route. See [SSH over port 443](#ssh-over-port-443) below.
 
 **Linux caveat — this is not kernel-enforced below kernel 7.1.** Landlock gains the unix-socket `connect()` right only at ABI v9, and the SSH agent socket is not in the set bubblewrap masks (see [Linux limitations](../SECURITY.md#linux-specific-limitations)), so the withheld `SSH_AUTH_SOCK` is the whole barrier: without bubblewrap `/tmp` is readable, so `ls /tmp/ssh-*/agent.*` finds a stock OpenSSH socket and `SSH_AUTH_SOCK=... ssh-add -l` uses the loaded keys. bubblewrap's private `/tmp` hides that one, but not a gnome-keyring or systemd agent at a fixed `$XDG_RUNTIME_DIR` path.
 
