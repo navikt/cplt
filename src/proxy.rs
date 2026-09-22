@@ -15,7 +15,10 @@ use crate::ui;
 #[path = "proxy_domains.rs"]
 pub mod domains;
 
-pub use domains::{DomainPolicy, PolicySpec, missing_allowlist_error, parse_lines_file};
+pub use domains::{
+    DomainPolicy, PolicySpec, blocklist, builtin_blocklist, missing_allowlist_error,
+    parse_lines_file,
+};
 
 /// Controls how much the proxy logs to stderr.
 /// The audit log file (if configured) always records everything regardless of this level.
@@ -831,9 +834,11 @@ fn freeze_snapshot(
 /// Bundled proxy startup options.
 pub struct ProxyOptions {
     pub port: u16,
-    pub blocked_file: PathBuf,
+    /// The user's `proxy.blocked_domains` file, added to the built-in list.
+    /// `None` = no user file; the built-in list still applies.
+    pub blocked_file: Option<PathBuf>,
     /// Domains from cached blocklist subscriptions (issue #144, Phase 1), frozen
-    /// at startup. Empty = no subscriptions (unchanged behaviour). UNIONed with
+    /// at startup. Empty = no subscriptions. UNIONed with the built-in list and
     /// `blocked_file` to form the effective blocklist. Tighten-only.
     pub subscription_blocklist: Vec<String>,
     pub allowed_ports: Vec<u16>,
@@ -1824,7 +1829,7 @@ fn is_timeout(e: &std::io::Error) -> bool {
 }
 
 /// Check if a hostname matches any entry in a pre-parsed blocklist.
-fn is_blocked_in_list(hostname: &str, blocked_domains: &[String]) -> bool {
+pub(crate) fn is_blocked_in_list(hostname: &str, blocked_domains: &[String]) -> bool {
     let host = normalize_hostname(hostname);
     for pattern in blocked_domains {
         if host == *pattern || host.ends_with(&format!(".{pattern}")) {
@@ -1832,25 +1837,6 @@ fn is_blocked_in_list(hostname: &str, blocked_domains: &[String]) -> bool {
         }
     }
     false
-}
-
-pub fn is_blocked(hostname: &str, blocked_file: &PathBuf) -> bool {
-    if !blocked_file.exists() {
-        return false;
-    }
-    let contents = match std::fs::read_to_string(blocked_file) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!(
-                "{}[proxy]{} Warning: cannot read blocklist {}: {e}",
-                ui::color(ui::YELLOW),
-                ui::color(ui::RESET),
-                blocked_file.display()
-            );
-            return false;
-        }
-    };
-    is_blocked_in_content(hostname, &contents)
 }
 
 pub fn is_blocked_in_content(hostname: &str, contents: &str) -> bool {
@@ -3239,7 +3225,7 @@ mod tests {
             Arc::new(move |_h: &str, p: u16| Some(std::net::SocketAddr::new(public_ip, p)));
         start(ProxyOptions {
             port: 0,
-            blocked_file: PathBuf::from("/dev/null"),
+            blocked_file: None,
             allowed_ports: vec![443, 80],
             allow_localhost_ports: Vec::new(),
             allow_localhost_any: false,
@@ -3517,7 +3503,7 @@ mod tests {
         let upstream = UpstreamProxy::parse(&format!("http://127.0.0.1:{}", up.port)).unwrap();
         let proxy = start(ProxyOptions {
             port: 0,
-            blocked_file: PathBuf::from("/dev/null"),
+            blocked_file: None,
             allowed_ports: vec![443, 80],
             allow_localhost_ports: vec![port],
             allow_localhost_any: false,
@@ -3588,7 +3574,7 @@ mod tests {
         let resolver: ResolverFn = Arc::new(|_host: &str, _port: u16| None);
         let proxy = start(ProxyOptions {
             port: 0,
-            blocked_file: PathBuf::from("/dev/null"),
+            blocked_file: None,
             subscription_blocklist: Vec::new(),
             allowed_ports: vec![443],
             allow_localhost_ports: Vec::new(),
@@ -3655,7 +3641,7 @@ mod tests {
         let resolver: ResolverFn = Arc::new(|_h: &str, _p: u16| None);
         let proxy = start(ProxyOptions {
             port: 0,
-            blocked_file: PathBuf::from("/dev/null"),
+            blocked_file: None,
             allowed_ports: vec![443, 80],
             allow_localhost_ports: Vec::new(),
             allow_localhost_any: false,
@@ -3784,7 +3770,7 @@ mod tests {
         let blocked = PathBuf::from("/dev/null");
         start(ProxyOptions {
             port: 0,
-            blocked_file: blocked,
+            blocked_file: Some(blocked),
             allowed_ports: vec![443, 80],
             allow_localhost_ports,
             allow_localhost_any,
@@ -4010,7 +3996,7 @@ mod tests {
 
         let proxy = start(ProxyOptions {
             port: 0,
-            blocked_file: PathBuf::from("/dev/null"),
+            blocked_file: None,
             allowed_ports: vec![443, 80],
             allow_localhost_ports: vec![],
             allow_localhost_any: false,
@@ -4072,7 +4058,7 @@ mod tests {
 
         let proxy = start(ProxyOptions {
             port: 0,
-            blocked_file: PathBuf::from("/dev/null"),
+            blocked_file: None,
             allowed_ports: vec![443, 80],
             allow_localhost_ports: vec![],
             allow_localhost_any: false,
@@ -4525,7 +4511,7 @@ mod tests {
     fn make_proxy_with_upstream(upstream: UpstreamProxy, blocked_file: PathBuf) -> ProxyHandle {
         start(ProxyOptions {
             port: 0,
-            blocked_file,
+            blocked_file: Some(blocked_file),
             allowed_ports: vec![443, 80],
             allow_localhost_ports: Vec::new(),
             allow_localhost_any: false,
@@ -4737,7 +4723,7 @@ mod tests {
     ) -> ProxyHandle {
         start(ProxyOptions {
             port: 0,
-            blocked_file,
+            blocked_file: Some(blocked_file),
             allowed_ports,
             allow_localhost_ports: Vec::new(),
             allow_localhost_any: false,
@@ -5194,7 +5180,7 @@ mod tests {
     ) -> ProxyHandle {
         start(ProxyOptions {
             port: 0,
-            blocked_file,
+            blocked_file: Some(blocked_file),
             allowed_ports: vec![443, 80],
             allow_localhost_ports: Vec::new(),
             allow_localhost_any: false,

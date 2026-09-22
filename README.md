@@ -769,7 +769,7 @@ cplt --inherit-env -- -p "debug the build"
 
 # Network
 cplt --no-proxy -- -p "fix the tests"                    # proxy is on by default
-cplt --blocked-domains ./blocked-domains.txt -- -p "refactor"
+cplt --blocked-domains ./my-blocklist.txt -- -p "refactor"   # adds to the built-in list
 cplt --allow-private-domain intern.nav.no -- -p "use mcp-onboarding"
 
 # Non-interactive / CI (skip the confirmation prompt)
@@ -917,10 +917,10 @@ The proxy is **on by default**. All outbound traffic from Copilot CLI, `gh`, and
 ```bash
 cplt --proxy-forced -- -p "fix tests"                 # force all egress through the proxy
 cplt --no-proxy -- -p "fix tests"                     # disable for one run
-cplt --blocked-domains blocked-domains.txt -- -p "x"  # block known-bad domains
+cplt --blocked-domains my-blocklist.txt -- -p "x"     # block more domains (adds to the built-in list)
 cplt --allowed-domains allowed-domains.txt -- -p "x"  # allowlist mode
 cplt --default-allowlist -- -p "x"                    # fail-closed: only the agent's own domains
-cplt --observe-domains -- -p "x"                      # record what the agent contacts, block nothing
+cplt --observe-domains -- -p "x"                      # record what the agent contacts, no allowlist
 cplt --proxy-upstream http://proxy.corp:8080 -- -p "x" # chain through a corporate proxy
 ```
 

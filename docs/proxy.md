@@ -38,7 +38,7 @@ cplt config set proxy.log_file "~/.config/cplt/proxy.log"
 | `--no-proxy`                | Disable the proxy for this run.                                                                  |
 | `--proxy-forced` / `--no-proxy-forced` | Make the proxy mandatory and restrict direct routing where the platform supports it (opt-in, default off). Conflicts with `--no-proxy`. See [Proxy-forced mode](#proxy-forced-mode) and [network snapshot coverage](#network-snapshot). |
 | `--proxy-port <PORT>`       | Which port the proxy listens on (default: 0, OS-assigned ephemeral).                             |
-| `--blocked-domains <FILE>`  | Domains to block, one per line. Re-read every ~5s, so you can edit it live. |
+| `--blocked-domains <FILE>`  | Domains to block, one per line, on top of the built-in list. Re-read every ~5s, so you can edit it live. |
 | `--allowed-domains <FILE>`  | Domains to allow. Setting it turns the allowlist on, and only listed domains can connect — an empty file therefore blocks everything, and a missing file is a startup error. Re-read every ~5s. |
 | `--default-allowlist`       | Enable the agent's built-in default allowlist for this run (opt-in, default off): restrict egress to the agent's fail-closed domain set merged with `--allowed-domains`. See [Default allowlist](#default-allowlist-fail-closed-networking). |
 | `--allow-all-domains`       | Escape hatch: disable the default allowlist for this run and allow all domains (blocklist still applies). Also ignores any `--allowed-domains` file. |
@@ -158,7 +158,7 @@ because only two of them are about permission at all.
 
 | List | The question it answers | Default | Reload |
 | --- | --- | --- | --- |
-| **Blocklist** (`--blocked-domains`) | "Never connect here." Exfiltration sinks: paste sites, webhook capture, tunnels. | A curated list ships with cplt | Live, ~5s |
+| **Blocklist** (`--blocked-domains`) | "Never connect here." Exfiltration sinks: paste sites, webhook capture, tunnels. | A curated list is built into cplt and always applies | Live, ~5s |
 | **Allowlist** (`--allowed-domains`, `--default-allowlist`) | "Connect *only* here." Everything not listed is refused. | Off | Live, ~5s |
 | **Private-domain waiver** (`proxy.allow_private_domains`) | "This name is a trusted internal service." Not about permission: it is the DNS-rebinding guard. | Empty | Live, ~5s |
 
@@ -205,11 +205,17 @@ The same matching applies to the blocklist, `proxy.allow_private_domains` and
 
 ### Blocklist
 
-Block domains commonly used for data exfiltration. A default blocklist ships with cplt, built from real attack infrastructure observed in 2025 and 2026 supply chain incidents. It covers webhook capture services, paste sites, file sharing, tunneling services, and IP recon endpoints. See [`blocked-domains.txt`](../blocked-domains.txt) for the full list with sources.
+Block domains commonly used for data exfiltration. cplt has a built-in blocklist, built from real attack infrastructure observed in 2025 and 2026 supply chain incidents. It covers webhook capture services, paste sites, file sharing, tunneling services, IP recon endpoints and a few telemetry hosts. See [`blocked-domains.txt`](../blocked-domains.txt) for the full list with sources.
+
+The list is compiled into the binary, so it applies on every install (Homebrew, apt, a release tarball, a source build) whenever the proxy is running. It is checked after the allowlist, so a host on both lists is blocked. There is no setting to turn it off and no per-host exemption.
+
+The blocklist is enforced by the proxy, so it only covers traffic that goes through the proxy. Without [proxy-forced mode](#proxy-forced-mode) (`proxy.forced`, `--proxy-forced` or `--preset strict`), outbound TCP to `*:443` is open at the kernel level, and a client that ignores `HTTPS_PROXY` reaches a blocked host directly on 443. `--no-proxy` turns the proxy, and with it the blocklist, off entirely.
+
+`proxy.blocked_domains` (or `--blocked-domains`) adds your own file on top of the built-in list. It never replaces it. The file is re-read every ~5 seconds, so edits take effect mid-session.
 
 ### Subscribing to blocklists
 
-The threat landscape moves faster than cplt releases. A blocklist subscription keeps a local cache fresh from a maintained upstream list (issue #144, Phase 1). Cached subscription domains are UNIONed into the effective blocklist alongside your local `blocked_domains` file and the built-in `blocked-domains.txt`, so they only ever add blocks.
+The threat landscape moves faster than cplt releases. A blocklist subscription keeps a local cache fresh from a maintained upstream list (issue #144, Phase 1). Cached subscription domains are UNIONed into the effective blocklist alongside the built-in list and your local `blocked_domains` file, so they only ever add blocks.
 
 Subscriptions are global-only (`~/.config/cplt/config.toml`). A repo `.cplt.toml` cannot add one, so a malicious repository can never point cplt at an attacker-controlled list.
 
@@ -366,7 +372,7 @@ Each agent adds its own endpoints on top of that shared registry base:
 - **Claude:** the Anthropic API, sign-in (`claude.ai` and `claude.com`) and the claude.ai MCP connector proxy (`mcp-proxy.anthropic.com`). Verified 2026-09-04 against Anthropic's published network-access requirements and the hosts in the Claude Code 2.1.260 binary. `claude.com` is listed bare so its subdomain match also covers `platform.claude.com`, which OAuth token refresh needs for both Console and claude.ai accounts, and `code.claude.com`, the documentation host. Deliberately excluded: `storage.googleapis.com` (plugin metadata, too broad a host to grant by default), `raw.githubusercontent.com` (`/release-notes`), `formulae.brew.sh` (Homebrew update check), the Datadog telemetry intakes and `*.claudeusercontent.com` (Claude in Chrome and artifacts). Add any of them via `allowed_domains` if you want them. Two inherited entries, `console.anthropic.com` and `statsig.anthropic.com`, are kept but could not be corroborated against either source — the current docs attribute Console authentication to `platform.claude.com` and feature-flag fetches to `api.anthropic.com`, and the binary carries neither host — so they are candidates for deletion once a run is observed.
 - **OpenCode:** only OpenCode's own infra (`opencode.ai`, `models.dev`). OpenCode is provider-agnostic, so you must add your chosen model provider's domain via `allowed_domains` (`api.anthropic.com`, `api.openai.com`, or `generativelanguage.googleapis.com`, for example) before its model traffic is permitted.
 - **Pi:** no infrastructure defaults yet. Add its endpoints via `allowed_domains` when enabling the allowlist. Contributions welcome.
-- **goose:** registry base only, and that is an observed result rather than a gap. A session captured with `--observe-domains` (goose 1.48.0, 2026-09-03) contacted no goose-owned host at all — only the configured model provider. goose is provider-agnostic, so add your provider's domain via `allowed_domains` the same way you would for OpenCode. Two hosts were seen but deliberately left out because neither is on a default path: `us.i.posthog.com` (telemetry, opt-in — add it if you turn telemetry on) and `github.com` (only reached by `goose update`, which is a self-update inside the sandbox).
+- **goose:** registry base only, and that is an observed result rather than a gap. A session captured with `--observe-domains` (goose 1.48.0, 2026-09-03) contacted no goose-owned host at all — only the configured model provider. goose is provider-agnostic, so add your provider's domain via `allowed_domains` the same way you would for OpenCode. Two hosts were seen but deliberately left out because neither is on a default path: `us.i.posthog.com` (telemetry, opt-in; adding it to `allowed_domains` does not help, because `posthog.com` is on the built-in blocklist, which is checked after the allowlist) and `github.com` (only reached by `goose update`, which is a self-update inside the sandbox).
 - **DeepSeek Harness:** the DeepSeek API, `deepseek.com`. Its shipped `dsh-llm-deepseek` adapter defaults to `https://api.deepseek.com`, so the bare domain covers the API host. A deployment that points `DEEPSEEK_BASE_URL` at a gateway must add that gateway's domain via `allowed_domains`.
 - **Shell:** registry base only, since it is not an AI agent.
 
@@ -396,7 +402,7 @@ cplt --agent copilot --observe-domains -- -p "add tests for the parser and run t
 
 `--observe-domains`:
 
-- **Forces the proxy on and in allow-all mode for this run.** It overrides `--preset strict`, `--default-allowlist`, `proxy.default_allowlist`, and any configured `allowed_domains`, while blocklists, port policy, and private-address restrictions continue to apply. cplt prints a one-line notice and a warning that this run does not enforce domain filtering. Do not treat an observe run as a protected session.
+- **Forces the proxy on and in allow-all mode for this run.** It overrides `--preset strict`, `--default-allowlist`, `proxy.default_allowlist`, and any configured `allowed_domains`, while blocklists, port policy, and private-address restrictions continue to apply. A host on the built-in blocklist, your blocklist or a subscription is still blocked, so it never appears in the observed allowlist. cplt prints a warning that this run does not enforce an allowlist. Do not treat an observe run as a protected session.
 - **Counts committed CONNECT records** regardless of `--proxy-log` and `--proxy-log-level`. It displays up to 20 sorted retained hosts on stderr, even under `--quiet`:
 
 ```
@@ -450,7 +456,7 @@ Every connection attempt is printed to stderr in real time:
 | Status | Meaning | Action |
 |---|---|---|
 | `CONNECTED` | Connection succeeded | none |
-| `BLOCKED` | Domain matched blocklist | Check `--blocked-domains` file |
+| `BLOCKED` | Domain matched blocklist | Check the built-in list (`blocked-domains.txt`), your `--blocked-domains` file and any subscription |
 | `BLOCKED-ALLOWLIST` | Domain not in allowlist | Add it to the file named by `proxy.allowed_domains` / `--allowed-domains` (re-read live), or `cplt config set allow.domains HOST` and restart |
 | `BLOCKED-PORT` | Port not in allowed list | Add with `--allow-port <PORT>` |
 | `BLOCKED-PRIVATE` | Pre-DNS private IP (`.local`, `127.*`, IP literals) | Use `--allow-localhost` for local ports |
