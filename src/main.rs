@@ -168,9 +168,10 @@ struct Cli {
     #[arg(long, value_name = "PORT")]
     proxy_port: Option<u16>,
 
-    /// File with domains to block (one per line, e.g. pastebin.com).
+    /// File with extra domains to block (one per line, e.g. pastebin.com).
     /// Only relevant when --with-proxy is enabled.
-    /// The proxy refuses CONNECT requests to these domains.
+    /// Adds to the built-in blocklist; it never replaces it. The proxy refuses
+    /// CONNECT requests to these domains.
     /// The file is re-read every ~5 seconds, so you can edit it live.
     #[arg(long, value_name = "FILE")]
     blocked_domains: Option<PathBuf>,
@@ -196,10 +197,11 @@ struct Cli {
     #[arg(long)]
     allow_all_domains: bool,
 
-    /// Run the proxy in ALLOW-ALL mode, block nothing, record every domain the
-    /// agent contacts, then print the observed set as a ready-to-paste
-    /// allowlist. Use it to build or verify an agent's default allowlist. This
-    /// run does NOT enforce domain filtering. It overrides --preset strict,
+    /// Run the proxy with no allowlist, record every domain the agent
+    /// contacts, then print the observed set as a ready-to-paste allowlist.
+    /// Use it to build or verify an agent's default allowlist. This run does
+    /// NOT enforce an allowlist; the built-in blocklist, your blocklist, port
+    /// policy and private-address checks still apply. It overrides --preset strict,
     /// --default-allowlist, and any configured allowlist for the session.
     /// See docs/proxy.md.
     #[arg(long)]
@@ -3045,12 +3047,15 @@ fn start_proxy_if_enabled(
     // point to record CONNECTs, even if the user disabled it. The allow-all
     // override (empty effective allowlist) is applied below where the allowlist
     // is computed. Print the mandatory warning that this run does NOT enforce
-    // domain filtering.
+    // an allowlist.
     if allowlist_decision.force_proxy_on {
         resolved.with_proxy = true;
-        ui::warn("observe-domains: proxy in allow-all mode; all traffic permitted and recorded");
         ui::warn(
-            "observe-domains: this run does NOT enforce domain filtering \
+            "observe-domains: no allowlist enforced; every allowed CONNECT is recorded \
+             (blocklists, port policy and private-address checks still apply)",
+        );
+        ui::warn(
+            "observe-domains: this run does NOT enforce an allowlist \
              (overrides --preset strict / --default-allowlist / configured allowlist)",
         );
     }

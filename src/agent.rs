@@ -950,7 +950,9 @@ impl Agent {
             //
             // Deliberately excluded, both observed but neither on a default
             // path: `us.i.posthog.com` (telemetry, opt-in — the same run with
-            // GOOSE_TELEMETRY_OFF=1 contacted nothing but the provider) and
+            // GOOSE_TELEMETRY_OFF=1 contacted nothing but the provider; it
+            // cannot be allowed anyway, since `posthog.com` is on the built-in
+            // blocklist, which is checked after the allowlist) and
             // `github.com` (only `goose update`, which is self-update inside
             // the sandbox and is not something to enable by default).
             //

@@ -340,7 +340,7 @@ or patched file       env vars, OS info        .env, npm tokens        or DNS tu
 | **Cloudflare Workers** | `*.workers.dev` | Free hosting for C2 relays, resistant to takedown |
 | **Ethereum dead-drop** | Smart contract to Cloudflare-fronted domains | C2 URL rotation without code changes, impossible to take down |
 
-cplt has a built-in blocklist covering most of these: [`blocked-domains.txt`](blocked-domains.txt), compiled into the binary and applied on every install whenever the proxy runs. `api.telegram.org` and `*.workers.dev` are not on it. Your own `proxy.blocked_domains` file adds to the built-in list; it does not replace it.
+cplt has a built-in blocklist covering most of these: [`blocked-domains.txt`](blocked-domains.txt), compiled into the binary and applied on every install whenever the proxy runs. `api.telegram.org` and `*.workers.dev` are not on it, and neither are Discord webhooks (`discord.com/api/webhooks/*`): they are path-based, and a domain list cannot block a path without blocking all of `discord.com`. Your own `proxy.blocked_domains` file adds to the built-in list; it does not replace it.
 
 ### What gets stolen (in order of attacker priority)
 

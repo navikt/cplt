@@ -1060,7 +1060,7 @@ For the `oh-my-openagent` OpenCode plugin specifically, `OMO_DISABLE_POSTHOG=1` 
 
 **Why blocked?** Analytics events may include code context, prompt fragments, or usage patterns that amount to unintended data exfiltration from inside the sandbox.
 
-**If you want to allow telemetry** (not recommended): there is no setting for it. The opt-out variables are always injected, and the built-in blocklist always applies while the proxy runs; `proxy.blocked_domains` only adds to it. Running without the proxy (`--no-proxy`) lets the connection through, at the cost of every other proxy protection.
+**If you want to allow telemetry** (not recommended): there is no setting for it. The opt-out variables are always injected, and the built-in blocklist always applies while the proxy runs; `proxy.blocked_domains` only adds to it. The blocklist is enforced by the proxy, so it does not stop a client that ignores `HTTPS_PROXY` and connects directly on 443 unless [proxy-forced mode](proxy.md#proxy-forced-mode) is on (`proxy.forced`, `--preset strict`). There is no per-host exemption.
 
 ## Terminal devices and allocating a PTY
 

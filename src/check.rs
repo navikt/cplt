@@ -457,7 +457,9 @@ pub fn explain_domain(
             Decision::Blocked,
             "the host is on cplt's built-in blocklist.".to_string(),
             Some(
-                "the built-in blocklist has no per-host exemption; only --no-proxy bypasses it."
+                "the built-in blocklist has no per-host exemption; it is enforced by the proxy, \
+                 so outside proxy-forced mode a client that ignores HTTPS_PROXY can still \
+                 reach the host directly on 443."
                     .to_string(),
             ),
         ),
