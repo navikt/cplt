@@ -29,6 +29,7 @@ use super::policy::{
     colima_socket_paths, current_uid, escape_regex, first_party_read_target, grant_is_refused,
     home_config_link_targets, nested_alternation, path_bin_dirs, playwright_runtime_intent,
     rel_is_glob, rel_regex, validate_playwright_socket_dir, validate_sbpl_path,
+    xdg_git_link_targets,
 };
 
 /// Device nodes a sandboxed process may open for writing, by exact path.
@@ -233,7 +234,7 @@ pub fn generate_profile_with_playwright_socket_dir(
     // Same reason: a dotfiles-managed `~/.gitconfig` can resolve into the
     // project or an `allow.write` tree, and the deny at its target must beat
     // that grant (#524).
-    emit_home_config_write_denies(&mut sb, &home);
+    emit_home_config_write_denies(&mut sb, config, &home);
     // Same reason, in the other direction: `process-exec` is granted
     // profile-wide, so an `allow.write` tree is executable unless something
     // says otherwise, and only a rule after every allow can say it.
@@ -1984,11 +1985,16 @@ fn emit_user_write_exec_denies(
 /// <project>/gitconfig` only a rule naming the target stops the write, and it
 /// has to come after the project and `allow.write` grants, hence the tail.
 ///
+/// `ignore` and `attributes` in a linked `~/.config/git` are denied too
+/// ([`xdg_git_link_targets`]): they need no read grant, but git on the host
+/// reads the resolved `ignore` as its excludes file.
+///
 /// The target's ancestors get `file-write-unlink`, for the reason
 /// `emit_gitdir_denies` pins the gitdir's: a literal deny holds only while the
 /// directories above it keep their names, and `mv git git.old && mkdir git`
-/// would leave the link pointing at a fresh, writable file.
-fn emit_home_config_write_denies(sb: &mut String, home: &str) {
+/// would leave the link pointing at a fresh, writable file. Which ancestors,
+/// and why the writable root itself is not one: `home_config_target_pins`.
+fn emit_home_config_write_denies(sb: &mut String, config: &SandboxConfig, home: &str) {
     sbpl!(
         sb,
         ";; Home config files — read-only, at $HOME and link target"
@@ -1996,20 +2002,23 @@ fn emit_home_config_write_denies(sb: &mut String, home: &str) {
     for file in READ_ONLY_HOME_CONFIG {
         sbpl!(sb, "(deny file-write* (literal \"{home}/{file}\"))");
     }
-    for target in home_config_link_targets(Path::new(home)) {
-        if validate_sbpl_path(&target).is_err() {
-            continue;
-        }
+    // A target the profile cannot name is skipped here; `prepare` refuses to
+    // launch when one sits in a writable tree (`validate_config_paths`).
+    let targets: Vec<PathBuf> = home_config_link_targets(Path::new(home))
+        .into_iter()
+        .chain(xdg_git_link_targets(Path::new(home)))
+        .filter(|t| validate_sbpl_path(t).is_ok())
+        .collect();
+    for target in &targets {
         let t = target.display();
         sbpl!(sb, "(deny file-write* (literal \"{t}\"))");
-        // Every ancestor but `/`, which nothing can rename anyway.
-        for dir in target.ancestors().skip(1) {
-            if dir.parent().is_none() {
-                break;
-            }
-            let d = dir.display();
-            sbpl!(sb, "(deny file-write-unlink (literal \"{d}\"))");
-        }
+    }
+    let mut pins = super::home_config_target_pins(config, &targets);
+    pins.sort();
+    pins.dedup();
+    for dir in pins {
+        let d = dir.display();
+        sbpl!(sb, "(deny file-write-unlink (literal \"{d}\"))");
     }
     sbpl!(sb);
 }

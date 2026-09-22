@@ -525,19 +525,75 @@ fn validate_exec_grants(config: &SandboxConfig) -> Result<(), String> {
     Ok(())
 }
 
-/// Dotfiles targets of [`policy::READ_ONLY_HOME_CONFIG`] that resolve into a
-/// writable tree, with that tree's description (#524). On Linux these are
-/// read-only only under Bubblewrap; the caller warns when it is absent.
-#[cfg(any(target_os = "linux", test))]
-fn home_config_targets_in_writable_trees(config: &SandboxConfig) -> Vec<(PathBuf, &'static str)> {
-    let trees = writable_trees(config);
-    home_config_link_targets(config.home_dir)
+/// [`writable_trees`] canonicalized, for matching against the canonical paths
+/// a dotfiles link resolves to.
+fn canonical_writable_trees(config: &SandboxConfig) -> Vec<(PathBuf, &'static str)> {
+    writable_trees(config)
+        .into_iter()
+        .map(|(t, why)| (std::fs::canonicalize(&t).unwrap_or(t), why))
+        .collect()
+}
+
+/// The dotfiles `targets` that sit inside a writable tree, with that tree's
+/// description (#524). On Linux these are read-only only under Bubblewrap and
+/// the caller warns when it is absent; on macOS one the profile cannot name is
+/// refused at launch.
+fn home_config_targets_in_writable_trees(
+    config: &SandboxConfig,
+    targets: Vec<PathBuf>,
+) -> Vec<(PathBuf, &'static str)> {
+    let trees = canonical_writable_trees(config);
+    targets
         .into_iter()
         .filter_map(|t| {
             let (_, why) = trees.iter().find(|(tree, _)| t.starts_with(tree))?;
             Some((t, *why))
         })
         .collect()
+}
+
+/// The directories above each dotfiles target that must keep their names
+/// (#524): a deny or read-only bind on the target holds only while its path
+/// still leads to it, and `mv dotfiles d2 && mkdir dotfiles` would leave
+/// `~/.gitconfig` resolving to a fresh, writable file.
+///
+/// Only the directories strictly inside the outermost writable tree holding
+/// the target are returned — those are the ones the agent can rename. That
+/// tree's root is left out, and so is everything above it. Moving the root
+/// away is harmless: recreating it needs write on its parent, and that parent
+/// lies in no writable tree (if it did, that tree would hold the target and be
+/// the outermost one). So the link dangles at a path the agent cannot create.
+/// Pinning the root would instead stop the user moving or deleting their own
+/// project, `--repo-dir` root or `allow.write` grant inside the sandbox.
+fn home_config_target_pins(config: &SandboxConfig, targets: &[PathBuf]) -> Vec<PathBuf> {
+    let trees: Vec<PathBuf> = canonical_writable_trees(config)
+        .into_iter()
+        // Bubblewrap gives the sandbox a private `/tmp` and `/dev/shm`, so
+        // nothing of the host's is reachable there, and a self-bind pin would
+        // be what exposed it.
+        .filter(|(t, why)| {
+            cfg!(target_os = "macos") || (*why != TEMP_DIR_SOURCE && t != Path::new("/dev/shm"))
+        })
+        .map(|(t, _)| t)
+        .collect();
+    let mut pins = Vec::new();
+    for target in targets {
+        let Some(root) = trees
+            .iter()
+            .filter(|r| target.starts_with(r))
+            .min_by_key(|r| r.components().count())
+        else {
+            continue;
+        };
+        pins.extend(
+            target
+                .ancestors()
+                .skip(1)
+                .take_while(|a| a.starts_with(root) && a != root)
+                .map(Path::to_path_buf),
+        );
+    }
+    pins
 }
 
 /// Every tree the sandbox makes writable, paired with a name for the error.
@@ -927,20 +983,11 @@ fn pin_paths(
     );
     // #524: the read-only bind on a dotfiles target pins its content, not
     // its name — `mv git git.old && mkdir git` would leave `~/.gitconfig`
-    // resolving to a fresh, writable file. Pin every directory between the
-    // writable root and the target. The root is not pinned, as above.
-    let (roots, _) = git_roots(config, extra_git_dirs);
-    for target in home_config_link_targets(config.home_dir) {
-        for root in roots.iter().filter(|r| target.starts_with(r)) {
-            pins.extend(
-                target
-                    .ancestors()
-                    .skip(1)
-                    .take_while(|a| a != root)
-                    .map(Path::to_path_buf),
-            );
-        }
-    }
+    // resolving to a fresh, writable file. Same set as the macOS unlink denies.
+    pins.extend(home_config_target_pins(
+        config,
+        &home_config_link_targets(config.home_dir),
+    ));
     pins.sort();
     pins.dedup();
     pins
@@ -1187,7 +1234,9 @@ fn prepare_impl(
     // alone leaves it writable through the tree it sits in. Say so rather
     // than let SECURITY.md's "read-only" stand for this run.
     if bwrap_wrapper.is_none() {
-        for (target, tree) in home_config_targets_in_writable_trees(config) {
+        for (target, tree) in
+            home_config_targets_in_writable_trees(config, home_config_link_targets(config.home_dir))
+        {
             ui::warn(&format!(
                 "{} is the target of a home Git config symlink and sits inside {tree}. \
                  cplt keeps that config read-only only with Bubblewrap, which is not active, \
@@ -1317,6 +1366,18 @@ fn validate_config_paths(config: &SandboxConfig) -> Result<(), String> {
         policy::validate_sbpl_path(dir).map_err(|e| format!("Named repository .git dir: {e}"))?;
     }
     policy::validate_sbpl_path(config.home_dir).map_err(|e| format!("Home dir: {e}"))?;
+    // #524: the profile keeps a dotfiles target read-only only with a rule
+    // naming it. One the profile cannot name inside a writable tree would stay
+    // writable, so refuse, as for every other path here. Outside a writable
+    // tree nothing grants the write, so the missing rule costs nothing.
+    let targets = policy::home_config_link_targets(config.home_dir)
+        .into_iter()
+        .chain(policy::xdg_git_link_targets(config.home_dir))
+        .collect();
+    for (target, _) in home_config_targets_in_writable_trees(config, targets) {
+        policy::validate_sbpl_path(&target)
+            .map_err(|e| format!("Home Git config symlink target: {e}"))?;
+    }
 
     if let Some(dir) = config.copilot_install_dir {
         policy::validate_sbpl_path(dir).map_err(|e| format!("Copilot install dir: {e}"))?;
@@ -1713,14 +1774,15 @@ mod tests {
         let mut config = test_config(&home, &[]);
         config.project_dir = &project;
         assert_eq!(
-            super::home_config_targets_in_writable_trees(&config),
+            super::home_config_targets_in_writable_trees(&config, home_config_link_targets(&home)),
             vec![(target, "the project directory")]
         );
 
         // The tempdir is itself under a system temp dir, which is a writable
         // tree too, so only the project attribution can be checked here.
         config.project_dir = Path::new("/elsewhere");
-        let found = super::home_config_targets_in_writable_trees(&config);
+        let found =
+            super::home_config_targets_in_writable_trees(&config, home_config_link_targets(&home));
         assert!(
             found.iter().all(|(_, why)| *why != "the project directory"),
             "{found:?}"
@@ -1744,6 +1806,65 @@ mod tests {
             "dotfiles dir missing from {pins:?}"
         );
         assert!(!pins.contains(&project), "the root is not pinned: {pins:?}");
+
+        // Any writable tree counts, not only the project and grants: here the
+        // writable `~/.cache` tool dir.
+        let cached = home.join(".cache/dots/local");
+        std::fs::create_dir_all(cached.parent().unwrap()).expect("mkdir cache dots");
+        std::fs::write(&cached, "").expect("write cached");
+        std::os::unix::fs::symlink(&cached, home.join(".gitconfig.local")).expect("symlink");
+        let pins = super::pin_paths(&config, &[], &[]);
+        assert!(
+            pins.contains(&home.join(".cache/dots")),
+            "cache dots dir missing from {pins:?}"
+        );
+        assert!(!pins.contains(&home.join(".cache")), "{pins:?}");
+    }
+
+    /// A target the profile cannot name inside a writable tree would get no
+    /// deny and stay writable, so launch is refused, as for every other path
+    /// the profile interpolates.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unnameable_home_config_target_in_the_project_is_refused() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let home = root.join("home");
+        let project = root.join("project");
+        let target = project.join("dot(files)/gitconfig");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        std::fs::create_dir_all(target.parent().unwrap()).expect("mkdir dotfiles");
+        std::fs::write(&target, "").expect("write target");
+        std::os::unix::fs::symlink(&target, home.join(".gitconfig")).expect("symlink");
+        let mut config = test_config(&home, &[]);
+        config.project_dir = &project;
+        let err = super::validate_config_paths(&config).expect_err("must refuse");
+        assert!(err.contains("Home Git config symlink target"), "{err}");
+    }
+
+    /// Only a real link counts. A `$HOME` reached through a symlinked parent
+    /// (`/var/folders` on macOS, `/home -> /var/home`) canonicalizes elsewhere
+    /// without any of its files being links; a symlinked directory inside
+    /// `$HOME` does make its files links.
+    #[test]
+    fn home_config_link_targets_needs_a_link_inside_home() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let real_home = root.join("real/home");
+        std::fs::create_dir_all(&real_home).expect("mkdir home");
+        std::fs::write(real_home.join(".gitconfig"), "").expect("write gitconfig");
+        std::os::unix::fs::symlink(root.join("real"), root.join("alias")).expect("symlink");
+        let home = root.join("alias/home");
+        assert_eq!(home_config_link_targets(&home), Vec::<PathBuf>::new());
+
+        let dots = root.join("dots");
+        std::fs::create_dir_all(dots.join("git")).expect("mkdir dots");
+        std::fs::write(dots.join("git/config"), "").expect("write config");
+        std::os::unix::fs::symlink(&dots, real_home.join(".config")).expect("symlink");
+        assert_eq!(
+            home_config_link_targets(&home),
+            vec![dots.join("git/config")]
+        );
     }
 
     /// The agent's own `host_persistence_denies` must reach the overlay too.

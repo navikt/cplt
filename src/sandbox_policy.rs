@@ -1818,9 +1818,46 @@ pub fn home_config_link_targets(home: &Path) -> Vec<PathBuf> {
         .iter()
         .filter_map(|rel| {
             let named = home.join(rel);
-            std::fs::canonicalize(&named).ok().filter(|t| *t != named)
+            if !links_inside_home(home, &named) {
+                return None;
+            }
+            std::fs::canonicalize(&named).ok()
         })
         .collect()
+}
+
+/// `ignore` and `attributes` beside `~/.config/git/config`, for the macOS
+/// write denies. Git reads `~/.config/git/ignore` as the default
+/// `core.excludesFile`, so when `~/.config/git` links into a writable tree the
+/// file there hides paths from `git status`. Unlike
+/// [`home_config_link_targets`], a missing file still resolves (through its
+/// directory), because the agent could otherwise create it.
+pub fn xdg_git_link_targets(home: &Path) -> Vec<PathBuf> {
+    let dir = home.join(".config/git");
+    ["ignore", "attributes"]
+        .iter()
+        .filter_map(|f| {
+            let named = dir.join(f);
+            if !links_inside_home(home, &named) {
+                return None;
+            }
+            std::fs::canonicalize(&named)
+                .or_else(|_| std::fs::canonicalize(&dir).map(|d| d.join(f)))
+                .ok()
+        })
+        .collect()
+}
+
+/// Whether `named`, or a directory between it and `home`, is a symlink.
+///
+/// Comparing `canonicalize(named)` with `named` would also flag a `$HOME` that
+/// is only spelled non-canonically (`/var/folders/…` on macOS, `/home ->
+/// /var/home` on Fedora Atomic) and treat every file in it as a link.
+fn links_inside_home(home: &Path, named: &Path) -> bool {
+    named
+        .ancestors()
+        .take_while(|a| *a != home)
+        .any(|a| a.symlink_metadata().is_ok_and(|m| m.is_symlink()))
 }
 
 /// Copilot's two package directories, which must be re-bound read-only by

@@ -961,56 +961,95 @@ fn profile_follows_symlinked_home_git_config() {
     );
 }
 
-/// #524: the read grant follows the link, so the write deny must too. With the
-/// dotfiles repo as the project and its parent also under `allow.write`, the
-/// target is writable through both grants unless a deny naming the target
-/// comes after each of them (SBPL is last-match-wins). The directory above the
-/// target must keep its name, or `mv dotfiles d2 && mkdir dotfiles` walks
-/// around the literal.
+/// #524: the read grant follows the link, so the write deny must too. Each
+/// target sits in a different writable tree — the project (and an
+/// `allow.write` grant inside it), a `--repo-dir` root, an `allow.write` root —
+/// and is writable through it unless a deny naming the target comes after the
+/// grant (SBPL is last-match-wins). The directory above each target must keep
+/// its name, or `mv dotfiles d2 && mkdir dotfiles` walks around the literal.
+/// The writable roots themselves, and everything above, stay movable.
 #[test]
 fn profile_denies_writes_at_a_symlinked_home_git_config_target() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    // Not under the system temp dir: that is a writable tree too, and would
+    // be the outermost one holding every target here.
+    let tmp = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("tempdir");
     let root = std::fs::canonicalize(tmp.path()).expect("canonicalize");
     let home_dir = root.join("home");
     let project = root.join("project");
-    let target = project.join("dotfiles/gitconfig");
-    std::fs::create_dir_all(&home_dir).expect("mkdir home");
-    std::fs::create_dir_all(target.parent().unwrap()).expect("mkdir dotfiles");
-    std::fs::write(&target, "[user]\n\tname = cplt\n").expect("write target");
-    std::os::unix::fs::symlink(&target, home_dir.join(".gitconfig")).expect("symlink");
-    let extra_write = [project.join("dotfiles")];
+    let named = root.join("named");
+    let other = root.join("other");
+    let links = [
+        (".gitconfig", project.join("dotfiles/gitconfig")),
+        (".gitconfig.local", named.join("dots/local")),
+        (".gitignore_global", other.join("dots/ignore")),
+    ];
+    std::fs::create_dir_all(home_dir.join(".config")).expect("mkdir home");
+    for (name, target) in &links {
+        std::fs::create_dir_all(target.parent().unwrap()).expect("mkdir target dir");
+        std::fs::write(target, "[user]\n\tname = cplt\n").expect("write target");
+        std::os::unix::fs::symlink(target, home_dir.join(name)).expect("symlink");
+    }
+    // `~/.config/git` itself links into the project, with no files in it yet.
+    let xdg = project.join("xdg-git");
+    std::fs::create_dir_all(&xdg).expect("mkdir xdg");
+    std::os::unix::fs::symlink(&xdg, home_dir.join(".config/git")).expect("symlink");
+    let named_roots = [named.clone()];
+    let extra_write = [other.clone(), project.join("dotfiles")];
 
     let p = generate_profile(
         &SandboxConfig {
             home_dir: &home_dir,
             project_dir: &project,
+            named_roots: &named_roots,
             extra_write: &extra_write,
             ..base_profile_options()
         },
         &[],
     );
 
-    let deny = format!("(deny file-write* (literal \"{}\"))", target.display());
-    let deny_at = p
-        .rfind(&deny)
-        .unwrap_or_else(|| panic!("no write deny at the link target:\n{p}"));
-    for grant in [&project, &extra_write[0]] {
-        let allow = format!("(allow file-write* (subpath \"{}\"))", grant.display());
-        let allow_at = p
-            .rfind(&allow)
-            .unwrap_or_else(|| panic!("{allow} missing:\n{p}"));
+    let last_grant = [&project, &named, &other, &extra_write[1]]
+        .iter()
+        .map(|g| {
+            let allow = format!("(allow file-write* (subpath \"{}\"))", g.display());
+            p.rfind(&allow)
+                .unwrap_or_else(|| panic!("{allow} missing:\n{p}"))
+        })
+        .max()
+        .unwrap();
+    let targets = links
+        .iter()
+        .map(|(_, t)| t.clone())
+        .chain([xdg.join("ignore"), xdg.join("attributes")]);
+    for target in targets {
+        let deny = format!("(deny file-write* (literal \"{}\"))", target.display());
+        let deny_at = p
+            .rfind(&deny)
+            .unwrap_or_else(|| panic!("no write deny at {}:\n{p}", target.display()));
         assert!(
-            deny_at > allow_at,
-            "the target deny must follow {allow} (last-match-wins):\n{p}"
+            deny_at > last_grant,
+            "{deny} must follow every write grant (last-match-wins):\n{p}"
         );
     }
-    assert!(
-        p.contains(&format!(
-            "(deny file-write-unlink (literal \"{}\"))",
-            extra_write[0].display()
-        )),
-        "the directory holding the target must not be renamable:\n{p}"
-    );
+    let unlink = |d: &Path| format!("(deny file-write-unlink (literal \"{}\"))", d.display());
+    for dir in [
+        project.join("dotfiles"),
+        named.join("dots"),
+        other.join("dots"),
+        xdg.clone(),
+    ] {
+        assert!(
+            p.contains(&unlink(&dir)),
+            "{} holds a target and must not be renamable:\n{p}",
+            dir.display()
+        );
+    }
+    for dir in [&project, &named, &other, &root] {
+        assert!(
+            !p.contains(&unlink(dir)),
+            "{} is a writable root or above one and must stay movable:\n{p}",
+            dir.display()
+        );
+    }
 }
 
 /// The overwhelmingly common case: no `~/.gitconfig` at all. `canonicalize`
