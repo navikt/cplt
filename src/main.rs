@@ -1204,12 +1204,35 @@ const LABEL_ALLOW_APPROVED: &str = "(approved)";
 const LABEL_ALLOW_PENDING: &str = "(pending approval)";
 const STATUS_APPROVED: &str = "✓ approved";
 const STATUS_PENDING: &str = "○ pending";
-/// Said by the launch and by `cplt trust` about an approval whose proposal is
-/// gone (#560). "Changed" was wrong there: it sent the user to `trust accept`,
-/// which then found nothing to approve.
-const APPROVAL_OUTLIVED: &str =
-    "Approval on file for a .cplt.toml proposal that no longer exists. It grants nothing.";
-const APPROVAL_OUTLIVED_HINT: &str = "Run `cplt trust accept` to remove it.";
+/// Said by the launch and by `cplt trust` about an approval this checkout's
+/// `.cplt.toml` no longer asks for (#560): the status, then the way out.
+/// "Changed" was wrong there: it sent the user to `trust accept`, which then
+/// found nothing to approve.
+///
+/// "This checkout", never "the proposal is gone": approvals match per
+/// repository (#527), so a worktree on a branch that proposes nothing sees the
+/// entry the main checkout still uses. Linked roots are named, because the
+/// approval still grants them through `sandbox.repo_dirs`.
+fn approval_outlived(linked: &[trust::LinkedRepo]) -> (String, &'static str) {
+    const BASE: &str =
+        "Approval on file, but this checkout's .cplt.toml proposes nothing that needs approval.";
+    if linked.is_empty() {
+        (
+            format!("{BASE} It grants nothing here."),
+            "`cplt trust accept --all` removes it, for every worktree of this repository.",
+        )
+    } else {
+        let roots: Vec<&str> = linked.iter().map(|r| r.path.as_str()).collect();
+        (
+            format!(
+                "{BASE} The repositories it linked are still granted (read+write+exec): {}.",
+                roots.join(", ")
+            ),
+            "`cplt trust revoke --all` removes it and unlinks them, for every worktree of this \
+             repository.",
+        )
+    }
+}
 
 fn source_label(source: repo_config::RepoConfigSource) -> &'static str {
     match source {
@@ -2247,10 +2270,21 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                             } else {
                                 t.repo.path.clone()
                             };
+                            // Nothing proposed: there is nothing to re-approve,
+                            // and pointing at accept would repeat #560.
+                            let hint = if !nothing_proposed {
+                                " Re-approve with `cplt trust accept`."
+                            } else if status != trust::ApprovalStatus::Current
+                                && trust::approval_is_orphaned(&t)
+                            {
+                                " `cplt trust accept --all` removes it."
+                            } else {
+                                ""
+                            };
                             ui::warn(&format!(
                                 ".cplt.toml for this remote was approved in a different \
                                  repository ({where_approved}), so cplt is not auto-trusting \
-                                 it here. Re-approve with `cplt trust accept`.",
+                                 it here.{hint}",
                             ));
                         }
                         Vec::new()
@@ -2269,7 +2303,8 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                     } else {
                         if !resolved.quiet {
                             if status == trust::ApprovalStatus::Outlived {
-                                ui::warn(&format!("{APPROVAL_OUTLIVED} {APPROVAL_OUTLIVED_HINT}"));
+                                let (msg, hint) = approval_outlived(&t.accepted.linked);
+                                ui::warn(&format!("{msg} {hint}"));
                             } else {
                                 ui::warn(
                                     ".cplt.toml permissions changed since the last approval. Re-approve with `cplt trust accept`",
@@ -8095,11 +8130,14 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
         );
 
         if outlived {
-            println!("{blue}[cplt]{nc}  {yellow}⚠ {APPROVAL_OUTLIVED}{nc}");
+            let (msg, hint) = approval_outlived(&entry.accepted.linked);
+            println!("{blue}[cplt]{nc}  {yellow}⚠ {msg}{nc}");
             if blocked.is_none() {
-                println!("{blue}[cplt]{nc}  {yellow}  {APPROVAL_OUTLIVED_HINT}{nc}");
+                println!("{blue}[cplt]{nc}  {yellow}  {hint}{nc}");
             }
-        } else if hash_mismatch {
+        } else if hash_mismatch && (!proposed.is_empty() || loaded.propose_dropped) {
+            // A foreign entry in front of a checkout that proposes nothing has
+            // nothing to re-approve (#560); the line below says what it is.
             println!("{blue}[cplt]{nc}  {red}⚠ Permissions have changed since last approval!{nc}");
             if blocked.is_none() {
                 println!(
@@ -8120,10 +8158,21 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
                     &entry.repo.path
                 }
             );
-            if blocked.is_none() {
+            // Nothing proposed: nothing to approve, so no accept to point at
+            // (#560) — except to retire an entry whose repository is gone.
+            if blocked.is_none() && !proposed.is_empty() {
                 println!(
                     "{blue}[cplt]{nc}  {red}  Run `cplt trust accept` to approve this repository.{nc}"
                 );
+            } else if blocked.is_none()
+                && !loaded.propose_dropped
+                && trust::approval_is_orphaned(entry)
+                && trust::approval_is_stale(
+                    &entry.accepted.content_hash,
+                    &trust::proposal_content_hash(&loaded.config.propose),
+                )
+            {
+                println!("{blue}[cplt]{nc}  {red}  `cplt trust accept --all` removes it.{nc}");
             }
         }
     } else if has_pending && blocked.is_none() {
@@ -8290,20 +8339,40 @@ fn unlink_approved_repos(project_dir: &Path, linked: &[trust::LinkedRepo]) {
 /// Retiring only narrows: the entry already applied no key, because its hash
 /// cannot match an empty proposal (see `trust::approval_status`).
 ///
-/// Only an entry granted at this repository. A foreign one is not this
-/// checkout's to change, and the launch names it for what it is.
+/// Only with `--all`. Approvals match per repository (#527), so this checkout
+/// may be a worktree on a branch that proposes nothing while the main checkout
+/// still uses the entry. Retiring it is a choice about every worktree, and a
+/// plain `accept` only says what `--all` would do.
+///
+/// Only an entry granted at this repository, or a foreign one whose repository
+/// is gone (`approval_is_orphaned`) — the same takeover rule `trust_accept`
+/// applies. A live foreign entry is not this checkout's to change.
 fn trust_accept_nothing_proposed(
     project_dir: &std::path::Path,
+    loaded: &repo_config::LoadedRepoConfig,
     stored: Option<trust::TrustEntry>,
     current_hash: &str,
+    all: bool,
 ) -> ExitCode {
     let Some(entry) = stored.filter(|t| {
-        trust::approved_path_matches(t, project_dir)
+        !loaded.propose_dropped
+            && (trust::approved_path_matches(t, project_dir) || trust::approval_is_orphaned(t))
             && trust::approval_status(t, current_hash, true) == trust::ApprovalStatus::Outlived
     }) else {
         ui::info("No permissions requested in .cplt.toml, nothing to approve.");
         return ExitCode::SUCCESS;
     };
+    if !all {
+        ui::info(
+            "This checkout's .cplt.toml proposes nothing that needs approval, but an approval \
+             is on file for this repository.",
+        );
+        println!(
+            "  `cplt trust accept --all` removes it for every worktree of this repository, \
+             including checkouts on a branch that still proposes it."
+        );
+        return ExitCode::SUCCESS;
+    }
     let linked = entry.accepted.linked.len();
     let result = match trust::retire_outlived(entry, current_hash) {
         None => trust::revoke_trust(project_dir),
@@ -8314,16 +8383,15 @@ fn trust_accept_nothing_proposed(
         return ExitCode::FAILURE;
     }
     println!(
-        "{}✓{} Removed the approval for a .cplt.toml proposal that no longer exists. \
-         Nothing is requested now.",
+        "{}✓{} Removed the approval for every worktree of this repository: this checkout's \
+         .cplt.toml proposes nothing that needs approval.",
         ui::stdout_color(ui::GREEN),
         ui::stdout_color(ui::RESET)
     );
     if linked > 0 {
         println!(
-            "  It linked {linked} repositor{}; those are left in place. \
-             `cplt trust revoke --all` unlinks them.",
-            if linked == 1 { "y" } else { "ies" }
+            "  Repositories it linked stay linked ({linked}). `cplt trust revoke repos` \
+             unlinks them."
         );
     }
     ExitCode::SUCCESS
@@ -8357,7 +8425,7 @@ fn trust_accept(
     let stored = trust::load_trust(project_dir);
 
     if proposed.is_empty() {
-        return trust_accept_nothing_proposed(project_dir, stored, &current_hash);
+        return trust_accept_nothing_proposed(project_dir, loaded, stored, &current_hash, all);
     }
 
     // Finding 4, write side: the trust file is keyed on the git origin URL alone,
@@ -8692,7 +8760,10 @@ fn trust_revoke(
 
     // Validate keys
     for key in keys {
-        if !proposed.contains(&key.as_str()) && !entry.accepted.keys.contains(key) {
+        if !proposed.contains(&key.as_str())
+            && !entry.accepted.keys.contains(key)
+            && (key != "repos" || entry.accepted.linked.is_empty())
+        {
             ui::warn(&format!(
                 "Key {key:?} is not in permissions or trust store."
             ));
@@ -8704,7 +8775,11 @@ fn trust_revoke(
     entry.accepted.keys.retain(|k| !keys.contains(k));
     let removed = before_len - entry.accepted.keys.len();
 
-    if removed == 0 {
+    // `repos` acts on the linked record even when no key matched: an entry
+    // retired by `trust accept` (#560) keeps its linked roots and no keys, and
+    // `cplt trust` points here for them.
+    let unlink = keys.iter().any(|k| k == "repos") && !entry.accepted.linked.is_empty();
+    if removed == 0 && !unlink {
         ui::info("No matching keys found to revoke.");
         return ExitCode::SUCCESS;
     }
@@ -8712,12 +8787,12 @@ fn trust_revoke(
     // After the early return, never before it: unlinking and then returning
     // without saving leaves the roots gone from the config and still recorded
     // as linked, so the next `trust accept` puts them back (#496 review).
-    if keys.iter().any(|k| k == "repos") {
+    if unlink {
         unlink_approved_repos(project_dir, &std::mem::take(&mut entry.accepted.linked));
     }
 
-    if entry.accepted.keys.is_empty() {
-        // No keys left — remove the file entirely
+    if entry.accepted.keys.is_empty() && entry.accepted.linked.is_empty() {
+        // Nothing left — remove the file entirely
         if let Err(e) = trust::revoke_trust(project_dir) {
             ui::error(&format!("Failed to remove trust file: {e}"));
             return ExitCode::FAILURE;
@@ -8730,8 +8805,13 @@ fn trust_revoke(
         }
     }
 
+    let what = if removed == 0 {
+        "Unlinked the repositories this approval linked.".to_string()
+    } else {
+        format!("Revoked {removed} key(s).")
+    };
     println!(
-        "{}✓{} Revoked {removed} key(s).",
+        "{}✓{} {what}",
         ui::stdout_color(ui::GREEN),
         ui::stdout_color(ui::RESET)
     );
