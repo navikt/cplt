@@ -397,15 +397,23 @@ fn deepest(path: &Path, hops: &mut u32) -> PathBuf {
     let mut cur = path;
     loop {
         if let Ok(base) = cur.canonicalize() {
-            return tail.iter().rev().fold(base, |acc, part| acc.join(part));
-        }
-        if *hops > 0
-            && let (Ok(link), Some(parent)) = (std::fs::read_link(cur), cur.parent())
-        {
+            // Only the first missing name can be a dangling link: everything
+            // below it sits under a name that does not exist. One `readlink`
+            // there, not one per level — each lookup of a missing name under
+            // an automounted `/home` costs tens of milliseconds on macOS.
+            let link = match tail.split_last() {
+                Some((first, rest)) if *hops > 0 => {
+                    std::fs::read_link(base.join(first)).ok().map(|l| (l, rest))
+                }
+                _ => None,
+            };
+            let Some((link, rest)) = link else {
+                return tail.iter().rev().fold(base, |acc, part| acc.join(part));
+            };
             *hops -= 1;
             // `..` in the link steps up from the resolved parent, POSIX order,
             // as in `fully_resolved`.
-            let mut out = deepest(parent, hops);
+            let mut out = base;
             for c in link.components() {
                 match c {
                     Component::ParentDir => {
@@ -416,7 +424,7 @@ fn deepest(path: &Path, hops: &mut u32) -> PathBuf {
                     other => out.push(other),
                 }
             }
-            let out = tail.iter().rev().fold(out, |acc, part| acc.join(part));
+            let out = rest.iter().rev().fold(out, |acc, part| acc.join(part));
             return deepest(&out, hops);
         }
         // Nothing along the whole path resolved (only reachable if even `/`
