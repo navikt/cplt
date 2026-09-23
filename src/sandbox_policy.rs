@@ -270,16 +270,20 @@ fn overlaps_credential_entry(home: &Path, target: &Path, own: &Path) -> bool {
 
 /// Whether `path` enters the credential entry `named` (its `$HOME` spelling,
 /// parent canonical) or its resolved `entry` by one of those two names, and
-/// resolves under it with no further symlink (#551).
+/// every symlink it follows below that lies inside the entry (#551).
 ///
 /// `~/.ssh/known_hosts` and `~/dotfiles/ssh/known_hosts` do, for `~/.ssh ->
-/// ~/dotfiles/ssh`. `~/dotfiles/docs/hosts -> ../ssh/id_ed25519` does not: the
-/// hop is a link the agent can plant or repoint inside a writable tree, and
-/// the spelling that was approved names neither the entry nor the key.
+/// ~/dotfiles/ssh`, and so does `~/.kube/config -> clusters/prod.yaml`: a link
+/// inside the entry is the user's, since the entry is masked under Bubblewrap
+/// and never granted otherwise. `~/dotfiles/docs/hosts -> ../ssh/id_ed25519`
+/// does not: the hop is a link the agent can plant or repoint inside a
+/// writable tree, and the spelling that was approved names neither the entry
+/// nor the key. Neither does `~/.ssh/l` when `l` leads through such a link.
+///
+/// Links above the entry name are resolved, not vetted: see SECURITY.md.
 #[must_use]
 pub fn reaches_entry_directly(path: &Path, named: &Path, entry: &Path) -> bool {
     let canon = config::canonicalize_deepest;
-    let resolved = canon(path);
     path.ancestors().any(|a| {
         let (Some(parent), Some(name)) = (a.parent(), a.file_name()) else {
             return false;
@@ -288,8 +292,41 @@ pub fn reaches_entry_directly(path: &Path, named: &Path, entry: &Path) -> bool {
         (at == named || at == entry)
             && path
                 .strip_prefix(a)
-                .is_ok_and(|rest| entry.join(rest) == resolved)
+                .is_ok_and(|rest| links_stay_inside(rest, named, entry))
     })
+}
+
+/// Whether walking `rest` from `entry` follows only symlinks that lie inside
+/// `entry`, or the entry's own `named` link. A missing component ends the
+/// lookups; the rest is lexical, as in [`config::canonicalize_deepest`].
+fn links_stay_inside(rest: &Path, named: &Path, entry: &Path) -> bool {
+    use std::path::Component;
+    let mut cur = entry.to_path_buf();
+    let mut todo: Vec<PathBuf> = rest.iter().rev().map(PathBuf::from).collect();
+    let mut hops = 0;
+    while let Some(part) = todo.pop() {
+        match part.components().next() {
+            Some(Component::RootDir) => cur = PathBuf::from("/"),
+            Some(Component::ParentDir) => {
+                cur.pop();
+            }
+            Some(Component::Normal(n)) => {
+                let next = cur.join(n);
+                let Ok(target) = std::fs::read_link(&next) else {
+                    cur = next;
+                    continue;
+                };
+                // Past the kernel's own limit (40 on Linux) is refused, not walked.
+                hops += 1;
+                if !(next.starts_with(entry) || next == named) || hops > 40 {
+                    return false;
+                }
+                todo.extend(target.iter().rev().map(PathBuf::from));
+            }
+            _ => {}
+        }
+    }
+    true
 }
 
 /// Every credential entry as `(rel, named, entry)`: the list entry, its
@@ -3272,6 +3309,55 @@ mod tests {
             "dotfiles/docs",
         ] {
             assert_eq!(credential_link_hop(&home, &home.join(ok)), None, "{ok}");
+        }
+    }
+
+    /// #551 review: a link inside the credential entry is the user's (the
+    /// agent cannot write there), so the per-file route through it stands:
+    /// `~/.kube/config -> clusters/prod.yaml`, `~/.aws/credentials ->
+    /// creds/work`, and the same inside a linked `~/.ssh`. A link inside the
+    /// entry that leads on through a planted link outside it does not.
+    #[test]
+    fn an_allow_path_following_a_link_inside_the_credential_is_kept() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        let ssh = home.join("dotfiles/ssh");
+        for d in [
+            ".kube/clusters",
+            ".aws/creds",
+            "dotfiles/ssh/conf.d",
+            "dotfiles/docs",
+        ] {
+            std::fs::create_dir_all(home.join(d)).unwrap();
+        }
+        std::fs::write(home.join(".kube/clusters/prod.yaml"), "k").unwrap();
+        std::fs::write(home.join(".aws/creds/work"), "a").unwrap();
+        std::fs::write(ssh.join("conf.d/work"), "c").unwrap();
+        std::fs::write(ssh.join("id_ed25519"), "key").unwrap();
+        symlink("clusters/prod.yaml", home.join(".kube/config")).unwrap();
+        symlink("creds/work", home.join(".aws/credentials")).unwrap();
+        symlink(&ssh, home.join(".ssh")).unwrap();
+        symlink("conf.d/work", ssh.join("config")).unwrap();
+        // Absolute, back in through the entry's own `~/.ssh` link.
+        symlink(home.join(".ssh/conf.d/work"), ssh.join("abs")).unwrap();
+        symlink("../ssh/id_ed25519", home.join("dotfiles/docs/hosts")).unwrap();
+        symlink("../docs/hosts", ssh.join("out")).unwrap();
+
+        for ok in [
+            ".kube/config",
+            ".aws/credentials",
+            ".ssh/config",
+            "dotfiles/ssh/config",
+            ".ssh/abs",
+        ] {
+            assert_eq!(credential_link_hop(&home, &home.join(ok)), None, "{ok}");
+        }
+        for bad in [".ssh/out", "dotfiles/ssh/out"] {
+            assert!(
+                credential_link_hop(&home, &home.join(bad)).is_some(),
+                "{bad} leaves the entry through a planted link"
+            );
         }
     }
 

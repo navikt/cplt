@@ -418,7 +418,7 @@ pub struct CredentialLink {
 /// Left out: an entry that resolves to its own `$HOME` spelling (no link), a
 /// target that does not exist (nothing to mask), and one a rule grants on
 /// purpose: `--allow-docker`'s `~/.docker`, a user `allow.read` naming the
-/// resolved file with no symlink of its own in between
+/// resolved file with no symlink outside the entry in between
 /// ([`policy::reaches_entry_directly`]), or a `DENIED_HOME_SUBPATHS` file that
 /// resolves inside its own granted tool dir, which is the documented Landlock
 /// limit whether linked or not. One that links out of that dir is masked: the

@@ -465,7 +465,8 @@ pub(crate) fn build_bwrap_args(
     // creates the mount point inside the tmpfs.
     //
     // Only a rule that enters the credential dir by its own name or its
-    // resolved one, with no symlink below that ([`reaches_entry_directly`]):
+    // resolved one, and follows no symlink outside it below that
+    // ([`reaches_entry_directly`]; `config -> conf.d/work` inside is fine):
     // a link the agent planted in a writable tree must not carry a grant
     // onto the key. User allow paths arrive canonical; the loader refused
     // any whose spelling took such a hop (`credential_link_hop`). Never
@@ -3039,7 +3040,10 @@ mod tests {
     /// #551 review: only a rule that enters the masked dir by `~/.ssh` or by
     /// its resolved name is bound back. A link planted in the writable tree
     /// (`docs/hosts -> ../ssh/id_ed25519`) is not, and neither does one onto a
-    /// linked `~/.npmrc` lift that file's mask.
+    /// linked `~/.npmrc` lift that file's mask. A link inside the entry
+    /// (`config -> conf.d/work`) is the user's and is bound back at its
+    /// target; one there that leads on through the planted link (`out ->
+    /// ../docs/hosts`) is not.
     #[test]
     fn a_rule_reaching_a_credential_through_a_planted_link_is_not_bound_back() {
         use std::os::unix::fs::symlink;
@@ -3056,11 +3060,17 @@ mod tests {
         symlink(dotfiles.join("npmrc"), home.join(".npmrc")).unwrap();
         symlink("../ssh/id_ed25519", dotfiles.join("docs/hosts")).unwrap();
         symlink("../npmrc", dotfiles.join("docs/npmrc")).unwrap();
+        std::fs::create_dir_all(ssh.join("conf.d")).unwrap();
+        std::fs::write(ssh.join("conf.d/work"), "c").unwrap();
+        symlink("conf.d/work", ssh.join("config")).unwrap();
+        symlink("../docs/hosts", ssh.join("out")).unwrap();
         let rules = [
             writable_rule(&dotfiles.to_string_lossy()),
             read_rule(&dotfiles.join("docs/hosts")),
             read_rule(&dotfiles.join("docs/npmrc")),
             read_rule(&home.join(".ssh/known_hosts")),
+            read_rule(&home.join(".ssh/config")),
+            read_rule(&home.join(".ssh/out")),
         ];
 
         let links = crate::sandbox::landlock_mod::credential_links(&home, &rules);
@@ -3075,6 +3085,11 @@ mod tests {
         assert!(
             args.windows(3).any(|w| w == ["--ro-bind", &kh, &kh]),
             "~/.ssh/known_hosts is spelled through the entry and is bound back: {args:?}"
+        );
+        let work = ssh.join("conf.d/work").to_string_lossy().into_owned();
+        assert!(
+            args.windows(3).any(|w| w == ["--ro-bind", &work, &work]),
+            "~/.ssh/config -> conf.d/work stays inside the entry and is bound back: {args:?}"
         );
         assert!(
             !args.iter().any(|a| a.ends_with("id_ed25519")),
