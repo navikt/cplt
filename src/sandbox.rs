@@ -638,6 +638,73 @@ fn home_config_target_pins(config: &SandboxConfig, targets: &[PathBuf]) -> Vec<P
     pins
 }
 
+/// Create, empty, the home Git config files a link points at inside a
+/// writable tree but that do not exist yet (#553), and return what was made.
+///
+/// Bubblewrap cannot bind a file that does not exist, so without this the
+/// agent could create `config` behind a linked `~/.config/git` (or the target
+/// of a dangling `~/.gitconfig`) and set `core.fsmonitor` for the host's next
+/// git command. Once the file exists, `home_config_link_targets` resolves it
+/// and it gets the same read-only bind and rename pins as any other target.
+/// An empty config, ignore or attributes file means the same to git as a
+/// missing one.
+///
+/// Only called when Bubblewrap is going to wrap the run: without it no bind
+/// would hold, and the launch warning names these paths instead. A failure
+/// is a warning, not a refusal, and leaves that file as unprotected as before.
+#[cfg(any(target_os = "linux", test))]
+fn create_missing_home_config_targets(config: &SandboxConfig) -> Vec<PathBuf> {
+    let trees = canonical_writable_trees(config);
+    let mut created = Vec::new();
+    for (missing, file) in policy::missing_home_config_links(config.home_dir) {
+        if !trees.iter().any(|(t, _)| missing.starts_with(t)) {
+            continue;
+        }
+        match create_empty_config(&missing, &file) {
+            Ok(made) => created.extend(made),
+            Err(e) => crate::ui::warn(&format!(
+                "Could not create {} ({e}). Git on the host reads it once it exists, and \
+                 it sits in a writable tree, so the agent can create it in this run.",
+                file.display()
+            )),
+        }
+    }
+    created
+}
+
+/// Create `file` empty, and `missing` first when that is its directory.
+///
+/// Nothing outside the resolved directory: `file`'s parent is either a
+/// canonical existing directory or `missing` itself, and a chain of more than
+/// one missing directory is refused. `create_new` is `O_CREAT|O_EXCL`, which
+/// never follows a symlink at the leaf, and `O_NOFOLLOW` says so explicitly.
+#[cfg(any(target_os = "linux", test))]
+fn create_empty_config(missing: &Path, file: &Path) -> std::io::Result<Vec<PathBuf>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut made = Vec::new();
+    if missing != file {
+        if file.parent() != Some(missing) {
+            return Err(std::io::Error::other("more than one directory is missing"));
+        }
+        match std::fs::create_dir(missing) {
+            Ok(()) => made.push(missing.to_path_buf()),
+            // An earlier file in the same directory created it.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::AlreadyExists
+                    && missing.symlink_metadata().is_ok_and(|m| m.is_dir()) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(file)?;
+    made.push(file.to_path_buf());
+    Ok(made)
+}
+
 /// Every tree the sandbox makes writable, paired with a name for the error.
 ///
 /// The `allow.write` grants include the ones `merge_tool_path_env_overrides`
@@ -1235,6 +1302,24 @@ fn prepare_impl(
         );
     }
 
+    // #553: a home Git config file a link points at inside a writable tree,
+    // but which does not exist yet, gets no bind, so the agent could create
+    // it. Create it empty first, so the read-only bind, the rename pins and
+    // the Landlock read grant below all find it. Only when Bubblewrap can
+    // wrap the run; the warning after `resolve` covers the rest.
+    if config.use_bubblewrap != Some(false) && bubblewrap::check_availability().is_some() {
+        let created = create_missing_home_config_targets(config);
+        if !created.is_empty() {
+            let list: Vec<String> = created.iter().map(|p| p.display().to_string()).collect();
+            ui::info(&format!(
+                "Created empty {} so Bubblewrap can bind it read-only: git on the host \
+                 reads it through your home Git config symlink, and it sits in a writable \
+                 tree. Empty, it changes nothing for git.",
+                list.join(", ")
+            ));
+        }
+    }
+
     let mut policy = landlock_mod::generate_policy(config);
     let mut profile_text = landlock_mod::describe_policy(&policy);
 
@@ -1346,6 +1431,20 @@ fn prepare_impl(
                  cplt keeps that config read-only only with Bubblewrap, which is not active, \
                  so the agent can edit it in this run. Install bubblewrap, or move the file \
                  out of the writable tree.",
+                target.display()
+            ));
+        }
+        // #553: one that does not exist yet can be created, with the same
+        // effect on the host's next git command.
+        for (target, tree) in home_config_targets_in_writable_trees(
+            config,
+            policy::missing_home_config_link_targets(config.home_dir),
+        ) {
+            ui::warn(&format!(
+                "{} is where a home Git config symlink points, inside {tree}, and does not \
+                 exist yet. Without Bubblewrap cplt cannot stop the agent creating it in \
+                 this run, and git on the host would read it. Install bubblewrap, or point \
+                 the link out of the writable tree.",
                 target.display()
             ));
         }
@@ -1476,7 +1575,7 @@ fn validate_config_paths(config: &SandboxConfig) -> Result<(), String> {
     // tree nothing grants the write, so the missing rule costs nothing.
     let targets = policy::home_config_link_targets(config.home_dir)
         .into_iter()
-        .chain(policy::xdg_git_link_targets(config.home_dir))
+        .chain(policy::missing_home_config_link_targets(config.home_dir))
         .collect();
     for (target, _) in home_config_targets_in_writable_trees(config, targets) {
         policy::validate_sbpl_path(&target)
@@ -2085,6 +2184,123 @@ mod tests {
         config.project_dir = &project;
         let err = super::validate_config_paths(&config).expect_err("must refuse");
         assert!(err.contains("Home Git config symlink target"), "{err}");
+    }
+
+    /// #553: a home Git config file a link points at, missing and inside a
+    /// writable tree, is created empty; one outside every writable tree is
+    /// left alone, and an existing one is not touched. Not under the system
+    /// temp dir, which is a writable tree itself.
+    #[test]
+    fn missing_home_config_targets_are_created_only_inside_a_writable_tree() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let tmp = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let home = root.join("home");
+        let project = root.join("project");
+        let xdg = project.join("xdg-git");
+        let dotfiles = project.join("dotfiles");
+        let outside = root.join("outside");
+        for d in [
+            home.join(".config"),
+            xdg.clone(),
+            dotfiles.clone(),
+            outside.clone(),
+        ] {
+            std::fs::create_dir_all(d).expect("mkdir");
+        }
+        std::fs::write(xdg.join("ignore"), "keep\n").expect("write ignore");
+        symlink(&xdg, home.join(".config/git")).expect("symlink");
+        // Dangling: the targets do not exist yet.
+        symlink(dotfiles.join("gitconfig"), home.join(".gitconfig")).expect("symlink");
+        symlink(outside.join("ignore"), home.join(".gitignore_global")).expect("symlink");
+        let mut config = test_config(&home, &[]);
+        config.project_dir = &project;
+
+        let mut created = super::create_missing_home_config_targets(&config);
+        created.sort();
+        assert_eq!(
+            created,
+            vec![
+                dotfiles.join("gitconfig"),
+                xdg.join("attributes"),
+                xdg.join("config"),
+            ]
+        );
+        for f in &created {
+            let meta = f.symlink_metadata().expect("created");
+            assert!(meta.is_file() && meta.len() == 0, "{f:?} must be empty");
+            assert_eq!(meta.permissions().mode() & 0o7133, 0, "{f:?} mode");
+        }
+        assert_eq!(
+            std::fs::read_to_string(xdg.join("ignore")).unwrap(),
+            "keep\n"
+        );
+        assert!(
+            !outside.join("ignore").exists(),
+            "outside every writable tree"
+        );
+        assert!(
+            super::create_missing_home_config_targets(&config).is_empty(),
+            "a second launch has nothing left to create"
+        );
+
+        // Once they exist, the Linux overlay binds and pins them.
+        #[cfg(target_os = "linux")]
+        {
+            let ro = super::ro_protect_paths(&config, &[], &[]);
+            let pins = super::pin_paths(&config, &[], &[]);
+            for f in &created {
+                assert!(ro.contains(f), "{f:?} missing from {ro:?}");
+            }
+            assert!(pins.contains(&xdg) && pins.contains(&dotfiles), "{pins:?}");
+        }
+    }
+
+    /// `~/.config` itself links into the project and has no `git` directory:
+    /// the directory is created, then the three files in it.
+    #[test]
+    fn missing_git_dir_under_a_linked_config_is_created_with_its_files() {
+        let tmp = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let home = root.join("home");
+        let project = root.join("project");
+        let dot_config = project.join("dot-config");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        std::fs::create_dir_all(&dot_config).expect("mkdir dot-config");
+        std::os::unix::fs::symlink(&dot_config, home.join(".config")).expect("symlink");
+        let mut config = test_config(&home, &[]);
+        config.project_dir = &project;
+
+        let mut created = super::create_missing_home_config_targets(&config);
+        created.sort();
+        let git = dot_config.join("git");
+        assert_eq!(
+            created,
+            vec![
+                git.clone(),
+                git.join("attributes"),
+                git.join("config"),
+                git.join("ignore"),
+            ]
+        );
+        assert!(git.symlink_metadata().unwrap().is_dir());
+    }
+
+    /// The creation never follows a symlink at the leaf, and never builds a
+    /// chain of directories.
+    #[test]
+    fn creating_a_missing_home_config_refuses_a_symlink_and_a_deep_chain() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let leaf = root.join("config");
+        let elsewhere = root.join("elsewhere");
+        std::os::unix::fs::symlink(&elsewhere, &leaf).expect("symlink");
+        super::create_empty_config(&leaf, &leaf).expect_err("symlink at the leaf");
+        assert!(!elsewhere.exists(), "the link target must not be created");
+
+        let deep = root.join("a/b/config");
+        super::create_empty_config(&root.join("a"), &deep).expect_err("two dirs missing");
+        assert!(!root.join("a").exists());
     }
 
     /// Only a real link counts. A `$HOME` reached through a symlinked parent
