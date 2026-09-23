@@ -462,8 +462,12 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     }
 
     // ── Home tool directories (filtered by discovery, relocated homes resolved) ──
+    // A symlinked dir needs no separate target rule: Landlock opens `path`
+    // following the link, so the rule lands on the target inode. That is also
+    // why `active_tool_dirs` drops a dir whose target is refused outright
+    // instead of just not naming the target (#523).
     let tool_dirs = policy::active_tool_dirs(home, config.existing_home_tool_dirs);
-    for policy::ResolvedToolDir { path, dir } in &tool_dirs {
+    for policy::ResolvedToolDir { path, dir, .. } in &tool_dirs {
         fs_rules.push(FsRule {
             path: path.clone(),
             access: FsAccess {

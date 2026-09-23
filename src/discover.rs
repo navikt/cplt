@@ -374,6 +374,46 @@ pub fn discover_tools(home_dir: &Path, tool_roots: &[ToolRoot]) -> ToolDiscovery
         // and the profile must permit the write that creates the directory.
         // Non-writable dirs (tool runtimes) are pruned to existing only.
         .filter(|d| d.dir.write || d.path.exists())
+        // A symlinked tool dir is granted at its target; one pointing somewhere
+        // no grant may reach is dropped, and said so, rather than failing later
+        // as if the tool were broken.
+        .filter(|d| match d.refused_target(home_dir) {
+            Some(target) => {
+                let (link, to) = (d.path.display(), target.display());
+                let unnameable = cfg!(target_os = "macos")
+                    && crate::sandbox::validate_sbpl_path(target).is_err();
+                ui::warn(&if unnameable {
+                    format!(
+                        "Not granting {link}: it is a symlink to {to}, which the macOS sandbox \
+                         profile cannot name. Re-point the symlink, or set the tool's *_HOME, \
+                         to a path without ( ) \" ; or \\."
+                    )
+                } else {
+                    format!(
+                        "Not granting {link}: it is a symlink to {to}, which the sandbox never \
+                         grants (a credential path, $HOME or a parent of it, or a system root)."
+                    )
+                });
+                false
+            }
+            None => true,
+        })
+        .collect();
+    let conflicts = crate::sandbox::exec_write_conflicts(&existing_home_tool_dirs);
+    for &(x, w) in &conflicts {
+        ui::warn(&format!(
+            "Not granting {}: it resolves onto the same tree as the writable {}, and \
+             one directory both writable and executable would let the agent drop and run a \
+             binary. Point the two at separate directories.",
+            existing_home_tool_dirs[x].path.display(),
+            existing_home_tool_dirs[w].path.display(),
+        ));
+    }
+    let existing_home_tool_dirs: Vec<ResolvedToolDir> = existing_home_tool_dirs
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| !conflicts.iter().any(|&(x, _)| x == *i))
+        .map(|(_, d)| d)
         .collect();
 
     // Writable app dirs are always included in this list because they potentially could be created on first use.

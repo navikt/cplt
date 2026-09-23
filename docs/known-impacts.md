@@ -167,6 +167,19 @@ cplt --print-profile | grep 'deny file-read'
 
 **Fix:** remove the entry from `.cplt.toml`, or narrow it to the path you actually meant. Paths that do not exist yet are kept (macOS enforces them once created), so an entry naming a future directory is not an error.
 
+## Toolchain homes inside a writable cache (behaviour change)
+
+The agent can no longer run programs from a toolchain directory that lands inside a writable cache. This covers two setups:
+
+- a toolchain home moved into a cache, such as `CARGO_HOME=~/.cache/cargo` or `GOPATH=~/.cache/go`;
+- two tool directories whose symlinks point into the same tree, such as `~/.cargo/bin` and `~/.cargo/registry` pointing at one directory.
+
+At launch cplt prints a warning naming both directories, then drops the executable one (`~/.cargo/bin`, `go/bin`). The writable cache stays granted.
+
+**Why:** when a directory is both writable and executable, an agent can write a program there and run it later. macOS already blocked running programs from such a tree, because the cache's exec deny comes last in the profile. On Linux, Landlock combined the two grants, so the directory really was both writable and executable.
+
+**Fix:** move the toolchain home outside `~/.cache` (for example `CARGO_HOME=~/.local/share/cargo`), or point the symlinks at separate trees.
+
 ## Lifecycle scripts (postinstall hooks)
 
 npm/yarn/pnpm lifecycle scripts are **blocked by default** via `npm_config_ignore_scripts=true` and `YARN_ENABLE_SCRIPTS=false`. This stops supply chain attacks through postinstall hooks, but it may break packages that need a post-install step:

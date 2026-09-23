@@ -23,7 +23,7 @@ use super::SandboxConfig;
 use super::policy::{
     DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS,
     DEPENDENCY_SOURCE_TREES, EXEC_IN_WRITABLE, GPG_SIGNING_ALLOW_FILES, HOME_CONFIG_FILES,
-    PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir,
+    HomeToolDir, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir,
     SENSITIVE_PROJECT_PATTERNS, SYSTEM_READ_FILES, TOOL_READ_DIRS, XCODE_SELECT_LINK,
     active_tool_dirs, ancestor_alternation, app_dirs, colima_socket_paths, current_uid,
     escape_regex, first_party_read_target, grant_is_refused, nested_alternation, path_bin_dirs,
@@ -503,19 +503,27 @@ fn emit_sensitive_project_denies(
 fn dependency_source_trees(home: &str, tool_dirs: Option<&[ResolvedToolDir]>) -> Vec<String> {
     DEPENDENCY_SOURCE_TREES
         .iter()
-        .map(|(tool_dir, sub)| {
-            let base = tool_dirs
-                .and_then(|dirs| {
-                    dirs.iter()
-                        .find(|d| d.dir.path == *tool_dir)
-                        .map(|d| d.path.to_string_lossy().into_owned())
-                })
-                .unwrap_or_else(|| format!("{home}/{tool_dir}"));
-            if sub.is_empty() {
+        .filter_map(|(tool_dir, sub)| {
+            let found = tool_dirs.and_then(|dirs| dirs.iter().find(|d| d.dir.path == *tool_dir));
+            let base = match found {
+                // A refused target is never granted, so its tree gets no
+                // re-allow either.
+                Some(d) if d.refused_target(Path::new(home)).is_some() => return None,
+                // The target when symlinked: the re-allow is a regex on the
+                // path the kernel resolves (#523).
+                Some(d) => d
+                    .target
+                    .as_ref()
+                    .unwrap_or(&d.path)
+                    .to_string_lossy()
+                    .into_owned(),
+                None => format!("{home}/{tool_dir}"),
+            };
+            Some(if sub.is_empty() {
                 base
             } else {
                 format!("{base}/{sub}")
-            }
+            })
         })
         .collect()
 }
@@ -1202,8 +1210,24 @@ fn emit_tool_dirs(
     }
     // Home tool dirs: use discovered existing dirs if available, else include all
     let active_dirs = active_tool_dirs(home_dir, existing_home_tool_dirs);
+    // Each dir under its own name and, when it is a symlink, its target: the
+    // kernel matches `subpath` against the resolved path, so the target rule
+    // is the one that grants anything (#523). `active_tool_dirs` has already
+    // dropped any dir whose target is refused.
+    let spellings: Vec<(&Path, &HomeToolDir)> = active_dirs
+        .iter()
+        .flat_map(|d| {
+            let target = d
+                .target
+                .as_deref()
+                .filter(|t| validate_sbpl_path(t).is_ok());
+            std::iter::once(d.path.as_path())
+                .chain(target)
+                .map(move |p| (p, d.dir))
+        })
+        .collect();
 
-    for ResolvedToolDir { path, dir } in &active_dirs {
+    for &(path, dir) in &spellings {
         let p = path.to_string_lossy();
         sbpl!(sb, "(allow file-read* (subpath \"{p}\"))");
         if dir.process_exec {
@@ -1220,7 +1244,7 @@ fn emit_tool_dirs(
     // Must come AFTER allows (last-match-wins in Seatbelt).
     // The blanket (allow process-exec) means we need explicit denies,
     // not just absence of a per-dir allow.
-    for ResolvedToolDir { path, dir } in &active_dirs {
+    for &(path, dir) in &spellings {
         let p = path.to_string_lossy();
         if dir.write && !dir.process_exec {
             sbpl!(sb, "(deny process-exec (subpath \"{p}\"))");
@@ -1961,6 +1985,12 @@ fn emit_deny_rules(sb: &mut String, home: &str, extra_deny: &[PathBuf]) {
     for file in DENIED_HOME_SUBPATHS {
         sbpl!(sb, "(deny file-read* (literal \"{home}/{file}\"))");
         sbpl!(sb, "(deny file-write* (literal \"{home}/{file}\"))");
+        // A symlinked tool dir is granted at its target (#523), and the kernel
+        // checks `~/.m2/settings.xml` there too — so the deny has to name it.
+        if let Some(r) = resolved_home_subpath(home, file) {
+            sbpl!(sb, "(deny file-read* (literal \"{r}\"))");
+            sbpl!(sb, "(deny file-write* (literal \"{r}\"))");
+        }
     }
     // These files must stay read-only even when an overlapping path is writable
     // (for example a temporary HOME under /private/var/folders).
@@ -1996,6 +2026,17 @@ fn resolved(path: PathBuf) -> PathBuf {
     std::fs::canonicalize(&path).unwrap_or(path)
 }
 
+/// Where `$HOME/{rel}` resolves, when that differs from the `$HOME` spelling
+/// and is safe to put in a profile. Resolved through the deepest existing
+/// ancestor, so a credential file created mid-session under a symlinked tool
+/// dir is still covered.
+fn resolved_home_subpath(home: &str, rel: &str) -> Option<String> {
+    let named = Path::new(home).join(rel);
+    let target = crate::config::canonicalize_deepest(&named);
+    (target != named && validate_sbpl_path(&target).is_ok())
+        .then(|| target.to_string_lossy().into_owned())
+}
+
 /// Re-allow credential files from `DENIED_HOME_SUBPATHS` when the user
 /// explicitly opts in via `--allow-read` or `allow.read` in config.toml.
 ///
@@ -2025,6 +2066,10 @@ fn emit_registry_config_overrides(sb: &mut String, home: &str, extra_read: &[Pat
         );
         for file in &overrides {
             sbpl!(sb, "(allow file-read* (literal \"{home}/{file}\"))");
+            // Lines up with the resolved deny in `emit_deny_rules`.
+            if let Some(r) = resolved_home_subpath(home, file) {
+                sbpl!(sb, "(allow file-read* (literal \"{r}\"))");
+            }
         }
         sbpl!(sb);
     }

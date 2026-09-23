@@ -74,9 +74,9 @@ pub use policy::{
     PLAYWRIGHT_SOCKET_ROOT, PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX, PROTECTED_IN_GITDIR,
     PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir, SENSITIVE_PROJECT_PATTERNS,
     TOOL_PATH_ENV_VARS, ToolPathEnvVar, ToolPathOverride, ToolRoot, active_tool_dirs, app_dirs,
-    copilot_ro_protect_paths, current_uid, home_tool_dirs, linux_docker_socket_paths,
-    linux_runtime_dirs, mise_ro_protect_paths, nested_alternation, path_bin_dirs,
-    playwright_runtime_intent, relocatable_tool_prefix, socket_mask_paths,
+    copilot_ro_protect_paths, current_uid, exec_write_conflicts, home_tool_dirs,
+    linux_docker_socket_paths, linux_runtime_dirs, mise_ro_protect_paths, nested_alternation,
+    path_bin_dirs, playwright_runtime_intent, relocatable_tool_prefix, socket_mask_paths,
     tool_override_path_is_safe, tool_path_env_overrides, validate_playwright_socket_dir,
     validate_sbpl_path, xdg_runtime_dir_env,
 };
@@ -1472,10 +1472,12 @@ mod tests {
         let dirs = [
             ResolvedToolDir {
                 path: store,
+                target: None,
                 dir: pnpm_tool_dir(".local/share/pnpm/store"),
             },
             ResolvedToolDir {
                 path: package_store,
+                target: None,
                 dir: pnpm_tool_dir(".local/share/pnpm/package-manager-store"),
             },
         ];
@@ -1499,6 +1501,7 @@ mod tests {
         symlink(&target, &package_store).unwrap();
         let dirs = [ResolvedToolDir {
             path: package_store,
+            target: None,
             dir: pnpm_tool_dir(".local/share/pnpm/package-manager-store"),
         }];
         let mut config = test_config(&home, &[]);

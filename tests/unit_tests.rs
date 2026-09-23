@@ -1025,6 +1025,286 @@ fn symlinked_git_config_cannot_escape_a_denied_directory() {
     );
 }
 
+/// `~/.cargo -> /opt/cargo`, the tool-dir half of #515 (#523). A `subpath` rule
+/// matches the resolved path, so granting only `~/.cargo/bin` left the real
+/// toolchain denied. The target must carry the tool dir's own permissions, and
+/// a credential file under it (`DENIED_HOME_SUBPATHS`) must stay denied at the
+/// target too, or granting the target would open it.
+#[test]
+fn profile_grants_a_symlinked_tool_dir_at_its_target() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let root = std::fs::canonicalize(root.path()).expect("canonicalize");
+    let home_dir = root.join("home");
+    let cargo = root.join("opt/cargo");
+    let m2 = root.join("opt/m2");
+    std::fs::create_dir_all(cargo.join("bin")).expect("mkdir cargo");
+    std::fs::create_dir_all(&m2).expect("mkdir m2");
+    std::fs::write(m2.join("settings.xml"), "<password/>").expect("write settings");
+    std::fs::create_dir_all(&home_dir).expect("mkdir home");
+    std::os::unix::fs::symlink(&cargo, home_dir.join(".cargo")).expect("symlink cargo");
+    std::os::unix::fs::symlink(&m2, home_dir.join(".m2")).expect("symlink m2");
+
+    let p = generate_profile(
+        &SandboxConfig {
+            home_dir: &home_dir,
+            ..base_profile_options()
+        },
+        &[],
+    );
+
+    let bin = cargo.join("bin");
+    for rule in ["file-read*", "process-exec", "file-map-executable"] {
+        let allow = format!("(allow {rule} (subpath \"{}\"))", bin.display());
+        assert!(
+            p.contains(&allow),
+            "the link target must be granted: {allow}\n{p}"
+        );
+    }
+    let settings = m2.join("settings.xml");
+    let grant = format!("(allow file-read* (subpath \"{}\"))", m2.display());
+    let deny = format!("(deny file-read* (literal \"{}\"))", settings.display());
+    let grant_at = p
+        .find(&grant)
+        .unwrap_or_else(|| panic!("m2 target missing:\n{p}"));
+    let deny_at = p
+        .rfind(&deny)
+        .unwrap_or_else(|| panic!("settings.xml must be denied at the target:\n{p}"));
+    assert!(grant_at < deny_at, "the deny must come last:\n{p}");
+}
+
+/// A tool-dir symlink must not become a way to grant a credential directory or
+/// an unsafe root. Landlock follows the link on its own, so the entry has to be
+/// dropped where both backends read the list, not just left out of the profile.
+#[test]
+fn symlinked_tool_dir_onto_a_sensitive_path_is_not_granted() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let home_dir = std::fs::canonicalize(home.path()).expect("canonicalize home");
+    let inside_ssh = home_dir.join(".ssh/cargo");
+    std::fs::create_dir_all(inside_ssh.join("bin")).expect("mkdir .ssh/cargo");
+    std::os::unix::fs::symlink(&inside_ssh, home_dir.join(".cargo")).expect("symlink cargo");
+    std::os::unix::fs::symlink("/", home_dir.join(".cache")).expect("symlink cache");
+
+    let active = cplt::sandbox::active_tool_dirs(&home_dir, None);
+    for refused in [".cargo/bin", ".cache"] {
+        assert!(
+            !active.iter().any(|d| d.dir.path == refused),
+            "{refused} resolves somewhere no grant may reach and must be dropped"
+        );
+    }
+    assert!(
+        active.iter().any(|d| d.dir.path == ".rustup"),
+        "unaffected tool dirs must still be granted"
+    );
+
+    let p = generate_profile(
+        &SandboxConfig {
+            home_dir: &home_dir,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    for leaked in [inside_ssh.join("bin"), PathBuf::from("/")] {
+        let allow = format!("(allow file-read* (subpath \"{}\"))", leaked.display());
+        assert!(!p.contains(&allow), "must not grant {allow}\n{p}");
+    }
+}
+
+/// Containment has to hold when `$HOME` itself is reached through a symlink
+/// and the protected entry does not exist yet: `~/.cache -> ~/dotfiles`, with
+/// `~/.gem -> ~/dotfiles/gem` and no `credentials` in it, or with `CPLT_CONFIG`
+/// moving cplt's state directory into `~/dotfiles`. Granting the target would
+/// grant the file the moment it is created.
+#[test]
+fn symlinked_tool_dir_containing_a_protected_path_under_a_symlinked_home_is_refused() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let root = std::fs::canonicalize(root.path()).expect("canonicalize");
+    let real_home = root.join("real-home");
+    let dotfiles = real_home.join("dotfiles");
+    std::fs::create_dir_all(&dotfiles).expect("mkdir dotfiles");
+    let home_dir = root.join("home");
+    std::os::unix::fs::symlink(&real_home, &home_dir).expect("symlink home");
+    std::os::unix::fs::symlink(&dotfiles, home_dir.join(".cache")).expect("symlink cache");
+    let cache_granted = || {
+        cplt::sandbox::active_tool_dirs(&home_dir, None)
+            .iter()
+            .any(|d| d.dir.path == ".cache")
+    };
+
+    assert!(cache_granted(), "nothing protected is inside yet");
+
+    std::fs::create_dir_all(dotfiles.join("gem")).expect("mkdir gem");
+    std::os::unix::fs::symlink(dotfiles.join("gem"), home_dir.join(".gem")).expect("symlink gem");
+    assert!(
+        !cache_granted(),
+        "~/.gem/credentials would land inside the ~/.cache target"
+    );
+    std::fs::remove_file(home_dir.join(".gem")).expect("unlink gem");
+    assert!(cache_granted(), "only the credential link refused it");
+
+    let config = home_dir.join("dotfiles/cplt/config.toml");
+    temp_env::with_var("CPLT_CONFIG", Some(&config), || {
+        assert!(
+            !cache_granted(),
+            "the relocated cplt state directory is inside the ~/.cache target"
+        );
+    });
+}
+
+/// `~/.cache -> ~/dotfiles` with `~/.npmrc -> ~/dotfiles/npmrc`. The credential
+/// file's `$HOME` spelling is outside `~/.cache`, but its target is inside the
+/// one granted for it. Landlock cannot deny a file inside a granted tree, and
+/// the macOS deny at the resolved path is skipped when that path is unsafe for
+/// the profile, so the tool dir is refused. A credential under the tool dir's
+/// own name (`~/.m2/settings.xml` for a symlinked `~/.m2`) is the documented
+/// subpath deny instead, and does not refuse it.
+#[test]
+fn symlinked_tool_dir_containing_a_linked_credential_file_is_refused() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let home_dir = std::fs::canonicalize(home.path()).expect("canonicalize home");
+    let dotfiles = home_dir.join("dotfiles");
+    std::fs::create_dir_all(&dotfiles).expect("mkdir dotfiles");
+    std::fs::write(dotfiles.join("npmrc"), "//registry/:_authToken=x").expect("write npmrc");
+    std::os::unix::fs::symlink(&dotfiles, home_dir.join(".cache")).expect("symlink cache");
+    std::os::unix::fs::symlink(dotfiles.join("npmrc"), home_dir.join(".npmrc"))
+        .expect("symlink npmrc");
+
+    let p = generate_profile(
+        &SandboxConfig {
+            home_dir: &home_dir,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    let active = cplt::sandbox::active_tool_dirs(&home_dir, None);
+    assert!(
+        !active.iter().any(|d| d.dir.path == ".cache"),
+        "~/.npmrc resolves inside the ~/.cache target"
+    );
+    let grant = format!("(subpath \"{}\")", dotfiles.display());
+    assert!(!p.contains(&grant), "must not grant {grant}\n{p}");
+}
+
+/// `~/.cache -> "~/Backup (1)/cache"`. The profile cannot name that target, and
+/// Seatbelt matches the resolved path, so the entry is dropped with a warning
+/// rather than aborting the launch or emitting a grant that grants nothing.
+#[cfg(target_os = "macos")]
+#[test]
+fn symlinked_tool_dir_onto_an_unnameable_target_is_dropped_not_fatal() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let home_dir = std::fs::canonicalize(home.path()).expect("canonicalize home");
+    let target = home_dir.join("Backup (1)/cache");
+    std::fs::create_dir_all(&target).expect("mkdir target");
+    std::os::unix::fs::symlink(&target, home_dir.join(".cache")).expect("symlink cache");
+
+    let active = cplt::sandbox::active_tool_dirs(&home_dir, None);
+    assert!(!active.iter().any(|d| d.dir.path == ".cache"));
+    assert!(active.iter().any(|d| d.dir.path == ".rustup"));
+    let p = generate_profile(
+        &SandboxConfig {
+            home_dir: &home_dir,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    assert!(!p.contains("Backup (1)"), "{p}");
+}
+
+/// `~/.cargo/bin` (exec, read-only) and `~/.cargo/registry` (writable, no
+/// exec) symlinked onto one directory, or the registry onto a tree holding the
+/// bin dir. Each is fine alone; Landlock unions the two rules on the shared
+/// inode, which would be a writable, executable directory. The executable side
+/// is dropped for every backend.
+#[test]
+fn tool_dirs_resolving_onto_one_tree_do_not_combine_write_and_exec() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let root = std::fs::canonicalize(root.path()).expect("canonicalize");
+    let home_dir = root.join("home");
+    let shared = root.join("opt/shared");
+    std::fs::create_dir_all(shared.join("bin")).expect("mkdir shared");
+    std::fs::create_dir_all(home_dir.join(".cargo")).expect("mkdir .cargo");
+    let bin_at = |target: &Path| {
+        let _ = std::fs::remove_file(home_dir.join(".cargo/bin"));
+        std::os::unix::fs::symlink(target, home_dir.join(".cargo/bin")).expect("symlink bin");
+    };
+    std::os::unix::fs::symlink(&shared, home_dir.join(".cargo/registry")).expect("symlink reg");
+    let granted = |rel: &str| {
+        cplt::sandbox::active_tool_dirs(&home_dir, None)
+            .iter()
+            .any(|d| d.dir.path == rel)
+    };
+
+    for bin in [shared.clone(), shared.join("bin")] {
+        bin_at(&bin);
+        assert!(
+            !granted(".cargo/bin"),
+            "{} is inside the writable registry",
+            bin.display()
+        );
+        assert!(
+            granted(".cargo/registry"),
+            "the writable store stays granted"
+        );
+        let p = generate_profile(
+            &SandboxConfig {
+                home_dir: &home_dir,
+                ..base_profile_options()
+            },
+            &[],
+        );
+        let exec = format!("(allow process-exec (subpath \"{}\")", bin.display());
+        assert!(!p.contains(&exec), "must not grant {exec}\n{p}");
+    }
+
+    bin_at(&root.join("opt/elsewhere"));
+    std::fs::create_dir_all(root.join("opt/elsewhere")).expect("mkdir elsewhere");
+    assert!(granted(".cargo/bin"), "separate trees do not conflict");
+}
+
+/// `~/.cargo -> /opt/cargo` before cargo has created `registry`. The target is
+/// resolved through the deepest existing ancestor, or the profile names only
+/// `~/.cargo/registry`, which Seatbelt never matches, and the cache is denied
+/// until created from outside. A missing tail is vetted like any other target:
+/// `~/.cargo -> ~/.ssh` must not grant `~/.ssh/registry`.
+#[test]
+fn symlinked_parent_of_a_missing_tool_dir_is_granted_at_its_target() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let root = std::fs::canonicalize(root.path()).expect("canonicalize");
+    let home_dir = root.join("home");
+    let cargo = root.join("opt/cargo");
+    std::fs::create_dir_all(&cargo).expect("mkdir cargo");
+    std::fs::create_dir_all(&home_dir).expect("mkdir home");
+    std::os::unix::fs::symlink(&cargo, home_dir.join(".cargo")).expect("symlink cargo");
+
+    let registry = home_tool_dirs()
+        .iter()
+        .find(|d| d.path == ".cargo/registry")
+        .expect("registry entry")
+        .resolve(&home_dir, &[]);
+    assert_eq!(registry.target, Some(cargo.join("registry")));
+    let p = generate_profile(
+        &SandboxConfig {
+            home_dir: &home_dir,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    let reg = cargo.join("registry");
+    for rule in ["allow file-write*", "deny process-exec"] {
+        let r = format!("({rule} (subpath \"{}\"))", reg.display());
+        assert!(p.contains(&r), "missing {r}\n{p}");
+    }
+
+    std::fs::remove_file(home_dir.join(".cargo")).expect("unlink cargo");
+    std::fs::create_dir_all(home_dir.join(".ssh")).expect("mkdir ssh");
+    std::os::unix::fs::symlink(home_dir.join(".ssh"), home_dir.join(".cargo")).expect("symlink");
+    assert!(
+        !cplt::sandbox::active_tool_dirs(&home_dir, None)
+            .iter()
+            .any(|d| d.dir.path == ".cargo/registry"),
+        "~/.ssh/registry does not exist yet but is still inside ~/.ssh"
+    );
+}
+
 /// `~/.gitconfig -> ~/.git-credentials`. The link target is a hard deny, so the
 /// resolved grant must never be emitted — on macOS the later deny would win
 /// anyway, but Landlock is grant-only and has no deny to fall back on, so the
@@ -1666,6 +1946,7 @@ fn the_carve_out_follows_a_relocated_tool_root() {
         .filter(|d| d.path == "go/pkg" || d.path == ".cargo/registry")
         .map(|d| ResolvedToolDir {
             path: PathBuf::from(format!("/elsewhere/{}", d.path)),
+            target: None,
             dir: d,
         })
         .collect();
