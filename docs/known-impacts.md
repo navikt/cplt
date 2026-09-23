@@ -946,6 +946,10 @@ One footgun with `allow.read`: the path must **exist** when cplt starts. A missi
 
 Adding `~/.npmrc` to the default read grant is not an option either. That hands the npm token to the sandboxed agent, which is the one thing the denial exists to prevent.
 
+### Linux: a denied file still looks readable
+
+yarn 1 is one case of a wider Linux behaviour. Landlock does not mediate `stat(2)`, `access(2)` or `faccessat(2)`, so a file the sandbox denies still exists and `access(path, R_OK)` says it is readable. Only the `open(2)` fails, with `EACCES`. A tool that checks a file before reading it believes the check and then fails on the open. On macOS, Seatbelt denies the check as well, so the same tool treats the file as absent. The fix is the same as above: grant the file with `allow.read`, or point the tool at a path that does not exist. See [SECURITY.md](../SECURITY.md#platform-enforcement-comparison) and [#389](https://github.com/navikt/cplt/issues/389).
+
 ## Cloud credential directories
 
 The following directories are **entirely blocked**, with no read, write, or execute:

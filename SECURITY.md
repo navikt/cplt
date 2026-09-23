@@ -179,8 +179,11 @@ cplt assumes the sandboxed agent is **untrusted**, because it executes arbitrary
 | Mount namespace isolation | N/A (not applicable) | ❌ Not available | ✅ Kernel namespace |
 | User namespace (unprivileged) | N/A (not applicable) | ❌ Not available | ✅ Kernel namespace |
 | --deny-path / deny.paths | ✅ Kernel deny | ❌ No effect (warned) | ✅ Mount-masked (files read as EACCES, dirs appear empty; the real content is unreachable) |
+| Metadata of a denied file (`stat`, `access`) | ✅ Denied with the read | ❌ Not mediated: exists and reports readable, then `open` fails with EACCES | ❌ Same as Landlock |
 
 Legend: ✅ = kernel-enforced, ⚠️ = defense-in-depth (proxy/env), ❌ = not available
+
+**Landlock does not mediate metadata.** Its access rights cover opening, reading, writing, executing and directory changes. There is no right for `stat(2)`, `access(2)` or `faccessat(2)`. On Linux, a file the sandbox denies still shows up as present, and `access(path, R_OK)` returns success. The `open(2)` that follows then fails with `EACCES`. Seatbelt denies the metadata call along with the read, so on macOS the check fails too. On Linux the sandbox can see a denied file's existence, size and timestamps, but not its contents. The bigger effect is on programs that check a file and then use it: on Linux they are told the file is readable and then fail on the open, while on macOS they treat it as absent and carry on. cplt cannot fix this in general. The workaround is per tool: grant the file with `allow.read` if the tool needs it, or point the tool at a path that does not exist so the check and the open agree. cplt does the second for `~/.npmrc` via `NPM_CONFIG_USERCONFIG` ([#180](https://github.com/navikt/cplt/issues/180), [#389](https://github.com/navikt/cplt/issues/389)).
 
 ### Linux namespace isolation (Bubblewrap)
 

@@ -320,11 +320,15 @@ curl -fsSL https://github.com/navikt/cplt/releases/latest/download/cplt-aarch64-
 sudo mv cplt /usr/local/bin/
 ```
 
-Every release binary carries a [build provenance attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations/using-artifact-attestations-to-establish-provenance-for-builds). Verify it:
+Every release tarball and `.deb` carries a [build provenance attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations/using-artifact-attestations-to-establish-provenance-for-builds). The attestation covers the downloaded file, not the binary inside it, so download to a file and verify it before you extract or install:
 
 ```bash
-gh attestation verify cplt -o navikt
+curl -fsSLO https://github.com/navikt/cplt/releases/latest/download/cplt-x86_64-unknown-linux-gnu.tar.gz
+gh attestation verify cplt-x86_64-unknown-linux-gnu.tar.gz --repo navikt/cplt
+tar xzf cplt-x86_64-unknown-linux-gnu.tar.gz
 ```
+
+Use the same `gh attestation verify <file> --repo navikt/cplt` on a downloaded `.deb` before `apt install`.
 
 ### Build from source
 
