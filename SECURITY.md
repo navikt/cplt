@@ -547,11 +547,11 @@ free, and the wording here has been wrong in both directions before.
   permit `TIOCSTI` with no capability at all. So on Linux the availability of
   the primitive is a property of the kernel the user happens to be running, and
   cplt cannot assume it is absent. Landlock does not help: it has no rule that
-  reaches an ioctl on an inherited descriptor. Denying `TIOCSTI` and `TIOCLINUX`
-  in the seccomp filter is the fix, and **it is not on `main` as of this
-  writing** — the filter table below does not list either. Until it lands,
-  assume an agent on a `CONFIG_LEGACY_TIOCSTI=y` kernel can inject into the
-  terminal cplt inherited.
+  reaches an ioctl on an inherited descriptor. What denies it is the seccomp
+  filter: `build_seccomp_filter` in `src/sandbox_landlock.rs` (step 2b) returns
+  `EPERM` for any `ioctl` whose request is `TIOCSTI` or `TIOCLINUX`, on any
+  descriptor. It is applied in every mode, with or without Bubblewrap
+  (GHSA-q3p2-6x2x-8w8w).
 
 The exposure is the same on both platforms and is not about peer terminals at
 all: `/dev/tty` and the inherited descriptors 0/1/2 name the agent's own
