@@ -483,8 +483,11 @@ through only when all of these hold:
   scope set);
 - its author is the account `gh` is logged in as, so any approving review it
   carries came from someone else;
-- an active ruleset on its base branch requires at least one approving review
-  or at least one status check, and that account cannot bypass the ruleset.
+- an active ruleset on its base branch requires at least one approving review,
+  that account cannot bypass the ruleset, and the ruleset also sets "Dismiss
+  stale pull request approvals when new commits are pushed" or "Require
+  approval of the most recent reviewable push". Without one of those, the
+  agent could get an approval, push unreviewed commits and merge.
 
 Otherwise the merge is refused with the reason. A failed or unreadable GitHub
 response also refuses. `--admin` is always refused, and so is any flag the shim
@@ -492,10 +495,14 @@ does not recognise. `--auto`, `--squash`, `--delete-branch` and the other
 ordinary flags pass. A merge queue alone does not count, and neither does
 classic branch protection, which the check does not read.
 
-A status-check rule alone is enough to pass. It stops a broken merge, not an
-unreviewed one, so if a human must approve every merge, require a review in
-the ruleset. The key applies to every repository you sandbox. `cplt config set
---local` limits it to one checkout.
+**An approval rule is required.** Required status checks do not count on their
+own: the pull request's author controls what CI reports, by editing the
+workflows in the pull request or by posting a status through
+`allow_api_write`. A branch with checks and no required approval, such as
+cplt's own `main`, refuses every merge.
+
+The key applies to every repository you sandbox. `cplt config set --local`
+limits it to one checkout.
 
 ## Policy presets
 

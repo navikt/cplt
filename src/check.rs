@@ -844,7 +844,7 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
                 reason: "allowed by gh_guard.allow_pr_merge only if, when it runs, the pull \
                          request is the authenticated account's own and an active ruleset \
                          on its base branch that the account cannot bypass requires an \
-                         approving review or status checks; refused otherwise."
+                         approving review that a new push dismisses; refused otherwise."
                     .to_string(),
                 fix: None,
                 objection: None,

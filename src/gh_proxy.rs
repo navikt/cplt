@@ -2144,7 +2144,7 @@ fn gate_with_scope_resolver(
                 format!(
                     "Reason: {}. `cplt config set gh_guard.allow_pr_merge true` lets the agent \
                      merge its own pull requests into a branch whose rulesets require an \
-                     approving review or status checks; `--admin` stays refused.",
+                     approving review that a new push dismisses; `--admin` stays refused.",
                     result.reason
                 )
             } else if result.reason.starts_with("gh api with") {
@@ -2208,7 +2208,6 @@ pub fn merge_selector(args: &[&str]) -> Result<Option<String>, String> {
     const WITH_VALUE: &[&str] = &[
         "-R",
         "--repo",
-        "--hostname",
         "-b",
         "--body",
         "-F",
@@ -2285,20 +2284,22 @@ fn encode_branch(branch: &str) -> String {
 }
 
 /// Whether one rule from `GET /repos/{o}/{r}/rules/branches/{b}` gates a merge:
-/// a pull-request rule requiring at least one approving review, or a non-empty
-/// set of required status checks. A merge queue alone does not count — it runs
-/// whatever checks are required, and with none it gates nothing.
+/// a pull-request rule requiring at least one approving review, where that
+/// approval cannot be carried past a later push (`dismiss_stale_reviews_on_push`
+/// or `require_last_push_approval`). Without either, the agent could collect an
+/// approval, push unreviewed commits and merge. A missing field counts as off.
+///
+/// Status checks do not count: the pull request's author controls CI, by editing
+/// the workflows in the pull request or posting a status with `allow_api_write`.
+/// A merge queue alone does not count either.
 fn rule_gates_merge(rule: &serde_json::Value) -> bool {
     let params = &rule["parameters"];
-    match rule["type"].as_str() {
-        Some("pull_request") => params["required_approving_review_count"]
+    rule["type"] == "pull_request"
+        && params["required_approving_review_count"]
             .as_u64()
-            .is_some_and(|n| n >= 1),
-        Some("required_status_checks") => params["required_status_checks"]
-            .as_array()
-            .is_some_and(|checks| !checks.is_empty()),
-        _ => false,
-    }
+            .is_some_and(|n| n >= 1)
+        && (params["dismiss_stale_reviews_on_push"] == true
+            || params["require_last_push_approval"] == true)
 }
 
 /// The ruleset condition behind `gh_guard.allow_pr_merge`.
@@ -2311,8 +2312,8 @@ fn rule_gates_merge(rule: &serde_json::Value) -> bool {
 /// - the pull request is in `repo` (a URL selector can name another one);
 /// - its author is the authenticated account, so a required review cannot be
 ///   one the agent gave with that account (GitHub forbids self-approval);
-/// - an active ruleset on its base branch requires an approving review or
-///   status checks ([`rule_gates_merge`]), and the account cannot bypass that
+/// - an active ruleset on its base branch requires an approving review that
+///   a later push dismisses ([`rule_gates_merge`]), and the account cannot bypass that
 ///   ruleset (`current_user_can_bypass == "never"`).
 ///
 /// What this does not cover: the facts are read at merge time by a `gh` that
@@ -2330,7 +2331,8 @@ pub fn check_merge_protection(
             "Reason: {reason}.\n\
              gh_guard.allow_pr_merge merges only the authenticated account's own pull \
              requests, into a branch where an active ruleset the account cannot bypass \
-             requires an approving review or status checks. Leave this merge to a human."
+             requires an approving review that a new push dismisses. Leave this merge \
+             to a human."
         ),
         agent_note: &[RESTRICTED, NOTE],
     };
@@ -2344,16 +2346,14 @@ pub fn check_merge_protection(
     };
     let repo = repo.strip_prefix("github.com/").unwrap_or(repo);
     let selector = merge_selector(args).map_err(refuse)?;
-    let mut view = vec![
-        "pr",
-        "view",
-        "-R",
-        repo,
-        "--json",
-        "url,baseRefName,author",
-        "--",
-    ];
-    view.extend(selector.as_deref());
+    // gh refuses `-R` without a selector, so a bare `gh pr merge` is looked up
+    // without it: the caller runs every lookup with `GH_REPO` pinned to `repo`,
+    // as the merge itself runs, so gh resolves the current branch's pull request
+    // the same way for both. The selector stays a separate argument.
+    let mut view = vec!["pr", "view", "--json", "url,baseRefName,author"];
+    if let Some(selector) = selector.as_deref() {
+        view.extend(["-R", repo, "--", selector]);
+    }
     let pr = gh(&view).and_then(json).map_err(failed)?;
     let (Some(url), Some(base), Some(author)) = (
         pr["url"].as_str(),
@@ -2381,6 +2381,8 @@ pub fn check_merge_protection(
         )));
     }
 
+    // One page of 100 rules, not paginated: a protecting rule on a later page is
+    // missed, which refuses the merge (fails closed).
     let rules_path = format!(
         "repos/{repo}/rules/branches/{}?per_page=100",
         encode_branch(base)
@@ -2398,7 +2400,7 @@ pub fn check_merge_protection(
     ruleset_ids.dedup();
     if ruleset_ids.is_empty() {
         return Err(refuse(format!(
-            "no active ruleset on '{base}' in {repo} requires an approving review or status checks"
+            "no active ruleset on '{base}' in {repo} requires an approving review that a new push dismisses"
         )));
     }
     for id in ruleset_ids {

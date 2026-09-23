@@ -4083,6 +4083,9 @@ enum GateEffect {
     Refuse(gh_proxy::Refusal),
 }
 
+/// Runs the real `gh` for a read the merge check needs: `(GH_REPO, args)`.
+type GhLookup<'a> = dyn FnMut(&str, &[&str]) -> Result<String, String> + 'a;
+
 /// Decide what `cplt gh-gate` should do. Pure: no process is spawned here.
 ///
 /// ## Why warn and audit exec without the `GH_REPO` pin
@@ -4108,7 +4111,7 @@ fn decide_gh_gate(
     policy: &gh_proxy::GatePolicy,
     repo_scope: &[String],
     real_git: Option<&Path>,
-    gh_lookup: &mut dyn FnMut(&[&str]) -> Result<String, String>,
+    gh_lookup: &mut GhLookup<'_>,
 ) -> GateEffect {
     // Intercept `gh auth token` — serve from cached file instead of blocking.
     // This allows Copilot to authenticate without exposing the token as an env var
@@ -4122,8 +4125,13 @@ fn decide_gh_gate(
     let verdict =
         gh_proxy::gate_with_repo_scope(&arg_refs, policy, repo_scope, real_git).and_then(|a| {
             // A merge let through by `allow_pr_merge` still needs its ruleset condition.
+            // Its lookups run with `GH_REPO` pinned as the merge will be; with no
+            // pinned repository the check refuses before looking anything up.
             if a.check_merge_protection {
-                gh_proxy::check_merge_protection(&arg_refs, a.repo_scope.as_deref(), gh_lookup)?;
+                let repo = a.repo_scope.as_deref();
+                gh_proxy::check_merge_protection(&arg_refs, repo, &mut |lookup| {
+                    gh_lookup(repo.unwrap_or_default(), lookup)
+                })?;
             }
             Ok(a)
         });
@@ -4156,20 +4164,21 @@ fn run_gh_gate(
     args: &[String],
     policy: &gh_proxy::GatePolicy,
 ) -> ExitCode {
-    let effect = decide_gh_gate(args, policy, repo_scope, real_git, &mut |lookup| {
-        run_gh_lookup(real_gh, lookup)
+    let effect = decide_gh_gate(args, policy, repo_scope, real_git, &mut |repo, lookup| {
+        run_gh_lookup(real_gh, repo, lookup)
     });
     perform_gate_effect(real_gh, "gh", args, effect)
 }
 
-/// Run the real `gh` for a read the gate needs, returning stdout. Any failure,
-/// including a non-zero exit, is an error the caller refuses on.
+/// Run the real `gh` for a read the gate needs, with `GH_REPO` pinned to `repo`
+/// (host-qualified, as [`perform_gate_effect`] pins it), returning stdout. Any
+/// failure, including a non-zero exit, is an error the caller refuses on.
 #[allow(clippy::disallowed_methods)] // runs INSIDE the sandbox as cplt gh-gate, against the same real gh it would exec
-fn run_gh_lookup(real_gh: &Path, args: &[&str]) -> Result<String, String> {
+fn run_gh_lookup(real_gh: &Path, repo: &str, args: &[&str]) -> Result<String, String> {
     let output = std::process::Command::new(real_gh)
         .args(args)
         .env_remove("GH_HOST")
-        .env_remove("GH_REPO")
+        .env("GH_REPO", repo)
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|e| format!("could not run gh: {e}"))?;
@@ -10148,7 +10157,7 @@ mod tests {
         repo_scope: &[String],
         real_git: Option<&Path>,
     ) -> GateEffect {
-        decide_gh_gate(args, policy, repo_scope, real_git, &mut |a| {
+        decide_gh_gate(args, policy, repo_scope, real_git, &mut |_, a| {
             panic!("unexpected gh lookup: {a:?}")
         })
     }
@@ -10156,11 +10165,21 @@ mod tests {
     // ── gh pr merge under allow_pr_merge (#412) ──────────────────────────
 
     /// A fake `gh` answering the protection check's reads. `rules` is the
-    /// `rules/branches` response; the ruleset (id 7) cannot be bypassed.
+    /// `rules/branches` response; the ruleset (id 7) cannot be bypassed. Like
+    /// real gh, `pr view` refuses `-R` without a selector.
     fn merge_lookup(rules: &'static str) -> impl FnMut(&[&str]) -> Result<String, String> {
         move |a: &[&str]| {
             Ok(match a {
-                ["pr", "view", "-R", "navikt/cplt", ..] => r#"{"url":"https://github.com/navikt/cplt/pull/5","baseRefName":"main","author":{"login":"me"}}"#,
+                ["pr", "view", rest @ ..] => {
+                    let selector = rest
+                        .iter()
+                        .position(|a| *a == "--")
+                        .and_then(|i| rest.get(i + 1));
+                    if rest.contains(&"-R") && selector.is_none() {
+                        return Err("argument required when using the --repo flag".to_string());
+                    }
+                    r#"{"url":"https://github.com/navikt/cplt/pull/5","baseRefName":"main","author":{"login":"me"}}"#
+                }
                 ["api", "user"] => r#"{"login":"me"}"#,
                 ["api", p] if p.starts_with("repos/navikt/cplt/rules/branches/main") => rules,
                 ["api", "repos/navikt/cplt/rulesets/7"] => {
@@ -10172,10 +10191,10 @@ mod tests {
         }
     }
 
-    const PROTECTED: &str = r#"[{"type":"pull_request","ruleset_id":7,"parameters":{"required_approving_review_count":1}}]"#;
+    const PROTECTED: &str = r#"[{"type":"pull_request","ruleset_id":7,"parameters":{"required_approving_review_count":1,"dismiss_stale_reviews_on_push":true}}]"#;
     /// Rules that look like protection but gate nothing: cplt's own `main` has a
     /// pull-request rule with zero required approvals.
-    const UNPROTECTED: &str = r#"[{"type":"deletion","ruleset_id":7},{"type":"pull_request","ruleset_id":7,"parameters":{"required_approving_review_count":0}},{"type":"required_status_checks","ruleset_id":7,"parameters":{"required_status_checks":[]}},{"type":"merge_queue","ruleset_id":7}]"#;
+    const UNPROTECTED: &str = r#"[{"type":"deletion","ruleset_id":7},{"type":"pull_request","ruleset_id":7,"parameters":{"required_approving_review_count":0,"dismiss_stale_reviews_on_push":true}},{"type":"required_status_checks","ruleset_id":7,"parameters":{"required_status_checks":[]}},{"type":"merge_queue","ruleset_id":7}]"#;
 
     fn merge_policy(allow_pr_merge: bool) -> gh_proxy::GatePolicy {
         gh_proxy::GatePolicy {
@@ -10194,7 +10213,11 @@ mod tests {
             &merge_policy(allow),
             &["navikt/cplt".to_string()],
             None,
-            lookup,
+            &mut |repo, a| {
+                // Every lookup runs with GH_REPO pinned, as the merge does.
+                assert_eq!(repo, "github.com/navikt/cplt");
+                lookup(a)
+            },
         )
     }
 
@@ -10229,17 +10252,72 @@ mod tests {
     }
 
     #[test]
-    fn pr_merge_allowed_with_required_status_checks_alone() {
+    fn pr_merge_of_the_current_branch_is_looked_up_without_a_repo_flag() {
+        // gh refuses `-R` without a selector, so the current branch's pull
+        // request is looked up under the GH_REPO pin alone. (Through the gate a
+        // bare merge also needs the cwd check against real git: see e2e_guards.)
+        let mut lookup = merge_lookup(PROTECTED);
+        let verdict = gh_proxy::check_merge_protection(
+            &["pr", "merge", "--auto"],
+            Some("github.com/navikt/cplt"),
+            &mut lookup,
+        );
+        assert!(verdict.is_ok(), "{verdict:?}");
+    }
+
+    #[test]
+    fn pr_merge_refused_with_required_status_checks_alone() {
+        // The PR author controls CI, so checks alone are not protection.
         let checks = r#"[{"type":"required_status_checks","ruleset_id":7,"parameters":{"required_status_checks":[{"context":"ci"}]}}]"#;
         let effect = decide_merge(
-            &["pr", "merge", "-R", "navikt/cplt", "--auto"],
+            &["pr", "merge", "5", "-R", "navikt/cplt", "--auto"],
             true,
             &mut merge_lookup(checks),
         );
-        assert_eq!(
-            effect,
-            GateEffect::ExecScoped("github.com/navikt/cplt".to_string())
-        );
+        assert_merge_refused(&effect, "requires an approving review");
+    }
+
+    #[test]
+    fn pr_merge_needs_an_approval_a_new_push_dismisses() {
+        let rules = |params: &str| -> &'static str {
+            format!(
+                r#"[{{"type":"pull_request","ruleset_id":7,"parameters":{{"required_approving_review_count":1{params}}}}}]"#
+            )
+            .leak()
+        };
+        for params in [
+            r#","dismiss_stale_reviews_on_push":true,"require_last_push_approval":false"#,
+            r#","dismiss_stale_reviews_on_push":false,"require_last_push_approval":true"#,
+        ] {
+            let effect = decide_merge(
+                &["pr", "merge", "5", "-R", "navikt/cplt"],
+                true,
+                &mut merge_lookup(rules(params)),
+            );
+            assert_eq!(
+                effect,
+                GateEffect::ExecScoped("github.com/navikt/cplt".to_string()),
+                "{params}"
+            );
+        }
+        // Neither set, a missing field, or a non-boolean: an approval could
+        // outlive unreviewed pushes.
+        for params in [
+            r#","dismiss_stale_reviews_on_push":false,"require_last_push_approval":false"#,
+            "",
+            r#","require_last_push_approval":false"#,
+            r#","dismiss_stale_reviews_on_push":"true""#,
+        ] {
+            let effect = decide_merge(
+                &["pr", "merge", "5", "-R", "navikt/cplt"],
+                true,
+                &mut merge_lookup(rules(params)),
+            );
+            assert_merge_refused(
+                &effect,
+                "requires an approving review that a new push dismisses",
+            );
+        }
     }
 
     #[test]
@@ -10249,7 +10327,7 @@ mod tests {
             true,
             &mut merge_lookup(UNPROTECTED),
         );
-        assert_merge_refused(&effect, "requires an approving review or status checks");
+        assert_merge_refused(&effect, "requires an approving review");
     }
 
     #[test]
@@ -10358,7 +10436,7 @@ mod tests {
             },
             &["navikt/cplt".to_string()],
             None,
-            &mut merge_lookup(UNPROTECTED),
+            &mut |_, a| merge_lookup(UNPROTECTED)(a),
         );
         assert!(
             matches!(effect, GateEffect::ExecPlain { notice: Some(ref n) } if n.contains("would block")),

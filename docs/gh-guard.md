@@ -315,6 +315,19 @@ subcommand.
 Note that `allow_api_write = true` scope-checks writes rather than freeing them.
 Cross-repo writes are still denied.
 
+**Breaking change:** before `allow_pr_merge` existed, `allow_api_write = true`
+let `gh api -X PUT repos/{o}/{r}/pulls/{n}/merge` (and `POST repos/{o}/{r}/merges`)
+through. Those writes are now refused for everyone, whether or not
+`allow_pr_merge` is on, because a REST merge skips the `allow_pr_merge` check
+and gh's own refusal to merge a blocked pull request without `--admin`. Merge
+with `gh pr merge` instead. A GET on the merge endpoint, which reports whether
+a pull request is merged, still passes.
+
+This does not make `allow_api_write` safe for the base branch. It still allows
+other writes that move it: a contents `PUT` with `branch=main`, a `PATCH` to
+`git/refs/heads/main`, `merge-upstream`. Only the repository's rulesets stop
+those; the shim does not.
+
 **Enable in config:**
 ```toml
 [gh_guard]
@@ -415,7 +428,7 @@ What the gh/git guard stops, and what it does not.
 
 | Threat | How it's stopped |
 |--------|-----------------|
-| Agent merges a PR without human review | `gh pr merge` is in the Block tier. With `allow_pr_merge = true` it is allowed only for the account's own PR into a branch where a ruleset the account cannot bypass requires a review or status checks; `--admin` is always refused |
+| Agent merges a PR without human review | `gh pr merge` is in the Block tier. With `allow_pr_merge = true` it is allowed only for the account's own PR into a branch where a ruleset the account cannot bypass requires an approving review that a new push dismisses; `--admin` is always refused. Status checks alone do not count |
 | Agent deletes a repository | `gh repo delete` is in the Block tier |
 | Agent creates releases or uploads artifacts | `gh release create/upload` blocked |
 | Agent triggers CI workflows | `gh workflow run` blocked |

@@ -1089,7 +1089,8 @@ fn gh_gate_allow_api_write_blocks_cross_repo_post() {
 
 /// Run `cplt gh-gate --allow-pr-merge` against a fake `gh` that answers the
 /// protection check's reads with `rules` for `main` and prints MERGED for the
-/// merge itself. Returns (stdout, stderr, exit_success).
+/// merge itself. Like real gh, its `pr view` refuses `-R` without a selector;
+/// without `-R` it needs `GH_REPO`. Returns (stdout, stderr, exit_success).
 fn gh_gate_merge(args: &[&str], rules: &str) -> (String, String, bool) {
     let repo = temp_repo("navikt/cplt");
     let gh = repo.path().join("fake-gh.sh");
@@ -1098,7 +1099,13 @@ fn gh_gate_merge(args: &[&str], rules: &str) -> (String, String, bool) {
         format!(
             r#"#!/bin/sh
 case "$1 $2" in
-  "pr view") echo '{{"url":"https://github.com/navikt/cplt/pull/5","baseRefName":"main","author":{{"login":"me"}}}}' ;;
+  "pr view")
+    case " $* " in
+      *" -R "*" -- "?*) ;;
+      *" -R "*) echo "argument required when using the --repo flag" >&2; exit 1 ;;
+      *) [ "$GH_REPO" = github.com/navikt/cplt ] || {{ echo "no repo: $GH_REPO" >&2; exit 1; }} ;;
+    esac
+    echo '{{"url":"https://github.com/navikt/cplt/pull/5","baseRefName":"main","author":{{"login":"me"}}}}' ;;
   "api user") echo '{{"login":"me"}}' ;;
   "api repos/navikt/cplt/rules/branches/main?per_page=100") echo '{rules}' ;;
   "api repos/navikt/cplt/rulesets/7") echo '{{"enforcement":"active","current_user_can_bypass":"never"}}' ;;
@@ -1134,7 +1141,7 @@ esac
     )
 }
 
-const MERGE_PROTECTED: &str = r#"[{"type":"required_status_checks","ruleset_id":7,"parameters":{"required_status_checks":[{"context":"ci"}]}}]"#;
+const MERGE_PROTECTED: &str = r#"[{"type":"pull_request","ruleset_id":7,"parameters":{"required_approving_review_count":1,"require_last_push_approval":true}}]"#;
 
 #[test]
 fn gh_gate_pr_merge_refused_without_the_opt_in() {
@@ -1149,10 +1156,24 @@ fn gh_gate_pr_merge_allowed_into_a_protected_branch() {
 }
 
 #[test]
+fn gh_gate_pr_merge_of_the_current_branch_allowed_into_a_protected_branch() {
+    let (stdout, stderr, ok) = gh_gate_merge(&["pr", "merge", "--squash"], MERGE_PROTECTED);
+    assert!(ok && stdout.contains("MERGED"), "{stdout}\n{stderr}");
+}
+
+#[test]
+fn gh_gate_pr_merge_refused_with_status_checks_alone() {
+    let checks = r#"[{"type":"required_status_checks","ruleset_id":7,"parameters":{"required_status_checks":[{"context":"ci"}]}}]"#;
+    let (stdout, stderr, ok) = gh_gate_merge(&["pr", "merge", "5"], checks);
+    assert!(!stdout.contains("MERGED"), "{stdout}");
+    assert_refused(&stderr, ok, "requires an approving review");
+}
+
+#[test]
 fn gh_gate_pr_merge_refused_into_an_unprotected_branch() {
     let (stdout, stderr, ok) = gh_gate_merge(&["pr", "merge", "5"], "[]");
     assert!(!stdout.contains("MERGED"), "{stdout}");
-    assert_refused(&stderr, ok, "requires an approving review or status checks");
+    assert_refused(&stderr, ok, "requires an approving review");
 }
 
 #[test]

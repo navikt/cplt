@@ -513,7 +513,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: true,
         default_display: "false",
-        description: "Allow 'gh pr merge' of the account's own PRs, in scope, into a branch where an active ruleset the account cannot bypass requires an approving review or status checks. '--admin' is always refused.",
+        description: "Allow 'gh pr merge' of the account's own PRs, in scope, into a branch where an active ruleset the account cannot bypass requires an approving review that a new push dismisses. '--admin' is always refused.",
     },
     // [git_guard]
     ConfigKeyInfo {

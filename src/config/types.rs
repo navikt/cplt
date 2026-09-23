@@ -395,7 +395,7 @@ pub struct GhGuardConfig {
     /// GraphQL is always blocked regardless of this setting (default: false).
     pub allow_api_write: Option<bool>,
     /// Allow `gh pr merge` of the authenticated account's own pull requests
-    /// into a branch whose rulesets require a review or status checks
+    /// into a branch whose rulesets require an approving review that a new push dismisses
     /// (default: false). `--admin` is always refused.
     pub allow_pr_merge: Option<bool>,
 }
