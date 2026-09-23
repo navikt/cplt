@@ -2842,6 +2842,23 @@ mod tests {
         assert_eq!(snapshot.domains[0].host, "pending.example");
     }
 
+    /// Waits that only bound a HANG, never a behaviour under test: long enough
+    /// that a loaded CI runner cannot lose them, short enough to fail a wedged
+    /// test instead of stalling the suite (#528).
+    const LOADED_RUNNER_WAIT: Duration = Duration::from_secs(30);
+
+    /// Block until the accept loop has published its admission boundary.
+    fn wait_for_admission_boundary(collector: &DomainCollector) {
+        let deadline = Instant::now() + LOADED_RUNNER_WAIT;
+        while collector.lock_recovering().admission_closed_at.is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "accept loop did not publish its admission boundary"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn live_finalizer_waits_for_gated_resolver_classification() {
         require_localhost_tcp!();
@@ -2855,7 +2872,7 @@ mod tests {
             resolver_release_rx
                 .lock()
                 .unwrap()
-                .recv_timeout(Duration::from_secs(2))
+                .recv_timeout(LOADED_RUNNER_WAIT)
                 .unwrap();
             None
         });
@@ -2876,33 +2893,28 @@ mod tests {
             let _ = BufReader::new(stream).read_line(&mut status);
         });
         resolver_entered_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(LOADED_RUNNER_WAIT)
             .unwrap();
 
+        // The budget is not what this test is about: it asserts the finalizer
+        // WAITS for a pending classification, which only a Settled snapshot
+        // proves. A 500ms budget let a descheduled test thread miss the window
+        // and read DeadlineExceeded (#528); `live_finalizer_bounds_a_stalled_resolver`
+        // is the test that owns the bound.
         let (snapshot_tx, snapshot_rx) = mpsc::channel();
         let finalizer = std::thread::spawn(move || {
             snapshot_tx
-                .send(proxy.finalize_snapshot(Duration::from_millis(500)))
+                .send(proxy.finalize_snapshot(LOADED_RUNNER_WAIT))
                 .unwrap();
         });
-        let wait_deadline = Instant::now() + Duration::from_secs(1);
-        loop {
-            if collector.lock_recovering().admission_closed_at.is_some() {
-                break;
-            }
-            assert!(
-                Instant::now() < wait_deadline,
-                "accept loop did not publish its admission boundary"
-            );
-            std::thread::yield_now();
-        }
+        wait_for_admission_boundary(&collector);
         assert!(
             snapshot_rx.try_recv().is_err(),
             "snapshot must wait while CONNECT classification is pending"
         );
 
         resolver_release_tx.send(()).unwrap();
-        let snapshot = snapshot_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let snapshot = snapshot_rx.recv_timeout(LOADED_RUNNER_WAIT).unwrap();
         finalizer.join().unwrap();
         client.join().unwrap();
         assert_eq!(snapshot.completion, SnapshotCompletion::Settled);
@@ -2923,12 +2935,13 @@ mod tests {
             resolver_release_rx
                 .lock()
                 .unwrap()
-                .recv_timeout(Duration::from_secs(2))
+                .recv_timeout(LOADED_RUNNER_WAIT)
                 .unwrap();
             None
         });
         let proxy = make_proxy_with_resolver(Vec::new(), false, Some(resolver));
         let proxy_port = proxy.port;
+        let collector = proxy.domain_collector.clone();
         let client = std::thread::spawn(move || {
             let mut stream = TcpStream::connect(("127.0.0.1", proxy_port)).unwrap();
             write!(
@@ -2938,12 +2951,25 @@ mod tests {
             .unwrap();
         });
         resolver_entered_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(LOADED_RUNNER_WAIT)
             .unwrap();
 
+        // Close admission first and wait for the accept loop to publish it, on
+        // its own generous clock. The accept loop polls its shutdown flag every
+        // 50ms, so on a loaded runner it could miss the whole 100ms budget and
+        // the snapshot read `admission: Open` (#528, CI run 34959497895). With
+        // the boundary already published, the budget below is spent only on
+        // the stalled classification, which is the thing being bounded.
+        proxy.shutdown();
+        wait_for_admission_boundary(&collector);
+
+        // The bound IS the assertion here, so it stays; only the margin is
+        // wide. The resolver stalls for LOADED_RUNNER_WAIT (30s), so a
+        // finalizer that waited on it would blow through 10s, while a
+        // descheduled thread returning late from a 100ms budget does not.
         let started = Instant::now();
         let snapshot = proxy.finalize_snapshot(Duration::from_millis(100));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_secs(10));
         assert_eq!(
             snapshot.completion,
             SnapshotCompletion::DeadlineExceeded {
@@ -2971,7 +2997,7 @@ mod tests {
         let (origin_connected_tx, origin_connected_rx) = mpsc::channel();
         let (origin_release_tx, origin_release_rx) = mpsc::channel();
         let origin_worker = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = Instant::now() + LOADED_RUNNER_WAIT;
             let _stream = loop {
                 match origin.accept() {
                     Ok((stream, _)) => break stream,
@@ -2979,7 +3005,7 @@ mod tests {
                         if Instant::now() >= deadline {
                             return Err("proxy did not connect to origin".to_string());
                         }
-                        std::thread::yield_now();
+                        std::thread::sleep(Duration::from_millis(1));
                     }
                     Err(error) => return Err(format!("origin accept failed: {error}")),
                 }
@@ -2988,28 +3014,31 @@ mod tests {
                 .send(())
                 .map_err(|error| format!("origin connect signal failed: {error}"))?;
             origin_release_rx
-                .recv_timeout(Duration::from_secs(2))
+                .recv_timeout(LOADED_RUNNER_WAIT)
                 .map_err(|error| format!("origin release signal failed: {error}"))?;
             Ok::<(), String>(())
         });
         let resolver: ResolverFn = Arc::new(move |_host: &str, _port: u16| Some(origin_addr));
         let proxy = make_proxy_with_resolver(vec![origin_port], false, Some(resolver));
         let mut client = TcpStream::connect(("127.0.0.1", proxy.port)).unwrap();
-        client
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        write!(
-            client,
+        client.set_read_timeout(Some(LOADED_RUNNER_WAIT)).unwrap();
+        // One write: see `proxy_connect`.
+        let request = format!(
             "CONNECT localhost:{origin_port} HTTP/1.1\r\nHost: localhost:{origin_port}\r\n\r\n"
-        )
-        .unwrap();
+        );
+        client.write_all(request.as_bytes()).unwrap();
         let mut status = String::new();
         BufReader::new(client.try_clone().unwrap())
             .read_line(&mut status)
             .unwrap();
-        let origin_connected = origin_connected_rx.recv_timeout(Duration::from_secs(2));
+        let origin_connected = origin_connected_rx.recv_timeout(LOADED_RUNNER_WAIT);
 
-        let snapshot = proxy.finalize_snapshot(Duration::from_millis(500));
+        // Every wait in this test only guards against a hang, so each gets
+        // LOADED_RUNNER_WAIT (#528); at 2s the origin's accept deadline was
+        // losable, which read as a 502. The budget can be long too: the relay
+        // stays open until after the snapshot, so a finalizer that waited on
+        // it would still end in DeadlineExceeded, only later.
+        let snapshot = proxy.finalize_snapshot(LOADED_RUNNER_WAIT);
         drop(client);
         let _ = origin_release_tx.send(());
         let origin_result = origin_worker.join();
@@ -3551,7 +3580,12 @@ mod tests {
     fn proxy_connect(proxy_port: u16, target: &str) -> String {
         use std::io::{BufRead as _, BufReader, Write as _};
         let mut conn = std::net::TcpStream::connect(format!("127.0.0.1:{proxy_port}")).unwrap();
-        let _ = write!(conn, "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n");
+        // One write, not `write!`: that issues a write per format piece, and
+        // the proxy reads the request line with a single `read`. A handler
+        // that ran between pieces saw a bare "CONNECT " and dropped the
+        // attempt unrecorded (#528).
+        let request = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n");
+        let _ = conn.write_all(request.as_bytes());
         let mut reader = BufReader::new(conn);
         let mut line = String::new();
         match reader.read_line(&mut line) {
@@ -3603,7 +3637,9 @@ mod tests {
         ] {
             let _ = proxy_connect(proxy.port, target);
         }
-        let snapshot = proxy.finalize_snapshot(Duration::from_millis(500));
+        // The bound is not what this test checks, so the budget only guards
+        // against a hang (#528).
+        let snapshot = proxy.finalize_snapshot(LOADED_RUNNER_WAIT);
         let logged = std::fs::read_to_string(log).unwrap();
 
         assert_eq!(snapshot.recorded_attempts, 3);
@@ -3689,7 +3725,8 @@ mod tests {
         for line in attacks.iter().chain(legit.iter()) {
             let mut conn =
                 std::net::TcpStream::connect(format!("127.0.0.1:{}", proxy.port)).unwrap();
-            let _ = write!(conn, "{line}\r\nHost: x\r\n\r\n");
+            // One write: see `proxy_connect`.
+            let _ = conn.write_all(format!("{line}\r\nHost: x\r\n\r\n").as_bytes());
             let mut drain = Vec::new();
             let _ = std::io::Read::read_to_end(&mut conn, &mut drain);
         }
