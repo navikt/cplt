@@ -5063,7 +5063,10 @@ fn run_exec_command(
             playwright_socket_guard: _playwright_socket_guard,
         ..
     } = {
-        let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
+        let mut probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
+        // `exec` never writes the managed block, so it gets no read on a root
+        // AGENTS.md cplt did not write (#252).
+        probe.root_agents_md = None;
         assemble_sandbox(
             cli,
             &mut resolved,

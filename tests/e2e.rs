@@ -6056,6 +6056,43 @@ paths = [
         );
     }
 
+    /// #252: the root AGENTS.md read grant exists for the block cplt writes on
+    /// an agent launch. `exec` never writes it, so from a subdirectory it must
+    /// not read the root file, even with --agents-md on.
+    #[test]
+    fn e2e_exec_gets_no_root_agents_md_grant() {
+        require_sandbox!();
+        // Not under the system temp dir, which the profile already reads.
+        let repo = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        assert!(git_ok(repo.path(), &["init", "--quiet"]));
+        let root = std::fs::canonicalize(repo.path()).unwrap();
+        let sub = root.join("apps/web");
+        std::fs::create_dir_all(&sub).unwrap();
+        let agents = root.join("AGENTS.md");
+        std::fs::write(&agents, "root-agents-marker\n").unwrap();
+
+        let output = cplt_cmd()
+            .args(["--no-validate", "--brief", "--agents-md", "--project-dir"])
+            .arg(&sub)
+            .args(["exec", "--", "/bin/cat"])
+            .arg(&agents)
+            .current_dir(&sub)
+            .output()
+            .expect("cplt exec should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !output.status.success() && !stdout.contains("root-agents-marker"),
+            "exec read the root AGENTS.md it never wrote.\nstdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&agents).unwrap(),
+            "root-agents-marker\n",
+            "exec must not write the managed block"
+        );
+    }
+
     #[test]
     fn e2e_exec_no_output_contamination() {
         // exec must not contaminate stdout or stderr with cplt startup messages —

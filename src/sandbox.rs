@@ -291,20 +291,24 @@ impl PreparedSandbox {
     /// write), the file holds nothing cplt put there and the agent has no
     /// reason to read outside its project, so the launch drops the grant.
     pub fn revoke_root_agents_md(&mut self, file: &Path) {
+        // The macOS profile is the enforced text itself; the Linux text is the
+        // `describe()` summary, kept in step with the rules removed below.
         #[cfg(target_os = "macos")]
-        {
-            self.profile_text = self
-                .profile_text
-                .replace(&profile::root_agents_md_sbpl(file), "");
-        }
+        let chunk = profile::root_agents_md_sbpl(file);
+        #[cfg(target_os = "linux")]
+        let chunk = landlock_mod::root_agents_md_description(file);
+        debug_assert!(
+            self.profile_text.contains(&chunk),
+            "revoking a root AGENTS.md grant the profile does not hold"
+        );
+        self.profile_text = self.profile_text.replacen(&chunk, "", 1);
         #[cfg(target_os = "linux")]
         {
-            let _ = file;
             self.precomputed.deferred_plain_file = None;
-            if let Some(w) = &mut self.bwrap_wrapper {
-                w.fs_rules
-                    .retain(|r| Some(&r.path) != w.plain_file.as_ref());
-                w.plain_file = None;
+            if let Some(w) = &mut self.bwrap_wrapper
+                && let Some(i) = w.plain_file.take()
+            {
+                w.fs_rules.remove(i);
             }
         }
     }
@@ -1148,22 +1152,15 @@ fn prepare_impl(
     // `resolve()` only clones `fs_rules`/`net_rules` on the arms that actually
     // build a wrapper (explicit-on, or auto-detect with bwrap available) — the
     // disabled and fallback arms borrow and clone nothing.
-    let mut bwrap_wrapper = bubblewrap::resolve(
+    let bwrap_wrapper = bubblewrap::resolve(
         config.use_bubblewrap,
-        &policy.fs_rules,
-        &policy.net_rules,
-        policy.restrict_net_connect,
-        config.proxy_forced,
+        &policy,
         bubblewrap::Overlays {
             read_only: &ro_protect,
             pins: &pins,
         },
         &deny_masks,
     )?;
-
-    if let Some(w) = &mut bwrap_wrapper {
-        w.plain_file.clone_from(&policy.plain_file);
-    }
 
     // Said only where it is true: without bubblewrap none of these binds exist,
     // so warning about a bounded scan there would imply a protection the host
@@ -1491,6 +1488,78 @@ mod tests {
             allow_cache_exec_any: false,
             allow_browser: false,
             use_bubblewrap: None,
+        }
+    }
+
+    /// #252: revoking the root AGENTS.md grant removes exactly that rule, on
+    /// both backends and in the text `describe()` prints. A user `allow.read`
+    /// naming the same file is a separate grant and survives the revoke.
+    #[test]
+    fn revoke_root_agents_md_removes_only_the_tagged_rule() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let file = root.join("AGENTS.md");
+        std::fs::write(&file, "x").unwrap();
+        let user = [file.clone()];
+        let mut config = test_config(&home, &user);
+        config.root_agents_md = Some(&file);
+        config.use_bubblewrap = Some(false);
+        let mut sandbox = prepare(&config).unwrap();
+
+        #[cfg(target_os = "macos")]
+        let chunk = profile::root_agents_md_sbpl(&file);
+        #[cfg(target_os = "linux")]
+        let chunk = landlock_mod::root_agents_md_description(&file);
+        assert!(describe(&sandbox).contains(&chunk), "not granted");
+
+        // prepare() ran Landlock-only; stand in the wrapper resolve() builds
+        // when bwrap is present, the user's rule and the tagged one side by side.
+        #[cfg(target_os = "linux")]
+        {
+            assert!(sandbox.precomputed.deferred_plain_file.is_some());
+            let rule = |path: &Path| landlock_mod::FsRule {
+                path: path.to_path_buf(),
+                access: landlock_mod::FsAccess {
+                    read: true,
+                    write: false,
+                    execute: false,
+                    ioctl: false,
+                    create_dirs: false,
+                },
+            };
+            sandbox.bwrap_wrapper = Some(bubblewrap::BubblewrapWrapper {
+                bwrap_path: PathBuf::from("/usr/bin/bwrap"),
+                bwrap_args: vec![],
+                fs_rules: vec![rule(&file), rule(&file)],
+                net_rules: vec![],
+                restrict_net_connect: true,
+                strict: false,
+                deny_mask_count: 0,
+                socket_mask_count: 0,
+                proxy_forced: false,
+                plain_file: Some(1),
+            });
+        }
+
+        sandbox.revoke_root_agents_md(&file);
+        let text = describe(&sandbox);
+        assert!(!text.contains(&chunk), "grant still described");
+        assert!(
+            text.contains(&file.display().to_string()),
+            "the user's own allow.read went with it"
+        );
+        #[cfg(target_os = "linux")]
+        {
+            assert!(sandbox.precomputed.deferred_plain_file.is_none());
+            let w = sandbox.bwrap_wrapper.as_ref().unwrap();
+            assert!(w.plain_file.is_none());
+            assert_eq!(
+                w.fs_rules.len(),
+                1,
+                "user rule removed, or tagged rule kept"
+            );
         }
     }
 

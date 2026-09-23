@@ -638,7 +638,10 @@ root), creating the file if it does not exist. When that file sits outside
 `--project-dir`, the sandbox grants read, and only read, on that one file so
 the agent can see the block; nothing else in the root becomes visible. The
 grant is dropped when the block could not be written, and a link or
-non-regular file at that path is never granted. This
+non-regular file at that path is never granted. `cplt exec` never writes the
+block and gets no grant. Under bubblewrap on Linux, a repository root under
+`/tmp` gets no grant either: the sandbox's `/tmp` is private, and the file is
+left out of it rather than bound in before cplt writes it. This
 writes into your repository, so it is a second opt-in on top of the first:
 
 - The block is delimited by `<!-- cplt:sandbox begin -->` /

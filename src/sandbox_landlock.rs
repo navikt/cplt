@@ -133,11 +133,13 @@ pub struct LandlockPolicy {
     /// Writable home tool dirs (build caches such as `$CARGO_HOME/registry`)
     /// pre-created before the sandbox is applied, for the same reason.
     pub precreate_dirs: Vec<PathBuf>,
-    /// The one `fs_rules` path that must be a single plain file: the
-    /// repository-root `AGENTS.md` (#252). Opened at exec time, not in
-    /// `precompute()`, because cplt writes it after the policy is built, and
-    /// only with [`open_plain_file`]'s checks.
-    pub plain_file: Option<PathBuf>,
+    /// Index into `fs_rules` of the one rule that must be a single plain
+    /// file: the repository-root `AGENTS.md` (#252). Opened at exec time, not
+    /// in `precompute()`, because cplt writes it after the policy is built, and
+    /// only with [`open_plain_file`]'s checks. An index, not a path: a user
+    /// `allow.read`/`allow.write` naming the same file is a separate rule and
+    /// keeps its own, ordinary open (and survives a revoke).
+    pub plain_file: Option<usize>,
 }
 
 /// Pre-computed data for sandbox application in the child process.
@@ -607,13 +609,14 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     }
 
     // ── Repository-root AGENTS.md: read only, this one file (#252) ──
-    let plain_file = config
+    let mut plain_file = None;
+    if let Some(p) = config
         .root_agents_md
         .filter(|p| !policy::grant_is_refused(home, p))
-        .map(Path::to_path_buf);
-    if let Some(p) = &plain_file {
+    {
+        plain_file = Some(fs_rules.len());
         fs_rules.push(FsRule {
-            path: p.clone(),
+            path: p.to_path_buf(),
             access: FsAccess {
                 read: true,
                 write: false,
@@ -1175,6 +1178,15 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     }
 }
 
+/// How [`describe_policy`] lists the root `AGENTS.md` rule (#252), as one
+/// string so `PreparedSandbox::revoke_root_agents_md` can remove exactly it.
+pub(crate) fn root_agents_md_description(file: &Path) -> String {
+    format!(
+        "## Read only, repository-root AGENTS.md\n  {}\n\n",
+        file.display()
+    )
+}
+
 /// Human-readable summary of the Landlock policy for `--print-profile`.
 pub fn describe_policy(policy: &LandlockPolicy) -> String {
     let mut out = String::new();
@@ -1187,7 +1199,10 @@ pub fn describe_policy(policy: &LandlockPolicy) -> String {
     let mut read_only = Vec::new();
     let mut write_only = Vec::new();
 
-    for rule in &policy.fs_rules {
+    for (i, rule) in policy.fs_rules.iter().enumerate() {
+        if policy.plain_file == Some(i) {
+            continue;
+        }
         let a = &rule.access;
         match (a.read, a.write, a.execute) {
             (true, true, true) => full.push(&rule.path),
@@ -1233,6 +1248,9 @@ pub fn describe_policy(policy: &LandlockPolicy) -> String {
             let _ = writeln!(out, "  {}", p.display());
         }
         out.push('\n');
+    }
+    if let Some(rule) = policy.plain_file.and_then(|i| policy.fs_rules.get(i)) {
+        out.push_str(&root_agents_md_description(&rule.path));
     }
 
     if !policy.restrict_net_connect {
@@ -1595,10 +1613,10 @@ pub fn precompute(policy: LandlockPolicy) -> Result<PrecomputedSandbox, String> 
     let mut pre_opened_fds = Vec::new();
     let mut deferred_paths = Vec::new();
     let mut deferred_plain_file = None;
-    for rule in &policy.fs_rules {
+    for (i, rule) in policy.fs_rules.iter().enumerate() {
         let c_path = CString::new(rule.path.as_os_str().as_bytes())
             .map_err(|_| format!("Path contains null byte: {}", rule.path.display()))?;
-        if policy.plain_file.as_ref() == Some(&rule.path) {
+        if policy.plain_file == Some(i) {
             deferred_plain_file = Some((c_path, rule.access));
             continue;
         }
@@ -2032,7 +2050,7 @@ pub(crate) fn apply_landlock_and_seccomp_now(
     net_rules: &[NetRule],
     restrict_net_connect: bool,
     proxy_forced: bool,
-    plain_file: Option<&Path>,
+    plain_file: Option<usize>,
 ) -> std::io::Result<()> {
     use landlock::{AccessNet, NetPort, RulesetCreatedAttr, RulesetStatus};
     use std::ffi::CString;
@@ -2045,10 +2063,10 @@ pub(crate) fn apply_landlock_and_seccomp_now(
     // Open each rule's path in *this* namespace. `/proc/self` resolves to this
     // process's pid, which is preserved across the upcoming `execve()`, so no
     // deferral is needed here (unlike the fork-based path).
-    for rule in fs_rules {
+    for (i, rule) in fs_rules.iter().enumerate() {
         let c_path = CString::new(rule.path.as_os_str().as_bytes())
             .map_err(|_| std::io::Error::other("path contains null byte"))?;
-        let raw_fd: RawFd = if plain_file == Some(rule.path.as_path()) {
+        let raw_fd: RawFd = if plain_file == Some(i) {
             match open_plain_file(&c_path) {
                 Some(fd) => fd,
                 None => continue,
@@ -3155,6 +3173,19 @@ mod tests {
                 .any(|r| r.path == Path::new("/home/user/repo")),
             "the repository root itself must not be granted"
         );
+
+        // A user grant on the same file stays its own, untagged rule.
+        let user = [file.clone()];
+        config.extra_read = &user;
+        let policy = generate_policy(&config);
+        let i = policy.plain_file.expect("tagged");
+        assert_eq!(policy.fs_rules[i].path, file);
+        assert_eq!(
+            policy.fs_rules.iter().filter(|r| r.path == file).count(),
+            2,
+            "the user's grant and the tagged rule must both exist"
+        );
+        config.extra_read = &[];
 
         let refused = home.join(".netrc");
         config.root_agents_md = Some(&refused);
@@ -4601,7 +4632,7 @@ mod tests {
             proxy_forced: false,
             home_dir: dir.path().to_path_buf(),
             precreate_dirs: vec![],
-            plain_file: Some(file.clone()),
+            plain_file: Some(0),
         };
 
         let pre = precompute(policy).expect("precompute should succeed");
@@ -4624,6 +4655,32 @@ mod tests {
         assert_ne!(before, after, "the upsert should rename a new file in");
         let fd = open_plain_file(c_path).expect("rewritten file");
         assert_eq!(fd_ino(fd), after, "rule bound to a stale inode");
+    }
+
+    /// The deferral follows the tagged rule, not the path: a user grant naming
+    /// the same file is opened in `precompute()` like any other rule.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_user_grant_on_the_root_agents_md_is_not_deferred() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("AGENTS.md");
+        std::fs::write(&file, "x").unwrap();
+        let rule = FsRule {
+            path: file.clone(),
+            access: read_only(),
+        };
+        let policy = LandlockPolicy {
+            fs_rules: vec![rule.clone(), rule],
+            net_rules: vec![],
+            restrict_net_connect: false,
+            proxy_forced: false,
+            home_dir: dir.path().to_path_buf(),
+            precreate_dirs: vec![],
+            plain_file: Some(1),
+        };
+        let pre = precompute(policy).expect("precompute should succeed");
+        assert_eq!(pre.pre_opened_fds.len(), 1, "the user's grant was deferred");
+        assert!(pre.deferred_plain_file.is_some());
     }
 
     /// The exec-time open of the root AGENTS.md checks the inode it binds to,
