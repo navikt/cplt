@@ -1475,6 +1475,49 @@ mod macos_tests {
         );
     }
 
+    /// Kernel truth for #524: the dotfiles repo IS the project, and
+    /// `~/.gitconfig` points into it. The project grant makes the tree
+    /// writable; the target must still refuse a write, and the directory
+    /// holding it must refuse a rename (else `mv` + `mkdir` walks around it).
+    /// A sibling file in the same directory is the control.
+    #[test]
+    fn real_profile_keeps_a_symlinked_git_config_read_only_inside_the_project() {
+        require_sandbox!();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let home = root.join("home");
+        let project = root.join("project");
+        let dotfiles = project.join("dotfiles");
+        let target = dotfiles.join("gitconfig");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&dotfiles).unwrap();
+        fs::write(&target, "[user]\nname = cplt\n").unwrap();
+        std::os::unix::fs::symlink(&target, home.join(".gitconfig")).unwrap();
+
+        let opts = default_opts(&project, &home);
+        let profile = write_real_profile(&opts);
+        let d = dotfiles.display();
+        // Control first: the rename below, if it wrongly succeeds, takes the
+        // directory with it.
+        let (ctl_out, ctl_ok) = run_sandboxed(&profile, &format!("echo ok > '{d}/sibling' 2>&1"));
+        let (write_out, write_ok) = run_sandboxed(
+            &profile,
+            &format!("echo evil >> '{}' 2>&1", target.display()),
+        );
+        let (mv_out, mv_ok) = run_sandboxed(&profile, &format!("mv '{d}' '{d}.old' 2>&1"));
+        fs::remove_file(&profile).ok();
+
+        assert!(ctl_ok, "the project must stay writable: {ctl_out}");
+        assert!(
+            !mv_ok && dotfiles.exists(),
+            "the directory holding the target must refuse a rename: {mv_out}"
+        );
+        assert!(
+            !write_ok && !fs::read_to_string(&target).unwrap().contains("evil"),
+            "the link target must refuse the write: {write_out}"
+        );
+    }
+
     /// The other half of the reverse case: no `~/.gitconfig` at all. Git must
     /// run clean rather than trip over a rule naming a path that is not there.
     #[test]

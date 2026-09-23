@@ -1790,6 +1790,92 @@ pub fn mise_ro_protect_paths(home: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// The [`HOME_CONFIG_FILES`] SECURITY.md documents as read-only: git's own
+/// config, ignore and attributes files, which git on the host trusts. They are
+/// write-denied on macOS, at `$HOME` and at a symlink target, and a symlink
+/// target is bound read-only by Bubblewrap on Linux
+/// (see [`home_config_link_targets`]).
+///
+/// Derived rather than listed, so a git file added to [`HOME_CONFIG_FILES`]
+/// gets the write deny too. The `gh` files and `.tool-versions` are readable
+/// but carry no read-only claim: they never had a `$HOME` write deny.
+pub fn read_only_home_config() -> impl Iterator<Item = &'static str> {
+    HOME_CONFIG_FILES.iter().copied().filter(|f| {
+        matches!(*f, ".gitconfig" | ".gitignore_global")
+            || f.starts_with(".gitconfig.")
+            || f.starts_with(".config/git/")
+    })
+}
+
+/// Where each [`read_only_home_config`] file really lives, for the ones that
+/// resolve somewhere other than `$HOME/<name>` — a dotfiles symlink (#524).
+///
+/// The read grant follows the link (#515), so the write deny has to as well:
+/// a deny naming only `$HOME/.gitconfig` says nothing about
+/// `~/dotfiles/gitconfig`, and when the dotfiles repo is the project (or sits
+/// under an `allow.write` grant) the "read-only" config was writable through
+/// that grant.
+///
+/// Resolved once, at launch. A link whose target does not exist yet resolves
+/// to nothing and is not covered.
+pub fn home_config_link_targets(home: &Path) -> Vec<PathBuf> {
+    read_only_home_config()
+        .filter_map(|rel| {
+            let named = home.join(rel);
+            if !links_inside_home(home, &named) {
+                return None;
+            }
+            std::fs::canonicalize(&named).ok()
+        })
+        .collect()
+}
+
+/// The [`read_only_home_config`] files in a linked `~/.config/git` that do
+/// not exist yet, for the macOS write denies. Git on the host reads
+/// `~/.config/git/config` whenever it exists, so if the agent could create it
+/// in a writable tree it could set `core.fsmonitor` or `core.hooksPath` and
+/// run code in the next unsandboxed git command. `ignore` is the default
+/// `core.excludesFile` and would hide paths from `git status`. Existing ones
+/// are already in [`home_config_link_targets`].
+///
+/// Each entry is the first missing component on the file's path, resolved
+/// through its existing parent: the file itself, or `git` when `~/.config` is
+/// the link and has no `git` directory yet. A deny on the file inside a
+/// missing directory would not hold: the agent could create `git` as a
+/// symlink into another writable tree and write `config` there.
+/// Linux cannot bind a file that does not exist, so it has no counterpart.
+pub fn xdg_git_link_targets(home: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = read_only_home_config()
+        .filter(|rel| rel.starts_with(".config/git/"))
+        .filter_map(|rel| {
+            let named = home.join(rel);
+            if !links_inside_home(home, &named) || std::fs::canonicalize(&named).is_ok() {
+                return None;
+            }
+            let missing = named
+                .ancestors()
+                .take_while(|a| a.symlink_metadata().is_err())
+                .last()?;
+            Some(config::canonicalize_deepest(missing))
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Whether `named`, or a directory between it and `home`, is a symlink.
+///
+/// Comparing `canonicalize(named)` with `named` would also flag a `$HOME` that
+/// is only spelled non-canonically (`/var/folders/…` on macOS, `/home ->
+/// /var/home` on Fedora Atomic) and treat every file in it as a link.
+fn links_inside_home(home: &Path, named: &Path) -> bool {
+    named
+        .ancestors()
+        .take_while(|a| *a != home)
+        .any(|a| a.symlink_metadata().is_ok_and(|m| m.is_symlink()))
+}
+
 /// Copilot's two package directories, which must be re-bound read-only by
 /// Bubblewrap on Linux.
 ///
@@ -3111,6 +3197,26 @@ mod tests {
         assert!(socket_owned_by(501, 1, 501));
         assert!(!socket_owned_by(0, 1, 501), "foreign owner");
         assert!(!socket_owned_by(501, 2, 501), "hardlinked socket");
+    }
+
+    /// The read-only files are git's, drawn from the shared read list (#524,
+    /// #547). Pinning the exact set makes a new entry a deliberate choice: a
+    /// git file joins it, `gh` and `.tool-versions` stay out.
+    #[test]
+    fn read_only_home_config_is_the_git_subset_of_home_config_files() {
+        let ro: Vec<&str> = read_only_home_config().collect();
+        assert!(ro.iter().all(|f| HOME_CONFIG_FILES.contains(f)), "{ro:?}");
+        assert_eq!(
+            ro,
+            [
+                ".gitconfig",
+                ".gitconfig.local",
+                ".gitignore_global",
+                ".config/git/config",
+                ".config/git/ignore",
+                ".config/git/attributes",
+            ]
+        );
     }
 
     #[test]
