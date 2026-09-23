@@ -4,7 +4,7 @@
 //! into the platform cache on first run. The sandbox denies writes to that cache,
 //! so `cplt` has to force the extraction before entering it (#166).
 
-use cplt::sandbox::{CacheEnv, copilot_pkg_dir, process_env};
+use cplt::sandbox::{CacheEnv, copilot_pkg_dir, copilot_pkg_dir_refused, process_env};
 use cplt::ui;
 use std::path::Path;
 use std::path::PathBuf;
@@ -84,6 +84,23 @@ pub fn ensure_copilot_extracted(
         _ => return Ok(()),
     };
 
+    // A cache variable cplt refuses (#374) still steers Copilot, so polling
+    // cplt's fallback would watch a directory Copilot never writes: the
+    // preflight would report a failure, or purge the wrong cache, and the
+    // launch would stop with a misleading message. Stop with the real one.
+    let os = if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "linux"
+    };
+    if let Some(dir) = copilot_pkg_dir_refused(&process_env, home, os) {
+        return Err(format!(
+            "Copilot would extract its runtime to {}, which cplt refuses to grant \
+             (see the warning above for why), so the launch would fail. Unset that \
+             variable, or point it at an absolute directory the warning allows.",
+            dir.display()
+        ));
+    }
     let (pkg_base, cache_dir) = copilot_cache_dirs(&process_env, home, arch);
 
     // Compute binary identity for the fast-path cache.
@@ -226,8 +243,8 @@ struct ExtractionAttempt {
 /// running outside the sandbox.
 ///
 /// cplt's own `copilot_cache_dirs` follows the same precedence through
-/// `copilot_pkg_dir` (#374), except that it ignores a value it considers unsafe
-/// and warns; copilot still honours that value, so the two then disagree.
+/// `copilot_pkg_dir` (#374). A value cplt considers unsafe would make the two
+/// disagree, so the preflight stops on it (`copilot_pkg_dir_refused`).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const EXTRACTION_ENV_ALLOWLIST: &[&str] = &[
     "HOME",

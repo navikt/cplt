@@ -1903,6 +1903,7 @@ mod tests {
             crate::agent::Agent::Copilot,
             home.path(),
             &|_| None,
+            &[],
         );
         let args = build_bwrap_args(
             &rules,

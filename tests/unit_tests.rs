@@ -4555,7 +4555,7 @@ fn copilot_ro_protect_paths_cover_both_package_dirs() {
     // mechanism, so both must be in its set.
     let home = std::path::Path::new("/Users/test");
     let paths =
-        cplt::sandbox::copilot_ro_protect_paths(cplt::agent::Agent::Copilot, home, &|_| None);
+        cplt::sandbox::copilot_ro_protect_paths(cplt::agent::Agent::Copilot, home, &|_| None, &[]);
     for expected in ["/Users/test/.copilot/pkg", "/Users/test/.cache/copilot/pkg"] {
         assert!(
             paths.contains(&std::path::PathBuf::from(expected)),
@@ -4577,7 +4577,8 @@ fn copilot_ro_protect_paths_are_empty_for_other_agents() {
             cplt::sandbox::copilot_ro_protect_paths(
                 agent,
                 std::path::Path::new("/Users/test"),
-                &|_| None
+                &|_| None,
+                &[],
             )
             .is_empty(),
             "{agent:?} must get no Copilot package binds"
@@ -4718,7 +4719,7 @@ fn copilot_pkg_dir_skips_unsafe_values() {
 fn copilot_pkg_dirs_is_only_the_default_without_overrides() {
     let home = std::path::Path::new("/Users/test");
     assert_eq!(
-        cplt::sandbox::copilot_pkg_dirs(&cache_env(&[]), home, "linux"),
+        cplt::sandbox::copilot_pkg_dirs(&cache_env(&[]), home, "linux", &[]),
         vec![std::path::PathBuf::from("/Users/test/.cache/copilot/pkg")]
     );
 }
@@ -4731,7 +4732,7 @@ fn copilot_pkg_dirs_keeps_the_default_and_adds_every_loader_dir() {
         ("XDG_CACHE_HOME", "/opt/xdg"),
     ]);
     assert_eq!(
-        cplt::sandbox::copilot_pkg_dirs(&env, home, "linux"),
+        cplt::sandbox::copilot_pkg_dirs(&env, home, "linux", &[]),
         [
             "/Users/test/.cache/copilot/pkg",
             "/opt/xdg/copilot/pkg",
@@ -4740,7 +4741,7 @@ fn copilot_pkg_dirs_keeps_the_default_and_adds_every_loader_dir() {
         .map(std::path::PathBuf::from)
     );
     assert_eq!(
-        cplt::sandbox::copilot_pkg_dirs(&env, home, "macos"),
+        cplt::sandbox::copilot_pkg_dirs(&env, home, "macos", &[]),
         [
             "/Users/test/Library/Caches/copilot/pkg",
             "/opt/pkgcache/pkg"
@@ -4756,6 +4757,7 @@ fn copilot_ro_protect_paths_follow_the_resolved_cache() {
         cplt::agent::Agent::Copilot,
         std::path::Path::new("/Users/test"),
         &env,
+        &[],
     );
     for expected in [
         "/Users/test/.copilot/pkg",
@@ -4795,18 +4797,112 @@ fn profile_carves_out_the_resolved_copilot_cache() {
             assert!(p.contains(&rule), "profile must contain {rule}");
         }
     }
-    // An override can sit anywhere, so its whole ancestor chain is pinned.
-    for pinned in [
-        "/opt/copilot-cache",
-        "/opt",
-        "/Users/test/Library/Caches/copilot",
-    ] {
+    assert!(
+        p.contains("(deny file-write-unlink (literal \"/Users/test/Library/Caches/copilot\"))")
+    );
+    // The override lies in no writable tree, so nothing above it can be
+    // renamed from inside and nothing is pinned (`home_config_target_pins`).
+    for unpinned in ["/opt/copilot-cache", "/opt", "/"] {
         assert!(
-            p.contains(&format!("(deny file-write-unlink (literal \"{pinned}\"))")),
-            "{pinned} must be pinned"
+            !p.contains(&format!(
+                "(deny file-write-unlink (literal \"{unpinned}\"))"
+            )),
+            "{unpinned} must not be pinned"
         );
     }
-    assert!(!p.contains("(deny file-write-unlink (literal \"/\"))"));
+}
+
+/// #374: the preflight stops when cplt refuses the directory Copilot will
+/// extract into, instead of polling a fallback Copilot never writes.
+#[test]
+fn copilot_pkg_dir_refused_names_where_copilot_extracts() {
+    let home = std::path::Path::new("/Users/test");
+    let refused = |vars: &[(&str, &str)]| {
+        cplt::sandbox::copilot_pkg_dir_refused(&cache_env(vars), home, "linux")
+    };
+    assert_eq!(refused(&[]), None);
+    assert_eq!(refused(&[("COPILOT_CACHE_HOME", "/opt/cache")]), None);
+    assert_eq!(
+        refused(&[("COPILOT_CACHE_HOME", "/Users/test/.ssh")]),
+        Some(std::path::PathBuf::from("/Users/test/.ssh/pkg"))
+    );
+}
+
+/// A real tree for the #374 writable-tree checks: `<tmp>/project`,
+/// `allow.write = <tmp>/w`, and `<tmp>/real` outside both. Not under the
+/// system temp dir, which is itself a writable tree.
+fn copilot_cache_tree() -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("tempdir");
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    for d in ["project", "w", "real"] {
+        std::fs::create_dir_all(root.join(d)).unwrap();
+    }
+    (tmp, root)
+}
+
+fn profile_in_tree(root: &std::path::Path, cache_home: &std::path::Path) -> String {
+    let value = cache_home.as_os_str().to_owned();
+    let env = move |k: &str| (k == "COPILOT_CACHE_HOME").then(|| value.clone());
+    let project = root.join("project");
+    let extra_write = [root.join("w")];
+    generate_profile(
+        &SandboxConfig {
+            project_dir: &project,
+            extra_write: &extra_write,
+            copilot_cache_env: &env,
+            ..base_profile_options()
+        },
+        &[],
+    )
+}
+
+/// #374: a cache variable that lands in a writable tree would make the
+/// directory Copilot runs from writable and executable, so it is refused.
+#[test]
+fn profile_refuses_a_copilot_cache_in_a_writable_tree() {
+    let (_guard, root) = copilot_cache_tree();
+    for value in [
+        root.join("project/.cache"),
+        root.join("w/cache"),
+        std::path::PathBuf::from("/tmp/cplt-copilot-cache"),
+    ] {
+        let p = profile_in_tree(&root, &value);
+        assert!(
+            !p.contains("cache/pkg\"))") && !p.contains("cplt-copilot-cache"),
+            "{} must be refused",
+            value.display()
+        );
+    }
+}
+
+/// #374: a symlinked value is granted where it resolves; Seatbelt matches the
+/// resolved path, so a rule on the link would never fire.
+#[test]
+fn profile_grants_a_symlinked_copilot_cache_at_its_target() {
+    let (_guard, root) = copilot_cache_tree();
+    std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+    let p = profile_in_tree(&root, &root.join("link"));
+    let real = root.join("real/pkg").display().to_string();
+    assert!(p.contains(&format!("(deny file-write* (subpath \"{real}\"))")));
+    assert!(p.contains(&format!("(allow process-exec (subpath \"{real}\"))")));
+    assert!(!p.contains(&root.join("link").display().to_string()));
+}
+
+/// #374: the write deny on a moved Copilot cache comes after every write
+/// allow, so neither `allow.write` nor the temp rules can reopen it.
+#[test]
+fn profile_copilot_cache_deny_follows_every_write_allow() {
+    let (_guard, root) = copilot_cache_tree();
+    let p = profile_in_tree(&root, &root.join("real"));
+    let real = root.join("real/pkg").display().to_string();
+    let deny_at = p
+        .find(&format!("(deny file-write* (subpath \"{real}\"))"))
+        .expect("override deny");
+    let last_allow = p.rfind("(allow file-write").expect("a write allow");
+    assert!(
+        deny_at > last_allow,
+        "the override deny must come after the last write allow"
+    );
 }
 
 #[test]

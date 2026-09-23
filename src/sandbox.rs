@@ -74,12 +74,13 @@ pub use policy::{
     PLAYWRIGHT_SOCKET_ROOT, PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX, PROTECTED_IN_GITDIR,
     PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir, SENSITIVE_PROJECT_PATTERNS,
     TOOL_PATH_ENV_VARS, ToolPathEnvVar, ToolPathOverride, ToolRoot, active_tool_dirs, app_dirs,
-    copilot_pkg_dir, copilot_pkg_dirs, copilot_ro_protect_paths, credential_link_hop, current_uid,
-    exec_write_conflicts, home_config_link_targets, home_tool_dirs, linux_docker_socket_paths,
-    linux_runtime_dirs, mise_ro_protect_paths, nested_alternation, no_cache_env, path_bin_dirs,
-    playwright_runtime_intent, process_env, relocatable_tool_prefix, socket_mask_paths,
-    tool_override_path_is_safe, tool_path_env_overrides, validate_playwright_socket_dir,
-    validate_sbpl_path, xdg_runtime_dir_env,
+    copilot_pkg_dir, copilot_pkg_dir_refused, copilot_pkg_dirs, copilot_ro_protect_paths,
+    credential_link_hop, current_uid, exec_write_conflicts, home_config_link_targets,
+    home_tool_dirs, linux_docker_socket_paths, linux_runtime_dirs, mise_ro_protect_paths,
+    nested_alternation, no_cache_env, path_bin_dirs, playwright_runtime_intent, process_env,
+    relocatable_tool_prefix, socket_mask_paths, tool_override_path_is_safe,
+    tool_path_env_overrides, validate_playwright_socket_dir, validate_sbpl_path,
+    xdg_runtime_dir_env,
 };
 
 // SBPL profile generation — kept public for unit tests.
@@ -583,6 +584,18 @@ fn canonical_writable_trees(config: &SandboxConfig) -> Vec<(PathBuf, &'static st
         .into_iter()
         .map(|(t, why)| (std::fs::canonicalize(&t).unwrap_or(t), why))
         .collect()
+}
+
+/// Copilot's SEA `pkg` directories for `os` (`policy::copilot_pkg_dirs`), with
+/// a cache variable that points into a writable tree refused (#374): that
+/// directory would be writable and executable at once.
+fn copilot_pkg_grants(config: &SandboxConfig, os: &str) -> Vec<PathBuf> {
+    policy::copilot_pkg_dirs(
+        config.copilot_cache_env,
+        config.home_dir,
+        os,
+        &canonical_writable_trees(config),
+    )
 }
 
 /// The dotfiles `targets` that sit inside a writable tree, with that tree's
@@ -1258,11 +1271,25 @@ fn pin_paths(
     // `rmdir` of a mountpoint return `EBUSY`. Derived from the read-only set
     // rather than spelled out, so a package dir added there cannot arrive
     // unpinned. Empty for every agent but Copilot.
+    //
+    // The first two entries are the fixed defaults, whose parents sit directly
+    // in a writable grant. A directory a cache variable moved lies outside
+    // every writable tree (`copilot_pkg_grants`), so it gets the same
+    // "strictly inside the outermost writable tree" pins as a dotfiles
+    // target: none today, and never a project or `allow.write` root.
+    let copilot = copilot_ro_protect_paths(
+        config.agent,
+        config.home_dir,
+        config.copilot_cache_env,
+        &canonical_writable_trees(config),
+    );
+    let (defaults, moved) = copilot.split_at(copilot.len().min(2));
     pins.extend(
-        copilot_ro_protect_paths(config.agent, config.home_dir, config.copilot_cache_env)
+        defaults
             .iter()
             .filter_map(|p| p.parent().map(Path::to_path_buf)),
     );
+    pins.extend(home_config_target_pins(config, moved));
     // GHSA-7mcc-xg5v-hv8v, Linux half — the same reasoning one class over, for
     // the exec-only agent grants the read-only overlay covers above.
     // OpenCode's `~/.cache/opencode/bin` is read-only bound, but its parent
@@ -1380,6 +1407,7 @@ fn ro_protect_paths(
         config.agent,
         config.home_dir,
         config.copilot_cache_env,
+        &canonical_writable_trees(config),
     ));
 
     // #524: a dotfiles-managed `~/.gitconfig` resolves to its target, and the

@@ -21,15 +21,15 @@ macro_rules! sbpl {
 
 use super::SandboxConfig;
 use super::policy::{
-    CacheEnv, DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS,
+    DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS,
     DEPENDENCY_SOURCE_TREES, EXEC_IN_WRITABLE, GPG_SIGNING_ALLOW_FILES, HOME_CONFIG_FILES,
     HomeToolDir, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir,
     SENSITIVE_PROJECT_PATTERNS, SYSTEM_READ_FILES, TOOL_READ_DIRS, XCODE_SELECT_LINK,
-    active_tool_dirs, ancestor_alternation, app_dirs, colima_socket_paths, copilot_pkg_dirs,
+    active_tool_dirs, ancestor_alternation, app_dirs, colima_socket_paths, copilot_pkg_dir,
     current_uid, escape_regex, first_party_read_target, grant_is_refused, home_config_link_targets,
-    missing_home_config_link_targets, nested_alternation, path_bin_dirs, playwright_runtime_intent,
-    read_only_home_config, rel_is_glob, rel_regex, validate_playwright_socket_dir,
-    validate_sbpl_path,
+    missing_home_config_link_targets, nested_alternation, no_cache_env, path_bin_dirs,
+    playwright_runtime_intent, read_only_home_config, rel_is_glob, rel_regex,
+    validate_playwright_socket_dir, validate_sbpl_path,
 };
 
 /// Device nodes a sandboxed process may open for writing, by exact path.
@@ -151,7 +151,6 @@ pub fn generate_profile_with_playwright_socket_dir(
         config.allow_cache_exec,
         config.allow_cache_exec_any,
         Path::new(XCODE_SELECT_LINK),
-        config.copilot_cache_env,
     );
     emit_agent_exec_carveouts(&mut sb, config.agent_dirs);
     emit_copilot_install(&mut sb, config.copilot_install_dir);
@@ -247,6 +246,9 @@ pub fn generate_profile_with_playwright_socket_dir(
         config.extra_write,
         config.scratch_dir,
     );
+    // Same reason: a Copilot cache moved by a cache variable (#374) keeps its
+    // write deny over every allow above.
+    emit_copilot_pkg_override_denies(&mut sb, config);
     // MUST stay last: see `emit_exec_write_denies`. An exec grant that could be
     // reopened for writing by a later allow is a write-then-exec path.
     emit_exec_write_denies(&mut sb, config.extra_exec);
@@ -1220,7 +1222,6 @@ fn emit_tool_dirs(
     allow_cache_exec: &[String],
     allow_cache_exec_any: bool,
     xcode_select_link: &Path,
-    copilot_cache_env: &CacheEnv,
 ) {
     let home = home_dir.to_string_lossy();
     sbpl!(sb, ";; Developer tools");
@@ -1386,17 +1387,12 @@ fn emit_tool_dirs(
     //     the sandbox (--no-auto-update), so writes are not needed.
     // Must come AFTER the denies (last-match-wins in SBPL).
     // Only needed for Copilot agent.
-    // Resolved as Copilot resolves it (#374): only the default below unless
-    // `COPILOT_PKG_CACHE_HOME` / `COPILOT_CACHE_HOME` moves it, in which case
-    // each directory gets the same four rules.
+    // A directory a cache variable moves it to (#374) gets the same rules
+    // from `emit_copilot_pkg_override_denies`, after every allow.
     if agent.needs_copilot_dir() {
-        // The first entry is always the default.
-        for (i, pkg_dir) in copilot_pkg_dirs(copilot_cache_env, home_dir, "macos")
-            .iter()
-            .enumerate()
-        {
-            emit_copilot_pkg_carveout(sb, pkg_dir, i > 0);
-        }
+        let pkg = copilot_pkg_dir(&no_cache_env, home_dir, "macos");
+        let pin: Vec<PathBuf> = pkg.parent().map(Path::to_path_buf).into_iter().collect();
+        emit_copilot_pkg_carveout(sb, &pkg, &pin);
     }
 
     // User-specified ~/Library/Caches exec carve-outs.
@@ -1431,11 +1427,11 @@ fn emit_tool_dirs(
     }
 }
 
-/// Exec, write-deny and rename pin for one Copilot SEA `pkg` directory.
+/// Exec, write-deny and rename pins for one Copilot SEA `pkg` directory.
 ///
 /// `pkg_dir` comes from `copilot_pkg_dirs`, which only admits env values that
 /// pass `validate_sbpl_path`.
-fn emit_copilot_pkg_carveout(sb: &mut String, pkg_dir: &Path, all_ancestors: bool) {
+fn emit_copilot_pkg_carveout(sb: &mut String, pkg_dir: &Path, pins: &[PathBuf]) {
     let pkg = pkg_dir.to_string_lossy();
     sbpl!(sb, "(allow file-map-executable (subpath \"{pkg}\"))");
     sbpl!(sb, "(allow process-exec (subpath \"{pkg}\"))");
@@ -1465,15 +1461,34 @@ fn emit_copilot_pkg_carveout(sb: &mut String, pkg_dir: &Path, all_ancestors: boo
     // here; this block stays hand-written because Copilot's package dir is
     // not an `AgentDir` grant.
     //
-    // The default's grandparent `~/Library/Caches` is not renameable, so one
-    // pin is enough there. A directory named by a cache variable can sit
-    // anywhere, so `all_ancestors` pins every ancestor below `/`.
-    let ancestors = pkg_dir.ancestors().skip(1).filter(|a| a.parent().is_some());
-    for ancestor in ancestors.take(if all_ancestors { usize::MAX } else { 1 }) {
-        let ancestor = ancestor.to_string_lossy();
-        sbpl!(sb, "(deny file-write-unlink (literal \"{ancestor}\"))");
+    // The default's grandparent `~/Library/Caches` is not renameable, so its
+    // one pin is the parent. A directory named by a cache variable gets
+    // `home_config_target_pins`: what lies strictly inside the outermost
+    // writable tree holding it.
+    for pin in pins {
+        let pin = pin.to_string_lossy();
+        sbpl!(sb, "(deny file-write-unlink (literal \"{pin}\"))");
     }
     sbpl!(sb);
+}
+
+/// The Copilot `pkg` carve-out for each directory a cache variable moved it to
+/// (#374).
+///
+/// Emitted after every allow, for the reason `emit_exec_write_denies` spells
+/// out: SBPL is last-match-wins, and a user `allow.write` or the temp rules
+/// emitted later would otherwise reopen the write deny on a directory the
+/// host executes. `copilot_pkg_grants` already refuses a directory inside a
+/// writable tree; this keeps the deny winning if that check ever misses one.
+fn emit_copilot_pkg_override_denies(sb: &mut String, config: &SandboxConfig) {
+    if !config.agent.needs_copilot_dir() {
+        return;
+    }
+    // The first entry is always the default, emitted in `emit_tool_dirs`.
+    for pkg_dir in super::copilot_pkg_grants(config, "macos").iter().skip(1) {
+        let pins = super::home_config_target_pins(config, std::slice::from_ref(pkg_dir));
+        emit_copilot_pkg_carveout(sb, pkg_dir, &pins);
+    }
 }
 
 /// Exec carve-out for exec-only agent dirs (`!write && process_exec`:
@@ -3165,7 +3180,6 @@ mod tests {
             &[],
             false,
             xcode_select_link,
-            &crate::sandbox::no_cache_env,
         );
         sb
     }
