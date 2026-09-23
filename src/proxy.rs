@@ -3787,17 +3787,31 @@ mod tests {
 
     /// Read the proxy's reply up to the end of its status line.
     fn read_status_line(conn: &mut std::net::TcpStream) -> String {
+        read_status_line_within(conn, Duration::from_secs(5))
+    }
+
+    /// [`read_status_line`] with the wait passed in. A read that ends before
+    /// the newline says why, so a failure is not a bare `""`.
+    fn read_status_line_within(conn: &mut std::net::TcpStream, wait: Duration) -> String {
         // `.ok()`: macOS refuses the option (EINVAL) once the peer has reset.
-        conn.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        conn.set_read_timeout(Some(wait)).ok();
         let mut line = Vec::new();
         let mut byte = [0u8; 1];
-        while let Ok(1) = conn.read(&mut byte) {
-            if byte[0] == b'\n' {
-                break;
+        let end = loop {
+            match conn.read(&mut byte) {
+                Ok(0) => break Some("EOF".to_string()),
+                Ok(_) if byte[0] == b'\n' => break None,
+                Ok(_) => line.push(byte[0]),
+                // Linux never restarts a read on a socket with SO_RCVTIMEO.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => break Some(e.to_string()),
             }
-            line.push(byte[0]);
+        };
+        let line = String::from_utf8_lossy(&line).trim().to_string();
+        match end {
+            Some(why) if line.is_empty() => format!("<{why}>"),
+            _ => line,
         }
-        String::from_utf8_lossy(&line).trim().to_string()
     }
 
     /// A request head split across TCP segments must be reassembled, and bytes
@@ -3882,6 +3896,9 @@ mod tests {
 
     /// A client that never finishes its head gets a 408 at the timeout, and
     /// the proxy serves another client while that one is still stalled.
+    ///
+    /// Takes the full head timeout (10 s) by design; it runs beside the rest
+    /// of the suite, not in front of it.
     #[test]
     fn unfinished_request_head_times_out_with_408() {
         require_localhost_tcp!();
@@ -3890,21 +3907,34 @@ mod tests {
         let origin = std::thread::spawn(move || listener.accept().is_ok());
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("p.log");
-        let proxy = head_test_proxy(port, Duration::from_secs(2), log.clone());
+        // Wide enough that a loaded runner serves the second client long
+        // before the stalled one's deadline, instead of racing it (#528).
+        let head_timeout = Duration::from_secs(10);
+        let proxy = head_test_proxy(port, head_timeout, log.clone());
 
         let mut slow = std::net::TcpStream::connect(("127.0.0.1", proxy.port)).unwrap();
         slow.write_all(b"CONNECT localhost:").unwrap();
-        // Served while `slow` is still inside its 2 s head deadline.
         let started = Instant::now();
         let next_status = proxy_connect(proxy.port, &format!("localhost:{port}"));
         assert!(next_status.contains("200"), "got {next_status:?}");
         assert!(
-            started.elapsed() < Duration::from_secs(2),
+            started.elapsed() < head_timeout / 2,
             "second client waited for the stalled one"
+        );
+        // The ordering the test is about, checked rather than assumed: when
+        // the 200 arrived, the stalled client had no reply and no close yet.
+        slow.set_nonblocking(true).unwrap();
+        let pending = slow.peek(&mut [0u8; 1]);
+        slow.set_nonblocking(false).unwrap();
+        assert!(
+            pending
+                .as_ref()
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock),
+            "stalled client was answered before the second one: {pending:?}"
         );
         // Only joined once the 200 proves the origin got its connection.
         assert!(origin.join().unwrap());
-        let slow_status = read_status_line(&mut slow);
+        let slow_status = read_status_line_within(&mut slow, head_timeout * 2);
         proxy.shutdown();
 
         assert!(slow_status.contains("408"), "got {slow_status:?}");
