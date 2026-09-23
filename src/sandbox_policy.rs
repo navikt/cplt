@@ -6,7 +6,7 @@
 use crate::agent::Agent;
 use crate::config;
 use directories::ProjectDirs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Characters that would break SBPL profile string interpolation.
 const SBPL_UNSAFE_CHARS: &[char] = &['"', ')', '(', ';', '\\', '\n', '\r', '\0'];
@@ -168,13 +168,38 @@ pub fn denied_dotfile_dir(home: &Path, path: &Path) -> Option<&'static str> {
 /// a symlink out of the directory is refused as well.
 #[must_use]
 pub fn cplt_state_dir_grant(home: &Path, path: &Path) -> Option<PathBuf> {
-    let resolved = config::canonicalize_deepest(path);
+    let canon = resolver(home);
+    let resolved = canon(path);
     [config::config_dir(), Some(home.join(CPLT_STATE_DIR))]
         .into_iter()
         .flatten()
-        .find(|dir| {
-            resolved.starts_with(config::canonicalize_deepest(dir)) || path.starts_with(dir)
-        })
+        .find(|dir| resolved.starts_with(canon(dir)) || path.starts_with(dir))
+}
+
+/// [`config::canonicalize_deepest`], with `home` resolved once.
+///
+/// A `$HOME` that does not exist has nothing under it, so a path below it
+/// resolves to the resolved `$HOME` plus the rest as spelled, with no lookup
+/// of its own. That is the case for the fake homes in tests, and on macOS
+/// `/home` is automounted: each lookup of a missing name there costs tens of
+/// milliseconds, and the deny lists are resolved for every grant.
+fn resolver(home: &Path) -> impl Fn(&Path) -> PathBuf {
+    let missing =
+        matches!(std::fs::canonicalize(home), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+            .then(|| config::canonicalize_deepest(home));
+    move |path| match (&missing, path.strip_prefix(home)) {
+        // `join("")` would add a trailing separator; `..` is not lexical.
+        (Some(resolved), Ok(rest))
+            if rest.components().all(|c| matches!(c, Component::Normal(_))) =>
+        {
+            if rest.as_os_str().is_empty() {
+                resolved.clone()
+            } else {
+                resolved.join(rest)
+            }
+        }
+        _ => config::canonicalize_deepest(path),
+    }
 }
 
 /// Whether a grant on `path` must never reach a backend ruleset.
@@ -419,9 +444,13 @@ pub fn gpg_signing_file_target(home: &Path, file: &str) -> Option<PathBuf> {
 }
 
 /// Exact-path membership of `path` in a `$HOME`-relative deny list, comparing
-/// the literal and the canonicalized form.
+/// the literal and the resolved form.
+///
+/// Resolved with [`config::canonicalize_deepest`], as the macOS deny is, so a
+/// dangling `~/.ssh -> ~/dotfiles/ssh` still refuses a grant on the
+/// `~/dotfiles/ssh` it will become.
 fn denied_entry(list: &[&'static str], home: &Path, path: &Path) -> Option<&'static str> {
-    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let canon = resolver(home);
     let resolved = canon(path);
     list.iter().copied().find(|f| {
         let denied = home.join(f);
@@ -3479,6 +3508,46 @@ mod tests {
         assert!(socket_owned_by(501, 1, 501));
         assert!(!socket_owned_by(0, 1, 501), "foreign owner");
         assert!(!socket_owned_by(501, 2, 501), "hardlinked socket");
+    }
+
+    /// A dangling `~/.ssh` / `~/.netrc` link: a grant naming the target it will
+    /// become is refused like one on the link itself.
+    #[test]
+    fn grant_on_the_future_target_of_a_dangling_credential_link_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir(home.join("dots")).unwrap();
+        std::os::unix::fs::symlink("dots/ssh", home.join(".ssh")).unwrap();
+        std::os::unix::fs::symlink("dots/netrc", home.join(".netrc")).unwrap();
+        assert_eq!(
+            denied_dotfile_dir(&home, &home.join("dots/ssh")),
+            Some(".ssh")
+        );
+        assert_eq!(
+            hard_denied_file(&home, &home.join("dots/netrc")),
+            Some(".netrc")
+        );
+    }
+
+    /// A `$HOME` that does not exist yet takes the shortcut in [`resolver`]:
+    /// a dangling `$HOME` link still refuses grants at its future target.
+    #[test]
+    fn a_missing_home_resolves_its_deny_entries_through_its_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let home = root.join("home");
+        std::os::unix::fs::symlink("real", &home).unwrap();
+        let target = root.join("real");
+        assert_eq!(
+            denied_dotfile_dir(&home, &target.join(".ssh")),
+            Some(".ssh")
+        );
+        assert_eq!(
+            hard_denied_file(&home, &target.join(".netrc")),
+            Some(".netrc")
+        );
+        assert_eq!(denied_dotfile_dir(&home, &target.join("src")), None);
+        assert!(cplt_state_dir_grant(&home, &target.join(".config/cplt/x")).is_some());
     }
 
     /// The read-only files are git's, drawn from the shared read list (#524,

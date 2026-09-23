@@ -382,12 +382,50 @@ pub(crate) fn lexically_normalized(path: &Path) -> PathBuf {
 /// actually land. This also covers a canonicalize failure that is not ENOENT —
 /// a permission-denied ancestor, or ELOOP — where the unresolved fallback would
 /// likewise name a path the kernel never matches.
+///
+/// A dangling symlink on the way is followed too: `~/.ssh -> ~/dotfiles/ssh`
+/// with no `~/dotfiles/ssh` yet would otherwise resolve to `~/.ssh` itself,
+/// and a rule naming that matches nothing once the target is created. Loops
+/// and long chains stop at the kernel's own `MAXSYMLINKS` (32 on macOS, 40 on
+/// Linux), keeping the lexical form from there.
 pub(crate) fn canonicalize_deepest(path: &Path) -> PathBuf {
+    deepest(path, &mut if cfg!(target_os = "macos") { 32 } else { 40 })
+}
+
+fn deepest(path: &Path, hops: &mut u32) -> PathBuf {
     let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
     let mut cur = path;
     loop {
         if let Ok(base) = cur.canonicalize() {
-            return tail.iter().rev().fold(base, |acc, part| acc.join(part));
+            // Only the first missing name can be a dangling link: everything
+            // below it sits under a name that does not exist. One `readlink`
+            // there, not one per level — each lookup of a missing name under
+            // an automounted `/home` costs tens of milliseconds on macOS.
+            let link = match tail.split_last() {
+                Some((first, rest)) if *hops > 0 => {
+                    std::fs::read_link(base.join(first)).ok().map(|l| (l, rest))
+                }
+                _ => None,
+            };
+            let Some((link, rest)) = link else {
+                return tail.iter().rev().fold(base, |acc, part| acc.join(part));
+            };
+            *hops -= 1;
+            // `..` in the link steps up from the resolved parent, POSIX order,
+            // as in `fully_resolved`.
+            let mut out = base;
+            for c in link.components() {
+                match c {
+                    Component::ParentDir => {
+                        out = deepest(&out, hops);
+                        out.pop();
+                    }
+                    Component::CurDir => {}
+                    other => out.push(other),
+                }
+            }
+            let out = rest.iter().rev().fold(out, |acc, part| acc.join(part));
+            return deepest(&out, hops);
         }
         // Nothing along the whole path resolved (only reachable if even `/`
         // fails to canonicalize) — keep the lexical form rather than drop it.
@@ -661,6 +699,37 @@ mod tests {
 
         assert_eq!(resolve_repo_path("link", &root), root.join("real"));
         assert_eq!(resolve_repo_path("./link/", &root), root.join("real"));
+    }
+
+    /// A dangling link resolves to where its target will be created, through
+    /// `..`, a chain of links and a missing tail; a loop still terminates.
+    #[test]
+    fn canonicalize_deepest_follows_a_dangling_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(root.join("home/dots")).unwrap();
+        let home = root.join("home");
+        std::os::unix::fs::symlink("dots/ssh", home.join(".ssh")).unwrap();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::os::unix::fs::symlink("../home/.ssh", root.join("sub/chain")).unwrap();
+        std::os::unix::fs::symlink("loop", root.join("loop")).unwrap();
+
+        assert_eq!(
+            canonicalize_deepest(&home.join(".ssh")),
+            home.join("dots/ssh")
+        );
+        assert_eq!(
+            canonicalize_deepest(&home.join(".ssh/id_ed25519")),
+            home.join("dots/ssh/id_ed25519")
+        );
+        assert_eq!(
+            canonicalize_deepest(&root.join("home/../sub/chain/k")),
+            home.join("dots/ssh/k")
+        );
+        assert_eq!(
+            canonicalize_deepest(&root.join("loop/x")),
+            root.join("loop/x")
+        );
     }
 
     #[test]
