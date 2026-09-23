@@ -1206,6 +1206,46 @@ fn symlinked_git_config_into_a_denied_directory_is_not_granted() {
     );
 }
 
+/// A home config grant covers one file. `~/.gitconfig -> ~/.config` would be a
+/// recursive Landlock rule over cplt's own state dir, and a `~/.gitconfig`
+/// hardlinked onto `~/.ssh/id_ed25519` is the key's inode under a harmless
+/// name. Neither gets a rule on either backend.
+#[test]
+fn home_config_grant_refuses_directories_and_hardlinks() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let home_dir = std::fs::canonicalize(home.path()).expect("canonicalize home");
+    let link = home_dir.join(".gitconfig");
+    let config = SandboxConfig {
+        home_dir: &home_dir,
+        ..base_profile_options()
+    };
+    let check = |what: &str, target: &std::path::Path| {
+        let p = generate_profile(&config, &[]);
+        for s in [&link, target] {
+            let lit = format!("(allow file-read* (literal \"{}\"))", s.display());
+            assert!(!p.contains(&lit), "{what}: macOS grants {s:?}:\n{p}");
+        }
+        let rules: Vec<_> = cplt::sandbox::generate_policy(&config)
+            .fs_rules
+            .into_iter()
+            .filter(|r| r.path == link)
+            .collect();
+        assert!(rules.is_empty(), "{what}: Landlock rule on {link:?}");
+    };
+
+    let state = home_dir.join(".config");
+    std::fs::create_dir_all(state.join("cplt")).expect("mkdir state");
+    std::os::unix::fs::symlink(&state, &link).expect("symlink");
+    check("directory symlink", &state);
+    std::fs::remove_file(&link).expect("rm link");
+
+    let key = home_dir.join(".ssh/id_ed25519");
+    std::fs::create_dir_all(key.parent().unwrap()).expect("mkdir .ssh");
+    std::fs::write(&key, "key").expect("write key");
+    std::fs::hard_link(&key, &link).expect("hardlink");
+    check("hardlink", &key);
+}
+
 /// `~/.cargo -> /opt/cargo`, the tool-dir half of #515 (#523). A `subpath` rule
 /// matches the resolved path, so granting only `~/.cargo/bin` left the real
 /// toolchain denied. The target must carry the tool dir's own permissions, and
