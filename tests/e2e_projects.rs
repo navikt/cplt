@@ -28,15 +28,9 @@ mod project_tests {
     use std::process::Command;
 
     use crate::common::{cplt_cmd, git_cmd};
-    use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     static PROJECT_COUNTER: AtomicU32 = AtomicU32::new(0);
-    /// Each proxy test gets a unique port to avoid collisions in parallel runs.
-    static PROXY_PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
-
-    fn next_proxy_port() -> u16 {
-        19400 + PROXY_PORT_COUNTER.fetch_add(1, Ordering::SeqCst)
-    }
 
     // ── Guards ─────────────────────────────────────────────────────
 
@@ -2257,7 +2251,9 @@ fi
     fn project_with_proxy_mode() {
         require_sandbox!();
         let project = TempProject::scaffold_node();
-        let port = next_proxy_port();
+        // 0 = OS-assigned ephemeral port; cplt binds it and reports the
+        // actual port back via --proxy-port's default-ephemeral support.
+        let port: u16 = 0;
 
         // Fake copilot that just reads a file (basic smoke test with proxy)
         let script = script_file_ops(&["package.json"], "output.txt");
@@ -2635,7 +2631,9 @@ if IFS= read -r -t 5 STOLEN < "{victim}" 2>/dev/null; then echo "RESULT:peer_tty
     fn project_proxy_env_vars_injected() {
         require_sandbox!();
         let project = TempProject::scaffold_node();
-        let port = next_proxy_port();
+        // 0 = OS-assigned ephemeral port; cplt binds it and reports the
+        // actual port back via --proxy-port's default-ephemeral support.
+        let port: u16 = 0;
 
         let script = r#"
 # Proxy env vars should be set when --with-proxy is used
@@ -2671,26 +2669,31 @@ if [ -n "${no_proxy:-}" ]; then echo "RESULT:no_proxy_lower:OK"; else echo "RESU
     fn project_proxy_port_filtering() {
         require_sandbox!();
         let project = TempProject::scaffold_node();
-        let port = next_proxy_port();
+        // 0 = OS-assigned ephemeral port; cplt binds it and reports the
+        // actual port back via --proxy-port's default-ephemeral support.
+        let port: u16 = 0;
 
         // Script that tries to connect to various ports through the proxy.
         // For port 443 we use a non-existent host — the proxy allows the port
         // but fails DNS, returning 502. This proves port filtering passed.
-        let script = format!(
-            r#"
+        let script = r#"
+# The actual proxy port is OS-assigned (--proxy-port 0); recover it from the
+# HTTP_PROXY URL cplt injects (http://127.0.0.1:PORT) rather than a fixed port.
+PROXY_PORT=${http_proxy##*:}
+
 # Port 443: allowed → proxy tries DNS, fails → 502 (proves port check passed)
-RESP443=$(printf 'CONNECT nonexistent.invalid:443 HTTP/1.1\r\nHost: nonexistent.invalid:443\r\n\r\n' | nc -w 3 127.0.0.1 {port} 2>/dev/null | head -1)
+RESP443=$(printf 'CONNECT nonexistent.invalid:443 HTTP/1.1\r\nHost: nonexistent.invalid:443\r\n\r\n' | nc -w 3 127.0.0.1 "$PROXY_PORT" 2>/dev/null | head -1)
 if echo "$RESP443" | grep -q "502"; then echo "RESULT:port_443:OK"; else echo "RESULT:port_443:FAIL:$RESP443"; fi
 
 # Port 80: blocked → 403 (port filter rejects before DNS)
-RESP80=$(printf 'CONNECT example.com:80 HTTP/1.1\r\nHost: example.com:80\r\n\r\n' | nc -w 2 127.0.0.1 {port} 2>/dev/null | head -1)
+RESP80=$(printf 'CONNECT example.com:80 HTTP/1.1\r\nHost: example.com:80\r\n\r\n' | nc -w 2 127.0.0.1 "$PROXY_PORT" 2>/dev/null | head -1)
 if echo "$RESP80" | grep -q "403"; then echo "RESULT:port_80:OK"; else echo "RESULT:port_80:FAIL:$RESP80"; fi
 
 # Port 8080: blocked → 403
-RESP8080=$(printf 'CONNECT example.com:8080 HTTP/1.1\r\nHost: example.com:8080\r\n\r\n' | nc -w 2 127.0.0.1 {port} 2>/dev/null | head -1)
+RESP8080=$(printf 'CONNECT example.com:8080 HTTP/1.1\r\nHost: example.com:8080\r\n\r\n' | nc -w 2 127.0.0.1 "$PROXY_PORT" 2>/dev/null | head -1)
 if echo "$RESP8080" | grep -q "403"; then echo "RESULT:port_8080:OK"; else echo "RESULT:port_8080:FAIL:$RESP8080"; fi
 "#
-        );
+        .to_string();
         let fake_dir = create_fake_copilot(&project, &script);
         let (stdout, stderr, success) = run_cplt(
             &project,
@@ -2734,7 +2737,9 @@ if [ -z "${HTTPS_PROXY:-}" ]; then echo "RESULT:no_https_proxy:OK"; else echo "R
     fn project_proxy_allowlist_blocks_unlisted() {
         require_sandbox!();
         let project = TempProject::scaffold_node();
-        let port = next_proxy_port();
+        // 0 = OS-assigned ephemeral port; cplt binds it and reports the
+        // actual port back via --proxy-port's default-ephemeral support.
+        let port: u16 = 0;
 
         // An allowlist with one domain, in a tree the session CANNOT write: a
         // list file inside a writable tree is refused at launch, because the
@@ -2753,13 +2758,15 @@ if [ -z "${HTTPS_PROXY:-}" ]; then echo "RESULT:no_https_proxy:OK"; else echo "R
         let allowlist_path = list_dir.join("allowed-domains.txt");
         std::fs::write(&allowlist_path, "only-this.example.com\n").unwrap();
 
-        // Try to CONNECT to a domain NOT in the allowlist
-        let script = format!(
-            r#"
-RESP=$(printf 'CONNECT blocked.example.com:443 HTTP/1.1\r\nHost: blocked.example.com:443\r\n\r\n' | nc -w 2 127.0.0.1 {port} 2>/dev/null | head -1)
+        // Try to CONNECT to a domain NOT in the allowlist. The actual proxy
+        // port is OS-assigned (--proxy-port 0); recover it from the
+        // HTTP_PROXY URL cplt injects (http://127.0.0.1:PORT).
+        let script = r#"
+PROXY_PORT=${http_proxy##*:}
+RESP=$(printf 'CONNECT blocked.example.com:443 HTTP/1.1\r\nHost: blocked.example.com:443\r\n\r\n' | nc -w 2 127.0.0.1 "$PROXY_PORT" 2>/dev/null | head -1)
 if echo "$RESP" | grep -q "403"; then echo "RESULT:blocked_unlisted:OK"; else echo "RESULT:blocked_unlisted:FAIL:$RESP"; fi
 "#
-        );
+        .to_string();
         let fake_dir = create_fake_copilot(&project, &script);
         let (stdout, stderr, success) = run_cplt(
             &project,
@@ -2786,16 +2793,20 @@ if echo "$RESP" | grep -q "403"; then echo "RESULT:blocked_unlisted:OK"; else ec
     fn project_proxy_audit_log_written() {
         require_sandbox!();
         let project = TempProject::scaffold_node();
-        let port = next_proxy_port();
+        // 0 = OS-assigned ephemeral port; cplt binds it and reports the
+        // actual port back via --proxy-port's default-ephemeral support.
+        let port: u16 = 0;
         let log_path = project.path().join("proxy-audit.log");
 
-        // Send a CONNECT through the proxy to generate a log entry
-        let script = format!(
-            r#"
-printf 'CONNECT example.com:80 HTTP/1.1\r\nHost: example.com:80\r\n\r\n' | nc -w 2 127.0.0.1 {port} 2>/dev/null >/dev/null
+        // Send a CONNECT through the proxy to generate a log entry. The actual
+        // proxy port is OS-assigned (--proxy-port 0); recover it from the
+        // HTTP_PROXY URL cplt injects (http://127.0.0.1:PORT).
+        let script = r#"
+PROXY_PORT=${http_proxy##*:}
+printf 'CONNECT example.com:80 HTTP/1.1\r\nHost: example.com:80\r\n\r\n' | nc -w 2 127.0.0.1 "$PROXY_PORT" 2>/dev/null >/dev/null
 echo "RESULT:sent:OK"
 "#
-        );
+        .to_string();
         let fake_dir = create_fake_copilot(&project, &script);
         let (stdout, stderr, success) = run_cplt(
             &project,
