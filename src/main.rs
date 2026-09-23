@@ -4919,7 +4919,10 @@ fn prepare_shell_sandbox(
     project_dir: &Path,
     repos: NamedRepos<'_>,
 ) -> anyhow::Result<AssembledSandbox> {
-    let probe = HostProbe::probe(resolved, home_dir, project_dir);
+    let mut probe = HostProbe::probe(resolved, home_dir, project_dir);
+    // Like `exec`, `check` never writes the managed block, so it probes
+    // without the root AGENTS.md read (#252).
+    probe.root_agents_md = None;
     assemble_sandbox(
         cli,
         resolved,

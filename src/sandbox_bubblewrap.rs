@@ -1189,6 +1189,14 @@ fn run_inner() {
     let Ok(policy) = serde_json::from_slice::<InnerPolicy>(&data) else {
         return;
     };
+    // An index past the rules would leave the root AGENTS.md without its
+    // link checks; refuse the policy rather than guess.
+    if policy
+        .plain_file
+        .is_some_and(|i| i >= policy.fs_rules.len())
+    {
+        return;
+    }
 
     let fs_rules: Vec<FsRule> = policy.fs_rules.iter().map(InnerRule::to_fs_rule).collect();
     let net_rules: Vec<NetRule> = policy

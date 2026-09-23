@@ -297,14 +297,20 @@ impl PreparedSandbox {
         let chunk = profile::root_agents_md_sbpl(file);
         #[cfg(target_os = "linux")]
         let chunk = landlock_mod::root_agents_md_description(file);
-        debug_assert!(
-            self.profile_text.contains(&chunk),
-            "revoking a root AGENTS.md grant the profile does not hold"
-        );
+        // A refused path (`grant_is_refused`) was never emitted: nothing to
+        // withdraw. On Linux the rule index is the truth, since the text may
+        // already omit a grant bubblewrap does not give.
+        #[cfg(target_os = "macos")]
+        if !self.profile_text.contains(&chunk) {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if self.precomputed.deferred_plain_file.take().is_none() {
+            return;
+        }
         self.profile_text = self.profile_text.replacen(&chunk, "", 1);
         #[cfg(target_os = "linux")]
         {
-            self.precomputed.deferred_plain_file = None;
             if let Some(w) = &mut self.bwrap_wrapper
                 && let Some(i) = w.plain_file.take()
             {
@@ -1111,7 +1117,7 @@ fn prepare_impl(
     }
 
     let mut policy = landlock_mod::generate_policy(config);
-    let profile_text = landlock_mod::describe_policy(&policy);
+    let mut profile_text = landlock_mod::describe_policy(&policy);
 
     // Repositories nested inside a writable root, found once and given to BOTH
     // path sets. The leaf binds and the rename pins have to see the same list:
@@ -1161,6 +1167,16 @@ fn prepare_impl(
         },
         &deny_masks,
     )?;
+
+    // Under bubblewrap a root AGENTS.md below the private /tmp gets no mount
+    // (`mount_rules`), so the launch gives no grant: do not print one.
+    if bwrap_wrapper.is_some()
+        && let Some(rule) = policy.plain_file.map(|i| &policy.fs_rules[i])
+        && rule.path.starts_with("/tmp")
+    {
+        profile_text =
+            profile_text.replacen(&landlock_mod::root_agents_md_description(&rule.path), "", 1);
+    }
 
     // Said only where it is true: without bubblewrap none of these binds exist,
     // so warning about a bounded scan there would imply a protection the host
@@ -1561,6 +1577,22 @@ mod tests {
                 "user rule removed, or tagged rule kept"
             );
         }
+    }
+
+    /// A refused root AGENTS.md is never emitted, yet the launch still revokes
+    /// it when the block is not written. That must be a no-op, not a panic.
+    #[test]
+    fn revoke_root_agents_md_of_a_refused_path_is_a_no_op() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(temp.path()).unwrap();
+        let refused = home.join(".netrc");
+        let mut config = test_config(&home, &[]);
+        config.root_agents_md = Some(&refused);
+        config.use_bubblewrap = Some(false);
+        let mut sandbox = prepare(&config).unwrap();
+        let before = describe(&sandbox).to_string();
+        sandbox.revoke_root_agents_md(&refused);
+        assert_eq!(describe(&sandbox), before);
     }
 
     fn pnpm_tool_dir(path: &str) -> &'static HomeToolDir {
