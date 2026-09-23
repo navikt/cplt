@@ -849,6 +849,15 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
                 fix: None,
                 objection: None,
             },
+            Ok(approval) if !approval.graphql_targets.is_empty() => ExecExplain {
+                decision: Decision::Allowed,
+                reason: "allowed by the gh guard if every review thread it writes to \
+                         belongs to a repository in scope; the guard asks GitHub when \
+                         the command runs."
+                    .to_string(),
+                fix: None,
+                objection: None,
+            },
             Ok(_) => ExecExplain {
                 decision: Decision::Allowed,
                 reason: "allowed by the gh guard.".to_string(),

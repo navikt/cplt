@@ -1063,7 +1063,7 @@ fn gh_gate_allow_api_write_still_blocks_graphql() {
     // GraphQL must remain blocked even with --allow-api-write — arbitrary mutations
     // cannot be statically scope-checked.
     let (_, stderr, ok) = gh_gate_with_opts(&["api", "graphql"], &["--allow-api-write"]);
-    assert_refused(&stderr, ok, "arbitrary mutations");
+    assert_refused(&stderr, ok, "no query was given");
 }
 
 #[test]
@@ -1334,10 +1334,11 @@ fn gh_gate_blocks_short_f_uppercase_combined() {
 #[test]
 fn gh_gate_blocks_graphql_endpoint() {
     // Agent tries: echo '{"query":"mutation{...}"}' | gh api graphql
+    // With no -f query the guard cannot see the request, so it is refused.
     let (_, stderr, ok) = gh_gate(&["api", "graphql"]);
     // The old assertion only required "graphql" in stderr, which the echoed
     // command line supplies for any refusal at all. Pin the reason instead.
-    assert_refused(&stderr, ok, "arbitrary mutations");
+    assert_refused(&stderr, ok, "no query was given");
 }
 
 #[test]
@@ -1365,7 +1366,125 @@ fn gh_gate_blocks_graphql_with_query_params() {
 fn gh_gate_blocks_graphql_with_method() {
     // Even explicit GET to graphql should be blocked (mutations can be sent as GET with query param)
     let (_, stderr, ok) = gh_gate(&["api", "-XGET", "graphql"]);
-    assert_refused(&stderr, ok, "arbitrary mutations");
+    assert_refused(&stderr, ok, "not supported for gh api graphql");
+    let (_, stderr, ok) = gh_gate(&["api", "-X", "GET", "graphql", "-f", "query={ __typename }"]);
+    assert_refused(&stderr, ok, "must use POST");
+}
+
+// -- GraphQL allowlist (#414) --
+
+/// A stand-in `gh` that answers the guard's node lookup as if the node lived
+/// in `repo_url`, and otherwise succeeds without doing anything.
+fn fake_lookup_gh(dir: &std::path::Path, typename: &str, repo_url: &str) -> std::path::PathBuf {
+    let script = dir.join("fake-gh.sh");
+    let body = format!(
+        r#"{{"data":{{"node":{{"__typename":"{typename}","repository":{{"url":"{repo_url}"}}}}}}}}"#
+    );
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in *'node(id: $id)'*) printf '%s' '{body}' ;; esac\nexit 0\n"
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    script
+}
+
+fn gh_gate_with_fake_gh(real_gh: &std::path::Path, args: &[&str]) -> (String, bool) {
+    let repo = temp_repo("navikt/cplt");
+    let output = cplt_cmd()
+        .arg("gh-gate")
+        .arg("--real-gh")
+        .arg(real_gh)
+        .arg("--real-git")
+        .arg(binary_in_path("git"))
+        .arg("--repo-scope")
+        .arg("navikt/cplt")
+        .arg("--")
+        .args(args)
+        .current_dir(repo.path())
+        .output()
+        .expect("cplt gh-gate should run");
+    (
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        output.status.success(),
+    )
+}
+
+const RESOLVE: &str = "query=mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { isResolved } } }";
+
+#[test]
+fn gh_gate_allows_graphql_query_on_startup_repo() {
+    let (_, stderr, ok) = gh_gate(&[
+        "api",
+        "graphql",
+        "-f",
+        "query={ repository(owner: \"navikt\", name: \"cplt\") { pullRequest(number: 1) { reviewThreads(first: 50) { nodes { id isResolved } } } } }",
+    ]);
+    assert!(ok, "in-scope query must run.\nstderr: {stderr}");
+}
+
+#[test]
+fn gh_gate_refuses_graphql_query_on_other_repo() {
+    let (_, stderr, ok) = gh_gate(&[
+        "api",
+        "graphql",
+        "-f",
+        "query={ repository(owner: \"other\", name: \"repo\") { id } }",
+    ]);
+    assert_refused(&stderr, ok, "outside the startup scope");
+}
+
+#[test]
+fn gh_gate_allows_resolve_thread_in_startup_repo() {
+    let dir = tempfile::tempdir().unwrap();
+    let gh = fake_lookup_gh(
+        dir.path(),
+        "PullRequestReviewThread",
+        "https://github.com/navikt/cplt",
+    );
+    let (stderr, ok) =
+        gh_gate_with_fake_gh(&gh, &["api", "graphql", "-f", RESOLVE, "-f", "id=PRRT_1"]);
+    assert!(ok, "in-scope thread must be resolvable.\nstderr: {stderr}");
+}
+
+#[test]
+fn gh_gate_refuses_resolve_thread_in_other_repo() {
+    let dir = tempfile::tempdir().unwrap();
+    let gh = fake_lookup_gh(
+        dir.path(),
+        "PullRequestReviewThread",
+        "https://github.com/other/repo",
+    );
+    let (stderr, ok) =
+        gh_gate_with_fake_gh(&gh, &["api", "graphql", "-f", RESOLVE, "-f", "id=PRRT_1"]);
+    assert_refused(&stderr, ok, "belongs to 'other/repo'");
+}
+
+#[test]
+fn gh_gate_refuses_resolve_thread_it_cannot_verify() {
+    // /usr/bin/true answers the lookup with nothing: unverifiable, refused.
+    let (stderr, ok) = gh_gate_with_fake_gh(
+        std::path::Path::new("/usr/bin/true"),
+        &["api", "graphql", "-f", RESOLVE, "-f", "id=PRRT_1"],
+    );
+    assert_refused(&stderr, ok, "could not verify");
+}
+
+#[test]
+fn gh_gate_refuses_non_allowlisted_graphql_mutation() {
+    let (_, stderr, ok) = gh_gate(&[
+        "api",
+        "graphql",
+        "-f",
+        "query=mutation { resolveReviewThread: mergePullRequest(input: {pullRequestId: \"PR_1\"}) { clientMutationId } }",
+    ]);
+    assert_refused(&stderr, ok, "mutation 'mergePullRequest' is not allowed");
 }
 
 // ============================================================
