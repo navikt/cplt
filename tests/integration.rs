@@ -668,7 +668,7 @@ mod macos_tests {
     }
 
     impl ChromeProcess {
-        fn spawn(stage: &str, command: &mut Command) -> Self {
+        fn try_spawn(stage: &str, command: &mut Command) -> Result<Self, String> {
             let stdout_file = tempfile::tempfile().expect("create Chrome stdout capture file");
             let stderr_file = tempfile::tempfile().expect("create Chrome stderr capture file");
             command
@@ -686,21 +686,21 @@ mod macos_tests {
 
             let mut child = command
                 .spawn()
-                .unwrap_or_else(|error| panic!("{stage}: failed to launch command: {error}"));
+                .map_err(|error| format!("{stage}: failed to launch command: {error}"))?;
             let process_group = libc::pid_t::try_from(child.id()).unwrap_or_else(|_| {
                 let _ = child.kill();
                 let _ = child.wait();
                 panic!("{stage}: Chrome process ID does not fit pid_t");
             });
 
-            Self {
+            Ok(Self {
                 child,
                 process_group,
                 stdout_file,
                 stderr_file,
                 status: None,
                 cleaned_up: false,
-            }
+            })
         }
 
         fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
@@ -1258,7 +1258,7 @@ mod macos_tests {
         render_url: &str,
         expected_token: &str,
     ) -> Result<(), String> {
-        let mut browser = ChromeProcess::spawn(stage, command);
+        let mut browser = ChromeProcess::try_spawn(stage, command)?;
         let deadline = Instant::now() + CHROME_PROBE_TIMEOUT;
 
         let failure = run_cdp_probe(
