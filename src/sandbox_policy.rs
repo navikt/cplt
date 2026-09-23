@@ -76,8 +76,10 @@ pub const DENIED_FILES: &[&str] = &[
 /// One list so the backends cannot drift apart (#522): a config that works on
 /// Linux and fails on macOS, or the reverse, with nothing to say the platform
 /// is the difference. Each backend follows a dotfiles symlink to its target
-/// and refuses a target that is hard-denied (`grant_is_refused`), so a link
-/// into `~/.ssh` or onto `~/.git-credentials` never becomes a grant.
+/// through [`first_party_read_target`], which refuses a target that is
+/// hard-denied, lies inside a [`DENIED_DOTFILES`] directory, or is a
+/// [`DENIED_HOME_SUBPATHS`] entry, so a link into `~/.ssh` or onto
+/// `~/.git-credentials` never becomes a grant.
 ///
 /// Exact files only. Linux used to grant the whole `~/.config/git` tree, which
 /// also holds `credentials`, git's XDG cleartext credential store. `ignore`
@@ -201,12 +203,28 @@ pub fn grant_is_refused(home: &Path, path: &Path) -> bool {
 /// refused when it lies anywhere inside a denied dotfile directory or is a
 /// [`DENIED_HOME_SUBPATHS`] entry. A path that does not resolve is returned as
 /// spelled, since there is nothing behind it to expose.
+///
+/// Every caller names a file, so an existing target must be a regular file.
+/// `~/.gitconfig -> ~/.config` would otherwise make Landlock grant the whole
+/// tree, cplt's own state directory included; a Landlock rule is recursive.
+/// A target the user owns with more than one link is refused too: a hardlink
+/// `~/.gitconfig` onto `~/.ssh/id_ed25519` canonicalizes to itself and passes
+/// every path check while exposing the key's inode. Dotfile managers link
+/// with symlinks. A root-owned file is exempt, as in a Nix store deduplicated
+/// by `auto-optimise-store`: the user cannot plant that link, and their
+/// credentials are their own files.
 #[must_use]
 pub fn first_party_read_target(home: &Path, path: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
     if grant_is_refused(home, path) {
         return None;
     }
     let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if let Ok(meta) = std::fs::metadata(&target)
+        && (!meta.is_file() || (meta.nlink() > 1 && meta.uid() == current_uid()))
+    {
+        return None;
+    }
     let in_denied_dir = DENIED_DOTFILES.iter().any(|d| {
         let dir = home.join(d);
         target.starts_with(&dir) || std::fs::canonicalize(&dir).is_ok_and(|c| target.starts_with(c))
@@ -3189,6 +3207,20 @@ mod tests {
 
         let absent = h.join(".nothing-here");
         assert_eq!(first_party_read_target(h, &absent), Some(absent.clone()));
+
+        // A directory target would become a recursive Landlock grant.
+        std::fs::remove_file(&link).unwrap();
+        std::fs::create_dir_all(h.join(".config/cplt")).unwrap();
+        symlink(h.join(".config"), &link).unwrap();
+        assert_eq!(first_party_read_target(h, &link), None, "link to a dir");
+        std::fs::remove_file(&link).unwrap();
+        std::fs::create_dir(&link).unwrap();
+        assert_eq!(first_party_read_target(h, &link), None, "a plain dir");
+        std::fs::remove_dir(&link).unwrap();
+
+        // A hardlink onto the key canonicalizes to itself.
+        std::fs::hard_link(h.join(".ssh/id_ed25519"), &link).unwrap();
+        assert_eq!(first_party_read_target(h, &link), None, "hardlink to key");
     }
 
     /// A hardlink to some other socket, planted in a colima dir, is refused.
