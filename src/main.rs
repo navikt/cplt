@@ -5,8 +5,8 @@ use clap::{Parser, Subcommand};
 #[cfg(target_os = "macos")]
 use cplt::gradle_init;
 use cplt::{
-    agent, audit, brief, check, config, discover, gh_proxy, git, proxy, repo_config, sandbox,
-    scratch, subscriptions, trust, update,
+    agent, audit, brief, check, config, discover, gh_proxy, proxy, repo_config, sandbox, scratch,
+    subscriptions, trust, update,
 };
 use std::collections::BTreeSet;
 use std::io::{self, IsTerminal, Seek, Write};
@@ -2954,19 +2954,39 @@ fn write_session_sandbox_brief(
 /// early return (`--print-profile`, a declined prompt) must leave the project
 /// untouched.
 ///
+/// Written at the repository toplevel, not at `project_dir` (#252): with
+/// `--project-dir apps/web` the file agents read is the root `AGENTS.md`. A
+/// linked worktree or a submodule is its own toplevel, so the block lands in
+/// that checkout, never in the main checkout or the superproject.
+///
 /// Skipped outside a git work tree: a project checkout is the only place a
 /// committed AGENTS.md makes sense, and cplt should not leave a file behind in
 /// an arbitrary directory the user happened to point it at.
 ///
-/// Best-effort: any failure is warned about, never fatal.
-fn apply_persistent_sandbox_brief(resolved: &config::Resolved, project_dir: &Path) {
+/// Best-effort: any failure is warned about, never fatal. Unless the block is
+/// in the file afterwards, the read grant `root_grant` (the probe's
+/// `root_agents_md`) is withdrawn from `prepared` before the agent starts.
+fn apply_persistent_sandbox_brief(
+    resolved: &config::Resolved,
+    project_dir: &Path,
+    prepared: &mut sandbox::PreparedSandbox,
+    root_grant: Option<&Path>,
+) {
+    let in_place = upsert_persistent_sandbox_brief(resolved, project_dir);
+    if !in_place && let Some(file) = root_grant {
+        prepared.revoke_root_agents_md(file);
+    }
+}
+
+/// The upsert half of [`apply_persistent_sandbox_brief`]: `true` when the
+/// managed block is in the root `AGENTS.md` afterwards, written or unchanged.
+fn upsert_persistent_sandbox_brief(resolved: &config::Resolved, project_dir: &Path) -> bool {
     if !resolved.agents_md {
-        return;
+        return false;
     }
-    if !in_git_work_tree(project_dir) {
-        return;
-    }
-    let agents_md = project_dir.join("AGENTS.md");
+    let Some(agents_md) = agents_md_path(project_dir) else {
+        return false;
+    };
     match brief::upsert_managed_block(&agents_md) {
         Ok(brief::BlockOutcome::SkippedAmbiguous) => {
             ui::warn(&format!(
@@ -2977,32 +2997,38 @@ fn apply_persistent_sandbox_brief(resolved: &config::Resolved, project_dir: &Pat
                 brief::BLOCK_BEGIN,
                 brief::BLOCK_END
             ));
+            false
         }
-        Ok(_) => {}
+        Ok(_) => true,
         Err(e) => {
             ui::warn(&format!(
                 "Could not update AGENTS.md sandbox block ({}): {e}",
                 agents_md.display()
             ));
+            false
         }
     }
 }
 
-/// Is `dir` inside a git work tree?
+/// Where the managed block goes: `AGENTS.md` at the toplevel of the work tree
+/// containing `project_dir`. `None` outside a work tree — a plain directory, a
+/// bare repo, or inside `.git` — since `--show-toplevel` fails in all three.
+fn agents_md_path(project_dir: &Path) -> Option<PathBuf> {
+    git_toplevel(project_dir).map(|root| root.join("AGENTS.md"))
+}
+
+/// [`agents_md_path`] when the project grant does not already cover it — the
+/// `--project-dir <subdir>` case, where the sandbox needs a read grant on that
+/// one file or the agent cannot see the block written for it.
 ///
-/// Bare repos and plain directories both answer no: `--is-inside-work-tree`
-/// prints `false` for a bare repo and fails outright outside a repository.
-///
-/// Goes through the hardened parent-side invoker (`git::command`, #210/#211):
-/// this runs in the parent, before the sandbox exists, in a directory the
-/// untrusted project controls, so it must not be a raw `Command::new("git")`.
-/// `rev-parse` is on `CONTENT_FREE_SUBCOMMANDS`, so the invoker never has to
-/// consult the repo config to decide, and returns `None` only for refused
-/// args — which a fixed arg list is not.
-fn in_git_work_tree(dir: &Path) -> bool {
-    git::command(dir, &["rev-parse", "--is-inside-work-tree"])
-        .and_then(|mut cmd| cmd.output().ok())
-        .is_some_and(|o| o.status.success() && o.stdout.starts_with(b"true"))
+/// The file is repository content, so a hostile clone can make it a link to a
+/// secret: Landlock would follow it and grant read on the target. It is granted
+/// only when [`brief::agents_md_is_plain`] passes — the same test that gates
+/// the write. Its directory needs no check: [`git_toplevel`] canonicalizes it.
+/// The one decision both backends consume.
+fn root_agents_md_outside(project_dir: &Path) -> Option<PathBuf> {
+    agents_md_path(project_dir)
+        .filter(|p| !p.starts_with(project_dir) && brief::agents_md_is_plain(p).is_ok())
 }
 
 fn start_proxy_if_enabled(
@@ -3663,7 +3689,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     let electron_app_dir = discover_electron_app_dir(&agent_bin_result, active_agent);
 
     let AssembledSandbox {
-        prepared,
+        mut prepared,
         policy,
         proxy_handle,
         scratch_guard: _scratch_guard,
@@ -3792,7 +3818,12 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // last setup step before launch: every early return above (--print-profile,
     // the recursion guard, preflight failure, a declined prompt) must leave
     // the user's repo untouched.
-    apply_persistent_sandbox_brief(&resolved, &project_dir);
+    apply_persistent_sandbox_brief(
+        &resolved,
+        &project_dir,
+        &mut prepared,
+        probe.root_agents_md.as_deref(),
+    );
 
     // Compute hardening categories for environment sanitization
     let disabled_categories = resolved.disabled_hardening_categories();
@@ -4442,6 +4473,8 @@ struct HostProbe {
     existing_app_dirs: Vec<String>,
     git_hooks_path: Option<PathBuf>,
     git_common_dir: Option<PathBuf>,
+    /// See [`sandbox::SandboxConfig::root_agents_md`].
+    root_agents_md: Option<PathBuf>,
     java_home: Option<PathBuf>,
     dotnet_root: Option<PathBuf>,
 }
@@ -4464,6 +4497,10 @@ impl HostProbe {
             git_hooks_path: discover::git_hooks_path(home_dir),
             // Git worktree common directory (shared .git for worktrees).
             git_common_dir: discover::git_common_dir(home_dir, project_dir),
+            root_agents_md: resolved
+                .agents_md
+                .then(|| root_agents_md_outside(project_dir))
+                .flatten(),
             // JDK read access when installed outside TOOL_READ_DIRS. Covers
             // sdkman (~/.sdkman/candidates/java/), actions/setup-java
             // (hostedtoolcache), jabba, or any other manager under HOME.
@@ -4857,6 +4894,7 @@ fn build_sandbox_config<'a>(
         dotnet_root: probe.dotnet_root.as_deref(),
         git_hooks_path: probe.git_hooks_path.as_deref(),
         git_common_dir: probe.git_common_dir.as_deref(),
+        root_agents_md: probe.root_agents_md.as_deref(),
         allow_gpg_signing: resolved.allow_gpg_signing,
         deny_clipboard: resolved.deny_clipboard,
         allow_jvm_attach: resolved.allow_jvm_attach,
@@ -4881,7 +4919,10 @@ fn prepare_shell_sandbox(
     project_dir: &Path,
     repos: NamedRepos<'_>,
 ) -> anyhow::Result<AssembledSandbox> {
-    let probe = HostProbe::probe(resolved, home_dir, project_dir);
+    let mut probe = HostProbe::probe(resolved, home_dir, project_dir);
+    // Like `exec`, `check` never writes the managed block, so it probes
+    // without the root AGENTS.md read (#252).
+    probe.root_agents_md = None;
     assemble_sandbox(
         cli,
         resolved,
@@ -5025,7 +5066,10 @@ fn run_exec_command(
             playwright_socket_guard: _playwright_socket_guard,
         ..
     } = {
-        let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
+        let mut probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
+        // `exec` never writes the managed block, so it gets no read on a root
+        // AGENTS.md cplt did not write (#252).
+        probe.root_agents_md = None;
         assemble_sandbox(
             cli,
             &mut resolved,
@@ -10283,42 +10327,219 @@ mod tests {
         assert!(resolved_ip_block_item(&optin, "127.0.0.1", 443).is_none());
     }
 
+    /// Run git in `dir` isolated from the caller's global and system config
+    /// (`commit.gpgsign`, `core.hooksPath`, init templates) with a fixed
+    /// identity, panicking on failure: a fixture that quietly failed would
+    /// leave the test asserting nothing.
+    fn git_in(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
     /// A plain directory is not a work tree, so the persistent brief must not
     /// write there — an AGENTS.md only belongs in a project checkout.
     #[test]
-    fn in_git_work_tree_rejects_plain_directory() {
+    fn agents_md_path_skips_plain_directory() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(!in_git_work_tree(dir.path()));
+        assert_eq!(agents_md_path(dir.path()), None);
     }
 
+    /// `--project-dir apps/web` must update the root AGENTS.md, not create
+    /// `apps/web/AGENTS.md` (#252).
     #[test]
-    fn in_git_work_tree_accepts_initialised_repo() {
+    fn agents_md_path_is_repo_root_from_subdirectory() {
         let dir = tempfile::tempdir().unwrap();
-        let ok = std::process::Command::new("git")
-            .args(["init", "--quiet"])
-            .current_dir(dir.path())
-            .status()
-            .is_ok_and(|s| s.success());
-        if !ok {
-            return; // no git on this machine — nothing to assert
-        }
-        assert!(in_git_work_tree(dir.path()));
+        git_in(dir.path(), &["init", "--quiet"]);
+        let sub = dir.path().join("apps/web");
+        std::fs::create_dir_all(&sub).unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        assert_eq!(agents_md_path(&sub), Some(root.join("AGENTS.md")));
+        assert_eq!(agents_md_path(dir.path()), Some(root.join("AGENTS.md")));
+    }
+
+    /// The sandbox read grant for the root AGENTS.md is needed only when the
+    /// project grant does not reach it: from a subdirectory, not from the root.
+    #[test]
+    fn root_agents_md_outside_only_from_subdirectory() {
+        let dir = tempfile::tempdir().unwrap();
+        git_in(dir.path(), &["init", "--quiet"]);
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let sub = root.join("apps/web");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert_eq!(root_agents_md_outside(&sub), Some(root.join("AGENTS.md")));
+        std::fs::write(root.join("AGENTS.md"), "x").unwrap();
+        assert_eq!(root_agents_md_outside(&sub), Some(root.join("AGENTS.md")));
+        assert_eq!(root_agents_md_outside(&root), None);
+    }
+
+    /// A hostile clone ships the root AGENTS.md as a link to a secret. No
+    /// grant: Landlock would follow a symlink to its target, and a hard link
+    /// is the secret under another name. `None` here is what both backends
+    /// receive, so neither emits a rule.
+    #[test]
+    fn root_agents_md_outside_refuses_links() {
+        let dir = tempfile::tempdir().unwrap();
+        git_in(dir.path(), &["init", "--quiet"]);
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let sub = root.join("apps/web");
+        std::fs::create_dir_all(&sub).unwrap();
+        let secrets = tempfile::tempdir().unwrap();
+        let aws = secrets.path().join(".aws");
+        std::fs::create_dir(&aws).unwrap();
+        let secret = aws.join("credentials");
+        std::fs::write(&secret, "aws_secret_access_key=x").unwrap();
+        let agents = root.join("AGENTS.md");
+
+        std::os::unix::fs::symlink(&secret, &agents).unwrap();
+        assert_eq!(root_agents_md_outside(&sub), None, "symlink granted");
+
+        std::fs::remove_file(&agents).unwrap();
+        std::fs::hard_link(&secret, &agents).unwrap();
+        assert_eq!(root_agents_md_outside(&sub), None, "hard link granted");
+
+        // Not a regular file, one link: a directory would trip the nlink test
+        // on most filesystems, a socket does not.
+        std::fs::remove_file(&agents).unwrap();
+        let _sock = std::os::unix::net::UnixListener::bind(&agents).unwrap();
+        assert_eq!(root_agents_md_outside(&sub), None, "socket granted");
+    }
+
+    /// The probe is where both backends get the grant from: a plain root
+    /// AGENTS.md reaches the macOS profile and the Landlock rules, a symlink
+    /// to a secret reaches neither.
+    #[test]
+    fn root_agents_md_grant_reaches_both_backends_only_when_plain() {
+        let dir = tempfile::tempdir().unwrap();
+        git_in(dir.path(), &["init", "--quiet"]);
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let sub = root.join("apps/web");
+        let home = root.join("home");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(home.join(".aws")).unwrap();
+        let secret = home.join(".aws/credentials");
+        std::fs::write(&secret, "aws_secret_access_key=x").unwrap();
+        let agents = root.join("AGENTS.md");
+        let mut resolved = config::Config::parse("")
+            .unwrap()
+            .merge(config::CliFlags::default())
+            .unwrap();
+        resolved.agents_md = true;
+
+        let grants = |resolved: &mut config::Resolved| {
+            let probe = HostProbe::probe(resolved, &home, &sub);
+            let cfg = build_sandbox_config(
+                resolved,
+                &probe,
+                agent::Agent::Shell,
+                &[],
+                NamedRepos::default(),
+                &[],
+                SessionPaths::default(),
+                None,
+            );
+            let lit = format!("(literal \"{}\")", agents.display());
+            let mac = cplt::sandbox::generate_profile(&cfg, &[]).contains(&lit);
+            let linux = cplt::sandbox::generate_policy(&cfg)
+                .fs_rules
+                .iter()
+                .any(|r| r.path == agents);
+            (mac, linux)
+        };
+
+        std::fs::write(&agents, "x").unwrap();
+        assert_eq!(grants(&mut resolved), (true, true), "plain file");
+
+        std::fs::remove_file(&agents).unwrap();
+        std::os::unix::fs::symlink(&secret, &agents).unwrap();
+        assert_eq!(grants(&mut resolved), (false, false), "symlink to a secret");
+    }
+
+    /// The read grant stands only when the upsert leaves the block in the
+    /// root AGENTS.md. Ambiguous markers skip the write, so the launch drops
+    /// the grant: the agent gets no read outside its project on a file cplt
+    /// did not write.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn root_agents_md_grant_withdrawn_when_upsert_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        git_in(dir.path(), &["init", "--quiet"]);
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let sub = root.join("apps/web");
+        let home = root.join("home");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let agents = root.join("AGENTS.md");
+        let mut resolved = config::Config::parse("")
+            .unwrap()
+            .merge(config::CliFlags::default())
+            .unwrap();
+        resolved.agents_md = true;
+        let lit = format!("(literal \"{}\")", agents.display());
+
+        let granted_after_upsert = |resolved: &mut config::Resolved| {
+            let probe = HostProbe::probe(resolved, &home, &sub);
+            let cfg = build_sandbox_config(
+                resolved,
+                &probe,
+                agent::Agent::Shell,
+                &[],
+                NamedRepos::default(),
+                &[],
+                SessionPaths::default(),
+                None,
+            );
+            let mut prepared = sandbox::prepare(&cfg).unwrap();
+            assert!(sandbox::describe(&prepared).contains(&lit), "not granted");
+            apply_persistent_sandbox_brief(
+                resolved,
+                &sub,
+                &mut prepared,
+                probe.root_agents_md.as_deref(),
+            );
+            sandbox::describe(&prepared).contains(&lit)
+        };
+
+        let pair = format!("{}\n{}\n", brief::BLOCK_BEGIN, brief::BLOCK_END);
+        std::fs::write(&agents, format!("{pair}{pair}")).unwrap();
+        assert!(!granted_after_upsert(&mut resolved), "skipped upsert");
+
+        std::fs::remove_file(&agents).unwrap();
+        assert!(granted_after_upsert(&mut resolved), "created by the upsert");
+    }
+
+    /// A linked worktree is its own checkout: the block goes in the worktree,
+    /// never in the main checkout it shares a `.git` with.
+    #[test]
+    fn agents_md_path_is_worktree_root_in_linked_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        git_in(&main, &["init", "--quiet"]);
+        git_in(&main, &["commit", "--quiet", "--allow-empty", "-m", "init"]);
+        git_in(&main, &["worktree", "add", "--quiet", "../wt"]);
+        let wt = std::fs::canonicalize(dir.path().join("wt")).unwrap();
+        let sub = wt.join("src");
+        std::fs::create_dir(&sub).unwrap();
+        assert_eq!(agents_md_path(&sub), Some(wt.join("AGENTS.md")));
     }
 
     /// A bare repo has no work tree, so there is nothing to commit the managed
     /// block into.
     #[test]
-    fn in_git_work_tree_rejects_bare_repo() {
+    fn agents_md_path_skips_bare_repo() {
         let dir = tempfile::tempdir().unwrap();
-        let ok = std::process::Command::new("git")
-            .args(["init", "--bare", "--quiet"])
-            .current_dir(dir.path())
-            .status()
-            .is_ok_and(|s| s.success());
-        if !ok {
-            return;
-        }
-        assert!(!in_git_work_tree(dir.path()));
+        git_in(dir.path(), &["init", "--bare", "--quiet"]);
+        assert_eq!(agents_md_path(dir.path()), None);
     }
 
     // ── --repo-dir validation (#344, stage 1) ────────────────────────────

@@ -71,7 +71,7 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
-use crate::sandbox::landlock_mod::{FsAccess, FsRule, NetRule};
+use crate::sandbox::landlock_mod::{FsAccess, FsRule, LandlockPolicy, NetRule};
 use crate::sandbox::policy::{
     LinuxCoverage, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, Protected, rel_ancestors,
 };
@@ -123,6 +123,10 @@ pub(crate) struct BubblewrapWrapper {
     /// in-namespace so the helper builds the same seccomp filter as the
     /// fork-based path (the UDP/raw-socket denial is gated on it).
     pub proxy_forced: bool,
+    /// [`LandlockPolicy::plain_file`]: the index in `fs_rules` of the root
+    /// `AGENTS.md` rule, which the helper opens with the same link and
+    /// file-type checks as the fork-based path.
+    pub plain_file: Option<usize>,
 }
 
 /// Check if bubblewrap is available on this system.
@@ -989,40 +993,21 @@ pub(crate) fn rename_pin_paths(write_roots: &[&Path], git_dirs: &[&Path]) -> Vec
 /// build a wrapper — never on the disabled or fallback paths.
 pub(crate) fn resolve(
     use_bubblewrap: Option<bool>,
-    fs_rules: &[FsRule],
-    net_rules: &[NetRule],
-    restrict_net_connect: bool,
-    proxy_forced: bool,
+    policy: &LandlockPolicy,
     overlays: Overlays<'_>,
     deny_masks: &DenyMasks,
 ) -> Result<Option<BubblewrapWrapper>, String> {
     match use_bubblewrap {
         Some(false) => Ok(None),
-        Some(true) => build_wrapper(
-            fs_rules,
-            net_rules,
-            restrict_net_connect,
-            proxy_forced,
-            overlays,
-            deny_masks,
-            true,
-        )
-        .map(Some)
-        .map_err(|e| {
-            format!(
-                "Bubblewrap explicitly requested but unavailable: {e}. \
+        Some(true) => build_wrapper(policy, overlays, deny_masks, true)
+            .map(Some)
+            .map_err(|e| {
+                format!(
+                    "Bubblewrap explicitly requested but unavailable: {e}. \
                  Install bubblewrap or remove --use-bubblewrap."
-            )
-        }),
-        None => match build_wrapper(
-            fs_rules,
-            net_rules,
-            restrict_net_connect,
-            proxy_forced,
-            overlays,
-            deny_masks,
-            false,
-        ) {
+                )
+            }),
+        None => match build_wrapper(policy, overlays, deny_masks, false) {
             Ok(wrapper) => Ok(Some(wrapper)),
             Err(e) => {
                 crate::ui::warn(&format!(
@@ -1035,10 +1020,7 @@ pub(crate) fn resolve(
 }
 
 fn build_wrapper(
-    fs_rules: &[FsRule],
-    net_rules: &[NetRule],
-    restrict_net_connect: bool,
-    proxy_forced: bool,
+    policy: &LandlockPolicy,
     overlays: Overlays<'_>,
     deny_masks: &DenyMasks,
     strict: bool,
@@ -1049,19 +1031,38 @@ fn build_wrapper(
             crate::git::TRUSTED_BIN_DIRS.join(", ")
         )
     })?;
-    test_functionality(&bwrap_path, fs_rules, overlays, deny_masks)?;
-    let bwrap_args = build_bwrap_args(fs_rules, overlays, deny_masks);
+    let bind_rules = mount_rules(policy);
+    test_functionality(&bwrap_path, &bind_rules, overlays, deny_masks)?;
+    let bwrap_args = build_bwrap_args(&bind_rules, overlays, deny_masks);
     Ok(BubblewrapWrapper {
         bwrap_path,
         bwrap_args,
-        fs_rules: fs_rules.to_vec(),
-        net_rules: net_rules.to_vec(),
-        restrict_net_connect,
+        fs_rules: policy.fs_rules.clone(),
+        net_rules: policy.net_rules.clone(),
+        restrict_net_connect: policy.restrict_net_connect,
         strict,
         deny_mask_count: deny_masks.mask_count(),
         socket_mask_count: deny_masks.socket_mask_count(),
-        proxy_forced,
+        proxy_forced: policy.proxy_forced,
+        plain_file: policy.plain_file,
     })
+}
+
+/// The rules that shape the mounts: every rule but the root `AGENTS.md`
+/// (#252). Outside /tmp that rule needs no mount (`--ro-bind / /` shows it),
+/// but under the private /tmp it would get its own `--ro-bind`, decided at
+/// `prepare()`, before cplt writes the file, and resolved by bwrap through
+/// any symlink swapped in since. So a repository root under /tmp gets no
+/// root-AGENTS.md grant under bubblewrap: the file is absent from the
+/// namespace, and the Landlock rule the helper still carries opens nothing.
+fn mount_rules(policy: &LandlockPolicy) -> Vec<FsRule> {
+    policy
+        .fs_rules
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| policy.plain_file != Some(i))
+        .map(|(_, r)| r.clone())
+        .collect()
 }
 
 // ── Re-entry helper: policy transfer ───────────────────────────
@@ -1112,6 +1113,10 @@ struct InnerPolicy {
     net_ports: Vec<u16>,
     restrict_net_connect: bool,
     proxy_forced: bool,
+    /// Index into `fs_rules`, carried as is so the path never goes through a
+    /// string round trip to be matched.
+    #[serde(default)]
+    plain_file: Option<usize>,
     /// `[agent_binary, args...]` — `execve`-ed verbatim by the helper.
     agent_argv: Vec<String>,
 }
@@ -1136,6 +1141,7 @@ pub(crate) fn serialize_policy(
         net_ports: wrapper.net_rules.iter().map(|r| r.port).collect(),
         restrict_net_connect: wrapper.restrict_net_connect,
         proxy_forced: wrapper.proxy_forced,
+        plain_file: wrapper.plain_file,
         agent_argv,
     };
     serde_json::to_vec(&policy).map_err(std::io::Error::other)
@@ -1183,6 +1189,14 @@ fn run_inner() {
     let Ok(policy) = serde_json::from_slice::<InnerPolicy>(&data) else {
         return;
     };
+    // An index past the rules would leave the root AGENTS.md without its
+    // link checks; refuse the policy rather than guess.
+    if policy
+        .plain_file
+        .is_some_and(|i| i >= policy.fs_rules.len())
+    {
+        return;
+    }
 
     let fs_rules: Vec<FsRule> = policy.fs_rules.iter().map(InnerRule::to_fs_rule).collect();
     let net_rules: Vec<NetRule> = policy
@@ -1198,6 +1212,7 @@ fn run_inner() {
         &net_rules,
         policy.restrict_net_connect,
         policy.proxy_forced,
+        policy.plain_file,
     )
     .is_err()
     {
@@ -1296,6 +1311,85 @@ mod tests {
                 create_dirs: false,
             },
         }
+    }
+
+    fn test_policy(fs_rules: Vec<FsRule>, plain_file: Option<usize>) -> LandlockPolicy {
+        LandlockPolicy {
+            fs_rules,
+            net_rules: vec![],
+            restrict_net_connect: true,
+            proxy_forced: false,
+            home_dir: PathBuf::from("/nonexistent-home"),
+            precreate_dirs: vec![],
+            plain_file,
+        }
+    }
+
+    fn read_rule(path: &Path) -> FsRule {
+        FsRule {
+            path: path.to_path_buf(),
+            access: FsAccess {
+                read: true,
+                write: false,
+                execute: false,
+                ioctl: false,
+                create_dirs: false,
+            },
+        }
+    }
+
+    /// #252: a root AGENTS.md under the private /tmp gets no `--ro-bind`. The
+    /// bind would be decided before cplt writes the file and resolved by bwrap
+    /// through a symlink swapped in since. A user `allow.read` naming the same
+    /// file is its own rule and keeps its bind.
+    #[test]
+    fn root_agents_md_under_tmp_is_not_bound() {
+        let dir = tempfile::TempDir::new_in("/tmp").expect("tempdir under /tmp");
+        let file = dir.path().join("AGENTS.md");
+        std::fs::write(&file, "x").unwrap();
+        let f = file.to_string_lossy().into_owned();
+        let bound = |policy: &LandlockPolicy| {
+            build_bwrap_args(
+                &mount_rules(policy),
+                Overlays::default(),
+                &DenyMasks::default(),
+            )
+            .windows(3)
+            .filter(|w| w[0] == "--ro-bind" && w[1] == f)
+            .count()
+        };
+
+        assert_eq!(bound(&test_policy(vec![read_rule(&file)], Some(0))), 0);
+        let user_too = test_policy(vec![read_rule(&file), read_rule(&file)], Some(1));
+        assert_eq!(bound(&user_too), 1, "the user's own grant lost its bind");
+    }
+
+    /// The helper finds the root AGENTS.md rule by index after the policy
+    /// crosses the pipe. If it lost the rule, the helper would open it without
+    /// the link checks; if it pointed elsewhere, another rule would get them.
+    #[test]
+    fn plain_file_index_survives_the_policy_transfer() {
+        let file = PathBuf::from("/repo/AGENTS.md");
+        let policy = test_policy(
+            vec![writable_rule("/repo/apps/web"), read_rule(&file)],
+            Some(1),
+        );
+        let wrapper = BubblewrapWrapper {
+            bwrap_path: PathBuf::from("/usr/bin/bwrap"),
+            bwrap_args: vec![],
+            fs_rules: policy.fs_rules.clone(),
+            net_rules: vec![],
+            restrict_net_connect: true,
+            strict: false,
+            deny_mask_count: 0,
+            socket_mask_count: 0,
+            proxy_forced: false,
+            plain_file: policy.plain_file,
+        };
+        let bytes = serialize_policy(&wrapper, Path::new("/bin/true"), &[]).unwrap();
+        let inner: InnerPolicy = serde_json::from_slice(&bytes).unwrap();
+        let i = inner.plain_file.expect("plain_file lost in transfer");
+        assert_eq!(inner.fs_rules[i].to_fs_rule().path, file);
     }
 
     #[test]
@@ -1612,10 +1706,7 @@ mod tests {
         assert!(
             resolve(
                 Some(false),
-                &[],
-                &[],
-                true,
-                false,
+                &test_policy(vec![], None),
                 Overlays::default(),
                 &DenyMasks::default()
             )

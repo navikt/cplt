@@ -133,6 +133,7 @@ pub fn generate_profile_with_playwright_socket_dir(
     );
     emit_git_hooks(&mut sb, config.git_hooks_path);
     emit_git_worktree(&mut sb, config.git_common_dir, config.named_root_git_dirs);
+    emit_root_agents_md(&mut sb, config.home_dir, config.root_agents_md);
     emit_system_access(
         &mut sb,
         &home,
@@ -910,6 +911,26 @@ fn emit_git_worktree(sb: &mut String, git_common_dir: Option<&Path>, named: &[Pa
         sbpl!(sb, "(allow file-write* (subpath \"{p}\"))");
     }
     sbpl!(sb);
+}
+
+/// Read, and only read, on the root `AGENTS.md` cplt writes its block into
+/// when `--project-dir` is a subdirectory (#252). A `literal`, so nothing else
+/// in the repository root becomes visible.
+fn emit_root_agents_md(sb: &mut String, home: &Path, file: Option<&Path>) {
+    let Some(file) = file.filter(|f| !grant_is_refused(home, f)) else {
+        return;
+    };
+    sb.push_str(&root_agents_md_sbpl(file));
+    sbpl!(sb);
+}
+
+/// The rule [`emit_root_agents_md`] writes, as one string so
+/// `PreparedSandbox::revoke_root_agents_md` can remove exactly it.
+pub(super) fn root_agents_md_sbpl(file: &Path) -> String {
+    format!(
+        ";; Repository-root AGENTS.md — read only\n(allow file-read* (literal \"{}\"))\n",
+        file.to_string_lossy()
+    )
 }
 
 /// Deny every path inside a git directory that names content git will later
@@ -2902,6 +2923,28 @@ mod tests {
         );
     }
 
+    /// `--project-dir <subdir>` with `sandbox.agents_md`: the root AGENTS.md
+    /// cplt writes is readable as one literal, and nothing else in the root
+    /// is granted (#252). A refused path emits nothing.
+    #[test]
+    fn root_agents_md_is_a_read_only_literal() {
+        let project = std::path::Path::new("/Users/test/repo/apps/web");
+        let home = std::path::Path::new("/Users/test");
+        let file = std::path::Path::new("/Users/test/repo/AGENTS.md");
+        let mut opts = test_options(project, home);
+        opts.root_agents_md = Some(file);
+        let p = generate_profile(&opts, &[]);
+
+        assert!(p.contains(r#"(allow file-read* (literal "/Users/test/repo/AGENTS.md"))"#));
+        assert!(!p.contains(r#"(allow file-write* (literal "/Users/test/repo/AGENTS.md"))"#));
+        assert!(!p.contains(r#"(subpath "/Users/test/repo")"#));
+
+        let refused = home.join(".netrc");
+        opts.root_agents_md = Some(&refused);
+        let p = generate_profile(&opts, &[]);
+        assert!(!p.contains(r#"(allow file-read* (literal "/Users/test/.netrc"))"#));
+    }
+
     fn test_options<'a>(
         project_dir: &'a std::path::Path,
         home_dir: &'a std::path::Path,
@@ -2932,6 +2975,7 @@ mod tests {
             dotnet_root: None,
             git_hooks_path: None,
             git_common_dir: None,
+            root_agents_md: None,
             allow_gpg_signing: false,
             deny_clipboard: false,
             allow_jvm_attach: false,

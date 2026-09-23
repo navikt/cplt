@@ -185,6 +185,12 @@ pub struct SandboxConfig<'a> {
     pub git_hooks_path: Option<&'a Path>,
     /// Shared .git directory for git worktrees.
     pub git_common_dir: Option<&'a Path>,
+    /// `AGENTS.md` at the repository root when `--project-dir` is a
+    /// subdirectory and `sandbox.agents_md` is on (#252). cplt writes its
+    /// managed block there, and the project grant does not reach it, so both
+    /// backends grant read on this one file — never write, never the root.
+    /// `None` when the file is inside `project_dir` already.
+    pub root_agents_md: Option<&'a Path>,
     pub allow_gpg_signing: bool,
     pub deny_clipboard: bool,
     /// Allow JVM Attach API unix sockets in /tmp (.java_pid* pattern only).
@@ -276,6 +282,41 @@ impl PreparedSandbox {
     /// The home directory this sandbox is configured for.
     pub fn home_dir(&self) -> &Path {
         &self.home_dir
+    }
+
+    /// Withdraw the read grant on the root `AGENTS.md` (#252).
+    ///
+    /// The grant is built before cplt writes the managed block, so it assumes
+    /// the write will land. When it did not (ambiguous markers, a failed
+    /// write), the file holds nothing cplt put there and the agent has no
+    /// reason to read outside its project, so the launch drops the grant.
+    pub fn revoke_root_agents_md(&mut self, file: &Path) {
+        // The macOS profile is the enforced text itself; the Linux text is the
+        // `describe()` summary, kept in step with the rules removed below.
+        #[cfg(target_os = "macos")]
+        let chunk = profile::root_agents_md_sbpl(file);
+        #[cfg(target_os = "linux")]
+        let chunk = landlock_mod::root_agents_md_description(file);
+        // A refused path (`grant_is_refused`) was never emitted: nothing to
+        // withdraw. On Linux the rule index is the truth, since the text may
+        // already omit a grant bubblewrap does not give.
+        #[cfg(target_os = "macos")]
+        if !self.profile_text.contains(&chunk) {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if self.precomputed.deferred_plain_file.take().is_none() {
+            return;
+        }
+        self.profile_text = self.profile_text.replacen(&chunk, "", 1);
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(w) = &mut self.bwrap_wrapper
+                && let Some(i) = w.plain_file.take()
+            {
+                w.fs_rules.remove(i);
+            }
+        }
     }
 }
 
@@ -1076,7 +1117,7 @@ fn prepare_impl(
     }
 
     let mut policy = landlock_mod::generate_policy(config);
-    let profile_text = landlock_mod::describe_policy(&policy);
+    let mut profile_text = landlock_mod::describe_policy(&policy);
 
     // Repositories nested inside a writable root, found once and given to BOTH
     // path sets. The leaf binds and the rename pins have to see the same list:
@@ -1119,16 +1160,23 @@ fn prepare_impl(
     // disabled and fallback arms borrow and clone nothing.
     let bwrap_wrapper = bubblewrap::resolve(
         config.use_bubblewrap,
-        &policy.fs_rules,
-        &policy.net_rules,
-        policy.restrict_net_connect,
-        config.proxy_forced,
+        &policy,
         bubblewrap::Overlays {
             read_only: &ro_protect,
             pins: &pins,
         },
         &deny_masks,
     )?;
+
+    // Under bubblewrap a root AGENTS.md below the private /tmp gets no mount
+    // (`mount_rules`), so the launch gives no grant: do not print one.
+    if bwrap_wrapper.is_some()
+        && let Some(rule) = policy.plain_file.map(|i| &policy.fs_rules[i])
+        && rule.path.starts_with("/tmp")
+    {
+        profile_text =
+            profile_text.replacen(&landlock_mod::root_agents_md_description(&rule.path), "", 1);
+    }
 
     // Said only where it is true: without bubblewrap none of these binds exist,
     // so warning about a bounded scan there would imply a protection the host
@@ -1282,6 +1330,9 @@ fn validate_config_paths(config: &SandboxConfig) -> Result<(), String> {
     }
     if let Some(p) = config.git_common_dir {
         policy::validate_sbpl_path(p).map_err(|e| format!("Git common dir: {e}"))?;
+    }
+    if let Some(p) = config.root_agents_md {
+        policy::validate_sbpl_path(p).map_err(|e| format!("Root AGENTS.md: {e}"))?;
     }
     if let Some(dir) = config.electron_app_dir {
         policy::validate_sbpl_path(dir).map_err(|e| format!("Electron app path: {e}"))?;
@@ -1440,6 +1491,7 @@ mod tests {
             dotnet_root: None,
             git_hooks_path: None,
             git_common_dir: None,
+            root_agents_md: None,
             allow_gpg_signing: false,
             deny_clipboard: false,
             allow_jvm_attach: false,
@@ -1453,6 +1505,94 @@ mod tests {
             allow_browser: false,
             use_bubblewrap: None,
         }
+    }
+
+    /// #252: revoking the root AGENTS.md grant removes exactly that rule, on
+    /// both backends and in the text `describe()` prints. A user `allow.read`
+    /// naming the same file is a separate grant and survives the revoke.
+    #[test]
+    fn revoke_root_agents_md_removes_only_the_tagged_rule() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let file = root.join("AGENTS.md");
+        std::fs::write(&file, "x").unwrap();
+        let user = [file.clone()];
+        let mut config = test_config(&home, &user);
+        config.root_agents_md = Some(&file);
+        config.use_bubblewrap = Some(false);
+        let mut sandbox = prepare(&config).unwrap();
+
+        #[cfg(target_os = "macos")]
+        let chunk = profile::root_agents_md_sbpl(&file);
+        #[cfg(target_os = "linux")]
+        let chunk = landlock_mod::root_agents_md_description(&file);
+        assert!(describe(&sandbox).contains(&chunk), "not granted");
+
+        // prepare() ran Landlock-only; stand in the wrapper resolve() builds
+        // when bwrap is present, the user's rule and the tagged one side by side.
+        #[cfg(target_os = "linux")]
+        {
+            assert!(sandbox.precomputed.deferred_plain_file.is_some());
+            let rule = |path: &Path| landlock_mod::FsRule {
+                path: path.to_path_buf(),
+                access: landlock_mod::FsAccess {
+                    read: true,
+                    write: false,
+                    execute: false,
+                    ioctl: false,
+                    create_dirs: false,
+                },
+            };
+            sandbox.bwrap_wrapper = Some(bubblewrap::BubblewrapWrapper {
+                bwrap_path: PathBuf::from("/usr/bin/bwrap"),
+                bwrap_args: vec![],
+                fs_rules: vec![rule(&file), rule(&file)],
+                net_rules: vec![],
+                restrict_net_connect: true,
+                strict: false,
+                deny_mask_count: 0,
+                socket_mask_count: 0,
+                proxy_forced: false,
+                plain_file: Some(1),
+            });
+        }
+
+        sandbox.revoke_root_agents_md(&file);
+        let text = describe(&sandbox);
+        assert!(!text.contains(&chunk), "grant still described");
+        assert!(
+            text.contains(&file.display().to_string()),
+            "the user's own allow.read went with it"
+        );
+        #[cfg(target_os = "linux")]
+        {
+            assert!(sandbox.precomputed.deferred_plain_file.is_none());
+            let w = sandbox.bwrap_wrapper.as_ref().unwrap();
+            assert!(w.plain_file.is_none());
+            assert_eq!(
+                w.fs_rules.len(),
+                1,
+                "user rule removed, or tagged rule kept"
+            );
+        }
+    }
+
+    /// A refused root AGENTS.md is never emitted, yet the launch still revokes
+    /// it when the block is not written. That must be a no-op, not a panic.
+    #[test]
+    fn revoke_root_agents_md_of_a_refused_path_is_a_no_op() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(temp.path()).unwrap();
+        let refused = home.join(".netrc");
+        let mut config = test_config(&home, &[]);
+        config.root_agents_md = Some(&refused);
+        config.use_bubblewrap = Some(false);
+        let mut sandbox = prepare(&config).unwrap();
+        let before = describe(&sandbox).to_string();
+        sandbox.revoke_root_agents_md(&refused);
+        assert_eq!(describe(&sandbox), before);
     }
 
     fn pnpm_tool_dir(path: &str) -> &'static HomeToolDir {
