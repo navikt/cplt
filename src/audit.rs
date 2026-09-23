@@ -1071,6 +1071,12 @@ impl SettleProbe {
     ///
     /// Consumes the probe: both descriptors are closed before returning.
     fn outcome(self) -> Settle {
+        self.outcome_within(SETTLE_TIMEOUT)
+    }
+
+    /// [`Self::outcome`] with the grace period passed in, so a test that is not
+    /// about the grace can give a loaded machine room (#528).
+    fn outcome_within(self, grace: Duration) -> Settle {
         // Retract the exemption before the descriptor number is freed, so a
         // later spawn cannot un-seal whatever gets that number next.
         SETTLE_PROBE_FD.store(-1, Ordering::Relaxed);
@@ -1078,7 +1084,7 @@ impl SettleProbe {
         // SAFETY: `self.write` is owned by this probe and closed exactly once.
         unsafe { libc::close(self.write) };
 
-        let deadline = Instant::now() + SETTLE_TIMEOUT;
+        let deadline = Instant::now() + grace;
         let mut wrote = 0usize;
         let outcome = loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1449,7 +1455,7 @@ mod tests {
     ///
     /// * `outcome` is the probe's own verdict, and its `wrote` says whether
     ///   any descendant ever had the descriptor to write to;
-    /// * `waited` against [`SETTLE_TIMEOUT`] says whether a deadline was lost
+    /// * `waited` against the probe's `budget` says whether a deadline was lost
     ///   or the probe returned early;
     /// * the descendant's liveness is measured HERE, at assertion time, with
     ///   [`alive_twice`] rather than inferred from the probe;
@@ -1462,7 +1468,13 @@ mod tests {
     ///
     /// Called only from a failing assertion's message, so the 100 ms it spends
     /// watching the descendant is never paid by a passing run.
-    fn settle_diagnosis(fd: i32, pid: i32, outcome: Settle, waited: Duration) -> String {
+    fn settle_diagnosis(
+        fd: i32,
+        pid: i32,
+        outcome: Settle,
+        waited: Duration,
+        budget: Duration,
+    ) -> String {
         let liveness = match alive_twice(pid) {
             (true, true) => "STILL ALIVE, and still alive 100ms later",
             (true, false) => "alive, but gone 100ms later: it was on its way out",
@@ -1480,7 +1492,7 @@ mod tests {
         let lines = [
             "--- settle probe diagnosis (#371) ---".to_string(),
             format!("probe verdict: {outcome:?}"),
-            format!("probe waited: {waited:?} of a {SETTLE_TIMEOUT:?} budget"),
+            format!("probe waited: {waited:?} of a {budget:?} budget"),
             format!("descendant pid {pid}: {liveness}"),
             format!("probe write fd: {fd} (SCRIPT_FD is {SCRIPT_FD}){fd_note}"),
             concat!(
@@ -1496,27 +1508,49 @@ mod tests {
         format!("\n  {}", lines.join("\n  "))
     }
 
+    /// A grace long enough that a loaded machine cannot lose it, for tests
+    /// whose subject is not the grace itself (#528).
+    const LOADED_RUNNER_GRACE: Duration = Duration::from_secs(30);
+
     /// GHSA-c47q-c3c8-7wrf: reaping the direct child says nothing about the
-    /// tree. `sh -c '(sleep 1; ...) &'` exits at once and the write lands a
-    /// second later — the audit used to sample git in between and print a clean
+    /// tree. `sh -c '(...; : > late) &'` exits at once and the write lands
+    /// later — the audit used to sample git in between and print a clean
     /// verdict for a write it had already been told about.
+    ///
+    /// The descendant blocks on a FIFO rather than a `sleep 1`, and the probe
+    /// gets [`LOADED_RUNNER_GRACE`] rather than [`SETTLE_TIMEOUT`] (#528).
+    /// With the sleep, a loaded machine could spend the second before
+    /// `output()` returned (the premise failed) or push the write past the
+    /// 2s grace (the probe timed out). The grace is not what this test is
+    /// about; `settle_probe_reports_unsettled_while_a_descendant_lives` keeps
+    /// the real one. The ordering assertion is untouched: a probe that
+    /// returns without waiting still finds no write.
     #[test]
     fn settle_probe_waits_for_a_backgrounded_descendant() {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
         let tmp = tempfile::tempdir().unwrap();
         let late = tmp.path().join("late.txt");
+        let go = tmp.path().join("go");
+        let go_c = std::ffi::CString::new(go.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path; mkfifo touches nothing else.
+        assert_eq!(unsafe { libc::mkfifo(go_c.as_ptr(), 0o600) }, 0, "mkfifo");
         let probe = SettleProbe::arm().expect("pipe");
 
         let fd = probe.write;
         // `echo $!` names the descendant so the assertions below can ask the
         // kernel whether it is still alive instead of inferring it (#371). Its
         // own output goes to /dev/null: inheriting the captured stdout would
-        // hold that pipe open for the whole second and `output()` would block
-        // until after the write, destroying the premise this test rests on.
+        // hold that pipe open until the descendant exits and `output()` would
+        // block until after the write, destroying the premise this test rests
+        // on.
         let out = sh_holding_the_probe(
             &probe,
             &format!(
-                "(sleep 1; : > '{}') >/dev/null 2>&1 & echo $!",
-                late.display()
+                "(read line < '{go}'; : > '{late}') >/dev/null 2>&1 & echo $!",
+                go = go.display(),
+                late = late.display()
             ),
         )
         .output()
@@ -1528,20 +1562,42 @@ mod tests {
             "test premise: the direct child exits before the descendant writes"
         );
 
+        // Release the descendant, then start waiting at once. A non-blocking
+        // open fails with ENXIO until the descendant has the FIFO open for
+        // reading, so a descendant that never gets there fails the test
+        // instead of hanging it.
+        let deadline = Instant::now() + LOADED_RUNNER_GRACE;
+        let mut release = loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&go)
+            {
+                Ok(file) => break file,
+                Err(error)
+                    if error.raw_os_error() == Some(libc::ENXIO) && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("the descendant never opened the FIFO: {error}"),
+            }
+        };
+        release.write_all(b"\n").unwrap();
+        drop(release);
         let started = Instant::now();
-        let outcome = probe.outcome();
+        let outcome = probe.outcome_within(LOADED_RUNNER_GRACE);
         let waited = started.elapsed();
         // The diagnosis is an assertion ARGUMENT, so it is built only when the
         // assertion fails and a passing run pays nothing for it.
         assert!(
             matches!(outcome, Settle::Eof { .. }),
             "the descendant's exit must be waited for{}",
-            settle_diagnosis(fd, pid, outcome, waited)
+            settle_diagnosis(fd, pid, outcome, waited, LOADED_RUNNER_GRACE)
         );
         assert!(
             late.exists(),
             "settling returned before the write it exists to wait for{}",
-            settle_diagnosis(fd, pid, outcome, waited)
+            settle_diagnosis(fd, pid, outcome, waited, LOADED_RUNNER_GRACE)
         );
     }
 
@@ -1580,7 +1636,7 @@ mod tests {
         assert!(
             !settled,
             "a live descendant must never read as settled{}\n  sh stderr: {:?}",
-            settle_diagnosis(fd, pid, outcome, waited),
+            settle_diagnosis(fd, pid, outcome, waited, SETTLE_TIMEOUT),
             String::from_utf8_lossy(&out.stderr)
         );
         // Slack for the sub-millisecond truncation in the poll timeout: the
@@ -1588,7 +1644,7 @@ mod tests {
         assert!(
             waited >= SETTLE_TIMEOUT.saturating_sub(Duration::from_millis(50)),
             "the grace period must actually be waited out, got {waited:?}{}\n  sh stderr: {:?}",
-            settle_diagnosis(fd, pid, outcome, waited),
+            settle_diagnosis(fd, pid, outcome, waited, SETTLE_TIMEOUT),
             String::from_utf8_lossy(&out.stderr)
         );
         // SAFETY: `pid` is the child this test just started.
@@ -1651,7 +1707,12 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
 
-        let outcome = probe.outcome();
+        // `wrote` is the assertion, not the grace. #528 saw this fail as
+        // `TimedOut { wrote: 1 }`: the byte arrived and the shell had exited,
+        // so only another holder of the write end can have kept EOF away past
+        // 2s, most likely a child another test forked while this pipe was
+        // briefly inheritable. A long grace waits such a holder out.
+        let outcome = probe.outcome_within(LOADED_RUNNER_GRACE);
         assert_eq!(
             outcome,
             Settle::Eof { wrote: 1 },
