@@ -76,8 +76,10 @@ pub const DENIED_FILES: &[&str] = &[
 /// One list so the backends cannot drift apart (#522): a config that works on
 /// Linux and fails on macOS, or the reverse, with nothing to say the platform
 /// is the difference. Each backend follows a dotfiles symlink to its target
-/// and refuses a target that is hard-denied (`grant_is_refused`), so a link
-/// into `~/.ssh` or onto `~/.git-credentials` never becomes a grant.
+/// through [`first_party_read_target`], which refuses a target that is
+/// hard-denied, lies inside a [`DENIED_DOTFILES`] directory, or is a
+/// [`DENIED_HOME_SUBPATHS`] entry, so a link into `~/.ssh` or onto
+/// `~/.git-credentials` never becomes a grant.
 ///
 /// Exact files only. Linux used to grant the whole `~/.config/git` tree, which
 /// also holds `credentials`, git's XDG cleartext credential store. `ignore`
