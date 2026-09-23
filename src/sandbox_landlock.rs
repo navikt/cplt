@@ -916,12 +916,15 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     // it to whatever the symlink resolves to. A dotfiles home that points
     // `~/.gitconfig` at `~/.git-credentials` or `~/.netrc` would hand the agent
     // that inode through a rule that names something harmless, and Landlock is
-    // grant-only, so there is no deny to lose to. `grant_is_refused` is the same
-    // filter `extra_read` goes through below, and it canonicalizes, so the
-    // symlink is what gets tested.
+    // grant-only, so there is no deny to lose to. `first_party_read_target`
+    // resolves the link and refuses a target anywhere inside a credential
+    // directory. `grant_is_refused`, the filter `extra_read` goes through
+    // above, is not enough here: it lets a user name `~/.ssh/known_hosts` on
+    // purpose, and a `~/.gitconfig -> ~/.ssh/id_ed25519` link carries no such
+    // intent.
     for &file in policy::HOME_CONFIG_FILES {
         let path = home.join(file);
-        if policy::grant_is_refused(home, &path) {
+        if policy::first_party_read_target(home, &path).is_none() {
             continue;
         }
         fs_rules.push(FsRule {

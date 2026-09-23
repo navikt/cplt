@@ -662,26 +662,27 @@ fn emit_home_access(
 /// because that is what the kernel actually checks — and that function denies
 /// writes at the resolved target for the same reason (#524).
 ///
-/// This grants the file the user already pointed the tool at, nowhere else. A
-/// link resolving onto a hard-denied file or a credential directory is refused
-/// outright by `grant_is_refused`, the same filter a user grant goes through,
-/// so `~/.gitconfig -> ~/.git-credentials` never becomes a rule. The `$HOME`
-/// literal that remains loses to [`emit_deny_rules`] anyway, SBPL being
-/// last-match-wins — the check is what keeps macOS and Linux answering alike,
-/// since Landlock is grant-only and has no deny to fall back on. The config *names* credentials — `credential.helper =
-/// store` points at `~/.git-credentials`, `url.<base>.insteadOf` can embed a
-/// token — but naming is all it does: `~/.git-credentials` is a hard deny in
-/// [`DENIED_FILES`], and an `include.path` outside these exceptions is not
-/// granted by any of them.
+/// This grants the file the user already pointed the tool at, nowhere else.
+/// [`first_party_read_target`] decides whether it may be granted at all: a
+/// link resolving onto a hard-denied file, anywhere inside a credential
+/// directory, or onto a [`DENIED_HOME_SUBPATHS`] entry gets neither literal, so
+/// `~/.gitconfig -> ~/.ssh/id_ed25519` never becomes a rule. The later `~/.ssh`
+/// subpath deny in [`emit_deny_rules`] is not enough on its own: it names the
+/// `$HOME` spelling, so when `~/.ssh` is itself a symlink the key's resolved
+/// path lies outside it and the literal on the target is what matches. The
+/// check also keeps macOS and Linux answering alike, since Landlock is
+/// grant-only and has no deny to fall back on. The config *names* credentials
+/// — `credential.helper = store` points at `~/.git-credentials`,
+/// `url.<base>.insteadOf` can embed a token — but naming is all it does:
+/// `~/.git-credentials` is a hard deny in [`DENIED_FILES`], and an
+/// `include.path` outside these exceptions is not granted by any of them.
 fn emit_home_config_read(sb: &mut String, home: &str, rel: &str) {
+    let named = Path::new(home).join(rel);
+    let Some(target) = first_party_read_target(Path::new(home), &named) else {
+        return;
+    };
     sbpl!(sb, "(allow file-read* (literal \"{home}/{rel}\"))");
-    let home_path = Path::new(home);
-    let named = home_path.join(rel);
-    let target = resolved(named.clone());
-    if target == named
-        || grant_is_refused(home_path, &target)
-        || validate_sbpl_path(&target).is_err()
-    {
+    if target == named || validate_sbpl_path(&target).is_err() {
         return;
     }
     let p = target.display();
@@ -2725,7 +2726,7 @@ mod tests {
             deny > grant,
             "the deny must follow the grant (last match wins)"
         );
-        assert!(grant_is_refused(
+        assert!(super::super::policy::grant_is_refused(
             home,
             &home.join(".config/git/credentials")
         ));

@@ -1139,40 +1139,70 @@ fn profile_tolerates_a_missing_home_git_config() {
     );
 }
 
-/// A symlink must not tunnel out of a hard deny. `~/.gitconfig -> ~/.ssh/config`
-/// resolves into a denied directory; the grant is emitted before the deny block
-/// and SBPL is last-match-wins, so the deny still has the last word.
+/// A symlink must not tunnel into a credential directory.
+/// `~/.gitconfig -> ~/.ssh/id_ed25519` gets no grant on either backend: Landlock
+/// follows the link, and on macOS the `~/.ssh` subpath deny names only the
+/// `$HOME` spelling, so it misses the key when `~/.ssh` is itself a symlink.
+/// Both layouts are checked. A safe dotfiles link is still granted at its target.
 #[test]
-fn symlinked_git_config_cannot_escape_a_denied_directory() {
+fn symlinked_git_config_into_a_denied_directory_is_not_granted() {
+    use std::os::unix::fs::symlink;
     let home = tempfile::tempdir().expect("tempdir");
     let home_dir = std::fs::canonicalize(home.path()).expect("canonicalize home");
-    let target = home_dir.join(".ssh/config");
-    std::fs::create_dir_all(target.parent().unwrap()).expect("mkdir .ssh");
-    std::fs::write(&target, "Host *\n").expect("write ssh config");
-    std::os::unix::fs::symlink(&target, home_dir.join(".gitconfig")).expect("symlink");
+    let link = home_dir.join(".gitconfig");
+    let config = SandboxConfig {
+        home_dir: &home_dir,
+        ..base_profile_options()
+    };
+    let lit = |p: &std::path::Path| format!("(allow file-read* (literal \"{}\"))", p.display());
+    // Landlock rules resolving onto `target`.
+    let landlock_rules = |target: &std::path::Path| -> Vec<std::path::PathBuf> {
+        cplt::sandbox::generate_policy(&config)
+            .fs_rules
+            .iter()
+            .map(|r| r.path.clone())
+            .filter(|p| std::fs::canonicalize(p).is_ok_and(|c| c == target))
+            .collect()
+    };
 
-    let p = generate_profile(
-        &SandboxConfig {
-            home_dir: &home_dir,
-            ..base_profile_options()
-        },
-        &[],
-    );
+    // A real `~/.ssh`, and a `~/.ssh` that is itself a dotfiles symlink.
+    for ssh_dir in [home_dir.join(".ssh"), home_dir.join("dotfiles/ssh")] {
+        std::fs::create_dir_all(&ssh_dir).expect("mkdir ssh");
+        if ssh_dir != home_dir.join(".ssh") {
+            symlink(&ssh_dir, home_dir.join(".ssh")).expect("symlink ~/.ssh");
+        }
+        let key = ssh_dir.join("id_ed25519");
+        std::fs::write(&key, "key").expect("write key");
+        symlink(home_dir.join(".ssh/id_ed25519"), &link).expect("symlink");
 
-    let allow = format!("(allow file-read* (literal \"{}\"))", target.display());
-    let deny = format!(
-        "(deny file-read* (subpath \"{}\"))",
-        home_dir.join(".ssh").display()
-    );
-    let deny_at = p
-        .rfind(&deny)
-        .unwrap_or_else(|| panic!("~/.ssh deny missing:\n{p}"));
-    let allow_at = p
-        .find(&allow)
-        .unwrap_or_else(|| panic!("the resolved target must be granted:\n{p}"));
+        let p = generate_profile(&config, &[]);
+        assert!(
+            !p.contains(&lit(&link)) && !p.contains(&lit(&key)),
+            "a link into ~/.ssh must not be granted on macOS:\n{p}"
+        );
+        let leaking = landlock_rules(&key);
+        assert!(
+            leaking.is_empty(),
+            "no Landlock rule may resolve onto the key: {leaking:?}"
+        );
+
+        std::fs::remove_file(&link).expect("rm link");
+        let _ = std::fs::remove_file(home_dir.join(".ssh"));
+        let _ = std::fs::remove_dir_all(home_dir.join(".ssh"));
+    }
+
+    let safe = home_dir.join("dotfiles/gitconfig");
+    std::fs::write(&safe, "[user]\n\tname = cplt\n").expect("write gitconfig");
+    symlink(&safe, &link).expect("symlink");
+    let p = generate_profile(&config, &[]);
     assert!(
-        allow_at < deny_at,
-        "the ~/.ssh deny must come last, SBPL is last-match-wins:\n{p}"
+        p.contains(&lit(&link)) && p.contains(&lit(&safe)),
+        "a safe dotfiles link is granted at both spellings:\n{p}"
+    );
+    assert_eq!(
+        landlock_rules(&safe),
+        vec![link.clone()],
+        "Landlock grants the safe link"
     );
 }
 

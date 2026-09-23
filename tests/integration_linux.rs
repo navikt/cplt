@@ -1132,7 +1132,7 @@ except OSError as e:
     /// needs no bus and runs anywhere.
     ///
     /// `$HOME` is the right home for it: Landlock grants the home tree
-    /// per-file (`LINUX_HOME_CONFIG_FILES`) and never wholesale, so a
+    /// per-file (`policy::HOME_CONFIG_FILES`) and never wholesale, so a
     /// uniquely named dotfile there is reliably ungranted on any host.
     struct OutsideSocket {
         path: PathBuf,
