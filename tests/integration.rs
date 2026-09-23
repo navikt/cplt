@@ -1518,8 +1518,9 @@ mod macos_tests {
         );
     }
 
-    /// A fixture home where `~/.ssh -> dots/ssh` and `~/.netrc -> dots/netrc`,
-    /// the layout stow, chezmoi and hand-rolled dotfiles repos produce.
+    /// A fixture home where `~/.ssh -> dots/ssh/.ssh`, `~/.gitconfig ->
+    /// dots/git/.gitconfig` and `~/.netrc -> dots/netrc`, the layouts stow,
+    /// chezmoi and hand-rolled dotfiles repos produce.
     ///
     /// Under `CARGO_TARGET_TMPDIR`, not the system temp dir: the profile grants
     /// `/private/var/folders` and `/private/tmp`, and a home under either would
@@ -1527,15 +1528,22 @@ mod macos_tests {
     fn symlinked_credentials_home() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
         let home = fs::canonicalize(dir.path()).unwrap();
-        fs::create_dir_all(home.join("dots/ssh")).unwrap();
-        fs::write(home.join("dots/ssh/id_ed25519"), "cplt-test-private-key\n").unwrap();
+        fs::create_dir_all(home.join("dots/ssh/.ssh")).unwrap();
+        fs::create_dir_all(home.join("dots/git")).unwrap();
+        fs::write(
+            home.join("dots/ssh/.ssh/id_ed25519"),
+            "cplt-test-private-key\n",
+        )
+        .unwrap();
+        fs::write(home.join("dots/git/.gitconfig"), "[user]\n").unwrap();
         fs::write(
             home.join("dots/netrc"),
             "machine x password cplt-test-netrc\n",
         )
         .unwrap();
         fs::write(home.join("dots/README"), "cplt-test-control\n").unwrap();
-        std::os::unix::fs::symlink("dots/ssh", home.join(".ssh")).unwrap();
+        std::os::unix::fs::symlink("dots/ssh/.ssh", home.join(".ssh")).unwrap();
+        std::os::unix::fs::symlink("dots/git/.gitconfig", home.join(".gitconfig")).unwrap();
         std::os::unix::fs::symlink("dots/netrc", home.join(".netrc")).unwrap();
         (dir, home)
     }
@@ -1563,7 +1571,7 @@ mod macos_tests {
         let h = home.display();
         let key_paths = [
             home.join(".ssh/id_ed25519"),
-            home.join("dots/ssh/id_ed25519"),
+            home.join("dots/ssh/.ssh/id_ed25519"),
         ];
         let base = "(version 1)(deny default)\
             (import \"/System/Library/Sandbox/Profiles/bsd.sb\")\
@@ -1620,7 +1628,7 @@ mod macos_tests {
             &[
                 dots.join("README"),
                 home.join(".ssh/id_ed25519"),
-                dots.join("ssh/id_ed25519"),
+                dots.join("ssh/.ssh/id_ed25519"),
                 home.join(".netrc"),
                 dots.join("netrc"),
             ],
@@ -1635,8 +1643,8 @@ mod macos_tests {
         // A per-file allow.read inside the linked `~/.ssh` still works through
         // both spellings, and the key beside it stays denied. `extra_read`
         // holds the canonical path, as config resolution would put it there.
-        fs::write(dots.join("ssh/known_hosts"), "cplt-test-known-host\n").unwrap();
-        let extra_read = [dots.join("ssh/known_hosts")];
+        fs::write(dots.join("ssh/.ssh/known_hosts"), "cplt-test-known-host\n").unwrap();
+        let extra_read = [dots.join("ssh/.ssh/known_hosts")];
         let mut opts = default_opts(&dots, &home);
         opts.extra_read = &extra_read;
         let profile = write_real_profile(&opts);
@@ -1644,7 +1652,7 @@ mod macos_tests {
             &profile,
             &[
                 home.join(".ssh/known_hosts"),
-                dots.join("ssh/known_hosts"),
+                dots.join("ssh/.ssh/known_hosts"),
                 home.join(".ssh/id_ed25519"),
             ],
         );
@@ -1654,6 +1662,26 @@ mod macos_tests {
             [true, true, false],
             "known_hosts via link, via target, key via link"
         );
+    }
+
+    /// The directories above a resolved credential or git config target keep
+    /// their names inside the writable dotfiles project: renaming `ssh` would
+    /// move the key out from under the deny at `ssh/.ssh`, and renaming `git`
+    /// would let `mkdir git` put a writable file under `~/.gitconfig`. A
+    /// sibling directory still renames, so the refusal is the pin.
+    #[test]
+    fn real_profile_pins_the_ancestors_of_symlinked_credential_targets() {
+        require_sandbox!();
+        let (_dir, home) = symlinked_credentials_home();
+        let dots = home.join("dots");
+        fs::create_dir(dots.join("other")).unwrap();
+        let profile = write_real_profile(&default_opts(&dots, &home));
+        let d = dots.display();
+        let mv = |from: &str| run_sandboxed(&profile, &format!("mv '{d}/{from}' '{d}/{from}2'")).1;
+        let got = [mv("ssh"), mv("git"), mv("other")];
+        fs::remove_file(&profile).ok();
+        assert_eq!(got, [false, false, true], "mv ssh, mv git, mv other");
+        assert!(dots.join("ssh/.ssh/id_ed25519").exists());
     }
 
     /// The other half of the reverse case: no `~/.gitconfig` at all. Git must
