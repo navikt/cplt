@@ -668,7 +668,7 @@ mod macos_tests {
     }
 
     impl ChromeProcess {
-        fn spawn(stage: &str, command: &mut Command) -> Self {
+        fn try_spawn(stage: &str, command: &mut Command) -> Result<Self, String> {
             let stdout_file = tempfile::tempfile().expect("create Chrome stdout capture file");
             let stderr_file = tempfile::tempfile().expect("create Chrome stderr capture file");
             command
@@ -686,21 +686,21 @@ mod macos_tests {
 
             let mut child = command
                 .spawn()
-                .unwrap_or_else(|error| panic!("{stage}: failed to launch command: {error}"));
+                .map_err(|error| format!("{stage}: failed to launch command: {error}"))?;
             let process_group = libc::pid_t::try_from(child.id()).unwrap_or_else(|_| {
                 let _ = child.kill();
                 let _ = child.wait();
                 panic!("{stage}: Chrome process ID does not fit pid_t");
             });
 
-            Self {
+            Ok(Self {
                 child,
                 process_group,
                 stdout_file,
                 stderr_file,
                 status: None,
                 cleaned_up: false,
-            }
+            })
         }
 
         fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
@@ -1243,7 +1243,22 @@ mod macos_tests {
         render_url: &str,
         expected_token: &str,
     ) {
-        let mut browser = ChromeProcess::spawn(stage, command);
+        if let Err(failure) =
+            try_chrome_probe(stage, command, user_data_dir, render_url, expected_token)
+        {
+            panic!("{failure}");
+        }
+    }
+
+    /// [`run_chrome_probe`], returning the failure instead of panicking.
+    fn try_chrome_probe(
+        stage: &str,
+        command: &mut Command,
+        user_data_dir: &Path,
+        render_url: &str,
+        expected_token: &str,
+    ) -> Result<(), String> {
+        let mut browser = ChromeProcess::try_spawn(stage, command)?;
         let deadline = Instant::now() + CHROME_PROBE_TIMEOUT;
 
         let failure = run_cdp_probe(
@@ -1258,19 +1273,17 @@ mod macos_tests {
         let cleanup = browser.terminate_and_reap();
         let diagnostics = browser.diagnostics();
         match (failure, cleanup) {
-            (None, Ok(_)) => {}
-            (None, Err(cleanup_error)) => {
-                panic!(
-                    "{stage}: browser was ready but cleanup failed: \
-                     {cleanup_error}\n{diagnostics}"
-                )
-            }
+            (None, Ok(_)) => Ok(()),
+            (None, Err(cleanup_error)) => Err(format!(
+                "{stage}: browser was ready but cleanup failed: \
+                 {cleanup_error}\n{diagnostics}"
+            )),
             (Some(failure), Ok(cleanup)) => {
-                panic!("{stage}: {failure}; {cleanup}:\n{diagnostics}")
+                Err(format!("{stage}: {failure}; {cleanup}:\n{diagnostics}"))
             }
-            (Some(failure), Err(cleanup_error)) => {
-                panic!("{stage}: {failure}; cleanup failed: {cleanup_error}\n{diagnostics}")
-            }
+            (Some(failure), Err(cleanup_error)) => Err(format!(
+                "{stage}: {failure}; cleanup failed: {cleanup_error}\n{diagnostics}"
+            )),
         }
     }
 
@@ -1299,19 +1312,42 @@ mod macos_tests {
             "CPLT_CHROME_FOR_TESTING must identify an executable file"
         );
 
-        let control_data_dir = tempfile::tempdir().expect("create control browser state");
-        let control_token = unique_render_token();
-        let control_url = render_probe_document(&control_token);
-        eprintln!(
-            "chrome-for-testing stage: direct control \
-             (Chromium sandbox enabled, no cplt Seatbelt)"
-        );
-        run_chrome_probe(
-            "direct Chrome for Testing control (Chromium sandbox enabled, no cplt Seatbelt)",
-            Command::new(&chrome).args(chrome_probe_args(control_data_dir.path())),
-            control_data_dir.path(),
-            &control_url,
-            &control_token,
+        // The control has no cplt profile, so it tests the runner, not cplt,
+        // and it gets retries. On CI the first Chrome launch on a fresh runner
+        // has missed the CDP discovery budget outright (#528: curl exit 28,
+        // twice, both in this stage). A fresh profile per attempt keeps one
+        // wedged launch from poisoning the next. The sandboxed launch below is
+        // the assertion about cplt and stays single-shot.
+        const CONTROL_ATTEMPTS: usize = 3;
+        let mut control_failures = Vec::new();
+        while control_failures.len() < CONTROL_ATTEMPTS {
+            let control_data_dir = tempfile::tempdir().expect("create control browser state");
+            let control_token = unique_render_token();
+            let control_url = render_probe_document(&control_token);
+            eprintln!(
+                "chrome-for-testing stage: direct control \
+                 (Chromium sandbox enabled, no cplt Seatbelt), attempt {}",
+                control_failures.len() + 1
+            );
+            match try_chrome_probe(
+                "direct Chrome for Testing control (Chromium sandbox enabled, no cplt Seatbelt)",
+                Command::new(&chrome).args(chrome_probe_args(control_data_dir.path())),
+                control_data_dir.path(),
+                &control_url,
+                &control_token,
+            ) {
+                Ok(()) => break,
+                Err(failure) => {
+                    eprintln!("chrome-for-testing stage: direct control failed: {failure}");
+                    control_failures.push(failure);
+                }
+            }
+        }
+        assert!(
+            control_failures.len() < CONTROL_ATTEMPTS,
+            "direct Chrome control failed {CONTROL_ATTEMPTS} times; the runner cannot \
+             host Chrome, so the sandboxed run would prove nothing:\n{}",
+            control_failures.join("\n---\n")
         );
         eprintln!("chrome-for-testing stage: direct control ready");
 

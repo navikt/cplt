@@ -240,11 +240,25 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// after the probe itself exits, and an unbounded join there would reintroduce
 /// exactly the hang this function exists to remove. A detached reader blocked
 /// on a pipe costs one thread in a process that exits moments later.
-#[allow(clippy::disallowed_methods)] // runs an already-resolved discovered path; trusting it is #248, not resolution
 /// `pub`, not `pub(crate)`: the binary is a separate crate from the library,
 /// so a crate-private item here is unreachable from `main.rs`, which uses this
 /// to print agent versions.
 pub fn probe_version(path: &Path, args: &[&str]) -> VersionProbe {
+    probe_version_within(path, args, PROBE_TIMEOUT, READ_GRACE)
+}
+
+/// How long the reader may take to hand over stdout once the probe has exited.
+const READ_GRACE: Duration = Duration::from_millis(500);
+
+/// [`probe_version`] with its two wall-clock budgets passed in, so a test that
+/// is not about the bounds can give a loaded machine room (#528).
+#[allow(clippy::disallowed_methods)] // runs an already-resolved discovered path; trusting it is #248, not resolution
+fn probe_version_within(
+    path: &Path,
+    args: &[&str],
+    timeout: Duration,
+    read_grace: Duration,
+) -> VersionProbe {
     let Ok(mut child) = std::process::Command::new(path)
         .args(args)
         .stdin(Stdio::null())
@@ -266,7 +280,7 @@ pub fn probe_version(path: &Path, args: &[&str]) -> VersionProbe {
         let _ = tx.send(buf);
     });
 
-    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -288,7 +302,7 @@ pub fn probe_version(path: &Path, args: &[&str]) -> VersionProbe {
 
     // The child is gone, so unless it left something else holding the write end
     // of the pipe the reader has already seen EOF and sent.
-    let Ok(buf) = rx.recv_timeout(Duration::from_millis(500)) else {
+    let Ok(buf) = rx.recv_timeout(read_grace) else {
         return VersionProbe::Unknown;
     };
     if !status.success() {
@@ -2199,19 +2213,29 @@ ELECTRON_RUN_AS_NODE=1 "/Applications/Visual Studio Code.app/Contents/Frameworks
 
     /// The happy path still parses, and a binary that answers is never
     /// misreported as timed out.
+    ///
+    /// Through the generous budgets, not the production ones: this test is
+    /// about parsing and exit status, and on a loaded machine starting even
+    /// `exec false` has taken longer than [`PROBE_TIMEOUT`] (#528). The bounds
+    /// have their own tests above. A probe that never reaps an answering
+    /// binary still fails here, only after a minute instead of five seconds.
     #[cfg(unix)]
     #[test]
     fn version_probe_parses_a_prompt_answer() {
+        const ROOM: Duration = Duration::from_mins(1);
         let dir = tempfile::tempdir().unwrap();
         let ok = fake_binary(dir.path(), "quick", "exec echo GitHub Copilot CLI 1.0.21.");
         assert_eq!(
-            probe_version(&ok, &["--version"]),
+            probe_version_within(&ok, &["--version"], ROOM, ROOM),
             VersionProbe::Version("1.0.21".to_string())
         );
 
         // Non-zero exit is "ran, said nothing useful" — not a timeout.
         let bad = fake_binary(dir.path(), "broken", "exec false");
-        assert_eq!(probe_version(&bad, &["--version"]), VersionProbe::Unknown);
+        assert_eq!(
+            probe_version_within(&bad, &["--version"], ROOM, ROOM),
+            VersionProbe::Unknown
+        );
     }
 }
 
