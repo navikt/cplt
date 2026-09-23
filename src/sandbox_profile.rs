@@ -27,9 +27,9 @@ use super::policy::{
     SENSITIVE_PROJECT_PATTERNS, SYSTEM_READ_FILES, TOOL_READ_DIRS, XCODE_SELECT_LINK,
     active_tool_dirs, ancestor_alternation, app_dirs, colima_socket_paths, current_uid,
     escape_regex, first_party_read_target, grant_is_refused, home_config_link_targets,
-    nested_alternation, path_bin_dirs, playwright_runtime_intent, read_only_home_config,
-    rel_is_glob, rel_regex, validate_playwright_socket_dir, validate_sbpl_path,
-    xdg_git_link_targets,
+    missing_home_config_link_targets, nested_alternation, path_bin_dirs, playwright_runtime_intent,
+    read_only_home_config, rel_is_glob, rel_regex, validate_playwright_socket_dir,
+    validate_sbpl_path,
 };
 
 /// Device nodes a sandboxed process may open for writing, by exact path.
@@ -2009,9 +2009,10 @@ fn emit_user_write_exec_denies(
 /// <project>/gitconfig` only a rule naming the target stops the write, and it
 /// has to come after the project and `allow.write` grants, hence the tail.
 ///
-/// `config`, `ignore` and `attributes` in a linked `~/.config/git` are denied
-/// even before they exist ([`xdg_git_link_targets`]): git on the host reads
-/// all three from the resolved directory.
+/// `config`, `ignore` and `attributes` in a linked `~/.config/git`, and the
+/// target of a dangling `~/.gitconfig`, are denied even before they exist
+/// ([`missing_home_config_link_targets`]): git on the host reads them once
+/// they do.
 ///
 /// The target's ancestors get `file-write-unlink`, for the reason
 /// `emit_gitdir_denies` pins the gitdir's: a literal deny holds only while the
@@ -2030,7 +2031,7 @@ fn emit_home_config_write_denies(sb: &mut String, config: &SandboxConfig, home: 
     // launch when one sits in a writable tree (`validate_config_paths`).
     let targets: Vec<PathBuf> = home_config_link_targets(Path::new(home))
         .into_iter()
-        .chain(xdg_git_link_targets(Path::new(home)))
+        .chain(missing_home_config_link_targets(Path::new(home)))
         .filter(|t| validate_sbpl_path(t).is_ok())
         .collect();
     for target in &targets {

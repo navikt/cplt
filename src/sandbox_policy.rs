@@ -2047,7 +2047,7 @@ pub fn read_only_home_config() -> impl Iterator<Item = &'static str> {
 /// that grant.
 ///
 /// Resolved once, at launch. A link whose target does not exist yet resolves
-/// to nothing and is not covered.
+/// to nothing here; [`missing_home_config_link_targets`] covers it.
 pub fn home_config_link_targets(home: &Path) -> Vec<PathBuf> {
     read_only_home_config()
         .filter_map(|rel| {
@@ -2060,33 +2060,38 @@ pub fn home_config_link_targets(home: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The [`read_only_home_config`] files in a linked `~/.config/git` that do
-/// not exist yet, for the macOS write denies. Git on the host reads
-/// `~/.config/git/config` whenever it exists, so if the agent could create it
-/// in a writable tree it could set `core.fsmonitor` or `core.hooksPath` and
-/// run code in the next unsandboxed git command. `ignore` is the default
-/// `core.excludesFile` and would hide paths from `git status`. Existing ones
-/// are already in [`home_config_link_targets`].
+/// The [`read_only_home_config`] files behind a link that do not exist yet:
+/// `config`, `ignore` or `attributes` in a linked `~/.config/git`, or the
+/// target of a dangling `~/.gitconfig`. Git on the host reads each of them
+/// whenever it exists, so if the agent could create one in a writable tree it
+/// could set `core.fsmonitor` or `core.hooksPath` and run code in the next
+/// unsandboxed git command. `ignore` is the default `core.excludesFile` and
+/// would hide paths from `git status`. Existing ones are already in
+/// [`home_config_link_targets`].
 ///
-/// Each entry is the first missing component on the file's path, resolved
-/// through its existing parent: the file itself, or `git` when `~/.config` is
-/// the link and has no `git` directory yet. A deny on the file inside a
-/// missing directory would not hold: the agent could create `git` as a
-/// symlink into another writable tree and write `config` there.
-/// Linux cannot bind a file that does not exist, so it has no counterpart.
-pub fn xdg_git_link_targets(home: &Path) -> Vec<PathBuf> {
+/// Each entry is the first missing component on the file's resolved path: the
+/// file itself, or `git` when `~/.config` is the link and has no `git`
+/// directory yet. A deny on the file inside a missing directory would not
+/// hold: the agent could create `git` as a symlink into another writable tree
+/// and write `config` there.
+///
+/// macOS denies these writes in the profile. Linux cannot bind a file that
+/// does not exist, so under Bubblewrap cplt creates them empty at launch
+/// (`plan_missing_home_config_targets`, #553), resolving the links itself
+/// rather than through this function.
+pub fn missing_home_config_link_targets(home: &Path) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = read_only_home_config()
-        .filter(|rel| rel.starts_with(".config/git/"))
         .filter_map(|rel| {
             let named = home.join(rel);
             if !links_inside_home(home, &named) || std::fs::canonicalize(&named).is_ok() {
                 return None;
             }
-            let missing = named
-                .ancestors()
+            // Follows a dangling link to where its target would be created.
+            let leaf = config::canonicalize_deepest(&named);
+            leaf.ancestors()
                 .take_while(|a| a.symlink_metadata().is_err())
-                .last()?;
-            Some(config::canonicalize_deepest(missing))
+                .last()
+                .map(Path::to_path_buf)
         })
         .collect();
     out.sort();

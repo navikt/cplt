@@ -2728,6 +2728,77 @@ print('CONNECTED')
         );
     }
 
+    /// #553: `~/.config/git -> <project>/git` with no `config` in it yet, and
+    /// a dangling `~/.gitconfig -> <project>/gitconfig`. Bubblewrap cannot
+    /// bind a missing file, so cplt creates both empty at launch and the
+    /// agent can neither write, remove nor rename them. Without Bubblewrap
+    /// nothing is created and the launch names them.
+    #[test]
+    fn bwrap_keeps_missing_linked_git_config_from_being_created() {
+        require_bwrap!();
+        let setup = || {
+            let home = create_deny_project();
+            let dotfiles = home.path().join("dotfiles");
+            fs::create_dir_all(dotfiles.join("git")).expect("mkdir git");
+            fs::create_dir_all(home.path().join(".config")).expect("mkdir .config");
+            std::os::unix::fs::symlink(dotfiles.join("git"), home.path().join(".config/git"))
+                .expect("link ~/.config/git");
+            std::os::unix::fs::symlink(dotfiles.join("gitconfig"), home.path().join(".gitconfig"))
+                .expect("link ~/.gitconfig");
+            (home, dotfiles)
+        };
+
+        // Printing the profile only inspects it: nothing is created, and the
+        // profile says what a launch would create.
+        let (home, dotfiles) = setup();
+        let (code, stdout, stderr) = run_sandboxed_home_with_flags(
+            &dotfiles,
+            home.path(),
+            &["--use-bubblewrap", "--print-profile"],
+            "true",
+        );
+        assert!(
+            code == 0
+                && stdout.contains("Would create empty at launch")
+                && stdout.contains(&dotfiles.join("gitconfig").display().to_string())
+                && !dotfiles.join("git/config").exists()
+                && !dotfiles.join("gitconfig").exists(),
+            "code: {code}, stdout: {stdout}, stderr: {stderr}"
+        );
+
+        let (home, dotfiles) = setup();
+        let d = dotfiles.display();
+        let script = &format!(
+            "(echo '[core]' > ~/.config/git/config) 2>/dev/null && echo XDG-WRITTEN || echo XDG-RO; \
+             (echo '[core]' > '{d}/gitconfig') 2>/dev/null && echo GC-WRITTEN || echo GC-RO; \
+             rm -f '{d}/git/config' 2>/dev/null && echo RM-OK || echo RM-DENIED; \
+             mv '{d}/git' '{d}/git2' 2>/dev/null && echo MOVED || echo PINNED"
+        );
+        let (code, stdout, stderr) =
+            run_sandboxed_home_with_flags(&dotfiles, home.path(), &["--use-bubblewrap"], script);
+        let empty = |p: &Path| fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() == 0);
+        assert!(
+            stdout.contains("XDG-RO")
+                && stdout.contains("GC-RO")
+                && stdout.contains("RM-DENIED")
+                && stdout.contains("PINNED")
+                && stderr.contains("Created empty")
+                && empty(&dotfiles.join("git/config"))
+                && empty(&dotfiles.join("gitconfig")),
+            "code: {code}, stdout: {stdout}, stderr: {stderr}"
+        );
+
+        let (home, dotfiles) = setup();
+        let (code, stdout, stderr) =
+            run_sandboxed_home_with_flags(&dotfiles, home.path(), &["--no-bubblewrap"], "true");
+        assert!(
+            stderr.contains("does not exist yet")
+                && !dotfiles.join("git/config").exists()
+                && !dotfiles.join("gitconfig").exists(),
+            "code: {code}, stdout: {stdout}, stderr: {stderr}"
+        );
+    }
+
     #[test]
     fn bwrap_deny_mask_placeholder_cannot_be_softened() {
         // The placeholder lives inside the writable scratch bind (TMPDIR); a
