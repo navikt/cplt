@@ -303,7 +303,15 @@ pub fn load_repo_config(project_dir: &Path) -> Result<Option<LoadedRepoConfig>, 
 
     // Fallback: the working tree, on every platform, for `[deny]` only.
     let file_path = project_dir.join(REPO_CONFIG_FILE);
-    if file_path.is_file() {
+    // `is_file()` would read a symlink loop or an unstattable file as "no
+    // .cplt.toml" and say nothing. Only an absent file is "none"; any other error
+    // goes to the caller, which warns as it does for an unparseable file (#385).
+    let is_file = match std::fs::metadata(&file_path) {
+        Ok(meta) => meta.is_file(),
+        Err(e) if crate::config::is_absent(&e) => false,
+        Err(e) => return Err(format!("Failed to read {}: {e}", file_path.display())),
+    };
+    if is_file {
         let content = std::fs::read_to_string(&file_path)
             .map_err(|e| format!("Failed to read {}: {e}", file_path.display()))?;
         let mut config = parse_repo_config(&content)?;
@@ -923,6 +931,31 @@ preset = \"full-trust\"\n",
         assert!(
             loaded.propose_dropped,
             "the user must be told why nothing was proposed"
+        );
+    }
+
+    /// A working-tree `.cplt.toml` that cannot be stat'ed is an error, not
+    /// "no file": `is_file()` read a symlink loop as absent and the launch said
+    /// nothing, where an unparseable file warns (#385). The caller keeps its
+    /// existing policy for `Err` (warn, #497); this only ends the silence.
+    #[test]
+    fn a_looping_working_tree_file_is_an_error_not_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().canonicalize().expect("canonical");
+        let file = path.join(REPO_CONFIG_FILE);
+        std::os::unix::fs::symlink(&file, &file).expect("symlink loop");
+
+        let err =
+            load_repo_config(&path).expect_err("a looping .cplt.toml must not read as absent");
+        assert!(
+            err.contains(&*file.to_string_lossy()),
+            "the error must name the file: {err}"
+        );
+
+        std::fs::remove_file(&file).expect("unlink");
+        assert!(
+            matches!(load_repo_config(&path), Ok(None)),
+            "a missing file is still the ordinary no-config case"
         );
     }
 

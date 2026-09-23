@@ -57,3 +57,17 @@ impl From<String> for ConfigError {
         ConfigError::Validation(s)
     }
 }
+
+/// Whether a failed config read means "there is no file" (#385).
+///
+/// `NotFound`, and `NotADirectory` — a path through a regular file, such as
+/// `CPLT_CONFIG=/dev/null/nonexistent`, cannot name a file either. Every other
+/// error (EACCES, EIO, a symlink loop, ...) means a file may be there with
+/// restrictions in it, so callers must fail rather than fall back to defaults.
+#[must_use]
+pub fn is_absent(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
