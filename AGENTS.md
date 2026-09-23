@@ -187,6 +187,17 @@ So, when adding a config key, a flag, or a grant kind:
 - Cover it with a test that fails when the setting stops taking effect. Every
   case above was found by a person tripping over it, never by the suite.
 
+### Staged rollout
+
+A change that can break a working setup ships behind a config key, default off, and is
+enabled gradually. The security fix lands on its own merits; flipping the default is a
+separate, staged decision that needs maintainer sign-off.
+
+With the key unset, generated profiles must be byte-identical to the previous release, and
+the PR is required to demonstrate that, not just assert it.
+
+#264 tracks which keys are off by default today.
+
 ## Key patterns
 
 - `(deny default)` plus specific allows, so the sandbox is deny-by-default
