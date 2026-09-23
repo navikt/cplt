@@ -1204,6 +1204,12 @@ const LABEL_ALLOW_APPROVED: &str = "(approved)";
 const LABEL_ALLOW_PENDING: &str = "(pending approval)";
 const STATUS_APPROVED: &str = "✓ approved";
 const STATUS_PENDING: &str = "○ pending";
+/// Said by the launch and by `cplt trust` about an approval whose proposal is
+/// gone (#560). "Changed" was wrong there: it sent the user to `trust accept`,
+/// which then found nothing to approve.
+const APPROVAL_OUTLIVED: &str =
+    "Approval on file for a .cplt.toml proposal that no longer exists. It grants nothing.";
+const APPROVAL_OUTLIVED_HINT: &str = "Run `cplt trust accept` to remove it.";
 
 fn source_label(source: repo_config::RepoConfigSource) -> &'static str {
     match source {
@@ -2225,6 +2231,9 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                 // Check trust store — validate content hash
                 if let Some(t) = trust::load_trust(&project_dir) {
                     let current_hash = trust::proposal_content_hash(&loaded.config.propose);
+                    let nothing_proposed = !loaded.propose_dropped
+                        && repo_config::proposed_keys(&loaded.config.propose).is_empty();
+                    let status = trust::approval_status(&t, &current_hash, nothing_proposed);
                     // Finding 4: the trust file is keyed on the git origin URL, which
                     // the repo can forge (`git remote set-url origin <victim>` + copy
                     // the victim's approved [propose] block so the content hash matches
@@ -2248,18 +2257,26 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                     }
                     // Treat a legacy empty stored hash as STALE (see approval_is_stale):
                     // it pins nothing, so applying its keys against arbitrary proposal
-                    // *values* with no re-prompt would be unsafe.
-                    else if trust::approval_is_stale(&t.accepted.content_hash, &current_hash) {
-                        // Proposals changed since approval (or a legacy unpinned
-                        // entry) — invalidate and require re-approval.
+                    // *values* with no re-prompt would be unsafe. Only `Current`
+                    // applies keys; the other two differ only in what they say.
+                    //
+                    // Every warning here is behind `quiet`, which `cplt exec`
+                    // turns on by default so a script's stderr stays clean. That
+                    // is deliberate: exec runs this same check and applies the
+                    // same key set, it just does not say so. `--no-quiet` shows it.
+                    else if status == trust::ApprovalStatus::Current {
+                        t.accepted.keys
+                    } else {
                         if !resolved.quiet {
-                            ui::warn(
-                                ".cplt.toml permissions changed since the last approval. Re-approve with `cplt trust accept`",
-                            );
+                            if status == trust::ApprovalStatus::Outlived {
+                                ui::warn(&format!("{APPROVAL_OUTLIVED} {APPROVAL_OUTLIVED_HINT}"));
+                            } else {
+                                ui::warn(
+                                    ".cplt.toml permissions changed since the last approval. Re-approve with `cplt trust accept`",
+                                );
+                            }
                         }
                         Vec::new()
-                    } else {
-                        t.accepted.keys
                     }
                 } else {
                     // No trust entry — first time seeing this repo config
@@ -7997,6 +8014,18 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
             t.accepted.content_hash != current_hash
         }
     });
+    // Not "changed": there is nothing left to re-approve (#560). Only for an
+    // entry that applies here — a foreign one has its own message below.
+    let outlived = entry_applies
+        && !loaded.propose_dropped
+        && proposed.is_empty()
+        && trust_entry.as_ref().is_some_and(|t| {
+            trust::approval_status(
+                t,
+                &trust::proposal_content_hash(&loaded.config.propose),
+                true,
+            ) == trust::ApprovalStatus::Outlived
+        });
 
     // Proposals
     let all_approved = !hash_mismatch
@@ -8065,7 +8094,12 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
             entry.accepted.approved_at
         );
 
-        if hash_mismatch {
+        if outlived {
+            println!("{blue}[cplt]{nc}  {yellow}⚠ {APPROVAL_OUTLIVED}{nc}");
+            if blocked.is_none() {
+                println!("{blue}[cplt]{nc}  {yellow}  {APPROVAL_OUTLIVED_HINT}{nc}");
+            }
+        } else if hash_mismatch {
             println!("{blue}[cplt]{nc}  {red}⚠ Permissions have changed since last approval!{nc}");
             if blocked.is_none() {
                 println!(
@@ -8248,6 +8282,53 @@ fn unlink_approved_repos(project_dir: &Path, linked: &[trust::LinkedRepo]) {
     }
 }
 
+/// `cplt trust accept` when the committed `.cplt.toml` proposes nothing.
+///
+/// Retires an approval left over from an earlier proposal (#560). The launch
+/// and `cplt trust` point here for it, so answering "nothing to approve" and
+/// keeping it left a warning that only `trust revoke --all` could clear.
+/// Retiring only narrows: the entry already applied no key, because its hash
+/// cannot match an empty proposal (see `trust::approval_status`).
+///
+/// Only an entry granted at this repository. A foreign one is not this
+/// checkout's to change, and the launch names it for what it is.
+fn trust_accept_nothing_proposed(
+    project_dir: &std::path::Path,
+    stored: Option<trust::TrustEntry>,
+    current_hash: &str,
+) -> ExitCode {
+    let Some(entry) = stored.filter(|t| {
+        trust::approved_path_matches(t, project_dir)
+            && trust::approval_status(t, current_hash, true) == trust::ApprovalStatus::Outlived
+    }) else {
+        ui::info("No permissions requested in .cplt.toml, nothing to approve.");
+        return ExitCode::SUCCESS;
+    };
+    let linked = entry.accepted.linked.len();
+    let result = match trust::retire_outlived(entry, current_hash) {
+        None => trust::revoke_trust(project_dir),
+        Some(kept) => trust::save_trust(project_dir, &kept),
+    };
+    if let Err(e) = result {
+        ui::error(&format!("Failed to remove the approval: {e}"));
+        return ExitCode::FAILURE;
+    }
+    println!(
+        "{}✓{} Removed the approval for a .cplt.toml proposal that no longer exists. \
+         Nothing is requested now.",
+        ui::stdout_color(ui::GREEN),
+        ui::stdout_color(ui::RESET)
+    );
+    if linked > 0 {
+        println!(
+            "  It linked {linked} repositor{}; those are left in place. \
+             `cplt trust revoke --all` unlinks them.",
+            if linked == 1 { "y" } else { "ies" }
+        );
+    }
+    ExitCode::SUCCESS
+}
+
 fn trust_accept(
     project_dir: &std::path::Path,
     loaded: &repo_config::LoadedRepoConfig,
@@ -8272,13 +8353,12 @@ fn trust_accept(
 
     let proposed = repo_config::proposed_keys(&loaded.config.propose);
 
-    if proposed.is_empty() {
-        ui::info("No permissions requested in .cplt.toml, nothing to approve.");
-        return ExitCode::SUCCESS;
-    }
-
     let current_hash = trust::proposal_content_hash(&loaded.config.propose);
     let stored = trust::load_trust(project_dir);
+
+    if proposed.is_empty() {
+        return trust_accept_nothing_proposed(project_dir, stored, &current_hash);
+    }
 
     // Finding 4, write side: the trust file is keyed on the git origin URL alone,
     // which any repo can forge (`git remote set-url origin <victim>`). The launch

@@ -3118,6 +3118,28 @@ validate = false
         assert!(unapproved.contains(&"allow_docker".to_string()));
     }
 
+    /// #560: an approval that outlived its proposal still names keys. Even
+    /// handed straight to the grant, they must change nothing — a key applies
+    /// only a value the current `[propose]` holds.
+    #[test]
+    fn apply_repo_config_approved_keys_without_a_proposal_grant_nothing() {
+        let mut resolved = Config::default().merge(CliFlags::default()).unwrap();
+        let before = format!("{resolved:?}");
+        let unapproved = resolved.apply_repo_config(
+            &crate::repo_config::RepoConfig::default(),
+            std::path::Path::new("/nonexistent-repo"),
+            &[
+                "allow.read",
+                "allow.write",
+                "allow_docker",
+                "repos",
+                "sandbox.pass_env",
+            ],
+        );
+        assert!(unapproved.is_empty());
+        assert_eq!(format!("{resolved:?}"), before);
+    }
+
     #[test]
     fn apply_repo_config_approved_proposals_take_effect() {
         let config = Config::default();

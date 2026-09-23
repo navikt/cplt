@@ -2642,6 +2642,178 @@ mod trust_accept_guard {
         assert!(ok, "a committed config must stay approvable.\n{out}");
         assert!(out.contains("allow_docker"), "{out}");
     }
+
+    /// `cplt <args>` in `dir` against the isolated store and a scratch HOME.
+    /// Returns (stdout, stderr, ok).
+    fn cplt_in(dir: &Path, store: &Path, args: &[&str]) -> (String, String, bool) {
+        let out = cplt_cmd()
+            .args(args)
+            .current_dir(dir)
+            .env("CPLT_CONFIG", store.join("config.toml"))
+            .env("HOME", store)
+            .output()
+            .expect("cplt should run");
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.status.success(),
+        )
+    }
+
+    /// #560: a `.cplt.toml` that stops proposing anything left its approval
+    /// behind. `cplt trust` and the launch called it "changed" and pointed at
+    /// `cplt trust accept`, which answered "nothing to approve" and kept it.
+    #[test]
+    fn accept_retires_an_approval_whose_proposal_is_gone() {
+        let (dir, store) = repo();
+        std::fs::write(store.path().join("config.toml"), "").unwrap();
+        git(
+            dir.path(),
+            &["remote", "add", "origin", "https://github.com/o/r.git"],
+        );
+        std::fs::write(
+            dir.path().join(".cplt.toml"),
+            "[propose.allow]\nread = [\"~/Desktop\"]\n",
+        )
+        .unwrap();
+        commit_all(dir.path());
+        let (out, ok) = trust_accept_all(dir.path(), store.path());
+        assert!(ok && out.contains("allow.read"), "{out}");
+
+        std::fs::write(dir.path().join(".cplt.toml"), "# no proposals\n").unwrap();
+        commit_all(dir.path());
+
+        let outlived = "proposal that no longer exists";
+        let (stdout, stderr, ok) = cplt_in(dir.path(), store.path(), &["trust"]);
+        assert!(ok, "{stdout}{stderr}");
+        assert!(stdout.contains(outlived), "{stdout}");
+        assert!(
+            stdout.contains("`cplt trust accept` to remove it"),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("have changed"), "{stdout}");
+
+        // The launch: summary on, so the warning is printed. The check runs
+        // before the sandbox does, so its exit status is not the point here.
+        let launch = [
+            "--no-quiet",
+            "--yes",
+            "--no-validate",
+            "exec",
+            "--",
+            "/usr/bin/true",
+        ];
+        let (_, stderr, _) = cplt_in(dir.path(), store.path(), &launch);
+        assert!(stderr.contains(outlived), "{stderr}");
+        assert!(!stderr.contains("permissions changed"), "{stderr}");
+        // exec is quiet by default, which silences this warning with the
+        // rest of the summary: the same check ran, it just did not speak.
+        let (_, stderr, _) = cplt_in(dir.path(), store.path(), &["exec", "--", "/usr/bin/true"]);
+        assert!(!stderr.contains(outlived), "{stderr}");
+
+        let (out, ok) = trust_accept_all(dir.path(), store.path());
+        assert!(ok, "{out}");
+        assert!(out.contains("Removed the approval"), "{out}");
+        assert!(!out.contains("nothing to approve"), "{out}");
+        let left = std::fs::read_dir(store.path().join("trust"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "toml"))
+            .count();
+        assert_eq!(left, 0, "the entry must be gone from the store");
+
+        // Cleared everywhere, and a second accept has nothing left to do.
+        let (stdout, _, _) = cplt_in(dir.path(), store.path(), &["trust"]);
+        assert!(!stdout.contains(outlived), "{stdout}");
+        let (_, stderr, _) = cplt_in(dir.path(), store.path(), &launch);
+        assert!(!stderr.contains(outlived), "{stderr}");
+        let (out, ok) = trust_accept_all(dir.path(), store.path());
+        assert!(ok && out.contains("nothing to approve"), "{out}");
+    }
+
+    /// Retiring is for this repository's own entry. Another clone of the same
+    /// origin that proposes nothing must not delete the approval it shares a
+    /// store slot with.
+    #[test]
+    fn accept_with_nothing_proposed_leaves_a_foreign_approval_alone() {
+        let (owner, store) = repo();
+        let (other, _) = repo();
+        std::fs::write(store.path().join("config.toml"), "").unwrap();
+        for dir in [owner.path(), other.path()] {
+            git(
+                dir,
+                &["remote", "add", "origin", "https://github.com/o/r.git"],
+            );
+        }
+        std::fs::write(owner.path().join(".cplt.toml"), PROPOSE).unwrap();
+        commit_all(owner.path());
+        let (out, ok) = trust_accept_all(owner.path(), store.path());
+        assert!(ok, "{out}");
+        let trust_file = || {
+            std::fs::read_dir(store.path().join("trust"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .find(|e| e.path().extension().is_some_and(|x| x == "toml"))
+                .map(|e| std::fs::read_to_string(e.path()).unwrap())
+        };
+        let before = trust_file().expect("owner's entry");
+
+        std::fs::write(other.path().join(".cplt.toml"), "# no proposals\n").unwrap();
+        commit_all(other.path());
+        let (out, ok) = trust_accept_all(other.path(), store.path());
+        assert!(ok && out.contains("nothing to approve"), "{out}");
+        assert_eq!(trust_file().as_deref(), Some(before.as_str()));
+    }
+
+    /// An uncommitted `.cplt.toml` has its `[propose]` stripped on load, so
+    /// nothing reaches cplt — but the file still proposes. That is not a
+    /// proposal that "no longer exists", and saying so would be false.
+    #[test]
+    fn an_uncommitted_proposal_is_not_called_gone() {
+        let (dir, store) = repo();
+        std::fs::write(store.path().join("config.toml"), "").unwrap();
+        git(
+            dir.path(),
+            &["remote", "add", "origin", "https://github.com/o/r.git"],
+        );
+        std::fs::write(dir.path().join(".cplt.toml"), PROPOSE).unwrap();
+        commit_all(dir.path());
+        let (out, ok) = trust_accept_all(dir.path(), store.path());
+        assert!(ok, "{out}");
+
+        git(dir.path(), &["rm", "-q", "--cached", ".cplt.toml"]);
+        git(
+            dir.path(),
+            &[
+                "-c",
+                "commit.gpgSign=false",
+                "commit",
+                "-q",
+                "-m",
+                "untrack",
+            ],
+        );
+
+        let (stdout, stderr, _) = cplt_in(dir.path(), store.path(), &["trust"]);
+        assert!(!stdout.contains("no longer exists"), "{stdout}{stderr}");
+        let (_, stderr, _) = cplt_in(
+            dir.path(),
+            store.path(),
+            &[
+                "--no-quiet",
+                "--yes",
+                "--no-validate",
+                "exec",
+                "--",
+                "/usr/bin/true",
+            ],
+        );
+        assert!(!stderr.contains("no longer exists"), "{stderr}");
+        assert!(
+            stderr.contains("changed since the last approval"),
+            "{stderr}"
+        );
+    }
 }
 
 // ── multi-repo gh scope (#344, stage 1) ───────────────────────────────────

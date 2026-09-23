@@ -413,6 +413,67 @@ pub fn approval_is_stale(stored_hash: &str, current_hash: &str) -> bool {
     stored_hash != current_hash
 }
 
+/// How a stored approval relates to the proposal in front of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApprovalStatus {
+    /// Pinned to these exact proposal values; its keys may apply.
+    Current,
+    /// The proposal changed since the approval; re-approve.
+    Changed,
+    /// Stale, and there is nothing left to approve: the proposal the entry was
+    /// granted for no longer exists (#560). Reporting this as "changed" sent
+    /// the user to `cplt trust accept`, which then said there was nothing to do.
+    Outlived,
+}
+
+/// Classify `entry` against the current proposal.
+///
+/// `nothing_proposed` must mean "the committed file proposes nothing", not
+/// "nothing reached us": a `[propose]` stripped from an uncommitted file is a
+/// proposal waiting for a commit, not one that is gone.
+///
+/// Only `Current` may apply keys. `Outlived` is as stale as `Changed` — the
+/// split exists for the message, never for the grant.
+#[must_use]
+pub fn approval_status(
+    entry: &TrustEntry,
+    current_hash: &str,
+    nothing_proposed: bool,
+) -> ApprovalStatus {
+    if !approval_is_stale(&entry.accepted.content_hash, current_hash) {
+        ApprovalStatus::Current
+    } else if nothing_proposed {
+        ApprovalStatus::Outlived
+    } else {
+        ApprovalStatus::Changed
+    }
+}
+
+/// What `cplt trust accept` leaves behind for an [`ApprovalStatus::Outlived`]
+/// entry: `None` to delete it, or an entry that approves nothing.
+///
+/// The entry is kept only when it records linked repositories. That record is
+/// the only way `cplt trust revoke --all` can find the roots an approval
+/// created, and accept never unlinks (see `trust_accept`), so dropping it would
+/// strand a read/write/execute grant no command could withdraw. What is kept
+/// approves no key and is pinned to the current (empty) proposal, so a
+/// proposal that comes back later is new and needs a fresh approval.
+#[must_use]
+pub fn retire_outlived(entry: TrustEntry, current_hash: &str) -> Option<TrustEntry> {
+    if entry.accepted.linked.is_empty() {
+        return None;
+    }
+    Some(TrustEntry {
+        repo: entry.repo,
+        accepted: AcceptedProposals {
+            keys: Vec::new(),
+            approved_at: now_iso8601(),
+            linked: entry.accepted.linked,
+            content_hash: current_hash.to_string(),
+        },
+    })
+}
+
 /// Check whether a trust entry applies to the repository at `project_dir`.
 ///
 /// # Why (Finding 4 — trust identity is a spoofable git origin URL)
@@ -538,6 +599,89 @@ pub fn approval_is_orphaned(entry: &TrustEntry) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An entry approved for `[propose.allow] read = ["~/Desktop"]` (#560).
+    fn approved_for_desktop() -> (TrustEntry, String) {
+        let propose = crate::repo_config::ProposeSection {
+            allow: crate::repo_config::ProposeAllowSection {
+                read: vec!["~/Desktop".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let entry = TrustEntry {
+            accepted: AcceptedProposals {
+                keys: vec!["allow.read".to_string()],
+                approved_at: "2026-01-01T00:00:00Z".to_string(),
+                content_hash: proposal_content_hash(&propose),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let empty = proposal_content_hash(&crate::repo_config::ProposeSection::default());
+        (entry, empty)
+    }
+
+    /// #560: the proposal is gone, so the entry is outlived — not "changed",
+    /// which sent the user to a `trust accept` that did nothing.
+    #[test]
+    fn approval_for_a_vanished_proposal_is_outlived() {
+        let (entry, empty) = approved_for_desktop();
+        assert_eq!(
+            approval_status(&entry, &empty, true),
+            ApprovalStatus::Outlived
+        );
+        // Something still proposed: a real change.
+        assert_eq!(
+            approval_status(&entry, &empty, false),
+            ApprovalStatus::Changed
+        );
+        let same = entry.accepted.content_hash.clone();
+        assert_eq!(
+            approval_status(&entry, &same, false),
+            ApprovalStatus::Current
+        );
+    }
+
+    /// A legacy entry pins nothing, so it can never be Current — including
+    /// against an empty proposal.
+    #[test]
+    fn legacy_entry_with_nothing_proposed_is_outlived_not_current() {
+        let (mut entry, empty) = approved_for_desktop();
+        entry.accepted.content_hash.clear();
+        assert_eq!(
+            approval_status(&entry, &empty, true),
+            ApprovalStatus::Outlived
+        );
+    }
+
+    #[test]
+    fn retiring_an_outlived_entry_deletes_it() {
+        let (entry, empty) = approved_for_desktop();
+        assert_eq!(retire_outlived(entry, &empty), None);
+    }
+
+    /// Linked roots keep their record, so `trust revoke --all` can still find
+    /// them. What is kept approves nothing and is pinned to the empty proposal.
+    #[test]
+    fn retiring_an_outlived_entry_keeps_only_the_linked_record() {
+        let (mut entry, empty) = approved_for_desktop();
+        entry.accepted.keys.push("repos".to_string());
+        entry.accepted.linked = vec![LinkedRepo {
+            identity: "github.com/o/sib".to_string(),
+            path: "/src/sib".to_string(),
+        }];
+        let kept = retire_outlived(entry.clone(), &empty).expect("linked record must be kept");
+        assert!(kept.accepted.keys.is_empty(), "no key may stay approved");
+        assert_eq!(kept.accepted.linked, entry.accepted.linked);
+        assert_eq!(kept.accepted.content_hash, empty);
+        assert_eq!(kept.repo, entry.repo);
+        // The old proposal, re-added verbatim, is new and needs approving.
+        assert_eq!(
+            approval_status(&kept, &entry.accepted.content_hash, false),
+            ApprovalStatus::Changed
+        );
+    }
 
     #[test]
     fn normalize_ssh_url() {
