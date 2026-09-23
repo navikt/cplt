@@ -1025,7 +1025,7 @@ fn profile_denies_writes_at_a_symlinked_home_git_config_target() {
     let targets = links
         .iter()
         .map(|(_, t)| t.clone())
-        .chain([xdg.join("ignore"), xdg.join("attributes")]);
+        .chain(["config", "ignore", "attributes"].map(|f| xdg.join(f)));
     for target in targets {
         let deny = format!("(deny file-write* (literal \"{}\"))", target.display());
         let deny_at = p
@@ -1056,6 +1056,59 @@ fn profile_denies_writes_at_a_symlinked_home_git_config_target() {
             dir.display()
         );
     }
+}
+
+/// `~/.config` links into the project and has no `git` directory yet. A deny
+/// on `<target>/git/config` alone would let the agent create `git` as a
+/// symlink elsewhere and write `config` there, so creating `git` itself is
+/// denied, after the project grant.
+#[test]
+fn profile_denies_creating_git_under_a_symlinked_config_dir() {
+    let tmp = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("tempdir");
+    let root = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+    let home_dir = root.join("home");
+    let project = root.join("project");
+    let xdg = project.join("dot-config");
+    std::fs::create_dir_all(&home_dir).expect("mkdir home");
+    std::fs::create_dir_all(&xdg).expect("mkdir xdg");
+    std::os::unix::fs::symlink(&xdg, home_dir.join(".config")).expect("symlink");
+
+    let p = generate_profile(
+        &SandboxConfig {
+            home_dir: &home_dir,
+            project_dir: &project,
+            ..base_profile_options()
+        },
+        &[],
+    );
+
+    let allow = format!("(allow file-write* (subpath \"{}\"))", project.display());
+    let deny = format!(
+        "(deny file-write* (literal \"{}\"))",
+        xdg.join("git").display()
+    );
+    let allow_at = p.rfind(&allow).unwrap_or_else(|| panic!("{allow}:\n{p}"));
+    let deny_at = p.rfind(&deny).unwrap_or_else(|| panic!("{deny}:\n{p}"));
+    assert!(deny_at > allow_at, "{deny} must follow {allow}:\n{p}");
+}
+
+/// The plain `$HOME` write deny must also come after an `allow.write` grant
+/// covering it, or the grant wins (SBPL is last-match-wins).
+#[test]
+fn home_git_config_deny_follows_a_write_grant_over_it() {
+    let extra_write = [std::path::PathBuf::from("/Users/test/.config")];
+    let p = generate_profile(
+        &SandboxConfig {
+            extra_write: &extra_write,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    let allow = "(allow file-write* (subpath \"/Users/test/.config\"))";
+    let deny = "(deny file-write* (literal \"/Users/test/.config/git/config\"))";
+    let allow_at = p.rfind(allow).unwrap_or_else(|| panic!("{allow}:\n{p}"));
+    let deny_at = p.rfind(deny).unwrap_or_else(|| panic!("{deny}:\n{p}"));
+    assert!(deny_at > allow_at, "{deny} must follow {allow}:\n{p}");
 }
 
 /// The overwhelmingly common case: no `~/.gitconfig` at all. `canonicalize`

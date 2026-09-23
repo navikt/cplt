@@ -1985,9 +1985,9 @@ fn emit_user_write_exec_denies(
 /// <project>/gitconfig` only a rule naming the target stops the write, and it
 /// has to come after the project and `allow.write` grants, hence the tail.
 ///
-/// `ignore` and `attributes` in a linked `~/.config/git` are denied even
-/// before they exist ([`xdg_git_link_targets`]): git on the host reads the
-/// resolved `ignore` as its excludes file.
+/// `config`, `ignore` and `attributes` in a linked `~/.config/git` are denied
+/// even before they exist ([`xdg_git_link_targets`]): git on the host reads
+/// all three from the resolved directory.
 ///
 /// The target's ancestors get `file-write-unlink`, for the reason
 /// `emit_gitdir_denies` pins the gitdir's: a literal deny holds only while the

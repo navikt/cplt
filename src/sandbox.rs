@@ -1807,6 +1807,19 @@ mod tests {
         );
         assert!(!pins.contains(&project), "the root is not pinned: {pins:?}");
 
+        // A linked `~/.config/git`: an existing `config` there is bound
+        // read-only too, or the agent could plant `core.fsmonitor` in it.
+        let xdg = project.join("xdg-git");
+        std::fs::create_dir_all(&xdg).expect("mkdir xdg");
+        std::fs::write(xdg.join("config"), "").expect("write xdg config");
+        std::fs::create_dir_all(home.join(".config")).expect("mkdir .config");
+        std::os::unix::fs::symlink(&xdg, home.join(".config/git")).expect("symlink");
+        let ro = super::ro_protect_paths(&config, &[], &[]);
+        assert!(
+            ro.contains(&xdg.join("config")),
+            "xdg config missing from {ro:?}"
+        );
+
         // Any writable tree counts, not only the project and grants: here the
         // writable `~/.cache` tool dir.
         let cached = home.join(".cache/dots/local");

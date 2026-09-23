@@ -1800,10 +1800,11 @@ pub fn mise_ro_protect_paths(home: &Path) -> Vec<PathBuf> {
 /// gets the write deny too. The `gh` files and `.tool-versions` are readable
 /// but carry no read-only claim: they never had a `$HOME` write deny.
 pub fn read_only_home_config() -> impl Iterator<Item = &'static str> {
-    HOME_CONFIG_FILES
-        .iter()
-        .copied()
-        .filter(|f| f.starts_with(".git") || f.starts_with(".config/git/"))
+    HOME_CONFIG_FILES.iter().copied().filter(|f| {
+        matches!(*f, ".gitconfig" | ".gitignore_global")
+            || f.starts_with(".gitconfig.")
+            || f.starts_with(".config/git/")
+    })
 }
 
 /// Where each [`read_only_home_config`] file really lives, for the ones that
@@ -1829,24 +1830,38 @@ pub fn home_config_link_targets(home: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// `ignore` and `attributes` in a linked `~/.config/git` that do not exist
-/// yet, for the macOS write denies. Git reads `~/.config/git/ignore` as the
-/// default `core.excludesFile`, so if the agent could create it in a writable
-/// tree it could hide paths from `git status`. Existing ones are already in
-/// [`home_config_link_targets`]; a missing one resolves through its directory.
+/// The [`read_only_home_config`] files in a linked `~/.config/git` that do
+/// not exist yet, for the macOS write denies. Git on the host reads
+/// `~/.config/git/config` whenever it exists, so if the agent could create it
+/// in a writable tree it could set `core.fsmonitor` or `core.hooksPath` and
+/// run code in the next unsandboxed git command. `ignore` is the default
+/// `core.excludesFile` and would hide paths from `git status`. Existing ones
+/// are already in [`home_config_link_targets`].
+///
+/// Each entry is the first missing component on the file's path, resolved
+/// through its existing parent: the file itself, or `git` when `~/.config` is
+/// the link and has no `git` directory yet. A deny on the file inside a
+/// missing directory would not hold: the agent could create `git` as a
+/// symlink into another writable tree and write `config` there.
 /// Linux cannot bind a file that does not exist, so it has no counterpart.
 pub fn xdg_git_link_targets(home: &Path) -> Vec<PathBuf> {
-    let dir = home.join(".config/git");
-    ["ignore", "attributes"]
-        .iter()
-        .filter_map(|f| {
-            let named = dir.join(f);
+    let mut out: Vec<PathBuf> = read_only_home_config()
+        .filter(|rel| rel.starts_with(".config/git/"))
+        .filter_map(|rel| {
+            let named = home.join(rel);
             if !links_inside_home(home, &named) || std::fs::canonicalize(&named).is_ok() {
                 return None;
             }
-            std::fs::canonicalize(&dir).map(|d| d.join(f)).ok()
+            let missing = named
+                .ancestors()
+                .take_while(|a| a.symlink_metadata().is_err())
+                .last()?;
+            Some(config::canonicalize_deepest(missing))
         })
-        .collect()
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Whether `named`, or a directory between it and `home`, is a symlink.
