@@ -814,7 +814,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     //
     // Docker Desktop for Linux serves the daemon from inside that tree, at
     // `~/.docker/desktop/docker.sock`, so the socket list carries it too
-    // (#279). It has to be its own read+write rule: `ResolveUnix` — the right
+    // (#279), as it carries every running colima profile's socket (#209). It has to be its own read+write rule: `ResolveUnix` — the right
     // `connect(2)` needs from ABI v9 — is granted on the write branch of
     // `create_path_beneath_rule` alone, so the read-only parent grant below
     // leaves the socket unconnectable. Landlock unions the rights of every
@@ -853,6 +853,22 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 create_dirs: false,
             },
         });
+        // TestContainers' own config (`docker.host`), read-only like on
+        // macOS (#209). The rule follows a symlink, so the resolved target is
+        // checked too: a link into `~/.ssh` would otherwise grant the key.
+        let tc_props = home.join(".testcontainers.properties");
+        if policy::first_party_read_target(home, &tc_props).is_some() {
+            fs_rules.push(FsRule {
+                path: tc_props,
+                access: FsAccess {
+                    read: true,
+                    write: false,
+                    execute: false,
+                    ioctl: false,
+                    create_dirs: false,
+                },
+            });
+        }
     }
 
     // ── Home config files: individual read-only rules ──
@@ -2458,6 +2474,78 @@ mod tests {
         assert!(
             !rule.access.execute,
             "~/.docker must not carry execute (Landlock execute is process-exec, #243)"
+        );
+    }
+
+    /// A running colima profile's socket, found by the on-disk scan, gets its
+    /// own read+write rule under `--allow-docker` (`ResolveUnix` rides on the
+    /// write branch), and is mount-masked without it (#209).
+    #[test]
+    fn colima_profile_socket_granted_with_docker_and_masked_without() {
+        let project = PathBuf::from("/home/user/project");
+        let home = tempfile::tempdir().unwrap();
+        let colima_home = tempfile::tempdir().unwrap();
+        let profile = colima_home.path().join("work");
+        std::fs::create_dir(&profile).unwrap();
+        let sock = profile.join("docker.sock");
+        let _l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+
+        let (policy, masks) = temp_env::with_var("COLIMA_HOME", Some(colima_home.path()), || {
+            let mut config = test_config(&project, home.path());
+            config.allow_docker = true;
+            let masks = policy::socket_mask_paths(home.path(), policy::current_uid(), None, false);
+            (generate_policy(&config), masks)
+        });
+
+        let rule = policy
+            .fs_rules
+            .iter()
+            .find(|r| r.path == sock)
+            .expect("the colima profile socket should be in the ruleset with --allow-docker");
+        assert!(rule.access.read && rule.access.write);
+        assert!(!rule.access.execute);
+        assert!(
+            masks.contains(&sock),
+            "without --allow-docker it must be masked"
+        );
+    }
+
+    /// `~/.testcontainers.properties` is read-only under `--allow-docker` (#209).
+    #[test]
+    fn allow_docker_grants_testcontainers_properties_read_only() {
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let mut config = test_config(&project, &home);
+        config.allow_docker = true;
+        let policy = generate_policy(&config);
+
+        let rule = policy
+            .fs_rules
+            .iter()
+            .find(|r| r.path == home.join(".testcontainers.properties"))
+            .expect("~/.testcontainers.properties should be in the ruleset with --allow-docker");
+        assert!(rule.access.read);
+        assert!(!rule.access.write, "it must not be writable");
+        assert!(!rule.access.execute);
+    }
+
+    /// A `~/.testcontainers.properties` symlinked into `~/.ssh` gets no rule:
+    /// Landlock would follow the link and grant the key (#209).
+    #[test]
+    fn testcontainers_properties_linked_into_ssh_is_not_granted() {
+        let project = PathBuf::from("/home/user/project");
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join(".ssh")).unwrap();
+        std::fs::write(home.path().join(".ssh/id_ed25519"), "key").unwrap();
+        let link = home.path().join(".testcontainers.properties");
+        std::os::unix::fs::symlink(home.path().join(".ssh/id_ed25519"), &link).unwrap();
+        let mut config = test_config(&project, home.path());
+        config.allow_docker = true;
+
+        let policy = generate_policy(&config);
+        assert!(
+            !policy.fs_rules.iter().any(|r| r.path == link),
+            "a link into ~/.ssh must not become a read rule"
         );
     }
 

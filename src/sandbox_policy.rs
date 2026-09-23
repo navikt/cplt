@@ -190,6 +190,33 @@ pub fn grant_is_refused(home: &Path, path: &Path) -> bool {
         || cplt_state_dir_grant(home, path).is_some()
 }
 
+/// Where a first-party read grant on the file `path` really lands, or `None`
+/// when it must not be emitted.
+///
+/// Stricter than [`grant_is_refused`], which lets a user grant a single file
+/// inside a [`DENIED_DOTFILES`] directory on purpose. A rule cplt adds on its
+/// own has no such intent behind it, and a symlink such as
+/// `~/.testcontainers.properties -> ~/.ssh/id_ed25519` would turn it into a
+/// grant on the key: Landlock follows the link. So the resolved target is
+/// refused when it lies anywhere inside a denied dotfile directory or is a
+/// [`DENIED_HOME_SUBPATHS`] entry. A path that does not resolve is returned as
+/// spelled, since there is nothing behind it to expose.
+#[must_use]
+pub fn first_party_read_target(home: &Path, path: &Path) -> Option<PathBuf> {
+    if grant_is_refused(home, path) {
+        return None;
+    }
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let in_denied_dir = DENIED_DOTFILES.iter().any(|d| {
+        let dir = home.join(d);
+        target.starts_with(&dir) || std::fs::canonicalize(&dir).is_ok_and(|c| target.starts_with(c))
+    });
+    if in_denied_dir || denied_entry(DENIED_HOME_SUBPATHS, home, &target).is_some() {
+        return None;
+    }
+    Some(target)
+}
+
 /// Exact-path membership of `path` in a `$HOME`-relative deny list, comparing
 /// the literal and the canonicalized form.
 fn denied_entry(list: &[&'static str], home: &Path, path: &Path) -> Option<&'static str> {
@@ -386,7 +413,88 @@ pub fn linux_docker_socket_paths(
     );
     paths.push(PathBuf::from("/run/podman"));
     paths.push(home.join(".docker").join("desktop").join("docker.sock"));
+    paths.extend(colima_socket_paths(home, uid));
     paths
+}
+
+/// Colima daemon sockets that exist right now, in every profile (#209).
+///
+/// `colima start --profile foo` serves Docker at `<colima dir>/foo/docker.sock`,
+/// so a fixed list can only ever name the default profile. The profile names
+/// are read from disk instead: each direct subdirectory of a colima dir, plus
+/// the root-level `<colima dir>/docker.sock`.
+///
+/// The colima dir is `$COLIMA_HOME` when set, else `~/.colima`, else the XDG
+/// location `$XDG_CONFIG_HOME/colima` (default `~/.config/colima`). All of them
+/// are scanned rather than guessing which one colima picked. That costs
+/// nothing, because only entries that `lstat` as a **socket** named
+/// `docker.sock` are returned: never a directory, a config file such as
+/// `colima.yaml`, or a symlink. A path carrying a character unsafe in SBPL is
+/// dropped as well. The symlink exclusion matters on Linux, where a
+/// Landlock rule follows links and would otherwise grant read+write to
+/// whatever the link names.
+///
+/// Ownership is checked too: the colima dir, the socket's own directory and
+/// the socket must all belong to `uid`, and the socket must have a single
+/// link. `$COLIMA_HOME` or `$XDG_CONFIG_HOME` may name a world-writable
+/// directory, where another user could plant a `docker.sock` that the next
+/// launch would grant. The project dir, scratch dir and `allow.write` grants
+/// are not excluded by path, because nothing planted there gains anything: a
+/// socket the agent binds is its own process, a hardlink to someone else's
+/// socket has a link count above one, and a foreign socket fails the owner
+/// check.
+///
+/// A profile started after cplt launched is not covered; the default-profile
+/// literals in the macOS profile still are.
+pub fn colima_socket_paths(home: &Path, uid: u32) -> Vec<PathBuf> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let env_dir = |var: &str| {
+        std::env::var_os(var)
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+    };
+    let mut dirs: Vec<PathBuf> = env_dir("COLIMA_HOME").into_iter().collect();
+    dirs.push(home.join(".colima"));
+    dirs.push(
+        env_dir("XDG_CONFIG_HOME")
+            .unwrap_or_else(|| home.join(".config"))
+            .join("colima"),
+    );
+
+    // Checked with lstat here and opened later by the sandbox. The window
+    // closes before the agent runs, and swapping the file needs write access
+    // to the colima dir, which no default grant gives.
+    let owned_socket = |p: &Path| {
+        std::fs::symlink_metadata(p)
+            .is_ok_and(|m| m.file_type().is_socket() && socket_owned_by(m.uid(), m.nlink(), uid))
+            && p.parent()
+                .is_some_and(|d| std::fs::metadata(d).is_ok_and(|m| m.uid() == uid))
+    };
+    let mut socks = Vec::new();
+    for dir in dirs {
+        if !std::fs::metadata(&dir).is_ok_and(|m| m.uid() == uid) {
+            continue;
+        }
+        let profiles = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path().join("docker.sock"));
+        for sock in std::iter::once(dir.join("docker.sock")).chain(profiles) {
+            // Profile names come from disk and end up in SBPL on macOS, so a
+            // name that could break out of a string literal is dropped.
+            if owned_socket(&sock) && validate_sbpl_path(&sock).is_ok() && !socks.contains(&sock) {
+                socks.push(sock);
+            }
+        }
+    }
+    socks
+}
+
+/// A colima socket is trusted only when `uid` owns it and it has a single
+/// link, so a hardlink to another socket planted in the dir is refused.
+fn socket_owned_by(owner: u32, nlink: u64, uid: u32) -> bool {
+    owner == uid && nlink == 1
 }
 
 /// Sensitive file patterns denied by default. These often contain secrets (API
@@ -2762,6 +2870,112 @@ pub const EXEC_IN_WRITABLE: &[ExecInWritable] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only live `docker.sock` sockets are returned, from every profile and from
+    /// `$COLIMA_HOME` -- never the profile's config, and never a symlink, which a
+    /// Landlock rule would follow to wherever it points (#209).
+    #[test]
+    fn colima_socket_paths_returns_only_real_sockets() {
+        use std::os::unix::net::UnixListener;
+        let home = tempfile::tempdir().unwrap();
+        let colima_home = tempfile::tempdir().unwrap();
+        let work = home.path().join(".colima/work");
+        let evil = home.path().join(".colima/evil");
+        let custom = colima_home.path().join("custom");
+        for d in [&work, &evil, &custom] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(work.join("colima.yaml"), "").unwrap();
+        let _a = UnixListener::bind(work.join("docker.sock")).unwrap();
+        let _b = UnixListener::bind(custom.join("docker.sock")).unwrap();
+        std::os::unix::fs::symlink(work.join("colima.yaml"), evil.join("docker.sock")).unwrap();
+
+        let got = temp_env::with_vars(
+            [
+                ("COLIMA_HOME", Some(colima_home.path().as_os_str())),
+                ("XDG_CONFIG_HOME", None),
+            ],
+            || colima_socket_paths(home.path(), current_uid()),
+        );
+        assert_eq!(
+            got,
+            vec![custom.join("docker.sock"), work.join("docker.sock")],
+            "expected exactly the two live sockets"
+        );
+    }
+
+    /// A socket in a dir owned by someone else is never returned: a
+    /// world-writable `$COLIMA_HOME` must not let another user plant one (#209).
+    /// Creating a foreign-owned dir needs root, so the scan runs as a uid that
+    /// owns nothing in the tempdir instead.
+    #[test]
+    fn colima_socket_paths_skips_sockets_owned_by_another_uid() {
+        let colima_home = tempfile::tempdir().unwrap();
+        let _l =
+            std::os::unix::net::UnixListener::bind(colima_home.path().join("docker.sock")).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let scan = |uid| {
+            temp_env::with_vars(
+                [
+                    ("COLIMA_HOME", Some(colima_home.path().as_os_str())),
+                    ("XDG_CONFIG_HOME", None),
+                ],
+                || colima_socket_paths(home.path(), uid),
+            )
+        };
+        assert_eq!(scan(current_uid()).len(), 1, "own socket is returned");
+        assert!(
+            scan(current_uid().wrapping_add(1)).is_empty(),
+            "a socket owned by another uid must not be returned"
+        );
+    }
+
+    /// A first-party read grant follows symlinks, so its resolved target is
+    /// refused anywhere inside a denied dotfile dir or on a
+    /// DENIED_HOME_SUBPATHS entry, and returned otherwise (#209).
+    #[test]
+    fn first_party_read_target_refuses_links_into_secrets() {
+        use std::os::unix::fs::symlink;
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        std::fs::create_dir_all(h.join(".ssh")).unwrap();
+        std::fs::create_dir_all(h.join(".m2")).unwrap();
+        std::fs::create_dir_all(h.join("dotfiles")).unwrap();
+        std::fs::write(h.join(".ssh/id_ed25519"), "key").unwrap();
+        std::fs::write(h.join(".m2/settings.xml"), "pw").unwrap();
+        std::fs::write(h.join("dotfiles/tc.properties"), "docker.host=x").unwrap();
+        let link = h.join(".testcontainers.properties");
+
+        symlink(h.join(".ssh/id_ed25519"), &link).unwrap();
+        assert_eq!(first_party_read_target(h, &link), None, "link into ~/.ssh");
+
+        std::fs::remove_file(&link).unwrap();
+        symlink(h.join(".m2/settings.xml"), &link).unwrap();
+        assert_eq!(
+            first_party_read_target(h, &link),
+            None,
+            "link to settings.xml"
+        );
+
+        std::fs::remove_file(&link).unwrap();
+        symlink(h.join("dotfiles/tc.properties"), &link).unwrap();
+        assert_eq!(
+            first_party_read_target(h, &link),
+            Some(std::fs::canonicalize(h.join("dotfiles/tc.properties")).unwrap()),
+            "a harmless dotfiles target is returned resolved"
+        );
+
+        let absent = h.join(".nothing-here");
+        assert_eq!(first_party_read_target(h, &absent), Some(absent.clone()));
+    }
+
+    /// A hardlink to some other socket, planted in a colima dir, is refused.
+    #[test]
+    fn colima_socket_ownership_predicate() {
+        assert!(socket_owned_by(501, 1, 501));
+        assert!(!socket_owned_by(0, 1, 501), "foreign owner");
+        assert!(!socket_owned_by(501, 2, 501), "hardlinked socket");
+    }
 
     #[test]
     fn resolve_rejects_relative_xdg_cache_home() {

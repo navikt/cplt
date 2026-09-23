@@ -6749,6 +6749,123 @@ fn profile_docker_withholds_the_overlapping_reallow() {
     );
 }
 
+/// A non-default colima profile (`colima start --profile work`) serves Docker at
+/// `~/.colima/work/docker.sock`, which no fixed list can name (#209). The grant
+/// is the socket alone: the profile's `colima.yaml` next to it stays
+/// unwritable, and `~/.testcontainers.properties` is readable but not writable.
+#[test]
+fn profile_docker_grants_running_colima_profiles_only_their_socket() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let profile = home.path().join(".colima").join("work");
+    std::fs::create_dir_all(&profile).unwrap();
+    std::fs::write(profile.join("colima.yaml"), "cpu: 2\n").unwrap();
+    let sock = profile.join("docker.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind socket");
+    let h = home.path().to_str().unwrap();
+
+    let p = temp_env::with_vars_unset(["COLIMA_HOME", "XDG_CONFIG_HOME"], || {
+        generate_profile(
+            &SandboxConfig {
+                home_dir: home.path(),
+                allow_docker: true,
+                ..base_profile_options()
+            },
+            &[],
+        )
+    });
+
+    let sock = sock.to_str().unwrap();
+    assert!(
+        p.contains(&format!(r#"(allow network-outbound (literal "{sock}"))"#)),
+        "the running non-default colima profile's socket must be granted"
+    );
+    assert!(
+        p.contains(&format!(
+            r#"(allow file-read* (literal "{h}/.testcontainers.properties"))"#
+        )),
+        "~/.testcontainers.properties must be readable with --allow-docker"
+    );
+
+    // No file allow may name the colima tree as a subpath: it holds lima's VM
+    // ssh key under `~/.colima/_lima`. And no write allow may cover colima.yaml
+    // or the properties file, as a literal or as a subpath of an ancestor,
+    // under any of the filters a multi-filter line carries.
+    let colima_subpath = format!(r#"subpath "{h}/.colima"#);
+    let colima_yaml = profile.join("colima.yaml");
+    let tc_props = home.path().join(".testcontainers.properties");
+    for line in p.lines().filter(|l| l.starts_with("(allow file-")) {
+        assert!(
+            !line.contains(&colima_subpath),
+            "the colima tree must not be granted as a subpath: {line}"
+        );
+        if !line.contains("file-write") {
+            continue;
+        }
+        for quoted in line.split('"').skip(1).step_by(2) {
+            for target in [&colima_yaml, &tc_props] {
+                assert!(
+                    !target.starts_with(quoted),
+                    "{} must not be writable, but found: {line}",
+                    target.display()
+                );
+            }
+        }
+    }
+}
+
+/// SBPL matches the resolved path, so a `~/.testcontainers.properties`
+/// symlinked into a dotfiles repo needs its target granted as well. A link into
+/// `~/.ssh` gets neither literal, and a `--deny-path` on the target withholds
+/// both (#209).
+#[test]
+fn profile_docker_testcontainers_properties_follows_safe_symlinks_only() {
+    use std::os::unix::fs::symlink;
+    let home = tempfile::tempdir().expect("tempdir");
+    let h = home.path();
+    std::fs::create_dir_all(h.join("dotfiles")).unwrap();
+    std::fs::create_dir_all(h.join(".ssh")).unwrap();
+    std::fs::write(h.join("dotfiles/tc.properties"), "docker.host=x\n").unwrap();
+    std::fs::write(h.join(".ssh/id_ed25519"), "key").unwrap();
+    let link = h.join(".testcontainers.properties");
+    let lit = |p: &std::path::Path| format!(r#"(allow file-read* (literal "{}"))"#, p.display());
+    let profile = |deny: &[std::path::PathBuf]| {
+        temp_env::with_vars_unset(["COLIMA_HOME", "XDG_CONFIG_HOME"], || {
+            generate_profile(
+                &SandboxConfig {
+                    home_dir: h,
+                    allow_docker: true,
+                    extra_deny: deny,
+                    ..base_profile_options()
+                },
+                &[],
+            )
+        })
+    };
+
+    symlink(h.join("dotfiles/tc.properties"), &link).unwrap();
+    let target = std::fs::canonicalize(&link).unwrap();
+    let p = profile(&[]);
+    assert!(p.contains(&lit(&link)), "the literal path must be readable");
+    assert!(
+        p.contains(&lit(&target)),
+        "the symlink target must be readable"
+    );
+    let p = profile(std::slice::from_ref(&target));
+    assert!(
+        !p.contains(&lit(&link)) && !p.contains(&lit(&target)),
+        "a deny on the target must withhold both literals"
+    );
+
+    std::fs::remove_file(&link).unwrap();
+    symlink(h.join(".ssh/id_ed25519"), &link).unwrap();
+    let key = std::fs::canonicalize(&link).unwrap();
+    let p = profile(&[]);
+    assert!(
+        !p.contains(&lit(&link)) && !p.contains(&lit(&key)),
+        "a link into ~/.ssh must not be granted"
+    );
+}
+
 #[test]
 fn profile_socket_allows_rules() {
     let p = generate_profile(
