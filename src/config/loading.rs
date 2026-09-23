@@ -29,7 +29,7 @@ impl Config {
         // with defaults would silently drop whatever the file restricts (#385).
         let raw = match std::fs::read_to_string(&path) {
             Ok(s) => s,
-            Err(e) if super::error::is_absent(&e) => return Ok(None),
+            Err(e) if super::error::is_absent(&e, &path) => return Ok(None),
             Err(e) => return Err(ConfigError::FileRead { path, source: e }),
         };
 

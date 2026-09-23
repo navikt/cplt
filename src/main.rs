@@ -1996,12 +1996,16 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             // #340 §8 requires that relocation to be named.
             config::CustomConfigVerdict::Outside(p) => {
                 let local_dir = p.parent().map(|d| d.join("local")).filter(|d| d.is_dir());
-                if p.exists() || local_dir.is_some() {
+                // Same rule as the load: only an absent file is "no file". An
+                // unreadable or looping one still selects something (#385).
+                let file_there =
+                    !matches!(std::fs::metadata(&p), Err(e) if config::is_absent(&e, &p));
+                if file_there || local_dir.is_some() {
                     ui::warn(
                         "CPLT_CONFIG replaces your whole cplt config, sandbox settings included:",
                     );
                     eprintln!("  {}", p.display());
-                    if !p.exists() {
+                    if !file_there {
                         eprintln!("  (no file there yet)");
                     }
                     if let Some(dir) = &local_dir {
@@ -6231,13 +6235,23 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         Ok(ctx) => ctx,
         Err(e) => {
             println!();
+            // Inside a session the config is unreadable by design: that is
+            // the finding, not a broken config file.
+            let message = if e.to_string().contains(config::IN_SANDBOX_HINT) {
+                format!(
+                    "cplt doctor cannot read the config: {}",
+                    config::IN_SANDBOX_HINT
+                )
+            } else {
+                format!("cplt cannot resolve this launch: {e}")
+            };
             let findings = [Finding {
                 level: Level::Blocking,
                 // The error text can quote an absolute path — "cplt refuses
                 // to sandbox '/Users/hans'" — and this view gets pasted into
                 // public issues.
                 message: doctor::tilde_in_text(
-                    &format!("cplt cannot resolve this launch: {e}"),
+                    &message,
                     &std::env::var("HOME").map_or_else(
                         |_| std::path::PathBuf::from("/nonexistent"),
                         std::path::PathBuf::from,

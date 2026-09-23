@@ -108,7 +108,7 @@ pub fn load_local(project_dir: &Path) -> Result<Option<LoadedConfig>, ConfigErro
     // Only an absent file is "no file"; any other error fails the launch (#385).
     let raw = match std::fs::read_to_string(&path) {
         Ok(raw) => raw,
-        Err(e) if super::error::is_absent(&e) => return Ok(None),
+        Err(e) if super::error::is_absent(&e, &path) => return Ok(None),
         Err(e) => return Err(ConfigError::FileRead { path, source: e }),
     };
     let config = parse_local_doc(&raw, &path, project_dir)?;

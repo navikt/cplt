@@ -531,7 +531,7 @@ impl ConfigSetOp {
         // `config set` replace a file it could not read (#385).
         let raw = match std::fs::read_to_string(&self.path) {
             Ok(raw) => raw,
-            Err(e) if super::error::is_absent(&e) => {
+            Err(e) if super::error::is_absent(&e, &self.path) => {
                 return Ok(toml_edit::DocumentMut::new());
             }
             Err(e) => {

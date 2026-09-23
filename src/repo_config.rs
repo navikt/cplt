@@ -308,7 +308,7 @@ pub fn load_repo_config(project_dir: &Path) -> Result<Option<LoadedRepoConfig>, 
     // goes to the caller, which warns as it does for an unparseable file (#385).
     let is_file = match std::fs::metadata(&file_path) {
         Ok(meta) => meta.is_file(),
-        Err(e) if crate::config::is_absent(&e) => false,
+        Err(e) if crate::config::is_absent(&e, &file_path) => false,
         Err(e) => return Err(format!("Failed to read {}: {e}", file_path.display())),
     };
     if is_file {
