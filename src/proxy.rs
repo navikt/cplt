@@ -1072,21 +1072,34 @@ fn handle_connection(
     client.set_read_timeout(Some(state.timeout)).ok();
     client.set_write_timeout(Some(state.timeout)).ok();
 
-    // Read the request line
-    let mut buf = [0u8; 8192];
-    let n = match client.read(&mut buf) {
-        Ok(0) => {
+    let head = match read_request_head(&mut client, state.timeout) {
+        Ok(head) => head,
+        Err(HeadError::Closed) => {
             classification.complete(None);
             return;
         }
-        Ok(n) => n,
-        Err(_) => {
+        Err(e) => {
+            // Log a fixed reason, never the partial head: it is agent-controlled
+            // and may carry CONNECT userinfo.
+            let (status, response): (&str, &[u8]) = match e {
+                HeadError::TooLarge => (
+                    "FAIL:request-head-too-large",
+                    b"HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n",
+                ),
+                _ => (
+                    "FAIL:request-head-timeout",
+                    b"HTTP/1.1 408 Request Timeout\r\n\r\n",
+                ),
+            };
             classification.complete(None);
+            log_connection(state, None, "REJECT", "request-head", status);
+            let _ = client.write_all(response);
             return;
         }
     };
+    client.set_read_timeout(Some(state.timeout)).ok();
 
-    let request = String::from_utf8_lossy(&buf[..n]);
+    let request = String::from_utf8_lossy(&head);
     let first_line = request.lines().next().unwrap_or("");
 
     // Parse method and target
@@ -1107,6 +1120,74 @@ fn handle_connection(
         classification.complete(None);
         log_connection(state, None, method, target, "UNSUPPORTED");
         let _ = client.write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n");
+    }
+}
+
+/// Cap on a client request head (request line + headers). A CONNECT head is a
+/// few hundred bytes; 8 KiB matches the old single-read buffer.
+const MAX_REQUEST_HEAD: usize = 8192;
+
+enum HeadError {
+    /// EOF or a read error before the head was complete.
+    Closed,
+    TooLarge,
+    TimedOut,
+}
+
+/// Read the client's request head up to and including the blank line that
+/// ends it. A client may split the head across any number of TCP segments.
+///
+/// Reads one byte at a time so nothing past the head is consumed: bytes a
+/// client sends right after a CONNECT head (a pipelined TLS ClientHello) stay
+/// in the socket for the relay. The whole head must arrive within `timeout`,
+/// not just each segment, so a client trickling bytes cannot hold a
+/// connection slot open.
+fn read_request_head(client: &mut TcpStream, timeout: Duration) -> Result<Vec<u8>, HeadError> {
+    let timeout = if timeout.is_zero() {
+        DEFAULT_PROXY_TIMEOUT
+    } else {
+        timeout
+    };
+    let deadline = Instant::now() + timeout;
+    let mut head = Vec::with_capacity(512);
+    let mut byte = [0u8; 1];
+    // Same terminator rule as `consume_until_header_end`: CR is ignored, so
+    // both CRLFCRLF and bare LFLF end the head.
+    let mut newlines = 0usize;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(HeadError::TimedOut);
+        }
+        client.set_read_timeout(Some(remaining)).ok();
+        match client.read(&mut byte) {
+            Ok(0) => return Err(HeadError::Closed),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(HeadError::TimedOut);
+            }
+            Err(_) => return Err(HeadError::Closed),
+        }
+        if head.len() == MAX_REQUEST_HEAD {
+            return Err(HeadError::TooLarge);
+        }
+        head.push(byte[0]);
+        match byte[0] {
+            b'\n' => {
+                newlines += 1;
+                if newlines == 2 {
+                    return Ok(head);
+                }
+            }
+            b'\r' => {}
+            _ => newlines = 0,
+        }
     }
 }
 
@@ -3613,6 +3694,145 @@ mod tests {
         assert!(!logged.contains("s3cret"));
         assert_eq!(logged.matches("***@example.invalid:443").count(), 3);
         assert!(!format!("{snapshot:?}").contains("secret"));
+    }
+
+    /// Proxy that lets CONNECT reach `origin_port` on IPv4 loopback directly.
+    fn head_test_proxy(origin_port: u16, timeout: Duration, log: PathBuf) -> ProxyHandle {
+        let loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let resolver: ResolverFn =
+            Arc::new(move |_h: &str, p: u16| Some(std::net::SocketAddr::new(loopback, p)));
+        start(ProxyOptions {
+            port: 0,
+            blocked_file: None,
+            subscription_blocklist: Vec::new(),
+            allowed_ports: vec![443],
+            allow_localhost_ports: vec![origin_port],
+            allow_localhost_any: false,
+            allowed_domains_file: None,
+            allowed_domains_initial: Vec::new(),
+            extra_allowed_domains: Vec::new(),
+            default_allowlist: Vec::new(),
+            cli_private_domains: Vec::new(),
+            config_private_domains: Vec::new(),
+            repo_private_domains: Vec::new(),
+            config_file: None,
+            log_file: Some(log),
+            log_level: ProxyLogLevel::None,
+            timeout,
+            upstream: None,
+            upstream_no_proxy: Vec::new(),
+            resolver: Some(resolver),
+        })
+        .expect("proxy start failed")
+    }
+
+    /// Read the proxy's reply up to the end of its status line.
+    fn read_status_line(conn: &mut std::net::TcpStream) -> String {
+        // `.ok()`: macOS refuses the option (EINVAL) once the peer has reset.
+        conn.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        let mut line = Vec::new();
+        let mut byte = [0u8; 1];
+        while let Ok(1) = conn.read(&mut byte) {
+            if byte[0] == b'\n' {
+                break;
+            }
+            line.push(byte[0]);
+        }
+        String::from_utf8_lossy(&line).trim().to_string()
+    }
+
+    /// A request head split across TCP segments must be reassembled, and bytes
+    /// the client sends after the head must reach the origin, not be dropped.
+    #[test]
+    fn split_connect_head_is_reassembled_and_trailing_bytes_reach_origin() {
+        require_localhost_tcp!();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let origin = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut got = [0u8; 11];
+            s.read_exact(&mut got).map(|()| got.to_vec())
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let proxy = head_test_proxy(port, Duration::from_secs(5), dir.path().join("p.log"));
+
+        let mut conn = std::net::TcpStream::connect(("127.0.0.1", proxy.port)).unwrap();
+        conn.set_nodelay(true).unwrap();
+        // Separate writes with pauses longer than the accept loop's 50 ms
+        // poll, so the handler is already reading when the later parts land.
+        // Timing only decides whether the split is exercised; the fixed code
+        // passes either way.
+        for part in [
+            "CONNECT ".to_string(),
+            format!("localhost:{port} HTTP/1.1\r\n"),
+            // The early bytes ride in the same segment as the end of the head.
+            "\r\nearly-bytes".to_string(),
+        ] {
+            // A proxy that gave up on the partial head closes; let the status
+            // assertion report that rather than a broken-pipe unwrap.
+            let _ = conn.write_all(part.as_bytes());
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let status = read_status_line(&mut conn);
+        // Before joining: without a tunnel the origin never gets a connection.
+        assert!(
+            status.contains("200"),
+            "split head must tunnel; got {status:?}"
+        );
+        let received = origin.join().unwrap();
+        proxy.shutdown();
+        assert_eq!(
+            received.ok().as_deref(),
+            Some(&b"early-bytes"[..]),
+            "bytes after the head must reach the origin"
+        );
+    }
+
+    #[test]
+    fn oversized_request_head_is_rejected_with_431() {
+        require_localhost_tcp!();
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("p.log");
+        let proxy = head_test_proxy(9, Duration::from_secs(5), log.clone());
+
+        let mut conn = std::net::TcpStream::connect(("127.0.0.1", proxy.port)).unwrap();
+        // Exactly one byte over the cap, so the proxy has read everything we
+        // sent when it rejects (unread bytes would turn its close into a RST).
+        let mut head = b"CONNECT ".to_vec();
+        head.resize(MAX_REQUEST_HEAD + 1, b'a');
+        conn.write_all(&head).unwrap();
+        let status = read_status_line(&mut conn);
+        proxy.shutdown();
+
+        assert!(status.contains("431"), "got {status:?}");
+        let logged = std::fs::read_to_string(log).unwrap();
+        assert!(logged.contains("FAIL:request-head-too-large"), "{logged:?}");
+    }
+
+    /// A client that never finishes its head gets a 408 at the timeout, and
+    /// the proxy keeps serving other clients.
+    #[test]
+    fn unfinished_request_head_times_out_with_408() {
+        require_localhost_tcp!();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let origin = std::thread::spawn(move || listener.accept().is_ok());
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("p.log");
+        let proxy = head_test_proxy(port, Duration::from_millis(300), log.clone());
+
+        let mut slow = std::net::TcpStream::connect(("127.0.0.1", proxy.port)).unwrap();
+        slow.write_all(b"CONNECT localhost:").unwrap();
+        let slow_status = read_status_line(&mut slow);
+        let next_status = proxy_connect(proxy.port, &format!("localhost:{port}"));
+        assert!(origin.join().unwrap());
+        proxy.shutdown();
+
+        assert!(slow_status.contains("408"), "got {slow_status:?}");
+        assert!(next_status.contains("200"), "got {next_status:?}");
+        let logged = std::fs::read_to_string(log).unwrap();
+        assert!(logged.contains("FAIL:request-head-timeout"), "{logged:?}");
     }
 
     /// A control character in the agent's request line must never reach a log
