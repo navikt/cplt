@@ -2748,6 +2748,24 @@ print('CONNECTED')
             (home, dotfiles)
         };
 
+        // Printing the profile only inspects it: nothing is created, and the
+        // profile says what a launch would create.
+        let (home, dotfiles) = setup();
+        let (code, stdout, stderr) = run_sandboxed_home_with_flags(
+            &dotfiles,
+            home.path(),
+            &["--use-bubblewrap", "--print-profile"],
+            "true",
+        );
+        assert!(
+            code == 0
+                && stdout.contains("Would create empty at launch")
+                && stdout.contains(&dotfiles.join("gitconfig").display().to_string())
+                && !dotfiles.join("git/config").exists()
+                && !dotfiles.join("gitconfig").exists(),
+            "code: {code}, stdout: {stdout}, stderr: {stderr}"
+        );
+
         let (home, dotfiles) = setup();
         let d = dotfiles.display();
         let script = &format!(

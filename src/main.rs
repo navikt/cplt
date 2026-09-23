@@ -3718,6 +3718,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             electron_app_dir: electron_app_dir.as_deref(),
             announce_scratch: true,
             pnpm_candidate: None,
+            inspect_only: cli.print_profile,
         },
     )?;
 
@@ -4560,6 +4561,10 @@ struct AssemblyOptions<'a> {
     announce_scratch: bool,
     /// A pnpm path explicitly requested by `cplt exec`, if any.
     pnpm_candidate: Option<&'a Path>,
+    /// The sandbox is only printed or checked, never launched
+    /// (`--print-profile`, `cplt check`), so preparing it must not write to
+    /// the host (#553).
+    inspect_only: bool,
 }
 
 /// A fully-built sandbox plus the live resources it depends on.
@@ -4802,8 +4807,9 @@ fn assemble_sandbox(
     let policy = sandbox::generate_policy(&sandbox_config);
     // Path validation (SBPL injection checks on macOS) is handled internally by
     // prepare(), so callers don't need to know about backend-specific risks.
-    let prepared = sandbox::prepare_with_pnpm_shadow(&sandbox_config, pnpm_shadow_path)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let prepared =
+        sandbox::prepare_with_pnpm_shadow(&sandbox_config, pnpm_shadow_path, opts.inspect_only)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     Ok(AssembledSandbox {
         prepared,
@@ -4945,6 +4951,8 @@ fn prepare_shell_sandbox(
             electron_app_dir: None,
             announce_scratch: false,
             pnpm_candidate: None,
+            // `cplt check` only reports on the policy.
+            inspect_only: true,
         },
     )
 }
@@ -5091,6 +5099,7 @@ fn run_exec_command(
                 electron_app_dir: None,
                 announce_scratch: false,
                 pnpm_candidate,
+                inspect_only: cli.print_profile,
             },
         )?
     };

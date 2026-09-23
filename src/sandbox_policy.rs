@@ -2077,22 +2077,10 @@ pub fn home_config_link_targets(home: &Path) -> Vec<PathBuf> {
 ///
 /// macOS denies these writes in the profile. Linux cannot bind a file that
 /// does not exist, so under Bubblewrap cplt creates them empty at launch
-/// (`create_missing_home_config_targets`, #553).
+/// (`plan_missing_home_config_targets`, #553), resolving the links itself
+/// rather than through this function.
 pub fn missing_home_config_link_targets(home: &Path) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = missing_home_config_links(home)
-        .into_iter()
-        .map(|(missing, _)| missing)
-        .collect();
-    out.sort();
-    out.dedup();
-    out
-}
-
-/// [`missing_home_config_link_targets`] paired with the file each missing
-/// component leads to: `(first missing component, resolved file)`. The two are
-/// equal unless a directory is missing too.
-pub fn missing_home_config_links(home: &Path) -> Vec<(PathBuf, PathBuf)> {
-    read_only_home_config()
+    let mut out: Vec<PathBuf> = read_only_home_config()
         .filter_map(|rel| {
             let named = home.join(rel);
             if !links_inside_home(home, &named) || std::fs::canonicalize(&named).is_ok() {
@@ -2100,14 +2088,15 @@ pub fn missing_home_config_links(home: &Path) -> Vec<(PathBuf, PathBuf)> {
             }
             // Follows a dangling link to where its target would be created.
             let leaf = config::canonicalize_deepest(&named);
-            let missing = leaf
-                .ancestors()
+            leaf.ancestors()
                 .take_while(|a| a.symlink_metadata().is_err())
-                .last()?
-                .to_path_buf();
-            Some((missing, leaf))
+                .last()
+                .map(Path::to_path_buf)
         })
-        .collect()
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Whether `named`, or a directory between it and `home`, is a symlink.
