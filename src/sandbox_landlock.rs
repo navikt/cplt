@@ -379,6 +379,84 @@ fn writable_non_exec_tree_over<'a>(fs_rules: &'a [FsRule], path: &Path) -> Optio
         .find(|r| r.access.write && !r.access.execute && path.starts_with(&r.path))
 }
 
+/// Whether a first-party grant on `path` is dropped because a symlink moves it
+/// onto a credential entry ([`policy::refused_first_party_dir`], #551). Warns
+/// when it is, so a tool that then fails to start says why.
+fn refused_link(home: &Path, path: &Path, what: &str) -> bool {
+    let Some(target) = policy::refused_first_party_dir(home, path) else {
+        return false;
+    };
+    crate::ui::warn(&format!(
+        "The {what} {} resolves to {}, which is or holds a credential directory, \
+         so it is not granted.",
+        path.display(),
+        target.display()
+    ));
+    true
+}
+
+/// A credential entry that a symlink moves into a granted tree (#551).
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialLink {
+    /// The `DENIED_DOTFILES` / `DENIED_FILES` / `DENIED_HOME_SUBPATHS` entry.
+    pub rel: &'static str,
+    /// Where `~/{rel}` resolves. Canonical, and it exists.
+    pub target: PathBuf,
+    /// The rule path whose tree holds `target`.
+    pub grant: PathBuf,
+}
+
+/// The credential entries whose resolved path is readable through `rules`.
+///
+/// Landlock can only grant: `~/.ssh -> ~/dotfiles/ssh` leaves the key
+/// readable to any rule covering `~/dotfiles`, and nothing in the ruleset can
+/// take it back. Bubblewrap masks these; without it the caller warns.
+///
+/// Left out: an entry that resolves to its own `$HOME` spelling (no link), a
+/// target that does not exist (nothing to mask), and one a rule grants on
+/// purpose: `--allow-docker`'s `~/.docker`, a user `allow.read` naming the
+/// resolved file, or a `DENIED_HOME_SUBPATHS` file under its own tool dir,
+/// which is the documented Landlock limit whether linked or not.
+#[must_use]
+#[cfg(target_os = "linux")]
+pub fn credential_links(home: &Path, rules: &[FsRule]) -> Vec<CredentialLink> {
+    let canon_home = crate::config::canonicalize_deepest(home);
+    let granted: Vec<(&Path, PathBuf)> = rules
+        .iter()
+        .filter_map(|r| Some((r.path.as_path(), std::fs::canonicalize(&r.path).ok()?)))
+        .collect();
+    let lists = [
+        (policy::DENIED_DOTFILES, false),
+        (policy::DENIED_FILES, false),
+        (policy::DENIED_HOME_SUBPATHS, true),
+    ];
+    let mut out = Vec::new();
+    for (list, subpath) in lists {
+        for &rel in list {
+            let named = home.join(rel);
+            let target = crate::config::canonicalize_deepest(&named);
+            if target == canon_home.join(rel) || !target.exists() {
+                continue;
+            }
+            let on_purpose = granted.iter().any(|(path, canon)| {
+                *path == named || *canon == target || (subpath && named.starts_with(path))
+            });
+            if on_purpose {
+                continue;
+            }
+            if let Some((_, grant)) = granted.iter().find(|(_, c)| target.starts_with(c)) {
+                out.push(CredentialLink {
+                    rel,
+                    target,
+                    grant: grant.clone(),
+                });
+            }
+        }
+    }
+    out
+}
+
 pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     let mut fs_rules = Vec::new();
     let home = config.home_dir;
@@ -448,6 +526,9 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                     .any(|e| e == path.to_string_lossy().as_ref()),
                 None => true,
             };
+            if include && refused_link(home, &path, "application directory") {
+                continue;
+            }
             if include {
                 // `map_exec` is deliberately not consulted: Landlock's EXECUTE
                 // is checked on execve() alone and has no mmap(PROT_EXEC) hook,
@@ -793,6 +874,14 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     // ── GPG signing files (read-only subset of ~/.gnupg) ──
     if config.allow_gpg_signing {
         for &file in policy::GPG_SIGNING_ALLOW_FILES {
+            // Landlock follows a link out of `~/.gnupg` (#551).
+            if policy::gpg_signing_file_target(home, file).is_none() {
+                crate::ui::warn(&format!(
+                    "~/.gnupg/{file} is a link out of ~/.gnupg or onto a credential, so \
+                     --allow-gpg-signing does not grant it."
+                ));
+                continue;
+            }
             fs_rules.push(FsRule {
                 path: home.join(".gnupg").join(file),
                 access: FsAccess {
@@ -961,6 +1050,9 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         });
     }
     for dir in config.agent_dirs {
+        if refused_link(home, &dir.path, "agent directory") {
+            continue;
+        }
         fs_rules.push(FsRule {
             path: dir.path.clone(),
             access: FsAccess {
@@ -983,8 +1075,16 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         });
         // File-level write grants within a read-only dir
         for file in &dir.write_files {
+            let path = dir.path.join(file);
+            if policy::first_party_read_target(home, &path).is_none() {
+                crate::ui::warn(&format!(
+                    "{} links into a credential directory, so it is not granted.",
+                    path.display()
+                ));
+                continue;
+            }
             fs_rules.push(FsRule {
-                path: dir.path.join(file),
+                path,
                 access: FsAccess {
                     read: true,
                     write: true,
@@ -4047,6 +4147,112 @@ mod tests {
             .expect("gpg-agent socket should be in rules");
         assert!(rule.access.read);
         assert!(rule.access.write);
+    }
+
+    /// #551: a GPG signing file that links out of `~/.gnupg`, onto the private
+    /// keys, or into another credential dir is not granted. One that stays
+    /// inside is, and so is every file of a `~/.gnupg` linked elsewhere whole.
+    #[test]
+    fn gpg_signing_files_linked_out_of_gnupg_are_refused() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        let gnupg = home.join("dotfiles/gnupg");
+        std::fs::create_dir_all(gnupg.join("private-keys-v1.d")).unwrap();
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::write(home.join(".ssh/id_ed25519"), "key").unwrap();
+        std::fs::write(home.join("elsewhere"), "x").unwrap();
+        std::fs::write(gnupg.join("gpg.conf"), "").unwrap();
+        std::fs::write(gnupg.join("trustdb.gpg"), "").unwrap();
+        symlink(&gnupg, home.join(".gnupg")).unwrap();
+        symlink(home.join(".ssh/id_ed25519"), gnupg.join("pubring.kbx")).unwrap();
+        symlink(home.join("elsewhere"), gnupg.join("pubring.gpg")).unwrap();
+        symlink(gnupg.join("private-keys-v1.d"), gnupg.join("common.conf")).unwrap();
+
+        let project = home.join("project");
+        let mut config = test_config(&project, &home);
+        config.allow_gpg_signing = true;
+        let policy = generate_policy(&config);
+        let granted = |f: &str| {
+            let p = home.join(".gnupg").join(f);
+            policy.fs_rules.iter().any(|r| r.path == p)
+        };
+        assert!(granted("gpg.conf") && granted("trustdb.gpg"));
+        for f in ["pubring.kbx", "pubring.gpg", "common.conf"] {
+            assert!(
+                !granted(f),
+                "{f} links out of ~/.gnupg and must not be granted"
+            );
+        }
+    }
+
+    /// #551: an agent dir or AppDir linked into `~/.aws`, or onto a tree that
+    /// holds a linked `~/.ssh`, is not granted, nor is a `write_files` entry
+    /// linked into `~/.ssh`. Landlock would follow the link. An unlinked agent
+    /// dir and one linked somewhere harmless still are.
+    #[test]
+    fn first_party_dirs_linked_into_credentials_are_refused() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        for d in [".aws", "dotfiles/ssh", "harmless", ".config/opencode"] {
+            std::fs::create_dir_all(home.join(d)).unwrap();
+        }
+        std::fs::write(home.join("dotfiles/ssh/id_ed25519"), "key").unwrap();
+        symlink(home.join("dotfiles/ssh"), home.join(".ssh")).unwrap();
+        symlink(home.join(".aws"), home.join(".claude")).unwrap();
+        symlink(home.join("dotfiles"), home.join(".gemini")).unwrap();
+        symlink(home.join("harmless"), home.join(".pi")).unwrap();
+        symlink(
+            home.join(".ssh/id_ed25519"),
+            home.join(".config/opencode/auth.json"),
+        )
+        .unwrap();
+        // The first AppDir path under $HOME, linked into ~/.aws.
+        let app = policy::app_dirs()
+            .iter()
+            .flat_map(|d| d.all_paths(&home))
+            .find(|p| p.starts_with(&home))
+            .expect("an AppDir under $HOME");
+        std::fs::create_dir_all(app.parent().unwrap()).unwrap();
+        symlink(home.join(".aws"), &app).unwrap();
+
+        let dir = |path: PathBuf, write_files: Vec<&'static str>| crate::agent::AgentDir {
+            path,
+            write: true,
+            map_exec: false,
+            process_exec: false,
+            write_files,
+            create_dirs: vec![],
+        };
+        let agent_dirs = [
+            dir(home.join(".claude"), vec![]),
+            dir(home.join(".gemini"), vec![]),
+            dir(home.join(".pi"), vec![]),
+            dir(home.join(".config/opencode"), vec!["auth.json"]),
+        ];
+        let project = home.join("project");
+        let mut config = test_config(&project, &home);
+        config.agent_dirs = &agent_dirs;
+        let policy = generate_policy(&config);
+        let granted = |p: &Path| policy.fs_rules.iter().any(|r| r.path == p);
+
+        assert!(!granted(&home.join(".claude")), "linked into ~/.aws");
+        assert!(!granted(&home.join(".gemini")), "holds the linked ~/.ssh");
+        assert!(
+            !granted(&app),
+            "AppDir {} linked into ~/.aws",
+            app.display()
+        );
+        assert!(
+            !granted(&home.join(".config/opencode/auth.json")),
+            "write_files entry linked onto the key"
+        );
+        assert!(granted(&home.join(".pi")), "a harmless link stays granted");
+        assert!(
+            granted(&home.join(".config/opencode")),
+            "an unlinked dir stays"
+        );
     }
 
     #[test]

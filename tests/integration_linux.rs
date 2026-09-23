@@ -2656,6 +2656,52 @@ print('CONNECTED')
         );
     }
 
+    /// #551: `~/.ssh -> ~/dotfiles/ssh` with the dotfiles repo as the project.
+    /// Under bubblewrap the key is masked at its resolved path, the directory
+    /// above it cannot be renamed aside, and `allow.read ~/.ssh/known_hosts`
+    /// still reads. Without bubblewrap the launch names the exposure.
+    #[test]
+    fn bwrap_masks_a_credential_dir_linked_into_the_project() {
+        require_bwrap!();
+        let home = create_deny_project();
+        let dotfiles = home.path().join("dotfiles");
+        let ssh = dotfiles.join("ssh/.ssh");
+        fs::create_dir_all(&ssh).expect("mkdir ssh");
+        fs::write(ssh.join("id_ed25519"), "TOP-SECRET-KEY").expect("write key");
+        fs::write(ssh.join("known_hosts"), "KNOWN-HOSTS").expect("write hosts");
+        std::os::unix::fs::symlink(&ssh, home.path().join(".ssh")).expect("link ~/.ssh");
+        let known_hosts = home.path().join(".ssh/known_hosts");
+        let d = dotfiles.display();
+        let script = &format!(
+            "cat ~/.ssh/known_hosts; cat ~/.ssh/id_ed25519; \
+             mv '{d}/ssh' '{d}/ssh2' 2>/dev/null && echo MOVED || echo PINNED"
+        );
+
+        let (code, stdout, stderr) = run_sandboxed_home_with_flags(
+            &dotfiles,
+            home.path(),
+            &[
+                "--use-bubblewrap",
+                "--allow-read",
+                &known_hosts.to_string_lossy(),
+            ],
+            script,
+        );
+        assert!(
+            stdout.contains("KNOWN-HOSTS")
+                && !stdout.contains("TOP-SECRET")
+                && stdout.contains("PINNED"),
+            "code: {code}, stdout: {stdout}, stderr: {stderr}"
+        );
+
+        let (code, stdout, stderr) =
+            run_sandboxed_home_with_flags(&dotfiles, home.path(), &["--no-bubblewrap"], "true");
+        assert!(
+            stderr.contains("~/.ssh resolves to") && stderr.contains("Bubblewrap is not active"),
+            "code: {code}, stdout: {stdout}, stderr: {stderr}"
+        );
+    }
+
     #[test]
     fn bwrap_deny_mask_placeholder_cannot_be_softened() {
         // The placeholder lives inside the writable scratch bind (TMPDIR); a

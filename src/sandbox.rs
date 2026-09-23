@@ -1135,6 +1135,39 @@ fn ro_protect_paths(
     ro_protect
 }
 
+/// Launch warnings for the credential entries a symlink moves into a grant
+/// and no mount mask covers (#551): which entry, where it resolves, which
+/// grant. `masks` is `None` when bubblewrap is not active, and then every
+/// link is exposed: Landlock cannot deny inside a grant.
+#[cfg(target_os = "linux")]
+fn unmasked_credential_warnings(
+    links: &[landlock_mod::CredentialLink],
+    masks: Option<&bubblewrap::DenyMasks>,
+) -> Vec<String> {
+    let (why, fix) = if masks.is_some() {
+        ("Bubblewrap could not mask it there", "Move")
+    } else {
+        (
+            "Landlock cannot deny a path inside a grant, and Bubblewrap is not active",
+            "Install bubblewrap, or move",
+        )
+    };
+    links
+        .iter()
+        .filter(|l| !masks.is_some_and(|m| m.covers(&l.target)))
+        .map(|l| {
+            format!(
+                "~/{} resolves to {}, inside the granted {}. {why}, so the agent can \
+                 read it, and write it if that grant is writable. {fix} the credential \
+                 out of that tree.",
+                l.rel,
+                l.target.display(),
+                l.grant.display()
+            )
+        })
+        .collect()
+}
+
 #[cfg(target_os = "linux")]
 fn prepare_impl(
     config: &SandboxConfig,
@@ -1214,7 +1247,18 @@ fn prepare_impl(
         bubblewrap::nested_repo_roots(&write_roots)
     };
     let ro_protect = ro_protect_paths(config, extra_git_dirs, &nested_repos);
-    let pins = pin_paths(config, extra_git_dirs, &nested_repos);
+    // #551: a credential entry linked into a granted tree (`~/.ssh ->
+    // ~/dotfiles/ssh` with the dotfiles repo as the project) is readable at
+    // its target, and Landlock cannot take that back. Bubblewrap masks it
+    // there, and pins the directories above it so `mv ssh ssh2 && mkdir ssh`
+    // cannot swap in a fresh one under the link.
+    let credential_links = landlock_mod::credential_links(config.home_dir, &policy.fs_rules);
+    let credential_targets: Vec<PathBuf> =
+        credential_links.iter().map(|l| l.target.clone()).collect();
+    let mut pins = pin_paths(config, extra_git_dirs, &nested_repos);
+    pins.extend(home_config_target_pins(config, &credential_targets));
+    pins.sort();
+    pins.dedup();
 
     // Deny-path masks: Landlock cannot deny subpaths within allowed
     // directories, but Bubblewrap can shadow them at the mount level — denied
@@ -1236,8 +1280,12 @@ fn prepare_impl(
     .into_iter()
     .filter(|p| p.exists())
     .collect();
-    let deny_masks =
-        bubblewrap::build_deny_masks(config.extra_deny, &socket_masks, config.scratch_dir);
+    let deny_masks = bubblewrap::build_deny_masks(
+        config.extra_deny,
+        &socket_masks,
+        &credential_targets,
+        config.scratch_dir,
+    );
 
     // Decide bubblewrap wrapping before `precompute()` consumes `policy`.
     // `resolve()` only clones `fs_rules`/`net_rules` on the arms that actually
@@ -1276,6 +1324,13 @@ fn prepare_impl(
              repositories you work in with --repo-dir, or grant a narrower tree.",
             bubblewrap::NESTED_SCAN_LIMIT
         ));
+    }
+
+    // #551: Landlock alone cannot deny inside a grant, so a credential linked
+    // into one stays readable unless bubblewrap masked it. Say so per entry.
+    let masks = bwrap_wrapper.is_some().then_some(&deny_masks);
+    for w in unmasked_credential_warnings(&credential_links, masks) {
+        ui::warn(&w);
     }
 
     // #524: the read-only bind on a dotfiles target is bwrap's; Landlock
@@ -1561,6 +1616,41 @@ fn validate_created_playwright_socket_dir(path: &Path) -> Result<(), String> {
 #[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod tests {
     use super::*;
+
+    /// #551: without bubblewrap a credential linked into a grant is named at
+    /// launch with its target and the grant; under bubblewrap only one the
+    /// masks do not cover is, and with a reason that says so.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_linked_credential_warns_unless_bubblewrap_masked_it() {
+        let base = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let dotfiles = base.path().canonicalize().unwrap();
+        let ssh = dotfiles.join("ssh");
+        std::fs::create_dir(&ssh).unwrap();
+        let links = [landlock_mod::CredentialLink {
+            rel: ".ssh",
+            target: ssh.clone(),
+            grant: dotfiles.clone(),
+        }];
+
+        let w = unmasked_credential_warnings(&links, None);
+        assert_eq!(w.len(), 1, "{w:?}");
+        for part in [
+            "~/.ssh".to_string(),
+            format!("resolves to {}", ssh.display()),
+            format!("granted {}", dotfiles.display()),
+            "Bubblewrap is not active".to_string(),
+        ] {
+            assert!(w[0].contains(&part), "missing {part:?} in {}", w[0]);
+        }
+
+        let masked = bubblewrap::build_deny_masks(&[], &[], std::slice::from_ref(&ssh), None);
+        assert!(unmasked_credential_warnings(&links, Some(&masked)).is_empty());
+
+        let unmasked = bubblewrap::build_deny_masks(&[], &[], &[], None);
+        let w = unmasked_credential_warnings(&links, Some(&unmasked));
+        assert!(w.len() == 1 && w[0].contains("could not mask"), "{w:?}");
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

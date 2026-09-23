@@ -235,6 +235,67 @@ pub fn first_party_read_target(home: &Path, path: &Path) -> Option<PathBuf> {
     Some(target)
 }
 
+/// Whether the canonical `target` lies inside or contains a
+/// [`DENIED_DOTFILES`] or [`DENIED_FILES`] entry, or cplt's state directory
+/// wherever `CPLT_CONFIG` puts it. Compared canonicalized: a Landlock rule on
+/// `target` follows links and is recursive, so containment is a leak too.
+fn overlaps_credential_entry(home: &Path, target: &Path) -> bool {
+    let canon = config::canonicalize_deepest;
+    let overlaps = |denied: PathBuf| denied.starts_with(target) || target.starts_with(&denied);
+    DENIED_DOTFILES
+        .iter()
+        .chain(DENIED_FILES)
+        .any(|d| overlaps(canon(&home.join(d))))
+        || [config::config_dir(), Some(home.join(CPLT_STATE_DIR))]
+            .into_iter()
+            .flatten()
+            .any(|dir| overlaps(canon(&dir)))
+}
+
+/// Where a first-party grant on `path` lands when a symlink moves it onto,
+/// into or around a credential entry, or `None` when it may be emitted.
+///
+/// The directory counterpart of [`first_party_read_target`], for the AppDir
+/// and agent-dir grants (#551). Landlock follows the link and a rule is
+/// recursive, so `~/.claude -> ~/.aws`, or `~/.claude -> ~/dotfiles` with
+/// `~/.ssh -> ~/dotfiles/ssh`, would grant the credentials. Only a path a
+/// symlink moves is vetted, as in [`ResolvedToolDir::refused_target`].
+#[must_use]
+pub fn refused_first_party_dir(home: &Path, path: &Path) -> Option<PathBuf> {
+    let canon = config::canonicalize_deepest;
+    let target = canon(path);
+    let unmoved = match path.strip_prefix(home) {
+        Ok(rel) => canon(home).join(rel) == target,
+        Err(_) => target == path,
+    };
+    (!unmoved && overlaps_credential_entry(home, &target)).then_some(target)
+}
+
+/// Where `~/.gnupg/{file}` resolves, or `None` when `--allow-gpg-signing`
+/// must not grant it (#551).
+///
+/// These files live inside `~/.gnupg` by design, so a link that stays inside
+/// its resolved directory is fine, `~/.gnupg -> ~/dotfiles/gnupg` included. A
+/// target outside it, under GnuPG's private keys, or inside another
+/// credential entry is refused: Landlock follows the link, so
+/// `pubring.kbx -> ~/.ssh/id_ed25519` would be a read grant on the key.
+#[must_use]
+pub fn gpg_signing_file_target(home: &Path, file: &str) -> Option<PathBuf> {
+    let canon = config::canonicalize_deepest;
+    let gnupg = canon(&home.join(".gnupg"));
+    let target = canon(&home.join(".gnupg").join(file));
+    let private = ["private-keys-v1.d", "secring.gpg"]
+        .iter()
+        .any(|p| target.starts_with(gnupg.join(p)));
+    let other = DENIED_DOTFILES
+        .iter()
+        .chain(DENIED_FILES)
+        .chain(DENIED_HOME_SUBPATHS)
+        .filter(|d| **d != ".gnupg")
+        .any(|d| target.starts_with(canon(&home.join(d))));
+    (target.starts_with(&gnupg) && !private && !other).then_some(target)
+}
+
 /// Exact-path membership of `path` in a `$HOME`-relative deny list, comparing
 /// the literal and the canonicalized form.
 fn denied_entry(list: &[&'static str], home: &Path, path: &Path) -> Option<&'static str> {
@@ -2016,22 +2077,12 @@ impl ResolvedToolDir {
         {
             return None;
         }
-        let overlaps_denied = DENIED_DOTFILES.iter().chain(DENIED_FILES).any(|d| {
-            let denied = canon(&home.join(d));
-            denied.starts_with(target) || target.starts_with(&denied)
-        }) || DENIED_HOME_SUBPATHS.iter().any(|f| {
-            let named = home.join(f);
-            !named.starts_with(&self.path) && canon(&named).starts_with(target)
-        });
-        // `grant_is_refused` catches a target inside cplt's state directory;
-        // one containing it (`CPLT_CONFIG` moved it out of `.config/cplt`) is
-        // caught only here.
-        let contains_state = [config::config_dir(), Some(home.join(CPLT_STATE_DIR))]
-            .into_iter()
-            .flatten()
-            .any(|dir| canon(&dir).starts_with(target));
+        let overlaps_denied = overlaps_credential_entry(home, target)
+            || DENIED_HOME_SUBPATHS.iter().any(|f| {
+                let named = home.join(f);
+                !named.starts_with(&self.path) && canon(&named).starts_with(target)
+            });
         (overlaps_denied
-            || contains_state
             || grant_is_refused(home, target)
             || (cfg!(target_os = "macos") && validate_sbpl_path(target).is_err())
             || !tool_override_path_is_safe(target, &canon(home)))
