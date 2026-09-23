@@ -283,6 +283,31 @@ impl PreparedSandbox {
     pub fn home_dir(&self) -> &Path {
         &self.home_dir
     }
+
+    /// Withdraw the read grant on the root `AGENTS.md` (#252).
+    ///
+    /// The grant is built before cplt writes the managed block, so it assumes
+    /// the write will land. When it did not (ambiguous markers, a failed
+    /// write), the file holds nothing cplt put there and the agent has no
+    /// reason to read outside its project, so the launch drops the grant.
+    pub fn revoke_root_agents_md(&mut self, file: &Path) {
+        #[cfg(target_os = "macos")]
+        {
+            self.profile_text = self
+                .profile_text
+                .replace(&profile::root_agents_md_sbpl(file), "");
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = file;
+            self.precomputed.deferred_plain_file = None;
+            if let Some(w) = &mut self.bwrap_wrapper {
+                w.fs_rules
+                    .retain(|r| Some(&r.path) != w.plain_file.as_ref());
+                w.plain_file = None;
+            }
+        }
+    }
 }
 
 /// Validate configuration and compile it into a platform-specific sandbox.
@@ -1123,7 +1148,7 @@ fn prepare_impl(
     // `resolve()` only clones `fs_rules`/`net_rules` on the arms that actually
     // build a wrapper (explicit-on, or auto-detect with bwrap available) — the
     // disabled and fallback arms borrow and clone nothing.
-    let bwrap_wrapper = bubblewrap::resolve(
+    let mut bwrap_wrapper = bubblewrap::resolve(
         config.use_bubblewrap,
         &policy.fs_rules,
         &policy.net_rules,
@@ -1135,6 +1160,10 @@ fn prepare_impl(
         },
         &deny_masks,
     )?;
+
+    if let Some(w) = &mut bwrap_wrapper {
+        w.plain_file.clone_from(&policy.plain_file);
+    }
 
     // Said only where it is true: without bubblewrap none of these binds exist,
     // so warning about a bounded scan there would imply a protection the host

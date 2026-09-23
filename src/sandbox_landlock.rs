@@ -133,6 +133,11 @@ pub struct LandlockPolicy {
     /// Writable home tool dirs (build caches such as `$CARGO_HOME/registry`)
     /// pre-created before the sandbox is applied, for the same reason.
     pub precreate_dirs: Vec<PathBuf>,
+    /// The one `fs_rules` path that must be a single plain file: the
+    /// repository-root `AGENTS.md` (#252). Opened at exec time, not in
+    /// `precompute()`, because cplt writes it after the policy is built, and
+    /// only with [`open_plain_file`]'s checks.
+    pub plain_file: Option<PathBuf>,
 }
 
 /// Pre-computed data for sandbox application in the child process.
@@ -168,6 +173,12 @@ pub struct PrecomputedSandbox {
     /// `CString` allocation happens in `precompute()` (parent, safe).
     /// The actual `open()` call happens in `apply_precomputed()` (child).
     pub deferred_paths: Vec<(std::ffi::CString, FsAccess)>,
+    /// [`LandlockPolicy::plain_file`], opened in the child with
+    /// [`open_plain_file`] and skipped if refused or absent. Deferred because
+    /// the parent writes the file after `precompute()`: an fd opened here would
+    /// miss a file created on first run and pin the old inode once the write
+    /// renames a new one over it.
+    pub deferred_plain_file: Option<(std::ffi::CString, FsAccess)>,
     pub net_rules: Vec<NetRule>,
     /// Whether to restrict TCP connect at the kernel level.
     pub restrict_net_connect: bool,
@@ -596,12 +607,13 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     }
 
     // ── Repository-root AGENTS.md: read only, this one file (#252) ──
-    if let Some(p) = config
+    let plain_file = config
         .root_agents_md
         .filter(|p| !policy::grant_is_refused(home, p))
-    {
+        .map(Path::to_path_buf);
+    if let Some(p) = &plain_file {
         fs_rules.push(FsRule {
-            path: p.to_path_buf(),
+            path: p.clone(),
             access: FsAccess {
                 read: true,
                 write: false,
@@ -1159,6 +1171,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         proxy_forced: config.proxy_forced,
         home_dir: home.to_path_buf(),
         precreate_dirs,
+        plain_file,
     }
 }
 
@@ -1581,9 +1594,14 @@ pub fn precompute(policy: LandlockPolicy) -> Result<PrecomputedSandbox, String> 
     // the parent's pid, not the child's. Defer those to apply_precomputed().
     let mut pre_opened_fds = Vec::new();
     let mut deferred_paths = Vec::new();
+    let mut deferred_plain_file = None;
     for rule in &policy.fs_rules {
         let c_path = CString::new(rule.path.as_os_str().as_bytes())
             .map_err(|_| format!("Path contains null byte: {}", rule.path.display()))?;
+        if policy.plain_file.as_ref() == Some(&rule.path) {
+            deferred_plain_file = Some((c_path, rule.access));
+            continue;
+        }
         if rule.path.starts_with("/proc/self") {
             deferred_paths.push((c_path, rule.access));
             continue;
@@ -1601,6 +1619,7 @@ pub fn precompute(policy: LandlockPolicy) -> Result<PrecomputedSandbox, String> 
     Ok(PrecomputedSandbox {
         pre_opened_fds,
         deferred_paths,
+        deferred_plain_file,
         net_rules,
         restrict_net_connect,
         seccomp_filter,
@@ -1935,6 +1954,16 @@ pub fn apply_precomputed(sandbox: &PrecomputedSandbox) -> std::io::Result<()> {
             .map_err(std::io::Error::other)?;
     }
 
+    // The root AGENTS.md (#252): opened now, after the parent wrote it, and
+    // skipped rather than failing the launch when it is absent or refused.
+    if let Some((c_path, access)) = &sandbox.deferred_plain_file
+        && let Some(raw_fd) = open_plain_file(c_path)
+    {
+        created = created
+            .add_rule(create_path_beneath_rule(&raw_fd, access))
+            .map_err(std::io::Error::other)?;
+    }
+
     // Add filesystem rules using pre-opened file descriptors.
     // No open() or CString allocation — just borrow the raw fd.
     for &(raw_fd, access) in &sandbox.pre_opened_fds {
@@ -2003,6 +2032,7 @@ pub(crate) fn apply_landlock_and_seccomp_now(
     net_rules: &[NetRule],
     restrict_net_connect: bool,
     proxy_forced: bool,
+    plain_file: Option<&Path>,
 ) -> std::io::Result<()> {
     use landlock::{AccessNet, NetPort, RulesetCreatedAttr, RulesetStatus};
     use std::ffi::CString;
@@ -2018,7 +2048,14 @@ pub(crate) fn apply_landlock_and_seccomp_now(
     for rule in fs_rules {
         let c_path = CString::new(rule.path.as_os_str().as_bytes())
             .map_err(|_| std::io::Error::other("path contains null byte"))?;
-        let raw_fd: RawFd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        let raw_fd: RawFd = if plain_file == Some(rule.path.as_path()) {
+            match open_plain_file(&c_path) {
+                Some(fd) => fd,
+                None => continue,
+            }
+        } else {
+            unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) }
+        };
         if raw_fd < 0 {
             // Path not present inside the namespace — skip, mirroring precompute().
             continue;
@@ -2050,6 +2087,38 @@ pub(crate) fn apply_landlock_and_seccomp_now(
     apply_seccomp_filter(&build_seccomp_filter(proxy_forced))?;
 
     Ok(())
+}
+
+/// Open a rule path that must name one plain file (#252), or `None`.
+///
+/// The path is repository content: between cplt's check and this open, a
+/// hostile repo can swap it for a symlink or hard link to a secret, and a
+/// plain `O_PATH` open would follow the one and bind the rule to the other.
+/// `O_NOFOLLOW` opens a symlink as itself, and `fstat` on the fd checks the
+/// very inode the rule binds to: a regular file with exactly one name.
+///
+/// Called in the forked child too, so it only makes raw syscalls.
+#[cfg(target_os = "linux")]
+fn open_plain_file(c_path: &std::ffi::CStr) -> Option<RawFd> {
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let plain = unsafe { libc::fstat(fd, &raw mut st) } == 0
+        && st.st_mode & libc::S_IFMT == libc::S_IFREG
+        && st.st_nlink == 1;
+    if plain {
+        Some(fd)
+    } else {
+        unsafe { libc::close(fd) };
+        None
+    }
 }
 
 /// Build a `PathBeneath` rule carrying the **full** access-rights set implied
@@ -4468,6 +4537,7 @@ mod tests {
             proxy_forced: false,
             home_dir: PathBuf::from("/tmp/test-home"),
             precreate_dirs: vec![],
+            plain_file: None,
         };
 
         let precomputed = precompute(policy).expect("precompute should succeed");
@@ -4489,6 +4559,106 @@ mod tests {
             1,
             "/tmp should be pre-opened; /proc/self must not be"
         );
+    }
+
+    /// `fstat` of an fd, for checking which inode a rule would bind to.
+    #[cfg(target_os = "linux")]
+    fn fd_ino(fd: RawFd) -> u64 {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(fd, &raw mut st) }, 0);
+        st.st_ino
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_only() -> FsAccess {
+        FsAccess {
+            read: true,
+            write: false,
+            execute: false,
+            ioctl: false,
+            create_dirs: false,
+        }
+    }
+
+    /// #252: cplt writes the root AGENTS.md after `precompute()`, so the rule
+    /// must not be opened there. On a first run the file does not exist yet
+    /// (an early open would drop the rule), and when the block changes the
+    /// write renames a new inode over the path (an early fd would pin the old,
+    /// unlinked one). The child-side open must see the file as written.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn plain_file_is_opened_after_the_upsert_not_in_precompute() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("AGENTS.md");
+        let policy = LandlockPolicy {
+            fs_rules: vec![FsRule {
+                path: file.clone(),
+                access: read_only(),
+            }],
+            net_rules: vec![],
+            restrict_net_connect: false,
+            proxy_forced: false,
+            home_dir: dir.path().to_path_buf(),
+            precreate_dirs: vec![],
+            plain_file: Some(file.clone()),
+        };
+
+        let pre = precompute(policy).expect("precompute should succeed");
+        assert!(pre.pre_opened_fds.is_empty(), "opened before the upsert");
+        let (c_path, _) = pre
+            .deferred_plain_file
+            .as_ref()
+            .expect("the root AGENTS.md rule must be deferred to exec");
+
+        // First run: created after precompute, still granted.
+        crate::brief::upsert_managed_block(&file).unwrap();
+        let fd = open_plain_file(c_path).expect("file written by the upsert");
+        assert_eq!(fd_ino(fd), std::fs::metadata(&file).unwrap().ino());
+
+        // Block changes: the upsert renames a new inode over the path.
+        std::fs::write(&file, "notes\n").unwrap();
+        let before = std::fs::metadata(&file).unwrap().ino();
+        crate::brief::upsert_managed_block(&file).unwrap();
+        let after = std::fs::metadata(&file).unwrap().ino();
+        assert_ne!(before, after, "the upsert should rename a new file in");
+        let fd = open_plain_file(c_path).expect("rewritten file");
+        assert_eq!(fd_ino(fd), after, "rule bound to a stale inode");
+    }
+
+    /// The exec-time open of the root AGENTS.md checks the inode it binds to,
+    /// not the name: a symlink, a hard link, a FIFO or a directory swapped in
+    /// after cplt's check gets no rule. Only a regular file with one link does.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn open_plain_file_refuses_everything_but_a_single_regular_file() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let c = |p: &Path| std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
+        let secret = dir.path().join("credentials");
+        std::fs::write(&secret, "x").unwrap();
+        let path = dir.path().join("AGENTS.md");
+
+        assert!(open_plain_file(&c(&path)).is_none(), "absent");
+
+        std::os::unix::fs::symlink(&secret, &path).unwrap();
+        assert!(open_plain_file(&c(&path)).is_none(), "symlink");
+        std::fs::remove_file(&path).unwrap();
+
+        std::fs::hard_link(&secret, &path).unwrap();
+        assert!(open_plain_file(&c(&path)).is_none(), "hard link");
+        std::fs::remove_file(&path).unwrap();
+
+        assert_eq!(unsafe { libc::mkfifo(c(&path).as_ptr(), 0o600) }, 0);
+        assert!(open_plain_file(&c(&path)).is_none(), "fifo");
+        std::fs::remove_file(&path).unwrap();
+
+        std::fs::create_dir(&path).unwrap();
+        assert!(open_plain_file(&c(&path)).is_none(), "directory");
+        std::fs::remove_dir(&path).unwrap();
+
+        std::fs::write(&path, "x").unwrap();
+        assert!(open_plain_file(&c(&path)).is_some(), "plain file");
     }
 
     /// The best-effort ruleset must build successfully on any kernel that

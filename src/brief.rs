@@ -1628,6 +1628,25 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "precious\n");
     }
 
+    /// A FIFO at `AGENTS.md` is neither a link nor a file cplt can write: the
+    /// read would block the launch until something writes into the pipe, and
+    /// the sandbox read grant would hand the agent a channel out of the repo.
+    #[test]
+    #[cfg(unix)]
+    fn upsert_refuses_fifo() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let path = tmpdir.path().join("AGENTS.md");
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
+
+        let err = upsert_managed_block(&path).unwrap_err();
+        assert!(
+            err.contains("not a regular file"),
+            "unexpected error: {err}"
+        );
+        assert!(agents_md_is_plain(&path).is_err());
+    }
+
     /// The other half of the same hole. A hard link has no target to inspect —
     /// `AGENTS.md` simply *is* a second name for a file outside the project, so
     /// the symlink check sees an ordinary regular file and every write through

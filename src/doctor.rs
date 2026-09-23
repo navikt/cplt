@@ -350,6 +350,7 @@ mod tests {
             proxy_forced: false,
             home_dir: PathBuf::from("/home/u"),
             precreate_dirs: vec![],
+            plain_file: None,
         }
     }
 

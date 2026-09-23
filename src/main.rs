@@ -2963,13 +2963,29 @@ fn write_session_sandbox_brief(
 /// committed AGENTS.md makes sense, and cplt should not leave a file behind in
 /// an arbitrary directory the user happened to point it at.
 ///
-/// Best-effort: any failure is warned about, never fatal.
-fn apply_persistent_sandbox_brief(resolved: &config::Resolved, project_dir: &Path) {
+/// Best-effort: any failure is warned about, never fatal. Unless the block is
+/// in the file afterwards, the read grant `root_grant` (the probe's
+/// `root_agents_md`) is withdrawn from `prepared` before the agent starts.
+fn apply_persistent_sandbox_brief(
+    resolved: &config::Resolved,
+    project_dir: &Path,
+    prepared: &mut sandbox::PreparedSandbox,
+    root_grant: Option<&Path>,
+) {
+    let in_place = upsert_persistent_sandbox_brief(resolved, project_dir);
+    if !in_place && let Some(file) = root_grant {
+        prepared.revoke_root_agents_md(file);
+    }
+}
+
+/// The upsert half of [`apply_persistent_sandbox_brief`]: `true` when the
+/// managed block is in the root `AGENTS.md` afterwards, written or unchanged.
+fn upsert_persistent_sandbox_brief(resolved: &config::Resolved, project_dir: &Path) -> bool {
     if !resolved.agents_md {
-        return;
+        return false;
     }
     let Some(agents_md) = agents_md_path(project_dir) else {
-        return;
+        return false;
     };
     match brief::upsert_managed_block(&agents_md) {
         Ok(brief::BlockOutcome::SkippedAmbiguous) => {
@@ -2981,13 +2997,15 @@ fn apply_persistent_sandbox_brief(resolved: &config::Resolved, project_dir: &Pat
                 brief::BLOCK_BEGIN,
                 brief::BLOCK_END
             ));
+            false
         }
-        Ok(_) => {}
+        Ok(_) => true,
         Err(e) => {
             ui::warn(&format!(
                 "Could not update AGENTS.md sandbox block ({}): {e}",
                 agents_md.display()
             ));
+            false
         }
     }
 }
@@ -3006,15 +3024,11 @@ fn agents_md_path(project_dir: &Path) -> Option<PathBuf> {
 /// The file is repository content, so a hostile clone can make it a link to a
 /// secret: Landlock would follow it and grant read on the target. It is granted
 /// only when [`brief::agents_md_is_plain`] passes — the same test that gates
-/// the write — and its directory is its own canonical path, so no symlinked
-/// directory can redirect it either. The one decision both backends consume.
+/// the write. Its directory needs no check: [`git_toplevel`] canonicalizes it.
+/// The one decision both backends consume.
 fn root_agents_md_outside(project_dir: &Path) -> Option<PathBuf> {
-    agents_md_path(project_dir).filter(|p| {
-        !p.starts_with(project_dir)
-            && brief::agents_md_is_plain(p).is_ok()
-            && p.parent()
-                .is_some_and(|d| std::fs::canonicalize(d).is_ok_and(|c| c == d))
-    })
+    agents_md_path(project_dir)
+        .filter(|p| !p.starts_with(project_dir) && brief::agents_md_is_plain(p).is_ok())
 }
 
 fn start_proxy_if_enabled(
@@ -3675,7 +3689,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     let electron_app_dir = discover_electron_app_dir(&agent_bin_result, active_agent);
 
     let AssembledSandbox {
-        prepared,
+        mut prepared,
         policy,
         proxy_handle,
         scratch_guard: _scratch_guard,
@@ -3804,7 +3818,12 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // last setup step before launch: every early return above (--print-profile,
     // the recursion guard, preflight failure, a declined prompt) must leave
     // the user's repo untouched.
-    apply_persistent_sandbox_brief(&resolved, &project_dir);
+    apply_persistent_sandbox_brief(
+        &resolved,
+        &project_dir,
+        &mut prepared,
+        probe.root_agents_md.as_deref(),
+    );
 
     // Compute hardening categories for environment sanitization
     let disabled_categories = resolved.disabled_hardening_categories();
@@ -10437,6 +10456,59 @@ mod tests {
         std::fs::remove_file(&agents).unwrap();
         std::os::unix::fs::symlink(&secret, &agents).unwrap();
         assert_eq!(grants(&mut resolved), (false, false), "symlink to a secret");
+    }
+
+    /// The read grant stands only when the upsert leaves the block in the
+    /// root AGENTS.md. Ambiguous markers skip the write, so the launch drops
+    /// the grant: the agent gets no read outside its project on a file cplt
+    /// did not write.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn root_agents_md_grant_withdrawn_when_upsert_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        git_in(dir.path(), &["init", "--quiet"]);
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let sub = root.join("apps/web");
+        let home = root.join("home");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let agents = root.join("AGENTS.md");
+        let mut resolved = config::Config::parse("")
+            .unwrap()
+            .merge(config::CliFlags::default())
+            .unwrap();
+        resolved.agents_md = true;
+        let lit = format!("(literal \"{}\")", agents.display());
+
+        let granted_after_upsert = |resolved: &mut config::Resolved| {
+            let probe = HostProbe::probe(resolved, &home, &sub);
+            let cfg = build_sandbox_config(
+                resolved,
+                &probe,
+                agent::Agent::Shell,
+                &[],
+                NamedRepos::default(),
+                &[],
+                SessionPaths::default(),
+                None,
+            );
+            let mut prepared = sandbox::prepare(&cfg).unwrap();
+            assert!(sandbox::describe(&prepared).contains(&lit), "not granted");
+            apply_persistent_sandbox_brief(
+                resolved,
+                &sub,
+                &mut prepared,
+                probe.root_agents_md.as_deref(),
+            );
+            sandbox::describe(&prepared).contains(&lit)
+        };
+
+        let pair = format!("{}\n{}\n", brief::BLOCK_BEGIN, brief::BLOCK_END);
+        std::fs::write(&agents, format!("{pair}{pair}")).unwrap();
+        assert!(!granted_after_upsert(&mut resolved), "skipped upsert");
+
+        std::fs::remove_file(&agents).unwrap();
+        assert!(granted_after_upsert(&mut resolved), "created by the upsert");
     }
 
     /// A linked worktree is its own checkout: the block goes in the worktree,

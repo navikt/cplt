@@ -123,6 +123,10 @@ pub(crate) struct BubblewrapWrapper {
     /// in-namespace so the helper builds the same seccomp filter as the
     /// fork-based path (the UDP/raw-socket denial is gated on it).
     pub proxy_forced: bool,
+    /// [`LandlockPolicy::plain_file`](crate::sandbox::landlock_mod::LandlockPolicy::plain_file),
+    /// set by `prepare()` after `resolve()`, so the helper opens that rule with
+    /// the same link and file-type checks as the fork-based path.
+    pub plain_file: Option<PathBuf>,
 }
 
 /// Check if bubblewrap is available on this system.
@@ -1061,6 +1065,7 @@ fn build_wrapper(
         deny_mask_count: deny_masks.mask_count(),
         socket_mask_count: deny_masks.socket_mask_count(),
         proxy_forced,
+        plain_file: None,
     })
 }
 
@@ -1112,6 +1117,8 @@ struct InnerPolicy {
     net_ports: Vec<u16>,
     restrict_net_connect: bool,
     proxy_forced: bool,
+    #[serde(default)]
+    plain_file: Option<PathBuf>,
     /// `[agent_binary, args...]` — `execve`-ed verbatim by the helper.
     agent_argv: Vec<String>,
 }
@@ -1136,6 +1143,7 @@ pub(crate) fn serialize_policy(
         net_ports: wrapper.net_rules.iter().map(|r| r.port).collect(),
         restrict_net_connect: wrapper.restrict_net_connect,
         proxy_forced: wrapper.proxy_forced,
+        plain_file: wrapper.plain_file.clone(),
         agent_argv,
     };
     serde_json::to_vec(&policy).map_err(std::io::Error::other)
@@ -1198,6 +1206,7 @@ fn run_inner() {
         &net_rules,
         policy.restrict_net_connect,
         policy.proxy_forced,
+        policy.plain_file.as_deref(),
     )
     .is_err()
     {

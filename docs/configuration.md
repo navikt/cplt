@@ -636,7 +636,9 @@ block into `AGENTS.md` at the repository root (the git toplevel, even when
 `--project-dir` names a subdirectory; a linked worktree or submodule is its own
 root), creating the file if it does not exist. When that file sits outside
 `--project-dir`, the sandbox grants read, and only read, on that one file so
-the agent can see the block; nothing else in the root becomes visible. This
+the agent can see the block; nothing else in the root becomes visible. The
+grant is dropped when the block could not be written, and a link or
+non-regular file at that path is never granted. This
 writes into your repository, so it is a second opt-in on top of the first:
 
 - The block is delimited by `<!-- cplt:sandbox begin -->` /

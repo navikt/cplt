@@ -911,10 +911,17 @@ fn emit_root_agents_md(sb: &mut String, home: &Path, file: Option<&Path>) {
     let Some(file) = file.filter(|f| !grant_is_refused(home, f)) else {
         return;
     };
-    let p = file.to_string_lossy();
-    sbpl!(sb, ";; Repository-root AGENTS.md — read only");
-    sbpl!(sb, "(allow file-read* (literal \"{p}\"))");
+    sb.push_str(&root_agents_md_sbpl(file));
     sbpl!(sb);
+}
+
+/// The rule [`emit_root_agents_md`] writes, as one string so
+/// `PreparedSandbox::revoke_root_agents_md` can remove exactly it.
+pub(super) fn root_agents_md_sbpl(file: &Path) -> String {
+    format!(
+        ";; Repository-root AGENTS.md — read only\n(allow file-read* (literal \"{}\"))\n",
+        file.to_string_lossy()
+    )
 }
 
 /// Deny every path inside a git directory that names content git will later
