@@ -1069,24 +1069,44 @@ fn handle_connection(
     state: &ProxyState,
     mut classification: ClassificationGuard,
 ) {
-    client.set_read_timeout(Some(state.timeout)).ok();
-    client.set_write_timeout(Some(state.timeout)).ok();
+    // The OS rejects a zero socket timeout, which would leave the socket
+    // fully blocking; substitute the default, as `relay_with_ceiling` does.
+    let timeout = if state.timeout.is_zero() {
+        DEFAULT_PROXY_TIMEOUT
+    } else {
+        state.timeout
+    };
+    client.set_read_timeout(Some(timeout)).ok();
+    client.set_write_timeout(Some(timeout)).ok();
 
-    // Read the request line
-    let mut buf = [0u8; 8192];
-    let n = match client.read(&mut buf) {
-        Ok(0) => {
+    let head = match read_request_head(&mut client, timeout) {
+        Ok(head) => head,
+        Err(HeadError::Closed) => {
             classification.complete(None);
             return;
         }
-        Ok(n) => n,
-        Err(_) => {
+        Err(e) => {
+            // Log a fixed reason, never the partial head: it is agent-controlled
+            // and may carry CONNECT userinfo.
+            let (status, response): (&str, &[u8]) = match e {
+                HeadError::TooLarge => (
+                    "FAIL:request-head-too-large",
+                    b"HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n",
+                ),
+                _ => (
+                    "FAIL:request-head-timeout",
+                    b"HTTP/1.1 408 Request Timeout\r\n\r\n",
+                ),
+            };
             classification.complete(None);
+            log_connection(state, None, "REJECT", "request-head", status);
+            reject(&mut client, response);
             return;
         }
     };
+    client.set_read_timeout(Some(timeout)).ok();
 
-    let request = String::from_utf8_lossy(&buf[..n]);
+    let request = String::from_utf8_lossy(&head);
     let first_line = request.lines().next().unwrap_or("");
 
     // Parse method and target
@@ -1106,7 +1126,105 @@ fn handle_connection(
         // CONNECT via proxy env vars for HTTPS traffic
         classification.complete(None);
         log_connection(state, None, method, target, "UNSUPPORTED");
-        let _ = client.write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n");
+        reject(&mut client, b"HTTP/1.1 405 Method Not Allowed\r\n\r\n");
+    }
+}
+
+/// Cap on a client request head (request line + headers). A CONNECT head is a
+/// few hundred bytes; 8 KiB matches the old single-read buffer.
+const MAX_REQUEST_HEAD: usize = 8192;
+
+enum HeadError {
+    /// EOF or a read error before the head was complete.
+    Closed,
+    TooLarge,
+    TimedOut,
+}
+
+/// Read the client's request head up to and including the blank line that
+/// ends it. A client may split the head across any number of TCP segments.
+///
+/// Reads one byte at a time so nothing past the head is consumed: bytes a
+/// client sends right after a CONNECT head (a pipelined TLS ClientHello) stay
+/// in the socket for the relay. The whole head must arrive within `timeout`,
+/// not just each segment, so a client trickling bytes cannot hold a
+/// connection slot open.
+fn read_request_head(client: &mut TcpStream, timeout: Duration) -> Result<Vec<u8>, HeadError> {
+    // `proxy.timeout` is an unbounded number of seconds; a huge one would
+    // overflow `Instant` and panic.
+    let now = Instant::now();
+    let deadline = now
+        .checked_add(timeout)
+        .unwrap_or_else(|| now + DEFAULT_PROXY_TIMEOUT);
+    let mut head = Vec::with_capacity(512);
+    let mut byte = [0u8; 1];
+    // Same terminator rule as `consume_until_header_end`: CR is ignored, so
+    // both CRLFCRLF and bare LFLF end the head.
+    let mut newlines = 0usize;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(HeadError::TimedOut);
+        }
+        client.set_read_timeout(Some(remaining)).ok();
+        match client.read(&mut byte) {
+            Ok(0) => return Err(HeadError::Closed),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(HeadError::TimedOut);
+            }
+            Err(_) => return Err(HeadError::Closed),
+        }
+        if head.len() == MAX_REQUEST_HEAD {
+            return Err(HeadError::TooLarge);
+        }
+        head.push(byte[0]);
+        match byte[0] {
+            b'\n' => {
+                newlines += 1;
+                if newlines == 2 {
+                    return Ok(head);
+                }
+            }
+            b'\r' => {}
+            _ => newlines = 0,
+        }
+    }
+}
+
+/// Send an error response and close without a reset.
+///
+/// The proxy stops reading at the end of the request head, so a client that
+/// pipelined bytes after it (a TLS ClientHello after CONNECT) may still have
+/// data unread. Closing a socket with unread data makes the kernel send RST,
+/// which can destroy the response before the client reads it. So half-close,
+/// then read and discard briefly, bounded in bytes and time so a client that
+/// keeps sending cannot hold the slot.
+fn reject(client: &mut TcpStream, response: &[u8]) {
+    const DRAIN_MAX: usize = 64 * 1024;
+    const DRAIN_TIME: Duration = Duration::from_millis(250);
+    let _ = client.write_all(response);
+    let _ = client.shutdown(std::net::Shutdown::Write);
+    let deadline = Instant::now() + DRAIN_TIME;
+    let mut buf = [0u8; 4096];
+    let mut drained = 0;
+    while drained < DRAIN_MAX {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || client.set_read_timeout(Some(remaining)).is_err() {
+            break;
+        }
+        match client.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => drained += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
     }
 }
 
@@ -1318,9 +1436,8 @@ fn handle_connect(
     // allowlist, blocklist, then the private-hostname SSRF guard — in that
     // order. The decision logic lives in `classify_connect` so the live proxy
     // and the `cplt check net` diagnostic can never drift apart; here we map
-    // each verdict to its audit-log status and 403 response. The `Blocked`
-    // (blocklist) and `BlockedPrivate` cases additionally half-close the socket,
-    // matching the original inline behaviour. `localhost_connect_allowed` is
+    // each verdict to its audit-log status and 403 response, sent through
+    // `reject` so the client reads it before the close. `localhost_connect_allowed` is
     // recomputed identically inside `classify_connect`; it is retained here
     // because the post-DNS section below still consults it.
     //
@@ -1340,7 +1457,10 @@ fn handle_connect(
                 target,
                 "BLOCKED-PORT",
             );
-            let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nPort not allowed\r\n");
+            reject(
+                &mut client,
+                b"HTTP/1.1 403 Forbidden\r\n\r\nPort not allowed\r\n",
+            );
             return;
         }
         NetVerdict::BlockedAllowlist => {
@@ -1351,13 +1471,15 @@ fn handle_connect(
                 target,
                 "BLOCKED-ALLOWLIST",
             );
-            let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nDomain not in allowlist. The allowlist is the agent's defaults (when enabled) plus allow.domains and the file named by proxy.allowed_domains; a preset or tool may have set these, not you.\r\nInspect them with `cplt config get proxy.allowed_domains` and `cplt config get allow.domains`.\r\nTo allow the host, add it to that file (re-read live) or run `cplt config set allow.domains HOST` and restart cplt.\r\n");
+            reject(&mut client, b"HTTP/1.1 403 Forbidden\r\n\r\nDomain not in allowlist. The allowlist is the agent's defaults (when enabled) plus allow.domains and the file named by proxy.allowed_domains; a preset or tool may have set these, not you.\r\nInspect them with `cplt config get proxy.allowed_domains` and `cplt config get allow.domains`.\r\nTo allow the host, add it to that file (re-read live) or run `cplt config set allow.domains HOST` and restart cplt.\r\n");
             return;
         }
         NetVerdict::Blocked => {
             log_connection(state, Some(classification), "CONNECT", target, "BLOCKED");
-            let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nBlocked by cplt\r\n");
-            let _ = client.shutdown(std::net::Shutdown::Both);
+            reject(
+                &mut client,
+                b"HTTP/1.1 403 Forbidden\r\n\r\nBlocked by cplt\r\n",
+            );
             return;
         }
         NetVerdict::BlockedPrivate => {
@@ -1368,8 +1490,7 @@ fn handle_connect(
                 target,
                 "BLOCKED-PRIVATE",
             );
-            let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nPrivate target blocked by cplt. For a trusted internal host, add its DNS name to proxy.allow_private_domains (or pass --allow-private-domain). An IP-literal target cannot be allowed: give the host a name.\r\n");
-            let _ = client.shutdown(std::net::Shutdown::Both);
+            reject(&mut client, b"HTTP/1.1 403 Forbidden\r\n\r\nPrivate target blocked by cplt. For a trusted internal host, add its DNS name to proxy.allow_private_domains (or pass --allow-private-domain). An IP-literal target cannot be allowed: give the host a name.\r\n");
             return;
         }
         NetVerdict::Allowed => {}
@@ -1420,10 +1541,7 @@ fn handle_connect(
                 target,
                 refusal.status(),
             );
-            let _ = client.write_all(refusal.response());
-            if refusal.shuts_down_socket() {
-                let _ = client.shutdown(std::net::Shutdown::Both);
-            }
+            reject(&mut client, refusal.response());
         }
         ConnectRoute::Upstream => {
             // `via_upstream` is only true when `state.upstream` is `Some`.
@@ -1465,7 +1583,7 @@ fn connect_direct(
                 target,
                 &format!("CONNECT-FAIL:{e}"),
             );
-            let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
+            reject(&mut client, b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
             return;
         }
     };
@@ -1515,7 +1633,7 @@ fn connect_via_upstream(
             target,
             "CONNECT-FAIL:upstream-dns",
         );
-        let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
+        reject(&mut client, b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
         return;
     };
     let mut remote = match TcpStream::connect_timeout(&socket_addr, CONNECT_TIMEOUT) {
@@ -1531,7 +1649,7 @@ fn connect_via_upstream(
                 target,
                 &format!("CONNECT-FAIL:upstream:{e}"),
             );
-            let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
+            reject(&mut client, b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
             return;
         }
     };
@@ -1548,7 +1666,7 @@ fn connect_via_upstream(
             target,
             "CONNECT-FAIL:upstream-write",
         );
-        let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
+        reject(&mut client, b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
         return;
     }
 
@@ -1564,7 +1682,7 @@ fn connect_via_upstream(
                 target,
                 "CONNECT-FAIL:upstream-refused",
             );
-            let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
+            reject(&mut client, b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
             return;
         }
         Err(_) => {
@@ -1575,7 +1693,7 @@ fn connect_via_upstream(
                 target,
                 "CONNECT-FAIL:upstream-read",
             );
-            let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
+            reject(&mut client, b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
             return;
         }
     }
@@ -2069,16 +2187,6 @@ impl Refusal {
             }
             Refusal::ResolvedPrivate => b"HTTP/1.1 403 Forbidden\r\n\r\nResolved to a private IP, blocked by cplt. For a trusted internal host, add it to proxy.allow_private_domains (or pass --allow-private-domain).\r\n",
         }
-    }
-
-    /// Whether the client socket is explicitly shut down (`Shutdown::Both`)
-    /// after the refusal, rather than just being dropped at the end of the
-    /// connection. A policy block does this so the client sees the tunnel go
-    /// away immediately; a gateway error does not. It is a full shutdown, not a
-    /// TCP half-close.
-    #[must_use]
-    pub(crate) fn shuts_down_socket(self) -> bool {
-        !matches!(self, Refusal::DnsFail)
     }
 }
 
@@ -2665,10 +2773,6 @@ mod tests {
             Refusal::ResolvedNonLoopback.status(),
             "BLOCKED-PRIVATE-RESOLVED"
         );
-        // A policy block half-closes the socket; a gateway error does not.
-        assert!(Refusal::ResolvedPrivate.shuts_down_socket());
-        assert!(Refusal::ResolvedNonLoopback.shuts_down_socket());
-        assert!(!Refusal::DnsFail.shuts_down_socket());
         assert!(Refusal::DnsFail.response().starts_with(b"HTTP/1.1 502"));
         assert!(
             Refusal::ResolvedPrivate
@@ -3613,6 +3717,211 @@ mod tests {
         assert!(!logged.contains("s3cret"));
         assert_eq!(logged.matches("***@example.invalid:443").count(), 3);
         assert!(!format!("{snapshot:?}").contains("secret"));
+    }
+
+    /// Proxy that lets CONNECT reach `origin_port` on IPv4 loopback directly.
+    fn head_test_proxy(origin_port: u16, timeout: Duration, log: PathBuf) -> ProxyHandle {
+        let loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let resolver: ResolverFn =
+            Arc::new(move |_h: &str, p: u16| Some(std::net::SocketAddr::new(loopback, p)));
+        start(ProxyOptions {
+            port: 0,
+            blocked_file: None,
+            subscription_blocklist: Vec::new(),
+            allowed_ports: vec![443],
+            allow_localhost_ports: vec![origin_port],
+            allow_localhost_any: false,
+            allowed_domains_file: None,
+            allowed_domains_initial: Vec::new(),
+            extra_allowed_domains: Vec::new(),
+            default_allowlist: Vec::new(),
+            cli_private_domains: Vec::new(),
+            config_private_domains: Vec::new(),
+            repo_private_domains: Vec::new(),
+            config_file: None,
+            log_file: Some(log),
+            log_level: ProxyLogLevel::None,
+            timeout,
+            upstream: None,
+            upstream_no_proxy: Vec::new(),
+            resolver: Some(resolver),
+        })
+        .expect("proxy start failed")
+    }
+
+    /// Read the proxy's reply up to the end of its status line.
+    fn read_status_line(conn: &mut std::net::TcpStream) -> String {
+        // `.ok()`: macOS refuses the option (EINVAL) once the peer has reset.
+        conn.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        let mut line = Vec::new();
+        let mut byte = [0u8; 1];
+        while let Ok(1) = conn.read(&mut byte) {
+            if byte[0] == b'\n' {
+                break;
+            }
+            line.push(byte[0]);
+        }
+        String::from_utf8_lossy(&line).trim().to_string()
+    }
+
+    /// A request head split across TCP segments must be reassembled, and bytes
+    /// the client sends after the head must reach the origin, not be dropped.
+    #[test]
+    fn split_connect_head_is_reassembled_and_trailing_bytes_reach_origin() {
+        require_localhost_tcp!();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let origin = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut got = [0u8; 11];
+            s.read_exact(&mut got).map(|()| got.to_vec())
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let proxy = head_test_proxy(port, Duration::from_secs(5), dir.path().join("p.log"));
+
+        let mut conn = std::net::TcpStream::connect(("127.0.0.1", proxy.port)).unwrap();
+        conn.set_nodelay(true).unwrap();
+        let parts = [
+            "CONNECT ".to_string(),
+            format!("localhost:{port} HTTP/1.1\r\n"),
+            // The early bytes ride in the same segment as the end of the head.
+            "\r\nearly-bytes".to_string(),
+        ];
+        let (last, partial) = parts.split_last().unwrap();
+        for part in partial {
+            conn.write_all(part.as_bytes()).unwrap();
+            // Nothing may come back for a partial head: a proxy that parsed
+            // it early would answer or close here. The wait also lets each
+            // part land as its own segment.
+            conn.set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+            let err = conn
+                .read(&mut [0u8; 1])
+                .expect_err("proxy answered a partial head");
+            assert!(
+                matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ),
+                "proxy closed on a partial head: {err}"
+            );
+        }
+        conn.write_all(last.as_bytes()).unwrap();
+        let status = read_status_line(&mut conn);
+        // Before joining: without a tunnel the origin never gets a connection.
+        assert!(
+            status.contains("200"),
+            "split head must tunnel; got {status:?}"
+        );
+        let received = origin.join().unwrap();
+        proxy.shutdown();
+        assert_eq!(
+            received.ok().as_deref(),
+            Some(&b"early-bytes"[..]),
+            "bytes after the head must reach the origin"
+        );
+    }
+
+    #[test]
+    fn oversized_request_head_is_rejected_with_431() {
+        require_localhost_tcp!();
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("p.log");
+        let proxy = head_test_proxy(9, Duration::from_secs(5), log.clone());
+
+        let mut conn = std::net::TcpStream::connect(("127.0.0.1", proxy.port)).unwrap();
+        // Exactly one byte over the cap, so the proxy has read everything we
+        // sent when it rejects (unread bytes would turn its close into a RST).
+        let mut head = b"CONNECT ".to_vec();
+        head.resize(MAX_REQUEST_HEAD + 1, b'a');
+        conn.write_all(&head).unwrap();
+        let status = read_status_line(&mut conn);
+        proxy.shutdown();
+
+        assert!(status.contains("431"), "got {status:?}");
+        let logged = std::fs::read_to_string(log).unwrap();
+        assert!(logged.contains("FAIL:request-head-too-large"), "{logged:?}");
+    }
+
+    /// A client that never finishes its head gets a 408 at the timeout, and
+    /// the proxy serves another client while that one is still stalled.
+    #[test]
+    fn unfinished_request_head_times_out_with_408() {
+        require_localhost_tcp!();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let origin = std::thread::spawn(move || listener.accept().is_ok());
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("p.log");
+        let proxy = head_test_proxy(port, Duration::from_secs(2), log.clone());
+
+        let mut slow = std::net::TcpStream::connect(("127.0.0.1", proxy.port)).unwrap();
+        slow.write_all(b"CONNECT localhost:").unwrap();
+        // Served while `slow` is still inside its 2 s head deadline.
+        let started = Instant::now();
+        let next_status = proxy_connect(proxy.port, &format!("localhost:{port}"));
+        assert!(next_status.contains("200"), "got {next_status:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "second client waited for the stalled one"
+        );
+        // Only joined once the 200 proves the origin got its connection.
+        assert!(origin.join().unwrap());
+        let slow_status = read_status_line(&mut slow);
+        proxy.shutdown();
+
+        assert!(slow_status.contains("408"), "got {slow_status:?}");
+        let logged = std::fs::read_to_string(log).unwrap();
+        assert!(logged.contains("FAIL:request-head-timeout"), "{logged:?}");
+    }
+
+    /// A huge `proxy.timeout` (unbounded seconds in config) must not overflow
+    /// the head deadline and panic the handler.
+    #[test]
+    fn huge_timeout_does_not_panic_head_read() {
+        require_localhost_tcp!();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let origin = std::thread::spawn(move || listener.accept().is_ok());
+        let dir = tempfile::tempdir().unwrap();
+        let proxy = head_test_proxy(
+            port,
+            Duration::from_secs(u64::MAX),
+            dir.path().join("p.log"),
+        );
+
+        let status = proxy_connect(proxy.port, &format!("localhost:{port}"));
+        assert!(status.contains("200"), "got {status:?}");
+        assert!(origin.join().unwrap());
+        proxy.shutdown();
+    }
+
+    /// A client that pipelines bytes after a CONNECT the proxy refuses must
+    /// still read the whole 403, not lose it to a RST from closing a socket
+    /// with unread data.
+    #[test]
+    fn rejected_connect_with_pipelined_bytes_reads_full_403() {
+        require_localhost_tcp!();
+        let dir = tempfile::tempdir().unwrap();
+        let proxy = head_test_proxy(9, Duration::from_secs(5), dir.path().join("p.log"));
+
+        let mut conn = std::net::TcpStream::connect(("127.0.0.1", proxy.port)).unwrap();
+        // Port 22 is not allowed. The trailing bytes stand in for a ClientHello.
+        let mut request = b"CONNECT example.com:22 HTTP/1.1\r\n\r\n".to_vec();
+        request.extend(std::iter::repeat_n(b'x', 16 * 1024));
+        conn.write_all(&request).unwrap();
+        conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut reply = Vec::new();
+        let read = conn.read_to_end(&mut reply);
+        proxy.shutdown();
+
+        assert!(read.is_ok(), "reading the 403 failed: {read:?}");
+        let reply = String::from_utf8_lossy(&reply);
+        assert!(
+            reply.starts_with("HTTP/1.1 403") && reply.ends_with("Port not allowed\r\n"),
+            "got {reply:?}"
+        );
     }
 
     /// A control character in the agent's request line must never reach a log
