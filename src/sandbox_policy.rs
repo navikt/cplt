@@ -236,13 +236,16 @@ pub fn first_party_read_target(home: &Path, path: &Path) -> Option<PathBuf> {
 }
 
 /// Exact-path membership of `path` in a `$HOME`-relative deny list, comparing
-/// the literal and the canonicalized form.
+/// the literal and the resolved form.
+///
+/// Resolved with [`config::canonicalize_deepest`], as the macOS deny is, so a
+/// dangling `~/.ssh -> ~/dotfiles/ssh` still refuses a grant on the
+/// `~/dotfiles/ssh` it will become.
 fn denied_entry(list: &[&'static str], home: &Path, path: &Path) -> Option<&'static str> {
-    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    let resolved = canon(path);
+    let resolved = config::canonicalize_deepest(path);
     list.iter().copied().find(|f| {
         let denied = home.join(f);
-        path == denied || resolved == canon(&denied)
+        path == denied || resolved == config::canonicalize_deepest(&denied)
     })
 }
 
@@ -3229,6 +3232,25 @@ mod tests {
         assert!(socket_owned_by(501, 1, 501));
         assert!(!socket_owned_by(0, 1, 501), "foreign owner");
         assert!(!socket_owned_by(501, 2, 501), "hardlinked socket");
+    }
+
+    /// A dangling `~/.ssh` / `~/.netrc` link: a grant naming the target it will
+    /// become is refused like one on the link itself.
+    #[test]
+    fn grant_on_the_future_target_of_a_dangling_credential_link_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir(home.join("dots")).unwrap();
+        std::os::unix::fs::symlink("dots/ssh", home.join(".ssh")).unwrap();
+        std::os::unix::fs::symlink("dots/netrc", home.join(".netrc")).unwrap();
+        assert_eq!(
+            denied_dotfile_dir(&home, &home.join("dots/ssh")),
+            Some(".ssh")
+        );
+        assert_eq!(
+            hard_denied_file(&home, &home.join("dots/netrc")),
+            Some(".netrc")
+        );
     }
 
     /// The read-only files are git's, drawn from the shared read list (#524,

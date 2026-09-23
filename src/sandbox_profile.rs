@@ -2051,26 +2051,39 @@ fn emit_deny_rules(sb: &mut String, config: &SandboxConfig, home: &str) {
     // Each deny names both spellings (`home_spellings`): SBPL checks the
     // resolved path, so a deny on `~/.ssh` alone does nothing once `~/.ssh` is
     // a symlink, and a grant covering the target would expose the keys.
-    sbpl!(sb, ";; Sensitive directories — DENIED");
-    for dotfile in DENIED_DOTFILES {
-        warn_unnameable_target(home, dotfile);
-        for p in home_spellings(home, dotfile) {
-            sbpl!(sb, "(deny file-read* (subpath \"{p}\"))");
-            sbpl!(sb, "(deny file-write* (subpath \"{p}\"))");
+    //
+    // Each entry is resolved once, for the warning, the denies and the pins.
+    let spell = |rel: &str, warn: bool| {
+        let named = Path::new(home).join(rel);
+        let target = crate::config::canonicalize_deepest(&named);
+        if warn {
+            warn_unnameable_target(rel, &named, &target);
         }
-    }
+        spellings(&named, &target)
+    };
+    let dirs: Vec<Vec<String>> = DENIED_DOTFILES.iter().map(|d| spell(d, true)).collect();
     // Hard-denied files, then the credential files inside allowed tool dirs
-    // (the latter overridable with --allow-read).
-    for file in DENIED_FILES.iter().chain(DENIED_HOME_SUBPATHS) {
-        if DENIED_FILES.contains(file) {
-            warn_unnameable_target(home, file);
-        }
-        for p in home_spellings(home, file) {
-            sbpl!(sb, "(deny file-read* (literal \"{p}\"))");
-            sbpl!(sb, "(deny file-write* (literal \"{p}\"))");
-        }
+    // (the latter overridable with --allow-read, so no warning).
+    let files: Vec<Vec<String>> = DENIED_FILES
+        .iter()
+        .map(|f| spell(f, true))
+        .chain(DENIED_HOME_SUBPATHS.iter().map(|f| spell(f, false)))
+        .collect();
+    sbpl!(sb, ";; Sensitive directories — DENIED");
+    for p in dirs.iter().flatten() {
+        sbpl!(sb, "(deny file-read* (subpath \"{p}\"))");
+        sbpl!(sb, "(deny file-write* (subpath \"{p}\"))");
     }
-    emit_resolved_deny_pins(sb, config, home);
+    for p in files.iter().flatten() {
+        sbpl!(sb, "(deny file-read* (literal \"{p}\"))");
+        sbpl!(sb, "(deny file-write* (literal \"{p}\"))");
+    }
+    let targets: Vec<PathBuf> = dirs
+        .iter()
+        .chain(&files)
+        .filter_map(|s| s.get(1).map(PathBuf::from))
+        .collect();
+    emit_resolved_deny_pins(sb, config, &targets);
     for path in config.extra_deny {
         let p = path.to_string_lossy();
         sbpl!(sb, "(deny file-read* (subpath \"{p}\"))");
@@ -2090,15 +2103,8 @@ fn emit_deny_rules(sb: &mut String, config: &SandboxConfig, home: &str) {
 /// strictly inside the outermost writable tree holding the target, the tree
 /// root left alone. The target itself needs no pin; its `file-write*` deny
 /// covers the unlink.
-fn emit_resolved_deny_pins(sb: &mut String, config: &SandboxConfig, home: &str) {
-    let targets: Vec<PathBuf> = DENIED_DOTFILES
-        .iter()
-        .chain(DENIED_FILES)
-        .chain(DENIED_HOME_SUBPATHS)
-        .filter_map(|rel| home_spellings(home, rel).into_iter().nth(1))
-        .map(PathBuf::from)
-        .collect();
-    let mut pins = super::home_config_target_pins(config, &targets);
+fn emit_resolved_deny_pins(sb: &mut String, config: &SandboxConfig, targets: &[PathBuf]) {
+    let mut pins = super::home_config_target_pins(config, targets);
     pins.sort();
     pins.dedup();
     if pins.is_empty() {
@@ -2116,10 +2122,8 @@ fn emit_resolved_deny_pins(sb: &mut String, config: &SandboxConfig, home: &str) 
 /// Warn when `~/{rel}` resolves somewhere the profile cannot name: the deny
 /// is then emitted only at the `$HOME` spelling, which the kernel never
 /// checks, so a grant covering the target exposes the credential.
-fn warn_unnameable_target(home: &str, rel: &str) {
-    let named = Path::new(home).join(rel);
-    let target = crate::config::canonicalize_deepest(&named);
-    if target != named && validate_sbpl_path(&target).is_err() {
+fn warn_unnameable_target(rel: &str, named: &Path, target: &Path) {
+    if target != named && validate_sbpl_path(target).is_err() {
         let t = target.display();
         crate::ui::warn(&format!(
             "~/{rel} resolves to {t}, which the macOS sandbox profile cannot name \
@@ -2161,9 +2165,13 @@ fn resolved(path: PathBuf) -> PathBuf {
 /// close it.
 fn home_spellings(home: &str, rel: &str) -> Vec<String> {
     let named = Path::new(home).join(rel);
-    let target = crate::config::canonicalize_deepest(&named);
+    spellings(&named, &crate::config::canonicalize_deepest(&named))
+}
+
+/// [`home_spellings`] for a path already resolved.
+fn spellings(named: &Path, target: &Path) -> Vec<String> {
     let mut out = vec![named.to_string_lossy().into_owned()];
-    if target != named && validate_sbpl_path(&target).is_ok() {
+    if target != named && validate_sbpl_path(target).is_ok() {
         out.push(target.to_string_lossy().into_owned());
     }
     out
@@ -2376,9 +2384,20 @@ fn emit_gpg_signing_rules(
     // Explicit --deny-path wins: if the user denied ~/.gnupg, anything under
     // it, or an ancestor of it, withhold all GPG allows (they all live under
     // ~/.gnupg) so the deny is not overridden.
-    // Against both spellings: `extra_deny` is canonical, so a deny on a
-    // symlinked `~/.gnupg` names its target, where the re-allows below also go.
-    if let Some(deny) = overlapping_home_deny(extra_deny, home, ".gnupg") {
+    // Against every spelling of the directory and of each re-allowed file:
+    // `extra_deny` is canonical, and each re-allow below also names where its
+    // own path resolves, so a real `~/.gnupg` whose `gpg.conf` links into a
+    // denied `~/dotfiles` would otherwise reopen the deny.
+    const SOCKETS: [&str; 2] = ["S.gpg-agent", "S.keyboxd"];
+    let deny = std::iter::once(".gnupg".to_string())
+        .chain(
+            GPG_SIGNING_ALLOW_FILES
+                .iter()
+                .chain(&SOCKETS)
+                .map(|f| format!(".gnupg/{f}")),
+        )
+        .find_map(|rel| overlapping_home_deny(extra_deny, home, &rel));
+    if let Some(deny) = deny {
         withhold_reallow(sb, "GPG signing", "~/.gnupg", deny);
         return;
     }
@@ -2395,7 +2414,7 @@ fn emit_gpg_signing_rules(
     // interface, and the Assuan protocol cannot export keys.
     // file-read* is needed for the inode lookup before connect(2).
     // S.keyboxd is needed for GnuPG 2.4+ with keyboxd-managed public keys.
-    for p in ["S.gpg-agent", "S.keyboxd"].iter().flat_map(|s| at(s)) {
+    for p in SOCKETS.iter().flat_map(|s| at(s)) {
         sbpl!(sb, "(allow file-read* (literal \"{p}\"))");
         sbpl!(sb, "(allow network-outbound (literal \"{p}\"))");
     }
@@ -4331,6 +4350,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A real `~/.gnupg` whose `gpg.conf` links into a denied dotfiles dir:
+    /// the per-file re-allow resolves to the target, so the overlap check has
+    /// to look there too, not only at `~/.gnupg`.
+    #[test]
+    fn deny_path_on_a_linked_gnupg_file_target_withholds_the_reallow() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let dots = home.join("dotfiles");
+        std::fs::create_dir_all(dots.join("gnupg")).expect("mkdir");
+        std::fs::create_dir_all(home.join(".gnupg")).expect("mkdir");
+        std::fs::write(dots.join("gnupg/gpg.conf"), "\n").expect("write");
+        std::os::unix::fs::symlink(dots.join("gnupg/gpg.conf"), home.join(".gnupg/gpg.conf"))
+            .expect("symlink");
+        let project = home.join("proj");
+        std::fs::create_dir_all(&project).expect("mkdir");
+        let extra_deny = [dots.clone()];
+        let mut opts = test_options(&project, &home);
+        opts.extra_deny = &extra_deny;
+        opts.allow_gpg_signing = true;
+        let p = generate_profile(&opts, &[]);
+        let got = allows_under(&p, &dots);
+        assert!(got.is_empty(), "--deny-path ~/dotfiles reopened: {got:?}");
     }
 
     /// A dangling `~/.ssh -> dotfiles/ssh` must be denied at the target, so

@@ -386,10 +386,10 @@ pub(crate) fn lexically_normalized(path: &Path) -> PathBuf {
 /// A dangling symlink on the way is followed too: `~/.ssh -> ~/dotfiles/ssh`
 /// with no `~/dotfiles/ssh` yet would otherwise resolve to `~/.ssh` itself,
 /// and a rule naming that matches nothing once the target is created. Loops
-/// and long chains stop after 40 hops, as the kernel's own `MAXSYMLINKS` does,
-/// keeping the lexical form from there.
+/// and long chains stop at the kernel's own `MAXSYMLINKS` (32 on macOS, 40 on
+/// Linux), keeping the lexical form from there.
 pub(crate) fn canonicalize_deepest(path: &Path) -> PathBuf {
-    deepest(path, &mut 40)
+    deepest(path, &mut if cfg!(target_os = "macos") { 32 } else { 40 })
 }
 
 fn deepest(path: &Path, hops: &mut u32) -> PathBuf {
