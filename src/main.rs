@@ -1508,12 +1508,21 @@ fn prompt_confirm(auto_yes: bool, quiet: bool) -> Result<(), String> {
     }
 }
 
-/// Canonicalize a list of paths, warning on failures.
+/// Canonicalize a list of allow paths, warning on failures and dropping one
+/// whose spelling takes a symlink into a credential (#551).
 fn canonicalize_paths(paths: &[PathBuf], flag_name: &str) -> Vec<PathBuf> {
     paths
         .iter()
         .filter_map(|p| match std::fs::canonicalize(p) {
-            Ok(c) => Some(c),
+            Ok(c) => {
+                let spelled = std::path::absolute(p).unwrap_or_default();
+                if let Some(target) = config::allow_path_credential_hop(&spelled) {
+                    let why = config::credential_hop_message(&target);
+                    ui::warn(&format!("{flag_name} path {} {why}", p.display()));
+                    return None;
+                }
+                Some(c)
+            }
             Err(e) => {
                 ui::warn(&format!("{flag_name} path {}: {e}", p.display()));
                 None

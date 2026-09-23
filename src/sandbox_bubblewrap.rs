@@ -71,9 +71,10 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
-use crate::sandbox::landlock_mod::{FsAccess, FsRule, LandlockPolicy, NetRule};
+use crate::sandbox::landlock_mod::{CredentialLink, FsAccess, FsRule, LandlockPolicy, NetRule};
 use crate::sandbox::policy::{
-    LinuxCoverage, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, Protected, rel_ancestors,
+    LinuxCoverage, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, Protected, reaches_entry_directly,
+    rel_ancestors,
 };
 
 /// Environment variable carrying the read end of the policy pipe (a decimal fd
@@ -457,6 +458,74 @@ pub(crate) fn build_bwrap_args(
         args.extend(["--tmpfs".to_string(), dir_str]);
     }
 
+    // ── Grants inside a masked credential directory, bound back (#551) ──
+    // A per-file `allow.read ~/.ssh/known_hosts`, or the `--allow-gpg-signing`
+    // files in a linked `~/.gnupg`, would otherwise vanish under the tmpfs.
+    // The source is the host path, so the tmpfs does not hide it; bwrap
+    // creates the mount point inside the tmpfs.
+    //
+    // Only a rule that enters the credential dir by its own name or its
+    // resolved one, and follows no symlink outside it below that
+    // ([`reaches_entry_directly`]; `config -> conf.d/work` inside is fine):
+    // a link the agent planted in a writable tree must not carry a grant
+    // onto the key. User allow paths arrive canonical; the loader refused
+    // any whose spelling took such a hop (`credential_link_hop`). Never
+    // under a user deny path.
+    let mut rebinds: Vec<(PathBuf, bool)> = fs_rules
+        .iter()
+        .filter_map(|r| {
+            let p = r.path.canonicalize().ok()?;
+            let inside = deny_masks.credential_dirs.iter().any(|(named, d)| {
+                p.starts_with(d) && p != *d && reaches_entry_directly(&r.path, named, d)
+            });
+            (inside && !deny_masks.user_denied.iter().any(|u| p.starts_with(u)))
+                .then_some((p, r.access.write))
+        })
+        .collect();
+    // Path order is by component, so a parent is bound before its children;
+    // a writable rule sorts first so the dedup keeps its write.
+    rebinds.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+    rebinds.dedup_by(|a, b| a.0 == b.0);
+    for (path, write) in &rebinds {
+        let p = path.to_string_lossy().into_owned();
+        let flag = if *write { "--bind" } else { "--ro-bind" };
+        args.extend([flag.to_string(), p.clone(), p]);
+    }
+
+    // A re-bound directory covers every earlier mount inside it: a user deny
+    // (`allow.read ~/.ssh/config.d` with `--deny-path ~/.ssh/config.d/work`),
+    // a read-only overlay, a pin. Emit those again on top, in the same order.
+    let under_rebind = |p: &Path| rebinds.iter().any(|(r, _)| p.starts_with(r));
+    for path in overlays
+        .pins
+        .iter()
+        .filter(|p| under_rebind(p) && p.exists())
+    {
+        let p = path.to_string_lossy().into_owned();
+        args.extend(["--bind".to_string(), p.clone(), p]);
+    }
+    for path in overlays
+        .read_only
+        .iter()
+        .filter(|p| under_rebind(p) && p.exists())
+    {
+        let p = path.to_string_lossy().into_owned();
+        args.extend(["--ro-bind".to_string(), p.clone(), p]);
+    }
+    if let Some(placeholder) = &deny_masks.placeholder {
+        let ph = placeholder.to_string_lossy().into_owned();
+        for file in deny_masks.files.iter().filter(|f| under_rebind(f)) {
+            args.extend([
+                "--ro-bind".to_string(),
+                ph.clone(),
+                file.to_string_lossy().into_owned(),
+            ]);
+        }
+    }
+    for dir in deny_masks.dirs.iter().filter(|d| under_rebind(d)) {
+        args.extend(["--tmpfs".to_string(), dir.to_string_lossy().into_owned()]);
+    }
+
     args
 }
 
@@ -495,9 +564,28 @@ pub(crate) struct DenyMasks {
     /// about here: this runs before we know whether bwrap will be used at
     /// all, and under `--no-bubblewrap` the warning would be noise.
     placeholder_error: Option<String>,
+    /// The kept directory masks that came from `credentials` (#551), as
+    /// `(named, target)`. Grants inside one are bound back after it
+    /// ([`build_bwrap_args`]).
+    credential_dirs: Vec<(PathBuf, PathBuf)>,
+    /// The user's deny paths, canonical. Nothing under one is bound back.
+    user_denied: Vec<PathBuf>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    User,
+    Socket,
+    Credential,
 }
 
 impl DenyMasks {
+    /// Whether `path` (canonical) is masked, by its own entry or by a
+    /// directory mask above it.
+    pub(crate) fn covers(&self, path: &Path) -> bool {
+        self.dirs.iter().any(|d| path.starts_with(d)) || self.files.iter().any(|f| f == path)
+    }
+
     /// Number of masks that came from the user's `--deny-path` / `deny.paths`.
     pub(crate) fn mask_count(&self) -> usize {
         self.user_masks
@@ -549,9 +637,15 @@ impl DenyMasks {
 /// exist on this host, so nothing from it should ever land in `skipped` — and
 /// is only counted separately so the deny-path diagnostics keep reporting the
 /// user's own paths.
+///
+/// `credentials` carries the resolved credential entries inside a granted
+/// tree (`landlock_mod::credential_links`, #551), counted in neither total.
+/// One that cannot be masked is not put in `skipped`, which reports the
+/// user's deny paths; the caller asks [`DenyMasks::covers`] and warns itself.
 pub(crate) fn build_deny_masks(
     extra_deny: &[PathBuf],
     socket_masks: &[PathBuf],
+    credentials: &[CredentialLink],
     scratch_dir: Option<&Path>,
 ) -> DenyMasks {
     let mut dirs: Vec<PathBuf> = Vec::new();
@@ -563,30 +657,36 @@ pub(crate) fn build_deny_masks(
     // already covers, and it must count for both, not neither.
     let mut socket_canon: Vec<PathBuf> = Vec::new();
     let mut user_canon: Vec<PathBuf> = Vec::new();
-    for (path, is_socket_mask) in extra_deny
+    for (path, origin) in extra_deny
         .iter()
-        .map(|p| (p, false))
-        .chain(socket_masks.iter().map(|p| (p, true)))
+        .map(|p| (p, Origin::User))
+        .chain(socket_masks.iter().map(|p| (p, Origin::Socket)))
+        .chain(credentials.iter().map(|l| (&l.target, Origin::Credential)))
     {
+        let mut skip = |p: PathBuf| {
+            if origin != Origin::Credential {
+                skipped.push(p);
+            }
+        };
         if !path.is_absolute() {
-            skipped.push(path.clone());
+            skip(path.clone());
             continue;
         }
         let Ok(canon) = path.canonicalize() else {
-            skipped.push(path.clone());
+            skip(path.clone());
             continue;
         };
-        if is_socket_mask {
-            socket_canon.push(canon.clone());
-        } else {
-            user_canon.push(canon.clone());
+        match origin {
+            Origin::User => user_canon.push(canon.clone()),
+            Origin::Socket => socket_canon.push(canon.clone()),
+            Origin::Credential => {}
         }
         if canon.starts_with("/proc")
             || canon.starts_with("/dev")
             || canon.starts_with("/sys")
             || canon.starts_with("/tmp")
         {
-            skipped.push(canon);
+            skip(canon);
             continue;
         }
         if canon.is_dir() {
@@ -596,19 +696,33 @@ pub(crate) fn build_deny_masks(
         }
     }
 
+    // A mask nested in another is redundant, except under a credential-only
+    // mask: grants inside that one are bound back on top (#551), and a user
+    // deny or socket mask below must be there to re-apply after them.
+    let cred_only = |d: &PathBuf| {
+        credentials.iter().any(|l| l.target == *d)
+            && !user_canon.contains(d)
+            && !socket_canon.contains(d)
+    };
+    let shadowed = |kept: &[PathBuf], p: &PathBuf| {
+        kept.iter()
+            .any(|k| p.starts_with(k) && (p == k || !cred_only(k)))
+    };
     dirs.sort_by_key(|p| p.components().count());
     let mut kept_dirs: Vec<PathBuf> = Vec::new();
     for dir in dirs {
-        if !kept_dirs.iter().any(|k| dir.starts_with(k)) {
+        if !shadowed(&kept_dirs, &dir) {
             kept_dirs.push(dir);
         }
     }
-    files.retain(|f| !kept_dirs.iter().any(|k| f.starts_with(k)));
+    files.retain(|f| !shadowed(&kept_dirs, f));
     files.sort();
     files.dedup();
 
     // A file mask needs the placeholder as its bind source; without one those
     // deny paths are unenforced, so they move to `skipped` with the reason.
+    // Credential-only files do not: the caller finds them uncovered.
+    let reported = |f: &PathBuf| user_canon.contains(f) || socket_canon.contains(f);
     let mut placeholder_error = None;
     let placeholder = if files.is_empty() {
         None
@@ -617,12 +731,12 @@ pub(crate) fn build_deny_masks(
             Some(Ok(path)) => Some(path),
             Some(Err(e)) => {
                 placeholder_error = Some(format!("cannot create deny-mask placeholder: {e}"));
-                skipped.append(&mut files);
+                skipped.extend(files.drain(..).filter(reported));
                 None
             }
             None => {
                 placeholder_error = Some("no scratch dir available".to_string());
-                skipped.append(&mut files);
+                skipped.extend(files.drain(..).filter(reported));
                 None
             }
         }
@@ -654,6 +768,11 @@ pub(crate) fn build_deny_masks(
         .chain(files.iter())
         .filter(|p| user_canon.contains(*p))
         .count();
+    let credential_dirs = credentials
+        .iter()
+        .filter(|l| kept_dirs.contains(&l.target))
+        .map(|l| (l.named.clone(), l.target.clone()))
+        .collect();
 
     DenyMasks {
         dirs: kept_dirs,
@@ -663,6 +782,8 @@ pub(crate) fn build_deny_masks(
         socket_masks,
         user_masks,
         placeholder_error,
+        credential_dirs,
+        user_denied: user_canon,
     }
 }
 
@@ -2403,7 +2524,7 @@ mod tests {
         let hooks_proj = base.path().join("proj");
         std::fs::create_dir_all(hooks_proj.join(".git/hooks")).expect("hooks");
 
-        let masks = build_deny_masks(std::slice::from_ref(&secret), &[], None);
+        let masks = build_deny_masks(std::slice::from_ref(&secret), &[], &[], None);
         assert_eq!(masks.mask_count(), 1);
 
         let rules = [writable_rule(&base.path().to_string_lossy())];
@@ -2449,7 +2570,7 @@ mod tests {
         let scratch = base.path().join("scratch");
         std::fs::create_dir(&scratch).expect("scratch");
 
-        let masks = build_deny_masks(std::slice::from_ref(&secret), &[], Some(&scratch));
+        let masks = build_deny_masks(std::slice::from_ref(&secret), &[], &[], Some(&scratch));
         assert_eq!(masks.mask_count(), 1);
         let placeholder = masks.placeholder.clone().expect("placeholder created");
         use std::os::unix::fs::PermissionsExt;
@@ -2491,7 +2612,7 @@ mod tests {
         let base = non_tmp_tempdir();
         let secret = base.path().join("token.txt");
         std::fs::write(&secret, "s").expect("write");
-        let masks = build_deny_masks(std::slice::from_ref(&secret), &[], None);
+        let masks = build_deny_masks(std::slice::from_ref(&secret), &[], &[], None);
         assert_eq!(masks.mask_count(), 0, "no scratch dir → no file mask");
         assert!(masks.placeholder.is_none());
         // The unmaskable file is reported rather than silently dropped, and
@@ -2523,7 +2644,7 @@ mod tests {
         };
         resolved.apply_repo_config(&repo_config, base.path(), &[]);
 
-        let masks = build_deny_masks(&resolved.deny_paths, &[], None);
+        let masks = build_deny_masks(&resolved.deny_paths, &[], &[], None);
         assert!(
             masks.skipped().is_empty(),
             "an anchored repo deny path must not be skipped: {:?}",
@@ -2544,6 +2665,7 @@ mod tests {
                 under_tmp.path().to_path_buf(),
             ],
             &[],
+            &[],
             None,
         );
         assert_eq!(masks.mask_count(), 0);
@@ -2562,7 +2684,7 @@ mod tests {
         let link = base.path().join("link-secrets");
         std::os::unix::fs::symlink(&real, &link).expect("symlink");
 
-        let masks = build_deny_masks(&[link], &[], None);
+        let masks = build_deny_masks(&[link], &[], &[], None);
         assert_eq!(masks.dirs, vec![real.canonicalize().unwrap()]);
     }
 
@@ -2580,7 +2702,12 @@ mod tests {
         let scratch = base.path().join("scratch");
         std::fs::create_dir(&scratch).expect("scratch");
 
-        let masks = build_deny_masks(&[child, parent.clone(), file_under], &[], Some(&scratch));
+        let masks = build_deny_masks(
+            &[child, parent.clone(), file_under],
+            &[],
+            &[],
+            Some(&scratch),
+        );
         assert_eq!(masks.dirs, vec![parent.canonicalize().unwrap()]);
         assert!(
             masks.files.is_empty(),
@@ -2604,7 +2731,7 @@ mod tests {
         let scratch = base.path().join("scratch");
         std::fs::create_dir(&scratch).expect("scratch");
 
-        let masks = build_deny_masks(&[dir.clone(), file], &[], Some(&scratch));
+        let masks = build_deny_masks(&[dir.clone(), file], &[], &[], Some(&scratch));
         let args = build_bwrap_args(&[], Overlays::default(), &masks);
         let file_pos = args.iter().position(|a| a.ends_with("f.txt")).unwrap();
         let dir_canon = dir.canonicalize().unwrap().to_string_lossy().into_owned();
@@ -2634,6 +2761,7 @@ mod tests {
         let masks = build_deny_masks(
             std::slice::from_ref(&denied),
             &[sock_dir, sock_file],
+            &[],
             Some(&scratch),
         );
         assert_eq!(masks.mask_count(), 1, "one user deny path");
@@ -2649,7 +2777,8 @@ mod tests {
         // cannot be rewritten in place.
         let scratch2 = base.path().join("scratch2");
         std::fs::create_dir(&scratch2).expect("scratch2");
-        let only_sockets = build_deny_masks(&[], std::slice::from_ref(&denied), Some(&scratch2));
+        let only_sockets =
+            build_deny_masks(&[], std::slice::from_ref(&denied), &[], Some(&scratch2));
         assert_eq!(only_sockets.mask_count(), 0);
         assert_eq!(only_sockets.socket_mask_count(), 1);
     }
@@ -2673,6 +2802,7 @@ mod tests {
         let masks = build_deny_masks(
             &[],
             &[sock.clone(), alias.join("docker.sock")],
+            &[],
             Some(&scratch),
         );
         assert_eq!(
@@ -2690,6 +2820,7 @@ mod tests {
         let both = build_deny_masks(
             std::slice::from_ref(&sock),
             std::slice::from_ref(&sock),
+            &[],
             Some(&scratch2),
         );
         assert_eq!(both.mask_count(), 1, "the user asked for this deny path");
@@ -2715,6 +2846,7 @@ mod tests {
         let masks = build_deny_masks(
             std::slice::from_ref(&run_user),
             &[bus, systemd],
+            &[],
             Some(&scratch),
         );
         assert_eq!(masks.mask_count(), 1, "the user's one deny path");
@@ -2736,7 +2868,7 @@ mod tests {
         let systemd = base.path().join("systemd");
         std::fs::create_dir(&systemd).expect("systemd");
 
-        let masks = build_deny_masks(&[], &[bus.clone(), systemd.clone()], Some(&scratch));
+        let masks = build_deny_masks(&[], &[bus.clone(), systemd.clone()], &[], Some(&scratch));
         let args = build_bwrap_args(&[], Overlays::default(), &masks);
 
         let bus_str = bus.canonicalize().unwrap().to_string_lossy().into_owned();
@@ -2846,5 +2978,179 @@ mod tests {
             found.iter().any(|m| m.contains(".git is not pinned")),
             "removing the gitdir pin must be reported: {found:?}"
         );
+    }
+
+    /// #551: `~/.ssh -> ~/dotfiles/ssh` with `~/dotfiles` granted is masked at
+    /// the resolved path, and a per-file `allow.read ~/.ssh/known_hosts` (which
+    /// arrives canonical) is bound back on top of the mask. The key is not.
+    /// A user deny path over the same dir wins over the re-bind, and a link to
+    /// a target that does not exist yields no mask.
+    #[test]
+    fn a_linked_credential_dir_is_masked_and_its_overrides_bound_back() {
+        use std::os::unix::fs::symlink;
+        let base = non_tmp_tempdir();
+        let home = base.path().canonicalize().unwrap();
+        let ssh = home.join("dotfiles/ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        std::fs::write(ssh.join("id_ed25519"), "key").unwrap();
+        std::fs::write(ssh.join("known_hosts"), "hosts").unwrap();
+        symlink(&ssh, home.join(".ssh")).unwrap();
+        symlink(home.join("dotfiles/aws"), home.join(".aws")).unwrap();
+        let known_hosts = ssh.join("known_hosts");
+        let rules = [
+            writable_rule(&home.join("dotfiles").to_string_lossy()),
+            read_rule(&known_hosts),
+        ];
+
+        let links = crate::sandbox::landlock_mod::credential_links(&home, &rules);
+        assert_eq!(links.len(), 1, "only the existing link: {links:?}");
+        assert_eq!(
+            (links[0].rel, &links[0].target, &links[0].grant),
+            (".ssh", &ssh, &home.join("dotfiles"))
+        );
+        let targets = links.clone();
+
+        let masks = build_deny_masks(&[], &[], &targets, None);
+        assert!(masks.covers(&ssh.join("id_ed25519")));
+        assert_eq!((masks.mask_count(), masks.socket_mask_count()), (0, 0));
+        let args = build_bwrap_args(&rules, Overlays::default(), &masks);
+        let s = |p: &Path| p.to_string_lossy().into_owned();
+        let tmpfs = args
+            .windows(2)
+            .position(|w| w[0] == "--tmpfs" && w[1] == s(&ssh))
+            .expect("the resolved ~/.ssh must be masked");
+        let rebind = args
+            .windows(3)
+            .position(|w| w == ["--ro-bind", &s(&known_hosts), &s(&known_hosts)])
+            .expect("the known_hosts override must be bound back");
+        assert!(rebind > tmpfs, "the re-bind must come after the mask");
+        assert!(
+            !args.iter().any(|a| a.ends_with("id_ed25519")),
+            "the key must not be bound: {args:?}"
+        );
+
+        let denied = build_deny_masks(std::slice::from_ref(&ssh), &[], &targets, None);
+        let args = build_bwrap_args(&rules, Overlays::default(), &denied);
+        assert!(
+            !args.iter().any(|a| *a == s(&known_hosts)),
+            "a user deny path must not be re-opened: {args:?}"
+        );
+    }
+
+    /// #551 review: only a rule that enters the masked dir by `~/.ssh` or by
+    /// its resolved name is bound back. A link planted in the writable tree
+    /// (`docs/hosts -> ../ssh/id_ed25519`) is not, and neither does one onto a
+    /// linked `~/.npmrc` lift that file's mask. A link inside the entry
+    /// (`config -> conf.d/work`) is the user's and is bound back at its
+    /// target; one there that leads on through the planted link (`out ->
+    /// ../docs/hosts`) is not.
+    #[test]
+    fn a_rule_reaching_a_credential_through_a_planted_link_is_not_bound_back() {
+        use std::os::unix::fs::symlink;
+        let base = non_tmp_tempdir();
+        let home = base.path().canonicalize().unwrap();
+        let dotfiles = home.join("dotfiles");
+        let ssh = dotfiles.join("ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        std::fs::create_dir_all(dotfiles.join("docs")).unwrap();
+        std::fs::write(ssh.join("id_ed25519"), "key").unwrap();
+        std::fs::write(ssh.join("known_hosts"), "hosts").unwrap();
+        std::fs::write(dotfiles.join("npmrc"), "token").unwrap();
+        symlink(&ssh, home.join(".ssh")).unwrap();
+        symlink(dotfiles.join("npmrc"), home.join(".npmrc")).unwrap();
+        symlink("../ssh/id_ed25519", dotfiles.join("docs/hosts")).unwrap();
+        symlink("../npmrc", dotfiles.join("docs/npmrc")).unwrap();
+        std::fs::create_dir_all(ssh.join("conf.d")).unwrap();
+        std::fs::write(ssh.join("conf.d/work"), "c").unwrap();
+        symlink("conf.d/work", ssh.join("config")).unwrap();
+        symlink("../docs/hosts", ssh.join("out")).unwrap();
+        let rules = [
+            writable_rule(&dotfiles.to_string_lossy()),
+            read_rule(&dotfiles.join("docs/hosts")),
+            read_rule(&dotfiles.join("docs/npmrc")),
+            read_rule(&home.join(".ssh/known_hosts")),
+            read_rule(&home.join(".ssh/config")),
+            read_rule(&home.join(".ssh/out")),
+        ];
+
+        let links = crate::sandbox::landlock_mod::credential_links(&home, &rules);
+        let rels: Vec<_> = links.iter().map(|l| l.rel).collect();
+        assert!(
+            rels.contains(&".ssh") && rels.contains(&".npmrc"),
+            "a planted link must not exempt a credential from its mask: {rels:?}"
+        );
+        let masks = build_deny_masks(&[], &[], &links, None);
+        let args = build_bwrap_args(&rules, Overlays::default(), &masks);
+        let kh = ssh.join("known_hosts").to_string_lossy().into_owned();
+        assert!(
+            args.windows(3).any(|w| w == ["--ro-bind", &kh, &kh]),
+            "~/.ssh/known_hosts is spelled through the entry and is bound back: {args:?}"
+        );
+        let work = ssh.join("conf.d/work").to_string_lossy().into_owned();
+        assert!(
+            args.windows(3).any(|w| w == ["--ro-bind", &work, &work]),
+            "~/.ssh/config -> conf.d/work stays inside the entry and is bound back: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a.ends_with("id_ed25519")),
+            "the key must not be bound back through docs/hosts: {args:?}"
+        );
+
+        // The rule naming the resolved file itself is on purpose.
+        let direct = [
+            writable_rule(&dotfiles.to_string_lossy()),
+            read_rule(&dotfiles.join("npmrc")),
+        ];
+        let links = crate::sandbox::landlock_mod::credential_links(&home, &direct);
+        assert!(!links.iter().any(|l| l.rel == ".npmrc"), "{links:?}");
+    }
+
+    /// #551 review: a re-bound directory would cover the masks inside it, so
+    /// a user deny path (and a read-only overlay) under it is emitted again
+    /// after the re-bind.
+    #[test]
+    fn a_rebound_credential_dir_keeps_the_user_deny_inside_it() {
+        use std::os::unix::fs::symlink;
+        let base = non_tmp_tempdir();
+        let home = base.path().canonicalize().unwrap();
+        let dotfiles = home.join("dotfiles");
+        let ssh = dotfiles.join("ssh");
+        let config_d = ssh.join("config.d");
+        std::fs::create_dir_all(&config_d).unwrap();
+        std::fs::write(config_d.join("work"), "work").unwrap();
+        std::fs::write(config_d.join("home"), "home").unwrap();
+        let scratch = home.join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        symlink(&ssh, home.join(".ssh")).unwrap();
+        let work = config_d.join("work");
+        let ro = config_d.join("home");
+        let rules = [
+            writable_rule(&dotfiles.to_string_lossy()),
+            writable_rule(&home.join(".ssh/config.d").to_string_lossy()),
+        ];
+        let links = crate::sandbox::landlock_mod::credential_links(&home, &rules);
+        let masks = build_deny_masks(std::slice::from_ref(&work), &[], &links, Some(&scratch));
+        let overlays = Overlays {
+            read_only: std::slice::from_ref(&ro),
+            pins: &[],
+        };
+        let args = build_bwrap_args(&rules, overlays, &masks);
+        let s = |p: &Path| p.to_string_lossy().into_owned();
+        let last = |flag: &str, dest: &Path| {
+            args.windows(3)
+                .rposition(|w| w[0] == flag && w[2] == s(dest))
+                .unwrap_or_else(|| panic!("no {flag} onto {}: {args:?}", dest.display()))
+        };
+        let rebind = last("--bind", &config_d);
+        let ph = s(masks.placeholder.as_ref().unwrap());
+        let mask = args
+            .windows(3)
+            .rposition(|w| w == ["--ro-bind", &ph, &s(&work)])
+            .expect("user deny mask");
+        assert!(
+            mask > rebind,
+            "the deny must come after the re-bind: {args:?}"
+        );
+        assert!(last("--ro-bind", &ro) > rebind, "{args:?}");
     }
 }
