@@ -320,7 +320,16 @@ curl -fsSL https://github.com/navikt/cplt/releases/latest/download/cplt-aarch64-
 sudo mv cplt /usr/local/bin/
 ```
 
-Every release tarball and `.deb` carries a [build provenance attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations/using-artifact-attestations-to-establish-provenance-for-builds). The attestation covers the downloaded file, not the binary inside it, so download to a file and verify it before you extract or install:
+Every release tarball and `.deb` carries a [build provenance attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations/using-artifact-attestations-to-establish-provenance-for-builds). The attestation covers the downloaded file, not the binary inside it, so download to a file and verify it before you extract or install. The pattern is the same for every release asset — download, then `gh attestation verify <file> --repo navikt/cplt` before you unpack or install it:
+
+- `cplt-x86_64-apple-darwin.tar.gz`
+- `cplt-aarch64-apple-darwin.tar.gz`
+- `cplt-x86_64-unknown-linux-gnu.tar.gz`
+- `cplt-aarch64-unknown-linux-gnu.tar.gz`
+- `cplt_<version>_amd64.deb`
+- `cplt_<version>_arm64.deb`
+
+For example, on Linux x86_64:
 
 ```bash
 curl -fsSLO https://github.com/navikt/cplt/releases/latest/download/cplt-x86_64-unknown-linux-gnu.tar.gz
@@ -328,7 +337,14 @@ gh attestation verify cplt-x86_64-unknown-linux-gnu.tar.gz --repo navikt/cplt
 tar xzf cplt-x86_64-unknown-linux-gnu.tar.gz
 ```
 
-Use the same `gh attestation verify <file> --repo navikt/cplt` on a downloaded `.deb` before `apt install`.
+The `.deb` carries a version in its name, so `gh release download` resolves it instead of a fixed URL:
+
+```bash
+arch=$(dpkg --print-architecture)   # amd64 or arm64
+gh release download --repo navikt/cplt --pattern "*_${arch}.deb"
+gh attestation verify cplt_*_"${arch}".deb --repo navikt/cplt
+sudo apt install ./cplt_*_"${arch}".deb
+```
 
 ### Build from source
 
