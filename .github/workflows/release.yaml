@@ -18,6 +18,33 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # A red CI on a push to main skips every job below, and a skipped run is
+  # green and silent. That left a published advisory with no patched version
+  # and nobody told (#370). Fail this run instead, so the Actions tab shows a
+  # red Release and GitHub sends its failed-run notification.
+  #
+  # `cancelled` is excluded: CI cancels an in-progress main run when a newer
+  # push lands, and that newer run carries the release.
+  ci-not-green:
+    name: CI not green, no release cut
+    if: >
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.conclusion != 'success' &&
+      github.event.workflow_run.conclusion != 'cancelled'
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Report skipped release
+        env:
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          CI_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          echo "::error title=No release cut::CI concluded '${CONCLUSION}' for ${HEAD_SHA}, so no tag was created. Fix or re-run CI (gh run rerun --failed): ${CI_URL}"
+          exit 1
+
   version:
     name: Determine version
     # `branches: [main]` on `workflow_run` filters the TRIGGERING run's head
