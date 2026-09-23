@@ -24,19 +24,13 @@ impl Config {
             return Ok(None);
         };
 
-        if !path.exists() {
-            return Ok(None);
-        }
-
+        // Only a missing file means "no config". Any other failure — EACCES on
+        // the file or a parent, EIO, a symlink loop — stops the launch: running
+        // with defaults would silently drop whatever the file restricts (#385).
         let raw = match std::fs::read_to_string(&path) {
             Ok(s) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                ui::info(&format!("Cannot read config file {}: {e}", path.display()));
-                return Ok(None);
-            }
-            Err(e) => {
-                return Err(ConfigError::FileRead { path, source: e });
-            }
+            Err(e) if super::error::is_absent(&e, &path) => return Ok(None),
+            Err(e) => return Err(ConfigError::FileRead { path, source: e }),
         };
 
         // Forward-compatible load: unknown keys (e.g. options from a newer cplt

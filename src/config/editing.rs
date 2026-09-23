@@ -527,19 +527,25 @@ impl ConfigSetOp {
 
     /// Load the existing TOML document, or create an empty one.
     pub fn load_document(&self) -> Result<toml_edit::DocumentMut, ConfigError> {
-        if self.path.exists() {
-            let raw = std::fs::read_to_string(&self.path).map_err(|e| ConfigError::Read {
-                path: self.path.clone(),
-                source: e,
-            })?;
-            raw.parse::<toml_edit::DocumentMut>()
-                .map_err(|e| ConfigError::TomlEditParse {
-                    path: self.path.display().to_string(),
+        // Only an absent file starts an empty document. Anything else would have
+        // `config set` replace a file it could not read (#385).
+        let raw = match std::fs::read_to_string(&self.path) {
+            Ok(raw) => raw,
+            Err(e) if super::error::is_absent(&e, &self.path) => {
+                return Ok(toml_edit::DocumentMut::new());
+            }
+            Err(e) => {
+                return Err(ConfigError::Read {
+                    path: self.path.clone(),
                     source: e,
-                })
-        } else {
-            Ok(toml_edit::DocumentMut::new())
-        }
+                });
+            }
+        };
+        raw.parse::<toml_edit::DocumentMut>()
+            .map_err(|e| ConfigError::TomlEditParse {
+                path: self.path.display().to_string(),
+                source: e,
+            })
     }
 
     /// Validate and write the document back, creating parent dirs if needed.

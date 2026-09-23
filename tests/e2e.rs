@@ -2747,6 +2747,243 @@ mod e2e_tests {
         let _ = std::fs::remove_dir_all(&fake_home);
     }
 
+    /// Launch with `--print-profile` from `repo` under `home`, optionally with
+    /// `CPLT_CONFIG` pointing at `config`.
+    fn print_profile(home: &Path, repo: &Path, config: Option<&Path>) -> (String, bool) {
+        let mut cmd = cplt_local(home, repo);
+        if let Some(config) = config {
+            cmd.env("CPLT_CONFIG", config);
+        }
+        let output = cmd
+            .args(["--print-profile", "--project-dir"])
+            .arg(repo)
+            .output()
+            .expect("should run");
+        (
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            output.status.success(),
+        )
+    }
+
+    fn running_as_root() -> bool {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    /// An unreadable config file must stop the launch, naming the file and the
+    /// OS error. It used to be treated as absent, and the session ran on
+    /// defaults with whatever the file restricted silently dropped (#385).
+    #[test]
+    fn e2e_unreadable_global_config_stops_the_launch() {
+        use std::os::unix::fs::PermissionsExt;
+        if running_as_root() {
+            eprintln!("skipped: root reads a mode-000 file");
+            return;
+        }
+        let fake_home = make_config_home("unreadable-global");
+        let repo = temp_repo("navikt/spleis");
+        let config = fake_home.join("config.toml");
+        std::fs::write(&config, "[sandbox]\nquiet = true\n").unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let (stderr, ok) = print_profile(&fake_home, repo.path(), Some(&config));
+
+        assert!(!ok, "an unreadable config must stop the launch: {stderr}");
+        assert!(
+            stderr.contains(&*config.to_string_lossy()) && stderr.contains("Permission denied"),
+            "the error must name the file and the OS error: {stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    /// A symlink loop is not a missing file: `exists()` said "absent" and the
+    /// launch ran on defaults without a word (#385).
+    #[test]
+    fn e2e_config_symlink_loop_stops_the_launch() {
+        let fake_home = make_config_home("loop-global");
+        let repo = temp_repo("navikt/spleis");
+        let config = fake_home.join("config.toml");
+        std::os::unix::fs::symlink(&config, &config).unwrap();
+
+        let (stderr, ok) = print_profile(&fake_home, repo.path(), Some(&config));
+
+        assert!(!ok, "a looping config path must stop the launch: {stderr}");
+        assert!(
+            stderr.contains(&*config.to_string_lossy())
+                && stderr.contains("Too many levels of symbolic links"),
+            "the error must name the file and the OS error: {stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    /// The other side of the rule: a config file that is simply not there is
+    /// still the ordinary no-config case.
+    #[test]
+    fn e2e_missing_config_still_launches_on_defaults() {
+        let fake_home = make_config_home("missing-global");
+        let repo = temp_repo("navikt/spleis");
+
+        // ENOENT, and ENOTDIR: a path through a regular file cannot name a
+        // file either (`common::NO_CONFIG` is one).
+        for missing in [
+            fake_home.join("nonexistent.toml"),
+            PathBuf::from("/dev/null/nonexistent"),
+        ] {
+            let (stderr, ok) = print_profile(&fake_home, repo.path(), Some(&missing));
+            assert!(ok, "a missing config means defaults: {stderr}");
+        }
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    /// The per-repo local layer follows the same rule as the global file.
+    #[test]
+    fn e2e_unreadable_local_config_stops_the_launch() {
+        use std::os::unix::fs::PermissionsExt;
+        if running_as_root() {
+            eprintln!("skipped: root reads a mode-000 file");
+            return;
+        }
+        let fake_home = make_config_home("unreadable-local");
+        let repo = temp_repo("navikt/spleis");
+        assert!(
+            cplt_local(&fake_home, repo.path())
+                .args(["config", "set", "--local", "sandbox.quiet", "true"])
+                .output()
+                .is_ok_and(|o| o.status.success())
+        );
+        let file = local_file(&fake_home).expect("a local file should have been written");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let (stderr, ok) = print_profile(&fake_home, repo.path(), None);
+
+        assert!(
+            !ok,
+            "an unreadable local config must stop the launch: {stderr}"
+        );
+        assert!(
+            stderr.contains(&*file.to_string_lossy()) && stderr.contains("Permission denied"),
+            "the error must name the file and the OS error: {stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    /// Inside a cplt session the sandbox denies the config on purpose, so
+    /// `--print-profile` and `doctor` stop there (they used to run on
+    /// defaults, f0e334f). The error must say why, not leave the user
+    /// suspecting the file. Mode 000 stands in for the sandbox's EPERM/EACCES.
+    #[test]
+    fn e2e_unreadable_config_inside_a_session_says_why() {
+        use std::os::unix::fs::PermissionsExt;
+        const HINT: &str = "you are inside a cplt sandbox; the config is deliberately \
+                            unreadable here — run this outside the sandbox";
+        if running_as_root() {
+            eprintln!("skipped: root reads a mode-000 file");
+            return;
+        }
+        let fake_home = make_config_home("unreadable-wrapped");
+        let repo = temp_repo("navikt/spleis");
+        let config = fake_home.join("config.toml");
+        std::fs::write(&config, "[sandbox]\nquiet = true\n").unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        for args in [&["--print-profile"][..], &["doctor"][..]] {
+            let output = cplt_local(&fake_home, repo.path())
+                .env("CPLT_CONFIG", &config)
+                .env("__CPLT_WRAPPED", "1")
+                .args(args)
+                .output()
+                .expect("should run");
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!output.status.success(), "{args:?} must fail: {text}");
+            assert!(text.contains(HINT), "{args:?} must say why: {text}");
+            assert!(
+                !text.contains("cannot resolve this launch"),
+                "{args:?} must not blame the config: {text}"
+            );
+        }
+
+        // Outside a session the same file gets no sandbox hint.
+        let (stderr, ok) = print_profile(&fake_home, repo.path(), Some(&config));
+        assert!(!ok && !stderr.contains(HINT), "{stderr}");
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    /// `CPLT_CONFIG=<file>/` is ENOTDIR, but it names a real config: reading
+    /// it as absent would drop whatever the file tightens. Only a path whose
+    /// parent is not a directory (`/dev/null/nonexistent`) is absent.
+    #[test]
+    fn e2e_config_path_with_trailing_slash_stops_the_launch() {
+        let fake_home = make_config_home("slash-global");
+        let repo = temp_repo("navikt/spleis");
+        let config = fake_home.join("config.toml");
+        std::fs::write(&config, "[sandbox]\nquiet = true\n").unwrap();
+        let slashed = PathBuf::from(format!("{}/", config.display()));
+
+        let (stderr, ok) = print_profile(&fake_home, repo.path(), Some(&slashed));
+
+        assert!(!ok, "a trailing slash must not hide the config: {stderr}");
+        assert!(stderr.contains("Not a directory"), "{stderr}");
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    /// `config set` on a file it cannot read must fail and leave the file
+    /// alone, not replace it with a document holding only the new key.
+    #[test]
+    fn e2e_config_set_on_unreadable_file_leaves_it_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        if running_as_root() {
+            eprintln!("skipped: root reads a mode-000 file");
+            return;
+        }
+        let fake_home = make_config_home("set-unreadable");
+        let repo = temp_repo("navikt/spleis");
+        let config = fake_home.join("config.toml");
+        let original = "[sandbox]\nquiet = true\nallow_localhost = [8080]\n";
+        std::fs::write(&config, original).unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let output = cplt_local(&fake_home, repo.path())
+            .env("CPLT_CONFIG", &config)
+            .args(["config", "set", "sandbox.quiet", "false"])
+            .output()
+            .expect("should run");
+
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    /// A local config that loops is not a missing one (#385).
+    #[test]
+    fn e2e_local_config_symlink_loop_stops_the_launch() {
+        let fake_home = make_config_home("loop-local");
+        let repo = temp_repo("navikt/spleis");
+        assert!(
+            cplt_local(&fake_home, repo.path())
+                .args(["config", "set", "--local", "sandbox.quiet", "true"])
+                .output()
+                .is_ok_and(|o| o.status.success())
+        );
+        let file = local_file(&fake_home).expect("a local file should have been written");
+        std::fs::remove_file(&file).unwrap();
+        std::os::unix::fs::symlink(&file, &file).unwrap();
+
+        let (stderr, ok) = print_profile(&fake_home, repo.path(), None);
+
+        assert!(!ok, "a looping local config must stop the launch: {stderr}");
+        assert!(
+            stderr.contains(&*file.to_string_lossy())
+                && stderr.contains("Too many levels of symbolic links"),
+            "{stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
     /// `config show` must say which file each value came from — a local value
     /// reads `(local)`, a global one does not, and the local file is named.
     #[test]
