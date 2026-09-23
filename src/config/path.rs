@@ -509,24 +509,54 @@ pub fn classify_custom_config(path: &Path, home: &Path, project_dir: &Path) -> C
     CustomConfigVerdict::Outside(resolved)
 }
 
+/// Where an allow entry spelled `spelled` (absolute, not yet resolved) lands
+/// when a symlink of its own carries it into a credential entry, or `None`
+/// ([`crate::sandbox::credential_link_hop`], #551). Every allow path is
+/// canonicalized at load, so this is checked before the spelling is lost.
+pub fn allow_path_credential_hop(spelled: &Path) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    crate::sandbox::credential_link_hop(Path::new(&home), spelled)
+}
+
+/// The refusal for [`allow_path_credential_hop`], after the entry's name.
+pub fn credential_hop_message(target: &Path) -> String {
+    format!(
+        "reaches the credential {} through a symlink, so cplt is \
+         ignoring it. A link inside a tree the agent can write can be repointed between \
+         runs; name the credential by its own path if you mean to grant it.",
+        target.display()
+    )
+}
+
+/// [`resolve_config_path`] for an `allow.*` entry: also `Err` when the
+/// spelling takes a symlink into a credential ([`allow_path_credential_hop`]).
+pub(super) fn resolve_allow_path(
+    path: &str,
+    config_dir: Option<&PathBuf>,
+) -> Result<PathBuf, ConfigError> {
+    let resolved = resolve_config_path(path, config_dir)?;
+    let spelled = std::path::absolute(anchored(path, config_dir)).unwrap_or_default();
+    match allow_path_credential_hop(&spelled) {
+        Some(target) => Err(ConfigError::Validation(credential_hop_message(&target))),
+        None => Ok(resolved),
+    }
+}
+
+/// Expand tilde and resolve a relative path against `config_dir`.
+fn anchored(path: &str, config_dir: Option<&PathBuf>) -> PathBuf {
+    let expanded = expand_tilde(path);
+    match config_dir {
+        Some(dir) if expanded.is_relative() => dir.join(&expanded),
+        _ => expanded,
+    }
+}
+
 /// Expand tilde, resolve relative paths against config dir, and canonicalize.
 pub(super) fn resolve_config_path(
     path: &str,
     config_dir: Option<&PathBuf>,
 ) -> Result<PathBuf, ConfigError> {
-    let expanded = expand_tilde(path);
-
-    // If relative and we know the config dir, resolve from there
-    let full = if expanded.is_relative() {
-        if let Some(dir) = config_dir {
-            dir.join(&expanded)
-        } else {
-            expanded
-        }
-    } else {
-        expanded
-    };
-
+    let full = anchored(path, config_dir);
     std::fs::canonicalize(&full).map_err(|_| {
         ConfigError::Validation(format!(
             "path does not exist or is inaccessible: {}",

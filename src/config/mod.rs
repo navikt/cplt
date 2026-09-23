@@ -34,8 +34,8 @@ pub use local::{
 pub(crate) use path::canonicalize_deepest;
 pub(crate) use path::lexically_normalized;
 pub use path::{
-    CustomConfigVerdict, classify_custom_config, collapse_tilde, config_dir, config_path,
-    default_config_contents, expand_tilde,
+    CustomConfigVerdict, allow_path_credential_hop, classify_custom_config, collapse_tilde,
+    config_dir, config_path, credential_hop_message, default_config_contents, expand_tilde,
 };
 pub use registry::{
     BoolKeyRow, ConfigKeyInfo, ConfigLayer, ConfigValueType, all_config_keys, bool_key,

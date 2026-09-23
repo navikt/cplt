@@ -3,7 +3,10 @@
 use std::path::{Path, PathBuf};
 
 use super::error::ConfigError;
-use super::path::{config_dir, config_path, expand_tilde, resolve_config_path, resolve_repo_path};
+use super::path::{
+    allow_path_credential_hop, config_dir, config_path, credential_hop_message, expand_tilde,
+    lexically_normalized, resolve_allow_path, resolve_config_path, resolve_repo_path,
+};
 use super::registry::ConfigLayer;
 use super::types::{
     CliFlags, Config, EnforcementMode, GhGuardPolicy, GitGuardPolicy, LoadedConfig, Preset,
@@ -339,7 +342,7 @@ impl Config {
         let config_dir = config_path().and_then(|p| p.parent().map(std::path::Path::to_path_buf));
         let mut allow_read: Vec<PathBuf> = Vec::new();
         for s in &self.allow.read {
-            match resolve_config_path(s, config_dir.as_ref()) {
+            match resolve_allow_path(s, config_dir.as_ref()) {
                 Ok(p) => allow_read.push(p),
                 Err(e) => {
                     ui::warn(&format!("Warning: allow.read path {s:?}: {e}"));
@@ -351,7 +354,7 @@ impl Config {
         // Allow-write: merge config + CLI
         let mut allow_write: Vec<PathBuf> = Vec::new();
         for s in &self.allow.write {
-            match resolve_config_path(s, config_dir.as_ref()) {
+            match resolve_allow_path(s, config_dir.as_ref()) {
                 Ok(p) => allow_write.push(p),
                 Err(e) => {
                     ui::warn(&format!("Warning: allow.write path {s:?}: {e}"));
@@ -366,7 +369,7 @@ impl Config {
         // env-derived write grants (`merge_tool_path_env_overrides`).
         let mut allow_exec: Vec<PathBuf> = Vec::new();
         for s in &self.allow.exec {
-            match resolve_config_path(s, config_dir.as_ref()) {
+            match resolve_allow_path(s, config_dir.as_ref()) {
                 Ok(p) => allow_exec.push(p),
                 Err(e) => {
                     ui::warn(&format!("Warning: allow.exec path {s:?}: {e}"));
@@ -378,7 +381,7 @@ impl Config {
         // Allow-socket: merge config + CLI
         let mut allow_socket: Vec<PathBuf> = Vec::new();
         for s in &self.allow.socket {
-            match resolve_config_path(s, config_dir.as_ref()) {
+            match resolve_allow_path(s, config_dir.as_ref()) {
                 Ok(p) => allow_socket.push(p),
                 Err(e) => {
                     ui::warn(&format!("Warning: allow.socket path {s:?}: {e}"));
@@ -1709,6 +1712,17 @@ impl Resolved {
 /// can only tighten, so a repointed deny symlink cannot escalate.
 fn resolve_repo_allow_path(path_str: &str, config_dir: &Path, key: &str) -> Option<PathBuf> {
     let resolved = resolve_repo_path(path_str, config_dir);
+    // #551: `docs/hosts` approved, then repointed by the agent at
+    // `../ssh/id_ed25519` in a repo that holds the linked `~/.ssh`, still
+    // resolves inside the repository.
+    let spelled = config_dir.join(lexically_normalized(&expand_tilde(path_str)));
+    if let Some(target) = allow_path_credential_hop(&spelled) {
+        ui::warn(&format!(
+            "{key} entry {path_str:?} {}",
+            credential_hop_message(&target)
+        ));
+        return None;
+    }
     if expand_tilde(path_str).is_relative() && !resolved.starts_with(config_dir) {
         ui::warn(&format!(
             "{key} entry {path_str:?} resolves outside the repository ({}), so cplt is ignoring it.\n  \

@@ -74,11 +74,12 @@ pub use policy::{
     PLAYWRIGHT_SOCKET_ROOT, PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX, PROTECTED_IN_GITDIR,
     PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir, SENSITIVE_PROJECT_PATTERNS,
     TOOL_PATH_ENV_VARS, ToolPathEnvVar, ToolPathOverride, ToolRoot, active_tool_dirs, app_dirs,
-    copilot_ro_protect_paths, current_uid, exec_write_conflicts, home_config_link_targets,
-    home_tool_dirs, linux_docker_socket_paths, linux_runtime_dirs, mise_ro_protect_paths,
-    nested_alternation, path_bin_dirs, playwright_runtime_intent, relocatable_tool_prefix,
-    socket_mask_paths, tool_override_path_is_safe, tool_path_env_overrides,
-    validate_playwright_socket_dir, validate_sbpl_path, xdg_runtime_dir_env,
+    copilot_ro_protect_paths, credential_link_hop, current_uid, exec_write_conflicts,
+    home_config_link_targets, home_tool_dirs, linux_docker_socket_paths, linux_runtime_dirs,
+    mise_ro_protect_paths, nested_alternation, path_bin_dirs, playwright_runtime_intent,
+    relocatable_tool_prefix, socket_mask_paths, tool_override_path_is_safe,
+    tool_path_env_overrides, validate_playwright_socket_dir, validate_sbpl_path,
+    xdg_runtime_dir_env,
 };
 
 // SBPL profile generation — kept public for unit tests.
@@ -1283,7 +1284,7 @@ fn prepare_impl(
     let deny_masks = bubblewrap::build_deny_masks(
         config.extra_deny,
         &socket_masks,
-        &credential_targets,
+        &credential_links,
         config.scratch_dir,
     );
 
@@ -1629,6 +1630,7 @@ mod tests {
         std::fs::create_dir(&ssh).unwrap();
         let links = [landlock_mod::CredentialLink {
             rel: ".ssh",
+            named: dotfiles.join(".ssh"),
             target: ssh.clone(),
             grant: dotfiles.clone(),
         }];
@@ -1644,7 +1646,7 @@ mod tests {
             assert!(w[0].contains(&part), "missing {part:?} in {}", w[0]);
         }
 
-        let masked = bubblewrap::build_deny_masks(&[], &[], std::slice::from_ref(&ssh), None);
+        let masked = bubblewrap::build_deny_masks(&[], &[], &links, None);
         assert!(unmasked_credential_warnings(&links, Some(&masked)).is_empty());
 
         let unmasked = bubblewrap::build_deny_masks(&[], &[], &[], None);

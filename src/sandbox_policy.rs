@@ -215,14 +215,11 @@ pub fn grant_is_refused(home: &Path, path: &Path) -> bool {
 /// credentials are their own files.
 #[must_use]
 pub fn first_party_read_target(home: &Path, path: &Path) -> Option<PathBuf> {
-    use std::os::unix::fs::MetadataExt;
     if grant_is_refused(home, path) {
         return None;
     }
     let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    if let Ok(meta) = std::fs::metadata(&target)
-        && (!meta.is_file() || (meta.nlink() > 1 && meta.uid() == current_uid()))
-    {
+    if !is_plain_file_or_absent(&target) {
         return None;
     }
     let in_denied_dir = DENIED_DOTFILES.iter().any(|d| {
@@ -235,11 +232,26 @@ pub fn first_party_read_target(home: &Path, path: &Path) -> Option<PathBuf> {
     Some(target)
 }
 
+/// Whether the (canonical) file target of a first-party grant is safe to
+/// grant as a file: absent, or a regular file without a second hard link the
+/// user could have planted. A directory would make the Landlock rule
+/// recursive; a user-owned hardlink canonicalizes to itself while exposing
+/// another name's inode. See [`first_party_read_target`].
+fn is_plain_file_or_absent(target: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(target).map_or(true, |m| {
+        m.is_file() && !(m.nlink() > 1 && m.uid() == current_uid())
+    })
+}
+
 /// Whether the canonical `target` lies inside or contains a
 /// [`DENIED_DOTFILES`] or [`DENIED_FILES`] entry, or cplt's state directory
-/// wherever `CPLT_CONFIG` puts it. Compared canonicalized: a Landlock rule on
-/// `target` follows links and is recursive, so containment is a leak too.
-fn overlaps_credential_entry(home: &Path, target: &Path) -> bool {
+/// wherever `CPLT_CONFIG` puts it, or contains a [`DENIED_HOME_SUBPATHS`] file
+/// not spelled under `own` (the grant's own `$HOME` path: `~/.m2/settings.xml`
+/// under a linked `~/.m2` is the documented Landlock limit, not a link leak).
+/// Compared canonicalized: a Landlock rule on `target` follows links and is
+/// recursive, so containment is a leak too.
+fn overlaps_credential_entry(home: &Path, target: &Path, own: &Path) -> bool {
     let canon = config::canonicalize_deepest;
     let overlaps = |denied: PathBuf| denied.starts_with(target) || target.starts_with(&denied);
     DENIED_DOTFILES
@@ -250,6 +262,74 @@ fn overlaps_credential_entry(home: &Path, target: &Path) -> bool {
             .into_iter()
             .flatten()
             .any(|dir| overlaps(canon(&dir)))
+        || DENIED_HOME_SUBPATHS.iter().any(|f| {
+            let named = home.join(f);
+            !named.starts_with(own) && canon(&named).starts_with(target)
+        })
+}
+
+/// Whether `path` enters the credential entry `named` (its `$HOME` spelling,
+/// parent canonical) or its resolved `entry` by one of those two names, and
+/// resolves under it with no further symlink (#551).
+///
+/// `~/.ssh/known_hosts` and `~/dotfiles/ssh/known_hosts` do, for `~/.ssh ->
+/// ~/dotfiles/ssh`. `~/dotfiles/docs/hosts -> ../ssh/id_ed25519` does not: the
+/// hop is a link the agent can plant or repoint inside a writable tree, and
+/// the spelling that was approved names neither the entry nor the key.
+#[must_use]
+pub fn reaches_entry_directly(path: &Path, named: &Path, entry: &Path) -> bool {
+    let canon = config::canonicalize_deepest;
+    let resolved = canon(path);
+    path.ancestors().any(|a| {
+        let (Some(parent), Some(name)) = (a.parent(), a.file_name()) else {
+            return false;
+        };
+        let at = canon(parent).join(name);
+        (at == named || at == entry)
+            && path
+                .strip_prefix(a)
+                .is_ok_and(|rest| entry.join(rest) == resolved)
+    })
+}
+
+/// Every credential entry as `(rel, named, entry)`: the list entry, its
+/// `$HOME` spelling with the parent resolved, and where it resolves.
+#[must_use]
+pub fn credential_entries(home: &Path) -> Vec<(&'static str, PathBuf, PathBuf)> {
+    let canon = config::canonicalize_deepest;
+    DENIED_DOTFILES
+        .iter()
+        .chain(DENIED_FILES)
+        .chain(DENIED_HOME_SUBPATHS)
+        .map(|&rel| {
+            let spelled = home.join(rel);
+            let named = match (spelled.parent(), spelled.file_name()) {
+                (Some(p), Some(n)) => canon(p).join(n),
+                _ => spelled.clone(),
+            };
+            (rel, named, canon(&spelled))
+        })
+        .collect()
+}
+
+/// Where the grant `spelled` (absolute, before canonicalizing) lands when it
+/// resolves into a credential entry through a symlink other than the entry's
+/// own ([`reaches_entry_directly`]), or `None`.
+///
+/// Allow paths are canonicalized at load, so this is the last point that sees
+/// the spelling. Without it, a repo-approved `allow.read docs/hosts` the agent
+/// repoints to `../ssh/id_ed25519` (with `~/.ssh -> ~/dotfiles/ssh`) would
+/// arrive as a grant naming the key, and Bubblewrap binds such a grant back
+/// over the credential mask (#551).
+#[must_use]
+pub fn credential_link_hop(home: &Path, spelled: &Path) -> Option<PathBuf> {
+    let resolved = config::canonicalize_deepest(spelled);
+    credential_entries(home)
+        .iter()
+        .any(|(_, named, entry)| {
+            resolved.starts_with(entry) && !reaches_entry_directly(spelled, named, entry)
+        })
+        .then_some(resolved)
 }
 
 /// Where a first-party grant on `path` lands when a symlink moves it onto,
@@ -258,7 +338,8 @@ fn overlaps_credential_entry(home: &Path, target: &Path) -> bool {
 /// The directory counterpart of [`first_party_read_target`], for the AppDir
 /// and agent-dir grants (#551). Landlock follows the link and a rule is
 /// recursive, so `~/.claude -> ~/.aws`, or `~/.claude -> ~/dotfiles` with
-/// `~/.ssh -> ~/dotfiles/ssh`, would grant the credentials. Only a path a
+/// `~/.ssh -> ~/dotfiles/ssh` or `~/.npmrc -> ~/dotfiles/npmrc`, would grant
+/// the credentials. Only a path a
 /// symlink moves is vetted, as in [`ResolvedToolDir::refused_target`].
 #[must_use]
 pub fn refused_first_party_dir(home: &Path, path: &Path) -> Option<PathBuf> {
@@ -268,7 +349,7 @@ pub fn refused_first_party_dir(home: &Path, path: &Path) -> Option<PathBuf> {
         Ok(rel) => canon(home).join(rel) == target,
         Err(_) => target == path,
     };
-    (!unmoved && overlaps_credential_entry(home, &target)).then_some(target)
+    (!unmoved && overlaps_credential_entry(home, &target, path)).then_some(target)
 }
 
 /// Where `~/.gnupg/{file}` resolves, or `None` when `--allow-gpg-signing`
@@ -278,7 +359,10 @@ pub fn refused_first_party_dir(home: &Path, path: &Path) -> Option<PathBuf> {
 /// its resolved directory is fine, `~/.gnupg -> ~/dotfiles/gnupg` included. A
 /// target outside it, under GnuPG's private keys, or inside another
 /// credential entry is refused: Landlock follows the link, so
-/// `pubring.kbx -> ~/.ssh/id_ed25519` would be a read grant on the key.
+/// `pubring.kbx -> ~/.ssh/id_ed25519` would be a read grant on the key. So is
+/// a target that is not a regular file, as in [`first_party_read_target`]:
+/// `common.conf -> .` resolves inside `~/.gnupg` and would grant all of it,
+/// private keys included.
 #[must_use]
 pub fn gpg_signing_file_target(home: &Path, file: &str) -> Option<PathBuf> {
     let canon = config::canonicalize_deepest;
@@ -293,7 +377,8 @@ pub fn gpg_signing_file_target(home: &Path, file: &str) -> Option<PathBuf> {
         .chain(DENIED_HOME_SUBPATHS)
         .filter(|d| **d != ".gnupg")
         .any(|d| target.starts_with(canon(&home.join(d))));
-    (target.starts_with(&gnupg) && !private && !other).then_some(target)
+    (target.starts_with(&gnupg) && !private && !other && is_plain_file_or_absent(&target))
+        .then_some(target)
 }
 
 /// Exact-path membership of `path` in a `$HOME`-relative deny list, comparing
@@ -2077,12 +2162,7 @@ impl ResolvedToolDir {
         {
             return None;
         }
-        let overlaps_denied = overlaps_credential_entry(home, target)
-            || DENIED_HOME_SUBPATHS.iter().any(|f| {
-                let named = home.join(f);
-                !named.starts_with(&self.path) && canon(&named).starts_with(target)
-            });
-        (overlaps_denied
+        (overlaps_credential_entry(home, target, &self.path)
             || grant_is_refused(home, target)
             || (cfg!(target_os = "macos") && validate_sbpl_path(target).is_err())
             || !tool_override_path_is_safe(target, &canon(home)))
@@ -3161,6 +3241,39 @@ pub const EXEC_IN_WRITABLE: &[ExecInWritable] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #551 review: an allow path that reaches a credential through a link of
+    /// its own (`docs/hosts -> ../ssh/id_ed25519` in the repo holding the
+    /// linked `~/.ssh`) is refused at load; one spelled through `~/.ssh`, or
+    /// naming the resolved file, is not.
+    #[test]
+    fn an_allow_path_reaching_a_credential_through_its_own_link_is_refused() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        let ssh = home.join("dotfiles/ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        std::fs::create_dir_all(home.join("dotfiles/docs")).unwrap();
+        std::fs::write(ssh.join("id_ed25519"), "key").unwrap();
+        std::fs::write(ssh.join("known_hosts"), "hosts").unwrap();
+        symlink(&ssh, home.join(".ssh")).unwrap();
+        symlink("../ssh/id_ed25519", home.join("dotfiles/docs/hosts")).unwrap();
+        symlink("../ssh", home.join("dotfiles/docs/sshdir")).unwrap();
+
+        for bad in ["dotfiles/docs/hosts", "dotfiles/docs/sshdir/known_hosts"] {
+            assert!(
+                credential_link_hop(&home, &home.join(bad)).is_some(),
+                "{bad} must be refused"
+            );
+        }
+        for ok in [
+            ".ssh/known_hosts",
+            "dotfiles/ssh/known_hosts",
+            "dotfiles/docs",
+        ] {
+            assert_eq!(credential_link_hop(&home, &home.join(ok)), None, "{ok}");
+        }
+    }
 
     /// Only live `docker.sock` sockets are returned, from every profile and from
     /// `$COLIMA_HOME` -- never the profile's config, and never a symlink, which a

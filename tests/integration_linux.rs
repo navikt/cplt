@@ -2669,11 +2669,27 @@ print('CONNECTED')
         fs::create_dir_all(&ssh).expect("mkdir ssh");
         fs::write(ssh.join("id_ed25519"), "TOP-SECRET-KEY").expect("write key");
         fs::write(ssh.join("known_hosts"), "KNOWN-HOSTS").expect("write hosts");
+        fs::create_dir_all(ssh.join("config.d")).expect("mkdir config.d");
+        // A directory, so the deny is a tmpfs: a file mask's mode-000
+        // placeholder does not stop root, and these tests run as root in CI
+        // containers.
+        fs::create_dir_all(ssh.join("config.d/work")).expect("mkdir work");
+        fs::write(ssh.join("config.d/work/conf"), "WORK-CONFIG").expect("write work");
+        fs::write(ssh.join("config.d/home"), "HOME-CONFIG").expect("write home");
         std::os::unix::fs::symlink(&ssh, home.path().join(".ssh")).expect("link ~/.ssh");
+        // Review item 1: a link planted in the project, onto the key.
+        fs::create_dir_all(dotfiles.join("docs")).expect("mkdir docs");
+        std::os::unix::fs::symlink("../ssh/.ssh/id_ed25519", dotfiles.join("docs/hosts"))
+            .expect("plant docs/hosts");
         let known_hosts = home.path().join(".ssh/known_hosts");
+        let config_d = home.path().join(".ssh/config.d");
+        let work = home.path().join(".ssh/config.d/work");
+        let planted = dotfiles.join("docs/hosts");
         let d = dotfiles.display();
         let script = &format!(
             "cat ~/.ssh/known_hosts; cat ~/.ssh/id_ed25519; \
+             cat ~/.ssh/config.d/home; cat ~/.ssh/config.d/work/conf; \
+             (echo x >> ~/.ssh/known_hosts) 2>/dev/null && echo HOSTS-WRITTEN || echo HOSTS-RO; \
              mv '{d}/ssh' '{d}/ssh2' 2>/dev/null && echo MOVED || echo PINNED"
         );
 
@@ -2684,13 +2700,23 @@ print('CONNECTED')
                 "--use-bubblewrap",
                 "--allow-read",
                 &known_hosts.to_string_lossy(),
+                "--allow-read",
+                &config_d.to_string_lossy(),
+                "--deny-path",
+                &work.to_string_lossy(),
+                "--allow-read",
+                &planted.to_string_lossy(),
             ],
             script,
         );
         assert!(
             stdout.contains("KNOWN-HOSTS")
                 && !stdout.contains("TOP-SECRET")
-                && stdout.contains("PINNED"),
+                && stdout.contains("HOME-CONFIG")
+                && !stdout.contains("WORK-CONFIG")
+                && stdout.contains("HOSTS-RO")
+                && stdout.contains("PINNED")
+                && stderr.contains("through a symlink"),
             "code: {code}, stdout: {stdout}, stderr: {stderr}"
         );
 

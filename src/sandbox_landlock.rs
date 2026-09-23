@@ -401,6 +401,8 @@ fn refused_link(home: &Path, path: &Path, what: &str) -> bool {
 pub struct CredentialLink {
     /// The `DENIED_DOTFILES` / `DENIED_FILES` / `DENIED_HOME_SUBPATHS` entry.
     pub rel: &'static str,
+    /// `~/{rel}` with its parent resolved ([`policy::credential_entries`]).
+    pub named: PathBuf,
     /// Where `~/{rel}` resolves. Canonical, and it exists.
     pub target: PathBuf,
     /// The rule path whose tree holds `target`.
@@ -416,8 +418,11 @@ pub struct CredentialLink {
 /// Left out: an entry that resolves to its own `$HOME` spelling (no link), a
 /// target that does not exist (nothing to mask), and one a rule grants on
 /// purpose: `--allow-docker`'s `~/.docker`, a user `allow.read` naming the
-/// resolved file, or a `DENIED_HOME_SUBPATHS` file under its own tool dir,
-/// which is the documented Landlock limit whether linked or not.
+/// resolved file with no symlink of its own in between
+/// ([`policy::reaches_entry_directly`]), or a `DENIED_HOME_SUBPATHS` file that
+/// resolves inside its own granted tool dir, which is the documented Landlock
+/// limit whether linked or not. One that links out of that dir is masked: the
+/// tool dir's rule does not reach it, only another grant does.
 #[must_use]
 #[cfg(target_os = "linux")]
 pub fn credential_links(home: &Path, rules: &[FsRule]) -> Vec<CredentialLink> {
@@ -426,32 +431,33 @@ pub fn credential_links(home: &Path, rules: &[FsRule]) -> Vec<CredentialLink> {
         .iter()
         .filter_map(|r| Some((r.path.as_path(), std::fs::canonicalize(&r.path).ok()?)))
         .collect();
-    let lists = [
-        (policy::DENIED_DOTFILES, false),
-        (policy::DENIED_FILES, false),
-        (policy::DENIED_HOME_SUBPATHS, true),
-    ];
     let mut out = Vec::new();
-    for (list, subpath) in lists {
-        for &rel in list {
-            let named = home.join(rel);
-            let target = crate::config::canonicalize_deepest(&named);
-            if target == canon_home.join(rel) || !target.exists() {
-                continue;
-            }
-            let on_purpose = granted.iter().any(|(path, canon)| {
-                *path == named || *canon == target || (subpath && named.starts_with(path))
+    for (rel, named, target) in policy::credential_entries(home) {
+        if target == canon_home.join(rel) || !target.exists() {
+            continue;
+        }
+        let subpath = policy::DENIED_HOME_SUBPATHS.contains(&rel);
+        let spelled = home.join(rel);
+        // A rule that names the entry or its target itself, not one a symlink
+        // inside a granted tree carries there (the agent can plant that). A
+        // tool dir rule covers its subpath file only where the file resolves
+        // inside it: `~/.m2/settings.xml -> ~/dotfiles/m2.xml` is out of the
+        // `~/.m2` rule's reach, and only another grant exposes it.
+        let on_purpose = granted.iter().any(|(path, canon)| {
+            *path == spelled
+                || (*canon == target && policy::reaches_entry_directly(path, &named, &target))
+                || (subpath && spelled.starts_with(path) && target.starts_with(canon))
+        });
+        if on_purpose {
+            continue;
+        }
+        if let Some((_, grant)) = granted.iter().find(|(_, c)| target.starts_with(c)) {
+            out.push(CredentialLink {
+                rel,
+                named,
+                target,
+                grant: grant.clone(),
             });
-            if on_purpose {
-                continue;
-            }
-            if let Some((_, grant)) = granted.iter().find(|(_, c)| target.starts_with(c)) {
-                out.push(CredentialLink {
-                    rel,
-                    target,
-                    grant: grant.clone(),
-                });
-            }
         }
     }
     out
@@ -4163,11 +4169,17 @@ mod tests {
         std::fs::write(home.join(".ssh/id_ed25519"), "key").unwrap();
         std::fs::write(home.join("elsewhere"), "x").unwrap();
         std::fs::write(gnupg.join("gpg.conf"), "").unwrap();
-        std::fs::write(gnupg.join("trustdb.gpg"), "").unwrap();
+        std::fs::write(gnupg.join("private-keys-v1.d/k.key"), "").unwrap();
         symlink(&gnupg, home.join(".gnupg")).unwrap();
         symlink(home.join(".ssh/id_ed25519"), gnupg.join("pubring.kbx")).unwrap();
         symlink(home.join("elsewhere"), gnupg.join("pubring.gpg")).unwrap();
-        symlink(gnupg.join("private-keys-v1.d"), gnupg.join("common.conf")).unwrap();
+        symlink(
+            gnupg.join("private-keys-v1.d/k.key"),
+            gnupg.join("trustdb.gpg"),
+        )
+        .unwrap();
+        // Inside ~/.gnupg, but a directory: the rule would grant all of it.
+        symlink(".", gnupg.join("common.conf")).unwrap();
 
         let project = home.join("project");
         let mut config = test_config(&project, &home);
@@ -4177,8 +4189,8 @@ mod tests {
             let p = home.join(".gnupg").join(f);
             policy.fs_rules.iter().any(|r| r.path == p)
         };
-        assert!(granted("gpg.conf") && granted("trustdb.gpg"));
-        for f in ["pubring.kbx", "pubring.gpg", "common.conf"] {
+        assert!(granted("gpg.conf"));
+        for f in ["pubring.kbx", "pubring.gpg", "trustdb.gpg", "common.conf"] {
             assert!(
                 !granted(f),
                 "{f} links out of ~/.gnupg and must not be granted"
@@ -4195,9 +4207,19 @@ mod tests {
         use std::os::unix::fs::symlink;
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().canonicalize().unwrap();
-        for d in [".aws", "dotfiles/ssh", "harmless", ".config/opencode"] {
+        for d in [
+            ".aws",
+            "dotfiles/ssh",
+            "harmless",
+            ".config/opencode",
+            "npmdots",
+        ] {
             std::fs::create_dir_all(home.join(d)).unwrap();
         }
+        // `~/.codex -> ~/npmdots` holds the linked `~/.npmrc` (review item 4).
+        std::fs::write(home.join("npmdots/npmrc"), "token").unwrap();
+        symlink(home.join("npmdots/npmrc"), home.join(".npmrc")).unwrap();
+        symlink(home.join("npmdots"), home.join(".codex")).unwrap();
         std::fs::write(home.join("dotfiles/ssh/id_ed25519"), "key").unwrap();
         symlink(home.join("dotfiles/ssh"), home.join(".ssh")).unwrap();
         symlink(home.join(".aws"), home.join(".claude")).unwrap();
@@ -4229,6 +4251,7 @@ mod tests {
             dir(home.join(".claude"), vec![]),
             dir(home.join(".gemini"), vec![]),
             dir(home.join(".pi"), vec![]),
+            dir(home.join(".codex"), vec![]),
             dir(home.join(".config/opencode"), vec!["auth.json"]),
         ];
         let project = home.join("project");
@@ -4239,6 +4262,7 @@ mod tests {
 
         assert!(!granted(&home.join(".claude")), "linked into ~/.aws");
         assert!(!granted(&home.join(".gemini")), "holds the linked ~/.ssh");
+        assert!(!granted(&home.join(".codex")), "holds the linked ~/.npmrc");
         assert!(
             !granted(&app),
             "AppDir {} linked into ~/.aws",
@@ -4252,6 +4276,49 @@ mod tests {
         assert!(
             granted(&home.join(".config/opencode")),
             "an unlinked dir stays"
+        );
+    }
+
+    /// #551 review: a `DENIED_HOME_SUBPATHS` file is exempt from its mask
+    /// only where it resolves inside its own granted tool dir. Linked out of
+    /// `~/.m2`, the `~/.m2` rule no longer reaches it, and the grant that does
+    /// gets it masked.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_subpath_file_linked_out_of_its_tool_dir_is_masked() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(home.join(".m2")).unwrap();
+        std::fs::create_dir_all(home.join("dotfiles/m2")).unwrap();
+        std::fs::write(home.join("dotfiles/m2.xml"), "pw").unwrap();
+        symlink(home.join("dotfiles/m2.xml"), home.join(".m2/settings.xml")).unwrap();
+        let rule = |p: PathBuf| FsRule {
+            path: p,
+            access: FsAccess {
+                read: true,
+                write: true,
+                execute: false,
+                ioctl: false,
+                create_dirs: false,
+            },
+        };
+        let rules = [rule(home.join(".m2")), rule(home.join("dotfiles"))];
+        let links = credential_links(&home, &rules);
+        assert!(
+            links.iter().any(|l| l.rel == ".m2/settings.xml"),
+            "{links:?}"
+        );
+
+        // `~/.m2` linked whole: the file resolves inside the tool dir's own
+        // grant, the documented Landlock limit, and is left alone.
+        std::fs::remove_dir_all(home.join(".m2")).unwrap();
+        std::fs::write(home.join("dotfiles/m2/settings.xml"), "pw").unwrap();
+        symlink(home.join("dotfiles/m2"), home.join(".m2")).unwrap();
+        let links = credential_links(&home, &rules);
+        assert!(
+            !links.iter().any(|l| l.rel == ".m2/settings.xml"),
+            "{links:?}"
         );
     }
 
