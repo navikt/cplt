@@ -5342,21 +5342,25 @@ exit $r";
     }
 }
 
+/// Credential paths the "read is blocked" probe may pick, in preference order.
+/// Each must be a `DENIED_FILES` entry or lie inside a `DENIED_DOTFILES`
+/// directory, so both backends deny it. `~/.config/gh/hosts.yml` is not here:
+/// it is granted read-only (`HOME_CONFIG_FILES`) so `gh auth token` works.
+const PROTECTED_READ_CANDIDATES: &[&str] = &[
+    ".ssh/id_rsa",
+    ".ssh/id_ed25519",
+    ".ssh",
+    ".aws/credentials",
+    ".aws",
+    ".netrc",
+    ".gnupg",
+];
+
 /// Pick a known-protected credential path that exists on this host, for the
 /// enforcement battery's "read is blocked" demonstration. Falls back to the
 /// home directory root (always present and never listable in the sandbox).
 fn pick_protected_read(home: &Path) -> (PathBuf, String) {
-    const CANDIDATES: &[&str] = &[
-        ".ssh/id_rsa",
-        ".ssh/id_ed25519",
-        ".ssh",
-        ".aws/credentials",
-        ".aws",
-        ".config/gh/hosts.yml",
-        ".netrc",
-        ".gnupg",
-    ];
-    for c in CANDIDATES {
+    for c in PROTECTED_READ_CANDIDATES {
         let p = home.join(c);
         if p.exists() {
             return (p, format!("read ~/{c}"));
@@ -9039,6 +9043,26 @@ fn start_denial_stream() -> Option<std::process::Child> {
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod tests {
+    /// #553: every path the "read is blocked" probe can pick must really be
+    /// denied on both backends, or `cplt check` reports a failure that is not
+    /// one on a host where only that path exists.
+    #[test]
+    fn every_protected_read_candidate_is_denied() {
+        use cplt::sandbox::{DENIED_DOTFILES, DENIED_FILES};
+        for c in super::PROTECTED_READ_CANDIDATES {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let path = tmp.path().join(c);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&path, b"").expect("write");
+            let (picked, _) = super::pick_protected_read(tmp.path());
+            assert_eq!(picked, path, "{c} was not picked");
+            let rel = picked.strip_prefix(tmp.path()).expect("under home");
+            let denied = DENIED_FILES.iter().any(|f| rel == std::path::Path::new(f))
+                || DENIED_DOTFILES.iter().any(|d| rel.starts_with(d));
+            assert!(denied, "{c} is not denied on both backends");
+        }
+    }
+
     /// #426: an allowlist the agent can edit is not an allowlist. Both proxy
     /// list files are re-read every few seconds by design, so one inside the
     /// project directory or an `allow.write` grant lets the sandboxed process
