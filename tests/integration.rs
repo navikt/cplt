@@ -1518,6 +1518,144 @@ mod macos_tests {
         );
     }
 
+    /// A fixture home where `~/.ssh -> dots/ssh` and `~/.netrc -> dots/netrc`,
+    /// the layout stow, chezmoi and hand-rolled dotfiles repos produce.
+    ///
+    /// Under `CARGO_TARGET_TMPDIR`, not the system temp dir: the profile grants
+    /// `/private/var/folders` and `/private/tmp`, and a home under either would
+    /// be readable whatever the credential denies say.
+    fn symlinked_credentials_home() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let home = fs::canonicalize(dir.path()).unwrap();
+        fs::create_dir_all(home.join("dots/ssh")).unwrap();
+        fs::write(home.join("dots/ssh/id_ed25519"), "cplt-test-private-key\n").unwrap();
+        fs::write(
+            home.join("dots/netrc"),
+            "machine x password cplt-test-netrc\n",
+        )
+        .unwrap();
+        fs::write(home.join("dots/README"), "cplt-test-control\n").unwrap();
+        std::os::unix::fs::symlink("dots/ssh", home.join(".ssh")).unwrap();
+        std::os::unix::fs::symlink("dots/netrc", home.join(".netrc")).unwrap();
+        (dir, home)
+    }
+
+    /// Whether `cat` inside the sandbox can read each path, in order.
+    fn readable(profile: &PathBuf, paths: &[PathBuf]) -> Vec<bool> {
+        paths
+            .iter()
+            .map(|p| run_sandboxed(profile, &format!("cat '{}'", p.display())).1)
+            .collect()
+    }
+
+    /// What an SBPL path filter matches when the path goes through a symlink.
+    ///
+    /// Observed on macOS 26 (Darwin 25): the rule is checked against the
+    /// resolved path only. A `subpath` or `literal` naming the link spelling
+    /// matches nothing once a symlink sits on the way, whichever spelling the
+    /// process opened. So a credential deny that names only `~/.ssh` does not
+    /// protect a key whose directory is a symlink, and a grant covering the
+    /// target wins.
+    #[test]
+    fn sbpl_path_filters_match_the_resolved_path_only() {
+        require_sandbox!();
+        let (_dir, home) = symlinked_credentials_home();
+        let h = home.display();
+        let key_paths = [
+            home.join(".ssh/id_ed25519"),
+            home.join("dots/ssh/id_ed25519"),
+        ];
+        let base = "(version 1)(deny default)\
+            (import \"/System/Library/Sandbox/Profiles/bsd.sb\")\
+            (allow process-exec)(allow process-fork)(allow file-read-metadata)\
+            (allow file-read* (subpath \"/usr\") (subpath \"/bin\") (subpath \"/System\")\
+             (subpath \"/Library\") (subpath \"/private/var/db\") (subpath \"/dev\"))";
+
+        // Case A: a deny on the link spelling, a grant on the target.
+        let case_a = unique_profile_path();
+        fs::write(
+            &case_a,
+            format!(
+                "{base}(deny file-read* (subpath \"{h}/.ssh\"))\
+                 (allow file-read* (subpath \"{h}/dots\"))"
+            ),
+        )
+        .unwrap();
+        // Case B: only a literal allow, on the link spelling.
+        let case_b = unique_profile_path();
+        fs::write(
+            &case_b,
+            format!("{base}(allow file-read* (literal \"{h}/.ssh/id_ed25519\"))"),
+        )
+        .unwrap();
+
+        let a = readable(&case_a, &key_paths);
+        let b = readable(&case_b, &key_paths);
+        fs::remove_file(&case_a).ok();
+        fs::remove_file(&case_b).ok();
+        assert_eq!(
+            a,
+            [true, true],
+            "a deny naming the link spelling does not reach either spelling"
+        );
+        assert_eq!(
+            b,
+            [false, false],
+            "a literal allow naming the link spelling does not open either spelling"
+        );
+    }
+
+    /// The shipped profile denies a credential through both spellings when
+    /// the credential is a symlink into a granted directory: here the project
+    /// dir is the dotfiles repo itself.
+    #[test]
+    fn real_profile_denies_symlinked_credentials_at_the_target() {
+        require_sandbox!();
+        let (_dir, home) = symlinked_credentials_home();
+        let dots = home.join("dots");
+        let profile = write_real_profile(&default_opts(&dots, &home));
+
+        let got = readable(
+            &profile,
+            &[
+                dots.join("README"),
+                home.join(".ssh/id_ed25519"),
+                dots.join("ssh/id_ed25519"),
+                home.join(".netrc"),
+                dots.join("netrc"),
+            ],
+        );
+        fs::remove_file(&profile).ok();
+        assert_eq!(
+            got,
+            [true, false, false, false, false],
+            "control, key via link, key via target, netrc via link, netrc via target"
+        );
+
+        // A per-file allow.read inside the linked `~/.ssh` still works through
+        // both spellings, and the key beside it stays denied. `extra_read`
+        // holds the canonical path, as config resolution would put it there.
+        fs::write(dots.join("ssh/known_hosts"), "cplt-test-known-host\n").unwrap();
+        let extra_read = [dots.join("ssh/known_hosts")];
+        let mut opts = default_opts(&dots, &home);
+        opts.extra_read = &extra_read;
+        let profile = write_real_profile(&opts);
+        let got = readable(
+            &profile,
+            &[
+                home.join(".ssh/known_hosts"),
+                dots.join("ssh/known_hosts"),
+                home.join(".ssh/id_ed25519"),
+            ],
+        );
+        fs::remove_file(&profile).ok();
+        assert_eq!(
+            got,
+            [true, true, false],
+            "known_hosts via link, via target, key via link"
+        );
+    }
+
     /// The other half of the reverse case: no `~/.gitconfig` at all. Git must
     /// run clean rather than trip over a rule naming a path that is not there.
     #[test]

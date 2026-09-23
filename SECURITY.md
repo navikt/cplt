@@ -926,6 +926,10 @@ Files denied by default, overridable via `--allow-read` for private registries:
 
 SBPL resolves symlink targets at the kernel VFS layer during path evaluation. cplt includes integration tests that demonstrate this: reading a denied file such as `.env` through a symlink with an innocuous name is blocked by the kernel.
 
+The flip side: an SBPL rule is checked against the resolved path only, and a rule naming the link spelling matches nothing once a symlink sits on the way (`sbpl_path_filters_match_the_resolved_path_only` in `tests/integration.rs`). A dotfiles home where `~/.ssh -> ~/dotfiles/ssh` or `~/.netrc -> ~/dotfiles/netrc` was therefore unprotected on macOS whenever a grant covered the target, for example a project directory, `--repo-dir` root or `allow.read` on `~/dotfiles`. The credential directory and file denies above, the git config write denies and the GPG and Docker rules now name both the `$HOME` path and its resolved target, resolved as deep as the path exists, as the `DENIED_HOME_SUBPATHS` denies and re-allows already did for symlinked tool directories ([#543](https://github.com/navikt/cplt/pull/543)). A target whose path contains a character cplt refuses to put in a profile (`"`, `(`, `)`, `;`, `\`) is still left out.
+
+On **Linux** the same layout stays exposed and this is not fixed: Landlock is grant-only, so a grant on `~/dotfiles` covers `~/dotfiles/ssh` whatever `~/.ssh` points at, and bubblewrap masks only `--deny-path` entries and the built-in socket set, not the credential lists. It is the same limit as a grant on an ancestor of `~/.ssh`.
+
 #### Tool directory permissions
 
 Home tool directories (`~/.cargo`, `~/.nvm`, and friends) use a per-directory permission model (`HomeToolDir`) with granular `process_exec`, `map_exec`, and `write` flags:
@@ -1271,7 +1275,7 @@ This is **not key theft**. The attacker cannot take the key with them, and opera
 
 **Known limitations:**
 - `GNUPGHOME` is not in `ENV_ALLOWLIST`, but it could be injected via `--pass-env` or `--inherit-env`, redirecting GPG to a directory outside the SBPL policy. The SBPL rules only cover `~/.gnupg/`.
-- If `~/.gnupg` is a symlink, SBPL path resolution may cause rules not to match as expected. Signing then fails closed, with no access, rather than open.
+- If `~/.gnupg` is a symlink, the GPG rules are emitted at its resolved target as well (see [Symlink attack protection](#symlink-attack-protection)). Signing through a symlinked `~/.gnupg` has no end-to-end test.
 
 ### Network limitations
 
