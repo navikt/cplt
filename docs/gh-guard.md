@@ -72,6 +72,7 @@ block_auth_token = true     # deny "gh auth token" exfiltration
 inject_token = false        # inject GH_TOKEN into sandbox (opt-in)
 unknown_command = "block"   # block|allow unrecognized gh commands
 allow_api_write = false     # allow gh api write (POST/PUT/PATCH) to current repo (opt-in)
+allow_pr_merge = false      # allow gh pr merge into a ruleset-protected branch (opt-in)
 
 [git_guard]
 enabled = true              # intercept git push, request-pull, send-pack
@@ -309,6 +310,7 @@ subcommand.
 | `-X DELETE` | Block | Block | Destructive, always blocked |
 | `-f`, `-F`, or `--input` present | Block | ScopeCheck | Input implies write, opt-in required |
 | `graphql` endpoint | Block | Block | Arbitrary mutations possible, always blocked |
+| Write to `repos/{o}/{r}/pulls/{n}/merge` or `repos/{o}/{r}/merges` | Block | Block | A merge must go through `gh pr merge` and its `allow_pr_merge` check |
 
 Note that `allow_api_write = true` scope-checks writes rather than freeing them.
 Cross-repo writes are still denied.
@@ -413,7 +415,7 @@ What the gh/git guard stops, and what it does not.
 
 | Threat | How it's stopped |
 |--------|-----------------|
-| Agent merges a PR without human review | `gh pr merge` is in the Block tier, always denied |
+| Agent merges a PR without human review | `gh pr merge` is in the Block tier. With `allow_pr_merge = true` it is allowed only for the account's own PR into a branch where a ruleset the account cannot bypass requires a review or status checks; `--admin` is always refused |
 | Agent deletes a repository | `gh repo delete` is in the Block tier |
 | Agent creates releases or uploads artifacts | `gh release create/upload` blocked |
 | Agent triggers CI workflows | `gh workflow run` blocked |

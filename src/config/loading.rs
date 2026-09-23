@@ -519,6 +519,7 @@ impl Config {
                 .unknown_command
                 .unwrap_or(UnknownCommandPolicy::Block),
             allow_api_write: bools.gh_allow_api_write,
+            allow_pr_merge: bools.gh_allow_pr_merge,
         };
 
         // An `allow_push` rule that names neither a remote nor any branch
@@ -4030,6 +4031,14 @@ mod precedence {
                 cli_on: None,
                 cli_off: None,
                 get: |r| r.gh_guard.allow_api_write,
+                default: false,
+                preset: None,
+            },
+            Ladder {
+                key: "gh_guard.allow_pr_merge",
+                cli_on: None,
+                cli_off: None,
+                get: |r| r.gh_guard.allow_pr_merge,
                 default: false,
                 preset: None,
             },

@@ -340,7 +340,7 @@ pub fn security_confirmation(key_info: &ConfigKeyInfo, value: &str, unset: bool)
                 "enabled" | "prevent_push" | "prevent_force_push",
                 "false"
             )
-            // `inject_token` and `allow_api_write` are not listed here: they
+            // `inject_token`, `allow_api_write` and `allow_pr_merge` are not listed here: they
             // carry `dangerous: true` in the registry and are caught by the
             // branch above. Listing them twice is how the two lists came to
             // disagree about which keys are dangerous in the first place.

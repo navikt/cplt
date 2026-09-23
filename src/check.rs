@@ -822,6 +822,7 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
                 }
             },
             allow_api_write: ctx.gh_guard.allow_api_write,
+            allow_pr_merge: ctx.gh_guard.allow_pr_merge,
         };
         // The scope-aware gate when the launch would have a scope set, the
         // project-dir one otherwise — the same two shapes `sandbox_exec` picks
@@ -837,6 +838,17 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
             )
         };
         return match verdict {
+            // `check` makes no network calls, so it cannot say which way this goes.
+            Ok(approval) if approval.check_merge_protection => ExecExplain {
+                decision: Decision::Allowed,
+                reason: "allowed by gh_guard.allow_pr_merge only if, when it runs, the pull \
+                         request is the authenticated account's own and an active ruleset \
+                         on its base branch that the account cannot bypass requires an \
+                         approving review or status checks; refused otherwise."
+                    .to_string(),
+                fix: None,
+                objection: None,
+            },
             Ok(_) => ExecExplain {
                 decision: Decision::Allowed,
                 reason: "allowed by the gh guard.".to_string(),

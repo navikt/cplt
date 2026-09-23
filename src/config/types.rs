@@ -394,6 +394,10 @@ pub struct GhGuardConfig {
     /// When true, write requests are scope-checked to the current repo.
     /// GraphQL is always blocked regardless of this setting (default: false).
     pub allow_api_write: Option<bool>,
+    /// Allow `gh pr merge` of the authenticated account's own pull requests
+    /// into a branch whose rulesets require a review or status checks
+    /// (default: false). `--admin` is always refused.
+    pub allow_pr_merge: Option<bool>,
 }
 
 /// `[git_guard]` — git command prevention for sandboxed agents.
@@ -728,6 +732,9 @@ pub struct GhGuardPolicy {
     /// Allow `gh api` write operations (POST/PATCH/PUT and input flags),
     /// scope-checked to the current repo. GraphQL remains blocked.
     pub allow_api_write: bool,
+    /// Allow `gh pr merge` under the ruleset condition in
+    /// `gh_proxy::check_merge_protection`.
+    pub allow_pr_merge: bool,
 }
 
 impl Default for GhGuardPolicy {
@@ -740,6 +747,7 @@ impl Default for GhGuardPolicy {
             inject_token: false,
             unknown_command: UnknownCommandPolicy::Block,
             allow_api_write: false,
+            allow_pr_merge: false,
         }
     }
 }

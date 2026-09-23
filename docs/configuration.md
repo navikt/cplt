@@ -466,6 +466,37 @@ cplt --allow-localhost-any --allow-docker --allow-jvm-attach \
 
 `cplt config explain` tells you what a key does and how to set it.
 
+### Letting the agent merge its own pull requests
+
+The gh guard refuses `gh pr merge`. `gh_guard.allow_pr_merge` (default `false`)
+lifts that for one case: a pull request the agent can merge only because the
+repository would stop a bad merge anyway.
+
+```bash
+cplt config set gh_guard.allow_pr_merge true
+```
+
+With the key on, the shim checks each `gh pr merge` when it runs and lets it
+through only when all of these hold:
+
+- the pull request is in the startup repository (or another repository in the
+  scope set);
+- its author is the account `gh` is logged in as, so any approving review it
+  carries came from someone else;
+- an active ruleset on its base branch requires at least one approving review
+  or at least one status check, and that account cannot bypass the ruleset.
+
+Otherwise the merge is refused with the reason. A failed or unreadable GitHub
+response also refuses. `--admin` is always refused, and so is any flag the shim
+does not recognise. `--auto`, `--squash`, `--delete-branch` and the other
+ordinary flags pass. A merge queue alone does not count, and neither does
+classic branch protection, which the check does not read.
+
+A status-check rule alone is enough to pass. It stops a broken merge, not an
+unreviewed one, so if a human must approve every merge, require a review in
+the ruleset. The key applies to every repository you sandbox. `cplt config set
+--local` limits it to one checkout.
+
 ## Policy presets
 
 A preset is a named security posture. One flag or key sets a baseline for the five sandbox toggles and for the safety features (`gh_guard`, `git_guard`, forced-proxy egress, fail-closed domain allowlist):

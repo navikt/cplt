@@ -507,6 +507,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         default_display: "false",
         description: "Allow 'gh api' write operations (POST/PATCH/PUT and input flags). Writes are scope-checked to the current repo. GraphQL is always blocked.",
     },
+    ConfigKeyInfo {
+        section: "gh_guard",
+        key: "allow_pr_merge",
+        value_type: ConfigValueType::Bool,
+        dangerous: true,
+        default_display: "false",
+        description: "Allow 'gh pr merge' of the account's own PRs, in scope, into a branch where an active ruleset the account cannot bypass requires an approving review or status checks. '--admin' is always refused.",
+    },
     // [git_guard]
     ConfigKeyInfo {
         section: "git_guard",
@@ -1036,6 +1044,12 @@ bool_keys! {
         config = |c: &Config| c.gh_guard.allow_api_write,
         baseline = |_: PresetBaseline| false,
         resolved = |r: &Resolved| r.gh_guard.allow_api_write;
+
+    gh_allow_pr_merge, "gh_guard", "allow_pr_merge",
+        cli = |_: &CliFlags| FeatureToggle::UseDefault,
+        config = |c: &Config| c.gh_guard.allow_pr_merge,
+        baseline = |_: PresetBaseline| false,
+        resolved = |r: &Resolved| r.gh_guard.allow_pr_merge;
 
     /// The config layer folds in the deprecated `sandbox.git_push_prevention`
     /// spelling.
