@@ -820,6 +820,7 @@ fn landlock_policy_device_files_have_ioctl() {
         playwright_socket_dir: None,
         allow_tmp_exec: false,
         copilot_install_dir: None,
+        copilot_cache_env: &cplt::sandbox::no_cache_env,
         java_home: None,
         dotnet_root: None,
         git_hooks_path: None,
@@ -2436,6 +2437,7 @@ fn base_profile_options() -> SandboxConfig<'static> {
         playwright_socket_dir: None,
         allow_tmp_exec: false,
         copilot_install_dir: None,
+        copilot_cache_env: &cplt::sandbox::no_cache_env,
         java_home: None,
         dotnet_root: None,
         git_hooks_path: None,
@@ -3868,6 +3870,7 @@ fn allow_localhost_any_affects_both_backends() {
         playwright_socket_dir: None,
         allow_tmp_exec: false,
         copilot_install_dir: None,
+        copilot_cache_env: &cplt::sandbox::no_cache_env,
         java_home: None,
         dotnet_root: None,
         git_hooks_path: None,
@@ -3930,6 +3933,7 @@ fn config_options_parity_across_backends() {
         playwright_socket_dir: None,
         allow_tmp_exec: true,
         copilot_install_dir: None,
+        copilot_cache_env: &cplt::sandbox::no_cache_env,
         java_home: None,
         dotnet_root: None,
         git_hooks_path: None,
@@ -4550,7 +4554,8 @@ fn copilot_ro_protect_paths_cover_both_package_dirs() {
     // Copilot spawns on the host. The bwrap read-only overlay is the only
     // mechanism, so both must be in its set.
     let home = std::path::Path::new("/Users/test");
-    let paths = cplt::sandbox::copilot_ro_protect_paths(cplt::agent::Agent::Copilot, home);
+    let paths =
+        cplt::sandbox::copilot_ro_protect_paths(cplt::agent::Agent::Copilot, home, &|_| None);
     for expected in ["/Users/test/.copilot/pkg", "/Users/test/.cache/copilot/pkg"] {
         assert!(
             paths.contains(&std::path::PathBuf::from(expected)),
@@ -4569,11 +4574,248 @@ fn copilot_ro_protect_paths_are_empty_for_other_agents() {
         cplt::agent::Agent::OpenCode,
     ] {
         assert!(
-            cplt::sandbox::copilot_ro_protect_paths(agent, std::path::Path::new("/Users/test"))
-                .is_empty(),
+            cplt::sandbox::copilot_ro_protect_paths(
+                agent,
+                std::path::Path::new("/Users/test"),
+                &|_| None
+            )
+            .is_empty(),
             "{agent:?} must get no Copilot package binds"
         );
     }
+}
+
+// ============================================================
+// Copilot cache resolver (#374)
+// ============================================================
+
+/// A fixed environment for `copilot_pkg_dir`.
+fn cache_env(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+    let vars: Vec<(String, String)> = vars
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+    move |name| vars.iter().find(|(k, _)| k == name).map(|(_, v)| v.into())
+}
+
+fn resolve_pkg(vars: &[(&str, &str)], os: &str) -> std::path::PathBuf {
+    cplt::sandbox::copilot_pkg_dir(&cache_env(vars), std::path::Path::new("/Users/test"), os)
+}
+
+#[test]
+fn copilot_pkg_dir_defaults_differ_by_platform() {
+    assert_eq!(
+        resolve_pkg(&[], "macos"),
+        std::path::Path::new("/Users/test/Library/Caches/copilot/pkg")
+    );
+    assert_eq!(
+        resolve_pkg(&[], "linux"),
+        std::path::Path::new("/Users/test/.cache/copilot/pkg")
+    );
+}
+
+#[test]
+fn copilot_pkg_dir_prefers_pkg_cache_home() {
+    let vars = [
+        ("COPILOT_PKG_CACHE_HOME", "/opt/pkgcache"),
+        ("COPILOT_CACHE_HOME", "/opt/cache"),
+        ("XDG_CACHE_HOME", "/opt/xdg"),
+    ];
+    for os in ["macos", "linux"] {
+        assert_eq!(
+            resolve_pkg(&vars, os),
+            std::path::Path::new("/opt/pkgcache/pkg")
+        );
+    }
+}
+
+#[test]
+fn copilot_pkg_dir_uses_cache_home_next() {
+    let vars = [
+        ("COPILOT_CACHE_HOME", "/opt/cache"),
+        ("XDG_CACHE_HOME", "/opt/xdg"),
+    ];
+    for os in ["macos", "linux"] {
+        assert_eq!(
+            resolve_pkg(&vars, os),
+            std::path::Path::new("/opt/cache/pkg")
+        );
+    }
+}
+
+#[test]
+fn copilot_pkg_dir_honours_xdg_on_linux_only() {
+    let vars = [("XDG_CACHE_HOME", "/opt/xdg")];
+    assert_eq!(
+        resolve_pkg(&vars, "linux"),
+        std::path::Path::new("/opt/xdg/copilot/pkg")
+    );
+    assert_eq!(
+        resolve_pkg(&vars, "macos"),
+        std::path::Path::new("/Users/test/Library/Caches/copilot/pkg")
+    );
+}
+
+#[test]
+fn copilot_pkg_dir_treats_empty_as_unset() {
+    let vars = [
+        ("COPILOT_PKG_CACHE_HOME", ""),
+        ("COPILOT_CACHE_HOME", ""),
+        ("XDG_CACHE_HOME", ""),
+    ];
+    assert_eq!(
+        resolve_pkg(&vars, "linux"),
+        std::path::Path::new("/Users/test/.cache/copilot/pkg")
+    );
+}
+
+#[test]
+fn copilot_pkg_dir_skips_unsafe_values() {
+    for bad in [
+        "relative/cache",
+        // Does not exist, so only the `..` check can catch it.
+        "/no-such-dir-cplt/../..",
+        "/",
+        "/tmp",
+        "/Users",
+        "/Users/test",
+        "/Users/test/.ssh",
+        "/Users/test/.ssh/sub",
+        "/Users/test/.aws/cache",
+        // cplt's own state directory.
+        "/Users/test/.config/cplt/cache",
+        // A hard-denied credential file (`grant_is_refused`).
+        "/Users/test/.netrc",
+        "/opt/a\"b",
+        "/opt/a)b",
+    ] {
+        // An unsafe override falls through to the next step of the order...
+        let next = resolve_pkg(
+            &[
+                ("COPILOT_PKG_CACHE_HOME", bad),
+                ("COPILOT_CACHE_HOME", "/opt/cache"),
+            ],
+            "linux",
+        );
+        assert_eq!(next, std::path::Path::new("/opt/cache/pkg"), "{bad}");
+        // ...and an unsafe XDG_CACHE_HOME to ~/.cache.
+        let xdg = resolve_pkg(&[("XDG_CACHE_HOME", bad)], "linux");
+        assert_eq!(
+            xdg,
+            std::path::Path::new("/Users/test/.cache/copilot/pkg"),
+            "{bad}"
+        );
+        let cache = resolve_pkg(&[("COPILOT_CACHE_HOME", bad)], "macos");
+        assert_eq!(
+            cache,
+            std::path::Path::new("/Users/test/Library/Caches/copilot/pkg"),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn copilot_pkg_dirs_is_only_the_default_without_overrides() {
+    let home = std::path::Path::new("/Users/test");
+    assert_eq!(
+        cplt::sandbox::copilot_pkg_dirs(&cache_env(&[]), home, "linux"),
+        vec![std::path::PathBuf::from("/Users/test/.cache/copilot/pkg")]
+    );
+}
+
+#[test]
+fn copilot_pkg_dirs_keeps_the_default_and_adds_every_loader_dir() {
+    let home = std::path::Path::new("/Users/test");
+    let env = cache_env(&[
+        ("COPILOT_PKG_CACHE_HOME", "/opt/pkgcache"),
+        ("XDG_CACHE_HOME", "/opt/xdg"),
+    ]);
+    assert_eq!(
+        cplt::sandbox::copilot_pkg_dirs(&env, home, "linux"),
+        [
+            "/Users/test/.cache/copilot/pkg",
+            "/opt/xdg/copilot/pkg",
+            "/opt/pkgcache/pkg"
+        ]
+        .map(std::path::PathBuf::from)
+    );
+    assert_eq!(
+        cplt::sandbox::copilot_pkg_dirs(&env, home, "macos"),
+        [
+            "/Users/test/Library/Caches/copilot/pkg",
+            "/opt/pkgcache/pkg"
+        ]
+        .map(std::path::PathBuf::from)
+    );
+}
+
+#[test]
+fn copilot_ro_protect_paths_follow_the_resolved_cache() {
+    let env = cache_env(&[("XDG_CACHE_HOME", "/opt/xdg")]);
+    let paths = cplt::sandbox::copilot_ro_protect_paths(
+        cplt::agent::Agent::Copilot,
+        std::path::Path::new("/Users/test"),
+        &env,
+    );
+    for expected in [
+        "/Users/test/.copilot/pkg",
+        "/Users/test/.cache/copilot/pkg",
+        "/opt/xdg/copilot/pkg",
+    ] {
+        assert!(
+            paths.contains(&std::path::PathBuf::from(expected)),
+            "{expected} must be in the bwrap read-only set: {paths:?}"
+        );
+    }
+}
+
+fn profile_with_cache_env(vars: &[(&str, &str)]) -> String {
+    let env = cache_env(vars);
+    generate_profile(
+        &SandboxConfig {
+            copilot_cache_env: &env,
+            ..base_profile_options()
+        },
+        &[],
+    )
+}
+
+#[test]
+fn profile_carves_out_the_resolved_copilot_cache() {
+    let p = profile_with_cache_env(&[("COPILOT_CACHE_HOME", "/opt/copilot-cache")]);
+    for pkg in [
+        "/Users/test/Library/Caches/copilot/pkg",
+        "/opt/copilot-cache/pkg",
+    ] {
+        for rule in [
+            format!("(allow file-map-executable (subpath \"{pkg}\"))"),
+            format!("(allow process-exec (subpath \"{pkg}\"))"),
+            format!("(deny file-write* (subpath \"{pkg}\"))"),
+        ] {
+            assert!(p.contains(&rule), "profile must contain {rule}");
+        }
+    }
+    // An override can sit anywhere, so its whole ancestor chain is pinned.
+    for pinned in [
+        "/opt/copilot-cache",
+        "/opt",
+        "/Users/test/Library/Caches/copilot",
+    ] {
+        assert!(
+            p.contains(&format!("(deny file-write-unlink (literal \"{pinned}\"))")),
+            "{pinned} must be pinned"
+        );
+    }
+    assert!(!p.contains("(deny file-write-unlink (literal \"/\"))"));
+}
+
+#[test]
+fn profile_ignores_an_unsafe_copilot_cache() {
+    let p = profile_with_cache_env(&[("COPILOT_PKG_CACHE_HOME", "/Users/test/.ssh")]);
+    assert!(!p.contains("(allow process-exec (subpath \"/Users/test/.ssh/pkg\"))"));
+    assert!(
+        p.contains("(allow process-exec (subpath \"/Users/test/Library/Caches/copilot/pkg\"))")
+    );
 }
 
 #[test]
@@ -9262,6 +9504,7 @@ fn landlock_relocated_cargo_bin_is_exec_only_and_registry_is_precreated() {
         playwright_socket_dir: None,
         allow_tmp_exec: false,
         copilot_install_dir: None,
+        copilot_cache_env: &cplt::sandbox::no_cache_env,
         java_home: None,
         dotnet_root: None,
         git_hooks_path: None,

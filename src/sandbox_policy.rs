@@ -6,6 +6,7 @@
 use crate::agent::Agent;
 use crate::config;
 use directories::ProjectDirs;
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
 /// Characters that would break SBPL profile string interpolation.
@@ -2132,10 +2133,11 @@ fn links_inside_home(home: &Path, named: &Path) -> bool {
 /// executable, and the SEA extraction that writes it happens outside the
 /// sandbox in `copilot_extract` by design.
 ///
-/// `~/.cache` is spelled literally rather than resolved through
-/// `XDG_CACHE_HOME`, to match `copilot_extract`'s `copilot_cache_dirs` — the
-/// code that actually creates the directory. If that gains XDG support this
-/// must follow it.
+/// The cache half comes from [`copilot_pkg_dirs`], so it follows
+/// `COPILOT_PKG_CACHE_HOME`, `COPILOT_CACHE_HOME` and `XDG_CACHE_HOME` the way
+/// Copilot's loader does, and still carries `~/.cache/copilot/pkg` when they
+/// point elsewhere (#374). Always resolved with Linux rules: bubblewrap is the
+/// only consumer.
 ///
 /// Same caveats as every other `ro_protect` entry: without bubblewrap this is
 /// unenforced, and bwrap skips a path that does not exist at launch.
@@ -2152,11 +2154,119 @@ fn links_inside_home(home: &Path, named: &Path) -> bool {
 /// Returns nothing for an agent that is not Copilot: the agent check lives here
 /// rather than at the call site so the whole decision is one unit-testable
 /// function on both platforms, instead of a Linux-only `if` no test can reach.
-pub fn copilot_ro_protect_paths(agent: Agent, home: &Path) -> Vec<PathBuf> {
+pub fn copilot_ro_protect_paths(agent: Agent, home: &Path, env: &CacheEnv) -> Vec<PathBuf> {
     if !agent.needs_copilot_dir() {
         return Vec::new();
     }
-    vec![home.join(".copilot/pkg"), home.join(".cache/copilot/pkg")]
+    let mut paths = vec![home.join(".copilot/pkg")];
+    paths.extend(copilot_pkg_dirs(env, home, "linux"));
+    paths
+}
+
+/// Environment lookup for the Copilot cache resolver: `&|k| std::env::var_os(k)`
+/// in production, a fixed map in tests.
+pub type CacheEnv<'a> = dyn Fn(&str) -> Option<OsString> + 'a;
+
+/// The launching process's environment, as a [`CacheEnv`].
+pub fn process_env(name: &str) -> Option<OsString> {
+    std::env::var_os(name)
+}
+
+/// A [`CacheEnv`] with nothing set.
+pub fn no_cache_env(_: &str) -> Option<OsString> {
+    None
+}
+
+/// Where Copilot's SEA loader extracts its runtime: the `pkg` directory whose
+/// `<os>-<arch>/<version>` children Copilot later executes on the host.
+///
+/// Mirrors the loader's precedence, read from the SEA loader embedded in the
+/// Copilot CLI 1.0.88 binary (`af`, `Wi` and `xs` in its minified source):
+///
+/// 1. `$COPILOT_PKG_CACHE_HOME/pkg`
+/// 2. `$COPILOT_CACHE_HOME/pkg`
+/// 3. macOS: `~/Library/Caches/copilot/pkg` (`XDG_CACHE_HOME` is not read)
+/// 4. Linux: `${XDG_CACHE_HOME:-~/.cache}/copilot/pkg`
+///
+/// An empty value counts as unset, as JavaScript's `||` does.
+///
+/// The values come from the launching environment, which a project can shape
+/// (direnv, mise), and the result becomes an exec grant. A value that is not
+/// absolute, contains `..`, is a system root or an ancestor of `$HOME`, is
+/// refused by [`grant_is_refused`], lies inside a credential directory, or
+/// cannot be written into an SBPL string is ignored with a warning, and the
+/// next step applies. Copilot itself still uses such a value; cplt then does
+/// not protect that directory, and the warning says so.
+pub fn copilot_pkg_dir(env: &CacheEnv, home: &Path, os: &str) -> PathBuf {
+    let var = |name: &str| -> Option<PathBuf> {
+        let value = PathBuf::from(env(name).filter(|v| !v.is_empty())?);
+        if copilot_cache_root_is_usable(&value, home) {
+            return Some(value);
+        }
+        warn_once(format!(
+            "Ignoring {name}={}: not a safe absolute directory. Copilot may still \
+             use it, and cplt does not protect it.",
+            value.display()
+        ));
+        None
+    };
+    if let Some(root) = var("COPILOT_PKG_CACHE_HOME").or_else(|| var("COPILOT_CACHE_HOME")) {
+        return root.join("pkg");
+    }
+    if os == "macos" {
+        return home.join("Library/Caches/copilot/pkg");
+    }
+    var("XDG_CACHE_HOME")
+        .unwrap_or_else(|| home.join(".cache"))
+        .join("copilot/pkg")
+}
+
+/// Every Copilot cache `pkg` directory cplt grants execute on and protects
+/// from writes: the default it has always covered, first, then the loader's
+/// platform default under `XDG_CACHE_HOME` and the actual extraction target
+/// when those differ. The loader also searches the defaults for a newer
+/// runtime to run, so dropping them when an override is set would leave a
+/// directory Copilot executes from writable. With none of the variables set
+/// this is the one default directory, so the generated policy is unchanged.
+pub fn copilot_pkg_dirs(env: &CacheEnv, home: &Path, os: &str) -> Vec<PathBuf> {
+    let xdg_only = |k: &str| if k == "XDG_CACHE_HOME" { env(k) } else { None };
+    let mut dirs = vec![copilot_pkg_dir(&|_| None, home, os)];
+    for dir in [
+        copilot_pkg_dir(&xdg_only, home, os),
+        copilot_pkg_dir(env, home, os),
+    ] {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
+}
+
+/// Whether an env-supplied cache root may become a Copilot `pkg` grant.
+fn copilot_cache_root_is_usable(root: &Path, home: &Path) -> bool {
+    let ok = |p: &Path| {
+        p.is_absolute()
+            && !p.components().any(|c| c == Component::ParentDir)
+            && validate_sbpl_path(p).is_ok()
+            && tool_override_path_is_safe(p, home)
+            && !grant_is_refused(home, p)
+            && !DENIED_DOTFILES.iter().any(|d| p.starts_with(home.join(d)))
+    };
+    // A symlinked root is granted where it points (Landlock follows the link,
+    // Seatbelt matches the resolved path), so the target must pass too.
+    ok(root) && std::fs::canonicalize(root).map_or(true, |real| ok(&real))
+}
+
+/// Print a warning once per process: every backend runs the resolver.
+fn warn_once(msg: String) {
+    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !seen.contains(&msg) {
+        crate::ui::warn(&msg);
+        seen.push(msg);
+    }
 }
 
 /// A tool home relocated by an env var (`CARGO_HOME=~/.local/share/cargo`).

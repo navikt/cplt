@@ -67,19 +67,19 @@ mod profile;
 // These are platform-agnostic and used by tests, discover, config, etc.
 
 pub use policy::{
-    AppDir, AppDirKind, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS, ENV_ALLOWLIST,
-    ENV_PREFIX_ALLOWLIST, EXEC_IN_WRITABLE, ExecInWritable, HARDENING_ENV_VARS, HOME_TOOL_DIRS,
-    HardeningCategory, HardeningEnvVar, HomeToolDir, LinuxCoverage,
+    AppDir, AppDirKind, CacheEnv, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS,
+    ENV_ALLOWLIST, ENV_PREFIX_ALLOWLIST, EXEC_IN_WRITABLE, ExecInWritable, HARDENING_ENV_VARS,
+    HOME_TOOL_DIRS, HardeningCategory, HardeningEnvVar, HomeToolDir, LinuxCoverage,
     PLAYWRIGHT_SOCKET_BASE_MAX_BYTES, PLAYWRIGHT_SOCKET_DIR_PREFIX, PLAYWRIGHT_SOCKET_PATH_LIMIT,
     PLAYWRIGHT_SOCKET_ROOT, PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX, PROTECTED_IN_GITDIR,
     PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir, SENSITIVE_PROJECT_PATTERNS,
     TOOL_PATH_ENV_VARS, ToolPathEnvVar, ToolPathOverride, ToolRoot, active_tool_dirs, app_dirs,
-    copilot_ro_protect_paths, credential_link_hop, current_uid, exec_write_conflicts,
-    home_config_link_targets, home_tool_dirs, linux_docker_socket_paths, linux_runtime_dirs,
-    mise_ro_protect_paths, nested_alternation, path_bin_dirs, playwright_runtime_intent,
-    relocatable_tool_prefix, socket_mask_paths, tool_override_path_is_safe,
-    tool_path_env_overrides, validate_playwright_socket_dir, validate_sbpl_path,
-    xdg_runtime_dir_env,
+    copilot_pkg_dir, copilot_pkg_dirs, copilot_ro_protect_paths, credential_link_hop, current_uid,
+    exec_write_conflicts, home_config_link_targets, home_tool_dirs, linux_docker_socket_paths,
+    linux_runtime_dirs, mise_ro_protect_paths, nested_alternation, no_cache_env, path_bin_dirs,
+    playwright_runtime_intent, process_env, relocatable_tool_prefix, socket_mask_paths,
+    tool_override_path_is_safe, tool_path_env_overrides, validate_playwright_socket_dir,
+    validate_sbpl_path, xdg_runtime_dir_env,
 };
 
 // SBPL profile generation — kept public for unit tests.
@@ -178,6 +178,10 @@ pub struct SandboxConfig<'a> {
     pub allow_tmp_exec: bool,
     /// Copilot CLI package directory (resolved from the binary location).
     pub copilot_install_dir: Option<&'a Path>,
+    /// Where the Copilot cache variables are read from (#374):
+    /// [`process_env`] for a real launch, [`no_cache_env`] for a policy that
+    /// should cover only the default SEA cache.
+    pub copilot_cache_env: &'a CacheEnv<'a>,
     /// JAVA_HOME directory — grants JDK read + dylib loading.
     pub java_home: Option<&'a Path>,
     /// DOTNET_ROOT directory — grants .NET SDK read + dylib loading.
@@ -1255,7 +1259,7 @@ fn pin_paths(
     // rather than spelled out, so a package dir added there cannot arrive
     // unpinned. Empty for every agent but Copilot.
     pins.extend(
-        copilot_ro_protect_paths(config.agent, config.home_dir)
+        copilot_ro_protect_paths(config.agent, config.home_dir, config.copilot_cache_env)
             .iter()
             .filter_map(|p| p.parent().map(Path::to_path_buf)),
     );
@@ -1372,7 +1376,11 @@ fn ro_protect_paths(
     // grant from HOME_TOOL_DIRS, leaving the SEA runtime writable AND
     // executable. Only the bwrap overlay can take the write back. Empty for
     // every other agent.
-    ro_protect.extend(copilot_ro_protect_paths(config.agent, config.home_dir));
+    ro_protect.extend(copilot_ro_protect_paths(
+        config.agent,
+        config.home_dir,
+        config.copilot_cache_env,
+    ));
 
     // #524: a dotfiles-managed `~/.gitconfig` resolves to its target, and the
     // target can sit inside the writable project. Landlock follows the link
@@ -2035,6 +2043,7 @@ mod tests {
             playwright_socket_dir: None,
             allow_tmp_exec: false,
             copilot_install_dir: None,
+            copilot_cache_env: &crate::sandbox::no_cache_env,
             java_home: None,
             dotnet_root: None,
             git_hooks_path: None,

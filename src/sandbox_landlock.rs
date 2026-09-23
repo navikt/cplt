@@ -1044,16 +1044,20 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         // Copilot SEA cache — auto-updaters download newer versions here.
         // Execute is required for Node to spawn the newer ripgrep / helpers.
         // (Write access is already inherited from the broader ~/.cache allow).
-        fs_rules.push(FsRule {
-            path: home.join(".cache/copilot/pkg"),
-            access: FsAccess {
-                read: true,
-                write: false,
-                execute: true,
-                ioctl: false,
-                create_dirs: false,
-            },
-        });
+        // Resolved as Copilot resolves it (#374): only `~/.cache/copilot/pkg`
+        // unless a cache variable moves it.
+        for path in policy::copilot_pkg_dirs(config.copilot_cache_env, home, "linux") {
+            fs_rules.push(FsRule {
+                path,
+                access: FsAccess {
+                    read: true,
+                    write: false,
+                    execute: true,
+                    ioctl: false,
+                    create_dirs: false,
+                },
+            });
+        }
     }
     for dir in config.agent_dirs {
         if refused_link(home, &dir.path, "agent directory") {
@@ -2550,6 +2554,7 @@ mod tests {
             playwright_socket_dir: None,
             allow_tmp_exec: false,
             copilot_install_dir: None,
+            copilot_cache_env: &crate::sandbox::no_cache_env,
             java_home: None,
             dotnet_root: None,
             git_hooks_path: None,
@@ -4357,6 +4362,26 @@ mod tests {
         assert!(rule.access.read);
         assert!(!rule.access.write);
         assert!(rule.access.execute);
+    }
+
+    /// #374: the SEA cache exec rule follows Copilot's own resolution, and
+    /// keeps the default as well.
+    #[test]
+    fn copilot_sea_cache_exec_rule_follows_the_cache_variables() {
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let env = |k: &str| (k == "XDG_CACHE_HOME").then(|| "/srv/xdg".into());
+        let mut config = test_config(&project, &home);
+        config.copilot_cache_env = &env;
+        let policy = generate_policy(&config);
+        for path in ["/home/user/.cache/copilot/pkg", "/srv/xdg/copilot/pkg"] {
+            let rule = policy
+                .fs_rules
+                .iter()
+                .find(|r| r.path == Path::new(path))
+                .unwrap_or_else(|| panic!("{path} should have an exec rule"));
+            assert!(rule.access.read && rule.access.execute && !rule.access.write);
+        }
     }
 
     #[test]

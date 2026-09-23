@@ -1899,8 +1899,11 @@ mod tests {
             writable_rule(&copilot.to_string_lossy()),
             writable_rule(&cache.to_string_lossy()),
         ];
-        let ro =
-            crate::sandbox::copilot_ro_protect_paths(crate::agent::Agent::Copilot, home.path());
+        let ro = crate::sandbox::copilot_ro_protect_paths(
+            crate::agent::Agent::Copilot,
+            home.path(),
+            &|_| None,
+        );
         let args = build_bwrap_args(
             &rules,
             Overlays {

@@ -21,12 +21,12 @@ macro_rules! sbpl {
 
 use super::SandboxConfig;
 use super::policy::{
-    DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS,
+    CacheEnv, DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS,
     DEPENDENCY_SOURCE_TREES, EXEC_IN_WRITABLE, GPG_SIGNING_ALLOW_FILES, HOME_CONFIG_FILES,
     HomeToolDir, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir,
     SENSITIVE_PROJECT_PATTERNS, SYSTEM_READ_FILES, TOOL_READ_DIRS, XCODE_SELECT_LINK,
-    active_tool_dirs, ancestor_alternation, app_dirs, colima_socket_paths, current_uid,
-    escape_regex, first_party_read_target, grant_is_refused, home_config_link_targets,
+    active_tool_dirs, ancestor_alternation, app_dirs, colima_socket_paths, copilot_pkg_dirs,
+    current_uid, escape_regex, first_party_read_target, grant_is_refused, home_config_link_targets,
     missing_home_config_link_targets, nested_alternation, path_bin_dirs, playwright_runtime_intent,
     read_only_home_config, rel_is_glob, rel_regex, validate_playwright_socket_dir,
     validate_sbpl_path,
@@ -151,6 +151,7 @@ pub fn generate_profile_with_playwright_socket_dir(
         config.allow_cache_exec,
         config.allow_cache_exec_any,
         Path::new(XCODE_SELECT_LINK),
+        config.copilot_cache_env,
     );
     emit_agent_exec_carveouts(&mut sb, config.agent_dirs);
     emit_copilot_install(&mut sb, config.copilot_install_dir);
@@ -1219,6 +1220,7 @@ fn emit_tool_dirs(
     allow_cache_exec: &[String],
     allow_cache_exec_any: bool,
     xcode_select_link: &Path,
+    copilot_cache_env: &CacheEnv,
 ) {
     let home = home_dir.to_string_lossy();
     sbpl!(sb, ";; Developer tools");
@@ -1384,48 +1386,17 @@ fn emit_tool_dirs(
     //     the sandbox (--no-auto-update), so writes are not needed.
     // Must come AFTER the denies (last-match-wins in SBPL).
     // Only needed for Copilot agent.
+    // Resolved as Copilot resolves it (#374): only the default below unless
+    // `COPILOT_PKG_CACHE_HOME` / `COPILOT_CACHE_HOME` moves it, in which case
+    // each directory gets the same four rules.
     if agent.needs_copilot_dir() {
-        sbpl!(
-            sb,
-            "(allow file-map-executable (subpath \"{home}/Library/Caches/copilot/pkg\"))"
-        );
-        sbpl!(
-            sb,
-            "(allow process-exec (subpath \"{home}/Library/Caches/copilot/pkg\"))"
-        );
-        sbpl!(
-            sb,
-            "(deny file-write* (subpath \"{home}/Library/Caches/copilot/pkg\"))"
-        );
-        // GHSA-8qmv-wxp3-526v. The deny above names a path, and a path-shaped
-        // rule only holds while the path keeps denoting the directory it
-        // protects. `~/Library/Caches` is writable (HOME_TOOL_DIRS), so
-        // `mv ~/Library/Caches/copilot ~/Library/Caches/copilot.bak` moved the
-        // whole `pkg` tree out from under the deny; the agent then recreated
-        // `copilot/pkg`, wrote its own code there and moved the directory back.
-        // `pkg` is what the host executes the next time Copilot runs outside
-        // cplt, so that is persistence plus host code execution.
-        //
-        // `file-write-unlink` on the parent closes it: Seatbelt checks that
-        // access on the *source* of a rename and on unlink/rmdir, not on writes
-        // inside the directory, so the cache keeps working and only the name is
-        // pinned. Same shape as the gitdir pin in `emit_gitdir_denies` and the
-        // `PROTECTED_IN_ROOT` ancestor pins; the invariant walk in
-        // `every_write_deny_has_a_pinned_parent_chain` is what keeps a fourth
-        // instance of this from shipping.
-        //
-        // Cost: `mv`/`rm -rf` of `~/Library/Caches/copilot` fails inside the
-        // sandbox (docs/known-impacts.md). OpenCode has the same shape one
-        // tree over — `~/.cache/opencode/bin` is exec-allowed and write-denied
-        // inside a writable cache grant — and is pinned by the derived rule in
-        // `emit_host_persistence_denies` rather than by a second special case
-        // here; this block stays hand-written because Copilot's package dir is
-        // not an `AgentDir` grant.
-        sbpl!(
-            sb,
-            "(deny file-write-unlink (literal \"{home}/Library/Caches/copilot\"))"
-        );
-        sbpl!(sb);
+        // The first entry is always the default.
+        for (i, pkg_dir) in copilot_pkg_dirs(copilot_cache_env, home_dir, "macos")
+            .iter()
+            .enumerate()
+        {
+            emit_copilot_pkg_carveout(sb, pkg_dir, i > 0);
+        }
     }
 
     // User-specified ~/Library/Caches exec carve-outs.
@@ -1458,6 +1429,51 @@ fn emit_tool_dirs(
             sbpl!(sb);
         }
     }
+}
+
+/// Exec, write-deny and rename pin for one Copilot SEA `pkg` directory.
+///
+/// `pkg_dir` comes from `copilot_pkg_dirs`, which only admits env values that
+/// pass `validate_sbpl_path`.
+fn emit_copilot_pkg_carveout(sb: &mut String, pkg_dir: &Path, all_ancestors: bool) {
+    let pkg = pkg_dir.to_string_lossy();
+    sbpl!(sb, "(allow file-map-executable (subpath \"{pkg}\"))");
+    sbpl!(sb, "(allow process-exec (subpath \"{pkg}\"))");
+    sbpl!(sb, "(deny file-write* (subpath \"{pkg}\"))");
+    // GHSA-8qmv-wxp3-526v. The deny above names a path, and a path-shaped
+    // rule only holds while the path keeps denoting the directory it
+    // protects. `~/Library/Caches` is writable (HOME_TOOL_DIRS), so
+    // `mv ~/Library/Caches/copilot ~/Library/Caches/copilot.bak` moved the
+    // whole `pkg` tree out from under the deny; the agent then recreated
+    // `copilot/pkg`, wrote its own code there and moved the directory back.
+    // `pkg` is what the host executes the next time Copilot runs outside
+    // cplt, so that is persistence plus host code execution.
+    //
+    // `file-write-unlink` on the parent closes it: Seatbelt checks that
+    // access on the *source* of a rename and on unlink/rmdir, not on writes
+    // inside the directory, so the cache keeps working and only the name is
+    // pinned. Same shape as the gitdir pin in `emit_gitdir_denies` and the
+    // `PROTECTED_IN_ROOT` ancestor pins; the invariant walk in
+    // `every_write_deny_has_a_pinned_parent_chain` is what keeps a fourth
+    // instance of this from shipping.
+    //
+    // Cost: `mv`/`rm -rf` of `~/Library/Caches/copilot` fails inside the
+    // sandbox (docs/known-impacts.md). OpenCode has the same shape one
+    // tree over — `~/.cache/opencode/bin` is exec-allowed and write-denied
+    // inside a writable cache grant — and is pinned by the derived rule in
+    // `emit_host_persistence_denies` rather than by a second special case
+    // here; this block stays hand-written because Copilot's package dir is
+    // not an `AgentDir` grant.
+    //
+    // The default's grandparent `~/Library/Caches` is not renameable, so one
+    // pin is enough there. A directory named by a cache variable can sit
+    // anywhere, so `all_ancestors` pins every ancestor below `/`.
+    let ancestors = pkg_dir.ancestors().skip(1).filter(|a| a.parent().is_some());
+    for ancestor in ancestors.take(if all_ancestors { usize::MAX } else { 1 }) {
+        let ancestor = ancestor.to_string_lossy();
+        sbpl!(sb, "(deny file-write-unlink (literal \"{ancestor}\"))");
+    }
+    sbpl!(sb);
 }
 
 /// Exec carve-out for exec-only agent dirs (`!write && process_exec`:
@@ -3113,6 +3129,7 @@ mod tests {
             playwright_socket_dir: None,
             allow_tmp_exec: false,
             copilot_install_dir: None,
+            copilot_cache_env: &crate::sandbox::no_cache_env,
             java_home: None,
             dotnet_root: None,
             git_hooks_path: None,
@@ -3148,6 +3165,7 @@ mod tests {
             &[],
             false,
             xcode_select_link,
+            &crate::sandbox::no_cache_env,
         );
         sb
     }
