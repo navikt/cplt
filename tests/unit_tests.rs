@@ -4207,6 +4207,31 @@ fn profile_denies_non_dev_cache_dirs() {
     );
 }
 
+/// #552: the home path is escaped in the `Library/Caches` regexes, so the `.`
+/// in `first.last` cannot match `firstXlast`.
+#[test]
+fn profile_cache_regexes_escape_home() {
+    let p = generate_profile(
+        &SandboxConfig {
+            home_dir: Path::new("/Users/first.last"),
+            ..base_profile_options()
+        },
+        &[],
+    );
+    for rule in [
+        r#"(deny file-read* (regex #"^/Users/first\.last/Library/Caches/com\.google\."))"#,
+        r#"(deny file-write* (regex #"^/Users/first\.last/Library/Caches/com\.google\."))"#,
+        r#"(allow file-read* (regex #"^/Users/first\.last/Library/Caches/com\.apple\.dt\."))"#,
+        r#"(allow file-write* (regex #"^/Users/first\.last/Library/Caches/com\.apple\.dt\."))"#,
+    ] {
+        assert!(p.contains(rule), "missing escaped rule: {rule}");
+    }
+    assert!(
+        !p.contains("regex #\"^/Users/first.last/"),
+        "home path interpolated into a regex unescaped"
+    );
+}
+
 #[test]
 fn profile_cargo_has_exec() {
     let p = default_profile();

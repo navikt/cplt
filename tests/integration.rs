@@ -1344,6 +1344,50 @@ mod macos_tests {
         eprintln!("chrome-for-testing stage: sandboxed launch ready");
     }
 
+    /// #552: Seatbelt itself must not let the `.` in a home path like
+    /// `first.last` match `firstXlast`. Only the generated `Library/Caches`
+    /// regex rules run, on top of `(allow default)`, so the result depends on
+    /// those rules alone.
+    #[test]
+    fn cache_regex_rules_do_not_match_a_sibling_of_a_dotted_home() {
+        require_sandbox!();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let home = root.join("first.last");
+        let sibling = root.join("firstXlast");
+        for base in [&home, &sibling] {
+            let dir = base.join("Library/Caches/com.google.Chrome");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("f"), "cache").unwrap();
+        }
+
+        let generated = generate_profile(&default_opts(&root, &home), &[]);
+        let rules: Vec<&str> = generated
+            .lines()
+            .filter(|l| l.contains("(regex #") && l.contains("/Library/Caches/"))
+            .collect();
+        assert!(!rules.is_empty(), "no Library/Caches regex rules generated");
+        let path = unique_profile_path();
+        fs::write(
+            &path,
+            format!("(version 1)\n(allow default)\n{}\n", rules.join("\n")),
+        )
+        .unwrap();
+
+        let cat = |base: &Path| {
+            let f = base.join("Library/Caches/com.google.Chrome/f");
+            run_sandboxed(&path, &format!("cat '{}'", f.display()))
+        };
+        let (out, ok) = cat(&home);
+        assert!(
+            !ok,
+            "control: the real home's com.google. cache must be denied: {out}"
+        );
+        let (out, ok) = cat(&sibling);
+        assert!(ok, "the `.` in the home path matched `X`: {out}");
+        let _ = fs::remove_file(&path);
+    }
+
     #[test]
     fn real_profile_allows_local_git_config_and_global_ignore() {
         require_sandbox!();

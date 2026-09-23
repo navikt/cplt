@@ -1350,26 +1350,28 @@ fn emit_tool_dirs(
     // pass through automatically without needing an explicit allowlist.
     // Xcode dev tools (com.apple.dt.*) are re-allowed after the broad com.apple. deny.
     sbpl!(sb, ";; Non-dev cache dirs denied (browsers, system apps)");
+    // Both the home path and the prefix are escaped: a `.` in `/Users/first.last`
+    // would otherwise match any character (#552).
+    let home_re = escape_regex(&home);
     for prefix in DENIED_CACHE_PREFIXES {
-        // Escape dots for SBPL regex
-        let escaped = prefix.replace('.', r"\.");
+        let escaped = escape_regex(prefix);
         sbpl!(
             sb,
-            "(deny file-read* (regex #\"^{home}/Library/Caches/{escaped}\"))"
+            "(deny file-read* (regex #\"^{home_re}/Library/Caches/{escaped}\"))"
         );
         sbpl!(
             sb,
-            "(deny file-write* (regex #\"^{home}/Library/Caches/{escaped}\"))"
+            "(deny file-write* (regex #\"^{home_re}/Library/Caches/{escaped}\"))"
         );
     }
     // Re-allow Xcode dev tools (com.apple.dt.Xcode, com.apple.dt.xcodebuild)
     sbpl!(
         sb,
-        "(allow file-read* (regex #\"^{home}/Library/Caches/com\\.apple\\.dt\\.\"))"
+        "(allow file-read* (regex #\"^{home_re}/Library/Caches/com\\.apple\\.dt\\.\"))"
     );
     sbpl!(
         sb,
-        "(allow file-write* (regex #\"^{home}/Library/Caches/com\\.apple\\.dt\\.\"))"
+        "(allow file-write* (regex #\"^{home_re}/Library/Caches/com\\.apple\\.dt\\.\"))"
     );
 
     // Copilot CLI v1.0.22+ stores native modules and helper binaries in
