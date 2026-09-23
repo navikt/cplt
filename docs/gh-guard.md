@@ -427,11 +427,11 @@ above, it refuses:
 - a duplicated argument or input field (`threadId: "a", threadId: "b"`), so the
   guard and the server cannot read different values
 - names and IDs it cannot know the value of: a string with escapes, a block
-  string, an unbound variable, a variable bound by `-F` to a number or boolean,
-  and `input: $var` in place of an object literal
-- variables named `operationName` or `endCursor`: `gh` sends the first outside
-  `variables`, and `--paginate` overwrites the second with a value from the
-  response
+  string, an unbound variable, a variable bound by `-F` to a number, boolean or
+  null, and `input: $var` in place of an object literal
+- a variable named `operationName` or `endCursor` may never supply a name or
+  ID: `gh` sends the first outside `variables`, and `--paginate` overwrites the
+  second with a value from the response
 - the ways `gh` sends something other than the arguments the guard saw:
   `--input`, `-H`, `-p`, `-X` other than `POST`, `-F key=@file`,
   `{owner}`/`{repo}`/`{branch}`/`:owner` placeholders in `-F` values (a branch

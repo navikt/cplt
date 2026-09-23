@@ -594,7 +594,10 @@ impl Parser {
 
     fn directives(&mut self) -> PResult<()> {
         while self.eat(b'@') {
-            self.name()?;
+            let name = self.name()?;
+            if name != "include" && name != "skip" {
+                return self.fail("only @include and @skip directives are allowed");
+            }
             if self.at(b'(') {
                 self.arguments()?;
             }
@@ -746,6 +749,9 @@ fn validate(
             return Err(FRAGMENTS.into());
         };
         if field.name == "__typename" {
+            if !field.args.is_empty() || !field.selection.is_empty() {
+                return Err("__typename takes no arguments or selection".into());
+            }
             continue;
         }
         match kind {
@@ -1017,6 +1023,29 @@ mod tests {
             Ok(vec![])
         );
         assert_eq!(q("{ __typename }"), Ok(vec![]));
+    }
+
+    #[test]
+    fn refuses_a_root_typename_with_arguments_or_selection() {
+        let err = q("{ __typename(x: 1) { a } }").unwrap_err();
+        assert!(err.contains("no arguments or selection"), "{err}");
+        let err = q("{ __typename { a } }").unwrap_err();
+        assert!(err.contains("no arguments or selection"), "{err}");
+    }
+
+    #[test]
+    fn refuses_directives_other_than_include_and_skip() {
+        assert_eq!(
+            q(r#"{ repository(owner:"navikt", name:"cplt") { __typename @include(if: true) } }"#),
+            Ok(vec![])
+        );
+        assert_eq!(
+            q(r#"{ repository(owner:"navikt", name:"cplt") { __typename @skip(if: false) } }"#),
+            Ok(vec![])
+        );
+        let err =
+            q(r#"{ repository(owner:"navikt", name:"cplt") @evil { __typename } }"#).unwrap_err();
+        assert!(err.contains("only @include and @skip"), "{err}");
     }
 
     #[test]
