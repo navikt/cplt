@@ -9,19 +9,17 @@
 //! does not understand is refused, so a parser gap fails closed:
 //!
 //! - **Queries** must have only `repository(owner: …, name: …)` (or
-//!   `__typename`) at the root, naming a repository in the startup scope — the
-//!   same rule `gh api` REST reads follow (`/repos/{owner}/{repo}/…` in scope).
-//!   A short list of fields that pivot from the repository to its owner, the
-//!   organization or other repositories is refused anywhere in the document.
-//!   That list is defense in depth, not a boundary: a query rooted at the scope
-//!   repository can still follow edges GitHub exposes (comment authors, linked
-//!   issues in other repositories, a fork's head repository).
+//!   `__typename`) at the root, naming a repository in the startup scope.
 //! - **Mutations** may only be the fields in [`MUTATIONS`], each with an
 //!   `input` object literal whose node IDs are then looked up with GitHub
 //!   ([`verify_targets`]) before `gh` runs. A node whose repository is not in
 //!   scope, or that cannot be looked up, is refused.
-//! - **Subscriptions**, documents with more than one operation, fragments at the
-//!   root of an operation, and fragments on a root type are refused.
+//! - **Below the root**, every field must be in [`FIELDS`] for the type it is
+//!   selected on: pull requests, their review threads and comments, and a
+//!   comment author's login. Nothing there leads to another repository, a
+//!   user's or organization's data, or the viewer.
+//! - **Subscriptions**, documents with more than one operation, and every
+//!   fragment (definition, spread or inline) are refused.
 //! - Only `-f`/`-F` fields carry the request. `--input`, headers, previews,
 //!   `@file` values and `gh`'s `{owner}`/`:repo` placeholders are refused,
 //!   because the guard would not be looking at what gets sent.
@@ -53,18 +51,21 @@ pub struct Target {
 }
 
 /// Allowed mutation fields: name, the `input` keys that are node IDs (with
-/// whether each is required), and the other `input` keys allowed.
+/// whether each is required), the other `input` keys allowed, and the payload
+/// type whose selection [`FIELDS`] then limits.
 type IdKeys = &'static [(&'static str, NodeKind, bool)];
-const MUTATIONS: &[(&str, IdKeys, &[&str])] = &[
+const MUTATIONS: &[(&str, IdKeys, &[&str], &str)] = &[
     (
         "resolveReviewThread",
         &[("threadId", NodeKind::ReviewThread, true)],
         &["clientMutationId"],
+        "ThreadPayload",
     ),
     (
         "unresolveReviewThread",
         &[("threadId", NodeKind::ReviewThread, true)],
         &["clientMutationId"],
+        "ThreadPayload",
     ),
     (
         "addPullRequestReviewThreadReply",
@@ -73,27 +74,100 @@ const MUTATIONS: &[(&str, IdKeys, &[&str])] = &[
             ("pullRequestReviewId", NodeKind::Review, false),
         ],
         &["body", "clientMutationId"],
+        "ReplyPayload",
     ),
 ];
 
-/// Fields that lead from a repository to its owner, the organization, or
-/// other repositories. Refused anywhere in the document. Not exhaustive.
-const PIVOT_FIELDS: &[&str] = &[
-    "owner",
-    "organization",
-    "organizations",
-    "enterprise",
-    "enterprises",
-    "membersWithRole",
-    "auditLog",
-    "teams",
-    "repositories",
-    "repositoriesContributedTo",
-    "viewer",
-    "relay",
+const PR_LIST_ARGS: &[&str] = &[
+    "first",
+    "last",
+    "after",
+    "before",
+    "states",
+    "orderBy",
+    "labels",
+    "headRefName",
+    "baseRefName",
+];
+const PAGE: &[&str] = &["first", "after"];
+
+/// Every field a document may select below the root: (parent type, field,
+/// allowed arguments, child type, or `None` for a scalar). Anything not here is
+/// refused, so nothing can lead from a repository in scope to its owner, a
+/// user, or another repository. `__typename` is allowed on every type. The
+/// payload types (`ThreadPayload`, `PayloadThread`, …) are the guard's own
+/// names for a restricted view of GitHub's types.
+#[rustfmt::skip]
+const FIELDS: &[(&str, &str, &[&str], Option<&str>)] = &[
+    ("Repository", "pullRequest", &["number"], Some("PullRequest")),
+    ("Repository", "pullRequests", PR_LIST_ARGS, Some("PullRequestConnection")),
+
+    ("PullRequestConnection", "nodes", &[], Some("PullRequest")),
+    ("PullRequestConnection", "edges", &[], Some("PullRequestEdge")),
+    ("PullRequestConnection", "totalCount", &[], None),
+    ("PullRequestConnection", "pageInfo", &[], Some("PageInfo")),
+    ("PullRequestEdge", "cursor", &[], None),
+    ("PullRequestEdge", "node", &[], Some("PullRequest")),
+
+    ("PullRequest", "id", &[], None),
+    ("PullRequest", "number", &[], None),
+    ("PullRequest", "title", &[], None),
+    ("PullRequest", "state", &[], None),
+    ("PullRequest", "url", &[], None),
+    ("PullRequest", "isDraft", &[], None),
+    ("PullRequest", "headRefName", &[], None),
+    ("PullRequest", "baseRefName", &[], None),
+    ("PullRequest", "reviewThreads", PAGE, Some("PullRequestReviewThreadConnection")),
+
+    ("PullRequestReviewThreadConnection", "nodes", &[], Some("PullRequestReviewThread")),
+    ("PullRequestReviewThreadConnection", "edges", &[], Some("PullRequestReviewThreadEdge")),
+    ("PullRequestReviewThreadConnection", "totalCount", &[], None),
+    ("PullRequestReviewThreadConnection", "pageInfo", &[], Some("PageInfo")),
+    ("PullRequestReviewThreadEdge", "cursor", &[], None),
+    ("PullRequestReviewThreadEdge", "node", &[], Some("PullRequestReviewThread")),
+
+    ("PullRequestReviewThread", "id", &[], None),
+    ("PullRequestReviewThread", "isResolved", &[], None),
+    ("PullRequestReviewThread", "isOutdated", &[], None),
+    ("PullRequestReviewThread", "path", &[], None),
+    ("PullRequestReviewThread", "line", &[], None),
+    ("PullRequestReviewThread", "originalLine", &[], None),
+    ("PullRequestReviewThread", "startLine", &[], None),
+    ("PullRequestReviewThread", "diffSide", &[], None),
+    ("PullRequestReviewThread", "comments", PAGE, Some("PullRequestReviewCommentConnection")),
+
+    ("PullRequestReviewCommentConnection", "nodes", &[], Some("PullRequestReviewComment")),
+    ("PullRequestReviewCommentConnection", "edges", &[], Some("PullRequestReviewCommentEdge")),
+    ("PullRequestReviewCommentConnection", "totalCount", &[], None),
+    ("PullRequestReviewCommentConnection", "pageInfo", &[], Some("PageInfo")),
+    ("PullRequestReviewCommentEdge", "cursor", &[], None),
+    ("PullRequestReviewCommentEdge", "node", &[], Some("PullRequestReviewComment")),
+
+    ("PullRequestReviewComment", "id", &[], None),
+    ("PullRequestReviewComment", "body", &[], None),
+    ("PullRequestReviewComment", "url", &[], None),
+    ("PullRequestReviewComment", "createdAt", &[], None),
+    ("PullRequestReviewComment", "path", &[], None),
+    // Only the login: an author is a User, Bot or Organization, and every
+    // other field on those leads to their repositories.
+    ("PullRequestReviewComment", "author", &[], Some("Author")),
+    ("Author", "login", &[], None),
+
+    ("PageInfo", "hasNextPage", &[], None),
+    ("PageInfo", "hasPreviousPage", &[], None),
+    ("PageInfo", "endCursor", &[], None),
+    ("PageInfo", "startCursor", &[], None),
+
+    ("ThreadPayload", "thread", &[], Some("PayloadThread")),
+    ("ThreadPayload", "clientMutationId", &[], None),
+    ("PayloadThread", "id", &[], None),
+    ("PayloadThread", "isResolved", &[], None),
+    ("ReplyPayload", "comment", &[], Some("PayloadComment")),
+    ("ReplyPayload", "clientMutationId", &[], None),
+    ("PayloadComment", "id", &[], None),
+    ("PayloadComment", "url", &[], None),
 ];
 
-const ROOT_TYPES: &[&str] = &["Query", "Mutation", "Subscription"];
 const MAX_DEPTH: usize = 64;
 
 /// Check a `gh api graphql …` argv (starting at `api`) against the allowlist.
@@ -153,7 +227,7 @@ fn parse_args(args: &[&str]) -> Result<HashMap<String, Var>, String> {
             "-f" | "--raw-field" => add_field(&mut fields, value()?, false)?,
             "-F" | "--field" => add_field(&mut fields, value()?, true)?,
             "-X" | "--method" => {
-                if !value()?.eq_ignore_ascii_case("POST") {
+                if value()? != "POST" {
                     return Err("gh api graphql must use POST".into());
                 }
             }
@@ -367,8 +441,8 @@ struct Field {
 #[derive(Debug)]
 enum Selection {
     Field(Field),
-    Spread,
-    Inline(Option<String>, Vec<Selection>),
+    /// A fragment spread or inline fragment: parsed only to be refused.
+    Fragment,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -381,7 +455,8 @@ enum OpKind {
 #[derive(Debug)]
 enum Definition {
     Operation(OpKind, Vec<Selection>),
-    Fragment(String, Vec<Selection>),
+    /// Parsed only to be refused.
+    Fragment,
 }
 
 struct Parser {
@@ -475,9 +550,10 @@ impl Parser {
                 if self.name()? != "on" {
                     return self.fail("expected 'on'");
                 }
-                let ty = self.name()?;
+                self.name()?;
                 self.directives()?;
-                return Ok(Definition::Fragment(ty, self.selection_set()?));
+                self.selection_set()?;
+                return Ok(Definition::Fragment);
             }
             _ => return self.fail("only operations and fragments are allowed"),
         };
@@ -504,6 +580,7 @@ impl Parser {
     }
 
     fn type_ref(&mut self) -> PResult<()> {
+        self.enter()?;
         if self.eat(b'[') {
             self.type_ref()?;
             self.expect(b']')?;
@@ -511,6 +588,7 @@ impl Parser {
             self.name()?;
         }
         self.eat(b'!');
+        self.depth -= 1;
         Ok(())
     }
 
@@ -605,16 +683,15 @@ impl Parser {
             {
                 self.name()?;
                 self.directives()?;
-                return Ok(Selection::Spread);
+                return Ok(Selection::Fragment);
             }
-            let ty = if self.peek_name() == Some("on") {
+            if self.peek_name() == Some("on") {
                 self.pos += 1;
-                Some(self.name()?)
-            } else {
-                None
-            };
+                self.name()?;
+            }
             self.directives()?;
-            return Ok(Selection::Inline(ty, self.selection_set()?));
+            self.selection_set()?;
+            return Ok(Selection::Fragment);
         }
         let mut name = self.name()?;
         if self.eat(b':') {
@@ -653,14 +730,8 @@ fn validate(
                 if operation.replace((kind, set)).is_some() {
                     return Err("only one operation per request is allowed".into());
                 }
-                check_nested(set)?;
             }
-            Definition::Fragment(ty, set) => {
-                if ROOT_TYPES.contains(&ty.as_str()) {
-                    return Err(format!("fragments on {ty} are not allowed"));
-                }
-                check_nested(set)?;
-            }
+            Definition::Fragment => return Err(FRAGMENTS.into()),
         }
     }
     let Some((kind, root)) = operation else {
@@ -672,43 +743,63 @@ fn validate(
     let mut targets = Vec::new();
     for sel in root {
         let Selection::Field(field) = sel else {
-            return Err("fragments at the root of an operation are not allowed".into());
+            return Err(FRAGMENTS.into());
         };
         if field.name == "__typename" {
             continue;
         }
         match kind {
-            OpKind::Query => check_query_root(field, vars, scope)?,
+            OpKind::Query => {
+                check_query_root(field, vars, scope)?;
+                check_selection("Repository", &field.selection)?;
+            }
             OpKind::Mutation | OpKind::Subscription => {
-                targets.extend(check_mutation_root(field, vars)?);
+                let (found, payload) = check_mutation_root(field, vars)?;
+                targets.extend(found);
+                check_selection(payload, &field.selection)?;
             }
         }
     }
     Ok(targets)
 }
 
-/// Refuse pivot fields and root-type fragments anywhere below the root.
-fn check_nested(set: &[Selection]) -> Result<(), String> {
+const FRAGMENTS: &str = "fragments (named, spread or inline) are not allowed";
+
+/// Hold a selection set on `parent` to [`FIELDS`], recursively.
+fn check_selection(parent: &str, set: &[Selection]) -> Result<(), String> {
     for sel in set {
-        match sel {
-            Selection::Field(f) => {
-                if PIVOT_FIELDS.contains(&f.name.as_str()) {
-                    return Err(format!(
-                        "field '{}' leads outside the repository and is not allowed",
-                        f.name
-                    ));
-                }
-                check_nested(&f.selection)?;
+        let Selection::Field(f) = sel else {
+            return Err(FRAGMENTS.into());
+        };
+        if f.name == "__typename" {
+            if !f.args.is_empty() || !f.selection.is_empty() {
+                return Err("__typename takes no arguments or selection".into());
             }
-            Selection::Inline(ty, inner) => {
-                if let Some(ty) = ty
-                    && ROOT_TYPES.contains(&ty.as_str())
-                {
-                    return Err(format!("fragments on {ty} are not allowed"));
-                }
-                check_nested(inner)?;
+            continue;
+        }
+        let Some((.., args, child)) = FIELDS
+            .iter()
+            .find(|(ty, name, ..)| *ty == parent && *name == f.name)
+        else {
+            return Err(format!(
+                "field '{}' on {parent} is not allowed; only pull request and \
+                 review-thread fields are",
+                f.name
+            ));
+        };
+        for (arg, _) in &f.args {
+            if !args.contains(&arg.as_str()) {
+                return Err(format!(
+                    "argument '{arg}' on {parent}.{} is not allowed",
+                    f.name
+                ));
             }
-            Selection::Spread => {}
+        }
+        unique(&f.args, "argument")?;
+        match child {
+            Some(child) => check_selection(child, &f.selection)?,
+            None if f.selection.is_empty() => {}
+            None => return Err(format!("{parent}.{} has no fields to select", f.name)),
         }
     }
     Ok(())
@@ -772,8 +863,12 @@ fn check_query_root(
     Ok(())
 }
 
-fn check_mutation_root(field: &Field, vars: &HashMap<String, Var>) -> Result<Vec<Target>, String> {
-    let Some((_, id_keys, other_keys)) = MUTATIONS.iter().find(|(n, ..)| *n == field.name) else {
+fn check_mutation_root(
+    field: &Field,
+    vars: &HashMap<String, Var>,
+) -> Result<(Vec<Target>, &'static str), String> {
+    let Some((_, id_keys, other_keys, payload)) = MUTATIONS.iter().find(|(n, ..)| *n == field.name)
+    else {
         return Err(format!(
             "mutation '{}' is not allowed; only {} are",
             field.name,
@@ -812,7 +907,7 @@ fn check_mutation_root(field: &Field, vars: &HashMap<String, Var>) -> Result<Vec
             }
         }
     }
-    Ok(targets)
+    Ok((targets, payload))
 }
 
 // ── target verification ─────────────────────────────────────────────
@@ -918,7 +1013,7 @@ mod tests {
     fn allows_a_read_of_the_scope_repository() {
         assert_eq!(q(READ_THREADS), Ok(vec![]));
         assert_eq!(
-            q("{ repository(owner:\"NAVIKT\", name:\"cplt\") { id } }"),
+            q("{ repository(owner:\"NAVIKT\", name:\"cplt\") { __typename } }"),
             Ok(vec![])
         );
         assert_eq!(q("{ __typename }"), Ok(vec![]));
@@ -926,8 +1021,7 @@ mod tests {
 
     #[test]
     fn allows_query_variables_from_raw_fields() {
-        let query =
-            "query=query($o: String!, $n: String!) { repository(owner: $o, name: $n) { id } }";
+        let query = "query=query($o: String!, $n: String!) { repository(owner: $o, name: $n) { __typename } }";
         assert_eq!(
             run(&[
                 "api",
@@ -980,15 +1074,15 @@ mod tests {
             ),
             (
                 "{ repository(owner:\"navikt\", name:\"cplt\") { owner { login } } }",
-                "leads outside",
+                "field 'owner' on Repository is not allowed",
             ),
             (
                 "{ repository(owner:\"navikt\", name:\"cplt\") { ...F } } fragment F on Repository { owner { login } }",
-                "leads outside",
+                "fragments",
             ),
             (
                 "{ ...R } fragment R on Query { viewer { login } }",
-                "fragments on Query",
+                "fragments",
             ),
         ] {
             let err = q(query).unwrap_err();
@@ -1078,7 +1172,7 @@ mod tests {
             ),
             (
                 "mutation { ...M } fragment M on Mutation { deleteIssue(input:{issueId:\"I_1\"}) { clientMutationId } }",
-                "fragments on Mutation",
+                "fragments",
             ),
             (
                 "mutation { ... on Mutation { deleteIssue(input:{issueId:\"I_1\"}) { clientMutationId } } }",
@@ -1086,7 +1180,7 @@ mod tests {
             ),
             (
                 "mutation { ... { deleteIssue(input:{issueId:\"I_1\"}) { clientMutationId } } }",
-                "fragments at the root",
+                "fragments",
             ),
             (
                 "mutation { resolveReviewThread(input:{threadId:\"PRRT_1\", threadId:\"PRRT_2\"}) { clientMutationId } }",
@@ -1110,7 +1204,7 @@ mod tests {
             ),
             (
                 "mutation { resolveReviewThread(input:{threadId:\"PRRT_1\"}) { thread { repository { owner { login } } } } }",
-                "leads outside",
+                "field 'repository' on PayloadThread is not allowed",
             ),
         ] {
             let err = q(query).unwrap_err();
@@ -1278,5 +1372,159 @@ mod tests {
         let deep = ok.replace("navikt/cplt", "navikt/cplt/pull/1");
         assert_eq!(repo_from_lookup(&deep, NodeKind::ReviewThread), None);
         assert_eq!(repo_from_lookup("not json", NodeKind::ReviewThread), None);
+    }
+
+    /// The #414 workflow: list open threads with their comments, paginated.
+    #[test]
+    fn allows_listing_unresolved_threads_with_comments() {
+        let query = r#"query=query($endCursor: String) {
+          repository(owner: "navikt", name: "cplt") {
+            pullRequests(first: 5, states: OPEN, headRefName: "feat/x") { nodes { number title url isDraft } }
+            pullRequest(number: 568) {
+              __typename number state headRefName baseRefName
+              reviewThreads(first: 100, after: $endCursor) {
+                totalCount
+                pageInfo { hasNextPage endCursor startCursor hasPreviousPage }
+                edges { cursor node { id } }
+                nodes {
+                  id isResolved isOutdated path line originalLine startLine diffSide
+                  comments(first: 50) {
+                    nodes { id body url createdAt path author { login __typename } }
+                  }
+                }
+              }
+            }
+          }
+        }"#;
+        assert_eq!(
+            run(&["api", "graphql", "--paginate", "-f", query]),
+            Ok(vec![])
+        );
+    }
+
+    #[test]
+    fn allows_resolving_and_replying_with_the_allowlisted_payloads() {
+        assert_eq!(
+            q(
+                "mutation { resolveReviewThread(input:{threadId:\"PRRT_1\"}) { clientMutationId thread { id isResolved } } }"
+            ),
+            Ok(thread("PRRT_1"))
+        );
+        assert_eq!(
+            q(
+                "mutation { addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:\"PRRT_1\", body:\"done\"}) { comment { id url } } }"
+            ),
+            Ok(thread("PRRT_1"))
+        );
+    }
+
+    /// Every route out of the scope repository the #568 review found.
+    #[test]
+    fn refuses_pivots_out_of_the_scope_repository() {
+        const R: &str = "repository(owner:\"navikt\", name:\"cplt\")";
+        for (query, want) in [
+            // Another repository through the head repository's owner.
+            (
+                format!("{{ {R} {{ pullRequest(number:1) {{ headRepositoryOwner {{ repository(name:\"secret\") {{ object(expression:\"HEAD:.env\") {{ ... on Blob {{ text }} }} }} }} }} }} }}"),
+                "field 'headRepositoryOwner' on PullRequest",
+            ),
+            // ... through a comment author, as a User.
+            (
+                format!("{{ {R} {{ pullRequest(number:1) {{ reviewThreads(first:1) {{ nodes {{ comments(first:1) {{ nodes {{ author {{ ... on User {{ repository(name:\"secret\") {{ id }} }} }} }} }} }} }} }} }} }}"),
+                "fragments",
+            ),
+            (
+                format!("{{ {R} {{ pullRequest(number:1) {{ reviewThreads(first:1) {{ nodes {{ comments(first:1) {{ nodes {{ author {{ repository(name:\"secret\") {{ id }} }} }} }} }} }} }} }} }}"),
+                "field 'repository' on Author",
+            ),
+            (
+                format!("{{ {R} {{ pullRequest(number:1) {{ author {{ login }} }} }} }}"),
+                "field 'author' on PullRequest",
+            ),
+            (
+                format!("{{ {R} {{ mentionableUsers(first:1) {{ nodes {{ repository(name:\"secret\") {{ id }} }} }} }} }}"),
+                "field 'mentionableUsers' on Repository",
+            ),
+            (
+                format!("{{ {R} {{ assignableUsers(first:1) {{ nodes {{ login }} }} }} }}"),
+                "field 'assignableUsers' on Repository",
+            ),
+            // ... through a cross-reference from another repository.
+            (
+                format!("{{ {R} {{ pullRequest(number:1) {{ timelineItems(first:9) {{ nodes {{ ... on CrossReferencedEvent {{ source {{ ... on Issue {{ repository {{ nameWithOwner }} }} }} }} }} }} }} }} }}"),
+                "field 'timelineItems' on PullRequest",
+            ),
+            // ... through a fork parent or template.
+            (
+                format!("{{ {R} {{ parent {{ object(expression:\"HEAD:.env\") {{ id }} }} }} }}"),
+                "field 'parent' on Repository",
+            ),
+            (
+                format!("{{ {R} {{ templateRepository {{ nameWithOwner }} }} }}"),
+                "field 'templateRepository' on Repository",
+            ),
+            (
+                format!("{{ {R} {{ pullRequest(number:1) {{ headRepository {{ nameWithOwner }} }} }} }}"),
+                "field 'headRepository' on PullRequest",
+            ),
+            // File contents, even of the scope repository.
+            (
+                format!("{{ {R} {{ object(expression:\"HEAD:.env\") {{ ... on Blob {{ text }} }} }} }}"),
+                "field 'object' on Repository",
+            ),
+            // The viewer and what it can enumerate, via an author fragment.
+            (
+                format!("{{ {R} {{ pullRequest(number:1) {{ reviewThreads(first:1) {{ nodes {{ comments(first:1) {{ nodes {{ author {{ ... on User {{ topRepositories(first:9, orderBy:{{field:NAME, direction:ASC}}) {{ nodes {{ nameWithOwner }} }} starredRepositories {{ totalCount }} }} }} }} }} }} }} }} }} }}"),
+                "fragments",
+            ),
+            // A named fragment is refused too, whatever it selects.
+            (
+                format!("{{ {R} {{ ...F }} }} fragment F on Repository {{ pullRequest(number:1) {{ id }} }}"),
+                "fragments",
+            ),
+            (
+                format!("{{ {R} {{ __typename }} }} fragment F on Repository {{ owner {{ login }} }}"),
+                "fragments",
+            ),
+            // Harmless-looking field with an argument not on its list.
+            (
+                format!("{{ {R} {{ pullRequest(number:1) {{ reviewThreads(first:1, last:1) {{ totalCount }} }} }} }}"),
+                "argument 'last'",
+            ),
+            (
+                format!("{{ {R} {{ pullRequest(number:1) {{ number {{ x }} }} }} }}"),
+                "no fields to select",
+            ),
+            // A mutation payload that climbs to the repository and beyond.
+            (
+                "mutation { resolveReviewThread(input:{threadId:\"PRRT_1\"}) { thread { pullRequest { headRepositoryOwner { login } } } } }".to_string(),
+                "field 'pullRequest' on PayloadThread",
+            ),
+            (
+                "mutation { addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:\"PRRT_1\", body:\"x\"}) { comment { author { ... on User { repositories(first:9) { nodes { name } } } } } } }".to_string(),
+                "field 'author' on PayloadComment",
+            ),
+            (
+                "mutation { resolveReviewThread(input:{threadId:\"PRRT_1\"}) { thread { comments(first:1) { nodes { body } } } } }".to_string(),
+                "field 'comments' on PayloadThread",
+            ),
+        ] {
+            let err = q(&query).unwrap_err();
+            assert!(err.contains(want), "{query}: expected {want:?}, got {err}");
+        }
+    }
+
+    #[test]
+    fn nits_exact_post_and_bounded_type_nesting() {
+        let query = "query={ __typename }";
+        let err = run(&["api", "graphql", "-X", "post", "-f", query]).unwrap_err();
+        assert!(err.contains("POST"), "{err}");
+        let deep = format!(
+            "query($a: {}Int{}) {{ __typename }}",
+            "[".repeat(100),
+            "]".repeat(100)
+        );
+        let err = q(&deep).unwrap_err();
+        assert!(err.contains("nesting too deep"), "{err}");
     }
 }

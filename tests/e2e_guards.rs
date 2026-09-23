@@ -1487,6 +1487,21 @@ fn gh_gate_refuses_non_allowlisted_graphql_mutation() {
     assert_refused(&stderr, ok, "mutation 'mergePullRequest' is not allowed");
 }
 
+#[test]
+fn gh_gate_refuses_graphql_pivot_to_another_repository() {
+    let (_, stderr, ok) = gh_gate(&[
+        "api",
+        "graphql",
+        "-f",
+        "query={ repository(owner: \"navikt\", name: \"cplt\") { pullRequest(number: 1) { headRepositoryOwner { repository(name: \"secret\") { object(expression: \"HEAD:.env\") { ... on Blob { text } } } } } } }",
+    ]);
+    assert_refused(
+        &stderr,
+        ok,
+        "field 'headRepositoryOwner' on PullRequest is not allowed",
+    );
+}
+
 // ============================================================
 // git-gate: Read operations (should be ALLOWED)
 // ============================================================

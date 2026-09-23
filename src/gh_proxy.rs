@@ -2217,7 +2217,8 @@ fn graphql_approval(
         guidance: format!(
             "Reason: {reason}.\n\
              Allowed: read-only queries whose root is repository(owner:, name:) for a \
-             repository in scope, and the mutations resolveReviewThread, \
+             repository in scope and that select only pull request and review-thread \
+             fields, and the mutations resolveReviewThread, \
              unresolveReviewThread and addPullRequestReviewThreadReply on review threads \
              in scope, sent with -f/-F fields. See docs/gh-guard.md."
         ),
