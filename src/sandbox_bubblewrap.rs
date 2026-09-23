@@ -163,6 +163,13 @@ pub(crate) struct Overlays<'a> {
     pub pins: &'a [PathBuf],
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Fails [`test_functionality`], as on a host where `bwrap` is installed
+    /// but user namespaces are disabled.
+    pub(crate) static FAIL_PROBE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Test that bubblewrap can actually create the namespaces we use.
 ///
 /// Runs `bwrap <production args> /bin/true`. The args come straight from
@@ -176,6 +183,10 @@ pub(crate) fn test_functionality(
     overlays: Overlays<'_>,
     deny_masks: &DenyMasks,
 ) -> Result<(), String> {
+    #[cfg(test)]
+    if FAIL_PROBE.get() {
+        return Err("bwrap test failed: forced by test".to_string());
+    }
     let mut args = build_bwrap_args(fs_rules, overlays, deny_masks);
     args.push("--".to_string());
     args.push("/bin/true".to_string());
@@ -1140,7 +1151,7 @@ pub(crate) fn resolve(
     }
 }
 
-fn build_wrapper(
+pub(crate) fn build_wrapper(
     policy: &LandlockPolicy,
     overlays: Overlays<'_>,
     deny_masks: &DenyMasks,

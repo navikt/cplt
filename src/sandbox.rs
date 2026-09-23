@@ -1419,6 +1419,42 @@ fn unmasked_credential_warnings(
         .collect()
 }
 
+/// Create the planned missing home Git config files (#553) and return what
+/// was made, or with `inspect_only`, what a launch would make.
+#[cfg(target_os = "linux")]
+fn create_missing_home_config(config: &SandboxConfig, inspect_only: bool) -> Vec<PathBuf> {
+    let mut made = Vec::new();
+    for planned in plan_missing_home_config_targets(config) {
+        let result = planned.and_then(|(dir, file)| {
+            if inspect_only {
+                return Ok(dir.into_iter().chain([file]).collect());
+            }
+            create_empty_config(dir.as_deref(), &file)
+                .map_err(|e| format!("{} ({e})", file.display()))
+        });
+        match result {
+            Ok(paths) => made.extend(paths),
+            Err(what) => ui::warn(&format!(
+                "Could not create {what}. Git on the host reads it through your home Git \
+                 config symlink once it exists, and it sits in a writable tree, so the \
+                 agent can create it in this run."
+            )),
+        }
+    }
+    if !inspect_only && !made.is_empty() {
+        let list: Vec<String> = made.iter().map(|p| p.display().to_string()).collect();
+        ui::info(&format!(
+            "Created empty {} so Bubblewrap can bind it read-only: git on the host \
+             reads it through your home Git config symlink, and it sits in a writable \
+             tree. Git reads an empty one the same as a missing one, but `git config \
+             --global` writes to ~/.config/git/config once it exists and ~/.gitconfig \
+             does not.",
+            list.join(", ")
+        ));
+    }
+    made
+}
+
 #[cfg(target_os = "linux")]
 fn prepare_impl(
     config: &SandboxConfig,
@@ -1486,57 +1522,8 @@ fn prepare_impl(
         );
     }
 
-    // #553: a home Git config file a link points at inside a writable tree,
-    // but which does not exist yet, gets no bind, so the agent could create
-    // it. Create it empty first, so the read-only bind, the rename pins and
-    // the Landlock read grant below all find it. Only when Bubblewrap can
-    // wrap the run; the warning after `resolve` covers the rest. A call that
-    // only inspects the policy creates nothing and says what a launch would.
-    let mut would_create = Vec::new();
-    if config.use_bubblewrap != Some(false) && bubblewrap::check_availability().is_some() {
-        let mut created = Vec::new();
-        for planned in plan_missing_home_config_targets(config) {
-            let made = planned.and_then(|(dir, file)| {
-                if inspect_only {
-                    would_create.extend(dir.into_iter().chain([file]));
-                    return Ok(Vec::new());
-                }
-                create_empty_config(dir.as_deref(), &file)
-                    .map_err(|e| format!("{} ({e})", file.display()))
-            });
-            match made {
-                Ok(made) => created.extend(made),
-                Err(what) => ui::warn(&format!(
-                    "Could not create {what}. Git on the host reads it through your home Git \
-                     config symlink once it exists, and it sits in a writable tree, so the \
-                     agent can create it in this run."
-                )),
-            }
-        }
-        if !created.is_empty() {
-            let list: Vec<String> = created.iter().map(|p| p.display().to_string()).collect();
-            ui::info(&format!(
-                "Created empty {} so Bubblewrap can bind it read-only: git on the host \
-                 reads it through your home Git config symlink, and it sits in a writable \
-                 tree. Git reads an empty one the same as a missing one, but `git config \
-                 --global` writes to ~/.config/git/config once it exists and ~/.gitconfig \
-                 does not.",
-                list.join(", ")
-            ));
-        }
-    }
-
     let mut policy = landlock_mod::generate_policy(config);
     let mut profile_text = landlock_mod::describe_policy(&policy);
-    if !would_create.is_empty() {
-        use std::fmt::Write as _;
-        profile_text
-            .push_str("## Would create empty at launch (home Git config link targets, #553)\n");
-        for p in &would_create {
-            let _ = writeln!(profile_text, "  {}", p.display());
-        }
-        profile_text.push('\n');
-    }
 
     // Repositories nested inside a writable root, found once and given to BOTH
     // path sets. The leaf binds and the rename pins have to see the same list:
@@ -1547,7 +1534,6 @@ fn prepare_impl(
         let (write_roots, _) = git_roots(config, extra_git_dirs);
         bubblewrap::nested_repo_roots(&write_roots)
     };
-    let ro_protect = ro_protect_paths(config, extra_git_dirs, &nested_repos);
     // #551: a credential entry linked into a granted tree (`~/.ssh ->
     // ~/dotfiles/ssh` with the dotfiles repo as the project) is readable at
     // its target, and Landlock cannot take that back. Bubblewrap masks it
@@ -1556,10 +1542,17 @@ fn prepare_impl(
     let credential_links = landlock_mod::credential_links(config.home_dir, &policy.fs_rules);
     let credential_targets: Vec<PathBuf> =
         credential_links.iter().map(|l| l.target.clone()).collect();
-    let mut pins = pin_paths(config, extra_git_dirs, &nested_repos);
-    pins.extend(home_config_target_pins(config, &credential_targets));
-    pins.sort();
-    pins.dedup();
+    // Built again after #553 creates files below, since both sets only cover
+    // paths that exist.
+    let overlay_paths = || {
+        let ro_protect = ro_protect_paths(config, extra_git_dirs, &nested_repos);
+        let mut pins = pin_paths(config, extra_git_dirs, &nested_repos);
+        pins.extend(home_config_target_pins(config, &credential_targets));
+        pins.sort();
+        pins.dedup();
+        (ro_protect, pins)
+    };
+    let (mut ro_protect, mut pins) = overlay_paths();
 
     // Deny-path masks: Landlock cannot deny subpaths within allowed
     // directories, but Bubblewrap can shadow them at the mount level — denied
@@ -1592,7 +1585,7 @@ fn prepare_impl(
     // `resolve()` only clones `fs_rules`/`net_rules` on the arms that actually
     // build a wrapper (explicit-on, or auto-detect with bwrap available) — the
     // disabled and fallback arms borrow and clone nothing.
-    let bwrap_wrapper = bubblewrap::resolve(
+    let mut bwrap_wrapper = bubblewrap::resolve(
         config.use_bubblewrap,
         &policy,
         bubblewrap::Overlays {
@@ -1601,6 +1594,41 @@ fn prepare_impl(
         },
         &deny_masks,
     )?;
+
+    // #553: a home Git config file a link points at inside a writable tree,
+    // but which does not exist yet, gets no bind, so the agent could create
+    // it. Only once Bubblewrap has passed its probe and will wrap this run:
+    // created any earlier, a probe failure would fall back to Landlock, which
+    // cannot protect the file inside the tree. The warning further down
+    // covers that case. The wrapper is then rebuilt, probe included, so the
+    // read-only bind and the rename pins cover the new files. A call that
+    // only inspects the policy creates nothing and says what a launch would.
+    if let Some(strict) = bwrap_wrapper.as_ref().map(|w| w.strict) {
+        let made = create_missing_home_config(config, inspect_only);
+        if inspect_only && !made.is_empty() {
+            use std::fmt::Write as _;
+            profile_text
+                .push_str("## Would create empty at launch (home Git config link targets, #553)\n");
+            for p in &made {
+                let _ = writeln!(profile_text, "  {}", p.display());
+            }
+            profile_text.push('\n');
+        } else if !made.is_empty() {
+            (ro_protect, pins) = overlay_paths();
+            let overlays = bubblewrap::Overlays {
+                read_only: &ro_protect,
+                pins: &pins,
+            };
+            let rebuilt = bubblewrap::build_wrapper(&policy, overlays, &deny_masks, strict)
+                .map_err(|e| {
+                    format!(
+                        "Bubblewrap failed after cplt created the empty home Git config files \
+                         it binds read-only: {e}. Not starting without that bind."
+                    )
+                })?;
+            bwrap_wrapper = Some(rebuilt);
+        }
+    }
 
     // Under bubblewrap a root AGENTS.md below the private /tmp gets no mount
     // (`mount_rules`), so the launch gives no grant: do not print one.
@@ -2399,6 +2427,48 @@ mod tests {
         config.project_dir = &project;
         let err = super::validate_config_paths(&config).expect_err("must refuse");
         assert!(err.contains("Home Git config symlink target"), "{err}");
+    }
+
+    /// #553: files are created only once Bubblewrap will wrap the run. With
+    /// `bwrap` installed but failing its probe, auto mode falls back to
+    /// Landlock, which cannot protect a file inside the writable tree, so
+    /// nothing is created and the launch warns that the target is missing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_home_config_is_not_created_when_bwrap_falls_back() {
+        if bubblewrap::check_availability().is_none() {
+            eprintln!("skipped: bwrap not installed");
+            return;
+        }
+        let tmp = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let home = root.join("home");
+        let project = root.join("project");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        std::fs::create_dir_all(&project).expect("mkdir project");
+        let target = project.join("gitconfig");
+        std::os::unix::fs::symlink(&target, home.join(".gitconfig")).expect("symlink");
+        let mut config = test_config(&home, &[]);
+        config.project_dir = &project;
+
+        bubblewrap::FAIL_PROBE.set(true);
+        let prepared = prepare(&config);
+        bubblewrap::FAIL_PROBE.set(false);
+        assert!(prepared.expect("prepare").bwrap_wrapper.is_none());
+        assert!(!target.exists(), "created without a wrapper");
+        // What the "does not exist yet" launch warning iterates.
+        assert_eq!(
+            home_config_targets_in_writable_trees(
+                &config,
+                policy::missing_home_config_link_targets(&home)
+            )
+            .len(),
+            1
+        );
+
+        // Control: with a working probe the same setup does create it.
+        let prepared = prepare(&config).expect("prepare");
+        assert!(prepared.bwrap_wrapper.is_some() && target.is_file());
     }
 
     /// What a launch under Bubblewrap does with the plan: create each entry,
