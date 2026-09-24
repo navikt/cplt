@@ -64,7 +64,7 @@ pub(super) fn apply_deny_env_and_credential(
         cmd.env_remove(var);
     }
     if let Some((var, val)) = substitute.and_then(crate::agent::KeychainSubstitute::env_value)
-        // `deny_env` wins here too, not only in `credential_outside_keychain`.
+        // `deny_env` wins here too, not only in `sandbox::keychain_substitute`.
         // That filter is what keeps a denied var from becoming a substitute in
         // the first place, so today this is unreachable — but this function
         // removes and then re-adds, and re-adding a var the repo denied is the
@@ -110,6 +110,9 @@ fn configure_command(
     // suppress the extraction. See `child_keeps_a_github_token`.
     deny_env: &[String],
     worktree_root: Option<&Path>,
+    // The Keychain substitute this run resolved. A `GhToken` one already puts
+    // gh's token in the child, so neither channel below runs `gh` again.
+    keychain_substitute: Option<&crate::agent::KeychainSubstitute>,
 ) {
     for arg in copilot_args {
         cmd.arg(arg);
@@ -288,7 +291,7 @@ fn configure_command(
         if gh_guard.enabled {
             // Inject GH_TOKEN into env only when explicitly requested.
             if gh_guard.inject_token {
-                inject_gh_token_if_needed(cmd, agent, deny_env);
+                inject_gh_token_if_needed(cmd, agent, deny_env, keychain_substitute);
             }
             // Cache token to file so the wrapper can serve `gh auth token`
             // requests without exposing the token as an env var to all child
@@ -302,7 +305,7 @@ fn configure_command(
             // does not close — the window. A determined agent that reads
             // `$TMPDIR/.gh-token` before the legitimate consumer still wins.
             if gh_guard.block_auth_token {
-                cache_gh_token_to_file(scratch, agent, deny_env);
+                cache_gh_token_to_file(scratch, agent, deny_env, keychain_substitute);
             }
         }
         install_command_wrappers(
@@ -486,9 +489,26 @@ fn child_keeps_a_github_token(deny_env: &[String]) -> bool {
     })
 }
 
-fn inject_gh_token_if_needed(cmd: &mut Command, agent: Agent, deny_env: &[String]) {
+/// Whether the Keychain trade already hands gh's token to the child (#277).
+/// Then the inject and cache channels would only run `gh auth token` again.
+fn substitute_carries_gh_token(substitute: Option<&crate::agent::KeychainSubstitute>) -> bool {
+    matches!(
+        substitute,
+        Some(crate::agent::KeychainSubstitute::GhToken { .. })
+    )
+}
+
+fn inject_gh_token_if_needed(
+    cmd: &mut Command,
+    agent: Agent,
+    deny_env: &[String],
+    substitute: Option<&crate::agent::KeychainSubstitute>,
+) {
     // Only inject for Copilot — other agents have their own auth.
-    if agent != Agent::Copilot || child_keeps_a_github_token(deny_env) {
+    if agent != Agent::Copilot
+        || child_keeps_a_github_token(deny_env)
+        || substitute_carries_gh_token(substitute)
+    {
         return;
     }
     // Into the first name the deny list does not strip. Injecting into
@@ -539,8 +559,12 @@ fn inject_gh_token_if_needed(cmd: &mut Command, agent: Agent, deny_env: &[String
 ///
 /// So: cache only for Copilot, only when `GH_TOKEN` itself is not denied, and
 /// only when the child would not already have one of its own.
-fn should_cache_token(agent: Agent, deny_env: &[String]) -> bool {
-    if agent != Agent::Copilot {
+fn should_cache_token(
+    agent: Agent,
+    deny_env: &[String],
+    substitute: Option<&crate::agent::KeychainSubstitute>,
+) -> bool {
+    if agent != Agent::Copilot || substitute_carries_gh_token(substitute) {
         return false;
     }
     // GH_TOKEN specifically, not any of the three. #225 asks for the cache to
@@ -551,8 +575,13 @@ fn should_cache_token(agent: Agent, deny_env: &[String]) -> bool {
     !target_denied && !child_keeps_a_github_token(deny_env)
 }
 
-fn cache_gh_token_to_file(scratch_dir: &Path, agent: Agent, deny_env: &[String]) {
-    if !should_cache_token(agent, deny_env) {
+fn cache_gh_token_to_file(
+    scratch_dir: &Path,
+    agent: Agent,
+    deny_env: &[String],
+    substitute: Option<&crate::agent::KeychainSubstitute>,
+) {
+    if !should_cache_token(agent, deny_env, substitute) {
         return;
     }
     let Some(token) = extract_gh_token() else {
@@ -1268,6 +1297,7 @@ pub fn exec(
         sandbox.playwright_runtime,
         deny_env,
         sandbox.worktree_root.as_deref(),
+        sandbox.keychain_substitute.as_ref(),
     );
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
@@ -1398,6 +1428,7 @@ pub fn exec(
         sandbox.playwright_runtime,
         deny_env,
         sandbox.worktree_root.as_deref(),
+        sandbox.keychain_substitute.as_ref(),
     );
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
@@ -1548,6 +1579,7 @@ fn exec_bwrap(
         sandbox.playwright_runtime,
         deny_env,
         sandbox.worktree_root.as_deref(),
+        sandbox.keychain_substitute.as_ref(),
     );
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
     // Set the re-entry env AFTER configure_command so a `clear_first` env build
@@ -1783,11 +1815,11 @@ mod gh_token_extraction_tests {
             ],
             || {
                 assert!(
-                    should_cache_token(Agent::Copilot, &[]),
+                    should_cache_token(Agent::Copilot, &[], None),
                     "no deny and no ambient token: the cache is the only channel"
                 );
                 assert!(
-                    !should_cache_token(Agent::Copilot, &["GH_TOKEN".to_string()]),
+                    !should_cache_token(Agent::Copilot, &["GH_TOKEN".to_string()], None),
                     "denying the injection target must silence the cache too"
                 );
                 // Narrower denies do not cost the cache. #225 ties the cache to
@@ -1795,7 +1827,7 @@ mod gh_token_extraction_tests {
                 // statement about that variable, not "no GitHub credential".
                 for other in ["GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"] {
                     assert!(
-                        should_cache_token(Agent::Copilot, &[other.to_string()]),
+                        should_cache_token(Agent::Copilot, &[other.to_string()], None),
                         "{other} denied alone must leave the cache channel open"
                     );
                 }
@@ -1807,8 +1839,35 @@ mod gh_token_extraction_tests {
     #[test]
     fn other_agents_never_get_the_token_cache() {
         for agent in [Agent::Claude, Agent::OpenCode, Agent::Shell, Agent::Goose] {
-            assert!(!should_cache_token(agent, &[]), "{agent:?}");
+            assert!(!should_cache_token(agent, &[], None), "{agent:?}");
         }
+    }
+
+    /// #277: when the Keychain trade already hands gh's token over, the cache
+    /// channel must not run `gh auth token` a second time. An env-var or file
+    /// substitute changes nothing here.
+    #[test]
+    fn a_gh_token_substitute_skips_the_second_extraction() {
+        use crate::agent::{KeychainSubstitute, SecretToken};
+        temp_env::with_vars(
+            [
+                ("GH_TOKEN", None::<&str>),
+                ("GITHUB_TOKEN", None),
+                ("COPILOT_GITHUB_TOKEN", None),
+            ],
+            || {
+                let gh = KeychainSubstitute::GhToken {
+                    var: "GH_TOKEN",
+                    token: SecretToken::new("tok".into()),
+                };
+                assert!(!should_cache_token(Agent::Copilot, &[], Some(&gh)));
+                assert!(substitute_carries_gh_token(Some(&gh)));
+                let file = KeychainSubstitute::File("/tmp/tok".into());
+                assert!(should_cache_token(Agent::Copilot, &[], Some(&file)));
+                assert!(!substitute_carries_gh_token(Some(&file)));
+                assert!(!substitute_carries_gh_token(None));
+            },
+        );
     }
 
     /// Injecting into a denied name hands the token to a variable that is

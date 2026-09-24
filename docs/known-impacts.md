@@ -49,7 +49,6 @@ On macOS this applies to every writable root, the launch repository included,
 not only to repositories named with `--repo-dir`. Tracked in
 [#402](https://github.com/navikt/cplt/issues/402), which also covers whether
 the guard should intercept these forms and fail loudly instead.
-||||||| parent of fc464a5 (fix(gh-guard): inject_token did nothing with the guard off, and said nothing)
 
 ## Linux: the system keyring is unreachable, so agents ask you to sign in again
 

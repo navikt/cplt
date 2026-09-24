@@ -555,7 +555,7 @@ What the gh/git guard stops, and what it does not.
 | Agent triggers CI workflows | `gh workflow run` blocked |
 | Agent pushes directly to main/master | `git push` blocked (or only default branch blocked with `protect_default_branch_only`) |
 | Agent force-pushes and rewrites history | `--force`/`--force-with-lease` detection on push |
-| Agent exfiltrates `gh auth token` value | `gh auth token` blocked; token served via one-time-read file (deleted after first use). Env var injection only with `inject_token=true`. Best-effort, not a same-UID boundary ([SECURITY.md](../SECURITY.md#honest-gaps)): `gh auth git-credential get` is allowed so HTTPS push works, and it prints `password=<token>` wherever the agent still has a token source |
+| Agent exfiltrates `gh auth token` value | `gh auth token` blocked; token served via one-time-read file (deleted after first use). Env var injection only with `inject_token=true`, or for Copilot with `sandbox.keychain_substitute=true`: that trades the Keychain grant for the token in `GH_TOKEN`, so `block_auth_token` no longer keeps it out of the environment. Best-effort, not a same-UID boundary ([SECURITY.md](../SECURITY.md#honest-gaps)): `gh auth git-credential get` is allowed so HTTPS push works, and it prints `password=<token>` wherever the agent still has a token source |
 | Agent modifies secrets/variables | `gh secret set/delete`, `gh variable set/delete` blocked |
 | Agent installs malicious gh extensions | `gh extension install/remove` blocked |
 | Agent operates on other repositories | `-R other/repo` checked via ScopeCheck |

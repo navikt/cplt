@@ -1255,7 +1255,7 @@ pub(crate) fn keychain_substitute_with(
         .find(|v| !deny_env.iter().any(|d| d == *v))?;
     Some(crate::agent::KeychainSubstitute::GhToken {
         var,
-        token: crate::agent::SecretToken(extract()?),
+        token: crate::agent::SecretToken::new(extract()?),
     })
 }
 

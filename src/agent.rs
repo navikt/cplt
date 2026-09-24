@@ -209,7 +209,18 @@ pub enum KeychainSubstitute {
 
 /// A token that never prints: `Debug` redacts it, and there is no `Display`.
 #[derive(Clone, PartialEq, Eq)]
-pub struct SecretToken(pub String);
+pub struct SecretToken(pub(crate) String);
+
+impl SecretToken {
+    pub(crate) fn new(token: String) -> Self {
+        Self(token)
+    }
+
+    /// The token itself, for the one place that sets it in the child.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
 
 impl std::fmt::Debug for SecretToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -224,7 +235,7 @@ impl KeychainSubstitute {
     pub fn env_value(&self) -> Option<(&'static str, String)> {
         match self {
             KeychainSubstitute::EnvVar(v) => std::env::var(v).ok().map(|val| (*v, val)),
-            KeychainSubstitute::GhToken { var, token } => Some((var, token.0.clone())),
+            KeychainSubstitute::GhToken { var, token } => Some((var, token.expose().to_string())),
             KeychainSubstitute::File(_) => None,
         }
     }
@@ -525,7 +536,7 @@ impl Agent {
             // exported is handled by `KeychainSubstitute::GhToken`.
             Agent::Copilot => &["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"],
             // Antigravity has no env substitute — its credential lives in
-            // a file instead, see `credential_outside_keychain`.
+            // a file instead, see `credential_outside_keychain_on`.
             Agent::Antigravity => &[],
             // `claude setup-token` mints a long-lived token for
             // CLAUDE_CODE_OAUTH_TOKEN. Verified against claude 2.1.258: with it
@@ -2605,7 +2616,7 @@ mod tests {
     #[test]
     fn keychain_needs() {
         // All four are the *base* term — the grant is still conditional on
-        // `credential_outside_keychain` at launch (#242).
+        // `sandbox::keychain_substitute` at launch (#242).
         assert!(Agent::Copilot.needs_keychain());
         assert!(Agent::Antigravity.needs_keychain());
         assert!(Agent::Claude.needs_keychain());
@@ -2946,7 +2957,7 @@ mod tests {
                 // mid-session for some providers, so a one-shot substitute
                 // cannot be safe for all of them.
                 Agent::Goose => &[],
-                // File-based substitute instead, in `credential_outside_keychain`.
+                // File-based substitute instead, in `credential_outside_keychain_on`.
                 Agent::Antigravity => &[],
                 Agent::Claude => &["CLAUDE_CODE_OAUTH_TOKEN"],
                 // Agents that never wanted the grant have nothing to trade.
@@ -2967,6 +2978,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The extracted gh token must never reach a log line or a summary.
+    #[test]
+    fn gh_token_substitute_never_prints_its_token() {
+        let secret = "gho_do_not_print_me";
+        let sub = KeychainSubstitute::GhToken {
+            var: "GH_TOKEN",
+            token: SecretToken::new(secret.into()),
+        };
+        for shown in [
+            format!("{sub:?}"),
+            format!("{sub:#?}"),
+            format!("{sub}"),
+            format!("{:?}", SecretToken::new(secret.into())),
+        ] {
+            assert!(!shown.contains(secret), "token leaked: {shown}");
+        }
+        assert_eq!(sub.env_value(), Some(("GH_TOKEN", secret.to_string())));
     }
 
     #[test]
