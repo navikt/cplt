@@ -50,7 +50,7 @@ pub fn run_init(project_dir: &Path, report: &DetectionReport, opts: &InitOptions
     // This is a local dev tool for authoring configs — the runtime config loader
     // in repo_config.rs reads from git HEAD for tamper-resistance.
     let toml = if opts.merge && config_path.exists() {
-        let existing = match std::fs::read_to_string(&config_path) {
+        let existing = match read_config(&config_path) {
             Ok(c) => c,
             Err(e) => return InitResult::WriteFailed(config_path, e),
         };
@@ -63,7 +63,7 @@ pub fn run_init(project_dir: &Path, report: &DetectionReport, opts: &InitOptions
         if config_path.exists() && !opts.force && !opts.merge {
             return InitResult::AlreadyExists(config_path);
         }
-        if let Err(e) = std::fs::write(&config_path, &toml) {
+        if let Err(e) = write_config(&config_path, &toml) {
             return InitResult::WriteFailed(config_path, e);
         }
         return InitResult::Generated {
@@ -78,6 +78,69 @@ pub fn run_init(project_dir: &Path, report: &DetectionReport, opts: &InitOptions
         path: config_path,
         written: false,
     }
+}
+
+/// Open `.cplt.toml` without following a symlink. A repository can ship it as
+/// a link to any file the user can write, so project init refuses a link
+/// instead of reading or writing through it. The global config is left alone:
+/// it sits outside the agent's reach, and dotfile managers symlink it.
+///
+/// A hard link reaches another file just as well, and a FIFO or device is no
+/// config at all, so the opened file must be a regular file with one link.
+/// `O_NONBLOCK` keeps a FIFO from hanging the open before that check runs.
+fn open_config(path: &Path, opts: &mut std::fs::OpenOptions) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let file = opts
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|e| {
+            // O_NOFOLLOW refusing a symlink surfaces as ELOOP.
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                std::io::Error::other(format!(
+                    "{} is a symlink, and cplt init does not read or write through links; \
+                     remove it or edit its target by hand",
+                    path.display()
+                ))
+            } else {
+                e
+            }
+        })?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::other(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    if meta.nlink() > 1 {
+        return Err(std::io::Error::other(format!(
+            "{} has other hard links, and cplt init does not read or write through links; \
+             remove it or edit it by hand",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
+fn read_config(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut s = String::new();
+    open_config(path, std::fs::OpenOptions::new().read(true))?.read_to_string(&mut s)?;
+    Ok(s)
+}
+
+fn write_config(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    // No O_TRUNC: it would empty a hard-linked file before the check runs.
+    let mut file = open_config(
+        path,
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false),
+    )?;
+    file.set_len(0)?;
+    file.write_all(contents.as_bytes())
 }
 
 /// Format the detection report for human-readable stdout display.
@@ -1613,5 +1676,90 @@ git_push_prevention = true
             },
         );
         assert!(matches!(result, InitResult::AlreadyExists(_)));
+    }
+
+    /// Run project init with `--write` and the given flags, expecting it to
+    /// refuse; returns the error text.
+    fn init_refusal(dir: &Path, force: bool, merge: bool) -> String {
+        let report = DetectionReport {
+            detections: vec![Detection {
+                name: "Docker",
+                signals: vec![],
+                suggestions: vec![Suggestion::Propose(SandboxFlag::AllowDocker)],
+            }],
+            suggestions: [Suggestion::Propose(SandboxFlag::AllowDocker)]
+                .into_iter()
+                .collect(),
+            diagnostics: vec![],
+            workspace_members: vec![],
+            provenance: std::collections::BTreeMap::new(),
+        };
+
+        let opts = InitOptions {
+            write: true,
+            force,
+            merge,
+            quiet: false,
+        };
+        match run_init(dir, &report, &opts) {
+            InitResult::WriteFailed(_, e) => e.to_string(),
+            _ => panic!("expected WriteFailed for force={force} merge={merge}"),
+        }
+    }
+
+    #[test]
+    fn write_refuses_symlinked_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "precious\n").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.path().join(".cplt.toml")).unwrap();
+
+        for (force, merge) in [(true, false), (false, true)] {
+            let e = init_refusal(dir.path(), force, merge);
+            assert!(e.contains("symlink"), "{e}");
+        }
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious\n");
+    }
+
+    #[test]
+    fn write_refuses_dangling_symlinked_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("created-elsewhere");
+        std::os::unix::fs::symlink(&victim, dir.path().join(".cplt.toml")).unwrap();
+
+        let e = init_refusal(dir.path(), false, false);
+        assert!(e.contains("symlink"), "{e}");
+        assert!(!victim.exists(), "init created the link's target");
+    }
+
+    #[test]
+    fn write_refuses_hardlinked_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "precious\n").unwrap();
+        std::fs::hard_link(&victim, dir.path().join(".cplt.toml")).unwrap();
+
+        for (force, merge) in [(true, false), (false, true)] {
+            let e = init_refusal(dir.path(), force, merge);
+            assert!(e.contains("hard links"), "{e}");
+        }
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious\n");
+    }
+
+    #[test]
+    fn merge_refuses_fifo_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = std::ffi::CString::new(
+            dir.path()
+                .join(".cplt.toml")
+                .into_os_string()
+                .into_encoded_bytes(),
+        )
+        .unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+        // Without O_NONBLOCK this open would block until a writer appeared.
+        let e = init_refusal(dir.path(), false, true);
+        assert!(e.contains("not a regular file"), "{e}");
     }
 }
