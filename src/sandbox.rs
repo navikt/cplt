@@ -3376,6 +3376,25 @@ mod tests {
         }
     }
 
+    /// A symlinked `~/Library/Caches` whose target the profile cannot name
+    /// stops the launch: Seatbelt matches the resolved path, so the default
+    /// cache would get no exec carve-out, write deny or pin.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prepare_refuses_a_default_copilot_cache_it_cannot_name() {
+        let (_guard, root) = copilot_cache_tree();
+        let target = root.join("bad\"caches");
+        std::fs::create_dir_all(target.join("copilot/pkg")).unwrap();
+        std::fs::create_dir_all(root.join("home/Library")).unwrap();
+        std::os::unix::fs::symlink(&target, root.join("home/Library/Caches")).unwrap();
+        let error = prepare_with_copilot_cache(&root, "UNSET", Path::new("/"), &[])
+            .expect_err("an unnameable default must stop the launch");
+        assert!(
+            error.contains("the sandbox profile cannot name") && error.contains("bad\"caches"),
+            "{error}"
+        );
+    }
+
     /// Reaching the default through a symlink outside every writable tree is
     /// the default too: nothing the agent can write decides where it points.
     #[test]

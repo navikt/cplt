@@ -2417,6 +2417,22 @@ pub fn copilot_pkg_dirs(
             tree.display()
         ));
     }
+    // Seatbelt matches the resolved path, and a target the profile cannot
+    // name gets no exec carve-out, write deny or pin: fail closed instead.
+    let real = crate::config::canonicalize_deepest(&default);
+    if os == "macos"
+        && real != default
+        && let Err(e) = validate_sbpl_path(&real)
+    {
+        return Err(format!(
+            "cplt refuses the Copilot cache {}: it resolves through a symlink to {}, \
+             which the sandbox profile cannot name, so cplt could not protect it. \
+             Point the link at a path without quotes, semicolons, parentheses, \
+             backslashes or line breaks.\n{e}",
+            default.display(),
+            real.display()
+        ));
+    }
     let mut dirs = vec![default];
     for dir in [resolve(&xdg_only)?, resolve(env)?] {
         if !dirs.contains(&dir) {
