@@ -309,7 +309,7 @@ subcommand.
 | `-X POST/PUT/PATCH` | Block | ScopeCheck | Write operation, opt-in required |
 | `-X DELETE` | Block | Block | Destructive, always blocked |
 | `-f`, `-F`, or `--input` present | Block | ScopeCheck | Input implies write, opt-in required |
-| `graphql` endpoint | Block | Block | Arbitrary mutations possible, always blocked |
+| `graphql` endpoint | See [below](#gh-api-graphql) | See [below](#gh-api-graphql) | Read-only queries of allowlisted pull request and review-thread fields on a repository in scope, and three review-thread mutations with verified targets. Everything else is blocked |
 | Write to `repos/{o}/{r}/pulls/{n}/merge` or `repos/{o}/{r}/merges` | Block | Block | A merge must go through `gh pr merge` and its `allow_pr_merge` check |
 
 Note that `allow_api_write = true` scope-checks writes rather than freeing them.
@@ -340,8 +340,8 @@ allow_api_write = true
 cplt --allow-api-write -- -p "post review comment replies"
 ```
 
-> **Note:** `gh api graphql` remains unconditionally blocked even with `allow_api_write = true`
-> because GraphQL mutations are specified via stdin and cannot be statically scope-checked.
+> **Note:** `allow_api_write` has no effect on `gh api graphql`. What GraphQL allows is
+> fixed, and described in [`gh api graphql`](#gh-api-graphql).
 
 ### API scope enforcement
 
@@ -356,6 +356,127 @@ GET requests are repo-scoped. Only endpoints matching
 
 Agents that need current-repo data (issues, PRs, actions, commits) work normally.
 If an agent needs org-level access, the human should run those commands outside the sandbox.
+
+### `gh api graphql`
+
+Some review actions exist only in GraphQL: which review threads are still open
+(`isResolved`), and resolving one. So `gh api graphql` is allowed in two narrow
+shapes and refused in every other.
+
+**Read-only queries of review threads in a repository in scope.** Every root
+field must be `repository(owner: …, name: …)` for a repository in the scope
+set, or `__typename`. `viewer`, `search`, `node`, `organization` and the rest of
+the root are refused. Below the root, each field must be on an allowlist for the
+type it is selected on (`FIELDS` in `src/gh_graphql.rs`):
+
+| On | Fields |
+|----|--------|
+| `Repository` | `pullRequest(number:)`, `pullRequests(first, last, after, before, states, orderBy, labels, headRefName, baseRefName)` |
+| `PullRequest` | `id`, `number`, `title`, `state`, `url`, `isDraft`, `headRefName`, `baseRefName`, `reviewThreads(first, after)` |
+| `PullRequestReviewThread` | `id`, `isResolved`, `isOutdated`, `path`, `line`, `originalLine`, `startLine`, `diffSide`, `comments(first, after)` |
+| `PullRequestReviewComment` | `id`, `body`, `url`, `createdAt`, `path`, `author { login }` |
+| each connection | `nodes`, `edges { cursor node }`, `totalCount`, `pageInfo { hasNextPage hasPreviousPage endCursor startCursor }` |
+| mutation payloads | `thread { id isResolved }`, `comment { id url }`, `clientMutationId` |
+| any type | `__typename` |
+
+Any other field or argument is refused, and so is every fragment (named,
+spread or inline).
+
+```bash
+gh api graphql -f query='{
+  repository(owner: "navikt", name: "cplt") {
+    pullRequest(number: 414) {
+      reviewThreads(first: 100) { nodes { id isResolved path } }
+    }
+  }
+}'
+```
+
+**Three review-thread mutations**: `resolveReviewThread`,
+`unresolveReviewThread` and `addPullRequestReviewThreadReply`. Each takes an
+`input: { … }` object literal. Before `gh` runs, the gate looks up every node ID
+the mutation names (`threadId`, `pullRequestReviewThreadId`,
+`pullRequestReviewId`) with a read-only `node(id:)` query, and requires the node
+to be of the expected type and to belong to a `https://github.com/` repository
+in the scope set. If a lookup fails, returns another type, or names another
+repository, the command is refused.
+
+```bash
+gh api graphql -f query='mutation($id: ID!) {
+  resolveReviewThread(input: {threadId: $id}) { thread { isResolved } }
+}' -f id=PRRT_kwDO...
+```
+
+These are allowed without `allow_api_write`, like `gh pr comment` and
+`gh pr review`, which also write to the pull request in scope. They are refused
+when `scope_check` is off, because then nothing holds a GraphQL request to a
+repository.
+
+#### How the request is checked
+
+The gate parses the GraphQL document itself with a strict parser, and refuses
+anything it cannot parse. It does not match text. Beyond what is described
+above, it refuses:
+
+- more than one operation in a document (so `operationName` never picks an
+  unchecked one), and every `subscription`
+- every fragment: definitions, spreads and inline fragments, wherever they
+  appear. An alias never counts: in `resolveReviewThread: deleteIssue(…)` the
+  field is `deleteIssue`
+- any field or argument not in the allowlist above for its parent type
+- a duplicated argument or input field (`threadId: "a", threadId: "b"`), so the
+  guard and the server cannot read different values
+- names and IDs it cannot know the value of: a string with escapes, a block
+  string, an unbound variable, a variable bound by `-F` to a number, boolean or
+  null, and `input: $var` in place of an object literal
+- a variable named `operationName` or `endCursor` may never supply a name or
+  ID: `gh` sends the first outside `variables`, and `--paginate` overwrites the
+  second with a value from the response
+- the ways `gh` sends something other than the arguments the guard saw:
+  `--input`, `-H`, `-p`, `-X` other than `POST`, `-F key=@file`,
+  `{owner}`/`{repo}`/`{branch}`/`:owner` placeholders in `-F` values (a branch
+  name can contain GraphQL punctuation), nested `key[sub]=` fields, attached
+  short flags such as `-fquery=…`, and a `--hostname` other than `github.com`
+- the endpoint spelled any way but `graphql` (`/graphql`, a full URL,
+  `graphql?x`): those stay blocked as before
+
+#### Threat model
+
+What an agent can do with this:
+
+- read the allowlisted pull request, review-thread and comment fields of a
+  repository in scope, including comment bodies and authors' logins
+- resolve, unresolve and reply to review threads on pull requests in a
+  repository in scope
+
+What it can't do through the guard:
+
+- run any other mutation, on any repository
+- write to a review thread outside the scope set
+- start a query at another repository, the viewer, an organization, a search,
+  or an arbitrary node
+- follow an edge out of the repository: owners, users, other repositories, fork
+  parents, cross-references, file contents (`object`) and the viewer's
+  repositories are not on the allowlist
+
+Where it stops:
+
+- **The allowlist depends on GitHub's schema.** Each allowlisted field is a
+  scalar or leads only to another allowlisted type. If GitHub changed one of
+  these fields to return something else, the guard would not notice.
+- **The lookup runs in the sandbox, as the agent.** The gate calls the real
+  `gh` with the agent's environment, minus `GH_HOST` and `GH_REPO`, just as it
+  runs the approved command. That keeps both on the same host, but it stops a
+  cooperative or confused agent, not a hostile one. A hostile agent can already
+  call the real `gh` directly (see
+  [What it does NOT protect against](#what-it-does-not-protect-against)).
+- **Check and use are separate calls.** A node's repository does not change
+  after the lookup, because review threads and reviews do not move between
+  repositories. But the lookup and the mutation are two requests.
+
+`cplt check exec gh api graphql …` reports the static verdict. For a mutation
+it says the command is allowed if the targets are in scope, because the lookup
+only happens when the command runs.
 
 ### Why `gh api` is stricter than other commands
 
@@ -439,7 +560,8 @@ What the gh/git guard stops, and what it does not.
 | Agent installs malicious gh extensions | `gh extension install/remove` blocked |
 | Agent operates on other repositories | `-R other/repo` checked via ScopeCheck |
 | Agent uses `gh api` POST to mutate state | Presence of `-f`, `-F`, `--input`, or non-GET method is blocked by default; opt-in with `allow_api_write = true` (scope-checked to current repo) |
-| Agent uses `gh api graphql` for mutations | `graphql` endpoint unconditionally blocked even with `allow_api_write = true` (mutations via stdin not parseable) |
+| Agent uses `gh api graphql` to read outside the repository | Queries must start at a repository in scope and select only allowlisted pull request and review-thread fields; fragments are refused. See [`gh api graphql`](#gh-api-graphql) |
+| Agent uses `gh api graphql` for mutations | Only `resolveReviewThread`, `unresolveReviewThread` and `addPullRequestReviewThreadReply` are allowed, after a lookup shows every target is in a repository in scope. The document is parsed, and anything unparseable is refused. See [`gh api graphql`](#gh-api-graphql) |
 
 ### What it does NOT protect against
 
@@ -483,7 +605,7 @@ The command guards are covered by `tests/e2e_guards.rs` and the `#[cfg(test)]` m
 - Scope checking: matching, non-matching, case-insensitive, `.git` suffix
 - API endpoint path extraction and cross-repo detection
 - Input flag bypass attempts (`--field=value`, `-fvalue`, `--input=-`)
-- GraphQL endpoint blocking
+- GraphQL: parsing, the query and mutation allowlists, smuggling attempts, target verification
 - Force-push flag detection, including the `--force-with-lease=ref` form
 - URL parsing: HTTPS, SSH shorthand, SSH URL, non-GitHub
 - Wrapper script generation for both gh and git

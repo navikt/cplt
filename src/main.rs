@@ -4084,6 +4084,9 @@ enum GateEffect {
     ServeCachedToken,
     /// Refuse, printing this refusal and the guard's escape hatch.
     Refuse(gh_proxy::Refusal),
+    /// Look these GraphQL mutation targets up with GitHub, then run the real
+    /// binary unpinned if every one is in scope, or refuse (#414).
+    VerifyGraphql(Vec<cplt::gh_graphql::Target>),
 }
 
 /// Runs the real `gh` for a read the merge check needs: `(GH_REPO, args)`.
@@ -4143,20 +4146,28 @@ fn decide_gh_gate(
             Ok((a, pinned))
         });
     match verdict {
+        Ok((approval, _)) if !approval.graphql_targets.is_empty() => {
+            GateEffect::VerifyGraphql(approval.graphql_targets)
+        }
         Ok((approval, pinned)) => match (approval.repo_scope, pinned) {
             (Some(repo), Some(args)) => GateEffect::ExecRewritten { repo, args },
             (Some(repo), None) => GateEffect::ExecScoped(repo),
             // The check refuses without a pinned repo, so a rewrite always has one.
             (None, _) => GateEffect::ExecPlain { notice: None },
         },
-        Err(refusal) => match policy.mode {
-            config::EnforcementMode::Block => GateEffect::Refuse(refusal),
-            config::EnforcementMode::Warn => GateEffect::ExecPlain {
-                notice: Some(refusal.warning()),
-            },
-            config::EnforcementMode::Audit => GateEffect::ExecPlain {
-                notice: Some(format!("[audit] gh-gate: would block: {refusal}")),
-            },
+        Err(refusal) => refusal_effect(policy.mode, refusal),
+    }
+}
+
+/// A refusal as the enforcement mode carries it out.
+fn refusal_effect(mode: config::EnforcementMode, refusal: gh_proxy::Refusal) -> GateEffect {
+    match mode {
+        config::EnforcementMode::Block => GateEffect::Refuse(refusal),
+        config::EnforcementMode::Warn => GateEffect::ExecPlain {
+            notice: Some(refusal.warning()),
+        },
+        config::EnforcementMode::Audit => GateEffect::ExecPlain {
+            notice: Some(format!("[audit] gh-gate: would block: {refusal}")),
         },
     }
 }
@@ -4173,9 +4184,19 @@ fn run_gh_gate(
     args: &[String],
     policy: &gh_proxy::GatePolicy,
 ) -> ExitCode {
-    let effect = decide_gh_gate(args, policy, repo_scope, real_git, &mut |repo, lookup| {
+    let effect = match decide_gh_gate(args, policy, repo_scope, real_git, &mut |repo, lookup| {
         run_gh_lookup(real_gh, repo, lookup)
-    });
+    }) {
+        GateEffect::VerifyGraphql(targets) => {
+            match cplt::gh_graphql::verify_targets(real_gh, &targets, repo_scope) {
+                Ok(()) => GateEffect::ExecPlain { notice: None },
+                Err(reason) => {
+                    refusal_effect(policy.mode, gh_proxy::graphql_target_refusal(&reason))
+                }
+            }
+        }
+        effect => effect,
+    };
     perform_gate_effect(real_gh, "gh", args, effect)
 }
 
@@ -4211,6 +4232,9 @@ fn perform_gate_effect(
 ) -> ExitCode {
     match effect {
         GateEffect::ServeCachedToken => serve_cached_gh_token(),
+        GateEffect::VerifyGraphql(_) => {
+            unreachable!("run_gh_gate resolves VerifyGraphql before performing it")
+        }
         GateEffect::Refuse(refusal) => {
             eprintln!("{refusal}\n{}", escape_hatch(name));
             ExitCode::FAILURE

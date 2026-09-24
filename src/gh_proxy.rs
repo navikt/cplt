@@ -1149,18 +1149,17 @@ pub fn evaluate_with_policy(cmd: &ParsedCommand, allow_api_write: bool) -> Polic
 ///
 /// GET requests are scope-checked. Any other method (or presence of input
 /// flags that imply a write) is blocked by default. When `allow_api_write`
-/// is true, writes are scope-checked instead of blocked. GraphQL is always
-/// blocked regardless (arbitrary mutations can't be statically scope-checked).
+/// is true, writes are scope-checked instead of blocked. GraphQL is blocked
+/// here in every spelling; for the exact `graphql` endpoint the gate ignores
+/// this verdict and decides with `graphql_approval` instead (#414).
 fn evaluate_api(cmd: &ParsedCommand, allow_api_write: bool) -> PolicyResult {
-    // Block GraphQL endpoint — it allows arbitrary mutations via stdin/body
-    // that cannot be statically analyzed for scope or intent.
-    // Normalize: strip trailing slashes and query params before matching.
+    // Block the GraphQL endpoint. Spellings `gh` does not treat as GraphQL
+    // (`/graphql`, full URL, query string) stay blocked. Exact `graphql` is parsed
+    // and allowlisted by the gate, which does not use this verdict for it.
+    // Normalize: strip query and fragment first, then slashes. The other order
+    // leaves `graphql/?x` as `graphql/`, which would pass as REST.
     if let Some(ref endpoint) = cmd.api_endpoint {
-        let normalized = endpoint
-            .trim_end_matches('/')
-            .split('?')
-            .next()
-            .unwrap_or(endpoint);
+        let normalized = endpoint.split(['?', '#']).next().unwrap_or(endpoint);
         // Extract the path component so a fully-qualified URL
         // (`https://api.github.com/graphql`) is caught too, not just the
         // relative `graphql` / `/graphql` forms.
@@ -1168,7 +1167,7 @@ fn evaluate_api(cmd: &ParsedCommand, allow_api_write: bool) -> PolicyResult {
             .split_once("://")
             .and_then(|(_, rest)| rest.split_once('/'))
             .map_or(normalized, |(_, p)| p);
-        if path.trim_start_matches('/') == "graphql" {
+        if path.trim_matches('/').eq_ignore_ascii_case("graphql") {
             return PolicyResult {
                 decision: Decision::Block,
                 reason: "gh api graphql allows arbitrary mutations — use specific REST endpoints instead",
@@ -1728,7 +1727,8 @@ pub struct GatePolicy {
     /// Policy for commands not in the classification table.
     pub unknown_command: UnknownCommandDecision,
     /// Allow `gh api` write operations (POST/PATCH/PUT and input flags),
-    /// scope-checked to the current repo. GraphQL remains blocked.
+    /// scope-checked to the current repo. Has no effect on `gh api graphql`,
+    /// whose allowlist is fixed (see `gh_graphql`).
     pub allow_api_write: bool,
     /// Allow `gh pr merge` into a branch whose rulesets gate the merge anyway
     /// (see [`check_merge_protection`]). `--admin` stays refused.
@@ -1810,6 +1810,10 @@ pub struct GateApproval {
     /// caller must still run [`check_merge_protection`] against `repo_scope`
     /// and refuse on any error. The gate itself makes no network calls.
     pub check_merge_protection: bool,
+    /// Node IDs an allowed `gh api graphql` mutation writes to. The caller
+    /// must pass them to [`crate::gh_graphql::verify_targets`] and refuse the
+    /// command unless every one belongs to the scope (#414).
+    pub graphql_targets: Vec<crate::gh_graphql::Target>,
 }
 
 impl Default for GatePolicy {
@@ -2035,6 +2039,12 @@ fn gate_with_scope_resolver(
         }
     }
 
+    // Exactly `graphql` is the form `gh` treats as GraphQL (variables grouped,
+    // GraphQL host). Every other spelling keeps the block in `evaluate_api`.
+    if cmd.command == "api" && cmd.api_endpoint.as_deref() == Some("graphql") {
+        return graphql_approval(args, policy, resolve_scope);
+    }
+
     match result.decision {
         Decision::Allow => allow_tier_approval(&cmd, policy, resolve_scope, real_git),
         Decision::ScopeCheck => {
@@ -2076,8 +2086,8 @@ fn gate_with_scope_resolver(
                 // The matched member, never the launch repository: pinning the
                 // launch repo with a set in play is #213, N repositories wide.
                 Ok(GateApproval {
-                    repo_scope: Some(format!("github.com/{member}")),
                     check_merge_protection: gated_merge,
+                    ..approval_from_scope(Some(member))
                 })
             } else if let Some(invocation_repo) = invocation_repo.as_deref()
                 && scope_member(&scope, invocation_repo).is_none()
@@ -2189,10 +2199,57 @@ fn gate_with_scope_resolver(
     }
 }
 
+/// `gh api graphql`: read-only queries rooted at a repository in scope, and a
+/// few review-thread mutations whose targets the caller verifies (#414).
+///
+/// Needs the scope check: with it off there is nothing to hold a GraphQL
+/// request to, so it stays refused as it was before.
+fn graphql_approval(
+    args: &[&str],
+    policy: &GatePolicy,
+    resolve_scope: impl FnOnce() -> Result<Vec<String>, String>,
+) -> Result<GateApproval, Refusal> {
+    let refuse = |reason: String| Refusal {
+        headline: "'gh api graphql' is not allowed in this form.".to_string(),
+        guidance: format!(
+            "Reason: {reason}.\n\
+             Allowed: read-only queries whose root is repository(owner:, name:) for a \
+             repository in scope and that select only pull request and review-thread \
+             fields, and the mutations resolveReviewThread, \
+             unresolveReviewThread and addPullRequestReviewThreadReply on review threads \
+             in scope, sent with -f/-F fields. See docs/gh-guard.md."
+        ),
+        agent_note: &[RESTRICTED, NOTE],
+    };
+    if !policy.scope_check {
+        return Err(refuse(
+            "GraphQL is only allowed with gh_guard.scope_check on".to_string(),
+        ));
+    }
+    let scope = resolve_scope().map_err(&refuse)?;
+    let graphql_targets = crate::gh_graphql::check(args, &scope).map_err(refuse)?;
+    Ok(GateApproval {
+        repo_scope: None,
+        check_merge_protection: false,
+        graphql_targets,
+    })
+}
+
+/// The refusal for a GraphQL mutation whose target failed verification.
+pub fn graphql_target_refusal(reason: &str) -> Refusal {
+    Refusal {
+        headline: "'gh api graphql' writes to a node that is not verified to be in scope."
+            .to_string(),
+        guidance: format!("Reason: {reason}."),
+        agent_note: &[RESTRICTED, NOTE],
+    }
+}
+
 fn approval_from_scope(repo_scope: Option<String>) -> GateApproval {
     GateApproval {
         repo_scope: repo_scope.map(|repo| format!("github.com/{repo}")),
         check_merge_protection: false,
+        graphql_targets: Vec::new(),
     }
 }
 
@@ -5362,6 +5419,66 @@ mod tests {
     }
 
     #[test]
+    fn graphql_gate_needs_the_scope_check() {
+        let args = ["api", "graphql", "-f", "query={ __typename }"];
+        let scope = ["navikt/cplt".to_string()];
+        let on = GatePolicy::default();
+        assert!(gate_with_repo_scope(&args, &on, &scope, None).is_ok());
+        let off = GatePolicy {
+            scope_check: false,
+            ..GatePolicy::default()
+        };
+        let refusal = gate_with_repo_scope(&args, &off, &scope, None).unwrap_err();
+        assert!(refusal.guidance.contains("scope_check"), "{refusal}");
+    }
+
+    #[test]
+    fn graphql_mutation_approval_carries_its_targets() {
+        let args = [
+            "api",
+            "graphql",
+            "-f",
+            "query=mutation { resolveReviewThread(input: {threadId: \"PRRT_1\"}) { clientMutationId } }",
+        ];
+        let approval =
+            gate_with_repo_scope(&args, &GatePolicy::default(), &["navikt/cplt".into()], None)
+                .unwrap();
+        assert_eq!(approval.graphql_targets.len(), 1);
+        assert_eq!(approval.repo_scope, None);
+    }
+
+    // Only exact `graphql` reaches the GraphQL checker; every other spelling of
+    // the endpoint must be refused, even with an in-scope `-R` and writes on.
+    #[test]
+    fn graphql_spellings_refused_at_the_gate() {
+        let writes = GatePolicy {
+            allow_api_write: true,
+            ..Default::default()
+        };
+        let scope = ["navikt/cplt".to_string()];
+        for ep in [
+            "graphql/?x",
+            "graphql?x",
+            "/graphql/",
+            "https://api.github.com/graphql",
+            "https://api.github.com/graphql/?x",
+        ] {
+            let args = [
+                "api",
+                ep,
+                "-R",
+                "navikt/cplt",
+                "-f",
+                "query=mutation { deleteRepository }",
+            ];
+            assert!(
+                gate_with_repo_scope(&args, &writes, &scope, None).is_err(),
+                "'{ep}' must be refused"
+            );
+        }
+    }
+
+    #[test]
     fn graphql_blocked_even_with_allow_api_write() {
         let cmd = ParsedCommand {
             command: "api".to_string(),
@@ -8287,7 +8404,21 @@ mod tests {
     // Lower-severity: full-URL graphql evades the relative-form block.
     #[test]
     fn api_graphql_full_url_blocked() {
-        for ep in ["graphql", "/graphql", "https://api.github.com/graphql"] {
+        for ep in [
+            "graphql",
+            "/graphql",
+            "/graphql/",
+            "graphql/",
+            "graphql?x",
+            "graphql/?x",
+            "/graphql/?x",
+            "graphql#x",
+            "GraphQL",
+            "https://api.github.com/graphql",
+            "https://api.github.com/graphql/",
+            "https://api.github.com/graphql?x",
+            "https://api.github.com/graphql/?x",
+        ] {
             let cmd = ParsedCommand {
                 command: "api".to_string(),
                 subcommand: None,
