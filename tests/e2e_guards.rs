@@ -1083,6 +1083,150 @@ fn gh_gate_allow_api_write_blocks_cross_repo_post() {
     assert_refused(&stderr, ok, "outside the startup repo");
 }
 
+// ============================================================
+// gh-gate: allow_pr_merge opt-in (#412)
+// ============================================================
+
+/// Run `cplt gh-gate --allow-pr-merge` against a fake `gh` that answers the
+/// protection check's reads with `rules` for `main` and prints MERGED for the
+/// merge itself. Like real gh, its `pr view` refuses `-R` without a selector;
+/// without `-R` it needs `GH_REPO`. Returns (stdout, stderr, exit_success).
+fn gh_gate_merge(args: &[&str], rules: &str) -> (String, String, bool) {
+    let repo = temp_repo("navikt/cplt");
+    let gh = repo.path().join("fake-gh.sh");
+    std::fs::write(
+        &gh,
+        format!(
+            r#"#!/bin/sh
+case "$1 $2" in
+  "pr view")
+    case " $* " in
+      *" -R "*" -- "?*) ;;
+      *" -R "*) echo "argument required when using the --repo flag" >&2; exit 1 ;;
+      *) [ "$GH_REPO" = github.com/navikt/cplt ] || {{ echo "no repo: $GH_REPO" >&2; exit 1; }} ;;
+    esac
+    echo '{{"url":"https://github.com/navikt/cplt/pull/5","baseRefName":"main","author":{{"login":"me"}},"headRefOid":"abc123"}}' ;;
+  "api user") echo '{{"login":"me"}}' ;;
+  "api repos/navikt/cplt/rules/branches/main?per_page=100") echo '{rules}' ;;
+  "api repos/navikt/cplt/rulesets/7") echo '{{"enforcement":"active","current_user_can_bypass":"never"}}' ;;
+  "pr merge") echo "MERGED GH_REPO=$GH_REPO $*" ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac
+"#
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let output = cplt_cmd()
+        .arg("gh-gate")
+        .arg("--real-gh")
+        .arg(&gh)
+        .arg("--real-git")
+        .arg(binary_in_path("git"))
+        .arg("--repo-scope")
+        .arg("navikt/cplt")
+        .arg("--allow-pr-merge")
+        .arg("--")
+        .args(args)
+        .current_dir(repo.path())
+        .output()
+        .expect("cplt gh-gate should run");
+    (
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        output.status.success(),
+    )
+}
+
+const MERGE_PROTECTED: &str = r#"[{"type":"pull_request","ruleset_id":7,"parameters":{"required_approving_review_count":1,"require_last_push_approval":true}}]"#;
+
+#[test]
+fn gh_gate_pr_merge_refused_without_the_opt_in() {
+    let (_, stderr, ok) = gh_gate(&["pr", "merge", "5"]);
+    assert_refused(&stderr, ok, "gh_guard.allow_pr_merge");
+}
+
+#[test]
+fn gh_gate_pr_merge_allowed_into_a_protected_branch() {
+    let (stdout, stderr, ok) = gh_gate_merge(&["pr", "merge", "5", "--squash"], MERGE_PROTECTED);
+    assert!(ok, "{stdout}\n{stderr}");
+    assert_eq!(stdout.trim(), MERGED_5, "{stderr}");
+}
+
+/// The fake's record of the merge the gate exec'd: the checked number and head.
+const MERGED_5: &str =
+    "MERGED GH_REPO=github.com/navikt/cplt pr merge 5 --squash --match-head-commit abc123";
+
+#[test]
+fn gh_gate_pr_merge_of_the_current_branch_allowed_into_a_protected_branch() {
+    // gh would resolve a bare merge from the current branch a second time, after
+    // the check; the gate execs the number and head the check verified instead.
+    let (stdout, stderr, ok) = gh_gate_merge(&["pr", "merge", "--squash"], MERGE_PROTECTED);
+    assert!(ok, "{stdout}\n{stderr}");
+    assert_eq!(stdout.trim(), MERGED_5, "{stderr}");
+}
+
+#[test]
+fn gh_gate_pr_merge_refused_with_another_match_head_commit() {
+    let (stdout, stderr, ok) = gh_gate_merge(
+        &["pr", "merge", "--squash", "--match-head-commit", "def456"],
+        MERGE_PROTECTED,
+    );
+    assert!(!stdout.contains("MERGED"), "{stdout}");
+    assert_refused(&stderr, ok, "is not the head of");
+}
+
+#[test]
+fn gh_gate_pr_merge_refused_with_status_checks_alone() {
+    let checks = r#"[{"type":"required_status_checks","ruleset_id":7,"parameters":{"required_status_checks":[{"context":"ci"}]}}]"#;
+    let (stdout, stderr, ok) = gh_gate_merge(&["pr", "merge", "5"], checks);
+    assert!(!stdout.contains("MERGED"), "{stdout}");
+    assert_refused(&stderr, ok, "requires an approving review");
+}
+
+#[test]
+fn gh_gate_pr_merge_refused_into_an_unprotected_branch() {
+    let (stdout, stderr, ok) = gh_gate_merge(&["pr", "merge", "5"], "[]");
+    assert!(!stdout.contains("MERGED"), "{stdout}");
+    assert_refused(&stderr, ok, "requires an approving review");
+}
+
+#[test]
+fn gh_gate_pr_merge_refused_with_admin_even_when_protected() {
+    let (stdout, stderr, ok) = gh_gate_merge(&["pr", "merge", "5", "--admin"], MERGE_PROTECTED);
+    assert!(!stdout.contains("MERGED"), "{stdout}");
+    assert_refused(&stderr, ok, "--admin");
+}
+
+#[test]
+fn gh_gate_pr_merge_refused_with_non_ascii_short_flag() {
+    // `-éx`: byte index 2 falls inside é's UTF-8 encoding, not on a char
+    // boundary. A byte-slice regression here panics instead of refusing.
+    let (_, stderr, ok) = gh_gate_with_opts(&["pr", "merge", "5", "-éx"], &["--allow-pr-merge"]);
+    assert_refused(&stderr, ok, "is not a flag cplt knows");
+}
+
+#[test]
+fn gh_gate_pr_merge_refused_in_another_repo() {
+    let (stdout, stderr, ok) = gh_gate_merge(
+        &["pr", "merge", "5", "-R", "evil-org/other"],
+        MERGE_PROTECTED,
+    );
+    assert!(!stdout.contains("MERGED"), "{stdout}");
+    assert_refused(&stderr, ok, "outside the startup repo");
+}
+
+#[test]
+fn gh_gate_pr_merge_refused_on_an_api_error() {
+    // The fake answers the rules read with something that is not JSON.
+    let (stdout, stderr, ok) = gh_gate_merge(&["pr", "merge", "5"], "<html>502</html>");
+    assert!(!stdout.contains("MERGED"), "{stdout}");
+    assert_refused(&stderr, ok, "could not complete");
+}
+
 #[test]
 fn gh_gate_default_still_blocks_api_post() {
     // Regression: default (no --allow-api-write) must still block writes.

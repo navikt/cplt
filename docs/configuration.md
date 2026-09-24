@@ -466,6 +466,52 @@ cplt --allow-localhost-any --allow-docker --allow-jvm-attach \
 
 `cplt config explain` tells you what a key does and how to set it.
 
+### Letting the agent merge its own pull requests
+
+The gh guard refuses `gh pr merge`. `gh_guard.allow_pr_merge` (default `false`)
+lifts that for one case: a pull request the agent can merge only because the
+repository would stop a bad merge anyway.
+
+```bash
+cplt config set gh_guard.allow_pr_merge true --force
+```
+
+With the key on, the shim checks each `gh pr merge` when it runs and lets it
+through only when all of these hold:
+
+- the pull request is in the startup repository (or another repository in the
+  scope set);
+- its author is the account `gh` is logged in as, so any approving review it
+  carries came from someone else;
+- an active ruleset on its base branch requires at least one approving review,
+  that account cannot bypass the ruleset, and the ruleset also sets "Dismiss
+  stale pull request approvals when new commits are pushed" or "Require
+  approval of the most recent reviewable push". Without one of those, the
+  agent could get an approval, push unreviewed commits and merge.
+
+Otherwise the merge is refused with the reason. A failed or unreadable GitHub
+response also refuses. `--admin` is always refused, and so is any flag the shim
+does not recognise. `--auto`, `--squash`, `--delete-branch` and the other
+ordinary flags pass. A merge queue alone does not count, and neither does
+classic branch protection, which the check does not read.
+
+The merge that runs is the one that was checked. The shim rewrites it to
+`gh pr merge <number> ... --match-head-commit <sha>` with the pull request
+number and head commit the check read, so a bare `gh pr merge` cannot land on
+another pull request after a `git checkout`, and a push after the check makes
+GitHub reject the merge. A `--match-head-commit` naming another commit is
+refused. What the check cannot pin is the base branch: its rules, or the pull
+request's base, could change between the check and the merge.
+
+**An approval rule is required.** Required status checks do not count on their
+own: the pull request's author controls what CI reports, by editing the
+workflows in the pull request or by posting a status through
+`allow_api_write`. A branch with checks and no required approval, such as
+cplt's own `main`, refuses every merge.
+
+The key applies to every repository you sandbox. `cplt config set --local`
+limits it to one checkout.
+
 ## Policy presets
 
 A preset is a named security posture. One flag or key sets a baseline for the five sandbox toggles and for the safety features (`gh_guard`, `git_guard`, forced-proxy egress, fail-closed domain allowlist):

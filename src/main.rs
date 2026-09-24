@@ -946,6 +946,14 @@ NOTE:
         #[arg(long, conflicts_with = "allow_api_write")]
         no_allow_api_write: bool,
 
+        /// Allow `gh pr merge` into a ruleset-protected branch.
+        #[arg(long, default_value_t = false)]
+        allow_pr_merge: bool,
+
+        /// Block `gh pr merge` (override for --allow-pr-merge).
+        #[arg(long, conflicts_with = "allow_pr_merge")]
+        no_allow_pr_merge: bool,
+
         /// gh arguments to evaluate and potentially pass through.
         #[arg(last = true)]
         args: Vec<String>,
@@ -3622,6 +3630,8 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
                 unknown_command,
                 allow_api_write,
                 no_allow_api_write,
+                allow_pr_merge,
+                no_allow_pr_merge,
                 args,
             } => {
                 let policy = gh_proxy::GatePolicy {
@@ -3638,6 +3648,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
                         gh_proxy::UnknownCommandDecision::Block
                     },
                     allow_api_write: allow_api_write && !no_allow_api_write,
+                    allow_pr_merge: allow_pr_merge && !no_allow_pr_merge,
                 };
                 run_gh_gate(&real_gh, &repo_scope, real_git.as_deref(), &args, &policy)
             }
@@ -4062,6 +4073,9 @@ enum GateEffect {
     /// Run the real binary with `GH_REPO` pinned to this repository, so the
     /// operation cannot retarget away from the repo the guard approved.
     ExecScoped(String),
+    /// Like `ExecScoped`, but run `args` instead of the invocation: a merge the
+    /// protection check rewrote to the pull request number and head it checked.
+    ExecRewritten { repo: String, args: Vec<String> },
     /// Run the real binary exactly as invoked, with no `GH_REPO` pin. `notice`
     /// is printed to stderr first: warn and audit modes report the verdict they
     /// are declining to enforce.
@@ -4071,6 +4085,9 @@ enum GateEffect {
     /// Refuse, printing this refusal and the guard's escape hatch.
     Refuse(gh_proxy::Refusal),
 }
+
+/// Runs the real `gh` for a read the merge check needs: `(GH_REPO, args)`.
+type GhLookup<'a> = dyn FnMut(&str, &[&str]) -> Result<String, String> + 'a;
 
 /// Decide what `cplt gh-gate` should do. Pure: no process is spawned here.
 ///
@@ -4097,6 +4114,7 @@ fn decide_gh_gate(
     policy: &gh_proxy::GatePolicy,
     repo_scope: &[String],
     real_git: Option<&Path>,
+    gh_lookup: &mut GhLookup<'_>,
 ) -> GateEffect {
     // Intercept `gh auth token` — serve from cached file instead of blocking.
     // This allows Copilot to authenticate without exposing the token as an env var
@@ -4107,10 +4125,29 @@ fn decide_gh_gate(
 
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
 
-    match gh_proxy::gate_with_repo_scope(&arg_refs, policy, repo_scope, real_git) {
-        Ok(approval) => match approval.repo_scope {
-            Some(repo) => GateEffect::ExecScoped(repo),
-            None => GateEffect::ExecPlain { notice: None },
+    let verdict =
+        gh_proxy::gate_with_repo_scope(&arg_refs, policy, repo_scope, real_git).and_then(|a| {
+            // A merge let through by `allow_pr_merge` still needs its ruleset condition.
+            // Its lookups run with `GH_REPO` pinned as the merge will be; with no
+            // pinned repository the check refuses before looking anything up.
+            // It returns the merge argv pinned to the number and head it checked.
+            let mut pinned = None;
+            if a.check_merge_protection {
+                let repo = a.repo_scope.as_deref();
+                pinned = Some(gh_proxy::check_merge_protection(
+                    &arg_refs,
+                    repo,
+                    &mut |lookup| gh_lookup(repo.unwrap_or_default(), lookup),
+                )?);
+            }
+            Ok((a, pinned))
+        });
+    match verdict {
+        Ok((approval, pinned)) => match (approval.repo_scope, pinned) {
+            (Some(repo), Some(args)) => GateEffect::ExecRewritten { repo, args },
+            (Some(repo), None) => GateEffect::ExecScoped(repo),
+            // The check refuses without a pinned repo, so a rewrite always has one.
+            (None, _) => GateEffect::ExecPlain { notice: None },
         },
         Err(refusal) => match policy.mode {
             config::EnforcementMode::Block => GateEffect::Refuse(refusal),
@@ -4136,8 +4173,32 @@ fn run_gh_gate(
     args: &[String],
     policy: &gh_proxy::GatePolicy,
 ) -> ExitCode {
-    let effect = decide_gh_gate(args, policy, repo_scope, real_git);
+    let effect = decide_gh_gate(args, policy, repo_scope, real_git, &mut |repo, lookup| {
+        run_gh_lookup(real_gh, repo, lookup)
+    });
     perform_gate_effect(real_gh, "gh", args, effect)
+}
+
+/// Run the real `gh` for a read the gate needs, with `GH_REPO` pinned to `repo`
+/// (host-qualified, as [`perform_gate_effect`] pins it), returning stdout. Any
+/// failure, including a non-zero exit, is an error the caller refuses on.
+#[allow(clippy::disallowed_methods)] // runs INSIDE the sandbox as cplt gh-gate, against the same real gh it would exec
+fn run_gh_lookup(real_gh: &Path, repo: &str, args: &[&str]) -> Result<String, String> {
+    let output = std::process::Command::new(real_gh)
+        .args(args)
+        .env_remove("GH_HOST")
+        .env("GH_REPO", repo)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("could not run gh: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "`gh {}` failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    String::from_utf8(output.stdout).map_err(|e| format!("gh printed invalid UTF-8: {e}"))
 }
 
 /// Carry out a decided [`GateEffect`]. On success `exec` replaces this process,
@@ -4155,6 +4216,9 @@ fn perform_gate_effect(
             ExitCode::FAILURE
         }
         GateEffect::ExecScoped(repo) => exec_real(real_binary, name, args, Some(&repo)),
+        GateEffect::ExecRewritten { repo, args } => {
+            exec_real(real_binary, name, &args, Some(&repo))
+        }
         GateEffect::ExecPlain { notice } => {
             if let Some(notice) = notice {
                 eprintln!("{notice}");
@@ -10098,9 +10162,339 @@ mod tests {
         args.iter().map(|s| (*s).to_string()).collect()
     }
 
+    /// `decide_gh_gate` for a command that must not reach the network.
+    fn decide_gh_gate_offline(
+        args: &[String],
+        policy: &gh_proxy::GatePolicy,
+        repo_scope: &[String],
+        real_git: Option<&Path>,
+    ) -> GateEffect {
+        decide_gh_gate(args, policy, repo_scope, real_git, &mut |_, a| {
+            panic!("unexpected gh lookup: {a:?}")
+        })
+    }
+
+    // ── gh pr merge under allow_pr_merge (#412) ──────────────────────────
+
+    /// A fake `gh` answering the protection check's reads. `rules` is the
+    /// `rules/branches` response; the ruleset (id 7) cannot be bypassed. Like
+    /// real gh, `pr view` refuses `-R` without a selector.
+    fn merge_lookup(rules: &'static str) -> impl FnMut(&[&str]) -> Result<String, String> {
+        move |a: &[&str]| {
+            Ok(match a {
+                ["pr", "view", rest @ ..] => {
+                    let selector = rest
+                        .iter()
+                        .position(|a| *a == "--")
+                        .and_then(|i| rest.get(i + 1));
+                    if rest.contains(&"-R") && selector.is_none() {
+                        return Err("argument required when using the --repo flag".to_string());
+                    }
+                    r#"{"url":"https://github.com/navikt/cplt/pull/5","baseRefName":"main","author":{"login":"me"},"headRefOid":"abc123"}"#
+                }
+                ["api", "user"] => r#"{"login":"me"}"#,
+                ["api", p] if p.starts_with("repos/navikt/cplt/rules/branches/main") => rules,
+                ["api", "repos/navikt/cplt/rulesets/7"] => {
+                    r#"{"enforcement":"active","current_user_can_bypass":"never"}"#
+                }
+                other => return Err(format!("unexpected lookup {other:?}")),
+            }
+            .to_string())
+        }
+    }
+
+    const PROTECTED: &str = r#"[{"type":"pull_request","ruleset_id":7,"parameters":{"required_approving_review_count":1,"dismiss_stale_reviews_on_push":true}}]"#;
+    /// Rules that look like protection but gate nothing: cplt's own `main` has a
+    /// pull-request rule with zero required approvals.
+    const UNPROTECTED: &str = r#"[{"type":"deletion","ruleset_id":7},{"type":"pull_request","ruleset_id":7,"parameters":{"required_approving_review_count":0,"dismiss_stale_reviews_on_push":true}},{"type":"required_status_checks","ruleset_id":7,"parameters":{"required_status_checks":[]}},{"type":"merge_queue","ruleset_id":7}]"#;
+
+    fn merge_policy(allow_pr_merge: bool) -> gh_proxy::GatePolicy {
+        gh_proxy::GatePolicy {
+            allow_pr_merge,
+            ..gh_proxy::GatePolicy::default()
+        }
+    }
+
+    fn decide_merge(
+        args: &[&str],
+        allow: bool,
+        lookup: &mut dyn FnMut(&[&str]) -> Result<String, String>,
+    ) -> GateEffect {
+        decide_gh_gate(
+            &gh_args(args),
+            &merge_policy(allow),
+            &["navikt/cplt".to_string()],
+            None,
+            &mut |repo, a| {
+                // Every lookup runs with GH_REPO pinned, as the merge does.
+                assert_eq!(repo, "github.com/navikt/cplt");
+                lookup(a)
+            },
+        )
+    }
+
+    fn assert_merge_refused(effect: &GateEffect, needle: &str) {
+        let GateEffect::Refuse(refusal) = effect else {
+            panic!("merge must be refused, got {effect:?}");
+        };
+        assert!(refusal.to_string().contains(needle), "{refusal}");
+    }
+
+    #[test]
+    fn pr_merge_refused_when_the_key_is_off() {
+        let effect = decide_merge(
+            &["pr", "merge", "5", "-R", "navikt/cplt"],
+            false,
+            &mut merge_lookup(PROTECTED),
+        );
+        assert_merge_refused(&effect, "gh_guard.allow_pr_merge");
+    }
+
+    #[test]
+    fn pr_merge_allowed_into_a_protected_branch() {
+        let effect = decide_merge(
+            &["pr", "merge", "5", "-R", "navikt/cplt", "--squash"],
+            true,
+            &mut merge_lookup(PROTECTED),
+        );
+        assert_eq!(effect, pinned_merge(&["-R", "navikt/cplt", "--squash"]));
+    }
+
+    /// What an allowed merge execs: pinned to PR 5 and the head the fake reports.
+    fn pinned_merge(flags: &[&str]) -> GateEffect {
+        let mut args = gh_args(&["pr", "merge", "5"]);
+        args.extend(gh_args(flags));
+        args.extend(gh_args(&["--match-head-commit", "abc123"]));
+        GateEffect::ExecRewritten {
+            repo: "github.com/navikt/cplt".to_string(),
+            args,
+        }
+    }
+
+    fn check_merge(args: &[&str]) -> Result<Vec<String>, gh_proxy::Refusal> {
+        gh_proxy::check_merge_protection(
+            args,
+            Some("github.com/navikt/cplt"),
+            &mut merge_lookup(PROTECTED),
+        )
+    }
+
+    #[test]
+    fn pr_merge_of_the_current_branch_is_pinned_to_the_checked_pr_and_head() {
+        // gh refuses `-R` without a selector, so the current branch's pull
+        // request is looked up under the GH_REPO pin alone. The merge then runs
+        // on the number and head that lookup returned, not on whatever branch
+        // is checked out by the time gh runs. (Through the gate a bare merge
+        // also needs the cwd check against real git: see e2e_guards.)
+        assert_eq!(
+            check_merge(&["pr", "merge", "--auto"]).unwrap(),
+            gh_args(&[
+                "pr",
+                "merge",
+                "5",
+                "--auto",
+                "--match-head-commit",
+                "abc123"
+            ])
+        );
+        // A selector is normalized to the number that was checked.
+        assert_eq!(
+            check_merge(&["pr", "merge", "-s", "--", "my-branch"]).unwrap(),
+            gh_args(&["pr", "merge", "5", "-s", "--match-head-commit", "abc123"])
+        );
+    }
+
+    #[test]
+    fn pr_merge_refuses_a_match_head_commit_other_than_the_checked_head() {
+        let refusal =
+            check_merge(&["pr", "merge", "5", "--match-head-commit", "def456"]).unwrap_err();
+        assert!(refusal.to_string().contains("def456"), "{refusal}");
+        assert!(check_merge(&["pr", "merge", "5", "--match-head-commit=def456"]).is_err());
+        // The same head is kept once.
+        assert_eq!(
+            check_merge(&["pr", "merge", "--match-head-commit=abc123", "5"]).unwrap(),
+            gh_args(&["pr", "merge", "5", "--match-head-commit", "abc123"])
+        );
+    }
+
+    #[test]
+    fn pr_merge_refused_with_required_status_checks_alone() {
+        // The PR author controls CI, so checks alone are not protection.
+        let checks = r#"[{"type":"required_status_checks","ruleset_id":7,"parameters":{"required_status_checks":[{"context":"ci"}]}}]"#;
+        let effect = decide_merge(
+            &["pr", "merge", "5", "-R", "navikt/cplt", "--auto"],
+            true,
+            &mut merge_lookup(checks),
+        );
+        assert_merge_refused(&effect, "requires an approving review");
+    }
+
+    #[test]
+    fn pr_merge_needs_an_approval_a_new_push_dismisses() {
+        let rules = |params: &str| -> &'static str {
+            format!(
+                r#"[{{"type":"pull_request","ruleset_id":7,"parameters":{{"required_approving_review_count":1{params}}}}}]"#
+            )
+            .leak()
+        };
+        for params in [
+            r#","dismiss_stale_reviews_on_push":true,"require_last_push_approval":false"#,
+            r#","dismiss_stale_reviews_on_push":false,"require_last_push_approval":true"#,
+        ] {
+            let effect = decide_merge(
+                &["pr", "merge", "5", "-R", "navikt/cplt"],
+                true,
+                &mut merge_lookup(rules(params)),
+            );
+            assert_eq!(effect, pinned_merge(&["-R", "navikt/cplt"]), "{params}");
+        }
+        // Neither set, a missing field, or a non-boolean: an approval could
+        // outlive unreviewed pushes.
+        for params in [
+            r#","dismiss_stale_reviews_on_push":false,"require_last_push_approval":false"#,
+            "",
+            r#","require_last_push_approval":false"#,
+            r#","dismiss_stale_reviews_on_push":"true""#,
+        ] {
+            let effect = decide_merge(
+                &["pr", "merge", "5", "-R", "navikt/cplt"],
+                true,
+                &mut merge_lookup(rules(params)),
+            );
+            assert_merge_refused(
+                &effect,
+                "requires an approving review that a new push dismisses",
+            );
+        }
+    }
+
+    #[test]
+    fn pr_merge_refused_into_an_unprotected_branch() {
+        let effect = decide_merge(
+            &["pr", "merge", "5", "-R", "navikt/cplt"],
+            true,
+            &mut merge_lookup(UNPROTECTED),
+        );
+        assert_merge_refused(&effect, "requires an approving review");
+    }
+
+    #[test]
+    fn pr_merge_refused_with_admin() {
+        for admin in ["--admin", "--admin=true"] {
+            let effect = decide_merge(
+                &["pr", "merge", "5", "-R", "navikt/cplt", admin],
+                true,
+                &mut merge_lookup(PROTECTED),
+            );
+            assert_merge_refused(&effect, "--admin");
+        }
+    }
+
+    #[test]
+    fn pr_merge_refused_in_another_repo() {
+        let effect = decide_merge(
+            &["pr", "merge", "5", "-R", "someone/else"],
+            true,
+            &mut merge_lookup(PROTECTED),
+        );
+        assert_merge_refused(&effect, "outside the startup repo");
+        // A URL selector naming another repository, from an in-scope -R.
+        let mut lookup = merge_lookup(PROTECTED);
+        let mut elsewhere = |a: &[&str]| {
+            match a {
+            ["pr", "view", ..] => Ok(r#"{"url":"https://github.com/someone/else/pull/5","baseRefName":"main","author":{"login":"me"},"headRefOid":"abc123"}"#.to_string()),
+            other => lookup(other),
+        }
+        };
+        let effect = decide_merge(
+            &[
+                "pr",
+                "merge",
+                "https://github.com/someone/else/pull/5",
+                "-R",
+                "navikt/cplt",
+            ],
+            true,
+            &mut elsewhere,
+        );
+        assert_merge_refused(&effect, "is not in navikt/cplt");
+    }
+
+    #[test]
+    fn pr_merge_refused_on_an_api_error() {
+        let mut failing = |_: &[&str]| Err("HTTP 502".to_string());
+        let effect = decide_merge(
+            &["pr", "merge", "5", "-R", "navikt/cplt"],
+            true,
+            &mut failing,
+        );
+        assert_merge_refused(&effect, "HTTP 502");
+        // An unreadable answer is an error too, not an empty rule list.
+        let mut garbled = merge_lookup("not json");
+        let effect = decide_merge(
+            &["pr", "merge", "5", "-R", "navikt/cplt"],
+            true,
+            &mut garbled,
+        );
+        assert_merge_refused(&effect, "unreadable GitHub response");
+    }
+
+    #[test]
+    fn pr_merge_refused_for_someone_elses_pr_or_a_bypassable_ruleset() {
+        let mut lookup = merge_lookup(PROTECTED);
+        let mut not_mine = |a: &[&str]| match a {
+            ["api", "user"] => Ok(r#"{"login":"someone"}"#.to_string()),
+            other => lookup(other),
+        };
+        let effect = decide_merge(
+            &["pr", "merge", "5", "-R", "navikt/cplt"],
+            true,
+            &mut not_mine,
+        );
+        assert_merge_refused(&effect, "not by the authenticated account");
+
+        for ruleset in [
+            r#"{"enforcement":"active","current_user_can_bypass":"always"}"#,
+            r#"{"enforcement":"active","current_user_can_bypass":"pull_requests_only"}"#,
+            r#"{"enforcement":"evaluate","current_user_can_bypass":"never"}"#,
+            r#"{"enforcement":"active"}"#,
+        ] {
+            let mut lookup = merge_lookup(PROTECTED);
+            let mut bypassable = |a: &[&str]| match a {
+                ["api", "repos/navikt/cplt/rulesets/7"] => Ok(ruleset.to_string()),
+                other => lookup(other),
+            };
+            let effect = decide_merge(
+                &["pr", "merge", "5", "-R", "navikt/cplt"],
+                true,
+                &mut bypassable,
+            );
+            assert_merge_refused(&effect, "can be bypassed");
+        }
+    }
+
+    #[test]
+    fn pr_merge_protection_failure_follows_warn_mode() {
+        let effect = decide_gh_gate(
+            &gh_args(&["pr", "merge", "5", "-R", "navikt/cplt"]),
+            &gh_proxy::GatePolicy {
+                mode: config::EnforcementMode::Warn,
+                allow_pr_merge: true,
+                ..gh_proxy::GatePolicy::default()
+            },
+            &["navikt/cplt".to_string()],
+            None,
+            &mut |_, a| merge_lookup(UNPROTECTED)(a),
+        );
+        assert!(
+            matches!(effect, GateEffect::ExecPlain { notice: Some(ref n) } if n.contains("would block")),
+            "{effect:?}"
+        );
+    }
+
     #[test]
     fn in_scope_write_execs_with_the_repo_pinned() {
-        let effect = decide_gh_gate(
+        let effect = decide_gh_gate_offline(
             &gh_args(&["pr", "create", "--repo", "navikt/cplt"]),
             &gh_policy(config::EnforcementMode::Block),
             &["navikt/cplt".to_string()],
@@ -10115,7 +10509,7 @@ mod tests {
 
     #[test]
     fn out_of_scope_write_is_refused_in_block_mode() {
-        let effect = decide_gh_gate(
+        let effect = decide_gh_gate_offline(
             &gh_args(&["pr", "create", "--repo", "someone/else"]),
             &gh_policy(config::EnforcementMode::Block),
             &["navikt/cplt".to_string()],
@@ -10148,7 +10542,7 @@ mod tests {
             config::EnforcementMode::Warn,
             config::EnforcementMode::Audit,
         ] {
-            let effect = decide_gh_gate(
+            let effect = decide_gh_gate_offline(
                 &gh_args(&["pr", "create", "--repo", "someone/else"]),
                 &gh_policy(mode),
                 &["navikt/cplt".to_string()],
@@ -10171,13 +10565,13 @@ mod tests {
     #[test]
     fn warn_and_audit_notices_are_distinguishable() {
         let args = gh_args(&["pr", "create", "--repo", "someone/else"]);
-        let warn = decide_gh_gate(
+        let warn = decide_gh_gate_offline(
             &args,
             &gh_policy(config::EnforcementMode::Warn),
             &["navikt/cplt".to_string()],
             None,
         );
-        let audit = decide_gh_gate(
+        let audit = decide_gh_gate_offline(
             &args,
             &gh_policy(config::EnforcementMode::Audit),
             &["navikt/cplt".to_string()],
@@ -10203,7 +10597,7 @@ mod tests {
             config::EnforcementMode::Audit,
         ] {
             assert_eq!(
-                decide_gh_gate(&gh_args(&["auth", "token"]), &gh_policy(mode), &[], None),
+                decide_gh_gate_offline(&gh_args(&["auth", "token"]), &gh_policy(mode), &[], None),
                 GateEffect::ServeCachedToken,
                 "{mode} must not let `gh auth token` reach the real binary"
             );
@@ -10215,7 +10609,7 @@ mod tests {
         // The shim's entry point, not just `gate`: `gh auth setup-git` points
         // `credential.helper` at this verb, so an HTTPS push must reach the real
         // `gh` — not the `auth token` cache intercept, and not a refusal (#396).
-        let effect = decide_gh_gate(
+        let effect = decide_gh_gate_offline(
             &gh_args(&["auth", "git-credential", "get"]),
             &gh_policy(config::EnforcementMode::Block),
             &["navikt/cplt".to_string()],
@@ -10231,7 +10625,7 @@ mod tests {
     #[test]
     fn informational_gh_commands_exec_unannounced() {
         assert_eq!(
-            decide_gh_gate(
+            decide_gh_gate_offline(
                 &gh_args(&["--version"]),
                 &gh_policy(config::EnforcementMode::Block),
                 &["navikt/cplt".to_string()],

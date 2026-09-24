@@ -8817,6 +8817,7 @@ block_auth_token = true
 inject_token = false
 unknown_command = "warn"
 allow_api_write = false
+allow_pr_merge = false
 
 [git_guard]
 enabled = false

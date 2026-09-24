@@ -1187,6 +1187,18 @@ fn evaluate_api(cmd: &ParsedCommand, allow_api_write: bool) -> PolicyResult {
         };
     }
 
+    // A REST merge skips `gh pr merge`, and with it the `allow_pr_merge`
+    // conditions and gh's refusal to merge a blocked pull request without
+    // `--admin`. Refused even with allow_api_write.
+    let is_write = cmd.has_input_flags || cmd.method.as_deref().is_some_and(|m| m != "GET");
+    if is_write && cmd.api_endpoint.as_deref().is_some_and(is_merge_endpoint) {
+        return PolicyResult {
+            decision: Decision::Block,
+            reason: "merging through gh api is not permitted even with allow_api_write — \
+                     use gh pr merge (gh_guard.allow_pr_merge)",
+        };
+    }
+
     // If input flags are present, it's implicitly a write
     if cmd.has_input_flags {
         return if allow_api_write {
@@ -1222,6 +1234,26 @@ fn evaluate_api(cmd: &ParsedCommand, allow_api_write: bool) -> PolicyResult {
             }
         }
     }
+}
+
+/// `repos/{o}/{r}/pulls/{n}/merge` or `repos/{o}/{r}/merges`, in any spelling
+/// GitHub would route the same way (full URL, extra slashes, query, case).
+fn is_merge_endpoint(endpoint: &str) -> bool {
+    let path = endpoint.split(['?', '#']).next().unwrap_or(endpoint);
+    let path = path
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split_once('/'))
+        .map_or(path, |(_, p)| p);
+    let segments: Vec<String> = path
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let segments: Vec<&str> = segments.iter().map(String::as_str).collect();
+    matches!(
+        segments.as_slice(),
+        ["repos", _, _, "pulls", _, "merge"] | ["repos", _, _, "merges"]
+    )
 }
 
 /// Check if a command targets the expected repository.
@@ -1661,12 +1693,17 @@ pub fn generate_wrapper_script(
     } else {
         "--no-allow-api-write"
     };
+    let pr_merge_flag = if policy.allow_pr_merge {
+        "--allow-pr-merge"
+    } else {
+        "--no-allow-pr-merge"
+    };
     format!(
         r#"#!/bin/sh
 # cplt gh proxy — blocks destructive gh operations in sandboxed agents.
 # This wrapper is auto-generated. Do not edit.
 
-exec {cplt_escaped} gh-gate --real-gh {gh_escaped} {repo_scope_flag} {real_git_flag} {mode_flag} {scope_flag} {auth_flag} {unknown_flag} {api_write_flag} -- "$@"
+exec {cplt_escaped} gh-gate --real-gh {gh_escaped} {repo_scope_flag} {real_git_flag} {mode_flag} {scope_flag} {auth_flag} {unknown_flag} {api_write_flag} {pr_merge_flag} -- "$@"
 "#
     )
 }
@@ -1693,6 +1730,9 @@ pub struct GatePolicy {
     /// Allow `gh api` write operations (POST/PATCH/PUT and input flags),
     /// scope-checked to the current repo. GraphQL remains blocked.
     pub allow_api_write: bool,
+    /// Allow `gh pr merge` into a branch whose rulesets gate the merge anyway
+    /// (see [`check_merge_protection`]). `--admin` stays refused.
+    pub allow_pr_merge: bool,
 }
 
 /// What to do with commands not in the policy table.
@@ -1766,6 +1806,10 @@ pub struct GateApproval {
     /// The caller must set `GH_REPO` to this value before executing `gh`, pinning
     /// the operation to the same repository the guard approved.
     pub repo_scope: Option<String>,
+    /// The command is a `gh pr merge` let through by `allow_pr_merge`: the
+    /// caller must still run [`check_merge_protection`] against `repo_scope`
+    /// and refuse on any error. The gate itself makes no network calls.
+    pub check_merge_protection: bool,
 }
 
 impl Default for GatePolicy {
@@ -1776,6 +1820,7 @@ impl Default for GatePolicy {
             block_auth_token: true,
             unknown_command: UnknownCommandDecision::Block,
             allow_api_write: false,
+            allow_pr_merge: false,
         }
     }
 }
@@ -1935,7 +1980,32 @@ fn gate_with_scope_resolver(
         });
     }
 
-    let result = evaluate_with_policy(&cmd, policy.allow_api_write);
+    let mut result = evaluate_with_policy(&cmd, policy.allow_api_write);
+
+    // `allow_pr_merge` turns the merge Block into a ScopeCheck; the ruleset
+    // condition is checked by the caller, which can reach the network.
+    let gated_merge =
+        policy.allow_pr_merge && cmd.command == "pr" && cmd.subcommand.as_deref() == Some("merge");
+    if gated_merge {
+        merge_selector(args).map_err(|reason| Refusal {
+            headline: "'gh pr merge' is not allowed with these arguments.".to_string(),
+            guidance: format!("Reason: {reason}."),
+            agent_note: &[RESTRICTED, NOTE],
+        })?;
+        if !policy.scope_check {
+            return Err(Refusal {
+                headline: "'gh pr merge' is not allowed in this environment.".to_string(),
+                guidance: "Reason: gh_guard.allow_pr_merge needs gh_guard.scope_check, \
+                           which pins the repository whose rulesets are checked."
+                    .to_string(),
+                agent_note: &[RESTRICTED, NOTE],
+            });
+        }
+        result = PolicyResult {
+            decision: Decision::ScopeCheck,
+            reason: "merging is allowed only into a branch whose rulesets gate it",
+        };
+    }
 
     if policy.scope_check {
         if cmd.command == "api"
@@ -2007,6 +2077,7 @@ fn gate_with_scope_resolver(
                 // launch repo with a set in play is #213, N repositories wide.
                 Ok(GateApproval {
                     repo_scope: Some(format!("github.com/{member}")),
+                    check_merge_protection: gated_merge,
                 })
             } else if let Some(invocation_repo) = invocation_repo.as_deref()
                 && scope_member(&scope, invocation_repo).is_none()
@@ -2069,7 +2140,14 @@ fn gate_with_scope_resolver(
             // the whole guard off: one reached for `gh_guard.mode = "warn"` for
             // exactly this, which also drops the repository scope check. Say
             // the small thing that opens this one command.
-            guidance: if result.reason.starts_with("gh api with") {
+            guidance: if cmd.command == "pr" && cmd.subcommand.as_deref() == Some("merge") {
+                format!(
+                    "Reason: {}. `cplt config set gh_guard.allow_pr_merge true` lets the agent \
+                     merge its own pull requests into a branch whose rulesets require an \
+                     approving review that a new push dismisses; `--admin` stays refused.",
+                    result.reason
+                )
+            } else if result.reason.starts_with("gh api with") {
                 format!(
                     "Reason: {}. Raw API writes are off by default because they bypass the \
                      per-command policy the guard rests on; the higher-level commands \
@@ -2114,7 +2192,280 @@ fn gate_with_scope_resolver(
 fn approval_from_scope(repo_scope: Option<String>) -> GateApproval {
     GateApproval {
         repo_scope: repo_scope.map(|repo| format!("github.com/{repo}")),
+        check_merge_protection: false,
     }
+}
+
+/// The pull request a `gh pr merge` names (`None`: the current branch's), or
+/// why the arguments are refused.
+///
+/// Every flag must be one `gh pr merge` is known to take, so the selector read
+/// here is the one gh will read: an unknown flag that takes a value would make
+/// the check look at one pull request and gh merge another. `--admin` is
+/// refused in any spelling and position, even as another flag's value — it
+/// bypasses exactly the rules the check relies on.
+pub fn merge_selector(args: &[&str]) -> Result<Option<String>, String> {
+    parse_merge_args(args).map(|m| m.selector.map(str::to_string))
+}
+
+/// A `gh pr merge` split into what the gate rewrites and what it keeps.
+struct MergeArgs<'a> {
+    selector: Option<&'a str>,
+    /// Every flag with its value, in order, except `--match-head-commit`.
+    flags: Vec<&'a str>,
+    /// Each `--match-head-commit` value the caller passed.
+    heads: Vec<&'a str>,
+}
+
+fn parse_merge_args<'a>(args: &[&'a str]) -> Result<MergeArgs<'a>, String> {
+    const WITH_VALUE: &[&str] = &[
+        "-R",
+        "--repo",
+        "-b",
+        "--body",
+        "-F",
+        "--body-file",
+        "-t",
+        "--subject",
+        "-A",
+        "--author-email",
+        "--match-head-commit",
+    ];
+    const BOOLEAN: &[&str] = &[
+        "--auto",
+        "--disable-auto",
+        "-d",
+        "--delete-branch",
+        "-m",
+        "--merge",
+        "-r",
+        "--rebase",
+        "-s",
+        "--squash",
+    ];
+    if args
+        .iter()
+        .any(|a| *a == "--admin" || a.starts_with("--admin="))
+    {
+        return Err("`--admin` bypasses the branch rules this opt-in depends on".to_string());
+    }
+    let mut positionals = Vec::new();
+    let mut flags = Vec::new();
+    let mut heads = Vec::new();
+    let mut end_of_flags = false;
+    let mut it = args.iter();
+    while let Some(&arg) = it.next() {
+        if end_of_flags || !arg.starts_with('-') || arg == "-" {
+            positionals.push(arg);
+            continue;
+        }
+        if arg == "--" {
+            end_of_flags = true;
+            continue;
+        }
+        let (name, inline) = arg
+            .split_once('=')
+            .map_or((arg, None), |(name, value)| (name, Some(value)));
+        if WITH_VALUE.contains(&name) {
+            let value = inline.or_else(|| it.next().copied());
+            if name == "--match-head-commit" {
+                heads.push(value.unwrap_or_default());
+            } else {
+                flags.push(arg);
+                if inline.is_none() {
+                    flags.extend(value);
+                }
+            }
+        } else if (name.len() > 2
+            && !name.starts_with("--")
+            && name.get(..2).is_some_and(|p| WITH_VALUE.contains(&p)))
+            || BOOLEAN.contains(&name)
+        {
+            // A boolean, or `-b<value>`: a short flag with its value attached.
+            flags.push(arg);
+        } else {
+            return Err(format!(
+                "`{arg}` is not a flag cplt knows `gh pr merge` to take \
+                 (spell short flags separately)"
+            ));
+        }
+    }
+    let selector = match positionals.as_slice() {
+        ["pr", "merge"] => None,
+        ["pr", "merge", selector] => Some(*selector),
+        _ => return Err("expected at most one pull request selector".to_string()),
+    };
+    Ok(MergeArgs {
+        selector,
+        flags,
+        heads,
+    })
+}
+
+/// Percent-encode a branch name for a REST path, keeping `/`.
+fn encode_branch(branch: &str) -> String {
+    branch
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-._~/".contains(&b) {
+                char::from(b).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+/// Whether one rule from `GET /repos/{o}/{r}/rules/branches/{b}` gates a merge:
+/// a pull-request rule requiring at least one approving review, where that
+/// approval cannot be carried past a later push (`dismiss_stale_reviews_on_push`
+/// or `require_last_push_approval`). Without either, the agent could collect an
+/// approval, push unreviewed commits and merge. A missing field counts as off.
+///
+/// Status checks do not count: the pull request's author controls CI, by editing
+/// the workflows in the pull request or posting a status with `allow_api_write`.
+/// A merge queue alone does not count either.
+fn rule_gates_merge(rule: &serde_json::Value) -> bool {
+    let params = &rule["parameters"];
+    rule["type"] == "pull_request"
+        && params["required_approving_review_count"]
+            .as_u64()
+            .is_some_and(|n| n >= 1)
+        && (params["dismiss_stale_reviews_on_push"] == true
+            || params["require_last_push_approval"] == true)
+}
+
+/// The ruleset condition behind `gh_guard.allow_pr_merge`.
+///
+/// `repo` is the member the gate approved (`github.com/owner/name`); `gh` runs
+/// the real `gh` with the given arguments and returns its stdout — the seam the
+/// tests replace. Only reads are issued. The merge is allowed only when all of
+/// these hold, and refused on any lookup error:
+///
+/// - the pull request is in `repo` (a URL selector can name another one);
+/// - its author is the authenticated account, so a required review cannot be
+///   one the agent gave with that account (GitHub forbids self-approval);
+/// - an active ruleset on its base branch requires an approving review that
+///   a later push dismisses ([`rule_gates_merge`]), and the account cannot bypass that
+///   ruleset (`current_user_can_bypass == "never"`).
+///
+/// On success it returns the argv to exec instead of `args`:
+/// `pr merge <number> <flags> --match-head-commit <headRefOid>`, pinned to the
+/// pull request and head that were checked. An agent-supplied
+/// `--match-head-commit` naming another commit is refused.
+///
+/// What this does not cover: the facts are read at merge time by a `gh` that
+/// runs in the agent's environment, so an agent that redirects gh's API traffic
+/// could forge them; and the pull request's base branch, or that branch's rules,
+/// could be changed between this check and the merge.
+pub fn check_merge_protection(
+    args: &[&str],
+    repo: Option<&str>,
+    gh: &mut dyn FnMut(&[&str]) -> Result<String, String>,
+) -> Result<Vec<String>, Refusal> {
+    let refuse = |reason: String| Refusal {
+        headline: "'gh pr merge' is not allowed for this pull request.".to_string(),
+        guidance: format!(
+            "Reason: {reason}.\n\
+             gh_guard.allow_pr_merge merges only the authenticated account's own pull \
+             requests, into a branch where an active ruleset the account cannot bypass \
+             requires an approving review that a new push dismisses. Leave this merge \
+             to a human."
+        ),
+        agent_note: &[RESTRICTED, NOTE],
+    };
+    let failed = |e: String| refuse(format!("the protection check could not complete: {e}"));
+    let json = |out: String| -> Result<serde_json::Value, String> {
+        serde_json::from_str(&out).map_err(|e| format!("unreadable GitHub response: {e}"))
+    };
+
+    let Some(repo) = repo else {
+        return Err(refuse("no repository was pinned for the merge".into()));
+    };
+    let repo = repo.strip_prefix("github.com/").unwrap_or(repo);
+    let merge = parse_merge_args(args).map_err(refuse)?;
+    // gh refuses `-R` without a selector, so a bare `gh pr merge` is looked up
+    // without it: the caller runs every lookup with `GH_REPO` pinned to `repo`,
+    // as the merge itself runs. The selector stays a separate argument.
+    let mut view = vec!["pr", "view", "--json", "url,baseRefName,author,headRefOid"];
+    if let Some(selector) = merge.selector {
+        view.extend(["-R", repo, "--", selector]);
+    }
+    let pr = gh(&view).and_then(json).map_err(failed)?;
+    let (Some(url), Some(base), Some(author), Some(head)) = (
+        pr["url"].as_str(),
+        pr["baseRefName"].as_str(),
+        pr["author"]["login"].as_str(),
+        pr["headRefOid"].as_str().filter(|h| !h.is_empty()),
+    ) else {
+        return Err(failed(
+            "the pull request lookup returned no url, base, author or head".into(),
+        ));
+    };
+    let Some((_, number)) = url
+        .strip_prefix("https://github.com/")
+        .and_then(|rest| rest.split_once("/pull/"))
+        .filter(|(r, n)| {
+            repos_match(r, repo) && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+        })
+    else {
+        return Err(refuse(format!("pull request {url} is not in {repo}")));
+    };
+    if let Some(other) = merge.heads.iter().find(|h| **h != head) {
+        return Err(refuse(format!(
+            "--match-head-commit {other} is not the head of {url} ({head})"
+        )));
+    }
+    let viewer = gh(&["api", "user"]).and_then(json).map_err(failed)?;
+    let Some(viewer) = viewer["login"].as_str() else {
+        return Err(failed("the account lookup returned no login".into()));
+    };
+    if !author.eq_ignore_ascii_case(viewer) {
+        return Err(refuse(format!(
+            "pull request {url} was opened by '{author}', not by the authenticated account '{viewer}'"
+        )));
+    }
+
+    // One page of 100 rules, not paginated: a protecting rule on a later page is
+    // missed, which refuses the merge (fails closed).
+    let rules_path = format!(
+        "repos/{repo}/rules/branches/{}?per_page=100",
+        encode_branch(base)
+    );
+    let rules = gh(&["api", &rules_path]).and_then(json).map_err(failed)?;
+    let Some(rules) = rules.as_array() else {
+        return Err(failed("the rules lookup did not return a list".into()));
+    };
+    let mut ruleset_ids: Vec<u64> = rules
+        .iter()
+        .filter(|rule| rule_gates_merge(rule))
+        .filter_map(|rule| rule["ruleset_id"].as_u64())
+        .collect();
+    ruleset_ids.sort_unstable();
+    ruleset_ids.dedup();
+    if ruleset_ids.is_empty() {
+        return Err(refuse(format!(
+            "no active ruleset on '{base}' in {repo} requires an approving review that a new push dismisses"
+        )));
+    }
+    for id in ruleset_ids {
+        let ruleset = gh(&["api", &format!("repos/{repo}/rulesets/{id}")])
+            .and_then(json)
+            .map_err(failed)?;
+        if ruleset["enforcement"] == "active" && ruleset["current_user_can_bypass"] == "never" {
+            // Pin the merge to what was checked: gh would otherwise resolve a
+            // bare merge (or a branch selector) again, after the agent had a
+            // chance to switch branches or push.
+            let mut pinned = vec!["pr".to_string(), "merge".to_string(), number.to_string()];
+            pinned.extend(merge.flags.iter().map(|f| (*f).to_string()));
+            pinned.extend(["--match-head-commit".to_string(), head.to_string()]);
+            return Ok(pinned);
+        }
+    }
+    Err(refuse(format!(
+        "every ruleset on '{base}' in {repo} that gates merges can be bypassed by the \
+         authenticated account, or is not enforced"
+    )))
 }
 
 fn requested_hostname<'a>(args: &'a [&str]) -> Option<&'a str> {
@@ -4841,6 +5192,127 @@ mod tests {
             script.contains("--allow-api-write"),
             "wrapper must bake in --allow-api-write when policy has allow_api_write=true"
         );
+    }
+
+    #[test]
+    fn wrapper_script_bakes_in_allow_pr_merge() {
+        for (on, flag) in [(true, "--allow-pr-merge "), (false, "--no-allow-pr-merge ")] {
+            let policy = crate::config::GhGuardPolicy {
+                allow_pr_merge: on,
+                ..Default::default()
+            };
+            let script = generate_wrapper_script(
+                "/usr/bin/gh",
+                &["navikt/cplt".to_string()],
+                None,
+                "/usr/local/bin/cplt",
+                &policy,
+            );
+            assert!(script.contains(flag), "{flag} missing: {script}");
+        }
+    }
+
+    #[test]
+    fn merge_selector_reads_the_pull_request_gh_will_merge() {
+        let sel = |a: &[&str]| merge_selector(a);
+        assert_eq!(sel(&["pr", "merge"]), Ok(None));
+        assert_eq!(
+            sel(&["-R", "o/r", "pr", "merge", "--subject", "7", "5", "-s"]),
+            Ok(Some("5".to_string()))
+        );
+        assert_eq!(
+            sel(&["pr", "merge", "--body=x", "-bx", "-d", "--", "-9"]),
+            Ok(Some("-9".to_string()))
+        );
+        // An unknown flag could take a value and shift the selector.
+        assert!(sel(&["pr", "merge", "--new-flag", "7", "5"]).is_err());
+        assert!(sel(&["pr", "merge", "-sd", "5"]).is_err());
+        assert!(sel(&["pr", "merge", "5", "6"]).is_err());
+        for admin in [
+            &["pr", "merge", "--admin"][..],
+            &["pr", "merge", "--admin=false"],
+            &["pr", "merge", "--body", "--admin"],
+            &["pr", "merge", "--", "--admin"],
+        ] {
+            assert!(sel(admin).unwrap_err().contains("--admin"), "{admin:?}");
+        }
+    }
+
+    #[test]
+    fn merge_gated_on_allow_pr_merge_is_scope_checked_and_flagged() {
+        let scope = || Ok(vec!["o/r".to_string()]);
+        let on = GatePolicy {
+            allow_pr_merge: true,
+            ..GatePolicy::default()
+        };
+        let approval =
+            gate_with_scope_resolver(&["pr", "merge", "1", "-R", "o/r"], &on, scope, None).unwrap();
+        assert!(approval.check_merge_protection);
+        assert_eq!(approval.repo_scope.as_deref(), Some("github.com/o/r"));
+        // Other scope-checked commands never carry the flag.
+        let approval =
+            gate_with_scope_resolver(&["pr", "close", "1", "-R", "o/r"], &on, scope, None).unwrap();
+        assert!(!approval.check_merge_protection);
+        // Without the scope check there is no pinned repository to read rules for.
+        let unscoped = GatePolicy {
+            scope_check: false,
+            ..on
+        };
+        assert!(gate_with_scope_resolver(&["pr", "merge", "1"], &unscoped, scope, None).is_err());
+    }
+
+    #[test]
+    fn merge_gated_refuses_non_ascii_short_flag_without_panicking() {
+        // `-éx`: byte index 2 lands inside é's UTF-8 encoding, not on a char
+        // boundary. A `&name[..2]` byte slice there panics; the gate must
+        // refuse it like any other unknown flag instead.
+        let scope = || Ok(vec!["o/r".to_string()]);
+        let on = GatePolicy {
+            allow_pr_merge: true,
+            ..GatePolicy::default()
+        };
+        let err =
+            gate_with_scope_resolver(&["pr", "merge", "1", "-éx"], &on, scope, None).unwrap_err();
+        assert!(err.guidance.contains("is not a flag cplt knows"), "{err:?}");
+    }
+
+    #[test]
+    fn rest_merge_endpoints_stay_blocked_with_allow_api_write() {
+        for endpoint in [
+            "repos/o/r/pulls/1/merge",
+            "/repos/o/r/pulls/1/merge/",
+            "https://api.github.com/repos/o/r//pulls/1/MERGE?x=1",
+            "repos/o/r/merges",
+        ] {
+            for method in ["PUT", "POST"] {
+                let cmd = parse_command(&["api", "-X", method, endpoint]).unwrap();
+                assert_eq!(
+                    evaluate_with_policy(&cmd, true).decision,
+                    Decision::Block,
+                    "{method} {endpoint}"
+                );
+            }
+            let cmd = parse_command(&["api", endpoint, "-f", "merge_method=squash"]).unwrap();
+            assert_eq!(evaluate_with_policy(&cmd, true).decision, Decision::Block);
+        }
+        // Reading whether a PR is merged is not a merge.
+        let cmd = parse_command(&["api", "repos/o/r/pulls/1/merge"]).unwrap();
+        assert_eq!(
+            evaluate_with_policy(&cmd, true).decision,
+            Decision::ScopeCheck
+        );
+        // Neighbouring writes are unaffected.
+        let cmd = parse_command(&["api", "-X", "PUT", "repos/o/r/pulls/1/update-branch"]).unwrap();
+        assert_eq!(
+            evaluate_with_policy(&cmd, true).decision,
+            Decision::ScopeCheck
+        );
+    }
+
+    #[test]
+    fn encode_branch_keeps_slashes_and_escapes_the_rest() {
+        assert_eq!(encode_branch("release/2026"), "release/2026");
+        assert_eq!(encode_branch("a#b%c d"), "a%23b%25c%20d");
     }
 
     #[test]
@@ -8131,6 +8603,7 @@ mod tests {
             block_auth_token: true,
             unknown_command: UnknownCommandDecision::Block,
             allow_api_write: false,
+            allow_pr_merge: false,
         };
         let scope = || Ok(vec!["o/r".to_string()]);
         let err = gate_with_scope_resolver(

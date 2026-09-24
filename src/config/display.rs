@@ -742,6 +742,16 @@ fn guard_lines(global: &Config, local: Option<&Config>) -> Vec<String> {
                 c.gh_guard.allow_api_write.is_some()
             )
         ),
+        format!(
+            "    allow_pr_merge        = {}{}{}",
+            b.gh_allow_pr_merge,
+            danger_suffix(b.gh_allow_pr_merge),
+            src(
+                "gh_guard",
+                "allow_pr_merge",
+                c.gh_guard.allow_pr_merge.is_some()
+            )
+        ),
         String::new(),
         "  [git_guard]".to_string(),
         format!(
@@ -909,6 +919,11 @@ mod tests {
                     "gh_guard.allow_api_write",
                     &gh["allow_api_write"],
                     r.gh_guard.allow_api_write.to_string(),
+                ),
+                (
+                    "gh_guard.allow_pr_merge",
+                    &gh["allow_pr_merge"],
+                    r.gh_guard.allow_pr_merge.to_string(),
                 ),
                 (
                     "git_guard.enabled",

@@ -531,6 +531,7 @@ impl Config {
                     inject_token: _,
                     unknown_command: _,
                     allow_api_write: _,
+                    allow_pr_merge: _,
                 },
             git_guard:
                 super::types::GitGuardConfig {
@@ -630,6 +631,7 @@ impl Config {
             inject_token,
             unknown_command,
             allow_api_write,
+            allow_pr_merge,
         );
         take_set!(
             out.git_guard,
