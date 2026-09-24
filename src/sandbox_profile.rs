@@ -5101,7 +5101,7 @@ mod tests {
         /// profile would leave most of the emitters unwalked.
         #[test]
         fn every_write_deny_has_a_pinned_parent_chain() {
-            crate::without_xdg(|| {
+            crate::with_env_lock_no_xdg(|| {
                 let mut unexpected: Vec<String> = Vec::new();
                 let mut seen: Vec<(String, String, String)> = Vec::new();
                 for &agent in crate::agent::Agent::ALL {

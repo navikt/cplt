@@ -624,16 +624,20 @@ mod tests {
 
     #[test]
     fn expand_tilde_replaces_home() {
-        let expanded = expand_tilde("~/some/path");
-        let home = std::env::var("HOME").unwrap();
-        assert_eq!(expanded, PathBuf::from(format!("{home}/some/path")));
+        crate::with_env_lock_no_xdg(|| {
+            let expanded = expand_tilde("~/some/path");
+            let home = std::env::var("HOME").unwrap();
+            assert_eq!(expanded, PathBuf::from(format!("{home}/some/path")));
+        });
     }
 
     #[test]
     fn expand_tilde_bare() {
-        let expanded = expand_tilde("~");
-        let home = std::env::var("HOME").unwrap();
-        assert_eq!(expanded, PathBuf::from(home));
+        crate::with_env_lock_no_xdg(|| {
+            let expanded = expand_tilde("~");
+            let home = std::env::var("HOME").unwrap();
+            assert_eq!(expanded, PathBuf::from(home));
+        });
     }
 
     #[test]
@@ -781,15 +785,17 @@ mod tests {
 
     #[test]
     fn resolve_repo_path_leaves_absolute_and_tilde_alone() {
-        let home = std::env::var("HOME").unwrap();
-        assert_eq!(
-            resolve_repo_path("/nonexistent-abs/shadow", Path::new("/nonexistent-repo")),
-            PathBuf::from("/nonexistent-abs/shadow")
-        );
-        assert_eq!(
-            resolve_repo_path("~/nonexistent-secrets", Path::new("/nonexistent-repo")),
-            PathBuf::from(format!("{home}/nonexistent-secrets"))
-        );
+        crate::with_env_lock_no_xdg(|| {
+            let home = std::env::var("HOME").unwrap();
+            assert_eq!(
+                resolve_repo_path("/nonexistent-abs/shadow", Path::new("/nonexistent-repo")),
+                PathBuf::from("/nonexistent-abs/shadow")
+            );
+            assert_eq!(
+                resolve_repo_path("~/nonexistent-secrets", Path::new("/nonexistent-repo")),
+                PathBuf::from(format!("{home}/nonexistent-secrets"))
+            );
+        });
     }
 
     #[test]
@@ -808,15 +814,19 @@ mod tests {
 
     #[test]
     fn collapse_tilde_home_subpath() {
-        let home = std::env::var("HOME").unwrap();
-        let input = format!("{home}/.config/gcloud/creds.json");
-        assert_eq!(collapse_tilde(&input), "~/.config/gcloud/creds.json");
+        crate::with_env_lock_no_xdg(|| {
+            let home = std::env::var("HOME").unwrap();
+            let input = format!("{home}/.config/gcloud/creds.json");
+            assert_eq!(collapse_tilde(&input), "~/.config/gcloud/creds.json");
+        });
     }
 
     #[test]
     fn collapse_tilde_exact_home() {
-        let home = std::env::var("HOME").unwrap();
-        assert_eq!(collapse_tilde(&home), "~");
+        crate::with_env_lock_no_xdg(|| {
+            let home = std::env::var("HOME").unwrap();
+            assert_eq!(collapse_tilde(&home), "~");
+        });
     }
 
     #[test]
@@ -826,10 +836,12 @@ mod tests {
 
     #[test]
     fn collapse_tilde_similar_prefix_not_collapsed() {
-        // e.g. HOME=/Users/hans but path is /Users/hans2/foo — must NOT collapse
-        let home = std::env::var("HOME").unwrap();
-        let similar = format!("{home}2/foo");
-        assert_eq!(collapse_tilde(&similar), similar);
+        crate::with_env_lock_no_xdg(|| {
+            // e.g. HOME=/Users/hans but path is /Users/hans2/foo — must NOT collapse
+            let home = std::env::var("HOME").unwrap();
+            let similar = format!("{home}2/foo");
+            assert_eq!(collapse_tilde(&similar), similar);
+        });
     }
 
     #[test]
@@ -839,12 +851,14 @@ mod tests {
 
     #[test]
     fn collapse_tilde_roundtrip_with_expand() {
-        let home = std::env::var("HOME").unwrap();
-        let original = "~/.config/test";
-        let expanded = expand_tilde(original);
-        assert_eq!(expanded, PathBuf::from(format!("{home}/.config/test")));
-        let collapsed = collapse_tilde(expanded.to_str().unwrap());
-        assert_eq!(collapsed, original);
+        crate::with_env_lock_no_xdg(|| {
+            let home = std::env::var("HOME").unwrap();
+            let original = "~/.config/test";
+            let expanded = expand_tilde(original);
+            assert_eq!(expanded, PathBuf::from(format!("{home}/.config/test")));
+            let collapsed = collapse_tilde(expanded.to_str().unwrap());
+            assert_eq!(collapsed, original);
+        });
     }
 
     // ── CPLT_CONFIG classification (issue #261) ──────────────────

@@ -3003,7 +3003,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn ro_protect_set_carries_the_exec_only_agent_dirs() {
-        crate::without_xdg(|| {
+        crate::with_env_lock_no_xdg(|| {
             let home = Path::new("/home/test");
             let agent_dirs = Agent::OpenCode.config_dirs(home);
             let mut config = test_config(home, &[]);

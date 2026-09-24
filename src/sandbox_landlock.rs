@@ -3220,7 +3220,7 @@ mod tests {
     /// `store/` instead, which is all `pnpm install` needs.
     #[test]
     fn pnpm_home_is_not_writable_but_its_store_is() {
-        crate::without_xdg(|| {
+        crate::with_env_lock_no_xdg(|| {
             let project = PathBuf::from("/home/user/project");
             let home = PathBuf::from("/home/user");
             let policy = generate_policy(&test_config(&project, &home));
@@ -3247,7 +3247,7 @@ mod tests {
 
     #[test]
     fn pnpm_self_management_storage_has_its_required_effective_permissions() {
-        crate::without_xdg(|| {
+        crate::with_env_lock_no_xdg(|| {
             let project = PathBuf::from("/home/user/project");
             let home = PathBuf::from("/home/user");
             let policy = generate_policy(&test_config(&project, &home));
@@ -4215,7 +4215,7 @@ mod tests {
     /// dir and one linked somewhere harmless still are.
     #[test]
     fn first_party_dirs_linked_into_credentials_are_refused() {
-        crate::without_xdg(|| {
+        crate::with_env_lock_no_xdg(|| {
             use std::os::unix::fs::symlink;
             let tmp = tempfile::tempdir().unwrap();
             let home = tmp.path().canonicalize().unwrap();
@@ -4592,7 +4592,7 @@ mod tests {
 
     #[test]
     fn home_config_files_are_readable() {
-        crate::without_xdg(|| {
+        crate::with_env_lock_no_xdg(|| {
             let project = PathBuf::from("/home/user/project");
             let home = PathBuf::from("/home/user");
             let config = test_config(&project, &home);
@@ -4824,7 +4824,7 @@ mod tests {
 
     #[test]
     fn app_dirs_included_when_existing_is_none() {
-        crate::without_xdg(|| {
+        crate::with_env_lock_no_xdg(|| {
             let project = PathBuf::from("/home/user/project");
             let home = PathBuf::from("/home/user");
             let config = test_config(&project, &home);
@@ -4848,7 +4848,7 @@ mod tests {
 
     #[test]
     fn app_dirs_excluded_when_no_match() {
-        crate::without_xdg(|| {
+        crate::with_env_lock_no_xdg(|| {
             let project = PathBuf::from("/home/user/project");
             let home = PathBuf::from("/home/user");
             let mut config = test_config(&project, &home);
@@ -4886,7 +4886,7 @@ mod tests {
 
     #[test]
     fn app_dir_fsaccess_flags_match_permissions() {
-        crate::without_xdg(|| {
+        crate::with_env_lock_no_xdg(|| {
             let project = PathBuf::from("/home/user/project");
             let home = PathBuf::from("/home/user");
             let config = test_config(&project, &home);
@@ -4964,7 +4964,7 @@ mod tests {
 
     #[test]
     fn app_dir_effective_permissions_include_parent_rules() {
-        crate::without_xdg(|| {
+        crate::with_env_lock_no_xdg(|| {
             let project = PathBuf::from("/home/user/project");
             let home = PathBuf::from("/home/user");
             let config = test_config(&project, &home);

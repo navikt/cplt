@@ -2759,7 +2759,7 @@ mod tests {
 
     #[test]
     fn opencode_config_dirs_xdg_default() {
-        crate::without_xdg(|| {
+        crate::with_env_lock_no_xdg(|| {
             let home = Path::new("/Users/test");
             let dirs = Agent::OpenCode.config_dirs(home);
             assert_eq!(
@@ -3097,7 +3097,7 @@ mod tests {
     /// the child and the create_dirs design has a hole — do not relax the test.
     #[test]
     fn create_dirs_exec_only_children_are_pre_created() {
-        crate::without_xdg(|| {
+        crate::with_env_lock_no_xdg(|| {
             let tmp = tempfile::tempdir().expect("tempdir");
             let home = tmp.path();
             let mut checked = 0;

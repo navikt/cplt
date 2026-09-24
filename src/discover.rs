@@ -2050,7 +2050,7 @@ mod tests {
 
     #[test]
     fn tool_discovery_finds_git() {
-        crate::without_xdg(|| {
+        crate::with_env_lock_no_xdg(|| {
             let home = PathBuf::from(std::env::var("HOME").unwrap());
             let tools = discover_tools(&home, &[]);
             assert!(
@@ -2062,7 +2062,7 @@ mod tests {
 
     #[test]
     fn path_discovery_runs_without_panic() {
-        crate::without_xdg(|| {
+        crate::with_env_lock_no_xdg(|| {
             let home = PathBuf::from(std::env::var("HOME").unwrap());
             let project = std::env::current_dir().unwrap();
             let paths = discover_paths(&home, &project);

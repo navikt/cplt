@@ -596,36 +596,40 @@ mod tests {
 
     #[test]
     fn set_repo_value_collapses_home_paths_for_read() {
-        let home = std::env::var("HOME").unwrap();
-        let abs_path = format!("{home}/.config/gcloud/application_default_credentials.json");
-        let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
-        let info = lookup_key("allow.read").unwrap();
-        let target = repo_key_target(info).unwrap();
-        set_repo_value_in_doc(&mut doc, info, target, &abs_path, false).unwrap();
-        let result = doc.to_string();
-        assert!(
-            result.contains("~/.config/gcloud/application_default_credentials.json"),
-            "absolute home path should be collapsed to ~/ form, got: {result}"
-        );
-        assert!(
-            !result.contains(&home),
-            "absolute home prefix should not remain in output"
-        );
+        crate::with_env_lock_no_xdg(|| {
+            let home = std::env::var("HOME").unwrap();
+            let abs_path = format!("{home}/.config/gcloud/application_default_credentials.json");
+            let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
+            let info = lookup_key("allow.read").unwrap();
+            let target = repo_key_target(info).unwrap();
+            set_repo_value_in_doc(&mut doc, info, target, &abs_path, false).unwrap();
+            let result = doc.to_string();
+            assert!(
+                result.contains("~/.config/gcloud/application_default_credentials.json"),
+                "absolute home path should be collapsed to ~/ form, got: {result}"
+            );
+            assert!(
+                !result.contains(&home),
+                "absolute home prefix should not remain in output"
+            );
+        });
     }
 
     #[test]
     fn set_repo_value_collapses_home_paths_for_write() {
-        let home = std::env::var("HOME").unwrap();
-        let abs_path = format!("{home}/some/dir");
-        let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
-        let info = lookup_key("allow.write").unwrap();
-        let target = repo_key_target(info).unwrap();
-        set_repo_value_in_doc(&mut doc, info, target, &abs_path, false).unwrap();
-        let result = doc.to_string();
-        assert!(
-            result.contains("~/some/dir"),
-            "should collapse to ~/some/dir, got: {result}"
-        );
+        crate::with_env_lock_no_xdg(|| {
+            let home = std::env::var("HOME").unwrap();
+            let abs_path = format!("{home}/some/dir");
+            let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
+            let info = lookup_key("allow.write").unwrap();
+            let target = repo_key_target(info).unwrap();
+            set_repo_value_in_doc(&mut doc, info, target, &abs_path, false).unwrap();
+            let result = doc.to_string();
+            assert!(
+                result.contains("~/some/dir"),
+                "should collapse to ~/some/dir, got: {result}"
+            );
+        });
     }
 
     #[test]
@@ -643,55 +647,61 @@ mod tests {
 
     #[test]
     fn set_repo_value_unset_matches_collapsed_form() {
-        let home = std::env::var("HOME").unwrap();
-        let abs_path = format!("{home}/.config/gcloud/creds.json");
-        // First set a collapsed value
-        let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
-        let info = lookup_key("allow.read").unwrap();
-        let target = repo_key_target(info).unwrap();
-        set_repo_value_in_doc(&mut doc, info, target, &abs_path, false).unwrap();
-        assert!(doc.to_string().contains("~/.config/gcloud/creds.json"));
+        crate::with_env_lock_no_xdg(|| {
+            let home = std::env::var("HOME").unwrap();
+            let abs_path = format!("{home}/.config/gcloud/creds.json");
+            // First set a collapsed value
+            let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
+            let info = lookup_key("allow.read").unwrap();
+            let target = repo_key_target(info).unwrap();
+            set_repo_value_in_doc(&mut doc, info, target, &abs_path, false).unwrap();
+            assert!(doc.to_string().contains("~/.config/gcloud/creds.json"));
 
-        // Now unset using the absolute path (as shell would expand it)
-        set_repo_value_in_doc(&mut doc, info, target, &abs_path, true).unwrap();
-        let result = doc.to_string();
-        assert!(
-            !result.contains("creds.json"),
-            "unset with absolute path should remove collapsed entry, got: {result}"
-        );
+            // Now unset using the absolute path (as shell would expand it)
+            set_repo_value_in_doc(&mut doc, info, target, &abs_path, true).unwrap();
+            let result = doc.to_string();
+            assert!(
+                !result.contains("creds.json"),
+                "unset with absolute path should remove collapsed entry, got: {result}"
+            );
+        });
     }
 
     #[test]
     fn set_repo_value_deny_collapses_home_paths() {
-        let home = std::env::var("HOME").unwrap();
-        let abs_path = format!("{home}/.ssh");
-        let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
-        let info = lookup_key("deny.paths").unwrap();
-        let target = repo_key_target(info).unwrap();
-        set_repo_value_in_doc(&mut doc, info, target, &abs_path, false).unwrap();
-        let result = doc.to_string();
-        assert!(
-            result.contains("~/.ssh"),
-            "deny paths should collapse home prefix, got: {result}"
-        );
+        crate::with_env_lock_no_xdg(|| {
+            let home = std::env::var("HOME").unwrap();
+            let abs_path = format!("{home}/.ssh");
+            let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
+            let info = lookup_key("deny.paths").unwrap();
+            let target = repo_key_target(info).unwrap();
+            set_repo_value_in_doc(&mut doc, info, target, &abs_path, false).unwrap();
+            let result = doc.to_string();
+            assert!(
+                result.contains("~/.ssh"),
+                "deny paths should collapse home prefix, got: {result}"
+            );
+        });
     }
 
     #[test]
     fn set_repo_value_no_duplicate_when_legacy_absolute_exists() {
-        let home = std::env::var("HOME").unwrap();
-        let abs_path = format!("{home}/.config/gcloud/creds.json");
-        // Simulate a legacy entry with absolute path already in the doc
-        let initial = format!("[propose.allow]\nread = [\"{abs_path}\"]\n");
-        let mut doc = initial.parse::<toml_edit::DocumentMut>().unwrap();
-        let info = lookup_key("allow.read").unwrap();
-        let target = repo_key_target(info).unwrap();
-        // Adding the same path again should NOT create a duplicate
-        set_repo_value_in_doc(&mut doc, info, target, &abs_path, false).unwrap();
-        let result = doc.to_string();
-        let count = result.matches("creds.json").count();
-        assert_eq!(
-            count, 1,
-            "should not duplicate when legacy absolute entry exists, got: {result}"
-        );
+        crate::with_env_lock_no_xdg(|| {
+            let home = std::env::var("HOME").unwrap();
+            let abs_path = format!("{home}/.config/gcloud/creds.json");
+            // Simulate a legacy entry with absolute path already in the doc
+            let initial = format!("[propose.allow]\nread = [\"{abs_path}\"]\n");
+            let mut doc = initial.parse::<toml_edit::DocumentMut>().unwrap();
+            let info = lookup_key("allow.read").unwrap();
+            let target = repo_key_target(info).unwrap();
+            // Adding the same path again should NOT create a duplicate
+            set_repo_value_in_doc(&mut doc, info, target, &abs_path, false).unwrap();
+            let result = doc.to_string();
+            let count = result.matches("creds.json").count();
+            assert_eq!(
+                count, 1,
+                "should not duplicate when legacy absolute entry exists, got: {result}"
+            );
+        });
     }
 }
