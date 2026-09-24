@@ -6836,7 +6836,8 @@ paths = [
     /// A git project with an existing nested repository `keep/`, a nested
     /// worktree-style `wt/.git` pointer file to the bare `e0` (which has a
     /// `pre-commit` hook), a `cw/` whose `commondir` names the bare `c0`, and
-    /// a repository `evil` beside the project, outside it. Plus a scratch
+    /// a repository `evil` beside the project, outside it, and `outer` with a
+    /// repository one level down, `outer/app`. Plus a scratch
     /// HOME. Built in the checkout, not `/tmp`, where the sandbox denies exec.
     fn nested_git_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let tmp = tempfile::Builder::new()
@@ -6858,6 +6859,7 @@ paths = [
         std::fs::write(project.join("cw/HEAD"), "ref: refs/heads/main\n").unwrap();
         std::fs::write(project.join("cw/commondir"), "../c0\n").unwrap();
         assert!(git_ok(&root, &["init", "-q", "-b", "main", "evil"]));
+        assert!(git_ok(&root, &["init", "-q", "-b", "main", "outer/app"]));
         (tmp, project, home)
     }
 
@@ -6895,8 +6897,17 @@ paths = [
              echo ../cm > sp/commondir && printf '[core]\\n\\tfsmonitor = x\\n' > cm/config && \
              mkdir -p hl/objects hl/refs && ln -s refs/heads/main hl/HEAD && \
              printf '[core]\\n\\tfsmonitor = x\\n' > hl/config && ln -s ../evil tools && \
+             ln -s ../outer pkgs && ln -s ../later lat && mkdir .git/.git && \
+             mkdir -p l2/in/objects l2/in/refs && echo 'ref: refs/heads/main' > l2/in/HEAD && \
+             chmod 311 l2 && \
              printf '[core]\\n\\tfsmonitor = x\\n' >> e0/config && echo x > keep/file",
         );
+        // Before any assertion, so the tempdir can be removed either way.
+        std::fs::set_permissions(
+            project.join("l2"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
         // Git itself takes `sp` (a commondir split) and `hl` (HEAD a dangling
         // symlink) as git directories, with no `.git` in sight. Without that,
         // reporting them would prove nothing.
@@ -6956,10 +6967,59 @@ paths = [
             let line = format!("{what}: {}", project.join(dir).display());
             assert!(stderr.contains(&line), "missing `{line}`: {stderr}");
         }
+        let outside = project.parent().unwrap();
+        for line in [
+            // N3: named by the planted entry, not the gitdir it is in.
+            format!("new: {}", project.join(".git/.git").display()),
+            // F3: a gitdir outside every root says so.
+            format!(
+                "new: {} (its git directory is outside the project: {})",
+                project.join("tools").display(),
+                outside.join("evil/.git").display()
+            ),
+            // B1: a link out of the project, with the repository one level
+            // down, and a dangling one that something outside can arm later.
+            format!("{} -> ../outer", project.join("pkgs").display()),
+            format!("{} -> ../later", project.join("lat").display()),
+            // B2: a directory the walk cannot list, hiding `l2/in`.
+            format!("  {}\n", project.join("l2").display()),
+        ] {
+            assert!(stderr.contains(&line), "missing `{line}`: {stderr}");
+        }
+        assert!(
+            stderr.contains("could not list these directories"),
+            "{stderr}"
+        );
+        // A link that stays inside the project is not a link report.
+        assert!(!stderr.contains("s2/.git -> ../e"), "{stderr}");
         assert!(
             !stderr.contains(&project.join("keep").display().to_string()),
             "an untouched nested repository was reported: {stderr}"
         );
+    }
+
+    /// #576 review (F1): a project root that is not a repository at launch
+    /// (here `--project-dir <repo>/sub`) is itself tested, and a `.git` the
+    /// session makes there is reported.
+    #[test]
+    fn e2e_nested_git_new_repo_at_the_project_root_is_reported() {
+        require_sandbox!();
+        let (_tmp, project, home) = nested_git_fixture();
+        let sub = project.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let output = cplt_cmd()
+            .arg("--no-validate")
+            .arg("--project-dir")
+            .arg(&sub)
+            .args(["exec", "-c", "mkdir .git"])
+            .current_dir(&sub)
+            .env("HOME", &home)
+            .output()
+            .expect("cplt exec should run");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "session failed: {stderr}");
+        let line = format!("new: {}\n", sub.display());
+        assert!(stderr.contains(&line), "missing `{line}`: {stderr}");
     }
 
     /// #576 review: a hook rewritten with the same length and its mtime put
