@@ -1202,6 +1202,14 @@ fn gh_gate_pr_merge_refused_with_admin_even_when_protected() {
 }
 
 #[test]
+fn gh_gate_pr_merge_refused_with_non_ascii_short_flag() {
+    // `-éx`: byte index 2 falls inside é's UTF-8 encoding, not on a char
+    // boundary. A byte-slice regression here panics instead of refusing.
+    let (_, stderr, ok) = gh_gate_with_opts(&["pr", "merge", "5", "-éx"], &["--allow-pr-merge"]);
+    assert_refused(&stderr, ok, "is not a flag cplt knows");
+}
+
+#[test]
 fn gh_gate_pr_merge_refused_in_another_repo() {
     let (stdout, stderr, ok) = gh_gate_merge(
         &["pr", "merge", "5", "-R", "evil-org/other"],

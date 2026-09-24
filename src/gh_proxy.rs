@@ -2276,7 +2276,9 @@ fn parse_merge_args<'a>(args: &[&'a str]) -> Result<MergeArgs<'a>, String> {
                     flags.extend(value);
                 }
             }
-        } else if (name.len() > 2 && !name.starts_with("--") && WITH_VALUE.contains(&&name[..2]))
+        } else if (name.len() > 2
+            && !name.starts_with("--")
+            && name.get(..2).is_some_and(|p| WITH_VALUE.contains(&p)))
             || BOOLEAN.contains(&name)
         {
             // A boolean, or `-b<value>`: a short flag with its value attached.
@@ -5257,6 +5259,21 @@ mod tests {
             ..on
         };
         assert!(gate_with_scope_resolver(&["pr", "merge", "1"], &unscoped, scope, None).is_err());
+    }
+
+    #[test]
+    fn merge_gated_refuses_non_ascii_short_flag_without_panicking() {
+        // `-éx`: byte index 2 lands inside é's UTF-8 encoding, not on a char
+        // boundary. A `&name[..2]` byte slice there panics; the gate must
+        // refuse it like any other unknown flag instead.
+        let scope = || Ok(vec!["o/r".to_string()]);
+        let on = GatePolicy {
+            allow_pr_merge: true,
+            ..GatePolicy::default()
+        };
+        let err =
+            gate_with_scope_resolver(&["pr", "merge", "1", "-éx"], &on, scope, None).unwrap_err();
+        assert!(err.guidance.contains("is not a flag cplt knows"), "{err:?}");
     }
 
     #[test]

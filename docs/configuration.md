@@ -473,7 +473,7 @@ lifts that for one case: a pull request the agent can merge only because the
 repository would stop a bad merge anyway.
 
 ```bash
-cplt config set gh_guard.allow_pr_merge true
+cplt config set gh_guard.allow_pr_merge true --force
 ```
 
 With the key on, the shim checks each `gh pr merge` when it runs and lets it
