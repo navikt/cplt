@@ -246,10 +246,11 @@ pub fn generate_profile_with_playwright_socket_dir(
         &project_roots,
         config.extra_write,
         config.scratch_dir,
+        &copilot_exec_carve_outs(config),
     );
-    // Same reason: a Copilot cache moved by a cache variable (#374) keeps its
-    // write deny over every allow above.
-    emit_copilot_pkg_override_denies(&mut sb, config);
+    // Same reason: Copilot's SEA cache, the default and any directory a cache
+    // variable moved it to (#374), keeps its write deny over every allow above.
+    emit_copilot_pkg_denies(&mut sb, config);
     // MUST stay last: see `emit_exec_write_denies`. An exec grant that could be
     // reopened for writing by a later allow is a write-then-exec path.
     emit_exec_write_denies(&mut sb, config.extra_exec);
@@ -1388,12 +1389,16 @@ fn emit_tool_dirs(
     //     the sandbox (--no-auto-update), so writes are not needed.
     // Must come AFTER the denies (last-match-wins in SBPL).
     // Only needed for Copilot agent.
-    // A directory a cache variable moves it to (#374) gets the same rules
-    // from `emit_copilot_pkg_override_denies`, after every allow.
+    // The write deny and rename pin are not here: they must beat every later
+    // allow, so `emit_copilot_pkg_denies` emits them after all of them, along
+    // with the whole block for a directory a cache variable moves it to (#374).
+    // The two allows stay here, right after the denies they carve out of: a
+    // later position would also let them override a user `deny` on the cache.
     if agent.needs_copilot_dir() {
-        let pkg = copilot_default_pkg_dir(home_dir, "macos");
-        let pin: Vec<PathBuf> = pkg.parent().map(Path::to_path_buf).into_iter().collect();
-        emit_copilot_pkg_carveout(sb, &pkg, &pin);
+        for pkg in copilot_default_pkg_spellings(home_dir) {
+            emit_copilot_pkg_exec(sb, &pkg);
+        }
+        sbpl!(sb);
     }
 
     // User-specified ~/Library/Caches exec carve-outs.
@@ -1428,14 +1433,40 @@ fn emit_tool_dirs(
     }
 }
 
-/// Exec, write-deny and rename pins for one Copilot SEA `pkg` directory.
-///
-/// `pkg_dir` comes from `copilot_pkg_dirs`, which only admits env values that
-/// pass `validate_sbpl_path`.
-fn emit_copilot_pkg_carveout(sb: &mut String, pkg_dir: &Path, pins: &[PathBuf]) {
-    let pkg = pkg_dir.to_string_lossy();
+/// The default Copilot `pkg` directory as spelled and, when a symlink sits on
+/// the way, where it resolves: Seatbelt matches the resolved path only, so the
+/// target spelling is the one whose rules fire (#523). A link the agent could
+/// re-point (inside a writable tree) never gets this far: `copilot_pkg_dirs`
+/// refuses the launch.
+fn copilot_default_pkg_spellings(home_dir: &Path) -> Vec<String> {
+    let pkg = copilot_default_pkg_dir(home_dir, "macos");
+    spellings(&pkg, &crate::config::canonicalize_deepest(&pkg))
+}
+
+/// The default Copilot `pkg` spellings for [`emit_user_write_exec_denies`] to
+/// re-allow exec on: an `allow.write` over `~/Library/Caches` would otherwise
+/// deny `process-exec` there after `emit_tool_dirs` allowed it, and Copilot's
+/// `spawn-helper` and `rg` would stop running. Its write deny still comes
+/// later, from `emit_copilot_pkg_denies`.
+fn copilot_exec_carve_outs(config: &SandboxConfig) -> Vec<String> {
+    if config.agent.needs_copilot_dir() {
+        copilot_default_pkg_spellings(config.home_dir)
+    } else {
+        Vec::new()
+    }
+}
+
+/// Exec carve-out for one Copilot SEA `pkg` directory.
+fn emit_copilot_pkg_exec(sb: &mut String, pkg: &str) {
     sbpl!(sb, "(allow file-map-executable (subpath \"{pkg}\"))");
     sbpl!(sb, "(allow process-exec (subpath \"{pkg}\"))");
+}
+
+/// Write deny and rename pins for one Copilot SEA `pkg` directory.
+///
+/// `pkg` comes from `copilot_pkg_dirs`, which only admits env values that
+/// pass `validate_sbpl_path`.
+fn emit_copilot_pkg_write_deny(sb: &mut String, pkg: &str, pins: &[PathBuf]) {
     sbpl!(sb, "(deny file-write* (subpath \"{pkg}\"))");
     // GHSA-8qmv-wxp3-526v. The deny above names a path, and a path-shaped
     // rule only holds while the path keeps denoting the directory it
@@ -1473,19 +1504,32 @@ fn emit_copilot_pkg_carveout(sb: &mut String, pkg_dir: &Path, pins: &[PathBuf]) 
     sbpl!(sb);
 }
 
-/// The Copilot `pkg` carve-out for each directory a cache variable moved it to
-/// (#374).
+/// The Copilot `pkg` write denies and rename pins, and the whole carve-out for
+/// each directory a cache variable moved it to (#374).
 ///
 /// Emitted after every allow, for the reason `emit_exec_write_denies` spells
-/// out: SBPL is last-match-wins, and a user `allow.write` or the temp rules
-/// emitted later would otherwise reopen the write deny on a directory the
-/// host executes. `copilot_pkg_grants` already refuses a directory inside a
-/// writable tree; this keeps the deny winning if that check ever misses one.
-fn emit_copilot_pkg_override_denies(sb: &mut String, config: &SandboxConfig) {
+/// out: SBPL is last-match-wins, and a user `allow.write` over
+/// `~/Library/Caches` or the temp rules emitted later would otherwise reopen
+/// the write deny on a directory the host executes. `copilot_pkg_grants`
+/// already refuses a moved directory inside a writable tree; this keeps the
+/// deny winning if that check ever misses one.
+fn emit_copilot_pkg_denies(sb: &mut String, config: &SandboxConfig) {
     if !config.agent.needs_copilot_dir() {
         return;
     }
-    // The first entry is always the default, emitted in `emit_tool_dirs`.
+    // The default, at each spelling, with its parent pinned at each: the
+    // grandparent `~/Library/Caches` is not renameable, so the parent is the
+    // one pin (see `emit_copilot_pkg_write_deny`). Its exec allows are in
+    // `emit_tool_dirs`.
+    for pkg in copilot_default_pkg_spellings(config.home_dir) {
+        let pin: Vec<PathBuf> = Path::new(&pkg)
+            .parent()
+            .map(Path::to_path_buf)
+            .into_iter()
+            .collect();
+        emit_copilot_pkg_write_deny(sb, &pkg, &pin);
+    }
+    // The first entry is always the default, handled above.
     for pkg_dir in super::copilot_pkg_grants(config, "macos").iter().skip(1) {
         let pins = super::home_config_target_pins(config, std::slice::from_ref(pkg_dir));
         // The default sits in `~/Library/Caches`, already readable as a
@@ -1494,7 +1538,8 @@ fn emit_copilot_pkg_override_denies(sb: &mut String, config: &SandboxConfig) {
         // carve-out's write deny still follows.
         let pkg = pkg_dir.to_string_lossy();
         sbpl!(sb, "(allow file-read* (subpath \"{pkg}\"))");
-        emit_copilot_pkg_carveout(sb, pkg_dir, &pins);
+        emit_copilot_pkg_exec(sb, &pkg);
+        emit_copilot_pkg_write_deny(sb, &pkg, &pins);
     }
 }
 
@@ -2035,7 +2080,9 @@ fn emit_exec_write_denies(sb: &mut String, extra_exec: &[PathBuf]) {
 /// - the scratch dir, which is write+exec by design;
 /// - the [`EXEC_IN_WRITABLE`] trees, which were already write+execute before
 ///   the grant. The deny exists to stop a grant *creating* that pair, not to
-///   revoke a documented one.
+///   revoke a documented one;
+/// - Copilot's default `pkg` directory, executable before the grant and still
+///   write-denied after it by `emit_copilot_pkg_denies`.
 ///
 /// Everything else loses execute: an `allow.write` covering `~/.cargo` or
 /// `~/.rustup` makes a read-only tool tree writable, and that pair is new.
@@ -2045,6 +2092,7 @@ fn emit_user_write_exec_denies(
     project_roots: &[String],
     extra_write: &[PathBuf],
     scratch_dir: Option<&Path>,
+    copilot_pkg: &[String],
 ) {
     if extra_write.is_empty() {
         return;
@@ -2066,6 +2114,7 @@ fn emit_user_write_exec_denies(
             .filter(|e| e.macos)
             .map(|e| Path::new(home).join(e.path)),
     );
+    carve_outs.extend(copilot_pkg.iter().map(PathBuf::from));
     for path in carve_outs.iter().filter(|p| granted(p)) {
         if validate_sbpl_path(path).is_err() {
             continue;

@@ -2308,6 +2308,105 @@ mod macos_tests {
         );
     }
 
+    /// A home and a project side by side under `CARGO_TARGET_TMPDIR`: not in
+    /// the system temp dir (the temp rules would grant writes on their own)
+    /// and not in the project (the project grant would).
+    fn copilot_cache_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let (home, project) = (root.join("home"), root.join("project"));
+        fs::create_dir_all(home.join("Library/Caches")).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        (dir, home, project)
+    }
+
+    /// SBPL is last-match-wins: an `allow.write` over `~/Library/Caches` must
+    /// not reopen the default Copilot cache, which the host executes, while
+    /// the rest of the cache it grants stays writable. Its exec allow must
+    /// survive the exec deny that grant brings, or spawn-helper and rg break.
+    #[test]
+    fn real_profile_keeps_the_copilot_cache_read_only_under_a_caches_allow_write() {
+        require_sandbox!();
+        let (_dir, home, project) = copilot_cache_fixture();
+        let caches = home.join("Library/Caches");
+        fs::create_dir_all(caches.join("copilot/pkg")).unwrap();
+        let helper = caches.join("copilot/pkg/helper");
+        fs::write(&helper, "#!/bin/sh\necho RAN\n").unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+        let other_helper = caches.join("other-helper");
+        fs::copy(&helper, &other_helper).unwrap();
+        let write = [caches.clone()];
+        let opts = SandboxConfig {
+            extra_write: &write,
+            ..default_opts(&project, &home)
+        };
+        let profile = write_real_profile(&opts);
+        let (pkg, other) = (caches.join("copilot/pkg/x"), caches.join("other"));
+        let run = |cmd: String| run_sandboxed(&profile, &cmd).0;
+        let blocked = run(format!("echo x > '{}' 2>&1; echo EXIT:$?", pkg.display()));
+        let allowed = run(format!("echo x > '{}' 2>&1; echo EXIT:$?", other.display()));
+        let ran = run(format!("'{}' 2>&1; echo EXIT:$?", helper.display()));
+        let ran_other = run(format!("'{}' 2>&1; echo EXIT:$?", other_helper.display()));
+        fs::remove_file(&profile).ok();
+        assert!(
+            !pkg.exists() && blocked.contains("EXIT:1"),
+            "the Copilot cache must stay read-only, got: {blocked}"
+        );
+        assert!(
+            allowed.contains("EXIT:0"),
+            "the rest of the cache must be writable: {allowed}"
+        );
+        assert!(
+            ran.contains("RAN") && ran.contains("EXIT:0"),
+            "the Copilot cache must stay executable: {ran}"
+        );
+        assert!(
+            !ran_other.contains("RAN"),
+            "the rest of the cache must stay non-executable: {ran_other}"
+        );
+    }
+
+    /// With the default Copilot cache missing, `prepare` creates it, so the
+    /// agent cannot plant `~/Library/Caches/copilot` as a symlink to a tree it
+    /// writes. A cache variable moving extraction elsewhere does not skip
+    /// that: the loader still searches the default for a newer runtime.
+    #[test]
+    fn prepare_leaves_no_room_for_a_planted_copilot_cache_link() {
+        require_sandbox!();
+        let (_dir, home, project) = copilot_cache_fixture();
+        let moved = home.parent().unwrap().join("moved");
+        let evil = project.join("evil");
+        fs::create_dir_all(&evil).unwrap();
+        let env = {
+            let moved = moved.clone().into_os_string();
+            move |k: &str| (k == "COPILOT_PKG_CACHE_HOME").then(|| moved.clone())
+        };
+        let opts = SandboxConfig {
+            copilot_cache_env: &env,
+            ..default_opts(&project, &home)
+        };
+        cplt::sandbox::prepare(&opts).expect("prepare");
+        let copilot = home.join("Library/Caches/copilot");
+        let profile = write_real_profile(&opts);
+        let (out, _) = run_sandboxed(
+            &profile,
+            &format!(
+                "c='{c}'; mv \"$c\" \"$c.bak\" 2>&1; rm -rf \"$c\" 2>&1; \
+                 ln -sfn '{e}' \"$c\" 2>&1; ln -s '{e}' \"$c\" 2>&1; echo DONE",
+                c = copilot.display(),
+                e = evil.display()
+            ),
+        );
+        fs::remove_file(&profile).ok();
+        let meta = fs::symlink_metadata(&copilot).expect("copilot must exist");
+        assert!(
+            meta.is_dir()
+                && copilot.join("pkg").is_dir()
+                && fs::read_dir(&evil).unwrap().next().is_none(),
+            "the default Copilot cache must stay a real directory: {out}"
+        );
+    }
+
     // ── nav-pilot state and skill directory denial ────────────────
 
     /// `~/.nav-pilot/` is unwritable from inside a session, and the one pinned

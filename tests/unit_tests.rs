@@ -2567,6 +2567,8 @@ fn write_exec_deny_comes_after_every_broad_exec_allow() {
         "/Users/test/.bun/install",
         "/Users/test/Library/pnpm/package-manager-store",
         "/Users/test/.local/share/pnpm/package-manager-store",
+        // Executable and write-denied: `emit_copilot_pkg_denies` follows.
+        "/Users/test/Library/Caches/copilot/pkg",
     ];
     const PREFIX: &str = "(allow process-exec (subpath \"";
     for (i, _) in p.match_indices(PREFIX) {
@@ -5965,6 +5967,97 @@ fn profile_denies_write_to_copilot_caches_pkg() {
         deny_pos > allow_pos,
         "Copilot Caches pkg write deny must come AFTER Library/Caches write allow (last-match-wins)"
     );
+}
+
+/// SBPL is last-match-wins, so the default cache's write deny and rename pin
+/// must follow every allow that could cover them: a user `allow.write` on
+/// `~/Library/Caches` and the temp rules. Only `emit_exec_write_denies` may
+/// come later.
+#[test]
+fn profile_copilot_caches_write_deny_follows_a_user_allow_write() {
+    let write = [std::path::PathBuf::from("/Users/test/Library/Caches")];
+    let p = generate_profile(
+        &SandboxConfig {
+            extra_write: &write,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    let last_allow = p
+        .rfind("(allow file-write* (subpath \"/Users/test/Library/Caches\"))")
+        .expect("the user allow must be in the profile");
+    for rule in [
+        "(deny file-write* (subpath \"/Users/test/Library/Caches/copilot/pkg\"))",
+        "(deny file-write-unlink (literal \"/Users/test/Library/Caches/copilot\"))",
+    ] {
+        let deny = p.rfind(rule).unwrap_or_else(|| panic!("missing {rule}"));
+        assert!(deny > last_allow, "{rule} must follow the user allow");
+        let tail = &p[deny..];
+        assert!(
+            !tail.contains("(allow file-write*"),
+            "no write allow may follow {rule}:\n{tail}"
+        );
+    }
+}
+
+/// An `allow.write` on `~/Library/Caches` denies `process-exec` on the whole
+/// tree after every allow; the default Copilot `pkg` must get its exec back
+/// after that deny (spawn-helper, rg), and its write deny must still follow.
+#[test]
+fn profile_copilot_caches_keep_exec_under_a_user_allow_write() {
+    let write = [std::path::PathBuf::from("/Users/test/Library/Caches")];
+    let p = generate_profile(
+        &SandboxConfig {
+            extra_write: &write,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    let exec_deny = p
+        .rfind("(deny process-exec (subpath \"/Users/test/Library/Caches\"))")
+        .expect("the allow.write exec deny must be in the profile");
+    let exec_allow = p
+        .rfind("(allow process-exec (subpath \"/Users/test/Library/Caches/copilot/pkg\"))")
+        .expect("the pkg exec allow must be in the profile");
+    assert!(
+        exec_allow > exec_deny,
+        "pkg exec must be re-allowed after the deny"
+    );
+    let write_deny = p
+        .rfind("(deny file-write* (subpath \"/Users/test/Library/Caches/copilot/pkg\"))")
+        .unwrap();
+    assert!(write_deny > exec_allow, "the write deny must stay last");
+}
+
+/// `~/Library/Caches/copilot` symlinked somewhere the agent cannot write:
+/// Seatbelt matches the resolved path, so the rules must name the target too,
+/// not only the spelling the kernel never sees.
+#[test]
+fn profile_protects_a_symlinked_default_copilot_cache_at_its_target() {
+    let tmp = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("tempdir");
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    let home = root.join("home");
+    let real = root.join("elsewhere/copilot");
+    std::fs::create_dir_all(real.join("pkg")).unwrap();
+    std::fs::create_dir_all(home.join("Library/Caches")).unwrap();
+    std::os::unix::fs::symlink(&real, home.join("Library/Caches/copilot")).unwrap();
+    let p = generate_profile(
+        &SandboxConfig {
+            home_dir: &home,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    let pkg = real.join("pkg");
+    let (pkg, parent) = (pkg.display(), real.display());
+    for rule in [
+        format!("(allow file-map-executable (subpath \"{pkg}\"))"),
+        format!("(allow process-exec (subpath \"{pkg}\"))"),
+        format!("(deny file-write* (subpath \"{pkg}\"))"),
+        format!("(deny file-write-unlink (literal \"{parent}\"))"),
+    ] {
+        assert!(p.contains(&rule), "profile must contain {rule}");
+    }
 }
 
 // ============================================================

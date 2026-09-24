@@ -354,6 +354,9 @@ pub fn prepare_with_pnpm_shadow(
     validate_pnpm_tool_dirs(config)?;
     validate_exec_grants(config)?;
     validate_copilot_cache_env(config)?;
+    if !inspect_only {
+        create_default_copilot_pkg_dir(config)?;
+    }
     if let Some(shadow) = pnpm_shadow_dir
         && !config.extra_exec.iter().any(|path| path == shadow)
     {
@@ -637,6 +640,60 @@ fn validate_copilot_cache_env(config: &SandboxConfig) -> Result<(), String> {
                 deny.display()
             ));
         }
+    }
+    Ok(())
+}
+
+/// Create the default Copilot `pkg` directory, and `copilot` above it, as real
+/// directories before the sandbox starts.
+///
+/// The write deny and rename pin name that path, and bubblewrap skips a
+/// missing one, so they only hold once it exists. Missing, it sits in a
+/// writable cache (`~/Library/Caches`, `~/.cache`): the agent could
+/// `ln -s <its dir> ~/Library/Caches/copilot` mid-session, and Copilot's
+/// loader searches the default for a newer runtime even when a cache variable
+/// moved extraction, so a later host `copilot` would run what it planted. The
+/// preflight creates only the extraction directory, and not at all for a
+/// project-local binary or an unsupported arch, so this runs regardless.
+///
+/// `mkdir` never follows a final symlink, so a link planted between the
+/// check and the call fails the launch instead of being used. An existing
+/// entry is left alone: `validate_copilot_cache_env` has already refused a
+/// symlink the agent could re-point.
+fn create_default_copilot_pkg_dir(config: &SandboxConfig) -> Result<(), String> {
+    use std::os::unix::fs::DirBuilderExt;
+    if !config.agent.needs_copilot_dir() {
+        return Ok(());
+    }
+    let os = if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "linux"
+    };
+    let pkg = policy::copilot_default_pkg_dir(config.home_dir, os);
+    let copilot = pkg.parent().expect("pkg has a parent");
+    let fail = |dir: &Path, e: std::io::Error| {
+        format!(
+            "Failed to create the Copilot cache directory {}: {e}. cplt protects it \
+             from the sandbox, which needs it to exist before launch.",
+            dir.display()
+        )
+    };
+    if let Some(caches) = copilot.parent() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(caches)
+            .map_err(|e| fail(caches, e))?;
+    }
+    for dir in [copilot, pkg.as_path()] {
+        if std::fs::symlink_metadata(dir).is_ok() {
+            continue;
+        }
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(dir)
+            .map_err(|e| fail(dir, e))?;
     }
     Ok(())
 }
@@ -2295,8 +2352,10 @@ mod tests {
 
     #[test]
     fn ordinary_exec_grant_is_not_treated_as_a_pnpm_shadow() {
-        let home = PathBuf::from("/home/user");
-        let project = PathBuf::from("/home/user/project");
+        // A real home: `prepare` creates the Copilot cache in it.
+        let (_guard, root) = copilot_cache_tree();
+        let home = root.join("home");
+        let project = home.join("project");
         let grant = home.join(".cplt-pnpm-shadow/user-selected");
         let grants = [grant];
         let mut config = test_config(&home, &[]);
@@ -3158,8 +3217,9 @@ mod tests {
     /// the flag would refuse every run it is set on.
     #[test]
     fn prepare_does_not_refuse_the_allow_docker_dotfile_grant() {
-        let home = Path::new("/home/test");
-        let mut config = test_config(home, &[]);
+        let (_guard, root) = copilot_cache_tree();
+        let home = root.join("home");
+        let mut config = test_config(&home, &[]);
         config.allow_docker = true;
 
         assert_eq!(validate_hard_denied_grants(&config), Ok(()));
@@ -3286,25 +3346,99 @@ mod tests {
         }
     }
 
-    /// Spelling the default is the same launch as leaving the variable unset,
-    /// even when the default is itself reached through a link in a writable
-    /// tree (`~/.cache/copilot -> ~/copilot`), which a link check would refuse.
+    /// `prepare` creates the default `copilot/pkg` as real directories, with a
+    /// cache variable set or not: the preflight creates only the extraction
+    /// directory, and nothing at all for a project-local binary, so this is
+    /// what keeps the agent from planting a `copilot` symlink mid-session. A
+    /// call that only inspects the policy creates nothing.
     #[test]
-    fn prepare_accepts_the_spelled_default_copilot_cache_behind_a_link() {
-        let (_guard, root) = copilot_cache_tree();
-        let home = root.join("home");
-        std::fs::create_dir_all(home.join("copilot/pkg")).unwrap();
-        for d in [".cache", "Library/Caches"] {
-            std::fs::create_dir_all(home.join(d)).unwrap();
-            std::os::unix::fs::symlink(home.join("copilot"), home.join(d).join("copilot")).unwrap();
+    fn prepare_creates_the_default_copilot_cache() {
+        use std::os::unix::fs::PermissionsExt;
+        for var in ["COPILOT_PKG_CACHE_HOME", "UNSET"] {
+            let (_guard, root) = copilot_cache_tree();
+            let home = root.join("home");
+            let os = if cfg!(target_os = "macos") {
+                "macos"
+            } else {
+                "linux"
+            };
+            let pkg = policy::copilot_default_pkg_dir(&home, os);
+            let moved = root.join("moved");
+            let (var_s, value) = (var.to_owned(), moved.clone().into_os_string());
+            let env = move |k: &str| (k == var_s).then(|| value.clone());
+            let project = root.join("project");
+            let mut config = test_config(&home, &[]);
+            config.project_dir = &project;
+            config.copilot_cache_env = &env;
+            config.use_bubblewrap = Some(false);
+
+            prepare_with_pnpm_shadow(&config, None, true).unwrap();
+            assert!(!pkg.parent().unwrap().exists(), "{var}: inspect wrote");
+
+            prepare(&config).unwrap_or_else(|e| panic!("{var}: {e}"));
+            for dir in [pkg.parent().unwrap(), pkg.as_path()] {
+                let meta = std::fs::symlink_metadata(dir).unwrap();
+                assert!(meta.is_dir(), "{var}: {} must be a real dir", dir.display());
+                assert_eq!(meta.permissions().mode() & 0o777, 0o700, "{var}");
+            }
+            assert!(!moved.exists(), "{var}: the override is Copilot's to make");
         }
-        let (var, value) = if cfg!(target_os = "macos") {
-            ("COPILOT_CACHE_HOME", home.join("Library/Caches/copilot"))
-        } else {
-            ("XDG_CACHE_HOME", home.join(".cache"))
-        };
-        prepare_with_copilot_cache(&root, var, &value, &[])
-            .unwrap_or_else(|e| panic!("{var}={} must launch: {e}", value.display()));
+    }
+
+    /// The default reached through a link in its writable cache
+    /// (`~/.cache/copilot -> ~/copilot`, or at `pkg`) is refused, set or
+    /// unset: the agent can re-point that link, and the host runs Copilot
+    /// from wherever it leads. Same stance as for an override (#570).
+    #[test]
+    fn prepare_refuses_the_default_copilot_cache_behind_a_writable_link() {
+        for linked in ["copilot", "copilot/pkg"] {
+            let (_guard, root) = copilot_cache_tree();
+            let home = root.join("home");
+            std::fs::create_dir_all(home.join("real/pkg")).unwrap();
+            for d in [".cache", "Library/Caches"] {
+                let at = home.join(d).join(linked);
+                std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+                let to = home.join(if linked == "copilot" {
+                    "real"
+                } else {
+                    "real/pkg"
+                });
+                std::os::unix::fs::symlink(to, at).unwrap();
+            }
+            let (var, value) = if cfg!(target_os = "macos") {
+                ("COPILOT_CACHE_HOME", home.join("Library/Caches/copilot"))
+            } else {
+                ("XDG_CACHE_HOME", home.join(".cache"))
+            };
+            for var in [var, "UNSET"] {
+                let error = prepare_with_copilot_cache(&root, var, &value, &[])
+                    .expect_err("a linked default must stop the launch");
+                assert!(
+                    error.contains("the writable tool directory")
+                        && error.contains("which the sandbox can write"),
+                    "{linked} with {var}: {error}"
+                );
+            }
+        }
+    }
+
+    /// A symlinked `~/Library/Caches` whose target the profile cannot name
+    /// stops the launch: Seatbelt matches the resolved path, so the default
+    /// cache would get no exec carve-out, write deny or pin.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prepare_refuses_a_default_copilot_cache_it_cannot_name() {
+        let (_guard, root) = copilot_cache_tree();
+        let target = root.join("bad\"caches");
+        std::fs::create_dir_all(target.join("copilot/pkg")).unwrap();
+        std::fs::create_dir_all(root.join("home/Library")).unwrap();
+        std::os::unix::fs::symlink(&target, root.join("home/Library/Caches")).unwrap();
+        let error = prepare_with_copilot_cache(&root, "UNSET", Path::new("/"), &[])
+            .expect_err("an unnameable default must stop the launch");
+        assert!(
+            error.contains("the sandbox profile cannot name") && error.contains("bad\"caches"),
+            "{error}"
+        );
     }
 
     /// Reaching the default through a symlink outside every writable tree is
@@ -3479,9 +3613,10 @@ mod tests {
     /// is not under it, and must still be accepted.
     #[test]
     fn prepare_accepts_an_exec_grant_beside_the_system_temp_dir() {
-        let home = Path::new("/home/test");
+        let (_guard, root) = copilot_cache_tree();
+        let home = root.join("home");
         let exec_paths = vec![PathBuf::from("/tmpfoo/bin")];
-        let mut config = test_config(home, &[]);
+        let mut config = test_config(&home, &[]);
         config.extra_exec = &exec_paths;
         assert!(
             prepare(&config).is_ok(),
