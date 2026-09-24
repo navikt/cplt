@@ -3361,8 +3361,9 @@ pub const PROTECTED_IN_ROOT: &[Protected] = &[
     // file: the loader takes `.ts` and `.js`, any `*/package.json` carrying a
     // `pi` field, and followed symlinks, so no single file shape covers it. The
     // rest of `.pi/` (skills, prompts, themes) is ordinary content and stays
-    // writable. Pi is closed-source; this mirrors the decision this repo already
-    // made HOST-side, where `~/.pi/agent` denies `extensions` and `settings.json`
+    // writable. Pi is open source (MIT, github.com/earendil-works/pi; the npm
+    // package ships readable `dist/` JS), so the loader can be checked rather
+    // than guessed. This mirrors the decision this repo already made HOST-side, where `~/.pi/agent` denies `extensions` and `settings.json`
     // for exactly these reasons (`Agent::host_persistence_denies`).
     Protected {
         rel: ".pi/extensions",
