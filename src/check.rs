@@ -288,6 +288,64 @@ pub fn writable_tree_over(policy: &LandlockPolicy, home: &Path, path: &Path) -> 
         .max_by_key(|p| p.as_os_str().len())
 }
 
+/// The last entry on the way to `path` that sits in a writable tree, and that
+/// tree (#385 F04).
+///
+/// [`writable_tree_over`] answers for one path. An agent that can write any
+/// directory the path passes through, or any symlink it follows, can swap that
+/// entry and redirect the file without touching the file itself. So this
+/// resolves `path` one component at a time, the way the kernel does, and asks
+/// about every entry it steps on: each directory, each symlink where it sits
+/// (its parent resolved), and the final target. A symlink chain longer than
+/// `MAXSYMLINKS` stops being followed, as the kernel stops too.
+#[must_use]
+pub fn writable_tree_on_path(
+    policy: &LandlockPolicy,
+    home: &Path,
+    path: &Path,
+) -> Option<(PathBuf, PathBuf)> {
+    use std::ffi::OsString;
+    use std::path::Component;
+    fn parts(p: &Path) -> impl DoubleEndedIterator<Item = OsString> + '_ {
+        p.components().filter_map(|c| match c {
+            Component::Normal(s) => Some(s.to_os_string()),
+            Component::ParentDir => Some(OsString::from("..")),
+            _ => None,
+        })
+    }
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    // A stack: the next component to resolve is on top.
+    let mut todo: Vec<OsString> = parts(&absolute).rev().collect();
+    let mut cur = PathBuf::from("/");
+    let mut hops = crate::config::MAXSYMLINKS;
+    let mut entries = Vec::new();
+    while let Some(name) = todo.pop() {
+        if name == ".." {
+            cur.pop();
+            continue;
+        }
+        let next = cur.join(&name);
+        entries.push(next.clone());
+        match std::fs::read_link(&next) {
+            Ok(target) if hops > 0 => {
+                hops -= 1;
+                if target.is_absolute() {
+                    cur = PathBuf::from("/");
+                }
+                todo.extend(parts(&target).rev());
+            }
+            _ => cur = next,
+        }
+    }
+    entries.push(cur);
+    // The last hit, so the entry named is the one to move (`proj/lists`),
+    // not the writable root above it that every later entry also sits in.
+    entries
+        .into_iter()
+        .rev()
+        .find_map(|e| writable_tree_over(policy, home, &e).map(|tree| (e, tree)))
+}
+
 /// The resolved target of `path`, when the policy grants execute on `path` but
 /// not on what it actually resolves to (#390).
 ///
@@ -1155,6 +1213,40 @@ mod tests {
             precreate_dirs: vec![],
             plain_file: None,
         }
+    }
+
+    /// #385 F04: a list file outside every writable tree is still the agent's
+    /// to redirect when a directory or symlink on the way to it is writable.
+    #[cfg(unix)]
+    #[test]
+    fn writable_tree_on_path_catches_a_writable_entry_on_the_way() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let t = std::fs::canonicalize(tmp.path()).unwrap();
+        let (proj, safe, other) = (t.join("proj"), t.join("safe"), t.join("other"));
+        for d in [&proj, &safe, &other] {
+            std::fs::create_dir(d).unwrap();
+        }
+        std::fs::write(safe.join("allowed.txt"), "x\n").unwrap();
+        // A link inside the writable project that points out of it.
+        symlink(&safe, proj.join("lists")).unwrap();
+        // A chain that only passes through the project: other/hop -> proj/hop2 -> safe.
+        symlink(proj.join("hop2"), other.join("hop")).unwrap();
+        symlink(&safe, proj.join("hop2")).unwrap();
+
+        let p = policy(vec![rule(proj.to_str().unwrap(), true, true, false)]);
+        let home = t.join("home");
+        let ask = |path: &Path| writable_tree_on_path(&p, &home, path);
+
+        assert_eq!(ask(&safe.join("allowed.txt")), None);
+        assert_eq!(
+            ask(&proj.join("lists/allowed.txt")),
+            Some((proj.join("lists"), proj.clone()))
+        );
+        assert_eq!(
+            ask(&other.join("hop/allowed.txt")),
+            Some((proj.join("hop2"), proj.clone()))
+        );
     }
 
     // ── explain_path ──

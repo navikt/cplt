@@ -5221,6 +5221,11 @@ fn assemble_sandbox(
     );
 
     let policy = sandbox::generate_policy(&sandbox_config);
+    // Here, not at each caller: the launch, `exec` and `check` all build their
+    // policy through this function, and all three must say it.
+    if proxy_handle.is_some() {
+        warn_agent_writable_list_files(resolved, &policy, home_dir);
+    }
     // Path validation (SBPL injection checks on macOS) is handled internally by
     // prepare(), so callers don't need to know about backend-specific risks.
     let mut prepared =
@@ -8222,6 +8227,41 @@ fn agent_writable_root(file: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
         .iter()
         .map(|root| real(root))
         .find(|root| as_written.starts_with(root) || resolved.starts_with(root))
+}
+
+/// Warn when a domain-list file the proxy re-reads can be redirected by the
+/// agent (#385 F04). The launch refusal above only knows the session's own
+/// writable roots and judges the file where it ends up. This asks the emitted
+/// policy, which also grants write on tool and cache trees under HOME, about
+/// every directory and symlink on the way to the file. A warning, not a
+/// refusal: the maintainer's call in #385, since the documented locations are
+/// safe and this catches unusual layouts.
+fn warn_agent_writable_list_files(
+    resolved: &config::Resolved,
+    policy: &sandbox::LandlockPolicy,
+    home: &Path,
+) {
+    let allowed = resolved
+        .allowed_domains
+        .as_ref()
+        .filter(|_| !resolved.allow_all_domains);
+    for (key, file) in [
+        ("proxy.allowed_domains", allowed),
+        ("proxy.blocked_domains", resolved.blocked_domains.as_ref()),
+    ] {
+        let Some(file) = file else { continue };
+        if let Some((entry, tree)) = cplt::check::writable_tree_on_path(policy, home, file) {
+            ui::warn(&format!(
+                "{key} names {}, and {} on the way to it is inside {}, which the sandbox \
+                 makes writable. The proxy re-reads that file every few seconds, so the agent \
+                 could swap it and change its own egress rules mid-session. Move the file \
+                 somewhere no grant covers (for example ~/.config/cplt/).",
+                file.display(),
+                entry.display(),
+                tree.display()
+            ));
+        }
+    }
 }
 
 /// `cplt link <owner>/<name> [dir]` — put another repository in scope for this
