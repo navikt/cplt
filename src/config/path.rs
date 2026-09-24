@@ -280,11 +280,12 @@ pub fn default_config_contents() -> String {
 # allow_browser = false
 #
 # EXPERIMENTAL. Drop the macOS Keychain grant for runs where the agent has a
-# credential it can reach without it (a token in the environment, or in
-# Antigravity's case its own fallback token file). The grant cannot be narrowed
-# to one item, so it otherwise reaches every keychain entry the agent can
-# unlock. Off by default: if it misjudges an agent you can neither authenticate
-# nor re-authenticate from inside the sandbox. Unset it to get the grant back.
+# credential it can reach without it (a token in the environment, gh's token
+# for Copilot, or Antigravity's own fallback token file). The grant cannot
+# be narrowed to one item, so it otherwise reaches every keychain entry the
+# agent can unlock. Off by default: if it misjudges an agent you can neither
+# authenticate nor re-authenticate from inside the sandbox. Unset it to get the
+# grant back.
 # keychain_substitute = false
 #
 # DANGEROUS: Let the agent read ~/.npmrc, ~/.gradle/gradle.properties and

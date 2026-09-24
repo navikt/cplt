@@ -186,7 +186,7 @@ const DEEPSEEK_DOMAINS: &[&str] = &["deepseek.com"];
 
 /// A credential an agent can use instead of the macOS login Keychain (#242).
 ///
-/// Returned by [`Agent::credential_outside_keychain`]. The variants exist
+/// Returned by [`crate::sandbox::keychain_substitute`]. The variants exist
 /// because the two kinds need different handling downstream: an env var has to
 /// be forwarded into the sandbox explicitly (credential vars that were not
 /// already in `ENV_ALLOWLIST` on main are deliberately still not in it, so they
@@ -198,13 +198,33 @@ pub enum KeychainSubstitute {
     EnvVar(&'static str),
     /// A credential file inside a directory the sandbox already grants.
     File(PathBuf),
+    /// Copilot only: the token `gh auth token` printed at launch, set in the
+    /// child as `var` (#277). The normal case for Copilot, where the user signed
+    /// in through `gh` and exported nothing, reaches the grant decision this way.
+    GhToken {
+        var: &'static str,
+        token: SecretToken,
+    },
+}
+
+/// A token that never prints: `Debug` redacts it, and there is no `Display`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecretToken(pub String);
+
+impl std::fmt::Debug for SecretToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretToken(<redacted>)")
+    }
 }
 
 impl KeychainSubstitute {
-    /// The variable to forward into the sandbox, if this substitute is one.
-    pub fn env_var(&self) -> Option<&'static str> {
+    /// The variable to set in the sandbox and its value, if this substitute is
+    /// an environment variable. An `EnvVar` whose value has since vanished from
+    /// the parent environment yields `None`.
+    pub fn env_value(&self) -> Option<(&'static str, String)> {
         match self {
-            KeychainSubstitute::EnvVar(v) => Some(v),
+            KeychainSubstitute::EnvVar(v) => std::env::var(v).ok().map(|val| (*v, val)),
+            KeychainSubstitute::GhToken { var, token } => Some((var, token.0.clone())),
             KeychainSubstitute::File(_) => None,
         }
     }
@@ -215,6 +235,7 @@ impl std::fmt::Display for KeychainSubstitute {
         match self {
             KeychainSubstitute::EnvVar(v) => write!(f, "${v}"),
             KeychainSubstitute::File(p) => write!(f, "{}", p.display()),
+            KeychainSubstitute::GhToken { var, .. } => write!(f, "gh's token as ${var}"),
         }
     }
 }
@@ -471,7 +492,7 @@ impl Agent {
     /// `secrets.yaml` in the config dir instead, which needs no grant.
     ///
     /// This is the *base* term only. Whether a given run actually gets the grant
-    /// is decided at launch by [`Agent::credential_outside_keychain`] (#242).
+    /// is decided at launch by [`crate::sandbox::keychain_substitute`] (#242).
     pub fn needs_keychain(&self) -> bool {
         matches!(
             self,
@@ -494,17 +515,16 @@ impl Agent {
     /// gateway token it may itself try to refresh, so it is not a safe stand-in.
     pub fn keychain_substitute_env_vars(&self) -> &'static [&'static str] {
         match self {
-            // Copilot gets no substitute until somebody probes it. It is the
-            // default, priority-1 agent, GITHUB_TOKEN is the most commonly
-            // exported token on a developer machine, and whether Copilot CLI
-            // prefers the env var over the Keychain is exactly the precedence
-            // question this trade declines to assume for Gemini. PR #173 asserts
-            // an injected token suffices; asserting is not probing, and the
-            // default agent is the wrong place to find out. Re-enable this with
-            // `["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]` once a run
-            // under a grant-dropped profile has been confirmed to authenticate.
-            Agent::Copilot => &[],
-            // Antigravity has no env substitute either — its credential lives in
+            // Probed (#277) against copilot 1.0.89 on macOS, `-p` under a
+            // profile with no ~/Library/Keychains grant: a valid GH_TOKEN
+            // authenticates, and a bogus one fails with 401 "Bad credentials"
+            // rather than reaching the Keychain. `copilot help environment`
+            // documents this order. These vars were already in ENV_ALLOWLIST
+            // before the trade existed, so listing them here changes nothing
+            // with `sandbox.keychain_substitute` off. A `gh` login with nothing
+            // exported is handled by `KeychainSubstitute::GhToken`.
+            Agent::Copilot => &["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"],
+            // Antigravity has no env substitute — its credential lives in
             // a file instead, see `credential_outside_keychain`.
             Agent::Antigravity => &[],
             // `claude setup-token` mints a long-lived token for
@@ -566,21 +586,10 @@ impl Agent {
     /// so a var listed there is NOT a substitute, or the run would end up with
     /// no Keychain *and* no token. That is the exact failure PR #173 hit, and
     /// here it would be reachable from a checked-in file.
-    pub fn credential_outside_keychain(
-        &self,
-        home: &Path,
-        deny_env: &[String],
-        enabled: bool,
-    ) -> Option<KeychainSubstitute> {
-        self.credential_outside_keychain_on(home, deny_env, enabled, cfg!(target_os = "macos"))
-    }
-
-    /// [`Agent::credential_outside_keychain`] with the platform as a parameter.
     ///
-    /// The only reason this is separate: `cfg!` is read in exactly one place
-    /// (the wrapper above), so callers cannot drift, while tests can assert
-    /// *both* platform outcomes from either host. A `#[cfg]`-gated test would
-    /// leave the Linux answer — "the trade never applies" — asserted nowhere.
+    /// The platform is a parameter so tests can assert *both* outcomes from
+    /// either host; `cfg!` is read once, in [`crate::sandbox::keychain_substitute`],
+    /// which every launch path calls and which adds Copilot's `gh` case.
     pub(crate) fn credential_outside_keychain_on(
         &self,
         home: &Path,
@@ -2931,9 +2940,8 @@ mod tests {
     fn every_keychain_agent_states_its_substitute() {
         fn expected_substitutes(agent: Agent) -> &'static [&'static str] {
             match agent {
-                // Unprobed: filling this in needs the run #277 asks for, not an
-                // argument. See the comment in `keychain_substitute_env_vars`.
-                Agent::Copilot => &[],
+                // Probed in #277: see the comment in `keychain_substitute_env_vars`.
+                Agent::Copilot => &["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"],
                 // Probed and negative: goose re-reads and rewrites its keyring
                 // mid-session for some providers, so a one-shot substitute
                 // cannot be safe for all of them.

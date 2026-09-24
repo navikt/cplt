@@ -802,6 +802,18 @@ Off by default, because it breaks things that create a `.git` below the project:
 
 It has no effect on Linux, where the launch says so. Landlock cannot deny a path inside a tree it allows, and bubblewrap only protects paths that exist at launch, so there the end-of-session check is the only cover.
 
+## Dropping the Keychain grant (`sandbox.keychain_substitute`) — EXPERIMENTAL
+
+Off by default. macOS only; on Linux it does nothing. `.cplt.toml` cannot set it.
+
+```bash
+cplt config set sandbox.keychain_substitute true
+```
+
+On, it removes the read+write grant on `~/Library/Keychains` for an agent that can authenticate another way, and hands that credential over instead. For Copilot that is a GitHub token: an exported `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN`, or, when none is set, what `gh auth token --hostname github.com` prints at launch, passed in as `GH_TOKEN`. The startup summary shows `Keychain: denied` and names the source. With the key off, the profile and the agent's environment are exactly what they were before the key existed.
+
+What it costs for Copilot: the token sits in the agent's environment, Copilot authenticates as `gh`'s account rather than a separate `copilot /login` account, and an exported token GitHub rejects becomes a sign-in error where Copilot would otherwise have fallen back to its stored login. Unset the key or the token variable to get the old behaviour back. The per-agent details, and what was and was not verified, are in [SECURITY.md](../SECURITY.md#keychain-access-is-all-or-nothing).
+
 ## Configuration file
 
 The config file lives at `~/.config/cplt/config.toml`. `cplt config init` writes a commented starter template there. It covers `[proxy]`, `[proxy.subscriptions]`, `[allow]`, `[deny]`, `[sandbox]`, `[gh_guard]`, and `[git_guard]`, with every key commented out and documented inline, so a fresh file changes nothing until you uncomment something. Run it and read the result rather than copying a snippet from here, since the template is generated from `src/config/path.rs` and moves with the code:

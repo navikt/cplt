@@ -49,13 +49,13 @@ fn compute_mise_ignored_paths(project_dir: &Path, home: &Path) -> Vec<PathBuf> {
 ///
 /// Both steps live here so the ordering is local and cannot drift: the
 /// substitute is applied *after* the deny sweep, and it can never name a denied
-/// variable in the first place because `Agent::credential_outside_keychain`
+/// variable in the first place because `sandbox::keychain_substitute`
 /// filters `deny_env` before returning one (#242).
 ///
 /// The forwarded variable is deliberately NOT in `ENV_ALLOWLIST` — it reaches
 /// the agent only as part of this trade, so with `sandbox.keychain_substitute`
 /// off the child environment is exactly what it was before the key existed.
-fn apply_deny_env_and_credential(
+pub(super) fn apply_deny_env_and_credential(
     cmd: &mut Command,
     deny_env: &[String],
     substitute: Option<&crate::agent::KeychainSubstitute>,
@@ -63,7 +63,7 @@ fn apply_deny_env_and_credential(
     for var in deny_env {
         cmd.env_remove(var);
     }
-    if let Some(var) = substitute.and_then(crate::agent::KeychainSubstitute::env_var)
+    if let Some((var, val)) = substitute.and_then(crate::agent::KeychainSubstitute::env_value)
         // `deny_env` wins here too, not only in `credential_outside_keychain`.
         // That filter is what keeps a denied var from becoming a substitute in
         // the first place, so today this is unreachable — but this function
@@ -71,7 +71,6 @@ fn apply_deny_env_and_credential(
         // one mistake its shape invites. The check costs nothing and does not
         // depend on a caller two modules away staying correct.
         && !deny_env.iter().any(|d| d == var)
-        && let Ok(val) = std::env::var(var)
     {
         cmd.env(var, val);
     }
@@ -370,7 +369,7 @@ fn trusted_gh() -> Option<PathBuf> {
 /// Mirrors `sandbox_env::COPILOT_ONLY_VARS`; kept here because this module both
 /// strips them from the `gh` subprocess and consults them to decide whether
 /// extraction is needed at all.
-const GH_TOKEN_VARS: &[&str] = &["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"];
+pub(super) const GH_TOKEN_VARS: &[&str] = &["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"];
 
 /// The GitHub token `gh` holds, or `None` when there is nothing to hand over.
 ///
@@ -384,7 +383,7 @@ const GH_TOKEN_VARS: &[&str] = &["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOK
 /// for the wrong host. The token vars are stripped from the subprocess so `gh`
 /// answers from its own credential store rather than echoing back an ambient
 /// value.
-fn extract_gh_token() -> Option<String> {
+pub(super) fn extract_gh_token() -> Option<String> {
     gh_auth_token(&trusted_gh()?, GH_AUTH_TOKEN_TIMEOUT)
 }
 

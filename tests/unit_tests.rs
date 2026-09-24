@@ -10530,6 +10530,14 @@ fn keychain_substitute_vars_are_never_allowlisted() {
                 agent.needs_keychain(),
                 "{agent:?} lists substitute credentials but never wanted the Keychain"
             );
+            // Copilot's three token vars were allowlisted long before the trade
+            // existed, so forwarding them with the key off is the old behaviour,
+            // not a new one. No other agent gets this exemption.
+            if *agent == Agent::Copilot
+                && ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"].contains(var)
+            {
+                continue;
+            }
             assert!(
                 !ENV_ALLOWLIST.contains(var),
                 "{agent:?}: {var} is allowlisted, so it reaches the agent even with \

@@ -3404,6 +3404,59 @@ mod tests {
         assert!(!p.contains(r#"(allow file-read* (literal "/Users/test/.netrc"))"#));
     }
 
+    /// #277: a Copilot user signed in through `gh`, nothing exported. With
+    /// `sandbox.keychain_substitute` off the Keychain grant stays, `gh` is never
+    /// asked, and no token var is set; with it on the grant is gone and the
+    /// extracted token reaches the child as GH_TOKEN.
+    #[allow(clippy::disallowed_methods)] // never spawned: only its env is inspected
+    #[test]
+    fn copilot_gh_token_replaces_keychain_only_when_key_on() {
+        use crate::agent::Agent;
+        let project = Path::new("/Users/test/repo");
+        let home = Path::new("/Users/test");
+        let unset: [(&str, Option<&str>); 3] = [
+            ("GH_TOKEN", None),
+            ("GITHUB_TOKEN", None),
+            ("COPILOT_GITHUB_TOKEN", None),
+        ];
+        temp_env::with_vars(unset, || {
+            for enabled in [false, true] {
+                let asked = std::cell::Cell::new(false);
+                let sub = crate::sandbox::keychain_substitute_with(
+                    Agent::Copilot,
+                    home,
+                    &[],
+                    enabled,
+                    true,
+                    || {
+                        asked.set(true);
+                        Some("tok".into())
+                    },
+                );
+                assert_eq!(asked.get(), enabled, "gh asked with key={enabled}");
+
+                let mut opts = test_options(project, home);
+                opts.agent = Agent::Copilot;
+                opts.keychain_substitute = sub.clone();
+                let granted =
+                    generate_profile(&opts, &[]).contains("/Users/test/Library/Keychains");
+                assert_eq!(granted, !enabled, "Keychain grant with key={enabled}");
+
+                let mut cmd = std::process::Command::new("/usr/bin/true");
+                crate::sandbox::exec::apply_deny_env_and_credential(&mut cmd, &[], sub.as_ref());
+                let token = cmd
+                    .get_envs()
+                    .find(|(k, _)| *k == "GH_TOKEN")
+                    .and_then(|(_, v)| v);
+                assert_eq!(
+                    token,
+                    enabled.then_some(std::ffi::OsStr::new("tok")),
+                    "GH_TOKEN with key={enabled}"
+                );
+            }
+        });
+    }
+
     fn test_options<'a>(
         project_dir: &'a std::path::Path,
         home_dir: &'a std::path::Path,
