@@ -75,6 +75,17 @@ pub struct Config {
     pub sandbox: SandboxConfig,
     pub gh_guard: GhGuardConfig,
     pub git_guard: GitGuardConfig,
+    pub shell: ShellConfig,
+}
+
+/// `[shell]`: the opt-in PATH shims (#514).
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ShellConfig {
+    /// Agents the shim sync must not shim, by `--agent` or command name. For a
+    /// binary that shares an agent's name but is not that agent, when the
+    /// version probe gets it wrong.
+    pub skip: Vec<String>,
 }
 
 /// Enforcement mode for security gates — controls rollout aggressiveness.

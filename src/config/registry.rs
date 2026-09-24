@@ -567,6 +567,15 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         default_display: "[]",
         description: "Structured push exceptions. Each entry specifies remote/branches/force conditions under which push is allowed.",
     },
+    // [shell]
+    ConfigKeyInfo {
+        section: "shell",
+        key: "skip",
+        value_type: ConfigValueType::StrArray,
+        dangerous: false,
+        default_display: "[]",
+        description: "Agents the PATH shim sync leaves out (e.g. [\"goose\"] when your goose is pressly/goose, the migration tool). Only matters after `cplt --shell-install --shims`.",
+    },
 ];
 
 /// The only layer that can set this key, when it is not settable everywhere.

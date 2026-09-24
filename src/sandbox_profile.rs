@@ -201,6 +201,7 @@ pub fn generate_profile_with_playwright_socket_dir(
     // The pnpm rule re-allows its two writable stores, so all security denies
     // below must remain later in the last-match-wins profile.
     emit_path_bin_denies(&mut sb, config.home_dir);
+    emit_shim_dir_denies(&mut sb, config);
     // Sensitive project file denies MUST come after all user-configured allows.
     // SBPL uses last-match-wins, so a user allow like `allow.read = ["~/Repos"]`
     // would override the .env deny if emitted before it.
@@ -1716,6 +1717,44 @@ fn emit_path_bin_denies(sb: &mut String, home_dir: &Path) {
     sbpl!(sb);
 }
 
+/// cplt's own PATH shims stay read-only (#514).
+///
+/// A shim is what the user's next `copilot` runs, outside any sandbox; an agent
+/// that rewrites its shim escapes at the next launch. Nothing grants
+/// `~/.local/share/cplt` write by default, so this is what survives an
+/// `allow.write` on an ancestor. The ancestors inside such a grant are pinned
+/// against rename, or `mv cplt cplt.old && mkdir -p cplt/bin` would put a
+/// fresh, writable directory where PATH looks.
+///
+/// Emitted only when the directory exists: a user who never opted in gets a
+/// profile byte-identical to one without this feature. Emitted AFTER
+/// `emit_user_allows`, like `emit_path_bin_denies`, because SBPL is
+/// last-match-wins.
+fn emit_shim_dir_denies(sb: &mut String, config: &SandboxConfig) {
+    let named = crate::shim::dir(config.home_dir);
+    if !named.is_dir() {
+        return;
+    }
+    let target = resolved(named.clone());
+    sbpl!(
+        sb,
+        ";; cplt PATH shims — read-only, and their ancestors keep their names"
+    );
+    for p in spellings(&named, &target) {
+        if validate_sbpl_path(Path::new(&p)).is_ok() {
+            sbpl!(sb, "(deny file-write* (subpath \"{p}\"))");
+        }
+    }
+    let mut pins = super::home_config_target_pins(config, &[target]);
+    pins.sort();
+    pins.dedup();
+    for dir in pins {
+        let d = dir.display();
+        sbpl!(sb, "(deny file-write-unlink (literal \"{d}\"))");
+    }
+    sbpl!(sb);
+}
+
 /// Allow reading and loading shared libraries from an Electron app bundle.
 /// Needed when Copilot CLI uses VS Code's (or similar editor's) Electron as its
 /// Node.js runtime — dyld must load `Electron Framework.framework` from within
@@ -2791,6 +2830,58 @@ mod tests {
         ] {
             assert!(p.contains(rule), "MISSING without git_common_dir: {rule}");
         }
+    }
+
+    /// #514: the PATH shim dir is write-denied once it exists, after every
+    /// allow it narrows, and its ancestors inside a writable grant keep their
+    /// names. Before it exists the profile does not mention it at all, which
+    /// is what keeps it byte-identical for a user who never opted in.
+    #[test]
+    fn shim_dir_is_write_denied_once_it_exists() {
+        // Not under the system temp dir: that is a writable tree of its own,
+        // and would make `~/.local` a pinned ancestor rather than the root.
+        let tmp = tempfile::Builder::new()
+            .prefix(".cplt-shim-home-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("tempdir");
+        let home = std::fs::canonicalize(tmp.path()).expect("canonical home");
+        let project = std::path::Path::new("/projects/app");
+        let local = home.join(".local");
+        let shims = home.join(".local/share/cplt/bin");
+        let extra_write = [local.clone()];
+        let mut opts = test_options(project, &home);
+        opts.extra_write = &extra_write;
+
+        let before = generate_profile(&opts, &[]);
+        assert!(
+            !before.contains("cplt PATH shims") && !before.contains(".local/share/cplt"),
+            "no shim rules before the user opts in"
+        );
+
+        std::fs::create_dir_all(&shims).expect("mkdir shims");
+        let p = generate_profile(&opts, &[]);
+        let deny = format!("(deny file-write* (subpath \"{}\"))", shims.display());
+        let allow = format!("(allow file-write* (subpath \"{}\"))", local.display());
+        let deny_at = p.rfind(&deny).unwrap_or_else(|| panic!("missing {deny}"));
+        let allow_at = p.rfind(&allow).unwrap_or_else(|| panic!("missing {allow}"));
+        assert!(
+            deny_at > allow_at,
+            "the deny must come after the allow it narrows"
+        );
+        for pinned in [home.join(".local/share/cplt"), home.join(".local/share")] {
+            let rule = format!(
+                "(deny file-write-unlink (literal \"{}\"))",
+                pinned.display()
+            );
+            assert!(p.contains(&rule), "missing rename pin {rule}");
+        }
+        assert!(
+            !p.contains(&format!(
+                "(deny file-write-unlink (literal \"{}\"))",
+                local.display()
+            )),
+            "the grant's root itself is not pinned"
+        );
     }
 
     /// #522: macOS grants exactly the shared home config list, the same one

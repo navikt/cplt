@@ -23,6 +23,7 @@ pub mod repo_config;
 pub mod sandbox;
 pub mod scratch;
 pub mod settings;
+pub mod shim;
 pub mod subscriptions;
 pub mod trust;
 pub mod ui;

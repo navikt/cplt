@@ -600,6 +600,19 @@ actually on screen, then turn it back off."
     #[arg(long)]
     shell_install: bool,
 
+    /// With --shell-install: also put a PATH shim for every installed agent
+    /// in ~/.local/share/cplt/bin, and that directory first on PATH in your rc
+    /// files (a marked block, each file backed up before its first edit). The
+    /// shims reach scripts, `zsh -c` and IDE-launched agents, which an alias
+    /// cannot. Opt-in; `cplt --shell-uninstall` removes all of it.
+    #[arg(long, requires = "shell_install")]
+    shims: bool,
+
+    /// Remove what `--shell-install --shims` added: the rc file blocks, their
+    /// backups, the files it created, and the shim directory.
+    #[arg(long, conflicts_with_all = ["shell_install", "shell_setup"])]
+    shell_uninstall: bool,
+
     /// [DEPRECATED: use `cplt doctor`] Run environment diagnostics and report
     /// what the sandbox will do. Checks auth mechanisms, Copilot CLI install,
     /// tool availability, and sandbox-critical paths. Exits 0 if all critical checks pass.
@@ -3530,12 +3543,24 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             }
         };
         if cli.shell_setup {
-            for line in alias_lines(agent, false) {
+            for line in cplt::shim::alias_lines(agent, false) {
                 println!("{line}");
+            }
+            // #514: the rc line every new shell runs is also where a newly
+            // installed agent gets its shim. Nothing on stdout, which `eval`
+            // reads; a no-op unless the user opted in.
+            if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+                sync_shims(&home);
             }
             return Ok(ExitCode::SUCCESS);
         }
+        if cli.shims {
+            return Ok(shell_install_shims(agent));
+        }
         return Ok(shell_install(agent));
+    }
+    if cli.shell_uninstall {
+        return Ok(shell_uninstall(cli.agent.as_deref()));
     }
 
     // Handle `cplt exec` before consuming cli.command so resolve_context
@@ -3804,6 +3829,10 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
              Ensure the real agent binary is in PATH and not aliased to cplt."
         );
     }
+
+    // #514: shim an agent installed since the last sync. A no-op unless the
+    // user opted in with `--shell-install --shims`.
+    sync_shims(&home_dir);
 
     // Unwrap the agent binary resolution (deferred from above).
     let agent_bin = match agent_bin_result {
@@ -6491,6 +6520,12 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         },
     }
 
+    // ── PATH shims (#514): only once the user opted in ──
+    if cplt::shim::installed(&home_dir) {
+        sync_shims(&home_dir);
+        doctor_shims(&home_dir, &mut findings, &mut ok);
+    }
+
     // ── config: which layers loaded ──
     let mut layers = vec![match &config_path {
         Some(p) => format!("user {}", tilde(p)),
@@ -9051,28 +9086,6 @@ fn shell_alias_agent(flag: Option<&str>) -> Result<agent::Agent, String> {
     Ok(agent)
 }
 
-/// The alias definitions that make an agent's own command run sandboxed.
-///
-/// Each alias pins `--agent`. Without the pin, the aliased command runs plain
-/// `cplt`, which falls back to auto-detection and launches whichever agent it
-/// finds first — copilot, ahead of the one whose name you typed (#509). An
-/// alias that sandboxes a different agent than the command promises is worse
-/// than no alias, because nothing tells you.
-fn alias_lines(agent: agent::Agent, fish: bool) -> Vec<String> {
-    let flag = agent.binary_name();
-    agent
-        .binary_names()
-        .iter()
-        .map(|name| {
-            if fish {
-                format!("alias {name} 'cplt --agent {flag}'")
-            } else {
-                format!("alias {name}='cplt --agent {flag}'")
-            }
-        })
-        .collect()
-}
-
 /// Whether `line` is already one of the lines in `contents`.
 fn has_line(contents: &str, line: &str) -> bool {
     contents.lines().any(|l| l.trim() == line)
@@ -9097,7 +9110,7 @@ fn shell_install(agent: agent::Agent) -> ExitCode {
     let (rc_file, mut wanted) = if fish {
         (
             home.join(".config/fish/conf.d/cplt.fish"),
-            alias_lines(agent, true),
+            cplt::shim::alias_lines(agent, true),
         )
     } else {
         let rc = if shell.ends_with("/bash") {
@@ -9137,7 +9150,7 @@ fn shell_install(agent: agent::Agent) -> ExitCode {
     let legacy_fish = "alias copilot cplt";
     let mut rewrote = false;
     if fish && has_line(&contents, legacy_fish) {
-        let pinned = &alias_lines(agent::Agent::Copilot, true)[0];
+        let pinned = &cplt::shim::alias_lines(agent::Agent::Copilot, true)[0];
         contents = contents
             .lines()
             .map(|l| {
@@ -9238,6 +9251,158 @@ fn shell_install(agent: agent::Agent) -> ExitCode {
             ui::error(&format!("Cannot write to {}: {e}", rc_file.display()));
             ExitCode::FAILURE
         }
+    }
+}
+
+// ── PATH shims (#514) ─────────────────────────────────────────
+
+/// `shell.skip` from the global config, or `None` when the config cannot be
+/// read or does not validate. The sync reads only the global file: the shims
+/// are machine-wide, and a per-repo value would make them flap between
+/// repositories (a local `shell.skip` is refused at load).
+fn shell_skip() -> Option<Vec<String>> {
+    match config::Config::load_file() {
+        Ok(None) => Some(Vec::new()),
+        Ok(Some(loaded)) => match loaded.config.merge(config::CliFlags::default()) {
+            Ok(_) => Some(loaded.config.shell.skip),
+            Err(e) => {
+                ui::warn(&format!("Not syncing PATH shims: {e}"));
+                None
+            }
+        },
+        Err(e) => {
+            ui::warn(&format!("Not syncing PATH shims: {e}"));
+            None
+        }
+    }
+}
+
+/// Bring the shim directory up to date. Does nothing unless the user opted in.
+/// Never fails the caller: a sync that cannot write says so and moves on.
+fn sync_shims(home: &Path) {
+    if !cplt::shim::installed(home) {
+        return;
+    }
+    let Some(skip) = shell_skip() else {
+        return;
+    };
+    let report = cplt::shim::sync(home, &skip);
+    for c in report.done {
+        ui::info(&format!("PATH shims: {}", doctor_tilde(&c, home)));
+    }
+    for e in report.refused {
+        ui::warn(&format!("PATH shims: {}", doctor_tilde(&e, home)));
+    }
+}
+
+fn doctor_tilde(text: &str, home: &Path) -> String {
+    cplt::doctor::tilde_in_text(text, home)
+}
+
+/// The `cplt doctor` shim check: Volta's `check_shim_reachable`. Each name is
+/// resolved through the PATH `doctor` was started with, which is the
+/// terminal's own after `mise activate` and `path_helper` have had their say.
+fn doctor_shims(home: &Path, findings: &mut Vec<cplt::doctor::Finding>, ok: &mut Vec<String>) {
+    use cplt::doctor::{Finding, tilde};
+    use cplt::shim::Reach;
+    let dir = cplt::shim::dir(home);
+    println!(
+        "shims:       {} · an agent started by absolute path bypasses them",
+        tilde(&dir, home)
+    );
+    let path = std::env::var("PATH").unwrap_or_default();
+    let Some(reach) = cplt::shim::reach(home, &path) else {
+        findings.push(Finding::blocking(
+            format!(
+                "PATH shims are installed in {} but it is not on PATH: no rc file cplt wrote \
+                 is being read, so an agent started by name runs unsandboxed.",
+                tilde(&dir, home)
+            ),
+            "open a new terminal (restart the IDE for its terminals); if this persists, run \
+             `cplt --shell-install --shims` from your usual shell",
+        ));
+        return;
+    };
+    for (name, r) in reach {
+        let real = cplt::shim::real_binary(&name)
+            .map_or_else(|| "no real binary found".to_string(), |p| tilde(&p, home));
+        match r {
+            Reach::First => ok.push(format!("shim {name} → {real}")),
+            Reach::Shadowed(first) => findings.push(Finding::warning(
+                format!(
+                    "{name} resolves to {} before the cplt shim, so typing {name} runs it \
+                     unsandboxed.",
+                    tilde(&first, home)
+                ),
+                Some(format!(
+                    "move {} earlier in PATH, or find the rc line that reorders PATH after \
+                     ~/.zshenv (mise activate, path_helper)",
+                    tilde(&dir, home)
+                )),
+            )),
+        }
+    }
+}
+
+/// `--shell-install --shims`: the explicit opt-in.
+fn shell_install_shims(agent: agent::Agent) -> ExitCode {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        ui::error("$HOME not set");
+        return ExitCode::FAILURE;
+    };
+    let Some(skip) = shell_skip() else {
+        return ExitCode::FAILURE;
+    };
+    let shell = std::env::var("SHELL").unwrap_or_default();
+    let report = cplt::shim::install(&home, &shell, agent, &skip);
+    for line in &report.done {
+        ui::ok(&doctor_tilde(line, &home));
+    }
+    for line in &report.refused {
+        ui::error(&doctor_tilde(line, &home));
+    }
+    if report.done.is_empty() && report.refused.is_empty() {
+        ui::ok("PATH shims already installed; nothing changed");
+    }
+    if !report.refused.is_empty() {
+        return ExitCode::FAILURE;
+    }
+    ui::info(
+        "Open a new terminal, and restart your IDE so it picks up the new PATH. \
+         `cplt doctor` shows whether each shim comes first. Undo with `cplt --shell-uninstall`.",
+    );
+    ExitCode::SUCCESS
+}
+
+/// `--shell-uninstall`: remove what `--shell-install --shims` added.
+fn shell_uninstall(agent: Option<&str>) -> ExitCode {
+    if let Some(name) = agent {
+        ui::error(&format!(
+            "--shell-uninstall --agent {name} is not built yet: the next sync would put the \
+             shim back. To stop shimming one agent, add it to shell.skip \
+             (cplt config set shell.skip {name}); `cplt --shell-uninstall` without --agent \
+             removes everything."
+        ));
+        return ExitCode::FAILURE;
+    }
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        ui::error("$HOME not set");
+        return ExitCode::FAILURE;
+    };
+    let report = cplt::shim::uninstall(&home);
+    for line in &report.done {
+        ui::ok(&doctor_tilde(line, &home));
+    }
+    for line in &report.refused {
+        ui::error(&doctor_tilde(line, &home));
+    }
+    if report.done.is_empty() && report.refused.is_empty() {
+        ui::ok("No PATH shims installed; nothing to remove");
+    }
+    if report.refused.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 

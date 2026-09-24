@@ -78,7 +78,7 @@ pub use policy::{
     credential_link_hop, current_uid, exec_write_conflicts, home_config_link_targets,
     home_tool_dirs, linux_docker_socket_paths, linux_runtime_dirs, mise_ro_protect_paths,
     nested_alternation, no_cache_env, path_bin_dirs, playwright_runtime_intent, process_env,
-    relocatable_tool_prefix, socket_mask_paths, tool_override_path_is_safe,
+    relocatable_tool_prefix, shim_ro_protect_paths, socket_mask_paths, tool_override_path_is_safe,
     tool_path_env_overrides, validate_playwright_socket_dir, validate_sbpl_path,
     xdg_runtime_dir_env,
 };
@@ -1354,6 +1354,16 @@ fn pin_paths(
         config,
         &home_config_link_targets(config.home_dir),
     ));
+    // #514: the read-only bind on the shim dir pins its content, not its
+    // name, so `mv cplt cplt.old && mkdir -p cplt/bin` under a writable
+    // ancestor would leave PATH naming a fresh, writable directory.
+    pins.extend(home_config_target_pins(
+        config,
+        &shim_ro_protect_paths(config.home_dir)
+            .into_iter()
+            .map(|d| std::fs::canonicalize(&d).unwrap_or(d))
+            .collect::<Vec<_>>(),
+    ));
     pins.sort();
     pins.dedup();
     pins
@@ -1439,6 +1449,10 @@ fn ro_protect_paths(
     // them on its own, with or without bwrap. Same "must already exist" caveat
     // as everything else in this list.
     ro_protect.extend(mise_ro_protect_paths(config.home_dir));
+
+    // #514: cplt's own PATH shims, when the user opted in. Same class as the
+    // mise shims above: what the user's next unsandboxed launch runs.
+    ro_protect.extend(shim_ro_protect_paths(config.home_dir));
 
     // #328: Copilot's package dirs. macOS write-denies both in the profile;
     // Landlock cannot — `~/.copilot` is granted write wholesale, and
@@ -2402,6 +2416,38 @@ mod tests {
             !paths.iter().any(|p| p.starts_with(home.join(".copilot"))),
             "no Copilot package binds for a non-Copilot agent, got {paths:?}"
         );
+    }
+
+    /// #514, Linux half: once the PATH shim dir exists it is bound read-only,
+    /// and the directories between it and a writable ancestor grant are pinned
+    /// against rename. Absent until then, so the policy does not change for a
+    /// user who never opted in.
+    #[test]
+    fn shim_dir_is_read_only_protected_once_it_exists() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = std::fs::canonicalize(tmp.path()).expect("canonical home");
+        let shims = home.join(".local/share/cplt/bin");
+        assert!(super::shim_ro_protect_paths(&home).is_empty());
+        std::fs::create_dir_all(&shims).expect("mkdir shims");
+        assert_eq!(super::shim_ro_protect_paths(&home), vec![shims.clone()]);
+
+        #[cfg(target_os = "linux")]
+        {
+            let grants = [home.join(".local")];
+            let mut config = test_config(&home, &[]);
+            config.extra_write = &grants;
+            let ro = super::ro_protect_paths(&config, &[], &[]);
+            assert!(ro.contains(&shims), "shim dir missing from {ro:?}");
+            let pins = super::pin_paths(&config, &[], &[]);
+            for pinned in [home.join(".local/share/cplt"), home.join(".local/share")] {
+                assert!(
+                    pins.contains(&pinned),
+                    "{} missing from {pins:?}",
+                    pinned.display()
+                );
+            }
+            assert!(!pins.contains(&home.join(".local")), "{pins:?}");
+        }
     }
 
     /// `~/.gitconfig -> <project>/dotfiles/gitconfig`: a dotfiles repo being

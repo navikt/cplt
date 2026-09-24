@@ -2021,6 +2021,21 @@ pub fn mise_ro_protect_paths(home: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// cplt's PATH shim directory, when the user has opted in (#514), for the
+/// Bubblewrap read-only overlay on Linux.
+///
+/// The shims are what the user's next `copilot` runs, outside any sandbox, so
+/// one an agent rewrites is an escape at the next launch. Nothing grants
+/// `~/.local/share/cplt` write by default; this is what survives an
+/// `allow.write` on an ancestor. Empty when the directory does not exist, so a
+/// user who never opted in gets the policy they had. Same caveats as every
+/// other `ro_protect` entry: without bubblewrap, Landlock cannot subtract the
+/// write from an ancestor grant.
+pub fn shim_ro_protect_paths(home: &Path) -> Vec<PathBuf> {
+    let d = crate::shim::dir(home);
+    if d.is_dir() { vec![d] } else { Vec::new() }
+}
+
 /// The [`HOME_CONFIG_FILES`] SECURITY.md documents as read-only: git's own
 /// config, ignore and attributes files, which git on the host trusts. They are
 /// write-denied on macOS, at `$HOME` and at a symlink target, and a symlink

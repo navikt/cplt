@@ -143,6 +143,16 @@ fn configure_command(
         }
     }
 
+    // The cplt PATH shim dir (#514) stays outside: in here the agent's own
+    // name must resolve to the real binary, not to a shim that would start
+    // cplt again. A PATH without the dir is left exactly as it was.
+    if let Some(path) = std::env::var("PATH")
+        .ok()
+        .and_then(|p| crate::shim::path_without_shims(home_dir, &p))
+    {
+        cmd.env("PATH", path);
+    }
+
     // Playwright's internal control server binds Unix sockets below this short,
     // random, policy-authorized per-session directory.
     // This runs after filtering so ambient values cannot displace the safe
@@ -857,7 +867,13 @@ fn install_command_wrappers(
 
 fn prepend_path(cmd: &mut Command, prefixes: &[&Path]) {
     let mut paths: Vec<PathBuf> = prefixes.iter().map(|path| path.to_path_buf()).collect();
-    if let Some(current_path) = std::env::var_os("PATH") {
+    // The PATH already set on `cmd` wins over ours, so the shim dir that
+    // `configure_command` took out does not come back here.
+    let set = cmd
+        .get_envs()
+        .find(|(k, _)| *k == "PATH")
+        .and_then(|(_, v)| v.map(std::ffi::OsStr::to_os_string));
+    if let Some(current_path) = set.or_else(|| std::env::var_os("PATH")) {
         paths.extend(std::env::split_paths(&current_path));
     }
     if let Ok(path) = std::env::join_paths(paths) {

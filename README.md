@@ -480,6 +480,30 @@ Same pattern mise, direnv, and starship use.
 
 > **Note:** cplt refuses to nest. If it detects that it is already running inside a sandbox (via the `__CPLT_WRAPPED` environment variable), it will not launch again. Read-only subcommands such as `--print-profile` and `cplt doctor` still work inside an existing sandbox.
 
+### PATH shims (opt-in)
+
+An alias only reaches an interactive shell that read your rc file. It does nothing for `zsh -c`, a script, `command copilot`, or an agent your IDE starts. PATH shims cover those:
+
+```bash
+cplt --shell-install --shims     # opt in
+cplt doctor                      # check that each shim comes first on PATH
+cplt --shell-uninstall           # undo all of it
+```
+
+The install does three things and prints each path it touches:
+
+1. It creates `~/.local/share/cplt/bin` and writes one small script there for each agent it finds installed (`antigravity` and `agy` both get one). Each script runs `cplt --agent <name> -- "$@"`, so the name you type is the agent you get and your arguments pass through untouched.
+2. It puts that directory first on PATH with a marked block (`# >>> cplt >>>` … `# <<< cplt <<<`) in `~/.zshenv`, `~/.zprofile` and `~/.profile`, creating them if missing, and adds the alias line to `~/.zshrc`, to `~/.bashrc` if it exists, and to fish's `conf.d/cplt.fish` if you use fish. Before its first edit to a file that already existed, cplt copies it to `<file>.cplt-backup`.
+3. From then on, `--shell-setup`, every `cplt` launch and `cplt doctor` add a shim for an agent you installed later and remove one for an agent you removed. This never touches the network, and it does nothing at all until you have run the install.
+
+Nothing changes for anyone who has not run `--shell-install --shims`: no directory, no rc edits, and the sandbox profile stays byte-identical.
+
+Uninstall removes the blocks, the backups, the files the install created and the shims, and leaves anything it did not write. A line you added inside a cplt block, or a file you put in the shim directory, makes it stop and tell you rather than delete it. Run it before you remove cplt itself; a shim left behind with no cplt on PATH refuses to start the agent (exit 127) instead of running it unsandboxed.
+
+What the shims do not cover: an agent started by absolute path (`/opt/homebrew/bin/copilot`), a PATH that `mise activate` or another rc line reordered after the block, `bash -c` without `BASH_ENV`, and an app launched by macOS that never ran a shell. `cplt doctor` warns when something on PATH shadows a shim, and fails when the shim directory is not on PATH at all.
+
+`goose` and `pi` share their names with unrelated tools (pressly/goose is a Go migration tool), so cplt checks their `--version` output before shimming them. If it still picks up the wrong binary, leave the agent out: `cplt config set shell.skip goose`.
+
 ## Usage
 
 ```
