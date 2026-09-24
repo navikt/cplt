@@ -2600,4 +2600,20 @@ mod tests {
             "change past the first MiB"
         );
     }
+
+    /// #576 review: a symlinked directory repointed at another repository
+    /// with identical contents changes the fingerprint.
+    #[test]
+    fn nested_git_fingerprint_sees_a_repointed_directory_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        for r in ["a", "b"] {
+            std::fs::create_dir_all(dir.path().join(r).join(".git")).unwrap();
+        }
+        let link = dir.path().join("tools");
+        std::os::unix::fs::symlink("a", &link).unwrap();
+        let fp = git_fingerprint(&link);
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink("b", &link).unwrap();
+        assert_ne!(fp, git_fingerprint(&link));
+    }
 }
