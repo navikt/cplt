@@ -198,7 +198,9 @@ impl Config {
         // Port: CLI (if provided) > config > 0 (OS-assigned ephemeral port)
         let proxy_port = cli.proxy_port.or(self.proxy.port).unwrap_or(0);
 
-        // Blocked domains: CLI > config > exe_dir fallback (handled later in main)
+        // Blocked domains file: CLI > config, else none. There is no default
+        // file; the built-in list and subscriptions apply either way
+        // (`proxy_domains::blocklist`).
         let blocked_domains = cli
             .blocked_domains
             .or_else(|| self.proxy.blocked_domains.as_ref().map(|s| expand_tilde(s)));
