@@ -3003,17 +3003,19 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn ro_protect_set_carries_the_exec_only_agent_dirs() {
-        let home = Path::new("/home/test");
-        let agent_dirs = Agent::OpenCode.config_dirs(home);
-        let mut config = test_config(home, &[]);
-        config.agent = Agent::OpenCode;
-        config.agent_dirs = &agent_dirs;
+        crate::without_xdg(|| {
+            let home = Path::new("/home/test");
+            let agent_dirs = Agent::OpenCode.config_dirs(home);
+            let mut config = test_config(home, &[]);
+            config.agent = Agent::OpenCode;
+            config.agent_dirs = &agent_dirs;
 
-        let paths = super::ro_protect_paths(&config, &[], &[]);
-        assert!(
-            paths.contains(&home.join(".cache/opencode/bin")),
-            "the managed-binary dir must be re-bound read-only, got {paths:?}"
-        );
+            let paths = super::ro_protect_paths(&config, &[], &[]);
+            assert!(
+                paths.contains(&home.join(".cache/opencode/bin")),
+                "the managed-binary dir must be re-bound read-only, got {paths:?}"
+            );
+        });
     }
 
     /// Same class, the file-level half: OpenCode's `auth.json` is a write grant

@@ -74,6 +74,25 @@ pub fn is_unsafe_root(path: &std::path::Path, home: &std::path::Path) -> bool {
     false
 }
 
+/// Run `f` with every XDG base directory variable unset.
+///
+/// For tests that resolve paths through `XDG_*`: `temp_env` mutates the real
+/// process environment, so a test that reads those variables without holding
+/// its lock races every test in the binary that sets them.
+#[cfg(test)]
+pub(crate) fn without_xdg<R>(f: impl FnOnce() -> R) -> R {
+    temp_env::with_vars_unset(
+        [
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_RUNTIME_DIR",
+        ],
+        f,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

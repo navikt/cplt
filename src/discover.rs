@@ -2013,8 +2013,9 @@ mod tests {
 
     #[test]
     fn auth_discovery_detects_env_vars() {
-        let home = PathBuf::from(std::env::var("HOME").unwrap());
         temp_env::with_var("COPILOT_GITHUB_TOKEN", Some("test-token-value"), || {
+            // Read under temp_env's lock: another test in this binary sets HOME.
+            let home = PathBuf::from(std::env::var("HOME").unwrap());
             let auth = discover_auth(&home);
             assert!(
                 auth.env_tokens
@@ -2049,21 +2050,25 @@ mod tests {
 
     #[test]
     fn tool_discovery_finds_git() {
-        let home = PathBuf::from(std::env::var("HOME").unwrap());
-        let tools = discover_tools(&home, &[]);
-        assert!(
-            tools.tools.iter().any(|t| t.name == "git"),
-            "git should be found on any dev machine"
-        );
+        crate::without_xdg(|| {
+            let home = PathBuf::from(std::env::var("HOME").unwrap());
+            let tools = discover_tools(&home, &[]);
+            assert!(
+                tools.tools.iter().any(|t| t.name == "git"),
+                "git should be found on any dev machine"
+            );
+        });
     }
 
     #[test]
     fn path_discovery_runs_without_panic() {
-        let home = PathBuf::from(std::env::var("HOME").unwrap());
-        let project = std::env::current_dir().unwrap();
-        let paths = discover_paths(&home, &project);
-        // Just verify it doesn't panic and returns plausible results
-        let _ = paths.copilot_dir_exists;
+        crate::without_xdg(|| {
+            let home = PathBuf::from(std::env::var("HOME").unwrap());
+            let project = std::env::current_dir().unwrap();
+            let paths = discover_paths(&home, &project);
+            // Just verify it doesn't panic and returns plausible results
+            let _ = paths.copilot_dir_exists;
+        });
     }
 
     // ── Electron app discovery ──────────────────────────────────
