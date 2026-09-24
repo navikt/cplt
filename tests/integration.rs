@@ -2431,7 +2431,17 @@ mod macos_tests {
         require_sandbox!();
         // Under the crate dir rather than temp: `/private/var/folders` is
         // exec-denied anyway, which would make the negatives pass for the
-        // wrong reason.
+        // wrong reason. A checkout under a temp dir hits the same deny, and
+        // it beats the toolchain allow, so the positive cannot pass there.
+        let crate_dir = fs::canonicalize(env!("CARGO_MANIFEST_DIR")).unwrap();
+        if crate_dir.starts_with("/private/tmp") || crate_dir.starts_with("/private/var/folders") {
+            eprintln!(
+                "SKIPPED: checkout under {} is tmp-exec-denied, which beats the \
+                 ~/.konan/dependencies exec allow",
+                crate_dir.display()
+            );
+            return;
+        }
         let project = tempfile::Builder::new()
             .prefix(".cplt-konan-project-")
             .tempdir_in(env!("CARGO_MANIFEST_DIR"))
@@ -2453,6 +2463,11 @@ mod macos_tests {
         }
         fs::create_dir_all(lock.parent().unwrap()).unwrap();
         fs::write(&lock, "").unwrap();
+        // An executable the agent could have built in its own project.
+        let evil = fs::canonicalize(project.path()).unwrap().join("evil");
+        fs::copy("/usr/bin/true", &evil).unwrap();
+        fs::set_permissions(&evil, fs::Permissions::from_mode(0o755)).unwrap();
+        let bin = clang.parent().unwrap();
 
         let profile = write_real_profile(&default_opts(project.path(), &home_path));
         let command = format!(
@@ -2463,12 +2478,22 @@ mod macos_tests {
              printf x >> '{lock}' && echo LOCK_WRITE_OK; \
              rm '{lock}' 2>/dev/null && echo LOCK_RM_RAN; \
              chmod 755 '{lock}' 2>/dev/null && echo LOCK_CHMOD_RAN; \
+             cp '{evil}' '{project}/evil2' && mv '{project}/evil2' '{bin}/evil' 2>/dev/null && echo MV_IN_RAN; \
+             ln '{evil}' '{bin}/evil-hard' 2>/dev/null && echo HARDLINK_RAN; \
+             ln -s '{evil}' '{bin}/evil-sym' 2>/dev/null && echo SYMLINK_RAN; \
+             mkdir '{deps}/llvm-evil' 2>/dev/null && echo MKDIR_RAN; \
+             mv '{deps}' '{konan}/deps-moved' 2>/dev/null && echo MV_DEPS_RAN; \
+             cat /usr/bin/true > '{lock}' && echo LOCK_MACHO_WRITTEN; \
+             '{lock}' 2>/dev/null && echo LOCK_EXEC_RAN; \
              true",
             clang = clang.display(),
             other = other.display(),
             deps = deps.display(),
             konan = konan.display(),
             lock = lock.display(),
+            evil = evil.display(),
+            project = evil.parent().unwrap().display(),
+            bin = bin.display(),
         );
         let (output, _) = run_sandboxed(&profile, &command);
         fs::remove_file(&profile).ok();
@@ -2496,6 +2521,26 @@ mod macos_tests {
         assert!(
             !output.contains("LOCK_RM_RAN") && !output.contains("LOCK_CHMOD_RAN"),
             "K/N's lock must not be replaceable or made executable: {output}"
+        );
+        for marker in [
+            "MV_IN_RAN",
+            "HARDLINK_RAN",
+            "SYMLINK_RAN",
+            "MKDIR_RAN",
+            "MV_DEPS_RAN",
+        ] {
+            assert!(
+                !output.contains(marker),
+                "{marker}: ~/.konan/dependencies must not take new entries or move: {output}"
+            );
+        }
+        assert!(
+            output.contains("LOCK_MACHO_WRITTEN"),
+            "the lock takes data, so a Mach-O can land in it: {output}"
+        );
+        assert!(
+            !output.contains("LOCK_EXEC_RAN"),
+            "a Mach-O written into the 0644 lock must not execute: {output}"
         );
     }
 

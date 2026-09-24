@@ -234,7 +234,7 @@ pub fn generate_profile_with_playwright_socket_dir(
     emit_dotnet_exec_denies(&mut sb, config.dotnet_root);
     // Same reason: keeps the exec-allowed toolchain dirs non-writable even
     // when a user allow.write covers ~/.gradle or ~/.konan (write-then-exec).
-    emit_toolchain_write_deny(&mut sb, &home);
+    emit_toolchain_write_deny(&mut sb, &home, config.extra_deny);
     // Same reason: a dotfiles-managed `~/.gitconfig` can resolve into the
     // project or an `allow.write` tree, and the deny at its target must beat
     // that grant (#524).
@@ -1781,7 +1781,7 @@ fn emit_toolchain_exec(sb: &mut String, home: &str) {
 /// `allow.write` covering `~/.gradle` (or any parent) would otherwise override
 /// a write-deny emitted alongside the exec allow and silently reopen the hole.
 /// Same rationale as `emit_dotnet_exec_denies`.
-fn emit_toolchain_write_deny(sb: &mut String, home: &str) {
+fn emit_toolchain_write_deny(sb: &mut String, home: &str, extra_deny: &[PathBuf]) {
     sbpl!(
         sb,
         ";; Provisioned toolchains — exec-allowed paths stay read-only"
@@ -1792,10 +1792,14 @@ fn emit_toolchain_write_deny(sb: &mut String, home: &str) {
     // K/N opens this lock for writing on every build, toolchain present or
     // not. Data only: no create, unlink, link or chmod, so the file K/N
     // created (0644) cannot be swapped for or turned into an executable.
-    sbpl!(
-        sb,
-        "(allow file-write-data (literal \"{home}/.konan/dependencies/cache/.lock\"))"
-    );
+    // Emitted after the user's `--deny-path` rules, so it would reopen one
+    // covering the lock: withheld then, like the opt-in re-allows.
+    const LOCK: &str = ".konan/dependencies/cache/.lock";
+    if let Some(deny) = overlapping_home_deny(extra_deny, home, LOCK) {
+        withhold_reallow(sb, "Kotlin/Native", &format!("~/{LOCK}"), deny);
+    } else {
+        sbpl!(sb, "(allow file-write-data (literal \"{home}/{LOCK}\"))");
+    }
     sbpl!(sb);
 }
 
@@ -4185,25 +4189,81 @@ mod tests {
     /// put an executable of its own at an exec-allowed path.
     #[test]
     fn konan_lock_is_writable_as_data_only() {
-        let p = generate_profile(
-            &test_options(
-                std::path::Path::new("/projects/app"),
-                std::path::Path::new("/Users/test"),
-            ),
-            &[],
+        let mut opts = test_options(
+            std::path::Path::new("/projects/app"),
+            std::path::Path::new("/Users/test"),
         );
+        // Worst case: user write grants over both stores.
+        let extra_write = [
+            PathBuf::from("/Users/test/.gradle"),
+            PathBuf::from("/Users/test/.konan"),
+        ];
+        opts.extra_write = &extra_write;
+        let p = generate_profile(&opts, &[]);
         let lock = "/Users/test/.konan/dependencies/cache/.lock";
-        let deny = p
-            .find(r#"(deny file-write* (subpath "/Users/test/.konan/dependencies"))"#)
-            .expect("toolchain write deny missing");
+        let lock_rule = format!(r#"(allow file-write-data (literal "{lock}"))"#);
         let allow = p
-            .find(&format!(r#"(allow file-write-data (literal "{lock}"))"#))
+            .find(&lock_rule)
             .unwrap_or_else(|| panic!("lock data-write allow missing\n{p}"));
-        assert!(allow > deny, "the lock allow must follow the write deny");
+
+        for toolchain in PROVISIONED_TOOLCHAINS {
+            let tree = PathBuf::from(format!("/Users/test/{toolchain}"));
+            let deny_rule = format!(r#"(deny file-write* (subpath "{}"))"#, tree.display());
+            let deny = p.find(&deny_rule).expect("toolchain write deny missing");
+            if toolchain.starts_with(".konan") {
+                assert!(allow > deny, "the lock allow must follow the write deny");
+            }
+            // Any write allow after the deny whose path is inside the tree, or
+            // an ancestor of it, reopens write-then-exec. Only the lock may.
+            for line in p[deny..]
+                .lines()
+                .filter(|l| l.starts_with("(allow file-write"))
+            {
+                if line == lock_rule {
+                    continue;
+                }
+                let Some(raw) = line.split('"').nth(1) else {
+                    continue;
+                };
+                let path = PathBuf::from(raw.trim_start_matches('^').replace('\\', ""));
+                assert!(
+                    !path.starts_with(&tree) && !tree.starts_with(&path),
+                    "{line} after the {toolchain} write deny reopens write on it\n{p}"
+                );
+            }
+        }
         for line in p.lines().filter(|l| l.contains(lock)) {
             assert!(
                 line.starts_with("(allow file-write-data "),
                 "the lock may only get file-write-data: {line}"
+            );
+        }
+    }
+
+    /// The lock allow is emitted after the user's `--deny-path` rules, so a
+    /// deny covering the lock or an ancestor must withhold it rather than be
+    /// silently reopened (last-match-wins). An unrelated deny must not.
+    #[test]
+    fn konan_lock_allow_is_withheld_under_an_overlapping_deny_path() {
+        let lock =
+            r#"(allow file-write-data (literal "/Users/test/.konan/dependencies/cache/.lock"))"#;
+        for (deny, withheld) in [
+            ("/Users/test/.konan", true),
+            ("/Users/test/.konan/dependencies/cache/.lock", true),
+            ("/Users/test", true),
+            ("/Users/test/.gradle", false),
+        ] {
+            let extra_deny = [PathBuf::from(deny)];
+            let mut opts = test_options(
+                std::path::Path::new("/projects/app"),
+                std::path::Path::new("/Users/test"),
+            );
+            opts.extra_deny = &extra_deny;
+            let p = generate_profile(&opts, &[]);
+            assert_eq!(
+                !p.contains(lock),
+                withheld,
+                "--deny-path {deny}: lock allow withheld should be {withheld}\n{p}"
             );
         }
     }
