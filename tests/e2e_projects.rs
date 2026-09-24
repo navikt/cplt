@@ -4543,6 +4543,7 @@ r root_git_mkdir 'mkdir "$R/.git"'
 r root_git_link 'ln -s "$R/g" "$R/.git"'
 r nested_upper 'mkdir "$R/a/d/.GIT"'
 r root_git_upper 'mkdir "$R/.Git"'
+r wt_remove 'git worktree remove --force "$R/b"'
 "##;
 
     /// With the key on, the agent can create two worktrees under
@@ -4602,6 +4603,9 @@ echo "ROOT:$R"
             "root_git_link",
             "nested_upper",
             "root_git_upper",
+            // The nested-gitdir rules deny unlinking `<root>/<name>/.git`, so
+            // removal has to happen outside cplt.
+            "wt_remove",
             "sib_read",
             "sib_write",
             "sib_exec",
@@ -4753,6 +4757,16 @@ if echo y > "{root_s}/g" 2>/dev/null; then echo RESULT:write:OK; else echo RESUL
                 stderr.contains("worktree links")
                     && stderr.contains(&format!("\n    {}\n", dir.display())),
                 "{name}: {stderr}"
+            );
+            // Key off: the root is not granted, so the launch runs, but the
+            // planted link is still named.
+            let (stdout, stderr, _) =
+                run_exec_with_home(&project, home.path(), "", "echo RESULT:off:OK\n");
+            assert_result_ok(&stdout, &stderr, "off");
+            assert!(
+                stderr.contains("allow_git_worktrees is off, but the worktree root")
+                    && stderr.contains(&format!("\n    {}\n", dir.display())),
+                "{name}: key off still names it.\n{stderr}"
             );
         }
     }

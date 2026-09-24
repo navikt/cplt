@@ -1822,7 +1822,8 @@ fn warn_worktrees_not_audited(
             "WORKTREE LINKS CHANGED. Do not run git in these directories until this is \
              fixed:\n    {}\n  git there would follow a link the agent wrote and could run \
              agent-written config on this machine. Found:\n    {}\n  The next cplt launch \
-             refuses to start until they are fixed.",
+             with sandbox.allow_git_worktrees on refuses to start until they are fixed; with \
+             it off, the launch repeats this error.",
             dirs.join("\n    "),
             details.join("\n    ")
         ));
@@ -1858,6 +1859,25 @@ fn managed_worktree_root(
     max_dirs: usize,
 ) -> anyhow::Result<Option<PathBuf>> {
     if !enabled {
+        // A root left by an earlier session is still checked: git on the
+        // host follows a planted link whether or not the key is on. Reported,
+        // not fatal, since this session grants nothing there.
+        let problems = cplt::worktrees::existing_root_problems(home_dir, project_dir, max_dirs);
+        if !problems.is_empty() {
+            ui::error(&format!(
+                "sandbox.allow_git_worktrees is off, but the worktree root an earlier session \
+                 left has links that do not match what git writes. Do not run git in these \
+                 directories until this is fixed:\n    {}\n  Found:\n    {}\n  Inspect them \
+                 without git and remove the worktrees involved (delete the directories, then \
+                 run `git worktree prune` from this repository)",
+                cplt::worktrees::problem_dirs(&problems).join("\n    "),
+                problems
+                    .iter()
+                    .map(|p| p.detail.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n    ")
+            ));
+        }
         return Ok(None);
     }
     let fail = |e: String| {

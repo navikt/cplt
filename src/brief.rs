@@ -309,7 +309,11 @@ pub fn generate_session_brief(facts: &BriefFacts) -> String {
              `git worktree add \"$CPLT_WORKTREE_ROOT/<name>\" -b <branch>`. You have read, \
              write and execute there, and not in other repositories' roots. It belongs to this repository \
              only. Worktrees and branches you create persist after the session; cplt never \
-             removes them. The end-of-session audit does not cover them.\n\n"
+             removes them. The end-of-session audit does not cover them. Do not run \
+             `git worktree remove` here: it fails in the sandbox and leaves a broken worktree \
+             that stops the next launch; leave removal to the user, outside cplt. A symlink \
+             that leads out of its worktree, or a `.git` or bare repository anywhere but \
+             where `git worktree add` puts it, also stops the next launch.\n\n"
         );
     }
 

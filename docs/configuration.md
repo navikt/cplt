@@ -473,33 +473,40 @@ What you get:
   `.github/hooks`, `.claude/settings.json`, `.cplt.toml` and the rest of the
   per-root list inside every worktree. See
   [SECURITY.md](../SECURITY.md#managed-worktree-root-sandboxallow_git_worktrees).
-- On macOS the kernel refuses rewriting a `<common>/worktrees/<name>/commondir`
-  in place, and refuses creating a `.git` (in any letter case) at
-  `<root>/.git` or in any subdirectory of a worktree
-  (`<root>/<name>/<dir>/.git`). It does not stop the
-  agent from rewriting a worktree's own `<root>/<name>/.git` pointer, deleting
-  and recreating a `commondir`, creating a `.git` in a new `<root>/<name>/`,
+- On macOS the kernel refuses rewriting a `<common>/worktrees/<id>/commondir`
+  in place, refuses rewriting or deleting any `.git` below the root, and
+  refuses creating a `.git` (in any letter case) at `<root>/.git` or in any
+  subdirectory of a worktree (`<root>/<name>/<dir>/.git`). It does not stop
+  the agent from deleting and recreating a `commondir`, creating an admin
+  directory, moving a worktree aside and writing a new `<root>/<name>/.git`,
   or moving in a directory that already holds a `.git` (the create rule only
-  sees the moved directory's own name). So cplt checks every `commondir` and
-  walks the whole root at every launch and at session end. It passes only
-  `<root>/<name>/.git` as `git worktree add` writes it: a regular file
-  naming an admin directory that names it back. It also reports:
+  sees the moved directory's own name). So cplt checks every admin directory
+  and walks the whole root at every launch and at session end. It compares
+  exact text and does not follow links, since a symlink that leads the right
+  way today can be re-aimed later. It passes only what `git worktree add`
+  writes: `commondir` reading exactly `../..`; the admin `gitdir` naming an
+  existing regular `.git` file by a path with no symlink in it; and
+  `<root>/<name>/.git` as a regular file reading exactly
+  `gitdir: <common>/worktrees/<id>`, whose admin `gitdir` reads exactly
+  `<root>/<name>/.git`. It also reports:
   - a `.git` anywhere else, in any letter case (on a case-insensitive volume
     Git opens `.GIT` for `.git`);
   - an admin directory whose `gitdir` does not name an existing regular
     `.git` file (a worktree deleted without `git worktree prune` counts);
   - a directory that Git would take for a bare repository: `HEAD` with
-    `objects/` and `refs/`, or `HEAD` with a `commondir`;
+    `objects` and `refs`, or `HEAD` with a `commondir`, whatever their file
+    type;
   - anything directly in the root that is not a directory, such as a symlink;
-  - a symlink deeper down that leads to a directory outside the root where
-    Git, searching upward from there, would find a `.git` or bare-repository
-    layout other than this repository's own `.git` directory, or a symlink
-    that cannot be resolved for a reason other than a missing target. The
-    walk does not descend through symlinks; it only checks where they lead.
+  - any symlink below the root, dangling or not, unless it resolves inside
+    its own worktree (links like `node_modules/.bin` do).
 
   Any finding prints an error at session end naming the directories not to
-  run Git in, and makes the next launch refuse to start. Submodules inside a
-  managed worktree are refused for the same reason.
+  run Git in, and makes the next launch with the key on refuse to start.
+  With the key off, cplt still checks this repository's root at launch if it
+  exists and prints the same error, but the launch goes ahead. Submodules
+  inside a managed worktree are refused for the same reason. So are
+  worktrees written with `worktree.useRelativePaths`, since the check expects
+  the absolute paths Git writes by default.
 - The walk visits at most `sandbox.worktree_walk_max_dirs` directories
   (default 100000; files do not count) and 64 levels. A root past either
   bound is a finding, so the launch refuses to start. The error lists how
@@ -514,7 +521,11 @@ What you get:
   the check, and nothing reports that until the next launch runs the check
   again. cplt does not kill leftover processes.
 - Worktrees and branches persist after the session. cplt never removes them.
-  Clean up with `git worktree remove` and `git branch -d` when you are done.
+  Clean up outside cplt with `git worktree remove` and `git branch -d` when
+  you are done. Inside cplt `git worktree remove` fails: deleting a
+  worktree's `.git` is denied, so it removes the files and the admin
+  directory but leaves the pointer, and the next launch refuses to start
+  until you delete that directory and run `git worktree prune`.
 - The end-of-session audit does not cover the worktrees' contents yet. It
   prints a line saying so. Review them with `git worktree list`.
 

@@ -601,7 +601,7 @@ does not:
   O_DIRECTORY` and their owner and mode are checked and set through that
   descriptor. These checks run on every launch, in case the root was replaced
   between sessions. Inside a session the root's name is pinned
-  (`file-write-unlink` on its literal path), so the agent cannot move it away.
+  (`file-write-unlink` on its exact path), so the agent cannot move it away.
   A `CPLT_CONFIG` inside the root is refused, like one inside a named
   repository.
 - **No new trust.** The root is not a repository and is not added to the gh
@@ -619,48 +619,66 @@ does not:
   The shared `.git/hooks` and `.git/config` keep their existing denies, and
   `worktrees/<name>/config.worktree` is denied by suffix. Verified by kernel
   tests in `tests/e2e_projects.rs`.
-- **Worktree links: kernel pins plus a check at launch and exit.** Two files
-  decide which config and hooks Git on the host reads for a worktree, and the
-  agent can write both. `<common>/worktrees/<name>/commondir` aimed at
+- **Worktree links: kernel pins plus a strict check at launch and exit.** Two
+  files decide which config and hooks Git on the host reads for a worktree,
+  and the agent can write both. `<common>/worktrees/<id>/commondir` aimed at
   `<root>/x/` would make Git read `<root>/x/config`, which the agent can write
   (`core.fsmonitor` runs on the host). A `<root>/<name>/.git` pointer aimed at
-  `<root>/g` does the same through `<root>/g/config` and `<root>/g/hooks`. The
-  kernel blocks rewriting a `commondir` in place (`file-write-data`). It does
-  not block rewriting a worktree's `<root>/<name>/.git` pointer, deleting and
-  recreating either file, moving the worktree aside and writing a new pointer,
-  or creating a new admin directory: `git worktree add` and `git worktree
-  remove` need those operations. A `.git` anywhere else in the root
-  (`<root>/.git`, `<root>/<name>/sub/.git`, as a file, symlink or directory)
-  works the same way for a `git status` run in that directory. The kernel
-  refuses creating one, in any letter case, since on case-insensitive APFS Git
-  opens `.GIT` for `.git` (`file-write-create` on `<root>/.git` and on
-  `<root>/<name>/<anything>/.git`: a new file, a symlink, a mkdir and a
-  rename onto the name). **Deny residual:** the rule only sees the name being
-  created. `mkdir -p /private/tmp/stage/sub/.git && mv /private/tmp/stage/sub
-  <root>/x/sub` creates only `sub` under the root, so it succeeds, and the
-  planted `.git` is there. The deny does not block that plant; the walk below
-  finds it. Nor can a rule express a bare-repository layout (`HEAD` with
-  `objects/` and `refs/`, or with a `commondir`), which Git accepts as a
-  gitdir with no `.git` at all, or a symlink that leads out of the root into
-  a repository the agent built in `/private/tmp`. cplt checks for all of
-  these at two points. At every launch it checks every
-  `<common>/worktrees/*/commondir` (it must resolve to the common directory)
-  and every admin directory's `gitdir` (it must name an existing regular
-  `.git` file), then walks the whole root. The only `.git` allowed, in any
-  letter case, is `<root>/<name>/.git` as a regular file with exactly that
-  name, naming `<common>/worktrees/<name>`, whose `gitdir` names it back.
-  Also reported: a bare-repository layout in any directory, anything
-  directly in the root that is not a directory, and a symlink deeper down
-  that leads to a directory outside the root where Git, searching upward from
-  there, would find a `.git` or bare layout other than this repository's own
-  `.git` directory. The walk does not descend through symlinks. Anything it
-  cannot read and a tree past its bounds (64 levels,
+  `<root>/g` does the same through `<root>/g/config` and `<root>/g/hooks`.
+  What the kernel blocks: rewriting a `commondir` in place
+  (`file-write-data`); rewriting or unlinking any `<root>/.../.git` (the
+  nested-gitdir rules every writable root gets); and creating a `.git`, in
+  any letter case since on case-insensitive APFS Git opens `.GIT` for `.git`,
+  at `<root>/.git` or at `<root>/<name>/<anything>/.git` (a new file, a
+  symlink, a mkdir and a rename onto the name). What it does not block:
+  deleting and recreating a `commondir`, creating a new admin directory,
+  moving a worktree aside and writing a new `<root>/<name>/.git`, and moving
+  in a directory that already holds a `.git`. **Deny residual:** the create
+  rule only sees the name being created. `mkdir -p
+  /private/tmp/stage/sub/.git && mv /private/tmp/stage/sub <root>/x/sub`
+  creates only `sub` under the root, so it succeeds, and the planted `.git`
+  is there. The deny does not block that plant; the walk below finds it. Nor
+  can a rule express a bare-repository layout or a symlink out of the root.
+  Because unlinking `<root>/<name>/.git` is denied, **`git worktree remove`
+  fails inside cplt.** It gets far enough to delete the worktree's files and
+  its admin directory, leaves the `.git` pointer, and the next launch refuses
+  to start until that directory is deleted and `git worktree prune` is run.
+  Remove worktrees outside cplt; the agent brief says so.
+
+  The check compares exact text rather than following links, because a link
+  that resolves correctly through a symlink today can be re-aimed tomorrow by
+  changing the symlink. At every launch with the key on, and at session end,
+  cplt requires for every admin directory `<common>/worktrees/<id>` that
+  `commondir` reads exactly `../..` and `gitdir` names an existing regular
+  `.git` file by an absolute path with no symlink, `.` or `..` in it
+  (`<root>/<name>/.git` when it is inside the root). Both must be regular
+  files, opened without following symlinks. Then it walks the whole root.
+  The only `.git` allowed, in any letter case, is `<root>/<name>/.git` as a
+  regular file with exactly that name that reads exactly
+  `gitdir: <common>/worktrees/<id>`, with no symlink on that path, and whose
+  admin directory's `gitdir` reads exactly `<root>/<name>/.git`. Also
+  reported:
+  - a bare-repository layout in any directory: `HEAD` with `objects` and
+    `refs`, or `HEAD` with a `commondir`, of any file type (Git checks
+    `objects` and `refs` with `access(X_OK)`, which an executable regular
+    file passes);
+  - anything directly in the root that is not a directory;
+  - any symlink below the root, dangling or not, unless it resolves inside
+    its own worktree, where the walk sees whatever it leads to. A link that
+    leads out can be aimed at a repository in `/private/tmp`, now or later.
+    Links inside the worktree, like `node_modules/.bin`, stay allowed.
+
+  Anything it cannot read and a tree past its bounds (64 levels,
   `sandbox.worktree_walk_max_dirs` directories, 100 000 by default) is a
   finding, and the launch refuses to start. At session end it runs the same
-  check and prints an error naming each directory not to run Git in. Between
-  the end of a session and your next Git command there, only that error
-  stands between you and the planted config. Submodules inside a managed
-  worktree are refused by the same rules.
+  check and prints an error naming each directory not to run Git in. That
+  error is advisory: nothing stops Git from running there if you do. With
+  the key off, cplt still runs the check at launch whenever this
+  repository's root exists, and prints the same error, but the launch goes
+  ahead, since the session grants nothing in the root. Submodules inside a
+  managed worktree are refused by the same rules. The strict text also
+  refuses worktrees Git wrote with relative paths
+  (`worktree.useRelativePaths`); turn that option off for this repository.
 - **The window after the session-end check.** The check runs when the agent's
   process has exited: after the audit's settle wait for its descendants (at
   most two seconds) when the change audit or `--observe-domains` runs, and at

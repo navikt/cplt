@@ -1159,10 +1159,12 @@ fn emit_git_persistence_denies(
     // `<root>/x/` and git on the host reads `<root>/x/config`, which the agent
     // can write (`core.fsmonitor`). `file-write-data` refuses an in-place
     // rewrite and still lets `git worktree add` create the file (checked with
-    // `sandbox-exec`). Unlink stays allowed so `git worktree remove` keeps
-    // working, so unlink-and-recreate, rename-over and a new admin dir are not
-    // stopped here: `worktrees::link_problems` checks every admin dir at launch
-    // and at session end.
+    // `sandbox-exec`). Unlink stays allowed, so unlink-and-recreate,
+    // rename-over and a new admin dir are not stopped here:
+    // `worktrees::link_problems` checks every admin dir, by exact text, at
+    // launch and at session end. `git worktree remove` fails inside cplt
+    // anyway: `emit_nested_gitdir_denies` refuses unlinking and rewriting
+    // `<root>/<name>/.git`, so removal happens outside cplt.
     //
     // The root's own name is pinned for the reason the gitdir is: a rename
     // walks around every path rule under it.
