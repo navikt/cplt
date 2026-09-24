@@ -1902,6 +1902,54 @@ mod macos_tests {
     /// created inside a gitdir: the root's own, and a worktree common dir
     /// outside every root, which only the gitdir rule covers. Off, all four
     /// are allowed, so the key is what blocks them.
+    /// #576 with #531: with both `sandbox.deny_nested_git` and the managed
+    /// worktree root on, the root keeps its own rules. `git worktree add`
+    /// can still write `<root>/<name>/.git`, #531 still refuses a deeper
+    /// `.git`, and an ordinary writable root still gets the nested deny.
+    #[test]
+    fn real_profile_deny_nested_git_leaves_the_managed_worktree_root_to_531() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        let id = std::process::id();
+        let tmp = project.join(format!(".cplt-wt-proj-{id}"));
+        let wt = project.join(format!(".cplt-wt-root-{id}"));
+        fs::create_dir_all(&tmp).unwrap();
+        fs::create_dir_all(&wt).unwrap();
+        let (tmp, wt) = (
+            fs::canonicalize(&tmp).unwrap(),
+            fs::canonicalize(&wt).unwrap(),
+        );
+        let roots = [wt.clone()];
+        let mut opts = default_opts(&tmp, &home);
+        opts.deny_nested_git = true;
+        opts.named_roots = &roots;
+        opts.managed_worktree_root = Some(&wt);
+        let profile = write_real_profile(&opts);
+        let run = |dir: &Path| {
+            let (output, _) = run_sandboxed(
+                &profile,
+                &format!(
+                    "mkdir -p '{d}' && printf 'gitdir: x\\n' > '{d}/.git' 2>&1; echo EXIT:$?",
+                    d = dir.display()
+                ),
+            );
+            output.contains("EXIT:0")
+        };
+        let worktree = run(&wt.join("name"));
+        let deeper = run(&wt.join("name2/sub"));
+        let ordinary = run(&tmp.join("a"));
+        fs::remove_dir_all(&tmp).ok();
+        fs::remove_dir_all(&wt).ok();
+        fs::remove_file(&profile).ok();
+        assert!(
+            worktree,
+            "<root>/<name>/.git must stay creatable for git worktree add"
+        );
+        assert!(!deeper, "<root>/<name>/sub/.git must stay denied by #531");
+        assert!(!ordinary, "an ordinary writable root keeps the nested deny");
+    }
+
     #[test]
     fn real_profile_deny_nested_git_blocks_dot_git_inside_a_gitdir() {
         require_sandbox!();

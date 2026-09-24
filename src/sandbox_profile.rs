@@ -1214,7 +1214,11 @@ fn emit_git_persistence_denies(
 
     for root in writable_roots(project_roots, extra_write) {
         emit_nested_gitdir_denies(sb, &root);
-        if deny_nested_git {
+        // Not in the managed worktree root: `git worktree add` has to create
+        // `<root>/<name>/.git` there, and the #531 rules above already refuse
+        // every other `.git` in it.
+        let managed = managed_worktree_root.is_some_and(|m| m.to_string_lossy() == root);
+        if deny_nested_git && !managed {
             emit_nested_git_create_deny(sb, &root);
         }
     }
