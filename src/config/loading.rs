@@ -503,6 +503,7 @@ impl Config {
         // Experimental, config-only (#242). With it off the Keychain grant is
         // exactly what `needs_keychain()` says.
         let keychain_substitute = bools.keychain_substitute;
+        let allow_git_worktrees = bools.allow_git_worktrees;
 
         // Config-only (#463). Expanded into `allow_read` at probe time, where
         // `$HOME` and the final deny list are known.
@@ -661,6 +662,7 @@ impl Config {
             allow_browser,
             keychain_substitute,
             allow_build_credentials,
+            allow_git_worktrees,
             scratch_dir,
             use_bubblewrap,
             quiet,
@@ -1056,6 +1058,7 @@ impl Resolved {
         home_dir: &std::path::Path,
         agent: crate::agent::Agent,
         repos: &[super::types::RepoSummaryRow],
+        worktree_root: Option<&std::path::Path>,
     ) {
         let blue = ui::color(ui::BLUE);
         let dim = ui::color(ui::DIM);
@@ -1118,6 +1121,14 @@ impl Resolved {
             "{blue}[cplt]{nc}    Project:       {green}read/write{nc}  {}",
             project_dir.display()
         );
+        // #531: a second read/write/execute tree, and one whose contents
+        // outlive the session, so both facts are on the line.
+        if let Some(root) = worktree_root {
+            eprintln!(
+                "{blue}[cplt]{nc}    Worktrees:     {yellow}read/write/exec{nc} {}  {dim}$CPLT_WORKTREE_ROOT; worktrees and branches persist after the session{nc}",
+                root.display()
+            );
+        }
         if !self.allow_read.is_empty() {
             for p in &self.allow_read {
                 eprintln!(
@@ -4021,6 +4032,14 @@ mod precedence {
                 cli_on: None,
                 cli_off: None,
                 get: |r| r.allow_build_credentials,
+                default: false,
+                preset: None,
+            },
+            Ladder {
+                key: "sandbox.allow_git_worktrees",
+                cli_on: None,
+                cli_off: None,
+                get: |r| r.allow_git_worktrees,
                 default: false,
                 preset: None,
             },

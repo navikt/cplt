@@ -28,6 +28,7 @@ pub mod subscriptions;
 pub mod trust;
 pub mod ui;
 pub mod update;
+pub mod worktrees;
 
 /// Safety check: reject overly broad project roots.
 ///

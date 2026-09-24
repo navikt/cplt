@@ -269,6 +269,10 @@ pub struct PreparedSandbox {
     /// The credential forwarded into the sandbox in place of the Keychain
     /// grant, if any (#242). `None` on every run where the trade did not apply.
     pub(crate) keychain_substitute: Option<crate::agent::KeychainSubstitute>,
+    /// Exported to the child as `CPLT_WORKTREE_ROOT` (#531). Set by the
+    /// launcher with [`Self::set_worktree_root`] after `prepare`; the grant
+    /// itself comes from `SandboxConfig::named_roots`.
+    worktree_root: Option<PathBuf>,
     /// Landlock + seccomp pre-computed sandbox data (Linux only).
     /// Built in the parent process; applied in pre_exec.
     #[cfg(target_os = "linux")]
@@ -288,6 +292,14 @@ impl PreparedSandbox {
     /// The home directory this sandbox is configured for.
     pub fn home_dir(&self) -> &Path {
         &self.home_dir
+    }
+
+    /// Name the managed worktree root to the child as `CPLT_WORKTREE_ROOT`.
+    ///
+    /// Environment only: the root must already be among the policy's named
+    /// roots, or the variable would name a directory the agent cannot use.
+    pub fn set_worktree_root(&mut self, root: Option<&Path>) {
+        self.worktree_root = root.map(Path::to_path_buf);
     }
 
     /// Withdraw the read grant on the root `AGENTS.md` (#252).
@@ -1284,6 +1296,7 @@ fn prepare_impl(
         allow_localhost_any: config.allow_localhost_any,
         npmrc_allowed: env::npmrc_explicitly_allowed(config.home_dir, config.extra_read),
         keychain_substitute: config.keychain_substitute.clone(),
+        worktree_root: None,
     })
 }
 
@@ -1948,6 +1961,7 @@ fn prepare_impl(
         allow_localhost_any: config.allow_localhost_any,
         npmrc_allowed: env::npmrc_explicitly_allowed(config.home_dir, config.extra_read),
         keychain_substitute: config.keychain_substitute.clone(),
+        worktree_root: None,
         precomputed,
         bwrap_wrapper,
     })

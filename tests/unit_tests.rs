@@ -9258,6 +9258,7 @@ allow_cache_exec_any = false
 allow_browser = false
 keychain_substitute = false
 allow_build_credentials = false
+allow_git_worktrees = false
 git_push_prevention = false
 
 [gh_guard]

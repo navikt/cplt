@@ -439,6 +439,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "sandbox",
+        key: "allow_git_worktrees",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "false",
+        description: "Grant read, write and execute on a cplt-owned directory for this repository's sub-agent worktrees (~/.cplt-worktrees/<id>, exported as CPLT_WORKTREE_ROOT). Worktrees and branches there persist after the session. User config only; .cplt.toml cannot propose it.",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
         key: "gh_proxy",
         value_type: ConfigValueType::Bool,
         dangerous: false,
@@ -1038,6 +1046,14 @@ bool_keys! {
         config = |c: &Config| c.sandbox.allow_build_credentials,
         baseline = |_: PresetBaseline| false,
         resolved = |r: &Resolved| r.allow_build_credentials;
+
+    /// Config-only (#531): grants a new executable tree outside the checkout,
+    /// so there is deliberately no CLI flag and no `[propose]` key.
+    allow_git_worktrees, "sandbox", "allow_git_worktrees",
+        cli = |_: &CliFlags| FeatureToggle::UseDefault,
+        config = |c: &Config| c.sandbox.allow_git_worktrees,
+        baseline = |_: PresetBaseline| false,
+        resolved = |r: &Resolved| r.allow_git_worktrees;
 
     /// The config layer folds in the deprecated `sandbox.gh_proxy` spelling.
     gh_guard_enabled, "gh_guard", "enabled",

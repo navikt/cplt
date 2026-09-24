@@ -57,6 +57,11 @@ pub struct BriefFacts {
     pub network: BriefNetwork,
     pub credentials: BriefCredentials,
     pub paths: BriefPaths,
+    /// `$CPLT_WORKTREE_ROOT` when `sandbox.allow_git_worktrees` is on (#531),
+    /// else `None`. Set by the launcher after [`Self::capture`]: the root is
+    /// created at launch and is not part of `Resolved`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_root: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -195,6 +200,7 @@ impl BriefFacts {
                 write: strs(&resolved.allow_write),
                 exec: strs(&resolved.allow_exec),
             },
+            worktree_root: None,
         }
     }
 }
@@ -292,6 +298,18 @@ pub fn generate_session_brief(facts: &BriefFacts) -> String {
              obstacle to route around. Report it and carry on; only the user can add one, \
              with `--repo-dir` or `cplt config set --local sandbox.repo_dirs <DIR>`, and it \
              takes a new session.\n\n",
+        );
+    }
+
+    if let Some(root) = &facts.worktree_root {
+        let _ = write!(
+            out,
+            "## Worktrees\n\n\
+             Create worktrees for parallel work under `$CPLT_WORKTREE_ROOT` ({root}): \
+             `git worktree add \"$CPLT_WORKTREE_ROOT/<name>\" -b <branch>`. You have read, \
+             write and execute there and nowhere beside it. It belongs to this repository \
+             only. Worktrees and branches you create persist after the session; cplt never \
+             removes them. The end-of-session audit does not cover them.\n\n"
         );
     }
 
@@ -892,6 +910,7 @@ mod tests {
             // full literal, so every new field lands here.
             keychain_substitute: false,
             allow_build_credentials: false,
+            allow_git_worktrees: false,
             allow_msbuild: false,
             allow_tmp_exec: false,
             allow_cache_exec: Vec::new(),

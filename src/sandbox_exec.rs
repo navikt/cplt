@@ -110,6 +110,7 @@ fn configure_command(
     // child afterwards, so a parent value that is about to be denied must not
     // suppress the extraction. See `child_keeps_a_github_token`.
     deny_env: &[String],
+    worktree_root: Option<&Path>,
 ) {
     for arg in copilot_args {
         cmd.arg(arg);
@@ -226,6 +227,14 @@ fn configure_command(
     // Recursion guard: if copilot somehow re-invokes cplt (e.g. via symlink),
     // cplt will see this and bail before launching another sandbox.
     cmd.env("__CPLT_WRAPPED", "1");
+
+    // #531: set after filtering, so an inherited or passed-through value can
+    // never point the agent at a directory the policy does not grant. Removed
+    // when the key is off for the same reason.
+    match worktree_root {
+        Some(root) => cmd.env(crate::worktrees::ENV, root),
+        None => cmd.env_remove(crate::worktrees::ENV),
+    };
 
     // Point the agent at its own brief, so it does not have to know the
     // `$TMPDIR/CPLT_BRIEF.md` convention to find it. Gated on the files
@@ -1259,6 +1268,7 @@ pub fn exec(
         sandbox.playwright_socket_dir.as_deref(),
         sandbox.playwright_runtime,
         deny_env,
+        sandbox.worktree_root.as_deref(),
     );
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
@@ -1388,6 +1398,7 @@ pub fn exec(
         sandbox.playwright_socket_dir.as_deref(),
         sandbox.playwright_runtime,
         deny_env,
+        sandbox.worktree_root.as_deref(),
     );
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
@@ -1537,6 +1548,7 @@ fn exec_bwrap(
         sandbox.playwright_socket_dir.as_deref(),
         sandbox.playwright_runtime,
         deny_env,
+        sandbox.worktree_root.as_deref(),
     );
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
     // Set the re-entry env AFTER configure_command so a `clear_first` env build

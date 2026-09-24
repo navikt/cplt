@@ -295,6 +295,12 @@ pub fn default_config_contents() -> String {
 # A --deny-path / deny.paths entry covering one of them still wins.
 # allow_build_credentials = false
 #
+# Give sub-agents a place to create Git worktrees: read, write and execute on a
+# cplt-owned directory for this repository only (~/.cplt-worktrees/<id>),
+# exported as CPLT_WORKTREE_ROOT. Worktrees and branches there persist after the
+# session; cplt never removes them. Global or local config only.
+# allow_git_worktrees = false
+#
 # Suppress the startup configuration summary and non-essential messages.
 # Errors and warnings are always shown. Useful once you've reviewed the
 # sandbox settings and don't need to see them every time.

@@ -4458,4 +4458,197 @@ fi
         assert_result_ok(&stdout, &stderr, "tcp_ipv6_bind");
         assert_result_ok(&stdout, &stderr, "tcp_wildcard_bind");
     }
+
+    // ============================================================
+    // Managed worktree root (sandbox.allow_git_worktrees, #531)
+    // ============================================================
+
+    /// Run `cplt exec` of a script inside `project`, with `home` as HOME and
+    /// `config` as the config file. The script lives in the project: nothing
+    /// else is executable in the sandbox.
+    fn run_exec_with_home(
+        project: &TempProject,
+        home: &Path,
+        config: &str,
+        script: &str,
+    ) -> (String, String, bool) {
+        let cfg = home.join("cplt.toml");
+        fs::write(&cfg, config).expect("write config");
+        project.write_file(".t/run.sh", &format!("#!/bin/sh\n{script}"));
+        let run = project.canonical_path().join(".t/run.sh");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&run, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let output = cplt_cmd()
+            .current_dir(project.canonical_path())
+            .env("HOME", home)
+            .env("CPLT_CONFIG", &cfg)
+            .args(["--no-quiet", "exec", "--"])
+            .arg(&run)
+            .output()
+            .expect("cplt should run");
+        (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            output.status.success(),
+        )
+    }
+
+    /// The root this repository gets under `home`, and a sibling root standing
+    /// in for another repository's, pre-populated with a file and a script.
+    fn managed_paths(project: &TempProject, home: &Path) -> (PathBuf, PathBuf) {
+        let common = fs::canonicalize(project.path().join(".git")).unwrap();
+        let base = fs::canonicalize(home).unwrap().join(".cplt-worktrees");
+        let other = base.join("0".repeat(32));
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("f"), "secret\n").unwrap();
+        fs::write(other.join("x.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(other.join("x.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        (base.join(cplt::worktrees::fingerprint(&common)), other)
+    }
+
+    const PROBE: &str = r##"
+P="$PWD"
+R="$CPLT_WORKTREE_ROOT"
+r(){ if eval "$2" >/dev/null 2>&1; then echo "RESULT:$1:OK"; else echo "RESULT:$1:FAIL"; fi; }
+r env '[ -n "$R" ]'
+r add_a 'git worktree add -q "$R/a" -b a'
+r add_b 'git worktree add -q "$R/b" -b b'
+r write 'echo x > "$R/a/new.txt"'
+r commit 'cd "$R/a" && git add new.txt && git -c user.name=t -c user.email=t@e -c commit.gpgsign=false commit -qm m'
+r status 'git -C "$R/b" status --porcelain'
+r exec 'printf "#!/bin/sh\nexit 0\n" > "$R/b/t.sh" && chmod +x "$R/b/t.sh" && "$R/b/t.sh"'
+r hook 'echo h > "$P/.git/hooks/pre-commit"'
+r gitconfig 'echo "[x]" >> "$P/.git/config"'
+r wtconfig 'echo "[core]" > "$P/.git/worktrees/a/config.worktree"'
+r ghhook 'mkdir -p "$R/a/.github/hooks" && echo {} > "$R/a/.github/hooks/x.json"'
+r cplttoml 'echo x > "$R/a/.cplt.toml"'
+r claude 'mkdir -p "$R/a/.claude" && echo {} > "$R/a/.claude/settings.json"'
+r pointer 'echo "gitdir: /tmp" > "$R/a/.git"'
+r ghrename 'mkdir -p "$R/a/.github/workflows" && mv "$R/a/.github" "$R/a/.gh2"'
+"##;
+
+    /// With the key on, the agent can create two worktrees under
+    /// `$CPLT_WORKTREE_ROOT`, commit and run code in them, and the shared-gitdir
+    /// and in-worktree persistence denies still hold. Another repository's
+    /// root beside it, and the parent that holds both, stay closed.
+    #[test]
+    fn managed_worktree_root_is_usable_and_scoped() {
+        require_sandbox!();
+        let project = TempProject::new("wt-on");
+        project.write_file("f.txt", "x\n");
+        project.git_init();
+        let home = TempProject::new("wt-on-home");
+        let (root, other) = managed_paths(&project, home.path());
+        let other_s = other.display().to_string();
+        let base_s = other.parent().unwrap().display().to_string();
+        let script = format!(
+            r#"{PROBE}
+r sib_read 'cat "{other_s}/f"'
+r sib_write 'echo y > "{other_s}/g"'
+r sib_exec '"{other_s}/x.sh"'
+r base_list 'ls "{base_s}"'
+r base_mkdir 'mkdir "{base_s}/new"'
+echo "ROOT:$R"
+"#
+        );
+        let (stdout, stderr, _) = run_exec_with_home(
+            &project,
+            home.path(),
+            "[sandbox]\nallow_git_worktrees = true\n",
+            &script,
+        );
+        assert!(
+            stdout.contains(&format!("ROOT:{}", root.display())),
+            "CPLT_WORKTREE_ROOT names this repository's root.\n{stdout}\n{stderr}"
+        );
+        for ok in ["env", "add_a", "add_b", "write", "commit", "status", "exec"] {
+            assert_result_ok(&stdout, &stderr, ok);
+        }
+        for denied in [
+            "hook",
+            "gitconfig",
+            "wtconfig",
+            "ghhook",
+            "cplttoml",
+            "claude",
+            "pointer",
+            "ghrename",
+            "sib_read",
+            "sib_write",
+            "sib_exec",
+            "base_list",
+            "base_mkdir",
+        ] {
+            assert_result_fail(&stdout, denied);
+        }
+        // Nothing is removed on exit: the work outlives the session.
+        assert!(root.join("a/new.txt").is_file(), "worktree persists");
+        assert!(
+            stderr.contains("does not cover worktrees under"),
+            "{stderr}"
+        );
+    }
+
+    /// Off (the default): no variable, no root created, and a root left by an
+    /// earlier session is not reachable.
+    #[test]
+    fn managed_worktree_root_is_absent_when_off() {
+        require_sandbox!();
+        let project = TempProject::new("wt-off");
+        project.write_file("f.txt", "x\n");
+        project.git_init();
+        let home = TempProject::new("wt-off-home");
+        let (root, _) = managed_paths(&project, home.path());
+        let root_s = root.display().to_string();
+        let script = format!(
+            r#"
+if [ -z "$CPLT_WORKTREE_ROOT" ]; then echo RESULT:unset:OK; else echo RESULT:unset:FAIL; fi
+if [ -e "{root_s}" ]; then echo RESULT:created:OK; else echo RESULT:created:FAIL; fi
+"#
+        );
+        let (stdout, stderr, _) = run_exec_with_home(&project, home.path(), "", &script);
+        assert_result_ok(&stdout, &stderr, "unset");
+        assert_result_fail(&stdout, "created");
+        assert!(!root.exists(), "the key off creates nothing");
+
+        // A root from an earlier session: still closed.
+        fs::create_dir_all(&root).unwrap();
+        let script = format!(
+            r#"
+if echo y > "{root_s}/g" 2>/dev/null; then echo RESULT:write:OK; else echo RESULT:write:FAIL; fi
+"#
+        );
+        let (stdout, _, _) = run_exec_with_home(&project, home.path(), "", &script);
+        assert_result_fail(&stdout, "write");
+    }
+
+    /// A symlink in place of the root fails the launch before anything runs,
+    /// instead of granting whatever the link points at.
+    #[test]
+    fn managed_worktree_root_refuses_a_symlink() {
+        require_sandbox!();
+        let project = TempProject::new("wt-link");
+        project.write_file("f.txt", "x\n");
+        project.git_init();
+        let home = TempProject::new("wt-link-home");
+        let (root, other) = managed_paths(&project, home.path());
+        std::os::unix::fs::symlink(&other, &root).unwrap();
+        let (stdout, stderr, ok) = run_exec_with_home(
+            &project,
+            home.path(),
+            "[sandbox]\nallow_git_worktrees = true\n",
+            "echo RESULT:ran:OK\n",
+        );
+        assert!(!ok, "launch must fail.\n{stdout}\n{stderr}");
+        assert!(!stdout.contains("RESULT:ran"), "{stdout}");
+        assert!(
+            stderr.contains("allow_git_worktrees") && stderr.contains("symlink"),
+            "{stderr}"
+        );
+    }
 }

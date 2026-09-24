@@ -578,6 +578,52 @@ controlling terminal, and that terminal is the user's shell.
 
 Because credentials are inaccessible at both the filesystem and environment level, network-based exfiltration can only leak project source code and `~/.config/gh` tokens. That is a much smaller blast radius than full credential theft.
 
+#### Managed worktree root (`sandbox.allow_git_worktrees`)
+
+Off by default (#531). When on, the session gets one more project-grade tree:
+`~/.cplt-worktrees/<id>`, read, write and execute, so sub-agents can run
+`git worktree add "$CPLT_WORKTREE_ROOT/<name>"`. What that grants and what it
+does not:
+
+- **One repository's root, never the parent.** `<id>` is the first 128 bits of
+  SHA-256 over the canonical Git common directory, so every worktree of one
+  repository shares it and a second clone does not. `~/.cplt-worktrees` is not
+  granted, so other repositories' roots stay unreadable, unwritable and
+  non-executable. The path is derived, not configurable.
+- **User config only.** `.cplt.toml` cannot set or propose the key. A repository
+  cannot give itself a new executable tree outside its checkout.
+- **Steering and path tricks fail the launch.** The common directory is accepted
+  only in the two layouts Git writes (the gitdir itself, or
+  `<common>/worktrees/<name>`), so a planted `commondir` cannot point the launch
+  at another repository's root. `~/.cplt-worktrees` and the root must be real
+  directories owned by the user (set to mode 0700), and the canonical path must
+  equal the expected one. These checks run on every launch, because the agent
+  can delete the root and leave a symlink in its place. A `CPLT_CONFIG` inside
+  the root is refused, like one inside a named repository.
+- **No new trust.** The root is not a repository and is not added to the gh
+  scope, the audit's repository list, or the trust store. Approval stays keyed
+  on the repository (#527), so launching from a managed worktree uses the
+  existing approval and creates none.
+- **Protections.** On macOS the per-root denies apply at every depth under the
+  root: `.github/hooks`, `.claude/settings.json`, `.cplt.toml`, `.mcp.json`
+  and the rest of `PROTECTED_IN_ROOT`, the rename pins on their ancestors, and
+  each worktree's `.git` pointer file. The shared `.git/hooks` and `.git/config`
+  keep their existing denies, and `worktrees/<name>/config.worktree` is denied
+  by suffix. Verified by kernel tests in `tests/e2e_projects.rs`.
+- **Linux gap.** None of the in-worktree denies are enforced on Linux. Landlock
+  cannot subtract a path from the granted root, and bubblewrap re-binds only
+  paths that exist at launch, at fixed depths, never `<root>/<worktree>/<rel>`.
+  The shared `.git/hooks` keeps its bubblewrap bind where bubblewrap runs;
+  `.git/config` stays writable on Linux as it already does
+  (`LinuxCoverage::Gap` in `PROTECTED_IN_GITDIR`). The launch prints this gap
+  on Linux every time the key is on. This is the same class as a repository
+  nested under the project directory.
+- **Residuals on both platforms.** Everything written to the root outlives the
+  session: cplt never deletes worktrees or branches. The agent can also
+  `rm -rf` the root (the next launch recreates it) or plant files you later run
+  outside cplt, the same as in the project directory. The end-of-session audit
+  does not inspect the root; it prints a line saying so.
+
 
 #### Keychain access is all-or-nothing
 

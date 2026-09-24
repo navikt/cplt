@@ -435,6 +435,54 @@ For a monorepo of many small repositories, name only the ones the agent will
 open pull requests against. Every named root widens what `gh` may write to, and
 the gh guard is the thing standing between an agent and the wrong repository.
 
+## Worktrees for sub-agents (`sandbox.allow_git_worktrees`)
+
+Off by default. When on, cplt gives the session one directory where sub-agents
+can create Git worktrees for parallel work without touching your checkout:
+
+```bash
+cplt config set sandbox.allow_git_worktrees true           # every repository
+cplt config set --local sandbox.allow_git_worktrees true   # this checkout only
+```
+
+Inside the sandbox:
+
+```bash
+git worktree add "$CPLT_WORKTREE_ROOT/<name>" -b <branch>
+```
+
+What you get:
+
+- The root is `~/.cplt-worktrees/<id>`, where `<id>` is derived from the
+  repository's canonical Git common directory. It is not configurable.
+  Every linked worktree of one repository gets the same root. A separate clone
+  of the same GitHub repository gets a different one.
+- The root is granted read, write and execute, like a `--repo-dir` repository.
+  `~/.cplt-worktrees` itself and the roots of other repositories are not
+  granted.
+- The launch prints the root in the startup summary, exports it as
+  `CPLT_WORKTREE_ROOT`, and names it in the sandbox brief. With the key off the
+  variable is not set, even if your shell has one.
+- The same persistence denies apply as in the project: the shared `.git/hooks`
+  and `.git/config`, each worktree's `config.worktree` and `.git` pointer file,
+  and `.github/hooks`, `.claude/settings.json`, `.cplt.toml` and the rest of
+  the per-root list inside every worktree. On macOS these hold at any depth. On
+  Linux only the shared `.git` protections apply, and only where bubblewrap
+  runs. See [SECURITY.md](../SECURITY.md#managed-worktree-root-sandboxallow_git_worktrees).
+- Worktrees and branches persist after the session. cplt never removes them.
+  Clean up with `git worktree remove` and `git branch -d` when you are done.
+- The end-of-session audit does not cover the worktrees yet. It prints a line
+  saying so. Review them with `git worktree list`.
+
+The launch fails, rather than running without the root, if it cannot be
+granted: the launch directory is not in a Git repository, the root or
+`~/.cplt-worktrees` is a symlink, is not a directory, or is owned by another
+user, or the repository's `commondir` does not match the layout Git writes.
+
+The key is accepted only in your own config, global or local. A `.cplt.toml`
+cannot set it or propose it. There it is an unknown key: it is reported and
+never applied.
+
 ## Quick setup
 
 `cplt settings` browses and changes settings interactively. It stages edits, shows their source and security impact, and writes validated TOML atomically. For scripts, CI, or a direct non-interactive edit, use `cplt config set`:
