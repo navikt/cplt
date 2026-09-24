@@ -3363,8 +3363,9 @@ pub const PROTECTED_IN_ROOT: &[Protected] = &[
     // rest of `.pi/` (skills, prompts, themes) is ordinary content and stays
     // writable. Pi is open source (MIT, github.com/earendil-works/pi; the npm
     // package ships readable `dist/` JS), so the loader can be checked rather
-    // than guessed. This mirrors the decision this repo already made HOST-side, where `~/.pi/agent` denies `extensions` and `settings.json`
-    // for exactly these reasons (`Agent::host_persistence_denies`).
+    // than guessed. This mirrors the decision this repo already made HOST-side,
+    // where `~/.pi/agent` denies `extensions` and `settings.json` for exactly
+    // these reasons (`Agent::host_persistence_denies`).
     Protected {
         rel: ".pi/extensions",
         tree: true,
@@ -3483,7 +3484,7 @@ pub const PROTECTED_IN_GITDIR: &[Protected] = &[
     //
     // Nothing legitimate writes it from inside a session: `git clone` and
     // `git remote set-head` write it, and neither runs against an existing
-    // sandboxed repo. `git fetch` since 2.46 sets it when it is *missing*: that
+    // sandboxed repo. `git fetch` since 2.48 sets it when it is *missing*: that
     // write is denied, so the fetch prints `error: couldn't set
     // 'refs/remotes/origin/HEAD'` and then succeeds anyway — every
     // remote-tracking branch still updates, exit status still 0 (verified on git

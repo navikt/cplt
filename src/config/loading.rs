@@ -90,7 +90,10 @@ impl Config {
 
     /// Merge with the per-repo user config (#340) as a layer above this one.
     ///
-    /// The ladder is `Default/Preset < Global < Repo < Local < CLI`. Booleans
+    /// The ladder is `Default/Preset < Repo < Global < Local < CLI`: an approved
+    /// `.cplt.toml` proposal is applied after this merge and only where no
+    /// explicit layer set the key, except a proposal that turns a guard on,
+    /// which wins over an explicit `false` (`apply_repo_config`). Booleans
     /// see local and global as separate layers, so the resolver can name which
     /// one a value came from (`Resolved::bool_layer`). Scalars and lists are
     /// overlaid first — local `Some` wins, lists union — and the rest of

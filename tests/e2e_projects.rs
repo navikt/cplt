@@ -3407,11 +3407,9 @@ else
         *"Operation not permitted"*|*"not permitted"*|*"Permission denied"*|*"sandbox"*|*"deny("*)
             echo "RESULT:gradle_build:FAIL:sandbox_deny"
             ;;
-        # No usable JDK in the sandbox's environment: a host setup problem,
-        # not a denial. Anything else is unexplained and must fail (#126).
-        *"JAVA_HOME is set to an invalid directory"*|*"Unable to locate a Java Runtime"*|*"No Java runtime present"*)
-            echo "RESULT:gradle_build:OK:known_non_sandbox_error"
-            ;;
+        # No known-error arm: gradle_available() proved `gradle --version`
+        # works on the host, so any failure here, a "missing" JDK included,
+        # is what a sandbox read deny looks like and must fail (#126).
         *)
             echo "RESULT:gradle_build:FAIL:unknown_error"
             ;;
