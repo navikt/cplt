@@ -3022,55 +3022,59 @@ mod tests {
     /// is what keeps it byte-identical for a user who never opted in.
     #[test]
     fn shim_dir_is_write_denied_once_it_exists() {
-        // Not under the system temp dir: that is a writable tree of its own,
-        // and would make `~/.local` a pinned ancestor rather than the root.
-        let tmp = tempfile::Builder::new()
-            .prefix(".cplt-shim-home-")
-            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
-            .expect("tempdir");
-        let home = std::fs::canonicalize(tmp.path()).expect("canonical home");
-        let project = std::path::Path::new("/projects/app");
-        let local = home.join(".local");
-        let shims = home.join(".local/share/cplt/bin");
-        let extra_write = [local.clone()];
-        let mut opts = test_options(project, &home);
-        opts.extra_write = &extra_write;
+        // The profile resolves tool dirs from XDG_DATA_HOME, which other tests
+        // set; without the lock the two profiles below can differ.
+        crate::with_env_lock_no_xdg(|| {
+            // Not under the system temp dir: that is a writable tree of its own,
+            // and would make `~/.local` a pinned ancestor rather than the root.
+            let tmp = tempfile::Builder::new()
+                .prefix(".cplt-shim-home-")
+                .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+                .expect("tempdir");
+            let home = std::fs::canonicalize(tmp.path()).expect("canonical home");
+            let project = std::path::Path::new("/projects/app");
+            let local = home.join(".local");
+            let shims = home.join(".local/share/cplt/bin");
+            let extra_write = [local.clone()];
+            let mut opts = test_options(project, &home);
+            opts.extra_write = &extra_write;
 
-        let before = generate_profile(&opts, &[]);
-        assert!(
-            !before.contains("cplt PATH shims") && !before.contains(".local/share/cplt"),
-            "no shim rules before the user opts in"
-        );
-        // Byte-identical, not just free of shim rules: a directory next to
-        // (and above) the shim dir changes nothing until the shim dir exists.
-        std::fs::create_dir_all(home.join(".local/share/cplt")).expect("mkdir parent");
-        std::fs::create_dir_all(home.join(".local/share/other")).expect("mkdir other");
-        assert_eq!(generate_profile(&opts, &[]), before);
-
-        std::fs::create_dir_all(&shims).expect("mkdir shims");
-        let p = generate_profile(&opts, &[]);
-        let deny = format!("(deny file-write* (subpath \"{}\"))", shims.display());
-        let allow = format!("(allow file-write* (subpath \"{}\"))", local.display());
-        let deny_at = p.rfind(&deny).unwrap_or_else(|| panic!("missing {deny}"));
-        let allow_at = p.rfind(&allow).unwrap_or_else(|| panic!("missing {allow}"));
-        assert!(
-            deny_at > allow_at,
-            "the deny must come after the allow it narrows"
-        );
-        for pinned in [home.join(".local/share/cplt"), home.join(".local/share")] {
-            let rule = format!(
-                "(deny file-write-unlink (literal \"{}\"))",
-                pinned.display()
+            let before = generate_profile(&opts, &[]);
+            assert!(
+                !before.contains("cplt PATH shims") && !before.contains(".local/share/cplt"),
+                "no shim rules before the user opts in"
             );
-            assert!(p.contains(&rule), "missing rename pin {rule}");
-        }
-        assert!(
-            !p.contains(&format!(
-                "(deny file-write-unlink (literal \"{}\"))",
-                local.display()
-            )),
-            "the grant's root itself is not pinned"
-        );
+            // Byte-identical, not just free of shim rules: a directory next to
+            // (and above) the shim dir changes nothing until the shim dir exists.
+            std::fs::create_dir_all(home.join(".local/share/cplt")).expect("mkdir parent");
+            std::fs::create_dir_all(home.join(".local/share/other")).expect("mkdir other");
+            assert_eq!(generate_profile(&opts, &[]), before);
+
+            std::fs::create_dir_all(&shims).expect("mkdir shims");
+            let p = generate_profile(&opts, &[]);
+            let deny = format!("(deny file-write* (subpath \"{}\"))", shims.display());
+            let allow = format!("(allow file-write* (subpath \"{}\"))", local.display());
+            let deny_at = p.rfind(&deny).unwrap_or_else(|| panic!("missing {deny}"));
+            let allow_at = p.rfind(&allow).unwrap_or_else(|| panic!("missing {allow}"));
+            assert!(
+                deny_at > allow_at,
+                "the deny must come after the allow it narrows"
+            );
+            for pinned in [home.join(".local/share/cplt"), home.join(".local/share")] {
+                let rule = format!(
+                    "(deny file-write-unlink (literal \"{}\"))",
+                    pinned.display()
+                );
+                assert!(p.contains(&rule), "missing rename pin {rule}");
+            }
+            assert!(
+                !p.contains(&format!(
+                    "(deny file-write-unlink (literal \"{}\"))",
+                    local.display()
+                )),
+                "the grant's root itself is not pinned"
+            );
+        });
     }
 
     /// #522: macOS grants exactly the shared home config list, the same one
