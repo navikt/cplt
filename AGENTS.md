@@ -196,7 +196,9 @@ separate, staged decision that needs maintainer sign-off.
 With the key unset, generated profiles must be byte-identical to the previous release, and
 the PR is required to demonstrate that, not just assert it.
 
-#264 tracks which keys are off by default today.
+#264 (pinned) is the inventory of default-off keys and holds the promotion criteria. A PR that
+adds a default-off key adds its row there; a PR that flips a default links there and moves the
+row to "Already flipped". A default flips only when every promotion criterion in #264 holds.
 
 ## Key patterns
 
