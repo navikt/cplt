@@ -370,7 +370,7 @@ cplt has a built-in blocklist covering most of these: [`blocked-domains.txt`](bl
 | **4b. DNS tunneling** | Encode data in DNS queries | Not inspected; DNS bypasses the proxy | ❌ **Not stopped** |
 | **4c. Reverse shell** | Connect back via ngrok | Non-standard ports blocked; `ngrok.io` blocked when proxy enabled; localhost blocked | ⚠️ **Partially mitigated** |
 | **5. Binary staging** | Drop RAT into cache dir and execute | **Kernel-blocked by default.** `~/Library/Caches` has no `process-exec` or `file-map-executable`, and `/tmp` exec is denied. `--allow-cache-exec <SUBDIR>` grants exec to one named subdir, and the write+exec risk applies there. `--allow-exec <PATH>` grants exec on a named tool prefix, but never write: a grant overlapping the project dir or an `allow.write` grant is refused at startup on both backends. | ✅ **Stopped** (⚠️ opt-in exemption available) |
-| **Worm propagation** | Republish infected packages | Can't read npm tokens (in ~/.npmrc, kernel-blocked) | ✅ **Stopped** |
+| **Worm propagation** | Republish infected packages | Can't read npm tokens (in ~/.npmrc, kernel-blocked), unless the user turned on `sandbox.allow_build_credentials` or `allow.read ~/.npmrc` | ✅ **Stopped** (⚠️ opt-in exemption available) |
 
 ### Honest gaps
 
@@ -932,6 +932,10 @@ Files always denied (hard blocks):
 Files denied by default, overridable via `--allow-read` for private registries:
 
 - `~/.npmrc` (npm registry configuration)
+
+`sandbox.allow_build_credentials` (config-only, default off, marked dangerous, [#463](https://github.com/navikt/cplt/issues/463)) re-allows `~/.npmrc`, `~/.gradle/gradle.properties` and `~/.m2/settings.xml` as the same per-file grants three `allow.read` lines would produce. **With it on, the agent can read every registry token in those files and send it anywhere the network policy allows.** The proxy and egress allowlist are then the only control between those tokens and the outside. Each file goes through `first_party_read_target`: a symlink into a credential directory or onto another credential file, a directory, or a user-owned hardlink is refused with a warning, so `~/.npmrc -> ~/.ssh/id_ed25519` does not become a grant on the key. A target with an SBPL-unsafe character, or a file that fails to resolve for any reason but absence, is refused with a warning too. A `--deny-path` or `deny.paths` entry covering a file drops it from the grant. `.cplt.toml` cannot set the key.
+
+The grant is read-only on macOS. On Linux it is read-only for `~/.npmrc` only: `~/.m2/settings.xml` and `~/.gradle/gradle.properties` sit inside the read/write `~/.m2` and `~/.gradle` tool-directory grants, which Landlock cannot carve a file out of, so both are readable and writable whether the key is on or off. A user deny on either is enforced only by a Bubblewrap mount mask; without Bubblewrap it has no effect on them, and cplt warns at launch naming each file.
 
 #### Symlink attack protection
 

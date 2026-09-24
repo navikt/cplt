@@ -283,6 +283,17 @@ pub fn validate_config(toml_text: &str) -> Vec<ConfigDiagnostic> {
                     .to_string(),
             });
         }
+        if sandbox
+            .get("allow_build_credentials")
+            .and_then(toml::Value::as_bool)
+            == Some(true)
+        {
+            diagnostics.push(ConfigDiagnostic {
+                level: DiagnosticLevel::Warning,
+                message: "sandbox.allow_build_credentials = true lets the agent read every registry token in ~/.npmrc, ~/.gradle/gradle.properties and ~/.m2/settings.xml (DANGEROUS)"
+                    .to_string(),
+            });
+        }
         if sandbox.get("allow_docker").and_then(toml::Value::as_bool) == Some(true) {
             diagnostics.push(ConfigDiagnostic {
                 level: DiagnosticLevel::Warning,
@@ -483,6 +494,17 @@ quiet = false
                 d.level == DiagnosticLevel::Warning && d.message.contains("DANGEROUS")
             })
         );
+    }
+
+    #[test]
+    fn validate_warns_about_build_credentials() {
+        let diagnostics = validate_config("[sandbox]\nallow_build_credentials = true\n");
+        assert!(diagnostics.iter().any(|d| {
+            d.level == DiagnosticLevel::Warning
+                && d.message.contains("allow_build_credentials")
+                && d.message.contains("DANGEROUS")
+        }));
+        assert!(validate_config("[sandbox]\nallow_build_credentials = false\n").is_empty());
     }
 
     #[test]

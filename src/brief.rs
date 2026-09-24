@@ -891,6 +891,7 @@ mod tests {
             // #257 added this after this branch forked; the fixture is a
             // full literal, so every new field lands here.
             keychain_substitute: false,
+            allow_build_credentials: false,
             allow_msbuild: false,
             allow_tmp_exec: false,
             allow_cache_exec: Vec::new(),

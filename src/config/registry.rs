@@ -431,6 +431,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "sandbox",
+        key: "allow_build_credentials",
+        value_type: ConfigValueType::Bool,
+        dangerous: true,
+        default_display: "false",
+        description: "\u{26a0}\u{fe0f}  DANGEROUS: Let the agent read ~/.npmrc, ~/.gradle/gradle.properties and ~/.m2/settings.xml (the files only; read-only on macOS, while Linux leaves the Maven and Gradle files read/write either way). Exposes every registry token in them, not only the one the project uses.",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
         key: "gh_proxy",
         value_type: ConfigValueType::Bool,
         dangerous: false,
@@ -1023,6 +1031,14 @@ bool_keys! {
         baseline = |_: PresetBaseline| false,
         resolved = |r: &Resolved| r.keychain_substitute;
 
+    /// Config-only (#463): a credential grant belongs in reviewed config,
+    /// not in a flag typed once.
+    allow_build_credentials, "sandbox", "allow_build_credentials",
+        cli = |_: &CliFlags| FeatureToggle::UseDefault,
+        config = |c: &Config| c.sandbox.allow_build_credentials,
+        baseline = |_: PresetBaseline| false,
+        resolved = |r: &Resolved| r.allow_build_credentials;
+
     /// The config layer folds in the deprecated `sandbox.gh_proxy` spelling.
     gh_guard_enabled, "gh_guard", "enabled",
         cli = |c: &CliFlags| c.gh_guard,
@@ -1179,6 +1195,13 @@ mod tests {
         assert!(inherit.dangerous);
         let tmp_exec = lookup_key("sandbox.allow_tmp_exec").unwrap();
         assert!(tmp_exec.dangerous);
+        let build_creds = lookup_key("sandbox.allow_build_credentials").unwrap();
+        assert!(build_creds.dangerous);
+        assert_eq!(build_creds.default_display, "false");
+        assert!(
+            super::super::repo::repo_key_target(build_creds).is_none(),
+            "a repo must not be able to propose the user's registry tokens"
+        );
 
         let quiet = lookup_key("sandbox.quiet").unwrap();
         assert!(!quiet.dangerous);

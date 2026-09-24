@@ -1674,6 +1674,30 @@ fn merge_tool_path_env_overrides(resolved: &mut config::Resolved, home: &Path) -
     roots
 }
 
+/// Grant the build-host credential files read-only when
+/// `sandbox.allow_build_credentials` is on (#463).
+///
+/// They are added to `allow_read` as canonical paths, the same form an
+/// `allow.read "~/.npmrc"` line resolves to, so each backend applies its
+/// existing per-file override of the `DENIED_HOME_SUBPATHS` deny and nothing
+/// else. With the key off this is never called, and the policy is untouched.
+fn merge_build_credentials(resolved: &mut config::Resolved, home: &Path) {
+    for grant in cplt::sandbox::build_credential_grants(home, &resolved.deny_paths) {
+        match grant {
+            Ok(path) => {
+                if !resolved.allow_read.contains(&path) {
+                    resolved.allow_read.push(path);
+                }
+            }
+            Err((named, why)) => ui::warn(&format!(
+                "sandbox.allow_build_credentials: {} is not granted: {why}. Point it at \
+                 a regular file, or grant the target with allow.read if you mean to.",
+                named.display()
+            )),
+        }
+    }
+}
+
 /// The `Repositories:` rows for the startup summary.
 ///
 /// Always includes the launch repository, so a consumer that reads this as "the
@@ -4687,6 +4711,9 @@ impl HostProbe {
     /// tool roots, so they must not be able to drift apart.
     fn probe(resolved: &mut config::Resolved, home_dir: &Path, project_dir: &Path) -> Self {
         let tool_roots = merge_tool_path_env_overrides(resolved, home_dir);
+        if resolved.allow_build_credentials {
+            merge_build_credentials(resolved, home_dir);
+        }
         let tool_discovery = discover::discover_tools(home_dir, &tool_roots);
         Self {
             home_dir: home_dir.to_path_buf(),

@@ -579,6 +579,7 @@ The settings below are machine-specific or local CLI preferences, so `.cplt.toml
 | `sandbox.audit` | local output preference, not project sandbox policy |
 | `sandbox.gradle_init` | writes to the machine's Gradle user home, not project policy |
 | `sandbox.inherit_env` | too dangerous for repo config, it would affect every team member |
+| `sandbox.allow_build_credentials` | hands the agent the user's own registry tokens from `$HOME`, and a repo cannot grant home paths |
 | `allow.exec` | exec paths differ per machine, and a repo must not be able to make one of its own trees executable |
 | `sandbox.allow_cache_exec` | cache paths differ per machine |
 | `sandbox.allow_cache_exec_any` | too broad for repo policy |
@@ -625,6 +626,36 @@ cplt config explain                       # list all keys with descriptions
 cplt config explain sandbox.pass_env      # explain a specific key
 cplt config validate                      # check for syntax errors and unknown keys
 ```
+
+## Build-host credentials (`sandbox.allow_build_credentials`)
+
+Off by default. Marked dangerous. Config-only: there is no CLI flag, and `.cplt.toml` cannot set it.
+
+```bash
+cplt config set sandbox.allow_build_credentials true
+```
+
+It grants read access to three files, and nothing else:
+
+- `~/.npmrc`
+- `~/.gradle/gradle.properties`
+- `~/.m2/settings.xml`
+
+A Node or JVM build that pulls from an authenticated registry, such as GitHub Packages or Nexus, needs one of these. Without it the build fails at dependency resolution even with the network open, typically as a 401 from `pnpm install` or Gradle. The failure comes from filesystem policy, not the proxy, so nothing in the error points at cplt. See [#463](https://github.com/navikt/cplt/issues/463).
+
+**Turning it on exposes those tokens to the agent.** It can read every token in the three files, not only the one for the registry the project uses. It can also send them anywhere the network policy allows. The key narrows nothing. It replaces three separate `allow.read` lines with one reviewed decision.
+
+What it does, exactly:
+
+- The files only. Neither backend gets a directory grant or a write grant from this key. On macOS the grant is read-only; on Linux it is read-only for `~/.npmrc` only (see the Linux note below). This is the same per-file override an `allow.read "~/.npmrc"` line produces: on macOS a literal re-allow emitted after the default deny, on Linux a read-only Landlock rule on the file.
+- A file that does not exist is skipped.
+- A file that is a symlink is granted at its target, like `allow.read`, as long as the target is a regular file of its own. It is refused, with a warning at launch, when it resolves into a credential directory (`~/.ssh`, `~/.aws`, ...) or onto another credential file, is a directory, or is a hardlink you own with more than one name. So `~/.npmrc -> ~/.ssh/id_ed25519` does not become a grant on the key. A target whose path holds a character that is unsafe in a macOS sandbox profile (such as `"`) is refused the same way, as is a file cplt cannot resolve for a reason other than absence (a symlink loop, say). The startup summary lists only the files actually granted.
+- A `--deny-path` or `deny.paths` entry covering one of the files keeps this key from granting it. On macOS and for `~/.npmrc` on Linux, that makes the file unreadable. For the Maven and Gradle files on Linux, see the note below.
+- `~/.m2/settings-security.xml`, `~/.cargo/credentials*` and `~/.nuget/NuGet.Config` are not included. Use `allow.read` for those.
+
+On Linux, `~/.m2/settings.xml` and `~/.gradle/gradle.properties` are already readable and writable inside the sandbox whether this key is on or off, because Landlock cannot deny a file inside the granted `~/.m2` and `~/.gradle` tool directories (see [Private registries](known-impacts.md#private-registries)). On Linux the key therefore changes only `~/.npmrc`. On macOS it changes all three, and the files stay unwritable. A deny on either of the two Linux files takes effect only when Bubblewrap is active and mount-masks it. Without Bubblewrap the deny does nothing for them: they stay readable and writable, and cplt names each one in a warning at launch.
+
+If you only need one of the files, a single `allow.read` line is narrower. `cplt init --global` still proposes exactly that: an `allow.read` entry for each file it finds credentials in.
 
 ## Configuration file
 
