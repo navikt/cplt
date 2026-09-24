@@ -1042,11 +1042,13 @@ impl Agent {
                 // to keep this grant identical to the hand-written rules it
                 // replaces: the Linux FsRule carried `execute: true` and macOS
                 // reached `~/.copilot` through the blanket `(allow
-                // process-exec)`. Whether Copilot needs to execve anything from
-                // its config dir is unverified and is exactly the question
-                // #324 asks; this is a refactor and deliberately does not
-                // answer it. Dropping `process_exec` here would withdraw
-                // execve, not break dlopen.
+                // process-exec)`. On Linux, Copilot CLI 1.0.88 was traced
+                // with `strace -f -e trace=execve` (a prompt, the grep tool and
+                // a shell call) and exec'd nothing under `~/.copilot`: its
+                // bundled binaries run from `~/.cache/copilot/pkg` (#324).
+                // `sandbox.deny_copilot_dir_exec` drops `process_exec` here on
+                // Linux via `deny_copilot_dir_exec`; it stays set by default
+                // until the key has been out long enough to flip.
                 vec![AgentDir {
                     path: home.join(".copilot"),
                     write: true,
@@ -1996,6 +1998,17 @@ fn dsh_home(home: &Path) -> PathBuf {
         expanded
     } else {
         std::env::current_dir().map_or(expanded.clone(), |cwd| cwd.join(&expanded))
+    }
+}
+
+/// `sandbox.deny_copilot_dir_exec` (#324): withdraw execve from `~/.copilot`.
+///
+/// Call before [`canonicalize_agent_dirs`], which may rewrite the path. Only
+/// the Linux callers apply it; see the grant in [`Agent::config_dirs`].
+pub fn deny_copilot_dir_exec(dirs: &mut [AgentDir], home: &Path) {
+    let copilot = home.join(".copilot");
+    for dir in dirs.iter_mut().filter(|d| d.path == copilot) {
+        dir.process_exec = false;
     }
 }
 

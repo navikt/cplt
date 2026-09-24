@@ -2209,6 +2209,107 @@ print('CONNECTED')
         );
     }
 
+    /// `sandbox.deny_copilot_dir_exec` (#324): a program stored in `~/.copilot`
+    /// runs with the key off and is refused with it on, through the real
+    /// launch path. Reading and writing there keep working either way.
+    #[test]
+    fn deny_copilot_dir_exec_refuses_exec_from_dot_copilot() {
+        require_landlock!();
+        use std::os::unix::fs::PermissionsExt;
+
+        let project = create_test_project();
+        let home = tempfile::tempdir().expect("Failed to create temp home");
+        // Present, so SEA extraction does not spawn the fake outside the sandbox.
+        fs::create_dir_all(home.path().join(".cache/copilot/pkg/universal/1.0.63")).unwrap();
+        let dot_copilot = home.path().join(".copilot");
+        fs::create_dir_all(&dot_copilot).unwrap();
+        let probe = dot_copilot.join("probe");
+        fs::write(&probe, "#!/bin/sh\necho PROBE_RAN\n").unwrap();
+        fs::set_permissions(&probe, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let bin_dir = project.path().join(".fake-bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let fake_copilot = bin_dir.join("copilot");
+        fs::write(
+            &fake_copilot,
+            format!(
+                "#!/bin/sh\necho written > \"{0}/w\" && cat \"{0}/w\"\n\"{1}\" || echo EXEC_REFUSED\n",
+                dot_copilot.display(),
+                probe.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&fake_copilot, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin_dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+
+        // Landlock alone, then under Bubblewrap when it is installed: the key
+        // must hold on both paths.
+        let backends: &[bool] = if bwrap_available() {
+            &[false, true]
+        } else {
+            &[false]
+        };
+        for &bwrap in backends {
+            let run = |on: bool| {
+                let cfg = tempfile::tempdir().unwrap();
+                let cfg_file = cfg.path().join("config.toml");
+                fs::write(
+                    &cfg_file,
+                    format!("[sandbox]\ndeny_copilot_dir_exec = {on}\nuse_bubblewrap = {bwrap}\n"),
+                )
+                .unwrap();
+                let out = cplt_cmd()
+                    .args([
+                        "--yes",
+                        "--no-validate",
+                        "--quiet",
+                        "--agent",
+                        "copilot",
+                        "--project-dir",
+                        &project.path().to_string_lossy(),
+                    ])
+                    .env("HOME", home.path())
+                    .env("PATH", &path)
+                    .env("CPLT_CONFIG", &cfg_file)
+                    .output()
+                    .expect("Failed to execute cplt");
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            };
+
+            let off = run(false);
+            assert!(
+                off.contains("written"),
+                "bwrap={bwrap} off: not writable: {off}"
+            );
+            assert!(
+                off.contains("PROBE_RAN"),
+                "bwrap={bwrap} off: exec failed: {off}"
+            );
+
+            let on = run(true);
+            assert!(
+                on.contains("written"),
+                "bwrap={bwrap} on: not writable: {on}"
+            );
+            assert!(
+                !on.contains("PROBE_RAN"),
+                "bwrap={bwrap} on: exec ran: {on}"
+            );
+            assert!(
+                on.contains("EXEC_REFUSED"),
+                "bwrap={bwrap} on: no run: {on}"
+            );
+        }
+    }
+
     // ── Bubblewrap namespace isolation ─────────────────────────────
     //
     // These tests verify the optional Bubblewrap layer on top of Landlock +

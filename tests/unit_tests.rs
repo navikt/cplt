@@ -9329,6 +9329,7 @@ allow_msbuild = false
 gradle_init = false
 deny_nested_git = false
 refuse_invalid_repo_config = false
+deny_copilot_dir_exec = false
 allow_docker = false
 allow_cache_exec = []
 allow_cache_exec_any = false

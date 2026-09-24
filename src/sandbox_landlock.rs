@@ -1040,6 +1040,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         // and is emitted by the agent_dirs loop below, execute included — that
         // execve grant is carried over from the rule this replaced, not
         // required by the .node addons, which dlopen with READ_FILE (#243).
+        // `sandbox.deny_copilot_dir_exec` withdraws it (#324).
         //
         // Copilot SEA cache — auto-updaters download newer versions here.
         // Execute is required for Node to spawn the newer ripgrep / helpers.
@@ -4685,8 +4686,44 @@ mod tests {
             rule.access.execute,
             ".copilot keeps the execve grant the hand-written rule carried. NOT \
              for the .node addons — Landlock EXECUTE is execve-only and dlopen \
-             needs READ_FILE (#243). #324 asks whether it is needed at all"
+             needs READ_FILE (#243). `sandbox.deny_copilot_dir_exec` drops it (#324)"
         );
+    }
+
+    /// `sandbox.deny_copilot_dir_exec` (#324): with the key the `.copilot` rule
+    /// loses execute and keeps read and write; every other rule is unchanged.
+    #[test]
+    fn deny_copilot_dir_exec_drops_only_execute_on_dot_copilot() {
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let rules = |deny: bool| {
+            let mut agent_dirs = crate::agent::Agent::Copilot.config_dirs(&home);
+            if deny {
+                crate::agent::deny_copilot_dir_exec(&mut agent_dirs, &home);
+            }
+            let mut config = test_config(&project, &home);
+            config.agent_dirs = &agent_dirs;
+            generate_policy(&config).fs_rules
+        };
+        let (off, on) = (rules(false), rules(true));
+        assert_eq!(off.len(), on.len());
+        let dot_copilot = home.join(".copilot");
+        for (a, b) in off.iter().zip(&on) {
+            assert_eq!(a.path, b.path);
+            if a.path == dot_copilot {
+                assert!(a.access.execute, "key off keeps execute");
+                assert!(!b.access.execute, "key on drops execute");
+                assert!(b.access.read && b.access.write, "read and write stay");
+                let restored = FsAccess {
+                    execute: true,
+                    ..b.access
+                };
+                assert_eq!(a.access, restored, "only execute differs");
+            } else {
+                assert_eq!(a.access, b.access, "{} must not change", a.path.display());
+            }
+        }
+        assert!(on.iter().any(|r| r.path == dot_copilot));
     }
 
     #[test]

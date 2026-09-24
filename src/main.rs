@@ -5198,6 +5198,10 @@ fn assemble_sandbox(
 
     // Compute agent-specific sandbox directories
     let mut agent_dirs = active_agent.config_dirs(home_dir);
+    // Linux only: macOS keeps `~/.copilot` as it was (#324).
+    if cfg!(target_os = "linux") && resolved.deny_copilot_dir_exec {
+        agent::deny_copilot_dir_exec(&mut agent_dirs, home_dir);
+    }
 
     // Pre-create agent directories before entering sandbox.
     // Agents like OpenCode crash if their data/config dirs don't exist,
@@ -7002,6 +7006,9 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
     // ── the policy a launch would build, for the rules below ──
     let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
     let mut agent_dirs = active_agent.config_dirs(&home_dir);
+    if cfg!(target_os = "linux") && resolved.deny_copilot_dir_exec {
+        agent::deny_copilot_dir_exec(&mut agent_dirs, &home_dir);
+    }
     agent::canonicalize_agent_dirs(&mut agent_dirs);
     let keychain_substitute = cplt::sandbox::keychain_substitute(
         active_agent,

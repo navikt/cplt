@@ -494,6 +494,7 @@ impl Config {
         let deny_nested_git = bools.deny_nested_git;
 
         let refuse_invalid_repo_config = bools.refuse_invalid_repo_config;
+        let deny_copilot_dir_exec = bools.deny_copilot_dir_exec;
 
         let allow_docker = bools.allow_docker;
 
@@ -672,6 +673,7 @@ impl Config {
             gradle_init,
             deny_nested_git,
             refuse_invalid_repo_config,
+            deny_copilot_dir_exec,
             allow_docker,
             allow_tmp_exec,
             allow_cache_exec,
@@ -1058,6 +1060,9 @@ impl Resolved {
     #[must_use]
     pub fn exec_tool_dir_warnings(&self, home: &Path, agent: crate::agent::Agent) -> Vec<String> {
         let mut agent_dirs = agent.config_dirs(home);
+        if cfg!(target_os = "linux") && self.deny_copilot_dir_exec {
+            crate::agent::deny_copilot_dir_exec(&mut agent_dirs, home);
+        }
         crate::agent::canonicalize_agent_dirs(&mut agent_dirs);
         self.write_grants_over_exec_tool_dirs(home, &agent_dirs)
             .into_iter()
@@ -4042,6 +4047,14 @@ mod precedence {
                 cli_on: None,
                 cli_off: None,
                 get: |r| r.refuse_invalid_repo_config,
+                default: false,
+                preset: None,
+            },
+            Ladder {
+                key: "sandbox.deny_copilot_dir_exec",
+                cli_on: None,
+                cli_off: None,
+                get: |r| r.deny_copilot_dir_exec,
                 default: false,
                 preset: None,
             },

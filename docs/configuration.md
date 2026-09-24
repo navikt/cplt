@@ -700,6 +700,7 @@ The settings below are machine-specific or local CLI preferences, so `.cplt.toml
 | `sandbox.gradle_init` | writes to the machine's Gradle user home, not project policy |
 | `sandbox.deny_nested_git` | a staged hardening switch, see [Blocking new nested `.git` entries](#blocking-new-nested-git-entries-sandboxdeny_nested_git) |
 | `sandbox.refuse_invalid_repo_config` | decides how a repo's own broken config is treated, so the repo cannot set it; see [Refusing an invalid `.cplt.toml`](#refusing-an-invalid-cplttoml-sandboxrefuse_invalid_repo_config) |
+| `sandbox.deny_copilot_dir_exec` | a staged hardening switch, see [No execute on `~/.copilot`](#no-execute-on-copilot-sandboxdeny_copilot_dir_exec) |
 | `sandbox.inherit_env` | too dangerous for repo config, it would affect every team member |
 | `sandbox.allow_build_credentials` | hands the agent the user's own registry tokens from `$HOME`, and a repo cannot grant home paths |
 | `allow.exec` | exec paths differ per machine, and a repo must not be able to make one of its own trees executable |
@@ -829,6 +830,18 @@ cplt config set sandbox.keychain_substitute true
 On, it removes the read+write grant on `~/Library/Keychains` for an agent that can authenticate another way, and hands that credential over instead. For Copilot that is a GitHub token: an exported `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN`, or, when none is set, what `gh auth token --hostname github.com` prints at launch, passed in as `GH_TOKEN`. The startup summary shows `Keychain: denied` and names the source. With the key off, the profile and the agent's environment are exactly what they were before the key existed.
 
 What it costs for Copilot: the token sits in the agent's environment, Copilot authenticates as `gh`'s account rather than a separate `copilot /login` account, and an exported token GitHub rejects becomes a sign-in error where Copilot would otherwise have fallen back to its stored login. Unset the key or the token variable to get the old behaviour back. The per-agent details, and what was and was not verified, are in [SECURITY.md](../SECURITY.md#keychain-access-is-all-or-nothing).
+
+## No execute on `~/.copilot` (`sandbox.deny_copilot_dir_exec`)
+
+On Linux, the Copilot agent gets read, write and execute on `~/.copilot`. A directory the agent can both write to and run programs from is a place to drop a binary and run it, the same pair cplt refuses when `allow.exec` asks for it ([#324](https://github.com/navikt/cplt/issues/324)). Copilot does not need the execute part: traced on Linux, Copilot CLI 1.0.88 ran nothing from `~/.copilot` for a prompt, its search tool or a shell command. Its bundled programs (`rg`, `tgrep`) run from `~/.cache/copilot/pkg`, and its native `.node` addons load with read access alone.
+
+```bash
+cplt config set sandbox.deny_copilot_dir_exec true
+```
+
+With the key on, `~/.copilot` stays readable and writable and loses execute, under Landlock and under Bubblewrap. Off by default for now, because anything you have set up to run as a program stored under `~/.copilot` stops working: a plugin, MCP server or hook whose command is a path in there. Commands started through an interpreter (`node ~/.copilot/...`, `bash ~/.copilot/...`) keep working, because the interpreter is what gets executed.
+
+It has no effect on macOS, where the profile is unchanged. The trace was done on Linux only.
 
 ## Configuration file
 
