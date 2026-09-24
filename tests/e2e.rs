@@ -6884,10 +6884,16 @@ paths = [
     fn e2e_planted_nested_git_is_reported() {
         require_sandbox!();
         let (_tmp, project, home) = nested_git_fixture();
+        // R1: a link out through /tmp that leads straight back in. The lookup
+        // ends inside the project today; `/tmp/…` can be re-aimed tomorrow.
+        let hop = PathBuf::from(format!("/tmp/cplt-e2e-hop-{}", std::process::id()));
         let stderr = exec_session(
             &project,
             &home,
-            "mkdir e e3 s1 s2 s3 s4 && printf '[core]\\n\\tfsmonitor = x\\n' > e/config && \
+            &format!(
+                "mkdir keep/app && ln -s \"$PWD/keep\" {hop} && ln -s {hop} pkgs3 && \
+             ln -s {hop}/app pkgs4 && \
+             mkdir e e3 s1 s2 s3 s4 && printf '[core]\\n\\tfsmonitor = x\\n' > e/config && \
              mkdir e/objects e/refs && echo 'ref: refs/heads/main' > e/HEAD && \
              printf 'gitdir: ../e\\n' > s1/.git && ln -s ../e s2/.git && mv e3 s3/.git && \
              ln -s ../e s4/.GIT && \
@@ -6901,7 +6907,10 @@ paths = [
              mkdir -p l2/in/objects l2/in/refs && echo 'ref: refs/heads/main' > l2/in/HEAD && \
              chmod 311 l2 && \
              printf '[core]\\n\\tfsmonitor = x\\n' >> e0/config && echo x > keep/file",
+                hop = hop.display()
+            ),
         );
+        std::fs::remove_file(&hop).ok();
         // Before any assertion, so the tempdir can be removed either way.
         std::fs::set_permissions(
             project.join("l2"),
@@ -6981,13 +6990,20 @@ paths = [
             // down, and a dangling one that something outside can arm later.
             format!("{} -> ../outer", project.join("pkgs").display()),
             format!("{} -> ../later", project.join("lat").display()),
+            // R1: out through /tmp and back in, both spellings.
+            format!("{} -> {}", project.join("pkgs3").display(), hop.display()),
+            format!(
+                "{} -> {}/app",
+                project.join("pkgs4").display(),
+                hop.display()
+            ),
             // B2: a directory the walk cannot list, hiding `l2/in`.
             format!("  {}\n", project.join("l2").display()),
         ] {
             assert!(stderr.contains(&line), "missing `{line}`: {stderr}");
         }
         assert!(
-            stderr.contains("could not list these directories"),
+            stderr.contains("not permitted to list these directories"),
             "{stderr}"
         );
         // A link that stays inside the project is not a link report.

@@ -3767,11 +3767,16 @@ pub(crate) const NESTED_SCAN_LIMIT: usize = 20_000;
 /// see there.
 #[derive(Default)]
 pub(crate) struct WalkExtras {
-    /// Every symlink met below the roots, dangling ones included. Not followed.
+    /// Every symlink met below the roots that leads to a directory or
+    /// dangles. Not followed. A link to a file is left out: git does not run
+    /// in one.
     pub(crate) links: Vec<PathBuf>,
-    /// Directories whose listing failed for a reason other than `NotFound`:
-    /// nothing below them was looked at.
+    /// Directories the walk was not permitted to list: nothing below them was
+    /// looked at, and `chmod` is how a session would hide something there.
     pub(crate) unreadable: Vec<PathBuf>,
+    /// Directories whose listing failed for any other reason than
+    /// `PermissionDenied` or `NotFound`.
+    pub(crate) failed: Vec<PathBuf>,
 }
 
 /// Repositories nested below `roots`: the walk behind bubblewrap's `nested_repo_roots` (#498), with the depth left to the caller.
@@ -3786,13 +3791,14 @@ pub(crate) struct WalkExtras {
 /// wrapper (see `nested_repo_roots`).
 ///
 /// `extras: Some` is the session-end check's walk. It also
-/// - records every symlink (and counts it against the budget), and tests one
-///   that leads to a directory with `is_repo`, following the link for that
+/// - records every symlink that leads to a directory or dangles (and counts
+///   it against the budget), and tests one that leads to a directory with
+///   `is_repo`, following the link for that
 ///   test only, never descending: git run in `<root>/tools` obeys the config
 ///   of the repository `tools` points at, wherever that is;
 /// - records directories it could not list, since `chmod` hides what is below;
-/// - skips `.git` in any letter case: on a case-insensitive volume `.GIT` is
-///   the gitdir.
+/// - skips `.git` in any letter case (on a case-insensitive volume `.GIT` is
+///   the gitdir), and `.tox`, `.nox` and `.direnv` too.
 pub(crate) fn repo_walk(
     roots: &[&Path],
     max_depth: usize,
@@ -3816,6 +3822,10 @@ pub(crate) fn repo_walk(
         ".next",
         ".cache",
     ];
+    /// The audit walk's own additions, left out of the bubblewrap walk so
+    /// that one stays as it was: tool-managed virtualenvs, full of symlinks
+    /// out of the project that would each be reported.
+    const AUDIT_SKIP: &[&str] = &[".tox", ".nox", ".direnv"];
     let audit = extras.is_some();
 
     let mut found: Vec<PathBuf> = Vec::new();
@@ -3830,10 +3840,12 @@ pub(crate) fn repo_walk(
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(e) => {
-                if let Some(x) = extras.as_deref_mut()
-                    && e.kind() != std::io::ErrorKind::NotFound
-                {
-                    x.unreadable.push(dir);
+                if let Some(x) = extras.as_deref_mut() {
+                    match e.kind() {
+                        std::io::ErrorKind::NotFound => {}
+                        std::io::ErrorKind::PermissionDenied => x.unreadable.push(dir),
+                        _ => x.failed.push(dir),
+                    }
                 }
                 continue;
             }
@@ -3848,7 +3860,10 @@ pub(crate) fn repo_walk(
                 let t = e.file_type().ok()?;
                 if t.is_dir() {
                     Some((e.path(), true))
-                } else if audit && t.is_symlink() {
+                } else if audit
+                    && t.is_symlink()
+                    && std::fs::metadata(e.path()).map_or(true, |m| m.is_dir())
+                {
                     Some((e.path(), false))
                 } else {
                     None
@@ -3886,7 +3901,9 @@ pub(crate) fn repo_walk(
             }
             let skipped = path.file_name().is_some_and(|n| {
                 let n = n.to_string_lossy();
-                SKIP.contains(&n.as_ref()) || (audit && n.eq_ignore_ascii_case(".git"))
+                SKIP.contains(&n.as_ref())
+                    || (audit
+                        && (n.eq_ignore_ascii_case(".git") || AUDIT_SKIP.contains(&n.as_ref())))
             });
             if !skipped {
                 queue.push_back((path, depth + 1));
@@ -4578,6 +4595,7 @@ mod tests {
         let in_capital_target = mk("Target/x");
         mk("node_modules/y");
         let in_upper_git = mk(".GIT/z");
+        let in_tox = mk(".tox/t");
         mk("a/b/c/four");
         mk("one");
         // A dangling `.git` symlink, and a symlinked directory to a repository.
@@ -4600,6 +4618,11 @@ mod tests {
         assert!(
             !audit.contains(&in_upper_git),
             "audit skips .GIT: {audit:?}"
+        );
+        // R5: `.tox` is skipped by the audit walk only.
+        assert!(
+            bwrap.contains(&in_tox) && !audit.contains(&in_tox),
+            "{audit:?}"
         );
     }
 
@@ -4674,5 +4697,18 @@ mod tests {
         std::fs::set_permissions(&l2, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(repos.is_empty(), "{repos:?}");
         assert_eq!(x.unreadable, vec![l2]);
+    }
+
+    /// R7: only `PermissionDenied` is recorded as unreadable; any other
+    /// listing failure (here, a root that is a file) goes to `failed`.
+    #[test]
+    fn the_audit_walk_separates_permission_from_other_failures() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("f");
+        std::fs::write(&file, "x").unwrap();
+        let mut x = WalkExtras::default();
+        repo_walk(&[&file], usize::MAX, has_dot_git, Some(&mut x));
+        assert!(x.unreadable.is_empty(), "{:?}", x.unreadable);
+        assert_eq!(x.failed, vec![file]);
     }
 }
