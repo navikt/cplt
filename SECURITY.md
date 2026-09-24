@@ -1386,7 +1386,7 @@ Repository maintainers can commit a `.cplt.toml` to configure sandbox settings f
 
 5. **Content-pinned approvals.** Trust entries store a SHA-256 hash of the approved `[propose]` values. If the maintainer changes any proposed value, previous approvals are automatically invalidated and the user must re-approve. Reordering array elements is hash-stable, thanks to a pre-sort. Approving a subset of the keys does not renew the rest: when the stored hash no longer matches, the previous approvals are dropped rather than merged, so the approved set becomes exactly the keys just accepted.
 
-6. **Additive-only semantics.** Repo config can enable features (`allow_docker = true`) but cannot disable anything set by the user's CLI flags or global config. Precedence: CLI > global config > approved repo permissions > defaults.
+6. **Additive-only semantics.** Repo config can enable features (`allow_docker = true`) but cannot disable anything set by the user's CLI flags, per-repo user config or global config. An approved boolean proposal applies only when no explicit layer set that key, so the order is: CLI > per-repo user config (`~/.config/cplt/local/<hash>.toml`) > global config > approved repo permissions > preset baseline and defaults. Approved list proposals (paths, ports, domains, `pass_env`) are appended to what the other layers produced. A proposal that turns a guard on is the exception: it is tighten-only, needs no approval, and applies even over an explicit `false`.
 
 7. **Path traversal rejection.** Paths in `.cplt.toml` containing `..` components are rejected at parse time, which prevents escape attempts like `../../.ssh`.
 

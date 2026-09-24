@@ -7,9 +7,9 @@ cplt resolves each setting in this order, highest first:
 1. CLI flags for the current run (`--with-proxy`, `--no-proxy`, `--proxy-port`, and so on)
 2. This project's per-repo user config, `~/.config/cplt/local/<hash>.toml` (see [Per-repo user config](#per-repo-user-config-config-set---local))
 3. The config file, `~/.config/cplt/config.toml`, or whatever `CPLT_CONFIG` points at
-4. Built-in defaults
+4. The preset baseline (`--preset`, `[sandbox] preset`), then built-in defaults
 
-Per-repo config (`.cplt.toml`) sits outside that hierarchy, as a separate layer with its own rules. See [Per-repo configuration](#per-repo-configuration-cplttoml).
+Per-repo config (`.cplt.toml`) is applied after those layers are merged, with its own rules. Its `[deny]` section, and any proposal that turns a guard on, always apply. Its other proposals do nothing until accepted with `cplt trust accept`. An accepted boolean takes effect only where none of layers 1 to 3 set the key, and accepted lists are appended. See [Per-repo configuration](#per-repo-configuration-cplttoml).
 
 Sessions that span several repositories are configured separately again — see [Working across several repositories](#working-across-several-repositories---repo-dir).
 
