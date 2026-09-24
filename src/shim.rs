@@ -302,7 +302,14 @@ pub fn sync_in(home: &Path, path_var: &str, skip: &[String], mode: SyncMode) -> 
     for agent in shimmable() {
         let names = agent.binary_names();
         let want = script(agent);
-        let is_current = |n: &str| std::fs::read_to_string(d.join(n)).is_ok_and(|c| c == want);
+        // Contents alone are not enough: a shim that lost its executable bit
+        // makes the name fall through to the next one on PATH, unsandboxed.
+        let is_current = |n: &str| {
+            use std::os::unix::fs::PermissionsExt;
+            let p = d.join(n);
+            std::fs::read_to_string(&p).is_ok_and(|c| c == want)
+                && std::fs::metadata(&p).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+        };
         // A shim of ours already there was vetted when it was first written.
         let vetted = names.iter().any(|n| is_ours(&d.join(n)));
         let is_skipped = skipped(agent, skip);
@@ -833,7 +840,23 @@ fn write_rc(home: &Path, rc: &RcFile) -> Result<Option<String>, String> {
     // by now, so it is replaced rather than reused.
     let first_edit = !current.lines().any(|l| l.trim_end() == BLOCK_BEGIN);
     let backed_up = existing.is_some() && first_edit;
+    // A backup path cplt did not record is someone else's file (or a
+    // symlink): copying over it would destroy it, skipping it would leave
+    // uninstall to delete it as ours.
+    if backed_up
+        && backup.symlink_metadata().is_ok()
+        && !read_manifest(home).contains(&entry("backup", &rc.path))
+    {
+        return Err(format!(
+            "{shown}: {} already exists and was not written by cplt; move it away, then run \
+             this again",
+            backup.display()
+        ));
+    }
     if backed_up {
+        // Our own stale backup: unlink first, so `copy` never writes through
+        // a symlink put in its place.
+        let _ = std::fs::remove_file(&backup);
         std::fs::copy(&rc.path, &backup)
             .map_err(|e| format!("{shown}: cannot back up to {}: {e}", backup.display()))?;
         record(entry("backup", &rc.path))?;
@@ -867,7 +890,7 @@ pub fn uninstall(home: &Path) -> Report {
         let Ok(contents) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let stripped = match replace_block(&contents, "") {
+        let mut stripped = match replace_block(&contents, "") {
             Ok(Some(s)) => s,
             Ok(None) => continue,
             Err(e) => {
@@ -881,6 +904,18 @@ pub fn uninstall(home: &Path) -> Report {
         } else {
             (!backup.exists(), backup.exists())
         };
+        // `upsert_block` put a newline before a block appended to a file that
+        // had none at EOF. The backup holds the original, so take exactly that
+        // separator back off when the block is still the last thing in the file.
+        let block_at_eof = contents
+            .lines()
+            .last()
+            .is_some_and(|l| l.trim_end() == BLOCK_END);
+        let had_no_eol = backup_ours
+            && std::fs::read(&backup).is_ok_and(|b| b.last().is_some_and(|c| *c != b'\n'));
+        if block_at_eof && had_no_eol && stripped.ends_with('\n') {
+            stripped.pop();
+        }
         // Once the block is gone and nothing else was added, a file the
         // install created goes too.
         let result = if created && stripped.trim().is_empty() {
@@ -1425,9 +1460,10 @@ echo 'goose version: v3'
         assert!(!home.path().join("missing").exists());
     }
 
-    /// A stale backup from an earlier install is replaced at the next first
-    /// edit, and uninstall removes only what its manifest lists, leaving a
-    /// `~/.local/share` that was already there.
+    /// A stale backup from an earlier install (the user took the block out by
+    /// hand) is replaced at the next first edit, and uninstall removes only
+    /// what its manifest lists, leaving a `~/.local/share` that was already
+    /// there.
     #[test]
     fn install_refreshes_stale_backups_and_uninstall_follows_the_manifest() {
         let home = tempfile::tempdir().unwrap();
@@ -1435,9 +1471,11 @@ echo 'goose version: v3'
         std::fs::create_dir_all(&share).unwrap();
         let profile = home.path().join(".profile");
         let bash_profile = home.path().join(".bash_profile");
-        std::fs::write(&profile, "new\n").unwrap();
+        std::fs::write(&profile, "old\n").unwrap();
         std::fs::write(&bash_profile, "bp\n").unwrap();
-        std::fs::write(backup_path(&profile), "stale\n").unwrap();
+        let r = install(home.path(), "", "/bin/bash", Agent::Copilot, &[]);
+        assert!(r.refused.is_empty(), "{r:?}");
+        std::fs::write(&profile, "new\n").unwrap();
         let r = install(home.path(), "", "/bin/bash", Agent::Copilot, &[]);
         assert!(r.refused.is_empty(), "{r:?}");
         assert_eq!(
@@ -1458,6 +1496,79 @@ echo 'goose version: v3'
         assert!(!home.path().join(".zshenv").exists());
         assert!(!home.path().join(".local/share/cplt").exists());
         assert!(share.is_dir(), "a directory the install did not make stays");
+    }
+
+    /// #571 review: a `<file>.cplt-backup` cplt did not record is not
+    /// overwritten, and the rc file it belongs to is left unedited.
+    #[test]
+    fn install_refuses_an_unrecorded_backup_path() {
+        let home = tempfile::tempdir().unwrap();
+        let profile = home.path().join(".profile");
+        std::fs::write(&profile, "mine\n").unwrap();
+        std::fs::write(backup_path(&profile), "user's own\n").unwrap();
+        let zshenv = home.path().join(".zshenv");
+        std::fs::write(&zshenv, "z\n").unwrap();
+        let elsewhere = home.path().join("elsewhere");
+        std::fs::write(&elsewhere, "target\n").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, backup_path(&zshenv)).unwrap();
+        let r = install(home.path(), "", "/bin/bash", Agent::Copilot, &[]);
+        assert_eq!(r.refused.len(), 2, "{r:?}");
+        assert_eq!(std::fs::read_to_string(&profile).unwrap(), "mine\n");
+        assert_eq!(std::fs::read_to_string(&zshenv).unwrap(), "z\n");
+        assert_eq!(
+            std::fs::read_to_string(backup_path(&profile)).unwrap(),
+            "user's own\n"
+        );
+        assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "target\n");
+        let r = uninstall(home.path());
+        assert!(r.refused.is_empty(), "{r:?}");
+        assert!(backup_path(&profile).exists());
+        assert!(backup_path(&zshenv).symlink_metadata().is_ok());
+    }
+
+    /// #571 review: an rc file with no newline at EOF comes back byte for
+    /// byte, and one with a newline keeps it.
+    #[test]
+    fn uninstall_restores_a_missing_eof_newline() {
+        let home = tempfile::tempdir().unwrap();
+        let profile = home.path().join(".profile");
+        let zshenv = home.path().join(".zshenv");
+        std::fs::write(&profile, "export A=1").unwrap();
+        std::fs::write(&zshenv, "export B=1\n").unwrap();
+        let r = install(home.path(), "", "/bin/bash", Agent::Copilot, &[]);
+        assert!(r.refused.is_empty(), "{r:?}");
+        assert!(
+            std::fs::read_to_string(&profile)
+                .unwrap()
+                .contains(BLOCK_BEGIN)
+        );
+        let r = uninstall(home.path());
+        assert!(r.refused.is_empty(), "{r:?}");
+        assert_eq!(std::fs::read(&profile).unwrap(), b"export A=1");
+        assert_eq!(std::fs::read(&zshenv).unwrap(), b"export B=1\n");
+    }
+
+    /// #571 review: a shim with the right contents but no executable bit is
+    /// not current; the sync rewrites it executable.
+    #[test]
+    fn sync_restores_a_shim_that_lost_its_executable_bit() {
+        let home = tempfile::tempdir().unwrap();
+        let shims = dir(home.path());
+        std::fs::create_dir_all(&shims).unwrap();
+        let bin = home.path().join("bin");
+        exe(&bin, "copilot", "#!/bin/sh\n");
+        let path = join(&[&shims, &bin]);
+        let _ = sync_in(home.path(), &path, &[], SyncMode::Background);
+        let shim = shims.join("copilot");
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let r = sync_in(home.path(), &path, &[], SyncMode::Background);
+        assert_eq!(r.done.len(), 1, "{r:?}");
+        let mode = std::fs::metadata(&shim).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+        assert_eq!(
+            std::fs::read_to_string(&shim).unwrap(),
+            script(Agent::Copilot)
+        );
     }
 
     /// A symlinked dotfile stays a symlink; its target gets the block.

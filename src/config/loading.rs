@@ -160,7 +160,7 @@ impl Config {
                 .flat_map(|a| a.binary_names().iter().copied())
                 .collect();
             return Err(ConfigError::Validation(format!(
-                "shell.skip names {bad:?}, which is not an agent cplt shims. Known: {}",
+                "shell.skip names {bad:?}, which is not a known cplt-shimmable agent (known: {})",
                 known.join(", ")
             )));
         }
