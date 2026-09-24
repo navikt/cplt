@@ -2567,6 +2567,8 @@ fn write_exec_deny_comes_after_every_broad_exec_allow() {
         "/Users/test/.bun/install",
         "/Users/test/Library/pnpm/package-manager-store",
         "/Users/test/.local/share/pnpm/package-manager-store",
+        // Executable and write-denied: `emit_copilot_pkg_denies` follows.
+        "/Users/test/Library/Caches/copilot/pkg",
     ];
     const PREFIX: &str = "(allow process-exec (subpath \"";
     for (i, _) in p.match_indices(PREFIX) {
@@ -5996,6 +5998,35 @@ fn profile_copilot_caches_write_deny_follows_a_user_allow_write() {
             "no write allow may follow {rule}:\n{tail}"
         );
     }
+}
+
+/// An `allow.write` on `~/Library/Caches` denies `process-exec` on the whole
+/// tree after every allow; the default Copilot `pkg` must get its exec back
+/// after that deny (spawn-helper, rg), and its write deny must still follow.
+#[test]
+fn profile_copilot_caches_keep_exec_under_a_user_allow_write() {
+    let write = [std::path::PathBuf::from("/Users/test/Library/Caches")];
+    let p = generate_profile(
+        &SandboxConfig {
+            extra_write: &write,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    let exec_deny = p
+        .rfind("(deny process-exec (subpath \"/Users/test/Library/Caches\"))")
+        .expect("the allow.write exec deny must be in the profile");
+    let exec_allow = p
+        .rfind("(allow process-exec (subpath \"/Users/test/Library/Caches/copilot/pkg\"))")
+        .expect("the pkg exec allow must be in the profile");
+    assert!(
+        exec_allow > exec_deny,
+        "pkg exec must be re-allowed after the deny"
+    );
+    let write_deny = p
+        .rfind("(deny file-write* (subpath \"/Users/test/Library/Caches/copilot/pkg\"))")
+        .unwrap();
+    assert!(write_deny > exec_allow, "the write deny must stay last");
 }
 
 /// `~/Library/Caches/copilot` symlinked somewhere the agent cannot write:

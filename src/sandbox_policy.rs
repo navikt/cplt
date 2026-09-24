@@ -2408,7 +2408,9 @@ pub fn copilot_pkg_dirs(
         return Err(format!(
             "cplt refuses the Copilot cache {}: it passes through the symlink {} in \
              {why} {}, which the sandbox can write. Copilot runs its runtime from \
-             there on the host, outside the sandbox. Remove the link and let Copilot \
+             there on the host, outside the sandbox. This default is checked even \
+             when a cache variable moves the cache, because Copilot's loader still \
+             searches it for a newer runtime. Remove the link and let Copilot \
              recreate the directory.",
             default.display(),
             link.display(),

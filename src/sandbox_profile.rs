@@ -245,6 +245,7 @@ pub fn generate_profile_with_playwright_socket_dir(
         &project_roots,
         config.extra_write,
         config.scratch_dir,
+        &copilot_exec_carve_outs(config),
     );
     // Same reason: Copilot's SEA cache, the default and any directory a cache
     // variable moved it to (#374), keeps its write deny over every allow above.
@@ -1441,6 +1442,19 @@ fn copilot_default_pkg_spellings(home_dir: &Path) -> Vec<String> {
     spellings(&pkg, &crate::config::canonicalize_deepest(&pkg))
 }
 
+/// The default Copilot `pkg` spellings for [`emit_user_write_exec_denies`] to
+/// re-allow exec on: an `allow.write` over `~/Library/Caches` would otherwise
+/// deny `process-exec` there after `emit_tool_dirs` allowed it, and Copilot's
+/// `spawn-helper` and `rg` would stop running. Its write deny still comes
+/// later, from `emit_copilot_pkg_denies`.
+fn copilot_exec_carve_outs(config: &SandboxConfig) -> Vec<String> {
+    if config.agent.needs_copilot_dir() {
+        copilot_default_pkg_spellings(config.home_dir)
+    } else {
+        Vec::new()
+    }
+}
+
 /// Exec carve-out for one Copilot SEA `pkg` directory.
 fn emit_copilot_pkg_exec(sb: &mut String, pkg: &str) {
     sbpl!(sb, "(allow file-map-executable (subpath \"{pkg}\"))");
@@ -2027,7 +2041,9 @@ fn emit_exec_write_denies(sb: &mut String, extra_exec: &[PathBuf]) {
 /// - the scratch dir, which is write+exec by design;
 /// - the [`EXEC_IN_WRITABLE`] trees, which were already write+execute before
 ///   the grant. The deny exists to stop a grant *creating* that pair, not to
-///   revoke a documented one.
+///   revoke a documented one;
+/// - Copilot's default `pkg` directory, executable before the grant and still
+///   write-denied after it by `emit_copilot_pkg_denies`.
 ///
 /// Everything else loses execute: an `allow.write` covering `~/.cargo` or
 /// `~/.rustup` makes a read-only tool tree writable, and that pair is new.
@@ -2037,6 +2053,7 @@ fn emit_user_write_exec_denies(
     project_roots: &[String],
     extra_write: &[PathBuf],
     scratch_dir: Option<&Path>,
+    copilot_pkg: &[String],
 ) {
     if extra_write.is_empty() {
         return;
@@ -2058,6 +2075,7 @@ fn emit_user_write_exec_denies(
             .filter(|e| e.macos)
             .map(|e| Path::new(home).join(e.path)),
     );
+    carve_outs.extend(copilot_pkg.iter().map(PathBuf::from));
     for path in carve_outs.iter().filter(|p| granted(p)) {
         if validate_sbpl_path(path).is_err() {
             continue;
