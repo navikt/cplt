@@ -488,6 +488,8 @@ impl Config {
 
         let deny_nested_git = bools.deny_nested_git;
 
+        let refuse_invalid_repo_config = bools.refuse_invalid_repo_config;
+
         let allow_docker = bools.allow_docker;
 
         let allow_tmp_exec = bools.allow_tmp_exec;
@@ -664,6 +666,7 @@ impl Config {
             allow_msbuild,
             gradle_init,
             deny_nested_git,
+            refuse_invalid_repo_config,
             allow_docker,
             allow_tmp_exec,
             allow_cache_exec,
@@ -4010,6 +4013,14 @@ mod precedence {
                 cli_on: None,
                 cli_off: None,
                 get: |r| r.deny_nested_git,
+                default: false,
+                preset: None,
+            },
+            Ladder {
+                key: "sandbox.refuse_invalid_repo_config",
+                cli_on: None,
+                cli_off: None,
+                get: |r| r.refuse_invalid_repo_config,
                 default: false,
                 preset: None,
             },

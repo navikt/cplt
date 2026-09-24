@@ -908,6 +908,7 @@ mod tests {
             allow_gpg_signing: false,
             deny_clipboard: false,
             deny_nested_git: false,
+            refuse_invalid_repo_config: false,
             allow_jvm_attach: false,
             gradle_init: false,
             allow_docker: false,

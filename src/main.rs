@@ -2542,8 +2542,19 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             repo_propose = loaded.config.propose.clone();
         }
         Ok(None) => {} // No .cplt.toml in HEAD — warn_repo_config_discrepancy explains why
+        // #385 M-01: a file that does not parse loses its `[deny]` with it.
+        // Warned by default; `sandbox.refuse_invalid_repo_config` makes it fatal.
+        Err(e) if resolved.refuse_invalid_repo_config => bail!(
+            "Cannot load .cplt.toml: {e}\n  \
+             sandbox.refuse_invalid_repo_config is on, so cplt will not launch without \
+             the [deny] rules this file may hold. Fix the file and rerun."
+        ),
         Err(e) => {
-            ui::warn(&format!("Failed to load .cplt.toml: {e}"));
+            ui::warn(&format!(
+                "Failed to load .cplt.toml: {e}\n  \
+                 Its [deny] section is NOT applied. Set \
+                 sandbox.refuse_invalid_repo_config to refuse the launch instead."
+            ));
         }
     }
 
@@ -2603,6 +2614,14 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             // thing lost is a tightening, and the loss is stated in the same
             // breath. The session is less restricted than that repository asked
             // for, and the operator is told exactly that.
+            // `sandbox.refuse_invalid_repo_config` makes both fatal (#385 M-01).
+            Err(e) if resolved.refuse_invalid_repo_config => bail!(
+                "Cannot read .cplt.toml in the named repository {}: {e}\n  \
+                 sandbox.refuse_invalid_repo_config is on, so cplt will not launch without \
+                 the [deny] rules this file may hold. Fix the file, or drop the repository \
+                 from the named set.",
+                root.dir.display()
+            ),
             Err(e) => {
                 ui::warn(&format!(
                     "Cannot read .cplt.toml in the named repository {}: {e}\n  \

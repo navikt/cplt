@@ -399,6 +399,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "sandbox",
+        key: "refuse_invalid_repo_config",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "false",
+        description: "Refuse to launch when a repository's .cplt.toml cannot be read or parsed, naming the error, instead of warning and launching without its [deny] rules. Covers the launch repository and every named repository.",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
         key: "allow_docker",
         value_type: ConfigValueType::Bool,
         dangerous: true,
@@ -1035,6 +1043,14 @@ bool_keys! {
         config = |c: &Config| c.sandbox.deny_nested_git,
         baseline = |_: PresetBaseline| false,
         resolved = |r: &Resolved| r.deny_nested_git;
+
+    /// Config-only and off by default (staged rollout, #385 M-01): with it on,
+    /// a typo in a committed `.cplt.toml` stops every launch in that repo.
+    refuse_invalid_repo_config, "sandbox", "refuse_invalid_repo_config",
+        cli = |_: &CliFlags| FeatureToggle::UseDefault,
+        config = |c: &Config| c.sandbox.refuse_invalid_repo_config,
+        baseline = |_: PresetBaseline| false,
+        resolved = |r: &Resolved| r.refuse_invalid_repo_config;
 
     allow_docker, "sandbox", "allow_docker",
         cli = |c: &CliFlags| c.allow_docker,

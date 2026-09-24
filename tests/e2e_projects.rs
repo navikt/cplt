@@ -1964,6 +1964,80 @@ if cat secrets/k.txt >/dev/null 2>&1; then echo "RESULT:launch_secret:OK"; else 
         );
     }
 
+    /// #385 M-01: `sandbox.refuse_invalid_repo_config` turns an unparseable
+    /// `.cplt.toml`, in the launch repository or a named one, into a refused
+    /// launch that names the parse error. Off, both warn and launch as before.
+    #[test]
+    fn refuse_invalid_repo_config_refuses_only_when_on() {
+        let bad = "this is not = = toml [[[\n";
+        let broken = TempProject::new("refuse-invalid-launch");
+        broken.write_file(".cplt.toml", bad);
+        broken.git_init();
+        let clean = TempProject::scaffold_node();
+        clean.git_init();
+        let named = TempProject::new("refuse-invalid-named");
+        named.write_file(".cplt.toml", bad);
+        named.git_init();
+        let named_path = named.canonical_path().to_string_lossy().to_string();
+
+        let config_home = TempProject::new("refuse-invalid-config");
+        let on = config_home.path().join("on.toml");
+        let off = config_home.path().join("off.toml");
+        fs::write(&on, "[sandbox]\nrefuse_invalid_repo_config = true\n").unwrap();
+        fs::write(&off, "[sandbox]\nrefuse_invalid_repo_config = false\n").unwrap();
+
+        // (config, project, extra args, expect refusal, text that must appear)
+        let cases: [(&Path, &TempProject, &[&str], bool, &str); 4] = [
+            (&on, &broken, &[], true, "Cannot load .cplt.toml"),
+            (&off, &broken, &[], false, "refuse_invalid_repo_config"),
+            (
+                &on,
+                &clean,
+                &["--repo-dir", &named_path],
+                true,
+                "named repository",
+            ),
+            (
+                &off,
+                &clean,
+                &["--repo-dir", &named_path],
+                false,
+                "NOT applied",
+            ),
+        ];
+        for (config, project, extra, refused, text) in cases {
+            let output = cplt_cmd()
+                .args(["--yes", "--no-validate", "--agent", "shell"])
+                .args(["--project-dir", &project.canonical_path().to_string_lossy()])
+                .args(extra)
+                .args(["--", "-c", "echo LAUNCHED"])
+                .env("CPLT_CONFIG", config)
+                .output()
+                .expect("cplt should run");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let what = format!("{}, {extra:?}", config.display());
+            assert_eq!(
+                output.status.success(),
+                !refused,
+                "{what}: exit status\nstdout: {stdout}\nstderr: {stderr}"
+            );
+            assert_eq!(
+                stdout.contains("LAUNCHED"),
+                !refused,
+                "{what}: did the command run?\nstdout: {stdout}\nstderr: {stderr}"
+            );
+            assert!(stderr.contains(text), "{what}: missing {text:?}\n{stderr}");
+            if refused {
+                // The refusal names the parse error, not just "invalid".
+                assert!(
+                    stderr.contains("TOML parse error") || stderr.contains("expected"),
+                    "{what}: the parse error must be named\n{stderr}"
+                );
+            }
+        }
+    }
+
     /// A tree the session was never given stays unreachable. Without this the
     /// two assertions above could both hold in a sandbox that grants
     /// everything.
