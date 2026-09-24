@@ -2205,6 +2205,19 @@ fn approval_from_scope(repo_scope: Option<String>) -> GateApproval {
 /// refused in any spelling and position, even as another flag's value — it
 /// bypasses exactly the rules the check relies on.
 pub fn merge_selector(args: &[&str]) -> Result<Option<String>, String> {
+    parse_merge_args(args).map(|m| m.selector.map(str::to_string))
+}
+
+/// A `gh pr merge` split into what the gate rewrites and what it keeps.
+struct MergeArgs<'a> {
+    selector: Option<&'a str>,
+    /// Every flag with its value, in order, except `--match-head-commit`.
+    flags: Vec<&'a str>,
+    /// Each `--match-head-commit` value the caller passed.
+    heads: Vec<&'a str>,
+}
+
+fn parse_merge_args<'a>(args: &[&'a str]) -> Result<MergeArgs<'a>, String> {
     const WITH_VALUE: &[&str] = &[
         "-R",
         "--repo",
@@ -2237,6 +2250,8 @@ pub fn merge_selector(args: &[&str]) -> Result<Option<String>, String> {
         return Err("`--admin` bypasses the branch rules this opt-in depends on".to_string());
     }
     let mut positionals = Vec::new();
+    let mut flags = Vec::new();
+    let mut heads = Vec::new();
     let mut end_of_flags = false;
     let mut it = args.iter();
     while let Some(&arg) = it.next() {
@@ -2248,25 +2263,41 @@ pub fn merge_selector(args: &[&str]) -> Result<Option<String>, String> {
             end_of_flags = true;
             continue;
         }
-        let name = arg.split_once('=').map_or(arg, |(name, _)| name);
+        let (name, inline) = arg
+            .split_once('=')
+            .map_or((arg, None), |(name, value)| (name, Some(value)));
         if WITH_VALUE.contains(&name) {
-            if name == arg {
-                it.next();
+            let value = inline.or_else(|| it.next().copied());
+            if name == "--match-head-commit" {
+                heads.push(value.unwrap_or_default());
+            } else {
+                flags.push(arg);
+                if inline.is_none() {
+                    flags.extend(value);
+                }
             }
-        } else if name.len() > 2 && !name.starts_with("--") && WITH_VALUE.contains(&&name[..2]) {
-            // `-b<value>`: a short flag with its value attached.
-        } else if !BOOLEAN.contains(&name) {
+        } else if (name.len() > 2 && !name.starts_with("--") && WITH_VALUE.contains(&&name[..2]))
+            || BOOLEAN.contains(&name)
+        {
+            // A boolean, or `-b<value>`: a short flag with its value attached.
+            flags.push(arg);
+        } else {
             return Err(format!(
                 "`{arg}` is not a flag cplt knows `gh pr merge` to take \
                  (spell short flags separately)"
             ));
         }
     }
-    match positionals.as_slice() {
-        ["pr", "merge"] => Ok(None),
-        ["pr", "merge", selector] => Ok(Some((*selector).to_string())),
-        _ => Err("expected at most one pull request selector".to_string()),
-    }
+    let selector = match positionals.as_slice() {
+        ["pr", "merge"] => None,
+        ["pr", "merge", selector] => Some(*selector),
+        _ => return Err("expected at most one pull request selector".to_string()),
+    };
+    Ok(MergeArgs {
+        selector,
+        flags,
+        heads,
+    })
 }
 
 /// Percent-encode a branch name for a REST path, keeping `/`.
@@ -2316,15 +2347,20 @@ fn rule_gates_merge(rule: &serde_json::Value) -> bool {
 ///   a later push dismisses ([`rule_gates_merge`]), and the account cannot bypass that
 ///   ruleset (`current_user_can_bypass == "never"`).
 ///
+/// On success it returns the argv to exec instead of `args`:
+/// `pr merge <number> <flags> --match-head-commit <headRefOid>`, pinned to the
+/// pull request and head that were checked. An agent-supplied
+/// `--match-head-commit` naming another commit is refused.
+///
 /// What this does not cover: the facts are read at merge time by a `gh` that
 /// runs in the agent's environment, so an agent that redirects gh's API traffic
-/// could forge them; and the base branch could be changed between this check
-/// and the merge.
+/// could forge them; and the pull request's base branch, or that branch's rules,
+/// could be changed between this check and the merge.
 pub fn check_merge_protection(
     args: &[&str],
     repo: Option<&str>,
     gh: &mut dyn FnMut(&[&str]) -> Result<String, String>,
-) -> Result<(), Refusal> {
+) -> Result<Vec<String>, Refusal> {
     let refuse = |reason: String| Refusal {
         headline: "'gh pr merge' is not allowed for this pull request.".to_string(),
         guidance: format!(
@@ -2345,31 +2381,38 @@ pub fn check_merge_protection(
         return Err(refuse("no repository was pinned for the merge".into()));
     };
     let repo = repo.strip_prefix("github.com/").unwrap_or(repo);
-    let selector = merge_selector(args).map_err(refuse)?;
+    let merge = parse_merge_args(args).map_err(refuse)?;
     // gh refuses `-R` without a selector, so a bare `gh pr merge` is looked up
     // without it: the caller runs every lookup with `GH_REPO` pinned to `repo`,
-    // as the merge itself runs, so gh resolves the current branch's pull request
-    // the same way for both. The selector stays a separate argument.
-    let mut view = vec!["pr", "view", "--json", "url,baseRefName,author"];
-    if let Some(selector) = selector.as_deref() {
+    // as the merge itself runs. The selector stays a separate argument.
+    let mut view = vec!["pr", "view", "--json", "url,baseRefName,author,headRefOid"];
+    if let Some(selector) = merge.selector {
         view.extend(["-R", repo, "--", selector]);
     }
     let pr = gh(&view).and_then(json).map_err(failed)?;
-    let (Some(url), Some(base), Some(author)) = (
+    let (Some(url), Some(base), Some(author), Some(head)) = (
         pr["url"].as_str(),
         pr["baseRefName"].as_str(),
         pr["author"]["login"].as_str(),
+        pr["headRefOid"].as_str().filter(|h| !h.is_empty()),
     ) else {
         return Err(failed(
-            "the pull request lookup returned no url, base or author".into(),
+            "the pull request lookup returned no url, base, author or head".into(),
         ));
     };
-    let pr_repo = url
+    let Some((_, number)) = url
         .strip_prefix("https://github.com/")
         .and_then(|rest| rest.split_once("/pull/"))
-        .map(|(r, _)| r);
-    if !pr_repo.is_some_and(|r| repos_match(r, repo)) {
+        .filter(|(r, n)| {
+            repos_match(r, repo) && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+        })
+    else {
         return Err(refuse(format!("pull request {url} is not in {repo}")));
+    };
+    if let Some(other) = merge.heads.iter().find(|h| **h != head) {
+        return Err(refuse(format!(
+            "--match-head-commit {other} is not the head of {url} ({head})"
+        )));
     }
     let viewer = gh(&["api", "user"]).and_then(json).map_err(failed)?;
     let Some(viewer) = viewer["login"].as_str() else {
@@ -2408,7 +2451,13 @@ pub fn check_merge_protection(
             .and_then(json)
             .map_err(failed)?;
         if ruleset["enforcement"] == "active" && ruleset["current_user_can_bypass"] == "never" {
-            return Ok(());
+            // Pin the merge to what was checked: gh would otherwise resolve a
+            // bare merge (or a branch selector) again, after the agent had a
+            // chance to switch branches or push.
+            let mut pinned = vec!["pr".to_string(), "merge".to_string(), number.to_string()];
+            pinned.extend(merge.flags.iter().map(|f| (*f).to_string()));
+            pinned.extend(["--match-head-commit".to_string(), head.to_string()]);
+            return Ok(pinned);
         }
     }
     Err(refuse(format!(

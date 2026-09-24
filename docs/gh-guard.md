@@ -428,7 +428,7 @@ What the gh/git guard stops, and what it does not.
 
 | Threat | How it's stopped |
 |--------|-----------------|
-| Agent merges a PR without human review | `gh pr merge` is in the Block tier. With `allow_pr_merge = true` it is allowed only for the account's own PR into a branch where a ruleset the account cannot bypass requires an approving review that a new push dismisses; `--admin` is always refused. Status checks alone do not count |
+| Agent merges a PR without human review | `gh pr merge` is in the Block tier. With `allow_pr_merge = true` it is allowed only for the account's own PR into a branch where a ruleset the account cannot bypass requires an approving review that a new push dismisses; `--admin` is always refused. Status checks alone do not count. The merge runs pinned to the checked PR number and head commit (`--match-head-commit`), so a bare merge cannot switch PRs after the check |
 | Agent deletes a repository | `gh repo delete` is in the Block tier |
 | Agent creates releases or uploads artifacts | `gh release create/upload` blocked |
 | Agent triggers CI workflows | `gh workflow run` blocked |

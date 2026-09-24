@@ -4073,6 +4073,9 @@ enum GateEffect {
     /// Run the real binary with `GH_REPO` pinned to this repository, so the
     /// operation cannot retarget away from the repo the guard approved.
     ExecScoped(String),
+    /// Like `ExecScoped`, but run `args` instead of the invocation: a merge the
+    /// protection check rewrote to the pull request number and head it checked.
+    ExecRewritten { repo: String, args: Vec<String> },
     /// Run the real binary exactly as invoked, with no `GH_REPO` pin. `notice`
     /// is printed to stderr first: warn and audit modes report the verdict they
     /// are declining to enforce.
@@ -4127,18 +4130,24 @@ fn decide_gh_gate(
             // A merge let through by `allow_pr_merge` still needs its ruleset condition.
             // Its lookups run with `GH_REPO` pinned as the merge will be; with no
             // pinned repository the check refuses before looking anything up.
+            // It returns the merge argv pinned to the number and head it checked.
+            let mut pinned = None;
             if a.check_merge_protection {
                 let repo = a.repo_scope.as_deref();
-                gh_proxy::check_merge_protection(&arg_refs, repo, &mut |lookup| {
-                    gh_lookup(repo.unwrap_or_default(), lookup)
-                })?;
+                pinned = Some(gh_proxy::check_merge_protection(
+                    &arg_refs,
+                    repo,
+                    &mut |lookup| gh_lookup(repo.unwrap_or_default(), lookup),
+                )?);
             }
-            Ok(a)
+            Ok((a, pinned))
         });
     match verdict {
-        Ok(approval) => match approval.repo_scope {
-            Some(repo) => GateEffect::ExecScoped(repo),
-            None => GateEffect::ExecPlain { notice: None },
+        Ok((approval, pinned)) => match (approval.repo_scope, pinned) {
+            (Some(repo), Some(args)) => GateEffect::ExecRewritten { repo, args },
+            (Some(repo), None) => GateEffect::ExecScoped(repo),
+            // The check refuses without a pinned repo, so a rewrite always has one.
+            (None, _) => GateEffect::ExecPlain { notice: None },
         },
         Err(refusal) => match policy.mode {
             config::EnforcementMode::Block => GateEffect::Refuse(refusal),
@@ -4207,6 +4216,9 @@ fn perform_gate_effect(
             ExitCode::FAILURE
         }
         GateEffect::ExecScoped(repo) => exec_real(real_binary, name, args, Some(&repo)),
+        GateEffect::ExecRewritten { repo, args } => {
+            exec_real(real_binary, name, &args, Some(&repo))
+        }
         GateEffect::ExecPlain { notice } => {
             if let Some(notice) = notice {
                 eprintln!("{notice}");
@@ -10178,7 +10190,7 @@ mod tests {
                     if rest.contains(&"-R") && selector.is_none() {
                         return Err("argument required when using the --repo flag".to_string());
                     }
-                    r#"{"url":"https://github.com/navikt/cplt/pull/5","baseRefName":"main","author":{"login":"me"}}"#
+                    r#"{"url":"https://github.com/navikt/cplt/pull/5","baseRefName":"main","author":{"login":"me"},"headRefOid":"abc123"}"#
                 }
                 ["api", "user"] => r#"{"login":"me"}"#,
                 ["api", p] if p.starts_with("repos/navikt/cplt/rules/branches/main") => rules,
@@ -10245,24 +10257,64 @@ mod tests {
             true,
             &mut merge_lookup(PROTECTED),
         );
+        assert_eq!(effect, pinned_merge(&["-R", "navikt/cplt", "--squash"]));
+    }
+
+    /// What an allowed merge execs: pinned to PR 5 and the head the fake reports.
+    fn pinned_merge(flags: &[&str]) -> GateEffect {
+        let mut args = gh_args(&["pr", "merge", "5"]);
+        args.extend(gh_args(flags));
+        args.extend(gh_args(&["--match-head-commit", "abc123"]));
+        GateEffect::ExecRewritten {
+            repo: "github.com/navikt/cplt".to_string(),
+            args,
+        }
+    }
+
+    fn check_merge(args: &[&str]) -> Result<Vec<String>, gh_proxy::Refusal> {
+        gh_proxy::check_merge_protection(
+            args,
+            Some("github.com/navikt/cplt"),
+            &mut merge_lookup(PROTECTED),
+        )
+    }
+
+    #[test]
+    fn pr_merge_of_the_current_branch_is_pinned_to_the_checked_pr_and_head() {
+        // gh refuses `-R` without a selector, so the current branch's pull
+        // request is looked up under the GH_REPO pin alone. The merge then runs
+        // on the number and head that lookup returned, not on whatever branch
+        // is checked out by the time gh runs. (Through the gate a bare merge
+        // also needs the cwd check against real git: see e2e_guards.)
         assert_eq!(
-            effect,
-            GateEffect::ExecScoped("github.com/navikt/cplt".to_string())
+            check_merge(&["pr", "merge", "--auto"]).unwrap(),
+            gh_args(&[
+                "pr",
+                "merge",
+                "5",
+                "--auto",
+                "--match-head-commit",
+                "abc123"
+            ])
+        );
+        // A selector is normalized to the number that was checked.
+        assert_eq!(
+            check_merge(&["pr", "merge", "-s", "--", "my-branch"]).unwrap(),
+            gh_args(&["pr", "merge", "5", "-s", "--match-head-commit", "abc123"])
         );
     }
 
     #[test]
-    fn pr_merge_of_the_current_branch_is_looked_up_without_a_repo_flag() {
-        // gh refuses `-R` without a selector, so the current branch's pull
-        // request is looked up under the GH_REPO pin alone. (Through the gate a
-        // bare merge also needs the cwd check against real git: see e2e_guards.)
-        let mut lookup = merge_lookup(PROTECTED);
-        let verdict = gh_proxy::check_merge_protection(
-            &["pr", "merge", "--auto"],
-            Some("github.com/navikt/cplt"),
-            &mut lookup,
+    fn pr_merge_refuses_a_match_head_commit_other_than_the_checked_head() {
+        let refusal =
+            check_merge(&["pr", "merge", "5", "--match-head-commit", "def456"]).unwrap_err();
+        assert!(refusal.to_string().contains("def456"), "{refusal}");
+        assert!(check_merge(&["pr", "merge", "5", "--match-head-commit=def456"]).is_err());
+        // The same head is kept once.
+        assert_eq!(
+            check_merge(&["pr", "merge", "--match-head-commit=abc123", "5"]).unwrap(),
+            gh_args(&["pr", "merge", "5", "--match-head-commit", "abc123"])
         );
-        assert!(verdict.is_ok(), "{verdict:?}");
     }
 
     #[test]
@@ -10294,11 +10346,7 @@ mod tests {
                 true,
                 &mut merge_lookup(rules(params)),
             );
-            assert_eq!(
-                effect,
-                GateEffect::ExecScoped("github.com/navikt/cplt".to_string()),
-                "{params}"
-            );
+            assert_eq!(effect, pinned_merge(&["-R", "navikt/cplt"]), "{params}");
         }
         // Neither set, a missing field, or a non-boolean: an approval could
         // outlive unreviewed pushes.
@@ -10354,7 +10402,7 @@ mod tests {
         let mut lookup = merge_lookup(PROTECTED);
         let mut elsewhere = |a: &[&str]| {
             match a {
-            ["pr", "view", ..] => Ok(r#"{"url":"https://github.com/someone/else/pull/5","baseRefName":"main","author":{"login":"me"}}"#.to_string()),
+            ["pr", "view", ..] => Ok(r#"{"url":"https://github.com/someone/else/pull/5","baseRefName":"main","author":{"login":"me"},"headRefOid":"abc123"}"#.to_string()),
             other => lookup(other),
         }
         };

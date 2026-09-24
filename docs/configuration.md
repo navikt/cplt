@@ -495,6 +495,14 @@ does not recognise. `--auto`, `--squash`, `--delete-branch` and the other
 ordinary flags pass. A merge queue alone does not count, and neither does
 classic branch protection, which the check does not read.
 
+The merge that runs is the one that was checked. The shim rewrites it to
+`gh pr merge <number> ... --match-head-commit <sha>` with the pull request
+number and head commit the check read, so a bare `gh pr merge` cannot land on
+another pull request after a `git checkout`, and a push after the check makes
+GitHub reject the merge. A `--match-head-commit` naming another commit is
+refused. What the check cannot pin is the base branch: its rules, or the pull
+request's base, could change between the check and the merge.
+
 **An approval rule is required.** Required status checks do not count on their
 own: the pull request's author controls what CI reports, by editing the
 workflows in the pull request or by posting a status through

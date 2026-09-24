@@ -1105,11 +1105,11 @@ case "$1 $2" in
       *" -R "*) echo "argument required when using the --repo flag" >&2; exit 1 ;;
       *) [ "$GH_REPO" = github.com/navikt/cplt ] || {{ echo "no repo: $GH_REPO" >&2; exit 1; }} ;;
     esac
-    echo '{{"url":"https://github.com/navikt/cplt/pull/5","baseRefName":"main","author":{{"login":"me"}}}}' ;;
+    echo '{{"url":"https://github.com/navikt/cplt/pull/5","baseRefName":"main","author":{{"login":"me"}},"headRefOid":"abc123"}}' ;;
   "api user") echo '{{"login":"me"}}' ;;
   "api repos/navikt/cplt/rules/branches/main?per_page=100") echo '{rules}' ;;
   "api repos/navikt/cplt/rulesets/7") echo '{{"enforcement":"active","current_user_can_bypass":"never"}}' ;;
-  "pr merge") echo MERGED ;;
+  "pr merge") echo "MERGED GH_REPO=$GH_REPO $*" ;;
   *) echo "unexpected: $*" >&2; exit 1 ;;
 esac
 "#
@@ -1152,13 +1152,31 @@ fn gh_gate_pr_merge_refused_without_the_opt_in() {
 #[test]
 fn gh_gate_pr_merge_allowed_into_a_protected_branch() {
     let (stdout, stderr, ok) = gh_gate_merge(&["pr", "merge", "5", "--squash"], MERGE_PROTECTED);
-    assert!(ok && stdout.contains("MERGED"), "{stdout}\n{stderr}");
+    assert!(ok, "{stdout}\n{stderr}");
+    assert_eq!(stdout.trim(), MERGED_5, "{stderr}");
 }
+
+/// The fake's record of the merge the gate exec'd: the checked number and head.
+const MERGED_5: &str =
+    "MERGED GH_REPO=github.com/navikt/cplt pr merge 5 --squash --match-head-commit abc123";
 
 #[test]
 fn gh_gate_pr_merge_of_the_current_branch_allowed_into_a_protected_branch() {
+    // gh would resolve a bare merge from the current branch a second time, after
+    // the check; the gate execs the number and head the check verified instead.
     let (stdout, stderr, ok) = gh_gate_merge(&["pr", "merge", "--squash"], MERGE_PROTECTED);
-    assert!(ok && stdout.contains("MERGED"), "{stdout}\n{stderr}");
+    assert!(ok, "{stdout}\n{stderr}");
+    assert_eq!(stdout.trim(), MERGED_5, "{stderr}");
+}
+
+#[test]
+fn gh_gate_pr_merge_refused_with_another_match_head_commit() {
+    let (stdout, stderr, ok) = gh_gate_merge(
+        &["pr", "merge", "--squash", "--match-head-commit", "def456"],
+        MERGE_PROTECTED,
+    );
+    assert!(!stdout.contains("MERGED"), "{stdout}");
+    assert_refused(&stderr, ok, "is not the head of");
 }
 
 #[test]
