@@ -2474,25 +2474,6 @@ print('CONNECTED')
     }
 
     #[test]
-    fn bwrap_landlock_still_blocks_sensitive_paths() {
-        require_bwrap!();
-        let project = create_test_project();
-
-        // Landlock (applied in-namespace by the re-entry helper) must still
-        // deny credential paths even though --ro-bind / / makes them visible
-        // in the mount table.
-        let (exit, stdout, _) = run_sandboxed_bwrap(
-            project.path(),
-            "ls ~/.ssh 2>&1 || cat ~/.aws/credentials 2>&1 || echo 'landlock blocked'",
-        );
-        assert_eq!(exit, 0);
-        assert!(
-            stdout.contains("landlock blocked") || stdout.contains("Permission denied"),
-            "Landlock must still deny sensitive paths with bwrap: {stdout}"
-        );
-    }
-
-    #[test]
     fn bwrap_user_namespace_maps_host_uid() {
         require_bwrap!();
         let project = create_test_project();
@@ -2544,10 +2525,9 @@ print('CONNECTED')
     // ── Bubblewrap capability probes (issue #113) ─────────────────
     //
     // These complement the bwrap tests above with PLANTED secrets in a fake
-    // HOME (the existing `bwrap_landlock_still_blocks_sensitive_paths` uses the
-    // real HOME and can pass vacuously) plus the two bwrap-only mount-namespace
-    // guarantees not yet asserted: a private /tmp that hides host temp files,
-    // and a read-only host filesystem.
+    // HOME, so the credential deny is asserted against files that exist, plus
+    // the two bwrap-only mount-namespace guarantees: a private /tmp that hides
+    // host temp files, and a read-only host filesystem.
 
     /// Run inside the sandbox with bubblewrap enabled and a custom HOME.
     fn run_sandboxed_home_bwrap(
