@@ -165,7 +165,7 @@ pub fn prepare_root_for(
             // will, and runs every check then.
             return Ok(root.clone());
         }
-        secure_dir(dir, label)?;
+        secure_dir(dir, label, create)?;
     }
     let canonical = std::fs::canonicalize(&root)
         .map_err(|e| format!("cannot resolve {}: {e}", root.display()))?;
@@ -186,13 +186,18 @@ pub fn prepare_root_for(
 /// refused by the kernel rather than by a separate `lstat`, and the owner
 /// check and `fchmod` apply to the directory that was opened, not to whatever
 /// the name points at by then.
-fn secure_dir(dir: &Path, label: &str) -> Result<(), String> {
+///
+/// `fix` is false for `doctor`, `check` and `--print-profile`: they check
+/// but never create the directory or change its mode.
+fn secure_dir(dir: &Path, label: &str, fix: bool) -> Result<(), String> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
-        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
-            return Err(format!("cannot create {label} {}: {e}", dir.display()));
+    if fix {
+        match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
+                return Err(format!("cannot create {label} {}: {e}", dir.display()));
+            }
+            _ => {}
         }
-        _ => {}
     }
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -225,7 +230,7 @@ fn secure_dir(dir: &Path, label: &str) -> Result<(), String> {
             meta.uid()
         ));
     }
-    if meta.mode() & 0o777 != 0o700 {
+    if fix && meta.mode() & 0o777 != 0o700 {
         // `File::set_permissions` is fchmod on this descriptor.
         file.set_permissions(std::fs::Permissions::from_mode(0o700))
             .map_err(|e| format!("cannot set permissions on {}: {e}", dir.display()))?;
@@ -672,6 +677,17 @@ fn check_pointer(pointer: &Path, common: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// `~/.cplt-worktrees` when something other than a directory is there (a
+/// file, a symlink). With the key on the launch refuses it; with the key off
+/// it is worth one line, not an alarm.
+#[must_use]
+pub fn stray_base(home_dir: &Path) -> Option<PathBuf> {
+    let base = home_dir.join(BASE);
+    base.symlink_metadata()
+        .is_ok_and(|m| !m.is_dir())
+        .then_some(base)
+}
+
 /// [`link_problems`] for a root an earlier session left, run while the key is
 /// off. Turning the key off does not make a planted link harmless: git on the
 /// host still follows it.
@@ -703,6 +719,11 @@ pub fn existing_root_problems(
         return Vec::new();
     };
     let base = home.join(BASE);
+    // A file or symlink in place of the base holds no root to check: the
+    // launch says so in one line ([`stray_base`]), not as a link finding.
+    if stray_base(&home).is_some() {
+        return Vec::new();
+    }
     match present(&base) {
         Ok(true) => {}
         Ok(false) => return Vec::new(),
@@ -1163,6 +1184,12 @@ mod tests {
         for dir in [root.as_path(), root.parent().unwrap()] {
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+        // A report (`doctor`, `check`, `--print-profile`) changes nothing.
+        prepare_root_for(h.path(), Path::new("/w/a/.git"), false).expect("reported");
+        for dir in [root.as_path(), root.parent().unwrap()] {
+            let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o755, "a report chmods {}", dir.display());
+        }
         prepare_root_for(h.path(), Path::new("/w/a/.git"), true).expect("reused");
         for dir in [root.as_path(), root.parent().unwrap()] {
             let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
@@ -1582,6 +1609,30 @@ mod tests {
         std::os::unix::fs::symlink("packages/../packages/pkg", &up).unwrap();
         let problems = link_problems(&common, &root, DEFAULT_WALK_MAX_DIRS);
         assert!(finding(&problems, &up).is_some(), "{problems:?}");
+    }
+
+    /// Key off, a file or symlink at `~/.cplt-worktrees`: one warning line
+    /// from the launch ([`stray_base`]), not a link finding at launch and
+    /// again at session end.
+    #[test]
+    fn a_stray_base_is_not_a_link_finding() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let main = base.join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        if !git_in(&main, &["init", "-q", "-b", "main"]) {
+            eprintln!("SKIPPED: git unavailable");
+            return;
+        }
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        assert_eq!(stray_base(&home), None);
+        std::os::unix::fs::symlink("/nonexistent", home.join(BASE)).unwrap();
+        assert_eq!(stray_base(&home), Some(home.join(BASE)));
+        assert_eq!(
+            existing_root_problems(&home, &main, DEFAULT_WALK_MAX_DIRS),
+            Vec::new()
+        );
     }
 
     /// With the key off, a root an earlier session left is still checked. A

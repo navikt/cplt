@@ -542,7 +542,8 @@ The launch fails, rather than running without the root, if it cannot be
 granted: the root or `~/.cplt-worktrees` is a symlink, is not a directory, or
 is owned by another user, the repository's `commondir` does not match the
 layout Git writes, or a worktree link fails the check above. It also fails on
-Linux, where nothing inside the root would be kernel-enforced.
+Linux, where nothing inside the root would be kernel-enforced; there `cplt config
+set sandbox.allow_git_worktrees true` is refused as well.
 
 Outside a Git repository there is no root to grant. With the key in your
 global config, cplt warns and runs without it. With the key in this checkout's

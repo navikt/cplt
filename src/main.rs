@@ -1866,6 +1866,13 @@ fn managed_worktree_root(
         // A root left by an earlier session is still checked: git on the
         // host follows a planted link whether or not the key is on. Reported,
         // not fatal, since this session grants nothing there.
+        if let Some(base) = cplt::worktrees::stray_base(home_dir) {
+            ui::warn(&format!(
+                "{} is not a directory, so there are no managed worktrees to check. Remove \
+                 it if you did not put it there.",
+                base.display()
+            ));
+        }
         let problems = cplt::worktrees::existing_root_problems(home_dir, project_dir, max_dirs);
         if !problems.is_empty() {
             ui::error(&format!(

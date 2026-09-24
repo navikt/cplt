@@ -704,10 +704,11 @@ does not:
   the settle-probe notes in `src/audit.rs` on why a process group is not used.
   When the audit runs and the tree has not settled, the audit's own warning
   says processes were left running.
-- **macOS only.** On Linux the launch fails with the key on. Landlock cannot
-  subtract a path from the granted root, and bubblewrap re-binds only paths
-  that exist at launch, at fixed depths, never `<root>/<worktree>/<rel>`. So
-  nothing inside the root would be kernel-enforced.
+- **macOS only.** On Linux the launch fails with the key on, and `config set`
+  refuses to turn it on. Landlock cannot subtract a path from the granted
+  root, and bubblewrap re-binds only paths that exist at launch, at fixed
+  depths, never `<root>/<worktree>/<rel>`. So nothing inside the root would
+  be kernel-enforced.
 - **Residuals.** Everything written to the root outlives the session: cplt
   never deletes worktrees or branches. The agent can empty the root or plant
   files you later run outside cplt, the same as in the project directory. The
