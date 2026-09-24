@@ -74,6 +74,26 @@ pub fn is_unsafe_root(path: &std::path::Path, home: &std::path::Path) -> bool {
     false
 }
 
+/// Run `f` holding `temp_env`'s lock, with every XDG base variable unset.
+///
+/// `temp_env` mutates the real process environment, so a test that reads
+/// `XDG_*`, `HOME` or `PATH` without holding its lock races every test in the
+/// binary that sets them. Tests that only need `HOME` stable use this too:
+/// unsetting XDG is harmless to them, and the lock is the point.
+#[cfg(test)]
+pub(crate) fn with_env_lock_no_xdg<R>(f: impl FnOnce() -> R) -> R {
+    temp_env::with_vars_unset(
+        [
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_RUNTIME_DIR",
+        ],
+        f,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

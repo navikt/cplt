@@ -2759,57 +2759,59 @@ mod tests {
 
     #[test]
     fn opencode_config_dirs_xdg_default() {
-        let home = Path::new("/Users/test");
-        let dirs = Agent::OpenCode.config_dirs(home);
-        assert_eq!(
-            dirs.len(),
-            5,
-            "should have config + data + state + cache + cache/bin"
-        );
+        crate::with_env_lock_no_xdg(|| {
+            let home = Path::new("/Users/test");
+            let dirs = Agent::OpenCode.config_dirs(home);
+            assert_eq!(
+                dirs.len(),
+                5,
+                "should have config + data + state + cache + cache/bin"
+            );
 
-        let config_dir = dirs
-            .iter()
-            .find(|d| d.path.to_str().unwrap().contains("config"))
-            .unwrap();
-        let data_dir = dirs
-            .iter()
-            .find(|d| d.path.to_str().unwrap().contains("share"))
-            .unwrap();
-        let state_dir = dirs
-            .iter()
-            .find(|d| d.path.to_str().unwrap().contains("state"))
-            .unwrap();
-        let cache_dir = dirs
-            .iter()
-            .find(|d| {
-                d.path.to_str().unwrap().ends_with("opencode")
-                    && d.path.to_str().unwrap().contains("cache")
-            })
-            .unwrap();
-        let cache_bin = dirs
-            .iter()
-            .find(|d| {
-                d.path.to_str().unwrap().contains("cache")
-                    && d.path.to_str().unwrap().ends_with("bin")
-            })
-            .unwrap();
+            let config_dir = dirs
+                .iter()
+                .find(|d| d.path.to_str().unwrap().contains("config"))
+                .unwrap();
+            let data_dir = dirs
+                .iter()
+                .find(|d| d.path.to_str().unwrap().contains("share"))
+                .unwrap();
+            let state_dir = dirs
+                .iter()
+                .find(|d| d.path.to_str().unwrap().contains("state"))
+                .unwrap();
+            let cache_dir = dirs
+                .iter()
+                .find(|d| {
+                    d.path.to_str().unwrap().ends_with("opencode")
+                        && d.path.to_str().unwrap().contains("cache")
+                })
+                .unwrap();
+            let cache_bin = dirs
+                .iter()
+                .find(|d| {
+                    d.path.to_str().unwrap().contains("cache")
+                        && d.path.to_str().unwrap().ends_with("bin")
+                })
+                .unwrap();
 
-        // Config dir: read-only with only auth.json writable
-        assert!(!config_dir.write, "config dir should be read-only");
-        assert_eq!(
-            config_dir.write_files,
-            vec!["auth.json"],
-            "only auth.json should be writable in config dir"
-        );
+            // Config dir: read-only with only auth.json writable
+            assert!(!config_dir.write, "config dir should be read-only");
+            assert_eq!(
+                config_dir.write_files,
+                vec!["auth.json"],
+                "only auth.json should be writable in config dir"
+            );
 
-        // Data + state + cache: writable
-        assert!(data_dir.write, "data dir should be writable");
-        assert!(state_dir.write, "state dir should be writable");
-        assert!(cache_dir.write, "cache dir should be writable");
+            // Data + state + cache: writable
+            assert!(data_dir.write, "data dir should be writable");
+            assert!(state_dir.write, "state dir should be writable");
+            assert!(cache_dir.write, "cache dir should be writable");
 
-        // Cache/bin: exec-only (managed tool binaries, not writable from sandbox)
-        assert!(!cache_bin.write, "cache/bin should not be writable");
-        assert!(cache_bin.process_exec, "cache/bin should allow exec");
+            // Cache/bin: exec-only (managed tool binaries, not writable from sandbox)
+            assert!(!cache_bin.write, "cache/bin should not be writable");
+            assert!(cache_bin.process_exec, "cache/bin should allow exec");
+        });
     }
 
     #[test]
@@ -3095,48 +3097,50 @@ mod tests {
     /// the child and the create_dirs design has a hole — do not relax the test.
     #[test]
     fn create_dirs_exec_only_children_are_pre_created() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let home = tmp.path();
-        let mut checked = 0;
-        for agent in ALL_AGENTS {
-            let dirs = agent.config_dirs(home);
-            let create_roots: Vec<&AgentDir> =
-                dirs.iter().filter(|d| !d.create_dirs.is_empty()).collect();
-            let exec_children: Vec<&AgentDir> = dirs
-                .iter()
-                .filter(|d| d.process_exec && !d.write)
-                .filter(|d| {
-                    create_roots
-                        .iter()
-                        .any(|r| d.path != r.path && d.path.starts_with(&r.path))
-                })
-                .collect();
-            if exec_children.is_empty() {
-                continue;
-            }
-            // main.rs's pre-creation loop, verbatim.
-            for dir in &dirs {
-                if !dir.path.exists() {
-                    let _ = std::fs::create_dir_all(&dir.path);
+        crate::with_env_lock_no_xdg(|| {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let home = tmp.path();
+            let mut checked = 0;
+            for agent in ALL_AGENTS {
+                let dirs = agent.config_dirs(home);
+                let create_roots: Vec<&AgentDir> =
+                    dirs.iter().filter(|d| !d.create_dirs.is_empty()).collect();
+                let exec_children: Vec<&AgentDir> = dirs
+                    .iter()
+                    .filter(|d| d.process_exec && !d.write)
+                    .filter(|d| {
+                        create_roots
+                            .iter()
+                            .any(|r| d.path != r.path && d.path.starts_with(&r.path))
+                    })
+                    .collect();
+                if exec_children.is_empty() {
+                    continue;
                 }
-            }
-            for child in exec_children {
-                checked += 1;
-                assert!(
-                    child.path.is_dir(),
-                    "{agent:?}: pre-creation did not create the exec-only child {} \
+                // main.rs's pre-creation loop, verbatim.
+                for dir in &dirs {
+                    if !dir.path.exists() {
+                        let _ = std::fs::create_dir_all(&dir.path);
+                    }
+                }
+                for child in exec_children {
+                    checked += 1;
+                    assert!(
+                        child.path.is_dir(),
+                        "{agent:?}: pre-creation did not create the exec-only child {} \
                      inside a create_dirs tree — the agent could mkdir the name \
                      itself",
-                    child.path.display()
-                );
+                        child.path.display()
+                    );
+                }
             }
-        }
-        // Pi is the current case; guard against the filter silently matching none.
-        assert!(
-            checked > 0,
-            "expected at least Pi's ~/.pi/agent/bin to be an exec-only child of a \
+            // Pi is the current case; guard against the filter silently matching none.
+            assert!(
+                checked > 0,
+                "expected at least Pi's ~/.pi/agent/bin to be an exec-only child of a \
              create_dirs tree"
-        );
+            );
+        });
     }
 
     #[test]

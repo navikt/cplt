@@ -2646,6 +2646,8 @@ mod tests {
         let ok = Command::new("git")
             .args(["init"])
             .current_dir(dir.path())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()

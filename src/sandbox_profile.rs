@@ -5183,45 +5183,47 @@ mod tests {
         /// profile would leave most of the emitters unwalked.
         #[test]
         fn every_write_deny_has_a_pinned_parent_chain() {
-            let mut unexpected: Vec<String> = Vec::new();
-            let mut seen: Vec<(String, String, String)> = Vec::new();
-            for &agent in crate::agent::Agent::ALL {
-                let name = format!("{agent:?}");
-                let profile = representative_profile(agent);
-                for (denied, ancestor, rule) in violations(&profile) {
-                    let key = (name.clone(), denied.clone(), ancestor.clone());
-                    if KNOWN_UNFIXED
-                        .iter()
-                        .any(|k| (k.0, k.1, k.2) == (&*key.0, &*key.1, &*key.2))
-                    {
-                        seen.push(key);
-                        continue;
-                    }
-                    unexpected.push(format!(
+            crate::with_env_lock_no_xdg(|| {
+                let mut unexpected: Vec<String> = Vec::new();
+                let mut seen: Vec<(String, String, String)> = Vec::new();
+                for &agent in crate::agent::Agent::ALL {
+                    let name = format!("{agent:?}");
+                    let profile = representative_profile(agent);
+                    for (denied, ancestor, rule) in violations(&profile) {
+                        let key = (name.clone(), denied.clone(), ancestor.clone());
+                        if KNOWN_UNFIXED
+                            .iter()
+                            .any(|k| (k.0, k.1, k.2) == (&*key.0, &*key.1, &*key.2))
+                        {
+                            seen.push(key);
+                            continue;
+                        }
+                        unexpected.push(format!(
                         "  agent: {name}\n  denied: {denied}\n  renameable ancestor: {ancestor}\n  rule: {rule}"
                     ));
+                    }
                 }
-            }
-            assert!(
-                unexpected.is_empty(),
-                "{} write-deny rule(s) sit under an ancestor the sandbox still \
+                assert!(
+                    unexpected.is_empty(),
+                    "{} write-deny rule(s) sit under an ancestor the sandbox still \
                  lets the agent rename or remove. Renaming that ancestor moves \
                  the protected tree out from under the deny \
                  (GHSA-39xf-9j26-f82m, GHSA-8qmv-wxp3-526v). Pin it with a \
                  `deny file-write-unlink` covering the ancestor — the directory \
                  stays writable, only its name is fixed. If it is deliberate, \
                  add it to KNOWN_UNFIXED with the reason.\n\n{}",
-                unexpected.len(),
-                unexpected.join("\n\n")
-            );
-            for k in KNOWN_UNFIXED {
-                assert!(
-                    seen.iter()
-                        .any(|s| (&*s.0, &*s.1, &*s.2) == (k.0, k.1, k.2)),
-                    "KNOWN_UNFIXED entry {k:?} no longer reproduces — delete it \
-                     rather than leaving a stale exception behind"
+                    unexpected.len(),
+                    unexpected.join("\n\n")
                 );
-            }
+                for k in KNOWN_UNFIXED {
+                    assert!(
+                        seen.iter()
+                            .any(|s| (&*s.0, &*s.1, &*s.2) == (k.0, k.1, k.2)),
+                        "KNOWN_UNFIXED entry {k:?} no longer reproduces — delete it \
+                     rather than leaving a stale exception behind"
+                    );
+                }
+            });
         }
 
         /// The resolved credential and git config denies of a stow home whose

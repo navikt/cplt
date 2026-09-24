@@ -3221,64 +3221,68 @@ mod tests {
     /// `store/` instead, which is all `pnpm install` needs.
     #[test]
     fn pnpm_home_is_not_writable_but_its_store_is() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
-        let policy = generate_policy(&test_config(&project, &home));
-        let Some(data) = policy::AppDirKind::Data.resolve("", "", "pnpm", &home) else {
-            return;
-        };
+        crate::with_env_lock_no_xdg(|| {
+            let project = PathBuf::from("/home/user/project");
+            let home = PathBuf::from("/home/user");
+            let policy = generate_policy(&test_config(&project, &home));
+            let Some(data) = policy::AppDirKind::Data.resolve("", "", "pnpm", &home) else {
+                return;
+            };
 
-        for rule in policy.fs_rules.iter().filter(|r| r.path == data) {
+            for rule in policy.fs_rules.iter().filter(|r| r.path == data) {
+                assert!(
+                    !rule.access.write,
+                    "$PNPM_HOME must not be writable — a shim dropped there runs unsandboxed on the next PATH lookup"
+                );
+            }
+            let store = data.join("store");
             assert!(
-                !rule.access.write,
-                "$PNPM_HOME must not be writable — a shim dropped there runs unsandboxed on the next PATH lookup"
+                policy
+                    .fs_rules
+                    .iter()
+                    .any(|r| r.path == store && r.access.write),
+                "pnpm's content-addressable store must stay writable for ordinary `pnpm install`"
             );
-        }
-        let store = data.join("store");
-        assert!(
-            policy
-                .fs_rules
-                .iter()
-                .any(|r| r.path == store && r.access.write),
-            "pnpm's content-addressable store must stay writable for ordinary `pnpm install`"
-        );
+        });
     }
 
     #[test]
     fn pnpm_self_management_storage_has_its_required_effective_permissions() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
-        let policy = generate_policy(&test_config(&project, &home));
-        let effective_access = |path: &Path| {
-            policy
-                .fs_rules
-                .iter()
-                .filter(|rule| path.starts_with(&rule.path))
-                .fold(FsAccess::default(), |mut access, rule| {
-                    access.read |= rule.access.read;
-                    access.write |= rule.access.write;
-                    access.execute |= rule.access.execute;
-                    access
-                })
-        };
+        crate::with_env_lock_no_xdg(|| {
+            let project = PathBuf::from("/home/user/project");
+            let home = PathBuf::from("/home/user");
+            let policy = generate_policy(&test_config(&project, &home));
+            let effective_access = |path: &Path| {
+                policy
+                    .fs_rules
+                    .iter()
+                    .filter(|rule| path.starts_with(&rule.path))
+                    .fold(FsAccess::default(), |mut access, rule| {
+                        access.read |= rule.access.read;
+                        access.write |= rule.access.write;
+                        access.execute |= rule.access.execute;
+                        access
+                    })
+            };
 
-        for rel in ["Library/pnpm/store", ".local/share/pnpm/store"] {
-            let access = effective_access(&home.join(rel));
-            assert!(
-                access.read && access.write && !access.execute,
-                "{rel} must remain writable but non-executable"
-            );
-        }
-        for rel in [
-            "Library/pnpm/package-manager-store",
-            ".local/share/pnpm/package-manager-store",
-        ] {
-            let access = effective_access(&home.join(rel));
-            assert!(
-                access.read && access.write && access.execute,
-                "{rel} must be writable and executable for pnpm self-management"
-            );
-        }
+            for rel in ["Library/pnpm/store", ".local/share/pnpm/store"] {
+                let access = effective_access(&home.join(rel));
+                assert!(
+                    access.read && access.write && !access.execute,
+                    "{rel} must remain writable but non-executable"
+                );
+            }
+            for rel in [
+                "Library/pnpm/package-manager-store",
+                ".local/share/pnpm/package-manager-store",
+            ] {
+                let access = effective_access(&home.join(rel));
+                assert!(
+                    access.read && access.write && access.execute,
+                    "{rel} must be writable and executable for pnpm self-management"
+                );
+            }
+        });
     }
 
     /// The same class one tree over, where the structural fix does apply:
@@ -4212,79 +4216,81 @@ mod tests {
     /// dir and one linked somewhere harmless still are.
     #[test]
     fn first_party_dirs_linked_into_credentials_are_refused() {
-        use std::os::unix::fs::symlink;
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().canonicalize().unwrap();
-        for d in [
-            ".aws",
-            "dotfiles/ssh",
-            "harmless",
-            ".config/opencode",
-            "npmdots",
-        ] {
-            std::fs::create_dir_all(home.join(d)).unwrap();
-        }
-        // `~/.codex -> ~/npmdots` holds the linked `~/.npmrc` (review item 4).
-        std::fs::write(home.join("npmdots/npmrc"), "token").unwrap();
-        symlink(home.join("npmdots/npmrc"), home.join(".npmrc")).unwrap();
-        symlink(home.join("npmdots"), home.join(".codex")).unwrap();
-        std::fs::write(home.join("dotfiles/ssh/id_ed25519"), "key").unwrap();
-        symlink(home.join("dotfiles/ssh"), home.join(".ssh")).unwrap();
-        symlink(home.join(".aws"), home.join(".claude")).unwrap();
-        symlink(home.join("dotfiles"), home.join(".gemini")).unwrap();
-        symlink(home.join("harmless"), home.join(".pi")).unwrap();
-        symlink(
-            home.join(".ssh/id_ed25519"),
-            home.join(".config/opencode/auth.json"),
-        )
-        .unwrap();
-        // The first AppDir path under $HOME, linked into ~/.aws.
-        let app = policy::app_dirs()
-            .iter()
-            .flat_map(|d| d.all_paths(&home))
-            .find(|p| p.starts_with(&home))
-            .expect("an AppDir under $HOME");
-        std::fs::create_dir_all(app.parent().unwrap()).unwrap();
-        symlink(home.join(".aws"), &app).unwrap();
+        crate::with_env_lock_no_xdg(|| {
+            use std::os::unix::fs::symlink;
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path().canonicalize().unwrap();
+            for d in [
+                ".aws",
+                "dotfiles/ssh",
+                "harmless",
+                ".config/opencode",
+                "npmdots",
+            ] {
+                std::fs::create_dir_all(home.join(d)).unwrap();
+            }
+            // `~/.codex -> ~/npmdots` holds the linked `~/.npmrc` (review item 4).
+            std::fs::write(home.join("npmdots/npmrc"), "token").unwrap();
+            symlink(home.join("npmdots/npmrc"), home.join(".npmrc")).unwrap();
+            symlink(home.join("npmdots"), home.join(".codex")).unwrap();
+            std::fs::write(home.join("dotfiles/ssh/id_ed25519"), "key").unwrap();
+            symlink(home.join("dotfiles/ssh"), home.join(".ssh")).unwrap();
+            symlink(home.join(".aws"), home.join(".claude")).unwrap();
+            symlink(home.join("dotfiles"), home.join(".gemini")).unwrap();
+            symlink(home.join("harmless"), home.join(".pi")).unwrap();
+            symlink(
+                home.join(".ssh/id_ed25519"),
+                home.join(".config/opencode/auth.json"),
+            )
+            .unwrap();
+            // The first AppDir path under $HOME, linked into ~/.aws.
+            let app = policy::app_dirs()
+                .iter()
+                .flat_map(|d| d.all_paths(&home))
+                .find(|p| p.starts_with(&home))
+                .expect("an AppDir under $HOME");
+            std::fs::create_dir_all(app.parent().unwrap()).unwrap();
+            symlink(home.join(".aws"), &app).unwrap();
 
-        let dir = |path: PathBuf, write_files: Vec<&'static str>| crate::agent::AgentDir {
-            path,
-            write: true,
-            map_exec: false,
-            process_exec: false,
-            write_files,
-            create_dirs: vec![],
-        };
-        let agent_dirs = [
-            dir(home.join(".claude"), vec![]),
-            dir(home.join(".gemini"), vec![]),
-            dir(home.join(".pi"), vec![]),
-            dir(home.join(".codex"), vec![]),
-            dir(home.join(".config/opencode"), vec!["auth.json"]),
-        ];
-        let project = home.join("project");
-        let mut config = test_config(&project, &home);
-        config.agent_dirs = &agent_dirs;
-        let policy = generate_policy(&config);
-        let granted = |p: &Path| policy.fs_rules.iter().any(|r| r.path == p);
+            let dir = |path: PathBuf, write_files: Vec<&'static str>| crate::agent::AgentDir {
+                path,
+                write: true,
+                map_exec: false,
+                process_exec: false,
+                write_files,
+                create_dirs: vec![],
+            };
+            let agent_dirs = [
+                dir(home.join(".claude"), vec![]),
+                dir(home.join(".gemini"), vec![]),
+                dir(home.join(".pi"), vec![]),
+                dir(home.join(".codex"), vec![]),
+                dir(home.join(".config/opencode"), vec!["auth.json"]),
+            ];
+            let project = home.join("project");
+            let mut config = test_config(&project, &home);
+            config.agent_dirs = &agent_dirs;
+            let policy = generate_policy(&config);
+            let granted = |p: &Path| policy.fs_rules.iter().any(|r| r.path == p);
 
-        assert!(!granted(&home.join(".claude")), "linked into ~/.aws");
-        assert!(!granted(&home.join(".gemini")), "holds the linked ~/.ssh");
-        assert!(!granted(&home.join(".codex")), "holds the linked ~/.npmrc");
-        assert!(
-            !granted(&app),
-            "AppDir {} linked into ~/.aws",
-            app.display()
-        );
-        assert!(
-            !granted(&home.join(".config/opencode/auth.json")),
-            "write_files entry linked onto the key"
-        );
-        assert!(granted(&home.join(".pi")), "a harmless link stays granted");
-        assert!(
-            granted(&home.join(".config/opencode")),
-            "an unlinked dir stays"
-        );
+            assert!(!granted(&home.join(".claude")), "linked into ~/.aws");
+            assert!(!granted(&home.join(".gemini")), "holds the linked ~/.ssh");
+            assert!(!granted(&home.join(".codex")), "holds the linked ~/.npmrc");
+            assert!(
+                !granted(&app),
+                "AppDir {} linked into ~/.aws",
+                app.display()
+            );
+            assert!(
+                !granted(&home.join(".config/opencode/auth.json")),
+                "write_files entry linked onto the key"
+            );
+            assert!(granted(&home.join(".pi")), "a harmless link stays granted");
+            assert!(
+                granted(&home.join(".config/opencode")),
+                "an unlinked dir stays"
+            );
+        });
     }
 
     /// #551 review: a `DENIED_HOME_SUBPATHS` file is exempt from its mask
@@ -4587,74 +4593,76 @@ mod tests {
 
     #[test]
     fn home_config_files_are_readable() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
-        let config = test_config(&project, &home);
-        let policy = generate_policy(&config);
+        crate::with_env_lock_no_xdg(|| {
+            let project = PathBuf::from("/home/user/project");
+            let home = PathBuf::from("/home/user");
+            let config = test_config(&project, &home);
+            let policy = generate_policy(&config);
 
-        for &file in policy::HOME_CONFIG_FILES {
-            let path = home.join(file);
-            let rule = policy
+            for &file in policy::HOME_CONFIG_FILES {
+                let path = home.join(file);
+                let rule = policy
+                    .fs_rules
+                    .iter()
+                    .find(|r| r.path == path)
+                    .unwrap_or_else(|| panic!("home config file {file} should be in rules"));
+                assert!(rule.access.read, "{file} should have read");
+                assert!(!rule.access.write, "{file} should NOT have write");
+                assert!(!rule.access.execute, "{file} should NOT have execute");
+            }
+
+            // #522: the shared list is the whole grant. Every read-only home rule
+            // that no AppDir or tool dir accounts for must be a list entry, and
+            // every entry must be emitted, so an entry chained onto this backend
+            // alone fails here.
+            let app_paths: Vec<PathBuf> = policy::app_dirs()
+                .iter()
+                .flat_map(|d| d.all_paths(&home))
+                .chain(policy::HOME_TOOL_DIRS.iter().map(|d| home.join(d.path)))
+                .collect();
+            let emitted: std::collections::BTreeSet<&Path> = policy
                 .fs_rules
                 .iter()
-                .find(|r| r.path == path)
-                .unwrap_or_else(|| panic!("home config file {file} should be in rules"));
-            assert!(rule.access.read, "{file} should have read");
-            assert!(!rule.access.write, "{file} should NOT have write");
-            assert!(!rule.access.execute, "{file} should NOT have execute");
-        }
-
-        // #522: the shared list is the whole grant. Every read-only home rule
-        // that no AppDir or tool dir accounts for must be a list entry, and
-        // every entry must be emitted, so an entry chained onto this backend
-        // alone fails here.
-        let app_paths: Vec<PathBuf> = policy::app_dirs()
-            .iter()
-            .flat_map(|d| d.all_paths(&home))
-            .chain(policy::HOME_TOOL_DIRS.iter().map(|d| home.join(d.path)))
-            .collect();
-        let emitted: std::collections::BTreeSet<&Path> = policy
-            .fs_rules
-            .iter()
-            .filter(|r| r.access.read && !r.access.write && !r.access.execute)
-            .filter(|r| !app_paths.contains(&r.path))
-            .filter_map(|r| r.path.strip_prefix(&home).ok())
-            .collect();
-        let expected: std::collections::BTreeSet<&Path> =
-            policy::HOME_CONFIG_FILES.iter().map(Path::new).collect();
-        assert_eq!(
-            emitted, expected,
-            "Landlock home config grants drifted from the shared list"
-        );
-        // git's XDG ignore/attributes defaults: unreadable, git drops the
-        // global ignore rules with only a warning.
-        assert!(emitted.contains(Path::new(".config/git/ignore")));
-        assert!(emitted.contains(Path::new(".config/git/attributes")));
-
-        // Nothing Linux used to grant on its own may come back, directly or
-        // through an ancestor (`~/.config/git` covered git's XDG `credentials`
-        // store).
-        for rel in [
-            ".zshrc",
-            ".bashrc",
-            ".profile",
-            ".bash_profile",
-            ".zprofile",
-            ".node_repl_history",
-            ".config/git/credentials",
-        ] {
-            let path = home.join(rel);
-            assert!(
-                !policy.fs_rules.iter().any(|r| path.starts_with(&r.path)),
-                "{rel} is not in the shared list and must not be granted"
+                .filter(|r| r.access.read && !r.access.write && !r.access.execute)
+                .filter(|r| !app_paths.contains(&r.path))
+                .filter_map(|r| r.path.strip_prefix(&home).ok())
+                .collect();
+            let expected: std::collections::BTreeSet<&Path> =
+                policy::HOME_CONFIG_FILES.iter().map(Path::new).collect();
+            assert_eq!(
+                emitted, expected,
+                "Landlock home config grants drifted from the shared list"
             );
-        }
+            // git's XDG ignore/attributes defaults: unreadable, git drops the
+            // global ignore rules with only a warning.
+            assert!(emitted.contains(Path::new(".config/git/ignore")));
+            assert!(emitted.contains(Path::new(".config/git/attributes")));
 
-        // $HOME itself must NOT be in the ruleset (would grant recursive read)
-        assert!(
-            !policy.fs_rules.iter().any(|r| r.path == home),
-            "$HOME must not have a blanket rule (Landlock is recursive)"
-        );
+            // Nothing Linux used to grant on its own may come back, directly or
+            // through an ancestor (`~/.config/git` covered git's XDG `credentials`
+            // store).
+            for rel in [
+                ".zshrc",
+                ".bashrc",
+                ".profile",
+                ".bash_profile",
+                ".zprofile",
+                ".node_repl_history",
+                ".config/git/credentials",
+            ] {
+                let path = home.join(rel);
+                assert!(
+                    !policy.fs_rules.iter().any(|r| path.starts_with(&r.path)),
+                    "{rel} is not in the shared list and must not be granted"
+                );
+            }
+
+            // $HOME itself must NOT be in the ruleset (would grant recursive read)
+            assert!(
+                !policy.fs_rules.iter().any(|r| r.path == home),
+                "$HOME must not have a blanket rule (Landlock is recursive)"
+            );
+        });
     }
 
     #[test]
@@ -4817,192 +4825,200 @@ mod tests {
 
     #[test]
     fn app_dirs_included_when_existing_is_none() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
-        let config = test_config(&project, &home);
-        let policy = generate_policy(&config);
+        crate::with_env_lock_no_xdg(|| {
+            let project = PathBuf::from("/home/user/project");
+            let home = PathBuf::from("/home/user");
+            let config = test_config(&project, &home);
+            let policy = generate_policy(&config);
 
-        // Resolve at least one mise app dir path; skip if no home dir
-        let mise_paths: Vec<PathBuf> = policy::app_dirs()[0].all_paths(&home);
-        if mise_paths.is_empty() {
-            return;
-        }
+            // Resolve at least one mise app dir path; skip if no home dir
+            let mise_paths: Vec<PathBuf> = policy::app_dirs()[0].all_paths(&home);
+            if mise_paths.is_empty() {
+                return;
+            }
 
-        let found = mise_paths
-            .iter()
-            .any(|p| policy.fs_rules.iter().any(|r| &r.path == p));
-        assert!(
-            found,
-            "With existing_app_dirs=None, at least one mise app dir path should appear in policy"
-        );
+            let found = mise_paths
+                .iter()
+                .any(|p| policy.fs_rules.iter().any(|r| &r.path == p));
+            assert!(
+                found,
+                "With existing_app_dirs=None, at least one mise app dir path should appear in policy"
+            );
+        });
     }
 
     #[test]
     fn app_dirs_excluded_when_no_match() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
-        let mut config = test_config(&project, &home);
-        let nonexistent = vec!["/nonexistent".to_string()];
-        config.existing_app_dirs = Some(&nonexistent);
-        let policy = generate_policy(&config);
+        crate::with_env_lock_no_xdg(|| {
+            let project = PathBuf::from("/home/user/project");
+            let home = PathBuf::from("/home/user");
+            let mut config = test_config(&project, &home);
+            let nonexistent = vec!["/nonexistent".to_string()];
+            config.existing_app_dirs = Some(&nonexistent);
+            let policy = generate_policy(&config);
 
-        // Some mise paths may appear read-only (the Config kind is read-only).
-        // The important property is that writable app-dir paths are excluded.
-        let write_paths = policy::app_dirs()[0].write_paths(&home);
-        for p in &write_paths {
-            assert!(
-                !policy
-                    .fs_rules
-                    .iter()
-                    .any(|r| &r.path == p && r.access.write),
-                "With non-matching existing_app_dirs, mise write path {} should NOT appear in policy with write access",
-                p.display()
-            );
-        }
-        // Also verify process_exec paths are not granted execute
-        let exec_paths = policy::app_dirs()[0].process_exec_paths(&home);
-        for p in &exec_paths {
-            assert!(
-                !policy
-                    .fs_rules
-                    .iter()
-                    .any(|r| &r.path == p && r.access.execute),
-                "With non-matching existing_app_dirs, mise exec path {} should NOT appear in policy with execute",
-                p.display()
-            );
-        }
+            // Some mise paths may appear read-only (the Config kind is read-only).
+            // The important property is that writable app-dir paths are excluded.
+            let write_paths = policy::app_dirs()[0].write_paths(&home);
+            for p in &write_paths {
+                assert!(
+                    !policy
+                        .fs_rules
+                        .iter()
+                        .any(|r| &r.path == p && r.access.write),
+                    "With non-matching existing_app_dirs, mise write path {} should NOT appear in policy with write access",
+                    p.display()
+                );
+            }
+            // Also verify process_exec paths are not granted execute
+            let exec_paths = policy::app_dirs()[0].process_exec_paths(&home);
+            for p in &exec_paths {
+                assert!(
+                    !policy
+                        .fs_rules
+                        .iter()
+                        .any(|r| &r.path == p && r.access.execute),
+                    "With non-matching existing_app_dirs, mise exec path {} should NOT appear in policy with execute",
+                    p.display()
+                );
+            }
+        });
     }
 
     #[test]
     fn app_dir_fsaccess_flags_match_permissions() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
-        let config = test_config(&project, &home);
-        let policy = generate_policy(&config);
+        crate::with_env_lock_no_xdg(|| {
+            let project = PathBuf::from("/home/user/project");
+            let home = PathBuf::from("/home/user");
+            let config = test_config(&project, &home);
+            let policy = generate_policy(&config);
 
-        let mise = &policy::app_dirs()[0];
-        let all_paths = mise.all_paths(&home);
-        if all_paths.is_empty() {
-            return;
-        }
-
-        let write_paths = mise.write_paths(&home);
-        let process_exec_paths = mise.process_exec_paths(&home);
-        let map_exec_paths = mise.map_exec_paths(&home);
-        let read_paths = mise.read_paths(&home);
-
-        for path in &all_paths {
-            let rule = policy.fs_rules.iter().find(|r| &r.path == path);
-            let Some(rule) = rule else {
-                panic!(
-                    "missing FsRule for expected app-dir path {}",
-                    path.display()
-                );
-            };
-
-            if write_paths.contains(path) {
-                assert!(
-                    rule.access.write,
-                    "path {} is in write_paths but FsRule.write is false",
-                    path.display()
-                );
-            }
-
-            if process_exec_paths.contains(path) || map_exec_paths.contains(path) {
-                assert!(
-                    rule.access.execute,
-                    "path {} is in exec paths but FsRule.execute is false",
-                    path.display()
-                );
-            }
-
-            if read_paths.contains(path) {
-                assert!(
-                    rule.access.read,
-                    "path {} is in read_paths but FsRule.read is false",
-                    path.display()
-                );
-            } else {
-                assert!(
-                    !rule.access.read,
-                    "path {} is NOT in read_paths but FsRule.read is true",
-                    path.display()
-                );
-            }
-
-            if read_paths.contains(path)
-                && !write_paths.contains(path)
-                && !process_exec_paths.contains(path)
-                && !map_exec_paths.contains(path)
-            {
-                assert!(
-                    !rule.access.write,
-                    "path {} is read-only but FsRule.write is true",
-                    path.display()
-                );
-                assert!(
-                    !rule.access.execute,
-                    "path {} is read-only but FsRule.execute is true",
-                    path.display()
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn app_dir_effective_permissions_include_parent_rules() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
-        let config = test_config(&project, &home);
-        let policy = generate_policy(&config);
-
-        for app_dir in policy::app_dirs() {
-            let all_paths = app_dir.all_paths(&home);
+            let mise = &policy::app_dirs()[0];
+            let all_paths = mise.all_paths(&home);
             if all_paths.is_empty() {
-                continue;
+                return;
             }
 
-            let write_paths = app_dir.write_paths(&home);
-            let process_exec_paths = app_dir.process_exec_paths(&home);
-            let map_exec_paths = app_dir.map_exec_paths(&home);
+            let write_paths = mise.write_paths(&home);
+            let process_exec_paths = mise.process_exec_paths(&home);
+            let map_exec_paths = mise.map_exec_paths(&home);
+            let read_paths = mise.read_paths(&home);
 
             for path in &all_paths {
-                // Compute effective access by OR-ing all rules whose path is an ancestor of
-                // or equal to the target path (Landlock rules apply to path and its subtree).
-                let mut effective_read = false;
-                let mut effective_write = false;
-                let mut effective_execute = false;
-                for rule in &policy.fs_rules {
-                    if path.starts_with(&rule.path) {
-                        effective_read |= rule.access.read;
-                        effective_write |= rule.access.write;
-                        effective_execute |= rule.access.execute;
-                    }
-                }
-
-                assert!(
-                    effective_read,
-                    "app-dir path {} should have effective read access",
-                    path.display()
-                );
+                let rule = policy.fs_rules.iter().find(|r| &r.path == path);
+                let Some(rule) = rule else {
+                    panic!(
+                        "missing FsRule for expected app-dir path {}",
+                        path.display()
+                    );
+                };
 
                 if write_paths.contains(path) {
                     assert!(
-                        effective_write,
-                        "app-dir path {} declares write but effective write is false",
+                        rule.access.write,
+                        "path {} is in write_paths but FsRule.write is false",
                         path.display()
                     );
                 }
 
                 if process_exec_paths.contains(path) || map_exec_paths.contains(path) {
                     assert!(
-                        effective_execute,
-                        "app-dir path {} declares exec but effective execute is false",
+                        rule.access.execute,
+                        "path {} is in exec paths but FsRule.execute is false",
+                        path.display()
+                    );
+                }
+
+                if read_paths.contains(path) {
+                    assert!(
+                        rule.access.read,
+                        "path {} is in read_paths but FsRule.read is false",
+                        path.display()
+                    );
+                } else {
+                    assert!(
+                        !rule.access.read,
+                        "path {} is NOT in read_paths but FsRule.read is true",
+                        path.display()
+                    );
+                }
+
+                if read_paths.contains(path)
+                    && !write_paths.contains(path)
+                    && !process_exec_paths.contains(path)
+                    && !map_exec_paths.contains(path)
+                {
+                    assert!(
+                        !rule.access.write,
+                        "path {} is read-only but FsRule.write is true",
+                        path.display()
+                    );
+                    assert!(
+                        !rule.access.execute,
+                        "path {} is read-only but FsRule.execute is true",
                         path.display()
                     );
                 }
             }
-        }
+        });
+    }
+
+    #[test]
+    fn app_dir_effective_permissions_include_parent_rules() {
+        crate::with_env_lock_no_xdg(|| {
+            let project = PathBuf::from("/home/user/project");
+            let home = PathBuf::from("/home/user");
+            let config = test_config(&project, &home);
+            let policy = generate_policy(&config);
+
+            for app_dir in policy::app_dirs() {
+                let all_paths = app_dir.all_paths(&home);
+                if all_paths.is_empty() {
+                    continue;
+                }
+
+                let write_paths = app_dir.write_paths(&home);
+                let process_exec_paths = app_dir.process_exec_paths(&home);
+                let map_exec_paths = app_dir.map_exec_paths(&home);
+
+                for path in &all_paths {
+                    // Compute effective access by OR-ing all rules whose path is an ancestor of
+                    // or equal to the target path (Landlock rules apply to path and its subtree).
+                    let mut effective_read = false;
+                    let mut effective_write = false;
+                    let mut effective_execute = false;
+                    for rule in &policy.fs_rules {
+                        if path.starts_with(&rule.path) {
+                            effective_read |= rule.access.read;
+                            effective_write |= rule.access.write;
+                            effective_execute |= rule.access.execute;
+                        }
+                    }
+
+                    assert!(
+                        effective_read,
+                        "app-dir path {} should have effective read access",
+                        path.display()
+                    );
+
+                    if write_paths.contains(path) {
+                        assert!(
+                            effective_write,
+                            "app-dir path {} declares write but effective write is false",
+                            path.display()
+                        );
+                    }
+
+                    if process_exec_paths.contains(path) || map_exec_paths.contains(path) {
+                        assert!(
+                            effective_execute,
+                            "app-dir path {} declares exec but effective execute is false",
+                            path.display()
+                        );
+                    }
+                }
+            }
+        });
     }
 
     #[cfg(target_os = "linux")]
