@@ -1808,13 +1808,17 @@ fn policy_roots(repo_paths: &[PathBuf], worktree_root: Option<&Path>) -> Vec<Pat
 fn warn_worktrees_not_audited(
     audit_enabled: bool,
     worktree_root: Option<&Path>,
+    home_dir: &Path,
     project_dir: &Path,
     max_dirs: usize,
 ) {
-    let Some(root) = worktree_root else {
-        return;
+    // Key off: a root an earlier session left is still checked, report only.
+    // The session could not write into it, but it could rewrite `commondir`
+    // in place, which only the key-on profile denies.
+    let problems = match worktree_root {
+        Some(root) => cplt::worktrees::session_end_problems(project_dir, root, max_dirs),
+        None => cplt::worktrees::existing_root_problems(home_dir, project_dir, max_dirs),
     };
-    let problems = cplt::worktrees::session_end_problems(project_dir, root, max_dirs);
     if !problems.is_empty() {
         let dirs = cplt::worktrees::problem_dirs(&problems);
         let details: Vec<String> = problems.iter().map(ToString::to_string).collect();
@@ -1828,7 +1832,7 @@ fn warn_worktrees_not_audited(
             details.join("\n    ")
         ));
     }
-    if audit_enabled {
+    if let (true, Some(root)) = (audit_enabled, worktree_root) {
         ui::warn(&format!(
             "The audit above does not cover worktrees under {}. Review them there \
              (`git worktree list` from this repository).",
@@ -4230,6 +4234,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     warn_worktrees_not_audited(
         audit_enabled,
         worktree_root.as_deref(),
+        &home_dir,
         &project_dir,
         resolved.worktree_walk_max_dirs,
     );
@@ -5637,6 +5642,7 @@ fn run_exec_command(
     warn_worktrees_not_audited(
         audit_enabled,
         worktree_root.as_deref(),
+        &home_dir,
         &project_dir,
         resolved.worktree_walk_max_dirs,
     );

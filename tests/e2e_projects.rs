@@ -4795,4 +4795,38 @@ if echo y > "{root_s}/g" 2>/dev/null; then echo RESULT:write:OK; else echo RESUL
             "{stderr}"
         );
     }
+
+    /// #574 round 8: with the key off, the session can rewrite a worktree's
+    /// `commondir` in place (only the key-on profile denies it, and the
+    /// key-off profile stays as on main). The session-end check still runs
+    /// whenever the root exists, and names the worktree.
+    #[test]
+    fn a_key_off_session_is_checked_at_its_end() {
+        require_sandbox!();
+        let project = TempProject::new("wt-offend");
+        project.write_file("f.txt", "x\n");
+        project.git_init();
+        let home = TempProject::new("wt-offend-home");
+        let (root, _) = managed_paths(&project, home.path());
+        let (stdout, stderr, _) = run_exec_with_home(
+            &project,
+            home.path(),
+            "[sandbox]\nallow_git_worktrees = true\n",
+            "git worktree add -q \"$CPLT_WORKTREE_ROOT/a\" -b a && echo RESULT:add:OK\n",
+        );
+        assert_result_ok(&stdout, &stderr, "add");
+        assert!(!stderr.contains("WORKTREE LINKS CHANGED"), "{stderr}");
+
+        let script = format!(
+            "echo \"{}/x\" > \"$PWD/.git/worktrees/a/commondir\" && echo RESULT:rewrite:OK\n",
+            root.display()
+        );
+        let (stdout, stderr, _) = run_exec_with_home(&project, home.path(), "", &script);
+        assert_result_ok(&stdout, &stderr, "rewrite");
+        assert!(
+            stderr.contains("WORKTREE LINKS CHANGED")
+                && stderr.contains(&format!("\n    {}\n", root.join("a").display())),
+            "the key-off session end names the worktree.\n{stderr}"
+        );
+    }
 }

@@ -314,9 +314,10 @@ pub const DEFAULT_WALK_MAX_DIRS: usize = 100_000;
 ///   `commondir`, of any file type: git's discovery takes that for a bare
 ///   repository and obeys the `config` beside it, with no `.git` anywhere.
 /// - Nothing directly in the root is anything but a directory.
-/// - No symlink anywhere below, dangling or not, unless it resolves inside
-///   its own worktree, which the walk covers. A link that leads out can be
-///   aimed at a repository the agent builds in `/private/tmp`, now or later.
+/// - No symlink anywhere below, dangling or not, unless it stays inside its
+///   own worktree, which the walk covers ([`link_stays_inside`]). A link that
+///   leads out, even one that comes back in, can be aimed at a repository the
+///   agent builds in `/private/tmp`, now or later.
 #[must_use]
 pub fn link_problems(common: &Path, root: &Path, max_dirs: usize) -> Vec<LinkProblem> {
     let mut out = Vec::new();
@@ -515,11 +516,11 @@ fn walk_problems(common: &Path, root: &Path, max_dirs: usize, out: &mut Vec<Link
                 continue;
             }
             if kind.is_symlink() && depth > 0 {
-                // Allowed only when it resolves inside its own worktree,
-                // where the walk sees whatever it leads to. Everything else,
+                // Allowed only when it stays inside its own worktree, where
+                // the walk sees whatever it leads to. Everything else,
                 // dangling included, can be aimed at a repository later.
                 let worktree = &counts[top].0;
-                if !std::fs::canonicalize(&path).is_ok_and(|t| t.starts_with(worktree)) {
+                if !link_stays_inside(&path, worktree) {
                     push(
                         &dir,
                         format!(
@@ -597,6 +598,48 @@ fn walk_problems(common: &Path, root: &Path, max_dirs: usize, out: &mut Vec<Link
     }
 }
 
+/// The symlink `link` leads into `worktree` without passing through anything
+/// outside it.
+///
+/// Where the link resolves today is not enough: `wt/l -> /private/tmp/s/d`
+/// with `/private/tmp/s -> wt` resolves inside the worktree, and re-aiming
+/// `/private/tmp/s` later (outside the root, so never checked) sends a `cd`
+/// into `wt/l` to a planted repository. So the target text, joined to the
+/// link's directory and normalised without touching the disk, must lie inside
+/// the worktree, and it must resolve inside it today.
+///
+/// A symlink met on the way is then inside the worktree, and the walk holds
+/// it to this same rule, so by induction nothing outside is ever traversed.
+/// That keeps chains like npm's `.bin/x -> ../pkg/bin/x` with a workspace
+/// `pkg -> ../packages/pkg` working. The normalising is exact only where no
+/// symlink precedes a `..`: leading `..` climb the link's own directories,
+/// which the walk reached as real directories, and a `..` after a name is
+/// refused.
+fn link_stays_inside(link: &Path, worktree: &Path) -> bool {
+    use std::path::Component;
+    let (Ok(target), Some(parent)) = (std::fs::read_link(link), link.parent()) else {
+        return false;
+    };
+    let mut lexical = parent.to_path_buf();
+    let mut named = false;
+    for part in target.components() {
+        match part {
+            Component::RootDir => lexical = PathBuf::from("/"),
+            Component::CurDir => {}
+            Component::ParentDir if !named => {
+                lexical.pop();
+            }
+            Component::Normal(name) => {
+                named = true;
+                lexical.push(name);
+            }
+            Component::ParentDir | Component::Prefix(_) => return false,
+        }
+    }
+    lexical.starts_with(worktree)
+        && std::fs::canonicalize(link).is_ok_and(|c| c.starts_with(worktree))
+}
+
 /// One `<root>/<name>/.git` pointer against its admin dir, both directions,
 /// by exact text.
 fn check_pointer(pointer: &Path, common: &Path) -> Result<(), String> {
@@ -642,22 +685,45 @@ pub fn existing_root_problems(
     project_dir: &Path,
     max_dirs: usize,
 ) -> Vec<LinkProblem> {
-    let is_dir = |p: &Path| p.symlink_metadata().is_ok_and(|m| m.is_dir());
+    let finding = |dir: &Path, detail: String| {
+        vec![LinkProblem {
+            dir: dir.to_path_buf(),
+            detail,
+        }]
+    };
+    // `None` when absent; a finding when it is there but not a directory we
+    // can look at (a symlink, a file, EACCES), since that is not "no root".
+    let present = |p: &Path| match p.symlink_metadata() {
+        Ok(m) if m.is_dir() => Ok(true),
+        Ok(_) => Err(finding(p, format!("{} is not a directory", p.display()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(finding(p, format!("cannot stat {}: {e}", p.display()))),
+    };
     let Ok(home) = std::fs::canonicalize(home_dir) else {
         return Vec::new();
     };
     let base = home.join(BASE);
-    if !is_dir(&base) {
-        return Vec::new();
+    match present(&base) {
+        Ok(true) => {}
+        Ok(false) => return Vec::new(),
+        Err(f) => return f,
     }
-    let Ok(Some(common)) = repository_common_dir(project_dir) else {
-        return Vec::new();
+    let common = match repository_common_dir(project_dir) {
+        Ok(Some(common)) => common,
+        Ok(None) => return Vec::new(),
+        Err(e) => {
+            return finding(
+                project_dir,
+                format!("cannot tell which worktree root belongs to this repository: {e}"),
+            );
+        }
     };
     let root = base.join(fingerprint(&common));
-    if !is_dir(&root) {
-        return Vec::new();
+    match present(&root) {
+        Ok(true) => link_problems(&common, &root, max_dirs),
+        Ok(false) => Vec::new(),
+        Err(f) => f,
     }
-    link_problems(&common, &root, max_dirs)
 }
 
 /// [`link_problems`] for the end of a session, re-deriving the common dir.
@@ -1460,5 +1526,122 @@ mod tests {
         let small = format!("{}: 1", root.join("small").display());
         assert!(p.detail.contains(&big), "{p:?}");
         assert!(p.detail.contains(&small), "{p:?}");
+    }
+
+    /// #574 round 8 blocker: `wt/l -> <outside>/s/d` with `<outside>/s -> wt`
+    /// resolves inside the worktree today, and re-aiming `s` later (never
+    /// checked, it is outside the root) sends git in `wt/l` elsewhere. The
+    /// link passes through a path outside the worktree, so it is a finding.
+    #[test]
+    fn a_symlink_back_in_through_an_outside_symlink_is_found() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let Some((common, root, wt)) = repo_with_worktree(&base) else {
+            eprintln!("SKIPPED: git unavailable");
+            return;
+        };
+        std::fs::create_dir_all(wt.join("d")).unwrap();
+        let s = base.join("s");
+        std::os::unix::fs::symlink(&wt, &s).unwrap();
+        let l = wt.join("l");
+        std::os::unix::fs::symlink(s.join("d"), &l).unwrap();
+        assert!(
+            std::fs::canonicalize(&l).unwrap().starts_with(&wt),
+            "the chain resolves inside the worktree today"
+        );
+        let problems = link_problems(&common, &root, DEFAULT_WALK_MAX_DIRS);
+        assert!(
+            finding(&problems, &l).is_some_and(|p| p.detail.contains("symlink")),
+            "{problems:?}"
+        );
+    }
+
+    /// The rule still lets a chain of links that stay inside the worktree
+    /// through (npm workspaces: `.bin/x -> ../pkg/bin/x`, `pkg ->
+    /// ../packages/pkg`), and refuses a `..` after a name, which the kernel
+    /// resolves against wherever a symlink before it points.
+    #[test]
+    fn links_chained_inside_the_worktree_pass() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let Some((common, root, wt)) = repo_with_worktree(&base) else {
+            eprintln!("SKIPPED: git unavailable");
+            return;
+        };
+        std::fs::create_dir_all(wt.join("packages/pkg/bin")).unwrap();
+        std::fs::write(wt.join("packages/pkg/bin/x"), "").unwrap();
+        std::fs::create_dir_all(wt.join("node_modules/.bin")).unwrap();
+        std::os::unix::fs::symlink("../packages/pkg", wt.join("node_modules/pkg")).unwrap();
+        std::os::unix::fs::symlink("../pkg/bin/x", wt.join("node_modules/.bin/x")).unwrap();
+        assert_eq!(
+            link_problems(&common, &root, DEFAULT_WALK_MAX_DIRS),
+            Vec::<LinkProblem>::new()
+        );
+
+        let up = wt.join("up");
+        std::os::unix::fs::symlink("packages/../packages/pkg", &up).unwrap();
+        let problems = link_problems(&common, &root, DEFAULT_WALK_MAX_DIRS);
+        assert!(finding(&problems, &up).is_some(), "{problems:?}");
+    }
+
+    /// With the key off, a root an earlier session left is still checked. A
+    /// root cplt cannot look at (EACCES) and a repository whose common dir
+    /// cannot be told are findings, not "no root".
+    #[test]
+    fn an_existing_root_is_checked_with_the_key_off() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let main = base.join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        if !git_in(&main, &["init", "-q", "-b", "main"]) {
+            eprintln!("SKIPPED: git unavailable");
+            return;
+        }
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let max = DEFAULT_WALK_MAX_DIRS;
+        assert_eq!(existing_root_problems(&home, &main, max), Vec::new());
+
+        let common = main.join(".git");
+        let root = home.join(BASE).join(fingerprint(&common));
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(existing_root_problems(&home, &main, max), Vec::new());
+        std::os::unix::fs::symlink("/", root.join("out")).unwrap();
+        let problems = existing_root_problems(&home, &main, max);
+        assert!(
+            finding(&problems, &root.join("out")).is_some(),
+            "{problems:?}"
+        );
+        std::fs::remove_file(root.join("out")).unwrap();
+
+        let base_dir = home.join(BASE);
+        std::fs::set_permissions(&base_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = std::fs::read_dir(&base_dir).is_ok(); // root ignores modes
+        let problems = existing_root_problems(&home, &main, max);
+        std::fs::set_permissions(&base_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if !readable {
+            assert!(
+                problems.iter().any(|p| p.detail.starts_with("cannot stat")),
+                "{problems:?}"
+            );
+        }
+
+        // A steered `commondir` makes `repository_common_dir` fail.
+        let other = base.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        assert!(git_in(&other, &["init", "-q", "-b", "main"]));
+        std::fs::write(
+            common.join("commondir"),
+            other.join(".git").to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        let problems = existing_root_problems(&home, &main, max);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.detail.starts_with("cannot tell which worktree root")),
+            "{problems:?}"
+        );
     }
 }

@@ -663,19 +663,35 @@ does not:
     `objects` and `refs` with `access(X_OK)`, which an executable regular
     file passes);
   - anything directly in the root that is not a directory;
-  - any symlink below the root, dangling or not, unless it resolves inside
-    its own worktree, where the walk sees whatever it leads to. A link that
-    leads out can be aimed at a repository in `/private/tmp`, now or later.
-    Links inside the worktree, like `node_modules/.bin`, stay allowed.
+  - any symlink below the root, dangling or not, unless it stays inside its
+    own worktree: its target text, joined to the link's directory and
+    normalised without following anything, lies inside the worktree (a `..`
+    is accepted only before the first name), and it resolves inside the
+    worktree today. Resolving inside is not enough on its own:
+    `wt/l -> /private/tmp/s/d` with `/private/tmp/s -> wt` resolves inside,
+    and re-aiming `/private/tmp/s` later, outside the root where nothing
+    checks it, sends Git in `wt/l` to a planted repository. A link met on
+    the way is inside the worktree and held to the same rule, so nothing
+    outside is traversed. Links that stay inside, like npm's
+    `node_modules/.bin/x -> ../pkg/bin/x` through a workspace link, are
+    allowed.
 
   Anything it cannot read and a tree past its bounds (64 levels,
   `sandbox.worktree_walk_max_dirs` directories, 100 000 by default) is a
   finding, and the launch refuses to start. At session end it runs the same
   check and prints an error naming each directory not to run Git in. That
-  error is advisory: nothing stops Git from running there if you do. With
-  the key off, cplt still runs the check at launch whenever this
-  repository's root exists, and prints the same error, but the launch goes
-  ahead, since the session grants nothing in the root. Submodules inside a
+  error is advisory: nothing stops Git from running there if you do.
+
+  **With the key off**, the session is not granted the root, but it can
+  still rewrite a worktree's `<common>/worktrees/<id>/commondir` in place:
+  that deny is part of the key-on profile only, so the key-off profile stays
+  exactly as on main, where any linked worktree's `commondir` is writable the
+  same way. So whenever this repository's root exists, cplt runs the same
+  check at launch and at session end with the key off too, and prints the
+  same error. It does not refuse the launch, since the session grants
+  nothing in the root. A root it cannot inspect (a permission error on
+  `~/.cplt-worktrees` or the root) or a repository whose common directory
+  cannot be established is reported, not treated as no root. Submodules inside a
   managed worktree are refused by the same rules. The strict text also
   refuses worktrees Git wrote with relative paths
   (`worktree.useRelativePaths`); turn that option off for this repository.

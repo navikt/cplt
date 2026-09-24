@@ -497,13 +497,22 @@ What you get:
     `objects` and `refs`, or `HEAD` with a `commondir`, whatever their file
     type;
   - anything directly in the root that is not a directory, such as a symlink;
-  - any symlink below the root, dangling or not, unless it resolves inside
-    its own worktree (links like `node_modules/.bin` do).
+  - any symlink below the root, dangling or not, unless it stays inside its
+    own worktree: its target, read as text, must name a path inside the
+    worktree (a `..` only before the first name), and it must resolve there.
+    A link that reaches the worktree through a symlink outside it is a
+    finding, since that outside symlink can be re-aimed later. Links like
+    npm's `node_modules/.bin/x -> ../pkg/bin/x` pass.
 
   Any finding prints an error at session end naming the directories not to
   run Git in, and makes the next launch with the key on refuse to start.
-  With the key off, cplt still checks this repository's root at launch if it
-  exists and prints the same error, but the launch goes ahead. Submodules
+  With the key off, a session can still rewrite a worktree's `commondir` in
+  place (the deny that stops it is part of the key-on profile only, so the
+  key-off profile is unchanged from main). So whenever this repository's
+  root exists, cplt runs the same check at launch and at session end with
+  the key off too, and prints the same error, but the launch goes ahead. A
+  root it cannot inspect, or a repository whose common directory it cannot
+  establish, is reported rather than skipped. Submodules
   inside a managed worktree are refused for the same reason. So are
   worktrees written with `worktree.useRelativePaths`, since the check expects
   the absolute paths Git writes by default.
