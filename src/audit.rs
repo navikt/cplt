@@ -1194,6 +1194,12 @@ impl AuditMode {
 /// way, following the link, since git run in `<root>/tools -> /tmp/evil` obeys
 /// `/tmp/evil`'s config.
 ///
+/// Three more things are reported because a repository test at check time
+/// cannot see through them: every new or re-aimed symlink that leads outside
+/// every root (the repository may be one level down, or armed later), every
+/// directory the walk could not list, and a root that gained a `.git` or
+/// layout it did not have at launch.
+///
 /// The scan runs after the settle probe. A descendant that detaches and
 /// outlives it can still plant afterwards; the report says when the session
 /// left processes running.
