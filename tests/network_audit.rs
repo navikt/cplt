@@ -342,7 +342,9 @@ mod tests {
             "{stderr}"
         );
         assert!(
-            stderr.contains("network activity after the cutoff is excluded"),
+            stderr.contains(
+                "network activity after the cutoff may be missing from the observed hosts and --observe-domains-out"
+            ),
             "{stderr}"
         );
         assert!(!stderr.contains(RECORDED), "{stderr}");
