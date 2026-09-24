@@ -1154,6 +1154,20 @@ impl AuditMode {
             Self::Disabled
         }
     }
+
+    /// Warning for a session whose descendants outlived the settle probe.
+    /// Only `Enabled` audits file changes, so only it may say "NOT audited" (#538).
+    fn unsettled_warning(self) -> Option<&'static str> {
+        match self {
+            Self::Disabled => None,
+            Self::ObserveOnly => Some(
+                "the session left processes running — network activity after the cutoff may be missing from the observed hosts and --observe-domains-out",
+            ),
+            Self::Enabled => Some(
+                "the session left processes running — anything they change from here on is NOT audited; network activity after the cutoff is excluded",
+            ),
+        }
+    }
 }
 
 /// Wrap a sandboxed exec with the audit lifecycle: capture the baseline just
@@ -1217,10 +1231,8 @@ pub fn run<F: FnOnce() -> u8, C: FnOnce() -> Option<proxy::ProxySnapshot>>(
             ui::warn(&line);
         }
     }
-    if mode != AuditMode::Disabled && !settled {
-        ui::warn(
-            "the session left processes running — anything they change from here on is NOT audited; network activity after the cutoff is excluded",
-        );
+    if let Some(line) = mode.unsettled_warning().filter(|_| !settled) {
+        ui::warn(line);
     }
     (exit_code, snapshot)
 }
@@ -1233,6 +1245,21 @@ mod tests {
 
     fn set(items: &[&str]) -> BTreeSet<String> {
         items.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn unsettled_warning_enabled_says_not_audited() {
+        let line = AuditMode::Enabled.unsettled_warning().unwrap();
+        assert!(line.contains("NOT audited"), "{line}");
+    }
+
+    #[test]
+    fn unsettled_warning_observe_only_names_observed_hosts() {
+        let line = AuditMode::ObserveOnly.unsettled_warning().unwrap();
+        assert!(!line.contains("NOT audited"), "{line}");
+        assert!(line.contains("observed hosts"), "{line}");
+        assert!(line.contains("--observe-domains-out"), "{line}");
+        assert_eq!(AuditMode::Disabled.unsettled_warning(), None);
     }
 
     /// The forgery from GHSA-c47q-c3c8-7wrf, at byte level.

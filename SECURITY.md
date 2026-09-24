@@ -179,8 +179,13 @@ cplt assumes the sandboxed agent is **untrusted**, because it executes arbitrary
 | Mount namespace isolation | N/A (not applicable) | ❌ Not available | ✅ Kernel namespace |
 | User namespace (unprivileged) | N/A (not applicable) | ❌ Not available | ✅ Kernel namespace |
 | --deny-path / deny.paths | ✅ Kernel deny | ❌ No effect (warned) | ✅ Mount-masked (files read as EACCES, dirs appear empty; the real content is unreachable) |
+| Metadata of a denied file (`stat`, `access`) | ✅ Denied with the read | ❌ Not mediated: exists and reports readable, then `open` fails with EACCES | ⚠️ Masked paths (`deny.paths`/`--deny-path`, credential-dir masks): mode-000 placeholder — `stat` sees an empty, unreadable file and `access(R_OK)` correctly fails. Everything else: same as Landlock |
 
 Legend: ✅ = kernel-enforced, ⚠️ = defense-in-depth (proxy/env), ❌ = not available
+
+**Landlock does not mediate metadata.** Its access rights cover opening, reading, writing, executing and directory changes. There is no right for `stat(2)`, `access(2)` or `faccessat(2)`. On Linux, a file the sandbox denies still shows up as present, and `access(path, R_OK)` returns success. The `open(2)` that follows then fails with `EACCES`. Seatbelt denies the metadata call along with the read, so on macOS the check fails too. On Linux the sandbox can see a denied file's existence, size and timestamps, but not its contents. The bigger effect is on programs that check a file and then use it: on Linux they are told the file is readable and then fail on the open, while on macOS they treat it as absent and carry on. cplt cannot fix this in general. The workaround is per tool: grant the file with `allow.read` if the tool needs it, or point the tool at a path that does not exist so the check and the open agree. cplt does the second for `~/.npmrc` via `NPM_CONFIG_USERCONFIG` ([#180](https://github.com/navikt/cplt/issues/180), [#389](https://github.com/navikt/cplt/issues/389)).
+
+**Bubblewrap changes this only for paths it explicitly masks.** A `deny.paths`/`--deny-path` target, or a credential-directory entry masked under [Linux namespace isolation](#linux-namespace-isolation-bubblewrap), is not left as the Landlock-denied original — bwrap binds a real, empty, mode-000 file over it. `stat` therefore reports that placeholder (present, zero-length, unreadable by anyone), and `access(path, R_OK)` correctly fails on it instead of lying. Every other Landlock-denied path — anything simply outside an `allow.*` grant, like `~/.npmrc` — is untouched by Bubblewrap and behaves exactly as the Landlock-only column.
 
 ### Linux namespace isolation (Bubblewrap)
 
@@ -545,11 +550,11 @@ free, and the wording here has been wrong in both directions before.
   permit `TIOCSTI` with no capability at all. So on Linux the availability of
   the primitive is a property of the kernel the user happens to be running, and
   cplt cannot assume it is absent. Landlock does not help: it has no rule that
-  reaches an ioctl on an inherited descriptor. Denying `TIOCSTI` and `TIOCLINUX`
-  in the seccomp filter is the fix, and **it is not on `main` as of this
-  writing** — the filter table below does not list either. Until it lands,
-  assume an agent on a `CONFIG_LEGACY_TIOCSTI=y` kernel can inject into the
-  terminal cplt inherited.
+  reaches an ioctl on an inherited descriptor. What denies it is the seccomp
+  filter: `build_seccomp_filter` in `src/sandbox_landlock.rs` (step 2b) returns
+  `EPERM` for any `ioctl` whose request is `TIOCSTI` or `TIOCLINUX`, on any
+  descriptor. It is applied in every mode, with or without Bubblewrap
+  (GHSA-q3p2-6x2x-8w8w).
 
 The exposure is the same on both platforms and is not about peer terminals at
 all: `/dev/tty` and the inherited descriptors 0/1/2 name the agent's own

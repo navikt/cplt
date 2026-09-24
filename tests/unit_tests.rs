@@ -844,8 +844,9 @@ fn landlock_policy_device_files_have_ioctl() {
     // applies to every peer terminal's slave, not just the agent's own —
     // read captures what the user types in another window, write forges
     // output in it, and ioctl reaches TIOCSTI on a kernel that still exposes
-    // it (pre-6.2, or dev.tty.legacy_tiocsti=1), which is keystroke
-    // injection. No rule at all: the agent's terminal is an inherited fd and
+    // it (pre-6.2, or CONFIG_LEGACY_TIOCSTI=y, which is `default y` upstream,
+    // unless dev.tty.legacy_tiocsti=0), which is keystroke injection. No
+    // rule at all: the agent's terminal is an inherited fd and
     // /dev/tty covers the rest.
     assert!(
         !policy
