@@ -3386,6 +3386,27 @@ mod tests {
         );
     }
 
+    /// `sandbox.deny_copilot_dir_exec` is Linux-only (#324): on macOS the
+    /// Copilot profile is the same with the key on and off.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn deny_copilot_dir_exec_leaves_the_macos_profile_unchanged() {
+        let project = Path::new("/Users/test/repo");
+        let home = Path::new("/Users/test");
+        let profile = |on: bool| {
+            let mut r = crate::config::Config::default()
+                .merge(crate::config::CliFlags::default())
+                .expect("default config merges");
+            r.deny_copilot_dir_exec = on;
+            let dirs = r.agent_config_dirs(crate::agent::Agent::Copilot, home);
+            let mut opts = test_options(project, home);
+            opts.agent = crate::agent::Agent::Copilot;
+            opts.agent_dirs = &dirs;
+            generate_profile(&opts, &[])
+        };
+        assert_eq!(profile(false), profile(true));
+    }
+
     /// `--project-dir <subdir>` with `sandbox.agents_md`: the root AGENTS.md
     /// cplt writes is readable as one literal, and nothing else in the root
     /// is granted (#252). A refused path emits nothing.

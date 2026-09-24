@@ -833,15 +833,15 @@ What it costs for Copilot: the token sits in the agent's environment, Copilot au
 
 ## No execute on `~/.copilot` (`sandbox.deny_copilot_dir_exec`)
 
-On Linux, the Copilot agent gets read, write and execute on `~/.copilot`. A directory the agent can both write to and run programs from is a place to drop a binary and run it, the same pair cplt refuses when `allow.exec` asks for it ([#324](https://github.com/navikt/cplt/issues/324)). Copilot does not need the execute part: traced on Linux, Copilot CLI 1.0.88 ran nothing from `~/.copilot` for a prompt, its search tool or a shell command. Its bundled programs (`rg`, `tgrep`) run from `~/.cache/copilot/pkg`, and its native `.node` addons load with read access alone.
+On Linux, the Copilot agent gets read, write and execute on `~/.copilot`. A directory the agent can both write to and run programs from is a place to drop a binary and run it, the same pair cplt refuses when `allow.exec` asks for it ([#324](https://github.com/navikt/cplt/issues/324)). In one trace, Copilot CLI 1.0.88 on linux-arm64, with no plugins, MCP servers, hooks or LSP servers installed, ran nothing from `~/.copilot` for a prompt, its search tool or a shell command. Its bundled programs (`rg`, `tgrep`) ran from `~/.cache/copilot/pkg`, and its native `.node` addons load with read access alone. Other versions and set-ups were not traced.
 
 ```bash
 cplt config set sandbox.deny_copilot_dir_exec true
 ```
 
-With the key on, `~/.copilot` stays readable and writable and loses execute, under Landlock and under Bubblewrap. Off by default for now, because anything you have set up to run as a program stored under `~/.copilot` stops working: a plugin, MCP server or hook whose command is a path in there. Commands started through an interpreter (`node ~/.copilot/...`, `bash ~/.copilot/...`) keep working, because the interpreter is what gets executed.
+With the key on, `~/.copilot` stays readable and writable and loses execute, under Landlock and under Bubblewrap. Off by default for now, because anything you have set up to run as a program stored under `~/.copilot` stops working: a plugin, MCP server, LSP server or hook whose command is a path in there. Commands started through an interpreter (`node ~/.copilot/...`, `bash ~/.copilot/...`) keep working, because the interpreter is what gets executed.
 
-It has no effect on macOS, where the profile is unchanged. The trace was done on Linux only.
+It has no effect on macOS, where the profile is unchanged and the launch warns that the key was ignored. The trace was done on Linux only.
 
 ## Configuration file
 

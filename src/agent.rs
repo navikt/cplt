@@ -2004,12 +2004,18 @@ fn dsh_home(home: &Path) -> PathBuf {
 /// `sandbox.deny_copilot_dir_exec` (#324): withdraw execve from `~/.copilot`.
 ///
 /// Call before [`canonicalize_agent_dirs`], which may rewrite the path. Only
-/// the Linux callers apply it; see the grant in [`Agent::config_dirs`].
-pub fn deny_copilot_dir_exec(dirs: &mut [AgentDir], home: &Path) {
+/// Linux applies it, through `Resolved::agent_config_dirs`; see the grant in
+/// [`Agent::config_dirs`]. Returns whether a `~/.copilot` entry was found, so
+/// a caller can tell a relocated config dir from a withdrawn grant.
+#[must_use]
+pub fn deny_copilot_dir_exec(dirs: &mut [AgentDir], home: &Path) -> bool {
     let copilot = home.join(".copilot");
+    let mut matched = false;
     for dir in dirs.iter_mut().filter(|d| d.path == copilot) {
         dir.process_exec = false;
+        matched = true;
     }
+    matched
 }
 
 /// Resolve each agent dir to its real path, in place.

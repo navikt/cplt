@@ -411,7 +411,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: false,
         default_display: "false",
-        description: "Linux only: stop granting execute on ~/.copilot, so the writable directory Copilot keeps its config in is not also a place to run a dropped binary from (#324). Copilot runs its bundled tools from ~/.cache/copilot/pkg. Breaks a plugin, MCP server or hook launched as a program stored under ~/.copilot. No effect on macOS.",
+        description: "Linux only: stop granting execute on ~/.copilot, so the writable directory Copilot keeps its config in is not also a place to run a dropped binary from (#324). Copilot runs its bundled tools from ~/.cache/copilot/pkg. Breaks a plugin, MCP server, LSP server or hook launched as a program stored under ~/.copilot. No effect on macOS, where the launch warns instead.",
     },
     ConfigKeyInfo {
         section: "sandbox",

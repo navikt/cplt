@@ -4696,10 +4696,16 @@ mod tests {
     fn deny_copilot_dir_exec_drops_only_execute_on_dot_copilot() {
         let project = PathBuf::from("/home/user/project");
         let home = PathBuf::from("/home/user");
+        // No `~/.copilot` entry: reported, so a relocated dir is not silent.
+        let mut claude_dirs = crate::agent::Agent::Claude.config_dirs(&home);
+        assert!(!crate::agent::deny_copilot_dir_exec(
+            &mut claude_dirs,
+            &home
+        ));
         let rules = |deny: bool| {
             let mut agent_dirs = crate::agent::Agent::Copilot.config_dirs(&home);
             if deny {
-                crate::agent::deny_copilot_dir_exec(&mut agent_dirs, &home);
+                assert!(crate::agent::deny_copilot_dir_exec(&mut agent_dirs, &home));
             }
             let mut config = test_config(&project, &home);
             config.agent_dirs = &agent_dirs;

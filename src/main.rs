@@ -5197,10 +5197,17 @@ fn assemble_sandbox(
     let playwright_socket_path = None;
 
     // Compute agent-specific sandbox directories
-    let mut agent_dirs = active_agent.config_dirs(home_dir);
-    // Linux only: macOS keeps `~/.copilot` as it was (#324).
-    if cfg!(target_os = "linux") && resolved.deny_copilot_dir_exec {
-        agent::deny_copilot_dir_exec(&mut agent_dirs, home_dir);
+    let mut agent_dirs = resolved.agent_config_dirs(active_agent, home_dir);
+    // A restriction the user asked for and cannot have is said out loud, not
+    // dropped (AGENTS.md "No silent grants").
+    #[cfg(target_os = "macos")]
+    if resolved.deny_copilot_dir_exec && active_agent.needs_copilot_dir() {
+        ui::warn(
+            "sandbox.deny_copilot_dir_exec has no effect on macOS: ~/.copilot keeps \
+             execute there. The key was verified on Linux only (#324), and on macOS \
+             Copilot's exec reaches ~/.copilot through the profile-wide process-exec \
+             allow, not a rule of its own, so dropping it needs a separate check.",
+        );
     }
 
     // Pre-create agent directories before entering sandbox.
@@ -7005,10 +7012,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
 
     // ── the policy a launch would build, for the rules below ──
     let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
-    let mut agent_dirs = active_agent.config_dirs(&home_dir);
-    if cfg!(target_os = "linux") && resolved.deny_copilot_dir_exec {
-        agent::deny_copilot_dir_exec(&mut agent_dirs, &home_dir);
-    }
+    let mut agent_dirs = resolved.agent_config_dirs(active_agent, &home_dir);
     agent::canonicalize_agent_dirs(&mut agent_dirs);
     let keychain_substitute = cplt::sandbox::keychain_substitute(
         active_agent,
