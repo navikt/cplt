@@ -3391,8 +3391,13 @@ else
         *"Operation not permitted"*|*"not permitted"*|*"Permission denied"*|*"sandbox"*|*"deny("*)
             echo "RESULT:gradle_build:FAIL:sandbox_deny"
             ;;
+        # No usable JDK in the sandbox's environment: a host setup problem,
+        # not a denial. Anything else is unexplained and must fail (#126).
+        *"JAVA_HOME is set to an invalid directory"*|*"Unable to locate a Java Runtime"*|*"No Java runtime present"*)
+            echo "RESULT:gradle_build:OK:known_non_sandbox_error"
+            ;;
         *)
-            echo "RESULT:gradle_build:OK:build_error_but_not_sandbox"
+            echo "RESULT:gradle_build:FAIL:unknown_error"
             ;;
     esac
 fi
