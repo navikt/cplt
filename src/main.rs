@@ -605,7 +605,9 @@ actually on screen, then turn it back off."
     /// files (a marked block, each file backed up before its first edit). The
     /// shims reach scripts, `zsh -c` and IDE-launched agents, which an alias
     /// cannot. Opt-in; `cplt --shell-uninstall` removes all of it.
-    #[arg(long, requires = "shell_install")]
+    /// With --shell-setup: print the aliases of every shimmed agent (what the
+    /// installed rc block evaluates).
+    #[arg(long)]
     shims: bool,
 
     /// Remove what `--shell-install --shims` added: the rc file blocks, their
@@ -3543,14 +3545,25 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             }
         };
         if cli.shell_setup {
-            for line in cplt::shim::alias_lines(agent, false) {
-                println!("{line}");
+            // Inside a sandbox the aliases would only start a nested cplt,
+            // and the sync belongs to the host.
+            if std::env::var_os("__CPLT_WRAPPED").is_some() {
+                return Ok(ExitCode::SUCCESS);
             }
+            let home = std::env::var_os("HOME").map(PathBuf::from);
             // #514: the rc line every new shell runs is also where a newly
             // installed agent gets its shim. Nothing on stdout, which `eval`
             // reads; a no-op unless the user opted in.
-            if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-                sync_shims(&home);
+            if let Some(home) = &home {
+                sync_shims(home, cplt::shim::SyncMode::Background);
+            }
+            let lines = match (&home, cli.shims) {
+                (Some(home), true) => cplt::shim::shimmed_aliases(home),
+                (None, true) => Vec::new(),
+                (_, false) => cplt::shim::alias_lines(agent, false),
+            };
+            for line in lines {
+                println!("{line}");
             }
             return Ok(ExitCode::SUCCESS);
         }
@@ -3558,6 +3571,10 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             return Ok(shell_install_shims(agent));
         }
         return Ok(shell_install(agent));
+    }
+    if cli.shims {
+        ui::error("--shims goes with --shell-install or --shell-setup");
+        return Ok(ExitCode::FAILURE);
     }
     if cli.shell_uninstall {
         return Ok(shell_uninstall(cli.agent.as_deref()));
@@ -3832,7 +3849,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
 
     // #514: shim an agent installed since the last sync. A no-op unless the
     // user opted in with `--shell-install --shims`.
-    sync_shims(&home_dir);
+    sync_shims(&home_dir, cplt::shim::SyncMode::Background);
 
     // Unwrap the agent binary resolution (deferred from above).
     let agent_bin = match agent_bin_result {
@@ -6522,7 +6539,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
 
     // ── PATH shims (#514): only once the user opted in ──
     if cplt::shim::installed(&home_dir) {
-        sync_shims(&home_dir);
+        sync_shims(&home_dir, cplt::shim::SyncMode::Doctor);
         doctor_shims(&home_dir, &mut findings, &mut ok);
     }
 
@@ -9279,14 +9296,14 @@ fn shell_skip() -> Option<Vec<String>> {
 
 /// Bring the shim directory up to date. Does nothing unless the user opted in.
 /// Never fails the caller: a sync that cannot write says so and moves on.
-fn sync_shims(home: &Path) {
+fn sync_shims(home: &Path, mode: cplt::shim::SyncMode) {
     if !cplt::shim::installed(home) {
         return;
     }
     let Some(skip) = shell_skip() else {
         return;
     };
-    let report = cplt::shim::sync(home, &skip);
+    let report = cplt::shim::sync(home, &skip, mode);
     for c in report.done {
         ui::info(&format!("PATH shims: {}", doctor_tilde(&c, home)));
     }
@@ -9353,8 +9370,26 @@ fn shell_install_shims(agent: agent::Agent) -> ExitCode {
     let Some(skip) = shell_skip() else {
         return ExitCode::FAILURE;
     };
+    // zsh reads `.zshenv` from `$ZDOTDIR` as it stood when zsh started, and
+    // the rest from wherever `.zshenv` moved it to. Which files that is cannot
+    // be told from here, and a block in a file zsh never reads would leave the
+    // shims off PATH while looking installed.
+    if let Some(z) = std::env::var_os("ZDOTDIR").filter(|z| {
+        !z.is_empty() && std::fs::canonicalize(z).ok() != std::fs::canonicalize(&home).ok()
+    }) {
+        ui::error(&format!(
+            "ZDOTDIR is set ({}), and cplt writes ~/.zshenv, ~/.zprofile and ~/.zshrc, \
+             which such a zsh may not read. Not installing. If ~/.zshenv is what sets \
+             ZDOTDIR (it is still read), run `ZDOTDIR= cplt --shell-install --shims`; \
+             otherwise add this line to $ZDOTDIR/.zshenv:\n  {}",
+            PathBuf::from(z).display(),
+            cplt::shim::POSIX_PATH_LINE
+        ));
+        return ExitCode::FAILURE;
+    }
     let shell = std::env::var("SHELL").unwrap_or_default();
-    let report = cplt::shim::install(&home, &shell, agent, &skip);
+    let path = std::env::var("PATH").unwrap_or_default();
+    let report = cplt::shim::install(&home, &path, &shell, agent, &skip);
     for line in &report.done {
         ui::ok(&doctor_tilde(line, &home));
     }

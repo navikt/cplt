@@ -2160,6 +2160,21 @@ mod e2e_tests {
             profile_before
         );
 
+        // The block's single eval: every shimmed agent's alias, and nothing
+        // inside a sandbox.
+        let setup = |wrapped: bool| {
+            let mut cmd = cplt_cmd();
+            cmd.args(["--shell-setup", "--shims"])
+                .env("HOME", home.path())
+                .env("PATH", format!("{}:/usr/bin:/bin", fake.path().display()));
+            if wrapped {
+                cmd.env("__CPLT_WRAPPED", "1");
+            }
+            String::from_utf8_lossy(&cmd.output().unwrap().stdout).into_owned()
+        };
+        assert_eq!(setup(false), "alias copilot='cplt --agent copilot'\n");
+        assert_eq!(setup(true), "");
+
         let second = install_shims(home.path(), fake.path());
         assert!(second.status.success());
         assert_eq!(
@@ -2271,6 +2286,56 @@ mod e2e_tests {
                 .collect::<Vec<_>>(),
             args,
             "args must pass through exactly: {got:?}"
+        );
+    }
+
+    /// `.zshenv` runs for every `zsh -c` the sandboxed agent spawns. Its PATH
+    /// line must not put the shim directory back there, or a tool call that
+    /// runs an agent by name hits the shim's loop guard (exit 126).
+    #[test]
+    fn e2e_zsh_in_the_sandbox_resolves_the_real_agent() {
+        require_sandbox!();
+        if !Path::new("/bin/zsh").exists() {
+            eprintln!("SKIP: no /bin/zsh");
+            return;
+        }
+        // Under the checkout, like the fake agent: exec is denied under the
+        // temp dir, and `command -v` skips a shim it could not exec, which
+        // would pass this test whatever `.zshenv` did.
+        let home = tempfile::Builder::new()
+            .prefix(".cplt-e2e-home-")
+            .tempdir_in(project_dir())
+            .unwrap();
+        let fake = fake_agent_dir("copilot");
+        let out = install_shims(home.path(), fake.path());
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let zshenv = std::fs::read_to_string(home.path().join(".zshenv")).unwrap();
+        assert!(zshenv.contains(".local/share/cplt/bin"), "{zshenv}");
+        let out = cplt_cmd()
+            .args(["--no-validate", "exec", "--", "/bin/zsh", "-c"])
+            .arg("command -v copilot")
+            .env("HOME", home.path())
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}:/usr/bin:/bin",
+                    shim_dir(home.path()).display(),
+                    fake.path().display()
+                ),
+            )
+            .current_dir(project_dir())
+            .output()
+            .expect("cplt exec should run");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            stdout.trim(),
+            fake.path().join("copilot").display().to_string(),
+            "stderr: {stderr}"
         );
     }
 

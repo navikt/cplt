@@ -600,7 +600,7 @@ The settings below are machine-specific or local CLI preferences, so `.cplt.toml
 
 ### `shell.skip`
 
-Agents the PATH shim sync leaves out, by `--agent` name or command name. It only matters after `cplt --shell-install --shims` (see the README's "PATH shims" section). Adding an agent removes its shim at the next sync; removing it from the list brings the shim back.
+Agents the PATH shim sync leaves out, by `--agent` name or command name. It only matters after `cplt --shell-install --shims` (see the README's "PATH shims" section). Adding an agent removes its shim at the next sync; removing it from the list brings the shim back (for `goose` and `pi`, which need a version check, at the next `cplt doctor` or `cplt --shell-install --shims`).
 
 ```bash
 cplt config set shell.skip goose     # your goose is pressly/goose, not Block's agent

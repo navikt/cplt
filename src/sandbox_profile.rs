@@ -2857,6 +2857,11 @@ mod tests {
             !before.contains("cplt PATH shims") && !before.contains(".local/share/cplt"),
             "no shim rules before the user opts in"
         );
+        // Byte-identical, not just free of shim rules: a directory next to
+        // (and above) the shim dir changes nothing until the shim dir exists.
+        std::fs::create_dir_all(home.join(".local/share/cplt")).expect("mkdir parent");
+        std::fs::create_dir_all(home.join(".local/share/other")).expect("mkdir other");
+        assert_eq!(generate_profile(&opts, &[]), before);
 
         std::fs::create_dir_all(&shims).expect("mkdir shims");
         let p = generate_profile(&opts, &[]);
