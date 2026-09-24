@@ -1403,7 +1403,7 @@ approved_at = "2026-05-01T12:00:00Z"
                 // The machine's own git config must not decide whether the
                 // fixture builds: `commit.gpgsign` and `core.hooksPath` both
                 // can (tests/common/mod.rs, issue #245).
-                .env_remove("GIT_CONFIG_GLOBAL")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("GIT_AUTHOR_NAME", "t")
                 .env("GIT_AUTHOR_EMAIL", "t@e")

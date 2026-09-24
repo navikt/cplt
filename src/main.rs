@@ -11759,6 +11759,8 @@ mod tests {
         std::process::Command::new("git")
             .args(["init", "--quiet"])
             .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .status()
             .is_ok_and(|s| s.success())
     }

@@ -3856,6 +3856,8 @@ mod tests {
             let ok = std::process::Command::new("git")
                 .args(args)
                 .current_dir(cwd)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("GIT_AUTHOR_NAME", "t")
                 .env("GIT_AUTHOR_EMAIL", "t@e")
                 .env("GIT_COMMITTER_NAME", "t")
