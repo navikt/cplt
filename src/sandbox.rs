@@ -3240,25 +3240,41 @@ mod tests {
         }
     }
 
-    /// Spelling the default is the same launch as leaving the variable unset,
-    /// even when the default is itself reached through a link in a writable
-    /// tree (`~/.cache/copilot -> ~/copilot`), which a link check would refuse.
+    /// The default reached through a link in its writable cache
+    /// (`~/.cache/copilot -> ~/copilot`, or at `pkg`) is refused, set or
+    /// unset: the agent can re-point that link, and the host runs Copilot
+    /// from wherever it leads. Same stance as for an override (#570).
     #[test]
-    fn prepare_accepts_the_spelled_default_copilot_cache_behind_a_link() {
-        let (_guard, root) = copilot_cache_tree();
-        let home = root.join("home");
-        std::fs::create_dir_all(home.join("copilot/pkg")).unwrap();
-        for d in [".cache", "Library/Caches"] {
-            std::fs::create_dir_all(home.join(d)).unwrap();
-            std::os::unix::fs::symlink(home.join("copilot"), home.join(d).join("copilot")).unwrap();
+    fn prepare_refuses_the_default_copilot_cache_behind_a_writable_link() {
+        for linked in ["copilot", "copilot/pkg"] {
+            let (_guard, root) = copilot_cache_tree();
+            let home = root.join("home");
+            std::fs::create_dir_all(home.join("real/pkg")).unwrap();
+            for d in [".cache", "Library/Caches"] {
+                let at = home.join(d).join(linked);
+                std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+                let to = home.join(if linked == "copilot" {
+                    "real"
+                } else {
+                    "real/pkg"
+                });
+                std::os::unix::fs::symlink(to, at).unwrap();
+            }
+            let (var, value) = if cfg!(target_os = "macos") {
+                ("COPILOT_CACHE_HOME", home.join("Library/Caches/copilot"))
+            } else {
+                ("XDG_CACHE_HOME", home.join(".cache"))
+            };
+            for var in [var, "UNSET"] {
+                let error = prepare_with_copilot_cache(&root, var, &value, &[])
+                    .expect_err("a linked default must stop the launch");
+                assert!(
+                    error.contains("the writable tool directory")
+                        && error.contains("which the sandbox can write"),
+                    "{linked} with {var}: {error}"
+                );
+            }
         }
-        let (var, value) = if cfg!(target_os = "macos") {
-            ("COPILOT_CACHE_HOME", home.join("Library/Caches/copilot"))
-        } else {
-            ("XDG_CACHE_HOME", home.join(".cache"))
-        };
-        prepare_with_copilot_cache(&root, var, &value, &[])
-            .unwrap_or_else(|e| panic!("{var}={} must launch: {e}", value.display()));
     }
 
     /// Reaching the default through a symlink outside every writable tree is

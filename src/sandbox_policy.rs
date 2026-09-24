@@ -2388,7 +2388,8 @@ fn writable_link_on_path<'a>(
 ///
 /// `writable` is the sandbox's canonical writable trees. A variable that is
 /// unsafe or overlaps one of them is an `Err` (see [`copilot_cache_override`]),
-/// and `prepare` stops the launch on it.
+/// and so is a default reached through a symlink inside one; `prepare` stops
+/// the launch on either.
 pub fn copilot_pkg_dirs(
     env: &CacheEnv,
     home: &Path,
@@ -2397,7 +2398,24 @@ pub fn copilot_pkg_dirs(
 ) -> Result<Vec<PathBuf>, String> {
     let xdg_only = |k: &str| if k == "XDG_CACHE_HOME" { env(k) } else { None };
     let resolve = |env: &CacheEnv| resolve_copilot_pkg_dir(env, home, os, writable);
-    let mut dirs = vec![copilot_default_pkg_dir(home, os)];
+    let default = copilot_default_pkg_dir(home, os);
+    // The default sits in a writable cache (`~/Library/Caches`, `~/.cache`),
+    // so a symlink at `copilot` or `pkg` is one the agent could have planted
+    // and can re-point: the rules follow the name, the host follows the link.
+    // Refused the way #570 refuses an override through such a link, before the
+    // preflight runs Copilot from it.
+    if let Some((link, (tree, why))) = writable_link_on_path(&default, writable) {
+        return Err(format!(
+            "cplt refuses the Copilot cache {}: it passes through the symlink {} in \
+             {why} {}, which the sandbox can write. Copilot runs its runtime from \
+             there on the host, outside the sandbox. Remove the link and let Copilot \
+             recreate the directory.",
+            default.display(),
+            link.display(),
+            tree.display()
+        ));
+    }
+    let mut dirs = vec![default];
     for dir in [resolve(&xdg_only)?, resolve(env)?] {
         if !dirs.contains(&dir) {
             dirs.push(dir);

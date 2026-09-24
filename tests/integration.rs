@@ -2308,6 +2308,49 @@ mod macos_tests {
         );
     }
 
+    /// SBPL is last-match-wins: an `allow.write` over `~/Library/Caches` must
+    /// not reopen the default Copilot cache, which the host executes, while
+    /// the rest of the cache it grants stays writable.
+    #[test]
+    fn real_profile_keeps_the_copilot_cache_read_only_under_a_caches_allow_write() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        // Not under temp: the temp rules would grant the write on their own.
+        let home = tempfile::Builder::new()
+            .prefix(".cplt-copilot-cache-home-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("create home");
+        let home = fs::canonicalize(home.path()).unwrap();
+        let caches = home.join("Library/Caches");
+        fs::create_dir_all(caches.join("copilot/pkg")).unwrap();
+        let write = [caches.clone()];
+        let opts = SandboxConfig {
+            extra_write: &write,
+            ..default_opts(&project, &home)
+        };
+        let profile = write_real_profile(&opts);
+        let (pkg, other) = (caches.join("copilot/pkg/x"), caches.join("other"));
+        let (blocked, _) = run_sandboxed(
+            &profile,
+            &format!("echo x > '{}' 2>&1; echo EXIT:$?", pkg.display()),
+        );
+        let (allowed, _) = run_sandboxed(
+            &profile,
+            &format!("echo x > '{}' 2>&1; echo EXIT:$?", other.display()),
+        );
+        fs::remove_file(&profile).ok();
+        let written = pkg.exists();
+        fs::remove_dir_all(&home).ok();
+        assert!(
+            !written && blocked.contains("EXIT:1"),
+            "the Copilot cache must stay read-only, got: {blocked}"
+        );
+        assert!(
+            allowed.contains("EXIT:0"),
+            "the rest of the cache must be writable: {allowed}"
+        );
+    }
+
     // ── nav-pilot state and skill directory denial ────────────────
 
     /// `~/.nav-pilot/` is unwritable from inside a session, and the one pinned
