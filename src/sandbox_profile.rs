@@ -2368,7 +2368,7 @@ fn emit_denied_dotfile_overrides(
 /// fix: `--allow-docker` re-allows `~/.config/containers` (which holds registry
 /// `auth.json`), and a `--deny-path ~/.config` is an ancestor of it, which SBPL
 /// last-match-wins would otherwise silently reopen for read.
-fn overlapping_deny<'a>(extra_deny: &'a [PathBuf], root: &Path) -> Option<&'a PathBuf> {
+pub(super) fn overlapping_deny<'a>(extra_deny: &'a [PathBuf], root: &Path) -> Option<&'a PathBuf> {
     extra_deny.iter().find(|deny| {
         let deny = deny.as_path();
         deny.starts_with(root) || root.starts_with(deny)

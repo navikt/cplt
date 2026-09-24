@@ -2273,12 +2273,33 @@ fn copilot_cache_override(
     if !copilot_cache_root_is_usable(root, home) {
         return reject("not a safe absolute directory".into());
     }
+    // The default is write-denied and pinned whatever the variables say, so
+    // spelling it out (`XDG_CACHE_HOME=$HOME/.cache`) changes nothing, though
+    // `~/.cache` and `~/Library/Caches` are themselves writable trees. `Path`
+    // equality compares components, so a trailing slash still matches.
+    if pkg == default {
+        return Ok(default.to_path_buf());
+    }
+    // A symlink inside a writable tree, anywhere on the way, is one the agent
+    // can re-point before extraction: `<project>/x -> ~/.cache` today can name
+    // the project tomorrow. Refused even when it points at the default.
+    if let Some((link, (tree, why))) = writable_link_on_path(pkg, writable) {
+        return reject(format!(
+            "it passes through the symlink {} in {why} {}, which the sandbox can write",
+            link.display(),
+            tree.display()
+        ));
+    }
+    // With no such link, a value that resolves to the default is the default:
+    // every link on the way sits where the agent cannot change it.
+    let real = config::canonicalize_deepest(pkg);
+    if real == config::canonicalize_deepest(default) {
+        return Ok(default.to_path_buf());
+    }
     // The path as spelled counts too, not only where it resolves: Copilot walks
-    // it name by name, so `<project>/x -> /opt/c` passes through the project,
-    // and anything that can write there can re-point `x` before extraction.
-    // Each name is placed under its resolved parent, which catches a symlink at
-    // any level without following it. Checked before the default shortcut, so
-    // a project link to the default is refused as well.
+    // it name by name, so a directory it names inside a writable tree could be
+    // swapped for a link before extraction. Each name is placed under its
+    // resolved parent, which catches that at any level without following it.
     let tree_on_path = pkg.ancestors().find_map(|a| {
         let spelled = match (a.parent(), a.file_name()) {
             (Some(parent), Some(name)) => config::canonicalize_deepest(parent).join(name),
@@ -2298,10 +2319,6 @@ fn copilot_cache_override(
     }
     // Granted where it resolves, like `ResolvedToolDir::granted_at`: Seatbelt
     // matches the resolved path, so a rule on the link would never fire.
-    let real = config::canonicalize_deepest(pkg);
-    if real == config::canonicalize_deepest(default) {
-        return Ok(default.to_path_buf());
-    }
     if !copilot_cache_root_is_usable(&real, home) {
         return reject(format!("it resolves to {}", real.display()));
     }
@@ -2316,6 +2333,49 @@ fn copilot_cache_override(
         ));
     }
     Ok(real)
+}
+
+/// The first symlink inside one of the `writable` trees that resolving the
+/// absolute `path` passes through, following each link the way the kernel
+/// does, so a link reached through another link counts. A loop past 40 hops
+/// resolves nowhere and is reported against the first tree, failing closed.
+fn writable_link_on_path<'a>(
+    path: &Path,
+    writable: &'a [(PathBuf, &'a str)],
+) -> Option<(PathBuf, &'a (PathBuf, &'a str))> {
+    let mut todo: Vec<OsString> = path
+        .components()
+        .rev()
+        .map(|c| c.as_os_str().to_owned())
+        .collect();
+    let mut at = PathBuf::from("/");
+    let mut hops = 0;
+    while let Some(name) = todo.pop() {
+        if name == ".." {
+            at.pop();
+            continue;
+        }
+        if name == "." {
+            continue;
+        }
+        let next = at.join(&name);
+        let Ok(target) = std::fs::read_link(&next) else {
+            at = next;
+            continue;
+        };
+        if let Some(tree) = writable.iter().find(|(t, _)| next.starts_with(t)) {
+            return Some((next, tree));
+        }
+        hops += 1;
+        if hops > 40 {
+            return writable.first().map(|tree| (next, tree));
+        }
+        if target.is_absolute() {
+            at = PathBuf::from("/");
+        }
+        todo.extend(target.components().rev().map(|c| c.as_os_str().to_owned()));
+    }
+    None
 }
 
 /// Every Copilot cache `pkg` directory cplt grants execute on and protects
