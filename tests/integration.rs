@@ -491,6 +491,7 @@ mod macos_tests {
             root_agents_md: None,
             allow_gpg_signing: false,
             deny_clipboard: false,
+            deny_nested_git: false,
             allow_jvm_attach: false,
             allow_msbuild: false,
             allow_docker: false,
@@ -1814,6 +1815,59 @@ mod macos_tests {
             output.contains("Operation not permitted") || output.contains("EXIT:1"),
             "writing to .git/hooks should be blocked, got: {output}"
         );
+    }
+
+    /// #576: `sandbox.deny_nested_git` refuses every way of bringing a `.git`
+    /// into existence below the project — a pointer file, a symlink, `mkdir`,
+    /// and a file or directory renamed onto the name — and leaves the root's
+    /// own `.git` alone. The same commands run under the default profile
+    /// first, so the test fails if the key stops being what blocks them.
+    #[test]
+    fn real_profile_deny_nested_git_blocks_creating_a_nested_git() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        let plants = |dir: &Path| {
+            let d = dir.display();
+            [
+                format!("mkdir -p '{d}/a' && printf 'gitdir: ../e\\n' > '{d}/a/.git'"),
+                format!("mkdir -p '{d}/b' && ln -s ../e '{d}/b/.git'"),
+                format!("mkdir -p '{d}/c/.git'"),
+                format!("mkdir -p '{d}/d' && echo x > '{d}/f' && mv '{d}/f' '{d}/d/.git'"),
+                format!("mkdir -p '{d}/g' '{d}/h' && mv '{d}/h' '{d}/g/.git'"),
+                // Case variants: APFS is case-insensitive by default, and git
+                // opens `.GIT` when it looks up `.git` (#576).
+                format!("mkdir -p '{d}/i' && ln -s ../e '{d}/i/.GIT'"),
+                format!("mkdir -p '{d}/j' && printf 'gitdir: ../e\\n' > '{d}/j/.Git'"),
+            ]
+        };
+        for deny in [false, true] {
+            let tmp = project.join(format!(".cplt-nested-git-{}-{deny}", std::process::id()));
+            fs::create_dir_all(&tmp).unwrap();
+            let tmp = fs::canonicalize(&tmp).unwrap();
+            let mut opts = default_opts(&tmp, &home);
+            opts.deny_nested_git = deny;
+            let profile = write_real_profile(&opts);
+            for cmd in plants(&tmp) {
+                let (output, _) = run_sandboxed(&profile, &format!("{cmd} 2>&1; echo EXIT:$?"));
+                assert_eq!(
+                    output.contains("EXIT:0"),
+                    !deny,
+                    "deny_nested_git={deny}: `{cmd}` gave {output}"
+                );
+            }
+            // The root's own `.git` is not matched: `git init` there still works.
+            let (output, _) = run_sandboxed(
+                &profile,
+                &format!("mkdir '{}/.git' 2>&1; echo EXIT:$?", tmp.display()),
+            );
+            fs::remove_dir_all(&tmp).ok();
+            fs::remove_file(&profile).ok();
+            assert!(
+                output.contains("EXIT:0"),
+                "the project root's own .git must stay creatable: {output}"
+            );
+        }
     }
 
     #[test]

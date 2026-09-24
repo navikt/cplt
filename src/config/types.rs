@@ -670,6 +670,9 @@ pub struct SandboxConfig {
     /// Opt-in: writes to a tool config dir, so it is off unless the
     /// user asks for it.
     pub gradle_init: Option<bool>,
+    /// Deny creating a `.git` entry below a writable root (default: false,
+    /// macOS only). See `sandbox_profile::emit_nested_gitdir_denies` (#576).
+    pub deny_nested_git: Option<bool>,
     /// Allow Docker/Colima/OrbStack access inside the sandbox (default: false).
     /// DANGEROUS: Docker can mount any host path via container volumes, completely
     /// bypassing sandbox filesystem restrictions. Only enable if you trust the
@@ -949,6 +952,7 @@ pub struct Resolved {
     pub allow_jvm_attach: bool,
     pub allow_msbuild: bool,
     pub gradle_init: bool,
+    pub deny_nested_git: bool,
     pub allow_docker: bool,
     pub allow_tmp_exec: bool,
     pub allow_cache_exec: Vec<String>,

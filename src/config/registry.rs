@@ -391,6 +391,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "sandbox",
+        key: "deny_nested_git",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "false",
+        description: "macOS only: refuse to create a .git file, directory or symlink anywhere below a writable root, so a session cannot plant a repository whose config runs on the host (#576). Breaks `git worktree add` and fixtures that create a .git inside the project. No effect on Linux, where the session-end check is the only cover.",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
         key: "allow_docker",
         value_type: ConfigValueType::Bool,
         dangerous: true,
@@ -1019,6 +1027,14 @@ bool_keys! {
         config = |c: &Config| c.sandbox.gradle_init,
         baseline = |_: PresetBaseline| false,
         resolved = |r: &Resolved| r.gradle_init;
+
+    /// Config-only and off by default (staged rollout, #576): it breaks
+    /// `git worktree add` inside the project.
+    deny_nested_git, "sandbox", "deny_nested_git",
+        cli = |_: &CliFlags| FeatureToggle::UseDefault,
+        config = |c: &Config| c.sandbox.deny_nested_git,
+        baseline = |_: PresetBaseline| false,
+        resolved = |r: &Resolved| r.deny_nested_git;
 
     allow_docker, "sandbox", "allow_docker",
         cli = |c: &CliFlags| c.allow_docker,

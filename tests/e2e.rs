@@ -6831,6 +6831,135 @@ paths = [
         );
     }
 
+    // ── #576: a .git planted below the project is reported at session end ──
+
+    /// A git project with an existing nested repository `keep/` and a nested
+    /// worktree-style `wt/.git` pointer file, plus a scratch HOME. Built in the
+    /// checkout, not `/tmp`, where the sandbox denies exec.
+    fn nested_git_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::Builder::new()
+            .prefix(".cplt-e2e-nested-git-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let (project, home) = (root.join("proj"), root.join("home"));
+        std::fs::create_dir_all(project.join("keep")).unwrap();
+        std::fs::create_dir_all(project.join("wt")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        assert!(git_ok(&project, &["init", "-q", "-b", "main"]));
+        assert!(git_ok(&project.join("keep"), &["init", "-q", "-b", "main"]));
+        assert!(git_ok(&project, &["init", "-q", "--bare", "e0"]));
+        std::fs::write(project.join("wt/.git"), "gitdir: ../e0\n").unwrap();
+        (tmp, project, home)
+    }
+
+    /// `cplt exec -c <script>` in `project`; returns stderr.
+    fn exec_session(project: &Path, home: &Path, script: &str) -> String {
+        let output = cplt_cmd()
+            .args(["--no-validate", "exec", "-c", script])
+            .current_dir(project)
+            .env("HOME", home)
+            .output()
+            .expect("cplt exec should run");
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(output.status.success(), "session failed: {stderr}");
+        stderr
+    }
+
+    /// The three plants from #576 — a `gitdir:` pointer file, a symlink, and a
+    /// gitdir renamed into place — plus a rewrite of the config an existing
+    /// pointer resolves to. None of them writes a path the profile denies, and
+    /// each must be named at session end.
+    #[test]
+    fn e2e_planted_nested_git_is_reported() {
+        require_sandbox!();
+        let (_tmp, project, home) = nested_git_fixture();
+        let stderr = exec_session(
+            &project,
+            &home,
+            "mkdir e e3 s1 s2 s3 s4 && printf '[core]\\n\\tfsmonitor = x\\n' > e/config && \
+             mkdir e/objects e/refs && echo 'ref: refs/heads/main' > e/HEAD && \
+             printf 'gitdir: ../e\\n' > s1/.git && ln -s ../e s2/.git && mv e3 s3/.git && \
+             ln -s ../e s4/.GIT && \
+             mkdir -p s5/objects s5/refs && echo 'ref: refs/heads/main' > s5/HEAD && \
+             printf '[core]\\n\\tfsmonitor = x\\n' > s5/config && \
+             printf '[core]\\n\\tfsmonitor = x\\n' >> e0/config && echo x > keep/file",
+        );
+        // On a case-insensitive volume (the macOS default) git really does
+        // use `s4/.GIT`, which is what makes it a plant worth reporting.
+        let case_insensitive = project.join("s4/.git").exists();
+        if case_insensitive {
+            let out = git_cmd(&project.join("s4"))
+                .args(["rev-parse", "--absolute-git-dir"])
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                project.join("e").display().to_string(),
+                "git should resolve the case variant: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        assert!(
+            stderr.contains("A git repository was created or changed"),
+            "no report: {stderr}"
+        );
+        for (what, dir) in [
+            ("new", "s1"),
+            ("new", "s2"),
+            ("new", "s3"),
+            // A bare-repository layout needs no `.git` at all.
+            ("new", "s5"),
+            ("new", "e"),
+            ("changed", "wt"),
+        ]
+        .into_iter()
+        .chain(case_insensitive.then_some(("new", "s4")))
+        {
+            let line = format!("{what}: {}", project.join(dir).display());
+            assert!(stderr.contains(&line), "missing `{line}`: {stderr}");
+        }
+        assert!(
+            !stderr.contains(&project.join("keep").display().to_string()),
+            "an untouched nested repository was reported: {stderr}"
+        );
+    }
+
+    /// Ordinary work inside existing nested repositories reports nothing.
+    #[test]
+    fn e2e_unchanged_nested_repo_is_not_reported() {
+        require_sandbox!();
+        let (_tmp, project, home) = nested_git_fixture();
+        let stderr = exec_session(&project, &home, "echo x > keep/file && echo y > wt/file");
+        assert!(
+            !stderr.contains("A git repository was created or changed")
+                && !stderr.contains("Stopped checking"),
+            "a clean session was reported: {stderr}"
+        );
+    }
+
+    /// The walk is bounded, and a session that pushes a plant past the bound
+    /// is told so rather than given a clean report.
+    #[test]
+    fn e2e_nested_git_walk_bound_is_reported() {
+        require_sandbox!();
+        let (_tmp, project, home) = nested_git_fixture();
+        let many = project.join("many");
+        for i in 0..=cplt_nested_scan_limit() {
+            std::fs::create_dir_all(many.join(format!("d{i:05}"))).unwrap();
+        }
+        let stderr = exec_session(&project, &home, "true");
+        assert!(
+            stderr.contains("Stopped checking for new .git entries"),
+            "hitting the walk bound was not reported: {stderr}"
+        );
+    }
+
+    /// `sandbox::NESTED_SCAN_LIMIT`, which is crate-private.
+    fn cplt_nested_scan_limit() -> usize {
+        20_000
+    }
+
     /// #252: the root AGENTS.md read grant exists for the block cplt writes on
     /// an agent launch. `exec` never writes it, so from a subdirectory it must
     /// not read the root file, even with --agents-md on.

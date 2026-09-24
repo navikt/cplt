@@ -3756,6 +3756,130 @@ pub const EXEC_IN_WRITABLE: &[ExecInWritable] = &[
     },
 ];
 
+/// Directories examined in total by [`repo_walk`], across all roots.
+///
+/// Public because the launch warning names it: a message with its own copy of
+/// the number is a message that will one day be wrong.
+pub(crate) const NESTED_SCAN_LIMIT: usize = 20_000;
+
+/// Repositories nested below `roots`: the walk behind bubblewrap's `nested_repo_roots` (#498), with the depth left to the caller.
+///
+/// The session-end `.git` check (`audit::NestedGit`, #576) passes no depth
+/// limit: a depth cut-off is a place to hide that nobody is told about, while
+/// the directory budget is reported when it is hit.
+pub(crate) fn repo_walk(
+    roots: &[&Path],
+    max_depth: usize,
+    is_repo: fn(&Path) -> bool,
+) -> (Vec<PathBuf>, bool) {
+    /// Not descended into: thousands of entries, and a `.git` inside one is
+    /// vendored rather than worked in. They are still *tested* for being a
+    /// repository — `~/src/build` may well be a checkout — only not walked.
+    const SKIP: &[&str] = &[
+        ".git",
+        "node_modules",
+        "target",
+        "vendor",
+        "dist",
+        ".venv",
+        "venv",
+        "__pycache__",
+        ".gradle",
+        ".terraform",
+        ".next",
+        ".cache",
+    ];
+
+    let mut found: Vec<PathBuf> = Vec::new();
+    let mut budget = NESTED_SCAN_LIMIT;
+    let mut queue: std::collections::VecDeque<(PathBuf, usize)> =
+        roots.iter().map(|r| ((*r).to_path_buf(), 0usize)).collect();
+
+    while let Some((dir, depth)) = queue.pop_front() {
+        if depth >= max_depth {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        // Sorted, so a truncated walk truncates the same way twice. An
+        // unsorted `read_dir` would protect different repositories on different
+        // launches of the same tree.
+        let mut dirs: Vec<PathBuf> = entries
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .map(|e| e.path())
+            .collect();
+        dirs.sort();
+
+        for path in dirs {
+            if budget == 0 {
+                return (dedup(found), true);
+            }
+            budget -= 1;
+            // `.git` as a directory, a file or a symlink (not followed) all mean a repository is
+            // here — but only the directory case is actually protected. A
+            // worktree or submodule keeps its hooks in the shared gitdir
+            // (`<super>/.git/modules/<name>/hooks`), which nothing resolves for
+            // a NESTED repository, so `<repo>/.git/hooks` does not exist and
+            // the bind is dropped downstream. A bare repository has no `.git`
+            // at all and is not found by `has_dot_git`. Both are recorded as
+            // uncovered in SECURITY.md rather than claimed (#498 review).
+            if is_repo(&path) {
+                found.push(path.clone());
+            }
+            let skipped = path
+                .file_name()
+                // Case-blind: on a case-insensitive volume `.GIT` is the gitdir.
+                .is_some_and(|n| {
+                    let n = n.to_string_lossy();
+                    SKIP.iter().any(|s| s.eq_ignore_ascii_case(&n))
+                });
+            if !skipped {
+                queue.push_back((path, depth + 1));
+            }
+        }
+    }
+    (dedup(found), false)
+}
+
+/// `dir/.git` exists as a directory, file or symlink (not followed).
+///
+/// A lookup rather than a name comparison on purpose: it resolves `.git` the
+/// way git itself does, so on a case-insensitive volume a `.GIT` is found
+/// exactly when git would open it, and on a case-sensitive one it is not
+/// (#576).
+pub(crate) fn has_dot_git(dir: &Path) -> bool {
+    std::fs::symlink_metadata(dir.join(".git")).is_ok()
+}
+
+/// [`has_dot_git`], or `dir` itself looks like a bare repository: git's
+/// discovery accepts a directory holding `HEAD`, `objects/` and `refs/` as a
+/// gitdir (`safe.bareRepository` defaults to `all`) and obeys its `config`,
+/// with no `.git` anywhere (#576).
+///
+/// A directory named `.git` (any case) is not counted as bare: it is reached
+/// through its parent already, and counting it too would report the project's
+/// own `.git` every time its config changes.
+pub(crate) fn has_dot_git_or_is_bare(dir: &Path) -> bool {
+    let is_dot_git = dir
+        .file_name()
+        .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(".git"));
+    has_dot_git(dir)
+        || (!is_dot_git
+            && dir.join("HEAD").exists()
+            && dir.join("objects").is_dir()
+            && dir.join("refs").is_dir())
+}
+
+/// Sort and deduplicate, so overlapping roots (a project inside an
+/// `allow.write` grant) contribute one entry rather than two.
+fn dedup(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

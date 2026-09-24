@@ -697,6 +697,7 @@ The settings below are machine-specific or local CLI preferences, so `.cplt.toml
 | `sandbox.use_bubblewrap` | depends on bwrap being installed on the machine |
 | `sandbox.audit` | local output preference, not project sandbox policy |
 | `sandbox.gradle_init` | writes to the machine's Gradle user home, not project policy |
+| `sandbox.deny_nested_git` | a staged hardening switch, see [Blocking new nested `.git` entries](#blocking-new-nested-git-entries-sandboxdeny_nested_git) |
 | `sandbox.inherit_env` | too dangerous for repo config, it would affect every team member |
 | `sandbox.allow_build_credentials` | hands the agent the user's own registry tokens from `$HOME`, and a repo cannot grant home paths |
 | `allow.exec` | exec paths differ per machine, and a repo must not be able to make one of its own trees executable |
@@ -775,6 +776,24 @@ What it does, exactly:
 On Linux, `~/.m2/settings.xml` and `~/.gradle/gradle.properties` are already readable and writable inside the sandbox whether this key is on or off, because Landlock cannot deny a file inside the granted `~/.m2` and `~/.gradle` tool directories (see [Private registries](known-impacts.md#private-registries)). On Linux the key therefore changes only `~/.npmrc`. On macOS it changes all three, and the files stay unwritable. A deny on either of the two Linux files takes effect only when Bubblewrap is active and mount-masks it. Without Bubblewrap the deny does nothing for them: they stay readable and writable, and cplt names each one in a warning at launch.
 
 If you only need one of the files, a single `allow.read` line is narrower. `cplt init --global` still proposes exactly that: an `allow.read` entry for each file it finds credentials in.
+
+## Blocking new nested `.git` entries (`sandbox.deny_nested_git`)
+
+A session can make any subdirectory of the project into a repository whose config it wrote: a `.git` pointer file, a `.git` symlink, or a git directory renamed into place. Git run there later, outside the sandbox, runs whatever that config names ([#576](https://github.com/navikt/cplt/issues/576)). cplt checks for this at the end of every session and names each directory whose `.git` is new or changed, including a `.GIT`-style case variant and a bare-repository layout (`HEAD`, `objects/`, `refs/` and a `config`, no `.git` at all). That check is always on and has no key.
+
+`sandbox.deny_nested_git` also blocks the plant on macOS. It refuses to create any `.git` entry, in any letter case, below each writable root (file, directory, symlink, hard link, or rename onto the name). The root's own `.git` is not affected, so `git init` in the project directory still works. It does not block the bare-repository layout; for that, set `safe.bareRepository = explicit` in your global git config.
+
+```bash
+cplt config set sandbox.deny_nested_git true
+```
+
+Off by default, because it breaks things that create a `.git` below the project:
+
+- `git worktree add` into a directory inside the project
+- test fixtures that `git init` or `mkdir .git` inside the project (on macOS, `git init` there already fails without this key, but a fixture that writes the `.git` itself succeeds)
+- any tool that writes a `gitdir:` pointer file inside the project
+
+It has no effect on Linux, where the launch says so. Landlock cannot deny a path inside a tree it allows, and bubblewrap only protects paths that exist at launch, so there the end-of-session check is the only cover.
 
 ## Configuration file
 

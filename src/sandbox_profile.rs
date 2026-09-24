@@ -223,6 +223,7 @@ pub fn generate_profile_with_playwright_socket_dir(
         config.git_common_dir,
         extra_git_dirs,
         config.managed_worktree_root,
+        config.deny_nested_git,
     );
     // Same reason, and the fix for the same bug one tree over: keeps the
     // agent's own auto-executing config unwritable even when a user
@@ -1111,6 +1112,7 @@ fn emit_git_persistence_denies(
     git_common_dir: Option<&Path>,
     extra_git_dirs: &[PathBuf],
     managed_worktree_root: Option<&Path>,
+    deny_nested_git: bool,
 ) {
     let mut gitdirs: Vec<String> = writable_roots(project_roots, extra_write)
         .iter()
@@ -1207,7 +1209,50 @@ fn emit_git_persistence_denies(
 
     for root in writable_roots(project_roots, extra_write) {
         emit_nested_gitdir_denies(sb, &root);
+        if deny_nested_git {
+            emit_nested_git_create_deny(sb, &root);
+        }
     }
+}
+
+/// `sandbox.deny_nested_git` (#576): refuse to create any `.git` entry below
+/// `root`.
+///
+/// `emit_nested_gitdir_denies` protects paths spelled `<repo>/.git/config`, so
+/// it only holds while a nested repository's gitdir is reached through a
+/// directory literally named `.git`. A session could sidestep it by building a
+/// gitdir under any other name and then pointing a new `.git` at it — a
+/// `gitdir:` pointer file, a symlink, or the directory itself renamed into
+/// place. None of those writes a denied path, and git run on the host in that
+/// directory then obeys the planted `core.fsmonitor` or `core.hooksPath`.
+///
+/// `file-write-create` is what Seatbelt checks when a name comes into
+/// existence: `open(O_CREAT)`, `mkdir`, `symlink`, `link`, and the destination
+/// of `rename` (verified with `sandbox-exec` for all five). Existing entries are
+/// untouched, so work inside a nested repository that was there at launch
+/// carries on. The leading `.+/` leaves `<root>/.git` alone, so `git init` at
+/// the project root still works.
+///
+/// Off by default because it breaks `git worktree add` into the project and
+/// any fixture that creates a `.git` below it. On Linux nothing can express it:
+/// Landlock cannot deny inside a tree it allows and bubblewrap only binds paths
+/// that exist, so there the session-end report (`audit::NestedGit`) is the
+/// only cover.
+fn emit_nested_git_create_deny(sb: &mut String, root: &str) {
+    let r = escape_regex(root);
+    sbpl!(
+        sb,
+        ";; No new .git entries below {root} (sandbox.deny_nested_git)"
+    );
+    // Case-blind: APFS is case-insensitive by default, so git opens `.GIT` as
+    // `.git`. On such a volume Seatbelt was seen to block `.GIT` with a plain
+    // `\.git` regex as well; the explicit classes keep the rule from depending
+    // on that undocumented matching.
+    sbpl!(
+        sb,
+        "(deny file-write-create (regex #\"^{r}/.+/\\.[gG][iI][tT]$\"))"
+    );
+    sbpl!(sb);
 }
 
 /// Extend the git-persistence denies to repositories nested *beneath* a
@@ -3358,6 +3403,7 @@ mod tests {
             root_agents_md: None,
             allow_gpg_signing: false,
             deny_clipboard: false,
+            deny_nested_git: false,
             allow_jvm_attach: false,
             allow_msbuild: false,
             allow_docker: false,

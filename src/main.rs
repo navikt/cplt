@@ -5336,6 +5336,7 @@ fn build_sandbox_config<'a>(
         root_agents_md: probe.root_agents_md.as_deref(),
         allow_gpg_signing: resolved.allow_gpg_signing,
         deny_clipboard: resolved.deny_clipboard,
+        deny_nested_git: resolved.deny_nested_git,
         allow_jvm_attach: resolved.allow_jvm_attach,
         allow_msbuild: resolved.allow_msbuild,
         allow_docker: resolved.allow_docker,
