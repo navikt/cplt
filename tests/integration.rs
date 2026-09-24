@@ -482,6 +482,7 @@ mod macos_tests {
             playwright_socket_dir: None,
             allow_tmp_exec: false,
             copilot_install_dir: None,
+            copilot_cache_env: &cplt::sandbox::no_cache_env,
             java_home: None,
             dotnet_root: None,
             git_hooks_path: None,

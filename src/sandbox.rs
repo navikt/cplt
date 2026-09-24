@@ -67,16 +67,17 @@ mod profile;
 // These are platform-agnostic and used by tests, discover, config, etc.
 
 pub use policy::{
-    AppDir, AppDirKind, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS, ENV_ALLOWLIST,
-    ENV_PREFIX_ALLOWLIST, EXEC_IN_WRITABLE, ExecInWritable, HARDENING_ENV_VARS, HOME_TOOL_DIRS,
-    HardeningCategory, HardeningEnvVar, HomeToolDir, LinuxCoverage,
+    AppDir, AppDirKind, CacheEnv, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS,
+    ENV_ALLOWLIST, ENV_PREFIX_ALLOWLIST, EXEC_IN_WRITABLE, ExecInWritable, HARDENING_ENV_VARS,
+    HOME_TOOL_DIRS, HardeningCategory, HardeningEnvVar, HomeToolDir, LinuxCoverage,
     PLAYWRIGHT_SOCKET_BASE_MAX_BYTES, PLAYWRIGHT_SOCKET_DIR_PREFIX, PLAYWRIGHT_SOCKET_PATH_LIMIT,
     PLAYWRIGHT_SOCKET_ROOT, PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX, PROTECTED_IN_GITDIR,
     PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir, SENSITIVE_PROJECT_PATTERNS,
     TOOL_PATH_ENV_VARS, ToolPathEnvVar, ToolPathOverride, ToolRoot, active_tool_dirs, app_dirs,
-    copilot_ro_protect_paths, credential_link_hop, current_uid, exec_write_conflicts,
-    home_config_link_targets, home_tool_dirs, linux_docker_socket_paths, linux_runtime_dirs,
-    mise_ro_protect_paths, nested_alternation, path_bin_dirs, playwright_runtime_intent,
+    copilot_default_pkg_dir, copilot_pkg_dir, copilot_pkg_dirs, copilot_ro_protect_paths,
+    credential_link_hop, current_uid, exec_write_conflicts, home_config_link_targets,
+    home_tool_dirs, linux_docker_socket_paths, linux_runtime_dirs, mise_ro_protect_paths,
+    nested_alternation, no_cache_env, path_bin_dirs, playwright_runtime_intent, process_env,
     relocatable_tool_prefix, socket_mask_paths, tool_override_path_is_safe,
     tool_path_env_overrides, validate_playwright_socket_dir, validate_sbpl_path,
     xdg_runtime_dir_env,
@@ -178,6 +179,10 @@ pub struct SandboxConfig<'a> {
     pub allow_tmp_exec: bool,
     /// Copilot CLI package directory (resolved from the binary location).
     pub copilot_install_dir: Option<&'a Path>,
+    /// Where the Copilot cache variables are read from (#374):
+    /// [`process_env`] for a real launch, [`no_cache_env`] for a policy that
+    /// should cover only the default SEA cache.
+    pub copilot_cache_env: &'a CacheEnv<'a>,
     /// JAVA_HOME directory — grants JDK read + dylib loading.
     pub java_home: Option<&'a Path>,
     /// DOTNET_ROOT directory — grants .NET SDK read + dylib loading.
@@ -348,6 +353,7 @@ pub fn prepare_with_pnpm_shadow(
     validate_hard_denied_grants(config)?;
     validate_pnpm_tool_dirs(config)?;
     validate_exec_grants(config)?;
+    validate_copilot_cache_env(config)?;
     if let Some(shadow) = pnpm_shadow_dir
         && !config.extra_exec.iter().any(|path| path == shadow)
     {
@@ -573,12 +579,66 @@ fn validate_exec_grants(config: &SandboxConfig) -> Result<(), String> {
 }
 
 /// [`writable_trees`] canonicalized, for matching against the canonical paths
-/// a dotfiles link resolves to.
+/// a dotfiles link or a cache variable resolves to. `canonicalize_deepest`, as
+/// on that side, so a missing `allow.write` path under a symlinked ancestor
+/// still matches what lies under it.
 fn canonical_writable_trees(config: &SandboxConfig) -> Vec<(PathBuf, &'static str)> {
     writable_trees(config)
         .into_iter()
-        .map(|(t, why)| (std::fs::canonicalize(&t).unwrap_or(t), why))
+        .map(|(t, why)| (crate::config::canonicalize_deepest(&t), why))
         .collect()
+}
+
+/// Copilot's SEA `pkg` directories for `os` (`policy::copilot_pkg_dirs`). A
+/// refused cache variable leaves only the default, and
+/// [`validate_copilot_cache_env`] stops that launch.
+fn copilot_pkg_grants(config: &SandboxConfig, os: &str) -> Vec<PathBuf> {
+    policy::granted_copilot_pkg_dirs(
+        config.copilot_cache_env,
+        config.home_dir,
+        os,
+        &canonical_writable_trees(config),
+    )
+}
+
+/// #374: stop on a Copilot cache variable cplt refuses, unsafe or inside a
+/// writable tree. Copilot would still extract into that directory, and the
+/// preflight runs `copilot` from it outside the sandbox, after this check.
+fn validate_copilot_cache_env(config: &SandboxConfig) -> Result<(), String> {
+    if !config.agent.needs_copilot_dir() {
+        return Ok(());
+    }
+    let os = if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "linux"
+    };
+    let dirs = policy::copilot_pkg_dirs(
+        config.copilot_cache_env,
+        config.home_dir,
+        os,
+        &canonical_writable_trees(config),
+    )?;
+    // A moved `pkg` gets its own read allow on macOS, emitted after the user's
+    // denies, so it would reopen one that covers it (SBPL: last match wins).
+    // The default is left out: it is a tool dir with its own handling.
+    let denies: Vec<PathBuf> = config
+        .extra_deny
+        .iter()
+        .flat_map(|d| [d.clone(), crate::config::canonicalize_deepest(d)])
+        .collect();
+    for dir in dirs.iter().skip(1) {
+        if let Some(deny) = profile::overlapping_deny(&denies, dir) {
+            return Err(format!(
+                "cplt refuses the Copilot cache {}: it overlaps the deny path {}. \
+                 Copilot must read the runtime it extracts there. Move the cache \
+                 out of the denied path, or drop the deny.",
+                dir.display(),
+                deny.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The dotfiles `targets` that sit inside a writable tree, with that tree's
@@ -1254,11 +1314,25 @@ fn pin_paths(
     // `rmdir` of a mountpoint return `EBUSY`. Derived from the read-only set
     // rather than spelled out, so a package dir added there cannot arrive
     // unpinned. Empty for every agent but Copilot.
+    //
+    // The first two entries are the fixed defaults, whose parents sit directly
+    // in a writable grant. A directory a cache variable moved lies outside
+    // every writable tree (`copilot_pkg_grants`), so it gets the same
+    // "strictly inside the outermost writable tree" pins as a dotfiles
+    // target: none today, and never a project or `allow.write` root.
+    let copilot = copilot_ro_protect_paths(
+        config.agent,
+        config.home_dir,
+        config.copilot_cache_env,
+        &canonical_writable_trees(config),
+    );
+    let (defaults, moved) = copilot.split_at(copilot.len().min(2));
     pins.extend(
-        copilot_ro_protect_paths(config.agent, config.home_dir)
+        defaults
             .iter()
             .filter_map(|p| p.parent().map(Path::to_path_buf)),
     );
+    pins.extend(home_config_target_pins(config, moved));
     // GHSA-7mcc-xg5v-hv8v, Linux half — the same reasoning one class over, for
     // the exec-only agent grants the read-only overlay covers above.
     // OpenCode's `~/.cache/opencode/bin` is read-only bound, but its parent
@@ -1372,7 +1446,12 @@ fn ro_protect_paths(
     // grant from HOME_TOOL_DIRS, leaving the SEA runtime writable AND
     // executable. Only the bwrap overlay can take the write back. Empty for
     // every other agent.
-    ro_protect.extend(copilot_ro_protect_paths(config.agent, config.home_dir));
+    ro_protect.extend(copilot_ro_protect_paths(
+        config.agent,
+        config.home_dir,
+        config.copilot_cache_env,
+        &canonical_writable_trees(config),
+    ));
 
     // #524: a dotfiles-managed `~/.gitconfig` resolves to its target, and the
     // target can sit inside the writable project. Landlock follows the link
@@ -2035,6 +2114,7 @@ mod tests {
             playwright_socket_dir: None,
             allow_tmp_exec: false,
             copilot_install_dir: None,
+            copilot_cache_env: &crate::sandbox::no_cache_env,
             java_home: None,
             dotnet_root: None,
             git_hooks_path: None,
@@ -3040,6 +3120,248 @@ mod tests {
         assert!(
             prepare(&config).is_ok(),
             "--allow-docker must not be caught by the denied-dotfile refusal"
+        );
+    }
+
+    /// A tree for the #374 launch checks, outside the system temp dir (itself
+    /// a writable tree): `<t>/home`, `<t>/project` and `<t>/w`.
+    fn copilot_cache_tree() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        for d in ["home", "project", "w"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        (tmp, root)
+    }
+
+    /// `prepare` for Copilot in that tree with `var=value` and `write` as
+    /// the `allow.write` grants.
+    fn prepare_with_copilot_cache(
+        root: &Path,
+        var: &str,
+        value: &Path,
+        write: &[PathBuf],
+    ) -> Result<(), String> {
+        let (home, project) = (root.join("home"), root.join("project"));
+        let (var, value) = (var.to_owned(), value.as_os_str().to_owned());
+        let env = move |k: &str| (k == var).then(|| value.clone());
+        let mut config = test_config(&home, &[]);
+        config.project_dir = &project;
+        config.extra_write = write;
+        config.copilot_cache_env = &env;
+        config.use_bubblewrap = Some(false);
+        prepare(&config).map(drop)
+    }
+
+    /// #374: a Copilot cache variable in a writable tree stops the launch in
+    /// `prepare`, before the preflight runs `copilot` from that directory
+    /// outside the sandbox.
+    #[test]
+    fn prepare_refuses_a_copilot_cache_in_a_writable_tree() {
+        let (_guard, root) = copilot_cache_tree();
+        let write = [root.join("w")];
+        let mut cases = vec![
+            ("COPILOT_CACHE_HOME", root.join("project/.cache")),
+            ("COPILOT_PKG_CACHE_HOME", root.join("w/cache")),
+            (
+                "COPILOT_CACHE_HOME",
+                PathBuf::from("/tmp/cplt-copilot-cache"),
+            ),
+        ];
+        if cfg!(target_os = "linux") {
+            cases.push(("XDG_CACHE_HOME", root.join("project/.cache")));
+        }
+        for (var, value) in cases {
+            let error = prepare_with_copilot_cache(&root, var, &value, &write)
+                .expect_err("the launch must stop");
+            for part in [
+                format!("cplt refuses {var}={}: ", value.display()),
+                "which the sandbox can write".into(),
+                format!("Unset {var}, or point it"),
+                "outside the project and every writable path".into(),
+            ] {
+                assert!(error.contains(&part), "{part:?} missing from: {error}");
+            }
+        }
+    }
+
+    /// A value spelled through the project is refused even when it resolves
+    /// outside every tree: the agent can re-point the link before extraction.
+    #[test]
+    fn prepare_refuses_a_copilot_cache_linked_from_the_project() {
+        let (_guard, root) = copilot_cache_tree();
+        std::fs::create_dir_all(root.join("outside")).unwrap();
+        std::os::unix::fs::symlink(root.join("outside"), root.join("project/x")).unwrap();
+        let value = root.join("project/x");
+        prepare_with_copilot_cache(&root, "COPILOT_CACHE_HOME", &root.join("outside"), &[])
+            .expect("the target itself is outside every tree");
+        let error = prepare_with_copilot_cache(&root, "COPILOT_CACHE_HOME", &value, &[])
+            .expect_err("a project link must stop the launch");
+        assert!(
+            error.contains("the project directory")
+                && error.contains("which the sandbox can write"),
+            "{error}"
+        );
+    }
+
+    /// `<home>` with Copilot's default `pkg` directories on both platforms.
+    fn copilot_cache_home(root: &Path) -> PathBuf {
+        let home = root.join("home");
+        for d in [".cache/copilot/pkg", "Library/Caches/copilot/pkg"] {
+            std::fs::create_dir_all(home.join(d)).unwrap();
+        }
+        home
+    }
+
+    /// The platform default spelled out is the directory cplt already
+    /// protects, so it launches even though `~/.cache` and `~/Library/Caches`
+    /// are writable tool trees. `XDG_CACHE_HOME=$HOME/.cache` is a common
+    /// explicit setting on Linux.
+    #[test]
+    fn prepare_accepts_a_copilot_cache_spelled_as_the_default() {
+        let (_guard, root) = copilot_cache_tree();
+        let home = copilot_cache_home(&root);
+        let slashed = |rel: &str| PathBuf::from(format!("{}/{rel}/", home.display()));
+        let cases = if cfg!(target_os = "macos") {
+            vec![
+                ("COPILOT_CACHE_HOME", home.join("Library/Caches/copilot")),
+                ("COPILOT_CACHE_HOME", slashed("Library/Caches/copilot")),
+            ]
+        } else {
+            vec![
+                ("XDG_CACHE_HOME", home.join(".cache")),
+                ("XDG_CACHE_HOME", slashed(".cache")),
+                ("COPILOT_CACHE_HOME", home.join(".cache/copilot")),
+            ]
+        };
+        for (var, value) in cases {
+            prepare_with_copilot_cache(&root, var, &value, &[])
+                .unwrap_or_else(|e| panic!("{var}={} must launch: {e}", value.display()));
+        }
+    }
+
+    /// Spelling the default is the same launch as leaving the variable unset,
+    /// even when the default is itself reached through a link in a writable
+    /// tree (`~/.cache/copilot -> ~/copilot`), which a link check would refuse.
+    #[test]
+    fn prepare_accepts_the_spelled_default_copilot_cache_behind_a_link() {
+        let (_guard, root) = copilot_cache_tree();
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join("copilot/pkg")).unwrap();
+        for d in [".cache", "Library/Caches"] {
+            std::fs::create_dir_all(home.join(d)).unwrap();
+            std::os::unix::fs::symlink(home.join("copilot"), home.join(d).join("copilot")).unwrap();
+        }
+        let (var, value) = if cfg!(target_os = "macos") {
+            ("COPILOT_CACHE_HOME", home.join("Library/Caches/copilot"))
+        } else {
+            ("XDG_CACHE_HOME", home.join(".cache"))
+        };
+        prepare_with_copilot_cache(&root, var, &value, &[])
+            .unwrap_or_else(|e| panic!("{var}={} must launch: {e}", value.display()));
+    }
+
+    /// Reaching the default through a symlink outside every writable tree is
+    /// the default too: nothing the agent can write decides where it points.
+    #[test]
+    fn prepare_accepts_a_copilot_cache_linked_to_the_default_from_outside() {
+        let (_guard, root) = copilot_cache_tree();
+        let home = copilot_cache_home(&root);
+        let default = if cfg!(target_os = "macos") {
+            home.join("Library/Caches/copilot")
+        } else {
+            home.join(".cache/copilot")
+        };
+        std::os::unix::fs::symlink(&default, root.join("alias")).unwrap();
+        prepare_with_copilot_cache(&root, "COPILOT_CACHE_HOME", &root.join("alias"), &[])
+            .expect("an outside link to the default must launch");
+    }
+
+    /// A link inside a writable tree is refused even when it points at the
+    /// default: the agent can re-point it before Copilot extracts. That holds
+    /// for a project link reached through an outside link, too.
+    #[test]
+    fn prepare_refuses_a_project_link_to_the_default_copilot_cache() {
+        let (_guard, root) = copilot_cache_tree();
+        let home = copilot_cache_home(&root);
+        let link = |to: PathBuf, at: &str| std::os::unix::fs::symlink(to, root.join(at)).unwrap();
+        link(home.join(".cache"), "project/x");
+        link(home.join("Library/Caches"), "project/y");
+        link(root.join("project"), "hop");
+        link(root.join("project/y/copilot"), "chain");
+        let mut cases = vec![
+            ("COPILOT_CACHE_HOME", root.join("project/x/copilot")),
+            ("COPILOT_CACHE_HOME", root.join("project/y/copilot")),
+            ("COPILOT_CACHE_HOME", root.join("hop/y/copilot")),
+            ("COPILOT_CACHE_HOME", root.join("chain")),
+        ];
+        if cfg!(target_os = "linux") {
+            cases.push(("XDG_CACHE_HOME", root.join("project/x")));
+        }
+        for (var, value) in cases {
+            let error = prepare_with_copilot_cache(&root, var, &value, &[])
+                .expect_err("a project link must stop the launch");
+            assert!(
+                error.contains("the project directory")
+                    && error.contains("which the sandbox can write"),
+                "{var}={}: {error}",
+                value.display()
+            );
+        }
+    }
+
+    /// A moved cache under a user deny path is refused: its read allow comes
+    /// after the deny in the profile and would reopen it.
+    #[test]
+    fn prepare_refuses_a_copilot_cache_under_a_deny_path() {
+        let (_guard, root) = copilot_cache_tree();
+        let (home, project) = (root.join("home"), root.join("project"));
+        let env = |k: &str| (k == "COPILOT_CACHE_HOME").then(|| "/opt/cplt-copilot-cache".into());
+        for (deny, refused) in [
+            ("/opt", true),
+            ("/opt/cplt-copilot-cache/pkg/darwin-arm64", true),
+            ("/opt/other", false),
+        ] {
+            let denies = [PathBuf::from(deny)];
+            let mut config = test_config(&home, &[]);
+            config.project_dir = &project;
+            config.extra_deny = &denies;
+            config.copilot_cache_env = &env;
+            config.use_bubblewrap = Some(false);
+            match prepare(&config) {
+                Err(e) if refused => assert!(
+                    e.contains("overlaps the deny path") && e.contains(deny),
+                    "{e}"
+                ),
+                Ok(_) if !refused => {}
+                other => panic!("deny {deny}: {:?}", other.map(drop)),
+            }
+        }
+    }
+
+    /// An override outside every writable tree still launches.
+    #[test]
+    fn prepare_accepts_a_copilot_cache_under_opt() {
+        let (_guard, root) = copilot_cache_tree();
+        let value = Path::new("/opt/cplt-copilot-cache");
+        prepare_with_copilot_cache(&root, "COPILOT_CACHE_HOME", value, &[root.join("w")])
+            .expect("/opt must be accepted");
+    }
+
+    /// #374: a missing `allow.write` path under a symlinked ancestor is
+    /// canonicalized the way the cache value is, so the overlap is still seen.
+    #[test]
+    fn prepare_refuses_a_copilot_cache_under_a_missing_symlinked_grant() {
+        let (_guard, root) = copilot_cache_tree();
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+        let value = root.join("real/missing/cache");
+        let write = [root.join("link/missing")];
+        let error = prepare_with_copilot_cache(&root, "COPILOT_CACHE_HOME", &value, &write)
+            .expect_err("the missing grant must still be matched");
+        assert!(
+            error.contains("COPILOT_CACHE_HOME") && error.contains("the allow.write grant"),
+            "{error}"
         );
     }
 

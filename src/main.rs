@@ -5025,6 +5025,7 @@ fn build_sandbox_config<'a>(
         playwright_socket_dir: session.playwright_socket_dir,
         allow_tmp_exec: resolved.allow_tmp_exec,
         copilot_install_dir: session.copilot_install_dir,
+        copilot_cache_env: &sandbox::process_env,
         java_home: probe.java_home.as_deref(),
         dotnet_root: probe.dotnet_root.as_deref(),
         git_hooks_path: probe.git_hooks_path.as_deref(),

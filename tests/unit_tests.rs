@@ -820,6 +820,7 @@ fn landlock_policy_device_files_have_ioctl() {
         playwright_socket_dir: None,
         allow_tmp_exec: false,
         copilot_install_dir: None,
+        copilot_cache_env: &cplt::sandbox::no_cache_env,
         java_home: None,
         dotnet_root: None,
         git_hooks_path: None,
@@ -2437,6 +2438,7 @@ fn base_profile_options() -> SandboxConfig<'static> {
         playwright_socket_dir: None,
         allow_tmp_exec: false,
         copilot_install_dir: None,
+        copilot_cache_env: &cplt::sandbox::no_cache_env,
         java_home: None,
         dotnet_root: None,
         git_hooks_path: None,
@@ -3869,6 +3871,7 @@ fn allow_localhost_any_affects_both_backends() {
         playwright_socket_dir: None,
         allow_tmp_exec: false,
         copilot_install_dir: None,
+        copilot_cache_env: &cplt::sandbox::no_cache_env,
         java_home: None,
         dotnet_root: None,
         git_hooks_path: None,
@@ -3931,6 +3934,7 @@ fn config_options_parity_across_backends() {
         playwright_socket_dir: None,
         allow_tmp_exec: true,
         copilot_install_dir: None,
+        copilot_cache_env: &cplt::sandbox::no_cache_env,
         java_home: None,
         dotnet_root: None,
         git_hooks_path: None,
@@ -4551,7 +4555,8 @@ fn copilot_ro_protect_paths_cover_both_package_dirs() {
     // Copilot spawns on the host. The bwrap read-only overlay is the only
     // mechanism, so both must be in its set.
     let home = std::path::Path::new("/Users/test");
-    let paths = cplt::sandbox::copilot_ro_protect_paths(cplt::agent::Agent::Copilot, home);
+    let paths =
+        cplt::sandbox::copilot_ro_protect_paths(cplt::agent::Agent::Copilot, home, &|_| None, &[]);
     for expected in ["/Users/test/.copilot/pkg", "/Users/test/.cache/copilot/pkg"] {
         assert!(
             paths.contains(&std::path::PathBuf::from(expected)),
@@ -4570,11 +4575,362 @@ fn copilot_ro_protect_paths_are_empty_for_other_agents() {
         cplt::agent::Agent::OpenCode,
     ] {
         assert!(
-            cplt::sandbox::copilot_ro_protect_paths(agent, std::path::Path::new("/Users/test"))
-                .is_empty(),
+            cplt::sandbox::copilot_ro_protect_paths(
+                agent,
+                std::path::Path::new("/Users/test"),
+                &|_| None,
+                &[],
+            )
+            .is_empty(),
             "{agent:?} must get no Copilot package binds"
         );
     }
+}
+
+// ============================================================
+// Copilot cache resolver (#374)
+// ============================================================
+
+/// A fixed environment for `copilot_pkg_dir`.
+fn cache_env(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+    let vars: Vec<(String, String)> = vars
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+    move |name| vars.iter().find(|(k, _)| k == name).map(|(_, v)| v.into())
+}
+
+fn resolve_pkg(vars: &[(&str, &str)], os: &str) -> std::path::PathBuf {
+    cplt::sandbox::copilot_pkg_dir(&cache_env(vars), std::path::Path::new("/Users/test"), os)
+        .expect("accepted")
+}
+
+#[test]
+fn copilot_pkg_dir_defaults_differ_by_platform() {
+    assert_eq!(
+        resolve_pkg(&[], "macos"),
+        std::path::Path::new("/Users/test/Library/Caches/copilot/pkg")
+    );
+    assert_eq!(
+        resolve_pkg(&[], "linux"),
+        std::path::Path::new("/Users/test/.cache/copilot/pkg")
+    );
+}
+
+#[test]
+fn copilot_pkg_dir_prefers_pkg_cache_home() {
+    let vars = [
+        ("COPILOT_PKG_CACHE_HOME", "/opt/pkgcache"),
+        ("COPILOT_CACHE_HOME", "/opt/cache"),
+        ("XDG_CACHE_HOME", "/opt/xdg"),
+    ];
+    for os in ["macos", "linux"] {
+        assert_eq!(
+            resolve_pkg(&vars, os),
+            std::path::Path::new("/opt/pkgcache/pkg")
+        );
+    }
+}
+
+#[test]
+fn copilot_pkg_dir_uses_cache_home_next() {
+    let vars = [
+        ("COPILOT_CACHE_HOME", "/opt/cache"),
+        ("XDG_CACHE_HOME", "/opt/xdg"),
+    ];
+    for os in ["macos", "linux"] {
+        assert_eq!(
+            resolve_pkg(&vars, os),
+            std::path::Path::new("/opt/cache/pkg")
+        );
+    }
+}
+
+#[test]
+fn copilot_pkg_dir_honours_xdg_on_linux_only() {
+    let vars = [("XDG_CACHE_HOME", "/opt/xdg")];
+    assert_eq!(
+        resolve_pkg(&vars, "linux"),
+        std::path::Path::new("/opt/xdg/copilot/pkg")
+    );
+    assert_eq!(
+        resolve_pkg(&vars, "macos"),
+        std::path::Path::new("/Users/test/Library/Caches/copilot/pkg")
+    );
+}
+
+#[test]
+fn copilot_pkg_dir_treats_empty_as_unset() {
+    let vars = [
+        ("COPILOT_PKG_CACHE_HOME", ""),
+        ("COPILOT_CACHE_HOME", ""),
+        ("XDG_CACHE_HOME", ""),
+    ];
+    assert_eq!(
+        resolve_pkg(&vars, "linux"),
+        std::path::Path::new("/Users/test/.cache/copilot/pkg")
+    );
+}
+
+#[test]
+fn copilot_pkg_dir_skips_unsafe_values() {
+    for bad in [
+        "relative/cache",
+        // Does not exist, so only the `..` check can catch it.
+        "/no-such-dir-cplt/../..",
+        "/",
+        "/tmp",
+        "/Users",
+        "/Users/test",
+        "/Users/test/.ssh",
+        "/Users/test/.ssh/sub",
+        "/Users/test/.aws/cache",
+        // cplt's own state directory.
+        "/Users/test/.config/cplt/cache",
+        // A hard-denied credential file (`grant_is_refused`).
+        "/Users/test/.netrc",
+        "/opt/a\"b",
+        "/opt/a)b",
+    ] {
+        // Copilot takes the first value set, so an unsafe one is an error
+        // naming it, never a fall-through to the next step.
+        for (vars, os, var) in [
+            (
+                &[
+                    ("COPILOT_PKG_CACHE_HOME", bad),
+                    ("COPILOT_CACHE_HOME", "/opt/cache"),
+                ][..],
+                "linux",
+                "COPILOT_PKG_CACHE_HOME",
+            ),
+            (&[("XDG_CACHE_HOME", bad)][..], "linux", "XDG_CACHE_HOME"),
+            (
+                &[("COPILOT_CACHE_HOME", bad)][..],
+                "macos",
+                "COPILOT_CACHE_HOME",
+            ),
+        ] {
+            let home = std::path::Path::new("/Users/test");
+            let error = cplt::sandbox::copilot_pkg_dir(&cache_env(vars), home, os).expect_err(bad);
+            assert!(
+                error.starts_with(&format!("cplt refuses {var}={bad}: ")),
+                "{error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn copilot_pkg_dirs_is_only_the_default_without_overrides() {
+    let home = std::path::Path::new("/Users/test");
+    assert_eq!(
+        cplt::sandbox::copilot_pkg_dirs(&cache_env(&[]), home, "linux", &[]).unwrap(),
+        vec![std::path::PathBuf::from("/Users/test/.cache/copilot/pkg")]
+    );
+}
+
+#[test]
+fn copilot_pkg_dirs_keeps_the_default_and_adds_every_loader_dir() {
+    let home = std::path::Path::new("/Users/test");
+    let env = cache_env(&[
+        ("COPILOT_PKG_CACHE_HOME", "/opt/pkgcache"),
+        ("XDG_CACHE_HOME", "/opt/xdg"),
+    ]);
+    assert_eq!(
+        cplt::sandbox::copilot_pkg_dirs(&env, home, "linux", &[]).unwrap(),
+        [
+            "/Users/test/.cache/copilot/pkg",
+            "/opt/xdg/copilot/pkg",
+            "/opt/pkgcache/pkg"
+        ]
+        .map(std::path::PathBuf::from)
+    );
+    assert_eq!(
+        cplt::sandbox::copilot_pkg_dirs(&env, home, "macos", &[]).unwrap(),
+        [
+            "/Users/test/Library/Caches/copilot/pkg",
+            "/opt/pkgcache/pkg"
+        ]
+        .map(std::path::PathBuf::from)
+    );
+}
+
+#[test]
+fn copilot_ro_protect_paths_follow_the_resolved_cache() {
+    let env = cache_env(&[("XDG_CACHE_HOME", "/opt/xdg")]);
+    let paths = cplt::sandbox::copilot_ro_protect_paths(
+        cplt::agent::Agent::Copilot,
+        std::path::Path::new("/Users/test"),
+        &env,
+        &[],
+    );
+    for expected in [
+        "/Users/test/.copilot/pkg",
+        "/Users/test/.cache/copilot/pkg",
+        "/opt/xdg/copilot/pkg",
+    ] {
+        assert!(
+            paths.contains(&std::path::PathBuf::from(expected)),
+            "{expected} must be in the bwrap read-only set: {paths:?}"
+        );
+    }
+}
+
+fn profile_with_cache_env(vars: &[(&str, &str)]) -> String {
+    let env = cache_env(vars);
+    generate_profile(
+        &SandboxConfig {
+            copilot_cache_env: &env,
+            ..base_profile_options()
+        },
+        &[],
+    )
+}
+
+#[test]
+fn profile_carves_out_the_resolved_copilot_cache() {
+    let p = profile_with_cache_env(&[("COPILOT_CACHE_HOME", "/opt/copilot-cache")]);
+    for pkg in [
+        "/Users/test/Library/Caches/copilot/pkg",
+        "/opt/copilot-cache/pkg",
+    ] {
+        for rule in [
+            format!("(allow file-map-executable (subpath \"{pkg}\"))"),
+            format!("(allow process-exec (subpath \"{pkg}\"))"),
+            format!("(deny file-write* (subpath \"{pkg}\"))"),
+        ] {
+            assert!(p.contains(&rule), "profile must contain {rule}");
+        }
+    }
+    // The default is readable through `~/Library/Caches`; `/opt` is not, and
+    // Copilot loads its extracted JS and native modules from there. The read
+    // allow must not follow the write deny it sits beside.
+    let read = p
+        .find("(allow file-read* (subpath \"/opt/copilot-cache/pkg\"))")
+        .expect("the moved cache must be readable");
+    let deny = p
+        .rfind("(deny file-write* (subpath \"/opt/copilot-cache/pkg\"))")
+        .unwrap();
+    assert!(read < deny, "the write deny must come after the read allow");
+    assert!(
+        p.contains("(deny file-write-unlink (literal \"/Users/test/Library/Caches/copilot\"))")
+    );
+    // The override lies in no writable tree, so nothing above it can be
+    // renamed from inside and nothing is pinned (`home_config_target_pins`).
+    for unpinned in ["/opt/copilot-cache", "/opt", "/"] {
+        assert!(
+            !p.contains(&format!(
+                "(deny file-write-unlink (literal \"{unpinned}\"))"
+            )),
+            "{unpinned} must not be pinned"
+        );
+    }
+}
+
+/// #374: a variable refused for sitting in a writable tree is an error from
+/// `copilot_pkg_dirs`, which `prepare` stops the launch on.
+#[test]
+fn copilot_pkg_dirs_refuses_a_writable_tree() {
+    let home = std::path::Path::new("/Users/test");
+    let writable = [(std::path::PathBuf::from("/srv/w"), "the allow.write grant")];
+    let dirs = |vars: &[(&str, &str)]| {
+        cplt::sandbox::copilot_pkg_dirs(&cache_env(vars), home, "linux", &writable)
+    };
+    assert!(dirs(&[("COPILOT_CACHE_HOME", "/opt/cache")]).is_ok());
+    for var in ["COPILOT_CACHE_HOME", "XDG_CACHE_HOME"] {
+        let error = dirs(&[(var, "/srv/w/cache")]).expect_err(var);
+        assert!(
+            error.contains(&format!("{var}=/srv/w/cache"))
+                && error.contains("the allow.write grant /srv/w"),
+            "{error}"
+        );
+    }
+}
+
+/// A real tree for the #374 writable-tree checks: `<tmp>/project`,
+/// `allow.write = <tmp>/w`, and `<tmp>/real` outside both. Not under the
+/// system temp dir, which is itself a writable tree.
+fn copilot_cache_tree() -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("tempdir");
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    for d in ["project", "w", "real"] {
+        std::fs::create_dir_all(root.join(d)).unwrap();
+    }
+    (tmp, root)
+}
+
+fn profile_in_tree(root: &std::path::Path, cache_home: &std::path::Path) -> String {
+    let value = cache_home.as_os_str().to_owned();
+    let env = move |k: &str| (k == "COPILOT_CACHE_HOME").then(|| value.clone());
+    let project = root.join("project");
+    let extra_write = [root.join("w")];
+    generate_profile(
+        &SandboxConfig {
+            project_dir: &project,
+            extra_write: &extra_write,
+            copilot_cache_env: &env,
+            ..base_profile_options()
+        },
+        &[],
+    )
+}
+
+/// #374: a cache variable that lands in a writable tree would make the
+/// directory Copilot runs from writable and executable, so it is refused.
+#[test]
+fn profile_refuses_a_copilot_cache_in_a_writable_tree() {
+    let (_guard, root) = copilot_cache_tree();
+    for value in [
+        root.join("project/.cache"),
+        root.join("w/cache"),
+        std::path::PathBuf::from("/tmp/cplt-copilot-cache"),
+    ] {
+        let p = profile_in_tree(&root, &value);
+        assert!(
+            !p.contains("cache/pkg\"))") && !p.contains("cplt-copilot-cache"),
+            "{} must be refused",
+            value.display()
+        );
+    }
+}
+
+/// #374: a symlinked value is granted where it resolves; Seatbelt matches the
+/// resolved path, so a rule on the link would never fire.
+#[test]
+fn profile_grants_a_symlinked_copilot_cache_at_its_target() {
+    let (_guard, root) = copilot_cache_tree();
+    std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+    let p = profile_in_tree(&root, &root.join("link"));
+    let real = root.join("real/pkg").display().to_string();
+    assert!(p.contains(&format!("(deny file-write* (subpath \"{real}\"))")));
+    assert!(p.contains(&format!("(allow process-exec (subpath \"{real}\"))")));
+    assert!(!p.contains(&root.join("link").display().to_string()));
+}
+
+/// #374: the write deny on a moved Copilot cache comes after every write
+/// allow, so neither `allow.write` nor the temp rules can reopen it.
+#[test]
+fn profile_copilot_cache_deny_follows_every_write_allow() {
+    let (_guard, root) = copilot_cache_tree();
+    let p = profile_in_tree(&root, &root.join("real"));
+    let real = root.join("real/pkg").display().to_string();
+    let deny_at = p
+        .find(&format!("(deny file-write* (subpath \"{real}\"))"))
+        .expect("override deny");
+    let last_allow = p.rfind("(allow file-write").expect("a write allow");
+    assert!(
+        deny_at > last_allow,
+        "the override deny must come after the last write allow"
+    );
+}
+
+#[test]
+fn profile_ignores_an_unsafe_copilot_cache() {
+    let p = profile_with_cache_env(&[("COPILOT_PKG_CACHE_HOME", "/Users/test/.ssh")]);
+    assert!(!p.contains("(allow process-exec (subpath \"/Users/test/.ssh/pkg\"))"));
+    assert!(
+        p.contains("(allow process-exec (subpath \"/Users/test/Library/Caches/copilot/pkg\"))")
+    );
 }
 
 #[test]
@@ -9264,6 +9620,7 @@ fn landlock_relocated_cargo_bin_is_exec_only_and_registry_is_precreated() {
         playwright_socket_dir: None,
         allow_tmp_exec: false,
         copilot_install_dir: None,
+        copilot_cache_env: &cplt::sandbox::no_cache_env,
         java_home: None,
         dotnet_root: None,
         git_hooks_path: None,

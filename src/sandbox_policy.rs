@@ -6,6 +6,7 @@
 use crate::agent::Agent;
 use crate::config;
 use directories::ProjectDirs;
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
 /// Characters that would break SBPL profile string interpolation.
@@ -2132,10 +2133,11 @@ fn links_inside_home(home: &Path, named: &Path) -> bool {
 /// executable, and the SEA extraction that writes it happens outside the
 /// sandbox in `copilot_extract` by design.
 ///
-/// `~/.cache` is spelled literally rather than resolved through
-/// `XDG_CACHE_HOME`, to match `copilot_extract`'s `copilot_cache_dirs` — the
-/// code that actually creates the directory. If that gains XDG support this
-/// must follow it.
+/// The cache half comes from [`copilot_pkg_dirs`], so it follows
+/// `COPILOT_PKG_CACHE_HOME`, `COPILOT_CACHE_HOME` and `XDG_CACHE_HOME` the way
+/// Copilot's loader does, and still carries `~/.cache/copilot/pkg` when they
+/// point elsewhere (#374). Always resolved with Linux rules: bubblewrap is the
+/// only consumer.
 ///
 /// Same caveats as every other `ro_protect` entry: without bubblewrap this is
 /// unenforced, and bwrap skips a path that does not exist at launch.
@@ -2152,11 +2154,283 @@ fn links_inside_home(home: &Path, named: &Path) -> bool {
 /// Returns nothing for an agent that is not Copilot: the agent check lives here
 /// rather than at the call site so the whole decision is one unit-testable
 /// function on both platforms, instead of a Linux-only `if` no test can reach.
-pub fn copilot_ro_protect_paths(agent: Agent, home: &Path) -> Vec<PathBuf> {
+pub fn copilot_ro_protect_paths(
+    agent: Agent,
+    home: &Path,
+    env: &CacheEnv,
+    writable: &[(PathBuf, &str)],
+) -> Vec<PathBuf> {
     if !agent.needs_copilot_dir() {
         return Vec::new();
     }
-    vec![home.join(".copilot/pkg"), home.join(".cache/copilot/pkg")]
+    let mut paths = vec![home.join(".copilot/pkg")];
+    paths.extend(granted_copilot_pkg_dirs(env, home, "linux", writable));
+    paths
+}
+
+/// Environment lookup for the Copilot cache resolver: `&|k| std::env::var_os(k)`
+/// in production, a fixed map in tests.
+pub type CacheEnv<'a> = dyn Fn(&str) -> Option<OsString> + 'a;
+
+/// The launching process's environment, as a [`CacheEnv`].
+pub fn process_env(name: &str) -> Option<OsString> {
+    std::env::var_os(name)
+}
+
+/// A [`CacheEnv`] with nothing set.
+pub fn no_cache_env(_: &str) -> Option<OsString> {
+    None
+}
+
+/// Where Copilot's SEA loader extracts its runtime: the `pkg` directory whose
+/// `<os>-<arch>/<version>` children Copilot later executes on the host.
+///
+/// Mirrors the loader's precedence, read from the SEA loader embedded in the
+/// Copilot CLI 1.0.88 binary (`af`, `Wi` and `xs` in its minified source):
+///
+/// 1. `$COPILOT_PKG_CACHE_HOME/pkg`
+/// 2. `$COPILOT_CACHE_HOME/pkg`
+/// 3. macOS: `~/Library/Caches/copilot/pkg` (`XDG_CACHE_HOME` is not read)
+/// 4. Linux: `${XDG_CACHE_HOME:-~/.cache}/copilot/pkg`
+///
+/// An empty value counts as unset, as JavaScript's `||` does. The first value
+/// set decides, as it does for Copilot.
+///
+/// The values come from the launching environment, which a project can shape
+/// (direnv, mise), and the result becomes an exec grant. A value that is not
+/// absolute, contains `..`, is a system root or an ancestor of `$HOME`, is
+/// refused by [`grant_is_refused`], lies inside a credential directory, or
+/// cannot be written into an SBPL string is an `Err` naming the variable, its
+/// value and the reason. Copilot would still extract into that directory and
+/// run it on the host, so the launch stops rather than fall back. An accepted
+/// value is returned where it resolves, since Seatbelt matches resolved paths.
+///
+/// This is the preflight's view, without the writable trees: `prepare` has
+/// already stopped the launch on a value in one of them (through
+/// [`copilot_pkg_dirs`]) before the preflight runs.
+pub fn copilot_pkg_dir(env: &CacheEnv, home: &Path, os: &str) -> Result<PathBuf, String> {
+    resolve_copilot_pkg_dir(env, home, os, &[])
+}
+
+/// Copilot's `pkg` directory for `os` with none of its cache variables set.
+pub fn copilot_default_pkg_dir(home: &Path, os: &str) -> PathBuf {
+    if os == "macos" {
+        home.join("Library/Caches/copilot/pkg")
+    } else {
+        home.join(".cache/copilot/pkg")
+    }
+}
+
+/// [`copilot_pkg_dir`], also refusing an override that overlaps one of the
+/// `writable` trees.
+fn resolve_copilot_pkg_dir(
+    env: &CacheEnv,
+    home: &Path,
+    os: &str,
+    writable: &[(PathBuf, &str)],
+) -> Result<PathBuf, String> {
+    let default = copilot_default_pkg_dir(home, os);
+    let mut vars = vec![
+        ("COPILOT_PKG_CACHE_HOME", "pkg"),
+        ("COPILOT_CACHE_HOME", "pkg"),
+    ];
+    if os != "macos" {
+        vars.push(("XDG_CACHE_HOME", "copilot/pkg"));
+    }
+    for (name, sub) in vars {
+        if let Some(value) = env(name).filter(|v| !v.is_empty()) {
+            let root = PathBuf::from(value);
+            let pkg = root.join(sub);
+            return copilot_cache_override(name, &root, &pkg, &default, home, writable);
+        }
+    }
+    Ok(default)
+}
+
+/// The `pkg` directory an env-supplied cache root may be granted at, or the
+/// error that stops the launch.
+///
+/// `writable` holds the canonical trees the sandbox can write. A `pkg`
+/// directory overlapping one of them would be writable by the agent and run
+/// by the host: the preflight executes Copilot from it outside the sandbox on
+/// the next launch. Refusing it is the one answer that holds on every backend.
+fn copilot_cache_override(
+    name: &str,
+    root: &Path,
+    pkg: &Path,
+    default: &Path,
+    home: &Path,
+    writable: &[(PathBuf, &str)],
+) -> Result<PathBuf, String> {
+    let reject = |why: String| {
+        Err(format!(
+            "cplt refuses {name}={}: {why}. Copilot would extract its runtime there \
+             and run it on the host, outside the sandbox. Unset {name}, or point it \
+             at an absolute directory outside the project and every writable path.",
+            root.display()
+        ))
+    };
+    if !copilot_cache_root_is_usable(root, home) {
+        return reject("not a safe absolute directory".into());
+    }
+    // The default is write-denied and pinned whatever the variables say, so
+    // spelling it out (`XDG_CACHE_HOME=$HOME/.cache`) changes nothing, though
+    // `~/.cache` and `~/Library/Caches` are themselves writable trees. `Path`
+    // equality compares components, so a trailing slash still matches.
+    if pkg == default {
+        return Ok(default.to_path_buf());
+    }
+    // A symlink inside a writable tree, anywhere on the way, is one the agent
+    // can re-point before extraction: `<project>/x -> ~/.cache` today can name
+    // the project tomorrow. Refused even when it points at the default.
+    if let Some((link, (tree, why))) = writable_link_on_path(pkg, writable) {
+        return reject(format!(
+            "it passes through the symlink {} in {why} {}, which the sandbox can write",
+            link.display(),
+            tree.display()
+        ));
+    }
+    // With no such link, a value that resolves to the default is the default:
+    // every link on the way sits where the agent cannot change it.
+    let real = config::canonicalize_deepest(pkg);
+    if real == config::canonicalize_deepest(default) {
+        return Ok(default.to_path_buf());
+    }
+    // The path as spelled counts too, not only where it resolves: Copilot walks
+    // it name by name, so a directory it names inside a writable tree could be
+    // swapped for a link before extraction. Each name is placed under its
+    // resolved parent, which catches that at any level without following it.
+    let tree_on_path = pkg.ancestors().find_map(|a| {
+        let spelled = match (a.parent(), a.file_name()) {
+            (Some(parent), Some(name)) => config::canonicalize_deepest(parent).join(name),
+            _ => a.to_path_buf(),
+        };
+        writable
+            .iter()
+            .find(|(t, _)| a.starts_with(t) || spelled.starts_with(t))
+            .map(|found| (spelled, found))
+    });
+    if let Some((spelled, (tree, why))) = tree_on_path {
+        return reject(format!(
+            "{} overlaps {why} {}, which the sandbox can write",
+            spelled.display(),
+            tree.display()
+        ));
+    }
+    // Granted where it resolves, like `ResolvedToolDir::granted_at`: Seatbelt
+    // matches the resolved path, so a rule on the link would never fire.
+    if !copilot_cache_root_is_usable(&real, home) {
+        return reject(format!("it resolves to {}", real.display()));
+    }
+    if let Some((tree, why)) = writable
+        .iter()
+        .find(|(t, _)| real.starts_with(t) || t.starts_with(&real))
+    {
+        return reject(format!(
+            "{} overlaps {why} {}, which the sandbox can write",
+            real.display(),
+            tree.display()
+        ));
+    }
+    Ok(real)
+}
+
+/// The first symlink inside one of the `writable` trees that resolving the
+/// absolute `path` passes through, following each link the way the kernel
+/// does, so a link reached through another link counts. A loop past 40 hops
+/// resolves nowhere and is reported against the first tree, failing closed.
+fn writable_link_on_path<'a>(
+    path: &Path,
+    writable: &'a [(PathBuf, &'a str)],
+) -> Option<(PathBuf, &'a (PathBuf, &'a str))> {
+    let mut todo: Vec<OsString> = path
+        .components()
+        .rev()
+        .map(|c| c.as_os_str().to_owned())
+        .collect();
+    let mut at = PathBuf::from("/");
+    let mut hops = 0;
+    while let Some(name) = todo.pop() {
+        if name == ".." {
+            at.pop();
+            continue;
+        }
+        if name == "." {
+            continue;
+        }
+        let next = at.join(&name);
+        let Ok(target) = std::fs::read_link(&next) else {
+            at = next;
+            continue;
+        };
+        if let Some(tree) = writable.iter().find(|(t, _)| next.starts_with(t)) {
+            return Some((next, tree));
+        }
+        hops += 1;
+        if hops > 40 {
+            return writable.first().map(|tree| (next, tree));
+        }
+        if target.is_absolute() {
+            at = PathBuf::from("/");
+        }
+        todo.extend(target.components().rev().map(|c| c.as_os_str().to_owned()));
+    }
+    None
+}
+
+/// Every Copilot cache `pkg` directory cplt grants execute on and protects
+/// from writes: the default it has always covered, first, then the loader's
+/// platform default under `XDG_CACHE_HOME` and the actual extraction target
+/// when those differ. The loader also searches the defaults for a newer
+/// runtime to run, so dropping them when an override is set would leave a
+/// directory Copilot executes from writable. With none of the variables set
+/// this is the one default directory, so the generated policy is unchanged.
+///
+/// `writable` is the sandbox's canonical writable trees. A variable that is
+/// unsafe or overlaps one of them is an `Err` (see [`copilot_cache_override`]),
+/// and `prepare` stops the launch on it.
+pub fn copilot_pkg_dirs(
+    env: &CacheEnv,
+    home: &Path,
+    os: &str,
+    writable: &[(PathBuf, &str)],
+) -> Result<Vec<PathBuf>, String> {
+    let xdg_only = |k: &str| if k == "XDG_CACHE_HOME" { env(k) } else { None };
+    let resolve = |env: &CacheEnv| resolve_copilot_pkg_dir(env, home, os, writable);
+    let mut dirs = vec![copilot_default_pkg_dir(home, os)];
+    for dir in [resolve(&xdg_only)?, resolve(env)?] {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    Ok(dirs)
+}
+
+/// [`copilot_pkg_dirs`] for a policy: only the default when a variable is
+/// refused, since `prepare` stops that launch before anything runs.
+pub(crate) fn granted_copilot_pkg_dirs(
+    env: &CacheEnv,
+    home: &Path,
+    os: &str,
+    writable: &[(PathBuf, &str)],
+) -> Vec<PathBuf> {
+    copilot_pkg_dirs(env, home, os, writable)
+        .unwrap_or_else(|_| vec![copilot_default_pkg_dir(home, os)])
+}
+
+/// Whether an env-supplied cache root may become a Copilot `pkg` grant.
+fn copilot_cache_root_is_usable(root: &Path, home: &Path) -> bool {
+    let ok = |p: &Path| {
+        p.is_absolute()
+            && !p.components().any(|c| c == Component::ParentDir)
+            && validate_sbpl_path(p).is_ok()
+            && tool_override_path_is_safe(p, home)
+            && !grant_is_refused(home, p)
+            && !DENIED_DOTFILES.iter().any(|d| p.starts_with(home.join(d)))
+    };
+    // A symlinked root is granted where it points (Landlock follows the link,
+    // Seatbelt matches the resolved path), so the target must pass too.
+    ok(root) && std::fs::canonicalize(root).map_or(true, |real| ok(&real))
 }
 
 /// A tool home relocated by an env var (`CARGO_HOME=~/.local/share/cargo`).

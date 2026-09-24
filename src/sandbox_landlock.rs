@@ -1044,16 +1044,21 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         // Copilot SEA cache — auto-updaters download newer versions here.
         // Execute is required for Node to spawn the newer ripgrep / helpers.
         // (Write access is already inherited from the broader ~/.cache allow).
-        fs_rules.push(FsRule {
-            path: home.join(".cache/copilot/pkg"),
-            access: FsAccess {
-                read: true,
-                write: false,
-                execute: true,
-                ioctl: false,
-                create_dirs: false,
-            },
-        });
+        // Resolved as Copilot resolves it (#374): only `~/.cache/copilot/pkg`
+        // unless a cache variable moves it, and never into a writable tree,
+        // where this rule would union with the write grant.
+        for path in super::copilot_pkg_grants(config, "linux") {
+            fs_rules.push(FsRule {
+                path,
+                access: FsAccess {
+                    read: true,
+                    write: false,
+                    execute: true,
+                    ioctl: false,
+                    create_dirs: false,
+                },
+            });
+        }
     }
     for dir in config.agent_dirs {
         if refused_link(home, &dir.path, "agent directory") {
@@ -2550,6 +2555,7 @@ mod tests {
             playwright_socket_dir: None,
             allow_tmp_exec: false,
             copilot_install_dir: None,
+            copilot_cache_env: &crate::sandbox::no_cache_env,
             java_home: None,
             dotnet_root: None,
             git_hooks_path: None,
@@ -4357,6 +4363,98 @@ mod tests {
         assert!(rule.access.read);
         assert!(!rule.access.write);
         assert!(rule.access.execute);
+    }
+
+    /// #374: the SEA cache exec rule follows Copilot's own resolution, and
+    /// keeps the default as well.
+    #[test]
+    fn copilot_sea_cache_exec_rule_follows_the_cache_variables() {
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let env = |k: &str| match k {
+            "XDG_CACHE_HOME" => Some("/srv/xdg".into()),
+            "COPILOT_CACHE_HOME" => Some("/opt/copilot-cache".into()),
+            _ => None,
+        };
+        let mut config = test_config(&project, &home);
+        config.copilot_cache_env = &env;
+        let policy = generate_policy(&config);
+        for path in [
+            "/home/user/.cache/copilot/pkg",
+            "/srv/xdg/copilot/pkg",
+            "/opt/copilot-cache/pkg",
+        ] {
+            let rule = policy
+                .fs_rules
+                .iter()
+                .find(|r| r.path == Path::new(path))
+                .unwrap_or_else(|| panic!("{path} should have an exec rule"));
+            assert!(rule.access.read && rule.access.execute && !rule.access.write);
+        }
+    }
+
+    /// The paths that get the Copilot SEA exec rule with `COPILOT_CACHE_HOME`
+    /// set to `value`, in a real tree: `<tmp>/project`, `<tmp>/home`, and
+    /// `allow.write = <tmp>/w`.
+    fn copilot_exec_rules_with(tmp: &Path, value: &Path) -> Vec<PathBuf> {
+        let (project, home, w) = (tmp.join("project"), tmp.join("home"), tmp.join("w"));
+        for d in [&project, &home, &w] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let extra_write = [w];
+        let value = value.as_os_str().to_owned();
+        let env = move |k: &str| (k == "COPILOT_CACHE_HOME").then(|| value.clone());
+        let mut config = test_config(&project, &home);
+        config.extra_write = &extra_write;
+        config.copilot_cache_env = &env;
+        generate_policy(&config)
+            .fs_rules
+            .into_iter()
+            .filter(|r| r.access.execute && r.path.ends_with("pkg"))
+            .map(|r| r.path)
+            .collect()
+    }
+
+    fn real_tempdir() -> (tempfile::TempDir, PathBuf) {
+        // Not under the system temp dir, which is itself a writable tree.
+        let tmp = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        (tmp, root)
+    }
+
+    /// #374: a cache variable that lands in a writable tree would union the
+    /// exec rule with the write grant, so it is refused and only the default
+    /// keeps its rule.
+    #[test]
+    fn copilot_sea_cache_in_a_writable_tree_gets_no_exec_rule() {
+        let (_guard, tmp) = real_tempdir();
+        for value in [
+            tmp.join("project/.cache"),
+            tmp.join("w/cache"),
+            PathBuf::from("/tmp/cplt-copilot-cache"),
+        ] {
+            let rules = copilot_exec_rules_with(&tmp, &value);
+            assert_eq!(
+                rules,
+                [tmp.join("home/.cache/copilot/pkg")],
+                "{} must be refused",
+                value.display()
+            );
+        }
+    }
+
+    /// #374: a symlinked value is granted where it resolves, since Landlock
+    /// follows the link and the policy should name what it covers.
+    #[test]
+    fn copilot_sea_cache_behind_a_symlink_is_granted_at_its_target() {
+        let (_guard, tmp) = real_tempdir();
+        std::fs::create_dir_all(tmp.join("real")).unwrap();
+        std::os::unix::fs::symlink(tmp.join("real"), tmp.join("link")).unwrap();
+        let rules = copilot_exec_rules_with(&tmp, &tmp.join("link"));
+        assert_eq!(
+            rules,
+            [tmp.join("home/.cache/copilot/pkg"), tmp.join("real/pkg")]
+        );
     }
 
     #[test]
