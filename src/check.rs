@@ -255,7 +255,7 @@ pub fn explain_path(
 /// **What this accounts for, exactly.** The `fs_rules` grants, minus one
 /// enforced subtraction: the macOS `path_bin_dirs` write-denies (see
 /// [`write_denied`]). It is *not* a reflection of every write-deny the SBPL
-/// profile emits — `~/.gradle/jdks`, the DOTNET subdirs, the write-then-exec
+/// profile emits — `~/.gradle/jdks`, `~/.konan/dependencies`, the DOTNET subdirs, the write-then-exec
 /// cache denies and the `.git` denies all narrow the real policy further and
 /// are not subtracted here. Those omissions can only make this over-report (a
 /// path called writable that macOS in fact denies), never under-report, so a

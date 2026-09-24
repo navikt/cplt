@@ -720,6 +720,14 @@ Two limits are worth knowing. Both rules match the *resolved* path, so if `~/.gr
 
 **Linux:** unaffected. Landlock has a single `EXECUTE` right covering both `execve` and executable mappings, so the map-exec grant on `~/.gradle` already implies exec there. The carve-out is macOS-only, and the read-only pairing cannot be expressed on Linux for the same reason [`DENIED_HOME_SUBPATHS`](#private-registries) cannot.
 
+## Kotlin/Native toolchain
+
+`~/.konan` is a store like `~/.gradle`: writable, `file-map-executable`, no `process-exec`. Kotlin/Native downloads an LLVM toolchain into `~/.konan/dependencies` on first use and a native link execs `clang++` from it, so on macOS every `link*Executable*` task failed with `Cannot run program ".../.konan/dependencies/llvm-.../bin/clang++": Exec failed, error: 1 (Operation not permitted)` ([#323](https://github.com/navikt/cplt/issues/323)).
+
+cplt now carves `~/.konan/dependencies` out as executable and **read-only**, like `~/.gradle/jdks`. The consequence is the same too. A first K/N build inside cplt cannot download the toolchain and fails with a write error under `~/.konan/dependencies`. Run that first build (or any build after a Kotlin version bump) outside cplt once. The lock file K/N opens on every build, `~/.konan/dependencies/cache/.lock`, takes data writes and nothing else.
+
+A `KONAN_DATA_DIR` outside `~/.konan` misses these rules and the `~/.konan` grant itself. **Linux** still grants execute on the whole of `~/.konan`, as before.
+
 ## JVM Attach API
 
 JVM testing frameworks like **MockK** (inline mocking), **Mockito** (inline agents), and **ByteBuddy** use the JVM Attach API for runtime class instrumentation. That API creates a Unix domain socket at `/tmp/.java_pid<PID>`, which the sandbox blocks by default.

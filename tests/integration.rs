@@ -2422,6 +2422,83 @@ mod macos_tests {
         );
     }
 
+    /// #323: Kotlin/Native execs `clang++` from the LLVM it downloads into
+    /// `~/.konan/dependencies`. That subtree executes and stays read-only; the
+    /// rest of `~/.konan` stays writable and non-executable; K/N's lock file
+    /// takes data writes and nothing else.
+    #[test]
+    fn real_profile_konan_toolchain_executes_but_stays_read_only() {
+        require_sandbox!();
+        // Under the crate dir rather than temp: `/private/var/folders` is
+        // exec-denied anyway, which would make the negatives pass for the
+        // wrong reason.
+        let project = tempfile::Builder::new()
+            .prefix(".cplt-konan-project-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        let home = tempfile::Builder::new()
+            .prefix(".cplt-konan-home-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        let home_path = fs::canonicalize(home.path()).unwrap();
+        let konan = home_path.join(".konan");
+        let deps = konan.join("dependencies");
+        let clang = deps.join("llvm-19-aarch64-macos-essentials-79/bin/clang++");
+        let other = konan.join("kotlin-native-prebuilt-macos-aarch64-2.2.21/bin/konanc");
+        let lock = deps.join("cache/.lock");
+        for bin in [&clang, &other] {
+            fs::create_dir_all(bin.parent().unwrap()).unwrap();
+            fs::copy("/usr/bin/true", bin).unwrap();
+            fs::set_permissions(bin, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        fs::write(&lock, "").unwrap();
+
+        let profile = write_real_profile(&default_opts(project.path(), &home_path));
+        let command = format!(
+            "'{clang}' && echo TOOLCHAIN_EXEC_OK; \
+             '{other}' 2>/dev/null && echo OTHER_EXEC_RAN; \
+             cp /usr/bin/true '{deps}/dropped' 2>/dev/null && echo DEPS_WRITE_RAN; \
+             touch '{konan}/klib-cache' && echo STORE_WRITE_OK; \
+             printf x >> '{lock}' && echo LOCK_WRITE_OK; \
+             rm '{lock}' 2>/dev/null && echo LOCK_RM_RAN; \
+             chmod 755 '{lock}' 2>/dev/null && echo LOCK_CHMOD_RAN; \
+             true",
+            clang = clang.display(),
+            other = other.display(),
+            deps = deps.display(),
+            konan = konan.display(),
+            lock = lock.display(),
+        );
+        let (output, _) = run_sandboxed(&profile, &command);
+        fs::remove_file(&profile).ok();
+
+        assert!(
+            output.contains("TOOLCHAIN_EXEC_OK"),
+            "a binary under ~/.konan/dependencies must execute: {output}"
+        );
+        assert!(
+            !output.contains("OTHER_EXEC_RAN"),
+            "the rest of ~/.konan must stay non-executable: {output}"
+        );
+        assert!(
+            !output.contains("DEPS_WRITE_RAN"),
+            "~/.konan/dependencies must be read-only, or it is write-then-exec: {output}"
+        );
+        assert!(
+            output.contains("STORE_WRITE_OK"),
+            "the rest of ~/.konan must stay writable: {output}"
+        );
+        assert!(
+            output.contains("LOCK_WRITE_OK"),
+            "K/N's lock must take data writes: {output}"
+        );
+        assert!(
+            !output.contains("LOCK_RM_RAN") && !output.contains("LOCK_CHMOD_RAN"),
+            "K/N's lock must not be replaceable or made executable: {output}"
+        );
+    }
+
     // ── Scratch dir ───────────────────────────────────────────────
 
     #[test]

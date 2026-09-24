@@ -154,7 +154,7 @@ pub fn generate_profile_with_playwright_socket_dir(
     );
     emit_agent_exec_carveouts(&mut sb, config.agent_dirs);
     emit_copilot_install(&mut sb, config.copilot_install_dir);
-    emit_gradle_toolchain_exec(&mut sb, &home);
+    emit_toolchain_exec(&mut sb, &home);
     emit_java_home(&mut sb, config.java_home);
     emit_dotnet_root(&mut sb, config.dotnet_root);
     emit_electron_app(&mut sb, config.electron_app_dir);
@@ -232,9 +232,9 @@ pub fn generate_profile_with_playwright_socket_dir(
     // Same reason: keeps exec-allowed DOTNET_ROOT subtrees non-writable even
     // when a user allow.write covers them (write-then-exec).
     emit_dotnet_exec_denies(&mut sb, config.dotnet_root);
-    // Same reason: keeps the exec-allowed Gradle toolchain dir non-writable
-    // even when a user allow.write covers ~/.gradle (write-then-exec).
-    emit_gradle_toolchain_write_deny(&mut sb, &home);
+    // Same reason: keeps the exec-allowed toolchain dirs non-writable even
+    // when a user allow.write covers ~/.gradle or ~/.konan (write-then-exec).
+    emit_toolchain_write_deny(&mut sb, &home);
     // Same reason: a dotfiles-managed `~/.gitconfig` can resolve into the
     // project or an `allow.write` tree, and the deny at its target must beat
     // that grant (#524).
@@ -1733,47 +1733,69 @@ fn emit_java_home(sb: &mut String, java_home: Option<&Path>) {
     }
 }
 
-/// Allow executing JDKs that Gradle auto-provisions into `~/.gradle/jdks`.
+/// Toolchains a build tool downloads into its own writable, exec-denied store
+/// and then execs. Each gets `process-exec` back and loses `file-write*`.
 ///
-/// `~/.gradle` is a dependency store in `HOME_TOOL_DIRS` (write + map-exec, no
-/// process-exec), so `emit_tool_dirs` emits an explicit
-/// `(deny process-exec (subpath "~/.gradle"))` to beat the blanket
-/// `(allow process-exec)`. That is right for dependency JARs, but Gradle's
-/// toolchain support drops provisioned JDKs under `~/.gradle/jdks` — inside the
-/// denied subtree. Forking a toolchain `javac` or test JVM then fails with
-/// "Operation not permitted", and no config key could grant it (`allow.read`
-/// emits `file-read*` only, and there is no `allow.exec`). Re-allow exec for
-/// just that subtree; the matching write-deny is emitted later, by
-/// `emit_gradle_toolchain_write_deny`.
+/// - `~/.gradle/jdks`: JDKs provisioned by Gradle's toolchain support (#191).
+/// - `~/.konan/dependencies`: the LLVM toolchain Kotlin/Native downloads on
+///   first use; a native link execs `clang++` from it (#323).
+const PROVISIONED_TOOLCHAINS: &[&str] = &[".gradle/jdks", ".konan/dependencies"];
+
+/// Allow executing the [`PROVISIONED_TOOLCHAINS`].
+///
+/// `~/.gradle` and `~/.konan` are dependency stores in `HOME_TOOL_DIRS` (write,
+/// map-exec, no process-exec), so `emit_tool_dirs` emits an explicit
+/// `(deny process-exec (subpath ...))` to beat the blanket
+/// `(allow process-exec)`. That is right for dependency JARs and klibs, but
+/// both tools drop a toolchain they exec inside the denied subtree. Forking a
+/// toolchain `javac` or K/N's `clang++` then fails with "Operation not
+/// permitted", and no config key could grant it. Re-allow exec for just those
+/// subtrees; the matching write-deny is emitted later, by
+/// `emit_toolchain_write_deny`.
 ///
 /// Emitted AFTER `emit_tool_dirs` because SBPL is last-match-wins.
-fn emit_gradle_toolchain_exec(sb: &mut String, home: &str) {
-    sbpl!(sb, ";; Gradle toolchain JDKs — exec auto-provisioned JDKs");
-    sbpl!(sb, "(allow process-exec (subpath \"{home}/.gradle/jdks\"))");
+fn emit_toolchain_exec(sb: &mut String, home: &str) {
+    sbpl!(
+        sb,
+        ";; Provisioned toolchains (Gradle JDKs, K/N LLVM) — exec"
+    );
+    for dir in PROVISIONED_TOOLCHAINS {
+        sbpl!(sb, "(allow process-exec (subpath \"{home}/{dir}\"))");
+    }
     sbpl!(sb);
 }
 
-/// Keep the exec-allowed Gradle toolchain directory read-only.
+/// Keep the exec-allowed [`PROVISIONED_TOOLCHAINS`] read-only.
 ///
-/// `~/.gradle` is agent-writable, so exec inside it without a write-deny is a
-/// write-then-exec primitive: drop a binary into `~/.gradle/jdks` and run it,
-/// bypassing the `allow_tmp_exec` / `allow_cache_exec` gates entirely. Gradle
-/// provisions toolchains outside the sandbox, so this costs nothing in normal
-/// use. The trade: with `auto-download=true`, a toolchain not already on disk
-/// now fails at provisioning time with a write error instead of at exec time
-/// with EPERM. Provision it outside cplt, or point
-/// `org.gradle.java.installations.paths` at a JDK outside `~/.gradle`.
+/// `~/.gradle` and `~/.konan` are agent-writable, so exec inside them without a
+/// write-deny is a write-then-exec primitive: drop a binary into
+/// `~/.gradle/jdks` and run it, bypassing the `allow_tmp_exec` /
+/// `allow_cache_exec` gates entirely. Both tools provision their toolchain
+/// outside the sandbox in normal use (a first build run outside cplt), so this
+/// costs nothing then. The trade: a toolchain not already on disk now fails at
+/// provisioning time with a write error instead of at exec time with EPERM —
+/// Gradle with `auto-download=true`, or a first Kotlin/Native build. Provision
+/// it outside cplt once.
 ///
 /// Emitted AFTER `emit_user_allows` because SBPL is last-match-wins: a user
 /// `allow.write` covering `~/.gradle` (or any parent) would otherwise override
 /// a write-deny emitted alongside the exec allow and silently reopen the hole.
 /// Same rationale as `emit_dotnet_exec_denies`.
-fn emit_gradle_toolchain_write_deny(sb: &mut String, home: &str) {
+fn emit_toolchain_write_deny(sb: &mut String, home: &str) {
     sbpl!(
         sb,
-        ";; Gradle toolchain JDKs — exec-allowed path stays read-only"
+        ";; Provisioned toolchains — exec-allowed paths stay read-only"
     );
-    sbpl!(sb, "(deny file-write* (subpath \"{home}/.gradle/jdks\"))");
+    for dir in PROVISIONED_TOOLCHAINS {
+        sbpl!(sb, "(deny file-write* (subpath \"{home}/{dir}\"))");
+    }
+    // K/N opens this lock for writing on every build, toolchain present or
+    // not. Data only: no create, unlink, link or chmod, so the file K/N
+    // created (0644) cannot be swapped for or turned into an executable.
+    sbpl!(
+        sb,
+        "(allow file-write-data (literal \"{home}/.konan/dependencies/cache/.lock\"))"
+    );
     sbpl!(sb);
 }
 
@@ -2178,7 +2200,7 @@ fn emit_user_allows(
 /// a write-deny sitting next to its own allow is reopened by any later
 /// `file-write*` allow that covers the same tree. That is exactly the bug #158
 /// left behind, and the reason `emit_dotnet_exec_denies` and
-/// `emit_gradle_toolchain_write_deny` are at the bottom of `generate_profile`
+/// `emit_toolchain_write_deny` are at the bottom of `generate_profile`
 /// too. Do not move this call.
 fn emit_exec_write_denies(sb: &mut String, extra_exec: &[PathBuf]) {
     if extra_exec.is_empty() {
@@ -4080,21 +4102,24 @@ mod tests {
         );
     }
 
-    /// #191: Gradle auto-provisions toolchain JDKs into `~/.gradle/jdks`, which
-    /// sits inside the `(deny process-exec (subpath "~/.gradle"))` that
-    /// `emit_tool_dirs` emits for dependency stores — `java`/`javac` from a
-    /// toolchain JDK got EPERM. The carve-out only works if it is emitted AFTER
-    /// that deny (last-match-wins), and the paired write-deny only closes the
-    /// write-then-exec hole if it is emitted after every write allow, including
-    /// a user `allow.write`. Byte offsets, not `contains`, because ordering is
-    /// the whole point.
+    /// #191 / #323: Gradle provisions toolchain JDKs into `~/.gradle/jdks` and
+    /// Kotlin/Native its LLVM into `~/.konan/dependencies`, each inside the
+    /// `(deny process-exec (subpath ...))` that `emit_tool_dirs` emits for
+    /// dependency stores — `javac` and K/N's `clang++` got EPERM. The carve-out
+    /// only works if it is emitted AFTER that deny (last-match-wins), and the
+    /// paired write-deny only closes the write-then-exec hole if it is emitted
+    /// after every write allow, including a user `allow.write`. Byte offsets,
+    /// not `contains`, because ordering is the whole point.
     #[test]
-    fn gradle_toolchain_exec_allow_comes_after_the_gradle_exec_deny() {
+    fn toolchain_exec_allow_comes_after_the_store_exec_deny() {
         let project = std::path::Path::new("/projects/app");
         let home = std::path::Path::new("/Users/test");
         let mut opts = test_options(project, home);
-        // Worst case for the write-deny: the user has opened up all of ~/.gradle.
-        let extra_write = [std::path::PathBuf::from("/Users/test/.gradle")];
+        // Worst case for the write-deny: the user has opened up both stores.
+        let extra_write = [
+            std::path::PathBuf::from("/Users/test/.gradle"),
+            std::path::PathBuf::from("/Users/test/.konan"),
+        ];
         opts.extra_write = &extra_write;
         let p = generate_profile(&opts, &[]);
 
@@ -4103,36 +4128,84 @@ mod tests {
                 .unwrap_or_else(|| panic!("rule missing from profile: {rule}"))
         };
 
-        let exec_deny = at(r#"(deny process-exec (subpath "/Users/test/.gradle"))"#);
-        let exec_allow = at(r#"(allow process-exec (subpath "/Users/test/.gradle/jdks"))"#);
-        assert!(
-            exec_deny < exec_allow,
-            "toolchain exec allow @ {exec_allow} must come AFTER the .gradle exec deny @ {exec_deny}"
-        );
+        for (store, toolchain) in [
+            (".gradle", ".gradle/jdks"),
+            (".konan", ".konan/dependencies"),
+        ] {
+            // Last against last: the tool-dir deny and the allow.write deny
+            // both precede the final allow, or the toolchain stops executing.
+            let last = |rule: String| {
+                p.rfind(&rule)
+                    .unwrap_or_else(|| panic!("rule missing from profile: {rule}"))
+            };
+            let exec_deny = last(format!(
+                r#"(deny process-exec (subpath "/Users/test/{store}"))"#
+            ));
+            let exec_allow = last(format!(
+                r#"(allow process-exec (subpath "/Users/test/{toolchain}"))"#
+            ));
+            assert!(
+                exec_deny < exec_allow,
+                "{toolchain} exec allow @ {exec_allow} must come AFTER the {store} exec deny @ {exec_deny}"
+            );
 
-        let write_allow = at(r#"(allow file-write* (subpath "/Users/test/.gradle"))"#);
-        let user_write_allow = p
-            .rfind(r#"(allow file-write* (subpath "/Users/test/.gradle"))"#)
-            .expect("user allow.write rule missing");
-        let write_deny = at(r#"(deny file-write* (subpath "/Users/test/.gradle/jdks"))"#);
-        assert!(
-            write_allow < write_deny && user_write_allow < write_deny,
-            "toolchain write deny @ {write_deny} must come AFTER every .gradle write allow \
-             (tool dir @ {write_allow}, user allow.write @ {user_write_allow})"
-        );
+            let store_write = format!(r#"(allow file-write* (subpath "/Users/test/{store}"))"#);
+            let write_allow = at(&store_write);
+            let user_write_allow = p
+                .rfind(&store_write)
+                .expect("user allow.write rule missing");
+            let write_deny = at(&format!(
+                r#"(deny file-write* (subpath "/Users/test/{toolchain}"))"#
+            ));
+            assert!(
+                write_allow < write_deny && user_write_allow < write_deny,
+                "{toolchain} write deny @ {write_deny} must come AFTER every {store} write allow \
+                 (tool dir @ {write_allow}, user allow.write @ {user_write_allow})"
+            );
 
-        // Stronger than the two known allows above: nothing emitted later may
-        // re-grant write over the exec-allowed subtree. Guards against a future
-        // emit_* being appended after emit_gradle_toolchain_write_deny.
-        let last_write_allow = p
-            .rfind("(allow file-write*")
-            .expect("profile has no write allows at all");
-        assert!(
-            last_write_allow < write_deny,
-            "the toolchain write deny @ {write_deny} must be the LAST rule \
-             touching write on this subtree; a later (allow file-write*) @ \
-             {last_write_allow} would reopen write-then-exec"
+            // Stronger than the two known allows above: nothing emitted later may
+            // re-grant write over the exec-allowed subtree. Guards against a future
+            // emit_* being appended after emit_toolchain_write_deny.
+            let last_write_allow = p
+                .rfind("(allow file-write*")
+                .expect("profile has no write allows at all");
+            assert!(
+                last_write_allow < write_deny,
+                "the {toolchain} write deny @ {write_deny} must be the LAST rule \
+                 touching write on this subtree; a later (allow file-write*) @ \
+                 {last_write_allow} would reopen write-then-exec"
+            );
+        }
+    }
+
+    /// #323: K/N opens `~/.konan/dependencies/cache/.lock` for writing on every
+    /// build, inside the exec-allowed, write-denied toolchain tree. It gets
+    /// `file-write-data` on that one literal, after the deny — never
+    /// `file-write*`, whose create/unlink/link/mode rights would let the agent
+    /// put an executable of its own at an exec-allowed path.
+    #[test]
+    fn konan_lock_is_writable_as_data_only() {
+        let p = generate_profile(
+            &test_options(
+                std::path::Path::new("/projects/app"),
+                std::path::Path::new("/Users/test"),
+            ),
+            &[],
         );
+        let lock = "/Users/test/.konan/dependencies/cache/.lock";
+        let deny = p
+            .find(r#"(deny file-write* (subpath "/Users/test/.konan/dependencies"))"#)
+            .expect("toolchain write deny missing");
+        let allow = p
+            .find(&format!(r#"(allow file-write-data (literal "{lock}"))"#))
+            .unwrap_or_else(|| panic!("lock data-write allow missing\n{p}"));
+        assert!(allow > deny, "the lock allow must follow the write deny");
+        for line in p.lines().filter(|l| l.contains(lock)) {
+            assert!(
+                line.starts_with("(allow file-write-data "),
+                "the lock may only get file-write-data: {line}"
+            );
+        }
     }
 
     #[test]
