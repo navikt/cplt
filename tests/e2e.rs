@@ -6831,6 +6831,317 @@ paths = [
         );
     }
 
+    // ── #576: a .git planted below the project is reported at session end ──
+
+    /// A git project with an existing nested repository `keep/`, a nested
+    /// worktree-style `wt/.git` pointer file to the bare `e0` (which has a
+    /// `pre-commit` hook), a `cw/` whose `commondir` names the bare `c0`, and
+    /// a repository `evil` beside the project, outside it, and `outer` with a
+    /// repository one level down, `outer/app`. Plus a scratch
+    /// HOME. Built in the checkout, not `/tmp`, where the sandbox denies exec.
+    fn nested_git_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::Builder::new()
+            .prefix(".cplt-e2e-nested-git-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let (project, home) = (root.join("proj"), root.join("home"));
+        std::fs::create_dir_all(project.join("keep")).unwrap();
+        std::fs::create_dir_all(project.join("wt")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        assert!(git_ok(&project, &["init", "-q", "-b", "main"]));
+        assert!(git_ok(&project.join("keep"), &["init", "-q", "-b", "main"]));
+        assert!(git_ok(&project, &["init", "-q", "--bare", "e0"]));
+        std::fs::write(project.join("wt/.git"), "gitdir: ../e0\n").unwrap();
+        std::fs::write(project.join("e0/hooks/pre-commit"), "#!/bin/sh\ntrue\n").unwrap();
+        assert!(git_ok(&project, &["init", "-q", "--bare", "c0"]));
+        std::fs::create_dir_all(project.join("cw")).unwrap();
+        std::fs::write(project.join("cw/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(project.join("cw/commondir"), "../c0\n").unwrap();
+        assert!(git_ok(&root, &["init", "-q", "-b", "main", "evil"]));
+        assert!(git_ok(&root, &["init", "-q", "-b", "main", "outer/app"]));
+        // L1: a real directory outside the project to `..` back in through,
+        // and where it can later be pointed instead.
+        std::fs::create_dir_all(root.join("stage/x")).unwrap();
+        std::fs::create_dir_all(root.join("evilbase/a/b")).unwrap();
+        assert!(git_ok(
+            &root,
+            &["init", "-q", "-b", "main", "evilbase/proj/keep"]
+        ));
+        (tmp, project, home)
+    }
+
+    /// `cplt exec -c <script>` in `project`; returns stderr.
+    fn exec_session(project: &Path, home: &Path, script: &str) -> String {
+        let output = cplt_cmd()
+            .args(["--no-validate", "exec", "-c", script])
+            .current_dir(project)
+            .env("HOME", home)
+            .output()
+            .expect("cplt exec should run");
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(output.status.success(), "session failed: {stderr}");
+        stderr
+    }
+
+    /// The three plants from #576 — a `gitdir:` pointer file, a symlink, and a
+    /// gitdir renamed into place — plus a rewrite of the config an existing
+    /// pointer resolves to. None of them writes a path the profile denies, and
+    /// each must be named at session end.
+    #[test]
+    fn e2e_planted_nested_git_is_reported() {
+        require_sandbox!();
+        let (_tmp, project, home) = nested_git_fixture();
+        // R1: a link out through /tmp that leads straight back in. The lookup
+        // ends inside the project today; `/tmp/…` can be re-aimed tomorrow.
+        let hop = PathBuf::from(format!("/tmp/cplt-e2e-hop-{}", std::process::id()));
+        let stderr = exec_session(
+            &project,
+            &home,
+            &format!(
+                "mkdir keep/app && ln -s \"$PWD/keep\" {hop} && ln -s {hop} pkgs3 && \
+             ln -s {hop}/app pkgs4 && ln -s {stage}/x/../../proj/keep dotdot && \
+             mkdir e e3 s1 s2 s3 s4 && printf '[core]\\n\\tfsmonitor = x\\n' > e/config && \
+             mkdir e/objects e/refs && echo 'ref: refs/heads/main' > e/HEAD && \
+             printf 'gitdir: ../e\\n' > s1/.git && ln -s ../e s2/.git && mv e3 s3/.git && \
+             ln -s ../e s4/.GIT && \
+             mkdir -p s5/objects s5/refs && echo 'ref: refs/heads/main' > s5/HEAD && \
+             printf '[core]\\n\\tfsmonitor = x\\n' > s5/config && \
+             mkdir -p sp cm/objects cm/refs && echo 'ref: refs/heads/main' > sp/HEAD && \
+             echo ../cm > sp/commondir && printf '[core]\\n\\tfsmonitor = x\\n' > cm/config && \
+             mkdir -p hl/objects hl/refs && ln -s refs/heads/main hl/HEAD && \
+             printf '[core]\\n\\tfsmonitor = x\\n' > hl/config && ln -s ../evil tools && \
+             ln -s ../outer pkgs && ln -s ../later lat && mkdir .git/.git && \
+             mkdir -p l2/in/objects l2/in/refs && echo 'ref: refs/heads/main' > l2/in/HEAD && \
+             chmod 311 l2 && \
+             printf '[core]\\n\\tfsmonitor = x\\n' >> e0/config && echo x > keep/file",
+                hop = hop.display(),
+                stage = project.parent().unwrap().join("stage").display()
+            ),
+        );
+        std::fs::remove_file(&hop).ok();
+        // Before any assertion, so the tempdir can be removed either way.
+        std::fs::set_permissions(
+            project.join("l2"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        // Git itself takes `sp` (a commondir split) and `hl` (HEAD a dangling
+        // symlink) as git directories, with no `.git` in sight. Without that,
+        // reporting them would prove nothing.
+        for dir in ["sp", "hl"] {
+            let out = git_cmd(&project.join(dir))
+                .args([
+                    "-c",
+                    "core.fsmonitor=false",
+                    "rev-parse",
+                    "--absolute-git-dir",
+                ])
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                project.join(dir).display().to_string(),
+                "git should take {dir} as a gitdir: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        // On a case-insensitive volume (the macOS default) git really does
+        // use `s4/.GIT`, which is what makes it a plant worth reporting.
+        let case_insensitive = project.join("s4/.git").exists();
+        if case_insensitive {
+            let out = git_cmd(&project.join("s4"))
+                .args(["rev-parse", "--absolute-git-dir"])
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                project.join("e").display().to_string(),
+                "git should resolve the case variant: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        assert!(
+            stderr.contains("A git repository was created or changed"),
+            "no report: {stderr}"
+        );
+        for (what, dir) in [
+            ("new", "s1"),
+            ("new", "s2"),
+            ("new", "s3"),
+            // A bare-repository layout needs no `.git` at all.
+            ("new", "s5"),
+            // #576 review: a commondir split, a dangling `HEAD` symlink, and a
+            // symlink to a repository outside the project.
+            ("new", "sp"),
+            ("new", "hl"),
+            ("new", "tools"),
+            ("new", "e"),
+            ("changed", "wt"),
+        ]
+        .into_iter()
+        .chain(case_insensitive.then_some(("new", "s4")))
+        {
+            let line = format!("{what}: {}", project.join(dir).display());
+            assert!(stderr.contains(&line), "missing `{line}`: {stderr}");
+        }
+        let outside = project.parent().unwrap();
+        for line in [
+            // N3: named by the planted entry, not the gitdir it is in.
+            format!("new: {}", project.join(".git/.git").display()),
+            // F3: a gitdir outside every root says so.
+            format!(
+                "new: {} (its git directory is outside the project and every named repository: {})",
+                project.join("tools").display(),
+                outside.join("evil/.git").display()
+            ),
+            // B1: a link out of the project, with the repository one level
+            // down, and a dangling one that something outside can arm later.
+            format!("{} -> ../outer", project.join("pkgs").display()),
+            format!("{} -> ../later", project.join("lat").display()),
+            // R1: out through /tmp and back in, both spellings.
+            format!("{} -> {}", project.join("pkgs3").display(), hop.display()),
+            format!(
+                "{} -> {}/app",
+                project.join("pkgs4").display(),
+                hop.display()
+            ),
+            // L1: out through a real directory and `..` back in.
+            format!(
+                "{} -> {}/stage/x/../../proj/keep",
+                project.join("dotdot").display(),
+                outside.display()
+            ),
+            // B2: a directory the walk cannot list, hiding `l2/in`.
+            format!("  {}\n", project.join("l2").display()),
+        ] {
+            assert!(stderr.contains(&line), "missing `{line}`: {stderr}");
+        }
+        assert!(
+            stderr.contains("not permitted to list these directories"),
+            "{stderr}"
+        );
+        // A link that stays inside the project is not a link report.
+        assert!(!stderr.contains("s2/.git -> ../e"), "{stderr}");
+        // L1, why it matters: swap `stage/x` for a symlink, and the same
+        // `dotdot` now leads to a different repository, with no change inside
+        // the project.
+        std::fs::remove_dir(outside.join("stage/x")).unwrap();
+        std::os::unix::fs::symlink(outside.join("evilbase/a/b"), outside.join("stage/x")).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(project.join("dotdot")).unwrap(),
+            outside.join("evilbase/proj/keep")
+        );
+        // `keep` itself is not reported (links through it may name it).
+        let keep = project.join("keep").display().to_string();
+        assert!(
+            !stderr.contains(&format!("new: {keep}"))
+                && !stderr.contains(&format!("changed: {keep}")),
+            "an untouched nested repository was reported: {stderr}"
+        );
+    }
+
+    /// #576 review (F1): a project root that is not a repository at launch
+    /// (here `--project-dir <repo>/sub`) is itself tested, and a `.git` the
+    /// session makes there is reported.
+    #[test]
+    fn e2e_nested_git_new_repo_at_the_project_root_is_reported() {
+        require_sandbox!();
+        let (_tmp, project, home) = nested_git_fixture();
+        let sub = project.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let output = cplt_cmd()
+            .arg("--no-validate")
+            .arg("--project-dir")
+            .arg(&sub)
+            .args(["exec", "-c", "mkdir .git"])
+            .current_dir(&sub)
+            .env("HOME", &home)
+            .output()
+            .expect("cplt exec should run");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "session failed: {stderr}");
+        let line = format!("new: {}\n", sub.display());
+        assert!(stderr.contains(&line), "missing `{line}`: {stderr}");
+    }
+
+    /// #576 review: a hook rewritten with the same length and its mtime put
+    /// back, and a config change reached only through `commondir`, are each
+    /// reported. `e0/hooks` is not spelled `.git/hooks`, so the profile lets
+    /// the session write it.
+    #[test]
+    fn e2e_nested_git_hook_and_commondir_changes_are_reported() {
+        require_sandbox!();
+        let (_tmp, project, home) = nested_git_fixture();
+        let stderr = exec_session(
+            &project,
+            &home,
+            "cp -p e0/hooks/pre-commit ref && printf '#!/bin/sh\\nevil\\n' > e0/hooks/pre-commit && \
+             touch -r ref e0/hooks/pre-commit && rm ref && \
+             printf '[core]\\n\\tfsmonitor = x\\n' >> c0/config",
+        );
+        for dir in ["wt", "cw"] {
+            let line = format!("changed: {}", project.join(dir).display());
+            assert!(stderr.contains(&line), "missing `{line}`: {stderr}");
+        }
+    }
+
+    /// Ordinary work inside existing nested repositories reports nothing.
+    #[test]
+    fn e2e_unchanged_nested_repo_is_not_reported() {
+        require_sandbox!();
+        let (_tmp, project, home) = nested_git_fixture();
+        let stderr = exec_session(&project, &home, "echo x > keep/file && echo y > wt/file");
+        assert!(
+            !stderr.contains("A git repository was created or changed")
+                && !stderr.contains("Stopped checking"),
+            "a clean session was reported: {stderr}"
+        );
+    }
+
+    /// The walk is bounded, and a session that pushes a plant past the bound
+    /// is told so rather than given a clean report.
+    #[test]
+    fn e2e_nested_git_walk_bound_is_reported() {
+        require_sandbox!();
+        let (_tmp, project, home) = nested_git_fixture();
+        let many = project.join("many");
+        for i in 0..=cplt_nested_scan_limit() {
+            std::fs::create_dir_all(many.join(format!("d{i:05}"))).unwrap();
+        }
+        let stderr = exec_session(&project, &home, "true");
+        assert!(
+            stderr.contains("Stopped checking for new .git entries")
+                && !stderr.contains("this session created enough directories"),
+            "a bound already hit at launch is a warning: {stderr}"
+        );
+    }
+
+    /// #576 review: a session that creates the directories that push the walk
+    /// over its bound is told so as an error, not the launch-time warning.
+    #[test]
+    fn e2e_nested_git_walk_bound_hit_by_the_session_is_an_error() {
+        require_sandbox!();
+        let (_tmp, project, home) = nested_git_fixture();
+        let stderr = exec_session(
+            &project,
+            &home,
+            &format!(
+                "mkdir many && cd many && seq -f 'd%05g' 0 {} | xargs mkdir",
+                cplt_nested_scan_limit()
+            ),
+        );
+        assert!(
+            stderr.contains("this session created enough directories"),
+            "a bound the session hit must be reported as its doing: {stderr}"
+        );
+    }
+
+    /// `sandbox::NESTED_SCAN_LIMIT`, which is crate-private.
+    fn cplt_nested_scan_limit() -> usize {
+        20_000
+    }
+
     /// #252: the root AGENTS.md read grant exists for the block cplt writes on
     /// an agent launch. `exec` never writes it, so from a subdirectory it must
     /// not read the root file, even with --agents-md on.

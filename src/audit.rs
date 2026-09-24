@@ -20,7 +20,7 @@
 //! Network visibility remains partial, including under forced routing.
 //! Denial-log collection and exclusive process attribution remain out of scope.
 
-use crate::{proxy, ui};
+use crate::{proxy, sandbox, ui};
 use std::collections::BTreeSet;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -1170,6 +1170,506 @@ impl AuditMode {
     }
 }
 
+/// Every `.git` entry nested below the project and repository roots, recorded
+/// before the session and compared with what is there after it (#576).
+///
+/// # Why
+///
+/// A session can plant a repository anywhere below the project: a `.git`
+/// pointer file (`gitdir: <dir it wrote>`), a `.git` symlink, or a gitdir
+/// renamed into place, each with a config naming `core.fsmonitor` or
+/// `core.hooksPath`. Git run in that directory later — by the user, or by a
+/// git-aware shell prompt on `cd` — runs that program on the host. The profile
+/// denies only paths spelled `<repo>/.git/<name>`, and on Linux bubblewrap only
+/// protects repositories that existed at launch (#498), so this check is the
+/// one layer that covers every platform. `sandbox.deny_nested_git` blocks the
+/// `.git` plants on macOS; nothing can on Linux.
+///
+/// Two variants need no ordinary `.git`: a case variant (`.GIT`), which git
+/// opens on a case-insensitive volume and the walk's lookup finds the same
+/// way; and a git-directory layout written straight into a directory (`HEAD`
+/// plus `objects/` and `refs/`, or plus a `commondir` naming where those
+/// live), which git's discovery accepts. Both are reported; the layout cannot
+/// be blocked by any profile rule. A symlink to a directory is tested the same
+/// way, following the link, since git run in `<root>/tools -> /tmp/evil` obeys
+/// `/tmp/evil`'s config.
+///
+/// Three more things are reported because a repository test at check time
+/// cannot see through them: every new or re-aimed directory or dangling
+/// symlink whose lookup passes outside every root at any hop (the repository
+/// may be one level down, or armed later), every directory the walk was not
+/// permitted to list or whose `stat` changed while unlistable, and a root that gained a `.git` or
+/// layout it did not have at launch.
+///
+/// The scan runs after the settle probe. A descendant that detaches and
+/// outlives it can still plant afterwards; the report says when the session
+/// left processes running.
+///
+/// # What counts as changed
+///
+/// The directory's own symlink target, if it is one; the `.git` entry's kind
+/// and, for a symlink its target and for a pointer file its contents; then, in
+/// the gitdir it resolves to (and that gitdir's `commondir`, if any), `config`,
+/// `config.worktree`, `commondir` and each hook's name, symlink target and
+/// content. Ordinary work in a nested repository — commits, fetches, the
+/// index — touches none of those. Not followed: `include.path` and
+/// `includeIf` targets, and a `core.hooksPath` directory (SECURITY.md).
+///
+/// # Bounded, and says so
+///
+/// The walk is [`sandbox::repo_walk`], the one #498 uses, with no depth limit:
+/// symlinks are tested but not descended into, and the directory budget
+/// ([`sandbox::NESTED_SCAN_LIMIT`]) is the only bound. Hitting it is reported,
+/// because an agent can create directories to push a plant past it. Build and
+/// dependency trees (`node_modules`, `target`, …) are tested for a `.git` but
+/// not descended into — the same trade the launch walk makes.
+pub struct NestedGit {
+    before: Scan,
+    /// Canonical, so the paths a lookup passes through compare with them.
+    roots: Vec<PathBuf>,
+}
+
+/// `stat` of a directory the walk could not list: inode, mtime, ctime.
+type DirStat = Option<(u64, i64, i64, i64, i64)>;
+
+/// One walk's worth of what [`NestedGit`] compares.
+struct Scan {
+    /// Repository directory -> fingerprint, and the git directories it
+    /// resolves to (for saying when one is outside every root).
+    repos: std::collections::BTreeMap<PathBuf, (u64, Vec<PathBuf>)>,
+    /// Every symlink below the roots that leads to a directory or dangles ->
+    /// its `read_link` target.
+    links: std::collections::BTreeMap<PathBuf, PathBuf>,
+    /// Directories the walk was not permitted to list -> their `stat`, so a
+    /// change behind the `chmod` shows.
+    unreadable: std::collections::BTreeMap<PathBuf, DirStat>,
+    /// Directories whose listing failed for another reason.
+    failed: Vec<PathBuf>,
+    /// Roots that are a repository themselves. Only a new one is reported:
+    /// the project's own `.git` is the profile's business, not this check's.
+    root_repos: BTreeSet<PathBuf>,
+    /// The walk stopped at its bound. Kept per walk, because only a bound hit
+    /// at the end alone is the session's doing.
+    capped: bool,
+}
+
+impl NestedGit {
+    pub fn capture(roots: &[&Path]) -> Self {
+        let roots: Vec<PathBuf> = roots
+            .iter()
+            .map(|r| std::fs::canonicalize(r).unwrap_or_else(|_| r.to_path_buf()))
+            .collect();
+        Self {
+            before: Scan::of(&roots),
+            roots,
+        }
+    }
+
+    /// The first real path a lookup of `p` reaches that is outside every root
+    /// and not an ancestor of one, if any. Every step counts, not just where
+    /// the lookup ends: a link through `/tmp/l -> <project>/src`, or through
+    /// `/tmp/stage/x/../..` back in, ends inside today, and what is under
+    /// `/tmp` can be changed tomorrow from somewhere this sandbox never sees
+    /// (#576 review). Ancestors are passed over, so `/Users/me/proj/src`
+    /// spelled out in full is not "outside" on its way down.
+    fn outside_roots(&self, p: &Path) -> Option<PathBuf> {
+        lookup_hops(p).into_iter().find(|q| {
+            !self
+                .roots
+                .iter()
+                .any(|r| q.starts_with(r) || r.starts_with(q))
+        })
+    }
+
+    /// New and changed repositories, one report line each.
+    fn repo_lines(&self, after: &Scan) -> Vec<String> {
+        let mut lines: Vec<String> = Vec::new();
+        for root in after.root_repos.difference(&self.before.root_repos) {
+            lines.push(format!("  new: {}", esc_path(root)));
+        }
+        for (dir, (fp, gitdirs)) in &after.repos {
+            let what = match self.before.repos.get(dir) {
+                None => "new",
+                Some((old, _)) if old != fp => "changed",
+                Some(_) => continue,
+            };
+            // N3: a `.git` directory that holds a `.git` is reported by the
+            // planted entry, not by the gitdir it was planted in.
+            let named = if dir
+                .file_name()
+                .is_some_and(|n| n.eq_ignore_ascii_case(".git"))
+            {
+                dir.join(".git")
+            } else {
+                dir.clone()
+            };
+            let outside = gitdirs
+                .iter()
+                .find(|g| self.outside_roots(g).is_some())
+                // Shown where the lookup ends today; the test above is what
+                // decides, over every step.
+                .and_then(|g| lookup_hops(g).pop())
+                .map(|q| {
+                    format!(
+                        " (its git directory is outside the project and every named repository: {})",
+                        esc_path(&q)
+                    )
+                })
+                .unwrap_or_default();
+            lines.push(format!("  {what}: {}{outside}", esc_path(&named)));
+        }
+        lines
+    }
+
+    /// B1: new or re-aimed symlinks any of whose hops leave every root. They
+    /// can be armed later, from outside this project's sandbox, so they are
+    /// reported whatever is at the other end now.
+    fn link_lines(&self, after: &Scan) -> Vec<String> {
+        after
+            .links
+            .iter()
+            .filter(|(link, target)| self.before.links.get(*link) != Some(*target))
+            .filter(|(link, _)| self.outside_roots(link).is_some())
+            .map(|(link, target)| format!("  {} -> {}", esc_path(link), esc_path(target)))
+            .collect()
+    }
+
+    /// B2/R3: unreadable directories that are new, were readable at launch,
+    /// or whose `stat` changed behind the `chmod` (errors); and those that
+    /// are exactly as unreadable as at launch (a warning).
+    fn unreadable_split<'a>(&self, after: &'a Scan) -> (Vec<&'a PathBuf>, Vec<&'a PathBuf>) {
+        let (mut changed, mut same) = (Vec::new(), Vec::new());
+        for (d, st) in &after.unreadable {
+            if self.before.unreadable.get(d) == Some(st) {
+                same.push(d);
+            } else {
+                changed.push(d);
+            }
+        }
+        (changed, same)
+    }
+
+    /// `unsettled`: the session left processes running past the settle probe,
+    /// so this scan is a snapshot they can still act after.
+    pub fn report(&self, unsettled: bool) {
+        let after = Scan::of(&self.roots);
+
+        let lines = self.repo_lines(&after);
+        if !lines.is_empty() {
+            ui::error(
+                "A git repository was created or changed below the project or a named \
+                 repository during this \
+                 session (a .git, or a bare-repository layout). Git run in these directories \
+                 reads config the session wrote, and can run a program of its choosing \
+                 outside the sandbox (core.fsmonitor, core.hooksPath). Do not run git there, \
+                 or cd there with a git-aware shell prompt, until you have checked the .git \
+                 and its config:",
+            );
+            for l in &lines {
+                ui::error(l);
+            }
+        }
+
+        let links = self.link_lines(&after);
+        if !links.is_empty() {
+            ui::error(
+                "This session created or re-aimed symlinks that lead out of the project \
+                 and every named repository. \
+                 Git run through one obeys whatever repository is at the other end, now or \
+                 later, and nothing here watches that end. Check them before running git \
+                 below them:",
+            );
+            for l in &links {
+                ui::error(l);
+            }
+        }
+
+        // `chmod` hides a directory's contents from the walk.
+        let (changed, same) = self.unreadable_split(&after);
+        if !changed.is_empty() {
+            ui::error(
+                "The .git check was not permitted to list these directories, which were \
+                 readable at launch, are new, or changed while unreadable, so nothing below \
+                 them was checked. Do not run git below them until you have looked yourself:",
+            );
+            for d in &changed {
+                ui::error(&format!("  {}", esc_path(d)));
+            }
+        }
+        if !same.is_empty() {
+            ui::warn(&format!(
+                "The .git check could not list {} directories that were unreadable and \
+                 unchanged since launch, so nothing below them was checked (first: {}).",
+                same.len(),
+                esc_path(same[0])
+            ));
+        }
+        if !after.failed.is_empty() {
+            ui::warn(&format!(
+                "The .git check could not list {} directories, so nothing below them was \
+                 checked (first: {}).",
+                after.failed.len(),
+                esc_path(&after.failed[0])
+            ));
+        }
+
+        // The walk goes level by level in name order, so what a stop leaves
+        // unchecked is everything deeper and every later name on its level.
+        let limit = sandbox::NESTED_SCAN_LIMIT;
+        if after.capped && !self.before.capped {
+            // Under the bound at launch and over it now: the session made the
+            // directories, which is exactly how a plant would be hidden.
+            ui::error(&format!(
+                "Stopped checking for new .git entries after {limit} directories. The \
+                 project and named repositories had fewer at launch, so this session \
+                 created enough directories \
+                 to cut the check short. Directories it did not reach (anything deeper, \
+                 and later names at the level where it stopped) were not checked. Do not \
+                 run git in the project or a named repository until you have looked for \
+                 new .git entries and \
+                 bare repositories yourself."
+            ));
+        } else if after.capped || self.before.capped {
+            ui::warn(&format!(
+                "Stopped checking for new .git entries below the project and named \
+                 repositories after {limit} directories, so directories the check did not \
+                 reach (anything deeper, and later names \
+                 at the level where it stopped) were not looked at."
+            ));
+        }
+        if unsettled {
+            ui::warn(
+                "The session left processes running, so a git repository they create \
+                 below the project or a named repository after this check is not \
+                 reported.",
+            );
+        }
+    }
+}
+
+/// Agent-chosen names: escaped like every other audit path.
+fn esc_path(p: &Path) -> String {
+    escape_path(&p.to_string_lossy())
+}
+
+impl Scan {
+    fn of(roots: &[PathBuf]) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        let roots: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
+        let mut x = sandbox::WalkExtras::default();
+        let (repos, capped) = sandbox::repo_walk(
+            &roots,
+            usize::MAX,
+            sandbox::has_dot_git_or_is_bare,
+            Some(&mut x),
+        );
+        Self {
+            repos: repos
+                .into_iter()
+                .map(|dir| {
+                    let fp = git_fingerprint(&dir);
+                    (dir, fp)
+                })
+                .collect(),
+            links: x
+                .links
+                .into_iter()
+                .filter_map(|l| Some((std::fs::read_link(&l).ok()?, l)))
+                .map(|(t, l)| (l, t))
+                .collect(),
+            unreadable: x
+                .unreadable
+                .into_iter()
+                .map(|d| {
+                    let st = std::fs::symlink_metadata(&d).ok().map(|m| {
+                        (
+                            m.ino(),
+                            m.mtime(),
+                            m.mtime_nsec(),
+                            m.ctime(),
+                            m.ctime_nsec(),
+                        )
+                    });
+                    (d, st)
+                })
+                .collect(),
+            failed: x.failed,
+            root_repos: roots
+                .iter()
+                .filter(|r| sandbox::has_dot_git_or_is_bare(r))
+                .map(|r| r.to_path_buf())
+                .collect(),
+            capped,
+        }
+    }
+}
+
+/// Every real path a lookup of `p` reaches, one component at a time: after
+/// each name, each `..` and each symlink hop, what has actually been resolved
+/// so far. One `read_link` per component, and `..` steps up from that
+/// resolved path, as the kernel does.
+///
+/// Name-normalising a link target is not enough: in
+/// `/tmp/stage/x/../../../<project>/src` the kernel's `..` depends on what
+/// `x` is when git runs, and `/tmp/stage` can be changed from anywhere. So
+/// every step is returned, and the caller asks whether any lies outside the
+/// roots (#576 review). Stops following links after the kernel's limit.
+fn lookup_hops(p: &Path) -> Vec<PathBuf> {
+    use std::collections::VecDeque;
+    use std::ffi::OsString;
+    use std::path::Component;
+    let owned = |c: Component| c.as_os_str().to_owned();
+    let mut todo: VecDeque<OsString> = p.components().map(owned).collect();
+    let mut cur = PathBuf::new();
+    let mut steps = Vec::new();
+    let mut left = crate::config::MAXSYMLINKS;
+    while let Some(c) = todo.pop_front() {
+        match Path::new(&c).components().next() {
+            Some(Component::RootDir) => cur = PathBuf::from("/"),
+            Some(Component::ParentDir) => {
+                cur.pop();
+            }
+            Some(Component::Normal(name)) => {
+                let next = cur.join(name);
+                match std::fs::read_link(&next) {
+                    Ok(target) if left > 0 => {
+                        left -= 1;
+                        for c in target.components().rev() {
+                            todo.push_front(owned(c));
+                        }
+                        // The link itself is a step: one sitting beside a
+                        // root (in an ancestor) can be re-aimed from outside
+                        // (#576 review, L5). `cur` stays the link's parent:
+                        // the target resolves from there, step by step.
+                        steps.push(next);
+                        continue;
+                    }
+                    _ => cur = next,
+                }
+            }
+            _ => continue,
+        }
+        steps.push(cur.clone());
+    }
+    steps
+}
+
+/// A hash of everything about a `.git` entry that decides what git run there
+/// would execute, and the git directories it reads. See [`NestedGit`].
+fn git_fingerprint(dir: &Path) -> (u64, Vec<PathBuf>) {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    // `dir` itself may be a symlink to a repository elsewhere (#576 review).
+    std::fs::read_link(dir).ok().hash(&mut h);
+    let dotgit = &dir.join(".git");
+    let gitdir = match std::fs::symlink_metadata(dotgit) {
+        Ok(m) if m.file_type().is_symlink() => {
+            ("symlink", std::fs::read_link(dotgit).ok()).hash(&mut h);
+            dotgit.clone()
+        }
+        Ok(m) if m.is_file() => {
+            let body = read_small(dotgit);
+            ("file", &body).hash(&mut h);
+            body.as_ref()
+                .and_then(|(_, b, _)| {
+                    let s = String::from_utf8_lossy(b);
+                    let t = s.trim().strip_prefix("gitdir:")?.trim().to_string();
+                    Some(dotgit.parent()?.join(t))
+                })
+                .unwrap_or_else(|| dotgit.clone())
+        }
+        Ok(_) => {
+            "dir".hash(&mut h);
+            dotgit.clone()
+        }
+        // No `.git`: the walk found a bare-repository layout, and the
+        // directory itself is the gitdir.
+        Err(_) => {
+            "bare".hash(&mut h);
+            dir.to_path_buf()
+        }
+    };
+    hash_gitdir(&gitdir, &mut h);
+    let mut gitdirs = vec![gitdir.clone()];
+    // `commondir` makes git read a second gitdir's config and hooks.
+    if let Some((_, c, _)) = read_small(&gitdir.join("commondir")) {
+        let common = gitdir.join(String::from_utf8_lossy(&c).trim());
+        hash_gitdir(&common, &mut h);
+        gitdirs.push(common);
+    }
+    (h.finish(), gitdirs)
+}
+
+fn hash_gitdir(gitdir: &Path, h: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    for name in ["config", "config.worktree", "commondir"] {
+        read_small(&gitdir.join(name)).hash(h);
+    }
+    // Content, not length and mtime: a same-length overwrite followed by
+    // `touch -r` keeps both (#576 review). A symlinked hook is read through the
+    // link, and its target recorded too.
+    // An unlistable `hooks` (`chmod 311`) still lets git exec a hook by
+    // name, so the failure itself is part of the hash (#576 review, R6).
+    // And its `stat`: a `hooks` that was already unlistable at launch still
+    // shows a hook added, removed or replaced through its mtime and ctime.
+    let listing = std::fs::read_dir(gitdir.join("hooks"));
+    listing.as_ref().err().map(std::io::Error::kind).hash(h);
+    std::fs::metadata(gitdir.join("hooks"))
+        .ok()
+        .map(|m| {
+            use std::os::unix::fs::MetadataExt;
+            (
+                m.ino(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec(),
+            )
+        })
+        .hash(h);
+    let mut hooks: Vec<_> = listing
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| {
+            let p = e.path();
+            (e.file_name(), std::fs::read_link(&p).ok(), read_small(&p))
+        })
+        .collect();
+    hooks.sort();
+    hooks.hash(h);
+}
+
+/// `read_small`'s result: length, first MiB, and (inode, ctime) past it.
+type Small = (u64, Vec<u8>, Option<(u64, i64, i64)>);
+
+/// A regular file's length and its first MiB, or `None`. Symlinks followed.
+///
+/// For a longer file, also its inode and ctime: a same-length rewrite past
+/// the first MiB leaves the bytes read unchanged, but not the ctime, which
+/// `touch` cannot set back.
+///
+/// Opened non-blocking and checked after opening: the session chose these
+/// paths, and a FIFO named `config` would otherwise hang the parent at the
+/// end of every session.
+fn read_small(path: &Path) -> Option<Small> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    const LIMIT: u64 = 1 << 20;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let meta = f.metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let mut buf = Vec::new();
+    f.take(LIMIT).read_to_end(&mut buf).ok()?;
+    let past_limit = (meta.len() > LIMIT).then(|| (meta.ino(), meta.ctime(), meta.ctime_nsec()));
+    Some((meta.len(), buf, past_limit))
+}
+
 /// Wrap a sandboxed exec with the audit lifecycle: capture the baseline just
 /// before the closure runs the agent, then generate and print the report after
 /// it exits. Both `main.rs` exec sites call this so the wiring cannot diverge.
@@ -1198,6 +1698,12 @@ pub fn run<F: FnOnce() -> u8, C: FnOnce() -> Option<proxy::ProxySnapshot>>(
     } else {
         Vec::new()
     };
+    // Independent of `mode`: this is a security check, not part of the
+    // change report `--no-audit` turns off (#576).
+    let git_roots: Vec<&Path> = std::iter::once(project_dir)
+        .chain(named_roots.iter().map(PathBuf::as_path))
+        .collect();
+    let nested_git = NestedGit::capture(&git_roots);
     // Armed AFTER the baseline, so only the session's own processes inherit the
     // write end. Baseline git children are already reaped.
     let probe = if mode == AuditMode::Disabled {
@@ -1208,6 +1714,10 @@ pub fn run<F: FnOnce() -> u8, C: FnOnce() -> Option<proxy::ProxySnapshot>>(
     let exit_code = exec();
     // `exec` returns when the direct child is reaped. The sample must wait for
     // the existing descendant probe before freezing the proxy snapshot.
+    // The `.git` scan below runs after this wait, so it sees what the tree did
+    // before settling. Without a probe (audit and observe both off) nothing
+    // is known either way, and the window is documented instead (#576).
+    let probed = probe.is_some();
     let settled = probe.is_some_and(SettleProbe::settled);
     // Preserve the existing project-audit timing boundary. Proxy drain time is
     // reported by the network window and does not extend session duration.
@@ -1234,6 +1744,7 @@ pub fn run<F: FnOnce() -> u8, C: FnOnce() -> Option<proxy::ProxySnapshot>>(
     if let Some(line) = mode.unsettled_warning().filter(|_| !settled) {
         ui::warn(line);
     }
+    nested_git.report(probed && !settled);
     (exit_code, snapshot)
 }
 
@@ -2304,5 +2815,208 @@ mod tests {
         assert_eq!(exit_code, 37);
         assert!(snapshot.is_none());
         assert_eq!(*events.borrow(), ["exec", "finalize"]);
+    }
+
+    /// #576 review: a hook rewritten with the same length and its mtime put
+    /// back, a hook symlink repointed, and a same-length change past the first
+    /// MiB of a config each change the fingerprint.
+    #[test]
+    fn nested_git_fingerprint_sees_content_not_just_size_and_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = repo.join(".git");
+        std::fs::create_dir_all(git.join("hooks")).unwrap();
+        let hook = git.join("hooks/pre-commit");
+        std::fs::write(&hook, "#!/bin/sh\ntrue\n").unwrap();
+        std::os::unix::fs::symlink("/a", git.join("hooks/post-merge")).unwrap();
+        let mut big = vec![b'#'; (1 << 20) + 10];
+        std::fs::write(git.join("config"), &big).unwrap();
+        let fp = git_fingerprint(repo);
+
+        let mtime = std::fs::metadata(&hook).unwrap().modified().unwrap();
+        std::fs::write(&hook, "#!/bin/sh\nevil\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&hook)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+        let after_hook = git_fingerprint(repo);
+        assert_ne!(
+            fp, after_hook,
+            "same-length hook rewrite with mtime restored"
+        );
+
+        std::fs::remove_file(git.join("hooks/post-merge")).unwrap();
+        std::os::unix::fs::symlink("/b", git.join("hooks/post-merge")).unwrap();
+        let after_link = git_fingerprint(repo);
+        assert_ne!(after_hook, after_link, "hook symlink repointed");
+
+        *big.last_mut().unwrap() = b'x';
+        std::fs::write(git.join("config"), &big).unwrap();
+        assert_ne!(
+            after_link,
+            git_fingerprint(repo),
+            "change past the first MiB"
+        );
+    }
+
+    /// #576 review: a symlinked directory repointed at another repository
+    /// with identical contents changes the fingerprint.
+    #[test]
+    fn nested_git_fingerprint_sees_a_repointed_directory_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        for r in ["a", "b"] {
+            std::fs::create_dir_all(dir.path().join(r).join(".git")).unwrap();
+        }
+        let link = dir.path().join("tools");
+        std::os::unix::fs::symlink("a", &link).unwrap();
+        let fp = git_fingerprint(&link);
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink("b", &link).unwrap();
+        assert_ne!(fp, git_fingerprint(&link));
+    }
+
+    /// Canonical tempdirs: a project root and a place outside it.
+    fn root_and_outside() -> (tempfile::TempDir, PathBuf, tempfile::TempDir, PathBuf) {
+        let (r, o) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (rp, op) = (
+            std::fs::canonicalize(r.path()).unwrap(),
+            std::fs::canonicalize(o.path()).unwrap(),
+        );
+        (r, rp, o, op)
+    }
+
+    /// R1 and R4: a link is judged by every hop. Out through a link outside
+    /// that leads back in is reported; a link that stays inside is not; a
+    /// link to a file outside is ignored, and one to a directory reported.
+    #[test]
+    fn nested_git_links_are_judged_by_every_hop_and_file_links_ignored() {
+        use std::os::unix::fs::symlink;
+        let (_r, root, _o, out) = root_and_outside();
+        std::fs::create_dir_all(root.join("src/app")).unwrap();
+        std::fs::write(out.join("file"), "x").unwrap();
+        let ng = NestedGit::capture(&[&root]);
+        symlink(root.join("src"), out.join("l")).unwrap();
+        symlink(out.join("l"), root.join("pkgs")).unwrap();
+        symlink(out.join("l/app"), root.join("pkgs2")).unwrap();
+        symlink(root.join("src"), root.join("inner")).unwrap();
+        symlink(out.join("file"), root.join("afile")).unwrap();
+        symlink(&out, root.join("adir")).unwrap();
+        let lines = ng.link_lines(&Scan::of(&ng.roots)).join("\n");
+        for name in ["pkgs", "pkgs2", "adir"] {
+            assert!(
+                lines.contains(&format!("{} ->", root.join(name).display())),
+                "{name}: {lines}"
+            );
+        }
+        for name in ["inner", "afile"] {
+            assert!(
+                !lines.contains(&format!("{} ->", root.join(name).display())),
+                "{name}: {lines}"
+            );
+        }
+    }
+
+    /// R3: a directory unreadable at launch whose `stat` changed is an error;
+    /// one exactly as it was is only a warning.
+    #[test]
+    fn nested_git_unreadable_dir_changed_behind_chmod_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode =
+            |p: &Path, m| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        let (_r, root, _o, _) = root_and_outside();
+        let (a, b) = (root.join("a"), root.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        mode(&a, 0o311);
+        mode(&b, 0o311);
+        let ng = NestedGit::capture(&[&root]);
+        mode(&a, 0o755);
+        std::fs::create_dir_all(a.join("in/.git")).unwrap();
+        mode(&a, 0o311);
+        let after = Scan::of(&ng.roots);
+        let (changed, same) = ng.unreadable_split(&after);
+        let (changed, same): (Vec<PathBuf>, Vec<PathBuf>) = (
+            changed.into_iter().cloned().collect(),
+            same.into_iter().cloned().collect(),
+        );
+        mode(&a, 0o755);
+        mode(&b, 0o755);
+        assert_eq!(changed, vec![a]);
+        assert_eq!(same, vec![b]);
+    }
+
+    /// R6: an unlistable `hooks` directory changes the fingerprint; git can
+    /// still exec a hook in it by name.
+    #[test]
+    fn nested_git_fingerprint_sees_an_unlistable_hooks_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let hooks = dir.path().join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let fp = git_fingerprint(dir.path());
+        std::fs::set_permissions(&hooks, std::fs::Permissions::from_mode(0o311)).unwrap();
+        let after = git_fingerprint(dir.path());
+        std::fs::set_permissions(&hooks, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_ne!(fp, after);
+    }
+
+    /// L1: a link out through a real directory outside and `..` back in is
+    /// reported, although it ends inside today: what `..` from that directory
+    /// reaches changes when it becomes a symlink.
+    #[test]
+    fn nested_git_link_out_and_back_through_dotdot_is_reported() {
+        let (_r, root, _o, out) = root_and_outside();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(out.join("stage/x")).unwrap();
+        let ng = NestedGit::capture(&[&root]);
+        let name = root.file_name().unwrap().to_string_lossy().into_owned();
+        let target = out.join(format!("stage/x/../../../{name}/src"));
+        assert_eq!(std::fs::canonicalize(&target).unwrap(), root.join("src"));
+        std::os::unix::fs::symlink(&target, root.join("dotdot")).unwrap();
+        let lines = ng.link_lines(&Scan::of(&ng.roots)).join("\n");
+        assert!(
+            lines.contains(&format!("{} ->", root.join("dotdot").display())),
+            "{lines}"
+        );
+    }
+
+    /// L4: a `hooks` directory unlistable at launch still changes the
+    /// fingerprint when a hook is added behind the `chmod`.
+    #[test]
+    fn nested_git_fingerprint_sees_a_change_behind_an_unlistable_hooks_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let hooks = dir.path().join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let mode =
+            |m| std::fs::set_permissions(&hooks, std::fs::Permissions::from_mode(m)).unwrap();
+        mode(0o311);
+        let fp = git_fingerprint(dir.path());
+        mode(0o755);
+        std::fs::write(hooks.join("pre-commit"), "#!/bin/sh\n").unwrap();
+        mode(0o311);
+        let after = git_fingerprint(dir.path());
+        mode(0o755);
+        assert_ne!(fp, after);
+    }
+
+    /// L5: a link sitting directly in an ancestor of the root is itself a
+    /// step, even though its target leads back inside.
+    #[test]
+    fn nested_git_link_through_a_link_beside_the_root_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("sub");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let ng = NestedGit::capture(&[&root]);
+        std::os::unix::fs::symlink(root.join("src"), base.join("l")).unwrap();
+        std::os::unix::fs::symlink(base.join("l"), root.join("pk")).unwrap();
+        let lines = ng.link_lines(&Scan::of(&ng.roots)).join("\n");
+        assert!(
+            lines.contains(&format!("{} ->", root.join("pk").display())),
+            "{lines}"
+        );
     }
 }

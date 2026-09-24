@@ -2564,6 +2564,7 @@ mod tests {
             root_agents_md: None,
             allow_gpg_signing: false,
             deny_clipboard: false,
+            deny_nested_git: false,
             allow_jvm_attach: false,
             allow_msbuild: false,
             allow_docker: false,

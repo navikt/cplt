@@ -34,6 +34,9 @@ use crate::ui;
 #[cfg(target_os = "linux")]
 #[path = "sandbox_bubblewrap.rs"]
 mod bubblewrap;
+/// The bounded nested-repository walk, shared with the session-end `.git`
+/// check in `audit` (#576) so both look at the same set.
+pub(crate) use policy::{NESTED_SCAN_LIMIT, WalkExtras, has_dot_git_or_is_bare, repo_walk};
 #[path = "sandbox_env.rs"]
 mod env;
 
@@ -203,6 +206,9 @@ pub struct SandboxConfig<'a> {
     pub root_agents_md: Option<&'a Path>,
     pub allow_gpg_signing: bool,
     pub deny_clipboard: bool,
+    /// `sandbox.deny_nested_git` (#576): deny creating a `.git` entry below a
+    /// writable root. macOS only; Linux has no way to express it.
+    pub deny_nested_git: bool,
     /// Allow JVM Attach API unix sockets in /tmp (.java_pid* pattern only).
     pub allow_jvm_attach: bool,
     /// Allow MSBuild worker-node unix sockets in /tmp (MSBuild<pid> pattern only).
@@ -1663,6 +1669,16 @@ fn prepare_impl(
              destination address, so there is no loopback exemption.",
         );
     }
+    // A restriction the user asked for and cannot have is said out loud, not
+    // dropped (AGENTS.md "No silent grants").
+    if config.deny_nested_git {
+        ui::warn(
+            "sandbox.deny_nested_git has no effect on Linux: Landlock cannot deny a \
+             path inside a tree it allows, and bubblewrap only protects paths that \
+             exist at launch. A .git created during the session is reported when it \
+             ends, not blocked.",
+        );
+    }
     if config.allow_docker {
         ui::warn(
             "--allow-docker on Linux grants the Docker/Podman daemon sockets and \
@@ -1818,7 +1834,7 @@ fn prepare_impl(
              protections a nested repository should have: .git/hooks, .cplt.toml, \
              .github/hooks and the agent auto-exec paths all stay writable there. Name the \
              repositories you work in with --repo-dir, or grant a narrower tree.",
-            bubblewrap::NESTED_SCAN_LIMIT
+            policy::NESTED_SCAN_LIMIT
         ));
     }
 
@@ -2227,6 +2243,7 @@ mod tests {
             root_agents_md: None,
             allow_gpg_signing: false,
             deny_clipboard: false,
+            deny_nested_git: false,
             allow_jvm_attach: false,
             allow_msbuild: false,
             allow_docker: false,

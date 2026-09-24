@@ -829,6 +829,7 @@ fn landlock_policy_device_files_have_ioctl() {
         root_agents_md: None,
         allow_gpg_signing: false,
         deny_clipboard: false,
+        deny_nested_git: false,
         allow_jvm_attach: false,
         allow_msbuild: false,
         allow_docker: false,
@@ -2485,6 +2486,7 @@ fn base_profile_options() -> SandboxConfig<'static> {
         root_agents_md: None,
         allow_gpg_signing: false,
         deny_clipboard: false,
+        deny_nested_git: false,
         allow_jvm_attach: false,
         allow_msbuild: false,
         allow_docker: false,
@@ -3921,6 +3923,7 @@ fn allow_localhost_any_affects_both_backends() {
         root_agents_md: None,
         allow_gpg_signing: false,
         deny_clipboard: false,
+        deny_nested_git: false,
         allow_jvm_attach: false,
         allow_msbuild: false,
         allow_docker: false,
@@ -3985,6 +3988,7 @@ fn config_options_parity_across_backends() {
         root_agents_md: None,
         allow_gpg_signing: true,
         deny_clipboard: false,
+        deny_nested_git: false,
         allow_jvm_attach: true,
         allow_msbuild: false,
         allow_docker: false,
@@ -9188,6 +9192,7 @@ fn no_pasteboard_rule_when_deny_clipboard_is_off() {
     let p = generate_profile(
         &SandboxConfig {
             deny_clipboard: false,
+            deny_nested_git: false,
             ..base_profile_options()
         },
         &[],
@@ -9196,6 +9201,32 @@ fn no_pasteboard_rule_when_deny_clipboard_is_off() {
         !p.contains("com.apple.pasteboard"),
         "pasteboard deny rule must not appear when deny_clipboard is off"
     );
+}
+
+/// #576: `sandbox.deny_nested_git` emits a create-deny per writable root,
+/// after every write allow (last-match-wins), and nothing when it is off.
+#[test]
+fn deny_nested_git_emits_create_deny_only_when_set() {
+    let off = generate_profile(&base_profile_options(), &[]);
+    assert!(
+        !off.contains("file-write-create"),
+        "rule emitted with the key off"
+    );
+    let on = generate_profile(
+        &SandboxConfig {
+            deny_nested_git: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    let deny = on
+        .find("(deny file-write-create (regex")
+        .expect("create deny missing");
+    let last_allow = on.rfind("(allow file-write").expect("a write allow");
+    assert!(deny > last_allow, "the deny must follow every write allow");
+    assert!(on.contains(r#"/.+/\.[gG][iI][tT]$"))"#), "{on}");
+    // F2: and inside the root's own gitdir.
+    assert!(on.contains(r#"/\.git/(.+/)?\.[gG][iI][tT]$"))"#), "{on}");
 }
 
 // ── Config coverage tests ─────────────────────────────────────────────────────
@@ -9296,6 +9327,7 @@ yes = false
 allow_jvm_attach = false
 allow_msbuild = false
 gradle_init = false
+deny_nested_git = false
 allow_docker = false
 allow_cache_exec = []
 allow_cache_exec_any = false
@@ -9772,6 +9804,7 @@ fn landlock_relocated_cargo_bin_is_exec_only_and_registry_is_precreated() {
         root_agents_md: None,
         allow_gpg_signing: false,
         deny_clipboard: false,
+        deny_nested_git: false,
         allow_jvm_attach: false,
         allow_msbuild: false,
         allow_docker: false,

@@ -491,6 +491,7 @@ mod macos_tests {
             root_agents_md: None,
             allow_gpg_signing: false,
             deny_clipboard: false,
+            deny_nested_git: false,
             allow_jvm_attach: false,
             allow_msbuild: false,
             allow_docker: false,
@@ -1814,6 +1815,181 @@ mod macos_tests {
             output.contains("Operation not permitted") || output.contains("EXIT:1"),
             "writing to .git/hooks should be blocked, got: {output}"
         );
+    }
+
+    /// #576: `sandbox.deny_nested_git` refuses every way of bringing a `.git`
+    /// into existence below the project — a pointer file, a symlink, a hard
+    /// link, `mkdir`, and a file or directory renamed onto the name — and
+    /// leaves the root's own `.git` alone. The same commands run under the
+    /// default profile first, so the test fails if the key stops being what
+    /// blocks them.
+    ///
+    /// It does not block moving in an *ancestor* of a `.git` staged outside
+    /// the project: no `.git` name is created, only `sub`. That residual is
+    /// pinned here as allowed, so a change in either direction is noticed;
+    /// the session-end check reports it.
+    #[test]
+    fn real_profile_deny_nested_git_blocks_creating_a_nested_git() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        let plants = |dir: &Path| {
+            let d = dir.display();
+            [
+                format!("mkdir -p '{d}/a' && printf 'gitdir: ../e\\n' > '{d}/a/.git'"),
+                format!("mkdir -p '{d}/b' && ln -s ../e '{d}/b/.git'"),
+                format!("mkdir -p '{d}/c/.git'"),
+                format!("mkdir -p '{d}/d' && echo x > '{d}/f' && mv '{d}/f' '{d}/d/.git'"),
+                format!("mkdir -p '{d}/g' '{d}/h' && mv '{d}/h' '{d}/g/.git'"),
+                // Case variants: APFS is case-insensitive by default, and git
+                // opens `.GIT` when it looks up `.git` (#576).
+                format!("mkdir -p '{d}/i' && ln -s ../e '{d}/i/.GIT'"),
+                format!("mkdir -p '{d}/j' && printf 'gitdir: ../e\\n' > '{d}/j/.Git'"),
+                format!("mkdir -p '{d}/k' && echo x > '{d}/f2' && ln '{d}/f2' '{d}/k/.git'"),
+            ]
+        };
+        for deny in [false, true] {
+            let tmp = project.join(format!(".cplt-nested-git-{}-{deny}", std::process::id()));
+            fs::create_dir_all(&tmp).unwrap();
+            let tmp = fs::canonicalize(&tmp).unwrap();
+            let mut opts = default_opts(&tmp, &home);
+            opts.deny_nested_git = deny;
+            let profile = write_real_profile(&opts);
+            // Every plant is run and every wrong answer listed, not just the first.
+            let wrong: Vec<String> = plants(&tmp)
+                .into_iter()
+                .filter_map(|cmd| {
+                    let (output, _) = run_sandboxed(&profile, &format!("{cmd} 2>&1; echo EXIT:$?"));
+                    (output.contains("EXIT:0") == deny).then(|| format!("`{cmd}` gave {output}"))
+                })
+                .collect();
+            assert!(wrong.is_empty(), "deny_nested_git={deny}: {wrong:#?}");
+            // Residual: an ancestor of a `.git` moved in from a writable
+            // staging area. Allowed with the key on as well as off.
+            let stage = PathBuf::from(format!(
+                "/private/tmp/cplt-nested-git-stage-{}-{deny}",
+                std::process::id()
+            ));
+            let (output, _) = run_sandboxed(
+                &profile,
+                &format!(
+                    "mkdir -p '{s}/sub/.git' '{d}/m' && mv '{s}/sub' '{d}/m/sub' 2>&1; echo EXIT:$?",
+                    s = stage.display(),
+                    d = tmp.display()
+                ),
+            );
+            fs::remove_dir_all(&stage).ok();
+            assert!(
+                output.contains("EXIT:0") && tmp.join("m/sub/.git").is_dir(),
+                "deny_nested_git={deny}: moving in a staged ancestor is a documented \
+                 residual, expected allowed: {output}"
+            );
+            // The root's own `.git` is not matched: `git init` there still works.
+            let (output, _) = run_sandboxed(
+                &profile,
+                &format!("mkdir '{}/.git' 2>&1; echo EXIT:$?", tmp.display()),
+            );
+            fs::remove_dir_all(&tmp).ok();
+            fs::remove_file(&profile).ok();
+            assert!(
+                output.contains("EXIT:0"),
+                "the project root's own .git must stay creatable: {output}"
+            );
+        }
+    }
+
+    /// #576 review (F2): with `sandbox.deny_nested_git`, no `.git` can be
+    /// created inside a gitdir: the root's own, and a worktree common dir
+    /// outside every root, which only the gitdir rule covers. Off, all four
+    /// are allowed, so the key is what blocks them.
+    /// #576 with #531: with both `sandbox.deny_nested_git` and the managed
+    /// worktree root on, the root keeps its own rules. `git worktree add`
+    /// can still write `<root>/<name>/.git`, #531 still refuses a deeper
+    /// `.git`, and an ordinary writable root still gets the nested deny.
+    #[test]
+    fn real_profile_deny_nested_git_leaves_the_managed_worktree_root_to_531() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        let id = std::process::id();
+        let tmp = project.join(format!(".cplt-wt-proj-{id}"));
+        let wt = project.join(format!(".cplt-wt-root-{id}"));
+        fs::create_dir_all(&tmp).unwrap();
+        fs::create_dir_all(&wt).unwrap();
+        let (tmp, wt) = (
+            fs::canonicalize(&tmp).unwrap(),
+            fs::canonicalize(&wt).unwrap(),
+        );
+        let roots = [wt.clone()];
+        let mut opts = default_opts(&tmp, &home);
+        opts.deny_nested_git = true;
+        opts.named_roots = &roots;
+        opts.managed_worktree_root = Some(&wt);
+        let profile = write_real_profile(&opts);
+        let run = |dir: &Path| {
+            let (output, _) = run_sandboxed(
+                &profile,
+                &format!(
+                    "mkdir -p '{d}' && printf 'gitdir: x\\n' > '{d}/.git' 2>&1; echo EXIT:$?",
+                    d = dir.display()
+                ),
+            );
+            output.contains("EXIT:0")
+        };
+        let worktree = run(&wt.join("name"));
+        let deeper = run(&wt.join("name2/sub"));
+        let ordinary = run(&tmp.join("a"));
+        fs::remove_dir_all(&tmp).ok();
+        fs::remove_dir_all(&wt).ok();
+        fs::remove_file(&profile).ok();
+        assert!(
+            worktree,
+            "<root>/<name>/.git must stay creatable for git worktree add"
+        );
+        assert!(!deeper, "<root>/<name>/sub/.git must stay denied by #531");
+        assert!(!ordinary, "an ordinary writable root keeps the nested deny");
+    }
+
+    #[test]
+    fn real_profile_deny_nested_git_blocks_dot_git_inside_a_gitdir() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        for deny in [false, true] {
+            let id = format!("{}-{deny}", std::process::id());
+            let tmp = project.join(format!(".cplt-gitdir-git-{id}"));
+            let common = project.join(format!(".cplt-gitdir-common-{id}"));
+            fs::create_dir_all(tmp.join(".git/refs")).unwrap();
+            fs::create_dir_all(tmp.join(".git/info")).unwrap();
+            fs::create_dir_all(common.join("refs")).unwrap();
+            let (tmp, common) = (
+                fs::canonicalize(&tmp).unwrap(),
+                fs::canonicalize(&common).unwrap(),
+            );
+            let mut opts = default_opts(&tmp, &home);
+            opts.deny_nested_git = deny;
+            opts.git_common_dir = Some(&common);
+            let profile = write_real_profile(&opts);
+            let wrong: Vec<String> = [
+                tmp.join(".git/.git"),
+                tmp.join(".git/refs/.git"),
+                tmp.join(".git/info/.git"),
+                common.join("refs/.git"),
+            ]
+            .iter()
+            .filter_map(|p| {
+                let (output, _) = run_sandboxed(
+                    &profile,
+                    &format!("mkdir '{}' 2>&1; echo EXIT:$?", p.display()),
+                );
+                (output.contains("EXIT:0") == deny).then(|| format!("{}: {output}", p.display()))
+            })
+            .collect();
+            fs::remove_dir_all(&tmp).ok();
+            fs::remove_dir_all(&common).ok();
+            fs::remove_file(&profile).ok();
+            assert!(wrong.is_empty(), "deny_nested_git={deny}: {wrong:#?}");
+        }
     }
 
     #[test]

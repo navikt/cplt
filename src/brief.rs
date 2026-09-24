@@ -907,6 +907,7 @@ mod tests {
             allow_lifecycle_scripts: false,
             allow_gpg_signing: false,
             deny_clipboard: false,
+            deny_nested_git: false,
             allow_jvm_attach: false,
             gradle_init: false,
             allow_docker: false,

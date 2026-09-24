@@ -486,6 +486,8 @@ impl Config {
         // no CLI flag.
         let gradle_init = bools.gradle_init;
 
+        let deny_nested_git = bools.deny_nested_git;
+
         let allow_docker = bools.allow_docker;
 
         let allow_tmp_exec = bools.allow_tmp_exec;
@@ -661,6 +663,7 @@ impl Config {
             allow_jvm_attach,
             allow_msbuild,
             gradle_init,
+            deny_nested_git,
             allow_docker,
             allow_tmp_exec,
             allow_cache_exec,
@@ -3999,6 +4002,14 @@ mod precedence {
                 cli_on: None,
                 cli_off: None,
                 get: |r| r.gradle_init,
+                default: false,
+                preset: None,
+            },
+            Ladder {
+                key: "sandbox.deny_nested_git",
+                cli_on: None,
+                cli_off: None,
+                get: |r| r.deny_nested_git,
                 default: false,
                 preset: None,
             },
