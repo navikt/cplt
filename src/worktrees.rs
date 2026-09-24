@@ -123,12 +123,13 @@ pub fn prepare_root(
     home_dir: &Path,
     project_dir: &Path,
     create: bool,
+    max_dirs: usize,
 ) -> Result<Option<PathBuf>, String> {
     let Some(common) = repository_common_dir(project_dir)? else {
         return Ok(None);
     };
     let root = prepare_root_for(home_dir, &common, create)?;
-    let problems = link_problems(&common, &root);
+    let problems = link_problems(&common, &root, max_dirs);
     if !problems.is_empty() {
         return Err(format!(
             "the worktree links of this repository do not match what git writes, so git \
@@ -278,10 +279,11 @@ pub fn problem_dirs(problems: &[LinkProblem]) -> Vec<String> {
 /// a finding, not a pass: past it a `.git` would go unseen.
 const WALK_MAX_DEPTH: usize = 64;
 
-/// How many directories the `.git` walk visits (files are not counted, so
-/// build output of many small files does not spend it). Reaching it is a
-/// finding, not a pass, for the same reason as the depth.
-const WALK_MAX_DIRS: usize = 100_000;
+/// Default for `sandbox.worktree_walk_max_dirs`: how many directories the
+/// `.git` walk visits (files are not counted, so build output of many small
+/// files does not spend it). Reaching it is a finding, not a pass, for the
+/// same reason as the depth.
+pub const DEFAULT_WALK_MAX_DIRS: usize = 100_000;
 
 /// Every way the agent-writable worktree bookkeeping can differ from what
 /// `git worktree add` writes. Empty when intact. Fails closed: anything that
@@ -295,7 +297,11 @@ const WALK_MAX_DIRS: usize = 100_000;
 ///   git treats the admin dir itself as the common dir and reads its `config`.
 ///   The kernel only refuses an in-place rewrite; unlink-and-recreate and new
 ///   admin dirs are caught here.
-/// - Every `.git` in the root. The only one allowed is `<root>/<name>/.git`,
+/// - Each admin dir's `gitdir` must name an existing regular file called
+///   `.git`: the pointer of a live worktree.
+/// - Every `.git` in the root, in any letter case: on a case-insensitive
+///   volume (the APFS default) git opens `.GIT` when it looks up `.git`. The
+///   only one allowed is `<root>/<name>/.git`,
 ///   the depth `git worktree add "$CPLT_WORKTREE_ROOT/<name>"` writes, as a
 ///   regular file naming an admin dir under `<common>/worktrees` whose
 ///   `gitdir` names it back. Anything else (a pointer the agent recreated, one
@@ -305,12 +311,18 @@ const WALK_MAX_DIRS: usize = 100_000;
 ///   the kernel refuses creating those, but a directory moved in with a `.git`
 ///   already inside is not a create, so the whole root is walked. Symlinks are
 ///   not followed.
+/// - Every directory holding `HEAD` with `objects/` and `refs/`, or with a
+///   `commondir`: git's discovery takes it for a bare repository and obeys the
+///   `config` beside them, with no `.git` anywhere.
+/// - Every entry directly in the root that is not a directory. A symlink
+///   there leads a `cd` (and the git after it) out of the root.
+/// - Every symlink deeper down that leads out of the root to a repository
+///   ([`symlink_problem`]). It is tested, never walked through.
 #[must_use]
-pub fn link_problems(common: &Path, root: &Path) -> Vec<LinkProblem> {
+pub fn link_problems(common: &Path, root: &Path, max_dirs: usize) -> Vec<LinkProblem> {
     let mut out = Vec::new();
-    let admin = common.join("worktrees");
     admin_problems(common, root, &mut out);
-    walk_problems(&admin, root, &mut out);
+    walk_problems(common, root, max_dirs, &mut out);
     out
 }
 
@@ -347,10 +359,27 @@ fn admin_problems(common: &Path, root: &Path, out: &mut Vec<LinkProblem>) {
         }
         // The worktree this admin dir serves, from its `gitdir` back link:
         // where the user would run git. Unknown, the whole root is suspect.
-        let worktree = std::fs::read_to_string(dir.join("gitdir"))
+        let back = dir.join("gitdir");
+        let target = std::fs::read_to_string(&back).map(|raw| PathBuf::from(raw.trim()));
+        let worktree = target
+            .as_ref()
             .ok()
-            .and_then(|raw| Path::new(raw.trim()).parent().map(Path::to_path_buf))
+            .and_then(|t| t.parent().map(Path::to_path_buf))
             .unwrap_or_else(|| root.to_path_buf());
+        match &target {
+            Ok(t)
+                if t.file_name() == Some(".git".as_ref())
+                    && t.symlink_metadata().is_ok_and(|m| m.is_file()) => {}
+            Ok(t) => push(
+                &worktree,
+                format!(
+                    "{} names {}, which is not an existing regular .git file",
+                    back.display(),
+                    t.display()
+                ),
+            ),
+            Err(e) => push(root, format!("cannot read {}: {e}", back.display())),
+        }
         let file = dir.join("commondir");
         match std::fs::read_to_string(&file) {
             Ok(raw) => match resolve(&dir, raw.trim()) {
@@ -379,19 +408,23 @@ fn admin_problems(common: &Path, root: &Path, out: &mut Vec<LinkProblem>) {
     }
 }
 
-/// Walk the whole root for `.git` entries, bounded by [`WALK_MAX_DEPTH`] and
-/// [`WALK_MAX_DIRS`].
-fn walk_problems(admin: &Path, root: &Path, out: &mut Vec<LinkProblem>) {
+/// Walk the whole root for `.git` entries and bare-repository layouts,
+/// bounded by [`WALK_MAX_DEPTH`] and `max_dirs`.
+fn walk_problems(common: &Path, root: &Path, max_dirs: usize, out: &mut Vec<LinkProblem>) {
+    let admin = &common.join("worktrees");
     let mut push = |dir: &Path, detail: String| {
         out.push(LinkProblem {
             dir: dir.to_path_buf(),
             detail,
         });
     };
-    let mut budget = WALK_MAX_DIRS;
-    // (directory, its depth below the root)
-    let mut stack = vec![(root.to_path_buf(), 0usize)];
-    while let Some((dir, depth)) = stack.pop() {
+    let mut budget = max_dirs;
+    // Directories counted under each entry directly in the root, for the
+    // message when the budget runs out: which worktree spent it.
+    let mut counts: Vec<(PathBuf, usize)> = Vec::new();
+    // (directory, its depth below the root, its index in `counts`)
+    let mut stack = vec![(root.to_path_buf(), 0usize, 0usize)];
+    while let Some((dir, depth, top)) = stack.pop() {
         let it = match std::fs::read_dir(&dir) {
             Ok(it) => it,
             // Gone since it was listed, or no root yet: nothing to follow.
@@ -401,6 +434,10 @@ fn walk_problems(admin: &Path, root: &Path, out: &mut Vec<LinkProblem>) {
                 continue;
             }
         };
+        // What git's bare-repository discovery looks for. Case-blind, like
+        // the `.git` match below. Taken from the listing, so a dangling
+        // `HEAD -> refs/heads/main` counts, as it does for git.
+        let (mut head, mut objects, mut refs, mut commondir) = (false, false, false, false);
         for entry in it {
             let entry = match entry {
                 Ok(entry) => entry,
@@ -418,15 +455,25 @@ fn walk_problems(admin: &Path, root: &Path, out: &mut Vec<LinkProblem>) {
                     continue;
                 }
             };
-            if entry.file_name() == ".git" {
-                if depth == 1 && kind.is_file() {
+            let name = entry.file_name();
+            let is = |n: &str| name.to_string_lossy().eq_ignore_ascii_case(n);
+            // git follows a symlink for `objects` and `refs`.
+            let dirlike = kind.is_dir() || kind.is_symlink();
+            head |= is("HEAD");
+            objects |= dirlike && is("objects");
+            refs |= dirlike && is("refs");
+            commondir |= is("commondir");
+            // Case-blind: on a case-insensitive volume git opens `.GIT` when
+            // it looks up `.git`.
+            if is(".git") {
+                if depth == 1 && kind.is_file() && name == ".git" {
                     if let Err(e) = check_pointer(&path, admin) {
                         push(&dir, format!("{}: {e}", path.display()));
                     }
                 } else if depth == 1 {
                     push(
                         &dir,
-                        format!("{} is not a gitdir pointer file", path.display()),
+                        format!("{} is not a gitdir pointer file named .git", path.display()),
                     );
                 } else {
                     push(
@@ -439,7 +486,23 @@ fn walk_problems(admin: &Path, root: &Path, out: &mut Vec<LinkProblem>) {
                 }
                 continue;
             }
+            if kind.is_symlink() && depth > 0 {
+                if let Some(detail) = symlink_problem(&path, root, common) {
+                    push(&dir, detail);
+                }
+                continue;
+            }
             if !kind.is_dir() {
+                if depth == 0 {
+                    push(
+                        root,
+                        format!(
+                            "{} is not a directory: only worktree directories belong directly \
+                             in the root",
+                            path.display()
+                        ),
+                    );
+                }
                 continue;
             }
             if depth + 1 > WALK_MAX_DEPTH {
@@ -454,20 +517,105 @@ fn walk_problems(admin: &Path, root: &Path, out: &mut Vec<LinkProblem>) {
                 continue;
             }
             if budget == 0 {
+                counts.sort_by(|a, b| b.1.cmp(&a.1));
+                let per: Vec<String> = counts
+                    .iter()
+                    .map(|(p, n)| format!("{}: {n}", p.display()))
+                    .collect();
                 push(
                     root,
                     format!(
-                        "the root holds more than {WALK_MAX_DIRS} directories, so the check for \
-                         .git entries stopped before the end. Remove worktrees or build output \
-                         you no longer need"
+                        "the root holds more than {max_dirs} directories \
+                         (sandbox.worktree_walk_max_dirs), so the check for .git entries \
+                         stopped before the end. Directories counted per worktree before it \
+                         stopped: {}. Remove worktrees or build output you no longer need, \
+                         or raise the limit",
+                        per.join(", ")
                     ),
                 );
                 return;
             }
             budget -= 1;
-            stack.push((path, depth + 1));
+            let top = if depth == 0 {
+                counts.push((path.clone(), 0));
+                counts.len() - 1
+            } else {
+                top
+            };
+            counts[top].1 += 1;
+            stack.push((path, depth + 1, top));
+        }
+        if head && ((objects && refs) || commondir) {
+            push(
+                &dir,
+                format!(
+                    "{} holds HEAD with objects and refs or a commondir, so git run there \
+                     takes it for a bare repository and reads its config",
+                    dir.display()
+                ),
+            );
         }
     }
+}
+
+/// `dir` passes git's gitdir test as far as a check needs: `HEAD` (a dangling
+/// symlink counts) with `objects/` and `refs/`, or with a `commondir` naming
+/// where those live.
+fn looks_like_gitdir(dir: &Path) -> bool {
+    dir.join("HEAD").symlink_metadata().is_ok()
+        && (dir.join("commondir").symlink_metadata().is_ok()
+            || (dir.join("objects").is_dir() && dir.join("refs").is_dir()))
+}
+
+/// A symlink below a worktree, checked without walking through it.
+///
+/// `cd` through it and git starts discovery at the target, then walks up
+/// from there. A target inside the root is covered by the walk itself. One
+/// outside it (`/private/tmp/evil`, which the agent can write) is checked the
+/// way git would: the first `.git` or gitdir-shaped directory on the way up
+/// is a finding, unless it is this repository's own common dir, whose config
+/// and hooks are kernel-denied. A target that does not exist is no directory
+/// to run git in; one that cannot be resolved for another reason is a
+/// finding.
+fn symlink_problem(link: &Path, root: &Path, common: &Path) -> Option<String> {
+    let target = match std::fs::canonicalize(link) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            return Some(format!(
+                "{}: cannot resolve the symlink: {e}",
+                link.display()
+            ));
+        }
+    };
+    if !target.is_dir() || target.starts_with(root) {
+        return None;
+    }
+    for dir in target.ancestors() {
+        if dir == common {
+            return None;
+        }
+        let dotgit = dir.join(".git");
+        if dotgit.symlink_metadata().is_ok() {
+            return (dotgit != common).then(|| {
+                format!(
+                    "{} leads to {}, where git would use the repository at {}",
+                    link.display(),
+                    target.display(),
+                    dotgit.display()
+                )
+            });
+        }
+        if looks_like_gitdir(dir) {
+            return Some(format!(
+                "{} leads to {}, where git would use {} as a bare repository",
+                link.display(),
+                target.display(),
+                dir.display()
+            ));
+        }
+    }
+    None
 }
 
 /// One `<root>/<name>/.git` pointer against its admin dir, both directions.
@@ -502,9 +650,9 @@ fn check_pointer(pointer: &Path, admin: &Path) -> Result<(), String> {
 /// [`link_problems`] for the end of a session, re-deriving the common dir.
 /// A repository that no longer resolves is itself a finding.
 #[must_use]
-pub fn session_end_problems(project_dir: &Path, root: &Path) -> Vec<LinkProblem> {
+pub fn session_end_problems(project_dir: &Path, root: &Path, max_dirs: usize) -> Vec<LinkProblem> {
     let detail = match repository_common_dir(project_dir) {
-        Ok(Some(common)) => return link_problems(&common, root),
+        Ok(Some(common)) => return link_problems(&common, root, max_dirs),
         Ok(None) => format!(
             "{} no longer resolves as a git repository",
             project_dir.display()
@@ -703,12 +851,15 @@ mod tests {
             eprintln!("SKIPPED: git unavailable");
             return;
         };
-        assert_eq!(link_problems(&common, &root), Vec::<LinkProblem>::new());
+        assert_eq!(
+            link_problems(&common, &root, DEFAULT_WALK_MAX_DIRS),
+            Vec::<LinkProblem>::new()
+        );
 
         let commondir = common.join("worktrees/wt/commondir");
         std::fs::create_dir_all(root.join("x")).unwrap();
         std::fs::write(&commondir, root.join("x").to_string_lossy().as_bytes()).unwrap();
-        let problems = link_problems(&common, &root);
+        let problems = link_problems(&common, &root, DEFAULT_WALK_MAX_DIRS);
         assert!(
             problems
                 .iter()
@@ -717,7 +868,7 @@ mod tests {
         );
 
         std::fs::remove_file(&commondir).unwrap();
-        let problems = link_problems(&common, &root);
+        let problems = link_problems(&common, &root, DEFAULT_WALK_MAX_DIRS);
         assert!(
             problems.iter().any(|p| p.detail.contains("is missing")),
             "{problems:?}"
@@ -739,7 +890,7 @@ mod tests {
         let evil = root.join("g");
         std::fs::create_dir_all(&evil).unwrap();
         std::fs::write(wt.join(".git"), format!("gitdir: {}\n", evil.display())).unwrap();
-        let problems = link_problems(&common, &root);
+        let problems = link_problems(&common, &root, DEFAULT_WALK_MAX_DIRS);
         assert!(
             problems
                 .iter()
@@ -757,7 +908,7 @@ mod tests {
             format!("gitdir: {}\n", common.join("worktrees/wt").display()),
         )
         .unwrap();
-        let problems = link_problems(&common, &root);
+        let problems = link_problems(&common, &root, DEFAULT_WALK_MAX_DIRS);
         assert!(
             problems
                 .iter()
@@ -796,7 +947,7 @@ mod tests {
         std::fs::create_dir_all(deep.join(".git")).unwrap();
         std::fs::write(root.join(".git"), &pointer).unwrap();
 
-        let problems = link_problems(&common, &root);
+        let problems = link_problems(&common, &root, DEFAULT_WALK_MAX_DIRS);
         for (git, dir) in [
             (sub.join(".git"), &sub),
             (sub2.join(".git"), &sub2),
@@ -825,7 +976,7 @@ mod tests {
         };
         std::fs::rename(wt.join(".git"), root.join("real")).unwrap();
         std::os::unix::fs::symlink(root.join("real"), wt.join(".git")).unwrap();
-        let problems = link_problems(&common, &root);
+        let problems = link_problems(&common, &root, DEFAULT_WALK_MAX_DIRS);
         let p = finding(&problems, &wt.join(".git")).expect("found");
         assert!(p.detail.contains("not a gitdir pointer file"), "{p:?}");
         assert_eq!(p.dir, wt);
@@ -843,7 +994,7 @@ mod tests {
         };
         let admin = common.join("worktrees");
         std::fs::write(admin.join("stray"), "").unwrap();
-        let problems = link_problems(&common, &root);
+        let problems = link_problems(&common, &root, DEFAULT_WALK_MAX_DIRS);
         assert!(
             finding(&problems, &admin.join("stray"))
                 .is_some_and(|p| p.detail.contains("not a directory")),
@@ -852,7 +1003,7 @@ mod tests {
 
         std::fs::rename(&admin, base.join("moved")).unwrap();
         std::os::unix::fs::symlink(base.join("moved"), &admin).unwrap();
-        let problems = link_problems(&common, &root);
+        let problems = link_problems(&common, &root, DEFAULT_WALK_MAX_DIRS);
         assert!(
             finding(&problems, &admin).is_some_and(|p| p.detail.contains("not a directory")),
             "{problems:?}"
@@ -874,7 +1025,7 @@ mod tests {
         std::fs::create_dir_all(&locked).unwrap();
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
         let readable = std::fs::read_dir(&locked).is_ok(); // root ignores modes
-        let problems = link_problems(&common, &root);
+        let problems = link_problems(&common, &root, DEFAULT_WALK_MAX_DIRS);
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
         if readable {
             eprintln!("SKIPPED: running as root");
@@ -889,7 +1040,7 @@ mod tests {
 
         let admin = common.join("worktrees");
         std::fs::set_permissions(&admin, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let problems = link_problems(&common, &root);
+        let problems = link_problems(&common, &root, DEFAULT_WALK_MAX_DIRS);
         std::fs::set_permissions(&admin, std::fs::Permissions::from_mode(0o755)).unwrap();
         let expected = format!("cannot read {}:", admin.display());
         assert!(
@@ -909,9 +1060,12 @@ mod tests {
             deep.push("d");
         }
         std::fs::create_dir_all(&deep).unwrap();
-        assert_eq!(link_problems(&common, &root), Vec::<LinkProblem>::new());
+        assert_eq!(
+            link_problems(&common, &root, DEFAULT_WALK_MAX_DIRS),
+            Vec::<LinkProblem>::new()
+        );
         std::fs::create_dir(deep.join("d")).unwrap();
-        let problems = link_problems(&common, &root);
+        let problems = link_problems(&common, &root, DEFAULT_WALK_MAX_DIRS);
         assert!(
             problems.iter().any(|p| p.detail.contains("levels below")),
             "{problems:?}"
@@ -937,5 +1091,203 @@ mod tests {
             let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o700, "{}", dir.display());
         }
+    }
+
+    /// #574 review blocker: on a case-insensitive volume git opens `.GIT`
+    /// when it looks up `.git`, so a case variant is a `.git` too. At depth
+    /// one only the exact name `git worktree add` writes passes.
+    #[test]
+    fn a_case_variant_git_entry_is_found() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let Some((common, root, wt)) = repo_with_worktree(&base) else {
+            eprintln!("SKIPPED: git unavailable");
+            return;
+        };
+        let sub = wt.join("sub");
+        std::fs::create_dir_all(sub.join(".GIT")).unwrap();
+        let problems = link_problems(&common, &root, DEFAULT_WALK_MAX_DIRS);
+        let p = finding(&problems, &sub.join(".GIT")).expect("nested .GIT found");
+        assert_eq!(p.dir, sub);
+
+        std::fs::rename(wt.join(".git"), wt.join(".Git")).unwrap();
+        let problems = link_problems(&common, &root, DEFAULT_WALK_MAX_DIRS);
+        let p = finding(&problems, &wt.join(".Git")).expect("depth-one .Git found");
+        assert!(p.detail.contains("named .git"), "{p:?}");
+    }
+
+    /// An admin dir whose `gitdir` does not name an existing regular `.git`
+    /// file serves no live worktree: a finding, not a pass.
+    #[test]
+    fn an_admin_dir_without_a_live_pointer_is_found() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let Some((common, root, wt)) = repo_with_worktree(&base) else {
+            eprintln!("SKIPPED: git unavailable");
+            return;
+        };
+        let back = common.join("worktrees/wt/gitdir");
+        std::fs::write(&back, format!("{}\n", wt.join("f").display())).unwrap();
+        let problems = link_problems(&common, &root, DEFAULT_WALK_MAX_DIRS);
+        assert!(
+            finding(&problems, &back)
+                .is_some_and(|p| p.detail.contains("not an existing regular .git file")),
+            "{problems:?}"
+        );
+
+        std::fs::write(&back, format!("{}\n", wt.join(".git").display())).unwrap();
+        std::fs::remove_dir_all(&wt).unwrap();
+        let problems = link_problems(&common, &root, DEFAULT_WALK_MAX_DIRS);
+        assert!(
+            finding(&problems, &back)
+                .is_some_and(|p| p.detail.contains("not an existing regular .git file")),
+            "{problems:?}"
+        );
+    }
+
+    /// A symlink or file directly in the root is a finding: a `cd` through it
+    /// leaves the root, and git follows.
+    #[test]
+    fn a_non_directory_directly_in_the_root_is_found() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let common = root.join("no-common");
+        std::fs::create_dir(root.join("wt")).unwrap();
+        assert_eq!(
+            link_problems(&common, &root, DEFAULT_WALK_MAX_DIRS),
+            Vec::<LinkProblem>::new()
+        );
+        std::os::unix::fs::symlink("/", root.join("link")).unwrap();
+        std::fs::write(root.join("file"), "").unwrap();
+        let problems = link_problems(&common, &root, DEFAULT_WALK_MAX_DIRS);
+        for name in ["link", "file"] {
+            assert!(
+                finding(&problems, &root.join(name))
+                    .is_some_and(|p| p.detail.contains("not a directory")),
+                "{name}: {problems:?}"
+            );
+        }
+    }
+
+    /// A directory with `HEAD`, `objects/` and `refs/` is a bare repository
+    /// to git's discovery, which then reads the `config` beside them.
+    #[test]
+    fn a_bare_repository_layout_is_found() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let Some((common, root, wt)) = repo_with_worktree(&base) else {
+            eprintln!("SKIPPED: git unavailable");
+            return;
+        };
+        let bare = wt.join("b");
+        std::fs::create_dir_all(bare.join("objects")).unwrap();
+        std::fs::create_dir_all(bare.join("refs")).unwrap();
+        assert_eq!(
+            link_problems(&common, &root, DEFAULT_WALK_MAX_DIRS),
+            Vec::<LinkProblem>::new(),
+            "objects and refs alone are not a repository"
+        );
+        // A dangling `HEAD -> refs/heads/main` is a HEAD to git.
+        std::os::unix::fs::symlink("refs/heads/main", bare.join("HEAD")).unwrap();
+        let problems = link_problems(&common, &root, DEFAULT_WALK_MAX_DIRS);
+        let p = finding(&problems, &bare).expect("bare layout found");
+        assert!(p.detail.contains("bare"), "{p:?}");
+        assert_eq!(p.dir, bare);
+
+        // HEAD with a `commondir` needs no objects or refs of its own.
+        let linked = wt.join("c");
+        std::fs::create_dir_all(&linked).unwrap();
+        std::fs::write(linked.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(linked.join("commondir"), "/elsewhere\n").unwrap();
+        let problems = link_problems(&common, &root, DEFAULT_WALK_MAX_DIRS);
+        assert!(finding(&problems, &linked).is_some(), "{problems:?}");
+    }
+
+    /// #577 review (a): a symlink below a worktree that leads out of the root
+    /// to a repository is where a `cd` and git would pick up that
+    /// repository's config. Tested, not walked. One into this repository's
+    /// own checkout, or one that dangles, is not a finding.
+    #[test]
+    fn a_symlink_out_of_the_root_to_a_repository_is_found() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let Some((common, root, wt)) = repo_with_worktree(&base) else {
+            eprintln!("SKIPPED: git unavailable");
+            return;
+        };
+        let evil = base.join("evil");
+        std::fs::create_dir_all(evil.join(".git")).unwrap();
+        std::fs::create_dir_all(evil.join("deep/er")).unwrap();
+        let bare = base.join("bare");
+        for d in ["objects", "refs", "sub"] {
+            std::fs::create_dir_all(bare.join(d)).unwrap();
+        }
+        std::fs::write(bare.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir_all(base.join("main/lib")).unwrap();
+
+        std::os::unix::fs::symlink(&evil, wt.join("tools")).unwrap();
+        std::os::unix::fs::symlink(evil.join("deep/er"), wt.join("deep")).unwrap();
+        std::os::unix::fs::symlink(bare.join("sub"), wt.join("b")).unwrap();
+        std::os::unix::fs::symlink(base.join("main/lib"), wt.join("own")).unwrap();
+        std::os::unix::fs::symlink(base.join("gone"), wt.join("dangling")).unwrap();
+        std::os::unix::fs::symlink(wt.join("f"), wt.join("file")).unwrap();
+
+        let problems = link_problems(&common, &root, DEFAULT_WALK_MAX_DIRS);
+        for name in ["tools", "deep", "b"] {
+            let p = finding(&problems, &wt.join(name))
+                .unwrap_or_else(|| panic!("{name}: {problems:?}"));
+            assert_eq!(p.dir, wt, "{name}");
+        }
+        for name in ["own", "dangling", "file"] {
+            assert!(
+                finding(&problems, &wt.join(name)).is_none(),
+                "{name}: {problems:?}"
+            );
+        }
+    }
+
+    /// #577 review (c): the create deny sees only the top directory of a
+    /// rename, so a tree staged outside the root with a `.git` inside and
+    /// moved in whole gets past it. The walk is what finds it.
+    #[test]
+    fn a_git_moved_in_inside_its_parent_is_found() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let Some((common, root, wt)) = repo_with_worktree(&base) else {
+            eprintln!("SKIPPED: git unavailable");
+            return;
+        };
+        let stage = base.join("stage/sub");
+        std::fs::create_dir_all(stage.join(".git")).unwrap();
+        std::fs::rename(&stage, wt.join("sub")).unwrap();
+        let problems = link_problems(&common, &root, DEFAULT_WALK_MAX_DIRS);
+        assert!(
+            finding(&problems, &wt.join("sub/.git")).is_some(),
+            "{problems:?}"
+        );
+    }
+
+    /// The directory budget is the caller's (`sandbox.worktree_walk_max_dirs`),
+    /// and running out of it names how many directories each worktree held.
+    #[test]
+    fn the_directory_budget_is_configurable_and_reports_counts() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let common = root.join("no-common");
+        std::fs::create_dir_all(root.join("big/a/b")).unwrap();
+        std::fs::create_dir_all(root.join("big/c")).unwrap();
+        std::fs::create_dir_all(root.join("small")).unwrap();
+        // Five directories: big, big/a, big/a/b, big/c and small.
+        assert_eq!(link_problems(&common, &root, 5), Vec::<LinkProblem>::new());
+        let problems = link_problems(&common, &root, 3);
+        let p = problems
+            .iter()
+            .find(|p| p.detail.contains("sandbox.worktree_walk_max_dirs"))
+            .unwrap_or_else(|| panic!("{problems:?}"));
+        assert!(p.detail.contains("more than 3 directories"), "{p:?}");
+        let big = format!("{}: ", root.join("big").display());
+        let small = format!("{}: 1", root.join("small").display());
+        assert!(p.detail.contains(&big), "{p:?}");
+        assert!(p.detail.contains(&small), "{p:?}");
     }
 }

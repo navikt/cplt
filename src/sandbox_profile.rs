@@ -1174,22 +1174,24 @@ fn emit_git_persistence_denies(
     // "$CPLT_WORKTREE_ROOT/<name>"` writes depth one, which stays open. A
     // directory moved in that already holds a `.git` is not a create, so
     // `worktrees::link_problems` walks the whole root for that.
+    //
+    // Case-blind: APFS is case-insensitive by default, and there git opens
+    // `.GIT` when it looks up `.git`. The explicit classes keep the rule from
+    // depending on how Seatbelt matches case.
+    //
+    // The root goes through `escape_regex` only; `sandbox::prepare` has already
+    // refused it if `validate_sbpl_path` fails (module contract above).
     if let Some(root) = managed_worktree_root {
         let r = escape_regex(&root.to_string_lossy());
         sbpl!(sb, ";; Managed worktree root (#531)");
+        sbpl!(sb, "(deny file-write-unlink (regex #\"^{r}$\"))");
         sbpl!(
             sb,
-            "(deny file-write-unlink (literal \"{}\"))",
-            root.display()
+            "(deny file-write-create (regex #\"^{r}/\\.[gG][iI][tT]$\"))"
         );
         sbpl!(
             sb,
-            "(deny file-write-create (literal \"{}/.git\"))",
-            root.display()
-        );
-        sbpl!(
-            sb,
-            "(deny file-write-create (regex #\"^{r}/[^/]+/.+/\\.git$\"))"
+            "(deny file-write-create (regex #\"^{r}/[^/]+/.+/\\.[gG][iI][tT]$\"))"
         );
         for gitdir in &gitdirs {
             let g = escape_regex(gitdir);

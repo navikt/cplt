@@ -2003,6 +2003,11 @@ fn validate_config_paths(config: &SandboxConfig) -> Result<(), String> {
             .map_err(|e| format!("Home Git config symlink target: {e}"))?;
     }
 
+    // Checked on its own, not only as one of `named_roots`: the profile
+    // interpolates it into the managed-root rules as well (#574).
+    if let Some(root) = config.managed_worktree_root {
+        policy::validate_sbpl_path(root).map_err(|e| format!("Managed worktree root: {e}"))?;
+    }
     if let Some(dir) = config.copilot_install_dir {
         policy::validate_sbpl_path(dir).map_err(|e| format!("Copilot install dir: {e}"))?;
     }
@@ -2641,6 +2646,21 @@ mod tests {
         config.project_dir = &project;
         let err = super::validate_config_paths(&config).expect_err("must refuse");
         assert!(err.contains("Home Git config symlink target"), "{err}");
+    }
+
+    /// #574 review item 7: the managed worktree root is interpolated into the
+    /// profile, so it is validated in its own right, not only when it is also
+    /// one of `named_roots`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unnameable_managed_worktree_root_is_refused() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let root = home.join(".cplt-worktrees/a\"b");
+        let mut config = test_config(&home, &[]);
+        config.managed_worktree_root = Some(&root);
+        let err = super::validate_config_paths(&config).expect_err("must refuse");
+        assert!(err.contains("Managed worktree root"), "{err}");
     }
 
     /// #553: files are created only once Bubblewrap will wrap the run. With

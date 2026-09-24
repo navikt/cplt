@@ -4541,6 +4541,8 @@ r nested_mv 'mv "$R/gp" "$R/a/m/.git"'
 r root_git 'echo "gitdir: $R/g" > "$R/.git"'
 r root_git_mkdir 'mkdir "$R/.git"'
 r root_git_link 'ln -s "$R/g" "$R/.git"'
+r nested_upper 'mkdir "$R/a/d/.GIT"'
+r root_git_upper 'mkdir "$R/.Git"'
 "##;
 
     /// With the key on, the agent can create two worktrees under
@@ -4598,6 +4600,8 @@ echo "ROOT:$R"
             "root_git",
             "root_git_mkdir",
             "root_git_link",
+            "nested_upper",
+            "root_git_upper",
             "sib_read",
             "sib_write",
             "sib_exec",
@@ -4690,6 +4694,21 @@ if echo y > "{root_s}/g" 2>/dev/null; then echo RESULT:write:OK; else echo RESUL
                 "nested_link",
                 r#"mkdir -p "$R/g" "$R/s" && printf 'gitdir: %s\n' "$R/g" > "$R/gp" && ln -s "$R/gp" "$R/s/.git" && mv "$R/s" "$R/a/sub2""#,
                 "a/sub2",
+                false,
+            ),
+            // #577 review (c): staged outside the root, so the create deny
+            // only ever sees `sub3` itself arrive.
+            (
+                "staged",
+                r#"mkdir -p "$P/st/sub/.git" && mv "$P/st/sub" "$R/a/sub3""#,
+                "a/sub3",
+                false,
+            ),
+            // #577 review (a): a symlink out of the root to a repository.
+            (
+                "dir_link",
+                r#"mkdir -p "$P/ev/objects" "$P/ev/refs" && echo "ref: refs/heads/m" > "$P/ev/HEAD" && ln -s "$P/ev" "$R/a/tools""#,
+                "a",
                 false,
             ),
             ("root", "true", "", true),

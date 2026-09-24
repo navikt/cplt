@@ -447,6 +447,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "sandbox",
+        key: "worktree_walk_max_dirs",
+        value_type: ConfigValueType::U64,
+        dangerous: false,
+        default_display: "100000",
+        description: "With allow_git_worktrees on: how many directories the check of the worktree root visits at launch and session end. Past it the launch refuses to start, since a .git beyond it would go unseen. Raise it for large dependency trees.",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
         key: "gh_proxy",
         value_type: ConfigValueType::Bool,
         dangerous: false,

@@ -1799,15 +1799,22 @@ fn policy_roots(repo_paths: &[PathBuf], worktree_root: Option<&Path>) -> Vec<Pat
 /// The worktree links are checked here too, audit or not: the session could
 /// have left a `commondir` or `.git` pointer that makes git on the host read
 /// agent-written config, and this is the last moment cplt can say so.
+///
+/// It runs after `audit::run` returns: after the settle probe's wait when the
+/// audit or `--observe-domains` is on, else as soon as the direct child exits.
+/// A background descendant that outlives that can still change the root
+/// afterwards. cplt does not kill the tree (see `audit::SettleProbe` on why no
+/// process group); the next launch runs the same check before it starts.
 fn warn_worktrees_not_audited(
     audit_enabled: bool,
     worktree_root: Option<&Path>,
     project_dir: &Path,
+    max_dirs: usize,
 ) {
     let Some(root) = worktree_root else {
         return;
     };
-    let problems = cplt::worktrees::session_end_problems(project_dir, root);
+    let problems = cplt::worktrees::session_end_problems(project_dir, root, max_dirs);
     if !problems.is_empty() {
         let dirs = cplt::worktrees::problem_dirs(&problems);
         let details: Vec<String> = problems.iter().map(ToString::to_string).collect();
@@ -1848,6 +1855,7 @@ fn managed_worktree_root(
     home_dir: &Path,
     project_dir: &Path,
     os: &str,
+    max_dirs: usize,
 ) -> anyhow::Result<Option<PathBuf>> {
     if !enabled {
         return Ok(None);
@@ -1874,7 +1882,7 @@ fn managed_worktree_root(
         return Ok(None);
     }
     cplt::worktrees::refuse_unsupported_os(os).map_err(fail)?;
-    match cplt::worktrees::prepare_root(home_dir, project_dir, create) {
+    match cplt::worktrees::prepare_root(home_dir, project_dir, create, max_dirs) {
         Ok(Some(root)) => Ok(Some(root)),
         Ok(None) => Err(fail(not_in_repo())),
         Err(e) => Err(fail(e)),
@@ -2850,6 +2858,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         &home_dir,
         &project_dir,
         std::env::consts::OS,
+        resolved.worktree_walk_max_dirs,
     )?;
     // Same confused deputy as the named-root check above: the managed root is
     // agent-writable, so a config file inside it is one the agent could rewrite.
@@ -4198,7 +4207,12 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             })
         },
     );
-    warn_worktrees_not_audited(audit_enabled, worktree_root.as_deref(), &project_dir);
+    warn_worktrees_not_audited(
+        audit_enabled,
+        worktree_root.as_deref(),
+        &project_dir,
+        resolved.worktree_walk_max_dirs,
+    );
 
     // Cleanup
     if cli.observe_domains
@@ -5600,7 +5614,12 @@ fn run_exec_command(
             })
         },
     );
-    warn_worktrees_not_audited(audit_enabled, worktree_root.as_deref(), &project_dir);
+    warn_worktrees_not_audited(
+        audit_enabled,
+        worktree_root.as_deref(),
+        &project_dir,
+        resolved.worktree_walk_max_dirs,
+    );
 
     if cli.observe_domains
         && let Some(snapshot) = snapshot.as_ref()
@@ -9772,6 +9791,7 @@ mod tests {
             home.path(),
             Path::new("/nonexistent"),
             "macos",
+            cplt::worktrees::DEFAULT_WALK_MAX_DIRS,
         )
         .expect("off never fails");
         assert!(root.is_none());
@@ -9794,13 +9814,21 @@ mod tests {
     fn managed_worktree_root_on_without_a_repository() {
         let home = tempfile::tempdir().expect("tempdir");
         let plain = tempfile::tempdir().expect("tempdir");
+        let max = cplt::worktrees::DEFAULT_WALK_MAX_DIRS;
         let err =
-            super::managed_worktree_root(true, true, true, home.path(), plain.path(), "macos")
+            super::managed_worktree_root(true, true, true, home.path(), plain.path(), "macos", max)
                 .expect_err("local key, no repository, no root");
         assert!(err.to_string().contains("allow_git_worktrees"), "{err}");
-        let root =
-            super::managed_worktree_root(true, false, true, home.path(), plain.path(), "macos")
-                .expect("global key outside a repository is skipped");
+        let root = super::managed_worktree_root(
+            true,
+            false,
+            true,
+            home.path(),
+            plain.path(),
+            "macos",
+            max,
+        )
+        .expect("global key outside a repository is skipped");
         assert!(root.is_none());
         assert!(!home.path().join(cplt::worktrees::BASE).exists());
     }
@@ -9830,6 +9858,7 @@ mod tests {
                 home.path(),
                 repo.path(),
                 "linux",
+                cplt::worktrees::DEFAULT_WALK_MAX_DIRS,
             )
             .expect_err("refused on linux");
             assert!(err.to_string().contains("macOS-only"), "{err}");

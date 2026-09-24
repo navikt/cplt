@@ -2321,9 +2321,10 @@ fn the_managed_worktree_root_section_is_emitted_only_when_set() {
     assert!(!off.contains("file-write-create"), "{off}");
     let on = profile(Some(&root));
     for rule in [
-        "(deny file-write-unlink (literal \"/Users/test/.cplt-worktrees/ab\"))",
-        "(deny file-write-create (literal \"/Users/test/.cplt-worktrees/ab/.git\"))",
-        "(deny file-write-create (regex #\"^/Users/test/\\.cplt-worktrees/ab/[^/]+/.+/\\.git$\"))",
+        "(deny file-write-unlink (regex #\"^/Users/test/\\.cplt-worktrees/ab$\"))",
+        // Case-blind (#574 review): APFS opens `.GIT` for `.git`.
+        "(deny file-write-create (regex #\"^/Users/test/\\.cplt-worktrees/ab/\\.[gG][iI][tT]$\"))",
+        "(deny file-write-create (regex #\"^/Users/test/\\.cplt-worktrees/ab/[^/]+/.+/\\.[gG][iI][tT]$\"))",
     ] {
         assert!(on.contains(rule), "missing {rule}\n{on}");
     }
@@ -9302,6 +9303,7 @@ allow_browser = false
 keychain_substitute = false
 allow_build_credentials = false
 allow_git_worktrees = false
+worktree_walk_max_dirs = 100000
 git_push_prevention = false
 
 [gh_guard]

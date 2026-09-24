@@ -911,6 +911,7 @@ mod tests {
             keychain_substitute: false,
             allow_build_credentials: false,
             allow_git_worktrees: false,
+            worktree_walk_max_dirs: crate::worktrees::DEFAULT_WALK_MAX_DIRS,
             allow_msbuild: false,
             allow_tmp_exec: false,
             allow_cache_exec: Vec::new(),

@@ -504,6 +504,12 @@ impl Config {
         // exactly what `needs_keychain()` says.
         let keychain_substitute = bools.keychain_substitute;
         let allow_git_worktrees = bools.allow_git_worktrees;
+        let worktree_walk_max_dirs = self
+            .sandbox
+            .worktree_walk_max_dirs
+            .map_or(crate::worktrees::DEFAULT_WALK_MAX_DIRS, |n| {
+                usize::try_from(n).unwrap_or(usize::MAX)
+            });
 
         // Config-only (#463). Expanded into `allow_read` at probe time, where
         // `$HOME` and the final deny list are known.
@@ -663,6 +669,7 @@ impl Config {
             keychain_substitute,
             allow_build_credentials,
             allow_git_worktrees,
+            worktree_walk_max_dirs,
             scratch_dir,
             use_bubblewrap,
             quiet,
