@@ -3762,23 +3762,42 @@ pub const EXEC_IN_WRITABLE: &[ExecInWritable] = &[
 /// the number is a message that will one day be wrong.
 pub(crate) const NESTED_SCAN_LIMIT: usize = 20_000;
 
+/// What the session-end `.git` check (`audit::NestedGit`, #576) needs from
+/// [`repo_walk`] beyond the repositories. Passing one also changes the walk;
+/// see there.
+#[derive(Default)]
+pub(crate) struct WalkExtras {
+    /// Every symlink met below the roots, dangling ones included. Not followed.
+    pub(crate) links: Vec<PathBuf>,
+    /// Directories whose listing failed for a reason other than `NotFound`:
+    /// nothing below them was looked at.
+    pub(crate) unreadable: Vec<PathBuf>,
+}
+
 /// Repositories nested below `roots`: the walk behind bubblewrap's `nested_repo_roots` (#498), with the depth left to the caller.
 ///
 /// The session-end `.git` check (`audit::NestedGit`, #576) passes no depth
 /// limit: a depth cut-off is a place to hide that nobody is told about, while
 /// the directory budget is reported when it is hit.
 ///
-/// `test_symlinked_dirs`: a symlink to a directory is also tested with
-/// `is_repo` (following the link for that test only), never descended into.
-/// The session-end check needs it, because git run in `<root>/tools` obeys
-/// the config of the repository `tools` points at, wherever that is. The
-/// bubblewrap caller passes `false`: it binds what it finds, and a bind onto a
-/// symlink fails the whole wrapper (see `nested_repo_roots`).
+/// `extras: None` is the bubblewrap walk, unchanged since #498: real
+/// directories only, `SKIP` compared exactly, unreadable directories passed
+/// over. It binds what it finds, and a bind onto a symlink fails the whole
+/// wrapper (see `nested_repo_roots`).
+///
+/// `extras: Some` is the session-end check's walk. It also
+/// - records every symlink (and counts it against the budget), and tests one
+///   that leads to a directory with `is_repo`, following the link for that
+///   test only, never descending: git run in `<root>/tools` obeys the config
+///   of the repository `tools` points at, wherever that is;
+/// - records directories it could not list, since `chmod` hides what is below;
+/// - skips `.git` in any letter case: on a case-insensitive volume `.GIT` is
+///   the gitdir.
 pub(crate) fn repo_walk(
     roots: &[&Path],
     max_depth: usize,
     is_repo: fn(&Path) -> bool,
-    test_symlinked_dirs: bool,
+    mut extras: Option<&mut WalkExtras>,
 ) -> (Vec<PathBuf>, bool) {
     /// Not descended into: thousands of entries, and a `.git` inside one is
     /// vendored rather than worked in. They are still *tested* for being a
@@ -3797,6 +3816,7 @@ pub(crate) fn repo_walk(
         ".next",
         ".cache",
     ];
+    let audit = extras.is_some();
 
     let mut found: Vec<PathBuf> = Vec::new();
     let mut budget = NESTED_SCAN_LIMIT;
@@ -3807,20 +3827,28 @@ pub(crate) fn repo_walk(
         if depth >= max_depth {
             continue;
         }
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                if let Some(x) = extras.as_deref_mut()
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    x.unreadable.push(dir);
+                }
+                continue;
+            }
         };
         // Sorted, so a truncated walk truncates the same way twice. An
         // unsorted `read_dir` would protect different repositories on different
         // launches of the same tree.
-        // `(path, is a real directory)`; the second kind is a symlink to one.
+        // `(path, is a real directory)`; the other kind is a symlink.
         let mut dirs: Vec<(PathBuf, bool)> = entries
             .flatten()
             .filter_map(|e| {
                 let t = e.file_type().ok()?;
                 if t.is_dir() {
                     Some((e.path(), true))
-                } else if test_symlinked_dirs && t.is_symlink() && e.path().is_dir() {
+                } else if audit && t.is_symlink() {
                     Some((e.path(), false))
                 } else {
                     None
@@ -3834,18 +3862,33 @@ pub(crate) fn repo_walk(
                 return (dedup(found), true);
             }
             budget -= 1;
-            // `.git` as a directory, a file or a symlink (not followed) all mean a repository is
+            if !real_dir {
+                // A symlink: only reached with `extras`. Recorded, tested if it
+                // leads to a directory, never descended into.
+                if path.is_dir() && is_repo(&path) {
+                    found.push(path.clone());
+                }
+                if let Some(x) = extras.as_deref_mut() {
+                    x.links.push(path);
+                }
+                continue;
+            }
+            // `.git` as a directory or as a file both mean a repository is
             // here — but only the directory case is actually protected. A
             // worktree or submodule keeps its hooks in the shared gitdir
             // (`<super>/.git/modules/<name>/hooks`), which nothing resolves for
             // a NESTED repository, so `<repo>/.git/hooks` does not exist and
             // the bind is dropped downstream. A bare repository has no `.git`
-            // at all and is not found by `has_dot_git`. Both are recorded as
-            // uncovered in SECURITY.md rather than claimed (#498 review).
+            // at all and is not found by `dot_git_exists`. Both are recorded
+            // as uncovered in SECURITY.md rather than claimed (#498 review).
             if is_repo(&path) {
                 found.push(path.clone());
             }
-            if real_dir && !skip_descent(&path, SKIP) {
+            let skipped = path.file_name().is_some_and(|n| {
+                let n = n.to_string_lossy();
+                SKIP.contains(&n.as_ref()) || (audit && n.eq_ignore_ascii_case(".git"))
+            });
+            if !skipped {
                 queue.push_back((path, depth + 1));
             }
         }
@@ -3853,14 +3896,11 @@ pub(crate) fn repo_walk(
     (dedup(found), false)
 }
 
-/// `path`'s name is in `skip`. Exact, except that `.git` matches in any case:
-/// on a case-insensitive volume `.GIT` is the gitdir, while `Target` or
-/// `Vendor` is somebody's source directory and stays walked.
-fn skip_descent(path: &Path, skip: &[&str]) -> bool {
-    path.file_name().is_some_and(|n| {
-        let n = n.to_string_lossy();
-        n.eq_ignore_ascii_case(".git") || skip.contains(&n.as_ref())
-    })
+/// `dir/.git` exists, following a symlink: bubblewrap's repository test,
+/// exactly as #498 wrote it.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn dot_git_exists(dir: &Path) -> bool {
+    dir.join(".git").exists()
 }
 
 /// `dir/.git` exists as a directory, file or symlink (not followed).
@@ -4467,28 +4507,105 @@ mod tests {
         );
     }
 
-    /// #576 review: only `.git` is skipped in any case. `Target` or `Vendor`
-    /// is somebody's source directory, and bubblewrap walked it before #576.
+    /// The walk `nested_repo_roots` ran on origin/main before #576, verbatim
+    /// apart from the depth parameter: the reference the bubblewrap walk must
+    /// still match (#576 review, N1).
+    fn main_nested_repo_roots(roots: &[&Path], max_depth: usize) -> (Vec<PathBuf>, bool) {
+        const SKIP: &[&str] = &[
+            ".git",
+            "node_modules",
+            "target",
+            "vendor",
+            "dist",
+            ".venv",
+            "venv",
+            "__pycache__",
+            ".gradle",
+            ".terraform",
+            ".next",
+            ".cache",
+        ];
+        let mut found: Vec<PathBuf> = Vec::new();
+        let mut budget = NESTED_SCAN_LIMIT;
+        let mut queue: std::collections::VecDeque<(PathBuf, usize)> =
+            roots.iter().map(|r| ((*r).to_path_buf(), 0usize)).collect();
+        while let Some((dir, depth)) = queue.pop_front() {
+            if depth >= max_depth {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            let mut dirs: Vec<PathBuf> = entries
+                .flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                .map(|e| e.path())
+                .collect();
+            dirs.sort();
+            for path in dirs {
+                if budget == 0 {
+                    return (dedup(found), true);
+                }
+                budget -= 1;
+                if path.join(".git").exists() {
+                    found.push(path.clone());
+                }
+                let skipped = path
+                    .file_name()
+                    .is_some_and(|n| SKIP.contains(&n.to_string_lossy().as_ref()));
+                if !skipped {
+                    queue.push_back((path, depth + 1));
+                }
+            }
+        }
+        (dedup(found), false)
+    }
+
+    /// #576 review (N1): the bubblewrap walk (`extras: None`, `dot_git_exists`)
+    /// gives exactly what origin/main's did on a tree built to tell them
+    /// apart, and the audit walk differs where it is meant to.
     #[test]
-    fn repo_walk_skips_dot_git_in_any_case_and_other_names_exactly() {
+    fn the_bubblewrap_walk_matches_main() {
+        let outside = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(outside.path().join(".git")).unwrap();
         let root = tempfile::tempdir().expect("tempdir");
+        let r = root.path();
         let mk = |rel: &str| {
-            let p = root.path().join(rel);
+            let p = r.join(rel);
             std::fs::create_dir_all(p.join(".git")).expect("repo");
             p
         };
         let in_capital_target = mk("Target/x");
-        let in_node_modules = mk("node_modules/y");
+        mk("node_modules/y");
         let in_upper_git = mk(".GIT/z");
-        let (repos, _) = repo_walk(&[root.path()], usize::MAX, has_dot_git, false);
-        assert!(repos.contains(&in_capital_target), "{repos:?}");
-        assert!(!repos.contains(&in_node_modules), "{repos:?}");
-        assert!(!repos.contains(&in_upper_git), "{repos:?}");
+        mk("a/b/c/four");
+        mk("one");
+        // A dangling `.git` symlink, and a symlinked directory to a repository.
+        std::fs::create_dir_all(r.join("dangle")).unwrap();
+        std::os::unix::fs::symlink("/nonexistent-cplt", r.join("dangle/.git")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), r.join("tools")).unwrap();
+
+        for depth in [3, usize::MAX] {
+            assert_eq!(
+                repo_walk(&[r], depth, dot_git_exists, None),
+                main_nested_repo_roots(&[r], depth),
+                "depth {depth}"
+            );
+        }
+        let (bwrap, _) = repo_walk(&[r], usize::MAX, dot_git_exists, None);
+        assert!(bwrap.contains(&in_capital_target) && bwrap.contains(&in_upper_git));
+        let mut x = WalkExtras::default();
+        let (audit, _) = repo_walk(&[r], usize::MAX, has_dot_git, Some(&mut x));
+        assert!(audit.contains(&in_capital_target), "{audit:?}");
+        assert!(
+            !audit.contains(&in_upper_git),
+            "audit skips .GIT: {audit:?}"
+        );
     }
 
-    /// #576 review: two gitdir layouts git accepts that the first bare-repo
-    /// test missed: a `commondir` split, and a `HEAD` that is a dangling
-    /// symlink to `refs/heads/main`.
+    /// #576 review: git directory layouts git accepts: a `commondir` split, a
+    /// `HEAD` that is a dangling symlink to `refs/heads/main`, and `objects`
+    /// and `refs` as regular files (git only `access`es them).
     #[test]
     fn git_dir_layouts_git_accepts_are_recognised() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -4504,6 +4621,13 @@ mod tests {
         std::os::unix::fs::symlink("refs/heads/main", dangling.join("HEAD")).unwrap();
         assert!(has_dot_git_or_is_bare(&dangling), "dangling HEAD symlink");
 
+        let files = root.path().join("files");
+        std::fs::create_dir_all(&files).unwrap();
+        for name in ["HEAD", "objects", "refs"] {
+            std::fs::write(files.join(name), "ref: refs/heads/main\n").unwrap();
+        }
+        assert!(has_dot_git_or_is_bare(&files), "objects and refs as files");
+
         let head_only = root.path().join("head_only");
         std::fs::create_dir_all(&head_only).unwrap();
         std::fs::write(head_only.join("HEAD"), "x").unwrap();
@@ -4513,24 +4637,42 @@ mod tests {
         );
     }
 
-    /// #576 review: a symlink to a repository outside the root is tested when
-    /// the caller asks (session-end check), never descended into, and left
-    /// alone for bubblewrap.
+    /// #576 review: with `extras`, a symlink to a repository outside the root
+    /// is tested and never descended into, and every symlink is recorded,
+    /// dangling ones too. Without, symlinks are invisible (bubblewrap).
     #[test]
-    fn a_symlinked_directory_is_tested_only_when_asked() {
+    fn the_audit_walk_tests_and_records_symlinks() {
         let outside = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(outside.path().join(".git")).unwrap();
         std::fs::create_dir_all(outside.path().join("inner/.git")).unwrap();
         let root = tempfile::tempdir().expect("tempdir");
         let link = root.path().join("tools");
         std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        let dangling = root.path().join("later");
+        std::os::unix::fs::symlink("/nonexistent-cplt", &dangling).unwrap();
 
-        let (repos, _) = repo_walk(&[root.path()], usize::MAX, has_dot_git, true);
-        assert_eq!(repos, vec![link], "tested, not descended into");
-        let (repos, _) = repo_walk(&[root.path()], usize::MAX, has_dot_git, false);
-        assert!(
-            repos.is_empty(),
-            "bubblewrap's walk is unchanged: {repos:?}"
-        );
+        let mut x = WalkExtras::default();
+        let (repos, _) = repo_walk(&[root.path()], usize::MAX, has_dot_git, Some(&mut x));
+        assert_eq!(repos, vec![link.clone()], "tested, not descended into");
+        x.links.sort();
+        assert_eq!(x.links, vec![dangling, link]);
+        let (repos, _) = repo_walk(&[root.path()], usize::MAX, has_dot_git, None);
+        assert!(repos.is_empty(), "{repos:?}");
+    }
+
+    /// #576 review (B2): a directory the walk cannot list is recorded with
+    /// `extras`, so `chmod 311` cannot hide what is below it.
+    #[test]
+    fn the_audit_walk_records_unreadable_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().expect("tempdir");
+        let l2 = root.path().join("l2");
+        std::fs::create_dir_all(l2.join("in/.git")).unwrap();
+        std::fs::set_permissions(&l2, std::fs::Permissions::from_mode(0o311)).unwrap();
+        let mut x = WalkExtras::default();
+        let (repos, _) = repo_walk(&[root.path()], usize::MAX, has_dot_git, Some(&mut x));
+        std::fs::set_permissions(&l2, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(repos.is_empty(), "{repos:?}");
+        assert_eq!(x.unreadable, vec![l2]);
     }
 }

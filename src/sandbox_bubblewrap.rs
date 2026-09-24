@@ -73,7 +73,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::sandbox::landlock_mod::{CredentialLink, FsAccess, FsRule, LandlockPolicy, NetRule};
 use crate::sandbox::policy::{
-    LinuxCoverage, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, Protected, has_dot_git,
+    LinuxCoverage, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, Protected, dot_git_exists,
     reaches_entry_directly, rel_ancestors, repo_walk,
 };
 
@@ -896,7 +896,7 @@ pub(crate) fn nested_repo_roots(roots: &[&Path]) -> (Vec<PathBuf>, bool) {
     /// covers the layouts people actually use, `~/src/<repo>` through
     /// `~/go/src/github.com/<org>/<repo>` when the grant is `~/go/src`.
     const MAX_DEPTH: usize = 3;
-    repo_walk(roots, MAX_DEPTH, has_dot_git, false)
+    repo_walk(roots, MAX_DEPTH, dot_git_exists, None)
 }
 
 /// Project-internal paths re-bound **read-only** when Bubblewrap is active, to

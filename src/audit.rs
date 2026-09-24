@@ -1217,44 +1217,85 @@ impl AuditMode {
 /// dependency trees (`node_modules`, `target`, …) are tested for a `.git` but
 /// not descended into — the same trade the launch walk makes.
 pub struct NestedGit {
-    before: std::collections::BTreeMap<PathBuf, u64>,
+    before: Scan,
+    /// Canonical, so a resolved target can be compared with them.
     roots: Vec<PathBuf>,
-    /// The launch walk stopped at its bound. Kept apart from the end walk's,
-    /// because only a bound hit at the end alone is the session's doing.
-    before_capped: bool,
+}
+
+/// One walk's worth of what [`NestedGit`] compares.
+struct Scan {
+    /// Repository directory -> fingerprint, and the git directories it
+    /// resolves to (for saying when one is outside every root).
+    repos: std::collections::BTreeMap<PathBuf, (u64, Vec<PathBuf>)>,
+    /// Every symlink below the roots -> its `read_link` target.
+    links: std::collections::BTreeMap<PathBuf, PathBuf>,
+    /// Directories the walk could not list.
+    unreadable: BTreeSet<PathBuf>,
+    /// Roots that are a repository themselves. Only a new one is reported:
+    /// the project's own `.git` is the profile's business, not this check's.
+    root_repos: BTreeSet<PathBuf>,
+    /// The walk stopped at its bound. Kept per walk, because only a bound hit
+    /// at the end alone is the session's doing.
+    capped: bool,
 }
 
 impl NestedGit {
     pub fn capture(roots: &[&Path]) -> Self {
-        let (before, before_capped) = scan_nested_git(roots);
+        let roots: Vec<PathBuf> = roots
+            .iter()
+            .map(|r| std::fs::canonicalize(r).unwrap_or_else(|_| r.to_path_buf()))
+            .collect();
         Self {
-            before,
-            roots: roots.iter().map(|r| r.to_path_buf()).collect(),
-            before_capped,
+            before: Scan::of(&roots),
+            roots,
         }
     }
 
-    /// The directories whose `.git` is new (`true`) or changed (`false`), and
-    /// whether the end walk stopped at its bound.
-    pub fn finish(&self) -> (Vec<(PathBuf, bool)>, bool) {
-        let roots: Vec<&Path> = self.roots.iter().map(PathBuf::as_path).collect();
-        let (after, capped) = scan_nested_git(&roots);
-        let found = after
-            .into_iter()
-            .filter_map(|(dir, fp)| match self.before.get(&dir) {
-                None => Some((dir, true)),
-                Some(old) if *old != fp => Some((dir, false)),
-                Some(_) => None,
-            })
-            .collect();
-        (found, capped)
+    fn outside_roots(&self, p: &Path) -> bool {
+        let p = resolve(p);
+        !self.roots.iter().any(|r| p.starts_with(r))
     }
 
     /// `unsettled`: the session left processes running past the settle probe,
     /// so this scan is a snapshot they can still act after.
     pub fn report(&self, unsettled: bool) {
-        let (found, after_capped) = self.finish();
-        if !found.is_empty() {
+        let after = Scan::of(&self.roots);
+        // Agent-chosen names: escaped like every other audit path.
+        let esc = |p: &Path| escape_path(&p.to_string_lossy());
+
+        let mut lines: Vec<String> = Vec::new();
+        for root in after.root_repos.difference(&self.before.root_repos) {
+            lines.push(format!("  new: {}", esc(root)));
+        }
+        for (dir, (fp, gitdirs)) in &after.repos {
+            let what = match self.before.repos.get(dir) {
+                None => "new",
+                Some((old, _)) if old != fp => "changed",
+                Some(_) => continue,
+            };
+            // N3: a `.git` directory that holds a `.git` is reported by the
+            // planted entry, not by the gitdir it was planted in.
+            let named = if dir
+                .file_name()
+                .is_some_and(|n| n.eq_ignore_ascii_case(".git"))
+            {
+                dir.join(".git")
+            } else {
+                dir.clone()
+            };
+            let outside = gitdirs
+                .iter()
+                .find(|g| self.outside_roots(g))
+                .map(|g| {
+                    format!(
+                        " (its git directory is outside the project: {})",
+                        esc(&resolve(g))
+                    )
+                })
+                .unwrap_or_default();
+            lines.push(format!("  {what}: {}{outside}", esc(&named)));
+        }
+        if !lines.is_empty() {
             ui::error(
                 "A git repository was created or changed below the project during this \
                  session (a .git, or a bare-repository layout). Git run in these directories \
@@ -1263,19 +1304,62 @@ impl NestedGit {
                  or cd there with a git-aware shell prompt, until you have checked the .git \
                  and its config:",
             );
-            for (dir, new) in &found {
-                let what = if *new { "new" } else { "changed" };
-                // Agent-chosen names: escaped like every other audit path.
-                ui::error(&format!(
-                    "  {what}: {}",
-                    escape_path(&dir.to_string_lossy())
-                ));
+            for l in &lines {
+                ui::error(l);
             }
         }
+
+        // B1: a symlink out of the project can be armed later, from outside
+        // this project's sandbox, so it is reported whatever is there now.
+        let links: Vec<String> = after
+            .links
+            .iter()
+            .filter(|(link, target)| self.before.links.get(*link) != Some(*target))
+            .filter(|(link, target)| {
+                self.outside_roots(&link.parent().unwrap_or(link).join(target))
+            })
+            .map(|(link, target)| format!("  {} -> {}", esc(link), esc(target)))
+            .collect();
+        if !links.is_empty() {
+            ui::error(
+                "This session created or re-aimed symlinks that lead out of the project. \
+                 Git run through one obeys whatever repository is at the other end, now or \
+                 later, and nothing here watches that end. Check them before running git \
+                 below them:",
+            );
+            for l in &links {
+                ui::error(l);
+            }
+        }
+
+        // B2: `chmod` hides a directory's contents from the walk.
+        let (new_unreadable, old_unreadable): (Vec<&PathBuf>, Vec<&PathBuf>) = after
+            .unreadable
+            .iter()
+            .partition(|d| !self.before.unreadable.contains(*d));
+        if !new_unreadable.is_empty() {
+            ui::error(
+                "The .git check could not list these directories, which were readable at \
+                 launch or are new, so nothing below them was checked. Do not run git below \
+                 them until you have looked yourself:",
+            );
+            for d in &new_unreadable {
+                ui::error(&format!("  {}", esc(d)));
+            }
+        }
+        if !old_unreadable.is_empty() {
+            ui::warn(&format!(
+                "The .git check could not list {} directories that were unreadable at \
+                 launch too, so nothing below them was checked (first: {}).",
+                old_unreadable.len(),
+                esc(old_unreadable[0])
+            ));
+        }
+
         // The walk goes level by level in name order, so what a stop leaves
         // unchecked is everything deeper and every later name on its level.
         let limit = sandbox::NESTED_SCAN_LIMIT;
-        if after_capped && !self.before_capped {
+        if after.capped && !self.before.capped {
             // Under the bound at launch and over it now: the session made the
             // directories, which is exactly how a plant would be hidden.
             ui::error(&format!(
@@ -1286,7 +1370,7 @@ impl NestedGit {
                  run git in the project until you have looked for new .git entries and \
                  bare repositories yourself."
             ));
-        } else if after_capped || self.before_capped {
+        } else if after.capped || self.before.capped {
             ui::warn(&format!(
                 "Stopped checking for new .git entries after {limit} directories, so \
                  directories the check did not reach (anything deeper, and later names \
@@ -1302,22 +1386,62 @@ impl NestedGit {
     }
 }
 
-fn scan_nested_git(roots: &[&Path]) -> (std::collections::BTreeMap<PathBuf, u64>, bool) {
-    let (repos, capped) =
-        sandbox::repo_walk(roots, usize::MAX, sandbox::has_dot_git_or_is_bare, true);
-    let map = repos
-        .into_iter()
-        .map(|dir| {
-            let fp = git_fingerprint(&dir);
-            (dir, fp)
-        })
-        .collect();
-    (map, capped)
+impl Scan {
+    fn of(roots: &[PathBuf]) -> Self {
+        let roots: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
+        let mut x = sandbox::WalkExtras::default();
+        let (repos, capped) = sandbox::repo_walk(
+            &roots,
+            usize::MAX,
+            sandbox::has_dot_git_or_is_bare,
+            Some(&mut x),
+        );
+        Self {
+            repos: repos
+                .into_iter()
+                .map(|dir| {
+                    let fp = git_fingerprint(&dir);
+                    (dir, fp)
+                })
+                .collect(),
+            links: x
+                .links
+                .into_iter()
+                .filter_map(|l| Some((std::fs::read_link(&l).ok()?, l)))
+                .map(|(t, l)| (l, t))
+                .collect(),
+            unreadable: x.unreadable.into_iter().collect(),
+            root_repos: roots
+                .iter()
+                .filter(|r| sandbox::has_dot_git_or_is_bare(r))
+                .map(|r| r.to_path_buf())
+                .collect(),
+            capped,
+        }
+    }
+}
+
+/// `p` with every symlink resolved, or, when it does not exist, with `.` and
+/// `..` resolved by name: where a dangling link would lead once armed.
+fn resolve(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| {
+        let mut out = PathBuf::new();
+        for c in p.components() {
+            match c {
+                std::path::Component::ParentDir => {
+                    out.pop();
+                }
+                std::path::Component::CurDir => {}
+                c => out.push(c),
+            }
+        }
+        out
+    })
 }
 
 /// A hash of everything about a `.git` entry that decides what git run there
-/// would execute. See [`NestedGit`].
-fn git_fingerprint(dir: &Path) -> u64 {
+/// would execute, and the git directories it reads. See [`NestedGit`].
+fn git_fingerprint(dir: &Path) -> (u64, Vec<PathBuf>) {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     // `dir` itself may be a symlink to a repository elsewhere (#576 review).
@@ -1351,12 +1475,14 @@ fn git_fingerprint(dir: &Path) -> u64 {
         }
     };
     hash_gitdir(&gitdir, &mut h);
+    let mut gitdirs = vec![gitdir.clone()];
     // `commondir` makes git read a second gitdir's config and hooks.
     if let Some((_, c, _)) = read_small(&gitdir.join("commondir")) {
         let common = gitdir.join(String::from_utf8_lossy(&c).trim());
         hash_gitdir(&common, &mut h);
+        gitdirs.push(common);
     }
-    h.finish()
+    (h.finish(), gitdirs)
 }
 
 fn hash_gitdir(gitdir: &Path, h: &mut impl std::hash::Hasher) {
