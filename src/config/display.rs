@@ -558,6 +558,27 @@ pub fn display_config(loaded: Option<&LoadedConfig>, local: Option<&LoadedConfig
             src("sandbox", "allow_build_credentials", build_credentials)
         );
     }
+    let allow_git_worktrees = c.sandbox.allow_git_worktrees.unwrap_or(false);
+    println!(
+        "{blue}[cplt]{nc}    allow_git_worktrees   = {}{}",
+        allow_git_worktrees,
+        src(
+            "sandbox",
+            "allow_git_worktrees",
+            c.sandbox.allow_git_worktrees.is_some()
+        )
+    );
+    println!(
+        "{blue}[cplt]{nc}    worktree_walk_max_dirs = {}{}",
+        c.sandbox
+            .worktree_walk_max_dirs
+            .unwrap_or(crate::worktrees::DEFAULT_WALK_MAX_DIRS as u64),
+        src(
+            "sandbox",
+            "worktree_walk_max_dirs",
+            c.sandbox.worktree_walk_max_dirs.is_some()
+        )
+    );
     // The brief and its AGENTS.md layer had no rows at all, so a user who set
     // `sandbox.brief = true` saw nothing here and had to reach for
     // `config get` to confirm it. A key that changes behaviour and is absent

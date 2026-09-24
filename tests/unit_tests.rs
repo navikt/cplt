@@ -808,6 +808,7 @@ fn landlock_policy_device_files_have_ioctl() {
         extra_deny: &[],
         named_roots: &[],
         named_root_git_dirs: &[],
+        managed_worktree_root: None,
         existing_home_tool_dirs: None,
         existing_app_dirs: None,
         extra_ports: &[],
@@ -2278,6 +2279,7 @@ fn a_named_root_is_granted_read_write_and_execute() {
         &SandboxConfig {
             named_roots: &named,
             named_root_git_dirs: &[],
+            managed_worktree_root: None,
             ..base_profile_options()
         },
         &[],
@@ -2297,6 +2299,37 @@ fn a_named_root_is_granted_read_write_and_execute() {
     );
 }
 
+/// #531: the managed worktree root section, with the `.git` create denies of
+/// the #574 re-review, appears only when the root is set.
+#[test]
+fn the_managed_worktree_root_section_is_emitted_only_when_set() {
+    let root = PathBuf::from("/Users/test/.cplt-worktrees/ab");
+    let named = [root.clone()];
+    let profile = |managed: Option<&std::path::Path>| {
+        generate_profile(
+            &SandboxConfig {
+                named_roots: &named,
+                named_root_git_dirs: &[],
+                managed_worktree_root: managed,
+                ..base_profile_options()
+            },
+            &[],
+        )
+    };
+    let off = profile(None);
+    assert!(!off.contains("Managed worktree root"), "{off}");
+    assert!(!off.contains("file-write-create"), "{off}");
+    let on = profile(Some(&root));
+    for rule in [
+        "(deny file-write-unlink (regex #\"^/Users/test/\\.cplt-worktrees/ab$\"))",
+        // Case-blind (#574 review): APFS opens `.GIT` for `.git`.
+        "(deny file-write-create (regex #\"^/Users/test/\\.cplt-worktrees/ab/\\.[gG][iI][tT]$\"))",
+        "(deny file-write-create (regex #\"^/Users/test/\\.cplt-worktrees/ab/[^/]+/.+/\\.[gG][iI][tT]$\"))",
+    ] {
+        assert!(on.contains(rule), "missing {rule}\n{on}");
+    }
+}
+
 /// The protected-path tables are emitted per writable root. A named root that
 /// did not join that set would be a repository whose `.git/hooks` the agent
 /// could write — and hooks run OUTSIDE the sandbox on the user's next git
@@ -2308,6 +2341,7 @@ fn a_named_root_carries_the_protected_paths() {
         &SandboxConfig {
             named_roots: &named,
             named_root_git_dirs: &[],
+            managed_worktree_root: None,
             ..base_profile_options()
         },
         &[],
@@ -2333,6 +2367,7 @@ fn an_allow_write_over_a_named_roots_parent_does_not_take_its_execute_back() {
         &SandboxConfig {
             named_roots: &named,
             named_root_git_dirs: &[],
+            managed_worktree_root: None,
             extra_write: &write,
             ..base_profile_options()
         },
@@ -2359,6 +2394,7 @@ fn the_landlock_model_grants_a_named_root_the_project_access() {
     let policy = generate_policy(&SandboxConfig {
         named_roots: &named,
         named_root_git_dirs: &[],
+        managed_worktree_root: None,
         ..base_profile_options()
     });
     let rule = policy
@@ -2385,6 +2421,7 @@ fn a_named_roots_shared_gitdir_is_granted() {
         &SandboxConfig {
             named_roots: &named,
             named_root_git_dirs: &gitdirs,
+            managed_worktree_root: None,
             ..base_profile_options()
         },
         &[],
@@ -2399,6 +2436,7 @@ fn a_named_roots_shared_gitdir_is_granted() {
     let policy = generate_policy(&SandboxConfig {
         named_roots: &named,
         named_root_git_dirs: &gitdirs,
+        managed_worktree_root: None,
         ..base_profile_options()
     });
     let rule = policy
@@ -2426,6 +2464,7 @@ fn base_profile_options() -> SandboxConfig<'static> {
         extra_deny: &[],
         named_roots: &[],
         named_root_git_dirs: &[],
+        managed_worktree_root: None,
         existing_home_tool_dirs: None,
         existing_app_dirs: None,
         extra_ports: &[],
@@ -3861,6 +3900,7 @@ fn allow_localhost_any_affects_both_backends() {
         extra_deny: &[],
         named_roots: &[],
         named_root_git_dirs: &[],
+        managed_worktree_root: None,
         existing_home_tool_dirs: None,
         existing_app_dirs: None,
         extra_ports: &[],
@@ -3924,6 +3964,7 @@ fn config_options_parity_across_backends() {
         extra_deny: &[],
         named_roots: &[],
         named_root_git_dirs: &[],
+        managed_worktree_root: None,
         existing_home_tool_dirs: None,
         existing_app_dirs: None,
         extra_ports: &ports,
@@ -6674,6 +6715,7 @@ fn profile_gpg_signing_deny_path_wins() {
             extra_deny: &deny,
             named_roots: &[],
             named_root_git_dirs: &[],
+            managed_worktree_root: None,
             allow_gpg_signing: true,
             ..base_profile_options()
         },
@@ -7709,6 +7751,7 @@ fn profile_docker_withholds_the_overlapping_reallow() {
             extra_deny: &[std::path::PathBuf::from("/Users/test/.docker")],
             named_roots: &[],
             named_root_git_dirs: &[],
+            managed_worktree_root: None,
             allow_docker: true,
             ..base_profile_options()
         },
@@ -7895,6 +7938,7 @@ fn profile_socket_skipped_when_deny_path_overlaps() {
             extra_deny: &[std::path::PathBuf::from("/Users/test/.codex")],
             named_roots: &[],
             named_root_git_dirs: &[],
+            managed_worktree_root: None,
             ..base_profile_options()
         },
         &[],
@@ -9258,6 +9302,8 @@ allow_cache_exec_any = false
 allow_browser = false
 keychain_substitute = false
 allow_build_credentials = false
+allow_git_worktrees = false
+worktree_walk_max_dirs = 100000
 git_push_prevention = false
 
 [gh_guard]
@@ -9705,6 +9751,7 @@ fn landlock_relocated_cargo_bin_is_exec_only_and_registry_is_precreated() {
         extra_deny: &[],
         named_roots: &[],
         named_root_git_dirs: &[],
+        managed_worktree_root: None,
         existing_home_tool_dirs: Some(&dirs),
         existing_app_dirs: None,
         extra_ports: &[],

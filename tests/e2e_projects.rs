@@ -4458,4 +4458,375 @@ fi
         assert_result_ok(&stdout, &stderr, "tcp_ipv6_bind");
         assert_result_ok(&stdout, &stderr, "tcp_wildcard_bind");
     }
+
+    // ============================================================
+    // Managed worktree root (sandbox.allow_git_worktrees, #531)
+    // ============================================================
+
+    /// Run `cplt exec` of a script inside `project`, with `home` as HOME and
+    /// `config` as the config file. The script lives in the project: nothing
+    /// else is executable in the sandbox.
+    fn run_exec_with_home(
+        project: &TempProject,
+        home: &Path,
+        config: &str,
+        script: &str,
+    ) -> (String, String, bool) {
+        let cfg = home.join("cplt.toml");
+        fs::write(&cfg, config).expect("write config");
+        project.write_file(".t/run.sh", &format!("#!/bin/sh\n{script}"));
+        let run = project.canonical_path().join(".t/run.sh");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&run, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let output = cplt_cmd()
+            .current_dir(project.canonical_path())
+            .env("HOME", home)
+            .env("CPLT_CONFIG", &cfg)
+            .args(["--no-quiet", "exec", "--"])
+            .arg(&run)
+            .output()
+            .expect("cplt should run");
+        (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            output.status.success(),
+        )
+    }
+
+    /// The root this repository gets under `home`, and a sibling root standing
+    /// in for another repository's, pre-populated with a file and a script.
+    fn managed_paths(project: &TempProject, home: &Path) -> (PathBuf, PathBuf) {
+        let common = fs::canonicalize(project.path().join(".git")).unwrap();
+        let base = fs::canonicalize(home).unwrap().join(".cplt-worktrees");
+        let other = base.join("0".repeat(32));
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("f"), "secret\n").unwrap();
+        fs::write(other.join("x.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(other.join("x.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        (base.join(cplt::worktrees::fingerprint(&common)), other)
+    }
+
+    const PROBE: &str = r##"
+P="$PWD"
+R="$CPLT_WORKTREE_ROOT"
+r(){ if eval "$2" >/dev/null 2>&1; then echo "RESULT:$1:OK"; else echo "RESULT:$1:FAIL"; fi; }
+r env '[ -n "$R" ]'
+r add_a 'git worktree add -q "$R/a" -b a'
+r add_b 'git worktree add -q "$R/b" -b b'
+r write 'echo x > "$R/a/new.txt"'
+r commit 'cd "$R/a" && git add new.txt && git -c user.name=t -c user.email=t@e -c commit.gpgsign=false commit -qm m'
+r status 'git -C "$R/b" status --porcelain'
+r exec 'printf "#!/bin/sh\nexit 0\n" > "$R/b/t.sh" && chmod +x "$R/b/t.sh" && "$R/b/t.sh"'
+r hook 'echo h > "$P/.git/hooks/pre-commit"'
+r gitconfig 'echo "[x]" >> "$P/.git/config"'
+r wtconfig 'echo "[core]" > "$P/.git/worktrees/a/config.worktree"'
+r ghhook 'mkdir -p "$R/a/.github/hooks" && echo {} > "$R/a/.github/hooks/x.json"'
+r cplttoml 'echo x > "$R/a/.cplt.toml"'
+r claude 'mkdir -p "$R/a/.claude" && echo {} > "$R/a/.claude/settings.json"'
+r pointer 'echo "gitdir: /tmp" > "$R/a/.git"'
+r ghrename 'mkdir -p "$R/a/.github/workflows" && mv "$R/a/.github" "$R/a/.gh2"'
+r commondir 'mkdir -p "$R/x" && echo "$R/x" > "$P/.git/worktrees/a/commondir"'
+r root_mv 'mv "$R" "$P/moved"'
+mkdir -p "$R/a/f" "$R/a/l" "$R/a/d" "$R/a/m" "$R/g"
+echo "gitdir: $R/g" > "$R/gp"
+r nested_file 'echo "gitdir: $R/g" > "$R/a/f/.git"'
+r nested_link 'ln -s "$R/gp" "$R/a/l/.git"'
+r nested_mkdir 'mkdir "$R/a/d/.git"'
+r nested_mv 'mv "$R/gp" "$R/a/m/.git"'
+r root_git 'echo "gitdir: $R/g" > "$R/.git"'
+r root_git_mkdir 'mkdir "$R/.git"'
+r root_git_link 'ln -s "$R/g" "$R/.git"'
+r nested_upper 'mkdir "$R/a/d/.GIT"'
+r root_git_upper 'mkdir "$R/.Git"'
+r wt_remove 'git worktree remove --force "$R/b"'
+"##;
+
+    /// With the key on, the agent can create two worktrees under
+    /// `$CPLT_WORKTREE_ROOT`, commit and run code in them, and the shared-gitdir
+    /// and in-worktree persistence denies still hold. Another repository's
+    /// root beside it, and the parent that holds both, stay closed.
+    #[test]
+    fn managed_worktree_root_is_usable_and_scoped() {
+        require_sandbox!();
+        let project = TempProject::new("wt-on");
+        project.write_file("f.txt", "x\n");
+        project.git_init();
+        let home = TempProject::new("wt-on-home");
+        let (root, other) = managed_paths(&project, home.path());
+        let other_s = other.display().to_string();
+        let base_s = other.parent().unwrap().display().to_string();
+        let script = format!(
+            r#"{PROBE}
+r sib_read 'cat "{other_s}/f"'
+r sib_write 'echo y > "{other_s}/g"'
+r sib_exec '"{other_s}/x.sh"'
+r base_list 'ls "{base_s}"'
+r base_mkdir 'mkdir "{base_s}/new"'
+echo "ROOT:$R"
+"#
+        );
+        let (stdout, stderr, _) = run_exec_with_home(
+            &project,
+            home.path(),
+            "[sandbox]\nallow_git_worktrees = true\n",
+            &script,
+        );
+        assert!(
+            stdout.contains(&format!("ROOT:{}", root.display())),
+            "CPLT_WORKTREE_ROOT names this repository's root.\n{stdout}\n{stderr}"
+        );
+        for ok in ["env", "add_a", "add_b", "write", "commit", "status", "exec"] {
+            assert_result_ok(&stdout, &stderr, ok);
+        }
+        for denied in [
+            "hook",
+            "gitconfig",
+            "wtconfig",
+            "ghhook",
+            "cplttoml",
+            "claude",
+            "pointer",
+            "ghrename",
+            "commondir",
+            "root_mv",
+            "nested_file",
+            "nested_link",
+            "nested_mkdir",
+            "nested_mv",
+            "root_git",
+            "root_git_mkdir",
+            "root_git_link",
+            "nested_upper",
+            "root_git_upper",
+            // The nested-gitdir rules deny unlinking `<root>/<name>/.git`, so
+            // removal has to happen outside cplt.
+            "wt_remove",
+            "sib_read",
+            "sib_write",
+            "sib_exec",
+            "base_list",
+            "base_mkdir",
+        ] {
+            assert_result_fail(&stdout, denied);
+        }
+        // Nothing is removed on exit: the work outlives the session.
+        assert!(root.join("a/new.txt").is_file(), "worktree persists");
+        assert!(
+            stderr.contains("does not cover worktrees under"),
+            "{stderr}"
+        );
+    }
+
+    /// Off (the default): no variable, no root created, and a root left by an
+    /// earlier session is not reachable.
+    #[test]
+    fn managed_worktree_root_is_absent_when_off() {
+        require_sandbox!();
+        let project = TempProject::new("wt-off");
+        project.write_file("f.txt", "x\n");
+        project.git_init();
+        let home = TempProject::new("wt-off-home");
+        let (root, _) = managed_paths(&project, home.path());
+        let root_s = root.display().to_string();
+        let script = format!(
+            r#"
+if [ -z "$CPLT_WORKTREE_ROOT" ]; then echo RESULT:unset:OK; else echo RESULT:unset:FAIL; fi
+if [ -e "{root_s}" ]; then echo RESULT:created:OK; else echo RESULT:created:FAIL; fi
+"#
+        );
+        let (stdout, stderr, _) = run_exec_with_home(&project, home.path(), "", &script);
+        assert_result_ok(&stdout, &stderr, "unset");
+        assert_result_fail(&stdout, "created");
+        assert!(!root.exists(), "the key off creates nothing");
+
+        // A root from an earlier session: still closed.
+        fs::create_dir_all(&root).unwrap();
+        let script = format!(
+            r#"
+if echo y > "{root_s}/g" 2>/dev/null; then echo RESULT:write:OK; else echo RESULT:write:FAIL; fi
+"#
+        );
+        let (stdout, _, _) = run_exec_with_home(&project, home.path(), "", &script);
+        assert_result_fail(&stdout, "write");
+    }
+
+    /// The walk-arounds the kernel does not stop are named loudly when the
+    /// session ends, with the directory not to run git in, and the next launch
+    /// refuses to start: a recreated `.git` pointer naming a gitdir inside the
+    /// root, a `commondir` unlinked and written again, an admin dir added
+    /// mid-session, and a `.git` pointer or symlink below a worktree, moved in
+    /// inside a directory built at depth one (creating it in place is denied,
+    /// see `managed_worktree_root_is_usable_and_scoped`).
+    ///
+    /// `<root>/.git` cannot be made from inside at all, so it is planted from
+    /// the host between sessions (`host`), and only the refusal is checked.
+    #[test]
+    fn managed_worktree_links_are_checked_at_exit_and_launch() {
+        require_sandbox!();
+        let config = "[sandbox]\nallow_git_worktrees = true\n";
+        for (name, attack, dir, host) in [
+            (
+                "pointer",
+                r#"mv "$R/a" "$R/a.old" && mkdir -p "$R/a" "$R/g" && printf 'gitdir: %s\n' "$R/g" > "$R/a/.git""#,
+                "a",
+                false,
+            ),
+            (
+                "commondir",
+                r#"mkdir -p "$R/x" && rm "$P/.git/worktrees/a/commondir" && echo "$R/x" > "$P/.git/worktrees/a/commondir""#,
+                "a",
+                false,
+            ),
+            (
+                "admin",
+                r#"mkdir -p "$R/x" "$P/.git/worktrees/evil" && echo "$R/x" > "$P/.git/worktrees/evil/commondir""#,
+                "",
+                false,
+            ),
+            (
+                "nested",
+                r#"mkdir -p "$R/g" "$R/s" && printf 'gitdir: %s\n' "$R/g" > "$R/s/.git" && mv "$R/s" "$R/a/sub""#,
+                "a/sub",
+                false,
+            ),
+            (
+                "nested_link",
+                r#"mkdir -p "$R/g" "$R/s" && printf 'gitdir: %s\n' "$R/g" > "$R/gp" && ln -s "$R/gp" "$R/s/.git" && mv "$R/s" "$R/a/sub2""#,
+                "a/sub2",
+                false,
+            ),
+            // #577 review (c): staged outside the root, so the create deny
+            // only ever sees `sub3` itself arrive.
+            (
+                "staged",
+                r#"mkdir -p "$P/st/sub/.git" && mv "$P/st/sub" "$R/a/sub3""#,
+                "a/sub3",
+                false,
+            ),
+            // #577 review (a): a symlink out of the root to a repository.
+            (
+                "dir_link",
+                r#"mkdir -p "$P/ev/objects" "$P/ev/refs" && echo "ref: refs/heads/m" > "$P/ev/HEAD" && ln -s "$P/ev" "$R/a/tools""#,
+                "a",
+                false,
+            ),
+            ("root", "true", "", true),
+        ] {
+            let project = TempProject::new(&format!("wt-links-{name}"));
+            project.write_file("f.txt", "x\n");
+            project.git_init();
+            let home = TempProject::new(&format!("wt-links-{name}-home"));
+            let (root, _) = managed_paths(&project, home.path());
+            let script = format!(
+                "P=\"$PWD\"\nR=\"$CPLT_WORKTREE_ROOT\"\ngit worktree add -q \"$R/a\" -b a \
+                 && {attack} && echo RESULT:attack:OK\n"
+            );
+            let (stdout, stderr, _) = run_exec_with_home(&project, home.path(), config, &script);
+            assert_result_ok(&stdout, &stderr, "attack");
+            let dir = if dir.is_empty() {
+                root.clone()
+            } else {
+                root.join(dir)
+            };
+            if host {
+                fs::create_dir_all(root.join("g")).unwrap();
+                fs::write(
+                    root.join(".git"),
+                    format!("gitdir: {}\n", root.join("g").display()),
+                )
+                .unwrap();
+            } else {
+                assert!(
+                    stderr.contains("WORKTREE LINKS CHANGED")
+                        && stderr.contains("Do not run git in these directories")
+                        && stderr.contains(&format!("\n    {}\n", dir.display())),
+                    "{name}: the session end names it and {}.\n{stderr}",
+                    dir.display()
+                );
+            }
+            let (stdout, stderr, ok) =
+                run_exec_with_home(&project, home.path(), config, "echo RESULT:ran:OK\n");
+            assert!(!ok, "{name}: next launch must fail.\n{stdout}\n{stderr}");
+            assert!(!stdout.contains("RESULT:ran"), "{stdout}");
+            assert!(
+                stderr.contains("worktree links")
+                    && stderr.contains(&format!("\n    {}\n", dir.display())),
+                "{name}: {stderr}"
+            );
+            // Key off: the root is not granted, so the launch runs, but the
+            // planted link is still named.
+            let (stdout, stderr, _) =
+                run_exec_with_home(&project, home.path(), "", "echo RESULT:off:OK\n");
+            assert_result_ok(&stdout, &stderr, "off");
+            assert!(
+                stderr.contains("allow_git_worktrees is off, but the worktree root")
+                    && stderr.contains(&format!("\n    {}\n", dir.display())),
+                "{name}: key off still names it.\n{stderr}"
+            );
+        }
+    }
+
+    /// A symlink in place of the root fails the launch before anything runs,
+    /// instead of granting whatever the link points at.
+    #[test]
+    fn managed_worktree_root_refuses_a_symlink() {
+        require_sandbox!();
+        let project = TempProject::new("wt-link");
+        project.write_file("f.txt", "x\n");
+        project.git_init();
+        let home = TempProject::new("wt-link-home");
+        let (root, other) = managed_paths(&project, home.path());
+        std::os::unix::fs::symlink(&other, &root).unwrap();
+        let (stdout, stderr, ok) = run_exec_with_home(
+            &project,
+            home.path(),
+            "[sandbox]\nallow_git_worktrees = true\n",
+            "echo RESULT:ran:OK\n",
+        );
+        assert!(!ok, "launch must fail.\n{stdout}\n{stderr}");
+        assert!(!stdout.contains("RESULT:ran"), "{stdout}");
+        assert!(
+            stderr.contains("allow_git_worktrees") && stderr.contains("symlink"),
+            "{stderr}"
+        );
+    }
+
+    /// #574 round 8: with the key off, the session can rewrite a worktree's
+    /// `commondir` in place (only the key-on profile denies it, and the
+    /// key-off profile stays as on main). The session-end check still runs
+    /// whenever the root exists, and names the worktree.
+    #[test]
+    fn a_key_off_session_is_checked_at_its_end() {
+        require_sandbox!();
+        let project = TempProject::new("wt-offend");
+        project.write_file("f.txt", "x\n");
+        project.git_init();
+        let home = TempProject::new("wt-offend-home");
+        let (root, _) = managed_paths(&project, home.path());
+        let (stdout, stderr, _) = run_exec_with_home(
+            &project,
+            home.path(),
+            "[sandbox]\nallow_git_worktrees = true\n",
+            "git worktree add -q \"$CPLT_WORKTREE_ROOT/a\" -b a && echo RESULT:add:OK\n",
+        );
+        assert_result_ok(&stdout, &stderr, "add");
+        assert!(!stderr.contains("WORKTREE LINKS CHANGED"), "{stderr}");
+
+        let script = format!(
+            "echo \"{}/x\" > \"$PWD/.git/worktrees/a/commondir\" && echo RESULT:rewrite:OK\n",
+            root.display()
+        );
+        let (stdout, stderr, _) = run_exec_with_home(&project, home.path(), "", &script);
+        assert_result_ok(&stdout, &stderr, "rewrite");
+        assert!(
+            stderr.contains("WORKTREE LINKS CHANGED")
+                && stderr.contains(&format!("\n    {}\n", root.join("a").display())),
+            "the key-off session end names the worktree.\n{stderr}"
+        );
+    }
 }

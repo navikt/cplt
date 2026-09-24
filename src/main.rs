@@ -1771,8 +1771,153 @@ struct ResolvedContext {
     /// launch one, from `--repo-dir` and `sandbox.repo_dirs` in the per-repo
     /// local config. Empty unless one of the two named something.
     repo_roots: Vec<RepoRoot>,
+    /// `sandbox.allow_git_worktrees` (#531): this repository's managed
+    /// worktree root, created and validated. `None` when the key is off.
+    worktree_root: Option<PathBuf>,
     active_agent: agent::Agent,
     unapproved_proposals: Vec<String>,
+}
+
+/// The project-grade roots the sandbox policy grants besides the project: the
+/// named repositories plus, when enabled, the managed worktree root (#531).
+///
+/// Policy input only. The worktree root is not a repository, so it stays out
+/// of everything that treats `repo_paths` as repository identities: the gh
+/// scope, the audit, the startup table and the brief's repository list.
+fn policy_roots(repo_paths: &[PathBuf], worktree_root: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots = repo_paths.to_vec();
+    roots.extend(worktree_root.map(Path::to_path_buf));
+    roots
+}
+
+/// Say that the audit just printed did not look at the managed worktrees.
+///
+/// Per-worktree reporting is deferred (#531). Until it exists, an audit that
+/// reads "no changes" while sub-agents committed in their worktrees would be a
+/// report of success that ignored their work, so the gap is stated every time.
+///
+/// The worktree links are checked here too, audit or not: the session could
+/// have left a `commondir` or `.git` pointer that makes git on the host read
+/// agent-written config, and this is the last moment cplt can say so.
+///
+/// It runs after `audit::run` returns: after the settle probe's wait when the
+/// audit or `--observe-domains` is on, else as soon as the direct child exits.
+/// A background descendant that outlives that can still change the root
+/// afterwards. cplt does not kill the tree (see `audit::SettleProbe` on why no
+/// process group); the next launch runs the same check before it starts.
+fn warn_worktrees_not_audited(
+    audit_enabled: bool,
+    worktree_root: Option<&Path>,
+    home_dir: &Path,
+    project_dir: &Path,
+    max_dirs: usize,
+) {
+    // Key off: a root an earlier session left is still checked, report only.
+    // The session could not write into it, but it could rewrite `commondir`
+    // in place, which only the key-on profile denies.
+    let problems = match worktree_root {
+        Some(root) => cplt::worktrees::session_end_problems(project_dir, root, max_dirs),
+        None => cplt::worktrees::existing_root_problems(home_dir, project_dir, max_dirs),
+    };
+    if !problems.is_empty() {
+        let dirs = cplt::worktrees::problem_dirs(&problems);
+        let details: Vec<String> = problems.iter().map(ToString::to_string).collect();
+        ui::error(&format!(
+            "WORKTREE LINKS CHANGED. Do not run git in these directories until this is \
+             fixed:\n    {}\n  git there would follow a link the agent wrote and could run \
+             agent-written config on this machine. Found:\n    {}\n  The next cplt launch \
+             with sandbox.allow_git_worktrees on refuses to start until they are fixed; with \
+             it off, the launch repeats this error.",
+            dirs.join("\n    "),
+            details.join("\n    ")
+        ));
+    }
+    if let (true, Some(root)) = (audit_enabled, worktree_root) {
+        ui::warn(&format!(
+            "The audit above does not cover worktrees under {}. Review them there \
+             (`git worktree list` from this repository).",
+            root.display()
+        ));
+    }
+}
+
+/// Resolve `sandbox.allow_git_worktrees` into a root, or fail the launch.
+///
+/// Fails rather than skipping: a user who turned the key on and gets a session
+/// without the root would find out only when a sub-agent's `git worktree add`
+/// is refused, with nothing pointing back here. The one exception is a launch
+/// outside any repository with the key set globally: there is no repository to
+/// give a root to, and failing would break every such launch. That warns and
+/// runs without the root. A key in this checkout's local config still fails.
+///
+/// `create` is false for `doctor` and `check`, which must not create the root.
+/// `os` is `std::env::consts::OS`, passed in so the refusal off macOS is
+/// tested on every host.
+fn managed_worktree_root(
+    enabled: bool,
+    from_local: bool,
+    create: bool,
+    home_dir: &Path,
+    project_dir: &Path,
+    os: &str,
+    max_dirs: usize,
+) -> anyhow::Result<Option<PathBuf>> {
+    if !enabled {
+        // A root left by an earlier session is still checked: git on the
+        // host follows a planted link whether or not the key is on. Reported,
+        // not fatal, since this session grants nothing there.
+        if let Some(base) = cplt::worktrees::stray_base(home_dir) {
+            ui::warn(&format!(
+                "{} is not a directory, so there are no managed worktrees to check. Remove \
+                 it if you did not put it there.",
+                base.display()
+            ));
+        }
+        let problems = cplt::worktrees::existing_root_problems(home_dir, project_dir, max_dirs);
+        if !problems.is_empty() {
+            ui::error(&format!(
+                "sandbox.allow_git_worktrees is off, but the worktree root an earlier session \
+                 left has links that do not match what git writes. Do not run git in these \
+                 directories until this is fixed:\n    {}\n  Found:\n    {}\n  Inspect them \
+                 without git and remove the worktrees involved (delete the directories, then \
+                 run `git worktree prune` from this repository)",
+                cplt::worktrees::problem_dirs(&problems).join("\n    "),
+                problems
+                    .iter()
+                    .map(|p| p.detail.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n    ")
+            ));
+        }
+        return Ok(None);
+    }
+    let fail = |e: String| {
+        anyhow::anyhow!(
+            "sandbox.allow_git_worktrees is on, but the managed worktree root cannot be \
+             granted: {e}.\n  Fix the cause, or turn the key off \
+             (`cplt config set sandbox.allow_git_worktrees false`)."
+        )
+    };
+    let not_in_repo = || format!("{} is not in a git repository", project_dir.display());
+    // Not in a repository, key from global config: nothing to grant.
+    if !from_local
+        && matches!(
+            cplt::worktrees::repository_common_dir(project_dir),
+            Ok(None)
+        )
+    {
+        ui::warn(&format!(
+            "sandbox.allow_git_worktrees is on, but {}. Running without a worktree root.",
+            not_in_repo()
+        ));
+        return Ok(None);
+    }
+    cplt::worktrees::refuse_unsupported_os(os).map_err(fail)?;
+    match cplt::worktrees::prepare_root(home_dir, project_dir, create, max_dirs) {
+        Ok(Some(root)) => Ok(Some(root)),
+        Ok(None) => Err(fail(not_in_repo())),
+        Err(e) => Err(fail(e)),
+    }
 }
 
 /// Warn when the binary cplt is about to launch is a shim whose real target the
@@ -2733,6 +2878,36 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         project_dir.clone()
     };
 
+    let worktree_key_is_local = local_cfg
+        .as_ref()
+        .and_then(|l| l.config.sandbox.allow_git_worktrees)
+        .is_some();
+    let worktree_root = managed_worktree_root(
+        resolved.allow_git_worktrees,
+        worktree_key_is_local,
+        !(check_mode || cli.doctor || cli.print_profile),
+        &home_dir,
+        &project_dir,
+        std::env::consts::OS,
+        resolved.worktree_walk_max_dirs,
+    )?;
+    // Same confused deputy as the named-root check above: the managed root is
+    // agent-writable, so a config file inside it is one the agent could rewrite.
+    if let (Some(root), Some(custom)) = (
+        worktree_root.as_deref(),
+        std::env::var("CPLT_CONFIG").ok().filter(|s| !s.is_empty()),
+    ) && let config::CustomConfigVerdict::InsideProject(p) =
+        config::classify_custom_config(&config::expand_tilde(&custom), &home_dir, root)
+    {
+        bail!(
+            "CPLT_CONFIG points inside the managed worktree root:\n  {}\n  \
+             {} is granted read, write and execute, so that file is content the agent can \
+             rewrite. Refusing. Move the config file elsewhere.",
+            p.display(),
+            root.display()
+        );
+    }
+
     Ok(ResolvedContext {
         resolved,
         config_path,
@@ -2740,6 +2915,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         project_dir,
         launch_dir,
         repo_roots,
+        worktree_root,
         active_agent,
         unapproved_proposals,
     })
@@ -3030,6 +3206,7 @@ fn write_session_sandbox_brief(
     scratch_path: Option<&Path>,
     home_dir: &Path,
     repos: &[config::RepoSummaryRow],
+    worktree_root: Option<&Path>,
     observe_domains: bool,
 ) {
     if !resolved.brief {
@@ -3048,8 +3225,9 @@ fn write_session_sandbox_brief(
         );
         return;
     };
-    let facts =
+    let mut facts =
         brief::BriefFacts::capture(resolved, active_agent, home_dir, repos, observe_domains);
+    facts.worktree_root = worktree_root.map(|p| p.display().to_string());
     if let Err(e) = brief::write_session_brief(scratch, &facts) {
         ui::warn(&format!("Could not write sandbox brief: {e}"));
     }
@@ -3782,12 +3960,14 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         project_dir,
         launch_dir,
         repo_roots,
+        worktree_root,
         active_agent,
         unapproved_proposals: _,
     } = resolve_context(&cli, false)?;
 
     let repo_paths: Vec<PathBuf> = repo_roots.iter().map(|r| r.dir.clone()).collect();
     let repo_git_dirs = sandbox::named_root_git_dirs(&repo_paths);
+    let policy_roots = policy_roots(&repo_paths, worktree_root.as_deref());
     // Built once: the brief, the startup summary and `doctor` must not each
     // resolve the identities separately and risk disagreeing.
     let repo_rows = repo_summary_rows(&project_dir, &repo_roots);
@@ -3846,7 +4026,12 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         &probe,
         AssemblyOptions {
             agent: active_agent,
-            repos: NamedRepos::new(&repo_paths, &repo_git_dirs, &repo_rows),
+            repos: NamedRepos::new(
+                &policy_roots,
+                &repo_git_dirs,
+                &repo_rows,
+                worktree_root.as_deref(),
+            ),
             copilot_install_dir: copilot_install_dir.as_deref(),
             electron_app_dir: electron_app_dir.as_deref(),
             announce_scratch: true,
@@ -3940,7 +4125,13 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
 
     // Print comprehensive summary and confirm before launching Copilot
     if !resolved.quiet {
-        resolved.print_summary(&project_dir, &home_dir, active_agent, &repo_rows);
+        resolved.print_summary(
+            &project_dir,
+            &home_dir,
+            active_agent,
+            &repo_rows,
+            worktree_root.as_deref(),
+        );
     }
     if let Err(e) = prompt_confirm(resolved.yes, resolved.quiet) {
         bail!("{e}");
@@ -4046,6 +4237,13 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
                 }
             })
         },
+    );
+    warn_worktrees_not_audited(
+        audit_enabled,
+        worktree_root.as_deref(),
+        &home_dir,
+        &project_dir,
+        resolved.worktree_walk_max_dirs,
     );
 
     // Cleanup
@@ -4954,6 +5152,7 @@ fn assemble_sandbox(
         scratch_path,
         home_dir,
         opts.repos.rows,
+        opts.repos.worktree_root,
         cli.observe_domains,
     );
 
@@ -5024,9 +5223,10 @@ fn assemble_sandbox(
     let policy = sandbox::generate_policy(&sandbox_config);
     // Path validation (SBPL injection checks on macOS) is handled internally by
     // prepare(), so callers don't need to know about backend-specific risks.
-    let prepared =
+    let mut prepared =
         sandbox::prepare_with_pnpm_shadow(&sandbox_config, pnpm_shadow_path, opts.inspect_only)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+    prepared.set_worktree_root(opts.repos.worktree_root);
 
     Ok(AssembledSandbox {
         prepared,
@@ -5073,6 +5273,9 @@ struct NamedRepos<'a> {
     /// `owner/name` and what its grant is. Carried here so the agent-facing
     /// brief and the operator-facing summary cannot describe different scopes.
     rows: &'a [config::RepoSummaryRow],
+    /// The managed worktree root (#531), also present in `dirs`. Carried
+    /// separately so the brief can name it without it posing as a repository.
+    worktree_root: Option<&'a Path>,
 }
 
 impl<'a> NamedRepos<'a> {
@@ -5080,11 +5283,13 @@ impl<'a> NamedRepos<'a> {
         dirs: &'a [PathBuf],
         git_dirs: &'a [PathBuf],
         rows: &'a [config::RepoSummaryRow],
+        worktree_root: Option<&'a Path>,
     ) -> Self {
         Self {
             dirs,
             git_dirs,
             rows,
+            worktree_root,
         }
     }
 }
@@ -5110,6 +5315,7 @@ fn build_sandbox_config<'a>(
         extra_deny: &resolved.deny_paths,
         named_roots: repos.dirs,
         named_root_git_dirs: repos.git_dirs,
+        managed_worktree_root: repos.worktree_root,
         existing_home_tool_dirs: Some(&probe.existing_home_tool_dirs),
         existing_app_dirs: Some(&probe.existing_app_dirs),
         extra_ports: &resolved.allow_ports,
@@ -5225,6 +5431,7 @@ fn run_exec_command(
         home_dir,
         project_dir,
         repo_roots,
+        worktree_root,
         unapproved_proposals: _,
         // active_agent from resolve_context is ignored — exec always uses Shell
         active_agent: _,
@@ -5233,6 +5440,7 @@ fn run_exec_command(
 
     let repo_paths: Vec<PathBuf> = repo_roots.iter().map(|r| r.dir.clone()).collect();
     let repo_git_dirs = sandbox::named_root_git_dirs(&repo_paths);
+    let policy_roots = policy_roots(&repo_paths, worktree_root.as_deref());
     // Built once: the brief, the startup summary and `doctor` must not each
     // resolve the identities separately and risk disagreeing.
     let repo_rows = repo_summary_rows(&project_dir, &repo_roots);
@@ -5312,7 +5520,12 @@ fn run_exec_command(
             &probe,
             AssemblyOptions {
                 agent: agent::Agent::Shell,
-                repos: NamedRepos::new(&repo_paths, &repo_git_dirs, &repo_rows),
+                repos: NamedRepos::new(
+                    &policy_roots,
+                    &repo_git_dirs,
+                    &repo_rows,
+                    worktree_root.as_deref(),
+                ),
                 copilot_install_dir: None,
                 electron_app_dir: None,
                 announce_scratch: false,
@@ -5372,7 +5585,13 @@ fn run_exec_command(
 
     // Summary (only shown with --no-quiet)
     if !resolved.quiet {
-        resolved.print_summary(&project_dir, &home_dir, active_agent, &repo_rows);
+        resolved.print_summary(
+            &project_dir,
+            &home_dir,
+            active_agent,
+            &repo_rows,
+            worktree_root.as_deref(),
+        );
     }
     if let Err(e) = prompt_confirm(resolved.yes, resolved.quiet) {
         bail!("{e}");
@@ -5426,6 +5645,13 @@ fn run_exec_command(
                 }
             })
         },
+    );
+    warn_worktrees_not_audited(
+        audit_enabled,
+        worktree_root.as_deref(),
+        &home_dir,
+        &project_dir,
+        resolved.worktree_walk_max_dirs,
     );
 
     if cli.observe_domains
@@ -5744,6 +5970,7 @@ fn run_check_command(
         home_dir,
         project_dir,
         repo_roots,
+        worktree_root,
         active_agent,
         unapproved_proposals: _,
         launch_dir: _,
@@ -5757,6 +5984,7 @@ fn run_check_command(
     // against: `check` must build the policy the launch would build.
     let repo_paths: Vec<PathBuf> = repo_roots.iter().map(|r| r.dir.clone()).collect();
     let repo_git_dirs = sandbox::named_root_git_dirs(&repo_paths);
+    let policy_roots = policy_roots(&repo_paths, worktree_root.as_deref());
     // Built once: the brief, the startup summary and `doctor` must not each
     // resolve the identities separately and risk disagreeing.
     let repo_rows = repo_summary_rows(&project_dir, &repo_roots);
@@ -5810,7 +6038,12 @@ fn run_check_command(
         config_path.as_ref(),
         &home_dir,
         &project_dir,
-        NamedRepos::new(&repo_paths, &repo_git_dirs, &repo_rows),
+        NamedRepos::new(
+            &policy_roots,
+            &repo_git_dirs,
+            &repo_rows,
+            worktree_root.as_deref(),
+        ),
     )?;
 
     let proxy_enabled = proxy_handle.is_some();
@@ -6483,6 +6716,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         home_dir,
         project_dir,
         repo_roots,
+        worktree_root,
         active_agent,
         unapproved_proposals,
         launch_dir: _,
@@ -6491,6 +6725,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
     // same named roots the launch would (#447).
     let repo_paths: Vec<PathBuf> = repo_roots.iter().map(|r| r.dir.clone()).collect();
     let repo_git_dirs = sandbox::named_root_git_dirs(&repo_paths);
+    let policy_roots = policy_roots(&repo_paths, worktree_root.as_deref());
     // Built once: the brief, the startup summary and `doctor` must not each
     // resolve the identities separately and risk disagreeing.
     let repo_rows = repo_summary_rows(&project_dir, &repo_roots);
@@ -6689,7 +6924,12 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         &probe,
         active_agent,
         &agent_dirs,
-        NamedRepos::new(&repo_paths, &repo_git_dirs, &repo_rows),
+        NamedRepos::new(
+            &policy_roots,
+            &repo_git_dirs,
+            &repo_rows,
+            worktree_root.as_deref(),
+        ),
         &doctor_exec,
         SessionPaths::default(),
         keychain_substitute,
@@ -9570,6 +9810,94 @@ fn start_denial_stream() -> Option<std::process::Child> {
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod tests {
+    /// #531 off: no root, nothing touched on disk, and the policy roots are
+    /// exactly the named repositories, which is what keeps the profile
+    /// byte-identical to a build without the feature.
+    #[test]
+    fn managed_worktree_root_off_adds_nothing() {
+        use std::path::{Path, PathBuf};
+        let home = tempfile::tempdir().expect("tempdir");
+        let root = super::managed_worktree_root(
+            false,
+            false,
+            true,
+            home.path(),
+            Path::new("/nonexistent"),
+            "macos",
+            cplt::worktrees::DEFAULT_WALK_MAX_DIRS,
+        )
+        .expect("off never fails");
+        assert!(root.is_none());
+        assert!(!home.path().join(cplt::worktrees::BASE).exists());
+        let named = vec![PathBuf::from("/w/lib")];
+        assert_eq!(super::policy_roots(&named, None), named);
+        assert_eq!(
+            super::policy_roots(&named, Some(Path::new("/h/.cplt-worktrees/x"))),
+            vec![
+                PathBuf::from("/w/lib"),
+                PathBuf::from("/h/.cplt-worktrees/x")
+            ]
+        );
+    }
+
+    /// #531 on, outside a repository: a key in local config fails the launch
+    /// and says which key; a global one warns and runs without a root, so it
+    /// does not break every launch outside a repository.
+    #[test]
+    fn managed_worktree_root_on_without_a_repository() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let plain = tempfile::tempdir().expect("tempdir");
+        let max = cplt::worktrees::DEFAULT_WALK_MAX_DIRS;
+        let err =
+            super::managed_worktree_root(true, true, true, home.path(), plain.path(), "macos", max)
+                .expect_err("local key, no repository, no root");
+        assert!(err.to_string().contains("allow_git_worktrees"), "{err}");
+        let root = super::managed_worktree_root(
+            true,
+            false,
+            true,
+            home.path(),
+            plain.path(),
+            "macos",
+            max,
+        )
+        .expect("global key outside a repository is skipped");
+        assert!(root.is_none());
+        assert!(!home.path().join(cplt::worktrees::BASE).exists());
+    }
+
+    /// #574 review: the launch path refuses the key off macOS, for a global
+    /// and a local key alike, before creating anything.
+    #[test]
+    fn managed_worktree_root_is_refused_on_linux() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("tempdir");
+        let ok = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo.path())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            eprintln!("SKIPPED: git unavailable");
+            return;
+        }
+        for from_local in [false, true] {
+            let err = super::managed_worktree_root(
+                true,
+                from_local,
+                true,
+                home.path(),
+                repo.path(),
+                "linux",
+                cplt::worktrees::DEFAULT_WALK_MAX_DIRS,
+            )
+            .expect_err("refused on linux");
+            assert!(err.to_string().contains("macOS-only"), "{err}");
+        }
+        assert!(!home.path().join(cplt::worktrees::BASE).exists());
+    }
     /// #553: every path the "read is blocked" probe can pick must really be
     /// denied on both backends, or `cplt check` reports a failure that is not
     /// one on a host where only that path exists.

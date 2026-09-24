@@ -148,6 +148,10 @@ pub struct SandboxConfig<'a> {
     /// [`crate::sandbox::named_root_git_dirs`], so a surface that builds a
     /// policy cannot forget it (#447).
     pub named_root_git_dirs: &'a [PathBuf],
+    /// The managed worktree root (#531), also present in `named_roots`.
+    /// `Some` adds the macOS pins that only matter with the key on: the root's
+    /// name, and each `<gitdir>/worktrees/<name>/commondir` against rewrite.
+    pub managed_worktree_root: Option<&'a Path>,
     pub home_dir: &'a Path,
     pub extra_read: &'a [PathBuf],
     pub extra_write: &'a [PathBuf],
@@ -269,6 +273,10 @@ pub struct PreparedSandbox {
     /// The credential forwarded into the sandbox in place of the Keychain
     /// grant, if any (#242). `None` on every run where the trade did not apply.
     pub(crate) keychain_substitute: Option<crate::agent::KeychainSubstitute>,
+    /// Exported to the child as `CPLT_WORKTREE_ROOT` (#531). Set by the
+    /// launcher with [`Self::set_worktree_root`] after `prepare`; the grant
+    /// itself comes from `SandboxConfig::named_roots`.
+    worktree_root: Option<PathBuf>,
     /// Landlock + seccomp pre-computed sandbox data (Linux only).
     /// Built in the parent process; applied in pre_exec.
     #[cfg(target_os = "linux")]
@@ -288,6 +296,14 @@ impl PreparedSandbox {
     /// The home directory this sandbox is configured for.
     pub fn home_dir(&self) -> &Path {
         &self.home_dir
+    }
+
+    /// Name the managed worktree root to the child as `CPLT_WORKTREE_ROOT`.
+    ///
+    /// Environment only: the root must already be among the policy's named
+    /// roots, or the variable would name a directory the agent cannot use.
+    pub fn set_worktree_root(&mut self, root: Option<&Path>) {
+        self.worktree_root = root.map(Path::to_path_buf);
     }
 
     /// Withdraw the read grant on the root `AGENTS.md` (#252).
@@ -1284,6 +1300,7 @@ fn prepare_impl(
         allow_localhost_any: config.allow_localhost_any,
         npmrc_allowed: env::npmrc_explicitly_allowed(config.home_dir, config.extra_read),
         keychain_substitute: config.keychain_substitute.clone(),
+        worktree_root: None,
     })
 }
 
@@ -1948,6 +1965,7 @@ fn prepare_impl(
         allow_localhost_any: config.allow_localhost_any,
         npmrc_allowed: env::npmrc_explicitly_allowed(config.home_dir, config.extra_read),
         keychain_substitute: config.keychain_substitute.clone(),
+        worktree_root: None,
         precomputed,
         bwrap_wrapper,
     })
@@ -1985,6 +2003,11 @@ fn validate_config_paths(config: &SandboxConfig) -> Result<(), String> {
             .map_err(|e| format!("Home Git config symlink target: {e}"))?;
     }
 
+    // Checked on its own, not only as one of `named_roots`: the profile
+    // interpolates it into the managed-root rules as well (#574).
+    if let Some(root) = config.managed_worktree_root {
+        policy::validate_sbpl_path(root).map_err(|e| format!("Managed worktree root: {e}"))?;
+    }
     if let Some(dir) = config.copilot_install_dir {
         policy::validate_sbpl_path(dir).map_err(|e| format!("Copilot install dir: {e}"))?;
     }
@@ -2182,6 +2205,7 @@ mod tests {
             extra_deny: &[],
             named_roots: &[],
             named_root_git_dirs: &[],
+            managed_worktree_root: None,
             existing_home_tool_dirs: None,
             existing_app_dirs: None,
             extra_ports: &[],
@@ -2622,6 +2646,21 @@ mod tests {
         config.project_dir = &project;
         let err = super::validate_config_paths(&config).expect_err("must refuse");
         assert!(err.contains("Home Git config symlink target"), "{err}");
+    }
+
+    /// #574 review item 7: the managed worktree root is interpolated into the
+    /// profile, so it is validated in its own right, not only when it is also
+    /// one of `named_roots`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unnameable_managed_worktree_root_is_refused() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let root = home.join(".cplt-worktrees/a\"b");
+        let mut config = test_config(&home, &[]);
+        config.managed_worktree_root = Some(&root);
+        let err = super::validate_config_paths(&config).expect_err("must refuse");
+        assert!(err.contains("Managed worktree root"), "{err}");
     }
 
     /// #553: files are created only once Bubblewrap will wrap the run. With

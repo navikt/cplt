@@ -705,6 +705,16 @@ pub struct SandboxConfig {
     /// (default: false, #463). DANGEROUS: the agent can read every token in
     /// them, not only the one the project needs. Config-only.
     pub allow_build_credentials: Option<bool>,
+    /// Grant a cplt-owned, per-repository directory for sub-agent worktrees
+    /// (default: false, #531). Read, write and execute on
+    /// `~/.cplt-worktrees/<fingerprint>`, exported as `CPLT_WORKTREE_ROOT`.
+    /// User config only (global or local): `.cplt.toml` cannot propose it,
+    /// because it grants a new executable tree outside the checkout.
+    pub allow_git_worktrees: Option<bool>,
+    /// How many directories the worktree-link walk visits before it stops and
+    /// fails the launch (default: 100000). Only read with
+    /// `allow_git_worktrees` on.
+    pub worktree_walk_max_dirs: Option<u64>,
     /// Enable per-session scratch directory for TMPDIR redirect (default: true).
     /// Creates an executable temp dir so tools like `go test` and `mise` can work.
     pub scratch_dir: Option<bool>,
@@ -950,6 +960,11 @@ pub struct Resolved {
     /// `sandbox.allow_build_credentials` (#463). Expanded into `allow_read`
     /// by `sandbox::build_credential_grants` at probe time.
     pub allow_build_credentials: bool,
+    /// `sandbox.allow_git_worktrees` (#531), default false.
+    pub allow_git_worktrees: bool,
+    /// `sandbox.worktree_walk_max_dirs`, default
+    /// [`crate::worktrees::DEFAULT_WALK_MAX_DIRS`].
+    pub worktree_walk_max_dirs: usize,
     pub scratch_dir: bool,
     pub use_bubblewrap: Option<bool>,
     pub quiet: bool,

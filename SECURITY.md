@@ -578,6 +578,143 @@ controlling terminal, and that terminal is the user's shell.
 
 Because credentials are inaccessible at both the filesystem and environment level, network-based exfiltration can only leak project source code and `~/.config/gh` tokens. That is a much smaller blast radius than full credential theft.
 
+#### Managed worktree root (`sandbox.allow_git_worktrees`)
+
+Off by default (#531). When on, the session gets one more project-grade tree:
+`~/.cplt-worktrees/<id>`, read, write and execute, so sub-agents can run
+`git worktree add "$CPLT_WORKTREE_ROOT/<name>"`. What that grants and what it
+does not:
+
+- **One repository's root, never the parent.** `<id>` is the first 128 bits of
+  SHA-256 over the canonical Git common directory, so every worktree of one
+  repository shares it and a second clone does not. `~/.cplt-worktrees` is not
+  granted, so other repositories' roots stay unreadable, unwritable and
+  non-executable. The path is derived, not configurable.
+- **User config only.** `.cplt.toml` cannot set or propose the key. A repository
+  cannot give itself a new executable tree outside its checkout.
+- **Steering and path tricks fail the launch.** The common directory is accepted
+  only in the two layouts Git writes (the gitdir itself, or
+  `<common>/worktrees/<name>`), so a planted `commondir` cannot point the launch
+  at another repository's root. `~/.cplt-worktrees` and the root must be real
+  directories owned by the user (set to mode 0700), and the canonical path must
+  equal the expected one. The directories are opened `O_NOFOLLOW |
+  O_DIRECTORY` and their owner and mode are checked and set through that
+  descriptor. These checks run on every launch, in case the root was replaced
+  between sessions. Inside a session the root's name is pinned
+  (`file-write-unlink` on its exact path), so the agent cannot move it away.
+  A `CPLT_CONFIG` inside the root is refused, like one inside a named
+  repository.
+- **No new trust.** The root is not a repository and is not added to the gh
+  scope, the audit's repository list, or the trust store. Approval stays keyed
+  on the repository (#527), so launching from a managed worktree uses the
+  existing approval and creates none.
+- **No isolation between sub-agents.** All worktrees in a session share one
+  grant. A sub-agent can write every other sub-agent's worktree, and every
+  sub-agent can still write the launch checkout. The root keeps parallel work
+  on separate branches and directories; it is not a security boundary between
+  agents.
+- **Protections.** On macOS the per-root denies apply at every depth under the
+  root: `.github/hooks`, `.claude/settings.json`, `.cplt.toml`, `.mcp.json`
+  and the rest of `PROTECTED_IN_ROOT`, and the rename pins on their ancestors.
+  The shared `.git/hooks` and `.git/config` keep their existing denies, and
+  `worktrees/<name>/config.worktree` is denied by suffix. Verified by kernel
+  tests in `tests/e2e_projects.rs`.
+- **Worktree links: kernel pins plus a strict check at launch and exit.** Two
+  files decide which config and hooks Git on the host reads for a worktree,
+  and the agent can write both. `<common>/worktrees/<id>/commondir` aimed at
+  `<root>/x/` would make Git read `<root>/x/config`, which the agent can write
+  (`core.fsmonitor` runs on the host). A `<root>/<name>/.git` pointer aimed at
+  `<root>/g` does the same through `<root>/g/config` and `<root>/g/hooks`.
+  What the kernel blocks: rewriting a `commondir` in place
+  (`file-write-data`); rewriting or unlinking any `<root>/.../.git` (the
+  nested-gitdir rules every writable root gets); and creating a `.git`, in
+  any letter case since on case-insensitive APFS Git opens `.GIT` for `.git`,
+  at `<root>/.git` or at `<root>/<name>/<anything>/.git` (a new file, a
+  symlink, a mkdir and a rename onto the name). What it does not block:
+  deleting and recreating a `commondir`, creating a new admin directory,
+  moving a worktree aside and writing a new `<root>/<name>/.git`, and moving
+  in a directory that already holds a `.git`. **Deny residual:** the create
+  rule only sees the name being created. `mkdir -p
+  /private/tmp/stage/sub/.git && mv /private/tmp/stage/sub <root>/x/sub`
+  creates only `sub` under the root, so it succeeds, and the planted `.git`
+  is there. The deny does not block that plant; the walk below finds it. Nor
+  can a rule express a bare-repository layout or a symlink out of the root.
+  Because unlinking `<root>/<name>/.git` is denied, **`git worktree remove`
+  fails inside cplt.** It gets far enough to delete the worktree's files and
+  its admin directory, leaves the `.git` pointer, and the next launch refuses
+  to start until that directory is deleted and `git worktree prune` is run.
+  Remove worktrees outside cplt; the agent brief says so.
+
+  The check compares exact text rather than following links, because a link
+  that resolves correctly through a symlink today can be re-aimed tomorrow by
+  changing the symlink. At every launch with the key on, and at session end,
+  cplt requires for every admin directory `<common>/worktrees/<id>` that
+  `commondir` reads exactly `../..` and `gitdir` names an existing regular
+  `.git` file by an absolute path with no symlink, `.` or `..` in it
+  (`<root>/<name>/.git` when it is inside the root). Both must be regular
+  files, opened without following symlinks. Then it walks the whole root.
+  The only `.git` allowed, in any letter case, is `<root>/<name>/.git` as a
+  regular file with exactly that name that reads exactly
+  `gitdir: <common>/worktrees/<id>`, with no symlink on that path, and whose
+  admin directory's `gitdir` reads exactly `<root>/<name>/.git`. Also
+  reported:
+  - a bare-repository layout in any directory: `HEAD` with `objects` and
+    `refs`, or `HEAD` with a `commondir`, of any file type (Git checks
+    `objects` and `refs` with `access(X_OK)`, which an executable regular
+    file passes);
+  - anything directly in the root that is not a directory;
+  - any symlink below the root, dangling or not, unless it stays inside its
+    own worktree: its target text, joined to the link's directory and
+    normalised without following anything, lies inside the worktree (a `..`
+    is accepted only before the first name), and it resolves inside the
+    worktree today. Resolving inside is not enough on its own:
+    `wt/l -> /private/tmp/s/d` with `/private/tmp/s -> wt` resolves inside,
+    and re-aiming `/private/tmp/s` later, outside the root where nothing
+    checks it, sends Git in `wt/l` to a planted repository. A link met on
+    the way is inside the worktree and held to the same rule, so nothing
+    outside is traversed. Links that stay inside, like npm's
+    `node_modules/.bin/x -> ../pkg/bin/x` through a workspace link, are
+    allowed.
+
+  Anything it cannot read and a tree past its bounds (64 levels,
+  `sandbox.worktree_walk_max_dirs` directories, 100 000 by default) is a
+  finding, and the launch refuses to start. At session end it runs the same
+  check and prints an error naming each directory not to run Git in. That
+  error is advisory: nothing stops Git from running there if you do.
+
+  **With the key off**, the session is not granted the root, but it can
+  still rewrite a worktree's `<common>/worktrees/<id>/commondir` in place:
+  that deny is part of the key-on profile only, so the key-off profile stays
+  exactly as on main, where any linked worktree's `commondir` is writable the
+  same way. So whenever this repository's root exists, cplt runs the same
+  check at launch and at session end with the key off too, and prints the
+  same error. It does not refuse the launch, since the session grants
+  nothing in the root. A root it cannot inspect (a permission error on
+  `~/.cplt-worktrees` or the root) or a repository whose common directory
+  cannot be established is reported, not treated as no root. Submodules inside a
+  managed worktree are refused by the same rules. The strict text also
+  refuses worktrees Git wrote with relative paths
+  (`worktree.useRelativePaths`); turn that option off for this repository.
+- **The window after the session-end check.** The check runs when the agent's
+  process has exited: after the audit's settle wait for its descendants (at
+  most two seconds) when the change audit or `--observe-domains` runs, and at
+  once otherwise. A descendant that detaches, or outlives that wait, can plant
+  in the root after the check, and nothing reports it until the next launch
+  runs the check again. cplt does not kill the session's process tree; see
+  the settle-probe notes in `src/audit.rs` on why a process group is not used.
+  When the audit runs and the tree has not settled, the audit's own warning
+  says processes were left running.
+- **macOS only.** On Linux the launch fails with the key on, and `config set`
+  refuses to turn it on. Landlock cannot subtract a path from the granted
+  root, and bubblewrap re-binds only paths that exist at launch, at fixed
+  depths, never `<root>/<worktree>/<rel>`. So nothing inside the root would
+  be kernel-enforced.
+- **Residuals.** Everything written to the root outlives the session: cplt
+  never deletes worktrees or branches. The agent can empty the root or plant
+  files you later run outside cplt, the same as in the project directory. The
+  end-of-session audit does not inspect the worktrees' contents; it prints a
+  line saying so.
+
 
 #### Keychain access is all-or-nothing
 

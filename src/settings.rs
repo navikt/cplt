@@ -669,6 +669,9 @@ fn resolved_values(
                 ("proxy", "log_file") => format_optional_path(resolved.proxy_log_file.as_ref()),
                 ("proxy", "log_level") => resolved.proxy_log_level.as_str().to_string(),
                 ("proxy", "timeout") => resolved.proxy_timeout.as_secs().to_string(),
+                ("sandbox", "worktree_walk_max_dirs") => {
+                    resolved.worktree_walk_max_dirs.to_string()
+                }
                 ("proxy", "upstream_no_proxy") => format_strings(&resolved.proxy_upstream_no_proxy),
                 ("proxy", "allow_private_domains") => {
                     format_strings(&resolved.allow_private_domains)

@@ -795,6 +795,23 @@ pub fn propose_key_detail(
 #[cfg(test)]
 mod tests {
 
+    /// #531: a repository cannot grant itself a managed worktree root. The key
+    /// is user config only, so in `.cplt.toml` it is an unknown key, reported
+    /// and never applied, wherever it is written.
+    #[test]
+    fn allow_git_worktrees_is_not_a_repo_config_key() {
+        let cfg: RepoConfig = toml::from_str(
+            "[sandbox]\nallow_git_worktrees = true\n\n[propose]\nallow_git_worktrees = true\n",
+        )
+        .expect("parses");
+        let unknown = unknown_keys(&cfg);
+        assert!(unknown.iter().any(|k| k == "sandbox"), "{unknown:?}");
+        assert!(
+            unknown.iter().any(|k| k == "propose.allow_git_worktrees"),
+            "{unknown:?}"
+        );
+    }
+
     /// #484: a `.cplt.toml` must be able to use a key a newer cplt understands
     /// without breaking every developer who has not upgraded. Before this, one
     /// unknown key failed the whole parse — the launch repository lost its
