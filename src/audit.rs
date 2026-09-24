@@ -1531,8 +1531,11 @@ fn lookup_hops(p: &Path) -> Vec<PathBuf> {
                         for c in target.components().rev() {
                             todo.push_front(owned(c));
                         }
-                        // `cur` stays the link's parent: the target resolves
-                        // from there, and is recorded step by step.
+                        // The link itself is a step: one sitting beside a
+                        // root (in an ancestor) can be re-aimed from outside
+                        // (#576 review, L5). `cur` stays the link's parent:
+                        // the target resolves from there, step by step.
+                        steps.push(next);
                         continue;
                     }
                     _ => cur = next,
@@ -2991,5 +2994,23 @@ mod tests {
         let after = git_fingerprint(dir.path());
         mode(0o755);
         assert_ne!(fp, after);
+    }
+
+    /// L5: a link sitting directly in an ancestor of the root is itself a
+    /// step, even though its target leads back inside.
+    #[test]
+    fn nested_git_link_through_a_link_beside_the_root_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("sub");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let ng = NestedGit::capture(&[&root]);
+        std::os::unix::fs::symlink(root.join("src"), base.join("l")).unwrap();
+        std::os::unix::fs::symlink(base.join("l"), root.join("pk")).unwrap();
+        let lines = ng.link_lines(&Scan::of(&ng.roots)).join("\n");
+        assert!(
+            lines.contains(&format!("{} ->", root.join("pk").display())),
+            "{lines}"
+        );
     }
 }
