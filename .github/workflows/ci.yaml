@@ -67,7 +67,21 @@ jobs:
         # broken lib assertion hides every integration test behind it. Two
         # mutation-testing rounds were scored against suites that never ran for
         # exactly that reason (issue #126). Failures still fail the job.
-        run: cargo test --no-fail-fast --test unit_tests --lib --verbose
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --no-fail-fast --test unit_tests --lib --verbose 2>&1 | tee "$RUNNER_TEMP/test-output.log"
+
+      - name: Annotate failing tests
+        if: failure()
+        shell: bash
+        run: |
+          # Print each failing test name as an annotation, so a flake is not
+          # lost in a long log (#528).
+          LOG="$RUNNER_TEMP/test-output.log"
+          [ -f "$LOG" ] || exit 0
+          sed -nE -e 's/^test (.*) \.\.\. FAILED$/\1/p' -e 's/^---- (.*) stdout ----$/\1/p' "$LOG" \
+            | sort -u | sed 's/^/::error::Test failed: /'
 
   # Integration tests need macOS for sandbox-exec
   integration-tests:
@@ -172,6 +186,17 @@ jobs:
         run: |
           set -o pipefail
           cargo test --no-fail-fast --verbose -- --nocapture 2>&1 | tee "$RUNNER_TEMP/test-output.log"
+
+      - name: Annotate failing tests
+        if: failure()
+        shell: bash
+        run: |
+          # Print each failing test name as an annotation, so a flake is not
+          # lost in a long log (#528).
+          LOG="$RUNNER_TEMP/test-output.log"
+          [ -f "$LOG" ] || exit 0
+          sed -nE -e 's/^test (.*) \.\.\. FAILED$/\1/p' -e 's/^---- (.*) stdout ----$/\1/p' "$LOG" \
+            | sort -u | sed 's/^/::error::Test failed: /'
 
       - name: Surface tests skipped for missing tooling
         if: always()
@@ -330,7 +355,21 @@ jobs:
         env:
           CPLT_TEST_REQUIRE_SANDBOX: "1"
           CPLT_TEST_PRIV_443: "1"
-        run: cargo test --no-fail-fast --verbose
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --no-fail-fast --verbose 2>&1 | tee "$RUNNER_TEMP/test-output.log"
+
+      - name: Annotate failing tests
+        if: failure()
+        shell: bash
+        run: |
+          # Print each failing test name as an annotation, so a flake is not
+          # lost in a long log (#528).
+          LOG="$RUNNER_TEMP/test-output.log"
+          [ -f "$LOG" ] || exit 0
+          sed -nE -e 's/^test (.*) \.\.\. FAILED$/\1/p' -e 's/^---- (.*) stdout ----$/\1/p' "$LOG" \
+            | sort -u | sed 's/^/::error::Test failed: /'
 
       - name: Stop 127.0.0.1:443 listener
         if: always()
