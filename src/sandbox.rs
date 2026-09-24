@@ -67,20 +67,20 @@ mod profile;
 // These are platform-agnostic and used by tests, discover, config, etc.
 
 pub use policy::{
-    AppDir, AppDirKind, CacheEnv, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS,
-    ENV_ALLOWLIST, ENV_PREFIX_ALLOWLIST, EXEC_IN_WRITABLE, ExecInWritable, HARDENING_ENV_VARS,
-    HOME_TOOL_DIRS, HardeningCategory, HardeningEnvVar, HomeToolDir, LinuxCoverage,
-    PLAYWRIGHT_SOCKET_BASE_MAX_BYTES, PLAYWRIGHT_SOCKET_DIR_PREFIX, PLAYWRIGHT_SOCKET_PATH_LIMIT,
-    PLAYWRIGHT_SOCKET_ROOT, PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX, PROTECTED_IN_GITDIR,
-    PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir, SENSITIVE_PROJECT_PATTERNS,
-    TOOL_PATH_ENV_VARS, ToolPathEnvVar, ToolPathOverride, ToolRoot, active_tool_dirs, app_dirs,
-    copilot_default_pkg_dir, copilot_pkg_dir, copilot_pkg_dirs, copilot_ro_protect_paths,
-    credential_link_hop, current_uid, exec_write_conflicts, home_config_link_targets,
-    home_tool_dirs, linux_docker_socket_paths, linux_runtime_dirs, mise_ro_protect_paths,
-    nested_alternation, no_cache_env, path_bin_dirs, playwright_runtime_intent, process_env,
-    relocatable_tool_prefix, shim_ro_protect_paths, socket_mask_paths, tool_override_path_is_safe,
-    tool_path_env_overrides, validate_playwright_socket_dir, validate_sbpl_path,
-    xdg_runtime_dir_env,
+    AppDir, AppDirKind, BUILD_CREDENTIAL_FILES, CacheEnv, DENIED_DOTFILES, DENIED_FILES,
+    DENIED_HOME_SUBPATHS, ENV_ALLOWLIST, ENV_PREFIX_ALLOWLIST, EXEC_IN_WRITABLE, ExecInWritable,
+    HARDENING_ENV_VARS, HOME_TOOL_DIRS, HardeningCategory, HardeningEnvVar, HomeToolDir,
+    LinuxCoverage, PLAYWRIGHT_SOCKET_BASE_MAX_BYTES, PLAYWRIGHT_SOCKET_DIR_PREFIX,
+    PLAYWRIGHT_SOCKET_PATH_LIMIT, PLAYWRIGHT_SOCKET_ROOT, PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX,
+    PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir,
+    SENSITIVE_PROJECT_PATTERNS, TOOL_PATH_ENV_VARS, ToolPathEnvVar, ToolPathOverride, ToolRoot,
+    active_tool_dirs, app_dirs, build_credential_grants, copilot_default_pkg_dir, copilot_pkg_dir,
+    copilot_pkg_dirs, copilot_ro_protect_paths, credential_link_hop, current_uid,
+    exec_write_conflicts, home_config_link_targets, home_tool_dirs, linux_docker_socket_paths,
+    linux_runtime_dirs, mise_ro_protect_paths, nested_alternation, no_cache_env, path_bin_dirs,
+    playwright_runtime_intent, process_env, relocatable_tool_prefix, shim_ro_protect_paths,
+    socket_mask_paths, tool_override_path_is_safe, tool_path_env_overrides,
+    validate_playwright_socket_dir, validate_sbpl_path, xdg_runtime_dir_env,
 };
 
 // SBPL profile generation — kept public for unit tests.

@@ -241,6 +241,12 @@ pub fn grant_is_refused(home: &Path, path: &Path) -> bool {
 /// credentials are their own files.
 #[must_use]
 pub fn first_party_read_target(home: &Path, path: &Path) -> Option<PathBuf> {
+    read_target(home, path, None)
+}
+
+/// [`first_party_read_target`], except that the [`DENIED_HOME_SUBPATHS`]
+/// entry `own` may be the target: the grant is for that file on purpose.
+fn read_target(home: &Path, path: &Path, own: Option<&str>) -> Option<PathBuf> {
     if grant_is_refused(home, path) {
         return None;
     }
@@ -252,10 +258,54 @@ pub fn first_party_read_target(home: &Path, path: &Path) -> Option<PathBuf> {
         let dir = home.join(d);
         target.starts_with(&dir) || std::fs::canonicalize(&dir).is_ok_and(|c| target.starts_with(c))
     });
-    if in_denied_dir || denied_entry(DENIED_HOME_SUBPATHS, home, &target).is_some() {
+    let other_entry =
+        denied_entry(DENIED_HOME_SUBPATHS, home, &target).is_some_and(|e| Some(e) != own);
+    if in_denied_dir || other_entry {
         return None;
     }
     Some(target)
+}
+
+/// The files `sandbox.allow_build_credentials` grants read-only (#463),
+/// relative to `$HOME`: the credentials of the three build hosts a Node or
+/// JVM project cannot avoid. Each is a [`DENIED_HOME_SUBPATHS`] entry, so the
+/// grant is the ordinary per-file `allow.read` override of that deny.
+pub const BUILD_CREDENTIAL_FILES: &[&str] =
+    &[".npmrc", ".gradle/gradle.properties", ".m2/settings.xml"];
+
+/// What `sandbox.allow_build_credentials` adds to `allow.read`, one entry per
+/// [`BUILD_CREDENTIAL_FILES`] file that exists.
+///
+/// `Ok` is the canonical target, the form an `allow.read` grant arrives in, so
+/// both backends treat it exactly as the user typing the path. `Err` is the
+/// `$HOME` path of a file refused because it does not resolve to a plain file
+/// of its own: a symlink into a credential directory or onto another
+/// credential file, a directory, or a user-owned hardlink
+/// ([`first_party_read_target`]'s rules, with the file itself exempt from the
+/// [`DENIED_HOME_SUBPATHS`] check it would otherwise fail). The caller warns.
+///
+/// A file covered by a user deny (`deny`, canonical like `deny.paths`) is left
+/// out without a word: the deny is the user's narrower statement, and on
+/// macOS the per-file override is emitted after the user denies, so it would
+/// otherwise win. A file that does not exist (or a dangling link) is left out
+/// too; there is nothing to read, and Landlock cannot open a rule on a
+/// missing path.
+#[must_use]
+pub fn build_credential_grants(home: &Path, deny: &[PathBuf]) -> Vec<Result<PathBuf, PathBuf>> {
+    BUILD_CREDENTIAL_FILES
+        .iter()
+        .filter_map(|rel| {
+            let named = home.join(rel);
+            let canon = std::fs::canonicalize(&named).ok()?;
+            if deny
+                .iter()
+                .any(|d| named.starts_with(d) || canon.starts_with(d))
+            {
+                return None;
+            }
+            Some(read_target(home, &named, Some(rel)).ok_or(named))
+        })
+        .collect()
 }
 
 /// Whether the (canonical) file target of a first-party grant is safe to
@@ -3830,6 +3880,79 @@ mod tests {
         // A hardlink onto the key canonicalizes to itself.
         std::fs::hard_link(h.join(".ssh/id_ed25519"), &link).unwrap();
         assert_eq!(first_party_read_target(h, &link), None, "hardlink to key");
+    }
+
+    /// `sandbox.allow_build_credentials` (#463): the three files, as exact
+    /// canonical file grants, and only when each is a plain file of its own.
+    #[test]
+    fn build_credential_grants_are_exact_files_and_refuse_links() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let h = &std::fs::canonicalize(tmp.path()).unwrap();
+        for d in [".ssh", ".m2", ".gradle", "dotfiles"] {
+            std::fs::create_dir_all(h.join(d)).unwrap();
+        }
+        std::fs::write(h.join(".ssh/id_ed25519"), "key").unwrap();
+        std::fs::write(h.join("dotfiles/npmrc"), "//r/:_authToken=t").unwrap();
+        std::fs::write(h.join(".gradle/gradle.properties"), "gpr.key=t").unwrap();
+        std::fs::write(h.join(".m2/settings.xml"), "<settings/>").unwrap();
+        let npmrc = h.join(".npmrc");
+        let grants = |deny: &[PathBuf]| build_credential_grants(h, deny);
+
+        // Absent: nothing to grant, nothing to warn about.
+        let all_but_npmrc = vec![
+            Ok(h.join(".gradle/gradle.properties")),
+            Ok(h.join(".m2/settings.xml")),
+        ];
+        assert_eq!(grants(&[]), all_but_npmrc, "absent ~/.npmrc");
+
+        // A dotfiles link is granted at its target, like `allow.read` would.
+        symlink(h.join("dotfiles/npmrc"), &npmrc).unwrap();
+        let mut want = vec![Ok(h.join("dotfiles/npmrc"))];
+        want.extend(all_but_npmrc.clone());
+        assert_eq!(grants(&[]), want, "dotfiles link");
+
+        // A user deny on the file, or on the tree its target sits in, wins.
+        assert_eq!(grants(std::slice::from_ref(&npmrc)), all_but_npmrc);
+        assert_eq!(grants(&[h.join("dotfiles")]), all_but_npmrc);
+
+        // Refused, loudly: a link into a credential dir, onto another
+        // credential file, a directory, and a hardlink onto the key.
+        for target in [h.join(".ssh/id_ed25519"), h.join(".m2/settings.xml")] {
+            std::fs::remove_file(&npmrc).unwrap();
+            symlink(&target, &npmrc).unwrap();
+            assert_eq!(grants(&[])[0], Err(npmrc.clone()), "{}", target.display());
+        }
+        std::fs::remove_file(&npmrc).unwrap();
+        symlink(h.join("dotfiles"), &npmrc).unwrap();
+        assert_eq!(grants(&[])[0], Err(npmrc.clone()), "link to a dir");
+        std::fs::remove_file(&npmrc).unwrap();
+        std::fs::hard_link(h.join(".ssh/id_ed25519"), &npmrc).unwrap();
+        assert_eq!(grants(&[])[0], Err(npmrc.clone()), "hardlink to key");
+
+        // A dangling link has nothing behind it.
+        std::fs::remove_file(&npmrc).unwrap();
+        symlink(h.join("gone"), &npmrc).unwrap();
+        assert_eq!(grants(&[]), all_but_npmrc, "dangling link");
+    }
+
+    /// The exemption is for the grant's own file only: without it every one
+    /// of the three would fail the `DENIED_HOME_SUBPATHS` check, and
+    /// `first_party_read_target` must keep refusing them.
+    #[test]
+    fn first_party_read_target_still_refuses_the_credential_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let h = tmp.path();
+        std::fs::write(h.join(".npmrc"), "t").unwrap();
+        assert_eq!(first_party_read_target(h, &h.join(".npmrc")), None);
+        assert_eq!(
+            read_target(h, &h.join(".npmrc"), Some(".npmrc")),
+            Some(std::fs::canonicalize(h.join(".npmrc")).unwrap())
+        );
+        assert_eq!(
+            read_target(h, &h.join(".npmrc"), Some(".m2/settings.xml")),
+            None
+        );
     }
 
     /// A hardlink to some other socket, planted in a colima dir, is refused.

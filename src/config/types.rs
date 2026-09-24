@@ -700,6 +700,11 @@ pub struct SandboxConfig {
     /// neither authenticate nor recover from inside the sandbox, because the
     /// recovery path *is* the credential store the trade just removed.
     pub keychain_substitute: Option<bool>,
+    /// Grant read-only access to the three build-host credential files,
+    /// `~/.npmrc`, `~/.gradle/gradle.properties` and `~/.m2/settings.xml`
+    /// (default: false, #463). DANGEROUS: the agent can read every token in
+    /// them, not only the one the project needs. Config-only.
+    pub allow_build_credentials: Option<bool>,
     /// Enable per-session scratch directory for TMPDIR redirect (default: true).
     /// Creates an executable temp dir so tools like `go test` and `mise` can work.
     pub scratch_dir: Option<bool>,
@@ -942,6 +947,9 @@ pub struct Resolved {
     /// EXPERIMENTAL: trade the macOS Keychain grant for a credential the agent
     /// can reach without it (`sandbox.keychain_substitute`, default false).
     pub keychain_substitute: bool,
+    /// `sandbox.allow_build_credentials` (#463). Expanded into `allow_read`
+    /// by `sandbox::build_credential_grants` at probe time.
+    pub allow_build_credentials: bool,
     pub scratch_dir: bool,
     pub use_bubblewrap: Option<bool>,
     pub quiet: bool,

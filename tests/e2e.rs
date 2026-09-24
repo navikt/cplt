@@ -2618,6 +2618,71 @@ mod e2e_tests {
         let _ = std::fs::remove_dir_all(&fake_home);
     }
 
+    /// `sandbox.allow_build_credentials` reaches the profile through the
+    /// binary's config and probe path (#463): on, each file gets the
+    /// per-file re-allow; unset, none does; a `--deny-path` drops its file.
+    #[test]
+    fn e2e_print_profile_build_credentials_key() {
+        let home = std::fs::canonicalize(make_config_home("buildcreds-home")).unwrap();
+        let cfg = make_config_home("buildcreds-cfg");
+        for rel in [".npmrc", ".gradle/gradle.properties", ".m2/settings.xml"] {
+            let path = home.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "token").unwrap();
+        }
+        let on = cfg.join("on.toml");
+        std::fs::write(&on, "[sandbox]\nallow_build_credentials = true\n").unwrap();
+        let profile = |config: Option<&Path>, extra: &[&str]| {
+            let mut cmd = cplt_cmd();
+            if let Some(c) = config {
+                cmd.env("CPLT_CONFIG", c);
+            }
+            let out = cmd
+                .arg("--print-profile")
+                .args(extra)
+                .env("HOME", &home)
+                .current_dir(project_dir())
+                .output()
+                .expect("binary should run");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let reallow = |rel: &str| {
+            format!(
+                "(allow file-read* (literal \"{}\"))",
+                home.join(rel).display()
+            )
+        };
+        let npmrc = home.join(".npmrc").to_string_lossy().into_owned();
+
+        let unset = profile(None, &[]);
+        let enabled = profile(Some(&on), &[]);
+        let denied = profile(Some(&on), &["--deny-path", &npmrc]);
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&cfg);
+
+        for rel in [".npmrc", ".gradle/gradle.properties", ".m2/settings.xml"] {
+            assert!(!unset.contains(&reallow(rel)), "unset re-allows {rel}");
+            assert!(
+                enabled.contains(&reallow(rel)),
+                "on misses {rel}:\n{enabled}"
+            );
+            let quoted = format!("\"{}\"", home.join(rel).display());
+            assert!(
+                !enabled
+                    .lines()
+                    .any(|l| l.starts_with("(allow file-write") && l.contains(&quoted)),
+                "on must not grant write to {rel}"
+            );
+        }
+        assert!(!denied.contains(&reallow(".npmrc")), "--deny-path lost");
+        assert!(denied.contains(&reallow(".m2/settings.xml")));
+    }
+
     #[test]
     fn e2e_config_validate_typo_fails() {
         let fake_home = std::env::temp_dir().join(format!(

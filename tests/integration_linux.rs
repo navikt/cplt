@@ -409,6 +409,116 @@ mod linux_tests {
         );
     }
 
+    /// Run the shell in a fake HOME with `sandbox.allow_build_credentials`
+    /// set as given (#463). The config lives outside HOME: a `CPLT_CONFIG`
+    /// directory holding HOME would make all of it cplt's state directory.
+    fn run_build_creds(home: &Path, on: bool, flags: &[&str], script: &str) -> (i32, String) {
+        let project = create_test_project();
+        let cfg = tempfile::tempdir().unwrap();
+        let cfg_file = cfg.path().join("config.toml");
+        fs::write(
+            &cfg_file,
+            format!("[sandbox]\nallow_build_credentials = {on}\n"),
+        )
+        .unwrap();
+        let dir = project.path().to_string_lossy().into_owned();
+        let mut args = vec![
+            "--yes",
+            "--no-validate",
+            "--quiet",
+            "--agent",
+            "shell",
+            "--project-dir",
+            &dir,
+        ];
+        args.extend_from_slice(flags);
+        args.extend_from_slice(&["--", "-c", script]);
+        let out = cplt_cmd()
+            .args(&args)
+            .env("HOME", home)
+            .env("CPLT_CONFIG", &cfg_file)
+            .output()
+            .expect("Failed to execute cplt");
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    }
+
+    fn build_creds_home() -> tempfile::TempDir {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        for (rel, body) in [
+            (".npmrc", "NPM_TOKEN_463"),
+            (".gradle/gradle.properties", "GRADLE_TOKEN_463"),
+            (".m2/settings.xml", "M2_PASSWORD_463"),
+            (".ssh/id_ed25519", "SSH_KEY_463"),
+        ] {
+            fs::create_dir_all(h.join(rel).parent().unwrap()).unwrap();
+            fs::write(h.join(rel), body).unwrap();
+        }
+        home
+    }
+
+    /// `~/.npmrc` is the file Linux actually withholds: it sits at the top of
+    /// `$HOME`, which is never granted. The `~/.m2` and `~/.gradle` files are
+    /// reachable through their tool dirs either way (the documented Landlock
+    /// limit), so only their readability is asserted here.
+    #[test]
+    fn build_credentials_key_grants_npmrc_read_only() {
+        require_landlock!();
+        let home = build_creds_home();
+        let read_all = "cat ~/.npmrc ~/.gradle/gradle.properties ~/.m2/settings.xml 2>&1";
+
+        let (_, off) = run_build_creds(home.path(), false, &[], read_all);
+        assert!(
+            !off.contains("NPM_TOKEN_463"),
+            "off: ~/.npmrc leaked: {off}"
+        );
+
+        let (_, on) = run_build_creds(home.path(), true, &[], read_all);
+        for token in ["NPM_TOKEN_463", "GRADLE_TOKEN_463", "M2_PASSWORD_463"] {
+            assert!(on.contains(token), "on: {token} unreadable: {on}");
+        }
+        let (code, out) = run_build_creds(home.path(), true, &[], "echo x >> ~/.npmrc");
+        assert_ne!(code, 0, "on: ~/.npmrc must stay read-only: {out}");
+        assert_eq!(
+            fs::read_to_string(home.path().join(".npmrc")).unwrap(),
+            "NPM_TOKEN_463"
+        );
+    }
+
+    #[test]
+    fn build_credentials_key_refuses_a_link_to_a_key_and_loses_to_deny_path() {
+        require_landlock!();
+        let home = build_creds_home();
+        let npmrc = home.path().join(".npmrc");
+
+        let deny = npmrc.to_string_lossy().into_owned();
+        let (_, out) = run_build_creds(
+            home.path(),
+            true,
+            &["--deny-path", &deny],
+            "cat ~/.npmrc 2>&1",
+        );
+        assert!(!out.contains("NPM_TOKEN_463"), "--deny-path lost: {out}");
+
+        fs::remove_file(&npmrc).unwrap();
+        std::os::unix::fs::symlink(home.path().join(".ssh/id_ed25519"), &npmrc).unwrap();
+        // Read the key by its own name too: under Bubblewrap the link itself
+        // may not be visible, while a grant on its target would be.
+        let (_, out) = run_build_creds(
+            home.path(),
+            true,
+            &[],
+            "cat ~/.npmrc ~/.ssh/id_ed25519 2>&1",
+        );
+        assert!(
+            !out.contains("SSH_KEY_463"),
+            "link into ~/.ssh leaked: {out}"
+        );
+    }
+
     #[test]
     fn landlock_blocks_docker_read() {
         require_landlock!();

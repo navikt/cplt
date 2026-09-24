@@ -225,6 +225,11 @@ pub fn repo_key_rejection_reason(key_info: &ConfigKeyInfo) -> &'static str {
              one of its own trees executable"
         }
         ("sandbox", "allow_cache_exec") => "cache paths are machine-specific, not project policy",
+        ("sandbox", "allow_build_credentials") => {
+            "hands the agent the user's own registry tokens from $HOME, and a repo cannot \
+             grant home paths. It is a per-user decision: \
+             cplt config set sandbox.allow_build_credentials true"
+        }
         ("sandbox", "allow_cache_exec_any") => {
             "too dangerous for repo config, it would affect all team members"
         }

@@ -545,6 +545,19 @@ pub fn display_config(loaded: Option<&LoadedConfig>, local: Option<&LoadedConfig
             c.sandbox.keychain_substitute.is_some()
         )
     );
+    let build_credentials = c.sandbox.allow_build_credentials.is_some();
+    if c.sandbox.allow_build_credentials == Some(true) {
+        let red = ui::stdout_color(ui::RED);
+        println!(
+            "{blue}[cplt]{nc}    allow_build_credentials = {red}true{nc} ⚠ DANGEROUS{}",
+            src("sandbox", "allow_build_credentials", build_credentials)
+        );
+    } else {
+        println!(
+            "{blue}[cplt]{nc}    allow_build_credentials = false{}",
+            src("sandbox", "allow_build_credentials", build_credentials)
+        );
+    }
     // The brief and its AGENTS.md layer had no rows at all, so a user who set
     // `sandbox.brief = true` saw nothing here and had to reach for
     // `config get` to confirm it. A key that changes behaviour and is absent

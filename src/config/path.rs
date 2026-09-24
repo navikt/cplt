@@ -287,6 +287,14 @@ pub fn default_config_contents() -> String {
 # nor re-authenticate from inside the sandbox. Unset it to get the grant back.
 # keychain_substitute = false
 #
+# DANGEROUS: Let the agent read ~/.npmrc, ~/.gradle/gradle.properties and
+# ~/.m2/settings.xml, read-only. A JVM or Node build that pulls from an
+# authenticated registry (GitHub Packages, Nexus) fails at dependency
+# resolution without them, even with the network open. The whole file is
+# exposed: every registry token in it, not just the one the project uses.
+# A --deny-path / deny.paths entry covering one of them still wins.
+# allow_build_credentials = false
+#
 # Suppress the startup configuration summary and non-essential messages.
 # Errors and warnings are always shown. Useful once you've reviewed the
 # sandbox settings and don't need to see them every time.

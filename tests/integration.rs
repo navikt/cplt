@@ -2862,6 +2862,137 @@ mod macos_tests {
         );
     }
 
+    // ── sandbox.allow_build_credentials (#463) ──────────────────
+
+    /// The three build credential files, planted with sentinels in a
+    /// throwaway HOME, plus a key in `~/.ssh` for the link case.
+    const BUILD_CREDS: [(&str, &str); 3] = [
+        (".npmrc", "SENTINEL_NPM_TOKEN_463"),
+        (".gradle/gradle.properties", "SENTINEL_GRADLE_TOKEN_463"),
+        (".m2/settings.xml", "SENTINEL_M2_PASSWORD_463"),
+    ];
+
+    fn build_creds_home(tag: &str) -> PathBuf {
+        let home = std::env::temp_dir().join(format!("cplt-bc-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        for (rel, sentinel) in BUILD_CREDS {
+            let path = home.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, sentinel).unwrap();
+        }
+        fs::create_dir_all(home.join(".ssh")).unwrap();
+        fs::write(home.join(".ssh/id_ed25519"), "SENTINEL_SSH_KEY_463").unwrap();
+        fs::canonicalize(&home).unwrap()
+    }
+
+    /// What `sandbox.allow_build_credentials = true` adds to `allow.read`.
+    fn build_creds_grants(home: &Path, deny: &[PathBuf]) -> Vec<PathBuf> {
+        cplt::sandbox::build_credential_grants(home, deny)
+            .into_iter()
+            .filter_map(Result::ok)
+            .collect()
+    }
+
+    /// `(read ok with sentinel, write succeeded)` for one file.
+    fn probe_build_cred(profile: &Path, file: &Path, sentinel: &str) -> (bool, bool) {
+        let f = file.display();
+        let (read, _) = run_sandboxed(&profile.to_path_buf(), &format!("cat '{f}' 2>&1"));
+        let (_, wrote) = run_sandboxed(&profile.to_path_buf(), &format!("echo x >> '{f}'"));
+        (read.contains(sentinel), wrote)
+    }
+
+    #[test]
+    fn real_profile_build_credentials_read_only_when_on_denied_when_off() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let home = build_creds_home("onoff");
+
+        // Off: nothing added, every file denied.
+        let off = write_real_profile(&default_opts(&project, &home));
+        // On: readable, never writable.
+        let grants = build_creds_grants(&home, &[]);
+        assert_eq!(grants.len(), 3, "{grants:?}");
+        let mut opts = default_opts(&project, &home);
+        opts.extra_read = &grants;
+        let on = write_real_profile(&opts);
+
+        let mut failures = Vec::new();
+        for (rel, sentinel) in BUILD_CREDS {
+            let file = home.join(rel);
+            let (read, wrote) = probe_build_cred(&off, &file, sentinel);
+            if read || wrote {
+                failures.push(format!("off: {rel} read={read} wrote={wrote}"));
+            }
+            let (read, wrote) = probe_build_cred(&on, &file, sentinel);
+            if !read || wrote {
+                failures.push(format!("on: {rel} read={read} wrote={wrote}"));
+            }
+            if fs::read_to_string(&file).unwrap() != sentinel {
+                failures.push(format!("{rel} was modified"));
+            }
+        }
+        fs::remove_dir_all(&home).ok();
+        fs::remove_file(&off).ok();
+        fs::remove_file(&on).ok();
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    #[test]
+    fn real_profile_build_credentials_refuse_a_link_to_a_key() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let home = build_creds_home("link");
+        let npmrc = home.join(".npmrc");
+        fs::remove_file(&npmrc).unwrap();
+        std::os::unix::fs::symlink(home.join(".ssh/id_ed25519"), &npmrc).unwrap();
+
+        let grants = build_creds_grants(&home, &[]);
+        let mut opts = default_opts(&project, &home);
+        opts.extra_read = &grants;
+        let profile = write_real_profile(&opts);
+        let (read, _) = probe_build_cred(&profile, &npmrc, "SENTINEL_SSH_KEY_463");
+        let (other, _) = probe_build_cred(
+            &profile,
+            &home.join(".m2/settings.xml"),
+            "SENTINEL_M2_PASSWORD_463",
+        );
+        fs::remove_dir_all(&home).ok();
+        fs::remove_file(&profile).ok();
+        assert!(
+            !read,
+            "~/.npmrc -> ~/.ssh/id_ed25519 must not expose the key"
+        );
+        assert!(other, "the other files are still granted");
+    }
+
+    #[test]
+    fn real_profile_build_credentials_lose_to_a_user_deny() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let home = build_creds_home("deny");
+        let npmrc = home.join(".npmrc");
+        let deny = vec![npmrc.clone()];
+
+        let grants = build_creds_grants(&home, &deny);
+        let mut opts = default_opts(&project, &home);
+        opts.extra_read = &grants;
+        opts.extra_deny = &deny;
+        let profile = write_real_profile(&opts);
+        let (read, _) = probe_build_cred(&profile, &npmrc, "SENTINEL_NPM_TOKEN_463");
+        let (other, _) = probe_build_cred(
+            &profile,
+            &home.join(".gradle/gradle.properties"),
+            "SENTINEL_GRADLE_TOKEN_463",
+        );
+        fs::remove_dir_all(&home).ok();
+        fs::remove_file(&profile).ok();
+        assert!(
+            !read,
+            "--deny-path ~/.npmrc must beat allow_build_credentials"
+        );
+        assert!(other, "the other files are still granted");
+    }
+
     // ── GPG signing ─────────────────────────────────────────────
 
     #[test]
