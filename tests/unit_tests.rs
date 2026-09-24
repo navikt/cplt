@@ -4801,6 +4801,16 @@ fn profile_carves_out_the_resolved_copilot_cache() {
             assert!(p.contains(&rule), "profile must contain {rule}");
         }
     }
+    // The default is readable through `~/Library/Caches`; `/opt` is not, and
+    // Copilot loads its extracted JS and native modules from there. The read
+    // allow must not follow the write deny it sits beside.
+    let read = p
+        .find("(allow file-read* (subpath \"/opt/copilot-cache/pkg\"))")
+        .expect("the moved cache must be readable");
+    let deny = p
+        .rfind("(deny file-write* (subpath \"/opt/copilot-cache/pkg\"))")
+        .unwrap();
+    assert!(read < deny, "the write deny must come after the read allow");
     assert!(
         p.contains("(deny file-write-unlink (literal \"/Users/test/Library/Caches/copilot\"))")
     );

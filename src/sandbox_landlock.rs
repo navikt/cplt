@@ -4371,11 +4371,19 @@ mod tests {
     fn copilot_sea_cache_exec_rule_follows_the_cache_variables() {
         let project = PathBuf::from("/home/user/project");
         let home = PathBuf::from("/home/user");
-        let env = |k: &str| (k == "XDG_CACHE_HOME").then(|| "/srv/xdg".into());
+        let env = |k: &str| match k {
+            "XDG_CACHE_HOME" => Some("/srv/xdg".into()),
+            "COPILOT_CACHE_HOME" => Some("/opt/copilot-cache".into()),
+            _ => None,
+        };
         let mut config = test_config(&project, &home);
         config.copilot_cache_env = &env;
         let policy = generate_policy(&config);
-        for path in ["/home/user/.cache/copilot/pkg", "/srv/xdg/copilot/pkg"] {
+        for path in [
+            "/home/user/.cache/copilot/pkg",
+            "/srv/xdg/copilot/pkg",
+            "/opt/copilot-cache/pkg",
+        ] {
             let rule = policy
                 .fs_rules
                 .iter()

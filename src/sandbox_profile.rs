@@ -1487,6 +1487,12 @@ fn emit_copilot_pkg_override_denies(sb: &mut String, config: &SandboxConfig) {
     // The first entry is always the default, emitted in `emit_tool_dirs`.
     for pkg_dir in super::copilot_pkg_grants(config, "macos").iter().skip(1) {
         let pins = super::home_config_target_pins(config, std::slice::from_ref(pkg_dir));
+        // The default sits in `~/Library/Caches`, already readable as a
+        // HOME_TOOL_DIR; a moved one (`/opt/...`) has no read grant, and
+        // Copilot loads its extracted JS and native modules from it. The
+        // carve-out's write deny still follows.
+        let pkg = pkg_dir.to_string_lossy();
+        sbpl!(sb, "(allow file-read* (subpath \"{pkg}\"))");
         emit_copilot_pkg_carveout(sb, pkg_dir, &pins);
     }
 }
