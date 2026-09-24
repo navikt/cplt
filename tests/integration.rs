@@ -1898,6 +1898,52 @@ mod macos_tests {
         }
     }
 
+    /// #576 review (F2): with `sandbox.deny_nested_git`, no `.git` can be
+    /// created inside a gitdir: the root's own, and a worktree common dir
+    /// outside every root, which only the gitdir rule covers. Off, all four
+    /// are allowed, so the key is what blocks them.
+    #[test]
+    fn real_profile_deny_nested_git_blocks_dot_git_inside_a_gitdir() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        for deny in [false, true] {
+            let id = format!("{}-{deny}", std::process::id());
+            let tmp = project.join(format!(".cplt-gitdir-git-{id}"));
+            let common = project.join(format!(".cplt-gitdir-common-{id}"));
+            fs::create_dir_all(tmp.join(".git/refs")).unwrap();
+            fs::create_dir_all(tmp.join(".git/info")).unwrap();
+            fs::create_dir_all(common.join("refs")).unwrap();
+            let (tmp, common) = (
+                fs::canonicalize(&tmp).unwrap(),
+                fs::canonicalize(&common).unwrap(),
+            );
+            let mut opts = default_opts(&tmp, &home);
+            opts.deny_nested_git = deny;
+            opts.git_common_dir = Some(&common);
+            let profile = write_real_profile(&opts);
+            let wrong: Vec<String> = [
+                tmp.join(".git/.git"),
+                tmp.join(".git/refs/.git"),
+                tmp.join(".git/info/.git"),
+                common.join("refs/.git"),
+            ]
+            .iter()
+            .filter_map(|p| {
+                let (output, _) = run_sandboxed(
+                    &profile,
+                    &format!("mkdir '{}' 2>&1; echo EXIT:$?", p.display()),
+                );
+                (output.contains("EXIT:0") == deny).then(|| format!("{}: {output}", p.display()))
+            })
+            .collect();
+            fs::remove_dir_all(&tmp).ok();
+            fs::remove_dir_all(&common).ok();
+            fs::remove_file(&profile).ok();
+            assert!(wrong.is_empty(), "deny_nested_git={deny}: {wrong:#?}");
+        }
+    }
+
     #[test]
     fn real_profile_blocks_git_config_write() {
         require_sandbox!();

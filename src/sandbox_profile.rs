@@ -1134,6 +1134,11 @@ fn emit_git_persistence_denies(
     for gitdir in &gitdirs {
         emit_gitdir_denies(sb, gitdir);
     }
+    if deny_nested_git {
+        for gitdir in &gitdirs {
+            emit_gitdir_dot_git_create_deny(sb, gitdir);
+        }
+    }
     // `<gitdir>/worktrees/<name>/config.worktree` is read as repository config
     // when `extensions.worktreeConfig` is set, so it is another core.hooksPath
     // vector — one per worktree. `<name>` is unknown when the profile is
@@ -1255,6 +1260,29 @@ fn emit_nested_git_create_deny(sb: &mut String, root: &str) {
     sbpl!(
         sb,
         "(deny file-write-create (regex #\"^{r}/.+/\\.[gG][iI][tT]$\"))"
+    );
+    sbpl!(sb);
+}
+
+/// `sandbox.deny_nested_git` (#576 review, F2): no `.git` entry anywhere inside
+/// a known gitdir. Git run with its working directory inside the gitdir
+/// (`.git/refs`, say) looks for `.git` there first, so a planted
+/// `<gitdir>/refs/.git` would be obeyed by a prompt that `cd`s in.
+///
+/// For a gitdir below a writable root, `emit_nested_git_create_deny` already
+/// matches these paths; this rule is what covers a gitdir outside every root
+/// (the worktree common dir, a named root's resolved gitdir). Nested
+/// repositories' gitdirs are below a root by definition, so they need no
+/// separate form.
+fn emit_gitdir_dot_git_create_deny(sb: &mut String, gitdir: &str) {
+    let g = escape_regex(gitdir);
+    sbpl!(
+        sb,
+        ";; No new .git entries inside {gitdir} (sandbox.deny_nested_git)"
+    );
+    sbpl!(
+        sb,
+        "(deny file-write-create (regex #\"^{g}/(.+/)?\\.[gG][iI][tT]$\"))"
     );
     sbpl!(sb);
 }

@@ -9225,6 +9225,8 @@ fn deny_nested_git_emits_create_deny_only_when_set() {
     let last_allow = on.rfind("(allow file-write").expect("a write allow");
     assert!(deny > last_allow, "the deny must follow every write allow");
     assert!(on.contains(r#"/.+/\.[gG][iI][tT]$"))"#), "{on}");
+    // F2: and inside the root's own gitdir.
+    assert!(on.contains(r#"/\.git/(.+/)?\.[gG][iI][tT]$"))"#), "{on}");
 }
 
 // ── Config coverage tests ─────────────────────────────────────────────────────
