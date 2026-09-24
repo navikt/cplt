@@ -367,6 +367,14 @@ fn git_toplevel(project_dir: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(root))
 }
 
+/// Whether `.cplt.toml` is committed at HEAD, which is the copy
+/// [`load_repo_config`] reads in preference to the working tree. Used to say
+/// which copy a load error came from (#385 M-01).
+#[must_use]
+pub fn committed_in_head(project_dir: &Path) -> bool {
+    read_from_git_head(project_dir).is_some()
+}
+
 /// Read `.cplt.toml` from git HEAD (the latest committed version).
 ///
 /// Uses `git cat-file blob HEAD:.cplt.toml` which reads from the object store,

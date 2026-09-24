@@ -781,15 +781,17 @@ If you only need one of the files, a single `allow.read` line is narrower. `cplt
 
 ## Refusing an invalid `.cplt.toml` (`sandbox.refuse_invalid_repo_config`)
 
-By default, a `.cplt.toml` that cannot be read or parsed produces a warning and the launch goes ahead. This applies to the launch repository and to every named repository. The warning names the error and says that the file's `[deny]` section is not applied. Everything the file would have granted is lost too. The session is less restricted than the file asks for, and a warning can scroll past unread.
+By default, a `.cplt.toml` that cannot be read, cannot be parsed or fails validation produces a warning, and the launch goes ahead. This applies to the launch repository and to every named repository. The warning names the error and says that the file's `[deny]` section is not applied. Everything the file would have granted is lost too. The session is less restricted than the file asks for, and a warning can scroll past unread. A `[deny]` key this version of cplt does not recognize, such as a typo, is warned about in the same way and is not applied.
 
 ```bash
 cplt config set sandbox.refuse_invalid_repo_config true
 ```
 
-With the key on, cplt refuses to launch instead. The error names the file and the parse error, and the fix is to correct the file. `cplt exec` and `cplt check` read repo config the same way, so they refuse too.
+With the key on, cplt refuses to launch instead, for both cases: a file it cannot load, and a file with an unrecognized `[deny]` key. The error names the file and the problem. It also says which copy cplt read: cplt prefers the committed `HEAD:.cplt.toml` to the working tree, so a broken committed file needs a fixing commit, and editing the working tree changes nothing. An unrecognized `[propose]` key does not refuse. It grants nothing, and refusing it would break older cplt versions reading a file written for a newer one. `cplt exec` and `cplt check` read repo config the same way, so they refuse too.
 
-It is off by default, and it is set in your own config, never in `.cplt.toml`. The cost of turning it on is that anyone who can write a repository's `.cplt.toml` can stop every launch there. That includes a previous agent session: the working-tree file in a named repository is writable inside the sandbox, and on the Landlock-only Linux path so is the project's. The refusal is loud and names the file, so this can stop your work but cannot weaken the sandbox. With the key off, cplt behaves exactly as it did before the key existed.
+It is off by default, and it is set in your own config, never in `.cplt.toml`. Turning it on means that anyone who can write a repository's `.cplt.toml` can stop every launch there. That includes an earlier agent session on either platform, in the launch repository or a named one. A session can commit a broken `.cplt.toml` into HEAD, and that commit shows in `git log`. On the Landlock-only Linux path a session can also edit the uncommitted working-tree file. The refusal is loud and names the file, so this can stop your work but cannot weaken the sandbox.
+
+The key catches broken or mistyped files. It is not a defence against an adversarial session: a session that can commit a broken file can just as easily commit a valid one with the `[deny]` section removed, and cplt applies that without complaint. With the key off, cplt launches as before.
 
 ## Blocking new nested `.git` entries (`sandbox.deny_nested_git`)
 

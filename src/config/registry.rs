@@ -403,7 +403,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: false,
         default_display: "false",
-        description: "Refuse to launch when a repository's .cplt.toml cannot be read or parsed, naming the error, instead of warning and launching without its [deny] rules. Covers the launch repository and every named repository.",
+        description: "Refuse to launch when a repository's .cplt.toml cannot be loaded or has a [deny] key this cplt does not recognize, naming the problem, instead of warning and launching without those [deny] rules. Covers the launch repository and every named repository. Catches broken files, not an adversarial session.",
     },
     ConfigKeyInfo {
         section: "sandbox",

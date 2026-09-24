@@ -1971,6 +1971,39 @@ fn warn_exec_tool_dir_shadowing(
 /// the repository a relaxation it asked for, which surfaces as a build that
 /// cannot do something; an ignored `[deny]` key costs a restriction its author
 /// believed was in force, and nothing else in the session will mention it.
+/// The `sandbox.refuse_invalid_repo_config` refusal (#385 M-01). Names the
+/// copy cplt read, because the fix differs: the loader prefers
+/// `HEAD:.cplt.toml`, and editing the working tree does not change that one.
+fn invalid_repo_config_refusal(problem: &str, committed: bool, named: bool) -> anyhow::Error {
+    let fix = if committed {
+        "The copy cplt read is the one committed at HEAD, not the working tree, so \
+         commit a fix and rerun"
+    } else {
+        "The copy cplt read is the uncommitted working-tree file, so fix the file and \
+         rerun"
+    };
+    let drop = if named {
+        ", or drop the repository from the named set"
+    } else {
+        ""
+    };
+    anyhow::anyhow!(
+        "{problem}\n  sandbox.refuse_invalid_repo_config is on, so cplt will not launch \
+         without the [deny] rules this file may hold. {fix}{drop}."
+    )
+}
+
+/// The unknown `[deny]` keys, comma-joined, for the refusal above.
+fn deny_unknown(config: &repo_config::RepoConfig) -> String {
+    config
+        .deny
+        .unknown
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", deny.")
+}
+
 fn warn_unknown_repo_config_keys(config: &repo_config::RepoConfig, label: &str) {
     let unknown = repo_config::unknown_keys(config);
     if unknown.is_empty() {
@@ -2410,6 +2443,21 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                 ui::info(&format!("Repo config: .cplt.toml{source_note}"));
             }
             warn_unknown_repo_config_keys(&loaded.config, ".cplt.toml");
+            // An unknown `[deny]` key is a restriction that is not applied,
+            // the same loss as a file that does not parse. Unknown `[propose]`
+            // keys grant nothing and stay forward-compatible.
+            if resolved.refuse_invalid_repo_config
+                && repo_config::has_unknown_tightening_keys(&loaded.config)
+            {
+                return Err(invalid_repo_config_refusal(
+                    &format!(
+                        ".cplt.toml has [deny] keys this cplt does not understand: deny.{}",
+                        deny_unknown(&loaded.config)
+                    ),
+                    matches!(loaded.source, repo_config::RepoConfigSource::GitHead),
+                    false,
+                ));
+            }
             if loaded.propose_dropped && !resolved.quiet {
                 // Said plainly, because the alternative is a session that quietly
                 // lacks a permission the file asks for and a developer who reads
@@ -2544,11 +2592,13 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         Ok(None) => {} // No .cplt.toml in HEAD — warn_repo_config_discrepancy explains why
         // #385 M-01: a file that does not parse loses its `[deny]` with it.
         // Warned by default; `sandbox.refuse_invalid_repo_config` makes it fatal.
-        Err(e) if resolved.refuse_invalid_repo_config => bail!(
-            "Cannot load .cplt.toml: {e}\n  \
-             sandbox.refuse_invalid_repo_config is on, so cplt will not launch without \
-             the [deny] rules this file may hold. Fix the file and rerun."
-        ),
+        Err(e) if resolved.refuse_invalid_repo_config => {
+            return Err(invalid_repo_config_refusal(
+                &format!("Cannot load .cplt.toml: {e}"),
+                repo_config::committed_in_head(&project_dir),
+                false,
+            ));
+        }
         Err(e) => {
             ui::warn(&format!(
                 "Failed to load .cplt.toml: {e}\n  \
@@ -2595,6 +2645,20 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                     &loaded.config,
                     &root.dir.join(".cplt.toml").display().to_string(),
                 );
+                if resolved.refuse_invalid_repo_config
+                    && repo_config::has_unknown_tightening_keys(&loaded.config)
+                {
+                    return Err(invalid_repo_config_refusal(
+                        &format!(
+                            ".cplt.toml in the named repository {} has [deny] keys this cplt \
+                             does not understand: deny.{}",
+                            root.dir.display(),
+                            deny_unknown(&loaded.config)
+                        ),
+                        matches!(loaded.source, repo_config::RepoConfigSource::GitHead),
+                        true,
+                    ));
+                }
                 resolved.apply_repo_deny(&loaded.config, &loaded.dir);
             }
             // No `.cplt.toml` is the ordinary case and says nothing.
@@ -2615,13 +2679,16 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             // breath. The session is less restricted than that repository asked
             // for, and the operator is told exactly that.
             // `sandbox.refuse_invalid_repo_config` makes both fatal (#385 M-01).
-            Err(e) if resolved.refuse_invalid_repo_config => bail!(
-                "Cannot read .cplt.toml in the named repository {}: {e}\n  \
-                 sandbox.refuse_invalid_repo_config is on, so cplt will not launch without \
-                 the [deny] rules this file may hold. Fix the file, or drop the repository \
-                 from the named set.",
-                root.dir.display()
-            ),
+            Err(e) if resolved.refuse_invalid_repo_config => {
+                return Err(invalid_repo_config_refusal(
+                    &format!(
+                        "Cannot read .cplt.toml in the named repository {}: {e}",
+                        root.dir.display()
+                    ),
+                    repo_config::committed_in_head(&root.dir),
+                    true,
+                ));
+            }
             Err(e) => {
                 ui::warn(&format!(
                     "Cannot read .cplt.toml in the named repository {}: {e}\n  \
@@ -5243,7 +5310,15 @@ fn assemble_sandbox(
     // Here, not at each caller: the launch, `exec` and `check` all build their
     // policy through this function, and all three must say it.
     if proxy_handle.is_some() {
-        warn_agent_writable_list_files(resolved, &policy, home_dir);
+        // The same decision the proxy makes: `--observe-domains` and
+        // `--allow-all-domains` leave the allowlist file unread.
+        let use_allowed_file = resolve_domain_allowlist_decision(
+            cli.observe_domains,
+            resolved.allow_all_domains,
+            resolved.default_allowlist,
+        )
+        .use_allowed_file;
+        warn_agent_writable_list_files(resolved, use_allowed_file, &policy, home_dir);
     }
     // Path validation (SBPL injection checks on macOS) is handled internally by
     // prepare(), so callers don't need to know about backend-specific risks.
@@ -8257,27 +8332,37 @@ fn agent_writable_root(file: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
 /// safe and this catches unusual layouts.
 fn warn_agent_writable_list_files(
     resolved: &config::Resolved,
+    use_allowed_file: bool,
     policy: &sandbox::LandlockPolicy,
     home: &Path,
 ) {
     let allowed = resolved
         .allowed_domains
         .as_ref()
-        .filter(|_| !resolved.allow_all_domains);
+        .filter(|_| use_allowed_file);
     for (key, file) in [
         ("proxy.allowed_domains", allowed),
         ("proxy.blocked_domains", resolved.blocked_domains.as_ref()),
     ] {
         let Some(file) = file else { continue };
         if let Some((entry, tree)) = cplt::check::writable_tree_on_path(policy, home, file) {
+            let is_file = std::path::absolute(file).is_ok_and(|a| a == entry)
+                || std::fs::canonicalize(file).is_ok_and(|c| c == entry);
+            let where_ = if is_file {
+                format!("which is inside {}", tree.display())
+            } else {
+                format!(
+                    "and {} on the way to it is inside {}",
+                    entry.display(),
+                    tree.display()
+                )
+            };
             ui::warn(&format!(
-                "{key} names {}, and {} on the way to it is inside {}, which the sandbox \
-                 makes writable. The proxy re-reads that file every few seconds, so the agent \
-                 could swap it and change its own egress rules mid-session. Move the file \
-                 somewhere no grant covers (for example ~/.config/cplt/).",
+                "{key} names {}, {where_}, which the sandbox makes writable. The proxy \
+                 re-reads that file every few seconds, so the agent could swap it and change \
+                 its own egress rules mid-session. Move the file somewhere no grant covers \
+                 (for example ~/.config/cplt/).",
                 file.display(),
-                entry.display(),
-                tree.display()
             ));
         }
     }

@@ -1247,6 +1247,41 @@ mod tests {
             ask(&other.join("hop/allowed.txt")),
             Some((proj.join("hop2"), proj.clone()))
         );
+
+        // `..` after a symlink is taken from where the link leads, as the
+        // kernel does: other/up -> proj/sub, so other/up/../../safe passes
+        // through proj/sub. Read lexically it would never touch proj.
+        std::fs::create_dir(proj.join("sub")).unwrap();
+        symlink(proj.join("sub"), other.join("up")).unwrap();
+        assert_eq!(
+            ask(&other.join("up/../../safe/allowed.txt")),
+            Some((proj.join("sub"), proj.clone()))
+        );
+
+        // A relative target resolves against the link's own directory:
+        // other/rel -> ../proj/hop2, which is itself a link out to safe.
+        symlink("../proj/hop2", other.join("rel")).unwrap();
+        assert_eq!(
+            ask(&other.join("rel/allowed.txt")),
+            Some((proj.join("hop2"), proj.clone()))
+        );
+
+        // A symlink loop ends once the hop budget runs out, in or out of a
+        // writable tree.
+        symlink("b", other.join("a")).unwrap();
+        symlink("a", other.join("b")).unwrap();
+        assert_eq!(ask(&other.join("a/allowed.txt")), None);
+        symlink("lb", proj.join("la")).unwrap();
+        symlink("la", proj.join("lb")).unwrap();
+        assert!(ask(&proj.join("la/allowed.txt")).is_some());
+
+        // A missing component is walked lexically from there on: the file an
+        // agent could create at that path is the one named.
+        assert_eq!(ask(&safe.join("missing/allowed.txt")), None);
+        assert_eq!(
+            ask(&proj.join("missing/allowed.txt")),
+            Some((proj.join("missing/allowed.txt"), proj.clone()))
+        );
     }
 
     // ── explain_path ──
