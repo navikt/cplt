@@ -52,9 +52,17 @@ fn compute_mise_ignored_paths(project_dir: &Path, home: &Path) -> Vec<PathBuf> {
 /// variable in the first place because `sandbox::keychain_substitute`
 /// filters `deny_env` before returning one (#242).
 ///
-/// The forwarded variable is deliberately NOT in `ENV_ALLOWLIST` — it reaches
-/// the agent only as part of this trade, so with `sandbox.keychain_substitute`
-/// off the child environment is exactly what it was before the key existed.
+/// With `sandbox.keychain_substitute` off there is no substitute, so this adds
+/// nothing and the child environment is what it was before the key existed.
+/// That holds for two different reasons:
+///
+/// - Other agents' substitute vars (`CLAUDE_CODE_OAUTH_TOKEN`) are deliberately
+///   NOT in `ENV_ALLOWLIST`; they reach the agent only through this trade.
+/// - Copilot's (`GH_TOKEN`, `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN`) ARE in
+///   `ENV_ALLOWLIST` and have been since before the trade. An exported one
+///   reaches Copilot either way. What only this function adds is a
+///   `KeychainSubstitute::GhToken` value that is in no parent environment:
+///   the token `gh auth token` printed, set under one of those names.
 pub(super) fn apply_deny_env_and_credential(
     cmd: &mut Command,
     deny_env: &[String],
