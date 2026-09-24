@@ -779,15 +779,15 @@ If you only need one of the files, a single `allow.read` line is narrower. `cplt
 
 ## Blocking new nested `.git` entries (`sandbox.deny_nested_git`)
 
-A session can make any subdirectory of the project into a repository whose config it wrote: a `.git` pointer file, a `.git` symlink, or a git directory renamed into place. Git run there later, outside the sandbox, runs whatever that config names ([#576](https://github.com/navikt/cplt/issues/576)). cplt checks for this at the end of every session and names each directory whose `.git` is new or changed, including a `.GIT`-style case variant, a git-directory layout with no `.git` at all (a `HEAD` plus `objects/` and `refs/`, or plus a `commondir` file), and a symlink to a repository elsewhere. That check is always on and has no key. Its limits are listed in [SECURITY.md](../SECURITY.md).
+A session can make any subdirectory of the project into a repository whose config it wrote: a `.git` pointer file, a `.git` symlink, or a git directory renamed into place. Git run there later, outside the sandbox, runs whatever that config names ([#576](https://github.com/navikt/cplt/issues/576)). cplt checks for this at the end of every session and names each directory whose `.git` is new or changed, including a `.GIT`-style case variant, a git-directory layout with no `.git` at all (a `HEAD` plus `objects/` and `refs/`, or plus a `commondir` file), and a new `.git` at a project root that was not a repository at launch. It also names every new or re-aimed symlink that leads out of the project, whatever it points at, and every directory it could not list. That check is always on and has no key. Its limits are listed in [SECURITY.md](../SECURITY.md).
 
-`sandbox.deny_nested_git` also blocks the plant on macOS. It refuses to create the `.git` name itself, in any letter case, below each writable root (file, directory, symlink, hard link, or rename onto the name). The root's own `.git` is not affected, so `git init` in the project directory still works. It does not block:
+`sandbox.deny_nested_git` also blocks the plant on macOS. It refuses to create the `.git` name itself, in any letter case, below each writable root (file, directory, symlink, hard link, or rename onto the name). The root's own `.git` is not affected, so `git init` in the project directory still works. It also refuses a new `.git` anywhere inside a git directory the profile knows (such as `<project>/.git/refs/.git`). It does not block:
 
 - moving in a directory that already contains a `.git`, staged in a writable place outside the project such as `/private/tmp` or `/var/folders`
-- a symlink to a repository outside the project
+- a symlink out of the project
 - the git-directory layout; for that, set `safe.bareRepository = explicit` in your global git config
 
-The end-of-session check reports all three.
+The end-of-session check reports all three: the moved-in directory and the layout as new repositories, the symlink as a link leading out of the project.
 
 ```bash
 cplt config set sandbox.deny_nested_git true
@@ -798,6 +798,7 @@ Off by default, because it breaks things that create a `.git` below the project:
 - `git worktree add` into a directory inside the project
 - test fixtures that `git init` or `mkdir .git` inside the project (on macOS, `git init` there already fails without this key, but a fixture that writes the `.git` itself succeeds)
 - any tool that writes a `gitdir:` pointer file inside the project
+- `allow.write` grants that cover a package manager's git checkouts, such as `~/.cargo/git/checkouts`: the rule applies below every writable root, so fetching a new git dependency there fails
 
 It has no effect on Linux, where the launch says so. Landlock cannot deny a path inside a tree it allows, and bubblewrap only protects paths that exist at launch, so there the end-of-session check is the only cover.
 
