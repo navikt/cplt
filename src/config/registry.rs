@@ -443,7 +443,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: false,
         default_display: "false",
-        description: "Grant read, write and execute on a cplt-owned directory for this repository's sub-agent worktrees (~/.cplt-worktrees/<id>, exported as CPLT_WORKTREE_ROOT). Worktrees and branches there persist after the session. User config only; .cplt.toml cannot propose it.",
+        description: "Grant read, write and execute on a cplt-owned directory for this repository's sub-agent worktrees (~/.cplt-worktrees/<id>, exported as CPLT_WORKTREE_ROOT). Worktrees and branches there persist after the session. macOS only. User config only; .cplt.toml cannot propose it.",
     },
     ConfigKeyInfo {
         section: "sandbox",

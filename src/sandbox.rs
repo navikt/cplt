@@ -148,6 +148,10 @@ pub struct SandboxConfig<'a> {
     /// [`crate::sandbox::named_root_git_dirs`], so a surface that builds a
     /// policy cannot forget it (#447).
     pub named_root_git_dirs: &'a [PathBuf],
+    /// The managed worktree root (#531), also present in `named_roots`.
+    /// `Some` adds the macOS pins that only matter with the key on: the root's
+    /// name, and each `<gitdir>/worktrees/<name>/commondir` against rewrite.
+    pub managed_worktree_root: Option<&'a Path>,
     pub home_dir: &'a Path,
     pub extra_read: &'a [PathBuf],
     pub extra_write: &'a [PathBuf],
@@ -2196,6 +2200,7 @@ mod tests {
             extra_deny: &[],
             named_roots: &[],
             named_root_git_dirs: &[],
+            managed_worktree_root: None,
             existing_home_tool_dirs: None,
             existing_app_dirs: None,
             extra_ports: &[],

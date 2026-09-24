@@ -437,8 +437,9 @@ the gh guard is the thing standing between an agent and the wrong repository.
 
 ## Worktrees for sub-agents (`sandbox.allow_git_worktrees`)
 
-Off by default. When on, cplt gives the session one directory where sub-agents
-can create Git worktrees for parallel work without touching your checkout:
+Off by default, macOS only. When on, cplt gives the session one directory
+outside your checkout where sub-agents can create Git worktrees for parallel
+work:
 
 ```bash
 cplt config set sandbox.allow_git_worktrees true           # every repository
@@ -460,24 +461,39 @@ What you get:
 - The root is granted read, write and execute, like a `--repo-dir` repository.
   `~/.cplt-worktrees` itself and the roots of other repositories are not
   granted.
+- There is no isolation between sub-agents. All worktrees in a session share
+  one grant, so a sub-agent can write the other sub-agents' worktrees, and
+  every sub-agent can still write the launch checkout. Separate worktrees keep
+  parallel work apart; they do not protect it from another agent.
 - The launch prints the root in the startup summary, exports it as
   `CPLT_WORKTREE_ROOT`, and names it in the sandbox brief. With the key off the
-  variable is not set, even if your shell has one.
-- The same persistence denies apply as in the project: the shared `.git/hooks`
-  and `.git/config`, each worktree's `config.worktree` and `.git` pointer file,
-  and `.github/hooks`, `.claude/settings.json`, `.cplt.toml` and the rest of
-  the per-root list inside every worktree. On macOS these hold at any depth. On
-  Linux only the shared `.git` protections apply, and only where bubblewrap
-  runs. See [SECURITY.md](../SECURITY.md#managed-worktree-root-sandboxallow_git_worktrees).
+  variable is removed, even if your shell has one.
+- The same persistence denies apply as in the project, at any depth: the shared
+  `.git/hooks` and `.git/config`, each worktree's `config.worktree`, and
+  `.github/hooks`, `.claude/settings.json`, `.cplt.toml` and the rest of the
+  per-root list inside every worktree. See
+  [SECURITY.md](../SECURITY.md#managed-worktree-root-sandboxallow_git_worktrees).
+- Each worktree's `.git` pointer and its `commondir` cannot be rewritten in
+  place. Deleting and recreating them is not blocked, so cplt checks both
+  links at every launch and at session end. A link that does not match what
+  `git worktree add` writes prints a loud warning at session end and makes the
+  next launch refuse to start. Do not run Git in those worktrees until you
+  have checked them.
 - Worktrees and branches persist after the session. cplt never removes them.
   Clean up with `git worktree remove` and `git branch -d` when you are done.
-- The end-of-session audit does not cover the worktrees yet. It prints a line
-  saying so. Review them with `git worktree list`.
+- The end-of-session audit does not cover the worktrees' contents yet. It
+  prints a line saying so. Review them with `git worktree list`.
 
 The launch fails, rather than running without the root, if it cannot be
-granted: the launch directory is not in a Git repository, the root or
-`~/.cplt-worktrees` is a symlink, is not a directory, or is owned by another
-user, or the repository's `commondir` does not match the layout Git writes.
+granted: the root or `~/.cplt-worktrees` is a symlink, is not a directory, or
+is owned by another user, the repository's `commondir` does not match the
+layout Git writes, or a worktree link fails the check above. It also fails on
+Linux, where nothing inside the root would be kernel-enforced.
+
+Outside a Git repository there is no root to grant. With the key in your
+global config, cplt warns and runs without it. With the key in this checkout's
+local config, the launch fails. `cplt doctor` and `cplt check` report on the
+root without creating it.
 
 The key is accepted only in your own config, global or local. A `.cplt.toml`
 cannot set it or propose it. There it is an unknown key: it is reported and

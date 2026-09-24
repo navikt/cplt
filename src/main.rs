@@ -1795,8 +1795,28 @@ fn policy_roots(repo_paths: &[PathBuf], worktree_root: Option<&Path>) -> Vec<Pat
 /// Per-worktree reporting is deferred (#531). Until it exists, an audit that
 /// reads "no changes" while sub-agents committed in their worktrees would be a
 /// report of success that ignored their work, so the gap is stated every time.
-fn warn_worktrees_not_audited(audit_enabled: bool, worktree_root: Option<&Path>) {
-    if let (true, Some(root)) = (audit_enabled, worktree_root) {
+///
+/// The worktree links are checked here too, audit or not: the session could
+/// have left a `commondir` or `.git` pointer that makes git on the host read
+/// agent-written config, and this is the last moment cplt can say so.
+fn warn_worktrees_not_audited(
+    audit_enabled: bool,
+    worktree_root: Option<&Path>,
+    project_dir: &Path,
+) {
+    let Some(root) = worktree_root else {
+        return;
+    };
+    let problems = cplt::worktrees::session_end_problems(project_dir, root);
+    if !problems.is_empty() {
+        ui::warn(&format!(
+            "WORKTREE LINKS CHANGED. Do not run git in this repository's worktrees until you \
+             have checked these: git outside cplt could read agent-written config and run \
+             it.\n    {}\n  The next cplt launch refuses to start until they are fixed.",
+            problems.join("\n    ")
+        ));
+    }
+    if audit_enabled {
         ui::warn(&format!(
             "The audit above does not cover worktrees under {}. Review them there \
              (`git worktree list` from this repository).",
@@ -1809,26 +1829,49 @@ fn warn_worktrees_not_audited(audit_enabled: bool, worktree_root: Option<&Path>)
 ///
 /// Fails rather than skipping: a user who turned the key on and gets a session
 /// without the root would find out only when a sub-agent's `git worktree add`
-/// is refused, with nothing pointing back here.
+/// is refused, with nothing pointing back here. The one exception is a launch
+/// outside any repository with the key set globally: there is no repository to
+/// give a root to, and failing would break every such launch. That warns and
+/// runs without the root. A key in this checkout's local config still fails.
+///
+/// `create` is false for `doctor` and `check`, which must not create the root.
 fn managed_worktree_root(
     enabled: bool,
+    from_local: bool,
+    create: bool,
     home_dir: &Path,
     project_dir: &Path,
 ) -> anyhow::Result<Option<PathBuf>> {
     if !enabled {
         return Ok(None);
     }
-    #[cfg(target_os = "linux")]
-    ui::warn(cplt::worktrees::LINUX_GAP);
-    cplt::worktrees::prepare_root(home_dir, project_dir)
-        .map(Some)
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "sandbox.allow_git_worktrees is on, but the managed worktree root cannot be \
-                 granted: {e}.\n  Fix the cause, or turn the key off \
-                 (`cplt config set sandbox.allow_git_worktrees false`)."
-            )
-        })
+    let fail = |e: String| {
+        anyhow::anyhow!(
+            "sandbox.allow_git_worktrees is on, but the managed worktree root cannot be \
+             granted: {e}.\n  Fix the cause, or turn the key off \
+             (`cplt config set sandbox.allow_git_worktrees false`)."
+        )
+    };
+    let not_in_repo = || format!("{} is not in a git repository", project_dir.display());
+    // Not in a repository, key from global config: nothing to grant.
+    if !from_local
+        && matches!(
+            cplt::worktrees::repository_common_dir(project_dir),
+            Ok(None)
+        )
+    {
+        ui::warn(&format!(
+            "sandbox.allow_git_worktrees is on, but {}. Running without a worktree root.",
+            not_in_repo()
+        ));
+        return Ok(None);
+    }
+    cplt::worktrees::refuse_unsupported_os(std::env::consts::OS).map_err(fail)?;
+    match cplt::worktrees::prepare_root(home_dir, project_dir, create) {
+        Ok(Some(root)) => Ok(Some(root)),
+        Ok(None) => Err(fail(not_in_repo())),
+        Err(e) => Err(fail(e)),
+    }
 }
 
 /// Warn when the binary cplt is about to launch is a shim whose real target the
@@ -2789,8 +2832,17 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         project_dir.clone()
     };
 
-    let worktree_root =
-        managed_worktree_root(resolved.allow_git_worktrees, &home_dir, &project_dir)?;
+    let worktree_key_is_local = local_cfg
+        .as_ref()
+        .and_then(|l| l.config.sandbox.allow_git_worktrees)
+        .is_some();
+    let worktree_root = managed_worktree_root(
+        resolved.allow_git_worktrees,
+        worktree_key_is_local,
+        !(check_mode || cli.doctor || cli.print_profile),
+        &home_dir,
+        &project_dir,
+    )?;
     // Same confused deputy as the named-root check above: the managed root is
     // agent-writable, so a config file inside it is one the agent could rewrite.
     if let (Some(root), Some(custom)) = (
@@ -4138,7 +4190,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             })
         },
     );
-    warn_worktrees_not_audited(audit_enabled, worktree_root.as_deref());
+    warn_worktrees_not_audited(audit_enabled, worktree_root.as_deref(), &project_dir);
 
     // Cleanup
     if cli.observe_domains
@@ -5209,6 +5261,7 @@ fn build_sandbox_config<'a>(
         extra_deny: &resolved.deny_paths,
         named_roots: repos.dirs,
         named_root_git_dirs: repos.git_dirs,
+        managed_worktree_root: repos.worktree_root,
         existing_home_tool_dirs: Some(&probe.existing_home_tool_dirs),
         existing_app_dirs: Some(&probe.existing_app_dirs),
         extra_ports: &resolved.allow_ports,
@@ -5539,7 +5592,7 @@ fn run_exec_command(
             })
         },
     );
-    warn_worktrees_not_audited(audit_enabled, worktree_root.as_deref());
+    warn_worktrees_not_audited(audit_enabled, worktree_root.as_deref(), &project_dir);
 
     if cli.observe_domains
         && let Some(snapshot) = snapshot.as_ref()
@@ -9704,8 +9757,14 @@ mod tests {
     fn managed_worktree_root_off_adds_nothing() {
         use std::path::{Path, PathBuf};
         let home = tempfile::tempdir().expect("tempdir");
-        let root = super::managed_worktree_root(false, home.path(), Path::new("/nonexistent"))
-            .expect("off never fails");
+        let root = super::managed_worktree_root(
+            false,
+            false,
+            true,
+            home.path(),
+            Path::new("/nonexistent"),
+        )
+        .expect("off never fails");
         assert!(root.is_none());
         assert!(!home.path().join(cplt::worktrees::BASE).exists());
         let named = vec![PathBuf::from("/w/lib")];
@@ -9719,14 +9778,20 @@ mod tests {
         );
     }
 
-    /// #531 on, outside a repository: the launch fails and says which key.
+    /// #531 on, outside a repository: a key in local config fails the launch
+    /// and says which key; a global one warns and runs without a root, so it
+    /// does not break every launch outside a repository.
     #[test]
-    fn managed_worktree_root_on_without_a_repository_fails_loudly() {
+    fn managed_worktree_root_on_without_a_repository() {
         let home = tempfile::tempdir().expect("tempdir");
         let plain = tempfile::tempdir().expect("tempdir");
-        let err = super::managed_worktree_root(true, home.path(), plain.path())
-            .expect_err("no repository, no root");
+        let err = super::managed_worktree_root(true, true, true, home.path(), plain.path())
+            .expect_err("local key, no repository, no root");
         assert!(err.to_string().contains("allow_git_worktrees"), "{err}");
+        let root = super::managed_worktree_root(true, false, true, home.path(), plain.path())
+            .expect("global key outside a repository is skipped");
+        assert!(root.is_none());
+        assert!(!home.path().join(cplt::worktrees::BASE).exists());
     }
     /// #553: every path the "read is blocked" probe can pick must really be
     /// denied on both backends, or `cplt check` reports a failure that is not

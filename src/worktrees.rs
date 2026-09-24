@@ -22,23 +22,30 @@ pub const ENV: &str = "CPLT_WORKTREE_ROOT";
 /// Home-relative parent of every per-repository root. Never granted itself.
 pub const BASE: &str = ".cplt-worktrees";
 
-/// What Linux does not enforce inside the managed root. Printed at every Linux
-/// launch with the key on, and restated in SECURITY.md.
+/// Refuse the key on any OS but macOS.
 ///
 /// macOS denies the protected paths at any depth below a granted root with a
 /// regex. Linux has no equivalent: Landlock cannot subtract a path from a
 /// granted tree, and bubblewrap re-binds read-only only paths that exist at
 /// launch, at fixed depths (`<root>/<rel>`), never `<root>/<worktree>/<rel>`.
-pub const LINUX_GAP: &str = "sandbox.allow_git_worktrees on Linux: the persistence denies \
-    inside managed worktrees (.github/hooks, .claude/settings.json, .cplt.toml, .mcp.json, \
-    the worktree's .git pointer, and the rest of the per-root list) are NOT enforced. Landlock \
-    cannot subtract paths from the granted root, and bubblewrap only protects paths that exist \
-    at launch at fixed depths. The shared .git/hooks of this repository keeps whatever \
-    protection it already has (read-only under bubblewrap). Review managed worktrees before \
-    running tools in them outside cplt.";
+/// So nothing inside the root would be kernel-enforced, and the key is
+/// macOS-only until that changes. `os` is `std::env::consts::OS`, passed in so
+/// the refusal is testable on either host.
+pub fn refuse_unsupported_os(os: &str) -> Result<(), String> {
+    if os == "macos" {
+        return Ok(());
+    }
+    Err(format!(
+        "sandbox.allow_git_worktrees is macOS-only for now. On {os}, nothing inside the \
+         worktree root would be kernel-enforced: Landlock cannot subtract paths from a granted \
+         tree, so .git pointers, hooks and agent config inside the worktrees would all be \
+         writable"
+    ))
+}
 
 /// The canonical common Git directory of the repository at `project_dir`,
-/// checked against steering.
+/// checked against steering. `Ok(None)` when `project_dir` is not in a
+/// repository at all.
 ///
 /// The fingerprint below decides which root is granted, so this is a grant
 /// input, not a deny input like [`crate::discover::git_dir_of`]. git derives
@@ -48,31 +55,25 @@ pub const LINUX_GAP: &str = "sandbox.allow_git_worktrees on Linux: the persisten
 /// layouts git itself produces are accepted, the same rule
 /// [`crate::discover::git_common_dir`] applies: the common dir is the gitdir,
 /// or the gitdir is `<common>/worktrees/<name>`.
-pub fn repository_common_dir(project_dir: &Path) -> Result<PathBuf, String> {
-    let run = |arg: &str| -> Result<PathBuf, String> {
+pub fn repository_common_dir(project_dir: &Path) -> Result<Option<PathBuf>, String> {
+    let run = |arg: &str| -> Result<Option<PathBuf>, String> {
         let out = crate::git::command(project_dir, &["rev-parse", arg])
             .ok_or("no trusted git binary to identify the repository")?
             .output()
             .map_err(|e| format!("cannot run git: {e}"))?;
         if !out.status.success() {
-            return Err(format!(
-                "{} is not in a git repository",
-                project_dir.display()
-            ));
+            return Ok(None);
         }
-        let raw = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
-        let abs = if raw.is_absolute() {
-            raw
-        } else {
-            project_dir.join(raw)
-        };
-        std::fs::canonicalize(&abs).map_err(|e| format!("cannot resolve {}: {e}", abs.display()))
+        let raw = String::from_utf8_lossy(&out.stdout);
+        resolve(project_dir, raw.trim()).map(Some)
     };
-    let common = run("--git-common-dir")?;
-    let git_dir = run("--absolute-git-dir")?;
+    let (Some(common), Some(git_dir)) = (run("--git-common-dir")?, run("--absolute-git-dir")?)
+    else {
+        return Ok(None);
+    };
     let linked = git_dir.parent().filter(|p| p.ends_with("worktrees"));
     if common == git_dir || linked.and_then(Path::parent) == Some(common.as_path()) {
-        Ok(common)
+        Ok(Some(common))
     } else {
         Err(format!(
             "the repository's common git directory {} is not where its gitdir {} says it \
@@ -113,25 +114,51 @@ pub fn fingerprint(common_dir: &Path) -> String {
 /// - The canonical root must equal `<canonical home>/.cplt-worktrees/<fp>`,
 ///   which rules out a symlinked ancestor below home.
 /// - The path must be safe to interpolate into an SBPL profile.
-pub fn prepare_root(home_dir: &Path, project_dir: &Path) -> Result<PathBuf, String> {
-    let common = repository_common_dir(project_dir)?;
-    prepare_root_for(home_dir, &common)
+/// - The worktree links must be intact ([`link_problems`]).
+///
+/// `create` is false for `doctor` and `check`, which report on the root and
+/// must not create it. `Ok(None)` means `project_dir` is not in a repository;
+/// the caller decides whether that fails the launch.
+pub fn prepare_root(
+    home_dir: &Path,
+    project_dir: &Path,
+    create: bool,
+) -> Result<Option<PathBuf>, String> {
+    let Some(common) = repository_common_dir(project_dir)? else {
+        return Ok(None);
+    };
+    let root = prepare_root_for(home_dir, &common, create)?;
+    let problems = link_problems(&common, &root);
+    if !problems.is_empty() {
+        return Err(format!(
+            "the worktree links of this repository do not match what git writes, so git \
+             run outside cplt could read agent-written config:\n    {}\n  Inspect them outside \
+             cplt and remove the worktrees involved (`git worktree remove --force`, or delete \
+             the directories and run `git worktree prune`)",
+            problems.join("\n    ")
+        ));
+    }
+    Ok(Some(root))
 }
 
 /// [`prepare_root`] once the repository is known. Split out so the path checks
 /// can be tested without a repository.
-pub fn prepare_root_for(home_dir: &Path, common_dir: &Path) -> Result<PathBuf, String> {
+pub fn prepare_root_for(
+    home_dir: &Path,
+    common_dir: &Path,
+    create: bool,
+) -> Result<PathBuf, String> {
     let home = std::fs::canonicalize(home_dir)
         .map_err(|e| format!("cannot resolve home {}: {e}", home_dir.display()))?;
     let base = home.join(BASE);
     let root = base.join(fingerprint(common_dir));
     for (dir, label) in [(&base, "worktree base"), (&root, "worktree root")] {
-        match crate::scratch::create_secure_dir(dir, label) {
-            Ok(()) => {}
-            Err(_) if dir.symlink_metadata().is_ok() => {}
-            Err(e) => return Err(e),
+        if !create && dir.symlink_metadata().is_err() {
+            // Nothing there yet, and a report must not create it. The launch
+            // will, and runs every check then.
+            return Ok(root.clone());
         }
-        crate::scratch::validate_dir_safety(dir, label)?;
+        secure_dir(dir, label)?;
     }
     let canonical = std::fs::canonicalize(&root)
         .map_err(|e| format!("cannot resolve {}: {e}", root.display()))?;
@@ -144,6 +171,190 @@ pub fn prepare_root_for(home_dir: &Path, common_dir: &Path) -> Result<PathBuf, S
     }
     crate::sandbox::validate_sbpl_path(&root).map_err(|e| format!("worktree root: {e}"))?;
     Ok(root)
+}
+
+/// Create `dir` if absent, then check and fix it through one descriptor.
+///
+/// Opened `O_NOFOLLOW | O_DIRECTORY`, so a symlink or a file in its place is
+/// refused by the kernel rather than by a separate `lstat`, and the owner
+/// check and `fchmod` apply to the directory that was opened, not to whatever
+/// the name points at by then.
+fn secure_dir(dir: &Path, label: &str) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
+            return Err(format!("cannot create {label} {}: {e}", dir.display()));
+        }
+        _ => {}
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dir)
+        .map_err(|e| {
+            // macOS reports a symlink as ENOTDIR here, Linux as ELOOP; the
+            // lstat only picks the message, the open already refused it.
+            let link = dir
+                .symlink_metadata()
+                .is_ok_and(|m| m.file_type().is_symlink());
+            match e.raw_os_error() {
+                Some(libc::ELOOP | libc::ENOTDIR) if link => format!(
+                    "{label} {} is a symlink, cplt refuses to use it",
+                    dir.display()
+                ),
+                Some(libc::ENOTDIR) => format!("{label} {} is not a directory", dir.display()),
+                _ => format!("cannot open {label} {}: {e}", dir.display()),
+            }
+        })?;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("cannot stat {label} {}: {e}", dir.display()))?;
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    if meta.uid() != uid {
+        return Err(format!(
+            "{label} {} is owned by uid {}, not {uid}. cplt refuses to use it",
+            dir.display(),
+            meta.uid()
+        ));
+    }
+    if meta.mode() & 0o777 != 0o700 {
+        // `File::set_permissions` is fchmod on this descriptor.
+        file.set_permissions(std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("cannot set permissions on {}: {e}", dir.display()))?;
+    }
+    Ok(())
+}
+
+/// `raw` as a canonical path, relative to `base` when not absolute.
+fn resolve(base: &Path, raw: &str) -> Result<PathBuf, String> {
+    let p = Path::new(raw);
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        base.join(p)
+    };
+    std::fs::canonicalize(&abs).map_err(|e| format!("cannot resolve {}: {e}", abs.display()))
+}
+
+fn entries(dir: &Path) -> Vec<std::fs::DirEntry> {
+    std::fs::read_dir(dir)
+        .map(|it| it.flatten().collect())
+        .unwrap_or_default()
+}
+
+/// Every way the agent-writable worktree bookkeeping can differ from what
+/// `git worktree add` writes, one line per finding. Empty when intact.
+///
+/// Two links decide which config and hooks git on the host reads, and the
+/// agent can write both:
+///
+/// - `<common>/worktrees/<name>/commondir` must lead back to `common`. Aimed
+///   at `<root>/x/`, git reads `<root>/x/config` (`core.fsmonitor`). Missing,
+///   git treats the admin dir itself as the common dir and reads its `config`.
+///   The kernel only refuses an in-place rewrite; unlink-and-recreate and new
+///   admin dirs are caught here.
+/// - `<root>/<name>/.git` must be a pointer file naming an admin dir under
+///   `<common>/worktrees` whose `gitdir` names this pointer back. A pointer
+///   the agent recreated (`mv wt wt.old && mkdir wt && echo gitdir: ...`) can
+///   name a gitdir in the root, where config and hooks are writable.
+///
+/// Only `<root>/*/.git` is checked, the depth `git worktree add
+/// "$CPLT_WORKTREE_ROOT/<name>"` writes.
+#[must_use]
+pub fn link_problems(common: &Path, root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let admin = common.join("worktrees");
+    if admin.symlink_metadata().is_ok_and(|m| !m.is_dir()) {
+        out.push(format!("{} is not a directory", admin.display()));
+        return out;
+    }
+    for entry in entries(&admin) {
+        let dir = entry.path();
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            out.push(format!("{} is not a directory", dir.display()));
+            continue;
+        }
+        let file = dir.join("commondir");
+        match std::fs::read_to_string(&file) {
+            Ok(raw) => match resolve(&dir, raw.trim()) {
+                Ok(p) if p == common => {}
+                Ok(p) => out.push(format!(
+                    "{} points at {}, not {}",
+                    file.display(),
+                    p.display(),
+                    common.display()
+                )),
+                Err(e) => out.push(format!("{}: {e}", file.display())),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => out.push(format!(
+                "{} is missing, so git would read {}/config as repository config",
+                file.display(),
+                dir.display()
+            )),
+            Err(e) => out.push(format!("cannot read {}: {e}", file.display())),
+        }
+    }
+    for entry in entries(root) {
+        let pointer = entry.path().join(".git");
+        let Ok(meta) = pointer.symlink_metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            out.push(format!(
+                "{} is not a gitdir pointer file",
+                pointer.display()
+            ));
+            continue;
+        }
+        if let Err(e) = check_pointer(&pointer, &admin) {
+            out.push(format!("{}: {e}", pointer.display()));
+        }
+    }
+    out
+}
+
+/// One `<root>/<name>/.git` pointer against its admin dir, both directions.
+fn check_pointer(pointer: &Path, admin: &Path) -> Result<(), String> {
+    let raw = std::fs::read_to_string(pointer).map_err(|e| e.to_string())?;
+    let target = raw
+        .trim()
+        .strip_prefix("gitdir:")
+        .ok_or("not a `gitdir:` pointer")?;
+    let wt = pointer.parent().unwrap_or(pointer);
+    let gitdir = resolve(wt, target.trim())?;
+    if gitdir.parent() != Some(admin) {
+        return Err(format!(
+            "names {}, which is not under {}",
+            gitdir.display(),
+            admin.display()
+        ));
+    }
+    let back_file = gitdir.join("gitdir");
+    let back = std::fs::read_to_string(&back_file)
+        .map_err(|e| format!("cannot read {}: {e}", back_file.display()))?;
+    let me = std::fs::canonicalize(pointer).map_err(|e| e.to_string())?;
+    if resolve(&gitdir, back.trim()).ok().as_deref() != Some(me.as_path()) {
+        return Err(format!(
+            "{} does not name this pointer back",
+            back_file.display()
+        ));
+    }
+    Ok(())
+}
+
+/// [`link_problems`] for the end of a session, re-deriving the common dir.
+/// A repository that no longer resolves is itself a finding.
+#[must_use]
+pub fn session_end_problems(project_dir: &Path, root: &Path) -> Vec<String> {
+    match repository_common_dir(project_dir) {
+        Ok(Some(common)) => link_problems(&common, root),
+        Ok(None) => vec![format!(
+            "{} no longer resolves as a git repository",
+            project_dir.display()
+        )],
+        Err(e) => vec![e],
+    }
 }
 
 #[cfg(test)]
@@ -166,7 +377,7 @@ mod tests {
     fn creates_a_private_root_and_reuses_it() {
         use std::os::unix::fs::PermissionsExt;
         let h = home();
-        let root = prepare_root_for(h.path(), Path::new("/w/a/.git")).expect("created");
+        let root = prepare_root_for(h.path(), Path::new("/w/a/.git"), true).expect("created");
         let home = std::fs::canonicalize(h.path()).unwrap();
         assert_eq!(
             root,
@@ -178,7 +389,7 @@ mod tests {
         }
         std::fs::write(root.join("keep"), "x").unwrap();
         assert_eq!(
-            prepare_root_for(h.path(), Path::new("/w/a/.git")),
+            prepare_root_for(h.path(), Path::new("/w/a/.git"), true),
             Ok(root.clone())
         );
         assert!(
@@ -195,7 +406,7 @@ mod tests {
         std::fs::create_dir_all(&target).unwrap();
         std::fs::create_dir_all(h.path().join(BASE)).unwrap();
         std::os::unix::fs::symlink(&target, h.path().join(BASE).join(&fp)).unwrap();
-        let err = prepare_root_for(h.path(), Path::new("/w/a/.git")).unwrap_err();
+        let err = prepare_root_for(h.path(), Path::new("/w/a/.git"), true).unwrap_err();
         assert!(err.contains("symlink"), "{err}");
     }
 
@@ -205,7 +416,7 @@ mod tests {
         let target = h.path().join("elsewhere");
         std::fs::create_dir_all(&target).unwrap();
         std::os::unix::fs::symlink(&target, h.path().join(BASE)).unwrap();
-        let err = prepare_root_for(h.path(), Path::new("/w/a/.git")).unwrap_err();
+        let err = prepare_root_for(h.path(), Path::new("/w/a/.git"), true).unwrap_err();
         assert!(err.contains("symlink"), "{err}");
         assert!(
             std::fs::read_dir(&target).unwrap().next().is_none(),
@@ -254,11 +465,11 @@ mod tests {
         ));
 
         let common = main.join(".git");
-        assert_eq!(repository_common_dir(&main), Ok(common.clone()));
-        assert_eq!(repository_common_dir(&wt), Ok(common));
+        assert_eq!(repository_common_dir(&main), Ok(Some(common.clone())));
+        assert_eq!(repository_common_dir(&wt), Ok(Some(common)));
         assert_ne!(
-            repository_common_dir(&other).map(|c| fingerprint(&c)),
-            repository_common_dir(&main).map(|c| fingerprint(&c)),
+            repository_common_dir(&other).map(|c| c.map(|c| fingerprint(&c))),
+            repository_common_dir(&main).map(|c| c.map(|c| fingerprint(&c))),
         );
 
         std::fs::write(
@@ -271,7 +482,7 @@ mod tests {
 
         let plain = base.join("plain");
         std::fs::create_dir_all(&plain).unwrap();
-        assert!(repository_common_dir(&plain).is_err());
+        assert_eq!(repository_common_dir(&plain), Ok(None));
     }
 
     #[test]
@@ -280,7 +491,116 @@ mod tests {
         std::fs::create_dir_all(h.path().join(BASE)).unwrap();
         let fp = fingerprint(Path::new("/w/a/.git"));
         std::fs::write(h.path().join(BASE).join(fp), "").unwrap();
-        let err = prepare_root_for(h.path(), Path::new("/w/a/.git")).unwrap_err();
+        let err = prepare_root_for(h.path(), Path::new("/w/a/.git"), true).unwrap_err();
         assert!(err.contains("not a directory"), "{err}");
+    }
+
+    /// `doctor` and `check` report the root without creating it.
+    #[test]
+    fn a_report_does_not_create_the_root() {
+        let h = home();
+        let root = prepare_root_for(h.path(), Path::new("/w/a/.git"), false).expect("path");
+        assert!(root.ends_with(fingerprint(Path::new("/w/a/.git"))));
+        assert!(!h.path().join(BASE).exists());
+    }
+
+    /// Item 3 of the #574 review: the key is macOS-only.
+    #[test]
+    fn the_key_is_refused_off_macos() {
+        assert_eq!(refuse_unsupported_os("macos"), Ok(()));
+        let err = refuse_unsupported_os("linux").unwrap_err();
+        assert!(err.contains("macOS-only"), "{err}");
+    }
+
+    /// A repository with one managed worktree, as `git worktree add` leaves it.
+    /// Returns (common dir, root, worktree), or `None` without git.
+    fn repo_with_worktree(base: &Path) -> Option<(PathBuf, PathBuf, PathBuf)> {
+        let main = base.join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        if !git_in(&main, &["init", "-q", "-b", "main"]) {
+            return None;
+        }
+        std::fs::write(main.join("f"), "x").unwrap();
+        assert!(git_in(&main, &["add", "-A"]) && git_in(&main, &["commit", "-qm", "i"]));
+        let root = base.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let wt = root.join("wt");
+        assert!(git_in(
+            &main,
+            &["worktree", "add", "-q", "-b", "f", &wt.to_string_lossy()]
+        ));
+        Some((main.join(".git"), root, wt))
+    }
+
+    /// Item 1: a per-worktree `commondir` aimed into the root (where the agent
+    /// can write `config` with `core.fsmonitor`) is found, and so is one that
+    /// was deleted.
+    #[test]
+    fn a_steered_worktree_commondir_is_found() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let Some((common, root, _)) = repo_with_worktree(&base) else {
+            eprintln!("SKIPPED: git unavailable");
+            return;
+        };
+        assert_eq!(link_problems(&common, &root), Vec::<String>::new());
+
+        let commondir = common.join("worktrees/wt/commondir");
+        std::fs::create_dir_all(root.join("x")).unwrap();
+        std::fs::write(&commondir, root.join("x").to_string_lossy().as_bytes()).unwrap();
+        let problems = link_problems(&common, &root);
+        assert!(
+            problems.iter().any(|p| p.contains("commondir points at")),
+            "{problems:?}"
+        );
+
+        std::fs::remove_file(&commondir).unwrap();
+        let problems = link_problems(&common, &root);
+        assert!(
+            problems.iter().any(|p| p.contains("is missing")),
+            "{problems:?}"
+        );
+    }
+
+    /// Item 2: a `.git` pointer recreated to name a gitdir inside the root is
+    /// found, and so is one whose admin dir does not name it back.
+    #[test]
+    fn a_recreated_worktree_pointer_is_found() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let Some((common, root, wt)) = repo_with_worktree(&base) else {
+            eprintln!("SKIPPED: git unavailable");
+            return;
+        };
+        std::fs::rename(&wt, root.join("wt.old")).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        let evil = root.join("g");
+        std::fs::create_dir_all(&evil).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", evil.display())).unwrap();
+        let problems = link_problems(&common, &root);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("wt/.git") && p.contains("not under")),
+            "{problems:?}"
+        );
+
+        // Pointing at the real admin dir from a second directory: the admin
+        // dir names `wt.old/.git`, not this one.
+        std::fs::remove_dir_all(&wt).unwrap();
+        let copy = root.join("copy");
+        std::fs::create_dir_all(&copy).unwrap();
+        std::fs::write(
+            copy.join(".git"),
+            format!("gitdir: {}\n", common.join("worktrees/wt").display()),
+        )
+        .unwrap();
+        let problems = link_problems(&common, &root);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("copy/.git") && p.contains("name this pointer back")),
+            "{problems:?}"
+        );
     }
 }

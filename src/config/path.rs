@@ -298,7 +298,7 @@ pub fn default_config_contents() -> String {
 # Give sub-agents a place to create Git worktrees: read, write and execute on a
 # cplt-owned directory for this repository only (~/.cplt-worktrees/<id>),
 # exported as CPLT_WORKTREE_ROOT. Worktrees and branches there persist after the
-# session; cplt never removes them. Global or local config only.
+# session; cplt never removes them. macOS only. Global or local config only.
 # allow_git_worktrees = false
 #
 # Suppress the startup configuration summary and non-essential messages.

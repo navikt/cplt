@@ -222,6 +222,7 @@ pub fn generate_profile_with_playwright_socket_dir(
         config.extra_write,
         config.git_common_dir,
         extra_git_dirs,
+        config.managed_worktree_root,
     );
     // Same reason, and the fix for the same bug one tree over: keeps the
     // agent's own auto-executing config unwritable even when a user
@@ -1109,6 +1110,7 @@ fn emit_git_persistence_denies(
     extra_write: &[PathBuf],
     git_common_dir: Option<&Path>,
     extra_git_dirs: &[PathBuf],
+    managed_worktree_root: Option<&Path>,
 ) {
     let mut gitdirs: Vec<String> = writable_roots(project_roots, extra_write)
         .iter()
@@ -1146,10 +1148,40 @@ fn emit_git_persistence_denies(
     // worktree it creates, so denying it would break a command that has to keep
     // working. `discover::git_common_dir` rejects a steered value, which closes
     // the escalation without costing that; the top-level `commondir` deny is
-    // free only because nothing legitimate ever writes it.
+    // free only because nothing legitimate ever writes it. With the managed
+    // worktree root on, the in-place rewrite is denied below.
     sbpl!(sb, ";; Per-worktree git config (core.hooksPath vector)");
     sbpl!(sb, "(deny file-write* (regex #\"/config\\.worktree$\"))");
     sbpl!(sb);
+
+    // #531: with the managed worktree root on, a steered per-worktree
+    // `commondir` is no longer contained to cplt's own discovery. Aim it at
+    // `<root>/x/` and git on the host reads `<root>/x/config`, which the agent
+    // can write (`core.fsmonitor`). `file-write-data` refuses an in-place
+    // rewrite and still lets `git worktree add` create the file (checked with
+    // `sandbox-exec`). Unlink stays allowed so `git worktree remove` keeps
+    // working, so unlink-and-recreate, rename-over and a new admin dir are not
+    // stopped here: `worktrees::link_problems` checks every admin dir at launch
+    // and at session end.
+    //
+    // The root's own name is pinned for the reason the gitdir is: a rename
+    // walks around every path rule under it.
+    if let Some(root) = managed_worktree_root {
+        sbpl!(sb, ";; Managed worktree root (#531)");
+        sbpl!(
+            sb,
+            "(deny file-write-unlink (literal \"{}\"))",
+            root.display()
+        );
+        for gitdir in &gitdirs {
+            let g = escape_regex(gitdir);
+            sbpl!(
+                sb,
+                "(deny file-write-data (regex #\"^{g}/worktrees/[^/]+/commondir$\"))"
+            );
+        }
+        sbpl!(sb);
+    }
 
     for root in writable_roots(project_roots, extra_write) {
         emit_nested_gitdir_denies(sb, &root);
@@ -3283,6 +3315,7 @@ mod tests {
             extra_deny: &[],
             named_roots: &[],
             named_root_git_dirs: &[],
+            managed_worktree_root: None,
             existing_home_tool_dirs: None,
             existing_app_dirs: None,
             extra_ports: &[],

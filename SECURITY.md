@@ -597,32 +597,54 @@ does not:
   `<common>/worktrees/<name>`), so a planted `commondir` cannot point the launch
   at another repository's root. `~/.cplt-worktrees` and the root must be real
   directories owned by the user (set to mode 0700), and the canonical path must
-  equal the expected one. These checks run on every launch, because the agent
-  can delete the root and leave a symlink in its place. A `CPLT_CONFIG` inside
-  the root is refused, like one inside a named repository.
+  equal the expected one. The directories are opened `O_NOFOLLOW |
+  O_DIRECTORY` and their owner and mode are checked and set through that
+  descriptor. These checks run on every launch, in case the root was replaced
+  between sessions. Inside a session the root's name is pinned
+  (`file-write-unlink` on its literal path), so the agent cannot move it away.
+  A `CPLT_CONFIG` inside the root is refused, like one inside a named
+  repository.
 - **No new trust.** The root is not a repository and is not added to the gh
   scope, the audit's repository list, or the trust store. Approval stays keyed
   on the repository (#527), so launching from a managed worktree uses the
   existing approval and creates none.
+- **No isolation between sub-agents.** All worktrees in a session share one
+  grant. A sub-agent can write every other sub-agent's worktree, and every
+  sub-agent can still write the launch checkout. The root keeps parallel work
+  on separate branches and directories; it is not a security boundary between
+  agents.
 - **Protections.** On macOS the per-root denies apply at every depth under the
   root: `.github/hooks`, `.claude/settings.json`, `.cplt.toml`, `.mcp.json`
-  and the rest of `PROTECTED_IN_ROOT`, the rename pins on their ancestors, and
-  each worktree's `.git` pointer file. The shared `.git/hooks` and `.git/config`
-  keep their existing denies, and `worktrees/<name>/config.worktree` is denied
-  by suffix. Verified by kernel tests in `tests/e2e_projects.rs`.
-- **Linux gap.** None of the in-worktree denies are enforced on Linux. Landlock
-  cannot subtract a path from the granted root, and bubblewrap re-binds only
-  paths that exist at launch, at fixed depths, never `<root>/<worktree>/<rel>`.
-  The shared `.git/hooks` keeps its bubblewrap bind where bubblewrap runs;
-  `.git/config` stays writable on Linux as it already does
-  (`LinuxCoverage::Gap` in `PROTECTED_IN_GITDIR`). The launch prints this gap
-  on Linux every time the key is on. This is the same class as a repository
-  nested under the project directory.
-- **Residuals on both platforms.** Everything written to the root outlives the
-  session: cplt never deletes worktrees or branches. The agent can also
-  `rm -rf` the root (the next launch recreates it) or plant files you later run
-  outside cplt, the same as in the project directory. The end-of-session audit
-  does not inspect the root; it prints a line saying so.
+  and the rest of `PROTECTED_IN_ROOT`, and the rename pins on their ancestors.
+  The shared `.git/hooks` and `.git/config` keep their existing denies, and
+  `worktrees/<name>/config.worktree` is denied by suffix. Verified by kernel
+  tests in `tests/e2e_projects.rs`.
+- **Worktree links: kernel pins plus a check at launch and exit.** Two files
+  decide which config and hooks Git on the host reads for a worktree, and the
+  agent can write both. `<common>/worktrees/<name>/commondir` aimed at
+  `<root>/x/` would make Git read `<root>/x/config`, which the agent can write
+  (`core.fsmonitor` runs on the host). A `<root>/<name>/.git` pointer aimed at
+  `<root>/g` does the same through `<root>/g/config` and `<root>/g/hooks`. The
+  kernel only blocks rewriting either file in place (`file-write-data`). It
+  does not block deleting and recreating them, moving the worktree aside and
+  writing a new pointer, or creating a new admin directory: `git worktree add`
+  and `git worktree remove` need those operations. cplt closes those at two
+  points. At every launch it checks every `<common>/worktrees/*/commondir` (it
+  must resolve to the common directory) and every `<root>/*/.git` (a pointer
+  file naming `<common>/worktrees/<name>`, whose `gitdir` names it back), and
+  refuses to start if one is off. At session end it runs the same check and
+  prints a loud warning naming each finding. Between the end of a session and
+  your next Git command in a worktree, only that warning stands between you and
+  the planted config. Pointers deeper than `<root>/*/.git` are not checked.
+- **macOS only.** On Linux the launch fails with the key on. Landlock cannot
+  subtract a path from the granted root, and bubblewrap re-binds only paths
+  that exist at launch, at fixed depths, never `<root>/<worktree>/<rel>`. So
+  nothing inside the root would be kernel-enforced.
+- **Residuals.** Everything written to the root outlives the session: cplt
+  never deletes worktrees or branches. The agent can empty the root or plant
+  files you later run outside cplt, the same as in the project directory. The
+  end-of-session audit does not inspect the worktrees' contents; it prints a
+  line saying so.
 
 
 #### Keychain access is all-or-nothing

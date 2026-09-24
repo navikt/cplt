@@ -470,6 +470,7 @@ mod macos_tests {
             extra_deny: &[],
             named_roots: &[],
             named_root_git_dirs: &[],
+            managed_worktree_root: None,
             existing_home_tool_dirs: None,
             existing_app_dirs: None,
             extra_ports: &[],

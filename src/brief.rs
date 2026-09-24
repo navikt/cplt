@@ -307,7 +307,7 @@ pub fn generate_session_brief(facts: &BriefFacts) -> String {
             "## Worktrees\n\n\
              Create worktrees for parallel work under `$CPLT_WORKTREE_ROOT` ({root}): \
              `git worktree add \"$CPLT_WORKTREE_ROOT/<name>\" -b <branch>`. You have read, \
-             write and execute there and nowhere beside it. It belongs to this repository \
+             write and execute there, and not in other repositories' roots. It belongs to this repository \
              only. Worktrees and branches you create persist after the session; cplt never \
              removes them. The end-of-session audit does not cover them.\n\n"
         );

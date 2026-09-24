@@ -808,6 +808,7 @@ fn landlock_policy_device_files_have_ioctl() {
         extra_deny: &[],
         named_roots: &[],
         named_root_git_dirs: &[],
+        managed_worktree_root: None,
         existing_home_tool_dirs: None,
         existing_app_dirs: None,
         extra_ports: &[],
@@ -2278,6 +2279,7 @@ fn a_named_root_is_granted_read_write_and_execute() {
         &SandboxConfig {
             named_roots: &named,
             named_root_git_dirs: &[],
+            managed_worktree_root: None,
             ..base_profile_options()
         },
         &[],
@@ -2308,6 +2310,7 @@ fn a_named_root_carries_the_protected_paths() {
         &SandboxConfig {
             named_roots: &named,
             named_root_git_dirs: &[],
+            managed_worktree_root: None,
             ..base_profile_options()
         },
         &[],
@@ -2333,6 +2336,7 @@ fn an_allow_write_over_a_named_roots_parent_does_not_take_its_execute_back() {
         &SandboxConfig {
             named_roots: &named,
             named_root_git_dirs: &[],
+            managed_worktree_root: None,
             extra_write: &write,
             ..base_profile_options()
         },
@@ -2359,6 +2363,7 @@ fn the_landlock_model_grants_a_named_root_the_project_access() {
     let policy = generate_policy(&SandboxConfig {
         named_roots: &named,
         named_root_git_dirs: &[],
+        managed_worktree_root: None,
         ..base_profile_options()
     });
     let rule = policy
@@ -2385,6 +2390,7 @@ fn a_named_roots_shared_gitdir_is_granted() {
         &SandboxConfig {
             named_roots: &named,
             named_root_git_dirs: &gitdirs,
+            managed_worktree_root: None,
             ..base_profile_options()
         },
         &[],
@@ -2399,6 +2405,7 @@ fn a_named_roots_shared_gitdir_is_granted() {
     let policy = generate_policy(&SandboxConfig {
         named_roots: &named,
         named_root_git_dirs: &gitdirs,
+        managed_worktree_root: None,
         ..base_profile_options()
     });
     let rule = policy
@@ -2426,6 +2433,7 @@ fn base_profile_options() -> SandboxConfig<'static> {
         extra_deny: &[],
         named_roots: &[],
         named_root_git_dirs: &[],
+        managed_worktree_root: None,
         existing_home_tool_dirs: None,
         existing_app_dirs: None,
         extra_ports: &[],
@@ -3861,6 +3869,7 @@ fn allow_localhost_any_affects_both_backends() {
         extra_deny: &[],
         named_roots: &[],
         named_root_git_dirs: &[],
+        managed_worktree_root: None,
         existing_home_tool_dirs: None,
         existing_app_dirs: None,
         extra_ports: &[],
@@ -3924,6 +3933,7 @@ fn config_options_parity_across_backends() {
         extra_deny: &[],
         named_roots: &[],
         named_root_git_dirs: &[],
+        managed_worktree_root: None,
         existing_home_tool_dirs: None,
         existing_app_dirs: None,
         extra_ports: &ports,
@@ -6674,6 +6684,7 @@ fn profile_gpg_signing_deny_path_wins() {
             extra_deny: &deny,
             named_roots: &[],
             named_root_git_dirs: &[],
+            managed_worktree_root: None,
             allow_gpg_signing: true,
             ..base_profile_options()
         },
@@ -7709,6 +7720,7 @@ fn profile_docker_withholds_the_overlapping_reallow() {
             extra_deny: &[std::path::PathBuf::from("/Users/test/.docker")],
             named_roots: &[],
             named_root_git_dirs: &[],
+            managed_worktree_root: None,
             allow_docker: true,
             ..base_profile_options()
         },
@@ -7895,6 +7907,7 @@ fn profile_socket_skipped_when_deny_path_overlaps() {
             extra_deny: &[std::path::PathBuf::from("/Users/test/.codex")],
             named_roots: &[],
             named_root_git_dirs: &[],
+            managed_worktree_root: None,
             ..base_profile_options()
         },
         &[],
@@ -9706,6 +9719,7 @@ fn landlock_relocated_cargo_bin_is_exec_only_and_registry_is_precreated() {
         extra_deny: &[],
         named_roots: &[],
         named_root_git_dirs: &[],
+        managed_worktree_root: None,
         existing_home_tool_dirs: Some(&dirs),
         existing_app_dirs: None,
         extra_ports: &[],

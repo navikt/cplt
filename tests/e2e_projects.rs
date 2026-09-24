@@ -4530,6 +4530,8 @@ r cplttoml 'echo x > "$R/a/.cplt.toml"'
 r claude 'mkdir -p "$R/a/.claude" && echo {} > "$R/a/.claude/settings.json"'
 r pointer 'echo "gitdir: /tmp" > "$R/a/.git"'
 r ghrename 'mkdir -p "$R/a/.github/workflows" && mv "$R/a/.github" "$R/a/.gh2"'
+r commondir 'mkdir -p "$R/x" && echo "$R/x" > "$P/.git/worktrees/a/commondir"'
+r root_mv 'mv "$R" "$P/moved"'
 "##;
 
     /// With the key on, the agent can create two worktrees under
@@ -4578,6 +4580,8 @@ echo "ROOT:$R"
             "claude",
             "pointer",
             "ghrename",
+            "commondir",
+            "root_mv",
             "sib_read",
             "sib_write",
             "sib_exec",
@@ -4625,6 +4629,46 @@ if echo y > "{root_s}/g" 2>/dev/null; then echo RESULT:write:OK; else echo RESUL
         );
         let (stdout, _, _) = run_exec_with_home(&project, home.path(), "", &script);
         assert_result_fail(&stdout, "write");
+    }
+
+    /// The walk-arounds the kernel does not stop, a recreated `.git` pointer
+    /// naming a gitdir inside the root and a `commondir` unlinked and written
+    /// again, are named loudly when the session ends, and the next launch
+    /// refuses to start.
+    #[test]
+    fn managed_worktree_links_are_checked_at_exit_and_launch() {
+        require_sandbox!();
+        let config = "[sandbox]\nallow_git_worktrees = true\n";
+        for (name, attack) in [
+            (
+                "pointer",
+                r#"mv "$R/a" "$R/a.old" && mkdir -p "$R/a" "$R/g" && printf 'gitdir: %s\n' "$R/g" > "$R/a/.git""#,
+            ),
+            (
+                "commondir",
+                r#"mkdir -p "$R/x" && rm "$P/.git/worktrees/a/commondir" && echo "$R/x" > "$P/.git/worktrees/a/commondir""#,
+            ),
+        ] {
+            let project = TempProject::new(&format!("wt-links-{name}"));
+            project.write_file("f.txt", "x\n");
+            project.git_init();
+            let home = TempProject::new(&format!("wt-links-{name}-home"));
+            let script = format!(
+                "P=\"$PWD\"\nR=\"$CPLT_WORKTREE_ROOT\"\ngit worktree add -q \"$R/a\" -b a \
+                 && {attack} && echo RESULT:attack:OK\n"
+            );
+            let (stdout, stderr, _) = run_exec_with_home(&project, home.path(), config, &script);
+            assert_result_ok(&stdout, &stderr, "attack");
+            assert!(
+                stderr.contains("WORKTREE LINKS CHANGED"),
+                "{name}: the session end names it.\n{stderr}"
+            );
+            let (stdout, stderr, ok) =
+                run_exec_with_home(&project, home.path(), config, "echo RESULT:ran:OK\n");
+            assert!(!ok, "{name}: next launch must fail.\n{stdout}\n{stderr}");
+            assert!(!stdout.contains("RESULT:ran"), "{stdout}");
+            assert!(stderr.contains("worktree links"), "{name}: {stderr}");
+        }
     }
 
     /// A symlink in place of the root fails the launch before anything runs,
