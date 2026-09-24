@@ -896,7 +896,7 @@ pub(crate) fn nested_repo_roots(roots: &[&Path]) -> (Vec<PathBuf>, bool) {
     /// covers the layouts people actually use, `~/src/<repo>` through
     /// `~/go/src/github.com/<org>/<repo>` when the grant is `~/go/src`.
     const MAX_DEPTH: usize = 3;
-    repo_walk(roots, MAX_DEPTH, has_dot_git)
+    repo_walk(roots, MAX_DEPTH, has_dot_git, false)
 }
 
 /// Project-internal paths re-bound **read-only** when Bubblewrap is active, to

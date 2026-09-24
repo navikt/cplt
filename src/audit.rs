@@ -1282,7 +1282,8 @@ impl NestedGit {
 }
 
 fn scan_nested_git(roots: &[&Path]) -> (std::collections::BTreeMap<PathBuf, u64>, bool) {
-    let (repos, capped) = sandbox::repo_walk(roots, usize::MAX, sandbox::has_dot_git_or_is_bare);
+    let (repos, capped) =
+        sandbox::repo_walk(roots, usize::MAX, sandbox::has_dot_git_or_is_bare, true);
     let map = repos
         .into_iter()
         .map(|dir| {

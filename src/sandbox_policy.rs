@@ -3767,10 +3767,18 @@ pub(crate) const NESTED_SCAN_LIMIT: usize = 20_000;
 /// The session-end `.git` check (`audit::NestedGit`, #576) passes no depth
 /// limit: a depth cut-off is a place to hide that nobody is told about, while
 /// the directory budget is reported when it is hit.
+///
+/// `test_symlinked_dirs`: a symlink to a directory is also tested with
+/// `is_repo` (following the link for that test only), never descended into.
+/// The session-end check needs it, because git run in `<root>/tools` obeys
+/// the config of the repository `tools` points at, wherever that is. The
+/// bubblewrap caller passes `false`: it binds what it finds, and a bind onto a
+/// symlink fails the whole wrapper (see `nested_repo_roots`).
 pub(crate) fn repo_walk(
     roots: &[&Path],
     max_depth: usize,
     is_repo: fn(&Path) -> bool,
+    test_symlinked_dirs: bool,
 ) -> (Vec<PathBuf>, bool) {
     /// Not descended into: thousands of entries, and a `.git` inside one is
     /// vendored rather than worked in. They are still *tested* for being a
@@ -3805,14 +3813,23 @@ pub(crate) fn repo_walk(
         // Sorted, so a truncated walk truncates the same way twice. An
         // unsorted `read_dir` would protect different repositories on different
         // launches of the same tree.
-        let mut dirs: Vec<PathBuf> = entries
+        // `(path, is a real directory)`; the second kind is a symlink to one.
+        let mut dirs: Vec<(PathBuf, bool)> = entries
             .flatten()
-            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-            .map(|e| e.path())
+            .filter_map(|e| {
+                let t = e.file_type().ok()?;
+                if t.is_dir() {
+                    Some((e.path(), true))
+                } else if test_symlinked_dirs && t.is_symlink() && e.path().is_dir() {
+                    Some((e.path(), false))
+                } else {
+                    None
+                }
+            })
             .collect();
         dirs.sort();
 
-        for path in dirs {
+        for (path, real_dir) in dirs {
             if budget == 0 {
                 return (dedup(found), true);
             }
@@ -3828,19 +3845,22 @@ pub(crate) fn repo_walk(
             if is_repo(&path) {
                 found.push(path.clone());
             }
-            let skipped = path
-                .file_name()
-                // Case-blind: on a case-insensitive volume `.GIT` is the gitdir.
-                .is_some_and(|n| {
-                    let n = n.to_string_lossy();
-                    SKIP.iter().any(|s| s.eq_ignore_ascii_case(&n))
-                });
-            if !skipped {
+            if real_dir && !skip_descent(&path, SKIP) {
                 queue.push_back((path, depth + 1));
             }
         }
     }
     (dedup(found), false)
+}
+
+/// `path`'s name is in `skip`. Exact, except that `.git` matches in any case:
+/// on a case-insensitive volume `.GIT` is the gitdir, while `Target` or
+/// `Vendor` is somebody's source directory and stays walked.
+fn skip_descent(path: &Path, skip: &[&str]) -> bool {
+    path.file_name().is_some_and(|n| {
+        let n = n.to_string_lossy();
+        n.eq_ignore_ascii_case(".git") || skip.contains(&n.as_ref())
+    })
 }
 
 /// `dir/.git` exists as a directory, file or symlink (not followed).
@@ -3853,10 +3873,15 @@ pub(crate) fn has_dot_git(dir: &Path) -> bool {
     std::fs::symlink_metadata(dir.join(".git")).is_ok()
 }
 
-/// [`has_dot_git`], or `dir` itself looks like a bare repository: git's
-/// discovery accepts a directory holding `HEAD`, `objects/` and `refs/` as a
-/// gitdir (`safe.bareRepository` defaults to `all`) and obeys its `config`,
-/// with no `.git` anywhere (#576).
+/// [`has_dot_git`], or `dir` itself looks like a git directory: git's
+/// discovery accepts one with no `.git` anywhere (`safe.bareRepository`
+/// defaults to `all`) and obeys its `config` (#576).
+///
+/// Broader than git's own test (`is_git_directory` in `setup.c`), never
+/// narrower: a `HEAD` of any kind — a dangling symlink to `refs/heads/main`
+/// counts, which `Path::exists` would miss — plus either `objects` and `refs`
+/// beside it, or a `commondir` file, which moves `objects`, `refs` and
+/// `config` to another directory that need not be below the root at all.
 ///
 /// A directory named `.git` (any case) is not counted as bare: it is reached
 /// through its parent already, and counting it too would report the project's
@@ -3867,9 +3892,9 @@ pub(crate) fn has_dot_git_or_is_bare(dir: &Path) -> bool {
         .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(".git"));
     has_dot_git(dir)
         || (!is_dot_git
-            && dir.join("HEAD").exists()
-            && dir.join("objects").is_dir()
-            && dir.join("refs").is_dir())
+            && std::fs::symlink_metadata(dir.join("HEAD")).is_ok()
+            && ((dir.join("objects").exists() && dir.join("refs").exists())
+                || std::fs::symlink_metadata(dir.join("commondir")).is_ok()))
 }
 
 /// Sort and deduplicate, so overlapping roots (a project inside an
@@ -4439,6 +4464,73 @@ mod tests {
             nested_alternation(PROTECTED_IN_ROOT),
             r"\.gitmodules|\.cplt\.toml|\.agents/plugins|\.github/hooks|\.opencode/plugins|\.opencode/plugin|\.opencode/tools|\.opencode/tool|opencode\.json|opencode\.jsonc|\.claude/settings\.json|\.claude/settings\.local\.json|\.claude-plugin|\.mcp\.json|\.pi/extensions|\.pi/settings\.json",
             "a `.` in a rel path must reach the regex escaped, not as `any char`"
+        );
+    }
+
+    /// #576 review: only `.git` is skipped in any case. `Target` or `Vendor`
+    /// is somebody's source directory, and bubblewrap walked it before #576.
+    #[test]
+    fn repo_walk_skips_dot_git_in_any_case_and_other_names_exactly() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mk = |rel: &str| {
+            let p = root.path().join(rel);
+            std::fs::create_dir_all(p.join(".git")).expect("repo");
+            p
+        };
+        let in_capital_target = mk("Target/x");
+        let in_node_modules = mk("node_modules/y");
+        let in_upper_git = mk(".GIT/z");
+        let (repos, _) = repo_walk(&[root.path()], usize::MAX, has_dot_git, false);
+        assert!(repos.contains(&in_capital_target), "{repos:?}");
+        assert!(!repos.contains(&in_node_modules), "{repos:?}");
+        assert!(!repos.contains(&in_upper_git), "{repos:?}");
+    }
+
+    /// #576 review: two gitdir layouts git accepts that the first bare-repo
+    /// test missed: a `commondir` split, and a `HEAD` that is a dangling
+    /// symlink to `refs/heads/main`.
+    #[test]
+    fn git_dir_layouts_git_accepts_are_recognised() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let split = root.path().join("split");
+        std::fs::create_dir_all(&split).unwrap();
+        std::fs::write(split.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(split.join("commondir"), "../common\n").unwrap();
+        assert!(has_dot_git_or_is_bare(&split), "commondir split");
+
+        let dangling = root.path().join("dangling");
+        std::fs::create_dir_all(dangling.join("objects")).unwrap();
+        std::fs::create_dir_all(dangling.join("refs")).unwrap();
+        std::os::unix::fs::symlink("refs/heads/main", dangling.join("HEAD")).unwrap();
+        assert!(has_dot_git_or_is_bare(&dangling), "dangling HEAD symlink");
+
+        let head_only = root.path().join("head_only");
+        std::fs::create_dir_all(&head_only).unwrap();
+        std::fs::write(head_only.join("HEAD"), "x").unwrap();
+        assert!(
+            !has_dot_git_or_is_bare(&head_only),
+            "HEAD alone is not a gitdir"
+        );
+    }
+
+    /// #576 review: a symlink to a repository outside the root is tested when
+    /// the caller asks (session-end check), never descended into, and left
+    /// alone for bubblewrap.
+    #[test]
+    fn a_symlinked_directory_is_tested_only_when_asked() {
+        let outside = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(outside.path().join(".git")).unwrap();
+        std::fs::create_dir_all(outside.path().join("inner/.git")).unwrap();
+        let root = tempfile::tempdir().expect("tempdir");
+        let link = root.path().join("tools");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+
+        let (repos, _) = repo_walk(&[root.path()], usize::MAX, has_dot_git, true);
+        assert_eq!(repos, vec![link], "tested, not descended into");
+        let (repos, _) = repo_walk(&[root.path()], usize::MAX, has_dot_git, false);
+        assert!(
+            repos.is_empty(),
+            "bubblewrap's walk is unchanged: {repos:?}"
         );
     }
 }
