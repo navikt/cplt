@@ -2538,32 +2538,55 @@ print('CONNECTED')
         run_sandboxed_home_with_flags(project_dir, home, &["--use-bubblewrap"], script)
     }
 
-    /// SECURITY (credential confidentiality under bwrap): a real `~/.ssh/id_rsa`
-    /// planted in a fake HOME is visible in the read-only mount table (`--ro-bind
-    /// / /`) but must be Landlock-denied — bwrap changes topology, not access
-    /// control. Non-vacuous because the file genuinely exists.
+    /// Run `script` under bwrap with a fake HOME holding the file `rel` (relative
+    /// to `~`), planted outside `/tmp` so it really exists inside the namespace.
+    fn run_bwrap_with_planted(rel: &str, content: &str, script: &str) -> String {
+        let project = create_test_project();
+        let fake_home = tempdir_outside_tmp();
+        let file = fake_home.path().join(rel);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, content).unwrap();
+        let (exit, stdout, stderr) =
+            run_sandboxed_home_bwrap(project.path(), fake_home.path(), script);
+        assert_eq!(
+            exit, 0,
+            "shell wrapper should exit cleanly — stderr: {stderr}"
+        );
+        stdout
+    }
+
+    /// SECURITY (credential confidentiality under bwrap): `--ro-bind / /` puts
+    /// a planted `~/.ssh/id_rsa` in the namespace's mount table, and only
+    /// Landlock stands between it and the agent — bwrap changes topology, not
+    /// access control. The test first proves the file is visible (`test -e`
+    /// needs no Landlock right), then that reading the key and listing the
+    /// directory both fail with EACCES rather than ENOENT.
     #[test]
     fn bwrap_cannot_read_planted_ssh_key() {
         require_bwrap!();
-        let project = create_test_project();
-        let fake_home = tempfile::tempdir().expect("Failed to create temp home");
-        let ssh_dir = fake_home.path().join(".ssh");
-        fs::create_dir_all(&ssh_dir).unwrap();
-        fs::write(
-            ssh_dir.join("id_rsa"),
+        let stdout = run_bwrap_with_planted(
+            ".ssh/id_rsa",
             "-----BEGIN OPENSSH PRIVATE KEY-----\n",
-        )
-        .unwrap();
-
-        let (exit, stdout, _) = run_sandboxed_home_bwrap(
-            project.path(),
-            fake_home.path(),
-            "cat ~/.ssh/id_rsa 2>&1 && echo READ_OK || echo READ_DENIED",
+            "test -e ~/.ssh/id_rsa && echo VISIBLE; \
+             cat ~/.ssh/id_rsa 2>&1 && echo READ_OK; \
+             ls ~/.ssh 2>&1 && echo LIST_OK; true",
         );
-        assert_eq!(exit, 0, "shell wrapper itself should exit cleanly");
         assert!(
-            stdout.contains("READ_DENIED") && !stdout.contains("BEGIN OPENSSH"),
+            stdout.contains("VISIBLE"),
+            "premise: the planted key must exist inside the namespace — stdout: {stdout}"
+        );
+        assert!(
+            !stdout.contains("READ_OK") && !stdout.contains("BEGIN OPENSSH"),
             "planted ~/.ssh/id_rsa must stay Landlock-denied under bwrap — stdout: {stdout}"
+        );
+        assert!(
+            !stdout.contains("LIST_OK"),
+            "~/.ssh must not be listable under bwrap — stdout: {stdout}"
+        );
+        assert_eq!(
+            stdout.matches("Permission denied").count(),
+            2,
+            "the read and the listing must both fail on Landlock, not ENOENT — stdout: {stdout}"
         );
     }
 
@@ -2571,25 +2594,23 @@ print('CONNECTED')
     #[test]
     fn bwrap_cannot_read_planted_aws_credentials() {
         require_bwrap!();
-        let project = create_test_project();
-        let fake_home = tempfile::tempdir().expect("Failed to create temp home");
-        let aws_dir = fake_home.path().join(".aws");
-        fs::create_dir_all(&aws_dir).unwrap();
-        fs::write(
-            aws_dir.join("credentials"),
+        let stdout = run_bwrap_with_planted(
+            ".aws/credentials",
             "[default]\naws_secret_access_key = PLANTED_SECRET_MUST_NOT_LEAK\n",
-        )
-        .unwrap();
-
-        let (exit, stdout, _) = run_sandboxed_home_bwrap(
-            project.path(),
-            fake_home.path(),
-            "cat ~/.aws/credentials 2>&1 && echo READ_OK || echo READ_DENIED",
+            "test -e ~/.aws/credentials && echo VISIBLE; \
+             cat ~/.aws/credentials 2>&1 && echo READ_OK; true",
         );
-        assert_eq!(exit, 0);
         assert!(
-            stdout.contains("READ_DENIED") && !stdout.contains("PLANTED_SECRET"),
+            stdout.contains("VISIBLE"),
+            "premise: the planted file must exist inside the namespace — stdout: {stdout}"
+        );
+        assert!(
+            !stdout.contains("READ_OK") && !stdout.contains("PLANTED_SECRET"),
             "planted ~/.aws/credentials must stay Landlock-denied under bwrap — stdout: {stdout}"
+        );
+        assert!(
+            stdout.contains("Permission denied"),
+            "the read must fail on Landlock, not ENOENT — stdout: {stdout}"
         );
     }
 
@@ -2679,9 +2700,22 @@ print('CONNECTED')
     /// Returns a `TempDir` guard so the tree is removed on Drop even when the
     /// test panics mid-assert.
     fn create_deny_project() -> tempfile::TempDir {
+        let dir = tempdir_outside_tmp();
+        fs::create_dir_all(dir.path().join("secrets")).expect("create project dirs");
+        fs::write(dir.path().join("secrets/pw.txt"), "TOP-SECRET-DIR").expect("write");
+        fs::write(dir.path().join("token.txt"), "TOP-SECRET-FILE").expect("write");
+        fs::write(dir.path().join("README.md"), "hello").expect("write");
+        dir
+    }
+
+    /// A temp dir under the cargo target dir, never under `/tmp`.
+    ///
+    /// bwrap mounts a private tmpfs over `/tmp`, so anything planted there is
+    /// absent inside the namespace, and a deny test that plants there passes
+    /// on ENOENT without any mask or Landlock rule being involved.
+    fn tempdir_outside_tmp() -> tempfile::TempDir {
         // A CARGO_TARGET_DIR under /tmp (a common build-speed setup) falls
-        // back to the manifest's target/ — deny masks skip /tmp, so a /tmp
-        // base would void these tests.
+        // back to the manifest's target/.
         let base = std::env::var_os("CARGO_TARGET_DIR")
             .map(PathBuf::from)
             .filter(|d| {
@@ -2695,15 +2729,10 @@ print('CONNECTED')
                 .canonicalize()
                 .expect("canonicalize base")
                 .starts_with("/tmp"),
-            "test premise: no usable target dir outside /tmp — the deny mask \
-             skips /tmp, so these tests would prove nothing there"
+            "test premise: no usable target dir outside /tmp — bwrap hides \
+             /tmp, so tests planting there would prove nothing"
         );
-        let dir = tempfile::tempdir_in(base).expect("tempdir in target dir");
-        fs::create_dir_all(dir.path().join("secrets")).expect("create project dirs");
-        fs::write(dir.path().join("secrets/pw.txt"), "TOP-SECRET-DIR").expect("write");
-        fs::write(dir.path().join("token.txt"), "TOP-SECRET-FILE").expect("write");
-        fs::write(dir.path().join("README.md"), "hello").expect("write");
-        dir
+        tempfile::tempdir_in(base).expect("tempdir in target dir")
     }
 
     #[test]
