@@ -2299,6 +2299,36 @@ fn a_named_root_is_granted_read_write_and_execute() {
     );
 }
 
+/// #531: the managed worktree root section, with the `.git` create denies of
+/// the #574 re-review, appears only when the root is set.
+#[test]
+fn the_managed_worktree_root_section_is_emitted_only_when_set() {
+    let root = PathBuf::from("/Users/test/.cplt-worktrees/ab");
+    let named = [root.clone()];
+    let profile = |managed: Option<&std::path::Path>| {
+        generate_profile(
+            &SandboxConfig {
+                named_roots: &named,
+                named_root_git_dirs: &[],
+                managed_worktree_root: managed,
+                ..base_profile_options()
+            },
+            &[],
+        )
+    };
+    let off = profile(None);
+    assert!(!off.contains("Managed worktree root"), "{off}");
+    assert!(!off.contains("file-write-create"), "{off}");
+    let on = profile(Some(&root));
+    for rule in [
+        "(deny file-write-unlink (literal \"/Users/test/.cplt-worktrees/ab\"))",
+        "(deny file-write-create (literal \"/Users/test/.cplt-worktrees/ab/.git\"))",
+        "(deny file-write-create (regex #\"^/Users/test/\\.cplt-worktrees/ab/[^/]+/.+/\\.git$\"))",
+    ] {
+        assert!(on.contains(rule), "missing {rule}\n{on}");
+    }
+}
+
 /// The protected-path tables are emitted per writable root. A named root that
 /// did not join that set would be a repository whose `.git/hooks` the agent
 /// could write — and hooks run OUTSIDE the sandbox on the user's next git

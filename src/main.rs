@@ -1809,11 +1809,15 @@ fn warn_worktrees_not_audited(
     };
     let problems = cplt::worktrees::session_end_problems(project_dir, root);
     if !problems.is_empty() {
-        ui::warn(&format!(
-            "WORKTREE LINKS CHANGED. Do not run git in this repository's worktrees until you \
-             have checked these: git outside cplt could read agent-written config and run \
-             it.\n    {}\n  The next cplt launch refuses to start until they are fixed.",
-            problems.join("\n    ")
+        let dirs = cplt::worktrees::problem_dirs(&problems);
+        let details: Vec<String> = problems.iter().map(ToString::to_string).collect();
+        ui::error(&format!(
+            "WORKTREE LINKS CHANGED. Do not run git in these directories until this is \
+             fixed:\n    {}\n  git there would follow a link the agent wrote and could run \
+             agent-written config on this machine. Found:\n    {}\n  The next cplt launch \
+             refuses to start until they are fixed.",
+            dirs.join("\n    "),
+            details.join("\n    ")
         ));
     }
     if audit_enabled {
@@ -1835,12 +1839,15 @@ fn warn_worktrees_not_audited(
 /// runs without the root. A key in this checkout's local config still fails.
 ///
 /// `create` is false for `doctor` and `check`, which must not create the root.
+/// `os` is `std::env::consts::OS`, passed in so the refusal off macOS is
+/// tested on every host.
 fn managed_worktree_root(
     enabled: bool,
     from_local: bool,
     create: bool,
     home_dir: &Path,
     project_dir: &Path,
+    os: &str,
 ) -> anyhow::Result<Option<PathBuf>> {
     if !enabled {
         return Ok(None);
@@ -1866,7 +1873,7 @@ fn managed_worktree_root(
         ));
         return Ok(None);
     }
-    cplt::worktrees::refuse_unsupported_os(std::env::consts::OS).map_err(fail)?;
+    cplt::worktrees::refuse_unsupported_os(os).map_err(fail)?;
     match cplt::worktrees::prepare_root(home_dir, project_dir, create) {
         Ok(Some(root)) => Ok(Some(root)),
         Ok(None) => Err(fail(not_in_repo())),
@@ -2842,6 +2849,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         !(check_mode || cli.doctor || cli.print_profile),
         &home_dir,
         &project_dir,
+        std::env::consts::OS,
     )?;
     // Same confused deputy as the named-root check above: the managed root is
     // agent-writable, so a config file inside it is one the agent could rewrite.
@@ -9763,6 +9771,7 @@ mod tests {
             true,
             home.path(),
             Path::new("/nonexistent"),
+            "macos",
         )
         .expect("off never fails");
         assert!(root.is_none());
@@ -9785,12 +9794,46 @@ mod tests {
     fn managed_worktree_root_on_without_a_repository() {
         let home = tempfile::tempdir().expect("tempdir");
         let plain = tempfile::tempdir().expect("tempdir");
-        let err = super::managed_worktree_root(true, true, true, home.path(), plain.path())
-            .expect_err("local key, no repository, no root");
+        let err =
+            super::managed_worktree_root(true, true, true, home.path(), plain.path(), "macos")
+                .expect_err("local key, no repository, no root");
         assert!(err.to_string().contains("allow_git_worktrees"), "{err}");
-        let root = super::managed_worktree_root(true, false, true, home.path(), plain.path())
-            .expect("global key outside a repository is skipped");
+        let root =
+            super::managed_worktree_root(true, false, true, home.path(), plain.path(), "macos")
+                .expect("global key outside a repository is skipped");
         assert!(root.is_none());
+        assert!(!home.path().join(cplt::worktrees::BASE).exists());
+    }
+
+    /// #574 review: the launch path refuses the key off macOS, for a global
+    /// and a local key alike, before creating anything.
+    #[test]
+    fn managed_worktree_root_is_refused_on_linux() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("tempdir");
+        let ok = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo.path())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            eprintln!("SKIPPED: git unavailable");
+            return;
+        }
+        for from_local in [false, true] {
+            let err = super::managed_worktree_root(
+                true,
+                from_local,
+                true,
+                home.path(),
+                repo.path(),
+                "linux",
+            )
+            .expect_err("refused on linux");
+            assert!(err.to_string().contains("macOS-only"), "{err}");
+        }
         assert!(!home.path().join(cplt::worktrees::BASE).exists());
     }
     /// #553: every path the "read is blocked" probe can pick must really be

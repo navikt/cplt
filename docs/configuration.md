@@ -474,11 +474,14 @@ What you get:
   per-root list inside every worktree. See
   [SECURITY.md](../SECURITY.md#managed-worktree-root-sandboxallow_git_worktrees).
 - Each worktree's `.git` pointer and its `commondir` cannot be rewritten in
-  place. Deleting and recreating them is not blocked, so cplt checks both
-  links at every launch and at session end. A link that does not match what
-  `git worktree add` writes prints a loud warning at session end and makes the
-  next launch refuse to start. Do not run Git in those worktrees until you
-  have checked them.
+  place, and no other `.git` can be created in the root. Deleting and
+  recreating them, or moving in a directory that holds a `.git`, is not
+  blocked, so cplt checks every `commondir` and walks the whole root for
+  `.git` entries at every launch and at session end. Only
+  `<root>/<name>/.git`, as `git worktree add` writes it, passes. Anything
+  else prints an error at session end naming the directories not to run Git
+  in, and makes the next launch refuse to start. Submodules inside a managed
+  worktree are refused for the same reason.
 - Worktrees and branches persist after the session. cplt never removes them.
   Clean up with `git worktree remove` and `git branch -d` when you are done.
 - The end-of-session audit does not cover the worktrees' contents yet. It

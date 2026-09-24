@@ -628,14 +628,23 @@ does not:
   kernel only blocks rewriting either file in place (`file-write-data`). It
   does not block deleting and recreating them, moving the worktree aside and
   writing a new pointer, or creating a new admin directory: `git worktree add`
-  and `git worktree remove` need those operations. cplt closes those at two
-  points. At every launch it checks every `<common>/worktrees/*/commondir` (it
-  must resolve to the common directory) and every `<root>/*/.git` (a pointer
-  file naming `<common>/worktrees/<name>`, whose `gitdir` names it back), and
-  refuses to start if one is off. At session end it runs the same check and
-  prints a loud warning naming each finding. Between the end of a session and
-  your next Git command in a worktree, only that warning stands between you and
-  the planted config. Pointers deeper than `<root>/*/.git` are not checked.
+  and `git worktree remove` need those operations. A `.git` anywhere else in
+  the root (`<root>/.git`, `<root>/<name>/sub/.git`, as a file, symlink or
+  directory) works the same way for a `git status` run in that directory. The
+  kernel refuses creating one (`file-write-create` on `<root>/.git` and on
+  `<root>/<name>/<anything>/.git`: a new file, a symlink, a mkdir and a
+  rename onto the name). It does not refuse moving in a directory that
+  already holds a `.git`, since that is not a create. cplt closes the rest at
+  two points. At every launch it checks every `<common>/worktrees/*/commondir`
+  (it must resolve to the common directory) and walks the whole root without
+  following symlinks: the only `.git` allowed is `<root>/<name>/.git` as a
+  regular file naming `<common>/worktrees/<name>`, whose `gitdir` names it
+  back. Anything else, anything it cannot read, and a tree past the walk's
+  bounds (64 levels, 100 000 directories) is a finding, and the launch refuses
+  to start. At session end it runs the same check and prints an error naming
+  each directory not to run Git in. Between the end of a session and your next
+  Git command there, only that error stands between you and the planted
+  config. Submodules inside a managed worktree are refused by the same rules.
 - **macOS only.** On Linux the launch fails with the key on. Landlock cannot
   subtract a path from the granted root, and bubblewrap re-binds only paths
   that exist at launch, at fixed depths, never `<root>/<worktree>/<rel>`. So

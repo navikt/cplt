@@ -4532,6 +4532,15 @@ r pointer 'echo "gitdir: /tmp" > "$R/a/.git"'
 r ghrename 'mkdir -p "$R/a/.github/workflows" && mv "$R/a/.github" "$R/a/.gh2"'
 r commondir 'mkdir -p "$R/x" && echo "$R/x" > "$P/.git/worktrees/a/commondir"'
 r root_mv 'mv "$R" "$P/moved"'
+mkdir -p "$R/a/f" "$R/a/l" "$R/a/d" "$R/a/m" "$R/g"
+echo "gitdir: $R/g" > "$R/gp"
+r nested_file 'echo "gitdir: $R/g" > "$R/a/f/.git"'
+r nested_link 'ln -s "$R/gp" "$R/a/l/.git"'
+r nested_mkdir 'mkdir "$R/a/d/.git"'
+r nested_mv 'mv "$R/gp" "$R/a/m/.git"'
+r root_git 'echo "gitdir: $R/g" > "$R/.git"'
+r root_git_mkdir 'mkdir "$R/.git"'
+r root_git_link 'ln -s "$R/g" "$R/.git"'
 "##;
 
     /// With the key on, the agent can create two worktrees under
@@ -4582,6 +4591,13 @@ echo "ROOT:$R"
             "ghrename",
             "commondir",
             "root_mv",
+            "nested_file",
+            "nested_link",
+            "nested_mkdir",
+            "nested_mv",
+            "root_git",
+            "root_git_mkdir",
+            "root_git_link",
             "sib_read",
             "sib_write",
             "sib_exec",
@@ -4631,43 +4647,94 @@ if echo y > "{root_s}/g" 2>/dev/null; then echo RESULT:write:OK; else echo RESUL
         assert_result_fail(&stdout, "write");
     }
 
-    /// The walk-arounds the kernel does not stop, a recreated `.git` pointer
-    /// naming a gitdir inside the root and a `commondir` unlinked and written
-    /// again, are named loudly when the session ends, and the next launch
-    /// refuses to start.
+    /// The walk-arounds the kernel does not stop are named loudly when the
+    /// session ends, with the directory not to run git in, and the next launch
+    /// refuses to start: a recreated `.git` pointer naming a gitdir inside the
+    /// root, a `commondir` unlinked and written again, an admin dir added
+    /// mid-session, and a `.git` pointer or symlink below a worktree, moved in
+    /// inside a directory built at depth one (creating it in place is denied,
+    /// see `managed_worktree_root_is_usable_and_scoped`).
+    ///
+    /// `<root>/.git` cannot be made from inside at all, so it is planted from
+    /// the host between sessions (`host`), and only the refusal is checked.
     #[test]
     fn managed_worktree_links_are_checked_at_exit_and_launch() {
         require_sandbox!();
         let config = "[sandbox]\nallow_git_worktrees = true\n";
-        for (name, attack) in [
+        for (name, attack, dir, host) in [
             (
                 "pointer",
                 r#"mv "$R/a" "$R/a.old" && mkdir -p "$R/a" "$R/g" && printf 'gitdir: %s\n' "$R/g" > "$R/a/.git""#,
+                "a",
+                false,
             ),
             (
                 "commondir",
                 r#"mkdir -p "$R/x" && rm "$P/.git/worktrees/a/commondir" && echo "$R/x" > "$P/.git/worktrees/a/commondir""#,
+                "a",
+                false,
             ),
+            (
+                "admin",
+                r#"mkdir -p "$R/x" "$P/.git/worktrees/evil" && echo "$R/x" > "$P/.git/worktrees/evil/commondir""#,
+                "",
+                false,
+            ),
+            (
+                "nested",
+                r#"mkdir -p "$R/g" "$R/s" && printf 'gitdir: %s\n' "$R/g" > "$R/s/.git" && mv "$R/s" "$R/a/sub""#,
+                "a/sub",
+                false,
+            ),
+            (
+                "nested_link",
+                r#"mkdir -p "$R/g" "$R/s" && printf 'gitdir: %s\n' "$R/g" > "$R/gp" && ln -s "$R/gp" "$R/s/.git" && mv "$R/s" "$R/a/sub2""#,
+                "a/sub2",
+                false,
+            ),
+            ("root", "true", "", true),
         ] {
             let project = TempProject::new(&format!("wt-links-{name}"));
             project.write_file("f.txt", "x\n");
             project.git_init();
             let home = TempProject::new(&format!("wt-links-{name}-home"));
+            let (root, _) = managed_paths(&project, home.path());
             let script = format!(
                 "P=\"$PWD\"\nR=\"$CPLT_WORKTREE_ROOT\"\ngit worktree add -q \"$R/a\" -b a \
                  && {attack} && echo RESULT:attack:OK\n"
             );
             let (stdout, stderr, _) = run_exec_with_home(&project, home.path(), config, &script);
             assert_result_ok(&stdout, &stderr, "attack");
-            assert!(
-                stderr.contains("WORKTREE LINKS CHANGED"),
-                "{name}: the session end names it.\n{stderr}"
-            );
+            let dir = if dir.is_empty() {
+                root.clone()
+            } else {
+                root.join(dir)
+            };
+            if host {
+                fs::create_dir_all(root.join("g")).unwrap();
+                fs::write(
+                    root.join(".git"),
+                    format!("gitdir: {}\n", root.join("g").display()),
+                )
+                .unwrap();
+            } else {
+                assert!(
+                    stderr.contains("WORKTREE LINKS CHANGED")
+                        && stderr.contains("Do not run git in these directories")
+                        && stderr.contains(&format!("\n    {}\n", dir.display())),
+                    "{name}: the session end names it and {}.\n{stderr}",
+                    dir.display()
+                );
+            }
             let (stdout, stderr, ok) =
                 run_exec_with_home(&project, home.path(), config, "echo RESULT:ran:OK\n");
             assert!(!ok, "{name}: next launch must fail.\n{stdout}\n{stderr}");
             assert!(!stdout.contains("RESULT:ran"), "{stdout}");
-            assert!(stderr.contains("worktree links"), "{name}: {stderr}");
+            assert!(
+                stderr.contains("worktree links")
+                    && stderr.contains(&format!("\n    {}\n", dir.display())),
+                "{name}: {stderr}"
+            );
         }
     }
 

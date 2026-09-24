@@ -1166,12 +1166,30 @@ fn emit_git_persistence_denies(
     //
     // The root's own name is pinned for the reason the gitdir is: a rename
     // walks around every path rule under it.
+    //
+    // A `.git` anywhere in the root other than `<root>/<name>/.git` is a
+    // pointer (or gitdir) that a plain `git status` there follows on the host,
+    // so creating one is refused: a new file, a symlink, a mkdir and a rename
+    // onto the name (checked with `sandbox-exec`). `git worktree add
+    // "$CPLT_WORKTREE_ROOT/<name>"` writes depth one, which stays open. A
+    // directory moved in that already holds a `.git` is not a create, so
+    // `worktrees::link_problems` walks the whole root for that.
     if let Some(root) = managed_worktree_root {
+        let r = escape_regex(&root.to_string_lossy());
         sbpl!(sb, ";; Managed worktree root (#531)");
         sbpl!(
             sb,
             "(deny file-write-unlink (literal \"{}\"))",
             root.display()
+        );
+        sbpl!(
+            sb,
+            "(deny file-write-create (literal \"{}/.git\"))",
+            root.display()
+        );
+        sbpl!(
+            sb,
+            "(deny file-write-create (regex #\"^{r}/[^/]+/.+/\\.git$\"))"
         );
         for gitdir in &gitdirs {
             let g = escape_regex(gitdir);
