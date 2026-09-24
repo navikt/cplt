@@ -62,6 +62,11 @@ const LAZY_FETCH_TIMEOUT_SECS: u64 = 5;
 /// the whole body before it is hashed.
 const MAX_FETCH_BYTES: u64 = 50 * 1024 * 1024;
 
+/// Ceiling on domains taken from one blocklist. The byte cap alone still lets
+/// a 50 MB list of one-letter lines become ~25M `String`s; twice the size of
+/// the largest real list is plenty.
+const MAX_BLOCKLIST_ENTRIES: usize = 2_000_000;
+
 /// Warn about a cache that has not been refreshed in this long.
 const STALE_WARN: Duration = Duration::from_hours(720);
 
@@ -302,12 +307,31 @@ fn cache_path(cache_dir: &Path, url: &str) -> PathBuf {
 /// dot, skip blank and `#` comment lines) so subscription domains match exactly
 /// like the local blocklist file and built-in list under the existing
 /// exact-or-subdomain matcher.
-pub fn parse_blocklist(contents: &str) -> Vec<String> {
-    contents
+///
+/// Keeps at most [`MAX_BLOCKLIST_ENTRIES`] domains; the flag is true when it
+/// dropped the rest.
+pub fn parse_blocklist(contents: &str) -> (Vec<String>, bool) {
+    let mut domains: Vec<String> = contents
         .lines()
         .map(|l| l.trim().to_lowercase().trim_end_matches('.').to_string())
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .collect()
+        .take(MAX_BLOCKLIST_ENTRIES + 1)
+        .collect();
+    let truncated = domains.len() > MAX_BLOCKLIST_ENTRIES;
+    domains.truncate(MAX_BLOCKLIST_ENTRIES);
+    (domains, truncated)
+}
+
+/// [`parse_blocklist`], warning with the list's URL when it was cut short.
+fn parse_subscription(contents: &str, url: &str) -> Vec<String> {
+    let (domains, truncated) = parse_blocklist(contents);
+    if truncated {
+        crate::ui::warn(&format!(
+            "blocklist {url} has more than {MAX_BLOCKLIST_ENTRIES} domains, so cplt kept \
+             the first {MAX_BLOCKLIST_ENTRIES} and ignored the rest"
+        ));
+    }
+    domains
 }
 
 /// Load and UNION the cached domains from every configured blocklist
@@ -321,7 +345,7 @@ pub fn load_cached_domains(set: &SubscriptionSet) -> Vec<String> {
     for sub in &set.blocklists {
         let path = cache_path(&set.cache_dir, &sub.url);
         if let Ok(contents) = std::fs::read_to_string(&path) {
-            domains.extend(parse_blocklist(&contents));
+            domains.extend(parse_subscription(&contents, &sub.url));
         }
     }
     domains.sort_unstable();
@@ -465,7 +489,7 @@ fn update_one(
         verified = true;
     }
 
-    let domains = parse_blocklist(&String::from_utf8_lossy(&bytes)).len();
+    let domains = parse_subscription(&String::from_utf8_lossy(&bytes), &sub.url).len();
 
     // Persist the cache atomically, and record the fetch timestamp ONLY after the
     // write is confirmed. If the dir create or atomic write fails we leave the
@@ -637,8 +661,9 @@ mod tests {
     #[test]
     fn parse_blocklist_normalizes() {
         let raw = "# comment\nEvil.COM\n\n  bad.example.  \nfoo.test\n";
-        let got = parse_blocklist(raw);
+        let (got, truncated) = parse_blocklist(raw);
         assert_eq!(got, vec!["evil.com", "bad.example", "foo.test"]);
+        assert!(!truncated);
     }
 
     #[test]
@@ -845,6 +870,14 @@ mod tests {
             assert_eq!(String::from_utf8_lossy(&bytes).trim(), "curl.example");
         }
         // curl may be unavailable in some CI images; a fetch error is tolerated.
+    }
+
+    #[test]
+    fn parse_blocklist_caps_entries() {
+        let raw = "a\n".repeat(MAX_BLOCKLIST_ENTRIES + 10);
+        let (got, truncated) = parse_blocklist(&raw);
+        assert_eq!(got.len(), MAX_BLOCKLIST_ENTRIES);
+        assert!(truncated);
     }
 
     // ── FIX 1: response size cap (DoS / pinning-bypass) ─────────────────────
