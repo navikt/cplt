@@ -1964,6 +1964,124 @@ if cat secrets/k.txt >/dev/null 2>&1; then echo "RESULT:launch_secret:OK"; else 
         );
     }
 
+    /// #385 M-01: `sandbox.refuse_invalid_repo_config` turns an unparseable
+    /// `.cplt.toml`, in the launch repository or a named one, into a refused
+    /// launch that names the parse error. Off, both warn and launch as before.
+    #[test]
+    fn refuse_invalid_repo_config_refuses_only_when_on() {
+        let bad = "this is not = = toml [[[\n";
+        let broken = TempProject::new("refuse-invalid-launch");
+        broken.write_file(".cplt.toml", bad);
+        broken.git_init();
+        let clean = TempProject::scaffold_node();
+        clean.git_init();
+        let named = TempProject::new("refuse-invalid-named");
+        named.write_file(".cplt.toml", bad);
+        named.git_init();
+        let named_path = named.canonical_path().to_string_lossy().to_string();
+
+        // Uncommitted: read from the working tree, so the fix is to edit it.
+        // Outside every repository (TempProject lives inside this checkout).
+        let loose_tmp = tempfile::tempdir().expect("tempdir");
+        fs::write(loose_tmp.path().join(".cplt.toml"), bad).unwrap();
+        let loose = fs::canonicalize(loose_tmp.path()).unwrap();
+        // A typo'd `[deny]` key: parses, but a restriction is silently lost.
+        let typo = TempProject::new("refuse-invalid-deny-typo");
+        typo.write_file(".cplt.toml", "[deny]\npathz = [\"secrets\"]\n");
+        typo.git_init();
+        // An unknown `[propose]` key grants nothing and stays forward-compatible.
+        let future = TempProject::new("refuse-invalid-propose-future");
+        future.write_file(".cplt.toml", "[propose]\nsome_future_key = true\n");
+        future.git_init();
+
+        let config_home = TempProject::new("refuse-invalid-config");
+        let on = config_home.path().join("on.toml");
+        let off = config_home.path().join("off.toml");
+        fs::write(&on, "[sandbox]\nrefuse_invalid_repo_config = true\n").unwrap();
+        fs::write(&off, "[sandbox]\nrefuse_invalid_repo_config = false\n").unwrap();
+
+        let named_args: &[&str] = &["--repo-dir", &named_path];
+        let typo_path = typo.canonical_path().to_string_lossy().to_string();
+        let typo_named: &[&str] = &["--repo-dir", &typo_path];
+        const PARSE: &str = "TOML parse error";
+        // (config, project, extra args, expect refusal, texts that must appear)
+        let dir = |p: &TempProject| p.canonical_path();
+        type Case<'a> = (&'a Path, PathBuf, &'a [&'a str], bool, Vec<&'a str>);
+        let cases: Vec<Case> = vec![
+            (
+                &on,
+                dir(&broken),
+                &[],
+                true,
+                vec!["Cannot load .cplt.toml", PARSE, "commit a fix"],
+            ),
+            (
+                &off,
+                dir(&broken),
+                &[],
+                false,
+                vec!["refuse_invalid_repo_config", PARSE],
+            ),
+            (&on, loose.clone(), &[], true, vec![PARSE, "fix the file"]),
+            (
+                &on,
+                dir(&clean),
+                typo_named,
+                true,
+                vec!["named repository", "deny.pathz", "commit a fix"],
+            ),
+            (
+                &on,
+                dir(&clean),
+                named_args,
+                true,
+                vec!["named repository", PARSE, "commit a fix"],
+            ),
+            (
+                &off,
+                dir(&clean),
+                named_args,
+                false,
+                vec!["NOT applied", PARSE],
+            ),
+            (
+                &on,
+                dir(&typo),
+                &[],
+                true,
+                vec!["deny.pathz", "commit a fix"],
+            ),
+            (&off, dir(&typo), &[], false, vec!["deny.pathz"]),
+            (&on, dir(&future), &[], false, vec!["some_future_key"]),
+        ];
+        for (config, project, extra, refused, texts) in cases {
+            let output = cplt_cmd()
+                .args(["--yes", "--no-validate", "--agent", "shell"])
+                .args(["--project-dir", &project.to_string_lossy()])
+                .args(extra)
+                .args(["--", "-c", "echo LAUNCHED"])
+                .env("CPLT_CONFIG", config)
+                .output()
+                .expect("cplt should run");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let what = format!("{}, {}, {extra:?}", config.display(), project.display());
+            assert_eq!(
+                output.status.success(),
+                !refused,
+                "{what}: exit status\nstdout: {stdout}\nstderr: {stderr}"
+            );
+            assert_eq!(
+                stdout.contains("LAUNCHED"),
+                !refused,
+                "{what}: did the command run?\nstdout: {stdout}\nstderr: {stderr}"
+            );
+            for text in texts {
+                assert!(stderr.contains(text), "{what}: missing {text:?}\n{stderr}");
+            }
+        }
+    }
+
     /// A tree the session was never given stays unreachable. Without this the
     /// two assertions above could both hold in a sandbox that grants
     /// everything.

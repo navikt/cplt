@@ -7873,6 +7873,55 @@ paths = [
         );
     }
 
+    /// #385 F04: an allowlist that is not itself in a writable tree, reached
+    /// through a symlink that is. The launch refusal (#499) resolves the
+    /// symlinked parent and passes it; `check` and the launch must still warn, naming the link.
+    #[test]
+    fn e2e_check_warns_on_an_allowlist_behind_a_writable_symlink() {
+        require_sandbox!();
+        let proj = check_project();
+        // Under $HOME, which this session cannot write (a temp dir would be).
+        // A TempDir, so a failing assertion still removes it from the real HOME.
+        let home = std::env::var("HOME").expect("HOME");
+        let list_dir = tempfile::Builder::new()
+            .prefix(".cplt-e2e-f04-")
+            .tempdir_in(&home)
+            .expect("list dir");
+        std::fs::write(list_dir.path().join("allowed.txt"), "registry.npmjs.org\n").unwrap();
+        std::os::unix::fs::symlink(list_dir.path(), proj.path().join("lists")).expect("symlink");
+
+        // `check`, and the launch itself (`exec` takes the same path as an
+        // agent). With `--observe-domains` the allowlist is not read, so there
+        // is nothing to warn about.
+        for (cmd, warns) in [
+            (&["check"][..], true),
+            (&["--no-validate", "exec", "--", "/usr/bin/true"], true),
+            (&["--observe-domains", "check"], false),
+        ] {
+            let output = cplt_cmd()
+                .args(["--agent", "shell"])
+                .arg("--project-dir")
+                .arg(proj.path())
+                .arg("--allowed-domains")
+                .arg(proj.path().join("lists/allowed.txt"))
+                .args(cmd)
+                .output()
+                .expect("cplt should run");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "{cmd:?}: a warning, not a refusal:\n{}\n{stderr}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert_eq!(
+                stderr.contains("proxy.allowed_domains names")
+                    && stderr.contains("lists on the way to it"),
+                warns,
+                "{cmd:?}: the writable-path warning:\n{stderr}"
+            );
+        }
+    }
+
     /// The probes are POSIX shell, so they must run under `/bin/sh` and never
     /// under `$SHELL`. A fish user got `fish: Unsupported use of '='` for the
     /// write probe, which exits non-zero, so `check` reported a healthy sandbox
