@@ -779,9 +779,15 @@ If you only need one of the files, a single `allow.read` line is narrower. `cplt
 
 ## Blocking new nested `.git` entries (`sandbox.deny_nested_git`)
 
-A session can make any subdirectory of the project into a repository whose config it wrote: a `.git` pointer file, a `.git` symlink, or a git directory renamed into place. Git run there later, outside the sandbox, runs whatever that config names ([#576](https://github.com/navikt/cplt/issues/576)). cplt checks for this at the end of every session and names each directory whose `.git` is new or changed, including a `.GIT`-style case variant and a bare-repository layout (`HEAD`, `objects/`, `refs/` and a `config`, no `.git` at all). That check is always on and has no key.
+A session can make any subdirectory of the project into a repository whose config it wrote: a `.git` pointer file, a `.git` symlink, or a git directory renamed into place. Git run there later, outside the sandbox, runs whatever that config names ([#576](https://github.com/navikt/cplt/issues/576)). cplt checks for this at the end of every session and names each directory whose `.git` is new or changed, including a `.GIT`-style case variant, a git-directory layout with no `.git` at all (a `HEAD` plus `objects/` and `refs/`, or plus a `commondir` file), and a symlink to a repository elsewhere. That check is always on and has no key. Its limits are listed in [SECURITY.md](../SECURITY.md).
 
-`sandbox.deny_nested_git` also blocks the plant on macOS. It refuses to create any `.git` entry, in any letter case, below each writable root (file, directory, symlink, hard link, or rename onto the name). The root's own `.git` is not affected, so `git init` in the project directory still works. It does not block the bare-repository layout; for that, set `safe.bareRepository = explicit` in your global git config.
+`sandbox.deny_nested_git` also blocks the plant on macOS. It refuses to create the `.git` name itself, in any letter case, below each writable root (file, directory, symlink, hard link, or rename onto the name). The root's own `.git` is not affected, so `git init` in the project directory still works. It does not block:
+
+- moving in a directory that already contains a `.git`, staged in a writable place outside the project such as `/private/tmp` or `/var/folders`
+- a symlink to a repository outside the project
+- the git-directory layout; for that, set `safe.bareRepository = explicit` in your global git config
+
+The end-of-session check reports all three.
 
 ```bash
 cplt config set sandbox.deny_nested_git true

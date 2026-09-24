@@ -1233,6 +1233,10 @@ fn emit_git_persistence_denies(
 /// carries on. The leading `.+/` leaves `<root>/.git` alone, so `git init` at
 /// the project root still works.
 ///
+/// Only the `.git` name itself is covered. Renaming in an ancestor that
+/// already holds one (staged in `/private/tmp`) creates `sub`, not `.git`, and
+/// is allowed; the session-end check reports it (SECURITY.md).
+///
 /// Off by default because it breaks `git worktree add` into the project and
 /// any fixture that creates a `.git` below it. On Linux nothing can express it:
 /// Landlock cannot deny inside a tree it allows and bubblewrap only binds paths
