@@ -6991,7 +6991,7 @@ paths = [
             format!("new: {}", project.join(".git/.git").display()),
             // F3: a gitdir outside every root says so.
             format!(
-                "new: {} (its git directory is outside the project: {})",
+                "new: {} (its git directory is outside the project and every named repository: {})",
                 project.join("tools").display(),
                 outside.join("evil/.git").display()
             ),

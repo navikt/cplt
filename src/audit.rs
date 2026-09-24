@@ -1311,7 +1311,7 @@ impl NestedGit {
                 .and_then(|g| lookup_hops(g).pop())
                 .map(|q| {
                     format!(
-                        " (its git directory is outside the project: {})",
+                        " (its git directory is outside the project and every named repository: {})",
                         esc_path(&q)
                     )
                 })
@@ -1357,7 +1357,8 @@ impl NestedGit {
         let lines = self.repo_lines(&after);
         if !lines.is_empty() {
             ui::error(
-                "A git repository was created or changed below the project during this \
+                "A git repository was created or changed below the project or a named \
+                 repository during this \
                  session (a .git, or a bare-repository layout). Git run in these directories \
                  reads config the session wrote, and can run a program of its choosing \
                  outside the sandbox (core.fsmonitor, core.hooksPath). Do not run git there, \
@@ -1372,7 +1373,8 @@ impl NestedGit {
         let links = self.link_lines(&after);
         if !links.is_empty() {
             ui::error(
-                "This session created or re-aimed symlinks that lead out of the project. \
+                "This session created or re-aimed symlinks that lead out of the project \
+                 and every named repository. \
                  Git run through one obeys whatever repository is at the other end, now or \
                  later, and nothing here watches that end. Check them before running git \
                  below them:",
@@ -1419,23 +1421,27 @@ impl NestedGit {
             // directories, which is exactly how a plant would be hidden.
             ui::error(&format!(
                 "Stopped checking for new .git entries after {limit} directories. The \
-                 project had fewer at launch, so this session created enough directories \
+                 project and named repositories had fewer at launch, so this session \
+                 created enough directories \
                  to cut the check short. Directories it did not reach (anything deeper, \
                  and later names at the level where it stopped) were not checked. Do not \
-                 run git in the project until you have looked for new .git entries and \
+                 run git in the project or a named repository until you have looked for \
+                 new .git entries and \
                  bare repositories yourself."
             ));
         } else if after.capped || self.before.capped {
             ui::warn(&format!(
-                "Stopped checking for new .git entries after {limit} directories, so \
-                 directories the check did not reach (anything deeper, and later names \
+                "Stopped checking for new .git entries below the project and named \
+                 repositories after {limit} directories, so directories the check did not \
+                 reach (anything deeper, and later names \
                  at the level where it stopped) were not looked at."
             ));
         }
         if unsettled {
             ui::warn(
                 "The session left processes running, so a git repository they create \
-                 below the project after this check is not reported.",
+                 below the project or a named repository after this check is not \
+                 reported.",
             );
         }
     }
