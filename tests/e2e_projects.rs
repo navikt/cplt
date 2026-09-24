@@ -2665,6 +2665,21 @@ if [ -n "${no_proxy:-}" ]; then echo "RESULT:no_proxy_lower:OK"; else echo "RESU
         assert_result_ok(&stdout, &stderr, "no_proxy_lower");
     }
 
+    /// Shell helper for the proxy tests: `proxy_connect HOST:PORT` sends one
+    /// CONNECT to the cplt proxy (port recovered from the injected `http_proxy`)
+    /// and prints the status line. A single short `nc -w` flaked under load
+    /// (#126), so an EMPTY reply is retried, up to three tries of 5 s each. A
+    /// reply with the wrong status is not retried: that is a real failure.
+    const PROXY_CONNECT_SH: &str = r#"
+proxy_connect() {
+    for _ in 1 2 3; do
+        resp=$(printf 'CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n' "$1" "$1" | nc -w 5 127.0.0.1 "${http_proxy##*:}" 2>/dev/null | head -1)
+        if [ -n "$resp" ]; then break; fi
+    done
+    printf '%s\n' "$resp"
+}
+"#;
+
     #[test]
     fn project_proxy_port_filtering() {
         require_sandbox!();
@@ -2676,24 +2691,25 @@ if [ -n "${no_proxy:-}" ]; then echo "RESULT:no_proxy_lower:OK"; else echo "RESU
         // Script that tries to connect to various ports through the proxy.
         // For port 443 we use a non-existent host — the proxy allows the port
         // but fails DNS, returning 502. This proves port filtering passed.
-        let script = r#"
-# The actual proxy port is OS-assigned (--proxy-port 0); recover it from the
-# HTTP_PROXY URL cplt injects (http://127.0.0.1:PORT) rather than a fixed port.
-PROXY_PORT=${http_proxy##*:}
-
+        // The proxy port is OS-assigned (--proxy-port 0); `proxy_connect`
+        // recovers it from the HTTP_PROXY URL cplt injects.
+        let script = [
+            PROXY_CONNECT_SH,
+            r#"
 # Port 443: allowed → proxy tries DNS, fails → 502 (proves port check passed)
-RESP443=$(printf 'CONNECT nonexistent.invalid:443 HTTP/1.1\r\nHost: nonexistent.invalid:443\r\n\r\n' | nc -w 3 127.0.0.1 "$PROXY_PORT" 2>/dev/null | head -1)
+RESP443=$(proxy_connect nonexistent.invalid:443)
 if echo "$RESP443" | grep -q "502"; then echo "RESULT:port_443:OK"; else echo "RESULT:port_443:FAIL:$RESP443"; fi
 
 # Port 80: blocked → 403 (port filter rejects before DNS)
-RESP80=$(printf 'CONNECT example.com:80 HTTP/1.1\r\nHost: example.com:80\r\n\r\n' | nc -w 2 127.0.0.1 "$PROXY_PORT" 2>/dev/null | head -1)
+RESP80=$(proxy_connect example.com:80)
 if echo "$RESP80" | grep -q "403"; then echo "RESULT:port_80:OK"; else echo "RESULT:port_80:FAIL:$RESP80"; fi
 
 # Port 8080: blocked → 403
-RESP8080=$(printf 'CONNECT example.com:8080 HTTP/1.1\r\nHost: example.com:8080\r\n\r\n' | nc -w 2 127.0.0.1 "$PROXY_PORT" 2>/dev/null | head -1)
+RESP8080=$(proxy_connect example.com:8080)
 if echo "$RESP8080" | grep -q "403"; then echo "RESULT:port_8080:OK"; else echo "RESULT:port_8080:FAIL:$RESP8080"; fi
-"#
-        .to_string();
+"#,
+        ]
+        .concat();
         let fake_dir = create_fake_copilot(&project, &script);
         let (stdout, stderr, success) = run_cplt(
             &project,
@@ -2758,15 +2774,15 @@ if [ -z "${HTTPS_PROXY:-}" ]; then echo "RESULT:no_https_proxy:OK"; else echo "R
         let allowlist_path = list_dir.join("allowed-domains.txt");
         std::fs::write(&allowlist_path, "only-this.example.com\n").unwrap();
 
-        // Try to CONNECT to a domain NOT in the allowlist. The actual proxy
-        // port is OS-assigned (--proxy-port 0); recover it from the
-        // HTTP_PROXY URL cplt injects (http://127.0.0.1:PORT).
-        let script = r#"
-PROXY_PORT=${http_proxy##*:}
-RESP=$(printf 'CONNECT blocked.example.com:443 HTTP/1.1\r\nHost: blocked.example.com:443\r\n\r\n' | nc -w 2 127.0.0.1 "$PROXY_PORT" 2>/dev/null | head -1)
+        // Try to CONNECT to a domain NOT in the allowlist.
+        let script = [
+            PROXY_CONNECT_SH,
+            r#"
+RESP=$(proxy_connect blocked.example.com:443)
 if echo "$RESP" | grep -q "403"; then echo "RESULT:blocked_unlisted:OK"; else echo "RESULT:blocked_unlisted:FAIL:$RESP"; fi
-"#
-        .to_string();
+"#,
+        ]
+        .concat();
         let fake_dir = create_fake_copilot(&project, &script);
         let (stdout, stderr, success) = run_cplt(
             &project,
@@ -2798,15 +2814,15 @@ if echo "$RESP" | grep -q "403"; then echo "RESULT:blocked_unlisted:OK"; else ec
         let port: u16 = 0;
         let log_path = project.path().join("proxy-audit.log");
 
-        // Send a CONNECT through the proxy to generate a log entry. The actual
-        // proxy port is OS-assigned (--proxy-port 0); recover it from the
-        // HTTP_PROXY URL cplt injects (http://127.0.0.1:PORT).
-        let script = r#"
-PROXY_PORT=${http_proxy##*:}
-printf 'CONNECT example.com:80 HTTP/1.1\r\nHost: example.com:80\r\n\r\n' | nc -w 2 127.0.0.1 "$PROXY_PORT" 2>/dev/null >/dev/null
+        // Send a CONNECT through the proxy to generate a log entry.
+        let script = [
+            PROXY_CONNECT_SH,
+            r#"
+proxy_connect example.com:80 >/dev/null
 echo "RESULT:sent:OK"
-"#
-        .to_string();
+"#,
+        ]
+        .concat();
         let fake_dir = create_fake_copilot(&project, &script);
         let (stdout, stderr, success) = run_cplt(
             &project,
