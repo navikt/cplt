@@ -860,7 +860,7 @@ fn check_query_root(
         return Err("repository(owner:, name:) must be plain strings or -f variables".into());
     };
     let repo = format!("{owner}/{name}");
-    if !scope.iter().any(|m| crate::gh_proxy::repos_match(&repo, m)) {
+    if !in_scope(&repo, scope) {
         return Err(format!(
             "query reads repository '{repo}', outside the startup scope '{}'",
             scope.join(", ")
@@ -922,6 +922,13 @@ const LOOKUP: &str = "query($id: ID!) { node(id: $id) { __typename \
     ... on PullRequestReviewThread { repository { url } } \
     ... on PullRequestReview { repository { url } } } }";
 
+/// Exact `owner/name`, ASCII case-insensitive. Not `repos_match`: that strips a
+/// `.git` suffix for Git URL spellings, but `repository(name:)` and the API's
+/// `repository { url }` carry the real name, which may itself end in `.git`.
+fn in_scope(repo: &str, scope: &[String]) -> bool {
+    scope.iter().any(|m| m.eq_ignore_ascii_case(repo))
+}
+
 /// The `owner/name` a lookup response places `kind`'s node in, when it is a
 /// github.com repository.
 fn repo_from_lookup(json: &str, kind: NodeKind) -> Option<String> {
@@ -971,7 +978,7 @@ pub fn verify_targets(real_gh: &Path, targets: &[Target], scope: &[String]) -> R
                     t.id
                 )
             })?;
-        if !scope.iter().any(|m| crate::gh_proxy::repos_match(&repo, m)) {
+        if !in_scope(&repo, scope) {
             return Err(format!(
                 "{} '{}' belongs to '{repo}', outside the startup scope '{}'",
                 t.kind.typename(),
@@ -1023,6 +1030,15 @@ mod tests {
             Ok(vec![])
         );
         assert_eq!(q("{ __typename }"), Ok(vec![]));
+    }
+
+    // `repository(name:)` is the exact name; `cplt.git` is a different repo.
+    #[test]
+    fn refuses_a_name_that_differs_by_a_git_suffix() {
+        let err =
+            q("{ repository(owner:\"navikt\", name:\"cplt.git\") { __typename } }").unwrap_err();
+        assert!(err.contains("outside the startup scope"), "{err}");
+        assert!(!in_scope("navikt/cplt.git", &scope()));
     }
 
     #[test]

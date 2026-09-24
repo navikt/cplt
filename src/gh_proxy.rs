@@ -1156,13 +1156,10 @@ fn evaluate_api(cmd: &ParsedCommand, allow_api_write: bool) -> PolicyResult {
     // Block the GraphQL endpoint. Spellings `gh` does not treat as GraphQL
     // (`/graphql`, full URL, query string) stay blocked. Exact `graphql` is parsed
     // and allowlisted by the gate, which does not use this verdict for it.
-    // Normalize: strip trailing slashes and query params before matching.
+    // Normalize: strip query and fragment first, then slashes. The other order
+    // leaves `graphql/?x` as `graphql/`, which would pass as REST.
     if let Some(ref endpoint) = cmd.api_endpoint {
-        let normalized = endpoint
-            .trim_end_matches('/')
-            .split('?')
-            .next()
-            .unwrap_or(endpoint);
+        let normalized = endpoint.split(['?', '#']).next().unwrap_or(endpoint);
         // Extract the path component so a fully-qualified URL
         // (`https://api.github.com/graphql`) is caught too, not just the
         // relative `graphql` / `/graphql` forms.
@@ -1170,7 +1167,7 @@ fn evaluate_api(cmd: &ParsedCommand, allow_api_write: bool) -> PolicyResult {
             .split_once("://")
             .and_then(|(_, rest)| rest.split_once('/'))
             .map_or(normalized, |(_, p)| p);
-        if path.trim_start_matches('/') == "graphql" {
+        if path.trim_matches('/').eq_ignore_ascii_case("graphql") {
             return PolicyResult {
                 decision: Decision::Block,
                 reason: "gh api graphql allows arbitrary mutations — use specific REST endpoints instead",
@@ -5450,6 +5447,37 @@ mod tests {
         assert_eq!(approval.repo_scope, None);
     }
 
+    // Only exact `graphql` reaches the GraphQL checker; every other spelling of
+    // the endpoint must be refused, even with an in-scope `-R` and writes on.
+    #[test]
+    fn graphql_spellings_refused_at_the_gate() {
+        let writes = GatePolicy {
+            allow_api_write: true,
+            ..Default::default()
+        };
+        let scope = ["navikt/cplt".to_string()];
+        for ep in [
+            "graphql/?x",
+            "graphql?x",
+            "/graphql/",
+            "https://api.github.com/graphql",
+            "https://api.github.com/graphql/?x",
+        ] {
+            let args = [
+                "api",
+                ep,
+                "-R",
+                "navikt/cplt",
+                "-f",
+                "query=mutation { deleteRepository }",
+            ];
+            assert!(
+                gate_with_repo_scope(&args, &writes, &scope, None).is_err(),
+                "'{ep}' must be refused"
+            );
+        }
+    }
+
     #[test]
     fn graphql_blocked_even_with_allow_api_write() {
         let cmd = ParsedCommand {
@@ -8376,7 +8404,21 @@ mod tests {
     // Lower-severity: full-URL graphql evades the relative-form block.
     #[test]
     fn api_graphql_full_url_blocked() {
-        for ep in ["graphql", "/graphql", "https://api.github.com/graphql"] {
+        for ep in [
+            "graphql",
+            "/graphql",
+            "/graphql/",
+            "graphql/",
+            "graphql?x",
+            "graphql/?x",
+            "/graphql/?x",
+            "graphql#x",
+            "GraphQL",
+            "https://api.github.com/graphql",
+            "https://api.github.com/graphql/",
+            "https://api.github.com/graphql?x",
+            "https://api.github.com/graphql/?x",
+        ] {
             let cmd = ParsedCommand {
                 command: "api".to_string(),
                 subcommand: None,
