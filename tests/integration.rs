@@ -1818,10 +1818,16 @@ mod macos_tests {
     }
 
     /// #576: `sandbox.deny_nested_git` refuses every way of bringing a `.git`
-    /// into existence below the project — a pointer file, a symlink, `mkdir`,
-    /// and a file or directory renamed onto the name — and leaves the root's
-    /// own `.git` alone. The same commands run under the default profile
-    /// first, so the test fails if the key stops being what blocks them.
+    /// into existence below the project — a pointer file, a symlink, a hard
+    /// link, `mkdir`, and a file or directory renamed onto the name — and
+    /// leaves the root's own `.git` alone. The same commands run under the
+    /// default profile first, so the test fails if the key stops being what
+    /// blocks them.
+    ///
+    /// It does not block moving in an *ancestor* of a `.git` staged outside
+    /// the project: no `.git` name is created, only `sub`. That residual is
+    /// pinned here as allowed, so a change in either direction is noticed;
+    /// the session-end check reports it.
     #[test]
     fn real_profile_deny_nested_git_blocks_creating_a_nested_git() {
         require_sandbox!();
@@ -1839,6 +1845,7 @@ mod macos_tests {
                 // opens `.GIT` when it looks up `.git` (#576).
                 format!("mkdir -p '{d}/i' && ln -s ../e '{d}/i/.GIT'"),
                 format!("mkdir -p '{d}/j' && printf 'gitdir: ../e\\n' > '{d}/j/.Git'"),
+                format!("mkdir -p '{d}/k' && echo x > '{d}/f2' && ln '{d}/f2' '{d}/k/.git'"),
             ]
         };
         for deny in [false, true] {
@@ -1848,14 +1855,35 @@ mod macos_tests {
             let mut opts = default_opts(&tmp, &home);
             opts.deny_nested_git = deny;
             let profile = write_real_profile(&opts);
-            for cmd in plants(&tmp) {
-                let (output, _) = run_sandboxed(&profile, &format!("{cmd} 2>&1; echo EXIT:$?"));
-                assert_eq!(
-                    output.contains("EXIT:0"),
-                    !deny,
-                    "deny_nested_git={deny}: `{cmd}` gave {output}"
-                );
-            }
+            // Every plant is run and every wrong answer listed, not just the first.
+            let wrong: Vec<String> = plants(&tmp)
+                .into_iter()
+                .filter_map(|cmd| {
+                    let (output, _) = run_sandboxed(&profile, &format!("{cmd} 2>&1; echo EXIT:$?"));
+                    (output.contains("EXIT:0") == deny).then(|| format!("`{cmd}` gave {output}"))
+                })
+                .collect();
+            assert!(wrong.is_empty(), "deny_nested_git={deny}: {wrong:#?}");
+            // Residual: an ancestor of a `.git` moved in from a writable
+            // staging area. Allowed with the key on as well as off.
+            let stage = PathBuf::from(format!(
+                "/private/tmp/cplt-nested-git-stage-{}-{deny}",
+                std::process::id()
+            ));
+            let (output, _) = run_sandboxed(
+                &profile,
+                &format!(
+                    "mkdir -p '{s}/sub/.git' '{d}/m' && mv '{s}/sub' '{d}/m/sub' 2>&1; echo EXIT:$?",
+                    s = stage.display(),
+                    d = tmp.display()
+                ),
+            );
+            fs::remove_dir_all(&stage).ok();
+            assert!(
+                output.contains("EXIT:0") && tmp.join("m/sub/.git").is_dir(),
+                "deny_nested_git={deny}: moving in a staged ancestor is a documented \
+                 residual, expected allowed: {output}"
+            );
             // The root's own `.git` is not matched: `git init` there still works.
             let (output, _) = run_sandboxed(
                 &profile,
