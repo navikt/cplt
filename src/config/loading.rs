@@ -1067,6 +1067,7 @@ impl Resolved {
         project_dir: &std::path::Path,
         home_dir: &std::path::Path,
         agent: crate::agent::Agent,
+        keychain: Option<&crate::agent::KeychainSubstitute>,
         repos: &[super::types::RepoSummaryRow],
         worktree_root: Option<&std::path::Path>,
     ) {
@@ -1278,21 +1279,36 @@ impl Resolved {
                 "{blue}[cplt]{nc}    Copilot dir:   {green}allowed{nc}     {dim}~/.copilot{nc}"
             );
         }
+        #[cfg(not(target_os = "macos"))]
+        let _ = keychain;
         if agent.needs_keychain() {
+            // The launch's own decision, not a recomputation: for Copilot it can
+            // rest on a `gh auth token` call this summary should not repeat.
             #[cfg(target_os = "macos")]
-            match agent.credential_outside_keychain(
-                home_dir,
-                &self.deny_env,
-                self.keychain_substitute,
-            ) {
+            if let Some(source) = keychain {
                 // The whole-Keychain grant is dropped: the agent has a
                 // credential it can reach without it (#242).
-                Some(source) => eprintln!(
+                eprintln!(
                     "{blue}[cplt]{nc}    Keychain:      {green}denied{nc}      {dim}{source} used instead{nc}"
-                ),
-                None => eprintln!(
-                    "{blue}[cplt]{nc}    Keychain:      {yellow}allowed{nc}     {dim}~/Library/Keychains — every item {agent} can unlock{nc}"
-                ),
+                );
+            } else {
+                // Key on for Copilot and still granted: say why, or the
+                // user reads the key as broken (#277).
+                let why = if self.keychain_substitute && agent == crate::agent::Agent::Copilot {
+                    let all_denied = ["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"]
+                        .iter()
+                        .all(|v| self.deny_env.iter().any(|d| d == v));
+                    if all_denied {
+                        " (no token: deny.env strips every token variable)"
+                    } else {
+                        " (no token: gh auth token failed)"
+                    }
+                } else {
+                    ""
+                };
+                eprintln!(
+                    "{blue}[cplt]{nc}    Keychain:      {yellow}allowed{nc}     {dim}~/Library/Keychains — every item {agent} can unlock{why}{nc}"
+                );
             }
         }
         eprintln!(

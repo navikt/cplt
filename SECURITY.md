@@ -13,12 +13,12 @@ cplt sandboxes AI coding agents. Currently that means **GitHub Copilot CLI**, **
 | Config dir      | `~/.copilot` (read/write)           | `~/.config/opencode` (read-only)                                    | `~/.gemini/config` (read/write)              | `~/.pi/agent` (read-only root; `sessions/`, `prompts/`, `themes/`, `tools/`, `tmp/` writable) | `~/.claude` + `~/.claude.json` (read/write)  |
 | Data dir        | `~/Library/Caches/copilot`          | `~/.local/share/opencode` (write, no exec)                          | `~/.gemini/antigravity-cli` (read/write)     | `~/.pi/agent/bin` (read + exec)             | N/A (in config dir)                          |
 | State data dir  | N/A                                 | `~/.local/state/opencode` (write, no exec)                          | N/A                                          | N/A                                          | N/A                                          |
-| Keychain access | Yes                                 | No                                                                  | Yes (OAuth/keyring flow)                     | No                                          | Yes (macOS OAuth token storage)              |
+| Keychain access | Yes¹                                | No                                                                  | Yes (OAuth/keyring flow)¹                    | No                                          | Yes (macOS OAuth token storage)¹             |
 | SEA extraction  | Yes (pre-sandbox)                   | No                                                                  | No                                           | No                                          | No                                           |
-| Env isolation   | `GH_TOKEN` not injected (one-time file); `COPILOT_*` passed | suppressed (see below)                          | suppressed (see below)           | suppressed (see below)          | suppressed (see below); `DISABLE_AUTOUPDATER=1` injected |
+| Env isolation   | `GH_TOKEN` not injected (one-time file)¹; `COPILOT_*` passed | suppressed (see below)                          | suppressed (see below)           | suppressed (see below)          | suppressed (see below); `DISABLE_AUTOUPDATER=1` injected |
 | Auto-detected   | Yes (priority 1)                    | Yes (priority 2)                                                    | Yes (priority 3)                             | No (explicit only, name collision risk)     | No (explicit only)                           |
 
-¹ Unless the experimental `sandbox.keychain_substitute` is on *and* the agent has a credential it can reach without the Keychain — see [Keychain access is all-or-nothing](#keychain-access-is-all-or-nothing).
+¹ Unless the experimental `sandbox.keychain_substitute` is on *and* the agent has a credential it can reach without the Keychain — see [Keychain access is all-or-nothing](#keychain-access-is-all-or-nothing). For Copilot that also means `gh`'s token *is* injected into the environment, as `GH_TOKEN`, in place of the Keychain.
 
 
 ### Rules that apply to every non-Copilot agent
@@ -779,7 +779,7 @@ flow needs access cplt does not grant by default.
 
 | Agent | Grant dropped when (`keychain_substitute = true`) | What the agent holds instead | Refresh |
 |---|---|---|---|
-| Copilot | never (unverified) | — | — |
+| Copilot | `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN` is set, or `gh auth token --hostname github.com` prints one at launch | that GitHub token, in the environment | none — `gh`'s OAuth token and PATs do not refresh |
 | Claude Code | `CLAUDE_CODE_OAUTH_TOKEN` is set | that OAuth token | none — see below |
 | Antigravity | `~/.gemini/antigravity-cli/antigravity-oauth-token` exists and is non-empty | that file | refreshes into that file |
 | goose | never (provider-dependent) | — | some providers refresh through the keyring mid-session |
@@ -788,7 +788,8 @@ The trade is not free. Whole-Keychain read+write is exchanged for a full OAuth
 token sitting in the agent's environment, readable by every process it spawns and
 exfiltratable over the permitted HTTPS egress. That token is narrower than the
 keychain but it is not narrow: `CLAUDE_CODE_OAUTH_TOKEN` is a working Anthropic
-credential for the account. What changes is blast radius — one credential the
+credential for the account, and Copilot's `GH_TOKEN` carries every scope `gh` was
+granted (typically `repo` and `workflow`). What changes is blast radius — one credential the
 agent was going to use anyway, instead of every credential the user owns.
 
 That variable is **not** in `ENV_ALLOWLIST` and does not match any allowlisted
@@ -796,7 +797,10 @@ prefix, so it is not something the sandbox passes through: it is forwarded by
 `apply_deny_env_and_credential` only on runs where the trade actually applied.
 With `sandbox.keychain_substitute` off, a `CLAUDE_CODE_OAUTH_TOKEN` exported in
 your shell still needs `--pass-env` to reach the agent, exactly as before this
-change. `keychain_substitute_vars_are_never_allowlisted` asserts it.
+change. `keychain_substitute_vars_are_never_allowlisted` asserts it. Copilot's
+three token variables are the one exception, and not a new one: they were
+allowlisted for Copilot long before this trade, so an exported one already reached
+the agent and still does with the key off.
 
 **Why cplt does not pre-extract the Keychain item itself.** The items are refresh
 blobs, not static tokens. `Claude Code-credentials` holds an access token with a
@@ -842,7 +846,7 @@ Copilot. Only credentials that are durable for a whole session qualify.
   unreadable, corrupt, expired past its refresh token — surfaces as a plain sign-in
   error.
 
-- **goose** — not eligible, and unlike Copilot that is a finding rather than a
+- **goose** — not eligible, and that is a finding rather than a
   gap. goose's `Config::get_secret` does read the uppercased environment
   variable before its keyring, so precedence is not the problem; the session
   lifetime is. Its GitHub Copilot provider re-reads `GITHUB_COPILOT_TOKEN`
@@ -859,16 +863,39 @@ Copilot. Only credentials that are durable for a whole session qualify.
   read-only. Determined by reading goose's source
   (`aaif-goose/goose`), not by inspecting the credential's shape.
 
-**Copilot is deliberately not eligible.** Claude Code's substitute was
-confirmed by running the agent under a profile with the grant dropped; Copilot's
-never was. PR #173 asserts an injected `GH_TOKEN` suffices and Copilot's docs
-point at these vars, but asserting is not probing — and Copilot is the default,
-priority-1 agent, while `GITHUB_TOKEN` is the most commonly exported token on a
-developer machine. A fine-grained PAT exported for something unrelated would have
-dropped the grant, and if Copilot rejected it the session would have neither. That
-is the same precedence question this trade declines to assume, so
-Copilot gets the same answer until someone probes it. Re-enabling it is one line
-in `Agent::keychain_substitute_env_vars`.
+- **Copilot** — probed (#277) with copilot 1.0.89 on macOS, running
+  `copilot -p ... --silent` under cplt's real profile with `keychain_substitute`
+  on and no `~/Library/Keychains` rule in it. With `GH_TOKEN` set to the output of
+  `gh auth token` (an OAuth `gho_` token), Copilot authenticated and answered.
+  With `GH_TOKEN` set to a well-formed but invalid token, it failed at startup
+  with `Failed to fetch GitHub CLI user login (401): Bad credentials`. So under the
+  dropped grant the environment token is what authenticates, and a bad one fails
+  loudly rather than falling through to anything else. `copilot help environment`
+  documents `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN` in that order of
+  precedence over stored credentials.
+
+  The usual Copilot user exports nothing and signed in through `gh`. For that
+  case cplt runs `gh auth token --hostname github.com` itself at launch (the same
+  trusted-path, host-pinned call `gh_guard.inject_token` uses) and hands the
+  result over as `GH_TOKEN`, or as the first of the three names the repo's
+  `deny.env` does not strip. If `gh` has no token the grant stays.
+
+  What changes for the user, and what was not verified:
+  - **A bad or stale token is now fatal.** With the Keychain granted, a
+    rejected `GH_TOKEN` did *not* stop Copilot: the same invalid token under
+    the key-off profile, and outside cplt, still answered, so Copilot falls back
+    to its stored login when the environment token fails. With the grant dropped
+    there is nothing to fall back to. A stale `GITHUB_TOKEN` exported for
+    something else, or a stale gh login, will show up as a sign-in error;
+    unset the variable, run `gh auth login`, or turn the key off.
+  - **The account can change.** Copilot now authenticates as `gh`'s
+    github.com account (or the exported token's), not a separate
+    `copilot /login` account stored in the Keychain.
+  - **The token sits in the agent's environment** — the same exposure
+    `gh_guard.inject_token` has, which is why that key is marked dangerous. The
+    trade here is that token instead of the whole login Keychain.
+  - Only one-shot `-p` runs and an OAuth token were exercised. A classic `ghp_`
+    PAT and a long interactive session under the dropped grant were not.
 
 The fallback is deliberate in both directions: when no substitute credential
 resolves, the grant stays and the session summary says so, rather than launching

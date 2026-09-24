@@ -304,6 +304,11 @@ impl PreparedSandbox {
         &self.home_dir
     }
 
+    /// What stands in for the Keychain grant this run, for the startup summary.
+    pub fn keychain_substitute(&self) -> Option<&crate::agent::KeychainSubstitute> {
+        self.keychain_substitute.as_ref()
+    }
+
     /// Name the managed worktree root to the child as `CPLT_WORKTREE_ROOT`.
     ///
     /// Environment only: the root must already be among the policy's named
@@ -1202,6 +1207,56 @@ fn extra_git_dirs(roots: &[PathBuf]) -> Vec<PathBuf> {
 #[must_use]
 pub fn named_root_git_dirs(roots: &[PathBuf]) -> Vec<PathBuf> {
     extra_git_dirs(roots)
+}
+
+/// The credential that stands in for the login Keychain this run, if any
+/// (#242). `None` keeps the grant. Always `None` with `enabled` false, which is
+/// `sandbox.keychain_substitute` and defaults off.
+///
+/// `Agent::credential_outside_keychain_on` answers from what the parent already
+/// has. This adds the Copilot case it cannot see (#277): a user signed in
+/// through `gh` who exported nothing. cplt runs `gh auth token` (trusted path,
+/// github.com pinned) and hands the result over as the first token var the
+/// repo's `deny.env` does not strip.
+pub fn keychain_substitute(
+    agent: Agent,
+    home: &Path,
+    deny_env: &[String],
+    enabled: bool,
+) -> Option<crate::agent::KeychainSubstitute> {
+    keychain_substitute_with(
+        agent,
+        home,
+        deny_env,
+        enabled,
+        cfg!(target_os = "macos"),
+        exec::extract_gh_token,
+    )
+}
+
+/// [`keychain_substitute`] with the platform and the `gh` call as parameters,
+/// so tests can drive both without a host `gh`.
+pub(crate) fn keychain_substitute_with(
+    agent: Agent,
+    home: &Path,
+    deny_env: &[String],
+    enabled: bool,
+    macos: bool,
+    extract: impl FnOnce() -> Option<String>,
+) -> Option<crate::agent::KeychainSubstitute> {
+    if let Some(found) = agent.credential_outside_keychain_on(home, deny_env, enabled, macos) {
+        return Some(found);
+    }
+    if !enabled || !macos || agent != Agent::Copilot {
+        return None;
+    }
+    let var = exec::GH_TOKEN_VARS
+        .iter()
+        .find(|v| !deny_env.iter().any(|d| d == *v))?;
+    Some(crate::agent::KeychainSubstitute::GhToken {
+        var,
+        token: crate::agent::SecretToken::new(extract()?),
+    })
 }
 
 /// Human-readable representation of the sandbox policy.

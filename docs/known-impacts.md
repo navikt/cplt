@@ -49,7 +49,6 @@ On macOS this applies to every writable root, the launch repository included,
 not only to repositories named with `--repo-dir`. Tracked in
 [#402](https://github.com/navikt/cplt/issues/402), which also covers whether
 the guard should intercept these forms and fail loudly instead.
-||||||| parent of fc464a5 (fix(gh-guard): inject_token did nothing with the guard off, and said nothing)
 
 ## Linux: the system keyring is unreachable, so agents ask you to sign in again
 
@@ -524,7 +523,7 @@ Git commit works for every agent. Whether `git push` works over HTTPS depends on
 
 Both rows depend on where `gh` keeps the token. An installation that stores it in `~/.config/gh/hosts.yml` rather than the Keychain works for every agent, since that file is readable in every profile, and `--pass-env GH_TOKEN` supplies one regardless of agent.
 
-The Keychain row has one caveat. With `sandbox.keychain_substitute = true` (off by default) the Keychain grant is dropped for an agent whose own credential already reaches it another way — `claude` with `CLAUDE_CODE_OAUTH_TOKEN` exported, `antigravity` with its `~/.gemini/antigravity-cli/antigravity-oauth-token` fallback file present. The drop takes `gh`'s token with it, so HTTPS push fails for exactly those two agents in that configuration.
+The Keychain row has one caveat. With `sandbox.keychain_substitute = true` (off by default) the Keychain grant is dropped for an agent whose own credential already reaches it another way — `claude` with `CLAUDE_CODE_OAUTH_TOKEN` exported, `antigravity` with its `~/.gemini/antigravity-cli/antigravity-oauth-token` fallback file present. The drop takes `gh`'s token with it, so HTTPS push fails for exactly those two agents in that configuration. Copilot keeps a token `gh` can use when the one it was handed is `GH_TOKEN` or `GITHUB_TOKEN`, which covers the `gh auth token` handover; a token exported only as `COPILOT_GITHUB_TOKEN` is one `gh` does not read. Push under a dropped grant was not tested.
 
 **On Linux the table does not apply.** There is no Keychain grant to drop in the first place; `gh` reads its token from the Secret Service or from `hosts.yml`, and push works wherever that lookup succeeds.
 

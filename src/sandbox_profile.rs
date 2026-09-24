@@ -3404,6 +3404,148 @@ mod tests {
         assert!(!p.contains(r#"(allow file-read* (literal "/Users/test/.netrc"))"#));
     }
 
+    /// #277: a Copilot user signed in through `gh`, nothing exported. With
+    /// `sandbox.keychain_substitute` off the Keychain grant stays, `gh` is never
+    /// asked, and no token var is set; with it on the grant is gone and the
+    /// extracted token reaches the child as GH_TOKEN.
+    #[allow(clippy::disallowed_methods)] // never spawned: only its env is inspected
+    #[test]
+    fn copilot_gh_token_replaces_keychain_only_when_key_on() {
+        use crate::agent::Agent;
+        let project = Path::new("/Users/test/repo");
+        let home = Path::new("/Users/test");
+        let unset: [(&str, Option<&str>); 3] = [
+            ("GH_TOKEN", None),
+            ("GITHUB_TOKEN", None),
+            ("COPILOT_GITHUB_TOKEN", None),
+        ];
+        temp_env::with_vars(unset, || {
+            for enabled in [false, true] {
+                let asked = std::cell::Cell::new(false);
+                let sub = crate::sandbox::keychain_substitute_with(
+                    Agent::Copilot,
+                    home,
+                    &[],
+                    enabled,
+                    true,
+                    || {
+                        asked.set(true);
+                        Some("tok".into())
+                    },
+                );
+                assert_eq!(asked.get(), enabled, "gh asked with key={enabled}");
+
+                let mut opts = test_options(project, home);
+                opts.agent = Agent::Copilot;
+                opts.keychain_substitute = sub.clone();
+                let granted =
+                    generate_profile(&opts, &[]).contains("/Users/test/Library/Keychains");
+                assert_eq!(granted, !enabled, "Keychain grant with key={enabled}");
+
+                let mut cmd = std::process::Command::new("/usr/bin/true");
+                crate::sandbox::exec::apply_deny_env_and_credential(&mut cmd, &[], sub.as_ref());
+                let token = cmd
+                    .get_envs()
+                    .find(|(k, _)| *k == "GH_TOKEN")
+                    .and_then(|(_, v)| v);
+                assert_eq!(
+                    token,
+                    enabled.then_some(std::ffi::OsStr::new("tok")),
+                    "GH_TOKEN with key={enabled}"
+                );
+            }
+        });
+    }
+
+    /// Every env var any agent's substitute could come from, cleared so the
+    /// host shell cannot decide these tests.
+    const SUBSTITUTE_VARS: [(&str, Option<&str>); 4] = [
+        ("GH_TOKEN", None),
+        ("GITHUB_TOKEN", None),
+        ("COPILOT_GITHUB_TOKEN", None),
+        ("CLAUDE_CODE_OAUTH_TOKEN", None),
+    ];
+
+    /// Run the decision with key on and a `gh` that would answer, and report
+    /// whether `gh` was asked.
+    fn decide(
+        agent: crate::agent::Agent,
+        deny_env: &[String],
+        macos: bool,
+        gh: Option<&str>,
+    ) -> (Option<crate::agent::KeychainSubstitute>, bool) {
+        let asked = std::cell::Cell::new(false);
+        let sub = crate::sandbox::keychain_substitute_with(
+            agent,
+            Path::new("/Users/test"),
+            deny_env,
+            true,
+            macos,
+            || {
+                asked.set(true);
+                gh.map(str::to_string)
+            },
+        );
+        (sub, asked.get())
+    }
+
+    /// Only Copilot takes gh's token. Every other agent, key on and on macOS,
+    /// gets no substitute from it and never makes cplt run `gh`.
+    #[test]
+    fn gh_token_substitute_is_copilot_only() {
+        use crate::agent::Agent;
+        temp_env::with_vars(SUBSTITUTE_VARS, || {
+            for &agent in Agent::ALL.iter().filter(|a| **a != Agent::Copilot) {
+                let (sub, asked) = decide(agent, &[], true, Some("tok"));
+                assert_eq!(sub, None, "{agent:?} got a substitute");
+                assert!(!asked, "{agent:?} made cplt run gh");
+            }
+        });
+    }
+
+    /// Fail-safe: `gh` has no token (not signed in, timed out, not
+    /// installed). The run keeps the Keychain rather than launching Copilot
+    /// with neither.
+    #[test]
+    fn gh_without_a_token_keeps_the_keychain() {
+        use crate::agent::Agent;
+        temp_env::with_vars(SUBSTITUTE_VARS, || {
+            let (sub, asked) = decide(Agent::Copilot, &[], true, None);
+            assert!(asked, "gh must be asked before giving up");
+            assert_eq!(sub, None);
+            let mut opts = test_options(Path::new("/Users/test/repo"), Path::new("/Users/test"));
+            opts.agent = Agent::Copilot;
+            opts.keychain_substitute = sub;
+            assert!(generate_profile(&opts, &[]).contains("/Users/test/Library/Keychains"));
+        });
+    }
+
+    /// Linux never asks `gh`, and `deny.env` picks which name carries the
+    /// token — or, with all three denied, whether there is one at all.
+    #[test]
+    fn gh_token_substitute_honours_platform_and_deny_env() {
+        use crate::agent::{Agent, KeychainSubstitute};
+        let var_of = |s: Option<KeychainSubstitute>| match s {
+            Some(KeychainSubstitute::GhToken { var, .. }) => Some(var),
+            other => panic!("expected a GhToken substitute, got {other:?}"),
+        };
+        temp_env::with_vars(SUBSTITUTE_VARS, || {
+            let (sub, asked) = decide(Agent::Copilot, &[], false, Some("tok"));
+            assert_eq!(sub, None, "Linux has no Keychain grant to trade");
+            assert!(!asked, "Linux must not run gh for it");
+
+            let (sub, _) = decide(Agent::Copilot, &["GH_TOKEN".into()], true, Some("tok"));
+            assert_eq!(var_of(sub), Some("GITHUB_TOKEN"));
+
+            let all: Vec<String> = ["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"]
+                .map(String::from)
+                .to_vec();
+            let (sub, asked) = decide(Agent::Copilot, &all, true, Some("tok"));
+            assert_eq!(sub, None, "no name left to carry the token");
+            assert!(!asked, "nothing to hand over, so gh must not run");
+        });
+    }
+
     fn test_options<'a>(
         project_dir: &'a std::path::Path,
         home_dir: &'a std::path::Path,

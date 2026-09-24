@@ -4129,6 +4129,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             &project_dir,
             &home_dir,
             active_agent,
+            prepared.keychain_substitute(),
             &repo_rows,
             worktree_root.as_deref(),
         );
@@ -5186,7 +5187,8 @@ fn assemble_sandbox(
     // without it. Resolved against `deny_env` because that list is stripped from
     // the child environment later — a repo `.cplt.toml` naming the token var
     // must not leave the run with neither Keychain nor token.
-    let keychain_substitute = active_agent.credential_outside_keychain(
+    let keychain_substitute = cplt::sandbox::keychain_substitute(
+        active_agent,
         home_dir,
         &resolved.deny_env,
         resolved.keychain_substitute,
@@ -5590,6 +5592,7 @@ fn run_exec_command(
             &project_dir,
             &home_dir,
             active_agent,
+            prepared.keychain_substitute(),
             &repo_rows,
             worktree_root.as_deref(),
         );
@@ -6901,7 +6904,8 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
     let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
     let mut agent_dirs = active_agent.config_dirs(&home_dir);
     agent::canonicalize_agent_dirs(&mut agent_dirs);
-    let keychain_substitute = active_agent.credential_outside_keychain(
+    let keychain_substitute = cplt::sandbox::keychain_substitute(
+        active_agent,
         &home_dir,
         &resolved.deny_env,
         resolved.keychain_substitute,
