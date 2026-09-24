@@ -4601,6 +4601,7 @@ fn cache_env(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<std::ffi::OsStrin
 
 fn resolve_pkg(vars: &[(&str, &str)], os: &str) -> std::path::PathBuf {
     cplt::sandbox::copilot_pkg_dir(&cache_env(vars), std::path::Path::new("/Users/test"), os)
+        .expect("accepted")
 }
 
 #[test]
@@ -4690,28 +4691,31 @@ fn copilot_pkg_dir_skips_unsafe_values() {
         "/opt/a\"b",
         "/opt/a)b",
     ] {
-        // An unsafe override falls through to the next step of the order...
-        let next = resolve_pkg(
-            &[
-                ("COPILOT_PKG_CACHE_HOME", bad),
-                ("COPILOT_CACHE_HOME", "/opt/cache"),
-            ],
-            "linux",
-        );
-        assert_eq!(next, std::path::Path::new("/opt/cache/pkg"), "{bad}");
-        // ...and an unsafe XDG_CACHE_HOME to ~/.cache.
-        let xdg = resolve_pkg(&[("XDG_CACHE_HOME", bad)], "linux");
-        assert_eq!(
-            xdg,
-            std::path::Path::new("/Users/test/.cache/copilot/pkg"),
-            "{bad}"
-        );
-        let cache = resolve_pkg(&[("COPILOT_CACHE_HOME", bad)], "macos");
-        assert_eq!(
-            cache,
-            std::path::Path::new("/Users/test/Library/Caches/copilot/pkg"),
-            "{bad}"
-        );
+        // Copilot takes the first value set, so an unsafe one is an error
+        // naming it, never a fall-through to the next step.
+        for (vars, os, var) in [
+            (
+                &[
+                    ("COPILOT_PKG_CACHE_HOME", bad),
+                    ("COPILOT_CACHE_HOME", "/opt/cache"),
+                ][..],
+                "linux",
+                "COPILOT_PKG_CACHE_HOME",
+            ),
+            (&[("XDG_CACHE_HOME", bad)][..], "linux", "XDG_CACHE_HOME"),
+            (
+                &[("COPILOT_CACHE_HOME", bad)][..],
+                "macos",
+                "COPILOT_CACHE_HOME",
+            ),
+        ] {
+            let home = std::path::Path::new("/Users/test");
+            let error = cplt::sandbox::copilot_pkg_dir(&cache_env(vars), home, os).expect_err(bad);
+            assert!(
+                error.starts_with(&format!("cplt refuses {var}={bad}: ")),
+                "{error}"
+            );
+        }
     }
 }
 
@@ -4719,7 +4723,7 @@ fn copilot_pkg_dir_skips_unsafe_values() {
 fn copilot_pkg_dirs_is_only_the_default_without_overrides() {
     let home = std::path::Path::new("/Users/test");
     assert_eq!(
-        cplt::sandbox::copilot_pkg_dirs(&cache_env(&[]), home, "linux", &[]),
+        cplt::sandbox::copilot_pkg_dirs(&cache_env(&[]), home, "linux", &[]).unwrap(),
         vec![std::path::PathBuf::from("/Users/test/.cache/copilot/pkg")]
     );
 }
@@ -4732,7 +4736,7 @@ fn copilot_pkg_dirs_keeps_the_default_and_adds_every_loader_dir() {
         ("XDG_CACHE_HOME", "/opt/xdg"),
     ]);
     assert_eq!(
-        cplt::sandbox::copilot_pkg_dirs(&env, home, "linux", &[]),
+        cplt::sandbox::copilot_pkg_dirs(&env, home, "linux", &[]).unwrap(),
         [
             "/Users/test/.cache/copilot/pkg",
             "/opt/xdg/copilot/pkg",
@@ -4741,7 +4745,7 @@ fn copilot_pkg_dirs_keeps_the_default_and_adds_every_loader_dir() {
         .map(std::path::PathBuf::from)
     );
     assert_eq!(
-        cplt::sandbox::copilot_pkg_dirs(&env, home, "macos", &[]),
+        cplt::sandbox::copilot_pkg_dirs(&env, home, "macos", &[]).unwrap(),
         [
             "/Users/test/Library/Caches/copilot/pkg",
             "/opt/pkgcache/pkg"
@@ -4812,20 +4816,24 @@ fn profile_carves_out_the_resolved_copilot_cache() {
     }
 }
 
-/// #374: the preflight stops when cplt refuses the directory Copilot will
-/// extract into, instead of polling a fallback Copilot never writes.
+/// #374: a variable refused for sitting in a writable tree is an error from
+/// `copilot_pkg_dirs`, which `prepare` stops the launch on.
 #[test]
-fn copilot_pkg_dir_refused_names_where_copilot_extracts() {
+fn copilot_pkg_dirs_refuses_a_writable_tree() {
     let home = std::path::Path::new("/Users/test");
-    let refused = |vars: &[(&str, &str)]| {
-        cplt::sandbox::copilot_pkg_dir_refused(&cache_env(vars), home, "linux")
+    let writable = [(std::path::PathBuf::from("/srv/w"), "the allow.write grant")];
+    let dirs = |vars: &[(&str, &str)]| {
+        cplt::sandbox::copilot_pkg_dirs(&cache_env(vars), home, "linux", &writable)
     };
-    assert_eq!(refused(&[]), None);
-    assert_eq!(refused(&[("COPILOT_CACHE_HOME", "/opt/cache")]), None);
-    assert_eq!(
-        refused(&[("COPILOT_CACHE_HOME", "/Users/test/.ssh")]),
-        Some(std::path::PathBuf::from("/Users/test/.ssh/pkg"))
-    );
+    assert!(dirs(&[("COPILOT_CACHE_HOME", "/opt/cache")]).is_ok());
+    for var in ["COPILOT_CACHE_HOME", "XDG_CACHE_HOME"] {
+        let error = dirs(&[(var, "/srv/w/cache")]).expect_err(var);
+        assert!(
+            error.contains(&format!("{var}=/srv/w/cache"))
+                && error.contains("the allow.write grant /srv/w"),
+            "{error}"
+        );
+    }
 }
 
 /// A real tree for the #374 writable-tree checks: `<tmp>/project`,

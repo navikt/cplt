@@ -25,11 +25,11 @@ use super::policy::{
     DEPENDENCY_SOURCE_TREES, EXEC_IN_WRITABLE, GPG_SIGNING_ALLOW_FILES, HOME_CONFIG_FILES,
     HomeToolDir, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir,
     SENSITIVE_PROJECT_PATTERNS, SYSTEM_READ_FILES, TOOL_READ_DIRS, XCODE_SELECT_LINK,
-    active_tool_dirs, ancestor_alternation, app_dirs, colima_socket_paths, copilot_pkg_dir,
+    active_tool_dirs, ancestor_alternation, app_dirs, colima_socket_paths, copilot_default_pkg_dir,
     current_uid, escape_regex, first_party_read_target, grant_is_refused, home_config_link_targets,
-    missing_home_config_link_targets, nested_alternation, no_cache_env, path_bin_dirs,
-    playwright_runtime_intent, read_only_home_config, rel_is_glob, rel_regex,
-    validate_playwright_socket_dir, validate_sbpl_path,
+    missing_home_config_link_targets, nested_alternation, path_bin_dirs, playwright_runtime_intent,
+    read_only_home_config, rel_is_glob, rel_regex, validate_playwright_socket_dir,
+    validate_sbpl_path,
 };
 
 /// Device nodes a sandboxed process may open for writing, by exact path.
@@ -1390,7 +1390,7 @@ fn emit_tool_dirs(
     // A directory a cache variable moves it to (#374) gets the same rules
     // from `emit_copilot_pkg_override_denies`, after every allow.
     if agent.needs_copilot_dir() {
-        let pkg = copilot_pkg_dir(&no_cache_env, home_dir, "macos");
+        let pkg = copilot_default_pkg_dir(home_dir, "macos");
         let pin: Vec<PathBuf> = pkg.parent().map(Path::to_path_buf).into_iter().collect();
         emit_copilot_pkg_carveout(sb, &pkg, &pin);
     }

@@ -4,7 +4,7 @@
 //! into the platform cache on first run. The sandbox denies writes to that cache,
 //! so `cplt` has to force the extraction before entering it (#166).
 
-use cplt::sandbox::{CacheEnv, copilot_pkg_dir, copilot_pkg_dir_refused, process_env};
+use cplt::sandbox::{CacheEnv, copilot_pkg_dir, process_env};
 use cplt::ui;
 use std::path::Path;
 use std::path::PathBuf;
@@ -13,22 +13,30 @@ use std::path::PathBuf;
 /// Copilot resolves it (`copilot_pkg_dir`, #374), plus cplt's own cache
 /// directory (which holds the `copilot-extracted` fast-path marker).
 #[cfg(target_os = "macos")]
-fn copilot_cache_dirs(env: &CacheEnv, home: &Path, arch: &str) -> (PathBuf, PathBuf) {
-    (
-        copilot_pkg_dir(env, home, "macos").join(format!("darwin-{arch}")),
+fn copilot_cache_dirs(
+    env: &CacheEnv,
+    home: &Path,
+    arch: &str,
+) -> Result<(PathBuf, PathBuf), String> {
+    Ok((
+        copilot_pkg_dir(env, home, "macos")?.join(format!("darwin-{arch}")),
         home.join("Library/Caches/cplt"),
-    )
+    ))
 }
 
 /// Copilot's SEA extraction directory for this platform, resolved the way
 /// Copilot resolves it (`copilot_pkg_dir`, #374), plus cplt's own cache
 /// directory (which holds the `copilot-extracted` fast-path marker).
 #[cfg(target_os = "linux")]
-fn copilot_cache_dirs(env: &CacheEnv, home: &Path, arch: &str) -> (PathBuf, PathBuf) {
-    (
-        copilot_pkg_dir(env, home, "linux").join(format!("linux-{arch}")),
+fn copilot_cache_dirs(
+    env: &CacheEnv,
+    home: &Path,
+    arch: &str,
+) -> Result<(PathBuf, PathBuf), String> {
+    Ok((
+        copilot_pkg_dir(env, home, "linux")?.join(format!("linux-{arch}")),
         home.join(".cache/cplt"),
-    )
+    ))
 }
 
 /// Ensure Copilot's bundled package is extracted before entering the sandbox.
@@ -84,24 +92,10 @@ pub fn ensure_copilot_extracted(
         _ => return Ok(()),
     };
 
-    // A cache variable cplt refuses (#374) still steers Copilot, so polling
-    // cplt's fallback would watch a directory Copilot never writes: the
-    // preflight would report a failure, or purge the wrong cache, and the
-    // launch would stop with a misleading message. Stop with the real one.
-    let os = if cfg!(target_os = "macos") {
-        "macos"
-    } else {
-        "linux"
-    };
-    if let Some(dir) = copilot_pkg_dir_refused(&process_env, home, os) {
-        return Err(format!(
-            "Copilot would extract its runtime to {}, which cplt refuses to grant \
-             (see the warning above for why), so the launch would fail. Unset that \
-             variable, or point it at an absolute directory the warning allows.",
-            dir.display()
-        ));
-    }
-    let (pkg_base, cache_dir) = copilot_cache_dirs(&process_env, home, arch);
+    // A cache variable cplt refuses (#374) is an error here too. `prepare`
+    // has already stopped on one in a writable tree; this catches the unsafe
+    // kind for any caller that did not go through it.
+    let (pkg_base, cache_dir) = copilot_cache_dirs(&process_env, home, arch)?;
 
     // Compute binary identity for the fast-path cache.
     // Works for any file type: Mach-O binary (Homebrew), node/shell wrapper (npm).
@@ -244,7 +238,7 @@ struct ExtractionAttempt {
 ///
 /// cplt's own `copilot_cache_dirs` follows the same precedence through
 /// `copilot_pkg_dir` (#374). A value cplt considers unsafe would make the two
-/// disagree, so the preflight stops on it (`copilot_pkg_dir_refused`).
+/// disagree, so the launch stops on it before this runs.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const EXTRACTION_ENV_ALLOWLIST: &[&str] = &[
     "HOME",
@@ -807,14 +801,14 @@ mod copilot_extraction_tests {
     fn cache_dirs_follow_the_copilot_cache_variables() {
         let home = Path::new("/Users/test");
         let env = |k: &str| (k == "COPILOT_CACHE_HOME").then(|| "/opt/cc".into());
-        let (pkg, own) = copilot_cache_dirs(&env, home, "arm64");
+        let (pkg, own) = copilot_cache_dirs(&env, home, "arm64").unwrap();
         let os = if cfg!(target_os = "macos") {
             "darwin"
         } else {
             "linux"
         };
         assert_eq!(pkg, PathBuf::from(format!("/opt/cc/pkg/{os}-arm64")));
-        assert_eq!(own, copilot_cache_dirs(&|_| None, home, "arm64").1);
+        assert_eq!(own, copilot_cache_dirs(&|_| None, home, "arm64").unwrap().1);
     }
 
     /// Mirror of `copilot_cache_dirs` for building the fixture HOME.
@@ -823,7 +817,7 @@ mod copilot_extraction_tests {
             "aarch64" => "arm64",
             _ => "x64",
         };
-        copilot_cache_dirs(&|_| None, home, arch).0
+        copilot_cache_dirs(&|_| None, home, arch).unwrap().0
     }
 
     struct Fixture {
@@ -924,6 +918,7 @@ mod copilot_extraction_tests {
                 _ => "x64",
             };
             copilot_cache_dirs(&|_| None, &self.home, arch)
+                .unwrap()
                 .1
                 .join("copilot-extracted")
         }

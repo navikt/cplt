@@ -2164,7 +2164,7 @@ pub fn copilot_ro_protect_paths(
         return Vec::new();
     }
     let mut paths = vec![home.join(".copilot/pkg")];
-    paths.extend(copilot_pkg_dirs(env, home, "linux", writable));
+    paths.extend(granted_copilot_pkg_dirs(env, home, "linux", writable));
     paths
 }
 
@@ -2193,72 +2193,67 @@ pub fn no_cache_env(_: &str) -> Option<OsString> {
 /// 3. macOS: `~/Library/Caches/copilot/pkg` (`XDG_CACHE_HOME` is not read)
 /// 4. Linux: `${XDG_CACHE_HOME:-~/.cache}/copilot/pkg`
 ///
-/// An empty value counts as unset, as JavaScript's `||` does.
+/// An empty value counts as unset, as JavaScript's `||` does. The first value
+/// set decides, as it does for Copilot.
 ///
 /// The values come from the launching environment, which a project can shape
 /// (direnv, mise), and the result becomes an exec grant. A value that is not
 /// absolute, contains `..`, is a system root or an ancestor of `$HOME`, is
 /// refused by [`grant_is_refused`], lies inside a credential directory, or
-/// cannot be written into an SBPL string is ignored with a warning, and the
-/// next step applies. Copilot itself still uses such a value; cplt then does
-/// not protect that directory, and the warning says so. An accepted value is
-/// returned where it resolves, since Seatbelt matches resolved paths.
+/// cannot be written into an SBPL string is an `Err` naming the variable, its
+/// value and the reason. Copilot would still extract into that directory and
+/// run it on the host, so the launch stops rather than fall back. An accepted
+/// value is returned where it resolves, since Seatbelt matches resolved paths.
 ///
-/// This is the preflight's view. The sandbox also refuses a directory in a
-/// writable tree, through [`copilot_pkg_dirs`].
-pub fn copilot_pkg_dir(env: &CacheEnv, home: &Path, os: &str) -> PathBuf {
-    resolve_copilot_pkg_dir(env, home, os, Some(&[]))
+/// This is the preflight's view, without the writable trees: `prepare` has
+/// already stopped the launch on a value in one of them (through
+/// [`copilot_pkg_dirs`]) before the preflight runs.
+pub fn copilot_pkg_dir(env: &CacheEnv, home: &Path, os: &str) -> Result<PathBuf, String> {
+    resolve_copilot_pkg_dir(env, home, os, &[])
 }
 
-/// The directory Copilot will extract into when [`copilot_pkg_dir`] refuses
-/// it. The preflight stops on this: it would otherwise poll a directory
-/// Copilot never writes, then fail the launch or purge the wrong cache.
-pub fn copilot_pkg_dir_refused(env: &CacheEnv, home: &Path, os: &str) -> Option<PathBuf> {
-    let copilot = resolve_copilot_pkg_dir(env, home, os, None);
-    let cplt = copilot_pkg_dir(env, home, os);
-    (config::canonicalize_deepest(&copilot) != config::canonicalize_deepest(&cplt))
-        .then_some(copilot)
+/// Copilot's `pkg` directory for `os` with none of its cache variables set.
+pub fn copilot_default_pkg_dir(home: &Path, os: &str) -> PathBuf {
+    if os == "macos" {
+        home.join("Library/Caches/copilot/pkg")
+    } else {
+        home.join(".cache/copilot/pkg")
+    }
 }
 
-/// [`copilot_pkg_dir`], with `writable` the trees an override must stay out
-/// of, or `None` to resolve exactly as Copilot does, unchecked.
+/// [`copilot_pkg_dir`], also refusing an override that overlaps one of the
+/// `writable` trees.
 fn resolve_copilot_pkg_dir(
     env: &CacheEnv,
     home: &Path,
     os: &str,
-    writable: Option<&[(PathBuf, &str)]>,
-) -> PathBuf {
-    let default = if os == "macos" {
-        home.join("Library/Caches/copilot/pkg")
-    } else {
-        home.join(".cache/copilot/pkg")
-    };
-    let var = |name: &str, sub: &str| {
-        let root = PathBuf::from(env(name).filter(|v| !v.is_empty())?);
-        let pkg = root.join(sub);
-        match writable {
-            None => Some(pkg),
-            Some(writable) => copilot_cache_override(name, &root, &pkg, &default, home, writable),
+    writable: &[(PathBuf, &str)],
+) -> Result<PathBuf, String> {
+    let default = copilot_default_pkg_dir(home, os);
+    let mut vars = vec![
+        ("COPILOT_PKG_CACHE_HOME", "pkg"),
+        ("COPILOT_CACHE_HOME", "pkg"),
+    ];
+    if os != "macos" {
+        vars.push(("XDG_CACHE_HOME", "copilot/pkg"));
+    }
+    for (name, sub) in vars {
+        if let Some(value) = env(name).filter(|v| !v.is_empty()) {
+            let root = PathBuf::from(value);
+            let pkg = root.join(sub);
+            return copilot_cache_override(name, &root, &pkg, &default, home, writable);
         }
-    };
-    let found = var("COPILOT_PKG_CACHE_HOME", "pkg")
-        .or_else(|| var("COPILOT_CACHE_HOME", "pkg"))
-        .or_else(|| {
-            (os != "macos")
-                .then(|| var("XDG_CACHE_HOME", "copilot/pkg"))
-                .flatten()
-        });
-    found.unwrap_or(default)
+    }
+    Ok(default)
 }
 
-/// The `pkg` directory an env-supplied cache root may be granted at, or
-/// `None` after a warning.
+/// The `pkg` directory an env-supplied cache root may be granted at, or the
+/// error that stops the launch.
 ///
 /// `writable` holds the canonical trees the sandbox can write. A `pkg`
-/// directory overlapping one of them would be writable and executable at
-/// once: Landlock unions the exec rule with the write grant, and on macOS a
-/// later allow can reopen the deny. Refusing it is the one answer that holds
-/// on every backend.
+/// directory overlapping one of them would be writable by the agent and run
+/// by the host: the preflight executes Copilot from it outside the sandbox on
+/// the next launch. Refusing it is the one answer that holds on every backend.
 fn copilot_cache_override(
     name: &str,
     root: &Path,
@@ -2266,14 +2261,14 @@ fn copilot_cache_override(
     default: &Path,
     home: &Path,
     writable: &[(PathBuf, &str)],
-) -> Option<PathBuf> {
+) -> Result<PathBuf, String> {
     let reject = |why: String| {
-        warn_once(format!(
-            "Ignoring {name}={}: {why}. Copilot still extracts and runs its runtime \
-             there, and cplt does not protect it.",
+        Err(format!(
+            "cplt refuses {name}={}: {why}. Copilot would extract its runtime there \
+             and run it on the host, outside the sandbox. Unset {name}, or point it \
+             at an absolute directory outside the project and every writable path.",
             root.display()
-        ));
-        None
+        ))
     };
     if !copilot_cache_root_is_usable(root, home) {
         return reject("not a safe absolute directory".into());
@@ -2282,7 +2277,7 @@ fn copilot_cache_override(
     // matches the resolved path, so a rule on the link would never fire.
     let real = config::canonicalize_deepest(pkg);
     if real == config::canonicalize_deepest(default) {
-        return Some(default.to_path_buf());
+        return Ok(default.to_path_buf());
     }
     if !copilot_cache_root_is_usable(&real, home) {
         return reject(format!("it resolves to {}", real.display()));
@@ -2297,7 +2292,7 @@ fn copilot_cache_override(
             tree.display()
         ));
     }
-    Some(real)
+    Ok(real)
 }
 
 /// Every Copilot cache `pkg` directory cplt grants execute on and protects
@@ -2308,23 +2303,36 @@ fn copilot_cache_override(
 /// directory Copilot executes from writable. With none of the variables set
 /// this is the one default directory, so the generated policy is unchanged.
 ///
-/// `writable` is the sandbox's canonical writable trees: an override that
-/// overlaps one is refused with a warning (see [`copilot_cache_override`]).
+/// `writable` is the sandbox's canonical writable trees. A variable that is
+/// unsafe or overlaps one of them is an `Err` (see [`copilot_cache_override`]),
+/// and `prepare` stops the launch on it.
 pub fn copilot_pkg_dirs(
     env: &CacheEnv,
     home: &Path,
     os: &str,
     writable: &[(PathBuf, &str)],
-) -> Vec<PathBuf> {
+) -> Result<Vec<PathBuf>, String> {
     let xdg_only = |k: &str| if k == "XDG_CACHE_HOME" { env(k) } else { None };
-    let resolve = |env: &CacheEnv| resolve_copilot_pkg_dir(env, home, os, Some(writable));
-    let mut dirs = vec![resolve(&no_cache_env)];
-    for dir in [resolve(&xdg_only), resolve(env)] {
+    let resolve = |env: &CacheEnv| resolve_copilot_pkg_dir(env, home, os, writable);
+    let mut dirs = vec![copilot_default_pkg_dir(home, os)];
+    for dir in [resolve(&xdg_only)?, resolve(env)?] {
         if !dirs.contains(&dir) {
             dirs.push(dir);
         }
     }
-    dirs
+    Ok(dirs)
+}
+
+/// [`copilot_pkg_dirs`] for a policy: only the default when a variable is
+/// refused, since `prepare` stops that launch before anything runs.
+pub(crate) fn granted_copilot_pkg_dirs(
+    env: &CacheEnv,
+    home: &Path,
+    os: &str,
+    writable: &[(PathBuf, &str)],
+) -> Vec<PathBuf> {
+    copilot_pkg_dirs(env, home, os, writable)
+        .unwrap_or_else(|_| vec![copilot_default_pkg_dir(home, os)])
 }
 
 /// Whether an env-supplied cache root may become a Copilot `pkg` grant.
@@ -2340,18 +2348,6 @@ fn copilot_cache_root_is_usable(root: &Path, home: &Path) -> bool {
     // A symlinked root is granted where it points (Landlock follows the link,
     // Seatbelt matches the resolved path), so the target must pass too.
     ok(root) && std::fs::canonicalize(root).map_or(true, |real| ok(&real))
-}
-
-/// Print a warning once per process: every backend runs the resolver.
-fn warn_once(msg: String) {
-    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-    let mut seen = SEEN
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !seen.contains(&msg) {
-        crate::ui::warn(&msg);
-        seen.push(msg);
-    }
 }
 
 /// A tool home relocated by an env var (`CARGO_HOME=~/.local/share/cargo`).
