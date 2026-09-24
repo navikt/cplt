@@ -123,7 +123,7 @@ pub const HOME_CONFIG_FILES: &[&str] = &[
 /// `resolve_config_path`) while `$HOME/.netrc` may be a symlink into a
 /// dotfiles repo — comparing the unresolved forms would miss the match.
 pub fn hard_denied_file(home: &Path, path: &Path) -> Option<&'static str> {
-    denied_entry(DENIED_FILES, home, path)
+    denied_entry(DENIED_FILES, home, path, None)
 }
 
 /// The [`DENIED_DOTFILES`] directory `path` names, if any.
@@ -147,7 +147,7 @@ pub fn hard_denied_file(home: &Path, path: &Path) -> Option<&'static str> {
 /// `--allow-docker`'s read-only `~/.docker` grant is unaffected: it is a
 /// first-party rule emitted by the backends, never a user grant on this path.
 pub fn denied_dotfile_dir(home: &Path, path: &Path) -> Option<&'static str> {
-    denied_entry(DENIED_DOTFILES, home, path)
+    denied_entry(DENIED_DOTFILES, home, path, None)
 }
 
 /// The cplt state directory containing `path`, if a grant names anything
@@ -258,8 +258,7 @@ fn read_target(home: &Path, path: &Path, own: Option<&str>) -> Option<PathBuf> {
         let dir = home.join(d);
         target.starts_with(&dir) || std::fs::canonicalize(&dir).is_ok_and(|c| target.starts_with(c))
     });
-    let other_entry =
-        denied_entry(DENIED_HOME_SUBPATHS, home, &target).is_some_and(|e| Some(e) != own);
+    let other_entry = denied_entry(DENIED_HOME_SUBPATHS, home, &target, own).is_some();
     if in_denied_dir || other_entry {
         return None;
     }
@@ -500,10 +499,23 @@ pub fn gpg_signing_file_target(home: &Path, file: &str) -> Option<PathBuf> {
 /// Resolved with [`config::canonicalize_deepest`], as the macOS deny is, so a
 /// dangling `~/.ssh -> ~/dotfiles/ssh` still refuses a grant on the
 /// `~/dotfiles/ssh` it will become.
-fn denied_entry(list: &[&'static str], home: &Path, path: &Path) -> Option<&'static str> {
+///
+/// `own`, when given, is excluded from the search rather than filtered from
+/// its result: a grant's own entry resolves through its own symlink to the
+/// same canonical target it names, so it matches `path` exactly like a
+/// genuinely different entry that happens to sit at the same target would.
+/// Filtering the single match `find` returns is not enough — if `own` sorts
+/// before that other entry in `list`, `find` returns `own` first and the
+/// other entry is never reached.
+fn denied_entry(
+    list: &[&'static str],
+    home: &Path,
+    path: &Path,
+    own: Option<&str>,
+) -> Option<&'static str> {
     let canon = resolver(home);
     let resolved = canon(path);
-    list.iter().copied().find(|f| {
+    list.iter().copied().filter(|f| Some(*f) != own).find(|f| {
         let denied = home.join(f);
         path == denied || resolved == canon(&denied)
     })
@@ -3953,6 +3965,39 @@ mod tests {
             read_target(h, &h.join(".npmrc"), Some(".m2/settings.xml")),
             None
         );
+    }
+
+    /// A grant whose file links onto a DIFFERENT `DENIED_HOME_SUBPATHS` entry
+    /// is refused no matter where the two entries sit in the list.
+    ///
+    /// `own`'s own path resolves through the symlink to the very same
+    /// canonical target as the other entry, so both match. The old
+    /// `denied_entry` returned the *first* match in list order and the caller
+    /// only compared that single result against `own`; whenever `own` came
+    /// first (as in all three cases below) the check saw `e == own` and waved
+    /// the link through without ever looking at the other entry.
+    #[test]
+    fn read_target_refuses_a_link_onto_another_credential_entry_regardless_of_list_order() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let h = &std::fs::canonicalize(tmp.path()).unwrap();
+        for d in [".m2", ".gradle", ".cargo", ".nuget"] {
+            std::fs::create_dir_all(h.join(d)).unwrap();
+        }
+        std::fs::write(h.join(".m2/settings-security.xml"), "s").unwrap();
+        std::fs::write(h.join(".cargo/credentials.toml"), "c").unwrap();
+        std::fs::write(h.join(".nuget/NuGet.Config"), "n").unwrap();
+
+        for (own, other) in [
+            (".m2/settings.xml", ".m2/settings-security.xml"),
+            (".gradle/gradle.properties", ".cargo/credentials.toml"),
+            (".m2/settings.xml", ".nuget/NuGet.Config"),
+        ] {
+            let named = h.join(own);
+            let _ = std::fs::remove_file(&named);
+            symlink(h.join(other), &named).unwrap();
+            assert_eq!(read_target(h, &named, Some(own)), None, "{own} -> {other}");
+        }
     }
 
     /// A hardlink to some other socket, planted in a colima dir, is refused.
