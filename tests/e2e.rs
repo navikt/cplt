@@ -6860,6 +6860,14 @@ paths = [
         std::fs::write(project.join("cw/commondir"), "../c0\n").unwrap();
         assert!(git_ok(&root, &["init", "-q", "-b", "main", "evil"]));
         assert!(git_ok(&root, &["init", "-q", "-b", "main", "outer/app"]));
+        // L1: a real directory outside the project to `..` back in through,
+        // and where it can later be pointed instead.
+        std::fs::create_dir_all(root.join("stage/x")).unwrap();
+        std::fs::create_dir_all(root.join("evilbase/a/b")).unwrap();
+        assert!(git_ok(
+            &root,
+            &["init", "-q", "-b", "main", "evilbase/proj/keep"]
+        ));
         (tmp, project, home)
     }
 
@@ -6892,7 +6900,7 @@ paths = [
             &home,
             &format!(
                 "mkdir keep/app && ln -s \"$PWD/keep\" {hop} && ln -s {hop} pkgs3 && \
-             ln -s {hop}/app pkgs4 && \
+             ln -s {hop}/app pkgs4 && ln -s {stage}/x/../../proj/keep dotdot && \
              mkdir e e3 s1 s2 s3 s4 && printf '[core]\\n\\tfsmonitor = x\\n' > e/config && \
              mkdir e/objects e/refs && echo 'ref: refs/heads/main' > e/HEAD && \
              printf 'gitdir: ../e\\n' > s1/.git && ln -s ../e s2/.git && mv e3 s3/.git && \
@@ -6907,7 +6915,8 @@ paths = [
              mkdir -p l2/in/objects l2/in/refs && echo 'ref: refs/heads/main' > l2/in/HEAD && \
              chmod 311 l2 && \
              printf '[core]\\n\\tfsmonitor = x\\n' >> e0/config && echo x > keep/file",
-                hop = hop.display()
+                hop = hop.display(),
+                stage = project.parent().unwrap().join("stage").display()
             ),
         );
         std::fs::remove_file(&hop).ok();
@@ -6997,6 +7006,12 @@ paths = [
                 project.join("pkgs4").display(),
                 hop.display()
             ),
+            // L1: out through a real directory and `..` back in.
+            format!(
+                "{} -> {}/stage/x/../../proj/keep",
+                project.join("dotdot").display(),
+                outside.display()
+            ),
             // B2: a directory the walk cannot list, hiding `l2/in`.
             format!("  {}\n", project.join("l2").display()),
         ] {
@@ -7008,8 +7023,20 @@ paths = [
         );
         // A link that stays inside the project is not a link report.
         assert!(!stderr.contains("s2/.git -> ../e"), "{stderr}");
+        // L1, why it matters: swap `stage/x` for a symlink, and the same
+        // `dotdot` now leads to a different repository, with no change inside
+        // the project.
+        std::fs::remove_dir(outside.join("stage/x")).unwrap();
+        std::os::unix::fs::symlink(outside.join("evilbase/a/b"), outside.join("stage/x")).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(project.join("dotdot")).unwrap(),
+            outside.join("evilbase/proj/keep")
+        );
+        // `keep` itself is not reported (links through it may name it).
+        let keep = project.join("keep").display().to_string();
         assert!(
-            !stderr.contains(&project.join("keep").display().to_string()),
+            !stderr.contains(&format!("new: {keep}"))
+                && !stderr.contains(&format!("changed: {keep}")),
             "an untouched nested repository was reported: {stderr}"
         );
     }

@@ -404,8 +404,12 @@ pub(crate) fn lexically_normalized(path: &Path) -> PathBuf {
 /// and long chains stop at the kernel's own `MAXSYMLINKS` (32 on macOS, 40 on
 /// Linux), keeping the lexical form from there.
 pub(crate) fn canonicalize_deepest(path: &Path) -> PathBuf {
-    deepest(path, &mut if cfg!(target_os = "macos") { 32 } else { 40 })
+    let mut hops = MAXSYMLINKS;
+    deepest(path, &mut hops)
 }
+
+/// The kernel's symlink-hop limit: `MAXSYMLINKS`, 32 on macOS and 40 on Linux.
+pub(crate) const MAXSYMLINKS: u32 = if cfg!(target_os = "macos") { 32 } else { 40 };
 
 fn deepest(path: &Path, hops: &mut u32) -> PathBuf {
     let mut tail: Vec<&std::ffi::OsStr> = Vec::new();

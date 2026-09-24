@@ -1265,14 +1265,20 @@ impl NestedGit {
         }
     }
 
-    /// The first path a lookup of `p` passes through that is outside every
-    /// root, if any. Every hop counts, not just where it ends: a link through
-    /// `/tmp/l -> <project>/src` ends inside today, and `/tmp/l` can be
-    /// re-aimed tomorrow from somewhere this sandbox never sees (#576 review).
+    /// The first real path a lookup of `p` reaches that is outside every root
+    /// and not an ancestor of one, if any. Every step counts, not just where
+    /// the lookup ends: a link through `/tmp/l -> <project>/src`, or through
+    /// `/tmp/stage/x/../..` back in, ends inside today, and what is under
+    /// `/tmp` can be changed tomorrow from somewhere this sandbox never sees
+    /// (#576 review). Ancestors are passed over, so `/Users/me/proj/src`
+    /// spelled out in full is not "outside" on its way down.
     fn outside_roots(&self, p: &Path) -> Option<PathBuf> {
-        lookup_hops(p)
-            .into_iter()
-            .find(|q| !self.roots.iter().any(|r| q.starts_with(r)))
+        lookup_hops(p).into_iter().find(|q| {
+            !self
+                .roots
+                .iter()
+                .any(|r| q.starts_with(r) || r.starts_with(q))
+        })
     }
 
     /// New and changed repositories, one report line each.
@@ -1299,7 +1305,10 @@ impl NestedGit {
             };
             let outside = gitdirs
                 .iter()
-                .find_map(|g| self.outside_roots(g))
+                .find(|g| self.outside_roots(g).is_some())
+                // Shown where the lookup ends today; the test above is what
+                // decides, over every step.
+                .and_then(|g| lookup_hops(g).pop())
                 .map(|q| {
                     format!(
                         " (its git directory is outside the project: {})",
@@ -1489,11 +1498,16 @@ impl Scan {
     }
 }
 
-/// Every path a lookup of `p` passes through: after each symlink hop, the
-/// whole path as it then reads (lexically), and the end. One `read_link` per
-/// component, so an intermediate link is seen even when the lookup ends back
-/// inside a root. `..` steps up from what has been resolved so far, as the
-/// kernel does. Stops following after 40 hops (Linux's `MAXSYMLINKS`).
+/// Every real path a lookup of `p` reaches, one component at a time: after
+/// each name, each `..` and each symlink hop, what has actually been resolved
+/// so far. One `read_link` per component, and `..` steps up from that
+/// resolved path, as the kernel does.
+///
+/// Name-normalising a link target is not enough: in
+/// `/tmp/stage/x/../../../<project>/src` the kernel's `..` depends on what
+/// `x` is when git runs, and `/tmp/stage` can be changed from anywhere. So
+/// every step is returned, and the caller asks whether any lies outside the
+/// roots (#576 review). Stops following links after the kernel's limit.
 fn lookup_hops(p: &Path) -> Vec<PathBuf> {
     use std::collections::VecDeque;
     use std::ffi::OsString;
@@ -1501,8 +1515,8 @@ fn lookup_hops(p: &Path) -> Vec<PathBuf> {
     let owned = |c: Component| c.as_os_str().to_owned();
     let mut todo: VecDeque<OsString> = p.components().map(owned).collect();
     let mut cur = PathBuf::new();
-    let mut hops = Vec::new();
-    let mut left = 40;
+    let mut steps = Vec::new();
+    let mut left = crate::config::MAXSYMLINKS;
     while let Some(c) = todo.pop_front() {
         match Path::new(&c).components().next() {
             Some(Component::RootDir) => cur = PathBuf::from("/"),
@@ -1517,27 +1531,18 @@ fn lookup_hops(p: &Path) -> Vec<PathBuf> {
                         for c in target.components().rev() {
                             todo.push_front(owned(c));
                         }
-                        let mut whole = cur.clone();
-                        for c in &todo {
-                            match Path::new(c).components().next() {
-                                Some(Component::RootDir) => whole = PathBuf::from("/"),
-                                Some(Component::ParentDir) => {
-                                    whole.pop();
-                                }
-                                Some(Component::Normal(n)) => whole.push(n),
-                                _ => {}
-                            }
-                        }
-                        hops.push(whole);
+                        // `cur` stays the link's parent: the target resolves
+                        // from there, and is recorded step by step.
+                        continue;
                     }
                     _ => cur = next,
                 }
             }
-            _ => {}
+            _ => continue,
         }
+        steps.push(cur.clone());
     }
-    hops.push(cur);
-    hops
+    steps
 }
 
 /// A hash of everything about a `.git` entry that decides what git run there
@@ -1596,8 +1601,23 @@ fn hash_gitdir(gitdir: &Path, h: &mut impl std::hash::Hasher) {
     // link, and its target recorded too.
     // An unlistable `hooks` (`chmod 311`) still lets git exec a hook by
     // name, so the failure itself is part of the hash (#576 review, R6).
+    // And its `stat`: a `hooks` that was already unlistable at launch still
+    // shows a hook added, removed or replaced through its mtime and ctime.
     let listing = std::fs::read_dir(gitdir.join("hooks"));
     listing.as_ref().err().map(std::io::Error::kind).hash(h);
+    std::fs::metadata(gitdir.join("hooks"))
+        .ok()
+        .map(|m| {
+            use std::os::unix::fs::MetadataExt;
+            (
+                m.ino(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec(),
+            )
+        })
+        .hash(h);
     let mut hooks: Vec<_> = listing
         .into_iter()
         .flatten()
@@ -2930,6 +2950,46 @@ mod tests {
         std::fs::set_permissions(&hooks, std::fs::Permissions::from_mode(0o311)).unwrap();
         let after = git_fingerprint(dir.path());
         std::fs::set_permissions(&hooks, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_ne!(fp, after);
+    }
+
+    /// L1: a link out through a real directory outside and `..` back in is
+    /// reported, although it ends inside today: what `..` from that directory
+    /// reaches changes when it becomes a symlink.
+    #[test]
+    fn nested_git_link_out_and_back_through_dotdot_is_reported() {
+        let (_r, root, _o, out) = root_and_outside();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(out.join("stage/x")).unwrap();
+        let ng = NestedGit::capture(&[&root]);
+        let name = root.file_name().unwrap().to_string_lossy().into_owned();
+        let target = out.join(format!("stage/x/../../../{name}/src"));
+        assert_eq!(std::fs::canonicalize(&target).unwrap(), root.join("src"));
+        std::os::unix::fs::symlink(&target, root.join("dotdot")).unwrap();
+        let lines = ng.link_lines(&Scan::of(&ng.roots)).join("\n");
+        assert!(
+            lines.contains(&format!("{} ->", root.join("dotdot").display())),
+            "{lines}"
+        );
+    }
+
+    /// L4: a `hooks` directory unlistable at launch still changes the
+    /// fingerprint when a hook is added behind the `chmod`.
+    #[test]
+    fn nested_git_fingerprint_sees_a_change_behind_an_unlistable_hooks_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let hooks = dir.path().join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let mode =
+            |m| std::fs::set_permissions(&hooks, std::fs::Permissions::from_mode(m)).unwrap();
+        mode(0o311);
+        let fp = git_fingerprint(dir.path());
+        mode(0o755);
+        std::fs::write(hooks.join("pre-commit"), "#!/bin/sh\n").unwrap();
+        mode(0o311);
+        let after = git_fingerprint(dir.path());
+        mode(0o755);
         assert_ne!(fp, after);
     }
 }

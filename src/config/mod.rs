@@ -31,12 +31,12 @@ pub use local::{
     resolve_path_entry, resolve_path_entry_for_removal, stamp_local_header,
     validate_local_document,
 };
-pub(crate) use path::canonicalize_deepest;
 pub(crate) use path::lexically_normalized;
 pub use path::{
     CustomConfigVerdict, allow_path_credential_hop, classify_custom_config, collapse_tilde,
     config_dir, config_path, credential_hop_message, default_config_contents, expand_tilde,
 };
+pub(crate) use path::{MAXSYMLINKS, canonicalize_deepest};
 pub use registry::{
     BoolKeyRow, ConfigKeyInfo, ConfigLayer, ConfigValueType, all_config_keys, bool_key,
     layer_only_flag, lookup_key,
