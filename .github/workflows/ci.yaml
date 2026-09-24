@@ -77,11 +77,20 @@ jobs:
         shell: bash
         run: |
           # Print each failing test name as an annotation, so a flake is not
-          # lost in a long log (#528).
+          # lost in a long log (#528). The awk half reads the indented names
+          # under libtest's closing `failures:` list, which --nocapture keeps
+          # when it drops the `---- name stdout ----` headers.
           LOG="$RUNNER_TEMP/test-output.log"
           [ -f "$LOG" ] || exit 0
-          sed -nE -e 's/^test (.*) \.\.\. FAILED$/\1/p' -e 's/^---- (.*) stdout ----$/\1/p' "$LOG" \
-            | sort -u | sed 's/^/::error::Test failed: /'
+          {
+            sed -nE -e 's/^test (.*) \.\.\. FAILED$/\1/p' -e 's/^---- (.*) stdout ----$/\1/p' "$LOG"
+            awk '/^failures:$/ { s = 1; next }
+                 s == 1 && /^$/ { next }
+                 s == 1 && /^    [^ ]/ { s = 2 }
+                 s == 1 { s = 0; next }
+                 s == 2 && /^    [^ ]/ { sub(/^    /, ""); print; next }
+                 { s = 0 }' "$LOG"
+          } | sort -u | sed 's/^/::error::Test failed: /'
 
   # Integration tests need macOS for sandbox-exec
   integration-tests:
@@ -192,11 +201,20 @@ jobs:
         shell: bash
         run: |
           # Print each failing test name as an annotation, so a flake is not
-          # lost in a long log (#528).
+          # lost in a long log (#528). The awk half reads the indented names
+          # under libtest's closing `failures:` list, which --nocapture keeps
+          # when it drops the `---- name stdout ----` headers.
           LOG="$RUNNER_TEMP/test-output.log"
           [ -f "$LOG" ] || exit 0
-          sed -nE -e 's/^test (.*) \.\.\. FAILED$/\1/p' -e 's/^---- (.*) stdout ----$/\1/p' "$LOG" \
-            | sort -u | sed 's/^/::error::Test failed: /'
+          {
+            sed -nE -e 's/^test (.*) \.\.\. FAILED$/\1/p' -e 's/^---- (.*) stdout ----$/\1/p' "$LOG"
+            awk '/^failures:$/ { s = 1; next }
+                 s == 1 && /^$/ { next }
+                 s == 1 && /^    [^ ]/ { s = 2 }
+                 s == 1 { s = 0; next }
+                 s == 2 && /^    [^ ]/ { sub(/^    /, ""); print; next }
+                 { s = 0 }' "$LOG"
+          } | sort -u | sed 's/^/::error::Test failed: /'
 
       - name: Surface tests skipped for missing tooling
         if: always()
@@ -365,11 +383,20 @@ jobs:
         shell: bash
         run: |
           # Print each failing test name as an annotation, so a flake is not
-          # lost in a long log (#528).
+          # lost in a long log (#528). The awk half reads the indented names
+          # under libtest's closing `failures:` list, which --nocapture keeps
+          # when it drops the `---- name stdout ----` headers.
           LOG="$RUNNER_TEMP/test-output.log"
           [ -f "$LOG" ] || exit 0
-          sed -nE -e 's/^test (.*) \.\.\. FAILED$/\1/p' -e 's/^---- (.*) stdout ----$/\1/p' "$LOG" \
-            | sort -u | sed 's/^/::error::Test failed: /'
+          {
+            sed -nE -e 's/^test (.*) \.\.\. FAILED$/\1/p' -e 's/^---- (.*) stdout ----$/\1/p' "$LOG"
+            awk '/^failures:$/ { s = 1; next }
+                 s == 1 && /^$/ { next }
+                 s == 1 && /^    [^ ]/ { s = 2 }
+                 s == 1 { s = 0; next }
+                 s == 2 && /^    [^ ]/ { sub(/^    /, ""); print; next }
+                 { s = 0 }' "$LOG"
+          } | sort -u | sed 's/^/::error::Test failed: /'
 
       - name: Stop 127.0.0.1:443 listener
         if: always()
