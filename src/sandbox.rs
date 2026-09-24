@@ -3166,6 +3166,25 @@ mod tests {
         }
     }
 
+    /// A value spelled through the project is refused even when it resolves
+    /// outside every tree: the agent can re-point the link before extraction.
+    #[test]
+    fn prepare_refuses_a_copilot_cache_linked_from_the_project() {
+        let (_guard, root) = copilot_cache_tree();
+        std::fs::create_dir_all(root.join("outside")).unwrap();
+        std::os::unix::fs::symlink(root.join("outside"), root.join("project/x")).unwrap();
+        let value = root.join("project/x");
+        prepare_with_copilot_cache(&root, "COPILOT_CACHE_HOME", &root.join("outside"), &[])
+            .expect("the target itself is outside every tree");
+        let error = prepare_with_copilot_cache(&root, "COPILOT_CACHE_HOME", &value, &[])
+            .expect_err("a project link must stop the launch");
+        assert!(
+            error.contains("the project directory")
+                && error.contains("which the sandbox can write"),
+            "{error}"
+        );
+    }
+
     /// An override outside every writable tree still launches.
     #[test]
     fn prepare_accepts_a_copilot_cache_under_opt() {

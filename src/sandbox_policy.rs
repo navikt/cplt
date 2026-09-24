@@ -2273,6 +2273,29 @@ fn copilot_cache_override(
     if !copilot_cache_root_is_usable(root, home) {
         return reject("not a safe absolute directory".into());
     }
+    // The path as spelled counts too, not only where it resolves: Copilot walks
+    // it name by name, so `<project>/x -> /opt/c` passes through the project,
+    // and anything that can write there can re-point `x` before extraction.
+    // Each name is placed under its resolved parent, which catches a symlink at
+    // any level without following it. Checked before the default shortcut, so
+    // a project link to the default is refused as well.
+    let tree_on_path = pkg.ancestors().find_map(|a| {
+        let spelled = match (a.parent(), a.file_name()) {
+            (Some(parent), Some(name)) => config::canonicalize_deepest(parent).join(name),
+            _ => a.to_path_buf(),
+        };
+        writable
+            .iter()
+            .find(|(t, _)| a.starts_with(t) || spelled.starts_with(t))
+            .map(|found| (spelled, found))
+    });
+    if let Some((spelled, (tree, why))) = tree_on_path {
+        return reject(format!(
+            "{} overlaps {why} {}, which the sandbox can write",
+            spelled.display(),
+            tree.display()
+        ));
+    }
     // Granted where it resolves, like `ResolvedToolDir::granted_at`: Seatbelt
     // matches the resolved path, so a rule on the link would never fire.
     let real = config::canonicalize_deepest(pkg);

@@ -250,17 +250,44 @@ pub fn probe_version(path: &Path, args: &[&str]) -> VersionProbe {
 /// How long the reader may take to hand over stdout once the probe has exited.
 const READ_GRACE: Duration = Duration::from_millis(500);
 
+/// Copilot's cache and home variables. Its SEA loader reads them on every
+/// start, `--version` included, to pick where it extracts its runtime and where
+/// it looks for a newer one to run (`sandbox::copilot_pkg_dir`).
+const COPILOT_CACHE_VARS: &[&str] = &[
+    "COPILOT_PKG_CACHE_HOME",
+    "COPILOT_CACHE_HOME",
+    "COPILOT_HOME",
+    "XDG_CACHE_HOME",
+];
+
+/// The probe's command, with [`COPILOT_CACHE_VARS`] removed.
+///
+/// SECURITY: a probe runs outside the sandbox, as the user, and a project can
+/// set these through direnv or mise. `COPILOT_CACHE_HOME=<project>/.cache`
+/// would have `copilot --version` run whatever runtime the agent planted
+/// there. `prepare` refuses such a value for a launch, but `cplt doctor` and
+/// the discovery report run without it, so the probe drops the variables and
+/// Copilot uses its default cache, the one the sandbox write-denies. Every
+/// agent gets the same treatment: a version string needs none of them.
+#[allow(clippy::disallowed_methods)] // runs an already-resolved discovered path; trusting it is #248, not resolution
+fn probe_command(path: &Path, args: &[&str]) -> std::process::Command {
+    let mut cmd = std::process::Command::new(path);
+    cmd.args(args);
+    for var in COPILOT_CACHE_VARS {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
 /// [`probe_version`] with its two wall-clock budgets passed in, so a test that
 /// is not about the bounds can give a loaded machine room (#528).
-#[allow(clippy::disallowed_methods)] // runs an already-resolved discovered path; trusting it is #248, not resolution
 fn probe_version_within(
     path: &Path,
     args: &[&str],
     timeout: Duration,
     read_grace: Duration,
 ) -> VersionProbe {
-    let Ok(mut child) = std::process::Command::new(path)
-        .args(args)
+    let Ok(mut child) = probe_command(path, args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -2209,6 +2236,27 @@ ELECTRON_RUN_AS_NODE=1 "/Applications/Visual Studio Code.app/Contents/Frameworks
             "a held-open pipe must not extend the probe, took {:?}",
             start.elapsed()
         );
+    }
+
+    /// #374: doctor and discovery run `copilot --version` outside the sandbox
+    /// and never see `prepare`, so the probe must not pass a cache variable a
+    /// project could point at a planted runtime.
+    #[test]
+    fn version_probe_drops_the_copilot_cache_variables() {
+        let cmd = probe_command(Path::new("/usr/bin/copilot"), &["--version"]);
+        let removed: Vec<_> = cmd
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_owned())
+            .collect();
+        for var in [
+            "COPILOT_PKG_CACHE_HOME",
+            "COPILOT_CACHE_HOME",
+            "COPILOT_HOME",
+            "XDG_CACHE_HOME",
+        ] {
+            assert!(removed.iter().any(|k| k == var), "{var} reaches the probe");
+        }
     }
 
     /// The happy path still parses, and a binary that answers is never
