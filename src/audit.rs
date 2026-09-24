@@ -1195,9 +1195,10 @@ impl AuditMode {
 /// `/tmp/evil`'s config.
 ///
 /// Three more things are reported because a repository test at check time
-/// cannot see through them: every new or re-aimed symlink that leads outside
-/// every root (the repository may be one level down, or armed later), every
-/// directory the walk could not list, and a root that gained a `.git` or
+/// cannot see through them: every new or re-aimed directory or dangling
+/// symlink whose lookup passes outside every root at any hop (the repository
+/// may be one level down, or armed later), every directory the walk was not
+/// permitted to list or whose `stat` changed while unlistable, and a root that gained a `.git` or
 /// layout it did not have at launch.
 ///
 /// The scan runs after the settle probe. A descendant that detaches and
