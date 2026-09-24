@@ -219,7 +219,7 @@ const AGENTS_TO_CHECK: &[(&str, &[&str], &[&str])] = &[
 /// `audit::GIT_TIMEOUT` and leaves a Node-based CLI room for a cold start on a
 /// loaded machine, while keeping doctor's worst case (every probed agent
 /// wedged) in the tens of seconds rather than forever.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Run `<path> <args>` and parse a version out of its stdout, giving up after
 /// [`PROBE_TIMEOUT`].
@@ -301,11 +301,11 @@ fn probe_version_within(
 }
 
 /// The raw stdout of `<path> <args>`, under the same bounds as
-/// [`probe_version`]. For callers that need the shape of the output rather
-/// than the version in it: the PATH shim sync tells Block's `goose` from
-/// pressly's migration tool this way (#514).
-pub fn probe_output(path: &Path, args: &[&str]) -> Option<String> {
-    run_probe(path, args, PROBE_TIMEOUT, READ_GRACE).ok()
+/// [`probe_version`], with the timeout passed in. For callers that need the
+/// shape of the output rather than the version in it: the PATH shim sync
+/// tells Block's `goose` from pressly's migration tool this way (#514).
+pub fn probe_output(path: &Path, args: &[&str], timeout: Duration) -> Option<String> {
+    run_probe(path, args, timeout, READ_GRACE).ok()
 }
 
 /// Run the probe and return its stdout when it exited zero in time.

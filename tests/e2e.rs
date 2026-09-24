@@ -2429,6 +2429,49 @@ mod e2e_tests {
         assert!(first.contains("shim copilot →"), "{first}");
     }
 
+    /// #514 review: `cplt doctor` runs no `goose --version` on the host. A
+    /// `goose` that turned up after the install is reported as not yet
+    /// vetted, and only the explicit install probes it.
+    #[test]
+    fn e2e_doctor_does_not_probe_an_unvetted_agent() {
+        let home = tempfile::tempdir().unwrap();
+        let fake = fake_agent_dir("copilot");
+        assert!(install_shims(home.path(), fake.path()).status.success());
+        let ran = home.path().join("probe-ran");
+        let goose = fake.path().join("goose");
+        std::fs::write(
+            &goose,
+            format!(
+                "#!/bin/sh\necho x >> '{}'\necho 'goose 1.15.0'\n",
+                ran.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&goose, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = cplt_cmd()
+            .args(["--agent", "copilot", "doctor"])
+            .env("HOME", home.path())
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}:/usr/bin:/bin",
+                    shim_dir(home.path()).display(),
+                    fake.path().display()
+                ),
+            )
+            .current_dir(project_dir())
+            .output()
+            .expect("binary should run");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!ran.exists(), "doctor ran goose --version on the host");
+        assert!(!shim_dir(home.path()).join("goose").exists());
+        assert!(stdout.contains("not yet vetted"), "{stdout}");
+        assert!(install_shims(home.path(), fake.path()).status.success());
+        assert!(ran.exists(), "the install probes it");
+        assert!(shim_dir(home.path()).join("goose").exists());
+    }
+
     /// The shim directory is not writable from inside the sandbox, not even
     /// under an `--allow-write` on an ancestor, and the ancestors inside that
     /// grant cannot be renamed away to plant a fresh directory. A sibling in

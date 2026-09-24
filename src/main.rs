@@ -6539,8 +6539,8 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
 
     // ── PATH shims (#514): only once the user opted in ──
     if cplt::shim::installed(&home_dir) {
-        sync_shims(&home_dir, cplt::shim::SyncMode::Doctor);
-        doctor_shims(&home_dir, &mut findings, &mut ok);
+        let skip = sync_shims(&home_dir, cplt::shim::SyncMode::Background);
+        doctor_shims(&home_dir, skip.as_deref(), &mut findings, &mut ok);
     }
 
     // ── config: which layers loaded ──
@@ -9296,13 +9296,12 @@ fn shell_skip() -> Option<Vec<String>> {
 
 /// Bring the shim directory up to date. Does nothing unless the user opted in.
 /// Never fails the caller: a sync that cannot write says so and moves on.
-fn sync_shims(home: &Path, mode: cplt::shim::SyncMode) {
+/// Returns the `shell.skip` list it used, `None` when it did not sync.
+fn sync_shims(home: &Path, mode: cplt::shim::SyncMode) -> Option<Vec<String>> {
     if !cplt::shim::installed(home) {
-        return;
+        return None;
     }
-    let Some(skip) = shell_skip() else {
-        return;
-    };
+    let skip = shell_skip()?;
     let report = cplt::shim::sync(home, &skip, mode);
     for c in report.done {
         ui::info(&format!("PATH shims: {}", doctor_tilde(&c, home)));
@@ -9310,6 +9309,7 @@ fn sync_shims(home: &Path, mode: cplt::shim::SyncMode) {
     for e in report.refused {
         ui::warn(&format!("PATH shims: {}", doctor_tilde(&e, home)));
     }
+    Some(skip)
 }
 
 fn doctor_tilde(text: &str, home: &Path) -> String {
@@ -9319,7 +9319,12 @@ fn doctor_tilde(text: &str, home: &Path) -> String {
 /// The `cplt doctor` shim check: Volta's `check_shim_reachable`. Each name is
 /// resolved through the PATH `doctor` was started with, which is the
 /// terminal's own after `mise activate` and `path_helper` have had their say.
-fn doctor_shims(home: &Path, findings: &mut Vec<cplt::doctor::Finding>, ok: &mut Vec<String>) {
+fn doctor_shims(
+    home: &Path,
+    skip: Option<&[String]>,
+    findings: &mut Vec<cplt::doctor::Finding>,
+    ok: &mut Vec<String>,
+) {
     use cplt::doctor::{Finding, tilde};
     use cplt::shim::Reach;
     let dir = cplt::shim::dir(home);
@@ -9328,6 +9333,20 @@ fn doctor_shims(home: &Path, findings: &mut Vec<cplt::doctor::Finding>, ok: &mut
         tilde(&dir, home)
     );
     let path = std::env::var("PATH").unwrap_or_default();
+    // Doctor never runs `goose`/`pi --version`: that is an unsandboxed run of
+    // whatever binary sits on PATH, so only the explicit install does it.
+    let unvetted = skip.map(|s| cplt::shim::unvetted_in(home, &path, s));
+    for (agent, bin) in unvetted.unwrap_or_default() {
+        findings.push(Finding::warning(
+            format!(
+                "{} is not yet vetted as {}, so it has no shim and runs unsandboxed when \
+                 started by name.",
+                tilde(&bin, home),
+                agent.display_name()
+            ),
+            Some("run `cplt --shell-install --shims` to vet it".to_string()),
+        ));
+    }
     let Some(reach) = cplt::shim::reach(home, &path) else {
         findings.push(Finding::blocking(
             format!(

@@ -51,10 +51,12 @@ pub const FISH_PATH_LINE: &str = "if not set -q __CPLT_WRAPPED; fish_add_path --
 pub const EVAL_LINE: &str = "if [ -z \"${__CPLT_WRAPPED:-}\" ] && command -v cplt >/dev/null 2>&1; then eval \"$(cplt --shell-setup --shims)\"; fi";
 
 /// What install records in the shim directory (#514 review): the rc files it
-/// created, the backups it took, the directories it made, the #513 lines it
-/// moved into a block, and binaries whose version probe said "not this
-/// agent". Uninstall undoes exactly what is listed. Hidden and without the
-/// shim marker, so nothing treats it as a shim.
+/// created, the backups it took, the directories it made, and binaries whose
+/// version probe said "not this agent". Uninstall undoes exactly what is
+/// listed. Hidden and without the shim marker, so nothing treats it as a shim.
+///
+/// Uninstall writes nothing from it into an rc file: the manifest sits in a
+/// user-writable directory, so its text is never trusted as shell code.
 const MANIFEST: &str = ".manifest";
 
 #[must_use]
@@ -236,19 +238,25 @@ fn rejected_entry(bin: &Path) -> Option<String> {
     ))
 }
 
-/// Run `bin --version`, unsandboxed, so only from an explicit command, and
-/// remember a "not this agent" answer so the same binary is not run again.
-fn confirmed(home: &Path, agent: Agent, bin: &Path) -> bool {
-    let rejected = rejected_entry(bin);
-    if rejected
-        .as_ref()
-        .is_some_and(|r| read_manifest(home).contains(r))
-    {
+fn cached_rejection(home: &Path, bin: &Path) -> bool {
+    rejected_entry(bin).is_some_and(|r| read_manifest(home).contains(&r))
+}
+
+/// Run `bin --version`, unsandboxed, so only from `--shell-install --shims`,
+/// and remember a "not this agent" answer so the same binary is not run again.
+///
+/// Only an answer is remembered. A timeout or a non-zero exit says nothing
+/// about which tool this is (a slow first start, a missing config), and
+/// caching it would leave the real agent unshimmed for good.
+fn confirmed(home: &Path, agent: Agent, bin: &Path, timeout: std::time::Duration) -> bool {
+    if cached_rejection(home, bin) {
         return false;
     }
-    let ok = crate::discover::probe_output(bin, &["--version"])
-        .is_some_and(|out| version_matches(agent, &out));
-    if !ok && let Some(r) = rejected {
+    let Some(out) = crate::discover::probe_output(bin, &["--version"], timeout) else {
+        return false;
+    };
+    let ok = version_matches(agent, &out);
+    if !ok && let Some(r) = rejected_entry(bin) {
         let _ = append_manifest(home, &r);
     }
     ok
@@ -264,15 +272,13 @@ fn skipped(agent: Agent, skip: &[String]) -> bool {
 /// Who is syncing, which sets what the sync may do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncMode {
-    /// A launch or `--shell-setup`: add only, and never run a binary. These run
-    /// with whatever PATH the caller had (an IDE, cron, `env -i`, a mise
-    /// project), so an agent missing from it is no evidence it was
-    /// uninstalled, and removing its shim would let the agent run
-    /// unsandboxed. A probe here would run an unvetted binary on the host at
-    /// every shell start.
+    /// A launch, `--shell-setup` or `cplt doctor`: add only, and never run a
+    /// binary. These run with whatever PATH the caller had (an IDE, cron,
+    /// `env -i`, a mise project), so an agent missing from it is no evidence
+    /// it was uninstalled, and removing its shim would let the agent run
+    /// unsandboxed. A probe here would run an unvetted binary on the host
+    /// without the user asking for it.
     Background,
-    /// `cplt doctor`: may probe `goose` and `pi`, still never removes.
-    Doctor,
     /// `--shell-install --shims`: probes, and removes the shims of agents not
     /// on PATH. The user ran it from the shell whose PATH they mean.
     Install,
@@ -307,7 +313,8 @@ pub fn sync_in(home: &Path, path_var: &str, skip: &[String], mode: SyncMode) -> 
                 .is_some_and(|bin| {
                     vetted
                         || !needs_probe(agent)
-                        || (mode != SyncMode::Background && confirmed(home, agent, &bin))
+                        || (mode == SyncMode::Install
+                            && confirmed(home, agent, &bin, crate::discover::PROBE_TIMEOUT))
                 });
         let may_remove = is_skipped || mode == SyncMode::Install;
         for name in names {
@@ -328,6 +335,28 @@ pub fn sync_in(home: &Path, path_var: &str, skip: &[String], mode: SyncMode) -> 
         }
     }
     report
+}
+
+/// The `goose`/`pi` binaries on `path_var` that have no shim yet because no
+/// `--shell-install --shims` has vetted them, as `(agent, binary)`. A binary
+/// the probe already rejected is not listed. Runs nothing.
+#[must_use]
+pub fn unvetted_in(home: &Path, path_var: &str, skip: &[String]) -> Vec<(Agent, PathBuf)> {
+    let d = dir(home);
+    if !d.is_dir() {
+        return Vec::new();
+    }
+    shimmable()
+        .filter(|a| needs_probe(*a) && !skipped(*a, skip))
+        .filter(|a| !a.binary_names().iter().any(|n| is_ours(&d.join(n))))
+        .filter_map(|a| {
+            a.binary_names()
+                .iter()
+                .find_map(|n| real_binary_in(path_var, home, n))
+                .filter(|bin| !cached_rejection(home, bin))
+                .map(|bin| (a, bin))
+        })
+        .collect()
 }
 
 /// [`sync_in`] against this process's `PATH`.
@@ -359,35 +388,86 @@ fn write_shim(path: &Path, contents: &str) -> Result<(), String> {
             path.display()
         ));
     }
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let tmp = path.with_file_name(format!(".{name}.cplt-tmp"));
-    std::fs::write(&tmp, contents)
-        .and_then(|()| std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)))
-        .and_then(|()| std::fs::rename(&tmp, path))
-        .map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            format!("cannot write {}: {e}", path.display())
+    replace_via_temp(path, contents, Some(std::fs::Permissions::from_mode(0o755)))
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
+/// Write `contents` to a fresh temporary file beside `target`, then rename it
+/// over `target`. The temporary name is random and created exclusively
+/// without following symlinks (see [`write_temp`]).
+fn replace_via_temp(
+    target: &Path,
+    contents: &str,
+    perms: Option<std::fs::Permissions>,
+) -> std::io::Result<()> {
+    use std::hash::{BuildHasher, Hasher};
+    let name = target.file_name().unwrap_or_default().to_string_lossy();
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u32(std::process::id());
+    let tmp = target.with_file_name(format!(".{name}.cplt-tmp.{:016x}", h.finish()));
+    write_temp(&tmp, contents, perms)
+        .and_then(|()| std::fs::rename(&tmp, target))
+        .inspect_err(|e| {
+            // An existing `tmp` is someone else's; only clean up our own.
+            if e.kind() != std::io::ErrorKind::AlreadyExists {
+                let _ = std::fs::remove_file(&tmp);
+            }
         })
+}
+
+/// Create `tmp` with `O_CREAT | O_EXCL | O_NOFOLLOW`, so a file or symlink
+/// planted there is refused rather than written through, with `perms` (the
+/// default mode when `None`) from the start, and fill it.
+fn write_temp(
+    tmp: &Path,
+    contents: &str,
+    perms: Option<std::fs::Permissions>,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    if let Some(p) = &perms {
+        opts.mode(p.mode() & 0o7777);
+    }
+    let mut f = opts.open(tmp)?;
+    // The umask may have narrowed the mode at creation; set it to exactly
+    // the target's.
+    if let Some(p) = perms {
+        f.set_permissions(p)?;
+    }
+    f.write_all(contents.as_bytes())
 }
 
 /// Replace an rc file's contents: a temporary file beside the file's real
 /// location, renamed over it. A symlinked dotfile stays a symlink and its
-/// target gets the new contents; the target's permissions carry over.
+/// target gets the new contents; the target's permissions carry over. A
+/// symlink whose target is missing is refused: replacing it would turn the
+/// user's link into a plain file.
 fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
-    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let target = match std::fs::canonicalize(path) {
+        Ok(t) => t,
+        Err(_)
+            if path
+                .symlink_metadata()
+                .is_ok_and(|m| m.file_type().is_symlink()) =>
+        {
+            return Err(std::io::Error::other(format!(
+                "{} is a symlink to a file that does not exist; create its target or remove \
+                 the link, then run this again",
+                path.display()
+            )));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => path.to_path_buf(),
+        Err(e) => return Err(e),
+    };
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let name = target.file_name().unwrap_or_default().to_string_lossy();
-    let tmp = target.with_file_name(format!(".{name}.cplt-tmp"));
     let perms = std::fs::metadata(&target).ok().map(|m| m.permissions());
-    let result = std::fs::write(&tmp, contents)
-        .and_then(|()| perms.map_or(Ok(()), |p| std::fs::set_permissions(&tmp, p)))
-        .and_then(|()| std::fs::rename(&tmp, &target));
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result
+    replace_via_temp(&target, contents, perms)
 }
 
 // ── Manifest ─────────────────────────────────────────────────────
@@ -396,11 +476,25 @@ fn manifest_path(home: &Path) -> PathBuf {
     dir(home).join(MANIFEST)
 }
 
-/// The manifest's lines, each `<kind>\t<path>[\t<detail>]`; empty when absent.
+/// The manifest opened without following a symlink, so a `.manifest` link
+/// can neither feed uninstall another file's lines nor redirect an append.
+fn open_manifest(home: &Path, opts: &mut std::fs::OpenOptions) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(manifest_path(home))
+}
+
+/// The manifest's lines, each `<kind>\t<path>[\t<detail>]`; empty when absent
+/// or a symlink.
 fn read_manifest(home: &Path) -> Vec<String> {
-    std::fs::read_to_string(manifest_path(home))
-        .map(|c| c.lines().map(str::to_string).collect())
-        .unwrap_or_default()
+    use std::io::Read;
+    let mut c = String::new();
+    match open_manifest(home, std::fs::OpenOptions::new().read(true))
+        .and_then(|mut f| f.read_to_string(&mut c))
+    {
+        Ok(_) => c.lines().map(str::to_string).collect(),
+        Err(_) => Vec::new(),
+    }
 }
 
 fn append_manifest(home: &Path, line: &str) -> std::io::Result<()> {
@@ -408,10 +502,7 @@ fn append_manifest(home: &Path, line: &str) -> std::io::Result<()> {
     if read_manifest(home).iter().any(|l| l == line) {
         return Ok(());
     }
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(manifest_path(home))?;
+    let mut f = open_manifest(home, std::fs::OpenOptions::new().create(true).append(true))?;
     writeln!(f, "{line}")
 }
 
@@ -481,19 +572,6 @@ fn historical_line(line: &str) -> bool {
 /// is someone else's, and the block is then left alone.
 fn known_line(line: &str) -> bool {
     current_line(line) || historical_line(line)
-}
-
-/// A line #513's plain `--shell-install` wrote outside any block, and the
-/// agent it aliases. The block's own line covers it once shims are installed,
-/// so an install moves it into the block rather than leave both to run.
-fn legacy_alias_line(line: &str) -> Option<Agent> {
-    if line == "eval \"$(cplt --shell-setup)\"" || line == "alias copilot cplt" {
-        return Some(Agent::Copilot);
-    }
-    shimmable().find(|a| {
-        line == format!("eval \"$(cplt --shell-setup --agent {})\"", a.binary_name())
-            || alias_lines(*a, true).iter().any(|l| l == line)
-    })
 }
 
 /// Where the block is, as `(begin line index, end line index)`.
@@ -604,8 +682,6 @@ fn render_block(body: &[String]) -> String {
 pub struct RcFile {
     pub path: PathBuf,
     pub body: Vec<String>,
-    /// Whether #513's alias lines in this file move into the block.
-    pub migrate: bool,
 }
 
 /// The rc files an install writes, per the PRD's placement table.
@@ -622,7 +698,6 @@ pub fn rc_files(home: &Path, shell: &str, agent: Agent) -> Vec<RcFile> {
     let path_rc = |name: &str| RcFile {
         path: home.join(name),
         body: vec![POSIX_PATH_LINE.to_string()],
-        migrate: false,
     };
     let mut files = vec![
         path_rc(".zshenv"),
@@ -637,7 +712,6 @@ pub fn rc_files(home: &Path, shell: &str, agent: Agent) -> Vec<RcFile> {
     let alias_rc = |path: PathBuf| RcFile {
         path,
         body: vec![EVAL_LINE.to_string()],
-        migrate: true,
     };
     let zshrc = home.join(".zshrc");
     if zshrc.exists() || shell.ends_with("/zsh") {
@@ -654,7 +728,6 @@ pub fn rc_files(home: &Path, shell: &str, agent: Agent) -> Vec<RcFile> {
         files.push(RcFile {
             path: fish_dir.join("conf.d/cplt.fish"),
             body,
-            migrate: true,
         });
     }
     files
@@ -695,8 +768,7 @@ pub struct Report {
 /// Opt in: create the shim directory, sync it, and write the managed blocks.
 ///
 /// An existing rc file gets a copy at `<file>.cplt-backup` before cplt's first
-/// edit, replacing any stale copy. Everything created, backed up or migrated
-/// is listed in the manifest for the uninstall. Idempotent: a second run
+/// edit, replacing any stale copy. Everything created or backed up is listed in the manifest for the uninstall. Idempotent: a second run
 /// changes nothing.
 #[must_use]
 pub fn install(home: &Path, path_var: &str, shell: &str, agent: Agent, skip: &[String]) -> Report {
@@ -748,33 +820,11 @@ fn write_rc(home: &Path, rc: &RcFile) -> Result<Option<String>, String> {
         Err(e) => return Err(format!("{shown}: cannot read: {e}")),
     };
     let current = existing.clone().unwrap_or_default();
-
-    // #513's lines outside the block: take them out, and let the block cover
-    // their agents.
-    let mut body = rc.body.clone();
-    let mut migrated = Vec::new();
-    let mut kept = String::new();
-    let mut inside = false;
-    for l in current.split_inclusive('\n') {
-        let t = l.trim_end();
-        inside |= t == BLOCK_BEGIN;
-        let legacy = (rc.migrate && !inside)
-            .then(|| legacy_alias_line(t.trim()))
-            .flatten();
-        inside &= t != BLOCK_END;
-        match legacy {
-            Some(agent) => {
-                migrated.push(t.to_string());
-                if t.trim().starts_with("alias ") {
-                    body.extend(fish_block_aliases(agent));
-                }
-            }
-            None => kept.push_str(l),
-        }
-    }
-
-    let upserted = upsert_block(&kept, &body).map_err(|e| format!("{shown}: {e}"))?;
-    let Some(updated) = upserted.or_else(|| (kept != current).then(|| kept.clone())) else {
+    // #513's alias lines outside the block stay where they are, untouched:
+    // the block's aliases are the same pinned definitions, so running both
+    // only defines each alias twice. Moving them was deferred (#514 review).
+    let Some(updated) = upsert_block(&current, &rc.body).map_err(|e| format!("{shown}: {e}"))?
+    else {
         return Ok(None);
     };
     let backup = backup_path(&rc.path);
@@ -792,9 +842,6 @@ fn write_rc(home: &Path, rc: &RcFile) -> Result<Option<String>, String> {
         record(entry("created", &rc.path))?;
     }
     write_atomic(&rc.path, &updated).map_err(|e| format!("{shown}: cannot write: {e}"))?;
-    for line in &migrated {
-        record(format!("legacy\t{}\t{line}", rc.path.display()))?;
-    }
     Ok(Some(match (existing.is_some(), backed_up) {
         (false, _) => format!("created {shown}"),
         (true, true) => format!("updated {shown} (backup: {})", backup.display()),
@@ -802,10 +849,9 @@ fn write_rc(home: &Path, rc: &RcFile) -> Result<Option<String>, String> {
     }))
 }
 
-/// Opt out: remove every block, put back the #513 lines the install moved
-/// into one, remove the backups and files the install made, then the shims,
-/// the manifest and the directories the install created. Leaves anything
-/// cplt did not write, and says so.
+/// Opt out: remove every block, the backups and files the install made, then
+/// the shims, the manifest and the directories the install created. Leaves
+/// anything cplt did not write, and says so.
 ///
 /// Without a manifest (an install from before it existed), a file with no
 /// backup counts as created, and no directory above the shim directory is
@@ -821,13 +867,7 @@ pub fn uninstall(home: &Path) -> Report {
         let Ok(contents) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let prefix = format!("{}\t", entry("legacy", &path));
-        let restore: String = manifest
-            .iter()
-            .filter_map(|l| l.strip_prefix(&prefix))
-            .map(|l| format!("{l}\n"))
-            .collect();
-        let stripped = match replace_block(&contents, &restore) {
+        let stripped = match replace_block(&contents, "") {
             Ok(Some(s)) => s,
             Ok(None) => continue,
             Err(e) => {
@@ -901,13 +941,19 @@ pub fn uninstall(home: &Path) -> Report {
         return report;
     }
     report.done.push(format!("removed {}", d.display()));
-    // Only the directories the install made, deepest first. `remove_dir`
-    // refuses a non-empty one, so anything else in them keeps them.
-    for parent in manifest.iter().filter_map(|l| l.strip_prefix("dir\t")) {
-        if std::fs::remove_dir(parent).is_err() {
+    // Only the directories the install made, deepest first, and only the
+    // shim directory's ancestors below `$HOME`: a `dir` line naming anything
+    // else is ignored. `remove_dir` refuses a non-empty one, so anything else
+    // in them keeps them.
+    for parent in d
+        .ancestors()
+        .skip(1)
+        .take_while(|p| *p != home && p.starts_with(home))
+    {
+        if !listed("dir", parent) || std::fs::remove_dir(parent).is_err() {
             break;
         }
-        report.done.push(format!("removed {parent}"));
+        report.done.push(format!("removed {}", parent.display()));
     }
     report
 }
@@ -1025,7 +1071,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let bin = home.path().join("bin");
         exe(&bin, "copilot", "#!/bin/sh\n");
-        for mode in [SyncMode::Background, SyncMode::Doctor, SyncMode::Install] {
+        for mode in [SyncMode::Background, SyncMode::Install] {
             let changes = sync_in(home.path(), &join(&[&bin]), &[], mode);
             assert!(changes.done.is_empty() && changes.refused.is_empty());
         }
@@ -1090,21 +1136,22 @@ mod tests {
         let shims = dir(home.path());
         exe(&shims, "copilot", &script(Agent::Copilot));
         for path in ["", "/nonexistent"] {
-            for mode in [SyncMode::Background, SyncMode::Doctor] {
-                let r = sync_in(home.path(), path, &[], mode);
-                assert!(r.done.is_empty() && r.refused.is_empty(), "{mode:?}: {r:?}");
-                assert!(shims.join("copilot").exists(), "{mode:?} removed a shim");
-            }
+            let r = sync_in(home.path(), path, &[], SyncMode::Background);
+            assert!(r.done.is_empty() && r.refused.is_empty(), "{r:?}");
+            assert!(
+                shims.join("copilot").exists(),
+                "a background sync removed a shim"
+            );
         }
         let r = sync_in(home.path(), "", &[], SyncMode::Install);
         assert_eq!(r.done.len(), 1, "{r:?}");
         assert!(!shims.join("copilot").exists());
     }
 
-    /// #514 review: `goose --version` runs unsandboxed, so a launch or shell
-    /// start must never run it: a `goose` an agent planted in a writable PATH
-    /// directory would run on the host. `cplt doctor` and the install may, and
-    /// a rejected binary is remembered rather than run again.
+    /// #514 review: `goose --version` runs unsandboxed, so a launch, a shell
+    /// start or `cplt doctor` must never run it: a `goose` an agent planted in
+    /// a writable PATH directory would run on the host. Only the install
+    /// does, and a rejected binary is remembered rather than run again.
     #[test]
     fn only_explicit_commands_probe_and_a_rejection_is_cached() {
         let home = tempfile::tempdir().unwrap();
@@ -1124,16 +1171,68 @@ mod tests {
         let r = sync_in(home.path(), &path, &[], SyncMode::Background);
         assert!(r.done.is_empty(), "{r:?}");
         assert!(!ran.exists(), "a background sync ran the probe");
+        assert_eq!(unvetted_in(home.path(), &path, &[]).len(), 1);
+        assert!(!ran.exists(), "listing the unvetted ran the probe");
 
-        let r = sync_in(home.path(), &path, &[], SyncMode::Doctor);
+        let r = sync_in(home.path(), &path, &[], SyncMode::Install);
         assert!(r.done.is_empty(), "pressly/goose is not shimmed: {r:?}");
         assert_eq!(std::fs::read_to_string(&ran).unwrap().lines().count(), 1);
+        assert!(
+            unvetted_in(home.path(), &path, &[]).is_empty(),
+            "a rejected binary is not reported as unvetted"
+        );
         let _ = sync_in(home.path(), &path, &[], SyncMode::Install);
         assert_eq!(
             std::fs::read_to_string(&ran).unwrap().lines().count(),
             1,
             "a rejected binary is not probed again"
         );
+    }
+
+    /// #514 review: a probe that timed out or exited non-zero said nothing
+    /// about which tool this is. Caching it as "not this agent" would leave
+    /// the real agent unshimmed for good.
+    #[test]
+    fn a_probe_that_gave_no_answer_is_not_cached() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir(home.path())).unwrap();
+        let bin = home.path().join("bin");
+        let fast = std::time::Duration::from_millis(300);
+        let slow = exe(
+            &bin,
+            "goose",
+            "#!/bin/sh
+exec sleep 3
+",
+        );
+        assert!(!confirmed(home.path(), Agent::Goose, &slow, fast));
+        assert!(
+            !cached_rejection(home.path(), &slow),
+            "a timeout was cached"
+        );
+        let failing = exe(
+            &bin,
+            "pi",
+            "#!/bin/sh
+echo 'pi 3.14'
+exit 1
+",
+        );
+        assert!(!confirmed(home.path(), Agent::Pi, &failing, fast * 10));
+        assert!(
+            !cached_rejection(home.path(), &failing),
+            "a non-zero exit was cached"
+        );
+        // An answer that is not the agent is cached.
+        let pressly = exe(
+            &bin,
+            "goose2",
+            "#!/bin/sh
+echo 'goose version: v3'
+",
+        );
+        assert!(!confirmed(home.path(), Agent::Goose, &pressly, fast * 10));
+        assert!(cached_rejection(home.path(), &pressly));
     }
 
     #[test]
@@ -1214,24 +1313,116 @@ mod tests {
         assert_eq!(b.matches(BLOCK_BEGIN).count(), 1);
     }
 
-    /// #513's unguarded eval moves into the block, so it does not run next to
-    /// the block's own; uninstall puts it back.
+    /// #513's lines stay exactly where they are, indented inside an `if` or
+    /// not: install only appends the block, uninstall only takes it away.
     #[test]
-    fn install_migrates_the_513_eval_and_uninstall_restores_it() {
+    fn install_and_uninstall_leave_513_lines_in_place() {
         let home = tempfile::tempdir().unwrap();
         let zshrc = home.path().join(".zshrc");
-        let before = "export A=1\neval \"$(cplt --shell-setup --agent claude)\"\n";
+        let fish = home.path().join(".config/fish/conf.d/cplt.fish");
+        std::fs::create_dir_all(fish.parent().unwrap()).unwrap();
+        let before = "export A=1\nif true; then\n  eval \"$(cplt --shell-setup --agent claude)\"\nfi\neval \"$(cplt --shell-setup)\"\n";
+        let fish_before = "alias copilot cplt\nalias claude 'cplt --agent claude'\n";
         std::fs::write(&zshrc, before).unwrap();
+        std::fs::write(&fish, fish_before).unwrap();
         let r = install(home.path(), "", "/bin/zsh", Agent::Copilot, &[]);
         assert!(r.refused.is_empty(), "{r:?}");
-        let after = std::fs::read_to_string(&zshrc).unwrap();
         assert_eq!(
-            after,
-            format!("export A=1\n{}", render_block(&[EVAL_LINE.to_string()]))
+            std::fs::read_to_string(&zshrc).unwrap(),
+            format!("{before}{}", render_block(&[EVAL_LINE.to_string()]))
+        );
+        assert!(
+            std::fs::read_to_string(&fish)
+                .unwrap()
+                .starts_with(fish_before)
+        );
+        assert!(
+            !read_manifest(home.path())
+                .iter()
+                .any(|l| l.starts_with("legacy"))
         );
         let r = uninstall(home.path());
         assert!(r.refused.is_empty(), "{r:?}");
         assert_eq!(std::fs::read_to_string(&zshrc).unwrap(), before);
+        assert_eq!(std::fs::read_to_string(&fish).unwrap(), fish_before);
+    }
+
+    /// #514 review: the manifest lives in a user-writable directory. A `dir`
+    /// line naming anything but an ancestor of the shim directory below
+    /// `$HOME` is ignored.
+    #[test]
+    fn uninstall_ignores_a_forged_dir_entry() {
+        let home = tempfile::tempdir().unwrap();
+        let victim = home.path().join("victim");
+        let outside = tempfile::tempdir().unwrap();
+        let outside_dir = outside.path().join("empty");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let r = install(home.path(), "", "/bin/sh", Agent::Copilot, &[]);
+        assert!(r.refused.is_empty(), "{r:?}");
+        for p in [&victim, &outside_dir, &home.path().to_path_buf()] {
+            append_manifest(home.path(), &entry("dir", p)).unwrap();
+        }
+        let r = uninstall(home.path());
+        assert!(r.refused.is_empty(), "{r:?}");
+        assert!(victim.is_dir(), "a forged entry under $HOME was removed");
+        assert!(
+            outside_dir.is_dir(),
+            "a forged entry outside $HOME was removed"
+        );
+        assert!(home.path().is_dir());
+        assert!(
+            !home.path().join(".local").exists(),
+            "the real ones still go"
+        );
+    }
+
+    /// #514 review: a `.manifest` symlink is neither read nor appended through.
+    #[test]
+    fn a_manifest_symlink_is_not_followed() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir(home.path())).unwrap();
+        let elsewhere = home.path().join("elsewhere");
+        std::fs::write(&elsewhere, "dir\t/x\n").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, manifest_path(home.path())).unwrap();
+        assert!(read_manifest(home.path()).is_empty());
+        assert!(append_manifest(home.path(), "created\t/y").is_err());
+        assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "dir\t/x\n");
+    }
+
+    /// #514 review: the temporary file is created fresh, never through
+    /// something planted at its name, with the target's mode from the start;
+    /// a dangling symlinked dotfile is refused, not replaced by a plain file.
+    #[test]
+    fn write_atomic_refuses_planted_temps_and_dangling_links_and_keeps_mode() {
+        let home = tempfile::tempdir().unwrap();
+        let rc = home.path().join(".zshenv");
+        std::fs::write(&rc, "a\n").unwrap();
+        std::fs::set_permissions(&rc, std::fs::Permissions::from_mode(0o640)).unwrap();
+        write_atomic(&rc, "b\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&rc).unwrap(), "b\n");
+        let mode = std::fs::metadata(&rc).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o640);
+
+        let victim = home.path().join("victim");
+        std::fs::write(&victim, "keep\n").unwrap();
+        let planted = home.path().join(".zshenv.cplt-tmp.planted");
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+        assert!(write_temp(&planted, "evil\n", None).is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep\n");
+
+        let dangling = home.path().join(".zprofile");
+        std::os::unix::fs::symlink(home.path().join("missing"), &dangling).unwrap();
+        let e = write_atomic(&dangling, "x\n").unwrap_err();
+        assert!(e.to_string().contains("does not exist"), "{e}");
+        assert!(
+            dangling
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!home.path().join("missing").exists());
     }
 
     /// A stale backup from an earlier install is replaced at the next first
