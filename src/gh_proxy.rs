@@ -1174,6 +1174,24 @@ fn evaluate_api(cmd: &ParsedCommand, allow_api_write: bool) -> PolicyResult {
                 reason: "gh api graphql allows arbitrary mutations — use specific REST endpoints instead",
             };
         }
+        // Every later comparison and scope extraction reads the decoded path, so
+        // a spelling that does not decode to one clean path is refused here.
+        match decode_api_path(path) {
+            None => {
+                return PolicyResult {
+                    decision: Decision::Block,
+                    reason: "gh api endpoint has a bad or double percent-escape, a '.' or '..' \
+                             segment, a backslash, or a control character",
+                };
+            }
+            Some(decoded) if decoded.trim_matches('/').eq_ignore_ascii_case("graphql") => {
+                return PolicyResult {
+                    decision: Decision::Block,
+                    reason: "gh api graphql allows arbitrary mutations — use specific REST endpoints instead",
+                };
+            }
+            Some(_) => {}
+        }
     }
 
     // Evaluate the HTTP method BEFORE the input-flags shortcut. DELETE is always
@@ -1253,6 +1271,8 @@ pub fn is_repo_in_scope(
             let Ok(endpoint) = github_api_endpoint_path(endpoint) else {
                 return None;
             };
+            let path = endpoint.split(['?', '#']).next().unwrap_or(endpoint);
+            let decoded = decode_api_path(path)?;
             if let Some(endpoint_repo) = extract_repo_from_api_path(endpoint) {
                 return scope_member(scope, &endpoint_repo);
             }
@@ -1267,8 +1287,7 @@ pub fn is_repo_in_scope(
             }
             // For reads: check if this looks like a relative path (no leading absolute prefix)
             // that gh CLI resolves to the current repo (e.g., `gh api pulls/67/comments`).
-            let path = endpoint.strip_prefix('/').unwrap_or(endpoint);
-            let path = path.split('?').next().unwrap_or(path);
+            let path = decoded.strip_prefix('/').unwrap_or(&decoded);
             if !path.starts_with("repos/")
                 && !path.starts_with("orgs/")
                 && !path.starts_with("users/")
@@ -1294,11 +1313,15 @@ pub fn is_repo_in_scope(
 /// The scope member `target` names, in the spelling captured at launch.
 ///
 /// The launch-time spelling is what gets pinned into `GH_REPO`, so a `-R` that
-/// differs only in case or a `.git` suffix still pins the canonical member.
+/// differs only in case still pins the canonical member.
+///
+/// Exact apart from ASCII case. Not `repos_match`: `target` is a name `gh` sends
+/// to the API as-is (`-R`, a `/repos/` path, or an origin already parsed by
+/// `parse_repo_from_url`), and `navikt/cplt.git` there is not `navikt/cplt`.
 fn scope_member(scope: &[String], target: &str) -> Option<String> {
     scope
         .iter()
-        .find(|member| repos_match(target, member))
+        .find(|member| member.eq_ignore_ascii_case(target))
         .cloned()
 }
 
@@ -1310,6 +1333,9 @@ fn scope_label(scope: &[String]) -> String {
 
 /// Two `owner/name` spellings naming the same repository: GitHub is
 /// case-insensitive and an origin URL may carry a `.git` suffix.
+///
+/// Only for identities read from Git remotes. A name `gh` sends to the API is
+/// compared exactly, by `scope_member`.
 pub fn repos_match(left: &str, right: &str) -> bool {
     left.trim_end_matches(".git")
         .eq_ignore_ascii_case(right.trim_end_matches(".git"))
@@ -1480,21 +1506,45 @@ fn extract_repo_from_api_path(endpoint: &str) -> Option<String> {
     let parts: Vec<&str> = path.split('/').collect();
 
     // Must start with "repos" and have at least owner + repo.
-    // Reject "." / ".." segments — they are not valid owner/repo names and could
+    // GitHub routes on the raw path and decodes each segment afterwards
+    // (`repos/%6Eavikt/x` is navikt/x), so the owner and name are decoded one
+    // segment at a time. `decode_api_path` rejects "." / ".." segments — they
+    // are not valid owner/repo names and could
     // otherwise be used to craft a path that string-matches the current repo
     // while resolving elsewhere.
-    let is_dot = |s: &str| s == "." || s == "..";
-    if parts.len() >= 3
-        && parts[0] == "repos"
-        && !parts[1].is_empty()
-        && !parts[2].is_empty()
-        && !is_dot(parts[1])
-        && !is_dot(parts[2])
-    {
-        Some(format!("{}/{}", parts[1], parts[2]))
+    let segment = |s: &str| decode_api_path(s).filter(|d| !d.is_empty());
+    if parts.len() >= 3 && parts[0] == "repos" {
+        Some(format!("{}/{}", segment(parts[1])?, segment(parts[2])?))
     } else {
         None
     }
+}
+
+/// `path` with its percent-escapes decoded once, as GitHub reads it.
+///
+/// `None` for a spelling the guard does not reason about: a malformed escape,
+/// a `%` left after decoding (double encoding), a `.` or `..` segment, a
+/// backslash, a control character, or bytes that are not UTF-8.
+fn decode_api_path(path: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(path.len());
+    let mut rest = path.as_bytes();
+    while let Some((&b, tail)) = rest.split_first() {
+        if b == b'%' {
+            let hex = tail
+                .get(..2)
+                .filter(|h| h.iter().all(u8::is_ascii_hexdigit))?;
+            bytes.push(u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?);
+            rest = &tail[2..];
+        } else {
+            bytes.push(b);
+            rest = tail;
+        }
+    }
+    let decoded = String::from_utf8(bytes).ok()?;
+    let refused = decoded.contains(['%', '\\'])
+        || decoded.chars().any(char::is_control)
+        || decoded.split('/').any(|s| s == "." || s == "..");
+    (!refused).then_some(decoded)
 }
 
 /// Detect the repository rooted at the supplied project directory.
@@ -4598,7 +4648,8 @@ mod tests {
     }
 
     #[test]
-    fn scope_check_strips_git_suffix() {
+    fn scope_check_does_not_strip_git_suffix() {
+        // `gh` sends `cplt.git` to the API as-is; it is not `cplt`.
         let cmd = ParsedCommand {
             command: "pr".to_string(),
             subcommand: Some("create".to_string()),
@@ -4607,7 +4658,15 @@ mod tests {
             has_input_flags: false,
             api_endpoint: None,
         };
-        assert!(in_scope(&cmd, "navikt/cplt", None));
+        assert!(!in_scope(&cmd, "navikt/cplt", None));
+        let cmd = ParsedCommand {
+            command: "api".to_string(),
+            subcommand: None,
+            repo_flag: None,
+            api_endpoint: Some("repos/navikt/cplt.git/pulls".to_string()),
+            ..cmd
+        };
+        assert!(!in_scope(&cmd, "navikt/cplt", None));
     }
 
     // ── API endpoint scope tests ──
@@ -7838,6 +7897,67 @@ mod tests {
         assert_eq!(extract_repo_from_api_path("/repos/./cplt/pulls"), None);
         assert_eq!(extract_repo_from_api_path("/repos/navikt/../pulls"), None);
         assert_eq!(extract_repo_from_api_path("repos/../../etc/passwd"), None);
+    }
+
+    #[test]
+    fn api_endpoint_percent_encoding() {
+        let api = |ep: &str| ParsedCommand {
+            command: "api".to_string(),
+            subcommand: None,
+            repo_flag: None,
+            method: None,
+            has_input_flags: false,
+            api_endpoint: Some(ep.to_string()),
+        };
+        for ep in [
+            "graphq%6C",
+            "%67raphql",
+            "/GRAPH%51L/",
+            "https://api.github.com/graphq%6C",
+            "graphq%256C",
+            "repos/navikt/cplt/pulls%",
+            "repos/navikt/cplt/pulls%zz",
+            "repos/navikt/cplt/%2E%2E/%2E%2E/other/x",
+            "repos/navikt/cplt/..%2F..%2Fother",
+            "repos/navikt/cplt/%5Cpulls",
+            "repos/navikt/cplt/pulls%0A",
+            "repos/navikt/cplt/%FF",
+        ] {
+            assert_eq!(
+                evaluate_with_policy(&api(ep), true).decision,
+                Decision::Block,
+                "'{ep}' must be blocked"
+            );
+        }
+        // GitHub decodes owner and name, so these are navikt/other and navikt/cplt.
+        assert!(!in_scope(
+            &api("repos/%6Eavikt/other/pulls"),
+            "navikt/cplt",
+            None
+        ));
+        assert!(in_scope(
+            &api("repos/%6Eavikt/cpl%74/pulls"),
+            "navikt/cplt",
+            None
+        ));
+        // An encoded slash inside owner or name is not a path separator to GitHub.
+        assert!(!in_scope(
+            &api("repos/navikt%2Fcplt/x/pulls"),
+            "navikt/cplt",
+            None
+        ));
+        // An encoded absolute prefix is not a relative read of the cwd repo.
+        let cwd = Some("navikt/cplt");
+        assert!(!in_scope(&api("%72epos/navikt/other"), "navikt/cplt", cwd));
+        assert!(!in_scope(&api("%67raphql"), "navikt/cplt", cwd));
+        // An encoded slash after owner/name is legitimate (refs, contents).
+        let git_ref = api("repos/navikt/cplt/git/ref/heads%2Fmain");
+        assert_eq!(evaluate(&git_ref).decision, Decision::ScopeCheck);
+        assert!(in_scope(&git_ref, "navikt/cplt", None));
+        // A query string may carry escapes of its own.
+        let query = api("repos/navikt/cplt/pulls?head=navikt%3Afix");
+        assert_eq!(evaluate(&query).decision, Decision::ScopeCheck);
+        assert!(in_scope(&query, "navikt/cplt", None));
     }
 
     // Lower-severity: `-R=`/`-X=` attached-equals in the api parser.

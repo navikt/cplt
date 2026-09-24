@@ -1224,6 +1224,37 @@ fn gh_gate_blocks_graphql_with_method() {
     assert_refused(&stderr, ok, "arbitrary mutations");
 }
 
+#[test]
+fn gh_gate_blocks_percent_encoded_graphql() {
+    for ep in ["graphq%6C", "%67raphql", "/graph%71l/"] {
+        let (_, stderr, ok) = gh_gate(&["api", ep]);
+        assert_refused(&stderr, ok, "arbitrary mutations");
+    }
+    let (_, stderr, ok) = gh_gate(&["api", "graphq%256C"]);
+    assert_refused(&stderr, ok, "double percent-escape");
+}
+
+#[test]
+fn gh_gate_scope_checks_percent_decoded_repo() {
+    let (_, stderr, ok) = gh_gate(&["api", "repos/%6Eavikt/other/pulls"]);
+    assert_refused(&stderr, ok, "'repos/%6Eavikt/other/pulls' which is outside");
+    let (_, _, ok) = gh_gate(&["api", "repos/%6Eavikt/cplt/pulls"]);
+    assert!(
+        ok,
+        "an encoded spelling of the scoped repo is still that repo"
+    );
+    let (_, _, ok) = gh_gate(&["api", "repos/navikt/cplt/git/ref/heads%2Fmain"]);
+    assert!(ok, "an encoded slash after owner/name stays allowed");
+}
+
+#[test]
+fn gh_gate_refuses_git_suffix_as_other_repo() {
+    let (_, stderr, ok) = gh_gate(&["api", "repos/navikt/cplt.git/pulls"]);
+    assert_refused(&stderr, ok, "outside the startup repo");
+    let (_, stderr, ok) = gh_gate(&["pr", "close", "42", "-R", "navikt/cplt.git"]);
+    assert_refused(&stderr, ok, "outside the startup repo");
+}
+
 // ============================================================
 // git-gate: Read operations (should be ALLOWED)
 // ============================================================
