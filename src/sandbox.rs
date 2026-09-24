@@ -1908,6 +1908,16 @@ fn prepare_impl(
                  deny subpaths within allowed directories. Proxy and env hardening \
                  provide defense-in-depth.",
             );
+            for file in
+                policy::unenforced_build_credential_denies(config.home_dir, config.extra_deny)
+            {
+                ui::warn(&format!(
+                    "{} stays readable and writable despite the deny: it sits inside \
+                     a granted tool directory, and without Bubblewrap nothing can take \
+                     it back.",
+                    file.display()
+                ));
+            }
         }
     }
 

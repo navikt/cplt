@@ -1689,11 +1689,9 @@ fn merge_build_credentials(resolved: &mut config::Resolved, home: &Path) {
                     resolved.allow_read.push(path);
                 }
             }
-            Err(named) => ui::warn(&format!(
-                "sandbox.allow_build_credentials: {} is not granted. It is a link into a \
-                 credential directory or onto another credential file, or not a plain \
-                 file of its own. Point it at a regular file, or grant the target with \
-                 allow.read if you mean to.",
+            Err((named, why)) => ui::warn(&format!(
+                "sandbox.allow_build_credentials: {} is not granted: {why}. Point it at \
+                 a regular file, or grant the target with allow.read if you mean to.",
                 named.display()
             )),
         }

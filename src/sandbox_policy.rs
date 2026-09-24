@@ -269,19 +269,54 @@ fn read_target(home: &Path, path: &Path, own: Option<&str>) -> Option<PathBuf> {
 /// relative to `$HOME`: the credentials of the three build hosts a Node or
 /// JVM project cannot avoid. Each is a [`DENIED_HOME_SUBPATHS`] entry, so the
 /// grant is the ordinary per-file `allow.read` override of that deny.
+///
+/// Read-only holds on macOS only. On Linux, `.m2/settings.xml` and
+/// `.gradle/gradle.properties` sit inside the `~/.m2` and `~/.gradle`
+/// [`HOME_TOOL_DIRS`] grants, which are read/write, and Landlock cannot deny
+/// a file inside a granted directory. Those two stay readable and writable
+/// whether this grant is made, omitted, or denied, unless Bubblewrap masks a
+/// user deny on them. Only `.npmrc` is governed by this grant there.
 pub const BUILD_CREDENTIAL_FILES: &[&str] =
     &[".npmrc", ".gradle/gradle.properties", ".m2/settings.xml"];
+
+/// The [`BUILD_CREDENTIAL_FILES`] a user deny (`deny`, canonical) covers
+/// that Landlock cannot withhold, for the Linux launch warning when
+/// Bubblewrap is not active: a read/write [`HOME_TOOL_DIRS`] grant covers
+/// their directory, so the deny does nothing for them.
+#[must_use]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn unenforced_build_credential_denies(home: &Path, deny: &[PathBuf]) -> Vec<PathBuf> {
+    [".gradle/gradle.properties", ".m2/settings.xml"]
+        .iter()
+        .map(|rel| home.join(rel))
+        .filter(|named| named.parent().is_some_and(Path::exists))
+        .filter(|named| {
+            let canon = std::fs::canonicalize(named).ok();
+            deny.iter()
+                .any(|d| named.starts_with(d) || canon.as_ref().is_some_and(|c| c.starts_with(d)))
+        })
+        .collect()
+}
 
 /// What `sandbox.allow_build_credentials` adds to `allow.read`, one entry per
 /// [`BUILD_CREDENTIAL_FILES`] file that exists.
 ///
 /// `Ok` is the canonical target, the form an `allow.read` grant arrives in, so
 /// both backends treat it exactly as the user typing the path. `Err` is the
-/// `$HOME` path of a file refused because it does not resolve to a plain file
-/// of its own: a symlink into a credential directory or onto another
-/// credential file, a directory, or a user-owned hardlink
-/// ([`first_party_read_target`]'s rules, with the file itself exempt from the
-/// [`DENIED_HOME_SUBPATHS`] check it would otherwise fail). The caller warns.
+/// `$HOME` path of a refused file and the reason, for the caller to warn
+/// with. A file is refused when:
+///
+/// - it does not resolve to a plain file of its own: a symlink into a
+///   credential directory or onto another credential file, a directory, or a
+///   user-owned hardlink ([`first_party_read_target`]'s rules, with the file
+///   itself exempt from the [`DENIED_HOME_SUBPATHS`] check it would otherwise
+///   fail);
+/// - its target is unsafe to interpolate into an SBPL profile
+///   ([`validate_sbpl_path`]). `Config::merge` checks every `allow.read` entry
+///   that way, but these are added after it ran;
+/// - resolving it fails for any reason other than absence (a symlink loop,
+///   an unreadable parent). Dropping it quietly would hide a grant the user
+///   asked for.
 ///
 /// A file covered by a user deny (`deny`, canonical like `deny.paths`) is left
 /// out without a word: the deny is the user's narrower statement, and on
@@ -290,19 +325,44 @@ pub const BUILD_CREDENTIAL_FILES: &[&str] =
 /// too; there is nothing to read, and Landlock cannot open a rule on a
 /// missing path.
 #[must_use]
-pub fn build_credential_grants(home: &Path, deny: &[PathBuf]) -> Vec<Result<PathBuf, PathBuf>> {
+pub fn build_credential_grants(
+    home: &Path,
+    deny: &[PathBuf],
+) -> Vec<Result<PathBuf, (PathBuf, String)>> {
     BUILD_CREDENTIAL_FILES
         .iter()
         .filter_map(|rel| {
             let named = home.join(rel);
-            let canon = std::fs::canonicalize(&named).ok()?;
+            let canon = match std::fs::canonicalize(&named) {
+                Ok(c) => c,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    return None;
+                }
+                Err(e) => return Some(Err((named, format!("it cannot be resolved ({e})")))),
+            };
             if deny
                 .iter()
                 .any(|d| named.starts_with(d) || canon.starts_with(d))
             {
                 return None;
             }
-            Some(read_target(home, &named, Some(rel)).ok_or(named))
+            let Some(target) = read_target(home, &named, Some(rel)) else {
+                return Some(Err((
+                    named,
+                    "it is a link into a credential directory or onto another credential \
+                     file, or not a plain file of its own"
+                        .to_string(),
+                )));
+            };
+            if let Err(e) = validate_sbpl_path(&target) {
+                return Some(Err((named, e.replace('\n', " "))));
+            }
+            Some(Ok(target))
         })
         .collect()
 }
@@ -3909,7 +3969,12 @@ mod tests {
         std::fs::write(h.join(".gradle/gradle.properties"), "gpr.key=t").unwrap();
         std::fs::write(h.join(".m2/settings.xml"), "<settings/>").unwrap();
         let npmrc = h.join(".npmrc");
-        let grants = |deny: &[PathBuf]| build_credential_grants(h, deny);
+        let grants = |deny: &[PathBuf]| -> Vec<Result<PathBuf, PathBuf>> {
+            build_credential_grants(h, deny)
+                .into_iter()
+                .map(|g| g.map_err(|(named, _)| named))
+                .collect()
+        };
 
         // Absent: nothing to grant, nothing to warn about.
         let all_but_npmrc = vec![
@@ -3946,6 +4011,48 @@ mod tests {
         std::fs::remove_file(&npmrc).unwrap();
         symlink(h.join("gone"), &npmrc).unwrap();
         assert_eq!(grants(&[]), all_but_npmrc, "dangling link");
+
+        // A target whose name would break out of an SBPL string literal is
+        // refused, not interpolated: these grants skip `Config::merge`.
+        std::fs::remove_file(&npmrc).unwrap();
+        let quoted = h.join("dotfiles/token\"file");
+        std::fs::write(&quoted, "t").unwrap();
+        symlink(&quoted, &npmrc).unwrap();
+        let (named, why) = build_credential_grants(h, &[]).remove(0).unwrap_err();
+        assert_eq!(named, npmrc);
+        assert!(why.contains("unsafe character"), "{why}");
+
+        // A resolution error other than absence is reported, not dropped.
+        std::fs::remove_file(&npmrc).unwrap();
+        symlink(&npmrc, &npmrc).unwrap();
+        let (named, why) = build_credential_grants(h, &[]).remove(0).unwrap_err();
+        assert_eq!(named, npmrc);
+        assert!(why.contains("cannot be resolved"), "{why}");
+    }
+
+    /// Linux without Bubblewrap: a deny on a credential file inside a
+    /// read/write tool dir is named for the launch warning, `~/.npmrc` is not
+    /// (Landlock withholds it by omission), and neither is a file whose tool
+    /// dir does not exist.
+    #[test]
+    fn unenforced_build_credential_denies_names_only_tool_dir_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let h = &std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(h.join(".m2")).unwrap();
+        let deny = [
+            h.join(".npmrc"),
+            h.join(".m2/settings.xml"),
+            h.join(".gradle/gradle.properties"),
+        ];
+        assert_eq!(
+            unenforced_build_credential_denies(h, &deny),
+            vec![h.join(".m2/settings.xml")]
+        );
+        assert_eq!(
+            unenforced_build_credential_denies(h, &[h.join(".m2")]),
+            vec![h.join(".m2/settings.xml")]
+        );
+        assert!(unenforced_build_credential_denies(h, &[h.join(".npmrc")]).is_empty());
     }
 
     /// The exemption is for the grant's own file only: without it every one

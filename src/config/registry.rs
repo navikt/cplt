@@ -435,7 +435,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: true,
         default_display: "false",
-        description: "\u{26a0}\u{fe0f}  DANGEROUS: Let the agent read ~/.npmrc, ~/.gradle/gradle.properties and ~/.m2/settings.xml (read-only, the files only). Exposes every registry token in them, not only the one the project uses.",
+        description: "\u{26a0}\u{fe0f}  DANGEROUS: Let the agent read ~/.npmrc, ~/.gradle/gradle.properties and ~/.m2/settings.xml (the files only; read-only on macOS, while Linux leaves the Maven and Gradle files read/write either way). Exposes every registry token in them, not only the one the project uses.",
     },
     ConfigKeyInfo {
         section: "sandbox",
