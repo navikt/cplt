@@ -1683,6 +1683,12 @@ impl Agent {
                     continue;
                 }
 
+                // A cplt PATH shim (#514) is not the agent: launching it would
+                // start cplt again inside the sandbox.
+                if crate::shim::skip_candidate(&candidate) {
+                    continue;
+                }
+
                 // Resolve mise/asdf shims to the real binary to avoid version conflicts
                 // when the project's .tool-versions specifies a different node version.
                 if let Some(real_bin) = resolve_mise_shim(&candidate, binary_name) {
@@ -1801,8 +1807,11 @@ impl Agent {
         // Same WSL interop rule as `resolve_binary`: a Windows-side copilot must
         // not win auto-detection over a working distro-side agent (#188).
         let wsl = cfg!(target_os = "linux") && is_wsl();
+        // A cplt PATH shim (#514) never counts as an installed agent.
         let usable = |resolved: &PathBuf| {
-            self_exe.as_ref() != Some(resolved) && !is_wsl_interop_binary(resolved, wsl)
+            self_exe.as_ref() != Some(resolved)
+                && !is_wsl_interop_binary(resolved, wsl)
+                && !crate::shim::skip_candidate(resolved)
         };
 
         let mut found_copilot = false;
@@ -4030,6 +4039,51 @@ mod tests {
                 "{agent:?} domains must be bare (no wildcard syntax)"
             );
         }
+    }
+
+    /// #514: a cplt PATH shim ahead of the real agent is skipped by both
+    /// resolvers. Without the skip cplt launches its own shim as the agent.
+    #[test]
+    fn resolvers_skip_the_cplt_path_shim_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = std::fs::canonicalize(tmp.path()).expect("canonical home");
+        let shims = home.join(crate::shim::SHIM_DIR);
+        let real_dir = home.join("real");
+        for (dir, body) in [
+            (&shims, crate::shim::script(Agent::OpenCode)),
+            (&real_dir, "#!/bin/sh\n".to_string()),
+        ] {
+            std::fs::create_dir_all(dir).expect("mkdir");
+            let f = dir.join("opencode");
+            std::fs::write(&f, body).expect("write");
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        let path = format!("{}:{}", shims.display(), real_dir.display());
+        temp_env::with_vars(
+            [
+                ("HOME", Some(home.as_os_str())),
+                ("PATH", Some(path.as_ref())),
+            ],
+            || {
+                assert_eq!(
+                    Agent::OpenCode.resolve_binary(),
+                    Ok(real_dir.join("opencode"))
+                );
+                assert_eq!(Agent::auto_detect(), Some(Agent::OpenCode));
+            },
+        );
+        // Only the shim: nothing is installed, and nothing may be detected.
+        temp_env::with_vars(
+            [
+                ("HOME", Some(home.as_os_str())),
+                ("PATH", Some(shims.as_os_str())),
+            ],
+            || {
+                assert!(Agent::OpenCode.resolve_binary().is_err());
+                assert_eq!(Agent::auto_detect(), None);
+            },
+        );
     }
 
     #[test]

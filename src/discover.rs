@@ -219,7 +219,7 @@ const AGENTS_TO_CHECK: &[(&str, &[&str], &[&str])] = &[
 /// `audit::GIT_TIMEOUT` and leaves a Node-based CLI room for a cold start on a
 /// loaded machine, while keeping doctor's worst case (every probed agent
 /// wedged) in the tens of seconds rather than forever.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Run `<path> <args>` and parse a version out of its stdout, giving up after
 /// [`PROBE_TIMEOUT`].
@@ -287,18 +287,46 @@ fn probe_version_within(
     timeout: Duration,
     read_grace: Duration,
 ) -> VersionProbe {
+    let buf = match run_probe(path, args, timeout, read_grace) {
+        Ok(buf) => buf,
+        Err(probe) => return probe,
+    };
+    // Parse "GitHub Copilot CLI 1.0.21." → "1.0.21": first token starting with
+    // a digit, trailing period trimmed.
+    buf.split_whitespace()
+        .find(|w| w.chars().next().is_some_and(|c| c.is_ascii_digit()))
+        .map_or(VersionProbe::Unknown, |v| {
+            VersionProbe::Version(v.trim_end_matches('.').to_string())
+        })
+}
+
+/// The raw stdout of `<path> <args>`, under the same bounds as
+/// [`probe_version`], with the timeout passed in. For callers that need the
+/// shape of the output rather than the version in it: the PATH shim sync
+/// tells Block's `goose` from pressly's migration tool this way (#514).
+pub fn probe_output(path: &Path, args: &[&str], timeout: Duration) -> Option<String> {
+    run_probe(path, args, timeout, READ_GRACE).ok()
+}
+
+/// Run the probe and return its stdout when it exited zero in time.
+fn run_probe(
+    path: &Path,
+    args: &[&str],
+    timeout: Duration,
+    read_grace: Duration,
+) -> Result<String, VersionProbe> {
     let Ok(mut child) = probe_command(path, args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
     else {
-        return VersionProbe::Unknown;
+        return Err(VersionProbe::Unknown);
     };
     let Some(mut stdout) = child.stdout.take() else {
         let _ = child.kill();
         let _ = child.wait();
-        return VersionProbe::Unknown;
+        return Err(VersionProbe::Unknown);
     };
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -318,11 +346,11 @@ fn probe_version_within(
                 let timed_out = matches!(outcome, Ok(None));
                 let _ = child.kill();
                 let _ = child.wait();
-                return if timed_out {
+                return Err(if timed_out {
                     VersionProbe::TimedOut
                 } else {
                     VersionProbe::Unknown
-                };
+                });
             }
         }
     };
@@ -330,19 +358,12 @@ fn probe_version_within(
     // The child is gone, so unless it left something else holding the write end
     // of the pipe the reader has already seen EOF and sent.
     let Ok(buf) = rx.recv_timeout(read_grace) else {
-        return VersionProbe::Unknown;
+        return Err(VersionProbe::Unknown);
     };
     if !status.success() {
-        return VersionProbe::Unknown;
+        return Err(VersionProbe::Unknown);
     }
-    // Parse "GitHub Copilot CLI 1.0.21." → "1.0.21": first token starting with
-    // a digit, trailing period trimmed.
-    String::from_utf8_lossy(&buf)
-        .split_whitespace()
-        .find(|w| w.chars().next().is_some_and(|c| c.is_ascii_digit()))
-        .map_or(VersionProbe::Unknown, |v| {
-            VersionProbe::Version(v.trim_end_matches('.').to_string())
-        })
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// Discover all available AI coding agents in PATH.
@@ -352,7 +373,7 @@ pub fn discover_agents() -> Vec<AgentInfo> {
         .filter_map(|(name, binaries, version_args)| {
             let (binary_name, path) = binaries
                 .iter()
-                .find_map(|binary| which_resolved(binary).map(|path| (*binary, path)))?;
+                .find_map(|binary| real_agent_binary(binary).map(|path| (*binary, path)))?;
             let version = probe_version(&path, version_args);
             Some(AgentInfo {
                 name,
@@ -1570,6 +1591,13 @@ fn find_app_contents(path: &Path) -> Option<PathBuf> {
 /// yourself when you want the target.
 pub fn which_on_path(name: &str) -> Option<PathBuf> {
     crate::sandbox::which_binary(name)
+}
+
+/// [`which_resolved`] for an agent: a cplt PATH shim is skipped, so the path
+/// shown is the real binary the shim stands in for (#514).
+fn real_agent_binary(name: &str) -> Option<PathBuf> {
+    let path = crate::shim::real_binary(name)?;
+    Some(std::fs::canonicalize(&path).unwrap_or(path))
 }
 
 fn which_resolved(name: &str) -> Option<PathBuf> {

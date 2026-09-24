@@ -596,6 +596,17 @@ The settings below are machine-specific or local CLI preferences, so `.cplt.toml
 | all `[proxy.subscriptions]` keys | subscription sources are security-sensitive, and a repo must not be able to add one |
 | all `[gh_guard]` keys | guard policy is configured globally, not per-repo |
 | all `[git_guard]` keys | guard policy is configured globally, not per-repo |
+| `shell.skip` | the PATH shims are shared by every repository on the machine; also refused in `config set --local` |
+
+### `shell.skip`
+
+Agents the PATH shim sync leaves out, by `--agent` name or command name. It only matters after `cplt --shell-install --shims` (see the README's "PATH shims" section). Adding an agent removes its shim at the next sync; removing it from the list brings the shim back (for `goose` and `pi`, which need a version check, at the next `cplt --shell-install --shims`).
+
+```bash
+cplt config set shell.skip goose     # your goose is pressly/goose, not Block's agent
+```
+
+An unknown name is an error rather than a silent no-op, so a typo cannot leave the shim you meant to remove in place.
 
 ### Removing values
 

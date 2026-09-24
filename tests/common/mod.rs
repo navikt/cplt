@@ -57,6 +57,19 @@ pub fn cplt_cmd() -> Command {
     cmd
 }
 
+/// A cplt PATH shim (#514) run directly, isolated the way [`cplt_cmd`] is: the
+/// shim execs `cplt`, which then reads no ambient config unless the test
+/// points `CPLT_CONFIG` somewhere itself. The environment is cleared, so the
+/// test supplies `HOME` and `PATH` and nothing else leaks in.
+#[must_use]
+pub fn shim_cmd(shim: &Path) -> Command {
+    let mut cmd = Command::new(shim);
+    cmd.env_clear()
+        .env("CPLT_CONFIG", NO_CONFIG)
+        .env("NO_COLOR", "1");
+    cmd
+}
+
 /// A `cplt` `Command` that reads the ambient `~/.config/cplt/config.toml`.
 ///
 /// Deliberately verbose: a test using this asserts something about config

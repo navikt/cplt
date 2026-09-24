@@ -303,7 +303,16 @@ pub fn resolve_path_entry_for_removal(value: &str, cwd: &Path) -> Result<String,
 /// meaningless here; anchoring to the repo instead would reintroduce the
 /// symlink-repointing hazard `resolve_repo_allow_path` exists to close, this
 /// time repointable by the agent between sessions rather than only by a commit.
+///
+/// Also refuses `[shell]`: the shim sync is machine-wide and reads only the
+/// global file, so a per-repo `shell.skip` would be accepted and then ignored.
 fn reject_relative_paths(config: &Config, display: &str) -> Result<(), ConfigError> {
+    if !config.shell.skip.is_empty() {
+        return Err(ConfigError::Validation(format!(
+            "{display}: shell.skip is machine-wide (the PATH shims are shared by every \
+             repository), so it belongs in the global config: cplt config set shell.skip <agent>"
+        )));
+    }
     for (key, values) in path_valued(config) {
         for value in values {
             // `~someone/repo` is not expanded by `expand_tilde`, so it would
@@ -542,6 +551,9 @@ impl Config {
                     protect_default_branch_only: _,
                     allow_push: _,
                 },
+            // Refused in a local file (`reject_relative_paths`), so there is
+            // nothing to overlay.
+            shell: _,
         } = local;
 
         let mut out = self.clone();

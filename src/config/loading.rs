@@ -150,6 +150,20 @@ impl Config {
         cli: CliFlags,
         no_proxy_env: Option<String>,
     ) -> Result<Resolved, ConfigError> {
+        // `shell.skip` names agents. A typo would be accepted and skip
+        // nothing, leaving the shim the user meant to remove in place.
+        if let Some(bad) = self.shell.skip.iter().find(|s| {
+            !crate::shim::shimmable()
+                .any(|a| a.binary_name() == s.as_str() || a.binary_names().contains(&s.as_str()))
+        }) {
+            let known: Vec<&str> = crate::shim::shimmable()
+                .flat_map(|a| a.binary_names().iter().copied())
+                .collect();
+            return Err(ConfigError::Validation(format!(
+                "shell.skip names {bad:?}, which is not a known cplt-shimmable agent (known: {})",
+                known.join(", ")
+            )));
+        }
         // Policy preset: sets a BASELINE spanning two axes — the five sandbox
         // toggles below AND the three safety features (gh_guard, git_guard,
         // proxy.forced). Precedence for the preset itself: CLI (--preset) wins

@@ -25,7 +25,7 @@ mod e2e_tests {
 
     use crate::common::{
         bare_origin_repo, binary_path, cplt_cmd, cplt_cmd_with_ambient_config, cplt_local, git_cmd,
-        git_ok, make_config_home, temp_repo,
+        git_ok, make_config_home, shim_cmd, temp_repo,
     };
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -2035,6 +2035,479 @@ mod e2e_tests {
         );
 
         let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    // ============================================================
+    // PATH shims (#514): opt-in, `--shell-install --shims`
+    // ============================================================
+
+    /// A fake agent under the checkout (exec is denied under /tmp), printing
+    /// each argument on its own line so the argv can be compared exactly.
+    fn fake_agent_dir(name: &str) -> tempfile::TempDir {
+        let dir = tempfile::Builder::new()
+            .prefix(".cplt-e2e-fake-copilot-")
+            .tempdir_in(project_dir())
+            .expect("create fake agent dir");
+        let script = dir.path().join(name);
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho REAL-AGENT\nfor arg in \"$@\"; do echo \"ARG:$arg\"; done\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        dir
+    }
+
+    /// Install the shims into a fresh HOME with `fake` on PATH, as a user would.
+    fn install_shims(home: &Path, fake: &Path) -> std::process::Output {
+        cplt_cmd()
+            .args(["--shell-install", "--shims"])
+            .env("HOME", home)
+            .env("SHELL", "/bin/zsh")
+            .env("PATH", format!("{}:/usr/bin:/bin", fake.display()))
+            .output()
+            .expect("binary should run")
+    }
+
+    fn shim_dir(home: &Path) -> PathBuf {
+        home.join(".local/share/cplt/bin")
+    }
+
+    /// Default off: neither the alias install, nor `--shell-setup`, nor a
+    /// launch creates the shim directory or touches a PATH rc file.
+    #[test]
+    fn e2e_shims_are_off_until_explicitly_installed() {
+        let home = tempfile::tempdir().unwrap();
+        let fake = fake_agent_dir("copilot");
+        let path = format!("{}:/usr/bin:/bin", fake.path().display());
+        for args in [
+            vec!["--shell-install"],
+            vec!["--shell-setup"],
+            vec!["--print-profile", "--agent", "copilot"],
+        ] {
+            let out = cplt_cmd()
+                .args(&args)
+                .env("HOME", home.path())
+                .env("SHELL", "/bin/zsh")
+                .env("PATH", &path)
+                .current_dir(project_dir())
+                .output()
+                .expect("binary should run");
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        assert!(
+            !shim_dir(home.path()).exists(),
+            "no shim dir without --shims"
+        );
+        for f in [".zshenv", ".zprofile", ".profile"] {
+            assert!(!home.path().join(f).exists(), "{f} must not be created");
+        }
+        let zshrc = std::fs::read_to_string(home.path().join(".zshrc")).unwrap();
+        assert!(
+            !zshrc.contains("# >>> cplt >>>"),
+            "no managed block: {zshrc}"
+        );
+    }
+
+    /// Install twice changes nothing the second time; uninstall restores every
+    /// file it touched byte for byte and removes every file it created; a
+    /// second uninstall is a no-op.
+    #[test]
+    fn e2e_shell_install_shims_is_idempotent_and_uninstall_is_exact() {
+        let home = tempfile::tempdir().unwrap();
+        let fake = fake_agent_dir("copilot");
+        let zshrc = home.path().join(".zshrc");
+        let profile = home.path().join(".profile");
+        let zshrc_before = "export EDITOR=vim\nalias ll='ls -l'\n";
+        let profile_before = "PATH=\"$HOME/bin:$PATH\"\n";
+        std::fs::write(&zshrc, zshrc_before).unwrap();
+        std::fs::write(&profile, profile_before).unwrap();
+
+        let first = install_shims(home.path(), fake.path());
+        assert!(
+            first.status.success(),
+            "{}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        let snapshot = |h: &Path| -> Vec<(PathBuf, Vec<u8>)> {
+            let mut files: Vec<(PathBuf, Vec<u8>)> = walk(h)
+                .into_iter()
+                .map(|p| {
+                    let bytes = std::fs::read(&p).unwrap();
+                    (p, bytes)
+                })
+                .collect();
+            files.sort();
+            files
+        };
+        let after_first = snapshot(home.path());
+        assert!(shim_dir(home.path()).join("copilot").is_file());
+        for f in [".zshenv", ".zprofile"] {
+            let c = std::fs::read_to_string(home.path().join(f)).unwrap();
+            assert!(
+                c.contains("export PATH=\"$HOME/.local/share/cplt/bin:$PATH\""),
+                "{f}: {c}"
+            );
+        }
+        assert!(home.path().join(".zshrc.cplt-backup").exists());
+        assert_eq!(
+            std::fs::read_to_string(home.path().join(".profile.cplt-backup")).unwrap(),
+            profile_before
+        );
+
+        // The block's single eval: every shimmed agent's alias, and nothing
+        // inside a sandbox.
+        let setup = |wrapped: bool| {
+            let mut cmd = cplt_cmd();
+            cmd.args(["--shell-setup", "--shims"])
+                .env("HOME", home.path())
+                .env("PATH", format!("{}:/usr/bin:/bin", fake.path().display()));
+            if wrapped {
+                cmd.env("__CPLT_WRAPPED", "1");
+            }
+            String::from_utf8_lossy(&cmd.output().unwrap().stdout).into_owned()
+        };
+        assert_eq!(setup(false), "alias copilot='cplt --agent copilot'\n");
+        assert_eq!(setup(true), "");
+
+        let second = install_shims(home.path(), fake.path());
+        assert!(second.status.success());
+        assert_eq!(
+            snapshot(home.path()),
+            after_first,
+            "a second install changes nothing"
+        );
+
+        let out = cplt_cmd()
+            .arg("--shell-uninstall")
+            .env("HOME", home.path())
+            .output()
+            .expect("binary should run");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(std::fs::read_to_string(&zshrc).unwrap(), zshrc_before);
+        assert_eq!(std::fs::read_to_string(&profile).unwrap(), profile_before);
+        let left: Vec<PathBuf> = walk(home.path());
+        assert_eq!(
+            left,
+            vec![profile.clone(), zshrc.clone()],
+            "only the user's files remain"
+        );
+        assert!(!home.path().join(".local").exists());
+
+        let again = cplt_cmd()
+            .arg("--shell-uninstall")
+            .env("HOME", home.path())
+            .output()
+            .expect("binary should run");
+        assert!(again.status.success());
+        assert_eq!(walk(home.path()), left);
+    }
+
+    /// Every file under `dir`, sorted.
+    fn walk(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    out.push(p);
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// The whole chain: shim → cplt → sandbox → the real agent, with the shim
+    /// directory first on PATH. cplt must skip its own shim when it resolves
+    /// the agent (without the skip it launches the shim inside the sandbox,
+    /// which refuses to loop and exits 126), and the arguments must arrive
+    /// exactly as typed, none of them read as a cplt flag.
+    #[test]
+    fn e2e_shim_runs_the_real_agent_with_args_intact() {
+        require_sandbox!();
+        let home = tempfile::tempdir().unwrap();
+        let fake = fake_agent_dir("copilot");
+        let out = install_shims(home.path(), fake.path());
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let config = home.path().join("config.toml");
+        std::fs::write(
+            &config,
+            "[sandbox]\nyes = true\nvalidate = false\nquiet = true\n",
+        )
+        .unwrap();
+        let cplt_dir = binary_path().parent().unwrap().to_path_buf();
+        let path = format!(
+            "{}:{}:{}:/usr/bin:/bin:/usr/sbin:/sbin",
+            shim_dir(home.path()).display(),
+            fake.path().display(),
+            cplt_dir.display()
+        );
+        let args = ["-p", "two words", "", "--yes", "--help", "$HOME"];
+        let run = shim_cmd(&shim_dir(home.path()).join("copilot"))
+            .args(args)
+            .env("HOME", home.path())
+            .env("PATH", &path)
+            .env("CPLT_CONFIG", &config)
+            .current_dir(project_dir())
+            .output()
+            .expect("shim should run");
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(run.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+        assert!(
+            stdout.contains("REAL-AGENT"),
+            "the real agent ran: {stdout}\n{stderr}"
+        );
+        let got: Vec<&str> = stdout
+            .lines()
+            .filter_map(|l| l.strip_prefix("ARG:"))
+            .collect();
+        assert_eq!(
+            got.iter()
+                .skip_while(|a| **a == "--no-auto-update")
+                .copied()
+                .collect::<Vec<_>>(),
+            args,
+            "args must pass through exactly: {got:?}"
+        );
+    }
+
+    /// `.zshenv` runs for every `zsh -c` the sandboxed agent spawns. Its PATH
+    /// line must not put the shim directory back there, or a tool call that
+    /// runs an agent by name hits the shim's loop guard (exit 126).
+    #[test]
+    fn e2e_zsh_in_the_sandbox_resolves_the_real_agent() {
+        require_sandbox!();
+        if !Path::new("/bin/zsh").exists() {
+            eprintln!("SKIP: no /bin/zsh");
+            return;
+        }
+        // Under the checkout, like the fake agent: exec is denied under the
+        // temp dir, and `command -v` skips a shim it could not exec, which
+        // would pass this test whatever `.zshenv` did.
+        let home = tempfile::Builder::new()
+            .prefix(".cplt-e2e-home-")
+            .tempdir_in(project_dir())
+            .unwrap();
+        let fake = fake_agent_dir("copilot");
+        let out = install_shims(home.path(), fake.path());
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let zshenv = std::fs::read_to_string(home.path().join(".zshenv")).unwrap();
+        assert!(zshenv.contains(".local/share/cplt/bin"), "{zshenv}");
+        let out = cplt_cmd()
+            .args(["--no-validate", "exec", "--", "/bin/zsh", "-c"])
+            .arg("command -v copilot")
+            .env("HOME", home.path())
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}:/usr/bin:/bin",
+                    shim_dir(home.path()).display(),
+                    fake.path().display()
+                ),
+            )
+            .current_dir(project_dir())
+            .output()
+            .expect("cplt exec should run");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            stdout.trim(),
+            fake.path().join("copilot").display().to_string(),
+            "stderr: {stderr}"
+        );
+    }
+
+    /// cplt missing: the shim fails loudly with 127 and never runs the agent
+    /// unsandboxed.
+    #[test]
+    fn e2e_shim_without_cplt_fails_loudly() {
+        let home = tempfile::tempdir().unwrap();
+        let fake = fake_agent_dir("copilot");
+        assert!(install_shims(home.path(), fake.path()).status.success());
+        let run = shim_cmd(&shim_dir(home.path()).join("copilot"))
+            .arg("-p")
+            .env("HOME", home.path())
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}:/usr/bin:/bin",
+                    shim_dir(home.path()).display(),
+                    fake.path().display()
+                ),
+            )
+            .output()
+            .expect("shim should run");
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert_eq!(run.status.code(), Some(127), "stderr: {stderr}");
+        assert!(stderr.contains("cplt is not installed"), "{stderr}");
+        assert!(!String::from_utf8_lossy(&run.stdout).contains("REAL-AGENT"));
+    }
+
+    /// Loop guard: a shim reached from inside a cplt sandbox refuses instead of
+    /// starting cplt within itself, and does not fall through to the agent.
+    #[test]
+    fn e2e_shim_refuses_to_loop_inside_a_sandbox() {
+        let home = tempfile::tempdir().unwrap();
+        let fake = fake_agent_dir("copilot");
+        assert!(install_shims(home.path(), fake.path()).status.success());
+        let cplt_dir = binary_path().parent().unwrap().to_path_buf();
+        let run = shim_cmd(&shim_dir(home.path()).join("copilot"))
+            .env("HOME", home.path())
+            .env("__CPLT_WRAPPED", "1")
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}:{}:/usr/bin:/bin",
+                    shim_dir(home.path()).display(),
+                    fake.path().display(),
+                    cplt_dir.display()
+                ),
+            )
+            .output()
+            .expect("shim should run");
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert_eq!(run.status.code(), Some(126), "stderr: {stderr}");
+        assert!(
+            stderr.contains("refusing to start cplt inside itself"),
+            "{stderr}"
+        );
+        assert!(!String::from_utf8_lossy(&run.stdout).contains("REAL-AGENT"));
+    }
+
+    /// `cplt doctor` blocks when the shims are installed but their directory is
+    /// not on PATH, and warns per shim when something shadows it.
+    #[test]
+    fn e2e_doctor_reports_unreachable_and_shadowed_shims() {
+        let home = tempfile::tempdir().unwrap();
+        let fake = fake_agent_dir("copilot");
+        assert!(install_shims(home.path(), fake.path()).status.success());
+        let doctor = |path: String| {
+            let out = cplt_cmd()
+                .args(["--agent", "copilot", "doctor"])
+                .env("HOME", home.path())
+                .env("PATH", path)
+                .current_dir(project_dir())
+                .output()
+                .expect("binary should run");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let off = doctor(format!("{}:/usr/bin:/bin", fake.path().display()));
+        assert!(off.contains("it is not on PATH"), "{off}");
+        let shadowed = doctor(format!(
+            "{}:{}:/usr/bin:/bin",
+            fake.path().display(),
+            shim_dir(home.path()).display()
+        ));
+        assert!(shadowed.contains("before the cplt shim"), "{shadowed}");
+        let first = doctor(format!(
+            "{}:{}:/usr/bin:/bin",
+            shim_dir(home.path()).display(),
+            fake.path().display()
+        ));
+        assert!(first.contains("shim copilot →"), "{first}");
+    }
+
+    /// #514 review: `cplt doctor` runs no `goose --version` on the host. A
+    /// `goose` that turned up after the install is reported as not yet
+    /// vetted, and only the explicit install probes it.
+    #[test]
+    fn e2e_doctor_does_not_probe_an_unvetted_agent() {
+        let home = tempfile::tempdir().unwrap();
+        let fake = fake_agent_dir("copilot");
+        assert!(install_shims(home.path(), fake.path()).status.success());
+        let ran = home.path().join("probe-ran");
+        let goose = fake.path().join("goose");
+        std::fs::write(
+            &goose,
+            format!(
+                "#!/bin/sh\necho x >> '{}'\necho 'goose 1.15.0'\n",
+                ran.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&goose, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = cplt_cmd()
+            .args(["--agent", "copilot", "doctor"])
+            .env("HOME", home.path())
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}:/usr/bin:/bin",
+                    shim_dir(home.path()).display(),
+                    fake.path().display()
+                ),
+            )
+            .current_dir(project_dir())
+            .output()
+            .expect("binary should run");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!ran.exists(), "doctor ran goose --version on the host");
+        assert!(!shim_dir(home.path()).join("goose").exists());
+        assert!(stdout.contains("not yet vetted"), "{stdout}");
+        assert!(install_shims(home.path(), fake.path()).status.success());
+        assert!(ran.exists(), "the install probes it");
+        assert!(shim_dir(home.path()).join("goose").exists());
+    }
+
+    /// The shim directory is not writable from inside the sandbox, not even
+    /// under an `--allow-write` on an ancestor, and the ancestors inside that
+    /// grant cannot be renamed away to plant a fresh directory. A sibling in
+    /// the same grant stays writable, so the grant itself is in force.
+    #[test]
+    fn e2e_shim_dir_is_not_writable_in_the_sandbox() {
+        require_sandbox!();
+        let home = tempfile::tempdir().unwrap();
+        let fake = fake_agent_dir("copilot");
+        assert!(install_shims(home.path(), fake.path()).status.success());
+        let local = home.path().join(".local");
+        let script = "echo pwned > \"$HOME/.local/share/cplt/bin/copilot\" && echo WROTE-SHIM; \
+                      echo x > \"$HOME/.local/share/cplt/bin/new\" && echo CREATED-SHIM; \
+                      mv \"$HOME/.local/share/cplt\" \"$HOME/.local/share/cplt.old\" && echo MOVED; \
+                      echo ok > \"$HOME/.local/sibling\" && echo WROTE-SIBLING";
+        let out = cplt_cmd()
+            .args(["--no-validate", "--allow-write"])
+            .arg(&local)
+            .args(["exec", "--", "/bin/sh", "-c", script])
+            .env("HOME", home.path())
+            .current_dir(project_dir())
+            .output()
+            .expect("cplt exec should run");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stdout.contains("WROTE-SIBLING"),
+            "the ancestor grant must be in force: {stdout}\n{stderr}"
+        );
+        for bad in ["WROTE-SHIM", "CREATED-SHIM", "MOVED"] {
+            assert!(!stdout.contains(bad), "{bad}: {stdout}\n{stderr}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(shim_dir(home.path()).join("copilot")).unwrap(),
+            cplt::shim::script(cplt::agent::Agent::Copilot)
+        );
     }
 
     /// The pin in each alias is not overridable. `--agent` is not a repeatable

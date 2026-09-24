@@ -520,6 +520,8 @@ fn candidates(dotted: &str, ty: cplt::config::ConfigValueType, s: &Scratch) -> V
         // validates the spelling, and the fallback candidate's hyphen is not
         // in `[A-Za-z0-9_]`.
         "deny.env" => vec!["CPLT_GOLDEN".into()],
+        // Agent names: `shell.skip` refuses anything cplt does not shim.
+        "shell.skip" => vec!["goose".into()],
         _ => match ty {
             // Both sides. `sandbox.scratch_dir = false` takes both guards to
             // `inactive` and `proxy.enabled = false` removes the proxy — the

@@ -9182,6 +9182,9 @@ mode = "warn"
 prevent_push = true
 prevent_force_push = true
 protect_default_branch_only = false
+
+[shell]
+skip = ["goose"]
 "#;
 
     // Parse the fixture so coverage is checked per-section, not by a bare
