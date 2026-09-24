@@ -841,6 +841,11 @@ cplt config set sandbox.deny_copilot_dir_exec true
 
 With the key on, `~/.copilot` stays readable and writable and loses execute, under Landlock and under Bubblewrap. Off by default for now, because anything you have set up to run as a program stored under `~/.copilot` stops working: a plugin, MCP server, LSP server or hook whose command is a path in there. Commands started through an interpreter (`node ~/.copilot/...`, `bash ~/.copilot/...`) keep working, because the interpreter is what gets executed.
 
+Two set-ups keep some execute, and the launch warns about each instead of staying silent. Landlock adds up every rule that applies to a path, so another rule that grants execute gives it back:
+
+- **`~/.copilot` is a symlink into a tree that is granted execute** (the project, `~/.local/bin`, Copilot's cache). Everything in it stays executable through that tree's grant, so the key cannot take effect. The warning names the tree. Point `~/.copilot` at a directory outside every executable grant.
+- **Copilot is installed inside `~/.copilot`.** Copilot's install directory is always granted execute, or Copilot could not start. That directory and everything below it stay executable; the rest of `~/.copilot` does not. The warning names the directory.
+
 It has no effect on macOS, where the profile is unchanged and the launch warns that the key was ignored. The trace was done on Linux only.
 
 ## Configuration file

@@ -3607,6 +3607,7 @@ mod tests {
             allow_gpg_signing: false,
             deny_clipboard: false,
             deny_nested_git: false,
+            deny_copilot_dir_exec: false,
             allow_jvm_attach: false,
             allow_msbuild: false,
             allow_docker: false,

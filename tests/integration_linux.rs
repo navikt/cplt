@@ -2310,6 +2310,82 @@ print('CONNECTED')
         }
     }
 
+    /// #324 review: `~/.copilot` linked into the project, which is granted
+    /// execute. What it holds stays executable through the project's grant
+    /// (Landlock adds the rules together), so the key cannot take effect, and
+    /// the launch says so instead of staying silent. Under both backends.
+    #[test]
+    fn deny_copilot_dir_exec_warns_when_dot_copilot_links_into_an_exec_tree() {
+        require_landlock!();
+        use std::os::unix::fs::PermissionsExt;
+
+        let project = create_test_project();
+        let home = tempfile::tempdir().expect("Failed to create temp home");
+        fs::create_dir_all(home.path().join(".cache/copilot/pkg/universal/1.0.63")).unwrap();
+        let target = project.path().join("copilot-cfg");
+        fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, home.path().join(".copilot")).unwrap();
+        let probe = target.join("probe");
+        fs::write(&probe, "#!/bin/sh\necho PROBE_RAN\n").unwrap();
+        fs::set_permissions(&probe, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let bin_dir = project.path().join(".fake-bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let fake_copilot = bin_dir.join("copilot");
+        fs::write(
+            &fake_copilot,
+            format!("#!/bin/sh\n\"{}\" || echo EXEC_REFUSED\n", probe.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&fake_copilot, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin_dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+
+        let backends: &[bool] = if bwrap_available() {
+            &[false, true]
+        } else {
+            &[false]
+        };
+        for &bwrap in backends {
+            let cfg = tempfile::tempdir().unwrap();
+            let cfg_file = cfg.path().join("config.toml");
+            fs::write(
+                &cfg_file,
+                format!("[sandbox]\ndeny_copilot_dir_exec = true\nuse_bubblewrap = {bwrap}\n"),
+            )
+            .unwrap();
+            let out = cplt_cmd()
+                .args([
+                    "--yes",
+                    "--no-validate",
+                    "--quiet",
+                    "--agent",
+                    "copilot",
+                    "--project-dir",
+                    &project.path().to_string_lossy(),
+                ])
+                .env("HOME", home.path())
+                .env("PATH", &path)
+                .env("CPLT_CONFIG", &cfg_file)
+                .output()
+                .expect("Failed to execute cplt");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.contains("sandbox.deny_copilot_dir_exec cannot take effect"),
+                "bwrap={bwrap}: the residual must be warned: {stderr}"
+            );
+            assert!(
+                stdout.contains("PROBE_RAN"),
+                "bwrap={bwrap}: the residual is real, execute comes back through the \
+                 project rule. stdout: {stdout}\nstderr: {stderr}"
+            );
+        }
+    }
+
     // ── Bubblewrap namespace isolation ─────────────────────────────
     //
     // These tests verify the optional Bubblewrap layer on top of Landlock +

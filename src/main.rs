@@ -5449,6 +5449,7 @@ fn build_sandbox_config<'a>(
         allow_gpg_signing: resolved.allow_gpg_signing,
         deny_clipboard: resolved.deny_clipboard,
         deny_nested_git: resolved.deny_nested_git,
+        deny_copilot_dir_exec: resolved.deny_copilot_dir_exec,
         allow_jvm_attach: resolved.allow_jvm_attach,
         allow_msbuild: resolved.allow_msbuild,
         allow_docker: resolved.allow_docker,

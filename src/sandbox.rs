@@ -209,6 +209,10 @@ pub struct SandboxConfig<'a> {
     /// `sandbox.deny_nested_git` (#576): deny creating a `.git` entry below a
     /// writable root. macOS only; Linux has no way to express it.
     pub deny_nested_git: bool,
+    /// `sandbox.deny_copilot_dir_exec` (#324). The grant itself is withdrawn
+    /// in `agent_dirs` before this config is built; the flag is here so the
+    /// Linux launch can warn about what Landlock unions back in.
+    pub deny_copilot_dir_exec: bool,
     /// Allow JVM Attach API unix sockets in /tmp (.java_pid* pattern only).
     pub allow_jvm_attach: bool,
     /// Allow MSBuild worker-node unix sockets in /tmp (MSBuild<pid> pattern only).
@@ -1763,6 +1767,20 @@ fn prepare_impl(
     let mut policy = landlock_mod::generate_policy(config);
     let mut profile_text = landlock_mod::describe_policy(&policy);
 
+    // A withdrawn grant another rule quietly gives back is said out loud
+    // (#324). Resolved the way `canonicalize_agent_dirs` resolves the rule.
+    if config.deny_copilot_dir_exec && config.agent.needs_copilot_dir() {
+        let copilot = config.home_dir.join(".copilot");
+        let copilot = std::fs::canonicalize(&copilot).unwrap_or(copilot);
+        for w in landlock_mod::copilot_dir_exec_residuals(
+            &policy.fs_rules,
+            &copilot,
+            config.copilot_install_dir,
+        ) {
+            ui::warn(&w);
+        }
+    }
+
     // Repositories nested inside a writable root, found once and given to BOTH
     // path sets. The leaf binds and the rename pins have to see the same list:
     // a read-only bind pins content, not the name, so a nested `.git` that is
@@ -2299,6 +2317,7 @@ mod tests {
             allow_gpg_signing: false,
             deny_clipboard: false,
             deny_nested_git: false,
+            deny_copilot_dir_exec: false,
             allow_jvm_attach: false,
             allow_msbuild: false,
             allow_docker: false,
