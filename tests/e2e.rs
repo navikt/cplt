@@ -6833,9 +6833,11 @@ paths = [
 
     // ── #576: a .git planted below the project is reported at session end ──
 
-    /// A git project with an existing nested repository `keep/` and a nested
-    /// worktree-style `wt/.git` pointer file, plus a scratch HOME. Built in the
-    /// checkout, not `/tmp`, where the sandbox denies exec.
+    /// A git project with an existing nested repository `keep/`, a nested
+    /// worktree-style `wt/.git` pointer file to the bare `e0` (which has a
+    /// `pre-commit` hook), a `cw/` whose `commondir` names the bare `c0`, and
+    /// a repository `evil` beside the project, outside it. Plus a scratch
+    /// HOME. Built in the checkout, not `/tmp`, where the sandbox denies exec.
     fn nested_git_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let tmp = tempfile::Builder::new()
             .prefix(".cplt-e2e-nested-git-")
@@ -6850,6 +6852,12 @@ paths = [
         assert!(git_ok(&project.join("keep"), &["init", "-q", "-b", "main"]));
         assert!(git_ok(&project, &["init", "-q", "--bare", "e0"]));
         std::fs::write(project.join("wt/.git"), "gitdir: ../e0\n").unwrap();
+        std::fs::write(project.join("e0/hooks/pre-commit"), "#!/bin/sh\ntrue\n").unwrap();
+        assert!(git_ok(&project, &["init", "-q", "--bare", "c0"]));
+        std::fs::create_dir_all(project.join("cw")).unwrap();
+        std::fs::write(project.join("cw/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(project.join("cw/commondir"), "../c0\n").unwrap();
+        assert!(git_ok(&root, &["init", "-q", "-b", "main", "evil"]));
         (tmp, project, home)
     }
 
@@ -6883,8 +6891,32 @@ paths = [
              ln -s ../e s4/.GIT && \
              mkdir -p s5/objects s5/refs && echo 'ref: refs/heads/main' > s5/HEAD && \
              printf '[core]\\n\\tfsmonitor = x\\n' > s5/config && \
+             mkdir -p sp cm/objects cm/refs && echo 'ref: refs/heads/main' > sp/HEAD && \
+             echo ../cm > sp/commondir && printf '[core]\\n\\tfsmonitor = x\\n' > cm/config && \
+             mkdir -p hl/objects hl/refs && ln -s refs/heads/main hl/HEAD && \
+             printf '[core]\\n\\tfsmonitor = x\\n' > hl/config && ln -s ../evil tools && \
              printf '[core]\\n\\tfsmonitor = x\\n' >> e0/config && echo x > keep/file",
         );
+        // Git itself takes `sp` (a commondir split) and `hl` (HEAD a dangling
+        // symlink) as git directories, with no `.git` in sight. Without that,
+        // reporting them would prove nothing.
+        for dir in ["sp", "hl"] {
+            let out = git_cmd(&project.join(dir))
+                .args([
+                    "-c",
+                    "core.fsmonitor=false",
+                    "rev-parse",
+                    "--absolute-git-dir",
+                ])
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                project.join(dir).display().to_string(),
+                "git should take {dir} as a gitdir: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
         // On a case-insensitive volume (the macOS default) git really does
         // use `s4/.GIT`, which is what makes it a plant worth reporting.
         let case_insensitive = project.join("s4/.git").exists();
@@ -6910,6 +6942,11 @@ paths = [
             ("new", "s3"),
             // A bare-repository layout needs no `.git` at all.
             ("new", "s5"),
+            // #576 review: a commondir split, a dangling `HEAD` symlink, and a
+            // symlink to a repository outside the project.
+            ("new", "sp"),
+            ("new", "hl"),
+            ("new", "tools"),
             ("new", "e"),
             ("changed", "wt"),
         ]
@@ -6923,6 +6960,27 @@ paths = [
             !stderr.contains(&project.join("keep").display().to_string()),
             "an untouched nested repository was reported: {stderr}"
         );
+    }
+
+    /// #576 review: a hook rewritten with the same length and its mtime put
+    /// back, and a config change reached only through `commondir`, are each
+    /// reported. `e0/hooks` is not spelled `.git/hooks`, so the profile lets
+    /// the session write it.
+    #[test]
+    fn e2e_nested_git_hook_and_commondir_changes_are_reported() {
+        require_sandbox!();
+        let (_tmp, project, home) = nested_git_fixture();
+        let stderr = exec_session(
+            &project,
+            &home,
+            "cp -p e0/hooks/pre-commit ref && printf '#!/bin/sh\\nevil\\n' > e0/hooks/pre-commit && \
+             touch -r ref e0/hooks/pre-commit && rm ref && \
+             printf '[core]\\n\\tfsmonitor = x\\n' >> c0/config",
+        );
+        for dir in ["wt", "cw"] {
+            let line = format!("changed: {}", project.join(dir).display());
+            assert!(stderr.contains(&line), "missing `{line}`: {stderr}");
+        }
     }
 
     /// Ordinary work inside existing nested repositories reports nothing.
@@ -6950,8 +7008,29 @@ paths = [
         }
         let stderr = exec_session(&project, &home, "true");
         assert!(
-            stderr.contains("Stopped checking for new .git entries"),
-            "hitting the walk bound was not reported: {stderr}"
+            stderr.contains("Stopped checking for new .git entries")
+                && !stderr.contains("this session created enough directories"),
+            "a bound already hit at launch is a warning: {stderr}"
+        );
+    }
+
+    /// #576 review: a session that creates the directories that push the walk
+    /// over its bound is told so as an error, not the launch-time warning.
+    #[test]
+    fn e2e_nested_git_walk_bound_hit_by_the_session_is_an_error() {
+        require_sandbox!();
+        let (_tmp, project, home) = nested_git_fixture();
+        let stderr = exec_session(
+            &project,
+            &home,
+            &format!(
+                "mkdir many && cd many && seq -f 'd%05g' 0 {} | xargs mkdir",
+                cplt_nested_scan_limit()
+            ),
+        );
+        assert!(
+            stderr.contains("this session created enough directories"),
+            "a bound the session hit must be reported as its doing: {stderr}"
         );
     }
 
