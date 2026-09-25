@@ -2665,6 +2665,71 @@ print('CONNECTED')
         );
     }
 
+    /// A policy larger than the 64 KiB pipe buffer must still reach the
+    /// re-entry helper. Before #587 the parent wrote the whole policy before
+    /// spawning bwrap, so anything over 60 KB was refused at startup (and an
+    /// ungated write would have blocked forever). Strict mode, so a transfer
+    /// failure is a hard error instead of a silent fallback.
+    #[test]
+    fn bwrap_policy_larger_than_pipe_buffer_launches_confined() {
+        require_bwrap!();
+        let project = create_test_project();
+        let fake_home = create_fake_home_with_secrets();
+
+        // Each rule opens a descriptor while the policy is applied, and ~1000
+        // rules already exhaust a soft limit of 1024. Raise it to the hard one.
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        unsafe {
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut lim), 0);
+            lim.rlim_cur = lim.rlim_max;
+            assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &raw const lim), 0);
+        }
+
+        // ~133 B of serialized policy per rule: 700 rules is well past 64 KiB.
+        let grants = tempfile::tempdir().expect("grant dir");
+        let dirs: Vec<String> = (0..700)
+            .map(|i| {
+                let d = grants.path().join(format!("read-grant-{i:04}"));
+                fs::create_dir(&d).unwrap();
+                d.to_string_lossy().into_owned()
+            })
+            .collect();
+        let mut flags: Vec<&str> = vec!["--use-bubblewrap"];
+        for d in &dirs {
+            flags.extend_from_slice(&["--allow-read", d]);
+        }
+
+        let host_userns = fs::read_link("/proc/self/ns/user").expect("host user ns");
+        let (exit, stdout, stderr) = run_sandboxed_home_with_flags(
+            project.path(),
+            fake_home.path(),
+            &flags,
+            "readlink /proc/self/ns/user; cat ~/.ssh/secret 2>/dev/null || echo SECRET_DENIED",
+        );
+
+        assert_eq!(
+            exit, 0,
+            "a >64 KiB policy must launch under strict bwrap — stdout: {stdout}\nstderr: {stderr}"
+        );
+        let inner_userns = stdout.lines().next().unwrap_or_default();
+        assert!(
+            inner_userns.starts_with("user:["),
+            "expected a user namespace link, got {inner_userns:?} — stderr: {stderr}"
+        );
+        assert_ne!(
+            inner_userns,
+            host_userns.to_string_lossy(),
+            "the agent must run in a new user namespace"
+        );
+        assert!(
+            stdout.contains("SECRET_DENIED") && !stdout.contains("sensitive-data"),
+            "~/.ssh must stay denied with a large policy — stdout: {stdout}"
+        );
+    }
+
     #[test]
     fn bwrap_preserves_environment_variables() {
         require_bwrap!();
