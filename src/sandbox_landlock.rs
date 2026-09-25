@@ -463,6 +463,55 @@ pub fn credential_links(home: &Path, rules: &[FsRule]) -> Vec<CredentialLink> {
     out
 }
 
+/// What `sandbox.deny_copilot_dir_exec` cannot withdraw (#324), as launch
+/// warnings. Landlock adds up every rule on a path, so another rule that
+/// grants execute puts it back:
+///
+/// - over the resolved `~/.copilot` (it is a symlink into `~/.local/bin`, the
+///   project, a cache): all of `~/.copilot` stays executable and the key does
+///   nothing;
+/// - inside it (Copilot installed under `~/.copilot`): that subtree stays
+///   executable, and has to, or Copilot cannot start.
+///
+/// `copilot` is the canonical `~/.copilot`, as the agent-dir rule carries it.
+#[must_use]
+#[cfg(target_os = "linux")]
+pub fn copilot_dir_exec_residuals(
+    rules: &[FsRule],
+    copilot: &Path,
+    install_dir: Option<&Path>,
+) -> Vec<String> {
+    rules
+        .iter()
+        .filter(|r| r.access.execute)
+        .filter_map(|r| {
+            if copilot.starts_with(&r.path) {
+                Some(format!(
+                    "sandbox.deny_copilot_dir_exec cannot take effect: ~/.copilot resolves \
+                     to {}, inside {}, which is granted execute. Landlock adds the rules \
+                     together, so everything in ~/.copilot stays executable through that \
+                     grant. Point ~/.copilot at a directory outside every executable grant.",
+                    copilot.display(),
+                    r.path.display()
+                ))
+            } else if r.path.starts_with(copilot) {
+                let why = if install_dir == Some(r.path.as_path()) {
+                    "Copilot is installed there and cannot start without it"
+                } else {
+                    "it has an execute grant of its own"
+                };
+                Some(format!(
+                    "sandbox.deny_copilot_dir_exec: {} stays executable, and everything \
+                     below it: {why}. The rest of ~/.copilot is not executable.",
+                    r.path.display()
+                ))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     let mut fs_rules = Vec::new();
     let home = config.home_dir;
@@ -1040,6 +1089,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         // and is emitted by the agent_dirs loop below, execute included — that
         // execve grant is carried over from the rule this replaced, not
         // required by the .node addons, which dlopen with READ_FILE (#243).
+        // `sandbox.deny_copilot_dir_exec` withdraws it (#324).
         //
         // Copilot SEA cache — auto-updaters download newer versions here.
         // Execute is required for Node to spawn the newer ripgrep / helpers.
@@ -2565,6 +2615,7 @@ mod tests {
             allow_gpg_signing: false,
             deny_clipboard: false,
             deny_nested_git: false,
+            deny_copilot_dir_exec: false,
             allow_jvm_attach: false,
             allow_msbuild: false,
             allow_docker: false,
@@ -4685,8 +4736,112 @@ mod tests {
             rule.access.execute,
             ".copilot keeps the execve grant the hand-written rule carried. NOT \
              for the .node addons — Landlock EXECUTE is execve-only and dlopen \
-             needs READ_FILE (#243). #324 asks whether it is needed at all"
+             needs READ_FILE (#243). `sandbox.deny_copilot_dir_exec` drops it (#324)"
         );
+    }
+
+    /// `sandbox.deny_copilot_dir_exec` (#324): with the key the `.copilot` rule
+    /// loses execute and keeps read and write; every other rule is unchanged.
+    #[test]
+    fn deny_copilot_dir_exec_drops_only_execute_on_dot_copilot() {
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        // No `~/.copilot` entry: reported, so a relocated dir is not silent.
+        let mut claude_dirs = crate::agent::Agent::Claude.config_dirs(&home);
+        assert!(!crate::agent::deny_copilot_dir_exec(
+            &mut claude_dirs,
+            &home
+        ));
+        let rules = |deny: bool| {
+            let mut agent_dirs = crate::agent::Agent::Copilot.config_dirs(&home);
+            if deny {
+                assert!(crate::agent::deny_copilot_dir_exec(&mut agent_dirs, &home));
+            }
+            let mut config = test_config(&project, &home);
+            config.agent_dirs = &agent_dirs;
+            generate_policy(&config).fs_rules
+        };
+        let (off, on) = (rules(false), rules(true));
+        assert_eq!(off.len(), on.len());
+        let dot_copilot = home.join(".copilot");
+        for (a, b) in off.iter().zip(&on) {
+            assert_eq!(a.path, b.path);
+            if a.path == dot_copilot {
+                assert!(a.access.execute, "key off keeps execute");
+                assert!(!b.access.execute, "key on drops execute");
+                assert!(b.access.read && b.access.write, "read and write stay");
+                let restored = FsAccess {
+                    execute: true,
+                    ..b.access
+                };
+                assert_eq!(a.access, restored, "only execute differs");
+            } else {
+                assert_eq!(a.access, b.access, "{} must not change", a.path.display());
+            }
+        }
+        assert!(on.iter().any(|r| r.path == dot_copilot));
+    }
+
+    /// Rules for Copilot with the key on and `~/.copilot` resolved to `copilot`,
+    /// as `canonicalize_agent_dirs` would leave it.
+    #[cfg(target_os = "linux")]
+    fn copilot_rules_with_key(
+        project: &Path,
+        home: &Path,
+        copilot: &Path,
+        install_dir: Option<&Path>,
+    ) -> Vec<FsRule> {
+        let mut dirs = crate::agent::Agent::Copilot.config_dirs(home);
+        assert!(crate::agent::deny_copilot_dir_exec(&mut dirs, home));
+        dirs[0].path = copilot.to_path_buf();
+        let mut config = test_config(project, home);
+        config.agent_dirs = &dirs;
+        config.copilot_install_dir = install_dir;
+        generate_policy(&config).fs_rules
+    }
+
+    /// #324 review: a `~/.copilot` that resolves into a tree granted execute
+    /// (here the project) gets execute back through Landlock's union, so the
+    /// key cannot take effect. That is warned, naming the rule; the ordinary
+    /// layout warns nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn copilot_dir_exec_residual_when_dot_copilot_links_into_an_exec_tree() {
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+
+        let plain = home.join(".copilot");
+        let rules = copilot_rules_with_key(&project, &home, &plain, None);
+        assert!(copilot_dir_exec_residuals(&rules, &plain, None).is_empty());
+
+        let linked = project.join("dotfiles/copilot");
+        let rules = copilot_rules_with_key(&project, &home, &linked, None);
+        let w = copilot_dir_exec_residuals(&rules, &linked, None);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("cannot take effect"), "{w:?}");
+        assert!(w[0].contains("inside /home/user/project,"), "{w:?}");
+    }
+
+    /// #324 review: Copilot installed under `~/.copilot` keeps its install
+    /// dir's execute grant, which it cannot start without. Warned, naming
+    /// exactly that dir; the rest of `~/.copilot` is not executable.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn copilot_dir_exec_residual_when_copilot_is_installed_inside_it() {
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let copilot = home.join(".copilot");
+        let install = copilot.join("install/bin");
+
+        let rules = copilot_rules_with_key(&project, &home, &copilot, Some(&install));
+        let w = copilot_dir_exec_residuals(&rules, &copilot, Some(&install));
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].contains("/home/user/.copilot/install/bin stays executable"),
+            "{w:?}"
+        );
+        assert!(w[0].contains("Copilot is installed there"), "{w:?}");
+        assert!(!w[0].contains("cannot take effect"), "{w:?}");
     }
 
     #[test]

@@ -700,6 +700,7 @@ The settings below are machine-specific or local CLI preferences, so `.cplt.toml
 | `sandbox.gradle_init` | writes to the machine's Gradle user home, not project policy |
 | `sandbox.deny_nested_git` | a staged hardening switch, see [Blocking new nested `.git` entries](#blocking-new-nested-git-entries-sandboxdeny_nested_git) |
 | `sandbox.refuse_invalid_repo_config` | decides how a repo's own broken config is treated, so the repo cannot set it; see [Refusing an invalid `.cplt.toml`](#refusing-an-invalid-cplttoml-sandboxrefuse_invalid_repo_config) |
+| `sandbox.deny_copilot_dir_exec` | a staged hardening switch, see [No execute on `~/.copilot`](#no-execute-on-copilot-sandboxdeny_copilot_dir_exec) |
 | `sandbox.inherit_env` | too dangerous for repo config, it would affect every team member |
 | `sandbox.allow_build_credentials` | hands the agent the user's own registry tokens from `$HOME`, and a repo cannot grant home paths |
 | `allow.exec` | exec paths differ per machine, and a repo must not be able to make one of its own trees executable |
@@ -829,6 +830,23 @@ cplt config set sandbox.keychain_substitute true
 On, it removes the read+write grant on `~/Library/Keychains` for an agent that can authenticate another way, and hands that credential over instead. For Copilot that is a GitHub token: an exported `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN`, or, when none is set, what `gh auth token --hostname github.com` prints at launch, passed in as `GH_TOKEN`. The startup summary shows `Keychain: denied` and names the source. With the key off, the profile and the agent's environment are exactly what they were before the key existed.
 
 What it costs for Copilot: the token sits in the agent's environment, Copilot authenticates as `gh`'s account rather than a separate `copilot /login` account, and an exported token GitHub rejects becomes a sign-in error where Copilot would otherwise have fallen back to its stored login. Unset the key or the token variable to get the old behaviour back. The per-agent details, and what was and was not verified, are in [SECURITY.md](../SECURITY.md#keychain-access-is-all-or-nothing).
+
+## No execute on `~/.copilot` (`sandbox.deny_copilot_dir_exec`)
+
+On Linux, the Copilot agent gets read, write and execute on `~/.copilot`. A directory the agent can both write to and run programs from is a place to drop a binary and run it, the same pair cplt refuses when `allow.exec` asks for it ([#324](https://github.com/navikt/cplt/issues/324)). In one trace, Copilot CLI 1.0.88 on linux-arm64, with no plugins, MCP servers, hooks or LSP servers installed, ran nothing from `~/.copilot` for a prompt, its search tool or a shell command. Its bundled programs (`rg`, `tgrep`) ran from `~/.cache/copilot/pkg`, and its native `.node` addons load with read access alone. Other versions and set-ups were not traced.
+
+```bash
+cplt config set sandbox.deny_copilot_dir_exec true
+```
+
+With the key on, `~/.copilot` stays readable and writable and loses execute, under Landlock and under Bubblewrap. Off by default for now, because anything you have set up to run as a program stored under `~/.copilot` stops working: a plugin, MCP server, LSP server or hook whose command is a path in there. Commands started through an interpreter (`node ~/.copilot/...`, `bash ~/.copilot/...`) keep working, because the interpreter is what gets executed.
+
+Two set-ups keep some execute, and the launch warns about each instead of staying silent. Landlock adds up every rule that applies to a path, so another rule that grants execute gives it back:
+
+- **`~/.copilot` is a symlink into a tree that is granted execute** (the project, `~/.local/bin`, Copilot's cache). Everything in it stays executable through that tree's grant, so the key cannot take effect. The warning names the tree. Point `~/.copilot` at a directory outside every executable grant.
+- **Copilot is installed inside `~/.copilot`.** Copilot's install directory is always granted execute, or Copilot could not start. That directory and everything below it stay executable; the rest of `~/.copilot` does not. The warning names the directory.
+
+It has no effect on macOS, where the profile is unchanged and the launch warns that the key was ignored. The trace was done on Linux only.
 
 ## Configuration file
 

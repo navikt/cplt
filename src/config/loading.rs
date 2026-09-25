@@ -494,6 +494,7 @@ impl Config {
         let deny_nested_git = bools.deny_nested_git;
 
         let refuse_invalid_repo_config = bools.refuse_invalid_repo_config;
+        let deny_copilot_dir_exec = bools.deny_copilot_dir_exec;
 
         let allow_docker = bools.allow_docker;
 
@@ -672,6 +673,7 @@ impl Config {
             gradle_init,
             deny_nested_git,
             refuse_invalid_repo_config,
+            deny_copilot_dir_exec,
             allow_docker,
             allow_tmp_exec,
             allow_cache_exec,
@@ -1048,6 +1050,29 @@ impl Resolved {
         grants_overlapping(&self.allow_write, &dirs)
     }
 
+    /// The agent's config dirs as this run grants them, before canonicalisation:
+    /// [`Agent::config_dirs`](crate::agent::Agent::config_dirs) with
+    /// `sandbox.deny_copilot_dir_exec` applied. Linux only; macOS keeps
+    /// `~/.copilot` as it was and warns at launch instead (#324).
+    #[must_use]
+    pub fn agent_config_dirs(
+        &self,
+        agent: crate::agent::Agent,
+        home: &Path,
+    ) -> Vec<crate::agent::AgentDir> {
+        let mut dirs = agent.config_dirs(home);
+        if cfg!(target_os = "linux") && self.deny_copilot_dir_exec && agent.needs_copilot_dir() {
+            let matched = crate::agent::deny_copilot_dir_exec(&mut dirs, home);
+            // A relocated config dir (a future COPILOT_HOME, say) must fail
+            // loudly here rather than leave execute on without a word.
+            debug_assert!(
+                matched,
+                "sandbox.deny_copilot_dir_exec: no ~/.copilot agent dir"
+            );
+        }
+        dirs
+    }
+
     /// Every rendered launch warning about an `allow.write` grant shadowing a
     /// directory this run grants execute on.
     ///
@@ -1057,7 +1082,7 @@ impl Resolved {
     /// an effect a session that never emits Copilot's rules cannot have (#343).
     #[must_use]
     pub fn exec_tool_dir_warnings(&self, home: &Path, agent: crate::agent::Agent) -> Vec<String> {
-        let mut agent_dirs = agent.config_dirs(home);
+        let mut agent_dirs = self.agent_config_dirs(agent, home);
         crate::agent::canonicalize_agent_dirs(&mut agent_dirs);
         self.write_grants_over_exec_tool_dirs(home, &agent_dirs)
             .into_iter()
@@ -2695,6 +2720,32 @@ validate = false
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// `sandbox.deny_copilot_dir_exec` (#324): an `allow.write` over `~/.copilot`
+    /// is warned about as shadowing an exec dir only while `~/.copilot` still
+    /// has execute. With the key on there is nothing to shadow.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deny_copilot_dir_exec_silences_the_dot_copilot_shadow_warning() {
+        let home = PathBuf::from("/nonexistent-home-324");
+        let mut r = Config::default()
+            .merge(CliFlags::default())
+            .expect("default config merges");
+        r.allow_write = vec![home.join(".copilot")];
+
+        let off = r.exec_tool_dir_warnings(&home, crate::agent::Agent::Copilot);
+        assert!(
+            off.iter().any(|w| w.contains(".copilot")),
+            "key off: the grant shadows ~/.copilot's execute: {off:?}"
+        );
+
+        r.deny_copilot_dir_exec = true;
+        let on = r.exec_tool_dir_warnings(&home, crate::agent::Agent::Copilot);
+        assert!(
+            on.is_empty(),
+            "key on: nothing executable is shadowed: {on:?}"
+        );
+    }
+
     /// The singular case is the one a `{plural}` format string gets wrong, and
     /// #322 shipped `director{plural}` rendering as "director". This is a
     /// warning whose whole job is to explain why a tool stopped working, so a
@@ -4042,6 +4093,14 @@ mod precedence {
                 cli_on: None,
                 cli_off: None,
                 get: |r| r.refuse_invalid_repo_config,
+                default: false,
+                preset: None,
+            },
+            Ladder {
+                key: "sandbox.deny_copilot_dir_exec",
+                cli_on: None,
+                cli_off: None,
+                get: |r| r.deny_copilot_dir_exec,
                 default: false,
                 preset: None,
             },

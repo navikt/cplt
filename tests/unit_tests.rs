@@ -830,6 +830,7 @@ fn landlock_policy_device_files_have_ioctl() {
         allow_gpg_signing: false,
         deny_clipboard: false,
         deny_nested_git: false,
+        deny_copilot_dir_exec: false,
         allow_jvm_attach: false,
         allow_msbuild: false,
         allow_docker: false,
@@ -2487,6 +2488,7 @@ fn base_profile_options() -> SandboxConfig<'static> {
         allow_gpg_signing: false,
         deny_clipboard: false,
         deny_nested_git: false,
+        deny_copilot_dir_exec: false,
         allow_jvm_attach: false,
         allow_msbuild: false,
         allow_docker: false,
@@ -3925,6 +3927,7 @@ fn allow_localhost_any_affects_both_backends() {
         allow_gpg_signing: false,
         deny_clipboard: false,
         deny_nested_git: false,
+        deny_copilot_dir_exec: false,
         allow_jvm_attach: false,
         allow_msbuild: false,
         allow_docker: false,
@@ -3990,6 +3993,7 @@ fn config_options_parity_across_backends() {
         allow_gpg_signing: true,
         deny_clipboard: false,
         deny_nested_git: false,
+        deny_copilot_dir_exec: false,
         allow_jvm_attach: true,
         allow_msbuild: false,
         allow_docker: false,
@@ -9194,6 +9198,7 @@ fn no_pasteboard_rule_when_deny_clipboard_is_off() {
         &SandboxConfig {
             deny_clipboard: false,
             deny_nested_git: false,
+            deny_copilot_dir_exec: false,
             ..base_profile_options()
         },
         &[],
@@ -9330,6 +9335,7 @@ allow_msbuild = false
 gradle_init = false
 deny_nested_git = false
 refuse_invalid_repo_config = false
+deny_copilot_dir_exec = false
 allow_docker = false
 allow_cache_exec = []
 allow_cache_exec_any = false
@@ -9807,6 +9813,7 @@ fn landlock_relocated_cargo_bin_is_exec_only_and_registry_is_precreated() {
         allow_gpg_signing: false,
         deny_clipboard: false,
         deny_nested_git: false,
+        deny_copilot_dir_exec: false,
         allow_jvm_attach: false,
         allow_msbuild: false,
         allow_docker: false,

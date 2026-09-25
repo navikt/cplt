@@ -407,6 +407,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "sandbox",
+        key: "deny_copilot_dir_exec",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "false",
+        description: "Linux only: stop granting execute on ~/.copilot, so the writable directory Copilot keeps its config in is not also a place to run a dropped binary from (#324). Copilot runs its bundled tools from ~/.cache/copilot/pkg. Breaks a plugin, MCP server, LSP server or hook launched as a program stored under ~/.copilot. No effect on macOS, where the launch warns instead.",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
         key: "allow_docker",
         value_type: ConfigValueType::Bool,
         dangerous: true,
@@ -1051,6 +1059,14 @@ bool_keys! {
         config = |c: &Config| c.sandbox.refuse_invalid_repo_config,
         baseline = |_: PresetBaseline| false,
         resolved = |r: &Resolved| r.refuse_invalid_repo_config;
+
+    /// Config-only and off by default (staged rollout, #324): it withdraws a
+    /// grant a plugin or MCP server stored under `~/.copilot` may rely on.
+    deny_copilot_dir_exec, "sandbox", "deny_copilot_dir_exec",
+        cli = |_: &CliFlags| FeatureToggle::UseDefault,
+        config = |c: &Config| c.sandbox.deny_copilot_dir_exec,
+        baseline = |_: PresetBaseline| false,
+        resolved = |r: &Resolved| r.deny_copilot_dir_exec;
 
     allow_docker, "sandbox", "allow_docker",
         cli = |c: &CliFlags| c.allow_docker,
