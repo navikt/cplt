@@ -202,6 +202,12 @@ pub fn generate_profile_with_playwright_socket_dir(
     // below must remain later in the last-match-wins profile.
     emit_path_bin_denies(&mut sb, config.home_dir);
     emit_shim_dir_denies(&mut sb, config);
+    // Keeps the exec-allowed toolchain dirs non-writable even when a user
+    // allow.write covers ~/.gradle or ~/.konan (write-then-exec): after every
+    // write allow above. It ends with K/N's lock `file-write-data` allow,
+    // which is why it sits here and not at the tail: the denies below
+    // (nested `.git` creation, #576) must follow every write allow.
+    emit_toolchain_write_deny(&mut sb, &home, config.extra_deny);
     // Sensitive project file denies MUST come after all user-configured allows.
     // SBPL uses last-match-wins, so a user allow like `allow.read = ["~/Repos"]`
     // would override the .env deny if emitted before it.
@@ -232,9 +238,6 @@ pub fn generate_profile_with_playwright_socket_dir(
     // Same reason: keeps exec-allowed DOTNET_ROOT subtrees non-writable even
     // when a user allow.write covers them (write-then-exec).
     emit_dotnet_exec_denies(&mut sb, config.dotnet_root);
-    // Same reason: keeps the exec-allowed toolchain dirs non-writable even
-    // when a user allow.write covers ~/.gradle or ~/.konan (write-then-exec).
-    emit_toolchain_write_deny(&mut sb, &home, config.extra_deny);
     // Same reason: a dotfiles-managed `~/.gitconfig` can resolve into the
     // project or an `allow.write` tree, and the deny at its target must beat
     // that grant (#524).
@@ -2203,9 +2206,9 @@ fn emit_user_allows(
 /// Emitted LAST, after every allow in the profile. SBPL is last-match-wins, so
 /// a write-deny sitting next to its own allow is reopened by any later
 /// `file-write*` allow that covers the same tree. That is exactly the bug #158
-/// left behind, and the reason `emit_dotnet_exec_denies` and
-/// `emit_toolchain_write_deny` are at the bottom of `generate_profile`
-/// too. Do not move this call.
+/// left behind, and the reason `emit_dotnet_exec_denies` is at the bottom of
+/// `generate_profile` too, and `emit_toolchain_write_deny` follows every write
+/// allow. Do not move this call.
 fn emit_exec_write_denies(sb: &mut String, extra_exec: &[PathBuf]) {
     if extra_exec.is_empty() {
         return;
