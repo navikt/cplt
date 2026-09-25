@@ -1595,17 +1595,24 @@ fn exec_bwrap(
     };
 
     // Policy pipe: bwrap/helper inherit the read end; the parent writes the
-    // policy after spawn so the helper exists before transfer begins.
+    // policy after spawn so the helper exists before transfer begins. A pipe
+    // rather than a file because the namespace's fresh `--tmpfs /tmp` would
+    // shadow a policy file in the host temp dir, and no policy data touches
+    // the disk.
+    //
+    // Both pipes are created O_CLOEXEC so no other spawn on another thread
+    // can inherit them; `seal_inherited_fds` clears CLOEXEC on the two kept
+    // ends in the bwrap child only.
     let mut policy_fds = [0i32; 2];
-    if unsafe { libc::pipe(policy_fds.as_mut_ptr()) } != 0 {
+    if unsafe { libc::pipe2(policy_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
         return bwrap_setup_failed(wrapper, "cannot create policy pipe");
     }
     let (policy_read_fd, policy_write_fd) = (policy_fds[0], policy_fds[1]);
 
-    // Confirm pipe: read end stays in the parent (CLOEXEC), write end is
-    // inherited through bwrap into the helper.
+    // Confirm pipe: read end stays in the parent, write end is inherited
+    // through bwrap into the helper.
     let mut fds = [0i32; 2];
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
         unsafe {
             libc::close(policy_read_fd);
             libc::close(policy_write_fd);
@@ -1613,9 +1620,6 @@ fn exec_bwrap(
         return bwrap_setup_failed(wrapper, "cannot create confirm pipe");
     }
     let (read_fd, write_fd) = (fds[0], fds[1]);
-    unsafe {
-        libc::fcntl(read_fd, libc::F_SETFD, libc::FD_CLOEXEC);
-    }
 
     let mut bwrap_argv = wrapper.bwrap_args.clone();
     bwrap_argv.push("--".to_string());
@@ -1659,8 +1663,9 @@ fn exec_bwrap(
     cmd.env(super::bubblewrap::ENV_CONFIRM_FD, write_fd.to_string());
     // bwrap forwards inherited descriptors into the namespace, so the caller's
     // leak reaches the agent here too. The policy and confirm pipes are the
-    // only two that are meant to: both are deliberately not CLOEXEC, and the
-    // re-entry helper reads them by the fd numbers set above.
+    // only two that are meant to: both are created CLOEXEC, the seal clears
+    // the flag on these two in the child, and the re-entry helper reads them
+    // by the fd numbers set above.
     seal_inherited_fds(&mut cmd, vec![policy_read_fd, write_fd]);
 
     ignore_terminal_stop_signals();
@@ -1690,14 +1695,14 @@ fn exec_bwrap(
         &policy_bytes,
         BWRAP_POLICY_TRANSFER_TIMEOUT_MS,
     );
-    unsafe {
-        libc::close(policy_write_fd);
-    }
     if let Err(err) = transfer {
+        // Kill and reap bwrap before closing the write end: closing first
+        // would hand the helper EOF on a truncated policy.
+        stop_bwrap_child(&mut child);
         unsafe {
+            libc::close(policy_write_fd);
             libc::close(read_fd);
         }
-        stop_bwrap_child(&mut child);
         restore_terminal_stop_signals();
         let detail = match err {
             PolicyTransferError::TimedOut => "timed out transferring policy to namespace helper",
@@ -1707,6 +1712,9 @@ fn exec_bwrap(
             PolicyTransferError::Syscall => "failed writing policy to namespace helper",
         };
         return bwrap_setup_failed(wrapper, detail);
+    }
+    unsafe {
+        libc::close(policy_write_fd);
     }
 
     let confirm = read_confirm_byte(read_fd);
@@ -2116,84 +2124,6 @@ mod inherited_fd_tests {
         f
     }
 
-    #[cfg(all(test, target_os = "linux"))]
-    mod bwrap_policy_transfer_tests {
-        use super::*;
-
-        fn pipe_with_small_capacity() -> (i32, i32, usize) {
-            let mut fds = [0i32; 2];
-            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
-            let (read_fd, write_fd) = (fds[0], fds[1]);
-            let _ = unsafe { libc::fcntl(write_fd, libc::F_SETPIPE_SZ, 4096) };
-            let cap = unsafe { libc::fcntl(write_fd, libc::F_GETPIPE_SZ) };
-            let cap = if cap > 0 { cap as usize } else { 4096 };
-            (read_fd, write_fd, cap)
-        }
-
-        #[test]
-        fn large_policy_transfer_times_out_without_a_reader() {
-            let (read_fd, write_fd, cap) = pipe_with_small_capacity();
-            let payload = vec![b'x'; cap * 4];
-            let start = std::time::Instant::now();
-            let result = transfer_policy_bytes(write_fd, &payload, 150);
-            let elapsed = start.elapsed();
-            unsafe {
-                libc::close(write_fd);
-                libc::close(read_fd);
-            }
-
-            assert_eq!(result, Err(PolicyTransferError::TimedOut));
-            assert!(
-                elapsed < std::time::Duration::from_secs(2),
-                "transfer should fail quickly instead of hanging; elapsed={elapsed:?}"
-            );
-        }
-
-        #[test]
-        fn large_policy_transfer_succeeds_when_reader_drains_pipe() {
-            let (read_fd, write_fd, cap) = pipe_with_small_capacity();
-            let payload = vec![b'y'; cap * 8 + 123];
-            let expected = payload.len();
-
-            let reader = std::thread::spawn(move || {
-                let mut total = 0usize;
-                let mut buf = [0u8; 2048];
-                loop {
-                    let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
-                    if n < 0 {
-                        if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                            continue;
-                        }
-                        unsafe {
-                            libc::close(read_fd);
-                        }
-                        panic!("read failed");
-                    }
-                    if n == 0 {
-                        break;
-                    }
-                    #[allow(clippy::cast_sign_loss)]
-                    {
-                        total += n as usize;
-                    }
-                }
-                unsafe {
-                    libc::close(read_fd);
-                }
-                total
-            });
-
-            let result = transfer_policy_bytes(write_fd, &payload, 3_000);
-            unsafe {
-                libc::close(write_fd);
-            }
-            let drained = reader.join().expect("reader thread");
-
-            assert_eq!(result, Ok(()));
-            assert_eq!(drained, expected);
-        }
-    }
-
     /// Open `file` and leave the descriptor non-CLOEXEC, exactly the way a
     /// wrapper or IDE leaves one when it launches cplt.
     ///
@@ -2496,5 +2426,87 @@ mod inherited_fd_tests {
             new_high * 20 <= old_high,
             "the seal is no cheaper than the sweep it replaced — {report}"
         );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod bwrap_policy_transfer_tests {
+    use super::*;
+
+    fn pipe_with_small_capacity() -> (i32, i32, usize) {
+        let mut fds = [0i32; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) },
+            0,
+            "pipe2"
+        );
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        let _ = unsafe { libc::fcntl(write_fd, libc::F_SETPIPE_SZ, 4096) };
+        let cap = unsafe { libc::fcntl(write_fd, libc::F_GETPIPE_SZ) };
+        let cap = if cap > 0 { cap as usize } else { 4096 };
+        (read_fd, write_fd, cap)
+    }
+
+    #[test]
+    fn large_policy_transfer_times_out_without_a_reader() {
+        let (read_fd, write_fd, cap) = pipe_with_small_capacity();
+        let payload = vec![b'x'; cap * 4];
+        let start = std::time::Instant::now();
+        let result = transfer_policy_bytes(write_fd, &payload, 150);
+        let elapsed = start.elapsed();
+        unsafe {
+            libc::close(write_fd);
+            libc::close(read_fd);
+        }
+
+        assert_eq!(result, Err(PolicyTransferError::TimedOut));
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "transfer should fail quickly instead of hanging; elapsed={elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn large_policy_transfer_succeeds_when_reader_drains_pipe() {
+        let (read_fd, write_fd, cap) = pipe_with_small_capacity();
+        let payload = vec![b'y'; cap * 8 + 123];
+        let expected = payload.len();
+
+        let reader = std::thread::spawn(move || {
+            let mut total = 0usize;
+            let mut buf = [0u8; 2048];
+            loop {
+                let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
+                if n < 0 {
+                    if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    unsafe {
+                        libc::close(read_fd);
+                    }
+                    panic!("read failed");
+                }
+                if n == 0 {
+                    break;
+                }
+                #[allow(clippy::cast_sign_loss)]
+                {
+                    total += n as usize;
+                }
+            }
+            unsafe {
+                libc::close(read_fd);
+            }
+            total
+        });
+
+        let result = transfer_policy_bytes(write_fd, &payload, 3_000);
+        unsafe {
+            libc::close(write_fd);
+        }
+        let drained = reader.join().expect("reader thread");
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(drained, expected);
     }
 }
