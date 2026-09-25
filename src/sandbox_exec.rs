@@ -1608,6 +1608,7 @@ fn exec_bwrap(
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
         unsafe {
             libc::close(policy_read_fd);
+            libc::close(policy_write_fd);
         }
         return bwrap_setup_failed(wrapper, "cannot create confirm pipe");
     }
@@ -1669,6 +1670,7 @@ fn exec_bwrap(
             restore_terminal_stop_signals();
             unsafe {
                 libc::close(policy_read_fd);
+                libc::close(policy_write_fd);
                 libc::close(read_fd);
                 libc::close(write_fd);
             }
