@@ -2605,6 +2605,7 @@ fn write_exec_deny_comes_after_every_broad_exec_allow() {
     // after the deny.
     let carve_outs = [
         "/Users/test/.gradle/jdks",
+        "/Users/test/.konan/dependencies",
         "/Users/test/.bun/install",
         "/Users/test/Library/pnpm/package-manager-store",
         "/Users/test/.local/share/pnpm/package-manager-store",

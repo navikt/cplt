@@ -3681,8 +3681,8 @@ pub struct ExecInWritable {
 pub const EXEC_IN_WRITABLE: &[ExecInWritable] = &[
     // Gradle provisions toolchain JDKs into `~/.gradle/jdks` and execs them.
     // macOS emits the matching `(allow process-exec)` in
-    // `emit_gradle_toolchain_exec` and takes the write back at the tail of the
-    // profile in `emit_gradle_toolchain_write_deny`; Landlock has no way to do
+    // `emit_toolchain_exec` and takes the write back at the tail of the
+    // profile in `emit_toolchain_write_deny`; Landlock has no way to do
     // the second half.
     ExecInWritable {
         path: ".gradle/jdks",
@@ -3743,17 +3743,33 @@ pub const EXEC_IN_WRITABLE: &[ExecInWritable] = &[
              kept until a Linux host can settle it.",
         ),
     },
-    // Kotlin/Native downloads an LLVM and clang toolchain into
-    // `~/.konan/dependencies` and execs it during a native build.
+    // Kotlin/Native downloads an LLVM toolchain into `~/.konan/dependencies`
+    // and execs `clang++` from it at link time. Observed on macOS with K/N
+    // 2.2.21 (#323): the link failed with EPERM until this was granted. Same
+    // shape as `.gradle/jdks`: macOS grants exec and takes the write back.
+    ExecInWritable {
+        path: ".konan/dependencies",
+        macos: true,
+        why: "Kotlin/Native execs the LLVM toolchain it downloads into ~/.konan/dependencies",
+        linux: LinuxCoverage::Gap(
+            "Landlock cannot subtract the ~/.konan write grant from this subtree, so \
+             it stays write+execute on Linux. macOS denies the write at the tail of \
+             the profile instead.",
+        ),
+    },
+    // Linux still keeps EXECUTE on the whole of `~/.konan`, as before #323.
+    // macOS showed the toolchain runs from `dependencies/` only, so narrowing
+    // Linux to that is the likely follow-up, but no Linux K/N build has been
+    // run to confirm nothing else under `~/.konan` is exec'd there.
     ExecInWritable {
         path: ".konan",
         macos: false,
-        why: "Kotlin/Native execs the LLVM toolchain it downloads into ~/.konan/dependencies",
+        why: "pre-#323 Linux grant, kept until a Linux K/N build confirms \
+              ~/.konan/dependencies is the only subtree K/N execs from",
         linux: LinuxCoverage::Gap(
-            "not verified against a real Kotlin/Native build (#243). macOS denies \
-             process-exec here, so K/N may already be broken there — that could not be \
-             demonstrated either way from macOS, and guessing in either direction is \
-             what this entry exists to avoid.",
+            "not verified against a real Kotlin/Native build on Linux (#243, #323). \
+             Dropping EXECUTE outside dependencies/ could break K/N there, and that \
+             failure is not visible from a macOS checkout.",
         ),
     },
 ];
