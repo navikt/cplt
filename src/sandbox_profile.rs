@@ -21,12 +21,12 @@ macro_rules! sbpl {
 
 use super::SandboxConfig;
 use super::policy::{
-    DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS,
+    CacheEnv, DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS,
     DEPENDENCY_SOURCE_TREES, EXEC_IN_WRITABLE, GPG_SIGNING_ALLOW_FILES, HOME_CONFIG_FILES,
     HomeToolDir, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir,
     SENSITIVE_PROJECT_PATTERNS, SYSTEM_READ_FILES, TOOL_READ_DIRS, XCODE_SELECT_LINK,
     active_tool_dirs, ancestor_alternation, app_dirs, colima_socket_paths, copilot_default_pkg_dir,
-    current_uid, cypress_app_data_dir, cypress_runtime_intent, escape_regex,
+    current_uid, cypress_app_data_dir_with_env, cypress_runtime_intent, escape_regex,
     first_party_read_target, grant_is_refused, home_config_link_targets,
     missing_home_config_link_targets, nested_alternation, path_bin_dirs, playwright_runtime_intent,
     read_only_home_config, rel_is_glob, rel_regex, validate_playwright_socket_dir,
@@ -182,7 +182,12 @@ pub fn generate_profile_with_playwright_socket_dir(
     );
     // This deny must follow user exec grants so Cypress's persistent writable
     // state cannot become executable through a broader allow.exec ancestor.
-    emit_cypress_app_data(&mut sb, config.home_dir, allow_cypress_runtime);
+    emit_cypress_app_data(
+        &mut sb,
+        config.home_dir,
+        config.copilot_cache_env,
+        allow_cypress_runtime,
+    );
     emit_deny_rules(&mut sb, config, &home);
     emit_registry_config_overrides(&mut sb, &home, config.extra_read);
     emit_denied_dotfile_overrides(
@@ -1598,11 +1603,16 @@ fn emit_tool_dirs(
     }
 }
 
-fn emit_cypress_app_data(sb: &mut String, home: &Path, allow_cypress_runtime: bool) {
+fn emit_cypress_app_data(
+    sb: &mut String,
+    home: &Path,
+    env: &CacheEnv<'_>,
+    allow_cypress_runtime: bool,
+) {
     if !allow_cypress_runtime {
         return;
     }
-    let path = cypress_app_data_dir(home);
+    let path = cypress_app_data_dir_with_env(home, env);
     if validate_sbpl_path(&path).is_err() {
         return;
     }

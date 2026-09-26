@@ -79,11 +79,12 @@ pub use policy::{
     SENSITIVE_PROJECT_PATTERNS, TOOL_PATH_ENV_VARS, ToolPathEnvVar, ToolPathOverride, ToolRoot,
     active_tool_dirs, app_dirs, build_credential_grants, copilot_default_pkg_dir, copilot_pkg_dir,
     copilot_pkg_dirs, copilot_ro_protect_paths, credential_link_hop, current_uid,
-    cypress_app_data_dir, cypress_runtime_intent, exec_write_conflicts, home_config_link_targets,
-    home_tool_dirs, linux_docker_socket_paths, linux_runtime_dirs, mise_ro_protect_paths,
-    nested_alternation, no_cache_env, path_bin_dirs, playwright_runtime_intent, process_env,
-    relocatable_tool_prefix, shim_ro_protect_paths, socket_mask_paths, tool_override_path_is_safe,
-    tool_path_env_overrides, validate_playwright_socket_dir, validate_sbpl_path, xdg_cache_dir,
+    cypress_app_data_dir, cypress_app_data_dir_with_env, cypress_runtime_intent,
+    exec_write_conflicts, home_config_link_targets, home_tool_dirs, linux_docker_socket_paths,
+    linux_runtime_dirs, mise_ro_protect_paths, nested_alternation, no_cache_env, path_bin_dirs,
+    playwright_runtime_intent, process_env, relocatable_tool_prefix, shim_ro_protect_paths,
+    socket_mask_paths, tool_override_path_is_safe, tool_path_env_overrides,
+    validate_playwright_socket_dir, validate_sbpl_path, xdg_cache_dir, xdg_cache_dir_with_env,
     xdg_runtime_dir_env,
 };
 
@@ -531,7 +532,7 @@ fn prepare_cypress_app_data(config: &SandboxConfig, inspect_only: bool) -> Resul
         return Ok(());
     }
 
-    let named = policy::cypress_app_data_dir(config.home_dir);
+    let named = policy::cypress_app_data_dir_with_env(config.home_dir, config.copilot_cache_env);
     let expected = if let Ok(relative) = named.strip_prefix(config.home_dir) {
         std::fs::canonicalize(config.home_dir)
             .map_err(|e| format!("Cannot resolve HOME {}: {e}", config.home_dir.display()))?
@@ -1254,7 +1255,7 @@ fn writable_trees(config: &SandboxConfig) -> Vec<(PathBuf, &'static str)> {
     }
     if policy::cypress_runtime_intent(config.allow_cache_exec, config.allow_cache_exec_any) {
         trees.push((
-            policy::cypress_app_data_dir(config.home_dir),
+            policy::cypress_app_data_dir_with_env(config.home_dir, config.copilot_cache_env),
             "the writable Cypress state directory",
         ));
     }
@@ -2689,7 +2690,7 @@ mod tests {
     fn exec_grant_over_cypress_app_data_is_refused() {
         let home = Path::new("/home/test");
         let allow_cache_exec = ["Cypress".to_string()];
-        let app_data = policy::cypress_app_data_dir(home);
+        let app_data = policy::cypress_app_data_dir_with_env(home, &policy::no_cache_env);
         let exec = [app_data
             .parent()
             .expect("Cypress app data must have a parent")
@@ -2767,7 +2768,7 @@ mod tests {
         config.existing_home_tool_dirs = Some(&[]);
         config.allow_cache_exec = &allow_cache_exec;
         config.use_bubblewrap = Some(false);
-        let app_data = policy::cypress_app_data_dir(&home);
+        let app_data = policy::cypress_app_data_dir_with_env(&home, &policy::no_cache_env);
 
         prepare_with_pnpm_shadow(&config, None, true).expect("inspection must validate");
         assert!(!app_data.exists(), "inspection must not create app state");
@@ -2782,7 +2783,7 @@ mod tests {
         let home = root.join("home");
         let project = root.join("project");
         let allow_cache_exec = ["Cypress".to_string()];
-        let app_data = policy::cypress_app_data_dir(&home);
+        let app_data = policy::cypress_app_data_dir_with_env(&home, &policy::no_cache_env);
         std::fs::create_dir_all(app_data.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(&project, &app_data).unwrap();
         let mut config = test_config(&home, &[]);
@@ -2804,7 +2805,7 @@ mod tests {
         let home = root.join("home");
         let project = root.join("project");
         let allow_cache_exec = ["Cypress".to_string()];
-        let app_data = policy::cypress_app_data_dir(&home);
+        let app_data = policy::cypress_app_data_dir_with_env(&home, &policy::no_cache_env);
         let writes = [app_data.parent().unwrap().to_path_buf()];
         let mut config = test_config(&home, &[]);
         config.project_dir = &project;

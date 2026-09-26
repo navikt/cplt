@@ -11,9 +11,9 @@ use cplt::is_unsafe_root;
 use cplt::proxy::{is_blocked_in_content, is_domain_match, is_private_hostname, is_private_ip};
 use cplt::sandbox::{
     HardeningCategory, PLAYWRIGHT_SOCKET_BASE_MAX_BYTES, PLAYWRIGHT_SOCKET_PATH_LIMIT,
-    PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX, SandboxConfig, build_sandbox_env, cypress_app_data_dir,
-    cypress_runtime_intent, generate_policy, generate_profile,
-    generate_profile_with_playwright_socket_dir, npmrc_explicitly_allowed,
+    PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX, SandboxConfig, build_sandbox_env,
+    cypress_app_data_dir_with_env, cypress_runtime_intent, generate_policy, generate_profile,
+    generate_profile_with_playwright_socket_dir, no_cache_env, npmrc_explicitly_allowed,
     npmrc_userconfig_override, npmrc_userconfig_stale_variants, playwright_runtime_intent,
     playwright_sockets_dir_override, tool_override_path_is_safe, tool_path_env_overrides,
     validate_playwright_socket_dir, validate_sbpl_path,
@@ -8916,7 +8916,7 @@ fn chromium_runtime_mach_register_rules_remain_narrow() {
 
 #[test]
 fn cypress_runtime_emits_only_its_narrow_mach_registration() {
-    let app_data = cypress_app_data_dir(Path::new("/Users/test"));
+    let app_data = cypress_app_data_dir_with_env(Path::new("/Users/test"), &no_cache_env);
     let app_data = app_data.display();
     for cache_entry in ["Cypress", "Cypress/15.21.1"] {
         let p = generate_profile(
@@ -9017,7 +9017,7 @@ fn cypress_runtime_grants_non_executable_app_state_on_landlock() {
         allow_cache_exec: &allow_cache_exec,
         ..base_profile_options()
     });
-    let app_data = cypress_app_data_dir(Path::new("/Users/test"));
+    let app_data = cypress_app_data_dir_with_env(Path::new("/Users/test"), &no_cache_env);
     let rule = policy
         .fs_rules
         .iter()

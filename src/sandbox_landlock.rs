@@ -591,7 +591,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
 
     if policy::cypress_runtime_intent(config.allow_cache_exec, config.allow_cache_exec_any) {
         fs_rules.push(FsRule {
-            path: policy::cypress_app_data_dir(home),
+            path: policy::cypress_app_data_dir_with_env(home, config.copilot_cache_env),
             access: FsAccess {
                 read: true,
                 write: true,

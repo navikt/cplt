@@ -1448,6 +1448,7 @@ mod macos_tests {
     }
 
     #[test]
+    #[ignore = "requires an installed Cypress binary named by CPLT_CYPRESS_BINARY"]
     fn real_profile_runs_cypress_electron_spec() {
         require_sandbox!();
 

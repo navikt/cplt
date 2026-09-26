@@ -1115,18 +1115,29 @@ pub fn xdg_cache_dir_with_env(home: &Path, env: &CacheEnv<'_>) -> PathBuf {
 /// Cypress's writable Electron state, kept separate from its executable cache.
 #[must_use]
 pub fn cypress_app_data_dir(home: &Path) -> PathBuf {
+    cypress_app_data_dir_with_env(home, &process_env)
+}
+
+/// Cypress's writable Electron state resolved from a caller-supplied environment.
+#[must_use]
+pub fn cypress_app_data_dir_with_env(home: &Path, env: &CacheEnv<'_>) -> PathBuf {
     #[cfg(target_os = "macos")]
     {
+        let _ = env;
         home.join("Library/Application Support/Cypress")
     }
     #[cfg(target_os = "linux")]
     {
-        AppDirKind::Config
-            .resolve("", "", "Cypress", home)
-            .unwrap_or_else(|| home.join(".config/Cypress"))
+        env("XDG_CONFIG_HOME")
+            .filter(|value| !value.as_encoded_bytes().trim_ascii().is_empty())
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .unwrap_or_else(|| home.join(".config"))
+            .join("Cypress")
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
+        let _ = env;
         home.join(".config/Cypress")
     }
 }
