@@ -1053,6 +1053,30 @@ pub const PLAYWRIGHT_SOCKET_BASE_MAX_BYTES: usize = 64;
 pub const PLAYWRIGHT_SOCKET_PATH_LIMIT: usize = 103;
 pub const PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX: &str = "/dashboard/0123456789abcdef.sock";
 
+fn cache_exec_first_component_matches(allow_cache_exec: &[String], component: &str) -> bool {
+    allow_cache_exec.iter().any(|entry| {
+        entry == component
+            || entry
+                .strip_prefix(component)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    })
+}
+
+/// Whether a cache-exec entry is a non-empty relative path of normal components.
+#[must_use]
+pub fn cache_exec_subdir_is_safe(subdir: &str) -> bool {
+    use std::path::Component;
+
+    let mut saw_component = false;
+    for component in Path::new(subdir).components() {
+        match component {
+            Component::Normal(_) => saw_component = true,
+            _ => return false,
+        }
+    }
+    saw_component
+}
+
 /// Whether cache execution explicitly opts into the Playwright browser runtime.
 ///
 /// This intent gates both Chromium's additional macOS runtime permissions and
@@ -1060,9 +1084,51 @@ pub const PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX: &str = "/dashboard/0123456789abcd
 /// deliberately ignored: broad cache execution must not imply browser runtime
 /// intent.
 pub fn playwright_runtime_intent(allow_cache_exec: &[String], _allow_cache_exec_any: bool) -> bool {
-    allow_cache_exec
-        .iter()
-        .any(|entry| entry == "ms-playwright" || entry.starts_with("ms-playwright/"))
+    cache_exec_first_component_matches(allow_cache_exec, "ms-playwright")
+}
+
+/// Whether cache execution explicitly opts into Cypress's Electron runtime.
+///
+/// The opt-in gates a macOS Mach registration needed by Cypress. Broad cache
+/// execution is deliberately insufficient because it must not grant additional
+/// Electron IPC rights.
+pub fn cypress_runtime_intent(allow_cache_exec: &[String], _allow_cache_exec_any: bool) -> bool {
+    cache_exec_first_component_matches(allow_cache_exec, "Cypress")
+}
+
+/// Linux/XDG cache root, with invalid relative overrides rejected.
+#[must_use]
+pub fn xdg_cache_dir(home: &Path) -> PathBuf {
+    xdg_cache_dir_with_env(home, &process_env)
+}
+
+/// Linux/XDG cache root resolved from a caller-supplied environment.
+#[must_use]
+pub fn xdg_cache_dir_with_env(home: &Path, env: &CacheEnv<'_>) -> PathBuf {
+    env("XDG_CACHE_HOME")
+        .filter(|value| !value.as_encoded_bytes().trim_ascii().is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| home.join(".cache"))
+}
+
+/// Cypress's writable Electron state, kept separate from its executable cache.
+#[must_use]
+pub fn cypress_app_data_dir(home: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        home.join("Library/Application Support/Cypress")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        AppDirKind::Config
+            .resolve("", "", "Cypress", home)
+            .unwrap_or_else(|| home.join(".config/Cypress"))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        home.join(".config/Cypress")
+    }
 }
 
 /// Validate the exact shape of a cplt-owned Playwright socket directory.

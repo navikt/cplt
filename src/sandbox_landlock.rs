@@ -343,27 +343,6 @@ const DEVICE_FILES: &[&str] = &[
 /// gap, not an oversight, and it is stated here so the absence is visible from
 /// the backend that has it. #207 survived for months precisely because a control that was
 /// effective on macOS and ineffective on Linux looked identical in the code.
-/// True if `subdir` is a safe relative cache subdirectory: non-empty and every
-/// path component is a normal name (rejects `..`, `.`, an absolute root, or a
-/// Windows-style prefix).
-///
-/// Load-bearing for the Linux cache-exec carve-out: the joined path is opened
-/// with `O_PATH`, and the kernel resolves `..` at open() time. Without this
-/// filter a crafted value like `../../bin` would grant execute *outside*
-/// `~/.cache`. (macOS SBPL is immune because `subpath` does literal prefix
-/// matching on already-canonicalized paths, where `..` never appears.)
-fn is_safe_cache_subdir(subdir: &str) -> bool {
-    use std::path::Component;
-    let mut saw_component = false;
-    for component in std::path::Path::new(subdir).components() {
-        match component {
-            Component::Normal(_) => saw_component = true,
-            _ => return false,
-        }
-    }
-    saw_component
-}
-
 /// The emitted rule, if any, that makes `path` writable without also making it
 /// executable.
 ///
@@ -610,6 +589,19 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         }
     }
 
+    if policy::cypress_runtime_intent(config.allow_cache_exec, config.allow_cache_exec_any) {
+        fs_rules.push(FsRule {
+            path: policy::cypress_app_data_dir(home),
+            access: FsAccess {
+                read: true,
+                write: true,
+                execute: false,
+                ioctl: false,
+                create_dirs: false,
+            },
+        });
+    }
+
     // ── Home tool directories (filtered by discovery, relocated homes resolved) ──
     // A symlinked dir needs no separate target rule: Landlock opens `path`
     // following the link, so the rule lands on the target inode. That is also
@@ -666,12 +658,12 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     // `~/.cache` stays non-executable.
     //
     // SECURITY: subdir entries are filtered to traversal-free relative paths via
-    // is_safe_cache_subdir() — see that function for why this is load-bearing on
+    // cache_exec_subdir_is_safe() — see that function for why this is load-bearing on
     // Linux but not macOS.
-    let cache_base = home.join(".cache");
+    let cache_base = policy::xdg_cache_dir_with_env(home, config.copilot_cache_env);
     if config.allow_cache_exec_any {
         fs_rules.push(FsRule {
-            path: cache_base,
+            path: cache_base.clone(),
             access: FsAccess {
                 read: true,
                 write: true,
@@ -682,7 +674,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         });
     } else {
         for subdir in config.allow_cache_exec {
-            if is_safe_cache_subdir(subdir) {
+            if policy::cache_exec_subdir_is_safe(subdir) {
                 fs_rules.push(FsRule {
                     path: cache_base.join(subdir),
                     access: FsAccess {
@@ -1345,11 +1337,21 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         )),
     }
 
-    let precreate_dirs = tool_dirs
+    let mut precreate_dirs: Vec<_> = tool_dirs
         .into_iter()
         .filter(|d| d.dir.write)
         .map(|d| d.path)
         .collect();
+    precreate_dirs.extend(
+        fs_rules
+            .iter()
+            .filter(|rule| {
+                rule.access.write && rule.access.execute && rule.path.starts_with(&cache_base)
+            })
+            .map(|rule| rule.path.clone()),
+    );
+    precreate_dirs.sort();
+    precreate_dirs.dedup();
 
     LandlockPolicy {
         fs_rules,
@@ -1755,38 +1757,20 @@ pub fn precompute(policy: LandlockPolicy) -> Result<PrecomputedSandbox, String> 
         }
     }
 
-    // Pre-create writable HOME_TOOL_DIRS cache directories that may not exist yet.
+    // Pre-create writable HOME_TOOL_DIRS and explicit cache-exec directories
+    // that may not exist yet.
     // Landlock requires open(O_PATH) to succeed, so non-existent paths are
     // silently skipped. Writable cache dirs (e.g. ~/.cargo/registry) are
     // expected to be created on first use by build tools — we ensure they
     // exist so the Landlock rule can be applied and the sandboxed process
     // can actually write there.
     //
-    // Scope: only HOME_TOOL_DIRS with write=true (build caches). We do NOT
+    // Scope: only HOME_TOOL_DIRS with write=true and cache-exec paths. We do NOT
     // pre-create user --allow-write paths, socket paths, or arbitrary writable
     // rules — those require the user to set up the filesystem themselves.
     for path in &policy.precreate_dirs {
         if !path.exists() {
             let _ = std::fs::create_dir_all(path);
-        }
-    }
-
-    // Pre-create cache-exec subdirs (e.g. ~/.cache/ms-playwright) that may not
-    // exist on first run. Landlock skips O_PATH on non-existent paths, so without
-    // this the execute rule would be silently dropped and the tool's binary would
-    // stay non-executable until cplt is restarted after the dir is populated.
-    //
-    // Scope: only writable+executable rules under ~/.cache — i.e. exactly the
-    // cache-exec carve-outs from generate_policy(). User --allow-write paths live
-    // elsewhere and are deliberately not pre-created (see comment above).
-    let cache_base = policy.home_dir.join(".cache");
-    for rule in &policy.fs_rules {
-        if rule.access.write
-            && rule.access.execute
-            && rule.path.starts_with(&cache_base)
-            && !rule.path.exists()
-        {
-            let _ = std::fs::create_dir_all(&rule.path);
         }
     }
 
@@ -3024,6 +3008,29 @@ mod tests {
     }
 
     #[test]
+    fn cache_exec_subdir_honors_xdg_cache_home() {
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let xdg_cache = PathBuf::from("/home/user/custom-cache");
+        let subdirs = vec!["Cypress".to_string()];
+
+        let env =
+            |name: &str| (name == "XDG_CACHE_HOME").then(|| xdg_cache.clone().into_os_string());
+        let mut config = test_config(&project, &home);
+        config.allow_cache_exec = &subdirs;
+        config.copilot_cache_env = &env;
+        let policy = generate_policy(&config);
+        let target = xdg_cache.join("Cypress");
+        assert!(
+            policy
+                .fs_rules
+                .iter()
+                .any(|rule| rule.path == target && rule.access.execute),
+            "cache-exec must follow XDG_CACHE_HOME on Linux"
+        );
+    }
+
+    #[test]
     fn cache_exec_supports_nested_subdir() {
         let project = PathBuf::from("/home/user/project");
         let home = PathBuf::from("/home/user");
@@ -3112,16 +3119,18 @@ mod tests {
     }
 
     #[test]
-    fn is_safe_cache_subdir_accepts_and_rejects() {
-        assert!(is_safe_cache_subdir("ms-playwright"));
-        assert!(is_safe_cache_subdir("ms-playwright/chromium-1217"));
-        assert!(is_safe_cache_subdir("pnpm/dlx"));
-        assert!(!is_safe_cache_subdir(""));
-        assert!(!is_safe_cache_subdir(".."));
-        assert!(!is_safe_cache_subdir("../etc"));
-        assert!(!is_safe_cache_subdir("foo/../../bar"));
-        assert!(!is_safe_cache_subdir("/etc"));
-        assert!(!is_safe_cache_subdir("."));
+    fn cache_exec_subdir_is_safe_accepts_and_rejects() {
+        assert!(policy::cache_exec_subdir_is_safe("ms-playwright"));
+        assert!(policy::cache_exec_subdir_is_safe(
+            "ms-playwright/chromium-1217"
+        ));
+        assert!(policy::cache_exec_subdir_is_safe("pnpm/dlx"));
+        assert!(!policy::cache_exec_subdir_is_safe(""));
+        assert!(!policy::cache_exec_subdir_is_safe(".."));
+        assert!(!policy::cache_exec_subdir_is_safe("../etc"));
+        assert!(!policy::cache_exec_subdir_is_safe("foo/../../bar"));
+        assert!(!policy::cache_exec_subdir_is_safe("/etc"));
+        assert!(!policy::cache_exec_subdir_is_safe("."));
     }
 
     #[test]

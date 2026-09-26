@@ -2193,6 +2193,11 @@ pub fn detect_global(home: &Path) -> GlobalDetectionReport {
         detections.push(d);
     }
 
+    // Cypress Electron cache
+    if let Some(d) = detect_global_cypress(home) {
+        detections.push(d);
+    }
+
     // GPG signing configuration
     if let Some(d) = detect_global_gpg(home) {
         detections.push(d);
@@ -2233,6 +2238,19 @@ fn detect_global_playwright(home: &Path) -> Option<GlobalDetection> {
         name: "Playwright browsers",
         reason: "ms-playwright cache directory exists".to_string(),
         suggestions: vec![GlobalSuggestion::CacheExec("ms-playwright".to_string())],
+    })
+}
+
+fn detect_global_cypress(home: &Path) -> Option<GlobalDetection> {
+    let mac_path = home.join("Library/Caches/Cypress");
+    let linux_path = crate::sandbox::xdg_cache_dir(home).join("Cypress");
+    if !mac_path.is_dir() && !linux_path.is_dir() {
+        return None;
+    }
+    Some(GlobalDetection {
+        name: "Cypress",
+        reason: "Cypress cache directory exists".to_string(),
+        suggestions: vec![GlobalSuggestion::CacheExec("Cypress".to_string())],
     })
 }
 
@@ -3382,6 +3400,39 @@ services:
                 .iter()
                 .any(|d| d.name == "Playwright browsers")
         );
+    }
+
+    #[test]
+    fn global_detect_cypress_cache() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("Library/Caches/Cypress")).unwrap();
+
+        let report = detect_global(home.path());
+        let detection = report
+            .detections
+            .iter()
+            .find(|d| d.name == "Cypress")
+            .expect("Cypress cache must be detected");
+        assert!(
+            detection
+                .suggestions
+                .contains(&GlobalSuggestion::CacheExec("Cypress".to_string()))
+        );
+    }
+
+    #[test]
+    fn global_detect_cypress_cache_honors_xdg_cache_home() {
+        let home = tempfile::tempdir().unwrap();
+        let xdg = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(xdg.path().join("Cypress")).unwrap();
+
+        temp_env::with_var("XDG_CACHE_HOME", Some(xdg.path()), || {
+            let report = detect_global(home.path());
+            assert!(
+                report.detections.iter().any(|d| d.name == "Cypress"),
+                "Cypress under XDG_CACHE_HOME must be detected"
+            );
+        });
     }
 
     #[test]

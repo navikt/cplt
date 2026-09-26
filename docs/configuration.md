@@ -1107,7 +1107,7 @@ Supported ecosystems:
 | Next.js | `next.config.ts/js/mjs` | localhost 3000, `allow_localhost_any` |
 | Vite | `vite.config.ts/js/mjs` | localhost 5173, `allow_localhost_any` |
 | Flyway | `src/main/resources/db/migration` or `.../migrations` | PostgreSQL port 5432 |
-| Cypress | `cypress.config.ts/js/mjs` + `cypress/` dir | `allow_localhost_any` |
+| Cypress | `cypress.config.ts/js/mjs` + `cypress/` dir | `allow_localhost_any` (repository proposal); `allow_cache_exec` (personal config hint from `cplt init --global`) |
 
 Machine-specific suggestions such as `allow_cache_exec` or home-relative read paths come out as comments pointing you to add them to your personal `~/.config/cplt/config.toml`.
 
@@ -1129,6 +1129,7 @@ It detects:
 | Tool | Probes | Suggests |
 |------|--------|----------|
 | Playwright browsers | `~/Library/Caches/ms-playwright/` (macOS) or `~/.cache/ms-playwright/` (Linux) | `allow_cache_exec = ["ms-playwright"]` |
+| Cypress | `~/Library/Caches/Cypress/` (macOS) or `${XDG_CACHE_HOME:-~/.cache}/Cypress/` (Linux) | `allow_cache_exec = ["Cypress"]` |
 | GPG signing | `~/.gnupg/`, plus `commit.gpgsign` from global git config for the reason text | `allow_gpg_signing = true` |
 | Gradle registry credentials | `~/.gradle/gradle.properties` mentioning `repository`, `nexus`, or `artifactory` | `allow.read` for that file |
 | npm registry credentials | `~/.npmrc` with a `registry` or `_authToken` line | `allow.read` for that file |

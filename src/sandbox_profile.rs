@@ -26,7 +26,8 @@ use super::policy::{
     HomeToolDir, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir,
     SENSITIVE_PROJECT_PATTERNS, SYSTEM_READ_FILES, TOOL_READ_DIRS, XCODE_SELECT_LINK,
     active_tool_dirs, ancestor_alternation, app_dirs, colima_socket_paths, copilot_default_pkg_dir,
-    current_uid, escape_regex, first_party_read_target, grant_is_refused, home_config_link_targets,
+    current_uid, cypress_app_data_dir, cypress_runtime_intent, escape_regex,
+    first_party_read_target, grant_is_refused, home_config_link_targets,
     missing_home_config_link_targets, nested_alternation, path_bin_dirs, playwright_runtime_intent,
     read_only_home_config, rel_is_glob, rel_regex, validate_playwright_socket_dir,
     validate_sbpl_path,
@@ -119,6 +120,8 @@ pub fn generate_profile_with_playwright_socket_dir(
     // emitted when the user explicitly signals browser testing intent.
     let allow_chromium_runtime =
         playwright_runtime_intent(config.allow_cache_exec, config.allow_cache_exec_any);
+    let allow_cypress_runtime =
+        cypress_runtime_intent(config.allow_cache_exec, config.allow_cache_exec_any);
     let playwright_socket_dir =
         playwright_socket_dir.filter(|path| validate_playwright_socket_dir(path).is_ok());
 
@@ -140,6 +143,7 @@ pub fn generate_profile_with_playwright_socket_dir(
         &home,
         config.allow_browser,
         allow_chromium_runtime,
+        allow_cypress_runtime,
         config.deny_clipboard,
     );
     emit_tool_dirs(
@@ -176,6 +180,9 @@ pub fn generate_profile_with_playwright_socket_dir(
         config.extra_write,
         config.extra_exec,
     );
+    // This deny must follow user exec grants so Cypress's persistent writable
+    // state cannot become executable through a broader allow.exec ancestor.
+    emit_cypress_app_data(&mut sb, config.home_dir, allow_cypress_runtime);
     emit_deny_rules(&mut sb, config, &home);
     emit_registry_config_overrides(&mut sb, &home, config.extra_read);
     emit_denied_dotfile_overrides(
@@ -704,6 +711,7 @@ fn emit_system_access(
     home: &str,
     allow_browser: bool,
     allow_chromium_runtime: bool,
+    allow_cypress_runtime: bool,
     deny_clipboard: bool,
 ) {
     // Mach IPC — Node.js and macOS frameworks need service lookups
@@ -807,6 +815,24 @@ fn emit_system_access(
         sbpl!(
             sb,
             r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.apps\.{apps_hash_pattern}$"))"#
+        );
+        sbpl!(sb);
+    }
+
+    // Cypress's Electron build registers this rendezvous service during
+    // bootstrap. Without it, bootstrap_check_in() fails with EPERM (1100)
+    // before `cypress verify` can start its smoke test. Keep this separate from
+    // the broader Chromium runtime grant: Cypress has only demonstrated a need
+    // for this exact bundle ID and numeric PID suffix.
+    //
+    // SECURITY: this activates only for an explicit "Cypress" cache-exec entry.
+    // A repository cannot set that machine-local option, allow_cache_exec_any
+    // does not imply it, and unrelated com.electron.* services remain denied.
+    if allow_cypress_runtime {
+        sbpl!(sb, ";; Cypress Electron runtime");
+        sbpl!(
+            sb,
+            r#"(allow mach-register (global-name-regex #"^com\.electron\.cypress\.MachPortRendezvousServer\.[0-9]+$"))"#
         );
         sbpl!(sb);
     }
@@ -1369,6 +1395,7 @@ fn emit_tool_dirs(
         sbpl!(sb, "(allow file-read* (subpath \"{dir}\"))");
         sbpl!(sb, "(allow file-map-executable (subpath \"{dir}\"))");
     }
+
     // The developer directory xcode-select actually points at, when it is not
     // already covered above. Without it the xcrun shims at /usr/bin/{git,clang,
     // make,python3} cannot dlopen libxcrun.dylib and exit 1 (#342).
@@ -1569,6 +1596,24 @@ fn emit_tool_dirs(
             sbpl!(sb);
         }
     }
+}
+
+fn emit_cypress_app_data(sb: &mut String, home: &Path, allow_cypress_runtime: bool) {
+    if !allow_cypress_runtime {
+        return;
+    }
+    let path = cypress_app_data_dir(home);
+    if validate_sbpl_path(&path).is_err() {
+        return;
+    }
+    let path = path.display();
+    sbpl!(sb, ";; Cypress Electron state");
+    sbpl!(sb, "(allow file-read* (subpath \"{path}\"))");
+    sbpl!(sb, "(allow file-write* (subpath \"{path}\"))");
+    // State persists across runs, so it must never become an executable cache.
+    sbpl!(sb, "(deny process-exec (subpath \"{path}\"))");
+    sbpl!(sb, "(deny file-map-executable (subpath \"{path}\"))");
+    sbpl!(sb);
 }
 
 /// The default Copilot `pkg` directory as spelled and, when a symlink sits on

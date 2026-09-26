@@ -11,8 +11,9 @@ use cplt::is_unsafe_root;
 use cplt::proxy::{is_blocked_in_content, is_domain_match, is_private_hostname, is_private_ip};
 use cplt::sandbox::{
     HardeningCategory, PLAYWRIGHT_SOCKET_BASE_MAX_BYTES, PLAYWRIGHT_SOCKET_PATH_LIMIT,
-    PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX, SandboxConfig, build_sandbox_env, generate_policy,
-    generate_profile, generate_profile_with_playwright_socket_dir, npmrc_explicitly_allowed,
+    PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX, SandboxConfig, build_sandbox_env, cypress_app_data_dir,
+    cypress_runtime_intent, generate_policy, generate_profile,
+    generate_profile_with_playwright_socket_dir, npmrc_explicitly_allowed,
     npmrc_userconfig_override, npmrc_userconfig_stale_variants, playwright_runtime_intent,
     playwright_sockets_dir_override, tool_override_path_is_safe, tool_path_env_overrides,
     validate_playwright_socket_dir, validate_sbpl_path,
@@ -6810,6 +6811,35 @@ fn playwright_runtime_intent_is_exact_and_does_not_follow_cache_exec_any() {
 }
 
 #[test]
+fn cypress_runtime_intent_is_exact_and_does_not_follow_cache_exec_any() {
+    for cache_entry in ["Cypress", "Cypress/15.21.1"] {
+        let allow_cache_exec = [cache_entry.to_string()];
+        assert!(
+            cypress_runtime_intent(&allow_cache_exec, false),
+            "{cache_entry:?} must enable Cypress runtime intent"
+        );
+    }
+
+    for cache_entry in [
+        "cypress",
+        "CYPRESS",
+        "Cypress-evil",
+        "Cypressx",
+        "not-Cypress",
+        "xCypress",
+    ] {
+        assert!(
+            !cypress_runtime_intent(&[cache_entry.to_string()], false),
+            "{cache_entry:?} must not imply Cypress runtime intent"
+        );
+    }
+    assert!(
+        !cypress_runtime_intent(&[], true),
+        "allow_cache_exec_any alone must not imply Cypress intent"
+    );
+}
+
+#[test]
 fn playwright_socket_dir_override_uses_only_the_automatic_path() {
     let socket_dir = std::path::Path::new("/private/tmp/cplt-pw-0123456789abcdef0123456789abcdef");
     assert_eq!(
@@ -8596,6 +8626,7 @@ const CHROME_FOR_TESTING_APPS_MACH_REGISTER_PREFIX: &str =
 const CHROME_FOR_TESTING_APPS_MACH_REGISTER_SUFFIX: &str = r#"$"))"#;
 const CHROME_FOR_TESTING_APPS_HASH_ATOM: &str = "[0-9A-F]";
 const CHROME_FOR_TESTING_APPS_HASH_LENGTH: usize = 64;
+const CYPRESS_MACH_REGISTER_RULE: &str = r#"(allow mach-register (global-name-regex #"^com\.electron\.cypress\.MachPortRendezvousServer\.[0-9]+$"))"#;
 
 fn chrome_for_testing_apps_mach_register_rule() -> String {
     format!(
@@ -8881,6 +8912,120 @@ fn chromium_runtime_mach_register_rules_remain_narrow() {
             "broader or unsupported mach-register rule must not be emitted: {disallowed_rule}"
         );
     }
+}
+
+#[test]
+fn cypress_runtime_emits_only_its_narrow_mach_registration() {
+    let app_data = cypress_app_data_dir(Path::new("/Users/test"));
+    let app_data = app_data.display();
+    for cache_entry in ["Cypress", "Cypress/15.21.1"] {
+        let p = generate_profile(
+            &SandboxConfig {
+                allow_cache_exec: &[cache_entry.to_string()],
+                ..base_profile_options()
+            },
+            &[],
+        );
+        assert!(
+            p.contains(CYPRESS_MACH_REGISTER_RULE),
+            "Cypress runtime rule must be present for {cache_entry:?}"
+        );
+        assert!(
+            !p.contains("(allow syscall*)")
+                && !p.contains("(allow system-socket (socket-domain AF_UNIX))")
+                && !p.contains("(allow iokit-open-user-client)")
+                && !p.contains(r"^org\.chromium\.")
+                && !p.contains(CHROME_FOR_TESTING_MACH_REGISTER_RULE),
+            "Cypress intent must not inherit Playwright's broader Chromium permissions"
+        );
+        assert!(
+            p.contains(&format!("(allow file-read* (subpath \"{app_data}\"))"))
+                && p.contains(&format!("(allow file-write* (subpath \"{app_data}\"))"))
+                && p.contains(&format!("(deny process-exec (subpath \"{app_data}\"))"))
+                && p.contains(&format!(
+                    "(deny file-map-executable (subpath \"{app_data}\"))"
+                )),
+            "Cypress app state must be writable but non-executable"
+        );
+    }
+
+    for cache_entry in [
+        None,
+        Some("some-other-tool"),
+        Some("ms-playwright"),
+        Some("cypress"),
+        Some("Cypress-evil"),
+        Some("xCypress"),
+    ] {
+        let allow_cache_exec = cache_entry
+            .map(|entry| vec![entry.to_string()])
+            .unwrap_or_default();
+        let p = generate_profile(
+            &SandboxConfig {
+                allow_cache_exec: &allow_cache_exec,
+                ..base_profile_options()
+            },
+            &[],
+        );
+        assert!(
+            !p.contains(CYPRESS_MACH_REGISTER_RULE),
+            "{cache_entry:?} must not enable the Cypress Mach registration"
+        );
+        assert!(
+            !p.contains(";; Cypress Electron state"),
+            "{cache_entry:?} must not enable Cypress app state"
+        );
+    }
+
+    let broad_cache_profile = generate_profile(
+        &SandboxConfig {
+            allow_cache_exec_any: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    assert!(
+        !broad_cache_profile.contains(CYPRESS_MACH_REGISTER_RULE),
+        "allow_cache_exec_any alone must not enable the Cypress Mach registration"
+    );
+
+    let p = generate_profile(
+        &SandboxConfig {
+            allow_cache_exec: &["Cypress".to_string()],
+            ..base_profile_options()
+        },
+        &[],
+    );
+    for disallowed_rule in [
+        "(allow mach-register)",
+        r#"(allow mach-register (global-name-regex #"^com\.electron\..+$"))"#,
+        r#"(allow mach-register (global-name-regex #"^com\.electron\.cypress\..+$"))"#,
+        r#"(allow mach-register (global-name-regex #"com\.electron\.cypress\.MachPortRendezvousServer\.[0-9]+$"))"#,
+        r#"(allow mach-register (global-name-regex #"^com\.electron\.cypress\.MachPortRendezvousServer\..+$"))"#,
+    ] {
+        assert!(
+            !p.lines().any(|line| line == disallowed_rule),
+            "broader Cypress mach-register rule must not be emitted: {disallowed_rule}"
+        );
+    }
+}
+
+#[test]
+fn cypress_runtime_grants_non_executable_app_state_on_landlock() {
+    let allow_cache_exec = ["Cypress".to_string()];
+    let policy = generate_policy(&SandboxConfig {
+        allow_cache_exec: &allow_cache_exec,
+        ..base_profile_options()
+    });
+    let app_data = cypress_app_data_dir(Path::new("/Users/test"));
+    let rule = policy
+        .fs_rules
+        .iter()
+        .find(|rule| rule.path == app_data)
+        .expect("Cypress intent must grant its app state directory");
+    assert!(rule.access.read);
+    assert!(rule.access.write);
+    assert!(!rule.access.execute);
 }
 
 // ============================================================
