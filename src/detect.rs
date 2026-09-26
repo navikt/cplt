@@ -2242,9 +2242,12 @@ fn detect_global_playwright(home: &Path) -> Option<GlobalDetection> {
 }
 
 fn detect_global_cypress(home: &Path) -> Option<GlobalDetection> {
-    let mac_path = home.join("Library/Caches/Cypress");
-    let linux_path = crate::sandbox::xdg_cache_dir(home).join("Cypress");
-    if !mac_path.is_dir() && !linux_path.is_dir() {
+    let cache_path = if cfg!(target_os = "macos") {
+        home.join("Library/Caches/Cypress")
+    } else {
+        crate::sandbox::xdg_cache_dir(home).join("Cypress")
+    };
+    if !cache_path.is_dir() {
         return None;
     }
     Some(GlobalDetection {
