@@ -79,11 +79,13 @@ pub use policy::{
     SENSITIVE_PROJECT_PATTERNS, TOOL_PATH_ENV_VARS, ToolPathEnvVar, ToolPathOverride, ToolRoot,
     active_tool_dirs, app_dirs, build_credential_grants, copilot_default_pkg_dir, copilot_pkg_dir,
     copilot_pkg_dirs, copilot_ro_protect_paths, credential_link_hop, current_uid,
+    cypress_app_data_dir, cypress_app_data_dir_with_env, cypress_runtime_intent,
     exec_write_conflicts, home_config_link_targets, home_tool_dirs, linux_docker_socket_paths,
     linux_runtime_dirs, mise_ro_protect_paths, nested_alternation, no_cache_env, path_bin_dirs,
     playwright_runtime_intent, process_env, relocatable_tool_prefix, shim_ro_protect_paths,
     socket_mask_paths, tool_override_path_is_safe, tool_path_env_overrides,
-    validate_playwright_socket_dir, validate_sbpl_path, xdg_runtime_dir_env,
+    validate_playwright_socket_dir, validate_sbpl_path, xdg_cache_dir, xdg_cache_dir_with_env,
+    xdg_runtime_dir_env,
 };
 
 // SBPL profile generation — kept public for unit tests.
@@ -383,7 +385,9 @@ pub fn prepare_with_pnpm_shadow(
     validate_playwright_socket_capability(config.playwright_socket_dir)?;
     validate_hard_denied_grants(config)?;
     validate_pnpm_tool_dirs(config)?;
+    validate_cache_exec_dirs(config)?;
     validate_exec_grants(config)?;
+    prepare_cypress_app_data(config, inspect_only)?;
     validate_copilot_cache_env(config)?;
     if !inspect_only {
         create_default_copilot_pkg_dir(config)?;
@@ -451,6 +455,162 @@ fn validate_pnpm_tool_dirs(config: &SandboxConfig) -> Result<(), String> {
             }
         }
     }
+    Ok(())
+}
+
+/// Refuse cache-exec entries that resolve outside their configured cache path.
+///
+/// Landlock opens each entry with `O_PATH`, which follows symlinks and grants
+/// the target read, write, and execute. A link planted during one session must
+/// therefore stop the next launch instead of turning a narrow cache opt-in into
+/// permissions on an arbitrary target.
+fn validate_cache_exec_dirs(config: &SandboxConfig) -> Result<(), String> {
+    if config.allow_cache_exec.is_empty() && !config.allow_cache_exec_any {
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    let cache_base = config.home_dir.join("Library/Caches");
+    #[cfg(not(target_os = "macos"))]
+    let cache_base = policy::xdg_cache_dir_with_env(config.home_dir, config.copilot_cache_env);
+
+    let expected_base = if let Ok(relative) = cache_base.strip_prefix(config.home_dir) {
+        std::fs::canonicalize(config.home_dir)
+            .map_err(|e| format!("Cannot resolve HOME {}: {e}", config.home_dir.display()))?
+            .join(relative)
+    } else {
+        cache_base.clone()
+    };
+    let resolved_base = crate::config::canonicalize_deepest(&cache_base);
+    if resolved_base != expected_base {
+        return Err(format!(
+            "Cache-exec root {} resolves through a symlink to {}. cplt refuses to grant \
+             writable executable cache access through a redirected root. Replace the symlink \
+             with a real directory.",
+            cache_base.display(),
+            resolved_base.display()
+        ));
+    }
+    if !policy::tool_override_path_is_safe(&resolved_base, config.home_dir) {
+        return Err(format!(
+            "Cache-exec root {} is not a safe cache directory. It cannot be `/`, `/tmp`, \
+             `$HOME`, an ancestor of `$HOME`, or a platform system directory.",
+            cache_base.display()
+        ));
+    }
+
+    for subdir in config.allow_cache_exec {
+        if !policy::cache_exec_subdir_is_safe(subdir) {
+            return Err(format!(
+                "allow_cache_exec subdir {subdir:?} must be a non-empty relative cache path \
+                 without `.` or `..` components"
+            ));
+        }
+        let named = cache_base.join(subdir);
+        let expected = resolved_base.join(subdir);
+        let resolved = crate::config::canonicalize_deepest(&named);
+        if resolved != expected {
+            return Err(format!(
+                "allow_cache_exec path {} resolves through a symlink to {}. cplt refuses a \
+                 writable executable cache whose target differs from its configured path. \
+                 Replace the symlink with a real directory.",
+                named.display(),
+                resolved.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate Cypress's persistent state before either backend grants it write.
+///
+/// Landlock follows symlinks and unions rules, so a link into any executable
+/// tree would turn the state grant into write+execute. Creating the fixed path
+/// here also ensures Bubblewrap sees it while constructing writable bind mounts.
+fn prepare_cypress_app_data(config: &SandboxConfig, inspect_only: bool) -> Result<(), String> {
+    if !policy::cypress_runtime_intent(config.allow_cache_exec, config.allow_cache_exec_any) {
+        return Ok(());
+    }
+
+    let named = policy::cypress_app_data_dir_with_env(config.home_dir, config.copilot_cache_env);
+    let expected = if let Ok(relative) = named.strip_prefix(config.home_dir) {
+        std::fs::canonicalize(config.home_dir)
+            .map_err(|e| format!("Cannot resolve HOME {}: {e}", config.home_dir.display()))?
+            .join(relative)
+    } else {
+        named.clone()
+    };
+    let resolved = crate::config::canonicalize_deepest(&named);
+    if resolved != expected {
+        return Err(format!(
+            "Cypress app state {} resolves through a symlink to {}. cplt refuses to grant \
+             persistent write access where another rule may also grant execution. Replace the \
+             symlink with a real directory.",
+            named.display(),
+            resolved.display()
+        ));
+    }
+
+    let parent = resolved
+        .parent()
+        .expect("Cypress app state must have a parent");
+    for (writable, source) in canonical_writable_trees(config) {
+        if parent.starts_with(&writable) {
+            return Err(format!(
+                "Cypress app state parent {} is inside {source} {}. A sandboxed process could \
+                 replace the state directory with a symlink after validation and combine its \
+                 write grant with execution elsewhere. Narrow the writable path so it does not \
+                 include Cypress's application-support parent.",
+                parent.display(),
+                writable.display()
+            ));
+        }
+    }
+
+    let mut executable: Vec<PathBuf> = landlock_mod::generate_policy(config)
+        .fs_rules
+        .into_iter()
+        .filter(|rule| rule.access.execute)
+        .map(|rule| rule.path)
+        .collect();
+    executable.extend(config.electron_app_dir.map(Path::to_path_buf));
+
+    for path in executable {
+        let path = crate::config::canonicalize_deepest(&path);
+        if resolved.starts_with(&path) || path.starts_with(&resolved) {
+            return Err(format!(
+                "Cypress app state {} overlaps executable tree {}. Landlock unions filesystem \
+                 permissions, so this would make writable browser state executable. Move the \
+                 project or executable path away from Cypress's application-support directory.",
+                named.display(),
+                path.display()
+            ));
+        }
+    }
+
+    if !inspect_only {
+        std::fs::create_dir_all(&named).map_err(|e| {
+            format!(
+                "Cannot create Cypress app state directory {}: {e}",
+                named.display()
+            )
+        })?;
+        let created = std::fs::canonicalize(&named).map_err(|e| {
+            format!(
+                "Cannot resolve Cypress app state directory {} after creating it: {e}",
+                named.display()
+            )
+        })?;
+        if created != expected {
+            return Err(format!(
+                "Cypress app state {} changed to resolve to {} while cplt prepared it. Refusing \
+                 to grant persistent write access.",
+                named.display(),
+                created.display()
+            ));
+        }
+    }
+
     Ok(())
 }
 
@@ -1092,6 +1252,12 @@ fn writable_trees(config: &SandboxConfig) -> Vec<(PathBuf, &'static str)> {
                 .iter()
                 .map(|f| (dir.path.join(f), "the writable agent file")),
         );
+    }
+    if policy::cypress_runtime_intent(config.allow_cache_exec, config.allow_cache_exec_any) {
+        trees.push((
+            policy::cypress_app_data_dir_with_env(config.home_dir, config.copilot_cache_env),
+            "the writable Cypress state directory",
+        ));
     }
     // A worktree's or bare repo's real `.git` is granted write so git can
     // update refs and the index from inside the sandbox.
@@ -2518,6 +2684,144 @@ mod tests {
         let error = validate_exec_grants(&config).expect_err("the overlap must be refused");
         assert!(error.contains(".local/share/opencode"), "{error}");
         assert!(error.contains("writable agent directory"), "{error}");
+    }
+
+    #[test]
+    fn exec_grant_over_cypress_app_data_is_refused() {
+        let home = Path::new("/home/test");
+        let allow_cache_exec = ["Cypress".to_string()];
+        let app_data = policy::cypress_app_data_dir_with_env(home, &policy::no_cache_env);
+        let exec = [app_data
+            .parent()
+            .expect("Cypress app data must have a parent")
+            .to_path_buf()];
+        let mut config = test_config(home, &[]);
+        config.existing_home_tool_dirs = Some(&[]);
+        config.allow_cache_exec = &allow_cache_exec;
+        config.extra_exec = &exec;
+
+        let error = validate_exec_grants(&config).expect_err("the overlap must be refused");
+        assert!(error.contains(&app_data.display().to_string()), "{error}");
+        assert!(
+            error.contains("writable Cypress state directory"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn symlinked_cache_exec_directory_is_refused() {
+        let (_guard, root) = copilot_cache_tree();
+        let home = root.join("home");
+        let project = root.join("project");
+        #[cfg(target_os = "macos")]
+        let cache = home.join("Library/Caches");
+        #[cfg(not(target_os = "macos"))]
+        let cache = policy::xdg_cache_dir(&home);
+        std::fs::create_dir_all(&cache).unwrap();
+        std::os::unix::fs::symlink(&project, cache.join("Cypress")).unwrap();
+        let allow_cache_exec = ["Cypress".to_string()];
+        let mut config = test_config(&home, &[]);
+        config.project_dir = &project;
+        config.existing_home_tool_dirs = Some(&[]);
+        config.allow_cache_exec = &allow_cache_exec;
+        config.use_bubblewrap = Some(false);
+
+        let Err(error) = prepare(&config) else {
+            panic!("symlinked cache-exec directory must be refused");
+        };
+        assert!(error.contains("allow_cache_exec path"), "{error}");
+        assert!(error.contains(&project.display().to_string()), "{error}");
+    }
+
+    #[test]
+    fn symlinked_cache_exec_root_is_refused_for_allow_any() {
+        let (_guard, root) = copilot_cache_tree();
+        let home = root.join("home");
+        let project = root.join("project");
+        #[cfg(target_os = "macos")]
+        let cache = home.join("Library/Caches");
+        #[cfg(not(target_os = "macos"))]
+        let cache = home.join(".cache");
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&project, &cache).unwrap();
+        let mut config = test_config(&home, &[]);
+        config.project_dir = &project;
+        config.existing_home_tool_dirs = Some(&[]);
+        config.allow_cache_exec_any = true;
+        config.use_bubblewrap = Some(false);
+
+        let Err(error) = prepare(&config) else {
+            panic!("symlinked cache-exec root must be refused");
+        };
+        assert!(error.contains("Cache-exec root"), "{error}");
+        assert!(error.contains(&project.display().to_string()), "{error}");
+    }
+
+    #[test]
+    fn cypress_app_data_is_created_before_backend_preparation() {
+        let (_guard, root) = copilot_cache_tree();
+        let home = root.join("home");
+        let project = root.join("project");
+        let allow_cache_exec = ["Cypress".to_string()];
+        let mut config = test_config(&home, &[]);
+        config.project_dir = &project;
+        config.existing_home_tool_dirs = Some(&[]);
+        config.allow_cache_exec = &allow_cache_exec;
+        config.use_bubblewrap = Some(false);
+        let app_data = policy::cypress_app_data_dir_with_env(&home, &policy::no_cache_env);
+
+        prepare_with_pnpm_shadow(&config, None, true).expect("inspection must validate");
+        assert!(!app_data.exists(), "inspection must not create app state");
+
+        prepare(&config).expect("launch must prepare app state");
+        assert!(app_data.is_dir(), "launch must create app state");
+    }
+
+    #[test]
+    fn cypress_app_data_symlink_is_refused() {
+        let (_guard, root) = copilot_cache_tree();
+        let home = root.join("home");
+        let project = root.join("project");
+        let allow_cache_exec = ["Cypress".to_string()];
+        let app_data = policy::cypress_app_data_dir_with_env(&home, &policy::no_cache_env);
+        std::fs::create_dir_all(app_data.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&project, &app_data).unwrap();
+        let mut config = test_config(&home, &[]);
+        config.project_dir = &project;
+        config.existing_home_tool_dirs = Some(&[]);
+        config.allow_cache_exec = &allow_cache_exec;
+        config.use_bubblewrap = Some(false);
+
+        let Err(error) = prepare(&config) else {
+            panic!("symlinked state must be refused");
+        };
+        assert!(error.contains("resolves through a symlink"), "{error}");
+        assert!(error.contains(&project.display().to_string()), "{error}");
+    }
+
+    #[test]
+    fn writable_cypress_app_data_parent_is_refused() {
+        let (_guard, root) = copilot_cache_tree();
+        let home = root.join("home");
+        let project = root.join("project");
+        let allow_cache_exec = ["Cypress".to_string()];
+        let app_data = policy::cypress_app_data_dir_with_env(&home, &policy::no_cache_env);
+        let writes = [app_data.parent().unwrap().to_path_buf()];
+        let mut config = test_config(&home, &[]);
+        config.project_dir = &project;
+        config.extra_write = &writes;
+        config.existing_home_tool_dirs = Some(&[]);
+        config.allow_cache_exec = &allow_cache_exec;
+        config.use_bubblewrap = Some(false);
+
+        let Err(error) = prepare(&config) else {
+            panic!("writable parent must be refused");
+        };
+        assert!(
+            error.contains("could replace the state directory"),
+            "{error}"
+        );
+        assert!(error.contains(&writes[0].display().to_string()), "{error}");
     }
 
     /// The ro_protect set the bwrap overlay consumes, end to end.

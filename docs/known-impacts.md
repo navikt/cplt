@@ -255,18 +255,53 @@ Some tools unpack and execute binaries straight out of `~/Library/Caches` (macOS
 | Tool | Cache path | Fix |
 |---|---|---|
 | Playwright Chromium | `~/Library/Caches/ms-playwright/` · `~/.cache/ms-playwright/` | Allow cache exec and disable Chromium's nested sandbox; see below |
+| Cypress | `~/Library/Caches/Cypress/` · `${XDG_CACHE_HOME:-~/.cache}/Cypress/` | Personal `allow_cache_exec`; repository proposal for `allow_localhost_any` |
 | pnpm dlx | `~/Library/Caches/pnpm/dlx/` · `~/.cache/pnpm/dlx/` | `--allow-cache-exec pnpm/dlx` |
 
 **Fix:**
 
 ```bash
 cplt config set sandbox.allow_cache_exec ms-playwright
+cplt config set sandbox.allow_cache_exec Cypress
 cplt config set sandbox.allow_cache_exec pnpm/dlx
 ```
 
-Or for a single run: `cplt --allow-cache-exec ms-playwright --allow-cache-exec pnpm/dlx`
+Or for a single run, repeat the flag as needed:
+`cplt --allow-cache-exec ms-playwright --allow-cache-exec Cypress --allow-cache-exec pnpm/dlx`
 
 `--allow-cache-exec-any` opens exec for the entire cache tree (`~/Library/Caches` on macOS, `~/.cache` on Linux). Last resort only.
+
+On macOS, the explicit `Cypress` entry also grants Electron permission to
+register only `com.electron.cypress.MachPortRendezvousServer.<numeric-pid>`.
+It grants read/write, but not execution, under
+`~/Library/Application Support/Cypress`, where Cypress keeps browser profiles
+and project state. Without it, `cypress verify` exits during bootstrap with
+`EPERM (1100)`, or a test run fails while opening its state.
+
+Cypress uses separate ephemeral loopback ports for its HTTP/WebSocket server
+and the browser's debugging protocol. Prefer requesting this in the committed
+`.cplt.toml`, because it is a project requirement rather than a machine setting:
+
+```toml
+[propose]
+allow_localhost_any = true
+```
+
+Each user approves the request with `cplt trust accept`. For a single run, use
+`--allow-localhost-any`. Setting `sandbox.allow_localhost_any` globally also
+works, but is not necessary.
+
+`proxy.forced` takes precedence and disables this broad localhost grant. To keep
+forced proxying, pin both Cypress ports and allow only those:
+
+```bash
+CYPRESS_REMOTE_DEBUGGING_PORT=9333 cplt \
+  --pass-env CYPRESS_REMOTE_DEBUGGING_PORT \
+  --allow-localhost 9222 \
+  --allow-localhost 9333 \
+  --allow-cache-exec Cypress \
+  exec -- ./node_modules/.bin/cypress run --port 9222
+```
 
 > **Playwright Chromium on macOS and Linux:** Chromium cannot run its own
 > nested sandbox in here. On macOS its helpers inherit cplt's profile and cannot

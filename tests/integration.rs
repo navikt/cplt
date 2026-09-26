@@ -434,7 +434,8 @@ mod macos_tests {
     // ============================================================
 
     use cplt::sandbox::{
-        SandboxConfig, generate_profile, generate_profile_with_playwright_socket_dir,
+        SandboxConfig, cypress_app_data_dir, generate_profile,
+        generate_profile_with_playwright_socket_dir,
     };
 
     /// Write a real cplt-generated profile to a temp file.
@@ -1382,6 +1383,185 @@ mod macos_tests {
             &sandbox_token,
         );
         eprintln!("chrome-for-testing stage: sandboxed launch ready");
+    }
+
+    #[test]
+    fn real_profile_cypress_app_state_is_writable_but_not_executable() {
+        require_sandbox!();
+
+        let project = fs::canonicalize(".").unwrap();
+        let parent = project.parent().expect("checkout must have a parent");
+        let fake_home = tempfile::Builder::new()
+            .prefix(".cplt-cypress-home-")
+            .tempdir_in(parent)
+            .expect("create isolated Cypress home");
+        let home = fs::canonicalize(fake_home.path()).unwrap();
+        let app_data = cypress_app_data_dir(&home);
+        fs::create_dir_all(&app_data).expect("create Cypress app state directory");
+
+        let allow_cache_exec = ["Cypress".to_string()];
+        let mut opts = default_opts(&project, &home);
+        opts.allow_cache_exec = &allow_cache_exec;
+        let profile = write_real_profile(&opts);
+
+        let marker = app_data.join("state.txt");
+        let write = Command::new("sandbox-exec")
+            .arg("-f")
+            .arg(&profile)
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg("printf cypress-state > \"$CPLT_CYPRESS_STATE\"")
+            .env("CPLT_CYPRESS_STATE", &marker)
+            .output()
+            .expect("write Cypress state under sandbox-exec");
+        assert!(
+            write.status.success()
+                && fs::read_to_string(&marker).is_ok_and(|state| state == "cypress-state"),
+            "Cypress app state write must succeed: {}{}",
+            String::from_utf8_lossy(&write.stdout),
+            String::from_utf8_lossy(&write.stderr)
+        );
+
+        let executable = app_data.join("must-not-run.sh");
+        fs::write(&executable, "#!/bin/sh\nexit 0\n").expect("write executable probe");
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+        assert!(
+            Command::new(&executable)
+                .status()
+                .is_ok_and(|status| status.success()),
+            "control executable must run outside the sandbox"
+        );
+
+        let denied = Command::new("sandbox-exec")
+            .arg("-f")
+            .arg(&profile)
+            .arg(&executable)
+            .output()
+            .expect("attempt Cypress app state execution under sandbox-exec");
+        fs::remove_file(&profile).ok();
+        assert!(
+            !denied.status.success(),
+            "Cypress app state must remain non-executable"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an installed Cypress binary named by CPLT_CYPRESS_BINARY"]
+    fn real_profile_runs_cypress_electron_spec() {
+        require_sandbox!();
+
+        let Some(cypress) = std::env::var_os("CPLT_CYPRESS_BINARY") else {
+            eprintln!("SKIPPED (cypress): CPLT_CYPRESS_BINARY is not set");
+            return;
+        };
+        let cypress = fs::canonicalize(cypress)
+            .expect("CPLT_CYPRESS_BINARY must identify an existing executable");
+        let expected_suffix = Path::new("Cypress.app/Contents/MacOS/Cypress");
+        assert!(
+            cypress.is_absolute() && cypress.ends_with(expected_suffix),
+            "CPLT_CYPRESS_BINARY must identify the expected Cypress.app executable"
+        );
+        let home = home_dir();
+        let cypress_cache = home.join("Library/Caches/Cypress");
+        assert!(
+            cypress.starts_with(&cypress_cache),
+            "CPLT_CYPRESS_BINARY must be inside {} so the test exercises the cache-exec grant",
+            cypress_cache.display()
+        );
+        let metadata = fs::metadata(&cypress)
+            .expect("CPLT_CYPRESS_BINARY executable metadata should be readable");
+        assert!(
+            metadata.is_file() && metadata.permissions().mode() & 0o111 != 0,
+            "CPLT_CYPRESS_BINARY must identify an executable file"
+        );
+
+        let fixture = tempfile::Builder::new()
+            .prefix(".cplt-cypress-project-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("create Cypress fixture");
+        let project = fixture.path().join("project");
+        let spec_dir = project.join("cypress/e2e");
+        let browser_state = project.join(".browser-state");
+        fs::create_dir_all(&spec_dir).expect("create Cypress spec directory");
+        fs::create_dir_all(&browser_state).expect("create Cypress browser state");
+        fs::write(
+            project.join("cypress.config.js"),
+            "module.exports = { e2e: { supportFile: false }, video: false };\n",
+        )
+        .expect("write Cypress config");
+        let spec = spec_dir.join("sandbox.cy.js");
+        fs::write(
+            &spec,
+            "it('connects', () => { expect(true).to.equal(true) })\n",
+        )
+        .expect("write Cypress spec");
+
+        // Keep browser state isolated from the developer's profile. The
+        // dedicated test above exercises the default application-state grant.
+        let cypress_args = [
+            "--run-project",
+            project
+                .to_str()
+                .expect("fixture project path must be UTF-8"),
+            "--browser",
+            "electron",
+            "--spec",
+            spec.to_str().expect("fixture spec path must be UTF-8"),
+            "--user-data-dir",
+            browser_state
+                .to_str()
+                .expect("browser state path must be UTF-8"),
+        ];
+        let direct = Command::new(&cypress)
+            .args(cypress_args)
+            .env("CYPRESS_INTERNAL_BROWSER_CONNECT_TIMEOUT", "5000")
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("run direct Cypress spec control");
+        let direct_output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&direct.stdout),
+            String::from_utf8_lossy(&direct.stderr)
+        );
+        assert!(
+            direct.status.success() && direct_output.contains("1 passing"),
+            "direct Cypress spec control failed; the runner cannot prove sandbox support:\n\
+             {direct_output}"
+        );
+        fs::remove_dir_all(&browser_state).expect("reset direct Cypress browser state");
+        fs::create_dir(&browser_state).expect("recreate sandboxed Cypress browser state");
+
+        let project = fs::canonicalize(&project).unwrap();
+        let allow_cache_exec = ["Cypress".to_string()];
+        let mut opts = default_opts(&project, &home);
+        opts.allow_cache_exec = &allow_cache_exec;
+        opts.allow_localhost_any = true;
+        let profile = tempfile::NamedTempFile::new()
+            .expect("create generated Cypress test profile")
+            .into_temp_path();
+        fs::write(&profile, generate_profile(&opts, &[]))
+            .expect("write generated Cypress test profile");
+
+        let sandboxed = Command::new("sandbox-exec")
+            .arg("-f")
+            .arg(profile.as_os_str())
+            .arg(&cypress)
+            .args(cypress_args)
+            .env("CYPRESS_INTERNAL_BROWSER_CONNECT_TIMEOUT", "5000")
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("run Cypress spec under sandbox-exec");
+        let sandboxed_output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&sandboxed.stdout),
+            String::from_utf8_lossy(&sandboxed.stderr)
+        );
+        assert!(
+            sandboxed.status.success() && sandboxed_output.contains("1 passing"),
+            "sandboxed Cypress spec failed:\n{sandboxed_output}"
+        );
     }
 
     /// #552: Seatbelt itself must not let the `.` in a home path like
