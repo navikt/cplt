@@ -273,6 +273,29 @@ pub fn launch(
     )
 }
 
+/// A directory under `$HOME`, backed by a `tempfile::TempDir` so it
+/// auto-deletes on drop — including when a test panics (Drop runs during
+/// unwind).
+///
+/// Several e2e tests need a list/lock file in a tree the sandboxed session
+/// cannot write, to prove the *parent* can still read it while the sandbox
+/// denies the child. `$TMPDIR`/`tempfile::tempdir()` doesn't prove that: the
+/// sandbox profile makes it wholesale-writable, so the test would pass
+/// vacuously. `$HOME`, deny-by-default with nothing granted, is the tree that
+/// makes the assertion mean something — see call sites for the full argument
+/// (#426, #499).
+///
+/// # Panics
+/// If `$HOME` is unset or the directory cannot be created.
+#[must_use]
+pub fn home_temp_dir(prefix: &str) -> tempfile::TempDir {
+    let home = std::env::var("HOME").expect("HOME");
+    tempfile::Builder::new()
+        .prefix(&format!(".cplt-e2e-{prefix}-"))
+        .tempdir_in(&home)
+        .expect("create temp dir under HOME")
+}
+
 /// A work tree with one commit and an `origin` pointing at a bare repository
 /// beside it: `(tempdir, work, origin)`.
 ///

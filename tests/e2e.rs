@@ -25,7 +25,7 @@ mod e2e_tests {
 
     use crate::common::{
         bare_origin_repo, binary_path, cplt_cmd, cplt_cmd_with_ambient_config, cplt_local, git_cmd,
-        git_ok, make_config_home, shim_cmd, temp_repo,
+        git_ok, home_temp_dir, make_config_home, shim_cmd, temp_repo,
     };
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -8716,10 +8716,8 @@ paths = [
     #[test]
     fn e2e_pi_trust_lock_is_creatable_but_nothing_else_in_the_root_moves() {
         require_sandbox!();
-        let real_home = PathBuf::from(std::env::var("HOME").expect("HOME"));
-        let fake_home = real_home.join(format!(".cplt-e2e-pi-lock-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&fake_home);
-        let agent = fake_home.join(".pi/agent");
+        let fake_home = home_temp_dir("pi-lock");
+        let agent = fake_home.path().join(".pi/agent");
         for d in ["bin", "tmp", "sessions", "extensions"] {
             std::fs::create_dir_all(agent.join(d)).unwrap();
         }
@@ -8740,7 +8738,7 @@ paths = [
                 "--project-dir",
                 project.path().to_str().unwrap(),
             ])
-            .env("HOME", &fake_home)
+            .env("HOME", fake_home.path())
             .output()
             .expect("run cplt --print-profile");
         assert!(
@@ -8809,7 +8807,5 @@ paths = [
             "the managed binary must be byte-for-byte untouched"
         );
         assert!(agent.join("bin").is_dir() && agent.join("extensions").is_dir());
-
-        let _ = std::fs::remove_dir_all(&fake_home);
     }
 }

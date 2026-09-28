@@ -5,7 +5,7 @@ mod common;
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod tests {
-    use super::common::{cplt_cmd, git_cmd};
+    use super::common::{cplt_cmd, git_cmd, home_temp_dir};
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::process::{Command, Output};
@@ -175,11 +175,8 @@ mod tests {
             // could rewrite its own egress rules (#426, #499). Under `$HOME`,
             // which is deny-by-default and granted nothing here, the parent
             // still reads it — the same shape `tests/e2e_projects.rs` uses.
-            let home = std::env::var("HOME").expect("HOME");
-            let list_dir = std::path::Path::new(&home)
-                .join(format!(".cplt-e2e-network-lists-{}", std::process::id()));
-            std::fs::create_dir_all(&list_dir).expect("list dir");
-            let allowlist = list_dir.join("allowed-domains.txt");
+            let list_dir = home_temp_dir("network-lists");
+            let allowlist = list_dir.path().join("allowed-domains.txt");
             std::fs::write(&allowlist, "permitted.example.invalid\n").unwrap();
             let mut command = command(&project);
             command
