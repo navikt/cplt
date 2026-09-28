@@ -699,6 +699,7 @@ The settings below are machine-specific or local CLI preferences, so `.cplt.toml
 | `sandbox.audit` | local output preference, not project sandbox policy |
 | `sandbox.gradle_init` | writes to the machine's Gradle user home, not project policy |
 | `sandbox.deny_nested_git` | a staged hardening switch, see [Blocking new nested `.git` entries](#blocking-new-nested-git-entries-sandboxdeny_nested_git) |
+| `sandbox.refuse_cache_exec_links` | a staged hardening switch, see [Symlinked cache-exec entries](#symlinked-cache-exec-entries-sandboxrefuse_cache_exec_links) |
 | `sandbox.deny_key_files_by_extension` | a staged hardening switch, see [Denying key files by extension](#denying-key-files-by-extension-sandboxdeny_key_files_by_extension) |
 | `sandbox.refuse_invalid_repo_config` | decides how a repo's own broken config is treated, so the repo cannot set it; see [Refusing an invalid `.cplt.toml`](#refusing-an-invalid-cplttoml-sandboxrefuse_invalid_repo_config) |
 | `sandbox.deny_copilot_dir_exec` | a staged hardening switch, see [No execute on `~/.copilot`](#no-execute-on-copilot-sandboxdeny_copilot_dir_exec) |
@@ -794,6 +795,18 @@ With the key on, cplt refuses to launch instead, for both cases: a file it canno
 It is off by default, and it is set in your own config, never in `.cplt.toml`. Turning it on means that anyone who can write a repository's `.cplt.toml` can stop every launch there. That includes an earlier agent session on either platform, in the launch repository or a named one. A session can commit a broken `.cplt.toml` into HEAD, and that commit shows in `git log`. On the Landlock-only Linux path a session can also edit the uncommitted working-tree file. The refusal is loud and names the file, so this can stop your work but cannot weaken the sandbox.
 
 The key catches broken or mistyped files. It is not a defence against an adversarial session: a session that can commit a broken file can just as easily commit a valid one with the `[deny]` section removed, and cplt applies that without complaint. With the key off, cplt launches as before.
+
+## Symlinked cache-exec entries (`sandbox.refuse_cache_exec_links`)
+
+Linux only. An `allow_cache_exec` entry such as `ms-playwright` or `pnpm/dlx` can reach its directory through a symlink inside `~/.cache`, at the entry itself or at a directory above it. Landlock grants the directory the link points to, so that is where the agent gets write and execute. cplt grants that target by default, prints a warning naming it, and refuses a target it will never make writable and executable: exactly `/`, `/tmp`, `$HOME` or a parent of it, or a system root such as `/usr` (the root itself, not a path below it); anything inside a dot directory in `$HOME` other than `~/.cache` (`~/.config/systemd/user`, `~/.config/autostart`, `~/.local/bin`, `~/.claude`, …) or inside `~/bin`, where the host loads code from on its own; anything inside `/run`, `/var/tmp` or `/dev/shm`; a credential directory, cplt's own state, the project, or any other path the sandbox already grants, such as a tool directory or `~/.cache/pnpm` itself. A cache moved to a data disk or an ordinary directory in `$HOME` keeps working. cplt never creates a linked entry's target; a missing one gets no grant until you create it.
+
+```bash
+cplt config set sandbox.refuse_cache_exec_links true
+```
+
+With the key on, any such link stops the launch. The sandbox can write `~/.cache`, so an earlier session could have planted the link or re-pointed it at a directory the checks above do not know about, such as a project checkout's build output or a tool prefix no rule names. The key is off by default because turning it on breaks a cache you moved on purpose with a symlink, which works without it.
+
+Either way, cplt opens the directory it checked without following any symlink when the launch applies the sandbox. A link swapped in after the check, at any level, stops the launch instead of moving the grant. A symlinked `~/.cache` itself (which only you can create, since the sandbox cannot write `$HOME`) is checked the same way and refused under the key; the scratch directory, on by default, refuses it regardless, so it only works with `--no-scratch-dir`. macOS is unaffected: Seatbelt checks the resolved path against rules on the literal cache path, so a link there grants nothing extra.
 
 ## Blocking new nested `.git` entries (`sandbox.deny_nested_git`)
 
@@ -1136,7 +1149,7 @@ Supported ecosystems:
 | Next.js | `next.config.ts/js/mjs` | localhost 3000, `allow_localhost_any` |
 | Vite | `vite.config.ts/js/mjs` | localhost 5173, `allow_localhost_any` |
 | Flyway | `src/main/resources/db/migration` or `.../migrations` | PostgreSQL port 5432 |
-| Cypress | `cypress.config.ts/js/mjs` + `cypress/` dir | `allow_localhost_any` |
+| Cypress | `cypress.config.ts/js/mjs` + `cypress/` dir | `allow_localhost_any` (repository proposal); `allow_cache_exec` (personal config hint from `cplt init --global`) |
 
 Machine-specific suggestions such as `allow_cache_exec` or home-relative read paths come out as comments pointing you to add them to your personal `~/.config/cplt/config.toml`.
 
@@ -1158,6 +1171,7 @@ It detects:
 | Tool | Probes | Suggests |
 |------|--------|----------|
 | Playwright browsers | `~/Library/Caches/ms-playwright/` (macOS) or `~/.cache/ms-playwright/` (Linux) | `allow_cache_exec = ["ms-playwright"]` |
+| Cypress | `~/Library/Caches/Cypress/` (macOS) or `~/.cache/Cypress/` (Linux; `XDG_CACHE_HOME` is ignored) | `allow_cache_exec = ["Cypress"]` |
 | GPG signing | `~/.gnupg/`, plus `commit.gpgsign` from global git config for the reason text | `allow_gpg_signing = true` |
 | Gradle registry credentials | `~/.gradle/gradle.properties` mentioning `repository`, `nexus`, or `artifactory` | `allow.read` for that file |
 | npm registry credentials | `~/.npmrc` with a `registry` or `_authToken` line | `allow.read` for that file |

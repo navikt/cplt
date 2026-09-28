@@ -5454,6 +5454,7 @@ fn build_sandbox_config<'a>(
         allow_gpg_signing: resolved.allow_gpg_signing,
         deny_clipboard: resolved.deny_clipboard,
         deny_nested_git: resolved.deny_nested_git,
+        refuse_cache_exec_links: resolved.refuse_cache_exec_links,
         deny_key_files_by_extension: resolved.deny_key_files_by_extension,
         deny_copilot_dir_exec: resolved.deny_copilot_dir_exec,
         allow_jvm_attach: resolved.allow_jvm_attach,

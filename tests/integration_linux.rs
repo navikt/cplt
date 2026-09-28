@@ -197,6 +197,19 @@ mod linux_tests {
         extra_flags: &[&str],
         script: &str,
     ) -> (i32, String, String) {
+        run_sandboxed_home_with_flags_env(project_dir, home, extra_flags, &[], script)
+    }
+
+    /// [`run_sandboxed_home_with_flags`] with extra environment variables for
+    /// cplt. The XDG base directories are cleared first so the fake HOME is
+    /// the only home the run sees.
+    fn run_sandboxed_home_with_flags_env(
+        project_dir: &Path,
+        home: &Path,
+        extra_flags: &[&str],
+        env: &[(&str, &Path)],
+        script: &str,
+    ) -> (i32, String, String) {
         let dir_str = project_dir.to_string_lossy().into_owned();
         let mut args: Vec<&str> = vec![
             "--yes",
@@ -213,6 +226,9 @@ mod linux_tests {
         let output = cplt_cmd()
             .args(&args)
             .env("HOME", home)
+            .env_remove("XDG_CACHE_HOME")
+            .env_remove("XDG_CONFIG_HOME")
+            .envs(env.iter().copied())
             .output()
             .expect("Failed to execute cplt");
 
@@ -762,6 +778,110 @@ EOF
         assert!(
             code != 0 || !stdout.contains("should not run"),
             "exec from ~/.cache without --allow-cache-exec must be blocked — code: {code}, stdout: {stdout}"
+        );
+    }
+
+    /// A fake HOME outside every default-writable tree (`/tmp` is writable
+    /// in the sandbox, so a write check under it would pass on its own).
+    fn home_outside_tmp(label: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(label)
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("create fake home")
+    }
+
+    /// Write an executable script that prints `marker`, from outside the
+    /// sandbox, so only the execute right is under test.
+    fn write_probe(path: &Path, marker: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, format!("#!/bin/sh\necho {marker}\n")).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Cypress keeps browser profiles in `${XDG_CONFIG_HOME:-~/.config}/Cypress`.
+    /// The `Cypress` cache-exec opt-in makes that tree writable but never
+    /// executable, and the rest of the config directory stays read-only.
+    #[test]
+    fn landlock_cypress_state_is_writable_but_not_executable() {
+        require_landlock!();
+        let project = create_test_project();
+        let home = home_outside_tmp(".cplt-cypress-home-");
+        let xdg_config = home.path().join("xdg-config");
+        for (config_dir, env) in [
+            (home.path().join(".config"), vec![]),
+            (
+                xdg_config.clone(),
+                vec![("XDG_CONFIG_HOME", xdg_config.as_path())],
+            ),
+        ] {
+            let state = config_dir.join("Cypress");
+            fs::create_dir_all(&state).unwrap();
+            let probe = state.join("probe.sh");
+            write_probe(&probe, "cypress-state-ran");
+            let script = format!(
+                "printf ok > '{state}/state.txt' && echo WROTE; \
+                 printf x > '{config}/not-cypress.txt' 2>/dev/null && echo SIBLING; \
+                 '{probe}' 2>&1",
+                state = state.display(),
+                config = config_dir.display(),
+                probe = probe.display(),
+            );
+            let (_, stdout, stderr) = run_sandboxed_home_with_flags_env(
+                project.path(),
+                home.path(),
+                &["--allow-cache-exec", "Cypress"],
+                &env,
+                &script,
+            );
+            assert!(
+                stdout.contains("WROTE"),
+                "Cypress state under {} must be writable — stdout: {stdout} stderr: {stderr}",
+                config_dir.display()
+            );
+            assert!(
+                !stdout.contains("SIBLING"),
+                "only the Cypress subtree may be writable — stdout: {stdout}"
+            );
+            assert!(
+                !stdout.contains("cypress-state-ran"),
+                "Cypress state must not be executable — stdout: {stdout}"
+            );
+        }
+    }
+
+    /// The cache-exec base is `~/.cache` whatever XDG_CACHE_HOME says, so a
+    /// hostile value cannot aim write+execute at another tree.
+    #[test]
+    fn landlock_cache_exec_base_ignores_xdg_cache_home() {
+        require_landlock!();
+        let project = create_test_project();
+        let home = home_outside_tmp(".cplt-xdg-cache-home-");
+        let xdg_cache = home.path().join("xdg-cache");
+        let in_home_cache = home.path().join(".cache/ms-playwright/run.sh");
+        let in_xdg_cache = xdg_cache.join("ms-playwright/run.sh");
+        write_probe(&in_home_cache, "home-cache-ran");
+        write_probe(&in_xdg_cache, "xdg-cache-ran");
+
+        let script = format!(
+            "'{}' 2>&1; '{}' 2>&1",
+            in_home_cache.display(),
+            in_xdg_cache.display()
+        );
+        let (_, stdout, stderr) = run_sandboxed_home_with_flags_env(
+            project.path(),
+            home.path(),
+            &["--allow-cache-exec", "ms-playwright"],
+            &[("XDG_CACHE_HOME", xdg_cache.as_path())],
+            &script,
+        );
+        assert!(
+            stdout.contains("home-cache-ran"),
+            "~/.cache/ms-playwright must stay executable — stdout: {stdout} stderr: {stderr}"
+        );
+        assert!(
+            !stdout.contains("xdg-cache-ran"),
+            "XDG_CACHE_HOME must not receive the cache-exec grant — stdout: {stdout}"
         );
     }
 
@@ -3502,5 +3622,221 @@ print('CONNECTED')
             "cplt must say the grant was withheld and why\nstderr: {stderr}"
         );
         let _ = fs::remove_dir_all(&home);
+    }
+
+    // ── Symlinked cache-exec paths (#591) ─────────────────────────
+
+    /// `~/.cache/<parent> -> ~/elsewhere` with a probe at
+    /// `~/elsewhere/dlx/run.sh`, and `~/.cache/ms-playwright -> ~/elsewhere/pw`.
+    fn home_with_linked_caches(label: &str, parent: &str) -> tempfile::TempDir {
+        let home = home_outside_tmp(label);
+        let elsewhere = home.path().join("elsewhere");
+        write_probe(&elsewhere.join("dlx/run.sh"), "dlx-ran");
+        write_probe(&elsewhere.join("pw/run.sh"), "pw-ran");
+        fs::create_dir_all(home.path().join(".cache")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, home.path().join(".cache").join(parent)).unwrap();
+        std::os::unix::fs::symlink(
+            elsewhere.join("pw"),
+            home.path().join(".cache/ms-playwright"),
+        )
+        .unwrap();
+        home
+    }
+
+    /// A cplt config file inside the fake home, for `CPLT_CONFIG`.
+    fn config_file(home: &Path, toml: &str) -> PathBuf {
+        let path = home.join("cplt-config.toml");
+        fs::write(&path, toml).unwrap();
+        path
+    }
+
+    /// Default (`sandbox.refuse_cache_exec_links` off): a symlink at the entry
+    /// or at an intermediate component is granted at its canonical target,
+    /// with a warning, on both backends. Under bubblewrap the writable bind
+    /// goes on that canonical path too.
+    fn assert_linked_entries_granted_at_target(bwrap_flag: &str) {
+        let project = create_test_project();
+        let home = home_with_linked_caches(".cplt-cache-link-home-", "tools");
+        let elsewhere = home.path().join("elsewhere");
+        let script = format!(
+            "'{e}/dlx/run.sh'; '{e}/pw/run.sh'; printf x > '{e}/dlx/w' && echo WROTE; \
+             printf x > '{e}/not-granted' 2>/dev/null && echo SIBLING",
+            e = elsewhere.display()
+        );
+        let (code, stdout, stderr) = run_sandboxed_home_with_flags(
+            project.path(),
+            home.path(),
+            &[
+                bwrap_flag,
+                "--allow-cache-exec",
+                "tools/dlx",
+                "--allow-cache-exec",
+                "ms-playwright",
+            ],
+            &script,
+        );
+        assert!(
+            stdout.contains("dlx-ran") && stdout.contains("pw-ran") && stdout.contains("WROTE"),
+            "{bwrap_flag}: the grant must land on the link's target (exit {code})\n\
+             stdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(
+            !stdout.contains("SIBLING"),
+            "{bwrap_flag}: only the entry's target is granted — stdout: {stdout}"
+        );
+        assert!(
+            stderr.contains("sandbox.refuse_cache_exec_links"),
+            "{bwrap_flag}: the launch must say where the grant went — stderr: {stderr}"
+        );
+    }
+
+    #[test]
+    fn landlock_grants_symlinked_cache_exec_entry_at_its_target() {
+        require_landlock!();
+        assert_linked_entries_granted_at_target("--no-bubblewrap");
+    }
+
+    /// `sandbox.refuse_cache_exec_links`: a link inside `~/.cache`, at the
+    /// entry or above it, stops the launch.
+    fn assert_linked_entries_refused(bwrap_flag: &str) {
+        let project = create_test_project();
+        let home = home_with_linked_caches(".cplt-cache-link-refuse-", "pnpm");
+        let config = config_file(home.path(), "[sandbox]\nrefuse_cache_exec_links = true\n");
+        for entry in ["pnpm/dlx", "ms-playwright"] {
+            let (code, stdout, stderr) = run_sandboxed_home_with_flags_env(
+                project.path(),
+                home.path(),
+                &[bwrap_flag, "--allow-cache-exec", entry],
+                &[("CPLT_CONFIG", config.as_path())],
+                "echo LAUNCHED",
+            );
+            assert!(
+                code != 0 && !stdout.contains("LAUNCHED"),
+                "{bwrap_flag} {entry}: a symlinked entry must stop the launch — stdout: {stdout}"
+            );
+            assert!(
+                stderr.contains("sandbox.refuse_cache_exec_links is set"),
+                "{bwrap_flag} {entry}: stderr: {stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn landlock_refuse_cache_exec_links_refuses_any_component() {
+        require_landlock!();
+        assert_linked_entries_refused("--no-bubblewrap");
+    }
+
+    /// `pnpm/dlx` with `~/.cache/pnpm` a symlink: `~/.cache/pnpm` is also a
+    /// writable application directory, so its target is a writable tree
+    /// outside the cache, and write+execute there is refused even with the
+    /// key off.
+    #[test]
+    fn landlock_refuses_cache_exec_link_into_a_writable_tree() {
+        require_landlock!();
+        let project = create_test_project();
+        let home = home_with_linked_caches(".cplt-cache-link-pnpm-", "pnpm");
+        let (code, stdout, stderr) = run_sandboxed_home_with_flags(
+            project.path(),
+            home.path(),
+            &["--allow-cache-exec", "pnpm/dlx"],
+            "echo LAUNCHED",
+        );
+        assert!(
+            code != 0 && !stdout.contains("LAUNCHED"),
+            "stdout: {stdout}"
+        );
+        assert!(
+            stderr.contains("will not grant write and execute there")
+                && stderr.contains("which the sandbox already grants"),
+            "stderr: {stderr}"
+        );
+    }
+
+    /// Whatever the key says, a link aimed at a tree cplt keeps from the agent
+    /// is refused: granting it would hand over the credentials.
+    #[test]
+    fn landlock_refuses_cache_exec_link_to_a_credential_dir() {
+        require_landlock!();
+        let project = create_test_project();
+        let home = home_outside_tmp(".cplt-cache-link-ssh-");
+        fs::create_dir_all(home.path().join(".ssh")).unwrap();
+        fs::create_dir_all(home.path().join(".cache")).unwrap();
+        std::os::unix::fs::symlink(
+            home.path().join(".ssh"),
+            home.path().join(".cache/ms-playwright"),
+        )
+        .unwrap();
+        let (code, stdout, stderr) = run_sandboxed_home_with_flags(
+            project.path(),
+            home.path(),
+            &["--allow-cache-exec", "ms-playwright"],
+            "echo LAUNCHED",
+        );
+        assert!(
+            code != 0 && !stdout.contains("LAUNCHED"),
+            "stdout: {stdout}"
+        );
+        assert!(
+            stderr.contains("will not grant write and execute there"),
+            "stderr: {stderr}"
+        );
+    }
+
+    /// The reproduced persistence attack, key off: a planted
+    /// `~/.cache/ms-playwright -> ~/.config/systemd/user`. Launch 1 used to
+    /// create the directory and launch 2 to write a unit into it. Both
+    /// launches are refused now, whether or not the directory exists, and
+    /// nothing is created.
+    #[test]
+    fn landlock_refuses_cache_exec_link_into_systemd_user() {
+        require_landlock!();
+        let project = create_test_project();
+        let home = home_outside_tmp(".cplt-cache-link-systemd-");
+        let units = home.path().join(".config/systemd/user");
+        fs::create_dir_all(home.path().join(".cache")).unwrap();
+        std::os::unix::fs::symlink(&units, home.path().join(".cache/ms-playwright")).unwrap();
+        for exists in [false, true] {
+            if exists {
+                fs::create_dir_all(&units).unwrap();
+            }
+            let script = format!(
+                "printf '[Service]\\n' > '{}/evil.service' && echo WROTE",
+                units.display()
+            );
+            let (code, stdout, stderr) = run_sandboxed_home_with_flags(
+                project.path(),
+                home.path(),
+                &["--no-bubblewrap", "--allow-cache-exec", "ms-playwright"],
+                &script,
+            );
+            assert!(
+                code != 0 && !stdout.contains("WROTE"),
+                "exists={exists}: the launch must be refused — stdout: {stdout}"
+            );
+            assert!(
+                stderr.contains("will not grant write and execute there")
+                    && stderr.contains("dot directory"),
+                "exists={exists}: stderr: {stderr}"
+            );
+            assert_eq!(
+                units.exists(),
+                exists,
+                "exists={exists}: cplt must not create the link target"
+            );
+            assert!(!units.join("evil.service").exists());
+        }
+    }
+
+    #[test]
+    fn bwrap_grants_symlinked_cache_exec_entry_at_its_target() {
+        require_bwrap!();
+        assert_linked_entries_granted_at_target("--use-bubblewrap");
+    }
+
+    #[test]
+    fn bwrap_refuse_cache_exec_links_refuses_any_component() {
+        require_bwrap!();
+        assert_linked_entries_refused("--use-bubblewrap");
     }
 }

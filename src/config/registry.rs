@@ -399,6 +399,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "sandbox",
+        key: "refuse_cache_exec_links",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "false",
+        description: "Linux only: refuse to launch when an allow_cache_exec entry reaches its directory through a symlink inside ~/.cache, instead of granting the link's target with a warning. The agent can write ~/.cache, so it can plant or re-point such a link for the next launch. A symlinked ~/.cache itself is not affected.",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
         key: "deny_key_files_by_extension",
         value_type: ConfigValueType::Bool,
         dangerous: false,
@@ -1059,6 +1067,14 @@ bool_keys! {
         config = |c: &Config| c.sandbox.deny_nested_git,
         baseline = |_: PresetBaseline| false,
         resolved = |r: &Resolved| r.deny_nested_git;
+
+    /// Config-only and off by default (staged rollout, #264): it breaks a
+    /// cache-exec entry that is a symlink out of `~/.cache`.
+    refuse_cache_exec_links, "sandbox", "refuse_cache_exec_links",
+        cli = |_: &CliFlags| FeatureToggle::UseDefault,
+        config = |c: &Config| c.sandbox.refuse_cache_exec_links,
+        baseline = |_: PresetBaseline| false,
+        resolved = |r: &Resolved| r.refuse_cache_exec_links;
 
     /// Config-only and off by default (staged rollout): it blocks key and
     /// certificate files that are readable today, such as a dev server's

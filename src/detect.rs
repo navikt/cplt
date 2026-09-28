@@ -2193,6 +2193,11 @@ pub fn detect_global(home: &Path) -> GlobalDetectionReport {
         detections.push(d);
     }
 
+    // Cypress Electron cache
+    if let Some(d) = detect_global_cypress(home) {
+        detections.push(d);
+    }
+
     // GPG signing configuration
     if let Some(d) = detect_global_gpg(home) {
         detections.push(d);
@@ -2233,6 +2238,24 @@ fn detect_global_playwright(home: &Path) -> Option<GlobalDetection> {
         name: "Playwright browsers",
         reason: "ms-playwright cache directory exists".to_string(),
         suggestions: vec![GlobalSuggestion::CacheExec("ms-playwright".to_string())],
+    })
+}
+
+fn detect_global_cypress(home: &Path) -> Option<GlobalDetection> {
+    // Only the path the cache-exec grant covers. On Linux that is `~/.cache`
+    // whatever XDG_CACHE_HOME says, so a relocated cache is not suggested.
+    let cache_path = if cfg!(target_os = "macos") {
+        home.join("Library/Caches/Cypress")
+    } else {
+        home.join(".cache/Cypress")
+    };
+    if !cache_path.is_dir() {
+        return None;
+    }
+    Some(GlobalDetection {
+        name: "Cypress",
+        reason: "Cypress cache directory exists".to_string(),
+        suggestions: vec![GlobalSuggestion::CacheExec("Cypress".to_string())],
     })
 }
 
@@ -3381,6 +3404,24 @@ services:
                 .detections
                 .iter()
                 .any(|d| d.name == "Playwright browsers")
+        );
+    }
+
+    #[test]
+    fn global_detect_cypress_cache() {
+        let home = tempfile::tempdir().unwrap();
+        let cache = if cfg!(target_os = "macos") {
+            home.path().join("Library/Caches/Cypress")
+        } else {
+            home.path().join(".cache/Cypress")
+        };
+        std::fs::create_dir_all(cache).unwrap();
+
+        let detection = detect_global_cypress(home.path()).expect("Cypress cache must be detected");
+        assert!(
+            detection
+                .suggestions
+                .contains(&GlobalSuggestion::CacheExec("Cypress".to_string()))
         );
     }
 

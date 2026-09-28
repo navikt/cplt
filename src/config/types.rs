@@ -673,6 +673,7 @@ pub struct SandboxConfig {
     /// Deny creating a `.git` entry below a writable root (default: false,
     /// macOS only). See `sandbox_profile::emit_nested_gitdir_denies` (#576).
     pub deny_nested_git: Option<bool>,
+    pub refuse_cache_exec_links: Option<bool>,
     /// Deny `*.pem`, `*.key`, `*.p12`, `*.pfx` and `*.jks` by extension, not
     /// only files named exactly `.pem` (default: false, macOS only). See
     /// `SENSITIVE_KEY_FILE_EXTENSION_PATTERNS`.
@@ -963,6 +964,7 @@ pub struct Resolved {
     pub allow_msbuild: bool,
     pub gradle_init: bool,
     pub deny_nested_git: bool,
+    pub refuse_cache_exec_links: bool,
     pub deny_key_files_by_extension: bool,
     pub refuse_invalid_repo_config: bool,
     pub deny_copilot_dir_exec: bool,

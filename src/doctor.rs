@@ -701,6 +701,7 @@ mod tests {
             fs_rules: rules
                 .into_iter()
                 .map(|(p, write, execute)| FsRule {
+                    nofollow: false,
                     path: PathBuf::from(p),
                     access: FsAccess {
                         read: true,
