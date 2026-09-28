@@ -4581,11 +4581,6 @@ fn a_user_deny_over_a_pnpm_store_withholds_its_write_allow() {
             &[".local/share/pnpm/store"][..],
         ),
         (
-            "/Users/test/Library/pnpm/store/v10",
-            &["Library/pnpm/store"][..],
-            &["Library/pnpm/package-manager-store"][..],
-        ),
-        (
             "/Users/test/.local/share/pnpm",
             &[
                 ".local/share/pnpm/store",
@@ -4623,8 +4618,39 @@ fn a_user_deny_over_a_pnpm_store_withholds_its_write_allow() {
     }
 }
 
+/// A deny inside a pnpm store keeps the store's write allow for the rest of
+/// the store and repeats itself, read and write, right after that allow.
+#[test]
+fn a_user_deny_inside_a_pnpm_store_is_repeated_after_its_write_allow() {
+    let deny = "/Users/test/Library/pnpm/store/v10";
+    let extra_deny = [PathBuf::from(deny)];
+    let p = generate_profile(
+        &SandboxConfig {
+            extra_deny: &extra_deny,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    let allow = r#"(allow file-write* (subpath "/Users/test/Library/pnpm/store"))"#;
+    let block = p
+        .find(";; PATH-resolved bin/shim dirs stay read-only")
+        .expect("the PATH-bin block is emitted");
+    let at = p[block..].find(allow).map(|i| i + block);
+    let at = at.unwrap_or_else(|| panic!("the store allow is kept\n{p}"));
+    let tail = &p[at + allow.len()..];
+    let expect = format!(
+        "\n(deny file-read* (subpath \"{deny}\"))\n(deny file-write* (subpath \"{deny}\"))\n"
+    );
+    assert!(
+        tail.starts_with(&expect),
+        "the deny follows the store allow\n{p}"
+    );
+    assert!(!p.contains("re-allow withheld"), "nothing is withheld\n{p}");
+}
+
 /// #597 class: the read allow for a relocated Copilot `pkg` is emitted after
-/// the user's denies, so an overlapping `--deny-path` withholds it.
+/// the user's denies, so a `--deny-path` at or above it withholds it, and one
+/// inside it is repeated right after it.
 /// (`validate_copilot_cache_env` also refuses that launch.)
 #[test]
 fn a_user_deny_over_a_moved_copilot_pkg_withholds_its_read_allow() {
@@ -4632,7 +4658,8 @@ fn a_user_deny_over_a_moved_copilot_pkg_withholds_its_read_allow() {
     let read = "(allow file-read* (subpath \"/opt/copilot-cache/pkg\"))";
     for (deny, withheld) in [
         ("/opt", true),
-        ("/opt/copilot-cache/pkg/x", true),
+        ("/opt/copilot-cache/pkg", true),
+        ("/opt/copilot-cache/pkg/x", false),
         ("/opt/other", false),
     ] {
         let extra_deny = [PathBuf::from(deny)];
@@ -4651,6 +4678,23 @@ fn a_user_deny_over_a_moved_copilot_pkg_withholds_its_read_allow() {
             "--deny-path {deny}: breadcrumb"
         );
     }
+    let deny = "/opt/copilot-cache/pkg/x";
+    let extra_deny = [PathBuf::from(deny)];
+    let p = generate_profile(
+        &SandboxConfig {
+            copilot_cache_env: &env,
+            extra_deny: &extra_deny,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    let redeny = format!(
+        "{read}\n(deny file-read* (subpath \"{deny}\"))\n(deny file-write* (subpath \"{deny}\"))\n"
+    );
+    assert!(
+        p.contains(&redeny),
+        "a deny inside pkg follows its allow\n{p}"
+    );
 }
 
 #[test]

@@ -1696,13 +1696,9 @@ fn emit_copilot_pkg_denies(sb: &mut String, config: &SandboxConfig) {
         let pkg = pkg_dir.to_string_lossy();
         // Emitted after the user's `--deny-path` rules, so it would reopen
         // reads under one that overlaps it (#597). `validate_copilot_cache_env`
-        // already refuses that launch; withhold here too so the profile never
-        // carries the reopening allow.
-        if let Some(deny) = overlapping_deny(config.extra_deny, pkg_dir) {
-            withhold_reallow(sb, "Copilot pkg", &pkg, deny);
-        } else {
-            sbpl!(sb, "(allow file-read* (subpath \"{pkg}\"))");
-        }
+        // already refuses that launch; the profile still never carries the
+        // reopening allow.
+        reallow_below_user_denies(sb, config.extra_deny, "Copilot pkg", "read", pkg_dir, true);
         emit_copilot_pkg_exec(sb, &pkg);
         emit_copilot_pkg_write_deny(sb, &pkg, &pins);
     }
@@ -1938,15 +1934,13 @@ fn emit_path_bin_denies(sb: &mut String, home_dir: &Path, extra_deny: &[PathBuf]
                 let p = path.display();
                 sbpl!(sb, "(deny file-write* (subpath \"{p}\"))");
                 // Emitted after the user's `--deny-path` rules, so a store
-                // allow would reopen writes under one that overlaps it (#597):
-                // withheld then, like the opt-in re-allows.
+                // allow would reopen writes under one that overlaps it (#597).
+                // `path_bin_dirs` names both pnpm homes whether or not they
+                // exist, so only warn about a store that is there.
                 for store in ["store", "package-manager-store"] {
                     let store = path.join(store);
-                    if let Some(deny) = overlapping_deny(extra_deny, &store) {
-                        withhold_reallow(sb, "pnpm store", &store.to_string_lossy(), deny);
-                    } else {
-                        sbpl!(sb, "(allow file-write* (subpath \"{}\"))", store.display());
-                    }
+                    let warn = store.exists();
+                    reallow_below_user_denies(sb, extra_deny, "pnpm store", "write", &store, warn);
                 }
                 sbpl!(sb, "(deny process-exec (subpath \"{p}\"))");
                 sbpl!(
@@ -2681,10 +2675,46 @@ fn withhold_reallow(sb: &mut String, grant: &str, reallow: &str, deny: &Path) {
     crate::ui::warn(&format!(
         "{grant}: --deny-path {deny} overlaps {reallow}; leaving it denied, not re-allowing it"
     ));
+    note_withheld(sb, grant, reallow, &deny);
+}
+
+fn note_withheld(sb: &mut String, grant: &str, reallow: &str, deny: &dyn std::fmt::Display) {
     sbpl!(
         sb,
         ";; {grant} re-allow withheld: --deny-path {deny} overlaps {reallow}"
     );
+}
+
+/// Emit `(allow file-{op}* (subpath root))` after the user's `--deny-path`
+/// rules without reopening any of them (#597).
+///
+/// A deny at or above `root` withholds the allow ([`withhold_reallow`], or
+/// only its breadcrumb when `warn` is false). A deny inside `root` keeps the
+/// allow for the rest of the tree and repeats that deny right after it, read
+/// and write as `emit_deny_rules` emits it, so last-match-wins keeps it closed.
+fn reallow_below_user_denies(
+    sb: &mut String,
+    extra_deny: &[PathBuf],
+    grant: &str,
+    op: &str,
+    root: &Path,
+    warn: bool,
+) {
+    let r = root.to_string_lossy();
+    if let Some(deny) = extra_deny.iter().find(|d| root.starts_with(d)) {
+        if warn {
+            withhold_reallow(sb, grant, &r, deny);
+        } else {
+            note_withheld(sb, grant, &r, &deny.display());
+        }
+        return;
+    }
+    sbpl!(sb, "(allow file-{op}* (subpath \"{r}\"))");
+    for deny in extra_deny.iter().filter(|d| d.starts_with(root)) {
+        let d = deny.to_string_lossy();
+        sbpl!(sb, "(deny file-read* (subpath \"{d}\"))");
+        sbpl!(sb, "(deny file-write* (subpath \"{d}\"))");
+    }
 }
 
 /// Allow GPG commit signing when `--allow-gpg-signing` is set.

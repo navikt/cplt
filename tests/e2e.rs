@@ -2074,6 +2074,32 @@ mod e2e_tests {
         home.join(".local/share/cplt/bin")
     }
 
+    /// `--deny-path ~` overlaps both pnpm homes, which the profile names
+    /// whether or not they exist. Only a store that exists earns a warning.
+    #[test]
+    fn e2e_deny_over_a_missing_pnpm_store_does_not_warn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        let stderr = || {
+            let out = cplt_cmd()
+                .args(["--print-profile", "--agent", "shell", "--deny-path"])
+                .arg(&home)
+                .env("HOME", &home)
+                .current_dir(project_dir())
+                .output()
+                .expect("binary should run");
+            let err = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(out.status.success(), "{err}");
+            err
+        };
+        let missing = stderr();
+        assert!(!missing.contains("pnpm store"), "{missing}");
+        std::fs::create_dir_all(home.join("Library/pnpm/store")).unwrap();
+        let present = stderr();
+        assert!(present.contains("Library/pnpm/store;"), "{present}");
+        assert!(!present.contains(".local/share/pnpm"), "{present}");
+    }
+
     /// Default off: neither the alias install, nor `--shell-setup`, nor a
     /// launch creates the shim directory or touches a PATH rc file.
     #[test]

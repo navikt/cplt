@@ -3507,8 +3507,22 @@ mod macos_tests {
         let open_store = write(&[], "store/a");
         let open_bin = write(&[], "pnpm-shim");
         let denied_store = write(std::slice::from_ref(&pnpm), "store/b");
+        // A deny inside the store closes only that part of it.
+        fs::create_dir_all(pnpm.join("store/v10")).unwrap();
+        fs::create_dir_all(pnpm.join("store/other")).unwrap();
+        let v10 = [pnpm.join("store/v10")];
+        let denied_v10 = write(&v10, "store/v10/c");
+        let open_other = write(&v10, "store/other/c");
 
         fs::remove_dir_all(&tmp).ok();
+        assert!(
+            !denied_v10,
+            "--deny-path on store/v10 must block writes into it"
+        );
+        assert!(
+            open_other,
+            "--deny-path on store/v10 must leave the rest of the store writable"
+        );
         assert!(open_store, "without a deny, the pnpm store stays writable");
         assert!(!open_bin, "without a deny, the pnpm home stays read-only");
         assert!(
