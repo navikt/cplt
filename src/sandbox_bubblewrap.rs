@@ -168,6 +168,10 @@ thread_local! {
     /// Fails [`test_functionality`], as on a host where `bwrap` is installed
     /// but user namespaces are disabled.
     pub(crate) static FAIL_PROBE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Fails [`test_functionality`] only when its arguments include this one,
+    /// as when one of the launch's own mounts is what bwrap cannot make.
+    pub(crate) static FAIL_PROBE_ON: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Test that bubblewrap can actually create the namespaces we use.
@@ -188,6 +192,10 @@ pub(crate) fn test_functionality(
         return Err("bwrap test failed: forced by test".to_string());
     }
     let mut args = build_bwrap_args(fs_rules, overlays, deny_masks);
+    #[cfg(test)]
+    if FAIL_PROBE_ON.with_borrow(|on| on.as_ref().is_some_and(|a| args.contains(a))) {
+        return Err("bwrap test failed: bwrap: forced by test".to_string());
+    }
     args.push("--".to_string());
     args.push("/bin/true".to_string());
 

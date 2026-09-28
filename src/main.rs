@@ -4094,27 +4094,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // can be included in the sandbox profile. Failure is deferred —
     // --print-profile doesn't need the binary.
     let agent_bin_result = active_agent.resolve_binary();
-    let copilot_install_dir = if active_agent == agent::Agent::Copilot {
-        agent_bin_result
-            .as_ref()
-            .ok()
-            .and_then(|p| {
-                // Try package.json discovery first (npm/Homebrew installs)
-                discover::copilot_pkg_dir(p, &home_dir).or_else(|| {
-                    // Fallback: use the binary's parent directory (VS Code extension installs
-                    // at ~/Library/Application Support/Code/.../copilotCli/copilot)
-                    p.parent().map(std::path::Path::to_path_buf)
-                })
-            })
-            .filter(|d| !crate::is_unsafe_root(d, &home_dir))
-    } else {
-        // Non-Copilot agents: use binary's parent dir for read + map-exec
-        agent_bin_result
-            .as_ref()
-            .ok()
-            .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
-            .filter(|d| !crate::is_unsafe_root(d, &home_dir))
-    };
+    let copilot_install_dir = agent_install_dir(active_agent, &agent_bin_result, &home_dir);
 
     // Discover Electron app bundle when Copilot CLI is installed via VS Code.
     // macOS-only: the shim invokes VS Code's Electron runtime, which needs
@@ -6851,19 +6831,16 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
             };
             let findings = [Finding {
                 level: Level::Blocking,
-                // The error text can quote an absolute path — "cplt refuses
-                // to sandbox '/Users/hans'" — and this view gets pasted into
-                // public issues.
-                message: doctor::tilde_in_text(
-                    &message,
-                    &std::env::var("HOME").map_or_else(
-                        |_| std::path::PathBuf::from("/nonexistent"),
-                        std::path::PathBuf::from,
-                    ),
-                ),
+                message,
                 fix: None,
             }];
-            print!("{}", doctor::render(&findings, &[], false));
+            // The error text can quote an absolute path — "cplt refuses to
+            // sandbox '/Users/hans'" — which `render` hides.
+            let home = std::env::var("HOME").map_or_else(
+                |_| std::path::PathBuf::from("/nonexistent"),
+                std::path::PathBuf::from,
+            );
+            print!("{}", doctor::render(&findings, &[], false, &home));
             return ExitCode::FAILURE;
         }
     };
@@ -6998,8 +6975,65 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         ));
     }
 
+    // ── the policy a launch would build, for the rules below ──
+    let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
+    let mut agent_dirs = resolved.agent_config_dirs(active_agent, &home_dir);
+    agent::canonicalize_agent_dirs(&mut agent_dirs);
+    let keychain_substitute = cplt::sandbox::keychain_substitute(
+        active_agent,
+        &home_dir,
+        &resolved.deny_env,
+        resolved.keychain_substitute,
+    );
+    let doctor_pnpm = resolve_exec_binary("pnpm").ok();
+    let doctor_pnpm_shadowed = doctor_pnpm
+        .as_ref()
+        .is_some_and(|pnpm| scratch::pnpm_requires_shadow(&home_dir, pnpm).unwrap_or(false));
+    let mut doctor_exec = resolved.allow_exec.clone();
+    doctor_exec.extend(pnpm_exec_grants(
+        &home_dir,
+        doctor_pnpm.as_deref(),
+        doctor_pnpm_shadowed,
+        &project_dir,
+        &repo_paths,
+    ));
+    doctor_exec.sort();
+    doctor_exec.dedup();
+    let agent_bin_result = active_agent.resolve_binary();
+    let doctor_install_dir = agent_install_dir(active_agent, &agent_bin_result, &home_dir);
+    let doctor_electron_dir = discover_electron_app_dir(&agent_bin_result, active_agent);
+    let sandbox_config = build_sandbox_config(
+        &resolved,
+        &probe,
+        active_agent,
+        &agent_dirs,
+        NamedRepos::new(
+            &policy_roots,
+            &repo_git_dirs,
+            &repo_rows,
+            worktree_root.as_deref(),
+        ),
+        &doctor_exec,
+        // The scratch dir is the bubblewrap probe's own (see
+        // `doctor::bubblewrap_state`); the proxy port and Playwright socket
+        // dir add no mounts.
+        SessionPaths {
+            copilot_install_dir: doctor_install_dir.as_deref(),
+            electron_app_dir: doctor_electron_dir.as_deref(),
+            ..SessionPaths::default()
+        },
+        keychain_substitute,
+    );
+    let policy = sandbox::generate_policy(&sandbox_config);
+
     // ── enforcement: the regime, and why ──
-    let bubblewrap = doctor::bubblewrap_state(resolved.use_bubblewrap);
+    // After the policy: bubblewrap is probed with the wrapper the launch would
+    // build from it, not an empty one.
+    let bubblewrap = doctor::bubblewrap_state(
+        resolved.use_bubblewrap,
+        resolved.scratch_dir,
+        &sandbox_config,
+    );
     #[cfg(target_os = "macos")]
     {
         if Path::new("/usr/bin/sandbox-exec").exists() {
@@ -7045,54 +7079,24 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
                     "use_bubblewrap = true but {}: the launch refuses to start.",
                     bubblewrap.describe()
                 ),
-                "install bubblewrap into /usr/bin, enable user namespaces \
+                "install bubblewrap into a trusted system directory such as /usr/bin or \
+                 /usr/local/bin, enable user namespaces \
                  (sysctl kernel.unprivileged_userns_clone=1), or drop use_bubblewrap",
             ));
         }
+        findings.extend(doctor::bubblewrap_finding(
+            &bubblewrap,
+            resolved.use_bubblewrap,
+        ));
     }
-    let _ = &bubblewrap;
     println!();
 
-    // ── the policy a launch would build, for the rules below ──
-    let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
-    let mut agent_dirs = resolved.agent_config_dirs(active_agent, &home_dir);
-    agent::canonicalize_agent_dirs(&mut agent_dirs);
-    let keychain_substitute = cplt::sandbox::keychain_substitute(
-        active_agent,
-        &home_dir,
-        &resolved.deny_env,
-        resolved.keychain_substitute,
-    );
-    let doctor_pnpm = resolve_exec_binary("pnpm").ok();
-    let doctor_pnpm_shadowed = doctor_pnpm
-        .as_ref()
-        .is_some_and(|pnpm| scratch::pnpm_requires_shadow(&home_dir, pnpm).unwrap_or(false));
-    let mut doctor_exec = resolved.allow_exec.clone();
-    doctor_exec.extend(pnpm_exec_grants(
-        &home_dir,
-        doctor_pnpm.as_deref(),
-        doctor_pnpm_shadowed,
-        &project_dir,
-        &repo_paths,
+    findings.extend(doctor::wsl_drive_project_finding(&project_dir, wsl));
+    findings.extend(doctor::pts_grant_finding(
+        &policy,
+        bubblewrap.active(),
+        cfg!(target_os = "linux"),
     ));
-    doctor_exec.sort();
-    doctor_exec.dedup();
-    let sandbox_config = build_sandbox_config(
-        &resolved,
-        &probe,
-        active_agent,
-        &agent_dirs,
-        NamedRepos::new(
-            &policy_roots,
-            &repo_git_dirs,
-            &repo_rows,
-            worktree_root.as_deref(),
-        ),
-        &doctor_exec,
-        SessionPaths::default(),
-        keychain_substitute,
-    );
-    let policy = sandbox::generate_policy(&sandbox_config);
 
     // Only for an agent that can run: "Pi will not start" under "Pi is not
     // installed" is noise.
@@ -7127,7 +7131,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
             let critical = discover::WSL_CRITICAL_TOOLS.contains(name);
             let msg = format!(
                 "{name} resolves to {}, a Windows install reached through WSL interop{}",
-                canon.display(),
+                tilde(&canon),
                 if critical {
                     ", which cannot run in the Linux sandbox."
                 } else {
@@ -7196,15 +7200,32 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         ok.push(format!("tools: {}", tool_names.join(" ")));
     }
 
-    print!("{}", doctor::render(&findings, &ok, !verbose));
+    print!("{}", doctor::render(&findings, &ok, !verbose, &home_dir));
 
     if verbose {
         println!();
         println!("── inventory ──");
-        println!("project:  {}", project_dir.display());
-        println!("home:     {}", home_dir.display());
+        println!("project:  {}", tilde(&project_dir));
+        println!("home:     ~");
+        // The effective grants, after presets, repo proposals and the
+        // build-credential expansion: what a launch would hand the sandbox.
+        for (key, paths) in [
+            ("allow.read", &resolved.allow_read),
+            ("allow.write", &resolved.allow_write),
+            ("deny.paths", &resolved.deny_paths),
+        ] {
+            let shown: Vec<String> = paths.iter().map(|p| tilde(p)).collect();
+            println!(
+                "{key:<12} {}",
+                if shown.is_empty() {
+                    "none".to_string()
+                } else {
+                    shown.join(", ")
+                }
+            );
+        }
         println!();
-        discover::discover_all(&home_dir, &project_dir).print_report();
+        discover::discover_all(&home_dir, &project_dir).print_report(&home_dir);
         print_project_ecosystems(&project_dir);
     }
 
@@ -9956,6 +9977,36 @@ fn shell_uninstall(agent: Option<&str>) -> ExitCode {
 //
 // Named functions with cfg-gated bodies keep the run() function
 // free of inline #[cfg] blocks.
+
+/// The agent's installation directory, granted read + map-exec
+/// (`SandboxConfig::copilot_install_dir`). Shared by the launch and `doctor`.
+fn agent_install_dir(
+    agent: agent::Agent,
+    agent_bin_result: &Result<PathBuf, String>,
+    home_dir: &Path,
+) -> Option<PathBuf> {
+    if agent == agent::Agent::Copilot {
+        agent_bin_result
+            .as_ref()
+            .ok()
+            .and_then(|p| {
+                // Try package.json discovery first (npm/Homebrew installs)
+                discover::copilot_pkg_dir(p, home_dir).or_else(|| {
+                    // Fallback: use the binary's parent directory (VS Code extension installs
+                    // at ~/Library/Application Support/Code/.../copilotCli/copilot)
+                    p.parent().map(std::path::Path::to_path_buf)
+                })
+            })
+            .filter(|d| !crate::is_unsafe_root(d, home_dir))
+    } else {
+        // Non-Copilot agents: use binary's parent dir for read + map-exec
+        agent_bin_result
+            .as_ref()
+            .ok()
+            .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+            .filter(|d| !crate::is_unsafe_root(d, home_dir))
+    }
+}
 
 /// Discover the VS Code Electron app bundle containing Copilot's shim (macOS only).
 ///

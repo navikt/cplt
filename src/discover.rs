@@ -572,7 +572,7 @@ pub fn discover_all(home_dir: &Path, project_dir: &Path) -> Discovery {
 /// Landlock, so printing an unconditional green tick for it was how doctor
 /// concluded "all critical checks passed" for a setup that could not work
 /// (#271). Same predicate, and the same reasoning, as the agents loop above.
-fn tool_lines(tools: &[ToolInfo], wsl: bool) -> (Vec<String>, bool) {
+fn tool_lines(tools: &[ToolInfo], wsl: bool, home: &Path) -> (Vec<String>, bool) {
     let mut critical_ok = true;
     let lines = tools
         .iter()
@@ -583,7 +583,7 @@ fn tool_lines(tools: &[ToolInfo], wsl: bool) -> (Vec<String>, bool) {
                     ui::stdout_color(ui::GREEN),
                     ui::stdout_color(ui::RESET),
                     tool.name,
-                    tool.path.display()
+                    crate::doctor::tilde(&tool.path, home)
                 );
             }
             if WSL_CRITICAL_TOOLS.contains(&tool.name.as_str()) {
@@ -594,7 +594,7 @@ fn tool_lines(tools: &[ToolInfo], wsl: bool) -> (Vec<String>, bool) {
                     ui::stdout_color(ui::RED),
                     ui::stdout_color(ui::RESET),
                     tool.name,
-                    tool.path.display(),
+                    crate::doctor::tilde(&tool.path, home),
                     tool.name
                 )
             } else {
@@ -604,7 +604,7 @@ fn tool_lines(tools: &[ToolInfo], wsl: bool) -> (Vec<String>, bool) {
                     ui::stdout_color(ui::YELLOW),
                     ui::stdout_color(ui::RESET),
                     tool.name,
-                    tool.path.display()
+                    crate::doctor::tilde(&tool.path, home)
                 )
             }
         })
@@ -615,7 +615,7 @@ fn tool_lines(tools: &[ToolInfo], wsl: bool) -> (Vec<String>, bool) {
 impl Discovery {
     /// Print the full inventory (`cplt doctor --verbose`). Returns true if
     /// nothing it prints is a hard failure; the verdict itself is doctor's.
-    pub fn print_report(&self) -> bool {
+    pub fn print_report(&self, home: &Path) -> bool {
         let mut critical_ok = true;
 
         // Auth section
@@ -720,7 +720,7 @@ impl Discovery {
                         ui::stdout_color(ui::RESET),
                         agent.name,
                         agent.binary_name,
-                        agent.path.display(),
+                        crate::doctor::tilde(&agent.path, home),
                         agent.binary_name
                     );
                     critical_ok = false;
@@ -733,7 +733,7 @@ impl Discovery {
                         ui::stdout_color(ui::RESET),
                         agent.name,
                         agent.binary_name,
-                        agent.path.display()
+                        crate::doctor::tilde(&agent.path, home)
                     ),
                     VersionProbe::Unknown => println!(
                         "  {}✓{} {} ({}): {}",
@@ -741,7 +741,7 @@ impl Discovery {
                         ui::stdout_color(ui::RESET),
                         agent.name,
                         agent.binary_name,
-                        agent.path.display()
+                        crate::doctor::tilde(&agent.path, home)
                     ),
                     // Reported, not omitted: the binary is installed, so
                     // "not detected" would be a lie, and a silently missing
@@ -754,7 +754,7 @@ impl Discovery {
                         ui::stdout_color(ui::RESET),
                         agent.name,
                         agent.binary_name,
-                        agent.path.display(),
+                        crate::doctor::tilde(&agent.path, home),
                         PROBE_TIMEOUT.as_secs()
                     ),
                 }
@@ -788,6 +788,7 @@ impl Discovery {
         let (tool_lines, tools_ok) = tool_lines(
             &self.tools.tools,
             cfg!(target_os = "linux") && crate::agent::is_wsl(),
+            home,
         );
         for line in &tool_lines {
             println!("{line}");
@@ -809,7 +810,7 @@ impl Discovery {
                 "  {}✓{} Homebrew: {}",
                 ui::stdout_color(ui::GREEN),
                 ui::stdout_color(ui::RESET),
-                prefix.display()
+                crate::doctor::tilde(prefix, home)
             );
         }
         if !self.tools.existing_home_tool_dirs.is_empty() {
@@ -817,7 +818,7 @@ impl Discovery {
                 .tools
                 .existing_home_tool_dirs
                 .iter()
-                .map(|d| d.path.display().to_string())
+                .map(|d| crate::doctor::tilde(&d.path, home))
                 .collect();
             println!(
                 "  {}✓{} Tool dirs: {}",
@@ -930,6 +931,19 @@ impl Discovery {
         if !print_sandbox_mechanism_status() {
             critical_ok = false;
         }
+        // Both platforms withhold the numbered terminal devices, so a tool
+        // that allocates its own PTY fails with an error that never names cplt
+        // (`forkpty(3) failed`, "no more ptys").
+        println!(
+            "  {}ℹ{} PTY allocation (openpty/forkpty, pexpect, node-pty, script, tmux) is blocked \
+             by the default policy; granting /dev allows it, at the cost described at:",
+            ui::stdout_color(ui::BLUE),
+            ui::stdout_color(ui::RESET)
+        );
+        println!(
+            "      https://github.com/navikt/cplt/blob/main/docs/known-impacts.md\
+             #terminal-devices-and-allocating-a-pty"
+        );
         println!();
 
         critical_ok
@@ -2338,7 +2352,7 @@ mod wsl_tool_report_tests {
     #[test]
     fn windows_side_critical_tool_is_reported_red_and_fails_critical() {
         let tools = vec![tool("npm", "/mnt/c/Users/N129069/AppData/Roaming/npm/npm")];
-        let (lines, ok) = tool_lines(&tools, true);
+        let (lines, ok) = tool_lines(&tools, true, Path::new("/home/u"));
         assert!(!ok, "a Windows-side npm must fail the critical checks");
         assert!(
             lines[0].contains('\u{2717}') && !lines[0].contains('\u{2713}'),
@@ -2346,8 +2360,9 @@ mod wsl_tool_report_tests {
             lines[0]
         );
         assert!(
-            lines[0].contains("/mnt/c/Users/N129069/AppData/Roaming/npm/npm"),
-            "the line must name the offending path, got: {}",
+            lines[0].contains("/mnt/c/Users/~/AppData/Roaming/npm/npm")
+                && !lines[0].contains("N129069"),
+            "the line must name the offending path, without the Windows user, got: {}",
             lines[0]
         );
     }
@@ -2359,7 +2374,7 @@ mod wsl_tool_report_tests {
             "gradle",
             "/mnt/c/apps/Gradle/gradle-8.10.2/bin/gradle",
         )];
-        let (lines, ok) = tool_lines(&tools, true);
+        let (lines, ok) = tool_lines(&tools, true, Path::new("/home/u"));
         assert!(
             ok,
             "a Windows-side gradle is a warning, not a critical failure"
@@ -2375,9 +2390,21 @@ mod wsl_tool_report_tests {
     #[test]
     fn mnt_path_outside_wsl_stays_green() {
         let tools = vec![tool("npm", "/mnt/c/npm")];
-        let (lines, ok) = tool_lines(&tools, false);
+        let (lines, ok) = tool_lines(&tools, false, Path::new("/home/u"));
         assert!(ok);
         assert!(lines[0].contains('\u{2713}'), "got: {}", lines[0]);
+    }
+
+    /// The inventory is pasted into public issues: no username.
+    #[test]
+    fn tool_under_home_is_shown_with_tilde() {
+        let tools = vec![tool("node", "/home/u/.local/bin/node")];
+        let (lines, _) = tool_lines(&tools, false, Path::new("/home/u"));
+        assert!(
+            lines[0].ends_with("node: ~/.local/bin/node"),
+            "got: {}",
+            lines[0]
+        );
     }
 
     /// npm is the tool the reporter actually tripped over, so it has to be
