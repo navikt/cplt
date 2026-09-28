@@ -89,10 +89,48 @@ fn hide_windows_user(path: &Path) -> PathBuf {
 #[must_use]
 pub fn tilde_in_text(text: &str, home: &Path) -> String {
     let home = home.to_string_lossy();
-    if home.is_empty() || home == "/" {
-        return text.to_string();
+    let text = if home.is_empty() || home == "/" {
+        text.to_string()
+    } else {
+        text.replace(home.as_ref(), "~")
+    };
+    hide_windows_user_in_text(&text)
+}
+
+/// `hide_windows_user` for a path quoted inside a sentence: the component
+/// after `/mnt/<drive>/Users/` becomes `~`. The name may contain spaces, so it
+/// runs to the next `/`, or to a quote or the end of the line when the path
+/// stops at the profile itself.
+fn hide_windows_user_in_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find("/mnt/") {
+        let (head, tail) = rest.split_at(i + "/mnt/".len());
+        out.push_str(head);
+        let b = tail.as_bytes();
+        let profile = b.len() > 8
+            && b[0].is_ascii_alphabetic()
+            && b[1] == b'/'
+            && tail
+                .get(2..8)
+                .is_some_and(|u| u.eq_ignore_ascii_case("users/"));
+        let name_len = if profile {
+            tail[8..]
+                .find(['/', '\'', '"', '`', '\n'])
+                .unwrap_or(tail.len() - 8)
+        } else {
+            0
+        };
+        if name_len == 0 {
+            rest = tail;
+            continue;
+        }
+        out.push_str(&tail[..8]);
+        out.push('~');
+        rest = &tail[8 + name_len..];
     }
-    text.replace(home.as_ref(), "~")
+    out.push_str(rest);
+    out
 }
 
 // ── Rule: tracked secrets vs. the .env deny ────────────────────
@@ -271,7 +309,7 @@ pub fn bubblewrap_state(
         Ok(()) => Bubblewrap::Usable(path),
         Err(reason) => Bubblewrap::Unusable {
             path,
-            reason: probe_reason(&reason),
+            reason: probe_reason(&reason, config.home_dir),
         },
     }
 }
@@ -327,17 +365,20 @@ pub fn bubblewrap_state(
 }
 
 /// The first line of a probe error, without the `bwrap test failed: ` that
-/// `test_functionality` puts in front of bwrap's own `bwrap: …`.
+/// `test_functionality` puts in front of bwrap's own `bwrap: …`. bwrap names
+/// the mount it failed on, often under home, so the username is hidden here:
+/// the reason is printed on the enforcement line as well as in a finding.
 #[cfg(any(target_os = "linux", test))]
-fn probe_reason(raw: &str) -> String {
+fn probe_reason(raw: &str, home: &Path) -> String {
     let line = raw
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
         .unwrap_or("probe failed");
-    line.strip_prefix("bwrap test failed: ")
-        .unwrap_or(line)
-        .to_string()
+    tilde_in_text(
+        line.strip_prefix("bwrap test failed: ").unwrap_or(line),
+        home,
+    )
 }
 
 /// Auto-detect (`use_bubblewrap` unset) found no usable bubblewrap, so the
@@ -400,7 +441,8 @@ pub fn wsl_drive_project_finding(project_dir: &Path, wsl: bool) -> Option<Findin
     Some(Finding::warning(
         format!(
             "The project is on the Windows drive /mnt/{drive}: Landlock enforcement on that \
-             mount is unverified, and every file access crosses 9p, which is slow."
+             mount is unverified, and every file access crosses the VM boundary (9p or \
+             virtiofs), which is slow."
         ),
         Some("move the project into the distro (e.g. ~/src) and run cplt there".to_string()),
     ))
@@ -427,23 +469,27 @@ pub fn pts_grant_finding(
     let pts = Path::new("/dev/pts");
     // The widest covering grant: `--allow-read / --allow-write /dev` must be
     // reported as the write it is, not the read rule that comes first.
+    // A grant below it, `/dev/pts/3`, reaches that one terminal only; a
+    // covering grant outranks it.
     let rule = policy
         .fs_rules
         .iter()
         .filter(|r| r.access.read || r.access.write)
         .filter(|r| pts.starts_with(&r.path) || r.path.starts_with(pts))
-        .max_by_key(|r| (r.access.write, r.access.execute))?;
+        .max_by_key(|r| (pts.starts_with(&r.path), r.access.write, r.access.execute))?;
+    let covers = pts.starts_with(&rule.path);
+    let them = if covers { "them" } else { "it" };
     // The rule carries access, not the config key it came from; an
     // `allow.exec` grant is read + execute.
     let (kind, reach) = if rule.access.write {
         (
             "allow.write",
-            "read what you type in them and write into them",
+            format!("read what you type in {them} and write into {them}"),
         )
     } else if rule.access.execute {
-        ("allow.exec", "read what you type in them")
+        ("allow.exec", format!("read what you type in {them}"))
     } else {
-        ("allow.read", "read what you type in them")
+        ("allow.read", format!("read what you type in {them}"))
     };
     let (devices, fix) = if linux {
         (
@@ -464,10 +510,14 @@ pub fn pts_grant_finding(
     } else {
         ""
     };
+    let target = if covers {
+        format!("every {devices}, the terminals of your other windows")
+    } else {
+        "a terminal that may belong to another window".to_string()
+    };
     Some(Finding::warning(
         format!(
-            "{kind} {} reaches every {devices}, the terminals of your other windows: the agent \
-             can {reach}.{seccomp}",
+            "{kind} {} reaches {target}: the agent can {reach}.{seccomp}",
             rule.path.display()
         ),
         Some(fix.to_string()),
@@ -478,8 +528,12 @@ pub fn pts_grant_finding(
 
 /// The findings block plus the summary line. `ok` is the one-line "what is
 /// fine" roll-up; `header` is printed by the caller, which owns the inputs.
+///
+/// The whole block goes through `tilde_in_text` on the way out: a finding's
+/// text is often an error built elsewhere that quotes a path, and this block
+/// is what gets pasted into a public issue.
 #[must_use]
-pub fn render(findings: &[Finding], ok: &[String], verbose_hint: bool) -> String {
+pub fn render(findings: &[Finding], ok: &[String], verbose_hint: bool, home: &Path) -> String {
     use crate::ui::{GREEN, RED, RESET, YELLOW, stdout_color};
     use std::fmt::Write as _;
     let mut out = String::new();
@@ -541,7 +595,7 @@ pub fn render(findings: &[Finding], ok: &[String], verbose_hint: bool) -> String
         " `cplt check` to probe enforcement."
     };
     let _ = writeln!(out, "{verdict}{hint}");
-    out
+    tilde_in_text(&out, home)
 }
 
 /// Exit non-zero iff something is blocking — the contract the old doctor had
@@ -615,14 +669,52 @@ mod tests {
         );
     }
 
+    /// Error text from elsewhere quotes paths mid-sentence.
+    #[test]
+    fn tilde_in_text_hides_both_usernames() {
+        let home = Path::new("/home/u");
+        assert_eq!(
+            tilde_in_text(
+                "copilot resolves to a Windows install:\n  /mnt/c/Users/Kari Nordmann/AppData/npm/copilot\n",
+                home
+            ),
+            "copilot resolves to a Windows install:\n  /mnt/c/Users/~/AppData/npm/copilot\n"
+        );
+        assert_eq!(
+            tilde_in_text("can't bind '/mnt/d/users/kari' and /home/u/x", home),
+            "can't bind '/mnt/d/users/~' and ~/x"
+        );
+        for same in [
+            "/mnt/c/Users/",
+            "/mnt/data/Users/kari",
+            "/mnt/c/apps/x",
+            "/mnt/",
+        ] {
+            assert_eq!(tilde_in_text(same, home), same);
+        }
+    }
+
     #[test]
     fn probe_reason_drops_the_wrapper_prefix() {
+        let home = Path::new("/home/u");
         assert_eq!(
-            probe_reason("bwrap test failed: bwrap: Can't mount proc\nmore"),
+            probe_reason("bwrap test failed: bwrap: Can't mount proc\nmore", home),
             "bwrap: Can't mount proc"
         );
-        assert_eq!(probe_reason("\n  other  \n"), "other");
-        assert_eq!(probe_reason(""), "probe failed");
+        assert_eq!(probe_reason("\n  other  \n", home), "other");
+        assert_eq!(probe_reason("", home), "probe failed");
+        // bwrap names the mount it failed on; the reason is printed as is.
+        assert_eq!(
+            probe_reason(
+                "bwrap test failed: bwrap: Can't bind mount /home/u/.cache on /newroot/home/u/.cache",
+                home
+            ),
+            "bwrap: Can't bind mount ~/.cache on /newroot~/.cache"
+        );
+        assert_eq!(
+            probe_reason("bwrap: Can't find source path /mnt/c/Users/kari/x", home),
+            "bwrap: Can't find source path /mnt/c/Users/~/x"
+        );
     }
 
     #[test]
@@ -726,6 +818,7 @@ mod tests {
         let p = Path::new("/mnt/c/Users/hans/src/app");
         let f = wsl_drive_project_finding(p, true).expect("finding");
         assert!(f.message.contains("/mnt/c:"));
+        assert!(f.message.contains("9p or virtiofs"), "{}", f.message);
         assert!(!f.message.contains("hans"));
         assert!(f.fix.unwrap().contains("~/src"));
         // Not WSL: /mnt/c is an ordinary mount.
@@ -771,10 +864,28 @@ mod tests {
         assert!(!mac.message.contains("TIOCSTI"));
         assert!(!mac.fix.unwrap().contains("bubblewrap"));
         // Read-only covering grant still leaks input, but not output.
-        let pts_ro = policy(vec![("/dev/pts/3", false, false)]);
+        let pts_ro = policy(vec![("/dev/pts", false, false)]);
         let f = pts_grant_finding(&pts_ro, false, true).unwrap();
-        assert!(f.message.starts_with("allow.read /dev/pts/3"));
+        assert!(f.message.starts_with("allow.read /dev/pts reaches every"));
         assert!(!f.message.contains("write into"));
+        // One terminal below it reaches that terminal, not every one; a
+        // covering grant elsewhere in the policy still wins.
+        let one = policy(vec![("/dev/pts/3", true, false)]);
+        let f = pts_grant_finding(&one, false, true).unwrap();
+        assert!(
+            f.message
+                .starts_with("allow.write /dev/pts/3 reaches a terminal that"),
+            "{}",
+            f.message
+        );
+        assert!(f.message.contains("write into it."), "{}", f.message);
+        let both = policy(vec![("/dev/pts/3", true, false), ("/dev", false, false)]);
+        let f = pts_grant_finding(&both, false, true).unwrap();
+        assert!(
+            f.message.starts_with("allow.read /dev reaches every"),
+            "{}",
+            f.message
+        );
         // The default device grants do not cover /dev/pts.
         let defaults = policy(vec![
             ("/dev/null", true, false),
@@ -791,7 +902,12 @@ mod tests {
             Finding::blocking("Pi will not start", "run outside"),
             Finding::warning("x is tracked", None),
         ];
-        let out = render(&findings, &["auth: gh CLI".to_string()], true);
+        let out = render(
+            &findings,
+            &["auth: gh CLI".to_string()],
+            true,
+            Path::new("/home/u"),
+        );
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines[0].contains("Pi will not start"));
         assert_eq!(lines[1].trim(), "fix: run outside");
@@ -801,6 +917,28 @@ mod tests {
         assert!(lines.last().unwrap().contains("--verbose"));
         assert!(exit_nonzero(&findings));
         assert!(!exit_nonzero(&findings[1..]));
-        assert!(render(&[], &[], false).contains("No problems found."));
+        assert!(render(&[], &[], false, Path::new("/home/u")).contains("No problems found."));
+    }
+
+    /// A finding built from an error elsewhere — `resolve_binary` naming a
+    /// Windows-side agent under WSL — is hidden on the way out, whatever rule
+    /// produced it.
+    #[test]
+    fn render_hides_usernames_in_every_finding() {
+        let findings = vec![Finding::blocking(
+            "copilot resolves to a Windows install reached through WSL interop:\n  \
+             /mnt/c/Users/kari/AppData/Roaming/npm/copilot",
+            "--allow-exec /home/u/bin",
+        )];
+        let out = render(
+            &findings,
+            &["x /home/u/y".to_string()],
+            false,
+            Path::new("/home/u"),
+        );
+        assert!(!out.contains("kari"), "{out}");
+        assert!(!out.contains("/home/u"), "{out}");
+        assert!(out.contains("/mnt/c/Users/~/AppData"), "{out}");
+        assert!(out.contains("fix: --allow-exec ~/bin"), "{out}");
     }
 }

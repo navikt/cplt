@@ -6789,19 +6789,16 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
             };
             let findings = [Finding {
                 level: Level::Blocking,
-                // The error text can quote an absolute path — "cplt refuses
-                // to sandbox '/Users/hans'" — and this view gets pasted into
-                // public issues.
-                message: doctor::tilde_in_text(
-                    &message,
-                    &std::env::var("HOME").map_or_else(
-                        |_| std::path::PathBuf::from("/nonexistent"),
-                        std::path::PathBuf::from,
-                    ),
-                ),
+                message,
                 fix: None,
             }];
-            print!("{}", doctor::render(&findings, &[], false));
+            // The error text can quote an absolute path — "cplt refuses to
+            // sandbox '/Users/hans'" — which `render` hides.
+            let home = std::env::var("HOME").map_or_else(
+                |_| std::path::PathBuf::from("/nonexistent"),
+                std::path::PathBuf::from,
+            );
+            print!("{}", doctor::render(&findings, &[], false, &home));
             return ExitCode::FAILURE;
         }
     };
@@ -7160,7 +7157,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         ok.push(format!("tools: {}", tool_names.join(" ")));
     }
 
-    print!("{}", doctor::render(&findings, &ok, !verbose));
+    print!("{}", doctor::render(&findings, &ok, !verbose, &home_dir));
 
     if verbose {
         println!();
