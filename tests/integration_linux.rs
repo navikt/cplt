@@ -3783,6 +3783,51 @@ print('CONNECTED')
         );
     }
 
+    /// The reproduced persistence attack, key off: a planted
+    /// `~/.cache/ms-playwright -> ~/.config/systemd/user`. Launch 1 used to
+    /// create the directory and launch 2 to write a unit into it. Both
+    /// launches are refused now, whether or not the directory exists, and
+    /// nothing is created.
+    #[test]
+    fn landlock_refuses_cache_exec_link_into_systemd_user() {
+        require_landlock!();
+        let project = create_test_project();
+        let home = home_outside_tmp(".cplt-cache-link-systemd-");
+        let units = home.path().join(".config/systemd/user");
+        fs::create_dir_all(home.path().join(".cache")).unwrap();
+        std::os::unix::fs::symlink(&units, home.path().join(".cache/ms-playwright")).unwrap();
+        for exists in [false, true] {
+            if exists {
+                fs::create_dir_all(&units).unwrap();
+            }
+            let script = format!(
+                "printf '[Service]\\n' > '{}/evil.service' && echo WROTE",
+                units.display()
+            );
+            let (code, stdout, stderr) = run_sandboxed_home_with_flags(
+                project.path(),
+                home.path(),
+                &["--no-bubblewrap", "--allow-cache-exec", "ms-playwright"],
+                &script,
+            );
+            assert!(
+                code != 0 && !stdout.contains("WROTE"),
+                "exists={exists}: the launch must be refused — stdout: {stdout}"
+            );
+            assert!(
+                stderr.contains("will not grant write and execute there")
+                    && stderr.contains("dot directory"),
+                "exists={exists}: stderr: {stderr}"
+            );
+            assert_eq!(
+                units.exists(),
+                exists,
+                "exists={exists}: cplt must not create the link target"
+            );
+            assert!(!units.join("evil.service").exists());
+        }
+    }
+
     #[test]
     fn bwrap_grants_symlinked_cache_exec_entry_at_its_target() {
         require_bwrap!();

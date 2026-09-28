@@ -296,13 +296,34 @@ browsers. `sandbox.refuse_cache_exec_links = true` makes every such link stop
 the launch; see
 [configuration](configuration.md#symlinked-cache-exec-entries-sandboxrefuse_cache_exec_links).
 
-cplt refuses the launch, with or without the key, when the target is a system
-directory, `/tmp`, `$HOME` or a parent of it, a credential directory, cplt's
-state, the project, or a path the sandbox already grants (a tool or application
-directory such as `~/.cache/pnpm`, a read-only config file, a tool prefix). The
-error reads `… and cplt will not grant write and execute there: <reason>`.
-`~/.cache` itself must be a real directory (`Cache-exec root … resolves through
-a symlink`), which cplt's scratch directory has always required on Linux.
+cplt refuses the launch, with or without the key, when the target is:
+
+- exactly `/`, `/tmp`, `$HOME` or a parent of it, or one of the system roots
+  such as `/usr` or `/etc` (the root itself; a path below one is caught by the
+  checks that follow, or not at all);
+- inside a dot directory in `$HOME` other than `~/.cache`, or inside `~/bin`.
+  These are where the host loads code from on its own: `~/.config/systemd/user`,
+  `~/.config/autostart`, `~/.config/environment.d`, `~/.config/fish/conf.d`,
+  `~/.bashrc.d`, `~/.local/bin`, editor and IDE config such as `~/.config/nvim`
+  or `~/.vscode/extensions`, and agent config such as `~/.claude` or
+  `~/.copilot`;
+- inside `/run`, `/var/tmp` or `/dev/shm`;
+- a credential directory, cplt's state, the project, or a path the sandbox
+  already grants (a tool or application directory such as `~/.cache/pnpm`, a
+  read-only config file, a tool prefix).
+
+The error reads `… and cplt will not grant write and execute there: <reason>`.
+A move to a data disk (`/data/pw`, `/mnt/…`) or to an ordinary directory in
+`$HOME` keeps working with the warning. cplt never creates a linked entry's
+target: if it does not exist, the launch says so and the entry gets no grant
+until you create it.
+
+`~/.cache` itself can be a symlink, since only you can make one there (the
+sandbox cannot write `$HOME`). Its target goes through the same checks
+(`Cache-exec root … resolves through a symlink to …, and cplt will not grant
+write and execute there`), and `sandbox.refuse_cache_exec_links` refuses it
+too. cplt's scratch directory, on by default, refuses a symlinked `~/.cache` on
+its own, so this only works with `--no-scratch-dir`.
 
 The grant goes on the target cplt checked. When the sandbox is applied, cplt
 opens it without following a symlink at any level, under bubblewrap as well,

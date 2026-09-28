@@ -2368,10 +2368,13 @@ pub(crate) fn open_nofollow_rule(path: &Path) -> std::io::Result<Option<std::os:
 pub(crate) fn nofollow_refusal(path: &Path, e: &std::io::Error) -> String {
     let why = match e.raw_os_error() {
         Some(libc::ELOOP) => "a symlink appeared in its path after cplt checked it".to_string(),
-        Some(libc::ENOSYS) => "the kernel, or a seccomp profile around cplt, refuses \
+        // Older Docker seccomp profiles answer an unknown syscall with EPERM.
+        Some(libc::ENOSYS | libc::EPERM) => {
+            "the kernel, or a seccomp profile around cplt, refuses \
                                openat2(2), which cplt needs to open it without following \
                                symlinks"
-            .to_string(),
+                .to_string()
+        }
         _ => format!("it could not be opened without following symlinks ({e})"),
     };
     format!(
@@ -2697,6 +2700,18 @@ pub fn blocked_syscall_names() -> Vec<&'static str> {
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
+
+    /// A seccomp profile that refuses openat2 answers ENOSYS or, in older
+    /// Docker profiles, EPERM. Both must name the cause.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nofollow_refusal_names_seccomp_for_enosys_and_eperm() {
+        for errno in [libc::ENOSYS, libc::EPERM] {
+            let e = std::io::Error::from_raw_os_error(errno);
+            let msg = nofollow_refusal(Path::new("/home/u/.cache/x"), &e);
+            assert!(msg.contains("openat2(2)"), "errno {errno}: {msg}");
+        }
+    }
 
     /// `create_dirs` maps to `MakeDir | RemoveDir` and to NOTHING that could
     /// write file content: no WriteFile, Truncate, MakeReg or MakeSym. Refer is
