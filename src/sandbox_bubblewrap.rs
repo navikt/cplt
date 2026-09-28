@@ -1375,6 +1375,7 @@ mod tests {
             home_dir: PathBuf::from("/nonexistent-home"),
             precreate_dirs: vec![],
             plain_file,
+            nofollow: vec![],
         }
     }
 

@@ -255,7 +255,7 @@ Some tools unpack and execute binaries straight out of `~/Library/Caches` (macOS
 | Tool | Cache path | Fix |
 |---|---|---|
 | Playwright Chromium | `~/Library/Caches/ms-playwright/` · `~/.cache/ms-playwright/` | Allow cache exec and disable Chromium's nested sandbox; see below |
-| Cypress | `~/Library/Caches/Cypress/` · `${XDG_CACHE_HOME:-~/.cache}/Cypress/` | Personal `allow_cache_exec`; repository proposal for `allow_localhost_any` |
+| Cypress | `~/Library/Caches/Cypress/` · `~/.cache/Cypress/` | Personal `allow_cache_exec`; repository proposal for `allow_localhost_any` |
 | pnpm dlx | `~/Library/Caches/pnpm/dlx/` · `~/.cache/pnpm/dlx/` | `--allow-cache-exec pnpm/dlx` |
 
 **Fix:**
@@ -271,12 +271,42 @@ Or for a single run, repeat the flag as needed:
 
 `--allow-cache-exec-any` opens exec for the entire cache tree (`~/Library/Caches` on macOS, `~/.cache` on Linux). Last resort only.
 
+Every entry makes its directory both writable and executable, so an agent can
+write a binary there and run it. That code still runs inside the sandbox. This
+holds for `~/.cache/Cypress` and `~/Library/Caches/Cypress` exactly as it does
+for Playwright's browser cache.
+
+**Linux: the cache is always `~/.cache`.** cplt ignores `XDG_CACHE_HOME` for
+cache-exec grants. The variable comes from the launching environment, and a
+value such as `~/.config` would otherwise put a write+execute grant on cplt's
+own config and trust store. A tool that follows a relocated `XDG_CACHE_HOME`
+(Cypress and Playwright both do) gets no exec grant there. Cypress with a
+relocated cache (`XDG_CACHE_HOME` or `CYPRESS_CACHE_FOLDER`) is not supported;
+unset the variable for the run so the tool uses `~/.cache`.
+
+**Linux: a symlinked cache-exec entry stops the launch.** Landlock follows a
+symlink when it opens a rule path, so a link at `~/.cache/ms-playwright` (or at
+`~/.cache` itself under `--allow-cache-exec-any`) would grant read, write and
+execute on whatever it points to. A link planted by an earlier session would
+turn a narrow opt-in into write+exec on any tree. cplt refuses with
+`allow_cache_exec path … resolves through a symlink` (or `Cache-exec root …`).
+To recover, check where the link points, then replace it with a real
+directory: `rm ~/.cache/ms-playwright && mkdir ~/.cache/ms-playwright`, and
+reinstall the browsers. If you relocated the cache on purpose, move the files
+back under `~/.cache`. cplt also opens these paths without following a final
+symlink, so a link swapped in after the check fails the launch as well. macOS
+does not refuse: Seatbelt checks the resolved path against rules on the literal
+cache path, so a link there grants nothing extra.
+
 On macOS, the explicit `Cypress` entry also grants Electron permission to
 register only `com.electron.cypress.MachPortRendezvousServer.<numeric-pid>`.
 It grants read/write, but not execution, under
 `~/Library/Application Support/Cypress`, where Cypress keeps browser profiles
 and project state. Without it, `cypress verify` exits during bootstrap with
-`EPERM (1100)`, or a test run fails while opening its state.
+`EPERM (1100)`, or a test run fails while opening its state. On Linux the same
+entry grants read/write, but not execution, under
+`${XDG_CONFIG_HOME:-~/.config}/Cypress`. On both platforms cplt refuses to
+launch if that state directory is a symlink.
 
 Cypress uses separate ephemeral loopback ports for its HTTP/WebSocket server
 and the browser's debugging protocol. Prefer requesting this in the committed

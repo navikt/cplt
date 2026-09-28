@@ -1063,6 +1063,12 @@ fn cache_exec_first_component_matches(allow_cache_exec: &[String], component: &s
 }
 
 /// Whether a cache-exec entry is a non-empty relative path of normal components.
+///
+/// Load-bearing for the Linux cache-exec carve-out: the joined path is opened
+/// with `O_PATH`, and the kernel resolves `..` at open() time. Without this
+/// filter a crafted value like `../../bin` would grant execute *outside*
+/// `~/.cache`. (macOS SBPL is immune because `subpath` does literal prefix
+/// matching on already-canonicalized paths, where `..` never appears.)
 #[must_use]
 pub fn cache_exec_subdir_is_safe(subdir: &str) -> bool {
     use std::path::Component;
@@ -1094,22 +1100,6 @@ pub fn playwright_runtime_intent(allow_cache_exec: &[String], _allow_cache_exec_
 /// Electron IPC rights.
 pub fn cypress_runtime_intent(allow_cache_exec: &[String], _allow_cache_exec_any: bool) -> bool {
     cache_exec_first_component_matches(allow_cache_exec, "Cypress")
-}
-
-/// Linux/XDG cache root, with invalid relative overrides rejected.
-#[must_use]
-pub fn xdg_cache_dir(home: &Path) -> PathBuf {
-    xdg_cache_dir_with_env(home, &process_env)
-}
-
-/// Linux/XDG cache root resolved from a caller-supplied environment.
-#[must_use]
-pub fn xdg_cache_dir_with_env(home: &Path, env: &CacheEnv<'_>) -> PathBuf {
-    env("XDG_CACHE_HOME")
-        .filter(|value| !value.as_encoded_bytes().trim_ascii().is_empty())
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .unwrap_or_else(|| home.join(".cache"))
 }
 
 /// Cypress's writable Electron state, kept separate from its executable cache.

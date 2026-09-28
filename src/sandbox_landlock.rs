@@ -140,6 +140,11 @@ pub struct LandlockPolicy {
     /// `allow.read`/`allow.write` naming the same file is a separate rule and
     /// keeps its own, ordinary open (and survives a revoke).
     pub plain_file: Option<usize>,
+    /// Indices into `fs_rules` of the cache-exec and Cypress state rules.
+    /// `precompute()` opens these with `O_NOFOLLOW` and refuses a symlink, so
+    /// a link swapped in after `prepare()` validated the path cannot move a
+    /// write grant (or write+execute grant) onto another tree.
+    pub nofollow: Vec<usize>,
 }
 
 /// Pre-computed data for sandbox application in the child process.
@@ -589,7 +594,9 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         }
     }
 
+    let mut nofollow = Vec::new();
     if policy::cypress_runtime_intent(config.allow_cache_exec, config.allow_cache_exec_any) {
+        nofollow.push(fs_rules.len());
         fs_rules.push(FsRule {
             path: policy::cypress_app_data_dir_with_env(home, config.copilot_cache_env),
             access: FsAccess {
@@ -660,8 +667,13 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     // SECURITY: subdir entries are filtered to traversal-free relative paths via
     // cache_exec_subdir_is_safe() — see that function for why this is load-bearing on
     // Linux but not macOS.
-    let cache_base = policy::xdg_cache_dir_with_env(home, config.copilot_cache_env);
+    //
+    // The base is always `~/.cache`, never `$XDG_CACHE_HOME`: an environment
+    // value pointing at `~/.config` would otherwise hand the agent write+execute
+    // on cplt's own config and trust store.
+    let cache_base = home.join(".cache");
     if config.allow_cache_exec_any {
+        nofollow.push(fs_rules.len());
         fs_rules.push(FsRule {
             path: cache_base.clone(),
             access: FsAccess {
@@ -675,6 +687,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     } else {
         for subdir in config.allow_cache_exec {
             if policy::cache_exec_subdir_is_safe(subdir) {
+                nofollow.push(fs_rules.len());
                 fs_rules.push(FsRule {
                     path: cache_base.join(subdir),
                     access: FsAccess {
@@ -1361,6 +1374,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         home_dir: home.to_path_buf(),
         precreate_dirs,
         plain_file,
+        nofollow,
     }
 }
 
@@ -1792,7 +1806,26 @@ pub fn precompute(policy: LandlockPolicy) -> Result<PrecomputedSandbox, String> 
             deferred_paths.push((c_path, rule.access));
             continue;
         }
-        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        let flags = if policy.nofollow.contains(&i) {
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC
+        } else {
+            libc::O_PATH | libc::O_CLOEXEC
+        };
+        let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
+        if fd >= 0 && policy.nofollow.contains(&i) {
+            // O_NOFOLLOW opens a final-component symlink as itself. Fail closed:
+            // prepare() refused links, so one here was swapped in since.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(fd, &raw mut st) } != 0
+                || st.st_mode & libc::S_IFMT == libc::S_IFLNK
+            {
+                unsafe { libc::close(fd) };
+                return Err(format!(
+                    "{} became a symlink after cplt validated it. Refusing to grant it.",
+                    rule.path.display()
+                ));
+            }
+        }
         if fd >= 0 {
             pre_opened_fds.push((fd, rule.access));
         }
@@ -3008,25 +3041,61 @@ mod tests {
     }
 
     #[test]
-    fn cache_exec_subdir_honors_xdg_cache_home() {
+    fn cache_exec_base_ignores_xdg_cache_home() {
         let project = PathBuf::from("/home/user/project");
         let home = PathBuf::from("/home/user");
-        let xdg_cache = PathBuf::from("/home/user/custom-cache");
         let subdirs = vec!["Cypress".to_string()];
+        // A hostile XDG_CACHE_HOME aimed at cplt's own config directory.
+        let env = |name: &str| (name == "XDG_CACHE_HOME").then(|| "/home/user/.config".into());
 
-        let env =
-            |name: &str| (name == "XDG_CACHE_HOME").then(|| xdg_cache.clone().into_os_string());
-        let mut config = test_config(&project, &home);
-        config.allow_cache_exec = &subdirs;
-        config.copilot_cache_env = &env;
-        let policy = generate_policy(&config);
-        let target = xdg_cache.join("Cypress");
-        assert!(
-            policy
+        for any in [false, true] {
+            let mut config = test_config(&project, &home);
+            config.allow_cache_exec = &subdirs;
+            config.allow_cache_exec_any = any;
+            config.copilot_cache_env = &env;
+            let policy = generate_policy(&config);
+            let exec_writable: Vec<_> = policy
                 .fs_rules
                 .iter()
-                .any(|rule| rule.path == target && rule.access.execute),
-            "cache-exec must follow XDG_CACHE_HOME on Linux"
+                .filter(|rule| rule.access.write && rule.access.execute)
+                .map(|rule| rule.path.clone())
+                .collect();
+            let expected = if any {
+                home.join(".cache")
+            } else {
+                home.join(".cache/Cypress")
+            };
+            assert!(exec_writable.contains(&expected), "{exec_writable:?}");
+            assert!(
+                exec_writable
+                    .iter()
+                    .all(|p| !p.starts_with(home.join(".config"))),
+                "XDG_CACHE_HOME must not move the cache-exec base: {exec_writable:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_exec_and_cypress_state_rules_are_opened_nofollow() {
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let subdirs = vec!["Cypress".to_string(), "ms-playwright".to_string()];
+        let mut config = test_config(&project, &home);
+        config.allow_cache_exec = &subdirs;
+        let policy = generate_policy(&config);
+        let mut nofollow: Vec<_> = policy
+            .nofollow
+            .iter()
+            .map(|&i| policy.fs_rules[i].path.clone())
+            .collect();
+        nofollow.sort();
+        assert_eq!(
+            nofollow,
+            vec![
+                home.join(".cache/Cypress"),
+                home.join(".cache/ms-playwright"),
+                policy::cypress_app_data_dir_with_env(&home, &policy::no_cache_env),
+            ]
         );
     }
 
@@ -5217,6 +5286,7 @@ mod tests {
             home_dir: PathBuf::from("/tmp/test-home"),
             precreate_dirs: vec![],
             plain_file: None,
+            nofollow: vec![],
         };
 
         let precomputed = precompute(policy).expect("precompute should succeed");
@@ -5264,6 +5334,39 @@ mod tests {
     /// (an early open would drop the rule), and when the block changes the
     /// write renames a new inode over the path (an early fd would pin the old,
     /// unlinked one). The child-side open must see the file as written.
+    /// A cache-exec or Cypress state path swapped for a symlink after
+    /// `prepare()` validated it must stop the launch, not bind the grant to the
+    /// link's target. The same link on an ordinary rule is still followed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn precompute_refuses_a_symlinked_nofollow_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("ms-playwright");
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let policy = |nofollow: Vec<usize>| LandlockPolicy {
+            fs_rules: vec![FsRule {
+                path: link.clone(),
+                access: read_only(),
+            }],
+            net_rules: vec![],
+            restrict_net_connect: false,
+            proxy_forced: false,
+            home_dir: dir.path().to_path_buf(),
+            precreate_dirs: vec![],
+            plain_file: None,
+            nofollow,
+        };
+
+        let Err(error) = precompute(policy(vec![0])) else {
+            panic!("a symlinked nofollow rule must be refused");
+        };
+        assert!(error.contains("became a symlink"), "{error}");
+        let pre = precompute(policy(vec![])).expect("an ordinary rule follows the link");
+        assert_eq!(pre.pre_opened_fds.len(), 1);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn plain_file_is_opened_after_the_upsert_not_in_precompute() {
@@ -5281,6 +5384,7 @@ mod tests {
             home_dir: dir.path().to_path_buf(),
             precreate_dirs: vec![],
             plain_file: Some(0),
+            nofollow: vec![],
         };
 
         let pre = precompute(policy).expect("precompute should succeed");
@@ -5325,6 +5429,7 @@ mod tests {
             home_dir: dir.path().to_path_buf(),
             precreate_dirs: vec![],
             plain_file: Some(1),
+            nofollow: vec![],
         };
         let pre = precompute(policy).expect("precompute should succeed");
         assert_eq!(pre.pre_opened_fds.len(), 1, "the user's grant was deferred");

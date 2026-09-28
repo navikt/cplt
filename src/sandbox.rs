@@ -84,8 +84,7 @@ pub use policy::{
     linux_runtime_dirs, mise_ro_protect_paths, nested_alternation, no_cache_env, path_bin_dirs,
     playwright_runtime_intent, process_env, relocatable_tool_prefix, shim_ro_protect_paths,
     socket_mask_paths, tool_override_path_is_safe, tool_path_env_overrides,
-    validate_playwright_socket_dir, validate_sbpl_path, xdg_cache_dir, xdg_cache_dir_with_env,
-    xdg_runtime_dir_env,
+    validate_playwright_socket_dir, validate_sbpl_path, xdg_runtime_dir_env,
 };
 
 // SBPL profile generation — kept public for unit tests.
@@ -458,47 +457,15 @@ fn validate_pnpm_tool_dirs(config: &SandboxConfig) -> Result<(), String> {
     Ok(())
 }
 
-/// Refuse cache-exec entries that resolve outside their configured cache path.
+/// Refuse malformed cache-exec entries everywhere, and symlinked ones on Linux.
 ///
 /// Landlock opens each entry with `O_PATH`, which follows symlinks and grants
 /// the target read, write, and execute. A link planted during one session must
 /// therefore stop the next launch instead of turning a narrow cache opt-in into
-/// permissions on an arbitrary target.
+/// permissions on an arbitrary target. Seatbelt matches the resolved path
+/// against rules on the literal cache path, so on macOS a link grants nothing
+/// extra and a relocated cache keeps working.
 fn validate_cache_exec_dirs(config: &SandboxConfig) -> Result<(), String> {
-    if config.allow_cache_exec.is_empty() && !config.allow_cache_exec_any {
-        return Ok(());
-    }
-
-    #[cfg(target_os = "macos")]
-    let cache_base = config.home_dir.join("Library/Caches");
-    #[cfg(not(target_os = "macos"))]
-    let cache_base = policy::xdg_cache_dir_with_env(config.home_dir, config.copilot_cache_env);
-
-    let expected_base = if let Ok(relative) = cache_base.strip_prefix(config.home_dir) {
-        std::fs::canonicalize(config.home_dir)
-            .map_err(|e| format!("Cannot resolve HOME {}: {e}", config.home_dir.display()))?
-            .join(relative)
-    } else {
-        cache_base.clone()
-    };
-    let resolved_base = crate::config::canonicalize_deepest(&cache_base);
-    if resolved_base != expected_base {
-        return Err(format!(
-            "Cache-exec root {} resolves through a symlink to {}. cplt refuses to grant \
-             writable executable cache access through a redirected root. Replace the symlink \
-             with a real directory.",
-            cache_base.display(),
-            resolved_base.display()
-        ));
-    }
-    if !policy::tool_override_path_is_safe(&resolved_base, config.home_dir) {
-        return Err(format!(
-            "Cache-exec root {} is not a safe cache directory. It cannot be `/`, `/tmp`, \
-             `$HOME`, an ancestor of `$HOME`, or a platform system directory.",
-            cache_base.display()
-        ));
-    }
-
     for subdir in config.allow_cache_exec {
         if !policy::cache_exec_subdir_is_safe(subdir) {
             return Err(format!(
@@ -506,6 +473,29 @@ fn validate_cache_exec_dirs(config: &SandboxConfig) -> Result<(), String> {
                  without `.` or `..` components"
             ));
         }
+    }
+    if cfg!(target_os = "macos")
+        || (config.allow_cache_exec.is_empty() && !config.allow_cache_exec_any)
+    {
+        return Ok(());
+    }
+
+    let cache_base = config.home_dir.join(".cache");
+    let resolved_base = std::fs::canonicalize(config.home_dir)
+        .map_err(|e| format!("Cannot resolve HOME {}: {e}", config.home_dir.display()))?
+        .join(".cache");
+    let actual_base = crate::config::canonicalize_deepest(&cache_base);
+    if actual_base != resolved_base {
+        return Err(format!(
+            "Cache-exec root {} resolves through a symlink to {}. cplt refuses to grant \
+             writable executable cache access through a redirected root. Replace the symlink \
+             with a real directory.",
+            cache_base.display(),
+            actual_base.display()
+        ));
+    }
+
+    for subdir in config.allow_cache_exec {
         let named = cache_base.join(subdir);
         let expected = resolved_base.join(subdir);
         let resolved = crate::config::canonicalize_deepest(&named);
@@ -2708,53 +2698,62 @@ mod tests {
         );
     }
 
-    #[test]
-    fn symlinked_cache_exec_directory_is_refused() {
+    /// Prepare a cache-exec launch whose `ms-playwright` entry (or, with
+    /// `any`, the whole cache root) is a symlink into the project.
+    fn prepare_with_symlinked_cache_exec(any: bool) -> (String, Result<PreparedSandbox, String>) {
         let (_guard, root) = copilot_cache_tree();
         let home = root.join("home");
         let project = root.join("project");
-        #[cfg(target_os = "macos")]
-        let cache = home.join("Library/Caches");
-        #[cfg(not(target_os = "macos"))]
-        let cache = policy::xdg_cache_dir(&home);
-        std::fs::create_dir_all(&cache).unwrap();
-        std::os::unix::fs::symlink(&project, cache.join("Cypress")).unwrap();
-        let allow_cache_exec = ["Cypress".to_string()];
+        let cache = if cfg!(target_os = "macos") {
+            home.join("Library/Caches")
+        } else {
+            home.join(".cache")
+        };
+        let link = if any {
+            cache.clone()
+        } else {
+            cache.join("ms-playwright")
+        };
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&project, &link).unwrap();
+        let allow_cache_exec = ["ms-playwright".to_string()];
         let mut config = test_config(&home, &[]);
         config.project_dir = &project;
         config.existing_home_tool_dirs = Some(&[]);
-        config.allow_cache_exec = &allow_cache_exec;
+        if any {
+            config.allow_cache_exec_any = true;
+        } else {
+            config.allow_cache_exec = &allow_cache_exec;
+        }
         config.use_bubblewrap = Some(false);
-
-        let Err(error) = prepare(&config) else {
-            panic!("symlinked cache-exec directory must be refused");
-        };
-        assert!(error.contains("allow_cache_exec path"), "{error}");
-        assert!(error.contains(&project.display().to_string()), "{error}");
+        (project.display().to_string(), prepare(&config))
     }
 
+    /// Landlock follows the link and would grant rwx on its target.
+    #[cfg(target_os = "linux")]
     #[test]
-    fn symlinked_cache_exec_root_is_refused_for_allow_any() {
-        let (_guard, root) = copilot_cache_tree();
-        let home = root.join("home");
-        let project = root.join("project");
-        #[cfg(target_os = "macos")]
-        let cache = home.join("Library/Caches");
-        #[cfg(not(target_os = "macos"))]
-        let cache = home.join(".cache");
-        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
-        std::os::unix::fs::symlink(&project, &cache).unwrap();
-        let mut config = test_config(&home, &[]);
-        config.project_dir = &project;
-        config.existing_home_tool_dirs = Some(&[]);
-        config.allow_cache_exec_any = true;
-        config.use_bubblewrap = Some(false);
+    fn symlinked_cache_exec_is_refused_on_linux() {
+        for (any, why) in [(false, "allow_cache_exec path"), (true, "Cache-exec root")] {
+            let (project, result) = prepare_with_symlinked_cache_exec(any);
+            let Err(error) = result else {
+                panic!("symlinked cache-exec (any={any}) must be refused");
+            };
+            assert!(error.contains(why), "{error}");
+            assert!(error.contains(&project), "{error}");
+        }
+    }
 
-        let Err(error) = prepare(&config) else {
-            panic!("symlinked cache-exec root must be refused");
-        };
-        assert!(error.contains("Cache-exec root"), "{error}");
-        assert!(error.contains(&project.display().to_string()), "{error}");
+    /// Seatbelt matches the resolved path, so a relocated cache is harmless
+    /// there and must keep working.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn symlinked_cache_exec_is_accepted_on_macos() {
+        for any in [false, true] {
+            let (_, result) = prepare_with_symlinked_cache_exec(any);
+            if let Err(error) = result {
+                panic!("symlinked cache-exec (any={any}) must launch on macOS: {error}");
+            }
+        }
     }
 
     #[test]

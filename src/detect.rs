@@ -2194,7 +2194,7 @@ pub fn detect_global(home: &Path) -> GlobalDetectionReport {
     }
 
     // Cypress Electron cache
-    if let Some(d) = detect_global_cypress(home, &crate::sandbox::process_env) {
+    if let Some(d) = detect_global_cypress(home) {
         detections.push(d);
     }
 
@@ -2241,14 +2241,13 @@ fn detect_global_playwright(home: &Path) -> Option<GlobalDetection> {
     })
 }
 
-fn detect_global_cypress(
-    home: &Path,
-    env: &crate::sandbox::CacheEnv<'_>,
-) -> Option<GlobalDetection> {
+fn detect_global_cypress(home: &Path) -> Option<GlobalDetection> {
+    // Only the path the cache-exec grant covers. On Linux that is `~/.cache`
+    // whatever XDG_CACHE_HOME says, so a relocated cache is not suggested.
     let cache_path = if cfg!(target_os = "macos") {
         home.join("Library/Caches/Cypress")
     } else {
-        crate::sandbox::xdg_cache_dir_with_env(home, env).join("Cypress")
+        home.join(".cache/Cypress")
     };
     if !cache_path.is_dir() {
         return None;
@@ -3411,7 +3410,6 @@ services:
     #[test]
     fn global_detect_cypress_cache() {
         let home = tempfile::tempdir().unwrap();
-        let env = |_: &str| None;
         let cache = if cfg!(target_os = "macos") {
             home.path().join("Library/Caches/Cypress")
         } else {
@@ -3419,27 +3417,11 @@ services:
         };
         std::fs::create_dir_all(cache).unwrap();
 
-        let detection =
-            detect_global_cypress(home.path(), &env).expect("Cypress cache must be detected");
+        let detection = detect_global_cypress(home.path()).expect("Cypress cache must be detected");
         assert!(
             detection
                 .suggestions
                 .contains(&GlobalSuggestion::CacheExec("Cypress".to_string()))
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn global_detect_cypress_cache_honors_xdg_cache_home() {
-        let home = tempfile::tempdir().unwrap();
-        let xdg = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(xdg.path().join("Cypress")).unwrap();
-        let env =
-            |name: &str| (name == "XDG_CACHE_HOME").then(|| xdg.path().as_os_str().to_owned());
-
-        assert!(
-            detect_global_cypress(home.path(), &env).is_some(),
-            "Cypress under XDG_CACHE_HOME must be detected"
         );
     }
 

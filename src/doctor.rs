@@ -351,6 +351,7 @@ mod tests {
             home_dir: PathBuf::from("/home/u"),
             precreate_dirs: vec![],
             plain_file: None,
+            nofollow: vec![],
         }
     }
 

@@ -1390,10 +1390,12 @@ mod macos_tests {
         require_sandbox!();
 
         let project = fs::canonicalize(".").unwrap();
-        let parent = project.parent().expect("checkout must have a parent");
+        // Under the real HOME, not the checkout's parent or TMPDIR: a fake home
+        // inside a default-writable tree such as /private/tmp would pass the
+        // write check and fail the exec check without the Cypress rules.
         let fake_home = tempfile::Builder::new()
             .prefix(".cplt-cypress-home-")
-            .tempdir_in(parent)
+            .tempdir_in(home_dir())
             .expect("create isolated Cypress home");
         let home = fs::canonicalize(fake_home.path()).unwrap();
         let app_data = cypress_app_data_dir(&home);
@@ -1420,6 +1422,23 @@ mod macos_tests {
             "Cypress app state write must succeed: {}{}",
             String::from_utf8_lossy(&write.stdout),
             String::from_utf8_lossy(&write.stderr)
+        );
+
+        // Control: the rest of the fake home stays read-only, so the write
+        // above succeeded because of the Cypress grant.
+        let sibling = app_data.with_file_name("not-cypress.txt");
+        let outside = Command::new("sandbox-exec")
+            .arg("-f")
+            .arg(&profile)
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg("printf x > \"$CPLT_SIBLING\"")
+            .env("CPLT_SIBLING", &sibling)
+            .output()
+            .expect("write outside Cypress state under sandbox-exec");
+        assert!(
+            !outside.status.success() && !sibling.exists(),
+            "writes next to Cypress app state must be denied"
         );
 
         let executable = app_data.join("must-not-run.sh");

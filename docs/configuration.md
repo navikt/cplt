@@ -1129,7 +1129,7 @@ It detects:
 | Tool | Probes | Suggests |
 |------|--------|----------|
 | Playwright browsers | `~/Library/Caches/ms-playwright/` (macOS) or `~/.cache/ms-playwright/` (Linux) | `allow_cache_exec = ["ms-playwright"]` |
-| Cypress | `~/Library/Caches/Cypress/` (macOS) or `${XDG_CACHE_HOME:-~/.cache}/Cypress/` (Linux) | `allow_cache_exec = ["Cypress"]` |
+| Cypress | `~/Library/Caches/Cypress/` (macOS) or `~/.cache/Cypress/` (Linux; `XDG_CACHE_HOME` is ignored) | `allow_cache_exec = ["Cypress"]` |
 | GPG signing | `~/.gnupg/`, plus `commit.gpgsign` from global git config for the reason text | `allow_gpg_signing = true` |
 | Gradle registry credentials | `~/.gradle/gradle.properties` mentioning `repository`, `nexus`, or `artifactory` | `allow.read` for that file |
 | npm registry credentials | `~/.npmrc` with a `registry` or `_authToken` line | `allow.read` for that file |
