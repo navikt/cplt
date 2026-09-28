@@ -830,6 +830,7 @@ fn landlock_policy_device_files_have_ioctl() {
         allow_gpg_signing: false,
         deny_clipboard: false,
         deny_nested_git: false,
+        deny_key_files_by_extension: false,
         deny_copilot_dir_exec: false,
         allow_jvm_attach: false,
         allow_msbuild: false,
@@ -2156,6 +2157,69 @@ fn the_env_deny_is_lifted_for_read_inside_dependency_stores_only() {
     );
 }
 
+/// With `sandbox.deny_key_files_by_extension`, the wider key file patterns get
+/// the same read carve-out in dependency stores, after the deny. The deny is
+/// scoped to granted trees, so it reaches a store only through a grant that
+/// covers it, such as `allow.read = ["~"]`.
+#[test]
+fn key_file_extension_denies_are_lifted_for_read_inside_dependency_stores() {
+    let home = [PathBuf::from("/Users/test")];
+    let profile = generate_profile(
+        &SandboxConfig {
+            extra_read: &home,
+            deny_key_files_by_extension: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    let deny = profile
+        .find(r#"(deny file-read* (regex #"^/Users/test/(.*/)?[^/]*\.pem$"))"#)
+        .expect("the deny stands");
+    let allow = profile
+        .find(r#"(allow file-read* (regex #"^/Users/test/go/pkg/mod/.*/[^/]*\.pem$"))"#)
+        .expect("the carve-out is emitted");
+    assert!(
+        allow > deny,
+        "last match wins, so the carve-out must be later"
+    );
+    assert!(
+        !profile.contains(r#"(allow file-write* (regex #"^/Users/test/go/pkg/mod/.*/[^/]*\."#),
+        "write must stay denied\n{profile}"
+    );
+}
+
+/// A user deny inside a store wins over the key file carve-out, as it does
+/// for the `.env` one (#597): the read deny is repeated after the carve-out,
+/// narrowed to the denied module, so the rest of the store keeps it. Without
+/// this, `--deny-path` on a module would leave its `server.pem` readable once
+/// the key is on.
+#[test]
+fn a_deny_path_inside_a_dependency_store_beats_the_key_file_carve_out() {
+    let deny = vec![PathBuf::from("/Users/test/go/pkg/mod/example.com/x@v1")];
+    let profile = generate_profile(
+        &SandboxConfig {
+            extra_deny: &deny,
+            deny_key_files_by_extension: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    let allow = profile
+        .rfind(r#"(allow file-read* (regex #"^/Users/test/go/pkg/mod/.*/[^/]*\.pem$"))"#)
+        .expect("the rest of the store keeps its carve-out");
+    let redeny = profile
+        .rfind(r#"(deny file-read* (subpath "/Users/test/go/pkg/mod/example.com/x@v1"))"#)
+        .expect("the deny path is repeated");
+    assert!(
+        redeny > allow,
+        "last match wins, so the deny path must be repeated after the carve-out\n{profile}"
+    );
+    assert!(
+        !profile.contains("sandbox.deny_key_files_by_extension re-allow withheld"),
+        "nothing is withheld store-wide\n{profile}"
+    );
+}
+
 /// #597: a `--deny-path` in or above a dependency store must win over the
 /// #477 carve-out. The user deny is emitted before the carve-out, so a read
 /// deny is repeated after the last re-allow, narrowed to the overlap: the
@@ -2578,6 +2642,7 @@ fn base_profile_options() -> SandboxConfig<'static> {
         allow_gpg_signing: false,
         deny_clipboard: false,
         deny_nested_git: false,
+        deny_key_files_by_extension: false,
         deny_copilot_dir_exec: false,
         allow_jvm_attach: false,
         allow_msbuild: false,
@@ -3345,6 +3410,100 @@ fn profile_allows_env_files_when_flag_set() {
     );
 }
 
+const KEY_FILE_EXTENSIONS: &[&str] = &["pem", "key", "p12", "pfx", "jks"];
+
+#[test]
+fn profile_omits_key_file_extension_denies_by_default() {
+    let p = generate_profile(
+        &SandboxConfig {
+            ..base_profile_options()
+        },
+        &[],
+    );
+    assert!(
+        !p.contains(r"[^/]*\."),
+        "key file extension denies must be absent when the key is unset: {p}"
+    );
+}
+
+#[test]
+fn profile_denies_key_files_by_extension_when_enabled() {
+    let write = [PathBuf::from("/work/sibling")];
+    let read = [PathBuf::from("/data/certs")];
+    let p = generate_profile(
+        &SandboxConfig {
+            extra_write: &write,
+            extra_read: &read,
+            deny_key_files_by_extension: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    let project_allow = p
+        .find("(allow file-read* (subpath \"/projects/app\"))")
+        .unwrap();
+    for r in ["/projects/app", "/work/sibling", "/data/certs"] {
+        for ext in KEY_FILE_EXTENSIONS {
+            let read = format!(r#"(deny file-read* (regex #"^{r}/(.*/)?[^/]*\.{ext}$"))"#);
+            let write = format!(r#"(deny file-write* (regex #"^{r}/(.*/)?[^/]*\.{ext}$"))"#);
+            let read_at = p
+                .find(&read)
+                .unwrap_or_else(|| panic!("missing {read}: {p}"));
+            let write_at = p
+                .find(&write)
+                .unwrap_or_else(|| panic!("missing {write}: {p}"));
+            assert!(
+                read_at > project_allow && write_at > project_allow,
+                "{ext} deny must come AFTER project allow for SBPL last-match-wins"
+            );
+        }
+    }
+    // Never global: `/etc/ssl/cert.pem` and every other CA bundle must stay
+    // readable, or TLS clients fail.
+    assert!(
+        !p.contains(r#"(regex #"/[^/]*\."#),
+        "the extension denies must be scoped to granted trees: {p}"
+    );
+    // The literal-name patterns stay; the new ones are additive.
+    assert!(p.contains(r#"(deny file-read* (regex #"/\.pem$"))"#));
+}
+
+/// The granted root is regex source in these denies: an unescaped `.` or `+`
+/// would match other paths, or none.
+#[test]
+fn profile_key_file_extension_denies_escape_the_root() {
+    let read = [PathBuf::from("/work/app.v1+x")];
+    let p = generate_profile(
+        &SandboxConfig {
+            extra_read: &read,
+            deny_key_files_by_extension: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    assert!(
+        p.contains(r#"(deny file-read* (regex #"^/work/app\.v1\+x/(.*/)?[^/]*\.pem$"))"#),
+        "the root must be regex-escaped: {p}"
+    );
+    assert!(!p.contains(r"^/work/app.v1+x/"), "no unescaped root: {p}");
+}
+
+#[test]
+fn profile_key_file_extension_denies_follow_allow_env_files() {
+    let p = generate_profile(
+        &SandboxConfig {
+            deny_key_files_by_extension: true,
+            allow_env_files: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    assert!(
+        !p.contains(r"[^/]*\."),
+        "allow_env_files turns off every sensitive-file pattern, including key files: {p}"
+    );
+}
+
 #[test]
 fn profile_env_deny_comes_after_project_allow() {
     let p = generate_profile(
@@ -4017,6 +4176,7 @@ fn allow_localhost_any_affects_both_backends() {
         allow_gpg_signing: false,
         deny_clipboard: false,
         deny_nested_git: false,
+        deny_key_files_by_extension: false,
         deny_copilot_dir_exec: false,
         allow_jvm_attach: false,
         allow_msbuild: false,
@@ -4083,6 +4243,7 @@ fn config_options_parity_across_backends() {
         allow_gpg_signing: true,
         deny_clipboard: false,
         deny_nested_git: false,
+        deny_key_files_by_extension: false,
         deny_copilot_dir_exec: false,
         allow_jvm_attach: true,
         allow_msbuild: false,
@@ -9425,6 +9586,7 @@ fn no_pasteboard_rule_when_deny_clipboard_is_off() {
         &SandboxConfig {
             deny_clipboard: false,
             deny_nested_git: false,
+            deny_key_files_by_extension: false,
             deny_copilot_dir_exec: false,
             ..base_profile_options()
         },
@@ -9561,6 +9723,7 @@ allow_jvm_attach = false
 allow_msbuild = false
 gradle_init = false
 deny_nested_git = false
+deny_key_files_by_extension = false
 refuse_invalid_repo_config = false
 deny_copilot_dir_exec = false
 allow_docker = false
@@ -10040,6 +10203,7 @@ fn landlock_relocated_cargo_bin_is_exec_only_and_registry_is_precreated() {
         allow_gpg_signing: false,
         deny_clipboard: false,
         deny_nested_git: false,
+        deny_key_files_by_extension: false,
         deny_copilot_dir_exec: false,
         allow_jvm_attach: false,
         allow_msbuild: false,

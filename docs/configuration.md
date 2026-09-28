@@ -699,6 +699,7 @@ The settings below are machine-specific or local CLI preferences, so `.cplt.toml
 | `sandbox.audit` | local output preference, not project sandbox policy |
 | `sandbox.gradle_init` | writes to the machine's Gradle user home, not project policy |
 | `sandbox.deny_nested_git` | a staged hardening switch, see [Blocking new nested `.git` entries](#blocking-new-nested-git-entries-sandboxdeny_nested_git) |
+| `sandbox.deny_key_files_by_extension` | a staged hardening switch, see [Denying key files by extension](#denying-key-files-by-extension-sandboxdeny_key_files_by_extension) |
 | `sandbox.refuse_invalid_repo_config` | decides how a repo's own broken config is treated, so the repo cannot set it; see [Refusing an invalid `.cplt.toml`](#refusing-an-invalid-cplttoml-sandboxrefuse_invalid_repo_config) |
 | `sandbox.deny_copilot_dir_exec` | a staged hardening switch, see [No execute on `~/.copilot`](#no-execute-on-copilot-sandboxdeny_copilot_dir_exec) |
 | `sandbox.inherit_env` | too dangerous for repo config, it would affect every team member |
@@ -818,6 +819,32 @@ Off by default, because it breaks things that create a `.git` below the project:
 - `allow.write` grants that cover a package manager's git checkouts, such as `~/.cargo/git/checkouts`: the rule applies below every writable root, so fetching a new git dependency there fails
 
 It has no effect on Linux, where the launch says so. Landlock cannot deny a path inside a tree it allows, and bubblewrap only protects paths that exist at launch, so there the end-of-session check is the only cover.
+
+## Denying key files by extension (`sandbox.deny_key_files_by_extension`)
+
+The default deny for key files is a pattern on the whole file name. It blocks a file named exactly `.pem`, `.key`, `.p12`, `.pfx` or `.jks`, but not `server.pem`, `tls.key` or `keystore.jks`. Those stay readable and writable.
+
+`sandbox.deny_key_files_by_extension` also denies any file whose name ends in one of those extensions, for read and write, on macOS. A name that only contains the extension (`x.key.bak`) is not affected. A directory whose name ends in one (`certs.pem/`) is denied itself, so it cannot be listed, but the files inside it stay readable.
+
+The extension denies apply only inside the trees you granted: the project, every `--repo-dir` root, and every `allow.write` and `allow.read` path. They are not global, unlike the exact-name patterns, because `*.pem` also matches the system CA bundles (`/etc/ssl/cert.pem`, Homebrew's `cert.pem`) that curl, git and pip need for HTTPS. Those stay readable unless you grant a tree that contains them. Such a grant (`--allow-read /`, or one covering `/private/etc/ssl`, `/opt/homebrew/etc`, `/usr/local/etc`, `/opt/homebrew/Cellar` or `/usr/local/Cellar`) is not refused, but the launch warns about it. The Cellar holds the real files behind Homebrew's symlinks, such as each Homebrew Python's `certifi/cacert.pem`. The warning does not cover python.org's installer: a grant over `/Library/Frameworks/Python.framework` denies its `certifi/cacert.pem` without a warning.
+
+```bash
+cplt config set sandbox.deny_key_files_by_extension true
+```
+
+Off by default, because it blocks files that work today, anywhere inside a granted tree:
+
+- a local HTTPS dev server that reads its certificate or key from the project
+- tests that load a key or keystore fixture from the project
+- a Java or Android build that signs with a `.jks` or `.p12` in the project
+- a CA bundle inside a granted tree. A Python virtualenv in the project ships `certifi/cacert.pem`, so `pip` and `requests` from that venv fail TLS verification. A wide grant such as `allow.read = ["~"]` puts every tool's bundled `cacert.pem` under the deny, and a grant that covers `/etc` or `/opt/homebrew` puts the system bundles there too
+- a package under `node_modules` or a vendored dependency that reads a `.pem` it ships
+
+To recover, set the key back to `false`. `--allow-env-files` also lifts it, but it lifts the `.env` deny as well.
+
+It follows `--allow-env-files`: with that flag, none of these patterns are emitted. Like the default patterns, it is lifted for read inside the extracted dependency stores (`~/go/pkg/mod`, `~/.cargo/registry`) when a granted tree covers them, since a key file there is a library's test fixture. A `--deny-path` or `deny.paths` entry inside or above a store still wins, the same way it does for `.env` (#597): the read deny is repeated after the carve-out, narrowed to the part of the store you denied, so `server.pem` under your deny stays unreadable and the rest of the store keeps the carve-out.
+
+It has no effect on Linux, where the launch says so. Landlock cannot deny a file by name pattern, so on Linux the default patterns do not apply either.
 
 ## Dropping the Keychain grant (`sandbox.keychain_substitute`) — EXPERIMENTAL
 

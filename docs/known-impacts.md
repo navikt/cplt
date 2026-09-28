@@ -88,7 +88,7 @@ macOS is unaffected: the Keychain is granted (narrowed per agent by
 
 ## `.env` file blocking
 
-`.env*`, `.pem`, `.key`, `.p12`, `.pfx`, `.jks` files are **blocked from reading** by default. This stops a rogue agent exfiltrating secrets, but it has side effects.
+`.env` and `.env.*` files are **blocked from reading** by default, and so are files named exactly `.pem`, `.key`, `.p12`, `.pfx` or `.jks`. A key file with a longer name, such as `server.pem`, is blocked only with [`sandbox.deny_key_files_by_extension`](configuration.md#denying-key-files-by-extension-sandboxdeny_key_files_by_extension). This stops a rogue agent exfiltrating secrets, but it has side effects.
 
 **The rule is a pattern on the file name, not a location**, so it applies everywhere the sandbox can reach. The two extracted dependency stores are carved back out for *reading* (#477), because a `.env` there is package content. A `--deny-path` or `deny.paths` entry inside or above one of those stores still wins over the carve-out (#597). Everywhere else the name is enough to deny it:
 
@@ -99,7 +99,7 @@ macOS is unaffected: the Keychain is granted (narrowed per agent by
 | `next build` / `next dev`      | ⚠️ May fail | Next.js auto-loads `.env`, `.env.local`, `.env.production` at startup |
 | `npm run dev` (Node.js)        | ⚠️ May fail | Apps using `dotenv` to load config will get `undefined` env vars      |
 | `npm test` / `vitest`          | ⚠️ May fail | Tests that depend on `.env` for config won't find the values          |
-| TLS dev servers (`.pem` certs) | ⚠️ Blocked  | Local HTTPS certs in `.pem`/`.key` files can't be read                |
+| TLS dev servers (`.pem` certs) | ✅ Works    | `server.pem`, `localhost.key` stay readable by default. Blocked with `sandbox.deny_key_files_by_extension`, which also blocks a project virtualenv's `certifi/cacert.pem` |
 | `.env.example`                 | ⚠️ Blocked  | Matches the `.env.*` pattern; use `--allow-env-files` if needed       |
 | Writing `.env` files           | ✅ Works    | Only read is denied; Copilot can create `.env` from templates         |
 | `go mod verify`, `cargo` over an extracted crate | ✅ Works | Read is re-allowed under `~/go/pkg/mod` and `~/.cargo/registry`: a `.env` there is a library's test fixture (`gotenv` ships one), not your secret, and the content is checksum-verified and came from a registry. Write stays denied, and so does read under a path you deny |

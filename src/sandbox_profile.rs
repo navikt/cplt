@@ -24,9 +24,10 @@ use super::policy::{
     DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS,
     DEPENDENCY_SOURCE_TREES, EXEC_IN_WRITABLE, GPG_SIGNING_ALLOW_FILES, HOME_CONFIG_FILES,
     HomeToolDir, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir,
-    SENSITIVE_PROJECT_PATTERNS, SYSTEM_READ_FILES, TOOL_READ_DIRS, XCODE_SELECT_LINK,
-    active_tool_dirs, ancestor_alternation, app_dirs, colima_socket_paths, copilot_default_pkg_dir,
-    current_uid, escape_regex, first_party_read_target, grant_is_refused, home_config_link_targets,
+    SENSITIVE_KEY_FILE_EXTENSION_PATTERNS, SENSITIVE_PROJECT_PATTERNS, SYSTEM_READ_FILES,
+    TOOL_READ_DIRS, XCODE_SELECT_LINK, active_tool_dirs, ancestor_alternation, app_dirs,
+    colima_socket_paths, copilot_default_pkg_dir, current_uid, escape_regex,
+    first_party_read_target, grant_is_refused, home_config_link_targets,
     missing_home_config_link_targets, nested_alternation, path_bin_dirs, playwright_runtime_intent,
     read_only_home_config, rel_is_glob, rel_regex, validate_playwright_socket_dir,
     validate_sbpl_path,
@@ -215,7 +216,9 @@ pub fn generate_profile_with_playwright_socket_dir(
         &mut sb,
         &project_roots,
         config.extra_write,
+        config.extra_read,
         config.allow_env_files,
+        config.deny_key_files_by_extension,
         &home,
         config.existing_home_tool_dirs,
         config.extra_deny,
@@ -407,11 +410,14 @@ fn writable_roots(project_roots: &[String], extra_write: &[PathBuf]) -> Vec<Stri
     roots
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_sensitive_project_denies(
     sb: &mut String,
     project_roots: &[String],
     extra_write: &[PathBuf],
+    extra_read: &[PathBuf],
     allow_env_files: bool,
+    deny_key_files_by_extension: bool,
     home: &str,
     tool_dirs: Option<&[ResolvedToolDir]>,
     extra_deny: &[PathBuf],
@@ -493,6 +499,46 @@ fn emit_sensitive_project_denies(
             sbpl!(sb, "(deny file-read* (regex #\"/{pattern}\"))");
             sbpl!(sb, "(deny file-write* (regex #\"/{pattern}\"))");
         }
+        // `sandbox.deny_key_files_by_extension`: the patterns above only match
+        // a key file named exactly `.pem`. See the constant's docs. Emitted
+        // before the re-allow below, so dependency fixtures stay readable.
+        //
+        // Scoped to the trees the user granted (project, named roots,
+        // `allow.write`, `allow.read`), not global like the patterns above:
+        // `*.pem` matches every CA bundle on the system (`/etc/ssl/cert.pem`,
+        // Homebrew's `cert.pem`), and denying those breaks every TLS client.
+        let key_patterns: &[&str] = if deny_key_files_by_extension {
+            SENSITIVE_KEY_FILE_EXTENSION_PATTERNS
+        } else {
+            &[]
+        };
+        if !key_patterns.is_empty() {
+            let mut key_roots = roots.clone();
+            for p in extra_read {
+                let s = p.to_string_lossy().into_owned();
+                if !key_roots.contains(&s) {
+                    key_roots.push(s);
+                }
+            }
+            for root in &key_roots {
+                // Not refused: the grant is the user's call. But they should
+                // know it takes the CA bundles with it.
+                if let Some(ca) = key_root_covers_system_ca(root) {
+                    crate::ui::warn(&format!(
+                        "sandbox.deny_key_files_by_extension: the grant {root} covers {ca}, \
+                         so the CA bundles there (cert.pem, cacert.pem) are denied too and \
+                         curl, git over HTTPS and pip will fail TLS setup. Narrow the grant, \
+                         or set sandbox.deny_key_files_by_extension = false."
+                    ));
+                }
+                // `/` trims to the empty prefix, which is the global rule.
+                let r = escape_regex(root.trim_end_matches('/'));
+                for pattern in key_patterns {
+                    sbpl!(sb, "(deny file-read* (regex #\"^{r}/(.*/)?{pattern}\"))");
+                    sbpl!(sb, "(deny file-write* (regex #\"^{r}/(.*/)?{pattern}\"))");
+                }
+            }
+        }
         // Re-allow READ inside the extracted dependency stores, after the deny,
         // because SBPL is last-match-wins. Write stays denied: nothing should be
         // writing a `.env` into a module cache.
@@ -515,6 +561,12 @@ fn emit_sensitive_project_denies(
             }
             let t = escape_regex(&tree);
             for pattern in SENSITIVE_PROJECT_PATTERNS {
+                sbpl!(sb, "(allow file-read* (regex #\"^{t}/.*/{pattern}\"))");
+            }
+            // `sandbox.deny_key_files_by_extension`: the same read carve-out
+            // for key files by extension. A `--deny-path` overlapping the store
+            // is handled by the re-deny below, like the `.env` carve-out above.
+            for pattern in key_patterns {
                 sbpl!(sb, "(allow file-read* (regex #\"^{t}/.*/{pattern}\"))");
             }
             let tree = PathBuf::from(tree);
@@ -2665,6 +2717,27 @@ fn overlapping_home_deny<'a>(
         .find_map(|p| overlapping_deny(extra_deny, Path::new(p)))
 }
 
+/// Where macOS and Homebrew keep the CA bundles TLS clients read. The Cellar
+/// holds the real files behind Homebrew's symlinks, including each Python's
+/// `certifi/cacert.pem` and `ca-certificates`' own bundle.
+const SYSTEM_CA_DIRS: [&str; 5] = [
+    "/private/etc/ssl",
+    "/opt/homebrew/etc",
+    "/usr/local/etc",
+    "/opt/homebrew/Cellar",
+    "/usr/local/Cellar",
+];
+
+/// The system CA directory a key-file extension deny on `root` would reach,
+/// if any: `root` at or above it (`--allow-read /`), or inside it.
+fn key_root_covers_system_ca(root: &str) -> Option<&'static str> {
+    let root = Path::new(root);
+    SYSTEM_CA_DIRS.into_iter().find(|ca| {
+        let ca = Path::new(ca);
+        ca.starts_with(root) || root.starts_with(ca)
+    })
+}
+
 /// Withhold one opt-in re-allow because an explicit `--deny-path` overlaps it.
 ///
 /// Emits an SBPL breadcrumb and warns the user: `main.rs` reports the grant as
@@ -3082,6 +3155,34 @@ fn emit_network_rules(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_root_over_a_system_ca_dir_is_flagged() {
+        for (root, ca) in [
+            ("/", "/private/etc/ssl"),
+            ("/private", "/private/etc/ssl"),
+            ("/private/etc", "/private/etc/ssl"),
+            ("/private/etc/ssl", "/private/etc/ssl"),
+            ("/opt", "/opt/homebrew/etc"),
+            ("/opt/homebrew/etc/openssl@3", "/opt/homebrew/etc"),
+            ("/usr/local", "/usr/local/etc"),
+            ("/opt/homebrew/Cellar", "/opt/homebrew/Cellar"),
+            ("/opt/homebrew/Cellar/python@3.14", "/opt/homebrew/Cellar"),
+            ("/usr/local/Cellar", "/usr/local/Cellar"),
+        ] {
+            assert_eq!(key_root_covers_system_ca(root), Some(ca), "{root}");
+        }
+        // Component-wise, not string prefix: `/private/etc/sslx` is elsewhere.
+        for root in [
+            "/Users/test/app",
+            "/private/etc/sslx",
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/work/app.v1+x",
+        ] {
+            assert_eq!(key_root_covers_system_ca(root), None, "{root}");
+        }
+    }
 
     /// Build a minimal `SandboxConfig` for SBPL-string tests.
     /// Resolving git from trusted directories means `git_common_dir` is `None`
@@ -3699,6 +3800,7 @@ mod tests {
             allow_gpg_signing: false,
             deny_clipboard: false,
             deny_nested_git: false,
+            deny_key_files_by_extension: false,
             deny_copilot_dir_exec: false,
             allow_jvm_attach: false,
             allow_msbuild: false,

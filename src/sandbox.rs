@@ -76,11 +76,12 @@ pub use policy::{
     LinuxCoverage, PLAYWRIGHT_SOCKET_BASE_MAX_BYTES, PLAYWRIGHT_SOCKET_DIR_PREFIX,
     PLAYWRIGHT_SOCKET_PATH_LIMIT, PLAYWRIGHT_SOCKET_ROOT, PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX,
     PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir,
-    SENSITIVE_PROJECT_PATTERNS, TOOL_PATH_ENV_VARS, ToolPathEnvVar, ToolPathOverride, ToolRoot,
-    active_tool_dirs, app_dirs, build_credential_grants, copilot_default_pkg_dir, copilot_pkg_dir,
-    copilot_pkg_dirs, copilot_ro_protect_paths, credential_link_hop, current_uid,
-    exec_write_conflicts, home_config_link_targets, home_tool_dirs, linux_docker_socket_paths,
-    linux_runtime_dirs, mise_ro_protect_paths, nested_alternation, no_cache_env, path_bin_dirs,
+    SENSITIVE_KEY_FILE_EXTENSION_PATTERNS, SENSITIVE_PROJECT_PATTERNS, TOOL_PATH_ENV_VARS,
+    ToolPathEnvVar, ToolPathOverride, ToolRoot, active_tool_dirs, app_dirs,
+    build_credential_grants, copilot_default_pkg_dir, copilot_pkg_dir, copilot_pkg_dirs,
+    copilot_ro_protect_paths, credential_link_hop, current_uid, exec_write_conflicts,
+    home_config_link_targets, home_tool_dirs, linux_docker_socket_paths, linux_runtime_dirs,
+    mise_ro_protect_paths, nested_alternation, no_cache_env, path_bin_dirs,
     playwright_runtime_intent, process_env, relocatable_tool_prefix, shim_ro_protect_paths,
     socket_mask_paths, tool_override_path_is_safe, tool_path_env_overrides,
     validate_playwright_socket_dir, validate_sbpl_path, xdg_runtime_dir_env,
@@ -209,6 +210,10 @@ pub struct SandboxConfig<'a> {
     /// `sandbox.deny_nested_git` (#576): deny creating a `.git` entry below a
     /// writable root. macOS only; Linux has no way to express it.
     pub deny_nested_git: bool,
+    /// `sandbox.deny_key_files_by_extension`: deny `*.pem`, `*.key`, `*.p12`,
+    /// `*.pfx` and `*.jks` by extension, not only files named exactly `.pem`.
+    /// macOS only; Linux has no name-pattern denies.
+    pub deny_key_files_by_extension: bool,
     /// `sandbox.deny_copilot_dir_exec` (#324). The grant itself is withdrawn
     /// in `agent_dirs` before this config is built; the flag is here so the
     /// Linux launch can warn about what Landlock unions back in.
@@ -1738,6 +1743,13 @@ fn prepare_impl(
              ends, not blocked.",
         );
     }
+    if config.deny_key_files_by_extension {
+        ui::warn(
+            "sandbox.deny_key_files_by_extension has no effect on Linux: Landlock \
+             cannot deny files by name pattern, so .pem, .key, .p12, .pfx and .jks \
+             files in the project stay readable.",
+        );
+    }
     if config.allow_docker {
         ui::warn(
             "--allow-docker on Linux grants the Docker/Podman daemon sockets and \
@@ -2317,6 +2329,7 @@ mod tests {
             allow_gpg_signing: false,
             deny_clipboard: false,
             deny_nested_git: false,
+            deny_key_files_by_extension: false,
             deny_copilot_dir_exec: false,
             allow_jvm_attach: false,
             allow_msbuild: false,

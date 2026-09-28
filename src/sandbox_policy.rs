@@ -880,6 +880,34 @@ pub const SENSITIVE_PROJECT_PATTERNS: &[&str] = &[
     r"\.jks$",
 ];
 
+/// Private key file patterns that match by extension, added with
+/// `sandbox.deny_key_files_by_extension`.
+///
+/// The key-file entries of [`SENSITIVE_PROJECT_PATTERNS`] are emitted behind a
+/// `/`, so `\.pem$` becomes `/\.pem$`. That matches only a file named exactly
+/// `.pem`: `server.pem`, `tls.key` and `keystore.jks` stay readable, although
+/// the docs and `is_sensitive_basename` treat them as sensitive. The `.env`
+/// entries are not affected, because `.env` really is the whole file name.
+///
+/// `[^/]*` lets any file name come before the extension. The pattern matches a
+/// path that ends in the extension, so a directory named `certs.pem` is itself
+/// denied (it cannot be listed), while the files inside it are not.
+///
+/// Unlike the default patterns these are emitted per granted tree (project,
+/// named roots, `allow.write`, `allow.read`), never globally: `*.pem` would
+/// otherwise hit every CA bundle on the system. These are added next to the
+/// default patterns, not in place of them, so with the key unset the profile
+/// is unchanged. Off by default because it can break a working setup, such as
+/// a dev server that reads a TLS certificate from the project (staged rollout,
+/// AGENTS.md).
+pub const SENSITIVE_KEY_FILE_EXTENSION_PATTERNS: &[&str] = &[
+    r"[^/]*\.pem$",
+    r"[^/]*\.key$",
+    r"[^/]*\.p12$",
+    r"[^/]*\.pfx$",
+    r"[^/]*\.jks$",
+];
+
 /// Dependency trees where [`SENSITIVE_PROJECT_PATTERNS`] is collateral rather
 /// than protection.
 ///

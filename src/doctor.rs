@@ -82,8 +82,16 @@ pub fn tilde_in_text(text: &str, home: &Path) -> String {
 /// A tracked secret under the `.env` deny breaks every git command that hashes
 /// the index (`add`, `diff`, `stash`, `commit -a`) with `cannot hash`. The
 /// file list comes from `cplt check`'s `tracked_sensitive_files` (#451).
+///
+/// `extension_only` says a file is on the list only because of
+/// `sandbox.deny_key_files_by_extension` (`server.pem`, not `.pem`), so
+/// turning that key off is a narrower fix than `allow_env_files`.
 #[must_use]
-pub fn tracked_env_finding(files: &[String], allow_env_files: bool) -> Option<Finding> {
+pub fn tracked_env_finding(
+    files: &[String],
+    allow_env_files: bool,
+    extension_only: bool,
+) -> Option<Finding> {
     if allow_env_files || files.is_empty() {
         return None;
     }
@@ -100,7 +108,13 @@ pub fn tracked_env_finding(files: &[String], allow_env_files: bool) -> Option<Fi
             // beginning with a dash would be read as a flag. The fix line is
             // meant to be pasted.
             "git rm --cached -- '{first}' && echo '{first}' >> .gitignore  \
-             (or sandbox.allow_env_files = true)"
+             (or sandbox.allow_env_files = true{})",
+            if extension_only {
+                ", or for the key files matched by extension only, \
+                 sandbox.deny_key_files_by_extension = false"
+            } else {
+                ""
+            }
         )),
     ))
 }
@@ -369,21 +383,28 @@ mod tests {
     fn tracked_env_finding_needs_a_tracked_file_and_the_deny() {
         let files = vec!["config/.env.local".to_string()];
         assert!(
-            tracked_env_finding(&files, true).is_none(),
+            tracked_env_finding(&files, true, false).is_none(),
             "deny off: nothing to say"
         );
         assert!(
-            tracked_env_finding(&[], false).is_none(),
+            tracked_env_finding(&[], false, false).is_none(),
             "nothing tracked: nothing to say"
         );
-        let f = tracked_env_finding(&files, false).expect("finding");
+        let f = tracked_env_finding(&files, false, false).expect("finding");
         assert_eq!(f.level, Level::Warning);
         assert!(f.message.contains("cannot hash"));
+        let fix = f.fix.as_deref().unwrap();
+        assert!(fix.contains("git rm --cached -- 'config/.env.local'"));
         assert!(
-            f.fix
-                .as_deref()
-                .unwrap()
-                .contains("git rm --cached -- 'config/.env.local'")
+            !fix.contains("deny_key_files_by_extension"),
+            "an exact-name match has nothing to do with the extension key: {fix}"
+        );
+        let f = tracked_env_finding(&["certs/server.pem".to_string()], false, true).unwrap();
+        let fix = f.fix.as_deref().unwrap();
+        assert!(
+            fix.contains("sandbox.allow_env_files = true")
+                && fix.contains("sandbox.deny_key_files_by_extension = false"),
+            "an extension-only match names the narrower key too: {fix}"
         );
     }
 

@@ -5474,6 +5474,7 @@ fn build_sandbox_config<'a>(
         allow_gpg_signing: resolved.allow_gpg_signing,
         deny_clipboard: resolved.deny_clipboard,
         deny_nested_git: resolved.deny_nested_git,
+        deny_key_files_by_extension: resolved.deny_key_files_by_extension,
         deny_copilot_dir_exec: resolved.deny_copilot_dir_exec,
         allow_jvm_attach: resolved.allow_jvm_attach,
         allow_msbuild: resolved.allow_msbuild,
@@ -6268,7 +6269,7 @@ fn run_check_command(
 /// without a commit yet, or no git at all, is not something to report as a
 /// finding.
 #[allow(clippy::disallowed_methods)] // `git` is a git::trusted_git() path, resolved immediately above
-fn tracked_sensitive_files(project_dir: &Path) -> Vec<String> {
+fn tracked_sensitive_files(project_dir: &Path, key_files_by_extension: bool) -> Vec<String> {
     let Some(git) = cplt::git::trusted_git() else {
         return Vec::new();
     };
@@ -6288,7 +6289,12 @@ fn tracked_sensitive_files(project_dir: &Path) -> Vec<String> {
     String::from_utf8_lossy(&out.stdout)
         .split('\0')
         .filter(|name| !name.is_empty())
-        .filter(|name| is_sensitive_basename(name.rsplit('/').next().unwrap_or(name)))
+        .filter(|name| {
+            is_sensitive_basename(
+                name.rsplit('/').next().unwrap_or(name),
+                key_files_by_extension,
+            )
+        })
         .map(str::to_string)
         .collect()
 }
@@ -6300,12 +6306,23 @@ fn tracked_sensitive_files(project_dir: &Path) -> Vec<String> {
 /// fixed shapes, so a `ends_with` each is the whole implementation — and
 /// `sensitive_basename_matches_the_profile_patterns` fails if the constant
 /// grows, so a new pattern cannot be silently unmatched here.
-fn is_sensitive_basename(base: &str) -> bool {
+///
+/// Key files match by exact name (`.pem`) unless `by_extension`
+/// (`sandbox.deny_key_files_by_extension`) is on, matching the profile.
+fn is_sensitive_basename(base: &str, by_extension: bool) -> bool {
+    const KEYS: [&str; 5] = [".pem", ".key", ".p12", ".pfx", ".jks"];
     base == ".env"
         || base.starts_with(".env.")
-        || [".pem", ".key", ".p12", ".pfx", ".jks"]
-            .iter()
-            .any(|ext| base.ends_with(ext))
+        || KEYS.contains(&base)
+        || (by_extension && KEYS.iter().any(|ext| base.ends_with(ext)))
+}
+
+/// Whether any of `files` is sensitive only through
+/// `sandbox.deny_key_files_by_extension` (`server.pem`, not `.pem` or `.env`).
+fn any_extension_only_match(files: &[String]) -> bool {
+    files
+        .iter()
+        .any(|f| !is_sensitive_basename(f.rsplit('/').next().unwrap_or(f), false))
 }
 
 /// Resolve a user-supplied check path to an absolute path without requiring it
@@ -6347,7 +6364,7 @@ fn build_battery(
     // hashes worktree files and the read deny aborts it. Worth checking for
     // two reasons at once — it is a git-hostile configuration *and* a secret
     // committed to the repository (#401).
-    for tracked in tracked_sensitive_files(project_dir) {
+    for tracked in tracked_sensitive_files(project_dir, resolved.deny_key_files_by_extension) {
         items.push(check::CheckItem {
             name: "tracked secret-shaped file".to_string(),
             category: "filesystem".to_string(),
@@ -7085,10 +7102,11 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
 
     // Tracked secrets under the .env deny — the same set `cplt check` reports
     // (#451), from the same function.
-    let sensitive = tracked_sensitive_files(&project_dir);
+    let sensitive = tracked_sensitive_files(&project_dir, resolved.deny_key_files_by_extension);
     findings.extend(doctor::tracked_env_finding(
         &sensitive,
         resolved.allow_env_files,
+        resolved.deny_key_files_by_extension && any_extension_only_match(&sensitive),
     ));
 
     // Tools as found on PATH — the shim, not its target.
@@ -10249,6 +10267,18 @@ mod tests {
         assert_eq!(merged.len(), 1, "one root, one record: {merged:?}");
     }
 
+    #[test]
+    fn extension_only_match_ignores_exact_names() {
+        let s = |v: &[&str]| v.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert!(!any_extension_only_match(&s(&["a/.env", "b/.pem"])));
+        assert!(any_extension_only_match(&s(&[
+            "a/.env",
+            "certs/server.pem"
+        ])));
+        // The basename decides, not a directory that looks like a key.
+        assert!(!any_extension_only_match(&s(&["x.pem/.key"])));
+    }
+
     /// The hand-written matcher must cover every pattern the profile denies.
     /// It cannot be derived from them — they are SBPL regex source and there is
     /// no regex engine linked — so this is the thing that stops the two
@@ -10261,28 +10291,59 @@ mod tests {
             "a pattern was added or removed; teach `is_sensitive_basename` about it \
              and update this count"
         );
+        assert_eq!(
+            sandbox::SENSITIVE_KEY_FILE_EXTENSION_PATTERNS.len(),
+            5,
+            "a key file extension was added or removed; teach `is_sensitive_basename` \
+             about it and update this count"
+        );
+        // Exact names match whether or not the extension key is on.
+        for by_ext in [false, true] {
+            for name in [
+                ".env",
+                ".env.local",
+                ".env.production",
+                ".pem",
+                ".key",
+                ".p12",
+                ".pfx",
+                ".jks",
+            ] {
+                assert!(
+                    is_sensitive_basename(name, by_ext),
+                    "{name} should be sensitive (by_extension={by_ext})"
+                );
+            }
+            for name in [
+                "env",
+                "environment.md",
+                ".envrc",
+                "README.md",
+                "monkey.jks.bak",
+            ] {
+                assert!(
+                    !is_sensitive_basename(name, by_ext),
+                    "{name} should not be treated as sensitive (by_extension={by_ext})"
+                );
+            }
+        }
+        // By extension only with `sandbox.deny_key_files_by_extension`: with it
+        // off the profile leaves these readable, so `cplt check` must not call
+        // them blocked.
         for name in [
-            ".env",
-            ".env.local",
-            ".env.production",
             "server.pem",
             "id.key",
             "cert.p12",
             "cert.pfx",
             "keystore.jks",
         ] {
-            assert!(is_sensitive_basename(name), "{name} should be sensitive");
-        }
-        for name in [
-            "env",
-            "environment.md",
-            ".envrc",
-            "README.md",
-            "monkey.jks.bak",
-        ] {
             assert!(
-                !is_sensitive_basename(name),
-                "{name} should not be treated as sensitive"
+                is_sensitive_basename(name, true),
+                "{name} is denied with the key on"
+            );
+            assert!(
+                !is_sensitive_basename(name, false),
+                "{name} is readable with the key off"
             );
         }
     }
