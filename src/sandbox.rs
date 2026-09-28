@@ -50,7 +50,9 @@ pub(crate) mod bubblewrap_probe {
     /// The wrapper `prepare` would build for `config` — same rules, overlays
     /// and deny masks, through the same `build_wrapper` — probed and dropped.
     /// `Ok` is exactly when auto-detect wraps the launch instead of falling
-    /// back to Landlock + seccomp only.
+    /// back to Landlock + seccomp only — for the session paths `config`
+    /// carries. What doctor's config leaves out is listed on
+    /// [`crate::doctor::bubblewrap_state`].
     pub(crate) fn test_launch(config: &super::SandboxConfig) -> Result<(), String> {
         let plan = super::bwrap_plan(config, &super::launch_git_dirs(config));
         super::bubblewrap::build_wrapper(
@@ -133,6 +135,7 @@ pub use landlock_mod::available_abi_version;
 /// This struct borrows all data from the caller — no allocations needed
 /// to construct it. Owned copies are made inside [`prepare()`] for the
 /// fields that [`PreparedSandbox`] needs at execution time.
+#[derive(Clone)]
 pub struct SandboxConfig<'a> {
     pub project_dir: &'a Path,
     /// Repositories named with `--repo-dir` / `sandbox.repo_dirs`.
@@ -2846,7 +2849,7 @@ mod tests {
         config.extra_deny = &deny;
 
         assert!(
-            crate::doctor::bubblewrap_state(None, &config).active(),
+            crate::doctor::bubblewrap_state(None, false, &config).active(),
             "control: bwrap must work here for this test to mean anything"
         );
         bubblewrap::FAIL_PROBE_ON.set(Some(secret.to_string_lossy().into_owned()));
@@ -2856,7 +2859,7 @@ mod tests {
             bubblewrap::Overlays::default(),
             &bubblewrap::DenyMasks::default(),
         );
-        let state = crate::doctor::bubblewrap_state(None, &config);
+        let state = crate::doctor::bubblewrap_state(None, false, &config);
         let launch = prepare(&config).expect("prepare");
         bubblewrap::FAIL_PROBE_ON.set(None);
 
@@ -2869,6 +2872,52 @@ mod tests {
                 reason: "bwrap: forced by test".to_string(),
             },
             "doctor must agree with the launch"
+        );
+    }
+
+    /// A file deny mask needs the session scratch dir for its placeholder, and
+    /// doctor's config has none. The probe must make one, or it never sees the
+    /// launch's file masks — and must leave nothing behind.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn doctor_bubblewrap_state_probes_file_deny_masks() {
+        let Some(bwrap) = bubblewrap::check_availability() else {
+            eprintln!("skipped: bwrap not installed");
+            return;
+        };
+        let tmp = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let home = root.join("home");
+        let project = root.join("project");
+        let secret = project.join(".netrc");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        std::fs::create_dir_all(&project).expect("mkdir project");
+        std::fs::write(&secret, "machine x").expect("write secret");
+        let deny = [secret.clone()];
+        let mut config = test_config(&home, &[]);
+        config.project_dir = &project;
+        config.extra_deny = &deny;
+
+        bubblewrap::FAIL_PROBE_ON.set(Some(secret.to_string_lossy().into_owned()));
+        let no_scratch = crate::doctor::bubblewrap_state(None, false, &config);
+        let state = crate::doctor::bubblewrap_state(None, true, &config);
+        bubblewrap::FAIL_PROBE_ON.set(None);
+
+        assert!(
+            no_scratch.active(),
+            "control: with scratch off the launch drops file masks too"
+        );
+        assert_eq!(
+            state,
+            crate::doctor::Bubblewrap::Unusable {
+                path: bwrap,
+                reason: "bwrap: forced by test".to_string(),
+            },
+            "the file mask must reach doctor's probe"
+        );
+        assert!(
+            !home.join(".cache").exists(),
+            "the probe's scratch dir and the ancestors it made are removed"
         );
     }
 

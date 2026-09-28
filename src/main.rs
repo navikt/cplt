@@ -4069,27 +4069,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // can be included in the sandbox profile. Failure is deferred —
     // --print-profile doesn't need the binary.
     let agent_bin_result = active_agent.resolve_binary();
-    let copilot_install_dir = if active_agent == agent::Agent::Copilot {
-        agent_bin_result
-            .as_ref()
-            .ok()
-            .and_then(|p| {
-                // Try package.json discovery first (npm/Homebrew installs)
-                discover::copilot_pkg_dir(p, &home_dir).or_else(|| {
-                    // Fallback: use the binary's parent directory (VS Code extension installs
-                    // at ~/Library/Application Support/Code/.../copilotCli/copilot)
-                    p.parent().map(std::path::Path::to_path_buf)
-                })
-            })
-            .filter(|d| !crate::is_unsafe_root(d, &home_dir))
-    } else {
-        // Non-Copilot agents: use binary's parent dir for read + map-exec
-        agent_bin_result
-            .as_ref()
-            .ok()
-            .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
-            .filter(|d| !crate::is_unsafe_root(d, &home_dir))
-    };
+    let copilot_install_dir = agent_install_dir(active_agent, &agent_bin_result, &home_dir);
 
     // Discover Electron app bundle when Copilot CLI is installed via VS Code.
     // macOS-only: the shim invokes VS Code's Electron runtime, which needs
@@ -6980,6 +6960,9 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
     ));
     doctor_exec.sort();
     doctor_exec.dedup();
+    let agent_bin_result = active_agent.resolve_binary();
+    let doctor_install_dir = agent_install_dir(active_agent, &agent_bin_result, &home_dir);
+    let doctor_electron_dir = discover_electron_app_dir(&agent_bin_result, active_agent);
     let sandbox_config = build_sandbox_config(
         &resolved,
         &probe,
@@ -6992,7 +6975,14 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
             worktree_root.as_deref(),
         ),
         &doctor_exec,
-        SessionPaths::default(),
+        // The scratch dir is the bubblewrap probe's own (see
+        // `doctor::bubblewrap_state`); the proxy port and Playwright socket
+        // dir add no mounts.
+        SessionPaths {
+            copilot_install_dir: doctor_install_dir.as_deref(),
+            electron_app_dir: doctor_electron_dir.as_deref(),
+            ..SessionPaths::default()
+        },
         keychain_substitute,
     );
     let policy = sandbox::generate_policy(&sandbox_config);
@@ -7000,7 +6990,11 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
     // ── enforcement: the regime, and why ──
     // After the policy: bubblewrap is probed with the wrapper the launch would
     // build from it, not an empty one.
-    let bubblewrap = doctor::bubblewrap_state(resolved.use_bubblewrap, &sandbox_config);
+    let bubblewrap = doctor::bubblewrap_state(
+        resolved.use_bubblewrap,
+        resolved.scratch_dir,
+        &sandbox_config,
+    );
     #[cfg(target_os = "macos")]
     {
         if Path::new("/usr/bin/sandbox-exec").exists() {
@@ -9922,6 +9916,36 @@ fn shell_uninstall(agent: Option<&str>) -> ExitCode {
 //
 // Named functions with cfg-gated bodies keep the run() function
 // free of inline #[cfg] blocks.
+
+/// The agent's installation directory, granted read + map-exec
+/// (`SandboxConfig::copilot_install_dir`). Shared by the launch and `doctor`.
+fn agent_install_dir(
+    agent: agent::Agent,
+    agent_bin_result: &Result<PathBuf, String>,
+    home_dir: &Path,
+) -> Option<PathBuf> {
+    if agent == agent::Agent::Copilot {
+        agent_bin_result
+            .as_ref()
+            .ok()
+            .and_then(|p| {
+                // Try package.json discovery first (npm/Homebrew installs)
+                discover::copilot_pkg_dir(p, home_dir).or_else(|| {
+                    // Fallback: use the binary's parent directory (VS Code extension installs
+                    // at ~/Library/Application Support/Code/.../copilotCli/copilot)
+                    p.parent().map(std::path::Path::to_path_buf)
+                })
+            })
+            .filter(|d| !crate::is_unsafe_root(d, home_dir))
+    } else {
+        // Non-Copilot agents: use binary's parent dir for read + map-exec
+        agent_bin_result
+            .as_ref()
+            .ok()
+            .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+            .filter(|d| !crate::is_unsafe_root(d, home_dir))
+    }
+}
 
 /// Discover the VS Code Electron app bundle containing Copilot's shim (macOS only).
 ///

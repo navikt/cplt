@@ -235,13 +235,21 @@ impl Bubblewrap {
 /// with an empty rule set can pass where the launch's fails and falls back to
 /// Landlock only, and every finding keyed on `active()` would then be wrong.
 ///
-/// Residual: doctor's config has no session scratch dir, so the scratch bind
-/// and the file deny masks (whose placeholder lives there) are not in the
-/// probe.
+/// `scratch` is `Resolved::scratch_dir`. When it is on and `config` has no
+/// scratch dir (doctor's does not), the probe makes a session scratch dir of
+/// its own the way the launch does, so the scratch bind and the file deny
+/// masks, whose placeholder lives there, are probed. It and any ancestor it
+/// had to create are removed before this returns.
+///
+/// Still not probed: the pnpm shadow dir (the launch copies pnpm into a fresh
+/// directory under `~/.cplt-pnpm-shadow` and grants it read+execute; doctor
+/// will not copy files for a diagnosis), and, if the scratch dir cannot be
+/// created here, the scratch bind and file masks.
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn bubblewrap_state(
     use_bubblewrap: Option<bool>,
+    scratch: bool,
     config: &crate::sandbox::SandboxConfig,
 ) -> Bubblewrap {
     use crate::sandbox::bubblewrap_probe;
@@ -251,7 +259,15 @@ pub fn bubblewrap_state(
     let Some(path) = bubblewrap_probe::check_availability() else {
         return Bubblewrap::NotInstalled;
     };
-    match bubblewrap_probe::test_launch(config) {
+    let probe_scratch =
+        (scratch && config.scratch_dir.is_none()).then(|| ProbeScratch::create(config.home_dir));
+    let probed = crate::sandbox::SandboxConfig {
+        scratch_dir: config
+            .scratch_dir
+            .or_else(|| probe_scratch.as_ref().and_then(ProbeScratch::path)),
+        ..config.clone()
+    };
+    match bubblewrap_probe::test_launch(&probed) {
         Ok(()) => Bubblewrap::Usable(path),
         Err(reason) => Bubblewrap::Unusable {
             path,
@@ -260,10 +276,51 @@ pub fn bubblewrap_state(
     }
 }
 
+/// A session scratch dir for one probe. Dropping it removes the dir and then
+/// every ancestor `ScratchDir::create` had to make, so doctor leaves nothing
+/// behind on a host that never launched.
+#[cfg(target_os = "linux")]
+struct ProbeScratch {
+    dir: Option<crate::scratch::ScratchDir>,
+    /// Deepest first, the order they must be removed in.
+    created: Vec<PathBuf>,
+}
+
+#[cfg(target_os = "linux")]
+impl ProbeScratch {
+    fn create(home_dir: &Path) -> Self {
+        let base = crate::scratch::ScratchDir::base(home_dir);
+        let created = base
+            .ancestors()
+            .take_while(|p| p.symlink_metadata().is_err())
+            .map(Path::to_path_buf)
+            .collect();
+        Self {
+            dir: crate::scratch::ScratchDir::create(home_dir).ok(),
+            created,
+        }
+    }
+
+    fn path(&self) -> Option<&Path> {
+        self.dir.as_ref().map(crate::scratch::ScratchDir::path)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ProbeScratch {
+    fn drop(&mut self) {
+        drop(self.dir.take());
+        for dir in &self.created {
+            let _ = std::fs::remove_dir(dir);
+        }
+    }
+}
+
 #[cfg(not(target_os = "linux"))]
 #[must_use]
 pub fn bubblewrap_state(
     _use_bubblewrap: Option<bool>,
+    _scratch: bool,
     _config: &crate::sandbox::SandboxConfig,
 ) -> Bubblewrap {
     Bubblewrap::NotApplicable
