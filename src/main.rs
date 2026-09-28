@@ -6956,8 +6956,51 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         ));
     }
 
+    // ── the policy a launch would build, for the rules below ──
+    let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
+    let mut agent_dirs = resolved.agent_config_dirs(active_agent, &home_dir);
+    agent::canonicalize_agent_dirs(&mut agent_dirs);
+    let keychain_substitute = cplt::sandbox::keychain_substitute(
+        active_agent,
+        &home_dir,
+        &resolved.deny_env,
+        resolved.keychain_substitute,
+    );
+    let doctor_pnpm = resolve_exec_binary("pnpm").ok();
+    let doctor_pnpm_shadowed = doctor_pnpm
+        .as_ref()
+        .is_some_and(|pnpm| scratch::pnpm_requires_shadow(&home_dir, pnpm).unwrap_or(false));
+    let mut doctor_exec = resolved.allow_exec.clone();
+    doctor_exec.extend(pnpm_exec_grants(
+        &home_dir,
+        doctor_pnpm.as_deref(),
+        doctor_pnpm_shadowed,
+        &project_dir,
+        &repo_paths,
+    ));
+    doctor_exec.sort();
+    doctor_exec.dedup();
+    let sandbox_config = build_sandbox_config(
+        &resolved,
+        &probe,
+        active_agent,
+        &agent_dirs,
+        NamedRepos::new(
+            &policy_roots,
+            &repo_git_dirs,
+            &repo_rows,
+            worktree_root.as_deref(),
+        ),
+        &doctor_exec,
+        SessionPaths::default(),
+        keychain_substitute,
+    );
+    let policy = sandbox::generate_policy(&sandbox_config);
+
     // ── enforcement: the regime, and why ──
-    let bubblewrap = doctor::bubblewrap_state(resolved.use_bubblewrap);
+    // After the policy: bubblewrap is probed with the wrapper the launch would
+    // build from it, not an empty one.
+    let bubblewrap = doctor::bubblewrap_state(resolved.use_bubblewrap, &sandbox_config);
     #[cfg(target_os = "macos")]
     {
         if Path::new("/usr/bin/sandbox-exec").exists() {
@@ -7003,7 +7046,8 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
                     "use_bubblewrap = true but {}: the launch refuses to start.",
                     bubblewrap.describe()
                 ),
-                "install bubblewrap into /usr/bin, enable user namespaces \
+                "install bubblewrap into a trusted system directory such as /usr/bin or \
+                 /usr/local/bin, enable user namespaces \
                  (sysctl kernel.unprivileged_userns_clone=1), or drop use_bubblewrap",
             ));
         }
@@ -7013,47 +7057,6 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         ));
     }
     println!();
-
-    // ── the policy a launch would build, for the rules below ──
-    let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
-    let mut agent_dirs = resolved.agent_config_dirs(active_agent, &home_dir);
-    agent::canonicalize_agent_dirs(&mut agent_dirs);
-    let keychain_substitute = cplt::sandbox::keychain_substitute(
-        active_agent,
-        &home_dir,
-        &resolved.deny_env,
-        resolved.keychain_substitute,
-    );
-    let doctor_pnpm = resolve_exec_binary("pnpm").ok();
-    let doctor_pnpm_shadowed = doctor_pnpm
-        .as_ref()
-        .is_some_and(|pnpm| scratch::pnpm_requires_shadow(&home_dir, pnpm).unwrap_or(false));
-    let mut doctor_exec = resolved.allow_exec.clone();
-    doctor_exec.extend(pnpm_exec_grants(
-        &home_dir,
-        doctor_pnpm.as_deref(),
-        doctor_pnpm_shadowed,
-        &project_dir,
-        &repo_paths,
-    ));
-    doctor_exec.sort();
-    doctor_exec.dedup();
-    let sandbox_config = build_sandbox_config(
-        &resolved,
-        &probe,
-        active_agent,
-        &agent_dirs,
-        NamedRepos::new(
-            &policy_roots,
-            &repo_git_dirs,
-            &repo_rows,
-            worktree_root.as_deref(),
-        ),
-        &doctor_exec,
-        SessionPaths::default(),
-        keychain_substitute,
-    );
-    let policy = sandbox::generate_policy(&sandbox_config);
 
     findings.extend(doctor::wsl_drive_project_finding(&project_dir, wsl));
     findings.extend(doctor::pts_grant_finding(
@@ -7094,7 +7097,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
             let critical = discover::WSL_CRITICAL_TOOLS.contains(name);
             let msg = format!(
                 "{name} resolves to {}, a Windows install reached through WSL interop{}",
-                canon.display(),
+                tilde(&canon),
                 if critical {
                     ", which cannot run in the Linux sandbox."
                 } else {

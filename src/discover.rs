@@ -594,7 +594,7 @@ fn tool_lines(tools: &[ToolInfo], wsl: bool, home: &Path) -> (Vec<String>, bool)
                     ui::stdout_color(ui::RED),
                     ui::stdout_color(ui::RESET),
                     tool.name,
-                    tool.path.display(),
+                    crate::doctor::tilde(&tool.path, home),
                     tool.name
                 )
             } else {
@@ -604,7 +604,7 @@ fn tool_lines(tools: &[ToolInfo], wsl: bool, home: &Path) -> (Vec<String>, bool)
                     ui::stdout_color(ui::YELLOW),
                     ui::stdout_color(ui::RESET),
                     tool.name,
-                    tool.path.display()
+                    crate::doctor::tilde(&tool.path, home)
                 )
             }
         })
@@ -720,7 +720,7 @@ impl Discovery {
                         ui::stdout_color(ui::RESET),
                         agent.name,
                         agent.binary_name,
-                        agent.path.display(),
+                        crate::doctor::tilde(&agent.path, home),
                         agent.binary_name
                     );
                     critical_ok = false;
@@ -810,7 +810,7 @@ impl Discovery {
                 "  {}✓{} Homebrew: {}",
                 ui::stdout_color(ui::GREEN),
                 ui::stdout_color(ui::RESET),
-                prefix.display()
+                crate::doctor::tilde(prefix, home)
             );
         }
         if !self.tools.existing_home_tool_dirs.is_empty() {
@@ -936,7 +936,7 @@ impl Discovery {
         // (`forkpty(3) failed`, "no more ptys").
         println!(
             "  {}ℹ{} PTY allocation (openpty/forkpty, pexpect, node-pty, script, tmux) is blocked \
-             unless /dev is granted:",
+             by the default policy; granting /dev allows it, at the cost described at:",
             ui::stdout_color(ui::BLUE),
             ui::stdout_color(ui::RESET)
         );
@@ -2360,8 +2360,9 @@ mod wsl_tool_report_tests {
             lines[0]
         );
         assert!(
-            lines[0].contains("/mnt/c/Users/N129069/AppData/Roaming/npm/npm"),
-            "the line must name the offending path, got: {}",
+            lines[0].contains("/mnt/c/Users/~/AppData/Roaming/npm/npm")
+                && !lines[0].contains("N129069"),
+            "the line must name the offending path, without the Windows user, got: {}",
             lines[0]
         );
     }

@@ -639,6 +639,12 @@ mod e2e_tests {
                 && stdout.contains("git"),
             "--verbose appends the old inventory (Tools section with git).\nstdout: {stdout}"
         );
+        // --verbose is what gets attached to bug reports: paste-safe too.
+        let home = std::env::var("HOME").expect("HOME");
+        assert!(
+            !stdout.contains(&home),
+            "--verbose must not print the home directory.\nstdout: {stdout}"
+        );
     }
 
     #[test]

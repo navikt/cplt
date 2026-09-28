@@ -52,14 +52,32 @@ impl Finding {
 }
 
 /// `~/…` for anything under `home`, so a pasted report does not carry the
-/// username.
+/// username. A Windows profile reached through WSL,
+/// `/mnt/<drive>/Users/<name>/…`, carries the Windows username instead, and
+/// is shown as `/mnt/<drive>/Users/~/…`.
 #[must_use]
 pub fn tilde(path: &Path, home: &Path) -> String {
     match path.strip_prefix(home) {
         Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
         Ok(rest) => format!("~/{}", rest.display()),
-        Err(_) => path.display().to_string(),
+        Err(_) => hide_windows_user(path).display().to_string(),
     }
+}
+
+/// `/mnt/<drive>/Users/<name>/…` → `/mnt/<drive>/Users/~/…`; anything else
+/// unchanged. Not gated on WSL: the name is private either way.
+fn hide_windows_user(path: &Path) -> PathBuf {
+    let parts: Vec<_> = path.components().collect();
+    let is_profile = crate::agent::is_windows_interop_path(path)
+        && parts.len() > 4
+        && parts[3].as_os_str().eq_ignore_ascii_case("users");
+    if !is_profile {
+        return path.to_path_buf();
+    }
+    let mut out: PathBuf = parts[..4].iter().collect();
+    out.push("~");
+    out.extend(&parts[5..]);
+    out
 }
 
 /// The same, for free-form text that may quote a path.
@@ -211,12 +229,21 @@ impl Bubblewrap {
     }
 }
 
-/// What the launch's own `bubblewrap::resolve` would conclude, minus the
-/// wrapper: the same trusted-directory lookup and the same `bwrap … /bin/true`
-/// namespace probe, run against an empty rule set.
+/// What the launch's own `bubblewrap::resolve` would conclude for `config`:
+/// the same trusted-directory lookup, and the same wrapper — the launch's
+/// rules, overlays and deny masks — probed with `bwrap … /bin/true`. A probe
+/// with an empty rule set can pass where the launch's fails and falls back to
+/// Landlock only, and every finding keyed on `active()` would then be wrong.
+///
+/// Residual: doctor's config has no session scratch dir, so the scratch bind
+/// and the file deny masks (whose placeholder lives there) are not in the
+/// probe.
 #[cfg(target_os = "linux")]
 #[must_use]
-pub fn bubblewrap_state(use_bubblewrap: Option<bool>) -> Bubblewrap {
+pub fn bubblewrap_state(
+    use_bubblewrap: Option<bool>,
+    config: &crate::sandbox::SandboxConfig,
+) -> Bubblewrap {
     use crate::sandbox::bubblewrap_probe;
     if use_bubblewrap == Some(false) {
         return Bubblewrap::Disabled;
@@ -224,19 +251,36 @@ pub fn bubblewrap_state(use_bubblewrap: Option<bool>) -> Bubblewrap {
     let Some(path) = bubblewrap_probe::check_availability() else {
         return Bubblewrap::NotInstalled;
     };
-    match bubblewrap_probe::test_empty(&path) {
+    match bubblewrap_probe::test_launch(config) {
         Ok(()) => Bubblewrap::Usable(path),
         Err(reason) => Bubblewrap::Unusable {
             path,
-            reason: first_line(&reason),
+            reason: probe_reason(&reason),
         },
     }
 }
 
 #[cfg(not(target_os = "linux"))]
 #[must_use]
-pub fn bubblewrap_state(_use_bubblewrap: Option<bool>) -> Bubblewrap {
+pub fn bubblewrap_state(
+    _use_bubblewrap: Option<bool>,
+    _config: &crate::sandbox::SandboxConfig,
+) -> Bubblewrap {
     Bubblewrap::NotApplicable
+}
+
+/// The first line of a probe error, without the `bwrap test failed: ` that
+/// `test_functionality` puts in front of bwrap's own `bwrap: …`.
+#[cfg(any(target_os = "linux", test))]
+fn probe_reason(raw: &str) -> String {
+    let line = raw
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("probe failed");
+    line.strip_prefix("bwrap test failed: ")
+        .unwrap_or(line)
+        .to_string()
 }
 
 /// Auto-detect (`use_bubblewrap` unset) found no usable bubblewrap, so the
@@ -252,7 +296,8 @@ pub fn bubblewrap_finding(state: &Bubblewrap, use_bubblewrap: Option<bool>) -> O
             "bubblewrap is not installed: the launch runs Landlock + seccomp only, without the \
              mount-level protections listed above.",
             Some(
-                "sudo apt install bubblewrap (or your distro's package; it must land in /usr/bin)"
+                "sudo apt install bubblewrap (or your distro's package; it must land in a trusted \
+                 system directory such as /usr/bin or /usr/local/bin)"
                     .to_string(),
             ),
         )),
@@ -285,7 +330,8 @@ pub fn bubblewrap_finding(state: &Bubblewrap, use_bubblewrap: Option<bool>) -> O
 /// the same WSL signal: on plain Linux `/mnt/c` is an ordinary mount.
 #[must_use]
 pub fn wsl_drive_project_finding(project_dir: &Path, wsl: bool) -> Option<Finding> {
-    if !crate::agent::is_wsl_interop_binary(project_dir, wsl) {
+    // The joined component makes the bare drive root, `/mnt/c` itself, count.
+    if !crate::agent::is_wsl_interop_binary(&project_dir.join("x"), wsl) {
         return None;
     }
     // Only the drive: the rest is usually /mnt/c/Users/<name>/….
@@ -322,16 +368,23 @@ pub fn pts_grant_finding(
         return None;
     }
     let pts = Path::new("/dev/pts");
+    // The widest covering grant: `--allow-read / --allow-write /dev` must be
+    // reported as the write it is, not the read rule that comes first.
     let rule = policy
         .fs_rules
         .iter()
         .filter(|r| r.access.read || r.access.write)
-        .find(|r| pts.starts_with(&r.path) || r.path.starts_with(pts))?;
+        .filter(|r| pts.starts_with(&r.path) || r.path.starts_with(pts))
+        .max_by_key(|r| (r.access.write, r.access.execute))?;
+    // The rule carries access, not the config key it came from; an
+    // `allow.exec` grant is read + execute.
     let (kind, reach) = if rule.access.write {
         (
             "allow.write",
             "read what you type in them and write into them",
         )
+    } else if rule.access.execute {
+        ("allow.exec", "read what you type in them")
     } else {
         ("allow.read", "read what you type in them")
     };
@@ -362,15 +415,6 @@ pub fn pts_grant_finding(
         ),
         Some(fix.to_string()),
     ))
-}
-
-#[cfg(target_os = "linux")]
-fn first_line(s: &str) -> String {
-    s.lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or("probe failed")
-        .to_string()
 }
 
 // ── Rendering ──────────────────────────────────────────────────
@@ -490,6 +534,40 @@ mod tests {
         assert_eq!(tilde(Path::new("/usr/bin/git"), home), "/usr/bin/git");
     }
 
+    /// Under WSL a Windows-side tool carries the Windows username.
+    #[test]
+    fn tilde_hides_the_windows_username() {
+        let home = Path::new("/home/u");
+        assert_eq!(
+            tilde(
+                Path::new("/mnt/c/Users/Kari Nordmann/AppData/Roaming/npm/npm"),
+                home
+            ),
+            "/mnt/c/Users/~/AppData/Roaming/npm/npm"
+        );
+        assert_eq!(
+            tilde(Path::new("/mnt/d/users/kari"), home),
+            "/mnt/d/users/~"
+        );
+        // Nothing to hide, or not a drive.
+        assert_eq!(tilde(Path::new("/mnt/c/Users"), home), "/mnt/c/Users");
+        assert_eq!(tilde(Path::new("/mnt/c/apps/x"), home), "/mnt/c/apps/x");
+        assert_eq!(
+            tilde(Path::new("/mnt/data/Users/kari"), home),
+            "/mnt/data/Users/kari"
+        );
+    }
+
+    #[test]
+    fn probe_reason_drops_the_wrapper_prefix() {
+        assert_eq!(
+            probe_reason("bwrap test failed: bwrap: Can't mount proc\nmore"),
+            "bwrap: Can't mount proc"
+        );
+        assert_eq!(probe_reason("\n  other  \n"), "other");
+        assert_eq!(probe_reason(""), "probe failed");
+    }
+
     #[test]
     fn tracked_env_finding_needs_a_tracked_file_and_the_deny() {
         let files = vec!["config/.env.local".to_string()];
@@ -563,7 +641,9 @@ mod tests {
         let missing = Bubblewrap::NotInstalled;
         let f = bubblewrap_finding(&missing, None).expect("not installed warns");
         assert_eq!(f.level, Level::Warning);
-        assert!(f.fix.unwrap().contains("apt install bubblewrap"));
+        let fix = f.fix.unwrap();
+        assert!(fix.contains("apt install bubblewrap"));
+        assert!(fix.contains("/usr/local/bin"), "not only /usr/bin: {fix}");
         // `true` has its own blocking finding; `false` was a choice.
         assert!(bubblewrap_finding(&missing, Some(true)).is_none());
         assert!(bubblewrap_finding(&missing, Some(false)).is_none());
@@ -596,6 +676,24 @@ mod tests {
         // WSL's own mounts and the Linux filesystem are fine.
         assert!(wsl_drive_project_finding(Path::new("/mnt/wsl/x"), true).is_none());
         assert!(wsl_drive_project_finding(Path::new("/home/u/src/app"), true).is_none());
+        // The bare drive root is on the drive too.
+        for root in ["/mnt/c", "/mnt/c/"] {
+            let f = wsl_drive_project_finding(Path::new(root), true).expect(root);
+            assert!(f.message.contains("/mnt/c:"), "{root}: {}", f.message);
+        }
+        assert!(wsl_drive_project_finding(Path::new("/mnt"), true).is_none());
+    }
+
+    /// `--allow-read / --allow-write /dev`: the read rule comes first, the
+    /// write is what reaches the terminals.
+    #[test]
+    fn pts_grant_finding_reports_the_widest_covering_grant() {
+        let both = policy(vec![("/", false, false), ("/dev", true, false)]);
+        let f = pts_grant_finding(&both, false, true).expect("finding");
+        assert!(f.message.starts_with("allow.write /dev "), "{}", f.message);
+        let exec = policy(vec![("/", false, false), ("/dev", false, true)]);
+        let f = pts_grant_finding(&exec, false, true).expect("finding");
+        assert!(f.message.starts_with("allow.exec /dev "), "{}", f.message);
     }
 
     #[test]
