@@ -89,18 +89,47 @@ fn hide_windows_user(path: &Path) -> PathBuf {
 #[must_use]
 pub fn tilde_in_text(text: &str, home: &Path) -> String {
     let home = home.to_string_lossy();
-    let text = if home.is_empty() || home == "/" {
+    let home = home.trim_end_matches('/');
+    let text = if home.is_empty() {
         text.to_string()
     } else {
-        text.replace(home.as_ref(), "~")
+        replace_home(text, home)
     };
     hide_windows_user_in_text(&text)
 }
 
+/// Replaces `home` only where it stands as a whole path: not inside
+/// `/newroot/home/u` and not as the prefix of `/home/anna`.
+fn replace_home(text: &str, home: &str) -> String {
+    let word = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-');
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    for (i, _) in text.match_indices(home) {
+        if i < last {
+            continue;
+        }
+        let before = text[..i].chars().next_back();
+        let mut after = text[i + home.len()..].chars();
+        let starts = before.is_none_or(|c| !(word(c) || matches!(c, '/' | '.' | '~')));
+        // A `.` ends a sentence unless a name continues after it.
+        let ends = match after.next() {
+            None | Some('/') => true,
+            Some('.') => after.next().is_none_or(|c| !word(c)),
+            Some(c) => !word(c),
+        };
+        if starts && ends {
+            out.push_str(&text[last..i]);
+            out.push('~');
+            last = i + home.len();
+        }
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
 /// `hide_windows_user` for a path quoted inside a sentence: the component
-/// after `/mnt/<drive>/Users/` becomes `~`. The name may contain spaces, so it
-/// runs to the next `/`, or to a quote or the end of the line when the path
-/// stops at the profile itself.
+/// after `/mnt/<drive>/Users/` becomes `~`. The name ends where prose would
+/// end a path (see `profile_name_len`), so the rest of the sentence survives.
 fn hide_windows_user_in_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -115,9 +144,7 @@ fn hide_windows_user_in_text(text: &str) -> String {
                 .get(2..8)
                 .is_some_and(|u| u.eq_ignore_ascii_case("users/"));
         let name_len = if profile {
-            tail[8..]
-                .find(['/', '\'', '"', '`', '\n'])
-                .unwrap_or(tail.len() - 8)
+            profile_name_len(&tail[8..])
         } else {
             0
         };
@@ -131,6 +158,36 @@ fn hide_windows_user_in_text(text: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// Length of the profile name at the start of `s`. It stops at whitespace or
+/// punctuation that ends a path in prose. A name with spaces (`Kari
+/// Nordmann`) is taken whole only when its words run straight on to a `/` or
+/// a closing quote; otherwise `kari and /mnt/…` would swallow the sentence.
+fn profile_name_len(s: &str) -> usize {
+    let word = |s: &str| {
+        s.find(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '/' | ':' | ',' | ')' | ']' | ';' | '\'' | '"' | '`' | '\x1b'
+                )
+        })
+        .unwrap_or(s.len())
+    };
+    let first = word(s);
+    let mut end = first;
+    while let Some(rest) = s[end..].strip_prefix(' ') {
+        match word(rest) {
+            0 => break,
+            w => end += 1 + w,
+        }
+    }
+    if matches!(s[end..].chars().next(), Some('/' | '\'' | '"' | '`')) {
+        end
+    } else {
+        first
+    }
 }
 
 // ── Rule: tracked secrets vs. the .env deny ────────────────────
@@ -471,12 +528,21 @@ pub fn pts_grant_finding(
     // reported as the write it is, not the read rule that comes first.
     // A grant below it, `/dev/pts/3`, reaches that one terminal only; a
     // covering grant outranks it.
-    let rule = policy
-        .fs_rules
-        .iter()
-        .filter(|r| r.access.read || r.access.write)
-        .filter(|r| pts.starts_with(&r.path) || r.path.starts_with(pts))
-        .max_by_key(|r| (pts.starts_with(&r.path), r.access.write, r.access.execute))?;
+    let matching = || {
+        policy
+            .fs_rules
+            .iter()
+            .filter(|r| r.access.read || r.access.write)
+            .filter(|r| pts.starts_with(&r.path) || r.path.starts_with(pts))
+    };
+    let rule =
+        matching().max_by_key(|r| (pts.starts_with(&r.path), r.access.write, r.access.execute))?;
+    // Never under-warn: a covering read grant must not hide a write grant on
+    // one terminal below it.
+    let other_write = matching()
+        .find(|r| r.access.write && !rule.access.write)
+        .map(|w| format!(", and write into {} (allow.write)", w.path.display()))
+        .unwrap_or_default();
     let covers = pts.starts_with(&rule.path);
     let them = if covers { "them" } else { "it" };
     // The rule carries access, not the config key it came from; an
@@ -487,9 +553,15 @@ pub fn pts_grant_finding(
             format!("read what you type in {them} and write into {them}"),
         )
     } else if rule.access.execute {
-        ("allow.exec", format!("read what you type in {them}"))
+        (
+            "allow.exec",
+            format!("read what you type in {them}{other_write}"),
+        )
     } else {
-        ("allow.read", format!("read what you type in {them}"))
+        (
+            "allow.read",
+            format!("read what you type in {them}{other_write}"),
+        )
     };
     let (devices, fix) = if linux {
         (
@@ -694,6 +766,59 @@ mod tests {
         }
     }
 
+    /// The profile name ends where prose ends a path.
+    #[test]
+    fn tilde_in_text_keeps_the_sentence_after_a_windows_name() {
+        let home = Path::new("/home/u");
+        for (text, want) in [
+            (
+                "/mnt/c/Users/kari: permission denied (os error 13)",
+                "/mnt/c/Users/~: permission denied (os error 13)",
+            ),
+            (
+                "/mnt/c/Users/kari and /mnt/c/Users/ola ok",
+                "/mnt/c/Users/~ and /mnt/c/Users/~ ok",
+            ),
+            (
+                "in /mnt/c/Users/kari, then more",
+                "in /mnt/c/Users/~, then more",
+            ),
+            ("(/mnt/c/Users/kari)", "(/mnt/c/Users/~)"),
+            ("[/mnt/c/Users/kari]", "[/mnt/c/Users/~]"),
+            ("/mnt/c/Users/kari; x", "/mnt/c/Users/~; x"),
+            (
+                "\x1b[1m/mnt/c/Users/kari\x1b[0m",
+                "\x1b[1m/mnt/c/Users/~\x1b[0m",
+            ),
+            ("'/mnt/c/Users/Kari Nordmann' x", "'/mnt/c/Users/~' x"),
+        ] {
+            assert_eq!(tilde_in_text(text, home), want, "{text:?}");
+        }
+    }
+
+    /// `$HOME` is replaced only as a whole path.
+    #[test]
+    fn tilde_in_text_matches_home_at_a_boundary() {
+        let slash = Path::new("/home/ann/");
+        assert_eq!(
+            tilde_in_text("refuses to sandbox '/home/ann'", slash),
+            "refuses to sandbox '~'"
+        );
+        assert_eq!(
+            tilde_in_text("HOME=/home/ann is /home/ann.", slash),
+            "HOME=~ is ~."
+        );
+        let home = Path::new("/home/ann");
+        assert_eq!(tilde_in_text("/home/anna/x", home), "/home/anna/x");
+        assert_eq!(tilde_in_text("/home/ann.bak/x", home), "/home/ann.bak/x");
+        assert_eq!(
+            tilde_in_text("/newroot/home/ann/.cache", home),
+            "/newroot/home/ann/.cache"
+        );
+        assert_eq!(tilde_in_text("'/home/ann/x'", home), "'~/x'");
+        assert_eq!(tilde_in_text("/home/ann", Path::new("/")), "/home/ann");
+    }
+
     #[test]
     fn probe_reason_drops_the_wrapper_prefix() {
         let home = Path::new("/home/u");
@@ -709,7 +834,7 @@ mod tests {
                 "bwrap test failed: bwrap: Can't bind mount /home/u/.cache on /newroot/home/u/.cache",
                 home
             ),
-            "bwrap: Can't bind mount ~/.cache on /newroot~/.cache"
+            "bwrap: Can't bind mount ~/.cache on /newroot/home/u/.cache"
         );
         assert_eq!(
             probe_reason("bwrap: Can't find source path /mnt/c/Users/kari/x", home),
@@ -883,6 +1008,13 @@ mod tests {
         let f = pts_grant_finding(&both, false, true).unwrap();
         assert!(
             f.message.starts_with("allow.read /dev reaches every"),
+            "{}",
+            f.message
+        );
+        // ... but the write on the one terminal is still reported.
+        assert!(
+            f.message
+                .contains(", and write into /dev/pts/3 (allow.write)."),
             "{}",
             f.message
         );
