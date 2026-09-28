@@ -200,7 +200,7 @@ pub fn generate_profile_with_playwright_socket_dir(
     // Keep PATH-resolved bin and shim locations read-only after user allows.
     // The pnpm rule re-allows its two writable stores, so all security denies
     // below must remain later in the last-match-wins profile.
-    emit_path_bin_denies(&mut sb, config.home_dir);
+    emit_path_bin_denies(&mut sb, config.home_dir, config.extra_deny);
     emit_shim_dir_denies(&mut sb, config);
     // Keeps the exec-allowed toolchain dirs non-writable even when a user
     // allow.write covers ~/.gradle or ~/.konan (write-then-exec): after every
@@ -503,6 +503,12 @@ fn emit_sensitive_project_denies(
         // (#477). Scoped to a short explicit list rather than a heuristic: the
         // properties that make it safe (content-addressed, checksum-verified,
         // from a registry) are ones only these trees have.
+        // A `--deny-path` in or above a tree is emitted before its re-allow,
+        // which last-match-wins would reopen for its `.env` files (#597).
+        // Repeat the read deny after every re-allow, narrowed to the overlap
+        // (the tree, for a deny above it) and once per scope; the rest of the
+        // tree keeps the carve-out.
+        let mut redeny = std::collections::BTreeSet::new();
         for tree in dependency_source_trees(home, tool_dirs) {
             if validate_sbpl_path(Path::new(&tree)).is_err() {
                 continue;
@@ -511,17 +517,17 @@ fn emit_sensitive_project_denies(
             for pattern in SENSITIVE_PROJECT_PATTERNS {
                 sbpl!(sb, "(allow file-read* (regex #\"^{t}/.*/{pattern}\"))");
             }
-            // A `--deny-path` in or above the tree is emitted before this
-            // re-allow, which last-match-wins would reopen for its `.env`
-            // files (#597). Repeat its read deny after the re-allow; the rest
-            // of the tree keeps the carve-out.
-            let tree = Path::new(&tree);
-            for deny in extra_deny
-                .iter()
-                .filter(|d| d.starts_with(tree) || tree.starts_with(d))
-            {
-                sbpl!(sb, "(deny file-read* (subpath \"{}\"))", deny.display());
+            let tree = PathBuf::from(tree);
+            for deny in extra_deny {
+                if tree.starts_with(deny) {
+                    redeny.insert(tree.clone());
+                } else if deny.starts_with(&tree) {
+                    redeny.insert(deny.clone());
+                }
             }
+        }
+        for scope in redeny {
+            sbpl!(sb, "(deny file-read* (subpath \"{}\"))", scope.display());
         }
         sbpl!(sb);
     }
@@ -1688,7 +1694,15 @@ fn emit_copilot_pkg_denies(sb: &mut String, config: &SandboxConfig) {
         // Copilot loads its extracted JS and native modules from it. The
         // carve-out's write deny still follows.
         let pkg = pkg_dir.to_string_lossy();
-        sbpl!(sb, "(allow file-read* (subpath \"{pkg}\"))");
+        // Emitted after the user's `--deny-path` rules, so it would reopen
+        // reads under one that overlaps it (#597). `validate_copilot_cache_env`
+        // already refuses that launch; withhold here too so the profile never
+        // carries the reopening allow.
+        if let Some(deny) = overlapping_deny(config.extra_deny, pkg_dir) {
+            withhold_reallow(sb, "Copilot pkg", &pkg, deny);
+        } else {
+            sbpl!(sb, "(allow file-read* (subpath \"{pkg}\"))");
+        }
         emit_copilot_pkg_exec(sb, &pkg);
         emit_copilot_pkg_write_deny(sb, &pkg, &pins);
     }
@@ -1906,7 +1920,7 @@ fn emit_dotnet_exec_denies(sb: &mut String, dotnet_root: Option<&Path>) {
 /// (`policy::mise_ro_protect_paths`) and the rest by the `HOME_TOOL_DIRS`
 /// shape; the `TopLevel` shape has no Landlock equivalent at all for a
 /// relocated `XDG_DATA_HOME`. See docs/security.md.
-fn emit_path_bin_denies(sb: &mut String, home_dir: &Path) {
+fn emit_path_bin_denies(sb: &mut String, home_dir: &Path, extra_deny: &[PathBuf]) {
     sbpl!(sb, ";; PATH-resolved bin/shim dirs stay read-only");
     for dir in path_bin_dirs(home_dir) {
         match dir {
@@ -1923,11 +1937,17 @@ fn emit_path_bin_denies(sb: &mut String, home_dir: &Path) {
                 }
                 let p = path.display();
                 sbpl!(sb, "(deny file-write* (subpath \"{p}\"))");
-                sbpl!(sb, "(allow file-write* (subpath \"{p}/store\"))");
-                sbpl!(
-                    sb,
-                    "(allow file-write* (subpath \"{p}/package-manager-store\"))"
-                );
+                // Emitted after the user's `--deny-path` rules, so a store
+                // allow would reopen writes under one that overlaps it (#597):
+                // withheld then, like the opt-in re-allows.
+                for store in ["store", "package-manager-store"] {
+                    let store = path.join(store);
+                    if let Some(deny) = overlapping_deny(extra_deny, &store) {
+                        withhold_reallow(sb, "pnpm store", &store.to_string_lossy(), deny);
+                    } else {
+                        sbpl!(sb, "(allow file-write* (subpath \"{}\"))", store.display());
+                    }
+                }
                 sbpl!(sb, "(deny process-exec (subpath \"{p}\"))");
                 sbpl!(
                     sb,

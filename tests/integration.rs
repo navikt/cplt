@@ -3481,6 +3481,42 @@ mod macos_tests {
         );
     }
 
+    /// #597 class: the pnpm `store` write allow follows the user's denies, so
+    /// it must be withheld under a `--deny-path` covering the pnpm home.
+    /// Without the deny the store stays writable and the rest of the pnpm
+    /// home does not, which shows the PATH-bin rules are in effect.
+    #[test]
+    fn real_profile_deny_on_pnpm_home_blocks_store_writes() {
+        require_sandbox!();
+        let tmp = std::env::temp_dir().join(format!("cplt-597-pnpm-{}", std::process::id()));
+        let pnpm = tmp.join("home/Library/pnpm");
+        fs::create_dir_all(pnpm.join("store")).unwrap();
+        let fake_home = fs::canonicalize(tmp.join("home")).unwrap();
+        let pnpm = fs::canonicalize(&pnpm).unwrap();
+        let project = fs::canonicalize(".").unwrap();
+
+        let write = |extra_deny: &[PathBuf], rel: &str| {
+            let mut opts = default_opts(&project, &fake_home);
+            opts.extra_deny = extra_deny;
+            let profile = write_real_profile(&opts);
+            let cmd = format!("echo x > '{}/{rel}'", pnpm.display());
+            let ok = run_sandboxed(&profile, &cmd).1;
+            fs::remove_file(&profile).ok();
+            ok
+        };
+        let open_store = write(&[], "store/a");
+        let open_bin = write(&[], "pnpm-shim");
+        let denied_store = write(std::slice::from_ref(&pnpm), "store/b");
+
+        fs::remove_dir_all(&tmp).ok();
+        assert!(open_store, "without a deny, the pnpm store stays writable");
+        assert!(!open_bin, "without a deny, the pnpm home stays read-only");
+        assert!(
+            !denied_store,
+            "--deny-path on the pnpm home must block writes into store/"
+        );
+    }
+
     // ── Localhost blocking ────────────────────────────────────────
 
     #[test]

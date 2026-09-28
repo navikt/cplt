@@ -1049,7 +1049,7 @@ The directories a package manager puts on your `PATH` are read-only inside the s
 
 **Those commands now fail inside cplt.** That is the point, not a bug. Run them outside, in a normal shell.
 
-**Project-local installs are unaffected.** `npm install`, `pnpm install`, `bun install`, `cargo build`, `go build` and `pip install` in a venv write to the project or to a per-project cache. The sibling package and cache trees stay writable — `~/.bun/install`, `$PNPM_HOME/store`, `~/.npm`, `~/.cargo/registry` — so nothing about ordinary dependency resolution changes.
+**Project-local installs are unaffected.** `npm install`, `pnpm install`, `bun install`, `cargo build`, `go build` and `pip install` in a venv write to the project or to a per-project cache. The sibling package and cache trees stay writable — `~/.bun/install`, `$PNPM_HOME/store`, `~/.npm`, `~/.cargo/registry` — so nothing about ordinary dependency resolution changes. A `--deny-path` or `deny.paths` entry covering a pnpm store (or `$PNPM_HOME`, or anything above it) still wins: cplt withholds that store's write allow and warns, instead of reopening writes under your deny (#597).
 
 **The one that will bite you: mise bootstrap.** mise can no longer install or update *any* toolchain from inside cplt — not only the shimmed ones. The whole `installs/` tree is denied, not just each `<tool>/<version>/bin`, because mise creates a `bin/` only for tools that ship one: on a machine with 207 installed version directories, 55 did. The rest land flat at `installs/<tool>/<version>/<name>`, and in non-shim mode mise puts *that* directory on PATH, so a `bin`-anchored rule would have left the majority of tools as drop points.
 
