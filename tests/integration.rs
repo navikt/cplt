@@ -3435,6 +3435,52 @@ mod macos_tests {
         );
     }
 
+    /// #597: the #477 carve-out re-allows `.env` reads in the Go module cache,
+    /// and must not reopen a `--deny-path` inside it. A module outside the
+    /// deny keeps the carve-out.
+    #[test]
+    fn real_profile_deny_in_module_cache_beats_env_carve_out() {
+        require_sandbox!();
+        let tmp = std::env::temp_dir().join(format!("cplt-597-{}", std::process::id()));
+        let fake_home = tmp.join("home");
+        let modcache = fake_home.join("go/pkg/mod");
+        for m in ["ex@v1", "ok@v1"] {
+            fs::create_dir_all(modcache.join(m)).unwrap();
+            fs::write(modcache.join(m).join(".env"), "secret\n").unwrap();
+            fs::write(modcache.join(m).join("other.txt"), "secret\n").unwrap();
+        }
+        let fake_home = fs::canonicalize(&fake_home).unwrap();
+        let modcache = fs::canonicalize(&modcache).unwrap();
+        let project = fs::canonicalize(".").unwrap();
+
+        let extra_read = vec![modcache.clone()];
+        let extra_deny = vec![modcache.join("ex@v1")];
+        let mut opts = default_opts(&project, &fake_home);
+        opts.extra_read = &extra_read;
+        opts.extra_deny = &extra_deny;
+        let profile = write_real_profile(&opts);
+
+        let read = |rel: &str| {
+            let cmd = format!("/bin/cat '{}/{rel}'", modcache.display());
+            run_sandboxed(&profile, &cmd).1
+        };
+        let denied_env = read("ex@v1/.env");
+        let denied_other = read("ex@v1/other.txt");
+        let carved_env = read("ok@v1/.env");
+
+        fs::remove_dir_all(&tmp).ok();
+        fs::remove_file(&profile).ok();
+        assert!(!denied_other, "--deny-path must block other.txt");
+        assert!(
+            !denied_env,
+            "--deny-path must block .env despite the carve-out"
+        );
+        assert!(
+            carved_env,
+            "outside the deny, the carve-out still re-allows .env"
+        );
+    }
+
     // ── Localhost blocking ────────────────────────────────────────
 
     #[test]

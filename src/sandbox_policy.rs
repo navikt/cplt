@@ -901,6 +901,7 @@ pub const SENSITIVE_PROJECT_PATTERNS: &[&str] = &[
 /// content-addressed, verified against a checksum, and came from a registry
 /// rather than from the person running cplt. Anything without all three stays
 /// denied — which is why this is a short explicit list and not a heuristic.
+/// A user `--deny-path` in or above a tree still wins over the re-allow (#597).
 ///
 /// macOS only, like the denies themselves: Landlock cannot express either side.
 pub const DEPENDENCY_SOURCE_TREES: &[(&str, &str)] = &[(".cargo/registry", ""), ("go/pkg", "mod")];

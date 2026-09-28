@@ -218,6 +218,7 @@ pub fn generate_profile_with_playwright_socket_dir(
         config.allow_env_files,
         &home,
         config.existing_home_tool_dirs,
+        config.extra_deny,
     );
     // Same reason, and one more: the worktree common-dir allow is emitted early
     // (so DENIED_DOTFILES still wins over it), which would leave its denies
@@ -413,6 +414,7 @@ fn emit_sensitive_project_denies(
     allow_env_files: bool,
     home: &str,
     tool_dirs: Option<&[ResolvedToolDir]>,
+    extra_deny: &[PathBuf],
 ) {
     // All security-critical project denies are emitted LAST in the profile.
     // SBPL uses last-match-wins, so these must come after all user-configured
@@ -508,6 +510,17 @@ fn emit_sensitive_project_denies(
             let t = escape_regex(&tree);
             for pattern in SENSITIVE_PROJECT_PATTERNS {
                 sbpl!(sb, "(allow file-read* (regex #\"^{t}/.*/{pattern}\"))");
+            }
+            // A `--deny-path` in or above the tree is emitted before this
+            // re-allow, which last-match-wins would reopen for its `.env`
+            // files (#597). Repeat its read deny after the re-allow; the rest
+            // of the tree keeps the carve-out.
+            let tree = Path::new(&tree);
+            for deny in extra_deny
+                .iter()
+                .filter(|d| d.starts_with(tree) || tree.starts_with(d))
+            {
+                sbpl!(sb, "(deny file-read* (subpath \"{}\"))", deny.display());
             }
         }
         sbpl!(sb);

@@ -2156,6 +2156,39 @@ fn the_env_deny_is_lifted_for_read_inside_dependency_stores_only() {
     );
 }
 
+/// #597: a `--deny-path` in or above a dependency store must win over the
+/// #477 carve-out. The user deny is emitted before the carve-out, so its read
+/// deny is repeated after the last re-allow for that tree. An unrelated deny
+/// is not repeated.
+#[test]
+fn a_user_deny_in_a_dependency_store_beats_the_env_carve_out() {
+    for (deny, tree, repeated) in [
+        ("/Users/test/go/pkg/mod/ex@v1", "go/pkg/mod", true),
+        ("/Users/test/go", "go/pkg/mod", true),
+        ("/Users/test/.cargo/registry/src", "\\.cargo/registry", true),
+        ("/Users/test/.gradle", "go/pkg/mod", false),
+    ] {
+        let extra_deny = [PathBuf::from(deny)];
+        let profile = generate_profile(
+            &SandboxConfig {
+                extra_deny: &extra_deny,
+                ..base_profile_options()
+            },
+            &[],
+        );
+        let rule = format!("(deny file-read* (subpath \"{deny}\"))");
+        let last_deny = profile.rfind(&rule).expect("the user deny is emitted");
+        let last_allow = profile
+            .rfind(&format!("(allow file-read* (regex #\"^/Users/test/{tree}/"))
+            .expect("the carve-out is emitted");
+        assert_eq!(
+            last_deny > last_allow,
+            repeated,
+            "--deny-path {deny}: user deny after the carve-out should be {repeated}\n{profile}"
+        );
+    }
+}
+
 /// A relocated `GOPATH` / `CARGO_HOME` must move the carve-out with it.
 ///
 /// The trees are named by their `HOME_TOOL_DIRS` entry plus a subpath, because
