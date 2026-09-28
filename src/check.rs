@@ -1192,6 +1192,7 @@ mod tests {
 
     fn rule(path: &str, read: bool, write: bool, execute: bool) -> FsRule {
         FsRule {
+            nofollow: false,
             path: PathBuf::from(path),
             access: FsAccess {
                 read,
@@ -1212,7 +1213,6 @@ mod tests {
             home_dir: PathBuf::from("/home/u"),
             precreate_dirs: vec![],
             plain_file: None,
-            nofollow: vec![],
         }
     }
 

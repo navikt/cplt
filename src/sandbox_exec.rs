@@ -1591,7 +1591,13 @@ fn exec_bwrap(
     let policy_bytes = match super::bubblewrap::serialize_policy(wrapper, copilot_bin, copilot_args)
     {
         Ok(b) => b,
-        Err(e) => return bwrap_setup_failed(wrapper, &format!("policy setup failed: {e}")),
+        // Not a fallback: the only failure here is a cache-exec or Cypress
+        // state path that stopped being the directory `prepare()` checked,
+        // and Landlock-only would open the same path.
+        Err(e) => {
+            ui::error(&e.to_string());
+            return BwrapOutcome::Ran(1);
+        }
     };
 
     // Policy pipe: bwrap/helper inherit the read end; the parent writes the
@@ -1722,6 +1728,13 @@ fn exec_bwrap(
         libc::close(read_fd);
     }
 
+    if matches!(confirm, ConfirmResult::Refused) {
+        // The helper printed which grant it refused. Falling back would let
+        // whoever raced the bind mount turn off bubblewrap at will.
+        let _ = forward_and_wait(child);
+        restore_terminal_stop_signals();
+        return BwrapOutcome::Ran(1);
+    }
     if matches!(confirm, ConfirmResult::Eof) {
         // Helper never applied the sandbox and never execed the agent — reap
         // the child and fall back (agent has not run, so no double execution).
@@ -1757,6 +1770,8 @@ enum ConfirmResult {
     Confirmed,
     /// All write ends closed with no byte — the helper did not apply the sandbox.
     Eof,
+    /// A zero byte: the helper refused a `nofollow` grant and did not start.
+    Refused,
     /// Timed out or errored; treat as "probably running" to avoid a double run.
     Unknown,
 }
@@ -1794,6 +1809,9 @@ fn read_confirm_byte(fd: i32) -> ConfirmResult {
         }
         if n == 0 {
             return ConfirmResult::Eof;
+        }
+        if buf[0] == 0 {
+            return ConfirmResult::Refused;
         }
         return ConfirmResult::Confirmed;
     }

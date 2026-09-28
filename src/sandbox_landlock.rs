@@ -98,6 +98,17 @@ pub struct FsAccess {
 pub struct FsRule {
     pub path: PathBuf,
     pub access: FsAccess,
+    /// Open `path` without following a symlink in ANY component
+    /// (`openat2(RESOLVE_NO_SYMLINKS)`), and fail the launch if one is there.
+    ///
+    /// Set on the cache-exec and Cypress state rules, whose paths sit in a tree
+    /// the agent can write, and which `prepare()` rewrites to the canonical path
+    /// it validated. A link swapped in after that check (at the entry, or at an
+    /// intermediate component such as `~/.cache/pnpm` for `pnpm/dlx`) would
+    /// otherwise move a write (or write+execute) grant onto its target. A flag
+    /// on the rule rather than an index list, so removing or filtering rules
+    /// cannot misalign it.
+    pub nofollow: bool,
 }
 
 /// TCP connect rule (requires Landlock ABI v4+, kernel 6.7+).
@@ -140,11 +151,6 @@ pub struct LandlockPolicy {
     /// `allow.read`/`allow.write` naming the same file is a separate rule and
     /// keeps its own, ordinary open (and survives a revoke).
     pub plain_file: Option<usize>,
-    /// Indices into `fs_rules` of the cache-exec and Cypress state rules.
-    /// `precompute()` opens these with `O_NOFOLLOW` and refuses a symlink, so
-    /// a link swapped in after `prepare()` validated the path cannot move a
-    /// write grant (or write+execute grant) onto another tree.
-    pub nofollow: Vec<usize>,
 }
 
 /// Pre-computed data for sandbox application in the child process.
@@ -513,6 +519,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         std::iter::once(config.project_dir).chain(config.named_roots.iter().map(PathBuf::as_path))
     {
         fs_rules.push(FsRule {
+            nofollow: false,
             path: root.to_path_buf(),
             access: FsAccess {
                 read: true,
@@ -527,6 +534,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     // ── System read paths ──
     for &p in LINUX_SYSTEM_READ_PATHS {
         fs_rules.push(FsRule {
+            nofollow: false,
             path: PathBuf::from(p),
             access: FsAccess {
                 read: true,
@@ -541,6 +549,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     // ── Tool directories: read + execute ──
     for &p in LINUX_TOOL_DIRS {
         fs_rules.push(FsRule {
+            nofollow: false,
             path: PathBuf::from(p),
             access: FsAccess {
                 read: true,
@@ -581,6 +590,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 // A write-only path (not in read_paths) does not get read access.
                 let readable = read.contains(&path);
                 fs_rules.push(FsRule {
+                    nofollow: false,
                     path,
                     access: FsAccess {
                         read: readable,
@@ -594,10 +604,9 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         }
     }
 
-    let mut nofollow = Vec::new();
     if policy::cypress_runtime_intent(config.allow_cache_exec, config.allow_cache_exec_any) {
-        nofollow.push(fs_rules.len());
         fs_rules.push(FsRule {
+            nofollow: true,
             path: policy::cypress_app_data_dir_with_env(home, config.copilot_cache_env),
             access: FsAccess {
                 read: true,
@@ -617,6 +626,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     let tool_dirs = policy::active_tool_dirs(home, config.existing_home_tool_dirs);
     for policy::ResolvedToolDir { path, dir, .. } in &tool_dirs {
         fs_rules.push(FsRule {
+            nofollow: false,
             path: path.clone(),
             access: FsAccess {
                 read: true,
@@ -641,6 +651,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     // is the write+execute pair each entry's `LinuxCoverage::Gap` records.
     for entry in policy::EXEC_IN_WRITABLE {
         fs_rules.push(FsRule {
+            nofollow: false,
             path: home.join(entry.path),
             access: FsAccess {
                 read: true,
@@ -673,8 +684,8 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     // on cplt's own config and trust store.
     let cache_base = home.join(".cache");
     if config.allow_cache_exec_any {
-        nofollow.push(fs_rules.len());
         fs_rules.push(FsRule {
+            nofollow: true,
             path: cache_base.clone(),
             access: FsAccess {
                 read: true,
@@ -687,8 +698,8 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     } else {
         for subdir in config.allow_cache_exec {
             if policy::cache_exec_subdir_is_safe(subdir) {
-                nofollow.push(fs_rules.len());
                 fs_rules.push(FsRule {
+                    nofollow: true,
                     path: cache_base.join(subdir),
                     access: FsAccess {
                         read: true,
@@ -705,6 +716,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     // ── Copilot install directory: read + execute ──
     if let Some(dir) = config.copilot_install_dir {
         fs_rules.push(FsRule {
+            nofollow: false,
             path: dir.to_path_buf(),
             access: FsAccess {
                 read: true,
@@ -719,6 +731,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     // ── Git hooks path: read + execute ──
     if let Some(p) = config.git_hooks_path {
         fs_rules.push(FsRule {
+            nofollow: false,
             path: p.to_path_buf(),
             access: FsAccess {
                 read: true,
@@ -742,6 +755,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         .chain(config.named_root_git_dirs.iter().map(PathBuf::as_path))
     {
         fs_rules.push(FsRule {
+            nofollow: false,
             path: p.to_path_buf(),
             access: FsAccess {
                 read: true,
@@ -761,6 +775,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     {
         plain_file = Some(fs_rules.len());
         fs_rules.push(FsRule {
+            nofollow: false,
             path: p.to_path_buf(),
             access: FsAccess {
                 read: true,
@@ -778,6 +793,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     // of allow_tmp_exec, which controls only system temp dirs like /tmp.
     if let Some(dir) = config.scratch_dir {
         fs_rules.push(FsRule {
+            nofollow: false,
             path: dir.to_path_buf(),
             access: FsAccess {
                 read: true,
@@ -793,6 +809,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     // ByteBuddy/MockK self-attach spawns a helper process that writes temp files
     // to /tmp and the JVM may dlopen() native libs from there.
     fs_rules.push(FsRule {
+        nofollow: false,
         path: PathBuf::from("/tmp"),
         access: FsAccess {
             read: true,
@@ -809,6 +826,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     // cooked/echo mode and Copilot's TUI hangs.
     for &dev in DEVICE_FILES {
         fs_rules.push(FsRule {
+            nofollow: false,
             path: PathBuf::from(dev),
             access: FsAccess {
                 read: true,
@@ -824,6 +842,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     // This path is a magic symlink resolved per-process. It is deferred to the
     // child in apply_precomputed() where it resolves to the correct pid.
     fs_rules.push(FsRule {
+        nofollow: false,
         path: PathBuf::from("/proc/self"),
         access: FsAccess {
             read: true,
@@ -840,6 +859,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     // Only granted with allow_jvm_attach since /proc can expose process info.
     if config.allow_jvm_attach {
         fs_rules.push(FsRule {
+            nofollow: false,
             path: PathBuf::from("/proc"),
             access: FsAccess {
                 read: true,
@@ -864,6 +884,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
             continue;
         }
         fs_rules.push(FsRule {
+            nofollow: false,
             path: p.clone(),
             access: FsAccess {
                 read: true,
@@ -881,6 +902,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
             continue;
         }
         fs_rules.push(FsRule {
+            nofollow: false,
             path: p.clone(),
             access: FsAccess {
                 read: true,
@@ -903,6 +925,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
             continue;
         }
         fs_rules.push(FsRule {
+            nofollow: false,
             path: p.clone(),
             access: FsAccess {
                 read: true,
@@ -920,6 +943,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
             continue;
         }
         fs_rules.push(FsRule {
+            nofollow: false,
             path: p.clone(),
             access: FsAccess {
                 read: true,
@@ -943,6 +967,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 continue;
             }
             fs_rules.push(FsRule {
+                nofollow: false,
                 path: home.join(".gnupg").join(file),
                 access: FsAccess {
                     read: true,
@@ -956,6 +981,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         // gpg-agent and keyboxd sockets (read + write for IPC)
         for socket in &["S.gpg-agent", "S.keyboxd"] {
             fs_rules.push(FsRule {
+                nofollow: false,
                 path: home.join(".gnupg").join(socket),
                 access: FsAccess {
                     read: true,
@@ -978,6 +1004,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
             policy::xdg_runtime_dir_env().as_deref(),
         ) {
             fs_rules.push(FsRule {
+                nofollow: false,
                 path: dir.join("gnupg"),
                 access: FsAccess {
                     read: true,
@@ -1018,6 +1045,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
             policy::xdg_runtime_dir_env().as_deref(),
         ) {
             fs_rules.push(FsRule {
+                nofollow: false,
                 path,
                 access: FsAccess {
                     read: true,
@@ -1029,6 +1057,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
             });
         }
         fs_rules.push(FsRule {
+            nofollow: false,
             path: home.join(".docker"),
             access: FsAccess {
                 read: true,
@@ -1044,6 +1073,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         let tc_props = home.join(".testcontainers.properties");
         if policy::first_party_read_target(home, &tc_props).is_some() {
             fs_rules.push(FsRule {
+                nofollow: false,
                 path: tc_props,
                 access: FsAccess {
                     read: true,
@@ -1077,6 +1107,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
             continue;
         }
         fs_rules.push(FsRule {
+            nofollow: false,
             path,
             access: FsAccess {
                 read: true,
@@ -1104,6 +1135,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         // where this rule would union with the write grant.
         for path in super::copilot_pkg_grants(config, "linux") {
             fs_rules.push(FsRule {
+                nofollow: false,
                 path,
                 access: FsAccess {
                     read: true,
@@ -1120,6 +1152,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
             continue;
         }
         fs_rules.push(FsRule {
+            nofollow: false,
             path: dir.path.clone(),
             access: FsAccess {
                 read: true,
@@ -1150,6 +1183,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 continue;
             }
             fs_rules.push(FsRule {
+                nofollow: false,
                 path,
                 access: FsAccess {
                     read: true,
@@ -1329,6 +1363,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 ));
             }
             None => fs_rules.push(FsRule {
+                nofollow: false,
                 path: cplt_bin,
                 access: FsAccess {
                     read: true,
@@ -1374,7 +1409,6 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         home_dir: home.to_path_buf(),
         precreate_dirs,
         plain_file,
-        nofollow,
     }
 }
 
@@ -1806,26 +1840,15 @@ pub fn precompute(policy: LandlockPolicy) -> Result<PrecomputedSandbox, String> 
             deferred_paths.push((c_path, rule.access));
             continue;
         }
-        let flags = if policy.nofollow.contains(&i) {
-            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC
-        } else {
-            libc::O_PATH | libc::O_CLOEXEC
-        };
-        let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
-        if fd >= 0 && policy.nofollow.contains(&i) {
-            // O_NOFOLLOW opens a final-component symlink as itself. Fail closed:
-            // prepare() refused links, so one here was swapped in since.
-            let mut st: libc::stat = unsafe { std::mem::zeroed() };
-            if unsafe { libc::fstat(fd, &raw mut st) } != 0
-                || st.st_mode & libc::S_IFMT == libc::S_IFLNK
-            {
-                unsafe { libc::close(fd) };
-                return Err(format!(
-                    "{} became a symlink after cplt validated it. Refusing to grant it.",
-                    rule.path.display()
-                ));
+        let fd = if rule.nofollow {
+            match open_nofollow_rule(&rule.path) {
+                Ok(Some(fd)) => std::os::fd::IntoRawFd::into_raw_fd(fd),
+                Ok(None) => continue,
+                Err(e) => return Err(nofollow_refusal(&rule.path, &e)),
             }
-        }
+        } else {
+            unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) }
+        };
         if fd >= 0 {
             pre_opened_fds.push((fd, rule.access));
         }
@@ -2247,7 +2270,7 @@ pub fn apply_precomputed(sandbox: &PrecomputedSandbox) -> std::io::Result<()> {
 /// `O_PATH | O_CLOEXEC` fds are closed by that `execve`.
 #[cfg(target_os = "linux")]
 pub(crate) fn apply_landlock_and_seccomp_now(
-    fs_rules: &[FsRule],
+    fs_rules: &[(FsRule, Option<FileId>)],
     net_rules: &[NetRule],
     restrict_net_connect: bool,
     proxy_forced: bool,
@@ -2264,13 +2287,23 @@ pub(crate) fn apply_landlock_and_seccomp_now(
     // Open each rule's path in *this* namespace. `/proc/self` resolves to this
     // process's pid, which is preserved across the upcoming `execve()`, so no
     // deferral is needed here (unlike the fork-based path).
-    for (i, rule) in fs_rules.iter().enumerate() {
+    for (i, (rule, host_id)) in fs_rules.iter().enumerate() {
         let c_path = CString::new(rule.path.as_os_str().as_bytes())
             .map_err(|_| std::io::Error::other("path contains null byte"))?;
         let raw_fd: RawFd = if plain_file == Some(i) {
             match open_plain_file(&c_path) {
                 Some(fd) => fd,
                 None => continue,
+            }
+        } else if rule.nofollow {
+            match open_nofollow_in_namespace(&rule.path, *host_id) {
+                Ok(Some(fd)) => std::os::fd::IntoRawFd::into_raw_fd(fd),
+                Ok(None) => continue,
+                Err(e) => {
+                    return Err(std::io::Error::other(NofollowRefused(nofollow_refusal(
+                        &rule.path, &e,
+                    ))));
+                }
             }
         } else {
             unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) }
@@ -2306,6 +2339,119 @@ pub(crate) fn apply_landlock_and_seccomp_now(
     apply_seccomp_filter(&build_seccomp_filter(proxy_forced))?;
 
     Ok(())
+}
+
+/// Open a [`FsRule::nofollow`] rule path with `O_PATH`, following no symlink
+/// in any component, or `Ok(None)` when it does not exist (skipped, like any
+/// other missing rule path).
+///
+/// `openat2(RESOLVE_NO_SYMLINKS)` fails with `ELOOP` on a link anywhere in the
+/// walk, the final component included (`O_NOFOLLOW` is not passed, so a final
+/// link is refused rather than opened as itself). `O_NOFOLLOW` alone covers
+/// only the final component: a link at `~/.cache/pnpm` would still carry a
+/// `pnpm/dlx` grant away. Every other error is returned so the caller fails
+/// closed, `ENOSYS` included: openat2 is Linux 5.6, below Landlock's 5.13
+/// floor, but a container's seccomp profile can still refuse it.
+#[cfg(target_os = "linux")]
+pub(crate) fn open_nofollow_rule(path: &Path) -> std::io::Result<Option<std::os::fd::OwnedFd>> {
+    let flags = libc::O_PATH | libc::O_CLOEXEC;
+    match super::openat2_no_symlinks(libc::AT_FDCWD, path, flags, 0) {
+        Ok(fd) => Ok(Some(fd)),
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The launch-stopping message for a [`FsRule::nofollow`] rule that could not
+/// be opened safely.
+#[cfg(target_os = "linux")]
+pub(crate) fn nofollow_refusal(path: &Path, e: &std::io::Error) -> String {
+    let why = match e.raw_os_error() {
+        Some(libc::ELOOP) => "a symlink appeared in its path after cplt checked it".to_string(),
+        Some(libc::ENOSYS) => "the kernel, or a seccomp profile around cplt, refuses \
+                               openat2(2), which cplt needs to open it without following \
+                               symlinks"
+            .to_string(),
+        _ => format!("it could not be opened without following symlinks ({e})"),
+    };
+    format!(
+        "Refusing to grant {}: {why}. Not starting, because the grant could land on a \
+         different directory than the one cplt checked.",
+        path.display()
+    )
+}
+
+/// `(st_dev, st_ino)` of a directory, the same through every bind mount of it.
+#[cfg(target_os = "linux")]
+pub(crate) type FileId = (u64, u64);
+
+#[cfg(target_os = "linux")]
+fn file_id(fd: &std::os::fd::OwnedFd) -> std::io::Result<FileId> {
+    use std::os::fd::AsRawFd;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd.as_raw_fd(), &raw mut st) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((st.st_dev, st.st_ino))
+}
+
+/// The host inode a [`FsRule::nofollow`] rule names, `None` when the path does
+/// not exist. Taken by the parent before bubblewrap starts, for the re-entry
+/// helper to compare against (see [`open_nofollow_in_namespace`]).
+#[cfg(target_os = "linux")]
+pub(crate) fn nofollow_host_id(path: &Path) -> Result<Option<FileId>, String> {
+    match open_nofollow_rule(path) {
+        Ok(Some(fd)) => file_id(&fd).map(Some),
+        Ok(None) => Ok(None),
+        Err(e) => Err(e),
+    }
+    .map_err(|e| nofollow_refusal(path, &e))
+}
+
+/// A [`FsRule::nofollow`] rule refused inside the bubblewrap namespace. The
+/// helper reports it to the parent as a refusal, not a startup failure, so
+/// auto-detect does not fall back to Landlock-only.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) struct NofollowRefused(pub String);
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for NofollowRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::error::Error for NofollowRefused {}
+
+/// [`open_nofollow_rule`] inside the bubblewrap namespace, then check the fd
+/// is the inode the parent found at the same path on the host (`host_id`).
+///
+/// Why both. bwrap binds a writable rule by path: `mount(2)` resolves the
+/// source and then the destination, so a symlink swapped in and back between
+/// the two lookups (renameat2 `RENAME_EXCHANGE` in a loop) can mount another
+/// tree's root *at* the granted path. The walk to it is then symlink-free and
+/// `RESOLVE_NO_SYMLINKS` alone passes, but the fd is that tree's root inode.
+/// A bind mount shares its source's `st_dev` and `st_ino`, so comparing them
+/// with the host's catches exactly that. A mount that lands anywhere else only
+/// makes a tree writable at the mount level: Landlock, applied here on this
+/// fd, is still what grants write and execute, and it grants them on the
+/// checked inode alone.
+#[cfg(target_os = "linux")]
+fn open_nofollow_in_namespace(
+    path: &Path,
+    host_id: Option<FileId>,
+) -> std::io::Result<Option<std::os::fd::OwnedFd>> {
+    let Some(fd) = open_nofollow_rule(path)? else {
+        return Ok(None);
+    };
+    if file_id(&fd).is_ok_and(|id| Some(id) == host_id) {
+        return Ok(Some(fd));
+    }
+    Err(std::io::Error::other(
+        "the directory in the namespace is not the one cplt checked on the host",
+    ))
 }
 
 /// Open a rule path that must name one plain file (#252), or `None`.
@@ -2632,6 +2778,7 @@ mod tests {
             allow_gpg_signing: false,
             deny_clipboard: false,
             deny_nested_git: false,
+            refuse_cache_exec_links: false,
             deny_copilot_dir_exec: false,
             allow_jvm_attach: false,
             allow_msbuild: false,
@@ -3080,23 +3227,40 @@ mod tests {
         let project = PathBuf::from("/home/user/project");
         let home = PathBuf::from("/home/user");
         let subdirs = vec!["Cypress".to_string(), "ms-playwright".to_string()];
+        let nofollow_paths = |policy: &LandlockPolicy| {
+            let mut paths: Vec<_> = policy
+                .fs_rules
+                .iter()
+                .filter(|rule| rule.nofollow)
+                .map(|rule| rule.path.clone())
+                .collect();
+            paths.sort();
+            paths
+        };
+
         let mut config = test_config(&project, &home);
         config.allow_cache_exec = &subdirs;
-        let policy = generate_policy(&config);
-        let mut nofollow: Vec<_> = policy
-            .nofollow
-            .iter()
-            .map(|&i| policy.fs_rules[i].path.clone())
-            .collect();
-        nofollow.sort();
         assert_eq!(
-            nofollow,
+            nofollow_paths(&generate_policy(&config)),
             vec![
                 home.join(".cache/Cypress"),
                 home.join(".cache/ms-playwright"),
                 policy::cypress_app_data_dir_with_env(&home, &policy::no_cache_env),
             ]
         );
+
+        // `allow_cache_exec_any` grants the whole cache; it needs the flag as
+        // much as a single entry does.
+        config.allow_cache_exec = &[];
+        config.allow_cache_exec_any = true;
+        assert_eq!(
+            nofollow_paths(&generate_policy(&config)),
+            vec![home.join(".cache")]
+        );
+
+        // No cache exec, no nofollow rule: nothing else changes how it opens.
+        config.allow_cache_exec_any = false;
+        assert!(nofollow_paths(&generate_policy(&config)).is_empty());
     }
 
     #[test]
@@ -3637,6 +3801,7 @@ mod tests {
     /// An `FsRule` with just the access bits the overlap check reads.
     fn rule(path: &str, write: bool, execute: bool) -> FsRule {
         FsRule {
+            nofollow: false,
             path: PathBuf::from(path),
             access: FsAccess {
                 read: true,
@@ -4437,6 +4602,7 @@ mod tests {
         std::fs::write(home.join("dotfiles/m2.xml"), "pw").unwrap();
         symlink(home.join("dotfiles/m2.xml"), home.join(".m2/settings.xml")).unwrap();
         let rule = |p: PathBuf| FsRule {
+            nofollow: false,
             path: p,
             access: FsAccess {
                 read: true,
@@ -5260,6 +5426,7 @@ mod tests {
         let policy = LandlockPolicy {
             fs_rules: vec![
                 FsRule {
+                    nofollow: false,
                     path: PathBuf::from("/proc/self"),
                     access: FsAccess {
                         read: true,
@@ -5270,6 +5437,7 @@ mod tests {
                     },
                 },
                 FsRule {
+                    nofollow: false,
                     path: PathBuf::from("/tmp"),
                     access: FsAccess {
                         read: true,
@@ -5286,7 +5454,6 @@ mod tests {
             home_dir: PathBuf::from("/tmp/test-home"),
             precreate_dirs: vec![],
             plain_file: None,
-            nofollow: vec![],
         };
 
         let precomputed = precompute(policy).expect("precompute should succeed");
@@ -5329,44 +5496,90 @@ mod tests {
         }
     }
 
-    /// #252: cplt writes the root AGENTS.md after `precompute()`, so the rule
-    /// must not be opened there. On a first run the file does not exist yet
-    /// (an early open would drop the rule), and when the block changes the
-    /// write renames a new inode over the path (an early fd would pin the old,
-    /// unlinked one). The child-side open must see the file as written.
-    /// A cache-exec or Cypress state path swapped for a symlink after
-    /// `prepare()` validated it must stop the launch, not bind the grant to the
-    /// link's target. The same link on an ordinary rule is still followed.
     #[cfg(target_os = "linux")]
-    #[test]
-    fn precompute_refuses_a_symlinked_nofollow_rule() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("target");
-        let link = dir.path().join("ms-playwright");
-        std::fs::create_dir(&target).unwrap();
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-        let policy = |nofollow: Vec<usize>| LandlockPolicy {
+    fn nofollow_policy(dir: &Path, path: PathBuf, nofollow: bool) -> LandlockPolicy {
+        LandlockPolicy {
             fs_rules: vec![FsRule {
-                path: link.clone(),
+                nofollow,
+                path,
                 access: read_only(),
             }],
             net_rules: vec![],
             restrict_net_connect: false,
             proxy_forced: false,
-            home_dir: dir.path().to_path_buf(),
+            home_dir: dir.to_path_buf(),
             precreate_dirs: vec![],
             plain_file: None,
-            nofollow,
-        };
-
-        let Err(error) = precompute(policy(vec![0])) else {
-            panic!("a symlinked nofollow rule must be refused");
-        };
-        assert!(error.contains("became a symlink"), "{error}");
-        let pre = precompute(policy(vec![])).expect("an ordinary rule follows the link");
-        assert_eq!(pre.pre_opened_fds.len(), 1);
+        }
     }
 
+    /// A cache-exec or Cypress state path that became a symlink after
+    /// `prepare()` checked it must stop the launch, not bind the grant to the
+    /// link's target. That holds for a link at the entry itself and for one at
+    /// an intermediate component (`~/.cache/pnpm` for `pnpm/dlx`), which
+    /// `O_NOFOLLOW` alone would have followed. The same links on an ordinary
+    /// rule are still followed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn precompute_refuses_a_symlink_in_any_component_of_a_nofollow_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join("dlx")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, dir.path().join("pnpm")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, dir.path().join("ms-playwright")).unwrap();
+        std::fs::create_dir(dir.path().join("real")).unwrap();
+
+        for linked in ["pnpm/dlx", "ms-playwright"] {
+            let path = dir.path().join(linked);
+            let Err(error) = precompute(nofollow_policy(dir.path(), path.clone(), true)) else {
+                panic!("{linked}: a symlinked nofollow rule must be refused");
+            };
+            assert!(error.contains("a symlink appeared"), "{linked}: {error}");
+            let pre = precompute(nofollow_policy(dir.path(), path, false))
+                .expect("an ordinary rule follows the link");
+            assert_eq!(pre.pre_opened_fds.len(), 1, "{linked}");
+        }
+
+        let real = precompute(nofollow_policy(dir.path(), dir.path().join("real"), true))
+            .expect("a real directory is granted");
+        assert_eq!(real.pre_opened_fds.len(), 1);
+        let missing = precompute(nofollow_policy(dir.path(), dir.path().join("nope"), true))
+            .expect("a missing path is skipped like any other rule");
+        assert!(missing.pre_opened_fds.is_empty());
+    }
+
+    /// Under bubblewrap the helper must refuse a directory that is not the
+    /// inode the parent checked on the host, even when the path to it has no
+    /// symlink: a bind mount raced onto the path looks exactly like that.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nofollow_in_namespace_accepts_only_the_host_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let (granted, other) = (dir.path().join("granted"), dir.path().join("other"));
+        std::fs::create_dir(&granted).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        let host = nofollow_host_id(&granted).unwrap();
+        let other_id = nofollow_host_id(&other).unwrap();
+        assert!(host.is_some() && other_id.is_some() && host != other_id);
+
+        assert!(
+            open_nofollow_in_namespace(&granted, host)
+                .unwrap()
+                .is_some(),
+            "the checked inode is granted"
+        );
+        assert!(open_nofollow_in_namespace(&granted, other_id).is_err());
+        assert!(
+            open_nofollow_in_namespace(&granted, None).is_err(),
+            "a directory absent on the host but present in the namespace is refused"
+        );
+    }
+
+    /// #252: cplt writes the root AGENTS.md after `precompute()`, so the rule
+    /// must not be opened there. On a first run the file does not exist yet
+    /// (an early open would drop the rule), and when the block changes the
+    /// write renames a new inode over the path (an early fd would pin the old,
+    /// unlinked one). The child-side open must see the file as written.
     #[cfg(target_os = "linux")]
     #[test]
     fn plain_file_is_opened_after_the_upsert_not_in_precompute() {
@@ -5375,6 +5588,7 @@ mod tests {
         let file = dir.path().join("AGENTS.md");
         let policy = LandlockPolicy {
             fs_rules: vec![FsRule {
+                nofollow: false,
                 path: file.clone(),
                 access: read_only(),
             }],
@@ -5384,7 +5598,6 @@ mod tests {
             home_dir: dir.path().to_path_buf(),
             precreate_dirs: vec![],
             plain_file: Some(0),
-            nofollow: vec![],
         };
 
         let pre = precompute(policy).expect("precompute should succeed");
@@ -5418,6 +5631,7 @@ mod tests {
         let file = dir.path().join("AGENTS.md");
         std::fs::write(&file, "x").unwrap();
         let rule = FsRule {
+            nofollow: false,
             path: file.clone(),
             access: read_only(),
         };
@@ -5429,7 +5643,6 @@ mod tests {
             home_dir: dir.path().to_path_buf(),
             precreate_dirs: vec![],
             plain_file: Some(1),
-            nofollow: vec![],
         };
         let pre = precompute(policy).expect("precompute should succeed");
         assert_eq!(pre.pre_opened_fds.len(), 1, "the user's grant was deferred");

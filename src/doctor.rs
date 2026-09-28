@@ -335,6 +335,7 @@ mod tests {
             fs_rules: rules
                 .into_iter()
                 .map(|(p, write, execute)| FsRule {
+                    nofollow: false,
                     path: PathBuf::from(p),
                     access: FsAccess {
                         read: true,
@@ -351,7 +352,6 @@ mod tests {
             home_dir: PathBuf::from("/home/u"),
             precreate_dirs: vec![],
             plain_file: None,
-            nofollow: vec![],
         }
     }
 

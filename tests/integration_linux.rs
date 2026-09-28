@@ -850,34 +850,6 @@ EOF
         }
     }
 
-    /// Landlock follows a symlinked cache-exec entry and would grant rwx on
-    /// its target, so cplt refuses to launch.
-    #[test]
-    fn landlock_refuses_symlinked_cache_exec_entry() {
-        require_landlock!();
-        let project = create_test_project();
-        let home = home_outside_tmp(".cplt-cache-link-home-");
-        let target = home.path().join("elsewhere");
-        fs::create_dir_all(&target).unwrap();
-        fs::create_dir_all(home.path().join(".cache")).unwrap();
-        std::os::unix::fs::symlink(&target, home.path().join(".cache/ms-playwright")).unwrap();
-
-        let (code, stdout, stderr) = run_sandboxed_home_with_flags(
-            project.path(),
-            home.path(),
-            &["--allow-cache-exec", "ms-playwright"],
-            "echo LAUNCHED",
-        );
-        assert!(
-            code != 0 && !stdout.contains("LAUNCHED"),
-            "a symlinked cache-exec entry must stop the launch — stdout: {stdout}"
-        );
-        assert!(
-            stderr.contains("resolves through a symlink"),
-            "stderr: {stderr}"
-        );
-    }
-
     /// The cache-exec base is `~/.cache` whatever XDG_CACHE_HOME says, so a
     /// hostile value cannot aim write+execute at another tree.
     #[test]
@@ -3650,5 +3622,176 @@ print('CONNECTED')
             "cplt must say the grant was withheld and why\nstderr: {stderr}"
         );
         let _ = fs::remove_dir_all(&home);
+    }
+
+    // ── Symlinked cache-exec paths (#591) ─────────────────────────
+
+    /// `~/.cache/<parent> -> ~/elsewhere` with a probe at
+    /// `~/elsewhere/dlx/run.sh`, and `~/.cache/ms-playwright -> ~/elsewhere/pw`.
+    fn home_with_linked_caches(label: &str, parent: &str) -> tempfile::TempDir {
+        let home = home_outside_tmp(label);
+        let elsewhere = home.path().join("elsewhere");
+        write_probe(&elsewhere.join("dlx/run.sh"), "dlx-ran");
+        write_probe(&elsewhere.join("pw/run.sh"), "pw-ran");
+        fs::create_dir_all(home.path().join(".cache")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, home.path().join(".cache").join(parent)).unwrap();
+        std::os::unix::fs::symlink(
+            elsewhere.join("pw"),
+            home.path().join(".cache/ms-playwright"),
+        )
+        .unwrap();
+        home
+    }
+
+    /// A cplt config file inside the fake home, for `CPLT_CONFIG`.
+    fn config_file(home: &Path, toml: &str) -> PathBuf {
+        let path = home.join("cplt-config.toml");
+        fs::write(&path, toml).unwrap();
+        path
+    }
+
+    /// Default (`sandbox.refuse_cache_exec_links` off): a symlink at the entry
+    /// or at an intermediate component is granted at its canonical target,
+    /// with a warning, on both backends. Under bubblewrap the writable bind
+    /// goes on that canonical path too.
+    fn assert_linked_entries_granted_at_target(bwrap_flag: &str) {
+        let project = create_test_project();
+        let home = home_with_linked_caches(".cplt-cache-link-home-", "tools");
+        let elsewhere = home.path().join("elsewhere");
+        let script = format!(
+            "'{e}/dlx/run.sh'; '{e}/pw/run.sh'; printf x > '{e}/dlx/w' && echo WROTE; \
+             printf x > '{e}/not-granted' 2>/dev/null && echo SIBLING",
+            e = elsewhere.display()
+        );
+        let (code, stdout, stderr) = run_sandboxed_home_with_flags(
+            project.path(),
+            home.path(),
+            &[
+                bwrap_flag,
+                "--allow-cache-exec",
+                "tools/dlx",
+                "--allow-cache-exec",
+                "ms-playwright",
+            ],
+            &script,
+        );
+        assert!(
+            stdout.contains("dlx-ran") && stdout.contains("pw-ran") && stdout.contains("WROTE"),
+            "{bwrap_flag}: the grant must land on the link's target (exit {code})\n\
+             stdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(
+            !stdout.contains("SIBLING"),
+            "{bwrap_flag}: only the entry's target is granted — stdout: {stdout}"
+        );
+        assert!(
+            stderr.contains("sandbox.refuse_cache_exec_links"),
+            "{bwrap_flag}: the launch must say where the grant went — stderr: {stderr}"
+        );
+    }
+
+    #[test]
+    fn landlock_grants_symlinked_cache_exec_entry_at_its_target() {
+        require_landlock!();
+        assert_linked_entries_granted_at_target("--no-bubblewrap");
+    }
+
+    /// `sandbox.refuse_cache_exec_links`: a link inside `~/.cache`, at the
+    /// entry or above it, stops the launch.
+    fn assert_linked_entries_refused(bwrap_flag: &str) {
+        let project = create_test_project();
+        let home = home_with_linked_caches(".cplt-cache-link-refuse-", "pnpm");
+        let config = config_file(home.path(), "[sandbox]\nrefuse_cache_exec_links = true\n");
+        for entry in ["pnpm/dlx", "ms-playwright"] {
+            let (code, stdout, stderr) = run_sandboxed_home_with_flags_env(
+                project.path(),
+                home.path(),
+                &[bwrap_flag, "--allow-cache-exec", entry],
+                &[("CPLT_CONFIG", config.as_path())],
+                "echo LAUNCHED",
+            );
+            assert!(
+                code != 0 && !stdout.contains("LAUNCHED"),
+                "{bwrap_flag} {entry}: a symlinked entry must stop the launch — stdout: {stdout}"
+            );
+            assert!(
+                stderr.contains("sandbox.refuse_cache_exec_links is set"),
+                "{bwrap_flag} {entry}: stderr: {stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn landlock_refuse_cache_exec_links_refuses_any_component() {
+        require_landlock!();
+        assert_linked_entries_refused("--no-bubblewrap");
+    }
+
+    /// `pnpm/dlx` with `~/.cache/pnpm` a symlink: `~/.cache/pnpm` is also a
+    /// writable application directory, so its target is a writable tree
+    /// outside the cache, and write+execute there is refused even with the
+    /// key off.
+    #[test]
+    fn landlock_refuses_cache_exec_link_into_a_writable_tree() {
+        require_landlock!();
+        let project = create_test_project();
+        let home = home_with_linked_caches(".cplt-cache-link-pnpm-", "pnpm");
+        let (code, stdout, stderr) = run_sandboxed_home_with_flags(
+            project.path(),
+            home.path(),
+            &["--allow-cache-exec", "pnpm/dlx"],
+            "echo LAUNCHED",
+        );
+        assert!(
+            code != 0 && !stdout.contains("LAUNCHED"),
+            "stdout: {stdout}"
+        );
+        assert!(
+            stderr.contains("will not grant write and execute there")
+                && stderr.contains("which the sandbox already grants"),
+            "stderr: {stderr}"
+        );
+    }
+
+    /// Whatever the key says, a link aimed at a tree cplt keeps from the agent
+    /// is refused: granting it would hand over the credentials.
+    #[test]
+    fn landlock_refuses_cache_exec_link_to_a_credential_dir() {
+        require_landlock!();
+        let project = create_test_project();
+        let home = home_outside_tmp(".cplt-cache-link-ssh-");
+        fs::create_dir_all(home.path().join(".ssh")).unwrap();
+        fs::create_dir_all(home.path().join(".cache")).unwrap();
+        std::os::unix::fs::symlink(
+            home.path().join(".ssh"),
+            home.path().join(".cache/ms-playwright"),
+        )
+        .unwrap();
+        let (code, stdout, stderr) = run_sandboxed_home_with_flags(
+            project.path(),
+            home.path(),
+            &["--allow-cache-exec", "ms-playwright"],
+            "echo LAUNCHED",
+        );
+        assert!(
+            code != 0 && !stdout.contains("LAUNCHED"),
+            "stdout: {stdout}"
+        );
+        assert!(
+            stderr.contains("will not grant write and execute there"),
+            "stderr: {stderr}"
+        );
+    }
+
+    #[test]
+    fn bwrap_grants_symlinked_cache_exec_entry_at_its_target() {
+        require_bwrap!();
+        assert_linked_entries_granted_at_target("--use-bubblewrap");
+    }
+
+    #[test]
+    fn bwrap_refuse_cache_exec_links_refuses_any_component() {
+        require_bwrap!();
+        assert_linked_entries_refused("--use-bubblewrap");
     }
 }

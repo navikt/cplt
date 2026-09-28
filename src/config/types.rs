@@ -673,6 +673,7 @@ pub struct SandboxConfig {
     /// Deny creating a `.git` entry below a writable root (default: false,
     /// macOS only). See `sandbox_profile::emit_nested_gitdir_denies` (#576).
     pub deny_nested_git: Option<bool>,
+    pub refuse_cache_exec_links: Option<bool>,
     /// Refuse to launch when a repository's `.cplt.toml` cannot be read or
     /// parsed, instead of warning and launching without its `[deny]`
     /// (default: false, #385 M-01).
@@ -959,6 +960,7 @@ pub struct Resolved {
     pub allow_msbuild: bool,
     pub gradle_init: bool,
     pub deny_nested_git: bool,
+    pub refuse_cache_exec_links: bool,
     pub refuse_invalid_repo_config: bool,
     pub deny_copilot_dir_exec: bool,
     pub allow_docker: bool,

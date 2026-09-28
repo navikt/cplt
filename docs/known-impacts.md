@@ -284,19 +284,38 @@ own config and trust store. A tool that follows a relocated `XDG_CACHE_HOME`
 relocated cache (`XDG_CACHE_HOME` or `CYPRESS_CACHE_FOLDER`) is not supported;
 unset the variable for the run so the tool uses `~/.cache`.
 
-**Linux: a symlinked cache-exec entry stops the launch.** Landlock follows a
-symlink when it opens a rule path, so a link at `~/.cache/ms-playwright` (or at
-`~/.cache` itself under `--allow-cache-exec-any`) would grant read, write and
-execute on whatever it points to. A link planted by an earlier session would
-turn a narrow opt-in into write+exec on any tree. cplt refuses with
-`allow_cache_exec path … resolves through a symlink` (or `Cache-exec root …`).
-To recover, check where the link points, then replace it with a real
-directory: `rm ~/.cache/ms-playwright && mkdir ~/.cache/ms-playwright`, and
-reinstall the browsers. If you relocated the cache on purpose, move the files
-back under `~/.cache`. cplt also opens these paths without following a final
-symlink, so a link swapped in after the check fails the launch as well. macOS
-does not refuse: Seatbelt checks the resolved path against rules on the literal
-cache path, so a link there grants nothing extra.
+**Linux: a symlinked cache-exec entry is granted where it points, with a
+warning.** Landlock grants the directory a symlink resolves to, so for a link
+at `~/.cache/ms-playwright`, or above an entry (`~/.cache/pnpm` for
+`pnpm/dlx`), the agent gets read, write and execute on the target. cplt says so
+at every launch (`allow_cache_exec path … resolves through a symlink to …`).
+The sandbox can write `~/.cache`, so an earlier session could have planted the
+link. If you did not make it, remove it:
+`rm ~/.cache/ms-playwright && mkdir ~/.cache/ms-playwright`, then reinstall the
+browsers. `sandbox.refuse_cache_exec_links = true` makes every such link stop
+the launch; see
+[configuration](configuration.md#symlinked-cache-exec-entries-sandboxrefuse_cache_exec_links).
+
+cplt refuses the launch, with or without the key, when the target is a system
+directory, `/tmp`, `$HOME` or a parent of it, a credential directory, cplt's
+state, the project, or a path the sandbox already grants (a tool or application
+directory such as `~/.cache/pnpm`, a read-only config file, a tool prefix). The
+error reads `… and cplt will not grant write and execute there: <reason>`.
+`~/.cache` itself must be a real directory (`Cache-exec root … resolves through
+a symlink`), which cplt's scratch directory has always required on Linux.
+
+The grant goes on the target cplt checked. When the sandbox is applied, cplt
+opens it without following a symlink at any level, under bubblewrap as well,
+where it also checks that the directory in the namespace is the one it
+checked on the host. A link swapped in after the check therefore stops the
+launch (`Refusing to grant …: a symlink appeared in its path after cplt checked
+it`) instead of moving the grant. Run it again once nothing is changing the
+cache. If bubblewrap itself trips over the change, auto-detect falls back to
+Landlock-only with its usual warning, as for any bubblewrap start-up failure. The same open needs `openat2(2)`: a container whose seccomp profile
+refuses it cannot launch with cache exec (`… refuses openat2(2) …`).
+
+macOS does not refuse or warn: Seatbelt checks the resolved path against rules
+on the literal cache path, so a link there grants nothing extra.
 
 On macOS, the explicit `Cypress` entry also grants Electron permission to
 register only `com.electron.cypress.MachPortRendezvousServer.<numeric-pid>`.
@@ -306,7 +325,8 @@ and project state. Without it, `cypress verify` exits during bootstrap with
 `EPERM (1100)`, or a test run fails while opening its state. On Linux the same
 entry grants read/write, but not execution, under
 `${XDG_CONFIG_HOME:-~/.config}/Cypress`. On both platforms cplt refuses to
-launch if that state directory is a symlink.
+launch if that state directory is a symlink, and on Linux it is opened without
+following symlinks when the sandbox is applied, like a cache-exec entry.
 
 Cypress uses separate ephemeral loopback ports for its HTTP/WebSocket server
 and the browser's debugging protocol. Prefer requesting this in the committed

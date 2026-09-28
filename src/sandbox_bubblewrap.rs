@@ -71,7 +71,9 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
-use crate::sandbox::landlock_mod::{CredentialLink, FsAccess, FsRule, LandlockPolicy, NetRule};
+use crate::sandbox::landlock_mod::{
+    self, CredentialLink, FileId, FsAccess, FsRule, LandlockPolicy, NetRule,
+};
 use crate::sandbox::policy::{
     LinuxCoverage, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, Protected, dot_git_exists,
     reaches_entry_directly, rel_ancestors, repo_walk,
@@ -335,7 +337,20 @@ pub(crate) fn build_bwrap_args(
         // new per-agent exception. `bin/` is thus write-denied by BOTH Landlock
         // and the overlay, so this is not "the overlay as sole control".
         .filter(|r| r.access.write || r.access.create_dirs)
-        .filter_map(|r| r.path.canonicalize().ok())
+        // A `nofollow` rule is never canonicalized: `prepare()` already put
+        // it at the canonical path it validated, and resolving it again here
+        // would follow a link swapped in since. `resolve` refuses such a link
+        // before this runs; one swapped in after is left unbound (the mount
+        // stays read-only there) and refused by the helper, see
+        // `open_nofollow_in_namespace` for why that check is the one that
+        // finally holds.
+        .filter_map(|r| {
+            if r.nofollow {
+                nofollow_bind_path(&r.path)
+            } else {
+                r.path.canonicalize().ok()
+            }
+        })
         // Skip bwrap-managed subtrees and the /tmp mount point itself.
         .filter(|p| {
             !(p.starts_with("/proc")
@@ -1050,6 +1065,14 @@ pub(crate) fn resolve(
     overlays: Overlays<'_>,
     deny_masks: &DenyMasks,
 ) -> Result<Option<BubblewrapWrapper>, String> {
+    // Before either arm: auto-detect turns a `build_wrapper` error into a
+    // Landlock-only fallback, and a symlink swapped into a cache-exec path is
+    // a refusal, not a reason to drop bubblewrap's masks.
+    if use_bubblewrap != Some(false) {
+        for rule in policy.fs_rules.iter().filter(|r| r.nofollow) {
+            landlock_mod::nofollow_host_id(&rule.path)?;
+        }
+    }
     match use_bubblewrap {
         Some(false) => Ok(None),
         Some(true) => build_wrapper(policy, overlays, deny_masks, true)
@@ -1101,6 +1124,13 @@ pub(crate) fn build_wrapper(
     })
 }
 
+/// Where to `--bind` a [`FsRule::nofollow`] rule: its own path, if that opens
+/// with no symlink in any component, else nothing.
+fn nofollow_bind_path(path: &Path) -> Option<PathBuf> {
+    landlock_mod::open_nofollow_rule(path).ok()??;
+    Some(path.to_path_buf())
+}
+
 /// The rules that shape the mounts: every rule but the root `AGENTS.md`
 /// (#252). Outside /tmp that rule needs no mount (`--ro-bind / /` shows it),
 /// but under the private /tmp it would get its own `--ro-bind`, decided at
@@ -1132,22 +1162,38 @@ struct InnerRule {
     // would silently drop the grant and Pi's trust-store `mkdir` would fail.
     #[serde(default)]
     c: bool,
+    /// [`FsRule::nofollow`], carried with the rule it belongs to.
+    #[serde(default)]
+    n: bool,
+    /// For a `nofollow` rule, the inode the parent found at `path` on the host
+    /// (`None`: absent there). The helper refuses any other inode.
+    #[serde(default)]
+    id: Option<FileId>,
 }
 
 impl InnerRule {
-    fn from_fs_rule(rule: &FsRule) -> Self {
-        Self {
+    /// Records the host inode of a `nofollow` rule, which also refuses a
+    /// symlink swapped in since `prepare()`.
+    fn from_fs_rule(rule: &FsRule) -> Result<Self, String> {
+        Ok(Self {
             path: rule.path.to_string_lossy().into_owned(),
             r: rule.access.read,
             w: rule.access.write,
             x: rule.access.execute,
             i: rule.access.ioctl,
             c: rule.access.create_dirs,
-        }
+            n: rule.nofollow,
+            id: if rule.nofollow {
+                landlock_mod::nofollow_host_id(&rule.path)?
+            } else {
+                None
+            },
+        })
     }
 
     fn to_fs_rule(&self) -> FsRule {
         FsRule {
+            nofollow: self.n,
             path: PathBuf::from(&self.path),
             access: FsAccess {
                 read: self.r,
@@ -1190,7 +1236,8 @@ pub(crate) fn serialize_policy(
             .fs_rules
             .iter()
             .map(InnerRule::from_fs_rule)
-            .collect(),
+            .collect::<Result<_, _>>()
+            .map_err(std::io::Error::other)?,
         net_ports: wrapper.net_rules.iter().map(|r| r.port).collect(),
         restrict_net_connect: wrapper.restrict_net_connect,
         proxy_forced: wrapper.proxy_forced,
@@ -1251,7 +1298,11 @@ fn run_inner() {
         return;
     }
 
-    let fs_rules: Vec<FsRule> = policy.fs_rules.iter().map(InnerRule::to_fs_rule).collect();
+    let fs_rules: Vec<(FsRule, Option<FileId>)> = policy
+        .fs_rules
+        .iter()
+        .map(|r| (r.to_fs_rule(), r.id))
+        .collect();
     let net_rules: Vec<NetRule> = policy
         .net_ports
         .iter()
@@ -1260,15 +1311,28 @@ fn run_inner() {
 
     // Bind Landlock to in-namespace inodes and install seccomp. If this fails
     // we return without signalling success — never run the agent unsandboxed.
-    if crate::sandbox::landlock_mod::apply_landlock_and_seccomp_now(
+    if let Err(e) = landlock_mod::apply_landlock_and_seccomp_now(
         &fs_rules,
         &net_rules,
         policy.restrict_net_connect,
         policy.proxy_forced,
         policy.plain_file,
-    )
-    .is_err()
-    {
+    ) {
+        // A refused `nofollow` rule is a refusal, not a startup failure: the
+        // zero byte tells the parent not to fall back to Landlock-only, or
+        // whoever wins the race could switch bubblewrap off.
+        if let Some(refused) = e
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<landlock_mod::NofollowRefused>())
+        {
+            let msg = format!("cplt: {refused}\n");
+            unsafe { libc::write(2, msg.as_ptr().cast(), msg.len()) };
+            if let Some(fd) = std::env::var_os(ENV_CONFIRM_FD)
+                .and_then(|v| v.to_str().and_then(|s| s.parse::<i32>().ok()))
+            {
+                unsafe { libc::write(fd, [0u8].as_ptr().cast(), 1) };
+            }
+        }
         return;
     }
 
@@ -1355,6 +1419,7 @@ mod tests {
 
     fn writable_rule(path: &str) -> FsRule {
         FsRule {
+            nofollow: false,
             path: PathBuf::from(path),
             access: FsAccess {
                 read: true,
@@ -1375,12 +1440,12 @@ mod tests {
             home_dir: PathBuf::from("/nonexistent-home"),
             precreate_dirs: vec![],
             plain_file,
-            nofollow: vec![],
         }
     }
 
     fn read_rule(path: &Path) -> FsRule {
         FsRule {
+            nofollow: false,
             path: path.to_path_buf(),
             access: FsAccess {
                 read: true,
@@ -1446,6 +1511,133 @@ mod tests {
         assert_eq!(inner.fs_rules[i].to_fs_rule().path, file);
     }
 
+    fn nofollow_rule(path: &Path) -> FsRule {
+        FsRule {
+            nofollow: true,
+            ..writable_rule(&path.to_string_lossy())
+        }
+    }
+
+    fn wrapper_for(fs_rules: Vec<FsRule>) -> BubblewrapWrapper {
+        BubblewrapWrapper {
+            bwrap_path: PathBuf::from("/usr/bin/bwrap"),
+            bwrap_args: vec![],
+            fs_rules,
+            net_rules: vec![],
+            restrict_net_connect: true,
+            strict: false,
+            deny_mask_count: 0,
+            socket_mask_count: 0,
+            proxy_forced: false,
+            plain_file: None,
+        }
+    }
+
+    /// `~/.cache/pnpm -> elsewhere` for a `pnpm/dlx` grant, and a link at the
+    /// entry itself.
+    fn linked_cache() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join("dlx")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, root.join("pnpm")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, root.join("ms-playwright")).unwrap();
+        (
+            dir,
+            elsewhere,
+            root.join("pnpm/dlx"),
+            root.join("ms-playwright"),
+        )
+    }
+
+    /// The helper checks a `nofollow` rule against the inode the parent found
+    /// on the host, so both the flag and that inode have to cross the pipe with
+    /// the rule. A path that became a symlink by then stops the transfer.
+    #[test]
+    fn nofollow_rule_crosses_the_pipe_with_its_host_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        let wrapper = wrapper_for(vec![writable_rule("/repo"), nofollow_rule(&cache)]);
+        let bytes = serialize_policy(&wrapper, Path::new("/bin/true"), &[]).unwrap();
+        let inner: InnerPolicy = serde_json::from_slice(&bytes).unwrap();
+        assert!(!inner.fs_rules[0].n && inner.fs_rules[0].id.is_none());
+        assert!(inner.fs_rules[1].to_fs_rule().nofollow);
+        assert_eq!(
+            inner.fs_rules[1].id,
+            landlock_mod::nofollow_host_id(&cache).unwrap()
+        );
+        assert!(inner.fs_rules[1].id.is_some());
+
+        let (_dir, _, intermediate, final_link) = linked_cache();
+        for linked in [intermediate, final_link] {
+            let wrapper = wrapper_for(vec![nofollow_rule(&linked)]);
+            let Err(e) = serialize_policy(&wrapper, Path::new("/bin/true"), &[]) else {
+                panic!(
+                    "{}: a symlinked nofollow rule crossed the pipe",
+                    linked.display()
+                );
+            };
+            assert!(e.to_string().contains("a symlink appeared"), "{e}");
+        }
+    }
+
+    /// bwrap binds by path, so a `nofollow` rule whose path runs through a
+    /// symlink, at the entry or above it, must not be bound at the link's
+    /// target, as `canonicalize` would have done. An ordinary rule still is.
+    #[test]
+    fn symlinked_nofollow_rule_gets_no_writable_bind() {
+        let (_dir, elsewhere, intermediate, final_link) = linked_cache();
+        for (linked, target) in [
+            (intermediate, elsewhere.join("dlx")),
+            (final_link, elsewhere.clone()),
+        ] {
+            let binds = |rule: FsRule| {
+                build_bwrap_args(&[rule], Overlays::default(), &DenyMasks::default())
+                    .windows(2)
+                    .filter(|w| w[0] == "--bind")
+                    .map(|w| w[1].clone())
+                    .collect::<Vec<_>>()
+            };
+            assert!(
+                binds(nofollow_rule(&linked)).is_empty(),
+                "{}",
+                linked.display()
+            );
+            assert_eq!(
+                binds(writable_rule(&linked.to_string_lossy())),
+                vec![target.to_string_lossy().into_owned()]
+            );
+        }
+    }
+
+    /// A symlinked `nofollow` rule is a hard refusal in `resolve`, not a
+    /// wrapper-build failure auto-detect would downgrade to Landlock-only.
+    #[test]
+    fn resolve_refuses_a_symlinked_nofollow_rule_in_every_mode() {
+        let (_dir, _, intermediate, final_link) = linked_cache();
+        for linked in [intermediate, final_link] {
+            let policy = test_policy(vec![nofollow_rule(&linked)], None);
+            for mode in [None, Some(true)] {
+                let Err(e) = resolve(mode, &policy, Overlays::default(), &DenyMasks::default())
+                else {
+                    panic!("{mode:?}: {} was not refused", linked.display());
+                };
+                assert!(e.contains("a symlink appeared"), "{mode:?}: {e}");
+            }
+            assert!(
+                resolve(
+                    Some(false),
+                    &policy,
+                    Overlays::default(),
+                    &DenyMasks::default()
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
+    }
+
     #[test]
     fn args_isolate_expected_namespaces() {
         let args = build_bwrap_args(&[], Overlays::default(), &DenyMasks::default());
@@ -1474,6 +1666,7 @@ mod tests {
         // A writable /tmp rule must NOT re-bind host /tmp over the tmpfs, which
         // would re-expose host temp files and grant exec through /tmp.
         let rules = vec![FsRule {
+            nofollow: false,
             path: PathBuf::from("/tmp"),
             access: FsAccess {
                 read: true,
@@ -1536,6 +1729,7 @@ mod tests {
         let rules = vec![
             writable_rule(&proj_str),
             FsRule {
+                nofollow: false,
                 path: base.path().to_path_buf(),
                 access: FsAccess {
                     read: true,
@@ -1572,6 +1766,7 @@ mod tests {
         let dir = tempfile::TempDir::new_in("/tmp").expect("tempdir under /tmp");
         let granted = dir.path().to_path_buf();
         let rules = vec![FsRule {
+            nofollow: false,
             path: granted.clone(),
             access: FsAccess {
                 read: true,
@@ -1611,6 +1806,7 @@ mod tests {
         let dir = non_tmp_tempdir();
         let granted = dir.path().to_path_buf();
         let rules = vec![FsRule {
+            nofollow: false,
             path: granted.clone(),
             access: FsAccess {
                 read: true,
@@ -1638,6 +1834,7 @@ mod tests {
         std::fs::create_dir(&nested).expect("nested dir");
         let rules = vec![
             FsRule {
+                nofollow: false,
                 path: writable.clone(),
                 access: FsAccess {
                     read: true,
@@ -1648,6 +1845,7 @@ mod tests {
                 },
             },
             FsRule {
+                nofollow: false,
                 path: nested.clone(),
                 access: FsAccess {
                     read: true,
