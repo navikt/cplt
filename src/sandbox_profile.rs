@@ -24,13 +24,13 @@ use super::policy::{
     CacheEnv, DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS,
     DEPENDENCY_SOURCE_TREES, EXEC_IN_WRITABLE, GPG_SIGNING_ALLOW_FILES, HOME_CONFIG_FILES,
     HomeToolDir, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir,
-    SENSITIVE_PROJECT_PATTERNS, SYSTEM_READ_FILES, TOOL_READ_DIRS, XCODE_SELECT_LINK,
-    active_tool_dirs, ancestor_alternation, app_dirs, colima_socket_paths, copilot_default_pkg_dir,
-    current_uid, cypress_app_data_dir_with_env, cypress_runtime_intent, escape_regex,
-    first_party_read_target, grant_is_refused, home_config_link_targets,
-    missing_home_config_link_targets, nested_alternation, path_bin_dirs, playwright_runtime_intent,
-    read_only_home_config, rel_is_glob, rel_regex, validate_playwright_socket_dir,
-    validate_sbpl_path,
+    SENSITIVE_KEY_FILE_EXTENSION_PATTERNS, SENSITIVE_PROJECT_PATTERNS, SYSTEM_READ_FILES,
+    TOOL_READ_DIRS, XCODE_SELECT_LINK, active_tool_dirs, ancestor_alternation, app_dirs,
+    colima_socket_paths, copilot_default_pkg_dir, current_uid, cypress_app_data_dir_with_env,
+    cypress_runtime_intent, escape_regex, first_party_read_target, grant_is_refused,
+    home_config_link_targets, missing_home_config_link_targets, nested_alternation, path_bin_dirs,
+    playwright_runtime_intent, read_only_home_config, rel_is_glob, rel_regex,
+    validate_playwright_socket_dir, validate_sbpl_path,
 };
 
 /// Device nodes a sandboxed process may open for writing, by exact path.
@@ -212,7 +212,7 @@ pub fn generate_profile_with_playwright_socket_dir(
     // Keep PATH-resolved bin and shim locations read-only after user allows.
     // The pnpm rule re-allows its two writable stores, so all security denies
     // below must remain later in the last-match-wins profile.
-    emit_path_bin_denies(&mut sb, config.home_dir);
+    emit_path_bin_denies(&mut sb, config.home_dir, config.extra_deny);
     emit_shim_dir_denies(&mut sb, config);
     // Keeps the exec-allowed toolchain dirs non-writable even when a user
     // allow.write covers ~/.gradle or ~/.konan (write-then-exec): after every
@@ -227,9 +227,12 @@ pub fn generate_profile_with_playwright_socket_dir(
         &mut sb,
         &project_roots,
         config.extra_write,
+        config.extra_read,
         config.allow_env_files,
+        config.deny_key_files_by_extension,
         &home,
         config.existing_home_tool_dirs,
+        config.extra_deny,
     );
     // Same reason, and one more: the worktree common-dir allow is emitted early
     // (so DENIED_DOTFILES still wins over it), which would leave its denies
@@ -418,13 +421,17 @@ fn writable_roots(project_roots: &[String], extra_write: &[PathBuf]) -> Vec<Stri
     roots
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_sensitive_project_denies(
     sb: &mut String,
     project_roots: &[String],
     extra_write: &[PathBuf],
+    extra_read: &[PathBuf],
     allow_env_files: bool,
+    deny_key_files_by_extension: bool,
     home: &str,
     tool_dirs: Option<&[ResolvedToolDir]>,
+    extra_deny: &[PathBuf],
 ) {
     // All security-critical project denies are emitted LAST in the profile.
     // SBPL uses last-match-wins, so these must come after all user-configured
@@ -503,6 +510,46 @@ fn emit_sensitive_project_denies(
             sbpl!(sb, "(deny file-read* (regex #\"/{pattern}\"))");
             sbpl!(sb, "(deny file-write* (regex #\"/{pattern}\"))");
         }
+        // `sandbox.deny_key_files_by_extension`: the patterns above only match
+        // a key file named exactly `.pem`. See the constant's docs. Emitted
+        // before the re-allow below, so dependency fixtures stay readable.
+        //
+        // Scoped to the trees the user granted (project, named roots,
+        // `allow.write`, `allow.read`), not global like the patterns above:
+        // `*.pem` matches every CA bundle on the system (`/etc/ssl/cert.pem`,
+        // Homebrew's `cert.pem`), and denying those breaks every TLS client.
+        let key_patterns: &[&str] = if deny_key_files_by_extension {
+            SENSITIVE_KEY_FILE_EXTENSION_PATTERNS
+        } else {
+            &[]
+        };
+        if !key_patterns.is_empty() {
+            let mut key_roots = roots.clone();
+            for p in extra_read {
+                let s = p.to_string_lossy().into_owned();
+                if !key_roots.contains(&s) {
+                    key_roots.push(s);
+                }
+            }
+            for root in &key_roots {
+                // Not refused: the grant is the user's call. But they should
+                // know it takes the CA bundles with it.
+                if let Some(ca) = key_root_covers_system_ca(root) {
+                    crate::ui::warn(&format!(
+                        "sandbox.deny_key_files_by_extension: the grant {root} covers {ca}, \
+                         so the CA bundles there (cert.pem, cacert.pem) are denied too and \
+                         curl, git over HTTPS and pip will fail TLS setup. Narrow the grant, \
+                         or set sandbox.deny_key_files_by_extension = false."
+                    ));
+                }
+                // `/` trims to the empty prefix, which is the global rule.
+                let r = escape_regex(root.trim_end_matches('/'));
+                for pattern in key_patterns {
+                    sbpl!(sb, "(deny file-read* (regex #\"^{r}/(.*/)?{pattern}\"))");
+                    sbpl!(sb, "(deny file-write* (regex #\"^{r}/(.*/)?{pattern}\"))");
+                }
+            }
+        }
         // Re-allow READ inside the extracted dependency stores, after the deny,
         // because SBPL is last-match-wins. Write stays denied: nothing should be
         // writing a `.env` into a module cache.
@@ -513,6 +560,12 @@ fn emit_sensitive_project_denies(
         // (#477). Scoped to a short explicit list rather than a heuristic: the
         // properties that make it safe (content-addressed, checksum-verified,
         // from a registry) are ones only these trees have.
+        // A `--deny-path` in or above a tree is emitted before its re-allow,
+        // which last-match-wins would reopen for its `.env` files (#597).
+        // Repeat the read deny after every re-allow, narrowed to the overlap
+        // (the tree, for a deny above it) and once per scope; the rest of the
+        // tree keeps the carve-out.
+        let mut redeny = std::collections::BTreeSet::new();
         for tree in dependency_source_trees(home, tool_dirs) {
             if validate_sbpl_path(Path::new(&tree)).is_err() {
                 continue;
@@ -521,6 +574,23 @@ fn emit_sensitive_project_denies(
             for pattern in SENSITIVE_PROJECT_PATTERNS {
                 sbpl!(sb, "(allow file-read* (regex #\"^{t}/.*/{pattern}\"))");
             }
+            // `sandbox.deny_key_files_by_extension`: the same read carve-out
+            // for key files by extension. A `--deny-path` overlapping the store
+            // is handled by the re-deny below, like the `.env` carve-out above.
+            for pattern in key_patterns {
+                sbpl!(sb, "(allow file-read* (regex #\"^{t}/.*/{pattern}\"))");
+            }
+            let tree = PathBuf::from(tree);
+            for deny in extra_deny {
+                if tree.starts_with(deny) {
+                    redeny.insert(tree.clone());
+                } else if deny.starts_with(&tree) {
+                    redeny.insert(deny.clone());
+                }
+            }
+        }
+        for scope in redeny {
+            sbpl!(sb, "(deny file-read* (subpath \"{}\"))", scope.display());
         }
         sbpl!(sb);
     }
@@ -1730,7 +1800,11 @@ fn emit_copilot_pkg_denies(sb: &mut String, config: &SandboxConfig) {
         // Copilot loads its extracted JS and native modules from it. The
         // carve-out's write deny still follows.
         let pkg = pkg_dir.to_string_lossy();
-        sbpl!(sb, "(allow file-read* (subpath \"{pkg}\"))");
+        // Emitted after the user's `--deny-path` rules, so it would reopen
+        // reads under one that overlaps it (#597). `validate_copilot_cache_env`
+        // already refuses that launch; the profile still never carries the
+        // reopening allow.
+        reallow_below_user_denies(sb, config.extra_deny, "Copilot pkg", "read", pkg_dir, true);
         emit_copilot_pkg_exec(sb, &pkg);
         emit_copilot_pkg_write_deny(sb, &pkg, &pins);
     }
@@ -1948,7 +2022,7 @@ fn emit_dotnet_exec_denies(sb: &mut String, dotnet_root: Option<&Path>) {
 /// (`policy::mise_ro_protect_paths`) and the rest by the `HOME_TOOL_DIRS`
 /// shape; the `TopLevel` shape has no Landlock equivalent at all for a
 /// relocated `XDG_DATA_HOME`. See docs/security.md.
-fn emit_path_bin_denies(sb: &mut String, home_dir: &Path) {
+fn emit_path_bin_denies(sb: &mut String, home_dir: &Path, extra_deny: &[PathBuf]) {
     sbpl!(sb, ";; PATH-resolved bin/shim dirs stay read-only");
     for dir in path_bin_dirs(home_dir) {
         match dir {
@@ -1965,11 +2039,15 @@ fn emit_path_bin_denies(sb: &mut String, home_dir: &Path) {
                 }
                 let p = path.display();
                 sbpl!(sb, "(deny file-write* (subpath \"{p}\"))");
-                sbpl!(sb, "(allow file-write* (subpath \"{p}/store\"))");
-                sbpl!(
-                    sb,
-                    "(allow file-write* (subpath \"{p}/package-manager-store\"))"
-                );
+                // Emitted after the user's `--deny-path` rules, so a store
+                // allow would reopen writes under one that overlaps it (#597).
+                // `path_bin_dirs` names both pnpm homes whether or not they
+                // exist, so only warn about a store that is there.
+                for store in ["store", "package-manager-store"] {
+                    let store = path.join(store);
+                    let warn = store.exists();
+                    reallow_below_user_denies(sb, extra_deny, "pnpm store", "write", &store, warn);
+                }
                 sbpl!(sb, "(deny process-exec (subpath \"{p}\"))");
                 sbpl!(
                     sb,
@@ -2693,6 +2771,27 @@ fn overlapping_home_deny<'a>(
         .find_map(|p| overlapping_deny(extra_deny, Path::new(p)))
 }
 
+/// Where macOS and Homebrew keep the CA bundles TLS clients read. The Cellar
+/// holds the real files behind Homebrew's symlinks, including each Python's
+/// `certifi/cacert.pem` and `ca-certificates`' own bundle.
+const SYSTEM_CA_DIRS: [&str; 5] = [
+    "/private/etc/ssl",
+    "/opt/homebrew/etc",
+    "/usr/local/etc",
+    "/opt/homebrew/Cellar",
+    "/usr/local/Cellar",
+];
+
+/// The system CA directory a key-file extension deny on `root` would reach,
+/// if any: `root` at or above it (`--allow-read /`), or inside it.
+fn key_root_covers_system_ca(root: &str) -> Option<&'static str> {
+    let root = Path::new(root);
+    SYSTEM_CA_DIRS.into_iter().find(|ca| {
+        let ca = Path::new(ca);
+        ca.starts_with(root) || root.starts_with(ca)
+    })
+}
+
 /// Withhold one opt-in re-allow because an explicit `--deny-path` overlaps it.
 ///
 /// Emits an SBPL breadcrumb and warns the user: `main.rs` reports the grant as
@@ -2703,10 +2802,46 @@ fn withhold_reallow(sb: &mut String, grant: &str, reallow: &str, deny: &Path) {
     crate::ui::warn(&format!(
         "{grant}: --deny-path {deny} overlaps {reallow}; leaving it denied, not re-allowing it"
     ));
+    note_withheld(sb, grant, reallow, &deny);
+}
+
+fn note_withheld(sb: &mut String, grant: &str, reallow: &str, deny: &dyn std::fmt::Display) {
     sbpl!(
         sb,
         ";; {grant} re-allow withheld: --deny-path {deny} overlaps {reallow}"
     );
+}
+
+/// Emit `(allow file-{op}* (subpath root))` after the user's `--deny-path`
+/// rules without reopening any of them (#597).
+///
+/// A deny at or above `root` withholds the allow ([`withhold_reallow`], or
+/// only its breadcrumb when `warn` is false). A deny inside `root` keeps the
+/// allow for the rest of the tree and repeats that deny right after it, read
+/// and write as `emit_deny_rules` emits it, so last-match-wins keeps it closed.
+fn reallow_below_user_denies(
+    sb: &mut String,
+    extra_deny: &[PathBuf],
+    grant: &str,
+    op: &str,
+    root: &Path,
+    warn: bool,
+) {
+    let r = root.to_string_lossy();
+    if let Some(deny) = extra_deny.iter().find(|d| root.starts_with(d)) {
+        if warn {
+            withhold_reallow(sb, grant, &r, deny);
+        } else {
+            note_withheld(sb, grant, &r, &deny.display());
+        }
+        return;
+    }
+    sbpl!(sb, "(allow file-{op}* (subpath \"{r}\"))");
+    for deny in extra_deny.iter().filter(|d| d.starts_with(root)) {
+        let d = deny.to_string_lossy();
+        sbpl!(sb, "(deny file-read* (subpath \"{d}\"))");
+        sbpl!(sb, "(deny file-write* (subpath \"{d}\"))");
+    }
 }
 
 /// Allow GPG commit signing when `--allow-gpg-signing` is set.
@@ -3074,6 +3209,34 @@ fn emit_network_rules(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_root_over_a_system_ca_dir_is_flagged() {
+        for (root, ca) in [
+            ("/", "/private/etc/ssl"),
+            ("/private", "/private/etc/ssl"),
+            ("/private/etc", "/private/etc/ssl"),
+            ("/private/etc/ssl", "/private/etc/ssl"),
+            ("/opt", "/opt/homebrew/etc"),
+            ("/opt/homebrew/etc/openssl@3", "/opt/homebrew/etc"),
+            ("/usr/local", "/usr/local/etc"),
+            ("/opt/homebrew/Cellar", "/opt/homebrew/Cellar"),
+            ("/opt/homebrew/Cellar/python@3.14", "/opt/homebrew/Cellar"),
+            ("/usr/local/Cellar", "/usr/local/Cellar"),
+        ] {
+            assert_eq!(key_root_covers_system_ca(root), Some(ca), "{root}");
+        }
+        // Component-wise, not string prefix: `/private/etc/sslx` is elsewhere.
+        for root in [
+            "/Users/test/app",
+            "/private/etc/sslx",
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/work/app.v1+x",
+        ] {
+            assert_eq!(key_root_covers_system_ca(root), None, "{root}");
+        }
+    }
 
     /// Build a minimal `SandboxConfig` for SBPL-string tests.
     /// Resolving git from trusted directories means `git_common_dir` is `None`
@@ -3692,6 +3855,7 @@ mod tests {
             deny_clipboard: false,
             deny_nested_git: false,
             refuse_cache_exec_links: false,
+            deny_key_files_by_extension: false,
             deny_copilot_dir_exec: false,
             allow_jvm_attach: false,
             allow_msbuild: false,

@@ -41,19 +41,35 @@ pub(crate) use policy::{NESTED_SCAN_LIMIT, WalkExtras, has_dot_git_or_is_bare, r
 mod env;
 
 /// The two bubblewrap probes `cplt doctor` reports from — the same trusted
-/// lookup and the same `bwrap … /bin/true` the launch runs, against an empty
-/// rule set, so "installed" and "usable" stay two different answers.
+/// lookup and the same `bwrap … /bin/true` the launch runs, with the launch's
+/// own mounts, so "installed" and "usable for this run" stay two answers.
 #[cfg(target_os = "linux")]
 pub(crate) mod bubblewrap_probe {
     pub(crate) use super::bubblewrap::check_availability;
 
-    pub(crate) fn test_empty(bwrap: &std::path::Path) -> Result<(), String> {
-        super::bubblewrap::test_functionality(
-            bwrap,
-            &[],
-            super::bubblewrap::Overlays::default(),
-            &super::bubblewrap::DenyMasks::default(),
+    /// The wrapper `prepare` would build for `config` — same rules, overlays
+    /// and deny masks, through the same `build_wrapper` — probed and dropped.
+    /// `Ok` is exactly when auto-detect wraps the launch instead of falling
+    /// back to Landlock + seccomp only — for the session paths `config`
+    /// carries. What doctor's config leaves out is listed on
+    /// [`crate::doctor::bubblewrap_state`].
+    pub(crate) fn test_launch(config: &super::SandboxConfig) -> Result<(), String> {
+        // The canonical cache-exec and Cypress grants the launch would use. A
+        // config that fails their validation never launches; the probe then
+        // checks the rest with the paths as generated.
+        let mut grants = super::validate_cache_exec_dirs(config).unwrap_or_default();
+        grants.extend(super::prepare_cypress_app_data(config, true).unwrap_or_default());
+        let plan = super::bwrap_plan(config, &super::launch_git_dirs(config), &grants);
+        super::bubblewrap::build_wrapper(
+            &plan.policy,
+            super::bubblewrap::Overlays {
+                read_only: &plan.ro_protect,
+                pins: &plan.pins,
+            },
+            &plan.deny_masks,
+            false,
         )
+        .map(|_| ())
     }
 }
 #[path = "sandbox_exec.rs"]
@@ -76,12 +92,13 @@ pub use policy::{
     LinuxCoverage, PLAYWRIGHT_SOCKET_BASE_MAX_BYTES, PLAYWRIGHT_SOCKET_DIR_PREFIX,
     PLAYWRIGHT_SOCKET_PATH_LIMIT, PLAYWRIGHT_SOCKET_ROOT, PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX,
     PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir,
-    SENSITIVE_PROJECT_PATTERNS, TOOL_PATH_ENV_VARS, ToolPathEnvVar, ToolPathOverride, ToolRoot,
-    active_tool_dirs, app_dirs, build_credential_grants, copilot_default_pkg_dir, copilot_pkg_dir,
-    copilot_pkg_dirs, copilot_ro_protect_paths, credential_link_hop, current_uid,
-    cypress_app_data_dir, cypress_app_data_dir_with_env, cypress_runtime_intent,
-    exec_write_conflicts, home_config_link_targets, home_tool_dirs, linux_docker_socket_paths,
-    linux_runtime_dirs, mise_ro_protect_paths, nested_alternation, no_cache_env, path_bin_dirs,
+    SENSITIVE_KEY_FILE_EXTENSION_PATTERNS, SENSITIVE_PROJECT_PATTERNS, TOOL_PATH_ENV_VARS,
+    ToolPathEnvVar, ToolPathOverride, ToolRoot, active_tool_dirs, app_dirs,
+    build_credential_grants, copilot_default_pkg_dir, copilot_pkg_dir, copilot_pkg_dirs,
+    copilot_ro_protect_paths, credential_link_hop, current_uid, cypress_app_data_dir,
+    cypress_app_data_dir_with_env, cypress_runtime_intent, exec_write_conflicts,
+    home_config_link_targets, home_tool_dirs, linux_docker_socket_paths, linux_runtime_dirs,
+    mise_ro_protect_paths, nested_alternation, no_cache_env, path_bin_dirs,
     playwright_runtime_intent, process_env, relocatable_tool_prefix, shim_ro_protect_paths,
     socket_mask_paths, tool_override_path_is_safe, tool_path_env_overrides,
     validate_playwright_socket_dir, validate_sbpl_path, xdg_runtime_dir_env,
@@ -125,6 +142,7 @@ pub use landlock_mod::available_abi_version;
 /// This struct borrows all data from the caller — no allocations needed
 /// to construct it. Owned copies are made inside [`prepare()`] for the
 /// fields that [`PreparedSandbox`] needs at execution time.
+#[derive(Clone)]
 pub struct SandboxConfig<'a> {
     pub project_dir: &'a Path,
     /// Repositories named with `--repo-dir` / `sandbox.repo_dirs`.
@@ -214,6 +232,10 @@ pub struct SandboxConfig<'a> {
     /// through a symlink inside `~/.cache` rather than grant its target with a
     /// warning. Linux only; see [`validate_cache_exec_dirs`].
     pub refuse_cache_exec_links: bool,
+    /// `sandbox.deny_key_files_by_extension`: deny `*.pem`, `*.key`, `*.p12`,
+    /// `*.pfx` and `*.jks` by extension, not only files named exactly `.pem`.
+    /// macOS only; Linux has no name-pattern denies.
+    pub deny_key_files_by_extension: bool,
     /// `sandbox.deny_copilot_dir_exec` (#324). The grant itself is withdrawn
     /// in `agent_dirs` before this config is built; the flag is here so the
     /// Linux launch can warn about what Landlock unions back in.
@@ -403,9 +425,21 @@ pub fn prepare_with_pnpm_shadow(
             shadow.display()
         ));
     }
-    // The named roots' resolved gitdirs join the write grants' here: they are
-    // granted (see `named_root_git_dirs`) and therefore need the same
-    // persistence denies and the same bubblewrap read-only binds.
+    prepare_impl(
+        config,
+        &launch_git_dirs(config),
+        pnpm_shadow_dir,
+        inspect_only,
+        &canonical_grants,
+    )
+}
+
+/// The gitdirs a launch protects beyond the project's own.
+///
+/// The named roots' resolved gitdirs join the write grants' here: they are
+/// granted (see `named_root_git_dirs`) and therefore need the same
+/// persistence denies and the same bubblewrap read-only binds.
+fn launch_git_dirs(config: &SandboxConfig) -> Vec<PathBuf> {
     let mut git_dirs = extra_git_dirs(config.extra_write);
     for dir in config.named_root_git_dirs {
         if !git_dirs.contains(dir) {
@@ -414,13 +448,7 @@ pub fn prepare_with_pnpm_shadow(
     }
     git_dirs.sort();
     git_dirs.dedup();
-    prepare_impl(
-        config,
-        &git_dirs,
-        pnpm_shadow_dir,
-        inspect_only,
-        &canonical_grants,
-    )
+    git_dirs
 }
 
 fn validate_pnpm_tool_dirs(config: &SandboxConfig) -> Result<(), String> {
@@ -2046,6 +2074,132 @@ fn create_missing_home_config(config: &SandboxConfig, inspect_only: bool) -> Vec
     made
 }
 
+/// Everything `bubblewrap::resolve` is handed, computed in one place so the
+/// launch and `cplt doctor`'s probe ([`bubblewrap_probe::test_launch`]) build
+/// the same wrapper: a probe against fewer mounts than the launch uses can
+/// pass where the launch's fails and falls back to Landlock only.
+#[cfg(target_os = "linux")]
+struct BwrapPlan {
+    policy: LandlockPolicy,
+    nested_repos: Vec<PathBuf>,
+    nested_capped: bool,
+    credential_links: Vec<landlock_mod::CredentialLink>,
+    credential_targets: Vec<PathBuf>,
+    ro_protect: Vec<PathBuf>,
+    pins: Vec<PathBuf>,
+    deny_masks: bubblewrap::DenyMasks,
+}
+
+#[cfg(target_os = "linux")]
+fn bwrap_plan(
+    config: &SandboxConfig,
+    extra_git_dirs: &[PathBuf],
+    canonical_grants: &[(PathBuf, PathBuf)],
+) -> BwrapPlan {
+    let mut policy = landlock_mod::generate_policy(config);
+    // The cache-exec and Cypress state rules name the canonical paths
+    // validation checked, and are opened without following any symlink.
+    // A cache-exec entry whose link sits inside `~/.cache` is never
+    // precreated: the agent can plant that link, and creating its target
+    // would let it make a directory the host loads from (`~/.config/systemd/
+    // user`) for a later session to fill.
+    let cache_base = config.home_dir.join(".cache");
+    let actual_cache = crate::config::canonicalize_deepest(&cache_base);
+    for rule in policy.fs_rules.iter_mut().filter(|r| r.nofollow) {
+        if let Some((_, real)) = canonical_grants
+            .iter()
+            .find(|(named, _)| *named == rule.path)
+        {
+            let linked_entry = rule
+                .path
+                .strip_prefix(&cache_base)
+                .is_ok_and(|rel| *real != actual_cache.join(rel));
+            if linked_entry {
+                policy.precreate_dirs.retain(|dir| *dir != rule.path);
+            }
+            for dir in &mut policy.precreate_dirs {
+                if *dir == rule.path {
+                    dir.clone_from(real);
+                }
+            }
+            rule.path.clone_from(real);
+        }
+    }
+    // Repositories nested inside a writable root, found once and given to BOTH
+    // path sets. The leaf binds and the rename pins have to see the same list:
+    // a read-only bind pins content, not the name, so a nested `.git` that is
+    // bound but not pinned can be renamed aside and recreated writable —
+    // GHSA-39xf-9j26-f82m one directory down (#498 review).
+    let (nested_repos, nested_capped) = {
+        let (write_roots, _) = git_roots(config, extra_git_dirs);
+        bubblewrap::nested_repo_roots(&write_roots)
+    };
+    // #551: a credential entry linked into a granted tree (`~/.ssh ->
+    // ~/dotfiles/ssh` with the dotfiles repo as the project) is readable at
+    // its target, and Landlock cannot take that back. Bubblewrap masks it
+    // there, and pins the directories above it so `mv ssh ssh2 && mkdir ssh`
+    // cannot swap in a fresh one under the link.
+    let credential_links = landlock_mod::credential_links(config.home_dir, &policy.fs_rules);
+    let credential_targets: Vec<PathBuf> =
+        credential_links.iter().map(|l| l.target.clone()).collect();
+    let (ro_protect, pins) =
+        overlay_paths(config, extra_git_dirs, &nested_repos, &credential_targets);
+
+    // Deny-path masks: Landlock cannot deny subpaths within allowed
+    // directories, but Bubblewrap can shadow them at the mount level — denied
+    // files read as EACCES, denied dirs read as empty (macOS gives EACCES for
+    // both; the content is unreachable either way).
+    // Built-in UNIX-socket masks (Finding A): D-Bus, systemd's private socket
+    // and — unless --allow-docker — the container-runtime sockets. Each is an
+    // escape *out of* the sandbox, and below kernel 7.1 Landlock cannot gate
+    // connect(2) to a pathname socket at all, so a bwrap mount mask is the only
+    // thing that can take them away. Non-existent entries are dropped here so
+    // they never show up in the "could not be mount-masked" warning; the masks
+    // are only ever applied when bwrap actually wraps the run.
+    let socket_masks: Vec<PathBuf> = policy::socket_mask_paths(
+        config.home_dir,
+        policy::current_uid(),
+        policy::xdg_runtime_dir_env().as_deref(),
+        config.allow_docker,
+    )
+    .into_iter()
+    .filter(|p| p.exists())
+    .collect();
+    let deny_masks = bubblewrap::build_deny_masks(
+        config.extra_deny,
+        &socket_masks,
+        &credential_links,
+        config.scratch_dir,
+    );
+    BwrapPlan {
+        policy,
+        nested_repos,
+        nested_capped,
+        credential_links,
+        credential_targets,
+        ro_protect,
+        pins,
+        deny_masks,
+    }
+}
+
+/// The read-only binds and the rename pins. Built again after #553 creates
+/// files, since both sets only cover paths that exist.
+#[cfg(target_os = "linux")]
+fn overlay_paths(
+    config: &SandboxConfig,
+    extra_git_dirs: &[PathBuf],
+    nested_repos: &[PathBuf],
+    credential_targets: &[PathBuf],
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let ro_protect = ro_protect_paths(config, extra_git_dirs, nested_repos);
+    let mut pins = pin_paths(config, extra_git_dirs, nested_repos);
+    pins.extend(home_config_target_pins(config, credential_targets));
+    pins.sort();
+    pins.dedup();
+    (ro_protect, pins)
+}
+
 #[cfg(target_os = "linux")]
 fn prepare_impl(
     config: &SandboxConfig,
@@ -2098,6 +2252,13 @@ fn prepare_impl(
              ends, not blocked.",
         );
     }
+    if config.deny_key_files_by_extension {
+        ui::warn(
+            "sandbox.deny_key_files_by_extension has no effect on Linux: Landlock \
+             cannot deny files by name pattern, so .pem, .key, .p12, .pfx and .jks \
+             files in the project stay readable.",
+        );
+    }
     if config.allow_docker {
         ui::warn(
             "--allow-docker on Linux grants the Docker/Podman daemon sockets and \
@@ -2124,35 +2285,16 @@ fn prepare_impl(
         );
     }
 
-    let mut policy = landlock_mod::generate_policy(config);
-    // The cache-exec and Cypress state rules name the canonical paths
-    // validation checked, and are opened without following any symlink.
-    // A cache-exec entry whose link sits inside `~/.cache` is never
-    // precreated: the agent can plant that link, and creating its target
-    // would let it make a directory the host loads from (`~/.config/systemd/
-    // user`) for a later session to fill.
-    let cache_base = config.home_dir.join(".cache");
-    let actual_cache = crate::config::canonicalize_deepest(&cache_base);
-    for rule in policy.fs_rules.iter_mut().filter(|r| r.nofollow) {
-        if let Some((_, real)) = canonical_grants
-            .iter()
-            .find(|(named, _)| *named == rule.path)
-        {
-            let linked_entry = rule
-                .path
-                .strip_prefix(&cache_base)
-                .is_ok_and(|rel| *real != actual_cache.join(rel));
-            if linked_entry {
-                policy.precreate_dirs.retain(|dir| *dir != rule.path);
-            }
-            for dir in &mut policy.precreate_dirs {
-                if *dir == rule.path {
-                    dir.clone_from(real);
-                }
-            }
-            rule.path.clone_from(real);
-        }
-    }
+    let BwrapPlan {
+        mut policy,
+        nested_repos,
+        nested_capped,
+        credential_links,
+        credential_targets,
+        mut ro_protect,
+        mut pins,
+        deny_masks,
+    } = bwrap_plan(config, extra_git_dirs, canonical_grants);
     let mut profile_text = landlock_mod::describe_policy(&policy);
 
     // A withdrawn grant another rule quietly gives back is said out loud
@@ -2168,62 +2310,6 @@ fn prepare_impl(
             ui::warn(&w);
         }
     }
-
-    // Repositories nested inside a writable root, found once and given to BOTH
-    // path sets. The leaf binds and the rename pins have to see the same list:
-    // a read-only bind pins content, not the name, so a nested `.git` that is
-    // bound but not pinned can be renamed aside and recreated writable —
-    // GHSA-39xf-9j26-f82m one directory down (#498 review).
-    let (nested_repos, nested_capped) = {
-        let (write_roots, _) = git_roots(config, extra_git_dirs);
-        bubblewrap::nested_repo_roots(&write_roots)
-    };
-    // #551: a credential entry linked into a granted tree (`~/.ssh ->
-    // ~/dotfiles/ssh` with the dotfiles repo as the project) is readable at
-    // its target, and Landlock cannot take that back. Bubblewrap masks it
-    // there, and pins the directories above it so `mv ssh ssh2 && mkdir ssh`
-    // cannot swap in a fresh one under the link.
-    let credential_links = landlock_mod::credential_links(config.home_dir, &policy.fs_rules);
-    let credential_targets: Vec<PathBuf> =
-        credential_links.iter().map(|l| l.target.clone()).collect();
-    // Built again after #553 creates files below, since both sets only cover
-    // paths that exist.
-    let overlay_paths = || {
-        let ro_protect = ro_protect_paths(config, extra_git_dirs, &nested_repos);
-        let mut pins = pin_paths(config, extra_git_dirs, &nested_repos);
-        pins.extend(home_config_target_pins(config, &credential_targets));
-        pins.sort();
-        pins.dedup();
-        (ro_protect, pins)
-    };
-    let (mut ro_protect, mut pins) = overlay_paths();
-
-    // Deny-path masks: Landlock cannot deny subpaths within allowed
-    // directories, but Bubblewrap can shadow them at the mount level — denied
-    // files read as EACCES, denied dirs read as empty (macOS gives EACCES for
-    // both; the content is unreachable either way).
-    // Built-in UNIX-socket masks (Finding A): D-Bus, systemd's private socket
-    // and — unless --allow-docker — the container-runtime sockets. Each is an
-    // escape *out of* the sandbox, and below kernel 7.1 Landlock cannot gate
-    // connect(2) to a pathname socket at all, so a bwrap mount mask is the only
-    // thing that can take them away. Non-existent entries are dropped here so
-    // they never show up in the "could not be mount-masked" warning; the masks
-    // are only ever applied when bwrap actually wraps the run.
-    let socket_masks: Vec<PathBuf> = policy::socket_mask_paths(
-        config.home_dir,
-        policy::current_uid(),
-        policy::xdg_runtime_dir_env().as_deref(),
-        config.allow_docker,
-    )
-    .into_iter()
-    .filter(|p| p.exists())
-    .collect();
-    let deny_masks = bubblewrap::build_deny_masks(
-        config.extra_deny,
-        &socket_masks,
-        &credential_links,
-        config.scratch_dir,
-    );
 
     // Decide bubblewrap wrapping before `precompute()` consumes `policy`.
     // `resolve()` only clones `fs_rules`/`net_rules` on the arms that actually
@@ -2258,7 +2344,8 @@ fn prepare_impl(
             }
             profile_text.push('\n');
         } else if !made.is_empty() {
-            (ro_protect, pins) = overlay_paths();
+            (ro_protect, pins) =
+                overlay_paths(config, extra_git_dirs, &nested_repos, &credential_targets);
             let overlays = bubblewrap::Overlays {
                 read_only: &ro_protect,
                 pins: &pins,
@@ -2706,6 +2793,7 @@ mod tests {
             deny_clipboard: false,
             deny_nested_git: false,
             refuse_cache_exec_links: false,
+            deny_key_files_by_extension: false,
             deny_copilot_dir_exec: false,
             allow_jvm_attach: false,
             allow_msbuild: false,
@@ -3446,6 +3534,102 @@ mod tests {
         config.managed_worktree_root = Some(&root);
         let err = super::validate_config_paths(&config).expect_err("must refuse");
         assert!(err.contains("Managed worktree root"), "{err}");
+    }
+
+    /// `cplt doctor` must probe the wrapper the launch builds, not an empty
+    /// one: a mount only the launch has (here a deny mask) can fail the
+    /// launch's probe, which auto mode answers by falling back to Landlock,
+    /// while the empty probe passes and doctor would say "active".
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn doctor_bubblewrap_state_probes_the_launch_mounts() {
+        let Some(bwrap) = bubblewrap::check_availability() else {
+            eprintln!("skipped: bwrap not installed");
+            return;
+        };
+        let tmp = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let home = root.join("home");
+        let project = root.join("project");
+        let secret = project.join("secret");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        std::fs::create_dir_all(&secret).expect("mkdir secret");
+        let deny = [secret.clone()];
+        let mut config = test_config(&home, &[]);
+        config.project_dir = &project;
+        config.extra_deny = &deny;
+
+        assert!(
+            crate::doctor::bubblewrap_state(None, false, &config).active(),
+            "control: bwrap must work here for this test to mean anything"
+        );
+        bubblewrap::FAIL_PROBE_ON.set(Some(secret.to_string_lossy().into_owned()));
+        let empty = bubblewrap::test_functionality(
+            &bwrap,
+            &[],
+            bubblewrap::Overlays::default(),
+            &bubblewrap::DenyMasks::default(),
+        );
+        let state = crate::doctor::bubblewrap_state(None, false, &config);
+        let launch = prepare(&config).expect("prepare");
+        bubblewrap::FAIL_PROBE_ON.set(None);
+
+        assert!(empty.is_ok(), "the empty probe does not see the mask");
+        assert!(launch.bwrap_wrapper.is_none(), "the launch falls back");
+        assert_eq!(
+            state,
+            crate::doctor::Bubblewrap::Unusable {
+                path: bwrap,
+                reason: "bwrap: forced by test".to_string(),
+            },
+            "doctor must agree with the launch"
+        );
+    }
+
+    /// A file deny mask needs the session scratch dir for its placeholder, and
+    /// doctor's config has none. The probe must make one, or it never sees the
+    /// launch's file masks — and must leave nothing behind.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn doctor_bubblewrap_state_probes_file_deny_masks() {
+        let Some(bwrap) = bubblewrap::check_availability() else {
+            eprintln!("skipped: bwrap not installed");
+            return;
+        };
+        let tmp = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let home = root.join("home");
+        let project = root.join("project");
+        let secret = project.join(".netrc");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        std::fs::create_dir_all(&project).expect("mkdir project");
+        std::fs::write(&secret, "machine x").expect("write secret");
+        let deny = [secret.clone()];
+        let mut config = test_config(&home, &[]);
+        config.project_dir = &project;
+        config.extra_deny = &deny;
+
+        bubblewrap::FAIL_PROBE_ON.set(Some(secret.to_string_lossy().into_owned()));
+        let no_scratch = crate::doctor::bubblewrap_state(None, false, &config);
+        let state = crate::doctor::bubblewrap_state(None, true, &config);
+        bubblewrap::FAIL_PROBE_ON.set(None);
+
+        assert!(
+            no_scratch.active(),
+            "control: with scratch off the launch drops file masks too"
+        );
+        assert_eq!(
+            state,
+            crate::doctor::Bubblewrap::Unusable {
+                path: bwrap,
+                reason: "bwrap: forced by test".to_string(),
+            },
+            "the file mask must reach doctor's probe"
+        );
+        assert!(
+            !home.join(".cache").exists(),
+            "the probe's scratch dir and the ancestors it made are removed"
+        );
     }
 
     /// #553: files are created only once Bubblewrap will wrap the run. With

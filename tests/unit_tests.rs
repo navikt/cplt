@@ -832,6 +832,7 @@ fn landlock_policy_device_files_have_ioctl() {
         deny_clipboard: false,
         deny_nested_git: false,
         refuse_cache_exec_links: false,
+        deny_key_files_by_extension: false,
         deny_copilot_dir_exec: false,
         allow_jvm_attach: false,
         allow_msbuild: false,
@@ -2158,6 +2159,159 @@ fn the_env_deny_is_lifted_for_read_inside_dependency_stores_only() {
     );
 }
 
+/// With `sandbox.deny_key_files_by_extension`, the wider key file patterns get
+/// the same read carve-out in dependency stores, after the deny. The deny is
+/// scoped to granted trees, so it reaches a store only through a grant that
+/// covers it, such as `allow.read = ["~"]`.
+#[test]
+fn key_file_extension_denies_are_lifted_for_read_inside_dependency_stores() {
+    let home = [PathBuf::from("/Users/test")];
+    let profile = generate_profile(
+        &SandboxConfig {
+            extra_read: &home,
+            deny_key_files_by_extension: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    let deny = profile
+        .find(r#"(deny file-read* (regex #"^/Users/test/(.*/)?[^/]*\.pem$"))"#)
+        .expect("the deny stands");
+    let allow = profile
+        .find(r#"(allow file-read* (regex #"^/Users/test/go/pkg/mod/.*/[^/]*\.pem$"))"#)
+        .expect("the carve-out is emitted");
+    assert!(
+        allow > deny,
+        "last match wins, so the carve-out must be later"
+    );
+    assert!(
+        !profile.contains(r#"(allow file-write* (regex #"^/Users/test/go/pkg/mod/.*/[^/]*\."#),
+        "write must stay denied\n{profile}"
+    );
+}
+
+/// A user deny inside a store wins over the key file carve-out, as it does
+/// for the `.env` one (#597): the read deny is repeated after the carve-out,
+/// narrowed to the denied module, so the rest of the store keeps it. Without
+/// this, `--deny-path` on a module would leave its `server.pem` readable once
+/// the key is on.
+#[test]
+fn a_deny_path_inside_a_dependency_store_beats_the_key_file_carve_out() {
+    let deny = vec![PathBuf::from("/Users/test/go/pkg/mod/example.com/x@v1")];
+    let profile = generate_profile(
+        &SandboxConfig {
+            extra_deny: &deny,
+            deny_key_files_by_extension: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    let allow = profile
+        .rfind(r#"(allow file-read* (regex #"^/Users/test/go/pkg/mod/.*/[^/]*\.pem$"))"#)
+        .expect("the rest of the store keeps its carve-out");
+    let redeny = profile
+        .rfind(r#"(deny file-read* (subpath "/Users/test/go/pkg/mod/example.com/x@v1"))"#)
+        .expect("the deny path is repeated");
+    assert!(
+        redeny > allow,
+        "last match wins, so the deny path must be repeated after the carve-out\n{profile}"
+    );
+    assert!(
+        !profile.contains("sandbox.deny_key_files_by_extension re-allow withheld"),
+        "nothing is withheld store-wide\n{profile}"
+    );
+}
+
+/// #597: a `--deny-path` in or above a dependency store must win over the
+/// #477 carve-out. The user deny is emitted before the carve-out, so a read
+/// deny is repeated after the last re-allow, narrowed to the overlap: the
+/// deny itself when it is inside the store, the store when the deny is above
+/// it. An unrelated deny is not repeated.
+#[test]
+fn a_user_deny_in_a_dependency_store_beats_the_env_carve_out() {
+    for (deny, scope, tree, repeated) in [
+        (
+            "/Users/test/go/pkg/mod/ex@v1",
+            "/Users/test/go/pkg/mod/ex@v1",
+            "go/pkg/mod",
+            true,
+        ),
+        (
+            "/Users/test/go",
+            "/Users/test/go/pkg/mod",
+            "go/pkg/mod",
+            true,
+        ),
+        (
+            "/Users/test/.cargo/registry/src",
+            "/Users/test/.cargo/registry/src",
+            "\\.cargo/registry",
+            true,
+        ),
+        (
+            "/Users/test/.gradle",
+            "/Users/test/.gradle",
+            "go/pkg/mod",
+            false,
+        ),
+    ] {
+        let extra_deny = [PathBuf::from(deny)];
+        let profile = generate_profile(
+            &SandboxConfig {
+                extra_deny: &extra_deny,
+                ..base_profile_options()
+            },
+            &[],
+        );
+        let rule = format!("(deny file-read* (subpath \"{scope}\"))");
+        let last_deny = profile.rfind(&rule).unwrap_or(0);
+        let last_allow = profile
+            .rfind(&format!("(allow file-read* (regex #\"^/Users/test/{tree}/"))
+            .expect("the carve-out is emitted");
+        assert_eq!(
+            last_deny > last_allow,
+            repeated,
+            "--deny-path {deny}: {scope} read deny after the carve-out should be {repeated}\n{profile}"
+        );
+        // The ancestor itself is not re-denied after the carve-out.
+        let own = format!("(deny file-read* (subpath \"{deny}\"))");
+        assert_eq!(
+            profile.matches(&own).count(),
+            usize::from(repeated && deny == scope) + 1
+        );
+    }
+}
+
+/// #597 review: a deny above both stores (`--deny-path ~`) is repeated once
+/// per store, narrowed to it, and never as the whole ancestor.
+#[test]
+fn a_user_deny_above_both_stores_is_repeated_once_per_store() {
+    let extra_deny = [PathBuf::from("/Users/test")];
+    let profile = generate_profile(
+        &SandboxConfig {
+            extra_deny: &extra_deny,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    assert_eq!(
+        profile
+            .matches("(deny file-read* (subpath \"/Users/test\"))")
+            .count(),
+        1,
+        "the ancestor deny is emitted once, by the user deny rules\n{profile}"
+    );
+    for store in ["/Users/test/go/pkg/mod", "/Users/test/.cargo/registry"] {
+        assert_eq!(
+            profile
+                .matches(&format!("(deny file-read* (subpath \"{store}\"))"))
+                .count(),
+            1,
+            "{store} must be re-denied exactly once\n{profile}"
+        );
+    }
+}
+
 /// A relocated `GOPATH` / `CARGO_HOME` must move the carve-out with it.
 ///
 /// The trees are named by their `HOME_TOOL_DIRS` entry plus a subpath, because
@@ -2491,6 +2645,7 @@ fn base_profile_options() -> SandboxConfig<'static> {
         deny_clipboard: false,
         deny_nested_git: false,
         refuse_cache_exec_links: false,
+        deny_key_files_by_extension: false,
         deny_copilot_dir_exec: false,
         allow_jvm_attach: false,
         allow_msbuild: false,
@@ -3258,6 +3413,100 @@ fn profile_allows_env_files_when_flag_set() {
     );
 }
 
+const KEY_FILE_EXTENSIONS: &[&str] = &["pem", "key", "p12", "pfx", "jks"];
+
+#[test]
+fn profile_omits_key_file_extension_denies_by_default() {
+    let p = generate_profile(
+        &SandboxConfig {
+            ..base_profile_options()
+        },
+        &[],
+    );
+    assert!(
+        !p.contains(r"[^/]*\."),
+        "key file extension denies must be absent when the key is unset: {p}"
+    );
+}
+
+#[test]
+fn profile_denies_key_files_by_extension_when_enabled() {
+    let write = [PathBuf::from("/work/sibling")];
+    let read = [PathBuf::from("/data/certs")];
+    let p = generate_profile(
+        &SandboxConfig {
+            extra_write: &write,
+            extra_read: &read,
+            deny_key_files_by_extension: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    let project_allow = p
+        .find("(allow file-read* (subpath \"/projects/app\"))")
+        .unwrap();
+    for r in ["/projects/app", "/work/sibling", "/data/certs"] {
+        for ext in KEY_FILE_EXTENSIONS {
+            let read = format!(r#"(deny file-read* (regex #"^{r}/(.*/)?[^/]*\.{ext}$"))"#);
+            let write = format!(r#"(deny file-write* (regex #"^{r}/(.*/)?[^/]*\.{ext}$"))"#);
+            let read_at = p
+                .find(&read)
+                .unwrap_or_else(|| panic!("missing {read}: {p}"));
+            let write_at = p
+                .find(&write)
+                .unwrap_or_else(|| panic!("missing {write}: {p}"));
+            assert!(
+                read_at > project_allow && write_at > project_allow,
+                "{ext} deny must come AFTER project allow for SBPL last-match-wins"
+            );
+        }
+    }
+    // Never global: `/etc/ssl/cert.pem` and every other CA bundle must stay
+    // readable, or TLS clients fail.
+    assert!(
+        !p.contains(r#"(regex #"/[^/]*\."#),
+        "the extension denies must be scoped to granted trees: {p}"
+    );
+    // The literal-name patterns stay; the new ones are additive.
+    assert!(p.contains(r#"(deny file-read* (regex #"/\.pem$"))"#));
+}
+
+/// The granted root is regex source in these denies: an unescaped `.` or `+`
+/// would match other paths, or none.
+#[test]
+fn profile_key_file_extension_denies_escape_the_root() {
+    let read = [PathBuf::from("/work/app.v1+x")];
+    let p = generate_profile(
+        &SandboxConfig {
+            extra_read: &read,
+            deny_key_files_by_extension: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    assert!(
+        p.contains(r#"(deny file-read* (regex #"^/work/app\.v1\+x/(.*/)?[^/]*\.pem$"))"#),
+        "the root must be regex-escaped: {p}"
+    );
+    assert!(!p.contains(r"^/work/app.v1+x/"), "no unescaped root: {p}");
+}
+
+#[test]
+fn profile_key_file_extension_denies_follow_allow_env_files() {
+    let p = generate_profile(
+        &SandboxConfig {
+            deny_key_files_by_extension: true,
+            allow_env_files: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    assert!(
+        !p.contains(r"[^/]*\."),
+        "allow_env_files turns off every sensitive-file pattern, including key files: {p}"
+    );
+}
+
 #[test]
 fn profile_env_deny_comes_after_project_allow() {
     let p = generate_profile(
@@ -3931,6 +4180,7 @@ fn allow_localhost_any_affects_both_backends() {
         deny_clipboard: false,
         deny_nested_git: false,
         refuse_cache_exec_links: false,
+        deny_key_files_by_extension: false,
         deny_copilot_dir_exec: false,
         allow_jvm_attach: false,
         allow_msbuild: false,
@@ -3998,6 +4248,7 @@ fn config_options_parity_across_backends() {
         deny_clipboard: false,
         deny_nested_git: false,
         refuse_cache_exec_links: false,
+        deny_key_files_by_extension: false,
         deny_copilot_dir_exec: false,
         allow_jvm_attach: true,
         allow_msbuild: false,
@@ -4473,6 +4724,143 @@ fn profile_keeps_the_sibling_package_and_cache_trees_writable() {
     ] {
         assert!(p.contains(rule), "{what} must stay writable: {rule}");
     }
+}
+
+/// #597 class: the pnpm store write allows are emitted after the user's
+/// denies, so a `--deny-path` overlapping a store withholds its allow instead
+/// of reopening writes under the deny. Checked per store and per shape.
+#[test]
+fn a_user_deny_over_a_pnpm_store_withholds_its_write_allow() {
+    let allow = |p: &str| format!("(allow file-write* (subpath \"/Users/test/{p}\"))");
+    for (deny, withheld, kept) in [
+        (
+            "/Users/test/Library/pnpm",
+            &["Library/pnpm/store", "Library/pnpm/package-manager-store"][..],
+            &[
+                ".local/share/pnpm/store",
+                ".local/share/pnpm/package-manager-store",
+            ][..],
+        ),
+        (
+            "/Users/test/Library",
+            &["Library/pnpm/store", "Library/pnpm/package-manager-store"][..],
+            &[".local/share/pnpm/store"][..],
+        ),
+        (
+            "/Users/test/.local/share/pnpm",
+            &[
+                ".local/share/pnpm/store",
+                ".local/share/pnpm/package-manager-store",
+            ][..],
+            &["Library/pnpm/store"][..],
+        ),
+    ] {
+        let extra_deny = [PathBuf::from(deny)];
+        let p = generate_profile(
+            &SandboxConfig {
+                extra_deny: &extra_deny,
+                ..base_profile_options()
+            },
+            &[],
+        );
+        // The tool-dir grants allow the stores too, but before the user
+        // denies; only an allow in the PATH-bin block would reopen them.
+        let block = p
+            .find(";; PATH-resolved bin/shim dirs stay read-only")
+            .expect("the PATH-bin block is emitted");
+        let after_block = |r: &str| p.rfind(&allow(r)).is_some_and(|i| i > block);
+        for w in withheld {
+            assert!(!after_block(w), "--deny-path {deny} must withhold {w}\n{p}");
+            assert!(
+                p.contains(&format!(
+                    ";; pnpm store re-allow withheld: --deny-path {deny} overlaps /Users/test/{w}"
+                )),
+                "--deny-path {deny}: breadcrumb for {w}"
+            );
+        }
+        for k in kept {
+            assert!(after_block(k), "--deny-path {deny} must keep {k}");
+        }
+    }
+}
+
+/// A deny inside a pnpm store keeps the store's write allow for the rest of
+/// the store and repeats itself, read and write, right after that allow.
+#[test]
+fn a_user_deny_inside_a_pnpm_store_is_repeated_after_its_write_allow() {
+    let deny = "/Users/test/Library/pnpm/store/v10";
+    let extra_deny = [PathBuf::from(deny)];
+    let p = generate_profile(
+        &SandboxConfig {
+            extra_deny: &extra_deny,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    let allow = r#"(allow file-write* (subpath "/Users/test/Library/pnpm/store"))"#;
+    let block = p
+        .find(";; PATH-resolved bin/shim dirs stay read-only")
+        .expect("the PATH-bin block is emitted");
+    let at = p[block..].find(allow).map(|i| i + block);
+    let at = at.unwrap_or_else(|| panic!("the store allow is kept\n{p}"));
+    let tail = &p[at + allow.len()..];
+    let expect = format!(
+        "\n(deny file-read* (subpath \"{deny}\"))\n(deny file-write* (subpath \"{deny}\"))\n"
+    );
+    assert!(
+        tail.starts_with(&expect),
+        "the deny follows the store allow\n{p}"
+    );
+    assert!(!p.contains("re-allow withheld"), "nothing is withheld\n{p}");
+}
+
+/// #597 class: the read allow for a relocated Copilot `pkg` is emitted after
+/// the user's denies, so a `--deny-path` at or above it withholds it, and one
+/// inside it is repeated right after it.
+/// (`validate_copilot_cache_env` also refuses that launch.)
+#[test]
+fn a_user_deny_over_a_moved_copilot_pkg_withholds_its_read_allow() {
+    let env = cache_env(&[("COPILOT_CACHE_HOME", "/opt/copilot-cache")]);
+    let read = "(allow file-read* (subpath \"/opt/copilot-cache/pkg\"))";
+    for (deny, withheld) in [
+        ("/opt", true),
+        ("/opt/copilot-cache/pkg", true),
+        ("/opt/copilot-cache/pkg/x", false),
+        ("/opt/other", false),
+    ] {
+        let extra_deny = [PathBuf::from(deny)];
+        let p = generate_profile(
+            &SandboxConfig {
+                copilot_cache_env: &env,
+                extra_deny: &extra_deny,
+                ..base_profile_options()
+            },
+            &[],
+        );
+        assert_eq!(!p.contains(read), withheld, "--deny-path {deny}\n{p}");
+        assert_eq!(
+            p.contains(";; Copilot pkg re-allow withheld"),
+            withheld,
+            "--deny-path {deny}: breadcrumb"
+        );
+    }
+    let deny = "/opt/copilot-cache/pkg/x";
+    let extra_deny = [PathBuf::from(deny)];
+    let p = generate_profile(
+        &SandboxConfig {
+            copilot_cache_env: &env,
+            extra_deny: &extra_deny,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    let redeny = format!(
+        "{read}\n(deny file-read* (subpath \"{deny}\"))\n(deny file-write* (subpath \"{deny}\"))\n"
+    );
+    assert!(
+        p.contains(&redeny),
+        "a deny inside pkg follows its allow\n{p}"
+    );
 }
 
 #[test]
@@ -9348,6 +9736,7 @@ fn no_pasteboard_rule_when_deny_clipboard_is_off() {
             deny_clipboard: false,
             deny_nested_git: false,
             refuse_cache_exec_links: false,
+            deny_key_files_by_extension: false,
             deny_copilot_dir_exec: false,
             ..base_profile_options()
         },
@@ -9485,6 +9874,7 @@ allow_msbuild = false
 gradle_init = false
 deny_nested_git = false
 refuse_cache_exec_links = false
+deny_key_files_by_extension = false
 refuse_invalid_repo_config = false
 deny_copilot_dir_exec = false
 allow_docker = false
@@ -9965,6 +10355,7 @@ fn landlock_relocated_cargo_bin_is_exec_only_and_registry_is_precreated() {
         deny_clipboard: false,
         deny_nested_git: false,
         refuse_cache_exec_links: false,
+        deny_key_files_by_extension: false,
         deny_copilot_dir_exec: false,
         allow_jvm_attach: false,
         allow_msbuild: false,

@@ -2029,6 +2029,25 @@ fn warn_unknown_repo_config_keys(config: &repo_config::RepoConfig, label: &str) 
     ));
 }
 
+/// Warn about `deny.paths` entries that look like a glob, which cplt takes as
+/// one literal path. `globs` comes from `repo_config::glob_like_deny_paths`.
+fn warn_glob_like_deny_paths(globs: &[&str], label: &str) {
+    if globs.is_empty() {
+        return;
+    }
+    let entries = globs
+        .iter()
+        .map(|p| format!("{p:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let verb = if globs.len() == 1 { "denies" } else { "deny" };
+    ui::warn(&format!(
+        "{label}: cplt does not expand globs in deny.paths. {entries} {verb} \
+         nothing unless a file or directory has exactly that name. Name each \
+         file or directory instead, for example \"certs/server.pem\" or \"certs\"."
+    ));
+}
+
 /// `gh_guard.inject_token` does nothing while the guard is off.
 ///
 /// The injection happens inside the `gh_guard.enabled` branch of the wrapper
@@ -2443,6 +2462,10 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                 ui::info(&format!("Repo config: .cplt.toml{source_note}"));
             }
             warn_unknown_repo_config_keys(&loaded.config, ".cplt.toml");
+            warn_glob_like_deny_paths(
+                &repo_config::glob_like_deny_paths(&loaded.config, &loaded.dir),
+                ".cplt.toml",
+            );
             // An unknown `[deny]` key is a restriction that is not applied,
             // the same loss as a file that does not parse. Unknown `[propose]`
             // keys grant nothing and stay forward-compatible.
@@ -2641,9 +2664,11 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                         ));
                     }
                 }
-                warn_unknown_repo_config_keys(
-                    &loaded.config,
-                    &root.dir.join(".cplt.toml").display().to_string(),
+                let label = root.dir.join(".cplt.toml").display().to_string();
+                warn_unknown_repo_config_keys(&loaded.config, &label);
+                warn_glob_like_deny_paths(
+                    &repo_config::glob_like_deny_paths(&loaded.config, &loaded.dir),
+                    &label,
                 );
                 if resolved.refuse_invalid_repo_config
                     && repo_config::has_unknown_tightening_keys(&loaded.config)
@@ -4069,27 +4094,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // can be included in the sandbox profile. Failure is deferred —
     // --print-profile doesn't need the binary.
     let agent_bin_result = active_agent.resolve_binary();
-    let copilot_install_dir = if active_agent == agent::Agent::Copilot {
-        agent_bin_result
-            .as_ref()
-            .ok()
-            .and_then(|p| {
-                // Try package.json discovery first (npm/Homebrew installs)
-                discover::copilot_pkg_dir(p, &home_dir).or_else(|| {
-                    // Fallback: use the binary's parent directory (VS Code extension installs
-                    // at ~/Library/Application Support/Code/.../copilotCli/copilot)
-                    p.parent().map(std::path::Path::to_path_buf)
-                })
-            })
-            .filter(|d| !crate::is_unsafe_root(d, &home_dir))
-    } else {
-        // Non-Copilot agents: use binary's parent dir for read + map-exec
-        agent_bin_result
-            .as_ref()
-            .ok()
-            .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
-            .filter(|d| !crate::is_unsafe_root(d, &home_dir))
-    };
+    let copilot_install_dir = agent_install_dir(active_agent, &agent_bin_result, &home_dir);
 
     // Discover Electron app bundle when Copilot CLI is installed via VS Code.
     // macOS-only: the shim invokes VS Code's Electron runtime, which needs
@@ -5450,6 +5455,7 @@ fn build_sandbox_config<'a>(
         deny_clipboard: resolved.deny_clipboard,
         deny_nested_git: resolved.deny_nested_git,
         refuse_cache_exec_links: resolved.refuse_cache_exec_links,
+        deny_key_files_by_extension: resolved.deny_key_files_by_extension,
         deny_copilot_dir_exec: resolved.deny_copilot_dir_exec,
         allow_jvm_attach: resolved.allow_jvm_attach,
         allow_msbuild: resolved.allow_msbuild,
@@ -6244,7 +6250,7 @@ fn run_check_command(
 /// without a commit yet, or no git at all, is not something to report as a
 /// finding.
 #[allow(clippy::disallowed_methods)] // `git` is a git::trusted_git() path, resolved immediately above
-fn tracked_sensitive_files(project_dir: &Path) -> Vec<String> {
+fn tracked_sensitive_files(project_dir: &Path, key_files_by_extension: bool) -> Vec<String> {
     let Some(git) = cplt::git::trusted_git() else {
         return Vec::new();
     };
@@ -6264,7 +6270,12 @@ fn tracked_sensitive_files(project_dir: &Path) -> Vec<String> {
     String::from_utf8_lossy(&out.stdout)
         .split('\0')
         .filter(|name| !name.is_empty())
-        .filter(|name| is_sensitive_basename(name.rsplit('/').next().unwrap_or(name)))
+        .filter(|name| {
+            is_sensitive_basename(
+                name.rsplit('/').next().unwrap_or(name),
+                key_files_by_extension,
+            )
+        })
         .map(str::to_string)
         .collect()
 }
@@ -6276,12 +6287,23 @@ fn tracked_sensitive_files(project_dir: &Path) -> Vec<String> {
 /// fixed shapes, so a `ends_with` each is the whole implementation — and
 /// `sensitive_basename_matches_the_profile_patterns` fails if the constant
 /// grows, so a new pattern cannot be silently unmatched here.
-fn is_sensitive_basename(base: &str) -> bool {
+///
+/// Key files match by exact name (`.pem`) unless `by_extension`
+/// (`sandbox.deny_key_files_by_extension`) is on, matching the profile.
+fn is_sensitive_basename(base: &str, by_extension: bool) -> bool {
+    const KEYS: [&str; 5] = [".pem", ".key", ".p12", ".pfx", ".jks"];
     base == ".env"
         || base.starts_with(".env.")
-        || [".pem", ".key", ".p12", ".pfx", ".jks"]
-            .iter()
-            .any(|ext| base.ends_with(ext))
+        || KEYS.contains(&base)
+        || (by_extension && KEYS.iter().any(|ext| base.ends_with(ext)))
+}
+
+/// Whether any of `files` is sensitive only through
+/// `sandbox.deny_key_files_by_extension` (`server.pem`, not `.pem` or `.env`).
+fn any_extension_only_match(files: &[String]) -> bool {
+    files
+        .iter()
+        .any(|f| !is_sensitive_basename(f.rsplit('/').next().unwrap_or(f), false))
 }
 
 /// Resolve a user-supplied check path to an absolute path without requiring it
@@ -6323,7 +6345,7 @@ fn build_battery(
     // hashes worktree files and the read deny aborts it. Worth checking for
     // two reasons at once — it is a git-hostile configuration *and* a secret
     // committed to the repository (#401).
-    for tracked in tracked_sensitive_files(project_dir) {
+    for tracked in tracked_sensitive_files(project_dir, resolved.deny_key_files_by_extension) {
         items.push(check::CheckItem {
             name: "tracked secret-shaped file".to_string(),
             category: "filesystem".to_string(),
@@ -6810,19 +6832,16 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
             };
             let findings = [Finding {
                 level: Level::Blocking,
-                // The error text can quote an absolute path — "cplt refuses
-                // to sandbox '/Users/hans'" — and this view gets pasted into
-                // public issues.
-                message: doctor::tilde_in_text(
-                    &message,
-                    &std::env::var("HOME").map_or_else(
-                        |_| std::path::PathBuf::from("/nonexistent"),
-                        std::path::PathBuf::from,
-                    ),
-                ),
+                message,
                 fix: None,
             }];
-            print!("{}", doctor::render(&findings, &[], false));
+            // The error text can quote an absolute path — "cplt refuses to
+            // sandbox '/Users/hans'" — which `render` hides.
+            let home = std::env::var("HOME").map_or_else(
+                |_| std::path::PathBuf::from("/nonexistent"),
+                std::path::PathBuf::from,
+            );
+            print!("{}", doctor::render(&findings, &[], false, &home));
             return ExitCode::FAILURE;
         }
     };
@@ -6957,8 +6976,65 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         ));
     }
 
+    // ── the policy a launch would build, for the rules below ──
+    let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
+    let mut agent_dirs = resolved.agent_config_dirs(active_agent, &home_dir);
+    agent::canonicalize_agent_dirs(&mut agent_dirs);
+    let keychain_substitute = cplt::sandbox::keychain_substitute(
+        active_agent,
+        &home_dir,
+        &resolved.deny_env,
+        resolved.keychain_substitute,
+    );
+    let doctor_pnpm = resolve_exec_binary("pnpm").ok();
+    let doctor_pnpm_shadowed = doctor_pnpm
+        .as_ref()
+        .is_some_and(|pnpm| scratch::pnpm_requires_shadow(&home_dir, pnpm).unwrap_or(false));
+    let mut doctor_exec = resolved.allow_exec.clone();
+    doctor_exec.extend(pnpm_exec_grants(
+        &home_dir,
+        doctor_pnpm.as_deref(),
+        doctor_pnpm_shadowed,
+        &project_dir,
+        &repo_paths,
+    ));
+    doctor_exec.sort();
+    doctor_exec.dedup();
+    let agent_bin_result = active_agent.resolve_binary();
+    let doctor_install_dir = agent_install_dir(active_agent, &agent_bin_result, &home_dir);
+    let doctor_electron_dir = discover_electron_app_dir(&agent_bin_result, active_agent);
+    let sandbox_config = build_sandbox_config(
+        &resolved,
+        &probe,
+        active_agent,
+        &agent_dirs,
+        NamedRepos::new(
+            &policy_roots,
+            &repo_git_dirs,
+            &repo_rows,
+            worktree_root.as_deref(),
+        ),
+        &doctor_exec,
+        // The scratch dir is the bubblewrap probe's own (see
+        // `doctor::bubblewrap_state`); the proxy port and Playwright socket
+        // dir add no mounts.
+        SessionPaths {
+            copilot_install_dir: doctor_install_dir.as_deref(),
+            electron_app_dir: doctor_electron_dir.as_deref(),
+            ..SessionPaths::default()
+        },
+        keychain_substitute,
+    );
+    let policy = sandbox::generate_policy(&sandbox_config);
+
     // ── enforcement: the regime, and why ──
-    let bubblewrap = doctor::bubblewrap_state(resolved.use_bubblewrap);
+    // After the policy: bubblewrap is probed with the wrapper the launch would
+    // build from it, not an empty one.
+    let bubblewrap = doctor::bubblewrap_state(
+        resolved.use_bubblewrap,
+        resolved.scratch_dir,
+        &sandbox_config,
+    );
     #[cfg(target_os = "macos")]
     {
         if Path::new("/usr/bin/sandbox-exec").exists() {
@@ -7004,54 +7080,24 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
                     "use_bubblewrap = true but {}: the launch refuses to start.",
                     bubblewrap.describe()
                 ),
-                "install bubblewrap into /usr/bin, enable user namespaces \
+                "install bubblewrap into a trusted system directory such as /usr/bin or \
+                 /usr/local/bin, enable user namespaces \
                  (sysctl kernel.unprivileged_userns_clone=1), or drop use_bubblewrap",
             ));
         }
+        findings.extend(doctor::bubblewrap_finding(
+            &bubblewrap,
+            resolved.use_bubblewrap,
+        ));
     }
-    let _ = &bubblewrap;
     println!();
 
-    // ── the policy a launch would build, for the rules below ──
-    let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
-    let mut agent_dirs = resolved.agent_config_dirs(active_agent, &home_dir);
-    agent::canonicalize_agent_dirs(&mut agent_dirs);
-    let keychain_substitute = cplt::sandbox::keychain_substitute(
-        active_agent,
-        &home_dir,
-        &resolved.deny_env,
-        resolved.keychain_substitute,
-    );
-    let doctor_pnpm = resolve_exec_binary("pnpm").ok();
-    let doctor_pnpm_shadowed = doctor_pnpm
-        .as_ref()
-        .is_some_and(|pnpm| scratch::pnpm_requires_shadow(&home_dir, pnpm).unwrap_or(false));
-    let mut doctor_exec = resolved.allow_exec.clone();
-    doctor_exec.extend(pnpm_exec_grants(
-        &home_dir,
-        doctor_pnpm.as_deref(),
-        doctor_pnpm_shadowed,
-        &project_dir,
-        &repo_paths,
+    findings.extend(doctor::wsl_drive_project_finding(&project_dir, wsl));
+    findings.extend(doctor::pts_grant_finding(
+        &policy,
+        bubblewrap.active(),
+        cfg!(target_os = "linux"),
     ));
-    doctor_exec.sort();
-    doctor_exec.dedup();
-    let sandbox_config = build_sandbox_config(
-        &resolved,
-        &probe,
-        active_agent,
-        &agent_dirs,
-        NamedRepos::new(
-            &policy_roots,
-            &repo_git_dirs,
-            &repo_rows,
-            worktree_root.as_deref(),
-        ),
-        &doctor_exec,
-        SessionPaths::default(),
-        keychain_substitute,
-    );
-    let policy = sandbox::generate_policy(&sandbox_config);
 
     // Only for an agent that can run: "Pi will not start" under "Pi is not
     // installed" is noise.
@@ -7061,10 +7107,11 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
 
     // Tracked secrets under the .env deny — the same set `cplt check` reports
     // (#451), from the same function.
-    let sensitive = tracked_sensitive_files(&project_dir);
+    let sensitive = tracked_sensitive_files(&project_dir, resolved.deny_key_files_by_extension);
     findings.extend(doctor::tracked_env_finding(
         &sensitive,
         resolved.allow_env_files,
+        resolved.deny_key_files_by_extension && any_extension_only_match(&sensitive),
     ));
 
     // Tools as found on PATH — the shim, not its target.
@@ -7085,7 +7132,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
             let critical = discover::WSL_CRITICAL_TOOLS.contains(name);
             let msg = format!(
                 "{name} resolves to {}, a Windows install reached through WSL interop{}",
-                canon.display(),
+                tilde(&canon),
                 if critical {
                     ", which cannot run in the Linux sandbox."
                 } else {
@@ -7154,15 +7201,32 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         ok.push(format!("tools: {}", tool_names.join(" ")));
     }
 
-    print!("{}", doctor::render(&findings, &ok, !verbose));
+    print!("{}", doctor::render(&findings, &ok, !verbose, &home_dir));
 
     if verbose {
         println!();
         println!("── inventory ──");
-        println!("project:  {}", project_dir.display());
-        println!("home:     {}", home_dir.display());
+        println!("project:  {}", tilde(&project_dir));
+        println!("home:     ~");
+        // The effective grants, after presets, repo proposals and the
+        // build-credential expansion: what a launch would hand the sandbox.
+        for (key, paths) in [
+            ("allow.read", &resolved.allow_read),
+            ("allow.write", &resolved.allow_write),
+            ("deny.paths", &resolved.deny_paths),
+        ] {
+            let shown: Vec<String> = paths.iter().map(|p| tilde(p)).collect();
+            println!(
+                "{key:<12} {}",
+                if shown.is_empty() {
+                    "none".to_string()
+                } else {
+                    shown.join(", ")
+                }
+            );
+        }
         println!();
-        discover::discover_all(&home_dir, &project_dir).print_report();
+        discover::discover_all(&home_dir, &project_dir).print_report(&home_dir);
         print_project_ecosystems(&project_dir);
     }
 
@@ -7427,6 +7491,10 @@ fn display_repo_config(loaded: &repo_config::LoadedRepoConfig, project_dir: &std
         for v in &rc.deny.env {
             println!("{blue}[cplt]{nc}    env     = {v}");
         }
+        warn_glob_like_deny_paths(
+            &repo_config::glob_like_deny_paths(rc, &loaded.dir),
+            ".cplt.toml",
+        );
         println!();
     }
 
@@ -8038,12 +8106,15 @@ fn run_config_set_repo(
     }
 
     let output = doc.to_string();
-    if let Err(e) = repo_config::parse_and_validate(&output) {
-        ui::error(&format!(
-            "refusing to write invalid .cplt.toml: {e}\n  No changes were saved."
-        ));
-        return ExitCode::FAILURE;
-    }
+    let written = match repo_config::parse_and_validate(&output) {
+        Ok(config) => config,
+        Err(e) => {
+            ui::error(&format!(
+                "refusing to write invalid .cplt.toml: {e}\n  No changes were saved."
+            ));
+            return ExitCode::FAILURE;
+        }
+    };
     if let Err(e) = config::write_repo_document_atomically(&repo_config_path, &doc) {
         ui::error(&format!("cannot write {}: {e}", repo_config_path.display()));
         return ExitCode::FAILURE;
@@ -8070,6 +8141,16 @@ fn run_config_set_repo(
         "{blue}[cplt]{nc} {dim}Updated: {}{nc}",
         repo_config_path.display()
     );
+    // Only the entry just written: the others were warned about when they
+    // were set, and are again at every launch.
+    if !unset && target == config::RepoKeyTarget::Deny("paths") {
+        let stored = config::collapse_tilde(val);
+        let globs: Vec<&str> = repo_config::glob_like_deny_paths(&written, &project_dir)
+            .into_iter()
+            .filter(|p| *p == val || *p == stored)
+            .collect();
+        warn_glob_like_deny_paths(&globs, ".cplt.toml");
+    }
 
     // Remind about trust approval for propose keys
     // Every `[propose]` shape, including the top-level arrays: a proposal the
@@ -8624,6 +8705,10 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
         for v in &loaded.config.deny.env {
             println!("{blue}[cplt]{nc}    env:  {v}");
         }
+        warn_glob_like_deny_paths(
+            &repo_config::glob_like_deny_paths(&loaded.config, &loaded.dir),
+            ".cplt.toml",
+        );
         println!();
     }
 
@@ -9894,6 +9979,36 @@ fn shell_uninstall(agent: Option<&str>) -> ExitCode {
 // Named functions with cfg-gated bodies keep the run() function
 // free of inline #[cfg] blocks.
 
+/// The agent's installation directory, granted read + map-exec
+/// (`SandboxConfig::copilot_install_dir`). Shared by the launch and `doctor`.
+fn agent_install_dir(
+    agent: agent::Agent,
+    agent_bin_result: &Result<PathBuf, String>,
+    home_dir: &Path,
+) -> Option<PathBuf> {
+    if agent == agent::Agent::Copilot {
+        agent_bin_result
+            .as_ref()
+            .ok()
+            .and_then(|p| {
+                // Try package.json discovery first (npm/Homebrew installs)
+                discover::copilot_pkg_dir(p, home_dir).or_else(|| {
+                    // Fallback: use the binary's parent directory (VS Code extension installs
+                    // at ~/Library/Application Support/Code/.../copilotCli/copilot)
+                    p.parent().map(std::path::Path::to_path_buf)
+                })
+            })
+            .filter(|d| !crate::is_unsafe_root(d, home_dir))
+    } else {
+        // Non-Copilot agents: use binary's parent dir for read + map-exec
+        agent_bin_result
+            .as_ref()
+            .ok()
+            .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+            .filter(|d| !crate::is_unsafe_root(d, home_dir))
+    }
+}
+
 /// Discover the VS Code Electron app bundle containing Copilot's shim (macOS only).
 ///
 /// On Linux, Copilot doesn't use Electron app bundles, so this always returns `None`.
@@ -10204,6 +10319,18 @@ mod tests {
         assert_eq!(merged.len(), 1, "one root, one record: {merged:?}");
     }
 
+    #[test]
+    fn extension_only_match_ignores_exact_names() {
+        let s = |v: &[&str]| v.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert!(!any_extension_only_match(&s(&["a/.env", "b/.pem"])));
+        assert!(any_extension_only_match(&s(&[
+            "a/.env",
+            "certs/server.pem"
+        ])));
+        // The basename decides, not a directory that looks like a key.
+        assert!(!any_extension_only_match(&s(&["x.pem/.key"])));
+    }
+
     /// The hand-written matcher must cover every pattern the profile denies.
     /// It cannot be derived from them — they are SBPL regex source and there is
     /// no regex engine linked — so this is the thing that stops the two
@@ -10216,28 +10343,59 @@ mod tests {
             "a pattern was added or removed; teach `is_sensitive_basename` about it \
              and update this count"
         );
+        assert_eq!(
+            sandbox::SENSITIVE_KEY_FILE_EXTENSION_PATTERNS.len(),
+            5,
+            "a key file extension was added or removed; teach `is_sensitive_basename` \
+             about it and update this count"
+        );
+        // Exact names match whether or not the extension key is on.
+        for by_ext in [false, true] {
+            for name in [
+                ".env",
+                ".env.local",
+                ".env.production",
+                ".pem",
+                ".key",
+                ".p12",
+                ".pfx",
+                ".jks",
+            ] {
+                assert!(
+                    is_sensitive_basename(name, by_ext),
+                    "{name} should be sensitive (by_extension={by_ext})"
+                );
+            }
+            for name in [
+                "env",
+                "environment.md",
+                ".envrc",
+                "README.md",
+                "monkey.jks.bak",
+            ] {
+                assert!(
+                    !is_sensitive_basename(name, by_ext),
+                    "{name} should not be treated as sensitive (by_extension={by_ext})"
+                );
+            }
+        }
+        // By extension only with `sandbox.deny_key_files_by_extension`: with it
+        // off the profile leaves these readable, so `cplt check` must not call
+        // them blocked.
         for name in [
-            ".env",
-            ".env.local",
-            ".env.production",
             "server.pem",
             "id.key",
             "cert.p12",
             "cert.pfx",
             "keystore.jks",
         ] {
-            assert!(is_sensitive_basename(name), "{name} should be sensitive");
-        }
-        for name in [
-            "env",
-            "environment.md",
-            ".envrc",
-            "README.md",
-            "monkey.jks.bak",
-        ] {
             assert!(
-                !is_sensitive_basename(name),
-                "{name} should not be treated as sensitive"
+                is_sensitive_basename(name, true),
+                "{name} is denied with the key on"
+            );
+            assert!(
+                !is_sensitive_basename(name, false),
+                "{name} is readable with the key off"
             );
         }
     }

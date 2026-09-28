@@ -639,6 +639,12 @@ mod e2e_tests {
                 && stdout.contains("git"),
             "--verbose appends the old inventory (Tools section with git).\nstdout: {stdout}"
         );
+        // --verbose is what gets attached to bug reports: paste-safe too.
+        let home = std::env::var("HOME").expect("HOME");
+        assert!(
+            !stdout.contains(&home),
+            "--verbose must not print the home directory.\nstdout: {stdout}"
+        );
     }
 
     #[test]
@@ -2072,6 +2078,32 @@ mod e2e_tests {
 
     fn shim_dir(home: &Path) -> PathBuf {
         home.join(".local/share/cplt/bin")
+    }
+
+    /// `--deny-path ~` overlaps both pnpm homes, which the profile names
+    /// whether or not they exist. Only a store that exists earns a warning.
+    #[test]
+    fn e2e_deny_over_a_missing_pnpm_store_does_not_warn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        let stderr = || {
+            let out = cplt_cmd()
+                .args(["--print-profile", "--agent", "shell", "--deny-path"])
+                .arg(&home)
+                .env("HOME", &home)
+                .current_dir(project_dir())
+                .output()
+                .expect("binary should run");
+            let err = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(out.status.success(), "{err}");
+            err
+        };
+        let missing = stderr();
+        assert!(!missing.contains("pnpm store"), "{missing}");
+        std::fs::create_dir_all(home.join("Library/pnpm/store")).unwrap();
+        let present = stderr();
+        assert!(present.contains("Library/pnpm/store;"), "{present}");
+        assert!(!present.contains(".local/share/pnpm"), "{present}");
     }
 
     /// Default off: neither the alias install, nor `--shell-setup`, nor a
@@ -4500,6 +4532,155 @@ paths = [
         );
 
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// cplt takes a `deny.paths` glob as one literal path, so it denies
+    /// nothing. Every place that reads or writes the entry must say so, and a
+    /// plain entry must stay silent.
+    #[test]
+    fn e2e_glob_like_deny_paths_warn_where_the_entry_is_read_or_written() {
+        const WARNING: &str = "cplt does not expand globs in deny.paths";
+        let print_profile = |repo: &Path, extra: &[&str]| {
+            let out = cplt_cmd()
+                .args([
+                    "--project-dir",
+                    &repo.to_string_lossy(),
+                    "--agent",
+                    "shell",
+                    "--accept-repo-config",
+                    "--print-profile",
+                ])
+                .args(extra)
+                .output()
+                .expect("binary should run");
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(out.status.success(), "launch should succeed: {stderr}");
+            stderr
+        };
+
+        // Launch repository: one warning names every glob entry, not the plain one.
+        let globs = repo_with_committed_cplt_toml(
+            "glob-launch",
+            "[deny]\npaths = [\"**/*.pem\", \"certs/*.key\", \"certs/server.crt\"]\n",
+        );
+        let stderr = print_profile(&globs, &[]);
+        assert!(
+            stderr.contains(&format!(".cplt.toml: {WARNING}")),
+            "the launch repo must warn: {stderr}"
+        );
+        assert!(
+            stderr.contains(r#""**/*.pem", "certs/*.key" deny nothing"#),
+            "the warning must name each glob entry: {stderr}"
+        );
+        assert!(
+            !stderr.contains(r#""certs/server.crt""#),
+            "a plain entry is not a glob: {stderr}"
+        );
+
+        // `config show` and `cplt trust` list the entry under "[deny] (applied)",
+        // so they must carry the same warning.
+        let stderr_of = |repo: &Path, args: &[&str]| {
+            let out = cplt_cmd()
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .expect("should run");
+            String::from_utf8_lossy(&out.stderr).into_owned()
+        };
+        for args in [&["config", "show"][..], &["trust"][..]] {
+            let stderr = stderr_of(&globs, args);
+            assert!(
+                stderr.contains(r#""**/*.pem", "certs/*.key" deny nothing"#),
+                "{args:?} must warn about the glob entries: {stderr}"
+            );
+        }
+
+        // A plain entry stays silent.
+        let plain =
+            repo_with_committed_cplt_toml("glob-plain", "[deny]\npaths = [\"certs/server.crt\"]\n");
+        let stderr = print_profile(&plain, &[]);
+        assert!(
+            !stderr.contains(WARNING),
+            "plain entries must not warn: {stderr}"
+        );
+        for args in [&["config", "show"][..], &["trust"][..]] {
+            let stderr = stderr_of(&plain, args);
+            assert!(
+                !stderr.contains(WARNING),
+                "{args:?} must not warn for plain entries: {stderr}"
+            );
+        }
+
+        // An entry that exists under its literal name is denied as written: a
+        // Next.js dynamic route is a real directory, not a glob.
+        let literal =
+            repo_with_committed_cplt_toml("glob-literal", "[deny]\npaths = [\"pages/[id]\"]\n");
+        std::fs::create_dir_all(literal.join("pages/[id]")).unwrap();
+        let stderr = print_profile(&literal, &[]);
+        assert!(
+            !stderr.contains(WARNING),
+            "an existing literal path must not warn: {stderr}"
+        );
+
+        // Named repository: the label is that repository's own file, and one
+        // entry takes the singular verb.
+        let named = repo_with_committed_cplt_toml("glob-named", "[deny]\npaths = [\"*.key\"]\n");
+        let named = std::fs::canonicalize(&named).unwrap();
+        let stderr = print_profile(&plain, &["--repo-dir", &named.to_string_lossy()]);
+        let label = named.join(".cplt.toml");
+        assert!(
+            stderr.contains(&format!("{}: {WARNING}", label.display())),
+            "a --repo-dir repo must warn under its own label: {stderr}"
+        );
+        assert!(
+            stderr.contains(r#""*.key" denies nothing"#),
+            "one entry takes the singular verb: {stderr}"
+        );
+
+        // `config set --repo` warns after it writes a glob, and not for a plain path.
+        let set = |repo: &Path, value: &str| {
+            let out = cplt_cmd()
+                .args(["config", "set", "--repo", "deny.paths", value])
+                .current_dir(repo)
+                .output()
+                .expect("should run");
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(out.status.success(), "set --repo should succeed: {stderr}");
+            stderr
+        };
+        let repo = make_repo_dir("glob-set");
+        let stderr = set(&repo, "**/*.pem");
+        assert!(
+            stderr.contains(WARNING) && stderr.contains(r#""**/*.pem" denies nothing"#),
+            "set --repo must warn for a glob: {stderr}"
+        );
+        let content = std::fs::read_to_string(repo.join(".cplt.toml")).unwrap();
+        assert!(
+            content.contains(r#""**/*.pem""#),
+            "the entry is kept: {content}"
+        );
+        let repo_plain = make_repo_dir("glob-set-plain");
+        let stderr = set(&repo_plain, "certs");
+        assert!(
+            !stderr.contains(WARNING),
+            "a plain path must not warn: {stderr}"
+        );
+        // Only the value just written is reported, not the glob already in the file.
+        let stderr = set(&repo, "certs");
+        assert!(
+            !stderr.contains(WARNING),
+            "a plain path must not re-list earlier globs: {stderr}"
+        );
+        let stderr = set(&repo, "*.key");
+        assert!(
+            stderr
+                .contains(r#": cplt does not expand globs in deny.paths. "*.key" denies nothing"#),
+            "set --repo must name only the new glob: {stderr}"
+        );
+
+        for dir in [&globs, &plain, &literal, &named, &repo, &repo_plain] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     #[test]

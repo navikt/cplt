@@ -493,6 +493,7 @@ impl Config {
 
         let deny_nested_git = bools.deny_nested_git;
         let refuse_cache_exec_links = bools.refuse_cache_exec_links;
+        let deny_key_files_by_extension = bools.deny_key_files_by_extension;
 
         let refuse_invalid_repo_config = bools.refuse_invalid_repo_config;
         let deny_copilot_dir_exec = bools.deny_copilot_dir_exec;
@@ -674,6 +675,7 @@ impl Config {
             gradle_init,
             deny_nested_git,
             refuse_cache_exec_links,
+            deny_key_files_by_extension,
             refuse_invalid_repo_config,
             deny_copilot_dir_exec,
             allow_docker,
@@ -4095,6 +4097,14 @@ mod precedence {
                 cli_on: None,
                 cli_off: None,
                 get: |r| r.refuse_cache_exec_links,
+                default: false,
+                preset: None,
+            },
+            Ladder {
+                key: "sandbox.deny_key_files_by_extension",
+                cli_on: None,
+                cli_off: None,
+                get: |r| r.deny_key_files_by_extension,
                 default: false,
                 preset: None,
             },

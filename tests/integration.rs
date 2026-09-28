@@ -494,6 +494,7 @@ mod macos_tests {
             deny_clipboard: false,
             deny_nested_git: false,
             refuse_cache_exec_links: false,
+            deny_key_files_by_extension: false,
             deny_copilot_dir_exec: false,
             allow_jvm_attach: false,
             allow_msbuild: false,
@@ -3231,6 +3232,118 @@ mod macos_tests {
         );
     }
 
+    #[test]
+    fn real_profile_key_files_by_extension() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let tmp = project.join(format!(".cplt-keyext-{}", std::process::id()));
+        fs::create_dir_all(tmp.join("certs")).unwrap();
+        let keys = [
+            "server.pem",
+            "tls.key",
+            "keystore.p12",
+            "cert.pfx",
+            "store.jks",
+        ];
+        for name in keys {
+            fs::write(tmp.join("certs").join(name), "KEY\n").unwrap();
+        }
+        fs::write(tmp.join("certs/x.key.bak"), "NOT-A-KEY\n").unwrap();
+        // At the root of the tree, not below a directory: `(.*/)?` must match empty.
+        fs::write(tmp.join("tls.key"), "KEY\n").unwrap();
+        fs::create_dir_all(tmp.join("certs/bundle.pem")).unwrap();
+        fs::write(tmp.join("certs/bundle.pem/inner.txt"), "INNER\n").unwrap();
+        let tmp = fs::canonicalize(&tmp).unwrap();
+        let home = home_dir();
+
+        let cat = |profile: &PathBuf, name: &str| {
+            let path = tmp.join("certs").join(name);
+            run_sandboxed(profile, &format!("cat '{}'", path.display()))
+        };
+
+        // Unset: only a file named exactly `.pem` / `.key` is denied.
+        let off = write_real_profile(&default_opts(&tmp, &home));
+        let off_results: Vec<_> = keys.iter().map(|k| (*k, cat(&off, k))).collect();
+
+        let mut opts = default_opts(&tmp, &home);
+        opts.deny_key_files_by_extension = true;
+        let on = write_real_profile(&opts);
+        let on_results: Vec<_> = keys.iter().map(|k| (*k, cat(&on, k))).collect();
+        let lookalike = cat(&on, "x.key.bak");
+        let top_level = run_sandboxed(&on, &format!("cat '{}'", tmp.join("tls.key").display()));
+        // Scoped to granted trees: the system CA bundle is outside the project
+        // and must stay readable, or curl, git and pip fail TLS setup.
+        let ca_bundle = run_sandboxed(&on, "head -c 64 /etc/ssl/cert.pem >/dev/null && echo CA-OK");
+        // A directory whose name ends in `.pem` is itself denied, its files are not.
+        let dir_inner = cat(&on, "bundle.pem/inner.txt");
+        let dir_list = run_sandboxed(
+            &on,
+            &format!("ls '{}'", tmp.join("certs/bundle.pem").display()),
+        );
+        // Overwrite, then delete. The file must be unchanged afterwards.
+        let tampered: Vec<_> = keys
+            .iter()
+            .map(|k| {
+                let path = tmp.join("certs").join(k);
+                let cmd = format!(
+                    "printf GONE > '{p}' 2>&1; rm '{p}' 2>&1; echo EXIT:$?",
+                    p = path.display()
+                );
+                let (output, _) = run_sandboxed(&on, &cmd);
+                (*k, output, fs::read_to_string(&path).ok())
+            })
+            .collect();
+
+        fs::remove_dir_all(&tmp).ok();
+        fs::remove_file(&off).ok();
+        fs::remove_file(&on).ok();
+
+        for (name, (output, success)) in off_results {
+            assert!(
+                success && output.contains("KEY"),
+                "{name} is readable when the key is unset, got: {output}"
+            );
+        }
+        for (name, (output, success)) in on_results {
+            assert!(
+                !success && !output.contains("KEY"),
+                "{name} must be blocked with deny_key_files_by_extension, got: {output}"
+            );
+        }
+        for (name, output, content) in tampered {
+            assert_eq!(
+                content.as_deref(),
+                Some("KEY\n"),
+                "{name} must survive overwrite and rm with deny_key_files_by_extension, got: {output}"
+            );
+        }
+        assert!(
+            !top_level.1 && !top_level.0.contains("KEY"),
+            "tls.key directly in the granted root must be blocked, got: {}",
+            top_level.0
+        );
+        assert!(
+            lookalike.1 && lookalike.0.contains("NOT-A-KEY"),
+            "x.key.bak does not end in .key and stays readable, got: {}",
+            lookalike.0
+        );
+        assert!(
+            ca_bundle.1 && ca_bundle.0.contains("CA-OK"),
+            "/etc/ssl/cert.pem is outside every granted tree and stays readable, got: {}",
+            ca_bundle.0
+        );
+        assert!(
+            dir_inner.1 && dir_inner.0.contains("INNER"),
+            "a file inside a directory named bundle.pem stays readable, got: {}",
+            dir_inner.0
+        );
+        assert!(
+            !dir_list.1,
+            "a directory named bundle.pem cannot be listed, got: {}",
+            dir_list.0
+        );
+    }
+
     // ── Denied files (not just dirs) ──────────────────────────────
 
     #[test]
@@ -3632,6 +3745,151 @@ mod macos_tests {
         assert!(
             output.contains("Operation not permitted") || output.contains("EXIT:1"),
             "deny-path should override allow-read, got: {output}"
+        );
+    }
+
+    /// #597: the #477 carve-out re-allows `.env` reads in the Go module cache,
+    /// and must not reopen a `--deny-path` inside it. A module outside the
+    /// deny keeps the carve-out.
+    #[test]
+    fn real_profile_deny_in_module_cache_beats_env_carve_out() {
+        require_sandbox!();
+        let tmp = std::env::temp_dir().join(format!("cplt-597-{}", std::process::id()));
+        let fake_home = tmp.join("home");
+        let modcache = fake_home.join("go/pkg/mod");
+        for m in ["ex@v1", "ok@v1"] {
+            fs::create_dir_all(modcache.join(m)).unwrap();
+            fs::write(modcache.join(m).join(".env"), "secret\n").unwrap();
+            fs::write(modcache.join(m).join("other.txt"), "secret\n").unwrap();
+        }
+        let fake_home = fs::canonicalize(&fake_home).unwrap();
+        let modcache = fs::canonicalize(&modcache).unwrap();
+        let project = fs::canonicalize(".").unwrap();
+
+        let extra_read = vec![modcache.clone()];
+        let extra_deny = vec![modcache.join("ex@v1")];
+        let mut opts = default_opts(&project, &fake_home);
+        opts.extra_read = &extra_read;
+        opts.extra_deny = &extra_deny;
+        let profile = write_real_profile(&opts);
+
+        let read = |rel: &str| {
+            let cmd = format!("/bin/cat '{}/{rel}'", modcache.display());
+            run_sandboxed(&profile, &cmd).1
+        };
+        let denied_env = read("ex@v1/.env");
+        let denied_other = read("ex@v1/other.txt");
+        let carved_env = read("ok@v1/.env");
+
+        fs::remove_dir_all(&tmp).ok();
+        fs::remove_file(&profile).ok();
+        assert!(!denied_other, "--deny-path must block other.txt");
+        assert!(
+            !denied_env,
+            "--deny-path must block .env despite the carve-out"
+        );
+        assert!(
+            carved_env,
+            "outside the deny, the carve-out still re-allows .env"
+        );
+    }
+
+    /// #597 with `sandbox.deny_key_files_by_extension`: the store's key-file
+    /// carve-out must not reopen a `--deny-path` inside it either, and the
+    /// modules outside the deny keep both carve-outs.
+    #[test]
+    fn real_profile_deny_in_module_cache_beats_key_file_carve_out() {
+        require_sandbox!();
+        let tmp = std::env::temp_dir().join(format!("cplt-597-key-{}", std::process::id()));
+        let fake_home = tmp.join("home");
+        let modcache = fake_home.join("go/pkg/mod");
+        for m in ["ex@v1", "ok@v1"] {
+            fs::create_dir_all(modcache.join(m)).unwrap();
+            fs::write(modcache.join(m).join(".env"), "secret\n").unwrap();
+            fs::write(modcache.join(m).join("server.pem"), "secret\n").unwrap();
+        }
+        let fake_home = fs::canonicalize(&fake_home).unwrap();
+        let modcache = fs::canonicalize(&modcache).unwrap();
+        let project = fs::canonicalize(".").unwrap();
+
+        // The grant puts the store under the extension deny.
+        let extra_read = vec![modcache.clone()];
+        let extra_deny = vec![modcache.join("ex@v1")];
+        let mut opts = default_opts(&project, &fake_home);
+        opts.extra_read = &extra_read;
+        opts.extra_deny = &extra_deny;
+        opts.deny_key_files_by_extension = true;
+        let profile = write_real_profile(&opts);
+
+        let read = |rel: &str| {
+            let cmd = format!("/bin/cat '{}/{rel}'", modcache.display());
+            (rel.to_string(), run_sandboxed(&profile, &cmd).1)
+        };
+        let results = [
+            read("ex@v1/.env"),
+            read("ex@v1/server.pem"),
+            read("ok@v1/.env"),
+            read("ok@v1/server.pem"),
+        ];
+
+        fs::remove_dir_all(&tmp).ok();
+        fs::remove_file(&profile).ok();
+        for (rel, readable) in results {
+            assert_eq!(
+                readable,
+                rel.starts_with("ok@v1"),
+                "{rel}: only the module outside --deny-path is readable"
+            );
+        }
+    }
+
+    /// #597 class: the pnpm `store` write allow follows the user's denies, so
+    /// it must be withheld under a `--deny-path` covering the pnpm home.
+    /// Without the deny the store stays writable and the rest of the pnpm
+    /// home does not, which shows the PATH-bin rules are in effect.
+    #[test]
+    fn real_profile_deny_on_pnpm_home_blocks_store_writes() {
+        require_sandbox!();
+        let tmp = std::env::temp_dir().join(format!("cplt-597-pnpm-{}", std::process::id()));
+        let pnpm = tmp.join("home/Library/pnpm");
+        fs::create_dir_all(pnpm.join("store")).unwrap();
+        let fake_home = fs::canonicalize(tmp.join("home")).unwrap();
+        let pnpm = fs::canonicalize(&pnpm).unwrap();
+        let project = fs::canonicalize(".").unwrap();
+
+        let write = |extra_deny: &[PathBuf], rel: &str| {
+            let mut opts = default_opts(&project, &fake_home);
+            opts.extra_deny = extra_deny;
+            let profile = write_real_profile(&opts);
+            let cmd = format!("echo x > '{}/{rel}'", pnpm.display());
+            let ok = run_sandboxed(&profile, &cmd).1;
+            fs::remove_file(&profile).ok();
+            ok
+        };
+        let open_store = write(&[], "store/a");
+        let open_bin = write(&[], "pnpm-shim");
+        let denied_store = write(std::slice::from_ref(&pnpm), "store/b");
+        // A deny inside the store closes only that part of it.
+        fs::create_dir_all(pnpm.join("store/v10")).unwrap();
+        fs::create_dir_all(pnpm.join("store/other")).unwrap();
+        let v10 = [pnpm.join("store/v10")];
+        let denied_v10 = write(&v10, "store/v10/c");
+        let open_other = write(&v10, "store/other/c");
+
+        fs::remove_dir_all(&tmp).ok();
+        assert!(
+            !denied_v10,
+            "--deny-path on store/v10 must block writes into it"
+        );
+        assert!(
+            open_other,
+            "--deny-path on store/v10 must leave the rest of the store writable"
+        );
+        assert!(open_store, "without a deny, the pnpm store stays writable");
+        assert!(!open_bin, "without a deny, the pnpm home stays read-only");
+        assert!(
+            !denied_store,
+            "--deny-path on the pnpm home must block writes into store/"
         );
     }
 

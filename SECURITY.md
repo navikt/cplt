@@ -585,6 +585,8 @@ controlling terminal, and that terminal is the user's shell.
 
 *Possible mitigation:* a future hardening category could mask the hostname and inject synthetic env values, at the risk of breaking tools that depend on accurate system info. Low priority, since recon without credential access has little value.
 
+**Key files are denied by exact name by default, not by extension.** The default name patterns for key files block a file named exactly `.pem`, `.key`, `.p12`, `.pfx` or `.jks`. They do not block `server.pem`, `tls.key` or `keystore.jks`, which is where keys usually live, so an agent can read and overwrite those on macOS. `sandbox.deny_key_files_by_extension` (off by default under the staged-rollout rule) denies any file name that ends in one of those extensions inside the project and every other granted tree. It is scoped to those trees rather than global so the system CA bundles (`/etc/ssl/cert.pem`) stay readable. Like the exact-name patterns, it is lifted for read inside the extracted dependency stores (`~/go/pkg/mod`, `~/.cargo/registry`), and a `--deny-path` inside or above a store still wins over that carve-out (#597). On Linux neither form applies: Landlock cannot deny a file by name pattern.
+
 **Project source code is readable and writable.** The agent needs read/write access to the project directory. That is its job. A compromised agent could exfiltrate source over HTTPS on port 443.
 
 *Possible mitigation:* a read-only project mode (`--read-only-project`) for review-only workflows. Outbound bandwidth tracking could flag bulk exfiltration, meaning large POSTs relative to Copilot's normal API pattern, but that needs deep packet inspection.
@@ -1608,7 +1610,7 @@ Most of these invoke `sandbox-exec` with real Seatbelt profiles and verify **ker
 | Sensitive dir and file blocks | 8 | `~/.ssh`, `~/.aws`, `~/.docker`, `~/.kube`, `.netrc`, `.npmrc`, credentials planted in a temp `HOME`, and `--deny-path` overriding `--allow-read` |
 | Git repository protection | 5 | Writes to `.git/hooks`, `.git/config`, `.gitmodules`, and `.cplt.toml` blocked; local git config and the global ignore file stay readable |
 | Temp and scratch exec | 3 | Exec from `/tmp` blocked by default, allowed with `--allow-tmp-exec`, allowed inside the scratch dir |
-| Env files | 4 | `.env` read, symlink read, and delete blocked; allowed with `--allow-env-files` |
+| Env files | 5 | `.env` read, symlink read, and delete blocked; allowed with `--allow-env-files`; key files by extension (`server.pem`) readable by default and blocked with `sandbox.deny_key_files_by_extension` |
 | GPG signing | 4 | Default blocks `~/.gnupg`, flag allows pubring read, private keys stay denied, writes stay denied |
 | Network | 10 | Outbound blocked by default, a port named in the profile reachable while an unnamed one is not, localhost blocked by default and allowed with `--allow-localhost-any`, Java localhost with and without `preferIPv4Stack`, localhost TCP bind, and the wildcard-bind SBPL limitation. Two are text-only: that the default profile emits `*:443`, and that proxy-forced emits the `localhost:<port>` pin and drops `*:443` |
 | Unix sockets | 6 | JVM Attach sockets in `/tmp` and `/var/folders` allowed, MSBuild worker-node socket allowed and blocked without the flag, SSH agent blocked, arbitrary `/tmp` sockets blocked |

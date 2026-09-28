@@ -710,6 +710,40 @@ pub fn has_unknown_tightening_keys(config: &RepoConfig) -> bool {
     !config.deny.unknown.is_empty()
 }
 
+/// The `deny.paths` entries that look like a glob pattern.
+///
+/// cplt does not expand globs. An entry is one path, anchored to the repository
+/// root, so `**/*.pem` denies only a file whose name is literally `*.pem` in a
+/// directory literally named `**`. Such an entry is kept, because `*`, `?`,
+/// `[` and `{` are legal in a file name, and dropping it could remove a
+/// restriction that works. It is reported instead: without the warning, the
+/// author believes that the files are denied and nothing says otherwise.
+///
+/// Refusing the entry is not an option here. A validation error drops the
+/// whole file, and with it every other `[deny]` entry (#385 M-01).
+///
+/// An entry that exists on disk under its literal name, resolved against
+/// `dir` like the deny itself, is not reported: a Next.js `pages/[id]` or a
+/// template's `{{project}}` directory is denied as written, and a warning that
+/// it denies nothing would be false. The check uses symlink metadata rather
+/// than following the link, so a dangling symlink with a glob-looking name
+/// still counts as existing: the deny is emitted, so it is not "nothing".
+#[must_use]
+pub fn glob_like_deny_paths<'a>(config: &'a RepoConfig, dir: &Path) -> Vec<&'a str> {
+    config
+        .deny
+        .paths
+        .iter()
+        .map(String::as_str)
+        .filter(|p| p.contains(['*', '?', '[', '{']))
+        .filter(|p| {
+            dir.join(crate::config::expand_tilde(p))
+                .symlink_metadata()
+                .is_err()
+        })
+        .collect()
+}
+
 pub fn proposed_keys(propose: &ProposeSection) -> Vec<&'static str> {
     let mut keys = Vec::new();
 
@@ -1444,5 +1478,73 @@ write = ["~/.m2/repository"]
 "#;
         let config = parse_repo_config(toml_str).unwrap();
         assert!(validate_repo_config(&config).is_ok());
+    }
+
+    #[test]
+    fn glob_like_deny_paths_are_reported_not_refused() {
+        // cplt does not expand globs, so these match nothing. They must stay
+        // valid: a validation error would drop the whole file, "secrets.txt"
+        // included.
+        let toml_str = r#"
+[deny]
+paths = ["**/*.pem", "certs/*.key", "id_rsa?", "[ab].txt", "*.{pem,key}", "{a,b}.txt", "secrets.txt"]
+"#;
+        let config = parse_repo_config(toml_str).unwrap();
+        assert!(validate_repo_config(&config).is_ok());
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            glob_like_deny_paths(&config, dir.path()),
+            [
+                "**/*.pem",
+                "certs/*.key",
+                "id_rsa?",
+                "[ab].txt",
+                "*.{pem,key}",
+                "{a,b}.txt"
+            ]
+        );
+    }
+
+    #[test]
+    fn glob_like_deny_paths_skip_entries_that_exist_under_their_literal_name() {
+        // A Next.js dynamic route and a template directory: real names, so the
+        // deny works as written and must not be reported as matching nothing.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("pages/[id]")).unwrap();
+        std::fs::create_dir(dir.path().join("{{project}}")).unwrap();
+        let toml_str = r#"
+[deny]
+paths = ["pages/[id]", "{{project}}", "*.pem"]
+"#;
+        let config = parse_repo_config(toml_str).unwrap();
+        assert_eq!(glob_like_deny_paths(&config, dir.path()), ["*.pem"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn glob_like_deny_paths_skip_a_dangling_symlink_with_that_name() {
+        // The deny is emitted for the link's own path, so the entry is not a
+        // no-op even though its target does not resolve.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("certs")).unwrap();
+        std::os::unix::fs::symlink("/nonexistent-cplt-test", dir.path().join("certs/*.key"))
+            .unwrap();
+        let toml_str = r#"
+[deny]
+paths = ["certs/*.key", "*.pem"]
+"#;
+        let config = parse_repo_config(toml_str).unwrap();
+        assert_eq!(glob_like_deny_paths(&config, dir.path()), ["*.pem"]);
+    }
+
+    #[test]
+    fn plain_deny_paths_are_not_reported_as_globs() {
+        let toml_str = r#"
+[deny]
+paths = [".env", "certs/server.pem", "~/secrets", "apps/web/.env.local"]
+"#;
+        let config = parse_repo_config(toml_str).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        assert!(glob_like_deny_paths(&config, dir.path()).is_empty());
     }
 }
