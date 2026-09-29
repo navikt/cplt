@@ -636,7 +636,9 @@ fn detect_docker(ctx: &DetectContext) -> DetectorOutput {
         });
     }
 
-    // Content scan: extract port mappings from compose files
+    // Content scan: extract port mappings from compose files. A published
+    // port is a listener on this machine, so it maps to allow.localhost:
+    // allow.ports is remote egress and leaves loopback denied.
     let primary_compose_files = [
         "docker-compose.yml",
         "docker-compose.yaml",
@@ -647,13 +649,13 @@ fn detect_docker(ctx: &DetectContext) -> DetectorOutput {
     for compose_file in &primary_compose_files {
         if let Some(content) = ctx.read_text(compose_file) {
             for port in extract_compose_ports(&content) {
-                suggestions.push(Suggestion::AllowPort(port));
+                suggestions.push(Suggestion::AllowLocalhost(port));
             }
             // Follow extends.file references to find ports in referenced files
             for referenced in extract_extends_files(&content) {
                 if let Some(ref_content) = ctx.read_text(&referenced) {
                     for port in extract_compose_ports(&ref_content) {
-                        suggestions.push(Suggestion::AllowPort(port));
+                        suggestions.push(Suggestion::AllowLocalhost(port));
                     }
                 }
             }
@@ -667,12 +669,12 @@ fn detect_docker(ctx: &DetectContext) -> DetectorOutput {
         }
         if let Some(content) = ctx.read_text(&alt_file) {
             for port in extract_compose_ports(&content) {
-                suggestions.push(Suggestion::AllowPort(port));
+                suggestions.push(Suggestion::AllowLocalhost(port));
             }
             for referenced in extract_extends_files(&content) {
                 if let Some(ref_content) = ctx.read_text(&referenced) {
                     for port in extract_compose_ports(&ref_content) {
-                        suggestions.push(Suggestion::AllowPort(port));
+                        suggestions.push(Suggestion::AllowLocalhost(port));
                     }
                 }
             }
@@ -1030,7 +1032,7 @@ fn detect_spring_boot(ctx: &DetectContext) -> DetectorOutput {
                 path: app_file.to_string(),
                 reason: "PostgreSQL datasource",
             });
-            suggestions.push(Suggestion::AllowPort(5432));
+            suggestions.push(Suggestion::AllowLocalhost(5432));
         }
     }
 
@@ -1239,7 +1241,8 @@ fn detect_flyway(ctx: &DetectContext) -> DetectorOutput {
     DetectorOutput::detected(Detection {
         name: "Flyway",
         signals,
-        suggestions: vec![Suggestion::AllowPort(5432)],
+        // The dev database runs locally (compose or a local install).
+        suggestions: vec![Suggestion::AllowLocalhost(5432)],
     })
 }
 
@@ -3245,8 +3248,24 @@ services:
 "#;
         fs::write(dir.path().join("docker-compose.yml"), compose).unwrap();
         let report = detect_project(dir.path());
-        assert!(report.suggestions.contains(&Suggestion::AllowPort(5432)));
-        assert!(report.suggestions.contains(&Suggestion::AllowPort(8080)));
+        assert!(
+            report
+                .suggestions
+                .contains(&Suggestion::AllowLocalhost(5432))
+        );
+        assert!(
+            report
+                .suggestions
+                .contains(&Suggestion::AllowLocalhost(8080))
+        );
+        // A published compose port is a listener on this machine. allow.ports
+        // opens that port to every remote host and still leaves loopback shut.
+        assert!(
+            !report
+                .suggestions
+                .iter()
+                .any(|s| matches!(s, Suggestion::AllowPort(_)))
+        );
     }
 
     // ── Python detector ──────────────────────────────────────────────
@@ -3524,7 +3543,11 @@ services:
                 .suggestions
                 .contains(&Suggestion::Propose(SandboxFlag::AllowDocker))
         );
-        assert!(report.suggestions.contains(&Suggestion::AllowPort(5432)));
+        assert!(
+            report
+                .suggestions
+                .contains(&Suggestion::AllowLocalhost(5432))
+        );
     }
 
     #[test]
@@ -3629,9 +3652,21 @@ services:
         .unwrap();
 
         let report = detect_project(dir.path());
-        assert!(report.suggestions.contains(&Suggestion::AllowPort(9009)));
-        assert!(report.suggestions.contains(&Suggestion::AllowPort(3000)));
-        assert!(report.suggestions.contains(&Suggestion::AllowPort(2345)));
+        assert!(
+            report
+                .suggestions
+                .contains(&Suggestion::AllowLocalhost(9009))
+        );
+        assert!(
+            report
+                .suggestions
+                .contains(&Suggestion::AllowLocalhost(3000))
+        );
+        assert!(
+            report
+                .suggestions
+                .contains(&Suggestion::AllowLocalhost(2345))
+        );
     }
 
     #[test]
@@ -3655,9 +3690,21 @@ services:
         .unwrap();
 
         let report = detect_project(dir.path());
-        assert!(report.suggestions.contains(&Suggestion::AllowPort(3000)));
-        assert!(report.suggestions.contains(&Suggestion::AllowPort(8080)));
-        assert!(report.suggestions.contains(&Suggestion::AllowPort(4200)));
+        assert!(
+            report
+                .suggestions
+                .contains(&Suggestion::AllowLocalhost(3000))
+        );
+        assert!(
+            report
+                .suggestions
+                .contains(&Suggestion::AllowLocalhost(8080))
+        );
+        assert!(
+            report
+                .suggestions
+                .contains(&Suggestion::AllowLocalhost(4200))
+        );
     }
 
     #[test]
@@ -3702,7 +3749,11 @@ services:
                 .suggestions
                 .contains(&Suggestion::AllowLocalhost(8080))
         );
-        assert!(report.suggestions.contains(&Suggestion::AllowPort(5432)));
+        assert!(
+            report
+                .suggestions
+                .contains(&Suggestion::AllowLocalhost(5432))
+        );
     }
 
     #[test]
@@ -3821,7 +3872,11 @@ services:
         .unwrap();
         let report = detect_project(dir.path());
         assert!(report.detections.iter().any(|d| d.name == "Flyway"));
-        assert!(report.suggestions.contains(&Suggestion::AllowPort(5432)));
+        assert!(
+            report
+                .suggestions
+                .contains(&Suggestion::AllowLocalhost(5432))
+        );
     }
 
     #[test]
@@ -3916,7 +3971,11 @@ services:
                 .suggestions
                 .contains(&Suggestion::Propose(SandboxFlag::AllowDocker))
         );
-        assert!(report.suggestions.contains(&Suggestion::AllowPort(5432)));
+        assert!(
+            report
+                .suggestions
+                .contains(&Suggestion::AllowLocalhost(5432))
+        );
         assert!(
             report
                 .suggestions

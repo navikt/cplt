@@ -479,7 +479,7 @@ Every connection attempt is printed to stderr in real time:
 | `CONNECTED (via ADDR ...)` | Connected to ADDR, but only after earlier addresses of the host failed (2 s per address while others remain, 10 s in total), or with blocked addresses in the DNS answer skipped (`skipped blocked ...`) | Often a broken IPv6 route or a mixed DNS answer; none needed |
 | `BLOCKED` | Domain matched blocklist | Check the built-in list (`blocked-domains.txt`), your `--blocked-domains` file and any subscription |
 | `BLOCKED-ALLOWLIST` | Domain not in allowlist | Add it to the file named by `proxy.allowed_domains` / `--allowed-domains` (re-read live), or `cplt config set allow.domains HOST` and restart |
-| `BLOCKED-PORT` | Port not in allowed list | Add with `--allow-port <PORT>` |
+| `BLOCKED-PORT` | Port not in allowed list | Add with `--allow-port <PORT>`; for a localhost target use `--allow-localhost <PORT>` |
 | `BLOCKED-PRIVATE` | Pre-DNS private IP (`.local`, `127.*`, IP literals) | Use `--allow-localhost` for local ports |
 | `BLOCKED-PRIVATE-RESOLVED` | DNS resolved to a private IP (every address is checked; passing addresses are still used) | Use `--allow-private-domain <DOMAIN>` |
 | `DNS-FAIL` | DNS resolution failed | Check domain spelling or network |

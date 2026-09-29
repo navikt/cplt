@@ -1225,18 +1225,18 @@ Supported ecosystems:
 |-----------|-------------|----------|
 | JVM (Gradle/Maven) | `build.gradle*`, `pom.xml` | `allow_jvm_attach`, read gradle properties; for Gradle also `allow_localhost_any` (the daemon listens on a random loopback port) |
 | Node.js | `package.json` | localhost ports, `allow_localhost_any` (for Next.js/Vite) |
-| Docker | `Dockerfile`, `compose.yml` | `allow_docker` (dangerous) and exposed ports, for a compose file only. A bare `Dockerfile` gets a diagnostic instead: CI builds the image |
+| Docker | `Dockerfile`, `compose.yml` | `allow_docker` (dangerous) and published compose ports as `allow.localhost`, for a compose file only. A bare `Dockerfile` gets a diagnostic instead: CI builds the image |
 | Python | `pyproject.toml`, `requirements.txt` | localhost ports (for Django/FastAPI) |
 | Rust | `Cargo.toml` | (works with defaults) |
 | Go | `go.mod` | `allow_localhost_any` when a `_test.go` file imports `net/http/httptest` (its test servers listen on a random loopback port); otherwise nothing |
 | Playwright | `@playwright/test` or `"playwright"` in package.json | `allow_cache_exec` (personal config hint) |
 | Environment secrets | `.env.example` | `deny.env` for sensitive variables |
-| Spring Boot | `application.yml` + Spring in Gradle | localhost 8080, PostgreSQL port |
+| Spring Boot | `application.yml` + Spring in Gradle | localhost 8080, and localhost 5432 when a datasource is configured |
 | Ktor | `application.conf` + Ktor in Gradle | localhost 8080 |
 | TestContainers | `testcontainers` in `build.gradle*`, `gradle/libs.versions.toml`, `pom.xml`, `package.json`, `go.mod`, `pyproject.toml` or `requirements.txt` | `allow_docker` (dangerous), `allow_localhost_any` |
 | Next.js | `next.config.ts/js/mjs` | localhost 3000, `allow_localhost_any` |
 | Vite | `vite.config.ts/js/mjs` | localhost 5173, `allow_localhost_any` |
-| Flyway | `src/main/resources/db/migration` or `.../migrations` | PostgreSQL port 5432 |
+| Flyway | `src/main/resources/db/migration` or `.../migrations` | localhost 5432 |
 | mise | a `tools` table in `mise.toml`, `.mise.toml`, `mise.local.toml`, `.mise.local.toml`, `.config/mise.toml`, `.config/mise/config.toml`, `mise/config.toml` or `.mise/config.toml` | nothing; a diagnostic to run `mise install` outside cplt |
 | Cypress | `cypress.config.ts/js/mjs` + `cypress/` dir | `allow_localhost_any` (repository proposal); `allow_cache_exec` (personal config hint from `cplt init --global`) |
 

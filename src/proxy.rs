@@ -1412,18 +1412,23 @@ pub struct NetPolicy {
     pub private_domains: Vec<String>,
 }
 
-/// Whether `host` is spelled as loopback (`localhost`, `*.localhost`, a
-/// loopback IP literal) and the user opted into localhost for this port: the
-/// localhost carve-out. The answer it resolves to must then be loopback too
-/// (see [`classify_resolved`]).
+/// `localhost`, `*.localhost`, or a loopback IP literal (brackets allowed).
+/// Expects a host already passed through [`normalize_hostname`].
 #[must_use]
-pub fn localhost_connect_allowed(host: &str, localhost_opt_in: bool) -> bool {
+pub fn is_loopback_host(host: &str) -> bool {
     let h = host.trim_start_matches('[').trim_end_matches(']');
-    let is_loopback = h == "localhost"
+    h == "localhost"
         || h.ends_with(".localhost")
         || h.parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback());
-    is_loopback && localhost_opt_in
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Whether `host` is spelled as loopback (see [`is_loopback_host`]) and the
+/// user opted into localhost for this port: the localhost carve-out. The
+/// answer it resolves to must then be loopback too (see [`classify_resolved`]).
+#[must_use]
+pub fn localhost_connect_allowed(host: &str, localhost_opt_in: bool) -> bool {
+    is_loopback_host(host) && localhost_opt_in
 }
 
 /// Classify a CONNECT target against the static (pre-DNS) proxy policy gates.

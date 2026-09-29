@@ -495,6 +495,17 @@ pub fn explain_domain(
             "permitted by the proxy policy, cplt is not blocking this.".to_string(),
             None,
         ),
+        // Loopback is governed by allow.localhost, not allow.ports: a port
+        // grant is egress to every remote host on that port, and the profile
+        // still denies loopback after it, so --allow-port cannot help here.
+        NetVerdict::BlockedPort if proxy::is_loopback_host(&proxy::normalize_hostname(host)) => (
+            Decision::Blocked,
+            format!("localhost port {port} is not in the allowed localhost ports."),
+            Some(format!(
+                "allow it with --allow-localhost {port} (or [allow] localhost in config), \
+                 or --allow-localhost-any for a service on a random port."
+            )),
+        ),
         NetVerdict::BlockedPort => (
             Decision::Blocked,
             format!("port {port} is not in the allowed-ports set (443 + --allow-port)."),
@@ -1492,6 +1503,25 @@ mod tests {
         let e = explain_domain(&np, "github.com", 22, true);
         assert_eq!(e.decision, Decision::Blocked);
         assert_eq!(e.status, "BLOCKED-PORT");
+    }
+
+    #[test]
+    fn loopback_port_fix_names_allow_localhost() {
+        // --allow-port 6969 does not reach a local listener on 6969; only
+        // --allow-localhost 6969 does. The fix must not send users to the
+        // flag that opens remote egress and still fails.
+        let np = net_policy(&[], &[], &[443]);
+        for host in ["127.0.0.1", "localhost", "[::1]"] {
+            let e = explain_domain(&np, host, 6969, true);
+            assert_eq!(e.status, "BLOCKED-PORT");
+            let fix = e.fix.as_deref().unwrap();
+            assert!(
+                fix.contains("--allow-localhost 6969") && !fix.contains("--allow-port"),
+                "{host}: {fix}"
+            );
+        }
+        let e = explain_domain(&np, "github.com", 6969, true);
+        assert!(e.fix.as_deref().unwrap().contains("--allow-port 6969"));
     }
 
     #[test]
