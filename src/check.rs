@@ -575,6 +575,61 @@ pub fn explain_domain(
     }
 }
 
+/// [`explain_domain`], plus the one case where a pre-DNS block gets the wrong
+/// fix: a name that is not spelled as loopback but resolves to it
+/// (`127.0.0.1.nip.io`, `lvh.me`).
+///
+/// The proxy's localhost carve-out lifts the port and allowlist gates only for
+/// a name that is loopback as written ([`proxy::is_loopback_host`]), because
+/// those gates run before DNS. A loopback alias therefore has to pass them like
+/// any remote host, and the localhost opt-in only matters after DNS
+/// ([`proxy::classify_resolved`]). The proxy does not resolve first on purpose:
+/// with a fail-closed allowlist, resolving a name the allowlist refuses would
+/// give the agent a DNS lookup for any name it likes, which is an exfiltration
+/// channel. `cplt check net` runs on the host, so it can resolve here and say
+/// what actually opens the target. `resolve` is the proxy's resolver in
+/// production and a stub in tests.
+#[must_use]
+pub fn explain_domain_resolved(
+    policy: &NetPolicy,
+    host: &str,
+    port: u16,
+    proxy_enabled: bool,
+    resolve: impl FnOnce(&str, u16) -> Vec<std::net::SocketAddr>,
+) -> NetExplain {
+    let mut expl = explain_domain(policy, host, port, proxy_enabled);
+    let gate = if expl.status == NetVerdict::BlockedPort.status() {
+        format!("--allow-port {port} (which also opens port {port} to remote hosts)")
+    } else if expl.status == NetVerdict::BlockedAllowlist.status() {
+        format!("{host} in allowed_domains")
+    } else {
+        return expl;
+    };
+    if proxy::is_loopback_host(&proxy::normalize_hostname(host)) {
+        return expl;
+    }
+    let addrs = resolve(host, port);
+    let Some(first) = addrs.first() else {
+        return expl;
+    };
+    if !addrs.iter().all(|a| a.ip().is_loopback()) {
+        return expl;
+    }
+    expl.reason = format!(
+        "{} {host} resolves to loopback ({}), but the proxy lifts this gate for a \
+         localhost target only when the name itself is loopback (localhost, *.localhost, \
+         127.0.0.1, [::1]): the gate runs before DNS.",
+        expl.reason,
+        first.ip()
+    );
+    expl.fix = Some(format!(
+        "connect to localhost:{port} with --allow-localhost {port} (or [allow] localhost \
+         in config), or --allow-localhost-any for a service on a random port. To keep the \
+         name {host}, add the localhost opt-in and {gate}."
+    ));
+    expl
+}
+
 // ── Layer 2: exec explain ──────────────────────────────────────
 
 /// The exec-relevant slice of the resolved policy, for [`explain_exec`].
@@ -1546,6 +1601,48 @@ mod tests {
                 "{status}: {fix}"
             );
         }
+    }
+
+    /// #645: a name that resolves to loopback (`127.0.0.1.nip.io`) is blocked
+    /// before DNS, where the proxy cannot know it is loopback. The fix must
+    /// name the localhost opt-in, and must say the gate still applies to the
+    /// name, because the live proxy refuses `127.0.0.1.nip.io:6969` with
+    /// `--allow-localhost 6969` alone (BLOCKED-PORT) and connects only with
+    /// `--allow-port 6969` added. The stub resolver keeps this off the network.
+    #[test]
+    fn loopback_alias_fix_names_allow_localhost_and_the_gate() {
+        let lo = |_: &str, p: u16| vec![std::net::SocketAddr::from(([127, 0, 0, 1], p))];
+        let alias = "127.0.0.1.nip.io";
+
+        let mut optin = net_policy(&[], &[], &[443]);
+        optin.allow_localhost_ports = vec![6969];
+        for np in [net_policy(&[], &[], &[443]), optin] {
+            let e = explain_domain_resolved(&np, alias, 6969, true, lo);
+            assert_eq!(e.status, "BLOCKED-PORT", "the proxy blocks it too");
+            let fix = e.fix.as_deref().unwrap();
+            assert!(fix.contains("--allow-localhost 6969"), "{fix}");
+            assert!(fix.contains("localhost:6969"), "{fix}");
+            assert!(fix.contains("--allow-port 6969"), "{fix}");
+            assert!(e.reason.contains("resolves to loopback"), "{}", e.reason);
+        }
+
+        let mut strict = net_policy(&["github.com"], &[], &[443]);
+        strict.allowlist_active = true;
+        let e = explain_domain_resolved(&strict, alias, 443, true, lo);
+        assert_eq!(e.status, "BLOCKED-ALLOWLIST");
+        let fix = e.fix.as_deref().unwrap();
+        assert!(fix.contains("--allow-localhost 443"), "{fix}");
+        assert!(fix.contains("127.0.0.1.nip.io in allowed_domains"), "{fix}");
+
+        // A name that resolves elsewhere keeps the generic advice, and the
+        // resolver is not consulted for a loopback literal or a non-DNS block.
+        let public = |_: &str, p: u16| vec![std::net::SocketAddr::from(([1, 1, 1, 1], p))];
+        let np = net_policy(&[], &[], &[443]);
+        let e = explain_domain_resolved(&np, "example.org", 6969, true, public);
+        assert!(!e.fix.as_deref().unwrap().contains("--allow-localhost"));
+        let unreachable = |_: &str, _: u16| -> Vec<std::net::SocketAddr> { panic!("resolved") };
+        let _ = explain_domain_resolved(&np, "localhost", 6969, true, unreachable);
+        let _ = explain_domain_resolved(&np, alias, 443, true, unreachable);
     }
 
     #[test]
