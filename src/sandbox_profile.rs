@@ -3324,6 +3324,24 @@ mod tests {
         });
     }
 
+    /// pnpm's macOS config dir: config.yaml is readable, nothing else in the
+    /// dir is (auth.ini/rc hold registry tokens) and nothing is writable.
+    #[test]
+    fn profile_grants_pnpm_macos_config_yaml_read_only() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let p = generate_profile(&test_options(project, home), &[]);
+        assert!(p.contains(
+            "(allow file-read* (literal \"/Users/test/Library/Preferences/pnpm/config.yaml\"))"
+        ));
+        for l in p.lines().filter(|l| l.contains("Library/Preferences/pnpm")) {
+            assert!(
+                l.starts_with("(allow file-read* (literal ") && l.contains("config.yaml"),
+                "unexpected pnpm prefs rule: {l}"
+            );
+        }
+    }
+
     /// #522: macOS grants exactly the shared home config list, the same one
     /// Landlock grants (`home_config_files_are_readable` in sandbox_landlock),
     /// and none of the entries Linux used to grant on its own.

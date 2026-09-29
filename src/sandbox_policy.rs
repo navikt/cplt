@@ -104,6 +104,13 @@ pub const HOME_CONFIG_FILES: &[&str] = &[
     ".config/gh/config.yml",
     // mise/asdf global tool versions.
     ".tool-versions",
+    // pnpm's global settings on macOS. The pnpm AppDir entry resolves to the
+    // XDG spelling (~/.config/pnpm) only, so the native config dir needs its
+    // own grant. One file, not the dir: `pnpm login` and `pnpm config set
+    // --global` keep registry tokens next to it (`auth.ini`, `rc` before
+    // pnpm 11). Read-only, so the agent cannot change settings the host's
+    // pnpm trusts outside the sandbox.
+    "Library/Preferences/pnpm/config.yaml",
 ];
 
 /// The [`DENIED_FILES`] entry `path` names, if any.
@@ -1545,6 +1552,10 @@ pub const GPG_SIGNING_ALLOW_FILES: &[&str] = &[
 
 /// Application directory kinds according to relevant platform specifications.
 /// See https://docs.rs/directories for more details
+///
+/// The macOS paths below apply only with a non-empty qualifier. Every
+/// [`APP_DIRS`] entry has an empty one, which selects XDG on macOS too, so a
+/// native macOS path (`~/Library/Preferences/<app>`, ...) needs its own grant.
 pub enum AppDirKind {
     /// macOS: `~/Library/Caches/<app>` · Linux/macOS when using XDG: `~/.cache/<app>`
     Cache,
@@ -1747,9 +1758,11 @@ pub const APP_DIRS: &[AppDir] = &[
         // file grant, or a read-only shadow when it is hardlinked into store.
         process_exec: &[],
         map_exec: &[],
-        // Config/Preference dirs (~/.config/pnpm, ~/Library/Preferences/pnpm) are
-        // writable: pnpm reads and writes its settings (hoisting, virtual store state)
-        // there during normal operation. These dirs contain no credentials.
+        // Config/Preference resolve to ~/.config/pnpm only (an empty qualifier
+        // means XDG on every platform). It is writable for `pnpm config set`.
+        // pnpm 11+ keeps global registry tokens there too (`auth.ini`).
+        // macOS's native ~/Library/Preferences/pnpm is not covered by this
+        // entry; its config.yaml is a read-only HOME_CONFIG_FILES grant.
         //
         // Data/DataLocal (~/.local/share/pnpm) is deliberately NOT writable: it
         // is $PNPM_HOME on Linux, so the global shims `pnpm setup` puts on PATH
@@ -2117,8 +2130,9 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
         map_exec: true,
         write: true,
     },
-    // Note: pnpm config dirs (~/.config/pnpm on Linux, ~/Library/Preferences/pnpm on macOS)
-    // are handled by the pnpm AppDir entry with Config/Preference write access, not here.
+    // Note: ~/.config/pnpm is handled by the pnpm AppDir entry. macOS's
+    // ~/Library/Preferences/pnpm gets only config.yaml, read-only, via
+    // HOME_CONFIG_FILES.
     // Kotlin compiler daemon: client marker files and run files.
     // The Kotlin Maven/Gradle plugin uses this for daemon lifecycle management.
     // XDG path (Linux, some macOS setups)
