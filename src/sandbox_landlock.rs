@@ -5465,8 +5465,9 @@ mod tests {
                 })
         };
         // A real, empty home: a fake /home/user is an automount on macOS, and
-        // lookups there can fail in ways a missing file does not.
-        let tmp = tempfile::tempdir().expect("tempdir");
+        // lookups there can fail in ways a missing file does not. Not under
+        // /tmp: the policy grants /tmp read+write, which covers the dir.
+        let tmp = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
         let home = std::fs::canonicalize(tmp.path()).expect("canonical");
         let cfg = home.join(".config/pnpm");
         crate::with_env_lock_no_xdg(|| {
@@ -5526,7 +5527,8 @@ mod tests {
     /// the default policy has none.
     #[test]
     fn pnpm_config_residuals_name_a_covering_grant() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        // Not under /tmp, whose read+write grant would cover the dir.
+        let tmp = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
         let home = std::fs::canonicalize(tmp.path()).expect("canonical");
         crate::with_env_lock_no_xdg(|| {
             let project = home.join("project");

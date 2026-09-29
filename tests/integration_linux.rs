@@ -477,7 +477,9 @@ mod linux_tests {
     #[test]
     fn protect_pnpm_config_withholds_token_files() {
         require_landlock!();
-        let home = tempfile::tempdir().unwrap();
+        // Not under /tmp: Landlock grants /tmp read+write, which covers the
+        // dir, and bwrap hides it behind a private tmpfs.
+        let home = tempdir_outside_tmp();
         let cfg = home.path().join(".config/pnpm");
         fs::create_dir_all(&cfg).unwrap();
         for (f, body) in [
