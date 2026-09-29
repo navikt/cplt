@@ -385,6 +385,10 @@ pub const DETECTORS: &[DetectorSpec] = &[
         id: "nais_bootstrap",
         detect: detect_nais_bootstrap,
     },
+    DetectorSpec {
+        id: "mise",
+        detect: detect_mise,
+    },
 ];
 
 /// Run all detectors against a project directory.
@@ -1142,6 +1146,46 @@ const COMPOSE_FILES: &[&str] = &[
     "compose.yml",
     "compose.yaml",
 ];
+
+/// mise config that pins tools. Diagnostic only: there is nothing to grant,
+/// because mise's `installs/` tree is read-only in the sandbox by design (a
+/// tool dir is on `PATH`, so a write there runs on the host after the session).
+/// A pinned version the host lacks therefore fails to install inside cplt with
+/// "Operation not permitted", which says nothing about running it outside.
+fn detect_mise(ctx: &DetectContext) -> DetectorOutput {
+    const CONFIGS: &[&str] = &[
+        "mise.toml",
+        ".mise.toml",
+        ".config/mise.toml",
+        ".config/mise/config.toml",
+        "mise/config.toml",
+    ];
+    let Some(file) = CONFIGS.iter().find(|f| {
+        ctx.read_text(f)
+            .is_some_and(|c| c.lines().any(|l| l.trim() == "[tools]"))
+    }) else {
+        return DetectorOutput::none();
+    };
+    DetectorOutput {
+        detection: Some(Detection {
+            name: "mise",
+            signals: vec![Signal::FileContains {
+                path: (*file).to_string(),
+                reason: "pins tool versions",
+            }],
+            suggestions: Vec::new(),
+        }),
+        diagnostics: vec![Diagnostic {
+            detector: "mise",
+            message: format!(
+                "{file} pins tool versions. Run `mise install` here outside cplt before \
+                 starting the agent: mise's installs directory is read-only in the sandbox \
+                 by design, so a missing version fails to install inside it with \
+                 \"Operation not permitted\"."
+            ),
+        }],
+    }
+}
 
 fn collect_nav_private(content: &str, out: &mut BTreeSet<String>) {
     for suffix in NAV_PRIVATE_SUFFIXES {
@@ -3366,6 +3410,40 @@ services:
                 .suggestions
                 .contains(&Suggestion::AllowLocalhost(8080))
         );
+    }
+
+    /// A pinned tool the host lacks cannot be installed inside cplt, and the
+    /// error ("Operation not permitted") does not say to run it outside.
+    #[test]
+    fn mise_tools_get_a_diagnostic() {
+        for file in ["mise.toml", ".mise.toml", ".config/mise.toml"] {
+            let dir = setup_dir();
+            fs::create_dir_all(dir.path().join(".config")).unwrap();
+            fs::write(dir.path().join(file), "[tools]\nnode = \"24\"\n").unwrap();
+            let report = detect_project(dir.path());
+            assert!(report.detections.iter().any(|d| d.name == "mise"), "{file}");
+            assert!(
+                report
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.detector == "mise" && d.message.contains("mise install")),
+                "{file}"
+            );
+            assert!(report.suggestions.is_empty(), "{file}: nothing to grant");
+        }
+    }
+
+    /// Tasks alone install nothing, so there is nothing to warn about.
+    #[test]
+    fn mise_without_tools_is_silent() {
+        let dir = setup_dir();
+        fs::write(
+            dir.path().join("mise.toml"),
+            "[tasks.test]\nrun = \"true\"\n",
+        )
+        .unwrap();
+        let report = detect_project(dir.path());
+        assert!(!report.detections.iter().any(|d| d.name == "mise"));
     }
 
     // ── Global detector tests ────────────────────────────────────────
