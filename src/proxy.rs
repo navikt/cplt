@@ -3001,12 +3001,12 @@ mod tests {
 
     #[test]
     fn connect_falls_back_to_the_next_address() {
-        // Port 1 is privileged and nothing listens there, so the connect is
-        // refused at once. A bind-and-release port could be handed out again
-        // to a parallel test before this one connects.
+        // Port 0 cannot be listened on, so the connect fails at once on any
+        // host. A bind-and-release port could be handed out again to a
+        // parallel test before this one connects.
         let live = TcpListener::bind("127.0.0.1:0").unwrap();
         let live_addr = live.local_addr().unwrap();
-        let closed: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let closed: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
 
         let (_stream, used, failed) = connect_any(&[closed, live_addr]).unwrap();
         assert_eq!(used, live_addr);
