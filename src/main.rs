@@ -5922,13 +5922,20 @@ fn decode_fs_probe(code: u8) -> check::Decision {
 }
 
 /// Probe read access to `path` inside the sandbox (opens for read, reads
-/// nothing). Works for files and directories.
+/// nothing). Works for files and directories; a missing path is
+/// [`check::Decision::Inconclusive`].
 fn probe_read(
     prepared: &sandbox::PreparedSandbox,
     resolved: &config::Resolved,
     disabled: &[sandbox::HardeningCategory],
     path: &Path,
 ) -> check::Decision {
+    // A missing path fails the open with ENOENT, which the exit code cannot
+    // tell apart from a sandbox denial (#621).
+    // Only a definite "missing": an unreadable ancestor is for the probe to judge.
+    if matches!(path.try_exists(), Ok(false)) {
+        return check::Decision::Inconclusive;
+    }
     let script = format!(
         "exec >/dev/null 2>&1; : < {}",
         sh_quote(&path.to_string_lossy())
@@ -6333,19 +6340,18 @@ fn any_extension_only_match(files: &[String]) -> bool {
 }
 
 /// Resolve a user-supplied check path to an absolute path without requiring it
-/// to exist (canonicalize the existing ancestor, then re-append the tail).
+/// to exist (canonicalize the deepest existing ancestor, then re-append the
+/// tail), so `<proj>/link/missing` is judged where `link` points.
 fn canonicalize_check_path(path: &Path) -> PathBuf {
-    if let Ok(c) = std::fs::canonicalize(path) {
-        return c;
-    }
-    if path.is_absolute() {
+    let abs = if path.is_absolute() {
         path.to_path_buf()
     } else {
         match std::env::current_dir() {
             Ok(d) => d.join(path),
             Err(_) => path.to_path_buf(),
         }
-    }
+    };
+    config::canonicalize_deepest(&abs)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6608,9 +6614,22 @@ fn build_path_check(
 ) -> check::Report {
     let expl = check::explain_path(policy, home_dir, project_dir, path);
     let mut items = Vec::new();
+    // A secret-shaped name is the one unmodelled deny a flag can lift.
+    let secret_file = !resolved.allow_env_files
+        && path.file_name().is_some_and(|n| {
+            is_sensitive_basename(&n.to_string_lossy(), resolved.deny_key_files_by_extension)
+        });
 
     let read_dec = probe_read(prepared, resolved, disabled, path);
-    let note = mismatch_note(read_dec, expl.read_decision());
+    let note =
+        if read_dec == check::Decision::Inconclusive && matches!(path.try_exists(), Ok(false)) {
+            Some(format!(
+                "path does not exist, so there is nothing to probe; the policy model predicts {}",
+                expl.read_decision().as_str()
+            ))
+        } else {
+            mismatch_note(read_dec, expl.read_decision())
+        };
     items.push(check::CheckItem {
         name: "read".to_string(),
         category: "filesystem".to_string(),
@@ -6618,7 +6637,7 @@ fn build_path_check(
         decision: read_dec,
         expected: None,
         reason: expl.reason.clone(),
-        fix: expl.fix.clone(),
+        fix: mismatch_fix(read_dec, expl.read_decision(), secret_file).or_else(|| expl.fix.clone()),
         note,
     });
 
@@ -6649,7 +6668,7 @@ fn build_path_check(
             decision: write_dec,
             expected: None,
             reason,
-            fix,
+            fix: mismatch_fix(write_dec, expl.write_decision(), secret_file).or(fix),
             note,
         });
     }
@@ -6670,6 +6689,29 @@ fn mismatch_note(probe: check::Decision, model: check::Decision) -> Option<Strin
             model.as_str()
         ))
     }
+}
+
+/// The fix for a block the policy model did not predict. The model's own fix
+/// (usually none, since it thinks access is granted) would be false here, so
+/// say what is known instead (#621). `secret_file`: the name matches the
+/// secret-file deny patterns and `--allow-env-files` is off.
+fn mismatch_fix(
+    probe: check::Decision,
+    model: check::Decision,
+    secret_file: bool,
+) -> Option<String> {
+    (probe == check::Decision::Blocked && model == check::Decision::Allowed).then(|| {
+        if secret_file {
+            "this is a secret-shaped file (.env, .pem, .key, ...), which cplt denies \
+             even inside the project. --allow-env-files lifts that deny."
+                .to_string()
+        } else {
+            "a sandbox rule the policy model does not cover blocks this (for example a \
+             protected agent config file nested in the project). Do this outside cplt \
+             if you need it."
+                .to_string()
+        }
+    })
 }
 
 /// Replicate the live proxy's post-DNS resolved-IP SSRF guard for `cplt check
@@ -10241,6 +10283,47 @@ mod tests {
     /// #531 off: no root, nothing touched on disk, and the policy roots are
     /// exactly the named repositories, which is what keeps the profile
     /// byte-identical to a build without the feature.
+    /// #621: a block the model did not predict gets a truthful fix, never
+    /// the model's "none needed".
+    #[test]
+    fn check_path_resolves_a_symlink_above_a_missing_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join("link")).unwrap();
+        assert_eq!(
+            super::canonicalize_check_path(&dir.path().join("link/missing")),
+            std::fs::canonicalize(&real).unwrap().join("missing")
+        );
+    }
+
+    #[test]
+    fn mismatch_fix_only_for_unpredicted_block() {
+        use crate::check::Decision::{Allowed, Blocked, Inconclusive};
+        assert!(
+            super::mismatch_fix(Blocked, Allowed, false)
+                .unwrap()
+                .contains("does not cover")
+        );
+        assert!(
+            super::mismatch_fix(Blocked, Allowed, true)
+                .unwrap()
+                .contains("--allow-env-files")
+        );
+        for (probe, model) in [
+            (Blocked, Blocked),
+            (Allowed, Allowed),
+            (Allowed, Blocked),
+            (Inconclusive, Allowed),
+        ] {
+            assert_eq!(
+                super::mismatch_fix(probe, model, true),
+                None,
+                "{probe:?} vs {model:?}"
+            );
+        }
+    }
+
     #[test]
     fn managed_worktree_root_off_adds_nothing() {
         use std::path::{Path, PathBuf};
