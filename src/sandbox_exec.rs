@@ -801,13 +801,16 @@ fn install_command_wrappers(
         // inside a named root has to be judged by THAT repository's default
         // branch, and before this it had no baked answer at all, so every push
         // there failed closed with wording about the launch repository.
+        // A missing symref is asked of the remote only when the policy needs
+        // the default branch (check.rs `for_launch` decides the same way).
+        let ask_remote = git_guard.enabled && git_guard.protect_default_branch_only;
         let mut repo_facts = crate::git::trusted_git()
-            .map(|git| crate::gh_proxy::capture_repo_facts_at_launch(git, project_dir))
+            .map(|git| crate::gh_proxy::capture_repo_facts_at_launch(git, project_dir, ask_remote))
             .unwrap_or_default();
         if let Some(git) = crate::git::trusted_git() {
             repo_facts.named = repo_dirs
                 .iter()
-                .map(|dir| crate::gh_proxy::capture_repo_facts_at_launch(git, dir))
+                .map(|dir| crate::gh_proxy::capture_repo_facts_at_launch(git, dir, ask_remote))
                 .collect();
         }
         // Two conditions narrow this to the case the operator can act on.

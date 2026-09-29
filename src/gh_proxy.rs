@@ -4064,6 +4064,16 @@ fn resolve_remote_url(real_git: &Path, repo_args: &[&str], remote: &str) -> Opti
 /// fails closed.
 #[allow(clippy::disallowed_methods)] // `real_git` is a git::trusted_git() path supplied by the caller
 fn resolve_push_urls(real_git: &Path, repo_args: &[&str], remote: &str) -> Vec<String> {
+    push_urls(real_git, repo_args, remote)
+        .iter()
+        .map(|url| crate::trust::normalize_remote_url(url))
+        .collect()
+}
+
+/// [`resolve_push_urls`] as git spells them, not normalized: the URLs a
+/// `git push` to `remote` contacts.
+#[allow(clippy::disallowed_methods)] // `real_git` is a git::trusted_git() path supplied by the caller
+fn push_urls(real_git: &Path, repo_args: &[&str], remote: &str) -> Vec<String> {
     // `--` guards against a remote name that looks like a flag.
     let Ok(output) = std::process::Command::new(real_git)
         .args(repo_args)
@@ -4079,7 +4089,7 @@ fn resolve_push_urls(real_git: &Path, repo_args: &[&str], remote: &str) -> Vec<S
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-        .map(crate::trust::normalize_remote_url)
+        .map(String::from)
         .collect()
 }
 
@@ -4396,7 +4406,7 @@ pub fn capture_repo_facts(real_git: &Path, project_dir: &Path) -> RepoFacts {
 }
 
 /// [`capture_repo_facts`] as a launch runs it: a remote with no recorded
-/// `refs/remotes/<remote>/HEAD` asks the remote itself.
+/// `refs/remotes/<remote>/HEAD` asks the remote itself, once.
 ///
 /// A repository made with `git init` + `git remote add`, or a clone whose
 /// set-head never ran, has no local symref, and without one every push was
@@ -4408,41 +4418,83 @@ pub fn capture_repo_facts(real_git: &Path, project_dir: &Path) -> RepoFacts {
 /// does not answer in time the remote stays absent and the guard fails closed
 /// exactly as before.
 ///
+/// The answer is recorded as `refs/remotes/<remote>/HEAD`, as set-head would
+/// have, so later launches, `check exec` and `doctor` read it locally and ask
+/// nothing.
+///
 /// Separate from [`capture_repo_facts`] so the unit tests that build it for a
-/// fake `github.com/o/o` remote never go to the network.
+/// fake `github.com/o/o` remote never go to the network. `ask_remote` is
+/// whether the policy needs the answer (`protect_default_branch_only`); without
+/// it this is [`capture_repo_facts`] and nothing leaves the machine.
 #[must_use]
-pub fn capture_repo_facts_at_launch(real_git: &Path, project_dir: &Path) -> RepoFacts {
+pub fn capture_repo_facts_at_launch(
+    real_git: &Path,
+    project_dir: &Path,
+    ask_remote: bool,
+) -> RepoFacts {
     let mut facts = capture_repo_facts(real_git, project_dir);
+    if !ask_remote {
+        return facts;
+    }
     let dir = project_dir.to_string_lossy().into_owned();
     let repo_args = ["-C", dir.as_str()];
-    // ponytail: one remote at a time, each bounded by LS_REMOTE_TIMEOUT; only
-    // remotes missing their symref pay it. Parallelize if several are common.
+    // One budget for the whole launch, however many remotes lack a symref.
+    let deadline = std::time::Instant::now() + LS_REMOTE_TIMEOUT;
     for remote in list_remotes(real_git, &repo_args) {
         if facts.default_branches.contains_key(&remote) {
             continue;
         }
-        // A GitHub remote is asked through `gh`: the parent's git runs with
-        // every credential helper reset (git::CONFIG_OVERRIDES), so a private
-        // repository over HTTPS would never answer `ls-remote`.
-        let github = git_config_value(real_git, &repo_args, &format!("remote.{remote}.url"))
-            .as_deref()
-            .and_then(parse_repo_from_url);
-        let branch = match github {
-            Some(repo) => gh_default_branch(&repo),
-            None => ls_remote_default_branch(project_dir, &remote),
+        // Ask about the repositories the push reaches: the push URLs, after
+        // insteadOf/pushInsteadOf, as the gh guard's scope check reads them.
+        // All of them must agree, or the answer is not the push's.
+        let mut answers = push_urls(real_git, &repo_args, &remote)
+            .into_iter()
+            .map(|url| {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    return None;
+                }
+                // A GitHub remote is asked through `gh`: the parent's git runs
+                // with every credential helper reset (git::CONFIG_OVERRIDES), so
+                // a private repository over HTTPS would never answer ls-remote.
+                match parse_repo_from_url(&url) {
+                    Some(repo) => gh_default_branch(&repo, left),
+                    None => ls_remote_default_branch(&url, left),
+                }
+            });
+        let Some(Some(branch)) = answers.next() else {
+            continue;
         };
-        if let Some(branch) = branch {
-            facts.default_branches.insert(remote, branch);
+        if !answers.all(|a| a.as_deref() == Some(branch.as_str())) {
+            continue;
         }
+        record_remote_head(project_dir, &remote, &branch);
+        facts.default_branches.insert(remote, branch);
     }
     facts
+}
+
+/// Write `refs/remotes/<remote>/HEAD` -> `refs/remotes/<remote>/<branch>`, what
+/// `git remote set-head <remote> <branch>` records. `symbolic-ref` accepts the
+/// target before a fetch has created it, which set-head does not, and
+/// [`resolve_default_branch`] reads it back either way. Through
+/// [`crate::git::command`], so no repository hook runs in the parent.
+fn record_remote_head(project_dir: &Path, remote: &str, branch: &str) {
+    let head = format!("refs/remotes/{remote}/HEAD");
+    let target = format!("refs/remotes/{remote}/{branch}");
+    if let Some(mut cmd) = crate::git::command(project_dir, &["symbolic-ref", &head, &target]) {
+        let _ = cmd
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
 }
 
 /// `default_branch` of `owner/name` from the GitHub API, via the trusted `gh`.
 ///
 /// `--hostname github.com` for the reason `gh auth token` carries it: `GH_HOST`
 /// must not steer the question to another host.
-fn gh_default_branch(repo: &str) -> Option<String> {
+fn gh_default_branch(repo: &str, timeout: std::time::Duration) -> Option<String> {
     // parse_repo_from_url guarantees one slash; keep the path to plain name
     // characters so nothing else reaches the API path.
     if repo.contains("..")
@@ -4464,26 +4516,34 @@ fn gh_default_branch(repo: &str) -> Option<String> {
             "--jq",
             ".default_branch",
         ],
-        LS_REMOTE_TIMEOUT,
+        timeout,
     )?;
     let branch = out.trim();
     (!branch.is_empty() && !branch.contains(char::is_whitespace)).then(|| branch.to_string())
 }
 
-/// How long a launch waits for `git ls-remote` before failing closed.
+/// How long a launch waits, in all, for remotes to report their default branch
+/// before failing closed.
 const LS_REMOTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The branch `remote`'s `HEAD` points at, per `git ls-remote --symref`.
+/// The branch `url`'s `HEAD` points at, per `git ls-remote --symref`.
 ///
 /// Built by [`crate::git::command`], so it runs the trusted git with the
 /// parent's hardening, including `GIT_TERMINAL_PROMPT=0` and a null stdin. It
-/// also runs in a new session: with no controlling terminal, ssh cannot open
-/// `/dev/tty` to ask for a passphrase in the middle of the launch summary.
-fn ls_remote_default_branch(project_dir: &Path, remote: &str) -> Option<String> {
+/// runs from `/`, on the URL rather than the remote name, so the repository's
+/// own config (agent-writable on Linux: `protocol.ext.allow`, transport
+/// settings) plays no part, and `GIT_ALLOW_PROTOCOL` refuses `ext::` whatever
+/// the URL says. It also runs in a new session: with no controlling terminal,
+/// ssh cannot open `/dev/tty` to ask for a passphrase mid-launch.
+fn ls_remote_default_branch(url: &str, timeout: std::time::Duration) -> Option<String> {
     use std::io::Read as _;
     use std::os::unix::process::CommandExt as _;
-    let mut cmd = crate::git::command(project_dir, &["ls-remote", "--symref", remote, "HEAD"])?;
-    cmd.stdout(std::process::Stdio::piped())
+    let mut cmd = crate::git::command(
+        Path::new("/"),
+        &["ls-remote", "--symref", "--", url, "HEAD"],
+    )?;
+    cmd.env("GIT_ALLOW_PROTOCOL", "file:git:http:https:ssh")
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
     // SAFETY: setsid is async-signal-safe and touches no memory of this process.
     unsafe {
@@ -4499,7 +4559,7 @@ fn ls_remote_default_branch(project_dir: &Path, remote: &str) -> Option<String> 
         let _ = stdout.read_to_string(&mut buf);
         buf
     });
-    let deadline = std::time::Instant::now() + LS_REMOTE_TIMEOUT;
+    let deadline = std::time::Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -8877,7 +8937,7 @@ mod tests {
             "premise: no local symref"
         );
 
-        let facts = capture_repo_facts_at_launch(&git, &repo);
+        let facts = capture_repo_facts_at_launch(&git, &repo, true);
         assert_eq!(
             facts.default_branches.get("origin").map(String::as_str),
             Some("trunk"),
@@ -8901,13 +8961,94 @@ mod tests {
             "the remote's default branch must stay refused"
         );
 
+        // The answer is recorded as set-head would have, so the next launch
+        // reads it locally and contacts nothing: a listener standing in for
+        // the remote sees no connection.
+        assert_eq!(
+            capture_repo_facts(&git, &repo)
+                .default_branches
+                .get("origin")
+                .map(String::as_str),
+            Some("trunk"),
+            "the answer must be recorded in refs/remotes/origin/HEAD"
+        );
+        let quiet = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        quiet.set_nonblocking(true).unwrap();
+        let quiet_url = format!("git://{}/o.git", quiet.local_addr().unwrap());
+        assert!(run_in(
+            &git,
+            &repo,
+            &["remote", "set-url", "origin", &quiet_url]
+        ));
+        let facts = capture_repo_facts_at_launch(&git, &repo, true);
+        assert_eq!(
+            facts.default_branches.get("origin").map(String::as_str),
+            Some("trunk")
+        );
+        assert!(
+            quiet.accept().is_err(),
+            "the second launch must ask nothing"
+        );
+        let unset = |repo: &Path| {
+            assert!(run_in(
+                &git,
+                repo,
+                &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+            ));
+        };
+
+        // A policy that does not need the default branch asks nothing either.
+        unset(&repo);
+        let facts = capture_repo_facts_at_launch(&git, &repo, false);
+        assert!(facts.default_branches.is_empty());
+        assert!(
+            quiet.accept().is_err(),
+            "ask_remote = false must ask nothing"
+        );
+
+        // The push URL is asked, not the fetch URL: a pushurl to a repository
+        // whose default is `develop` bakes `develop`. Push URLs that disagree
+        // bake nothing.
+        let (_dev_tmp, dev) =
+            scratch_repo_with_default("develop", "https://github.com/o/o.git", "develop").unwrap();
+        let dev_url = dev.to_string_lossy().into_owned();
+        assert!(run_in(
+            &git,
+            &repo,
+            &["remote", "set-url", "origin", &origin_url]
+        ));
+        assert!(run_in(
+            &git,
+            &repo,
+            &["config", "remote.origin.pushurl", &dev_url]
+        ));
+        let facts = capture_repo_facts_at_launch(&git, &repo, true);
+        assert_eq!(
+            facts.default_branches.get("origin").map(String::as_str),
+            Some("develop"),
+            "the push URL's default branch must be the one baked"
+        );
+        unset(&repo);
+        assert!(run_in(
+            &git,
+            &repo,
+            &["config", "--add", "remote.origin.pushurl", &origin_url]
+        ));
+        let facts = capture_repo_facts_at_launch(&git, &repo, true);
+        assert!(facts.default_branches.is_empty(), "push URLs disagree");
+        assert!(run_in(
+            &git,
+            &repo,
+            &["config", "--unset-all", "remote.origin.pushurl"]
+        ));
+
         // The remote does not answer: nothing captured, every push refused.
         assert!(run_in(
             &git,
             &repo,
             &["remote", "set-url", "origin", "/nonexistent/cplt-origin"],
         ));
-        let facts = capture_repo_facts_at_launch(&git, &repo);
+        let facts = capture_repo_facts_at_launch(&git, &repo, true);
         assert!(facts.default_branches.is_empty(), "nothing to bake");
         assert!(push("feature/x", &facts).is_err(), "fails closed");
 
@@ -8917,7 +9058,7 @@ mod tests {
         let url = format!("git://{}/o.git", listener.local_addr().unwrap());
         assert!(run_in(&git, &repo, &["remote", "set-url", "origin", &url]));
         let started = std::time::Instant::now();
-        let facts = capture_repo_facts_at_launch(&git, &repo);
+        let facts = capture_repo_facts_at_launch(&git, &repo, true);
         let waited = started.elapsed();
         assert!(facts.default_branches.is_empty(), "nothing to bake");
         assert!(
