@@ -7332,6 +7332,13 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
     // Detector diagnostics carry their own remedy (#434); they are findings,
     // the ecosystem list itself is `cplt init`'s business.
     for diag in cplt::detect::detect_project_recursive(&project_dir).diagnostics {
+        // `init` says it for every mise repo; doctor only when mise itself
+        // reports a pinned tool missing (or cannot tell).
+        if let Some(dir) = cplt::detect::mise_diagnostic_dir(&diag)
+            && !cplt::detect::mise_reports_missing(&dir)
+        {
+            continue;
+        }
         findings.push(Finding::warning(
             format!("[{}] {}", diag.detector, diag.message),
             None,

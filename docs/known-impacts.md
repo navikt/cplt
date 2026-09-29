@@ -1228,6 +1228,8 @@ mise install          # outside cplt
 cplt                  # then work inside
 ```
 
+`cplt init` says this for every repo whose mise config has a `tools` table. `cplt doctor` says it only when `mise ls --missing` lists something, or when it cannot ask: no mise in the trusted bin dirs, or the command fails.
+
 `mise x`, `mise exec` and an already-activated toolchain keep working — reading and executing what is already on disk was never restricted.
 
 **Relocated homes are followed, `XDG_DATA_HOME` for pnpm is not.** A custom `$PNPM_HOME` gets the same split posture through the same mechanism that keeps `$CARGO_HOME/bin` exec-only: a read-only top level, writable non-executable `store/`, and writable executable `package-manager-store/`. If pnpm follows a custom `XDG_DATA_HOME`, set `PNPM_HOME` to that pnpm directory before launching cplt so all three rules move together:

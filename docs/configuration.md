@@ -1195,6 +1195,7 @@ Supported ecosystems:
 | Next.js | `next.config.ts/js/mjs` | localhost 3000, `allow_localhost_any` |
 | Vite | `vite.config.ts/js/mjs` | localhost 5173, `allow_localhost_any` |
 | Flyway | `src/main/resources/db/migration` or `.../migrations` | PostgreSQL port 5432 |
+| mise | a `tools` table in `mise.toml`, `.mise.toml`, `mise.local.toml`, `.mise.local.toml`, `.config/mise.toml`, `.config/mise/config.toml`, `mise/config.toml` or `.mise/config.toml` | nothing; a diagnostic to run `mise install` outside cplt |
 | Cypress | `cypress.config.ts/js/mjs` + `cypress/` dir | `allow_localhost_any` (repository proposal); `allow_cache_exec` (personal config hint from `cplt init --global`) |
 
 Machine-specific suggestions such as `allow_cache_exec` or home-relative read paths come out as comments pointing you to add them to your personal `~/.config/cplt/config.toml`.
