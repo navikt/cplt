@@ -2706,7 +2706,7 @@ const GIT_ALLOWED_SUBCOMMANDS: &[&str] = &[
 /// positional (the remote/refspec), both false-blocking legitimate pushes and
 /// corrupting branch detection. This single list is shared by all push parsers so
 /// the rule can't drift between copies.
-const PUSH_FLAGS_WITH_VALUE: &[&str] =
+pub const PUSH_FLAGS_WITH_VALUE: &[&str] =
     &["--repo", "--receive-pack", "--exec", "-o", "--push-option"];
 
 /// Every long option real `git push` accepts, transcribed from `git push -h`

@@ -32,13 +32,16 @@ tracking was recorded. It was not.
 For `git push`, cplt removes `-u` and `--set-upstream` before the push runs.
 The flag does nothing except write that config, so the push itself is
 unchanged, and git has no failed write to report. The one line cplt prints
-instead: `cplt: pushing without -u, because .git/config is read-only in the
-sandbox. No upstream is recorded, so name the branch on later pushes`. A
-bundled flag such as `-uf` is left alone and gets the note below.
+instead:
+
+``cplt: pushing without -u, because .git/config is read-only in the sandbox. No upstream is recorded, so name the branch on later pushes: `git push origin HEAD:<branch>`, or run `git branch -u origin/<branch>` outside the sandbox.``
+
+A bundled flag such as `-uf` is left alone and gets the note below. A `-u`
+that is the value of an option (`-o -u`) is not the flag and stays.
 
 For the other commands, cplt says so when it can see the request coming: a
-`branch`, `checkout` or `switch` carrying `--set-upstream-to` or `--track` gets
-a note before the command runs, saying the success line will be false. Both
+`branch`, `checkout` or `switch` carrying `-u`, `--set-upstream-to`, `-t` or
+`--track` gets a note before the command runs, saying the success line will be false. Both
 need the git guard on, since the wrapper they run in is the guard's. The
 implicit form, `git checkout -b <name> <remote>/<base>`, is named in the note
 rather than detected: it sets tracking from a positional that only git can tell
@@ -46,6 +49,8 @@ from a pathspec.
 
 **The shape that works**, and what to tell an agent to do: push with an explicit
 refspec and open the PR with an explicit head, so nothing needs local config.
+To record the upstream anyway, run `git branch -u origin/<branch>` outside the
+sandbox.
 
 ```bash
 git push origin HEAD:my-branch

@@ -4839,10 +4839,15 @@ fn push_without_upstream(args: &[String]) -> Option<Vec<String>> {
         .position(|a| a == "--")
         .map_or(args.len(), |p| i + p);
     let mut kept = Vec::with_capacity(args.len());
+    // `-u` as the value of `-o`/`--repo`/…: dropping it would shift the next
+    // word into the value slot and change the destination the guard judged.
+    let mut is_value = false;
     for (n, a) in args.iter().enumerate() {
-        if n > i && n < end && (a == "-u" || a == "--set-upstream") {
+        let flags = n > i && n < end && !is_value;
+        if flags && (a == "-u" || a == "--set-upstream") {
             continue;
         }
+        is_value = flags && cplt::gh_proxy::PUSH_FLAGS_WITH_VALUE.contains(&a.as_str());
         kept.push(a.clone());
     }
     (kept.len() < args.len()).then_some(kept)
@@ -4852,7 +4857,8 @@ fn push_without_upstream(args: &[String]) -> Option<Vec<String>> {
 const UPSTREAM_DROPPED_NOTICE: &str = concat!(
     "cplt: pushing without -u, because .git/config is read-only in the sandbox. ",
     "No upstream is recorded, so name the branch on later pushes: ",
-    "`git push origin HEAD:<branch>`."
+    "`git push origin HEAD:<branch>`, or run `git branch -u origin/<branch>` ",
+    "outside the sandbox."
 );
 
 /// The note printed for such a command.
@@ -13184,6 +13190,15 @@ mod tests {
         assert_eq!(dropped(&["push", "origin", "feat"]), None);
         assert_eq!(dropped(&["clean", "-u"]), None);
         assert_eq!(dropped(&["push", "origin", "--", "-u"]), None);
+        // `-u` as an option's value is not the flag.
+        assert_eq!(
+            dropped(&["push", "--push-option", "-u", "origin", "feat"]),
+            None
+        );
+        assert_eq!(
+            dropped(&["push", "-o", "-u", "-u", "origin", "feat"]),
+            Some(a(&["push", "-o", "-u", "origin", "feat"]))
+        );
 
         // Through the gate: an allowed `push -u` runs as the rewritten argv.
         let tmp = tempfile::tempdir().unwrap();
