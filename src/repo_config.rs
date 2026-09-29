@@ -784,6 +784,89 @@ pub fn proposed_keys(propose: &ProposeSection) -> Vec<&'static str> {
     keys
 }
 
+/// What approving each `[propose]` key costs, in one line. The one table:
+/// `cplt trust show --json` hands it to consumers such as nav-pilot, which
+/// print it and write no cost text of their own, and `cplt init` takes its
+/// risk comments from here.
+pub const PROPOSE_COSTS: &[(&str, &str)] = &[
+    (
+        "allow_localhost_any",
+        "reaches any local listener; on Linux also drops kernel TCP filtering for remote \
+         hosts. Ignored under proxy.forced",
+    ),
+    (
+        "allow_jvm_attach",
+        "opens the JVM Attach API sockets, the channel tools use to load code into a \
+         running JVM",
+    ),
+    (
+        "allow_msbuild",
+        "opens MSBuild worker-node sockets for dotnet build",
+    ),
+    (
+        "gradle_init",
+        "writes cplt's init script into the machine's Gradle user home, outside the project",
+    ),
+    (
+        "allow_docker",
+        "grants access to the Docker socket, effectively root on the host",
+    ),
+    ("allow_tmp_exec", "allows code execution from /tmp"),
+    (
+        "allow_gpg_signing",
+        "exposes the GPG agent socket, so the agent can sign commits and tags as you",
+    ),
+    (
+        "allow_lifecycle_scripts",
+        "runs arbitrary scripts on install, only enable if builds fail without it",
+    ),
+    (
+        "allow_browser",
+        "can launch any application outside the sandbox, via launchd; cannot be scoped",
+    ),
+    (
+        "allow_env_files",
+        "can read .env, .pem and .key files in the project",
+    ),
+    ("repos", "read, write and execute in each named repository"),
+    ("allow.read", "can read the listed paths"),
+    ("allow.write", "can write the listed paths"),
+    (
+        "allow.socket",
+        "can connect to the listed Unix sockets; a daemon socket can be a way out of the \
+         sandbox",
+    ),
+    (
+        "sandbox.pass_env",
+        "passes the listed environment variables, and any secret in them, into the sandbox",
+    ),
+    (
+        "allow.ports",
+        "outbound connections on the listed ports, beyond 443",
+    ),
+    (
+        "allow.localhost",
+        "reaches local listeners on the listed ports",
+    ),
+    (
+        "allow.domains",
+        "adds the listed domains to an allowlist already in force",
+    ),
+    (
+        "proxy.allow_private_domains",
+        "lets the listed domains resolve to private IPs, which is a DNS-rebinding bypass",
+    ),
+];
+
+/// The cost text for a `[propose]` key, from [`PROPOSE_COSTS`].
+#[must_use]
+pub fn propose_key_cost(key: &str) -> Option<&'static str> {
+    PROPOSE_COSTS
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, c)| *c)
+}
+
 /// Format the proposed values for a key for display.
 pub fn propose_key_detail(
     propose: &ProposeSection,
@@ -800,6 +883,15 @@ pub fn propose_key_detail(
         }
         "allow.localhost" if !propose.allow.localhost.is_empty() => {
             Some(format!("{:?}", propose.allow.localhost))
+        }
+        "allow.socket" if !propose.allow.socket.is_empty() => {
+            Some(format!("{:?}", propose.allow.socket))
+        }
+        "allow.domains" if !propose.allow.domains.is_empty() => {
+            Some(format!("{:?}", propose.allow.domains))
+        }
+        "sandbox.pass_env" if !propose.pass_env.is_empty() => {
+            Some(format!("{:?}", propose.pass_env))
         }
         "proxy.allow_private_domains" if !propose.proxy.allow_private_domains.is_empty() => {
             Some(format!("{:?}", propose.proxy.allow_private_domains))
@@ -840,6 +932,38 @@ mod tests {
     /// #531: a repository cannot grant itself a managed worktree root. The key
     /// is user config only, so in `.cplt.toml` it is an unknown key, reported
     /// and never applied, wherever it is written.
+    /// #635: every key a `.cplt.toml` can ask approval for has a cost text and
+    /// a detail, so `trust show --json` never hands a consumer an empty one.
+    #[test]
+    fn every_proposable_key_has_a_cost_and_detail() {
+        let mut propose = ProposeSection {
+            repos: vec!["navikt/x".into()],
+            pass_env: vec!["X".into()],
+            ..Default::default()
+        };
+        propose.allow.read = vec!["/r".into()];
+        propose.allow.write = vec!["/w".into()];
+        propose.allow.socket = vec!["/s".into()];
+        propose.allow.ports = vec![5432];
+        propose.allow.localhost = vec![3000];
+        propose.allow.domains = vec!["example.com".into()];
+        propose.proxy.allow_private_domains = vec!["intern.example".into()];
+        let bools: Vec<&str> = crate::config::PROPOSE_BOOLS
+            .iter()
+            .filter(|r| !r.tighten_only)
+            .map(|r| r.key)
+            .collect();
+        for key in bools.iter().copied().chain(proposed_keys(&propose)) {
+            assert!(propose_key_cost(key).is_some(), "no cost text for {key}");
+            if !bools.contains(&key) {
+                assert!(
+                    propose_key_detail(&propose, key, None).is_some(),
+                    "no detail for {key}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn allow_git_worktrees_is_not_a_repo_config_key() {
         let cfg: RepoConfig = toml::from_str(

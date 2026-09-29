@@ -47,13 +47,9 @@ impl SandboxFlag {
     /// Risk warning for dangerous permissions. None means safe to suggest.
     pub fn risk_warning(self) -> Option<&'static str> {
         match self {
-            Self::AllowLifecycleScripts => {
-                Some("runs arbitrary scripts on install, only enable if builds fail without it")
+            Self::AllowLifecycleScripts | Self::AllowDocker | Self::AllowTmpExec => {
+                crate::repo_config::propose_key_cost(self.key_name())
             }
-            Self::AllowDocker => {
-                Some("grants access to the Docker socket, effectively root on the host")
-            }
-            Self::AllowTmpExec => Some("allows code execution from /tmp"),
             _ => None,
         }
     }

@@ -872,7 +872,7 @@ localhost = [3000]
 socket = ["/var/run/docker.sock"]
 ```
 
-cplt reads it from `git HEAD`, so the agent cannot tamper with its own policy mid-session, and trust approvals are pinned to the file's content. An uncommitted `.cplt.toml` grants nothing until it is committed, though its `[deny]` keys still apply. In CI and scripts, where nobody can answer a prompt, `--accept-repo-config` approves the committed file's proposals for that one run without persisting any trust. `cplt init` writes one for you by detecting the project's tooling:
+cplt reads it from `git HEAD`, so the agent cannot tamper with its own policy mid-session, and trust approvals are pinned to the file's content. An uncommitted `.cplt.toml` grants nothing until it is committed, though its `[deny]` keys still apply. In CI and scripts, where nobody can answer a prompt, `--accept-repo-config` approves the committed file's proposals for that one run without persisting any trust. Tools that need the approval state read `cplt trust show --json` ([format](docs/configuration.md#reading-trust-state-from-a-script)). `cplt init` writes one for you by detecting the project's tooling:
 
 ```bash
 cplt init             # preview detected permissions

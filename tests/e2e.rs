@@ -5364,6 +5364,145 @@ paths = [
         cmd
     }
 
+    /// #635: `trust show --json`, `config show` and the launch agree on every
+    /// state, because all three read the launch gate's rule. The changed case
+    /// keeps the same keys with a new value: `config show` used to judge by key
+    /// names and called that "approved" while the launch granted nothing.
+    #[test]
+    fn e2e_trust_show_json_config_show_and_launch_agree() {
+        require_sandbox!();
+        let (repo, config_file) = make_trust_repo(
+            "show-json",
+            "[propose]\nallow_localhost_any = true\n[propose.allow]\nports = [5432]\n",
+        );
+        let json = || -> serde_json::Value {
+            let out = trust_cmd(&repo, &config_file)
+                .args(["trust", "show", "--json"])
+                .output()
+                .expect("run trust show --json");
+            assert!(out.status.success(), "{out:?}");
+            serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+                panic!(
+                    "stdout is not JSON ({e}): {}",
+                    String::from_utf8_lossy(&out.stdout)
+                )
+            })
+        };
+        let config_show = || {
+            let out = trust_cmd(&repo, &config_file)
+                .args(["config", "show"])
+                .output()
+                .expect("run config show");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        // The keys the launch reports as unapproved: one `○ key` line each.
+        let launch_unapproved = || -> Vec<String> {
+            let out = trust_cmd(&repo, &config_file)
+                .args([
+                    "--agent",
+                    "shell",
+                    "--yes",
+                    "--no-validate",
+                    "--",
+                    "-c",
+                    "true",
+                ])
+                .output()
+                .expect("launch");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "launch failed: {stderr}");
+            let mut keys: Vec<String> = stderr
+                .lines()
+                .filter_map(|l| l.trim_start().strip_prefix("○ "))
+                .map(|l| l.split(':').next().unwrap_or(l).trim().to_string())
+                .collect();
+            keys.sort();
+            keys
+        };
+        let json_unapproved = |v: &serde_json::Value| -> Vec<String> {
+            let mut keys: Vec<String> = v["proposed"]
+                .as_array()
+                .expect("proposed")
+                .iter()
+                .filter(|p| p["approved"] == false)
+                .map(|p| p["key"].as_str().expect("key").to_string())
+                .collect();
+            keys.sort();
+            keys
+        };
+        let commit = |content: &str| {
+            std::fs::write(repo.join(".cplt.toml"), content).expect("write");
+            git_cmd(&repo)
+                .args(["-c", "commit.gpgSign=false", "commit", "-qam", "change"])
+                .output()
+                .expect("commit");
+        };
+
+        // Not trusted at all.
+        let v = json();
+        assert_eq!(v["version"], 1);
+        assert_eq!(v["state"], "pending", "{v}");
+        assert_eq!(v["command"], "cplt trust accept", "{v}");
+        let p0 = &v["proposed"][0];
+        assert_eq!(p0["key"], "allow_localhost_any", "{v}");
+        assert!(
+            p0["effect"]
+                .as_str()
+                .is_some_and(|e| e.contains("any local listener")),
+            "{v}"
+        );
+        assert_eq!(v["proposed"][1]["detail"], "[5432]", "{v}");
+        assert_eq!(json_unapproved(&v), launch_unapproved());
+        assert!(config_show().contains("(pending approval)"));
+
+        // Trusted.
+        let out = trust_cmd(&repo, &config_file)
+            .args(["trust", "accept", "--all"])
+            .output()
+            .expect("accept");
+        assert!(out.status.success(), "{out:?}");
+        let v = json();
+        assert_eq!(v["state"], "approved", "{v}");
+        assert_eq!(v["command"], serde_json::Value::Null, "{v}");
+        assert!(json_unapproved(&v).is_empty());
+        assert_eq!(json_unapproved(&v), launch_unapproved());
+        let shown = config_show();
+        assert!(
+            shown.contains("(approved)") && !shown.contains("pending"),
+            "{shown}"
+        );
+
+        // Changed: same keys, new value.
+        commit("[propose]\nallow_localhost_any = true\n[propose.allow]\nports = [6543]\n");
+        let v = json();
+        assert_eq!(v["state"], "changed", "{v}");
+        assert_eq!(v["command"], "cplt trust accept", "{v}");
+        assert_eq!(json_unapproved(&v), ["allow.ports", "allow_localhost_any"]);
+        assert_eq!(json_unapproved(&v), launch_unapproved());
+        let shown = config_show();
+        assert!(
+            shown.contains("(pending approval)") && !shown.contains("✓ approved"),
+            "config show must not call a changed proposal approved:\n{shown}"
+        );
+
+        // No .cplt.toml.
+        git_cmd(&repo)
+            .args(["-c", "commit.gpgSign=false", "rm", "-q", ".cplt.toml"])
+            .output()
+            .expect("git rm");
+        git_cmd(&repo)
+            .args(["-c", "commit.gpgSign=false", "commit", "-qm", "rm"])
+            .output()
+            .expect("commit");
+        let v = json();
+        assert_eq!(v["state"], "none", "{v}");
+        assert_eq!(v["proposed"], serde_json::json!([]), "{v}");
+        assert!(launch_unapproved().is_empty());
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(config_file.parent().expect("cfg dir"));
+    }
+
     /// #491, the whole loop: a repository proposes another repository by name,
     /// approving resolves and links it, and revoking removes exactly what the
     /// approval created — never a root the user added themselves.

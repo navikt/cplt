@@ -449,6 +449,48 @@ pub fn approval_status(
     }
 }
 
+/// What the launch gate concludes about a stored approval.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// No trust entry for this repository.
+    NoEntry,
+    /// An entry exists, but it was granted in a different repository.
+    Foreign,
+    /// Any [`ApprovalStatus`] of an entry bound to this repository.
+    Status(ApprovalStatus),
+}
+
+/// The launch gate's rule, in one place: `cplt trust show --json` and
+/// `cplt config show` call this too, so none of them can say "approved" about
+/// a proposal the launch refuses.
+#[must_use]
+pub fn verdict(
+    entry: Option<&TrustEntry>,
+    project_dir: &Path,
+    loaded: &crate::repo_config::LoadedRepoConfig,
+) -> Verdict {
+    let Some(t) = entry else {
+        return Verdict::NoEntry;
+    };
+    if !approved_path_matches(t, project_dir) {
+        return Verdict::Foreign;
+    }
+    let current_hash = proposal_content_hash(&loaded.config.propose);
+    let nothing_proposed = !loaded.propose_dropped
+        && crate::repo_config::proposed_keys(&loaded.config.propose).is_empty();
+    Verdict::Status(approval_status(t, &current_hash, nothing_proposed))
+}
+
+/// The keys the launch applies under `verdict`: only a current approval bound
+/// to this repository grants anything.
+#[must_use]
+pub fn granted_keys(entry: Option<&TrustEntry>, verdict: Verdict) -> Vec<String> {
+    match (entry, verdict) {
+        (Some(t), Verdict::Status(ApprovalStatus::Current)) => t.accepted.keys.clone(),
+        _ => Vec::new(),
+    }
+}
+
 /// What `cplt trust accept` leaves behind for an [`ApprovalStatus::Outlived`]
 /// entry: `None` to delete it, or an entry that approves nothing.
 ///
