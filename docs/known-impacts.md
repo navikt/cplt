@@ -179,6 +179,19 @@ At launch cplt prints a warning naming both directories, then drops the executab
 
 **Fix:** move the toolchain home outside `~/.cache` (for example `CARGO_HOME=~/.local/share/cargo`), or point the symlinks at separate trees.
 
+## Go builds in a git worktree
+
+A Go build in a git worktree can fail under cplt with:
+
+```
+error obtaining VCS status: exit status 128
+	Use -buildvcs=false to disable VCS stamping.
+```
+
+**Why:** Go only treats a `.git` directory as a repository root. A worktree has a `.git` file, so Go keeps walking up. If `$HOME` is a git repo (a dotfiles repo, say), Go runs git there, and the sandbox does not let the agent read `$HOME`. Outside cplt the build passes because Go stamps the dotfiles repo instead.
+
+**Fix:** turn off VCS stamping. Set `GOFLAGS=-buildvcs=false` in your shell or in mise's `[env]`; cplt passes `GOFLAGS` through to the sandbox. For a single build, use `go build -buildvcs=false`.
+
 ## Lifecycle scripts (postinstall hooks)
 
 npm/yarn/pnpm lifecycle scripts are **blocked by default** via `npm_config_ignore_scripts=true` and `YARN_ENABLE_SCRIPTS=false`. This stops supply chain attacks through postinstall hooks, but it may break packages that need a post-install step:

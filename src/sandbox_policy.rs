@@ -1281,6 +1281,12 @@ pub const ENV_ALLOWLIST: &[&str] = &[
     "GOMODCACHE",
     "GOPROXY",
     "GOPRIVATE",
+    // GOFLAGS carries user build flags such as `-buildvcs=false`, which a Go
+    // build in a git worktree needs when $HOME is a git repo (#617). It can hold
+    // `-toolexec`, which runs a program, but the value comes from the invoking
+    // shell, which already runs unsandboxed, so it opens no new attacker path.
+    // Same trust level as JAVA_TOOL_OPTIONS and MAVEN_OPTS (both inherited unsanitized).
+    "GOFLAGS",
     // Java/JVM
     "JAVA_HOME",
     "GRADLE_HOME",
