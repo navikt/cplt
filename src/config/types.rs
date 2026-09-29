@@ -680,6 +680,9 @@ pub struct SandboxConfig {
     /// only files named exactly `.pem` (default: false, macOS only). See
     /// `SENSITIVE_KEY_FILE_EXTENSION_PATTERNS`.
     pub deny_key_files_by_extension: Option<bool>,
+    /// Keep pnpm's XDG config dir read-only and deny its token files
+    /// (`auth.ini`, `rc`) (default: false). See `sandbox_policy::pnpm_config_dirs`.
+    pub protect_pnpm_config: Option<bool>,
     /// Refuse to launch when a repository's `.cplt.toml` cannot be read or
     /// parsed, instead of warning and launching without its `[deny]`
     /// (default: false, #385 M-01).
@@ -968,6 +971,7 @@ pub struct Resolved {
     pub deny_nested_git: bool,
     pub refuse_cache_exec_links: bool,
     pub deny_key_files_by_extension: bool,
+    pub protect_pnpm_config: bool,
     pub refuse_invalid_repo_config: bool,
     pub deny_copilot_dir_exec: bool,
     pub allow_docker: bool,

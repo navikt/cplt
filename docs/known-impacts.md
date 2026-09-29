@@ -978,12 +978,22 @@ Registry credential files are **blocked by default**, because they typically hol
 | `~/.cargo/credentials` | Cargo crate registry tokens |
 | `~/.cargo/credentials.toml` | Cargo crate registry tokens (TOML format) |
 
+With [`sandbox.protect_pnpm_config`](configuration.md#protecting-pnpms-global-config-sandboxprotect_pnpm_config) on, pnpm's global token files are blocked too:
+
+| File | Purpose |
+|------|---------|
+| `~/.config/pnpm/auth.ini` | pnpm 11+ registry tokens (`pnpm login`, `pnpm config set --global`) |
+| `~/.config/pnpm/rc` | the same, pnpm 10 and older |
+
+The key is off by default, and then pnpm's config dir is readable and writable, tokens included. The path follows `$XDG_CONFIG_HOME` when it is set.
+
 **Fix:** all of these can be overridden with `--allow-read`.
 
 ```bash
 cplt config set allow.read "~/.m2/settings.xml"
 cplt config set allow.read "~/.gradle/gradle.properties"
 cplt config set allow.read "~/.npmrc"
+cplt config set allow.read "~/.config/pnpm/auth.ini"
 ```
 
 Or for a single run: `cplt --allow-read ~/.m2/settings.xml`

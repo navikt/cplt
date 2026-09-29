@@ -833,6 +833,7 @@ fn landlock_policy_device_files_have_ioctl() {
         deny_nested_git: false,
         refuse_cache_exec_links: false,
         deny_key_files_by_extension: false,
+        protect_pnpm_config: false,
         deny_copilot_dir_exec: false,
         allow_jvm_attach: false,
         allow_msbuild: false,
@@ -2646,6 +2647,7 @@ fn base_profile_options() -> SandboxConfig<'static> {
         deny_nested_git: false,
         refuse_cache_exec_links: false,
         deny_key_files_by_extension: false,
+        protect_pnpm_config: false,
         deny_copilot_dir_exec: false,
         allow_jvm_attach: false,
         allow_msbuild: false,
@@ -4184,6 +4186,7 @@ fn allow_localhost_any_affects_both_backends() {
         deny_nested_git: false,
         refuse_cache_exec_links: false,
         deny_key_files_by_extension: false,
+        protect_pnpm_config: false,
         deny_copilot_dir_exec: false,
         allow_jvm_attach: false,
         allow_msbuild: false,
@@ -4252,6 +4255,7 @@ fn config_options_parity_across_backends() {
         deny_nested_git: false,
         refuse_cache_exec_links: false,
         deny_key_files_by_extension: false,
+        protect_pnpm_config: false,
         deny_copilot_dir_exec: false,
         allow_jvm_attach: true,
         allow_msbuild: false,
@@ -9758,6 +9762,7 @@ fn no_pasteboard_rule_when_deny_clipboard_is_off() {
             deny_nested_git: false,
             refuse_cache_exec_links: false,
             deny_key_files_by_extension: false,
+            protect_pnpm_config: false,
             deny_copilot_dir_exec: false,
             ..base_profile_options()
         },
@@ -9896,6 +9901,7 @@ gradle_init = false
 deny_nested_git = false
 refuse_cache_exec_links = false
 deny_key_files_by_extension = false
+protect_pnpm_config = false
 refuse_invalid_repo_config = false
 deny_copilot_dir_exec = false
 allow_docker = false
@@ -10377,6 +10383,7 @@ fn landlock_relocated_cargo_bin_is_exec_only_and_registry_is_precreated() {
         deny_nested_git: false,
         refuse_cache_exec_links: false,
         deny_key_files_by_extension: false,
+        protect_pnpm_config: false,
         deny_copilot_dir_exec: false,
         allow_jvm_attach: false,
         allow_msbuild: false,

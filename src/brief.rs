@@ -926,6 +926,7 @@ mod tests {
             deny_nested_git: false,
             refuse_cache_exec_links: false,
             deny_key_files_by_extension: false,
+            protect_pnpm_config: false,
             refuse_invalid_repo_config: false,
             deny_copilot_dir_exec: false,
             allow_jvm_attach: false,

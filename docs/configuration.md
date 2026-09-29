@@ -722,6 +722,7 @@ The settings below are machine-specific or local CLI preferences, so `.cplt.toml
 | `sandbox.deny_nested_git` | a staged hardening switch, see [Blocking new nested `.git` entries](#blocking-new-nested-git-entries-sandboxdeny_nested_git) |
 | `sandbox.refuse_cache_exec_links` | a staged hardening switch, see [Symlinked cache-exec entries](#symlinked-cache-exec-entries-sandboxrefuse_cache_exec_links) |
 | `sandbox.deny_key_files_by_extension` | a staged hardening switch, see [Denying key files by extension](#denying-key-files-by-extension-sandboxdeny_key_files_by_extension) |
+| `sandbox.protect_pnpm_config` | a staged hardening switch, see [Protecting pnpm's global config](#protecting-pnpms-global-config-sandboxprotect_pnpm_config) |
 | `sandbox.refuse_invalid_repo_config` | decides how a repo's own broken config is treated, so the repo cannot set it; see [Refusing an invalid `.cplt.toml`](#refusing-an-invalid-cplttoml-sandboxrefuse_invalid_repo_config) |
 | `sandbox.deny_copilot_dir_exec` | a staged hardening switch, see [No execute on `~/.copilot`](#no-execute-on-copilot-sandboxdeny_copilot_dir_exec) |
 | `sandbox.inherit_env` | too dangerous for repo config, it would affect every team member |
@@ -880,6 +881,29 @@ To recover, set the key back to `false`. `--allow-env-files` also lifts it, but 
 It follows `--allow-env-files`: with that flag, none of these patterns are emitted. Like the default patterns, it is lifted for read inside the extracted dependency stores (`~/go/pkg/mod`, `~/.cargo/registry`) when a granted tree covers them, since a key file there is a library's test fixture. A `--deny-path` or `deny.paths` entry inside or above a store still wins, the same way it does for `.env` (#597): the read deny is repeated after the carve-out, narrowed to the part of the store you denied, so `server.pem` under your deny stays unreadable and the rest of the store keeps the carve-out.
 
 It has no effect on Linux, where the launch says so. Landlock cannot deny a file by name pattern, so on Linux the default patterns do not apply either.
+
+## Protecting pnpm's global config (`sandbox.protect_pnpm_config`)
+
+pnpm keeps its global config in `~/.config/pnpm` (or `$XDG_CONFIG_HOME/pnpm`). That is where pnpm looks on Linux, and on macOS when `XDG_CONFIG_HOME` is set; otherwise macOS pnpm uses `~/Library/Preferences/pnpm`, where cplt grants `config.yaml` read-only. The XDG directory holds `config.yaml` and, since pnpm 11, `auth.ini`, where `pnpm login` and `pnpm config set --global //registry/:_authToken=...` store registry tokens. pnpm 10 and older keep them in `rc`. cplt grants the directory read and write, so by default the agent can read those tokens and change settings that your own pnpm uses outside the sandbox.
+
+`sandbox.protect_pnpm_config` makes the directory read-only and denies `auth.ini` and `rc` for read and write. `config.yaml` stays readable, so `pnpm install` still sees your global settings. On macOS the two files get deny rules. On Linux, where Landlock cannot deny a file inside a granted directory, the directory is no longer granted at all and `config.yaml` is granted read-only on its own. Anything else in the directory is then unreadable on Linux.
+
+```bash
+cplt config set sandbox.protect_pnpm_config true
+```
+
+Off by default, because it breaks things that work today:
+
+- a `pnpm install` from a private registry whose token is only in `auth.ini` or `rc`. It fails with 401, and pnpm 11 warns that it could not read `auth.ini`
+- `pnpm config set --global`, `pnpm login` and `pnpm logout` inside the sandbox
+
+To give pnpm one token file back, grant it by exact path. On macOS the grant re-allows it after the deny, as it does for `~/.npmrc`:
+
+```bash
+cplt config set allow.read "~/.config/pnpm/auth.ini"
+```
+
+Or set the key back to `false`. A token in `config.yaml` (pnpm 11 accepts an `_auth` entry there) stays readable either way. See [Private registries](known-impacts.md#private-registries).
 
 ## Dropping the Keychain grant (`sandbox.keychain_substitute`) — EXPERIMENTAL
 

@@ -236,6 +236,9 @@ pub struct SandboxConfig<'a> {
     /// `*.pfx` and `*.jks` by extension, not only files named exactly `.pem`.
     /// macOS only; Linux has no name-pattern denies.
     pub deny_key_files_by_extension: bool,
+    /// `sandbox.protect_pnpm_config`: pnpm's XDG config dir is read-only and
+    /// its token files (`auth.ini`, `rc`) are denied, on both backends.
+    pub protect_pnpm_config: bool,
     /// `sandbox.deny_copilot_dir_exec` (#324). The grant itself is withdrawn
     /// in `agent_dirs` before this config is built; the flag is here so the
     /// Linux launch can warn about what Landlock unions back in.
@@ -2310,6 +2313,11 @@ fn prepare_impl(
             ui::warn(&w);
         }
     }
+    if config.protect_pnpm_config {
+        for w in landlock_mod::pnpm_config_residuals(&policy.fs_rules, config.home_dir) {
+            ui::warn(&w);
+        }
+    }
 
     // Decide bubblewrap wrapping before `precompute()` consumes `policy`.
     // `resolve()` only clones `fs_rules`/`net_rules` on the arms that actually
@@ -2617,6 +2625,27 @@ fn validate_config_paths(config: &SandboxConfig) -> Result<(), String> {
     for p in config.extra_deny {
         policy::validate_sbpl_path(p).map_err(|e| format!("--deny-path path: {e}"))?;
     }
+    // `sandbox.protect_pnpm_config`: a deny the profile cannot name would be
+    // dropped, leaving the tokens to any grant that covers them. Refuse.
+    if config.protect_pnpm_config {
+        let dirs = policy::pnpm_config_dirs(config.home_dir);
+        for p in dirs
+            .iter()
+            .cloned()
+            .chain(policy::pnpm_credential_files(config.home_dir))
+        {
+            for s in [p.clone(), crate::config::canonicalize_deepest(&p)] {
+                policy::validate_sbpl_path(&s).map_err(|e| {
+                    format!(
+                        "sandbox.protect_pnpm_config: {e}\n\
+                             pnpm's config dir comes from XDG_CONFIG_HOME (default ~/.config). \
+                             Point it at a path without those characters, or run \
+                             `cplt config set sandbox.protect_pnpm_config false`."
+                    )
+                })?;
+            }
+        }
+    }
 
     // allow_cache_exec subdirs are interpolated into SBPL string literals — validate here
     // as a second line of defence (config::merge already validates, but SandboxConfig can
@@ -2794,6 +2823,7 @@ mod tests {
             deny_nested_git: false,
             refuse_cache_exec_links: false,
             deny_key_files_by_extension: false,
+            protect_pnpm_config: false,
             deny_copilot_dir_exec: false,
             allow_jvm_attach: false,
             allow_msbuild: false,
@@ -3534,6 +3564,28 @@ mod tests {
         config.managed_worktree_root = Some(&root);
         let err = super::validate_config_paths(&config).expect_err("must refuse");
         assert!(err.contains("Managed worktree root"), "{err}");
+    }
+
+    /// `sandbox.protect_pnpm_config` with an `XDG_CONFIG_HOME` the profile
+    /// cannot name refuses the launch rather than dropping the token denies.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unnameable_pnpm_config_dir_is_refused_with_protect_pnpm_config() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let xdg = home.join("x\"dg");
+        temp_env::with_var("XDG_CONFIG_HOME", Some(&xdg), || {
+            let mut config = test_config(&home, &[]);
+            assert!(super::validate_config_paths(&config).is_ok(), "key off");
+            config.protect_pnpm_config = true;
+            let err = super::validate_config_paths(&config).expect_err("must refuse");
+            assert!(err.contains("sandbox.protect_pnpm_config"), "{err}");
+            assert!(err.contains("XDG_CONFIG_HOME"), "names the source: {err}");
+            assert!(
+                err.contains("cplt config set sandbox.protect_pnpm_config false"),
+                "names the way out: {err}"
+            );
+        });
     }
 
     /// `cplt doctor` must probe the wrapper the launch builds, not an empty

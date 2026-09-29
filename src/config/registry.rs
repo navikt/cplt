@@ -415,6 +415,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "sandbox",
+        key: "protect_pnpm_config",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "false",
+        description: "Keep pnpm's global config dir (~/.config/pnpm, or $XDG_CONFIG_HOME/pnpm) read-only and deny its token files, auth.ini (pnpm 11+) and rc (pnpm 10 and older). Breaks pnpm installs from a private registry whose token is only in those files, and `pnpm config set --global` / `pnpm login` inside the sandbox. config.yaml stays readable. Re-allow a token file with allow.read.",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
         key: "refuse_invalid_repo_config",
         value_type: ConfigValueType::Bool,
         dangerous: false,
@@ -1084,6 +1092,14 @@ bool_keys! {
         config = |c: &Config| c.sandbox.deny_key_files_by_extension,
         baseline = |_: PresetBaseline| false,
         resolved = |r: &Resolved| r.deny_key_files_by_extension;
+
+    /// Config-only and off by default (staged rollout, #264): it withholds
+    /// pnpm registry tokens a private-registry install may need.
+    protect_pnpm_config, "sandbox", "protect_pnpm_config",
+        cli = |_: &CliFlags| FeatureToggle::UseDefault,
+        config = |c: &Config| c.sandbox.protect_pnpm_config,
+        baseline = |_: PresetBaseline| false,
+        resolved = |r: &Resolved| r.protect_pnpm_config;
 
     /// Config-only and off by default (staged rollout, #385 M-01): with it on,
     /// a typo in a committed `.cplt.toml` stops every launch in that repo.

@@ -5526,6 +5526,7 @@ fn build_sandbox_config<'a>(
         deny_nested_git: resolved.deny_nested_git,
         refuse_cache_exec_links: resolved.refuse_cache_exec_links,
         deny_key_files_by_extension: resolved.deny_key_files_by_extension,
+        protect_pnpm_config: resolved.protect_pnpm_config,
         deny_copilot_dir_exec: resolved.deny_copilot_dir_exec,
         allow_jvm_attach: resolved.allow_jvm_attach,
         allow_msbuild: resolved.allow_msbuild,

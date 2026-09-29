@@ -494,6 +494,7 @@ impl Config {
         let deny_nested_git = bools.deny_nested_git;
         let refuse_cache_exec_links = bools.refuse_cache_exec_links;
         let deny_key_files_by_extension = bools.deny_key_files_by_extension;
+        let protect_pnpm_config = bools.protect_pnpm_config;
 
         let refuse_invalid_repo_config = bools.refuse_invalid_repo_config;
         let deny_copilot_dir_exec = bools.deny_copilot_dir_exec;
@@ -676,6 +677,7 @@ impl Config {
             deny_nested_git,
             refuse_cache_exec_links,
             deny_key_files_by_extension,
+            protect_pnpm_config,
             refuse_invalid_repo_config,
             deny_copilot_dir_exec,
             allow_docker,
@@ -4105,6 +4107,14 @@ mod precedence {
                 cli_on: None,
                 cli_off: None,
                 get: |r| r.deny_key_files_by_extension,
+                default: false,
+                preset: None,
+            },
+            Ladder {
+                key: "sandbox.protect_pnpm_config",
+                cli_on: None,
+                cli_off: None,
+                get: |r| r.protect_pnpm_config,
                 default: false,
                 preset: None,
             },

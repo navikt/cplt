@@ -429,14 +429,21 @@ mod linux_tests {
     /// set as given (#463). The config lives outside HOME: a `CPLT_CONFIG`
     /// directory holding HOME would make all of it cplt's state directory.
     fn run_build_creds(home: &Path, on: bool, flags: &[&str], script: &str) -> (i32, String) {
+        run_with_sandbox_key(home, "allow_build_credentials", on, flags, script)
+    }
+
+    /// [`run_build_creds`] for any boolean `[sandbox]` key.
+    fn run_with_sandbox_key(
+        home: &Path,
+        key: &str,
+        on: bool,
+        flags: &[&str],
+        script: &str,
+    ) -> (i32, String) {
         let project = create_test_project();
         let cfg = tempfile::tempdir().unwrap();
         let cfg_file = cfg.path().join("config.toml");
-        fs::write(
-            &cfg_file,
-            format!("[sandbox]\nallow_build_credentials = {on}\n"),
-        )
-        .unwrap();
+        fs::write(&cfg_file, format!("[sandbox]\n{key} = {on}\n")).unwrap();
         let dir = project.path().to_string_lossy().into_owned();
         let mut args = vec![
             "--yes",
@@ -453,12 +460,65 @@ mod linux_tests {
             .args(&args)
             .env("HOME", home)
             .env("CPLT_CONFIG", &cfg_file)
+            .env_remove("XDG_CONFIG_HOME")
             .output()
             .expect("Failed to execute cplt");
         (
             out.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&out.stdout).into_owned(),
         )
+    }
+
+    /// `sandbox.protect_pnpm_config` under Landlock, which cannot take a file
+    /// out of a granted dir: with the key on, pnpm's config dir loses its dir
+    /// grant, so `auth.ini` and `rc` are unreadable and nothing is writable,
+    /// while `config.yaml` keeps a read-only file grant. Off, all three are
+    /// readable and the dir writable, as before the key existed.
+    #[test]
+    fn protect_pnpm_config_withholds_token_files() {
+        require_landlock!();
+        // Not under /tmp: Landlock grants /tmp read+write, which covers the
+        // dir, and bwrap hides it behind a private tmpfs.
+        let home = tempdir_outside_tmp();
+        let cfg = home.path().join(".config/pnpm");
+        fs::create_dir_all(&cfg).unwrap();
+        for (f, body) in [
+            ("auth.ini", "PNPM_AUTH_TOKEN"),
+            ("rc", "PNPM_RC_TOKEN"),
+            ("config.yaml", "PNPM_YAML_OK"),
+        ] {
+            fs::write(cfg.join(f), body).unwrap();
+        }
+        let key = "protect_pnpm_config";
+        let read_all = "cd ~/.config/pnpm && cat auth.ini; cat rc; cat config.yaml; echo";
+
+        let (_, off) = run_with_sandbox_key(home.path(), key, false, &[], read_all);
+        for token in ["PNPM_AUTH_TOKEN", "PNPM_RC_TOKEN", "PNPM_YAML_OK"] {
+            assert!(off.contains(token), "off: {token} unreadable: {off}");
+        }
+        let (code, out) =
+            run_with_sandbox_key(home.path(), key, false, &[], "echo x > ~/.config/pnpm/new");
+        assert_eq!(code, 0, "off: the dir stays writable: {out}");
+
+        let (_, on) = run_with_sandbox_key(home.path(), key, true, &[], read_all);
+        assert!(
+            on.contains("PNPM_YAML_OK"),
+            "on: config.yaml unreadable: {on}"
+        );
+        for token in ["PNPM_AUTH_TOKEN", "PNPM_RC_TOKEN"] {
+            assert!(!on.contains(token), "on: {token} leaked: {on}");
+        }
+        for script in [
+            "echo x > ~/.config/pnpm/new2",
+            "echo x >> ~/.config/pnpm/config.yaml",
+        ] {
+            let (code, out) = run_with_sandbox_key(home.path(), key, true, &[], script);
+            assert_ne!(code, 0, "on: `{script}` must fail: {out}");
+        }
+        assert_eq!(
+            fs::read_to_string(cfg.join("config.yaml")).unwrap(),
+            "PNPM_YAML_OK"
+        );
     }
 
     fn build_creds_home() -> tempfile::TempDir {
