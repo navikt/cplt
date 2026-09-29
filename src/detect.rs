@@ -1156,9 +1156,12 @@ fn detect_mise(ctx: &DetectContext) -> DetectorOutput {
     const CONFIGS: &[&str] = &[
         "mise.toml",
         ".mise.toml",
+        "mise.local.toml",
+        ".mise.local.toml",
         ".config/mise.toml",
         ".config/mise/config.toml",
         "mise/config.toml",
+        ".mise/config.toml",
     ];
     let Some(file) = CONFIGS.iter().find(|f| {
         ctx.read_text(f)
@@ -1187,6 +1190,38 @@ fn detect_mise(ctx: &DetectContext) -> DetectorOutput {
             ),
         }],
     }
+}
+
+/// The directory a mise diagnostic names, for `cplt doctor` to ask mise
+/// whether anything is actually missing there. Parses the message
+/// [`detect_mise`] formats.
+pub fn mise_diagnostic_dir(diag: &Diagnostic) -> Option<PathBuf> {
+    if diag.detector != "mise" {
+        return None;
+    }
+    let rest = diag.message.split_once("`mise install` in ")?.1;
+    Some(PathBuf::from(rest.split_once(" outside cplt")?.0))
+}
+
+/// Whether `mise ls --missing` reports a pinned tool missing in `dir`.
+///
+/// `true` whenever that cannot be told — no mise in the trusted bin dirs, an
+/// untrusted config, any failure — so doctor keeps the warning rather than
+/// dropping it on a guess. mise comes from [`crate::git::trusted_binary`],
+/// never `PATH`, like every parent-side spawn; stdin is closed so a trust
+/// prompt fails instead of hanging.
+pub fn mise_reports_missing(dir: &Path) -> bool {
+    let Some(mise) = crate::git::trusted_binary("mise") else {
+        return true;
+    };
+    #[allow(clippy::disallowed_methods)] // absolute path from trusted_binary
+    let out = std::process::Command::new(mise)
+        .args(["ls", "--missing"])
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    !matches!(out, Ok(o) if o.status.success() && o.stdout.trim_ascii().is_empty())
 }
 
 fn collect_nav_private(content: &str, out: &mut BTreeSet<String>) {
@@ -3453,6 +3488,58 @@ services:
                 report.diagnostics
             );
         }
+    }
+
+    #[test]
+    fn mise_local_and_dot_mise_configs_count() {
+        for file in ["mise.local.toml", ".mise.local.toml", ".mise/config.toml"] {
+            let dir = setup_dir();
+            fs::create_dir_all(dir.path().join(".mise")).unwrap();
+            fs::write(dir.path().join(file), "[tools]\nnode = \"24\"\n").unwrap();
+            let report = detect_project(dir.path());
+            assert!(report.detections.iter().any(|d| d.name == "mise"), "{file}");
+        }
+    }
+
+    /// doctor finds the directory to ask mise about from the diagnostic, so
+    /// the parser must stay in step with the message.
+    #[test]
+    fn mise_diagnostic_dir_round_trips() {
+        let dir = setup_dir();
+        fs::write(dir.path().join("mise.toml"), "[tools]\nnode = \"24\"\n").unwrap();
+        let report = detect_project(dir.path());
+        let diag = report
+            .diagnostics
+            .iter()
+            .find(|d| d.detector == "mise")
+            .unwrap();
+        assert_eq!(mise_diagnostic_dir(diag).as_deref(), Some(dir.path()));
+        let other = Diagnostic {
+            detector: "node",
+            message: "Run `mise install` in /x outside cplt".to_string(),
+        };
+        assert_eq!(mise_diagnostic_dir(&other), None);
+    }
+
+    /// Unknown means keep warning: a directory mise cannot run in is not
+    /// evidence that nothing is missing.
+    #[test]
+    fn mise_reports_missing_when_it_cannot_tell() {
+        assert!(mise_reports_missing(Path::new(
+            "/nonexistent/cplt-mise-probe"
+        )));
+    }
+
+    /// With a trusted mise and nothing pinned, nothing is missing. Skipped on
+    /// hosts without mise in the trusted bin dirs, where the answer is
+    /// always "keep the warning".
+    #[test]
+    fn mise_reports_nothing_missing_without_pins() {
+        if crate::git::trusted_binary("mise").is_none() {
+            return;
+        }
+        let dir = setup_dir();
+        assert!(!mise_reports_missing(dir.path()));
     }
 
     /// Tasks alone install nothing, so there is nothing to warn about, even

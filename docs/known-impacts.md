@@ -1214,7 +1214,7 @@ mise install          # outside cplt
 cplt                  # then work inside
 ```
 
-`cplt init` and `cplt doctor` say this for a repo whose mise config has a `[tools]` section.
+`cplt init` says this for every repo whose mise config has a `tools` table. `cplt doctor` says it only when `mise ls --missing` lists something, or when it cannot ask: no mise in the trusted bin dirs, or the command fails.
 
 `mise x`, `mise exec` and an already-activated toolchain keep working — reading and executing what is already on disk was never restricted.
 
