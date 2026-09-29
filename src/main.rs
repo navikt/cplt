@@ -5922,13 +5922,19 @@ fn decode_fs_probe(code: u8) -> check::Decision {
 }
 
 /// Probe read access to `path` inside the sandbox (opens for read, reads
-/// nothing). Works for files and directories.
+/// nothing). Works for files and directories; a missing path is
+/// [`check::Decision::Inconclusive`].
 fn probe_read(
     prepared: &sandbox::PreparedSandbox,
     resolved: &config::Resolved,
     disabled: &[sandbox::HardeningCategory],
     path: &Path,
 ) -> check::Decision {
+    // A missing path fails the open with ENOENT, which the exit code cannot
+    // tell apart from a sandbox denial (#621).
+    if !path.exists() {
+        return check::Decision::Inconclusive;
+    }
     let script = format!(
         "exec >/dev/null 2>&1; : < {}",
         sh_quote(&path.to_string_lossy())
@@ -6610,7 +6616,14 @@ fn build_path_check(
     let mut items = Vec::new();
 
     let read_dec = probe_read(prepared, resolved, disabled, path);
-    let note = mismatch_note(read_dec, expl.read_decision());
+    let note = if read_dec == check::Decision::Inconclusive && !path.exists() {
+        Some(format!(
+            "path does not exist, so there is nothing to probe; the policy model predicts {}",
+            expl.read_decision().as_str()
+        ))
+    } else {
+        mismatch_note(read_dec, expl.read_decision())
+    };
     items.push(check::CheckItem {
         name: "read".to_string(),
         category: "filesystem".to_string(),
@@ -6618,7 +6631,7 @@ fn build_path_check(
         decision: read_dec,
         expected: None,
         reason: expl.reason.clone(),
-        fix: expl.fix.clone(),
+        fix: mismatch_fix(read_dec, expl.read_decision()).or_else(|| expl.fix.clone()),
         note,
     });
 
@@ -6649,7 +6662,7 @@ fn build_path_check(
             decision: write_dec,
             expected: None,
             reason,
-            fix,
+            fix: mismatch_fix(write_dec, expl.write_decision()).or(fix),
             note,
         });
     }
@@ -6670,6 +6683,18 @@ fn mismatch_note(probe: check::Decision, model: check::Decision) -> Option<Strin
             model.as_str()
         ))
     }
+}
+
+/// The fix for a block the policy model did not predict. The model's own fix
+/// (usually none, since it thinks access is granted) would be false here, so
+/// say what is known instead (#621).
+fn mismatch_fix(probe: check::Decision, model: check::Decision) -> Option<String> {
+    (probe == check::Decision::Blocked && model == check::Decision::Allowed).then(|| {
+        "none known: the sandbox denies this through a rule the policy model does not \
+         cover (for example a protected agent config file nested in the project). \
+         Do this outside cplt if you need it."
+            .to_string()
+    })
 }
 
 /// Replicate the live proxy's post-DNS resolved-IP SSRF guard for `cplt check
@@ -10239,6 +10264,30 @@ mod tests {
     /// #531 off: no root, nothing touched on disk, and the policy roots are
     /// exactly the named repositories, which is what keeps the profile
     /// byte-identical to a build without the feature.
+    /// #621: a block the model did not predict gets a truthful fix, never
+    /// the model's "none needed".
+    #[test]
+    fn mismatch_fix_only_for_unpredicted_block() {
+        use crate::check::Decision::{Allowed, Blocked, Inconclusive};
+        assert!(
+            super::mismatch_fix(Blocked, Allowed)
+                .unwrap()
+                .contains("does not cover")
+        );
+        for (probe, model) in [
+            (Blocked, Blocked),
+            (Allowed, Allowed),
+            (Allowed, Blocked),
+            (Inconclusive, Allowed),
+        ] {
+            assert_eq!(
+                super::mismatch_fix(probe, model),
+                None,
+                "{probe:?} vs {model:?}"
+            );
+        }
+    }
+
     #[test]
     fn managed_worktree_root_off_adds_nothing() {
         use std::path::{Path, PathBuf};

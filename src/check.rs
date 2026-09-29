@@ -950,6 +950,10 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
         };
     }
 
+    if let Some(e) = explain_setuid(first) {
+        return e;
+    }
+
     ExecExplain {
         decision: Decision::Allowed,
         reason: "not specifically gated. It runs inside the sandbox, subject to the \
@@ -958,6 +962,49 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
         fix: None,
         objection: None,
     }
+}
+
+/// Setuid/setgid binaries (`/bin/ps`, `top`, `sudo`) behave differently in the
+/// sandbox (#620): Seatbelt refuses to exec them (`EPERM`), and on Linux
+/// `no_new_privs` makes the kernel ignore the bit, so they run unprivileged.
+/// `None` when the command does not resolve or carries neither bit.
+fn explain_setuid(cmd: &str) -> Option<ExecExplain> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = if cmd.contains('/') {
+        PathBuf::from(cmd)
+    } else {
+        crate::sandbox::which_binary(cmd)?
+    };
+    let mode = std::fs::metadata(&path).ok()?.permissions().mode();
+    if mode & 0o6000 == 0 {
+        return None;
+    }
+    Some(if cfg!(target_os = "macos") {
+        ExecExplain {
+            decision: Decision::Blocked,
+            reason: format!(
+                "{} is setuid/setgid, and setuid/setgid binaries cannot run under Seatbelt \
+                 (exec fails with EPERM).",
+                path.display()
+            ),
+            fix: Some(
+                "use an alternative that is not setuid/setgid, or run the command outside cplt."
+                    .to_string(),
+            ),
+            objection: None,
+        }
+    } else {
+        ExecExplain {
+            decision: Decision::Allowed,
+            reason: format!(
+                "{} is setuid/setgid. It runs, but without elevated privileges: the sandbox \
+                 sets no_new_privs, so the kernel ignores the bit.",
+                path.display()
+            ),
+            fix: None,
+            objection: None,
+        }
+    })
 }
 
 fn looks_like_tmp_path(cmd: &str) -> bool {
@@ -1194,9 +1241,18 @@ fn render_targeted_item(out: &mut String, item: &CheckItem) {
         Some(fix) => {
             let _ = writeln!(out, "  Fix: {fix}");
         }
-        None => {
-            let _ = writeln!(out, "  Fix: none needed (intentional).");
-        }
+        // No fix on a block means the model knows the block and it is
+        // deliberate; "none needed" there read as a contradiction (#621). An
+        // inconclusive probe observed nothing, so there is nothing to fix.
+        None => match item.decision {
+            Decision::Allowed => {
+                let _ = writeln!(out, "  Fix: none needed (intentional).");
+            }
+            Decision::Blocked => {
+                let _ = writeln!(out, "  Fix: none, the block is intentional.");
+            }
+            Decision::Inconclusive => {}
+        },
     }
 }
 
@@ -1814,5 +1870,70 @@ mod tests {
         assert!(j.contains("\"over_blocked\": 0"));
         assert!(j.contains("\"items\""));
         assert!(j.contains("\"decision\": \"blocked\""));
+    }
+
+    /// #620: a setuid binary cannot exec under Seatbelt and runs unprivileged
+    /// under Linux's no_new_privs; a plain binary stays generic.
+    #[test]
+    fn setuid_binary_reported_per_platform() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let gh = GhGuardPolicy::default();
+        let git = GitGuardPolicy::default();
+        let ctx = exec_ctx(&gh, &git, false);
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("tool");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let e = explain_exec(&[bin.display().to_string()], &ctx);
+        assert_eq!(e.decision, Decision::Allowed);
+        assert!(
+            e.reason.starts_with("not specifically gated"),
+            "{}",
+            e.reason
+        );
+
+        for mode in [0o4755, 0o2755] {
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(mode)).unwrap();
+            let e = explain_exec(&[bin.display().to_string()], &ctx);
+            if cfg!(target_os = "macos") {
+                assert_eq!(e.decision, Decision::Blocked, "mode {mode:o}");
+                assert!(e.reason.contains("Seatbelt"), "{}", e.reason);
+                assert!(e.fix.as_deref().unwrap().contains("outside cplt"));
+            } else {
+                assert_eq!(e.decision, Decision::Allowed, "mode {mode:o}");
+                assert!(
+                    e.reason.contains("without elevated privileges"),
+                    "{}",
+                    e.reason
+                );
+            }
+        }
+    }
+
+    /// #621: "none needed" must never follow BLOCKED, and an inconclusive
+    /// probe gets no fix line at all.
+    #[test]
+    fn targeted_render_never_says_none_needed_after_a_block() {
+        let item = |decision| CheckItem {
+            name: "read".to_string(),
+            category: "filesystem".to_string(),
+            target: "/p/x (read)".to_string(),
+            decision,
+            expected: None,
+            reason: "r".to_string(),
+            fix: None,
+            note: None,
+        };
+        let render = |d| Report::new("shell".into(), None, false, vec![item(d)]).render();
+        assert!(render(Decision::Allowed).contains("Fix: none needed"));
+        let blocked = render(Decision::Blocked);
+        assert!(!blocked.contains("none needed"), "{blocked}");
+        assert!(
+            blocked.contains("Fix: none, the block is intentional."),
+            "{blocked}"
+        );
+        let inconclusive = render(Decision::Inconclusive);
+        assert!(!inconclusive.contains("Fix:"), "{inconclusive}");
     }
 }
