@@ -1198,7 +1198,12 @@ enum TrustAction {
     /// Show trust status for the current repository.
     ///
     /// Displays what .cplt.toml requests and which permissions are approved.
-    Show,
+    Show {
+        /// Emit JSON: {"version":1,"state":...,"proposed":[...],"command":...}.
+        /// The state comes from the rule the launch applies.
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Approve specific permissions from .cplt.toml.
     ///
@@ -2535,20 +2540,29 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                     .map(std::string::ToString::to_string)
                     .collect()
             } else {
-                // Check trust store — validate content hash
-                if let Some(t) = trust::load_trust(&project_dir) {
-                    let current_hash = trust::proposal_content_hash(&loaded.config.propose);
-                    let nothing_proposed = !loaded.propose_dropped
-                        && repo_config::proposed_keys(&loaded.config.propose).is_empty();
-                    let status = trust::approval_status(&t, &current_hash, nothing_proposed);
-                    // Finding 4: the trust file is keyed on the git origin URL, which
-                    // the repo can forge (`git remote set-url origin <victim>` + copy
-                    // the victim's approved [propose] block so the content hash matches
-                    // too). Bind the approval to the local checkout path: a matching
-                    // fingerprint presented from a DIFFERENT path is NOT auto-trusted,
-                    // defeating the confused-deputy escalation.
-                    if !trust::approved_path_matches(&t, &project_dir) {
-                        if !resolved.quiet {
+                // Check trust store — validate content hash and the repository
+                // the approval is bound to. `trust::verdict` is the one rule:
+                // `cplt trust show --json` and `cplt config show` use it too.
+                let entry = trust::load_trust(&project_dir);
+                let verdict = trust::verdict(entry.as_ref(), &project_dir, &loaded);
+                let proposes_nothing =
+                    repo_config::proposed_keys(&loaded.config.propose).is_empty();
+                let nothing_proposed = !loaded.propose_dropped && proposes_nothing;
+                // Every warning here is behind `quiet`, which `cplt exec` turns
+                // on by default so a script's stderr stays clean. exec runs this
+                // same check and applies the same key set, it just does not say
+                // so. `--no-quiet` shows it.
+                if !resolved.quiet {
+                    match (&entry, verdict) {
+                        // Finding 4: the trust file is keyed on the git origin URL,
+                        // which the repo can forge (`git remote set-url origin
+                        // <victim>` + copy the victim's approved [propose] block so
+                        // the content hash matches too). The approval is bound to
+                        // the local repository: a matching fingerprint presented
+                        // from a DIFFERENT one is NOT auto-trusted.
+                        (Some(t), trust::Verdict::Foreign) => {
+                            let current_hash = trust::proposal_content_hash(&loaded.config.propose);
+                            let status = trust::approval_status(t, &current_hash, nothing_proposed);
                             let where_approved = if t.repo.path.is_empty() {
                                 "an unrecorded location".to_string()
                             } else {
@@ -2559,7 +2573,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                             let hint = if !nothing_proposed {
                                 " Re-approve with `cplt trust accept`."
                             } else if status != trust::ApprovalStatus::Current
-                                && trust::approval_is_orphaned(&t)
+                                && trust::approval_is_orphaned(t)
                             {
                                 " `cplt trust accept --all` removes it."
                             } else {
@@ -2571,54 +2585,39 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                                  it here.{hint}",
                             ));
                         }
-                        Vec::new()
-                    }
-                    // Treat a legacy empty stored hash as STALE (see approval_is_stale):
-                    // it pins nothing, so applying its keys against arbitrary proposal
-                    // *values* with no re-prompt would be unsafe. Only `Current`
-                    // applies keys; the other two differ only in what they say.
-                    //
-                    // Every warning here is behind `quiet`, which `cplt exec`
-                    // turns on by default so a script's stderr stays clean. That
-                    // is deliberate: exec runs this same check and applies the
-                    // same key set, it just does not say so. `--no-quiet` shows it.
-                    else if status == trust::ApprovalStatus::Current {
-                        t.accepted.keys
-                    } else {
-                        if !resolved.quiet {
-                            if status == trust::ApprovalStatus::Outlived {
-                                let (msg, hint) = approval_outlived(&t.accepted.linked);
-                                ui::warn(&format!("{msg} {hint}"));
-                            } else {
-                                ui::warn(
-                                    ".cplt.toml permissions changed since the last approval. Re-approve with `cplt trust accept`",
-                                );
-                            }
+                        (Some(t), trust::Verdict::Status(trust::ApprovalStatus::Outlived)) => {
+                            let (msg, hint) = approval_outlived(&t.accepted.linked);
+                            ui::warn(&format!("{msg} {hint}"));
                         }
-                        Vec::new()
+                        (_, trust::Verdict::Status(trust::ApprovalStatus::Changed)) => {
+                            ui::warn(
+                                ".cplt.toml permissions changed since the last approval. Re-approve with `cplt trust accept`",
+                            );
+                        }
+                        // No trust entry — first time seeing this repo config
+                        (None, _) if !proposes_nothing => {
+                            ui::warn(
+                                "Untrusted .cplt.toml. This repo wants to relax sandbox permissions.",
+                            );
+                            eprintln!(
+                                "  {}⚠{} Review proposed permissions before approving.",
+                                ui::color(ui::YELLOW),
+                                ui::color(ui::RESET)
+                            );
+                            eprintln!(
+                                "  {}Show:{} cplt trust        {}Approve:{} cplt trust accept --all",
+                                ui::color(ui::DIM),
+                                ui::color(ui::RESET),
+                                ui::color(ui::DIM),
+                                ui::color(ui::RESET),
+                            );
+                        }
+                        _ => {}
                     }
-                } else {
-                    // No trust entry — first time seeing this repo config
-                    let proposed = repo_config::proposed_keys(&loaded.config.propose);
-                    if !proposed.is_empty() && !resolved.quiet {
-                        ui::warn(
-                            "Untrusted .cplt.toml. This repo wants to relax sandbox permissions.",
-                        );
-                        eprintln!(
-                            "  {}⚠{} Review proposed permissions before approving.",
-                            ui::color(ui::YELLOW),
-                            ui::color(ui::RESET)
-                        );
-                        eprintln!(
-                            "  {}Show:{} cplt trust        {}Approve:{} cplt trust accept --all",
-                            ui::color(ui::DIM),
-                            ui::color(ui::RESET),
-                            ui::color(ui::DIM),
-                            ui::color(ui::RESET),
-                        );
-                    }
-                    Vec::new()
                 }
+                // A legacy empty stored hash is STALE (see approval_is_stale).
+                // Only a current approval bound to this repository grants keys.
+                trust::granted_keys(entry.as_ref(), verdict)
             };
 
             let approved_refs: Vec<&str> = approved_keys
@@ -7669,6 +7668,22 @@ fn display_repo_config(loaded: &repo_config::LoadedRepoConfig, project_dir: &std
         println!();
     }
 
+    // Tighten-only proposals turn a guard on without approval, like [deny]; the
+    // launch applies them only as `true`. Shown apart from [allow], which
+    // `proposed_keys` (and so the branch below) never covers.
+    let guards: Vec<&str> = config::PROPOSE_BOOLS
+        .iter()
+        .filter(|row| row.tighten_only && (row.propose)(&rc.propose) == Some(true))
+        .map(|row| row.key)
+        .collect();
+    if !guards.is_empty() {
+        println!("{blue}[cplt]{nc}  {dim}[guards]{nc} {green}{LABEL_DENY_APPLIED}{nc}");
+        for g in guards {
+            println!("{blue}[cplt]{nc}    {g:<30} = true");
+        }
+        println!();
+    }
+
     // [propose]
     let proposed = repo_config::proposed_keys(&rc.propose);
     if proposed.is_empty() {
@@ -7682,26 +7697,29 @@ fn display_repo_config(loaded: &repo_config::LoadedRepoConfig, project_dir: &std
             println!("{blue}[cplt]{nc}  {dim}No additional permissions requested.{nc}");
         }
     } else {
-        let trust_entry = crate::trust::load_trust(project_dir);
+        // The launch gate's rule. Key names alone said "approved" for a
+        // proposal whose values changed, or one approved in another checkout,
+        // while the launch granted nothing (#635).
+        let trust_entry = trust::load_trust(project_dir);
+        let st = trust_state(project_dir, loaded, trust_entry.as_ref());
+        let is_approved = |key: &str| st.proposed.iter().any(|&(k, a)| k == key && a);
 
-        // Determine overall approval status for the header
-        let all_approved = proposed.iter().all(|key| {
-            trust_entry
-                .as_ref()
-                .is_some_and(|t| crate::trust::is_key_approved(t, key))
-        });
-        let header_status = if all_approved {
+        let header_status = if st.state == "approved" {
             format!("{green}{LABEL_ALLOW_APPROVED}{nc}")
         } else {
             format!("{yellow}{LABEL_ALLOW_PENDING}{nc}")
         };
         println!("{blue}[cplt]{nc}  {dim}[allow]{nc} {header_status}");
+        if !matches!(st.state, "approved" | "pending") {
+            println!("{blue}[cplt]{nc}  {yellow}⚠ {}{nc}", st.message);
+        }
 
         // Booleans
         let bools: &[(&str, Option<bool>)] = &[
             ("allow_localhost_any", rc.propose.allow_localhost_any),
             ("allow_jvm_attach", rc.propose.allow_jvm_attach),
             ("allow_msbuild", rc.propose.allow_msbuild),
+            ("gradle_init", rc.propose.gradle_init),
             ("allow_docker", rc.propose.allow_docker),
             ("allow_tmp_exec", rc.propose.allow_tmp_exec),
             ("allow_gpg_signing", rc.propose.allow_gpg_signing),
@@ -7711,14 +7729,10 @@ fn display_repo_config(loaded: &repo_config::LoadedRepoConfig, project_dir: &std
             ),
             ("allow_env_files", rc.propose.allow_env_files),
             ("allow_browser", rc.propose.allow_browser),
-            ("gh_guard", rc.propose.gh_guard),
-            ("git_push_prevention", rc.propose.git_push_prevention),
         ];
         for (name, val) in bools {
             if let Some(v) = val {
-                let approved = trust_entry
-                    .as_ref()
-                    .is_some_and(|t| crate::trust::is_key_approved(t, name));
+                let approved = is_approved(name);
                 let status = if approved {
                     format!("{green}{STATUS_APPROVED}{nc}")
                 } else {
@@ -8853,6 +8867,11 @@ fn run_trust_command(action: Option<TrustAction>) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    if let Some(TrustAction::Show { json: true }) = action {
+        println!("{}", trust_show_json(&project_dir));
+        return ExitCode::SUCCESS;
+    }
+
     // Load repo config
     let loaded = match repo_config::load_repo_config(&project_dir) {
         Ok(Some(l)) => l,
@@ -8881,18 +8900,176 @@ fn run_trust_command(action: Option<TrustAction>) -> ExitCode {
         }
     };
 
-    let action = action.unwrap_or(TrustAction::Show);
+    let action = action.unwrap_or(TrustAction::Show { json: false });
 
     match action {
-        TrustAction::Show => trust_show(&project_dir, &loaded),
+        TrustAction::Show { .. } => trust_show(&project_dir, &loaded),
         TrustAction::Accept { keys, all } => trust_accept(&project_dir, &loaded, &keys, all),
         TrustAction::Revoke { keys, all } => trust_revoke(&project_dir, &loaded, &keys, all),
     }
 }
 
+/// Where a repository's `.cplt.toml` stands with the trust store, as the
+/// launch sees it. `trust show` (text and JSON) and `config show` read this;
+/// it is built on `trust::verdict` and `trust::granted_keys`, the launch
+/// gate's own rule, so none of them can call a proposal approved that the
+/// launch refuses (#635).
+struct TrustState {
+    /// none, approved, pending, changed, foreign, outlived or uncommitted.
+    state: &'static str,
+    /// One line, worded as the launch words it.
+    message: String,
+    /// Every proposed key, and whether the launch grants it.
+    proposed: Vec<(&'static str, bool)>,
+    /// What to run next, when `cplt trust accept` would accept.
+    command: Option<&'static str>,
+}
+
+fn trust_state(
+    project_dir: &std::path::Path,
+    loaded: &repo_config::LoadedRepoConfig,
+    entry: Option<&trust::TrustEntry>,
+) -> TrustState {
+    let verdict = trust::verdict(entry, project_dir, loaded);
+    let granted = trust::granted_keys(entry, verdict);
+    let proposed: Vec<(&'static str, bool)> = repo_config::proposed_keys(&loaded.config.propose)
+        .into_iter()
+        .map(|key| (key, granted.iter().any(|g| g == key)))
+        .collect();
+    let pending = proposed.iter().filter(|(_, approved)| !approved).count();
+
+    let (state, message) = if loaded.propose_dropped {
+        (
+            "uncommitted",
+            "The permissions this file asks for are ignored while it is uncommitted.".to_string(),
+        )
+    } else if proposed.is_empty() {
+        match (entry, verdict) {
+            (Some(t), trust::Verdict::Status(trust::ApprovalStatus::Outlived)) => {
+                ("outlived", approval_outlived(&t.accepted.linked).0)
+            }
+            _ => ("none", "No additional permissions requested.".to_string()),
+        }
+    } else {
+        match (entry, verdict) {
+            (Some(t), trust::Verdict::Foreign) => (
+                "foreign",
+                format!(
+                    ".cplt.toml for this remote was approved in a different repository ({}), \
+                     so cplt is not auto-trusting it here.{}",
+                    if t.repo.path.is_empty() {
+                        "an unrecorded location"
+                    } else {
+                        &t.repo.path
+                    },
+                    // `trust accept` refuses a live foreign entry.
+                    if trust::approval_is_orphaned(t) {
+                        ""
+                    } else {
+                        " To approve here instead, run `cplt trust revoke --all` first; \
+                         that also removes the approval in that repository."
+                    }
+                ),
+            ),
+            (_, trust::Verdict::Status(trust::ApprovalStatus::Changed)) => (
+                "changed",
+                ".cplt.toml permissions changed since the last approval.".to_string(),
+            ),
+            _ if pending == 0 => (
+                "approved",
+                "Every proposed permission is approved.".to_string(),
+            ),
+            (None, _) => (
+                "pending",
+                "Untrusted .cplt.toml. This repo wants to relax sandbox permissions.".to_string(),
+            ),
+            _ => (
+                "pending",
+                format!(".cplt.toml has {pending} unapproved permission(s)."),
+            ),
+        }
+    };
+    // `trust accept` refuses anything but the committed copy; never point at
+    // a command that would exit 1.
+    // A live foreign entry is refused too (`trust_accept`); an orphaned one is not.
+    let command = (match state {
+        "pending" | "changed" => true,
+        "foreign" => entry.is_some_and(trust::approval_is_orphaned),
+        _ => false,
+    } && repo_config::repo_config_state(project_dir)
+        == repo_config::RepoConfigState::Committed)
+        .then_some("cplt trust accept");
+    TrustState {
+        state,
+        message,
+        proposed,
+        command,
+    }
+}
+
+/// `cplt trust show --json`. `version` lets a consumer refuse a shape it does
+/// not know.
+fn trust_show_json(project_dir: &std::path::Path) -> serde_json::Value {
+    let bare = |state: &str, message: String| {
+        serde_json::json!({
+            "version": 1,
+            "state": state,
+            "project_dir": project_dir.display().to_string(),
+            "content_hash": null,
+            "message": message,
+            "proposed": [],
+            "command": null,
+        })
+    };
+    let loaded = match repo_config::load_repo_config(project_dir) {
+        Ok(Some(l)) => l,
+        Ok(None) => {
+            let st = repo_config::repo_config_state(project_dir);
+            let state = match st {
+                repo_config::RepoConfigState::Missing
+                | repo_config::RepoConfigState::NotAGitRepo { has_file: false } => "none",
+                _ => "uncommitted",
+            };
+            return bare(state, st.explain().unwrap_or_default());
+        }
+        Err(e) => return bare("invalid", format!("Failed to load .cplt.toml: {e}")),
+    };
+    let entry = trust::load_trust(project_dir);
+    let st = trust_state(project_dir, &loaded, entry.as_ref());
+    let propose = &loaded.config.propose;
+    let proposed: Vec<serde_json::Value> = st
+        .proposed
+        .iter()
+        .map(|&(key, approved)| {
+            serde_json::json!({
+                "key": key,
+                // A boolean key is proposed only as `true`.
+                "detail": repo_config::propose_key_detail(propose, key, None)
+                    .unwrap_or_else(|| "true".to_string()),
+                "effect": repo_config::propose_key_cost(key),
+                "approved": approved,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "version": 1,
+        "state": st.state,
+        "project_dir": project_dir.display().to_string(),
+        // Approvals pin the committed proposal. An uncommitted file has none
+        // (its proposals are dropped), so any hash here would name a proposal
+        // nothing can approve.
+        "content_hash": (loaded.source == repo_config::RepoConfigSource::GitHead)
+            .then(|| trust::proposal_content_hash(propose)),
+        "message": st.message,
+        "proposed": proposed,
+        "command": st.command,
+    })
+}
+
 fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoConfig) -> ExitCode {
     let proposed = repo_config::proposed_keys(&loaded.config.propose);
     let trust_entry = trust::load_trust(project_dir);
+    let st = trust_state(project_dir, loaded, trust_entry.as_ref());
 
     let blue = ui::stdout_color(ui::BLUE);
     let nc = ui::stdout_color(ui::RESET);
@@ -8902,6 +9079,7 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
 
     println!("{blue}[cplt]{nc} ── Repo Config Trust ──────────────────────────────");
     println!("{blue}[cplt]{nc}  Source: {}", source_label(loaded.source));
+    println!("{blue}[cplt]{nc}  State:  {} ({})", st.message, st.state);
     println!();
 
     // Anything but the committed copy is refused by the accept guard. Say so
@@ -8935,39 +9113,21 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
     // launch gate drops every key when it does not, so showing them as approved
     // — which this did, above a warning saying they were not auto-trusted —
     // told the user the opposite of what the next run would do.
-    let entry_applies = trust_entry
-        .as_ref()
-        .is_some_and(|t| trust::approved_path_matches(t, project_dir));
+    let verdict = trust::verdict(trust_entry.as_ref(), project_dir, loaded);
+    let entry_applies = trust_entry.is_some() && verdict != trust::Verdict::Foreign;
 
-    // Check if proposals have changed since approval (content hash mismatch)
+    // Stale against the proposal in front of us. A legacy entry with no stored
+    // hash is stale too, as the launch treats it.
     let hash_mismatch = trust_entry.as_ref().is_some_and(|t| {
-        !t.accepted.content_hash.is_empty() && {
-            let current_hash = trust::proposal_content_hash(&loaded.config.propose);
-            t.accepted.content_hash != current_hash
-        }
+        let current_hash = trust::proposal_content_hash(&loaded.config.propose);
+        trust::approval_status(t, &current_hash, false) != trust::ApprovalStatus::Current
     });
     // Not "changed": there is nothing left to re-approve (#560). Only for an
     // entry that applies here — a foreign one has its own message below.
-    let outlived = entry_applies
-        && !loaded.propose_dropped
-        && proposed.is_empty()
-        && trust_entry.as_ref().is_some_and(|t| {
-            trust::approval_status(
-                t,
-                &trust::proposal_content_hash(&loaded.config.propose),
-                true,
-            ) == trust::ApprovalStatus::Outlived
-        });
+    let outlived = verdict == trust::Verdict::Status(trust::ApprovalStatus::Outlived);
 
     // Proposals
-    let all_approved = !hash_mismatch
-        && entry_applies
-        && !proposed.is_empty()
-        && proposed.iter().all(|&key| {
-            trust_entry
-                .as_ref()
-                .is_some_and(|t| trust::is_key_approved(t, key))
-        });
+    let all_approved = !st.proposed.is_empty() && st.proposed.iter().all(|(_, a)| *a);
     if proposed.is_empty() {
         if loaded.propose_dropped {
             // "No additional permissions requested" would be false here: the
@@ -8986,18 +9146,17 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
             LABEL_ALLOW_PENDING
         };
         println!("{blue}[cplt]{nc}  {yellow}[allow]{nc} {section_label}");
-        for &key in &proposed {
-            let approved = !hash_mismatch
-                && entry_applies
-                && trust_entry
-                    .as_ref()
-                    .is_some_and(|t| trust::is_key_approved(t, key));
+        let dim = ui::stdout_color(ui::DIM);
+        for &(key, approved) in &st.proposed {
             let status = if approved {
                 format!("{green}{STATUS_APPROVED}{nc}")
             } else {
                 format!("{yellow}{STATUS_PENDING}{nc}")
             };
             println!("{blue}[cplt]{nc}    {key:<35} {status}");
+            if !approved && let Some(cost) = repo_config::propose_key_cost(key) {
+                println!("{blue}[cplt]{nc}      {dim}{cost}{nc}");
+            }
         }
     }
 
@@ -9078,21 +9237,15 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
         println!("{blue}[cplt]{nc}    cplt trust accept --all");
         println!();
         println!("{blue}[cplt]{nc}  {yellow}Or approve specific keys:{nc}");
-        let pending_keys: Vec<&&str> = proposed
+        let pending_keys: Vec<&str> = st
+            .proposed
             .iter()
-            .filter(|&&key| {
-                !trust_entry
-                    .as_ref()
-                    .is_some_and(|t| trust::is_key_approved(t, key))
-            })
+            .filter(|(_, approved)| !approved)
+            .map(|(key, _)| *key)
             .collect();
         println!(
             "{blue}[cplt]{nc}    cplt trust accept {}",
-            pending_keys
-                .iter()
-                .map(|k| **k)
-                .collect::<Vec<_>>()
-                .join(" ")
+            pending_keys.join(" ")
         );
     }
 
@@ -13044,5 +13197,129 @@ mod tests {
                 assert!(agent_allowlist(agent::Agent::OpenCode, false, false).is_empty());
             },
         );
+    }
+
+    // ── trust state (#635) ─────────────────────────────────────────────
+
+    /// A committed `.cplt.toml` in a fresh repository, loaded as the launch
+    /// loads it.
+    fn committed_repo_config(
+        body: &str,
+    ) -> (tempfile::TempDir, PathBuf, repo_config::LoadedRepoConfig) {
+        let (guard, dir) = canonical_tempdir();
+        git_in(&dir, &["init", "--quiet"]);
+        std::fs::write(dir.join(".cplt.toml"), body).unwrap();
+        git_in(&dir, &["add", ".cplt.toml"]);
+        git_in(
+            &dir,
+            &["-c", "commit.gpgSign=false", "commit", "-qm", "init"],
+        );
+        let loaded = repo_config::load_repo_config(&dir).unwrap().unwrap();
+        (guard, dir, loaded)
+    }
+
+    fn approval(dir: &Path, keys: &[&str], hash: &str) -> trust::TrustEntry {
+        trust::TrustEntry {
+            repo: trust::approved_identity(dir, ""),
+            accepted: trust::AcceptedProposals {
+                keys: keys.iter().map(|k| (*k).to_string()).collect(),
+                content_hash: hash.to_string(),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Every state, and in each the keys `trust_state` calls approved are
+    /// exactly the keys the launch gate grants (`trust::granted_keys` of
+    /// `trust::verdict`, which is all the gate applies).
+    #[test]
+    fn trust_state_matches_the_launch_gate() {
+        const BODY: &str =
+            "[propose]\nallow_localhost_any = true\n[propose.allow]\nports = [5432]\n";
+        let (_g, dir, loaded) = committed_repo_config(BODY);
+        let hash = trust::proposal_content_hash(&loaded.config.propose);
+        let both = ["allow_localhost_any", "allow.ports"];
+        let (_g2, other, _) = committed_repo_config(BODY);
+        let mut orphan = approval(&other, &both, &hash);
+        orphan.repo.git_dir = format!("{}/gone", orphan.repo.git_dir);
+        orphan.repo.path = format!("{}/gone", orphan.repo.path);
+
+        let cases: Vec<(&str, Option<trust::TrustEntry>, &str)> = vec![
+            ("no entry", None, "pending"),
+            ("approved", Some(approval(&dir, &both, &hash)), "approved"),
+            (
+                "partial",
+                Some(approval(&dir, &["allow_localhost_any"], &hash)),
+                "pending",
+            ),
+            // Same keys, other values: the key names still match.
+            ("changed", Some(approval(&dir, &both, "0ld")), "changed"),
+            // A legacy entry with no hash pins nothing, so it is stale.
+            ("legacy", Some(approval(&dir, &both, "")), "changed"),
+            ("foreign", Some(approval(&other, &both, &hash)), "foreign"),
+            ("foreign orphaned", Some(orphan), "foreign"),
+        ];
+        for (name, entry, want) in cases {
+            let st = trust_state(&dir, &loaded, entry.as_ref());
+            assert_eq!(st.state, want, "{name}");
+            let granted = trust::granted_keys(
+                entry.as_ref(),
+                trust::verdict(entry.as_ref(), &dir, &loaded),
+            );
+            for (key, approved) in &st.proposed {
+                assert_eq!(*approved, granted.iter().any(|g| g == key), "{name}: {key}");
+            }
+            // Never point at a `trust accept` that would refuse: the one
+            // refusal for a non-matching entry is `trust_accept`'s own test.
+            if st.command.is_some() {
+                let refused = entry.as_ref().is_some_and(|t| {
+                    !trust::approved_path_matches(t, &dir) && !trust::approval_is_orphaned(t)
+                });
+                assert!(
+                    !refused,
+                    "{name}: command {:?} would be refused",
+                    st.command
+                );
+            }
+            assert_eq!(
+                st.command.is_some(),
+                name != "approved" && name != "foreign",
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn trust_state_outlived_and_none() {
+        let (_g, dir, loaded) = committed_repo_config("[deny]\nenv = [\"X\"]\n");
+        assert_eq!(trust_state(&dir, &loaded, None).state, "none");
+        let entry = approval(&dir, &["allow_docker"], "0ld");
+        let st = trust_state(&dir, &loaded, Some(&entry));
+        assert_eq!(st.state, "outlived");
+        assert_eq!(st.command, None);
+    }
+
+    /// The launch reads `HEAD:.cplt.toml`; an uncommitted file has no
+    /// proposal an approval could pin, so it has no hash either.
+    #[test]
+    fn trust_show_json_has_no_hash_for_an_uncommitted_file() {
+        let (_g, dir) = canonical_tempdir();
+        git_in(&dir, &["init", "--quiet"]);
+        std::fs::write(dir.join(".cplt.toml"), "[propose]\nallow_docker = true\n").unwrap();
+        let v = trust_show_json(&dir);
+        assert_eq!(v["state"], "uncommitted", "{v}");
+        assert_eq!(v["content_hash"], serde_json::Value::Null, "{v}");
+        assert_eq!(v["command"], serde_json::Value::Null, "{v}");
+    }
+
+    #[test]
+    fn trust_show_json_without_a_repo_config() {
+        let (_g, dir) = canonical_tempdir();
+        git_in(&dir, &["init", "--quiet"]);
+        let v = trust_show_json(&dir);
+        assert_eq!(v["version"], 1);
+        assert_eq!(v["state"], "none");
+        assert_eq!(v["proposed"], serde_json::json!([]));
+        assert_eq!(v["command"], serde_json::Value::Null);
     }
 }

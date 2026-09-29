@@ -1146,6 +1146,7 @@ allow_private_domains = ["intern.nav.no"]
 
 ```bash
 cplt trust                                # Show permissions and approval status
+cplt trust show --json                    # The same, for scripts and tools
 cplt trust accept allow_jvm_attach        # Approve specific keys
 cplt trust accept --all                   # Approve everything
 cplt trust revoke allow_docker            # Revoke a specific key
@@ -1159,6 +1160,47 @@ it is approved too. A worktree on a branch that changed `[propose]` is not: the
 approval is pinned to the values you reviewed, and different values need a fresh
 `cplt trust accept`. A separate clone is a separate repository and approves on
 its own, even when its `.cplt.toml` is identical.
+
+`cplt trust`, `cplt trust show --json` and `cplt config show` use the rule the
+launch uses: a key counts as approved only when the approval matches the
+current values and was granted in this repository. A proposal that keeps its
+keys but changes a value is shown as changed, not approved.
+
+#### Reading trust state from a script
+
+`cplt trust show --json` prints one JSON object for the repository you are in:
+
+```json
+{
+  "version": 1,
+  "state": "changed",
+  "project_dir": "/Users/you/src/app",
+  "content_hash": "2deff3a5…",
+  "message": ".cplt.toml permissions changed since the last approval.",
+  "proposed": [
+    {
+      "key": "allow_localhost_any",
+      "detail": "true",
+      "effect": "reaches any local listener; on Linux also drops kernel TCP filtering for remote hosts. Ignored under proxy.forced",
+      "approved": false
+    }
+  ],
+  "command": "cplt trust accept"
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `version` | Shape version. Refuse a version you do not know. |
+| `state` | `none` (no `.cplt.toml`, or nothing to approve), `approved`, `pending` (never approved, or only some keys), `changed` (values changed since the approval), `foreign` (approved in a different repository), `outlived` (an approval, but nothing left to approve), `uncommitted` (the file's proposals are ignored until committed), `invalid` (the file does not load) |
+| `content_hash` | Hash of the committed `[propose]` section. An approval is pinned to it. `null` when there is no committed `.cplt.toml` to approve: no file, an invalid one, or one that exists only in the working tree (the launch ignores its proposals). |
+| `message` | One line, worded as the launch warning. |
+| `proposed` | Every key that needs approval: its value (`detail`), what approving it costs (`effect`), and whether the launch grants it (`approved`). |
+| `command` | What to run to approve, or `null` when there is nothing to approve or `cplt trust accept` would refuse. |
+
+Print `effect` as given rather than writing your own cost text. The command
+exits 0 whenever it prints the object. Only the launch repository has trust
+state: a `--repo-dir` root contributes its `[deny]` and never proposes.
 
 In CI and scripts, where interactive approval is not possible:
 
