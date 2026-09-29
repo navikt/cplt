@@ -1000,10 +1000,14 @@ pub struct Report {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preset: Option<String>,
     pub platform: String,
-    /// Whether every graded expectation held (⇒ the sandbox is enforcing).
+    /// Whether every protection held (no expected block was allowed) and at
+    /// least one was verified. An expected-allowed probe that was blocked does
+    /// not clear this: that is a policy too strict, counted in `over_blocked`.
     pub enforcing: bool,
     /// Number of expected-BLOCKED protections that were actually blocked.
     pub verified: usize,
+    /// Number of expected-ALLOWED probes that were blocked (policy too strict).
+    pub over_blocked: usize,
     /// True for the bare enforcement battery (drives the verdict rendering).
     pub battery: bool,
     pub items: Vec<CheckItem>,
@@ -1022,17 +1026,25 @@ impl Report {
             .iter()
             .filter(|i| i.expected == Some(Decision::Blocked) && i.decision == Decision::Blocked)
             .count();
-        // Enforcing iff every graded expectation held AND at least one protection
-        // (an expected block) was verified. Inconclusive items are never graded,
-        // so they neither verify nor break the verdict.
-        let all_graded_passed = items.iter().all(|i| i.passed() != Some(false));
-        let enforcing = battery && all_graded_passed && verified >= 1;
+        let over_blocked = items
+            .iter()
+            .filter(|i| i.expected == Some(Decision::Allowed) && i.passed() == Some(false))
+            .count();
+        // Enforcing iff no protection (an expected block) leaked AND at least one
+        // was verified. A blocked expected-allowed probe means the policy is too
+        // strict, not that the sandbox leaks, so it does not clear the verdict.
+        // Inconclusive items are never graded, so they neither verify nor break it.
+        let no_leak = items
+            .iter()
+            .all(|i| i.expected != Some(Decision::Blocked) || i.passed() != Some(false));
+        let enforcing = battery && no_leak && verified >= 1;
         Report {
             agent,
             preset,
             platform: platform_name().to_string(),
             enforcing,
             verified,
+            over_blocked,
             battery,
             items,
         }
@@ -1045,10 +1057,11 @@ impl Report {
     }
 
     /// The process exit code: 0 when enforcing (or a targeted, non-battery
-    /// query), non-zero when the battery could not confirm enforcement.
+    /// query), non-zero when the battery could not confirm enforcement or an
+    /// expected-allowed probe was blocked.
     #[must_use]
     pub fn exit_nonzero(&self) -> bool {
-        self.battery && !self.enforcing
+        self.battery && (!self.enforcing || self.over_blocked > 0)
     }
 
     /// Render a clean human-readable report.
@@ -1072,7 +1085,14 @@ impl Report {
             if let Some(p) = &self.preset {
                 let _ = write!(suffix, " · preset={p}");
             }
-            if self.enforcing {
+            if self.enforcing && self.over_blocked > 0 {
+                let _ = writeln!(
+                    out,
+                    "→ Sandbox is enforcing, but {} expected-allowed check(s) were blocked \
+                     (policy too strict) · {}",
+                    self.over_blocked, suffix
+                );
+            } else if self.enforcing {
                 let _ = writeln!(
                     out,
                     "→ Sandbox is ENFORCING ({} protection{} verified) · {}",
@@ -1118,6 +1138,12 @@ impl Report {
                     let _ = write!(line, "  ({note})");
                 }
                 let _ = writeln!(out, "{line}");
+                if item.passed() == Some(false) {
+                    let _ = writeln!(out, "      Reason: {}", item.reason);
+                    if let Some(fix) = &item.fix {
+                        let _ = writeln!(out, "      Fix: {fix}");
+                    }
+                }
             }
         }
     }
@@ -1129,16 +1155,14 @@ impl Report {
             .iter()
             .filter(|i| i.expected == Some(Decision::Blocked) && i.decision == Decision::Allowed)
             .count();
-        let over = self
-            .items
-            .iter()
-            .filter(|i| i.expected == Some(Decision::Allowed) && i.decision == Decision::Blocked)
-            .count();
         if under > 0 {
             reasons.push(format!("{under} protection(s) did NOT block"));
         }
-        if over > 0 {
-            reasons.push(format!("{over} expected-allowed check(s) were blocked"));
+        if self.over_blocked > 0 {
+            reasons.push(format!(
+                "{} expected-allowed check(s) were blocked",
+                self.over_blocked
+            ));
         }
         if self.verified == 0 && reasons.is_empty() {
             reasons.push("no protection could be verified".to_string());
@@ -1678,8 +1702,74 @@ mod tests {
             vec![allowed_item("proj"), leak],
         );
         assert!(!r.enforcing);
+        assert_eq!(r.over_blocked, 0);
         assert!(r.exit_nonzero());
-        assert!(r.render().contains("NOT ENFORCING"));
+        assert!(
+            r.render()
+                .contains("NOT ENFORCING. 1 protection(s) did NOT block")
+        );
+    }
+
+    fn over_blocked_item() -> CheckItem {
+        let mut item = allowed_item("reach githubcopilot.com");
+        item.decision = Decision::Blocked;
+        item.reason = "not on the allowlist".to_string();
+        item.fix = Some("add it to allow_domains".to_string());
+        item
+    }
+
+    #[test]
+    fn over_block_only_is_enforcing_but_too_strict() {
+        let r = Report::new(
+            "copilot".into(),
+            None,
+            true,
+            vec![over_blocked_item(), blocked_item("ssh")],
+        );
+        assert!(r.enforcing, "a too-strict policy still enforces");
+        assert_eq!(r.over_blocked, 1);
+        assert!(r.exit_nonzero(), "over-blocking still fails CI");
+        let out = r.render();
+        assert!(!out.contains("NOT ENFORCING"), "{out}");
+        assert!(
+            out.contains("Sandbox is enforcing, but 1 expected-allowed check(s) were blocked (policy too strict)"),
+            "{out}"
+        );
+        assert!(r.to_json().contains("\"over_blocked\": 1"));
+    }
+
+    #[test]
+    fn under_block_wins_over_over_block() {
+        let mut leak = blocked_item("ssh");
+        leak.decision = Decision::Allowed;
+        let r = Report::new(
+            "copilot".into(),
+            None,
+            true,
+            vec![over_blocked_item(), leak, blocked_item("metadata")],
+        );
+        assert!(!r.enforcing);
+        assert_eq!(r.over_blocked, 1);
+        let out = r.render();
+        assert!(
+            out.contains("NOT ENFORCING. 1 protection(s) did NOT block; 1 expected-allowed"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn failed_probe_shows_reason_and_fix() {
+        let r = Report::new(
+            "copilot".into(),
+            None,
+            true,
+            vec![over_blocked_item(), blocked_item("ssh")],
+        );
+        let out = r.render();
+        assert!(out.contains("      Reason: not on the allowlist"), "{out}");
+        assert!(out.contains("      Fix: add it to allow_domains"), "{out}");
+        // Passing probes stay one line.
+        assert_eq!(out.matches("Reason:").count(), 1, "{out}");
     }
 
     #[test]
@@ -1688,6 +1778,7 @@ mod tests {
         let j = r.to_json();
         assert!(j.contains("\"enforcing\""));
         assert!(j.contains("\"verified\""));
+        assert!(j.contains("\"over_blocked\": 0"));
         assert!(j.contains("\"items\""));
         assert!(j.contains("\"decision\": \"blocked\""));
     }
