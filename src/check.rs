@@ -495,17 +495,23 @@ pub fn explain_domain(
             "permitted by the proxy policy, cplt is not blocking this.".to_string(),
             None,
         ),
-        // Loopback is governed by allow.localhost, not allow.ports: a port
-        // grant is egress to every remote host on that port, and the profile
-        // still denies loopback after it, so --allow-port cannot help here.
-        NetVerdict::BlockedPort if proxy::is_loopback_host(&proxy::normalize_hostname(host)) => (
-            Decision::Blocked,
-            format!("localhost port {port} is not in the allowed localhost ports."),
-            Some(format!(
-                "allow it with --allow-localhost {port} (or [allow] localhost in config), \
+        // Loopback is governed by allow.localhost alone. A localhost opt-in
+        // skips the port, allowlist and private gates, so any of those three
+        // on a loopback host means the opt-in is missing. --allow-port and
+        // allowed_domains cannot help: the profile denies loopback after a
+        // port grant, and the allowlist is never consulted for loopback.
+        NetVerdict::BlockedPort | NetVerdict::BlockedAllowlist | NetVerdict::BlockedPrivate
+            if proxy::is_loopback_host(&proxy::normalize_hostname(host)) =>
+        {
+            (
+                Decision::Blocked,
+                format!("localhost port {port} is not in the allowed localhost ports."),
+                Some(format!(
+                    "allow it with --allow-localhost {port} (or [allow] localhost in config), \
                  or --allow-localhost-any for a service on a random port."
-            )),
-        ),
+                )),
+            )
+        }
         NetVerdict::BlockedPort => (
             Decision::Blocked,
             format!("port {port} is not in the allowed-ports set (443 + --allow-port)."),
@@ -1522,6 +1528,24 @@ mod tests {
         }
         let e = explain_domain(&np, "github.com", 6969, true);
         assert!(e.fix.as_deref().unwrap().contains("--allow-port 6969"));
+
+        // An allowed port with an active allowlist (strict mode) reaches the
+        // allowlist gate, and a plain allowed port reaches the private gate.
+        // Neither allowed_domains nor a private-domain grant opens loopback.
+        let mut strict = net_policy(&["github.com"], &[], &[443]);
+        strict.allowlist_active = true;
+        for (np, status) in [
+            (strict, "BLOCKED-ALLOWLIST"),
+            (net_policy(&[], &[], &[443]), "BLOCKED-PRIVATE"),
+        ] {
+            let e = explain_domain(&np, "localhost", 443, true);
+            assert_eq!(e.status, status);
+            let fix = e.fix.as_deref().unwrap();
+            assert!(
+                fix.contains("--allow-localhost 443") && !fix.contains("allowed_domains"),
+                "{status}: {fix}"
+            );
+        }
     }
 
     #[test]
