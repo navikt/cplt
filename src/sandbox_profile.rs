@@ -2557,7 +2557,7 @@ fn emit_deny_rules(sb: &mut String, config: &SandboxConfig, home: &str) {
     let mut targets: Vec<PathBuf> = Vec::new();
     if config.protect_pnpm_config {
         for dir in pnpm_config_dirs(config.home_dir) {
-            let target = resolved(dir.clone());
+            let target = crate::config::canonicalize_deepest(&dir);
             for p in spellings(&dir, &target) {
                 if validate_sbpl_path(Path::new(&p)).is_ok() {
                     sbpl!(sb, "(deny file-write* (subpath \"{p}\"))");
@@ -3446,6 +3446,42 @@ mod tests {
                     assert!(p.contains(&rule), "missing rename pin {rule}");
                 }
             });
+        });
+    }
+
+    /// `sandbox.protect_pnpm_config` with `~/.config` a link into the project
+    /// and no `pnpm/` there yet: the dir write deny must land at the target
+    /// the link would create it at, as the token-file denies do. At the link
+    /// spelling alone it is inert (SBPL checks resolved paths), and the
+    /// project grant would let the agent create `config/pnpm/config.yaml`.
+    #[test]
+    fn protect_pnpm_config_follows_a_linked_config_dir_that_has_no_pnpm_yet() {
+        let tmp = tempfile::Builder::new()
+            .prefix(".cplt-pnpm-link-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonical root");
+        let home = root.join("home");
+        let project = root.join("dotfiles");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        std::fs::create_dir_all(project.join("config")).expect("mkdir config");
+        std::os::unix::fs::symlink(project.join("config"), home.join(".config")).expect("symlink");
+        crate::with_env_lock_no_xdg(|| {
+            let mut opts = test_options(&project, &home);
+            opts.protect_pnpm_config = true;
+            let p = generate_profile(&opts, &[]);
+            let target = project.join("config/pnpm");
+            let deny = format!("(deny file-write* (subpath \"{}\"))", target.display());
+            let auth = format!(
+                "(deny file-write* (literal \"{}\"))",
+                target.join("auth.ini").display()
+            );
+            let allow = format!("(allow file-write* (subpath \"{}\"))", project.display());
+            let allow_at = p.rfind(&allow).unwrap_or_else(|| panic!("missing {allow}"));
+            let auth_at = p.rfind(&auth).unwrap_or_else(|| panic!("missing {auth}"));
+            let deny_at = p.rfind(&deny).unwrap_or_else(|| panic!("missing {deny}"));
+            assert!(auth_at > allow_at, "the token deny comes after the allow");
+            assert!(deny_at > allow_at, "the dir deny comes after the allow");
         });
     }
 

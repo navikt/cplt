@@ -2635,8 +2635,14 @@ fn validate_config_paths(config: &SandboxConfig) -> Result<(), String> {
             .chain(policy::pnpm_credential_files(config.home_dir))
         {
             for s in [p.clone(), crate::config::canonicalize_deepest(&p)] {
-                policy::validate_sbpl_path(&s)
-                    .map_err(|e| format!("sandbox.protect_pnpm_config path: {e}"))?;
+                policy::validate_sbpl_path(&s).map_err(|e| {
+                    format!(
+                        "sandbox.protect_pnpm_config: {e}\n\
+                             pnpm's config dir comes from XDG_CONFIG_HOME (default ~/.config). \
+                             Point it at a path without those characters, or run \
+                             `cplt config set sandbox.protect_pnpm_config false`."
+                    )
+                })?;
             }
         }
     }
@@ -3574,6 +3580,11 @@ mod tests {
             config.protect_pnpm_config = true;
             let err = super::validate_config_paths(&config).expect_err("must refuse");
             assert!(err.contains("sandbox.protect_pnpm_config"), "{err}");
+            assert!(err.contains("XDG_CONFIG_HOME"), "names the source: {err}");
+            assert!(
+                err.contains("cplt config set sandbox.protect_pnpm_config false"),
+                "names the way out: {err}"
+            );
         });
     }
 
