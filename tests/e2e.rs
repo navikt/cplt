@@ -7246,11 +7246,10 @@ paths = [
         let shims = dir.path().join("shims");
         std::fs::create_dir(&shims).unwrap();
         std::os::unix::fs::symlink(&multicall, shims.join("cplt-e2e-tool")).unwrap();
-        let path = format!(
-            "{}:{}",
-            shims.display(),
-            std::env::var("PATH").unwrap_or_default()
-        );
+        // Fixed system dirs after the shim dir, not the runner's PATH: only
+        // the shim entry is under test, and `sh`/`basename` must not depend
+        // on what the host happens to have first.
+        let path = format!("{}:/usr/bin:/bin", shims.display());
 
         let output = cplt_cmd()
             .args(["--no-validate", "exec", "--", "cplt-e2e-tool"])

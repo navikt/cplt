@@ -4959,7 +4959,11 @@ fn canonical_exec_binary(found: &Path) -> anyhow::Result<PathBuf> {
 /// and checks execute on the target, the same file `canonical` names, so
 /// Seatbelt and Landlock enforce exactly what they did before. What changes
 /// is that Seatbelt must also be able to read the symlink to follow it, so the
-/// symlink is used only when the policy grants read where it lives. Otherwise
+/// symlink is used only when the policy grants read where it lives and no
+/// deny path covers it. The deny check is separate because `LandlockPolicy`
+/// holds only grants: Seatbelt emits `deny_paths` after the allows and
+/// Bubblewrap masks them, so a link inside a readable tree can still be
+/// unreadable to the child. Otherwise
 /// — and whenever the link and its target share a name, so argv[0] is the same
 /// either way — this returns `canonical`, the pre-#640 behaviour.
 ///
@@ -4969,6 +4973,7 @@ fn exec_invocation_path(
     found: &Path,
     canonical: PathBuf,
     policy: &sandbox::LandlockPolicy,
+    deny_paths: &[PathBuf],
 ) -> PathBuf {
     let Some(name) = found.file_name() else {
         return canonical;
@@ -4987,7 +4992,10 @@ fn exec_invocation_path(
         .fs_rules
         .iter()
         .any(|rule| rule.access.read && link.starts_with(&rule.path));
-    if readable { link } else { canonical }
+    let denied = deny_paths.iter().any(|deny| {
+        link.starts_with(deny) || std::fs::canonicalize(deny).is_ok_and(|d| link.starts_with(d))
+    });
+    if readable && !denied { link } else { canonical }
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -5828,7 +5836,9 @@ fn run_exec_command(
         // Only the binary the user named: a guard shim or pnpm shadow is
         // cplt's own file and is run by the path cplt chose for it.
         let bin = match requested_path.as_deref() {
-            Some(found) if bin == canonical => exec_invocation_path(found, bin, &policy),
+            Some(found) if bin == canonical => {
+                exec_invocation_path(found, bin, &policy, &resolved.deny_paths)
+            }
             _ => bin,
         };
         (bin, cmd[1..].to_vec())
@@ -11005,20 +11015,35 @@ mod tests {
         };
 
         assert_eq!(
-            exec_invocation_path(&found, canonical.clone(), &policy(vec![rule(true)])),
+            exec_invocation_path(&found, canonical.clone(), &policy(vec![rule(true)]), &[]),
             shims.join("go"),
             "the link keeps the name the binary dispatches on"
         );
         assert_eq!(
-            exec_invocation_path(&found, canonical.clone(), &policy(vec![rule(false)])),
+            exec_invocation_path(&found, canonical.clone(), &policy(vec![rule(false)]), &[]),
             canonical,
             "a link the sandbox cannot read would fail to exec: keep the target"
         );
         let same_name = shims.join("multicall");
         assert_eq!(
-            exec_invocation_path(&same_name, canonical.clone(), &policy(vec![rule(true)])),
+            exec_invocation_path(
+                &same_name,
+                canonical.clone(),
+                &policy(vec![rule(true)]),
+                &[]
+            ),
             canonical,
             "same name either way: nothing to preserve, keep the target"
+        );
+        assert_eq!(
+            exec_invocation_path(
+                &found,
+                canonical.clone(),
+                &policy(vec![rule(true)]),
+                std::slice::from_ref(&shims)
+            ),
+            canonical,
+            "a deny path over the link wins over the read grant around it"
         );
     }
 
