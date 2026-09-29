@@ -3328,6 +3328,34 @@ fn agent_allowlist(
     domains.into_iter().map(str::to_string).collect()
 }
 
+/// The allowlist half of the proxy's policy, for the live proxy and
+/// `cplt check` alike, so a source added here reaches both (#606).
+///
+/// The user's `allowed_domains` file (dropped by the allow-all overrides), the
+/// agent's hosts (see [`agent_allowlist`]) and `allow.domains`. Empty agent
+/// list and no file = no allowlist: the proxy stays allow-all.
+fn allowlist_spec(
+    resolved: &config::Resolved,
+    agent: agent::Agent,
+    decision: &DomainAllowlistDecision,
+) -> proxy::PolicySpec {
+    let allowed_domains_file = if decision.use_allowed_file {
+        resolved.allowed_domains.clone()
+    } else {
+        None
+    };
+    proxy::PolicySpec {
+        default_allowlist: agent_allowlist(
+            agent,
+            decision.use_default_allowlist,
+            allowed_domains_file.is_some(),
+        ),
+        allowed_domains_file,
+        extra_allowed_domains: resolved.allow_domains.clone(),
+        ..Default::default()
+    }
+}
+
 /// Session layer of the sandbox brief (issue #148; opt-in via `--brief` /
 /// `sandbox.brief = true`): a fresh scratch `CPLT_BRIEF.md` rendered from the
 /// resolved policy, never a static template.
@@ -3529,20 +3557,12 @@ fn start_proxy_if_enabled(
     // allowlist file and (below) no agent default allowlist. Other policy checks
     // still apply, and only bounded proxy CONNECT evidence is retained. This must override any
     // configured allowlist, not combine with it (fail-closed would hide domains).
-    let allowed_domains_file = if allowlist_decision.use_allowed_file {
-        resolved.allowed_domains.clone()
-    } else {
-        None
-    };
-
-    // Fail-closed networking (#52): the agent's part of the allowlist, which
-    // the proxy MERGES with the user's allowed_domains file. Empty vec = no
-    // allowlist, so the proxy keeps today's allow-all behaviour unchanged.
-    let default_allowlist = agent_allowlist(
-        active_agent,
-        allowlist_decision.use_default_allowlist,
-        allowed_domains_file.is_some(),
-    );
+    let proxy::PolicySpec {
+        allowed_domains_file,
+        default_allowlist,
+        extra_allowed_domains,
+        ..
+    } = allowlist_spec(resolved, active_agent, &allowlist_decision);
 
     // An allowlist the agent can edit is not an allowlist (#426). Both list
     // files are re-read every few seconds by design, so one inside the project
@@ -3669,7 +3689,7 @@ fn start_proxy_if_enabled(
         allow_localhost_any: resolved.allow_localhost_any,
         allowed_domains_file,
         allowed_domains_initial: Vec::new(),
-        extra_allowed_domains: resolved.allow_domains.clone(),
+        extra_allowed_domains,
         default_allowlist,
         cli_private_domains: cli.allow_private_domains.clone(),
         // Reloadable portion: what the config file itself supplied. The two
@@ -5986,71 +6006,31 @@ fn build_net_policy(
     resolved: &config::Resolved,
     agent: agent::Agent,
 ) -> Result<proxy::NetPolicy, String> {
-    let mut ports = vec![443u16];
-    ports.extend_from_slice(&resolved.allow_ports);
-    ports.sort_unstable();
-    ports.dedup();
-
-    let default_allowlist = agent_allowlist(
-        agent,
+    // `check` has no --observe-domains, so only --allow-all-domains applies.
+    let decision = resolve_domain_allowlist_decision(
+        false,
+        resolved.allow_all_domains,
         resolved.default_allowlist,
-        !resolved.allow_all_domains && resolved.allowed_domains.is_some(),
     );
-    let file_domains: Vec<String> = if resolved.allow_all_domains {
-        Vec::new()
-    } else if let Some(ref path) = resolved.allowed_domains {
-        // Parse the allowed_domains file through the EXACT parser the live
-        // allowlist cache uses (`parse_lines_file` via `get_cached_domains`), NOT
-        // `parse_domain_file`. The latter extra-normalizes (strips scheme/path/
-        // port), so a non-canonical entry like `github.com:443` would be stored
-        // as `github.com` for check but kept verbatim for live enforcement —
-        // making check report ALLOWED while `handle_connect` returns
-        // BLOCKED-ALLOWLIST. Sharing one parser keeps the two byte-identical.
-        proxy::parse_lines_file(path).unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    // Same intent bit `start_proxy_if_enabled` computes and hands the live
-    // proxy (via `DomainPolicy::build`). Without it, `cplt check net` would
-    // report ALLOWED for every host under an enabled-but-empty allowlist that
-    // the proxy blocks — a self-consistent wrong answer to the one command a
-    // user runs to verify the setup.
-    let allowlist_active = !default_allowlist.is_empty()
-        || (!resolved.allow_all_domains && resolved.allowed_domains.is_some());
-    let allowed_domains = if default_allowlist.is_empty() {
-        file_domains
-    } else {
-        let mut merged = default_allowlist;
-        merged.extend(file_domains);
-        merged.sort_unstable();
-        merged.dedup();
-        merged
-    };
-
-    // The blocklist goes through `proxy::blocklist`, the same constructor the
-    // live proxy uses: built-in ∪ subscriptions ∪ the user's file. The one
-    // difference is where subscription domains come from: check reads the
-    // last-good on-disk cache and never triggers a network refresh.
+    // Built by `DomainPolicy::build`, the constructor the live proxy uses, so
+    // the allowlist merge, the file parser and the `allowlist_active` intent
+    // bit are the proxy's own. The one difference is where subscription
+    // domains come from: check reads the last-good on-disk cache and never
+    // triggers a network refresh.
     let now = std::time::Instant::now();
-    let blocked_domains = proxy::blocklist(
-        resolved.blocked_domains.clone(),
-        subscriptions::load_cached_domains(&resolved.proxy_subscriptions),
-        now,
-    )?
-    .current(now);
-
-    Ok(proxy::NetPolicy {
-        allowed_ports: ports,
-        allowed_domains,
-        allowlist_active,
-        blocked_domains,
+    let spec = proxy::PolicySpec {
+        blocked_file: resolved.blocked_domains.clone(),
+        subscription_blocklist: subscriptions::load_cached_domains(&resolved.proxy_subscriptions),
+        allowed_ports: resolved.allow_ports.clone(),
         allow_localhost_ports: resolved.allow_localhost.clone(),
         allow_localhost_any: resolved.allow_localhost_any,
-        // Mirror the live proxy's private-domain union (config + CLI, deduped),
-        // which `resolved.allow_private_domains` already holds, so check's
-        // post-DNS resolved-IP guard waives exactly the hosts the live proxy does.
-        private_domains: resolved.allow_private_domains.clone(),
-    })
+        // The live proxy's private-domain union (config + CLI + repo), which
+        // `resolved.allow_private_domains` already holds, so check's post-DNS
+        // resolved-IP guard waives exactly the hosts the live proxy does.
+        config_private_domains: resolved.allow_private_domains.clone(),
+        ..allowlist_spec(resolved, agent, &decision)
+    };
+    Ok(proxy::DomainPolicy::build(spec, now)?.net_policy(now))
 }
 
 /// Split a `host[:port]` target into `(host, port)` (default 443).
@@ -11783,6 +11763,72 @@ mod tests {
                 "check net and the live proxy must agree about {host}"
             );
             assert_eq!(checked, want, "{host}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #606: `cplt check` built its allowlist from the agent's hosts and the
+    /// `allowed_domains` file only, while the live proxy also merges
+    /// `allow.domains`. A host named only there was ALLOWED at runtime and
+    /// BLOCKED in check. Both now come from `allowlist_spec`.
+    #[test]
+    fn check_net_matches_the_proxy_for_allow_domains() {
+        let dir = std::env::temp_dir().join(format!(
+            "cplt-check-net-allow-domains-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let allowed = dir.join("allowed.txt");
+        std::fs::write(&allowed, "user.example.com\n").unwrap();
+        let blocked = dir.join("blocked.txt");
+        std::fs::write(&blocked, "denied.example.com\n").unwrap();
+
+        let esc = |p: &Path| p.display().to_string().replace('\\', "\\\\");
+        let toml = format!(
+            "[proxy]\ndefault_allowlist = true\nallowed_domains = \"{}\"\nblocked_domains = \"{}\"\n\
+             [allow]\ndomains = [\"extra.example.com\", \"denied.example.com\"]\n",
+            esc(&allowed),
+            esc(&blocked)
+        );
+        let resolved = toml::from_str::<config::Config>(&toml)
+            .expect("config parses")
+            .merge(config::CliFlags::default())
+            .expect("config merges");
+
+        let checked = build_net_policy(&resolved, agent::Agent::Copilot).expect("policy builds");
+        // The same inputs `start_proxy_if_enabled` hands `proxy::start`.
+        let now = std::time::Instant::now();
+        let live = proxy::DomainPolicy::build(
+            proxy::PolicySpec {
+                blocked_file: Some(blocked),
+                allowed_domains_file: Some(allowed),
+                default_allowlist: agent_allowlist(agent::Agent::Copilot, true, true),
+                extra_allowed_domains: resolved.allow_domains.clone(),
+                ..Default::default()
+            },
+            now,
+        )
+        .expect("live policy builds")
+        .net_policy(now);
+
+        assert_eq!(checked.allowed_domains, live.allowed_domains);
+        assert_eq!(checked.allowlist_active, live.allowlist_active);
+        assert_eq!(checked.blocked_domains, live.blocked_domains);
+        for (host, want) in [
+            ("api.githubcopilot.com", proxy::NetVerdict::Allowed),
+            ("user.example.com", proxy::NetVerdict::Allowed),
+            ("extra.example.com", proxy::NetVerdict::Allowed),
+            ("denied.example.com", proxy::NetVerdict::Blocked),
+            ("evil.example", proxy::NetVerdict::BlockedAllowlist),
+        ] {
+            assert_eq!(
+                proxy::classify_connect(&checked, host, 443),
+                proxy::classify_connect(&live, host, 443),
+                "check net and the live proxy must agree about {host}"
+            );
+            assert_eq!(proxy::classify_connect(&checked, host, 443), want, "{host}");
         }
 
         let _ = std::fs::remove_dir_all(&dir);
