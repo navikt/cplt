@@ -1534,6 +1534,13 @@ use cplt::is_unsafe_root;
 use cplt::sandbox::ToolRoot;
 use cplt::ui;
 
+/// The launch confirmation. It names the way to turn itself off because the
+/// prompt appears on every interactive launch and `sandbox.yes` was found only
+/// by reading the source (navikt/copilot#1348). The summary above it still
+/// prints either way.
+const CONFIRM_PROMPT: &str =
+    "Proceed? (--yes, or `cplt config set sandbox.yes true`, skips this) [y/N] ";
+
 /// Prompt the user to confirm the sandbox configuration.
 ///
 /// Returns Ok(()) if the user confirms, Err with message if they decline or
@@ -1566,7 +1573,7 @@ fn prompt_confirm(auto_yes: bool, quiet: bool) -> Result<(), String> {
         );
     } else {
         eprint!(
-            "{}[cplt]{} Proceed? [y/N] ",
+            "{}[cplt]{} {CONFIRM_PROMPT}",
             ui::color(ui::BLUE),
             ui::color(ui::RESET)
         );
@@ -13219,6 +13226,22 @@ mod tests {
             matches!(&effect, GateEffect::ExecWithout { args, .. } if *args == a(&["push", "origin", "feat"])),
             "an allowed push -u must run without -u"
         );
+    }
+
+    /// The launch prompt names how to skip it, and the command it names works.
+    #[test]
+    fn confirm_prompt_names_a_settable_skip() {
+        let cmd = CONFIRM_PROMPT
+            .split('`')
+            .nth(1)
+            .expect("the prompt quotes a command");
+        let parts: Vec<&str> = cmd.split_whitespace().collect();
+        assert_eq!(parts[..3], ["cplt", "config", "set"], "{cmd}");
+        let info = config::lookup_key(parts[3]).expect("the named key exists");
+        let mut doc = toml_edit::DocumentMut::new();
+        config::set_value_in_doc(&mut doc, info, parts[4]).expect("the value is accepted");
+        assert!(CONFIRM_PROMPT.contains("--yes"));
+        assert!(CONFIRM_PROMPT.ends_with("[y/N] "));
     }
 
     /// #402: git records branch tracking in `.git/config`, which the sandbox
