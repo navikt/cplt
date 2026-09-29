@@ -472,6 +472,63 @@ fn golden_default_policy_pushes_a_feature_branch_and_refuses_the_default_one() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// `git push -u` printed `error: could not write config file .git/config:
+/// Operation not permitted` after a push that worked, because the upstream
+/// write is denied on macOS (navikt/copilot#1348). The guard now runs the push
+/// without `-u` and says so in one line.
+#[test]
+fn golden_push_with_upstream_flag_succeeds_quietly() {
+    require_launch!();
+    if !cfg!(target_os = "macos") {
+        return; // .git/config is writable on Linux; -u works there as is
+    }
+    let home = make_config_home("golden-push-u");
+    let (_tmp, work, origin) = bare_origin_repo(Path::new(env!("CARGO_MANIFEST_DIR")));
+    let run = |args: &[&str]| assert!(common::git_ok(&work, args), "git {args:?}");
+    run(&["push", "--quiet", "origin", "main"]);
+    run(&[
+        "symbolic-ref",
+        "refs/remotes/origin/HEAD",
+        "refs/remotes/origin/main",
+    ]);
+    run(&["checkout", "--quiet", "-b", "feature/push-u"]);
+    run(&["commit", "--quiet", "--allow-empty", "-m", "work"]);
+
+    let allow = origin.to_string_lossy().into_owned();
+    let (_, stderr, status) = launch(
+        &home,
+        &work,
+        &[
+            "--yes",
+            "--no-validate",
+            "--allow-write",
+            &allow,
+            "exec",
+            "--",
+            "git",
+            "push",
+            "-u",
+            "origin",
+            "feature/push-u",
+        ],
+    );
+    assert!(status.success(), "the push must succeed:\n{stderr}");
+    assert!(common::git_ok(
+        &origin,
+        &["rev-parse", "--verify", "refs/heads/feature/push-u"]
+    ));
+    assert!(
+        !stderr.contains("could not write config file") && !stderr.contains("set up to track"),
+        "no config-write error and no false tracking line:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("pushing without -u"),
+        "the dropped flag must be named:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 // ════════════════════════════════════════════════════════════════════
 // Path 3 — every `config set` leaves a launchable config
 // ════════════════════════════════════════════════════════════════════

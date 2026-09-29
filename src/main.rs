@@ -4514,6 +4514,10 @@ enum GateEffect {
     /// is printed to stderr first: warn and audit modes report the verdict they
     /// are declining to enforce.
     ExecPlain { notice: Option<String> },
+    /// Print `notice`, then run `args` instead of the invocation: a push with
+    /// `-u` taken out, whose only effect was a `.git/config` write the sandbox
+    /// denies (#402).
+    ExecWithout { notice: String, args: Vec<String> },
     /// Serve the cached token from the scratch dir instead of running `gh`.
     ServeCachedToken,
     /// Refuse, printing this refusal and the guard's escape hatch.
@@ -4683,6 +4687,10 @@ fn perform_gate_effect(
             }
             exec_real(real_binary, name, args, None)
         }
+        GateEffect::ExecWithout { notice, args } => {
+            eprintln!("{notice}");
+            exec_real(real_binary, name, &args, None)
+        }
     }
 }
 
@@ -4807,6 +4815,52 @@ fn tracking_flag(args: &[String]) -> bool {
     })
 }
 
+/// `git push -u …` with the `-u` taken out, on macOS; `None` otherwise.
+///
+/// `-u` / `--set-upstream` only asks git to write `branch.<b>.remote` and
+/// `.merge` into `.git/config` after the push. The sandbox denies that write,
+/// so git printed `error: could not write config file .git/config: Operation
+/// not permitted` and a false `set up to track` line after a push that had
+/// worked (navikt/copilot#1348). Without the flag the push is the same push
+/// and git has nothing to fail at. The guard has already judged the original
+/// argv; dropping a flag that picks no destination changes nothing it decided.
+///
+/// Exact tokens before a `--` only: a bundled `-uf` keeps the old notice.
+fn push_without_upstream(args: &[String]) -> Option<Vec<String>> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let i = cplt::gh_proxy::git_subcommand_index(args)?;
+    if args[i] != "push" {
+        return None;
+    }
+    let end = args[i..]
+        .iter()
+        .position(|a| a == "--")
+        .map_or(args.len(), |p| i + p);
+    let mut kept = Vec::with_capacity(args.len());
+    // `-u` as the value of `-o`/`--repo`/…: dropping it would shift the next
+    // word into the value slot and change the destination the guard judged.
+    let mut is_value = false;
+    for (n, a) in args.iter().enumerate() {
+        let flags = n > i && n < end && !is_value;
+        if flags && (a == "-u" || a == "--set-upstream") {
+            continue;
+        }
+        is_value = flags && cplt::gh_proxy::PUSH_FLAGS_WITH_VALUE.contains(&a.as_str());
+        kept.push(a.clone());
+    }
+    (kept.len() < args.len()).then_some(kept)
+}
+
+/// The note printed when [`push_without_upstream`] took `-u` out.
+const UPSTREAM_DROPPED_NOTICE: &str = concat!(
+    "cplt: pushing without -u, because .git/config is read-only in the sandbox. ",
+    "No upstream is recorded, so name the branch on later pushes: ",
+    "`git push origin HEAD:<branch>`, or run `git branch -u origin/<branch>` ",
+    "outside the sandbox."
+);
+
 /// The note printed for such a command.
 const TRACKING_DROPPED_NOTICE: &str = concat!(
     "cplt: this records branch tracking in .git/config, which the sandbox denies. ",
@@ -4844,11 +4898,17 @@ fn decide_git_gate(
         Some(real_git),
         repo_facts,
     ) {
-        Ok(()) => GateEffect::ExecPlain {
-            // Only where nothing else is being said: a refusal or a warn-mode
-            // notice is the more urgent message, and two notices on one command
-            // is how both get skimmed.
-            notice: tracking_flag(args).then(|| TRACKING_DROPPED_NOTICE.to_string()),
+        Ok(()) => match push_without_upstream(args) {
+            Some(args) => GateEffect::ExecWithout {
+                notice: UPSTREAM_DROPPED_NOTICE.to_string(),
+                args,
+            },
+            None => GateEffect::ExecPlain {
+                // Only where nothing else is being said: a refusal or a
+                // warn-mode notice is the more urgent message, and two notices
+                // on one command is how both get skimmed.
+                notice: tracking_flag(args).then(|| TRACKING_DROPPED_NOTICE.to_string()),
+            },
         },
         Err(refusal) => match mode {
             config::EnforcementMode::Block => GateEffect::Refuse(refusal),
@@ -13105,6 +13165,60 @@ mod tests {
         }
         let err = validate_flags(&[sub], &project).unwrap_err().to_string();
         assert!(err.contains(&inner.display().to_string()), "{err}");
+    }
+
+    /// `git push -u` runs without the `-u` on macOS, so git has no denied
+    /// `.git/config` write to print an error about (navikt/copilot#1348).
+    #[test]
+    fn push_upstream_flag_is_dropped_before_the_push_runs() {
+        let a = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let dropped = |v: &[&str]| push_without_upstream(&a(v));
+        if !cfg!(target_os = "macos") {
+            // Linux writes .git/config; the flag works there and stays.
+            assert_eq!(dropped(&["push", "-u", "origin", "feat"]), None);
+            return;
+        }
+        assert_eq!(
+            dropped(&["push", "-u", "origin", "feat"]),
+            Some(a(&["push", "origin", "feat"]))
+        );
+        assert_eq!(
+            dropped(&["-C", "/x", "push", "--set-upstream", "origin", "HEAD:feat"]),
+            Some(a(&["-C", "/x", "push", "origin", "HEAD:feat"]))
+        );
+        // Nothing to drop, not a push, or after `--` (a refspec, not a flag).
+        assert_eq!(dropped(&["push", "origin", "feat"]), None);
+        assert_eq!(dropped(&["clean", "-u"]), None);
+        assert_eq!(dropped(&["push", "origin", "--", "-u"]), None);
+        // `-u` as an option's value is not the flag.
+        assert_eq!(
+            dropped(&["push", "--push-option", "-u", "origin", "feat"]),
+            None
+        );
+        assert_eq!(
+            dropped(&["push", "-o", "-u", "-u", "origin", "feat"]),
+            Some(a(&["push", "-o", "-u", "origin", "feat"]))
+        );
+
+        // Through the gate: an allowed `push -u` runs as the rewritten argv.
+        let tmp = tempfile::tempdir().unwrap();
+        let effect = decide_git_gate(
+            &a(&["push", "-u", "origin", "feat"]),
+            config::EnforcementMode::Block,
+            false,
+            false,
+            false,
+            &[],
+            Path::new("/usr/bin/git"),
+            &gh_proxy::RepoFacts {
+                project_dir: tmp.path().display().to_string(),
+                ..Default::default()
+            },
+        );
+        assert!(
+            matches!(&effect, GateEffect::ExecWithout { args, .. } if *args == a(&["push", "origin", "feat"])),
+            "an allowed push -u must run without -u"
+        );
     }
 
     /// #402: git records branch tracking in `.git/config`, which the sandbox
