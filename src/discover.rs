@@ -1410,48 +1410,24 @@ fn gitdir_without_git(dir: &Path) -> Option<PathBuf> {
 /// - Not a worktree (regular repo with `.git` dir in project root)
 /// - The common dir resolves to an unsafe root
 /// - The common dir is not under `$HOME`
-pub fn git_common_dir(home_dir: &Path, project_dir: &Path) -> Option<PathBuf> {
-    // `git_dir_of` runs the hardened invoker and canonicalizes; it also
-    // subsumes the old `raw == ".git"` spelling check, because the comparison
-    // below is against the *resolved* local `.git` rather than git's output.
-    let resolved = git_dir_of(project_dir)?;
-    // Not a worktree — the common dir is the project's own `.git` directory,
-    // which the project grant already covers.
-    let local = project_dir.join(".git");
-    if resolved == std::fs::canonicalize(&local).unwrap_or(local) {
-        return None;
-    }
+///
+/// A common dir outside `$HOME` gets a warning unless `allow_write` already
+/// covers it; otherwise git just fails inside the sandbox with no reason given.
+pub fn git_common_dir(
+    home_dir: &Path,
+    project_dir: &Path,
+    allow_write: &[PathBuf],
+) -> Option<PathBuf> {
+    let resolved = worktree_common_dir(project_dir)?;
     // Safety: reject unsafe roots
     if crate::is_unsafe_root(&resolved, home_dir) {
         return None;
     }
     // Must be under $HOME to prevent overly broad filesystem access
     if !resolved.starts_with(home_dir) {
-        return None;
-    }
-    // `--git-common-dir` is not trustworthy on its own: git derives it from a
-    // `commondir` file inside the gitdir, which sits in the project tree the
-    // agent can write. Planting one makes git name *another repository*, and
-    // the checks above wave it through — it is a real git repo under $HOME, so
-    // it is neither an unsafe root nor outside home. The grant that follows
-    // would hand over that repo's whole object store (every file ever
-    // committed, reachable with `git cat-file` regardless of the working-tree
-    // deny) plus its refs.
-    //
-    // Only two layouts are legitimate, and both are relative to the gitdir git
-    // actually resolved for this project:
-    //   - separate gitdir / plain repo: the common dir *is* the gitdir
-    //   - worktree: the common dir is `<gitdir>/../..`, because git writes
-    //     literally `../..` into `<main>/.git/worktrees/<name>/commondir`
-    // A steered commondir satisfies neither.
-    let git_dir = crate::git::command(project_dir, &["rev-parse", "--absolute-git-dir"])?
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))?;
-    let git_dir = std::fs::canonicalize(&git_dir).unwrap_or(git_dir);
-    let is_worktree_layout = git_dir.parent().and_then(Path::parent) == Some(resolved.as_path());
-    if resolved != git_dir && !is_worktree_layout {
+        if ungranted_outside_home(&resolved, home_dir, allow_write) {
+            ui::warn(&common_dir_outside_home_message(&resolved));
+        }
         return None;
     }
     // An unsafe character here must not brick the launch. `prepare()` validates
@@ -1477,6 +1453,86 @@ pub fn git_common_dir(home_dir: &Path, project_dir: &Path) -> Option<PathBuf> {
         return None;
     }
     Some(resolved)
+}
+
+/// The shared git dir of a linked worktree or separate gitdir, with a steered
+/// `commondir` rejected. `None` for a plain repo, whose `.git` the project grant
+/// already covers. No unsafe-root or `$HOME` filtering: [`git_common_dir`] and
+/// [`git_common_dir_outside_home`] apply that.
+fn worktree_common_dir(project_dir: &Path) -> Option<PathBuf> {
+    // `git_dir_of` runs the hardened invoker and canonicalizes; it also
+    // subsumes the old `raw == ".git"` spelling check, because the comparison
+    // below is against the *resolved* local `.git` rather than git's output.
+    let resolved = git_dir_of(project_dir)?;
+    // Not a worktree — the common dir is the project's own `.git` directory,
+    // which the project grant already covers.
+    let local = project_dir.join(".git");
+    if resolved == std::fs::canonicalize(&local).unwrap_or(local) {
+        return None;
+    }
+    // `--git-common-dir` is not trustworthy on its own: git derives it from a
+    // `commondir` file inside the gitdir, which sits in the project tree the
+    // agent can write. Planting one makes git name *another repository*, and
+    // the unsafe-root and $HOME checks wave it through — it is a real git repo
+    // under $HOME, so it is neither an unsafe root nor outside home. The grant
+    // that follows would hand over that repo's whole object store (every file
+    // ever committed, reachable with `git cat-file` regardless of the
+    // working-tree deny) plus its refs.
+    //
+    // Only two layouts are legitimate, and both are relative to the gitdir git
+    // actually resolved for this project:
+    //   - separate gitdir / plain repo: the common dir *is* the gitdir
+    //   - worktree: the common dir is `<gitdir>/../..`, because git writes
+    //     literally `../..` into `<main>/.git/worktrees/<name>/commondir`
+    // A steered commondir satisfies neither, and is never named in a warning.
+    let git_dir = crate::git::command(project_dir, &["rev-parse", "--absolute-git-dir"])?
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))?;
+    let git_dir = std::fs::canonicalize(&git_dir).unwrap_or(git_dir);
+    let is_worktree_layout = git_dir.parent().and_then(Path::parent) == Some(resolved.as_path());
+    if resolved != git_dir && !is_worktree_layout {
+        return None;
+    }
+    Some(resolved)
+}
+
+/// The shared git dir [`git_common_dir`] leaves ungranted because it is outside
+/// `$HOME` and `allow_write` does not cover, for `cplt doctor`.
+pub fn git_common_dir_outside_home(
+    home_dir: &Path,
+    project_dir: &Path,
+    allow_write: &[PathBuf],
+) -> Option<PathBuf> {
+    worktree_common_dir(project_dir).filter(|d| ungranted_outside_home(d, home_dir, allow_write))
+}
+
+/// `dir` is a safe root outside `$HOME` that no `allow_write` entry covers.
+fn ungranted_outside_home(dir: &Path, home_dir: &Path, allow_write: &[PathBuf]) -> bool {
+    !crate::is_unsafe_root(dir, home_dir)
+        && !dir.starts_with(home_dir)
+        && !allow_write.iter().any(|w| dir.starts_with(w))
+}
+
+/// The startup warning for [`git_common_dir_outside_home`]. `cplt doctor`
+/// shows the same problem and fix as a finding.
+pub fn common_dir_outside_home_message(dir: &Path) -> String {
+    format!(
+        "Not granting the shared git directory {} (outside $HOME), so git in this \
+         worktree will fail inside the sandbox. {}.",
+        dir.display(),
+        common_dir_outside_home_fix(dir)
+    )
+}
+
+/// The fix for a shared git dir outside `$HOME`. `--allow-write` gets the same
+/// grant cplt gives one under `$HOME`: the hooks and config denies stay.
+pub fn common_dir_outside_home_fix(dir: &Path) -> String {
+    format!(
+        "Move the repository under $HOME, or grant it with --allow-write {}",
+        dir.display()
+    )
 }
 
 /// Find the Electron `.app/Contents` that a Copilot CLI shim runs under.
@@ -1695,7 +1751,7 @@ mod tests {
 
         // Sanity: an ordinary repo is not a worktree, so there is no grant.
         assert_eq!(
-            git_common_dir(home, &attacker),
+            git_common_dir(home, &attacker, &[]),
             None,
             "a plain repo must not produce a common-dir grant"
         );
@@ -1709,7 +1765,7 @@ mod tests {
         .expect("plant commondir");
 
         assert_eq!(
-            git_common_dir(home, &attacker),
+            git_common_dir(home, &attacker, &[]),
             None,
             "a planted commondir must not grant access to another repository"
         );
@@ -1743,7 +1799,7 @@ mod tests {
 
         let expected = std::fs::canonicalize(main.join(".git")).expect("canonicalize .git");
         assert_eq!(
-            git_common_dir(home, &wt),
+            git_common_dir(home, &wt, &[]),
             Some(expected),
             "a real worktree must still resolve to the main repo's .git"
         );
@@ -1786,11 +1842,60 @@ mod tests {
             "fixture must produce an SBPL-unsafe path"
         );
         assert_eq!(
-            git_common_dir(home, &wt),
+            git_common_dir(home, &wt, &[]),
             None,
             "an unquotable common dir must be skipped, not returned for \
              prepare() to hard-error on"
         );
+    }
+
+    /// A worktree under `$HOME` whose shared git dir is outside it: not
+    /// granted, but reported with its path so the user learns why git fails
+    /// (#629). An `allow_write` covering it silences the report.
+    #[test]
+    fn common_dir_outside_home_is_reported_not_granted() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonicalize tmp");
+        let home = root.join("home");
+        let main = root.join("shared");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        std::fs::create_dir_all(&main).expect("mkdir main");
+        if !git_in(&main, &["init", "-q", "-b", "main"]) {
+            eprintln!("SKIPPED: git unavailable");
+            return;
+        }
+        assert!(git_in(&main, &["commit", "-q", "--allow-empty", "-m", "i"]));
+        let wt = home.join("wt");
+        assert!(git_in(
+            &main,
+            &["worktree", "add", "-q", "-b", "feat", &wt.to_string_lossy()]
+        ));
+        let common = std::fs::canonicalize(main.join(".git")).expect("canonicalize .git");
+
+        assert_eq!(git_common_dir(&home, &wt, &[]), None);
+        assert_eq!(
+            git_common_dir_outside_home(&home, &wt, &[]),
+            Some(common.clone())
+        );
+        assert_eq!(
+            git_common_dir_outside_home(&home, &wt, std::slice::from_ref(&main)),
+            None,
+            "a covering --allow-write already grants it"
+        );
+        assert_eq!(
+            git_common_dir_outside_home(&root, &wt, &[]),
+            None,
+            "under $HOME it is granted, nothing to report"
+        );
+
+        let msg = common_dir_outside_home_message(&common);
+        let d = common.display();
+        assert!(
+            msg.contains(&format!("shared git directory {d} (outside $HOME)")),
+            "{msg}"
+        );
+        assert!(msg.contains(&format!("--allow-write {d}")), "{msg}");
+        assert!(!msg.contains('\n'), "one line: {msg}");
     }
 
     /// Without a trusted git, a worktree's gitdir must still resolve — it is

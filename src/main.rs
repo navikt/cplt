@@ -5083,7 +5083,7 @@ impl HostProbe {
             // Global git hooks path from core.hooksPath.
             git_hooks_path: discover::git_hooks_path(home_dir),
             // Git worktree common directory (shared .git for worktrees).
-            git_common_dir: discover::git_common_dir(home_dir, project_dir),
+            git_common_dir: discover::git_common_dir(home_dir, project_dir, &resolved.allow_write),
             root_agents_md: resolved
                 .agents_md
                 .then(|| root_agents_md_outside(project_dir))
@@ -7191,6 +7191,20 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
     println!();
 
     findings.extend(doctor::wsl_drive_project_finding(&project_dir, wsl));
+    findings.extend(
+        discover::git_common_dir_outside_home(&home_dir, &project_dir, &resolved.allow_write).map(
+            |dir| {
+                Finding::warning(
+                    format!(
+                        "The shared git directory {} is outside $HOME, so cplt does not grant it: \
+                     git in this worktree fails inside the sandbox.",
+                        dir.display()
+                    ),
+                    Some(discover::common_dir_outside_home_fix(&dir)),
+                )
+            },
+        ),
+    );
     findings.extend(doctor::pts_grant_finding(
         &policy,
         bubblewrap.active(),
