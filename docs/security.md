@@ -30,7 +30,7 @@ This section describes the macOS Seatbelt profile; the Linux equivalents, and wh
 - The SSH agent is blocked on macOS. Unix socket access is denied, so loaded SSH keys cannot be used. On Linux it is not gated by Landlock below kernel 7.1; bubblewrap's private `/tmp` hides the stock OpenSSH socket, but a desktop agent under `$XDG_RUNTIME_DIR` stays reachable.
 - Filesystem isolation is the primary control. Credentials are kernel-blocked whatever the network allows.
 - The proxy is on by default, and logs and filters every outbound connection from Copilot, `gh`, and `curl` alike.
-- `cplt config set allow.ports 8080` adds a port when you need one, for a dev server for example.
+- `cplt config set allow.ports 8443` adds an outbound port to remote hosts. A local dev server or database needs `allow.localhost` instead: `allow.ports` does not open loopback.
 
 See [SECURITY.md](../SECURITY.md) for the full threat model and honest gaps.
 
