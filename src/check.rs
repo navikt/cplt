@@ -1243,7 +1243,8 @@ fn render_targeted_item(out: &mut String, item: &CheckItem) {
         }
         // No fix on a block means the model knows the block and it is
         // deliberate; "none needed" there read as a contradiction (#621). An
-        // inconclusive probe observed nothing, so there is nothing to fix.
+        // inconclusive probe observed nothing, so it gets no stock line; a fix
+        // the model knows (it predicts BLOCKED) is still printed above.
         None => match item.decision {
             Decision::Allowed => {
                 let _ = writeln!(out, "  Fix: none needed (intentional).");
@@ -1935,5 +1936,14 @@ mod tests {
         );
         let inconclusive = render(Decision::Inconclusive);
         assert!(!inconclusive.contains("Fix:"), "{inconclusive}");
+        // A fix the model knows (it predicts BLOCKED) still helps when the
+        // probe could not run, e.g. --allow-read for a missing path.
+        let mut known = item(Decision::Inconclusive);
+        known.fix = Some("grant it with --allow-read <PATH>.".to_string());
+        let known = Report::new("shell".into(), None, false, vec![known]).render();
+        assert!(
+            known.contains("  Fix: grant it with --allow-read"),
+            "{known}"
+        );
     }
 }

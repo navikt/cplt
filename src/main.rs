@@ -6614,6 +6614,11 @@ fn build_path_check(
 ) -> check::Report {
     let expl = check::explain_path(policy, home_dir, project_dir, path);
     let mut items = Vec::new();
+    // A secret-shaped name is the one unmodelled deny a flag can lift.
+    let secret_file = !resolved.allow_env_files
+        && path.file_name().is_some_and(|n| {
+            is_sensitive_basename(&n.to_string_lossy(), resolved.deny_key_files_by_extension)
+        });
 
     let read_dec = probe_read(prepared, resolved, disabled, path);
     let note = if read_dec == check::Decision::Inconclusive && !path.exists() {
@@ -6631,7 +6636,7 @@ fn build_path_check(
         decision: read_dec,
         expected: None,
         reason: expl.reason.clone(),
-        fix: mismatch_fix(read_dec, expl.read_decision()).or_else(|| expl.fix.clone()),
+        fix: mismatch_fix(read_dec, expl.read_decision(), secret_file).or_else(|| expl.fix.clone()),
         note,
     });
 
@@ -6662,7 +6667,7 @@ fn build_path_check(
             decision: write_dec,
             expected: None,
             reason,
-            fix: mismatch_fix(write_dec, expl.write_decision()).or(fix),
+            fix: mismatch_fix(write_dec, expl.write_decision(), secret_file).or(fix),
             note,
         });
     }
@@ -6687,13 +6692,24 @@ fn mismatch_note(probe: check::Decision, model: check::Decision) -> Option<Strin
 
 /// The fix for a block the policy model did not predict. The model's own fix
 /// (usually none, since it thinks access is granted) would be false here, so
-/// say what is known instead (#621).
-fn mismatch_fix(probe: check::Decision, model: check::Decision) -> Option<String> {
+/// say what is known instead (#621). `secret_file`: the name matches the
+/// secret-file deny patterns and `--allow-env-files` is off.
+fn mismatch_fix(
+    probe: check::Decision,
+    model: check::Decision,
+    secret_file: bool,
+) -> Option<String> {
     (probe == check::Decision::Blocked && model == check::Decision::Allowed).then(|| {
-        "none known: the sandbox denies this through a rule the policy model does not \
-         cover (for example a protected agent config file nested in the project). \
-         Do this outside cplt if you need it."
-            .to_string()
+        if secret_file {
+            "this is a secret-shaped file (.env, .pem, .key, ...), which cplt denies \
+             even inside the project. --allow-env-files lifts that deny."
+                .to_string()
+        } else {
+            "a sandbox rule the policy model does not cover blocks this (for example a \
+             protected agent config file nested in the project). Do this outside cplt \
+             if you need it."
+                .to_string()
+        }
     })
 }
 
@@ -10270,9 +10286,14 @@ mod tests {
     fn mismatch_fix_only_for_unpredicted_block() {
         use crate::check::Decision::{Allowed, Blocked, Inconclusive};
         assert!(
-            super::mismatch_fix(Blocked, Allowed)
+            super::mismatch_fix(Blocked, Allowed, false)
                 .unwrap()
                 .contains("does not cover")
+        );
+        assert!(
+            super::mismatch_fix(Blocked, Allowed, true)
+                .unwrap()
+                .contains("--allow-env-files")
         );
         for (probe, model) in [
             (Blocked, Blocked),
@@ -10281,7 +10302,7 @@ mod tests {
             (Inconclusive, Allowed),
         ] {
             assert_eq!(
-                super::mismatch_fix(probe, model),
+                super::mismatch_fix(probe, model, true),
                 None,
                 "{probe:?} vs {model:?}"
             );

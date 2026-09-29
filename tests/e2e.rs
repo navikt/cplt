@@ -8285,6 +8285,34 @@ paths = [
         assert!(!stdout.contains("none needed"), "{stdout}");
     }
 
+    /// #621 review: a project `.env` probes BLOCKED while the model says the
+    /// project rule allows it. The fix must name --allow-env-files, not claim
+    /// nothing inside cplt helps.
+    #[test]
+    fn e2e_check_path_env_file_names_allow_env_files() {
+        require_sandbox!();
+        let proj = check_project();
+        let env = proj.path().join(".env");
+        std::fs::write(&env, "X=1\n").unwrap();
+        let output = cplt_cmd()
+            .args(["--agent", "claude"])
+            .arg("--project-dir")
+            .arg(proj.path())
+            .args(["check", "path"])
+            .arg(&env)
+            .output()
+            .expect("cplt check path should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("(read): BLOCKED"), "{stdout}");
+        assert!(
+            stdout.contains("secret-shaped file") && stdout.contains("--allow-env-files lifts"),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("outside cplt"), "{stdout}");
+        assert!(!stdout.contains("none needed"), "{stdout}");
+    }
+
     /// #620: Seatbelt refuses to exec setuid binaries, so check must not
     /// call /bin/ps ALLOWED.
     #[test]
