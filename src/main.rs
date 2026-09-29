@@ -4958,9 +4958,11 @@ fn canonical_exec_binary(found: &Path) -> anyhow::Result<PathBuf> {
 /// Nothing about the policy changes. The kernel follows the symlink on exec
 /// and checks execute on the target, the same file `canonical` names, so
 /// Seatbelt and Landlock enforce exactly what they did before. What changes
-/// is that Seatbelt must also be able to read the symlink to follow it, so the
-/// symlink is used only when the policy grants read where it lives and no
-/// deny path covers it. The deny check is separate because `LandlockPolicy`
+/// is that Seatbelt must also be able to read every symlink on the way to
+/// follow it (`file-read-metadata`, per hop: a mise shim is two links,
+/// `shims/go -> /opt/homebrew/bin/mise -> ../Cellar/...`), so the symlink is
+/// used only when the policy grants read on every link in the chain and no
+/// deny path covers any of them. The deny check is separate because `LandlockPolicy`
 /// holds only grants: Seatbelt emits `deny_paths` after the allows and
 /// Bubblewrap masks them, so a link inside a readable tree can still be
 /// unreadable to the child. Otherwise
@@ -4988,14 +4990,57 @@ fn exec_invocation_path(
         return canonical;
     };
     let link = dir.join(name);
-    let readable = policy
-        .fs_rules
-        .iter()
-        .any(|rule| rule.access.read && link.starts_with(&rule.path));
-    let denied = deny_paths.iter().any(|deny| {
-        link.starts_with(deny) || std::fs::canonicalize(deny).is_ok_and(|d| link.starts_with(d))
-    });
-    if readable && !denied { link } else { canonical }
+    // The LandlockPolicy is the Linux policy; on macOS it lacks the Seatbelt
+    // tool read grants, so `/opt/homebrew/bin/mise`, the middle hop of every
+    // Homebrew mise shim, would read as unreadable. Add them back there.
+    let tool_read_dirs: &[&str] = if cfg!(target_os = "macos") {
+        sandbox::TOOL_READ_DIRS
+    } else {
+        &[]
+    };
+    let followable = |hop: &Path| {
+        (policy
+            .fs_rules
+            .iter()
+            .any(|rule| rule.access.read && hop.starts_with(&rule.path))
+            || tool_read_dirs.iter().any(|dir| hop.starts_with(dir)))
+            && !deny_paths.iter().any(|deny| {
+                hop.starts_with(deny)
+                    || std::fs::canonicalize(deny).is_ok_and(|d| hop.starts_with(d))
+            })
+    };
+    // Walk the chain one link at a time, each resolved against its own
+    // canonical directory. 40 is the kernel's own symlink limit (MAXSYMLINKS).
+    let mut hop = link.clone();
+    for _ in 0..40 {
+        let Ok(target) = std::fs::read_link(&hop) else {
+            // Not a link: the chain ended on the file the kernel runs, whose
+            // execute check is the policy's business, not this function's.
+            return link;
+        };
+        if !followable(&hop) {
+            return canonical;
+        }
+        let next = hop.parent().unwrap_or(Path::new("/")).join(target);
+        let (Some(name), Some(Ok(dir))) =
+            (next.file_name(), next.parent().map(std::fs::canonicalize))
+        else {
+            return canonical;
+        };
+        hop = dir.join(name);
+    }
+    canonical
+}
+
+/// The pnpm binary `cplt exec` was asked to run, if it was asked for pnpm.
+///
+/// Matches the name the user typed as well as the canonical file name, the
+/// way `redirect_to_guard_shim` keys on the typed name: `shims/pnpm -> mise`
+/// canonicalizes to `mise`, and is still a request for pnpm.
+fn exec_pnpm_candidate<'a>(typed: &str, canonical: Option<&'a Path>) -> Option<&'a Path> {
+    let is_pnpm =
+        |name: Option<&std::ffi::OsStr>| name.is_some_and(|name| name.eq_ignore_ascii_case("pnpm"));
+    canonical.filter(|path| is_pnpm(path.file_name()) || is_pnpm(Path::new(typed).file_name()))
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -5687,10 +5732,10 @@ fn run_exec_command(
         .as_deref()
         .map(canonical_exec_binary)
         .transpose()?;
-    let pnpm_candidate = requested_binary.as_deref().filter(|path| {
-        path.file_name()
-            .is_some_and(|name| name.eq_ignore_ascii_case("pnpm"))
-    });
+    let pnpm_candidate = exec_pnpm_candidate(
+        cmd.first().map_or("", String::as_str),
+        requested_binary.as_deref(),
+    );
 
     // Resolve config, paths, project dir — same pipeline as the main agent launch
     let ResolvedContext {
@@ -11045,6 +11090,42 @@ mod tests {
             canonical,
             "a deny path over the link wins over the read grant around it"
         );
+
+        // Two hops, like a mise shim: shims/go2 -> hop/mise -> ../multicall.
+        // Seatbelt needs read on every link, so a denied middle hop must
+        // fall back to the target even though the first link is readable.
+        let hop_dir = root.join("hop");
+        std::fs::create_dir(&hop_dir).unwrap();
+        std::os::unix::fs::symlink("../multicall", hop_dir.join("mise")).unwrap();
+        std::os::unix::fs::symlink(hop_dir.join("mise"), shims.join("go2")).unwrap();
+        let two_hop = shims.join("go2");
+        assert_eq!(canonical_exec_binary(&two_hop).unwrap(), multicall);
+        assert_eq!(
+            exec_invocation_path(&two_hop, canonical.clone(), &policy(vec![rule(true)]), &[]),
+            two_hop,
+            "every hop readable: run through the first link"
+        );
+        assert_eq!(
+            exec_invocation_path(
+                &two_hop,
+                canonical.clone(),
+                &policy(vec![rule(true)]),
+                std::slice::from_ref(&hop_dir)
+            ),
+            canonical,
+            "a denied middle hop makes the whole chain unfollowable"
+        );
+    }
+
+    #[test]
+    fn exec_treats_a_pnpm_shim_as_a_pnpm_request() {
+        let mise = Path::new("/opt/homebrew/Cellar/mise/1/bin/mise");
+        let pnpm = Path::new("/home/u/Library/pnpm/pnpm");
+        assert_eq!(exec_pnpm_candidate("pnpm", Some(mise)), Some(mise));
+        assert_eq!(exec_pnpm_candidate("/x/shims/pnpm", Some(mise)), Some(mise));
+        assert_eq!(exec_pnpm_candidate("pn", Some(pnpm)), Some(pnpm));
+        assert_eq!(exec_pnpm_candidate("go", Some(mise)), None);
+        assert_eq!(exec_pnpm_candidate("pnpm", None), None);
     }
 
     #[test]

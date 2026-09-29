@@ -980,7 +980,7 @@ pub(super) const SYSTEM_READ_FILES: &[&str] = &[
 ];
 
 /// Tool directories commonly needed by developers.
-pub(super) const TOOL_READ_DIRS: &[&str] = &[
+pub const TOOL_READ_DIRS: &[&str] = &[
     "/bin",
     "/usr/bin",
     "/usr/lib",
