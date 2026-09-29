@@ -364,13 +364,13 @@ pub fn writable_tree_on_path(
 /// is a preflight — asked of the same resolved policy the run is about to
 /// enforce, before the launch, and only about the one binary cplt resolved.
 ///
-/// Only sees a symlink that is still one by the time cplt resolves it, which is
-/// the reported case: `resolve_exec_binary`'s PATH branch returns the shim as
-/// found, and an agent binary discovered on PATH the same way. An *explicit*
-/// path (`cplt exec -- /path/to/shim`) is canonicalized before it gets here, so
-/// what runs is the target and there is no shim left to name — the exec still
-/// fails, and the remedy is still `--allow-exec` on that directory, but this
-/// says nothing about it.
+/// Only sees a symlink that is still one by the time cplt resolves it: an agent
+/// binary discovered on PATH, and a `cplt exec` binary that is run through its
+/// link because the link and its target have different names (#640, a mise
+/// shim, for instance). Any other `cplt exec` binary is canonicalized before it
+/// gets here, so what runs is the target and there is no shim left to name —
+/// the exec still fails, and the remedy is still `--allow-exec` on that
+/// directory, but this says nothing about it.
 ///
 /// Returns `None` when `path` is not a symlink, when it cannot be resolved, or
 /// when the target is granted execute anyway (the ordinary case: nvm, fnm, asdf,

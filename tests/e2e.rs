@@ -7226,6 +7226,52 @@ paths = [
         let _ = std::fs::remove_dir_all(&fake_home);
     }
 
+    /// #640: `cplt exec -- go` with `go` a mise shim ran `mise` itself. A
+    /// multicall binary picks what to run from argv[0], and cplt executed the
+    /// canonical target, so argv[0] named the target. This one prints the
+    /// name it was started under, reached through a differently named link on
+    /// PATH, exactly like a mise shim.
+    #[test]
+    fn e2e_exec_keeps_argv0_of_a_multicall_binary_behind_a_symlink() {
+        require_sandbox!();
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::Builder::new()
+            .prefix(".cplt-e2e-multicall-")
+            .tempdir_in(project_dir())
+            .expect("create multicall dir");
+        let multicall = dir.path().join("multicall");
+        std::fs::write(&multicall, "#!/bin/sh\necho \"argv0=$(basename \"$0\")\"\n").unwrap();
+        std::fs::set_permissions(&multicall, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let shims = dir.path().join("shims");
+        std::fs::create_dir(&shims).unwrap();
+        std::os::unix::fs::symlink(&multicall, shims.join("cplt-e2e-tool")).unwrap();
+        let path = format!(
+            "{}:{}",
+            shims.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+
+        let output = cplt_cmd()
+            .args(["--no-validate", "exec", "--", "cplt-e2e-tool"])
+            .env("PATH", path)
+            .current_dir(project_dir())
+            .output()
+            .expect("cplt exec should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "exec through the link failed.\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            stdout.trim(),
+            "argv0=cplt-e2e-tool",
+            "the binary must see the name it was reached by, not its target's"
+        );
+    }
+
     #[test]
     fn e2e_exec_exit_code_pass_through() {
         require_sandbox!();

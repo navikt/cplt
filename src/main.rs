@@ -4884,54 +4884,110 @@ fn run_git_gate(
 
 // ── cplt exec ──────────────────────────────────────────────────────────────
 
-/// Resolve a command name to an absolute binary path.
+/// Resolve a command name to an absolute, canonical binary path.
 ///
-/// If `name` is already an absolute path, validate it exists and return it.
-/// Otherwise walk PATH entries (left-to-right) and return the first match.
-/// Unlike `Agent::resolve_binary()`, this does not skip cplt aliases — the
-/// user explicitly asked for this binary.
+/// The canonical path is what every policy decision about the binary keys on:
+/// the guard-shim redirect, the pnpm shadow and the pnpm exec grants. Unlike
+/// `Agent::resolve_binary()`, this does not skip cplt aliases — the user
+/// explicitly asked for this binary.
 fn resolve_exec_binary(name: &str) -> anyhow::Result<PathBuf> {
-    let p = PathBuf::from(name);
-    if p.is_absolute() {
-        // Canonicalize to resolve symlinks and `..` components — consistent with
-        // how other paths are handled, and avoids passing a non-canonical path
-        // to the OS after the sandbox allow-lists have been resolved.
-        let canonical = std::fs::canonicalize(&p).with_context(|| {
-            format!("exec: binary not found or not accessible: {}", p.display())
-        })?;
-        if is_executable_file(&canonical) {
-            return Ok(canonical);
-        }
-        bail!("exec: not an executable file: {}", canonical.display());
-    }
-    // Relative path (e.g. `./vendor-script.sh`) — resolve against cwd, not PATH.
-    if name.contains('/') {
-        let cwd = std::env::current_dir().context("exec: cannot determine current directory")?;
-        let canonical = std::fs::canonicalize(cwd.join(name)).with_context(|| {
-            format!("exec: relative binary not found or not accessible: {name}")
-        })?;
-        if is_executable_file(&canonical) {
-            return Ok(canonical);
-        }
-        bail!("exec: not an executable file: {}", canonical.display());
-    }
-    let path_var = std::env::var_os("PATH").unwrap_or_default();
-    resolve_exec_binary_in_path(name, &path_var)
+    canonical_exec_binary(&locate_exec_binary(name)?)
 }
 
-fn resolve_exec_binary_in_path(name: &str, path_var: &std::ffi::OsStr) -> anyhow::Result<PathBuf> {
-    for dir in std::env::split_paths(path_var) {
-        let candidate = dir.join(name);
-        if is_executable_file(&candidate) {
-            return std::fs::canonicalize(&candidate).with_context(|| {
-                format!(
-                    "exec: cannot resolve executable candidate {}",
-                    candidate.display()
-                )
-            });
-        }
+/// Find `name` the way a shell would, without following a final symlink.
+///
+/// An absolute path is taken as given, a name with a slash (`./vendor-script.sh`)
+/// is joined to the cwd, and a bare name is the first executable PATH hit.
+/// Kept apart from [`canonical_exec_binary`] because the two answer different
+/// questions: the canonical path decides policy, and this one keeps the name a
+/// multicall binary dispatches on (#640, see [`exec_invocation_path`]).
+fn locate_exec_binary(name: &str) -> anyhow::Result<PathBuf> {
+    let p = PathBuf::from(name);
+    let found = if p.is_absolute() {
+        p
+    } else if name.contains('/') {
+        // Relative path (e.g. `./vendor-script.sh`) — resolve against cwd, not PATH.
+        std::env::current_dir()
+            .context("exec: cannot determine current directory")?
+            .join(name)
+    } else {
+        let path_var = std::env::var_os("PATH").unwrap_or_default();
+        return locate_exec_binary_in_path(name, &path_var);
+    };
+    if !found.exists() {
+        bail!(
+            "exec: binary not found or not accessible: {}",
+            found.display()
+        );
     }
-    bail!("exec: '{name}' not found in PATH")
+    if !is_executable_file(&found) {
+        bail!("exec: not an executable file: {}", found.display());
+    }
+    Ok(found)
+}
+
+fn locate_exec_binary_in_path(name: &str, path_var: &std::ffi::OsStr) -> anyhow::Result<PathBuf> {
+    std::env::split_paths(path_var)
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable_file(candidate))
+        .ok_or_else(|| anyhow::anyhow!("exec: '{name}' not found in PATH"))
+}
+
+/// Resolve symlinks and `..` components, so policy is decided on the file the
+/// kernel will actually run.
+fn canonical_exec_binary(found: &Path) -> anyhow::Result<PathBuf> {
+    std::fs::canonicalize(found)
+        .with_context(|| format!("exec: cannot resolve executable {}", found.display()))
+}
+
+/// The path to hand the OS for a binary cplt found at `found` and decided
+/// policy for at `canonical` (#640).
+///
+/// A multicall binary (a mise shim, busybox, a rustup proxy) is one file
+/// reached through symlinks under many names, and picks what to run from the
+/// name in argv[0]. Executing the canonical path loses that name, so
+/// `cplt exec -- go version` ran `mise version`. Only the name the binary was
+/// reached by carries it, so that path is executed instead, as a shell would.
+///
+/// `CommandExt::arg0` is not enough on its own: on macOS the child is started
+/// by `sandbox-exec`, which executes its command argument with that same
+/// string as argv[0], so the only way to set the child's argv[0] there is to
+/// execute the symlink. One mechanism for both platforms keeps them from
+/// disagreeing.
+///
+/// Nothing about the policy changes. The kernel follows the symlink on exec
+/// and checks execute on the target, the same file `canonical` names, so
+/// Seatbelt and Landlock enforce exactly what they did before. What changes
+/// is that Seatbelt must also be able to read the symlink to follow it, so the
+/// symlink is used only when the policy grants read where it lives. Otherwise
+/// — and whenever the link and its target share a name, so argv[0] is the same
+/// either way — this returns `canonical`, the pre-#640 behaviour.
+///
+/// Parent components are resolved: the link is matched against the policy's
+/// canonical rule paths, and `/tmp` versus `/private/tmp` would never match.
+fn exec_invocation_path(
+    found: &Path,
+    canonical: PathBuf,
+    policy: &sandbox::LandlockPolicy,
+) -> PathBuf {
+    let Some(name) = found.file_name() else {
+        return canonical;
+    };
+    if canonical.file_name() == Some(name) {
+        return canonical;
+    }
+    let Ok(dir) = found
+        .parent()
+        .map_or(Ok(PathBuf::from("/")), std::fs::canonicalize)
+    else {
+        return canonical;
+    };
+    let link = dir.join(name);
+    let readable = policy
+        .fs_rules
+        .iter()
+        .any(|rule| rule.access.read && link.starts_with(&rule.path));
+    if readable { link } else { canonical }
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -5614,11 +5670,15 @@ fn run_exec_command(
         );
     }
 
-    let requested_binary = if shell_cmd.is_none() {
-        Some(resolve_exec_binary(&cmd[0])?)
+    let requested_path = if shell_cmd.is_none() {
+        Some(locate_exec_binary(&cmd[0])?)
     } else {
         None
     };
+    let requested_binary = requested_path
+        .as_deref()
+        .map(canonical_exec_binary)
+        .transpose()?;
     let pnpm_candidate = requested_binary.as_deref().filter(|path| {
         path.file_name()
             .is_some_and(|name| name.eq_ignore_ascii_case("pnpm"))
@@ -5750,9 +5810,10 @@ fn run_exec_command(
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         (shell, vec!["-c".to_string(), shell_c.clone()])
     } else {
+        let canonical = requested_binary.expect("non-shell exec resolved before sandbox assembly");
         let bin = redirect_to_guard_shim(
             &cmd[0],
-            requested_binary.expect("non-shell exec resolved before sandbox assembly"),
+            canonical.clone(),
             scratch_guard.as_ref().map(cplt::scratch::ScratchDir::path),
             resolved.gh_guard.enabled,
             resolved.git_guard.enabled,
@@ -5764,10 +5825,22 @@ fn run_exec_command(
                 bin
             }
         });
+        // Only the binary the user named: a guard shim or pnpm shadow is
+        // cplt's own file and is run by the path cplt chose for it.
+        let bin = match requested_path.as_deref() {
+            Some(found) if bin == canonical => exec_invocation_path(found, bin, &policy),
+            _ => bin,
+        };
         (bin, cmd[1..].to_vec())
     };
 
-    warn_shim_target_without_exec(&policy, &exec_bin);
+    // Linux only, as in `doctor`: there the LandlockPolicy is the enforcement.
+    // On macOS it models the SBPL profile without the Homebrew exec grants, so
+    // a mise shim run through its link (#640) would be reported as failing
+    // while the real sandbox runs it.
+    if cfg!(target_os = "linux") {
+        warn_shim_target_without_exec(&policy, &exec_bin);
+    }
 
     if cli.print_profile {
         println!("{}", sandbox::describe(&prepared));
@@ -10885,8 +10958,67 @@ mod tests {
         let path = std::env::join_paths([first.path(), second.path()]).unwrap();
 
         assert_eq!(
-            resolve_exec_binary_in_path("pnpm", &path).unwrap(),
-            executable.canonicalize().unwrap()
+            locate_exec_binary_in_path("pnpm", &path).unwrap(),
+            executable
+        );
+    }
+
+    /// #640: a multicall binary reached through a symlink must be run through
+    /// that symlink, or it sees its own name in argv[0] and dispatches wrong.
+    /// The policy decision still keys on the canonical path.
+    #[test]
+    fn exec_runs_a_renamed_symlink_through_the_link_when_the_policy_can_read_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let multicall = root.join("multicall");
+        std::fs::write(&multicall, "#!/bin/sh\necho \"$0\"\n").unwrap();
+        std::fs::set_permissions(&multicall, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let shims = root.join("shims");
+        std::fs::create_dir(&shims).unwrap();
+        std::os::unix::fs::symlink(&multicall, shims.join("go")).unwrap();
+        std::os::unix::fs::symlink(&multicall, shims.join("multicall")).unwrap();
+        let path = std::env::join_paths([&shims]).unwrap();
+
+        let found = locate_exec_binary_in_path("go", &path).unwrap();
+        let canonical = canonical_exec_binary(&found).unwrap();
+        assert_eq!(canonical, multicall, "policy keys on the target");
+
+        let rule = |read| cplt::sandbox::FsRule {
+            nofollow: false,
+            path: root.clone(),
+            access: cplt::sandbox::FsAccess {
+                read,
+                execute: true,
+                ..Default::default()
+            },
+        };
+        let policy = |rules| cplt::sandbox::LandlockPolicy {
+            fs_rules: rules,
+            net_rules: Vec::new(),
+            restrict_net_connect: true,
+            proxy_forced: false,
+            home_dir: root.clone(),
+            precreate_dirs: vec![],
+            plain_file: None,
+        };
+
+        assert_eq!(
+            exec_invocation_path(&found, canonical.clone(), &policy(vec![rule(true)])),
+            shims.join("go"),
+            "the link keeps the name the binary dispatches on"
+        );
+        assert_eq!(
+            exec_invocation_path(&found, canonical.clone(), &policy(vec![rule(false)])),
+            canonical,
+            "a link the sandbox cannot read would fail to exec: keep the target"
+        );
+        let same_name = shims.join("multicall");
+        assert_eq!(
+            exec_invocation_path(&same_name, canonical.clone(), &policy(vec![rule(true)])),
+            canonical,
+            "same name either way: nothing to preserve, keep the target"
         );
     }
 
