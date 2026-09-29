@@ -503,6 +503,8 @@ Or for a single run: `cplt --allow-private-domain intern.nav.no`
 cplt config set allow.localhost 3000
 ```
 
+**A name that resolves to loopback is blocked** (`127.0.0.1.nip.io`, `lvh.me`). `allow.localhost` lifts the port and allowlist gates only for a name that is loopback as written: `localhost`, `*.localhost`, `127.0.0.1` or `[::1]`. Those gates run before DNS, and the proxy does not resolve a name to find out, because under a fail-closed allowlist that would let the agent trigger a DNS lookup for any name it likes. So `127.0.0.1.nip.io:3000` with only `--allow-localhost 3000` gets `BLOCKED-PORT`. Use `localhost:3000` instead. To keep the name, the target must also pass the gates a remote host passes: `--allow-port 3000` (which opens port 3000 to remote hosts as well) and, under an allowlist, the name in `allowed_domains`. The localhost opt-in is still needed, since without it the answer is refused after DNS with `BLOCKED-PRIVATE-RESOLVED`. `cplt check net HOST:PORT` resolves the name and gives this advice.
+
 **Tool needs a non-443 port.** Add it explicitly:
 
 ```bash

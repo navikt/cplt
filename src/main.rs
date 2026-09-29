@@ -6991,7 +6991,13 @@ fn build_net_check(
     preset_name: Option<String>,
 ) -> check::Report {
     let (host, port) = split_host_port(target);
-    let expl = check::explain_domain(net_policy, &host, port, proxy_enabled);
+    let expl = check::explain_domain_resolved(
+        net_policy,
+        &host,
+        port,
+        proxy_enabled,
+        proxy::resolve_socket_addrs,
+    );
 
     // The live proxy applies a SECOND, post-DNS guard once the pre-DNS gates in
     // `classify_connect` pass. Mirror it before trusting an ALLOWED verdict so
