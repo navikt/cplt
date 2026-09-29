@@ -171,19 +171,21 @@ impl<'de> Deserialize<'de> for UnknownCommandPolicy {
 /// baseline (see the merge logic in `loading.rs`).
 ///
 /// `Standard` is the default posture and carries cplt's hardcoded defaults:
-/// all five toggles off, gh_guard and git_guard **on** (git_guard in `warn`
-/// mode), no forced proxy and no default allowlist. Passing no preset behaves
-/// exactly like `standard`. `Strict` adds forced-proxy egress, the fail-closed
-/// allowlist, and escalates the git guard to `block`. `Permissive` and
+/// all five toggles off, gh_guard and git_guard **on** (git_guard in `block`
+/// mode, scoped to the default branch), no forced proxy and no default
+/// allowlist. Passing no preset behaves exactly like `standard`. `Strict` adds
+/// forced-proxy egress, the fail-closed allowlist, and widens the git guard to
+/// every push. `Permissive` and
 /// `FullTrust` weaken the sandbox and turn both guards back off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Preset {
     /// Locked down. No localhost, env files, tmp exec, docker, or lifecycle
-    /// scripts, AND gh_guard + git_guard (in `block` mode) + forced-proxy
+    /// scripts, AND gh_guard + git_guard (blocking every push) + forced-proxy
     /// egress + the fail-closed default allowlist on.
     Strict,
     /// The default posture. Scratch dir stays on, all five toggles off, both
-    /// guards on (git_guard warns rather than blocks), no forced proxy.
+    /// guards on (git_guard blocks pushes to the default branch and force
+    /// pushes), no forced proxy.
     Standard,
     /// Developer-friendly. Localhost, tmp exec, and lifecycle scripts on.
     Permissive,

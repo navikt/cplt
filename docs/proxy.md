@@ -327,7 +327,7 @@ filtering.
 
 Restrict connections to specific domains. When the allowlist is set, the proxy blocks everything not in it, except the running agent's own hosts: the infrastructure part of its [default allowlist](#default-allowlist-fail-closed-networking) (for Copilot, `github.com`, `githubcopilot.com` and the rest of that list). Those are always merged into an active allowlist, so an allowlist cannot cut such an agent off from its own backend and break login. The shared package registries are not added unless `proxy.default_allowlist` is on.
 
-Not every agent has such a list. Goose, Pi and Shell have none: Goose is provider-agnostic and Pi's endpoints are not yet documented, so under an allowlist the model provider Goose or Pi uses must be in your file, or the agent cannot reach it. Shell is not an AI agent and has no backend of its own. OpenCode's own hosts are `opencode.ai` and `models.dev` only; cplt does not currently add the GitHub Copilot hosts when OpenCode uses its Copilot provider, so list those yourself (or the hosts of whichever provider it uses).
+Not every agent has such a list. Goose, Pi and Shell have none: Goose is provider-agnostic and Pi's endpoints are not yet documented, so under an allowlist the model provider Goose or Pi uses must be in your file, or the agent cannot reach it. Shell is not an AI agent and has no backend of its own. OpenCode's own hosts are `opencode.ai` and `models.dev`. cplt adds the GitHub Copilot hosts only when OpenCode's `auth.json` has a `github-copilot` entry that is not Copilot Enterprise (see [below](#default-allowlist-fail-closed-networking)); for any other provider, list its hosts yourself.
 
 So the file only needs the hosts your project uses beyond the agent itself, for example:
 
