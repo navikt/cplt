@@ -852,7 +852,8 @@ QUICK START:
     /// before `check`, e.g. `cplt --preset strict check`.
     ///
     /// With no subcommand it runs a battery demonstrating enforcement and exits
-    /// non-zero if the sandbox is NOT enforcing (useful in CI).
+    /// non-zero if the sandbox is NOT enforcing, or if the policy blocks
+    /// something the agent is expected to reach (useful in CI).
     ///
     /// EXAMPLES:
     ///   cplt check
