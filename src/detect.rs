@@ -750,6 +750,36 @@ fn detect_go(ctx: &DetectContext) -> DetectorOutput {
     })
 }
 
+/// Whether Go source has an import spec for `net/http/httptest`: a line that
+/// is the path alone (inside an `import (...)` block), with an alias, or after
+/// `import`, in either string form. A mention in a line comment or an ordinary
+/// string expression does not count.
+// ponytail: line-based, so a spec inside a /* */ block comment still matches;
+// use a Go tokenizer if that false positive ever matters.
+fn imports_httptest(src: &str) -> bool {
+    src.lines().any(|line| {
+        let code = line.split("//").next().unwrap_or_default();
+        let tokens: Vec<&str> = code.split_whitespace().collect();
+        let Some((path, rest)) = tokens.split_last() else {
+            return false;
+        };
+        if *path != "\"net/http/httptest\"" && *path != "`net/http/httptest`" {
+            return false;
+        }
+        let is_alias = |t: &str| {
+            t.chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+        };
+        match rest {
+            [] => true,
+            ["import"] => true,
+            [alias] => is_alias(alias),
+            ["import", alias] => is_alias(alias),
+            _ => false,
+        }
+    })
+}
+
 /// Max `_test.go` files [`find_go_httptest`] reads before giving up.
 const GO_TEST_SCAN_MAX_FILES: usize = 200;
 
@@ -790,10 +820,7 @@ fn find_go_httptest(ctx: &DetectContext) -> Option<String> {
                     return None;
                 }
                 let child = child.to_str()?.to_string();
-                if ctx
-                    .read_text(&child)
-                    .is_some_and(|c| c.contains("\"net/http/httptest\""))
-                {
+                if ctx.read_text(&child).is_some_and(|c| imports_httptest(&c)) {
                     return Some(child);
                 }
             }
@@ -2903,6 +2930,27 @@ services:
         )
         .unwrap();
         assert!(go_localhost_any(dir.path()));
+    }
+
+    #[test]
+    fn go_httptest_import_forms() {
+        for src in [
+            "import \"net/http/httptest\"",
+            "import `net/http/httptest`",
+            "import ht \"net/http/httptest\"",
+            "import (\n\t\"testing\"\n\t\"net/http/httptest\" // servers\n)",
+            "import (\n\t_ `net/http/httptest`\n)",
+        ] {
+            assert!(imports_httptest(src), "{src}");
+        }
+        for src in [
+            "// uses \"net/http/httptest\" elsewhere",
+            "var p = \"net/http/httptest\"",
+            "paths := []string{\n\t\"net/http/httptest\",\n}",
+            "import \"net/http\"",
+        ] {
+            assert!(!imports_httptest(src), "{src}");
+        }
     }
 
     #[test]
