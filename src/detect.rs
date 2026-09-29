@@ -979,8 +979,26 @@ fn detect_ktor(ctx: &DetectContext) -> DetectorOutput {
 }
 
 fn detect_testcontainers(ctx: &DetectContext) -> DetectorOutput {
-    // Where a Testcontainers dependency is declared: Gradle (a version catalog
-    // names it instead of the build script), Maven, npm, Go and Python.
+    // Where a Testcontainers dependency is declared, matched on its real
+    // coordinates: a bare "testcontainers" also hits a comment, and this
+    // proposal is the Docker socket. Gradle (a version catalog names it
+    // instead of the build script), Maven, npm, Go and Python.
+    fn declares(file: &str, content: &str) -> bool {
+        match file {
+            "package.json" => {
+                content.contains("\"testcontainers\"") || content.contains("\"@testcontainers/")
+            }
+            "go.mod" => content
+                .lines()
+                .any(|l| l.contains("github.com/testcontainers/") && !l.contains("// indirect")),
+            "pyproject.toml" | "requirements.txt" => content.lines().any(|l| {
+                l.trim_start()
+                    .trim_start_matches(['"', '\''])
+                    .starts_with("testcontainers")
+            }),
+            _ => content.contains("org.testcontainers"),
+        }
+    }
     const MANIFESTS: &[&str] = &[
         "build.gradle.kts",
         "build.gradle",
@@ -993,7 +1011,7 @@ fn detect_testcontainers(ctx: &DetectContext) -> DetectorOutput {
     ];
     let Some((manifest, content)) = MANIFESTS.iter().find_map(|file| {
         ctx.read_text(file)
-            .filter(|c| c.contains("testcontainers"))
+            .filter(|c| declares(file, c))
             .map(|c| (*file, c))
     }) else {
         return DetectorOutput::none();
@@ -2284,6 +2302,20 @@ pub fn detect_project_recursive(root: &Path) -> DetectionReport {
         report.diagnostics.extend(member_report.diagnostics);
     }
 
+    // Diagnostics are per directory, the proposal is merged: a root compose
+    // file proposes the socket that a member's bare Dockerfile says was left
+    // out. Drop that claim once it is false, and repeats of the same line.
+    if report
+        .suggestions
+        .contains(&Suggestion::Propose(SandboxFlag::AllowDocker))
+    {
+        report.diagnostics.retain(|d| d.detector != "docker");
+    }
+    let mut seen = BTreeSet::new();
+    report
+        .diagnostics
+        .retain(|d| seen.insert((d.detector, d.message.clone())));
+
     report.workspace_members = members;
     report.provenance = provenance;
     report
@@ -2931,6 +2963,77 @@ mod tests {
                 "{compose}"
             );
         }
+    }
+
+    /// The name alone is not a dependency: a comment, an indirect Go module
+    /// or a longer package name must not propose the socket.
+    #[test]
+    fn testcontainers_needs_real_coordinates() {
+        for (file, content) in [
+            ("pom.xml", "<!-- we tried testcontainers once -->"),
+            ("package.json", "{\"name\":\"not-testcontainers-here\"}"),
+            (
+                "go.mod",
+                "require github.com/testcontainers/testcontainers-go v0.33.0 // indirect",
+            ),
+            ("requirements.txt", "# testcontainers later\nrequests\n"),
+        ] {
+            let dir = setup_dir();
+            fs::write(dir.path().join(file), content).unwrap();
+            let report = detect_project(dir.path());
+            assert!(
+                !report.detections.iter().any(|d| d.name == "TestContainers"),
+                "{file}"
+            );
+        }
+        for (file, content) in [
+            ("requirements.txt", "testcontainers[postgres]==4.8\n"),
+            (
+                "pyproject.toml",
+                "dependencies = [\n  \"testcontainers>=4\",\n]\n",
+            ),
+            (
+                "package.json",
+                "{\"devDependencies\":{\"testcontainers\":\"^10\"}}",
+            ),
+        ] {
+            let dir = setup_dir();
+            fs::write(dir.path().join(file), content).unwrap();
+            let report = detect_project(dir.path());
+            assert!(
+                report.detections.iter().any(|d| d.name == "TestContainers"),
+                "{file}"
+            );
+        }
+    }
+
+    /// Per-directory diagnostics against a merged proposal: a root compose
+    /// file proposes the socket, so a member's bare Dockerfile must not say
+    /// it was left out. Several bare Dockerfiles say it once.
+    #[test]
+    fn docker_diagnostic_follows_the_merged_proposal() {
+        let dir = setup_dir();
+        for app in ["apps/web", "apps/api"] {
+            fs::create_dir_all(dir.path().join(app)).unwrap();
+            fs::write(dir.path().join(app).join("Dockerfile"), "FROM node:20").unwrap();
+            fs::write(dir.path().join(app).join("package.json"), "{}").unwrap();
+        }
+        let docker_diags = |r: &DetectionReport| {
+            r.diagnostics
+                .iter()
+                .filter(|d| d.detector == "docker")
+                .count()
+        };
+        assert_eq!(docker_diags(&detect_project_recursive(dir.path())), 1);
+
+        fs::write(dir.path().join("compose.yaml"), "services: {}\n").unwrap();
+        let report = detect_project_recursive(dir.path());
+        assert!(
+            report
+                .suggestions
+                .contains(&Suggestion::Propose(SandboxFlag::AllowDocker))
+        );
+        assert_eq!(docker_diags(&report), 0);
     }
 
     /// A repo with only `docker-compose.dev.yml` used to return before the
