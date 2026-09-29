@@ -29,6 +29,8 @@ cplt config set proxy.allowed_domains "~/.config/cplt/allowed-domains.txt"
 cplt config set proxy.log_file "~/.config/cplt/proxy.log"
 ```
 
+The allowlist file must exist, or cplt refuses to start. The agent's own hosts are always allowed on top of it, but package registries such as npm and Maven Central are not: add `cplt config set proxy.default_allowlist true` to get them. See [Allowlist](#allowlist).
+
 <details>
 <summary>CLI flags reference (override for a single run)</summary>
 
@@ -39,7 +41,7 @@ cplt config set proxy.log_file "~/.config/cplt/proxy.log"
 | `--proxy-forced` / `--no-proxy-forced` | Make the proxy mandatory and restrict direct routing where the platform supports it (opt-in, default off). Conflicts with `--no-proxy`. See [Proxy-forced mode](#proxy-forced-mode) and [network snapshot coverage](#network-snapshot). |
 | `--proxy-port <PORT>`       | Which port the proxy listens on (default: 0, OS-assigned ephemeral).                             |
 | `--blocked-domains <FILE>`  | Domains to block, one per line, on top of the built-in list. Re-read every ~5s, so you can edit it live. |
-| `--allowed-domains <FILE>`  | Domains to allow. Setting it turns the allowlist on, and only listed domains can connect — an empty file therefore blocks everything, and a missing file is a startup error. Re-read every ~5s. |
+| `--allowed-domains <FILE>`  | Domains to allow. Setting it turns the allowlist on, and only listed domains plus the agent's own hosts can connect — an empty file therefore blocks everything else, and a missing file is a startup error. Re-read every ~5s. |
 | `--default-allowlist`       | Enable the agent's built-in default allowlist for this run (opt-in, default off): restrict egress to the agent's fail-closed domain set merged with `--allowed-domains`. See [Default allowlist](#default-allowlist-fail-closed-networking). |
 | `--allow-all-domains`       | Escape hatch: disable the default allowlist for this run and allow all domains (blocklist still applies). Also ignores any `--allowed-domains` file. |
 | `--proxy-log <FILE>`        | Append a line per connection to this file for post-session audit.                                |
@@ -193,7 +195,7 @@ itself and every subdomain under it, at any depth:
 | `cloud.nais.io` | `cloud.nais.io`, `foo.cloud.nais.io`, `a.b.cloud.nais.io` | `evilcloud.nais.io` |
 
 So write `cloud.nais.io`, not `*.cloud.nais.io`. A `*` is compared literally and
-matches nothing — and in an allowlist, where the file is the whole policy, that
+matches nothing — and in an allowlist, where everything not listed is refused, that
 does not merely fail to help: it leaves the hosts you meant to permit blocked,
 with an entry on screen that looks right. cplt warns at startup about a `*` in a domain **file**
 (`--allowed-domains`, `--blocked-domains`, a subscription cache) rather than
@@ -323,24 +325,25 @@ filtering.
 
 ### Allowlist
 
-Restrict connections to specific domains. When the allowlist is set, the proxy blocks everything not in it. An `allowed-domains.txt` for Copilot-only access looks like this:
+Restrict connections to specific domains. When the allowlist is set, the proxy blocks everything not in it, except the running agent's own hosts: the infrastructure part of its [default allowlist](#default-allowlist-fail-closed-networking) (for Copilot, `github.com`, `githubcopilot.com` and the rest of that list). Those are always merged into an active allowlist, so an allowlist cannot cut the agent off from its own backend and break login. The shared package registries are not added unless `proxy.default_allowlist` is on.
+
+So the file only needs the hosts your project uses beyond the agent itself, for example:
 
 ```
-api.github.com
-api.githubcopilot.com
-api.business.githubcopilot.com
-proxy.business.githubcopilot.com
-telemetry.business.githubcopilot.com
+registry.npmjs.org
+internal-artifacts.example.com
 ```
+
+To keep the agent away from one of its own hosts anyway, put it on the blocklist, which is checked after the allowlist and wins.
 
 > **Setting `allowed_domains` is what turns the allowlist on, not the file's contents.** The two ways to say "no allowlist" are not the same thing:
 >
 > - **No `allowed_domains` key** (and no `--allowed-domains`, no `default_allowlist`): no allowlist, every domain is allowed. This is the default.
-> - **`allowed_domains` pointing at an empty or all-comment file**: an allowlist with nothing on it, so every domain is blocked.
+> - **`allowed_domains` pointing at an empty or all-comment file**: an allowlist with nothing on it, so every domain except the agent's own hosts is blocked.
 >
 > A configured `allowed_domains` file that does not exist is a startup error rather than a silent fallback to allow-all. Use `--allow-all-domains` to allow everything for a single run without editing config.
 
-> **Note:** Both the allowlist and blocklist are re-read from disk every ~5 seconds (TTL-cached), so you can edit them live mid-session and changes take effect within seconds without restarting cplt. If a file becomes unreadable or is deleted at runtime, the last-known-good list is kept (fail-safe); if it becomes *empty*, that is a real edit and the allowlist tightens to blocking everything. At startup, an unreadable or missing allowlist makes cplt exit with an error (fail-closed).
+> **Note:** Both the allowlist and blocklist are re-read from disk every ~5 seconds (TTL-cached), so you can edit them live mid-session and changes take effect within seconds without restarting cplt. If a file becomes unreadable or is deleted at runtime, the last-known-good list is kept (fail-safe); if it becomes *empty*, that is a real edit and the allowlist tightens to blocking everything but the agent's own hosts. At startup, an unreadable or missing allowlist makes cplt exit with an error (fail-closed).
 >
 > The `allow_private_domains` list in `config.toml` is also re-read every ~5 seconds. Domains from other sources, meaning `--allow-private-domain` CLI flags and trust-approved `[propose.proxy] allow_private_domains` entries from a repo `.cplt.toml`, are preserved for the whole session regardless of config changes.
 
@@ -386,7 +389,7 @@ cplt config set proxy.default_allowlist true         # permanently
 ```
 
 - **Opt-in and off by default.** Enabling it changes no other behaviour, and the global default stays allow-all. Making it the default is tracked in issue #71.
-- **Effective allowlist = agent defaults ⊕ your `allowed_domains`.** When on, the agent's built-in list is merged with any file or config `allowed_domains`, so you add project registries or internal hosts without re-listing the base set. On startup cplt prints something like `Domain policy: 15 domains allowed (agent defaults + 1 configured)`.
+- **Effective allowlist = agent defaults ⊕ your `allowed_domains`.** When on, the agent's built-in list is merged with any file or config `allowed_domains`, so you add project registries or internal hosts without re-listing the base set. On startup cplt prints something like `Domain policy: 15 domains allowed (agent defaults + 1 configured)`. With it off and only `allowed_domains` set, the agent's own hosts are still merged in, but the package registries are not.
 - **Blocked attempts are visible.** Denied connections are logged as `BLOCKED-ALLOWLIST`, visible through `--proxy-log` or `--proxy-log-level blocked`, so you can see what to add.
 - **Escape hatch.** `--allow-all-domains` disables the allowlist for a single run and ignores any `--allowed-domains` file, putting you back to allow-all for debugging. It overrides both `--default-allowlist` and `proxy.default_allowlist`.
 - **Composes with the other proxy features.** The proxy enforces the domain allowlist regardless of `proxy.forced` (kernel egress restriction) or `proxy.upstream` (corporate-proxy forwarding). A no-proxy or upstream target still passes the same allowlist check, because the allowlist governs which domains, orthogonal to how they are routed.

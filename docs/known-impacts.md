@@ -966,9 +966,10 @@ Two NAV-run hosts show up in most `navikt` JVM builds, and they need different a
 ```bash
 echo github-package-registry-mirror.gc.nav.no >> ~/.config/cplt/allowed-domains.txt
 cplt config set proxy.allowed_domains "~/.config/cplt/allowed-domains.txt"
+cplt config set proxy.default_allowlist true
 ```
 
-(`proxy.allowed_domains` is a path to a domain list file, one host per line, not an inline array. Under `proxy.default_allowlist` the file is merged with the agent's built-in list, so you add the mirror without re-listing the registry base.)
+(`proxy.allowed_domains` is a path to a domain list file, one host per line, not an inline array. Setting it turns the allowlist on, and the agent's own hosts are always included, but the package registries are not: without `proxy.default_allowlist`, Maven Central (`repo.maven.apache.org`) and `plugins.gradle.org` are blocked and the build still fails. With it on, the file is merged with the agent's built-in list, which includes those registries, so you add the mirror without re-listing them. The `strict` preset turns it on already.)
 
 `repo.adeo.no` is NAV's internal Nexus and resolves into private address space, so `allowed_domains` is not enough — it is exactly the case [`proxy.allow_private_domains`](#internal-mavengradle-repositories-on-private-ips) exists for. `navikt/pensjonsbrev/.cplt.toml` is a working example of a team configuring it.
 

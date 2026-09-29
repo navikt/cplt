@@ -503,7 +503,8 @@ pub fn explain_domain(
         NetVerdict::BlockedAllowlist => (
             Decision::Blocked,
             "a fail-closed domain allowlist is active and this host is not in it \
-             (agent defaults + your allowed_domains)."
+             (the agent's own hosts, the package registries when proxy.default_allowlist \
+             is on, and your allowed_domains)."
                 .to_string(),
             Some(
                 "add it to allowed_domains (--allowed-domains FILE / [proxy] allowed_domains), \

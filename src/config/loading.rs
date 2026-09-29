@@ -1405,7 +1405,7 @@ impl Resolved {
             );
             if self.allowed_domains.is_some() {
                 eprintln!(
-                    "{blue}[cplt]{nc}    Allowlist:     {green}on{nc}          {dim}only listed domains{nc}"
+                    "{blue}[cplt]{nc}    Allowlist:     {green}on{nc}          {dim}only listed domains + agent hosts{nc}"
                 );
             }
             if !self.allow_private_domains.is_empty() {
