@@ -364,9 +364,12 @@ default.exp2.cds.s9ch.io
 # Package registries (shared by all agents)
 registry.npmjs.org  registry.yarnpkg.com  repo.maven.apache.org
 plugins.gradle.org  crates.io  static.crates.io  pypi.org  files.pythonhosted.org
+plugins-artifacts.gradle.org         # where plugin-portal jars redirect
 packages.confluent.io                # Kafka clients, Avro serdes
 jitpack.io                           # Maven artifacts built from git tags
 ```
+
+The base does not cover the Gradle wrapper's first download. `services.gradle.org` redirects to a GitHub release, then to `release-assets.githubusercontent.com`, and `github.com` is too broad to grant every agent. If `./gradlew` has to fetch a distribution inside the sandbox, add `services.gradle.org`, `github.com` and `release-assets.githubusercontent.com` to `allowed_domains`, or run the wrapper once outside cplt so the distribution is already in `~/.gradle/wrapper/dists`.
 
 Each agent adds its own endpoints on top of that shared registry base:
 

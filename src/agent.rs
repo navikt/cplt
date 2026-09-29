@@ -40,6 +40,17 @@ const PACKAGE_REGISTRY_DOMAINS: &[&str] = &[
     "registry.yarnpkg.com",
     "repo.maven.apache.org",
     "plugins.gradle.org",
+    // The plugin portal serves only POMs and marker files itself; every plugin
+    // jar answers `303 See Other` to this host (checked 2026-09-29 with
+    // kotlin-gradle-plugin 2.0.0). Without it a `plugins {}` block resolves
+    // the marker and then fails on the jar. Not a subdomain of the entry
+    // above, so it needs its own line.
+    //
+    // The Gradle wrapper download is deliberately NOT covered:
+    // services.gradle.org redirects to github.com release downloads and then
+    // to release-assets.githubusercontent.com, and granting all of github.com
+    // to every agent is too broad for this base.
+    "plugins-artifacts.gradle.org",
     "crates.io",
     "static.crates.io",
     "pypi.org",
@@ -3850,8 +3861,8 @@ mod tests {
     #[test]
     fn copilot_default_allowed_domains_matches_issue_52() {
         let domains = Agent::Copilot.default_allowed_domains();
-        // 6 GitHub Copilot infra domains + 10 package registries = 16.
-        assert_eq!(domains.len(), 16, "copilot list: infra + registries");
+        // 6 GitHub Copilot infra domains + 11 package registries = 17.
+        assert_eq!(domains.len(), 17, "copilot list: infra + registries");
         // GitHub Copilot infrastructure (bare forms of the issue's wildcards).
         for d in [
             "githubcopilot.com",
@@ -3869,6 +3880,7 @@ mod tests {
             "registry.yarnpkg.com",
             "repo.maven.apache.org",
             "plugins.gradle.org",
+            "plugins-artifacts.gradle.org",
             "crates.io",
             "static.crates.io",
             "pypi.org",
@@ -4072,10 +4084,10 @@ mod tests {
     #[test]
     fn pi_and_shell_get_registry_base_only() {
         // Pi's infra is not yet documented; Shell is not an AI agent. Both get
-        // only the shared package-registry base (10 domains).
+        // only the shared package-registry base (11 domains).
         for agent in [Agent::Pi, Agent::Shell] {
             let domains = agent.default_allowed_domains();
-            assert_eq!(domains.len(), 10, "{agent:?} gets registry base only");
+            assert_eq!(domains.len(), 11, "{agent:?} gets registry base only");
             assert!(domains.contains(&"registry.npmjs.org"));
             assert!(
                 !domains.contains(&"githubcopilot.com"),
