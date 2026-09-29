@@ -2269,19 +2269,22 @@ pub fn shim_ro_protect_paths(home: &Path) -> Vec<PathBuf> {
 }
 
 /// The [`HOME_CONFIG_FILES`] SECURITY.md documents as read-only: git's own
-/// config, ignore and attributes files, which git on the host trusts. They are
+/// config, ignore and attributes files, which git on the host trusts, and
+/// pnpm's macOS `config.yaml` (`registry`, `ignoreScripts`). They are
 /// write-denied on macOS, at `$HOME` and at a symlink target, and a symlink
 /// target is bound read-only by Bubblewrap on Linux
 /// (see [`home_config_link_targets`]).
 ///
-/// Derived rather than listed, so a git file added to [`HOME_CONFIG_FILES`]
-/// gets the write deny too. The `gh` files and `.tool-versions` are readable
-/// but carry no read-only claim: they never had a `$HOME` write deny.
+/// Every entry except the ones named here, so a file added to
+/// [`HOME_CONFIG_FILES`] gets the write deny unless someone decides otherwise.
+/// The `gh` files and `.tool-versions` are readable but carry no read-only
+/// claim: they never had a `$HOME` write deny.
 pub fn read_only_home_config() -> impl Iterator<Item = &'static str> {
     HOME_CONFIG_FILES.iter().copied().filter(|f| {
-        matches!(*f, ".gitconfig" | ".gitignore_global")
-            || f.starts_with(".gitconfig.")
-            || f.starts_with(".config/git/")
+        !matches!(
+            *f,
+            ".config/gh/hosts.yml" | ".config/gh/config.yml" | ".tool-versions"
+        )
     })
 }
 
@@ -4489,11 +4492,11 @@ mod tests {
         assert!(cplt_state_dir_grant(&home, &target.join(".config/cplt/x")).is_some());
     }
 
-    /// The read-only files are git's, drawn from the shared read list (#524,
-    /// #547). Pinning the exact set makes a new entry a deliberate choice: a
-    /// git file joins it, `gh` and `.tool-versions` stay out.
+    /// The read-only files are git's and pnpm's macOS config, drawn from the
+    /// shared read list (#524, #547). Pinning the exact set makes a new entry
+    /// a deliberate choice: `gh` and `.tool-versions` stay out.
     #[test]
-    fn read_only_home_config_is_the_git_subset_of_home_config_files() {
+    fn read_only_home_config_is_the_protected_subset_of_home_config_files() {
         let ro: Vec<&str> = read_only_home_config().collect();
         assert!(ro.iter().all(|f| HOME_CONFIG_FILES.contains(f)), "{ro:?}");
         assert_eq!(
@@ -4505,6 +4508,7 @@ mod tests {
                 ".config/git/config",
                 ".config/git/ignore",
                 ".config/git/attributes",
+                "Library/Preferences/pnpm/config.yaml",
             ]
         );
     }

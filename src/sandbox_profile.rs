@@ -3334,10 +3334,53 @@ mod tests {
         assert!(p.contains(
             "(allow file-read* (literal \"/Users/test/Library/Preferences/pnpm/config.yaml\"))"
         ));
+        let deny =
+            "(deny file-write* (literal \"/Users/test/Library/Preferences/pnpm/config.yaml\"))";
+        assert!(p.contains(deny), "missing write deny:\n{p}");
         for l in p.lines().filter(|l| l.contains("Library/Preferences/pnpm")) {
             assert!(
-                l.starts_with("(allow file-read* (literal ") && l.contains("config.yaml"),
+                (l.starts_with("(allow file-read* (literal ") || l == deny)
+                    && l.contains("config.yaml"),
                 "unexpected pnpm prefs rule: {l}"
+            );
+        }
+    }
+
+    /// The pnpm config.yaml stays write-denied when a write grant reaches it:
+    /// through a symlink into the writable project, or under `allow.write`.
+    /// The denies must come after the grants (SBPL: last match wins).
+    #[test]
+    fn profile_write_denies_pnpm_config_yaml_under_a_write_grant() {
+        let tmp = tempfile::Builder::new()
+            .prefix("cplt")
+            .tempdir()
+            .expect("tempdir");
+        let home = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let dots = home.join("dotfiles");
+        std::fs::create_dir_all(dots.join("pnpm")).expect("mkdir");
+        std::fs::write(dots.join("pnpm/config.yaml"), "registry: x\n").expect("write");
+        std::fs::create_dir_all(home.join("Library/Preferences")).expect("mkdir");
+        std::os::unix::fs::symlink(dots.join("pnpm"), home.join("Library/Preferences/pnpm"))
+            .expect("symlink");
+        let extra_write = [home.join("Library")];
+        let mut opts = test_options(&dots, &home);
+        opts.extra_write = &extra_write;
+        let p = generate_profile(&opts, &[]);
+        let last_allow = p
+            .lines()
+            .collect::<Vec<_>>()
+            .iter()
+            .rposition(|l| l.starts_with("(allow file-write*"))
+            .expect("write grants");
+        for f in [
+            dots.join("pnpm/config.yaml"),
+            home.join("Library/Preferences/pnpm/config.yaml"),
+        ] {
+            let deny = format!("(deny file-write* (literal \"{}\"))", f.display());
+            let at = p.lines().position(|l| l == deny);
+            assert!(
+                at.is_some_and(|i| i > last_allow),
+                "{deny} missing or before a write grant:\n{p}"
             );
         }
     }
