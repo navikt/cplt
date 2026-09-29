@@ -1289,21 +1289,24 @@ fn interleave_families(addrs: &[std::net::SocketAddr]) -> Vec<std::net::SocketAd
     }
 }
 
-/// The timeout for one connect attempt with `left` of the deadline remaining:
-/// capped while another address is still to come, the whole rest for the last.
-fn attempt_timeout(left: Duration, last: bool) -> Duration {
-    if last {
-        left
-    } else {
-        left.min(CONNECT_ATTEMPT_TIMEOUT)
+/// The timeout for one connect attempt with `left` of the deadline remaining
+/// and `remaining` addresses still to try, this one included. The last gets the
+/// whole rest; the others get an even share, capped, so a long list of dead
+/// addresses cannot use up the deadline before a live one at the end.
+fn attempt_timeout(left: Duration, remaining: usize) -> Duration {
+    match u32::try_from(remaining) {
+        Ok(0 | 1) => left,
+        Ok(n) => (left / n).min(CONNECT_ATTEMPT_TIMEOUT),
+        Err(_) => Duration::ZERO,
     }
 }
 
 /// Connect to the first reachable address, trying them in RFC 8305 order.
 ///
-/// Each attempt but the last is capped at [`CONNECT_ATTEMPT_TIMEOUT`]; all of
-/// them share one [`CONNECT_TIMEOUT`] deadline, so a single-address host keeps
-/// the old 10 s budget. `Ok` carries the stream, the address that answered and
+/// Each attempt but the last gets an even share of what is left, capped at
+/// [`CONNECT_ATTEMPT_TIMEOUT`] (see [`attempt_timeout`]); all of them share one
+/// [`CONNECT_TIMEOUT`] deadline, so a single-address host keeps the old 10 s
+/// budget. `Ok` carries the stream, the address that answered and
 /// the failures before it (empty when the first try worked); `Err` carries every
 /// failure. Callers must have policy-checked every address in `addrs`.
 ///
@@ -1321,7 +1324,7 @@ fn connect_any(
             failures.push(format!("{addr}: not tried, deadline passed"));
             break;
         }
-        match TcpStream::connect_timeout(addr, attempt_timeout(left, i + 1 == ordered.len())) {
+        match TcpStream::connect_timeout(addr, attempt_timeout(left, ordered.len() - i)) {
             Ok(stream) => return Ok((stream, *addr, failures.join("; "))),
             Err(e) => failures.push(format!("{addr}: {e}")),
         }
@@ -1409,6 +1412,20 @@ pub struct NetPolicy {
     pub private_domains: Vec<String>,
 }
 
+/// Whether `host` is spelled as loopback (`localhost`, `*.localhost`, a
+/// loopback IP literal) and the user opted into localhost for this port: the
+/// localhost carve-out. The answer it resolves to must then be loopback too
+/// (see [`classify_resolved`]).
+#[must_use]
+pub fn localhost_connect_allowed(host: &str, localhost_opt_in: bool) -> bool {
+    let h = host.trim_start_matches('[').trim_end_matches(']');
+    let is_loopback = h == "localhost"
+        || h.ends_with(".localhost")
+        || h.parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    is_loopback && localhost_opt_in
+}
+
 /// Classify a CONNECT target against the static (pre-DNS) proxy policy gates.
 ///
 /// This is the exact gate order [`handle_connect`] enforces before it resolves
@@ -1422,14 +1439,7 @@ pub fn classify_connect(policy: &NetPolicy, host: &str, port: u16) -> NetVerdict
 
     let localhost_opt_in =
         policy.allow_localhost_any || policy.allow_localhost_ports.contains(&port);
-    let localhost_connect_allowed = {
-        let h = host.trim_start_matches('[').trim_end_matches(']');
-        let is_loopback = h == "localhost"
-            || h.ends_with(".localhost")
-            || h.parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback());
-        is_loopback && localhost_opt_in
-    };
+    let localhost_connect_allowed = localhost_connect_allowed(&host, localhost_opt_in);
 
     if !localhost_connect_allowed && !policy.allowed_ports.contains(&port) {
         return NetVerdict::BlockedPort;
@@ -1489,14 +1499,7 @@ fn handle_connect(
     let localhost_opt_in =
         state.policy.allow_localhost_any || state.policy.allow_localhost_ports.contains(&port);
 
-    let localhost_connect_allowed = {
-        let h = host.trim_start_matches('[').trim_end_matches(']');
-        let is_loopback = h == "localhost"
-            || h.ends_with(".localhost")
-            || h.parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback());
-        is_loopback && localhost_opt_in
-    };
+    let localhost_connect_allowed = localhost_connect_allowed(&host, localhost_opt_in);
 
     // Apply the static (pre-DNS) policy gates — port policy, fail-closed
     // allowlist, blocklist, then the private-hostname SSRF guard — in that
@@ -1725,21 +1728,15 @@ fn connect_via_upstream(
         reject(&mut client, b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
         return;
     }
-    let mut remote = match connect_any(&upstream_addrs) {
-        Ok((s, addr, failed)) => {
-            if !failed.is_empty() {
-                // Logged against the upstream's own address, not the target:
-                // `log_connection` redacts userinfo only for CONNECT lines.
-                log_connection(
-                    state,
-                    None,
-                    "UPSTREAM",
-                    &addr.to_string(),
-                    &format!("UPSTREAM-FALLBACK (after {failed})"),
-                );
-            }
+    let (mut remote, status) = match connect_any(&upstream_addrs) {
+        Ok((s, _, failed)) if failed.is_empty() => {
             s.set_nodelay(true).ok();
-            s
+            (s, "CONNECTED".to_string())
+        }
+        // Fell back to a later address of the upstream proxy itself.
+        Ok((s, addr, failed)) => {
+            s.set_nodelay(true).ok();
+            (s, format!("CONNECTED (upstream via {addr} after {failed})"))
         }
         Err(e) => {
             log_connection(
@@ -1801,7 +1798,7 @@ fn connect_via_upstream(
     // Log as CONNECTED — identical audit/stats semantics to a direct connect,
     // so the allowed connection is recorded the same way whether or not an
     // upstream is in use.
-    log_connection(state, Some(classification), "CONNECT", target, "CONNECTED");
+    log_connection(state, Some(classification), "CONNECT", target, &status);
 
     // Tell the client its tunnel is established, then splice bytes as usual.
     if client
@@ -2252,7 +2249,7 @@ pub fn resolved_ip_is_blocked(
 /// Each variant carries the audit-log status and the exact 403/502 the client
 /// sees, so the decision and its wire effect cannot drift apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Refusal {
+pub enum Refusal {
     /// The host does not resolve locally and there is no upstream to defer to.
     DnsFail,
     /// A target permitted ONLY by the `--allow-localhost` carve-out resolved to
@@ -2292,7 +2289,7 @@ impl Refusal {
 
 /// What to do with a CONNECT target once DNS has answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ConnectRoute {
+pub enum ConnectRoute {
     /// Forward the tunnel through the configured upstream proxy.
     Upstream,
     /// Connect directly to one of these resolved addresses, all of which passed
@@ -2327,7 +2324,7 @@ pub(crate) enum ConnectRoute {
 /// allow/block/port gates above still constrain it. On the direct path there is
 /// no upstream to defer to, so it is a hard error.
 #[must_use]
-pub(crate) fn classify_resolved(
+pub fn classify_resolved(
     resolved: &[std::net::SocketAddr],
     via_upstream: bool,
     localhost_connect_allowed: bool,
@@ -2933,10 +2930,20 @@ mod tests {
     #[test]
     fn the_last_attempt_gets_the_rest_of_the_deadline() {
         let s = Duration::from_secs;
-        assert_eq!(attempt_timeout(s(10), false), CONNECT_ATTEMPT_TIMEOUT);
-        assert_eq!(attempt_timeout(s(10), true), s(10));
-        assert_eq!(attempt_timeout(s(1), false), s(1));
-        assert_eq!(attempt_timeout(s(6), true), s(6));
+        // The last address gets whatever is left.
+        assert_eq!(attempt_timeout(s(10), 1), s(10));
+        assert_eq!(attempt_timeout(s(6), 1), s(6));
+        // Earlier ones are capped...
+        assert_eq!(attempt_timeout(s(10), 2), CONNECT_ATTEMPT_TIMEOUT);
+        // ...and share the rest evenly, so every address gets a turn.
+        assert_eq!(attempt_timeout(s(10), 10), s(1));
+        assert_eq!(attempt_timeout(s(1), 2), Duration::from_millis(500));
+        // All dead: the attempts together never overrun the deadline.
+        let mut left = CONNECT_TIMEOUT;
+        for remaining in (1..=7).rev() {
+            left -= attempt_timeout(left, remaining);
+        }
+        assert_eq!(left, Duration::ZERO);
         assert!(CONNECT_ATTEMPT_TIMEOUT < CONNECT_TIMEOUT);
     }
 
@@ -2954,13 +2961,14 @@ mod tests {
     #[test]
     fn connect_falls_back_to_the_next_address() {
         // A port that was just bound and released refuses at once, standing in
-        // for a dead first address without waiting out a timeout.
+        // for a dead first address without waiting out a timeout. The live
+        // listener is bound first so the released port cannot be handed to it.
+        let live = TcpListener::bind("127.0.0.1:0").unwrap();
+        let live_addr = live.local_addr().unwrap();
         let closed = TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
             .unwrap();
-        let live = TcpListener::bind("127.0.0.1:0").unwrap();
-        let live_addr = live.local_addr().unwrap();
 
         let (_stream, used, failed) = connect_any(&[closed, live_addr]).unwrap();
         assert_eq!(used, live_addr);

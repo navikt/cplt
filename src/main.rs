@@ -6765,13 +6765,33 @@ fn resolved_ip_verdict(
     let localhost_opt_in =
         net_policy.allow_localhost_any || net_policy.allow_localhost_ports.contains(&port);
     let host_is_private_domain = proxy::is_domain_match(host, &net_policy.private_domains);
-    let blocked: Vec<_> = addrs
-        .iter()
-        .map(std::net::SocketAddr::ip)
-        .filter(|ip| proxy::resolved_ip_is_blocked(ip, host_is_private_domain, localhost_opt_in))
-        .collect();
-    let Some(first) = blocked.first().filter(|_| blocked.len() == addrs.len()) else {
-        return Ok(blocked);
+    if addrs.is_empty() {
+        return Ok(Vec::new());
+    }
+    // The live proxy's own post-DNS decision, so check cannot drift from it.
+    let refusal = match proxy::classify_resolved(
+        addrs,
+        false,
+        proxy::localhost_connect_allowed(&proxy::normalize_hostname(host), localhost_opt_in),
+        localhost_opt_in,
+        host_is_private_domain,
+    ) {
+        proxy::ConnectRoute::Refuse(r) => r,
+        proxy::ConnectRoute::Direct(kept) => {
+            return Ok(addrs
+                .iter()
+                .filter(|a| !kept.contains(a))
+                .map(std::net::SocketAddr::ip)
+                .collect());
+        }
+        // Not reachable: classified without an upstream.
+        proxy::ConnectRoute::Upstream => return Ok(Vec::new()),
+    };
+    let first = addrs[0].ip();
+    let why = if refusal == proxy::Refusal::ResolvedNonLoopback {
+        "not loopback, which a localhost target must resolve to"
+    } else {
+        "a private / loopback / link-local IP"
     };
     Err(Box::new(check::CheckItem {
         name: "BLOCKED-PRIVATE-RESOLVED".to_string(),
@@ -6780,7 +6800,7 @@ fn resolved_ip_verdict(
         decision: check::Decision::Blocked,
         expected: None,
         reason: format!(
-            "{host} resolves to {first}, a private / loopback / link-local IP the proxy blocks \
+            "{host} resolves to {first}, {why}: the proxy blocks it \
              AFTER DNS (BLOCKED-PRIVATE-RESOLVED) as an SSRF / DNS-rebinding safeguard \
              (e.g. cloud metadata 169.254.169.254, internal services)."
         ),
@@ -12325,6 +12345,17 @@ mod tests {
             ..Default::default()
         };
         assert!(resolved_ip_block_item(&optin, "127.0.0.1", 443).ok() == Some(vec![]));
+
+        // The localhost carve-out: a `localhost` name must resolve to loopback,
+        // so a public address in its answer is skipped, and an answer with no
+        // loopback left is BLOCKED, as in the live proxy.
+        let a = |s: &str| -> std::net::SocketAddr { format!("{s}:443").parse().unwrap() };
+        let (lo, public) = (a("127.0.0.1"), a("1.1.1.1"));
+        assert_eq!(
+            resolved_ip_verdict(&optin, "localhost", 443, &[lo, public]).ok(),
+            Some(vec![public.ip()])
+        );
+        assert!(resolved_ip_verdict(&optin, "localhost", 443, &[public]).is_err());
     }
 
     /// Run git in `dir` isolated from the caller's global and system config
