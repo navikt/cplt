@@ -1162,7 +1162,8 @@ fn detect_mise(ctx: &DetectContext) -> DetectorOutput {
     ];
     let Some(file) = CONFIGS.iter().find(|f| {
         ctx.read_text(f)
-            .is_some_and(|c| c.lines().any(|l| l.trim() == "[tools]"))
+            .and_then(|c| c.parse::<toml::Table>().ok())
+            .is_some_and(|t| t.contains_key("tools"))
     }) else {
         return DetectorOutput::none();
     };
@@ -1178,10 +1179,11 @@ fn detect_mise(ctx: &DetectContext) -> DetectorOutput {
         diagnostics: vec![Diagnostic {
             detector: "mise",
             message: format!(
-                "{file} pins tool versions. Run `mise install` here outside cplt before \
+                "{file} pins tool versions. Run `mise install` in {} outside cplt before \
                  starting the agent: mise's installs directory is read-only in the sandbox \
                  by design, so a missing version fails to install inside it with \
-                 \"Operation not permitted\"."
+                 \"Operation not permitted\".",
+                ctx.root().display()
             ),
         }],
     }
@@ -3419,7 +3421,7 @@ services:
         for file in ["mise.toml", ".mise.toml", ".config/mise.toml"] {
             let dir = setup_dir();
             fs::create_dir_all(dir.path().join(".config")).unwrap();
-            fs::write(dir.path().join(file), "[tools]\nnode = \"24\"\n").unwrap();
+            fs::write(dir.path().join(file), "[tools] # pinned\nnode = \"24\"\n").unwrap();
             let report = detect_project(dir.path());
             assert!(report.detections.iter().any(|d| d.name == "mise"), "{file}");
             assert!(
@@ -3433,13 +3435,34 @@ services:
         }
     }
 
-    /// Tasks alone install nothing, so there is nothing to warn about.
+    /// Any TOML spelling of the table counts, and the directory is named so
+    /// a workspace member's diagnostic says where to run the install.
+    #[test]
+    fn mise_tools_any_spelling_names_the_directory() {
+        for content in ["tools.node = \"24\"\n", "tools = { node = \"24\" }\n"] {
+            let dir = setup_dir();
+            fs::write(dir.path().join("mise.toml"), content).unwrap();
+            let report = detect_project(dir.path());
+            let root = dir.path().display().to_string();
+            assert!(
+                report
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.detector == "mise" && d.message.contains(&root)),
+                "{content}: {:?}",
+                report.diagnostics
+            );
+        }
+    }
+
+    /// Tasks alone install nothing, so there is nothing to warn about, even
+    /// when a task body mentions `[tools]`.
     #[test]
     fn mise_without_tools_is_silent() {
         let dir = setup_dir();
         fs::write(
             dir.path().join("mise.toml"),
-            "[tasks.test]\nrun = \"true\"\n",
+            "[tasks.test]\nrun = \"\"\"\n[tools]\n\"\"\"\n",
         )
         .unwrap();
         let report = detect_project(dir.path());
