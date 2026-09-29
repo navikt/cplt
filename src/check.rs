@@ -1026,18 +1026,19 @@ impl Report {
             .iter()
             .filter(|i| i.expected == Some(Decision::Blocked) && i.decision == Decision::Blocked)
             .count();
-        let over_blocked = items
+        let is_over_blocked = |i: &CheckItem| {
+            i.expected == Some(Decision::Allowed) && i.decision == Decision::Blocked
+        };
+        let over_blocked = items.iter().filter(|i| is_over_blocked(i)).count();
+        // Enforcing iff every graded expectation held AND at least one protection
+        // (an expected block) was verified. A blocked expected-allowed probe means
+        // the policy is too strict, not that the sandbox leaks, so it does not
+        // clear the verdict. An inconclusive graded probe does: nothing was
+        // observed, so the battery cannot vouch for it.
+        let all_graded_passed = items
             .iter()
-            .filter(|i| i.expected == Some(Decision::Allowed) && i.passed() == Some(false))
-            .count();
-        // Enforcing iff no protection (an expected block) leaked AND at least one
-        // was verified. A blocked expected-allowed probe means the policy is too
-        // strict, not that the sandbox leaks, so it does not clear the verdict.
-        // Inconclusive items are never graded, so they neither verify nor break it.
-        let no_leak = items
-            .iter()
-            .all(|i| i.expected != Some(Decision::Blocked) || i.passed() != Some(false));
-        let enforcing = battery && no_leak && verified >= 1;
+            .all(|i| i.passed() != Some(false) || is_over_blocked(i));
+        let enforcing = battery && all_graded_passed && verified >= 1;
         Report {
             agent,
             preset,
@@ -1163,6 +1164,14 @@ impl Report {
                 "{} expected-allowed check(s) were blocked",
                 self.over_blocked
             ));
+        }
+        let inconclusive = self
+            .items
+            .iter()
+            .filter(|i| i.expected.is_some() && i.decision == Decision::Inconclusive)
+            .count();
+        if inconclusive > 0 {
+            reasons.push(format!("{inconclusive} check(s) were inconclusive"));
         }
         if self.verified == 0 && reasons.is_empty() {
             reasons.push("no protection could be verified".to_string());
@@ -1753,6 +1762,27 @@ mod tests {
         let out = r.render();
         assert!(
             out.contains("NOT ENFORCING. 1 protection(s) did NOT block; 1 expected-allowed"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn inconclusive_allowed_probe_is_not_over_blocked() {
+        let mut unsure = allowed_item("reach githubcopilot.com");
+        unsure.decision = Decision::Inconclusive;
+        let r = Report::new(
+            "copilot".into(),
+            None,
+            true,
+            vec![unsure, blocked_item("ssh")],
+        );
+        assert_eq!(r.over_blocked, 0);
+        assert!(!r.enforcing, "an unobserved probe cannot be vouched for");
+        assert!(r.exit_nonzero());
+        let out = r.render();
+        assert!(!out.contains("too strict"), "{out}");
+        assert!(
+            out.contains("NOT ENFORCING. 1 check(s) were inconclusive"),
             "{out}"
         );
     }
