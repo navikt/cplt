@@ -950,10 +950,19 @@ impl Agent {
     /// These are best-effort defaults for an opt-in feature: blocked domains are
     /// logged (BLOCKED-ALLOWLIST) so users can add any that are missing.
     pub fn default_allowed_domains(&self) -> Vec<&'static str> {
-        // Per-agent infrastructure endpoints, layered on top of the shared
-        // package-registry base below. Pi and Shell get the base only: Pi's
-        // endpoints are not yet documented (contributions welcome), and Shell
-        // is not an AI agent so it has no model/auth traffic of its own.
+        let mut domains = self.infra_domains();
+        domains.extend_from_slice(PACKAGE_REGISTRY_DOMAINS);
+        domains
+    }
+
+    /// The agent's own endpoints (model, auth, telemetry), without the shared
+    /// package-registry base. Merged into every active allowlist, including a
+    /// user `allowed_domains` with `proxy.default_allowlist` off: an allowlist
+    /// that cuts the agent off from its own backend just breaks the session.
+    pub fn infra_domains(&self) -> Vec<&'static str> {
+        // Pi and Shell get none: Pi's endpoints are not yet documented
+        // (contributions welcome), and Shell is not an AI agent so it has no
+        // model/auth traffic of its own.
         let infra: &[&[&str]] = match self {
             Agent::Copilot => &[COPILOT_INFRA_DOMAINS],
             Agent::Antigravity => &[GOOGLE_AI_DOMAINS, ANTIGRAVITY_DOMAINS],
@@ -981,12 +990,7 @@ impl Agent {
             // github.com/aaif-goose/goose.
             Agent::Goose | Agent::Pi | Agent::Shell => &[],
         };
-        let mut domains: Vec<&'static str> = Vec::new();
-        for slice in infra {
-            domains.extend_from_slice(slice);
-        }
-        domains.extend_from_slice(PACKAGE_REGISTRY_DOMAINS);
-        domains
+        infra.concat()
     }
 
     /// The writable dirs a shell session needs, by shell name.
