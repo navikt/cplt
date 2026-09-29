@@ -562,8 +562,8 @@ fn detect_node(ctx: &DetectContext) -> DetectorOutput {
                 message: format!(
                     "{scope} resolves from an authenticated registry, so the token in \
                      ~/.npmrc is needed to install at all — without the grant the install \
-                     fails with 401 (E401) rather than falling back. Grant it with \
-                     `cplt config set allow.read \"~/.npmrc\"`, or with \
+                     fails with 401 (E401) rather than falling back. Grant it with the \
+                     narrower `cplt config set allow.read \"~/.npmrc\"`, or with \
                      `cplt config set sandbox.allow_build_credentials true` (personal \
                      config only), which also exposes ~/.gradle/gradle.properties and \
                      ~/.m2/settings.xml. pnpm cannot take the token from a project .npmrc, \
@@ -1380,7 +1380,14 @@ fn scoped_auth_registry(npmrc: &str) -> Option<String> {
 /// is compared exactly (ignoring case), so a path or a lookalike domain that
 /// merely contains the name does not count.
 fn is_github_packages(url: &str) -> bool {
-    let rest = url.trim().split_once("://").map_or(url.trim(), |(_, r)| r);
+    let url = url.trim();
+    // npm accepts a quoted value: `@navikt:registry="https://..."`.
+    let url = url
+        .strip_prefix('"')
+        .and_then(|u| u.strip_suffix('"'))
+        .or_else(|| url.strip_prefix('\'').and_then(|u| u.strip_suffix('\'')))
+        .unwrap_or(url);
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
     let host = rest.split(['/', ':']).next().unwrap_or_default();
     host.eq_ignore_ascii_case("npm.pkg.github.com")
 }
@@ -3526,6 +3533,16 @@ services:
             scoped_auth_registry("@navikt:registry=https://NPM.PKG.GITHUB.COM/\n").as_deref(),
             Some("@navikt")
         );
+        for quoted in [
+            "@navikt:registry=\"https://npm.pkg.github.com\"\n",
+            "@navikt:registry='https://npm.pkg.github.com/'\n",
+        ] {
+            assert_eq!(
+                scoped_auth_registry(quoted).as_deref(),
+                Some("@navikt"),
+                "{quoted}"
+            );
+        }
     }
 
     /// navikt frontends map `@navikt` to GitHub Packages and keep the token in
