@@ -35,7 +35,7 @@ use std::sync::OnceLock;
 /// Entries are bare registrable domains: the proxy's `is_domain_match` does
 /// exact-or-subdomain matching, so `crates.io` also covers `static.crates.io`
 /// (both are listed explicitly for clarity, matching issue #52).
-const PACKAGE_REGISTRY_DOMAINS: &[&str] = &[
+pub const PACKAGE_REGISTRY_DOMAINS: &[&str] = &[
     "registry.npmjs.org",
     "registry.yarnpkg.com",
     "repo.maven.apache.org",

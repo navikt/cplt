@@ -6965,7 +6965,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
     }
     layers.push(format!(
         "preset: {}",
-        resolved.preset.map_or("none", preset_label)
+        resolved.preset.map_or("standard (default)", preset_label)
     ));
     println!("config:      {}", layers.join(" · "));
     if !unapproved_proposals.is_empty() {
@@ -6977,6 +6977,36 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
             ),
             Some("review with `cplt trust`, then `cplt trust accept --all`".to_string()),
         ));
+    }
+
+    // ── network: the policy `cplt check net` classifies against (#604) ──
+    // Static: the same gate, no connection and no sandbox battery.
+    if resolved.with_proxy {
+        match resolved
+            .allowed_domains
+            .as_ref()
+            .filter(|p| !resolved.allow_all_domains && proxy::parse_lines_file(p).is_none())
+        {
+            Some(path) => findings.push(Finding {
+                level: Level::Blocking,
+                message: proxy::missing_allowlist_error(path),
+                fix: None,
+            }),
+            None => match build_net_policy(&resolved, active_agent) {
+                Ok(net) => match doctor::agent_hosts_finding(active_agent, &net) {
+                    Some(f) => findings.push(f),
+                    None if net.allowlist_active => {
+                        ok.push("allowlist: agent hosts pass".to_string());
+                    }
+                    None => {}
+                },
+                Err(message) => findings.push(Finding {
+                    level: Level::Blocking,
+                    message,
+                    fix: None,
+                }),
+            },
+        }
     }
 
     // ── the policy a launch would build, for the rules below ──
