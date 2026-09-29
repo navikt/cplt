@@ -777,6 +777,8 @@ alias python="cplt exec -- python"
 
 Every top-level `cplt` flag applies: `--project-dir`, `--allow-read`, `--deny-path`, `--with-proxy`, `--pass-env`, and the rest. Add `--no-quiet` to see the full sandbox configuration summary before the command runs.
 
+cplt finds the command on `PATH` the way a shell does and decides policy on the file a symlink points to. A tool reached through a symlink under another name, such as a mise shim, busybox or a rustup proxy, is started through that symlink, so it still sees the name it was called by. The sandbox must be able to read the symlink; if it cannot, cplt starts the target directly.
+
 ### Examples
 
 ```bash
