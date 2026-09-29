@@ -104,6 +104,13 @@ pub const HOME_CONFIG_FILES: &[&str] = &[
     ".config/gh/config.yml",
     // mise/asdf global tool versions.
     ".tool-versions",
+    // pnpm's global settings on macOS. The pnpm AppDir entry resolves to the
+    // XDG spelling (~/.config/pnpm) only, so the native config dir needs its
+    // own grant. One file, not the dir: `pnpm login` and `pnpm config set
+    // --global` keep registry tokens next to it (`auth.ini`, `rc` before
+    // pnpm 11). Read-only, so the agent cannot change settings the host's
+    // pnpm trusts outside the sandbox.
+    "Library/Preferences/pnpm/config.yaml",
 ];
 
 /// The [`DENIED_FILES`] entry `path` names, if any.
@@ -1545,6 +1552,10 @@ pub const GPG_SIGNING_ALLOW_FILES: &[&str] = &[
 
 /// Application directory kinds according to relevant platform specifications.
 /// See https://docs.rs/directories for more details
+///
+/// The macOS paths below apply only with a non-empty qualifier. Every
+/// [`APP_DIRS`] entry has an empty one, which selects XDG on macOS too, so a
+/// native macOS path (`~/Library/Preferences/<app>`, ...) needs its own grant.
 pub enum AppDirKind {
     /// macOS: `~/Library/Caches/<app>` · Linux/macOS when using XDG: `~/.cache/<app>`
     Cache,
@@ -1747,9 +1758,11 @@ pub const APP_DIRS: &[AppDir] = &[
         // file grant, or a read-only shadow when it is hardlinked into store.
         process_exec: &[],
         map_exec: &[],
-        // Config/Preference dirs (~/.config/pnpm, ~/Library/Preferences/pnpm) are
-        // writable: pnpm reads and writes its settings (hoisting, virtual store state)
-        // there during normal operation. These dirs contain no credentials.
+        // Config/Preference resolve to ~/.config/pnpm only (an empty qualifier
+        // means XDG on every platform). It is writable for `pnpm config set`.
+        // pnpm 11+ keeps global registry tokens there too (`auth.ini`).
+        // macOS's native ~/Library/Preferences/pnpm is not covered by this
+        // entry; its config.yaml is a read-only HOME_CONFIG_FILES grant.
         //
         // Data/DataLocal (~/.local/share/pnpm) is deliberately NOT writable: it
         // is $PNPM_HOME on Linux, so the global shims `pnpm setup` puts on PATH
@@ -2117,8 +2130,9 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
         map_exec: true,
         write: true,
     },
-    // Note: pnpm config dirs (~/.config/pnpm on Linux, ~/Library/Preferences/pnpm on macOS)
-    // are handled by the pnpm AppDir entry with Config/Preference write access, not here.
+    // Note: ~/.config/pnpm is handled by the pnpm AppDir entry. macOS's
+    // ~/Library/Preferences/pnpm gets only config.yaml, read-only, via
+    // HOME_CONFIG_FILES.
     // Kotlin compiler daemon: client marker files and run files.
     // The Kotlin Maven/Gradle plugin uses this for daemon lifecycle management.
     // XDG path (Linux, some macOS setups)
@@ -2255,19 +2269,22 @@ pub fn shim_ro_protect_paths(home: &Path) -> Vec<PathBuf> {
 }
 
 /// The [`HOME_CONFIG_FILES`] SECURITY.md documents as read-only: git's own
-/// config, ignore and attributes files, which git on the host trusts. They are
+/// config, ignore and attributes files, which git on the host trusts, and
+/// pnpm's macOS `config.yaml` (`registry`, `ignoreScripts`). They are
 /// write-denied on macOS, at `$HOME` and at a symlink target, and a symlink
 /// target is bound read-only by Bubblewrap on Linux
 /// (see [`home_config_link_targets`]).
 ///
-/// Derived rather than listed, so a git file added to [`HOME_CONFIG_FILES`]
-/// gets the write deny too. The `gh` files and `.tool-versions` are readable
-/// but carry no read-only claim: they never had a `$HOME` write deny.
+/// Every entry except the ones named here, so a file added to
+/// [`HOME_CONFIG_FILES`] gets the write deny unless someone decides otherwise.
+/// The `gh` files and `.tool-versions` are readable but carry no read-only
+/// claim: they never had a `$HOME` write deny.
 pub fn read_only_home_config() -> impl Iterator<Item = &'static str> {
     HOME_CONFIG_FILES.iter().copied().filter(|f| {
-        matches!(*f, ".gitconfig" | ".gitignore_global")
-            || f.starts_with(".gitconfig.")
-            || f.starts_with(".config/git/")
+        !matches!(
+            *f,
+            ".config/gh/hosts.yml" | ".config/gh/config.yml" | ".tool-versions"
+        )
     })
 }
 
@@ -4475,11 +4492,11 @@ mod tests {
         assert!(cplt_state_dir_grant(&home, &target.join(".config/cplt/x")).is_some());
     }
 
-    /// The read-only files are git's, drawn from the shared read list (#524,
-    /// #547). Pinning the exact set makes a new entry a deliberate choice: a
-    /// git file joins it, `gh` and `.tool-versions` stay out.
+    /// The read-only files are git's and pnpm's macOS config, drawn from the
+    /// shared read list (#524, #547). Pinning the exact set makes a new entry
+    /// a deliberate choice: `gh` and `.tool-versions` stay out.
     #[test]
-    fn read_only_home_config_is_the_git_subset_of_home_config_files() {
+    fn read_only_home_config_is_the_protected_subset_of_home_config_files() {
         let ro: Vec<&str> = read_only_home_config().collect();
         assert!(ro.iter().all(|f| HOME_CONFIG_FILES.contains(f)), "{ro:?}");
         assert_eq!(
@@ -4491,6 +4508,7 @@ mod tests {
                 ".config/git/config",
                 ".config/git/ignore",
                 ".config/git/attributes",
+                "Library/Preferences/pnpm/config.yaml",
             ]
         );
     }
