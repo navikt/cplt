@@ -87,17 +87,22 @@ pub struct BriefNetwork {
     pub proxy: bool,
     pub proxy_forced: bool,
     pub allow_all_domains: bool,
-    /// An allowlist is configured. It is only ENFORCED when the proxy is also
-    /// running (the proxy is what applies it) and nothing has switched domain
-    /// filtering off, which is why this and `allowlist_in_force` are separate
-    /// fields and the second is the one to read.
+    /// The agent's built-in allowlist is configured (`proxy.default_allowlist`).
+    /// It is one of two allowlist sources; the other is an `allowed_domains`
+    /// file. Neither is ENFORCED unless the proxy is also running (the proxy is
+    /// what applies it) and nothing has switched domain filtering off, which
+    /// is why this and `allowlist_in_force` are separate fields and the second
+    /// is the one to read.
     pub default_allowlist: bool,
     /// Domain filtering is actually applied this session.
     ///
-    /// `default_allowlist && proxy` is not enough: `allow_all_domains` turns
-    /// filtering off, and the prose says so first. A JSON that reported an
-    /// allowlist "in force" while the agent could reach any domain would be
-    /// this file doing the one thing it must not do.
+    /// Same sources as the proxy's own `allowlist_active`
+    /// (`DomainPolicy::build`): the built-in list OR an `allowed_domains` file,
+    /// either one makes the proxy fail closed (#607). Then the proxy must be
+    /// running, and `allow_all_domains` must not have turned filtering off: a
+    /// JSON that reported an allowlist "in force" while the agent could reach
+    /// any domain would be this file doing the one thing it must not do.
+    /// `allow.domains` is not a source: it widens an allowlist, never starts one.
     pub allowlist_in_force: bool,
     /// The ports `allow.ports` names. CONFIGURED, not effective: under
     /// `proxy_forced` no direct socket is opened for any of them, which is why
@@ -174,7 +179,10 @@ impl BriefFacts {
                 proxy_forced: resolved.proxy_forced,
                 allow_all_domains,
                 default_allowlist: resolved.default_allowlist,
-                allowlist_in_force: resolved.default_allowlist && proxy && !allow_all_domains,
+                allowlist_in_force: (resolved.default_allowlist
+                    || resolved.allowed_domains.is_some())
+                    && proxy
+                    && !allow_all_domains,
                 allow_ports: resolved.allow_ports.clone(),
                 allow_localhost: resolved.allow_localhost.clone(),
                 allow_localhost_any: resolved.allow_localhost_any,
@@ -337,11 +345,19 @@ pub fn generate_session_brief(facts: &BriefFacts) -> String {
             "- No domain allowlist this session (`--allow-all-domains`): any \
              domain is reachable except the ones on the blocklist.\n",
         );
-    } else if net.allowlist_in_force {
+    } else if net.allowlist_in_force && net.default_allowlist {
         out.push_str(
             "- Only the agent's built-in allowlist (plus any configured \
-             `allowed_domains`) is reachable. The proxy refuses everything \
-             else.\n",
+             `allowed_domains` and `allow.domains`) is reachable. The proxy \
+             refuses everything else.\n",
+        );
+    } else if net.allowlist_in_force {
+        // An `allowed_domains` file with no built-in list: the file plus the
+        // agent's own hosts (#605) is the allowlist (#607).
+        out.push_str(
+            "- Only the domains in the configured `allowed_domains` file, plus the \
+             agent's own hosts and any `allow.domains`, are reachable. The proxy \
+             refuses everything else.\n",
         );
     } else if net.default_allowlist {
         // `proxy.default_allowlist = true` with `--no-proxy` is a reachable
@@ -1029,8 +1045,10 @@ mod tests {
             // wrong, and this one was. It read `default_allowlist && with_proxy`
             // and so reported an allowlist in force under `--allow-all-domains`,
             // which switches domain filtering off.
-            let filtering_applies =
-                resolved.default_allowlist && resolved.with_proxy && !resolved.allow_all_domains;
+            let filtering_applies = (resolved.default_allowlist
+                || resolved.allowed_domains.is_some())
+                && resolved.with_proxy
+                && !resolved.allow_all_domains;
             assert_eq!(
                 facts.network.allowlist_in_force, filtering_applies,
                 "allowlist_in_force must mean domain filtering is applied"
@@ -1288,6 +1306,50 @@ mod tests {
             false,
         ));
         assert!(brief.contains("built-in allowlist"));
+    }
+
+    /// An `allowed_domains` file is an allowlist on its own: the proxy fails
+    /// closed on it with the built-in list off (`DomainPolicy::build`). The
+    /// brief used to key only on `default_allowlist` and so told the agent no
+    /// allowlist applied while the proxy was refusing everything else (#607).
+    #[test]
+    fn allowed_domains_file_alone_is_an_allowlist_in_force() {
+        let mut resolved = base_resolved();
+        resolved.default_allowlist = false;
+        resolved.allowed_domains = Some(PathBuf::from("/home/u/.config/cplt/allowed.txt"));
+        let facts = BriefFacts::capture(&resolved, Agent::OpenCode, home(), &[], false);
+        assert!(facts.network.allowlist_in_force);
+        let brief = generate_session_brief(&facts);
+        assert!(
+            brief.contains(
+                "Only the domains in the configured `allowed_domains` file, plus the \
+                 agent's own hosts and any `allow.domains`, are reachable"
+            ),
+            "{brief}"
+        );
+        assert!(!brief.contains("built-in allowlist"), "{brief}");
+
+        // `--allow-all-domains` drops the file, so nothing is in force.
+        resolved.allow_all_domains = true;
+        let facts = BriefFacts::capture(&resolved, Agent::OpenCode, home(), &[], false);
+        assert!(!facts.network.allowlist_in_force);
+    }
+
+    /// `allow.domains` (inline) widens an allowlist that is already in force
+    /// and never starts one (`PolicySpec::extra_allowed_domains`). The brief
+    /// must not report filtering the proxy does not apply.
+    #[test]
+    fn inline_allow_domains_alone_is_not_an_allowlist() {
+        let mut resolved = base_resolved();
+        resolved.default_allowlist = false;
+        resolved.allow_domains = vec!["example.com".to_string()];
+        let facts = BriefFacts::capture(&resolved, Agent::OpenCode, home(), &[], false);
+        assert!(!facts.network.allowlist_in_force);
+        let brief = generate_session_brief(&facts);
+        assert!(
+            !brief.contains("The proxy refuses everything else"),
+            "{brief}"
+        );
     }
 
     /// Plain proxy mode does not fail closed: direct `*:443` egress is still
