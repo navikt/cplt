@@ -502,6 +502,39 @@ pub fn copilot_dir_exec_residuals(
         .collect()
 }
 
+/// What `sandbox.protect_pnpm_config` cannot withhold, as launch warnings.
+/// Landlock adds up every rule on a path, so a grant that covers pnpm's config
+/// dir (`XDG_CONFIG_HOME` inside the project, an `allow.read` on `~/.config`)
+/// gives `auth.ini` and `rc` back, and write too when the grant has it.
+#[must_use]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn pnpm_config_residuals(rules: &[FsRule], home: &Path) -> Vec<String> {
+    policy::pnpm_config_dirs(home)
+        .into_iter()
+        .filter_map(|dir| {
+            let canon = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+            let r = rules
+                .iter()
+                .filter(|r| r.access.read || r.access.write)
+                .find(|r| dir.starts_with(&r.path) || canon.starts_with(&r.path))?;
+            Some(format!(
+                "sandbox.protect_pnpm_config cannot take effect on {}: it is inside {}, \
+                 which is granted {}. Landlock adds the rules together, so pnpm's token \
+                 files stay readable through that grant. Under bubblewrap, \
+                 --deny-path {}/auth.ini masks the file.",
+                dir.display(),
+                r.path.display(),
+                if r.access.write {
+                    "read and write"
+                } else {
+                    "read"
+                },
+                dir.display()
+            ))
+        })
+        .collect()
+}
+
 pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     let mut fs_rules = Vec::new();
     let home = config.home_dir;
@@ -5486,6 +5519,35 @@ mod tests {
                 !policy.fs_rules.iter().any(|r| r.path.starts_with(&cfg)),
                 "a config.yaml linked onto auth.ini gets no rule"
             );
+        });
+    }
+
+    /// A grant covering pnpm's config dir is warned about with the key on;
+    /// the default policy has none.
+    #[test]
+    fn pnpm_config_residuals_name_a_covering_grant() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = std::fs::canonicalize(tmp.path()).expect("canonical");
+        crate::with_env_lock_no_xdg(|| {
+            let project = home.join("project");
+            let mut config = test_config(&project, &home);
+            config.protect_pnpm_config = true;
+            let mut policy = generate_policy(&config);
+            assert!(pnpm_config_residuals(&policy.fs_rules, &home).is_empty());
+            policy.fs_rules.push(FsRule {
+                nofollow: false,
+                path: home.join(".config"),
+                access: FsAccess {
+                    read: true,
+                    write: false,
+                    execute: false,
+                    ioctl: false,
+                    create_dirs: false,
+                },
+            });
+            let w = pnpm_config_residuals(&policy.fs_rules, &home);
+            assert_eq!(w.len(), 1, "{w:?}");
+            assert!(w[0].contains("granted read."), "{}", w[0]);
         });
     }
 

@@ -2551,11 +2551,26 @@ fn emit_deny_rules(sb: &mut String, config: &SandboxConfig, home: &str) {
         sbpl!(sb, "(deny file-read* (literal \"{p}\"))");
         sbpl!(sb, "(deny file-write* (literal \"{p}\"))");
     }
-    let targets: Vec<PathBuf> = dirs
-        .iter()
-        .chain(&files)
-        .filter_map(|s| s.get(1).map(PathBuf::from))
-        .collect();
+    // `sandbox.protect_pnpm_config`: the dir stays read-only under a project or
+    // `allow.write` grant that covers it too, and its ancestors in such a grant
+    // keep their names (the pins below), so it cannot be moved aside.
+    let mut targets: Vec<PathBuf> = Vec::new();
+    if config.protect_pnpm_config {
+        for dir in pnpm_config_dirs(config.home_dir) {
+            let target = resolved(dir.clone());
+            for p in spellings(&dir, &target) {
+                if validate_sbpl_path(Path::new(&p)).is_ok() {
+                    sbpl!(sb, "(deny file-write* (subpath \"{p}\"))");
+                }
+            }
+            targets.push(target);
+        }
+    }
+    targets.extend(
+        dirs.iter()
+            .chain(&files)
+            .filter_map(|s| s.get(1).map(PathBuf::from)),
+    );
     emit_resolved_deny_pins(sb, config, &targets);
     for path in config.extra_deny {
         let p = path.to_string_lossy();
@@ -3391,6 +3406,46 @@ mod tests {
                 !reopened.contains(&format!("(allow file-read* (literal \"{cfg}/rc\"))")),
                 "and only that file"
             );
+        });
+    }
+
+    /// `sandbox.protect_pnpm_config` under a write grant that covers pnpm's
+    /// config dir (here `XDG_CONFIG_HOME` inside an `allow.write` tree): the
+    /// dir is write-denied after that allow, and its ancestors inside the
+    /// grant are pinned so it cannot be moved aside.
+    #[test]
+    fn protect_pnpm_config_holds_under_a_covering_write_grant() {
+        // Not under the system temp dir, which is a writable tree of its own.
+        let tmp = tempfile::Builder::new()
+            .prefix(".cplt-pnpm-home-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("tempdir");
+        let home = std::fs::canonicalize(tmp.path()).expect("canonical home");
+        let tree = home.join("work");
+        let xdg = tree.join("sub/.xdg");
+        let cfg = xdg.join("pnpm");
+        std::fs::create_dir_all(&cfg).expect("mkdir");
+        crate::with_env_lock_no_xdg(|| {
+            temp_env::with_var("XDG_CONFIG_HOME", Some(&xdg), || {
+                let project = std::path::Path::new("/projects/app");
+                let extra_write = [tree.clone()];
+                let mut opts = test_options(project, &home);
+                opts.extra_write = &extra_write;
+                opts.protect_pnpm_config = true;
+                let p = generate_profile(&opts, &[]);
+                let deny = format!("(deny file-write* (subpath \"{}\"))", cfg.display());
+                let allow = format!("(allow file-write* (subpath \"{}\"))", tree.display());
+                let deny_at = p.rfind(&deny).unwrap_or_else(|| panic!("missing {deny}"));
+                let allow_at = p.rfind(&allow).unwrap_or_else(|| panic!("missing {allow}"));
+                assert!(deny_at > allow_at, "the deny comes after the allow");
+                for pinned in [xdg.clone(), tree.join("sub")] {
+                    let rule = format!(
+                        "(deny file-write-unlink (literal \"{}\"))",
+                        pinned.display()
+                    );
+                    assert!(p.contains(&rule), "missing rename pin {rule}");
+                }
+            });
         });
     }
 

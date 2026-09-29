@@ -2313,6 +2313,11 @@ fn prepare_impl(
             ui::warn(&w);
         }
     }
+    if config.protect_pnpm_config {
+        for w in landlock_mod::pnpm_config_residuals(&policy.fs_rules, config.home_dir) {
+            ui::warn(&w);
+        }
+    }
 
     // Decide bubblewrap wrapping before `precompute()` consumes `policy`.
     // `resolve()` only clones `fs_rules`/`net_rules` on the arms that actually
@@ -2619,6 +2624,21 @@ fn validate_config_paths(config: &SandboxConfig) -> Result<(), String> {
     }
     for p in config.extra_deny {
         policy::validate_sbpl_path(p).map_err(|e| format!("--deny-path path: {e}"))?;
+    }
+    // `sandbox.protect_pnpm_config`: a deny the profile cannot name would be
+    // dropped, leaving the tokens to any grant that covers them. Refuse.
+    if config.protect_pnpm_config {
+        let dirs = policy::pnpm_config_dirs(config.home_dir);
+        for p in dirs
+            .iter()
+            .cloned()
+            .chain(policy::pnpm_credential_files(config.home_dir))
+        {
+            for s in [p.clone(), crate::config::canonicalize_deepest(&p)] {
+                policy::validate_sbpl_path(&s)
+                    .map_err(|e| format!("sandbox.protect_pnpm_config path: {e}"))?;
+            }
+        }
     }
 
     // allow_cache_exec subdirs are interpolated into SBPL string literals — validate here
@@ -3538,6 +3558,23 @@ mod tests {
         config.managed_worktree_root = Some(&root);
         let err = super::validate_config_paths(&config).expect_err("must refuse");
         assert!(err.contains("Managed worktree root"), "{err}");
+    }
+
+    /// `sandbox.protect_pnpm_config` with an `XDG_CONFIG_HOME` the profile
+    /// cannot name refuses the launch rather than dropping the token denies.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unnameable_pnpm_config_dir_is_refused_with_protect_pnpm_config() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let xdg = home.join("x\"dg");
+        temp_env::with_var("XDG_CONFIG_HOME", Some(&xdg), || {
+            let mut config = test_config(&home, &[]);
+            assert!(super::validate_config_paths(&config).is_ok(), "key off");
+            config.protect_pnpm_config = true;
+            let err = super::validate_config_paths(&config).expect_err("must refuse");
+            assert!(err.contains("sandbox.protect_pnpm_config"), "{err}");
+        });
     }
 
     /// `cplt doctor` must probe the wrapper the launch builds, not an empty
