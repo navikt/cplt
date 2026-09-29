@@ -750,6 +750,7 @@ cplt config get sandbox.quiet             # get a single value
 cplt config explain                       # list all keys with descriptions
 cplt config explain sandbox.pass_env      # explain a specific key
 cplt config validate                      # check for syntax errors and unknown keys
+cplt config hosts --agent copilot --json  # an agent's built-in hosts, see docs/proxy.md
 ```
 
 ## Build-host credentials (`sandbox.allow_build_credentials`)

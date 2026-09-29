@@ -1138,6 +1138,22 @@ enum ConfigAction {
         local: bool,
     },
 
+    /// Print an agent's built-in network hosts.
+    ///
+    /// Agent hosts (model, auth, telemetry) stay reachable under a user
+    /// allowlist. The default allowlist is those plus the package registries
+    /// that `proxy.default_allowlist` adds.
+    /// Example: cplt config hosts --agent copilot --json
+    Hosts {
+        /// Agent to list hosts for (copilot, opencode, antigravity, ...).
+        #[arg(long, value_name = "AGENT")]
+        agent: String,
+
+        /// Emit JSON: {"version":1,"agent_hosts":[...],"default_allowlist":[...]}.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Inspect the per-repo user configs under ~/.config/cplt/local/.
     #[command(subcommand)]
     Local(LocalAction),
@@ -7359,6 +7375,7 @@ fn run_config_command(action: ConfigAction) -> ExitCode {
             local,
         } => run_config_set(&key, value.as_deref(), append, unset, force, repo, local),
         ConfigAction::Explain { key } => run_config_explain(key.as_deref()),
+        ConfigAction::Hosts { agent, json } => run_config_hosts(&agent, json),
         ConfigAction::Local(LocalAction::List) => run_config_local_list(),
     }
 }
@@ -7616,6 +7633,39 @@ fn run_config_path(local: bool) -> ExitCode {
         ui::error("Cannot determine config path ($HOME not set)");
         ExitCode::FAILURE
     }
+}
+
+/// `cplt config hosts --json` output. nav-pilot reads this instead of keeping
+/// its own copy of the lists; bump `version` on any breaking change to the shape.
+fn config_hosts_json(agent: agent::Agent) -> serde_json::Value {
+    serde_json::json!({
+        "version": 1,
+        "agent_hosts": agent.infra_domains(),
+        "default_allowlist": agent.default_allowed_domains(),
+    })
+}
+
+fn run_config_hosts(name: &str, json: bool) -> ExitCode {
+    let agent = match name.parse::<agent::Agent>() {
+        Ok(a) => a,
+        Err(e) => {
+            ui::error(&e);
+            return ExitCode::FAILURE;
+        }
+    };
+    if json {
+        println!("{}", config_hosts_json(agent));
+    } else {
+        println!("Agent hosts (always allowed):");
+        for h in agent.infra_domains() {
+            println!("  {h}");
+        }
+        println!("Default allowlist (proxy.default_allowlist):");
+        for h in agent.default_allowed_domains() {
+            println!("  {h}");
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 fn run_config_get(key: &str) -> ExitCode {
@@ -10090,6 +10140,48 @@ fn start_denial_stream() -> Option<std::process::Child> {
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod tests {
+    /// #608: `cplt config hosts --json` is built from the same lists the proxy
+    /// uses, so nav-pilot reading it cannot drift from what cplt enforces.
+    #[test]
+    fn config_hosts_json_matches_agent_lists() {
+        for name in [
+            "copilot",
+            "opencode",
+            "antigravity",
+            "claude",
+            "goose",
+            "dsh",
+            "pi",
+            "shell",
+        ] {
+            let agent: agent::Agent = name.parse().unwrap();
+            let v = config_hosts_json(agent);
+            assert_eq!(v["version"], 1);
+            assert_eq!(
+                v["agent_hosts"],
+                serde_json::json!(agent.infra_domains()),
+                "{name}"
+            );
+            assert_eq!(
+                v["default_allowlist"],
+                serde_json::json!(agent.default_allowed_domains()),
+                "{name}"
+            );
+        }
+        // Both sides empty would pass the loop above; pin known entries.
+        let copilot = config_hosts_json(agent::Agent::Copilot);
+        let has = |key: &str, host: &str| {
+            copilot[key]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(host))
+        };
+        assert!(has("agent_hosts", "github.com"));
+        assert!(!has("agent_hosts", "jitpack.io"));
+        assert!(has("default_allowlist", "github.com"));
+        assert!(has("default_allowlist", "jitpack.io"));
+    }
+
     /// #531 off: no root, nothing touched on disk, and the policy roots are
     /// exactly the named repositories, which is what keeps the profile
     /// byte-identical to a build without the feature.
