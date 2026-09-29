@@ -606,6 +606,10 @@ fn detect_docker(ctx: &DetectContext) -> DetectorOutput {
         }
     }
 
+    for alt in find_alternate_compose_files(ctx) {
+        signals.push(Signal::FileExists { path: alt });
+    }
+
     if signals.is_empty() {
         return DetectorOutput::none();
     }
@@ -616,8 +620,7 @@ fn detect_docker(ctx: &DetectContext) -> DetectorOutput {
     // image built in CI, and editing it does not need the daemon.
     let has_compose = signals
         .iter()
-        .any(|s| !matches!(s, Signal::FileExists { path } if path == "Dockerfile"))
-        || !find_alternate_compose_files(ctx).is_empty();
+        .any(|s| !matches!(s, Signal::FileExists { path } if path == "Dockerfile"));
     let mut suggestions = Vec::new();
     let mut diagnostics = Vec::new();
     if has_compose {
@@ -2928,6 +2931,20 @@ mod tests {
                 "{compose}"
             );
         }
+    }
+
+    /// A repo with only `docker-compose.dev.yml` used to return before the
+    /// alternates were looked at, so it was not detected at all.
+    #[test]
+    fn docker_alternate_compose_only_is_proposed() {
+        let dir = setup_dir();
+        fs::write(dir.path().join("docker-compose.dev.yml"), "services: {}\n").unwrap();
+        let report = detect_project(dir.path());
+        assert!(
+            report
+                .suggestions
+                .contains(&Suggestion::Propose(SandboxFlag::AllowDocker))
+        );
     }
 
     /// Testcontainers needs the daemon wherever it is declared, and a repo
