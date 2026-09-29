@@ -3312,19 +3312,26 @@ fn resolve_domain_allowlist_decision(
 /// the agent off from its backend breaks login and every model call, and no
 /// user writes one on purpose. With neither, it is empty and there is no
 /// allowlist. This only ever adds hosts to an allowlist that is already in
-/// force; the blocklists are checked after it and still win.
+/// force; the blocklists are checked after it and still win. For OpenCode it
+/// also carries the hosts of a connected GitHub Copilot provider (#609).
 fn agent_allowlist(
     agent: agent::Agent,
     default_allowlist: bool,
     allowed_domains_file: bool,
 ) -> Vec<String> {
-    let domains = if default_allowlist {
+    let mut domains = if default_allowlist {
         agent.default_allowed_domains()
     } else if allowed_domains_file {
         agent.infra_domains()
     } else {
-        Vec::new()
+        return Vec::new();
     };
+    // OpenCode's connected provider hosts (#609), read from its credential
+    // store in the user's home, never from the repo.
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    domains.extend(agent.provider_domains(&home));
     domains.into_iter().map(str::to_string).collect()
 }
 
@@ -3649,7 +3656,7 @@ fn start_proxy_if_enabled(
             if allowlist_decision.use_default_allowlist {
                 "agent defaults"
             } else {
-                "the agent's own hosts"
+                "the agent's hosts"
             },
             extra
         ));
@@ -12715,6 +12722,28 @@ mod tests {
             )
             .unwrap()
             .is_empty()
+        );
+    }
+
+    /// #609: OpenCode with a connected Copilot provider gets the Copilot hosts
+    /// under a user allowlist and under `default_allowlist`, and no allowlist
+    /// still means no allowlist.
+    #[test]
+    fn agent_allowlist_adds_opencode_copilot_provider_hosts() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("opencode");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("auth.json"), r#"{"github-copilot":{}}"#).expect("write");
+        // XDG_DATA_HOME, not HOME: other tests in this binary read HOME.
+        temp_env::with_var(
+            "XDG_DATA_HOME",
+            Some(tmp.path().to_str().expect("utf-8 path")),
+            || {
+                let copilot = "githubcopilot.com".to_string();
+                assert!(agent_allowlist(agent::Agent::OpenCode, false, true).contains(&copilot));
+                assert!(agent_allowlist(agent::Agent::OpenCode, true, false).contains(&copilot));
+                assert!(agent_allowlist(agent::Agent::OpenCode, false, false).is_empty());
+            },
         );
     }
 }

@@ -182,7 +182,9 @@ const ANTHROPIC_DOMAINS: &[&str] = &[
 /// OpenCode's OWN infrastructure only. OpenCode is provider-agnostic: it routes
 /// model traffic to a user-configured provider (Anthropic/OpenAI/Google/…), so
 /// enabling `default_allowlist` for OpenCode requires adding that provider's
-/// domain via `allowed_domains`. Only OpenCode's own infra is listed here.
+/// domain via `allowed_domains`. Only OpenCode's own infra is listed here;
+/// a connected GitHub Copilot provider is detected separately, see
+/// [`Agent::provider_domains`] (#609).
 ///
 /// BARE domains, matched exact-or-subdomain — see `COPILOT_INFRA_DOMAINS`.
 const OPENCODE_DOMAINS: &[&str] = &["opencode.ai", "models.dev"];
@@ -194,6 +196,51 @@ const OPENCODE_DOMAINS: &[&str] = &["opencode.ai", "models.dev"];
 ///
 /// BARE domain — see `COPILOT_INFRA_DOMAINS` for the no-glob convention.
 const DEEPSEEK_DOMAINS: &[&str] = &["deepseek.com"];
+
+/// The provider hosts an OpenCode `auth.json` body calls for. Split from
+/// [`Agent::provider_domains`] so the parse is testable without a home dir.
+/// Anything that is not a JSON object with a `github-copilot` key, including
+/// a malformed file, yields nothing: this only ever widens an allowlist, so
+/// the failure direction is to add no hosts.
+fn opencode_provider_domains(auth_json: &str) -> Vec<&'static str> {
+    // An enterprise login is stored under the same key with an
+    // `enterpriseUrl`; its hosts are the customer's own, so it adds nothing.
+    let connected = serde_json::from_str::<serde_json::Value>(auth_json).is_ok_and(|v| {
+        v.get("github-copilot")
+            .is_some_and(|e| e.get("enterpriseUrl").is_none())
+    });
+    if connected {
+        COPILOT_INFRA_DOMAINS.to_vec()
+    } else {
+        Vec::new()
+    }
+}
+
+/// Upper bound for [`read_small_regular_file`]; OpenCode's `auth.json` is a
+/// few hundred bytes.
+const SMALL_FILE_LIMIT: u64 = 64 * 1024;
+
+/// Read a file the sandboxed agent can write, without letting it hang the
+/// next launch: `O_NONBLOCK` so opening a planted FIFO returns at once, then
+/// only a regular file of at most [`SMALL_FILE_LIMIT`] bytes is read (a
+/// symlink to `/dev/zero` is a character device and is refused). `None` for
+/// anything else.
+fn read_small_regular_file(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > SMALL_FILE_LIMIT {
+        return None;
+    }
+    let mut s = String::new();
+    file.take(SMALL_FILE_LIMIT).read_to_string(&mut s).ok()?;
+    Some(s)
+}
 
 /// A credential an agent can use instead of the macOS login Keychain (#242).
 ///
@@ -955,7 +1002,9 @@ impl Agent {
     /// add domains via `allowed_domains`:
     ///   - OpenCode is provider-agnostic: its model traffic goes to a
     ///     user-configured provider (Anthropic/OpenAI/Google/…), which is NOT
-    ///     included here — only OpenCode's own infra is.
+    ///     included here — only OpenCode's own infra is. The one exception,
+    ///     a connected GitHub Copilot provider, is added by the caller via
+    ///     [`Agent::provider_domains`].
     ///   - Pi's infrastructure endpoints are not yet documented here.
     ///
     /// These are best-effort defaults for an opt-in feature: blocked domains are
@@ -1002,6 +1051,45 @@ impl Agent {
             Agent::Goose | Agent::Pi | Agent::Shell => &[],
         };
         infra.concat()
+    }
+
+    /// Provider hosts OpenCode needs beyond its own infra, detected from the
+    /// user's OpenCode credential store (#609). Today only one: a connected
+    /// GitHub Copilot provider gets `COPILOT_INFRA_DOMAINS`, so an allowlist
+    /// does not cut OpenCode off from the model it was set up to use. Every
+    /// other agent, and OpenCode without that provider, gets nothing.
+    ///
+    /// The signal is the `github-copilot` key in
+    /// `$XDG_DATA_HOME/opencode/auth.json` (default `~/.local/share`), where
+    /// `/connect` stores provider credentials. It is read once, read-only,
+    /// before the sandbox starts. A project `opencode.json` is deliberately
+    /// NOT consulted: it is repo-controlled, and a hostile repo must not be
+    /// able to widen egress by naming a provider. The data dir is writable
+    /// from inside the sandbox, so a compromised session could plant the key
+    /// for the next one; what that buys is the GitHub hosts every Copilot
+    /// session already has, which is the accepted ceiling here.
+    ///
+    /// Copilot Enterprise (an entry with `enterpriseUrl`, or the
+    /// `github-copilot-enterprise` key) is not matched: its hosts live on the
+    /// customer's own domain, which cplt cannot know. Those go in
+    /// `allowed_domains` (docs/known-impacts.md).
+    pub fn provider_domains(&self, home: &Path) -> Vec<&'static str> {
+        if *self != Agent::OpenCode {
+            return Vec::new();
+        }
+        // A relative or empty XDG_DATA_HOME would resolve against the
+        // project dir and let a repo supply the file; the spec says to ignore it.
+        // The same goes for an unset or empty HOME.
+        let Some(data_base) = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(|| home.is_absolute().then(|| home.join(".local/share")))
+        else {
+            return Vec::new();
+        };
+        read_small_regular_file(&data_base.join("opencode/auth.json"))
+            .map(|s| opencode_provider_domains(&s))
+            .unwrap_or_default()
     }
 
     /// The writable dirs a shell session needs, by shell name.
@@ -3977,6 +4065,125 @@ mod tests {
                 && !domains.contains(&"generativelanguage.googleapis.com"),
             "OpenCode must not assume a specific model provider"
         );
+    }
+
+    /// #609: only a `github-copilot` entry in OpenCode's credential store adds
+    /// the Copilot hosts. Other providers, a malformed file or a value that
+    /// merely mentions Copilot add nothing.
+    #[test]
+    fn opencode_provider_domains_only_for_connected_copilot() {
+        let copilot = opencode_provider_domains(
+            r#"{"github-copilot":{"type":"oauth","refresh":"gho_x","access":"tid=x","expires":0}}"#,
+        );
+        assert_eq!(copilot, COPILOT_INFRA_DOMAINS.to_vec());
+        for body in [
+            r#"{"github-copilot":{"type":"oauth","refresh":"gho_x","access":"tid=x","expires":0,"enterpriseUrl":"github.example.com"}}"#,
+            r#"{"anthropic":{"type":"api"}}"#,
+            r#"{"anthropic":{"note":"github-copilot"}}"#,
+            r#"{"github-copilot-enterprise":{"type":"oauth"}}"#,
+            "not json",
+            "",
+        ] {
+            assert!(opencode_provider_domains(body).is_empty(), "{body}");
+        }
+    }
+
+    /// #609: the file is found in the XDG data dir, and only OpenCode reads it.
+    #[test]
+    fn provider_domains_reads_opencode_auth_json_from_data_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join(".local/share/opencode");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("auth.json"), r#"{"github-copilot":{}}"#).expect("write");
+        temp_env::with_var("XDG_DATA_HOME", None::<&str>, || {
+            assert!(
+                Agent::OpenCode
+                    .provider_domains(tmp.path())
+                    .contains(&"githubcopilot.com")
+            );
+            assert!(Agent::Copilot.provider_domains(tmp.path()).is_empty());
+            assert!(Agent::Pi.provider_domains(tmp.path()).is_empty());
+        });
+        temp_env::with_var("XDG_DATA_HOME", Some("/nonexistent-cplt-609"), || {
+            assert!(Agent::OpenCode.provider_domains(tmp.path()).is_empty());
+        });
+        // Relative and empty values are ignored, not resolved against the cwd.
+        for bad in ["", "relative-data"] {
+            temp_env::with_var("XDG_DATA_HOME", Some(bad), || {
+                assert!(
+                    Agent::OpenCode
+                        .provider_domains(tmp.path())
+                        .contains(&"githubcopilot.com"),
+                    "{bad:?}"
+                );
+            });
+        }
+        // No usable HOME and no XDG_DATA_HOME: nothing, not a cwd-relative
+        // path. The relative home below resolves to `tmp` from the cwd, so a
+        // missing guard would find the file.
+        let cwd = std::env::current_dir().expect("cwd");
+        let mut relative_home = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            relative_home.push("..");
+        }
+        relative_home.push(tmp.path().strip_prefix("/").expect("absolute tmp"));
+        temp_env::with_var("XDG_DATA_HOME", None::<&str>, || {
+            assert!(Agent::OpenCode.provider_domains(Path::new("")).is_empty());
+            assert!(Agent::OpenCode.provider_domains(&relative_home).is_empty());
+        });
+    }
+
+    /// #609: the auth file sits in a dir the sandboxed agent can write, so a
+    /// planted FIFO, device symlink or huge file must not hang or bloat the
+    /// next launch; each is skipped.
+    #[test]
+    fn provider_domains_skips_non_regular_and_oversize_auth_json() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join(".local/share/opencode");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let auth = dir.join("auth.json");
+        let read = || {
+            temp_env::with_var("XDG_DATA_HOME", None::<&str>, || {
+                Agent::OpenCode.provider_domains(tmp.path())
+            })
+        };
+
+        let fifo = std::ffi::CString::new(auth.as_os_str().as_encoded_bytes()).expect("cstr");
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0, "mkfifo");
+        assert!(read().is_empty(), "FIFO, no writer");
+        // A FIFO with valid JSON waiting in it is refused too: hold a reader
+        // open so the data stays buffered after the writer closes.
+        {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let _reader = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&auth)
+                .expect("open fifo reader");
+            let mut writer = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&auth)
+                .expect("open fifo writer");
+            writer
+                .write_all(br#"{"github-copilot":{}}"#)
+                .expect("write fifo");
+            drop(writer);
+            assert!(read().is_empty(), "FIFO with data");
+        }
+        std::fs::remove_file(&auth).expect("rm fifo");
+
+        std::os::unix::fs::symlink("/dev/zero", &auth).expect("symlink");
+        assert!(read().is_empty(), "/dev/zero symlink");
+        std::fs::remove_file(&auth).expect("rm symlink");
+
+        let body = r#"{"github-copilot":{}}"#;
+        let pad = " ".repeat(SMALL_FILE_LIMIT as usize + 1 - body.len());
+        std::fs::write(&auth, format!("{body}{pad}")).expect("write big");
+        assert!(read().is_empty(), "oversize");
+
+        std::fs::write(&auth, body).expect("write small");
+        assert!(read().contains(&"githubcopilot.com"), "regular");
     }
 
     /// DSH ships one adapter, `dsh-llm-deepseek`, whose default `PUBLIC_BASE_URL`
