@@ -5057,6 +5057,9 @@ struct HostProbe {
     existing_app_dirs: Vec<String>,
     git_hooks_path: Option<PathBuf>,
     git_common_dir: Option<PathBuf>,
+    /// Why `git_common_dir` is `None` for a worktree that has one. A launch
+    /// warns with it, `cplt doctor` shows it as a finding.
+    git_common_dir_problem: Option<discover::CommonDirProblem>,
     /// See [`sandbox::SandboxConfig::root_agents_md`].
     root_agents_md: Option<PathBuf>,
     java_home: Option<PathBuf>,
@@ -5075,6 +5078,9 @@ impl HostProbe {
             merge_build_credentials(resolved, home_dir);
         }
         let tool_discovery = discover::discover_tools(home_dir, &tool_roots);
+        // Git worktree common directory (shared .git for worktrees).
+        let (git_common_dir, git_common_dir_problem) =
+            discover::git_common_dir(home_dir, project_dir, &resolved.allow_write);
         Self {
             home_dir: home_dir.to_path_buf(),
             project_dir: project_dir.to_path_buf(),
@@ -5082,8 +5088,8 @@ impl HostProbe {
             existing_app_dirs: tool_discovery.existing_app_dirs,
             // Global git hooks path from core.hooksPath.
             git_hooks_path: discover::git_hooks_path(home_dir),
-            // Git worktree common directory (shared .git for worktrees).
-            git_common_dir: discover::git_common_dir(home_dir, project_dir),
+            git_common_dir,
+            git_common_dir_problem,
             root_agents_md: resolved
                 .agents_md
                 .then(|| root_agents_md_outside(project_dir))
@@ -5225,6 +5231,9 @@ fn assemble_sandbox(
 ) -> anyhow::Result<AssembledSandbox> {
     let home_dir = probe.home_dir.as_path();
     let active_agent = opts.agent;
+    if let Some(problem) = &probe.git_common_dir_problem {
+        ui::warn(&problem.warning());
+    }
 
     // Create per-session scratch directory if enabled
     let scratch_guard = if resolved.scratch_dir {
@@ -7192,6 +7201,12 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
     println!();
 
     findings.extend(doctor::wsl_drive_project_finding(&project_dir, wsl));
+    findings.extend(
+        probe
+            .git_common_dir_problem
+            .as_ref()
+            .map(|p| Finding::warning(p.message.clone(), Some(p.fix.clone()))),
+    );
     findings.extend(doctor::pts_grant_finding(
         &policy,
         bubblewrap.active(),
