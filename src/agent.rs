@@ -216,6 +216,32 @@ fn opencode_provider_domains(auth_json: &str) -> Vec<&'static str> {
     }
 }
 
+/// Upper bound for [`read_small_regular_file`]; OpenCode's `auth.json` is a
+/// few hundred bytes.
+const SMALL_FILE_LIMIT: u64 = 64 * 1024;
+
+/// Read a file the sandboxed agent can write, without letting it hang the
+/// next launch: `O_NONBLOCK` so opening a planted FIFO returns at once, then
+/// only a regular file of at most [`SMALL_FILE_LIMIT`] bytes is read (a
+/// symlink to `/dev/zero` is a character device and is refused). `None` for
+/// anything else.
+fn read_small_regular_file(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > SMALL_FILE_LIMIT {
+        return None;
+    }
+    let mut s = String::new();
+    file.take(SMALL_FILE_LIMIT).read_to_string(&mut s).ok()?;
+    Some(s)
+}
+
 /// A credential an agent can use instead of the macOS login Keychain (#242).
 ///
 /// Returned by [`crate::sandbox::keychain_substitute`]. The variants exist
@@ -1053,11 +1079,15 @@ impl Agent {
         }
         // A relative or empty XDG_DATA_HOME would resolve against the
         // project dir and let a repo supply the file; the spec says to ignore it.
-        let data_base = std::env::var_os("XDG_DATA_HOME")
+        // The same goes for an unset or empty HOME.
+        let Some(data_base) = std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
             .filter(|p| p.is_absolute())
-            .unwrap_or_else(|| home.join(".local/share"));
-        std::fs::read_to_string(data_base.join("opencode/auth.json"))
+            .or_else(|| home.is_absolute().then(|| home.join(".local/share")))
+        else {
+            return Vec::new();
+        };
+        read_small_regular_file(&data_base.join("opencode/auth.json"))
             .map(|s| opencode_provider_domains(&s))
             .unwrap_or_default()
     }
@@ -4088,6 +4118,72 @@ mod tests {
                 );
             });
         }
+        // No usable HOME and no XDG_DATA_HOME: nothing, not a cwd-relative
+        // path. The relative home below resolves to `tmp` from the cwd, so a
+        // missing guard would find the file.
+        let cwd = std::env::current_dir().expect("cwd");
+        let mut relative_home = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            relative_home.push("..");
+        }
+        relative_home.push(tmp.path().strip_prefix("/").expect("absolute tmp"));
+        temp_env::with_var("XDG_DATA_HOME", None::<&str>, || {
+            assert!(Agent::OpenCode.provider_domains(Path::new("")).is_empty());
+            assert!(Agent::OpenCode.provider_domains(&relative_home).is_empty());
+        });
+    }
+
+    /// #609: the auth file sits in a dir the sandboxed agent can write, so a
+    /// planted FIFO, device symlink or huge file must not hang or bloat the
+    /// next launch; each is skipped.
+    #[test]
+    fn provider_domains_skips_non_regular_and_oversize_auth_json() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join(".local/share/opencode");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let auth = dir.join("auth.json");
+        let read = || {
+            temp_env::with_var("XDG_DATA_HOME", None::<&str>, || {
+                Agent::OpenCode.provider_domains(tmp.path())
+            })
+        };
+
+        let fifo = std::ffi::CString::new(auth.as_os_str().as_encoded_bytes()).expect("cstr");
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0, "mkfifo");
+        assert!(read().is_empty(), "FIFO, no writer");
+        // A FIFO with valid JSON waiting in it is refused too: hold a reader
+        // open so the data stays buffered after the writer closes.
+        {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let _reader = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&auth)
+                .expect("open fifo reader");
+            let mut writer = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&auth)
+                .expect("open fifo writer");
+            writer
+                .write_all(br#"{"github-copilot":{}}"#)
+                .expect("write fifo");
+            drop(writer);
+            assert!(read().is_empty(), "FIFO with data");
+        }
+        std::fs::remove_file(&auth).expect("rm fifo");
+
+        std::os::unix::fs::symlink("/dev/zero", &auth).expect("symlink");
+        assert!(read().is_empty(), "/dev/zero symlink");
+        std::fs::remove_file(&auth).expect("rm symlink");
+
+        let body = r#"{"github-copilot":{}}"#;
+        let pad = " ".repeat(SMALL_FILE_LIMIT as usize + 1 - body.len());
+        std::fs::write(&auth, format!("{body}{pad}")).expect("write big");
+        assert!(read().is_empty(), "oversize");
+
+        std::fs::write(&auth, body).expect("write small");
+        assert!(read().contains(&"githubcopilot.com"), "regular");
     }
 
     /// DSH ships one adapter, `dsh-llm-deepseek`, whose default `PUBLIC_BASE_URL`
