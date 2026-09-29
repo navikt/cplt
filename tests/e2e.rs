@@ -7271,6 +7271,43 @@ paths = [
         );
     }
 
+    /// #643: `cplt exec` ran every command from the project root, so
+    /// `cplt exec -- go test ./...` from an app directory tested the whole
+    /// repository. Inside the project the child starts where the caller is;
+    /// outside it, in the project root.
+    #[test]
+    fn e2e_exec_starts_in_the_callers_directory_inside_the_project() {
+        require_sandbox!();
+        let pwd = |dir: &Path, extra: &[&str]| {
+            let output = cplt_cmd()
+                .args(extra)
+                .args(["--no-validate", "exec", "--", "/bin/pwd", "-P"])
+                .current_dir(dir)
+                .output()
+                .expect("cplt exec should run");
+            assert!(
+                output.status.success(),
+                "stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
+        };
+
+        let sub = project_dir().join("src");
+        assert_eq!(pwd(&sub, &[]), sub, "a subdirectory of the project");
+
+        let outside = tempfile::tempdir().unwrap();
+        let project = project_dir();
+        assert_eq!(
+            pwd(
+                outside.path(),
+                &["--project-dir", project.to_str().unwrap()]
+            ),
+            project,
+            "outside the project: the project root"
+        );
+    }
+
     #[test]
     fn e2e_exec_exit_code_pass_through() {
         require_sandbox!();
