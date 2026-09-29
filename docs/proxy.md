@@ -539,6 +539,8 @@ cplt config set sandbox.pass_env HTTPS_PROXY
 
 Instead of disabling cplt's proxy, keep it and forward its approved CONNECT tunnels through your corporate proxy. Every hostname gate runs before the forward, so the upstream only ever receives a target whose *name* cplt's policy permits: the port policy, the fail-closed allowlist, the blocklist, and the pre-DNS private-hostname check that rejects private IP literals and `localhost` / `*.localhost` / `*.local`.
 
+Local targets are never forwarded. A loopback target you opted into with `--allow-localhost`, whether spelled `localhost`, `127.0.0.1` or a name that resolves only to loopback (such as `127.0.0.1.nip.io`), is connected directly, so it reaches your machine and not the upstream's.
+
 > [!IMPORTANT]
 > **Upstream mode delegates private-address defense to the upstream.** cplt forwards the target *hostname*, not an address, and the upstream resolves it itself. cplt's resolved-IP SSRF guard classifies the answer cplt's own resolver gives, which need not be the address the tunnel lands on: a split-horizon name that is public locally and private upstream passes the guard and still reaches the private host, and a name that does not resolve locally at all is forwarded with no address classification (that is how split-DNS names are meant to work here). This is deliberate — pinning the checked IP would break split-DNS and internal-name resolution, which is the reason upstream mode exists. In this mode the private-network boundary is the upstream proxy and its network segment, not cplt.
 
