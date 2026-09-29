@@ -1539,7 +1539,7 @@ use cplt::ui;
 /// by reading the source (navikt/copilot#1348). The summary above it still
 /// prints either way.
 const CONFIRM_PROMPT: &str =
-    "Proceed? (--yes, or `cplt config set sandbox.yes true`, skips this) [y/N] ";
+    "Proceed? (skip once with --yes, or always with `cplt config set sandbox.yes true`) [y/N] ";
 
 /// Prompt the user to confirm the sandbox configuration.
 ///
@@ -13236,7 +13236,11 @@ mod tests {
             .nth(1)
             .expect("the prompt quotes a command");
         let parts: Vec<&str> = cmd.split_whitespace().collect();
-        assert_eq!(parts[..3], ["cplt", "config", "set"], "{cmd}");
+        assert_eq!(
+            parts,
+            ["cplt", "config", "set", "sandbox.yes", "true"],
+            "{cmd}"
+        );
         let info = config::lookup_key(parts[3]).expect("the named key exists");
         let mut doc = toml_edit::DocumentMut::new();
         config::set_value_in_doc(&mut doc, info, parts[4]).expect("the value is accepted");
