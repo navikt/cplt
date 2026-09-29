@@ -1205,6 +1205,19 @@ The directories a package manager puts on your `PATH` are read-only inside the s
 
 **Project-local installs are unaffected.** `npm install`, `pnpm install`, `bun install`, `cargo build`, `go build` and `pip install` in a venv write to the project or to a per-project cache. The sibling package and cache trees stay writable — `~/.bun/install`, `$PNPM_HOME/store`, `~/.npm`, `~/.cargo/registry` — so nothing about ordinary dependency resolution changes. A `--deny-path` or `deny.paths` entry covering a pnpm store (or `$PNPM_HOME`, or anything above it) still wins: cplt withholds that store's write allow and warns, instead of reopening writes under your deny (#597).
 
+**pnpm does not pick the shared store on its own.** With no `storeDir` configured, pnpm tests whether it can link into `$PNPM_HOME` by creating a temporary directory there. `$PNPM_HOME` is read-only, so the test fails. pnpm then falls back to a `.pnpm-store` next to the project (`<repo>/.pnpm-store`, or a parent directory it can write), and every repo and worktree downloads its dependencies again. Installs still work. To use the shared store inside cplt, give pnpm an absolute store dir, which skips the test:
+
+```bash
+# per session: pnpm 11+ reads pnpm_config_*, not npm_config_*
+export pnpm_config_store_dir="$HOME/Library/pnpm/store"
+cplt --pass-env pnpm_config_store_dir
+
+# or permanently, in pnpm-workspace.yaml or pnpm's global config.yaml
+storeDir: /Users/<you>/Library/pnpm/store
+```
+
+See [#637](https://github.com/navikt/cplt/issues/637) for why cplt does not set this for you.
+
 **The one that will bite you: mise bootstrap.** mise can no longer install or update *any* toolchain from inside cplt — not only the shimmed ones. The whole `installs/` tree is denied, not just each `<tool>/<version>/bin`, because mise creates a `bin/` only for tools that ship one: on a machine with 207 installed version directories, 55 did. The rest land flat at `installs/<tool>/<version>/<name>`, and in non-shim mode mise puts *that* directory on PATH, so a `bin`-anchored rule would have left the majority of tools as drop points.
 
 So a repo whose `mise.toml` pins a toolchain your host does not already have will not bootstrap inside cplt. `mise install` fails writing to `installs/`, and even a toolchain that installs cleanly cannot be reshimmed. Install it once outside:
