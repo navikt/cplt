@@ -832,11 +832,20 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
     // "not specifically gated", while `cplt exec` blocks the same push. Split
     // it the way the shell would have without the quotes, unless the word is
     // an existing path (a binary under a directory with a space in it).
+    // Quotes are honoured as the shell would: `HEAD:'main'` is `HEAD:main`,
+    // `-C "repo copy"` is one word.
     if let [only] = argv
         && only.split_whitespace().nth(1).is_some()
         && !Path::new(only).exists()
     {
-        let words: Vec<String> = only.split_whitespace().map(String::from).collect();
+        let Some(words) = shell_words(only) else {
+            return ExecExplain {
+                decision: Decision::Inconclusive,
+                reason: "unbalanced quotes in the command.".to_string(),
+                fix: Some("pass the command's words as separate arguments.".to_string()),
+                objection: None,
+            };
+        };
         return explain_exec(&words, ctx);
     }
     let base = command_basename(first);
@@ -1055,7 +1064,7 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
     // here. Saying only "not gated" read as "the push inside is allowed".
     if argv[1..]
         .iter()
-        .flat_map(|a| a.split_whitespace())
+        .flat_map(|a| a.split(|c: char| c.is_whitespace() || ";&|()`'\"".contains(c)))
         .any(|w| matches!(command_basename(w).as_str(), "git" | "gh"))
     {
         reason.push_str(
@@ -1069,6 +1078,48 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
         fix: None,
         objection: None,
     }
+}
+
+/// Split `s` into words the way `sh` would for plain words: whitespace
+/// separates, `'…'` and `"…"` group and are removed, `\` escapes the next
+/// character (outside single quotes). No expansion. `None` on an unclosed quote.
+fn shell_words(s: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some('"') | None, '\\') => {
+                word.extend(chars.next());
+                in_word = true;
+            }
+            (Some(_), c) => word.push(c),
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                in_word = true;
+            }
+            (None, c) if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            (None, c) => {
+                word.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if in_word {
+        words.push(word);
+    }
+    Some(words)
 }
 
 /// Setuid/setgid binaries (`/bin/ps`, `top`, `sudo`) behave differently in the
@@ -1789,17 +1840,77 @@ mod tests {
             let e = explain_exec(&[cmd.into()], &ctx);
             assert_eq!(e.decision, Decision::Blocked, "{cmd}: {}", e.reason);
         }
-        // A shell wrapping the push: exec decides at run time, and says so.
-        let e = explain_exec(
-            &["sh".into(), "-c".into(), "git push origin main".into()],
-            &ctx,
+        // Quotes are honoured like the shell does: a quoted `main` is still
+        // `main`, and `-C "a dir"` is one word. Needs a real repository (with
+        // a space in its path): the default-branch arm fails closed without one.
+        if let Some(git) = crate::git::trusted_git() {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo = tmp.path().join("repo copy");
+            std::fs::create_dir(&repo).unwrap();
+            #[allow(clippy::disallowed_methods)] // `git` is trusted_git(), not a bare name
+            let run = |args: &[&str]| {
+                let ok = std::process::Command::new(git)
+                    .args(args)
+                    .current_dir(&repo)
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .output()
+                    .is_ok_and(|o| o.status.success());
+                assert!(ok, "git {args:?}");
+            };
+            run(&["init", "-q"]);
+            run(&["symbolic-ref", "HEAD", "refs/heads/feat"]);
+            run(&[
+                "-c",
+                "user.email=t@e",
+                "-c",
+                "user.name=t",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "i",
+            ]);
+            run(&["branch", "main"]);
+            run(&["remote", "add", "origin", "https://github.com/o/o.git"]);
+            run(&[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ]);
+            let only = GitGuardPolicy {
+                enabled: true,
+                protect_default_branch_only: true,
+                ..GitGuardPolicy::default()
+            };
+            let mut only_ctx = exec_ctx(&gh, &only, false);
+            only_ctx.repo_facts = crate::gh_proxy::capture_repo_facts(git, &repo);
+            let dir = repo.display();
+            for push in ["HEAD:main", "HEAD:'main'", "\"HEAD:main\"", "feat:\"main\""] {
+                let cmd = format!("git -C \"{dir}\" push origin {push}");
+                let e = explain_exec(std::slice::from_ref(&cmd), &only_ctx);
+                assert_eq!(e.decision, Decision::Blocked, "{cmd}: {}", e.reason);
+            }
+            let cmd = format!("git -C '{dir}' push origin HEAD:'feat'");
+            let e = explain_exec(&[cmd], &only_ctx);
+            assert_eq!(e.decision, Decision::Allowed, "{}", e.reason);
+        }
+        let e = explain_exec(&["git push origin 'main".into()], &ctx);
+        assert_eq!(e.decision, Decision::Inconclusive, "{}", e.reason);
+        assert_eq!(
+            shell_words(r#"a 'b c' "d\"e" f\ g ''"#).unwrap(),
+            ["a", "b c", "d\"e", "f g", ""]
         );
-        assert_eq!(e.decision, Decision::Allowed);
-        assert!(
-            e.reason.contains("passes through the guards when it runs"),
-            "{}",
-            e.reason
-        );
+        // A shell wrapping the push: exec decides at run time, and says so,
+        // also when the git sits next to a shell operator.
+        for script in ["git push origin main", "cd repo&&git push origin main"] {
+            let e = explain_exec(&["sh".into(), "-c".into(), script.into()], &ctx);
+            assert_eq!(e.decision, Decision::Allowed);
+            assert!(
+                e.reason.contains("passes through the guards when it runs"),
+                "{script}: {}",
+                e.reason
+            );
+        }
         let e = explain_exec(&["node".into(), "app.js".into()], &ctx);
         assert!(!e.reason.contains("guards when it runs"), "{}", e.reason);
     }

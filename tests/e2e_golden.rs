@@ -1075,6 +1075,24 @@ fn golden_doctor_and_quoted_check_exec_give_the_launch_verdicts() {
             "doctor must print `{line}`:\n{out}{err}"
         );
     }
+
+    // Without refs/remotes/origin/HEAD the guard cannot tell a feature branch
+    // from the default one: doctor says so, with the guard's reason and fix.
+    assert!(common::git_ok(
+        repo.path(),
+        &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"]
+    ));
+    let (out, err, _) = launch(&home, repo.path(), &["doctor"]);
+    for want in [
+        "guard:       push feature  BLOCKED",
+        "git guard refuses a feature-branch push here",
+        "git remote set-head origin",
+    ] {
+        assert!(
+            out.contains(want),
+            "doctor must print `{want}`:\n{out}{err}"
+        );
+    }
     let _ = std::fs::remove_dir_all(&home);
 }
 
