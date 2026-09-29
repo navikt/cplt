@@ -1205,15 +1205,16 @@ The directories a package manager puts on your `PATH` are read-only inside the s
 
 **Project-local installs are unaffected.** `npm install`, `pnpm install`, `bun install`, `cargo build`, `go build` and `pip install` in a venv write to the project or to a per-project cache. The sibling package and cache trees stay writable — `~/.bun/install`, `$PNPM_HOME/store`, `~/.npm`, `~/.cargo/registry` — so installs keep working. One thing does change: pnpm puts its store next to the project instead of in `$PNPM_HOME/store` (see below). A `--deny-path` or `deny.paths` entry covering a pnpm store (or `$PNPM_HOME`, or anything above it) still wins: cplt withholds that store's write allow and warns, instead of reopening writes under your deny (#597).
 
-**pnpm does not pick the shared store on its own.** With no `storeDir` configured, pnpm tests whether it can link into `$PNPM_HOME` by creating a temporary directory there. `$PNPM_HOME` is read-only, so the test fails. pnpm then falls back to a `.pnpm-store` next to the project (`<repo>/.pnpm-store`, or a parent directory it can write), and every repo and worktree downloads its dependencies again. Installs still work. To use the shared store inside cplt, give pnpm an absolute store dir, which skips the test:
+**pnpm does not pick the shared store on its own.** With no `storeDir` configured, pnpm tests whether it can link into `$PNPM_HOME` by creating a temporary directory there. `$PNPM_HOME` is read-only, so the test fails. pnpm then puts a `.pnpm-store` in the highest ancestor of the project it can write to. That can be the repo itself, a parent directory, or somewhere like `/private/tmp` for a project under `/tmp`. Every repo and worktree then downloads its dependencies again. Installs still work. To use the shared store inside cplt, give pnpm an absolute store dir, which skips the test. Use the parent of what `pnpm store path` prints *outside* cplt, without the `/v10` or `/v11` at the end. By default that is `~/Library/pnpm/store` on macOS and `~/.local/share/pnpm/store` on Linux.
 
 ```bash
 # per session: pnpm 11+ reads pnpm_config_*, not npm_config_*
-export pnpm_config_store_dir="$HOME/Library/pnpm/store"
+export pnpm_config_store_dir="$(dirname "$(pnpm store path)")"
 cplt --pass-env pnpm_config_store_dir
 
-# or permanently, in pnpm-workspace.yaml or pnpm's global config.yaml
-storeDir: /Users/<you>/Library/pnpm/store
+# or permanently, in pnpm-workspace.yaml or pnpm's global config.yaml,
+# as an absolute path:
+storeDir: /absolute/path/to/pnpm/store
 ```
 
 See [#637](https://github.com/navikt/cplt/issues/637) for why cplt does not set this for you.
