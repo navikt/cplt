@@ -470,7 +470,7 @@ pub struct ProxyConfig {
     pub port: Option<u16>,
     /// Path to blocked domains file.
     pub blocked_domains: Option<String>,
-    /// Path to allowed domains file. When set, only listed domains are permitted.
+    /// Path to allowed domains file. When set, only listed domains (plus the agent's own hosts) are permitted.
     pub allowed_domains: Option<String>,
     /// Opt-in fail-closed networking (issue #52, default: false). When true, the
     /// proxy restricts egress to the running agent's built-in default allowlist
