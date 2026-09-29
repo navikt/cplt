@@ -449,6 +449,11 @@ fn detect_jvm(ctx: &DetectContext) -> DetectorOutput {
 
     // Check for credentials/proxy config files
     if is_gradle {
+        // The Gradle client reaches its daemon over loopback on an ephemeral
+        // port, so a fixed allow.localhost port cannot cover it. Without this
+        // every `./gradlew` fails with "Could not connect to the Gradle
+        // daemon", even under --no-daemon (it still forks a single-use one).
+        suggestions.push(Suggestion::Propose(SandboxFlag::AllowLocalhostAny));
         suggestions.push(Suggestion::AllowRead(
             "~/.gradle/gradle.properties".to_string(),
         ));
@@ -2642,6 +2647,33 @@ mod tests {
             report
                 .suggestions
                 .contains(&Suggestion::Propose(SandboxFlag::AllowJvmAttach))
+        );
+    }
+
+    #[test]
+    fn jvm_gradle_proposes_localhost_any_for_the_daemon() {
+        // The Gradle client talks to its daemon over loopback on an ephemeral
+        // port; without the grant `./gradlew test` fails with "Could not
+        // connect to the Gradle daemon", also under --no-daemon.
+        let dir = setup_dir();
+        fs::write(dir.path().join("settings.gradle.kts"), "").unwrap();
+        let report = detect_project(dir.path());
+        assert!(
+            report
+                .suggestions
+                .contains(&Suggestion::Propose(SandboxFlag::AllowLocalhostAny))
+        );
+    }
+
+    #[test]
+    fn jvm_maven_does_not_propose_localhost_any() {
+        let dir = setup_dir();
+        fs::write(dir.path().join("pom.xml"), "<project/>").unwrap();
+        let report = detect_project(dir.path());
+        assert!(
+            !report
+                .suggestions
+                .contains(&Suggestion::Propose(SandboxFlag::AllowLocalhostAny))
         );
     }
 
