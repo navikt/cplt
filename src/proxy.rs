@@ -2381,8 +2381,10 @@ pub fn classify_resolved(
     // A name that resolves only to loopback (`127.0.0.1.nip.io`, `lvh.me`) is a
     // local target like the literal carve-out: forwarding it would make the
     // upstream resolve the name on ITS host and reach a service there, not on
-    // the user's machine. So it is connected directly, never forwarded.
-    if via_upstream && !allowed.iter().all(|a| a.ip().is_loopback()) {
+    // the user's machine. So it is connected directly, never forwarded — but
+    // only when the user opted into localhost. A private-domain name whose
+    // local answer is loopback, without that opt-in, keeps going upstream.
+    if via_upstream && !(localhost_opt_in && allowed.iter().all(|a| a.ip().is_loopback())) {
         ConnectRoute::Upstream
     } else {
         ConnectRoute::Direct(allowed)
@@ -2893,6 +2895,12 @@ mod tests {
         // public one, which is forwarded.
         assert_eq!(
             classify_resolved(&[lo, public], true, false, false, false),
+            ConnectRoute::Upstream
+        );
+        // A private-domain name whose local answer is loopback is not a local
+        // target without the localhost opt-in, so it is still forwarded.
+        assert_eq!(
+            classify_resolved(&[lo], true, false, false, true),
             ConnectRoute::Upstream
         );
     }
