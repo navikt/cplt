@@ -750,34 +750,51 @@ fn detect_go(ctx: &DetectContext) -> DetectorOutput {
     })
 }
 
-/// Whether Go source has an import spec for `net/http/httptest`: a line that
-/// is the path alone (inside an `import (...)` block), with an alias, or after
-/// `import`, in either string form. A mention in a line comment or an ordinary
-/// string expression does not count.
-// ponytail: line-based, so a spec inside a /* */ block comment still matches;
-// use a Go tokenizer if that false positive ever matters.
-fn imports_httptest(src: &str) -> bool {
-    src.lines().any(|line| {
-        let code = line.split("//").next().unwrap_or_default();
+/// Whether Go source imports `net/http/httptest` and starts one of its test
+/// servers, which listen on a random loopback port. `NewRequest` and
+/// `NewRecorder` never open a socket, so they do not count.
+///
+/// Both halves are needed. The import alone also matches a bare
+/// `"net/http/httptest"` line inside a raw-string fixture (analyzer and
+/// codegen tests carry whole Go files that way), and a false positive here
+/// proposes `allow_localhost_any`, which on Linux drops every Landlock TCP
+/// connect rule.
+// ponytail: line-based, not a Go parser. A fixture that holds both an import
+// spec and a server call, or a spec inside a /* */ comment, still matches;
+// use go/parser-grade tokenizing if that ever shows up in a real repository.
+fn starts_httptest_server(src: &str) -> bool {
+    let code = |line: &str| line.split("//").next().unwrap_or_default().to_string();
+    let aliases = src.lines().filter_map(|line| {
+        let code = code(line);
         let tokens: Vec<&str> = code.split_whitespace().collect();
-        let Some((path, rest)) = tokens.split_last() else {
-            return false;
-        };
+        let (path, rest) = tokens.split_last()?;
         if *path != "\"net/http/httptest\"" && *path != "`net/http/httptest`" {
-            return false;
+            return None;
         }
-        let is_alias = |t: &str| {
-            t.chars()
-                .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+        let alias = match rest {
+            [] | ["import"] => "httptest",
+            [alias] | ["import", alias] => alias,
+            _ => return None,
         };
-        match rest {
-            [] => true,
-            ["import"] => true,
-            [alias] => is_alias(alias),
-            ["import", alias] => is_alias(alias),
-            _ => false,
-        }
-    })
+        let valid = alias
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '.');
+        (valid && alias != "_").then(|| alias.to_string())
+    });
+    let calls: Vec<String> = aliases
+        .flat_map(|alias| {
+            let prefix = if alias == "." {
+                String::new()
+            } else {
+                format!("{alias}.")
+            };
+            ["NewServer(", "NewTLSServer(", "NewUnstartedServer("].map(|f| format!("{prefix}{f}"))
+        })
+        .collect();
+    !calls.is_empty()
+        && src
+            .lines()
+            .any(|line| calls.iter().any(|c| code(line).contains(c.as_str())))
 }
 
 /// Max `_test.go` files [`find_go_httptest`] reads before giving up.
@@ -820,7 +837,10 @@ fn find_go_httptest(ctx: &DetectContext) -> Option<String> {
                     return None;
                 }
                 let child = child.to_str()?.to_string();
-                if ctx.read_text(&child).is_some_and(|c| imports_httptest(&c)) {
+                if ctx
+                    .read_text(&child)
+                    .is_some_and(|c| starts_httptest_server(&c))
+                {
                     return Some(child);
                 }
             }
@@ -2926,30 +2946,43 @@ services:
         fs::create_dir_all(dir.path().join("internal/api")).unwrap();
         fs::write(
             dir.path().join("internal/api/api_test.go"),
-            "package api\n\nimport (\n\t\"net/http/httptest\"\n\t\"testing\"\n)\n",
+            "package api\n\nimport (\n\t\"net/http/httptest\"\n\t\"testing\"\n)\n\nfunc TestAPI(t *testing.T) {\n\ts := httptest.NewServer(nil)\n\tdefer s.Close()\n}\n",
         )
         .unwrap();
         assert!(go_localhost_any(dir.path()));
     }
 
     #[test]
-    fn go_httptest_import_forms() {
-        for src in [
+    fn go_httptest_server_forms() {
+        let server = "\nfunc TestX(t *testing.T) { s := httptest.NewServer(h) }";
+        for imports in [
             "import \"net/http/httptest\"",
             "import `net/http/httptest`",
-            "import ht \"net/http/httptest\"",
             "import (\n\t\"testing\"\n\t\"net/http/httptest\" // servers\n)",
-            "import (\n\t_ `net/http/httptest`\n)",
         ] {
-            assert!(imports_httptest(src), "{src}");
+            let src = format!("{imports}{server}");
+            assert!(starts_httptest_server(&src), "{src}");
         }
+        assert!(starts_httptest_server(
+            "import ht \"net/http/httptest\"\nvar s = ht.NewTLSServer(h)"
+        ));
+        assert!(starts_httptest_server(
+            "import . \"net/http/httptest\"\nvar s = NewUnstartedServer(h)"
+        ));
         for src in [
-            "// uses \"net/http/httptest\" elsewhere",
-            "var p = \"net/http/httptest\"",
+            // A mention is not an import.
+            &format!("// uses \"net/http/httptest\"{server}"),
+            &format!("var p = \"net/http/httptest\"{server}"),
             "paths := []string{\n\t\"net/http/httptest\",\n}",
-            "import \"net/http\"",
+            // Imported, but no socket: NewRequest and NewRecorder are in-memory.
+            "import \"net/http/httptest\"\nvar r = httptest.NewRecorder()",
+            "import _ \"net/http/httptest\"\nvar s = httptest.NewServer(h)",
+            // Server call only in a comment.
+            "import \"net/http/httptest\"\n// httptest.NewServer(h)",
+            // Analyzer/codegen fixture: a whole Go file in a raw string.
+            "import \"testing\"\n\nconst fixture = `package x\n\nimport (\n\t\"net/http/httptest\"\n)\n`\n",
         ] {
-            assert!(!imports_httptest(src), "{src}");
+            assert!(!starts_httptest_server(src), "{src}");
         }
     }
 
@@ -2979,7 +3012,7 @@ services:
             fs::create_dir_all(dir.path().join(sub)).unwrap();
             fs::write(
                 dir.path().join(sub).join("x_test.go"),
-                "import \"net/http/httptest\"\n",
+                "import \"net/http/httptest\"\nvar s = httptest.NewServer(nil)\n",
             )
             .unwrap();
         }
