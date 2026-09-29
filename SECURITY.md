@@ -945,7 +945,7 @@ By default `cplt` clears the child process environment and re-adds only safe var
 
 **How it works:**
 1. `cmd.env_clear()` removes all environment variables
-2. Variables matching `ENV_ALLOWLIST` (49 safe vars) are re-added from the parent process
+2. Variables matching `ENV_ALLOWLIST` (77 safe vars) are re-added from the parent process
 3. Variables matching `ENV_PREFIX_ALLOWLIST` (9 prefixes: `LC_*`, `COPILOT_*`, `COREPACK_*`, `MISE_*`, `NVM_*`, `PYENV_*`, `SDKMAN_*`, `YARN_*`, `OTEL_*`) are re-added
 4. `--pass-env VAR` adds explicit vars (repeatable)
 5. `ENV_ALWAYS_DENY` vars (`NO_COLOR`, `FORCE_COLOR`, `SSH_AUTH_SOCK`, `SSH_AGENT_PID`) are always stripped

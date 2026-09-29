@@ -3861,6 +3861,9 @@ fn env_allowlist_includes_essential_vars() {
     assert!(ENV_ALLOWLIST.contains(&"GOPATH"));
     assert!(ENV_ALLOWLIST.contains(&"CARGO_HOME"));
 
+    // Go build flags from the user's shell, e.g. -buildvcs=false (#617)
+    assert!(ENV_ALLOWLIST.contains(&"GOFLAGS"));
+
     // Java/Maven build options (consistent with NODE_OPTIONS)
     assert!(ENV_ALLOWLIST.contains(&"MAVEN_OPTS"));
     assert!(ENV_ALLOWLIST.contains(&"JAVA_TOOL_OPTIONS"));
@@ -7824,6 +7827,24 @@ fn env_dotnet_do_not_use_msbuild_server_respects_pass_env() {
         "0",
         "--pass-env should prevent forcing DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1"
     );
+}
+
+/// `GOFLAGS` from the user's shell reaches the sandbox unchanged, so
+/// `GOFLAGS=-buildvcs=false` fixes Go builds in a git worktree (#617).
+#[test]
+fn env_goflags_passes_through() {
+    let parent = make_env(&[("HOME", "/Users/test"), ("GOFLAGS", "-buildvcs=false")]);
+    let env = build_sandbox_env(
+        &parent,
+        &[],
+        false,
+        &[],
+        None,
+        None,
+        cplt::agent::Agent::Copilot,
+    );
+    let goflags = env.vars.iter().find(|(k, _)| k == "GOFLAGS");
+    assert_eq!(goflags.map(|(_, v)| v.as_str()), Some("-buildvcs=false"));
 }
 
 // ============================================================
