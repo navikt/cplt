@@ -3656,7 +3656,7 @@ fn start_proxy_if_enabled(
             if allowlist_decision.use_default_allowlist {
                 "agent defaults"
             } else {
-                "the agent's own hosts"
+                "the agent's hosts"
             },
             extra
         ));
