@@ -91,9 +91,11 @@ const MAX_CONNECTIONS: usize = 64;
 /// Overall deadline for connecting to one target, across all its addresses.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Per-address cap while another resolved address is still left to try, so one
-/// dead address (broken IPv6, a dead anycast node) costs 3 s, not the whole
-/// deadline. The last address gets whatever remains of [`CONNECT_TIMEOUT`].
-const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
+/// dead address (broken IPv6, a dead anycast node) costs 2 s, not the whole
+/// deadline. 2 s still covers a far-away handshake plus the first SYN
+/// retransmit (1 s on Linux and macOS). The last address gets whatever remains
+/// of [`CONNECT_TIMEOUT`].
+const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Maximum number of normalized host records retained in one proxy snapshot.
 pub const OBSERVED_HOST_LIMIT: usize = 1_024;
@@ -1287,6 +1289,16 @@ fn interleave_families(addrs: &[std::net::SocketAddr]) -> Vec<std::net::SocketAd
     }
 }
 
+/// The timeout for one connect attempt with `left` of the deadline remaining:
+/// capped while another address is still to come, the whole rest for the last.
+fn attempt_timeout(left: Duration, last: bool) -> Duration {
+    if last {
+        left
+    } else {
+        left.min(CONNECT_ATTEMPT_TIMEOUT)
+    }
+}
+
 /// Connect to the first reachable address, trying them in RFC 8305 order.
 ///
 /// Each attempt but the last is capped at [`CONNECT_ATTEMPT_TIMEOUT`]; all of
@@ -1296,7 +1308,7 @@ fn interleave_families(addrs: &[std::net::SocketAddr]) -> Vec<std::net::SocketAd
 /// failure. Callers must have policy-checked every address in `addrs`.
 ///
 /// ponytail: sequential, not raced with a 250 ms stagger as full happy eyeballs
-/// does; a dead first address costs up to 3 s. Race them if that shows up.
+/// does; a dead first address costs up to 2 s. Race them if that shows up.
 fn connect_any(
     addrs: &[std::net::SocketAddr],
 ) -> Result<(TcpStream, std::net::SocketAddr, String), String> {
@@ -1309,12 +1321,7 @@ fn connect_any(
             failures.push(format!("{addr}: not tried, deadline passed"));
             break;
         }
-        let timeout = if i + 1 == ordered.len() {
-            left
-        } else {
-            left.min(CONNECT_ATTEMPT_TIMEOUT)
-        };
-        match TcpStream::connect_timeout(addr, timeout) {
+        match TcpStream::connect_timeout(addr, attempt_timeout(left, i + 1 == ordered.len())) {
             Ok(stream) => return Ok((stream, *addr, failures.join("; "))),
             Err(e) => failures.push(format!("{addr}: {e}")),
         }
@@ -1609,7 +1616,8 @@ fn handle_connect(
             }
         }
         ConnectRoute::Direct(addrs) => {
-            connect_direct(client, &addrs, target, state, classification);
+            let skipped: Vec<_> = resolved.iter().filter(|a| !addrs.contains(a)).collect();
+            connect_direct(client, &addrs, &skipped, target, state, classification);
         }
     }
 }
@@ -1619,26 +1627,40 @@ fn handle_connect(
 ///
 /// Precondition: every cplt policy check has passed — the pre-DNS gates in
 /// [`classify_connect`] and the post-DNS gates in [`classify_resolved`], which
-/// checked every address in `addrs`. This function filters nothing. It connects
+/// checked every address in `addrs`. This function filters nothing; `skipped`
+/// is the part of the DNS answer the guard dropped, only for the log line. It connects
 /// to the resolved addresses rather than the hostname so DNS is never consulted
 /// a second time (no TOCTOU between the checked answer and the connection).
 fn connect_direct(
     mut client: TcpStream,
     addrs: &[std::net::SocketAddr],
+    skipped: &[&std::net::SocketAddr],
     target: &str,
     state: &ProxyState,
     classification: &mut ClassificationGuard,
 ) {
     let (remote, status) = match connect_any(addrs) {
-        Ok((s, _, failed)) if failed.is_empty() => {
+        Ok((s, _, failed)) if failed.is_empty() && skipped.is_empty() => {
             s.set_nodelay(true).ok();
             (s, "CONNECTED".to_string())
         }
-        // A fallback happened: say which address answered and why the earlier
-        // ones did not, so a broken IPv6 route or dead node is visible.
+        // A fallback happened or the guard dropped part of the answer: say which
+        // address answered, why earlier ones did not and what was skipped, so a
+        // broken IPv6 route, a dead node or a mixed answer shows in the audit.
         Ok((s, addr, failed)) => {
             s.set_nodelay(true).ok();
-            (s, format!("CONNECTED (via {addr} after {failed})"))
+            let after = if failed.is_empty() {
+                String::new()
+            } else {
+                format!(" after {failed}")
+            };
+            let skip = if skipped.is_empty() {
+                String::new()
+            } else {
+                let list: Vec<_> = skipped.iter().map(ToString::to_string).collect();
+                format!("; skipped blocked {}", list.join(", "))
+            };
+            (s, format!("CONNECTED (via {addr}{after}{skip})"))
         }
         Err(e) => {
             log_connection(
@@ -1704,7 +1726,18 @@ fn connect_via_upstream(
         return;
     }
     let mut remote = match connect_any(&upstream_addrs) {
-        Ok((s, _, _)) => {
+        Ok((s, addr, failed)) => {
+            if !failed.is_empty() {
+                // Logged against the upstream's own address, not the target:
+                // `log_connection` redacts userinfo only for CONNECT lines.
+                log_connection(
+                    state,
+                    None,
+                    "UPSTREAM",
+                    &addr.to_string(),
+                    &format!("UPSTREAM-FALLBACK (after {failed})"),
+                );
+            }
             s.set_nodelay(true).ok();
             s
         }
@@ -2309,14 +2342,14 @@ pub(crate) fn classify_resolved(
         };
     }
 
-    // EVERY address is checked, and one bad address refuses the whole answer.
-    // The connect falls back through the list, so a private address anywhere in
-    // it would be reached as soon as the ones before it fail — and whoever
-    // controls the DNS answer can make them fail.
+    // EVERY address is checked; the ones that fail are dropped and only the
+    // rest are ever connected to. The connect falls back through the list, so a
+    // blocked address left in it would be reached as soon as the ones before it
+    // fail — and whoever controls the DNS answer can make them fail. The answer
+    // is refused only when nothing passes.
+    let mut first_refusal = None;
+    let mut allowed = Vec::with_capacity(resolved.len());
     for addr in resolved {
-        if localhost_connect_allowed && !addr.ip().is_loopback() {
-            return ConnectRoute::Refuse(Refusal::ResolvedNonLoopback);
-        }
         // The resolved IP, not the hostname, decides. `*.localhost` is supposed
         // to resolve to 127.0.0.1, but a compromised resolver or /etc/hosts entry
         // could point `evil.localhost` at 169.254.169.254 or an internal host;
@@ -2325,15 +2358,28 @@ pub(crate) fn classify_resolved(
         // (`localhost_opt_in`), NOT because the name literally spells
         // "localhost" — so a loopback-aliasing name (`lvh.me`,
         // `127.0.0.1.nip.io`) works with an opt-in and is blocked without.
-        if resolved_ip_is_blocked(&addr.ip(), host_is_private_domain, localhost_opt_in) {
-            return ConnectRoute::Refuse(Refusal::ResolvedPrivate);
+        let refusal = if localhost_connect_allowed && !addr.ip().is_loopback() {
+            Some(Refusal::ResolvedNonLoopback)
+        } else if resolved_ip_is_blocked(&addr.ip(), host_is_private_domain, localhost_opt_in) {
+            Some(Refusal::ResolvedPrivate)
+        } else {
+            None
+        };
+        match refusal {
+            Some(r) => {
+                first_refusal.get_or_insert(r);
+            }
+            None => allowed.push(*addr),
         }
+    }
+    if allowed.is_empty() {
+        return ConnectRoute::Refuse(first_refusal.unwrap_or(Refusal::ResolvedPrivate));
     }
 
     if via_upstream {
         ConnectRoute::Upstream
     } else {
-        ConnectRoute::Direct(resolved.to_vec())
+        ConnectRoute::Direct(allowed)
     }
 }
 
@@ -2462,7 +2508,7 @@ fn log_connection(
             "BLOCKED" | "BLOCKED-PRIVATE" | "BLOCKED-PORT" | "BLOCKED-ALLOWLIST" | "LIMIT" => {
                 ui::color(ui::RED)
             }
-            "CONNECTED" => ui::color(ui::GREEN),
+            s if s.starts_with("CONNECTED") => ui::color(ui::GREEN),
             _ => ui::color(ui::YELLOW),
         };
         let timestamp = chrono_now();
@@ -2837,17 +2883,32 @@ mod tests {
     }
 
     #[test]
-    fn a_private_address_anywhere_in_the_answer_refuses_it() {
-        // The connect falls back through the answer, so a blocked address in
-        // ANY position would be reached once the ones before it fail.
+    fn blocked_addresses_are_dropped_from_a_mixed_answer() {
+        // Only addresses that pass the guard are ever connected to, so a blocked
+        // one cannot be reached by making the ones before it fail.
         let public = addr("93.184.216.34");
         let ula: std::net::SocketAddr = "[fd00::1]:443".parse().unwrap();
         for via_upstream in [false, true] {
-            for answer in [
-                vec![public, addr("169.254.169.254")],
-                vec![addr("10.0.0.5"), public],
-                vec![public, public, ula],
+            let keep = |kept: Vec<std::net::SocketAddr>| {
+                if via_upstream {
+                    ConnectRoute::Upstream
+                } else {
+                    ConnectRoute::Direct(kept)
+                }
+            };
+            for (answer, kept) in [
+                (vec![public, addr("169.254.169.254")], vec![public]),
+                (vec![addr("10.0.0.5"), public], vec![public]),
+                (vec![public, public, ula], vec![public, public]),
             ] {
+                assert_eq!(
+                    classify_resolved(&answer, via_upstream, false, false, false),
+                    keep(kept),
+                    "via_upstream={via_upstream} answer={answer:?}"
+                );
+            }
+            // Nothing passes: refused.
+            for answer in [vec![addr("10.0.0.5")], vec![ula, addr("169.254.169.254")]] {
                 assert_eq!(
                     classify_resolved(&answer, via_upstream, false, false, false),
                     ConnectRoute::Refuse(Refusal::ResolvedPrivate),
@@ -2855,10 +2916,11 @@ mod tests {
                 );
             }
         }
-        // The localhost carve-out needs every address to be loopback.
+        // The localhost carve-out keeps only the loopback addresses.
+        let lo = addr("127.0.0.1");
         assert_eq!(
-            classify_resolved(&[addr("127.0.0.1"), public], false, true, true, false),
-            ConnectRoute::Refuse(Refusal::ResolvedNonLoopback)
+            classify_resolved(&[lo, public], false, true, true, false),
+            ConnectRoute::Direct(vec![lo])
         );
         // An all-public answer keeps every address, in order.
         let other = addr("93.184.216.35");
@@ -2866,6 +2928,16 @@ mod tests {
             classify_resolved(&[public, other], false, false, false, false),
             ConnectRoute::Direct(vec![public, other])
         );
+    }
+
+    #[test]
+    fn the_last_attempt_gets_the_rest_of_the_deadline() {
+        let s = Duration::from_secs;
+        assert_eq!(attempt_timeout(s(10), false), CONNECT_ATTEMPT_TIMEOUT);
+        assert_eq!(attempt_timeout(s(10), true), s(10));
+        assert_eq!(attempt_timeout(s(1), false), s(1));
+        assert_eq!(attempt_timeout(s(6), true), s(6));
+        assert!(CONNECT_ATTEMPT_TIMEOUT < CONNECT_TIMEOUT);
     }
 
     #[test]
