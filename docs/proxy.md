@@ -29,6 +29,8 @@ cplt config set proxy.allowed_domains "~/.config/cplt/allowed-domains.txt"
 cplt config set proxy.log_file "~/.config/cplt/proxy.log"
 ```
 
+The allowlist file must exist, or cplt refuses to start. The agent's own hosts are always allowed on top of it, but package registries such as npm and Maven Central are not: add `cplt config set proxy.default_allowlist true` to get them. See [Allowlist](#allowlist).
+
 <details>
 <summary>CLI flags reference (override for a single run)</summary>
 
@@ -341,7 +343,7 @@ To keep the agent away from one of its own hosts anyway, put it on the blocklist
 >
 > A configured `allowed_domains` file that does not exist is a startup error rather than a silent fallback to allow-all. Use `--allow-all-domains` to allow everything for a single run without editing config.
 
-> **Note:** Both the allowlist and blocklist are re-read from disk every ~5 seconds (TTL-cached), so you can edit them live mid-session and changes take effect within seconds without restarting cplt. If a file becomes unreadable or is deleted at runtime, the last-known-good list is kept (fail-safe); if it becomes *empty*, that is a real edit and the allowlist tightens to blocking everything. At startup, an unreadable or missing allowlist makes cplt exit with an error (fail-closed).
+> **Note:** Both the allowlist and blocklist are re-read from disk every ~5 seconds (TTL-cached), so you can edit them live mid-session and changes take effect within seconds without restarting cplt. If a file becomes unreadable or is deleted at runtime, the last-known-good list is kept (fail-safe); if it becomes *empty*, that is a real edit and the allowlist tightens to blocking everything but the agent's own hosts. At startup, an unreadable or missing allowlist makes cplt exit with an error (fail-closed).
 >
 > The `allow_private_domains` list in `config.toml` is also re-read every ~5 seconds. Domains from other sources, meaning `--allow-private-domain` CLI flags and trust-approved `[propose.proxy] allow_private_domains` entries from a repo `.cplt.toml`, are preserved for the whole session regardless of config changes.
 
