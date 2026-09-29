@@ -538,7 +538,29 @@ pub fn agent_hosts_finding(agent: Agent, policy: &NetPolicy) -> Option<Finding> 
         .map(|h| (*h, crate::check::explain_domain(policy, h, 443, true)))
         .filter(|(_, e)| e.decision != crate::check::Decision::Allowed)
         .collect();
-    let (_, first) = blocked.first()?;
+    if blocked.is_empty() {
+        return None;
+    }
+    // One fix per distinct cause, so a mix (an agent host on the blocklist, a
+    // registry off the allowlist) names every remedy it needs. Every active
+    // allowlist carries the agent's own hosts (#605), so BLOCKED-ALLOWLIST is
+    // only ever a registry, which one key merges; an agent host is blocked by
+    // a blocklist, and its explain fix points there.
+    let mut fixes: Vec<String> = Vec::new();
+    for (_, e) in &blocked {
+        let fix = if e.status == "BLOCKED-ALLOWLIST" {
+            Some(
+                "set proxy.default_allowlist = true (or pass --default-allowlist) to merge the \
+                 package registries into your allowed_domains, or add them to that file"
+                    .to_string(),
+            )
+        } else {
+            e.fix.clone()
+        };
+        if let Some(fix) = fix.filter(|f| !fixes.contains(f)) {
+            fixes.push(fix);
+        }
+    }
     let mut named: Vec<String> = blocked
         .iter()
         .take(3)
@@ -554,16 +576,7 @@ pub fn agent_hosts_finding(agent: Agent, policy: &NetPolicy) -> Option<Finding> 
             agent.display_name(),
             named.join(", ")
         ),
-        // Under an allowlist one fix covers every host: merge the agent's own.
-        if first.status == "BLOCKED-ALLOWLIST" {
-            Some(
-                "set proxy.default_allowlist = true (or pass --default-allowlist) to merge the \
-                 agent's hosts into your allowed_domains, or add them to that file"
-                    .to_string(),
-            )
-        } else {
-            first.fix.clone()
-        },
+        (!fixes.is_empty()).then(|| fixes.join("; ")),
     ))
 }
 
@@ -1171,15 +1184,47 @@ mod tests {
         }
     }
 
-    /// The #604 setup: an allowlist file without the agent's own hosts.
+    /// The #604 setup after #605: a user allowlist gets the agent's own hosts
+    /// but not the registries, and the fix is the key that merges them.
     #[test]
-    fn an_allowlist_without_the_agent_hosts_warns() {
-        let f = agent_hosts_finding(Agent::Copilot, &net(&["example.com"], true, &[]))
-            .expect("copilot hosts are blocked");
+    fn an_allowlist_without_the_registries_warns() {
+        let mut allowed = Agent::Copilot.infra_domains();
+        allowed.push("example.com");
+        let f = agent_hosts_finding(Agent::Copilot, &net(&allowed, true, &[]))
+            .expect("registries are blocked");
         assert_eq!(f.level, Level::Warning);
         assert!(f.message.contains("(BLOCKED-ALLOWLIST)"), "{}", f.message);
         assert!(f.message.contains(" more."), "{}", f.message);
-        assert!(f.fix.unwrap().contains("default_allowlist = true"));
+        let fix = f.fix.unwrap();
+        assert!(fix.contains("default_allowlist = true"), "{fix}");
+        assert!(fix.contains("package registries"), "{fix}");
+    }
+
+    /// Only a blocklist can block an agent host now, so that is where the fix
+    /// points, not at an allowlist key.
+    #[test]
+    fn a_blocklisted_agent_host_points_at_the_blocklist() {
+        let defaults = Agent::Copilot.default_allowed_domains();
+        let f = agent_hosts_finding(
+            Agent::Copilot,
+            &net(&defaults, true, &["githubcopilot.com"]),
+        )
+        .expect("blocked agent host");
+        assert!(
+            f.message.contains("githubcopilot.com (BLOCKED)"),
+            "{}",
+            f.message
+        );
+        assert!(f.fix.unwrap().contains("remove it from that file"));
+
+        // Mixed causes name both remedies.
+        let mut allowed = Agent::Copilot.infra_domains();
+        allowed.push("example.com");
+        let f = agent_hosts_finding(Agent::Copilot, &net(&allowed, true, &["githubcopilot.com"]))
+            .expect("mixed");
+        let fix = f.fix.unwrap();
+        assert!(fix.contains("remove it from that file"), "{fix}");
+        assert!(fix.contains("default_allowlist = true"), "{fix}");
     }
 
     #[test]
