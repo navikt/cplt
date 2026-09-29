@@ -348,15 +348,16 @@ pub fn generate_session_brief(facts: &BriefFacts) -> String {
     } else if net.allowlist_in_force && net.default_allowlist {
         out.push_str(
             "- Only the agent's built-in allowlist (plus any configured \
-             `allowed_domains`) is reachable. The proxy refuses everything \
-             else.\n",
+             `allowed_domains` and `allow.domains`) is reachable. The proxy \
+             refuses everything else.\n",
         );
     } else if net.allowlist_in_force {
-        // An `allowed_domains` file with no built-in list: the file alone is
-        // the allowlist (#607).
+        // An `allowed_domains` file with no built-in list: the file plus the
+        // agent's own hosts (#605) is the allowlist (#607).
         out.push_str(
-            "- Only the domains in the configured `allowed_domains` file are \
-             reachable. The proxy refuses everything else.\n",
+            "- Only the domains in the configured `allowed_domains` file, plus the \
+             agent's own hosts and any `allow.domains`, are reachable. The proxy \
+             refuses everything else.\n",
         );
     } else if net.default_allowlist {
         // `proxy.default_allowlist = true` with `--no-proxy` is a reachable
@@ -1320,7 +1321,10 @@ mod tests {
         assert!(facts.network.allowlist_in_force);
         let brief = generate_session_brief(&facts);
         assert!(
-            brief.contains("Only the domains in the configured `allowed_domains` file"),
+            brief.contains(
+                "Only the domains in the configured `allowed_domains` file, plus the \
+                 agent's own hosts and any `allow.domains`, are reachable"
+            ),
             "{brief}"
         );
         assert!(!brief.contains("built-in allowlist"), "{brief}");
