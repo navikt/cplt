@@ -1186,7 +1186,7 @@ Supported ecosystems:
 | Docker | `Dockerfile`, `compose.yml` | `allow_docker` (dangerous), exposed ports |
 | Python | `pyproject.toml`, `requirements.txt` | localhost ports (for Django/FastAPI) |
 | Rust | `Cargo.toml` | (works with defaults) |
-| Go | `go.mod` | (works with defaults) |
+| Go | `go.mod` | `allow_localhost_any` when a `_test.go` file imports `net/http/httptest` (its test servers listen on a random loopback port); otherwise nothing |
 | Playwright | `@playwright/test` or `"playwright"` in package.json | `allow_cache_exec` (personal config hint) |
 | Environment secrets | `.env.example` | `deny.env` for sensitive variables |
 | Spring Boot | `application.yml` + Spring in Gradle | localhost 8080, PostgreSQL port |

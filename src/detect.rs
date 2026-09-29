@@ -727,14 +727,79 @@ fn detect_go(ctx: &DetectContext) -> DetectorOutput {
         return DetectorOutput::none();
     }
 
-    // Go projects work well with cplt defaults — minimal permissions needed
+    let mut signals = vec![Signal::FileExists {
+        path: "go.mod".to_string(),
+    }];
+    let mut suggestions = Vec::new();
+
+    // `httptest.NewServer` listens on 127.0.0.1 with an ephemeral port, so a
+    // fixed allow.localhost port cannot cover it; without the grant the test
+    // fails with "dial tcp 127.0.0.1:<port>: connect: operation not permitted".
+    if let Some(path) = find_go_httptest(ctx) {
+        signals.push(Signal::FileContains {
+            path,
+            reason: "uses net/http/httptest, which listens on a random loopback port",
+        });
+        suggestions.push(Suggestion::Propose(SandboxFlag::AllowLocalhostAny));
+    }
+
     DetectorOutput::detected(Detection {
         name: "Go",
-        signals: vec![Signal::FileExists {
-            path: "go.mod".to_string(),
-        }],
-        suggestions: Vec::new(),
+        signals,
+        suggestions,
     })
+}
+
+/// Max `_test.go` files [`find_go_httptest`] reads before giving up.
+const GO_TEST_SCAN_MAX_FILES: usize = 200;
+
+/// First `_test.go` file (relative path) that imports `net/http/httptest`.
+///
+/// Bounded like the fallback workspace scan: [`SCAN_MAX_DEPTH`] levels,
+/// [`SCAN_MAX_ENTRIES`] entries, [`GO_TEST_SCAN_MAX_FILES`] files read. Skips
+/// hidden dirs, [`SCAN_SKIP_DIRS`] (vendor/ among them), `testdata` and
+/// symlinks; reads go through [`DetectContext::read_text`], which keeps them
+/// inside the root and under the size cap.
+fn find_go_httptest(ctx: &DetectContext) -> Option<String> {
+    let mut stack = vec![(PathBuf::new(), 0usize)];
+    let (mut entries, mut files) = (0usize, 0usize);
+    while let Some((rel, depth)) = stack.pop() {
+        let Ok(dir) = std::fs::read_dir(ctx.root().join(&rel)) else {
+            continue;
+        };
+        for entry in dir.flatten() {
+            entries += 1;
+            if entries > SCAN_MAX_ENTRIES {
+                return None;
+            }
+            let Ok(ft) = entry.file_type() else { continue };
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let child = rel.join(name);
+            if ft.is_dir() {
+                if depth < SCAN_MAX_DEPTH
+                    && !name.starts_with('.')
+                    && name != "testdata"
+                    && !SCAN_SKIP_DIRS.contains(&name)
+                {
+                    stack.push((child, depth + 1));
+                }
+            } else if ft.is_file() && name.ends_with("_test.go") {
+                files += 1;
+                if files > GO_TEST_SCAN_MAX_FILES {
+                    return None;
+                }
+                let child = child.to_str()?.to_string();
+                if ctx
+                    .read_text(&child)
+                    .is_some_and(|c| c.contains("\"net/http/httptest\""))
+                {
+                    return Some(child);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn detect_playwright(ctx: &DetectContext) -> DetectorOutput {
@@ -2819,6 +2884,58 @@ services:
         fs::write(dir.path().join("go.mod"), "module example.com/test").unwrap();
         let report = detect_project(dir.path());
         assert!(report.detections.iter().any(|d| d.name == "Go"));
+    }
+
+    fn go_localhost_any(dir: &Path) -> bool {
+        detect_project(dir)
+            .suggestions
+            .contains(&Suggestion::Propose(SandboxFlag::AllowLocalhostAny))
+    }
+
+    #[test]
+    fn go_httptest_proposes_localhost_any() {
+        let dir = setup_dir();
+        fs::write(dir.path().join("go.mod"), "module example.com/test").unwrap();
+        fs::create_dir_all(dir.path().join("internal/api")).unwrap();
+        fs::write(
+            dir.path().join("internal/api/api_test.go"),
+            "package api\n\nimport (\n\t\"net/http/httptest\"\n\t\"testing\"\n)\n",
+        )
+        .unwrap();
+        assert!(go_localhost_any(dir.path()));
+    }
+
+    #[test]
+    fn go_without_httptest_proposes_nothing() {
+        let dir = setup_dir();
+        fs::write(dir.path().join("go.mod"), "module example.com/test").unwrap();
+        fs::write(
+            dir.path().join("main_test.go"),
+            "package main\n\nimport \"testing\"\n",
+        )
+        .unwrap();
+        // httptest outside a _test.go file does not count.
+        fs::write(
+            dir.path().join("helper.go"),
+            "package main\n\nimport \"net/http/httptest\"\n",
+        )
+        .unwrap();
+        assert!(!go_localhost_any(dir.path()));
+    }
+
+    #[test]
+    fn go_httptest_scan_skips_vendor_and_testdata() {
+        let dir = setup_dir();
+        fs::write(dir.path().join("go.mod"), "module example.com/test").unwrap();
+        for sub in ["vendor/example.com/dep", "testdata"] {
+            fs::create_dir_all(dir.path().join(sub)).unwrap();
+            fs::write(
+                dir.path().join(sub).join("x_test.go"),
+                "import \"net/http/httptest\"\n",
+            )
+            .unwrap();
+        }
+        assert!(!go_localhost_any(dir.path()));
     }
 
     // ── Playwright detector ──────────────────────────────────────────
