@@ -6730,14 +6730,15 @@ fn mismatch_fix(
 /// public host whose A record points at a private/link-local IP
 /// (10.x/172.16.x/192.168.x/169.254.169.254) with BLOCKED-PRIVATE-RESOLVED.
 ///
-/// Returns `Some(blocked item)` when the resolved IP is blocked (so check
-/// reports BLOCKED, matching live enforcement, and never runs the reachability
-/// probe for such a target); returns `None` when the resolved IP passes the
-/// guard OR the host does not resolve here (in which case the pre-DNS ALLOWED
-/// verdict stands and `probe_reachable` reports the resolution failure honestly,
-/// exactly as the live proxy would then hit DNS-FAIL rather than a policy block).
+/// Returns `Some(blocked item)` when ANY resolved IP is blocked (the live proxy
+/// then refuses the whole answer, so check reports BLOCKED, matching live
+/// enforcement, and never runs the reachability probe for such a target);
+/// returns `None` when every resolved IP passes the guard OR the host does not
+/// resolve here (in which case the pre-DNS ALLOWED verdict stands and
+/// `probe_reachable` reports the resolution failure honestly, exactly as the
+/// live proxy would then hit DNS-FAIL rather than a policy block).
 ///
-/// Uses the same resolver ([`proxy::resolve_socket_addr`]) and guard
+/// Uses the same resolver ([`proxy::resolve_socket_addrs`]) and guard
 /// ([`proxy::resolved_ip_is_blocked`]) as the live path, with the same
 /// localhost-opt-in and `allow_private_domains` semantics.
 fn resolved_ip_block_item(
@@ -6745,13 +6746,14 @@ fn resolved_ip_block_item(
     host: &str,
     port: u16,
 ) -> Option<check::CheckItem> {
-    let addr = proxy::resolve_socket_addr(host, port)?;
     let localhost_opt_in =
         net_policy.allow_localhost_any || net_policy.allow_localhost_ports.contains(&port);
     let host_is_private_domain = proxy::is_domain_match(host, &net_policy.private_domains);
-    if !proxy::resolved_ip_is_blocked(&addr.ip(), host_is_private_domain, localhost_opt_in) {
-        return None;
-    }
+    let addr = proxy::resolve_socket_addrs(host, port)
+        .into_iter()
+        .find(|a| {
+            proxy::resolved_ip_is_blocked(&a.ip(), host_is_private_domain, localhost_opt_in)
+        })?;
     Some(check::CheckItem {
         name: "BLOCKED-PRIVATE-RESOLVED".to_string(),
         category: "network".to_string(),

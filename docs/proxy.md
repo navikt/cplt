@@ -476,13 +476,14 @@ Every connection attempt is printed to stderr in real time:
 | Status | Meaning | Action |
 |---|---|---|
 | `CONNECTED` | Connection succeeded | none |
+| `CONNECTED (via ADDR after ...)` | Connected, but only after earlier addresses of the host failed (3 s per address while others remain, 10 s in total) | Often a broken IPv6 route; none needed |
 | `BLOCKED` | Domain matched blocklist | Check the built-in list (`blocked-domains.txt`), your `--blocked-domains` file and any subscription |
 | `BLOCKED-ALLOWLIST` | Domain not in allowlist | Add it to the file named by `proxy.allowed_domains` / `--allowed-domains` (re-read live), or `cplt config set allow.domains HOST` and restart |
 | `BLOCKED-PORT` | Port not in allowed list | Add with `--allow-port <PORT>` |
 | `BLOCKED-PRIVATE` | Pre-DNS private IP (`.local`, `127.*`, IP literals) | Use `--allow-localhost` for local ports |
-| `BLOCKED-PRIVATE-RESOLVED` | DNS resolved to a private IP | Use `--allow-private-domain <DOMAIN>` |
+| `BLOCKED-PRIVATE-RESOLVED` | DNS resolved to a private IP (any address in the answer) | Use `--allow-private-domain <DOMAIN>` |
 | `DNS-FAIL` | DNS resolution failed | Check domain spelling or network |
-| `CONNECT-FAIL:...` | TCP connection to target failed | Target may be down |
+| `CONNECT-FAIL:...` | TCP connection to every resolved address failed (each listed) | Target may be down |
 | `UNSUPPORTED` | Non-CONNECT HTTP method | Only CONNECT tunnels are supported |
 | `LIMIT` | 64 concurrent connections reached | Reduce parallelism |
 
