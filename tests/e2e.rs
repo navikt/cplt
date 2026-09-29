@@ -3046,6 +3046,43 @@ mod e2e_tests {
         let _ = std::fs::remove_dir_all(&fake_home);
     }
 
+    /// A quoted `~/` (so the shell leaves it alone) names the home directory,
+    /// as it does for the loader, not a folder called `~` in the project. A
+    /// literal `./~/` is still project-relative and still refused.
+    #[test]
+    fn e2e_config_set_proxy_list_expands_quoted_tilde() {
+        let fake_home = make_config_home("set-list-tilde");
+        let set = |val: &str| {
+            cplt_cmd()
+                .args(["config", "set", "proxy.allowed_domains", val])
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
+                .env("HOME", fake_home.to_str().unwrap())
+                .env_remove("CPLT_CONFIG")
+                .output()
+                .expect("should run")
+        };
+
+        let out = set("~/.config/cplt/allowed-domains.txt");
+        assert!(
+            out.status.success(),
+            "a quoted ~/ path under HOME must be accepted: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let out = set("./~/allowed-domains.txt");
+        assert!(
+            !out.status.success(),
+            "a literal ./~/ path is inside the project and must be refused"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("a tree a session can write"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
     #[test]
     fn e2e_config_set_unset_reverts_to_default() {
         let fake_home = make_config_home("set-unset");

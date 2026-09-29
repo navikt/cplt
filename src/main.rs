@@ -7900,7 +7900,9 @@ fn run_config_set(
             .map(|h| scratch::ScratchDir::base(Path::new(&h)));
         let writable =
             sandbox::session_writable_roots(&project, &[], &grants, scratch_base.as_deref());
-        if let Some(root) = agent_writable_root(Path::new(val), &writable) {
+        // Judge the path the launch will open: the loader expands a leading
+        // `~/`, so a quoted `"~/.config/cplt/…"` must not read as `./~/…`.
+        if let Some(root) = agent_writable_root(&config::expand_tilde(val), &writable) {
             ui::error(&format!(
                 "{key} = {val} is inside {} — a tree a session can write.\n  \
                  The proxy re-reads that file every few seconds, so the agent could edit its \
