@@ -1138,7 +1138,7 @@ enum ConfigAction {
         local: bool,
     },
 
-    /// Print an agent's built-in network hosts.
+    /// Print an agent's effective network hosts (built-in plus hosts detected on this machine).
     ///
     /// Agent hosts (model, auth, telemetry) stay reachable under a user
     /// allowlist. The default allowlist is those plus the package registries
@@ -10157,30 +10157,34 @@ mod tests {
     /// uses, so nav-pilot reading it cannot drift from what cplt enforces.
     #[test]
     fn config_hosts_json_matches_agent_lists() {
-        for name in [
-            "copilot",
-            "opencode",
-            "antigravity",
-            "claude",
-            "goose",
-            "dsh",
-            "pi",
-            "shell",
-        ] {
-            let agent: agent::Agent = name.parse().unwrap();
-            let v = config_hosts_json(agent);
-            assert_eq!(v["version"], 1);
-            assert_eq!(
-                v["agent_hosts"],
-                serde_json::json!(agent_allowlist(agent, false, true)),
-                "{name}"
-            );
-            assert_eq!(
-                v["default_allowlist"],
-                serde_json::json!(agent_allowlist(agent, true, false)),
-                "{name}"
-            );
-        }
+        // Another test sets XDG_DATA_HOME to plant an OpenCode auth.json;
+        // unset it (under temp_env's lock) so both sides read the same file.
+        temp_env::with_var_unset("XDG_DATA_HOME", || {
+            for name in [
+                "copilot",
+                "opencode",
+                "antigravity",
+                "claude",
+                "goose",
+                "dsh",
+                "pi",
+                "shell",
+            ] {
+                let agent: agent::Agent = name.parse().unwrap();
+                let v = config_hosts_json(agent);
+                assert_eq!(v["version"], 1);
+                assert_eq!(
+                    v["agent_hosts"],
+                    serde_json::json!(agent_allowlist(agent, false, true)),
+                    "{name}"
+                );
+                assert_eq!(
+                    v["default_allowlist"],
+                    serde_json::json!(agent_allowlist(agent, true, false)),
+                    "{name}"
+                );
+            }
+        });
         // Both sides empty would pass the loop above; pin known entries.
         let copilot = config_hosts_json(agent::Agent::Copilot);
         let has = |key: &str, host: &str| {
