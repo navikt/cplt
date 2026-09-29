@@ -3861,7 +3861,7 @@ mod tests {
     #[test]
     fn copilot_default_allowed_domains_matches_issue_52() {
         let domains = Agent::Copilot.default_allowed_domains();
-        // 6 GitHub Copilot infra domains + 10 package registries = 16.
+        // 6 GitHub Copilot infra domains + 11 package registries = 17.
         assert_eq!(domains.len(), 17, "copilot list: infra + registries");
         // GitHub Copilot infrastructure (bare forms of the issue's wildcards).
         for d in [
@@ -4084,7 +4084,7 @@ mod tests {
     #[test]
     fn pi_and_shell_get_registry_base_only() {
         // Pi's infra is not yet documented; Shell is not an AI agent. Both get
-        // only the shared package-registry base (10 domains).
+        // only the shared package-registry base (11 domains).
         for agent in [Agent::Pi, Agent::Shell] {
             let domains = agent.default_allowed_domains();
             assert_eq!(domains.len(), 11, "{agent:?} gets registry base only");
