@@ -182,7 +182,9 @@ const ANTHROPIC_DOMAINS: &[&str] = &[
 /// OpenCode's OWN infrastructure only. OpenCode is provider-agnostic: it routes
 /// model traffic to a user-configured provider (Anthropic/OpenAI/Google/…), so
 /// enabling `default_allowlist` for OpenCode requires adding that provider's
-/// domain via `allowed_domains`. Only OpenCode's own infra is listed here.
+/// domain via `allowed_domains`. Only OpenCode's own infra is listed here;
+/// a connected GitHub Copilot provider is detected separately, see
+/// [`Agent::provider_domains`] (#609).
 ///
 /// BARE domains, matched exact-or-subdomain — see `COPILOT_INFRA_DOMAINS`.
 const OPENCODE_DOMAINS: &[&str] = &["opencode.ai", "models.dev"];
@@ -194,6 +196,21 @@ const OPENCODE_DOMAINS: &[&str] = &["opencode.ai", "models.dev"];
 ///
 /// BARE domain — see `COPILOT_INFRA_DOMAINS` for the no-glob convention.
 const DEEPSEEK_DOMAINS: &[&str] = &["deepseek.com"];
+
+/// The provider hosts an OpenCode `auth.json` body calls for. Split from
+/// [`Agent::provider_domains`] so the parse is testable without a home dir.
+/// Anything that is not a JSON object with a `github-copilot` key, including
+/// a malformed file, yields nothing: this only ever widens an allowlist, so
+/// the failure direction is to add no hosts.
+fn opencode_provider_domains(auth_json: &str) -> Vec<&'static str> {
+    let connected = serde_json::from_str::<serde_json::Value>(auth_json)
+        .is_ok_and(|v| v.get("github-copilot").is_some());
+    if connected {
+        COPILOT_INFRA_DOMAINS.to_vec()
+    } else {
+        Vec::new()
+    }
+}
 
 /// A credential an agent can use instead of the macOS login Keychain (#242).
 ///
@@ -955,7 +972,9 @@ impl Agent {
     /// add domains via `allowed_domains`:
     ///   - OpenCode is provider-agnostic: its model traffic goes to a
     ///     user-configured provider (Anthropic/OpenAI/Google/…), which is NOT
-    ///     included here — only OpenCode's own infra is.
+    ///     included here — only OpenCode's own infra is. The one exception,
+    ///     a connected GitHub Copilot provider, is added by the caller via
+    ///     [`Agent::provider_domains`].
     ///   - Pi's infrastructure endpoints are not yet documented here.
     ///
     /// These are best-effort defaults for an opt-in feature: blocked domains are
@@ -1002,6 +1021,37 @@ impl Agent {
             Agent::Goose | Agent::Pi | Agent::Shell => &[],
         };
         infra.concat()
+    }
+
+    /// Provider hosts OpenCode needs beyond its own infra, detected from the
+    /// user's OpenCode credential store (#609). Today only one: a connected
+    /// GitHub Copilot provider gets `COPILOT_INFRA_DOMAINS`, so an allowlist
+    /// does not cut OpenCode off from the model it was set up to use. Every
+    /// other agent, and OpenCode without that provider, gets nothing.
+    ///
+    /// The signal is the `github-copilot` key in
+    /// `$XDG_DATA_HOME/opencode/auth.json` (default `~/.local/share`), where
+    /// `/connect` stores provider credentials. It is read once, read-only,
+    /// before the sandbox starts. A project `opencode.json` is deliberately
+    /// NOT consulted: it is repo-controlled, and a hostile repo must not be
+    /// able to widen egress by naming a provider. The data dir is writable
+    /// from inside the sandbox, so a compromised session could plant the key
+    /// for the next one; what that buys is the GitHub hosts every Copilot
+    /// session already has, which is the accepted ceiling here.
+    ///
+    /// `github-copilot-enterprise` is not matched: its hosts live on the
+    /// customer's own domain, which cplt cannot know. Those go in
+    /// `allowed_domains` (docs/known-impacts.md).
+    pub fn provider_domains(&self, home: &Path) -> Vec<&'static str> {
+        if *self != Agent::OpenCode {
+            return Vec::new();
+        }
+        let data_base = std::env::var("XDG_DATA_HOME")
+            .ok()
+            .map_or_else(|| home.join(".local/share"), PathBuf::from);
+        std::fs::read_to_string(data_base.join("opencode/auth.json"))
+            .map(|s| opencode_provider_domains(&s))
+            .unwrap_or_default()
     }
 
     /// The writable dirs a shell session needs, by shell name.
@@ -3977,6 +4027,45 @@ mod tests {
                 && !domains.contains(&"generativelanguage.googleapis.com"),
             "OpenCode must not assume a specific model provider"
         );
+    }
+
+    /// #609: only a `github-copilot` entry in OpenCode's credential store adds
+    /// the Copilot hosts. Other providers, a malformed file or a value that
+    /// merely mentions Copilot add nothing.
+    #[test]
+    fn opencode_provider_domains_only_for_connected_copilot() {
+        let copilot = opencode_provider_domains(r#"{"github-copilot":{"type":"oauth"}}"#);
+        assert_eq!(copilot, COPILOT_INFRA_DOMAINS.to_vec());
+        for body in [
+            r#"{"anthropic":{"type":"api"}}"#,
+            r#"{"anthropic":{"note":"github-copilot"}}"#,
+            r#"{"github-copilot-enterprise":{"type":"oauth"}}"#,
+            "not json",
+            "",
+        ] {
+            assert!(opencode_provider_domains(body).is_empty(), "{body}");
+        }
+    }
+
+    /// #609: the file is found in the XDG data dir, and only OpenCode reads it.
+    #[test]
+    fn provider_domains_reads_opencode_auth_json_from_data_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join(".local/share/opencode");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("auth.json"), r#"{"github-copilot":{}}"#).expect("write");
+        temp_env::with_var("XDG_DATA_HOME", None::<&str>, || {
+            assert!(
+                Agent::OpenCode
+                    .provider_domains(tmp.path())
+                    .contains(&"githubcopilot.com")
+            );
+            assert!(Agent::Copilot.provider_domains(tmp.path()).is_empty());
+            assert!(Agent::Pi.provider_domains(tmp.path()).is_empty());
+        });
+        temp_env::with_var("XDG_DATA_HOME", Some("/nonexistent-cplt-609"), || {
+            assert!(Agent::OpenCode.provider_domains(tmp.path()).is_empty());
+        });
     }
 
     /// DSH ships one adapter, `dsh-llm-deepseek`, whose default `PUBLIC_BASE_URL`
