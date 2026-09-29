@@ -814,7 +814,7 @@ pub const PROPOSE_COSTS: &[(&str, &str)] = &[
     ("allow_tmp_exec", "allows code execution from /tmp"),
     (
         "allow_gpg_signing",
-        "exposes the GPG agent socket, so the agent can sign commits and tags as you",
+        "exposes the GPG agent socket, so the agent can sign and decrypt as you",
     ),
     (
         "allow_lifecycle_scripts",

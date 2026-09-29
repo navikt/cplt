@@ -8889,11 +8889,17 @@ fn trust_state(
                 "foreign",
                 format!(
                     ".cplt.toml for this remote was approved in a different repository ({}), \
-                     so cplt is not auto-trusting it here.",
+                     so cplt is not auto-trusting it here.{}",
                     if t.repo.path.is_empty() {
                         "an unrecorded location"
                     } else {
                         &t.repo.path
+                    },
+                    // `trust accept` refuses a live foreign entry.
+                    if trust::approval_is_orphaned(t) {
+                        ""
+                    } else {
+                        " To approve here instead, run `cplt trust revoke --all` first."
                     }
                 ),
             ),
@@ -8917,8 +8923,13 @@ fn trust_state(
     };
     // `trust accept` refuses anything but the committed copy; never point at
     // a command that would exit 1.
-    let command = (matches!(state, "pending" | "changed" | "foreign")
-        && repo_config::repo_config_state(project_dir) == repo_config::RepoConfigState::Committed)
+    // A live foreign entry is refused too (`trust_accept`); an orphaned one is not.
+    let command = (match state {
+        "pending" | "changed" => true,
+        "foreign" => entry.is_some_and(trust::approval_is_orphaned),
+        _ => false,
+    } && repo_config::repo_config_state(project_dir)
+        == repo_config::RepoConfigState::Committed)
         .then_some("cplt trust accept");
     TrustState {
         state,
@@ -13124,6 +13135,9 @@ mod tests {
         let hash = trust::proposal_content_hash(&loaded.config.propose);
         let both = ["allow_localhost_any", "allow.ports"];
         let (_g2, other, _) = committed_repo_config(BODY);
+        let mut orphan = approval(&other, &both, &hash);
+        orphan.repo.git_dir = format!("{}/gone", orphan.repo.git_dir);
+        orphan.repo.path = format!("{}/gone", orphan.repo.path);
 
         let cases: Vec<(&str, Option<trust::TrustEntry>, &str)> = vec![
             ("no entry", None, "pending"),
@@ -13138,6 +13152,7 @@ mod tests {
             // A legacy entry with no hash pins nothing, so it is stale.
             ("legacy", Some(approval(&dir, &both, "")), "changed"),
             ("foreign", Some(approval(&other, &both, &hash)), "foreign"),
+            ("foreign orphaned", Some(orphan), "foreign"),
         ];
         for (name, entry, want) in cases {
             let st = trust_state(&dir, &loaded, entry.as_ref());
@@ -13149,11 +13164,22 @@ mod tests {
             for (key, approved) in &st.proposed {
                 assert_eq!(*approved, granted.iter().any(|g| g == key), "{name}: {key}");
             }
+            // Never point at a `trust accept` that would refuse: the one
+            // refusal for a non-matching entry is `trust_accept`'s own test.
+            if st.command.is_some() {
+                let refused = entry.as_ref().is_some_and(|t| {
+                    !trust::approved_path_matches(t, &dir) && !trust::approval_is_orphaned(t)
+                });
+                assert!(
+                    !refused,
+                    "{name}: command {:?} would be refused",
+                    st.command
+                );
+            }
             assert_eq!(
                 st.command.is_some(),
-                want != "approved",
-                "{name}: command {:?}",
-                st.command
+                name != "approved" && name != "foreign",
+                "{name}"
             );
         }
     }
