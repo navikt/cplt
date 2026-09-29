@@ -2566,6 +2566,29 @@ mod e2e_tests {
 
     // ── Config subcommand e2e tests ─────────────────────────
 
+    /// #608: nav-pilot runs the binary, so pin the contract end to end:
+    /// parsing, dispatch and stdout are one JSON object with the three fields.
+    #[test]
+    fn e2e_config_hosts_json() {
+        let output = cplt_cmd()
+            .args(["config", "hosts", "--agent", "copilot", "--json"])
+            .output()
+            .expect("should run");
+        assert!(output.status.success(), "config hosts should succeed");
+        let v: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("stdout is one JSON object");
+        assert_eq!(v["version"], 1);
+        let has = |key: &str, host: &str| {
+            v[key]
+                .as_array()
+                .unwrap_or_else(|| panic!("{key} is an array: {v}"))
+                .contains(&serde_json::json!(host))
+        };
+        assert!(has("agent_hosts", "githubcopilot.com"));
+        assert!(!has("agent_hosts", "jitpack.io"));
+        assert!(has("default_allowlist", "jitpack.io"));
+    }
+
     #[test]
     fn e2e_config_path_prints_path() {
         // Asserts config *discovery*, so CPLT_CONFIG must stay unset — but the

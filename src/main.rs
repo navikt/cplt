@@ -7635,13 +7635,25 @@ fn run_config_path(local: bool) -> ExitCode {
     }
 }
 
+/// `cplt config hosts` lists: the agent's part of an allowlist under a user
+/// `allowed_domains` file, and under `proxy.default_allowlist`. Both come from
+/// [`agent_allowlist`], the function the proxy and `cplt check` use, so the
+/// output is the effective list on this machine, not a copy of the constants.
+fn config_hosts(agent: agent::Agent) -> (Vec<String>, Vec<String>) {
+    (
+        agent_allowlist(agent, false, true),
+        agent_allowlist(agent, true, false),
+    )
+}
+
 /// `cplt config hosts --json` output. nav-pilot reads this instead of keeping
 /// its own copy of the lists; bump `version` on any breaking change to the shape.
 fn config_hosts_json(agent: agent::Agent) -> serde_json::Value {
+    let (agent_hosts, default_allowlist) = config_hosts(agent);
     serde_json::json!({
         "version": 1,
-        "agent_hosts": agent.infra_domains(),
-        "default_allowlist": agent.default_allowed_domains(),
+        "agent_hosts": agent_hosts,
+        "default_allowlist": default_allowlist,
     })
 }
 
@@ -7656,12 +7668,13 @@ fn run_config_hosts(name: &str, json: bool) -> ExitCode {
     if json {
         println!("{}", config_hosts_json(agent));
     } else {
-        println!("Agent hosts (always allowed):");
-        for h in agent.infra_domains() {
+        let (agent_hosts, default_allowlist) = config_hosts(agent);
+        println!("Agent hosts (added to any active allowlist; a blocklist entry still wins):");
+        for h in agent_hosts {
             println!("  {h}");
         }
         println!("Default allowlist (proxy.default_allowlist):");
-        for h in agent.default_allowed_domains() {
+        for h in default_allowlist {
             println!("  {h}");
         }
     }
@@ -10159,12 +10172,12 @@ mod tests {
             assert_eq!(v["version"], 1);
             assert_eq!(
                 v["agent_hosts"],
-                serde_json::json!(agent.infra_domains()),
+                serde_json::json!(agent_allowlist(agent, false, true)),
                 "{name}"
             );
             assert_eq!(
                 v["default_allowlist"],
-                serde_json::json!(agent.default_allowed_domains()),
+                serde_json::json!(agent_allowlist(agent, true, false)),
                 "{name}"
             );
         }
