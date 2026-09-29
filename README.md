@@ -779,6 +779,8 @@ Every top-level `cplt` flag applies: `--project-dir`, `--allow-read`, `--deny-pa
 
 cplt finds the command on `PATH` the way a shell does and decides policy on the file a symlink points to. A tool reached through a symlink under another name, such as a mise shim, busybox or a rustup proxy, is started through that symlink, so it still sees the name it was called by. The sandbox must be able to read every link on the way to the target. cplt checks that against its read grants and `--deny-path`, and starts the target directly when a link fails the check. It does not check the built-in read denies (credential files, key files, `.env` files), so a link behind one of those makes the command fail to start instead.
 
+The command starts in your current directory when that is inside the project or another granted repository root, so `cd apps/web && cplt exec -- npm test` runs in `apps/web`. The project root decides which paths are granted, not where the command runs. From a directory outside every grant, for example with `--project-dir` pointing elsewhere, the command starts in the project root.
+
 ### Examples
 
 ```bash
