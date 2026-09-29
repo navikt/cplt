@@ -3639,6 +3639,7 @@ fn start_proxy_if_enabled(
     if !default_allowlist.is_empty() && !resolved.quiet {
         let mut merged = default_allowlist.clone();
         merged.extend(configured_domains.iter().cloned());
+        merged.extend(extra_allowed_domains.iter().cloned());
         merged.sort_unstable();
         merged.dedup();
         let extra = merged.len().saturating_sub(default_allowlist.len());
@@ -11830,6 +11831,17 @@ mod tests {
             );
             assert_eq!(proxy::classify_connect(&checked, host, 443), want, "{host}");
         }
+
+        // --allow-all-domains drops every allowlist source; `allow.domains`
+        // alone must not bring enforcement back.
+        let mut allow_all = resolved;
+        allow_all.allow_all_domains = true;
+        allow_all.default_allowlist = false; // as `merge` reconciles it
+        let open = build_net_policy(&allow_all, agent::Agent::Copilot).expect("policy builds");
+        assert_eq!(
+            proxy::classify_connect(&open, "evil.example", 443),
+            proxy::NetVerdict::Allowed
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
