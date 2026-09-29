@@ -2378,7 +2378,11 @@ pub fn classify_resolved(
         return ConnectRoute::Refuse(first_refusal.unwrap_or(Refusal::ResolvedPrivate));
     }
 
-    if via_upstream {
+    // A name that resolves only to loopback (`127.0.0.1.nip.io`, `lvh.me`) is a
+    // local target like the literal carve-out: forwarding it would make the
+    // upstream resolve the name on ITS host and reach a service there, not on
+    // the user's machine. So it is connected directly, never forwarded.
+    if via_upstream && !allowed.iter().all(|a| a.ip().is_loopback()) {
         ConnectRoute::Upstream
     } else {
         ConnectRoute::Direct(allowed)
@@ -2866,6 +2870,30 @@ mod tests {
         assert_eq!(
             classify_resolved(&[lo], false, false, true, false),
             ConnectRoute::Direct(vec![lo])
+        );
+    }
+
+    #[test]
+    fn loopback_alias_connects_directly_even_with_an_upstream() {
+        // A name that resolves only to loopback is local, so it is never
+        // forwarded: the upstream would resolve it on its own host.
+        let lo = addr("127.0.0.1");
+        let lo6: std::net::SocketAddr = "[::1]:443".parse().unwrap();
+        assert_eq!(
+            classify_resolved(&[lo, lo6], true, false, true, false),
+            ConnectRoute::Direct(vec![lo, lo6])
+        );
+        // A mixed answer still has a non-loopback address, so it is forwarded.
+        let public = addr("93.184.216.34");
+        assert_eq!(
+            classify_resolved(&[lo, public], true, false, true, false),
+            ConnectRoute::Upstream
+        );
+        // Without the opt-in the loopback address is dropped, leaving only the
+        // public one, which is forwarded.
+        assert_eq!(
+            classify_resolved(&[lo, public], true, false, false, false),
+            ConnectRoute::Upstream
         );
     }
 
