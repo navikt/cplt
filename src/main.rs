@@ -892,6 +892,11 @@ NOTE:
     /// All top-level cplt flags work, written BEFORE `exec`:
     /// --project-dir, --allow-read, --with-proxy, etc.
     ///
+    /// The command starts in the current directory when that is inside the
+    /// project or another granted repository root, so `cd apps/web && cplt
+    /// exec -- npm test` runs in apps/web. From anywhere else it starts in the
+    /// project root, the one directory it is sure to be granted.
+    ///
     /// EXAMPLES:
     ///   cplt exec -- npm install
     ///   cplt --allow-lifecycle-scripts exec -- npm install
@@ -5043,6 +5048,26 @@ fn exec_pnpm_candidate<'a>(typed: &str, canonical: Option<&'a Path>) -> Option<&
     canonical.filter(|path| is_pnpm(path.file_name()) || is_pnpm(Path::new(typed).file_name()))
 }
 
+/// The working directory `cplt exec` starts its child in (#643).
+///
+/// The caller's own directory when it lies inside the project or another
+/// granted root, so a monorepo script running `cplt exec -- go test ./...`
+/// from an app directory tests that app. The project root only decides which
+/// paths are granted. Anywhere else the child starts in the project root, as
+/// it always did: a directory outside every grant is one the sandbox may not
+/// let it read.
+fn exec_launch_dir(
+    invocation_dir: Option<PathBuf>,
+    project_dir: &Path,
+    granted_roots: &[PathBuf],
+) -> PathBuf {
+    invocation_dir
+        .filter(|dir| {
+            dir.starts_with(project_dir) || granted_roots.iter().any(|root| dir.starts_with(root))
+        })
+        .unwrap_or_else(|| project_dir.to_path_buf())
+}
+
 fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
 
@@ -5754,6 +5779,11 @@ fn run_exec_command(
     let repo_paths: Vec<PathBuf> = repo_roots.iter().map(|r| r.dir.clone()).collect();
     let repo_git_dirs = sandbox::named_root_git_dirs(&repo_paths);
     let policy_roots = policy_roots(&repo_paths, worktree_root.as_deref());
+    let launch_dir = exec_launch_dir(
+        std::env::current_dir().and_then(std::fs::canonicalize).ok(),
+        &project_dir,
+        &policy_roots,
+    );
     // Built once: the brief, the startup summary and `doctor` must not each
     // resolve the identities separately and risk disagreeing.
     let repo_rows = repo_summary_rows(&project_dir, &repo_roots);
@@ -5953,7 +5983,7 @@ fn run_exec_command(
                 &prepared,
                 &exec_bin,
                 &exec_args,
-                &project_dir,
+                &launch_dir,
                 &repo_paths,
                 &resolved.pass_env,
                 resolved.inherit_env,
@@ -11126,6 +11156,20 @@ mod tests {
         assert_eq!(exec_pnpm_candidate("pn", Some(pnpm)), Some(pnpm));
         assert_eq!(exec_pnpm_candidate("go", Some(mise)), None);
         assert_eq!(exec_pnpm_candidate("pnpm", None), None);
+    }
+
+    #[test]
+    fn exec_starts_in_the_callers_directory_only_inside_a_granted_root() {
+        let project = Path::new("/repo");
+        let roots = [PathBuf::from("/other-repo")];
+        let launch = |dir: &str| exec_launch_dir(Some(PathBuf::from(dir)), project, &roots);
+
+        assert_eq!(launch("/repo/apps/web"), Path::new("/repo/apps/web"));
+        assert_eq!(launch("/repo"), Path::new("/repo"));
+        assert_eq!(launch("/other-repo/lib"), Path::new("/other-repo/lib"));
+        assert_eq!(launch("/elsewhere"), project, "outside every grant");
+        assert_eq!(launch("/repository"), project, "a prefix is not a parent");
+        assert_eq!(exec_launch_dir(None, project, &roots), project);
     }
 
     #[test]
