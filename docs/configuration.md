@@ -1193,7 +1193,7 @@ keys but changes a value is shown as changed, not approved.
 |---|---|
 | `version` | Shape version. Refuse a version you do not know. |
 | `state` | `none` (no `.cplt.toml`, or nothing to approve), `approved`, `pending` (never approved, or only some keys), `changed` (values changed since the approval), `foreign` (approved in a different repository), `outlived` (an approval, but nothing left to approve), `uncommitted` (the file's proposals are ignored until committed), `invalid` (the file does not load) |
-| `content_hash` | Hash of the committed `[propose]` section. An approval is pinned to it. |
+| `content_hash` | Hash of the committed `[propose]` section. An approval is pinned to it. `null` when there is no committed `.cplt.toml` to approve: no file, an invalid one, or one that exists only in the working tree (the launch ignores its proposals). |
 | `message` | One line, worded as the launch warning. |
 | `proposed` | Every key that needs approval: its value (`detail`), what approving it costs (`effect`), and whether the launch grants it (`approved`). |
 | `command` | What to run to approve, or `null` when there is nothing to approve or `cplt trust accept` would refuse. |

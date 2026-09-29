@@ -5503,6 +5503,35 @@ paths = [
         let _ = std::fs::remove_dir_all(config_file.parent().expect("cfg dir"));
     }
 
+    /// A file that only turns guards on proposes nothing to approve, but the
+    /// launch applies the guards, so `config show` must list them as applied.
+    #[test]
+    fn e2e_config_show_lists_tighten_only_guards() {
+        let (repo, config_file) = make_trust_repo(
+            "guards-only",
+            "[propose]\ngh_guard = true\ngit_push_prevention = true\n",
+        );
+        let out = trust_cmd(&repo, &config_file)
+            .args(["config", "show"])
+            .output()
+            .expect("run config show");
+        let shown = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{shown}");
+        assert!(shown.contains("[guards] (applied)"), "{shown}");
+        for key in ["gh_guard", "git_push_prevention"] {
+            assert!(
+                shown
+                    .lines()
+                    .any(|l| l.contains(key) && l.trim_end().ends_with("= true")),
+                "{key} missing:\n{shown}"
+            );
+        }
+        assert!(!shown.contains("pending"), "{shown}");
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(config_file.parent().expect("cfg dir"));
+    }
+
     /// #491, the whole loop: a repository proposes another repository by name,
     /// approving resolves and links it, and revoking removes exactly what the
     /// approval created — never a root the user added themselves.

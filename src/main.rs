@@ -7612,6 +7612,22 @@ fn display_repo_config(loaded: &repo_config::LoadedRepoConfig, project_dir: &std
         println!();
     }
 
+    // Tighten-only proposals turn a guard on without approval, like [deny]; the
+    // launch applies them only as `true`. Shown apart from [allow], which
+    // `proposed_keys` (and so the branch below) never covers.
+    let guards: Vec<&str> = config::PROPOSE_BOOLS
+        .iter()
+        .filter(|row| row.tighten_only && (row.propose)(&rc.propose) == Some(true))
+        .map(|row| row.key)
+        .collect();
+    if !guards.is_empty() {
+        println!("{blue}[cplt]{nc}  {dim}[guards]{nc} {green}{LABEL_DENY_APPLIED}{nc}");
+        for g in guards {
+            println!("{blue}[cplt]{nc}    {g:<30} = true");
+        }
+        println!();
+    }
+
     // [propose]
     let proposed = repo_config::proposed_keys(&rc.propose);
     if proposed.is_empty() {
@@ -7657,16 +7673,11 @@ fn display_repo_config(loaded: &repo_config::LoadedRepoConfig, project_dir: &std
             ),
             ("allow_env_files", rc.propose.allow_env_files),
             ("allow_browser", rc.propose.allow_browser),
-            ("gh_guard", rc.propose.gh_guard),
-            ("git_push_prevention", rc.propose.git_push_prevention),
         ];
         for (name, val) in bools {
             if let Some(v) = val {
                 let approved = is_approved(name);
-                let status = if matches!(*name, "gh_guard" | "git_push_prevention") {
-                    // Tighten-only: applied without approval, never pending.
-                    format!("{green}{LABEL_DENY_APPLIED}{nc}")
-                } else if approved {
+                let status = if approved {
                     format!("{green}{STATUS_APPROVED}{nc}")
                 } else {
                     format!("{yellow}{STATUS_PENDING}{nc}")
@@ -8899,7 +8910,8 @@ fn trust_state(
                     if trust::approval_is_orphaned(t) {
                         ""
                     } else {
-                        " To approve here instead, run `cplt trust revoke --all` first."
+                        " To approve here instead, run `cplt trust revoke --all` first; \
+                         that also removes the approval in that repository."
                     }
                 ),
             ),
@@ -8987,7 +8999,11 @@ fn trust_show_json(project_dir: &std::path::Path) -> serde_json::Value {
         "version": 1,
         "state": st.state,
         "project_dir": project_dir.display().to_string(),
-        "content_hash": trust::proposal_content_hash(propose),
+        // Approvals pin the committed proposal. An uncommitted file has none
+        // (its proposals are dropped), so any hash here would name a proposal
+        // nothing can approve.
+        "content_hash": (loaded.source == repo_config::RepoConfigSource::GitHead)
+            .then(|| trust::proposal_content_hash(propose)),
         "message": st.message,
         "proposed": proposed,
         "command": st.command,
@@ -13192,6 +13208,19 @@ mod tests {
         let st = trust_state(&dir, &loaded, Some(&entry));
         assert_eq!(st.state, "outlived");
         assert_eq!(st.command, None);
+    }
+
+    /// The launch reads `HEAD:.cplt.toml`; an uncommitted file has no
+    /// proposal an approval could pin, so it has no hash either.
+    #[test]
+    fn trust_show_json_has_no_hash_for_an_uncommitted_file() {
+        let (_g, dir) = canonical_tempdir();
+        git_in(&dir, &["init", "--quiet"]);
+        std::fs::write(dir.join(".cplt.toml"), "[propose]\nallow_docker = true\n").unwrap();
+        let v = trust_show_json(&dir);
+        assert_eq!(v["state"], "uncommitted", "{v}");
+        assert_eq!(v["content_hash"], serde_json::Value::Null, "{v}");
+        assert_eq!(v["command"], serde_json::Value::Null, "{v}");
     }
 
     #[test]
