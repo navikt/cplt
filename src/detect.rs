@@ -562,10 +562,10 @@ fn detect_node(ctx: &DetectContext) -> DetectorOutput {
                 message: format!(
                     "{scope} resolves from an authenticated registry, so the token in \
                      ~/.npmrc is needed to install at all — without the grant the install \
-                     fails with 401 (E401) rather than falling back. Grant it in your own \
-                     config, since .cplt.toml cannot: `cplt config set allow.read \
-                     \"~/.npmrc\"`, or `cplt config set sandbox.allow_build_credentials \
-                     true`, which also exposes ~/.gradle/gradle.properties and \
+                     fails with 401 (E401) rather than falling back. Grant it with \
+                     `cplt config set allow.read \"~/.npmrc\"`, or with \
+                     `cplt config set sandbox.allow_build_credentials true` (personal \
+                     config only), which also exposes ~/.gradle/gradle.properties and \
                      ~/.m2/settings.xml. pnpm cannot take the token from a project .npmrc, \
                      since it does not expand environment variables there."
                 ),
@@ -1368,12 +1368,21 @@ fn scoped_auth_registry(npmrc: &str) -> Option<String> {
         let scope = scope.trim();
         if !scope.starts_with('@')
             || url.contains("registry.npmjs.org")
-            || !(has_credentials || url.contains("npm.pkg.github.com"))
+            || !(has_credentials || is_github_packages(url))
         {
             return None;
         }
         Some(scope.to_string())
     })
+}
+
+/// Whether a registry URL's host is GitHub Packages' npm registry. The host
+/// is compared exactly (ignoring case), so a path or a lookalike domain that
+/// merely contains the name does not count.
+fn is_github_packages(url: &str) -> bool {
+    let rest = url.trim().split_once("://").map_or(url.trim(), |(_, r)| r);
+    let host = rest.split(['/', ':']).next().unwrap_or_default();
+    host.eq_ignore_ascii_case("npm.pkg.github.com")
 }
 
 /// Extract a port number from package.json scripts (best-effort).
@@ -3513,6 +3522,10 @@ services:
             scoped_auth_registry("@navikt:registry=https://npm.pkg.github.com\n").as_deref(),
             Some("@navikt")
         );
+        assert_eq!(
+            scoped_auth_registry("@navikt:registry=https://NPM.PKG.GITHUB.COM/\n").as_deref(),
+            Some("@navikt")
+        );
     }
 
     /// navikt frontends map `@navikt` to GitHub Packages and keep the token in
@@ -3547,6 +3560,9 @@ services:
             "save-exact=true\nengine-strict=true\n",
             // A scope on a self-hosted registry, but no token anywhere.
             "@acme:registry=https://nexus.example.internal/repository/npm/\n",
+            // Hosts that only contain GitHub Packages' name.
+            "@acme:registry=https://registry.example/npm.pkg.github.com/\n",
+            "@acme:registry=https://npm.pkg.github.com.evil.example/\n",
             // Credentials, but the scope resolves from public npm.
             "@acme:registry=https://registry.npmjs.org/\n\
              //npm.pkg.github.com/:_authToken=x\n",
