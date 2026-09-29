@@ -558,12 +558,33 @@ mod e2e_tests {
             "the agent line names the resolved agent and where the choice came from.\nstdout: {stdout}"
         );
         assert!(
-            stdout.contains("config:      user") && stdout.contains("preset:"),
+            stdout.contains("config:      user") && stdout.contains("preset: standard (default)"),
             "the config line lists the layers loaded.\nstdout: {stdout}"
         );
         assert!(
             stdout.contains("enforcement: "),
             "the enforcement line names the regime.\nstdout: {stdout}"
+        );
+    }
+
+    /// #604: an allowlist that blocks the agent's hosts failed `cplt check`
+    /// while doctor said "No problems found".
+    #[test]
+    fn e2e_doctor_flags_an_allowlist_that_blocks_the_agent_hosts() {
+        let dir = tempfile::tempdir().unwrap();
+        let list = dir.path().join("allow.txt");
+        std::fs::write(&list, "example.com\n").unwrap();
+        let output = cplt_cmd()
+            .args(["--agent", "shell", "--allowed-domains"])
+            .arg(&list)
+            .arg("doctor")
+            .current_dir(project_dir())
+            .output()
+            .expect("binary should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("The network policy blocks host(s) Shell needs: registry.npmjs.org"),
+            "doctor names the blocked hosts.\nstdout: {stdout}"
         );
     }
 

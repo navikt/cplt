@@ -12,7 +12,8 @@
 //! answer from fewer inputs than the launch uses (#447). `main.rs` gathers
 //! those inputs and prints; this module decides.
 
-use crate::agent::Agent;
+use crate::agent::{Agent, PACKAGE_REGISTRY_DOMAINS};
+use crate::proxy::NetPolicy;
 use crate::sandbox::LandlockPolicy;
 use std::path::{Path, PathBuf};
 
@@ -516,6 +517,53 @@ pub fn wsl_drive_project_finding(project_dir: &Path, wsl: bool) -> Option<Findin
              virtiofs), which is slow."
         ),
         Some("move the project into the distro (e.g. ~/src) and run cplt there".to_string()),
+    ))
+}
+
+// ── Rule: the network policy blocks the agent's own hosts ──────
+
+/// The agent's own infrastructure hosts and, under an active allowlist, the
+/// package registries, run through the proxy's gate the way `cplt check net`
+/// does (`explain_domain`, port 443, no network). One warning naming what is
+/// blocked, so a policy too strict for the agent cannot pass doctor (#604).
+///
+/// Registries count only under an allowlist: without one, a registry is
+/// blocked only by a blocklist the user wrote on purpose.
+#[must_use]
+pub fn agent_hosts_finding(agent: Agent, policy: &NetPolicy) -> Option<Finding> {
+    let hosts = agent.default_allowed_domains();
+    let blocked: Vec<(&str, crate::check::NetExplain)> = hosts
+        .iter()
+        .filter(|h| policy.allowlist_active || !PACKAGE_REGISTRY_DOMAINS.contains(h))
+        .map(|h| (*h, crate::check::explain_domain(policy, h, 443, true)))
+        .filter(|(_, e)| e.decision != crate::check::Decision::Allowed)
+        .collect();
+    let (_, first) = blocked.first()?;
+    let mut named: Vec<String> = blocked
+        .iter()
+        .take(3)
+        .map(|(h, e)| format!("{h} ({})", e.status))
+        .collect();
+    if blocked.len() > 3 {
+        named.push(format!("{} more", blocked.len() - 3));
+    }
+    Some(Finding::warning(
+        format!(
+            "The network policy blocks host(s) {} needs: {}. `cplt check` fails and the \
+             agent cannot reach them.",
+            agent.display_name(),
+            named.join(", ")
+        ),
+        // Under an allowlist one fix covers every host: merge the agent's own.
+        if first.status == "BLOCKED-ALLOWLIST" {
+            Some(
+                "set proxy.default_allowlist = true (or pass --default-allowlist) to merge the \
+                 agent's hosts into your allowed_domains, or add them to that file"
+                    .to_string(),
+            )
+        } else {
+            first.fix.clone()
+        },
     ))
 }
 
@@ -1094,5 +1142,56 @@ mod tests {
         assert!(!out.contains("/home/u"), "{out}");
         assert!(out.contains("/mnt/c/Users/~/AppData"), "{out}");
         assert!(out.contains("fix: --allow-exec ~/bin"), "{out}");
+    }
+
+    fn net(allowed: &[&str], active: bool, blocked: &[&str]) -> NetPolicy {
+        NetPolicy {
+            allowed_ports: vec![443],
+            allowed_domains: allowed.iter().map(|s| (*s).to_string()).collect(),
+            allowlist_active: active,
+            blocked_domains: blocked.iter().map(|s| (*s).to_string()).collect(),
+            ..NetPolicy::default()
+        }
+    }
+
+    #[test]
+    fn agent_hosts_pass_without_an_allowlist_or_under_the_agent_defaults() {
+        for agent in Agent::ALL {
+            assert_eq!(
+                agent_hosts_finding(*agent, &net(&[], false, &[])),
+                None,
+                "{agent:?}"
+            );
+            let defaults = agent.default_allowed_domains();
+            assert_eq!(
+                agent_hosts_finding(*agent, &net(&defaults, true, &[])),
+                None,
+                "{agent:?}"
+            );
+        }
+    }
+
+    /// The #604 setup: an allowlist file without the agent's own hosts.
+    #[test]
+    fn an_allowlist_without_the_agent_hosts_warns() {
+        let f = agent_hosts_finding(Agent::Copilot, &net(&["example.com"], true, &[]))
+            .expect("copilot hosts are blocked");
+        assert_eq!(f.level, Level::Warning);
+        assert!(f.message.contains("(BLOCKED-ALLOWLIST)"), "{}", f.message);
+        assert!(f.message.contains(" more."), "{}", f.message);
+        assert!(f.fix.unwrap().contains("default_allowlist = true"));
+    }
+
+    #[test]
+    fn a_blocklisted_registry_counts_only_under_an_allowlist() {
+        let blocked = ["pypi.org"];
+        assert_eq!(
+            agent_hosts_finding(Agent::Shell, &net(&[], false, &blocked)),
+            None
+        );
+        let defaults = Agent::Shell.default_allowed_domains();
+        let f = agent_hosts_finding(Agent::Shell, &net(&defaults, true, &blocked))
+            .expect("blocked registry under an allowlist");
+        assert!(f.message.contains("pypi.org (BLOCKED)"), "{}", f.message);
     }
 }
