@@ -894,8 +894,8 @@ NOTE:
     ///
     /// The command starts in the current directory when that is inside the
     /// project or another granted repository root, so `cd apps/web && cplt
-    /// exec -- npm test` runs in apps/web. From anywhere else it starts in the
-    /// project root, the one directory it is sure to be granted.
+    /// exec -- npm test` runs in apps/web. From anywhere else, or from under a
+    /// --deny-path, it starts in the project root.
     ///
     /// EXAMPLES:
     ///   cplt exec -- npm install
@@ -5055,15 +5055,23 @@ fn exec_pnpm_candidate<'a>(typed: &str, canonical: Option<&'a Path>) -> Option<&
 /// from an app directory tests that app. The project root only decides which
 /// paths are granted. Anywhere else the child starts in the project root, as
 /// it always did: a directory outside every grant is one the sandbox may not
-/// let it read.
+/// let it read. The same holds for a directory under a `--deny-path` inside
+/// the project.
 fn exec_launch_dir(
     invocation_dir: Option<PathBuf>,
     project_dir: &Path,
     granted_roots: &[PathBuf],
+    deny_paths: &[PathBuf],
 ) -> PathBuf {
     invocation_dir
         .filter(|dir| {
             dir.starts_with(project_dir) || granted_roots.iter().any(|root| dir.starts_with(root))
+        })
+        .filter(|dir| {
+            !deny_paths.iter().any(|deny| {
+                dir.starts_with(deny)
+                    || std::fs::canonicalize(deny).is_ok_and(|d| dir.starts_with(d))
+            })
         })
         .unwrap_or_else(|| project_dir.to_path_buf())
 }
@@ -5783,6 +5791,7 @@ fn run_exec_command(
         std::env::current_dir().and_then(std::fs::canonicalize).ok(),
         &project_dir,
         &policy_roots,
+        &resolved.deny_paths,
     );
     // Built once: the brief, the startup summary and `doctor` must not each
     // resolve the identities separately and risk disagreeing.
@@ -11162,14 +11171,17 @@ mod tests {
     fn exec_starts_in_the_callers_directory_only_inside_a_granted_root() {
         let project = Path::new("/repo");
         let roots = [PathBuf::from("/other-repo")];
-        let launch = |dir: &str| exec_launch_dir(Some(PathBuf::from(dir)), project, &roots);
+        let deny = [PathBuf::from("/repo/secrets")];
+        let launch = |dir: &str| exec_launch_dir(Some(PathBuf::from(dir)), project, &roots, &deny);
 
         assert_eq!(launch("/repo/apps/web"), Path::new("/repo/apps/web"));
         assert_eq!(launch("/repo"), Path::new("/repo"));
         assert_eq!(launch("/other-repo/lib"), Path::new("/other-repo/lib"));
         assert_eq!(launch("/elsewhere"), project, "outside every grant");
         assert_eq!(launch("/repository"), project, "a prefix is not a parent");
-        assert_eq!(exec_launch_dir(None, project, &roots), project);
+        assert_eq!(launch("/repo/secrets/x"), project, "under a deny path");
+        assert_eq!(launch("/repo/secretsafe"), Path::new("/repo/secretsafe"));
+        assert_eq!(exec_launch_dir(None, project, &roots, &deny), project);
     }
 
     #[test]
