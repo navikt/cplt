@@ -136,7 +136,7 @@ forced = true
 
 **Platform asymmetry.** Enforcement is not equal on the two platforms:
 
-- **macOS (Seatbelt):** the profile pins egress to `localhost:<proxy_port>`. There is no direct-network path at all, so enforcement is complete with no residual.
+- **macOS (Seatbelt):** the profile pins egress to `localhost:<proxy_port>`. There is no direct-network path for connections. DNS lookups through the system resolver (mDNSResponder) still leave the machine outside the proxy.
 - **Linux (Landlock):** Landlock is port-based and cannot pin to localhost. Proxy-forced drops the `:443` rule and allows only the proxy port, which blocks direct `:443` to any host, but a narrow `evil.com:<proxy_port>` channel remains reachable if a remote host happens to answer on that exact port. Landlock itself gates **TCP only**, since its UDP support lands at ABI v10 and cplt handles TCP connect alone, but in this mode the seccomp rule above closes UDP, raw, SCTP and DCCP on any kernel, so the residual is the proxy-port channel rather than open UDP. Closing that residual requires a network namespace and is tracked in [#114](https://github.com/navikt/cplt/issues/114). Until then, treat Linux proxy-forced as "no direct TCP `:443` bypass and no non-TCP egress" rather than "no egress except the proxy".
 
 **Fail-closed behavior:**
