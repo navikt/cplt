@@ -1181,7 +1181,7 @@ Supported ecosystems:
 
 | Ecosystem | Detected via | Suggests |
 |-----------|-------------|----------|
-| JVM (Gradle/Maven) | `build.gradle*`, `pom.xml` | `allow_jvm_attach`, read gradle properties |
+| JVM (Gradle/Maven) | `build.gradle*`, `pom.xml` | `allow_jvm_attach`, read gradle properties; for Gradle also `allow_localhost_any` (the daemon listens on a random loopback port) |
 | Node.js | `package.json` | localhost ports, `allow_localhost_any` (for Next.js/Vite) |
 | Docker | `Dockerfile`, `compose.yml` | `allow_docker` (dangerous), exposed ports |
 | Python | `pyproject.toml`, `requirements.txt` | localhost ports (for Django/FastAPI) |
