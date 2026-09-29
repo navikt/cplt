@@ -571,8 +571,8 @@ pub fn agent_hosts_finding(agent: Agent, policy: &NetPolicy) -> Option<Finding> 
     }
     Some(Finding::warning(
         format!(
-            "The network policy blocks host(s) {} needs: {}. `cplt check` fails and the \
-             agent cannot reach them.",
+            "The network policy blocks host(s) {} needs: {}. The agent cannot reach \
+             them.",
             agent.display_name(),
             named.join(", ")
         ),
