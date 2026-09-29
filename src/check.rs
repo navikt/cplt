@@ -1890,7 +1890,10 @@ mod tests {
         let gh = GhGuardPolicy::default();
         let git = GitGuardPolicy::default();
         let ctx = exec_ctx(&gh, &git, false);
-        let dir = tempfile::tempdir().unwrap();
+        let target = concat!(env!("CARGO_MANIFEST_DIR"), "/target");
+        std::fs::create_dir_all(target).unwrap();
+        // Not /tmp: the tmp-exec rule would block the plain binary on Linux.
+        let dir = tempfile::tempdir_in(target).unwrap();
         let bin = dir.path().join("tool");
         std::fs::write(&bin, "#!/bin/sh\n").unwrap();
 
@@ -1899,8 +1902,7 @@ mod tests {
         assert_eq!(e.decision, Decision::Allowed);
         assert!(
             e.reason.starts_with("not specifically gated"),
-            "{}",
-            e.reason
+            "unexpected reason"
         );
 
         for mode in [0o4755, 0o2755] {
@@ -1908,14 +1910,13 @@ mod tests {
             let e = explain_exec(&[bin.display().to_string()], &ctx);
             if cfg!(target_os = "macos") {
                 assert_eq!(e.decision, Decision::Blocked, "mode {mode:o}");
-                assert!(e.reason.contains("Seatbelt"), "{}", e.reason);
+                assert!(e.reason.contains("Seatbelt"), "unexpected reason");
                 assert!(e.fix.as_deref().unwrap().contains("outside cplt"));
             } else {
                 assert_eq!(e.decision, Decision::Allowed, "mode {mode:o}");
                 assert!(
                     e.reason.contains("without elevated privileges"),
-                    "{}",
-                    e.reason
+                    "unexpected reason"
                 );
             }
         }
@@ -1927,10 +1928,10 @@ mod tests {
         std::fs::set_permissions(&git_bin, std::fs::Permissions::from_mode(0o4755)).unwrap();
         let e = explain_exec(&[git_bin.display().to_string(), "status".into()], &ctx);
         if cfg!(target_os = "macos") {
-            assert_eq!(e.decision, Decision::Blocked, "{}", e.reason);
-            assert!(e.reason.contains("Seatbelt"), "{}", e.reason);
+            assert_eq!(e.decision, Decision::Blocked, "unexpected reason");
+            assert!(e.reason.contains("Seatbelt"), "unexpected reason");
         } else {
-            assert!(!e.reason.contains("Seatbelt"), "{}", e.reason);
+            assert!(!e.reason.contains("Seatbelt"), "unexpected reason");
         }
     }
 
