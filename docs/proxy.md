@@ -386,6 +386,18 @@ Each agent adds its own endpoints on top of that shared registry base:
 
 These infra lists are best-effort defaults for an opt-in feature. Anything missing shows up as `BLOCKED-ALLOWLIST`, so you can add it.
 
+`cplt config hosts --agent <name>` prints both lists for an agent, as the proxy would use them on this machine. Tools that build cplt config should read `--json` rather than keep a copy:
+
+```bash
+cplt config hosts --agent copilot --json | jq .agent_hosts
+```
+
+The output is one JSON object with three fields:
+
+- `agent_hosts`: the agent's own hosts, always merged into an active allowlist.
+- `default_allowlist`: `agent_hosts` plus the package registries, the list `proxy.default_allowlist` turns on.
+- `version`: `1`. It goes up only if a field is removed or changes meaning; new fields may be added without a bump. An older cplt without the subcommand exits non-zero.
+
 Turn the allowlist on to make the proxy fail-closed, so only these domains and your own additions are allowed:
 
 ```bash
