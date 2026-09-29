@@ -442,9 +442,11 @@ pub fn parse_lines_file(path: &Path) -> Option<Vec<String>> {
 /// at all.
 ///
 /// That is worth a warning rather than silence because of which direction it
-/// fails in. In an allowlist the file is the whole policy, so an entry that
-/// matches nothing does not merely fail to help — it leaves the hosts the user
-/// meant to permit blocked, with an entry on screen that looks exactly right.
+/// fails in. In an allowlist the file is everything the user adds on top of
+/// the agent's own hosts (and the registries, with `default_allowlist`), so an
+/// entry that matches nothing does not merely fail to help — it leaves the
+/// hosts the user meant to permit blocked, with an entry on screen that looks
+/// exactly right.
 /// The user writes the glob they would write in any other tool and gets a
 /// fail-closed session with no explanation.
 fn warn_wildcard_entries(path: &Path, entries: &[String]) {

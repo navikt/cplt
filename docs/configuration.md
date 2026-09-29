@@ -438,9 +438,9 @@ the gh guard is the thing standing between an agent and the wrong repository.
 
 ## Worktrees for sub-agents (`sandbox.allow_git_worktrees`)
 
-Off by default, macOS only. When on, cplt gives the session one directory
-outside your checkout where sub-agents can create Git worktrees for parallel
-work:
+Off by default, macOS only, since 2026.09.24-164900-53d4462. When on, cplt
+gives the session one directory outside your checkout where sub-agents can
+create Git worktrees for parallel work:
 
 ```bash
 cplt config set sandbox.allow_git_worktrees true           # every repository
@@ -538,6 +538,27 @@ What you get:
   until you delete that directory and run `git worktree prune`.
 - The end-of-session audit does not cover the worktrees' contents yet. It
   prints a line saying so. Review them with `git worktree list`.
+
+Two other layouts work too:
+
+- **Starting cplt inside an existing linked worktree.** The root is keyed on
+  the repository's common Git directory, not on the checkout you start from,
+  so a launch from a linked worktree gets the same root as a launch from the
+  main checkout, and the sub-agents' worktrees land next to the ones created
+  from there.
+- **A worktree whose shared `.git` lives in another repository or in a bare
+  repository** (for example `git clone --bare` followed by `git worktree
+  add`). The root is keyed on that shared directory. Independently of this
+  key, cplt grants that directory to the session so Git works in the checkout,
+  with or without `sandbox.allow_git_worktrees`. It grants it only when the shared
+  directory is under `$HOME`, is not a system or temp root, sits where the
+  gitdir says it should (`<common>/worktrees/<name>`), and has none of the
+  characters `"`, `(`, `)`, `;`, `\`, a newline, a carriage return or a NUL
+  byte in its path, since those cannot go into the sandbox profile safely.
+  Otherwise the shared directory is not granted: cplt warns only about the
+  refused characters, and in every case Git fails inside the sandbox. A
+  shared directory that does not sit where the gitdir says (a steered
+  `commondir`) fails the launch when the key is on.
 
 The launch fails, rather than running without the root, if it cannot be
 granted: the root or `~/.cplt-worktrees` is a symlink, is not a directory, or

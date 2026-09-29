@@ -47,7 +47,9 @@ pub enum Decision {
     Blocked,
     /// The probe could not be run to a conclusive result (e.g. the target does
     /// not exist, or a probe prerequisite failed). Never counts as a verified
-    /// protection and never fails the enforcement verdict.
+    /// protection. On a graded battery probe it does fail the enforcement
+    /// verdict (nothing was observed, so it cannot be vouched for), which
+    /// gives a non-zero exit; it is never counted as over-blocked.
     Inconclusive,
 }
 
