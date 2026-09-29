@@ -5932,7 +5932,8 @@ fn probe_read(
 ) -> check::Decision {
     // A missing path fails the open with ENOENT, which the exit code cannot
     // tell apart from a sandbox denial (#621).
-    if !path.exists() {
+    // Only a definite "missing": an unreadable ancestor is for the probe to judge.
+    if matches!(path.try_exists(), Ok(false)) {
         return check::Decision::Inconclusive;
     }
     let script = format!(
@@ -6339,19 +6340,18 @@ fn any_extension_only_match(files: &[String]) -> bool {
 }
 
 /// Resolve a user-supplied check path to an absolute path without requiring it
-/// to exist (canonicalize the existing ancestor, then re-append the tail).
+/// to exist (canonicalize the deepest existing ancestor, then re-append the
+/// tail), so `<proj>/link/missing` is judged where `link` points.
 fn canonicalize_check_path(path: &Path) -> PathBuf {
-    if let Ok(c) = std::fs::canonicalize(path) {
-        return c;
-    }
-    if path.is_absolute() {
+    let abs = if path.is_absolute() {
         path.to_path_buf()
     } else {
         match std::env::current_dir() {
             Ok(d) => d.join(path),
             Err(_) => path.to_path_buf(),
         }
-    }
+    };
+    config::canonicalize_deepest(&abs)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6621,14 +6621,15 @@ fn build_path_check(
         });
 
     let read_dec = probe_read(prepared, resolved, disabled, path);
-    let note = if read_dec == check::Decision::Inconclusive && !path.exists() {
-        Some(format!(
-            "path does not exist, so there is nothing to probe; the policy model predicts {}",
-            expl.read_decision().as_str()
-        ))
-    } else {
-        mismatch_note(read_dec, expl.read_decision())
-    };
+    let note =
+        if read_dec == check::Decision::Inconclusive && matches!(path.try_exists(), Ok(false)) {
+            Some(format!(
+                "path does not exist, so there is nothing to probe; the policy model predicts {}",
+                expl.read_decision().as_str()
+            ))
+        } else {
+            mismatch_note(read_dec, expl.read_decision())
+        };
     items.push(check::CheckItem {
         name: "read".to_string(),
         category: "filesystem".to_string(),
@@ -10282,6 +10283,18 @@ mod tests {
     /// byte-identical to a build without the feature.
     /// #621: a block the model did not predict gets a truthful fix, never
     /// the model's "none needed".
+    #[test]
+    fn check_path_resolves_a_symlink_above_a_missing_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join("link")).unwrap();
+        assert_eq!(
+            super::canonicalize_check_path(&dir.path().join("link/missing")),
+            std::fs::canonicalize(&real).unwrap().join("missing")
+        );
+    }
+
     #[test]
     fn mismatch_fix_only_for_unpredicted_block() {
         use crate::check::Decision::{Allowed, Blocked, Inconclusive};

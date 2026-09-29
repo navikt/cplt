@@ -758,6 +758,15 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
     let base = command_basename(first);
     let rest: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
 
+    // Seatbelt refuses the exec before any guard sees it, so a setuid
+    // `docker`/`git`/`gh` is blocked whatever its guard would say. On Linux
+    // the guards still decide; the bit only changes the reason text below.
+    if cfg!(target_os = "macos")
+        && let Some(e) = explain_setuid(first)
+    {
+        return e;
+    }
+
     // ── Docker family: gated by allow_docker (socket = host RCE) ──
     if matches!(
         base.as_str(),
@@ -1909,6 +1918,19 @@ mod tests {
                     e.reason
                 );
             }
+        }
+
+        // A guarded name does not skip the setuid check on macOS: Seatbelt
+        // refuses the exec before the git guard ever sees it.
+        let git_bin = dir.path().join("git");
+        std::fs::write(&git_bin, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&git_bin, std::fs::Permissions::from_mode(0o4755)).unwrap();
+        let e = explain_exec(&[git_bin.display().to_string(), "status".into()], &ctx);
+        if cfg!(target_os = "macos") {
+            assert_eq!(e.decision, Decision::Blocked, "{}", e.reason);
+            assert!(e.reason.contains("Seatbelt"), "{}", e.reason);
+        } else {
+            assert!(!e.reason.contains("Seatbelt"), "{}", e.reason);
         }
     }
 
