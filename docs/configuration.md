@@ -548,8 +548,9 @@ Two other layouts work too:
   from there.
 - **A worktree whose shared `.git` lives in another repository or in a bare
   repository** (for example `git clone --bare` followed by `git worktree
-  add`). The root is keyed on that shared directory, and cplt grants it to the
-  session so Git works in the checkout. It grants it only when the shared
+  add`). The root is keyed on that shared directory. Independently of this
+  key, cplt grants that directory to the session so Git works in the checkout,
+  with or without `sandbox.allow_git_worktrees`. It grants it only when the shared
   directory is under `$HOME`, is not a system or temp root, sits where the
   gitdir says it should (`<common>/worktrees/<name>`), and has none of the
   characters `"`, `(`, `)`, `;`, `\`, a newline, a carriage return or a NUL

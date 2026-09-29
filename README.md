@@ -981,7 +981,7 @@ cplt config set proxy.allowed_domains "~/.config/cplt/allowed-domains.txt"
 cplt config set proxy.log_file "~/.config/cplt/proxy.log"
 ```
 
-An allowlist always includes the agent's own hosts, but not package registries; add `cplt config set proxy.default_allowlist true` for those. Goose, Pi and Shell have no built-in hosts, and OpenCode's are `opencode.ai` and `models.dev` only, so with those agents the model provider's hosts must be in your allowlist ([docs/proxy.md](docs/proxy.md#allowlist)).
+An allowlist always includes the agent's own hosts, but not package registries; add `cplt config set proxy.default_allowlist true` for those. Goose and Pi have no built-in hosts, and OpenCode's are `opencode.ai` and `models.dev` only, so with those agents the model provider's hosts must be in your allowlist ([docs/proxy.md](docs/proxy.md#allowlist)).
 
 Proxy-forced mode is opt-in. It restricts kernel egress to the proxy port so a socket opened directly, or an `env -u HTTPS_PROXY`, cannot slip past. Enforcement is full on macOS, which pins to `localhost:<proxy_port>`. On Linux it blocks direct TCP `:443`, and a seccomp rule permits only `SOCK_STREAM` with protocol 0 or `IPPROTO_TCP` for `AF_INET`/`AF_INET6`, so UDP, raw, SCTP and DCCP are closed too — at the cost of anything that opens such a socket, not only code that sends UDP. What remains is a port-based residual, `evil.com:<proxy_port>`, until [#114](https://github.com/navikt/cplt/issues/114).
 

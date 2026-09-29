@@ -88,7 +88,7 @@ macOS is unaffected: the Keychain is granted (narrowed per agent by
 
 ## `.env` file blocking
 
-**macOS only.** Landlock cannot deny a file inside a granted directory, so on Linux these files stay readable and writable (the proxy's exfiltration filtering is the mitigation there, not a deny; see [security.md](security.md)).
+**macOS only.** Landlock cannot deny a file inside a granted directory, so on Linux these files stay readable and writable (the proxy's domain filtering limits where a read secret can be sent; nothing denies the read; see [security.md](security.md)).
 
 `.env` and `.env.*` files are **blocked from reading and writing** by default, and so are files named exactly `.pem`, `.key`, `.p12`, `.pfx` or `.jks`. A key file with a longer name, such as `server.pem`, is blocked only with [`sandbox.deny_key_files_by_extension`](configuration.md#denying-key-files-by-extension-sandboxdeny_key_files_by_extension). This stops a rogue agent exfiltrating secrets, but it has side effects.
 
@@ -117,7 +117,7 @@ Or for a single run: `cplt --allow-env-files -- -p "start the dev server"`
 
 ### A tracked protected file breaks git
 
-The table above lists reading. There is a second effect that looks like a git
+The table above lists reading and writing. There is a second effect that looks like a git
 bug rather than a sandbox decision: if one of these files is **tracked by git**
 and has been modified, git commands that hash the worktree fail outright.
 
