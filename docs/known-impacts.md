@@ -518,6 +518,8 @@ Docker is **intentionally blocked**. `~/.docker` is denied, and on macOS the Doc
 - Local databases via Docker Compose need `--allow-localhost <PORT>` for the exposed port (the database container runs outside the sandbox)
 - Consider running database/Kafka containers before starting cplt, then use `--allow-localhost` for the ports
 
+`cplt init` proposes `allow_docker` only for a repo that runs containers during development: one with a compose file, or a Testcontainers dependency. A bare `Dockerfile` gets a diagnostic instead, since the image is usually built in CI and editing the file does not need the daemon.
+
 **Opting in (⚠️ dangerous):** if you understand the risks (container mounts bypass the sandbox entirely), you can allow Docker access:
 
 ```bash

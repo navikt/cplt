@@ -6714,9 +6714,15 @@ paths = [
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("Rust"), "should detect Rust: {stdout}");
         assert!(stdout.contains("Docker"), "should detect Docker: {stdout}");
+        // A bare Dockerfile is built in CI: the socket (root on the host) is
+        // explained in a diagnostic, never proposed.
         assert!(
-            stdout.contains("allow_docker"),
-            "should suggest allow_docker: {stdout}"
+            !stdout.contains("allow_docker = true"),
+            "must not propose allow_docker for a bare Dockerfile: {stdout}"
+        );
+        assert!(
+            stdout.contains("[docker/warning]"),
+            "should explain why allow_docker is not proposed: {stdout}"
         );
     }
 
@@ -6744,7 +6750,7 @@ paths = [
     #[test]
     fn e2e_init_write_creates_file() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("Dockerfile"), "FROM node:20").unwrap();
+        std::fs::write(dir.path().join("compose.yaml"), "services: {}\n").unwrap();
 
         let output = cplt_cmd()
             .args(["init", "--write"])
@@ -6765,7 +6771,7 @@ paths = [
     #[test]
     fn e2e_init_write_refuses_overwrite() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("Dockerfile"), "FROM node:20").unwrap();
+        std::fs::write(dir.path().join("compose.yaml"), "services: {}\n").unwrap();
         std::fs::write(dir.path().join(".cplt.toml"), "# existing").unwrap();
 
         let output = cplt_cmd()
@@ -6785,7 +6791,7 @@ paths = [
     #[test]
     fn e2e_init_write_force_overwrites() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("Dockerfile"), "FROM node:20").unwrap();
+        std::fs::write(dir.path().join("compose.yaml"), "services: {}\n").unwrap();
         std::fs::write(dir.path().join(".cplt.toml"), "# old content").unwrap();
 
         let output = cplt_cmd()
@@ -6805,7 +6811,7 @@ paths = [
     #[test]
     fn e2e_init_quiet_outputs_only_toml() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("Dockerfile"), "FROM node:20").unwrap();
+        std::fs::write(dir.path().join("compose.yaml"), "services: {}\n").unwrap();
 
         let output = cplt_cmd()
             .args(["init", "--quiet"])

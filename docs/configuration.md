@@ -1225,7 +1225,7 @@ Supported ecosystems:
 |-----------|-------------|----------|
 | JVM (Gradle/Maven) | `build.gradle*`, `pom.xml` | `allow_jvm_attach`, read gradle properties; for Gradle also `allow_localhost_any` (the daemon listens on a random loopback port) |
 | Node.js | `package.json` | localhost ports, `allow_localhost_any` (for Next.js/Vite) |
-| Docker | `Dockerfile`, `compose.yml` | `allow_docker` (dangerous), exposed ports |
+| Docker | `Dockerfile`, `compose.yml` | `allow_docker` (dangerous) and exposed ports, for a compose file only. A bare `Dockerfile` gets a diagnostic instead: CI builds the image |
 | Python | `pyproject.toml`, `requirements.txt` | localhost ports (for Django/FastAPI) |
 | Rust | `Cargo.toml` | (works with defaults) |
 | Go | `go.mod` | `allow_localhost_any` when a `_test.go` file imports `net/http/httptest` (its test servers listen on a random loopback port); otherwise nothing |
@@ -1233,7 +1233,7 @@ Supported ecosystems:
 | Environment secrets | `.env.example` | `deny.env` for sensitive variables |
 | Spring Boot | `application.yml` + Spring in Gradle | localhost 8080, PostgreSQL port |
 | Ktor | `application.conf` + Ktor in Gradle | localhost 8080 |
-| TestContainers | `testcontainers` in Gradle deps | `allow_docker` (dangerous), `allow_localhost_any` |
+| TestContainers | `testcontainers` in `build.gradle*`, `gradle/libs.versions.toml`, `pom.xml`, `package.json`, `go.mod`, `pyproject.toml` or `requirements.txt` | `allow_docker` (dangerous), `allow_localhost_any` |
 | Next.js | `next.config.ts/js/mjs` | localhost 3000, `allow_localhost_any` |
 | Vite | `vite.config.ts/js/mjs` | localhost 5173, `allow_localhost_any` |
 | Flyway | `src/main/resources/db/migration` or `.../migrations` | PostgreSQL port 5432 |

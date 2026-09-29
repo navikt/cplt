@@ -7338,6 +7338,10 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         {
             continue;
         }
+        // "allow_docker is not proposed" is false for someone who has it.
+        if diag.detector == "docker" && resolved.allow_docker {
+            continue;
+        }
         findings.push(Finding::warning(
             format!("[{}] {}", diag.detector, diag.message),
             None,

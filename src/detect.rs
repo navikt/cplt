@@ -607,11 +607,34 @@ fn detect_docker(ctx: &DetectContext) -> DetectorOutput {
         }
     }
 
+    for alt in find_alternate_compose_files(ctx) {
+        signals.push(Signal::FileExists { path: alt });
+    }
+
     if signals.is_empty() {
         return DetectorOutput::none();
     }
 
-    let mut suggestions = vec![Suggestion::Propose(SandboxFlag::AllowDocker)];
+    // The Docker socket is root on the host, so it is proposed only where the
+    // project runs containers during development: a compose file, or
+    // Testcontainers (proposed by its own detector). A Dockerfile alone is an
+    // image built in CI, and editing it does not need the daemon.
+    let has_compose = signals
+        .iter()
+        .any(|s| !matches!(s, Signal::FileExists { path } if path == "Dockerfile"));
+    let mut suggestions = Vec::new();
+    let mut diagnostics = Vec::new();
+    if has_compose {
+        suggestions.push(Suggestion::Propose(SandboxFlag::AllowDocker));
+    } else if detect_testcontainers(ctx).detection.is_none() {
+        diagnostics.push(Diagnostic {
+            detector: "docker",
+            message: "Dockerfile without a compose file or Testcontainers, so allow_docker is \
+                      not proposed: the Docker socket is effectively root on the host. \
+                      `docker build` fails inside cplt; build images outside it or in CI."
+                .to_string(),
+        });
+    }
 
     // Content scan: extract port mappings from compose files
     let primary_compose_files = [
@@ -656,11 +679,14 @@ fn detect_docker(ctx: &DetectContext) -> DetectorOutput {
         }
     }
 
-    DetectorOutput::detected(Detection {
-        name: "Docker",
-        signals,
-        suggestions,
-    })
+    DetectorOutput {
+        detection: Some(Detection {
+            name: "Docker",
+            signals,
+            suggestions,
+        }),
+        diagnostics,
+    }
 }
 
 fn detect_python(ctx: &DetectContext) -> DetectorOutput {
@@ -1066,20 +1092,46 @@ fn detect_ktor(ctx: &DetectContext) -> DetectorOutput {
 }
 
 fn detect_testcontainers(ctx: &DetectContext) -> DetectorOutput {
-    let (gradle_file, content) = if let Some(c) = ctx.read_text("build.gradle.kts") {
-        ("build.gradle.kts", c)
-    } else if let Some(c) = ctx.read_text("build.gradle") {
-        ("build.gradle", c)
-    } else {
+    // Where a Testcontainers dependency is declared, matched on its real
+    // coordinates: a bare "testcontainers" also hits a comment, and this
+    // proposal is the Docker socket. Gradle (a version catalog names it
+    // instead of the build script), Maven, npm, Go and Python.
+    fn declares(file: &str, content: &str) -> bool {
+        match file {
+            "package.json" => {
+                content.contains("\"testcontainers\"") || content.contains("\"@testcontainers/")
+            }
+            "go.mod" => content
+                .lines()
+                .any(|l| l.contains("github.com/testcontainers/") && !l.contains("// indirect")),
+            "pyproject.toml" | "requirements.txt" => content.lines().any(|l| {
+                l.trim_start()
+                    .trim_start_matches(['"', '\''])
+                    .starts_with("testcontainers")
+            }),
+            _ => content.contains("org.testcontainers"),
+        }
+    }
+    const MANIFESTS: &[&str] = &[
+        "build.gradle.kts",
+        "build.gradle",
+        "gradle/libs.versions.toml",
+        "pom.xml",
+        "package.json",
+        "go.mod",
+        "pyproject.toml",
+        "requirements.txt",
+    ];
+    let Some((manifest, content)) = MANIFESTS.iter().find_map(|file| {
+        ctx.read_text(file)
+            .filter(|c| declares(file, c))
+            .map(|c| (*file, c))
+    }) else {
         return DetectorOutput::none();
     };
 
-    if !content.contains("testcontainers") {
-        return DetectorOutput::none();
-    }
-
     let mut signals = vec![Signal::FileContains {
-        path: gradle_file.to_string(),
+        path: manifest.to_string(),
         reason: "TestContainers dependency",
     }];
 
@@ -1088,13 +1140,13 @@ fn detect_testcontainers(ctx: &DetectContext) -> DetectorOutput {
         || content.contains("testcontainers.postgresql")
     {
         signals.push(Signal::FileContains {
-            path: gradle_file.to_string(),
+            path: manifest.to_string(),
             reason: "PostgreSQL TestContainer",
         });
     }
     if content.contains("testcontainers:kafka") || content.contains("testcontainers.kafka") {
         signals.push(Signal::FileContains {
-            path: gradle_file.to_string(),
+            path: manifest.to_string(),
             reason: "Kafka TestContainer",
         });
     }
@@ -2363,6 +2415,20 @@ pub fn detect_project_recursive(root: &Path) -> DetectionReport {
         report.diagnostics.extend(member_report.diagnostics);
     }
 
+    // Diagnostics are per directory, the proposal is merged: a root compose
+    // file proposes the socket that a member's bare Dockerfile says was left
+    // out. Drop that claim once it is false, and repeats of the same line.
+    if report
+        .suggestions
+        .contains(&Suggestion::Propose(SandboxFlag::AllowDocker))
+    {
+        report.diagnostics.retain(|d| d.detector != "docker");
+    }
+    let mut seen = BTreeSet::new();
+    report
+        .diagnostics
+        .retain(|d| seen.insert((d.detector, d.message.clone())));
+
     report.workspace_members = members;
     report.provenance = provenance;
     report
@@ -2991,17 +3057,178 @@ mod tests {
 
     // ── Docker detector ──────────────────────────────────────────────
 
+    /// A Dockerfile alone is an image CI builds. Proposing the socket for it
+    /// asked every such repo to grant root on the host for nothing, so it
+    /// gets a diagnostic that says why `docker build` fails instead.
     #[test]
-    fn docker_detects_dockerfile() {
+    fn docker_bare_dockerfile_is_not_proposed() {
         let dir = setup_dir();
         fs::write(dir.path().join("Dockerfile"), "FROM node:20").unwrap();
         let report = detect_project(dir.path());
         assert!(report.detections.iter().any(|d| d.name == "Docker"));
         assert!(
+            !report
+                .suggestions
+                .contains(&Suggestion::Propose(SandboxFlag::AllowDocker))
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.detector == "docker" && d.message.contains("allow_docker")),
+            "{:?}",
+            report.diagnostics
+        );
+    }
+
+    #[test]
+    fn docker_compose_file_is_proposed() {
+        for compose in [
+            "compose.yaml",
+            "docker-compose.yml",
+            "docker-compose.dev.yml",
+        ] {
+            let dir = setup_dir();
+            fs::write(dir.path().join("Dockerfile"), "FROM node:20").unwrap();
+            fs::write(dir.path().join(compose), "services: {}\n").unwrap();
+            let report = detect_project(dir.path());
+            assert!(
+                report
+                    .suggestions
+                    .contains(&Suggestion::Propose(SandboxFlag::AllowDocker)),
+                "{compose}"
+            );
+            assert!(
+                !report.diagnostics.iter().any(|d| d.detector == "docker"),
+                "{compose}"
+            );
+        }
+    }
+
+    /// The name alone is not a dependency: a comment, an indirect Go module
+    /// or a longer package name must not propose the socket.
+    #[test]
+    fn testcontainers_needs_real_coordinates() {
+        for (file, content) in [
+            ("pom.xml", "<!-- we tried testcontainers once -->"),
+            ("package.json", "{\"name\":\"not-testcontainers-here\"}"),
+            (
+                "go.mod",
+                "require github.com/testcontainers/testcontainers-go v0.33.0 // indirect",
+            ),
+            ("requirements.txt", "# testcontainers later\nrequests\n"),
+        ] {
+            let dir = setup_dir();
+            fs::write(dir.path().join(file), content).unwrap();
+            let report = detect_project(dir.path());
+            assert!(
+                !report.detections.iter().any(|d| d.name == "TestContainers"),
+                "{file}"
+            );
+        }
+        for (file, content) in [
+            ("requirements.txt", "testcontainers[postgres]==4.8\n"),
+            (
+                "pyproject.toml",
+                "dependencies = [\n  \"testcontainers>=4\",\n]\n",
+            ),
+            (
+                "package.json",
+                "{\"devDependencies\":{\"testcontainers\":\"^10\"}}",
+            ),
+        ] {
+            let dir = setup_dir();
+            fs::write(dir.path().join(file), content).unwrap();
+            let report = detect_project(dir.path());
+            assert!(
+                report.detections.iter().any(|d| d.name == "TestContainers"),
+                "{file}"
+            );
+        }
+    }
+
+    /// Per-directory diagnostics against a merged proposal: a root compose
+    /// file proposes the socket, so a member's bare Dockerfile must not say
+    /// it was left out. Several bare Dockerfiles say it once.
+    #[test]
+    fn docker_diagnostic_follows_the_merged_proposal() {
+        let dir = setup_dir();
+        for app in ["apps/web", "apps/api"] {
+            fs::create_dir_all(dir.path().join(app)).unwrap();
+            fs::write(dir.path().join(app).join("Dockerfile"), "FROM node:20").unwrap();
+            fs::write(dir.path().join(app).join("package.json"), "{}").unwrap();
+        }
+        let docker_diags = |r: &DetectionReport| {
+            r.diagnostics
+                .iter()
+                .filter(|d| d.detector == "docker")
+                .count()
+        };
+        assert_eq!(docker_diags(&detect_project_recursive(dir.path())), 1);
+
+        fs::write(dir.path().join("compose.yaml"), "services: {}\n").unwrap();
+        let report = detect_project_recursive(dir.path());
+        assert!(
             report
                 .suggestions
                 .contains(&Suggestion::Propose(SandboxFlag::AllowDocker))
         );
+        assert_eq!(docker_diags(&report), 0);
+    }
+
+    /// A repo with only `docker-compose.dev.yml` used to return before the
+    /// alternates were looked at, so it was not detected at all.
+    #[test]
+    fn docker_alternate_compose_only_is_proposed() {
+        let dir = setup_dir();
+        fs::write(dir.path().join("docker-compose.dev.yml"), "services: {}\n").unwrap();
+        let report = detect_project(dir.path());
+        assert!(
+            report
+                .suggestions
+                .contains(&Suggestion::Propose(SandboxFlag::AllowDocker))
+        );
+    }
+
+    /// Testcontainers needs the daemon wherever it is declared, and a repo
+    /// that has it must not also be told allow_docker was left out.
+    #[test]
+    fn docker_testcontainers_in_any_manifest_is_proposed() {
+        for (file, content) in [
+            ("pom.xml", "<groupId>org.testcontainers</groupId>"),
+            (
+                "package.json",
+                "{\"devDependencies\":{\"@testcontainers/postgresql\":\"^10\"}}",
+            ),
+            (
+                "go.mod",
+                "require github.com/testcontainers/testcontainers-go v0.33.0",
+            ),
+            (
+                "gradle/libs.versions.toml",
+                "[libraries]\ntc = { module = \"org.testcontainers:postgresql\" }",
+            ),
+        ] {
+            let dir = setup_dir();
+            fs::write(dir.path().join("Dockerfile"), "FROM node:20").unwrap();
+            fs::create_dir_all(dir.path().join("gradle")).unwrap();
+            fs::write(dir.path().join(file), content).unwrap();
+            let report = detect_project(dir.path());
+            assert!(
+                report.detections.iter().any(|d| d.name == "TestContainers"),
+                "{file}"
+            );
+            assert!(
+                report
+                    .suggestions
+                    .contains(&Suggestion::Propose(SandboxFlag::AllowDocker)),
+                "{file}"
+            );
+            assert!(
+                !report.diagnostics.iter().any(|d| d.detector == "docker"),
+                "{file}"
+            );
+        }
     }
 
     #[test]
