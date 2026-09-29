@@ -495,6 +495,7 @@ mod macos_tests {
             deny_nested_git: false,
             refuse_cache_exec_links: false,
             deny_key_files_by_extension: false,
+            protect_pnpm_config: false,
             deny_copilot_dir_exec: false,
             allow_jvm_attach: false,
             allow_msbuild: false,
@@ -3277,6 +3278,97 @@ mod macos_tests {
             success && output.contains("SECRET=hunter2"),
             "with allow_env_files, .env should be readable, got: {output}"
         );
+    }
+
+    /// `sandbox.protect_pnpm_config` against the real Seatbelt: unset, pnpm's
+    /// config dir is readable and writable as before; set, `auth.ini` and `rc`
+    /// cannot be read or overwritten, `config.yaml` stays readable, and nothing
+    /// new can be written into the dir.
+    #[test]
+    fn real_profile_protect_pnpm_config() {
+        require_sandbox!();
+        if std::env::var_os("XDG_CONFIG_HOME").is_some_and(|v| !v.is_empty()) {
+            eprintln!("skipping: XDG_CONFIG_HOME moves pnpm's config dir out of the test home");
+            return;
+        }
+        let project = fs::canonicalize(".").unwrap();
+        // Under the real HOME: a fake home inside the project or TMPDIR sits
+        // in a writable tree and would pass the write checks for that reason.
+        let fake_home = tempfile::Builder::new()
+            .prefix(".cplt-pnpmcfg-home-")
+            .tempdir_in(home_dir())
+            .expect("create isolated pnpm home");
+        let home = fs::canonicalize(fake_home.path()).unwrap();
+        let cfg = home.join(".config/pnpm");
+        fs::create_dir_all(&cfg).unwrap();
+        for f in ["auth.ini", "rc", "config.yaml"] {
+            fs::write(cfg.join(f), format!("{f}-CONTENT\n")).unwrap();
+        }
+        let cat = |profile: &PathBuf, f: &str| {
+            run_sandboxed(profile, &format!("cat '{}'", cfg.join(f).display()))
+        };
+        let touch = |profile: &PathBuf, f: &str| {
+            let path = cfg.join(f);
+            run_sandboxed(profile, &format!("printf NEW > '{}'", path.display()));
+            fs::read_to_string(&path).ok()
+        };
+
+        let off = write_real_profile(&default_opts(&project, &home));
+        let off_reads: Vec<_> = ["auth.ini", "rc", "config.yaml"]
+            .iter()
+            .map(|f| (*f, cat(&off, f)))
+            .collect();
+        let off_write = touch(&off, "new-off.txt");
+
+        let mut opts = default_opts(&project, &home);
+        opts.protect_pnpm_config = true;
+        let on = write_real_profile(&opts);
+        let on_tokens: Vec<_> = ["auth.ini", "rc"]
+            .iter()
+            .map(|f| (*f, cat(&on, f)))
+            .collect();
+        let on_yaml = cat(&on, "config.yaml");
+        let on_overwrite = touch(&on, "auth.ini");
+        let on_yaml_overwrite = touch(&on, "config.yaml");
+        let on_new = touch(&on, "new-on.txt");
+
+        fs::remove_dir_all(&home).ok();
+        fs::remove_file(&off).ok();
+        fs::remove_file(&on).ok();
+
+        for (f, (output, ok)) in off_reads {
+            assert!(
+                ok && output.contains("CONTENT"),
+                "{f} readable with the key unset: {output}"
+            );
+        }
+        assert_eq!(
+            off_write.as_deref(),
+            Some("NEW"),
+            "dir writable with the key unset"
+        );
+        for (f, (output, ok)) in on_tokens {
+            assert!(
+                !ok && !output.contains("CONTENT"),
+                "{f} must be denied: {output}"
+            );
+        }
+        assert!(
+            on_yaml.1 && on_yaml.0.contains("config.yaml-CONTENT"),
+            "config.yaml readable: {}",
+            on_yaml.0
+        );
+        assert_eq!(
+            on_overwrite.as_deref(),
+            Some("auth.ini-CONTENT\n"),
+            "auth.ini not overwritten"
+        );
+        assert_eq!(
+            on_yaml_overwrite.as_deref(),
+            Some("config.yaml-CONTENT\n"),
+            "config.yaml not overwritten"
+        );
+        assert_eq!(on_new, None, "nothing new written into the dir");
     }
 
     #[test]

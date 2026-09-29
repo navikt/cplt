@@ -1764,9 +1764,13 @@ pub const APP_DIRS: &[AppDir] = &[
         // file grant, or a read-only shadow when it is hardlinked into store.
         process_exec: &[],
         map_exec: &[],
-        // Config/Preference resolve to ~/.config/pnpm only (an empty qualifier
-        // means XDG on every platform). It is writable for `pnpm config set`.
-        // pnpm 11+ keeps global registry tokens there too (`auth.ini`).
+        // Config/Preference resolve to ~/.config/pnpm (or $XDG_CONFIG_HOME/pnpm)
+        // only: an empty qualifier means XDG on every platform. pnpm writes
+        // there only for `pnpm config set --global`, `pnpm login`/`logout` and
+        // (pnpm 12) `pnpm shim`; `pnpm install` just reads config.yaml. The dir
+        // also holds registry tokens: `auth.ini` (pnpm 11+), `rc` (pnpm <= 10).
+        // `sandbox.protect_pnpm_config` makes it read-only and denies those two
+        // files ([`pnpm_config_dirs`], [`PNPM_CREDENTIAL_FILES`]).
         // macOS's native ~/Library/Preferences/pnpm is not covered by this
         // entry; its config.yaml is a read-only HOME_CONFIG_FILES grant.
         //
@@ -1834,6 +1838,44 @@ pub const APP_DIRS: &[AppDir] = &[
         read: DEFAULT_READ_APP_DIRS,
     },
 ];
+
+/// pnpm's registry-token files inside its config dir: `auth.ini` (pnpm 11+,
+/// written by `pnpm login` and `pnpm config set --global //host/:_authToken`)
+/// and `rc` (the same, pnpm 10 and older). Denied, and re-allowable with an
+/// exact `allow.read`, when `sandbox.protect_pnpm_config` is on.
+pub const PNPM_CREDENTIAL_FILES: &[&str] = &["auth.ini", "rc"];
+
+/// pnpm's settings file inside its config dir. The one file the Landlock
+/// backend still grants (read-only) there with `sandbox.protect_pnpm_config`.
+pub const PNPM_CONFIG_YAML: &str = "config.yaml";
+
+/// The config dirs the pnpm [`APP_DIRS`] entry grants (`~/.config/pnpm`, or
+/// `$XDG_CONFIG_HOME/pnpm`). `sandbox.protect_pnpm_config` takes write away
+/// from these and withholds [`PNPM_CREDENTIAL_FILES`] in them.
+pub fn pnpm_config_dirs(home_dir: &Path) -> Vec<PathBuf> {
+    APP_DIRS
+        .iter()
+        .find(|d| d.application == "pnpm")
+        .map(|d| {
+            d.resolve_dedup(
+                &[
+                    AppDirKind::Config,
+                    AppDirKind::ConfigLocal,
+                    AppDirKind::Preference,
+                ],
+                home_dir,
+            )
+        })
+        .unwrap_or_default()
+}
+
+/// [`PNPM_CREDENTIAL_FILES`] in every [`pnpm_config_dirs`] entry.
+pub fn pnpm_credential_files(home_dir: &Path) -> Vec<PathBuf> {
+    pnpm_config_dirs(home_dir)
+        .iter()
+        .flat_map(|d| PNPM_CREDENTIAL_FILES.iter().map(move |f| d.join(f)))
+        .collect()
+}
 
 /// Return the application directory list.
 ///

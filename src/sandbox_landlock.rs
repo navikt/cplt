@@ -562,12 +562,48 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     }
 
     // ── Application directories (filtered by discovery) ──
+    // `sandbox.protect_pnpm_config`: Landlock cannot take `auth.ini` and `rc`
+    // out of a granted directory, so pnpm's config dir gets no rule at all and
+    // its `config.yaml` a read-only file rule instead. A `config.yaml` that
+    // resolves onto a token file (a link an earlier, writable session could
+    // have planted) or into a credential directory gets none.
+    let pnpm_config_dirs = if config.protect_pnpm_config {
+        policy::pnpm_config_dirs(home)
+    } else {
+        Vec::new()
+    };
+    for dir in &pnpm_config_dirs {
+        let yaml = dir.join(policy::PNPM_CONFIG_YAML);
+        let Some(target) = policy::first_party_read_target(home, &yaml) else {
+            continue;
+        };
+        if policy::pnpm_credential_files(home)
+            .iter()
+            .any(|f| std::fs::canonicalize(f).unwrap_or_else(|_| f.clone()) == target)
+        {
+            continue;
+        }
+        fs_rules.push(FsRule {
+            nofollow: false,
+            path: yaml,
+            access: FsAccess {
+                read: true,
+                write: false,
+                execute: false,
+                ioctl: false,
+                create_dirs: false,
+            },
+        });
+    }
     for dir in policy::app_dirs() {
         let process_exec = dir.process_exec_paths(home);
         let write = dir.write_paths(home);
         let read = dir.read_paths(home);
         // all_paths() returns deduplicated union of all categories
         for path in dir.all_paths(home) {
+            if pnpm_config_dirs.contains(&path) {
+                continue;
+            }
             let include = match &config.existing_app_dirs {
                 Some(existing) => existing
                     .iter()
@@ -2795,6 +2831,7 @@ mod tests {
             deny_nested_git: false,
             refuse_cache_exec_links: false,
             deny_key_files_by_extension: false,
+            protect_pnpm_config: false,
             deny_copilot_dir_exec: false,
             allow_jvm_attach: false,
             allow_msbuild: false,
@@ -5375,6 +5412,80 @@ mod tests {
                     );
                 }
             }
+        });
+    }
+
+    /// `sandbox.protect_pnpm_config`: Landlock cannot take files out of a
+    /// granted dir, so with the key on pnpm's config dir gets no rule and its
+    /// `config.yaml` a read-only file rule; with it off the dir rule is the
+    /// read+write one it always was. A `config.yaml` linked onto `auth.ini`
+    /// gets no rule.
+    #[test]
+    fn protect_pnpm_config_replaces_the_dir_grant_with_config_yaml() {
+        let covering = |policy: &LandlockPolicy, p: &Path| -> (bool, bool) {
+            policy
+                .fs_rules
+                .iter()
+                .filter(|r| p.starts_with(&r.path))
+                .fold((false, false), |(r, w), rule| {
+                    (r || rule.access.read, w || rule.access.write)
+                })
+        };
+        // A real, empty home: a fake /home/user is an automount on macOS, and
+        // lookups there can fail in ways a missing file does not.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = std::fs::canonicalize(tmp.path()).expect("canonical");
+        let cfg = home.join(".config/pnpm");
+        crate::with_env_lock_no_xdg(|| {
+            let project = home.join("project");
+            let mut config = test_config(&project, &home);
+            let off = generate_policy(&config);
+            let dir_rules: Vec<&FsRule> = off.fs_rules.iter().filter(|r| r.path == cfg).collect();
+            assert_eq!(dir_rules.len(), 1, "key off: one rule for the dir");
+            assert!(dir_rules[0].access.read && dir_rules[0].access.write);
+            assert!(
+                !off.fs_rules
+                    .iter()
+                    .any(|r| r.path.starts_with(&cfg) && r.path != cfg)
+            );
+
+            config.protect_pnpm_config = true;
+            let on = generate_policy(&config);
+            let y = cfg.join("config.yaml");
+            assert_eq!(
+                covering(&on, &y),
+                (true, false),
+                "config.yaml read-only; dirs={:?} target={:?} state={:?}",
+                policy::pnpm_config_dirs(&home),
+                policy::first_party_read_target(&home, &y),
+                policy::cplt_state_dir_grant(&home, &y)
+            );
+            for f in ["auth.ini", "rc", "other"] {
+                assert_eq!(covering(&on, &cfg.join(f)), (false, false), "{f}");
+            }
+            assert_eq!(covering(&on, &cfg), (false, false), "no dir rule");
+            let rest = |p: &LandlockPolicy| {
+                p.fs_rules
+                    .iter()
+                    .filter(|r| !r.path.starts_with(&cfg))
+                    .map(|r| format!("{r:?}"))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(rest(&off), rest(&on), "nothing outside the dir changes");
+        });
+
+        std::fs::create_dir_all(&cfg).expect("mkdir");
+        std::fs::write(cfg.join("auth.ini"), "//r/:_authToken=x\n").expect("write");
+        std::os::unix::fs::symlink(cfg.join("auth.ini"), cfg.join("config.yaml")).expect("symlink");
+        crate::with_env_lock_no_xdg(|| {
+            let project = home.join("project");
+            let mut config = test_config(&project, &home);
+            config.protect_pnpm_config = true;
+            let policy = generate_policy(&config);
+            assert!(
+                !policy.fs_rules.iter().any(|r| r.path.starts_with(&cfg)),
+                "a config.yaml linked onto auth.ini gets no rule"
+            );
         });
     }
 

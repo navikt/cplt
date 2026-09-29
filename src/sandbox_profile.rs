@@ -29,8 +29,8 @@ use super::policy::{
     colima_socket_paths, copilot_default_pkg_dir, current_uid, cypress_app_data_dir_with_env,
     cypress_runtime_intent, escape_regex, first_party_read_target, grant_is_refused,
     home_config_link_targets, missing_home_config_link_targets, nested_alternation, path_bin_dirs,
-    playwright_runtime_intent, read_only_home_config, rel_is_glob, rel_regex,
-    validate_playwright_socket_dir, validate_sbpl_path,
+    playwright_runtime_intent, pnpm_config_dirs, pnpm_credential_files, read_only_home_config,
+    rel_is_glob, rel_regex, validate_playwright_socket_dir, validate_sbpl_path,
 };
 
 /// Device nodes a sandboxed process may open for writing, by exact path.
@@ -155,6 +155,7 @@ pub fn generate_profile_with_playwright_socket_dir(
         config.allow_cache_exec,
         config.allow_cache_exec_any,
         Path::new(XCODE_SELECT_LINK),
+        config.protect_pnpm_config,
     );
     emit_agent_exec_carveouts(&mut sb, config.agent_dirs);
     emit_copilot_install(&mut sb, config.copilot_install_dir);
@@ -189,7 +190,12 @@ pub fn generate_profile_with_playwright_socket_dir(
         allow_cypress_runtime,
     );
     emit_deny_rules(&mut sb, config, &home);
-    emit_registry_config_overrides(&mut sb, &home, config.extra_read);
+    emit_registry_config_overrides(
+        &mut sb,
+        &home,
+        config.extra_read,
+        config.protect_pnpm_config,
+    );
     emit_denied_dotfile_overrides(
         &mut sb,
         &home,
@@ -1484,6 +1490,7 @@ fn emit_tool_dirs(
     allow_cache_exec: &[String],
     allow_cache_exec_any: bool,
     xcode_select_link: &Path,
+    protect_pnpm_config: bool,
 ) {
     let home = home_dir.to_string_lossy();
     sbpl!(sb, ";; Developer tools");
@@ -1551,9 +1558,17 @@ fn emit_tool_dirs(
     // App dirs: absolute paths resolved from XDG/macOS conventions.
     // Use discovered existing dirs if available, else include all.
     // Per-path filtering: each path is checked individually against existing_app_dirs.
+    // `sandbox.protect_pnpm_config`: pnpm's config dir stays readable but not
+    // writable; its token files are denied in `emit_deny_rules`.
+    let read_only_app_dirs = if protect_pnpm_config {
+        pnpm_config_dirs(home_dir)
+    } else {
+        Vec::new()
+    };
     for dir in app_dirs() {
         let read_paths = dir.read_paths(home_dir);
-        let write_paths = dir.write_paths(home_dir);
+        let mut write_paths = dir.write_paths(home_dir);
+        write_paths.retain(|p| !read_only_app_dirs.contains(p));
         let process_exec_paths = dir.process_exec_paths(home_dir);
         let map_exec_paths = dir.map_exec_paths(home_dir);
 
@@ -2510,10 +2525,22 @@ fn emit_deny_rules(sb: &mut String, config: &SandboxConfig, home: &str) {
     let dirs: Vec<Vec<String>> = DENIED_DOTFILES.iter().map(|d| spell(d, true)).collect();
     // Hard-denied files, then the credential files inside allowed tool dirs
     // (the latter overridable with --allow-read, so no warning).
+    // `sandbox.protect_pnpm_config` adds pnpm's token files, absolute paths
+    // (`$HOME.join` keeps them as they are), overridable like the subpaths.
+    let pnpm_files: Vec<String> = if config.protect_pnpm_config {
+        pnpm_credential_files(config.home_dir)
+            .iter()
+            .filter(|p| validate_sbpl_path(p).is_ok())
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect()
+    } else {
+        Vec::new()
+    };
     let files: Vec<Vec<String>> = DENIED_FILES
         .iter()
         .map(|f| spell(f, true))
         .chain(DENIED_HOME_SUBPATHS.iter().map(|f| spell(f, false)))
+        .chain(pnpm_files.iter().map(|f| spell(f, false)))
         .collect();
     sbpl!(sb, ";; Sensitive directories — DENIED");
     for p in dirs.iter().flatten() {
@@ -2633,12 +2660,30 @@ fn spellings(named: &Path, target: &Path) -> Vec<String> {
 /// The re-allow names both spellings, like the deny it overrides: SBPL checks
 /// the resolved path, so when the file is a symlink only the resolved literal
 /// takes effect, and it has to come after the resolved deny.
-fn emit_registry_config_overrides(sb: &mut String, home: &str, extra_read: &[PathBuf]) {
+fn emit_registry_config_overrides(
+    sb: &mut String,
+    home: &str,
+    extra_read: &[PathBuf],
+    protect_pnpm_config: bool,
+) {
     let home_path = Path::new(home);
-    let mut overrides: Vec<&str> = Vec::new();
+    let mut overrides: Vec<String> = Vec::new();
 
-    for &file in DENIED_HOME_SUBPATHS {
-        let full_path = resolved(home_path.join(file));
+    // `sandbox.protect_pnpm_config`'s token files are absolute; joining one
+    // onto `$HOME` leaves it as it is.
+    let pnpm_files = if protect_pnpm_config {
+        let mut files = pnpm_credential_files(home_path);
+        files.retain(|p| validate_sbpl_path(p).is_ok());
+        files
+    } else {
+        Vec::new()
+    };
+    let candidates = DENIED_HOME_SUBPATHS
+        .iter()
+        .map(|f| (*f).to_string())
+        .chain(pnpm_files.iter().map(|p| p.to_string_lossy().into_owned()));
+    for file in candidates {
+        let full_path = resolved(home_path.join(&file));
         if extra_read.iter().any(|p| p == &full_path) {
             overrides.push(file);
         }
@@ -3282,6 +3327,71 @@ mod tests {
         ] {
             assert!(p.contains(rule), "MISSING without git_common_dir: {rule}");
         }
+    }
+
+    /// `sandbox.protect_pnpm_config` off keeps pnpm's config dir exactly as it
+    /// was granted before the key existed (read, write, and the exec denies
+    /// that go with write), and the key changes no line outside that dir. On,
+    /// the dir loses write, and `auth.ini` and `rc` are denied after every
+    /// allow (last-match-wins) while `config.yaml` stays readable through the
+    /// dir grant. An exact `allow.read` on a token file re-allows it.
+    #[test]
+    fn protect_pnpm_config_denies_token_files_only_when_set() {
+        crate::with_env_lock_no_xdg(|| {
+            let project = std::path::Path::new("/projects/app");
+            let home = std::path::Path::new("/Users/test");
+            let cfg = "/Users/test/.config/pnpm";
+            let before = [
+                format!("(allow file-read* (subpath \"{cfg}\"))"),
+                format!("(allow file-write* (subpath \"{cfg}\"))"),
+                format!("(deny process-exec (subpath \"{cfg}\"))"),
+                format!("(deny file-map-executable (subpath \"{cfg}\"))"),
+            ];
+            let mut opts = test_options(project, home);
+            let off = generate_profile(&opts, &[]);
+            let off_cfg: Vec<&str> = off.lines().filter(|l| l.contains(cfg)).collect();
+            assert_eq!(
+                off_cfg, before,
+                "key off: the pnpm config rules are unchanged"
+            );
+
+            opts.protect_pnpm_config = true;
+            let on = generate_profile(&opts, &[]);
+            let changed: Vec<&str> = off
+                .lines()
+                .filter(|l| !on.lines().any(|o| o == *l))
+                .chain(on.lines().filter(|l| !off.lines().any(|o| o == *l)))
+                .collect();
+            assert!(
+                changed.iter().all(|l| l.contains(cfg)),
+                "the key touches only pnpm's config dir: {changed:?}"
+            );
+            assert!(on.contains(&before[0]), "config.yaml stays readable");
+            assert!(!on.contains(&before[1]), "no write on the config dir");
+            let read_allow = on.find(&before[0]).expect("read allow");
+            for f in ["auth.ini", "rc"] {
+                for op in ["file-read*", "file-write*"] {
+                    let deny = format!("(deny {op} (literal \"{cfg}/{f}\"))");
+                    let at = on.find(&deny).unwrap_or_else(|| panic!("missing {deny}"));
+                    assert!(at > read_allow, "{deny} must follow the dir allow");
+                }
+            }
+            assert!(!on.contains(&format!("{cfg}/config.yaml")));
+
+            let token = [std::path::PathBuf::from(format!("{cfg}/auth.ini"))];
+            opts.extra_read = &token;
+            let reopened = generate_profile(&opts, &[]);
+            let allow = format!("(allow file-read* (literal \"{cfg}/auth.ini\"))");
+            let deny = format!("(deny file-read* (literal \"{cfg}/auth.ini\"))");
+            assert!(
+                reopened.rfind(&allow) > reopened.rfind(&deny),
+                "an exact allow.read re-allows the token file after its deny"
+            );
+            assert!(
+                !reopened.contains(&format!("(allow file-read* (literal \"{cfg}/rc\"))")),
+                "and only that file"
+            );
+        });
     }
 
     /// #514: the PATH shim dir is write-denied once it exists, after every
@@ -3938,6 +4048,7 @@ mod tests {
             deny_nested_git: false,
             refuse_cache_exec_links: false,
             deny_key_files_by_extension: false,
+            protect_pnpm_config: false,
             deny_copilot_dir_exec: false,
             allow_jvm_attach: false,
             allow_msbuild: false,
@@ -3967,6 +4078,7 @@ mod tests {
             &[],
             false,
             xcode_select_link,
+            false,
         );
         sb
     }

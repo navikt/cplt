@@ -236,6 +236,9 @@ pub struct SandboxConfig<'a> {
     /// `*.pfx` and `*.jks` by extension, not only files named exactly `.pem`.
     /// macOS only; Linux has no name-pattern denies.
     pub deny_key_files_by_extension: bool,
+    /// `sandbox.protect_pnpm_config`: pnpm's XDG config dir is read-only and
+    /// its token files (`auth.ini`, `rc`) are denied, on both backends.
+    pub protect_pnpm_config: bool,
     /// `sandbox.deny_copilot_dir_exec` (#324). The grant itself is withdrawn
     /// in `agent_dirs` before this config is built; the flag is here so the
     /// Linux launch can warn about what Landlock unions back in.
@@ -2794,6 +2797,7 @@ mod tests {
             deny_nested_git: false,
             refuse_cache_exec_links: false,
             deny_key_files_by_extension: false,
+            protect_pnpm_config: false,
             deny_copilot_dir_exec: false,
             allow_jvm_attach: false,
             allow_msbuild: false,
