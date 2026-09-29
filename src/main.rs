@@ -6730,39 +6730,79 @@ fn mismatch_fix(
 /// public host whose A record points at a private/link-local IP
 /// (10.x/172.16.x/192.168.x/169.254.169.254) with BLOCKED-PRIVATE-RESOLVED.
 ///
-/// Returns `Some(blocked item)` when the resolved IP is blocked (so check
-/// reports BLOCKED, matching live enforcement, and never runs the reachability
-/// probe for such a target); returns `None` when the resolved IP passes the
-/// guard OR the host does not resolve here (in which case the pre-DNS ALLOWED
-/// verdict stands and `probe_reachable` reports the resolution failure honestly,
-/// exactly as the live proxy would then hit DNS-FAIL rather than a policy block).
+/// Returns `Err(blocked item)` when EVERY resolved IP is blocked (the live
+/// proxy then refuses the answer, so check reports BLOCKED, matching live
+/// enforcement, and never runs the reachability probe for such a target).
+/// Otherwise returns `Ok` with the blocked IPs the live proxy skips (empty when
+/// all pass, or when the host does not resolve here: the pre-DNS ALLOWED
+/// verdict then stands and `probe_reachable` reports the resolution failure
+/// honestly, exactly as the live proxy would then hit DNS-FAIL rather than a
+/// policy block).
 ///
-/// Uses the same resolver ([`proxy::resolve_socket_addr`]) and guard
+/// Uses the same resolver ([`proxy::resolve_socket_addrs`]) and guard
 /// ([`proxy::resolved_ip_is_blocked`]) as the live path, with the same
 /// localhost-opt-in and `allow_private_domains` semantics.
 fn resolved_ip_block_item(
     net_policy: &proxy::NetPolicy,
     host: &str,
     port: u16,
-) -> Option<check::CheckItem> {
-    let addr = proxy::resolve_socket_addr(host, port)?;
+) -> Result<Vec<std::net::IpAddr>, Box<check::CheckItem>> {
+    resolved_ip_verdict(
+        net_policy,
+        host,
+        port,
+        &proxy::resolve_socket_addrs(host, port),
+    )
+}
+
+/// [`resolved_ip_block_item`] for an answer already in hand.
+fn resolved_ip_verdict(
+    net_policy: &proxy::NetPolicy,
+    host: &str,
+    port: u16,
+    addrs: &[std::net::SocketAddr],
+) -> Result<Vec<std::net::IpAddr>, Box<check::CheckItem>> {
     let localhost_opt_in =
         net_policy.allow_localhost_any || net_policy.allow_localhost_ports.contains(&port);
     let host_is_private_domain = proxy::is_domain_match(host, &net_policy.private_domains);
-    if !proxy::resolved_ip_is_blocked(&addr.ip(), host_is_private_domain, localhost_opt_in) {
-        return None;
+    if addrs.is_empty() {
+        return Ok(Vec::new());
     }
-    Some(check::CheckItem {
+    // The live proxy's own post-DNS decision, so check cannot drift from it.
+    let refusal = match proxy::classify_resolved(
+        addrs,
+        false,
+        proxy::localhost_connect_allowed(&proxy::normalize_hostname(host), localhost_opt_in),
+        localhost_opt_in,
+        host_is_private_domain,
+    ) {
+        proxy::ConnectRoute::Refuse(r) => r,
+        proxy::ConnectRoute::Direct(kept) => {
+            return Ok(addrs
+                .iter()
+                .filter(|a| !kept.contains(a))
+                .map(std::net::SocketAddr::ip)
+                .collect());
+        }
+        // Not reachable: classified without an upstream.
+        proxy::ConnectRoute::Upstream => return Ok(Vec::new()),
+    };
+    let first = addrs[0].ip();
+    let why = if refusal == proxy::Refusal::ResolvedNonLoopback {
+        "not loopback, which a localhost target must resolve to"
+    } else {
+        "a private / loopback / link-local IP"
+    };
+    Err(Box::new(check::CheckItem {
         name: "BLOCKED-PRIVATE-RESOLVED".to_string(),
         category: "network".to_string(),
         target: format!("{host}:{port}"),
         decision: check::Decision::Blocked,
         expected: None,
         reason: format!(
-            "{host} resolves to {}, a private / loopback / link-local IP the proxy blocks \
+            "{host} resolves to {first}, {why}: the proxy blocks it \
              AFTER DNS (BLOCKED-PRIVATE-RESOLVED) as an SSRF / DNS-rebinding safeguard \
-             (e.g. cloud metadata 169.254.169.254, internal services).",
-            addr.ip()
+             (e.g. cloud metadata 169.254.169.254, internal services)."
         ),
         fix: Some(
             // Post-DNS verdict: the host HAS a name, so allow_private_domains can
@@ -6773,7 +6813,7 @@ fn resolved_ip_block_item(
                 .to_string(),
         ),
         note: None,
-    })
+    }))
 }
 
 fn build_net_check(
@@ -6792,18 +6832,27 @@ fn build_net_check(
     // check never reports ALLOWED — nor probes reachability (which cplt runs
     // OUTSIDE the sandbox, where private IPs ARE reachable) — for a target the
     // live proxy would block on its resolved IP.
-    if proxy_enabled
-        && expl.decision == check::Decision::Allowed
-        && let Some(item) = resolved_ip_block_item(net_policy, &host, port)
-    {
-        return check::Report::new(agent_name, preset_name, false, vec![item]);
+    let mut skipped = Vec::new();
+    if proxy_enabled && expl.decision == check::Decision::Allowed {
+        match resolved_ip_block_item(net_policy, &host, port) {
+            Err(item) => return check::Report::new(agent_name, preset_name, false, vec![*item]),
+            Ok(s) => skipped = s,
+        }
     }
 
-    let note = if !no_connect && expl.decision == check::Decision::Allowed && proxy_enabled {
+    let mut note = if !no_connect && expl.decision == check::Decision::Allowed && proxy_enabled {
         Some(probe_reachable(&host, port))
     } else {
         None
     };
+    if !skipped.is_empty() {
+        let list: Vec<_> = skipped.iter().map(ToString::to_string).collect();
+        let skip = format!(
+            "the proxy skips {}: private / loopback / link-local, blocked after DNS",
+            list.join(", ")
+        );
+        note = Some(note.map_or(skip.clone(), |n| format!("{n}; {skip}")));
+    }
 
     let item = check::CheckItem {
         name: expl.status.clone(),
@@ -12238,16 +12287,38 @@ mod tests {
         let policy = proxy::NetPolicy::default();
 
         let item = resolved_ip_block_item(&policy, "10.0.0.1", 443)
-            .expect("a private resolved IP must be reported BLOCKED");
+            .expect_err("a private resolved IP must be reported BLOCKED");
         assert_eq!(item.decision, check::Decision::Blocked);
         assert_eq!(item.name, "BLOCKED-PRIVATE-RESOLVED");
 
         // Cloud metadata endpoint (link-local) is likewise blocked post-DNS.
-        assert!(resolved_ip_block_item(&policy, "169.254.169.254", 443).is_some());
+        assert!(resolved_ip_block_item(&policy, "169.254.169.254", 443).is_err());
 
         // A public resolved IP passes the guard, so the pre-DNS ALLOWED verdict
         // stands and reachability may then be probed.
-        assert!(resolved_ip_block_item(&policy, "1.1.1.1", 443).is_none());
+        assert_eq!(
+            resolved_ip_block_item(&policy, "1.1.1.1", 443).ok(),
+            Some(vec![])
+        );
+
+        // A mixed answer is ALLOWED, as the live proxy connects to the public
+        // address; the private one is reported as skipped. Only an answer with
+        // nothing left is BLOCKED.
+        let a = |s: &str| -> std::net::SocketAddr { format!("{s}:443").parse().unwrap() };
+        let (public, private) = (a("1.1.1.1"), a("10.0.0.1"));
+        assert_eq!(
+            resolved_ip_verdict(&policy, "mixed.example", 443, &[public, private]).ok(),
+            Some(vec![private.ip()])
+        );
+        assert!(
+            resolved_ip_verdict(
+                &policy,
+                "mixed.example",
+                443,
+                &[private, a("169.254.169.254")]
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -12260,20 +12331,31 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            resolved_ip_block_item(&trusted, "10.0.0.1", 443).is_none(),
+            resolved_ip_block_item(&trusted, "10.0.0.1", 443).ok() == Some(vec![]),
             "allow_private_domains must waive the resolved-IP block, matching live"
         );
 
         // Loopback without opt-in → blocked (default no-localhost posture).
         let no_optin = proxy::NetPolicy::default();
-        assert!(resolved_ip_block_item(&no_optin, "127.0.0.1", 443).is_some());
+        assert!(resolved_ip_block_item(&no_optin, "127.0.0.1", 443).is_err());
 
         // Loopback with opt-in → waived (matches resolved_ip_is_blocked semantics).
         let optin = proxy::NetPolicy {
             allow_localhost_any: true,
             ..Default::default()
         };
-        assert!(resolved_ip_block_item(&optin, "127.0.0.1", 443).is_none());
+        assert!(resolved_ip_block_item(&optin, "127.0.0.1", 443).ok() == Some(vec![]));
+
+        // The localhost carve-out: a `localhost` name must resolve to loopback,
+        // so a public address in its answer is skipped, and an answer with no
+        // loopback left is BLOCKED, as in the live proxy.
+        let a = |s: &str| -> std::net::SocketAddr { format!("{s}:443").parse().unwrap() };
+        let (lo, public) = (a("127.0.0.1"), a("1.1.1.1"));
+        assert_eq!(
+            resolved_ip_verdict(&optin, "localhost", 443, &[lo, public]).ok(),
+            Some(vec![public.ip()])
+        );
+        assert!(resolved_ip_verdict(&optin, "localhost", 443, &[public]).is_err());
     }
 
     /// Run git in `dir` isolated from the caller's global and system config
