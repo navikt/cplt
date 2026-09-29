@@ -254,7 +254,15 @@ impl DomainPolicy {
             allowed: DomainList::new(
                 spec.default_allowlist
                     .into_iter()
-                    .chain(spec.extra_allowed_domains)
+                    // Only widens an allowlist already in force. Merged into an
+                    // inactive one, it would trip `classify_connect`'s
+                    // non-empty backstop and make `allow.domains` alone (or
+                    // under --allow-all-domains) deny every other host.
+                    .chain(if allowlist_active {
+                        spec.extra_allowed_domains
+                    } else {
+                        Vec::new()
+                    })
                     .collect(),
                 spec.allowed_domains_file,
                 parse_lines_file,
@@ -1082,6 +1090,26 @@ mod tests {
         );
         assert!(policy.allowlist_active);
         assert_eq!(policy.allowed_domains(now), vec!["github.com"]);
+    }
+
+    /// `allow.domains` widens an allowlist in force and never switches one
+    /// on: alone it must leave the proxy allow-all, not deny every other host
+    /// through `classify_connect`'s non-empty backstop.
+    #[test]
+    fn extra_allowed_domains_alone_do_not_enforce() {
+        let now = Instant::now();
+        let p = policy(
+            PolicySpec {
+                extra_allowed_domains: vec!["extra.example.com".into()],
+                ..PolicySpec::default()
+            },
+            now,
+        );
+        assert!(!p.allowlist_active);
+        assert_eq!(
+            crate::proxy::classify_connect(&p.net_policy(now), "other.example", 443),
+            crate::proxy::NetVerdict::Allowed
+        );
     }
 
     /// The four states F03 conflated. `allowlist_active` is what separates

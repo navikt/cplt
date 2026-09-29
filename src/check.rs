@@ -504,7 +504,7 @@ pub fn explain_domain(
             Decision::Blocked,
             "a fail-closed domain allowlist is active and this host is not in it \
              (the agent's own hosts, the package registries when proxy.default_allowlist \
-             is on, and your allowed_domains)."
+             is on, your allowed_domains and [allow] domains)."
                 .to_string(),
             Some(
                 "add it to allowed_domains (--allowed-domains FILE / [proxy] allowed_domains), \
