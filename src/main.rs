@@ -7486,6 +7486,28 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
             resolved.use_bubblewrap,
         ));
     }
+
+    // ── guards: the three verdicts an agent workflow hits first ──
+    // The same decision `cplt check exec` and the launch make, for this repo.
+    let named: Vec<&Path> = repo_paths.iter().map(PathBuf::as_path).collect();
+    let exec_ctx = check::ExecContext::for_launch(&resolved, &project_dir, &named);
+    for (label, cmd) in [
+        ("push feature", "git push origin HEAD:cplt-doctor-probe"),
+        ("push main", "git push origin HEAD:main"),
+        ("pr merge", "gh pr merge"),
+    ] {
+        let argv: Vec<String> = cmd.split(' ').map(String::from).collect();
+        let e = check::explain_exec(&argv, &exec_ctx);
+        println!("guard:       {label:<14}{}", e.decision.as_str());
+        // A blocked feature-branch push breaks the branch-and-PR workflow;
+        // the other two are blocked by design and need no explanation.
+        if label == "push feature" && e.decision == check::Decision::Blocked {
+            findings.push(Finding::warning(
+                format!("git guard refuses a feature-branch push here: {}", e.reason),
+                e.fix,
+            ));
+        }
+    }
     println!();
 
     findings.extend(doctor::wsl_drive_project_finding(&project_dir, wsl));

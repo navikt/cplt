@@ -827,6 +827,18 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
             objection: None,
         };
     };
+    // `cplt check exec "git push origin main"` hands over one word. Judged as
+    // a command named `git push origin main`, it matched no guard and read
+    // "not specifically gated", while `cplt exec` blocks the same push. Split
+    // it the way the shell would have without the quotes, unless the word is
+    // an existing path (a binary under a directory with a space in it).
+    if let [only] = argv
+        && only.split_whitespace().nth(1).is_some()
+        && !Path::new(only).exists()
+    {
+        let words: Vec<String> = only.split_whitespace().map(String::from).collect();
+        return explain_exec(&words, ctx);
+    }
     let base = command_basename(first);
     let rest: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
 
@@ -1035,11 +1047,25 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
         return e;
     }
 
+    let mut reason = "not specifically gated. It runs inside the sandbox, subject to the \
+                      filesystem, network, and env policy."
+        .to_string();
+    // `sh -c "git push origin main"`, `make release`: the guards are PATH
+    // shims, so a git or gh this command starts is judged when it runs, not
+    // here. Saying only "not gated" read as "the push inside is allowed".
+    if argv[1..]
+        .iter()
+        .flat_map(|a| a.split_whitespace())
+        .any(|w| matches!(command_basename(w).as_str(), "git" | "gh"))
+    {
+        reason.push_str(
+            " Any git or gh it starts still passes through the guards when it runs; \
+             check that command directly, e.g. `cplt check exec git push origin main`.",
+        );
+    }
     ExecExplain {
         decision: Decision::Allowed,
-        reason: "not specifically gated. It runs inside the sandbox, subject to the \
-                 filesystem, network, and env policy."
-            .to_string(),
+        reason,
         fix: None,
         objection: None,
     }
@@ -1744,6 +1770,38 @@ mod tests {
             &ctx,
         );
         assert_eq!(e.decision, Decision::Blocked);
+    }
+
+    /// `cplt check exec "gh pr merge 1"` (one quoted word) must get the verdict
+    /// `cplt exec` gives, not "not specifically gated" (navikt/copilot#1348).
+    #[test]
+    fn a_quoted_command_is_judged_like_the_unquoted_one() {
+        let gh = GhGuardPolicy {
+            enabled: true,
+            ..GhGuardPolicy::default()
+        };
+        let git = GitGuardPolicy {
+            enabled: true,
+            ..GitGuardPolicy::default()
+        };
+        let ctx = exec_ctx(&gh, &git, false);
+        for cmd in ["git push origin main", "gh pr merge 1"] {
+            let e = explain_exec(&[cmd.into()], &ctx);
+            assert_eq!(e.decision, Decision::Blocked, "{cmd}: {}", e.reason);
+        }
+        // A shell wrapping the push: exec decides at run time, and says so.
+        let e = explain_exec(
+            &["sh".into(), "-c".into(), "git push origin main".into()],
+            &ctx,
+        );
+        assert_eq!(e.decision, Decision::Allowed);
+        assert!(
+            e.reason.contains("passes through the guards when it runs"),
+            "{}",
+            e.reason
+        );
+        let e = explain_exec(&["node".into(), "app.js".into()], &ctx);
+        assert!(!e.reason.contains("guards when it runs"), "{}", e.reason);
     }
 
     #[test]
