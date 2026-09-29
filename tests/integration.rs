@@ -2350,6 +2350,53 @@ mod macos_tests {
         );
     }
 
+    /// #618: packages ship `.claude/settings.local.json` (thread-stream@4.2.0),
+    /// and the nested deny made installing them fail with EPERM. Dependency
+    /// trees are excepted — write, and remove the package — while the project
+    /// root and a nested non-dependency directory stay denied.
+    #[test]
+    fn real_profile_allows_claude_settings_inside_node_modules() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let tmp = project.join(format!(".claude-nm-{}", std::process::id()));
+        for d in [
+            ".claude",
+            "sub/.claude",
+            "node_modules/.pnpm/x/node_modules/x",
+        ] {
+            fs::create_dir_all(tmp.join(d)).unwrap();
+        }
+        let tmp = fs::canonicalize(&tmp).unwrap();
+        let home = home_dir();
+        let profile = write_real_profile(&default_opts(&tmp, &home));
+
+        let write = |rel: &str| {
+            let cmd = format!(
+                "mkdir -p '{0}' && echo {{}} > '{0}/settings.local.json' 2>&1; echo EXIT:$?",
+                tmp.join(rel).display()
+            );
+            run_sandboxed(&profile, &cmd).0
+        };
+        let dep = write("node_modules/.pnpm/x/node_modules/x/.claude");
+        let root = write(".claude");
+        let sub = write("sub/.claude");
+        let rm = run_sandboxed(
+            &profile,
+            &format!(
+                "rm -rf '{}' 2>&1; echo EXIT:$?",
+                tmp.join("node_modules").display()
+            ),
+        )
+        .0;
+
+        fs::remove_dir_all(&tmp).ok();
+        fs::remove_file(&profile).ok();
+        assert!(dep.contains("EXIT:0"), "node_modules write denied: {dep}");
+        assert!(rm.contains("EXIT:0"), "node_modules removal denied: {rm}");
+        assert!(root.contains("EXIT:1"), "root .claude writable: {root}");
+        assert!(sub.contains("EXIT:1"), "nested .claude writable: {sub}");
+    }
+
     /// H-11: OpenCode auto-imports `.opencode/{plugin,plugins,tool,tools}/*` at
     /// startup, but also writes `.opencode/{node_modules,.gitignore,*.lock}`
     /// there every run. So the deny is surgical — the exec subdirs, not the

@@ -455,10 +455,19 @@ fn emit_sensitive_project_denies(
             // A repo nested under a writable root needs this too: `allow.write
             // ~/code` leaves `~/code/other-repo/.agents/plugins` writable, and a
             // manifest there fires whichever agent next opens THAT repo.
+            // Not inside `node_modules` (#618): packages ship these names
+            // (thread-stream has `.claude/settings.local.json`), no agent loads
+            // config from a dependency directory, and code under
+            // `node_modules` already runs on the host through npm scripts —
+            // the deny there broke installs and protected nothing.
             if p.nested {
                 let r = escape_regex(root);
                 let rel = rel_regex(p.rel);
-                sbpl!(sb, "(deny file-write* (regex #\"^{r}/.+/{rel}($|/)\"))");
+                sbpl!(
+                    sb,
+                    "(deny file-write* (require-all (regex #\"^{r}/.+/{rel}($|/)\") {}))",
+                    not_in_node_modules(&r)
+                );
             }
         }
         sbpl!(sb);
@@ -484,8 +493,14 @@ fn emit_sensitive_project_denies(
         for root in &roots {
             let r = escape_regex(root);
             sbpl!(sb, "(deny file-write-unlink (regex #\"^{r}/({anc})$\"))");
-            // Same at any depth, mirroring the nested denies above.
-            sbpl!(sb, "(deny file-write-unlink (regex #\"^{r}/.+/({anc})$\"))");
+            // Same at any depth, mirroring the nested denies above — including
+            // their `node_modules` exception, or removing a package that ships
+            // `.github/` or `.claude/` fails.
+            sbpl!(
+                sb,
+                "(deny file-write-unlink (require-all (regex #\"^{r}/.+/({anc})$\") {}))",
+                not_in_node_modules(&r)
+            );
         }
         sbpl!(sb);
     }
@@ -1451,6 +1466,12 @@ fn emit_nested_gitdir_denies(sb: &mut String, root: &str) {
         "(deny file-write-unlink (regex #\"^{r}/.+/\\.git/({anc})$\"))"
     );
     sbpl!(sb);
+}
+
+/// SBPL filter: the path is not below a `node_modules` directory under the
+/// (already regex-escaped) root `r`.
+fn not_in_node_modules(r: &str) -> String {
+    format!("(require-not (regex #\"^{r}/(.+/)?node_modules/\"))")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4622,7 +4643,9 @@ mod tests {
 
         for root in ["/projects/app", "/Users/test/code"] {
             let esc = root.replace('.', r"\.");
-            let rule = format!("(deny file-write* (regex #\"^{esc}/.+/\\.agents/plugins($|/)\"))");
+            let rule = format!(
+                "(deny file-write* (require-all (regex #\"^{esc}/.+/\\.agents/plugins($|/)\")"
+            );
             assert!(p.contains(&rule), "missing nested deny for {root}: {rule}");
         }
     }
@@ -4673,7 +4696,9 @@ mod tests {
 
         for root in ["/projects/app", "/Users/test/code"] {
             let esc = root.replace('.', r"\.");
-            let rule = format!("(deny file-write* (regex #\"^{esc}/.+/\\.github/hooks($|/)\"))");
+            let rule = format!(
+                "(deny file-write* (require-all (regex #\"^{esc}/.+/\\.github/hooks($|/)\")"
+            );
             assert!(p.contains(&rule), "missing nested deny for {root}: {rule}");
         }
     }
@@ -4765,7 +4790,8 @@ mod tests {
             let esc = root.replace('.', r"\.");
             for &(rel, _) in H11_PATHS {
                 let esc_rel = rel.replace('.', r"\.");
-                let rule = format!("(deny file-write* (regex #\"^{esc}/.+/{esc_rel}($|/)\"))");
+                let rule =
+                    format!("(deny file-write* (require-all (regex #\"^{esc}/.+/{esc_rel}($|/)\")");
                 assert!(
                     p.contains(&rule),
                     "missing nested deny for {root} {rel}: {rule}"
@@ -4948,7 +4974,8 @@ mod tests {
             let rule = format!("(deny file-write-unlink (regex #\"^{esc}/({anc})$\"))");
             assert!(p.contains(&rule), "missing for {root}: {rule}");
             // A repo nested under a writable root has the same walk-around.
-            let nested = format!("(deny file-write-unlink (regex #\"^{esc}/.+/({anc})$\"))");
+            let nested =
+                format!("(deny file-write-unlink (require-all (regex #\"^{esc}/.+/({anc})$\")");
             assert!(
                 p.contains(&nested),
                 "missing nested pin for {root}: {nested}"
@@ -4978,7 +5005,9 @@ mod tests {
 
         for root in ["/projects/app", "/Users/test/code"] {
             let esc = root.replace('.', r"\.");
-            let rule = format!("(deny file-write* (regex #\"^{esc}/.+/\\.cplt\\.toml($|/)\"))");
+            let rule = format!(
+                "(deny file-write* (require-all (regex #\"^{esc}/.+/\\.cplt\\.toml($|/)\")"
+            );
             assert!(p.contains(&rule), "missing nested deny for {root}: {rule}");
         }
     }
@@ -4992,7 +5021,9 @@ mod tests {
         let home = std::path::Path::new("/Users/test");
         let p = generate_profile(&test_options(project, home), &[]);
         assert!(
-            p.contains("(deny file-write* (regex #\"^/projects/app/.+/\\.gitmodules($|/)\"))"),
+            p.contains(
+                "(deny file-write* (require-all (regex #\"^/projects/app/.+/\\.gitmodules($|/)\")"
+            ),
             "missing nested .gitmodules deny:\n{p}"
         );
     }
@@ -5556,6 +5587,17 @@ mod tests {
                 // chain is reachable through it. (Not because later denies
                 // win: empirically a `require-all` allow beats a plain
                 // `subpath` deny, which is why the grant is a literal at all.)
+                // The nested denies and their rename pins carry the same
+                // `node_modules` exception (#618). Modelled without it: the
+                // exception removes the same paths from a deny and its pin,
+                // so the walk over the wider rule checks the narrower one.
+                let body = match body.strip_prefix("(require-all ") {
+                    Some(b) if !allow && b.contains("(require-not ") => {
+                        let (m, _) = b.split_once(" (require-not ").unwrap();
+                        m
+                    }
+                    _ => body,
+                };
                 if body.starts_with("(require-all") {
                     assert!(
                         body.contains("(literal "),
