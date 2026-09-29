@@ -128,8 +128,15 @@ target branch:
 The default branch is the one the repository actually has. The guard reads it
 from the local `refs/remotes/<remote>/HEAD` symref that `git clone` and
 `git remote set-head` write, so a repository whose default is `develop`,
-`trunk` or `production` is protected under the setting that promises it — no
-network call is made. A default branch with a slash in it (`release/2026`) is
+`trunk` or `production` is protected under the setting that promises it. When
+that symref is missing (a repository made with `git init` and `git remote add`,
+or a clone whose set-head never ran), the launch asks the remote, in the
+parent, before the agent starts, with a 5 second limit and no terminal prompt:
+a GitHub remote through `gh api repos/<owner>/<name>` (the parent's own git
+runs with no credential helper, so a private repository would not answer it),
+any other remote with `git ls-remote --symref <remote> HEAD`. That is the answer
+`git remote set-head <remote> -a` would have recorded; nothing is written to
+the repository. A default branch with a slash in it (`release/2026`) is
 compared whole, because that is how both sides arrive: the symref gives up only
 its `<remote>/` prefix, and the push argument is the branch name entire. `main`
 and `master` stay protected as a floor alongside it, recognized with or without
@@ -138,7 +145,7 @@ given, the guard checks all of them and blocks if any names a protected branch,
 so `git push origin feature main` does not slip through.
 
 If the default branch cannot be resolved — no such remote, or no recorded
-`refs/remotes/<remote>/HEAD` — the guard cannot tell a feature branch from the
+`refs/remotes/<remote>/HEAD` and no answer from the remote at launch — the guard cannot tell a feature branch from the
 protected one, so it allows no push at all and the block message says to run
 `git remote set-head <remote> -a`. The setting grants a relaxation of
 `prevent_push`; a relaxation that cannot be justified is refused, not guessed

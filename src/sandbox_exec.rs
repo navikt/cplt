@@ -802,12 +802,12 @@ fn install_command_wrappers(
         // branch, and before this it had no baked answer at all, so every push
         // there failed closed with wording about the launch repository.
         let mut repo_facts = crate::git::trusted_git()
-            .map(|git| crate::gh_proxy::capture_repo_facts(git, project_dir))
+            .map(|git| crate::gh_proxy::capture_repo_facts_at_launch(git, project_dir))
             .unwrap_or_default();
         if let Some(git) = crate::git::trusted_git() {
             repo_facts.named = repo_dirs
                 .iter()
-                .map(|dir| crate::gh_proxy::capture_repo_facts(git, dir))
+                .map(|dir| crate::gh_proxy::capture_repo_facts_at_launch(git, dir))
                 .collect();
         }
         // Two conditions narrow this to the case the operator can act on.
@@ -831,10 +831,11 @@ fn install_command_wrappers(
                 .is_some_and(|git| crate::gh_proxy::has_remotes(git, project_dir))
         {
             ui::warn(
-                "git guard: no remote's default branch could be captured at launch, so \
-                 protect_default_branch_only cannot tell a feature branch from the protected \
-                 one and every push is refused. Run `git remote set-head origin -a` in the \
-                 project repository and start a new session.",
+                "git guard: no remote's default branch could be captured at launch (no \
+                 refs/remotes/<remote>/HEAD, and the remote did not report one within \
+                 5 seconds), so protect_default_branch_only cannot tell a feature branch from the \
+                 protected one and every push is refused. Run `git remote set-head origin -a` \
+                 in the project repository and start a new session.",
             );
         }
         // An allow_push rule also requires the push to run in a repository the

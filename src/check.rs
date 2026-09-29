@@ -677,7 +677,7 @@ impl<'a> ExecContext<'a> {
     ) -> Self {
         let real_git = crate::git::trusted_git();
         let repo_facts = real_git
-            .map(|git| crate::gh_proxy::capture_repo_facts(git, project_dir))
+            .map(|git| crate::gh_proxy::capture_repo_facts_at_launch(git, project_dir))
             .unwrap_or_default();
         // `repos_match`, not `contains`: the launch dedups case-insensitively
         // and ignoring a `.git` suffix, so holding an exact-match set here

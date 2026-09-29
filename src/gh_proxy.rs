@@ -4395,6 +4395,143 @@ pub fn capture_repo_facts(real_git: &Path, project_dir: &Path) -> RepoFacts {
     facts
 }
 
+/// [`capture_repo_facts`] as a launch runs it: a remote with no recorded
+/// `refs/remotes/<remote>/HEAD` asks the remote itself.
+///
+/// A repository made with `git init` + `git remote add`, or a clone whose
+/// set-head never ran, has no local symref, and without one every push was
+/// refused with "run set-head outside and restart" (navikt/copilot#1348). The
+/// remote's own `HEAD` is the answer set-head would have recorded, so this
+/// cannot make a push to the real default branch look like a feature branch.
+/// It runs here, in the parent, before the agent starts, for the same reason
+/// the local symref is only read here (GHSA-cm6f-3wjh-x9qx). When the remote
+/// does not answer in time the remote stays absent and the guard fails closed
+/// exactly as before.
+///
+/// Separate from [`capture_repo_facts`] so the unit tests that build it for a
+/// fake `github.com/o/o` remote never go to the network.
+#[must_use]
+pub fn capture_repo_facts_at_launch(real_git: &Path, project_dir: &Path) -> RepoFacts {
+    let mut facts = capture_repo_facts(real_git, project_dir);
+    let dir = project_dir.to_string_lossy().into_owned();
+    let repo_args = ["-C", dir.as_str()];
+    // ponytail: one remote at a time, each bounded by LS_REMOTE_TIMEOUT; only
+    // remotes missing their symref pay it. Parallelize if several are common.
+    for remote in list_remotes(real_git, &repo_args) {
+        if facts.default_branches.contains_key(&remote) {
+            continue;
+        }
+        // A GitHub remote is asked through `gh`: the parent's git runs with
+        // every credential helper reset (git::CONFIG_OVERRIDES), so a private
+        // repository over HTTPS would never answer `ls-remote`.
+        let github = git_config_value(real_git, &repo_args, &format!("remote.{remote}.url"))
+            .as_deref()
+            .and_then(parse_repo_from_url);
+        let branch = match github {
+            Some(repo) => gh_default_branch(&repo),
+            None => ls_remote_default_branch(project_dir, &remote),
+        };
+        if let Some(branch) = branch {
+            facts.default_branches.insert(remote, branch);
+        }
+    }
+    facts
+}
+
+/// `default_branch` of `owner/name` from the GitHub API, via the trusted `gh`.
+///
+/// `--hostname github.com` for the reason `gh auth token` carries it: `GH_HOST`
+/// must not steer the question to another host.
+fn gh_default_branch(repo: &str) -> Option<String> {
+    // parse_repo_from_url guarantees one slash; keep the path to plain name
+    // characters so nothing else reaches the API path.
+    if repo.contains("..")
+        || !repo
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+    {
+        return None;
+    }
+    let gh = crate::git::trusted_binary("gh")?;
+    let path = format!("repos/{repo}");
+    let out = crate::discover::probe_output(
+        &gh,
+        &[
+            "api",
+            "--hostname",
+            "github.com",
+            &path,
+            "--jq",
+            ".default_branch",
+        ],
+        LS_REMOTE_TIMEOUT,
+    )?;
+    let branch = out.trim();
+    (!branch.is_empty() && !branch.contains(char::is_whitespace)).then(|| branch.to_string())
+}
+
+/// How long a launch waits for `git ls-remote` before failing closed.
+const LS_REMOTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The branch `remote`'s `HEAD` points at, per `git ls-remote --symref`.
+///
+/// Built by [`crate::git::command`], so it runs the trusted git with the
+/// parent's hardening, including `GIT_TERMINAL_PROMPT=0` and a null stdin. It
+/// also runs in a new session: with no controlling terminal, ssh cannot open
+/// `/dev/tty` to ask for a passphrase in the middle of the launch summary.
+fn ls_remote_default_branch(project_dir: &Path, remote: &str) -> Option<String> {
+    use std::io::Read as _;
+    use std::os::unix::process::CommandExt as _;
+    let mut cmd = crate::git::command(project_dir, &["ls-remote", "--symref", remote, "HEAD"])?;
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    // SAFETY: setsid is async-signal-safe and touches no memory of this process.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stdout.read_to_string(&mut buf);
+        buf
+    });
+    let deadline = std::time::Instant::now() + LS_REMOTE_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            _ => {
+                // The whole session: git and the ssh or https helper it started.
+                if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+                    // SAFETY: plain syscall; the group is the one setsid made.
+                    unsafe { libc::kill(-pid, libc::SIGKILL) };
+                }
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    let out = reader.join().ok()?;
+    if !status.success() {
+        return None;
+    }
+    parse_ls_remote_head(&out)
+}
+
+/// `ref: refs/heads/<branch>\tHEAD` out of `git ls-remote --symref` output.
+fn parse_ls_remote_head(out: &str) -> Option<String> {
+    out.lines()
+        .find_map(|l| l.strip_prefix("ref: refs/heads/")?.strip_suffix("\tHEAD"))
+        .filter(|b| !b.is_empty())
+        .map(ToString::to_string)
+}
+
 /// What a `--repo-dir` root is, captured in the unsandboxed parent at launch.
 ///
 /// Same rule as [`capture_repo_facts`]: `real_git` must be a
@@ -8712,6 +8849,100 @@ mod tests {
         assert!(
             err.contains("could not be determined when this session started"),
             "the refusal must name the missing launch-time fact, got: {err}"
+        );
+    }
+
+    /// No `refs/remotes/origin/HEAD` (`git init` + `git remote add`): the
+    /// launch asks the remote, so a feature branch pushes and the remote's real
+    /// default branch stays refused. A remote that does not answer leaves the
+    /// guard failing closed (navikt/copilot#1348).
+    #[test]
+    fn a_missing_remote_head_is_asked_of_the_remote_at_launch() {
+        let Some((_origin_tmp, origin)) =
+            scratch_repo_with_default("trunk", "https://github.com/o/o.git", "trunk")
+        else {
+            return; // no git available
+        };
+        let origin_url = origin.to_string_lossy().into_owned();
+        let (_tmp, repo) = scratch_repo_with_default("trunk", &origin_url, "trunk").unwrap();
+        let git = which_git().unwrap();
+        make_branches(&git, &repo, &["feature/x"]);
+        assert!(run_in(
+            &git,
+            &repo,
+            &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+        ));
+        assert!(
+            capture_repo_facts(&git, &repo).default_branches.is_empty(),
+            "premise: no local symref"
+        );
+
+        let facts = capture_repo_facts_at_launch(&git, &repo);
+        assert_eq!(
+            facts.default_branches.get("origin").map(String::as_str),
+            Some("trunk"),
+            "the remote's own HEAD must be captured"
+        );
+        let dir = repo.to_string_lossy().into_owned();
+        let push = |branch: &str, facts: &RepoFacts| {
+            gate_git(
+                &["-C", dir.as_str(), "push", "origin", branch],
+                true,
+                true,
+                true,
+                &[],
+                Some(&git),
+                facts,
+            )
+        };
+        assert!(push("feature/x", &facts).is_ok(), "a feature branch pushes");
+        assert!(
+            push("trunk", &facts).is_err(),
+            "the remote's default branch must stay refused"
+        );
+
+        // The remote does not answer: nothing captured, every push refused.
+        assert!(run_in(
+            &git,
+            &repo,
+            &["remote", "set-url", "origin", "/nonexistent/cplt-origin"],
+        ));
+        let facts = capture_repo_facts_at_launch(&git, &repo);
+        assert!(facts.default_branches.is_empty(), "nothing to bake");
+        assert!(push("feature/x", &facts).is_err(), "fails closed");
+
+        // A remote that never answers (a listener that accepts the connection
+        // and says nothing) is cut off at the timeout, and fails closed too.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("git://{}/o.git", listener.local_addr().unwrap());
+        assert!(run_in(&git, &repo, &["remote", "set-url", "origin", &url]));
+        let started = std::time::Instant::now();
+        let facts = capture_repo_facts_at_launch(&git, &repo);
+        let waited = started.elapsed();
+        assert!(facts.default_branches.is_empty(), "nothing to bake");
+        assert!(
+            waited >= std::time::Duration::from_millis(4500),
+            "premise: the remote must actually have hung, returned after {waited:?}"
+        );
+        assert!(
+            waited < LS_REMOTE_TIMEOUT + std::time::Duration::from_secs(3),
+            "the launch must not wait on a hung remote: {waited:?}"
+        );
+        drop(listener);
+    }
+
+    #[test]
+    fn ls_remote_head_is_parsed_from_the_symref_line_only() {
+        let out = "ref: refs/heads/trunk\tHEAD\nabc123\tHEAD\n";
+        assert_eq!(parse_ls_remote_head(out).as_deref(), Some("trunk"));
+        let out = "ref: refs/heads/release/2026\tHEAD\n";
+        assert_eq!(parse_ls_remote_head(out).as_deref(), Some("release/2026"));
+        // No symref (an old server, a detached remote HEAD): nothing.
+        assert_eq!(parse_ls_remote_head("abc123\tHEAD\n"), None);
+        assert_eq!(parse_ls_remote_head(""), None);
+        assert_eq!(
+            parse_ls_remote_head("ref: refs/heads/main\trefs/heads/x\n"),
+            None
         );
     }
 
