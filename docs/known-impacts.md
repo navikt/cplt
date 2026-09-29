@@ -23,16 +23,23 @@ tracking was recorded. It was not.
 
 | Command | What happens |
 | --- | --- |
-| `git push -u origin <branch>` | Push succeeds, upstream **not** recorded, exit 0 |
+| `git push -u origin <branch>` | With the git guard on: cplt runs the push without `-u` and says so in one line, so git prints no config error. The push succeeds and no upstream is recorded. With the guard off: push succeeds, git prints the error and a false tracking line, exit 0 |
 | `git checkout -b <branch> origin/<base>` | Branch created, tracking **not** recorded, exit 0 |
 | `git branch --set-upstream-to=origin/<base>` | Records nothing, exit 0 |
 | `git config user.name <x>` | Fails loudly, exit 4 |
 | `git switch -c <branch>` (no tracking) | Clean, nothing to record |
 
-cplt says so when it can see the request coming: a `push`, `branch`, `checkout`
-or `switch` carrying `-u`, `--set-upstream`, `--set-upstream-to` or `--track`
-gets a note before the command runs, saying the success line will be false. That
-needs the git guard on, since the wrapper it prints from is the guard's. The
+For `git push`, cplt removes `-u` and `--set-upstream` before the push runs.
+The flag does nothing except write that config, so the push itself is
+unchanged, and git has no failed write to report. The one line cplt prints
+instead: `cplt: pushing without -u, because .git/config is read-only in the
+sandbox. No upstream is recorded, so name the branch on later pushes`. A
+bundled flag such as `-uf` is left alone and gets the note below.
+
+For the other commands, cplt says so when it can see the request coming: a
+`branch`, `checkout` or `switch` carrying `--set-upstream-to` or `--track` gets
+a note before the command runs, saying the success line will be false. Both
+need the git guard on, since the wrapper they run in is the guard's. The
 implicit form, `git checkout -b <name> <remote>/<base>`, is named in the note
 rather than detected: it sets tracking from a positional that only git can tell
 from a pathspec.
