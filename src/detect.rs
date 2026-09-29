@@ -562,8 +562,12 @@ fn detect_node(ctx: &DetectContext) -> DetectorOutput {
                 message: format!(
                     "{scope} resolves from an authenticated registry, so the token in \
                      ~/.npmrc is needed to install at all — without the grant the install \
-                     returns 401 rather than falling back. pnpm cannot take the token from \
-                     a project .npmrc, since it does not expand environment variables there."
+                     fails with 401 (E401) rather than falling back. Grant it in your own \
+                     config, since .cplt.toml cannot: `cplt config set allow.read \
+                     \"~/.npmrc\"`, or `cplt config set sandbox.allow_build_credentials \
+                     true`, which also exposes ~/.gradle/gradle.properties and \
+                     ~/.m2/settings.xml. pnpm cannot take the token from a project .npmrc, \
+                     since it does not expand environment variables there."
                 ),
             });
         }
@@ -1345,9 +1349,11 @@ pub fn nais_bootstrap_driver(dir: &Path) -> Option<String> {
 /// The first `@scope` a project `.npmrc` maps to an authenticated registry.
 ///
 /// "Authenticated" is inferred from the file naming credentials for a host at
-/// all — an `_authToken`/`_auth`/`username` line — rather than from the
-/// registry URL, so a self-hosted Nexus counts the same as GitHub Packages.
-/// A scope line pointing at the public npm registry does not.
+/// all — an `_authToken`/`_auth`/`username` line — so a self-hosted Nexus
+/// counts the same as GitHub Packages. GitHub Packages counts without one: it
+/// refuses anonymous npm installs, even of public packages, and navikt repos
+/// map `@navikt` to it with the token kept in `~/.npmrc`. A scope line
+/// pointing at the public npm registry does not count.
 fn scoped_auth_registry(npmrc: &str) -> Option<String> {
     let lines: Vec<&str> = npmrc
         .lines()
@@ -1357,13 +1363,13 @@ fn scoped_auth_registry(npmrc: &str) -> Option<String> {
     let has_credentials = lines
         .iter()
         .any(|l| l.contains("_authToken") || l.contains("_auth=") || l.contains("username="));
-    if !has_credentials {
-        return None;
-    }
     lines.iter().find_map(|line| {
         let (scope, url) = line.split_once(":registry=")?;
         let scope = scope.trim();
-        if !scope.starts_with('@') || url.contains("registry.npmjs.org") {
+        if !scope.starts_with('@')
+            || url.contains("registry.npmjs.org")
+            || !(has_credentials || url.contains("npm.pkg.github.com"))
+        {
             return None;
         }
         Some(scope.to_string())
@@ -3501,6 +3507,34 @@ services:
             .as_deref(),
             Some("@acme")
         );
+        // GitHub Packages with the token in ~/.npmrc, as navikt repos do:
+        // the project file names no credentials, the install still needs one.
+        assert_eq!(
+            scoped_auth_registry("@navikt:registry=https://npm.pkg.github.com\n").as_deref(),
+            Some("@navikt")
+        );
+    }
+
+    /// navikt frontends map `@navikt` to GitHub Packages and keep the token in
+    /// `~/.npmrc`. Inside cplt that is an E401 with nothing pointing back at
+    /// the sandbox, so `init` and `doctor` must name the grant.
+    #[test]
+    fn node_github_packages_scope_names_the_grant() {
+        let dir = setup_dir();
+        fs::write(dir.path().join("package.json"), "{}").unwrap();
+        fs::write(
+            dir.path().join(".npmrc"),
+            "@navikt:registry=https://npm.pkg.github.com\n",
+        )
+        .unwrap();
+        let report = detect_project(dir.path());
+        let diag = report
+            .diagnostics
+            .iter()
+            .find(|d| d.detector == "node" && d.message.contains("@navikt"))
+            .expect("a diagnostic for the GitHub Packages scope");
+        assert!(diag.message.contains("sandbox.allow_build_credentials"));
+        assert!(diag.message.contains("allow.read"));
     }
 
     /// The suggestion already fires for any project `.npmrc`. This signal is
@@ -3511,8 +3545,8 @@ services:
     fn scoped_auth_registry_ignores_npmrc_without_credentials() {
         for npmrc in [
             "save-exact=true\nengine-strict=true\n",
-            // A scope, but no token anywhere: nothing to grant.
-            "@navikt:registry=https://npm.pkg.github.com\n",
+            // A scope on a self-hosted registry, but no token anywhere.
+            "@acme:registry=https://nexus.example.internal/repository/npm/\n",
             // Credentials, but the scope resolves from public npm.
             "@acme:registry=https://registry.npmjs.org/\n\
              //npm.pkg.github.com/:_authToken=x\n",
