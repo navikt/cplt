@@ -88,7 +88,9 @@ macOS is unaffected: the Keychain is granted (narrowed per agent by
 
 ## `.env` file blocking
 
-`.env` and `.env.*` files are **blocked from reading** by default, and so are files named exactly `.pem`, `.key`, `.p12`, `.pfx` or `.jks`. A key file with a longer name, such as `server.pem`, is blocked only with [`sandbox.deny_key_files_by_extension`](configuration.md#denying-key-files-by-extension-sandboxdeny_key_files_by_extension). This stops a rogue agent exfiltrating secrets, but it has side effects.
+**macOS only.** Landlock cannot deny a file inside a granted directory, so on Linux these files stay readable and writable (the proxy's exfiltration filtering is the mitigation there, not a deny; see [security.md](security.md)).
+
+`.env` and `.env.*` files are **blocked from reading and writing** by default, and so are files named exactly `.pem`, `.key`, `.p12`, `.pfx` or `.jks`. A key file with a longer name, such as `server.pem`, is blocked only with [`sandbox.deny_key_files_by_extension`](configuration.md#denying-key-files-by-extension-sandboxdeny_key_files_by_extension). This stops a rogue agent exfiltrating secrets, but it has side effects.
 
 **The rule is a pattern on the file name, not a location**, so it applies everywhere the sandbox can reach. The two extracted dependency stores are carved back out for *reading* (#477), because a `.env` there is package content. A `--deny-path` or `deny.paths` entry inside or above one of those stores still wins over the carve-out (#597). Everywhere else the name is enough to deny it:
 
@@ -101,7 +103,7 @@ macOS is unaffected: the Keychain is granted (narrowed per agent by
 | `npm test` / `vitest`          | ⚠️ May fail | Tests that depend on `.env` for config won't find the values          |
 | TLS dev servers (`.pem` certs) | ✅ Works    | `server.pem`, `localhost.key` stay readable by default. Blocked with `sandbox.deny_key_files_by_extension`, which also blocks a project virtualenv's `certifi/cacert.pem` |
 | `.env.example`                 | ⚠️ Blocked  | Matches the `.env.*` pattern; use `--allow-env-files` if needed       |
-| Writing `.env` files           | ✅ Works    | Only read is denied; Copilot can create `.env` from templates         |
+| Writing `.env` files           | ❌ Blocked  | Write and delete are denied as well as read, so an agent cannot create a `.env` from a template or remove one; use `--allow-env-files` if needed |
 | `go mod verify`, `cargo` over an extracted crate | ✅ Works | Read is re-allowed under `~/go/pkg/mod` and `~/.cargo/registry`: a `.env` there is a library's test fixture (`gotenv` ships one), not your secret, and the content is checksum-verified and came from a registry. Write stays denied, and so does read under a path you deny |
 | A `.env` in another dependency store | ⚠️ Blocked | The carve-out is a short explicit list, not a heuristic — only trees that are content-addressed, verified and registry-sourced |
 
@@ -443,6 +445,28 @@ the policy could not be *read* — Copilot turns the sandbox on and says
 "Sandboxing is enabled because your organization's managed policy couldn't be
 read". If a session under cplt hangs right after the startup banner and your
 organization manages Copilot, that is the first thing to check.
+
+## Setuid and setgid binaries (`ps`, `top`, `sudo`)
+
+**macOS:** a sandboxed process cannot exec a setuid or setgid binary. The
+kernel refuses it for any Seatbelt-sandboxed process, whatever the profile
+allows, so there is no cplt setting that lifts it. On macOS that includes
+`/bin/ps`, `/usr/bin/top`, `/usr/bin/sudo`, `/usr/bin/su` and `/usr/bin/login`:
+
+```
+$ cplt exec -- /bin/ps
+sandbox-exec: execvp() of '/bin/ps' failed: Operation not permitted
+```
+
+Scripts that shell out to `ps` fail the same way, for example Go's
+`fork/exec /bin/ps: operation not permitted`. Run them outside cplt.
+
+**Linux:** Landlock sets `no_new_privs`, so the binary runs but the setuid bit
+is ignored. A tool that only reads what any user may read works; one that
+needs the elevated uid, such as `sudo`, fails.
+
+`cplt check exec` does not yet report this and says such a binary is allowed
+([#620](https://github.com/navikt/cplt/issues/620)).
 
 ## Localhost blocking
 
@@ -969,7 +993,7 @@ cplt config set proxy.allowed_domains "~/.config/cplt/allowed-domains.txt"
 cplt config set proxy.default_allowlist true
 ```
 
-(`proxy.allowed_domains` is a path to a domain list file, one host per line, not an inline array. Setting it turns the allowlist on, and the agent's own hosts are always included, but the package registries are not: without `proxy.default_allowlist`, Maven Central (`repo.maven.apache.org`) and `plugins.gradle.org` are blocked and the build still fails. With it on, the file is merged with the agent's built-in list, which includes those registries, so you add the mirror without re-listing them. The `strict` preset turns it on already.)
+(`proxy.allowed_domains` is a path to a domain list file, one host per line, not an inline array. Setting it turns the allowlist on, and the agent's own hosts are always included (since 2026.09.29-095137-e745d3a; Goose, Pi and Shell have none), but the package registries are not: without `proxy.default_allowlist`, Maven Central (`repo.maven.apache.org`) and `plugins.gradle.org` are blocked and the build still fails. With it on, the file is merged with the agent's built-in list, which includes those registries, so you add the mirror without re-listing them. The `strict` preset turns it on already.)
 
 `repo.adeo.no` is NAV's internal Nexus and resolves into private address space, so `allowed_domains` is not enough — it is exactly the case [`proxy.allow_private_domains`](#internal-mavengradle-repositories-on-private-ips) exists for. `navikt/pensjonsbrev/.cplt.toml` is a working example of a team configuring it.
 
@@ -990,9 +1014,9 @@ The audit reports `incomplete` instead of listing changes, and the one-time `cpl
 
 **A committed `.cplt.toml` still applies.** cplt reads it from the object store with `git cat-file`, which cannot reach a filter and is never refused. Permissions you have already approved keep working. It is the one-time accept that is blocked.
 
-**Why it works this way.** Git runs a content filter's program when it reads working-tree files, and cplt runs `git` in the parent process, *outside* the sandbox. `.git/config` stays writable to the agent on both platforms, so a repository could otherwise pick a program that cplt executes unsandboxed ([#210](https://github.com/navikt/cplt/issues/210)). Unlike the other executable config keys, filters are named by an arbitrary subsection, so no fixed `-c` override can neutralise them. That leaves two options. Run the filter, which is the escape. Or refuse, and say so. An `incomplete` audit is a loud "could not verify", not a clean session cplt never checked.
+**Why it works this way.** Git runs a content filter's program when it reads working-tree files, and cplt runs `git` in the parent process, *outside* the sandbox. `.git/config` is write-denied on macOS but stays writable to the agent on Linux (see [Git restrictions](#git-restrictions)), and on either platform the file may already carry a filter from before the session, so a repository could otherwise pick a program that cplt executes unsandboxed ([#210](https://github.com/navikt/cplt/issues/210)). Unlike the other executable config keys, filters are named by an arbitrary subsection, so no fixed `-c` override can neutralise them. That leaves two options. Run the filter, which is the escape. Or refuse, and say so. An `incomplete` audit is a loud "could not verify", not a clean session cplt never checked.
 
-One consequence is worth knowing: an agent can deliberately force the audit to `incomplete` by writing `.git/config`. That is inherent to failing closed.
+One consequence is worth knowing: on Linux, where `.git/config` is writable, an agent can deliberately force the audit to `incomplete` by writing a filter into it. That is inherent to failing closed.
 
 **Fix:** move the filter to your global config if it belongs there (`git config --global filter.lfs.clean …`), or accept the `incomplete` audit for that repository. If you need `cplt trust accept` to work, remove the repo-local filter for the one invocation.
 

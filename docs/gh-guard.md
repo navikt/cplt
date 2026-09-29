@@ -511,7 +511,10 @@ The full message bodies live in `src/gh_proxy.rs`.
 
 cplt installs a git wrapper alongside the gh wrapper. It blocks `git push`,
 `git request-pull`, `git send-pack`, and `git subtree push` while letting local
-git work through, so an agent can commit but a human has to push. It also blocks
+git work through. Under the default `standard` preset only pushes to the
+default branch are blocked (`protect_default_branch_only`), so an agent can
+push a feature branch; under `strict` every push is blocked and a human has to
+push. It also blocks
 anything that would retarget the `origin` remote, since that is where the gh
 guard reads the enforced scope from, and it refuses git subcommands it does not
 recognize while push prevention is on. Blocked commands, the
@@ -570,8 +573,8 @@ What the gh/git guard stops, and what it does not.
 | **Data exfiltration via `gh api` GET** | The agent can `gh api /repos/owner/repo/contents/secret.yml` to read and then exfiltrate via network | Use network proxy domain filtering (`--blocked-domains`) |
 | **Direct `curl` with `GH_TOKEN`** | Agent can `curl -H "Authorization: token $GH_TOKEN" https://api.github.com/...` bypassing the gh wrapper entirely | GH_TOKEN is only injected for Copilot agent; network proxy logs all outbound connections |
 | **Wrapper bypass via real binary path** | Agent can `cat $(which gh)` to discover the real `gh` path in the wrapper script and call it directly | The wrapper uses `exec` so the real path is in the script; Seatbelt blocks writes to the scratch bin dir, but the path stays readable |
-| **Agent edits `.github/workflows/`** | Agent can write CI configs that run on push, so destructive actions happen in CI, not locally | Code review (git diff); git push is blocked so workflows can't trigger |
-| **Agent creates commits on main locally** | `git commit` on the main branch is allowed, being a local operation | The push guard prevents pushing those commits; human reviews before push |
+| **Agent edits `.github/workflows/`** | Agent can write CI configs that run on push, so destructive actions happen in CI, not locally | Code review (git diff). Under `standard` a feature-branch push is allowed and can trigger `on: push` workflows; only `strict`, which blocks every push, keeps them from running |
+| **Agent creates commits on main locally** | `git commit` on the main branch is allowed, being a local operation | The push guard prevents pushing those commits to the default branch |
 | **`git send-pack` plumbing variants** | Covered, `send-pack` is in the block list | Already handled |
 | **Agent reads project source code** | Project dir is fully readable (agent's core function) | Network domain filtering to prevent exfiltration |
 | **Heuristic parser confusion** | Extremely unusual flag combinations might confuse the parser | Fail-closed: unknown states are blocked, and the e2e guard suite covers bypass variants |
