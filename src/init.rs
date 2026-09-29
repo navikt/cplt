@@ -1088,7 +1088,7 @@ mod tests {
     #[test]
     fn init_writes_file() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("Dockerfile"), "FROM node:20").unwrap();
+        std::fs::write(dir.path().join("compose.yaml"), "services: {}\n").unwrap();
         let report = crate::detect::detect_project(dir.path());
         let result = run_init(
             dir.path(),
