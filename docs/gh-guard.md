@@ -118,7 +118,8 @@ Agent calls gh → wrapper script (in PATH) → cplt gh-gate → policy check
 6. If blocked, it prints an error explaining why and exits non-zero
 
 > **Note:** Wrappers require the scratch directory. If you run with `--no-scratch-dir`,
-> the gh/git guards will be inactive (shown as such in `cplt doctor` output).
+> the gh/git guards will be inactive. `cplt doctor` then shows `push main` and
+> `pr merge` as ALLOWED on its `guard:` lines.
 
 ## Policy tiers
 
