@@ -2908,6 +2908,109 @@ mod e2e_tests {
         let _ = std::fs::remove_dir_all(&fake_home);
     }
 
+    /// `config show` under a loosening preset printed `false (default)` for the
+    /// sandbox toggles the launch resolves `true` (#679): the rows read the raw
+    /// file value, not the resolver's.
+    #[test]
+    fn e2e_config_show_reports_preset_resolved_toggles() {
+        let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+            "cplt-e2e-config-show-preset-{}",
+            FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_file = dir.join("config.toml");
+
+        // (preset, key, expected row suffix)
+        let cases: &[(&str, &[(&str, &str)])] = &[
+            (
+                "full-trust",
+                &[
+                    ("allow_env_files ", "= true (preset)"),
+                    ("allow_docker ", "= true ⚠ DANGEROUS (preset)"),
+                    ("allow_tmp_exec ", "= true ⚠ DANGEROUS (preset)"),
+                    ("allow_lifecycle_scripts ", "= true (preset)"),
+                ],
+            ),
+            (
+                "permissive",
+                &[
+                    ("allow_env_files ", "= false (default)"),
+                    ("allow_docker ", "= false (default)"),
+                    ("allow_tmp_exec ", "= true ⚠ DANGEROUS (preset)"),
+                    ("allow_lifecycle_scripts ", "= true (preset)"),
+                ],
+            ),
+            ("strict", &[("default_allowlist ", "= true (preset)")]),
+            ("standard", &[("default_allowlist ", "= false (default)")]),
+        ];
+        for (preset, rows) in cases {
+            std::fs::write(&config_file, format!("[sandbox]\npreset = \"{preset}\"\n")).unwrap();
+            let output = cplt_cmd()
+                .args(["config", "show"])
+                .env("CPLT_CONFIG", config_file.to_str().unwrap())
+                .env("NO_COLOR", "1")
+                .output()
+                .expect("should run");
+            assert!(output.status.success(), "config show should succeed");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for (key, want) in *rows {
+                let line = stdout
+                    .lines()
+                    .find(|l| l.contains(key))
+                    .unwrap_or_else(|| panic!("{preset}: no {key} line: {stdout}"));
+                assert!(line.trim_end().ends_with(want), "{preset}: {line}");
+            }
+        }
+
+        // The `[allow] domains` inert hint reads the resolved allowlist too, so
+        // `strict` (which turns the allowlist on) must not call the list inert.
+        for (preset, inert) in [("strict", false), ("standard", true)] {
+            std::fs::write(
+                &config_file,
+                format!("[sandbox]\npreset = \"{preset}\"\n[allow]\ndomains = [\"example.com\"]\n"),
+            )
+            .unwrap();
+            let output = cplt_cmd()
+                .args(["config", "show"])
+                .env("CPLT_CONFIG", config_file.to_str().unwrap())
+                .env("NO_COLOR", "1")
+                .output()
+                .expect("should run");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let line = stdout
+                .lines()
+                .find(|l| l.contains("domains ") && l.contains("example.com"))
+                .unwrap_or_else(|| panic!("{preset}: no domains line: {stdout}"));
+            assert_eq!(
+                line.contains("no allowlist in force"),
+                inert,
+                "{preset}: {line}"
+            );
+        }
+
+        // An explicit file value still wins over the preset, with no label.
+        std::fs::write(
+            &config_file,
+            "[sandbox]\npreset = \"full-trust\"\nallow_docker = false\n",
+        )
+        .unwrap();
+        let output = cplt_cmd()
+            .args(["config", "show"])
+            .env("CPLT_CONFIG", config_file.to_str().unwrap())
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let line = stdout
+            .lines()
+            .find(|l| l.contains("allow_docker "))
+            .unwrap();
+        assert!(line.trim_end().ends_with("= false"), "{line}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn e2e_config_show_no_config_shows_defaults() {
         let fake_home = std::env::temp_dir().join(format!(
