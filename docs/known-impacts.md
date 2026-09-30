@@ -490,8 +490,10 @@ Scripts that shell out to `ps` fail the same way, for example Go's
 is ignored. A tool that only reads what any user may read works; one that
 needs the elevated uid, such as `sudo`, fails.
 
-`cplt check exec /bin/ps` reports this: BLOCKED on macOS, ALLOWED on Linux
-with a note that it runs without elevated privileges
+`cplt check exec /bin/ps` reports this on macOS: BLOCKED, with the setuid
+reason. On Linux a binary that carries the setuid/setgid bit is ALLOWED with a
+note that it runs without elevated privileges; `/bin/ps` there usually has no
+such bit and is plain ALLOWED
 ([#620](https://github.com/navikt/cplt/issues/620)).
 
 ## Localhost blocking
