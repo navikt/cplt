@@ -7476,7 +7476,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         if label == "push feature"
             && e.decision == check::Decision::Blocked
             && cplt::git::trusted_git()
-                .is_some_and(|git| cplt::gh_proxy::has_remotes(git, &project_dir))
+                .is_some_and(|git| cplt::gh_proxy::launch_repo_facts(git, &project_dir, false).1)
         {
             findings.push(Finding::warning(
                 format!("git guard refuses a feature-branch push here: {}", e.reason),
