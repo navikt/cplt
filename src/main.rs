@@ -2192,9 +2192,10 @@ fn write_granted_repos_without_exec(
 /// that does not run, with an error naming neither cplt nor the grant, and the
 /// session that reported it had `quiet = true`. Same reasoning as the
 /// trusted-binary warning above.
-/// Warn when a repository sits under a writable cache the macOS profile
-/// denies execute on (#675): its `node_modules/.bin` and build scripts fail
-/// with `Operation not permitted`, which names neither cplt nor the cache.
+/// Warn when a repository sits under a writable cache or temp root the macOS
+/// profile denies execute on (#675, #666): its `node_modules/.bin` and build
+/// scripts fail with `Operation not permitted`, which names neither cplt nor
+/// the directory.
 fn warn_repo_under_no_exec_cache(
     resolved: &config::Resolved,
     home_dir: &Path,
@@ -2210,7 +2211,9 @@ fn warn_repo_under_no_exec_cache(
             home_dir,
             &resolved.allow_cache_exec,
             resolved.allow_cache_exec_any,
-        ) {
+        )
+        .or_else(|| cplt::sandbox::no_exec_temp_dir_over(root, resolved.allow_tmp_exec))
+        {
             ui::warn(&format!(
                 "{} is under {}, where the sandbox denies execute. Its own tools \
                  (node_modules/.bin, build scripts, native addons) will fail with \
@@ -4354,11 +4357,6 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
 
     // proxy_handle is set up before sandbox::prepare() (see above)
 
-    ui::ok(&format!(
-        "Starting {} in sandbox...",
-        active_agent.display_name()
-    ));
-
     // --show-denials: stream sandbox denial logs in the background.
     #[allow(unused_mut)] // mut needed on macOS where denial_proc is assigned
     let mut denial_proc: Option<std::process::Child> = None;
@@ -4366,12 +4364,24 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         denial_proc = start_denial_stream();
     }
 
-    eprintln!(
-        "{}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{}",
-        ui::color(ui::YELLOW),
-        ui::color(ui::RESET)
-    );
-    eprintln!();
+    // Printed by the exec path once the wrappers are installed, so their
+    // notices (gh scope, git guard) land above the separator, not under it
+    // (#666). Once: a Bubblewrap fallback reaches the spawn twice.
+    let banner = std::sync::Once::new();
+    let print_banner = || {
+        banner.call_once(|| {
+            ui::ok(&format!(
+                "Starting {} in sandbox...",
+                active_agent.display_name()
+            ));
+            eprintln!(
+                "{}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{}",
+                ui::color(ui::YELLOW),
+                ui::color(ui::RESET)
+            );
+            eprintln!();
+        });
+    };
 
     // Build agent args: extra args (e.g. --no-auto-update) + forwarded convenience flags + explicit -- args
     let copilot_args = build_copilot_args(&cli, &active_agent);
@@ -4411,6 +4421,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
                 &resolved.gh_guard,
                 &resolved.git_guard,
                 resolved.quiet,
+                &print_banner,
             )
         },
         || {
@@ -6072,6 +6083,7 @@ fn run_exec_command(
                 &resolved.gh_guard,
                 &resolved.git_guard,
                 resolved.quiet,
+                &|| {},
             )
         },
         || {
@@ -6156,6 +6168,7 @@ fn probe_shell(
         &resolved.gh_guard,
         &resolved.git_guard,
         resolved.quiet,
+        &|| {},
     )
 }
 

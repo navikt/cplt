@@ -98,10 +98,11 @@ pub use policy::{
     copilot_ro_protect_paths, credential_link_hop, current_uid, cypress_app_data_dir,
     cypress_app_data_dir_with_env, cypress_runtime_intent, exec_write_conflicts,
     home_config_link_targets, home_tool_dirs, linux_docker_socket_paths, linux_runtime_dirs,
-    mise_ro_protect_paths, nested_alternation, no_cache_env, no_exec_tool_dir_over, path_bin_dirs,
-    playwright_runtime_intent, process_env, relocatable_tool_prefix, shim_ro_protect_paths,
-    socket_mask_paths, tool_override_path_is_safe, tool_path_env_overrides,
-    validate_playwright_socket_dir, validate_sbpl_path, xdg_runtime_dir_env,
+    mise_ro_protect_paths, nested_alternation, no_cache_env, no_exec_temp_dir_over,
+    no_exec_tool_dir_over, path_bin_dirs, playwright_runtime_intent, process_env,
+    relocatable_tool_prefix, shim_ro_protect_paths, socket_mask_paths, tool_override_path_is_safe,
+    tool_path_env_overrides, validate_playwright_socket_dir, validate_sbpl_path,
+    xdg_runtime_dir_env,
 };
 
 // SBPL profile generation — kept public for unit tests.
@@ -1681,6 +1682,8 @@ pub fn preflight(sandbox: &PreparedSandbox) -> Result<(), String> {
 /// `deny_env` contains additional env vars to strip (from repo config [deny] section).
 /// `repo_dirs` are the validated `--repo-dir` roots — first-class repositories
 /// alongside the launch one, whose identity the gh guard's scope set is built from.
+/// `on_launch` runs after the launch-time notices and just before the spawn,
+/// so a caller's banner follows them (#666). A Bubblewrap fallback runs it twice.
 #[allow(clippy::too_many_arguments)]
 pub fn exec_sandboxed(
     sandbox: &PreparedSandbox,
@@ -1695,6 +1698,7 @@ pub fn exec_sandboxed(
     gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
     quiet: bool,
+    on_launch: &dyn Fn(),
 ) -> u8 {
     exec::exec(
         sandbox,
@@ -1709,6 +1713,7 @@ pub fn exec_sandboxed(
         gh_guard,
         git_guard,
         quiet,
+        on_launch,
     )
 }
 

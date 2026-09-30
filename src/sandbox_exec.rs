@@ -1281,6 +1281,7 @@ pub fn exec(
     gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
     quiet: bool,
+    on_launch: &dyn Fn(),
 ) -> u8 {
     let mut cmd = Command::new(SANDBOX_EXEC);
     cmd.arg("-p").arg(&sandbox.profile_text).arg(copilot_bin);
@@ -1316,6 +1317,9 @@ pub fn exec(
     // Nothing the caller was holding open crosses into the agent.
     seal_inherited_fds(&mut cmd, Vec::new());
 
+    // Every launch-time notice above (configure_command) is out; the
+    // caller's banner now closes the pre-launch block (#666).
+    on_launch();
     spawn_and_wait(&mut cmd)
 }
 
@@ -1364,6 +1368,7 @@ pub fn exec(
     gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
     quiet: bool,
+    on_launch: &dyn Fn(),
 ) -> u8 {
     use std::os::unix::process::CommandExt as _;
 
@@ -1383,6 +1388,7 @@ pub fn exec(
             gh_guard,
             git_guard,
             quiet,
+            on_launch,
         ) {
             BwrapOutcome::Ran(code) => return code,
             BwrapOutcome::Fallback => {
@@ -1459,6 +1465,9 @@ pub fn exec(
         cmd.pre_exec(move || super::landlock_mod::apply_precomputed(&precomputed));
     }
 
+    // Every launch-time notice above (configure_command) is out; the
+    // caller's banner now closes the pre-launch block (#666).
+    on_launch();
     spawn_and_wait(&mut cmd)
 }
 
@@ -1583,6 +1592,7 @@ fn exec_bwrap(
     gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
     quiet: bool,
+    on_launch: &dyn Fn(),
 ) -> BwrapOutcome {
     // The re-entry helper is this very binary; bwrap execs it by absolute path
     // (visible inside the namespace via `--ro-bind / /`).
@@ -1678,6 +1688,7 @@ fn exec_bwrap(
     // by the fd numbers set above.
     seal_inherited_fds(&mut cmd, vec![policy_read_fd, write_fd]);
 
+    on_launch();
     ignore_terminal_stop_signals();
     let mut child = match cmd.spawn() {
         Ok(c) => c,
