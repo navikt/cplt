@@ -1838,7 +1838,7 @@ mod tests {
         let ctx = exec_ctx(&gh, &git, false);
         for cmd in ["git push origin main", "gh pr merge 1"] {
             let e = explain_exec(&[cmd.into()], &ctx);
-            assert_eq!(e.decision, Decision::Blocked, "{cmd}: {}", e.reason);
+            assert_eq!(e.decision, Decision::Blocked, "{cmd}");
         }
         // Quotes are honoured like the shell does: a quoted `main` is still
         // `main`, and `-C "a dir"` is one word. Needs a real repository (with
@@ -1888,14 +1888,22 @@ mod tests {
             for push in ["HEAD:main", "HEAD:'main'", "\"HEAD:main\"", "feat:\"main\""] {
                 let cmd = format!("git -C \"{dir}\" push origin {push}");
                 let e = explain_exec(std::slice::from_ref(&cmd), &only_ctx);
-                assert_eq!(e.decision, Decision::Blocked, "{cmd}: {}", e.reason);
+                assert_eq!(e.decision, Decision::Blocked, "{cmd}");
             }
             let cmd = format!("git -C '{dir}' push origin HEAD:'feat'");
             let e = explain_exec(&[cmd], &only_ctx);
-            assert_eq!(e.decision, Decision::Allowed, "{}", e.reason);
+            assert_eq!(
+                e.decision,
+                Decision::Allowed,
+                "a quoted feature push must be allowed"
+            );
         }
         let e = explain_exec(&["git push origin 'main".into()], &ctx);
-        assert_eq!(e.decision, Decision::Inconclusive, "{}", e.reason);
+        assert_eq!(
+            e.decision,
+            Decision::Inconclusive,
+            "an unterminated quote is inconclusive"
+        );
         assert_eq!(
             shell_words(r#"a 'b c' "d\"e" f\ g ''"#).unwrap(),
             ["a", "b c", "d\"e", "f g", ""]
@@ -1907,12 +1915,14 @@ mod tests {
             assert_eq!(e.decision, Decision::Allowed);
             assert!(
                 e.reason.contains("passes through the guards when it runs"),
-                "{script}: {}",
-                e.reason
+                "{script}"
             );
         }
         let e = explain_exec(&["node".into(), "app.js".into()], &ctx);
-        assert!(!e.reason.contains("guards when it runs"), "{}", e.reason);
+        assert!(
+            !e.reason.contains("guards when it runs"),
+            "a plain node run is not a shell wrapper"
+        );
     }
 
     #[test]
