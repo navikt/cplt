@@ -1204,6 +1204,7 @@ keys but changes a value is shown as changed, not approved.
   "state": "changed",
   "project_dir": "/Users/you/src/app",
   "content_hash": "2deff3a5…",
+  "drifted": false,
   "message": ".cplt.toml permissions changed since the last approval.",
   "proposed": [
     {
@@ -1219,9 +1220,10 @@ keys but changes a value is shown as changed, not approved.
 
 | Field | Meaning |
 |---|---|
-| `version` | Shape version. Refuse a version you do not know. |
+| `version` | Shape version. Refuse a version you do not know. New fields can appear without a version change, so ignore fields you do not know. |
 | `state` | `none` (no `.cplt.toml`, or nothing to approve), `approved`, `pending` (never approved, or only some keys), `changed` (values changed since the approval), `foreign` (approved in a different repository), `outlived` (an approval, but nothing left to approve), `uncommitted` (the file's proposals are ignored until committed), `invalid` (the file does not load) |
 | `content_hash` | Hash of the committed `[propose]` section. An approval is pinned to it. `null` when there is no committed `.cplt.toml` to approve: no file, an invalid one, or one that exists only in the working tree (the launch ignores its proposals). |
+| `drifted` | `true` when `.cplt.toml` is committed and the working-tree copy differs from `HEAD:.cplt.toml`, as `git diff HEAD` sees it (a line-ending filter alone is not a difference). The verdict describes the committed copy, so it does not cover the bytes on disk, and the launch warns that local edits are not in effect. `false` otherwise: the working tree matches HEAD, there is no working-tree copy, or there is no committed copy to differ from (no file, or one that is untracked or staged but not committed, which `state` reports as `uncommitted`). |
 | `message` | One line, worded as the launch warning. |
 | `proposed` | Every key that needs approval: its value (`detail`), what approving it costs (`effect`), and whether the launch grants it (`approved`). |
 | `command` | What to run to approve, or `null` when there is nothing to approve or `cplt trust accept` would refuse. |

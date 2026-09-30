@@ -6596,8 +6596,41 @@ paths = [
             stdout.contains("git HEAD"),
             "should indicate source is git HEAD: {stdout}"
         );
+        // The launch's hint, from the same drift check.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("local edits are not in effect"),
+            "should say the local edits are not in effect: {stderr}"
+        );
+
+        // Approved + drift: the verdict covers HEAD, `drifted` says the
+        // working-tree bytes are not what was approved. `trust accept` refuses
+        // a drifted file, so approve the clean checkout and edit again.
+        std::fs::write(
+            repo.join(".cplt.toml"),
+            "[propose]\nallow_localhost_any = true\n",
+        )
+        .unwrap();
+        let accept = trust_cmd(&repo, &config_file)
+            .args(["trust", "accept", "--all"])
+            .output()
+            .expect("run trust accept");
+        assert!(accept.status.success(), "{accept:?}");
+        std::fs::write(
+            repo.join(".cplt.toml"),
+            "[propose]\nallow_localhost_any = true\nallow_docker = true\n",
+        )
+        .unwrap();
+        let out = trust_cmd(&repo, &config_file)
+            .args(["trust", "show", "--json"])
+            .output()
+            .expect("run trust show --json");
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["state"], "approved", "{v}");
+        assert_eq!(v["drifted"], true, "{v}");
 
         let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(config_file.parent().unwrap());
     }
 
     #[test]
