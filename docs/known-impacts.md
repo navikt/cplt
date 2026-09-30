@@ -318,10 +318,18 @@ npm install -D cowsay
 npx cowsay hi
 ```
 
-If you need npx for packages outside the project, move npm's cache into the cache dir and allow exec on its npx directory only. npm keeps the npx directory at `<cache>/_npx`:
+If you need npx for packages outside the project, move npm's cache into the cache dir and allow exec on its npx directory only. npm keeps the npx directory at `<cache>/_npx`. Put the variable in your shell profile (`~/.zshrc` or `~/.bashrc`), so every new shell has it; the `cplt config set` lines are one-time:
 
 ```bash
-export npm_config_cache="$HOME/Library/Caches/npm"   # Linux: "$HOME/.cache/npm"
+# in ~/.zshrc or ~/.bashrc
+if [ "$(uname)" = Darwin ]; then
+  export npm_config_cache="$HOME/Library/Caches/npm"
+else
+  export npm_config_cache="$HOME/.cache/npm"
+fi
+```
+
+```bash
 cplt config set sandbox.pass_env npm_config_cache
 cplt config set sandbox.allow_cache_exec npm/_npx
 ```

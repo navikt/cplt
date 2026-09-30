@@ -814,6 +814,33 @@ fn refusal_decision(
     }
 }
 
+/// npm's subcommand, past any global options before it (`npm --prefix app exec`).
+fn npm_subcommand<'a>(rest: &[&'a str]) -> Option<&'a str> {
+    let mut it = rest.iter();
+    while let Some(&a) = it.next() {
+        if !a.starts_with('-') {
+            return Some(a);
+        }
+        // Known value-taking globals only; an unlisted one followed by a separate
+        // value falls back to the generic answer.
+        if matches!(
+            a,
+            "--prefix"
+                | "-C"
+                | "--cache"
+                | "--registry"
+                | "--userconfig"
+                | "--globalconfig"
+                | "--loglevel"
+                | "-w"
+                | "--workspace"
+        ) {
+            it.next();
+        }
+    }
+    None
+}
+
 /// Explain whether `argv` would run, is guard-blocked, or needs an `allow_*`.
 ///
 /// Reuses the gh/git guard classifiers ([`crate::gh_proxy::gate`],
@@ -1064,20 +1091,22 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
     // runs it from there. `~/.npm` is writable and deliberately not executable
     // (write-then-exec), so the run fails with `bad interpreter: Operation not
     // permitted`, which names neither cplt nor the rule.
-    if base == "npx" || (base == "npm" && matches!(rest.first(), Some(&("exec" | "x")))) {
+    if base == "npx" || (base == "npm" && matches!(npm_subcommand(&rest), Some("exec" | "x"))) {
         return ExecExplain {
             decision: Decision::Allowed,
-            reason: "npx runs, but a package that is not installed in the project is \
-                     fetched into ~/.npm/_npx and run from there. ~/.npm is writable and \
-                     not executable (write-then-exec), so that fails with `bad \
-                     interpreter: Operation not permitted`."
+            reason: "npx runs. With npm's default cache, a package that is not installed \
+                     in the project is fetched into ~/.npm/_npx and run from there. \
+                     ~/.npm is writable and not executable (write-then-exec), so that \
+                     fails with `bad interpreter: Operation not permitted`. If \
+                     npm_config_cache already points under the cache dir and \
+                     allow_cache_exec names npm/_npx, it runs."
                 .to_string(),
             fix: Some(
                 "add the package to the project (`npm install -D <pkg>`), so npx runs it \
-                 from node_modules/.bin; or move npm's cache under the cache dir and allow \
-                 exec there: export npm_config_cache=\"$HOME/Library/Caches/npm\" \
-                 (~/.cache/npm on Linux), then `--pass-env npm_config_cache \
-                 --allow-cache-exec npm/_npx`. See docs/known-impacts.md#npx."
+                 from node_modules/.bin; or set npm_config_cache in your shell profile to \
+                 \"$HOME/Library/Caches/npm\" on macOS or \"$HOME/.cache/npm\" on Linux, then \
+                 `--pass-env npm_config_cache --allow-cache-exec npm/_npx`. See \
+                 docs/known-impacts.md#npx."
                     .to_string(),
             ),
             objection: None,
@@ -1836,14 +1865,23 @@ mod tests {
             &["npx", "cowsay"][..],
             &["npm", "exec", "cowsay"],
             &["npm", "x"],
+            &["npm", "--silent", "x", "cowsay"],
+            &["npm", "--prefix", "./app", "exec", "cowsay"],
+            &["npm", "--prefix=./app", "exec", "cowsay"],
         ] {
             let argv: Vec<String> = argv.iter().map(|s| (*s).to_string()).collect();
             let e = explain_exec(&argv, &ctx);
-            assert!(e.reason.contains("~/.npm/_npx"), "{argv:?}: {}", e.reason);
+            assert!(e.reason.contains("~/.npm/_npx"), "{argv:?}");
             assert!(e.fix.as_deref().unwrap().contains("npm/_npx"), "{argv:?}");
         }
-        let e = explain_exec(&["npm".into(), "install".into()], &ctx);
-        assert!(e.reason.starts_with("not specifically gated"));
+        for argv in [
+            &["npm", "install"][..],
+            &["npm", "--prefix", "x", "install"],
+        ] {
+            let argv: Vec<String> = argv.iter().map(|s| (*s).to_string()).collect();
+            let e = explain_exec(&argv, &ctx);
+            assert!(e.reason.starts_with("not specifically gated"), "{argv:?}");
+        }
     }
 
     #[test]
