@@ -2483,7 +2483,8 @@ pub fn copilot_ro_protect_paths(
 /// rule carries execute, so Linux is unaffected and the caller only warns on
 /// macOS. Not fixed by re-granting execute: that makes part of a shared cache
 /// write+exec. `allow_cache_exec`, which only covers `~/Library/Caches`, is
-/// the one carve-out honoured here.
+/// the one carve-out honoured here; the toolchain exec carve-outs inside
+/// `~/.gradle` and `~/.konan` are not, since no checkout lives there.
 pub fn no_exec_tool_dir_over(
     root: &Path,
     home: &Path,
@@ -2503,7 +2504,10 @@ pub fn no_exec_tool_dir_over(
         .iter()
         .filter(|d| d.write && !d.process_exec)
         .map(|d| home.join(d.path))
-        .find(|dir| root.starts_with(dir))
+        // The root is canonical; a symlinked `~/.cache` only matches by target.
+        .find(|dir| {
+            root.starts_with(dir) || std::fs::canonicalize(dir).is_ok_and(|t| root.starts_with(t))
+        })
 }
 
 /// Environment lookup for the Copilot cache resolver: `&|k| std::env::var_os(k)`
@@ -4183,6 +4187,21 @@ fn dedup(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn project_under_a_symlinked_cache_is_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let target = tmp.path().join("vol");
+        std::fs::create_dir_all(target.join("p")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::os::unix::fs::symlink(&target, home.join(".cache")).unwrap();
+        let root = std::fs::canonicalize(target.join("p")).unwrap();
+        assert_eq!(
+            no_exec_tool_dir_over(&root, &home, &[], false),
+            Some(home.join(".cache"))
+        );
+    }
+
     #[test]
     fn project_under_a_no_exec_cache_is_named() {
         let home = Path::new("/Users/u");
