@@ -286,15 +286,18 @@ pub fn display_config(loaded: Option<&LoadedConfig>, local: Option<&LoadedConfig
     if let Some(ref ad) = c.proxy.allowed_domains {
         println!("{blue}[cplt]{nc}    allowed_domains  = \"{ad}\"");
     }
-    let default_allowlist = c.proxy.default_allowlist.unwrap_or(false);
+    let default_allowlist = bools.default_allowlist;
     println!(
         "{blue}[cplt]{nc}    default_allowlist = {}{}{nc}{}",
         if default_allowlist { green } else { yellow },
         default_allowlist,
-        src(
-            "proxy",
-            "default_allowlist",
-            c.proxy.default_allowlist.is_some()
+        preset_label(
+            default_allowlist,
+            src(
+                "proxy",
+                "default_allowlist",
+                c.proxy.default_allowlist.is_some()
+            )
         )
     );
     if let Some(ref lf) = c.proxy.log_file {
@@ -391,12 +394,11 @@ pub fn display_config(loaded: Option<&LoadedConfig>, local: Option<&LoadedConfig
         // and turns none on, so with no allowlist active these entries change
         // nothing — and a list sitting there looking effective is exactly the
         // kind of thing that sends someone debugging the wrong layer.
-        let inert =
-            if c.proxy.default_allowlist.unwrap_or(false) || c.proxy.allowed_domains.is_some() {
-                String::new()
-            } else {
-                format!(" {dim}(no allowlist in force, so these add nothing yet){nc}")
-            };
+        let inert = if default_allowlist || c.proxy.allowed_domains.is_some() {
+            String::new()
+        } else {
+            format!(" {dim}(no allowlist in force, so these add nothing yet){nc}")
+        };
         println!(
             "{blue}[cplt]{nc}    domains          = {:?}{inert}",
             c.allow.domains
@@ -441,14 +443,17 @@ pub fn display_config(loaded: Option<&LoadedConfig>, local: Option<&LoadedConfig
         validate,
         src("sandbox", "validate", c.sandbox.validate.is_some())
     );
-    let allow_env_files = c.sandbox.allow_env_files.unwrap_or(false);
+    let allow_env_files = bools.allow_env_files;
     println!(
         "{blue}[cplt]{nc}    allow_env_files       = {}{}",
         allow_env_files,
-        src(
-            "sandbox",
-            "allow_env_files",
-            c.sandbox.allow_env_files.is_some()
+        preset_label(
+            allow_env_files,
+            src(
+                "sandbox",
+                "allow_env_files",
+                c.sandbox.allow_env_files.is_some()
+            )
         )
     );
     let allow_localhost_any = bools.allow_localhost_any;
@@ -484,14 +489,17 @@ pub fn display_config(loaded: Option<&LoadedConfig>, local: Option<&LoadedConfig
             src("sandbox", "inherit_env", c.sandbox.inherit_env.is_some())
         );
     }
-    let allow_lifecycle = c.sandbox.allow_lifecycle_scripts.unwrap_or(false);
+    let allow_lifecycle = bools.allow_lifecycle_scripts;
     println!(
         "{blue}[cplt]{nc}    allow_lifecycle_scripts = {}{}",
         allow_lifecycle,
-        src(
-            "sandbox",
-            "allow_lifecycle_scripts",
-            c.sandbox.allow_lifecycle_scripts.is_some()
+        preset_label(
+            allow_lifecycle,
+            src(
+                "sandbox",
+                "allow_lifecycle_scripts",
+                c.sandbox.allow_lifecycle_scripts.is_some()
+            )
         )
     );
     let allow_gpg = c.sandbox.allow_gpg_signing.unwrap_or(false);
@@ -515,12 +523,15 @@ pub fn display_config(loaded: Option<&LoadedConfig>, local: Option<&LoadedConfig
             )
         );
     }
-    let allow_docker = c.sandbox.allow_docker.unwrap_or(false);
+    let allow_docker = bools.allow_docker;
     if allow_docker {
         let red = ui::stdout_color(ui::RED);
         println!(
             "{blue}[cplt]{nc}    allow_docker          = {red}true{nc} ⚠ DANGEROUS{}",
-            src("sandbox", "allow_docker", c.sandbox.allow_docker.is_some())
+            preset_label(
+                true,
+                src("sandbox", "allow_docker", c.sandbox.allow_docker.is_some())
+            )
         );
     } else {
         println!(
@@ -528,15 +539,18 @@ pub fn display_config(loaded: Option<&LoadedConfig>, local: Option<&LoadedConfig
             src("sandbox", "allow_docker", c.sandbox.allow_docker.is_some())
         );
     }
-    let allow_tmp = c.sandbox.allow_tmp_exec.unwrap_or(false);
+    let allow_tmp = bools.allow_tmp_exec;
     if allow_tmp {
         let red = ui::stdout_color(ui::RED);
         println!(
             "{blue}[cplt]{nc}    allow_tmp_exec        = {red}true{nc} ⚠ DANGEROUS{}",
-            src(
-                "sandbox",
-                "allow_tmp_exec",
-                c.sandbox.allow_tmp_exec.is_some()
+            preset_label(
+                true,
+                src(
+                    "sandbox",
+                    "allow_tmp_exec",
+                    c.sandbox.allow_tmp_exec.is_some()
+                )
             )
         );
     } else {
@@ -702,7 +716,8 @@ fn local_mode_is_set(local: &Config, section: &str, key: &str) -> bool {
 /// without `--force`. Plain text, not coloured: these rows are built as strings
 /// and coloured by the caller, and a marker that only appears in a terminal is
 /// not one a user can paste into a support thread.
-/// Both keys default to off, so a baseline `true` came from a preset.
+/// Every preset-controlled key defaults to off, so a baseline `true` came
+/// from a preset.
 fn preset_label(on: bool, label: &'static str) -> &'static str {
     if on && label == " (default)" {
         " (preset)"
