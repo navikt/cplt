@@ -291,6 +291,7 @@ Some tools unpack and execute binaries straight out of `~/Library/Caches` (macOS
 | Playwright Chromium | `~/Library/Caches/ms-playwright/` · `~/.cache/ms-playwright/` | Allow cache exec and disable Chromium's nested sandbox; see below |
 | Cypress | `~/Library/Caches/Cypress/` · `~/.cache/Cypress/` | Personal `allow_cache_exec`; repository proposal for `allow_localhost_any` |
 | pnpm dlx | `~/Library/Caches/pnpm/dlx/` · `~/.cache/pnpm/dlx/` | `--allow-cache-exec pnpm/dlx` |
+| npx / `npm exec` | `~/.npm/_npx/` | Install the package in the project; see [npx](#npx) |
 
 **Fix:**
 
@@ -304,6 +305,43 @@ Or for a single run, repeat the flag as needed:
 `cplt --allow-cache-exec ms-playwright --allow-cache-exec Cypress --allow-cache-exec pnpm/dlx`
 
 `--allow-cache-exec-any` opens exec for the entire cache tree (`~/Library/Caches` on macOS, `~/.cache` on Linux). Last resort only.
+
+<a id="npx"></a>
+
+### npx and `npm exec`
+
+A package that is not installed in the project is fetched into `~/.npm/_npx` and run from there. `~/.npm` is writable and deliberately not executable, so the run fails with a message that names neither cplt nor the rule:
+
+```
+sh: /Users/you/.npm/_npx/8f497369b2d6166e/node_modules/.bin/cowsay: /usr/bin/env: bad interpreter: Operation not permitted
+```
+
+This is the same write-then-exec protection as for the caches above: npx downloads code and runs it. `cplt check exec npx` says so. `~/.npm/_npx` is not under the cache dir, so `allow_cache_exec` cannot name it, and `allow.exec ~/.npm/_npx` is refused because the directory is writable.
+
+**Fix:** install the package in the project, and npx runs it from `node_modules/.bin`, which is executable like the rest of the project:
+
+```bash
+npm install -D cowsay
+npx cowsay hi
+```
+
+If you need npx for packages outside the project, move npm's cache into the cache dir and allow exec on its npx directory only. npm keeps the npx directory at `<cache>/_npx`. Put the variable in your shell profile (`~/.zshrc` or `~/.bashrc`), so every new shell has it; the `cplt config set` lines are one-time:
+
+```bash
+# in ~/.zshrc or ~/.bashrc
+if [ "$(uname)" = Darwin ]; then
+  export npm_config_cache="$HOME/Library/Caches/npm"
+else
+  export npm_config_cache="$HOME/.cache/npm"
+fi
+```
+
+```bash
+cplt config set sandbox.pass_env npm_config_cache
+cplt config set sandbox.allow_cache_exec npm/_npx
+```
+
+That starts a new npm cache, and every package npx fetches can then run inside the sandbox, as with `pnpm/dlx`.
 
 Every entry makes its directory both writable and executable, so an agent can
 write a binary there and run it. That code still runs inside the sandbox. This
