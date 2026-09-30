@@ -629,6 +629,9 @@ fn try_extraction_fallback(
     let Ok(mut child) = child else {
         return None;
     };
+    // This can take up to 30 s; the `--version` run only announces itself once
+    // it sees an extraction start, so say something here.
+    ui::info("Checking the Copilot runtime (first run after update)...");
 
     for _ in 0..60 {
         if let Some(name) = find_new_extracted_dir(pkg_base, dirs_before) {
