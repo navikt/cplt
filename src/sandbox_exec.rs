@@ -698,10 +698,15 @@ fn install_command_wrappers(
             match crate::gh_proxy::launch_repo(real_git, project_dir) {
                 Ok(repo) => repo_scope.push(repo),
                 Err(reason) => {
-                    ui::warn(&format!(
-                        "gh guard could not capture repository scope: {reason}. \
-                         Scope-checked commands will be blocked."
-                    ));
+                    // Once per process: `cplt check` launches one sandbox per
+                    // probe, and the same repository gives the same answer.
+                    static WARNED: std::sync::Once = std::sync::Once::new();
+                    WARNED.call_once(|| {
+                        ui::warn(&format!(
+                            "gh guard could not capture repository scope: {reason}. \
+                             Scope-checked commands will be blocked."
+                        ));
+                    });
                 }
             }
             for dir in repo_dirs {

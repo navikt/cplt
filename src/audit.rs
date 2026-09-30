@@ -669,6 +669,23 @@ pub fn write_network_report<W: Write>(
         return Ok(());
     };
 
+    // A clean, empty snapshot is the common case: one line, not ten. It keeps
+    // the caveat that zero is not proof; the fixed scope text is in
+    // docs/proxy.md. Anything else gets the full report.
+    if snapshot.availability == proxy::SnapshotAvailability::Available
+        && snapshot.completion == proxy::SnapshotCompletion::Settled
+        && snapshot.integrity == proxy::SnapshotIntegrity::default()
+        && snapshot.recorded_attempts == 0
+        && snapshot.unretained_observations == 0
+        && snapshot.domains.is_empty()
+    {
+        writeln!(
+            writer,
+            "[cplt] Proxy-observed CONNECT attempts recorded: 0. This does not prove that no networking occurred (routing: {routing})."
+        )?;
+        return Ok(());
+    }
+
     write_snapshot_status(writer, snapshot, "[cplt]")?;
 
     match &snapshot.availability {
@@ -2834,9 +2851,14 @@ mod tests {
         healthy.recorded_attempts = 0;
         healthy.domains.clear();
         let healthy_report = render_network_report(Some(&healthy), "proxy enabled");
-        assert!(healthy_report.contains("Collection: available."));
         assert!(healthy_report.contains("CONNECT attempts recorded: 0."));
         assert!(healthy_report.contains("does not prove that no networking occurred"));
+        assert!(healthy_report.contains("routing: proxy enabled"));
+        assert_eq!(
+            healthy_report.lines().count(),
+            1,
+            "a clean empty report is one line:\n{healthy_report}"
+        );
 
         let mut failed = healthy;
         failed.availability =

@@ -8451,6 +8451,13 @@ paths = [
             stdout.contains("BLOCKED"),
             "should show blocked items:\n{stdout}"
         );
+        // Each probe launches a sandbox, and this project has no origin: the
+        // gh-scope warning is the same answer every time, so it prints once
+        // (#673), not once per probe.
+        assert!(
+            stderr.matches("could not capture repository scope").count() <= 1,
+            "the gh-scope warning must print once per check:\n{stderr}"
+        );
     }
 
     /// #385 F04: an allowlist that is not itself in a writable tree, reached
