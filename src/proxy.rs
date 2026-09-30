@@ -707,10 +707,20 @@ enum AcceptLoopOutcome {
 
 impl ProxyHandle {
     pub fn shutdown(&self) {
-        self.shutdown_flag
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        // Accept loop is non-blocking with 50ms sleep, so it will notice
-        // the flag within ~50ms without needing a wake-up connection.
+        // The accept loop blocks in accept(); one connection of our own wakes
+        // it to see the flag. Only the first call connects: once the loop has
+        // stopped the port is closed and may belong to someone else. A failed
+        // connect needs no retry: the only way it fails while the listener is
+        // open is a full backlog, and then accept() returns without our help.
+        if !self
+            .shutdown_flag
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            let _ = TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], self.port)),
+                Duration::from_secs(1),
+            );
+        }
     }
 
     /// Test reader for the live collector before snapshot finalization.
@@ -959,10 +969,6 @@ pub fn start(opts: ProxyOptions) -> Result<ProxyHandle, String> {
         resolver: opts.resolver,
     });
 
-    listener
-        .set_nonblocking(false)
-        .map_err(|e| format!("set_nonblocking: {e}"))?;
-
     let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = shutdown_flag.clone();
     let active_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -990,8 +996,6 @@ pub fn start(opts: ProxyOptions) -> Result<ProxyHandle, String> {
         })
         .map_err(|e| format!("spawn proxy thread: {e}"))?;
 
-    std::thread::sleep(Duration::from_millis(50));
-
     Ok(ProxyHandle {
         shutdown_flag,
         port: actual_port,
@@ -1008,26 +1012,21 @@ fn accept_loop(
     state: Arc<ProxyState>,
     active_count: Arc<std::sync::atomic::AtomicUsize>,
 ) {
-    // Non-blocking accept with periodic shutdown check
-    listener.set_nonblocking(true).ok();
-
+    // Blocking accept. `ProxyHandle::shutdown` sets the flag and then
+    // connects once, so a blocked accept() returns and the flag check after it
+    // drops that connection (or any other that raced it) unserved.
     loop {
         if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
             break;
         }
 
-        let stream = match listener.accept() {
-            Ok((s, _)) => s,
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(50));
-                continue;
-            }
-            Err(_) => continue,
+        let Ok((stream, _)) = listener.accept() else {
+            continue;
         };
+        if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
 
-        // Ensure accepted socket is blocking (listener is non-blocking for
-        // shutdown checks, but connection handlers need blocking I/O).
-        stream.set_nonblocking(false).ok();
         stream.set_nodelay(true).ok();
 
         // Connection limit
@@ -3738,6 +3737,44 @@ mod tests {
                 "{host} was never recorded in the observed set (last status: {status:?})"
             );
         }
+    }
+
+    /// The accept loop blocks in accept(); `shutdown` must wake it at once,
+    /// close the listening port and let the accept thread finish, with no
+    /// polling interval to wait out. A second shutdown is a no-op.
+    #[test]
+    fn shutdown_wakes_the_blocked_accept_loop_and_closes_the_port() {
+        require_localhost_tcp!();
+        let up = spawn_fake_upstream();
+        let upstream = UpstreamProxy::parse(&format!("http://127.0.0.1:{}", up.port)).unwrap();
+        let proxy = make_proxy_default_allowlist(copilot_defaults(), None, upstream);
+        let port = proxy.port;
+        // Idle long enough that the accept thread is certainly blocked.
+        std::thread::sleep(Duration::from_millis(100));
+
+        let started = Instant::now();
+        proxy.shutdown();
+        proxy.shutdown();
+        let outcome = proxy.accept_done_rx.recv_timeout(Duration::from_secs(5));
+        up.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        assert!(
+            matches!(outcome, Ok(AcceptLoopOutcome::Closed(_))),
+            "accept loop must end cleanly on shutdown; got {outcome:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "shutdown must not wait on a poll interval: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            TcpStream::connect(("127.0.0.1", port)).is_err(),
+            "the listener must be closed once the accept loop has ended"
+        );
+        assert!(
+            proxy.observed_domains().is_empty(),
+            "the wake-up connection must never be admitted or recorded"
+        );
     }
 
     #[test]

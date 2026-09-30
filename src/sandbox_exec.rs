@@ -422,11 +422,11 @@ const GH_AUTH_TOKEN_EOF_GRACE: std::time::Duration = std::time::Duration::from_m
 ///
 /// Bounded in the same shape as [`crate::audit`]'s git probe: stdout is drained
 /// on a helper thread so `gh` can never block writing into a full pipe while the
-/// main thread polls, and on timeout the child is killed and reaped.
+/// main thread waits, and on timeout the child is killed and reaped.
 ///
 /// The reader is never joined, on either path. A descendant that outlives `gh`
 /// keeps the write end of the pipe open, so the reader sees no EOF even once
-/// `try_wait` reports the child gone — joining there would reinstate exactly the
+/// the child is reaped — joining there would reinstate exactly the
 /// hang this exists to remove. It hands its buffer over a channel instead, and
 /// both the wait for the child and the wait for that buffer are bounded.
 ///
@@ -436,7 +436,6 @@ const GH_AUTH_TOKEN_EOF_GRACE: std::time::Duration = std::time::Duration::from_m
 #[allow(clippy::disallowed_methods)] // gh resolved by trusted_gh() at the call site
 fn gh_auth_token(gh: &Path, timeout: std::time::Duration) -> Option<String> {
     use std::io::Read as _;
-    use std::time::{Duration, Instant};
 
     let mut cmd = std::process::Command::new(gh);
     cmd.args(["auth", "token", "--hostname", "github.com"]);
@@ -458,20 +457,7 @@ fn gh_auth_token(gh: &Path, timeout: std::time::Duration) -> Option<String> {
         let _ = tx.send(buf);
     });
 
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-    };
+    let status = crate::audit::wait_timeout(&mut child, timeout)?;
 
     // The child is gone, so its own write end is closed. A descendant it left
     // behind may still hold the other one, which is why this wait is bounded
