@@ -9276,12 +9276,19 @@ fn trust_state(
 /// `cplt trust show --json`. `version` lets a consumer refuse a shape it does
 /// not know.
 fn trust_show_json(project_dir: &std::path::Path) -> serde_json::Value {
+    // The launch warns from the same state, so the two cannot disagree.
+    let config_state = repo_config::repo_config_state(project_dir);
+    // The verdict describes `HEAD:.cplt.toml`; `drifted` says the working-tree
+    // file is not those bytes. Only a committed file can drift: an untracked or
+    // staged-only file has no HEAD copy, and is `uncommitted` instead.
+    let drifted = config_state == repo_config::RepoConfigState::Drifted;
     let bare = |state: &str, message: String| {
         serde_json::json!({
             "version": 1,
             "state": state,
             "project_dir": project_dir.display().to_string(),
             "content_hash": null,
+            "drifted": drifted,
             "message": message,
             "proposed": [],
             "command": null,
@@ -9290,7 +9297,7 @@ fn trust_show_json(project_dir: &std::path::Path) -> serde_json::Value {
     let loaded = match repo_config::load_repo_config(project_dir) {
         Ok(Some(l)) => l,
         Ok(None) => {
-            let st = repo_config::repo_config_state(project_dir);
+            let st = config_state;
             let state = match st {
                 repo_config::RepoConfigState::Missing
                 | repo_config::RepoConfigState::NotAGitRepo { has_file: false } => "none",
@@ -9326,6 +9333,7 @@ fn trust_show_json(project_dir: &std::path::Path) -> serde_json::Value {
         // nothing can approve.
         "content_hash": (loaded.source == repo_config::RepoConfigSource::GitHead)
             .then(|| trust::proposal_content_hash(propose)),
+        "drifted": drifted,
         "message": st.message,
         "proposed": proposed,
         "command": st.command,
@@ -13777,6 +13785,51 @@ mod tests {
         assert_eq!(v["state"], "uncommitted", "{v}");
         assert_eq!(v["content_hash"], serde_json::Value::Null, "{v}");
         assert_eq!(v["command"], serde_json::Value::Null, "{v}");
+    }
+
+    /// `drifted` is the launch's own drift check (`repo_config_state`): true
+    /// only when a committed `.cplt.toml` differs from the working tree.
+    /// Approved + drift is covered end to end in `e2e_trust_head_preferred_over_working_tree`.
+    #[test]
+    fn trust_show_json_drifted() {
+        // Pending + drift: the verdict still describes HEAD.
+        let (_g, dir, _) = committed_repo_config("[propose]\nallow_docker = true\n");
+        let v = trust_show_json(&dir);
+        assert_eq!(
+            (v["state"].as_str(), &v["drifted"]),
+            (Some("pending"), &false.into()),
+            "{v}"
+        );
+        std::fs::write(dir.join(".cplt.toml"), "[propose]\nallow_tmp_exec = true\n").unwrap();
+        let v = trust_show_json(&dir);
+        assert_eq!(
+            (v["state"].as_str(), &v["drifted"]),
+            (Some("pending"), &true.into()),
+            "{v}"
+        );
+        assert_eq!(v["proposed"][0]["key"], "allow_docker", "{v}");
+        // Deleted from the working tree: cplt still reads HEAD, and nothing
+        // on disk disagrees with it.
+        std::fs::remove_file(dir.join(".cplt.toml")).unwrap();
+        assert_eq!(trust_show_json(&dir)["drifted"], false);
+
+        // Untracked, then staged but never committed: no HEAD copy to drift from.
+        let (_g2, dir) = canonical_tempdir();
+        git_in(&dir, &["init", "--quiet"]);
+        std::fs::write(dir.join(".cplt.toml"), "[propose]\nallow_docker = true\n").unwrap();
+        let v = trust_show_json(&dir);
+        assert_eq!(
+            (v["state"].as_str(), &v["drifted"]),
+            (Some("uncommitted"), &false.into()),
+            "{v}"
+        );
+        git_in(&dir, &["add", ".cplt.toml"]);
+        let v = trust_show_json(&dir);
+        assert_eq!(
+            (v["state"].as_str(), &v["drifted"]),
+            (Some("uncommitted"), &false.into()),
+            "{v}"
+        );
     }
 
     #[test]
