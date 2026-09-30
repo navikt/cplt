@@ -865,7 +865,7 @@ fn human_duration(d: Duration) -> String {
 ///
 /// The call is bounded by [`GIT_TIMEOUT`]: the child is spawned, its stdout
 /// drained on a helper thread (so a large diff can't fill the pipe buffer and
-/// deadlock while we poll), and on timeout the child is killed and reaped (no
+/// deadlock while we wait), and on timeout the child is killed and reaped (no
 /// zombie) before returning `None`.
 fn git_output(project_dir: &Path, args: &[&str]) -> Option<String> {
     let mut child = crate::git::command(project_dir, args)?
@@ -883,36 +883,58 @@ fn git_output(project_dir: &Path, args: &[&str]) -> Option<String> {
         buf
     });
 
-    let deadline = Instant::now() + GIT_TIMEOUT;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    // Timed out: kill and reap so we don't leak a zombie, then
-                    // let the reader observe EOF and join.
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = reader.join();
-                    return None;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = reader.join();
-                return None;
-            }
-        }
-    };
-
-    // Child exited; its stdout write end is closed, so the reader hits EOF.
+    // On timeout the child is already killed and reaped; the reader then sees
+    // EOF and joins.
+    let status = wait_timeout(&mut child, GIT_TIMEOUT);
     let buf = reader.join().ok()?;
-    if !status.success() {
+    if !status?.success() {
         return None;
     }
     Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Wait for `child` to exit, at most `timeout`. Returns its status, or `None`
+/// when it outlived the deadline (it is then SIGKILLed and reaped — no zombie)
+/// or could not be waited on.
+///
+/// Blocks instead of polling, so a fast child costs its own runtime and not a
+/// sleep step. A helper thread sits in `waitid(WNOWAIT)`, which returns when
+/// the child exits but leaves it unreaped: the pid stays this child's until
+/// `child.wait()` below, so the timeout's kill can never hit a recycled pid.
+/// The helper is always joined; after a kill it returns at once.
+pub(crate) fn wait_timeout(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> Option<std::process::ExitStatus> {
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        loop {
+            // SAFETY: zeroed siginfo_t is a valid out-parameter for waitid.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: plain syscall on our own unreaped child; WNOWAIT leaves
+            // it for `Child::wait` to reap.
+            let rc = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid,
+                    &raw mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if rc == 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                break;
+            }
+        }
+        let _ = tx.send(());
+    });
+    let exited = rx.recv_timeout(timeout).is_ok();
+    if !exited {
+        let _ = child.kill();
+    }
+    let _ = waiter.join();
+    let status = child.wait().ok();
+    status.filter(|_| exited)
 }
 
 /// Writable roots the audit does NOT measure: every `allow.write` grant that
@@ -2257,6 +2279,36 @@ mod tests {
             "the child on a colliding SCRIPT_FD never got the write end\n  sh stderr: {:?}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    /// A hung child is killed at the deadline and reaped: `None`, returned
+    /// near the deadline, and the pid no longer exists (no zombie left).
+    #[test]
+    fn wait_timeout_kills_and_reaps_a_hung_child() {
+        let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let pid = libc::pid_t::try_from(child.id()).unwrap();
+        let started = Instant::now();
+        let status = wait_timeout(&mut child, Duration::from_millis(200));
+        let waited = started.elapsed();
+        assert!(status.is_none(), "a hung child must time out");
+        assert!(
+            waited >= Duration::from_millis(200) && waited < Duration::from_secs(10),
+            "the deadline must hold: {waited:?}"
+        );
+        // SAFETY: signal 0 only probes whether the pid exists.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!alive, "the timed-out child must be killed and reaped");
+    }
+
+    /// A child that exits in time reports its real status, success or not.
+    #[test]
+    fn wait_timeout_returns_the_exit_status() {
+        let mut ok = Command::new("/usr/bin/true").spawn().unwrap();
+        let mut bad = Command::new("/usr/bin/false").spawn().unwrap();
+        let ok = wait_timeout(&mut ok, Duration::from_secs(10)).expect("true exits");
+        let bad = wait_timeout(&mut bad, Duration::from_secs(10)).expect("false exits");
+        assert!(ok.success());
+        assert!(!bad.success());
     }
 
     /// The second terminal sink for text cplt does not control, and the one the
