@@ -2007,15 +2007,6 @@ fn warn_exec_tool_dir_shadowing(
 /// The `sandbox.refuse_invalid_repo_config` refusal (#385 M-01). Names the
 /// copy cplt read, because the fix differs: the loader prefers
 /// `HEAD:.cplt.toml`, and editing the working tree does not change that one.
-/// The one line that says a repo's `[propose]` is waiting for approval. Also
-/// printed by a `--quiet` agent launch: quiet hides chatter, not the fact that
-/// the repo's permissions are not applied (#673).
-fn untrusted_repo_config_notice(pending: usize) -> String {
-    format!(
-        "Untrusted .cplt.toml: {pending} unapproved permission(s), not applied. Review: cplt trust"
-    )
-}
-
 fn invalid_repo_config_refusal(problem: &str, committed: bool, named: bool) -> anyhow::Error {
     let fix = if committed {
         "The copy cplt read is the one committed at HEAD, not the working tree, so \
@@ -2044,6 +2035,15 @@ fn deny_unknown(config: &repo_config::RepoConfig) -> String {
         .cloned()
         .collect::<Vec<_>>()
         .join(", deny.")
+}
+
+/// The one line that says a repo's `[propose]` is waiting for approval. Also
+/// printed by a `--quiet` agent launch: quiet hides chatter, not the fact that
+/// the repo's permissions are not applied (#673).
+fn untrusted_repo_config_notice(pending: usize) -> String {
+    format!(
+        "Untrusted .cplt.toml: {pending} unapproved permission(s), not applied. Review: cplt trust"
+    )
 }
 
 fn warn_unknown_repo_config_keys(config: &repo_config::RepoConfig, label: &str) {
