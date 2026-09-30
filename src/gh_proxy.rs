@@ -4388,6 +4388,14 @@ fn list_remotes(real_git: &Path, repo_args: &[&str]) -> Vec<String> {
 #[must_use]
 pub fn capture_repo_facts(real_git: &Path, project_dir: &Path) -> RepoFacts {
     let dir = project_dir.to_string_lossy().into_owned();
+    let remotes = list_remotes(real_git, &["-C", dir.as_str()]);
+    capture_repo_facts_for(real_git, project_dir, &remotes)
+}
+
+/// [`capture_repo_facts`] with the remote list already read, so a launch lists
+/// the remotes once rather than once per question (#666).
+fn capture_repo_facts_for(real_git: &Path, project_dir: &Path, remotes: &[String]) -> RepoFacts {
+    let dir = project_dir.to_string_lossy().into_owned();
     let repo_args = ["-C", dir.as_str()];
     let mut facts = RepoFacts {
         project_dir: std::fs::canonicalize(project_dir)
@@ -4397,9 +4405,9 @@ pub fn capture_repo_facts(real_git: &Path, project_dir: &Path) -> RepoFacts {
         git_common_dir: git_common_dir(real_git, &repo_args).unwrap_or_default(),
         ..RepoFacts::default()
     };
-    for remote in list_remotes(real_git, &repo_args) {
-        if let Some(branch) = resolve_default_branch(real_git, &repo_args, &remote) {
-            facts.default_branches.insert(remote, branch);
+    for remote in remotes {
+        if let Some(branch) = resolve_default_branch(real_git, &repo_args, remote) {
+            facts.default_branches.insert(remote.clone(), branch);
         }
     }
     facts
@@ -4432,15 +4440,27 @@ pub fn capture_repo_facts_at_launch(
     project_dir: &Path,
     ask_remote: bool,
 ) -> RepoFacts {
-    let mut facts = capture_repo_facts(real_git, project_dir);
-    if !ask_remote {
-        return facts;
-    }
+    capture_launch_facts(real_git, project_dir, ask_remote).0
+}
+
+/// [`capture_repo_facts_at_launch`], plus whether the repository has any remote
+/// at all, read from the same `git remote` listing.
+fn capture_launch_facts(
+    real_git: &Path,
+    project_dir: &Path,
+    ask_remote: bool,
+) -> (RepoFacts, bool) {
     let dir = project_dir.to_string_lossy().into_owned();
     let repo_args = ["-C", dir.as_str()];
+    let remotes = list_remotes(real_git, &repo_args);
+    let has_remotes = !remotes.is_empty();
+    let mut facts = capture_repo_facts_for(real_git, project_dir, &remotes);
+    if !ask_remote {
+        return (facts, has_remotes);
+    }
     // One budget for the whole launch, however many remotes lack a symref.
     let deadline = std::time::Instant::now() + LS_REMOTE_TIMEOUT;
-    for remote in list_remotes(real_git, &repo_args) {
+    for remote in remotes {
         if facts.default_branches.contains_key(&remote) {
             continue;
         }
@@ -4471,7 +4491,53 @@ pub fn capture_repo_facts_at_launch(
         record_remote_head(project_dir, &remote, &branch);
         facts.default_branches.insert(remote, branch);
     }
-    facts
+    (facts, has_remotes)
+}
+
+/// Answers taken before any agent session in this process, kept for the rest
+/// of it (#666).
+///
+/// A launch asks the same questions of the same repository from several places
+/// before the agent starts, and `cplt check` asks them again for each of its
+/// probes. The answers cannot change in between: a launch starts its agent only
+/// after the last of these calls, and `check` runs nothing in its sandboxes but
+/// its own fixed probe scripts, none of which touches git config or refs.
+///
+/// **Only for callers that run before the agent does.** Parent-side code after
+/// a session (the audit) must ask git afresh: the agent may have changed the
+/// answer.
+type Memo<K, V> = std::sync::Mutex<Vec<(K, V)>>;
+
+/// Look `key` up in `cache`, computing and storing it on a miss. See [`Memo`].
+fn memo<K: PartialEq, V: Clone>(cache: &Memo<K, V>, key: K, compute: impl FnOnce() -> V) -> V {
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, v)) = cache.iter().find(|(k, _)| *k == key) {
+        return v.clone();
+    }
+    let v = compute();
+    cache.push((key, v.clone()));
+    v
+}
+
+/// [`detect_current_repo`], asked once per directory per process. Pre-launch
+/// callers only; see [`Memo`].
+pub fn launch_repo(real_git: &Path, dir: &Path) -> Result<String, String> {
+    static CACHE: Memo<PathBuf, Result<String, String>> = std::sync::Mutex::new(Vec::new());
+    memo(&CACHE, dir.to_path_buf(), || {
+        detect_current_repo(real_git, dir)
+    })
+}
+
+/// [`capture_repo_facts_at_launch`] plus whether any remote exists, asked once
+/// per directory per process. Pre-launch callers only; see [`Memo`].
+#[must_use]
+pub fn launch_repo_facts(real_git: &Path, dir: &Path, ask_remote: bool) -> (RepoFacts, bool) {
+    static CACHE: Memo<(PathBuf, bool), (RepoFacts, bool)> = std::sync::Mutex::new(Vec::new());
+    memo(&CACHE, (dir.to_path_buf(), ask_remote), || {
+        capture_launch_facts(real_git, dir, ask_remote)
+    })
 }
 
 /// Write `refs/remotes/<remote>/HEAD` -> `refs/remotes/<remote>/<branch>`, what
@@ -4615,21 +4681,9 @@ pub fn capture_named_root(real_git: &Path, dir: &Path) -> NamedRoot {
     let d = dir.to_string_lossy().into_owned();
     NamedRoot {
         path: std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()),
-        repo: detect_current_repo(real_git, dir).ok(),
+        repo: launch_repo(real_git, dir).ok(),
         git_common_dir: git_common_dir(real_git, &["-C", d.as_str()]).unwrap_or_default(),
     }
-}
-
-/// Whether `project_dir` has any remote configured at all.
-///
-/// Separates "no default branch could be captured" into its two cases: a repo
-/// with remotes whose `refs/remotes/*/HEAD` was never recorded (pushes really
-/// will be refused, and `git remote set-head` really is the fix), and a repo
-/// with nowhere to push, where neither is true.
-#[must_use]
-pub fn has_remotes(real_git: &Path, project_dir: &Path) -> bool {
-    let dir = project_dir.to_string_lossy().into_owned();
-    !list_remotes(real_git, &["-C", dir.as_str()]).is_empty()
 }
 
 /// The remote a `git push` writes to.
@@ -8791,6 +8845,30 @@ mod tests {
             .expect("git must run")
             .status
             .success()
+    }
+
+    /// The pre-launch lookups answer from the first call for the rest of the
+    /// process (#666), and agree with the uncached capture they stand in for.
+    #[test]
+    fn launch_lookups_ask_git_once_per_directory() {
+        let Some((_tmp, repo)) =
+            scratch_repo_with_default("trunk", "https://github.com/o/o.git", "trunk")
+        else {
+            return; // no git available
+        };
+        let git = which_git().unwrap();
+
+        let (facts, has_remotes) = launch_repo_facts(&git, &repo, false);
+        assert_eq!(facts, capture_repo_facts_at_launch(&git, &repo, false));
+        assert!(has_remotes);
+        assert_eq!(launch_repo(&git, &repo).as_deref(), Ok("o/o"));
+
+        // Changed behind the cache's back: the fresh capture sees it, the
+        // launch lookups still answer from their first call.
+        assert!(run_in(&git, &repo, &["remote", "remove", "origin"]));
+        assert!(capture_repo_facts(&git, &repo).default_branches.is_empty());
+        assert_eq!(launch_repo_facts(&git, &repo, false), (facts, true));
+        assert_eq!(launch_repo(&git, &repo).as_deref(), Ok("o/o"));
     }
 
     /// The advisory, verbatim: default branch `trunk`, stock configuration.
