@@ -4366,7 +4366,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
 
     // Printed by the exec path once the wrappers are installed, so their
     // notices (gh scope, git guard) land above the separator, not under it
-    // (#666). Once: a Bubblewrap fallback reaches the spawn twice.
+    // (#666). Once: cheap insurance against a path that reaches it twice.
     let banner = std::sync::Once::new();
     let print_banner = || {
         banner.call_once(|| {

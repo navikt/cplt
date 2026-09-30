@@ -1688,7 +1688,6 @@ fn exec_bwrap(
     // by the fd numbers set above.
     seal_inherited_fds(&mut cmd, vec![policy_read_fd, write_fd]);
 
-    on_launch();
     ignore_terminal_stop_signals();
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -1758,6 +1757,9 @@ fn exec_bwrap(
         return bwrap_setup_failed(wrapper, "namespace helper did not apply the sandbox");
     }
 
+    // Not before the spawn: every failure above can fall back, and the
+    // fallback's warnings (masks not applied) belong above the banner too.
+    on_launch();
     let code = forward_and_wait(child);
     restore_terminal_stop_signals();
     BwrapOutcome::Ran(code)

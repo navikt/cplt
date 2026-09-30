@@ -1683,7 +1683,8 @@ pub fn preflight(sandbox: &PreparedSandbox) -> Result<(), String> {
 /// `repo_dirs` are the validated `--repo-dir` roots — first-class repositories
 /// alongside the launch one, whose identity the gh guard's scope set is built from.
 /// `on_launch` runs after the launch-time notices and just before the spawn,
-/// so a caller's banner follows them (#666). A Bubblewrap fallback runs it twice.
+/// so a caller's banner follows them (#666). On the Bubblewrap path it runs once
+/// the namespace helper confirms, so fallback warnings come first too.
 #[allow(clippy::too_many_arguments)]
 pub fn exec_sandboxed(
     sandbox: &PreparedSandbox,
