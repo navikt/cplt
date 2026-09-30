@@ -6104,16 +6104,18 @@ mod tests {
         let ceiling = Duration::from_millis(500);
         // A thread stalled for a whole ceiling (a loaded CI runner) leaves the
         // tunnel genuinely idle, and the shared clock is right to reap it.
-        // Such a run proves nothing either way, so run again. A per-direction
-        // clock fails with every gap far below the ceiling and is never
-        // excused.
+        // Such a run proves nothing either way, pass or fail, so run again.
+        // A per-direction clock fails with every gap far below the ceiling
+        // and is never excused.
         for attempt in 1..=3 {
             match one_way_run(ceiling) {
-                Ok(()) => return,
-                Err((worst, msg)) if worst >= ceiling => {
-                    eprintln!("attempt {attempt}: {msg}; the test stalled {worst:?}, retrying");
+                (worst, outcome) if worst >= ceiling => {
+                    eprintln!(
+                        "attempt {attempt}: {outcome:?}; the test stalled {worst:?}, retrying"
+                    );
                 }
-                Err((worst, msg)) => {
+                (_, Ok(())) => return,
+                (worst, Err(msg)) => {
                     panic!("{msg} (longest stretch without traffic {worst:?}, ceiling {ceiling:?})")
                 }
             }
@@ -6122,11 +6124,11 @@ mod tests {
     }
 
     /// Stream one way for twice the ceiling, then send one byte the quiet way.
-    /// On failure, also returns the longest stretch in which the test could
-    /// not prove a byte crossed the tunnel: from a write to the next receipt.
+    /// Also returns the longest stretch in which the test could not prove a
+    /// byte crossed the tunnel: from a write to the next receipt.
     /// The relay's shared clock is touched between those two points, so it
     /// cannot legitimately idle out unless that stretch reached the ceiling.
-    fn one_way_run(ceiling: Duration) -> Result<(), (Duration, String)> {
+    fn one_way_run(ceiling: Duration) -> (Duration, Result<(), String>) {
         fn pair() -> (TcpStream, TcpStream) {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let a = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -6159,7 +6161,9 @@ mod tests {
                 .and_then(|()| client.read_exact(&mut buf));
             worst = worst.max(last_write.elapsed());
             last_write = wrote;
-            r.map_err(|e| (worst, format!("stream broke: {e}")))?;
+            if let Err(e) = r {
+                return (worst, Err(format!("stream broke: {e}")));
+            }
             assert_eq!(&buf, b"tick");
             std::thread::sleep(Duration::from_millis(25));
         }
@@ -6170,9 +6174,14 @@ mod tests {
             .write_all(b"ping")
             .and_then(|()| remote.read_exact(&mut buf));
         worst = worst.max(last_write.elapsed());
-        r.map_err(|e| (worst, format!("quiet direction was closed mid-stream: {e}")))?;
+        if let Err(e) = r {
+            return (
+                worst,
+                Err(format!("quiet direction was closed mid-stream: {e}")),
+            );
+        }
         assert_eq!(&buf, b"ping", "quiet direction was closed mid-stream");
-        Ok(())
+        (worst, Ok(()))
     }
 
     /// A CONNECT tunnel that sits idle longer than `proxy.timeout` must stay
