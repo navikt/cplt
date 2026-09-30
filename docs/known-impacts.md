@@ -1037,7 +1037,7 @@ cplt config set proxy.default_allowlist true
 
 (`proxy.allowed_domains` is a path to a domain list file, one host per line, not an inline array. Setting it turns the allowlist on, and the agent's own hosts are always included (since 2026.09.29-095137-e745d3a; Goose, Pi and Shell have none), but the package registries are not: without `proxy.default_allowlist`, Maven Central (`repo.maven.apache.org`) and `plugins.gradle.org` are blocked and the build still fails. With it on, the file is merged with the agent's built-in list, which includes those registries, so you add the mirror without re-listing them. The `strict` preset turns it on already.)
 
-`repo.adeo.no` is NAV's internal Nexus and resolves into private address space, so `allowed_domains` is not enough — it is exactly the case [`proxy.allow_private_domains`](#internal-mavengradle-repositories-on-private-ips) exists for. `navikt/pensjonsbrev/.cplt.toml` is a working example of a team configuring it.
+`repo.adeo.no` is NAV's internal Nexus and resolves into private address space, so `allowed_domains` is not enough — it is exactly the case [`proxy.allow_private_domains`](#internal-mavengradle-repositories-on-private-ips) exists for.
 
 > **Linux limitation:** the denials for files *inside an allowed tool dir* are only enforced on macOS, via SBPL literal deny rules. On Linux, Landlock cannot deny individual files within an allowed directory, so the parent dirs (`.m2`, `.gradle`, `.cargo`) stay fully readable for dependency resolution. `~/.npmrc` is the exception: it sits at the top of `$HOME`, which is never granted, so it is withheld on both platforms.
 
