@@ -4,40 +4,41 @@
 //! into the platform cache on first run. The sandbox denies writes to that cache,
 //! so `cplt` has to force the extraction before entering it (#166).
 
-use cplt::sandbox::{CacheEnv, copilot_pkg_dir, process_env};
+use cplt::sandbox::{CPLT_STATE_DIR, CacheEnv, copilot_pkg_dir, process_env};
 use cplt::ui;
 use std::path::Path;
 use std::path::PathBuf;
 
 /// Copilot's SEA extraction directory for this platform, resolved the way
-/// Copilot resolves it (`copilot_pkg_dir`, #374), plus cplt's own cache
-/// directory (which holds the `copilot-extracted` fast-path marker).
-#[cfg(target_os = "macos")]
+/// Copilot resolves it (`copilot_pkg_dir`, #374), plus the directory that
+/// holds cplt's `copilot-extracted` fast-path marker.
+///
+/// The marker lives in cplt's state directory, which the sandbox denies
+/// outright (`DENIED_DOTFILES`), not in `~/Library/Caches/cplt` or
+/// `~/.cache/cplt`, which the agent can write. A verdict the agent could forge
+/// would let it skip this preflight.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn copilot_cache_dirs(
     env: &CacheEnv,
     home: &Path,
     arch: &str,
 ) -> Result<(PathBuf, PathBuf), String> {
+    let platform = if cfg!(target_os = "macos") {
+        "darwin"
+    } else {
+        "linux"
+    };
     Ok((
-        copilot_pkg_dir(env, home, "macos")?.join(format!("darwin-{arch}")),
-        home.join("Library/Caches/cplt"),
+        copilot_pkg_dir(env, home, std::env::consts::OS)?.join(format!("{platform}-{arch}")),
+        home.join(CPLT_STATE_DIR),
     ))
 }
 
-/// Copilot's SEA extraction directory for this platform, resolved the way
-/// Copilot resolves it (`copilot_pkg_dir`, #374), plus cplt's own cache
-/// directory (which holds the `copilot-extracted` fast-path marker).
-#[cfg(target_os = "linux")]
-fn copilot_cache_dirs(
-    env: &CacheEnv,
-    home: &Path,
-    arch: &str,
-) -> Result<(PathBuf, PathBuf), String> {
-    Ok((
-        copilot_pkg_dir(env, home, "linux")?.join(format!("linux-{arch}")),
-        home.join(".cache/cplt"),
-    ))
-}
+/// Second line of the fast-path marker when this copilot does not SEA-extract.
+/// Hidden names are never extraction directories (`extraction_dirs` skips
+/// them), so this cannot collide with a real one.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const NOT_NEEDED: &str = ".not-needed";
 
 /// Ensure Copilot's bundled package is extracted before entering the sandbox.
 ///
@@ -104,7 +105,9 @@ pub fn ensure_copilot_extracted(
     let binary_id = binary_identity(copilot_bin);
 
     // Fast path: check cplt-managed marker that records both the binary
-    // identity and the actual extraction directory from the last successful run.
+    // identity and the verdict from the last successful run: the extraction
+    // directory, or `NOT_NEEDED`. Either is re-checked against the disk, so a
+    // marker that no longer matches only costs a fresh preflight.
     let cache_file = cache_dir.join("copilot-extracted");
     if let Some(ref bid) = binary_id
         && let Ok(cached) = std::fs::read_to_string(&cache_file)
@@ -113,15 +116,22 @@ pub fn ensure_copilot_extracted(
         if let (Some(cached_id), Some(cached_dir)) = (lines.next(), lines.next())
             && cached_id == bid.as_str()
         {
-            // Binary unchanged — verify the extracted dir still exists on disk
-            let extracted_marker = pkg_base.join(cached_dir).join(".extraction-complete");
-            if extracted_marker.exists() {
+            // Binary unchanged. `NOT_NEEDED` was only ever concluded with no
+            // extraction directory present; one appearing since means
+            // something changed, so look again.
+            let still_valid = if cached_dir == NOT_NEEDED {
+                extraction_dirs(&pkg_base).is_empty()
+            } else {
+                pkg_base
+                    .join(cached_dir)
+                    .join(".extraction-complete")
+                    .exists()
+            };
+            if still_valid {
                 return Ok(());
             }
         }
     }
-
-    ui::info("Extracting Copilot runtime (first run after update)...");
 
     // Ensure pkg_base exists — Copilot extracts into it, and both preflight
     // spawns use it as their working directory. A failure here has to be
@@ -158,20 +168,23 @@ pub fn ensure_copilot_extracted(
             reported_version = attempt.version;
         }
 
-        match outcome {
+        let verdict = match outcome {
             ExtractionOutcome::Extracted(dir_name) => {
-                // Persist success: binary identity + extracted dir name.
-                if let Some(ref bid) = binary_id {
-                    let _ = std::fs::create_dir_all(&cache_dir);
-                    let _ = std::fs::write(&cache_file, format!("{bid}\n{dir_name}"));
-                }
                 if !dirs_before.contains(&dir_name) {
                     ui::ok("Copilot runtime extracted");
                 }
-                return Ok(());
+                Some(dir_name)
             }
-            ExtractionOutcome::NotNeeded => return Ok(()),
-            ExtractionOutcome::Unresolved => {}
+            ExtractionOutcome::NotNeeded => Some(NOT_NEEDED.to_string()),
+            ExtractionOutcome::Unresolved => None,
+        };
+        if let Some(verdict) = verdict {
+            // Persist the verdict against the binary identity.
+            if let Some(ref bid) = binary_id {
+                let _ = std::fs::create_dir_all(&cache_dir);
+                let _ = std::fs::write(&cache_file, format!("{bid}\n{verdict}"));
+            }
+            return Ok(());
         }
 
         // Self-heal, once. Only reached when every other path is exhausted, so
@@ -364,17 +377,27 @@ fn run_extraction_attempt(
     // 1. A new directory with `.extraction-complete` marker (normal success)
     // 2. An in-progress `.extracting-*` temp dir (extraction is happening)
     // Timeout: 60s (larger SEA payloads in newer versions need more time)
+    //
+    // The interval is short because most runs end on the child's exit: a copilot
+    // that does not extract, or whose runtime is already there, is done in well
+    // under a second. The loop used to sleep 500 ms before its first exit check,
+    // a coarse tick from the original `-p ""` probe (f878509), which made that
+    // the floor for every run.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let tick = std::time::Duration::from_millis(20);
     let mut extracted_dir_name: Option<String> = None;
     let mut saw_extracting = false;
     let mut child_exit_ok = false;
-    for i in 0..120 {
+    loop {
         if let Some(name) = find_new_extracted_dir(pkg_base, dirs_before) {
             extracted_dir_name = Some(name);
             break;
         }
-        // Detect in-progress `.extracting-*` temp dirs — proves extraction started
+        // Detect in-progress `.extracting-*` temp dirs — proves extraction
+        // started, and is the only point at which saying so is true.
         if !saw_extracting && has_extracting_dir(pkg_base) {
             saw_extracting = true;
+            ui::info("Extracting Copilot runtime (first run after update)...");
         }
         if let Ok(Some(status)) = child.try_wait() {
             child_exit_ok = status.success();
@@ -385,7 +408,7 @@ fn run_extraction_attempt(
             }
             // If extraction started (saw temp dir) but process exited without
             // completion, wait a bit more — rename may be in flight
-            if saw_extracting && i < 119 {
+            if saw_extracting && std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(500));
                 extracted_dir_name = find_new_extracted_dir(pkg_base, dirs_before);
             }
@@ -396,7 +419,10 @@ fn run_extraction_attempt(
             }
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(tick);
     }
 
     // If extraction is still in flight when the poll loop ends, give it time to
@@ -603,6 +629,9 @@ fn try_extraction_fallback(
     let Ok(mut child) = child else {
         return None;
     };
+    // This can take up to 30 s; the `--version` run only announces itself once
+    // it sees an extraction start, so say something here.
+    ui::info("Checking the Copilot runtime (first run after update)...");
 
     for _ in 0..60 {
         if let Some(name) = find_new_extracted_dir(pkg_base, dirs_before) {
@@ -842,7 +871,6 @@ mod copilot_extraction_tests {
     /// Build a temp HOME plus a fake copilot whose body can inspect `$PKG`
     /// (the platform extraction dir).
     fn fixture(name: &str, script: &str) -> Fixture {
-        use std::os::unix::fs::PermissionsExt;
         let root = std::env::temp_dir().join(format!("cplt-extract-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let home = root.join("home");
@@ -852,46 +880,56 @@ mod copilot_extraction_tests {
         std::fs::create_dir_all(&project).unwrap();
         std::fs::create_dir_all(&bindir).unwrap();
         std::fs::create_dir_all(&pkg).unwrap();
-        let bin = bindir.join("copilot");
-        // Write the script here, then have a *child process* copy it into
-        // place. Writing it in-process and exec'ing it races every other test
-        // thread: `Command::spawn` forks, and a fork that happens while this
-        // file is open for writing inherits the writable descriptor, so our
-        // exec comes back ETXTBSY. #285 tried to close that with a staged
-        // write plus an atomic rename, but ETXTBSY is a property of the inode,
-        // not of the name — renaming hands the exec the very inode that was
-        // open for writing, so the race survived and recurred. Copying via
-        // `cp` gives `bin` a fresh inode whose only writable descriptor lives
-        // and dies inside the child, where no fork of ours can inherit it.
-        let staging = root.join("copilot.staging");
-        std::fs::write(
-            &staging,
-            format!(
-                "#!/bin/sh\nPKG=\"{}\"\nCOUNT=\"{}\"\n{script}\n",
-                pkg.to_string_lossy().replace('"', "\\\""),
-                root.join("version-calls")
-                    .to_string_lossy()
-                    .replace('"', "\\\""),
-            ),
-        )
-        .unwrap();
-        let copied = std::process::Command::new("cp")
-            .arg(&staging)
-            .arg(&bin)
-            .status()
-            .unwrap();
-        assert!(copied.success(), "cp of the fake copilot failed: {copied}");
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        Fixture {
+        let f = Fixture {
+            bin: bindir.join("copilot"),
             root,
             home,
             project,
             pkg,
-            bin,
-        }
+        };
+        f.install(script);
+        f
     }
 
     impl Fixture {
+        /// Put a fake copilot running `script` at `self.bin`, replacing any
+        /// earlier one with a new inode (so its identity changes, as after an
+        /// `npm update`).
+        fn install(&self, script: &str) {
+            use std::os::unix::fs::PermissionsExt;
+            let (root, pkg, bin) = (&self.root, &self.pkg, &self.bin);
+            let _ = std::fs::remove_file(bin);
+            // Write the script here, then have a *child process* copy it into
+            // place. Writing it in-process and exec'ing it races every other test
+            // thread: `Command::spawn` forks, and a fork that happens while this
+            // file is open for writing inherits the writable descriptor, so our
+            // exec comes back ETXTBSY. #285 tried to close that with a staged
+            // write plus an atomic rename, but ETXTBSY is a property of the inode,
+            // not of the name — renaming hands the exec the very inode that was
+            // open for writing, so the race survived and recurred. Copying via
+            // `cp` gives `bin` a fresh inode whose only writable descriptor lives
+            // and dies inside the child, where no fork of ours can inherit it.
+            let staging = root.join("copilot.staging");
+            std::fs::write(
+                &staging,
+                format!(
+                    "#!/bin/sh\nPKG=\"{}\"\nCOUNT=\"{}\"\n{script}\n",
+                    pkg.to_string_lossy().replace('"', "\\\""),
+                    root.join("version-calls")
+                        .to_string_lossy()
+                        .replace('"', "\\\""),
+                ),
+            )
+            .unwrap();
+            let copied = std::process::Command::new("cp")
+                .arg(&staging)
+                .arg(bin)
+                .status()
+                .unwrap();
+            assert!(copied.success(), "cp of the fake copilot failed: {copied}");
+            std::fs::set_permissions(bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
         fn run(&self) -> Result<(), String> {
             ensure_copilot_extracted(&self.bin, &self.home, &self.project)
         }
@@ -962,6 +1000,65 @@ mod copilot_extraction_tests {
     fn empty_cache_and_a_clean_exit_means_nothing_to_extract() {
         let f = fixture("empty", NEVER_EXTRACTS);
         assert!(f.run().is_ok());
+    }
+
+    /// Counts its `--version` runs and never extracts: a non-SEA copilot such
+    /// as the pure-JS npm package.
+    const COUNTS_NEVER_EXTRACTS: &str = "case \"$*\" in *--version*) echo x >> \"$COUNT\" ;; esac\necho 'GitHub Copilot CLI 1.0.63.'";
+
+    /// #666: a copilot that needs no extraction is checked once per binary,
+    /// not on every launch.
+    #[test]
+    fn not_needed_is_cached_until_the_binary_changes() {
+        let f = fixture("not-needed-cache", COUNTS_NEVER_EXTRACTS);
+        assert!(f.run().is_ok());
+        assert!(f.run().is_ok());
+        assert_eq!(f.version_calls(), 1, "a cache hit must not spawn copilot");
+
+        // An upgrade replaces the binary: the verdict no longer applies.
+        f.install(&format!("{COUNTS_NEVER_EXTRACTS}\n# upgraded"));
+        assert!(f.run().is_ok());
+        assert_eq!(f.version_calls(), 2, "a new binary must be re-checked");
+    }
+
+    /// The marker lives in cplt's state directory, which the sandbox denies.
+    #[test]
+    fn marker_lives_in_the_sandbox_denied_state_dir() {
+        let f = fixture("marker-dir", COUNTS_NEVER_EXTRACTS);
+        assert!(f.run().is_ok());
+        assert!(f.cache_file().starts_with(f.home.join(CPLT_STATE_DIR)));
+        assert!(f.cache_file().exists());
+    }
+
+    /// A marker that does not describe this binary, or whose verdict the disk
+    /// contradicts, only ever costs a re-check.
+    #[test]
+    fn a_marker_that_does_not_fit_is_rechecked() {
+        let f = fixture("marker-tamper", COUNTS_NEVER_EXTRACTS);
+        assert!(f.run().is_ok());
+        let good = std::fs::read_to_string(f.cache_file()).unwrap();
+        let (id, _) = good.split_once('\n').unwrap();
+
+        // Someone else's identity with a "not needed" verdict.
+        std::fs::write(
+            f.cache_file(),
+            format!("/usr/bin/true:1:1:1.1\n{NOT_NEEDED}"),
+        )
+        .unwrap();
+        assert!(f.run().is_ok());
+        assert_eq!(f.version_calls(), 2);
+
+        // This binary's identity, but an extraction directory has appeared
+        // since "not needed" was concluded.
+        std::fs::write(f.cache_file(), format!("{id}\n{NOT_NEEDED}")).unwrap();
+        f.complete_dir("1.0.63");
+        assert!(f.run().is_ok());
+        assert_eq!(f.version_calls(), 3);
+
+        // Garbage.
+        std::fs::write(f.cache_file(), "garbage").unwrap();
+        assert!(f.run().is_ok());
+        assert_eq!(f.version_calls(), 4);
     }
 
     /// #166 core case: after an update the old version's directory is still
