@@ -2037,6 +2037,15 @@ fn deny_unknown(config: &repo_config::RepoConfig) -> String {
         .join(", deny.")
 }
 
+/// The one line that says a repo's `[propose]` is waiting for approval. Also
+/// printed by a `--quiet` agent launch: quiet hides chatter, not the fact that
+/// the repo's permissions are not applied (#673).
+fn untrusted_repo_config_notice(pending: usize) -> String {
+    format!(
+        "Untrusted .cplt.toml: {pending} unapproved permission(s), not applied. Review: cplt trust"
+    )
+}
+
 fn warn_unknown_repo_config_keys(config: &repo_config::RepoConfig, label: &str) {
     let unknown = repo_config::unknown_keys(config);
     if unknown.is_empty() {
@@ -2562,7 +2571,8 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                 // Every warning here is behind `quiet`, which `cplt exec` turns
                 // on by default so a script's stderr stays clean. exec runs this
                 // same check and applies the same key set, it just does not say
-                // so. `--no-quiet` shows it.
+                // so. `--no-quiet` shows it. A quiet agent launch gets one line
+                // (#673), printed from the launch path.
                 if !resolved.quiet {
                     match (&entry, verdict) {
                         // Finding 4: the trust file is keyed on the git origin URL,
@@ -2605,24 +2615,8 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                                 ".cplt.toml permissions changed since the last approval. Re-approve with `cplt trust accept`",
                             );
                         }
-                        // No trust entry — first time seeing this repo config
-                        (None, _) if !proposes_nothing => {
-                            ui::warn(
-                                "Untrusted .cplt.toml. This repo wants to relax sandbox permissions.",
-                            );
-                            eprintln!(
-                                "  {}⚠{} Review proposed permissions before approving.",
-                                ui::color(ui::YELLOW),
-                                ui::color(ui::RESET)
-                            );
-                            eprintln!(
-                                "  {}Show:{} cplt trust        {}Approve:{} cplt trust accept --all",
-                                ui::color(ui::DIM),
-                                ui::color(ui::RESET),
-                                ui::color(ui::DIM),
-                                ui::color(ui::RESET),
-                            );
-                        }
+                        // No trust entry: the "Untrusted .cplt.toml" notice
+                        // below lists what is pending, so nothing to add here.
                         _ => {}
                     }
                 }
@@ -2838,10 +2832,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
 
     // Show unapproved permissions warning (non-fatal — deny-default keeps us safe)
     if !unapproved_proposals.is_empty() && !resolved.quiet {
-        ui::warn(&format!(
-            ".cplt.toml has {} unapproved permission(s):",
-            unapproved_proposals.len()
-        ));
+        ui::warn(&untrusted_repo_config_notice(unapproved_proposals.len()));
         for key in &unapproved_proposals {
             match repo_config::propose_key_detail(&repo_propose, key, Some(5)) {
                 Some(detail) => eprintln!(
@@ -2853,15 +2844,14 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             }
         }
         eprintln!(
-            "  Run: {}cplt trust accept --all{}  (or select specific keys)",
-            ui::color(ui::GREEN),
-            ui::color(ui::RESET)
+            "  {}Approve:{} cplt trust accept --all  (or select specific keys)",
+            ui::color(ui::DIM),
+            ui::color(ui::RESET),
         );
     }
 
     if !resolved.quiet {
         ui::info(&format!("Project:  {}", project_dir.display()));
-        ui::info(&format!("Home:     {}", home_dir.display()));
         if let Some(ref cp) = config_path {
             ui::info(&format!("Config:   {}", cp.display()));
         }
@@ -3705,15 +3695,6 @@ fn start_proxy_if_enabled(
     // everything else.
     let allowlist_active = !default_allowlist.is_empty() || allowed_domains_file.is_some();
 
-    let port_hint = if resolved.proxy_port == 0 {
-        "ephemeral port".to_string()
-    } else {
-        format!("localhost:{}", resolved.proxy_port)
-    };
-    if !resolved.quiet {
-        ui::info(&format!("Starting proxy on {port_hint}..."));
-    }
-
     match proxy::start(proxy::ProxyOptions {
         port: resolved.proxy_port,
         blocked_file,
@@ -4153,7 +4134,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         repo_roots,
         worktree_root,
         active_agent,
-        unapproved_proposals: _,
+        unapproved_proposals,
     } = resolve_context(&cli, false)?;
 
     let repo_paths: Vec<PathBuf> = repo_roots.iter().map(|r| r.dir.clone()).collect();
@@ -4205,7 +4186,6 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             ),
             copilot_install_dir: copilot_install_dir.as_deref(),
             electron_app_dir: electron_app_dir.as_deref(),
-            announce_scratch: true,
             pnpm_candidate: None,
             inspect_only: cli.print_profile,
         },
@@ -4304,6 +4284,8 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             &repo_rows,
             worktree_root.as_deref(),
         );
+    } else if !unapproved_proposals.is_empty() {
+        ui::warn(&untrusted_repo_config_notice(unapproved_proposals.len()));
     }
     if let Err(e) = prompt_confirm(resolved.yes, resolved.quiet) {
         bail!("{e}");
@@ -5346,9 +5328,6 @@ struct AssemblyOptions<'a> {
     copilot_install_dir: Option<&'a Path>,
     /// VS Code's Electron bundle, which the Copilot shim needs dyld access to.
     electron_app_dir: Option<&'a Path>,
-    /// Announce the scratch directory. The agent launch prints a summary; `exec`
-    /// and `check` must keep their output clean for scripts and `--json`.
-    announce_scratch: bool,
     /// A pnpm path explicitly requested by `cplt exec`, if any.
     pnpm_candidate: Option<&'a Path>,
     /// The sandbox is only printed or checked, never launched
@@ -5448,12 +5427,7 @@ fn assemble_sandbox(
         scratch::ScratchDir::gc_stale(home_dir);
 
         match scratch::ScratchDir::create(home_dir) {
-            Ok(s) => {
-                if opts.announce_scratch && !resolved.quiet {
-                    ui::ok(&format!("Scratch dir: {}", s.path().display()));
-                }
-                Some(s)
-            }
+            Ok(s) => Some(s),
             Err(e) => bail!("Cannot create scratch dir: {e}"),
         }
     } else {
@@ -5781,7 +5755,6 @@ fn prepare_shell_sandbox(
             // shell/check have no agent install dir to grant special access to
             copilot_install_dir: None,
             electron_app_dir: None,
-            announce_scratch: false,
             pnpm_candidate: None,
             // `cplt check` only reports on the policy.
             inspect_only: true,
@@ -5946,7 +5919,6 @@ fn run_exec_command(
                 ),
                 copilot_install_dir: None,
                 electron_app_dir: None,
-                announce_scratch: false,
                 pnpm_candidate,
                 inspect_only: cli.print_profile,
             },
@@ -7499,8 +7471,13 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         let e = check::explain_exec(&argv, &exec_ctx);
         println!("guard:       {label:<14}{}", e.decision.as_str());
         // A blocked feature-branch push breaks the branch-and-PR workflow;
-        // the other two are blocked by design and need no explanation.
-        if label == "push feature" && e.decision == check::Decision::Blocked {
+        // the other two are blocked by design and need no explanation. A repo
+        // with no remote has nowhere to push, so that block is no finding.
+        if label == "push feature"
+            && e.decision == check::Decision::Blocked
+            && cplt::git::trusted_git()
+                .is_some_and(|git| cplt::gh_proxy::launch_repo_facts(git, &project_dir, false).1)
+        {
             findings.push(Finding::warning(
                 format!("git guard refuses a feature-branch push here: {}", e.reason),
                 e.fix,

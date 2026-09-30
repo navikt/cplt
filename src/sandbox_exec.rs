@@ -670,6 +670,9 @@ fn install_command_wrappers(
     if gh_guard.enabled
         && let Some(real_gh) = which_binary("gh")
     {
+        // Once per process: `cplt check` launches one sandbox per probe, and
+        // the same repository gives the same answer each time (#673).
+        static SCOPE_WARNED: std::sync::Once = std::sync::Once::new();
         let real_git = if gh_guard.scope_check {
             // Trusted, not PATH: this git runs in the UNSANDBOXED parent, at
             // launch. A `git` the previous session planted in ~/.bun/bin (or any
@@ -678,10 +681,12 @@ fn install_command_wrappers(
             if let Some(real_git) = crate::git::trusted_git() {
                 Some(real_git.to_path_buf())
             } else {
-                ui::warn(
-                    "gh guard could not find Git to capture repository scope. \
-                     Scope-checked commands will be blocked.",
-                );
+                SCOPE_WARNED.call_once(|| {
+                    ui::warn(
+                        "gh guard could not find Git to capture repository scope. \
+                         Scope-checked commands will be blocked.",
+                    );
+                });
                 None
             }
         } else {
@@ -698,10 +703,12 @@ fn install_command_wrappers(
             match crate::gh_proxy::launch_repo(real_git, project_dir) {
                 Ok(repo) => repo_scope.push(repo),
                 Err(reason) => {
-                    ui::warn(&format!(
-                        "gh guard could not capture repository scope: {reason}. \
-                         Scope-checked commands will be blocked."
-                    ));
+                    SCOPE_WARNED.call_once(|| {
+                        ui::warn(&format!(
+                            "gh guard could not capture repository scope: {reason}. \
+                             Scope-checked commands will be blocked."
+                        ));
+                    });
                 }
             }
             for dir in repo_dirs {

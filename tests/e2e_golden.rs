@@ -1256,6 +1256,38 @@ fn golden_untrusted_repo_config_is_announced_inert_then_applied() {
         "an unapproved proposal must not be in force — this is the whole trust \
          model:\n{stderr}"
     );
+    // One notice, not two stacked ones saying the same thing.
+    assert_eq!(
+        stderr.matches("cplt trust accept").count(),
+        1,
+        "the pending notice must be printed once:\n{stderr}"
+    );
+
+    // A `--quiet` agent launch still says it, in one line (#673). exec, which
+    // is quiet by default for scripts, stays silent.
+    let (_, stderr, status) = launch(
+        &home,
+        repo.path(),
+        &[
+            "--agent",
+            "shell",
+            "--yes",
+            "--quiet",
+            "--no-validate",
+            "--",
+            "-c",
+            "true",
+        ],
+    );
+    assert!(status.success(), "quiet launch should succeed:\n{stderr}");
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|l| l.contains("Untrusted .cplt.toml"))
+            .count(),
+        1,
+        "--quiet must still warn that the repo config is not applied:\n{stderr}"
+    );
 
     // 2. `cplt trust` shows it as pending rather than applied.
     let (stdout, stderr, status) = launch(&home, repo.path(), &["trust"]);
