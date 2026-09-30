@@ -867,8 +867,16 @@ mod tests {
     #[test]
     fn explain_hint_is_accepted_by_config_set_for_every_key() {
         use crate::config::{
-            all_config_keys, repo_key_target, set_repo_value_in_doc, set_value_in_doc,
-            validate_global_document,
+            all_config_keys, append_value_in_doc, repo_key_target, set_repo_value_in_doc,
+            set_value_in_doc, validate_global_document, validate_local_document,
+        };
+        // The writer `config set` picks: arrays always append (main.rs).
+        let write = |doc: &mut toml_edit::DocumentMut, key: &ConfigKeyInfo, sample: &str| {
+            if key.value_type.is_array() {
+                append_value_in_doc(doc, key, sample)
+            } else {
+                set_value_in_doc(doc, key, sample)
+            }
         };
         for key in all_config_keys() {
             let dotted = format!("{}.{}", key.section, key.key);
@@ -877,6 +885,7 @@ mod tests {
                 // Values whose shape is checked beyond their type.
                 ("proxy.upstream", _) => "proxy.example.com:3128",
                 ("shell.skip", _) => "goose",
+                ("deny.env", _) => "MY_SECRET",
                 (_, ConfigValueType::Bool) => "false",
                 (_, ConfigValueType::U16 | ConfigValueType::U16Array) => "8080",
                 (_, ConfigValueType::U64) => "1",
@@ -886,7 +895,7 @@ mod tests {
             let mut doc = toml_edit::DocumentMut::new();
             let Some(rest) = hint.strip_prefix("cplt config set ") else {
                 assert!(
-                    set_value_in_doc(&mut doc, key, sample).is_err(),
+                    write(&mut doc, key, sample).is_err(),
                     "{dotted}: explain says config set cannot write it, but it can: {hint}"
                 );
                 continue;
@@ -900,6 +909,8 @@ mod tests {
                         .unwrap_or_else(|| panic!("{dotted}: hint says --repo, repo refuses"));
                     set_repo_value_in_doc(&mut doc, key, target, sample, false)
                         .unwrap_or_else(|e| panic!("{dotted}: --repo set refused: {e}"));
+                    crate::repo_config::parse_and_validate(&doc.to_string())
+                        .unwrap_or_else(|e| panic!("{dotted}: .cplt.toml refused: {e}"));
                 }
                 Some(flag) => {
                     assert_eq!(
@@ -907,12 +918,14 @@ mod tests {
                         crate::config::layer_only_flag(key),
                         "{dotted}: hint names a layer config set does not require: {hint}"
                     );
-                    set_value_in_doc(&mut doc, key, sample)
+                    write(&mut doc, key, sample)
                         .unwrap_or_else(|e| panic!("{dotted}: config set refused: {e}"));
-                    if flag.is_empty() {
+                    let valid = if flag == "--local" {
+                        validate_local_document(&doc)
+                    } else {
                         validate_global_document(&doc)
-                            .unwrap_or_else(|e| panic!("{dotted}: global config refused: {e}"));
-                    }
+                    };
+                    valid.unwrap_or_else(|e| panic!("{dotted}: {flag} config refused: {e}"));
                 }
                 None => panic!("{dotted}: unexpected hint shape: {hint}"),
             }

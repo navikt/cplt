@@ -936,7 +936,7 @@ It has no effect on macOS, where the profile is unchanged and the launch warns t
 
 ## Other keys
 
-Keys not covered in a section above. `cplt config explain <key>` prints the same facts for the version you have installed. Keys marked ⚠️ weaken the sandbox when turned on, and `config set` asks for `--force` to do it.
+Keys not covered in a section above. `cplt config explain <key>` prints the same facts for the version you have installed. Keys marked ⚠️ weaken the sandbox when turned on, and `config set` asks for `--force` to do it. `git_guard.allow_push` is the exception: `config set` cannot write it at all, so you add it in the config file.
 
 | Key | Default | What it does |
 |---|---|---|
@@ -951,12 +951,12 @@ Keys not covered in a section above. `cplt config explain <key>` prints the same
 | `gh_guard.mode` | `block` | `block` refuses, `warn` prints a warning and runs the command, `audit` runs it and logs the decision. See [gh guard](gh-guard.md). |
 | `gh_guard.scope_check` | `true` | Refuses write commands aimed at another repository, for example with `-R`. |
 | `gh_guard.block_auth_token` | `true` | Refuses `gh auth token`, so the agent cannot print the token. |
-| `gh_guard.inject_token` ⚠️ | `false` | Puts `GH_TOKEN` in the sandbox environment at launch, where every subprocess can read it. |
+| `gh_guard.inject_token` ⚠️ | `false` | For Copilot only, and only while `gh_guard.enabled` is on: puts your `gh` token in the sandbox environment at launch, where every subprocess can read it. The token goes into `GH_TOKEN`, or the next of `GITHUB_TOKEN` and `COPILOT_GITHUB_TOKEN` that `deny.env` leaves in place. Skipped when the agent already has a token. |
 | `gh_guard.unknown_command` | `block` | What to do with a `gh` command the guard does not classify: `block` or `allow`. |
 | `gh_guard.allow_api_write` ⚠️ | `false` | Allows `gh api` writes (POST, PATCH, PUT and input flags), scope-checked to the current repository. |
 | `git_guard.enabled` | `true` | Intercepts `git push`, `request-pull` and `send-pack`. See [git guard](git-guard.md). |
 | `git_guard.prevent_push` | `true` | Treats those commands as violations; `git_guard.mode` decides what a violation costs. |
-| `git_guard.prevent_force_push` | `true` | Refuses force pushes on any branch, including feature branches under `protect_default_branch_only`. |
+| `git_guard.prevent_force_push` | `true` | Refuses force pushes on any branch, including feature branches under `protect_default_branch_only`. A `git_guard.allow_push` rule with `force = true` lets a matching force push through, and `git_guard.mode` `warn` or `audit` does not block. |
 | `git_guard.protect_default_branch_only` | `true` | Refuses only pushes to the default branch. `false` refuses every push, as `--preset strict` does. |
 | `git_guard.allow_push` ⚠️ | `[]` | Push exceptions, each a `[[git_guard.allow_push]]` block with `remote`, `branches` and `force`. `config set` cannot write an array of tables, so edit the config file. See [git guard](git-guard.md#configuration). |
 | `sandbox.gh_proxy` | `false` | Deprecated spelling of `gh_guard.enabled`. |
