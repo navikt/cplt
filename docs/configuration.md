@@ -674,7 +674,7 @@ preset = "standard"
 | Preset | localhost (`allow_localhost_any`) | env files (`allow_env_files`) | tmp exec (`allow_tmp_exec`) | docker (`allow_docker`) | lifecycle (`allow_lifecycle_scripts`) | `gh_guard` | `git_guard` | `proxy.forced` | `proxy.default_allowlist` |
 |--------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 | `strict` | off | off | off | off | off | **on** | **on** | **on** | **on** |
-| `standard` | off | off | off¹ | off | off | off | off | off | off |
+| `standard` | off | off | off¹ | off | off | **on** | **on** | off | off |
 | `permissive` | **on** | off | **on** | off | **on** | off | off | off | off |
 | `full-trust` | **on** | **on** | **on** | **on** | **on** | off | off | off | off |
 
