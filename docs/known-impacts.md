@@ -1073,11 +1073,11 @@ Nothing is granted: `~/.npmrc` stays unreadable either way. `~/.yarnrc` is a sep
 
 **On Linux the walk is not covered.** Landlock does not restrict `stat` or `access`, so yarn 1 sees `~/.npmrc` as present on the walk and aborts on the `EACCES` when the project is under `$HOME`. Use one of the fixes below. The redirect still covers the user-config read.
 
-The injection is skipped in three cases. On macOS none of them fails: in the first yarn can read the file, and in the other two the hidden metadata keeps yarn away from it. On Linux they can hit the failure below:
+The injection is skipped in three cases:
 
-- you allowed `~/.npmrc` yourself (`allow.read`), so you asked for the real file and cplt does not redirect around it;
-- you set `NPM_CONFIG_USERCONFIG` yourself — in any capitalisation, since npm and yarn lowercase the key — and your value wins;
-- the scratch dir is off (`--no-scratch-dir`), so there is no session-scoped writable location to point at.
+- you allowed `~/.npmrc` yourself (`allow.read`), so you asked for the real file and cplt does not redirect around it. yarn reads it, on both platforms;
+- you set `NPM_CONFIG_USERCONFIG` yourself — in any capitalisation, since npm and yarn lowercase the key — and your value wins. If it names `~/.npmrc`, macOS hides it and Linux fails as below. If it names another file the sandbox cannot read, yarn fails as below on both platforms, since only `~/.npmrc` has its metadata hidden;
+- the scratch dir is off (`--no-scratch-dir`), so there is no session-scoped writable location to point at. On macOS the hidden metadata keeps yarn away from `~/.npmrc`; on Linux yarn fails as below.
 
 Without it, `yarn install` fails outright under the default policy when an `~/.npmrc` exists on the host. Nothing is resolved and no `node_modules` is written:
 
