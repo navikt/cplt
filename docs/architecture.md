@@ -63,7 +63,9 @@ src/
   sandbox_bubblewrap.rs Optional Bubblewrap namespace layer + in-namespace re-entry helper (Linux).
   discover.rs          Runtime probing (`cplt doctor --verbose` inventory), tool/auth discovery.
   doctor.rs            `cplt doctor` finding rules (Pi trust lock, tracked .env, shims,
-                       bubblewrap state) and rendering; main.rs feeds it the launch's resolution.
+                       bubblewrap state, network policy vs the agent's hosts) and rendering;
+                       main.rs feeds it the launch's resolution and prints the `guard:`
+                       verdicts itself, from check.rs.
   detect.rs            Project and machine ecosystem detectors behind `cplt init`.
   proxy.rs             CONNECT proxy, domain blocking, audit log.
   gh_proxy.rs          gh and git command guards: policy tables, gates, wrapper scripts.

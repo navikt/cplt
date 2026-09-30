@@ -610,7 +610,7 @@ cplt auto-discovers installed tools and writes sandbox rules to match. Generally
 | Corepack | none | `COREPACK_*` | none |
 | mise | `.local/share/mise`, `.mise` | `MISE_*` | `mise` |
 
-Run `cplt doctor` to see whether cplt will work here for your agent, and `cplt doctor --verbose` for everything it detected on your machine.
+Run `cplt doctor` to see whether cplt will work here for your agent, and `cplt doctor --verbose` for everything it detected on your machine. Its `guard:` lines show whether the git and gh guards would let a feature-branch push, a push to `main` and `gh pr merge` through in this repository.
 
 ### Debugging
 
@@ -888,7 +888,7 @@ cplt init --global    # generate a personal ~/.config/cplt/config.toml
 
 It knows JVM (Gradle/Maven), Node.js, Docker, Python, Rust, Go, Playwright, Spring Boot, Ktor, TestContainers, Next.js, Vite, Flyway, Cypress, mise, and environment secrets from `.env.example`. Dangerous permissions come out of the generator with a risk warning attached. `--global` looks at machine-level things instead: Playwright browsers, GPG signing, registry credentials, alternative agents.
 
-Some keys are global-only and rejected from `.cplt.toml` because they are machine-specific or a local preference: `sandbox.agent`, `sandbox.quiet`, `sandbox.yes`, `sandbox.validate`, `sandbox.scratch_dir`, `sandbox.pass_env`, `sandbox.inherit_env`, `sandbox.allow_cache_exec`, `sandbox.allow_cache_exec_any`, `proxy.enabled`, `proxy.port`, `proxy.log_file`, `proxy.log_level`, `proxy.blocked_domains`, `proxy.allowed_domains`, and every `[gh_guard]` and `[git_guard]` key.
+Some keys are global-only and rejected from `.cplt.toml` because they are machine-specific or a local preference: `sandbox.agent`, `sandbox.quiet`, `sandbox.yes`, `sandbox.validate`, `sandbox.scratch_dir`, `sandbox.inherit_env`, `sandbox.allow_cache_exec`, `sandbox.allow_cache_exec_any`, `proxy.enabled`, `proxy.port`, `proxy.log_file`, `proxy.log_level`, `proxy.blocked_domains`, `proxy.allowed_domains`, and every `[gh_guard]` and `[git_guard]` key.
 
 Full details, including the trust model, path expansion rules, and the complete config file reference: [docs/configuration.md](docs/configuration.md).
 

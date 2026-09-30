@@ -338,6 +338,8 @@ internal-artifacts.example.com
 
 To keep the agent away from one of its own hosts anyway, put it on the blocklist, which is checked after the allowlist and wins.
 
+`cplt doctor` checks the agent's hosts against your policy, plus the package registries when an allowlist is active, without going to the network. One warning names up to three blocked hosts with their status (`BLOCKED` for a blocklist entry, `BLOCKED-ALLOWLIST` for a registry missing from a plain `allowed_domains`), counts the rest ("9 more"), and gives one fix per cause.
+
 > **Setting `allowed_domains` is what turns the allowlist on, not the file's contents.** The two ways to say "no allowlist" are not the same thing:
 >
 > - **No `allowed_domains` key** (and no `--allowed-domains`, no `default_allowlist`): no allowlist, every domain is allowed. This is the default.
