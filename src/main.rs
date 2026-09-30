@@ -8006,7 +8006,7 @@ fn display_repo_config(
                     format!("{yellow}{STATUS_PENDING}{nc}")
                 };
                 let ignored = config::localhost_any_ignored_suffix(
-                    *name == "allow_localhost_any" && *v && approved && proxy_forced,
+                    *name == "allow_localhost_any" && *v && proxy_forced,
                 );
                 println!("{blue}[cplt]{nc}    {name:<30} = {v}  {status}{ignored}");
             }
