@@ -1,7 +1,7 @@
 //! Human-readable config display and `cplt config explain`.
 
 use super::path::config_path;
-use super::registry::{ConfigKeyInfo, ConfigLayer, ResolvedBools, type_label};
+use super::registry::{ConfigKeyInfo, ConfigLayer, ConfigValueType, ResolvedBools, type_label};
 use super::types::{CliFlags, Config, EnforcementMode, LoadedConfig, Preset, UnknownCommandPolicy};
 use crate::ui;
 
@@ -46,20 +46,36 @@ pub fn explain_key(
         println!("  {dim}{type_str}  {current_value}{nc}");
     }
 
-    if key_info.dangerous {
+    let editable_by_set = key_info.value_type != ConfigValueType::ArrayOfTables;
+    if key_info.dangerous && editable_by_set {
         println!("  {yellow}Requires --force to enable{nc}");
     }
-    // The layer this key actually accepts, not a generic invocation: for a
-    // local- or repo-only key the plain form is refused, so printing it sent
-    // the reader to a dead end (#438).
-    println!(
-        "  {blue}Set:{nc}  cplt config set {}{}.{} <value>",
-        super::registry::layer_only_flag(key_info)
-            .map(|flag| format!("{flag} "))
-            .unwrap_or_default(),
-        key_info.section,
-        key_info.key
-    );
+    let label = if editable_by_set { "Set:" } else { "Edit:" };
+    println!("  {blue}{label}{nc}  {}", set_hint(key_info));
+}
+
+/// How to change a key, as `explain` prints it.
+///
+/// The layer this key actually accepts, not a generic invocation: for a
+/// local- or repo-only key the plain form is refused, so printing it sent the
+/// reader to a dead end (#438). An array of tables has no `config set`
+/// spelling at all, so the hint names the file block instead.
+#[must_use]
+fn set_hint(key_info: &ConfigKeyInfo) -> String {
+    let dotted = format!("{}.{}", key_info.section, key_info.key);
+    if key_info.value_type == ConfigValueType::ArrayOfTables {
+        return format!(
+            "add a [[{dotted}]] block to {} (config set cannot write an array of tables)",
+            config_path().map_or_else(
+                || "your config file".to_string(),
+                |p| super::path::collapse_tilde(&p.display().to_string())
+            )
+        );
+    }
+    let flag = super::registry::layer_only_flag(key_info)
+        .map(|flag| format!("{flag} "))
+        .unwrap_or_default();
+    format!("cplt config set {flag}{dotted} <value>")
 }
 
 /// Print explanation of all config keys, grouped by section.
@@ -843,6 +859,65 @@ fn guard_lines(global: &Config, local: Option<&Config>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every key's `explain` hint must work: a `cplt config set` line is one
+    /// that `config set` accepts at the layer it names, and anything else is
+    /// a key `config set` really refuses. `git_guard.allow_push` printed a
+    /// plain `config set` line that `config set` then rejected.
+    #[test]
+    fn explain_hint_is_accepted_by_config_set_for_every_key() {
+        use crate::config::{
+            all_config_keys, repo_key_target, set_repo_value_in_doc, set_value_in_doc,
+            validate_global_document,
+        };
+        for key in all_config_keys() {
+            let dotted = format!("{}.{}", key.section, key.key);
+            let hint = set_hint(key);
+            let sample = match (dotted.as_str(), key.value_type) {
+                // Values whose shape is checked beyond their type.
+                ("proxy.upstream", _) => "proxy.example.com:3128",
+                ("shell.skip", _) => "goose",
+                (_, ConfigValueType::Bool) => "false",
+                (_, ConfigValueType::U16 | ConfigValueType::U16Array) => "8080",
+                (_, ConfigValueType::U64) => "1",
+                (_, ConfigValueType::Str) if !key.default_display.is_empty() => key.default_display,
+                _ => "/tmp",
+            };
+            let mut doc = toml_edit::DocumentMut::new();
+            let Some(rest) = hint.strip_prefix("cplt config set ") else {
+                assert!(
+                    set_value_in_doc(&mut doc, key, sample).is_err(),
+                    "{dotted}: explain says config set cannot write it, but it can: {hint}"
+                );
+                continue;
+            };
+            let flag = rest
+                .strip_suffix(&format!("{dotted} <value>"))
+                .map(str::trim);
+            match flag {
+                Some("--repo") => {
+                    let target = repo_key_target(key)
+                        .unwrap_or_else(|| panic!("{dotted}: hint says --repo, repo refuses"));
+                    set_repo_value_in_doc(&mut doc, key, target, sample, false)
+                        .unwrap_or_else(|e| panic!("{dotted}: --repo set refused: {e}"));
+                }
+                Some(flag) => {
+                    assert_eq!(
+                        (!flag.is_empty()).then_some(flag),
+                        crate::config::layer_only_flag(key),
+                        "{dotted}: hint names a layer config set does not require: {hint}"
+                    );
+                    set_value_in_doc(&mut doc, key, sample)
+                        .unwrap_or_else(|e| panic!("{dotted}: config set refused: {e}"));
+                    if flag.is_empty() {
+                        validate_global_document(&doc)
+                            .unwrap_or_else(|e| panic!("{dotted}: global config refused: {e}"));
+                    }
+                }
+                None => panic!("{dotted}: unexpected hint shape: {hint}"),
+            }
+        }
+    }
 
     #[test]
     fn get_config_value_returns_default_when_no_file() {
