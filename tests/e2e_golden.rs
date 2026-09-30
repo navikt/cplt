@@ -1102,6 +1102,53 @@ fn golden_check_exec_agrees_with_the_launch_in_both_modes() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// `cplt check exec "gh pr merge 1"` (one quoted word) said "not specifically
+/// gated" while the launch blocks it, and `doctor` showed no guard verdict at
+/// all (navikt/copilot#1348). Both now give the launch's answer.
+#[test]
+fn golden_doctor_and_quoted_check_exec_give_the_launch_verdicts() {
+    let home = make_config_home("golden-doctor-guards");
+    let repo = temp_repo("navikt/probe");
+
+    let (out, err, status) = launch(&home, repo.path(), &["check", "exec", "gh pr merge 1"]);
+    assert!(status.success(), "check exec should run:\n{out}{err}");
+    assert!(
+        out.contains("gh pr merge 1: BLOCKED"),
+        "a quoted command must be judged like the unquoted one:\n{out}{err}"
+    );
+
+    let (out, err, _) = launch(&home, repo.path(), &["doctor"]);
+    for line in [
+        "guard:       push feature  ALLOWED",
+        "guard:       push main     BLOCKED",
+        "guard:       pr merge      BLOCKED",
+    ] {
+        assert!(
+            out.contains(line),
+            "doctor must print `{line}`:\n{out}{err}"
+        );
+    }
+
+    // Without refs/remotes/origin/HEAD the guard cannot tell a feature branch
+    // from the default one: doctor says so, with the guard's reason and fix.
+    assert!(common::git_ok(
+        repo.path(),
+        &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"]
+    ));
+    let (out, err, _) = launch(&home, repo.path(), &["doctor"]);
+    for want in [
+        "guard:       push feature  BLOCKED",
+        "git guard refuses a feature-branch push here",
+        "git remote set-head origin",
+    ] {
+        assert!(
+            out.contains(want),
+            "doctor must print `{want}`:\n{out}{err}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// Both guards install themselves through a PATH shim in the scratch dir, so
 /// `sandbox.scratch_dir = false` turns them off however they are configured —
 /// which the launch summary reports as `inactive`. `check exec` read only
