@@ -2859,6 +2859,55 @@ mod e2e_tests {
         let _ = std::fs::remove_dir_all(&fake_home);
     }
 
+    /// #674: the launch ignores `allow_localhost_any` under `proxy.forced`
+    /// (#53), and `--preset strict` turns `proxy.forced` on. `config show` must
+    /// resolve the preset like the launch does and say the key has no effect,
+    /// not print `forced = false` and an `allow_localhost_any` that seems to apply.
+    #[test]
+    fn e2e_config_show_marks_localhost_any_ignored_under_strict() {
+        let fake_home = std::env::temp_dir().join(format!(
+            ".cplt-e2e-config-show-strict-{}",
+            FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&fake_home);
+        std::fs::create_dir_all(&fake_home).unwrap();
+        let config_file = fake_home.join("config.toml");
+
+        for (toml, ignored) in [
+            (
+                "[sandbox]\npreset = \"strict\"\nallow_localhost_any = true\n",
+                true,
+            ),
+            (
+                "[proxy]\nforced = true\n[sandbox]\nallow_localhost_any = true\n",
+                true,
+            ),
+            ("[sandbox]\nallow_localhost_any = true\n", false),
+        ] {
+            std::fs::write(&config_file, toml).unwrap();
+            let output = cplt_cmd()
+                .args(["config", "show"])
+                .env("CPLT_CONFIG", config_file.to_str().unwrap())
+                .output()
+                .expect("should run");
+            assert!(output.status.success(), "config show should succeed");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let line = stdout
+                .lines()
+                .find(|l| l.contains("allow_localhost_any") && l.contains("= true"))
+                .unwrap_or_else(|| panic!("no allow_localhost_any line: {stdout}"));
+            assert_eq!(
+                line.contains("no effect: proxy.forced is on"),
+                ignored,
+                "{toml}: {line}"
+            );
+            let forced = stdout.lines().find(|l| l.contains("forced ")).unwrap();
+            assert_eq!(forced.contains("true"), ignored, "{toml}: {forced}");
+        }
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
     #[test]
     fn e2e_config_show_no_config_shows_defaults() {
         let fake_home = std::env::temp_dir().join(format!(

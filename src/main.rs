@@ -6454,6 +6454,7 @@ fn run_check_command(
         }) => build_net_check(
             &net_policy,
             proxy_enabled,
+            resolved.proxy_forced,
             &dom,
             no_connect,
             agent_name,
@@ -6756,7 +6757,8 @@ fn build_battery(
             .default_allowed_domains()
             .first()
             .map_or_else(|| "github.com".to_string(), |s| (*s).to_string());
-        let a_expl = check::explain_domain(net_policy, &allowed_host, 443, true);
+        let a_expl =
+            check::explain_domain(net_policy, &allowed_host, 443, true, resolved.proxy_forced);
         items.push(check::CheckItem {
             name: format!("reach {allowed_host}"),
             category: "network".to_string(),
@@ -6769,7 +6771,13 @@ fn build_battery(
         });
 
         // Blocked: the cloud-metadata IP (SSRF) — always refused, never leaves cplt.
-        let b_expl = check::explain_domain(net_policy, "169.254.169.254", 443, true);
+        let b_expl = check::explain_domain(
+            net_policy,
+            "169.254.169.254",
+            443,
+            true,
+            resolved.proxy_forced,
+        );
         items.push(check::CheckItem {
             name: "reach metadata IP (SSRF)".to_string(),
             category: "network".to_string(),
@@ -7023,6 +7031,7 @@ fn resolved_ip_verdict(
 fn build_net_check(
     net_policy: &proxy::NetPolicy,
     proxy_enabled: bool,
+    proxy_forced: bool,
     target: &str,
     no_connect: bool,
     agent_name: String,
@@ -7034,6 +7043,7 @@ fn build_net_check(
         &host,
         port,
         proxy_enabled,
+        proxy_forced,
         proxy::resolve_socket_addrs,
     );
 
@@ -7849,13 +7859,24 @@ fn run_config_show() -> ExitCode {
 
     let local = local_for_display();
     config::display_config(loaded.as_ref(), local.as_ref());
+    // What the launch resolves from the files (preset included), so an approved
+    // repo `allow_localhost_any` is shown as ignored under proxy.forced (#674).
+    let proxy_forced = loaded
+        .as_ref()
+        .map(|l| l.config.clone())
+        .unwrap_or_default()
+        .merge_with_local(
+            local.as_ref().map(|l| &l.config),
+            config::CliFlags::default(),
+        )
+        .is_ok_and(|r| r.proxy_forced);
 
     // Show repo config if present
     let project_dir = detect_project_root().or_else(|| std::env::current_dir().ok());
     if let Some(ref dir) = project_dir {
         match repo_config::load_repo_config(dir) {
             Ok(Some(loaded_repo)) => {
-                display_repo_config(&loaded_repo, dir);
+                display_repo_config(&loaded_repo, dir, proxy_forced);
             }
             Err(e) => {
                 eprintln!();
@@ -7873,7 +7894,11 @@ fn run_config_show() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn display_repo_config(loaded: &repo_config::LoadedRepoConfig, project_dir: &std::path::Path) {
+fn display_repo_config(
+    loaded: &repo_config::LoadedRepoConfig,
+    project_dir: &std::path::Path,
+    proxy_forced: bool,
+) {
     let dim = ui::stdout_color(ui::DIM);
     let green = ui::stdout_color(ui::GREEN);
     let yellow = ui::stdout_color(ui::YELLOW);
@@ -7980,7 +8005,10 @@ fn display_repo_config(loaded: &repo_config::LoadedRepoConfig, project_dir: &std
                 } else {
                     format!("{yellow}{STATUS_PENDING}{nc}")
                 };
-                println!("{blue}[cplt]{nc}    {name:<30} = {v}  {status}");
+                let ignored = config::localhost_any_ignored_suffix(
+                    *name == "allow_localhost_any" && *v && proxy_forced,
+                );
+                println!("{blue}[cplt]{nc}    {name:<30} = {v}  {status}{ignored}");
             }
         }
 
@@ -12806,6 +12834,7 @@ mod tests {
         let report = build_net_check(
             &policy,
             true,
+            false,
             "github.com",
             true, // no_connect
             "copilot".to_string(),

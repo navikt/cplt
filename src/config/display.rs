@@ -264,12 +264,16 @@ pub fn display_config(loaded: Option<&LoadedConfig>, local: Option<&LoadedConfig
         proxy_enabled,
         src("proxy", "enabled", c.proxy.enabled.is_some())
     );
-    let proxy_forced = c.proxy.forced.unwrap_or(false);
+    // The resolver's value, so a preset (`strict`) counts, as it does at launch.
+    let proxy_forced = bools.proxy_forced;
     println!(
         "{blue}[cplt]{nc}    forced           = {}{}{nc}{}",
         if proxy_forced { yellow } else { green },
         proxy_forced,
-        src("proxy", "forced", c.proxy.forced.is_some())
+        preset_label(
+            proxy_forced,
+            src("proxy", "forced", c.proxy.forced.is_some())
+        )
     );
     println!(
         "{blue}[cplt]{nc}    port             = {}{}",
@@ -447,15 +451,19 @@ pub fn display_config(loaded: Option<&LoadedConfig>, local: Option<&LoadedConfig
             c.sandbox.allow_env_files.is_some()
         )
     );
-    let allow_localhost_any = c.sandbox.allow_localhost_any.unwrap_or(false);
+    let allow_localhost_any = bools.allow_localhost_any;
     println!(
-        "{blue}[cplt]{nc}    allow_localhost_any    = {}{}",
+        "{blue}[cplt]{nc}    allow_localhost_any    = {}{}{}",
         allow_localhost_any,
-        src(
-            "sandbox",
-            "allow_localhost_any",
-            c.sandbox.allow_localhost_any.is_some()
-        )
+        preset_label(
+            allow_localhost_any,
+            src(
+                "sandbox",
+                "allow_localhost_any",
+                c.sandbox.allow_localhost_any.is_some()
+            )
+        ),
+        localhost_any_ignored_suffix(allow_localhost_any && proxy_forced)
     );
     if !c.sandbox.pass_env.is_empty() {
         println!(
@@ -694,6 +702,30 @@ fn local_mode_is_set(local: &Config, section: &str, key: &str) -> bool {
 /// without `--force`. Plain text, not coloured: these rows are built as strings
 /// and coloured by the caller, and a marker that only appears in a terminal is
 /// not one a user can paste into a support thread.
+/// Both keys default to off, so a baseline `true` came from a preset.
+fn preset_label(on: bool, label: &'static str) -> &'static str {
+    if on && label == " (default)" {
+        " (preset)"
+    } else {
+        label
+    }
+}
+
+/// The launch forces `allow_localhost_any` off under `proxy.forced` (#53), so
+/// `config show` says so next to the key instead of implying it applies (#674).
+#[must_use]
+pub fn localhost_any_ignored_suffix(ignored: bool) -> String {
+    if ignored {
+        format!(
+            "  {}(no effect: proxy.forced is on){}",
+            ui::stdout_color(ui::YELLOW),
+            ui::stdout_color(ui::RESET)
+        )
+    } else {
+        String::new()
+    }
+}
+
 fn danger_suffix(on: bool) -> &'static str {
     if on { " ⚠ DANGEROUS" } else { "" }
 }

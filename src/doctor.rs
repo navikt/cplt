@@ -535,7 +535,12 @@ pub fn agent_hosts_finding(agent: Agent, policy: &NetPolicy) -> Option<Finding> 
     let blocked: Vec<(&str, crate::check::NetExplain)> = hosts
         .iter()
         .filter(|h| policy.allowlist_active || !PACKAGE_REGISTRY_DOMAINS.contains(h))
-        .map(|h| (*h, crate::check::explain_domain(policy, h, 443, true)))
+        .map(|h| {
+            (
+                *h,
+                crate::check::explain_domain(policy, h, 443, true, false),
+            )
+        })
         .filter(|(_, e)| e.decision != crate::check::Decision::Allowed)
         .collect();
     if blocked.is_empty() {

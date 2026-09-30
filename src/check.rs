@@ -467,12 +467,17 @@ pub struct NetExplain {
 /// verdict comes straight from [`crate::proxy::classify_connect`] — the same
 /// gate logic the live proxy enforces — and each `BLOCKED-*` status is mapped to
 /// the governing config plus the exact fix.
+///
+/// `proxy_forced` only changes advice: under `proxy.forced` cplt ignores
+/// `allow_localhost_any` (#53, see `Resolved::reconcile_proxy_forced`), so the
+/// fix must not offer it (#674).
 #[must_use]
 pub fn explain_domain(
     policy: &NetPolicy,
     host: &str,
     port: u16,
     proxy_enabled: bool,
+    proxy_forced: bool,
 ) -> NetExplain {
     if !proxy_enabled {
         return NetExplain {
@@ -507,8 +512,8 @@ pub fn explain_domain(
                 Decision::Blocked,
                 format!("localhost port {port} is not in the allowed localhost ports."),
                 Some(format!(
-                    "allow it with --allow-localhost {port} (or [allow] localhost in config), \
-                 or --allow-localhost-any for a service on a random port."
+                    "allow it with --allow-localhost {port} (or [allow] localhost in config){}",
+                    random_port_advice(proxy_forced)
                 )),
             )
         }
@@ -595,9 +600,10 @@ pub fn explain_domain_resolved(
     host: &str,
     port: u16,
     proxy_enabled: bool,
+    proxy_forced: bool,
     resolve: impl FnOnce(&str, u16) -> Vec<std::net::SocketAddr>,
 ) -> NetExplain {
-    let mut expl = explain_domain(policy, host, port, proxy_enabled);
+    let mut expl = explain_domain(policy, host, port, proxy_enabled, proxy_forced);
     let gate = if expl.status == NetVerdict::BlockedPort.status() {
         format!("--allow-port {port} (which also opens port {port} to remote hosts)")
     } else if expl.status == NetVerdict::BlockedAllowlist.status() {
@@ -624,10 +630,21 @@ pub fn explain_domain_resolved(
     );
     expl.fix = Some(format!(
         "connect to localhost:{port} with --allow-localhost {port} (or [allow] localhost \
-         in config), or --allow-localhost-any for a service on a random port. To keep the \
-         name {host}, add the localhost opt-in and {gate}."
+         in config){} To keep the name {host}, add the localhost opt-in and {gate}.",
+        random_port_advice(proxy_forced)
     ));
     expl
+}
+
+/// The tail of a localhost fix: `allow_localhost_any` for a random port, or,
+/// under `proxy.forced`, that it is ignored there (#674).
+fn random_port_advice(proxy_forced: bool) -> &'static str {
+    if proxy_forced {
+        ". allow_localhost_any has no effect under proxy.forced (--preset strict), so a \
+         service on a random port needs a fixed port, or proxy.forced off."
+    } else {
+        ", or --allow-localhost-any for a service on a random port."
+    }
 }
 
 // ── Layer 2: exec explain ──────────────────────────────────────
@@ -1669,7 +1686,7 @@ mod tests {
     #[test]
     fn allowed_domain_is_allowed() {
         let np = net_policy(&["github.com"], &[], &[443]);
-        let e = explain_domain(&np, "github.com", 443, true);
+        let e = explain_domain(&np, "github.com", 443, true, false);
         assert_eq!(e.decision, Decision::Allowed);
         assert_eq!(e.status, "ALLOWED");
     }
@@ -1677,7 +1694,7 @@ mod tests {
     #[test]
     fn unknown_domain_blocked_by_allowlist() {
         let np = net_policy(&["github.com"], &[], &[443]);
-        let e = explain_domain(&np, "evil.example", 443, true);
+        let e = explain_domain(&np, "evil.example", 443, true, false);
         assert_eq!(e.decision, Decision::Blocked);
         assert_eq!(e.status, "BLOCKED-ALLOWLIST");
         assert!(e.fix.as_deref().unwrap().contains("allowed_domains"));
@@ -1687,7 +1704,7 @@ mod tests {
     fn metadata_ip_blocked_private() {
         // Empty allowlist ⇒ allow-all, so the SSRF guard is what blocks it.
         let np = net_policy(&[], &[], &[443]);
-        let e = explain_domain(&np, "169.254.169.254", 443, true);
+        let e = explain_domain(&np, "169.254.169.254", 443, true, false);
         assert_eq!(e.decision, Decision::Blocked);
         assert_eq!(e.status, "BLOCKED-PRIVATE");
     }
@@ -1695,7 +1712,7 @@ mod tests {
     #[test]
     fn bad_port_blocked() {
         let np = net_policy(&[], &[], &[443]);
-        let e = explain_domain(&np, "github.com", 22, true);
+        let e = explain_domain(&np, "github.com", 22, true, false);
         assert_eq!(e.decision, Decision::Blocked);
         assert_eq!(e.status, "BLOCKED-PORT");
     }
@@ -1707,7 +1724,7 @@ mod tests {
         // flag that opens remote egress and still fails.
         let np = net_policy(&[], &[], &[443]);
         for host in ["127.0.0.1", "localhost", "[::1]"] {
-            let e = explain_domain(&np, host, 6969, true);
+            let e = explain_domain(&np, host, 6969, true, false);
             assert_eq!(e.status, "BLOCKED-PORT");
             let fix = e.fix.as_deref().unwrap();
             assert!(
@@ -1715,7 +1732,7 @@ mod tests {
                 "{host}: {fix}"
             );
         }
-        let e = explain_domain(&np, "github.com", 6969, true);
+        let e = explain_domain(&np, "github.com", 6969, true, false);
         assert!(e.fix.as_deref().unwrap().contains("--allow-port 6969"));
 
         // An allowed port with an active allowlist (strict mode) reaches the
@@ -1727,13 +1744,35 @@ mod tests {
             (strict, "BLOCKED-ALLOWLIST"),
             (net_policy(&[], &[], &[443]), "BLOCKED-PRIVATE"),
         ] {
-            let e = explain_domain(&np, "localhost", 443, true);
+            let e = explain_domain(&np, "localhost", 443, true, false);
             assert_eq!(e.status, status);
             let fix = e.fix.as_deref().unwrap();
             assert!(
                 fix.contains("--allow-localhost 443") && !fix.contains("allowed_domains"),
                 "{status}: {fix}"
             );
+        }
+    }
+
+    /// #674: under proxy.forced the launch ignores allow_localhost_any (#53),
+    /// so the localhost fix must not send the user to it, and must say why.
+    #[test]
+    fn loopback_fix_under_proxy_forced_does_not_offer_localhost_any() {
+        let np = net_policy(&[], &[], &[443]);
+        let lo = |_: &str, p: u16| vec![std::net::SocketAddr::from(([127, 0, 0, 1], p))];
+        for forced in [false, true] {
+            let direct = explain_domain(&np, "localhost", 6969, true, forced);
+            let alias = explain_domain_resolved(&np, "127.0.0.1.nip.io", 6969, true, forced, lo);
+            for e in [direct, alias] {
+                let fix = e.fix.as_deref().unwrap();
+                assert!(fix.contains("--allow-localhost 6969"), "{fix}");
+                assert_eq!(fix.contains("--allow-localhost-any"), !forced, "{fix}");
+                assert_eq!(
+                    fix.contains("no effect under proxy.forced"),
+                    forced,
+                    "{fix}"
+                );
+            }
         }
     }
 
@@ -1751,7 +1790,7 @@ mod tests {
         let mut optin = net_policy(&[], &[], &[443]);
         optin.allow_localhost_ports = vec![6969];
         for np in [net_policy(&[], &[], &[443]), optin] {
-            let e = explain_domain_resolved(&np, alias, 6969, true, lo);
+            let e = explain_domain_resolved(&np, alias, 6969, true, false, lo);
             assert_eq!(e.status, "BLOCKED-PORT", "the proxy blocks it too");
             let fix = e.fix.as_deref().unwrap();
             assert!(fix.contains("--allow-localhost 6969"), "{fix}");
@@ -1762,7 +1801,7 @@ mod tests {
 
         let mut strict = net_policy(&["github.com"], &[], &[443]);
         strict.allowlist_active = true;
-        let e = explain_domain_resolved(&strict, alias, 443, true, lo);
+        let e = explain_domain_resolved(&strict, alias, 443, true, false, lo);
         assert_eq!(e.status, "BLOCKED-ALLOWLIST");
         let fix = e.fix.as_deref().unwrap();
         assert!(fix.contains("--allow-localhost 443"), "{fix}");
@@ -1772,17 +1811,17 @@ mod tests {
         // resolver is not consulted for a loopback literal or a non-DNS block.
         let public = |_: &str, p: u16| vec![std::net::SocketAddr::from(([1, 1, 1, 1], p))];
         let np = net_policy(&[], &[], &[443]);
-        let e = explain_domain_resolved(&np, "example.org", 6969, true, public);
+        let e = explain_domain_resolved(&np, "example.org", 6969, true, false, public);
         assert!(!e.fix.as_deref().unwrap().contains("--allow-localhost"));
         let unreachable = |_: &str, _: u16| -> Vec<std::net::SocketAddr> { panic!("resolved") };
-        let _ = explain_domain_resolved(&np, "localhost", 6969, true, unreachable);
-        let _ = explain_domain_resolved(&np, alias, 443, true, unreachable);
+        let _ = explain_domain_resolved(&np, "localhost", 6969, true, false, unreachable);
+        let _ = explain_domain_resolved(&np, alias, 443, true, false, unreachable);
     }
 
     #[test]
     fn proxy_disabled_is_not_filtered() {
         let np = net_policy(&[], &[], &[443]);
-        let e = explain_domain(&np, "anything.example", 443, false);
+        let e = explain_domain(&np, "anything.example", 443, false, false);
         assert_eq!(e.decision, Decision::Allowed);
         assert_eq!(e.status, "NO-PROXY");
     }
@@ -1793,7 +1832,7 @@ mod tests {
         // blocked_domains too (as the merged built-in ∪ user list would) so
         // classify_connect actually returns Blocked for it.
         let np = net_policy(&[], &["webhook.site"], &[443]);
-        let e = explain_domain(&np, "webhook.site", 443, true);
+        let e = explain_domain(&np, "webhook.site", 443, true, false);
         assert_eq!(e.decision, Decision::Blocked);
         assert_eq!(e.status, "BLOCKED");
         assert!(
@@ -1814,7 +1853,7 @@ mod tests {
         // example.org is not in blocked-domains.txt, so it can only be here
         // via the user's --blocked-domains file / subscription.
         let np = net_policy(&[], &["example.org"], &[443]);
-        let e = explain_domain(&np, "example.org", 443, true);
+        let e = explain_domain(&np, "example.org", 443, true, false);
         assert_eq!(e.decision, Decision::Blocked);
         assert_eq!(e.status, "BLOCKED");
         assert!(
