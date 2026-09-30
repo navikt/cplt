@@ -3767,9 +3767,28 @@ mod tests {
             "shutdown must not wait on a poll interval: {:?}",
             started.elapsed()
         );
+        // The accept loop dropped the listener before it reported, but a
+        // parallel test that forks (Command with pre_exec) can hold a copy of
+        // the descriptor until its child execs and CLOEXEC closes it. A
+        // connect in that window completes and is then reset. So wait for the
+        // port to refuse, and require every connect that got through first to
+        // be dead by then. A listener that stays open keeps them established
+        // (and refuses only once its backlog is full), so it still fails.
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut stray = Vec::new();
+        while let Ok(conn) = TcpStream::connect_timeout(&addr, Duration::from_secs(1)) {
+            stray.push(conn);
+            assert!(
+                Instant::now() < deadline,
+                "the listener must be closed once the accept loop has ended"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert!(
-            TcpStream::connect(("127.0.0.1", port)).is_err(),
-            "the listener must be closed once the accept loop has ended"
+            stray.iter().all(|c| c.peer_addr().is_err()),
+            "the listener must be closed once the accept loop has ended; {} connect(s) stayed established",
+            stray.len()
         );
         assert!(
             proxy.observed_domains().is_empty(),
@@ -6082,6 +6101,32 @@ mod tests {
     /// a FIN into a live connection. Regression guard for the shared clock.
     #[test]
     fn one_way_traffic_keeps_the_quiet_direction_alive() {
+        let ceiling = Duration::from_millis(500);
+        // A thread stalled for a whole ceiling (a loaded CI runner) leaves the
+        // tunnel genuinely idle, and the shared clock is right to reap it.
+        // Such a run proves nothing either way, so run again. A per-direction
+        // clock fails with every gap far below the ceiling and is never
+        // excused.
+        for attempt in 1..=3 {
+            match one_way_run(ceiling) {
+                Ok(()) => return,
+                Err((worst, msg)) if worst >= ceiling => {
+                    eprintln!("attempt {attempt}: {msg}; the test stalled {worst:?}, retrying");
+                }
+                Err((worst, msg)) => {
+                    panic!("{msg} (longest stretch without traffic {worst:?}, ceiling {ceiling:?})")
+                }
+            }
+        }
+        panic!("every attempt stalled past the ceiling; the runner is too loaded to judge");
+    }
+
+    /// Stream one way for twice the ceiling, then send one byte the quiet way.
+    /// On failure, also returns the longest stretch in which the test could
+    /// not prove a byte crossed the tunnel: from a write to the next receipt.
+    /// The relay's shared clock is touched between those two points, so it
+    /// cannot legitimately idle out unless that stretch reached the ceiling.
+    fn one_way_run(ceiling: Duration) -> Result<(), (Duration, String)> {
         fn pair() -> (TcpStream, TcpStream) {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let a = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -6090,35 +6135,44 @@ mod tests {
         }
         let (mut client, proxy_client) = pair();
         let (proxy_remote, mut remote) = pair();
+        let long = Some(Duration::from_secs(10));
+        client.set_read_timeout(long).unwrap();
+        remote.set_read_timeout(long).unwrap();
+        remote.set_write_timeout(long).unwrap();
 
+        // The relay's clock starts after this, so measuring from here only
+        // overstates a stretch.
+        let mut last_write = Instant::now();
         let timeout = Duration::from_millis(20);
-        // Margin matters here: the gap between ticks must stay far below the
-        // ceiling even on a loaded runner, while the total stream outlasts it.
-        let ceiling = Duration::from_millis(500);
-        let gap = Duration::from_millis(25);
-        let ticks = 40;
         std::thread::spawn(move || {
             relay_with_ceiling(proxy_client, proxy_remote, timeout, ceiling);
         });
 
-        // Remote streams for well over the ceiling; the client never sends.
-        let long = Some(Duration::from_secs(10));
-        client.set_read_timeout(long).unwrap();
-        remote.set_write_timeout(long).unwrap();
+        let mut worst = Duration::ZERO;
         let mut buf = [0u8; 4];
-        for _ in 0..ticks {
-            remote.write_all(b"tick").unwrap();
-            client.read_exact(&mut buf).unwrap();
+        let started = Instant::now();
+        // Remote streams for well over the ceiling; the client never sends.
+        while started.elapsed() < ceiling * 2 {
+            let wrote = Instant::now();
+            let r = remote
+                .write_all(b"tick")
+                .and_then(|()| client.read_exact(&mut buf));
+            worst = worst.max(last_write.elapsed());
+            last_write = wrote;
+            r.map_err(|e| (worst, format!("stream broke: {e}")))?;
             assert_eq!(&buf, b"tick");
-            std::thread::sleep(gap);
+            std::thread::sleep(Duration::from_millis(25));
         }
 
         // The quiet direction must still carry a byte: it was never idle,
         // because the tunnel as a whole was not.
-        remote.set_read_timeout(long).unwrap();
-        client.write_all(b"ping").unwrap();
-        remote.read_exact(&mut buf).unwrap();
+        let r = client
+            .write_all(b"ping")
+            .and_then(|()| remote.read_exact(&mut buf));
+        worst = worst.max(last_write.elapsed());
+        r.map_err(|e| (worst, format!("quiet direction was closed mid-stream: {e}")))?;
         assert_eq!(&buf, b"ping", "quiet direction was closed mid-stream");
+        Ok(())
     }
 
     /// A CONNECT tunnel that sits idle longer than `proxy.timeout` must stay
