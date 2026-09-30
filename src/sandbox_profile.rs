@@ -2551,6 +2551,18 @@ fn emit_deny_rules(sb: &mut String, config: &SandboxConfig, home: &str) {
         sbpl!(sb, "(deny file-read* (literal \"{p}\"))");
         sbpl!(sb, "(deny file-write* (literal \"{p}\"))");
     }
+    // `bsd.sb` allows `file-read-metadata` everywhere, and that named operation
+    // outranks the `file-read*` deny above, so a denied `~/.npmrc` still stats
+    // as present. yarn 1 checks existence before it reads every npmrc on the
+    // way from the project up to `/`, then aborts on the EPERM — and a project
+    // under `$HOME` walks past `~/.npmrc`, where the `NPM_CONFIG_USERCONFIG`
+    // redirect cannot reach. Hiding the file's metadata makes it look absent.
+    for p in spell(".npmrc", false) {
+        sbpl!(
+            sb,
+            "(deny file-read-metadata file-test-existence (literal \"{p}\"))"
+        );
+    }
     // `sandbox.protect_pnpm_config`: the dir stays read-only under a project or
     // `allow.write` grant that covers it too, and its ancestors in such a grant
     // keep their names (the pins below), so it cannot be moved aside.
@@ -2711,6 +2723,12 @@ fn emit_registry_config_overrides(
         );
         for p in overrides.iter().flat_map(|file| home_spellings(home, file)) {
             sbpl!(sb, "(allow file-read* (literal \"{p}\"))");
+            // Undoes the `~/.npmrc` metadata deny, which `file-read*` alone
+            // does not override. Harmless for the others: they are granted.
+            sbpl!(
+                sb,
+                "(allow file-read-metadata file-test-existence (literal \"{p}\"))"
+            );
         }
         sbpl!(sb);
     }

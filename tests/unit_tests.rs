@@ -940,6 +940,64 @@ fn profile_grants_project_access() {
     }
 }
 
+/// yarn 1 stats every `.npmrc` up to `/` before reading it, so a denied
+/// `~/.npmrc` must also hide its metadata (`bsd.sb` allows `file-read-metadata`
+/// everywhere), on both spellings of a symlinked file, and `allow.read` must
+/// undo that after the deny (SBPL last-match-wins).
+#[test]
+fn profile_hides_npmrc_metadata_until_allowed() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let home_dir = std::fs::canonicalize(home.path()).expect("canonicalize home");
+    let target = home_dir.join("dotfiles/npmrc");
+    std::fs::create_dir_all(target.parent().unwrap()).expect("mkdir dotfiles");
+    std::fs::write(&target, "color=false\n").expect("write target");
+    std::os::unix::fs::symlink(&target, home_dir.join(".npmrc")).expect("symlink");
+    let deny = |f: &std::path::Path| {
+        format!(
+            "(deny file-read-metadata file-test-existence (literal \"{}\"))",
+            f.display()
+        )
+    };
+    let allow = |f: &std::path::Path| {
+        format!(
+            "(allow file-read-metadata file-test-existence (literal \"{}\"))",
+            f.display()
+        )
+    };
+    let spellings = [home_dir.join(".npmrc"), target.clone()];
+
+    let off = generate_profile(
+        &SandboxConfig {
+            home_dir: &home_dir,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    for f in &spellings {
+        assert!(off.contains(&deny(f)), "missing {}:\n{off}", deny(f));
+        assert!(!off.contains(&allow(f)), "unexpected {}", allow(f));
+    }
+
+    let grant = [target.clone()];
+    let on = generate_profile(
+        &SandboxConfig {
+            home_dir: &home_dir,
+            extra_read: &grant,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    for f in &spellings {
+        let d = on.find(&deny(f)).expect("deny stays");
+        let a = on.find(&allow(f)).expect("re-allow for allow.read");
+        assert!(
+            a > d,
+            "re-allow must come after the deny for {}",
+            f.display()
+        );
+    }
+}
+
 /// `~/.gitconfig` symlinked into a dotfiles repo (stow, chezmoi, yadm, plain
 /// `ln -s`). An SBPL `literal` rule matches the resolved path, so a rule naming
 /// `$HOME/.gitconfig` covers nothing and every git command in the session fails

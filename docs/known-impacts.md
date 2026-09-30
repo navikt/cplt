@@ -1071,13 +1071,20 @@ One consequence is worth knowing: on Linux, where `.git/config` is writable, an 
 
 ## yarn 1 and unreadable home rc files
 
-**The `~/.npmrc` half of this is handled automatically since [#180](https://github.com/navikt/cplt/issues/180).** cplt sets `NPM_CONFIG_USERCONFIG` to a path inside the session scratch dir that deliberately does not exist, so the user-level npmrc read fails with `ENOENT`, which yarn 1 tolerates, instead of the denial errno, which it does not. Nothing is granted: `~/.npmrc` stays unreadable either way. `~/.yarnrc` is a separate loader and still needs `allow.read`; see below.
+**On macOS the `~/.npmrc` half of this is handled automatically.** yarn 1 reaches `~/.npmrc` two ways, and cplt closes both:
 
-The injection is skipped in three cases, where the failure below can still appear:
+- as the user config. cplt sets `NPM_CONFIG_USERCONFIG` to a path inside the session scratch dir that deliberately does not exist, so that read fails with `ENOENT`, which yarn 1 tolerates, instead of the denial errno, which it does not ([#180](https://github.com/navikt/cplt/issues/180));
+- on its walk up from the project directory, which checks `.npmrc` in every parent directory up to `/`. A project anywhere under `$HOME` passes `~/.npmrc` on the way, and no variable turns that walk off. The macOS profile also hides the file's metadata, so yarn's existence check sees no file and skips it.
 
-- you allowed `~/.npmrc` yourself (`allow.read`), so you asked for the real file and cplt does not redirect around it;
-- you set `NPM_CONFIG_USERCONFIG` yourself — in any capitalisation, since npm and yarn lowercase the key — and your value wins;
-- the scratch dir is off (`--no-scratch-dir`), so there is no session-scoped writable location to point at.
+Nothing is granted: `~/.npmrc` stays unreadable either way. `~/.yarnrc` is a separate loader and still needs `allow.read`; see below.
+
+**On Linux the walk is not covered.** Landlock does not restrict `stat` or `access`, so yarn 1 sees `~/.npmrc` as present on the walk and aborts on the `EACCES` when the project is under `$HOME`. Use one of the fixes below. The redirect still covers the user-config read.
+
+The injection is skipped in three cases:
+
+- you allowed `~/.npmrc` yourself (`allow.read`), so you asked for the real file and cplt does not redirect around it. yarn reads it, on both platforms;
+- you set `NPM_CONFIG_USERCONFIG` yourself — in any capitalisation, since npm and yarn lowercase the key — and your value wins. If it names `~/.npmrc`, macOS hides it and Linux fails as below. If it names another file the sandbox cannot read, yarn fails as below on both platforms, since only `~/.npmrc` has its metadata hidden;
+- the scratch dir is off (`--no-scratch-dir`), so there is no session-scoped writable location to point at. On macOS the hidden metadata keeps yarn away from `~/.npmrc`; on Linux yarn fails as below.
 
 Without it, `yarn install` fails outright under the default policy when an `~/.npmrc` exists on the host. Nothing is resolved and no `node_modules` is written:
 
@@ -1086,9 +1093,9 @@ yarn install v1.22.22
 error Error: EACCES: permission denied, open '/home/you/.npmrc'
 ```
 
-macOS reports the same failure as `EPERM: operation not permitted`. The errno differs by backend; the outcome does not.
+cplt releases before this fix failed the same way on macOS, as `EPERM: operation not permitted`, for any project under `$HOME`.
 
-**Fix, in the skipped cases.** If you only install from the public registry, point yarn at a different npmrc. The token stays outside the sandbox:
+**Fix, on Linux.** For a project outside `$HOME` with the redirect skipped, and only the public registry in use, point yarn at a different npmrc. The token stays outside the sandbox. For a project under `$HOME` this does not help, because the walk still reaches `~/.npmrc`:
 
 ```bash
 : > .npmrc.sandbox
@@ -1131,7 +1138,7 @@ The XDG variables, by contrast, do not help. yarn 1's `.yarnrc` scan builds its 
 
 One footgun with `allow.read`: the path must **exist** when cplt starts. A missing path is warned about and dropped, so `allow.read "~/.npmrc"` on a machine without one is silently inert. That is fine here, since yarn only fails when the file exists in the first place.
 
-**Why cplt does not make the *denial itself* look like ENOENT.** The redirect above sidesteps the errno for the one file that has an env-var escape hatch. It does not change what a denied `open` reports, so `~/.yarnrc` and every other withheld dotfile still fail with the platform's denial errno. The tempting general accommodation is to report these files as *absent* rather than *denied*, which every package manager tolerates. macOS can express that. SBPL accepts `(deny file-read* (literal …) (with errno 2))`, so the read fails with `No such file or directory`. Linux cannot. Landlock is grant-only with no control over the errno a denied `open` returns, and on Linux `~/.npmrc` is not denied by a rule at all. It is simply never granted. Shipping the macOS half would fix macOS, leave Linux (where this was reported) untouched, and split the two backends' denial semantics for every tool, not just yarn. One line of config is the better trade. Bubblewrap could mask the file with an empty `/dev/null` bind, but it is opt-in, applies only where the wrapper is active, and inverts the existing deny-path masks, which deliberately use an unreadable placeholder so a masked read fails loudly instead of reading as empty.
+**Why cplt does not make the *denial itself* look like ENOENT.** The redirect above sidesteps the errno for the one file that has an env-var escape hatch. It does not change what a denied `open` reports, so `~/.yarnrc` and every other withheld dotfile still fail with the platform's denial errno. The tempting general accommodation is to report these files as *absent* rather than *denied*, which every package manager tolerates. macOS can express that. SBPL accepts `(deny file-read* (literal …) (with errno 2))`, so the read fails with `No such file or directory`. Linux cannot. Landlock is grant-only with no control over the errno a denied `open` returns, and on Linux `~/.npmrc` is not denied by a rule at all. It is simply never granted. Shipping the macOS half would fix macOS, leave Linux (where this was reported) untouched, and split the two backends' denial semantics for every tool, not just yarn. One line of config is the better trade. The macOS metadata rule for `~/.npmrc` above is narrower: it hides one file from `stat` and `access` and leaves the errno of a denied `open` alone. The profile imports Apple's `bsd.sb`, which allows `file-read-metadata` everywhere, and that named operation outranks cplt's `file-read*` deny, so without the extra rule the denied file still stats as present. Bubblewrap could mask the file with an empty `/dev/null` bind, but it is opt-in, applies only where the wrapper is active, and inverts the existing deny-path masks, which deliberately use an unreadable placeholder so a masked read fails loudly instead of reading as empty.
 
 Adding `~/.npmrc` to the default read grant is not an option either. That hands the npm token to the sandboxed agent, which is the one thing the denial exists to prevent.
 
