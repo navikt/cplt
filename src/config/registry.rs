@@ -1278,6 +1278,22 @@ mod tests {
 
     use super::*;
 
+    /// A key missing from docs/configuration.md is one a reader of the docs
+    /// cannot find; twenty-one older keys drifted out that way.
+    #[test]
+    fn every_key_is_named_in_configuration_docs() {
+        let docs = include_str!("../../docs/configuration.md");
+        let missing: Vec<String> = all_config_keys()
+            .iter()
+            .map(|k| format!("{}.{}", k.section, k.key))
+            .filter(|dotted| !docs.contains(&format!("`{dotted}`")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "not in docs/configuration.md: {missing:?}"
+        );
+    }
+
     #[test]
     fn lookup_key_valid_keys() {
         assert!(lookup_key("sandbox.quiet").is_ok());
