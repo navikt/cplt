@@ -3689,6 +3689,45 @@ mod macos_tests {
         assert!(failures.is_empty(), "{failures:?}");
     }
 
+    /// yarn 1 stats every `.npmrc` from the project up to `/` and aborts on
+    /// the EPERM of one it cannot read, so a denied `~/.npmrc` must look
+    /// absent, and an `allow.read` of it must bring the metadata back.
+    #[test]
+    fn real_profile_hides_denied_npmrc_metadata_until_allowed() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let home = build_creds_home("meta");
+        let npmrc = home.join(".npmrc");
+        // `test -e` is stat(2) (file-read-metadata); Node's `fs.exists`, which
+        // yarn uses, is access(2) F_OK (file-test-existence). Both must agree.
+        let f = npmrc.display();
+        let probe = format!(
+            "test -e '{f}' && /usr/bin/perl -MPOSIX -e \
+             'exit(POSIX::access($ARGV[0], POSIX::F_OK()) ? 0 : 1)' '{f}'"
+        );
+        let absent = format!(
+            "! test -e '{f}' && ! /usr/bin/perl -MPOSIX -e \
+             'exit(POSIX::access($ARGV[0], POSIX::F_OK()) ? 0 : 1)' '{f}'"
+        );
+
+        let off = write_real_profile(&default_opts(&project, &home));
+        let (_, off_absent) = run_sandboxed(&off, &absent);
+        let grant = [npmrc.clone()];
+        let mut opts = default_opts(&project, &home);
+        opts.extra_read = &grant;
+        let on = write_real_profile(&opts);
+        let (_, on_exists) = run_sandboxed(&on, &probe);
+
+        fs::remove_dir_all(&home).ok();
+        fs::remove_file(&off).ok();
+        fs::remove_file(&on).ok();
+        assert!(
+            off_absent,
+            "denied ~/.npmrc must look absent to stat and access"
+        );
+        assert!(on_exists, "allow.read ~/.npmrc must stat as present");
+    }
+
     #[test]
     fn real_profile_build_credentials_refuse_a_link_to_a_key() {
         require_sandbox!();
