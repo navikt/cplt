@@ -358,7 +358,8 @@ fn past_xcrun_shim(git: PathBuf) -> PathBuf {
 }
 
 /// The resolved path of an absolute, executable `git` that this process cannot
-/// modify: neither the file nor the directory holding it is writable by us.
+/// modify: neither the file nor the directory holding it is writable by us,
+/// and nothing on its path is ours to make writable.
 /// Anything the user can write, a sandboxed agent with a write grant there
 /// could too.
 ///
@@ -373,8 +374,17 @@ fn shim_target(target: &Path) -> Option<PathBuf> {
     let real = std::fs::canonicalize(target).ok()?;
     (real.file_name().is_some_and(|n| n == "git")
         && !writable_by_us(&real)
-        && real.parent().is_some_and(|dir| !writable_by_us(dir)))
+        && real.parent().is_some_and(|dir| !writable_by_us(dir))
+        && !real.ancestors().any(owned_by_us))
     .then_some(real)
+}
+
+/// An owner can `chmod` a read-only file or directory back to writable, so
+/// nothing on the path to the target may belong to us.
+fn owned_by_us(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions.
+    std::fs::metadata(path).map_or(true, |m| m.uid() == unsafe { libc::geteuid() })
 }
 
 fn writable_by_us(path: &Path) -> bool {
@@ -831,6 +841,11 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o555)).unwrap();
         assert_eq!(shim_target(&planted), None, "writable dir accepted");
+        // Read-only directory too, but ours: we could chmod it back.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let owned = shim_target(&planted);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(owned, None, "owned read-only tree accepted");
         assert_eq!(shim_target(Path::new("git")), None, "relative accepted");
         assert_eq!(
             shim_target(&dir.path().join("absent/git")),
