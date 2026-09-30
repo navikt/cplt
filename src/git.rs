@@ -321,13 +321,16 @@ pub fn trusted_git() -> Option<&'static Path> {
 /// [`TRUSTED_BIN_DIRS`] still decides where git comes from: `/usr/bin` wins or
 /// loses exactly as before, and this only skips the hop inside it.
 ///
-/// The answer is still checked, never taken on faith. `--no-cache` because
-/// xcrun's lookup cache lives under the user's temp dir, which the sandbox can
-/// write; `PATH` is pinned to `/usr/bin:/bin` because `xcrun --find` falls back
-/// to a `PATH` search for a tool the developer directory lacks. And the target
-/// must be an executable file that this process can neither write nor replace
-/// ([`shim_target`]), so a developer directory a user owns (a
-/// dragged-in `Xcode.app`) keeps the shim. Any failure keeps the shim too:
+/// The answer is still checked, never taken on faith. xcrun's lookup cache
+/// lives under the user's temp dir, which the sandbox can write, but the shim
+/// reads that same cache on every call, so trusting it is no worse than
+/// before. `--no-cache` is not an option: with a full Xcode it runs
+/// `xcodebuild -find`, about 2 s per launch on a CI runner. `PATH` is pinned
+/// to `/usr/bin:/bin` because `xcrun --find` falls back to a `PATH` search for
+/// a tool the developer directory lacks. And the target must be an executable
+/// file that this process can neither write nor replace ([`shim_target`]), so
+/// a developer directory a user owns (a dragged-in `Xcode.app`) keeps the
+/// shim. Any failure keeps the shim too:
 /// slower, never less safe.
 #[cfg(target_os = "macos")]
 #[allow(clippy::disallowed_methods)] // /usr/bin/xcrun is absolute and SIP-protected
@@ -336,7 +339,7 @@ fn past_xcrun_shim(git: PathBuf) -> PathBuf {
         return git;
     }
     let Ok(out) = Command::new("/usr/bin/xcrun")
-        .args(["--no-cache", "--find", "git"])
+        .args(["--find", "git"])
         .env("PATH", "/usr/bin:/bin")
         .stdin(Stdio::null())
         .stderr(Stdio::null())
@@ -886,7 +889,7 @@ mod tests {
         let clt = "/Library/Developer/CommandLineTools/usr/bin/git";
         #[allow(clippy::disallowed_methods)] // absolute, SIP-protected
         let found = Command::new("/usr/bin/xcrun")
-            .args(["--no-cache", "--find", "git"])
+            .args(["--find", "git"])
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .ok();
