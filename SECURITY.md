@@ -381,7 +381,7 @@ cplt has a built-in blocklist covering most of these: [`blocked-domains.txt`](bl
 
 | Kill chain step | Attack technique | Sandbox defense | Verdict |
 |---|---|---|---|
-| **1. Infection** | `postinstall` hook runs code | **Blocked by default.** Hardening injects `npm_config_ignore_scripts=true` and `YARN_ENABLE_SCRIPTS=false` | ✅ **Stopped** |
+| **1. Infection** | `postinstall` hook runs code | **Blocked by default.** Hardening injects `npm_config_ignore_scripts=true`, `pnpm_config_ignore_scripts=true`, `YARN_IGNORE_SCRIPTS=true` (yarn 1) and `YARN_ENABLE_SCRIPTS=false` (yarn 2+, dependencies only) | ✅ **Stopped** |
 | **2. Recon** | Read hostname, IP, env vars | Can read process env vars (needed for Copilot), hostname | ⚠️ Partial leak possible |
 | **3. Credential harvest** | Read ~/.ssh, ~/.aws, .env | **Kernel-blocked.** macOS Seatbelt denies the read syscall. | ✅ **Stopped** |
 | **4a. HTTP exfil** | POST to discord/webhook/C2 | Only port 443 allowed. On macOS localhost and the SSH agent socket are blocked too; on Linux neither is, and UDP is unrestricted unless `proxy.forced` is on (see [Linux-specific limitations](#linux-specific-limitations)). Credentials are unreadable, so the blast radius is small. The proxy blocklist helps if enabled. | ⚠️ **Partially mitigated** |
@@ -996,7 +996,9 @@ Beyond sanitization, `cplt` injects hardening environment variables that disable
 
 | Variable | Value | Category | Purpose |
 |---|---|---|---|
-| `npm_config_ignore_scripts` | `true` | LifecycleScripts | Block npm/pnpm postinstall hooks |
+| `npm_config_ignore_scripts` | `true` | LifecycleScripts | Block npm and pnpm 10 postinstall hooks |
+| `pnpm_config_ignore_scripts` | `true` | LifecycleScripts | Block pnpm 11+ postinstall hooks (pnpm 11 stopped reading `npm_config_*`) |
+| `YARN_IGNORE_SCRIPTS` | `true` | LifecycleScripts | Block yarn 1 lifecycle scripts. Set only when the launch directory shows yarn 1 and not yarn 2+, since yarn 2+ rejects the setting and aborts. See [known impacts](docs/known-impacts.md#lifecycle-scripts-postinstall-hooks) |
 | `YARN_ENABLE_SCRIPTS` | `false` | LifecycleScripts | Block Yarn Berry lifecycle scripts |
 | `GIT_TERMINAL_PROMPT` | `0` | GitHardening | Prevent git credential prompts |
 | `GIT_CONFIG_COUNT` | `2` | GitSigning | Number of git config overrides |

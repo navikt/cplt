@@ -208,7 +208,14 @@ error obtaining VCS status: exit status 128
 
 ## Lifecycle scripts (postinstall hooks)
 
-npm/yarn/pnpm lifecycle scripts are **blocked by default** via `npm_config_ignore_scripts=true` and `YARN_ENABLE_SCRIPTS=false`. This stops supply chain attacks through postinstall hooks, but it may break packages that need a post-install step:
+npm/yarn/pnpm lifecycle scripts are **blocked by default** via `npm_config_ignore_scripts=true` (npm, pnpm 10), `pnpm_config_ignore_scripts=true` (pnpm 11 and later, which no longer read `npm_config_*`), `YARN_IGNORE_SCRIPTS=true` (yarn 1) and `YARN_ENABLE_SCRIPTS=false` (yarn 2+). Each tool reads only its own variable.
+
+Two limits:
+
+- yarn 2+ blocks only the dependencies' scripts. The project's own `postinstall` still runs, by yarn's design.
+- yarn 2+ rejects `YARN_IGNORE_SCRIPTS` as an unknown setting (`Unrecognized or legacy configuration settings found: ignoreScripts`), so cplt sets it only when it sees yarn 1 and no yarn 2+. It looks at the directory you start cplt in and its parents, and the nearest one with a `.yarnrc.yml`, a `packageManager` naming yarn, or a `yarn.lock` decides. If none has one, it looks one level down, and every yarn project there must be yarn 1. A yarn 1 project without a `yarn.lock` or `packageManager`, or deeper than one level, still runs its scripts. Commit its `yarn.lock`, or start cplt in its directory.
+
+This stops supply chain attacks through postinstall hooks, but it may break packages that need a post-install step:
 
 | Operation                        | Impact      | Why                                                            |
 | -------------------------------- | ----------- | -------------------------------------------------------------- |
