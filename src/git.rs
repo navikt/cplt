@@ -326,7 +326,7 @@ pub fn trusted_git() -> Option<&'static Path> {
 /// write; `PATH` is pinned to `/usr/bin:/bin` because `xcrun --find` falls back
 /// to a `PATH` search for a tool the developer directory lacks. And the target
 /// must be an executable file that this process can neither write nor replace
-/// ([`is_shim_target_acceptable`]), so a developer directory a user owns (a
+/// ([`shim_target`]), so a developer directory a user owns (a
 /// dragged-in `Xcode.app`) keeps the shim. Any failure keeps the shim too:
 /// slower, never less safe.
 #[cfg(target_os = "macos")]
@@ -345,11 +345,11 @@ fn past_xcrun_shim(git: PathBuf) -> PathBuf {
         return git;
     };
     let target = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
-    if out.status.success() && is_shim_target_acceptable(&target) {
-        target
-    } else {
-        git
-    }
+    out.status
+        .success()
+        .then(|| shim_target(&target))
+        .flatten()
+        .unwrap_or(git)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -357,17 +357,24 @@ fn past_xcrun_shim(git: PathBuf) -> PathBuf {
     git
 }
 
-/// An absolute, executable `git` that this process cannot modify: neither the
-/// file nor the directory holding it is writable by us. Anything the user can
-/// write, a sandboxed agent with a write grant there could too.
+/// The resolved path of an absolute, executable `git` that this process cannot
+/// modify: neither the file nor the directory holding it is writable by us.
+/// Anything the user can write, a sandboxed agent with a write grant there
+/// could too.
+///
+/// The checked path is the one returned, symlinks resolved: running the path
+/// xcrun printed would re-walk any link on it at every spawn, and a link that
+/// sits in a writable directory could be repointed after this check.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn is_shim_target_acceptable(target: &Path) -> bool {
-    target.is_absolute()
-        && target.file_name().is_some_and(|n| n == "git")
-        && is_executable_file(target)
-        && std::fs::canonicalize(target).is_ok_and(|real| {
-            !writable_by_us(&real) && real.parent().is_some_and(|dir| !writable_by_us(dir))
-        })
+fn shim_target(target: &Path) -> Option<PathBuf> {
+    if !target.is_absolute() || !is_executable_file(target) {
+        return None;
+    }
+    let real = std::fs::canonicalize(target).ok()?;
+    (real.file_name().is_some_and(|n| n == "git")
+        && !writable_by_us(&real)
+        && real.parent().is_some_and(|dir| !writable_by_us(dir)))
+    .then_some(real)
 }
 
 fn writable_by_us(path: &Path) -> bool {
@@ -806,10 +813,7 @@ mod tests {
         // The trusted-directory lookup picks the path; the only step after it
         // is following macOS's xcrun shim to the git it runs.
         let picked = trusted_binary("git").expect("command() resolved a git");
-        assert!(
-            TRUSTED_BIN_DIRS.iter().any(|d| picked.starts_with(d)),
-            "{picked:?} is outside TRUSTED_BIN_DIRS"
-        );
+        assert!(TRUSTED_BIN_DIRS.iter().any(|d| picked.starts_with(d)));
         assert_eq!(program, past_xcrun_shim(picked));
     }
 
@@ -822,20 +826,19 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let planted = dir.path().join("git");
         plant_executable(&planted);
-        assert!(
-            !is_shim_target_acceptable(&planted),
-            "writable dir accepted"
-        );
-        assert!(
-            !is_shim_target_acceptable(Path::new("git")),
-            "relative accepted"
-        );
-        assert!(
-            !is_shim_target_acceptable(&dir.path().join("absent/git")),
+        assert_eq!(shim_target(&planted), None, "writable file accepted");
+        // Read-only file, writable directory: replaceable by a rename.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o555)).unwrap();
+        assert_eq!(shim_target(&planted), None, "writable dir accepted");
+        assert_eq!(shim_target(Path::new("git")), None, "relative accepted");
+        assert_eq!(
+            shim_target(&dir.path().join("absent/git")),
+            None,
             "missing file accepted"
         );
         // A read-only executable with the wrong name is not git.
-        assert!(!is_shim_target_acceptable(Path::new("/bin/sh")));
+        assert_eq!(shim_target(Path::new("/bin/sh")), None);
 
         // Root can write anything, so nothing is acceptable to it.
         // SAFETY: geteuid has no preconditions.
@@ -848,7 +851,14 @@ mod tests {
             .map(Path::new)
             .find(|p| p.is_file())
         {
-            assert!(is_shim_target_acceptable(git), "{git:?} refused");
+            let real = std::fs::canonicalize(git).unwrap();
+            assert_eq!(shim_target(git).as_ref(), Some(&real), "{git:?} refused");
+            // Reached through a link in a writable directory, the answer is the
+            // link's target: running the link would let it be repointed.
+            let link = tempfile::tempdir().expect("tempdir");
+            let link = link.path().join("git");
+            std::os::unix::fs::symlink(git, &link).unwrap();
+            assert_eq!(shim_target(&link), Some(real), "the link itself returned");
         }
     }
 
@@ -875,7 +885,7 @@ mod tests {
             Path::new("/usr/bin/git"),
             "still going through the shim"
         );
-        assert!(is_shim_target_acceptable(git), "{git:?}");
+        assert_eq!(shim_target(git).as_deref(), Some(git), "{git:?}");
     }
 
     /// Spelled out independently of the const, like the override table above: a

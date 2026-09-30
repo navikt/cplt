@@ -337,9 +337,15 @@ fn a_git_planted_on_path_is_never_run_by_the_parent() {
         !f.marker.exists(),
         "a git planted on PATH ran in the parent"
     );
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    // macOS lists the deny path in the profile; Linux reports it on stderr
+    // when the path does not exist to be masked. Either way git ran.
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(
-        out.status.success() && stdout.contains("planted-path-probe"),
+        out.status.success() && output.contains("planted-path-probe"),
         "the committed .cplt.toml was not read, so git never ran: {}",
         String::from_utf8_lossy(&out.stderr)
     );
