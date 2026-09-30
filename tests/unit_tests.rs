@@ -11032,7 +11032,7 @@ fn docker_socket_list_follows_the_home_dir() {
         "the Docker Desktop socket must be built from the configured home, got {paths:?}"
     );
     assert!(
-        !paths.iter().any(|p| p.starts_with("/fake/user")),
+        !paths.iter().any(|p| p.starts_with("/home/user")),
         "no home path may be hardcoded, got {paths:?}"
     );
 }
