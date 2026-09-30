@@ -2,6 +2,9 @@
 //!
 //! These tests verify core logic without invoking sandbox-exec,
 //! so they run on any platform (Linux CI, macOS, etc.).
+//!
+//! Fake homes live under /fake, not /home: /home is an automount on
+//! macOS, and every lookup of a missing name there costs tens of milliseconds.
 
 mod common;
 use common::git_cmd;
@@ -105,7 +108,7 @@ fn allows_deep_project_path() {
 #[cfg(target_os = "linux")]
 #[test]
 fn rejects_linux_unsafe_roots() {
-    let home = std::path::Path::new("/home/testuser");
+    let home = std::path::Path::new("/fake/testuser");
     assert!(is_unsafe_root(std::path::Path::new("/home"), home));
     assert!(is_unsafe_root(std::path::Path::new("/proc"), home));
     assert!(is_unsafe_root(std::path::Path::new("/sys"), home));
@@ -801,7 +804,7 @@ fn landlock_policy_device_files_have_ioctl() {
     // below (GHSA-q3p2-6x2x-8w8w).
     let policy = generate_policy(&SandboxConfig {
         project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/home/test"),
+        home_dir: std::path::Path::new("/fake/test"),
         extra_read: &[],
         extra_write: &[],
         extra_exec: &[],
@@ -4212,7 +4215,7 @@ fn allow_localhost_any_affects_both_backends() {
     // Linux: allow_localhost_any should disable net_connect restriction
     let landlock_policy = generate_policy(&SandboxConfig {
         project_dir: std::path::Path::new("/tmp/proj"),
-        home_dir: std::path::Path::new("/home/test"),
+        home_dir: std::path::Path::new("/fake/test"),
         extra_read: &[],
         extra_write: &[],
         extra_exec: &[],
@@ -4272,7 +4275,7 @@ fn config_options_parity_across_backends() {
     use std::path::{Path, PathBuf};
 
     let project = Path::new("/tmp/proj");
-    let home = Path::new("/home/test");
+    let home = Path::new("/fake/test");
     let extra_read = vec![PathBuf::from("/extra/read")];
     let extra_write = vec![PathBuf::from("/extra/write")];
     let ports = vec![8443u16];
@@ -5667,7 +5670,7 @@ fn env_opencode_redirects_claude_config_dir() {
     // oh-my-openagent writes transcripts to $CLAUDE_CONFIG_DIR/transcripts
     // (default ~/.claude), which the sandbox denies for OpenCode — cplt must
     // redirect it into the write-allowed OpenCode state dir.
-    let parent = make_env(&[("HOME", "/home/test"), ("PATH", "/usr/bin")]);
+    let parent = make_env(&[("HOME", "/fake/test"), ("PATH", "/usr/bin")]);
     let env = build_sandbox_env(
         &parent,
         &[],
@@ -5685,13 +5688,13 @@ fn env_opencode_redirects_claude_config_dir() {
     );
     assert_eq!(
         found.unwrap().1,
-        "/home/test/.local/state/opencode/claude-config"
+        "/fake/test/.local/state/opencode/claude-config"
     );
 }
 
 #[test]
 fn env_opencode_claude_config_dir_respects_xdg_state_home() {
-    let parent = make_env(&[("HOME", "/home/test"), ("XDG_STATE_HOME", "/xdg/state")]);
+    let parent = make_env(&[("HOME", "/fake/test"), ("XDG_STATE_HOME", "/xdg/state")]);
     let env = build_sandbox_env(
         &parent,
         &[],
@@ -5711,7 +5714,7 @@ fn env_opencode_claude_config_dir_respects_user_override() {
     // User-set CLAUDE_CONFIG_DIR passes through untouched (allowlisted) —
     // cplt must not clobber it with the redirect.
     let parent = make_env(&[
-        ("HOME", "/home/test"),
+        ("HOME", "/fake/test"),
         ("CLAUDE_CONFIG_DIR", "/custom/claude"),
     ]);
     let env = build_sandbox_env(
@@ -5737,7 +5740,7 @@ fn env_opencode_claude_config_dir_respects_user_override() {
 fn env_opencode_claude_config_dir_empty_is_treated_as_unset() {
     // An empty CLAUDE_CONFIG_DIR in parent env must not prevent injection —
     // the plugin would resolve it to a relative "transcripts/" path and hit EACCES.
-    let parent = make_env(&[("HOME", "/home/test"), ("CLAUDE_CONFIG_DIR", "")]);
+    let parent = make_env(&[("HOME", "/fake/test"), ("CLAUDE_CONFIG_DIR", "")]);
     let env = build_sandbox_env(
         &parent,
         &[],
@@ -5756,14 +5759,14 @@ fn env_opencode_claude_config_dir_empty_is_treated_as_unset() {
     assert_eq!(matches.len(), 1, "exactly one CLAUDE_CONFIG_DIR entry");
     assert_eq!(
         matches[0].1,
-        "/home/test/.local/state/opencode/claude-config"
+        "/fake/test/.local/state/opencode/claude-config"
     );
 }
 
 #[test]
 fn env_claude_config_dir_not_injected_for_other_agents() {
     for agent in [cplt::agent::Agent::Copilot, cplt::agent::Agent::Claude] {
-        let parent = make_env(&[("HOME", "/home/test"), ("PATH", "/usr/bin")]);
+        let parent = make_env(&[("HOME", "/fake/test"), ("PATH", "/usr/bin")]);
         let env = build_sandbox_env(&parent, &[], false, &[], None, None, agent);
         assert!(
             !env.vars.iter().any(|(k, _)| k == "CLAUDE_CONFIG_DIR"),
@@ -9524,7 +9527,7 @@ fn cypress_runtime_grants_non_executable_app_state_on_landlock() {
 fn existing_app_dirs_none_includes_all() {
     // Resolve a known mise app dir path at test time
     let data_path =
-        cplt::sandbox::AppDirKind::Data.resolve("", "", "mise", std::path::Path::new("/home/test"));
+        cplt::sandbox::AppDirKind::Data.resolve("", "", "mise", std::path::Path::new("/fake/test"));
     let Some(data_path) = data_path else {
         // No home dir in this environment — skip
         return;
@@ -9534,7 +9537,7 @@ fn existing_app_dirs_none_includes_all() {
     let p = generate_profile(
         &SandboxConfig {
             project_dir: std::path::Path::new("/tmp/proj"),
-            home_dir: std::path::Path::new("/home/test"),
+            home_dir: std::path::Path::new("/fake/test"),
             ..base_profile_options()
         },
         &[],
@@ -9548,7 +9551,7 @@ fn existing_app_dirs_none_includes_all() {
 #[test]
 fn existing_app_dirs_matching_includes_dir() {
     let data_path =
-        cplt::sandbox::AppDirKind::Data.resolve("", "", "mise", std::path::Path::new("/home/test"));
+        cplt::sandbox::AppDirKind::Data.resolve("", "", "mise", std::path::Path::new("/fake/test"));
     let Some(data_path) = data_path else {
         return;
     };
@@ -9558,7 +9561,7 @@ fn existing_app_dirs_matching_includes_dir() {
     let p = generate_profile(
         &SandboxConfig {
             project_dir: std::path::Path::new("/tmp/proj"),
-            home_dir: std::path::Path::new("/home/test"),
+            home_dir: std::path::Path::new("/fake/test"),
             existing_app_dirs: Some(&existing),
             ..base_profile_options()
         },
@@ -9574,7 +9577,7 @@ fn existing_app_dirs_matching_includes_dir() {
 fn existing_app_dirs_nonmatching_excludes_dir() {
     // Resolve any mise path to confirm what we'd expect to see
     let data_path =
-        cplt::sandbox::AppDirKind::Data.resolve("", "", "mise", std::path::Path::new("/home/test"));
+        cplt::sandbox::AppDirKind::Data.resolve("", "", "mise", std::path::Path::new("/fake/test"));
     let Some(data_path) = data_path else {
         return;
     };
@@ -9584,7 +9587,7 @@ fn existing_app_dirs_nonmatching_excludes_dir() {
     let p = generate_profile(
         &SandboxConfig {
             project_dir: std::path::Path::new("/tmp/proj"),
-            home_dir: std::path::Path::new("/home/test"),
+            home_dir: std::path::Path::new("/fake/test"),
             existing_app_dirs: Some(&existing),
             ..base_profile_options()
         },
@@ -9608,12 +9611,12 @@ fn existing_app_dirs_nonmatching_excludes_dir() {
 fn existing_app_dirs_per_path_filtering() {
     // Resolve two distinct mise paths from different categories
     let data_path =
-        cplt::sandbox::AppDirKind::Data.resolve("", "", "mise", std::path::Path::new("/home/test"));
+        cplt::sandbox::AppDirKind::Data.resolve("", "", "mise", std::path::Path::new("/fake/test"));
     let config_path = cplt::sandbox::AppDirKind::Config.resolve(
         "",
         "",
         "mise",
-        std::path::Path::new("/home/test"),
+        std::path::Path::new("/fake/test"),
     );
     let (Some(data_path), Some(config_path)) = (data_path, config_path) else {
         return;
@@ -9626,7 +9629,7 @@ fn existing_app_dirs_per_path_filtering() {
     let p = generate_profile(
         &SandboxConfig {
             project_dir: std::path::Path::new("/tmp/proj"),
-            home_dir: std::path::Path::new("/home/test"),
+            home_dir: std::path::Path::new("/fake/test"),
             existing_app_dirs: Some(&existing),
             ..base_profile_options()
         },
@@ -10052,7 +10055,7 @@ fn env_pairs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
 
 #[test]
 fn tool_path_gopath_custom_yields_writable_rule() {
-    let home = std::path::Path::new("/home/tester");
+    let home = std::path::Path::new("/fake/tester");
     let env = env_pairs(&[("GOPATH", "/custom/gopath")]);
     let overrides = tool_path_env_overrides(&env, home);
     assert_eq!(overrides.len(), 1, "GOPATH override should be emitted");
@@ -10065,7 +10068,7 @@ fn tool_path_gopath_custom_yields_writable_rule() {
 
 #[test]
 fn tool_path_node_path_yields_read_only_rule() {
-    let home = std::path::Path::new("/home/tester");
+    let home = std::path::Path::new("/fake/tester");
     let env = env_pairs(&[("NODE_PATH", "/custom/node_modules")]);
     let overrides = tool_path_env_overrides(&env, home);
     assert_eq!(overrides.len(), 1);
@@ -10081,7 +10084,7 @@ fn tool_path_node_path_yields_read_only_rule() {
 
 #[test]
 fn tool_path_unset_env_vars_add_nothing() {
-    let home = std::path::Path::new("/home/tester");
+    let home = std::path::Path::new("/fake/tester");
     let env: Vec<(String, String)> = Vec::new();
     let overrides = tool_path_env_overrides(&env, home);
     assert!(
@@ -10092,7 +10095,7 @@ fn tool_path_unset_env_vars_add_nothing() {
 
 #[test]
 fn tool_path_empty_value_adds_nothing() {
-    let home = std::path::Path::new("/home/tester");
+    let home = std::path::Path::new("/fake/tester");
     let env = env_pairs(&[("GOPATH", "")]);
     let overrides = tool_path_env_overrides(&env, home);
     assert!(overrides.is_empty(), "empty value → treated as unset");
@@ -10102,8 +10105,8 @@ fn tool_path_empty_value_adds_nothing() {
 fn tool_path_default_value_not_double_added() {
     // GOPATH pointing at the default ~/go is already covered by HOME_TOOL_DIRS
     // (go/bin, go/pkg), so it must not produce an extra override.
-    let home = std::path::Path::new("/home/tester");
-    let env = env_pairs(&[("GOPATH", "/home/tester/go")]);
+    let home = std::path::Path::new("/fake/tester");
+    let env = env_pairs(&[("GOPATH", "/fake/tester/go")]);
     let overrides = tool_path_env_overrides(&env, home);
     assert!(
         overrides.is_empty(),
@@ -10114,7 +10117,7 @@ fn tool_path_default_value_not_double_added() {
 #[test]
 fn tool_path_default_value_via_tilde_not_double_added() {
     // The tilde form of the default must also resolve to ~/go and be skipped.
-    let home = std::path::Path::new("/home/tester");
+    let home = std::path::Path::new("/fake/tester");
     let env = env_pairs(&[("CARGO_HOME", "~/.cargo")]);
     let overrides = tool_path_env_overrides(&env, home);
     assert!(
@@ -10125,20 +10128,20 @@ fn tool_path_default_value_via_tilde_not_double_added() {
 
 #[test]
 fn tool_path_tilde_is_expanded_to_home() {
-    let home = std::path::Path::new("/home/tester");
+    let home = std::path::Path::new("/fake/tester");
     let env = env_pairs(&[("CARGO_HOME", "~/alt-cargo")]);
     let overrides = tool_path_env_overrides(&env, home);
     assert_eq!(overrides.len(), 1);
     assert_eq!(
         overrides[0].path,
-        std::path::PathBuf::from("/home/tester/alt-cargo")
+        std::path::PathBuf::from("/fake/tester/alt-cargo")
     );
     assert!(overrides[0].write);
 }
 
 #[test]
 fn tool_path_multiple_vars_mapped_by_access() {
-    let home = std::path::Path::new("/home/tester");
+    let home = std::path::Path::new("/fake/tester");
     let env = env_pairs(&[
         ("GOPATH", "/custom/gopath"),
         ("CARGO_HOME", "/custom/cargo"),
@@ -10166,7 +10169,7 @@ fn tool_path_multiple_vars_mapped_by_access() {
 fn tool_path_same_path_write_wins_over_read() {
     // If a read-only var and a write var resolve to the same custom path,
     // the write grant must win (deduped to a single writable override).
-    let home = std::path::Path::new("/home/tester");
+    let home = std::path::Path::new("/fake/tester");
     let env = env_pairs(&[("NODE_PATH", "/shared/dir"), ("GOPATH", "/shared/dir")]);
     let overrides = tool_path_env_overrides(&env, home);
     assert_eq!(overrides.len(), 1, "same path must be deduplicated");
@@ -10181,7 +10184,7 @@ fn tool_path_same_path_write_wins_over_read() {
 #[test]
 fn tool_path_gopath_list_yields_one_override_per_segment() {
     // GOPATH=/a:/b → two writable overrides, one per directory in the list.
-    let home = std::path::Path::new("/home/tester");
+    let home = std::path::Path::new("/fake/tester");
     let env = env_pairs(&[("GOPATH", "/a:/b")]);
     let overrides = tool_path_env_overrides(&env, home);
     let paths: Vec<&std::path::Path> = overrides.iter().map(|o| o.path.as_path()).collect();
@@ -10197,7 +10200,7 @@ fn tool_path_gopath_list_yields_one_override_per_segment() {
 #[test]
 fn tool_path_node_path_list_yields_read_only_per_segment() {
     // NODE_PATH=/x:/y → two read-only overrides, one per lookup directory.
-    let home = std::path::Path::new("/home/tester");
+    let home = std::path::Path::new("/fake/tester");
     let env = env_pairs(&[("NODE_PATH", "/x:/y")]);
     let overrides = tool_path_env_overrides(&env, home);
     let paths: Vec<&std::path::Path> = overrides.iter().map(|o| o.path.as_path()).collect();
@@ -10218,7 +10221,7 @@ fn tool_path_node_path_list_yields_read_only_per_segment() {
 fn tool_path_list_empty_segments_are_ignored() {
     // Doubled (`/a::/b`) and trailing (`/b:`) separators produce empty segments
     // that must be skipped rather than resolving to HOME (join of an empty path).
-    let home = std::path::Path::new("/home/tester");
+    let home = std::path::Path::new("/fake/tester");
     let env = env_pairs(&[("GOPATH", "/a::/b:")]);
     let overrides = tool_path_env_overrides(&env, home);
     let paths: Vec<&std::path::Path> = overrides.iter().map(|o| o.path.as_path()).collect();
@@ -10239,7 +10242,7 @@ fn tool_path_list_empty_segments_are_ignored() {
 fn tool_path_single_path_var_with_colon_is_not_split() {
     // A single-path var (CARGO_HOME) is never split, so a `:` in a weird-but-real
     // directory name is preserved verbatim as one path.
-    let home = std::path::Path::new("/home/tester");
+    let home = std::path::Path::new("/fake/tester");
     let env = env_pairs(&[("CARGO_HOME", "/weird:dir/cargo")]);
     let overrides = tool_path_env_overrides(&env, home);
     assert_eq!(overrides.len(), 1, "single-path var must not be split");
@@ -10254,7 +10257,7 @@ fn tool_path_single_path_var_with_colon_is_not_split() {
 fn tool_path_list_per_segment_safety_guard_drops_unsafe_segment() {
     // GOPATH=/custom:/ → the list splits into /custom and /. tool_path_env_overrides
     // emits both; the per-segment safety guard keeps /custom and drops the root.
-    let home = std::path::Path::new("/home/tester");
+    let home = std::path::Path::new("/fake/tester");
     let env = env_pairs(&[("GOPATH", "/custom:/")]);
     let overrides = tool_path_env_overrides(&env, home);
     let kept: Vec<&std::path::Path> = overrides
@@ -10288,7 +10291,7 @@ fn tool_dir(path: &str) -> &'static cplt::sandbox::HomeToolDir {
 fn cargo_root() -> Vec<ToolRoot> {
     vec![ToolRoot {
         default: ".cargo",
-        root: PathBuf::from("/home/tester/.local/share/cargo"),
+        root: PathBuf::from("/fake/tester/.local/share/cargo"),
     }]
 }
 
@@ -10306,36 +10309,36 @@ fn relocatable_prefix_covers_split_trees_only() {
 
 #[test]
 fn resolve_reroots_entries_under_relocated_home() {
-    let home = std::path::Path::new("/home/tester");
+    let home = std::path::Path::new("/fake/tester");
     let roots = cargo_root();
     let bin = tool_dir(".cargo/bin").resolve(home, &roots);
     assert_eq!(
         bin.path,
-        PathBuf::from("/home/tester/.local/share/cargo/bin")
+        PathBuf::from("/fake/tester/.local/share/cargo/bin")
     );
     assert!(bin.dir.process_exec && !bin.dir.write);
     let registry = tool_dir(".cargo/registry").resolve(home, &roots);
     assert_eq!(
         registry.path,
-        PathBuf::from("/home/tester/.local/share/cargo/registry")
+        PathBuf::from("/fake/tester/.local/share/cargo/registry")
     );
     assert!(registry.dir.write && !registry.dir.process_exec);
     // Unrelated entries stay under HOME.
     assert_eq!(
         tool_dir(".nvm").resolve(home, &roots).path,
-        PathBuf::from("/home/tester/.nvm")
+        PathBuf::from("/fake/tester/.nvm")
     );
     // No roots → default location.
     assert_eq!(
         tool_dir(".cargo/bin").resolve(home, &[]).path,
-        PathBuf::from("/home/tester/.cargo/bin")
+        PathBuf::from("/fake/tester/.cargo/bin")
     );
 }
 
 #[test]
 fn resolve_reroots_split_pnpm_permissions() {
-    let home = std::path::Path::new("/home/tester");
-    let root = PathBuf::from("/home/tester/custom-pnpm");
+    let home = std::path::Path::new("/fake/tester");
+    let root = PathBuf::from("/fake/tester/custom-pnpm");
     let roots = vec![ToolRoot {
         default: "Library/pnpm",
         root: root.clone(),
@@ -10360,20 +10363,20 @@ fn resolve_reroots_split_pnpm_permissions() {
 
 #[test]
 fn resolve_entry_equal_to_root_has_no_trailing_separator() {
-    let home = std::path::Path::new("/home/tester");
+    let home = std::path::Path::new("/fake/tester");
     let roots = vec![ToolRoot {
         default: ".rustup",
-        root: PathBuf::from("/home/tester/.local/share/rustup"),
+        root: PathBuf::from("/fake/tester/.local/share/rustup"),
     }];
     let r = tool_dir(".rustup").resolve(home, &roots);
-    assert_eq!(r.path, PathBuf::from("/home/tester/.local/share/rustup"));
+    assert_eq!(r.path, PathBuf::from("/fake/tester/.local/share/rustup"));
     assert!(!r.path.to_string_lossy().ends_with('/'));
 }
 
 #[test]
 fn tool_path_rustup_home_custom_yields_read_only_rule() {
-    let home = std::path::Path::new("/home/tester");
-    let env = env_pairs(&[("RUSTUP_HOME", "/home/tester/.local/share/rustup")]);
+    let home = std::path::Path::new("/fake/tester");
+    let env = env_pairs(&[("RUSTUP_HOME", "/fake/tester/.local/share/rustup")]);
     let overrides = tool_path_env_overrides(&env, home);
     assert_eq!(overrides.len(), 1);
     assert!(
@@ -10388,7 +10391,7 @@ fn tool_path_rustup_home_custom_yields_read_only_rule() {
 }
 
 fn relocated_cargo_dirs() -> Vec<ResolvedToolDir> {
-    let home = std::path::Path::new("/home/tester");
+    let home = std::path::Path::new("/fake/tester");
     let roots = cargo_root();
     [".cargo/bin", ".cargo/registry", ".cargo/git"]
         .iter()
@@ -10401,20 +10404,20 @@ fn profile_relocated_cargo_bin_is_exec_only_and_registry_is_write_only() {
     let dirs = relocated_cargo_dirs();
     let p = generate_profile(
         &SandboxConfig {
-            home_dir: std::path::Path::new("/home/tester"),
+            home_dir: std::path::Path::new("/fake/tester"),
             existing_home_tool_dirs: Some(&dirs),
             ..base_profile_options()
         },
         &[],
     );
-    let bin = "/home/tester/.local/share/cargo/bin";
-    let registry = "/home/tester/.local/share/cargo/registry";
+    let bin = "/fake/tester/.local/share/cargo/bin";
+    let registry = "/fake/tester/.local/share/cargo/registry";
     assert!(p.contains(&format!("(allow process-exec (subpath \"{bin}\"))")));
     assert!(!p.contains(&format!("(allow file-write* (subpath \"{bin}\"))")));
     assert!(p.contains(&format!("(allow file-write* (subpath \"{registry}\"))")));
     assert!(p.contains(&format!("(deny process-exec (subpath \"{registry}\"))")));
     // The default location is not granted when discovery relocated it.
-    assert!(!p.contains("/home/tester/.cargo/bin"));
+    assert!(!p.contains("/fake/tester/.cargo/bin"));
 }
 
 #[test]
@@ -10422,7 +10425,7 @@ fn landlock_relocated_cargo_bin_is_exec_only_and_registry_is_precreated() {
     let dirs = relocated_cargo_dirs();
     let ll = generate_policy(&SandboxConfig {
         project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/home/tester"),
+        home_dir: std::path::Path::new("/fake/tester"),
         extra_read: &[],
         extra_write: &[],
         extra_exec: &[],
@@ -10474,22 +10477,22 @@ fn landlock_relocated_cargo_bin_is_exec_only_and_registry_is_precreated() {
             .find(|r| r.path == std::path::Path::new(p))
             .unwrap_or_else(|| panic!("{p} should have a rule"))
     };
-    let bin = rule("/home/tester/.local/share/cargo/bin");
+    let bin = rule("/fake/tester/.local/share/cargo/bin");
     assert!(bin.access.execute && !bin.access.write);
-    let registry = rule("/home/tester/.local/share/cargo/registry");
+    let registry = rule("/fake/tester/.local/share/cargo/registry");
     assert!(registry.access.write);
     assert!(
         ll.precreate_dirs
-            .contains(&PathBuf::from("/home/tester/.local/share/cargo/registry"))
+            .contains(&PathBuf::from("/fake/tester/.local/share/cargo/registry"))
     );
     assert!(
         !ll.precreate_dirs
-            .contains(&PathBuf::from("/home/tester/.local/share/cargo/bin"))
+            .contains(&PathBuf::from("/fake/tester/.local/share/cargo/bin"))
     );
     assert!(
         !ll.fs_rules
             .iter()
-            .any(|r| r.path == std::path::Path::new("/home/tester/.cargo/bin"))
+            .any(|r| r.path == std::path::Path::new("/fake/tester/.cargo/bin"))
     );
 }
 
@@ -10501,7 +10504,7 @@ fn landlock_relocated_cargo_bin_is_exec_only_and_registry_is_precreated() {
 #[test]
 fn tool_override_home_dir_is_dropped() {
     // GOPATH=$HOME → granting write to the entire home dir defeats the sandbox.
-    let home = std::path::Path::new("/home/tester");
+    let home = std::path::Path::new("/fake/tester");
     assert!(
         !tool_override_path_is_safe(home, home),
         "an override resolving to HOME itself must be dropped"
@@ -10511,7 +10514,7 @@ fn tool_override_home_dir_is_dropped() {
 #[test]
 fn tool_override_filesystem_root_is_dropped() {
     // GOPATH=/ → granting the whole filesystem must be dropped.
-    let home = std::path::Path::new("/home/tester");
+    let home = std::path::Path::new("/fake/tester");
     assert!(
         !tool_override_path_is_safe(std::path::Path::new("/"), home),
         "an override resolving to / must be dropped"
@@ -10539,7 +10542,7 @@ fn tool_override_escaped_path_to_unsafe_root_is_dropped() {
     // join-to-HOME does NOT contain it once `..` collapses. The guard catches the
     // effective (canonicalized) grant. /tmp is an unsafe root everywhere; /etc is
     // one on Linux.
-    let home = std::path::Path::new("/home/tester");
+    let home = std::path::Path::new("/fake/tester");
     assert!(
         !tool_override_path_is_safe(std::path::Path::new("/tmp"), home),
         "an override resolving to /tmp must be dropped"
@@ -10555,13 +10558,13 @@ fn tool_override_escaped_path_to_unsafe_root_is_dropped() {
 fn tool_override_normal_custom_dir_is_kept() {
     // The feature must still work: a real custom tool dir that is neither a root
     // nor HOME/an ancestor stays granted — both outside and inside HOME.
-    let home = std::path::Path::new("/home/tester");
+    let home = std::path::Path::new("/fake/tester");
     assert!(
         tool_override_path_is_safe(std::path::Path::new("/opt/custom-gopath"), home),
         "a normal custom dir outside HOME must be granted"
     );
     assert!(
-        tool_override_path_is_safe(std::path::Path::new("/home/tester/go-alt"), home),
+        tool_override_path_is_safe(std::path::Path::new("/fake/tester/go-alt"), home),
         "a normal custom SUBdir of HOME must be granted"
     );
 }
@@ -10991,7 +10994,7 @@ fn repo_config_state_not_a_git_repo() {
 #[test]
 fn socket_masks_cover_the_escape_sockets() {
     let masks =
-        cplt::sandbox::socket_mask_paths(std::path::Path::new("/home/user"), 1000, None, false);
+        cplt::sandbox::socket_mask_paths(std::path::Path::new("/fake/user"), 1000, None, false);
     for expected in [
         "/run/user/1000/bus",          // D-Bus session bus -> systemd-run --user
         "/run/user/1000/systemd",      // systemd's private socket
@@ -11003,7 +11006,7 @@ fn socket_masks_cover_the_escape_sockets() {
         "/run/podman",
         // Docker Desktop for Linux's daemon (#279). Not under /run at all, so
         // a list keyed only on the runtime dirs left it connectable.
-        "/home/user/.docker/desktop/docker.sock",
+        "/fake/user/.docker/desktop/docker.sock",
     ] {
         assert!(
             masks.iter().any(|p| p == std::path::Path::new(expected)),
@@ -11029,7 +11032,7 @@ fn docker_socket_list_follows_the_home_dir() {
         "the Docker Desktop socket must be built from the configured home, got {paths:?}"
     );
     assert!(
-        !paths.iter().any(|p| p.starts_with("/home/user")),
+        !paths.iter().any(|p| p.starts_with("/fake/user")),
         "no home path may be hardcoded, got {paths:?}"
     );
 }
@@ -11037,9 +11040,9 @@ fn docker_socket_list_follows_the_home_dir() {
 #[test]
 fn allow_docker_lifts_only_the_container_masks() {
     let with_docker =
-        cplt::sandbox::socket_mask_paths(std::path::Path::new("/home/user"), 1000, None, true);
+        cplt::sandbox::socket_mask_paths(std::path::Path::new("/fake/user"), 1000, None, true);
     let docker_paths =
-        cplt::sandbox::linux_docker_socket_paths(std::path::Path::new("/home/user"), 1000, None);
+        cplt::sandbox::linux_docker_socket_paths(std::path::Path::new("/fake/user"), 1000, None);
 
     for p in &docker_paths {
         assert!(
@@ -11064,7 +11067,7 @@ fn allow_docker_lifts_only_the_container_masks() {
     }
     assert_eq!(
         with_docker.len() + docker_paths.len(),
-        cplt::sandbox::socket_mask_paths(std::path::Path::new("/home/user"), 1000, None, false)
+        cplt::sandbox::socket_mask_paths(std::path::Path::new("/fake/user"), 1000, None, false)
             .len(),
         "allow_docker must differ from the default set by exactly the container sockets"
     );
@@ -11081,7 +11084,7 @@ fn socket_masks_follow_a_relocated_xdg_runtime_dir() {
     // banner still counting the escape sockets as masked.
     let xdg = std::path::Path::new("/run/somewhere-else/1000");
     let masks = cplt::sandbox::socket_mask_paths(
-        std::path::Path::new("/home/user"),
+        std::path::Path::new("/fake/user"),
         1000,
         Some(xdg),
         false,
@@ -11112,7 +11115,7 @@ fn relative_xdg_runtime_dir_is_ignored() {
     // Same rule as `AppDirKind::resolve`: a relative value would produce a
     // relative mask path, which resolves against the process cwd.
     let masks = cplt::sandbox::socket_mask_paths(
-        std::path::Path::new("/home/user"),
+        std::path::Path::new("/fake/user"),
         1000,
         Some(std::path::Path::new("relative/dir")),
         false,
@@ -11125,7 +11128,7 @@ fn relative_xdg_runtime_dir_is_ignored() {
     );
     assert_eq!(
         masks.len(),
-        cplt::sandbox::socket_mask_paths(std::path::Path::new("/home/user"), 1000, None, false)
+        cplt::sandbox::socket_mask_paths(std::path::Path::new("/fake/user"), 1000, None, false)
             .len(),
         "a rejected value must leave the list exactly as it was"
     );
@@ -11136,7 +11139,7 @@ fn socket_masks_follow_the_uid() {
     // The runtime-dir entries are per-user; a hardcoded uid would mask nothing
     // on any host but the developer's.
     let masks =
-        cplt::sandbox::socket_mask_paths(std::path::Path::new("/home/user"), 4242, None, false);
+        cplt::sandbox::socket_mask_paths(std::path::Path::new("/fake/user"), 4242, None, false);
     assert!(
         masks
             .iter()
