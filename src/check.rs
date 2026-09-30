@@ -676,8 +676,12 @@ impl<'a> ExecContext<'a> {
         named_roots: &[&Path],
     ) -> Self {
         let real_git = crate::git::trusted_git();
+        // As the launch decides it: the remote is asked only when the policy
+        // needs its default branch.
+        let ask_remote =
+            resolved.git_guard.enabled && resolved.git_guard.protect_default_branch_only;
         let repo_facts = real_git
-            .map(|git| crate::gh_proxy::capture_repo_facts(git, project_dir))
+            .map(|git| crate::gh_proxy::capture_repo_facts_at_launch(git, project_dir, ask_remote))
             .unwrap_or_default();
         // `repos_match`, not `contains`: the launch dedups case-insensitively
         // and ignoring a `.git` suffix, so holding an exact-match set here

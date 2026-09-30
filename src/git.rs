@@ -415,7 +415,14 @@ const VALUE_TAKING_GLOBALS: &[&str] = &[
 /// Everything not on this list is treated as content-reading and gated by
 /// [`repo_defines_content_filter`]. The list is an allowlist on purpose: adding
 /// a new subcommand fails closed rather than silently inheriting an exemption.
-const CONTENT_FREE_SUBCOMMANDS: &[&str] = &["rev-parse", "cat-file", "config", "remote"];
+const CONTENT_FREE_SUBCOMMANDS: &[&str] = &[
+    "rev-parse",
+    "cat-file",
+    "config",
+    "remote",
+    "ls-remote",
+    "symbolic-ref",
+];
 
 /// Inherited environment variables that would undo [`CONFIG_OVERRIDES`] or
 /// retarget the query, cleared from every parent-side invocation.

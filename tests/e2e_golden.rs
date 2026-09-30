@@ -529,6 +529,59 @@ fn golden_push_with_upstream_flag_succeeds_quietly() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A repository with no `refs/remotes/origin/HEAD` (`git init` + `git remote
+/// add`) refused every push until the operator ran set-head outside the
+/// sandbox (navikt/copilot#1348). The launch now asks the remote, so a
+/// feature branch pushes and the default branch is still refused.
+#[test]
+fn golden_missing_origin_head_is_asked_of_the_remote() {
+    require_launch!();
+    let home = make_config_home("golden-no-origin-head");
+    let (_tmp, work, origin) = bare_origin_repo(Path::new(env!("CARGO_MANIFEST_DIR")));
+    let run = |args: &[&str]| assert!(common::git_ok(&work, args), "git {args:?}");
+    run(&["push", "--quiet", "origin", "main"]);
+    run(&["checkout", "--quiet", "-b", "feature/no-head"]);
+    run(&["commit", "--quiet", "--allow-empty", "-m", "work"]);
+    assert!(
+        !common::git_ok(
+            &work,
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]
+        ),
+        "premise: no recorded origin/HEAD"
+    );
+
+    let allow = origin.to_string_lossy().into_owned();
+    let push = |branch: &str| {
+        let mut args = vec![
+            "--no-quiet",
+            "--yes",
+            "--no-validate",
+            "--allow-write",
+            &allow,
+        ];
+        args.extend_from_slice(&["exec", "--", "git", "push", "origin", branch]);
+        launch(&home, &work, &args)
+    };
+    let (_, stderr, status) = push("feature/no-head");
+    assert!(
+        !stderr.contains("could be captured at launch"),
+        "the remote's HEAD must have been captured:\n{stderr}"
+    );
+    assert!(
+        status.success(),
+        "a feature-branch push must work:\n{stderr}"
+    );
+    assert!(common::git_ok(
+        &origin,
+        &["rev-parse", "--verify", "refs/heads/feature/no-head"]
+    ));
+
+    let (_, stderr, status) = push("main");
+    common::assert_refused(&stderr, status.success(), "default branch");
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 // ════════════════════════════════════════════════════════════════════
 // Path 3 — every `config set` leaves a launchable config
 // ════════════════════════════════════════════════════════════════════
