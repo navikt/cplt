@@ -1275,19 +1275,32 @@ mod e2e_tests {
             stdout.contains("YARN_ENABLE_SCRIPTS=false"),
             "YARN_ENABLE_SCRIPTS should be injected.\nstdout: {stdout}"
         );
-        // pnpm 11+ and yarn 1 each read only their own variable.
-        for var in [
-            "pnpm_config_ignore_scripts=true",
-            "YARN_IGNORE_SCRIPTS=true",
-        ] {
-            assert!(
-                stdout.contains(var),
-                "{var} should be injected.\nstdout: {stdout}"
-            );
-        }
+        // pnpm 11+ reads only its own prefix.
+        assert!(
+            stdout.contains("pnpm_config_ignore_scripts=true"),
+            "pnpm_config_ignore_scripts should be injected.\nstdout: {stdout}"
+        );
         assert!(
             stdout.contains("GIT_TERMINAL_PROMPT=0"),
             "GIT_TERMINAL_PROMPT should be injected.\nstdout: {stdout}"
+        );
+    }
+
+    /// Launched in a yarn 1 project, the child gets yarn 1's own switch.
+    #[test]
+    fn e2e_env_yarn1_project_gets_yarn_ignore_scripts() {
+        require_sandbox!();
+        let (mut cmd, fake_dir) = cplt_cmd_with_fake_copilot();
+        std::fs::write(fake_dir.path().join("yarn.lock"), "# yarn lockfile v1\n").unwrap();
+        let output = cmd
+            .args(["--yes", "--no-validate", "--", "--version"])
+            .current_dir(fake_dir.path())
+            .output()
+            .expect("binary should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("YARN_IGNORE_SCRIPTS=true"),
+            "yarn 1 project should get YARN_IGNORE_SCRIPTS.\nstdout: {stdout}"
         );
     }
 

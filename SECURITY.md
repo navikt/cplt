@@ -998,7 +998,7 @@ Beyond sanitization, `cplt` injects hardening environment variables that disable
 |---|---|---|---|
 | `npm_config_ignore_scripts` | `true` | LifecycleScripts | Block npm and pnpm 10 postinstall hooks |
 | `pnpm_config_ignore_scripts` | `true` | LifecycleScripts | Block pnpm 11+ postinstall hooks (pnpm 11 stopped reading `npm_config_*`) |
-| `YARN_IGNORE_SCRIPTS` | `true` | LifecycleScripts | Block yarn 1 lifecycle scripts. Not set when the project root shows yarn 2+ (`.yarnrc.yml`, or `packageManager` naming yarn 2 or later): yarn 2+ rejects the setting and aborts |
+| `YARN_IGNORE_SCRIPTS` | `true` | LifecycleScripts | Block yarn 1 lifecycle scripts. Set only when the launch directory shows yarn 1 and not yarn 2+, since yarn 2+ rejects the setting and aborts. See [known impacts](docs/known-impacts.md#lifecycle-scripts-postinstall-hooks) |
 | `YARN_ENABLE_SCRIPTS` | `false` | LifecycleScripts | Block Yarn Berry lifecycle scripts |
 | `GIT_TERMINAL_PROMPT` | `0` | GitHardening | Prevent git credential prompts |
 | `GIT_CONFIG_COUNT` | `2` | GitSigning | Number of git config overrides |

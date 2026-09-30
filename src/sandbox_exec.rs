@@ -156,7 +156,7 @@ fn configure_command(
 
     // After the filtered env, so a parent `YARN_IGNORE_SCRIPTS=false` that the
     // `YARN_` prefix let through is replaced, as the hardening vars are.
-    if super::env::yarn1_ignore_scripts(project_dir, extra_pass_env, disabled_categories) {
+    if super::env::yarn1_ignore_scripts(launch_dir, extra_pass_env, disabled_categories) {
         cmd.env("YARN_IGNORE_SCRIPTS", "true");
     }
 
