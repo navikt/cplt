@@ -934,6 +934,34 @@ Two set-ups keep some execute, and the launch warns about each instead of stayin
 
 It has no effect on macOS, where the profile is unchanged and the launch warns that the key was ignored. The trace was done on Linux only.
 
+## Other keys
+
+Keys not covered in a section above. `cplt config explain <key>` prints the same facts for the version you have installed. Keys marked ⚠️ weaken the sandbox when turned on, and `config set` asks for `--force` to do it. `git_guard.allow_push` is the exception: `config set` cannot write it at all, so you add it in the config file.
+
+| Key | Default | What it does |
+|---|---|---|
+| `sandbox.allow_env_files` | `false` | Lets the agent read, write and delete `.env*`, `.pem` and `.key` files in the project. See [known impacts](known-impacts.md). |
+| `sandbox.allow_lifecycle_scripts` ⚠️ | `false` | Lets npm, yarn and pnpm run lifecycle scripts (`postinstall`, `prepare` and so on). |
+| `sandbox.allow_tmp_exec` ⚠️ | `false` | Allows executing binaries from `/tmp` and `/var/folders`. The per-session scratch directory usually covers the same need. |
+| `sandbox.allow_gpg_signing` ⚠️ | `false` | Allows GPG commit and tag signing: read-only access to the public keyring and the GPG agent socket. Private keys stay denied. See [GPG commit signing](known-impacts.md#gpg-commit-signing). |
+| `sandbox.allow_browser` ⚠️ | `false` | macOS Launch Services grant, for OAuth sign-in flows. With it on, the agent can start any application outside the sandbox, and the grant cannot be scoped. See [security](security.md#--allow-browser-is-a-sandbox-escape-and-cannot-be-scoped). |
+| `sandbox.deny_clipboard` | `true` | Denies the macOS clipboard, so `pbpaste` cannot read what you last copied. `--allow-clipboard` lifts it for one run. No effect on Linux. |
+| `allow.socket` | `[]` | Unix socket paths the agent may connect to. Whatever listens on the socket runs outside the sandbox. On Linux it does nothing below kernel 7.1. |
+| `proxy.allow_private_domains` | `[]` | Domains allowed to resolve to private or internal IP addresses, a waiver of the DNS-rebinding guard for intranet services. A name covers its subdomains. See [private-domain waiver](proxy.md#private-domain-waiver). |
+| `gh_guard.mode` | `block` | `block` refuses, `warn` prints a warning and runs the command, `audit` runs it and logs the decision. See [gh guard](gh-guard.md). |
+| `gh_guard.scope_check` | `true` | Refuses write commands aimed at another repository, for example with `-R`. |
+| `gh_guard.block_auth_token` | `true` | Refuses `gh auth token`, so the agent cannot print the token. |
+| `gh_guard.inject_token` ⚠️ | `false` | For Copilot only, and only while `gh_guard.enabled` is on: puts your `gh` token in the sandbox environment at launch, where every subprocess can read it. The token goes into `GH_TOKEN`, or the next of `GITHUB_TOKEN` and `COPILOT_GITHUB_TOKEN` that `deny.env` leaves in place. Skipped when the agent already has a token. |
+| `gh_guard.unknown_command` | `block` | What to do with a `gh` command the guard does not classify: `block` or `allow`. |
+| `gh_guard.allow_api_write` ⚠️ | `false` | Allows `gh api` writes (POST, PATCH, PUT and input flags), scope-checked to the current repository. |
+| `git_guard.enabled` | `true` | Intercepts `git push`, `request-pull` and `send-pack`. See [git guard](git-guard.md). |
+| `git_guard.prevent_push` | `true` | Treats those commands as violations; `git_guard.mode` decides what a violation costs. |
+| `git_guard.prevent_force_push` | `true` | Refuses force pushes on any branch, including feature branches under `protect_default_branch_only`. A `git_guard.allow_push` rule with `force = true` lets a matching force push through, and `git_guard.mode` `warn` or `audit` does not block. |
+| `git_guard.protect_default_branch_only` | `true` | Refuses only pushes to the default branch. `false` refuses every push, as `--preset strict` does. |
+| `git_guard.allow_push` ⚠️ | `[]` | Push exceptions, each a `[[git_guard.allow_push]]` block with `remote`, `branches` and `force`. `config set` cannot write an array of tables, so edit the config file. See [git guard](git-guard.md#configuration). |
+| `sandbox.gh_proxy` | `false` | Deprecated spelling of `gh_guard.enabled`. |
+| `sandbox.git_push_prevention` | `false` | Deprecated spelling of `git_guard.enabled`. |
+
 ## Configuration file
 
 The config file lives at `~/.config/cplt/config.toml`. `cplt config init` writes a commented starter template there. It covers `[proxy]`, `[proxy.subscriptions]`, `[allow]`, `[deny]`, `[sandbox]`, `[gh_guard]`, and `[git_guard]`, with every key commented out and documented inline, so a fresh file changes nothing until you uncomment something. Run it and read the result rather than copying a snippet from here, since the template is generated from `src/config/path.rs` and moves with the code:
