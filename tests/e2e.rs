@@ -2963,6 +2963,32 @@ mod e2e_tests {
             }
         }
 
+        // The `[allow] domains` inert hint reads the resolved allowlist too, so
+        // `strict` (which turns the allowlist on) must not call the list inert.
+        for (preset, inert) in [("strict", false), ("standard", true)] {
+            std::fs::write(
+                &config_file,
+                format!("[sandbox]\npreset = \"{preset}\"\n[allow]\ndomains = [\"example.com\"]\n"),
+            )
+            .unwrap();
+            let output = cplt_cmd()
+                .args(["config", "show"])
+                .env("CPLT_CONFIG", config_file.to_str().unwrap())
+                .env("NO_COLOR", "1")
+                .output()
+                .expect("should run");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let line = stdout
+                .lines()
+                .find(|l| l.contains("domains ") && l.contains("example.com"))
+                .unwrap_or_else(|| panic!("{preset}: no domains line: {stdout}"));
+            assert_eq!(
+                line.contains("no allowlist in force"),
+                inert,
+                "{preset}: {line}"
+            );
+        }
+
         // An explicit file value still wins over the preset, with no label.
         std::fs::write(
             &config_file,
