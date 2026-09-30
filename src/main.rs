@@ -2192,6 +2192,37 @@ fn write_granted_repos_without_exec(
 /// that does not run, with an error naming neither cplt nor the grant, and the
 /// session that reported it had `quiet = true`. Same reasoning as the
 /// trusted-binary warning above.
+/// Warn when a repository sits under a writable cache the macOS profile
+/// denies execute on (#675): its `node_modules/.bin` and build scripts fail
+/// with `Operation not permitted`, which names neither cplt nor the cache.
+fn warn_repo_under_no_exec_cache(
+    resolved: &config::Resolved,
+    home_dir: &Path,
+    project_dir: &Path,
+    named_roots: &[PathBuf],
+) {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    for root in std::iter::once(project_dir).chain(named_roots.iter().map(PathBuf::as_path)) {
+        if let Some(dir) = cplt::sandbox::no_exec_tool_dir_over(
+            root,
+            home_dir,
+            &resolved.allow_cache_exec,
+            resolved.allow_cache_exec_any,
+        ) {
+            ui::warn(&format!(
+                "{} is under {}, where the sandbox denies execute. Its own tools \
+                 (node_modules/.bin, build scripts, native addons) will fail with \
+                 `Operation not permitted`. Move the checkout out of {}.",
+                root.display(),
+                dir.display(),
+                dir.display()
+            ));
+        }
+    }
+}
+
 fn warn_write_granted_repos(
     resolved: &config::Resolved,
     project_dir: &Path,
@@ -4146,6 +4177,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
 
     warn_exec_tool_dir_shadowing(&resolved, &home_dir, active_agent);
     warn_write_granted_repos(&resolved, &project_dir, &repo_paths);
+    warn_repo_under_no_exec_cache(&resolved, &home_dir, &project_dir, &repo_paths);
     warn_inject_token_without_guard(&resolved);
 
     // Probe the host for everything the sandbox profile depends on.
@@ -5886,6 +5918,7 @@ fn run_exec_command(
     // effect this session cannot have (#343).
     warn_exec_tool_dir_shadowing(&resolved, &home_dir, active_agent);
     warn_write_granted_repos(&resolved, &project_dir, &repo_paths);
+    warn_repo_under_no_exec_cache(&resolved, &home_dir, &project_dir, &repo_paths);
     warn_inject_token_without_guard(&resolved);
 
     // Build the resolved Shell sandbox (discovery → proxy → prepare). Shared
@@ -6361,6 +6394,7 @@ fn run_check_command(
     // Shell, not `active_agent`: `check` probes under the Shell profile.
     warn_exec_tool_dir_shadowing(&resolved, &home_dir, agent::Agent::Shell);
     warn_write_granted_repos(&resolved, &project_dir, &repo_paths);
+    warn_repo_under_no_exec_cache(&resolved, &home_dir, &project_dir, &repo_paths);
 
     // check prints its own report; never prompt.
     resolved.yes = true;

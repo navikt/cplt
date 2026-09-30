@@ -2474,6 +2474,42 @@ pub fn copilot_ro_protect_paths(
     paths
 }
 
+/// The writable, non-executable `HOME_TOOL_DIRS` entry a project root sits
+/// under, if any (#675).
+///
+/// On macOS the tool-dir `(deny process-exec ...)` follows the project grant
+/// in the last-match-wins profile, so a checkout under `~/.cache` cannot run
+/// its own `node_modules/.bin`. Landlock grants are additive and the project
+/// rule carries execute, so Linux is unaffected and the caller only warns on
+/// macOS. Not fixed by re-granting execute: that makes part of a shared cache
+/// write+exec. `allow_cache_exec`, which only covers `~/Library/Caches`, is
+/// the one carve-out honoured here; the toolchain exec carve-outs inside
+/// `~/.gradle` and `~/.konan` are not, since no checkout lives there.
+pub fn no_exec_tool_dir_over(
+    root: &Path,
+    home: &Path,
+    allow_cache_exec: &[String],
+    allow_cache_exec_any: bool,
+) -> Option<PathBuf> {
+    let caches = home.join("Library/Caches");
+    if root.starts_with(&caches)
+        && (allow_cache_exec_any
+            || allow_cache_exec
+                .iter()
+                .any(|s| root.starts_with(caches.join(s))))
+    {
+        return None;
+    }
+    HOME_TOOL_DIRS
+        .iter()
+        .filter(|d| d.write && !d.process_exec)
+        .map(|d| home.join(d.path))
+        // The root is canonical; a symlinked `~/.cache` only matches by target.
+        .find(|dir| {
+            root.starts_with(dir) || std::fs::canonicalize(dir).is_ok_and(|t| root.starts_with(t))
+        })
+}
+
 /// Environment lookup for the Copilot cache resolver: `&|k| std::env::var_os(k)`
 /// in production, a fixed map in tests.
 pub type CacheEnv<'a> = dyn Fn(&str) -> Option<OsString> + 'a;
@@ -4151,6 +4187,45 @@ fn dedup(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn project_under_a_symlinked_cache_is_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let target = tmp.path().join("vol");
+        std::fs::create_dir_all(target.join("p")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::os::unix::fs::symlink(&target, home.join(".cache")).unwrap();
+        let root = std::fs::canonicalize(target.join("p")).unwrap();
+        assert_eq!(
+            no_exec_tool_dir_over(&root, &home, &[], false),
+            Some(home.join(".cache"))
+        );
+    }
+
+    #[test]
+    fn project_under_a_no_exec_cache_is_named() {
+        let home = Path::new("/Users/u");
+        let under = |p: &str, exec: &[&str], any: bool| {
+            let exec: Vec<String> = exec.iter().map(ToString::to_string).collect();
+            no_exec_tool_dir_over(&home.join(p), home, &exec, any)
+        };
+        assert_eq!(under(".cache/proj", &[], false), Some(home.join(".cache")));
+        assert_eq!(
+            under("Library/Caches/proj", &[], false),
+            Some(home.join("Library/Caches"))
+        );
+        assert_eq!(under("Library/Caches/proj", &["proj"], false), None);
+        assert_eq!(under("Library/Caches/proj", &[], true), None);
+        // allow_cache_exec is Library/Caches only; it does not cover ~/.cache.
+        assert_eq!(
+            under(".cache/proj", &["proj"], true),
+            Some(home.join(".cache"))
+        );
+        assert_eq!(under("src/proj", &[], false), None);
+        // Component match, not string prefix.
+        assert_eq!(under(".cachet/proj", &[], false), None);
+    }
+
     use super::*;
 
     /// #551 review: an allow path that reaches a credential through a link of
