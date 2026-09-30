@@ -1060,6 +1060,30 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
         return e;
     }
 
+    // npx fetches a package that is not in the project into `~/.npm/_npx` and
+    // runs it from there. `~/.npm` is writable and deliberately not executable
+    // (write-then-exec), so the run fails with `bad interpreter: Operation not
+    // permitted`, which names neither cplt nor the rule.
+    if base == "npx" || (base == "npm" && matches!(rest.first(), Some(&("exec" | "x")))) {
+        return ExecExplain {
+            decision: Decision::Allowed,
+            reason: "npx runs, but a package that is not installed in the project is \
+                     fetched into ~/.npm/_npx and run from there. ~/.npm is writable and \
+                     not executable (write-then-exec), so that fails with `bad \
+                     interpreter: Operation not permitted`."
+                .to_string(),
+            fix: Some(
+                "add the package to the project (`npm install -D <pkg>`), so npx runs it \
+                 from node_modules/.bin; or move npm's cache under the cache dir and allow \
+                 exec there: export npm_config_cache=\"$HOME/Library/Caches/npm\" \
+                 (~/.cache/npm on Linux), then `--pass-env npm_config_cache \
+                 --allow-cache-exec npm/_npx`. See docs/known-impacts.md#npx."
+                    .to_string(),
+            ),
+            objection: None,
+        };
+    }
+
     let mut reason = "not specifically gated. It runs inside the sandbox, subject to the \
                       filesystem, network, and env policy."
         .to_string();
@@ -1801,6 +1825,25 @@ mod tests {
         let e = explain_exec(&["docker".into(), "ps".into()], &ctx);
         assert_eq!(e.decision, Decision::Blocked);
         assert!(e.fix.as_deref().unwrap().contains("--allow-docker"));
+    }
+
+    #[test]
+    fn npx_names_the_cache_exec_rule_and_the_fix() {
+        let gh = GhGuardPolicy::default();
+        let git = GitGuardPolicy::default();
+        let ctx = exec_ctx(&gh, &git, false);
+        for argv in [
+            &["npx", "cowsay"][..],
+            &["npm", "exec", "cowsay"],
+            &["npm", "x"],
+        ] {
+            let argv: Vec<String> = argv.iter().map(|s| (*s).to_string()).collect();
+            let e = explain_exec(&argv, &ctx);
+            assert!(e.reason.contains("~/.npm/_npx"), "{argv:?}: {}", e.reason);
+            assert!(e.fix.as_deref().unwrap().contains("npm/_npx"), "{argv:?}");
+        }
+        let e = explain_exec(&["npm".into(), "install".into()], &ctx);
+        assert!(e.reason.starts_with("not specifically gated"));
     }
 
     #[test]
