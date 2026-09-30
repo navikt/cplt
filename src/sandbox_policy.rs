@@ -1421,7 +1421,15 @@ pub const HARDENING_ENV_VARS: &[HardeningEnvVar] = &[
         name: "npm_config_ignore_scripts",
         value: "true",
         category: HardeningCategory::LifecycleScripts,
-        description: "Block npm/pnpm postinstall hooks",
+        description: "Block npm and pnpm 10 postinstall hooks",
+    },
+    // pnpm 11+ reads only `pnpm_config_*` from the environment and ignores
+    // `npm_config_*`, so the entry above no longer reaches it.
+    HardeningEnvVar {
+        name: "pnpm_config_ignore_scripts",
+        value: "true",
+        category: HardeningCategory::LifecycleScripts,
+        description: "Block pnpm 11+ postinstall hooks",
     },
     HardeningEnvVar {
         name: "YARN_ENABLE_SCRIPTS",

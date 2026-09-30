@@ -5538,6 +5538,13 @@ fn env_sanitized_injects_hardening_vars() {
     assert!(npm.is_some(), "should inject npm_config_ignore_scripts");
     assert_eq!(npm.unwrap().1, "true");
 
+    // pnpm 11+ ignores npm_config_*; it needs its own prefix.
+    let pnpm = env
+        .vars
+        .iter()
+        .find(|(k, _)| k == "pnpm_config_ignore_scripts");
+    assert_eq!(pnpm.map(|(_, v)| v.as_str()), Some("true"));
+
     let yarn = env.vars.iter().find(|(k, _)| k == "YARN_ENABLE_SCRIPTS");
     assert!(yarn.is_some(), "should inject YARN_ENABLE_SCRIPTS");
     assert_eq!(yarn.unwrap().1, "false");
@@ -5797,6 +5804,12 @@ fn env_sanitized_lifecycle_opt_out_skips_npm_yarn() {
     assert!(
         !env.vars.iter().any(|(k, _)| k == "YARN_ENABLE_SCRIPTS"),
         "should not inject YARN_ENABLE_SCRIPTS when lifecycle scripts allowed"
+    );
+    assert!(
+        !env.vars
+            .iter()
+            .any(|(k, _)| k == "pnpm_config_ignore_scripts"),
+        "should not inject pnpm_config_ignore_scripts when lifecycle scripts allowed"
     );
     // Git hardening should still be active
     assert!(

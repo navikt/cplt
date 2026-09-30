@@ -208,7 +208,7 @@ error obtaining VCS status: exit status 128
 
 ## Lifecycle scripts (postinstall hooks)
 
-npm/yarn/pnpm lifecycle scripts are **blocked by default** via `npm_config_ignore_scripts=true` and `YARN_ENABLE_SCRIPTS=false`. This stops supply chain attacks through postinstall hooks, but it may break packages that need a post-install step:
+npm/yarn/pnpm lifecycle scripts are **blocked by default** via `npm_config_ignore_scripts=true` (npm, pnpm 10), `pnpm_config_ignore_scripts=true` (pnpm 11 and later, which no longer read `npm_config_*`) and `YARN_ENABLE_SCRIPTS=false`. This stops supply chain attacks through postinstall hooks, but it may break packages that need a post-install step:
 
 | Operation                        | Impact      | Why                                                            |
 | -------------------------------- | ----------- | -------------------------------------------------------------- |
