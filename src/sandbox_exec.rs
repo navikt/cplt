@@ -646,6 +646,8 @@ fn install_command_wrappers(
     // and *every* git through the wrapper dies with
     // "unable to load libxcrun ... (file system sandbox blocked open())" —
     // `git status`, `git log`, `git --version`, not just `git push`.
+    // Resolving past the shim (git.rs, #666) does not help there: the git it
+    // finds sits inside that same ungranted `Xcode.app`.
     //
     // Preferring PATH makes the guard run the same git the agent would have run
     // without it. That is the invariant that was broken: a guard decides
@@ -693,7 +695,7 @@ fn install_command_wrappers(
         if gh_guard.scope_check
             && let Some(real_git) = real_git.as_deref()
         {
-            match crate::gh_proxy::detect_current_repo(real_git, project_dir) {
+            match crate::gh_proxy::launch_repo(real_git, project_dir) {
                 Ok(repo) => repo_scope.push(repo),
                 Err(reason) => {
                     ui::warn(&format!(
@@ -727,7 +729,7 @@ fn install_command_wrappers(
                             // from the capture itself, so "no origin at all"
                             // and "an origin cplt cannot parse as a GitHub
                             // repository" do not read the same.
-                            let reason = crate::gh_proxy::detect_current_repo(real_git, dir)
+                            let reason = crate::gh_proxy::launch_repo(real_git, dir)
                                 .err()
                                 .unwrap_or_else(|| "no GitHub origin".to_string());
                             ui::warn(&format!(
@@ -796,13 +798,13 @@ fn install_command_wrappers(
         // A missing symref is asked of the remote only when the policy needs
         // the default branch (check.rs `for_launch` decides the same way).
         let ask_remote = git_guard.enabled && git_guard.protect_default_branch_only;
-        let mut repo_facts = crate::git::trusted_git()
-            .map(|git| crate::gh_proxy::capture_repo_facts_at_launch(git, project_dir, ask_remote))
+        let (mut repo_facts, has_remotes) = crate::git::trusted_git()
+            .map(|git| crate::gh_proxy::launch_repo_facts(git, project_dir, ask_remote))
             .unwrap_or_default();
         if let Some(git) = crate::git::trusted_git() {
             repo_facts.named = repo_dirs
                 .iter()
-                .map(|dir| crate::gh_proxy::capture_repo_facts_at_launch(git, dir, ask_remote))
+                .map(|dir| crate::gh_proxy::launch_repo_facts(git, dir, ask_remote).0)
                 .collect();
         }
         // Two conditions narrow this to the case the operator can act on.
@@ -822,8 +824,7 @@ fn install_command_wrappers(
                 .named
                 .iter()
                 .all(|n| n.default_branches.is_empty())
-            && crate::git::trusted_git()
-                .is_some_and(|git| crate::gh_proxy::has_remotes(git, project_dir))
+            && has_remotes
         {
             ui::warn(
                 "git guard: no remote's default branch could be captured at launch (no \

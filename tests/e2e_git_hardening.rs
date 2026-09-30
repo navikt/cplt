@@ -292,6 +292,65 @@ fn worktree_scope_content_filter_is_detected() {
     );
 }
 
+/// A `git` (or `xcrun`) planted on `PATH` never runs in the parent, now that
+/// macOS resolves past the xcrun shim once per process (#666). The committed
+/// `[deny]` path showing up in the profile proves the parent did run git: it
+/// is read with `git cat-file` from HEAD.
+#[test]
+fn a_git_planted_on_path_is_never_run_by_the_parent() {
+    let Some(f) = fixture() else {
+        eprintln!("skipping: git unavailable");
+        return;
+    };
+    std::fs::write(
+        f.repo.join(".cplt.toml"),
+        "[deny]\npaths = [\"planted-path-probe\"]\n",
+    )
+    .unwrap();
+    std::fs::remove_file(f.repo.join(".gitattributes")).unwrap();
+    assert!(git(&f.repo, &["add", "-A"]));
+    assert!(git(&f.repo, &["commit", "-qm", "deny"]));
+
+    let bin = f.repo.parent().unwrap().join("planted-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    for name in ["git", "xcrun"] {
+        let path = bin.join(name);
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\n: > '{}'\nexit 1\n", f.marker.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let out = common::cplt_cmd()
+        .arg("--print-profile")
+        .current_dir(&f.repo)
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("HOME", f.repo.parent().unwrap())
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+
+    assert!(
+        !f.marker.exists(),
+        "a git planted on PATH ran in the parent"
+    );
+    // macOS lists the deny path in the profile; Linux reports it on stderr
+    // when the path does not exist to be masked. Either way git ran.
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success() && output.contains("planted-path-probe"),
+        "the committed .cplt.toml was not read, so git never ran: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 // ── Git guard: a setting that cannot be honoured grants nothing (#215) ──
 //
 // Both properties below are instances of the "no silent grants" rule in

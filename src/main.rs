@@ -1751,17 +1751,16 @@ fn repo_summary_rows(project_dir: &Path, roots: &[RepoRoot]) -> Vec<config::Repo
     // describes a root downstream has to agree with the launch about whether
     // `gh` can target it, and the fallback string is not a fact to re-derive by
     // looking for a parenthesis.
-    let name_of =
-        |dir: &Path| match real_git.and_then(|git| gh_proxy::detect_current_repo(git, dir).ok()) {
-            Some(repo) => (repo, true),
-            None => (
-                format!(
-                    "{} (no GitHub origin)",
-                    dir.file_name().unwrap_or_default().to_string_lossy()
-                ),
-                false,
+    let name_of = |dir: &Path| match real_git.and_then(|git| gh_proxy::launch_repo(git, dir).ok()) {
+        Some(repo) => (repo, true),
+        None => (
+            format!(
+                "{} (no GitHub origin)",
+                dir.file_name().unwrap_or_default().to_string_lossy()
             ),
-        };
+            false,
+        ),
+    };
     let (launch_name, launch_github) = name_of(project_dir);
     let mut rows = vec![config::RepoSummaryRow {
         name: launch_name,
@@ -10036,6 +10035,11 @@ no longer apply"
 /// since the last commit — is silently not in effect. Says nothing when there is
 /// no `.cplt.toml` at all, or when the committed file is what the user sees.
 fn warn_repo_config_discrepancy(project_dir: &std::path::Path) {
+    // Every state this warns about has a working-tree file. Without one there
+    // is nothing to say, and asking git costs two spawns per launch (#666).
+    if !project_dir.join(repo_config::REPO_CONFIG_FILE).is_file() {
+        return;
+    }
     let state = repo_config::repo_config_state(project_dir);
     if matches!(
         state,

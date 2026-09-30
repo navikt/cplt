@@ -294,7 +294,7 @@ pub(crate) fn trusted_binary(name: &str) -> Option<PathBuf> {
 pub fn trusted_git() -> Option<&'static Path> {
     static GIT: OnceLock<Option<PathBuf>> = OnceLock::new();
     GIT.get_or_init(|| {
-        let found = trusted_binary("git");
+        let found = trusted_binary("git").map(past_xcrun_shim);
         if found.is_none() {
             crate::ui::warn(&format!(
                 "no git found in {} — parent-side git queries (audit, repo config \
@@ -308,6 +308,102 @@ pub fn trusted_git() -> Option<&'static Path> {
         found
     })
     .as_deref()
+}
+
+/// On macOS `/usr/bin/git` is not git: it is Apple's `xcrun` shim, which looks
+/// up the active developer directory and execs the git inside it on **every**
+/// call. That lookup costs about 8 ms per spawn, and a launch runs git a dozen
+/// times or more (#666).
+///
+/// So the shim is asked once, with `xcrun --find git`, which git it would run,
+/// and that binary is used directly. It is the same file the shim would exec,
+/// chosen by the same `xcode-select` / `DEVELOPER_DIR` inputs, so
+/// [`TRUSTED_BIN_DIRS`] still decides where git comes from: `/usr/bin` wins or
+/// loses exactly as before, and this only skips the hop inside it.
+///
+/// The answer is still checked, never taken on faith. xcrun's lookup cache
+/// lives under the user's temp dir, which the sandbox can write, but the shim
+/// reads that same cache on every call, so trusting it is no worse than
+/// before. `--no-cache` is not an option: with a full Xcode it runs
+/// `xcodebuild -find`, about 2 s per launch on a CI runner. `PATH` is pinned
+/// to `/usr/bin:/bin` because `xcrun --find` falls back to a `PATH` search for
+/// a tool the developer directory lacks. And the target must be an executable
+/// file that this process can neither write nor replace ([`shim_target`]), so
+/// a developer directory a user owns (a dragged-in `Xcode.app`) keeps the
+/// shim. Any failure keeps the shim too:
+/// slower, never less safe.
+#[cfg(target_os = "macos")]
+#[allow(clippy::disallowed_methods)] // /usr/bin/xcrun is absolute and SIP-protected
+fn past_xcrun_shim(git: PathBuf) -> PathBuf {
+    if git != Path::new("/usr/bin/git") {
+        return git;
+    }
+    let Ok(out) = Command::new("/usr/bin/xcrun")
+        .args(["--find", "git"])
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return git;
+    };
+    let target = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    out.status
+        .success()
+        .then(|| shim_target(&target))
+        .flatten()
+        .unwrap_or(git)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn past_xcrun_shim(git: PathBuf) -> PathBuf {
+    git
+}
+
+/// The resolved path of an absolute, executable `git` that this process cannot
+/// modify: neither the file nor the directory holding it is writable by us,
+/// and nothing on its path is ours to make writable.
+/// Anything the user can write, a sandboxed agent with a write grant there
+/// could too.
+///
+/// The checked path is the one returned, symlinks resolved: running the path
+/// xcrun printed would re-walk any link on it at every spawn, and a link that
+/// sits in a writable directory could be repointed after this check.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn shim_target(target: &Path) -> Option<PathBuf> {
+    if !target.is_absolute() || !is_executable_file(target) {
+        return None;
+    }
+    let real = std::fs::canonicalize(target).ok()?;
+    (real.file_name().is_some_and(|n| n == "git")
+        && !writable_by_us(&real)
+        && real.parent().is_some_and(|dir| !writable_by_us(dir))
+        && !real.ancestors().any(owned_by_us))
+    .then_some(real)
+}
+
+/// An owner can `chmod` a read-only file or directory back to writable, so
+/// nothing on the path to the target may belong to us.
+fn owned_by_us(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions.
+    std::fs::metadata(path).map_or(true, |m| m.uid() == unsafe { libc::geteuid() })
+}
+
+fn writable_by_us(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return true; // Cannot ask, so cannot vouch for it.
+    };
+    // SAFETY: `c_path` is a valid NUL-terminated C string that outlives the call.
+    unsafe {
+        libc::faccessat(
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            libc::W_OK,
+            libc::AT_EACCESS,
+        ) == 0
+    }
 }
 
 /// `-c key=value` overrides prepended to every parent-side git invocation.
@@ -727,10 +823,87 @@ mod tests {
             program.is_absolute(),
             "git must not be resolved through PATH: {program:?}"
         );
-        assert!(
-            TRUSTED_BIN_DIRS.iter().any(|d| program.starts_with(d)),
-            "{program:?} is outside TRUSTED_BIN_DIRS"
+        // The trusted-directory lookup picks the path; the only step after it
+        // is following macOS's xcrun shim to the git it runs.
+        let picked = trusted_binary("git").expect("command() resolved a git");
+        assert!(TRUSTED_BIN_DIRS.iter().any(|d| picked.starts_with(d)));
+        assert_eq!(program, past_xcrun_shim(picked));
+    }
+
+    /// The shim's answer is only used when nothing this process could write
+    /// sits on it: a `git` in a user-writable directory (where a sandboxed
+    /// agent with a write grant could plant one) is refused, as is anything
+    /// that is not an absolute path to an executable named `git`.
+    #[test]
+    fn shim_target_must_be_an_unwritable_absolute_git() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let planted = dir.path().join("git");
+        plant_executable(&planted);
+        assert_eq!(shim_target(&planted), None, "writable file accepted");
+        // Read-only file, writable directory: replaceable by a rename.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o555)).unwrap();
+        assert_eq!(shim_target(&planted), None, "writable dir accepted");
+        // Read-only directory too, but ours: we could chmod it back.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let owned = shim_target(&planted);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(owned, None, "owned read-only tree accepted");
+        assert_eq!(shim_target(Path::new("git")), None, "relative accepted");
+        assert_eq!(
+            shim_target(&dir.path().join("absent/git")),
+            None,
+            "missing file accepted"
         );
+        // A read-only executable with the wrong name is not git.
+        assert_eq!(shim_target(Path::new("/bin/sh")), None);
+
+        // Root can write anything, so nothing is acceptable to it.
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        // A root-owned system git is the case this exists to accept.
+        if let Some(git) = ["/usr/bin/git", "/bin/git"]
+            .into_iter()
+            .map(Path::new)
+            .find(|p| p.is_file())
+        {
+            let real = std::fs::canonicalize(git).unwrap();
+            assert_eq!(shim_target(git).as_ref(), Some(&real), "{git:?} refused");
+            // Reached through a link in a writable directory, the answer is the
+            // link's target: running the link would let it be repointed.
+            let link = tempfile::tempdir().expect("tempdir");
+            let link = link.path().join("git");
+            std::os::unix::fs::symlink(git, &link).unwrap();
+            assert_eq!(shim_target(&link), Some(real), "the link itself returned");
+        }
+    }
+
+    /// On macOS with the Command Line Tools installed, the resolved git is the
+    /// one behind the shim, and it passes the same check.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_resolves_past_the_xcrun_shim() {
+        let Some(git) = trusted_git() else { return };
+        let clt = "/Library/Developer/CommandLineTools/usr/bin/git";
+        #[allow(clippy::disallowed_methods)] // absolute, SIP-protected
+        let found = Command::new("/usr/bin/xcrun")
+            .args(["--find", "git"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .ok();
+        if trusted_binary("git").as_deref() != Some(Path::new("/usr/bin/git"))
+            || found.as_deref() != Some(clt)
+        {
+            return; // No shim, or it points at a developer dir other than the CLT.
+        }
+        assert_ne!(
+            git,
+            Path::new("/usr/bin/git"),
+            "still going through the shim"
+        );
+        assert_eq!(shim_target(git).as_deref(), Some(git), "{git:?}");
     }
 
     /// Spelled out independently of the const, like the override table above: a
