@@ -2736,6 +2736,11 @@ fn validate_created_playwright_socket_dir(path: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    // Fake homes live under /fake, not /home: /home is an automount on
+    // macOS, and every lookup of a missing name there costs tens of
+    // milliseconds. Policy generation resolves dozens of home paths per call,
+    // which made this module take minutes on the macOS CI runner.
+
     /// #551: without bubblewrap a credential linked into a grant is named at
     /// launch with its target and the grant; under bubblewrap only one the
     /// masks do not cover is, and with a reason that says so.
@@ -3018,7 +3023,7 @@ mod tests {
     /// whose data dir is `~/.local/share/opencode`.
     #[test]
     fn exec_grant_over_an_agent_data_dir_is_refused() {
-        let home = Path::new("/home/test");
+        let home = Path::new("/fake/test");
         let agent_dirs = [AgentDir {
             path: home.join(".local/share/opencode"),
             write: true,
@@ -3041,7 +3046,7 @@ mod tests {
 
     #[test]
     fn exec_grant_over_cypress_app_data_is_refused() {
-        let home = Path::new("/home/test");
+        let home = Path::new("/fake/test");
         let allow_cache_exec = ["Cypress".to_string()];
         let app_data = policy::cypress_app_data_dir_with_env(home, &policy::no_cache_env);
         let exec = [app_data
@@ -3349,7 +3354,7 @@ mod tests {
         let repo = tempfile::tempdir().expect("tempdir");
         let nested = repo.path().join("libs/model");
         std::fs::create_dir_all(nested.join(".git/hooks")).expect("nested hooks");
-        let home = Path::new("/home/test");
+        let home = Path::new("/fake/test");
         let config = test_config(home, &[]);
 
         let binds = super::ro_protect_paths(&config, &[], std::slice::from_ref(&nested));
@@ -3375,7 +3380,7 @@ mod tests {
     /// had forgotten writing. One predicate serves both now.
     #[test]
     fn a_grant_no_launch_can_honour_is_refused_by_one_predicate() {
-        let home = Path::new("/home/test");
+        let home = Path::new("/fake/test");
 
         for (key, path) in [
             ("allow.read", home.join(".netrc")),
@@ -3394,7 +3399,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn ro_protect_set_carries_the_copilot_package_dirs_for_copilot_only() {
-        let home = Path::new("/home/test");
+        let home = Path::new("/fake/test");
         let mut config = test_config(home, &[]);
         config.agent = Agent::Copilot;
         let paths = super::ro_protect_paths(&config, &[], &[]);
@@ -3991,7 +3996,7 @@ mod tests {
     #[test]
     fn ro_protect_set_carries_the_agent_config_dir_denies() {
         temp_env::with_var_unset("CLAUDE_CONFIG_DIR", || {
-            let home = Path::new("/home/test");
+            let home = Path::new("/fake/test");
             for (agent, dir) in [
                 (Agent::Claude, home.join(".claude")),
                 (Agent::Copilot, home.join(".copilot")),
@@ -4025,7 +4030,7 @@ mod tests {
     #[test]
     fn ro_protect_set_carries_the_exec_only_agent_dirs() {
         crate::with_env_lock_no_xdg(|| {
-            let home = Path::new("/home/test");
+            let home = Path::new("/fake/test");
             let agent_dirs = Agent::OpenCode.config_dirs(home);
             let mut config = test_config(home, &[]);
             config.agent = Agent::OpenCode;
@@ -4043,7 +4048,7 @@ mod tests {
     /// inside an otherwise read-only agent dir.
     #[test]
     fn exec_grant_over_a_writable_agent_file_is_refused() {
-        let home = Path::new("/home/test");
+        let home = Path::new("/fake/test");
         let agent_dirs = [AgentDir {
             path: home.join(".config/opencode"),
             write: false,
@@ -4066,7 +4071,7 @@ mod tests {
     /// update refs from inside the sandbox.
     #[test]
     fn exec_grant_over_the_git_common_dir_is_refused() {
-        let home = Path::new("/home/test");
+        let home = Path::new("/fake/test");
         let common = home.join("repo/.git");
         let exec = [home.join("repo")];
         let mut config = test_config(home, &[]);
@@ -4085,7 +4090,7 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn exec_grant_over_dev_shm_is_refused() {
-        let home = Path::new("/home/test");
+        let home = Path::new("/fake/test");
         let exec = [PathBuf::from("/dev/shm")];
         let mut config = test_config(home, &[]);
         config.existing_home_tool_dirs = Some(&[]);
@@ -4099,7 +4104,7 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn prepare_rejects_playwright_socket_capability_off_macos() {
-        let mut config = test_config(Path::new("/home/test"), &[]);
+        let mut config = test_config(Path::new("/fake/test"), &[]);
         config.playwright_socket_dir = Some(Path::new(
             "/private/tmp/cplt-pw-0123456789abcdef0123456789abcdef",
         ));
@@ -4116,7 +4121,7 @@ mod tests {
     /// [`validate_hard_denied_grants`]. Same answer on both backends (#207).
     #[test]
     fn prepare_rejects_a_grant_on_a_hard_denied_file() {
-        let home = Path::new("/home/test");
+        let home = Path::new("/fake/test");
         for &file in policy::DENIED_FILES {
             let granted = vec![home.join(file)];
 
@@ -4148,7 +4153,7 @@ mod tests {
     /// because that is the route that still works.
     #[test]
     fn prepare_rejects_a_grant_on_a_denied_dotfile_directory() {
-        let home = Path::new("/home/test");
+        let home = Path::new("/fake/test");
         for &dir in policy::DENIED_DOTFILES {
             let granted = vec![home.join(dir)];
 
@@ -4199,7 +4204,7 @@ mod tests {
     /// (navikt/copilot#858).
     #[test]
     fn prepare_accepts_a_grant_inside_a_denied_dotfile_directory() {
-        let home = Path::new("/home/test");
+        let home = Path::new("/fake/test");
         let granted = vec![
             home.join(".ssh/id_ed25519"),
             home.join(".ssh/known_hosts"),
@@ -4223,7 +4228,7 @@ mod tests {
     /// it would otherwise walk straight through a canonicalize-only check).
     #[test]
     fn prepare_rejects_a_grant_inside_the_cplt_state_directory() {
-        let home = Path::new("/home/test");
+        let home = Path::new("/fake/test");
         let state = home.join(policy::CPLT_STATE_DIR);
         for tail in ["", "trust", "local", "config.toml", "not/created/yet"] {
             let granted = vec![if tail.is_empty() {
@@ -4260,7 +4265,7 @@ mod tests {
     /// The subtree rule is cplt's own directory, not `~/.config` at large.
     #[test]
     fn a_grant_on_another_config_subdirectory_is_untouched() {
-        let home = Path::new("/home/test");
+        let home = Path::new("/fake/test");
         let granted = vec![home.join(".config/foo"), home.join(".config/cpltish")];
         let config = test_config(home, &granted);
         assert_eq!(validate_hard_denied_grants(&config), Ok(()));
@@ -4276,7 +4281,7 @@ mod tests {
         let granted = vec![dir.join("trust")];
 
         temp_env::with_var("CPLT_CONFIG", Some(dir.join("config.toml")), || {
-            let config = test_config(Path::new("/home/test"), &granted);
+            let config = test_config(Path::new("/fake/test"), &granted);
             let error = validate_hard_denied_grants(&config)
                 .expect_err("a grant in the relocated state dir must be refused");
             assert!(error.contains("state directory"), "{error}");
@@ -4621,8 +4626,8 @@ mod tests {
     /// `$HOME`'s ancestors go with it — granting `/home` reaches every user.
     #[test]
     fn prepare_refuses_an_unbounded_exec_grant() {
-        let home = Path::new("/home/test");
-        for wide in ["/", "/tmp", "/home/test"] {
+        let home = Path::new("/fake/test");
+        for wide in ["/", "/tmp", "/fake/test"] {
             let granted = vec![PathBuf::from(wide)];
             let mut config = test_config(home, &[]);
             config.extra_exec = &granted;
@@ -4652,7 +4657,7 @@ mod tests {
         #[cfg(not(target_os = "macos"))]
         let roots = ["/tmp"];
 
-        let home = Path::new("/home/test");
+        let home = Path::new("/fake/test");
         for root in roots {
             let exec = Path::new(root).join("build-xyz/bin");
             let exec_paths = vec![exec.clone()];
@@ -4706,18 +4711,18 @@ mod tests {
     /// bubblewrap. Refusing is the only answer both backends give alike.
     #[test]
     fn prepare_refuses_an_exec_grant_overlapping_a_writable_tree() {
-        let home = Path::new("/home/test");
+        let home = Path::new("/fake/test");
         let cases: [(&str, &str); 5] = [
             // exec inside the writable grant, and the reverse
-            ("/home/test/tools/bin", "/home/test/tools"),
-            ("/home/test/tools", "/home/test/tools/bin"),
+            ("/fake/test/tools/bin", "/fake/test/tools"),
+            ("/fake/test/tools", "/fake/test/tools/bin"),
             // the same tree granted twice
-            ("/home/test/tools", "/home/test/tools"),
+            ("/fake/test/tools", "/fake/test/tools"),
             // exec inside the project directory
             ("/project/vendor/bin", "/project"),
             // exec inside a writable HOME_TOOL_DIRS entry — the same write+exec
             // pair by another route; `--allow-cache-exec` is the way in there.
-            ("/home/test/.cache/ms-playwright", "/home/test/.cache"),
+            ("/fake/test/.cache/ms-playwright", "/fake/test/.cache"),
         ];
         for (exec, write) in cases {
             let exec_paths = vec![PathBuf::from(exec)];
@@ -4727,7 +4732,7 @@ mod tests {
             // "/project" is `test_config`'s project dir and `~/.cache` a
             // writable HOME_TOOL_DIRS entry; both are writable without any
             // `allow.write` at all.
-            if write != "/project" && !write.starts_with("/home/test/.cache") {
+            if write != "/project" && !write.starts_with("/fake/test/.cache") {
                 config.extra_write = &write_paths;
             }
 
@@ -4750,7 +4755,7 @@ mod tests {
     /// `~/.linuxbrew/bin/git` runnable.
     #[test]
     fn prepare_accepts_a_relocated_tool_prefix_exec_grant() {
-        let home = Path::new("/home/test");
+        let home = Path::new("/fake/test");
         let granted = vec![home.join(".linuxbrew")];
         let mut config = test_config(home, &[]);
         config.extra_exec = &granted;
@@ -4761,7 +4766,7 @@ mod tests {
     /// The overridable list keeps working: refusing these would be a regression.
     #[test]
     fn prepare_accepts_a_grant_on_an_overridable_credential_file() {
-        let home = Path::new("/home/test");
+        let home = Path::new("/fake/test");
         let granted: Vec<PathBuf> = policy::DENIED_HOME_SUBPATHS
             .iter()
             .map(|f| home.join(f))

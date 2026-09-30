@@ -2770,6 +2770,11 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
 
+    // Fake homes live under /fake, not /home: /home is an automount on
+    // macOS, and every lookup of a missing name there costs tens of
+    // milliseconds. Policy generation resolves dozens of home paths per call,
+    // which made this module take minutes on the macOS CI runner.
+
     /// A seccomp profile that refuses openat2 answers ENOSYS or, in older
     /// Docker profiles, EPERM. Both must name the cause.
     #[cfg(target_os = "linux")]
@@ -2882,8 +2887,8 @@ mod tests {
 
     #[test]
     fn project_dir_gets_full_access() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let config = test_config(&project, &home);
         let policy = generate_policy(&config);
 
@@ -2899,8 +2904,8 @@ mod tests {
 
     #[test]
     fn denied_dotfiles_not_in_ruleset() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let config = test_config(&project, &home);
         let policy = generate_policy(&config);
 
@@ -2919,8 +2924,8 @@ mod tests {
     /// invariant true for every other caller of `generate_policy`.
     #[test]
     fn a_granted_denied_dotfile_directory_stays_out_of_the_ruleset() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let granted: Vec<PathBuf> = policy::DENIED_DOTFILES
             .iter()
             .map(|d| home.join(d))
@@ -2955,8 +2960,8 @@ mod tests {
     /// to it on a first connection.
     #[test]
     fn a_granted_file_inside_a_denied_dotfile_directory_survives() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let key = vec![home.join(".ssh/id_ed25519")];
         let known_hosts = vec![home.join(".ssh/known_hosts")];
 
@@ -2985,8 +2990,8 @@ mod tests {
     /// dir stays out of the ruleset (covered by `denied_dotfiles_not_in_ruleset`).
     #[test]
     fn allow_docker_grants_docker_config_read_only() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let mut config = test_config(&project, &home);
         config.allow_docker = true;
         let policy = generate_policy(&config);
@@ -3009,7 +3014,7 @@ mod tests {
     /// write branch), and is mount-masked without it (#209).
     #[test]
     fn colima_profile_socket_granted_with_docker_and_masked_without() {
-        let project = PathBuf::from("/home/user/project");
+        let project = PathBuf::from("/fake/user/project");
         let home = tempfile::tempdir().unwrap();
         let colima_home = tempfile::tempdir().unwrap();
         let profile = colima_home.path().join("work");
@@ -3040,8 +3045,8 @@ mod tests {
     /// `~/.testcontainers.properties` is read-only under `--allow-docker` (#209).
     #[test]
     fn allow_docker_grants_testcontainers_properties_read_only() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let mut config = test_config(&project, &home);
         config.allow_docker = true;
         let policy = generate_policy(&config);
@@ -3060,7 +3065,7 @@ mod tests {
     /// Landlock would follow the link and grant the key (#209).
     #[test]
     fn testcontainers_properties_linked_into_ssh_is_not_granted() {
-        let project = PathBuf::from("/home/user/project");
+        let project = PathBuf::from("/fake/user/project");
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir(home.path().join(".ssh")).unwrap();
         std::fs::write(home.path().join(".ssh/id_ed25519"), "key").unwrap();
@@ -3084,8 +3089,8 @@ mod tests {
     /// and a refused connection.
     #[test]
     fn allow_docker_grants_the_desktop_socket_read_write() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let mut config = test_config(&project, &home);
         config.allow_docker = true;
         let policy = generate_policy(&config);
@@ -3112,8 +3117,8 @@ mod tests {
     /// bubblewrap mask list is what takes it away (see `socket_mask_paths`).
     #[test]
     fn docker_desktop_socket_absent_without_allow_docker() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let config = test_config(&project, &home);
         let policy = generate_policy(&config);
 
@@ -3133,8 +3138,8 @@ mod tests {
     /// grant exists to fix.
     #[test]
     fn exec_grant_carries_read_and_execute_but_not_write() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let granted = vec![home.join(".linuxbrew")];
 
         let mut config = test_config(&project, &home);
@@ -3169,8 +3174,8 @@ mod tests {
     /// still passed.
     #[test]
     fn denied_files_not_in_ruleset() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let granted: Vec<PathBuf> = policy::DENIED_FILES.iter().map(|f| home.join(f)).collect();
 
         let mut config = test_config(&project, &home);
@@ -3194,8 +3199,8 @@ mod tests {
     /// Filtering it here would be a regression, not a fix.
     #[test]
     fn denied_home_subpath_grant_survives() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let granted: Vec<PathBuf> = policy::DENIED_HOME_SUBPATHS
             .iter()
             .map(|f| home.join(f))
@@ -3223,8 +3228,8 @@ mod tests {
     /// macOS enforces these via literal SBPL deny rules (last-match-wins).
     #[test]
     fn denied_home_subpaths_not_enforceable_on_linux() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let config = test_config(&project, &home);
         let policy = generate_policy(&config);
 
@@ -3243,8 +3248,8 @@ mod tests {
 
     #[test]
     fn cache_exec_subdir_grants_execute_on_that_subdir() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let subdirs = vec!["ms-playwright".to_string()];
         let mut config = test_config(&project, &home);
         config.allow_cache_exec = &subdirs;
@@ -3275,11 +3280,11 @@ mod tests {
 
     #[test]
     fn cache_exec_base_ignores_xdg_cache_home() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let subdirs = vec!["Cypress".to_string()];
         // A hostile XDG_CACHE_HOME aimed at cplt's own config directory.
-        let env = |name: &str| (name == "XDG_CACHE_HOME").then(|| "/home/user/.config".into());
+        let env = |name: &str| (name == "XDG_CACHE_HOME").then(|| "/fake/user/.config".into());
 
         for any in [false, true] {
             let mut config = test_config(&project, &home);
@@ -3310,8 +3315,8 @@ mod tests {
 
     #[test]
     fn cache_exec_and_cypress_state_rules_are_opened_nofollow() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let subdirs = vec!["Cypress".to_string(), "ms-playwright".to_string()];
         let nofollow_paths = |policy: &LandlockPolicy| {
             let mut paths: Vec<_> = policy
@@ -3351,8 +3356,8 @@ mod tests {
 
     #[test]
     fn cache_exec_supports_nested_subdir() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let subdirs = vec!["ms-playwright/chromium-1217".to_string()];
         let mut config = test_config(&project, &home);
         config.allow_cache_exec = &subdirs;
@@ -3370,8 +3375,8 @@ mod tests {
 
     #[test]
     fn cache_exec_any_grants_execute_on_whole_cache() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let mut config = test_config(&project, &home);
         config.allow_cache_exec_any = true;
         let policy = generate_policy(&config);
@@ -3388,8 +3393,8 @@ mod tests {
 
     #[test]
     fn cache_exec_rejects_path_traversal() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         // A crafted subdir must not grant execute outside ~/.cache. On Linux the
         // kernel resolves `..` at open() time, so an unfiltered value like
         // "../../bin" would otherwise escape the cache dir.
@@ -3454,8 +3459,8 @@ mod tests {
 
     #[test]
     fn system_read_paths_are_readonly() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let config = test_config(&project, &home);
         let policy = generate_policy(&config);
 
@@ -3473,8 +3478,8 @@ mod tests {
 
     #[test]
     fn tool_dirs_have_read_and_execute() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let config = test_config(&project, &home);
         let policy = generate_policy(&config);
 
@@ -3497,8 +3502,8 @@ mod tests {
     /// needs read + execute in its own right.
     #[test]
     fn linuxbrew_prefix_is_readable_and_executable() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let policy = generate_policy(&test_config(&project, &home));
 
         let rule = policy
@@ -3513,8 +3518,8 @@ mod tests {
 
     #[test]
     fn home_tool_dirs_permissions_match() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let config = test_config(&project, &home);
         let policy = generate_policy(&config);
 
@@ -3541,8 +3546,8 @@ mod tests {
     /// nowhere else.
     #[test]
     fn map_exec_alone_does_not_grant_execute() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let policy = generate_policy(&test_config(&project, &home));
 
         for rel in [
@@ -3579,8 +3584,8 @@ mod tests {
     /// because it is not a `HOME_TOOL_DIRS` entry.
     #[test]
     fn exec_in_writable_trees_keep_execute() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let policy = generate_policy(&test_config(&project, &home));
 
         for entry in policy::EXEC_IN_WRITABLE {
@@ -3601,8 +3606,8 @@ mod tests {
     #[test]
     fn pnpm_home_is_not_writable_but_its_store_is() {
         crate::with_env_lock_no_xdg(|| {
-            let project = PathBuf::from("/home/user/project");
-            let home = PathBuf::from("/home/user");
+            let project = PathBuf::from("/fake/user/project");
+            let home = PathBuf::from("/fake/user");
             let policy = generate_policy(&test_config(&project, &home));
             let Some(data) = policy::AppDirKind::Data.resolve("", "", "pnpm", &home) else {
                 return;
@@ -3628,8 +3633,8 @@ mod tests {
     #[test]
     fn pnpm_self_management_storage_has_its_required_effective_permissions() {
         crate::with_env_lock_no_xdg(|| {
-            let project = PathBuf::from("/home/user/project");
-            let home = PathBuf::from("/home/user");
+            let project = PathBuf::from("/fake/user/project");
+            let home = PathBuf::from("/fake/user");
             let policy = generate_policy(&test_config(&project, &home));
             let effective_access = |path: &Path| {
                 policy
@@ -3668,8 +3673,8 @@ mod tests {
     /// `~/.bun/bin` and `~/.deno/bin` are covered by their parents losing write.
     #[test]
     fn bun_and_deno_roots_are_not_writable() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let policy = generate_policy(&test_config(&project, &home));
 
         for dir in [".bun", ".deno"] {
@@ -3695,9 +3700,9 @@ mod tests {
 
     #[test]
     fn scratch_dir_always_has_exec() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
-        let scratch = PathBuf::from("/home/user/.cache/cplt/tmp/session-1");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
+        let scratch = PathBuf::from("/fake/user/.cache/cplt/tmp/session-1");
 
         // Scratch dir should always have exec, regardless of allow_tmp_exec.
         // The scratch dir is the controlled alternative to /tmp for
@@ -3722,8 +3727,8 @@ mod tests {
 
     #[test]
     fn extra_read_paths_added() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let extra = vec![PathBuf::from("/mnt/data")];
         let mut config = test_config(&project, &home);
         config.extra_read = &extra;
@@ -3744,9 +3749,9 @@ mod tests {
     /// (#252). A refused path (here a hard-denied file) gets no rule at all.
     #[test]
     fn root_agents_md_is_read_only_file_rule() {
-        let project = PathBuf::from("/home/user/repo/apps/web");
-        let home = PathBuf::from("/home/user");
-        let file = PathBuf::from("/home/user/repo/AGENTS.md");
+        let project = PathBuf::from("/fake/user/repo/apps/web");
+        let home = PathBuf::from("/fake/user");
+        let file = PathBuf::from("/fake/user/repo/AGENTS.md");
         let mut config = test_config(&project, &home);
         config.root_agents_md = Some(&file);
         let policy = generate_policy(&config);
@@ -3762,7 +3767,7 @@ mod tests {
             !policy
                 .fs_rules
                 .iter()
-                .any(|r| r.path == Path::new("/home/user/repo")),
+                .any(|r| r.path == Path::new("/fake/user/repo")),
             "the repository root itself must not be granted"
         );
 
@@ -3787,8 +3792,8 @@ mod tests {
 
     #[test]
     fn extra_socket_paths_added() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let extra = vec![PathBuf::from("/var/run/custom.sock")];
         let mut config = test_config(&project, &home);
         config.extra_socket = &extra;
@@ -3807,8 +3812,8 @@ mod tests {
 
     #[test]
     fn extra_write_paths_added() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let extra = vec![PathBuf::from("/mnt/output")];
         let mut config = test_config(&project, &home);
         config.extra_write = &extra;
@@ -3825,8 +3830,8 @@ mod tests {
 
     #[test]
     fn proxy_port_added_to_net_rules() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let mut config = test_config(&project, &home);
         config.proxy_port = Some(8080);
         let policy = generate_policy(&config);
@@ -3838,8 +3843,8 @@ mod tests {
     fn default_path_seeds_443() {
         // Regression guard: with proxy_forced=false the default path must still
         // seed the 443 allowance exactly as before #53.
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let config = test_config(&project, &home);
         assert!(!config.proxy_forced);
         let policy = generate_policy(&config);
@@ -3852,8 +3857,8 @@ mod tests {
         // #53: with proxy_forced=true the ONLY allowed egress port must be the
         // proxy port — 443 must NOT be seeded, so direct HTTPS is kernel-denied
         // and all traffic is forced through the proxy.
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let mut config = test_config(&project, &home);
         config.proxy_forced = true;
         config.proxy_port = Some(8080);
@@ -3871,8 +3876,8 @@ mod tests {
         // Defensive fail-closed: proxy_forced with no proxy port is a
         // contradiction the orchestration prevents, but we must still produce a
         // deny (no 443) policy rather than silently re-adding 443.
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let mut config = test_config(&project, &home);
         config.proxy_forced = true;
         config.proxy_port = None;
@@ -3919,9 +3924,9 @@ mod tests {
         // The project dir and the scratch dir are write+exec by design. The
         // grant adds nothing there, so skipping it would break the guard
         // wrappers to close a hole that is open by construction.
-        let rules = vec![rule("/home/user/project", true, true)];
+        let rules = vec![rule("/fake/user/project", true, true)];
         assert!(
-            writable_non_exec_tree_over(&rules, Path::new("/home/user/project/target/debug/cplt"))
+            writable_non_exec_tree_over(&rules, Path::new("/fake/user/project/target/debug/cplt"))
                 .is_none()
         );
     }
@@ -3953,8 +3958,8 @@ mod tests {
         // `CARGO_TARGET_DIR=/tmp/...` — because `/tmp` is writable and not
         // executable, so the overlap check correctly skips the grant. That is
         // the check working, not the test breaking; build elsewhere.
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let policy = generate_policy(&test_config(&project, &home));
         let exe = std::env::current_exe().unwrap();
         assert!(
@@ -3975,8 +3980,8 @@ mod tests {
         // rule for the binary may be emitted at all.
         let exe = std::env::current_exe().unwrap();
         let writable = vec![exe.parent().unwrap().to_path_buf()];
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let mut config = test_config(&project, &home);
         config.extra_write = &writable;
         let policy = generate_policy(&config);
@@ -3997,7 +4002,7 @@ mod tests {
         // disarming the guard for anyone running cplt from their own checkout.
         let exe = std::env::current_exe().unwrap();
         let project = exe.parent().unwrap().to_path_buf();
-        let home = PathBuf::from("/home/user");
+        let home = PathBuf::from("/fake/user");
         let policy = generate_policy(&test_config(&project, &home));
         assert!(
             policy
@@ -4012,8 +4017,8 @@ mod tests {
     fn generate_policy_records_proxy_forced_flag() {
         // The proxy_forced flag must reach the policy so precompute() can
         // fail closed on kernels that can't enforce net restriction (#53).
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let mut config = test_config(&project, &home);
         config.proxy_forced = true;
         config.proxy_port = Some(8080);
@@ -4407,8 +4412,8 @@ mod tests {
 
     #[test]
     fn extra_ports_added_to_net_rules() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let ports = vec![443, 8443];
         let mut config = test_config(&project, &home);
         config.extra_ports = &ports;
@@ -4424,8 +4429,8 @@ mod tests {
         // on that port, outside the proxy's log and domain filtering. Under
         // proxy_forced the allowed set must be the proxy port alone. Same config
         // both ways, so only the gate can make this pass.
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let ports = vec![9999];
         let mut config = test_config(&project, &home);
         config.extra_ports = &ports;
@@ -4452,8 +4457,8 @@ mod tests {
 
     #[test]
     fn localhost_ports_in_net_rules() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let ports = vec![3000, 5173];
         let mut config = test_config(&project, &home);
         config.localhost_ports = &ports;
@@ -4466,8 +4471,8 @@ mod tests {
 
     #[test]
     fn allow_localhost_any_disables_net_connect_restriction() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let mut config = test_config(&project, &home);
         config.allow_localhost_any = true;
         let policy = generate_policy(&config);
@@ -4478,8 +4483,8 @@ mod tests {
 
     #[test]
     fn default_config_restricts_net_connect() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let config = test_config(&project, &home);
         let policy = generate_policy(&config);
 
@@ -4489,8 +4494,8 @@ mod tests {
 
     #[test]
     fn discovery_filtering_limits_home_tool_dirs() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let existing: Vec<policy::ResolvedToolDir> = policy::home_tool_dirs()
             .iter()
             .filter(|d| [".cargo/bin", ".cargo/registry", ".cargo/git", ".nvm"].contains(&d.path))
@@ -4520,8 +4525,8 @@ mod tests {
 
     #[test]
     fn gpg_signing_adds_specific_files() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let mut config = test_config(&project, &home);
         config.allow_gpg_signing = true;
         let policy = generate_policy(&config);
@@ -4719,8 +4724,8 @@ mod tests {
 
     #[test]
     fn gpg_signing_off_excludes_gnupg() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let config = test_config(&project, &home);
         let policy = generate_policy(&config);
 
@@ -4737,9 +4742,9 @@ mod tests {
 
     #[test]
     fn copilot_install_dir_gets_read_exec() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
-        let install_dir = PathBuf::from("/home/user/.cache/copilot/pkg");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
+        let install_dir = PathBuf::from("/fake/user/.cache/copilot/pkg");
         let mut config = test_config(&project, &home);
         config.copilot_install_dir = Some(&install_dir);
         let policy = generate_policy(&config);
@@ -4758,8 +4763,8 @@ mod tests {
     /// keeps the default as well.
     #[test]
     fn copilot_sea_cache_exec_rule_follows_the_cache_variables() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let env = |k: &str| match k {
             "XDG_CACHE_HOME" => Some("/srv/xdg".into()),
             "COPILOT_CACHE_HOME" => Some("/opt/copilot-cache".into()),
@@ -4769,7 +4774,7 @@ mod tests {
         config.copilot_cache_env = &env;
         let policy = generate_policy(&config);
         for path in [
-            "/home/user/.cache/copilot/pkg",
+            "/fake/user/.cache/copilot/pkg",
             "/srv/xdg/copilot/pkg",
             "/opt/copilot-cache/pkg",
         ] {
@@ -4848,8 +4853,8 @@ mod tests {
 
     #[test]
     fn tmp_no_exec_by_default() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let config = test_config(&project, &home);
         let policy = generate_policy(&config);
 
@@ -4868,8 +4873,8 @@ mod tests {
 
     #[test]
     fn jvm_attach_grants_tmp_exec_and_proc_read() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let mut config = test_config(&project, &home);
         config.allow_jvm_attach = true;
         let policy = generate_policy(&config);
@@ -4896,8 +4901,8 @@ mod tests {
 
     #[test]
     fn device_files_have_read_write() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let config = test_config(&project, &home);
         let policy = generate_policy(&config);
 
@@ -4915,8 +4920,8 @@ mod tests {
 
     #[test]
     fn proc_self_is_readonly() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let config = test_config(&project, &home);
         let policy = generate_policy(&config);
 
@@ -4932,8 +4937,8 @@ mod tests {
 
     #[test]
     fn describe_policy_includes_all_sections() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let mut config = test_config(&project, &home);
         config.proxy_port = Some(8080);
         let policy = generate_policy(&config);
@@ -4941,7 +4946,7 @@ mod tests {
 
         assert!(desc.contains("deny-by-default"));
         assert!(desc.contains("Full access"));
-        assert!(desc.contains("/home/user/project"));
+        assert!(desc.contains("/fake/user/project"));
         assert!(desc.contains("Read + execute"));
         assert!(desc.contains("Read only"));
         assert!(desc.contains("Network"));
@@ -4951,8 +4956,8 @@ mod tests {
 
     #[test]
     fn describe_policy_shows_unrestricted_when_localhost_any() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let mut config = test_config(&project, &home);
         config.allow_localhost_any = true;
         let policy = generate_policy(&config);
@@ -4975,8 +4980,8 @@ mod tests {
     #[test]
     fn home_config_files_are_readable() {
         crate::with_env_lock_no_xdg(|| {
-            let project = PathBuf::from("/home/user/project");
-            let home = PathBuf::from("/home/user");
+            let project = PathBuf::from("/fake/user/project");
+            let home = PathBuf::from("/fake/user");
             let config = test_config(&project, &home);
             let policy = generate_policy(&config);
 
@@ -5048,8 +5053,8 @@ mod tests {
 
     #[test]
     fn copilot_config_dir_is_writable_and_executable() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let agent_dirs = crate::agent::Agent::Copilot.config_dirs(&home);
         let mut config = test_config(&project, &home);
         config.agent_dirs = &agent_dirs;
@@ -5074,8 +5079,8 @@ mod tests {
     /// loses execute and keeps read and write; every other rule is unchanged.
     #[test]
     fn deny_copilot_dir_exec_drops_only_execute_on_dot_copilot() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         // No `~/.copilot` entry: reported, so a relocated dir is not silent.
         let mut claude_dirs = crate::agent::Agent::Claude.config_dirs(&home);
         assert!(!crate::agent::deny_copilot_dir_exec(
@@ -5137,8 +5142,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn copilot_dir_exec_residual_when_dot_copilot_links_into_an_exec_tree() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
 
         let plain = home.join(".copilot");
         let rules = copilot_rules_with_key(&project, &home, &plain, None);
@@ -5149,7 +5154,7 @@ mod tests {
         let w = copilot_dir_exec_residuals(&rules, &linked, None);
         assert_eq!(w.len(), 1, "{w:?}");
         assert!(w[0].contains("cannot take effect"), "{w:?}");
-        assert!(w[0].contains("inside /home/user/project,"), "{w:?}");
+        assert!(w[0].contains("inside /fake/user/project,"), "{w:?}");
     }
 
     /// #324 review: Copilot installed under `~/.copilot` keeps its install
@@ -5158,8 +5163,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn copilot_dir_exec_residual_when_copilot_is_installed_inside_it() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let copilot = home.join(".copilot");
         let install = copilot.join("install/bin");
 
@@ -5167,7 +5172,7 @@ mod tests {
         let w = copilot_dir_exec_residuals(&rules, &copilot, Some(&install));
         assert_eq!(w.len(), 1, "{w:?}");
         assert!(
-            w[0].contains("/home/user/.copilot/install/bin stays executable"),
+            w[0].contains("/fake/user/.copilot/install/bin stays executable"),
             "{w:?}"
         );
         assert!(w[0].contains("Copilot is installed there"), "{w:?}");
@@ -5176,8 +5181,8 @@ mod tests {
 
     #[test]
     fn copilot_dir_absent_for_non_copilot_agent() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let mut config = test_config(&project, &home);
         config.agent = crate::agent::Agent::OpenCode;
         let policy = generate_policy(&config);
@@ -5193,8 +5198,8 @@ mod tests {
 
     #[test]
     fn agent_dirs_added_to_policy() {
-        let project = PathBuf::from("/home/user/project");
-        let home = PathBuf::from("/home/user");
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
         let agent_dirs = vec![
             crate::agent::AgentDir {
                 path: home.join(".config/opencode"),
@@ -5311,8 +5316,8 @@ mod tests {
     #[test]
     fn app_dirs_included_when_existing_is_none() {
         crate::with_env_lock_no_xdg(|| {
-            let project = PathBuf::from("/home/user/project");
-            let home = PathBuf::from("/home/user");
+            let project = PathBuf::from("/fake/user/project");
+            let home = PathBuf::from("/fake/user");
             let config = test_config(&project, &home);
             let policy = generate_policy(&config);
 
@@ -5335,8 +5340,8 @@ mod tests {
     #[test]
     fn app_dirs_excluded_when_no_match() {
         crate::with_env_lock_no_xdg(|| {
-            let project = PathBuf::from("/home/user/project");
-            let home = PathBuf::from("/home/user");
+            let project = PathBuf::from("/fake/user/project");
+            let home = PathBuf::from("/fake/user");
             let mut config = test_config(&project, &home);
             let nonexistent = vec!["/nonexistent".to_string()];
             config.existing_app_dirs = Some(&nonexistent);
@@ -5373,8 +5378,8 @@ mod tests {
     #[test]
     fn app_dir_fsaccess_flags_match_permissions() {
         crate::with_env_lock_no_xdg(|| {
-            let project = PathBuf::from("/home/user/project");
-            let home = PathBuf::from("/home/user");
+            let project = PathBuf::from("/fake/user/project");
+            let home = PathBuf::from("/fake/user");
             let config = test_config(&project, &home);
             let policy = generate_policy(&config);
 
@@ -5464,7 +5469,7 @@ mod tests {
                     (r || rule.access.read, w || rule.access.write)
                 })
         };
-        // A real, empty home: a fake /home/user is an automount on macOS, and
+        // A real, empty home: a fake /fake/user is an automount on macOS, and
         // lookups there can fail in ways a missing file does not. Not under
         // /tmp: the policy grants /tmp read+write, which covers the dir.
         let tmp = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
@@ -5556,8 +5561,8 @@ mod tests {
     #[test]
     fn app_dir_effective_permissions_include_parent_rules() {
         crate::with_env_lock_no_xdg(|| {
-            let project = PathBuf::from("/home/user/project");
-            let home = PathBuf::from("/home/user");
+            let project = PathBuf::from("/fake/user/project");
+            let home = PathBuf::from("/fake/user");
             let config = test_config(&project, &home);
             let policy = generate_policy(&config);
 
