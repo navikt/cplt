@@ -176,7 +176,7 @@ Tools such as VS Code agent mode rely mainly on UI permissions. cplt enforces it
 | DNS rebinding protection | ✅ Post-DNS IP checked against private ranges | ❌ Not implemented |
 | Network proxy | HTTP CONNECT + domain allow/block | HTTP + SOCKS5 + experimental TLS MITM |
 | SSH git | No key: agent socket denied at kernel on macOS, on Linux only `SSH_AUTH_SOCK` is withheld. The transport is not blocked, `ssh.github.com:443` is reachable | Proxied via SOCKS5 |
-| Package manager scripts | Blocked by default (`npm_config_ignore_scripts`, `pnpm_config_ignore_scripts`, `YARN_ENABLE_SCRIPTS`) | Not blocked |
+| Package manager scripts | Blocked by default (`npm_config_ignore_scripts`, `pnpm_config_ignore_scripts`, `YARN_IGNORE_SCRIPTS`, `YARN_ENABLE_SCRIPTS`). Yarn 2+ still runs the project's own scripts | Not blocked |
 | Agent support | Copilot, OpenCode, Gemini, Antigravity, Pi, Claude Code, goose, DSH, Shell | Claude Code |
 | Config | TOML (global + per-repo) | JSON (global only) + `--control-fd` live updates |
 | Library API | ❌ Binary only | ✅ Embeddable TypeScript library |

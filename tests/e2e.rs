@@ -1275,6 +1275,16 @@ mod e2e_tests {
             stdout.contains("YARN_ENABLE_SCRIPTS=false"),
             "YARN_ENABLE_SCRIPTS should be injected.\nstdout: {stdout}"
         );
+        // pnpm 11+ and yarn 1 each read only their own variable.
+        for var in [
+            "pnpm_config_ignore_scripts=true",
+            "YARN_IGNORE_SCRIPTS=true",
+        ] {
+            assert!(
+                stdout.contains(var),
+                "{var} should be injected.\nstdout: {stdout}"
+            );
+        }
         assert!(
             stdout.contains("GIT_TERMINAL_PROMPT=0"),
             "GIT_TERMINAL_PROMPT should be injected.\nstdout: {stdout}"
@@ -1294,6 +1304,12 @@ mod e2e_tests {
             !stdout.contains("YARN_ENABLE_SCRIPTS=false"),
             "--allow-lifecycle-scripts should remove yarn hardening.\nstdout: {stdout}"
         );
+        for var in ["pnpm_config_ignore_scripts", "YARN_IGNORE_SCRIPTS"] {
+            assert!(
+                !stdout.contains(var),
+                "{var} should be gone.\nstdout: {stdout}"
+            );
+        }
         // Git hardening should remain — it's a separate category
         assert!(
             stdout.contains("GIT_TERMINAL_PROMPT=0"),

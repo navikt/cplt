@@ -154,6 +154,12 @@ fn configure_command(
         }
     }
 
+    // After the filtered env, so a parent `YARN_IGNORE_SCRIPTS=false` that the
+    // `YARN_` prefix let through is replaced, as the hardening vars are.
+    if super::env::yarn1_ignore_scripts(project_dir, extra_pass_env, disabled_categories) {
+        cmd.env("YARN_IGNORE_SCRIPTS", "true");
+    }
+
     // The cplt PATH shim dir (#514) stays outside: in here the agent's own
     // name must resolve to the real binary, not to a shim that would start
     // cplt again. A PATH without the dir is left exactly as it was.

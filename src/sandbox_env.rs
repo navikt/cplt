@@ -327,6 +327,36 @@ pub fn build_sandbox_env(
     env
 }
 
+/// Whether to set `YARN_IGNORE_SCRIPTS=true`, yarn 1's only environment switch
+/// for `ignore-scripts` (it ignores `npm_config_ignore_scripts` and
+/// `YARN_ENABLE_SCRIPTS`).
+///
+/// Not in `HARDENING_ENV_VARS`: yarn 2+ rejects it as an unknown setting and
+/// aborts every command, so it is left out for a project that shows yarn 2+
+/// (`.yarnrc.yml`, or `packageManager` naming yarn 2 or later). yarn 2+ reads
+/// `YARN_ENABLE_SCRIPTS` instead.
+///
+/// ponytail: only the project root is looked at. A yarn 2+ project nested
+/// below a yarn 1 or yarn-less root still gets the variable and fails with
+/// "Unrecognized or legacy configuration settings found: ignoreScripts".
+pub fn yarn1_ignore_scripts(
+    project_dir: &Path,
+    extra_pass_env: &[String],
+    disabled_categories: &[HardeningCategory],
+) -> bool {
+    if disabled_categories.contains(&HardeningCategory::LifecycleScripts)
+        || extra_pass_env.iter().any(|v| v == "YARN_IGNORE_SCRIPTS")
+        || project_dir.join(".yarnrc.yml").exists()
+    {
+        return false;
+    }
+    let package_manager = std::fs::read_to_string(project_dir.join("package.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("packageManager")?.as_str().map(str::to_owned));
+    !package_manager.is_some_and(|pm| pm.starts_with("yarn@") && !pm.starts_with("yarn@1."))
+}
+
 /// Whether the user explicitly re-allowed `$HOME/.npmrc` via `--allow-read` / `allow.read`.
 ///
 /// Both entry points canonicalize before the path reaches `extra_read`
@@ -578,5 +608,42 @@ mod tests {
             "the default is unchanged: {:?}",
             not_asked.remove
         );
+    }
+
+    /// yarn 1 reads `ignore-scripts` only from `YARN_IGNORE_SCRIPTS`; yarn 2+
+    /// aborts on it, so a project that shows yarn 2+ must not get it.
+    #[test]
+    fn yarn1_ignore_scripts_skips_yarn2_projects_and_opt_outs() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        let on = |p: &Path| yarn1_ignore_scripts(p, &[], &[]);
+        assert!(on(p), "no package.json");
+        let pkg = |pm: &str| {
+            std::fs::write(
+                p.join("package.json"),
+                format!(r#"{{"packageManager":"{pm}"}}"#),
+            )
+            .unwrap();
+        };
+        pkg("yarn@1.22.22");
+        assert!(on(p), "yarn 1");
+        pkg("pnpm@10.0.0");
+        assert!(on(p), "not yarn");
+        pkg("yarn@4.9.2");
+        assert!(!on(p), "yarn 4");
+        pkg("yarn@1.22.22");
+        std::fs::write(p.join(".yarnrc.yml"), "").unwrap();
+        assert!(!on(p), ".yarnrc.yml");
+        std::fs::remove_file(p.join(".yarnrc.yml")).unwrap();
+        assert!(!yarn1_ignore_scripts(
+            p,
+            &[],
+            &[HardeningCategory::LifecycleScripts]
+        ));
+        assert!(!yarn1_ignore_scripts(
+            p,
+            &["YARN_IGNORE_SCRIPTS".into()],
+            &[]
+        ));
     }
 }
