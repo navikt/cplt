@@ -2918,7 +2918,15 @@ mod macos_tests {
     #[test]
     fn temporary_home_copilot_pkg_maps_native_code_without_opening_temp_exec() {
         require_sandbox!();
-        let (_dir, home, project) = copilot_cache_fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let home = fs::canonicalize(dir.path()).unwrap();
+        assert!(
+            home.starts_with("/private/var/folders") || home.starts_with("/private/tmp"),
+            "test HOME must be under a macOS temp exec deny: {}",
+            home.display()
+        );
+        let project = home.join("project");
+        fs::create_dir_all(&project).unwrap();
         let pkg = home.join("Library/Caches/copilot/pkg");
         let other = home.join("Library/Caches/other");
         fs::create_dir_all(&pkg).unwrap();
@@ -2947,6 +2955,14 @@ mod macos_tests {
         };
         let allowed = run(&cache_addon);
         let blocked = run(&temp_addon);
+        let written = run_sandboxed(
+            &profile,
+            &format!(
+                "touch '{}' 2>&1; echo EXIT:$?",
+                pkg.join("planted").display()
+            ),
+        )
+        .0;
         fs::remove_file(profile).ok();
         assert!(
             allowed.0 && allowed.1.contains("cplt"),
@@ -2955,6 +2971,37 @@ mod macos_tests {
         assert!(
             !blocked.0 && !blocked.1.contains("cplt "),
             "the rest of temporary HOME must remain non-executable: {blocked:?}"
+        );
+        assert!(
+            written.contains("EXIT:1") && !pkg.join("planted").exists(),
+            "the executable cache must remain read-only: {written}"
+        );
+    }
+
+    #[test]
+    fn temp_root_home_and_similar_prefix_get_only_the_intended_carve_out() {
+        let project = Path::new("/projects/app");
+        let profile_for =
+            |home: &str| generate_profile(&default_opts(project, Path::new(home)), &[]);
+        for home in ["/private/tmp", "/private/var/folders"] {
+            let profile = profile_for(home);
+            let pkg = format!("{home}/Library/Caches/copilot/pkg");
+            let temp_deny = profile
+                .find("(deny file-map-executable (subpath \"/private/var/folders\"))")
+                .unwrap();
+            let allow = profile
+                .rfind(&format!("(allow file-map-executable (subpath \"{pkg}\"))"))
+                .unwrap();
+            assert!(
+                temp_deny < allow,
+                "{home} must restore Copilot cache exec after temp deny"
+            );
+        }
+        let unrelated = profile_for("/private/tmp-not-a-root");
+        assert_eq!(
+            unrelated.matches("(allow file-map-executable (subpath \"/private/tmp-not-a-root/Library/Caches/copilot/pkg\"))").count(),
+            1,
+            "similar prefixes must not get the post-temp carve-out"
         );
     }
 

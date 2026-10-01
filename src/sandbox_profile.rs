@@ -178,16 +178,10 @@ pub fn generate_profile_with_playwright_socket_dir(
     // A temporary HOME puts Copilot's extracted SEA cache under /var/folders.
     // Restore exec only for its pinned, write-denied pkg tree after the broad
     // temp deny; the existing user-deny and write-deny rules still follow.
-    let home_path = config.home_dir.to_string_lossy();
     if config.agent.needs_copilot_dir()
-        && [
-            "/private/tmp/",
-            "/private/var/folders/",
-            "/tmp/",
-            "/var/folders/",
-        ]
-        .iter()
-        .any(|prefix| home_path.starts_with(prefix))
+        && ["/private/tmp", "/private/var/folders"]
+            .iter()
+            .any(|root| config.home_dir.starts_with(root))
     {
         for pkg in copilot_default_pkg_spellings(config.home_dir) {
             emit_copilot_pkg_exec(&mut sb, &pkg);
