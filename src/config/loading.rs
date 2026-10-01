@@ -1540,9 +1540,11 @@ impl Resolved {
             );
         }
         eprintln!("{blue}[cplt]{nc}  {dim}Full profile:{nc}   cplt --print-profile");
-        eprintln!(
-            "{blue}[cplt]{nc}  {yellow}Tip:{nc}            {dim}use --quiet, or cplt config set sandbox.quiet true{nc}"
-        );
+        if quiet_tip_due(home_dir) {
+            eprintln!(
+                "{blue}[cplt]{nc}  {yellow}Tip:{nc}            {dim}use --quiet, or cplt config set sandbox.quiet true{nc}"
+            );
+        }
         eprintln!("{blue}[cplt]{nc} ──────────────────────────────────────────────────────");
     }
 
@@ -1832,10 +1834,50 @@ fn resolve_repo_allow_path(path_str: &str, config_dir: &Path, key: &str) -> Opti
     Some(resolved)
 }
 
+/// Launches that still show the `--quiet` tip (#666).
+const QUIET_TIP_LAUNCHES: u32 = 3;
+
+/// True for the first [`QUIET_TIP_LAUNCHES`] summaries, counted in cplt's state
+/// directory next to the Copilot extraction verdict. That directory is
+/// sandbox-denied, so the agent cannot reset or silence the count. A read or
+/// write failure shows the tip: it is advice, and a missing file is a new user.
+fn quiet_tip_due(home: &Path) -> bool {
+    let file = home
+        .join(crate::sandbox::CPLT_STATE_DIR)
+        .join("quiet-tip-shown");
+    let shown: u32 = std::fs::read_to_string(&file)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    if shown >= QUIET_TIP_LAUNCHES {
+        return false;
+    }
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&file, (shown + 1).to_string());
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::types::{FeatureToggle, Preset};
     use super::*;
+
+    #[test]
+    fn quiet_tip_shows_on_the_first_launches_only() {
+        let home = tempfile::tempdir().unwrap();
+        for _ in 0..QUIET_TIP_LAUNCHES {
+            assert!(quiet_tip_due(home.path()));
+        }
+        assert!(!quiet_tip_due(home.path()));
+        // The count lives in the sandbox-denied state dir, not a cache.
+        let file = home
+            .path()
+            .join(crate::sandbox::CPLT_STATE_DIR)
+            .join("quiet-tip-shown");
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "3");
+    }
 
     #[test]
     fn default_config_is_valid_toml() {

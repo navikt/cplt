@@ -2510,6 +2510,20 @@ pub fn no_exec_tool_dir_over(
         })
 }
 
+/// The macOS temp root a project root sits under when `allow_tmp_exec` is off
+/// (#666). `emit_temp_rules` denies execute there, after the project grant, so
+/// the checkout hits the same wall as one under `~/.cache` (#675). The root is
+/// canonical, so `/tmp` arrives as `/private/tmp`.
+pub fn no_exec_temp_dir_over(root: &Path, allow_tmp_exec: bool) -> Option<PathBuf> {
+    if allow_tmp_exec {
+        return None;
+    }
+    ["/private/tmp", "/private/var/folders"]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|dir| root.starts_with(dir))
+}
+
 /// Environment lookup for the Copilot cache resolver: `&|k| std::env::var_os(k)`
 /// in production, a fixed map in tests.
 pub type CacheEnv<'a> = dyn Fn(&str) -> Option<OsString> + 'a;
@@ -4187,6 +4201,22 @@ fn dedup(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn project_under_a_no_exec_temp_dir_is_named() {
+        let p = |s: &str| no_exec_temp_dir_over(Path::new(s), false);
+        assert_eq!(p("/private/tmp/proj"), Some(PathBuf::from("/private/tmp")));
+        assert_eq!(
+            p("/private/var/folders/xy/T/proj"),
+            Some(PathBuf::from("/private/var/folders"))
+        );
+        assert_eq!(p("/private/tmpfoo/proj"), None);
+        assert_eq!(p("/Users/u/src/proj"), None);
+        assert_eq!(
+            no_exec_temp_dir_over(Path::new("/private/tmp/proj"), true),
+            None
+        );
+    }
+
     #[test]
     fn project_under_a_symlinked_cache_is_named() {
         let tmp = tempfile::tempdir().unwrap();
