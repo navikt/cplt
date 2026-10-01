@@ -2915,6 +2915,49 @@ mod macos_tests {
         );
     }
 
+    #[test]
+    fn temporary_home_copilot_pkg_maps_native_code_without_opening_temp_exec() {
+        require_sandbox!();
+        let (_dir, home, project) = copilot_cache_fixture();
+        let pkg = home.join("Library/Caches/copilot/pkg");
+        let other = home.join("Library/Caches/other");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let addon = Path::new(env!("CARGO_BIN_EXE_cplt"));
+        let cache_addon = pkg.join("cplt");
+        let temp_addon = other.join("cplt");
+        fs::copy(addon, &cache_addon).unwrap();
+        fs::copy(addon, &temp_addon).unwrap();
+        let profile = write_real_profile(&default_opts(&project, &home));
+        let run = |path: &Path| {
+            let output = Command::new("sandbox-exec")
+                .args(["-f", profile.to_str().unwrap()])
+                .arg(path)
+                .arg("--version")
+                .output()
+                .unwrap();
+            (
+                output.status.success(),
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+            )
+        };
+        let allowed = run(&cache_addon);
+        let blocked = run(&temp_addon);
+        fs::remove_file(profile).ok();
+        assert!(
+            allowed.0 && allowed.1.contains("cplt"),
+            "Copilot's pkg must be executable under a temporary HOME: {allowed:?}"
+        );
+        assert!(
+            !blocked.0 && !blocked.1.contains("cplt "),
+            "the rest of temporary HOME must remain non-executable: {blocked:?}"
+        );
+    }
+
     /// With the default Copilot cache missing, `prepare` creates it, so the
     /// agent cannot plant `~/Library/Caches/copilot` as a symlink to a tree it
     /// writes. A cache variable moving extraction elsewhere does not skip

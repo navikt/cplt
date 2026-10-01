@@ -175,6 +175,24 @@ pub fn generate_profile_with_playwright_socket_dir(
             .then_some(playwright_socket_dir)
             .flatten(),
     );
+    // A temporary HOME puts Copilot's extracted SEA cache under /var/folders.
+    // Restore exec only for its pinned, write-denied pkg tree after the broad
+    // temp deny; the existing user-deny and write-deny rules still follow.
+    let home_path = config.home_dir.to_string_lossy();
+    if config.agent.needs_copilot_dir()
+        && [
+            "/private/tmp/",
+            "/private/var/folders/",
+            "/tmp/",
+            "/var/folders/",
+        ]
+        .iter()
+        .any(|prefix| home_path.starts_with(prefix))
+    {
+        for pkg in copilot_default_pkg_spellings(config.home_dir) {
+            emit_copilot_pkg_exec(&mut sb, &pkg);
+        }
+    }
     emit_user_allows(
         &mut sb,
         config.extra_read,
@@ -1663,8 +1681,9 @@ fn emit_tool_dirs(
     //   - deny file-write*: prevent write-then-exec attacks (writable + executable
     //     is a binary-drop staging risk). Auto-update is already blocked inside
     //     the sandbox (--no-auto-update), so writes are not needed.
-    // Must come AFTER the denies (last-match-wins in SBPL).
-    // Only needed for Copilot agent.
+    // Must come AFTER the cache denies (last-match-wins in SBPL).
+    // Only needed for Copilot agent. The same carve-out is repeated after
+    // emit_temp_rules for a HOME under /var/folders.
     // The write deny and rename pin are not here: they must beat every later
     // allow, so `emit_copilot_pkg_denies` emits them after all of them, along
     // with the whole block for a directory a cache variable moves it to (#374).
