@@ -4207,7 +4207,7 @@ mod tests {
     /// A client that never finishes its head gets a 408 at the timeout, and
     /// the proxy serves another client while that one is still stalled.
     ///
-    /// Takes the full head timeout (10 s) by design; it runs beside the rest
+    /// Takes the full head timeout (5 s) by design; it runs beside the rest
     /// of the suite, not in front of it.
     #[test]
     fn unfinished_request_head_times_out_with_408() {
@@ -4219,7 +4219,7 @@ mod tests {
         let log = dir.path().join("p.log");
         // Wide enough that a loaded runner serves the second client long
         // before the stalled one's deadline, instead of racing it (#528).
-        let head_timeout = Duration::from_secs(10);
+        let head_timeout = Duration::from_secs(5);
         let proxy = head_test_proxy(port, head_timeout, log.clone());
 
         let mut slow = std::net::TcpStream::connect(("127.0.0.1", proxy.port)).unwrap();
