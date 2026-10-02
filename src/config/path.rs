@@ -59,11 +59,10 @@ pub fn default_config_contents() -> String {
 # domain is blocked. Override for a single run with --allow-all-domains.
 # default_allowlist = false
 # log_file = "~/.config/cplt/proxy.log"
-# Stderr verbosity: "none" (default/silent), "error", "blocked", or "all".
+# Stderr verbosity: "none", "error", "blocked", or "all". Unset defaults to
+# "blocked" with an allowlist, "none" otherwise. Explicit "none" stays silent.
 # The log_file always records everything regardless of this setting.
 # log_level = "none"
-# Floored at "blocked" while a domain allowlist is enforcing, so a refused
-# host explains itself instead of surfacing as an unexplained 403.
 # Domains allowed to resolve to private/internal IPs (bypasses DNS-rebinding block).
 # Use for corporate internal services, e.g. MCP servers on your company's intranet.
 # Suffix matching: "intern.nav.no" covers all its subdomains.
