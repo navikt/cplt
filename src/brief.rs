@@ -110,6 +110,10 @@ pub struct BriefNetwork {
     pub allow_ports: Vec<u16>,
     pub allow_localhost: Vec<u16>,
     pub allow_localhost_any: bool,
+    /// macOS Seatbelt does not match IPv4-mapped loopback with `localhost`,
+    /// even when the user granted the destination port. The proxy's own
+    /// listener is not a user grant.
+    pub localhost_grant_excludes_ipv4_mapped: bool,
     /// `open`, `blocked_by_port`, or `blocked_by_keys`.
     pub ssh: &'static str,
     /// `git push` is additionally gated by the git guard.
@@ -186,6 +190,8 @@ impl BriefFacts {
                 allow_ports: resolved.allow_ports.clone(),
                 allow_localhost: resolved.allow_localhost.clone(),
                 allow_localhost_any: resolved.allow_localhost_any,
+                localhost_grant_excludes_ipv4_mapped: cfg!(target_os = "macos")
+                    && (resolved.allow_localhost_any || !resolved.allow_localhost.is_empty()),
                 ssh: if !ssh_port_open(resolved) {
                     "blocked_by_port"
                 } else if !ssh_key_readable(&resolved.allow_read, home)
@@ -395,6 +401,18 @@ pub fn generate_session_brief(facts: &BriefFacts) -> String {
                  kernel-enforced either.\n",
             );
         }
+    }
+    if net.localhost_grant_excludes_ipv4_mapped {
+        out.push_str(
+            "- On macOS, Seatbelt does not match IPv4-mapped loopback destinations \
+             (`::ffff:127.0.0.1`) with `localhost`, even on granted ports. \
+             If a VSTest/testhost or `TcpClient` failure is traced to such a \
+             connection, prefix the failing .NET command with \
+             `DOTNET_SYSTEM_NET_DISABLEIPV6=1` (for example, \
+             `DOTNET_SYSTEM_NET_DISABLEIPV6=1 dotnet test`). This changes IPv6 \
+             behavior for that .NET process tree only; cplt does not set it \
+             for the session.\n",
+        );
     }
     if net.ssh == "blocked_by_port" {
         out.push_str(
@@ -960,6 +978,44 @@ mod tests {
     /// be a stable prefix the `~/.ssh` and credential checks can compare to.
     fn home() -> &'static Path {
         Path::new("/home/tester")
+    }
+
+    #[test]
+    fn mapped_loopback_limitation_follows_effective_localhost_grants() {
+        let mut resolved = base_resolved();
+        for (any, ports, forced) in [
+            (false, vec![], false),
+            (true, vec![], false),
+            (false, vec![5000], false),
+            (true, vec![], true),
+            (true, vec![5000], true),
+        ] {
+            resolved.allow_localhost_any = any;
+            resolved.allow_localhost = ports;
+            resolved.proxy_forced = forced;
+            let _ = resolved.reconcile_proxy_forced();
+            let facts = BriefFacts::capture(&resolved, Agent::Copilot, home(), &[], false);
+            let md = generate_session_brief(&facts);
+            let json: serde_json::Value =
+                serde_json::from_str(&generate_session_brief_json(&facts)).unwrap();
+            let expected = cfg!(target_os = "macos")
+                && (resolved.allow_localhost_any || !resolved.allow_localhost.is_empty());
+            assert_eq!(
+                facts.network.localhost_grant_excludes_ipv4_mapped, expected,
+                "any={any}, ports={:?}, forced={forced}",
+                resolved.allow_localhost
+            );
+            assert_eq!(
+                json["network"]["localhost_grant_excludes_ipv4_mapped"],
+                expected
+            );
+            assert_eq!(md.contains("::ffff:127.0.0.1"), expected);
+            assert_eq!(md.contains("prefix the failing .NET command"), expected);
+            assert_eq!(
+                md.contains("DOTNET_SYSTEM_NET_DISABLEIPV6=1 dotnet test"),
+                expected
+            );
+        }
     }
 
     /// Observe mode is not in `Resolved`, and the brief has to see it anyway.
