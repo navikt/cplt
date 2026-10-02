@@ -2916,6 +2916,41 @@ if echo "$RESP" | grep -q "403"; then echo "RESULT:blocked_unlisted:OK"; else ec
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
         assert_result_ok(&stdout, &stderr, "blocked_unlisted");
+
+        assert!(
+            stderr.contains("[proxy]") && stderr.contains("BLOCKED-ALLOWLIST"),
+            "the unset log level should show allowlist refusals:\n{stderr}"
+        );
+
+        let log_path = list_dir.path().join("proxy.log");
+        let (stdout, stderr, success) = run_cplt(
+            &project,
+            &fake_dir,
+            &[
+                "--with-proxy",
+                "--allowed-domains",
+                &allowlist_path.to_string_lossy(),
+                "--proxy-log-level",
+                "none",
+                "--proxy-log",
+                &log_path.to_string_lossy(),
+            ],
+        );
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, &stderr, "blocked_unlisted");
+        assert!(
+            !stderr.contains("[proxy]"),
+            "explicit none must silence proxy stderr:\n{stderr}"
+        );
+        assert!(
+            std::fs::read_to_string(&log_path)
+                .unwrap()
+                .contains("blocked.example.com:443 BLOCKED-ALLOWLIST"),
+            "the separate audit file still records refusals"
+        );
     }
 
     #[test]

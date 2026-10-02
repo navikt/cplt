@@ -22,9 +22,6 @@ pub use domains::{
 
 /// Controls how much the proxy logs to stderr.
 /// The audit log file (if configured) always records everything regardless of this level.
-/// Ordered least to most verbose, and `Ord` follows the declaration order, so
-/// `a.max(b)` is "at least this verbose" — which is how the allowlist floor in
-/// `main.rs` raises a level without ever lowering one the user asked for.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum ProxyLogLevel {
