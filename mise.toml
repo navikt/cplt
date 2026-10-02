@@ -18,7 +18,7 @@ run = "cargo fmt -- --check"
 
 [tasks.clippy]
 description = "Run Clippy linter"
-run = "cargo clippy --all-targets -- -D warnings"
+run = "cargo clippy --quiet --all-targets -- -D warnings"
 
 [tasks.build]
 description = "Build debug binary"
@@ -53,39 +53,39 @@ done
 
 [tasks.test]
 description = "Run all tests (same as cargo test; macOS only)"
-run = "cargo test"
+run = "sh hack/quiet-test.sh"
 
 [tasks."test:lib"]
 description = "Run library crate tests — cross-platform, sandbox-safe"
-run = "cargo test --lib"
+run = "sh hack/quiet-test.sh --lib"
 
 [tasks."test:unit"]
 description = "Run unit tests — cross-platform, sandbox-safe"
-run = "cargo test --test unit_tests"
+run = "sh hack/quiet-test.sh --test unit_tests"
 
 [tasks."test:integration"]
 description = "Run integration tests — macOS only, sandbox-safe"
-run = "cargo test --test integration"
+run = "sh hack/quiet-test.sh --test integration"
 
 [tasks."test:integration-linux"]
 description = "Run Linux Landlock integration tests — Linux only (kernel 5.13+)"
-run = "cargo test --test integration_linux"
+run = "sh hack/quiet-test.sh --test integration_linux"
 
 [tasks."test:network-audit"]
 description = "Run network audit command-path tests on macOS or Linux"
-run = "cargo test --test network_audit"
+run = "sh hack/quiet-test.sh --test network_audit"
 
 [tasks."test:e2e"]
 description = "Run E2E tests — macOS only, sandbox-safe"
-run = "cargo test --test e2e"
+run = "sh hack/quiet-test.sh --test e2e"
 
 [tasks."test:e2e-projects"]
 description = "Run E2E project scaffold tests — macOS only, sandbox-safe"
-run = "cargo test --test e2e_projects"
+run = "sh hack/quiet-test.sh --test e2e_projects"
 
 [tasks."test:e2e-live"]
 description = "Run live smoke tests — macOS only, requires Copilot auth + network, NOT sandbox-safe"
-run = "cargo test --test e2e -- --ignored"
+run = "sh hack/quiet-test.sh --test e2e -- --ignored"
 
 [tasks."test:all"]
 description = "Run all test suites except live smoke tests — macOS only, sandbox-safe"

@@ -8449,6 +8449,9 @@ paths = [
         let allow_origin = origin.to_string_lossy().into_owned();
         let push = |args: &[&str]| {
             let out = cplt_cmd()
+                // zsh startup files can replace PATH before `-c` runs; use a
+                // shell that preserves the PATH cplt gave the sandbox.
+                .env("SHELL", "/bin/sh")
                 .args(["--allow-write", &allow_origin])
                 .args(args)
                 .current_dir(&work)
