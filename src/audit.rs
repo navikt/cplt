@@ -2188,26 +2188,55 @@ mod tests {
     /// read counts as the tree having settled.
     #[test]
     fn settle_probe_reports_unsettled_while_a_descendant_lives() {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let go = tmp.path().join("go");
+        let go_c = std::ffi::CString::new(go.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path under a private temporary directory.
+        assert_eq!(unsafe { libc::mkfifo(go_c.as_ptr(), 0o600) }, 0, "mkfifo");
         let probe = SettleProbe::arm().expect("pipe");
         let fd = probe.write;
         // The straggler's stdout goes to /dev/null, or `output()` would block
         // on the pipe until it exits and there would be nothing left to detect.
         let out = sh_holding_the_probe(
             &probe,
-            &format!("sleep 5 >/dev/null 2>&1 & printf x >&{SCRIPT_FD}; echo $!"),
+            &format!(
+                "(read line < '{}') >/dev/null 2>&1 & printf x >&{SCRIPT_FD}; echo $!",
+                go.display()
+            ),
         )
         .output()
         .expect("sh runs");
         let pid: i32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+
+        // Opening the writer proves the descendant has reached the blocking
+        // read; keep it open throughout the probe instead of racing a sleep.
+        let deadline = Instant::now() + LOADED_RUNNER_GRACE;
+        let release = loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&go)
+            {
+                Ok(file) => break file,
+                Err(error)
+                    if error.raw_os_error() == Some(libc::ENXIO) && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("the descendant never opened the FIFO: {error}"),
+            }
+        };
 
         let started = Instant::now();
         let outcome = probe.outcome();
         let waited = started.elapsed();
         let settled = matches!(outcome, Settle::Eof { .. });
 
-        // The straggler is killed AFTER the assertions, so a failure's
-        // diagnosis still finds it where the probe left it. A skipped kill
-        // leaks nothing: `sleep 5` is gone within five seconds either way.
+        // The straggler is released AFTER the assertions, so a failure's
+        // diagnosis still finds it where the probe left it.
         // `sh`'s stderr is the other half of the fd question: a failed
         // `printf x >&9` is the shell saying it never had the descriptor.
         assert!(
@@ -2224,8 +2253,7 @@ mod tests {
             settle_diagnosis(fd, pid, outcome, waited, SETTLE_TIMEOUT),
             String::from_utf8_lossy(&out.stderr)
         );
-        // SAFETY: `pid` is the child this test just started.
-        unsafe { libc::kill(pid, libc::SIGKILL) };
+        drop(release);
     }
 
     /// #371, on purpose rather than by luck: the write end IS [`SCRIPT_FD`].
