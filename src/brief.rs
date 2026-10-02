@@ -407,8 +407,9 @@ pub fn generate_session_brief(facts: &BriefFacts) -> String {
             "- On macOS, Seatbelt does not match IPv4-mapped loopback destinations \
              (`::ffff:127.0.0.1`) with `localhost`, even on granted ports. \
              If a VSTest/testhost or `TcpClient` failure is traced to such a \
-             connection, run the affected command with \
-             `DOTNET_SYSTEM_NET_DISABLEIPV6=1 dotnet test`. This changes IPv6 \
+             connection, prefix the failing .NET command with \
+             `DOTNET_SYSTEM_NET_DISABLEIPV6=1` (for example, \
+             `DOTNET_SYSTEM_NET_DISABLEIPV6=1 dotnet test`). This changes IPv6 \
              behavior for that .NET process tree only; cplt does not set it \
              for the session.\n",
         );
@@ -1009,6 +1010,7 @@ mod tests {
                 expected
             );
             assert_eq!(md.contains("::ffff:127.0.0.1"), expected);
+            assert_eq!(md.contains("prefix the failing .NET command"), expected);
             assert_eq!(
                 md.contains("DOTNET_SYSTEM_NET_DISABLEIPV6=1 dotnet test"),
                 expected
