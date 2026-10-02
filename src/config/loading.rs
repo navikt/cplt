@@ -228,6 +228,8 @@ impl Config {
             .or_else(|| self.proxy.log_file.as_ref().map(|s| expand_tilde(s)));
 
         // Proxy log level: CLI > config > default (none)
+        let proxy_log_level_explicit =
+            cli.proxy_log_level.is_some() || self.proxy.log_level.is_some();
         let proxy_log_level = if let Some(level) = cli.proxy_log_level {
             level
         } else if let Some(ref level_str) = self.proxy.log_level {
@@ -648,6 +650,7 @@ impl Config {
             allow_all_domains,
             proxy_log_file,
             proxy_log_level,
+            proxy_log_level_explicit,
             proxy_timeout,
             proxy_upstream,
             proxy_upstream_no_proxy,
@@ -3897,6 +3900,29 @@ validate = false
         );
         assert!(resolved.gh_guard.enabled);
         assert!(resolved.git_guard.enabled);
+    }
+
+    #[test]
+    fn proxy_log_level_tracks_explicit_none_from_config_and_cli() {
+        use crate::proxy::ProxyLogLevel;
+
+        let defaults = Config::default().merge(CliFlags::default()).unwrap();
+        assert_eq!(defaults.proxy_log_level, ProxyLogLevel::None);
+        assert!(!defaults.proxy_log_level_explicit);
+
+        let config: Config = toml::from_str("[proxy]\nlog_level = \"none\"\n").unwrap();
+        let configured = config.merge(CliFlags::default()).unwrap();
+        assert_eq!(configured.proxy_log_level, ProxyLogLevel::None);
+        assert!(configured.proxy_log_level_explicit);
+
+        let cli = Config::default()
+            .merge(CliFlags {
+                proxy_log_level: Some(ProxyLogLevel::None),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(cli.proxy_log_level, ProxyLogLevel::None);
+        assert!(cli.proxy_log_level_explicit);
     }
 
     #[test]

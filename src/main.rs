@@ -217,7 +217,7 @@ struct Cli {
     #[arg(long, value_name = "FILE")]
     proxy_log: Option<PathBuf>,
 
-    /// Proxy stderr verbosity: none (default), error, blocked, or all.
+    /// Proxy stderr verbosity: none (default; blocked with an allowlist), error, blocked, or all.
     /// The audit log file (--proxy-log) always records everything, whatever
     /// this is set to.
     #[arg(long, value_name = "LEVEL")]
@@ -3309,25 +3309,14 @@ struct DomainAllowlistDecision {
     force_proxy_on: bool,
 }
 
-/// Floor the proxy's stderr verbosity at `blocked` whenever a domain allowlist
-/// is enforcing.
-///
-/// `proxy.log_level` defaults to `none`, which is fine while the proxy lets
-/// everything through: there is nothing to explain. Under an allowlist it is a
-/// debuggability hole — the agent gets a bare 403 from a host that worked
-/// yesterday, and stderr says nothing at all about why. That is also the
-/// precondition for ever making an allowlist the default (#147 Stage 3): a
-/// fail-closed network nobody can diagnose is one people turn off.
-///
-/// `max` only ever raises. An explicit `all` survives untouched, and the level
-/// this overrides is `none` — silence about refusals the user did not ask for
-/// so much as inherit from a default written for the allow-all case.
+/// Show allowlist refusals by default, but honor an explicitly chosen log level.
 fn proxy_log_level(
     configured: proxy::ProxyLogLevel,
+    explicit: bool,
     allowlist_active: bool,
 ) -> proxy::ProxyLogLevel {
-    if allowlist_active {
-        configured.max(proxy::ProxyLogLevel::Blocked)
+    if allowlist_active && !explicit {
+        proxy::ProxyLogLevel::Blocked
     } else {
         configured
     }
@@ -3759,7 +3748,11 @@ fn start_proxy_if_enabled(
         repo_private_domains: resolved.repo_private_domains.clone(),
         config_file: config_path.cloned(),
         log_file: resolved.proxy_log_file.clone(),
-        log_level: proxy_log_level(resolved.proxy_log_level, allowlist_active),
+        log_level: proxy_log_level(
+            resolved.proxy_log_level,
+            resolved.proxy_log_level_explicit,
+            allowlist_active,
+        ),
         timeout: resolved.proxy_timeout,
         upstream: resolved.proxy_upstream.clone(),
         upstream_no_proxy: resolved.proxy_upstream_no_proxy.clone(),
@@ -11362,19 +11355,15 @@ mod tests {
     }
 
     #[test]
-    fn an_active_allowlist_floors_the_proxy_log_level_at_blocked() {
+    fn an_active_allowlist_logs_blocks_by_default_but_honors_explicit_levels() {
         use proxy::ProxyLogLevel::{All, Blocked, Error, None as Silent};
 
-        // The whole point: the `none` default stops hiding refusals.
-        assert_eq!(proxy_log_level(Silent, true), Blocked);
-        assert_eq!(proxy_log_level(Error, true), Blocked);
-        // Never lowers a level the user asked for.
-        assert_eq!(proxy_log_level(All, true), All);
-        assert_eq!(proxy_log_level(Blocked, true), Blocked);
-        // No allowlist, no floor — every level passes through untouched.
+        assert_eq!(proxy_log_level(Silent, false, true), Blocked);
         for level in [Silent, Error, Blocked, All] {
-            assert_eq!(proxy_log_level(level, false), level);
+            assert_eq!(proxy_log_level(level, true, true), level);
+            assert_eq!(proxy_log_level(level, true, false), level);
         }
+        assert_eq!(proxy_log_level(Silent, false, false), Silent);
     }
 
     #[test]

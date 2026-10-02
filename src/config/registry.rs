@@ -104,7 +104,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Str,
         dangerous: false,
         default_display: "none",
-        description: "Stderr verbosity for proxy events: \"none\" (silent), \"error\" (DNS/connect failures), \"blocked\" (errors + blocked connections), \"all\" (everything including CONNECTED).",
+        description: "Stderr verbosity for proxy events: \"none\" (silent), \"error\" (DNS/connect failures), \"blocked\" (errors + blocked connections), \"all\" (everything including CONNECTED). With an allowlist, an unset level shows blocked connections; an explicit \"none\" stays silent. The separate log_file records everything.",
     },
     ConfigKeyInfo {
         section: "proxy",

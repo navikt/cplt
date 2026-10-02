@@ -913,6 +913,7 @@ mod tests {
             allow_all_domains: false,
             proxy_log_file: None,
             proxy_log_level: crate::proxy::ProxyLogLevel::default(),
+            proxy_log_level_explicit: false,
             proxy_timeout: std::time::Duration::from_secs(30),
             proxy_upstream: None,
             proxy_upstream_no_proxy: Vec::new(),

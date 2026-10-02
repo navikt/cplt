@@ -45,7 +45,7 @@ The allowlist file must exist, or cplt refuses to start. The agent's own hosts a
 | `--default-allowlist`       | Enable the agent's built-in default allowlist for this run (opt-in, default off): restrict egress to the agent's fail-closed domain set merged with `--allowed-domains`. See [Default allowlist](#default-allowlist-fail-closed-networking). |
 | `--allow-all-domains`       | Escape hatch: disable the default allowlist for this run and allow all domains (blocklist still applies). Also ignores any `--allowed-domains` file. |
 | `--proxy-log <FILE>`        | Append a line per connection to this file for post-session audit.                                |
-| `--proxy-log-level <LEVEL>` | Stderr verbosity: `none` (default/silent), `error`, `blocked`, or `all`. The audit log file always records everything. |
+| `--proxy-log-level <LEVEL>` | Stderr verbosity: `none`, `error`, `blocked`, or `all`. Defaults to `none` without an allowlist and `blocked` with one. An explicit `none` silences proxy stderr. The audit log file always records everything. |
 | `--allow-private-domain <DOMAIN>` | Allow connections to this domain even if it resolves to a private/internal IP. Use for corporate intranet services such as internal MCP servers. Suffix matching: `intern.nav.no` covers all subdomains. Can be repeated. |
 
 </details>
@@ -54,7 +54,7 @@ The allowlist file must exist, or cplt refuses to start. The agent's own hosts a
 >
 > **Localhost traffic** (MCP servers, dev servers) bypasses the proxy via `NO_PROXY` and will not appear in the audit log.
 >
-> **Quiet mode** (`-q` / `sandbox.quiet = true`) suppresses the startup banner. Proxy stderr output is controlled separately by `--proxy-log-level`, which defaults to `none`. Use `--proxy-log` to capture all connections to a file.
+> **Quiet mode** (`-q` / `sandbox.quiet = true`) suppresses the startup banner. Proxy stderr output is controlled separately by `--proxy-log-level` / `proxy.log_level`. To silence it with an allowlist, set the level to `none`. To stop writing the separate audit file, run `cplt config set proxy.log_file --unset` (and omit `--proxy-log`).
 
 ## Network snapshot
 
@@ -460,7 +460,7 @@ When editing `src/agent.rs`, record provenance in a comment on the const, naming
 
 ### Connection log
 
-Every connection attempt is printed to stderr in real time:
+At log level `all`, every connection attempt is printed to stderr in real time:
 
 ```
 [proxy] 14:23:01 CONNECT api.githubcopilot.com:443 → CONNECTED

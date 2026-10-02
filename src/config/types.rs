@@ -924,6 +924,7 @@ pub struct Resolved {
     pub allow_all_domains: bool,
     pub proxy_log_file: Option<PathBuf>,
     pub proxy_log_level: crate::proxy::ProxyLogLevel,
+    pub proxy_log_level_explicit: bool,
     pub proxy_timeout: std::time::Duration,
     /// Parsed upstream (corporate) proxy to forward CONNECT tunnels through.
     /// `None` = direct connections (unchanged behavior).
