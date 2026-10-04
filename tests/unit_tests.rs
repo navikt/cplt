@@ -9118,6 +9118,8 @@ const CHROME_FOR_TESTING_APPS_MACH_REGISTER_SUFFIX: &str = r#"$"))"#;
 const CHROME_FOR_TESTING_APPS_HASH_ATOM: &str = "[0-9A-F]";
 const CHROME_FOR_TESTING_APPS_HASH_LENGTH: usize = 64;
 const CYPRESS_MACH_REGISTER_RULE: &str = r#"(allow mach-register (global-name-regex #"^com\.electron\.cypress\.MachPortRendezvousServer\.[0-9]+$"))"#;
+const CYPRESS_POWER_MONITOR_RULE: &str =
+    r#"(allow iokit-open-user-client (iokit-user-client-class "RootDomainUserClient"))"#;
 
 fn chrome_for_testing_apps_mach_register_rule() -> String {
     format!(
@@ -9406,7 +9408,7 @@ fn chromium_runtime_mach_register_rules_remain_narrow() {
 }
 
 #[test]
-fn cypress_runtime_emits_only_its_narrow_mach_registration() {
+fn cypress_runtime_emits_only_its_narrow_system_permissions() {
     let app_data = cypress_app_data_dir_with_env(Path::new("/Users/test"), &no_cache_env);
     let app_data = app_data.display();
     for cache_entry in ["Cypress", "Cypress/15.21.1"] {
@@ -9420,6 +9422,17 @@ fn cypress_runtime_emits_only_its_narrow_mach_registration() {
         assert!(
             p.contains(CYPRESS_MACH_REGISTER_RULE),
             "Cypress runtime rule must be present for {cache_entry:?}"
+        );
+        assert!(
+            p.contains(CYPRESS_POWER_MONITOR_RULE),
+            "Cypress power monitor must be able to open RootDomainUserClient for {cache_entry:?}"
+        );
+        assert_eq!(
+            p.lines()
+                .filter(|line| line.starts_with("(allow iokit-open-user-client"))
+                .collect::<Vec<_>>(),
+            [CYPRESS_POWER_MONITOR_RULE],
+            "Cypress must not grant other IOKit user clients"
         );
         assert!(
             !p.contains("(allow syscall*)")
@@ -9463,6 +9476,10 @@ fn cypress_runtime_emits_only_its_narrow_mach_registration() {
             "{cache_entry:?} must not enable the Cypress Mach registration"
         );
         assert!(
+            !p.contains(CYPRESS_POWER_MONITOR_RULE),
+            "{cache_entry:?} must not enable the Cypress power monitor grant"
+        );
+        assert!(
             !p.contains(";; Cypress Electron state"),
             "{cache_entry:?} must not enable Cypress app state"
         );
@@ -9478,6 +9495,10 @@ fn cypress_runtime_emits_only_its_narrow_mach_registration() {
     assert!(
         !broad_cache_profile.contains(CYPRESS_MACH_REGISTER_RULE),
         "allow_cache_exec_any alone must not enable the Cypress Mach registration"
+    );
+    assert!(
+        !broad_cache_profile.contains(CYPRESS_POWER_MONITOR_RULE),
+        "allow_cache_exec_any alone must not enable the Cypress power monitor grant"
     );
 
     let p = generate_profile(

@@ -97,6 +97,76 @@ pub fn binary_in_path(name: &str) -> PathBuf {
         .unwrap_or_else(|| panic!("{name} should be available in PATH"))
 }
 
+/// A native test command with no developer configuration or environment.
+#[cfg(target_os = "macos")]
+pub fn native_cmd(program: &Path) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("CPLT_CONFIG", NO_CONFIG)
+        .env("NO_COLOR", "1");
+    cmd
+}
+
+/// Build the power-monitor startup call used by Cypress's Chromium runtime.
+///
+/// A null notification port must be detected before querying its run-loop
+/// source, where Chromium otherwise crashes when Seatbelt denies the open.
+#[cfg(target_os = "macos")]
+pub fn cypress_power_monitor_probe(project: &Path) -> PathBuf {
+    let source = project.join("power-monitor.c");
+    let binary = project.join("power-monitor");
+    std::fs::write(
+        &source,
+        r#"#include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/pwr_mgt/IOPMLib.h>
+#include <stdio.h>
+
+static void power_changed(void *context, io_service_t service,
+                          natural_t type, void *argument) {
+    (void)context;
+    (void)service;
+    (void)type;
+    (void)argument;
+}
+
+int main(void) {
+    IONotificationPortRef port = NULL;
+    io_object_t notifier = IO_OBJECT_NULL;
+    io_connect_t root = IORegisterForSystemPower(NULL, &port, power_changed, &notifier);
+    if (root == IO_OBJECT_NULL || port == NULL) {
+        fprintf(stderr, "IORegisterForSystemPower denied\n");
+        return 1;
+    }
+    int has_source = IONotificationPortGetRunLoopSource(port) != NULL;
+    IODeregisterForSystemPower(&notifier);
+    IOServiceClose(root);
+    IONotificationPortDestroy(port);
+    if (!has_source) {
+        fprintf(stderr, "power monitor has no run-loop source\n");
+        return 2;
+    }
+    puts("power-monitor:OK");
+    return 0;
+}
+"#,
+    )
+    .expect("write Cypress power monitor probe");
+    let output = native_cmd(&binary_in_path("clang"))
+        .arg(&source)
+        .args(["-Wall", "-Wextra", "-Werror", "-framework", "IOKit"])
+        .args(["-framework", "CoreFoundation", "-o"])
+        .arg(&binary)
+        .output()
+        .expect("compile Cypress power monitor probe");
+    assert!(
+        output.status.success(),
+        "power monitor probe must compile: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    binary
+}
+
 /// A `git` `Command` in `dir`, isolated from the developer's global and system
 /// git config.
 ///

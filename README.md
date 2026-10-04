@@ -1037,9 +1037,10 @@ The sandbox blocks some workflows on purpose. The common ones and their fixes:
 
 **Cypress needs `cplt config set sandbox.allow_cache_exec Cypress`.** Cache
 execution is machine-specific, so each user must set it in personal config or
-pass `--allow-cache-exec Cypress` for a run. Cypress also needs ephemeral
-loopback ports. Prefer requesting those in the repository's committed
-`.cplt.toml`, rather than enabling them globally:
+pass `--allow-cache-exec Cypress` for a run. On macOS the entry grants Electron's
+scoped Mach registration and `RootDomainUserClient` power-monitor access.
+Cypress also needs ephemeral loopback ports. Prefer requesting those in the
+repository's committed `.cplt.toml`, rather than enabling them globally:
 
 ```toml
 [propose]
