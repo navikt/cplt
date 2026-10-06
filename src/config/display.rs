@@ -573,10 +573,11 @@ pub fn display_config(loaded: Option<&LoadedConfig>, local: Option<&LoadedConfig
             c.sandbox.allow_browser.is_some()
         )
     );
-    let keychain_substitute = c
-        .sandbox
-        .keychain_substitute
-        .map_or("agent default (Copilot: on)".to_string(), |b| b.to_string());
+    let keychain_substitute = match c.sandbox.keychain_substitute {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "agent default (Copilot: on)",
+    };
     println!(
         "{blue}[cplt]{nc}    keychain_substitute   = {}{}",
         keychain_substitute,
