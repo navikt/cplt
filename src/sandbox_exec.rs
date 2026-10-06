@@ -604,7 +604,13 @@ fn should_cache_exec_token(
         && !substitute_carries_gh_token(substitute)
         && !deny_env.iter().any(|d| d == "GH_TOKEN")
         && (agent != Agent::Copilot
-            || (cfg!(target_os = "linux") && !child_keeps_a_github_token(deny_env)))
+            // gh reads only GH_TOKEN/GITHUB_TOKEN, not COPILOT_GITHUB_TOKEN.
+            // On macOS gh has the Keychain unless a substitute dropped it.
+            || ((cfg!(target_os = "linux") || substitute.is_some())
+                && !GH_TOKEN_VARS[..2].iter().any(|var| {
+                    !deny_env.iter().any(|d| d == var)
+                        && std::env::var(var).is_ok_and(|v| !v.trim().is_empty())
+                })))
 }
 
 /// The scratch dir holding `.gh-exec-token`, for `cplt gh-gate`.
@@ -2265,6 +2271,27 @@ mod gh_token_extraction_tests {
                     should_cache_exec_token(Agent::Copilot, &[], None, true),
                     cfg!(target_os = "linux"),
                     "macOS Copilot has the Keychain; Linux Copilot needs the cache"
+                );
+            },
+        );
+        // COPILOT_GITHUB_TOKEN alone does not authenticate gh (#696 review).
+        temp_env::with_vars(
+            [
+                ("GH_TOKEN", None::<&str>),
+                ("GITHUB_TOKEN", None),
+                ("COPILOT_GITHUB_TOKEN", Some("t")),
+            ],
+            || {
+                let sub = crate::agent::KeychainSubstitute::EnvVar("COPILOT_GITHUB_TOKEN");
+                assert!(should_cache_exec_token(
+                    Agent::Copilot,
+                    &[],
+                    Some(&sub),
+                    true
+                ));
+                assert_eq!(
+                    should_cache_exec_token(Agent::Copilot, &[], None, true),
+                    cfg!(target_os = "linux")
                 );
             },
         );

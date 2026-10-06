@@ -275,7 +275,8 @@ impl SettingsApp {
                 .unwrap_or_else(|| key.default_display.to_string());
             self.stage(
                 key,
-                Some(if value == "true" { "false" } else { "true" }.to_string()),
+                // Prose defaults (per-agent `keychain_substitute`) toggle to off.
+                Some(if value == "false" { "true" } else { "false" }.to_string()),
             );
         }
     }
