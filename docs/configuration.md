@@ -911,12 +911,20 @@ Or set the key back to `false`. A token in `config.yaml` (pnpm 11 accepts an `_a
 
 ## Dropping the Keychain grant (`sandbox.keychain_substitute`)
 
-On by default for Copilot, off for the other agents. macOS only; on Linux it does nothing. `.cplt.toml` cannot set it. An explicit value applies to every agent:
+On by default for Copilot and Claude Code, off for the other agents. macOS only; on Linux it does nothing. `.cplt.toml` cannot set it. An explicit value applies to every agent:
 
 ```bash
 cplt config set sandbox.keychain_substitute false   # keep the Keychain grant
-cplt config set sandbox.keychain_substitute true    # also try it for Claude Code and Antigravity
+cplt config set sandbox.keychain_substitute true    # also try it for Antigravity
 ```
+
+For Claude Code, the grant goes when `CLAUDE_CODE_OAUTH_TOKEN` is exported. Create the token with `claude setup-token`; Claude Code then signs in with it alone and never reads the Keychain. Without the variable nothing changes, and `cplt check --agent claude` suggests the command. `ANTHROPIC_API_KEY` does not count, so a subscription login is never switched to API billing.
+
+If you already export `CLAUDE_CODE_OAUTH_TOKEN`, Claude Code loses the Keychain grant on your next launch without you doing anything. MCP servers that use OAuth then ask you to sign in once more, and Claude Code stores those tokens in `~/.claude/.credentials.json`. If Claude Code fails to sign in, do one of these:
+
+- unset `CLAUDE_CODE_OAUTH_TOKEN` to go back to the Keychain login
+- run `claude setup-token` again and export the new token, if the old one has expired
+- run `cplt config set sandbox.keychain_substitute false` to keep the Keychain grant
 
 When it applies, it removes the read+write grant on `~/Library/Keychains` for an agent that can authenticate another way, and hands that credential over instead. For Copilot that is a GitHub token: an exported `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN`, or, when none is set, what `gh auth token --hostname github.com` prints at launch, passed in as `GH_TOKEN`. The startup summary shows `Keychain: denied` and names the source. If `gh` is not installed, not signed in, or prints nothing, the Keychain grant stays for that run. It also stays when `gh` is signed in to github.com as a different user than Copilot's own login, or Copilot is signed in to another host such as GitHub Enterprise, so Copilot never switches account without you noticing; the startup summary names both. Copilot's login comes from the account name on its `copilot-cli` Keychain item, read on the host without reading the secret. If there is no such item, the substitute goes ahead. With the key `false`, the profile and the agent's environment are exactly what they were before the key existed.
 

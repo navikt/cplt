@@ -806,7 +806,8 @@ fn emit_home_config_read(sb: &mut String, home: &str, rel: &str) {
     let Some(target) = first_party_read_target(Path::new(home), &named) else {
         return;
     };
-    sbpl!(sb, "(allow file-read* (literal \"{home}/{rel}\"))");
+    // `rel` may be absolute (gh's config dir elsewhere); `join` handles both.
+    sbpl!(sb, "(allow file-read* (literal \"{}\"))", named.display());
     if target == named || validate_sbpl_path(&target).is_err() {
         return;
     }
@@ -1010,6 +1011,11 @@ fn emit_system_access(
     sbpl!(sb, ";; Home config files (read-only)");
     for rel in HOME_CONFIG_FILES {
         emit_home_config_read(sb, home, rel);
+    }
+    // gh under GH_CONFIG_DIR or $XDG_CONFIG_HOME/gh; a path SBPL cannot name
+    // is already left out.
+    for p in crate::sandbox::policy::gh_config_files_elsewhere(Path::new(home)) {
+        emit_home_config_read(sb, home, &p.to_string_lossy());
     }
     sbpl!(sb);
 }
@@ -3645,7 +3651,11 @@ mod tests {
     fn profile_grants_the_shared_home_config_files() {
         let project = std::path::Path::new("/projects/app");
         let home = std::path::Path::new("/Users/test");
-        let p = generate_profile(&test_options(project, home), &[]);
+        // CI exports XDG_CONFIG_HOME, which adds gh's files elsewhere.
+        let p = temp_env::with_vars(
+            [("GH_CONFIG_DIR", None::<&str>), ("XDG_CONFIG_HOME", None)],
+            || generate_profile(&test_options(project, home), &[]),
+        );
         // The section holds exactly the list: an entry chained onto this
         // backend alone fails here.
         let section: std::collections::BTreeSet<&str> = p
@@ -4052,7 +4062,7 @@ mod tests {
         for &agent in Agent::ALL {
             assert_eq!(
                 on(agent, None),
-                agent == Agent::Copilot,
+                matches!(agent, Agent::Copilot | Agent::Claude),
                 "{agent:?} default"
             );
             assert!(on(agent, Some(true)), "{agent:?} explicit true");
@@ -4120,6 +4130,40 @@ mod tests {
             opts.agent = Agent::Copilot;
             opts.keychain_substitute = sub;
             assert!(generate_profile(&opts, &[]).contains("/Users/test/Library/Keychains"));
+        });
+    }
+
+    /// #695: with the key unset, Claude drops the Keychain grant only when
+    /// CLAUDE_CODE_OAUTH_TOKEN is set and not in `deny.env`.
+    #[test]
+    fn claude_oauth_token_drops_keychain_by_default() {
+        use crate::agent::Agent;
+        let granted = |deny: &[String]| {
+            let enabled = crate::sandbox::keychain_substitute_enabled(Agent::Claude, None);
+            let sub = crate::sandbox::keychain_substitute_with(
+                Agent::Claude,
+                Path::new("/Users/test"),
+                deny,
+                enabled,
+                true,
+                || None,
+            );
+            let mut opts = test_options(Path::new("/Users/test/repo"), Path::new("/Users/test"));
+            opts.agent = Agent::Claude;
+            opts.keychain_substitute = sub;
+            generate_profile(&opts, &[]).contains("/Users/test/Library/Keychains")
+        };
+        temp_env::with_vars(SUBSTITUTE_VARS, || {
+            assert!(granted(&[]), "no token keeps grant");
+        });
+        let mut vars = SUBSTITUTE_VARS;
+        vars[3].1 = Some("dummy");
+        temp_env::with_vars(vars, || {
+            assert!(!granted(&[]), "token drops grant");
+            assert!(
+                granted(&["CLAUDE_CODE_OAUTH_TOKEN".into()]),
+                "denied token keeps grant"
+            );
         });
     }
 

@@ -1170,8 +1170,8 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     // above, is not enough here: it lets a user name `~/.ssh/known_hosts` on
     // purpose, and a `~/.gitconfig -> ~/.ssh/id_ed25519` link carries no such
     // intent.
-    for &file in policy::HOME_CONFIG_FILES {
-        let path = home.join(file);
+    let home_config = policy::HOME_CONFIG_FILES.iter().map(|f| home.join(f));
+    for path in home_config.chain(policy::gh_config_files_elsewhere(home)) {
         if policy::first_party_read_target(home, &path).is_none() {
             continue;
         }

@@ -560,6 +560,7 @@ What passes through:
 | Tool managers | `NVM_*`, `FNM_*`, `PYENV_*`, `MISE_*`, `SDKMAN_*`, `COREPACK_*`, `YARN_*` | Prefix allowlist |
 | OpenTelemetry | `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_*` | Prefix allowlist (`OTEL_EXPORTER_OTLP_HEADERS` may carry opt-in auth) |
 | XDG dirs | `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME` | Explicit allowlist |
+| gh config | `GH_CONFIG_DIR` | Explicit allowlist. Its `hosts.yml` and `config.yml` are readable |
 
 **Prefix allowlist with secret-suffix protection.** A variable matching an allowed prefix such as `COPILOT_*` or `YARN_*` still gets dropped if it ends in a secret-bearing suffix: `_TOKEN`, `_AUTH`, `_SECRET`, `_SECRET_KEY`, `_KEY`, `_PASSWORD`, or `_CREDENTIALS`. So `COPILOT_DEBUG` passes and `COPILOT_API_KEY` does not.
 

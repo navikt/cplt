@@ -1722,12 +1722,31 @@ fn account_mismatch(gh: &str, copilot_acct: Option<&str>) -> Option<String> {
 }
 
 /// `sandbox.keychain_substitute` as it applies to `agent`. Unset is on for
-/// Copilot only: its `gh auth token` path is proven and falls back to the
-/// grant on failure. Other agents stay opt-in, since a misjudged trade strands
+/// Copilot and Claude: Copilot's `gh auth token` path and Claude's
+/// `CLAUDE_CODE_OAUTH_TOKEN` are proven, and both keep the grant when there is
+/// no credential. Other agents stay opt-in, since a misjudged trade strands
 /// them at a login they cannot reach from inside the sandbox.
 #[must_use]
 pub fn keychain_substitute_enabled(agent: Agent, setting: Option<bool>) -> bool {
-    setting.unwrap_or(agent == Agent::Copilot)
+    setting.unwrap_or(matches!(agent, Agent::Copilot | Agent::Claude))
+}
+
+/// `cplt check` advice for a Claude user on macOS who still gets the
+/// whole-Keychain grant: mint a long-lived token so the grant can go (#695).
+/// `None` when the key is off, for other agents, or when `has_token` (a
+/// usable `CLAUDE_CODE_OAUTH_TOKEN` reaches the sandbox).
+#[must_use]
+pub fn claude_keychain_nudge(
+    agent: Agent,
+    setting: Option<bool>,
+    has_token: bool,
+    macos: bool,
+) -> Option<&'static str> {
+    (macos && agent == Agent::Claude && keychain_substitute_enabled(agent, setting) && !has_token)
+        .then_some(
+            "Claude can read login Keychain items whose ACL lets it. Run `claude setup-token` \
+             and export the token as CLAUDE_CODE_OAUTH_TOKEN; cplt then drops the Keychain grant.",
+        )
 }
 
 /// [`keychain_substitute`] with the platform and the `gh` call as parameters,
@@ -2844,6 +2863,16 @@ fn validate_created_playwright_socket_dir(path: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn claude_keychain_nudge_only_without_token() {
+        let n = claude_keychain_nudge;
+        assert!(n(Agent::Claude, None, false, true).is_some());
+        assert!(n(Agent::Claude, None, true, true).is_none());
+        assert!(n(Agent::Claude, Some(false), false, true).is_none());
+        assert!(n(Agent::Claude, None, false, false).is_none());
+        assert!(n(Agent::Copilot, None, false, true).is_none());
+    }
+
     // Fake homes live under /fake, not /home: /home is an automount on
     // macOS, and every lookup of a missing name there costs tens of
     // milliseconds. Policy generation resolves dozens of home paths per call,
@@ -3677,6 +3706,26 @@ mod tests {
         config.managed_worktree_root = Some(&root);
         let err = super::validate_config_paths(&config).expect_err("must refuse");
         assert!(err.contains("Managed worktree root"), "{err}");
+    }
+
+    /// A gh config dir SBPL cannot name launches without the gh grant instead
+    /// of refusing: such paths launched before the grant existed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unnameable_gh_config_dir_launches_without_grant() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let gh = home.join("g(h);");
+        temp_env::with_vars(
+            [
+                ("GH_CONFIG_DIR", Some(gh.as_os_str())),
+                ("XDG_CONFIG_HOME", None),
+            ],
+            || {
+                assert!(policy::gh_config_files_elsewhere(&home).is_empty());
+                assert!(super::validate_config_paths(&test_config(&home, &[])).is_ok());
+            },
+        );
     }
 
     /// `sandbox.protect_pnpm_config` with an `XDG_CONFIG_HOME` the profile

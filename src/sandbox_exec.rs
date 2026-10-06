@@ -534,14 +534,8 @@ fn inject_gh_token_if_needed(
 /// gh's `hosts.yml`, located the way gh does: `GH_CONFIG_DIR`, then
 /// `$XDG_CONFIG_HOME/gh`, then `~/.config/gh`.
 pub(super) fn gh_hosts_yml() -> Option<PathBuf> {
-    let dir = match std::env::var_os("GH_CONFIG_DIR").filter(|v| !v.is_empty()) {
-        Some(d) => PathBuf::from(d),
-        None => match std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-            Some(x) => PathBuf::from(x).join("gh"),
-            None => PathBuf::from(std::env::var_os("HOME")?).join(".config/gh"),
-        },
-    };
-    Some(dir.join("hosts.yml"))
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    super::policy::gh_config_dir(&home).map(|d| d.join("hosts.yml"))
 }
 
 /// Cache the GitHub token to a file in the scratch dir.

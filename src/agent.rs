@@ -612,6 +612,7 @@ impl Agent {
     /// `gemini`/`antigravity` and refreshes it there.
     /// Claude Code stores its OAuth token in the login Keychain on macOS
     /// ("Claude Code-credentials"); on Linux it uses ~/.claude/.credentials.json.
+    /// With CLAUDE_CODE_OAUTH_TOKEN exported, cplt drops the Keychain grant.
     /// OpenCode authenticates via the `/connect` device flow by default;
     /// third-party providers use API keys from env vars or config files.
     /// goose stores provider API keys in the OS keyring by default (the macOS
@@ -1784,7 +1785,8 @@ impl Agent {
             ],
             // Claude Code authenticates via the OAuth token in ~/.claude
             // (or macOS Keychain) by default — no env var needed for the
-            // subscription flow. These are for API-key / enterprise routing.
+            // subscription flow. CLAUDE_CODE_OAUTH_TOKEN replaces the Keychain
+            // grant on macOS. The rest are for API-key / enterprise routing.
             Agent::Claude => &[
                 // Anthropic API direct
                 "ANTHROPIC_API_KEY",
