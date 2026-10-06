@@ -12483,7 +12483,7 @@ mod tests {
         let run = |gh: Option<&str>, github: Option<&str>| {
             temp_env::with_vars(
                 [
-                    ("TMPDIR", Some(tmp)),
+                    (sandbox::GH_TOKEN_DIR_ENV, Some(tmp)),
                     ("GH_TOKEN", gh),
                     ("GITHUB_TOKEN", github),
                 ],
