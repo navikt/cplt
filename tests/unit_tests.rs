@@ -5666,6 +5666,39 @@ fn env_claude_injects_autoupdater_and_suppresses_copilot_vars() {
 }
 
 #[test]
+fn env_opencode_keeps_gh_token_but_not_copilot_vars() {
+    let parent = make_env(&[
+        ("HOME", "/Users/test"),
+        ("PATH", "/usr/bin"),
+        ("GH_TOKEN", "gh-secret"),
+        ("GITHUB_TOKEN", "gh-secret2"),
+        ("COPILOT_GITHUB_TOKEN", "copilot-secret"),
+        ("COPILOT_FOO", "x"),
+    ]);
+    let env = build_sandbox_env(
+        &parent,
+        &[],
+        false,
+        &[],
+        None,
+        None,
+        cplt::agent::Agent::OpenCode,
+    );
+    for kept in &["GH_TOKEN", "GITHUB_TOKEN"] {
+        assert!(
+            env.vars.iter().any(|(k, _)| k == kept),
+            "{kept} should reach OpenCode so its gh calls authenticate"
+        );
+    }
+    for leaked in &["COPILOT_GITHUB_TOKEN", "COPILOT_FOO"] {
+        assert!(
+            !env.vars.iter().any(|(k, _)| k == leaked),
+            "{leaked} should be suppressed for OpenCode"
+        );
+    }
+}
+
+#[test]
 fn env_opencode_redirects_claude_config_dir() {
     // oh-my-openagent writes transcripts to $CLAUDE_CONFIG_DIR/transcripts
     // (default ~/.claude), which the sandbox denies for OpenCode — cplt must

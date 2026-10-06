@@ -69,7 +69,7 @@ enabled = true              # blocks destructive gh operations
 mode = "block"              # block | warn | audit
 scope_check = true          # enforce repo-scoping on write commands
 block_auth_token = true     # deny "gh auth token" exfiltration
-inject_token = false        # inject GH_TOKEN into sandbox (opt-in)
+inject_token = false        # inject GH_TOKEN into sandbox (opt-in; Copilot, OpenCode)
 unknown_command = "block"   # block|allow unrecognized gh commands
 allow_api_write = false     # allow gh api write (POST/PUT/PATCH) to current repo (opt-in)
 allow_pr_merge = false      # allow gh pr merge into a ruleset-protected branch (opt-in)
@@ -297,6 +297,11 @@ or `ps -E` on macOS:
 [gh_guard]
 inject_token = true   # injects GH_TOKEN env var (visible to all subprocesses)
 ```
+
+OpenCode gets no Keychain in the sandbox, so `gh` there cannot read a token
+stored in the Keychain and gets 401. An exported `GH_TOKEN` or `GITHUB_TOKEN`
+reaches OpenCode; otherwise set `inject_token = true`. cplt prints a hint at
+launch when this applies.
 
 ## `gh api` handling
 

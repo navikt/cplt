@@ -60,7 +60,7 @@ fn compute_mise_ignored_paths(project_dir: &Path, home: &Path) -> Vec<PathBuf> {
 ///   NOT in `ENV_ALLOWLIST`; they reach the agent only through this trade.
 /// - Copilot's (`GH_TOKEN`, `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN`) ARE in
 ///   `ENV_ALLOWLIST` and have been since before the trade. An exported one
-///   reaches Copilot either way. What only this function adds is a
+///   reaches Copilot either way (OpenCode gets `GH_TOKEN`/`GITHUB_TOKEN`). What only this function adds is a
 ///   `KeychainSubstitute::GhToken` value that is in no parent environment:
 ///   the token `gh auth token` printed, set under one of those names.
 pub(super) fn apply_deny_env_and_credential(
@@ -303,9 +303,12 @@ fn configure_command(
     // - git push prevention: blocks git push while allowing all other git operations
     if let Some(scratch) = scratch_dir {
         if gh_guard.enabled {
-            // Inject GH_TOKEN into env only when explicitly requested.
+            // Inject GH_TOKEN into env only when explicitly requested
+            // (Copilot and OpenCode, see `token_vars_for`).
             if gh_guard.inject_token {
                 inject_gh_token_if_needed(cmd, agent, deny_env, keychain_substitute);
+            } else if !quiet {
+                hint_opencode_gh_token(agent, gh_guard, deny_env);
             }
             // Cache token to file so the wrapper can serve `gh auth token`
             // requests without exposing the token as an env var to all child
@@ -380,13 +383,23 @@ fn trusted_gh() -> Option<PathBuf> {
     None
 }
 
-/// Only injects for agents that need GitHub access (Copilot).
 /// The env vars that carry a GitHub token into the agent.
 ///
-/// Mirrors `sandbox_env::COPILOT_ONLY_VARS`; kept here because this module both
+/// Mirrors the token vars in `sandbox_env`; kept here because this module both
 /// strips them from the `gh` subprocess and consults them to decide whether
 /// extraction is needed at all.
 pub(super) const GH_TOKEN_VARS: &[&str] = &["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"];
+
+/// The token vars that reach this agent: all three for Copilot, `GH_TOKEN` and
+/// `GITHUB_TOKEN` for OpenCode (`COPILOT_GITHUB_TOKEN` is stripped for it),
+/// none for agents that do not drive `gh`.
+fn token_vars_for(agent: Agent) -> &'static [&'static str] {
+    match agent {
+        Agent::Copilot => GH_TOKEN_VARS,
+        _ if agent.uses_gh_cli() => &GH_TOKEN_VARS[..2],
+        _ => &[],
+    }
+}
 
 /// The GitHub token `gh` holds, or `None` when there is nothing to hand over.
 ///
@@ -483,8 +496,8 @@ fn gh_auth_token(gh: &Path, timeout: std::time::Duration) -> Option<String> {
 /// AFTER this runs. Without it a repo `deny.env = ["GH_TOKEN"]` produced a
 /// child with no token at all: the parent's value suppressed the extraction,
 /// and then the deny removed the variable it was suppressed in favour of.
-fn child_keeps_a_github_token(deny_env: &[String]) -> bool {
-    GH_TOKEN_VARS.iter().any(|var| {
+fn child_keeps_a_github_token(agent: Agent, deny_env: &[String]) -> bool {
+    token_vars_for(agent).iter().any(|var| {
         !deny_env.iter().any(|d| d == var) && std::env::var(var).is_ok_and(|v| !v.trim().is_empty())
     })
 }
@@ -504,27 +517,77 @@ fn inject_gh_token_if_needed(
     deny_env: &[String],
     substitute: Option<&crate::agent::KeychainSubstitute>,
 ) {
-    // Only inject for Copilot — other agents have their own auth.
-    if agent != Agent::Copilot
-        || child_keeps_a_github_token(deny_env)
-        || substitute_carries_gh_token(substitute)
-    {
+    // Only for agents that drive `gh` (Copilot, OpenCode) — others have their
+    // own auth.
+    if child_keeps_a_github_token(agent, deny_env) || substitute_carries_gh_token(substitute) {
         return;
     }
-    // Into the first name the deny list does not strip. Injecting into
-    // GH_TOKEN unconditionally would hand the token to a variable
-    // `apply_deny_env_and_credential` removes moments later, so a repo denying
-    // GH_TOKEN alone would leave the agent tokenless even though Copilot reads
-    // GITHUB_TOKEN too. All three names are denied means no channel is left, so
-    // there is nothing to inject into.
-    let Some(target) = GH_TOKEN_VARS
-        .iter()
-        .find(|var| !deny_env.iter().any(|d| d == *var))
-    else {
+    let Some(target) = injection_target(agent, deny_env) else {
         return;
     };
     if let Some(token) = extract_gh_token() {
         cmd.env(target, &token);
+    }
+}
+
+/// The first token var that reaches this agent and that the deny list does not
+/// strip. Injecting into GH_TOKEN unconditionally would hand the token to a
+/// variable `apply_deny_env_and_credential` removes moments later. `None` when
+/// the agent takes no token or every name is denied.
+fn injection_target(agent: Agent, deny_env: &[String]) -> Option<&'static str> {
+    token_vars_for(agent)
+        .iter()
+        .find(|var| !deny_env.iter().any(|d| d == *var))
+        .copied()
+}
+
+/// Whether to tell an OpenCode user that `gh` inside the sandbox has no token.
+///
+/// gh keeps its token in the Keychain unless `hosts.yml` carries an
+/// `oauth_token:` line, and the sandbox gives OpenCode no Keychain. So with no
+/// token in the env and none in `hosts.yml`, `gh` gets 401. `hosts` is the
+/// file's contents, `None` when it does not exist (gh not logged in at all).
+fn opencode_gh_token_hint_needed(
+    agent: Agent,
+    gh_guard: &crate::config::GhGuardPolicy,
+    env_has_token: bool,
+    hosts: Option<&str>,
+) -> bool {
+    agent == Agent::OpenCode
+        && gh_guard.enabled
+        && !gh_guard.inject_token
+        && !env_has_token
+        && hosts.is_some_and(|h| !h.contains("oauth_token:"))
+}
+
+/// gh's `hosts.yml`, located the way gh does: `GH_CONFIG_DIR`, then
+/// `$XDG_CONFIG_HOME/gh`, then `~/.config/gh`.
+fn gh_hosts_yml() -> Option<PathBuf> {
+    let dir = match std::env::var_os("GH_CONFIG_DIR").filter(|v| !v.is_empty()) {
+        Some(d) => PathBuf::from(d),
+        None => match std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+            Some(x) => PathBuf::from(x).join("gh"),
+            None => PathBuf::from(std::env::var_os("HOME")?).join(".config/gh"),
+        },
+    };
+    Some(dir.join("hosts.yml"))
+}
+
+fn hint_opencode_gh_token(
+    agent: Agent,
+    gh_guard: &crate::config::GhGuardPolicy,
+    deny_env: &[String],
+) {
+    if agent != Agent::OpenCode {
+        return; // skip the file read for every other agent
+    }
+    let hosts = gh_hosts_yml().and_then(|p| std::fs::read_to_string(p).ok());
+    let env_has_token = child_keeps_a_github_token(agent, deny_env);
+    if opencode_gh_token_hint_needed(agent, gh_guard, env_has_token, hosts.as_deref()) {
+        ui::info(
+            "gh inside the sandbox has no token (it is in the Keychain); to inject it: \
+             cplt config set gh_guard.inject_token true --force",
+        );
     }
 }
 
@@ -572,7 +635,7 @@ fn should_cache_token(
     // GitHub credential", while denying only COPILOT_GITHUB_TOKEN is a narrower
     // statement that should not cost the agent the cache channel as well.
     let target_denied = deny_env.iter().any(|d| d == "GH_TOKEN");
-    !target_denied && !child_keeps_a_github_token(deny_env)
+    !target_denied && !child_keeps_a_github_token(agent, deny_env)
 }
 
 fn cache_gh_token_to_file(
@@ -1927,11 +1990,11 @@ mod gh_token_extraction_tests {
     fn a_denied_parent_token_does_not_suppress_extraction() {
         temp_env::with_var("GH_TOKEN", Some("ghp_parent"), || {
             assert!(
-                child_keeps_a_github_token(&[]),
+                child_keeps_a_github_token(Agent::Copilot, &[]),
                 "an undenied parent token reaches the child, so no extraction is needed"
             );
             assert!(
-                !child_keeps_a_github_token(&["GH_TOKEN".to_string()]),
+                !child_keeps_a_github_token(Agent::Copilot, &["GH_TOKEN".to_string()]),
                 "a denied token is stripped from the child, so extraction must still run"
             );
         });
@@ -2011,12 +2074,7 @@ mod gh_token_extraction_tests {
     /// the surviving name is the one to use.
     #[test]
     fn injection_target_skips_denied_names() {
-        let pick = |deny: &[String]| -> Option<&'static str> {
-            GH_TOKEN_VARS
-                .iter()
-                .find(|var| !deny.iter().any(|d| d.as_str() == **var))
-                .copied()
-        };
+        let pick = |deny: &[String]| injection_target(Agent::Copilot, deny);
         assert_eq!(pick(&[]), Some("GH_TOKEN"), "no deny, first name wins");
         assert_eq!(
             pick(&["GH_TOKEN".to_string()]),
@@ -2034,6 +2092,91 @@ mod gh_token_extraction_tests {
         );
     }
 
+    /// OpenCode gets the token in GH_TOKEN/GITHUB_TOKEN only:
+    /// COPILOT_GITHUB_TOKEN is stripped for it, so injecting there is a no-op.
+    #[test]
+    fn opencode_injection_targets_gh_token_vars_only() {
+        let deny = |v: &[&str]| v.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(injection_target(Agent::OpenCode, &[]), Some("GH_TOKEN"));
+        assert_eq!(
+            injection_target(Agent::OpenCode, &deny(&["GH_TOKEN"])),
+            Some("GITHUB_TOKEN")
+        );
+        assert_eq!(
+            injection_target(Agent::OpenCode, &deny(&["GH_TOKEN", "GITHUB_TOKEN"])),
+            None
+        );
+        for agent in Agent::ALL.iter().filter(|a| !a.uses_gh_cli()) {
+            assert_eq!(injection_target(*agent, &[]), None, "{agent:?}");
+        }
+        temp_env::with_vars(
+            [
+                ("GH_TOKEN", None::<&str>),
+                ("GITHUB_TOKEN", None),
+                ("COPILOT_GITHUB_TOKEN", Some("ghp_copilot")),
+            ],
+            || {
+                assert!(child_keeps_a_github_token(Agent::Copilot, &[]));
+                assert!(
+                    !child_keeps_a_github_token(Agent::OpenCode, &[]),
+                    "COPILOT_GITHUB_TOKEN never reaches OpenCode"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn opencode_gh_token_hint_gating() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("hosts.yml");
+        std::fs::write(
+            &path,
+            "github.com:\n    user: me\n    git_protocol: https\n",
+        )
+        .unwrap();
+        let keychain = std::fs::read_to_string(&path).unwrap();
+        let on = crate::config::GhGuardPolicy {
+            enabled: true,
+            inject_token: false,
+            ..Default::default()
+        };
+        let need = |agent, g: &crate::config::GhGuardPolicy, env, hosts: Option<&str>| {
+            opencode_gh_token_hint_needed(agent, g, env, hosts)
+        };
+        assert!(need(Agent::OpenCode, &on, false, Some(&keychain)));
+        assert!(!need(Agent::Copilot, &on, false, Some(&keychain)));
+        assert!(
+            !need(Agent::OpenCode, &on, true, Some(&keychain)),
+            "env token"
+        );
+        assert!(!need(Agent::OpenCode, &on, false, None), "gh not logged in");
+        assert!(
+            !need(
+                Agent::OpenCode,
+                &on,
+                false,
+                Some("github.com:\n    oauth_token: gho_x\n")
+            ),
+            "token in hosts.yml is readable in the sandbox"
+        );
+        let inject = crate::config::GhGuardPolicy {
+            inject_token: true,
+            ..on.clone()
+        };
+        assert!(!need(Agent::OpenCode, &inject, false, Some(&keychain)));
+        let off = crate::config::GhGuardPolicy {
+            enabled: false,
+            ..on.clone()
+        };
+        assert!(!need(Agent::OpenCode, &off, false, Some(&keychain)));
+        temp_env::with_vars(
+            [("GH_CONFIG_DIR", Some(dir.path().to_str().unwrap()))],
+            || {
+                assert_eq!(gh_hosts_yml(), Some(path.clone()));
+            },
+        );
+    }
+
     /// Denying one variable says nothing about the others.
     #[test]
     fn denying_one_token_var_leaves_the_others_counting() {
@@ -2045,7 +2188,7 @@ mod gh_token_extraction_tests {
             ],
             || {
                 assert!(
-                    child_keeps_a_github_token(&["GH_TOKEN".to_string()]),
+                    child_keeps_a_github_token(Agent::Copilot, &["GH_TOKEN".to_string()]),
                     "GITHUB_TOKEN survives the deny and still reaches the child"
                 );
             },
@@ -2061,7 +2204,7 @@ mod gh_token_extraction_tests {
                 ("GITHUB_TOKEN", None),
                 ("COPILOT_GITHUB_TOKEN", None),
             ],
-            || assert!(!child_keeps_a_github_token(&[])),
+            || assert!(!child_keeps_a_github_token(Agent::Copilot, &[])),
         );
     }
 }
