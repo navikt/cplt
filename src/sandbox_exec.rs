@@ -348,40 +348,27 @@ fn configure_command(
 /// the gh proxy to safely block `gh auth token` inside the sandbox
 /// while still giving the agent API access.
 ///
-/// `gh`, resolved from [`crate::git::TRUSTED_BIN_DIRS`], warning once when the
-/// only `gh` on this machine is somewhere else.
+/// `gh`, resolved from [`crate::git::TRUSTED_BIN_DIRS`].
 ///
-/// Before the trusted-lookup change, `gh` came off `PATH`, so an installation in
-/// `~/.local/bin` or a mise shim worked. It no longer does — correctly, since a
-/// planted `gh` hands the agent both unsandboxed execution and a channel into
-/// the next agent's environment. But the failure is invisible: no token is
-/// injected, and the user sees Copilot's GitHub API calls fail with nothing
-/// pointing at cplt. A `gh` that exists on `PATH` and is not trusted is the one
-/// case worth a line on stderr.
-///
-/// Warned once per process: both token paths call this, and two identical
-/// warnings at launch read like two different problems.
+/// Trusted path, not PATH: a planted `gh` would hand the agent both
+/// unsandboxed execution and a channel into the next agent's environment.
 fn trusted_gh() -> Option<PathBuf> {
-    if let Some(gh) = crate::git::trusted_binary("gh") {
-        return Some(gh);
-    }
-    static WARNED: std::sync::Once = std::sync::Once::new();
+    crate::git::trusted_binary("gh")
+}
+
+/// Warn when the gh guard wanted a token for the sandboxed `gh` but the only
+/// `gh` here is outside the trusted dirs. Scoped to that path so a mise/asdf
+/// `gh` does not add launch noise where nothing would have been written.
+fn warn_untrusted_gh() {
     if let Some(untrusted) = which_binary("gh") {
-        WARNED.call_once(|| {
-            ui::warn(&format!(
-                "gh is installed at {} — outside the directories cplt trusts for \
-                 unsandboxed helpers ({}).\n  \
-                 The GitHub token is NOT injected, so the agent's GitHub API calls \
-                 will fail. cplt runs `gh auth token` as you, outside the sandbox, \
-                 so it will not run a `gh` a previous session could have replaced.\n  \
-                 Install gh into one of those directories (`brew install gh`, or your \
-                 distro's package), or export GH_TOKEN yourself before launching.",
-                untrusted.display(),
-                crate::git::TRUSTED_BIN_DIRS.join(", ")
-            ));
-        });
+        ui::warn(&format!(
+            "gh is installed at {}, outside the directories cplt trusts ({}).\n  \
+             gh inside the sandbox runs without a GitHub token. Install gh into one \
+             of those directories, or export GH_TOKEN before launching.",
+            untrusted.display(),
+            crate::git::TRUSTED_BIN_DIRS.join(", ")
+        ));
     }
-    None
 }
 
 /// Only injects for agents that need GitHub access (Copilot).
@@ -634,6 +621,9 @@ fn cache_gh_token_to_file(
         return;
     }
     let Some(token) = extract_gh_token() else {
+        if exec && trusted_gh().is_none() {
+            warn_untrusted_gh();
+        }
         return;
     };
     if serve {
@@ -2112,9 +2102,18 @@ mod gh_token_extraction_tests {
                         "{agent:?}: denied"
                     );
                 }
+                // Parent GH_TOKEN reaches Copilot directly on every platform.
                 assert!(
                     !should_cache_exec_token(Agent::Copilot, &[], None, true),
                     "Copilot keeps the parent token"
+                );
+                let sub = crate::agent::KeychainSubstitute::GhToken {
+                    var: "GH_TOKEN",
+                    token: crate::agent::SecretToken::new("t".into()),
+                };
+                assert!(
+                    !should_cache_exec_token(Agent::OpenCode, &[], Some(&sub), true),
+                    "substitute already carries the token"
                 );
                 assert!(
                     should_cache_exec_token(Agent::OpenCode, &[], None, true),
@@ -2137,6 +2136,10 @@ mod gh_token_extraction_tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn gh_hosts_yml_honours_gh_config_dir() {
         temp_env::with_vars(
             [("GH_CONFIG_DIR", Some("/x/gh")), ("XDG_CONFIG_HOME", None)],
             || assert_eq!(gh_hosts_yml(), Some(PathBuf::from("/x/gh/hosts.yml"))),
