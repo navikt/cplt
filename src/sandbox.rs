@@ -1629,17 +1629,16 @@ pub fn keychain_substitute(
         || {
             // Maintainer call: never switch identity silently. gh signed in as
             // someone other than Copilot's own login keeps the grant (#696).
-            let gh = exec::gh_hosts_yml()
-                .and_then(|p| std::fs::read_to_string(p).ok())
-                .and_then(|s| gh_login(&s));
-            let cp = std::fs::read_to_string(home.join(".copilot/config.json"))
-                .ok()
-                .and_then(|s| copilot_login(&s));
-            if let (Some(gh), Some(cp)) = (&gh, &cp)
-                && !gh.eq_ignore_ascii_case(cp)
-            {
-                let _ = ACCOUNT_MISMATCH.set((gh.clone(), cp.clone()));
-                return None;
+            if agent == Agent::Copilot {
+                let gh = exec::gh_hosts_yml()
+                    .and_then(|p| crate::agent::read_small_regular_file(&p))
+                    .and_then(|s| gh_login(&s));
+                if let Some(gh) = &gh
+                    && let Some(why) = account_mismatch(gh, copilot_keychain_acct(gh).as_deref())
+                {
+                    let _ = ACCOUNT_MISMATCH.set(why);
+                    return None;
+                }
             }
             exec::extract_gh_token()
         },
@@ -1652,9 +1651,9 @@ pub fn gh_configured() -> bool {
     exec::gh_hosts_yml().is_some_and(|p| p.exists())
 }
 
-/// `(gh login, Copilot login)` when the substitute was skipped because they
-/// differ, for the launch summary to say why the grant stayed.
-pub static ACCOUNT_MISMATCH: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+/// Why the substitute was skipped for an account mismatch, for the launch
+/// summary to say why the grant stayed.
+pub static ACCOUNT_MISMATCH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// The github.com `user:` from gh's `hosts.yml`.
 fn gh_login(hosts_yml: &str) -> Option<String> {
@@ -1669,18 +1668,57 @@ fn gh_login(hosts_yml: &str) -> Option<String> {
     None
 }
 
-/// `lastLoggedInUser.login` for github.com from Copilot CLI's `config.json`,
-/// which opens with `//` comment lines.
-fn copilot_login(config: &str) -> Option<String> {
-    let json: String = config
-        .lines()
-        .filter(|l| !l.trim_start().starts_with("//"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let v: serde_json::Value = serde_json::from_str(&json).ok()?;
-    let u = v.get("lastLoggedInUser")?;
-    (u.get("host")?.as_str()? == "https://github.com")
-        .then(|| u.get("login")?.as_str().map(str::to_string))?
+/// The `acct` attribute of Copilot CLI's own Keychain item (`copilot-cli`),
+/// shaped `https://github.com:<login>`. Read on the host from the item's
+/// attributes only (no `-w`/`-g`), so the secret is never read and nothing
+/// prompts. Unlike `~/.copilot/config.json`, the sandboxed agent cannot
+/// rewrite this without the Keychain grant it is about to lose.
+///
+/// Tries the item for `gh_login` first, so several stored accounts resolve to
+/// the matching one; otherwise whichever item `security` returns first.
+/// `None` when there is no item, `security` fails, or it outlives 1 s.
+fn copilot_keychain_acct(gh_login: &str) -> Option<String> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let query = |acct: Option<&str>| {
+        #[allow(clippy::disallowed_methods)] // absolute system path
+        let mut cmd = std::process::Command::new("/usr/bin/security");
+        cmd.args(["find-generic-password", "-s", "copilot-cli"]);
+        if let Some(a) = acct {
+            cmd.args(["-a", a]);
+        }
+        let out = exec::bounded_stdout(cmd, std::time::Duration::from_secs(1))?;
+        keychain_acct(&String::from_utf8_lossy(&out))
+    };
+    query(Some(&format!("https://github.com:{gh_login}"))).or_else(|| query(None))
+}
+
+/// The `"acct"<blob>="..."` value from `security find-generic-password` output.
+fn keychain_acct(out: &str) -> Option<String> {
+    out.lines().find_map(|l| {
+        let v = l
+            .trim()
+            .strip_prefix("\"acct\"<blob>=\"")?
+            .strip_suffix('"')?;
+        Some(v.to_string())
+    })
+}
+
+/// `Some(reason)` when gh's github.com login differs from Copilot's Keychain
+/// account (another user, or a non-github.com host such as GitHub Enterprise),
+/// so the substitute must not switch identity. `None` (proceed) on a match or
+/// when Copilot's account is unknown.
+fn account_mismatch(gh: &str, copilot_acct: Option<&str>) -> Option<String> {
+    let acct = copilot_acct?;
+    match acct.strip_prefix("https://github.com:") {
+        Some(cp) if cp.eq_ignore_ascii_case(gh) => None,
+        Some(cp) => Some(format!("gh is {gh}, Copilot is {cp}")),
+        None => Some(format!(
+            "gh is {gh} on github.com, Copilot is on {}",
+            acct.rsplit_once(':').map_or(acct, |(h, _)| h)
+        )),
+    }
 }
 
 /// `sandbox.keychain_substitute` as it applies to `agent`. Unset is on for
@@ -5023,21 +5061,34 @@ mod tests {
 
 #[cfg(test)]
 mod account_tests {
-    use super::{copilot_login, gh_login};
+    use super::{account_mismatch, gh_login, keychain_acct};
 
     #[test]
-    fn reads_both_logins() {
+    fn reads_gh_login_and_keychain_acct() {
         let hosts = "ghe.example:\n    user: other\ngithub.com:\n    users:\n        alice:\n    git_protocol: ssh\n    user: alice\n";
         assert_eq!(gh_login(hosts).as_deref(), Some("alice"));
         assert_eq!(gh_login("ghe.example:\n    user: other\n"), None);
-        let cfg = "// managed\n{\n \"lastLoggedInUser\": {\"host\": \"https://github.com\", \"login\": \"Bob\"}\n}\n";
-        assert_eq!(copilot_login(cfg).as_deref(), Some("Bob"));
-        assert_eq!(copilot_login("{}"), None);
+        let out = "keychain: \"/x\"\nattributes:\n    \"acct\"<blob>=\"https://github.com:Bob\"\n    \"svce\"<blob>=\"copilot-cli\"\n";
         assert_eq!(
-            copilot_login(
-                "{\"lastLoggedInUser\": {\"host\": \"https://ghe.example\", \"login\": \"x\"}}"
-            ),
+            keychain_acct(out).as_deref(),
+            Some("https://github.com:Bob")
+        );
+        assert_eq!(keychain_acct(""), None);
+    }
+
+    #[test]
+    fn mismatch_decision() {
+        assert_eq!(
+            account_mismatch("alice", Some("https://github.com:alice")),
             None
         );
+        assert_eq!(
+            account_mismatch("Alice", Some("https://github.com:aLICE")),
+            None
+        );
+        assert_eq!(account_mismatch("alice", None), None, "unknown proceeds");
+        assert!(account_mismatch("alice", Some("https://github.com:bob")).is_some());
+        let ghe = account_mismatch("alice", Some("https://ghe.example:alice")).unwrap();
+        assert!(ghe.contains("https://ghe.example"), "{ghe}");
     }
 }

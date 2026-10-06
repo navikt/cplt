@@ -924,9 +924,19 @@ Copilot. Only credentials that are durable for a whole session qualify.
     something else, or a stale gh login, will show up as a sign-in error;
     unset the variable, run `gh auth refresh` or `gh auth login` on the host,
     or set `sandbox.keychain_substitute = false`.
-  - **The account can change.** Copilot now authenticates as `gh`'s
-    github.com account (or the exported token's), not a separate
-    `copilot /login` account stored in the Keychain.
+  - **The account is checked, not trusted to the agent.** Before handing over
+    `gh auth token`, cplt compares `gh`'s github.com `user:` with the `acct`
+    attribute of Copilot's own Keychain item (`copilot-cli`,
+    `https://github.com:<login>`), read on the host with
+    `/usr/bin/security find-generic-password` without `-w`/`-g`, so the secret
+    is not read and nothing prompts. A different user, or an item on another
+    host (GitHub Enterprise), keeps the grant and the summary says why. No item,
+    or a `security` error or timeout (1 s), lets the substitute proceed.
+    `~/.copilot/config.json` is not consulted: the agent can rewrite it.
+    An exported token is used as-is, without this check. Once the grant is kept
+    for a real mismatch, the agent has Keychain write access for that session
+    and could edit the item so the next launch keeps it too, the same exposure
+    as before this default.
   - **The token sits in the agent's environment** — the same exposure
     `gh_guard.inject_token` has, which is why that key is marked dangerous. The
     trade here is that token instead of the whole login Keychain.

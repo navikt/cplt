@@ -275,8 +275,18 @@ impl SettingsApp {
                 .unwrap_or_else(|| key.default_display.to_string());
             self.stage(
                 key,
-                // Prose defaults (per-agent `keychain_substitute`) toggle to off.
-                Some(if value == "false" { "true" } else { "false" }.to_string()),
+                // `keychain_substitute`'s prose default (per agent) toggles to off.
+                Some(
+                    if value == "true"
+                        || ((key.section, key.key) == ("sandbox", "keychain_substitute")
+                            && value != "false")
+                    {
+                        "false"
+                    } else {
+                        "true"
+                    }
+                    .to_string(),
+                ),
             );
         }
     }

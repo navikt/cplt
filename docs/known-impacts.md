@@ -723,7 +723,8 @@ Git commit works for every agent. Whether `git push` works over HTTPS depends on
 
 | Agent                                       | HTTPS push  | Credential source                                                          |
 | ------------------------------------------- | ----------- | -------------------------------------------------------------------------- |
-| `copilot`, `antigravity`, `claude`, `goose` | ✅ Works     | Login Keychain is readable, which is where `gh auth login` stores the token |
+| `copilot`                                   | ✅ Works     | Keychain is denied by default; `gh` uses the `GH_TOKEN` cplt hands Copilot (from `gh auth token`). Where the grant stays (no token, or an account mismatch), the Keychain is readable as for the next row |
+| `antigravity`, `claude`, `goose`            | ✅ Works     | Login Keychain is readable, which is where `gh auth login` stores the token |
 | `opencode`, `pi`, `dsh`, `cplt exec`        | ✅ Works     | Keychain is denied. The gh guard reads the token at launch and hands it to `gh` when git asks for credentials ([how](gh-guard.md#how-gh-itself-authenticates)). With `gh_guard.enabled = false` these agents need a token in `hosts.yml` or `--pass-env GH_TOKEN` |
 
 Both rows depend on where `gh` keeps the token. An installation that stores it in `~/.config/gh/hosts.yml` rather than the Keychain works for every agent, since that file is readable in every profile, and `--pass-env GH_TOKEN` supplies one regardless of agent.
