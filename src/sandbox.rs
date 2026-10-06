@@ -5089,6 +5089,6 @@ mod account_tests {
         assert_eq!(account_mismatch("alice", None), None, "unknown proceeds");
         assert!(account_mismatch("alice", Some("https://github.com:bob")).is_some());
         let ghe = account_mismatch("alice", Some("https://ghe.example:alice")).unwrap();
-        assert!(ghe.contains("https://ghe.example"), "{ghe}");
+        assert!(ghe.contains("https://ghe.example"));
     }
 }
