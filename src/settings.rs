@@ -655,6 +655,12 @@ fn resolved_values(
             // (the legacy `sandbox.gh_proxy` / `sandbox.git_push_prevention`
             // spellings, and `sandbox.use_bubblewrap`) are not on the ladder
             // and still need an arm below.
+            // Unset is a per-agent default, not `false`: show the registry text.
+            if (key.section, key.key) == ("sandbox", "keychain_substitute")
+                && resolved.keychain_substitute.is_none()
+            {
+                return ((key.section, key.key), key.default_display.to_string());
+            }
             if let Some(row) = crate::config::bool_key(key.section, key.key) {
                 return ((key.section, key.key), (row.resolved)(resolved).to_string());
             }
