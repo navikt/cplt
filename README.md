@@ -1010,7 +1010,7 @@ Enable them and cplt intercepts `gh` and `git` through wrapper scripts in `$PATH
 
 This is Layer 3, a soft barrier. It stops a compliant agent from doing something destructive by accident. For a hard boundary, lean on the kernel sandbox and server-side branch protection.
 
-With the gh guard on, cplt also caches the GitHub token at launch and serves it once through the `gh auth token` callback, then deletes the cache. That cuts accidental and environment-based leakage. It is not a boundary against a hostile agent, because the cache lives in the agent's own `TMPDIR` and an agent that reads it before the legitimate consumer still gets the token. [SECURITY.md](SECURITY.md) has the full statement on `block_auth_token`.
+With the gh guard on, cplt also caches the GitHub token at launch and serves it once through the `gh auth token` callback, then deletes the cache. That cuts accidental and environment-based leakage. It is not a boundary against a hostile agent, because the cache lives in the agent's own `TMPDIR` and an agent that reads it before the legitimate consumer still gets the token. For every agent except Copilot on macOS, which uses the Keychain, it also hands the real `gh` that token as `GH_TOKEN` on each approved call, so `gh` works without the Keychain while the agent's own environment stays without it. That file stays for the session and is just as readable to the agent. [SECURITY.md](SECURITY.md) has the full statement on `block_auth_token`.
 
 Full behavior: [docs/gh-guard.md](docs/gh-guard.md) · [docs/git-guard.md](docs/git-guard.md)
 

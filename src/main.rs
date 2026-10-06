@@ -4650,7 +4650,12 @@ fn run_gh_gate(
         run_gh_lookup(real_gh, repo, lookup)
     }) {
         GateEffect::VerifyGraphql(targets) => {
-            match cplt::gh_graphql::verify_targets(real_gh, &targets, repo_scope) {
+            match cplt::gh_graphql::verify_targets(
+                real_gh,
+                exec_gh_token().as_deref(),
+                &targets,
+                repo_scope,
+            ) {
                 Ok(()) => GateEffect::ExecPlain { notice: None },
                 Err(reason) => {
                     refusal_effect(policy.mode, gh_proxy::graphql_target_refusal(&reason))
@@ -4667,7 +4672,11 @@ fn run_gh_gate(
 /// failure, including a non-zero exit, is an error the caller refuses on.
 #[allow(clippy::disallowed_methods)] // runs INSIDE the sandbox as cplt gh-gate, against the same real gh it would exec
 fn run_gh_lookup(real_gh: &Path, repo: &str, args: &[&str]) -> Result<String, String> {
-    let output = std::process::Command::new(real_gh)
+    let mut cmd = std::process::Command::new(real_gh);
+    if let Some(token) = exec_gh_token() {
+        cmd.env("GH_TOKEN", token);
+    }
+    let output = cmd
         .args(args)
         .env_remove("GH_HOST")
         .env("GH_REPO", repo)
@@ -4744,9 +4753,28 @@ fn exec_real(
     if let Some(repo) = repo_scope {
         command.env("GH_REPO", repo);
     }
+    if name == "gh"
+        && let Some(token) = exec_gh_token()
+    {
+        command.env("GH_TOKEN", token);
+    }
     let err = command.exec();
     ui::error(&format!("Failed to exec {name}: {err}"));
     ExitCode::FAILURE
+}
+
+/// The token cplt cached at launch for the real `gh` (`$TMPDIR/.gh-exec-token`),
+/// unless the env already names one: an explicit `GH_TOKEN`/`GITHUB_TOKEN` wins.
+/// Set on the exec'd `gh` only, so the agent's own env never carries it. The
+/// file is not deleted: every approved `gh` call needs it.
+fn exec_gh_token() -> Option<String> {
+    let set = |k| std::env::var(k).is_ok_and(|v| !v.trim().is_empty());
+    if set("GH_TOKEN") || set("GITHUB_TOKEN") {
+        return None;
+    }
+    let tmpdir = std::env::var_os("TMPDIR").filter(|v| !v.is_empty())?;
+    let token = std::fs::read_to_string(Path::new(&tmpdir).join(".gh-exec-token")).ok()?;
+    Some(token.trim().to_string()).filter(|t| !t.is_empty())
 }
 
 /// Check if args represent a `gh auth token` invocation.
@@ -12426,6 +12454,42 @@ mod tests {
                 "{mode} must not let `gh auth token` reach the real binary"
             );
         }
+    }
+
+    #[test]
+    fn exec_gh_token_reads_the_cache_without_overriding_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().to_str().unwrap();
+        let run = |gh: Option<&str>, github: Option<&str>| {
+            temp_env::with_vars(
+                [
+                    ("TMPDIR", Some(tmp)),
+                    ("GH_TOKEN", gh),
+                    ("GITHUB_TOKEN", github),
+                ],
+                exec_gh_token,
+            )
+        };
+        assert_eq!(run(None, None), None, "no cache file");
+        std::fs::write(dir.path().join(".gh-exec-token"), "gho_cached\n").unwrap();
+        assert_eq!(run(None, None).as_deref(), Some("gho_cached"));
+        assert_eq!(
+            run(None, None).as_deref(),
+            Some("gho_cached"),
+            "file persists"
+        );
+        assert_eq!(
+            run(Some("ghp_explicit"), None),
+            None,
+            "explicit GH_TOKEN wins"
+        );
+        assert_eq!(
+            run(None, Some("ghp_explicit")),
+            None,
+            "explicit GITHUB_TOKEN wins"
+        );
+        // The serve-once cache is separate: `gh auth token` never reads this file.
+        assert!(!dir.path().join(".gh-token").exists());
     }
 
     #[test]
