@@ -231,8 +231,10 @@ fn opencode_auth_json(home: &Path) -> Option<PathBuf> {
 /// `Ok(None)` when the file does not exist, `Ok(Some(body))` when it was
 /// read, `Err` when it exists but was refused (FIFO, oversize, unreadable).
 fn read_opencode_auth_json(path: &Path) -> Result<Option<String>, ()> {
-    if path.symlink_metadata().is_err() {
-        return Ok(None);
+    match path.symlink_metadata() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(()),
+        Ok(_) => {}
     }
     read_small_regular_file(path).map(Some).ok_or(())
 }
@@ -242,8 +244,11 @@ fn read_opencode_auth_json(path: &Path) -> Result<Option<String>, ()> {
 /// `auth.json`, so the user's other providers are copied in unchanged.
 ///
 /// `None` (leave OpenCode alone) when the store already has a
-/// `github-copilot` entry (a `/connect` login, or Enterprise), or is not a
-/// JSON object: replacing what the user set up, or hiding a store cplt cannot
+/// `github-copilot` entry (a `/connect` login, or Enterprise in its
+/// `enterpriseUrl` form), or is not a JSON object. A store holding only a
+/// `github-copilot-enterprise` key is not matched and does get the github.com
+/// login added beside it; OpenCode then has both providers. Bailing out
+/// otherwise: replacing what the user set up, or hiding a store cplt cannot
 /// parse, would break a working setup.
 fn opencode_auth_overlay(auth_json: Option<&str>, token: &str) -> Option<String> {
     let mut map = match auth_json {
@@ -1130,6 +1135,13 @@ impl Agent {
     /// `gh_configured`: gh is logged in on the host, so cplt hands OpenCode
     /// that login when the store has no `github-copilot` entry of its own
     /// ([`opencode_host_login`], #695). The same hosts are needed then.
+    ///
+    /// The caller passes false when `deny.env` blocks the handover (`GH_TOKEN`
+    /// or `OPENCODE_AUTH_CONTENT`). Otherwise it is only "gh's hosts.yml
+    /// exists", decided before the sandbox starts without running gh, so the
+    /// hosts are still added when the handover fails later (gh guard off,
+    /// untrusted gh, token extraction failing). They are GitHub's own hosts;
+    /// predicting those cases would mean running gh for `cplt check`.
     pub fn provider_domains(&self, home: &Path, gh_configured: bool) -> Vec<&'static str> {
         if *self != Agent::OpenCode {
             return Vec::new();

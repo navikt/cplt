@@ -1338,7 +1338,7 @@ goose is the exception to the table's opening sentence: its config dir is grante
 
 ## OpenCode: GitHub Copilot login from the host
 
-When `gh` is logged in on the host and OpenCode's `auth.json` has no `github-copilot` entry, cplt logs OpenCode in to GitHub Copilot with the host's gh token, so `opencode run -m github-copilot/...` works without `/connect`. It does this through `OPENCODE_AUTH_CONTENT`, which OpenCode reads instead of `auth.json`; your other providers are copied in. An existing `github-copilot` login is left alone. Running `/connect` inside the sandbox writes the gh token into `auth.json` as the `github-copilot` entry. To turn this off, add `OPENCODE_AUTH_CONTENT` to `deny.env`. Details in [SECURITY.md](../SECURITY.md#github-token-handling-per-agent).
+When `gh` is logged in on the host and OpenCode's `auth.json` has no `github-copilot` entry, cplt logs OpenCode in to GitHub Copilot with the host's gh token, so `opencode run -m github-copilot/...` works without `/connect`. It does this through `OPENCODE_AUTH_CONTENT`, which OpenCode reads instead of `auth.json`; your other providers are copied in. An existing `github-copilot` login is left alone. Running `/connect` inside the sandbox writes the gh token into `auth.json` as the `github-copilot` entry. This needs OpenCode 1.4.7 or newer; older versions ignore `OPENCODE_AUTH_CONTENT` and behave as before. To turn this off, add `OPENCODE_AUTH_CONTENT` to `deny.env`. Details in [SECURITY.md](../SECURITY.md#github-token-handling-per-agent).
 
 ## AI agent telemetry
 
