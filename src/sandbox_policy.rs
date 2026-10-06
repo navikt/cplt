@@ -246,6 +246,29 @@ pub fn grant_is_refused(home: &Path, path: &Path) -> bool {
 /// with symlinks. A root-owned file is exempt, as in a Nix store deduplicated
 /// by `auto-optimise-store`: the user cannot plant that link, and their
 /// credentials are their own files.
+/// gh's config dir, located the way gh does: `GH_CONFIG_DIR`, then
+/// `$XDG_CONFIG_HOME/gh`, then `~/.config/gh`.
+#[must_use]
+pub fn gh_config_dir(home: &Path) -> PathBuf {
+    let env = |k| std::env::var_os(k).filter(|v| !v.is_empty());
+    match (env("GH_CONFIG_DIR"), env("XDG_CONFIG_HOME")) {
+        (Some(d), _) => PathBuf::from(d),
+        (None, Some(x)) => PathBuf::from(x).join("gh"),
+        (None, None) => home.join(".config/gh"),
+    }
+}
+
+/// gh's `hosts.yml` and `config.yml` when gh reads them from somewhere other
+/// than the `~/.config/gh` that [`HOME_CONFIG_FILES`] already grants.
+#[must_use]
+pub fn gh_config_files_elsewhere(home: &Path) -> Vec<PathBuf> {
+    let dir = gh_config_dir(home);
+    if dir == home.join(".config/gh") {
+        return Vec::new();
+    }
+    vec![dir.join("hosts.yml"), dir.join("config.yml")]
+}
+
 #[must_use]
 pub fn first_party_read_target(home: &Path, path: &Path) -> Option<PathBuf> {
     read_target(home, path, None)
@@ -4257,6 +4280,21 @@ mod tests {
     }
 
     use super::*;
+
+    /// The read grant follows gh's own lookup order, not a fixed ~/.config/gh.
+    #[test]
+    fn gh_config_files_follow_gh_lookup() {
+        let home = Path::new("/fake/home");
+        let files = |gh: Option<&str>, xdg: Option<&str>| {
+            temp_env::with_vars([("GH_CONFIG_DIR", gh), ("XDG_CONFIG_HOME", xdg)], || {
+                gh_config_files_elsewhere(home)
+            })
+        };
+        assert!(files(None, None).is_empty());
+        assert!(files(None, Some("/fake/home/.config")).is_empty());
+        assert_eq!(files(None, Some("/x"))[0], Path::new("/x/gh/hosts.yml"));
+        assert_eq!(files(Some("/g"), Some("/x"))[1], Path::new("/g/config.yml"));
+    }
 
     /// #551 review: an allow path that reaches a credential through a link of
     /// its own (`docs/hosts -> ../ssh/id_ed25519` in the repo holding the
