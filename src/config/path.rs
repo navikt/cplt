@@ -282,8 +282,9 @@ pub fn default_config_contents() -> String {
 # can reach without it (a token in the environment, gh's token for Copilot, or
 # Antigravity's own fallback token file). The grant cannot be narrowed to one
 # item, so it otherwise reaches every keychain entry the agent can unlock.
-# Unset: on for Copilot (grant kept if `gh auth token` fails), off for others.
-# false keeps the grant for every agent; true also tries Claude and Antigravity.
+# Unset: on for Copilot (grant kept if `gh auth token` fails) and Claude (grant
+# kept without CLAUDE_CODE_OAUTH_TOKEN), off for others.
+# false keeps the grant for every agent; true also tries Antigravity.
 # keychain_substitute = false
 #
 # DANGEROUS: Let the agent read ~/.npmrc, ~/.gradle/gradle.properties and

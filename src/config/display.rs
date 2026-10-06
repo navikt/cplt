@@ -576,7 +576,7 @@ pub fn display_config(loaded: Option<&LoadedConfig>, local: Option<&LoadedConfig
     let keychain_substitute = match c.sandbox.keychain_substitute {
         Some(true) => "true",
         Some(false) => "false",
-        None => "agent default (Copilot: on)",
+        None => "agent default (Copilot, Claude: on)",
     };
     println!(
         "{blue}[cplt]{nc}    keychain_substitute   = {}{}",

@@ -6556,6 +6556,23 @@ fn run_check_command(
         println!("{}", report.to_json());
     } else {
         print!("{}", report.render());
+        // Claude only: for Copilot this would run `gh auth token`.
+        let has_token = active_agent == agent::Agent::Claude
+            && cplt::sandbox::keychain_substitute(
+                active_agent,
+                &home_dir,
+                &resolved.deny_env,
+                resolved.keychain_substitute,
+            )
+            .is_some();
+        if let Some(nudge) = cplt::sandbox::claude_keychain_nudge(
+            active_agent,
+            resolved.keychain_substitute,
+            has_token,
+            cfg!(target_os = "macos"),
+        ) {
+            println!("\nNote: {nudge}");
+        }
     }
 
     if report.exit_nonzero() {

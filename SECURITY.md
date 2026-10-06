@@ -18,7 +18,7 @@ cplt sandboxes AI coding agents. Currently that means **GitHub Copilot CLI**, **
 | Env isolation   | `GH_TOKEN` not injected (one-time file)¹; `COPILOT_*` passed | suppressed (see below)                          | suppressed (see below)           | suppressed (see below)          | suppressed (see below); `DISABLE_AUTOUPDATER=1` injected |
 | Auto-detected   | Yes (priority 1)                    | Yes (priority 2)                                                    | Yes (priority 3)                             | No (explicit only, name collision risk)     | No (explicit only)                           |
 
-¹ Unless `sandbox.keychain_substitute` applies (on by default for Copilot, opt-in for the others) *and* the agent has a credential it can reach without the Keychain — see [Keychain access is all-or-nothing](#keychain-access-is-all-or-nothing). For Copilot that is the default: `gh`'s token *is* injected into the environment, as `GH_TOKEN`, in place of the Keychain, and the grant stays when `gh` has no token.
+¹ Unless `sandbox.keychain_substitute` applies (on by default for Copilot and Claude Code, opt-in for the others) *and* the agent has a credential it can reach without the Keychain — see [Keychain access is all-or-nothing](#keychain-access-is-all-or-nothing). For Copilot that is the default: `gh`'s token *is* injected into the environment, as `GH_TOKEN`, in place of the Keychain, and the grant stays when `gh` has no token. For Claude Code it applies when `CLAUDE_CODE_OAUTH_TOKEN` is exported.
 
 ### GitHub token handling per agent
 
@@ -520,7 +520,7 @@ a symlink chooses where its grant lands next time. None of cplt's default grants
 makes a tool directory's parent writable; an `allow.write` on one (say
 `~/.cargo`) hands that choice to the agent, within the bar above.
 
-**`~/.config/gh/hosts.yml` is readable.** With gh guard enabled (the default), Copilot gets its token through a one-time cached file that is deleted after the first read; with gh guard disabled, `gh auth token` works inside the sandbox. The file holds a GitHub OAuth token. Only `hosts.yml` and `config.yml` are readable, not the whole `.config/gh` directory. With outbound port 443 open, a compromised agent could exfiltrate this token, though the token grants access to GitHub, which Copilot is already connected to. To mitigate, use `--deny-path ~/.config/gh`; Copilot falls back to Keychain auth.
+**`~/.config/gh/hosts.yml` is readable.** With gh guard enabled (the default), Copilot gets its token through a one-time cached file that is deleted after the first read; with gh guard disabled, `gh auth token` works inside the sandbox. The file holds a GitHub OAuth token. Only `hosts.yml` and `config.yml` are readable, not the whole `.config/gh` directory. When `GH_CONFIG_DIR` or `XDG_CONFIG_HOME` moves gh's config, the same two files are granted where gh actually reads them. With outbound port 443 open, a compromised agent could exfiltrate this token, though the token grants access to GitHub, which Copilot is already connected to. To mitigate, use `--deny-path ~/.config/gh`; Copilot falls back to Keychain auth.
 
 **The nested denies stop at `node_modules`.** On macOS the project-path denies also match at any depth below a writable root, except inside a `node_modules` directory ([#618](https://github.com/navikt/cplt/issues/618)). Packages ship these names — `thread-stream@4.2.0` contains `.claude/settings.local.json` — and the deny made `pnpm install` fail with `EPERM`, and removing such a package fail too. No supported agent loads its config from inside a dependency directory: they read it from the directory the session opens in and, for some, its ancestors, and nobody opens a session in `node_modules/<pkg>`. The exception also gives the agent nothing new: code under `node_modules` already runs on the host whenever the user runs an npm script or the test suite outside cplt, so an agent that can write there can plant code without any agent config file. The deny at the root and the rules for every other nested directory are unchanged. A workspace package reached through a `node_modules` symlink is still denied, because Seatbelt matches the resolved path. Seatbelt matches the exemption case-insensitively (`Node_Modules` is exempt too), and a `node_modules` directory can serve as a staging area for the moved-in-ancestor trick (move `sub` in, write `sub/.claude/settings.json`, move it back), which already works through `/private/tmp` without this exception (see the `sandbox.deny_nested_git` residuals above). Linux was not affected: the bubblewrap walk that finds nested repositories never descends into `node_modules`.
 
@@ -783,9 +783,9 @@ command fails with `SecKeychainSearchCopyNext: The specified item could not be
 found in the keychain` (exit 44). Blocking securityd's Mach service instead is
 neither necessary nor sufficient on its own.
 
-**On for Copilot, off for the others.** The trade is gated on one config key,
-`sandbox.keychain_substitute`. Unset, it is on for Copilot and off for every
-other agent. An explicit value applies to every agent:
+**On for Copilot and Claude Code, off for the others.** The trade is gated on one
+config key, `sandbox.keychain_substitute`. Unset, it is on for Copilot and Claude
+Code and off for every other agent. An explicit value applies to every agent:
 
 ```toml
 [sandbox]
@@ -794,7 +794,12 @@ keychain_substitute = false   # keep the Keychain grant, Copilot included
 
 Copilot is on by default because its path is proven and has a fallback: when
 `gh auth token` fails, prints nothing, or `gh` is not installed, the grant stays
-and nothing changes for that run. With the key `false`, the Keychain grant is
+and nothing changes for that run. Claude Code is on by default for the same
+reason (#695): it drops the grant only when `CLAUDE_CODE_OAUTH_TOKEN` is set,
+and Claude Code then authenticates from that variable alone (see below). Without
+the variable the grant stays, so nothing changes for a Claude user who has not
+run `claude setup-token`. `cplt check --agent claude` suggests it while the
+grant is still in place. With the key `false`, the Keychain grant is
 exactly what `needs_keychain()` says, for every agent, as in every release
 before the key existed. It stays off for the other agents because of the
 shape of the failure: if the trade misjudges an agent, the user can neither
@@ -812,7 +817,7 @@ flow needs access cplt does not grant by default.
 
 **What the key does when it is on.** Per agent:
 
-| Agent | Grant dropped when the key applies (Copilot by default, others with `true`) | What the agent holds instead | Refresh |
+| Agent | Grant dropped when the key applies (Copilot and Claude Code by default, others with `true`) | What the agent holds instead | Refresh |
 |---|---|---|---|
 | Copilot | `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN` is set, or `gh auth token --hostname github.com` prints one at launch | that GitHub token, in the environment | none — `gh`'s OAuth token and PATs do not refresh |
 | Claude Code | `CLAUDE_CODE_OAUTH_TOKEN` is set | that OAuth token | none — see below |
@@ -830,9 +835,10 @@ agent was going to use anyway, instead of every credential the user owns.
 That variable is **not** in `ENV_ALLOWLIST` and does not match any allowlisted
 prefix, so it is not something the sandbox passes through: it is forwarded by
 `apply_deny_env_and_credential` only on runs where the trade actually applied.
-With `sandbox.keychain_substitute` off, a `CLAUDE_CODE_OAUTH_TOKEN` exported in
-your shell still needs `--pass-env` to reach the agent, exactly as before this
-change. `keychain_substitute_vars_are_never_allowlisted` asserts it. Copilot's
+Since it is on for Claude Code by default, an exported `CLAUDE_CODE_OAUTH_TOKEN`
+now reaches Claude Code without `--pass-env`, and the Keychain grant goes in its
+place. With `sandbox.keychain_substitute = false` it still needs `--pass-env`,
+exactly as before this change, and no other agent receives it. `keychain_substitute_vars_are_never_allowlisted` asserts it. Copilot's
 three token variables are the one exception, and not a new one: they were
 allowlisted for Copilot long before this trade, so an exported one already reached
 the agent and still does with the key off.

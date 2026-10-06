@@ -474,8 +474,8 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         key: "keychain_substitute",
         value_type: ConfigValueType::Bool,
         dangerous: false,
-        default_display: "true for Copilot, false for other agents",
-        description: "Drop the macOS Keychain grant when the agent has a credential it can reach without it. Copilot uses `gh auth token` and keeps the grant if that fails.",
+        default_display: "true for Copilot and Claude, false for other agents",
+        description: "Drop the macOS Keychain grant when the agent has a credential it can reach without it. Copilot uses `gh auth token`, Claude uses CLAUDE_CODE_OAUTH_TOKEN; both keep the grant without one.",
     },
     ConfigKeyInfo {
         section: "sandbox",
