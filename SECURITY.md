@@ -20,10 +20,11 @@ cplt sandboxes AI coding agents. Currently that means **GitHub Copilot CLI**, **
 
 ¹ Unless the experimental `sandbox.keychain_substitute` is on *and* the agent has a credential it can reach without the Keychain — see [Keychain access is all-or-nothing](#keychain-access-is-all-or-nothing). For Copilot that also means `gh`'s token *is* injected into the environment, as `GH_TOKEN`, in place of the Keychain.
 
+OpenCode is the one exception to the `GH_TOKEN`/`GITHUB_TOKEN` rule below: it runs `gh`, so both pass through. Its Copilot provider uses its own auth file.
 
 ### Rules that apply to every non-Copilot agent
 
-- **Copilot env vars are suppressed.** `COPILOT_GITHUB_TOKEN` and every `COPILOT_*` variable are stripped for every agent except Copilot. `GH_TOKEN` and `GITHUB_TOKEN` are stripped too, except for OpenCode, which runs `gh` and needs them. OpenCode's Copilot provider uses its own auth file.
+- **Copilot env vars are suppressed.** `COPILOT_GITHUB_TOKEN` and every `COPILOT_*` variable are stripped for every agent except Copilot. `GH_TOKEN` and `GITHUB_TOKEN` are stripped too.
 - **Third-party API keys are opt-in.** `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`), and the Bedrock/Vertex routing vars (`CLAUDE_CODE_USE_BEDROCK`, `AWS_BEARER_TOKEN_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `ANTHROPIC_VERTEX_PROJECT_ID`, `GOOGLE_CLOUD_PROJECT`) are never passed through by default. You have to name each one with `--pass-env`. That keeps credentials from reaching a sandboxed process by accident.
 
 - **Host-persistence guard on the agent's own writable grants.** Most agents get their global config dir mounted read/write — and for some, more than that: the shell also gets the fish *data* dir, Claude a top-level file (`~/.claude.json`), OpenCode its data, state and cache dirs. Some files in those grants auto-execute the next time the agent runs *outside* the sandbox. goose is the exception: its config dir is read-only, because it rewrites `config.yaml` by rename, which needs directory write and would hand back the whole vector. Those paths are write-denied (`Agent::host_persistence_denies`):

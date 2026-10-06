@@ -260,6 +260,8 @@ enough. The file exists for well under a second, the token never appears as an
 environment variable, and after the delete no subprocess can get it back via
 `gh auth token`.
 
+The cache is written for Copilot only. OpenCode calling `gh auth token` gets "No cached token" even when `GH_TOKEN` is in its environment; `gh` itself still authenticates from that variable.
+
 This path applies only:
 - to the Copilot agent (other agents have their own auth mechanisms)
 - when `block_auth_token = true` (default)
@@ -577,7 +579,7 @@ What the gh/git guard stops, and what it does not.
 | Gap | Explanation | Mitigation |
 |-----|-------------|------------|
 | **Data exfiltration via `gh api` GET** | The agent can `gh api /repos/owner/repo/contents/secret.yml` to read and then exfiltrate via network | Use network proxy domain filtering (`--blocked-domains`) |
-| **Direct `curl` with `GH_TOKEN`** | Agent can `curl -H "Authorization: token $GH_TOKEN" https://api.github.com/...` bypassing the gh wrapper entirely | GH_TOKEN is only injected for Copilot agent; network proxy logs all outbound connections |
+| **Direct `curl` with `GH_TOKEN`** | Agent can `curl -H "Authorization: token $GH_TOKEN" https://api.github.com/...` bypassing the gh wrapper entirely | GH_TOKEN is only injected for Copilot and OpenCode; network proxy logs all outbound connections |
 | **Wrapper bypass via real binary path** | Agent can `cat $(which gh)` to discover the real `gh` path in the wrapper script and call it directly | The wrapper uses `exec` so the real path is in the script; Seatbelt blocks writes to the scratch bin dir, but the path stays readable |
 | **Agent edits `.github/workflows/`** | Agent can write CI configs that run on push, so destructive actions happen in CI, not locally | Code review (git diff). Under `standard` a feature-branch push is allowed and can trigger `on: push` workflows; only `strict`, which blocks every push, keeps them from running |
 | **Agent creates commits on main locally** | `git commit` on the main branch is allowed, being a local operation | The push guard prevents pushing those commits to the default branch |

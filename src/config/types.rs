@@ -396,7 +396,7 @@ pub struct GhGuardConfig {
     pub scope_check: Option<bool>,
     /// Block `gh auth token` to prevent token exfiltration (default: true).
     pub block_auth_token: Option<bool>,
-    /// Pre-extract GH_TOKEN before sandbox launch for Copilot agent (default: false).
+    /// Pre-extract GH_TOKEN before sandbox launch for Copilot and OpenCode (default: false).
     /// Only meaningful when block_auth_token is true — provides the token via env var
     /// while blocking the command that would expose it to arbitrary tools.
     pub inject_token: Option<bool>,
