@@ -1699,7 +1699,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let dir_str = dir.path().to_string_lossy().into_owned();
         assert!(
-            dir.path().starts_with(std::env::temp_dir()),
+            dir.path().starts_with(tempfile::env::temp_dir()),
             "test premise: tempdir lives under the system temp dir"
         );
         let rules = vec![writable_rule(&dir_str)];

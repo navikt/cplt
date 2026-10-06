@@ -2654,7 +2654,7 @@ validate = false
     /// this machine has installed.
     #[test]
     fn write_grant_shadowing_an_exec_tool_dir_is_reported() {
-        let home = std::env::temp_dir().join(format!(
+        let home = tempfile::env::temp_dir().join(format!(
             "cplt-exec-warn-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -2716,7 +2716,7 @@ validate = false
     /// them; this is the test that says it was.
     #[test]
     fn write_grant_shadowing_an_agent_exec_dir_is_reported() {
-        let home = std::env::temp_dir().join(format!(
+        let home = tempfile::env::temp_dir().join(format!(
             "cplt-agent-exec-warn-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -2839,7 +2839,7 @@ validate = false
     /// created here: that absence is the whole test.
     #[test]
     fn an_agent_exec_dir_is_reported_before_cplt_creates_it() {
-        let home = std::env::temp_dir().join(format!(
+        let home = tempfile::env::temp_dir().join(format!(
             "cplt-agent-exec-absent-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -3207,7 +3207,7 @@ validate = false
         // containment rule and must keep working outside the repo.
         let tmp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
-        let outside = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let outside = std::fs::canonicalize(tempfile::env::temp_dir()).unwrap();
 
         let mut resolved = Config::default().merge(CliFlags::default()).unwrap();
         let repo_config = crate::repo_config::RepoConfig {

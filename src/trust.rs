@@ -1001,7 +1001,7 @@ approved_at = "2026-05-01T12:00:00Z"
     #[test]
     fn approved_path_matches_same_path() {
         // Same remote + same local checkout path → still trusted (no false re-prompt).
-        let dir = std::env::temp_dir();
+        let dir = tempfile::env::temp_dir();
         let entry = TrustEntry {
             repo: RepoIdentity {
                 remote: "github.com/navikt/spleis".to_string(),

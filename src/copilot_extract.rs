@@ -871,7 +871,8 @@ mod copilot_extraction_tests {
     /// Build a temp HOME plus a fake copilot whose body can inspect `$PKG`
     /// (the platform extraction dir).
     fn fixture(name: &str, script: &str) -> Fixture {
-        let root = std::env::temp_dir().join(format!("cplt-extract-{}-{name}", std::process::id()));
+        let root =
+            tempfile::env::temp_dir().join(format!("cplt-extract-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let home = root.join("home");
         let project = root.join("project");
@@ -1221,7 +1222,7 @@ mod copilot_extraction_tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn find_complete_dir_for_version_rejects_stale_old_version() {
-        let tmp = std::env::temp_dir().join(format!("cplt-ver-test-{}", std::process::id()));
+        let tmp = tempfile::env::temp_dir().join(format!("cplt-ver-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         // Old version is fully extracted, current version is NOT.
         std::fs::create_dir_all(tmp.join("1.0.62")).unwrap();
@@ -1248,7 +1249,7 @@ mod copilot_extraction_tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn find_complete_dir_for_version_matches_prerelease_suffix() {
-        let tmp = std::env::temp_dir().join(format!("cplt-ver-pre-{}", std::process::id()));
+        let tmp = tempfile::env::temp_dir().join(format!("cplt-ver-pre-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("1.0.32-1-73748")).unwrap();
         std::fs::write(tmp.join("1.0.32-1-73748/.extraction-complete"), "").unwrap();
@@ -1331,7 +1332,7 @@ mod copilot_extraction_tests {
     /// verbatim would hand back the influence that clearing cwd and env removed.
     #[test]
     fn sanitized_path_drops_everything_the_project_controls() {
-        let tmp = std::env::temp_dir().join(format!(
+        let tmp = tempfile::env::temp_dir().join(format!(
             "cplt-path-sanitize-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
