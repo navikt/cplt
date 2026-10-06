@@ -344,12 +344,6 @@ impl Agent {
         Agent::Shell,
     ];
 
-    /// Whether the agent drives `gh` and so needs a GitHub token in
-    /// `GH_TOKEN`/`GITHUB_TOKEN` (passthrough and opt-in injection).
-    pub fn uses_gh_cli(&self) -> bool {
-        matches!(self, Agent::Copilot | Agent::OpenCode)
-    }
-
     /// The binary name to search for in PATH.
     pub fn binary_name(&self) -> &'static str {
         match self {

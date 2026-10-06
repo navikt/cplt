@@ -22,12 +22,9 @@ pub struct SandboxEnv {
     pub clear_first: bool,
 }
 
-/// GitHub token vars. Passed through only to agents that drive `gh`
-/// ([`Agent::uses_gh_cli`]); stripped for the rest.
-const GH_TOKEN_ONLY_VARS: &[&str] = &["GH_TOKEN", "GITHUB_TOKEN"];
-
-/// Copilot's own token var. Stripped for every other agent.
-const COPILOT_ONLY_VARS: &[&str] = &["COPILOT_GITHUB_TOKEN"];
+/// Environment variables that are Copilot-specific and should not be exposed
+/// to other agents. These contain GitHub auth tokens that OpenCode doesn't need.
+const COPILOT_ONLY_VARS: &[&str] = &["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"];
 
 /// Environment variable prefix that is Copilot-specific.
 const COPILOT_ONLY_PREFIXES: &[&str] = &["COPILOT_"];
@@ -37,13 +34,16 @@ fn is_agent_suppressed(key: &str, agent: Agent) -> bool {
     if agent == Agent::Copilot {
         return false; // Copilot gets everything in the allowlist
     }
-    if GH_TOKEN_ONLY_VARS.contains(&key) {
-        return !agent.uses_gh_cli();
+    if COPILOT_ONLY_VARS.contains(&key) {
+        return true;
     }
-    COPILOT_ONLY_VARS.contains(&key)
-        || COPILOT_ONLY_PREFIXES
-            .iter()
-            .any(|prefix| key.starts_with(prefix))
+    if COPILOT_ONLY_PREFIXES
+        .iter()
+        .any(|prefix| key.starts_with(prefix))
+    {
+        return true;
+    }
+    false
 }
 
 /// Loopback spellings that must NEVER be sent to the CONNECT proxy.
