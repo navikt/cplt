@@ -907,17 +907,20 @@ cplt config set allow.read "~/.config/pnpm/auth.ini"
 
 Or set the key back to `false`. A token in `config.yaml` (pnpm 11 accepts an `_auth` entry there) stays readable either way. See [Private registries](known-impacts.md#private-registries).
 
-## Dropping the Keychain grant (`sandbox.keychain_substitute`) — EXPERIMENTAL
+<a id="dropping-the-keychain-grant-sandboxkeychain_substitute--experimental"></a>
 
-Off by default. macOS only; on Linux it does nothing. `.cplt.toml` cannot set it.
+## Dropping the Keychain grant (`sandbox.keychain_substitute`)
+
+On by default for Copilot, off for the other agents. macOS only; on Linux it does nothing. `.cplt.toml` cannot set it. An explicit value applies to every agent:
 
 ```bash
-cplt config set sandbox.keychain_substitute true
+cplt config set sandbox.keychain_substitute false   # keep the Keychain grant
+cplt config set sandbox.keychain_substitute true    # also try it for Claude Code and Antigravity
 ```
 
-On, it removes the read+write grant on `~/Library/Keychains` for an agent that can authenticate another way, and hands that credential over instead. For Copilot that is a GitHub token: an exported `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN`, or, when none is set, what `gh auth token --hostname github.com` prints at launch, passed in as `GH_TOKEN`. The startup summary shows `Keychain: denied` and names the source. With the key off, the profile and the agent's environment are exactly what they were before the key existed.
+When it applies, it removes the read+write grant on `~/Library/Keychains` for an agent that can authenticate another way, and hands that credential over instead. For Copilot that is a GitHub token: an exported `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN`, or, when none is set, what `gh auth token --hostname github.com` prints at launch, passed in as `GH_TOKEN`. The startup summary shows `Keychain: denied` and names the source. If `gh` is not installed, not signed in, or prints nothing, the Keychain grant stays for that run. It also stays when `gh` is signed in to github.com as a different user than Copilot's own login, or Copilot is signed in to another host such as GitHub Enterprise, so Copilot never switches account without you noticing; the startup summary names both. Copilot's login comes from the account name on its `copilot-cli` Keychain item, read on the host without reading the secret. If there is no such item, the substitute goes ahead. With the key `false`, the profile and the agent's environment are exactly what they were before the key existed.
 
-What it costs for Copilot: the token sits in the agent's environment, Copilot authenticates as `gh`'s account rather than a separate `copilot /login` account, and an exported token GitHub rejects becomes a sign-in error where Copilot would otherwise have fallen back to its stored login. Unset the key or the token variable to get the old behaviour back. The per-agent details, and what was and was not verified, are in [SECURITY.md](../SECURITY.md#keychain-access-is-all-or-nothing).
+What it costs for Copilot: the token sits in the agent's environment, Copilot authenticates with `gh`'s token rather than its own stored one, and an exported token GitHub rejects becomes a sign-in error where Copilot would otherwise have fallen back to its stored login. If Copilot reports a sign-in error, run `gh auth refresh` or `gh auth login` on the host, unset the stale token variable, or set the key to `false` to get the old behaviour back. The per-agent details, and what was and was not verified, are in [SECURITY.md](../SECURITY.md#keychain-access-is-all-or-nothing).
 
 ## No execute on `~/.copilot` (`sandbox.deny_copilot_dir_exec`)
 

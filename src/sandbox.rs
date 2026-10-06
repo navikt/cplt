@@ -1605,8 +1605,9 @@ pub fn named_root_git_dirs(roots: &[PathBuf]) -> Vec<PathBuf> {
 }
 
 /// The credential that stands in for the login Keychain this run, if any
-/// (#242). `None` keeps the grant. Always `None` with `enabled` false, which is
-/// `sandbox.keychain_substitute` and defaults off.
+/// (#242). `None` keeps the grant. Always `None` when
+/// [`keychain_substitute_enabled`] is false. A failed or empty `gh auth token`
+/// also yields `None`, so an existing user falls back to the grant.
 ///
 /// `Agent::credential_outside_keychain_on` answers from what the parent already
 /// has. This adds the Copilot case it cannot see (#277): a user signed in
@@ -1617,15 +1618,30 @@ pub fn keychain_substitute(
     agent: Agent,
     home: &Path,
     deny_env: &[String],
-    enabled: bool,
+    setting: Option<bool>,
 ) -> Option<crate::agent::KeychainSubstitute> {
     keychain_substitute_with(
         agent,
         home,
         deny_env,
-        enabled,
+        keychain_substitute_enabled(agent, setting),
         cfg!(target_os = "macos"),
-        exec::extract_gh_token,
+        || {
+            // Maintainer call: never switch identity silently. gh signed in as
+            // someone other than Copilot's own login keeps the grant (#696).
+            if agent == Agent::Copilot {
+                let gh = exec::gh_hosts_yml()
+                    .and_then(|p| crate::agent::read_small_regular_file(&p))
+                    .and_then(|s| gh_login(&s));
+                if let Some(gh) = &gh
+                    && let Some(why) = account_mismatch(gh, copilot_keychain_acct(gh).as_deref())
+                {
+                    let _ = ACCOUNT_MISMATCH.set(why);
+                    return None;
+                }
+            }
+            exec::extract_gh_token()
+        },
     )
 }
 
@@ -1633,6 +1649,85 @@ pub fn keychain_substitute(
 /// carry its token for `gh` and OpenCode (#693, #695).
 pub fn gh_configured() -> bool {
     exec::gh_hosts_yml().is_some_and(|p| p.exists())
+}
+
+/// Why the substitute was skipped for an account mismatch, for the launch
+/// summary to say why the grant stayed.
+pub static ACCOUNT_MISMATCH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The github.com `user:` from gh's `hosts.yml`.
+fn gh_login(hosts_yml: &str) -> Option<String> {
+    let mut in_github = false;
+    for line in hosts_yml.lines() {
+        if !line.starts_with(' ') {
+            in_github = line.trim_end() == "github.com:";
+        } else if in_github && let Some(u) = line.strip_prefix("    user:") {
+            return Some(u.trim().trim_matches(['"', '\'']).to_string()).filter(|u| !u.is_empty());
+        }
+    }
+    None
+}
+
+/// The `acct` attribute of Copilot CLI's own Keychain item (`copilot-cli`),
+/// shaped `https://github.com:<login>`. Read on the host from the item's
+/// attributes only (no `-w`/`-g`), so the secret is never read and nothing
+/// prompts. Unlike `~/.copilot/config.json`, the sandboxed agent cannot
+/// rewrite this without the Keychain grant it is about to lose.
+///
+/// Tries the item for `gh_login` first, so several stored accounts resolve to
+/// the matching one; otherwise whichever item `security` returns first.
+/// `None` when there is no item, `security` fails, or it outlives 1 s.
+fn copilot_keychain_acct(gh_login: &str) -> Option<String> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let query = |acct: Option<&str>| {
+        #[allow(clippy::disallowed_methods)] // absolute system path
+        let mut cmd = std::process::Command::new("/usr/bin/security");
+        cmd.args(["find-generic-password", "-s", "copilot-cli"]);
+        if let Some(a) = acct {
+            cmd.args(["-a", a]);
+        }
+        let out = exec::bounded_stdout(cmd, std::time::Duration::from_secs(1))?;
+        keychain_acct(&String::from_utf8_lossy(&out))
+    };
+    query(Some(&format!("https://github.com:{gh_login}"))).or_else(|| query(None))
+}
+
+/// The `"acct"<blob>="..."` value from `security find-generic-password` output.
+fn keychain_acct(out: &str) -> Option<String> {
+    out.lines().find_map(|l| {
+        let v = l
+            .trim()
+            .strip_prefix("\"acct\"<blob>=\"")?
+            .strip_suffix('"')?;
+        Some(v.to_string())
+    })
+}
+
+/// `Some(reason)` when gh's github.com login differs from Copilot's Keychain
+/// account (another user, or a non-github.com host such as GitHub Enterprise),
+/// so the substitute must not switch identity. `None` (proceed) on a match or
+/// when Copilot's account is unknown.
+fn account_mismatch(gh: &str, copilot_acct: Option<&str>) -> Option<String> {
+    let acct = copilot_acct?;
+    match acct.strip_prefix("https://github.com:") {
+        Some(cp) if cp.eq_ignore_ascii_case(gh) => None,
+        Some(cp) => Some(format!("gh is {gh}, Copilot is {cp}")),
+        None => Some(format!(
+            "gh is {gh} on github.com, Copilot is on {}",
+            acct.rsplit_once(':').map_or(acct, |(h, _)| h)
+        )),
+    }
+}
+
+/// `sandbox.keychain_substitute` as it applies to `agent`. Unset is on for
+/// Copilot only: its `gh auth token` path is proven and falls back to the
+/// grant on failure. Other agents stay opt-in, since a misjudged trade strands
+/// them at a login they cannot reach from inside the sandbox.
+#[must_use]
+pub fn keychain_substitute_enabled(agent: Agent, setting: Option<bool>) -> bool {
+    setting.unwrap_or(agent == Agent::Copilot)
 }
 
 /// [`keychain_substitute`] with the platform and the `gh` call as parameters,
@@ -4961,5 +5056,39 @@ mod tests {
             vec![bare, repo_git],
             "overlapping and repeated grants must not emit duplicate denies"
         );
+    }
+}
+
+#[cfg(test)]
+mod account_tests {
+    use super::{account_mismatch, gh_login, keychain_acct};
+
+    #[test]
+    fn reads_gh_login_and_keychain_acct() {
+        let hosts = "ghe.example:\n    user: other\ngithub.com:\n    users:\n        alice:\n    git_protocol: ssh\n    user: alice\n";
+        assert_eq!(gh_login(hosts).as_deref(), Some("alice"));
+        assert_eq!(gh_login("ghe.example:\n    user: other\n"), None);
+        let out = "keychain: \"/x\"\nattributes:\n    \"acct\"<blob>=\"https://github.com:Bob\"\n    \"svce\"<blob>=\"copilot-cli\"\n";
+        assert_eq!(
+            keychain_acct(out).as_deref(),
+            Some("https://github.com:Bob")
+        );
+        assert_eq!(keychain_acct(""), None);
+    }
+
+    #[test]
+    fn mismatch_decision() {
+        assert_eq!(
+            account_mismatch("alice", Some("https://github.com:alice")),
+            None
+        );
+        assert_eq!(
+            account_mismatch("Alice", Some("https://github.com:aLICE")),
+            None
+        );
+        assert_eq!(account_mismatch("alice", None), None, "unknown proceeds");
+        assert!(account_mismatch("alice", Some("https://github.com:bob")).is_some());
+        let ghe = account_mismatch("alice", Some("https://ghe.example:alice")).unwrap();
+        assert!(ghe.contains("https://ghe.example"));
     }
 }

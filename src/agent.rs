@@ -283,7 +283,7 @@ const SMALL_FILE_LIMIT: u64 = 64 * 1024;
 /// only a regular file of at most [`SMALL_FILE_LIMIT`] bytes is read (a
 /// symlink to `/dev/zero` is a character device and is refused). `None` for
 /// anything else.
-fn read_small_regular_file(path: &Path) -> Option<String> {
+pub(crate) fn read_small_regular_file(path: &Path) -> Option<String> {
     use std::io::Read as _;
     use std::os::unix::fs::OpenOptionsExt as _;
     let file = std::fs::OpenOptions::new()

@@ -18,7 +18,7 @@ cplt sandboxes AI coding agents. Currently that means **GitHub Copilot CLI**, **
 | Env isolation   | `GH_TOKEN` not injected (one-time file)¹; `COPILOT_*` passed | suppressed (see below)                          | suppressed (see below)           | suppressed (see below)          | suppressed (see below); `DISABLE_AUTOUPDATER=1` injected |
 | Auto-detected   | Yes (priority 1)                    | Yes (priority 2)                                                    | Yes (priority 3)                             | No (explicit only, name collision risk)     | No (explicit only)                           |
 
-¹ Unless the experimental `sandbox.keychain_substitute` is on *and* the agent has a credential it can reach without the Keychain — see [Keychain access is all-or-nothing](#keychain-access-is-all-or-nothing). For Copilot that also means `gh`'s token *is* injected into the environment, as `GH_TOKEN`, in place of the Keychain.
+¹ Unless `sandbox.keychain_substitute` applies (on by default for Copilot, opt-in for the others) *and* the agent has a credential it can reach without the Keychain — see [Keychain access is all-or-nothing](#keychain-access-is-all-or-nothing). For Copilot that is the default: `gh`'s token *is* injected into the environment, as `GH_TOKEN`, in place of the Keychain, and the grant stays when `gh` has no token.
 
 ### GitHub token handling per agent
 
@@ -783,16 +783,20 @@ command fails with `SecKeychainSearchCopyNext: The specified item could not be
 found in the keychain` (exit 44). Blocking securityd's Mach service instead is
 neither necessary nor sufficient on its own.
 
-**The trade is off by default.** It is gated on one experimental config key,
-`sandbox.keychain_substitute` (default `false`), covering every agent at once:
+**On for Copilot, off for the others.** The trade is gated on one config key,
+`sandbox.keychain_substitute`. Unset, it is on for Copilot and off for every
+other agent. An explicit value applies to every agent:
 
 ```toml
 [sandbox]
-keychain_substitute = true   # EXPERIMENTAL
+keychain_substitute = false   # keep the Keychain grant, Copilot included
 ```
 
-With it unset, the Keychain grant is exactly what `needs_keychain()` says, for
-every agent, as in every release before the key existed. It is off because of the
+Copilot is on by default because its path is proven and has a fallback: when
+`gh auth token` fails, prints nothing, or `gh` is not installed, the grant stays
+and nothing changes for that run. With the key `false`, the Keychain grant is
+exactly what `needs_keychain()` says, for every agent, as in every release
+before the key existed. It stays off for the other agents because of the
 shape of the failure: if the trade misjudges an agent, the user can neither
 authenticate nor recover *from inside the sandbox*, since the recovery path is the
 credential store the trade just removed. That is what PR #173 hit, and what the
@@ -800,15 +804,15 @@ first Antigravity verification for this change turned out to be — it passed on
 because a stale fallback file happened to exist on the test host. Nobody's
 authentication should change until they ask for it.
 
-**If your agent cannot authenticate with the key on:** unset
-`sandbox.keychain_substitute` (or unset the substitute variable, e.g.
+**If your agent cannot authenticate with the key on:** set
+`sandbox.keychain_substitute = false` (or unset the substitute variable, e.g.
 `CLAUDE_CODE_OAUTH_TOKEN`) and the grant comes back on the next run. If the agent
 has lost its login entirely, run it once outside cplt to sign in — the browser
 flow needs access cplt does not grant by default.
 
 **What the key does when it is on.** Per agent:
 
-| Agent | Grant dropped when (`keychain_substitute = true`) | What the agent holds instead | Refresh |
+| Agent | Grant dropped when the key applies (Copilot by default, others with `true`) | What the agent holds instead | Refresh |
 |---|---|---|---|
 | Copilot | `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN` is set, or `gh auth token --hostname github.com` prints one at launch | that GitHub token, in the environment | none — `gh`'s OAuth token and PATs do not refresh |
 | Claude Code | `CLAUDE_CODE_OAUTH_TOKEN` is set | that OAuth token | none — see below |
@@ -894,7 +898,7 @@ Copilot. Only credentials that are durable for a whole session qualify.
   read-only. Determined by reading goose's source
   (`aaif-goose/goose`), not by inspecting the credential's shape.
 
-- **Copilot** — probed (#277) with copilot 1.0.89 on macOS, running
+- **Copilot** — on by default since #696. Probed (#277) with copilot 1.0.89 on macOS, running
   `copilot -p ... --silent` under cplt's real profile with `keychain_substitute`
   on and no `~/Library/Keychains` rule in it. With `GH_TOKEN` set to the output of
   `gh auth token` (an OAuth `gho_` token), Copilot authenticated and answered.
@@ -918,10 +922,21 @@ Copilot. Only credentials that are durable for a whole session qualify.
     to its stored login when the environment token fails. With the grant dropped
     there is nothing to fall back to. A stale `GITHUB_TOKEN` exported for
     something else, or a stale gh login, will show up as a sign-in error;
-    unset the variable, run `gh auth login`, or turn the key off.
-  - **The account can change.** Copilot now authenticates as `gh`'s
-    github.com account (or the exported token's), not a separate
-    `copilot /login` account stored in the Keychain.
+    unset the variable, run `gh auth refresh` or `gh auth login` on the host,
+    or set `sandbox.keychain_substitute = false`.
+  - **The account is checked, not trusted to the agent.** Before handing over
+    `gh auth token`, cplt compares `gh`'s github.com `user:` with the `acct`
+    attribute of Copilot's own Keychain item (`copilot-cli`,
+    `https://github.com:<login>`), read on the host with
+    `/usr/bin/security find-generic-password` without `-w`/`-g`, so the secret
+    is not read and nothing prompts. A different user, or an item on another
+    host (GitHub Enterprise), keeps the grant and the summary says why. No item,
+    or a `security` error or timeout (1 s), lets the substitute proceed.
+    `~/.copilot/config.json` is not consulted: the agent can rewrite it.
+    An exported token is used as-is, without this check. Once the grant is kept
+    for a real mismatch, the agent has Keychain write access for that session
+    and could edit the item so the next launch keeps it too, the same exposure
+    as before this default.
   - **The token sits in the agent's environment** — the same exposure
     `gh_guard.inject_token` has, which is why that key is marked dangerous. The
     trade here is that token instead of the whole login Keychain.

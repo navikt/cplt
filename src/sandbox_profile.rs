@@ -4043,6 +4043,23 @@ mod tests {
         });
     }
 
+    /// Unset `sandbox.keychain_substitute` is on for Copilot only; an
+    /// explicit value wins for every agent, so `false` restores the grant.
+    #[test]
+    fn keychain_substitute_default_is_per_agent() {
+        use crate::agent::Agent;
+        use crate::sandbox::keychain_substitute_enabled as on;
+        for &agent in Agent::ALL {
+            assert_eq!(
+                on(agent, None),
+                agent == Agent::Copilot,
+                "{agent:?} default"
+            );
+            assert!(on(agent, Some(true)), "{agent:?} explicit true");
+            assert!(!on(agent, Some(false)), "{agent:?} explicit false");
+        }
+    }
+
     /// Every env var any agent's substitute could come from, cleared so the
     /// host shell cannot decide these tests.
     const SUBSTITUTE_VARS: [(&str, Option<&str>); 4] = [

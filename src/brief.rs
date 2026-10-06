@@ -953,7 +953,7 @@ mod tests {
             allow_docker: false,
             // #257 added this after this branch forked; the fixture is a
             // full literal, so every new field lands here.
-            keychain_substitute: false,
+            keychain_substitute: Some(false),
             allow_build_credentials: false,
             allow_git_worktrees: false,
             worktree_walk_max_dirs: crate::worktrees::DEFAULT_WALK_MAX_DIRS,

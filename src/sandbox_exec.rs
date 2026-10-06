@@ -437,13 +437,24 @@ const GH_AUTH_TOKEN_EOF_GRACE: std::time::Duration = std::time::Duration::from_m
 /// decides to prompt would then block on a read nobody answers.
 #[allow(clippy::disallowed_methods)] // gh resolved by trusted_gh() at the call site
 fn gh_auth_token(gh: &Path, timeout: std::time::Duration) -> Option<String> {
-    use std::io::Read as _;
-
     let mut cmd = std::process::Command::new(gh);
     cmd.args(["auth", "token", "--hostname", "github.com"]);
     for var in GH_TOKEN_VARS {
         cmd.env_remove(var);
     }
+    let buf = bounded_stdout(cmd, timeout)?;
+    let token = String::from_utf8_lossy(&buf).trim().to_string();
+    (!token.is_empty()).then_some(token)
+}
+
+/// Run `cmd` with null stdin and stderr and return its stdout, or `None` on
+/// spawn failure, non-zero exit, or a child outliving `timeout` (killed and
+/// reaped). See [`gh_auth_token`] for why the reader is never joined.
+pub(crate) fn bounded_stdout(
+    mut cmd: std::process::Command,
+    timeout: std::time::Duration,
+) -> Option<Vec<u8>> {
+    use std::io::Read as _;
     let mut child = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -465,11 +476,7 @@ fn gh_auth_token(gh: &Path, timeout: std::time::Duration) -> Option<String> {
     // behind may still hold the other one, which is why this wait is bounded
     // too: an unbounded one here is the same hang in a different place.
     let buf = rx.recv_timeout(GH_AUTH_TOKEN_EOF_GRACE).ok()?;
-    if !status.success() {
-        return None;
-    }
-    let token = String::from_utf8_lossy(&buf).trim().to_string();
-    (!token.is_empty()).then_some(token)
+    status.success().then_some(buf)
 }
 
 /// Whether the child will already have a usable GitHub token in its own
@@ -604,7 +611,13 @@ fn should_cache_exec_token(
         && !substitute_carries_gh_token(substitute)
         && !deny_env.iter().any(|d| d == "GH_TOKEN")
         && (agent != Agent::Copilot
-            || (cfg!(target_os = "linux") && !child_keeps_a_github_token(deny_env)))
+            // gh reads only GH_TOKEN/GITHUB_TOKEN, not COPILOT_GITHUB_TOKEN.
+            // On macOS gh has the Keychain unless a substitute dropped it.
+            || ((cfg!(target_os = "linux") || substitute.is_some())
+                && !GH_TOKEN_VARS[..2].iter().any(|var| {
+                    !deny_env.iter().any(|d| d == var)
+                        && std::env::var(var).is_ok_and(|v| !v.trim().is_empty())
+                })))
 }
 
 /// The scratch dir holding `.gh-exec-token`, for `cplt gh-gate`.
@@ -2265,6 +2278,27 @@ mod gh_token_extraction_tests {
                     should_cache_exec_token(Agent::Copilot, &[], None, true),
                     cfg!(target_os = "linux"),
                     "macOS Copilot has the Keychain; Linux Copilot needs the cache"
+                );
+            },
+        );
+        // COPILOT_GITHUB_TOKEN alone does not authenticate gh (#696 review).
+        temp_env::with_vars(
+            [
+                ("GH_TOKEN", None::<&str>),
+                ("GITHUB_TOKEN", None),
+                ("COPILOT_GITHUB_TOKEN", Some("t")),
+            ],
+            || {
+                let sub = crate::agent::KeychainSubstitute::EnvVar("COPILOT_GITHUB_TOKEN");
+                assert!(should_cache_exec_token(
+                    Agent::Copilot,
+                    &[],
+                    Some(&sub),
+                    true
+                ));
+                assert_eq!(
+                    should_cache_exec_token(Agent::Copilot, &[], None, true),
+                    cfg!(target_os = "linux")
                 );
             },
         );
