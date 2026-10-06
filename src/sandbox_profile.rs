@@ -1012,8 +1012,8 @@ fn emit_system_access(
     for rel in HOME_CONFIG_FILES {
         emit_home_config_read(sb, home, rel);
     }
-    // gh under GH_CONFIG_DIR or $XDG_CONFIG_HOME/gh; validate_config_paths
-    // refuses a path SBPL cannot name.
+    // gh under GH_CONFIG_DIR or $XDG_CONFIG_HOME/gh; a path SBPL cannot name
+    // is already left out.
     for p in crate::sandbox::policy::gh_config_files_elsewhere(Path::new(home)) {
         emit_home_config_read(sb, home, &p.to_string_lossy());
     }

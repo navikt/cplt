@@ -1744,7 +1744,7 @@ pub fn claude_keychain_nudge(
 ) -> Option<&'static str> {
     (macos && agent == Agent::Claude && keychain_substitute_enabled(agent, setting) && !has_token)
         .then_some(
-            "Claude can read every item in your login Keychain. Run `claude setup-token` \
+            "Claude can read login Keychain items whose ACL lets it. Run `claude setup-token` \
              and export the token as CLAUDE_CODE_OAUTH_TOKEN; cplt then drops the Keychain grant.",
         )
 }
@@ -2689,9 +2689,6 @@ fn validate_config_paths(config: &SandboxConfig) -> Result<(), String> {
         policy::validate_sbpl_path(dir).map_err(|e| format!("Named repository .git dir: {e}"))?;
     }
     policy::validate_sbpl_path(config.home_dir).map_err(|e| format!("Home dir: {e}"))?;
-    for f in policy::gh_config_files_elsewhere(config.home_dir) {
-        policy::validate_sbpl_path(&f).map_err(|e| format!("gh config dir: {e}"))?;
-    }
     // #524: the profile keeps a dotfiles target read-only only with a rule
     // naming it. One the profile cannot name inside a writable tree would stay
     // writable, so refuse, as for every other path here. Outside a writable
@@ -3711,6 +3708,26 @@ mod tests {
         assert!(err.contains("Managed worktree root"), "{err}");
     }
 
+    /// A gh config dir SBPL cannot name launches without the gh grant instead
+    /// of refusing: such paths launched before the grant existed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unnameable_gh_config_dir_launches_without_grant() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let gh = home.join("g(h);");
+        temp_env::with_vars(
+            [
+                ("GH_CONFIG_DIR", Some(gh.as_os_str())),
+                ("XDG_CONFIG_HOME", None),
+            ],
+            || {
+                assert!(policy::gh_config_files_elsewhere(&home).is_empty());
+                assert!(super::validate_config_paths(&test_config(&home, &[])).is_ok());
+            },
+        );
+    }
+
     /// `sandbox.protect_pnpm_config` with an `XDG_CONFIG_HOME` the profile
     /// cannot name refuses the launch rather than dropping the token denies.
     #[cfg(target_os = "macos")]
@@ -3719,13 +3736,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = std::fs::canonicalize(tmp.path()).expect("canonicalize");
         let xdg = home.join("x\"dg");
-        // gh's own dir pinned to the default, so only pnpm sees the bad path.
-        let gh = home.join(".config/gh");
-        let vars = [
-            ("XDG_CONFIG_HOME", Some(xdg.as_os_str())),
-            ("GH_CONFIG_DIR", Some(gh.as_os_str())),
-        ];
-        temp_env::with_vars(vars, || {
+        temp_env::with_var("XDG_CONFIG_HOME", Some(&xdg), || {
             let mut config = test_config(&home, &[]);
             assert!(super::validate_config_paths(&config).is_ok(), "key off");
             config.protect_pnpm_config = true;
