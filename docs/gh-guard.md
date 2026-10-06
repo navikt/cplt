@@ -69,7 +69,7 @@ enabled = true              # blocks destructive gh operations
 mode = "block"              # block | warn | audit
 scope_check = true          # enforce repo-scoping on write commands
 block_auth_token = true     # deny "gh auth token" exfiltration
-inject_token = false        # inject GH_TOKEN into sandbox (opt-in; Copilot, OpenCode)
+inject_token = false        # inject GH_TOKEN into sandbox (opt-in)
 unknown_command = "block"   # block|allow unrecognized gh commands
 allow_api_write = false     # allow gh api write (POST/PUT/PATCH) to current repo (opt-in)
 allow_pr_merge = false      # allow gh pr merge into a ruleset-protected branch (opt-in)
@@ -260,7 +260,13 @@ enough. The file exists for well under a second, the token never appears as an
 environment variable, and after the delete no subprocess can get it back via
 `gh auth token`.
 
-The cache is written for Copilot only. OpenCode calling `gh auth token` gets "No cached token" even when `GH_TOKEN` is in its environment; `gh` itself still authenticates from that variable.
+The `gh auth token` cache is written for Copilot only. Every other agent calling `gh auth token` gets "No cached token".
+
+### How `gh` itself authenticates
+
+Inside the sandbox `gh` usually cannot read its token: it is in the Keychain, which most agents do not get, and token variables are stripped for every agent except Copilot. So with the gh guard on and `gh` configured on the host, cplt also writes the token to `$TMPDIR/.gh-exec-token` (mode `0600`) at launch, for every agent. When the wrapper runs an approved command, it sets `GH_TOKEN` from that file on the real `gh` process only. The agent's environment never gets it. This covers `gh auth git-credential`, so HTTPS `git push` through gh works too.
+
+An explicit `GH_TOKEN` or `GITHUB_TOKEN` in the environment wins, and `deny.env` naming `GH_TOKEN` turns the file off. The file is not deleted, since every `gh` call reads it. Like `.gh-token`, it is not a boundary: the agent runs as the same user and can read it.
 
 This path applies only:
 - to the Copilot agent (other agents have their own auth mechanisms)
@@ -299,11 +305,6 @@ or `ps -E` on macOS:
 [gh_guard]
 inject_token = true   # injects GH_TOKEN env var (visible to all subprocesses)
 ```
-
-OpenCode gets no Keychain in the sandbox, so `gh` there cannot read a token
-stored in the Keychain and gets 401. An exported `GH_TOKEN` or `GITHUB_TOKEN`
-reaches OpenCode; otherwise set `inject_token = true`. cplt prints a hint at
-launch when this applies.
 
 When a token is in the environment, exported or injected, `block_auth_token`
 does not hide it: the agent can read `$GH_TOKEN` directly. It only blocks
@@ -584,7 +585,7 @@ What the gh/git guard stops, and what it does not.
 | Gap | Explanation | Mitigation |
 |-----|-------------|------------|
 | **Data exfiltration via `gh api` GET** | The agent can `gh api /repos/owner/repo/contents/secret.yml` to read and then exfiltrate via network | Use network proxy domain filtering (`--blocked-domains`) |
-| **Direct `curl` with `GH_TOKEN`** | Agent can `curl -H "Authorization: token $GH_TOKEN" https://api.github.com/...` bypassing the gh wrapper entirely | GH_TOKEN is only injected for Copilot and OpenCode; network proxy logs all outbound connections |
+| **Direct `curl` with `GH_TOKEN`** | Agent can `curl -H "Authorization: token $GH_TOKEN" https://api.github.com/...` bypassing the gh wrapper entirely | GH_TOKEN is only injected for Copilot; other agents get it only on the real `gh` process (or by reading `$TMPDIR/.gh-exec-token`); network proxy logs all outbound connections |
 | **Wrapper bypass via real binary path** | Agent can `cat $(which gh)` to discover the real `gh` path in the wrapper script and call it directly | The wrapper uses `exec` so the real path is in the script; Seatbelt blocks writes to the scratch bin dir, but the path stays readable |
 | **Agent edits `.github/workflows/`** | Agent can write CI configs that run on push, so destructive actions happen in CI, not locally | Code review (git diff). Under `standard` a feature-branch push is allowed and can trigger `on: push` workflows; only `strict`, which blocks every push, keeps them from running |
 | **Agent creates commits on main locally** | `git commit` on the main branch is allowed, being a local operation | The push guard prevents pushing those commits to the default branch |
