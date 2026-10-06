@@ -918,7 +918,7 @@ cplt config set sandbox.keychain_substitute false   # keep the Keychain grant
 cplt config set sandbox.keychain_substitute true    # also try it for Antigravity
 ```
 
-For Claude Code, the grant goes when `CLAUDE_CODE_OAUTH_TOKEN` is exported. Create the token with `claude setup-token`; Claude Code then signs in with it alone and never reads the Keychain. Without the variable nothing changes, and `cplt check --agent claude` suggests the command. `ANTHROPIC_API_KEY` does not count, so a subscription login is never switched to API billing.
+For Claude Code, the grant goes when `CLAUDE_CODE_OAUTH_TOKEN` is exported. Create the token with `claude setup-token`; Claude Code then signs in with it alone and never reads the Keychain. Without the variable nothing changes, and `cplt --agent claude check` suggests the command. `ANTHROPIC_API_KEY` does not count, so a subscription login is never switched to API billing.
 
 If you already export `CLAUDE_CODE_OAUTH_TOKEN`, Claude Code loses the Keychain grant on your next launch. MCP servers that use OAuth then ask you to sign in once more, and Claude Code stores those tokens in `~/.claude/.credentials.json`. If Claude Code fails to sign in, do one of these:
 

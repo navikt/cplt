@@ -798,7 +798,7 @@ and nothing changes for that run. Claude Code is on by default for the same
 reason (#695): it drops the grant only when `CLAUDE_CODE_OAUTH_TOKEN` is set,
 and Claude Code then authenticates from that variable alone (see below). Without
 the variable the grant stays, so nothing changes for a Claude user who has not
-run `claude setup-token`; `cplt check --agent claude` suggests it while the
+run `claude setup-token`; `cplt --agent claude check` suggests it while the
 grant is in place. With the key `false`, the Keychain grant is exactly what
 `needs_keychain()` says, for every agent, as in every release before the key
 existed. It stays off for the other agents because of the shape of the failure:
