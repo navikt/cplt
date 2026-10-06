@@ -526,7 +526,7 @@ mod wildcard_tests {
 
     #[test]
     fn parsing_a_file_with_a_wildcard_still_returns_the_entries() {
-        let dir = std::env::temp_dir().join(format!("cplt-wild-{}", std::process::id()));
+        let dir = tempfile::env::temp_dir().join(format!("cplt-wild-{}", std::process::id()));
         // Removed first: a panic before the cleanup below would otherwise leave
         // this directory behind and the next run would read stale state.
         let _ = std::fs::remove_dir_all(&dir);
@@ -643,8 +643,8 @@ mod tests {
 
     /// Create a unique temp directory for test isolation.
     fn test_dir(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("cplt-test-domains-{name}-{}", std::process::id()));
+        let dir = tempfile::env::temp_dir()
+            .join(format!("cplt-test-domains-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

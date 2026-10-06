@@ -2301,7 +2301,7 @@ ELECTRON_RUN_AS_NODE=1 "/Applications/Visual Studio Code.app/Contents/Frameworks
     #[test]
     fn discover_electron_app_non_shim_returns_none() {
         // A compiled binary (non-text) should return None
-        let tmp = std::env::temp_dir().join("cplt-test-binary");
+        let tmp = tempfile::env::temp_dir().join("cplt-test-binary");
         std::fs::write(&tmp, [0x7f, 0x45, 0x4c, 0x46]).unwrap(); // ELF magic
         let result = discover_electron_app(&tmp);
         std::fs::remove_file(&tmp).ok();
@@ -2311,7 +2311,7 @@ ELECTRON_RUN_AS_NODE=1 "/Applications/Visual Studio Code.app/Contents/Frameworks
     #[test]
     fn discover_electron_app_non_copilot_shim_returns_none() {
         // A shell script without copilotCLIShim.js marker
-        let tmp = std::env::temp_dir().join("cplt-test-non-copilot");
+        let tmp = tempfile::env::temp_dir().join("cplt-test-non-copilot");
         std::fs::write(&tmp, "#!/bin/sh\necho hello\n").unwrap();
         let result = discover_electron_app(&tmp);
         std::fs::remove_file(&tmp).ok();
@@ -2320,13 +2320,13 @@ ELECTRON_RUN_AS_NODE=1 "/Applications/Visual Studio Code.app/Contents/Frameworks
 
     #[test]
     fn copilot_sea_cache_dir_returns_none_if_missing() {
-        let tmp = std::env::temp_dir().join("cplt-test-no-cache");
+        let tmp = tempfile::env::temp_dir().join("cplt-test-no-cache");
         assert!(copilot_sea_cache_dir(&tmp).is_none());
     }
 
     #[test]
     fn copilot_sea_cache_dir_returns_some_if_parent_exists() {
-        let tmp = std::env::temp_dir().join("cplt-test-cache-parent");
+        let tmp = tempfile::env::temp_dir().join("cplt-test-cache-parent");
         std::fs::create_dir_all(tmp.join(".cache/copilot")).unwrap();
         let expected = tmp.join(".cache/copilot/pkg");
         assert_eq!(copilot_sea_cache_dir(&tmp), Some(expected));
@@ -2334,7 +2334,7 @@ ELECTRON_RUN_AS_NODE=1 "/Applications/Visual Studio Code.app/Contents/Frameworks
 
     #[test]
     fn copilot_sea_cache_dir_returns_some_if_exists() {
-        let tmp = std::env::temp_dir().join("cplt-test-cache-exists");
+        let tmp = tempfile::env::temp_dir().join("cplt-test-cache-exists");
         std::fs::create_dir_all(tmp.join(".cache/copilot/pkg")).unwrap();
         let expected = tmp.join(".cache/copilot/pkg");
         assert_eq!(copilot_sea_cache_dir(&tmp), Some(expected));

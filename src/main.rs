@@ -11459,7 +11459,8 @@ mod tests {
             DomainVerdict, ObservedDomain, ProxySnapshot, SnapshotAvailability, SnapshotCompletion,
             SnapshotIntegrity,
         };
-        let dir = std::env::temp_dir().join(format!("cplt-observe-emit-{}", std::process::id()));
+        let dir =
+            tempfile::env::temp_dir().join(format!("cplt-observe-emit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("domains.txt");
         // The list is already sorted+unique (as the final snapshot
@@ -11533,7 +11534,8 @@ mod tests {
             AdmissionStatus, DomainVerdict, ObservedDomain, ProxySnapshot, SnapshotAvailability,
             SnapshotCompletion, SnapshotIntegrity,
         };
-        let dir = std::env::temp_dir().join(format!("cplt-observe-refuse-{}", std::process::id()));
+        let dir =
+            tempfile::env::temp_dir().join(format!("cplt-observe-refuse-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("domains.txt");
         std::fs::write(&out, "stale.example\n").unwrap();
@@ -12608,7 +12610,7 @@ mod tests {
 
     #[test]
     fn tool_dir_env_var_that_is_unset_or_missing_grants_nothing() {
-        let home = std::env::temp_dir();
+        let home = tempfile::env::temp_dir();
         assert_eq!(accept_tool_dir(None, &home), None);
         assert_eq!(
             accept_tool_dir(Some(String::new()), &home),
@@ -12623,7 +12625,7 @@ mod tests {
 
     #[test]
     fn tool_dir_env_var_pointing_at_an_unsafe_root_is_refused() {
-        let home = std::env::temp_dir();
+        let home = tempfile::env::temp_dir();
         // HOME itself, and the filesystem root: granting either would hand the
         // sandbox read access to everything the guard exists to withhold.
         assert_eq!(
@@ -12678,8 +12680,8 @@ mod tests {
     /// separately.
     #[test]
     fn check_net_and_the_proxy_block_the_same_set() {
-        let dir =
-            std::env::temp_dir().join(format!("cplt-check-net-blocklist-{}", std::process::id()));
+        let dir = tempfile::env::temp_dir()
+            .join(format!("cplt-check-net-blocklist-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("blocked.txt");
@@ -12725,7 +12727,7 @@ mod tests {
     /// intent bit, so check reports the block the proxy enforces.
     #[test]
     fn check_net_matches_the_proxy_for_an_enabled_but_empty_allowlist() {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = tempfile::env::temp_dir().join(format!(
             "cplt-check-net-empty-allowlist-{}",
             std::process::id()
         ));
@@ -12788,7 +12790,7 @@ mod tests {
     /// BLOCKED in check. Both now come from `allowlist_spec`.
     #[test]
     fn check_net_matches_the_proxy_for_allow_domains() {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = tempfile::env::temp_dir().join(format!(
             "cplt-check-net-allow-domains-{}",
             std::process::id()
         ));
@@ -12865,8 +12867,8 @@ mod tests {
     /// own hosts are now always part of an active allowlist.
     #[test]
     fn user_allowlist_keeps_the_agents_own_hosts_reachable() {
-        let dir =
-            std::env::temp_dir().join(format!("cplt-check-net-agent-hosts-{}", std::process::id()));
+        let dir = tempfile::env::temp_dir()
+            .join(format!("cplt-check-net-agent-hosts-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("allowed.txt");
@@ -12899,7 +12901,7 @@ mod tests {
     /// for one of them still blocks it, in check and in the live proxy.
     #[test]
     fn user_blocklist_still_blocks_an_agent_host() {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = tempfile::env::temp_dir().join(format!(
             "cplt-check-net-agent-host-blocked-{}",
             std::process::id()
         ));
