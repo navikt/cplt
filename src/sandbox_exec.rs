@@ -523,6 +523,14 @@ fn inject_gh_token_if_needed(
         return;
     }
     let Some(target) = injection_target(agent, deny_env) else {
+        if !token_vars_for(agent).is_empty() {
+            ui::warn(&format!(
+                "gh_guard.inject_token is on, but deny.env removes every token variable {} \
+                 reads ({}); no GitHub token is injected",
+                agent.display_name(),
+                token_vars_for(agent).join(", ")
+            ));
+        }
         return;
     };
     if let Some(token) = extract_gh_token() {
@@ -585,7 +593,7 @@ fn hint_opencode_gh_token(
     let env_has_token = child_keeps_a_github_token(agent, deny_env);
     if opencode_gh_token_hint_needed(agent, gh_guard, env_has_token, hosts.as_deref()) {
         ui::info(
-            "gh inside the sandbox has no token (it is in the Keychain); to inject it: \
+            "gh inside the sandbox has no token (it is in the system keyring); to inject it: \
              cplt config set gh_guard.inject_token true --force",
         );
     }
