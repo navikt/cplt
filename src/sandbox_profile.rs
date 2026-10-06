@@ -3652,7 +3652,11 @@ mod tests {
     fn profile_grants_the_shared_home_config_files() {
         let project = std::path::Path::new("/projects/app");
         let home = std::path::Path::new("/Users/test");
-        let p = generate_profile(&test_options(project, home), &[]);
+        // CI exports XDG_CONFIG_HOME, which adds gh's files elsewhere.
+        let p = temp_env::with_vars(
+            [("GH_CONFIG_DIR", None::<&str>), ("XDG_CONFIG_HOME", None)],
+            || generate_profile(&test_options(project, home), &[]),
+        );
         // The section holds exactly the list: an entry chained onto this
         // backend alone fails here.
         let section: std::collections::BTreeSet<&str> = p
