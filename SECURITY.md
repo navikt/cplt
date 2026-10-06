@@ -112,7 +112,7 @@ The cost of the narrowing is that Pi can no longer create a **new** top-level en
 
 **Claude Code.** Not auto-detected either; select it with `--agent claude` (aliases `cc`, `claude-code`) or `sandbox.agent = "claude"`.
 
-- **Subscription auth works out of the box.** The OAuth token lives in `~/.claude/.credentials.json` (Linux) or the macOS login Keychain ("Claude Code-credentials"). Both are exposed to the sandbox, so the subscription flow needs no env var. That hands the sandboxed agent its own credentials, an inherent trade-off, the same one Copilot's Keychain access makes. Because subscription OAuth needs no env var, cplt does not emit the "needs auth" warning for Claude Code.
+- **Subscription auth works out of the box.** The OAuth token lives in `~/.claude/.credentials.json` (Linux) or the macOS login Keychain ("Claude Code-credentials"). Both are exposed to the sandbox, so the subscription flow needs no env var. On macOS the Keychain grant is dropped when `CLAUDE_CODE_OAUTH_TOKEN` is exported (see [Keychain access is all or nothing](#keychain-access-is-all-or-nothing)). That hands the sandboxed agent its own credentials, an inherent trade-off, the same one Copilot's Keychain access makes. Because subscription OAuth needs no env var, cplt does not emit the "needs auth" warning for Claude Code.
 - **Config dirs are read/write.** `~/.claude/` (sessions, projects, history, settings, credentials) and the top-level `~/.claude.json`.
 - **Host-persistence guard.** Inside that writable config dir, `statusline.sh`, `plugins/` and `settings.json` are explicitly write-denied. All three auto-execute the next time `claude` runs *outside* the sandbox, so a compromised agent could otherwise plant code that escapes via the next launch. `settings.json` was previously left writable on the grounds that it needs explicit user invocation; that was wrong — its `hooks` key auto-fires on `SessionStart`, `UserPromptSubmit` and other events, so it is now denied. `commands/`, `agents/` and `skills/` stay writable, and the reason previously given for that — that they run only when the user invokes them — was wrong. All three are **model-invocable**, and all three reach a host shell. Probed against Claude Code 2.1.261 in a scratch `CLAUDE_CONFIG_DIR`: a `skills/<name>/SKILL.md` and a `commands/<name>.md` are both listed to the model as "available for use with the Skill tool" with the user never naming them, and invoking either runs the `` !`cmd` `` shell preprocessing in its body; an `agents/<name>.md` accepts a `hooks:` block in its frontmatter, and its `Stop` hook ran a host command when the model spawned the agent. The invocations in that probe were forged from a stub API server, so what is established is that the CLI executes them on the model's word — not that a live model picked the planted file, which was not tested. The per-file `disable-model-invocation: true` key does block the first two (verified: the call is refused and the shell does not run), but it is **absent by default** — upstream's own wording, in the shipped binary, is "Both the user (`/<skill-name>`) and Claude can invoke skills by default" — so anything the agent writes is model-invocable unless the agent opts out, which a hostile one will not. What separates these three from `statusline.sh`, `plugins/` and `settings.json` is therefore not user invocation; it is only that the model has to select them rather than them firing at launch, and a description written to match ordinary prompts closes most of that gap. One thing still stands between a planted file and execution: the preprocessing goes through the normal Bash permission check. It was denied under default `-p` permissions and ran once Bash was allowed, so the vector lands on sessions with a Bash allowlist, `--dangerously-skip-permissions`, or auto mode, and prompts in a default interactive one.
 
@@ -866,6 +866,15 @@ Copilot. Only credentials that are durable for a whole session qualify.
   grant on its account would silently move a subscription user onto per-token API
   billing. Pass it explicitly with `--pass-env ANTHROPIC_API_KEY` if that is what
   you want.
+
+  MCP OAuth tokens are the cost. Claude Code keeps them in the Keychain on macOS
+  and falls back to plaintext `~/.claude/.credentials.json` when secure storage is
+  unavailable
+  ([credential management](https://code.claude.com/docs/en/authentication.md#credential-management)).
+  With the grant dropped, each MCP server that uses OAuth asks for one fresh
+  sign-in, and the new token then sits in that file, which the agent can read and
+  write. That exposes those MCP tokens, a smaller blast radius than every
+  Keychain item whose ACL lets the agent through.
 - **Antigravity** — no broker; the grant is dropped only when `agy`'s fallback
   token file is already there. `agy` prefers its keyring and writes the file only
   when the keyring fails: its own strings are "Failed to save token to keyring,
