@@ -18,7 +18,7 @@ cplt sandboxes AI coding agents. Currently that means **GitHub Copilot CLI**, **
 | Env isolation   | `GH_TOKEN` not injected (one-time file)¹; `COPILOT_*` passed | suppressed (see below)                          | suppressed (see below)           | suppressed (see below)          | suppressed (see below); `DISABLE_AUTOUPDATER=1` injected |
 | Auto-detected   | Yes (priority 1)                    | Yes (priority 2)                                                    | Yes (priority 3)                             | No (explicit only, name collision risk)     | No (explicit only)                           |
 
-¹ Dropped when the Keychain substitute applies (`sandbox.keychain_substitute`: on by default for Copilot and Claude Code, opt-in for the others) *and* the agent has a credential it can reach without the Keychain; see [Keychain access is all-or-nothing](#keychain-access-is-all-or-nothing). For Copilot that means `gh`'s token *is* injected as `GH_TOKEN` in place of the Keychain; the grant stays when `gh` has no token. For Claude Code it means `CLAUDE_CODE_OAUTH_TOKEN` is exported.
+¹ Dropped when the Keychain substitute applies (`sandbox.keychain_substitute`: on by default for Copilot and Claude Code, opt-in for the others) *and* the agent has a credential it can reach without the Keychain; see [Keychain access is all-or-nothing](#keychain-access-is-all-or-nothing). For Copilot that credential is an exported `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN`, or else `gh`'s token, injected as `GH_TOKEN`; with none of those the grant stays. For Claude Code it means `CLAUDE_CODE_OAUTH_TOKEN` is exported.
 
 ### GitHub token handling per agent
 
