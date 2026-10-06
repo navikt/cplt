@@ -971,11 +971,11 @@ fn install_command_wrappers(
 /// never gets the `.gh-exec-token` the wrapper hands to the real `gh`, and an
 /// HTTPS push fails wherever the Keychain is not granted. Overriding the helper
 /// via `GIT_CONFIG_*` env reaches every git in the sandbox without touching any
-/// file. The empty value first resets the helper list for that URL (git
-/// documents an empty `credential.helper` as "clear the list"), so the
-/// absolute-path helper from the user's gitconfig does not also run. Only the
-/// `https://github.com` context is touched; helpers for other hosts and the
-/// generic `credential.helper` stay as configured.
+/// file. The entry is appended, not a reset: git tries helpers in order, so the
+/// user's own helpers (osxkeychain, GCM, store) still run first, and where the
+/// absolute-path gh helper fails for lack of Keychain, git falls through to the
+/// wrapper. Clearing the list would break users whose push works today through
+/// another helper. Helpers for other hosts are untouched.
 ///
 /// Appends after any `GIT_CONFIG_COUNT` entries already set (the signing
 /// overrides, or a user's own via `--pass-env`) instead of replacing them.
@@ -996,8 +996,8 @@ fn route_github_credentials_through_gh_guard(cmd: &mut Command, inherit_env: boo
     }
 }
 
-/// The env vars that append the two `credential.https://github.com.helper`
-/// entries after `existing_count` config overrides. An unparsable count is
+/// The env vars that append the `credential.https://github.com.helper`
+/// entry after `existing_count` config overrides. An unparsable count is
 /// left alone (git would reject it anyway) and nothing is added.
 fn github_credential_helper_config(existing_count: Option<&str>) -> Vec<(String, String)> {
     const KEY: &str = "credential.https://github.com.helper";
@@ -1006,13 +1006,11 @@ fn github_credential_helper_config(existing_count: Option<&str>) -> Vec<(String,
     };
     vec![
         (format!("GIT_CONFIG_KEY_{n}"), KEY.to_string()),
-        (format!("GIT_CONFIG_VALUE_{n}"), String::new()),
-        (format!("GIT_CONFIG_KEY_{}", n + 1), KEY.to_string()),
         (
-            format!("GIT_CONFIG_VALUE_{}", n + 1),
+            format!("GIT_CONFIG_VALUE_{n}"),
             "!gh auth git-credential".to_string(),
         ),
-        ("GIT_CONFIG_COUNT".to_string(), (n + 2).to_string()),
+        ("GIT_CONFIG_COUNT".to_string(), (n + 1).to_string()),
     ]
 }
 
@@ -2142,24 +2140,24 @@ mod gh_token_extraction_tests {
     fn github_credential_helper_appends_after_existing_overrides() {
         let env = github_credential_helper_config(Some("2"));
         let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
-        assert_eq!(get("GIT_CONFIG_COUNT"), Some("4"));
+        assert_eq!(get("GIT_CONFIG_COUNT"), Some("3"));
         assert_eq!(
             get("GIT_CONFIG_KEY_2"),
             Some("credential.https://github.com.helper")
         );
         assert_eq!(
             get("GIT_CONFIG_VALUE_2"),
-            Some(""),
-            "empty value resets the list"
+            Some("!gh auth git-credential"),
+            "appended, no reset: user helpers keep precedence"
         );
-        assert_eq!(get("GIT_CONFIG_VALUE_3"), Some("!gh auth git-credential"));
+        assert!(get("GIT_CONFIG_KEY_3").is_none());
         assert!(
             get("GIT_CONFIG_KEY_0").is_none(),
             "existing entries untouched"
         );
 
         let fresh = github_credential_helper_config(None);
-        assert!(fresh.contains(&("GIT_CONFIG_COUNT".into(), "2".into())));
+        assert!(fresh.contains(&("GIT_CONFIG_COUNT".into(), "1".into())));
         assert!(fresh.contains(&(
             "GIT_CONFIG_KEY_0".into(),
             "credential.https://github.com.helper".into()
