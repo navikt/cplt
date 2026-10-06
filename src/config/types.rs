@@ -980,9 +980,10 @@ pub struct Resolved {
     pub allow_cache_exec: Vec<String>,
     pub allow_cache_exec_any: bool,
     pub allow_browser: bool,
-    /// EXPERIMENTAL: trade the macOS Keychain grant for a credential the agent
-    /// can reach without it (`sandbox.keychain_substitute`, default false).
-    pub keychain_substitute: bool,
+    /// Trade the macOS Keychain grant for a credential the agent can reach
+    /// without it (`sandbox.keychain_substitute`). `None` = per-agent default,
+    /// see [`crate::sandbox::keychain_substitute_enabled`].
+    pub keychain_substitute: Option<bool>,
     /// `sandbox.allow_build_credentials` (#463). Expanded into `allow_read`
     /// by `sandbox::build_credential_grants` at probe time.
     pub allow_build_credentials: bool,

@@ -515,9 +515,10 @@ impl Config {
 
         let allow_browser = bools.allow_browser;
 
-        // Experimental, config-only (#242). With it off the Keychain grant is
-        // exactly what `needs_keychain()` says.
-        let keychain_substitute = bools.keychain_substitute;
+        // Config-only (#242). Unset means the per-agent default (on for
+        // Copilot); `false` keeps the Keychain grant exactly as `needs_keychain()` says.
+        let _ = bools.keychain_substitute; // resolved per agent at launch
+        let keychain_substitute = self.sandbox.keychain_substitute;
         let allow_git_worktrees = bools.allow_git_worktrees;
         let worktree_walk_max_dirs = self
             .sandbox
@@ -1336,18 +1337,21 @@ impl Resolved {
             } else {
                 // Key on for Copilot and still granted: say why, or the
                 // user reads the key as broken (#277).
-                let why = if self.keychain_substitute && agent == crate::agent::Agent::Copilot {
-                    let all_denied = ["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"]
-                        .iter()
-                        .all(|v| self.deny_env.iter().any(|d| d == v));
-                    if all_denied {
-                        " (no token: deny.env strips every token variable)"
+                let why =
+                    if crate::sandbox::keychain_substitute_enabled(agent, self.keychain_substitute)
+                        && agent == crate::agent::Agent::Copilot
+                    {
+                        let all_denied = ["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"]
+                            .iter()
+                            .all(|v| self.deny_env.iter().any(|d| d == v));
+                        if all_denied {
+                            " (no token: deny.env strips every token variable)"
+                        } else {
+                            " (no token: gh auth token failed)"
+                        }
                     } else {
-                        " (no token: gh auth token failed)"
-                    }
-                } else {
-                    ""
-                };
+                        ""
+                    };
                 eprintln!(
                     "{blue}[cplt]{nc}    Keychain:      {yellow}allowed{nc}     {dim}~/Library/Keychains — every item {agent} can unlock{why}{nc}"
                 );
@@ -4230,7 +4234,7 @@ mod precedence {
                 key: "sandbox.keychain_substitute",
                 cli_on: None,
                 cli_off: None,
-                get: |r| r.keychain_substitute,
+                get: |r| r.keychain_substitute.unwrap_or(false),
                 default: false,
                 preset: None,
             },

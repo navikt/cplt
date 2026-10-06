@@ -1605,8 +1605,9 @@ pub fn named_root_git_dirs(roots: &[PathBuf]) -> Vec<PathBuf> {
 }
 
 /// The credential that stands in for the login Keychain this run, if any
-/// (#242). `None` keeps the grant. Always `None` with `enabled` false, which is
-/// `sandbox.keychain_substitute` and defaults off.
+/// (#242). `None` keeps the grant. Always `None` when
+/// [`keychain_substitute_enabled`] is false. A failed or empty `gh auth token`
+/// also yields `None`, so an existing user falls back to the grant.
 ///
 /// `Agent::credential_outside_keychain_on` answers from what the parent already
 /// has. This adds the Copilot case it cannot see (#277): a user signed in
@@ -1617,13 +1618,13 @@ pub fn keychain_substitute(
     agent: Agent,
     home: &Path,
     deny_env: &[String],
-    enabled: bool,
+    setting: Option<bool>,
 ) -> Option<crate::agent::KeychainSubstitute> {
     keychain_substitute_with(
         agent,
         home,
         deny_env,
-        enabled,
+        keychain_substitute_enabled(agent, setting),
         cfg!(target_os = "macos"),
         exec::extract_gh_token,
     )
@@ -1633,6 +1634,15 @@ pub fn keychain_substitute(
 /// carry its token for `gh` and OpenCode (#693, #695).
 pub fn gh_configured() -> bool {
     exec::gh_hosts_yml().is_some_and(|p| p.exists())
+}
+
+/// `sandbox.keychain_substitute` as it applies to `agent`. Unset is on for
+/// Copilot only: its `gh auth token` path is proven and falls back to the
+/// grant on failure. Other agents stay opt-in, since a misjudged trade strands
+/// them at a login they cannot reach from inside the sandbox.
+#[must_use]
+pub fn keychain_substitute_enabled(agent: Agent, setting: Option<bool>) -> bool {
+    setting.unwrap_or(agent == Agent::Copilot)
 }
 
 /// [`keychain_substitute`] with the platform and the `gh` call as parameters,
