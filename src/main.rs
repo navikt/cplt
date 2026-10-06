@@ -8152,17 +8152,26 @@ fn run_config_path(local: bool) -> ExitCode {
 /// `allowed_domains` file, and under `proxy.default_allowlist`. Both come from
 /// [`agent_allowlist`], the function the proxy and `cplt check` use, so the
 /// output is the effective list on this machine, not a copy of the constants.
-fn config_hosts(agent: agent::Agent) -> (Vec<String>, Vec<String>) {
+fn config_hosts(agent: agent::Agent, deny_env: &[String]) -> (Vec<String>, Vec<String>) {
     (
-        agent_allowlist(agent, false, true, &[]),
-        agent_allowlist(agent, true, false, &[]),
+        agent_allowlist(agent, false, true, deny_env),
+        agent_allowlist(agent, true, false, deny_env),
     )
+}
+
+/// The repo's `deny.env`, as a launch here would apply it: it only tightens,
+/// so it counts without trust.
+fn repo_deny_env() -> Vec<String> {
+    detect_project_root()
+        .and_then(|d| repo_config::load_repo_config(&d).ok().flatten())
+        .map(|l| l.config.deny.env)
+        .unwrap_or_default()
 }
 
 /// `cplt config hosts --json` output. nav-pilot reads this instead of keeping
 /// its own copy of the lists; bump `version` on any breaking change to the shape.
-fn config_hosts_json(agent: agent::Agent) -> serde_json::Value {
-    let (agent_hosts, default_allowlist) = config_hosts(agent);
+fn config_hosts_json(agent: agent::Agent, deny_env: &[String]) -> serde_json::Value {
+    let (agent_hosts, default_allowlist) = config_hosts(agent, deny_env);
     serde_json::json!({
         "version": 1,
         "agent_hosts": agent_hosts,
@@ -8178,10 +8187,11 @@ fn run_config_hosts(name: &str, json: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let deny_env = repo_deny_env();
     if json {
-        println!("{}", config_hosts_json(agent));
+        println!("{}", config_hosts_json(agent, &deny_env));
     } else {
-        let (agent_hosts, default_allowlist) = config_hosts(agent);
+        let (agent_hosts, default_allowlist) = config_hosts(agent, &deny_env);
         println!("Agent hosts (added to any active allowlist; a blocklist entry still wins):");
         for h in agent_hosts {
             println!("  {h}");
@@ -10838,7 +10848,7 @@ mod tests {
                 "shell",
             ] {
                 let agent: agent::Agent = name.parse().unwrap();
-                let v = config_hosts_json(agent);
+                let v = config_hosts_json(agent, &[]);
                 assert_eq!(v["version"], 1);
                 assert_eq!(
                     v["agent_hosts"],
@@ -10853,7 +10863,7 @@ mod tests {
             }
         });
         // Both sides empty would pass the loop above; pin known entries.
-        let copilot = config_hosts_json(agent::Agent::Copilot);
+        let copilot = config_hosts_json(agent::Agent::Copilot, &[]);
         let has = |key: &str, host: &str| {
             copilot[key]
                 .as_array()
@@ -12500,6 +12510,23 @@ mod tests {
         );
         // The serve-once cache is separate: `gh auth token` never reads this file.
         assert!(!dir.path().join(".gh-token").exists());
+    }
+
+    #[test]
+    fn exec_gh_token_prefers_token_dir_over_tmpdir() {
+        let cache = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(cache.path().join(".gh-exec-token"), "gho_cached\n").unwrap();
+        let got = temp_env::with_vars(
+            [
+                (sandbox::GH_TOKEN_DIR_ENV, cache.path().to_str()),
+                ("TMPDIR", other.path().to_str()),
+                ("GH_TOKEN", None),
+                ("GITHUB_TOKEN", None),
+            ],
+            exec_gh_token,
+        );
+        assert_eq!(got.as_deref(), Some("gho_cached"));
     }
 
     #[test]

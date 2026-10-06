@@ -607,6 +607,16 @@ fn should_cache_exec_token(
 /// The scratch dir holding `.gh-exec-token`, for `cplt gh-gate`.
 pub const GH_TOKEN_DIR_ENV: &str = "__CPLT_GH_TOKEN_DIR";
 
+/// The effective child env, `--pass-env` included: a token gh will use there
+/// makes the host credential in `.gh-exec-token` pointless. Blank counts as
+/// unset, as in `cplt gh-gate`.
+fn child_env_has_gh_token(cmd: &Command) -> bool {
+    cmd.get_envs().any(|(k, v)| {
+        (k == "GH_TOKEN" || k == "GITHUB_TOKEN")
+            && v.is_some_and(|v| !v.to_string_lossy().trim().is_empty())
+    })
+}
+
 fn cache_gh_token_to_file(
     cmd: &mut Command,
     scratch_dir: &Path,
@@ -616,12 +626,7 @@ fn cache_gh_token_to_file(
     block_auth_token: bool,
 ) {
     let serve = block_auth_token && should_cache_token(agent, deny_env, substitute);
-    // The effective child env, `--pass-env` included: a token gh will use
-    // there makes the host credential in `.gh-exec-token` pointless.
-    let child_has_token = cmd.get_envs().any(|(k, v)| {
-        ["GH_TOKEN", "GITHUB_TOKEN"].iter().any(|t| k == *t) && v.is_some_and(|v| !v.is_empty())
-    });
-    let exec = !child_has_token
+    let exec = !child_env_has_gh_token(cmd)
         && should_cache_exec_token(
             agent,
             deny_env,
@@ -2102,6 +2107,26 @@ mod gh_token_extraction_tests {
             None,
             "all three denied leaves no channel to inject into"
         );
+    }
+
+    #[test]
+    #[allow(clippy::disallowed_methods)] // never spawned; only the env is read
+    fn child_env_gh_token_skips_exec_cache() {
+        let has = |vars: &[(&str, &str)]| {
+            let mut cmd = Command::new("true");
+            for (k, v) in vars {
+                cmd.env(k, v);
+            }
+            child_env_has_gh_token(&cmd)
+        };
+        assert!(!has(&[]));
+        assert!(has(&[("GH_TOKEN", "ghp_x")]));
+        assert!(has(&[("GITHUB_TOKEN", "ghp_x")]));
+        assert!(!has(&[("GH_TOKEN", "  ")]), "blank is unset");
+        assert!(!has(&[("COPILOT_GITHUB_TOKEN", "ghp_x")]), "gh ignores it");
+        let mut cmd = Command::new("true");
+        cmd.env("GH_TOKEN", "ghp_x").env_remove("GH_TOKEN");
+        assert!(!child_env_has_gh_token(&cmd), "removed is unset");
     }
 
     /// The exec cache is written for every agent once gh is configured, and
