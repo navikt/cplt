@@ -4650,7 +4650,12 @@ fn run_gh_gate(
         run_gh_lookup(real_gh, repo, lookup)
     }) {
         GateEffect::VerifyGraphql(targets) => {
-            match cplt::gh_graphql::verify_targets(real_gh, &targets, repo_scope) {
+            match cplt::gh_graphql::verify_targets(
+                real_gh,
+                exec_gh_token().as_deref(),
+                &targets,
+                repo_scope,
+            ) {
                 Ok(()) => GateEffect::ExecPlain { notice: None },
                 Err(reason) => {
                     refusal_effect(policy.mode, gh_proxy::graphql_target_refusal(&reason))
@@ -4667,7 +4672,11 @@ fn run_gh_gate(
 /// failure, including a non-zero exit, is an error the caller refuses on.
 #[allow(clippy::disallowed_methods)] // runs INSIDE the sandbox as cplt gh-gate, against the same real gh it would exec
 fn run_gh_lookup(real_gh: &Path, repo: &str, args: &[&str]) -> Result<String, String> {
-    let output = std::process::Command::new(real_gh)
+    let mut cmd = std::process::Command::new(real_gh);
+    if let Some(token) = exec_gh_token() {
+        cmd.env("GH_TOKEN", token);
+    }
+    let output = cmd
         .args(args)
         .env_remove("GH_HOST")
         .env("GH_REPO", repo)

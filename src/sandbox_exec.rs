@@ -412,8 +412,9 @@ pub(super) fn extract_gh_token() -> Option<String> {
 /// milliseconds; this only bounds a `gh` that never answers at all.
 ///
 /// Unbounded, this was the single blocking wait between the startup banner and
-/// exec: `configure_command` reaches it on every Copilot launch (the gh guard's
-/// `block_auth_token` defaults on), so a wedged `gh` hung cplt itself with the
+/// exec: `configure_command` reaches it on every launch that caches a token
+/// (Copilot's serve-once cache, `block_auth_token` on by default, or the gh
+/// guard's exec cache), so a wedged `gh` hung cplt itself with the
 /// banner as the last thing on screen and nothing pointing at the cause.
 const GH_AUTH_TOKEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -597,7 +598,8 @@ fn should_cache_token(
 /// `gh` inside the sandbox is anonymous: its token sits in the Keychain, which
 /// the sandbox does not grant.
 ///
-/// Every agent, when gh is configured on the host (`hosts_yml_exists`, so a
+/// Every agent except Copilot on macOS (it has the Keychain or the substitute's
+/// token), when gh is configured on the host (`hosts_yml_exists`, so a
 /// host without gh spawns no subprocess). Same deny rule as the serve cache: a
 /// denied `GH_TOKEN` means no credential. Skipped when the agent env already
 /// carries a token `gh` will use; only Copilot keeps the parent's token vars.
@@ -610,7 +612,8 @@ fn should_cache_exec_token(
     hosts_yml_exists
         && !substitute_carries_gh_token(substitute)
         && !deny_env.iter().any(|d| d == "GH_TOKEN")
-        && (agent != Agent::Copilot || !child_keeps_a_github_token(deny_env))
+        && (agent != Agent::Copilot
+            || (cfg!(target_os = "linux") && !child_keeps_a_github_token(deny_env)))
 }
 
 fn cache_gh_token_to_file(
@@ -2118,6 +2121,20 @@ mod gh_token_extraction_tests {
                     "OpenCode's env is stripped, so gh needs the cache"
                 );
                 assert!(should_cache_exec_token(Agent::Shell, &[], None, true));
+            },
+        );
+        temp_env::with_vars(
+            [
+                ("GH_TOKEN", None::<&str>),
+                ("GITHUB_TOKEN", None),
+                ("COPILOT_GITHUB_TOKEN", None),
+            ],
+            || {
+                assert_eq!(
+                    should_cache_exec_token(Agent::Copilot, &[], None, true),
+                    cfg!(target_os = "linux"),
+                    "macOS Copilot has the Keychain; Linux Copilot needs the cache"
+                );
             },
         );
         temp_env::with_vars(
