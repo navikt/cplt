@@ -713,22 +713,22 @@ Git commit works for every agent. Whether `git push` works over HTTPS depends on
    ```bash
    gh auth login   # one-time setup
    ```
-3. **Configure the git credential helper** (if not already set by `gh auth setup-git`):
+3. **Configure the git credential helper** (not needed for `github.com` with the gh guard on):
    ```bash
    gh auth setup-git
    ```
-   `gh auth setup-git` writes the helper with an absolute path (for example `!/opt/homebrew/bin/gh auth git-credential`), so git runs the real `gh` directly and never passes through the gh guard. That `gh` gets no token from the guard, only what it can read itself.
+   `gh auth setup-git` writes the helper with an absolute path (for example `!/opt/homebrew/bin/gh auth git-credential`). With the gh guard on, cplt adds `!gh auth git-credential` as a last helper for `https://github.com` inside the sandbox, so git goes through the gh guard and gets its token ([how](gh-guard.md#how-gh-itself-authenticates)). Your own `github.com` helpers still run first and win when they return a credential. Your git config is not changed.
 
 **Credentials per agent (macOS).** The helper only produces a token if `gh` can reach one from inside the sandbox:
 
 | Agent                                       | HTTPS push  | Credential source                                                          |
 | ------------------------------------------- | ----------- | -------------------------------------------------------------------------- |
 | `copilot`, `antigravity`, `claude`, `goose` | ✅ Works     | Login Keychain is readable, which is where `gh auth login` stores the token |
-| `opencode`, `pi`, `dsh`, `cplt exec`        | ❌ Needs setup | Keychain is denied. The gh guard's token ([how](gh-guard.md#how-gh-itself-authenticates)) reaches `gh` commands the agent runs, not the absolute-path helper `gh auth setup-git` writes. Use a token in `hosts.yml`, `--pass-env GH_TOKEN`, or set the helper PATH-relative: `git config --global --replace-all credential.https://github.com.helper '!gh auth git-credential'` |
+| `opencode`, `pi`, `dsh`, `cplt exec`        | ✅ Works     | Keychain is denied. The gh guard reads the token at launch and hands it to `gh` when git asks for credentials ([how](gh-guard.md#how-gh-itself-authenticates)). With `gh_guard.enabled = false` these agents need a token in `hosts.yml` or `--pass-env GH_TOKEN` |
 
 Both rows depend on where `gh` keeps the token. An installation that stores it in `~/.config/gh/hosts.yml` rather than the Keychain works for every agent, since that file is readable in every profile, and `--pass-env GH_TOKEN` supplies one regardless of agent.
 
-The Keychain row has one caveat. With `sandbox.keychain_substitute = true` (off by default) the Keychain grant is dropped for an agent whose own credential already reaches it another way — `claude` with `CLAUDE_CODE_OAUTH_TOKEN` exported, `antigravity` with its `~/.gemini/antigravity-cli/antigravity-oauth-token` fallback file present. The drop takes `gh`'s Keychain token with it, so HTTPS push through the absolute-path helper fails for exactly those two agents in that configuration. Copilot keeps a token `gh` can use when the one it was handed is `GH_TOKEN` or `GITHUB_TOKEN`, which covers the `gh auth token` handover; a token exported only as `COPILOT_GITHUB_TOKEN` is one `gh` does not read. Push under a dropped grant was not tested.
+The Keychain row has one caveat. With `sandbox.keychain_substitute = true` (off by default) the Keychain grant is dropped for an agent whose own credential already reaches it another way — `claude` with `CLAUDE_CODE_OAUTH_TOKEN` exported, `antigravity` with its `~/.gemini/antigravity-cli/antigravity-oauth-token` fallback file present. The drop takes `gh`'s Keychain token with it. With the gh guard on, the guard's token covers push for those two agents as for the row above; with it off, push fails for them in that configuration. Copilot keeps a token `gh` can use when the one it was handed is `GH_TOKEN` or `GITHUB_TOKEN`, which covers the `gh auth token` handover; a token exported only as `COPILOT_GITHUB_TOKEN` is one `gh` does not read. Push under a dropped grant was not tested.
 
 **On Linux the table does not apply.** There is no Keychain grant to drop in the first place; `gh` reads its token from the Secret Service or from `hosts.yml`, and push works wherever that lookup succeeds.
 
