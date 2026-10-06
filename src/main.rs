@@ -12476,8 +12476,17 @@ mod tests {
         }
     }
 
+    /// Tests that set TMPDIR call this first. tempfile reads TMPDIR on every
+    /// call, so a concurrent test would otherwise create its temp dir inside
+    /// ours and lose it when ours is dropped. Pinning tempfile's base dir
+    /// before TMPDIR changes keeps every other test's temp dirs where they were.
+    fn pin_tempfile_dir() {
+        let _ = tempfile::env::override_temp_dir(&std::env::temp_dir());
+    }
+
     #[test]
     fn exec_gh_token_reads_the_cache_without_overriding_env() {
+        pin_tempfile_dir();
         let dir = tempfile::tempdir().unwrap();
         let tmp = dir.path().to_str().unwrap();
         let run = |gh: Option<&str>, github: Option<&str>| {
@@ -12514,6 +12523,7 @@ mod tests {
 
     #[test]
     fn exec_gh_token_prefers_token_dir_over_tmpdir() {
+        pin_tempfile_dir();
         let cache = tempfile::tempdir().unwrap();
         let other = tempfile::tempdir().unwrap();
         std::fs::write(cache.path().join(".gh-exec-token"), "gho_cached\n").unwrap();
