@@ -1628,6 +1628,12 @@ pub fn keychain_substitute(
     )
 }
 
+/// gh is logged in on the host (its `hosts.yml` exists), so the sandbox will
+/// carry its token for `gh` and OpenCode (#693, #695).
+pub fn gh_configured() -> bool {
+    exec::gh_hosts_yml().is_some_and(|p| p.exists())
+}
+
 /// [`keychain_substitute`] with the platform and the `gh` call as parameters,
 /// so tests can drive both without a host `gh`.
 pub(crate) fn keychain_substitute_with(

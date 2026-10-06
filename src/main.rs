@@ -3370,7 +3370,7 @@ fn agent_allowlist(
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_default();
-    domains.extend(agent.provider_domains(&home));
+    domains.extend(agent.provider_domains(&home, sandbox::gh_configured()));
     domains.into_iter().map(str::to_string).collect()
 }
 

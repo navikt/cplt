@@ -319,6 +319,7 @@ fn configure_command(
             // does not close — the window. A determined agent that reads
             // `$TMPDIR/.gh-token` before the legitimate consumer still wins.
             cache_gh_token_to_file(
+                cmd,
                 scratch,
                 agent,
                 deny_env,
@@ -522,7 +523,7 @@ fn inject_gh_token_if_needed(
 
 /// gh's `hosts.yml`, located the way gh does: `GH_CONFIG_DIR`, then
 /// `$XDG_CONFIG_HOME/gh`, then `~/.config/gh`.
-fn gh_hosts_yml() -> Option<PathBuf> {
+pub(super) fn gh_hosts_yml() -> Option<PathBuf> {
     let dir = match std::env::var_os("GH_CONFIG_DIR").filter(|v| !v.is_empty()) {
         Some(d) => PathBuf::from(d),
         None => match std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
@@ -604,6 +605,7 @@ fn should_cache_exec_token(
 }
 
 fn cache_gh_token_to_file(
+    cmd: &mut Command,
     scratch_dir: &Path,
     agent: Agent,
     deny_env: &[String],
@@ -631,6 +633,16 @@ fn cache_gh_token_to_file(
     }
     if exec {
         write_token_file(&scratch_dir.join(".gh-exec-token"), &token);
+        // OpenCode: the same token as its GitHub Copilot login, when the user
+        // has none of their own (#695). OpenCode reads OPENCODE_AUTH_CONTENT
+        // instead of auth.json, so the real file is never read or rewritten
+        // for this; the value carries the user's other providers too.
+        if agent == Agent::OpenCode
+            && let Some(home) = std::env::var_os("HOME")
+            && let Some(auth) = crate::agent::opencode_host_login(Path::new(&home), &token)
+        {
+            cmd.env("OPENCODE_AUTH_CONTENT", auth);
+        }
     }
 }
 
