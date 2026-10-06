@@ -336,6 +336,9 @@ fn configure_command(
             quiet,
             pnpm_shadow_dir,
         );
+        if gh_guard.enabled && scratch.join("bin").join("gh").is_file() {
+            route_github_credentials_through_gh_guard(cmd, inherit_env);
+        }
     } else if let Some(shadow) = pnpm_shadow_dir {
         prepend_path(cmd, &[shadow]);
     }
@@ -958,6 +961,59 @@ fn install_command_wrappers(
     if !prefixes.is_empty() {
         prepend_path(cmd, &prefixes);
     }
+}
+
+/// Point git's credential helper for `https://github.com` at the `gh` on PATH,
+/// which inside the sandbox is the gh guard wrapper (#695).
+///
+/// `gh auth setup-git` writes the helper as `!/abs/path/to/gh auth
+/// git-credential`, so git runs the real `gh` directly: it skips the wrapper,
+/// never gets the `.gh-exec-token` the wrapper hands to the real `gh`, and an
+/// HTTPS push fails wherever the Keychain is not granted. Overriding the helper
+/// via `GIT_CONFIG_*` env reaches every git in the sandbox without touching any
+/// file. The empty value first resets the helper list for that URL (git
+/// documents an empty `credential.helper` as "clear the list"), so the
+/// absolute-path helper from the user's gitconfig does not also run. Only the
+/// `https://github.com` context is touched; helpers for other hosts and the
+/// generic `credential.helper` stay as configured.
+///
+/// Appends after any `GIT_CONFIG_COUNT` entries already set (the signing
+/// overrides, or a user's own via `--pass-env`) instead of replacing them.
+fn route_github_credentials_through_gh_guard(cmd: &mut Command, inherit_env: bool) {
+    let set = cmd
+        .get_envs()
+        .find(|(k, _)| *k == "GIT_CONFIG_COUNT")
+        .map(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()));
+    let current = match set {
+        Some(v) => v,
+        // Not touched on `cmd`: the child inherits the parent's value, if any,
+        // only when the env is not cleared.
+        None if inherit_env => std::env::var("GIT_CONFIG_COUNT").ok(),
+        None => None,
+    };
+    for (k, v) in github_credential_helper_config(current.as_deref()) {
+        cmd.env(k, v);
+    }
+}
+
+/// The env vars that append the two `credential.https://github.com.helper`
+/// entries after `existing_count` config overrides. An unparsable count is
+/// left alone (git would reject it anyway) and nothing is added.
+fn github_credential_helper_config(existing_count: Option<&str>) -> Vec<(String, String)> {
+    const KEY: &str = "credential.https://github.com.helper";
+    let Ok(n) = existing_count.map_or(Ok(0), |c| c.trim().parse::<usize>()) else {
+        return Vec::new();
+    };
+    vec![
+        (format!("GIT_CONFIG_KEY_{n}"), KEY.to_string()),
+        (format!("GIT_CONFIG_VALUE_{n}"), String::new()),
+        (format!("GIT_CONFIG_KEY_{}", n + 1), KEY.to_string()),
+        (
+            format!("GIT_CONFIG_VALUE_{}", n + 1),
+            "!gh auth git-credential".to_string(),
+        ),
+        ("GIT_CONFIG_COUNT".to_string(), (n + 2).to_string()),
+    ]
 }
 
 fn prepend_path(cmd: &mut Command, prefixes: &[&Path]) {
@@ -2082,6 +2138,35 @@ mod gh_token_extraction_tests {
 
     /// The exec cache is written for every agent once gh is configured, and
     /// follows the same GH_TOKEN deny and env-token rules as the serve cache.
+    #[test]
+    fn github_credential_helper_appends_after_existing_overrides() {
+        let env = github_credential_helper_config(Some("2"));
+        let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("GIT_CONFIG_COUNT"), Some("4"));
+        assert_eq!(
+            get("GIT_CONFIG_KEY_2"),
+            Some("credential.https://github.com.helper")
+        );
+        assert_eq!(
+            get("GIT_CONFIG_VALUE_2"),
+            Some(""),
+            "empty value resets the list"
+        );
+        assert_eq!(get("GIT_CONFIG_VALUE_3"), Some("!gh auth git-credential"));
+        assert!(
+            get("GIT_CONFIG_KEY_0").is_none(),
+            "existing entries untouched"
+        );
+
+        let fresh = github_credential_helper_config(None);
+        assert!(fresh.contains(&("GIT_CONFIG_COUNT".into(), "2".into())));
+        assert!(fresh.contains(&(
+            "GIT_CONFIG_KEY_0".into(),
+            "credential.https://github.com.helper".into()
+        )));
+        assert!(github_credential_helper_config(Some("x")).is_empty());
+    }
+
     #[test]
     fn exec_token_cache_gating() {
         let deny = vec!["GH_TOKEN".to_string()];
