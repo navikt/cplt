@@ -2689,6 +2689,9 @@ fn validate_config_paths(config: &SandboxConfig) -> Result<(), String> {
         policy::validate_sbpl_path(dir).map_err(|e| format!("Named repository .git dir: {e}"))?;
     }
     policy::validate_sbpl_path(config.home_dir).map_err(|e| format!("Home dir: {e}"))?;
+    for f in policy::gh_config_files_elsewhere(config.home_dir) {
+        policy::validate_sbpl_path(&f).map_err(|e| format!("gh config dir: {e}"))?;
+    }
     // #524: the profile keeps a dotfiles target read-only only with a rule
     // naming it. One the profile cannot name inside a writable tree would stay
     // writable, so refuse, as for every other path here. Outside a writable
@@ -3716,7 +3719,13 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = std::fs::canonicalize(tmp.path()).expect("canonicalize");
         let xdg = home.join("x\"dg");
-        temp_env::with_var("XDG_CONFIG_HOME", Some(&xdg), || {
+        // gh's own dir pinned to the default, so only pnpm sees the bad path.
+        let gh = home.join(".config/gh");
+        let vars = [
+            ("XDG_CONFIG_HOME", Some(xdg.as_os_str())),
+            ("GH_CONFIG_DIR", Some(gh.as_os_str())),
+        ];
+        temp_env::with_vars(vars, || {
             let mut config = test_config(&home, &[]);
             assert!(super::validate_config_paths(&config).is_ok(), "key off");
             config.protect_pnpm_config = true;

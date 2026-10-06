@@ -225,27 +225,6 @@ pub fn grant_is_refused(home: &Path, path: &Path) -> bool {
         || cplt_state_dir_grant(home, path).is_some()
 }
 
-/// Where a first-party read grant on the file `path` really lands, or `None`
-/// when it must not be emitted.
-///
-/// Stricter than [`grant_is_refused`], which lets a user grant a single file
-/// inside a [`DENIED_DOTFILES`] directory on purpose. A rule cplt adds on its
-/// own has no such intent behind it, and a symlink such as
-/// `~/.testcontainers.properties -> ~/.ssh/id_ed25519` would turn it into a
-/// grant on the key: Landlock follows the link. So the resolved target is
-/// refused when it lies anywhere inside a denied dotfile directory or is a
-/// [`DENIED_HOME_SUBPATHS`] entry. A path that does not resolve is returned as
-/// spelled, since there is nothing behind it to expose.
-///
-/// Every caller names a file, so an existing target must be a regular file.
-/// `~/.gitconfig -> ~/.config` would otherwise make Landlock grant the whole
-/// tree, cplt's own state directory included; a Landlock rule is recursive.
-/// A target the user owns with more than one link is refused too: a hardlink
-/// `~/.gitconfig` onto `~/.ssh/id_ed25519` canonicalizes to itself and passes
-/// every path check while exposing the key's inode. Dotfile managers link
-/// with symlinks. A root-owned file is exempt, as in a Nix store deduplicated
-/// by `auto-optimise-store`: the user cannot plant that link, and their
-/// credentials are their own files.
 /// gh's config dir, located the way gh does: `GH_CONFIG_DIR`, then
 /// `$XDG_CONFIG_HOME/gh`, then `~/.config/gh`.
 #[must_use]
@@ -269,6 +248,27 @@ pub fn gh_config_files_elsewhere(home: &Path) -> Vec<PathBuf> {
     vec![dir.join("hosts.yml"), dir.join("config.yml")]
 }
 
+/// Where a first-party read grant on the file `path` really lands, or `None`
+/// when it must not be emitted.
+///
+/// Stricter than [`grant_is_refused`], which lets a user grant a single file
+/// inside a [`DENIED_DOTFILES`] directory on purpose. A rule cplt adds on its
+/// own has no such intent behind it, and a symlink such as
+/// `~/.testcontainers.properties -> ~/.ssh/id_ed25519` would turn it into a
+/// grant on the key: Landlock follows the link. So the resolved target is
+/// refused when it lies anywhere inside a denied dotfile directory or is a
+/// [`DENIED_HOME_SUBPATHS`] entry. A path that does not resolve is returned as
+/// spelled, since there is nothing behind it to expose.
+///
+/// Every caller names a file, so an existing target must be a regular file.
+/// `~/.gitconfig -> ~/.config` would otherwise make Landlock grant the whole
+/// tree, cplt's own state directory included; a Landlock rule is recursive.
+/// A target the user owns with more than one link is refused too: a hardlink
+/// `~/.gitconfig` onto `~/.ssh/id_ed25519` canonicalizes to itself and passes
+/// every path check while exposing the key's inode. Dotfile managers link
+/// with symlinks. A root-owned file is exempt, as in a Nix store deduplicated
+/// by `auto-optimise-store`: the user cannot plant that link, and their
+/// credentials are their own files.
 #[must_use]
 pub fn first_party_read_target(home: &Path, path: &Path) -> Option<PathBuf> {
     read_target(home, path, None)
@@ -1287,6 +1287,9 @@ pub const ENV_ALLOWLIST: &[&str] = &[
     "XDG_STATE_HOME",
     "XDG_CACHE_HOME",
     "XDG_RUNTIME_DIR",
+    // gh's config location (a path, not a secret): the profile grants
+    // hosts.yml/config.yml there, so gh inside must look there too.
+    "GH_CONFIG_DIR",
     // Node.js
     "NODE_OPTIONS",
     "NODE_PATH",
