@@ -1344,10 +1344,14 @@ impl Resolved {
                         let all_denied = ["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"]
                             .iter()
                             .all(|v| self.deny_env.iter().any(|d| d == v));
-                        if all_denied {
+                        if let Some((gh, cp)) = crate::sandbox::ACCOUNT_MISMATCH.get() {
+                            &format!(
+                                " (gh is {gh}, Copilot is {cp}: kept to avoid switching account)"
+                            )
+                        } else if all_denied {
                             " (no token: deny.env strips every token variable)"
                         } else {
-                            " (no token: gh auth token failed)"
+                            " (no token: gh auth token failed, or gh is not in a trusted bin dir)"
                         }
                     } else {
                         ""

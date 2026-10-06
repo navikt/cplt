@@ -1626,7 +1626,23 @@ pub fn keychain_substitute(
         deny_env,
         keychain_substitute_enabled(agent, setting),
         cfg!(target_os = "macos"),
-        exec::extract_gh_token,
+        || {
+            // Maintainer call: never switch identity silently. gh signed in as
+            // someone other than Copilot's own login keeps the grant (#696).
+            let gh = exec::gh_hosts_yml()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .and_then(|s| gh_login(&s));
+            let cp = std::fs::read_to_string(home.join(".copilot/config.json"))
+                .ok()
+                .and_then(|s| copilot_login(&s));
+            if let (Some(gh), Some(cp)) = (&gh, &cp)
+                && !gh.eq_ignore_ascii_case(cp)
+            {
+                let _ = ACCOUNT_MISMATCH.set((gh.clone(), cp.clone()));
+                return None;
+            }
+            exec::extract_gh_token()
+        },
     )
 }
 
@@ -1634,6 +1650,37 @@ pub fn keychain_substitute(
 /// carry its token for `gh` and OpenCode (#693, #695).
 pub fn gh_configured() -> bool {
     exec::gh_hosts_yml().is_some_and(|p| p.exists())
+}
+
+/// `(gh login, Copilot login)` when the substitute was skipped because they
+/// differ, for the launch summary to say why the grant stayed.
+pub static ACCOUNT_MISMATCH: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+
+/// The github.com `user:` from gh's `hosts.yml`.
+fn gh_login(hosts_yml: &str) -> Option<String> {
+    let mut in_github = false;
+    for line in hosts_yml.lines() {
+        if !line.starts_with(' ') {
+            in_github = line.trim_end() == "github.com:";
+        } else if in_github && let Some(u) = line.strip_prefix("    user:") {
+            return Some(u.trim().trim_matches(['"', '\'']).to_string()).filter(|u| !u.is_empty());
+        }
+    }
+    None
+}
+
+/// `lastLoggedInUser.login` for github.com from Copilot CLI's `config.json`,
+/// which opens with `//` comment lines.
+fn copilot_login(config: &str) -> Option<String> {
+    let json: String = config
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let v: serde_json::Value = serde_json::from_str(&json).ok()?;
+    let u = v.get("lastLoggedInUser")?;
+    (u.get("host")?.as_str()? == "https://github.com")
+        .then(|| u.get("login")?.as_str().map(str::to_string))?
 }
 
 /// `sandbox.keychain_substitute` as it applies to `agent`. Unset is on for
@@ -4970,6 +5017,27 @@ mod tests {
             extra_git_dirs(&[wt.clone(), repo, plain, bare.clone(), wt]),
             vec![bare, repo_git],
             "overlapping and repeated grants must not emit duplicate denies"
+        );
+    }
+}
+
+#[cfg(test)]
+mod account_tests {
+    use super::{copilot_login, gh_login};
+
+    #[test]
+    fn reads_both_logins() {
+        let hosts = "ghe.example:\n    user: other\ngithub.com:\n    users:\n        alice:\n    git_protocol: ssh\n    user: alice\n";
+        assert_eq!(gh_login(hosts).as_deref(), Some("alice"));
+        assert_eq!(gh_login("ghe.example:\n    user: other\n"), None);
+        let cfg = "// managed\n{\n \"lastLoggedInUser\": {\"host\": \"https://github.com\", \"login\": \"Bob\"}\n}\n";
+        assert_eq!(copilot_login(cfg).as_deref(), Some("Bob"));
+        assert_eq!(copilot_login("{}"), None);
+        assert_eq!(
+            copilot_login(
+                "{\"lastLoggedInUser\": {\"host\": \"https://ghe.example\", \"login\": \"x\"}}"
+            ),
+            None
         );
     }
 }
