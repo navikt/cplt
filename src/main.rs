@@ -3357,6 +3357,7 @@ fn agent_allowlist(
     agent: agent::Agent,
     default_allowlist: bool,
     allowed_domains_file: bool,
+    deny_env: &[String],
 ) -> Vec<String> {
     let mut domains = if default_allowlist {
         agent.default_allowed_domains()
@@ -3370,7 +3371,13 @@ fn agent_allowlist(
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_default();
-    domains.extend(agent.provider_domains(&home));
+    // Same deny rule as the handover: either variable denied means OpenCode
+    // gets no host login, so it needs no hosts for one.
+    let handover = sandbox::gh_configured()
+        && !deny_env
+            .iter()
+            .any(|d| d == "GH_TOKEN" || d == "OPENCODE_AUTH_CONTENT");
+    domains.extend(agent.provider_domains(&home, handover));
     domains.into_iter().map(str::to_string).collect()
 }
 
@@ -3395,6 +3402,7 @@ fn allowlist_spec(
             agent,
             decision.use_default_allowlist,
             allowed_domains_file.is_some(),
+            &resolved.deny_env,
         ),
         allowed_domains_file,
         extra_allowed_domains: resolved.allow_domains.clone(),
@@ -4772,7 +4780,9 @@ fn exec_gh_token() -> Option<String> {
     if set("GH_TOKEN") || set("GITHUB_TOKEN") {
         return None;
     }
-    let tmpdir = std::env::var_os("TMPDIR").filter(|v| !v.is_empty())?;
+    let tmpdir = std::env::var_os(sandbox::GH_TOKEN_DIR_ENV)
+        .or_else(|| std::env::var_os("TMPDIR"))
+        .filter(|v| !v.is_empty())?;
     let token = std::fs::read_to_string(Path::new(&tmpdir).join(".gh-exec-token")).ok()?;
     Some(token.trim().to_string()).filter(|t| !t.is_empty())
 }
@@ -8142,17 +8152,26 @@ fn run_config_path(local: bool) -> ExitCode {
 /// `allowed_domains` file, and under `proxy.default_allowlist`. Both come from
 /// [`agent_allowlist`], the function the proxy and `cplt check` use, so the
 /// output is the effective list on this machine, not a copy of the constants.
-fn config_hosts(agent: agent::Agent) -> (Vec<String>, Vec<String>) {
+fn config_hosts(agent: agent::Agent, deny_env: &[String]) -> (Vec<String>, Vec<String>) {
     (
-        agent_allowlist(agent, false, true),
-        agent_allowlist(agent, true, false),
+        agent_allowlist(agent, false, true, deny_env),
+        agent_allowlist(agent, true, false, deny_env),
     )
+}
+
+/// The repo's `deny.env`, as a launch here would apply it: it only tightens,
+/// so it counts without trust.
+fn repo_deny_env() -> Vec<String> {
+    detect_project_root()
+        .and_then(|d| repo_config::load_repo_config(&d).ok().flatten())
+        .map(|l| l.config.deny.env)
+        .unwrap_or_default()
 }
 
 /// `cplt config hosts --json` output. nav-pilot reads this instead of keeping
 /// its own copy of the lists; bump `version` on any breaking change to the shape.
-fn config_hosts_json(agent: agent::Agent) -> serde_json::Value {
-    let (agent_hosts, default_allowlist) = config_hosts(agent);
+fn config_hosts_json(agent: agent::Agent, deny_env: &[String]) -> serde_json::Value {
+    let (agent_hosts, default_allowlist) = config_hosts(agent, deny_env);
     serde_json::json!({
         "version": 1,
         "agent_hosts": agent_hosts,
@@ -8168,10 +8187,11 @@ fn run_config_hosts(name: &str, json: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let deny_env = repo_deny_env();
     if json {
-        println!("{}", config_hosts_json(agent));
+        println!("{}", config_hosts_json(agent, &deny_env));
     } else {
-        let (agent_hosts, default_allowlist) = config_hosts(agent);
+        let (agent_hosts, default_allowlist) = config_hosts(agent, &deny_env);
         println!("Agent hosts (added to any active allowlist; a blocklist entry still wins):");
         for h in agent_hosts {
             println!("  {h}");
@@ -10828,22 +10848,22 @@ mod tests {
                 "shell",
             ] {
                 let agent: agent::Agent = name.parse().unwrap();
-                let v = config_hosts_json(agent);
+                let v = config_hosts_json(agent, &[]);
                 assert_eq!(v["version"], 1);
                 assert_eq!(
                     v["agent_hosts"],
-                    serde_json::json!(agent_allowlist(agent, false, true)),
+                    serde_json::json!(agent_allowlist(agent, false, true, &[])),
                     "{name}"
                 );
                 assert_eq!(
                     v["default_allowlist"],
-                    serde_json::json!(agent_allowlist(agent, true, false)),
+                    serde_json::json!(agent_allowlist(agent, true, false, &[])),
                     "{name}"
                 );
             }
         });
         // Both sides empty would pass the loop above; pin known entries.
-        let copilot = config_hosts_json(agent::Agent::Copilot);
+        let copilot = config_hosts_json(agent::Agent::Copilot, &[]);
         let has = |key: &str, host: &str| {
             copilot[key]
                 .as_array()
@@ -12493,6 +12513,23 @@ mod tests {
     }
 
     #[test]
+    fn exec_gh_token_prefers_token_dir_over_tmpdir() {
+        let cache = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(cache.path().join(".gh-exec-token"), "gho_cached\n").unwrap();
+        let got = temp_env::with_vars(
+            [
+                (sandbox::GH_TOKEN_DIR_ENV, cache.path().to_str()),
+                ("TMPDIR", other.path().to_str()),
+                ("GH_TOKEN", None),
+                ("GITHUB_TOKEN", None),
+            ],
+            exec_gh_token,
+        );
+        assert_eq!(got.as_deref(), Some("gho_cached"));
+    }
+
+    #[test]
     fn git_credential_helper_reaches_the_real_binary() {
         // The shim's entry point, not just `gate`: `gh auth setup-git` points
         // `credential.helper` at this verb, so an HTTPS push must reach the real
@@ -12707,7 +12744,7 @@ mod tests {
             proxy::PolicySpec {
                 blocked_file: None,
                 allowed_domains_file: Some(path),
-                default_allowlist: agent_allowlist(agent::Agent::Copilot, false, true),
+                default_allowlist: agent_allowlist(agent::Agent::Copilot, false, true, &[]),
                 ..Default::default()
             },
             std::time::Instant::now(),
@@ -12771,7 +12808,7 @@ mod tests {
             proxy::PolicySpec {
                 blocked_file: Some(blocked),
                 allowed_domains_file: Some(allowed),
-                default_allowlist: agent_allowlist(agent::Agent::Copilot, true, true),
+                default_allowlist: agent_allowlist(agent::Agent::Copilot, true, true, &[]),
                 extra_allowed_domains: resolved.allow_domains.clone(),
                 ..Default::default()
             },
@@ -12880,7 +12917,7 @@ mod tests {
             proxy::PolicySpec {
                 blocked_file: resolved.blocked_domains.clone(),
                 allowed_domains_file: resolved.allowed_domains.clone(),
-                default_allowlist: agent_allowlist(agent::Agent::Copilot, false, true),
+                default_allowlist: agent_allowlist(agent::Agent::Copilot, false, true, &[]),
                 ..Default::default()
             },
             now,
@@ -13777,9 +13814,34 @@ mod tests {
             Some(tmp.path().to_str().expect("utf-8 path")),
             || {
                 let copilot = "githubcopilot.com".to_string();
-                assert!(agent_allowlist(agent::Agent::OpenCode, false, true).contains(&copilot));
-                assert!(agent_allowlist(agent::Agent::OpenCode, true, false).contains(&copilot));
-                assert!(agent_allowlist(agent::Agent::OpenCode, false, false).is_empty());
+                assert!(
+                    agent_allowlist(agent::Agent::OpenCode, false, true, &[]).contains(&copilot)
+                );
+                assert!(
+                    agent_allowlist(agent::Agent::OpenCode, true, false, &[]).contains(&copilot)
+                );
+                assert!(agent_allowlist(agent::Agent::OpenCode, false, false, &[]).is_empty());
+            },
+        );
+    }
+
+    /// #695: the host-login hosts follow the handover's deny rule.
+    #[test]
+    fn agent_allowlist_host_login_hosts_respect_deny_env() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("opencode")).expect("mkdir");
+        std::fs::write(tmp.path().join("opencode/auth.json"), "{}").expect("write");
+        std::fs::write(tmp.path().join("hosts.yml"), "").expect("write");
+        let p = tmp.path().to_str().expect("utf-8 path");
+        temp_env::with_vars(
+            [("XDG_DATA_HOME", Some(p)), ("GH_CONFIG_DIR", Some(p))],
+            || {
+                let copilot = "githubcopilot.com".to_string();
+                let a = |d: &[String]| agent_allowlist(agent::Agent::OpenCode, false, true, d);
+                assert!(a(&[]).contains(&copilot));
+                for v in ["GH_TOKEN", "OPENCODE_AUTH_CONTENT"] {
+                    assert!(!a(&[v.to_string()]).contains(&copilot), "{v}");
+                }
             },
         );
     }

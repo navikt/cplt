@@ -74,6 +74,7 @@ pub(crate) mod bubblewrap_probe {
 }
 #[path = "sandbox_exec.rs"]
 mod exec;
+pub use exec::GH_TOKEN_DIR_ENV;
 #[path = "sandbox_landlock.rs"]
 pub(crate) mod landlock_mod;
 #[path = "sandbox_policy.rs"]
@@ -1626,6 +1627,12 @@ pub fn keychain_substitute(
         cfg!(target_os = "macos"),
         exec::extract_gh_token,
     )
+}
+
+/// gh is logged in on the host (its `hosts.yml` exists), so the sandbox will
+/// carry its token for `gh` and OpenCode (#693, #695).
+pub fn gh_configured() -> bool {
+    exec::gh_hosts_yml().is_some_and(|p| p.exists())
 }
 
 /// [`keychain_substitute`] with the platform and the `gh` call as parameters,

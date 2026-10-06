@@ -1336,6 +1336,10 @@ Each agent's global config dir is mounted read/write, but the files in it that *
 
 goose is the exception to the table's opening sentence: its config dir is granted read-only outright rather than read/write with named denies. A `write_files` carve-out would not work — goose rewrites `config.yaml`, `permission.yaml` and `permissions/tool_permissions.json` by creating a temp file in the directory and renaming over the target, which needs directory write and would hand back the very vector the deny exists to close.
 
+## OpenCode: GitHub Copilot login from the host
+
+When `gh` is logged in on the host and OpenCode's `auth.json` has no `github-copilot` entry, cplt logs OpenCode in to GitHub Copilot with the host's gh token, so `opencode run -m github-copilot/...` works without `/connect`. It does this through `OPENCODE_AUTH_CONTENT`, which OpenCode reads instead of `auth.json`; your other providers are copied in. An existing `github-copilot` login is left alone. Running `/connect` inside the sandbox writes the gh token into `auth.json` as the `github-copilot` entry. This needs OpenCode 1.4.7 or newer; older versions ignore `OPENCODE_AUTH_CONTENT` and behave as before. To turn this off, add `OPENCODE_AUTH_CONTENT` to `deny.env`. Details in [SECURITY.md](../SECURITY.md#github-token-handling-per-agent).
+
 ## AI agent telemetry
 
 AI agents and their third-party packages often send usage analytics and crash reports to external services such as PostHog and Sentry. cplt blocks these at two layers:

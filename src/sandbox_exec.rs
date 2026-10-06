@@ -319,6 +319,7 @@ fn configure_command(
             // does not close — the window. A determined agent that reads
             // `$TMPDIR/.gh-token` before the legitimate consumer still wins.
             cache_gh_token_to_file(
+                cmd,
                 scratch,
                 agent,
                 deny_env,
@@ -522,7 +523,7 @@ fn inject_gh_token_if_needed(
 
 /// gh's `hosts.yml`, located the way gh does: `GH_CONFIG_DIR`, then
 /// `$XDG_CONFIG_HOME/gh`, then `~/.config/gh`.
-fn gh_hosts_yml() -> Option<PathBuf> {
+pub(super) fn gh_hosts_yml() -> Option<PathBuf> {
     let dir = match std::env::var_os("GH_CONFIG_DIR").filter(|v| !v.is_empty()) {
         Some(d) => PathBuf::from(d),
         None => match std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
@@ -603,7 +604,21 @@ fn should_cache_exec_token(
             || (cfg!(target_os = "linux") && !child_keeps_a_github_token(deny_env)))
 }
 
+/// The scratch dir holding `.gh-exec-token`, for `cplt gh-gate`.
+pub const GH_TOKEN_DIR_ENV: &str = "__CPLT_GH_TOKEN_DIR";
+
+/// The effective child env, `--pass-env` included: a token gh will use there
+/// makes the host credential in `.gh-exec-token` pointless. Blank counts as
+/// unset, as in `cplt gh-gate`.
+fn child_env_has_gh_token(cmd: &Command) -> bool {
+    cmd.get_envs().any(|(k, v)| {
+        (k == "GH_TOKEN" || k == "GITHUB_TOKEN")
+            && v.is_some_and(|v| !v.to_string_lossy().trim().is_empty())
+    })
+}
+
 fn cache_gh_token_to_file(
+    cmd: &mut Command,
     scratch_dir: &Path,
     agent: Agent,
     deny_env: &[String],
@@ -611,12 +626,13 @@ fn cache_gh_token_to_file(
     block_auth_token: bool,
 ) {
     let serve = block_auth_token && should_cache_token(agent, deny_env, substitute);
-    let exec = should_cache_exec_token(
-        agent,
-        deny_env,
-        substitute,
-        gh_hosts_yml().is_some_and(|p| p.exists()),
-    );
+    let exec = !child_env_has_gh_token(cmd)
+        && should_cache_exec_token(
+            agent,
+            deny_env,
+            substitute,
+            gh_hosts_yml().is_some_and(|p| p.exists()),
+        );
     if !serve && !exec {
         return;
     }
@@ -631,6 +647,19 @@ fn cache_gh_token_to_file(
     }
     if exec {
         write_token_file(&scratch_dir.join(".gh-exec-token"), &token);
+        // `--pass-env TMPDIR` points the child's TMPDIR elsewhere; tell the
+        // gate where the cache really is.
+        cmd.env(GH_TOKEN_DIR_ENV, scratch_dir);
+        // OpenCode: the same token as its GitHub Copilot login, when the user
+        // has none of their own (#695). OpenCode reads OPENCODE_AUTH_CONTENT
+        // instead of auth.json, so the real file is never read or rewritten
+        // for this; the value carries the user's other providers too.
+        if agent == Agent::OpenCode
+            && let Some(home) = std::env::var_os("HOME")
+            && let Some(auth) = crate::agent::opencode_host_login(Path::new(&home), &token)
+        {
+            cmd.env("OPENCODE_AUTH_CONTENT", auth);
+        }
     }
 }
 
@@ -2078,6 +2107,26 @@ mod gh_token_extraction_tests {
             None,
             "all three denied leaves no channel to inject into"
         );
+    }
+
+    #[test]
+    #[allow(clippy::disallowed_methods)] // never spawned; only the env is read
+    fn child_env_gh_token_skips_exec_cache() {
+        let has = |vars: &[(&str, &str)]| {
+            let mut cmd = Command::new("true");
+            for (k, v) in vars {
+                cmd.env(k, v);
+            }
+            child_env_has_gh_token(&cmd)
+        };
+        assert!(!has(&[]));
+        assert!(has(&[("GH_TOKEN", "ghp_x")]));
+        assert!(has(&[("GITHUB_TOKEN", "ghp_x")]));
+        assert!(!has(&[("GH_TOKEN", "  ")]), "blank is unset");
+        assert!(!has(&[("COPILOT_GITHUB_TOKEN", "ghp_x")]), "gh ignores it");
+        let mut cmd = Command::new("true");
+        cmd.env("GH_TOKEN", "ghp_x").env_remove("GH_TOKEN");
+        assert!(!child_env_has_gh_token(&cmd), "removed is unset");
     }
 
     /// The exec cache is written for every agent once gh is configured, and
