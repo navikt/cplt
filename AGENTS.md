@@ -193,6 +193,10 @@ A change that can break a working setup ships behind a config key, default off, 
 enabled gradually. The security fix lands on its own merits; flipping the default is a
 separate, staged decision that needs maintainer sign-off.
 
+Not required when every existing user has a proven, tested path forward: an automatic
+fallback to the old behavior, or a documented one-step recovery. Ship such a change as the
+new default, with the fallback tested and the recovery documented.
+
 With the key unset, generated profiles must be byte-identical to the previous release, and
 the PR is required to demonstrate that, not just assert it.
 
