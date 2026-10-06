@@ -898,7 +898,7 @@ Copilot. Only credentials that are durable for a whole session qualify.
   read-only. Determined by reading goose's source
   (`aaif-goose/goose`), not by inspecting the credential's shape.
 
-- **Copilot** — on by default since #695. Probed (#277) with copilot 1.0.89 on macOS, running
+- **Copilot** — on by default since #696. Probed (#277) with copilot 1.0.89 on macOS, running
   `copilot -p ... --silent` under cplt's real profile with `keychain_substitute`
   on and no `~/Library/Keychains` rule in it. With `GH_TOKEN` set to the output of
   `gh auth token` (an OAuth `gho_` token), Copilot authenticated and answered.
