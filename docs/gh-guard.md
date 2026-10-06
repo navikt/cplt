@@ -305,6 +305,11 @@ stored in the Keychain and gets 401. An exported `GH_TOKEN` or `GITHUB_TOKEN`
 reaches OpenCode; otherwise set `inject_token = true`. cplt prints a hint at
 launch when this applies.
 
+When a token is in the environment, exported or injected, `block_auth_token`
+does not hide it: the agent can read `$GH_TOKEN` directly. It only blocks
+`gh auth token` and `--show-token`. See the
+[per-agent table](../SECURITY.md#github-token-handling-per-agent).
+
 ## `gh api` handling
 
 `gh api` gives raw API access, so it is classified per request rather than per
