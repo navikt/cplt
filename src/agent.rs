@@ -199,26 +199,58 @@ const DEEPSEEK_DOMAINS: &[&str] = &["deepseek.com"];
 
 /// #710: does this resolved `opencode` binary belong to OpenCode v2?
 ///
-/// Read from the install path, not from `opencode --version`, so launch stays
-/// free of subprocesses. v2 ships as the npm package `@opencode/cli` (1.x is
-/// `opencode-ai`), so the canonical path runs through an `@opencode` scope
-/// dir. A version manager or Homebrew keg dir named `opencode/<version>` with
-/// major ≥ 2 counts too.
-// ponytail: path heuristic; a v2 build copied somewhere unrecognisable slips
-// through. Probe `--version` once per binary and cache it if that turns up.
-pub fn is_opencode_v2(bin: &Path) -> bool {
+/// The install path settles most cases with no subprocess: v2 ships as the
+/// npm package `@opencode/cli` (1.x is `opencode-ai`), and Homebrew or a
+/// version manager keeps it under `opencode/<version>`. Anything else (the
+/// upstream installer puts both majors at `~/.opencode/bin`) is asked
+/// `--version` once, and the answer is cached per binary path, size and
+/// mtime, so steady-state launch spawns nothing. An unanswered probe counts
+/// as 1.x and is not cached.
+pub fn is_opencode_v2(bin: &Path, cache_dir: &Path) -> bool {
     let real = std::fs::canonicalize(bin).unwrap_or_else(|_| bin.to_path_buf());
     let parts: Vec<String> = real
         .components()
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .collect();
-    parts.iter().any(|p| p == "@opencode")
-        || parts.windows(2).any(|w| {
-            w[0] == "opencode"
-                && crate::discover::parse_version(&w[1])
-                    .and_then(|v| v.split('.').next()?.parse::<u32>().ok())
-                    .is_some_and(|major| major >= 2)
-        })
+    if parts.iter().any(|p| p == "@opencode") {
+        return true;
+    }
+    if let Some([_, ver]) = parts
+        .windows(2)
+        .find(|w| w[0] == "opencode" && crate::discover::parse_version(&w[1]).is_some())
+    {
+        return major_at_least_2(ver);
+    }
+    let Ok(meta) = std::fs::metadata(&real) else {
+        return false;
+    };
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos());
+    let key = format!("{}\t{}\t{mtime}\t", real.display(), meta.len());
+    let cache = cache_dir.join("opencode-version");
+    if let Some(v) = std::fs::read_to_string(&cache)
+        .ok()
+        .and_then(|c| c.strip_prefix(&key).map(|v| v.trim().to_string()))
+    {
+        return major_at_least_2(&v);
+    }
+    match crate::discover::probe_version(&real, &["--version"]) {
+        crate::discover::VersionProbe::Version(v) => {
+            let _ = std::fs::create_dir_all(cache_dir);
+            let _ = std::fs::write(&cache, format!("{key}{v}\n"));
+            major_at_least_2(&v)
+        }
+        _ => false,
+    }
+}
+
+fn major_at_least_2(version: &str) -> bool {
+    crate::discover::parse_version(version)
+        .and_then(|v| v.split('.').next()?.parse::<u32>().ok())
+        .is_some_and(|major| major >= 2)
 }
 
 /// The provider hosts an OpenCode `auth.json` body calls for. Split from
@@ -2643,18 +2675,45 @@ mod tests {
 
     #[test]
     fn opencode_v2_is_detected_from_its_install_path() {
-        assert!(is_opencode_v2(Path::new(
-            "/n/lib/node_modules/@opencode/cli/bin/opencode.exe"
-        )));
-        assert!(is_opencode_v2(Path::new(
-            "/brew/Cellar/opencode/2.0.24/bin/opencode"
-        )));
-        assert!(!is_opencode_v2(Path::new(
-            "/brew/Cellar/opencode/1.18.35/bin/opencode"
-        )));
-        assert!(!is_opencode_v2(Path::new(
-            "/n/lib/node_modules/opencode-ai/bin/opencode"
-        )));
+        let none = Path::new("/nonexistent-cplt-cache");
+        assert!(is_opencode_v2(
+            Path::new("/n/lib/node_modules/@opencode/cli/bin/opencode.exe"),
+            none
+        ));
+        assert!(is_opencode_v2(
+            Path::new("/brew/Cellar/opencode/2.0.24/bin/opencode"),
+            none
+        ));
+        assert!(!is_opencode_v2(
+            Path::new("/brew/Cellar/opencode/1.18.35/bin/opencode"),
+            none
+        ));
+        assert!(!is_opencode_v2(
+            Path::new("/n/lib/node_modules/opencode-ai/bin/opencode"),
+            none
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_v2_probe_is_cached() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("opencode");
+        let count = dir.path().join("count");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\necho x >> {}\necho opencode v2.0.24\n",
+                count.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cache = dir.path().join("cache");
+        assert!(is_opencode_v2(&bin, &cache));
+        assert!(is_opencode_v2(&bin, &cache));
+        assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(), 1);
     }
 
     #[test]

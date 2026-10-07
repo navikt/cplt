@@ -1343,7 +1343,7 @@ goose is the exception to the table's opening sentence: its config dir is grante
 
 OpenCode v2 (the npm package `@opencode/cli`, which still installs a binary called `opencode`) is not supported yet. It runs tool calls through a background service, and a service started outside cplt would run them unsandboxed. cplt refuses to launch it and points to [navikt/cplt#710](https://github.com/navikt/cplt/issues/710). To stay on 1.x, run `npm uninstall -g @opencode/cli && npm i -g opencode-ai@1`, or pin `opencode-ai@1` in your version manager.
 
-cplt spots v2 from where the binary lives, not by running `opencode --version`, so launch stays as fast as before: the resolved path runs through an `@opencode` npm scope, or through an `opencode/<version>` directory (Homebrew, version managers) with version 2 or higher. A v2 binary copied to some other location is not caught.
+cplt spots v2 from where the binary lives when it can: a path through an `@opencode` npm scope, or an `opencode/<version>` directory (Homebrew, version managers). Anywhere else, such as `~/.opencode/bin` from the upstream installer, it runs `opencode --version` once and caches the answer in `$XDG_CACHE_HOME/cplt/opencode-version` (default `~/.cache/cplt`) until the binary changes, so later launches spawn nothing extra. `--print-profile` does not check.
 
 ## OpenCode: GitHub Copilot login from the host
 

@@ -4193,8 +4193,15 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     let agent_bin_result = active_agent.resolve_binary();
     // #710: v2 runs tool calls through a background service that may live
     // outside the sandbox. Refuse rather than launch it.
+    // --print-profile never runs the agent, so it is left alone.
     if let (agent::Agent::OpenCode, Ok(bin)) = (active_agent, &agent_bin_result)
-        && agent::is_opencode_v2(bin)
+        && !cli.print_profile
+        && agent::is_opencode_v2(
+            bin,
+            &std::env::var_os("XDG_CACHE_HOME")
+                .map_or_else(|| home_dir.join(".cache"), PathBuf::from)
+                .join("cplt"),
+        )
     {
         bail!(
             "OpenCode v2 ({}) is not supported by cplt yet: \
