@@ -316,7 +316,15 @@ pub(crate) fn read_small_regular_file(path: &Path) -> Option<String> {
 /// exec-only, so the file is also write-denied in the sandbox. Skipped, never
 /// refused: paths under `root` (already granted), credential dirs and files,
 /// `~/Library/Keychains`, and anything SBPL cannot name.
+///
+/// macOS only. On Linux the file is write-denied only under bubblewrap; with
+/// Landlock alone the whole root is writable, so the agent could plant a hook
+/// naming any file and get it granted on the next launch. ponytail: Linux
+/// stays as before until this can be gated on bubblewrap being active.
 fn claude_hook_script_grants(root: &Path, home: &Path) -> Vec<AgentDir> {
+    if !cfg!(target_os = "macos") {
+        return vec![];
+    }
     let Some(text) = read_small_regular_file(&root.join("settings.json")) else {
         return vec![];
     };
@@ -2573,6 +2581,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn claude_hook_scripts_get_exec_only_file_grants() {
         let tmp = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(tmp.path()).unwrap();
