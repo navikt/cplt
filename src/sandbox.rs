@@ -3287,6 +3287,7 @@ mod tests {
             process_exec: true,
             write_files: vec![],
             create_dirs: vec![],
+            via: vec![],
         }];
         let mut config = test_config(home.path(), &[]);
         config.agent_dirs = &dirs;
@@ -3319,6 +3320,7 @@ mod tests {
             process_exec: true,
             write_files: vec![],
             create_dirs: vec![],
+            via: vec![],
         };
         let root = AgentDir {
             path: home.join(".claude"),
