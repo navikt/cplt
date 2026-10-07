@@ -2383,9 +2383,9 @@ fn overlay_paths(
 }
 
 /// #705: remove the Claude hook-script grants (`claude_hook_script_grants`,
-/// the only read+execute, non-write Claude agent dirs) from `policy`. Called
-/// when bubblewrap is not active: only its read-only bind keeps
-/// `settings.json`, which names these files, out of the agent's reach.
+/// the only read+execute, non-write Claude agent dirs) from the direct-path
+/// `policy`: only bubblewrap's read-only bind keeps `settings.json`, which
+/// names these files, out of the agent's reach.
 /// Returns the dropped paths. Keeps `plain_file` pointing at its rule.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn drop_claude_hook_grants(
@@ -2395,28 +2395,27 @@ fn drop_claude_hook_grants(
     if config.agent != Agent::Claude {
         return vec![];
     }
-    let hooks: Vec<&Path> = config
+    let mut dropped = Vec::new();
+    for hook in config
         .agent_dirs
         .iter()
         .filter(|d| !d.write && d.process_exec)
-        .map(|d| d.path.as_path())
-        .collect();
-    let mut dropped = Vec::new();
-    let mut i = 0;
-    let plain = policy.plain_file;
-    let mut shift = 0;
-    policy.fs_rules.retain(|r| {
-        let drop = r.access.execute && !r.access.write && hooks.contains(&r.path.as_path());
-        if drop {
-            dropped.push(r.path.display().to_string());
-            if plain.is_some_and(|p| i < p) {
-                shift += 1;
-            }
+    {
+        // The last match: `generate_policy` emits agent dirs after the user's
+        // `allow.exec`, so an identical user rule earlier on stays.
+        let Some(i) = policy
+            .fs_rules
+            .iter()
+            .rposition(|r| r.path == hook.path && r.access.execute && !r.access.write)
+        else {
+            continue;
+        };
+        policy.fs_rules.remove(i);
+        if let Some(p) = policy.plain_file.as_mut().filter(|p| i < **p) {
+            *p -= 1;
         }
-        i += 1;
-        !drop
-    });
-    policy.plain_file = plain.map(|p| p - shift);
+        dropped.push(hook.path.display().to_string());
+    }
     dropped
 }
 
@@ -2662,13 +2661,18 @@ fn prepare_impl(
     // the root stays read-only and Pi does not start, which `cplt doctor`
     // explains. Cleared here, after `resolve` consumed the rules, so the
     // writable bind it needs is still emitted when bwrap IS active.
+    //
+    // #705: the Claude hook-script grants go from the direct-path policy
+    // always. A wrapper carries its own copy of the rules, so they still apply
+    // under bubblewrap, but an exec-time fallback to plain Landlock does not
+    // get them.
+    let dropped = drop_claude_hook_grants(config, &mut policy);
     if bwrap_wrapper.is_none() {
         let mut cleared = Vec::new();
         for rule in policy.fs_rules.iter_mut().filter(|r| r.access.create_dirs) {
             rule.access.create_dirs = false;
             cleared.push(rule.path.display().to_string());
         }
-        let dropped = drop_claude_hook_grants(config, &mut policy);
         if !dropped.is_empty() {
             ui::warn(&format!(
                 "Claude hook script grant on {} is NOT applied without Bubblewrap: \
@@ -3272,18 +3276,21 @@ mod tests {
             nofollow: false,
         };
         let mut policy = landlock_mod::generate_policy(&config);
+        // An identical user `allow.exec` rule comes first and must stay.
         policy.fs_rules = vec![
+            rule("/x/gate.py", false),
             rule("/x/gate.py", false),
             rule("/h/.claude", true),
             rule("/p", false),
         ];
-        policy.plain_file = Some(2);
+        policy.plain_file = Some(3);
         let mut other = policy.clone();
         assert_eq!(
             drop_claude_hook_grants(&config, &mut policy),
             ["/x/gate.py"]
         );
-        assert_eq!(policy.fs_rules.len(), 2);
+        assert_eq!(policy.fs_rules.len(), 3);
+        assert_eq!(policy.fs_rules[0].path, Path::new("/x/gate.py"));
         assert_eq!(
             policy.fs_rules[policy.plain_file.unwrap()].path,
             Path::new("/p")
