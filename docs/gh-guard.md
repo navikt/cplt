@@ -291,7 +291,7 @@ effect.
 On macOS `inject_token` is deprecated. `gh` gets its token from the exec token,
 and Copilot signs in through `sandbox.keychain_substitute = true`. The key still
 works; while it is `true`, cplt prints one line at launch and `cplt check` lists
-it. On Linux the substitute does nothing, so keep the key for the case above. If you still want the token in the environment, set `inject_token = true`.
+it. On Linux the substitute does nothing, so keep the key set to `true` for the case above, or anywhere you still want the token in the environment.
 `cplt config set` refuses it without `--force`, and `cplt config show` marks it
 `⚠ DANGEROUS`, because the token is then inherited by every process in the
 sandbox — and readable from any of them, through `/proc/<pid>/environ` on Linux
