@@ -206,7 +206,12 @@ const DEEPSEEK_DOMAINS: &[&str] = &["deepseek.com"];
 /// `--version` once, and the answer is cached per binary path, size and
 /// mtime, so steady-state launch spawns nothing. An unanswered probe counts
 /// as 1.x and is not cached.
-pub fn is_opencode_v2(bin: &Path, cache_dir: &Path) -> bool {
+///
+/// The verdict lives in cplt's state directory, which the sandbox denies, not
+/// in `~/.cache/cplt`, which the agent can write: a forged "1.x" verdict for a
+/// v2 binary would bypass this gate.
+pub fn is_opencode_v2(bin: &Path, home: &Path) -> bool {
+    let cache_dir = &home.join(crate::sandbox::CPLT_STATE_DIR);
     let real = std::fs::canonicalize(bin).unwrap_or_else(|_| bin.to_path_buf());
     let parts: Vec<String> = real
         .components()
@@ -2710,10 +2715,14 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let cache = dir.path().join("cache");
-        assert!(is_opencode_v2(&bin, &cache));
-        assert!(is_opencode_v2(&bin, &cache));
+        let home = dir.path().join("home");
+        assert!(is_opencode_v2(&bin, &home));
+        assert!(is_opencode_v2(&bin, &home));
         assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(), 1);
+        // The verdict must sit where the sandbox denies the agent writes.
+        let state = home.join(crate::sandbox::CPLT_STATE_DIR);
+        assert!(state.join("opencode-version").exists());
+        assert!(crate::sandbox::DENIED_DOTFILES.contains(&crate::sandbox::CPLT_STATE_DIR));
     }
 
     #[test]

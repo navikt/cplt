@@ -1341,9 +1341,9 @@ goose is the exception to the table's opening sentence: its config dir is grante
 
 ## OpenCode v2 is refused
 
-OpenCode v2 (the npm package `@opencode/cli`, which still installs a binary called `opencode`) is not supported yet. It runs tool calls through a background service, and a service started outside cplt would run them unsandboxed. cplt refuses to launch it and points to [navikt/cplt#710](https://github.com/navikt/cplt/issues/710). To stay on 1.x, run `npm uninstall -g @opencode/cli && npm i -g opencode-ai@1`, or pin `opencode-ai@1` in your version manager.
+OpenCode v2 (the npm package `@opencode/cli`, which still installs a binary called `opencode`) is not supported yet. It runs tool calls through a background service, and a service started outside cplt would run them unsandboxed. cplt refuses to launch it and points to [navikt/cplt#710](https://github.com/navikt/cplt/issues/710). To stay on 1.x, reinstall OpenCode 1.x: for npm, `npm uninstall -g @opencode/cli && npm i -g opencode-ai@1`; elsewhere, pin `opencode-ai@1` in your version manager or installer. The check covers `--agent opencode` only: running `opencode` from another agent or a shell inside the sandbox is not checked.
 
-cplt spots v2 from where the binary lives when it can: a path through an `@opencode` npm scope, or an `opencode/<version>` directory (Homebrew, version managers). Anywhere else, such as `~/.opencode/bin` from the upstream installer, it runs `opencode --version` once and caches the answer in `$XDG_CACHE_HOME/cplt/opencode-version` (default `~/.cache/cplt`) until the binary changes, so later launches spawn nothing extra. `--print-profile` does not check.
+cplt spots v2 from where the binary lives when it can: a path through an `@opencode` npm scope, or an `opencode/<version>` directory (Homebrew, version managers). Anywhere else, such as `~/.opencode/bin` from the upstream installer, it runs `opencode --version` once and caches the answer in `~/.config/cplt/opencode-version` until the binary changes, so later launches spawn nothing extra. The agent cannot write that directory, so it cannot fake the answer. If `opencode --version` fails or times out, cplt assumes 1.x and launches. `--print-profile` does not check.
 
 ## OpenCode: GitHub Copilot login from the host
 

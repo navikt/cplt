@@ -4196,18 +4196,17 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // --print-profile never runs the agent, so it is left alone.
     if let (agent::Agent::OpenCode, Ok(bin)) = (active_agent, &agent_bin_result)
         && !cli.print_profile
-        && agent::is_opencode_v2(
-            bin,
-            &std::env::var_os("XDG_CACHE_HOME")
-                .map_or_else(|| home_dir.join(".cache"), PathBuf::from)
-                .join("cplt"),
-        )
+        && agent::is_opencode_v2(bin, &home_dir)
     {
+        let s = bin.to_string_lossy();
+        let fix = if s.contains("node_modules") || s.contains("@opencode") {
+            "Stay on 1.x: npm uninstall -g @opencode/cli && npm i -g opencode-ai@1."
+        } else {
+            "Stay on 1.x: reinstall OpenCode 1.x (npm package opencode-ai@1)."
+        };
         bail!(
             "OpenCode v2 ({}) is not supported by cplt yet: \
-             https://github.com/navikt/cplt/issues/710\n\
-             Stay on 1.x: npm uninstall -g @opencode/cli && npm i -g opencode-ai@1 \
-             (or pin opencode-ai@1 in your version manager).",
+             https://github.com/navikt/cplt/issues/710\n{fix}",
             bin.display()
         );
     }
