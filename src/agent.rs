@@ -416,27 +416,38 @@ fn copilot_hook_script_grants(root: &Path, home: &Path) -> Vec<AgentDir> {
 /// server commands in the user config (`opencode.json`, `opencode.jsonc`,
 /// `config.json` in `config_dir`), as [`claude_hook_script_grants`] does for
 /// Claude hooks (#703). The config dir is granted read-only, so the agent
-/// cannot plant a path there; a project `opencode.json` is agent-writable and
-/// never read. macOS only, for the same reason as the Claude grant.
+/// cannot plant a path there. Project config is never read. macOS only, for
+/// the same reason as the Claude grant.
 fn opencode_script_grants(config_dir: &Path, home: &Path, writable: &[PathBuf]) -> Vec<AgentDir> {
     if !cfg!(target_os = "macos") {
         return vec![];
     }
     const FILES: [&str; 3] = ["opencode.json", "opencode.jsonc", "config.json"];
-    let paths = FILES
-        .iter()
-        .filter_map(|f| read_small_regular_file(&config_dir.join(f)))
-        .flat_map(|t| opencode_script_paths(&t, home))
-        .collect();
+    // The config files are trusted only because nothing on their path is
+    // agent-writable. Record every location they resolve through: the
+    // configured dir, each symlink hop, the resolved dir, and for each file
+    // read its own hops and resolved target (a dotfiles-managed
+    // `opencode.json` symlink is fine as long as it points outside every
+    // writable tree). If any of these sits in a project or `allow.write`
+    // tree, the agent could edit the config, or swap the dir with `mv`, and
+    // plant a path for the next launch; `drop_script_grants_under` then drops
+    // every grant.
+    let resolved = |p: &Path| {
+        symlink_locations(p)
+            .into_iter()
+            .chain(std::fs::canonicalize(p).ok())
+    };
+    let mut locs: Vec<PathBuf> = resolved(config_dir).collect();
+    let mut paths = vec![];
+    for f in FILES.iter().map(|f| config_dir.join(f)) {
+        if let Some(t) = read_small_regular_file(&f) {
+            locs.extend(resolved(&f));
+            paths.extend(opencode_script_paths(&t, home));
+        }
+    }
     let mut out = script_grants(paths, config_dir, home, writable);
-    // The config files are trusted only because the config dir is read-only.
-    // If the dir (or anything above it) sits in a project or `allow.write`
-    // tree, the agent can edit them, or swap the whole dir with `mv`, and
-    // plant a path for the next launch. Recording the config dir's locations
-    // in `via` makes `drop_script_grants_under` drop every grant then.
-    let cfg_locs = symlink_locations(config_dir);
     for g in &mut out {
-        g.via.extend(cfg_locs.iter().cloned());
+        g.via.extend(locs.iter().cloned());
     }
     out
 }
@@ -3250,6 +3261,47 @@ mod tests {
         let mut dirs = got.clone();
         drop_script_grants_under(&mut dirs, &[home.join(".config")]);
         assert!(dirs.is_empty(), "{dirs:?}");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn opencode_script_grants_follow_symlinked_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        let proj = home.join("proj");
+        let dots = home.join("dotfiles");
+        let ext = home.join("ext");
+        for d in [&proj, &dots, &ext, &home.join(".config")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let plugin = ext.join("p.js");
+        std::fs::write(&plugin, "x").unwrap();
+        let conf = format!(r#"{{"plugin":["file://{}"]}}"#, plugin.display());
+        let grants = |cfg: &Path| {
+            let mut g = opencode_script_grants(cfg, &home, &[]);
+            drop_script_grants_under(&mut g, std::slice::from_ref(&proj));
+            g
+        };
+        // 1. Config dir is a symlink into the project.
+        std::fs::create_dir_all(proj.join("dotcfg")).unwrap();
+        std::fs::write(proj.join("dotcfg/config.json"), &conf).unwrap();
+        let cfg1 = home.join(".config/oc1");
+        std::os::unix::fs::symlink(proj.join("dotcfg"), &cfg1).unwrap();
+        assert!(grants(&cfg1).is_empty());
+        // 2. Config file is a symlink into the project.
+        let cfg2 = home.join(".config/oc2");
+        std::fs::create_dir_all(&cfg2).unwrap();
+        std::fs::write(proj.join("oc.json"), &conf).unwrap();
+        std::os::unix::fs::symlink(proj.join("oc.json"), cfg2.join("opencode.json")).unwrap();
+        assert!(grants(&cfg2).is_empty());
+        // 3. Dotfiles symlink outside every writable tree is still trusted.
+        let cfg3 = home.join(".config/oc3");
+        std::fs::create_dir_all(&cfg3).unwrap();
+        std::fs::write(dots.join("oc.json"), &conf).unwrap();
+        std::os::unix::fs::symlink(dots.join("oc.json"), cfg3.join("opencode.json")).unwrap();
+        let g = grants(&cfg3);
+        assert_eq!(g.len(), 1, "{g:?}");
+        assert_eq!(g[0].path, plugin);
     }
 
     #[test]
