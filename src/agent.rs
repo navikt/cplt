@@ -333,6 +333,93 @@ fn claude_hook_script_grants(root: &Path, home: &Path, writable: &[PathBuf]) -> 
     let Some(text) = read_small_regular_file(&root.join("settings.json")) else {
         return vec![];
     };
+    script_grants(claude_hook_script_paths(&text, home), root, home, writable)
+}
+
+/// Copilot CLI's equivalent of [`claude_hook_script_grants`] (#704): the
+/// scripts named by user-level hooks (`hooks.<event>[]` with `bash`,
+/// `command`, or `exec` + `args`) in `<root>/settings.json` and
+/// `<root>/hooks/*.json`, and by `mcpServers.<n>.command` + `args` in
+/// `<root>/mcp-config.json`. All three are `host_persistence_denies`
+/// entries, so the agent cannot plant a path in them. A symlinked file or
+/// `hooks/` dir is not read: Seatbelt matches the resolved path, so the deny
+/// would not cover the target. Project-level config is never read. Same
+/// grant shape and skips as the Claude version; macOS only for the same
+/// reason.
+fn copilot_hook_script_grants(root: &Path, home: &Path) -> Vec<AgentDir> {
+    if !cfg!(target_os = "macos") {
+        return vec![];
+    }
+    let plain = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| !m.file_type().is_symlink());
+    let mut files = vec![root.join("settings.json"), root.join("mcp-config.json")];
+    if plain(&root.join("hooks"))
+        && let Ok(rd) = std::fs::read_dir(root.join("hooks"))
+    {
+        files.extend(
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|e| e == "json")),
+        );
+    }
+    let mut commands: Vec<Vec<String>> = vec![];
+    for f in files.iter().filter(|f| plain(f)) {
+        let Some(v) = read_small_regular_file(f)
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        else {
+            continue;
+        };
+        let with_args = |head: &str, e: &serde_json::Value| {
+            let args = e.get("args").and_then(|a| a.as_array());
+            std::iter::once(head.to_string())
+                .chain(
+                    args.into_iter()
+                        .flatten()
+                        .filter_map(|a| a.as_str())
+                        .map(String::from),
+                )
+                .collect::<Vec<_>>()
+        };
+        for e in v
+            .get("hooks")
+            .and_then(|h| h.as_object())
+            .into_iter()
+            .flat_map(|events| events.values())
+            .filter_map(|e| e.as_array())
+            .flatten()
+        {
+            for key in ["bash", "command"] {
+                commands.extend(e.get(key).and_then(|c| c.as_str()).map(shell_words));
+            }
+            commands.extend(
+                e.get("exec")
+                    .and_then(|c| c.as_str())
+                    .map(|x| with_args(x, e)),
+            );
+        }
+        for s in v
+            .get("mcpServers")
+            .and_then(|m| m.as_object())
+            .into_iter()
+            .flat_map(|m| m.values())
+        {
+            commands.extend(
+                s.get("command")
+                    .and_then(|c| c.as_str())
+                    .map(|x| with_args(x, s)),
+            );
+        }
+    }
+    script_grants(script_paths(commands, home), root, home, &[])
+}
+
+/// Read + exec grants for `paths`, minus anything under `root`/`writable`,
+/// credentials or unnameable in SBPL. See [`claude_hook_script_grants`].
+fn script_grants(
+    paths: Vec<PathBuf>,
+    root: &Path,
+    home: &Path,
+    writable: &[PathBuf],
+) -> Vec<AgentDir> {
     let own: Vec<PathBuf> = std::iter::once(root)
         .chain(writable.iter().map(PathBuf::as_path))
         .flat_map(|p| {
@@ -344,7 +431,7 @@ fn claude_hook_script_grants(root: &Path, home: &Path, writable: &[PathBuf]) -> 
         .filter(|p| !p.as_os_str().is_empty())
         .collect();
     let mut out: Vec<AgentDir> = vec![];
-    for path in claude_hook_script_paths(&text, home) {
+    for path in paths {
         let Ok(real) = std::fs::canonicalize(&path) else {
             continue;
         };
@@ -394,9 +481,15 @@ fn claude_hook_script_paths(text: &str, home: &Path) -> Vec<PathBuf> {
         .filter_map(|h| h.get("command")?.as_str())
         .collect();
     commands.extend(v.pointer("/statusLine/command").and_then(|c| c.as_str()));
+    script_paths(commands.into_iter().map(shell_words), home)
+}
+
+/// The absolute script path (see [`script_token`]) of each command, after
+/// `~` and `$HOME` expansion.
+fn script_paths(commands: impl IntoIterator<Item = Vec<String>>, home: &Path) -> Vec<PathBuf> {
     commands
         .into_iter()
-        .filter_map(|c| script_token(shell_words(c)))
+        .filter_map(script_token)
         .filter_map(|w| {
             let w = if let Some(rest) = w.strip_prefix("~/") {
                 home.join(rest)
@@ -1386,14 +1479,20 @@ impl Agent {
                 // `sandbox.deny_copilot_dir_exec` drops `process_exec` here on
                 // Linux via `deny_copilot_dir_exec`; it stays set by default
                 // until the key has been out long enough to flip.
-                vec![AgentDir {
-                    path: home.join(".copilot"),
-                    write: true,
-                    map_exec: true,
-                    process_exec: true,
-                    write_files: vec![],
-                    create_dirs: vec![],
-                }]
+                let root = home.join(".copilot");
+                let mut dirs = copilot_hook_script_grants(&root, home);
+                dirs.insert(
+                    0,
+                    AgentDir {
+                        path: root,
+                        write: true,
+                        map_exec: true,
+                        process_exec: true,
+                        write_files: vec![],
+                        create_dirs: vec![],
+                    },
+                );
+                dirs
             }
             Agent::Shell => {
                 // Shell needs write access to its config/data dirs for history
@@ -2715,6 +2814,85 @@ mod tests {
         )
         .unwrap();
         assert!(claude_hook_script_grants(&link, &base, &[]).is_empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn copilot_hook_and_mcp_scripts_get_exec_only_file_grants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let home = base.join("home");
+        let root = home.join(".copilot");
+        let ext = base.join("ext");
+        for d in [&root.join("hooks"), &ext, &home.join(".ssh")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let file = |p: PathBuf| {
+            std::fs::write(&p, "#!/bin/sh\n").unwrap();
+            p
+        };
+        let bash = file(ext.join("bash.sh"));
+        let exec = file(ext.join("exec.py"));
+        let setting = file(ext.join("setting.sh"));
+        let server = file(ext.join("server.js"));
+        let log = file(ext.join("log.txt"));
+        let linked = file(ext.join("linked.sh"));
+        let project = file(ext.join("project.sh"));
+        let key = file(home.join(".ssh/id_ed25519"));
+        let inside = file(root.join("own.sh"));
+        let hook = |cmd: serde_json::Value| {
+            serde_json::json!({"version": 1, "hooks": {"preToolUse": [cmd]}}).to_string()
+        };
+        std::fs::write(
+            root.join("hooks/a.json"),
+            hook(serde_json::json!({"type": "command", "bash": format!("'{}' {}", bash.display(), log.display())})),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("hooks/b.json"),
+            hook(serde_json::json!({"type": "command", "exec": "python3", "args": ["-u", exec.display().to_string()]})),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("settings.json"),
+            hook(serde_json::json!({"type": "command", "command": format!("{} && {}", setting.display(), inside.display())})),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("mcp-config.json"),
+            serde_json::json!({"mcpServers": {
+                "a": {"command": "node", "args": [server.display().to_string()]},
+                "b": {"command": key.display().to_string()},
+                "c": {"command": "npx", "args": ["-y", "pkg"]},
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        // A symlinked hook file is not covered by the write deny: not read.
+        let planted = base.join("planted.json");
+        std::fs::write(
+            &planted,
+            hook(serde_json::json!({"bash": linked.display().to_string()})),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&planted, root.join("hooks/c.json")).unwrap();
+        // Project-level config is never read.
+        std::fs::create_dir_all(base.join(".github/hooks")).unwrap();
+        std::fs::write(
+            base.join(".github/hooks/p.json"),
+            hook(serde_json::json!({"bash": project.display().to_string()})),
+        )
+        .unwrap();
+
+        let got = copilot_hook_script_grants(&root, &home);
+        let paths: Vec<_> = got.iter().map(|d| d.path.clone()).collect();
+        for want in [&bash, &exec, &setting, &server] {
+            assert!(paths.contains(want), "{want:?} missing: {paths:?}");
+        }
+        for not in [&log, &linked, &project, &key, &inside] {
+            assert!(!paths.contains(not), "{not:?} granted: {paths:?}");
+        }
+        assert!(got.iter().all(|d| !d.write && d.process_exec));
     }
 
     #[test]
