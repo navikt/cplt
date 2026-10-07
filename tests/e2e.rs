@@ -2071,10 +2071,10 @@ mod e2e_tests {
         let _ = std::fs::remove_dir_all(&fake_home);
     }
 
-    /// #710: an OpenCode v2 binary at the upstream installer's path (which
+    /// #710: on Linux, an OpenCode v2 binary at the upstream installer's path (which
     /// the path check cannot classify) is refused, and never run beyond
     /// `--version`.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn e2e_opencode_v2_is_refused_before_launch() {
         use std::os::unix::fs::PermissionsExt;

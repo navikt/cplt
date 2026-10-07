@@ -4340,7 +4340,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
                  drop --no-scratch-dir (or sandbox.scratch_dir = false) to run it."
             );
         };
-        let session = cplt::opencode_v2::prepare(scratch, &home_dir)
+        let session = cplt::opencode_v2::prepare(scratch, &home_dir, &launch_dir)
             .map_err(|e| anyhow::anyhow!("Cannot set up the OpenCode v2 session: {e}"))?;
         prepared.add_opencode_v2(session);
     }

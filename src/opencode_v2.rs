@@ -45,7 +45,7 @@ fn xdg_base(var: &str, home: &Path, default: &str) -> PathBuf {
 }
 
 /// Set up the session under `scratch` and return its env and profile tail.
-pub fn prepare(scratch: &Path, home: &Path) -> Result<Session, String> {
+pub fn prepare(scratch: &Path, home: &Path, launch_dir: &Path) -> Result<Session, String> {
     let config_base = xdg_base("XDG_CONFIG_HOME", home, ".config");
     let state_base = xdg_base("XDG_STATE_HOME", home, ".local/state");
     let config = scratch.join("opencode-v2/config");
@@ -71,7 +71,7 @@ pub fn prepare(scratch: &Path, home: &Path) -> Result<Session, String> {
     Ok(Session {
         port,
         env,
-        sbpl: profile_tail(home, &[config_base, state_base], port)?,
+        sbpl: profile_tail(home, launch_dir, &[config_base, state_base], port)?,
     })
 }
 
@@ -104,11 +104,17 @@ fn free_port() -> std::io::Result<u16> {
 
 /// The SBPL rules a v2 session adds.
 ///
-/// v2 resolves `$HOME`, `~/.claude` and `~/.agents` at startup and treats any
-/// error other than "not found" as fatal, so the dir entries themselves become
-/// readable; their contents stay denied. Both host `service.json` files are
-/// denied at the spelled and the resolved path.
-fn profile_tail(home: &Path, bases: &[PathBuf], port: u16) -> Result<String, String> {
+/// v2's config discovery resolves `$HOME` and every parent of the working dir,
+/// plus the `.claude` and `.agents` entries in each, and treats any error
+/// other than "not found" as fatal. Those dir entries themselves become
+/// readable (a listing of names); their contents stay denied. Both host
+/// `service.json` files are denied at the spelled and the resolved path.
+fn profile_tail(
+    home: &Path,
+    launch_dir: &Path,
+    bases: &[PathBuf],
+    port: u16,
+) -> Result<String, String> {
     let mut denied = Vec::new();
     for base in bases {
         let file = base.join("opencode/service.json");
@@ -118,11 +124,12 @@ fn profile_tail(home: &Path, bases: &[PathBuf], port: u16) -> Result<String, Str
         denied.push(real);
     }
     denied.dedup();
-    let reads = [
-        home.to_path_buf(),
-        home.join(".claude"),
-        home.join(".agents"),
-    ];
+    let mut reads = Vec::new();
+    for dir in home.ancestors().chain(launch_dir.ancestors()) {
+        reads.extend([dir.to_path_buf(), dir.join(".claude"), dir.join(".agents")]);
+    }
+    reads.sort();
+    reads.dedup();
     for p in reads.iter().chain(&denied) {
         crate::sandbox::validate_sbpl_path(p)?;
     }
@@ -177,7 +184,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let s = temp_env::with_vars(
             [("XDG_CONFIG_HOME", None::<&str>), ("XDG_STATE_HOME", None)],
-            || prepare(tmp.path(), tmp.path()).unwrap(),
+            || prepare(tmp.path(), tmp.path(), &tmp.path().join("src/repo")).unwrap(),
         );
         let file = tmp.path().join("opencode-v2/config/opencode/service.json");
         let v: serde_json::Value =
@@ -202,6 +209,8 @@ mod tests {
             s.sbpl
                 .contains(&format!("{home}/.local/state/opencode/service.json"))
         );
-        assert!(s.sbpl.contains(&format!("(literal \"{home}/.claude\")")));
+        for read in [format!("{home}/.claude"), format!("{home}/src"), "/".into()] {
+            assert!(s.sbpl.contains(&format!("(literal \"{read}\")")), "{read}");
+        }
     }
 }
