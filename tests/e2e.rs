@@ -9618,13 +9618,13 @@ paths = [
                 ] {
                     cmd.env_remove(v);
                 }
-                cmd.args(["--yes", "--agent", "opencode", "--"]).args(args);
+                cmd.args(["--yes", "--agent", "opencode"]).args(args);
                 cmd
             }
 
             /// Run `script` inside the sandbox: (stdout, stderr, exit code).
             fn sh(&self, script: &str) -> (String, String, Option<i32>) {
-                let o = self.cmd(&[script]).output().expect("cplt should run");
+                let o = self.cmd(&["--", script]).output().expect("cplt should run");
                 (
                     String::from_utf8_lossy(&o.stdout).into_owned(),
                     String::from_utf8_lossy(&o.stderr).into_owned(),
@@ -9657,7 +9657,7 @@ paths = [
             require_sandbox!();
             let home = stub_home();
             let o = home
-                .cmd(&["env"])
+                .cmd(&["--pass-env", "OPENCODE_AUTH_CONTENT", "--", "env"])
                 .env("OPENCODE_AUTH_CONTENT", "AUTH-CANARY")
                 .output()
                 .unwrap();
@@ -9719,8 +9719,8 @@ paths = [
                 r#"h={h}
                 cat "$h/.local/state/opencode/service.json"
                 cat "$h/.config/opencode/service.json"
-                mv "$h/.local/state/opencode" "$h/.local/state/moved" && echo MOVED
-                mv "$h/.config/opencode" "$h/.config/moved" && echo MOVED
+                mv "$h/.local/state/opencode" "$PWD/moved1" && echo MOVED
+                mv "$h/.config/opencode" "$PWD/moved2" && echo MOVED
                 P=$(sed 's/.*"port":\([0-9]*\).*/\1/' "$XDG_CONFIG_HOME/opencode/service.json")
                 /usr/bin/nc -l 127.0.0.1 "$P" >/dev/null & sleep 0.5
                 /usr/bin/nc -z -G 2 127.0.0.1 "$P" && echo SESSION-PORT-OPEN
@@ -9803,7 +9803,7 @@ paths = [
             let ssh = home.h.join(".ssh");
             std::fs::create_dir_all(&ssh).unwrap();
             let o = home
-                .cmd(&["echo RAN"])
+                .cmd(&["--", "echo RAN"])
                 .env("OPENCODE_CONFIG_DIR", &ssh)
                 .output()
                 .unwrap();
@@ -9819,7 +9819,7 @@ paths = [
             let home = stub_home();
             let script = r#"cat "$XDG_CONFIG_HOME/opencode/service.json"; sleep 1"#;
             let spawn = || {
-                home.cmd(&[script])
+                home.cmd(&["--", script])
                     .stdout(std::process::Stdio::piped())
                     .spawn()
                     .unwrap()
@@ -9847,7 +9847,7 @@ paths = [
         fn session_dir_is_removed_after_sigint() {
             require_sandbox!();
             let home = stub_home();
-            let mut c = home.cmd(&["echo $XDG_STATE_HOME; exec sleep 30"]);
+            let mut c = home.cmd(&["--", "echo $XDG_STATE_HOME; exec sleep 30"]);
             let (scratch, status) = interrupt(&mut c);
             assert!(!status.success());
             assert!(!scratch.exists(), "{} left behind", scratch.display());
