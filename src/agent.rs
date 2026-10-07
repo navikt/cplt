@@ -419,14 +419,11 @@ pub(crate) fn read_small_regular_file(path: &Path) -> Option<String> {
 /// and files,
 /// `~/Library/Keychains`, and anything SBPL cannot name.
 ///
-/// macOS only. On Linux the file is write-denied only under bubblewrap; with
+/// On Linux `settings.json` is write-denied only under bubblewrap; with
 /// Landlock alone the whole root is writable, so the agent could plant a hook
-/// naming any file and get it granted on the next launch. ponytail: Linux
-/// stays as before until this can be gated on bubblewrap being active.
+/// naming any file and get it granted on the next launch. `prepare_impl`
+/// drops these grants again when bubblewrap does not resolve active (#705).
 fn claude_hook_script_grants(root: &Path, home: &Path, writable: &[PathBuf]) -> Vec<AgentDir> {
-    if !cfg!(target_os = "macos") {
-        return vec![];
-    }
     let Some(text) = read_small_regular_file(&root.join("settings.json")) else {
         return vec![];
     };
@@ -3133,7 +3130,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     fn claude_hook_scripts_get_exec_only_file_grants() {
         let tmp = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(tmp.path()).unwrap();
@@ -3241,7 +3238,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     fn claude_hook_scripts_skip_files_under_symlinked_root() {
         let tmp = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(tmp.path()).unwrap();

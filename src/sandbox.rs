@@ -2382,6 +2382,66 @@ fn overlay_paths(
     (ro_protect, pins)
 }
 
+/// #705: remove the Claude hook-script grants (`claude_hook_script_grants`,
+/// the only read+execute, non-write Claude agent dirs) from the direct-path
+/// `policy`: only bubblewrap's read-only bind keeps `settings.json`, which
+/// names these files, out of the agent's reach.
+/// Returns the dropped paths. Keeps `plain_file` pointing at its rule.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn drop_claude_hook_grants(
+    config: &SandboxConfig,
+    policy: &mut landlock_mod::LandlockPolicy,
+) -> Vec<String> {
+    if config.agent != Agent::Claude {
+        return vec![];
+    }
+    let mut dropped = Vec::new();
+    for hook in config
+        .agent_dirs
+        .iter()
+        .filter(|d| !d.write && d.process_exec)
+    {
+        // The last match: `generate_policy` emits agent dirs after the user's
+        // `allow.exec`, so an identical user rule earlier on stays.
+        let Some(i) = policy
+            .fs_rules
+            .iter()
+            .rposition(|r| r.path == hook.path && r.access.execute && !r.access.write)
+        else {
+            continue;
+        };
+        policy.fs_rules.remove(i);
+        if let Some(p) = policy.plain_file.as_mut().filter(|p| i < **p) {
+            *p -= 1;
+        }
+        dropped.push(hook.path.display().to_string());
+    }
+    dropped
+}
+
+/// #705: bubblewrap re-binds `settings.json` read-only only when it exists
+/// (a bind needs a source). A missing one could be created by the agent in
+/// the writable Claude root, and its hooks would be granted read+execute on
+/// the next launch. Seed it with `{}` (Claude's own default) so the read-only
+/// bind always covers it. Never overwrites.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn seed_claude_settings(config: &SandboxConfig) {
+    if config.agent != Agent::Claude {
+        return;
+    }
+    for dir in config
+        .agent_dirs
+        .iter()
+        .filter(|d| d.write && d.path.is_dir())
+    {
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.path.join("settings.json"))
+            .and_then(|mut f| std::io::Write::write_all(&mut f, b"{}\n"));
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn prepare_impl(
     config: &SandboxConfig,
@@ -2476,8 +2536,15 @@ fn prepare_impl(
         mut ro_protect,
         mut pins,
         deny_masks,
-    } = bwrap_plan(config, extra_git_dirs, canonical_grants);
+    } = {
+        if !inspect_only {
+            seed_claude_settings(config);
+        }
+        bwrap_plan(config, extra_git_dirs, canonical_grants)
+    };
     let mut profile_text = landlock_mod::describe_policy(&policy);
+    // Rebuilt below if the hook grants are dropped on a Landlock-only host.
+    let policy_text_len = profile_text.len();
 
     // A withdrawn grant another rule quietly gives back is said out loud
     // (#324). Resolved the way `canonicalize_agent_dirs` resolves the rule.
@@ -2624,11 +2691,29 @@ fn prepare_impl(
     // the root stays read-only and Pi does not start, which `cplt doctor`
     // explains. Cleared here, after `resolve` consumed the rules, so the
     // writable bind it needs is still emitted when bwrap IS active.
+    //
+    // #705: the Claude hook-script grants go from the direct-path policy
+    // always. A wrapper carries its own copy of the rules, so they still apply
+    // under bubblewrap, but an exec-time fallback to plain Landlock does not
+    // get them.
+    let dropped = drop_claude_hook_grants(config, &mut policy);
     if bwrap_wrapper.is_none() {
         let mut cleared = Vec::new();
         for rule in policy.fs_rules.iter_mut().filter(|r| r.access.create_dirs) {
             rule.access.create_dirs = false;
             cleared.push(rule.path.display().to_string());
+        }
+        if !dropped.is_empty() {
+            // `--print-profile` / `cplt check` must not list the dropped grant.
+            profile_text =
+                landlock_mod::describe_policy(&policy) + &profile_text[policy_text_len..];
+            ui::warn(&format!(
+                "Claude hook script grant on {} is NOT applied without Bubblewrap: \
+                 Landlock alone leaves settings.json writable, so the agent could \
+                 name any file there. Hooks that run these scripts may fail. Install \
+                 bubblewrap to enable it.",
+                dropped.join(", ")
+            ));
         }
         if !cleared.is_empty() {
             ui::warn(&format!(
@@ -3188,6 +3273,97 @@ mod tests {
 
         let error = validate_pnpm_tool_dirs(&config).expect_err("symlink must be refused");
         assert!(error.contains("resolves through a symlink"));
+    }
+
+    #[test]
+    fn claude_settings_seeded_only_when_missing() {
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir(&claude).unwrap();
+        let dirs = [AgentDir {
+            path: claude.clone(),
+            write: true,
+            map_exec: false,
+            process_exec: true,
+            write_files: vec![],
+            create_dirs: vec![],
+            via: vec![],
+        }];
+        let mut config = test_config(home.path(), &[]);
+        config.agent_dirs = &dirs;
+        config.agent = Agent::Copilot;
+        seed_claude_settings(&config);
+        assert!(!claude.join("settings.json").exists());
+        config.agent = Agent::Claude;
+        seed_claude_settings(&config);
+        assert_eq!(
+            std::fs::read_to_string(claude.join("settings.json")).unwrap(),
+            "{}\n"
+        );
+        std::fs::write(claude.join("settings.json"), "{\"a\":1}").unwrap();
+        seed_claude_settings(&config);
+        assert_eq!(
+            std::fs::read_to_string(claude.join("settings.json")).unwrap(),
+            "{\"a\":1}"
+        );
+    }
+
+    #[test]
+    fn claude_hook_grants_are_dropped_and_plain_file_follows() {
+        // #705: without bubblewrap the hook-script grant goes; the Claude
+        // root grant and the plain-file rule stay, the index still on it.
+        let home = Path::new("/h");
+        let hook = AgentDir {
+            path: PathBuf::from("/x/gate.py"),
+            write: false,
+            map_exec: false,
+            process_exec: true,
+            write_files: vec![],
+            create_dirs: vec![],
+            via: vec![],
+        };
+        let root = AgentDir {
+            path: home.join(".claude"),
+            write: true,
+            ..hook.clone()
+        };
+        let dirs = [root, hook];
+        let mut config = test_config(home, &[]);
+        config.agent = Agent::Claude;
+        config.agent_dirs = &dirs;
+        let rule = |p: &str, write| landlock_mod::FsRule {
+            path: PathBuf::from(p),
+            access: landlock_mod::FsAccess {
+                read: true,
+                write,
+                execute: true,
+                ioctl: false,
+                create_dirs: false,
+            },
+            nofollow: false,
+        };
+        let mut policy = landlock_mod::generate_policy(&config);
+        // An identical user `allow.exec` rule comes first and must stay.
+        policy.fs_rules = vec![
+            rule("/x/gate.py", false),
+            rule("/x/gate.py", false),
+            rule("/h/.claude", true),
+            rule("/p", false),
+        ];
+        policy.plain_file = Some(3);
+        let mut other = policy.clone();
+        assert_eq!(
+            drop_claude_hook_grants(&config, &mut policy),
+            ["/x/gate.py"]
+        );
+        assert_eq!(policy.fs_rules.len(), 3);
+        assert_eq!(policy.fs_rules[0].path, Path::new("/x/gate.py"));
+        assert_eq!(
+            policy.fs_rules[policy.plain_file.unwrap()].path,
+            Path::new("/p")
+        );
+        config.agent = Agent::Copilot;
+        assert!(drop_claude_hook_grants(&config, &mut other).is_empty());
     }
 
     #[test]
