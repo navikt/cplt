@@ -1555,10 +1555,12 @@ pub fn home_and_temp_writable_roots(
     tool_dirs: &[policy::ResolvedToolDir],
     git_common_dir: Option<&Path>,
 ) -> Vec<PathBuf> {
-    let mut roots: Vec<PathBuf> = tool_dirs
-        .iter()
+    // Vetted like the profile does: a refused target (`~/.cache -> $HOME`)
+    // must not turn all of home into a "writable root" here.
+    let mut roots: Vec<PathBuf> = policy::active_tool_dirs(home, Some(tool_dirs))
+        .into_iter()
         .filter(|d| d.dir.write)
-        .flat_map(|d| std::iter::once(d.path.clone()).chain(d.target.clone()))
+        .flat_map(|d| std::iter::once(d.path).chain(d.target))
         .collect();
     roots.extend(policy::app_dirs().iter().flat_map(|d| d.write_paths(home)));
     roots.push(policy::cypress_app_data_dir_with_env(home, &process_env));

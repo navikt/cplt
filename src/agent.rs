@@ -2561,9 +2561,23 @@ pub fn drop_script_grants_under(dirs: &mut Vec<AgentDir>, writable: &[PathBuf]) 
     roots.dedup();
     dirs.retain(|d| {
         let script = !d.write && d.process_exec && !d.map_exec && d.path.is_file();
-        let under = |p: &PathBuf| roots.iter().any(|r| p.starts_with(r));
+        let under = |p: &PathBuf| roots.iter().any(|r| path_under(p, r));
         !(script && (under(&d.path) || d.via.iter().any(under)))
     });
+}
+
+/// `p` is `root` or inside it. On macOS APFS is case-insensitive by default and
+/// `realpath` keeps the spelling it was given, so `$T/PROJ` and `$T/proj` name
+/// the same tree; compare case-insensitively there (over-matching only drops a
+/// script grant).
+fn path_under(p: &Path, root: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let lower = |x: &Path| PathBuf::from(x.to_string_lossy().to_lowercase());
+        lower(p).starts_with(lower(root))
+    }
+    #[cfg(not(target_os = "macos"))]
+    p.starts_with(root)
 }
 
 pub fn canonicalize_agent_dirs(dirs: &mut [AgentDir]) {
@@ -5234,6 +5248,34 @@ mod tests {
         drop_script_grants_under(&mut dirs, &roots);
         let got: Vec<_> = dirs.iter().map(|d| d.path.clone()).collect();
         assert_eq!(got, vec![ok]);
+    }
+
+    /// A tool dir whose symlink target is refused (`~/.cache -> $HOME`) is
+    /// vetted out, so home itself never becomes a writable root.
+    #[test]
+    fn refused_tool_dir_target_is_not_a_writable_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        std::os::unix::fs::symlink(&home, home.join(".cache")).unwrap();
+        let tool_dirs: Vec<_> = crate::sandbox::HOME_TOOL_DIRS
+            .iter()
+            .map(|d| d.resolve(&home, &[]))
+            .collect();
+        let roots = crate::sandbox::home_and_temp_writable_roots(&home, &tool_dirs, None);
+        assert!(!roots.contains(&home), "{roots:?}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn path_under_ignores_case_on_macos() {
+        assert!(path_under(
+            Path::new("/t/PROJ/xdg/hook.sh"),
+            Path::new("/t/proj")
+        ));
+        assert!(!path_under(
+            Path::new("/t/projx/hook.sh"),
+            Path::new("/t/proj")
+        ));
     }
 
     /// `/dev/shm` is always writable off macOS, like `/tmp` (#714).
