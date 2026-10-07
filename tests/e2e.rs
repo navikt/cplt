@@ -8124,6 +8124,43 @@ paths = [
         );
     }
 
+    /// Ctrl-C reaches both cplt and the agent (same foreground process group).
+    /// cplt must not die from it: it waits for the child, returns the child's
+    /// status and removes the scratch dir.
+    #[test]
+    fn e2e_exec_sigint_to_cplt_waits_for_child_and_cleans_up() {
+        use std::io::{BufRead, BufReader};
+        use std::process::Stdio;
+        require_sandbox!();
+        let mut child = cplt_cmd()
+            .args(["--no-validate", "exec", "--", "/bin/sh", "-c"])
+            .arg("echo \"$TMPDIR\"; sleep 2; echo done; exit 7")
+            .current_dir(project_dir())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("cplt exec should start");
+        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        let tmpdir = lines.next().unwrap().unwrap();
+        assert!(
+            Path::new(&tmpdir).is_dir(),
+            "scratch dir should exist: {tmpdir}"
+        );
+
+        unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
+        let status = child.wait().unwrap();
+
+        assert_eq!(lines.next().unwrap().unwrap(), "done");
+        assert_eq!(
+            status.code(),
+            Some(7),
+            "cplt must return the child's status"
+        );
+        assert!(
+            !Path::new(&tmpdir).exists(),
+            "scratch dir must be removed: {tmpdir}"
+        );
+    }
+
     #[test]
     fn e2e_exec_npmrc_userconfig_absent_without_scratch_dir() {
         require_sandbox!();

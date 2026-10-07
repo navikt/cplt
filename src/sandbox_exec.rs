@@ -1335,7 +1335,21 @@ fn install_signal_forwarding(child_pid: i32) {
         }
     }
 
+    // Ctrl-C and Ctrl-\ already reach the child: it shares our foreground
+    // process group, so forwarding would deliver them twice. Catch them with a
+    // no-op rather than SIG_IGN (which the child would inherit), so cplt
+    // outlives the child and its cleanup (scratch dir, service registrations) runs.
+    extern "C" fn ignore_signal(_: i32) {}
+
     unsafe {
+        libc::signal(
+            libc::SIGINT,
+            ignore_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGQUIT,
+            ignore_signal as *const () as libc::sighandler_t,
+        );
         libc::signal(
             libc::SIGTERM,
             forward_signal as *const () as libc::sighandler_t,
