@@ -47,10 +47,17 @@ fn xdg_base(var: &str, home: &Path, default: &str) -> PathBuf {
 pub fn prepare(scratch: &Path, home: &Path, launch_dir: &Path) -> Result<Session, String> {
     let config_base = xdg_base("XDG_CONFIG_HOME", home, ".config");
     let state_base = xdg_base("XDG_STATE_HOME", home, ".local/state");
+    // v2 uses OPENCODE_CONFIG_DIR, when set, in place of
+    // `$XDG_CONFIG_HOME/opencode`, service.json included.
+    let user_oc = std::env::var_os("OPENCODE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| config_base.join("opencode"));
     let config = scratch.join("opencode-v2/config");
     let state = scratch.join("opencode-v2/state");
     std::fs::create_dir_all(&state).map_err(|e| format!("{}: {e}", state.display()))?;
-    build_overlay(&config_base, &config).map_err(|e| format!("{}: {e}", config.display()))?;
+    build_overlay(&config_base, &user_oc, &config)
+        .map_err(|e| format!("{}: {e}", config.display()))?;
     let port = free_port().map_err(|e| format!("no free loopback port: {e}"))?;
     let password = crate::scratch::generate_session_id()?;
     let body = serde_json::json!({ "port": port, "password": password }).to_string();
@@ -64,24 +71,30 @@ pub fn prepare(scratch: &Path, home: &Path, launch_dir: &Path) -> Result<Session
     let env = vec![
         ("XDG_CONFIG_HOME".into(), config.display().to_string()),
         ("XDG_STATE_HOME".into(), state.display().to_string()),
+        (
+            "OPENCODE_CONFIG_DIR".into(),
+            config.join("opencode").display().to_string(),
+        ),
         ("OPENCODE_DISABLE_MODELS_FETCH".into(), "1".into()),
         ("OPENCODE_DISABLE_AUTOUPDATE".into(), "1".into()),
     ];
+    let files = [
+        user_oc.join("service.json"),
+        config_base.join("opencode/service.json"),
+        state_base.join("opencode/service.json"),
+    ];
     Ok(Session {
         env,
-        sbpl: profile_tail(home, launch_dir, &[config_base, state_base], port)?,
+        sbpl: profile_tail(home, launch_dir, &files, port)?,
     })
 }
 
 /// `overlay` = a link per entry of `user`, except `opencode`, which becomes a
-/// real dir holding a link per entry of `user/opencode` except `service.json`.
-fn build_overlay(user: &Path, overlay: &Path) -> std::io::Result<()> {
+/// real dir holding a link per entry of `user_oc` except `service.json`.
+fn build_overlay(user: &Path, user_oc: &Path, overlay: &Path) -> std::io::Result<()> {
     let own = overlay.join("opencode");
     std::fs::create_dir_all(&own)?;
-    for (from, to, skip) in [
-        (user, overlay, "opencode"),
-        (&user.join("opencode"), &own, "service.json"),
-    ] {
+    for (from, to, skip) in [(user, overlay, "opencode"), (user_oc, &own, "service.json")] {
         let Ok(entries) = std::fs::read_dir(from) else {
             continue;
         };
@@ -106,33 +119,48 @@ fn free_port() -> std::io::Result<u16> {
 /// The SBPL rules a v2 session adds.
 ///
 /// v2's config discovery resolves `$HOME` and every parent of the working dir,
-/// plus the `.claude` and `.agents` entries in each, and treats any error
-/// other than "not found" as fatal. Those dir entries themselves become
-/// readable (a listing of names); their contents stay denied. Both host
-/// `service.json` files are denied at the spelled and the resolved path.
+/// plus the `.claude`, `.agents` and `.opencode` entries in each, and treats
+/// any error other than "not found" as fatal. Those dir entries themselves
+/// become readable (a listing of names), at the spelled and the resolved
+/// path; their contents stay denied.
+///
+/// The host `service.json` files are denied at the spelled and the resolved
+/// path. Every ancestor is pinned against unlink, so a writable one (the
+/// granted host state dir) cannot be renamed into a readable tree to carry
+/// the file out from under the literal deny.
 fn profile_tail(
     home: &Path,
     launch_dir: &Path,
-    bases: &[PathBuf],
+    files: &[PathBuf],
     port: u16,
 ) -> Result<String, String> {
     let mut denied = Vec::new();
-    for base in bases {
-        let file = base.join("opencode/service.json");
+    for file in files {
         // Resolved per file, so a symlinked `opencode/` dir is covered too.
-        let real = crate::config::canonicalize_deepest(&file);
-        denied.push(file.clone());
-        if real != file {
-            denied.push(real);
-        }
+        denied.extend([file.clone(), crate::config::canonicalize_deepest(file)]);
     }
+    denied.sort();
+    denied.dedup();
+    let mut pinned: Vec<PathBuf> = denied
+        .iter()
+        .flat_map(|f| f.ancestors().skip(1).map(Path::to_path_buf))
+        .collect();
+    pinned.sort();
+    pinned.dedup();
     let mut reads = Vec::new();
     for dir in home.ancestors().chain(launch_dir.ancestors()) {
-        reads.extend([dir.to_path_buf(), dir.join(".claude"), dir.join(".agents")]);
+        reads.push(dir.to_path_buf());
+        for name in [".claude", ".agents", ".opencode"] {
+            let entry = dir.join(name);
+            if let Ok(real) = std::fs::canonicalize(&entry) {
+                reads.push(real);
+            }
+            reads.push(entry);
+        }
     }
     reads.sort();
     reads.dedup();
-    for p in reads.iter().chain(&denied) {
+    for p in reads.iter().chain(&denied).chain(&pinned) {
         crate::sandbox::validate_sbpl_path(p)?;
     }
     let lit = |ps: &[PathBuf]| {
@@ -144,9 +172,11 @@ fn profile_tail(
         "\n;; OpenCode v2 session service (#710)\n\
          (allow file-read-data{})\n\
          (deny file-read* file-write*{})\n\
+         (deny file-write-unlink{})\n\
          (allow network-outbound (remote ip \"localhost:{port}\"))\n",
         lit(&reads),
         lit(&denied),
+        lit(&pinned),
     ))
 }
 
@@ -163,7 +193,7 @@ mod tests {
         std::fs::write(user.join("opencode/opencode.json"), "{}").unwrap();
         std::fs::write(user.join("opencode/service.json"), "{\"password\":\"x\"}").unwrap();
         let ov = tmp.path().join("ov");
-        build_overlay(&user, &ov).unwrap();
+        build_overlay(&user, &user.join("opencode"), &ov).unwrap();
         assert_eq!(
             std::fs::read_link(ov.join("git")).unwrap(),
             user.join("git")
@@ -177,7 +207,8 @@ mod tests {
         }
         assert!(!ov.join("opencode/service.json").exists());
         // A user without a config dir still gets the overlay.
-        build_overlay(&tmp.path().join("missing"), &tmp.path().join("ov2")).unwrap();
+        let missing = tmp.path().join("missing");
+        build_overlay(&missing, &missing.join("opencode"), &tmp.path().join("ov2")).unwrap();
         assert!(tmp.path().join("ov2/opencode").is_dir());
     }
 
@@ -190,7 +221,8 @@ mod tests {
         std::fs::create_dir_all(root.join("cfg")).unwrap();
         std::os::unix::fs::symlink(root.join("dotfiles/opencode"), root.join("cfg/opencode"))
             .unwrap();
-        let tail = profile_tail(&root, &root, &[root.join("cfg")], 1).unwrap();
+        let tail =
+            profile_tail(&root, &root, &[root.join("cfg/opencode/service.json")], 1).unwrap();
         for f in [
             "cfg/opencode/service.json",
             "dotfiles/opencode/service.json",
@@ -200,6 +232,38 @@ mod tests {
                 "{f}"
             );
         }
+    }
+
+    /// Kernel check: the writable host state dir cannot be renamed away to
+    /// carry `service.json` out from under its literal deny, and the file
+    /// itself cannot be read. Control: without the tail the rename works.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[allow(clippy::disallowed_methods)] // fixed /usr/bin/sandbox-exec, /bin tools
+    fn host_service_json_survives_a_rename_of_its_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let state = root.join("state/opencode");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir_all(root.join("proj")).unwrap();
+        std::fs::write(state.join("service.json"), "{}").unwrap();
+        let tail = profile_tail(&root, &root, &[state.join("service.json")], 1).unwrap();
+        let run = |profile: &str, cmd: &[&str]| {
+            std::process::Command::new("/usr/bin/sandbox-exec")
+                .args(["-p", profile])
+                .args(cmd)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        };
+        let guarded = format!("(version 1)(allow default){tail}");
+        let moved = root.join("proj/moved");
+        let mv = ["/bin/mv", state.to_str().unwrap(), moved.to_str().unwrap()];
+        assert!(!run(&guarded, &mv), "rename of the state dir must fail");
+        let cat = state.join("service.json");
+        assert!(!run(&guarded, &["/bin/cat", cat.to_str().unwrap()]));
+        assert!(run("(version 1)(allow default)", &mv), "control");
     }
 
     #[test]
@@ -226,7 +290,7 @@ mod tests {
         assert!(!s.sbpl.contains("49374"));
         let home = tmp.path().display();
         assert!(s.sbpl.contains(&format!(
-            "(deny file-read* file-write* (literal \"{home}/.config/opencode/service.json\")"
+            "(literal \"{home}/.config/opencode/service.json\")"
         )));
         assert!(
             s.sbpl

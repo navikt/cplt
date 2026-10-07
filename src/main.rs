@@ -4349,6 +4349,18 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         };
         let session = cplt::opencode_v2::prepare(scratch, &home_dir, &launch_dir)
             .map_err(|e| anyhow::anyhow!("Cannot set up the OpenCode v2 session: {e}"))?;
+        // These variables carry the session's isolation; dropping them would
+        // point OpenCode back at the host service.
+        if let Some((name, _)) = session
+            .env
+            .iter()
+            .find(|(k, _)| resolved.deny_env.contains(k))
+        {
+            bail!(
+                "deny.env names {name}, which cplt must set for an OpenCode v2 session \
+                 (#710). Remove it from deny.env (check the repo's .cplt.toml) to run v2."
+            );
+        }
         prepared.add_opencode_v2(session);
     }
 
