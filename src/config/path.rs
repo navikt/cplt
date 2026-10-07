@@ -314,7 +314,7 @@ pub fn default_config_contents() -> String {
 # mode = "block"              # "block" | "warn" | "audit"
 # scope_check = true          # enforce same-repo check on write commands
 # block_auth_token = true     # deny 'gh auth token' exfiltration
-# inject_token = false        # pre-inject GH_TOKEN into sandbox (opt-in)
+# inject_token = false        # DEPRECATED: gh gets its token without it
 # unknown_command = "block"   # policy for commands not in classification table
 # allow_api_write = false     # allow gh api POST/PATCH/PUT to current repo (opt-in)
 # allow_pr_merge = false      # allow gh pr merge into ruleset-protected branches (opt-in)

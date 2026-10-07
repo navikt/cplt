@@ -69,7 +69,7 @@ enabled = true              # blocks destructive gh operations
 mode = "block"              # block | warn | audit
 scope_check = true          # enforce repo-scoping on write commands
 block_auth_token = true     # deny "gh auth token" exfiltration
-inject_token = false        # inject GH_TOKEN into sandbox (opt-in)
+inject_token = false        # deprecated: gh gets its token without it
 unknown_command = "block"   # block|allow unrecognized gh commands
 allow_api_write = false     # allow gh api write (POST/PUT/PATCH) to current repo (opt-in)
 allow_pr_merge = false      # allow gh pr merge into a ruleset-protected branch (opt-in)
@@ -288,7 +288,10 @@ the gh wrapper, which the guard owns. With the guard off it does nothing, and
 cplt says so at launch rather than leaving a key that reads as true and has no
 effect.
 
-If you prefer the token in the environment instead, set `inject_token = true`.
+`inject_token` is deprecated. `gh` gets its token from the exec token, and
+Copilot signs in through `sandbox.keychain_substitute = true`. The key still
+works; while it is `true`, cplt prints one line at launch and `cplt check` lists
+it. If you still want the token in the environment, set `inject_token = true`.
 `cplt config set` refuses it without `--force`, and `cplt config show` marks it
 `⚠ DANGEROUS`, because the token is then inherited by every process in the
 sandbox — and readable from any of them, through `/proc/<pid>/environ` on Linux

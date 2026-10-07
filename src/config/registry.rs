@@ -560,7 +560,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         // unremarkable. A user hit exactly that and asked why.
         dangerous: true,
         default_display: "false",
-        description: "Pre-extract GH_TOKEN before sandbox launch (only for Copilot agent).",
+        description: "DEPRECATED: gh gets its token from the gh guard, Copilot from sandbox.keychain_substitute. Pre-extracts GH_TOKEN into the agent env (Copilot only).",
     },
     ConfigKeyInfo {
         section: "gh_guard",
