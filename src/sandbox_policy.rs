@@ -425,6 +425,11 @@ fn is_plain_file_or_absent(target: &Path) -> bool {
 /// under a linked `~/.m2` is the documented Landlock limit, not a link leak).
 /// Compared canonicalized: a Landlock rule on `target` follows links and is
 /// recursive, so containment is a leak too.
+/// [`overlaps_credential_entry`] for a whole directory grant at `dir`.
+pub fn dir_overlaps_credentials(home: &Path, dir: &Path) -> bool {
+    overlaps_credential_entry(home, &config::canonicalize_deepest(dir), dir)
+}
+
 fn overlaps_credential_entry(home: &Path, target: &Path, own: &Path) -> bool {
     let canon = config::canonicalize_deepest;
     let overlaps = |denied: PathBuf| denied.starts_with(target) || target.starts_with(&denied);

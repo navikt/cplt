@@ -161,12 +161,22 @@ fn profile_tail(
         // Discovery also resolves each `opencode.json(c)` and reads it as a
         // config (#718). Granted only as a plain file with one link: a symlink
         // or a hard link the agent planted could name any file, ~/.ssh too.
+        // Anything else is refused by name rather than left to fail as EPERM.
         for name in ["opencode.json", "opencode.jsonc"] {
             let file = dir.join(name);
-            if std::fs::symlink_metadata(&file).is_ok_and(|m| m.is_file() && m.nlink() == 1) {
-                reads.extend(std::fs::canonicalize(&file));
-                reads.push(file);
+            let Ok(m) = std::fs::symlink_metadata(&file) else {
+                continue;
+            };
+            if !(m.is_file() && m.nlink() == 1) {
+                return Err(format!(
+                    "{} is a symlink, hard link or directory. OpenCode v2 reads it as \
+                     config, and cplt grants it only as a plain file. Replace it with a \
+                     regular file or move it.",
+                    file.display()
+                ));
             }
+            reads.extend(std::fs::canonicalize(&file));
+            reads.push(file);
         }
     }
     reads.sort();
@@ -278,8 +288,8 @@ mod tests {
     }
 
     /// Kernel check (#718): a plain `opencode.json` in an ancestor of the
-    /// launch dir is readable; one that is a symlink or a hard link is not
-    /// granted, so neither reaches the file it points at.
+    /// launch dir is readable; a symlink, hard link or directory there is
+    /// refused by name, so it never reaches the file it points at.
     #[cfg(target_os = "macos")]
     #[test]
     #[allow(clippy::disallowed_methods)] // fixed /usr/bin/sandbox-exec, /bin/cat
@@ -290,9 +300,21 @@ mod tests {
         std::fs::create_dir_all(&c).unwrap();
         std::fs::write(a.join("opencode.json"), "PLAIN").unwrap();
         std::fs::write(root.join("secret"), "SECRET").unwrap();
+        let svc = [root.join("x/service.json")];
+        let refused = |f: PathBuf| {
+            let err = profile_tail(&root, &c, &svc, 1).unwrap_err();
+            assert!(err.contains(&f.display().to_string()), "{err}");
+            std::fs::remove_file(&f)
+                .or_else(|_| std::fs::remove_dir(&f))
+                .unwrap();
+        };
         std::os::unix::fs::symlink(root.join("secret"), b.join("opencode.json")).unwrap();
-        std::fs::hard_link(root.join("secret"), c.join("opencode.json")).unwrap();
-        let tail = profile_tail(&root, &c, &[root.join("x/service.json")], 1).unwrap();
+        refused(b.join("opencode.json"));
+        std::fs::hard_link(root.join("secret"), c.join("opencode.jsonc")).unwrap();
+        refused(c.join("opencode.jsonc"));
+        std::fs::create_dir(b.join("opencode.json")).unwrap();
+        refused(b.join("opencode.json"));
+        let tail = profile_tail(&root, &c, &svc, 1).unwrap();
         let profile = format!(
             "(version 1)(allow default)(deny file-read-data (subpath \"{}\")){tail}",
             root.display()
@@ -306,8 +328,7 @@ mod tests {
             String::from_utf8_lossy(&o.stdout).into_owned()
         };
         assert_eq!(cat(&a.join("opencode.json")), "PLAIN");
-        assert_eq!(cat(&b.join("opencode.json")), "");
-        assert_eq!(cat(&c.join("opencode.json")), "");
+        assert_eq!(cat(&root.join("secret")), "", "control: the deny holds");
     }
 
     #[test]

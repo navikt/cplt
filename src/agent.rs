@@ -546,6 +546,22 @@ fn opencode_script_grants(config_dir: &Path, home: &Path, writable: &[PathBuf]) 
     out
 }
 
+/// An absolute `OPENCODE_CONFIG_DIR`, the config dir OpenCode v2 uses in
+/// place of `$XDG_CONFIG_HOME/opencode`.
+fn opencode_custom_config_dir() -> Option<PathBuf> {
+    std::env::var_os("OPENCODE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+}
+
+/// `OPENCODE_CONFIG_DIR` when it is, contains or lies in a credential dir
+/// (`~/.ssh`, `~/.aws`, ...). Its read grant would become a Landlock rule on
+/// Linux, which no deny can narrow, so the launch must refuse it (#720).
+#[must_use]
+pub fn opencode_config_dir_on_credentials(home: &Path) -> Option<PathBuf> {
+    opencode_custom_config_dir().filter(|d| crate::sandbox::dir_overlaps_credentials(home, d))
+}
+
 /// Candidate paths in an OpenCode config: each `plugin[]` entry (string or
 /// `[spec, options]`) that is a `file://` URL, and the script token of each
 /// `mcp.<name>.command` array.
@@ -1843,13 +1859,12 @@ impl Agent {
                 let cache_dir = cache_base.join("opencode");
                 let writable = [data_dir.clone(), state_dir.clone(), cache_dir.clone()];
                 let mut scripts = opencode_script_grants(&config_dir, home, &writable);
-                // `OPENCODE_CONFIG_DIR` adds (v1) or replaces (v2) the config
-                // dir; v2's overlay links into it. Granted like the default dir,
-                // read-only, its scripts under the same provenance rules (#718).
-                if let Some(custom) = std::env::var_os("OPENCODE_CONFIG_DIR")
-                    .map(PathBuf::from)
-                    .filter(|p| p.is_absolute() && *p != config_dir)
-                {
+                // v2 replaces the config dir with `OPENCODE_CONFIG_DIR` and its
+                // overlay links into it; v1 never receives the variable (not in
+                // the env allowlist), so for v1 this grant is unused. Granted
+                // like the default dir, read-only, its scripts under the same
+                // provenance rules (#718).
+                if let Some(custom) = opencode_custom_config_dir().filter(|p| *p != config_dir) {
                     scripts.extend(opencode_script_grants(&custom, home, &writable));
                     scripts.insert(
                         0,
@@ -4080,6 +4095,29 @@ mod tests {
             assert!(!cache_bin.write, "cache/bin should not be writable");
             assert!(cache_bin.process_exec, "cache/bin should allow exec");
         });
+    }
+
+    /// #720: on Linux the custom dir's read grant is a Landlock rule no deny
+    /// can narrow, so one on or around a credential dir must be refused.
+    #[test]
+    fn opencode_config_dir_on_credentials_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(home.join(".ssh/sub")).unwrap();
+        std::fs::create_dir_all(home.join(".config/oc")).unwrap();
+        std::os::unix::fs::symlink(home.join(".ssh"), home.join("link")).unwrap();
+        for (dir, bad) in [
+            (".ssh", true),
+            (".ssh/sub", true),
+            ("link", true),
+            (".aws", true),
+            (".config/oc", false),
+        ] {
+            let got = temp_env::with_var("OPENCODE_CONFIG_DIR", Some(home.join(dir)), || {
+                opencode_config_dir_on_credentials(&home)
+            });
+            assert_eq!(got.is_some(), bad, "{dir}");
+        }
     }
 
     #[test]
