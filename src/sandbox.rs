@@ -2382,6 +2382,44 @@ fn overlay_paths(
     (ro_protect, pins)
 }
 
+/// #705: remove the Claude hook-script grants (`claude_hook_script_grants`,
+/// the only read+execute, non-write Claude agent dirs) from `policy`. Called
+/// when bubblewrap is not active: only its read-only bind keeps
+/// `settings.json`, which names these files, out of the agent's reach.
+/// Returns the dropped paths. Keeps `plain_file` pointing at its rule.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn drop_claude_hook_grants(
+    config: &SandboxConfig,
+    policy: &mut landlock_mod::LandlockPolicy,
+) -> Vec<String> {
+    if config.agent != Agent::Claude {
+        return vec![];
+    }
+    let hooks: Vec<&Path> = config
+        .agent_dirs
+        .iter()
+        .filter(|d| !d.write && d.process_exec)
+        .map(|d| d.path.as_path())
+        .collect();
+    let mut dropped = Vec::new();
+    let mut i = 0;
+    let plain = policy.plain_file;
+    let mut shift = 0;
+    policy.fs_rules.retain(|r| {
+        let drop = r.access.execute && !r.access.write && hooks.contains(&r.path.as_path());
+        if drop {
+            dropped.push(r.path.display().to_string());
+            if plain.is_some_and(|p| i < p) {
+                shift += 1;
+            }
+        }
+        i += 1;
+        !drop
+    });
+    policy.plain_file = plain.map(|p| p - shift);
+    dropped
+}
+
 #[cfg(target_os = "linux")]
 fn prepare_impl(
     config: &SandboxConfig,
@@ -2629,6 +2667,16 @@ fn prepare_impl(
         for rule in policy.fs_rules.iter_mut().filter(|r| r.access.create_dirs) {
             rule.access.create_dirs = false;
             cleared.push(rule.path.display().to_string());
+        }
+        let dropped = drop_claude_hook_grants(config, &mut policy);
+        if !dropped.is_empty() {
+            ui::warn(&format!(
+                "Claude hook script grant on {} is NOT applied without Bubblewrap: \
+                 Landlock alone leaves settings.json writable, so the agent could \
+                 name any file there. Hooks that run these scripts may fail. Install \
+                 bubblewrap to enable it.",
+                dropped.join(", ")
+            ));
         }
         if !cleared.is_empty() {
             ui::warn(&format!(
@@ -3188,6 +3236,60 @@ mod tests {
 
         let error = validate_pnpm_tool_dirs(&config).expect_err("symlink must be refused");
         assert!(error.contains("resolves through a symlink"));
+    }
+
+    #[test]
+    fn claude_hook_grants_are_dropped_and_plain_file_follows() {
+        // #705: without bubblewrap the hook-script grant goes; the Claude
+        // root grant and the plain-file rule stay, the index still on it.
+        let home = Path::new("/h");
+        let hook = AgentDir {
+            path: PathBuf::from("/x/gate.py"),
+            write: false,
+            map_exec: false,
+            process_exec: true,
+            write_files: vec![],
+            create_dirs: vec![],
+        };
+        let root = AgentDir {
+            path: home.join(".claude"),
+            write: true,
+            ..hook.clone()
+        };
+        let dirs = [root, hook];
+        let mut config = test_config(home, &[]);
+        config.agent = Agent::Claude;
+        config.agent_dirs = &dirs;
+        let rule = |p: &str, write| landlock_mod::FsRule {
+            path: PathBuf::from(p),
+            access: landlock_mod::FsAccess {
+                read: true,
+                write,
+                execute: true,
+                ioctl: false,
+                create_dirs: false,
+            },
+            nofollow: false,
+        };
+        let mut policy = landlock_mod::generate_policy(&config);
+        policy.fs_rules = vec![
+            rule("/x/gate.py", false),
+            rule("/h/.claude", true),
+            rule("/p", false),
+        ];
+        policy.plain_file = Some(2);
+        let mut other = policy.clone();
+        assert_eq!(
+            drop_claude_hook_grants(&config, &mut policy),
+            ["/x/gate.py"]
+        );
+        assert_eq!(policy.fs_rules.len(), 2);
+        assert_eq!(
+            policy.fs_rules[policy.plain_file.unwrap()].path,
+            Path::new("/p")
+        );
+        config.agent = Agent::Copilot;
+        assert!(drop_claude_hook_grants(&config, &mut other).is_empty());
     }
 
     #[test]
