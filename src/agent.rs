@@ -412,6 +412,124 @@ fn copilot_hook_script_grants(root: &Path, home: &Path) -> Vec<AgentDir> {
     script_grants(script_paths(commands, home), root, home, &[])
 }
 
+/// Read + execute grants for OpenCode's `file://` plugins and local MCP
+/// server commands in the user config (`opencode.json`, `opencode.jsonc`,
+/// `config.json` in `config_dir`), as [`claude_hook_script_grants`] does for
+/// Claude hooks (#703). The config dir is granted read-only, so the agent
+/// cannot plant a path there; a project `opencode.json` is agent-writable and
+/// never read. macOS only, for the same reason as the Claude grant.
+fn opencode_script_grants(config_dir: &Path, home: &Path, writable: &[PathBuf]) -> Vec<AgentDir> {
+    if !cfg!(target_os = "macos") {
+        return vec![];
+    }
+    let paths = ["opencode.json", "opencode.jsonc", "config.json"]
+        .iter()
+        .filter_map(|f| read_small_regular_file(&config_dir.join(f)))
+        .flat_map(|t| opencode_script_paths(&t, home))
+        .collect();
+    script_grants(paths, config_dir, home, writable)
+}
+
+/// Candidate paths in an OpenCode config: each `plugin[]` entry (string or
+/// `[spec, options]`) that is a `file://` URL, and the script token of each
+/// `mcp.<name>.command` array.
+fn opencode_script_paths(text: &str, home: &Path) -> Vec<PathBuf> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&strip_jsonc(text)) else {
+        return vec![];
+    };
+    let plugins = v
+        .get("plugin")
+        .and_then(|p| p.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p.as_str().or_else(|| p.get(0)?.as_str()))
+        .filter_map(|p| p.strip_prefix("file://"))
+        .map(str::to_string);
+    let commands = v
+        .get("mcp")
+        .and_then(|m| m.as_object())
+        .into_iter()
+        .flat_map(|m| m.values())
+        .filter_map(|s| s.get("command")?.as_array())
+        .map(|c| {
+            c.iter()
+                .filter_map(|w| Some(w.as_str()?.to_string()))
+                .collect()
+        });
+    plugins
+        .filter_map(|w| expand_home(&w, home))
+        .chain(script_paths(commands, home))
+        .collect()
+}
+
+/// JSONC to JSON: drops `//` and `/* */` comments outside strings and
+/// trailing commas before `}` or `]`.
+fn strip_jsonc(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut in_str = false;
+    while let Some(c) = chars.next() {
+        if in_str {
+            out.push(c);
+            if c == '\\' {
+                out.extend(chars.next());
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match (c, chars.peek()) {
+            ('"', _) => {
+                in_str = true;
+                out.push(c);
+            }
+            ('/', Some('/')) => {
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        out.push(c);
+                        break;
+                    }
+                }
+            }
+            ('/', Some('*')) => {
+                chars.next();
+                let mut prev = ' ';
+                for c in chars.by_ref() {
+                    if prev == '*' && c == '/' {
+                        break;
+                    }
+                    prev = c;
+                }
+                out.push(' ');
+            }
+            (c @ ('}' | ']'), _) => {
+                let t = out.trim_end().len();
+                if out[..t].ends_with(',') {
+                    out.truncate(t - 1);
+                }
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// `~/` and `$HOME/` expansion; `None` unless the result is absolute.
+fn expand_home(w: &str, home: &Path) -> Option<PathBuf> {
+    let w = if let Some(rest) = w.strip_prefix("~/") {
+        home.join(rest)
+    } else if let Some(rest) = w
+        .strip_prefix("$HOME/")
+        .or_else(|| w.strip_prefix("${HOME}/"))
+    {
+        home.join(rest)
+    } else {
+        PathBuf::from(w)
+    };
+    w.is_absolute().then_some(w)
+}
+
 /// Read + exec grants for `paths`, minus anything under `root`/`writable`,
 /// credentials or unnameable in SBPL. See [`claude_hook_script_grants`].
 fn script_grants(
@@ -519,19 +637,7 @@ fn script_paths(commands: impl IntoIterator<Item = Vec<String>>, home: &Path) ->
     commands
         .into_iter()
         .filter_map(script_token)
-        .filter_map(|w| {
-            let w = if let Some(rest) = w.strip_prefix("~/") {
-                home.join(rest)
-            } else if let Some(rest) = w
-                .strip_prefix("$HOME/")
-                .or_else(|| w.strip_prefix("${HOME}/"))
-            {
-                home.join(rest)
-            } else {
-                PathBuf::from(w)
-            };
-            w.is_absolute().then_some(w)
-        })
+        .filter_map(|w| expand_home(&w, home))
         .collect()
 }
 
@@ -1574,8 +1680,10 @@ impl Agent {
                     .ok()
                     .map_or_else(|| home.join(".cache"), PathBuf::from);
                 let cache_dir = cache_base.join("opencode");
+                let writable = [data_dir.clone(), state_dir.clone(), cache_dir.clone()];
+                let scripts = opencode_script_grants(&config_dir, home, &writable);
 
-                vec![
+                let mut dirs = vec![
                     AgentDir {
                         path: config_dir,
                         write: false,
@@ -1623,7 +1731,9 @@ impl Agent {
                         create_dirs: vec![],
                         via: vec![],
                     },
-                ]
+                ];
+                dirs.extend(scripts);
+                dirs
             }
             Agent::Antigravity => {
                 // Antigravity stores project config under ~/.gemini/config
@@ -2978,6 +3088,74 @@ mod tests {
         assert!(claude_hook_script_grants(tmp.path(), tmp.path(), &[]).is_empty());
         std::fs::write(tmp.path().join("settings.json"), "{not json").unwrap();
         assert!(claude_hook_script_grants(tmp.path(), tmp.path(), &[]).is_empty());
+    }
+
+    #[test]
+    fn strip_jsonc_drops_comments_and_trailing_commas() {
+        let t = "{\n // c\n \"a\": \"x//y /*z*/\", /* b */\n \"b\": [1,2,],\n}";
+        let v: serde_json::Value = serde_json::from_str(&strip_jsonc(t)).unwrap();
+        assert_eq!(v, serde_json::json!({"a": "x//y /*z*/", "b": [1, 2]}));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn opencode_script_grants_plugins_and_mcp_commands() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        let cfg = home.join(".config/opencode");
+        let data = home.join(".local/share/opencode");
+        let ext = home.join("ext");
+        for d in [&cfg, &data, &ext, &home.join(".ssh")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let f = |p: PathBuf| {
+            std::fs::write(&p, "x").unwrap();
+            p
+        };
+        let plugin = f(ext.join("plugin.js"));
+        let arr_plugin = f(ext.join("arr.js"));
+        let server = f(ext.join("server.js"));
+        let direct = f(ext.join("mcp.sh"));
+        let arg = f(ext.join("arg.txt"));
+        let key = f(home.join(".ssh/id_ed25519"));
+        let inside = f(data.join("x.sh"));
+        let project = f(ext.join("project.js"));
+        std::fs::write(
+            ext.join("opencode.json"),
+            format!(r#"{{"plugin":["file://{}"]}}"#, project.display()),
+        )
+        .unwrap();
+        std::fs::write(
+            cfg.join("opencode.jsonc"),
+            format!(
+                r#"{{
+  // user config
+  "plugin": ["npm-pkg", "file://~/ext/plugin.js", ["file://{arr}", {{}}], "file://{key}",],
+  "mcp": {{
+    "a": {{"type": "local", "command": ["node", "--x", "{server}", "{arg}"]}},
+    "b": {{"type": "local", "command": ["$HOME/ext/mcp.sh"]}},
+    "c": {{"type": "local", "command": ["{inside}"]}},
+    "d": {{"type": "remote", "url": "https://x"}}, /* trailing */
+  }},
+}}"#,
+                arr = arr_plugin.display(),
+                key = key.display(),
+                server = server.display(),
+                arg = arg.display(),
+                inside = inside.display(),
+            ),
+        )
+        .unwrap();
+        let got = opencode_script_grants(&cfg, &home, &[data]);
+        let mut paths: Vec<_> = got.iter().map(|d| d.path.clone()).collect();
+        paths.sort();
+        let mut want = vec![plugin, arr_plugin, server, direct];
+        want.sort();
+        assert_eq!(
+            paths, want,
+            "project config, args, ~/.ssh, writable dir skipped"
+        );
+        assert!(got.iter().all(|d| !d.write && d.process_exec));
     }
 
     #[test]
