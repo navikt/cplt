@@ -162,7 +162,11 @@ fn profile_tail(
         // config (#718). Granted only as a plain file with one link: a symlink
         // or a hard link the agent planted could name any file, ~/.ssh too.
         // Anything else is refused by name rather than left to fail as EPERM.
-        for name in ["opencode.json", "opencode.jsonc"] {
+        // The launch dir is the project, already readable: nothing to grant.
+        for name in ["opencode.json", "opencode.jsonc"]
+            .iter()
+            .filter(|_| dir != launch_dir)
+        {
             let file = dir.join(name);
             let Ok(m) = std::fs::symlink_metadata(&file) else {
                 continue;
@@ -310,11 +314,14 @@ mod tests {
         };
         std::os::unix::fs::symlink(root.join("secret"), b.join("opencode.json")).unwrap();
         refused(b.join("opencode.json"));
-        std::fs::hard_link(root.join("secret"), c.join("opencode.jsonc")).unwrap();
-        refused(c.join("opencode.jsonc"));
+        std::fs::hard_link(root.join("secret"), b.join("opencode.jsonc")).unwrap();
+        refused(b.join("opencode.jsonc"));
         std::fs::create_dir(b.join("opencode.json")).unwrap();
         refused(b.join("opencode.json"));
+        // In the launch dir (the project, already readable) a link is fine.
+        std::os::unix::fs::symlink(root.join("secret"), c.join("opencode.json")).unwrap();
         let tail = profile_tail(&root, &c, &svc, 1).unwrap();
+        assert!(!tail.contains("c/opencode.json"), "{tail}");
         let profile = format!(
             "(version 1)(allow default)(deny file-read-data (subpath \"{}\")){tail}",
             root.display()
