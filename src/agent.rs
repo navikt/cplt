@@ -560,13 +560,13 @@ fn opencode_custom_config_dir() -> Option<PathBuf> {
 /// which no deny can narrow, so the launch must refuse it (#720, #723).
 #[must_use]
 pub fn env_config_dir_on_credentials(agent: Agent, home: &Path) -> Option<(&'static str, PathBuf)> {
-    let set = |v: &str| std::env::var_os(v).is_some_and(|s| !s.is_empty());
+    let var = |v: &str| std::env::var_os(v).filter(|s| !s.is_empty());
     let found = match agent {
-        Agent::Claude if set("CLAUDE_CONFIG_DIR") => (
-            "CLAUDE_CONFIG_DIR",
-            PathBuf::from(std::env::var_os("CLAUDE_CONFIG_DIR")?),
-        ),
-        Agent::Dsh if set("DSH_HOME") => ("DSH_HOME", dsh_home(home)),
+        Agent::Claude => ("CLAUDE_CONFIG_DIR", var("CLAUDE_CONFIG_DIR")?.into()),
+        Agent::Dsh => {
+            var("DSH_HOME")?;
+            ("DSH_HOME", dsh_home(home))
+        }
         Agent::OpenCode => ("OPENCODE_CONFIG_DIR", opencode_custom_config_dir()?),
         _ => return None,
     };
