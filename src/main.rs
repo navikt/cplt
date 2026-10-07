@@ -3441,7 +3441,16 @@ fn agent_allowlist(
         && !deny_env
             .iter()
             .any(|d| d == "GH_TOKEN" || d == "OPENCODE_AUTH_CONTENT");
-    domains.extend(agent.provider_domains(&home, handover));
+    let v2 = agent == agent::Agent::OpenCode
+        && home.is_absolute()
+        && agent
+            .resolve_binary()
+            .is_ok_and(|bin| agent::is_opencode_v2(&bin, &home));
+    if v2 {
+        domains.extend(agent::opencode_v2_provider_domains(&home));
+    } else {
+        domains.extend(agent.provider_domains(&home, handover));
+    }
     domains.into_iter().map(str::to_string).collect()
 }
 
@@ -4290,7 +4299,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         mut prepared,
         policy,
         proxy_handle,
-        scratch_guard: _scratch_guard,
+        scratch_guard,
         pnpm_shadow_guard: _pnpm_shadow_guard,
         #[cfg(target_os = "macos")]
             playwright_socket_guard: _playwright_socket_guard,
@@ -4331,10 +4340,8 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         );
     }
 
-    #[cfg(target_os = "macos")]
-    #[allow(clippy::used_underscore_binding)]
     if opencode_v2 {
-        let Some(scratch) = _scratch_guard.as_ref().map(cplt::scratch::ScratchDir::path) else {
+        let Some(scratch) = scratch_guard.as_ref().map(cplt::scratch::ScratchDir::path) else {
             bail!(
                 "OpenCode v2 keeps its per-session service config in the scratch dir; \
                  drop --no-scratch-dir (or sandbox.scratch_dir = false) to run it."

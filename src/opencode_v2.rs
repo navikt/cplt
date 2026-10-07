@@ -28,7 +28,6 @@ use std::path::{Path, PathBuf};
 
 /// What the launch adds for a v2 session.
 pub struct Session {
-    pub port: u16,
     /// Set on the child after the sandbox's own environment.
     pub env: Vec<(String, String)>,
     /// Appended to the end of the macOS profile (last match wins).
@@ -69,7 +68,6 @@ pub fn prepare(scratch: &Path, home: &Path, launch_dir: &Path) -> Result<Session
         ("OPENCODE_DISABLE_AUTOUPDATE".into(), "1".into()),
     ];
     Ok(Session {
-        port,
         env,
         sbpl: profile_tail(home, launch_dir, &[config_base, state_base], port)?,
     })
@@ -96,6 +94,9 @@ fn build_overlay(user: &Path, overlay: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// ponytail: the port is released before the service binds it, so another
+/// process can take it in between; the service then fails "already in use"
+/// after its 15 s retry. Rare; passing a bound socket in would need upstream.
 fn free_port() -> std::io::Result<u16> {
     Ok(std::net::TcpListener::bind("127.0.0.1:0")?
         .local_addr()?
@@ -118,12 +119,13 @@ fn profile_tail(
     let mut denied = Vec::new();
     for base in bases {
         let file = base.join("opencode/service.json");
-        let real = std::fs::canonicalize(base)
-            .map_or_else(|_| file.clone(), |b| b.join("opencode/service.json"));
-        denied.push(file);
-        denied.push(real);
+        // Resolved per file, so a symlinked `opencode/` dir is covered too.
+        let real = crate::config::canonicalize_deepest(&file);
+        denied.push(file.clone());
+        if real != file {
+            denied.push(real);
+        }
     }
-    denied.dedup();
     let mut reads = Vec::new();
     for dir in home.ancestors().chain(launch_dir.ancestors()) {
         reads.extend([dir.to_path_buf(), dir.join(".claude"), dir.join(".agents")]);
@@ -179,6 +181,27 @@ mod tests {
         assert!(tmp.path().join("ov2/opencode").is_dir());
     }
 
+    /// A dotfiles-style symlinked `opencode/` dir: the resolved file is denied.
+    #[test]
+    fn service_json_is_denied_at_its_resolved_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(root.join("dotfiles/opencode")).unwrap();
+        std::fs::create_dir_all(root.join("cfg")).unwrap();
+        std::os::unix::fs::symlink(root.join("dotfiles/opencode"), root.join("cfg/opencode"))
+            .unwrap();
+        let tail = profile_tail(&root, &root, &[root.join("cfg")], 1).unwrap();
+        for f in [
+            "cfg/opencode/service.json",
+            "dotfiles/opencode/service.json",
+        ] {
+            assert!(
+                tail.contains(&format!("(literal \"{}\")", root.join(f).display())),
+                "{f}"
+            );
+        }
+    }
+
     #[test]
     fn prepare_writes_a_private_service_config() {
         let tmp = tempfile::tempdir().unwrap();
@@ -189,7 +212,7 @@ mod tests {
         let file = tmp.path().join("opencode-v2/config/opencode/service.json");
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
-        assert_eq!(v["port"], s.port);
+        let port = v["port"].as_u64().unwrap();
         assert_eq!(v["password"].as_str().unwrap().len(), 32);
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
@@ -198,7 +221,7 @@ mod tests {
         assert_eq!(env["OPENCODE_DISABLE_MODELS_FETCH"], "1");
         assert!(
             s.sbpl
-                .contains(&format!("(remote ip \"localhost:{}\")", s.port))
+                .contains(&format!("(remote ip \"localhost:{port}\")"))
         );
         assert!(!s.sbpl.contains("49374"));
         let home = tmp.path().display();

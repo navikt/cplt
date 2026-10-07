@@ -289,6 +289,19 @@ fn opencode_auth_json(home: &Path) -> Option<PathBuf> {
     Some(data_base.join("opencode/auth.json"))
 }
 
+/// [`Agent::provider_domains`] for OpenCode v2 (#710): its logins live in
+/// `opencode.db`, and the gh handover does not apply (v2 ignores
+/// `OPENCODE_AUTH_CONTENT`), so only a stored Copilot login adds hosts.
+pub fn opencode_v2_provider_domains(home: &Path) -> Vec<&'static str> {
+    if opencode_auth_json(home)
+        .is_some_and(|p| opencode_db_has_copilot(&p.with_file_name("opencode.db")))
+    {
+        COPILOT_INFRA_DOMAINS.to_vec()
+    } else {
+        Vec::new()
+    }
+}
+
 /// Does OpenCode v2's credential store hold a github.com Copilot login?
 ///
 /// Opened read-only by the system sqlite3, and only the integration id and
@@ -304,7 +317,7 @@ fn opencode_db_has_copilot(db: &Path) -> bool {
         .arg(db)
         .arg(
             "SELECT 1 FROM credential WHERE integration_id = 'github-copilot' \
-             AND json_extract(value, '$.enterpriseUrl') IS NULL LIMIT 1",
+             AND json_extract(value, '$.metadata.enterpriseUrl') IS NULL LIMIT 1",
         )
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -1692,12 +1705,6 @@ impl Agent {
             return Vec::new();
         };
         let stored = read_opencode_auth_json(&path);
-        // v2 keeps its logins in opencode.db, not auth.json (#710).
-        if matches!(stored, Ok(None))
-            && opencode_db_has_copilot(&path.with_file_name("opencode.db"))
-        {
-            return COPILOT_INFRA_DOMAINS.to_vec();
-        }
         let domains = stored
             .as_ref()
             .ok()
@@ -5240,7 +5247,7 @@ mod tests {
         sql(r#"INSERT INTO credential VALUES ('anthropic', '{"type":"key"}')"#);
         assert!(!opencode_db_has_copilot(&db));
         sql(
-            r#"INSERT INTO credential VALUES ('github-copilot', '{"type":"oauth","enterpriseUrl":"x"}')"#,
+            r#"INSERT INTO credential VALUES ('github-copilot', '{"type":"oauth","metadata":{"enterpriseUrl":"x"}}')"#,
         );
         assert!(!opencode_db_has_copilot(&db));
         sql(r#"INSERT INTO credential VALUES ('github-copilot', '{"type":"oauth"}')"#);

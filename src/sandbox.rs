@@ -358,7 +358,6 @@ impl PreparedSandbox {
 
     /// Add an OpenCode v2 session (#710): its rules go at the end of the
     /// profile, where they win, and its variables are set on the child last.
-    #[cfg(target_os = "macos")]
     pub fn add_opencode_v2(&mut self, session: crate::opencode_v2::Session) {
         self.profile_text.push_str(&session.sbpl);
         self.extra_env = session.env;
