@@ -1339,6 +1339,8 @@ fn install_signal_forwarding(child_pid: i32) {
     // process group, so forwarding would deliver them twice. Catch them with a
     // no-op rather than SIG_IGN (which the child would inherit), so cplt
     // outlives the child and its cleanup (scratch dir, service registrations) runs.
+    // SIGINT from outside the terminal is not forwarded; use SIGTERM to stop
+    // cplt from a script.
     extern "C" fn ignore_signal(_: i32) {}
 
     unsafe {
