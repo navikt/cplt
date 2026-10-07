@@ -2108,7 +2108,71 @@ fn inject_token_is_inert(gh_guard: &config::GhGuardPolicy) -> bool {
     gh_guard.inject_token && !gh_guard.enabled
 }
 
+/// One short launch line for a user who set the deprecated key (#695). Only
+/// an explicit `true` reaches here: the default is false and `.cplt.toml`
+/// cannot set it. Skipped when the inert warning above already fires, which
+/// tells them to remove the key anyway. macOS only: on Linux the Keychain
+/// substitute does nothing, and the key is still how Copilot gets a login
+/// past the masked Secret Service. Also skipped without an exec token
+/// (`gh_token`), since then nothing replaces the injected one.
+fn inject_token_deprecation_line(
+    gh_guard: &config::GhGuardPolicy,
+    macos: bool,
+    gh_token: bool,
+) -> Option<&'static str> {
+    (macos && gh_token && gh_guard.inject_token && gh_guard.enabled).then_some(
+        "gh_guard.inject_token is deprecated: gh gets its token without it. Remove the key.",
+    )
+}
+
+/// The sandbox gets an exec token for gh: gh is logged in on the host and
+/// `GH_TOKEN` is not denied. Without it, the deprecation notes would tell a
+/// user to drop the one token that works.
+fn gh_exec_token_available(deny_env: &[String]) -> bool {
+    !deny_env.iter().any(|v| v == "GH_TOKEN") && cplt::sandbox::gh_configured()
+}
+
+/// Notes `cplt check` prints for weaker auth paths that have a replacement (#695).
+fn auth_deprecation_notes(
+    gh_guard: &config::GhGuardPolicy,
+    pass_env: &[String],
+    agent: agent::Agent,
+    macos: bool,
+    gh_token: bool,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    if !gh_token {
+        return notes;
+    }
+    if macos && gh_guard.inject_token {
+        notes.push(
+            "gh_guard.inject_token is deprecated: gh gets its token from the gh guard, and \
+             Copilot can sign in with sandbox.keychain_substitute = true. Remove the key."
+                .to_string(),
+        );
+    }
+    if gh_guard.enabled && agent != agent::Agent::Copilot {
+        for var in ["GH_TOKEN", "GITHUB_TOKEN"] {
+            if pass_env.iter().any(|v| v == var) {
+                notes.push(format!(
+                    "{var} passed to {}: gh no longer needs it; drop it from pass_env \
+                     unless another tool uses it.",
+                    agent.display_name()
+                ));
+            }
+        }
+    }
+    notes
+}
+
 fn warn_inject_token_without_guard(resolved: &config::Resolved) {
+    if let Some(line) = inject_token_deprecation_line(
+        &resolved.gh_guard,
+        cfg!(target_os = "macos"),
+        gh_exec_token_available(&resolved.deny_env),
+    ) {
+        ui::warn(line);
+    }
     if inject_token_is_inert(&resolved.gh_guard) {
         ui::warn(
             "gh_guard.inject_token is set but gh_guard.enabled is false, so no token is \
@@ -6556,6 +6620,15 @@ fn run_check_command(
         println!("{}", report.to_json());
     } else {
         print!("{}", report.render());
+        for note in auth_deprecation_notes(
+            &resolved.gh_guard,
+            &resolved.pass_env,
+            active_agent,
+            cfg!(target_os = "macos"),
+            gh_exec_token_available(&resolved.deny_env),
+        ) {
+            println!("\nNote: {note}");
+        }
         // Claude only: for Copilot this would run `gh auth token`.
         let has_token = active_agent == agent::Agent::Claude
             && cplt::sandbox::keychain_substitute(
@@ -13525,6 +13598,59 @@ mod tests {
         assert!(!inject_token_is_inert(&policy(true, true)), "doing its job");
         assert!(!inject_token_is_inert(&policy(false, false)));
         assert!(!inject_token_is_inert(&policy(false, true)));
+    }
+
+    /// The launch line shows only for an explicit `true` with the guard on.
+    #[test]
+    fn inject_token_deprecation_line_only_when_set() {
+        let policy = |inject: bool, enabled: bool| config::GhGuardPolicy {
+            inject_token: inject,
+            enabled,
+            ..config::GhGuardPolicy::default()
+        };
+        assert!(
+            inject_token_deprecation_line(&config::GhGuardPolicy::default(), true, true).is_none()
+        );
+        assert!(inject_token_deprecation_line(&policy(false, true), true, true).is_none());
+        assert!(
+            inject_token_deprecation_line(&policy(true, false), true, true).is_none(),
+            "inert warning covers it"
+        );
+        assert!(inject_token_deprecation_line(&policy(true, true), true, true).is_some());
+        assert!(
+            inject_token_deprecation_line(&policy(true, true), true, false).is_none(),
+            "nothing replaces the injected token without an exec token"
+        );
+        assert!(
+            inject_token_deprecation_line(&policy(true, true), false, true).is_none(),
+            "Linux still needs it"
+        );
+    }
+
+    #[test]
+    fn check_notes_name_inject_token_and_gh_token_pass_env() {
+        let mut g = config::GhGuardPolicy::default();
+        assert!(auth_deprecation_notes(&g, &[], agent::Agent::Claude, true, true).is_empty());
+        g.inject_token = true;
+        g.enabled = true;
+        let env = vec!["GH_TOKEN".to_string()];
+        let claude = auth_deprecation_notes(&g, &env, agent::Agent::Claude, true, true);
+        assert_eq!(claude.len(), 2, "{claude:?}");
+        assert!(claude[0].contains("keychain_substitute"));
+        assert!(claude[1].starts_with("GH_TOKEN passed to"));
+        // Copilot's own login may use GH_TOKEN, so no pass_env note there.
+        assert_eq!(
+            auth_deprecation_notes(&g, &env, agent::Agent::Copilot, true, true).len(),
+            1
+        );
+        // Linux: no inject_token note, the pass_env note stays.
+        assert_eq!(
+            auth_deprecation_notes(&g, &env, agent::Agent::Claude, false, true).len(),
+            1
+        );
+        // No exec token (gh not logged in, or GH_TOKEN denied): GH_TOKEN in
+        // pass_env is the only token, so no note tells the user to drop it.
+        assert!(auth_deprecation_notes(&g, &env, agent::Agent::Claude, true, false).is_empty());
     }
 
     /// The shape a user hit: two repositories side by side under one
