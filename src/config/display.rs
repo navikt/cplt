@@ -573,9 +573,13 @@ pub fn display_config(loaded: Option<&LoadedConfig>, local: Option<&LoadedConfig
             c.sandbox.allow_browser.is_some()
         )
     );
-    let keychain_substitute = c.sandbox.keychain_substitute.unwrap_or(false);
+    let keychain_substitute = match c.sandbox.keychain_substitute {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "agent default (Copilot, Claude: on)",
+    };
     println!(
-        "{blue}[cplt]{nc}    keychain_substitute   = {}{} {dim}(experimental){nc}",
+        "{blue}[cplt]{nc}    keychain_substitute   = {}{}",
         keychain_substitute,
         src(
             "sandbox",

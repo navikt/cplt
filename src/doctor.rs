@@ -969,7 +969,8 @@ mod tests {
     #[test]
     fn shim_findings_use_the_launch_predicate() {
         // A real symlink whose target is outside every exec grant.
-        let tmp = std::env::temp_dir().join(format!("cplt-doctor-shim-{}", std::process::id()));
+        let tmp =
+            tempfile::env::temp_dir().join(format!("cplt-doctor-shim-{}", std::process::id()));
         let granted = tmp.join("granted");
         let outside = tmp.join("outside");
         std::fs::create_dir_all(&granted).unwrap();

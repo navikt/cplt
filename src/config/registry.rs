@@ -474,8 +474,8 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         key: "keychain_substitute",
         value_type: ConfigValueType::Bool,
         dangerous: false,
-        default_display: "false",
-        description: "EXPERIMENTAL: drop the macOS Keychain grant when the agent has a credential it can reach without it.",
+        default_display: "true for Copilot and Claude, false for other agents",
+        description: "Drop the macOS Keychain grant when the agent has a credential it can reach without it. Copilot uses `gh auth token`, Claude uses CLAUDE_CODE_OAUTH_TOKEN; both keep the grant without one.",
     },
     ConfigKeyInfo {
         section: "sandbox",
@@ -1142,7 +1142,7 @@ bool_keys! {
         cli = |_: &CliFlags| FeatureToggle::UseDefault,
         config = |c: &Config| c.sandbox.keychain_substitute,
         baseline = |_: PresetBaseline| false,
-        resolved = |r: &Resolved| r.keychain_substitute;
+        resolved = |r: &Resolved| r.keychain_substitute.unwrap_or(false);
 
     /// Config-only (#463): a credential grant belongs in reviewed config,
     /// not in a flag typed once.

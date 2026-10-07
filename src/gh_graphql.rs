@@ -954,9 +954,18 @@ fn repo_from_lookup(json: &str, kind: NodeKind) -> Option<String> {
 /// `GH_HOST`/`GH_REPO` exactly as the exec scrubs them, so both reach the same
 /// host.
 #[allow(clippy::disallowed_methods)] // real_gh is the resolved path baked into the wrapper; this runs inside the sandbox
-pub fn verify_targets(real_gh: &Path, targets: &[Target], scope: &[String]) -> Result<(), String> {
+pub fn verify_targets(
+    real_gh: &Path,
+    token: Option<&str>,
+    targets: &[Target],
+    scope: &[String],
+) -> Result<(), String> {
     for t in targets {
-        let out = std::process::Command::new(real_gh)
+        let mut cmd = std::process::Command::new(real_gh);
+        if let Some(token) = token {
+            cmd.env("GH_TOKEN", token);
+        }
+        let out = cmd
             .args(["api", "graphql", "-f"])
             .arg(format!("query={LOOKUP}"))
             .arg("-f")

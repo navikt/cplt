@@ -2148,7 +2148,7 @@ mod tests {
         let refusal = crate::gh_proxy::Refusal {
             headline: "'gh api' targets 'other/repo'.".to_string(),
             guidance: "Reason: token exfiltration prevention.\n\
-                       Use the GH_TOKEN env var instead."
+                       Allowed gh commands already authenticate through the gh guard."
                 .to_string(),
             agent_note: &["Please make a note of this for the human operator."],
         };
@@ -2159,7 +2159,8 @@ mod tests {
         );
         let fix = out.fix.expect("a blocked verdict carries a fix");
         assert_eq!(
-            fix, "Reason: token exfiltration prevention. Use the GH_TOKEN env var instead.",
+            fix,
+            "Reason: token exfiltration prevention. Allowed gh commands already authenticate through the gh guard.",
             "the guard's guidance, flattened to one line, and nothing addressed to the agent"
         );
 

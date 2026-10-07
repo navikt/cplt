@@ -515,9 +515,10 @@ impl Config {
 
         let allow_browser = bools.allow_browser;
 
-        // Experimental, config-only (#242). With it off the Keychain grant is
-        // exactly what `needs_keychain()` says.
-        let keychain_substitute = bools.keychain_substitute;
+        // Config-only (#242). Unset means the per-agent default (on for
+        // Copilot); `false` keeps the Keychain grant exactly as `needs_keychain()` says.
+        let _ = bools.keychain_substitute; // resolved per agent at launch
+        let keychain_substitute = self.sandbox.keychain_substitute;
         let allow_git_worktrees = bools.allow_git_worktrees;
         let worktree_walk_max_dirs = self
             .sandbox
@@ -1336,18 +1337,23 @@ impl Resolved {
             } else {
                 // Key on for Copilot and still granted: say why, or the
                 // user reads the key as broken (#277).
-                let why = if self.keychain_substitute && agent == crate::agent::Agent::Copilot {
-                    let all_denied = ["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"]
-                        .iter()
-                        .all(|v| self.deny_env.iter().any(|d| d == v));
-                    if all_denied {
-                        " (no token: deny.env strips every token variable)"
+                let why =
+                    if crate::sandbox::keychain_substitute_enabled(agent, self.keychain_substitute)
+                        && agent == crate::agent::Agent::Copilot
+                    {
+                        let all_denied = ["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"]
+                            .iter()
+                            .all(|v| self.deny_env.iter().any(|d| d == v));
+                        if let Some(why) = crate::sandbox::ACCOUNT_MISMATCH.get() {
+                            &format!(" ({why}: kept to avoid switching account)")
+                        } else if all_denied {
+                            " (no token: deny.env strips every token variable)"
+                        } else {
+                            " (no token: gh auth token failed, or gh is not in a trusted bin dir)"
+                        }
                     } else {
-                        " (no token: gh auth token failed)"
-                    }
-                } else {
-                    ""
-                };
+                        ""
+                    };
                 eprintln!(
                     "{blue}[cplt]{nc}    Keychain:      {yellow}allowed{nc}     {dim}~/Library/Keychains — every item {agent} can unlock{why}{nc}"
                 );
@@ -2654,7 +2660,7 @@ validate = false
     /// this machine has installed.
     #[test]
     fn write_grant_shadowing_an_exec_tool_dir_is_reported() {
-        let home = std::env::temp_dir().join(format!(
+        let home = tempfile::env::temp_dir().join(format!(
             "cplt-exec-warn-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -2716,7 +2722,7 @@ validate = false
     /// them; this is the test that says it was.
     #[test]
     fn write_grant_shadowing_an_agent_exec_dir_is_reported() {
-        let home = std::env::temp_dir().join(format!(
+        let home = tempfile::env::temp_dir().join(format!(
             "cplt-agent-exec-warn-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -2839,7 +2845,7 @@ validate = false
     /// created here: that absence is the whole test.
     #[test]
     fn an_agent_exec_dir_is_reported_before_cplt_creates_it() {
-        let home = std::env::temp_dir().join(format!(
+        let home = tempfile::env::temp_dir().join(format!(
             "cplt-agent-exec-absent-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -3207,7 +3213,7 @@ validate = false
         // containment rule and must keep working outside the repo.
         let tmp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
-        let outside = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let outside = std::fs::canonicalize(tempfile::env::temp_dir()).unwrap();
 
         let mut resolved = Config::default().merge(CliFlags::default()).unwrap();
         let repo_config = crate::repo_config::RepoConfig {
@@ -4230,7 +4236,7 @@ mod precedence {
                 key: "sandbox.keychain_substitute",
                 cli_on: None,
                 cli_off: None,
-                get: |r| r.keychain_substitute,
+                get: |r| r.keychain_substitute.unwrap_or(false),
                 default: false,
                 preset: None,
             },

@@ -225,6 +225,38 @@ pub fn grant_is_refused(home: &Path, path: &Path) -> bool {
         || cplt_state_dir_grant(home, path).is_some()
 }
 
+/// gh's config dir, located the way gh does: `GH_CONFIG_DIR`, then
+/// `$XDG_CONFIG_HOME/gh`, then `~/.config/gh`. `None` for a relative value,
+/// matching [`AppDirKind::resolve`]: it would resolve against the cwd.
+#[must_use]
+pub fn gh_config_dir(home: &Path) -> Option<PathBuf> {
+    let env = |k| std::env::var_os(k).filter(|v| !v.is_empty());
+    let dir = match (env("GH_CONFIG_DIR"), env("XDG_CONFIG_HOME")) {
+        (Some(d), _) => PathBuf::from(d),
+        (None, Some(x)) => PathBuf::from(x).join("gh"),
+        (None, None) => home.join(".config/gh"),
+    };
+    dir.is_absolute().then_some(dir)
+}
+
+/// gh's `hosts.yml` and `config.yml` when gh reads them from somewhere other
+/// than the `~/.config/gh` that [`HOME_CONFIG_FILES`] already grants.
+#[must_use]
+///
+/// On macOS a path SBPL cannot name is left out rather than refusing the
+/// launch: gh then runs without its config, as it did before the grant.
+pub fn gh_config_files_elsewhere(home: &Path) -> Vec<PathBuf> {
+    let Some(dir) = gh_config_dir(home) else {
+        return Vec::new();
+    };
+    if dir == home.join(".config/gh")
+        || (cfg!(target_os = "macos") && validate_sbpl_path(&dir).is_err())
+    {
+        return Vec::new();
+    }
+    vec![dir.join("hosts.yml"), dir.join("config.yml")]
+}
+
 /// Where a first-party read grant on the file `path` really lands, or `None`
 /// when it must not be emitted.
 ///
@@ -1264,6 +1296,9 @@ pub const ENV_ALLOWLIST: &[&str] = &[
     "XDG_STATE_HOME",
     "XDG_CACHE_HOME",
     "XDG_RUNTIME_DIR",
+    // gh's config location (a path, not a secret): the profile grants
+    // hosts.yml/config.yml there, so gh inside must look there too.
+    "GH_CONFIG_DIR",
     // Node.js
     "NODE_OPTIONS",
     "NODE_PATH",
@@ -4257,6 +4292,25 @@ mod tests {
     }
 
     use super::*;
+
+    /// The read grant follows gh's own lookup order, not a fixed ~/.config/gh.
+    #[test]
+    fn gh_config_files_follow_gh_lookup() {
+        let home = Path::new("/fake/home");
+        let files = |gh: Option<&str>, xdg: Option<&str>| {
+            temp_env::with_vars([("GH_CONFIG_DIR", gh), ("XDG_CONFIG_HOME", xdg)], || {
+                gh_config_files_elsewhere(home)
+            })
+        };
+        assert!(files(None, None).is_empty());
+        assert!(files(None, Some("/fake/home/.config")).is_empty());
+        assert_eq!(files(None, Some("/x"))[0], Path::new("/x/gh/hosts.yml"));
+        assert_eq!(files(Some("/g"), Some("/x"))[1], Path::new("/g/config.yml"));
+        assert!(
+            files(Some("rel/gh"), None).is_empty(),
+            "relative is ignored"
+        );
+    }
 
     /// #551 review: an allow path that reaches a credential through a link of
     /// its own (`docs/hosts -> ../ssh/id_ed25519` in the repo holding the

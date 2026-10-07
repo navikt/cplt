@@ -2025,7 +2025,7 @@ fn gate_with_scope_resolver(
     {
         return Err(Refusal {
             headline: "revealing the GitHub token is not allowed in this environment.".to_string(),
-            guidance: "Reason: token exfiltration prevention. Use the GH_TOKEN env var instead."
+            guidance: "Reason: token exfiltration prevention. Allowed gh commands already authenticate through the gh guard."
                 .to_string(),
             agent_note: &[
                 "This operation is restricted by the cplt sandbox to prevent credential leaks.",

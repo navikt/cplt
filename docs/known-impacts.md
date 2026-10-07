@@ -716,22 +716,25 @@ Git commit works for every agent. Whether `git push` works over HTTPS depends on
    ```bash
    gh auth login   # one-time setup
    ```
-3. **Configure the git credential helper** (if not already set by `gh auth setup-git`):
+3. **Configure the git credential helper** (not needed for `github.com` with the gh guard on):
    ```bash
-   gh auth setup-git   # sets credential.helper to `!gh auth git-credential`
+   gh auth setup-git
    ```
-   Every HTTPS `git push` then runs `gh auth git-credential`, which the gh guard allows.
+   `gh auth setup-git` writes the helper with an absolute path (for example `!/opt/homebrew/bin/gh auth git-credential`). With the gh guard on, cplt adds `!gh auth git-credential` as a last helper for `https://github.com` inside the sandbox, so git goes through the gh guard and gets the exec token ([how](gh-guard.md#how-gh-itself-authenticates)). Your own `github.com` helpers run first and win when they return a credential. Your git config is not changed.
 
 **Credentials per agent (macOS).** The helper only produces a token if `gh` can reach one from inside the sandbox:
 
 | Agent                                       | HTTPS push  | Credential source                                                          |
 | ------------------------------------------- | ----------- | -------------------------------------------------------------------------- |
-| `copilot`, `antigravity`, `claude`, `goose` | ✅ Works     | Login Keychain is readable, which is where `gh auth login` stores the token |
-| `opencode`, `pi`, `dsh`, `cplt exec`        | ⚠️ Only via `hosts.yml` or `--pass-env` | Keychain is denied. With the token in the Keychain only, `gh api user` reports "Requires authentication" |
+| `copilot`                                   | ✅ Works     | Keychain is denied by default; `gh` uses the `GH_TOKEN` cplt hands Copilot (from `gh auth token`). Where the grant stays (no token, or an account mismatch), the Keychain is readable, as in the next row |
+| `antigravity`, `claude`, `goose`            | ✅ Works     | Login Keychain is readable, which is where `gh auth login` stores the token |
+| `opencode`, `pi`, `dsh`, `cplt exec`        | ✅ Works     | Keychain is denied. The gh guard reads the token at launch and hands it to `gh` as the exec token when git asks for credentials ([how](gh-guard.md#how-gh-itself-authenticates)). With `gh_guard.enabled = false` these agents need a token in `hosts.yml` or `--pass-env GH_TOKEN` |
 
 Both rows depend on where `gh` keeps the token. An installation that stores it in `~/.config/gh/hosts.yml` rather than the Keychain works for every agent, since that file is readable in every profile, and `--pass-env GH_TOKEN` supplies one regardless of agent.
 
-The Keychain row has one caveat. With `sandbox.keychain_substitute = true` (off by default) the Keychain grant is dropped for an agent whose own credential already reaches it another way — `claude` with `CLAUDE_CODE_OAUTH_TOKEN` exported, `antigravity` with its `~/.gemini/antigravity-cli/antigravity-oauth-token` fallback file present. The drop takes `gh`'s token with it, so HTTPS push fails for exactly those two agents in that configuration. Copilot keeps a token `gh` can use when the one it was handed is `GH_TOKEN` or `GITHUB_TOKEN`, which covers the `gh auth token` handover; a token exported only as `COPILOT_GITHUB_TOKEN` is one `gh` does not read. Push under a dropped grant was not tested.
+The Keychain row has one caveat. When the Keychain substitute applies (`sandbox.keychain_substitute`: by default for Copilot and Claude Code, `true` for the others) the Keychain grant is dropped for an agent whose own credential already reaches it another way: `claude` with `CLAUDE_CODE_OAUTH_TOKEN` exported, `antigravity` with its `~/.gemini/antigravity-cli/antigravity-oauth-token` fallback file present. The drop takes `gh`'s Keychain token with it. With the gh guard on, the exec token covers push for those two agents as in the row below; with it off, push fails for them in that configuration. Copilot keeps a token `gh` can use when the one it was handed is `GH_TOKEN` or `GITHUB_TOKEN`, which covers the `gh auth token` handover. A token exported only as `COPILOT_GITHUB_TOKEN` is one `gh` does not read, so there the exec token is written and the gh guard covers push. Push under a dropped grant was not tested. goose, and Antigravity without its fallback file, have no substitute and keep the whole-Keychain grant; that gap is known.
+
+For Claude Code the drop also takes its MCP OAuth tokens, which it keeps in the Keychain on macOS. Each MCP server that uses OAuth asks for one fresh sign-in, and Claude Code then stores the token in plaintext in `~/.claude/.credentials.json`, which the agent can read and write ([credential management](https://code.claude.com/docs/en/authentication.md#credential-management)). Those MCP tokens are exposed instead of the Keychain items the grant reached.
 
 **On Linux the table does not apply.** There is no Keychain grant to drop in the first place; `gh` reads its token from the Secret Service or from `hosts.yml`, and push works wherever that lookup succeeds.
 
@@ -1338,6 +1341,10 @@ Each agent's global config dir is mounted read/write, but the files in it that *
 **Linux is weaker than macOS here.** Landlock cannot deny a subpath inside an allowed directory, so the denies are carried by the bubblewrap read-only overlay. They hold only when `bwrap` is installed, and only for paths that **already exist** — bubblewrap cannot bind a missing source, so a `extensions/` directory that does not exist yet is unprotected until something creates it. Without bubblewrap the guard does not apply on Linux at all.
 
 goose is the exception to the table's opening sentence: its config dir is granted read-only outright rather than read/write with named denies. A `write_files` carve-out would not work — goose rewrites `config.yaml`, `permission.yaml` and `permissions/tool_permissions.json` by creating a temp file in the directory and renaming over the target, which needs directory write and would hand back the very vector the deny exists to close.
+
+## OpenCode: GitHub Copilot login from the host
+
+When `gh` is logged in on the host and OpenCode's `auth.json` has no `github-copilot` entry, cplt logs OpenCode in to GitHub Copilot with the host's gh token, so `opencode run -m github-copilot/...` works without `/connect`. It does this through `OPENCODE_AUTH_CONTENT`, which OpenCode reads instead of `auth.json`; your other providers are copied in. An existing `github-copilot` login is left alone. Running `/connect` inside the sandbox writes the gh token into `auth.json` as the `github-copilot` entry. This needs OpenCode 1.4.7 or newer; older versions ignore `OPENCODE_AUTH_CONTENT` and behave as before. To turn it off, add `OPENCODE_AUTH_CONTENT` (or `GH_TOKEN`) to `deny.env`. Details in [SECURITY.md](../SECURITY.md#github-token-handling-per-agent).
 
 ## AI agent telemetry
 

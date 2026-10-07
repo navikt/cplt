@@ -969,7 +969,7 @@ mod tests {
 
     #[test]
     fn scratch_dir_creates_and_cleans_up() {
-        let tmp = std::env::temp_dir().join("cplt-test-scratch");
+        let tmp = tempfile::env::temp_dir().join("cplt-test-scratch");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
 
@@ -997,7 +997,7 @@ mod tests {
 
     #[test]
     fn scratch_dir_rejects_symlink_base() {
-        let tmp = std::env::temp_dir().join("cplt-test-symlink");
+        let tmp = tempfile::env::temp_dir().join("cplt-test-symlink");
         let _ = std::fs::remove_dir_all(&tmp);
         let real_dir = tmp.join("real");
         std::fs::create_dir_all(&real_dir).unwrap();
@@ -1017,7 +1017,7 @@ mod tests {
     fn scratch_dir_rejects_ancestor_symlink() {
         // If the scratch base ancestor is a symlink, the scratch dir
         // would escape. The canonicalize + prefix check must catch this.
-        let tmp = std::env::temp_dir().join("cplt-test-ancestor-symlink");
+        let tmp = tempfile::env::temp_dir().join("cplt-test-ancestor-symlink");
         let _ = std::fs::remove_dir_all(&tmp);
         let evil_target = tmp.join("evil-target");
         std::fs::create_dir_all(&evil_target).unwrap();
@@ -1293,7 +1293,7 @@ mod tests {
 
     #[test]
     fn gc_removes_stale_dirs() {
-        let tmp = std::env::temp_dir().join("cplt-test-gc");
+        let tmp = tempfile::env::temp_dir().join("cplt-test-gc");
         let _ = std::fs::remove_dir_all(&tmp);
         let base = tmp.join(SCRATCH_BASE);
         std::fs::create_dir_all(&base).unwrap();
@@ -1339,7 +1339,7 @@ mod tests {
 
     #[test]
     fn gc_ignores_non_session_entries() {
-        let tmp = std::env::temp_dir().join("cplt-test-gc-safe");
+        let tmp = tempfile::env::temp_dir().join("cplt-test-gc-safe");
         let _ = std::fs::remove_dir_all(&tmp);
         let base = tmp.join(SCRATCH_BASE);
         std::fs::create_dir_all(&base).unwrap();

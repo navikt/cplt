@@ -318,9 +318,14 @@ fn configure_command(
             // the first read (see `serve_cached_gh_token`), which narrows — but
             // does not close — the window. A determined agent that reads
             // `$TMPDIR/.gh-token` before the legitimate consumer still wins.
-            if gh_guard.block_auth_token {
-                cache_gh_token_to_file(scratch, agent, deny_env, keychain_substitute);
-            }
+            cache_gh_token_to_file(
+                cmd,
+                scratch,
+                agent,
+                deny_env,
+                keychain_substitute,
+                gh_guard.block_auth_token,
+            );
         }
         install_command_wrappers(
             cmd,
@@ -332,6 +337,9 @@ fn configure_command(
             quiet,
             pnpm_shadow_dir,
         );
+        if gh_guard.enabled && scratch.join("bin").join("gh").is_file() {
+            route_github_credentials_through_gh_guard(cmd, inherit_env);
+        }
     } else if let Some(shadow) = pnpm_shadow_dir {
         prepend_path(cmd, &[shadow]);
     }
@@ -344,40 +352,27 @@ fn configure_command(
 /// the gh proxy to safely block `gh auth token` inside the sandbox
 /// while still giving the agent API access.
 ///
-/// `gh`, resolved from [`crate::git::TRUSTED_BIN_DIRS`], warning once when the
-/// only `gh` on this machine is somewhere else.
+/// `gh`, resolved from [`crate::git::TRUSTED_BIN_DIRS`].
 ///
-/// Before the trusted-lookup change, `gh` came off `PATH`, so an installation in
-/// `~/.local/bin` or a mise shim worked. It no longer does — correctly, since a
-/// planted `gh` hands the agent both unsandboxed execution and a channel into
-/// the next agent's environment. But the failure is invisible: no token is
-/// injected, and the user sees Copilot's GitHub API calls fail with nothing
-/// pointing at cplt. A `gh` that exists on `PATH` and is not trusted is the one
-/// case worth a line on stderr.
-///
-/// Warned once per process: both token paths call this, and two identical
-/// warnings at launch read like two different problems.
+/// Trusted path, not PATH: a planted `gh` would hand the agent both
+/// unsandboxed execution and a channel into the next agent's environment.
 fn trusted_gh() -> Option<PathBuf> {
-    if let Some(gh) = crate::git::trusted_binary("gh") {
-        return Some(gh);
-    }
-    static WARNED: std::sync::Once = std::sync::Once::new();
+    crate::git::trusted_binary("gh")
+}
+
+/// Warn when the gh guard wanted a token for the sandboxed `gh` but the only
+/// `gh` here is outside the trusted dirs. Scoped to that path so a mise/asdf
+/// `gh` does not add launch noise where nothing would have been written.
+fn warn_untrusted_gh() {
     if let Some(untrusted) = which_binary("gh") {
-        WARNED.call_once(|| {
-            ui::warn(&format!(
-                "gh is installed at {} — outside the directories cplt trusts for \
-                 unsandboxed helpers ({}).\n  \
-                 The GitHub token is NOT injected, so the agent's GitHub API calls \
-                 will fail. cplt runs `gh auth token` as you, outside the sandbox, \
-                 so it will not run a `gh` a previous session could have replaced.\n  \
-                 Install gh into one of those directories (`brew install gh`, or your \
-                 distro's package), or export GH_TOKEN yourself before launching.",
-                untrusted.display(),
-                crate::git::TRUSTED_BIN_DIRS.join(", ")
-            ));
-        });
+        ui::warn(&format!(
+            "gh is installed at {}, outside the directories cplt trusts ({}).\n  \
+             gh inside the sandbox runs without a GitHub token. Install gh into one \
+             of those directories, or export GH_TOKEN before launching.",
+            untrusted.display(),
+            crate::git::TRUSTED_BIN_DIRS.join(", ")
+        ));
     }
-    None
 }
 
 /// Only injects for agents that need GitHub access (Copilot).
@@ -408,8 +403,9 @@ pub(super) fn extract_gh_token() -> Option<String> {
 /// milliseconds; this only bounds a `gh` that never answers at all.
 ///
 /// Unbounded, this was the single blocking wait between the startup banner and
-/// exec: `configure_command` reaches it on every Copilot launch (the gh guard's
-/// `block_auth_token` defaults on), so a wedged `gh` hung cplt itself with the
+/// exec: `configure_command` reaches it on every launch that caches a token
+/// (Copilot's serve-once cache, `block_auth_token` on by default, or the gh
+/// guard's exec cache), so a wedged `gh` hung cplt itself with the
 /// banner as the last thing on screen and nothing pointing at the cause.
 const GH_AUTH_TOKEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -441,13 +437,24 @@ const GH_AUTH_TOKEN_EOF_GRACE: std::time::Duration = std::time::Duration::from_m
 /// decides to prompt would then block on a read nobody answers.
 #[allow(clippy::disallowed_methods)] // gh resolved by trusted_gh() at the call site
 fn gh_auth_token(gh: &Path, timeout: std::time::Duration) -> Option<String> {
-    use std::io::Read as _;
-
     let mut cmd = std::process::Command::new(gh);
     cmd.args(["auth", "token", "--hostname", "github.com"]);
     for var in GH_TOKEN_VARS {
         cmd.env_remove(var);
     }
+    let buf = bounded_stdout(cmd, timeout)?;
+    let token = String::from_utf8_lossy(&buf).trim().to_string();
+    (!token.is_empty()).then_some(token)
+}
+
+/// Run `cmd` with null stdin and stderr and return its stdout, or `None` on
+/// spawn failure, non-zero exit, or a child outliving `timeout` (killed and
+/// reaped). See [`gh_auth_token`] for why the reader is never joined.
+pub(crate) fn bounded_stdout(
+    mut cmd: std::process::Command,
+    timeout: std::time::Duration,
+) -> Option<Vec<u8>> {
+    use std::io::Read as _;
     let mut child = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -469,11 +476,7 @@ fn gh_auth_token(gh: &Path, timeout: std::time::Duration) -> Option<String> {
     // behind may still hold the other one, which is why this wait is bounded
     // too: an unbounded one here is the same hang in a different place.
     let buf = rx.recv_timeout(GH_AUTH_TOKEN_EOF_GRACE).ok()?;
-    if !status.success() {
-        return None;
-    }
-    let token = String::from_utf8_lossy(&buf).trim().to_string();
-    (!token.is_empty()).then_some(token)
+    status.success().then_some(buf)
 }
 
 /// Whether the child will already have a usable GitHub token in its own
@@ -528,6 +531,13 @@ fn inject_gh_token_if_needed(
     }
 }
 
+/// gh's `hosts.yml`, located the way gh does: `GH_CONFIG_DIR`, then
+/// `$XDG_CONFIG_HOME/gh`, then `~/.config/gh`.
+pub(super) fn gh_hosts_yml() -> Option<PathBuf> {
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    super::policy::gh_config_dir(&home).map(|d| d.join("hosts.yml"))
+}
+
 /// Cache the GitHub token to a file in the scratch dir.
 ///
 /// The gh wrapper script reads this file to serve `gh auth token` requests
@@ -575,29 +585,104 @@ fn should_cache_token(
     !target_denied && !child_keeps_a_github_token(deny_env)
 }
 
+/// Whether to write `.gh-exec-token`, the file `cplt gh-gate` reads to set
+/// `GH_TOKEN` on the real `gh` it execs (never on the agent's env). Without it
+/// `gh` inside the sandbox is anonymous: its token sits in the Keychain, which
+/// the sandbox does not grant.
+///
+/// Every agent except Copilot on macOS (it has the Keychain or the substitute's
+/// token), when gh is configured on the host (`hosts_yml_exists`, so a
+/// host without gh spawns no subprocess). Same deny rule as the serve cache: a
+/// denied `GH_TOKEN` means no credential. Skipped when the agent env already
+/// carries a token `gh` will use; only Copilot keeps the parent's token vars.
+fn should_cache_exec_token(
+    agent: Agent,
+    deny_env: &[String],
+    substitute: Option<&crate::agent::KeychainSubstitute>,
+    hosts_yml_exists: bool,
+) -> bool {
+    hosts_yml_exists
+        && !substitute_carries_gh_token(substitute)
+        && !deny_env.iter().any(|d| d == "GH_TOKEN")
+        && (agent != Agent::Copilot
+            // gh reads only GH_TOKEN/GITHUB_TOKEN, not COPILOT_GITHUB_TOKEN.
+            // On macOS gh has the Keychain unless a substitute dropped it.
+            || ((cfg!(target_os = "linux") || substitute.is_some())
+                && !GH_TOKEN_VARS[..2].iter().any(|var| {
+                    !deny_env.iter().any(|d| d == var)
+                        && std::env::var(var).is_ok_and(|v| !v.trim().is_empty())
+                })))
+}
+
+/// The scratch dir holding `.gh-exec-token`, for `cplt gh-gate`.
+pub const GH_TOKEN_DIR_ENV: &str = "__CPLT_GH_TOKEN_DIR";
+
+/// The effective child env, `--pass-env` included: a token gh will use there
+/// makes the host credential in `.gh-exec-token` pointless. Blank counts as
+/// unset, as in `cplt gh-gate`.
+fn child_env_has_gh_token(cmd: &Command) -> bool {
+    cmd.get_envs().any(|(k, v)| {
+        (k == "GH_TOKEN" || k == "GITHUB_TOKEN")
+            && v.is_some_and(|v| !v.to_string_lossy().trim().is_empty())
+    })
+}
+
 fn cache_gh_token_to_file(
+    cmd: &mut Command,
     scratch_dir: &Path,
     agent: Agent,
     deny_env: &[String],
     substitute: Option<&crate::agent::KeychainSubstitute>,
+    block_auth_token: bool,
 ) {
-    if !should_cache_token(agent, deny_env, substitute) {
+    let serve = block_auth_token && should_cache_token(agent, deny_env, substitute);
+    let exec = !child_env_has_gh_token(cmd)
+        && should_cache_exec_token(
+            agent,
+            deny_env,
+            substitute,
+            gh_hosts_yml().is_some_and(|p| p.exists()),
+        );
+    if !serve && !exec {
         return;
     }
     let Some(token) = extract_gh_token() else {
+        if exec && trusted_gh().is_none() {
+            warn_untrusted_gh();
+        }
         return;
     };
+    if serve {
+        write_token_file(&scratch_dir.join(".gh-token"), &token);
+    }
+    if exec {
+        write_token_file(&scratch_dir.join(".gh-exec-token"), &token);
+        // `--pass-env TMPDIR` points the child's TMPDIR elsewhere; tell the
+        // gate where the cache really is.
+        cmd.env(GH_TOKEN_DIR_ENV, scratch_dir);
+        // OpenCode: the same token as its GitHub Copilot login, when the user
+        // has none of their own (#695). OpenCode reads OPENCODE_AUTH_CONTENT
+        // instead of auth.json, so the real file is never read or rewritten
+        // for this; the value carries the user's other providers too.
+        if agent == Agent::OpenCode
+            && let Some(home) = std::env::var_os("HOME")
+            && let Some(auth) = crate::agent::opencode_host_login(Path::new(&home), &token)
+        {
+            cmd.env("OPENCODE_AUTH_CONTENT", auth);
+        }
+    }
+}
 
+fn write_token_file(token_path: &Path, token: &str) {
     // Write token to file, creating it with 0600 from the start to avoid a
     // permissions window where the file is world-readable.
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    let token_path = scratch_dir.join(".gh-token");
     let Ok(mut file) = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(&token_path)
+        .open(token_path)
     else {
         return;
     };
@@ -912,6 +997,57 @@ fn install_command_wrappers(
     if !prefixes.is_empty() {
         prepend_path(cmd, &prefixes);
     }
+}
+
+/// Point git's credential helper for `https://github.com` at the `gh` on PATH,
+/// which inside the sandbox is the gh guard wrapper (#695).
+///
+/// `gh auth setup-git` writes the helper as `!/abs/path/to/gh auth
+/// git-credential`, so git runs the real `gh` directly: it skips the wrapper,
+/// never gets the `.gh-exec-token` the wrapper hands to the real `gh`, and an
+/// HTTPS push fails wherever the Keychain is not granted. Overriding the helper
+/// via `GIT_CONFIG_*` env reaches every git in the sandbox without touching any
+/// file. The entry is appended, not a reset: git tries helpers in order, so the
+/// user's own helpers (osxkeychain, GCM, store) still run first, and where the
+/// absolute-path gh helper fails for lack of Keychain, git falls through to the
+/// wrapper. Clearing the list would break users whose push works today through
+/// another helper. Helpers for other hosts are untouched.
+///
+/// Appends after any `GIT_CONFIG_COUNT` entries already set (the signing
+/// overrides, or a user's own via `--pass-env`) instead of replacing them.
+fn route_github_credentials_through_gh_guard(cmd: &mut Command, inherit_env: bool) {
+    let set = cmd
+        .get_envs()
+        .find(|(k, _)| *k == "GIT_CONFIG_COUNT")
+        .map(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()));
+    let current = match set {
+        Some(v) => v,
+        // Not touched on `cmd`: the child inherits the parent's value, if any,
+        // only when the env is not cleared.
+        None if inherit_env => std::env::var("GIT_CONFIG_COUNT").ok(),
+        None => None,
+    };
+    for (k, v) in github_credential_helper_config(current.as_deref()) {
+        cmd.env(k, v);
+    }
+}
+
+/// The env vars that append the `credential.https://github.com.helper`
+/// entry after `existing_count` config overrides. An unparsable count is
+/// left alone (git would reject it anyway) and nothing is added.
+fn github_credential_helper_config(existing_count: Option<&str>) -> Vec<(String, String)> {
+    const KEY: &str = "credential.https://github.com.helper";
+    let Ok(n) = existing_count.map_or(Ok(0), |c| c.trim().parse::<usize>()) else {
+        return Vec::new();
+    };
+    vec![
+        (format!("GIT_CONFIG_KEY_{n}"), KEY.to_string()),
+        (
+            format!("GIT_CONFIG_VALUE_{n}"),
+            "!gh auth git-credential".to_string(),
+        ),
+        ("GIT_CONFIG_COUNT".to_string(), (n + 1).to_string()),
+    ]
 }
 
 fn prepend_path(cmd: &mut Command, prefixes: &[&Path]) {
@@ -2031,6 +2167,142 @@ mod gh_token_extraction_tests {
             ]),
             None,
             "all three denied leaves no channel to inject into"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::disallowed_methods)] // never spawned; only the env is read
+    fn child_env_gh_token_skips_exec_cache() {
+        let has = |vars: &[(&str, &str)]| {
+            let mut cmd = Command::new("true");
+            for (k, v) in vars {
+                cmd.env(k, v);
+            }
+            child_env_has_gh_token(&cmd)
+        };
+        assert!(!has(&[]));
+        assert!(has(&[("GH_TOKEN", "ghp_x")]));
+        assert!(has(&[("GITHUB_TOKEN", "ghp_x")]));
+        assert!(!has(&[("GH_TOKEN", "  ")]), "blank is unset");
+        assert!(!has(&[("COPILOT_GITHUB_TOKEN", "ghp_x")]), "gh ignores it");
+        let mut cmd = Command::new("true");
+        cmd.env("GH_TOKEN", "ghp_x").env_remove("GH_TOKEN");
+        assert!(!child_env_has_gh_token(&cmd), "removed is unset");
+    }
+
+    /// The exec cache is written for every agent once gh is configured, and
+    /// follows the same GH_TOKEN deny and env-token rules as the serve cache.
+    #[test]
+    fn github_credential_helper_appends_after_existing_overrides() {
+        let env = github_credential_helper_config(Some("2"));
+        let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("GIT_CONFIG_COUNT"), Some("3"));
+        assert_eq!(
+            get("GIT_CONFIG_KEY_2"),
+            Some("credential.https://github.com.helper")
+        );
+        assert_eq!(
+            get("GIT_CONFIG_VALUE_2"),
+            Some("!gh auth git-credential"),
+            "appended, no reset: user helpers keep precedence"
+        );
+        assert!(get("GIT_CONFIG_KEY_3").is_none());
+        assert!(
+            get("GIT_CONFIG_KEY_0").is_none(),
+            "existing entries untouched"
+        );
+
+        let fresh = github_credential_helper_config(None);
+        assert!(fresh.contains(&("GIT_CONFIG_COUNT".into(), "1".into())));
+        assert!(fresh.contains(&(
+            "GIT_CONFIG_KEY_0".into(),
+            "credential.https://github.com.helper".into()
+        )));
+        assert!(github_credential_helper_config(Some("x")).is_empty());
+    }
+
+    #[test]
+    fn exec_token_cache_gating() {
+        let deny = vec!["GH_TOKEN".to_string()];
+        temp_env::with_vars(
+            [
+                ("GH_TOKEN", Some("ghp_parent")),
+                ("GITHUB_TOKEN", None::<&str>),
+                ("COPILOT_GITHUB_TOKEN", None),
+            ],
+            || {
+                for agent in Agent::ALL {
+                    assert!(
+                        !should_cache_exec_token(*agent, &[], None, false),
+                        "{agent:?}: no gh"
+                    );
+                    assert!(
+                        !should_cache_exec_token(*agent, &deny, None, true),
+                        "{agent:?}: denied"
+                    );
+                }
+                // Parent GH_TOKEN reaches Copilot directly on every platform.
+                assert!(
+                    !should_cache_exec_token(Agent::Copilot, &[], None, true),
+                    "Copilot keeps the parent token"
+                );
+                let sub = crate::agent::KeychainSubstitute::GhToken {
+                    var: "GH_TOKEN",
+                    token: crate::agent::SecretToken::new("t".into()),
+                };
+                assert!(
+                    !should_cache_exec_token(Agent::OpenCode, &[], Some(&sub), true),
+                    "substitute already carries the token"
+                );
+                assert!(
+                    should_cache_exec_token(Agent::OpenCode, &[], None, true),
+                    "OpenCode's env is stripped, so gh needs the cache"
+                );
+                assert!(should_cache_exec_token(Agent::Shell, &[], None, true));
+            },
+        );
+        temp_env::with_vars(
+            [
+                ("GH_TOKEN", None::<&str>),
+                ("GITHUB_TOKEN", None),
+                ("COPILOT_GITHUB_TOKEN", None),
+            ],
+            || {
+                assert_eq!(
+                    should_cache_exec_token(Agent::Copilot, &[], None, true),
+                    cfg!(target_os = "linux"),
+                    "macOS Copilot has the Keychain; Linux Copilot needs the cache"
+                );
+            },
+        );
+        // COPILOT_GITHUB_TOKEN alone does not authenticate gh (#696 review).
+        temp_env::with_vars(
+            [
+                ("GH_TOKEN", None::<&str>),
+                ("GITHUB_TOKEN", None),
+                ("COPILOT_GITHUB_TOKEN", Some("t")),
+            ],
+            || {
+                let sub = crate::agent::KeychainSubstitute::EnvVar("COPILOT_GITHUB_TOKEN");
+                assert!(should_cache_exec_token(
+                    Agent::Copilot,
+                    &[],
+                    Some(&sub),
+                    true
+                ));
+                assert_eq!(
+                    should_cache_exec_token(Agent::Copilot, &[], None, true),
+                    cfg!(target_os = "linux")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn gh_hosts_yml_honours_gh_config_dir() {
+        temp_env::with_vars(
+            [("GH_CONFIG_DIR", Some("/x/gh")), ("XDG_CONFIG_HOME", None)],
+            || assert_eq!(gh_hosts_yml(), Some(PathBuf::from("/x/gh/hosts.yml"))),
         );
     }
 

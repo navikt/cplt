@@ -216,6 +216,64 @@ fn opencode_provider_domains(auth_json: &str) -> Vec<&'static str> {
     }
 }
 
+/// OpenCode's credential store, `$XDG_DATA_HOME/opencode/auth.json`
+/// (default `~/.local/share`). A relative or empty XDG_DATA_HOME would resolve
+/// against the project dir and let a repo supply the file; the spec says to
+/// ignore it. The same goes for an unset or empty HOME.
+fn opencode_auth_json(home: &Path) -> Option<PathBuf> {
+    let data_base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| home.is_absolute().then(|| home.join(".local/share")))?;
+    Some(data_base.join("opencode/auth.json"))
+}
+
+/// `Ok(None)` when the file does not exist, `Ok(Some(body))` when it was
+/// read, `Err` when it exists but was refused (FIFO, oversize, unreadable).
+fn read_opencode_auth_json(path: &Path) -> Result<Option<String>, ()> {
+    match path.symlink_metadata() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(()),
+        Ok(_) => {}
+    }
+    read_small_regular_file(path).map(Some).ok_or(())
+}
+
+/// The `OPENCODE_AUTH_CONTENT` value that logs OpenCode in to GitHub Copilot
+/// with the host's gh token (#695). OpenCode reads this variable *instead of*
+/// `auth.json`, so the user's other providers are copied in unchanged.
+///
+/// `None` (leave OpenCode alone) when the store already has a
+/// `github-copilot` entry (a `/connect` login, or Enterprise in its
+/// `enterpriseUrl` form), or is not a JSON object. A store holding only a
+/// `github-copilot-enterprise` key is not matched and does get the github.com
+/// login added beside it; OpenCode then has both providers. Bailing out
+/// otherwise: replacing what the user set up, or hiding a store cplt cannot
+/// parse, would break a working setup.
+fn opencode_auth_overlay(auth_json: Option<&str>, token: &str) -> Option<String> {
+    let mut map = match auth_json {
+        None => serde_json::Map::new(),
+        Some(s) => match serde_json::from_str(s).ok()? {
+            serde_json::Value::Object(m) => m,
+            _ => return None,
+        },
+    };
+    if map.contains_key("github-copilot") {
+        return None;
+    }
+    map.insert(
+        "github-copilot".into(),
+        serde_json::json!({"type": "oauth", "access": token, "refresh": token, "expires": 0}),
+    );
+    Some(serde_json::Value::Object(map).to_string())
+}
+
+/// [`opencode_auth_overlay`] for the store in `home`.
+pub(crate) fn opencode_host_login(home: &Path, token: &str) -> Option<String> {
+    let stored = read_opencode_auth_json(&opencode_auth_json(home)?).ok()?;
+    opencode_auth_overlay(stored.as_deref(), token)
+}
+
 /// Upper bound for [`read_small_regular_file`]; OpenCode's `auth.json` is a
 /// few hundred bytes.
 const SMALL_FILE_LIMIT: u64 = 64 * 1024;
@@ -225,7 +283,7 @@ const SMALL_FILE_LIMIT: u64 = 64 * 1024;
 /// only a regular file of at most [`SMALL_FILE_LIMIT`] bytes is read (a
 /// symlink to `/dev/zero` is a character device and is refused). `None` for
 /// anything else.
-fn read_small_regular_file(path: &Path) -> Option<String> {
+pub(crate) fn read_small_regular_file(path: &Path) -> Option<String> {
     use std::io::Read as _;
     use std::os::unix::fs::OpenOptionsExt as _;
     let file = std::fs::OpenOptions::new()
@@ -554,6 +612,7 @@ impl Agent {
     /// `gemini`/`antigravity` and refreshes it there.
     /// Claude Code stores its OAuth token in the login Keychain on macOS
     /// ("Claude Code-credentials"); on Linux it uses ~/.claude/.credentials.json.
+    /// With CLAUDE_CODE_OAUTH_TOKEN exported, cplt drops the Keychain grant.
     /// OpenCode authenticates via the `/connect` device flow by default;
     /// third-party providers use API keys from env vars or config files.
     /// goose stores provider API keys in the OS keyring by default (the macOS
@@ -1073,23 +1132,38 @@ impl Agent {
     /// `github-copilot-enterprise` key) is not matched: its hosts live on the
     /// customer's own domain, which cplt cannot know. Those go in
     /// `allowed_domains` (docs/known-impacts.md).
-    pub fn provider_domains(&self, home: &Path) -> Vec<&'static str> {
+    ///
+    /// `gh_configured`: gh is logged in on the host, so cplt hands OpenCode
+    /// that login when the store has no `github-copilot` entry of its own
+    /// ([`opencode_host_login`], #695). The same hosts are needed then.
+    ///
+    /// The caller passes false when `deny.env` blocks the handover (`GH_TOKEN`
+    /// or `OPENCODE_AUTH_CONTENT`). Otherwise it is only "gh's hosts.yml
+    /// exists", decided before the sandbox starts without running gh, so the
+    /// hosts are still added when the handover fails later (gh guard off,
+    /// untrusted gh, token extraction failing). They are GitHub's own hosts;
+    /// predicting those cases would mean running gh for `cplt check`.
+    pub fn provider_domains(&self, home: &Path, gh_configured: bool) -> Vec<&'static str> {
         if *self != Agent::OpenCode {
             return Vec::new();
         }
-        // A relative or empty XDG_DATA_HOME would resolve against the
-        // project dir and let a repo supply the file; the spec says to ignore it.
-        // The same goes for an unset or empty HOME.
-        let Some(data_base) = std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .or_else(|| home.is_absolute().then(|| home.join(".local/share")))
-        else {
+        let Some(path) = opencode_auth_json(home) else {
             return Vec::new();
         };
-        read_small_regular_file(&data_base.join("opencode/auth.json"))
-            .map(|s| opencode_provider_domains(&s))
-            .unwrap_or_default()
+        let stored = read_opencode_auth_json(&path);
+        let domains = stored
+            .as_ref()
+            .ok()
+            .and_then(|s| s.as_deref())
+            .map(opencode_provider_domains)
+            .unwrap_or_default();
+        if domains.is_empty()
+            && gh_configured
+            && stored.is_ok_and(|s| opencode_auth_overlay(s.as_deref(), "").is_some())
+        {
+            return COPILOT_INFRA_DOMAINS.to_vec();
+        }
+        domains
     }
 
     /// The writable dirs a shell session needs, by shell name.
@@ -1711,7 +1785,8 @@ impl Agent {
             ],
             // Claude Code authenticates via the OAuth token in ~/.claude
             // (or macOS Keychain) by default — no env var needed for the
-            // subscription flow. These are for API-key / enterprise routing.
+            // subscription flow. CLAUDE_CODE_OAUTH_TOKEN replaces the Keychain
+            // grant on macOS. The rest are for API-key / enterprise routing.
             Agent::Claude => &[
                 // Anthropic API direct
                 "ANTHROPIC_API_KEY",
@@ -4088,6 +4163,65 @@ mod tests {
         }
     }
 
+    /// #695: the host login is added only where the user has no Copilot login
+    /// of their own, and every other provider survives the swap.
+    #[test]
+    fn opencode_auth_overlay_keeps_other_providers_and_existing_logins() {
+        let fresh = opencode_auth_overlay(None, "tok").expect("no store");
+        let v: serde_json::Value = serde_json::from_str(&fresh).expect("json");
+        assert_eq!(v["github-copilot"]["access"], "tok");
+        assert_eq!(v["github-copilot"]["refresh"], "tok");
+        assert_eq!(v["github-copilot"]["expires"], 0);
+
+        let merged =
+            opencode_auth_overlay(Some(r#"{"anthropic":{"type":"api","key":"k"}}"#), "tok")
+                .expect("other provider");
+        let v: serde_json::Value = serde_json::from_str(&merged).expect("json");
+        assert_eq!(v["anthropic"]["key"], "k");
+        assert_eq!(v["github-copilot"]["type"], "oauth");
+
+        for body in [
+            r#"{"github-copilot":{"type":"oauth","access":"own"}}"#,
+            r#"{"github-copilot":{"enterpriseUrl":"ghe.example.com"}}"#,
+            "not json",
+            "[]",
+            "",
+        ] {
+            assert!(opencode_auth_overlay(Some(body), "tok").is_none(), "{body}");
+        }
+    }
+
+    /// #695: a configured gh adds the Copilot hosts only when the overlay
+    /// would apply.
+    #[test]
+    fn provider_domains_follow_the_host_login() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        temp_env::with_var("XDG_DATA_HOME", None::<&str>, || {
+            assert!(
+                Agent::OpenCode
+                    .provider_domains(tmp.path(), true)
+                    .contains(&"githubcopilot.com")
+            );
+            assert!(
+                Agent::OpenCode
+                    .provider_domains(tmp.path(), false)
+                    .is_empty()
+            );
+            let dir = tmp.path().join(".local/share/opencode");
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            std::fs::write(
+                dir.join("auth.json"),
+                r#"{"github-copilot":{"enterpriseUrl":"x"}}"#,
+            )
+            .expect("write");
+            assert!(
+                Agent::OpenCode
+                    .provider_domains(tmp.path(), true)
+                    .is_empty()
+            );
+        });
+    }
+
     /// #609: the file is found in the XDG data dir, and only OpenCode reads it.
     #[test]
     fn provider_domains_reads_opencode_auth_json_from_data_dir() {
@@ -4098,21 +4232,29 @@ mod tests {
         temp_env::with_var("XDG_DATA_HOME", None::<&str>, || {
             assert!(
                 Agent::OpenCode
-                    .provider_domains(tmp.path())
+                    .provider_domains(tmp.path(), false)
                     .contains(&"githubcopilot.com")
             );
-            assert!(Agent::Copilot.provider_domains(tmp.path()).is_empty());
-            assert!(Agent::Pi.provider_domains(tmp.path()).is_empty());
+            assert!(
+                Agent::Copilot
+                    .provider_domains(tmp.path(), false)
+                    .is_empty()
+            );
+            assert!(Agent::Pi.provider_domains(tmp.path(), false).is_empty());
         });
         temp_env::with_var("XDG_DATA_HOME", Some("/nonexistent-cplt-609"), || {
-            assert!(Agent::OpenCode.provider_domains(tmp.path()).is_empty());
+            assert!(
+                Agent::OpenCode
+                    .provider_domains(tmp.path(), false)
+                    .is_empty()
+            );
         });
         // Relative and empty values are ignored, not resolved against the cwd.
         for bad in ["", "relative-data"] {
             temp_env::with_var("XDG_DATA_HOME", Some(bad), || {
                 assert!(
                     Agent::OpenCode
-                        .provider_domains(tmp.path())
+                        .provider_domains(tmp.path(), false)
                         .contains(&"githubcopilot.com"),
                     "{bad:?}"
                 );
@@ -4128,8 +4270,16 @@ mod tests {
         }
         relative_home.push(tmp.path().strip_prefix("/").expect("absolute tmp"));
         temp_env::with_var("XDG_DATA_HOME", None::<&str>, || {
-            assert!(Agent::OpenCode.provider_domains(Path::new("")).is_empty());
-            assert!(Agent::OpenCode.provider_domains(&relative_home).is_empty());
+            assert!(
+                Agent::OpenCode
+                    .provider_domains(Path::new(""), false)
+                    .is_empty()
+            );
+            assert!(
+                Agent::OpenCode
+                    .provider_domains(&relative_home, false)
+                    .is_empty()
+            );
         });
     }
 
@@ -4144,7 +4294,7 @@ mod tests {
         let auth = dir.join("auth.json");
         let read = || {
             temp_env::with_var("XDG_DATA_HOME", None::<&str>, || {
-                Agent::OpenCode.provider_domains(tmp.path())
+                Agent::OpenCode.provider_domains(tmp.path(), false)
             })
         };
 

@@ -907,17 +907,28 @@ cplt config set allow.read "~/.config/pnpm/auth.ini"
 
 Or set the key back to `false`. A token in `config.yaml` (pnpm 11 accepts an `_auth` entry there) stays readable either way. See [Private registries](known-impacts.md#private-registries).
 
-## Dropping the Keychain grant (`sandbox.keychain_substitute`) — EXPERIMENTAL
+<a id="dropping-the-keychain-grant-sandboxkeychain_substitute--experimental"></a>
 
-Off by default. macOS only; on Linux it does nothing. `.cplt.toml` cannot set it.
+## Dropping the Keychain grant (`sandbox.keychain_substitute`)
+
+On by default for Copilot and Claude Code, off for the other agents. macOS only; on Linux it does nothing. `.cplt.toml` cannot set it. An explicit value applies to every agent:
 
 ```bash
-cplt config set sandbox.keychain_substitute true
+cplt config set sandbox.keychain_substitute false   # keep the Keychain grant
+cplt config set sandbox.keychain_substitute true    # also try it for Antigravity
 ```
 
-On, it removes the read+write grant on `~/Library/Keychains` for an agent that can authenticate another way, and hands that credential over instead. For Copilot that is a GitHub token: an exported `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN`, or, when none is set, what `gh auth token --hostname github.com` prints at launch, passed in as `GH_TOKEN`. The startup summary shows `Keychain: denied` and names the source. With the key off, the profile and the agent's environment are exactly what they were before the key existed.
+For Claude Code, the grant goes when `CLAUDE_CODE_OAUTH_TOKEN` is exported. Create the token with `claude setup-token`; Claude Code then signs in with it alone and never reads the Keychain. Without the variable nothing changes, and `cplt --agent claude check` suggests the command. `ANTHROPIC_API_KEY` does not count, so a subscription login is never switched to API billing.
 
-What it costs for Copilot: the token sits in the agent's environment, Copilot authenticates as `gh`'s account rather than a separate `copilot /login` account, and an exported token GitHub rejects becomes a sign-in error where Copilot would otherwise have fallen back to its stored login. Unset the key or the token variable to get the old behaviour back. The per-agent details, and what was and was not verified, are in [SECURITY.md](../SECURITY.md#keychain-access-is-all-or-nothing).
+If you already export `CLAUDE_CODE_OAUTH_TOKEN`, Claude Code loses the Keychain grant on your next launch. MCP servers that use OAuth then ask you to sign in once more, and Claude Code stores those tokens in `~/.claude/.credentials.json`. If Claude Code fails to sign in, do one of these:
+
+- unset `CLAUDE_CODE_OAUTH_TOKEN` to go back to the Keychain login
+- run `claude setup-token` again and export the new token, if the old one has expired
+- run `cplt config set sandbox.keychain_substitute false` to keep the Keychain grant
+
+When it applies, it removes the read+write grant on `~/Library/Keychains` for an agent that can authenticate another way, and hands that credential over instead. For Copilot that is a GitHub token: an exported `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN`, or, when none is set, what `gh auth token --hostname github.com` prints at launch, passed in as `GH_TOKEN`. The launch summary shows `Keychain: denied` and names the source. If `gh` is not installed, not signed in, or prints nothing, the Keychain grant stays for that run. On the `gh auth token` path it also stays when `gh`'s github.com login differs from the account on Copilot's `copilot-cli` Keychain item, or that item is for another host such as GitHub Enterprise; the launch summary names both. The account name is read on the host without reading the secret. With several items, cplt compares the one matching gh's login, else the first `security` returns, so it catches a plain mismatch but cannot tell which account Copilot is actively using. With no item, the substitute goes ahead. An exported token skips this check and is used as-is. With the key `false`, the profile and the agent's environment are exactly what they were before the key existed.
+
+What it costs for Copilot: the token sits in the agent's environment, Copilot authenticates with `gh`'s token rather than its own stored one, and a token GitHub rejects is a sign-in error where Copilot would otherwise have fallen back to its stored login. If Copilot reports a sign-in error, run `gh auth refresh` or `gh auth login` on the host, unset the stale token variable, or set the key to `false` to get the old behaviour back. The per-agent details, and what was and was not verified, are in [SECURITY.md](../SECURITY.md#keychain-access-is-all-or-nothing).
 
 ## No execute on `~/.copilot` (`sandbox.deny_copilot_dir_exec`)
 
@@ -952,8 +963,8 @@ Keys not covered in a section above. `cplt config explain <key>` prints the same
 | `proxy.allow_private_domains` | `[]` | Domains allowed to resolve to private or internal IP addresses, a waiver of the DNS-rebinding guard for intranet services. A name covers its subdomains. See [private-domain waiver](proxy.md#private-domain-waiver). |
 | `gh_guard.mode` | `block` | `block` refuses, `warn` prints a warning and runs the command, `audit` runs it and logs the decision. See [gh guard](gh-guard.md). |
 | `gh_guard.scope_check` | `true` | Refuses write commands aimed at another repository, for example with `-R`. |
-| `gh_guard.block_auth_token` | `true` | Refuses `gh auth token`, so the agent cannot print the token. |
-| `gh_guard.inject_token` ⚠️ | `false` | For Copilot only, and only while `gh_guard.enabled` is on: puts your `gh` token in the sandbox environment at launch, where every subprocess can read it. The token goes into `GH_TOKEN`, or the next of `GITHUB_TOKEN` and `COPILOT_GITHUB_TOKEN` that `deny.env` leaves in place. Skipped when the agent already has a token. |
+| `gh_guard.block_auth_token` | `true` | Refuses `gh auth token`, so the agent cannot print the token. With `false`, `gh auth token` prints the real token for every agent. |
+| `gh_guard.inject_token` ⚠️ | `false` | For Copilot only, and only while `gh_guard.enabled` is on: puts your `gh` token in the sandbox environment at launch, where every subprocess can read it. The token goes into `GH_TOKEN`, or the next of `GITHUB_TOKEN` and `COPILOT_GITHUB_TOKEN` that `deny.env` leaves in place. Not needed for `gh` itself: the gh guard hands the real `gh` the exec token (see [gh guard](gh-guard.md#how-gh-itself-authenticates)). Skipped when the agent already has a token. |
 | `gh_guard.unknown_command` | `block` | What to do with a `gh` command the guard does not classify: `block` or `allow`. |
 | `gh_guard.allow_api_write` ⚠️ | `false` | Allows `gh api` writes (POST, PATCH, PUT and input flags), scope-checked to the current repository. |
 | `git_guard.enabled` | `true` | Intercepts `git push`, `request-pull` and `send-pack`. See [git guard](git-guard.md). |
