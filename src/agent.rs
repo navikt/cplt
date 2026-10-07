@@ -5181,10 +5181,66 @@ mod tests {
         let mut dirs = script_grants(paths, &home.join("root"), &home, &[]);
         assert_eq!(dirs.len(), 3);
         // The tempdir itself sits under a system temp root; keep only home roots.
-        let mut roots = crate::sandbox::home_and_temp_writable_roots(&home);
+        let tool_dirs: Vec<_> = crate::sandbox::HOME_TOOL_DIRS
+            .iter()
+            .map(|d| d.resolve(&home, &[]))
+            .collect();
+        let mut roots = crate::sandbox::home_and_temp_writable_roots(&home, &tool_dirs, None);
         roots.retain(|r| r.starts_with(&home));
         drop_script_grants_under(&mut dirs, &roots);
         let got: Vec<_> = dirs.iter().map(|d| d.path.clone()).collect();
         assert_eq!(got, vec![ok]);
+    }
+
+    /// `CARGO_HOME` relocated outside home and a worktree's git common dir are
+    /// writable trees too; a script linked from either loses its grant.
+    #[test]
+    fn script_grant_through_relocated_tool_dir_or_git_common_dir_is_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let (home, cargo, git, tools) = (
+            base.join("home"),
+            base.join("cargo"),
+            base.join("repo.git"),
+            base.join("tools"),
+        );
+        for d in [&home, &cargo.join("registry"), &git.join("hooks"), &tools] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let (a, b, ok) = (tools.join("a.sh"), tools.join("b.sh"), tools.join("ok.sh"));
+        for f in [&a, &b, &ok] {
+            std::fs::write(f, "").unwrap();
+        }
+        std::os::unix::fs::symlink(&a, cargo.join("registry/hook")).unwrap();
+        std::os::unix::fs::symlink(&b, git.join("hooks/mcp")).unwrap();
+        let paths = vec![
+            cargo.join("registry/hook"),
+            git.join("hooks/mcp"),
+            ok.clone(),
+        ];
+        let mut dirs = script_grants(paths, &base.join("root"), &home, &[]);
+        assert_eq!(dirs.len(), 3);
+        let relocate = [crate::sandbox::ToolRoot {
+            default: ".cargo",
+            root: cargo.clone(),
+        }];
+        let tool_dirs: Vec<_> = crate::sandbox::HOME_TOOL_DIRS
+            .iter()
+            .map(|d| d.resolve(&home, &relocate))
+            .collect();
+        let mut roots = crate::sandbox::home_and_temp_writable_roots(&home, &tool_dirs, Some(&git));
+        roots.retain(|r| r.starts_with(&base));
+        assert!(roots.iter().any(|r| r.starts_with(&cargo)), "{roots:?}");
+        drop_script_grants_under(&mut dirs, &roots);
+        let got: Vec<_> = dirs.iter().map(|d| d.path.clone()).collect();
+        assert_eq!(got, vec![ok]);
+    }
+
+    /// `/dev/shm` is always writable off macOS, like `/tmp` (#714).
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn home_and_temp_writable_roots_include_dev_shm() {
+        let roots = crate::sandbox::home_and_temp_writable_roots(Path::new("/h"), &[], None);
+        assert!(roots.contains(&PathBuf::from("/dev/shm")));
     }
 }

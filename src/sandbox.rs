@@ -1534,27 +1534,46 @@ pub fn session_writable_roots(
     roots.extend(named_roots.iter().cloned());
     roots.extend(allow_write.iter().cloned());
     roots.extend(scratch_dir.map(Path::to_path_buf));
-    roots.extend(SYSTEM_TEMP_DIRS.iter().map(PathBuf::from));
-    #[cfg(not(target_os = "macos"))]
-    roots.push(PathBuf::from("/dev/shm"));
+    roots.extend(always_writable_roots());
     #[cfg(not(target_os = "macos"))]
     roots.push(PathBuf::from("/tmp"));
     roots
 }
 
-/// The trees writable by construction rather than by config: the writable
-/// home tool dirs (`~/.cache`, `~/.yarn`, ...) and the system temp dirs. A
+/// The trees writable by construction rather than by config, for callers that
+/// run before a [`SandboxConfig`] exists: the writable tool dirs (env-relocated
+/// ones and their symlink targets included), the app dirs' write paths, the
+/// Cypress state dir, the git common dir, and the system temp dirs. A
 /// hook/MCP script reached through one of these keeps no exec-only grant
 /// (`agent::drop_script_grants_under`); the agent could rewrite the link (#714).
+///
+/// A superset of what a given launch grants (Cypress and every app dir are
+/// included unconditionally): over-including only drops a script grant.
 #[must_use]
-pub fn home_and_temp_writable_roots(home: &Path) -> Vec<PathBuf> {
-    let mut roots: Vec<PathBuf> = policy::HOME_TOOL_DIRS
+pub fn home_and_temp_writable_roots(
+    home: &Path,
+    tool_dirs: &[policy::ResolvedToolDir],
+    git_common_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = tool_dirs
         .iter()
-        .filter(|d| d.write)
-        .map(|d| home.join(d.path))
+        .filter(|d| d.dir.write)
+        .flat_map(|d| std::iter::once(d.path.clone()).chain(d.target.clone()))
         .collect();
-    roots.extend(SYSTEM_TEMP_DIRS.iter().map(PathBuf::from));
+    roots.extend(policy::app_dirs().iter().flat_map(|d| d.write_paths(home)));
+    roots.push(policy::cypress_app_data_dir_with_env(home, &process_env));
+    roots.extend(git_common_dir.map(Path::to_path_buf));
+    roots.extend(always_writable_roots());
     roots
+}
+
+/// The system temp dirs and, off macOS, `/dev/shm`: writable with no grant
+/// behind them. Shared by every writable-tree list so they cannot drift.
+fn always_writable_roots() -> Vec<PathBuf> {
+    let roots = SYSTEM_TEMP_DIRS.iter().map(PathBuf::from);
+    #[cfg(not(target_os = "macos"))]
+    let roots = roots.chain(std::iter::once(PathBuf::from("/dev/shm")));
+    roots.collect()
 }
 
 /// Names the temp-dir collision in the refusal, and selects its remedy: a temp
