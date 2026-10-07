@@ -3258,6 +3258,69 @@ mod macos_tests {
         );
     }
 
+    /// #703: a script named by the user `opencode.json` (MCP command) runs,
+    /// but cannot be written; its argument and siblings stay unreadable, and
+    /// the config file itself stays write-denied.
+    #[test]
+    fn real_profile_runs_opencode_config_script_only() {
+        require_sandbox!();
+        let project = tempfile::Builder::new()
+            .prefix(".cplt-ocs-project-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        let home = tempfile::Builder::new()
+            .prefix(".cplt-ocs-home-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        let home = fs::canonicalize(home.path()).unwrap();
+        let cfg = home.join(".config/opencode");
+        let ext = home.join("ext");
+        fs::create_dir_all(&cfg).unwrap();
+        fs::create_dir_all(&ext).unwrap();
+        let script = ext.join("server.sh");
+        fs::write(&script, "#!/bin/sh\necho RAN\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(ext.join("arg.txt"), "SECRET").unwrap();
+        fs::write(
+            cfg.join("opencode.json"),
+            format!(
+                r#"{{"mcp":{{"s":{{"type":"local","command":["{}","{}/arg.txt"]}}}}}}"#,
+                script.display(),
+                ext.display()
+            ),
+        )
+        .unwrap();
+        let agent_dirs = temp_env::with_var_unset("XDG_CONFIG_HOME", || {
+            cplt::agent::Agent::OpenCode.config_dirs(&home)
+        });
+        let mut opts = default_opts(project.path(), &home);
+        opts.agent = cplt::agent::Agent::OpenCode;
+        opts.agent_dirs = &agent_dirs;
+        let profile = write_real_profile(&opts);
+        let run = |cmd: String| run_sandboxed(&profile, &cmd).0;
+        let exec = run(format!("'{}'; echo EXIT:$?", script.display()));
+        let write = run(format!("echo x >> '{}'; echo EXIT:$?", script.display()));
+        let arg = run(format!("cat '{}/arg.txt' 2>&1", ext.display()));
+        let cfg_write = run(format!(
+            "echo x >> '{}'; echo EXIT:$?",
+            cfg.join("opencode.json").display()
+        ));
+        fs::remove_file(&profile).ok();
+        assert!(exec.contains("RAN") && exec.contains("EXIT:0"), "{exec}");
+        assert!(
+            !write.contains("EXIT:0"),
+            "script must not be writable: {write}"
+        );
+        assert!(
+            !arg.contains("SECRET"),
+            "argument must stay unreadable: {arg}"
+        );
+        assert!(
+            !cfg_write.contains("EXIT:0"),
+            "config must not be writable: {cfg_write}"
+        );
+    }
+
     // ── .env file read denial ─────────────────────────────────────
 
     #[test]

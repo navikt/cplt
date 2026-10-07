@@ -422,12 +422,37 @@ fn opencode_script_grants(config_dir: &Path, home: &Path, writable: &[PathBuf]) 
     if !cfg!(target_os = "macos") {
         return vec![];
     }
-    let paths = ["opencode.json", "opencode.jsonc", "config.json"]
+    const FILES: [&str; 3] = ["opencode.json", "opencode.jsonc", "config.json"];
+    let paths = FILES
         .iter()
         .filter_map(|f| read_small_regular_file(&config_dir.join(f)))
         .flat_map(|t| opencode_script_paths(&t, home))
         .collect();
-    script_grants(paths, config_dir, home, writable)
+    let mut out = script_grants(paths, config_dir, home, writable);
+    // The config dir is read-only by its own grant, but a project or
+    // `allow.write` tree containing `XDG_CONFIG_HOME` would still make these
+    // files writable, and the agent could plant a path for the next launch.
+    // Write-deny them, existing or not (and their resolved spelling), with
+    // the exec-only grant's tail deny and rename pin, whatever covers them.
+    let real_dir = std::fs::canonicalize(config_dir).ok();
+    for f in FILES {
+        let mut pins = vec![config_dir.join(f)];
+        pins.extend(real_dir.as_ref().map(|d| d.join(f)));
+        pins.extend(std::fs::canonicalize(config_dir.join(f)));
+        for p in pins {
+            if out.iter().all(|d| d.path != p) && crate::sandbox::validate_sbpl_path(&p).is_ok() {
+                out.push(AgentDir {
+                    path: p,
+                    write: false,
+                    map_exec: false,
+                    process_exec: true,
+                    write_files: vec![],
+                    create_dirs: vec![],
+                });
+            }
+        }
+    }
+    out
 }
 
 /// Candidate paths in an OpenCode config: each `plugin[]` entry (string or
@@ -444,7 +469,8 @@ fn opencode_script_paths(text: &str, home: &Path) -> Vec<PathBuf> {
         .flatten()
         .filter_map(|p| p.as_str().or_else(|| p.get(0)?.as_str()))
         .filter_map(|p| p.strip_prefix("file://"))
-        .map(str::to_string);
+        .filter_map(|p| expand_home(&percent_decode(p), home))
+        .map(|p| plugin_entrypoint(&p).unwrap_or(p));
     let commands = v
         .get("mcp")
         .and_then(|m| m.as_object())
@@ -456,10 +482,44 @@ fn opencode_script_paths(text: &str, home: &Path) -> Vec<PathBuf> {
                 .filter_map(|w| Some(w.as_str()?.to_string()))
                 .collect()
         });
-    plugins
-        .filter_map(|w| expand_home(&w, home))
-        .chain(script_paths(commands, home))
-        .collect()
+    plugins.chain(script_paths(commands, home)).collect()
+}
+
+/// `%XX` decoding for the path of a `file://` URL, as `fileURLToPath` does.
+/// Invalid escapes are kept literally.
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = (b[i] == b'%')
+            .then(|| s.get(i + 1..i + 3))
+            .flatten()
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        if let Some(v) = hex {
+            out.push(v);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The file a directory plugin loads: `package.json` `main`, else
+/// `index.ts` or `index.js`. `None` when `dir` is not a directory.
+fn plugin_entrypoint(dir: &Path) -> Option<PathBuf> {
+    if !dir.is_dir() {
+        return None;
+    }
+    let main = read_small_regular_file(&dir.join("package.json"))
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| Some(v.get("main")?.as_str()?.to_string()));
+    main.into_iter()
+        .chain(["index.ts".into(), "index.js".into()])
+        .map(|m| dir.join(m))
+        .find(|p| p.is_file())
 }
 
 /// JSONC to JSON: drops `//` and `/* */` comments outside strings and
@@ -3120,6 +3180,10 @@ mod tests {
         let key = f(home.join(".ssh/id_ed25519"));
         let inside = f(data.join("x.sh"));
         let project = f(ext.join("project.js"));
+        std::fs::create_dir_all(ext.join("my dir/pkg")).unwrap();
+        let spaced = f(ext.join("my dir/s.js"));
+        let pkg_main = f(ext.join("my dir/pkg/main.js"));
+        std::fs::write(ext.join("my dir/pkg/package.json"), r#"{"main":"main.js"}"#).unwrap();
         std::fs::write(
             ext.join("opencode.json"),
             format!(r#"{{"plugin":["file://{}"]}}"#, project.display()),
@@ -3130,7 +3194,7 @@ mod tests {
             format!(
                 r#"{{
   // user config
-  "plugin": ["npm-pkg", "file://~/ext/plugin.js", ["file://{arr}", {{}}], "file://{key}",],
+  "plugin": ["npm-pkg", "file://~/ext/plugin.js", ["file://{arr}", {{}}], "file://{key}", "file://~/ext/my%20dir/s.js", "file://~/ext/my%20dir/pkg",],
   "mcp": {{
     "a": {{"type": "local", "command": ["node", "--x", "{server}", "{arg}"]}},
     "b": {{"type": "local", "command": ["$HOME/ext/mcp.sh"]}},
@@ -3147,9 +3211,18 @@ mod tests {
         )
         .unwrap();
         let got = opencode_script_grants(&cfg, &home, &[data]);
-        let mut paths: Vec<_> = got.iter().map(|d| d.path.clone()).collect();
+        let pins = ["opencode.json", "opencode.jsonc", "config.json"].map(|n| cfg.join(n));
+        assert!(
+            pins.iter().all(|p| got.iter().any(|d| &d.path == p)),
+            "config files are write-denied, existing or not"
+        );
+        let mut paths: Vec<_> = got
+            .iter()
+            .map(|d| d.path.clone())
+            .filter(|p| !p.starts_with(&cfg))
+            .collect();
         paths.sort();
-        let mut want = vec![plugin, arr_plugin, server, direct];
+        let mut want = vec![plugin, arr_plugin, server, direct, spaced, pkg_main];
         want.sort();
         assert_eq!(
             paths, want,
@@ -3702,7 +3775,9 @@ mod tests {
     fn opencode_config_dirs_xdg_default() {
         crate::with_env_lock_no_xdg(|| {
             let home = Path::new("/Users/test");
-            let dirs = Agent::OpenCode.config_dirs(home);
+            let mut dirs = Agent::OpenCode.config_dirs(home);
+            // Minus the macOS write-pins on the config files (#703).
+            dirs.retain(|d| d.path.parent() != Some(Path::new("/Users/test/.config/opencode")));
             assert_eq!(
                 dirs.len(),
                 5,
