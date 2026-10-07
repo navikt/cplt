@@ -5670,6 +5670,16 @@ fn assemble_sandbox(
         );
     }
 
+    if active_agent == agent::Agent::OpenCode
+        && let Some(bad) = agent::opencode_config_dir_on_credentials(home_dir)
+    {
+        bail!(
+            "cplt refuses OPENCODE_CONFIG_DIR='{}': it is, or overlaps, a credential \
+             directory the sandbox denies. Point it at a dedicated directory such as '{}'.",
+            bad.display(),
+            home_dir.join(".config/opencode").display(),
+        );
+    }
     // Pre-create agent directories before entering sandbox.
     // Agents like OpenCode crash if their data/config dirs don't exist,
     // and the sandbox may block mkdir on parent paths.
@@ -5708,7 +5718,7 @@ fn assemble_sandbox(
             "cplt refuses to grant the agent the config directory derived from the \
              environment, '{}', it is too broad (a system root, your home directory, \
              or an ancestor of it). Point the relevant variable (CLAUDE_CONFIG_DIR, \
-             DSH_HOME, or an XDG_* base) at a dedicated subdirectory such as '{}'.",
+             DSH_HOME, OPENCODE_CONFIG_DIR, or an XDG_* base) at a dedicated subdirectory such as '{}'.",
             bad.path.display(),
             home_dir.join(".claude").display(),
         );

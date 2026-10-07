@@ -3352,19 +3352,28 @@ mod macos_tests {
             r#"{{"mcp":{{"s":{{"type":"local","command":["{}"]}}}}}}"#,
             script.display()
         );
-        let check = |xdg: &Path| {
-            let mut agent_dirs = temp_env::with_var("XDG_CONFIG_HOME", Some(xdg), || {
-                cplt::agent::Agent::OpenCode.config_dirs(&home)
-            });
+        let check_with = |xdg: &Path, custom: Option<&Path>, extra: &str| {
+            let mut agent_dirs = temp_env::with_vars(
+                [
+                    ("XDG_CONFIG_HOME", Some(xdg)),
+                    ("OPENCODE_CONFIG_DIR", custom),
+                ],
+                || cplt::agent::Agent::OpenCode.config_dirs(&home),
+            );
             cplt::agent::drop_script_grants_under(&mut agent_dirs, std::slice::from_ref(&project));
             let mut opts = default_opts(&project, &home);
             opts.agent = cplt::agent::Agent::OpenCode;
             opts.agent_dirs = &agent_dirs;
             let profile = write_real_profile(&opts);
-            let out = run_sandboxed(&profile, &format!("'{}'; echo EXIT:$?", script.display())).0;
+            let out = run_sandboxed(
+                &profile,
+                &format!("'{}'; echo EXIT:$?; {extra}", script.display()),
+            )
+            .0;
             fs::remove_file(&profile).ok();
             out
         };
+        let check = |xdg: &Path| check_with(xdg, None, "");
         // Config dir inside the project: the MCP script gets nothing.
         config(&project.join("xdg/opencode"), mcp.clone());
         let out = check(&project.join("xdg"));
@@ -3380,6 +3389,29 @@ mod macos_tests {
             !out.contains("RAN"),
             "escaping plugin main must grant nothing: {out}"
         );
+        // #718: `opencode.json` symlinked into the project: nothing.
+        fs::create_dir_all(home.join("xdg3/opencode")).unwrap();
+        fs::write(project.join("oc.json"), &mcp).unwrap();
+        std::os::unix::fs::symlink(
+            project.join("oc.json"),
+            home.join("xdg3/opencode/opencode.json"),
+        )
+        .unwrap();
+        let out = check(&home.join("xdg3"));
+        assert!(
+            !out.contains("RAN"),
+            "linked config must grant nothing: {out}"
+        );
+        // #718: a custom OPENCODE_CONFIG_DIR is readable and its scripts run,
+        // under the same rules: inside the project it grants no script.
+        let custom = home.join("custom");
+        config(&custom, mcp.clone());
+        fs::write(custom.join("AGENTS.md"), "CUSTOMREAD").unwrap();
+        let cat = format!("cat '{}'", custom.join("AGENTS.md").display());
+        let out = check_with(&home.join("none"), Some(&custom), &cat);
+        assert!(out.contains("RAN") && out.contains("CUSTOMREAD"), "{out}");
+        let out = check_with(&home.join("none"), Some(&project.join("xdg/opencode")), "");
+        assert!(!out.contains("RAN"), "custom dir in project: {out}");
         // Control: the same MCP config outside any writable tree runs.
         config(&home.join("xdg2/opencode"), mcp);
         let out = check(&home.join("xdg2"));
