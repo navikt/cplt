@@ -324,6 +324,32 @@ mod e2e_tests {
         );
     }
 
+    /// #703: a missing OpenCode config file must not be created on the host
+    /// (as an empty directory, which OpenCode then fails to read).
+    #[test]
+    fn e2e_opencode_print_profile_creates_no_config_files() {
+        let tmp = tempfile::Builder::new()
+            .prefix(".cplt-ocpp-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("tempdir");
+        let xdg = tmp.path().join("xdg");
+        let output = cplt_cmd()
+            .args(["--print-profile", "--agent", "opencode"])
+            .env("XDG_CONFIG_HOME", &xdg)
+            .current_dir(project_dir())
+            .output()
+            .expect("binary should run");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for f in ["opencode.json", "opencode.jsonc", "config.json"] {
+            let p = xdg.join("opencode").join(f);
+            assert!(!p.exists(), "{} must not be created", p.display());
+        }
+    }
+
     /// Audit C-02: an externally-set `CLAUDE_CONFIG_DIR` pointing at a system
     /// root must not become a writable grant. The refusal fires in
     /// `assemble_sandbox`, which `--print-profile --agent claude` reaches

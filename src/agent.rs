@@ -429,28 +429,14 @@ fn opencode_script_grants(config_dir: &Path, home: &Path, writable: &[PathBuf]) 
         .flat_map(|t| opencode_script_paths(&t, home))
         .collect();
     let mut out = script_grants(paths, config_dir, home, writable);
-    // The config dir is read-only by its own grant, but a project or
-    // `allow.write` tree containing `XDG_CONFIG_HOME` would still make these
-    // files writable, and the agent could plant a path for the next launch.
-    // Write-deny them, existing or not (and their resolved spelling), with
-    // the exec-only grant's tail deny and rename pin, whatever covers them.
-    let real_dir = std::fs::canonicalize(config_dir).ok();
-    for f in FILES {
-        let mut pins = vec![config_dir.join(f)];
-        pins.extend(real_dir.as_ref().map(|d| d.join(f)));
-        pins.extend(std::fs::canonicalize(config_dir.join(f)));
-        for p in pins {
-            if out.iter().all(|d| d.path != p) && crate::sandbox::validate_sbpl_path(&p).is_ok() {
-                out.push(AgentDir {
-                    path: p,
-                    write: false,
-                    map_exec: false,
-                    process_exec: true,
-                    write_files: vec![],
-                    create_dirs: vec![],
-                });
-            }
-        }
+    // The config files are trusted only because the config dir is read-only.
+    // If the dir (or anything above it) sits in a project or `allow.write`
+    // tree, the agent can edit them, or swap the whole dir with `mv`, and
+    // plant a path for the next launch. Recording the config dir's locations
+    // in `via` makes `drop_script_grants_under` drop every grant then.
+    let cfg_locs = symlink_locations(config_dir);
+    for g in &mut out {
+        g.via.extend(cfg_locs.iter().cloned());
     }
     out
 }
@@ -470,7 +456,13 @@ fn opencode_script_paths(text: &str, home: &Path) -> Vec<PathBuf> {
         .filter_map(|p| p.as_str().or_else(|| p.get(0)?.as_str()))
         .filter_map(|p| p.strip_prefix("file://"))
         .filter_map(|p| expand_home(&percent_decode(p), home))
-        .map(|p| plugin_entrypoint(&p).unwrap_or(p));
+        .filter_map(|p| {
+            if p.is_dir() {
+                plugin_entrypoint(&p)
+            } else {
+                Some(p)
+            }
+        });
     let commands = v
         .get("mcp")
         .and_then(|m| m.as_object())
@@ -508,11 +500,11 @@ fn percent_decode(s: &str) -> String {
 }
 
 /// The file a directory plugin loads: `package.json` `main`, else
-/// `index.ts` or `index.js`. `None` when `dir` is not a directory.
+/// `index.ts` or `index.js`. `None` when that file resolves outside `dir`
+/// (an absolute or `..` `main`, or a symlink out), so the grant cannot be
+/// pointed at an arbitrary file.
 fn plugin_entrypoint(dir: &Path) -> Option<PathBuf> {
-    if !dir.is_dir() {
-        return None;
-    }
+    let real_dir = std::fs::canonicalize(dir).ok()?;
     let main = read_small_regular_file(&dir.join("package.json"))
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
         .and_then(|v| Some(v.get("main")?.as_str()?.to_string()));
@@ -520,6 +512,7 @@ fn plugin_entrypoint(dir: &Path) -> Option<PathBuf> {
         .chain(["index.ts".into(), "index.js".into()])
         .map(|m| dir.join(m))
         .find(|p| p.is_file())
+        .filter(|p| std::fs::canonicalize(p).is_ok_and(|r| r.starts_with(&real_dir)))
 }
 
 /// JSONC to JSON: drops `//` and `/* */` comments outside strings and
@@ -3046,6 +3039,33 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "macos")]
+    fn opencode_dir_plugin_entrypoint_must_stay_inside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        let cfg = home.join(".config/opencode");
+        let (abs, dotdot, link) = (home.join("abs"), home.join("dotdot"), home.join("link"));
+        for d in [&cfg, &abs, &dotdot, &link] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let secret = home.join("secret.sh");
+        std::fs::write(&secret, "x").unwrap();
+        let main = |d: &Path, m: &str| {
+            std::fs::write(d.join("package.json"), format!(r#"{{"main":"{m}"}}"#)).unwrap();
+        };
+        main(&abs, &secret.display().to_string());
+        main(&dotdot, "../secret.sh");
+        std::os::unix::fs::symlink(&secret, link.join("index.js")).unwrap();
+        std::fs::write(
+            cfg.join("opencode.json"),
+            r#"{"plugin":["file://~/abs","file://~/dotdot","file://~/link"]}"#,
+        )
+        .unwrap();
+        let got = opencode_script_grants(&cfg, &home, &[]);
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
     fn claude_hook_scripts_skip_files_under_symlinked_root() {
         let tmp = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(tmp.path()).unwrap();
@@ -3211,16 +3231,13 @@ mod tests {
         )
         .unwrap();
         let got = opencode_script_grants(&cfg, &home, &[data]);
-        let pins = ["opencode.json", "opencode.jsonc", "config.json"].map(|n| cfg.join(n));
         assert!(
-            pins.iter().all(|p| got.iter().any(|d| &d.path == p)),
-            "config files are write-denied, existing or not"
+            ["opencode.json", "config.json"]
+                .iter()
+                .all(|n| !cfg.join(n).exists() && got.iter().all(|d| d.path != cfg.join(n))),
+            "missing config files are neither granted nor created"
         );
-        let mut paths: Vec<_> = got
-            .iter()
-            .map(|d| d.path.clone())
-            .filter(|p| !p.starts_with(&cfg))
-            .collect();
+        let mut paths: Vec<_> = got.iter().map(|d| d.path.clone()).collect();
         paths.sort();
         let mut want = vec![plugin, arr_plugin, server, direct, spaced, pkg_main];
         want.sort();
@@ -3229,6 +3246,10 @@ mod tests {
             "project config, args, ~/.ssh, writable dir skipped"
         );
         assert!(got.iter().all(|d| !d.write && d.process_exec));
+        // A config dir inside a writable tree grants nothing (#703).
+        let mut dirs = got.clone();
+        drop_script_grants_under(&mut dirs, &[home.join(".config")]);
+        assert!(dirs.is_empty(), "{dirs:?}");
     }
 
     #[test]
@@ -3775,9 +3796,7 @@ mod tests {
     fn opencode_config_dirs_xdg_default() {
         crate::with_env_lock_no_xdg(|| {
             let home = Path::new("/Users/test");
-            let mut dirs = Agent::OpenCode.config_dirs(home);
-            // Minus the macOS write-pins on the config files (#703).
-            dirs.retain(|d| d.path.parent() != Some(Path::new("/Users/test/.config/opencode")));
+            let dirs = Agent::OpenCode.config_dirs(home);
             assert_eq!(
                 dirs.len(),
                 5,
