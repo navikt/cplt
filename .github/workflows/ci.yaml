@@ -257,6 +257,54 @@ jobs:
           fi
           echo "Working tree clean — no test artifacts leaked"
 
+  # OpenCode v2 (#710) through cplt with the real, pinned binary and no
+  # credentials. The integration job covers the same ground with a stub; this
+  # checks the real client finds and reaches its own per-session service.
+  opencode-v2-e2e:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # ratchet:actions/checkout@v7.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # ratchet:dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94"
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # ratchet:actions/cache@v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Install pinned OpenCode v2
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The platform package carries the binary; the @opencode/cli shim
+          # only links it from a postinstall script, which stays off.
+          prefix="$RUNNER_TEMP/opencode-v2"
+          npm install --ignore-scripts --no-save --prefix "$prefix" "@opencode/cli-darwin-arm64@2.0.24"
+          bin="$prefix/node_modules/@opencode/cli-darwin-arm64/bin/opencode"
+          "$bin" --version
+          echo "CPLT_E2E_OPENCODE_V2=$bin" >> "$GITHUB_ENV"
+
+      - name: Run OpenCode v2 e2e tests
+        env:
+          CPLT_TEST_REQUIRE_SANDBOX: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --test e2e opencode_v2 -- --nocapture 2>&1 | tee "$RUNNER_TEMP/test-output.log"
+          if grep -q "SKIPPED (opencode v2)" "$RUNNER_TEMP/test-output.log"; then
+            echo "::error::OpenCode v2 tests skipped although the binary is installed"
+            exit 1
+          fi
+
   # Linux integration tests — Landlock kernel enforcement (requires Linux 5.13+)
   linux-integration-tests:
     runs-on: ubuntu-latest
@@ -480,7 +528,7 @@ jobs:
   ci-ok:
     name: ci-ok
     if: ${{ always() }}
-    needs: [unit-tests, integration-tests, linux-integration-tests]
+    needs: [unit-tests, integration-tests, opencode-v2-e2e, linux-integration-tests]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

@@ -9555,7 +9555,7 @@ paths = [
         use std::os::unix::fs::{PermissionsExt, symlink};
 
         const STUB: &str = "#!/bin/sh\n[ \"$1\" = --version ] && { echo opencode v2.0.24; exit 0; }\nexec /bin/sh -c \"$1\"\n";
-        pub(super) const SECRET: &str = "HOST-SECRET";
+        const SECRET: &str = "HOST-SECRET";
 
         pub(super) struct Home {
             _dir: tempfile::TempDir,
@@ -9877,6 +9877,156 @@ paths = [
                 .unwrap();
             assert!(kill.success());
             (scratch, c.wait().unwrap())
+        }
+    }
+
+    /// #710 against the real OpenCode v2 binary, without credentials. Runs
+    /// only when `CPLT_E2E_OPENCODE_V2` names the binary (the CI job installs
+    /// a pinned one); skips otherwise.
+    mod opencode_v2_real {
+        use super::opencode_v2::{Home, home};
+        use super::*;
+        use std::time::{Duration, Instant};
+
+        fn real_home() -> Option<Home> {
+            let Some(bin) = std::env::var_os("CPLT_E2E_OPENCODE_V2") else {
+                eprintln!("SKIPPED (opencode v2): CPLT_E2E_OPENCODE_V2 unset");
+                return None;
+            };
+            let bin = std::fs::canonicalize(bin).expect("CPLT_E2E_OPENCODE_V2");
+            let home = home();
+            std::os::unix::fs::symlink(&bin, home.bin.join("opencode")).unwrap();
+            Some(home)
+        }
+
+        fn run(home: &Home, args: &[&str]) -> String {
+            let o = home
+                .cmd(&[&["--quiet", "--"], args].concat())
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            let all = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            assert!(o.status.success(), "{args:?}: {all}");
+            all
+        }
+
+        /// No process of the session left (found by its fake HOME in the
+        /// environment), allowing the service its 5 s shutdown.
+        fn processes(home: &Home) -> Vec<String> {
+            let tag = format!("HOME={} ", home.h.display());
+            let o = Command::new("/bin/ps")
+                .args(["-Eww", "-axo", "pid=,command="])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter(|l| l.contains(&tag))
+                .map(|l| l.chars().take(200).collect())
+                .collect()
+        }
+
+        fn assert_no_process(home: &Home) {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                let left = processes(home);
+                if left.is_empty() {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "left running: {left:#?}");
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+
+        fn scratch_dirs(home: &Home) -> Vec<PathBuf> {
+            std::fs::read_dir(home.h.join("Library/Caches/cplt/tmp"))
+                .map(|d| d.flatten().map(|e| e.path()).collect())
+                .unwrap_or_default()
+        }
+
+        #[test]
+        fn debug_config_and_session_list_succeed() {
+            require_sandbox!();
+            let Some(home) = real_home() else {
+                return;
+            };
+            run(&home, &["debug", "config"]);
+            run(&home, &["session", "list"]);
+            assert!(scratch_dirs(&home).is_empty(), "{:?}", scratch_dirs(&home));
+            assert_no_process(&home);
+        }
+
+        /// Host registrations point at listeners the test holds; the session
+        /// must use its own service and never touch them.
+        #[test]
+        fn mcp_list_uses_the_session_service_not_the_host_one() {
+            require_sandbox!();
+            let Some(home) = real_home() else {
+                return;
+            };
+            let host = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let default = std::net::TcpListener::bind("127.0.0.1:49374").ok();
+            let port = host.local_addr().unwrap().port();
+            let reg = format!(
+                "{{\"port\":{port},\"password\":\"host\",\"url\":\"http://127.0.0.1:{port}\"}}"
+            );
+            std::fs::write(home.h.join(".local/state/opencode/service.json"), &reg).unwrap();
+            std::fs::write(home.h.join(".config/opencode/service.json"), &reg).unwrap();
+            run(&home, &["mcp", "list"]);
+            // `api` needs a running service; it can only be the session's.
+            run(&home, &["api", "GET", "/path"]);
+            let get = run(&home, &["service", "get"]);
+            let pinned = get
+                .split("\"port\":")
+                .nth(1)
+                .and_then(|r| r.trim_start().split(|c: char| !c.is_ascii_digit()).next())
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or_else(|| panic!("no port: {get}"));
+            assert!(pinned != 49374 && pinned != port, "{get}");
+            for l in std::iter::once(&host).chain(default.as_ref()) {
+                l.set_nonblocking(true).unwrap();
+                assert!(l.accept().is_err(), "host service port was contacted");
+            }
+            assert_no_process(&home);
+        }
+
+        /// Ctrl-C on a long-running session: the session dir and the service
+        /// go with it.
+        #[test]
+        fn sigint_leaves_no_session_or_process() {
+            require_sandbox!();
+            let Some(home) = real_home() else {
+                return;
+            };
+            use std::os::unix::process::CommandExt;
+            let mut c = home
+                .cmd(&["--quiet", "--", "acp"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while scratch_dirs(&home).is_empty() {
+                assert!(Instant::now() < deadline, "no session dir appeared");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            std::thread::sleep(Duration::from_secs(3));
+            let running = processes(&home);
+            assert!(running.len() >= 2, "agent and service: {running:#?}");
+            let pg = format!("-{}", c.id());
+            let kill = Command::new("/bin/kill")
+                .args(["-INT", "--", &pg])
+                .status()
+                .unwrap();
+            assert!(kill.success());
+            c.wait().unwrap();
+            assert!(scratch_dirs(&home).is_empty(), "{:?}", scratch_dirs(&home));
+            assert_no_process(&home);
         }
     }
 }
