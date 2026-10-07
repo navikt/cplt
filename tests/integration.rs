@@ -3258,6 +3258,134 @@ mod macos_tests {
         );
     }
 
+    /// #703: a script named by the user `opencode.json` (MCP command) runs,
+    /// but cannot be written; its argument and siblings stay unreadable, and
+    /// the config file itself stays write-denied.
+    #[test]
+    fn real_profile_runs_opencode_config_script_only() {
+        require_sandbox!();
+        let project = tempfile::Builder::new()
+            .prefix(".cplt-ocs-project-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        let home = tempfile::Builder::new()
+            .prefix(".cplt-ocs-home-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        let home = fs::canonicalize(home.path()).unwrap();
+        let cfg = home.join(".config/opencode");
+        let ext = home.join("ext");
+        fs::create_dir_all(&cfg).unwrap();
+        fs::create_dir_all(&ext).unwrap();
+        let script = ext.join("server.sh");
+        fs::write(&script, "#!/bin/sh\necho RAN\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(ext.join("arg.txt"), "SECRET").unwrap();
+        fs::write(
+            cfg.join("opencode.json"),
+            format!(
+                r#"{{"mcp":{{"s":{{"type":"local","command":["{}","{}/arg.txt"]}}}}}}"#,
+                script.display(),
+                ext.display()
+            ),
+        )
+        .unwrap();
+        let agent_dirs = temp_env::with_var_unset("XDG_CONFIG_HOME", || {
+            cplt::agent::Agent::OpenCode.config_dirs(&home)
+        });
+        let mut opts = default_opts(project.path(), &home);
+        opts.agent = cplt::agent::Agent::OpenCode;
+        opts.agent_dirs = &agent_dirs;
+        let profile = write_real_profile(&opts);
+        let run = |cmd: String| run_sandboxed(&profile, &cmd).0;
+        let exec = run(format!("'{}'; echo EXIT:$?", script.display()));
+        let write = run(format!("echo x >> '{}'; echo EXIT:$?", script.display()));
+        let arg = run(format!("cat '{}/arg.txt' 2>&1", ext.display()));
+        let cfg_write = run(format!(
+            "echo x >> '{}'; echo EXIT:$?",
+            cfg.join("opencode.json").display()
+        ));
+        fs::remove_file(&profile).ok();
+        assert!(exec.contains("RAN") && exec.contains("EXIT:0"), "{exec}");
+        assert!(
+            !write.contains("EXIT:0"),
+            "script must not be writable: {write}"
+        );
+        assert!(
+            !arg.contains("SECRET"),
+            "argument must stay unreadable: {arg}"
+        );
+        assert!(
+            !cfg_write.contains("EXIT:0"),
+            "config must not be writable: {cfg_write}"
+        );
+    }
+
+    /// #703: no grant when the OpenCode config dir sits in a writable tree
+    /// (the agent could rewrite it), nor for a directory plugin whose
+    /// `main` escapes the plugin dir.
+    #[test]
+    fn real_profile_refuses_opencode_writable_config_and_escaping_plugin() {
+        require_sandbox!();
+        let project = tempfile::Builder::new()
+            .prefix(".cplt-ocw-project-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        let project = fs::canonicalize(project.path()).unwrap();
+        let home = tempfile::Builder::new()
+            .prefix(".cplt-ocw-home-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        let home = fs::canonicalize(home.path()).unwrap();
+        let ext = home.join("ext");
+        let plug = ext.join("plug");
+        fs::create_dir_all(&plug).unwrap();
+        let script = ext.join("server.sh");
+        fs::write(&script, "#!/bin/sh\necho RAN\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(plug.join("package.json"), r#"{"main":"../server.sh"}"#).unwrap();
+        let config = |cfg: &Path, json: String| {
+            fs::create_dir_all(cfg).unwrap();
+            fs::write(cfg.join("opencode.json"), json).unwrap();
+        };
+        let mcp = format!(
+            r#"{{"mcp":{{"s":{{"type":"local","command":["{}"]}}}}}}"#,
+            script.display()
+        );
+        let check = |xdg: &Path| {
+            let mut agent_dirs = temp_env::with_var("XDG_CONFIG_HOME", Some(xdg), || {
+                cplt::agent::Agent::OpenCode.config_dirs(&home)
+            });
+            cplt::agent::drop_script_grants_under(&mut agent_dirs, std::slice::from_ref(&project));
+            let mut opts = default_opts(&project, &home);
+            opts.agent = cplt::agent::Agent::OpenCode;
+            opts.agent_dirs = &agent_dirs;
+            let profile = write_real_profile(&opts);
+            let out = run_sandboxed(&profile, &format!("'{}'; echo EXIT:$?", script.display())).0;
+            fs::remove_file(&profile).ok();
+            out
+        };
+        // Config dir inside the project: the MCP script gets nothing.
+        config(&project.join("xdg/opencode"), mcp.clone());
+        let out = check(&project.join("xdg"));
+        assert!(
+            !out.contains("RAN"),
+            "config in project must grant nothing: {out}"
+        );
+        // Directory plugin whose `main` is `../server.sh`: no grant.
+        let plugin = format!(r#"{{"plugin":["file://{}"]}}"#, plug.display());
+        config(&home.join("xdg/opencode"), plugin);
+        let out = check(&home.join("xdg"));
+        assert!(
+            !out.contains("RAN"),
+            "escaping plugin main must grant nothing: {out}"
+        );
+        // Control: the same MCP config outside any writable tree runs.
+        config(&home.join("xdg2/opencode"), mcp);
+        let out = check(&home.join("xdg2"));
+        assert!(out.contains("RAN"), "control must run: {out}");
+    }
+
     // ── .env file read denial ─────────────────────────────────────
 
     #[test]

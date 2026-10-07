@@ -473,6 +473,188 @@ fn copilot_hook_script_grants(root: &Path, home: &Path) -> Vec<AgentDir> {
     script_grants(script_paths(commands, home), root, home, &[])
 }
 
+/// Read + execute grants for OpenCode's `file://` plugins and local MCP
+/// server commands in the user config (`opencode.json`, `opencode.jsonc`,
+/// `config.json` in `config_dir`), as [`claude_hook_script_grants`] does for
+/// Claude hooks (#703). The config dir is granted read-only, so the agent
+/// cannot plant a path there. Project config is never read. macOS only, for
+/// the same reason as the Claude grant.
+fn opencode_script_grants(config_dir: &Path, home: &Path, writable: &[PathBuf]) -> Vec<AgentDir> {
+    if !cfg!(target_os = "macos") {
+        return vec![];
+    }
+    const FILES: [&str; 3] = ["opencode.json", "opencode.jsonc", "config.json"];
+    // The config files are trusted only because nothing on their path is
+    // agent-writable. Record every location they resolve through: the
+    // configured dir, each symlink hop, the resolved dir, and for each file
+    // read its own hops and resolved target (a dotfiles-managed
+    // `opencode.json` symlink is fine as long as it points outside every
+    // writable tree). If any of these sits in a project or `allow.write`
+    // tree, the agent could edit the config, or swap the dir with `mv`, and
+    // plant a path for the next launch; `drop_script_grants_under` then drops
+    // every grant.
+    let resolved = |p: &Path| {
+        symlink_locations(p)
+            .into_iter()
+            .chain(std::fs::canonicalize(p).ok())
+    };
+    let mut locs: Vec<PathBuf> = resolved(config_dir).collect();
+    let mut paths = vec![];
+    for f in FILES.iter().map(|f| config_dir.join(f)) {
+        if let Some(t) = read_small_regular_file(&f) {
+            locs.extend(resolved(&f));
+            paths.extend(opencode_script_paths(&t, home));
+        }
+    }
+    let mut out = script_grants(paths, config_dir, home, writable);
+    for g in &mut out {
+        g.via.extend(locs.iter().cloned());
+    }
+    out
+}
+
+/// Candidate paths in an OpenCode config: each `plugin[]` entry (string or
+/// `[spec, options]`) that is a `file://` URL, and the script token of each
+/// `mcp.<name>.command` array.
+fn opencode_script_paths(text: &str, home: &Path) -> Vec<PathBuf> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&strip_jsonc(text)) else {
+        return vec![];
+    };
+    let plugins = v
+        .get("plugin")
+        .and_then(|p| p.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p.as_str().or_else(|| p.get(0)?.as_str()))
+        .filter_map(|p| p.strip_prefix("file://"))
+        .filter_map(|p| expand_home(&percent_decode(p), home))
+        .filter_map(|p| {
+            if p.is_dir() {
+                plugin_entrypoint(&p)
+            } else {
+                Some(p)
+            }
+        });
+    let commands = v
+        .get("mcp")
+        .and_then(|m| m.as_object())
+        .into_iter()
+        .flat_map(|m| m.values())
+        .filter_map(|s| s.get("command")?.as_array())
+        .map(|c| {
+            c.iter()
+                .filter_map(|w| Some(w.as_str()?.to_string()))
+                .collect()
+        });
+    plugins.chain(script_paths(commands, home)).collect()
+}
+
+/// `%XX` decoding for the path of a `file://` URL, as `fileURLToPath` does.
+/// Invalid escapes are kept literally.
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = (b[i] == b'%')
+            .then(|| s.get(i + 1..i + 3))
+            .flatten()
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        if let Some(v) = hex {
+            out.push(v);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The file a directory plugin loads: `package.json` `main`, else
+/// `index.ts` or `index.js`. `None` when that file resolves outside `dir`
+/// (an absolute or `..` `main`, or a symlink out), so the grant cannot be
+/// pointed at an arbitrary file.
+fn plugin_entrypoint(dir: &Path) -> Option<PathBuf> {
+    let real_dir = std::fs::canonicalize(dir).ok()?;
+    let main = read_small_regular_file(&dir.join("package.json"))
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| Some(v.get("main")?.as_str()?.to_string()));
+    main.into_iter()
+        .chain(["index.ts".into(), "index.js".into()])
+        .map(|m| dir.join(m))
+        .find(|p| p.is_file())
+        .filter(|p| std::fs::canonicalize(p).is_ok_and(|r| r.starts_with(&real_dir)))
+}
+
+/// JSONC to JSON: drops `//` and `/* */` comments outside strings and
+/// trailing commas before `}` or `]`.
+fn strip_jsonc(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut in_str = false;
+    while let Some(c) = chars.next() {
+        if in_str {
+            out.push(c);
+            if c == '\\' {
+                out.extend(chars.next());
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match (c, chars.peek()) {
+            ('"', _) => {
+                in_str = true;
+                out.push(c);
+            }
+            ('/', Some('/')) => {
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        out.push(c);
+                        break;
+                    }
+                }
+            }
+            ('/', Some('*')) => {
+                chars.next();
+                let mut prev = ' ';
+                for c in chars.by_ref() {
+                    if prev == '*' && c == '/' {
+                        break;
+                    }
+                    prev = c;
+                }
+                out.push(' ');
+            }
+            (c @ ('}' | ']'), _) => {
+                let t = out.trim_end().len();
+                if out[..t].ends_with(',') {
+                    out.truncate(t - 1);
+                }
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// `~/` and `$HOME/` expansion; `None` unless the result is absolute.
+fn expand_home(w: &str, home: &Path) -> Option<PathBuf> {
+    let w = if let Some(rest) = w.strip_prefix("~/") {
+        home.join(rest)
+    } else if let Some(rest) = w
+        .strip_prefix("$HOME/")
+        .or_else(|| w.strip_prefix("${HOME}/"))
+    {
+        home.join(rest)
+    } else {
+        PathBuf::from(w)
+    };
+    w.is_absolute().then_some(w)
+}
+
 /// Read + exec grants for `paths`, minus anything under `root`/`writable`,
 /// credentials or unnameable in SBPL. See [`claude_hook_script_grants`].
 fn script_grants(
@@ -585,19 +767,7 @@ fn script_paths(commands: impl IntoIterator<Item = Vec<String>>, home: &Path) ->
     commands
         .into_iter()
         .filter_map(script_token)
-        .filter_map(|w| {
-            let w = if let Some(rest) = w.strip_prefix("~/") {
-                home.join(rest)
-            } else if let Some(rest) = w
-                .strip_prefix("$HOME/")
-                .or_else(|| w.strip_prefix("${HOME}/"))
-            {
-                home.join(rest)
-            } else {
-                PathBuf::from(w)
-            };
-            w.is_absolute().then_some(w)
-        })
+        .filter_map(|w| expand_home(&w, home))
         .collect()
 }
 
@@ -1640,8 +1810,10 @@ impl Agent {
                     .ok()
                     .map_or_else(|| home.join(".cache"), PathBuf::from);
                 let cache_dir = cache_base.join("opencode");
+                let writable = [data_dir.clone(), state_dir.clone(), cache_dir.clone()];
+                let scripts = opencode_script_grants(&config_dir, home, &writable);
 
-                vec![
+                let mut dirs = vec![
                     AgentDir {
                         path: config_dir,
                         write: false,
@@ -1689,7 +1861,9 @@ impl Agent {
                         create_dirs: vec![],
                         via: vec![],
                     },
-                ]
+                ];
+                dirs.extend(scripts);
+                dirs
             }
             Agent::Antigravity => {
                 // Antigravity stores project config under ~/.gemini/config
@@ -3005,6 +3179,33 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "macos")]
+    fn opencode_dir_plugin_entrypoint_must_stay_inside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        let cfg = home.join(".config/opencode");
+        let (abs, dotdot, link) = (home.join("abs"), home.join("dotdot"), home.join("link"));
+        for d in [&cfg, &abs, &dotdot, &link] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let secret = home.join("secret.sh");
+        std::fs::write(&secret, "x").unwrap();
+        let main = |d: &Path, m: &str| {
+            std::fs::write(d.join("package.json"), format!(r#"{{"main":"{m}"}}"#)).unwrap();
+        };
+        main(&abs, &secret.display().to_string());
+        main(&dotdot, "../secret.sh");
+        std::os::unix::fs::symlink(&secret, link.join("index.js")).unwrap();
+        std::fs::write(
+            cfg.join("opencode.json"),
+            r#"{"plugin":["file://~/abs","file://~/dotdot","file://~/link"]}"#,
+        )
+        .unwrap();
+        let got = opencode_script_grants(&cfg, &home, &[]);
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
     fn claude_hook_scripts_skip_files_under_symlinked_root() {
         let tmp = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(tmp.path()).unwrap();
@@ -3107,6 +3308,129 @@ mod tests {
         assert!(claude_hook_script_grants(tmp.path(), tmp.path(), &[]).is_empty());
         std::fs::write(tmp.path().join("settings.json"), "{not json").unwrap();
         assert!(claude_hook_script_grants(tmp.path(), tmp.path(), &[]).is_empty());
+    }
+
+    #[test]
+    fn strip_jsonc_drops_comments_and_trailing_commas() {
+        let t = "{\n // c\n \"a\": \"x//y /*z*/\", /* b */\n \"b\": [1,2,],\n}";
+        let v: serde_json::Value = serde_json::from_str(&strip_jsonc(t)).unwrap();
+        assert_eq!(v, serde_json::json!({"a": "x//y /*z*/", "b": [1, 2]}));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn opencode_script_grants_plugins_and_mcp_commands() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        let cfg = home.join(".config/opencode");
+        let data = home.join(".local/share/opencode");
+        let ext = home.join("ext");
+        for d in [&cfg, &data, &ext, &home.join(".ssh")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let f = |p: PathBuf| {
+            std::fs::write(&p, "x").unwrap();
+            p
+        };
+        let plugin = f(ext.join("plugin.js"));
+        let arr_plugin = f(ext.join("arr.js"));
+        let server = f(ext.join("server.js"));
+        let direct = f(ext.join("mcp.sh"));
+        let arg = f(ext.join("arg.txt"));
+        let key = f(home.join(".ssh/id_ed25519"));
+        let inside = f(data.join("x.sh"));
+        let project = f(ext.join("project.js"));
+        std::fs::create_dir_all(ext.join("my dir/pkg")).unwrap();
+        let spaced = f(ext.join("my dir/s.js"));
+        let pkg_main = f(ext.join("my dir/pkg/main.js"));
+        std::fs::write(ext.join("my dir/pkg/package.json"), r#"{"main":"main.js"}"#).unwrap();
+        std::fs::write(
+            ext.join("opencode.json"),
+            format!(r#"{{"plugin":["file://{}"]}}"#, project.display()),
+        )
+        .unwrap();
+        std::fs::write(
+            cfg.join("opencode.jsonc"),
+            format!(
+                r#"{{
+  // user config
+  "plugin": ["npm-pkg", "file://~/ext/plugin.js", ["file://{arr}", {{}}], "file://{key}", "file://~/ext/my%20dir/s.js", "file://~/ext/my%20dir/pkg",],
+  "mcp": {{
+    "a": {{"type": "local", "command": ["node", "--x", "{server}", "{arg}"]}},
+    "b": {{"type": "local", "command": ["$HOME/ext/mcp.sh"]}},
+    "c": {{"type": "local", "command": ["{inside}"]}},
+    "d": {{"type": "remote", "url": "https://x"}}, /* trailing */
+  }},
+}}"#,
+                arr = arr_plugin.display(),
+                key = key.display(),
+                server = server.display(),
+                arg = arg.display(),
+                inside = inside.display(),
+            ),
+        )
+        .unwrap();
+        let got = opencode_script_grants(&cfg, &home, &[data]);
+        assert!(
+            ["opencode.json", "config.json"]
+                .iter()
+                .all(|n| !cfg.join(n).exists() && got.iter().all(|d| d.path != cfg.join(n))),
+            "missing config files are neither granted nor created"
+        );
+        let mut paths: Vec<_> = got.iter().map(|d| d.path.clone()).collect();
+        paths.sort();
+        let mut want = vec![plugin, arr_plugin, server, direct, spaced, pkg_main];
+        want.sort();
+        assert_eq!(
+            paths, want,
+            "project config, args, ~/.ssh, writable dir skipped"
+        );
+        assert!(got.iter().all(|d| !d.write && d.process_exec));
+        // A config dir inside a writable tree grants nothing (#703).
+        let mut dirs = got.clone();
+        drop_script_grants_under(&mut dirs, &[home.join(".config")]);
+        assert!(dirs.is_empty(), "{dirs:?}");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn opencode_script_grants_follow_symlinked_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        let proj = home.join("proj");
+        let dots = home.join("dotfiles");
+        let ext = home.join("ext");
+        for d in [&proj, &dots, &ext, &home.join(".config")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let plugin = ext.join("p.js");
+        std::fs::write(&plugin, "x").unwrap();
+        let conf = format!(r#"{{"plugin":["file://{}"]}}"#, plugin.display());
+        let grants = |cfg: &Path| {
+            let mut g = opencode_script_grants(cfg, &home, &[]);
+            drop_script_grants_under(&mut g, std::slice::from_ref(&proj));
+            g
+        };
+        // 1. Config dir is a symlink into the project.
+        std::fs::create_dir_all(proj.join("dotcfg")).unwrap();
+        std::fs::write(proj.join("dotcfg/config.json"), &conf).unwrap();
+        let cfg1 = home.join(".config/oc1");
+        std::os::unix::fs::symlink(proj.join("dotcfg"), &cfg1).unwrap();
+        assert!(grants(&cfg1).is_empty());
+        // 2. Config file is a symlink into the project.
+        let cfg2 = home.join(".config/oc2");
+        std::fs::create_dir_all(&cfg2).unwrap();
+        std::fs::write(proj.join("oc.json"), &conf).unwrap();
+        std::os::unix::fs::symlink(proj.join("oc.json"), cfg2.join("opencode.json")).unwrap();
+        assert!(grants(&cfg2).is_empty());
+        // 3. Dotfiles symlink outside every writable tree is still trusted.
+        let cfg3 = home.join(".config/oc3");
+        std::fs::create_dir_all(&cfg3).unwrap();
+        std::fs::write(dots.join("oc.json"), &conf).unwrap();
+        std::os::unix::fs::symlink(dots.join("oc.json"), cfg3.join("opencode.json")).unwrap();
+        let g = grants(&cfg3);
+        assert_eq!(g.len(), 1, "{g:?}");
+        assert_eq!(g[0].path, plugin);
     }
 
     #[test]
