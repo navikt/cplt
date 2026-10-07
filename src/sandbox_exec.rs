@@ -1533,7 +1533,12 @@ pub fn exec(
         ) {
             BwrapOutcome::Ran(code) => return code,
             BwrapOutcome::Fallback => {
-                ui::warn("Bubblewrap could not start; using Landlock + seccomp only.");
+                ui::warn(if sandbox.agent == crate::agent::Agent::Claude {
+                    "Bubblewrap could not start; using Landlock + seccomp only \
+                     (Claude hook script grants are not applied)."
+                } else {
+                    "Bubblewrap could not start; using Landlock + seccomp only."
+                });
                 if wrapper.deny_mask_count > 0 {
                     // prepare() already announced these as enforced.
                     ui::warn(&format!(

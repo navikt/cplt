@@ -2419,6 +2419,29 @@ fn drop_claude_hook_grants(
     dropped
 }
 
+/// #705: bubblewrap re-binds `settings.json` read-only only when it exists
+/// (a bind needs a source). A missing one could be created by the agent in
+/// the writable Claude root, and its hooks would be granted read+execute on
+/// the next launch. Seed it with `{}` (Claude's own default) so the read-only
+/// bind always covers it. Never overwrites.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn seed_claude_settings(config: &SandboxConfig) {
+    if config.agent != Agent::Claude {
+        return;
+    }
+    for dir in config
+        .agent_dirs
+        .iter()
+        .filter(|d| d.write && d.path.is_dir())
+    {
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.path.join("settings.json"))
+            .and_then(|mut f| std::io::Write::write_all(&mut f, b"{}\n"));
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn prepare_impl(
     config: &SandboxConfig,
@@ -2513,8 +2536,15 @@ fn prepare_impl(
         mut ro_protect,
         mut pins,
         deny_masks,
-    } = bwrap_plan(config, extra_git_dirs, canonical_grants);
+    } = {
+        if !inspect_only {
+            seed_claude_settings(config);
+        }
+        bwrap_plan(config, extra_git_dirs, canonical_grants)
+    };
     let mut profile_text = landlock_mod::describe_policy(&policy);
+    // Rebuilt below if the hook grants are dropped on a Landlock-only host.
+    let policy_text_len = profile_text.len();
 
     // A withdrawn grant another rule quietly gives back is said out loud
     // (#324). Resolved the way `canonicalize_agent_dirs` resolves the rule.
@@ -2674,6 +2704,9 @@ fn prepare_impl(
             cleared.push(rule.path.display().to_string());
         }
         if !dropped.is_empty() {
+            // `--print-profile` / `cplt check` must not list the dropped grant.
+            profile_text =
+                landlock_mod::describe_policy(&policy) + &profile_text[policy_text_len..];
             ui::warn(&format!(
                 "Claude hook script grant on {} is NOT applied without Bubblewrap: \
                  Landlock alone leaves settings.json writable, so the agent could \
@@ -3240,6 +3273,38 @@ mod tests {
 
         let error = validate_pnpm_tool_dirs(&config).expect_err("symlink must be refused");
         assert!(error.contains("resolves through a symlink"));
+    }
+
+    #[test]
+    fn claude_settings_seeded_only_when_missing() {
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir(&claude).unwrap();
+        let dirs = [AgentDir {
+            path: claude.clone(),
+            write: true,
+            map_exec: false,
+            process_exec: true,
+            write_files: vec![],
+            create_dirs: vec![],
+        }];
+        let mut config = test_config(home.path(), &[]);
+        config.agent_dirs = &dirs;
+        config.agent = Agent::Copilot;
+        seed_claude_settings(&config);
+        assert!(!claude.join("settings.json").exists());
+        config.agent = Agent::Claude;
+        seed_claude_settings(&config);
+        assert_eq!(
+            std::fs::read_to_string(claude.join("settings.json")).unwrap(),
+            "{}\n"
+        );
+        std::fs::write(claude.join("settings.json"), "{\"a\":1}").unwrap();
+        seed_claude_settings(&config);
+        assert_eq!(
+            std::fs::read_to_string(claude.join("settings.json")).unwrap(),
+            "{\"a\":1}"
+        );
     }
 
     #[test]
