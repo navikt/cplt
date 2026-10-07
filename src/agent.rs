@@ -2482,6 +2482,26 @@ pub fn deny_copilot_dir_exec(dirs: &mut [AgentDir], home: &Path) -> bool {
 /// brings the built-in agent dirs in line. Paths that cannot be resolved (a dir
 /// the caller has not created yet, a dangling link) are left as-is so the
 /// caller still emits a rule for the literal path rather than dropping it.
+/// Drop hook/MCP script grants (file-level, exec-only) that sit under a path
+/// the sandbox already makes writable: the project, `--repo-dir` roots,
+/// `allow.write` and the agent's own writable dirs. Those scripts are already
+/// readable and run under the normal rules for that tree; an exec-only grant
+/// would write-deny the script and pin its parent, so a developer could not
+/// edit their own MCP server or hook. Call after [`canonicalize_agent_dirs`].
+pub fn drop_script_grants_under(dirs: &mut Vec<AgentDir>, writable: &[PathBuf]) {
+    let mut roots: Vec<PathBuf> = writable
+        .iter()
+        .chain(dirs.iter().filter(|d| d.write).map(|d| &d.path))
+        .flat_map(|p| [p.clone(), std::fs::canonicalize(p).unwrap_or_default()])
+        .filter(|p| !p.as_os_str().is_empty())
+        .collect();
+    roots.dedup();
+    dirs.retain(|d| {
+        let script = !d.write && d.process_exec && !d.map_exec && d.path.is_file();
+        !(script && roots.iter().any(|r| d.path.starts_with(r)))
+    });
+}
+
 pub fn canonicalize_agent_dirs(dirs: &mut [AgentDir]) {
     for dir in dirs {
         if let Ok(resolved) = std::fs::canonicalize(&dir.path) {
@@ -5012,5 +5032,35 @@ mod tests {
         let candidate = Path::new("/home/user/.asdf/shims/copilot");
         let result = resolve_mise_shim(candidate, "copilot");
         let _ = result;
+    }
+
+    /// A script inside a writable tree (the project) keeps no exec-only grant,
+    /// so it is not write-denied; one outside keeps its grant.
+    #[test]
+    fn script_grants_under_writable_paths_are_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let proj = base.join("proj");
+        std::fs::create_dir_all(proj.join("mcp")).unwrap();
+        let inside = proj.join("mcp/server.js");
+        let outside = base.join("hook.sh");
+        let bin = base.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for f in [&inside, &outside] {
+            std::fs::write(f, "").unwrap();
+        }
+        let grant = |p: &Path| AgentDir {
+            path: p.to_path_buf(),
+            write: false,
+            map_exec: false,
+            process_exec: true,
+            write_files: vec![],
+            create_dirs: vec![],
+        };
+        let mut dirs = vec![grant(&inside), grant(&outside), grant(&bin)];
+        drop_script_grants_under(&mut dirs, &[proj]);
+        let paths: Vec<_> = dirs.iter().map(|d| d.path.clone()).collect();
+        // `bin` is a directory grant (OpenCode's shape), never dropped here.
+        assert_eq!(paths, vec![outside, bin]);
     }
 }
