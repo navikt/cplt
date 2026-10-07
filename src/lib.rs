@@ -90,6 +90,7 @@ pub(crate) fn with_env_lock_no_xdg<R>(f: impl FnOnce() -> R) -> R {
             "XDG_STATE_HOME",
             "XDG_CACHE_HOME",
             "XDG_RUNTIME_DIR",
+            "OPENCODE_CONFIG_DIR",
         ],
         f,
     )

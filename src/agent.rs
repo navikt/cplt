@@ -1503,10 +1503,8 @@ impl Agent {
             // writable grants are the data, state and cache dirs, which hold
             // sessions, logs and downloaded binaries and no skills; the one
             // exec-bearing path among them, `~/.cache/opencode/bin`, is its own
-            // read-only `AgentDir`. A relocated `OPENCODE_CONFIG_DIR` inherits
-            // the same posture — nav-pilot points it at a pinned payload and
-            // hands cplt `--allow-read` on it, which is read-only by
-            // construction. (These
+            // read-only `AgentDir`. A relocated `OPENCODE_CONFIG_DIR` gets
+            // the same read-only grant (#718). (These
             // denies are joined onto writable dirs only, so an entry here would
             // be inert anyway.) The data and state dirs hold sessions, logs and
             // downloaded model weights — nothing goose auto-executes.
@@ -1844,7 +1842,28 @@ impl Agent {
                     .map_or_else(|| home.join(".cache"), PathBuf::from);
                 let cache_dir = cache_base.join("opencode");
                 let writable = [data_dir.clone(), state_dir.clone(), cache_dir.clone()];
-                let scripts = opencode_script_grants(&config_dir, home, &writable);
+                let mut scripts = opencode_script_grants(&config_dir, home, &writable);
+                // `OPENCODE_CONFIG_DIR` adds (v1) or replaces (v2) the config
+                // dir; v2's overlay links into it. Granted like the default dir,
+                // read-only, its scripts under the same provenance rules (#718).
+                if let Some(custom) = std::env::var_os("OPENCODE_CONFIG_DIR")
+                    .map(PathBuf::from)
+                    .filter(|p| p.is_absolute() && *p != config_dir)
+                {
+                    scripts.extend(opencode_script_grants(&custom, home, &writable));
+                    scripts.insert(
+                        0,
+                        AgentDir {
+                            path: custom,
+                            write: false,
+                            map_exec: false,
+                            process_exec: false,
+                            write_files: vec![],
+                            create_dirs: vec![],
+                            via: vec![],
+                        },
+                    );
+                }
 
                 let mut dirs = vec![
                     AgentDir {

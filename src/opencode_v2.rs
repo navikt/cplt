@@ -23,7 +23,7 @@
 //! during the session is not seen until the next one.
 
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 /// What the launch adds for a v2 session.
@@ -122,7 +122,8 @@ fn free_port() -> std::io::Result<u16> {
 /// plus the `.claude`, `.agents` and `.opencode` entries in each, and treats
 /// any error other than "not found" as fatal. Those dir entries themselves
 /// become readable (a listing of names), at the spelled and the resolved
-/// path; their contents stay denied.
+/// path; their contents stay denied. An existing `opencode.json(c)` there
+/// is a config v2 loads, so a plain one is readable.
 ///
 /// The host `service.json` files are denied at the spelled and the resolved
 /// path. Every ancestor is pinned against unlink, so a writable one (the
@@ -156,6 +157,16 @@ fn profile_tail(
                 reads.push(real);
             }
             reads.push(entry);
+        }
+        // Discovery also resolves each `opencode.json(c)` and reads it as a
+        // config (#718). Granted only as a plain file with one link: a symlink
+        // or a hard link the agent planted could name any file, ~/.ssh too.
+        for name in ["opencode.json", "opencode.jsonc"] {
+            let file = dir.join(name);
+            if std::fs::symlink_metadata(&file).is_ok_and(|m| m.is_file() && m.nlink() == 1) {
+                reads.extend(std::fs::canonicalize(&file));
+                reads.push(file);
+            }
         }
     }
     reads.sort();
@@ -264,6 +275,39 @@ mod tests {
         let cat = state.join("service.json");
         assert!(!run(&guarded, &["/bin/cat", cat.to_str().unwrap()]));
         assert!(run("(version 1)(allow default)", &mv), "control");
+    }
+
+    /// Kernel check (#718): a plain `opencode.json` in an ancestor of the
+    /// launch dir is readable; one that is a symlink or a hard link is not
+    /// granted, so neither reaches the file it points at.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[allow(clippy::disallowed_methods)] // fixed /usr/bin/sandbox-exec, /bin/cat
+    fn ancestor_opencode_json_is_readable_only_as_a_plain_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let (a, b, c) = (root.join("a"), root.join("a/b"), root.join("a/b/c"));
+        std::fs::create_dir_all(&c).unwrap();
+        std::fs::write(a.join("opencode.json"), "PLAIN").unwrap();
+        std::fs::write(root.join("secret"), "SECRET").unwrap();
+        std::os::unix::fs::symlink(root.join("secret"), b.join("opencode.json")).unwrap();
+        std::fs::hard_link(root.join("secret"), c.join("opencode.json")).unwrap();
+        let tail = profile_tail(&root, &c, &[root.join("x/service.json")], 1).unwrap();
+        let profile = format!(
+            "(version 1)(allow default)(deny file-read-data (subpath \"{}\")){tail}",
+            root.display()
+        );
+        let cat = |p: &Path| {
+            let o = std::process::Command::new("/usr/bin/sandbox-exec")
+                .args(["-p", &profile, "/bin/cat"])
+                .arg(p)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).into_owned()
+        };
+        assert_eq!(cat(&a.join("opencode.json")), "PLAIN");
+        assert_eq!(cat(&b.join("opencode.json")), "");
+        assert_eq!(cat(&c.join("opencode.json")), "");
     }
 
     #[test]
