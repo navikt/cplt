@@ -18,6 +18,7 @@ pub mod git;
 pub mod gradle_init;
 pub mod init;
 pub mod link;
+pub mod opencode_v2;
 pub mod proxy;
 pub mod repo_config;
 pub mod sandbox;

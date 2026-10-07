@@ -3441,7 +3441,16 @@ fn agent_allowlist(
         && !deny_env
             .iter()
             .any(|d| d == "GH_TOKEN" || d == "OPENCODE_AUTH_CONTENT");
-    domains.extend(agent.provider_domains(&home, handover));
+    let v2 = agent == agent::Agent::OpenCode
+        && home.is_absolute()
+        && agent
+            .resolve_binary()
+            .is_ok_and(|bin| agent::is_opencode_v2(&bin, &home));
+    if v2 {
+        domains.extend(agent::opencode_v2_provider_domains(&home));
+    } else {
+        domains.extend(agent.provider_domains(&home, handover));
+    }
     domains.into_iter().map(str::to_string).collect()
 }
 
@@ -4255,12 +4264,17 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // can be included in the sandbox profile. Failure is deferred —
     // --print-profile doesn't need the binary.
     let agent_bin_result = active_agent.resolve_binary();
-    // #710: v2 runs tool calls through a background service that may live
-    // outside the sandbox. Refuse rather than launch it.
-    // --print-profile never runs the agent, so it is left alone.
-    if let (agent::Agent::OpenCode, Ok(bin)) = (active_agent, &agent_bin_result)
-        && !cli.print_profile
-        && agent::is_opencode_v2(bin, &home_dir)
+    // #710: v2 runs tool calls through a background service. On macOS each
+    // session gets its own service inside the sandbox (see `opencode_v2`); the
+    // Linux backend cannot deny the host service's files inside granted dirs,
+    // so it still refuses. --print-profile never runs the agent.
+    let opencode_v2 = matches!(
+        (active_agent, &agent_bin_result),
+        (agent::Agent::OpenCode, Ok(bin)) if !cli.print_profile && agent::is_opencode_v2(bin, &home_dir)
+    );
+    if opencode_v2
+        && cfg!(not(target_os = "macos"))
+        && let Ok(bin) = &agent_bin_result
     {
         let s = bin.to_string_lossy();
         let fix = if s.contains("node_modules") || s.contains("@opencode") {
@@ -4269,7 +4283,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             "Stay on 1.x: reinstall OpenCode 1.x (npm package opencode-ai@1)."
         };
         bail!(
-            "OpenCode v2 ({}) is not supported by cplt yet: \
+            "OpenCode v2 ({}) is not supported by cplt on Linux yet: \
              https://github.com/navikt/cplt/issues/710\n{fix}",
             bin.display()
         );
@@ -4285,7 +4299,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         mut prepared,
         policy,
         proxy_handle,
-        scratch_guard: _scratch_guard,
+        scratch_guard,
         pnpm_shadow_guard: _pnpm_shadow_guard,
         #[cfg(target_os = "macos")]
             playwright_socket_guard: _playwright_socket_guard,
@@ -4324,6 +4338,30 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             "cplt is already running (recursion detected). \
              Ensure the real agent binary is in PATH and not aliased to cplt."
         );
+    }
+
+    if opencode_v2 {
+        let Some(scratch) = scratch_guard.as_ref().map(cplt::scratch::ScratchDir::path) else {
+            bail!(
+                "OpenCode v2 keeps its per-session service config in the scratch dir; \
+                 drop --no-scratch-dir (or sandbox.scratch_dir = false) to run it."
+            );
+        };
+        let session = cplt::opencode_v2::prepare(scratch, &home_dir, &launch_dir)
+            .map_err(|e| anyhow::anyhow!("Cannot set up the OpenCode v2 session: {e}"))?;
+        // These variables carry the session's isolation; dropping them would
+        // point OpenCode back at the host service.
+        if let Some((name, _)) = session
+            .env
+            .iter()
+            .find(|(k, _)| resolved.deny_env.contains(k))
+        {
+            bail!(
+                "deny.env names {name}, which cplt must set for an OpenCode v2 session \
+                 (#710). Remove it from deny.env (check the repo's .cplt.toml) to run v2."
+            );
+        }
+        prepared.add_opencode_v2(session);
     }
 
     // #514: shim an agent installed since the last sync. A no-op unless the
