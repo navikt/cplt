@@ -1426,3 +1426,8 @@ cplt --allow-write /dev -- -p "run the pexpect suite"
 One flag is enough: an `--allow-write` grant also emits the matching read allow, and `openpty()` needs both because it opens the new slave read-write.
 
 Be clear about what that flag buys: it restores read and write on every device node, including the terminals of your other windows. For the length of that session a compromised agent can print whatever it likes into them, set your clipboard, and read what you type in them. Prefer the first option, and keep the second for a single run rather than putting it in `config.toml`.
+
+
+## Stopping cplt from a script
+
+cplt ignores SIGINT while the agent runs, because Ctrl-C already reaches the agent through the terminal. To stop cplt from a script, send SIGTERM, which cplt passes on to the agent.

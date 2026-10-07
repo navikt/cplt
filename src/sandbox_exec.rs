@@ -1084,10 +1084,28 @@ pub(crate) fn which_binary(name: &str) -> Option<PathBuf> {
 /// Ignore SIGTTOU/SIGTTIN — copilot (Node.js) may manipulate terminal
 /// settings (raw mode), and when the child exits the terminal state can
 /// cause these signals to be sent to us.
+///
+/// Also catches SIGINT/SIGQUIT, before spawn so no window is left. Ctrl-C and
+/// Ctrl-\ already reach the child: it shares our foreground process group, so
+/// forwarding would deliver them twice. A no-op handler rather than SIG_IGN
+/// (which the child would inherit), so cplt outlives the child and its cleanup
+/// (scratch dir, service registrations) runs. Not restored afterwards, since
+/// that cleanup runs later. SIGINT from outside the terminal is not forwarded;
+/// use SIGTERM to stop cplt from a script.
 fn ignore_terminal_stop_signals() {
+    extern "C" fn ignore_signal(_: i32) {}
+
     unsafe {
         libc::signal(libc::SIGTTOU, libc::SIG_IGN);
         libc::signal(libc::SIGTTIN, libc::SIG_IGN);
+        libc::signal(
+            libc::SIGINT,
+            ignore_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGQUIT,
+            ignore_signal as *const () as libc::sighandler_t,
+        );
     }
 }
 
