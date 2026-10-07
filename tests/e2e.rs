@@ -9544,4 +9544,339 @@ paths = [
         );
         assert!(agent.join("bin").is_dir() && agent.join("extensions").is_dir());
     }
+
+    /// #710 OpenCode v2 sessions, end to end through the real sandbox. The
+    /// agent is a stub: it answers `--version` like v2 (so cplt takes the v2
+    /// path) and otherwise runs its argument as a shell script inside the
+    /// sandbox, so each probe tests cplt's real profile and environment. HOME
+    /// is a fake one under the real HOME (deny-by-default, unlike TMPDIR).
+    mod opencode_v2 {
+        use super::*;
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        const STUB: &str = "#!/bin/sh\n[ \"$1\" = --version ] && { echo opencode v2.0.24; exit 0; }\nexec /bin/sh -c \"$1\"\n";
+        pub(super) const SECRET: &str = "HOST-SECRET";
+
+        pub(super) struct Home {
+            _dir: tempfile::TempDir,
+            pub(super) h: PathBuf,
+            pub(super) proj: PathBuf,
+            pub(super) bin: PathBuf,
+        }
+
+        /// A fake HOME with host service files, a user config and the
+        /// discovery dirs v2 lists at startup. `bin` is where `opencode` goes.
+        pub(super) fn home() -> Home {
+            let dir = home_temp_dir("ocv2");
+            let h = std::fs::canonicalize(dir.path()).unwrap();
+            let w = |rel: &str, body: &str| {
+                let p = h.join(rel);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(p, body).unwrap();
+            };
+            w(".config/opencode/opencode.json", "{}");
+            w(".config/opencode/service.json", SECRET);
+            w(".config/git/config", "");
+            w(".local/state/opencode/service.json", SECRET);
+            for d in [".claude", ".agents", ".opencode"] {
+                w(&format!("{d}/secret"), SECRET);
+            }
+            let proj = h.join("work/proj");
+            std::fs::create_dir_all(&proj).unwrap();
+            // Its own repo, so the project is not whatever repo holds the real HOME.
+            assert!(git_ok(&proj, &["init", "-q"]));
+            let bin = h.join(".opencode/bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            Home {
+                _dir: dir,
+                h,
+                proj,
+                bin,
+            }
+        }
+
+        fn stub_home() -> Home {
+            let home = home();
+            let stub = home.bin.join("opencode");
+            std::fs::write(&stub, STUB).unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            home
+        }
+
+        impl Home {
+            pub(super) fn cmd(&self, args: &[&str]) -> Command {
+                let mut cmd = cplt_cmd();
+                cmd.current_dir(&self.proj)
+                    .env("HOME", &self.h)
+                    .env("PATH", format!("{}:/usr/bin:/bin", self.bin.display()));
+                for v in [
+                    "XDG_CONFIG_HOME",
+                    "XDG_DATA_HOME",
+                    "XDG_STATE_HOME",
+                    "XDG_CACHE_HOME",
+                    "OPENCODE_CONFIG_DIR",
+                ] {
+                    cmd.env_remove(v);
+                }
+                cmd.args(["--yes", "--agent", "opencode", "--"]).args(args);
+                cmd
+            }
+
+            /// Run `script` inside the sandbox: (stdout, stderr, exit code).
+            fn sh(&self, script: &str) -> (String, String, Option<i32>) {
+                let o = self.cmd(&[script]).output().expect("cplt should run");
+                (
+                    String::from_utf8_lossy(&o.stdout).into_owned(),
+                    String::from_utf8_lossy(&o.stderr).into_owned(),
+                    o.status.code(),
+                )
+            }
+        }
+
+        /// The scratch dir the session ran in, from the XDG_STATE_HOME it printed.
+        fn scratch_of(state: &str) -> PathBuf {
+            PathBuf::from(
+                state
+                    .trim()
+                    .strip_suffix("/opencode-v2/state")
+                    .expect(state),
+            )
+        }
+
+        #[test]
+        fn launches_and_propagates_the_exit_code() {
+            require_sandbox!();
+            let (out, err, code) = stub_home().sh("echo RAN; exit 7");
+            assert_eq!(code, Some(7), "{err}");
+            assert!(out.contains("RAN"), "{out}\n{err}");
+            assert!(!err.contains("issues/710"), "{err}");
+        }
+
+        #[test]
+        fn env_points_at_the_private_session() {
+            require_sandbox!();
+            let home = stub_home();
+            let o = home
+                .cmd(&["env"])
+                .env("OPENCODE_AUTH_CONTENT", "AUTH-CANARY")
+                .output()
+                .unwrap();
+            let out = String::from_utf8_lossy(&o.stdout);
+            let err = String::from_utf8_lossy(&o.stderr);
+            assert!(o.status.success(), "{err}");
+            let var = |k: &str| {
+                out.lines()
+                    .find_map(|l| l.strip_prefix(&format!("{k}=")))
+                    .unwrap_or_else(|| panic!("{k} unset:\n{out}"))
+                    .to_string()
+            };
+            let state = var("XDG_STATE_HOME");
+            assert!(state.ends_with("/opencode-v2/state"), "{state}");
+            let config = var("XDG_CONFIG_HOME");
+            assert!(config.ends_with("/opencode-v2/config"), "{config}");
+            assert_eq!(var("OPENCODE_CONFIG_DIR"), format!("{config}/opencode"));
+            assert_eq!(var("OPENCODE_DISABLE_MODELS_FETCH"), "1");
+            assert_eq!(var("OPENCODE_DISABLE_AUTOUPDATE"), "1");
+            assert!(!out.contains("OPENCODE_AUTH_CONTENT"), "{out}");
+        }
+
+        #[test]
+        fn overlay_holds_cplts_service_json_and_links_the_rest() {
+            require_sandbox!();
+            let home = stub_home();
+            let (out, err, code) = home.sh(r#"o="$XDG_CONFIG_HOME/opencode"
+                [ -L "$o/service.json" ] && echo SVC-IS-LINK
+                echo "MODE=$(stat -f %Lp "$o/service.json")"
+                echo "SVC=$(cat "$o/service.json")"
+                echo "OC=$(readlink "$o/opencode.json")"
+                echo "GIT=$(readlink "$XDG_CONFIG_HOME/git")""#);
+            assert_eq!(code, Some(0), "{err}");
+            assert!(!out.contains("SVC-IS-LINK"), "{out}");
+            assert!(out.contains("MODE=600"), "{out}");
+            let svc = out.lines().find_map(|l| l.strip_prefix("SVC=")).unwrap();
+            let v: serde_json::Value = serde_json::from_str(svc).expect(svc);
+            assert!(v["port"].as_u64().is_some_and(|p| p != 49374), "{svc}");
+            assert_eq!(v["password"].as_str().unwrap().len(), 32, "{svc}");
+            let user = home.h.join(".config");
+            let oc = format!("OC={}/opencode/opencode.json", user.display());
+            assert!(out.contains(&oc), "{out}");
+            assert!(
+                out.contains(&format!("GIT={}/git", user.display())),
+                "{out}"
+            );
+        }
+
+        /// Host service files stay unreadable, their dirs cannot be renamed
+        /// away, the default service port is closed and the session's is open.
+        #[test]
+        fn sandbox_denies_the_host_service() {
+            require_sandbox!();
+            let home = stub_home();
+            // Something must listen on 49374 for a refused connect to mean
+            // anything: hold it, unless a host service already does.
+            let _held = std::net::TcpListener::bind("127.0.0.1:49374");
+            let (out, err, code) = home.sh(&format!(
+                r#"h={h}
+                cat "$h/.local/state/opencode/service.json"
+                cat "$h/.config/opencode/service.json"
+                mv "$h/.local/state/opencode" "$h/.local/state/moved" && echo MOVED
+                mv "$h/.config/opencode" "$h/.config/moved" && echo MOVED
+                P=$(sed 's/.*"port":\([0-9]*\).*/\1/' "$XDG_CONFIG_HOME/opencode/service.json")
+                /usr/bin/nc -l 127.0.0.1 "$P" >/dev/null & sleep 0.5
+                /usr/bin/nc -z -G 2 127.0.0.1 "$P" && echo SESSION-PORT-OPEN
+                /usr/bin/nc -z -G 2 127.0.0.1 49374 && echo DEFAULT-PORT-OPEN
+                kill $! 2>/dev/null; exit 0"#,
+                h = home.h.display()
+            ));
+            assert_eq!(code, Some(0), "{err}");
+            assert!(!out.contains(SECRET), "{out}");
+            assert!(!out.contains("MOVED"), "{out}");
+            assert!(out.contains("SESSION-PORT-OPEN"), "{out}\n{err}");
+            assert!(!out.contains("DEFAULT-PORT-OPEN"), "{out}");
+            assert!(home.h.join(".local/state/opencode/service.json").exists());
+        }
+
+        /// A dotfiles-style `~/.config/opencode` symlink: the resolved file is
+        /// denied too.
+        #[test]
+        fn sandbox_denies_host_service_json_behind_a_symlinked_config_dir() {
+            require_sandbox!();
+            let home = stub_home();
+            let dot = home.h.join("dotfiles/opencode");
+            std::fs::create_dir_all(dot.parent().unwrap()).unwrap();
+            std::fs::rename(home.h.join(".config/opencode"), &dot).unwrap();
+            symlink(&dot, home.h.join(".config/opencode")).unwrap();
+            let (out, err, code) = home.sh(&format!(
+                "cat {0}/.config/opencode/service.json {1}/service.json; exit 0",
+                home.h.display(),
+                dot.display()
+            ));
+            assert_eq!(code, Some(0), "{err}");
+            assert!(!out.contains(SECRET), "{out}");
+        }
+
+        /// v2's startup discovery lists $HOME and its .claude, .agents and
+        /// .opencode entries; their contents stay denied.
+        #[test]
+        fn startup_listings_are_allowed_contents_denied() {
+            require_sandbox!();
+            let home = stub_home();
+            let (out, err, code) = home.sh(&format!(
+                r#"cd /; for d in {h} {h}/.claude {h}/.agents {h}/.opencode; do
+                  ls "$d" >/dev/null && echo "LS-OK $d"; cat "$d/secret" 2>/dev/null
+                done; exit 0"#,
+                h = home.h.display()
+            ));
+            assert_eq!(code, Some(0), "{err}");
+            for d in ["", "/.claude", "/.agents", "/.opencode"] {
+                let want = format!("LS-OK {}{d}\n", home.h.display());
+                assert!(out.contains(&want), "{want}\n{out}\n{err}");
+            }
+            assert!(!out.contains(SECRET), "{out}");
+        }
+
+        #[test]
+        fn ancestor_opencode_json_symlink_is_refused() {
+            require_sandbox!();
+            let home = stub_home();
+            let link = home.h.join("work/opencode.json");
+            symlink(home.h.join(".claude/secret"), &link).unwrap();
+            let (_, err, code) = home.sh("echo RAN");
+            assert_ne!(code, Some(0), "{err}");
+            assert!(err.contains(&link.display().to_string()), "{err}");
+            std::fs::remove_file(&link).unwrap();
+            // In the project root (already readable) a link is fine.
+            symlink(
+                home.h.join(".claude/secret"),
+                home.proj.join("opencode.json"),
+            )
+            .unwrap();
+            let (out, err, code) = home.sh("echo RAN");
+            assert_eq!(code, Some(0), "{err}");
+            assert!(out.contains("RAN"));
+        }
+
+        #[test]
+        fn opencode_config_dir_on_ssh_is_refused() {
+            require_sandbox!();
+            let home = stub_home();
+            let ssh = home.h.join(".ssh");
+            std::fs::create_dir_all(&ssh).unwrap();
+            let o = home
+                .cmd(&["echo RAN"])
+                .env("OPENCODE_CONFIG_DIR", &ssh)
+                .output()
+                .unwrap();
+            let err = String::from_utf8_lossy(&o.stderr);
+            assert!(!o.status.success(), "{err}");
+            assert!(err.contains("OPENCODE_CONFIG_DIR"), "{err}");
+            assert!(!String::from_utf8_lossy(&o.stdout).contains("RAN"));
+        }
+
+        #[test]
+        fn concurrent_sessions_get_their_own_service() {
+            require_sandbox!();
+            let home = stub_home();
+            let script = r#"cat "$XDG_CONFIG_HOME/opencode/service.json"; sleep 1"#;
+            let spawn = || {
+                home.cmd(&[script])
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            };
+            let (a, b) = (spawn(), spawn());
+            let svc = |c: std::process::Child| -> serde_json::Value {
+                let o = c.wait_with_output().unwrap();
+                serde_json::from_slice(&o.stdout).unwrap()
+            };
+            let (a, b) = (svc(a), svc(b));
+            assert_ne!(a["port"], b["port"]);
+            assert_ne!(a["password"], b["password"]);
+        }
+
+        #[test]
+        fn session_dir_is_removed_after_exit() {
+            require_sandbox!();
+            let (out, err, code) = stub_home().sh("echo $XDG_STATE_HOME");
+            assert_eq!(code, Some(0), "{err}");
+            let scratch = scratch_of(&out);
+            assert!(!scratch.exists(), "{} left behind", scratch.display());
+        }
+
+        #[test]
+        fn session_dir_is_removed_after_sigint() {
+            require_sandbox!();
+            let home = stub_home();
+            let mut c = home.cmd(&["echo $XDG_STATE_HOME; exec sleep 30"]);
+            let (scratch, status) = interrupt(&mut c);
+            assert!(!status.success());
+            assert!(!scratch.exists(), "{} left behind", scratch.display());
+        }
+
+        /// Start `cmd` in its own process group, wait for its first stdout
+        /// line (the session's XDG_STATE_HOME), then SIGINT the group the way
+        /// a terminal Ctrl-C does. Returns the scratch dir and cplt's status.
+        pub(super) fn interrupt(cmd: &mut Command) -> (PathBuf, std::process::ExitStatus) {
+            use std::io::BufRead;
+            use std::os::unix::process::CommandExt;
+            let mut c = cmd
+                .stdout(std::process::Stdio::piped())
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(c.stdout.take().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let scratch = scratch_of(&line);
+            assert!(scratch.exists(), "{line}");
+            let pg = format!("-{}", c.id());
+            let kill = Command::new("/bin/kill")
+                .args(["-INT", "--", &pg])
+                .status()
+                .unwrap();
+            assert!(kill.success());
+            (scratch, c.wait().unwrap())
+        }
+    }
 }
