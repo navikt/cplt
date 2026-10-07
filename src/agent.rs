@@ -289,6 +289,29 @@ fn opencode_auth_json(home: &Path) -> Option<PathBuf> {
     Some(data_base.join("opencode/auth.json"))
 }
 
+/// Does OpenCode v2's credential store hold a github.com Copilot login?
+///
+/// Opened read-only by the system sqlite3, and only the integration id and
+/// the enterprise marker are selected: no secret leaves the database. A
+/// missing file, a 1.x database without the table or a failed run is "no".
+#[allow(clippy::disallowed_methods)] // fixed absolute /usr/bin/sqlite3
+fn opencode_db_has_copilot(db: &Path) -> bool {
+    if !db.is_file() {
+        return false;
+    }
+    std::process::Command::new("/usr/bin/sqlite3")
+        .args(["-readonly", "-batch"])
+        .arg(db)
+        .arg(
+            "SELECT 1 FROM credential WHERE integration_id = 'github-copilot' \
+             AND json_extract(value, '$.enterpriseUrl') IS NULL LIMIT 1",
+        )
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .is_ok_and(|o| o.status.success() && o.stdout.trim_ascii() == b"1")
+}
+
 /// `Ok(None)` when the file does not exist, `Ok(Some(body))` when it was
 /// read, `Err` when it exists but was refused (FIFO, oversize, unreadable).
 fn read_opencode_auth_json(path: &Path) -> Result<Option<String>, ()> {
@@ -1669,6 +1692,12 @@ impl Agent {
             return Vec::new();
         };
         let stored = read_opencode_auth_json(&path);
+        // v2 keeps its logins in opencode.db, not auth.json (#710).
+        if matches!(stored, Ok(None))
+            && opencode_db_has_copilot(&path.with_file_name("opencode.db"))
+        {
+            return COPILOT_INFRA_DOMAINS.to_vec();
+        }
         let domains = stored
             .as_ref()
             .ok()
@@ -5188,6 +5217,34 @@ mod tests {
         ] {
             assert!(opencode_auth_overlay(Some(body), "tok").is_none(), "{body}");
         }
+    }
+
+    /// #710: v2's login lives in opencode.db's credential table.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn opencode_db_copilot_login_is_detected() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("opencode.db");
+        assert!(!opencode_db_has_copilot(&db));
+        let sql = |q: &str| {
+            assert!(
+                std::process::Command::new("/usr/bin/sqlite3")
+                    .arg(&db)
+                    .arg(q)
+                    .status()
+                    .expect("sqlite3")
+                    .success()
+            );
+        };
+        sql("CREATE TABLE credential (integration_id TEXT, value TEXT)");
+        sql(r#"INSERT INTO credential VALUES ('anthropic', '{"type":"key"}')"#);
+        assert!(!opencode_db_has_copilot(&db));
+        sql(
+            r#"INSERT INTO credential VALUES ('github-copilot', '{"type":"oauth","enterpriseUrl":"x"}')"#,
+        );
+        assert!(!opencode_db_has_copilot(&db));
+        sql(r#"INSERT INTO credential VALUES ('github-copilot', '{"type":"oauth"}')"#);
+        assert!(opencode_db_has_copilot(&db));
     }
 
     /// #695: a configured gh adds the Copilot hosts only when the overlay

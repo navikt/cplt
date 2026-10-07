@@ -319,6 +319,9 @@ pub struct PreparedSandbox {
     /// launcher with [`Self::set_worktree_root`] after `prepare`; the grant
     /// itself comes from `SandboxConfig::named_roots`.
     worktree_root: Option<PathBuf>,
+    /// Set on the child last, after the sandbox environment (OpenCode v2, #710).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    extra_env: Vec<(String, String)>,
     /// Landlock + seccomp pre-computed sandbox data (Linux only).
     /// Built in the parent process; applied in pre_exec.
     #[cfg(target_os = "linux")]
@@ -351,6 +354,14 @@ impl PreparedSandbox {
     /// roots, or the variable would name a directory the agent cannot use.
     pub fn set_worktree_root(&mut self, root: Option<&Path>) {
         self.worktree_root = root.map(Path::to_path_buf);
+    }
+
+    /// Add an OpenCode v2 session (#710): its rules go at the end of the
+    /// profile, where they win, and its variables are set on the child last.
+    #[cfg(target_os = "macos")]
+    pub fn add_opencode_v2(&mut self, session: crate::opencode_v2::Session) {
+        self.profile_text.push_str(&session.sbpl);
+        self.extra_env = session.env;
     }
 
     /// Withdraw the read grant on the root `AGENTS.md` (#252).
@@ -1919,6 +1930,7 @@ fn prepare_impl(
         npmrc_allowed: env::npmrc_explicitly_allowed(config.home_dir, config.extra_read),
         keychain_substitute: config.keychain_substitute.clone(),
         worktree_root: None,
+        extra_env: Vec::new(),
     })
 }
 
@@ -2701,6 +2713,7 @@ fn prepare_impl(
         npmrc_allowed: env::npmrc_explicitly_allowed(config.home_dir, config.extra_read),
         keychain_substitute: config.keychain_substitute.clone(),
         worktree_root: None,
+        extra_env: Vec::new(),
         precomputed,
         bwrap_wrapper,
     })

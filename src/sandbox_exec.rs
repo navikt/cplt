@@ -1450,6 +1450,7 @@ pub fn exec(
     );
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
+    cmd.envs(sandbox.extra_env.iter().map(|(k, v)| (k, v)));
     // Nothing the caller was holding open crosses into the agent.
     seal_inherited_fds(&mut cmd, Vec::new());
 

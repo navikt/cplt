@@ -4255,12 +4255,17 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // can be included in the sandbox profile. Failure is deferred —
     // --print-profile doesn't need the binary.
     let agent_bin_result = active_agent.resolve_binary();
-    // #710: v2 runs tool calls through a background service that may live
-    // outside the sandbox. Refuse rather than launch it.
-    // --print-profile never runs the agent, so it is left alone.
-    if let (agent::Agent::OpenCode, Ok(bin)) = (active_agent, &agent_bin_result)
-        && !cli.print_profile
-        && agent::is_opencode_v2(bin, &home_dir)
+    // #710: v2 runs tool calls through a background service. On macOS each
+    // session gets its own service inside the sandbox (see `opencode_v2`); the
+    // Linux backend cannot deny the host service's files inside granted dirs,
+    // so it still refuses. --print-profile never runs the agent.
+    let opencode_v2 = matches!(
+        (active_agent, &agent_bin_result),
+        (agent::Agent::OpenCode, Ok(bin)) if !cli.print_profile && agent::is_opencode_v2(bin, &home_dir)
+    );
+    if opencode_v2
+        && cfg!(not(target_os = "macos"))
+        && let Ok(bin) = &agent_bin_result
     {
         let s = bin.to_string_lossy();
         let fix = if s.contains("node_modules") || s.contains("@opencode") {
@@ -4269,7 +4274,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             "Stay on 1.x: reinstall OpenCode 1.x (npm package opencode-ai@1)."
         };
         bail!(
-            "OpenCode v2 ({}) is not supported by cplt yet: \
+            "OpenCode v2 ({}) is not supported by cplt on Linux yet: \
              https://github.com/navikt/cplt/issues/710\n{fix}",
             bin.display()
         );
@@ -4324,6 +4329,20 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             "cplt is already running (recursion detected). \
              Ensure the real agent binary is in PATH and not aliased to cplt."
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::used_underscore_binding)]
+    if opencode_v2 {
+        let Some(scratch) = _scratch_guard.as_ref().map(cplt::scratch::ScratchDir::path) else {
+            bail!(
+                "OpenCode v2 keeps its per-session service config in the scratch dir; \
+                 drop --no-scratch-dir (or sandbox.scratch_dir = false) to run it."
+            );
+        };
+        let session = cplt::opencode_v2::prepare(scratch, &home_dir)
+            .map_err(|e| anyhow::anyhow!("Cannot set up the OpenCode v2 session: {e}"))?;
+        prepared.add_opencode_v2(session);
     }
 
     // #514: shim an agent installed since the last sync. A no-op unless the
