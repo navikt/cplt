@@ -3218,6 +3218,7 @@ mod macos_tests {
             process_exec: !write,
             write_files: vec![],
             create_dirs: vec![],
+            via: vec![],
         };
         let agent_dirs = vec![
             agent_dir(cache.clone(), true),

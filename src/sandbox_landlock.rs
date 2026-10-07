@@ -4644,6 +4644,7 @@ mod tests {
                 process_exec: false,
                 write_files,
                 create_dirs: vec![],
+                via: vec![],
             };
             let agent_dirs = [
                 dir(home.join(".claude"), vec![]),
@@ -5208,6 +5209,7 @@ mod tests {
                 process_exec: false,
                 write_files: vec!["auth.json"],
                 create_dirs: vec![],
+                via: vec![],
             },
             crate::agent::AgentDir {
                 path: home.join(".local/share/opencode"),
@@ -5216,6 +5218,7 @@ mod tests {
                 process_exec: false,
                 write_files: vec![],
                 create_dirs: vec![],
+                via: vec![],
             },
             crate::agent::AgentDir {
                 path: home.join(".local/state/opencode"),
@@ -5224,6 +5227,7 @@ mod tests {
                 process_exec: false,
                 write_files: vec![],
                 create_dirs: vec![],
+                via: vec![],
             },
             crate::agent::AgentDir {
                 path: home.join(".cache/opencode"),
@@ -5232,6 +5236,7 @@ mod tests {
                 process_exec: false,
                 write_files: vec![],
                 create_dirs: vec![],
+                via: vec![],
             },
             crate::agent::AgentDir {
                 path: home.join(".cache/opencode/bin"),
@@ -5240,6 +5245,7 @@ mod tests {
                 process_exec: true,
                 write_files: vec![],
                 create_dirs: vec![],
+                via: vec![],
             },
         ];
         let mut config = test_config(&project, &home);

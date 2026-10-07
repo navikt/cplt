@@ -2741,6 +2741,7 @@ validate = false
                 process_exec: false,
                 write_files: vec![],
                 create_dirs: vec![],
+                via: vec![],
             },
             crate::agent::AgentDir {
                 path: home.join(".pi/agent/bin"),
@@ -2749,6 +2750,7 @@ validate = false
                 process_exec: true,
                 write_files: vec![],
                 create_dirs: vec![],
+                via: vec![],
             },
         ];
 
@@ -2864,6 +2866,7 @@ validate = false
             process_exec: true,
             write_files: vec![],
             create_dirs: vec![],
+            via: vec![],
         }];
 
         let mut r = Config::default()
@@ -2899,6 +2902,7 @@ validate = false
             process_exec: true,
             write_files: vec![],
             create_dirs: vec![],
+            via: vec![],
         };
         let rustup = home.join(".rustup").to_string_lossy().into_owned();
         let copilot_dir = copilot.path.to_string_lossy().into_owned();

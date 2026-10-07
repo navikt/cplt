@@ -2127,6 +2127,7 @@ fn fish_startup_files_are_write_denied_in_both_granted_dirs() {
             process_exec: false,
             write_files: vec![],
             create_dirs: vec![],
+            via: vec![],
         }
     });
     let conf = std::path::PathBuf::from("/Users/test/.config/fish");
@@ -9663,6 +9664,7 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
             process_exec: false,
             write_files: vec!["auth.json"],
             create_dirs: vec![],
+            via: vec![],
         },
         AgentDir {
             path: data_dir.clone(),
@@ -9671,6 +9673,7 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
             process_exec: false,
             write_files: vec![],
             create_dirs: vec![],
+            via: vec![],
         },
         AgentDir {
             path: state_dir.clone(),
@@ -9679,6 +9682,7 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
             process_exec: false,
             write_files: vec![],
             create_dirs: vec![],
+            via: vec![],
         },
         AgentDir {
             path: cache_dir.clone(),
@@ -9687,6 +9691,7 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
             process_exec: false,
             write_files: vec![],
             create_dirs: vec![],
+            via: vec![],
         },
         AgentDir {
             path: cache_dir.join("bin"),
@@ -9695,6 +9700,7 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
             process_exec: true,
             write_files: vec![],
             create_dirs: vec![],
+            via: vec![],
         },
     ];
 
