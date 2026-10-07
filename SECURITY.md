@@ -48,6 +48,8 @@ A token in the environment is readable: `block_auth_token` blocks `gh auth token
   | Copilot | `settings.json`, `hooks/`, `mcp-config.json`, `lsp-config.json`, `extensions/`, `installed-plugins/`, `pkg/`, `skills/` |
   | Shell (fish) | `config.fish`, `conf.d/`, `functions/`, `completions/`, `vendor_conf.d/`, `vendor_functions.d/`, `vendor_completions.d/` |
   | goose | — (its whole config dir is read-only; see below) |
+
+  **Hook and status-line scripts outside `~/.claude` (macOS only, [#702](https://github.com/navikt/cplt/pull/702)).** cplt reads the user-level `settings.json` (never `settings.local.json` or a project's `.claude/settings*.json`, which the agent can write) and grants read + execute on the one file each hook or `statusLine` command runs: the command itself, or the script an interpreter (`python3`, `node`, `bash`, `uv run`, ...) is given. Other arguments, such as a log file, are not granted. The granted file is write-protected inside the sandbox. Files in a credential directory, under the Claude config root, or under another writable grant are skipped, and a hook inside an `allow.write` tree stays exec-denied. A script that imports sibling files needs `allow.read` on its directory. Linux is unchanged for now: the grant is only safe when bubblewrap protects `settings.json`, and gating on that is a follow-up.
   | DeepSeek Harness | `cordis.patch.yml` (home-level overlay; `profiles/` stays writable so DSH can rewrite its boot include-root) |
   | OpenCode | — (skills live in its read-only config dir; see below) |
 

@@ -309,25 +309,40 @@ pub(crate) fn read_small_regular_file(path: &Path) -> Option<String> {
 /// to read itself into, say, `~/.ssh`. `settings.local.json` and the project's
 /// `.claude/settings*.json` are agent-writable and deliberately not read.
 ///
-/// Every token of each command that names an existing regular file by
-/// absolute path (after `~`/`$HOME` expansion) is granted, which covers both
-/// `/x/gate.py` and `python3 /x/gate.py`. File-level, never the directory: a
+/// Per command one path is granted: the executable (first token), or, when
+/// that is an interpreter, its first non-flag argument, so both `/x/gate.py`
+/// and `python3 /x/gate.py --log /p/log` grant only `gate.py`. Never other
+/// arguments: the grant write-protects the file, so a log or state file
+/// would become unwritable. Only an absolute path (after `~`/`$HOME`
+/// expansion) to an existing regular file counts. File-level, never the directory: a
 /// script that imports siblings needs an `allow.read` on its dir. The grant is
 /// exec-only, so the file is also write-denied in the sandbox. Skipped, never
-/// refused: paths under `root` (already granted), credential dirs and files,
+/// refused: paths under `root` or any of `writable` (canonicalized; an exec
+/// grant there would write-protect the agent's own files), credential dirs
+/// and files,
 /// `~/Library/Keychains`, and anything SBPL cannot name.
 ///
 /// macOS only. On Linux the file is write-denied only under bubblewrap; with
 /// Landlock alone the whole root is writable, so the agent could plant a hook
 /// naming any file and get it granted on the next launch. ponytail: Linux
 /// stays as before until this can be gated on bubblewrap being active.
-fn claude_hook_script_grants(root: &Path, home: &Path) -> Vec<AgentDir> {
+fn claude_hook_script_grants(root: &Path, home: &Path, writable: &[PathBuf]) -> Vec<AgentDir> {
     if !cfg!(target_os = "macos") {
         return vec![];
     }
     let Some(text) = read_small_regular_file(&root.join("settings.json")) else {
         return vec![];
     };
+    let own: Vec<PathBuf> = std::iter::once(root)
+        .chain(writable.iter().map(PathBuf::as_path))
+        .flat_map(|p| {
+            [
+                p.to_path_buf(),
+                std::fs::canonicalize(p).unwrap_or_default(),
+            ]
+        })
+        .filter(|p| !p.as_os_str().is_empty())
+        .collect();
     let mut out: Vec<AgentDir> = vec![];
     for path in claude_hook_script_paths(&text, home) {
         let Ok(real) = std::fs::canonicalize(&path) else {
@@ -337,7 +352,7 @@ fn claude_hook_script_grants(root: &Path, home: &Path) -> Vec<AgentDir> {
             continue;
         }
         let sensitive = |p: &Path| {
-            p.starts_with(root)
+            own.iter().any(|o| p.starts_with(o))
                 || p.starts_with(home.join("Library/Keychains"))
                 || crate::sandbox::DENIED_DOTFILES
                     .iter()
@@ -360,8 +375,9 @@ fn claude_hook_script_grants(root: &Path, home: &Path) -> Vec<AgentDir> {
     out
 }
 
-/// Candidate script paths in a Claude `settings.json`: every absolute path
-/// token in `hooks.<event>[].hooks[].command` and `statusLine.command`.
+/// Candidate script paths in a Claude `settings.json`: the script token (see
+/// [`script_token`]) of each `hooks.<event>[].hooks[].command` and
+/// `statusLine.command`, if absolute.
 fn claude_hook_script_paths(text: &str, home: &Path) -> Vec<PathBuf> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
         return vec![];
@@ -380,7 +396,7 @@ fn claude_hook_script_paths(text: &str, home: &Path) -> Vec<PathBuf> {
     commands.extend(v.pointer("/statusLine/command").and_then(|c| c.as_str()));
     commands
         .into_iter()
-        .flat_map(shell_words)
+        .filter_map(|c| script_token(shell_words(c)))
         .filter_map(|w| {
             let w = if let Some(rest) = w.strip_prefix("~/") {
                 home.join(rest)
@@ -395,6 +411,22 @@ fn claude_hook_script_paths(text: &str, home: &Path) -> Vec<PathBuf> {
             w.is_absolute().then_some(w)
         })
         .collect()
+}
+
+/// The file a command runs: the first word, or for an interpreter the first
+/// argument that is not a flag (`uv run` and `uvx` skip `run` too).
+fn script_token(words: Vec<String>) -> Option<String> {
+    const INTERPRETERS: &[&str] = &[
+        "python", "node", "bash", "sh", "zsh", "ruby", "perl", "deno", "bun", "uv", "uvx",
+    ];
+    let mut it = words.into_iter();
+    let first = it.next()?;
+    let name = first.rsplit('/').next().unwrap_or(&first);
+    let name = name.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    if !INTERPRETERS.contains(&name) {
+        return Some(first);
+    }
+    it.find(|w| !w.starts_with('-') && w != "run")
 }
 
 /// Whitespace split honouring single and double quotes. ponytail: no escapes
@@ -1592,7 +1624,7 @@ impl Agent {
                     .filter(|s| !s.is_empty());
                 if let Some(dir) = custom_dir {
                     let root = PathBuf::from(dir);
-                    let mut dirs = claude_hook_script_grants(&root, home);
+                    let mut dirs = claude_hook_script_grants(&root, home, &[]);
                     dirs.insert(
                         0,
                         AgentDir {
@@ -1629,7 +1661,12 @@ impl Agent {
                         create_dirs: vec![],
                     },
                 ];
-                dirs.extend(claude_hook_script_grants(&home.join(".claude"), home));
+                let writable: Vec<PathBuf> = dirs.iter().map(|d| d.path.clone()).collect();
+                dirs.extend(claude_hook_script_grants(
+                    &home.join(".claude"),
+                    home,
+                    &writable,
+                ));
                 dirs
             }
             Agent::Goose => {
@@ -2600,6 +2637,11 @@ mod tests {
         let env = file(home.join("bin/env.sh"));
         let inside = file(root.join("own.sh"));
         let key = file(home.join(".ssh/id_ed25519"));
+        let logged = file(hooks.join("hook.py"));
+        let log = file(base.join("log.txt"));
+        let plain = file(hooks.join("hook.sh"));
+        let log2 = file(base.join("state.txt"));
+        let cfg = file(home.join(".claude.json"));
         // A project-level settings file is never read.
         let project = file(base.join("project.sh"));
         std::fs::create_dir_all(base.join(".claude")).unwrap();
@@ -2623,13 +2665,16 @@ mod tests {
                     {"type": "command", "command": "$HOME/bin/env.sh"},
                     {"type": "command", "command": format!("{} && cat {}", inside.display(), key.display())},
                     {"type": "command", "command": "/does/not/exist.sh"},
+                    {"type": "command", "command": format!("python3 -u '{}' --log {}", logged.display(), log.display())},
+                    {"type": "command", "command": format!("'{}' {}", plain.display(), log2.display())},
+                    {"type": "command", "command": format!("{} --x", cfg.display())},
                 ]}],
             },
             "statusLine": {"type": "command", "command": "~/bin/status.sh"},
         });
         std::fs::write(root.join("settings.json"), settings.to_string()).unwrap();
 
-        let got = claude_hook_script_grants(&root, &home);
+        let got = claude_hook_script_grants(&root, &home, &[home.join(".claude.json")]);
         let paths: Vec<_> = got.iter().map(|d| d.path.clone()).collect();
         assert!(
             paths.contains(&quoted),
@@ -2646,15 +2691,38 @@ mod tests {
             !paths.contains(&project),
             "agent-writable settings are ignored"
         );
+        assert!(paths.contains(&logged) && paths.contains(&plain));
+        assert!(!paths.contains(&log), "interpreter args are not granted");
+        assert!(!paths.contains(&log2), "script args are not granted");
+        assert!(!paths.contains(&cfg), "agent-writable file is skipped");
         assert!(got.iter().all(|d| !d.write && d.process_exec));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn claude_hook_scripts_skip_files_under_symlinked_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let hook = real.join("hook.sh");
+        std::fs::write(&hook, "#!/bin/sh\n").unwrap();
+        std::fs::write(
+            link.join("settings.json"),
+            format!(r#"{{"statusLine":{{"command":"{}"}}}}"#, hook.display()),
+        )
+        .unwrap();
+        assert!(claude_hook_script_grants(&link, &base, &[]).is_empty());
     }
 
     #[test]
     fn claude_hook_scripts_tolerate_missing_and_bad_settings() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(claude_hook_script_grants(tmp.path(), tmp.path()).is_empty());
+        assert!(claude_hook_script_grants(tmp.path(), tmp.path(), &[]).is_empty());
         std::fs::write(tmp.path().join("settings.json"), "{not json").unwrap();
-        assert!(claude_hook_script_grants(tmp.path(), tmp.path()).is_empty());
+        assert!(claude_hook_script_grants(tmp.path(), tmp.path(), &[]).is_empty());
     }
 
     #[test]
