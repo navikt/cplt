@@ -197,6 +197,30 @@ const OPENCODE_DOMAINS: &[&str] = &["opencode.ai", "models.dev"];
 /// BARE domain — see `COPILOT_INFRA_DOMAINS` for the no-glob convention.
 const DEEPSEEK_DOMAINS: &[&str] = &["deepseek.com"];
 
+/// #710: does this resolved `opencode` binary belong to OpenCode v2?
+///
+/// Read from the install path, not from `opencode --version`, so launch stays
+/// free of subprocesses. v2 ships as the npm package `@opencode/cli` (1.x is
+/// `opencode-ai`), so the canonical path runs through an `@opencode` scope
+/// dir. A version manager or Homebrew keg dir named `opencode/<version>` with
+/// major ≥ 2 counts too.
+// ponytail: path heuristic; a v2 build copied somewhere unrecognisable slips
+// through. Probe `--version` once per binary and cache it if that turns up.
+pub fn is_opencode_v2(bin: &Path) -> bool {
+    let real = std::fs::canonicalize(bin).unwrap_or_else(|_| bin.to_path_buf());
+    let parts: Vec<String> = real
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    parts.iter().any(|p| p == "@opencode")
+        || parts.windows(2).any(|w| {
+            w[0] == "opencode"
+                && crate::discover::parse_version(&w[1])
+                    .and_then(|v| v.split('.').next()?.parse::<u32>().ok())
+                    .is_some_and(|major| major >= 2)
+        })
+}
+
 /// The provider hosts an OpenCode `auth.json` body calls for. Split from
 /// [`Agent::provider_domains`] so the parse is testable without a home dir.
 /// Anything that is not a JSON object with a `github-copilot` key, including
@@ -2616,6 +2640,22 @@ impl std::fmt::Display for Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opencode_v2_is_detected_from_its_install_path() {
+        assert!(is_opencode_v2(Path::new(
+            "/n/lib/node_modules/@opencode/cli/bin/opencode.exe"
+        )));
+        assert!(is_opencode_v2(Path::new(
+            "/brew/Cellar/opencode/2.0.24/bin/opencode"
+        )));
+        assert!(!is_opencode_v2(Path::new(
+            "/brew/Cellar/opencode/1.18.35/bin/opencode"
+        )));
+        assert!(!is_opencode_v2(Path::new(
+            "/n/lib/node_modules/opencode-ai/bin/opencode"
+        )));
+    }
 
     #[test]
     #[cfg(target_os = "macos")]

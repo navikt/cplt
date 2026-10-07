@@ -4191,6 +4191,19 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // can be included in the sandbox profile. Failure is deferred —
     // --print-profile doesn't need the binary.
     let agent_bin_result = active_agent.resolve_binary();
+    // #710: v2 runs tool calls through a background service that may live
+    // outside the sandbox. Refuse rather than launch it.
+    if let (agent::Agent::OpenCode, Ok(bin)) = (active_agent, &agent_bin_result)
+        && agent::is_opencode_v2(bin)
+    {
+        bail!(
+            "OpenCode v2 ({}) is not supported by cplt yet: \
+             https://github.com/navikt/cplt/issues/710\n\
+             Stay on 1.x: npm uninstall -g @opencode/cli && npm i -g opencode-ai@1 \
+             (or pin opencode-ai@1 in your version manager).",
+            bin.display()
+        );
+    }
     let copilot_install_dir = agent_install_dir(active_agent, &agent_bin_result, &home_dir);
 
     // Discover Electron app bundle when Copilot CLI is installed via VS Code.
