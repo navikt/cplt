@@ -291,13 +291,17 @@ fn probe_version_within(
         Ok(buf) => buf,
         Err(probe) => return probe,
     };
-    // Parse "GitHub Copilot CLI 1.0.21." → "1.0.21": first token starting with
-    // a digit, trailing period trimmed.
-    buf.split_whitespace()
+    parse_version(&buf).map_or(VersionProbe::Unknown, VersionProbe::Version)
+}
+
+/// Parse "GitHub Copilot CLI 1.0.21." → "1.0.21" and "opencode v2.0.24" →
+/// "2.0.24" (#710): first token starting with a digit, after an optional `v`,
+/// trailing period trimmed.
+pub fn parse_version(out: &str) -> Option<String> {
+    out.split_whitespace()
+        .map(|w| w.strip_prefix('v').unwrap_or(w))
         .find(|w| w.chars().next().is_some_and(|c| c.is_ascii_digit()))
-        .map_or(VersionProbe::Unknown, |v| {
-            VersionProbe::Version(v.trim_end_matches('.').to_string())
-        })
+        .map(|v| v.trim_end_matches('.').to_string())
 }
 
 /// The raw stdout of `<path> <args>`, under the same bounds as
@@ -2349,7 +2353,18 @@ ELECTRON_RUN_AS_NODE=1 "/Applications/Visual Studio Code.app/Contents/Frameworks
     fn fake_binary(dir: &Path, name: &str, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        // Written in-process, the script would be open for writing while other
+        // test threads fork; a fork in that window inherits the descriptor and
+        // our exec fails ETXTBSY. `cp` gives `path` an inode whose only writable
+        // descriptor lives in the child (same fix as copilot_extract's Fixture).
+        let staging = dir.join(format!("{name}.staging"));
+        std::fs::write(&staging, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let copied = std::process::Command::new("cp")
+            .arg(&staging)
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(copied.success(), "cp of the fake binary failed: {copied}");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
     }
@@ -2447,6 +2462,17 @@ ELECTRON_RUN_AS_NODE=1 "/Applications/Visual Studio Code.app/Contents/Frameworks
         ] {
             assert!(removed.iter().any(|k| k == var), "{var} reaches the probe");
         }
+    }
+
+    #[test]
+    fn parse_version_handles_v_prefix() {
+        assert_eq!(parse_version("1.18.35\n").as_deref(), Some("1.18.35"));
+        assert_eq!(parse_version("opencode v2.0.24").as_deref(), Some("2.0.24"));
+        assert_eq!(
+            parse_version("GitHub Copilot CLI 1.0.21.").as_deref(),
+            Some("1.0.21")
+        );
+        assert_eq!(parse_version("verbose nothing"), None);
     }
 
     /// The happy path still parses, and a binary that answers is never

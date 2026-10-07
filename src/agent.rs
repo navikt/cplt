@@ -197,6 +197,67 @@ const OPENCODE_DOMAINS: &[&str] = &["opencode.ai", "models.dev"];
 /// BARE domain — see `COPILOT_INFRA_DOMAINS` for the no-glob convention.
 const DEEPSEEK_DOMAINS: &[&str] = &["deepseek.com"];
 
+/// #710: does this resolved `opencode` binary belong to OpenCode v2?
+///
+/// The install path settles most cases with no subprocess: v2 ships as the
+/// npm package `@opencode/cli` (1.x is `opencode-ai`), and Homebrew or a
+/// version manager keeps it under `opencode/<version>`. Anything else (the
+/// upstream installer puts both majors at `~/.opencode/bin`) is asked
+/// `--version` once, and the answer is cached per binary path, size and
+/// mtime, so steady-state launch spawns nothing. An unanswered probe counts
+/// as 1.x and is not cached.
+///
+/// The verdict lives in cplt's state directory, which the sandbox denies, not
+/// in `~/.cache/cplt`, which the agent can write: a forged "1.x" verdict for a
+/// v2 binary would bypass this gate.
+pub fn is_opencode_v2(bin: &Path, home: &Path) -> bool {
+    let cache_dir = &home.join(crate::sandbox::CPLT_STATE_DIR);
+    let real = std::fs::canonicalize(bin).unwrap_or_else(|_| bin.to_path_buf());
+    let parts: Vec<String> = real
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    if parts.iter().any(|p| p == "@opencode") {
+        return true;
+    }
+    if let Some([_, ver]) = parts
+        .windows(2)
+        .find(|w| w[0] == "opencode" && crate::discover::parse_version(&w[1]).is_some())
+    {
+        return major_at_least_2(ver);
+    }
+    let Ok(meta) = std::fs::metadata(&real) else {
+        return false;
+    };
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos());
+    let key = format!("{}\t{}\t{mtime}\t", real.display(), meta.len());
+    let cache = cache_dir.join("opencode-version");
+    if let Some(v) = std::fs::read_to_string(&cache)
+        .ok()
+        .and_then(|c| c.strip_prefix(&key).map(|v| v.trim().to_string()))
+    {
+        return major_at_least_2(&v);
+    }
+    match crate::discover::probe_version(&real, &["--version"]) {
+        crate::discover::VersionProbe::Version(v) => {
+            let _ = std::fs::create_dir_all(cache_dir);
+            let _ = std::fs::write(&cache, format!("{key}{v}\n"));
+            major_at_least_2(&v)
+        }
+        _ => false,
+    }
+}
+
+fn major_at_least_2(version: &str) -> bool {
+    crate::discover::parse_version(version)
+        .and_then(|v| v.split('.').next()?.parse::<u32>().ok())
+        .is_some_and(|major| major >= 2)
+}
+
 /// The provider hosts an OpenCode `auth.json` body calls for. Split from
 /// [`Agent::provider_domains`] so the parse is testable without a home dir.
 /// Anything that is not a JSON object with a `github-copilot` key, including
@@ -2792,6 +2853,53 @@ impl std::fmt::Display for Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opencode_v2_is_detected_from_its_install_path() {
+        let none = Path::new("/nonexistent-cplt-cache");
+        assert!(is_opencode_v2(
+            Path::new("/n/lib/node_modules/@opencode/cli/bin/opencode.exe"),
+            none
+        ));
+        assert!(is_opencode_v2(
+            Path::new("/brew/Cellar/opencode/2.0.24/bin/opencode"),
+            none
+        ));
+        assert!(!is_opencode_v2(
+            Path::new("/brew/Cellar/opencode/1.18.35/bin/opencode"),
+            none
+        ));
+        assert!(!is_opencode_v2(
+            Path::new("/n/lib/node_modules/opencode-ai/bin/opencode"),
+            none
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_v2_probe_is_cached() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("opencode");
+        let count = dir.path().join("count");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\necho x >> {}\necho opencode v2.0.24\n",
+                count.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let home = dir.path().join("home");
+        assert!(is_opencode_v2(&bin, &home));
+        assert!(is_opencode_v2(&bin, &home));
+        assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(), 1);
+        // The verdict must sit where the sandbox denies the agent writes.
+        let state = home.join(crate::sandbox::CPLT_STATE_DIR);
+        assert!(state.join("opencode-version").exists());
+        assert!(crate::sandbox::DENIED_DOTFILES.contains(&crate::sandbox::CPLT_STATE_DIR));
+    }
 
     #[test]
     #[cfg(target_os = "macos")]

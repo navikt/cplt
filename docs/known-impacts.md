@@ -1339,6 +1339,12 @@ Each agent's global config dir is mounted read/write, but the files in it that *
 
 goose is the exception to the table's opening sentence: its config dir is granted read-only outright rather than read/write with named denies. A `write_files` carve-out would not work — goose rewrites `config.yaml`, `permission.yaml` and `permissions/tool_permissions.json` by creating a temp file in the directory and renaming over the target, which needs directory write and would hand back the very vector the deny exists to close.
 
+## OpenCode v2 is refused
+
+OpenCode v2 (the npm package `@opencode/cli`, which still installs a binary called `opencode`) is not supported yet. It runs tool calls through a background service, and a service started outside cplt would run them unsandboxed. cplt refuses to launch it and points to [navikt/cplt#710](https://github.com/navikt/cplt/issues/710). To stay on 1.x, reinstall OpenCode 1.x: for npm, `npm uninstall -g @opencode/cli && npm i -g opencode-ai@1`; elsewhere, pin `opencode-ai@1` in your version manager or installer. The check covers `--agent opencode` only: running `opencode` from another agent or a shell inside the sandbox is not checked.
+
+cplt spots v2 from where the binary lives when it can: a path through an `@opencode` npm scope, or an `opencode/<version>` directory (Homebrew, version managers). Anywhere else, such as `~/.opencode/bin` from the upstream installer, it runs `opencode --version` once and caches the answer in `~/.config/cplt/opencode-version` until the binary changes, so later launches spawn nothing extra. The agent cannot write that directory, so it cannot fake the answer. If `opencode --version` fails or times out, cplt assumes 1.x and launches. `--print-profile` does not check.
+
 ## OpenCode: GitHub Copilot login from the host
 
 When `gh` is logged in on the host and OpenCode's `auth.json` has no `github-copilot` entry, cplt logs OpenCode in to GitHub Copilot with the host's gh token, so `opencode run -m github-copilot/...` works without `/connect`. It does this through `OPENCODE_AUTH_CONTENT`, which OpenCode reads instead of `auth.json`; your other providers are copied in. An existing `github-copilot` login is left alone. Running `/connect` inside the sandbox writes the gh token into `auth.json` as the `github-copilot` entry. This needs OpenCode 1.4.7 or newer; older versions ignore `OPENCODE_AUTH_CONTENT` and behave as before. To turn it off, add `OPENCODE_AUTH_CONTENT` (or `GH_TOKEN`) to `deny.env`. Details in [SECURITY.md](../SECURITY.md#github-token-handling-per-agent).

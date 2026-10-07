@@ -2045,6 +2045,52 @@ mod e2e_tests {
         let _ = std::fs::remove_dir_all(&fake_home);
     }
 
+    /// #710: an OpenCode v2 binary at the upstream installer's path (which
+    /// the path check cannot classify) is refused, and never run beyond
+    /// `--version`.
+    #[cfg(unix)]
+    #[test]
+    fn e2e_opencode_v2_is_refused_before_launch() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bin_dir = tmp.path().join(".opencode/bin");
+        std::fs::create_dir_all(&bin_dir).expect("bin dir");
+        let canary = tmp.path().join("ran");
+        let bin = bin_dir.join("opencode");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = --version ] && {{ echo opencode v2.0.24; exit 0; }}\ntouch {}\n",
+                canary.display()
+            ),
+        )
+        .expect("write fake opencode");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let path = format!(
+            "{}:{}",
+            bin_dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+
+        let out = cplt_cmd()
+            .current_dir(project_dir())
+            .env("PATH", &path)
+            .env("XDG_CACHE_HOME", tmp.path().join("cache"))
+            .args(["--agent", "opencode", "--", "run", "hi"])
+            .output()
+            .expect("binary should run");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success(),
+            "v2 must be refused.\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("issues/710"),
+            "refusal names #710.\nstderr: {stderr}"
+        );
+        assert!(!canary.exists(), "the v2 agent must never be launched");
+    }
+
     /// fish gets literal alias lines, not an `eval`, so a stale unpinned line
     /// cannot fix itself the way the POSIX `eval` does. Rewrite it in place.
     #[test]
