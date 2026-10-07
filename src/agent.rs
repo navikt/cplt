@@ -529,7 +529,13 @@ fn script_grants(
 /// its parent canonicalized. Used to refuse a script grant reached through a
 /// link the agent could rewrite.
 fn symlink_locations(path: &Path) -> Vec<PathBuf> {
-    let mut out = vec![path.to_path_buf()];
+    let canon_parent = |p: &Path| {
+        let parent = p.parent().unwrap_or(Path::new("/"));
+        std::fs::canonicalize(parent)
+            .unwrap_or(parent.to_path_buf())
+            .join(p.file_name().unwrap_or_default())
+    };
+    let mut out = vec![canon_parent(path)];
     let mut queue = vec![path.to_path_buf()];
     // Bounded like the kernel's ELOOP; past it canonicalize fails anyway.
     while let Some(p) = queue.pop().filter(|_| out.len() < 64) {
@@ -540,10 +546,9 @@ fn symlink_locations(path: &Path) -> Vec<PathBuf> {
             let Ok(target) = std::fs::read_link(&cur) else {
                 continue;
             };
-            let parent = cur.parent().unwrap_or(Path::new("/"));
-            let parent = std::fs::canonicalize(parent).unwrap_or(parent.to_path_buf());
-            out.push(parent.join(cur.file_name().unwrap_or_default()));
-            let mut next = parent.join(target);
+            let link = canon_parent(&cur);
+            out.push(link.clone());
+            let mut next = link.parent().unwrap_or(Path::new("/")).join(target);
             next.extend(&comps[i + 1..]);
             queue.push(next);
             break;
@@ -2598,7 +2603,9 @@ pub fn deny_copilot_dir_exec(dirs: &mut [AgentDir], home: &Path) -> bool {
 /// caller still emits a rule for the literal path rather than dropping it.
 /// Drop hook/MCP script grants (file-level, exec-only) that sit under a path
 /// the sandbox already makes writable: the project, `--repo-dir` roots,
-/// `allow.write` and the agent's own writable dirs. Those scripts are already
+/// `allow.write`, the writable home tool dirs, the system temp dirs
+/// ([`crate::sandbox::home_and_temp_writable_roots`]) and the agent's own
+/// writable dirs. Those scripts are already
 /// readable and run under the normal rules for that tree; an exec-only grant
 /// would write-deny the script and pin its parent, so a developer could not
 /// edit their own MCP server or hook. A grant whose configured path or any
@@ -2615,9 +2622,23 @@ pub fn drop_script_grants_under(dirs: &mut Vec<AgentDir>, writable: &[PathBuf]) 
     roots.dedup();
     dirs.retain(|d| {
         let script = !d.write && d.process_exec && !d.map_exec && d.path.is_file();
-        let under = |p: &PathBuf| roots.iter().any(|r| p.starts_with(r));
+        let under = |p: &PathBuf| roots.iter().any(|r| path_under(p, r));
         !(script && (under(&d.path) || d.via.iter().any(under)))
     });
+}
+
+/// `p` is `root` or inside it. On macOS APFS is case-insensitive by default and
+/// `realpath` keeps the spelling it was given, so `$T/PROJ` and `$T/proj` name
+/// the same tree; compare case-insensitively there (over-matching only drops a
+/// script grant).
+fn path_under(p: &Path, root: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let lower = |x: &Path| PathBuf::from(x.to_string_lossy().to_lowercase());
+        lower(p).starts_with(lower(root))
+    }
+    #[cfg(not(target_os = "macos"))]
+    p.starts_with(root)
 }
 
 pub fn canonicalize_agent_dirs(dirs: &mut [AgentDir]) {
@@ -5255,5 +5276,121 @@ mod tests {
         drop_script_grants_under(&mut dirs, &[proj]);
         let got: Vec<_> = dirs.iter().map(|d| d.path.clone()).collect();
         assert_eq!(got, vec![hook]);
+    }
+
+    /// Links in writable home tool dirs (`~/.cache`, `~/.yarn/bin`) are
+    /// agent-rewritable too, so scripts reached through them lose their grant;
+    /// a plain script elsewhere in home keeps it (#714).
+    #[test]
+    fn script_grant_through_home_tool_dir_symlink_is_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        let tools = home.join("tools");
+        std::fs::create_dir_all(home.join(".cache")).unwrap();
+        std::fs::create_dir_all(home.join(".yarn/bin")).unwrap();
+        std::fs::create_dir_all(&tools).unwrap();
+        let (a, b, ok) = (tools.join("a.sh"), tools.join("b.js"), tools.join("ok.sh"));
+        for f in [&a, &b, &ok] {
+            std::fs::write(f, "").unwrap();
+        }
+        std::os::unix::fs::symlink(&a, home.join(".cache/hook.sh")).unwrap();
+        std::os::unix::fs::symlink(&b, home.join(".yarn/bin/mcp")).unwrap();
+        let paths = vec![
+            home.join(".cache/hook.sh"),
+            home.join(".yarn/bin/mcp"),
+            ok.clone(),
+        ];
+        let mut dirs = script_grants(paths, &home.join("root"), &home, &[]);
+        assert_eq!(dirs.len(), 3);
+        // The tempdir itself sits under a system temp root; keep only home roots.
+        let tool_dirs: Vec<_> = crate::sandbox::HOME_TOOL_DIRS
+            .iter()
+            .map(|d| d.resolve(&home, &[]))
+            .collect();
+        let mut roots = crate::sandbox::home_and_temp_writable_roots(&home, &tool_dirs, None);
+        roots.retain(|r| r.starts_with(&home));
+        drop_script_grants_under(&mut dirs, &roots);
+        let got: Vec<_> = dirs.iter().map(|d| d.path.clone()).collect();
+        assert_eq!(got, vec![ok]);
+    }
+
+    /// `CARGO_HOME` relocated outside home and a worktree's git common dir are
+    /// writable trees too; a script linked from either loses its grant.
+    #[test]
+    fn script_grant_through_relocated_tool_dir_or_git_common_dir_is_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let (home, cargo, git, tools) = (
+            base.join("home"),
+            base.join("cargo"),
+            base.join("repo.git"),
+            base.join("tools"),
+        );
+        for d in [&home, &cargo.join("registry"), &git.join("hooks"), &tools] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let (a, b, ok) = (tools.join("a.sh"), tools.join("b.sh"), tools.join("ok.sh"));
+        for f in [&a, &b, &ok] {
+            std::fs::write(f, "").unwrap();
+        }
+        std::os::unix::fs::symlink(&a, cargo.join("registry/hook")).unwrap();
+        std::os::unix::fs::symlink(&b, git.join("hooks/mcp")).unwrap();
+        let paths = vec![
+            cargo.join("registry/hook"),
+            git.join("hooks/mcp"),
+            ok.clone(),
+        ];
+        let mut dirs = script_grants(paths, &base.join("root"), &home, &[]);
+        assert_eq!(dirs.len(), 3);
+        let relocate = [crate::sandbox::ToolRoot {
+            default: ".cargo",
+            root: cargo.clone(),
+        }];
+        let tool_dirs: Vec<_> = crate::sandbox::HOME_TOOL_DIRS
+            .iter()
+            .map(|d| d.resolve(&home, &relocate))
+            .collect();
+        let mut roots = crate::sandbox::home_and_temp_writable_roots(&home, &tool_dirs, Some(&git));
+        roots.retain(|r| r.starts_with(&base));
+        assert!(roots.iter().any(|r| r.starts_with(&cargo)), "{roots:?}");
+        drop_script_grants_under(&mut dirs, &roots);
+        let got: Vec<_> = dirs.iter().map(|d| d.path.clone()).collect();
+        assert_eq!(got, vec![ok]);
+    }
+
+    /// A tool dir whose symlink target is refused (`~/.cache -> $HOME`) is
+    /// vetted out, so home itself never becomes a writable root.
+    #[test]
+    fn refused_tool_dir_target_is_not_a_writable_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        std::os::unix::fs::symlink(&home, home.join(".cache")).unwrap();
+        let tool_dirs: Vec<_> = crate::sandbox::HOME_TOOL_DIRS
+            .iter()
+            .map(|d| d.resolve(&home, &[]))
+            .collect();
+        let roots = crate::sandbox::home_and_temp_writable_roots(&home, &tool_dirs, None);
+        assert!(!roots.contains(&home), "{roots:?}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn path_under_ignores_case_on_macos() {
+        assert!(path_under(
+            Path::new("/t/PROJ/xdg/hook.sh"),
+            Path::new("/t/proj")
+        ));
+        assert!(!path_under(
+            Path::new("/t/projx/hook.sh"),
+            Path::new("/t/proj")
+        ));
+    }
+
+    /// `/dev/shm` is always writable off macOS, like `/tmp` (#714).
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn home_and_temp_writable_roots_include_dev_shm() {
+        let roots = crate::sandbox::home_and_temp_writable_roots(Path::new("/h"), &[], None);
+        assert!(roots.contains(&PathBuf::from("/dev/shm")));
     }
 }
