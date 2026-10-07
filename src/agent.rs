@@ -333,6 +333,93 @@ fn claude_hook_script_grants(root: &Path, home: &Path, writable: &[PathBuf]) -> 
     let Some(text) = read_small_regular_file(&root.join("settings.json")) else {
         return vec![];
     };
+    script_grants(claude_hook_script_paths(&text, home), root, home, writable)
+}
+
+/// Copilot CLI's equivalent of [`claude_hook_script_grants`] (#704): the
+/// scripts named by user-level hooks (`hooks.<event>[]` with `bash`,
+/// `command`, or `exec` + `args`) in `<root>/settings.json` and
+/// `<root>/hooks/*.json`, and by `mcpServers.<n>.command` + `args` in
+/// `<root>/mcp-config.json`. All three are `host_persistence_denies`
+/// entries, so the agent cannot plant a path in them. A symlinked file or
+/// `hooks/` dir is not read: Seatbelt matches the resolved path, so the deny
+/// would not cover the target. Project-level config is never read. Same
+/// grant shape and skips as the Claude version; macOS only for the same
+/// reason.
+fn copilot_hook_script_grants(root: &Path, home: &Path) -> Vec<AgentDir> {
+    if !cfg!(target_os = "macos") {
+        return vec![];
+    }
+    let plain = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| !m.file_type().is_symlink());
+    let mut files = vec![root.join("settings.json"), root.join("mcp-config.json")];
+    if plain(&root.join("hooks"))
+        && let Ok(rd) = std::fs::read_dir(root.join("hooks"))
+    {
+        files.extend(
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|e| e == "json")),
+        );
+    }
+    let mut commands: Vec<Vec<String>> = vec![];
+    for f in files.iter().filter(|f| plain(f)) {
+        let Some(v) = read_small_regular_file(f)
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        else {
+            continue;
+        };
+        let with_args = |head: &str, e: &serde_json::Value| {
+            let args = e.get("args").and_then(|a| a.as_array());
+            std::iter::once(head.to_string())
+                .chain(
+                    args.into_iter()
+                        .flatten()
+                        .filter_map(|a| a.as_str())
+                        .map(String::from),
+                )
+                .collect::<Vec<_>>()
+        };
+        for e in v
+            .get("hooks")
+            .and_then(|h| h.as_object())
+            .into_iter()
+            .flat_map(|events| events.values())
+            .filter_map(|e| e.as_array())
+            .flatten()
+        {
+            for key in ["bash", "command"] {
+                commands.extend(e.get(key).and_then(|c| c.as_str()).map(shell_words));
+            }
+            commands.extend(
+                e.get("exec")
+                    .and_then(|c| c.as_str())
+                    .map(|x| with_args(x, e)),
+            );
+        }
+        for s in v
+            .get("mcpServers")
+            .and_then(|m| m.as_object())
+            .into_iter()
+            .flat_map(|m| m.values())
+        {
+            commands.extend(
+                s.get("command")
+                    .and_then(|c| c.as_str())
+                    .map(|x| with_args(x, s)),
+            );
+        }
+    }
+    script_grants(script_paths(commands, home), root, home, &[])
+}
+
+/// Read + exec grants for `paths`, minus anything under `root`/`writable`,
+/// credentials or unnameable in SBPL. See [`claude_hook_script_grants`].
+fn script_grants(
+    paths: Vec<PathBuf>,
+    root: &Path,
+    home: &Path,
+    writable: &[PathBuf],
+) -> Vec<AgentDir> {
     let own: Vec<PathBuf> = std::iter::once(root)
         .chain(writable.iter().map(PathBuf::as_path))
         .flat_map(|p| {
@@ -344,7 +431,7 @@ fn claude_hook_script_grants(root: &Path, home: &Path, writable: &[PathBuf]) -> 
         .filter(|p| !p.as_os_str().is_empty())
         .collect();
     let mut out: Vec<AgentDir> = vec![];
-    for path in claude_hook_script_paths(&text, home) {
+    for path in paths {
         let Ok(real) = std::fs::canonicalize(&path) else {
             continue;
         };
@@ -360,7 +447,8 @@ fn claude_hook_script_grants(root: &Path, home: &Path, writable: &[PathBuf]) -> 
                     .any(|d| p.starts_with(home.join(d)))
                 || crate::sandbox::validate_sbpl_path(p).is_err()
         };
-        if sensitive(&path) || sensitive(&real) {
+        let via = symlink_locations(&path);
+        if sensitive(&real) || via.iter().any(|p| sensitive(p)) {
             continue;
         }
         out.push(AgentDir {
@@ -370,7 +458,35 @@ fn claude_hook_script_grants(root: &Path, home: &Path, writable: &[PathBuf]) -> 
             process_exec: true,
             write_files: vec![],
             create_dirs: vec![],
+            via,
         });
+    }
+    out
+}
+
+/// `path` plus the location of every symlink crossed resolving it, each with
+/// its parent canonicalized. Used to refuse a script grant reached through a
+/// link the agent could rewrite.
+fn symlink_locations(path: &Path) -> Vec<PathBuf> {
+    let mut out = vec![path.to_path_buf()];
+    let mut queue = vec![path.to_path_buf()];
+    // Bounded like the kernel's ELOOP; past it canonicalize fails anyway.
+    while let Some(p) = queue.pop().filter(|_| out.len() < 64) {
+        let comps: Vec<_> = p.components().collect();
+        let mut cur = PathBuf::new();
+        for (i, c) in comps.iter().enumerate() {
+            cur.push(c);
+            let Ok(target) = std::fs::read_link(&cur) else {
+                continue;
+            };
+            let parent = cur.parent().unwrap_or(Path::new("/"));
+            let parent = std::fs::canonicalize(parent).unwrap_or(parent.to_path_buf());
+            out.push(parent.join(cur.file_name().unwrap_or_default()));
+            let mut next = parent.join(target);
+            next.extend(&comps[i + 1..]);
+            queue.push(next);
+            break;
+        }
     }
     out
 }
@@ -394,9 +510,15 @@ fn claude_hook_script_paths(text: &str, home: &Path) -> Vec<PathBuf> {
         .filter_map(|h| h.get("command")?.as_str())
         .collect();
     commands.extend(v.pointer("/statusLine/command").and_then(|c| c.as_str()));
+    script_paths(commands.into_iter().map(shell_words), home)
+}
+
+/// The absolute script path (see [`script_token`]) of each command, after
+/// `~` and `$HOME` expansion.
+fn script_paths(commands: impl IntoIterator<Item = Vec<String>>, home: &Path) -> Vec<PathBuf> {
     commands
         .into_iter()
-        .filter_map(|c| script_token(shell_words(c)))
+        .filter_map(script_token)
         .filter_map(|w| {
             let w = if let Some(rest) = w.strip_prefix("~/") {
                 home.join(rest)
@@ -1345,6 +1467,7 @@ impl Agent {
             process_exec: false,
             write_files: vec![],
             create_dirs: vec![],
+            via: vec![],
         };
         match shell_name {
             // Config dir: `fish_variables` (universal variables) is rewritten by
@@ -1386,14 +1509,21 @@ impl Agent {
                 // `sandbox.deny_copilot_dir_exec` drops `process_exec` here on
                 // Linux via `deny_copilot_dir_exec`; it stays set by default
                 // until the key has been out long enough to flip.
-                vec![AgentDir {
-                    path: home.join(".copilot"),
-                    write: true,
-                    map_exec: true,
-                    process_exec: true,
-                    write_files: vec![],
-                    create_dirs: vec![],
-                }]
+                let root = home.join(".copilot");
+                let mut dirs = copilot_hook_script_grants(&root, home);
+                dirs.insert(
+                    0,
+                    AgentDir {
+                        path: root,
+                        write: true,
+                        map_exec: true,
+                        process_exec: true,
+                        write_files: vec![],
+                        create_dirs: vec![],
+                        via: vec![],
+                    },
+                );
+                dirs
             }
             Agent::Shell => {
                 // Shell needs write access to its config/data dirs for history
@@ -1454,6 +1584,7 @@ impl Agent {
                         // Legacy auth.json (newer versions use account.json in data dir)
                         write_files: vec!["auth.json"],
                         create_dirs: vec![],
+                        via: vec![],
                     },
                     AgentDir {
                         path: data_dir,
@@ -1462,6 +1593,7 @@ impl Agent {
                         process_exec: false,
                         write_files: vec![],
                         create_dirs: vec![],
+                        via: vec![],
                     },
                     AgentDir {
                         path: state_dir,
@@ -1470,6 +1602,7 @@ impl Agent {
                         process_exec: false,
                         write_files: vec![],
                         create_dirs: vec![],
+                        via: vec![],
                     },
                     AgentDir {
                         path: cache_dir.clone(),
@@ -1478,6 +1611,7 @@ impl Agent {
                         process_exec: false,
                         write_files: vec![],
                         create_dirs: vec![],
+                        via: vec![],
                     },
                     AgentDir {
                         // OpenCode downloads managed tool binaries (rg, fd, etc.) here
@@ -1487,6 +1621,7 @@ impl Agent {
                         process_exec: true,
                         write_files: vec![],
                         create_dirs: vec![],
+                        via: vec![],
                     },
                 ]
             }
@@ -1501,6 +1636,7 @@ impl Agent {
                         process_exec: false,
                         write_files: vec![],
                         create_dirs: vec![],
+                        via: vec![],
                     },
                     AgentDir {
                         path: home.join(".gemini/antigravity-cli"),
@@ -1509,6 +1645,7 @@ impl Agent {
                         process_exec: false,
                         write_files: vec![],
                         create_dirs: vec![],
+                        via: vec![],
                     },
                 ]
             }
@@ -1559,6 +1696,7 @@ impl Agent {
                     process_exec: false,
                     write_files: vec![],
                     create_dirs: vec![],
+                    via: vec![],
                 };
                 vec![
                     AgentDir {
@@ -1597,6 +1735,7 @@ impl Agent {
                         // `AgentDir::create_dirs` for the bound and the Linux
                         // caveat.
                         create_dirs: vec!["trust.json.lock"],
+                        via: vec![],
                     },
                     writable(agent.join("sessions")),
                     writable(agent.join("prompts")),
@@ -1611,6 +1750,7 @@ impl Agent {
                         process_exec: true,
                         write_files: vec![],
                         create_dirs: vec![],
+                        via: vec![],
                     },
                 ]
             }
@@ -1634,6 +1774,7 @@ impl Agent {
                             process_exec: false,
                             write_files: vec![],
                             create_dirs: vec![],
+                            via: vec![],
                         },
                     );
                     return dirs;
@@ -1651,6 +1792,7 @@ impl Agent {
                         process_exec: false,
                         write_files: vec![],
                         create_dirs: vec![],
+                        via: vec![],
                     },
                     AgentDir {
                         path: home.join(".claude.json"),
@@ -1659,6 +1801,7 @@ impl Agent {
                         process_exec: false,
                         write_files: vec![],
                         create_dirs: vec![],
+                        via: vec![],
                     },
                 ];
                 let writable: Vec<PathBuf> = dirs.iter().map(|d| d.path.clone()).collect();
@@ -1726,6 +1869,7 @@ impl Agent {
                         process_exec: false,
                         write_files: vec![],
                         create_dirs: vec![],
+                        via: vec![],
                     },
                     AgentDir {
                         path: data_base.join("goose"),
@@ -1734,6 +1878,7 @@ impl Agent {
                         process_exec: false,
                         write_files: vec![],
                         create_dirs: vec![],
+                        via: vec![],
                     },
                     AgentDir {
                         path: state_base.join("goose"),
@@ -1742,6 +1887,7 @@ impl Agent {
                         process_exec: false,
                         write_files: vec![],
                         create_dirs: vec![],
+                        via: vec![],
                     },
                 ]
             }
@@ -1767,6 +1913,7 @@ impl Agent {
                     process_exec: false,
                     write_files: vec![],
                     create_dirs: vec![],
+                    via: vec![],
                 }]
             }
         }
@@ -2314,6 +2461,11 @@ pub struct AgentDir {
     ///   Under bubblewrap any *new* subdirectory name can be made and any
     ///   *empty* one removed, never file content (no `WriteFile`/`MakeReg`).
     pub create_dirs: Vec<&'static str>,
+    /// For a hook/MCP script grant: the path as configured plus every symlink
+    /// location crossed resolving it (see [`symlink_locations`]). A grant is
+    /// dropped when any of these sits in a writable tree, since the agent could
+    /// swap that link for one to any file it wants read. Empty otherwise.
+    pub via: Vec<PathBuf>,
 }
 
 /// The root `dsh` will resolve for its Harness home, mirroring the harness's
@@ -2383,6 +2535,30 @@ pub fn deny_copilot_dir_exec(dirs: &mut [AgentDir], home: &Path) -> bool {
 /// brings the built-in agent dirs in line. Paths that cannot be resolved (a dir
 /// the caller has not created yet, a dangling link) are left as-is so the
 /// caller still emits a rule for the literal path rather than dropping it.
+/// Drop hook/MCP script grants (file-level, exec-only) that sit under a path
+/// the sandbox already makes writable: the project, `--repo-dir` roots,
+/// `allow.write` and the agent's own writable dirs. Those scripts are already
+/// readable and run under the normal rules for that tree; an exec-only grant
+/// would write-deny the script and pin its parent, so a developer could not
+/// edit their own MCP server or hook. A grant whose configured path or any
+/// symlink crossed resolving it ([`AgentDir::via`]) is in such a tree is
+/// dropped too: the agent could point that link at any file it wants read.
+/// Call after [`canonicalize_agent_dirs`].
+pub fn drop_script_grants_under(dirs: &mut Vec<AgentDir>, writable: &[PathBuf]) {
+    let mut roots: Vec<PathBuf> = writable
+        .iter()
+        .chain(dirs.iter().filter(|d| d.write).map(|d| &d.path))
+        .flat_map(|p| [p.clone(), std::fs::canonicalize(p).unwrap_or_default()])
+        .filter(|p| !p.as_os_str().is_empty())
+        .collect();
+    roots.dedup();
+    dirs.retain(|d| {
+        let script = !d.write && d.process_exec && !d.map_exec && d.path.is_file();
+        let under = |p: &PathBuf| roots.iter().any(|r| p.starts_with(r));
+        !(script && (under(&d.path) || d.via.iter().any(under)))
+    });
+}
+
 pub fn canonicalize_agent_dirs(dirs: &mut [AgentDir]) {
     for dir in dirs {
         if let Ok(resolved) = std::fs::canonicalize(&dir.path) {
@@ -2718,6 +2894,85 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
+    fn copilot_hook_and_mcp_scripts_get_exec_only_file_grants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let home = base.join("home");
+        let root = home.join(".copilot");
+        let ext = base.join("ext");
+        for d in [&root.join("hooks"), &ext, &home.join(".ssh")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let file = |p: PathBuf| {
+            std::fs::write(&p, "#!/bin/sh\n").unwrap();
+            p
+        };
+        let bash = file(ext.join("bash.sh"));
+        let exec = file(ext.join("exec.py"));
+        let setting = file(ext.join("setting.sh"));
+        let server = file(ext.join("server.js"));
+        let log = file(ext.join("log.txt"));
+        let linked = file(ext.join("linked.sh"));
+        let project = file(ext.join("project.sh"));
+        let key = file(home.join(".ssh/id_ed25519"));
+        let inside = file(root.join("own.sh"));
+        let hook = |cmd: serde_json::Value| {
+            serde_json::json!({"version": 1, "hooks": {"preToolUse": [cmd]}}).to_string()
+        };
+        std::fs::write(
+            root.join("hooks/a.json"),
+            hook(serde_json::json!({"type": "command", "bash": format!("'{}' {}", bash.display(), log.display())})),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("hooks/b.json"),
+            hook(serde_json::json!({"type": "command", "exec": "python3", "args": ["-u", exec.display().to_string()]})),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("settings.json"),
+            hook(serde_json::json!({"type": "command", "command": format!("{} && {}", setting.display(), inside.display())})),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("mcp-config.json"),
+            serde_json::json!({"mcpServers": {
+                "a": {"command": "node", "args": [server.display().to_string()]},
+                "b": {"command": key.display().to_string()},
+                "c": {"command": "npx", "args": ["-y", "pkg"]},
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        // A symlinked hook file is not covered by the write deny: not read.
+        let planted = base.join("planted.json");
+        std::fs::write(
+            &planted,
+            hook(serde_json::json!({"bash": linked.display().to_string()})),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&planted, root.join("hooks/c.json")).unwrap();
+        // Project-level config is never read.
+        std::fs::create_dir_all(base.join(".github/hooks")).unwrap();
+        std::fs::write(
+            base.join(".github/hooks/p.json"),
+            hook(serde_json::json!({"bash": project.display().to_string()})),
+        )
+        .unwrap();
+
+        let got = copilot_hook_script_grants(&root, &home);
+        let paths: Vec<_> = got.iter().map(|d| d.path.clone()).collect();
+        for want in [&bash, &exec, &setting, &server] {
+            assert!(paths.contains(want), "{want:?} missing: {paths:?}");
+        }
+        for not in [&log, &linked, &project, &key, &inside] {
+            assert!(!paths.contains(not), "{not:?} granted: {paths:?}");
+        }
+        assert!(got.iter().all(|d| !d.write && d.process_exec));
+    }
+
+    #[test]
     fn claude_hook_scripts_tolerate_missing_and_bad_settings() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(claude_hook_script_grants(tmp.path(), tmp.path(), &[]).is_empty());
@@ -2778,6 +3033,7 @@ mod tests {
             process_exec: false,
             write_files: vec![],
             create_dirs: vec![],
+            via: vec![],
         }
     }
 
@@ -4834,5 +5090,62 @@ mod tests {
         let candidate = Path::new("/home/user/.asdf/shims/copilot");
         let result = resolve_mise_shim(candidate, "copilot");
         let _ = result;
+    }
+
+    /// A script inside a writable tree (the project) keeps no exec-only grant,
+    /// so it is not write-denied; one outside keeps its grant.
+    #[test]
+    fn script_grants_under_writable_paths_are_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let proj = base.join("proj");
+        std::fs::create_dir_all(proj.join("mcp")).unwrap();
+        let inside = proj.join("mcp/server.js");
+        let outside = base.join("hook.sh");
+        let bin = base.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for f in [&inside, &outside] {
+            std::fs::write(f, "").unwrap();
+        }
+        let grant = |p: &Path| AgentDir {
+            path: p.to_path_buf(),
+            write: false,
+            map_exec: false,
+            process_exec: true,
+            write_files: vec![],
+            create_dirs: vec![],
+            via: vec![],
+        };
+        let mut dirs = vec![grant(&inside), grant(&outside), grant(&bin)];
+        drop_script_grants_under(&mut dirs, &[proj]);
+        let paths: Vec<_> = dirs.iter().map(|d| d.path.clone()).collect();
+        // `bin` is a directory grant (OpenCode's shape), never dropped here.
+        assert_eq!(paths, vec![outside, bin]);
+    }
+
+    /// A configured script path that is a symlink in a writable tree gets no
+    /// grant, wherever it points: the agent could repoint it at a secret. A
+    /// symlink outside writable trees still resolves and is granted.
+    #[test]
+    fn script_grant_through_writable_symlink_is_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let (proj, out) = (base.join("proj"), base.join("out"));
+        std::fs::create_dir_all(proj.join("sub")).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        let secret = out.join("secret");
+        let hook = out.join("hook.sh");
+        std::fs::write(&secret, "").unwrap();
+        std::fs::write(&hook, "").unwrap();
+        // Direct link in the project; link outside via a dir link in the project.
+        std::os::unix::fs::symlink(&secret, proj.join("evil.sh")).unwrap();
+        std::os::unix::fs::symlink(proj.join("sub"), out.join("d")).unwrap();
+        std::os::unix::fs::symlink(&secret, proj.join("sub/x")).unwrap();
+        std::os::unix::fs::symlink(&hook, out.join("ok.sh")).unwrap();
+        let paths = vec![proj.join("evil.sh"), out.join("d/x"), out.join("ok.sh")];
+        let mut dirs = script_grants(paths, &base.join("root"), &base.join("home"), &[]);
+        drop_script_grants_under(&mut dirs, &[proj]);
+        let got: Vec<_> = dirs.iter().map(|d| d.path.clone()).collect();
+        assert_eq!(got, vec![hook]);
     }
 }

@@ -5623,6 +5623,15 @@ fn assemble_sandbox(
     }
     // After pre-creation, so a dir we just made resolves too. See #171.
     agent::canonicalize_agent_dirs(&mut agent_dirs);
+    agent::drop_script_grants_under(
+        &mut agent_dirs,
+        &[
+            std::slice::from_ref(&probe.project_dir),
+            opts.repos.dirs,
+            &resolved.allow_write,
+        ]
+        .concat(),
+    );
 
     // An agent config dir can be relocated by an env var the user (or a repo, or
     // an attacker) controls — CLAUDE_CONFIG_DIR is used raw, the XDG_* bases feed
@@ -7525,6 +7534,15 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
     let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
     let mut agent_dirs = resolved.agent_config_dirs(active_agent, &home_dir);
     agent::canonicalize_agent_dirs(&mut agent_dirs);
+    agent::drop_script_grants_under(
+        &mut agent_dirs,
+        &[
+            std::slice::from_ref(&project_dir),
+            &repo_paths[..],
+            &resolved.allow_write,
+        ]
+        .concat(),
+    );
     let keychain_substitute = cplt::sandbox::keychain_substitute(
         active_agent,
         &home_dir,

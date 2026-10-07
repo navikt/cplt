@@ -3168,6 +3168,7 @@ mod tests {
             process_exec: false,
             write_files: vec![],
             create_dirs: vec![],
+            via: vec![],
         }];
         let exec = [home.join(".local")];
         let mut config = test_config(home, &[]);
@@ -4213,6 +4214,7 @@ mod tests {
             process_exec: false,
             write_files: vec!["auth.json"],
             create_dirs: vec![],
+            via: vec![],
         }];
         let exec = [home.join(".config/opencode")];
         let mut config = test_config(home, &[]);
