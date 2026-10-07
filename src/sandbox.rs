@@ -1542,6 +1542,21 @@ pub fn session_writable_roots(
     roots
 }
 
+/// The trees writable by construction rather than by config: the writable
+/// home tool dirs (`~/.cache`, `~/.yarn`, ...) and the system temp dirs. A
+/// hook/MCP script reached through one of these keeps no exec-only grant
+/// (`agent::drop_script_grants_under`); the agent could rewrite the link (#714).
+#[must_use]
+pub fn home_and_temp_writable_roots(home: &Path) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = policy::HOME_TOOL_DIRS
+        .iter()
+        .filter(|d| d.write)
+        .map(|d| home.join(d.path))
+        .collect();
+    roots.extend(SYSTEM_TEMP_DIRS.iter().map(PathBuf::from));
+    roots
+}
+
 /// Names the temp-dir collision in the refusal, and selects its remedy: a temp
 /// dir is writable with no grant to withdraw, so "narrow one of the two" is not
 /// advice a user can act on there.

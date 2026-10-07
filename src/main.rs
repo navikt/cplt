@@ -5629,6 +5629,7 @@ fn assemble_sandbox(
             std::slice::from_ref(&probe.project_dir),
             opts.repos.dirs,
             &resolved.allow_write,
+            &cplt::sandbox::home_and_temp_writable_roots(home_dir),
         ]
         .concat(),
     );
@@ -7540,6 +7541,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
             std::slice::from_ref(&project_dir),
             &repo_paths[..],
             &resolved.allow_write,
+            &cplt::sandbox::home_and_temp_writable_roots(&home_dir),
         ]
         .concat(),
     );
