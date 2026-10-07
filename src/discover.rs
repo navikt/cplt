@@ -2353,7 +2353,18 @@ ELECTRON_RUN_AS_NODE=1 "/Applications/Visual Studio Code.app/Contents/Frameworks
     fn fake_binary(dir: &Path, name: &str, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        // Written in-process, the script would be open for writing while other
+        // test threads fork; a fork in that window inherits the descriptor and
+        // our exec fails ETXTBSY. `cp` gives `path` an inode whose only writable
+        // descriptor lives in the child (same fix as copilot_extract's Fixture).
+        let staging = dir.join(format!("{name}.staging"));
+        std::fs::write(&staging, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let copied = std::process::Command::new("cp")
+            .arg(&staging)
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(copied.success(), "cp of the fake binary failed: {copied}");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
     }
