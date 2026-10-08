@@ -674,13 +674,9 @@ mod tests {
         };
         std::os::unix::fs::symlink(root.join("gone"), b.join("opencode.json")).unwrap();
         refused(b.join("opencode.json"));
-        assert!(
-            std::process::Command::new("/usr/bin/mkfifo")
-                .arg(root.join("fifo"))
-                .status()
-                .unwrap()
-                .success()
-        );
+        let fifo = std::ffi::CString::new(root.join("fifo").to_str().unwrap()).unwrap();
+        // SAFETY: valid C string.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
         std::os::unix::fs::symlink(root.join("fifo"), b.join("opencode.json")).unwrap();
         refused(b.join("opencode.json"));
         std::fs::hard_link(root.join("secret"), b.join("opencode.jsonc")).unwrap();

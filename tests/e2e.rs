@@ -9848,13 +9848,9 @@ paths = [
             std::fs::remove_file(&link).unwrap();
             std::fs::create_dir_all(home.h.join(".ssh")).unwrap();
             std::fs::write(home.h.join(".ssh/config"), SECRET).unwrap();
-            assert!(
-                Command::new("/usr/bin/mkfifo")
-                    .arg(home.h.join("fifo"))
-                    .status()
-                    .unwrap()
-                    .success()
-            );
+            let c = std::ffi::CString::new(home.h.join("fifo").to_str().unwrap()).unwrap();
+            // SAFETY: valid C string.
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
             std::fs::create_dir_all(home.h.join(".cargo")).unwrap();
             std::fs::write(home.h.join(".cargo/credentials.toml"), SECRET).unwrap();
             for target in [".ssh/config", "fifo", ".cargo/credentials.toml"] {
