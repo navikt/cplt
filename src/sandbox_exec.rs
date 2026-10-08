@@ -294,6 +294,10 @@ fn configure_command(
         //     --allow-localhost-any. Without explicit localhost access, the proxy is
         //     the sole mechanism blocking loopback connections (Landlock is port-based
         //     only and cannot distinguish localhost from remote hosts).
+        //   - Linux, OpenCode v2: the session sets NO_PROXY for loopback itself
+        //     (`opencode_v2::prepare`), so its client reaches its service. Loopback
+        //     traffic from any proxy-honouring tool then skips the proxy and its log;
+        //     Landlock still limits it to the allowlisted ports (ABI 4+).
         #[cfg(target_os = "macos")]
         let set_no_proxy = {
             let _ = (allow_localhost, allow_localhost_any); // used on Linux only

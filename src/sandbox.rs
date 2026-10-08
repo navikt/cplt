@@ -421,8 +421,8 @@ impl PreparedSandbox {
             {
                 ui::warn(
                     "OpenCode v2: this kernel cannot filter TCP ports (Landlock ABI < 4, \
-                     kernel < 6.7), so a host OpenCode service on port 49374 is reachable; \
-                     protected by the service password only.",
+                     kernel < 6.7), so every loopback port is reachable, including a host \
+                     OpenCode service on 49374 (protected by its password only).",
                 );
             }
         }

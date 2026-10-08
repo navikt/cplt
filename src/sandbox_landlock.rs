@@ -1546,7 +1546,19 @@ pub fn hide_files(
             let Ok(real) = std::fs::canonicalize(e.path()) else {
                 continue;
             };
+            // A link back to the dir or above it (`ln -s . loop`) would expand
+            // this dir again, forever.
+            if dir.starts_with(&real) {
+                continue;
+            }
             if real.starts_with(&dir) && !skip.contains(&e.file_name().as_os_str()) {
+                if rules.len() > 100_000 {
+                    return Err(format!(
+                        "{} has too many entries to grant one by one for OpenCode v2. \
+                         See https://github.com/navikt/cplt/issues/719",
+                        dir.display()
+                    ));
+                }
                 rules.push(FsRule {
                     path: real,
                     nofollow: true,
@@ -6203,6 +6215,15 @@ mod tests {
         assert!(
             hide_files(&mut rules, &mut None, &hidden).is_err(),
             "a rule on a link to it"
+        );
+        let state = home.join(".local/state/opencode");
+        std::os::unix::fs::symlink(".", state.join("dot")).unwrap();
+        std::os::unix::fs::symlink("..", state.join("up")).unwrap();
+        let mut rules = vec![read(state.clone())];
+        hide_files(&mut rules, &mut None, &hidden).unwrap();
+        assert!(
+            rules.iter().all(|r| !state.starts_with(&r.path)),
+            "a loop link is skipped"
         );
         std::fs::hard_link(&hidden[0], home.join(".config/opencode/alias")).unwrap();
         let mut rules = vec![read(home.join("proj"))];
