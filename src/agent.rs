@@ -336,17 +336,23 @@ fn opencode_db_has_copilot(db: &Path) -> bool {
     if !db.symlink_metadata().is_ok_and(|m| m.is_file()) {
         return false;
     }
-    std::process::Command::new("/usr/bin/sqlite3")
-        .args(["-init", "/dev/null", "-readonly", "-batch"])
-        .arg(db)
-        .arg(
+    // Bounded: a FIFO swapped in after the check above would otherwise hang
+    // the launch.
+    let Some(db) = db.to_str() else { return false };
+    crate::discover::probe_output(
+        Path::new("/usr/bin/sqlite3"),
+        &[
+            "-init",
+            "/dev/null",
+            "-readonly",
+            "-batch",
+            db,
             "SELECT 1 FROM credential WHERE integration_id = 'github-copilot' \
              AND json_extract(value, '$.metadata.enterpriseUrl') IS NULL LIMIT 1",
-        )
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .is_ok_and(|o| o.status.success() && o.stdout.trim_ascii() == b"1")
+        ],
+        std::time::Duration::from_secs(5),
+    )
+    .is_some_and(|o| o.trim() == "1")
 }
 
 /// `Ok(None)` when the file does not exist, `Ok(Some(body))` when it was
@@ -361,10 +367,23 @@ fn read_opencode_auth_json(path: &Path) -> Result<Option<String>, ()> {
         Ok(m) if m.is_symlink() => return Err(()),
         Ok(_) => {}
     }
-    crate::untrusted::read_untrusted(path, SMALL_FILE_LIMIT)
+    // nlink == 1 on the opened fd: a hard link to a host file is refused too.
+    use std::io::Read as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let file = crate::untrusted::open_untrusted(path)
         .ok()
         .flatten()
-        .map(Some)
+        .filter(|f| {
+            f.metadata()
+                .is_ok_and(|m| m.nlink() == 1 && m.len() <= SMALL_FILE_LIMIT)
+        })
+        .ok_or(())?;
+    let mut s = String::new();
+    file.take(SMALL_FILE_LIMIT + 1)
+        .read_to_string(&mut s)
+        .map_err(|_| ())?;
+    (s.len() as u64 <= SMALL_FILE_LIMIT)
+        .then_some(Some(s))
         .ok_or(())
 }
 
@@ -5509,6 +5528,12 @@ mod tests {
             opencode_host_login(tmp.path(), "tok")
         });
         assert!(got.is_none(), "handed over through a symlink: {got:?}");
+        std::fs::remove_file(dir.join("auth.json")).unwrap();
+        std::fs::hard_link(&secret, dir.join("auth.json")).unwrap();
+        let got = temp_env::with_var("XDG_DATA_HOME", None::<&str>, || {
+            opencode_host_login(tmp.path(), "tok")
+        });
+        assert!(got.is_none(), "handed over through a hard link: {got:?}");
     }
 
     #[test]
