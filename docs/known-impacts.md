@@ -490,7 +490,11 @@ for `mmdc -p`:
 
 Adjust the path to the `chrome-headless-shell` build you have. `--no-sandbox`
 is needed for the same reason as with Playwright above; without it the launch
-fails with `ConnectionClosedError: Connection closed`.
+fails with `ConnectionClosedError: Connection closed`. Puppeteer only guarantees its own bundled
+browser, so a Playwright upgrade can bring a Chromium that this Puppeteer
+version does not support. If launches start failing after an upgrade, use the
+`PUPPETEER_CACHE_DIR` alternative below, which gives Puppeteer its matching
+browser.
 
 Alternatives: set `PUPPETEER_CACHE_DIR` to a directory under
 `~/Library/Caches/ms-playwright`, download the browser there outside cplt
