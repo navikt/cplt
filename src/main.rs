@@ -8222,6 +8222,26 @@ fn run_config_show() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Whether an `--unset` left the repo config's content as it was. Compares
+/// parsed values with empty tables pruned, since the setter may create an
+/// empty `[propose]` or `[deny]` on its way to a value that is not there.
+fn repo_doc_unchanged(before: &str, after: &toml_edit::DocumentMut) -> bool {
+    fn prune(t: &mut toml::Table) {
+        for (_, v) in t.iter_mut() {
+            if let toml::Value::Table(sub) = v {
+                prune(sub);
+            }
+        }
+        t.retain(|_, v| !matches!(v, toml::Value::Table(sub) if sub.is_empty()));
+    }
+    let parse = |s: &str| {
+        let mut t: toml::Table = s.parse().unwrap_or_default();
+        prune(&mut t);
+        t
+    };
+    parse(before) == parse(&after.to_string())
+}
+
 fn display_repo_config(
     loaded: &repo_config::LoadedRepoConfig,
     project_dir: &std::path::Path,
@@ -8960,12 +8980,27 @@ fn run_config_set_repo(
 
     // Apply every value to the one document; nothing is written unless all
     // of them, and the result, are valid. A bare --unset removes the key.
+    // An --unset of named values reports each one that was not there, like
+    // the global path, and writes nothing when none of them was.
     let applied: &[&str] = if values.is_empty() { &[""] } else { values };
-    for val in applied {
+    let mut seen = std::collections::HashSet::new();
+    let mut removed = 0;
+    for val in applied.iter().filter(|v| seen.insert(**v)) {
+        let before = doc.to_string();
         if let Err(e) = config::set_repo_value_in_doc(&mut doc, key_info, target, val, unset) {
             ui::error(&format!("{e}\n  No changes were saved."));
             return ExitCode::FAILURE;
         }
+        if unset && !val.is_empty() {
+            if repo_doc_unchanged(&before, &doc) {
+                ui::warn(&format!("{key}: {val} is not set, nothing removed"));
+            } else {
+                removed += 1;
+            }
+        }
+    }
+    if unset && !values.is_empty() && removed == 0 {
+        return ExitCode::SUCCESS;
     }
     let val = values.join(", ");
 

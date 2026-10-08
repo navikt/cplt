@@ -5333,6 +5333,82 @@ paths = [
     }
 
     #[test]
+    fn e2e_config_set_repo_unset_warns_for_absent_value() {
+        let repo = make_repo_dir("set-repo-unset-partial");
+        std::fs::write(
+            repo.join(".cplt.toml"),
+            "[propose.allow]\nports = [8080, 9090]\n",
+        )
+        .unwrap();
+
+        let output = cplt_cmd()
+            .args([
+                "config",
+                "set",
+                "--repo",
+                "allow.ports",
+                "8080",
+                "7070",
+                "--unset",
+            ])
+            .current_dir(&repo)
+            .output()
+            .expect("should run");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "unset: {stderr}");
+        assert!(stderr.contains("7070 is not set"), "should warn: {stderr}");
+        assert!(
+            !stderr.contains("8080 is not set"),
+            "8080 was set: {stderr}"
+        );
+
+        let content = std::fs::read_to_string(repo.join(".cplt.toml")).unwrap();
+        assert!(
+            !content.contains("8080"),
+            "8080 should be removed: {content}"
+        );
+        assert!(content.contains("9090"), "9090 should stay: {content}");
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn e2e_config_set_repo_unset_all_absent_writes_nothing() {
+        let repo = make_repo_dir("set-repo-unset-absent");
+        let original = "# keep me\n[propose.allow]\nports = [ 8080 ]\n";
+        std::fs::write(repo.join(".cplt.toml"), original).unwrap();
+
+        let output = cplt_cmd()
+            .args([
+                "config",
+                "set",
+                "--repo",
+                "allow.ports",
+                "7070",
+                "6060",
+                "--unset",
+            ])
+            .current_dir(&repo)
+            .output()
+            .expect("should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "unset: {stderr}");
+        assert!(stderr.contains("7070 is not set"), "should warn: {stderr}");
+        assert!(stderr.contains("6060 is not set"), "should warn: {stderr}");
+        assert!(
+            !format!("{stdout}{stderr}").contains("removed from"),
+            "no removal: {stdout}{stderr}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join(".cplt.toml")).unwrap(),
+            original
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
     fn e2e_config_set_repo_port_array() {
         let repo = make_repo_dir("set-repo-ports");
 
