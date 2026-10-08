@@ -1996,11 +1996,6 @@ fn parse_pnpm_workspace(
         return;
     };
 
-    // Bound file size
-    if content.len() > WORKSPACE_MAX_FILE_SIZE {
-        return;
-    }
-
     // Simple YAML parsing — look for `packages:` array.
     // We don't pull in a YAML dependency; the format is simple enough.
     let mut in_packages = false;
@@ -2053,9 +2048,6 @@ fn parse_package_json_workspaces(
     let Some(content) = read_workspace_file(&path) else {
         return;
     };
-    if content.len() > WORKSPACE_MAX_FILE_SIZE {
-        return;
-    }
 
     let json: serde_json::Value = match serde_json::from_str(&content) {
         Ok(v) => v,
@@ -2099,9 +2091,6 @@ fn parse_cargo_workspace(
     let Some(content) = read_workspace_file(&path) else {
         return;
     };
-    if content.len() > WORKSPACE_MAX_FILE_SIZE {
-        return;
-    }
 
     let table: toml::Table = match content.parse() {
         Ok(v) => v,
@@ -2160,9 +2149,6 @@ fn parse_gradle_settings(
     } else {
         return;
     };
-    if content.len() > WORKSPACE_MAX_FILE_SIZE {
-        return;
-    }
 
     // Match both: include("app", "lib") and include 'app', 'lib'
     // Also: include(":services:api") → services/api
@@ -2217,9 +2203,6 @@ fn parse_go_work(
     let Some(content) = read_workspace_file(&path) else {
         return;
     };
-    if content.len() > WORKSPACE_MAX_FILE_SIZE {
-        return;
-    }
 
     let mut in_block = false;
     for line in content.lines() {

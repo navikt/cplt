@@ -252,8 +252,9 @@ fn opencode_v2_within(bin: &Path, home: &Path, timeouts: [std::time::Duration; 2
         .map_or(0, |d| d.as_nanos());
     let key = format!("{}\t{}\t{mtime}\t", real.display(), meta.len());
     let cache = cache_dir.join("opencode-version");
-    if let Some(v) = std::fs::read_to_string(&cache)
+    if let Some(v) = crate::untrusted::read_untrusted(&cache, SMALL_FILE_LIMIT)
         .ok()
+        .flatten()
         .and_then(|c| c.strip_prefix(&key).map(|v| v.trim().to_string()))
     {
         return Some(major_at_least_2(&v));
@@ -354,9 +355,17 @@ fn read_opencode_auth_json(path: &Path) -> Result<Option<String>, ()> {
     match path.symlink_metadata() {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(()),
+        // The data dir is agent-writable: a symlink here could point at any
+        // host JSON (gcloud ADC, ~/.docker/config.json) and have it handed
+        // to the agent in OPENCODE_AUTH_CONTENT. Refuse it.
+        Ok(m) if m.is_symlink() => return Err(()),
         Ok(_) => {}
     }
-    read_small_regular_file(path).map(Some).ok_or(())
+    crate::untrusted::read_untrusted(path, SMALL_FILE_LIMIT)
+        .ok()
+        .flatten()
+        .map(Some)
+        .ok_or(())
 }
 
 /// The `OPENCODE_AUTH_CONTENT` value that logs OpenCode in to GitHub Copilot
@@ -390,7 +399,15 @@ fn opencode_auth_overlay(auth_json: Option<&str>, token: &str) -> Option<String>
 
 /// [`opencode_auth_overlay`] for the store in `home`.
 pub(crate) fn opencode_host_login(home: &Path, token: &str) -> Option<String> {
-    let stored = read_opencode_auth_json(&opencode_auth_json(home)?).ok()?;
+    let path = opencode_auth_json(home)?;
+    if path.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+        crate::ui::warn(&format!(
+            "{} is a symlink; skipping the Copilot login handover. Replace it with a plain file.",
+            path.display()
+        ));
+        return None;
+    }
+    let stored = read_opencode_auth_json(&path).ok()?;
     opencode_auth_overlay(stored.as_deref(), token)
 }
 
@@ -5478,6 +5495,22 @@ mod tests {
     /// #609: the auth file sits in a dir the sandboxed agent can write, so a
     /// planted FIFO, device symlink or huge file must not hang or bloat the
     /// next launch; each is skipped.
+    /// Pre-existing leak: a symlinked auth.json (agent-writable data dir)
+    /// pointing at another host JSON must not reach OPENCODE_AUTH_CONTENT.
+    #[test]
+    fn opencode_host_login_refuses_symlinked_auth_json() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join(".local/share/opencode");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let secret = tmp.path().join("adc.json");
+        std::fs::write(&secret, r#"{"client_secret":"s3cret"}"#).unwrap();
+        std::os::unix::fs::symlink(&secret, dir.join("auth.json")).unwrap();
+        let got = temp_env::with_var("XDG_DATA_HOME", None::<&str>, || {
+            opencode_host_login(tmp.path(), "tok")
+        });
+        assert!(got.is_none(), "handed over through a symlink: {got:?}");
+    }
+
     #[test]
     fn provider_domains_skips_non_regular_and_oversize_auth_json() {
         let tmp = tempfile::tempdir().expect("tempdir");
