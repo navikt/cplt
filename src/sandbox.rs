@@ -361,17 +361,17 @@ impl PreparedSandbox {
 
     /// Add an OpenCode v2 session (#710): its rules go at the end of the
     /// profile, where they win, and its variables are set on the child last.
-    pub fn add_opencode_v2(&mut self, session: crate::opencode_v2::Session) {
-        // File grants go before the deny section, so every deny still wins.
-        let at = self
-            .profile_text
-            .find(profile::DENY_SECTION)
-            .unwrap_or(self.profile_text.len());
+    pub fn add_opencode_v2(&mut self, session: crate::opencode_v2::Session) -> Result<(), String> {
+        // File grants go before the denies, so every deny still wins.
+        let Some(at) = self.profile_text.find(profile::V2_GRANTS) else {
+            return Err("the sandbox profile has no place for the OpenCode v2 grants".into());
+        };
         self.profile_text
             .insert_str(at, &session.sbpl_before_denies);
         self.profile_text.push_str(&session.sbpl);
         self.extra_env = session.env;
         self.opencode_v2 = true;
+        Ok(())
     }
 
     /// Withdraw the read grant on the root `AGENTS.md` (#252).

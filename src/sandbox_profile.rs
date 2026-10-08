@@ -135,6 +135,7 @@ pub fn generate_profile_with_playwright_socket_dir(
         config.agent_dirs,
         config.keychain_substitute.is_some(),
     );
+    sbpl!(sb, "{V2_GRANTS}");
     emit_git_hooks(&mut sb, config.git_hooks_path);
     emit_git_worktree(&mut sb, config.git_common_dir, config.named_root_git_dirs);
     emit_root_agents_md(&mut sb, config.home_dir, config.root_agents_md);
@@ -2525,8 +2526,9 @@ fn emit_home_config_write_denies(sb: &mut String, config: &SandboxConfig, home: 
     sbpl!(sb);
 }
 
-/// The first line of the deny section; grants inserted before it lose to it.
-pub const DENY_SECTION: &str = ";; Sensitive directories — DENIED";
+/// Where an OpenCode v2 session's file grants go: after the home grants and
+/// before every deny, so each deny still wins over them.
+pub const V2_GRANTS: &str = ";; OpenCode v2 grants (#710)";
 
 fn emit_deny_rules(sb: &mut String, config: &SandboxConfig, home: &str) {
     // Sensitive directories — DENY (after allows, so these override)
@@ -2564,7 +2566,7 @@ fn emit_deny_rules(sb: &mut String, config: &SandboxConfig, home: &str) {
         .chain(DENIED_HOME_SUBPATHS.iter().map(|f| spell(f, false)))
         .chain(pnpm_files.iter().map(|f| spell(f, false)))
         .collect();
-    sbpl!(sb, "{DENY_SECTION}");
+    sbpl!(sb, ";; Sensitive directories — DENIED");
     for p in dirs.iter().flatten() {
         sbpl!(sb, "(deny file-read* (subpath \"{p}\"))");
         sbpl!(sb, "(deny file-write* (subpath \"{p}\"))");

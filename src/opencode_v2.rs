@@ -164,14 +164,19 @@ fn profile_tail(
         let git = launch_dir.ancestors().find(|d| d.join(".git").exists());
         git.unwrap_or(launch_dir).to_path_buf()
     };
+    let project = launch_dir
+        .ancestors()
+        .find(|d| d.join(".git").exists())
+        .unwrap_or(launch_dir);
     for dir in home.ancestors().chain(launch_dir.ancestors()) {
         reads.push(dir.to_path_buf());
+        // The project is readable already; an entry there is agent-planted
+        // and must not resolve anywhere for it (#716).
+        if dir.starts_with(project) {
+            continue;
+        }
         for name in [".claude", ".agents", ".opencode"] {
-            let entry = dir.join(name);
-            if let Ok(real) = std::fs::canonicalize(&entry) {
-                reads.push(real);
-            }
-            reads.push(entry);
+            grant_dir(home, &dir.join(name), &mut reads)?;
         }
         // Discovery also resolves and reads each `opencode.json(c)` as config
         // (#718), and the instruction loader blocks the session when an
@@ -189,9 +194,10 @@ fn profile_tail(
     }
     reads.sort();
     reads.dedup();
+    files.append(&mut reads);
     files.sort();
     files.dedup();
-    for p in reads.iter().chain(&files).chain(&denied).chain(&pinned) {
+    for p in files.iter().chain(&denied).chain(&pinned) {
         crate::sandbox::validate_sbpl_path(p)?;
     }
     let lit = |ps: &[PathBuf]| {
@@ -205,17 +211,16 @@ fn profile_tail(
         String::new()
     } else {
         format!(
-            ";; OpenCode v2 config and instruction files\n(allow file-read*{})\n",
+            ";; OpenCode v2 discovery: dir listings, config and instruction files\n\
+             (allow file-read*{})\n",
             lit(&files)
         )
     };
     let tail = format!(
         "\n;; OpenCode v2 session service (#710)\n\
-         (allow file-read-data{})\n\
          (deny file-read* file-write*{})\n\
          (deny file-write-unlink{})\n\
          (allow network-outbound (remote ip \"localhost:{port}\"))\n",
-        lit(&reads),
         lit(&denied),
         lit(&pinned),
     );
@@ -410,6 +415,31 @@ fn grant_file(home: &Path, file: &Path, reads: &mut Vec<PathBuf>) -> Result<(), 
     }
     reads.extend([real, file.to_path_buf()]);
     Ok(())
+}
+
+/// Grants the listing of a `.claude`, `.agents` or `.opencode` entry v2
+/// stats at startup: the spelled path, and its target when that is a
+/// directory outside every sandbox deny. Anything else that exists is
+/// refused, naming link and target: a planted link could name a key.
+fn grant_dir(home: &Path, entry: &Path, reads: &mut Vec<PathBuf>) -> Result<(), String> {
+    reads.push(entry.to_path_buf());
+    if std::fs::symlink_metadata(entry).is_err() {
+        return Ok(());
+    }
+    let real = std::fs::canonicalize(entry);
+    if let Ok(real) = &real
+        && real.is_dir()
+        && !crate::sandbox::dir_overlaps_credentials(home, real)
+    {
+        reads.push(real.clone());
+        return Ok(());
+    }
+    let to = real.map_or_else(|_| "nothing".into(), |r| r.display().to_string());
+    Err(format!(
+        "{} points to {to}, which is not a directory the sandbox allows. OpenCode v2 \
+         reads it at startup. Remove the link or point it at a directory.",
+        entry.display()
+    ))
 }
 
 #[cfg(test)]
@@ -715,7 +745,8 @@ mod tests {
                 .contains(&format!("{home}/.local/state/opencode/service.json"))
         );
         for read in [format!("{home}/.claude"), format!("{home}/src"), "/".into()] {
-            assert!(s.sbpl.contains(&format!("(literal \"{read}\")")), "{read}");
+            let lit = format!("(literal \"{read}\")");
+            assert!(s.sbpl_before_denies.contains(&lit), "{read}");
         }
     }
 }

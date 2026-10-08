@@ -9890,6 +9890,26 @@ paths = [
             }
         }
 
+        /// A `.agents` link the agent plants in the project must not make its
+        /// target readable at the next launch (#716 leak).
+        #[test]
+        fn planted_discovery_link_does_not_expose_a_key() {
+            require_sandbox!();
+            let home = stub_home();
+            let key = home.h.join(".ssh/id_ed25519");
+            std::fs::create_dir_all(key.parent().unwrap()).unwrap();
+            std::fs::write(&key, SECRET).unwrap();
+            symlink(&key, home.proj.join(".agents")).unwrap();
+            let (out, err, _) = home.sh(&format!("cat {}", key.display()));
+            assert!(!out.contains(SECRET), "{out}\n{err}");
+            // Outside the project, the same link is refused by name.
+            symlink(&key, home.h.join("work/.agents")).unwrap();
+            let (out, err, code) = home.sh(&format!("cat {}", key.display()));
+            assert_ne!(code, Some(0), "{err}");
+            assert!(!out.contains(SECRET), "{out}");
+            assert!(err.contains(&key.display().to_string()), "{err}");
+        }
+
         #[test]
         fn ancestor_opencode_json_symlink_is_refused() {
             require_sandbox!();
