@@ -929,20 +929,24 @@ fn emit_system_access(
         sbpl!(sb);
     }
 
-    // Cypress's Electron build registers this rendezvous service during
-    // bootstrap. Without it, bootstrap_check_in() fails with EPERM (1100)
-    // before `cypress verify` can start its smoke test. Keep this separate from
-    // the broader Chromium runtime grant: Cypress has only demonstrated a need
-    // for this exact bundle ID and numeric PID suffix.
+    // Cypress's Electron startup registers its Mach rendezvous service and
+    // opens RootDomainUserClient through IORegisterForSystemPower. Both are
+    // required for the smoke test and browser initialization.
     //
     // SECURITY: this activates only for an explicit "Cypress" cache-exec entry.
     // A repository cannot set that machine-local option, allow_cache_exec_any
     // does not imply it, and unrelated com.electron.* services remain denied.
+    // Scope the grants to the exact bundle ID with a numeric PID suffix and
+    // the power-monitor IOKit class. Other IOKit user clients stay denied.
     if allow_cypress_runtime {
         sbpl!(sb, ";; Cypress Electron runtime");
         sbpl!(
             sb,
             r#"(allow mach-register (global-name-regex #"^com\.electron\.cypress\.MachPortRendezvousServer\.[0-9]+$"))"#
+        );
+        sbpl!(
+            sb,
+            r#"(allow iokit-open-user-client (iokit-user-client-class "RootDomainUserClient"))"#
         );
         sbpl!(sb);
     }

@@ -1168,9 +1168,9 @@ pub fn playwright_runtime_intent(allow_cache_exec: &[String], _allow_cache_exec_
 
 /// Whether cache execution explicitly opts into Cypress's Electron runtime.
 ///
-/// The opt-in gates a macOS Mach registration needed by Cypress. Broad cache
-/// execution is deliberately insufficient because it must not grant additional
-/// Electron IPC rights.
+/// The opt-in gates Cypress's macOS Mach registration and power-monitor IOKit
+/// access. Broad cache execution is deliberately insufficient because it must
+/// not grant additional Electron system permissions.
 pub fn cypress_runtime_intent(allow_cache_exec: &[String], _allow_cache_exec_any: bool) -> bool {
     cache_exec_first_component_matches(allow_cache_exec, "Cypress")
 }

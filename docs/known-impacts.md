@@ -410,8 +410,11 @@ refuses it cannot launch with cache exec (`… refuses openat2(2) …`).
 macOS does not refuse or warn: Seatbelt checks the resolved path against rules
 on the literal cache path, so a link there grants nothing extra.
 
-On macOS, the explicit `Cypress` entry also grants Electron permission to
-register only `com.electron.cypress.MachPortRendezvousServer.<numeric-pid>`.
+On macOS, the explicit `Cypress` entry grants Electron permission to register
+only `com.electron.cypress.MachPortRendezvousServer.<numeric-pid>` and open
+`RootDomainUserClient` through `IORegisterForSystemPower` for power monitoring.
+The `iokit-open-user-client` grant is limited to that class; other IOKit user
+clients remain denied.
 It grants read/write, but not execution, under
 `~/Library/Application Support/Cypress`, where Cypress keeps browser profiles
 and project state. Without it, `cypress verify` exits during bootstrap with

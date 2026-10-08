@@ -14,7 +14,7 @@ mod common;
 
 #[cfg(target_os = "macos")]
 mod macos_tests {
-    use crate::common::{cplt_cmd, git_cmd};
+    use crate::common::{self, cplt_cmd, git_cmd};
 
     use std::ffi::OsString;
     use std::fs::{self, File};
@@ -1409,6 +1409,55 @@ mod macos_tests {
         opts.allow_cache_exec = &allow_cache_exec;
         let profile = write_real_profile(&opts);
 
+        let probe_project = tempfile::Builder::new()
+            .prefix(".cplt-cypress-power-")
+            .tempdir_in(&project)
+            .expect("create power monitor project");
+        let probe = common::cypress_power_monitor_probe(probe_project.path());
+        let direct = common::native_cmd(&probe)
+            .output()
+            .expect("run power monitor control");
+        assert!(
+            direct.status.success(),
+            "power monitor control must work outside Seatbelt: {}",
+            String::from_utf8_lossy(&direct.stderr)
+        );
+        for (cache_entry, broad_cache_exec, allowed) in [
+            (None, false, false),
+            (None, true, false),
+            (Some("Cypress-evil"), false, false),
+            (Some("Cypress"), false, true),
+            (Some("Cypress/15.18.1"), false, true),
+        ] {
+            let entries = cache_entry
+                .map(|entry| vec![entry.to_string()])
+                .unwrap_or_default();
+            let mut power_opts = default_opts(&project, &home);
+            power_opts.allow_cache_exec = &entries;
+            power_opts.allow_cache_exec_any = broad_cache_exec;
+            let power_profile =
+                tempfile::NamedTempFile::new().expect("create power monitor profile");
+            fs::write(power_profile.path(), generate_profile(&power_opts, &[]))
+                .expect("write power monitor profile");
+            let output = common::native_cmd(Path::new("/usr/bin/sandbox-exec"))
+                .arg("-f")
+                .arg(power_profile.path())
+                .arg(&probe)
+                .output()
+                .expect("run sandboxed power monitor");
+            assert_eq!(
+                output.status.code(),
+                Some(i32::from(!allowed)),
+                "cache entry {cache_entry:?}, broad exec {broad_cache_exec}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if allowed {
+                assert_eq!(output.stdout, b"power-monitor:OK\n");
+            } else {
+                assert_eq!(output.stderr, b"IORegisterForSystemPower denied\n");
+            }
+        }
+
         let marker = app_data.join("state.txt");
         let write = Command::new("sandbox-exec")
             .arg("-f")
@@ -1565,6 +1614,35 @@ mod macos_tests {
             .into_temp_path();
         fs::write(&profile, generate_profile(&opts, &[]))
             .expect("write generated Cypress test profile");
+
+        let smoke = cplt_cmd()
+            .args([
+                "--yes",
+                "--no-validate",
+                "--quiet",
+                "--no-proxy",
+                "--allow-cache-exec",
+                "Cypress",
+                "--allow-localhost-any",
+                "--project-dir",
+            ])
+            .arg(&project)
+            .current_dir(&project)
+            .args(["exec", "--"])
+            .arg(&cypress)
+            .args(["--smoke-test", "--ping=12345", "--user-data-dir"])
+            .arg(&browser_state)
+            .output()
+            .expect("run Cypress smoke test through cplt");
+        assert!(
+            smoke.status.success()
+                && String::from_utf8_lossy(&smoke.stdout)
+                    .lines()
+                    .any(|line| line.trim() == "12345"),
+            "Cypress smoke test failed:\n{}{}",
+            String::from_utf8_lossy(&smoke.stdout),
+            String::from_utf8_lossy(&smoke.stderr)
+        );
 
         let sandboxed = Command::new("sandbox-exec")
             .arg("-f")
