@@ -666,7 +666,7 @@ Pick one with `--agent <name>`, or make it the default with `cplt config set san
 | Agent | `--agent` value | Auto-detected | Auth |
 | --- | --- | --- | --- |
 | GitHub Copilot CLI | `copilot` | yes, priority 1 | GitHub token, from the Keychain or `gh` |
-| [OpenCode](https://opencode.ai/) | `opencode` | yes, priority 2 | Copilot subscription via `/connect`, or `--pass-env ANTHROPIC_API_KEY`; v2 on macOS only ([#710](docs/known-impacts.md#opencode-v2-is-refused)) |
+| [OpenCode](https://opencode.ai/) | `opencode` | yes, priority 2 | Copilot subscription via `/connect`, or `--pass-env ANTHROPIC_API_KEY`; v2: own sandboxed service per session ([#710](docs/known-impacts.md#opencode-v2)) |
 | [Antigravity CLI](https://github.com/google-antigravity/antigravity-cli) | `antigravity`, aliases `agy` and `agi` | yes, priority 3 | Google OAuth in the browser |
 | [Pi](https://github.com/earendil-works/pi) | `pi` | no | `--pass-env ANTHROPIC_API_KEY` and friends |
 | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | `claude`, aliases `cc` and `claude-code` | no | Subscription OAuth in `~/.claude` or the Keychain, `CLAUDE_CODE_OAUTH_TOKEN` (drops the Keychain grant), or `--pass-env ANTHROPIC_API_KEY` |

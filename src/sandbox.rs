@@ -320,11 +320,13 @@ pub struct PreparedSandbox {
     /// itself comes from `SandboxConfig::named_roots`.
     worktree_root: Option<PathBuf>,
     /// Set on the child last, after the sandbox environment (OpenCode v2, #710).
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     extra_env: Vec<(String, String)>,
     /// An OpenCode v2 session (#710): no gh handover via OPENCODE_AUTH_CONTENT.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     opencode_v2: bool,
+    /// The rules `precomputed` was built from, kept so an OpenCode v2 session
+    /// can take files out of them (#719).
+    #[cfg(target_os = "linux")]
+    policy: landlock_mod::LandlockPolicy,
     /// Landlock + seccomp pre-computed sandbox data (Linux only).
     /// Built in the parent process; applied in pre_exec.
     #[cfg(target_os = "linux")]
@@ -361,14 +363,71 @@ impl PreparedSandbox {
 
     /// Add an OpenCode v2 session (#710): its rules go at the end of the
     /// profile, where they win, and its variables are set on the child last.
+    /// On Linux the host service files leave the Landlock rules and the
+    /// session port joins the connect allowlist (#719), in both the direct
+    /// and the bubblewrap rules.
     pub fn add_opencode_v2(&mut self, session: crate::opencode_v2::Session) -> Result<(), String> {
         // File grants go before the denies, so every deny still wins.
-        let Some(at) = self.profile_text.find(profile::V2_GRANTS) else {
-            return Err("the sandbox profile has no place for the OpenCode v2 grants".into());
-        };
-        self.profile_text
-            .insert_str(at, &session.sbpl_before_denies);
-        self.profile_text.push_str(&session.sbpl);
+        #[cfg(target_os = "macos")]
+        {
+            let Some(at) = self.profile_text.find(profile::V2_GRANTS) else {
+                return Err("the sandbox profile has no place for the OpenCode v2 grants".into());
+            };
+            self.profile_text
+                .insert_str(at, &session.sbpl_before_denies);
+            self.profile_text.push_str(&session.sbpl);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let port = landlock_mod::NetRule { port: session.port };
+            // v2's service is a child of the client, so the `/proc/self`
+            // grant (the agent's pid) does not reach it, and Bun aborts at
+            // startup without `/proc`. Under bubblewrap that is the session's
+            // own pid namespace.
+            let read = landlock_mod::FsAccess {
+                read: true,
+                ..landlock_mod::FsAccess::default()
+            };
+            let extra: Vec<landlock_mod::FsRule> = session
+                .reads
+                .iter()
+                .map(PathBuf::as_path)
+                // The project is readable already, and the agent can plant there.
+                .filter(|p| !p.starts_with(&self.project_dir))
+                .chain([Path::new("/proc")])
+                .map(|path| landlock_mod::FsRule {
+                    path: path.to_path_buf(),
+                    access: read,
+                    nofollow: false,
+                })
+                .collect();
+            if self.bwrap_wrapper.is_none() {
+                ui::warn(
+                    "OpenCode v2 without Bubblewrap: /proc is readable, so the agent can \
+                     see the command lines of your other processes. Install bubblewrap \
+                     to limit it to the session's own processes.",
+                );
+            }
+            let p = &mut self.policy;
+            p.fs_rules.extend(extra.iter().cloned());
+            landlock_mod::hide_files(&mut p.fs_rules, &mut p.plain_file, &session.hidden)?;
+            p.net_rules.push(port);
+            if let Some(w) = &mut self.bwrap_wrapper {
+                w.fs_rules.extend(extra);
+                landlock_mod::hide_files(&mut w.fs_rules, &mut w.plain_file, &session.hidden)?;
+                w.net_rules.push(port);
+            }
+            self.precomputed.reload(&self.policy)?;
+            if self.policy.restrict_net_connect
+                && landlock_mod::available_abi_version().is_some_and(|abi| abi < 4)
+            {
+                ui::warn(
+                    "OpenCode v2: this kernel cannot filter TCP ports (Landlock ABI < 4, \
+                     kernel < 6.7), so a host OpenCode service on port 49374 is reachable; \
+                     protected by the service password only.",
+                );
+            }
+        }
         self.extra_env = session.env;
         self.opencode_v2 = true;
         Ok(())
@@ -397,6 +456,10 @@ impl PreparedSandbox {
         #[cfg(target_os = "linux")]
         if self.precomputed.deferred_plain_file.take().is_none() {
             return;
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(i) = self.policy.plain_file.take() {
+            self.policy.fs_rules.remove(i);
         }
         self.profile_text = self.profile_text.replacen(&chunk, "", 1);
         #[cfg(target_os = "linux")]
@@ -2784,7 +2847,7 @@ fn prepare_impl(
     // Pre-compute everything in the parent process.
     // ABI check, BPF construction, and all allocation happens here.
     // The pre_exec hook only makes raw syscalls.
-    let precomputed = landlock_mod::precompute(policy)?;
+    let precomputed = landlock_mod::precompute(policy.clone())?;
 
     Ok(PreparedSandbox {
         project_dir: config.project_dir.to_path_buf(),
@@ -2811,6 +2874,7 @@ fn prepare_impl(
         worktree_root: None,
         extra_env: Vec::new(),
         opencode_v2: false,
+        policy,
         precomputed,
         bwrap_wrapper,
     })
@@ -3124,6 +3188,34 @@ mod tests {
             allow_browser: false,
             use_bubblewrap: None,
         }
+    }
+
+    /// #719 unit 4: an OpenCode v2 session's port joins the connect allowlist
+    /// of the rules the child gets; the host default port does not.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opencode_v2_session_port_is_allowed_and_the_host_port_is_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(temp.path()).unwrap();
+        let mut config = test_config(&home, &[]);
+        config.use_bubblewrap = Some(false);
+        let mut sandbox = prepare(&config).unwrap();
+        sandbox
+            .add_opencode_v2(crate::opencode_v2::Session {
+                env: Vec::new(),
+                port: 50123,
+                hidden: Vec::new(),
+                reads: Vec::new(),
+            })
+            .unwrap();
+        let ports: Vec<u16> = sandbox
+            .precomputed
+            .net_rules
+            .iter()
+            .map(|r| r.port)
+            .collect();
+        assert!(ports.contains(&50123), "{ports:?}");
+        assert!(!ports.contains(&49374), "{ports:?}");
     }
 
     /// #252: revoking the root AGENTS.md grant removes exactly that rule, on

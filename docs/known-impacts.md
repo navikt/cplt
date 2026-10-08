@@ -717,7 +717,7 @@ Git commit works for every agent. Whether `git push` works over HTTPS depends on
    ```bash
    gh auth setup-git
    ```
-   `gh auth setup-git` writes the helper with an absolute path (for example `!/opt/homebrew/bin/gh auth git-credential`). With the gh guard on, cplt adds `!gh auth git-credential` as a last helper for `https://github.com` inside the sandbox, so git goes through the gh guard and gets the exec token ([how](gh-guard.md#how-gh-itself-authenticates)). Your own `github.com` helpers run first and win when they return a credential. Your git config is not changed. The same helper means the agent can get the token itself; see [the limit](../SECURITY.md#github-token-handling-per-agent).
+   `gh auth setup-git` writes the helper with an absolute path (for example `!/opt/homebrew/bin/gh auth git-credential`). With the gh guard on, cplt adds `!gh auth git-credential` as a last helper for `https://github.com` inside the sandbox, so git goes through the gh guard and gets the exec token ([how](gh-guard.md#how-gh-itself-authenticates)). Your own `github.com` helpers run first and win when they return a credential. Your git config is not changed.
 
 **Credentials per agent (macOS).** The helper only produces a token if `gh` can reach one from inside the sandbox:
 
@@ -1342,7 +1342,7 @@ goose is the exception to the table's opening sentence: its config dir is grante
 <a id="opencode-v2-is-refused"></a>
 ## OpenCode v2
 
-OpenCode v2 (the npm package `@opencode/cli`, which still installs a binary called `opencode`) runs every tool call in a background service, `opencode serve --service`. A service started outside cplt would run them unsandboxed, so on macOS each cplt session runs its own service inside the sandbox ([navikt/cplt#710](https://github.com/navikt/cplt/issues/710)):
+OpenCode v2 (the npm package `@opencode/cli`, which still installs a binary called `opencode`) runs every tool call in a background service, `opencode serve --service`. A service started outside cplt would run them unsandboxed, so each cplt session runs its own service inside the sandbox ([navikt/cplt#710](https://github.com/navikt/cplt/issues/710)). What follows is macOS; Linux differs where [the Linux section](#opencode-v2-on-linux) says:
 
 - The session gets a private `XDG_STATE_HOME`, so OpenCode does not find a service you run on the host, and an `XDG_CONFIG_HOME` that links every entry of your own config dir, and of its `opencode/` dir (or of `OPENCODE_CONFIG_DIR`, when set), except `service.json`. `OPENCODE_CONFIG_DIR` then points at the session copy. In its place cplt writes one with a free loopback port and a random password. The OpenCode client starts the service on that port, inside the sandbox.
 - The sandbox may connect to that port only. The default service port, 49374, stays blocked, and both of your `service.json` files (in the config and state dirs) are unreadable and cannot be moved by renaming a dir above them, also through a symlinked `opencode/` dir.
@@ -1355,7 +1355,17 @@ OpenCode v2 (the npm package `@opencode/cli`, which still installs a binary call
 
 **Sessions share your database.** `$XDG_DATA_HOME/opencode/opencode.db` holds your sessions and logins and is shared with the host and with other cplt sessions. When an OpenCode v2 service opens it, it resumes every turn that was in flight when another service stopped. That includes a turn started in another repository's sandbox, which then runs with this service's permissions. A service on the host resumes such turns outside the sandbox. Let a turn finish before you stop a session, and do not run an OpenCode v2 service on the host while cplt sessions are open. The first v2 run creates `opencode.db`, so start that first session alone: two first runs at the same moment can fail with "database is locked" (an OpenCode race), and running again works.
 
-On Linux, v2 is still refused: Landlock cannot deny the host `service.json` inside the granted OpenCode dirs. To stay on 1.x there, reinstall OpenCode 1.x: for npm, `npm uninstall -g @opencode/cli && npm i -g opencode-ai@1`; elsewhere, pin `opencode-ai@1` in your version manager or installer. The check covers `--agent opencode` only: running `opencode` from another agent or a shell inside the sandbox is not checked.
+<a id="opencode-v2-on-linux"></a>
+**On Linux** ([navikt/cplt#719](https://github.com/navikt/cplt/issues/719)) the session setup is the same, and Landlock does the rest, under Bubblewrap and without it:
+
+- Landlock cannot deny a file inside a granted dir, so cplt grants `~/.config/opencode` and `~/.local/state/opencode` entry by entry, leaving out `service.json`. An entry OpenCode or you create there during the session is not visible until the next one. A symlinked `opencode/` dir is followed, but a symlink inside it that points out of it is not granted: Landlock would grant whatever it names.
+- Any other grant that covers a host `service.json`, such as `allow.read = ["~/.config"]`, refuses v2 with a message naming it. Narrow the grant to run v2.
+- The session port joins the Landlock connect allowlist, and loopback is exempt from the proxy (`NO_PROXY`) so the client reaches its service. Landlock filters by port on any host, so the session port is open on remote hosts too, as the proxy port already is.
+- Port filtering needs Landlock ABI 4 (kernel 6.7). On older kernels cplt warns that port 49374 is reachable and continues: a host service there still asks for its password. `--allow-localhost-any` leaves it reachable the same way.
+- `/proc` is readable: the service is a child of the client and does not get the client's `/proc/self` grant, and it stops at startup without `/proc`. With Bubblewrap that `/proc` shows only the session's processes. Without it, the agent can read the command lines of your other processes (not their environment); cplt warns.
+- `AGENTS.md`, `opencode.json` and `opencode.jsonc` in a parent of the launch directory are readable when each is a regular file, or a symlink to one outside the credential dirs; cplt refuses anything else. OpenCode stops when it cannot read an `AGENTS.md` it finds.
+- With Bubblewrap the service stops with the session. Without it, it stops within 5 seconds of the session ending, as on macOS.
+- Ubuntu 24.04 blocks Bubblewrap through AppArmor by default; see `cplt doctor`.
 
 GitHub Copilot hosts for the proxy allowlist come from the `credential` table in `opencode.db`, not from `auth.json` or a gh login. cplt opens it read-only with `/usr/bin/sqlite3` and reads only whether a `github-copilot` login exists, never the credential itself. The host gh token handover below does not apply to v2: cplt does not set `OPENCODE_AUTH_CONTENT` for it.
 

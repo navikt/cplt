@@ -3899,4 +3899,251 @@ print('CONNECTED')
         require_bwrap!();
         assert_linked_entries_refused("--use-bubblewrap");
     }
+
+    /// #719: OpenCode v2 on Linux, against the real binary when
+    /// `CPLT_E2E_OPENCODE_V2` names it (the CI job installs a pinned one).
+    /// The agent is a stub that answers `--version` like v2 and otherwise runs
+    /// its argument as a shell script in the sandbox; the script drives the
+    /// real client, copied next to it. HOME is a fake one under the real HOME:
+    /// bubblewrap replaces /tmp.
+    mod opencode_v2 {
+        use super::*;
+        use crate::common::home_temp_dir;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        const STUB: &str = "#!/bin/sh\n[ \"$1\" = --version ] && { echo opencode v2.0.24; exit 0; }\nexec /bin/sh -c \"$1\"\n";
+
+        struct Home {
+            _dir: tempfile::TempDir,
+            h: PathBuf,
+            proj: PathBuf,
+            bin: PathBuf,
+        }
+
+        /// A fake HOME with an `opencode` stub on PATH, a user config, an
+        /// `opencode.json` in two ancestors of the project and `~/AGENTS.md`.
+        fn home() -> Home {
+            let dir = home_temp_dir("ocv2");
+            let h = fs::canonicalize(dir.path()).unwrap();
+            let w = |rel: &str, body: &str| {
+                let p = h.join(rel);
+                fs::create_dir_all(p.parent().unwrap()).unwrap();
+                fs::write(p, body).unwrap();
+            };
+            w(".config/opencode/opencode.json", "{}");
+            w("opencode.json", "{}");
+            // v2 blocks the session on an ancestor AGENTS.md it cannot read.
+            w("AGENTS.md", "# home");
+            w(".ssh/id_ed25519", "KEY");
+            fs::create_dir_all(h.join(".local/state/opencode")).unwrap();
+            // Planted by an earlier session in the writable state dir.
+            std::os::unix::fs::symlink(
+                h.join(".ssh/id_ed25519"),
+                h.join(".local/state/opencode/key"),
+            )
+            .unwrap();
+            w("work/opencode.json", "{}");
+            let proj = h.join("work/proj");
+            fs::create_dir_all(&proj).unwrap();
+            let bin = h.join(".opencode/bin");
+            fs::create_dir_all(&bin).unwrap();
+            fs::write(bin.join("opencode"), STUB).unwrap();
+            fs::set_permissions(bin.join("opencode"), fs::Permissions::from_mode(0o755)).unwrap();
+            Home {
+                _dir: dir,
+                h,
+                proj,
+                bin,
+            }
+        }
+
+        impl Home {
+            fn cmd(&self, dir: &Path) -> Command {
+                let mut cmd = cplt_cmd();
+                cmd.current_dir(dir)
+                    .env("HOME", &self.h)
+                    .env("PATH", format!("{}:/usr/bin:/bin", self.bin.display()))
+                    .env("OPENCODE_DISABLE_MODELS_FETCH", "1");
+                for v in [
+                    "XDG_CONFIG_HOME",
+                    "XDG_DATA_HOME",
+                    "XDG_STATE_HOME",
+                    "XDG_CACHE_HOME",
+                    "OPENCODE_CONFIG_DIR",
+                ] {
+                    cmd.env_remove(v);
+                }
+                cmd.args(["--yes", "--quiet", "--agent", "opencode"]);
+                cmd
+            }
+
+            /// Pids of `serve --service` processes running with this HOME.
+            fn services(&self) -> Vec<u32> {
+                let tag = format!("HOME={}", self.h.display());
+                fs::read_dir("/proc")
+                    .unwrap()
+                    .flatten()
+                    .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+                    .filter(|pid| {
+                        let read =
+                            |f: &str| fs::read(format!("/proc/{pid}/{f}")).unwrap_or_default();
+                        let has =
+                            |b: &[u8], s: &str| b.split(|c| *c == 0).any(|x| x == s.as_bytes());
+                        let cmd = read("cmdline");
+                        has(&cmd, "serve") && has(&cmd, "--service") && has(&read("environ"), &tag)
+                    })
+                    .collect()
+            }
+        }
+
+        /// A host service started outside cplt, as a user who runs both.
+        struct HostService(std::process::Child);
+        impl Drop for HostService {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        /// Items 5-8 of the #719 test plan, under `flag`.
+        fn session_is_private(flag: &str) {
+            let Some(real) = std::env::var_os("CPLT_E2E_OPENCODE_V2") else {
+                eprintln!("SKIPPED (opencode v2): CPLT_E2E_OPENCODE_V2 unset");
+                return;
+            };
+            let home = home();
+            let oc = home.bin.join("oc");
+            fs::copy(fs::canonicalize(real).unwrap(), &oc).unwrap();
+            // The host service, registered where an unsandboxed client finds it.
+            fs::write(
+                home.h.join(".config/opencode/service.json"),
+                "{\"port\":49374,\"password\":\"HOSTPW\"}",
+            )
+            .unwrap();
+            let mut host = Command::new(&oc);
+            host.args(["serve", "--service"])
+                .current_dir(&home.h)
+                .env("HOME", &home.h)
+                .env("OPENCODE_DISABLE_MODELS_FETCH", "1")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            for v in ["XDG_CONFIG_HOME", "XDG_STATE_HOME", "OPENCODE_CONFIG_DIR"] {
+                host.env_remove(v);
+            }
+            let host = HostService(host.spawn().unwrap());
+            let reg = home.h.join(".local/state/opencode/service.json");
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !fs::read_to_string(&reg).is_ok_and(|s| s.contains("HOSTPW")) {
+                assert!(Instant::now() < deadline, "host service did not register");
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            let host_pid = host.0.id();
+
+            let script = format!(
+                r#"for f in "{cfg}" "{reg}"; do cat "$f" >/dev/null 2>&1 && echo "READ $f"; done
+                cat "$HOME/.config/opencode/opencode.json" >/dev/null && echo OCJSON-OK
+                cat "$HOME/AGENTS.md" >/dev/null && echo AGENTS-OK
+                cat "$HOME/.local/state/opencode/key" 2>/dev/null && echo PLANTED
+                P=$(sed -n 's/.*"port":\([0-9]*\).*/\1/p' "$XDG_CONFIG_HOME/opencode/service.json")
+                echo "P=$P"
+                "{oc}" api GET /path >/dev/null && echo API-OK
+                "{oc}" service get
+                c() {{ curl --noproxy '*' -s -m3 -o /dev/null -w '%{{http_code}}' "http://127.0.0.1:$1/"; }}
+                echo "SESSION=$(c $P)"
+                echo "HOST=$(c 49374)""#,
+                cfg = home.h.join(".config/opencode/service.json").display(),
+                reg = reg.display(),
+                oc = oc.display(),
+            );
+            let o = home
+                .cmd(&home.proj)
+                .args([flag, "--", &script])
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            let out = String::from_utf8_lossy(&o.stdout);
+            let all = format!("{out}\n{}", String::from_utf8_lossy(&o.stderr));
+            assert!(o.status.success(), "{all}");
+            // 6: neither host file is readable, its password never shows.
+            assert!(!out.contains("READ "), "{all}");
+            assert!(!all.contains("HOSTPW"), "{all}");
+            // 8: startup with an ungranted HOME and ancestor opencode.json.
+            assert!(out.contains("OCJSON-OK"), "{all}");
+            assert!(out.contains("AGENTS-OK"), "{all}");
+            assert!(!out.contains("PLANTED"), "{all}");
+            // 5: the client runs its own service on the session port.
+            let p: u16 = out
+                .lines()
+                .find_map(|l| l.strip_prefix("P="))
+                .and_then(|p| p.parse().ok())
+                .unwrap_or_else(|| panic!("no session port: {all}"));
+            assert_ne!(p, 49374);
+            assert!(
+                out.contains(&format!("\"port\":{p}")) || out.contains(&format!("\"port\": {p}")),
+                "{all}"
+            );
+            // 6: the session port answers; the host
+            // port is unreachable where the kernel filters ports.
+            assert!(out.contains("API-OK"), "{all}");
+            assert!(
+                out.contains("SESSION=") && !out.contains("SESSION=000"),
+                "{all}"
+            );
+            if landlock_abi_version().is_some_and(|v| v >= 4) {
+                assert!(out.contains("HOST=000"), "{all}");
+            }
+            // 7: no session service outlives cplt; the host one is untouched.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let left: Vec<u32> = home
+                    .services()
+                    .into_iter()
+                    .filter(|p| *p != host_pid)
+                    .collect();
+                if left.is_empty() {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "session service left running: {left:?}"
+                );
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            assert!(home.services().contains(&host_pid), "host service gone");
+        }
+
+        #[test]
+        fn opencode_v2_session_is_private_with_bubblewrap() {
+            require_bwrap!();
+            session_is_private("--use-bubblewrap");
+        }
+
+        #[test]
+        fn opencode_v2_session_is_private_with_landlock_only() {
+            require_landlock!();
+            session_is_private("--no-bubblewrap");
+        }
+
+        /// 3: a grant above the host files (`allow.read ~/.config`; a launch
+        /// from HOME is already refused as too broad) is refused before the
+        /// agent runs.
+        #[test]
+        fn opencode_v2_grant_over_the_service_file_is_refused() {
+            require_landlock!();
+            let home = home();
+            fs::write(home.h.join(".config/opencode/service.json"), "{}").unwrap();
+            let o = home
+                .cmd(&home.proj)
+                .arg("--allow-read")
+                .arg(home.h.join(".config"))
+                .args(["--no-bubblewrap", "--", "touch ran"])
+                .output()
+                .unwrap();
+            let err = String::from_utf8_lossy(&o.stderr);
+            assert!(!o.status.success(), "{err}");
+            assert!(err.contains("issues/719"), "{err}");
+            assert!(!home.proj.join("ran").exists());
+        }
+    }
 }

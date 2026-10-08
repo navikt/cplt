@@ -84,6 +84,15 @@ pub(super) fn apply_deny_env_and_credential(
     }
 }
 
+/// The OpenCode v2 session's variables (#710), set last.
+fn apply_session_env(cmd: &mut Command, sandbox: &super::PreparedSandbox) {
+    // v2 ignores the #695 handover: don't put the gh token where nothing reads it.
+    if sandbox.opencode_v2 {
+        cmd.env_remove("OPENCODE_AUTH_CONTENT");
+    }
+    cmd.envs(sandbox.extra_env.iter().map(|(k, v)| (k, v)));
+}
+
 /// Configure environment, proxy, and common args on a sandboxed Command.
 ///
 /// Both macOS (Seatbelt) and Linux (Landlock) paths call this to apply the
@@ -1492,11 +1501,7 @@ pub fn exec(
     );
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
-    // v2 ignores the #695 handover: don't put the gh token where nothing reads it.
-    if sandbox.opencode_v2 {
-        cmd.env_remove("OPENCODE_AUTH_CONTENT");
-    }
-    cmd.envs(sandbox.extra_env.iter().map(|(k, v)| (k, v)));
+    apply_session_env(&mut cmd, sandbox);
     // Nothing the caller was holding open crosses into the agent.
     seal_inherited_fds(&mut cmd, Vec::new());
 
@@ -1638,6 +1643,7 @@ pub fn exec(
     );
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
+    apply_session_env(&mut cmd, sandbox);
     // Before the Landlock hook below: that hook opens descriptors of its own,
     // and they must not be sealed.
     seal_inherited_fds(&mut cmd, Vec::new());
@@ -1862,6 +1868,7 @@ fn exec_bwrap(
         sandbox.keychain_substitute.as_ref(),
     );
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
+    apply_session_env(&mut cmd, sandbox);
     // Set the re-entry env AFTER configure_command so a `clear_first` env build
     // cannot wipe them.
     cmd.env(

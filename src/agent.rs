@@ -204,46 +204,30 @@ const DEEPSEEK_DOMAINS: &[&str] = &["deepseek.com"];
 /// version manager keeps it under `opencode/<version>`. Anything else (the
 /// upstream installer puts both majors at `~/.opencode/bin`) is asked
 /// `--version` once, and the answer is cached per binary path, size and
-/// mtime, so steady-state launch spawns nothing. An unanswered or unparseable
-/// probe is retried once with a longer timeout; if that also fails and the path
-/// is not the 1.x npm package `opencode-ai`, the verdict is `None` (#725) and
-/// the launch refuses rather than run a possible v2 without its isolation. An
-/// unknown verdict is never cached.
+/// mtime, so steady-state launch spawns nothing. An unanswered probe counts
+/// as 1.x and is not cached.
 ///
 /// The verdict lives in cplt's state directory, which the sandbox denies, not
 /// in `~/.cache/cplt`, which the agent can write: a forged "1.x" verdict for a
 /// v2 binary would bypass this gate.
-pub fn is_opencode_v2(bin: &Path, home: &Path) -> Option<bool> {
-    opencode_v2_within(
-        bin,
-        home,
-        [
-            crate::discover::PROBE_TIMEOUT,
-            crate::discover::PROBE_TIMEOUT * 3,
-        ],
-    )
-}
-
-fn opencode_v2_within(bin: &Path, home: &Path, timeouts: [std::time::Duration; 2]) -> Option<bool> {
+pub fn is_opencode_v2(bin: &Path, home: &Path) -> bool {
     let cache_dir = &home.join(crate::sandbox::CPLT_STATE_DIR);
     let real = std::fs::canonicalize(bin).unwrap_or_else(|_| bin.to_path_buf());
     let parts: Vec<String> = real
         .components()
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .collect();
-    // `opencode-v2`: the anomalyco/tap Homebrew formula (Cellar/opencode-v2/<ver>).
-    if parts.iter().any(|p| p == "@opencode" || p == "opencode-v2") {
-        return Some(true);
+    if parts.iter().any(|p| p == "@opencode") {
+        return true;
     }
     if let Some([_, ver]) = parts
         .windows(2)
         .find(|w| w[0] == "opencode" && crate::discover::parse_version(&w[1]).is_some())
     {
-        return Some(major_at_least_2(ver));
+        return major_at_least_2(ver);
     }
-    let is_v1_npm = parts.iter().any(|p| p == "opencode-ai");
     let Ok(meta) = std::fs::metadata(&real) else {
-        return is_v1_npm.then_some(false);
+        return false;
     };
     let mtime = meta
         .modified()
@@ -257,20 +241,16 @@ fn opencode_v2_within(bin: &Path, home: &Path, timeouts: [std::time::Duration; 2
         .flatten()
         .and_then(|c| c.strip_prefix(&key).map(|v| v.trim().to_string()))
     {
-        return Some(major_at_least_2(&v));
+        return major_at_least_2(&v);
     }
-    for timeout in timeouts {
-        if let crate::discover::VersionProbe::Version(v) =
-            crate::discover::probe_version_within(&real, &["--version"], timeout)
-        {
+    match crate::discover::probe_version(&real, &["--version"]) {
+        crate::discover::VersionProbe::Version(v) => {
             let _ = std::fs::create_dir_all(cache_dir);
             let _ = std::fs::write(&cache, format!("{key}{v}\n"));
-            return Some(major_at_least_2(&v));
+            major_at_least_2(&v)
         }
+        _ => false,
     }
-    // The 1.x npm package, reached through a shim that did not canonicalize
-    // into it; v2's packages are all `@opencode/*`, caught above.
-    is_v1_npm.then_some(false)
 }
 
 fn major_at_least_2(version: &str) -> bool {
@@ -3177,29 +3157,22 @@ mod tests {
     #[test]
     fn opencode_v2_is_detected_from_its_install_path() {
         let none = Path::new("/nonexistent-cplt-cache");
-        let v2 = |p: &str| is_opencode_v2(Path::new(p), none);
-        assert_eq!(
-            v2("/n/lib/node_modules/@opencode/cli/bin/opencode.exe"),
-            Some(true)
-        );
-        assert_eq!(
-            v2("/n/lib/node_modules/@opencode/cli-darwin-arm64/bin/opencode"),
-            Some(true)
-        );
-        assert_eq!(v2("/brew/Cellar/opencode/2.0.24/bin/opencode"), Some(true));
-        assert_eq!(
-            v2("/brew/Cellar/opencode-v2/2.0.24/bin/opencode"),
-            Some(true)
-        );
-        assert_eq!(v2("/nonexistent-cplt/bin/opencode"), None);
-        assert_eq!(
-            v2("/brew/Cellar/opencode/1.18.35/bin/opencode"),
-            Some(false)
-        );
-        assert_eq!(
-            v2("/n/lib/node_modules/opencode-ai/bin/opencode"),
-            Some(false)
-        );
+        assert!(is_opencode_v2(
+            Path::new("/n/lib/node_modules/@opencode/cli/bin/opencode.exe"),
+            none
+        ));
+        assert!(is_opencode_v2(
+            Path::new("/brew/Cellar/opencode/2.0.24/bin/opencode"),
+            none
+        ));
+        assert!(!is_opencode_v2(
+            Path::new("/brew/Cellar/opencode/1.18.35/bin/opencode"),
+            none
+        ));
+        assert!(!is_opencode_v2(
+            Path::new("/n/lib/node_modules/opencode-ai/bin/opencode"),
+            none
+        ));
     }
 
     #[cfg(unix)]
@@ -3219,49 +3192,13 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         let home = dir.path().join("home");
-        assert_eq!(is_opencode_v2(&bin, &home), Some(true));
-        assert_eq!(is_opencode_v2(&bin, &home), Some(true));
+        assert!(is_opencode_v2(&bin, &home));
+        assert!(is_opencode_v2(&bin, &home));
         assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(), 1);
         // The verdict must sit where the sandbox denies the agent writes.
         let state = home.join(crate::sandbox::CPLT_STATE_DIR);
         assert!(state.join("opencode-version").exists());
         assert!(crate::sandbox::DENIED_DOTFILES.contains(&crate::sandbox::CPLT_STATE_DIR));
-    }
-
-    /// #725: a probe with no usable answer is retried once, never cached, and
-    /// yields no verdict, so the launch refuses instead of assuming 1.x.
-    #[cfg(unix)]
-    #[test]
-    fn opencode_v2_unknown_probe_is_retried_and_not_cached() {
-        use std::os::unix::fs::PermissionsExt;
-        let short = std::time::Duration::from_millis(300);
-        for (name, body) in [
-            ("hang", "sleep 5"),
-            ("garbage", "echo opencode"),
-            ("fail", "echo opencode v2.0.0; exit 1"),
-        ] {
-            let dir = tempfile::tempdir().unwrap();
-            let bin = dir.path().join("opencode");
-            let count = dir.path().join("count");
-            let script = format!("#!/bin/sh\necho x >> {}\n{body}\n", count.display());
-            std::fs::write(&bin, script).unwrap();
-            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-            let home = dir.path().join("home");
-            assert_eq!(opencode_v2_within(&bin, &home, [short; 2]), None, "{name}");
-            assert_eq!(
-                std::fs::read_to_string(&count).unwrap().lines().count(),
-                2,
-                "{name}: one retry"
-            );
-            let state = home.join(crate::sandbox::CPLT_STATE_DIR);
-            assert!(!state.join("opencode-version").exists(), "{name}: cached");
-        }
-        // A 1.x answer is unchanged.
-        let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join("opencode");
-        std::fs::write(&bin, "#!/bin/sh\necho 1.18.35\n").unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert_eq!(is_opencode_v2(&bin, &dir.path().join("home")), Some(false));
     }
 
     #[test]

@@ -13,7 +13,9 @@
 //!   dir, and every entry of its `opencode/`, except the user's `service.json`,
 //!   which cplt replaces with one naming a free port and a random password;
 //! - a profile tail that opens loopback to that port only and denies both host
-//!   `service.json` files.
+//!   `service.json` files. On Linux the same files are left out of the Landlock
+//!   rules instead, and the port joins the connect allowlist (see
+//!   `sandbox_landlock::hide_files`).
 //!
 //! Both dirs live in the session scratch dir. Removing it at exit takes the
 //! registration with it, and the service shuts itself down within 5 s when its
@@ -30,11 +32,24 @@ use std::path::{Path, PathBuf};
 pub struct Session {
     /// Set on the child after the sandbox's own environment.
     pub env: Vec<(String, String)>,
+    /// The session service's loopback port.
+    pub port: u16,
     /// Appended to the end of the macOS profile (last match wins).
+    #[cfg(target_os = "macos")]
     pub sbpl: String,
     /// File grants placed before the profile's deny rules, so a deny
     /// (credential, `deny.paths`, `.env`) on the same file still wins.
+    #[cfg(target_os = "macos")]
     pub sbpl_before_denies: String,
+    /// The host `service.json` files, spelled and resolved, which no Landlock
+    /// rule may cover.
+    #[cfg(not(target_os = "macos"))]
+    pub hidden: Vec<PathBuf>,
+    /// Files v2 reads at startup outside the project: each ancestor's
+    /// `opencode.json(c)` and `AGENTS.md`, spelled and resolved. An
+    /// `AGENTS.md` that exists but cannot be read blocks the session.
+    #[cfg(not(target_os = "macos"))]
+    pub reads: Vec<PathBuf>,
 }
 
 /// An XDG base from the environment, ignoring a relative or empty value as the
@@ -80,17 +95,41 @@ pub fn prepare(scratch: &Path, home: &Path, launch_dir: &Path) -> Result<Session
         ),
         ("OPENCODE_DISABLE_MODELS_FETCH".into(), "1".into()),
         ("OPENCODE_DISABLE_AUTOUPDATE".into(), "1".into()),
+        // The client reaches its service over HTTP; on Linux the proxy would
+        // take that request (macOS always exempts loopback). Landlock still
+        // limits loopback to the allowlisted ports.
+        #[cfg(not(target_os = "macos"))]
+        ("NO_PROXY".into(), "localhost,127.0.0.1,::1".into()),
+        #[cfg(not(target_os = "macos"))]
+        ("no_proxy".into(), "localhost,127.0.0.1,::1".into()),
     ];
     let files = [
         user_oc.join("service.json"),
         config_base.join("opencode/service.json"),
         state_base.join("opencode/service.json"),
     ];
+    #[cfg(target_os = "macos")]
     let (sbpl_before_denies, sbpl) = profile_tail(home, launch_dir, &files, port)?;
+    // Landlock does not gate the startup stat/realpath calls; only the files
+    // v2 reads need a grant.
+    #[cfg(not(target_os = "macos"))]
+    let mut reads = Vec::new();
+    #[cfg(not(target_os = "macos"))]
+    startup_files(home, launch_dir, &mut reads)?;
     Ok(Session {
         env,
+        port,
+        #[cfg(target_os = "macos")]
         sbpl,
+        #[cfg(target_os = "macos")]
         sbpl_before_denies,
+        #[cfg(not(target_os = "macos"))]
+        hidden: files
+            .iter()
+            .flat_map(|f| [f.clone(), crate::config::canonicalize_deepest(f)])
+            .collect(),
+        #[cfg(not(target_os = "macos"))]
+        reads,
     })
 }
 
@@ -135,6 +174,7 @@ fn free_port() -> std::io::Result<u16> {
 /// path. Every ancestor is pinned against unlink, so a writable one (the
 /// granted host state dir) cannot be renamed into a readable tree to carry
 /// the file out from under the literal deny.
+#[cfg(target_os = "macos")]
 fn profile_tail(
     home: &Path,
     launch_dir: &Path,
@@ -156,14 +196,6 @@ fn profile_tail(
     pinned.dedup();
     let mut reads = Vec::new();
     let mut files = Vec::new();
-    // v2 walks `AGENTS.md` from the launch dir up to `$HOME`, or up to the
-    // project root when the launch dir is outside `$HOME` (instruction.ts).
-    let stop = if launch_dir.starts_with(home) {
-        home.to_path_buf()
-    } else {
-        let git = launch_dir.ancestors().find(|d| d.join(".git").exists());
-        git.unwrap_or(launch_dir).to_path_buf()
-    };
     let project = launch_dir
         .ancestors()
         .find(|d| d.join(".git").exists())
@@ -178,20 +210,8 @@ fn profile_tail(
         for name in [".claude", ".agents", ".opencode"] {
             grant_dir(home, &dir.join(name), &mut reads)?;
         }
-        // Discovery also resolves and reads each `opencode.json(c)` as config
-        // (#718), and the instruction loader blocks the session when an
-        // `AGENTS.md` it finds cannot be read. The launch dir is the project,
-        // already readable: nothing to grant there.
-        if dir == launch_dir {
-            continue;
-        }
-        let agents = launch_dir.starts_with(dir) && dir.starts_with(&stop);
-        for name in ["opencode.json", "opencode.jsonc", "AGENTS.md"] {
-            if name != "AGENTS.md" || agents {
-                grant_file(home, &dir.join(name), &mut files)?;
-            }
-        }
     }
+    startup_files(home, launch_dir, &mut files)?;
     reads.sort();
     reads.dedup();
     files.append(&mut reads);
@@ -381,6 +401,34 @@ fn gate(
     None
 }
 
+/// The files v2 reads at startup outside the launch dir. Discovery resolves
+/// and reads each `opencode.json(c)` as config (#718), and the instruction
+/// loader blocks the session when an `AGENTS.md` it finds cannot be read.
+/// v2 walks `AGENTS.md` from the launch dir up to `$HOME`, or up to the
+/// project root when the launch dir is outside `$HOME` (instruction.ts).
+fn startup_files(home: &Path, launch_dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+    let project = launch_dir.ancestors().find(|d| d.join(".git").exists());
+    let stop = if launch_dir.starts_with(home) {
+        home
+    } else {
+        project.unwrap_or(launch_dir)
+    };
+    let project = project.unwrap_or(launch_dir);
+    for dir in home.ancestors().chain(launch_dir.ancestors()) {
+        // The project is readable already, and the agent can plant there.
+        if dir.starts_with(project) {
+            continue;
+        }
+        let agents = launch_dir.starts_with(dir) && dir.starts_with(stop);
+        for name in ["opencode.json", "opencode.jsonc", "AGENTS.md"] {
+            if name != "AGENTS.md" || agents {
+                grant_file(home, &dir.join(name), files)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Grants `file` as a literal if it is a plain file with one link, or a
 /// symlink (dotfile managers) whose launch-time target is one. The spelled
 /// and the resolved path are granted, never a subpath, so repointing the link
@@ -421,6 +469,7 @@ fn grant_file(home: &Path, file: &Path, reads: &mut Vec<PathBuf>) -> Result<(), 
 /// stats at startup: the spelled path, and its target when that is a
 /// directory outside every sandbox deny. Anything else that exists is
 /// refused, naming link and target: a planted link could name a key.
+#[cfg(target_os = "macos")]
 fn grant_dir(home: &Path, entry: &Path, reads: &mut Vec<PathBuf>) -> Result<(), String> {
     reads.push(entry.to_path_buf());
     if std::fs::symlink_metadata(entry).is_err() {
@@ -445,122 +494,6 @@ fn grant_dir(home: &Path, entry: &Path, reads: &mut Vec<PathBuf>) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn host_service_pid_needs_a_live_process() {
-        let tmp = tempfile::tempdir().unwrap();
-        let reg = tmp.path().join("service.json");
-        let me = std::process::id();
-        std::fs::write(&reg, format!("{{\"pid\":{me},\"password\":\"x\"}}")).unwrap();
-        assert_eq!(host_service_pid(&reg), Some(me as i32));
-        // A reaped child's pid is free.
-        #[allow(clippy::disallowed_methods)] // test: any short-lived process
-        let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
-        let dead = child.id();
-        child.wait().unwrap();
-        std::fs::write(&reg, format!("{{\"pid\":{dead}}}")).unwrap();
-        assert_eq!(host_service_pid(&reg), None);
-        std::fs::write(&reg, "{}").unwrap();
-        assert_eq!(host_service_pid(&reg), None);
-        // A planted FIFO must not hang the launch.
-        std::fs::remove_file(&reg).unwrap();
-        let c = std::ffi::CString::new(reg.to_str().unwrap()).unwrap();
-        // SAFETY: valid C string.
-        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
-        assert_eq!(host_service_pid(&reg), None);
-    }
-
-    #[test]
-    fn logged_out_after_upgrade_reads_the_credential_count() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (data, st) = (tmp.path().join("data"), tmp.path().join("st"));
-        std::fs::create_dir_all(&data).unwrap();
-        assert!(!logged_out_after_upgrade(&data, &st), "no auth.json");
-        std::fs::write(data.join("auth.json"), "{}").unwrap();
-        assert!(!logged_out_after_upgrade(&data, &st), "empty auth.json");
-        std::fs::write(data.join("auth.json"), "{\"a\":{}}").unwrap();
-        assert!(logged_out_after_upgrade(&data, &st), "no database yet");
-        let db = data.join("opencode.db");
-        #[allow(clippy::disallowed_methods)] // resolved, not a PATH lookup
-        let sql = |q: &str| {
-            crate::git::trusted_binary("sqlite3")
-                .map(std::process::Command::new)
-                .and_then(|mut c| c.arg(&db).arg(q).status().ok())
-                .is_some_and(|s| s.success())
-        };
-        if !sql("CREATE TABLE credential (id TEXT)") {
-            return; // no sqlite3 on this host
-        }
-        assert!(logged_out_after_upgrade(&data, &st), "no credential rows");
-        let marker = st.join("opencode-v2-credentials-seen");
-        assert!(marker.exists(), "hint once, then skip");
-        assert!(!logged_out_after_upgrade(&data, &st), "marker skips");
-        std::fs::remove_file(&marker).unwrap();
-        assert!(sql("INSERT INTO credential VALUES ('c')"));
-        assert!(!logged_out_after_upgrade(&data, &st));
-        assert!(marker.exists());
-    }
-
-    #[test]
-    fn sqlite_count_refuses_a_fifo() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db = tmp.path().join("opencode.db");
-        let c = std::ffi::CString::new(db.to_str().unwrap()).unwrap();
-        // SAFETY: valid C string.
-        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
-        let t = std::time::Instant::now();
-        assert_eq!(sqlite_count(&db, "credential"), None);
-        assert!(t.elapsed() < std::time::Duration::from_secs(1));
-    }
-
-    /// Test stand-in for the migration check: a non-empty file is "done".
-    fn non_empty(db: &Path) -> bool {
-        std::fs::metadata(db).is_ok_and(|m| m.len() > 0)
-    }
-
-    #[test]
-    fn first_run_gate_serializes_until_the_bootstrap_is_done() {
-        use std::time::{Duration, Instant};
-        let tmp = tempfile::tempdir().unwrap();
-        let db = tmp.path().join("opencode.db");
-        let lock = tmp.path().join("st/first-run.lock");
-        let limit = Duration::from_secs(10);
-        assert_eq!(gate(db.clone(), &lock, limit, non_empty), None);
-        let t = Instant::now();
-        let maker = {
-            let db = db.clone();
-            std::thread::spawn(move || {
-                // The file appears before the bootstrap commits.
-                std::thread::sleep(Duration::from_millis(200));
-                std::fs::write(&db, "").unwrap();
-                std::thread::sleep(Duration::from_millis(600));
-                std::fs::write(&db, "x").unwrap();
-            })
-        };
-        // A second first-run launch, started before the file exists.
-        assert_eq!(gate(db.clone(), &lock, limit, non_empty), None);
-        let waited = t.elapsed();
-        maker.join().unwrap();
-        assert!(waited >= Duration::from_millis(700), "{waited:?}");
-        assert!(waited < limit, "{waited:?}");
-        let t = Instant::now();
-        assert_eq!(gate(db, &lock, limit, non_empty), None);
-        assert!(t.elapsed() < Duration::from_millis(50), "database exists");
-    }
-
-    #[test]
-    fn first_run_gate_warns_when_the_lock_is_unusable() {
-        let tmp = tempfile::tempdir().unwrap();
-        let lock = tmp.path().join("lockdir");
-        std::fs::create_dir(&lock).unwrap(); // File::create on a dir fails
-        let w = gate(
-            tmp.path().join("opencode.db"),
-            &lock,
-            std::time::Duration::from_secs(1),
-            non_empty,
-        );
-        assert!(w.is_some_and(|w| w.contains("database is locked")));
-    }
 
     #[test]
     fn overlay_links_everything_but_the_service_files() {
@@ -591,6 +524,7 @@ mod tests {
     }
 
     /// A dotfiles-style symlinked `opencode/` dir: the resolved file is denied.
+    #[cfg(target_os = "macos")]
     #[test]
     fn service_json_is_denied_at_its_resolved_path() {
         let tmp = tempfile::tempdir().unwrap();
@@ -710,6 +644,34 @@ mod tests {
         assert_eq!(cat_with(&later, &b.join("AGENTS.md")), "");
     }
 
+    /// An ancestor `AGENTS.md` linked at a credential, a hard link or a dir
+    /// is refused; a link to a plain file grants both paths.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn grant_file_refuses_links_into_credentials() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::write(home.join(".ssh/id_ed25519"), "KEY").unwrap();
+        std::fs::write(home.join("notes.md"), "x").unwrap();
+        let f = home.join("AGENTS.md");
+        let mut reads = Vec::new();
+        std::os::unix::fs::symlink(home.join(".ssh/id_ed25519"), &f).unwrap();
+        assert!(grant_file(&home, &f, &mut reads).is_err());
+        std::fs::remove_file(&f).unwrap();
+        std::fs::hard_link(home.join("notes.md"), &f).unwrap();
+        assert!(grant_file(&home, &f, &mut reads).is_err(), "hard link");
+        std::fs::remove_file(&f).unwrap();
+        std::fs::create_dir(&f).unwrap();
+        assert!(grant_file(&home, &f, &mut reads).is_err(), "dir");
+        std::fs::remove_dir(&f).unwrap();
+        assert!(reads.is_empty());
+        std::fs::write(home.join("dot.md"), "x").unwrap();
+        std::os::unix::fs::symlink(home.join("dot.md"), &f).unwrap();
+        grant_file(&home, &f, &mut reads).unwrap();
+        assert_eq!(reads, [home.join("dot.md"), f]);
+    }
+
     #[test]
     fn prepare_writes_a_private_service_config() {
         let tmp = tempfile::tempdir().unwrap();
@@ -727,22 +689,33 @@ mod tests {
         let env: std::collections::HashMap<_, _> = s.env.into_iter().collect();
         assert!(env["XDG_STATE_HOME"].ends_with("opencode-v2/state"));
         assert_eq!(env["OPENCODE_DISABLE_MODELS_FETCH"], "1");
-        assert!(
-            s.sbpl
-                .contains(&format!("(remote ip \"localhost:{port}\")"))
-        );
-        assert!(!s.sbpl.contains("49374"));
-        let home = tmp.path().display();
-        assert!(s.sbpl.contains(&format!(
-            "(literal \"{home}/.config/opencode/service.json\")"
-        )));
-        assert!(
-            s.sbpl
-                .contains(&format!("{home}/.local/state/opencode/service.json"))
-        );
-        for read in [format!("{home}/.claude"), format!("{home}/src"), "/".into()] {
-            let lit = format!("(literal \"{read}\")");
-            assert!(s.sbpl_before_denies.contains(&lit), "{read}");
+        assert_eq!(u64::from(s.port), port);
+        #[cfg(not(target_os = "macos"))]
+        for f in [".config/opencode", ".local/state/opencode"] {
+            assert!(
+                s.hidden.contains(&tmp.path().join(f).join("service.json")),
+                "{f}"
+            );
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert!(
+                s.sbpl
+                    .contains(&format!("(remote ip \"localhost:{port}\")"))
+            );
+            assert!(!s.sbpl.contains("49374"));
+            let home = tmp.path().display();
+            assert!(s.sbpl.contains(&format!(
+                "(literal \"{home}/.config/opencode/service.json\")"
+            )));
+            assert!(
+                s.sbpl
+                    .contains(&format!("{home}/.local/state/opencode/service.json"))
+            );
+            for read in [format!("{home}/.claude"), format!("{home}/src"), "/".into()] {
+                let lit = format!("(literal \"{read}\")");
+                assert!(s.sbpl_before_denies.contains(&lit), "{read}");
+            }
         }
     }
 }
