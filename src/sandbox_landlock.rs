@@ -6065,7 +6065,15 @@ mod tests {
         ] {
             std::fs::write(home.join(f), "x").unwrap();
         }
-        let dirs = crate::agent::Agent::OpenCode.config_dirs(home);
+        // CI runners set XDG_CONFIG_HOME; the dirs must sit in this HOME.
+        let unset = [
+            "XDG_CONFIG_HOME",
+            "XDG_STATE_HOME",
+            "XDG_DATA_HOME",
+            "OPENCODE_CONFIG_DIR",
+        ];
+        let dirs =
+            temp_env::with_vars_unset(unset, || crate::agent::Agent::OpenCode.config_dirs(home));
         let mut config = test_config(project, home);
         config.agent = crate::agent::Agent::OpenCode;
         config.agent_dirs = &dirs;
