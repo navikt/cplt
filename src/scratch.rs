@@ -47,7 +47,13 @@ const PNPM_SHADOW_BASE: &str = ".cplt-pnpm-shadow";
 #[derive(Debug)]
 pub struct ScratchDir {
     path: PathBuf,
+    /// Shared `flock` on the directory while the session runs, so
+    /// [`ScratchDir::gc_stale`] can tell a live session from an orphan.
+    _lock: Option<std::fs::File>,
 }
+
+/// gh token caches cplt writes into the scratch dir (see `sandbox_exec`).
+const GH_TOKEN_FILES: [&str; 2] = [".gh-exec-token", ".gh-token"];
 
 /// A read-only executable copy of pnpm outside its writable store.
 ///
@@ -625,7 +631,15 @@ impl ScratchDir {
             return Err(format!("Scratch dir path unsafe: {e}"));
         }
 
-        Ok(ScratchDir { path: session_dir })
+        let lock = std::fs::File::open(&session_dir).ok().filter(|f| {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: `f` owns a valid descriptor; the lock lives as long as it.
+            unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_SH) == 0 }
+        });
+        Ok(ScratchDir {
+            path: session_dir,
+            _lock: lock,
+        })
     }
 
     /// The directory every scratch dir is created under, whether or not one
@@ -682,6 +696,15 @@ fn gc_stale_session_dirs(base: &Path) {
             continue;
         }
 
+        // A session that crashed or was killed never ran `Drop`, so its gh
+        // token cache would sit on disk until the 24h sweep. Remove it now
+        // unless the session still holds its lock.
+        if session_is_orphaned(&path) {
+            for file in GH_TOKEN_FILES {
+                let _ = std::fs::remove_file(path.join(file));
+            }
+        }
+
         // Check age via directory modification time
         let Ok(modified) = metadata.modified() else {
             continue;
@@ -703,6 +726,16 @@ fn gc_stale_session_dirs(base: &Path) {
             }
         }
     }
+}
+
+/// True when no running cplt holds the session dir's lock.
+fn session_is_orphaned(dir: &Path) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let Ok(f) = std::fs::File::open(dir) else {
+        return false;
+    };
+    // SAFETY: `f` owns a valid descriptor; the lock is released when it drops.
+    unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
 }
 
 /// A short, random, per-session macOS directory for Playwright control sockets.
@@ -965,6 +998,31 @@ mod tests {
 
         assert!(error.contains("resolves through a symlink"));
         assert!(!target.path().join("package-manager-store").exists());
+    }
+
+    /// A crashed session's gh token cache goes at the next start; a live
+    /// session's stays (its gh still needs it); `Drop` takes the rest.
+    #[test]
+    fn gc_removes_orphaned_gh_token_caches_only() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let live = ScratchDir::create(&home).unwrap();
+        // A crashed session: a session dir nobody holds a lock on.
+        let orphan = ScratchDir::base(&home).join(generate_session_id().unwrap());
+        std::fs::create_dir(&orphan).unwrap();
+        for dir in [live.path(), orphan.as_path()] {
+            for f in GH_TOKEN_FILES {
+                std::fs::write(dir.join(f), "x").unwrap();
+            }
+        }
+        ScratchDir::gc_stale(&home);
+        for f in GH_TOKEN_FILES {
+            assert!(live.path().join(f).exists(), "live {f} kept");
+            assert!(!orphan.join(f).exists(), "orphan {f} removed");
+        }
+        let live_path = live.path().to_path_buf();
+        drop(live);
+        assert!(!live_path.exists(), "Drop removes the session dir");
     }
 
     #[test]

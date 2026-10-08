@@ -717,7 +717,7 @@ Git commit works for every agent. Whether `git push` works over HTTPS depends on
    ```bash
    gh auth setup-git
    ```
-   `gh auth setup-git` writes the helper with an absolute path (for example `!/opt/homebrew/bin/gh auth git-credential`). With the gh guard on, cplt adds `!gh auth git-credential` as a last helper for `https://github.com` inside the sandbox, so git goes through the gh guard and gets the exec token ([how](gh-guard.md#how-gh-itself-authenticates)). Your own `github.com` helpers run first and win when they return a credential. Your git config is not changed.
+   `gh auth setup-git` writes the helper with an absolute path (for example `!/opt/homebrew/bin/gh auth git-credential`). With the gh guard on, cplt adds `!gh auth git-credential` as a last helper for `https://github.com` inside the sandbox, so git goes through the gh guard and gets the exec token ([how](gh-guard.md#how-gh-itself-authenticates)). Your own `github.com` helpers run first and win when they return a credential. Your git config is not changed. The same helper means the agent can get the token itself; see [the limit](../SECURITY.md#github-token-handling-per-agent).
 
 **Credentials per agent (macOS).** The helper only produces a token if `gh` can reach one from inside the sandbox:
 
