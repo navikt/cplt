@@ -155,13 +155,17 @@ Do not modify `blocked-domains.txt` without reviewing the domain's purpose.
 cplt runs outside the sandbox, so treat every path the agent can write as hostile:
 the project, the scratch dir, agent config, state and data dirs, and cplt's own cache.
 
-- Read such files with `untrusted::read_untrusted` or `open_untrusted`. They don't
-  follow symlinks, don't block on a FIFO, accept plain files only and cap the size.
-  Check `is_file()` before handing such a path to a subprocess like `sqlite3`.
+- Read such files with `untrusted::read_untrusted(path, limit)`. It doesn't follow
+  symlinks, doesn't block on a FIFO, accepts plain files only and caps the size.
+  `open_untrusted` does the same checks but returns a `File` with no cap: bound
+  any read from it yourself.
+- Before handing such a path to a subprocess like `sqlite3`, check it with
+  `symlink_metadata(..).is_file()`. `Path::is_file()` follows symlinks.
 - Never put their contents into the sandbox, an env var or output without that check.
   A symlinked `auth.json` once leaked another tool's credentials this way.
-- Emit file grants before the deny rules, as `file-read*`. In Seatbelt a narrower
-  allow such as `file-read-data` beats a broader deny, whatever the order.
+- Emit automatic file grants before the deny rules, as `file-read*`. In Seatbelt a
+  narrower allow such as `file-read-data` beats a broader deny, whatever the order.
+  Explicit overrides the user approved still go after the denies, on purpose.
 - Add a test that plants a FIFO and a symlink.
 
 ### No silent grants
