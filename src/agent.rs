@@ -231,7 +231,8 @@ fn opencode_v2_within(bin: &Path, home: &Path, timeouts: [std::time::Duration; 2
         .components()
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .collect();
-    if parts.iter().any(|p| p == "@opencode") {
+    // `opencode-v2`: the anomalyco/tap Homebrew formula (Cellar/opencode-v2/<ver>).
+    if parts.iter().any(|p| p == "@opencode" || p == "opencode-v2") {
         return Some(true);
     }
     if let Some([_, ver]) = parts
@@ -240,8 +241,9 @@ fn opencode_v2_within(bin: &Path, home: &Path, timeouts: [std::time::Duration; 2
     {
         return Some(major_at_least_2(ver));
     }
+    let is_v1_npm = parts.iter().any(|p| p == "opencode-ai");
     let Ok(meta) = std::fs::metadata(&real) else {
-        return Some(false);
+        return is_v1_npm.then_some(false);
     };
     let mtime = meta
         .modified()
@@ -267,7 +269,7 @@ fn opencode_v2_within(bin: &Path, home: &Path, timeouts: [std::time::Duration; 2
     }
     // The 1.x npm package, reached through a shim that did not canonicalize
     // into it; v2's packages are all `@opencode/*`, caught above.
-    parts.iter().any(|p| p == "opencode-ai").then_some(false)
+    is_v1_npm.then_some(false)
 }
 
 fn major_at_least_2(version: &str) -> bool {
@@ -3160,6 +3162,11 @@ mod tests {
             Some(true)
         );
         assert_eq!(v2("/brew/Cellar/opencode/2.0.24/bin/opencode"), Some(true));
+        assert_eq!(
+            v2("/brew/Cellar/opencode-v2/2.0.24/bin/opencode"),
+            Some(true)
+        );
+        assert_eq!(v2("/nonexistent-cplt/bin/opencode"), None);
         assert_eq!(
             v2("/brew/Cellar/opencode/1.18.35/bin/opencode"),
             Some(false)
