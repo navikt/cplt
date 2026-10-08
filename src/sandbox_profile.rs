@@ -4936,7 +4936,7 @@ mod tests {
             let esc = root.replace('.', r"\.");
             for rule in [
                 format!(
-                    "(deny file-write* (regex #\"^{esc}/.+/\\.git/(hooks|config|commondir|modules|refs/remotes/[^/]+/HEAD|info/exclude)($|/)\"))"
+                    "(deny file-write* (regex #\"^{esc}/.+/\\.git/(hooks|config|commondir|modules|refs/remotes/[^/]+/HEAD|info/exclude|remotes|branches)($|/)\"))"
                 ),
                 format!("(deny file-write-unlink (regex #\"^{esc}/.+/\\.git$\"))"),
                 format!("(deny file-write-data (regex #\"^{esc}/.+/\\.git$\"))"),
@@ -4948,7 +4948,7 @@ mod tests {
         // Last-match-wins: nothing may re-open write after these.
         let nested_deny = p
             .rfind(
-                "/.+/\\.git/(hooks|config|commondir|modules|refs/remotes/[^/]+/HEAD|info/exclude)",
+                "/.+/\\.git/(hooks|config|commondir|modules|refs/remotes/[^/]+/HEAD|info/exclude|remotes|branches)",
             )
             .expect("nested deny missing");
         let last_write_allow = p.rfind("(allow file-write*").expect("no write allows");
@@ -5214,6 +5214,26 @@ mod tests {
         );
     }
 
+    /// #743: git still resolves remote names through the legacy
+    /// `<gitdir>/remotes/<name>` and `<gitdir>/branches/<name>` files, so a
+    /// planted one defines a remote without touching the denied `config`.
+    #[test]
+    fn legacy_remote_dirs_are_denied_in_every_gitdir() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let mut opts = test_options(project, home);
+        let extra_write = [std::path::PathBuf::from("/Users/test/code")];
+        opts.extra_write = &extra_write;
+        let p = generate_profile(&opts, &[]);
+
+        for root in ["/projects/app", "/Users/test/code"] {
+            for dir in ["remotes", "branches"] {
+                let rule = format!("(deny file-write* (subpath \"{root}/.git/{dir}\"))");
+                assert!(p.contains(&rule), "missing for {root}: {rule}");
+            }
+        }
+    }
+
     /// GHSA-cm6f-3wjh-x9qx: `refs/remotes/<remote>/HEAD` names the branch
     /// `protect_default_branch_only` refuses pushes to, and every `cplt exec`
     /// re-reads it before the sandbox exists — so a rewrite that survives one
@@ -5243,7 +5263,7 @@ mod tests {
         // A repo nested under a writable root is reached by the alternation.
         assert!(
             p.contains(
-                "(deny file-write* (regex #\"^/projects/app/.+/\\.git/(hooks|config|commondir|modules|refs/remotes/[^/]+/HEAD|info/exclude)($|/)\"))"
+                "(deny file-write* (regex #\"^/projects/app/.+/\\.git/(hooks|config|commondir|modules|refs/remotes/[^/]+/HEAD|info/exclude|remotes|branches)($|/)\"))"
             ),
             "the remote HEAD symref must reach the nested-repo alternation:\n{p}"
         );
@@ -5303,7 +5323,7 @@ mod tests {
         let p = generate_profile(&test_options(project, home), &[]);
         assert!(
             p.contains(
-                "(deny file-write* (regex #\"^/projects/app/.+/\\.git/(hooks|config|commondir|modules|refs/remotes/[^/]+/HEAD|info/exclude)($|/)\"))"
+                "(deny file-write* (regex #\"^/projects/app/.+/\\.git/(hooks|config|commondir|modules|refs/remotes/[^/]+/HEAD|info/exclude|remotes|branches)($|/)\"))"
             ),
             "info/exclude must reach the nested-repo alternation:\n{p}"
         );

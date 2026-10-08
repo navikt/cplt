@@ -2404,6 +2404,9 @@ mod tests {
             .expect("create remote branch");
         std::fs::create_dir_all(proj.path().join(".git/info")).expect("create .git/info");
         std::fs::write(proj.path().join(".git/info/exclude"), "").expect("create info/exclude");
+        for d in [".git/remotes", ".git/branches"] {
+            std::fs::create_dir_all(proj.path().join(d)).expect("create legacy remote dir");
+        }
         std::fs::write(proj.path().join(".git/config"), "").expect("create .git/config");
         std::fs::write(proj.path().join(".gitmodules"), "").expect("create .gitmodules");
         std::fs::write(proj.path().join(".cplt.toml"), "").expect("create .cplt.toml");
@@ -2433,6 +2436,14 @@ mod tests {
                     && w[1] == proj.path().join(".cplt.toml").to_string_lossy()),
             ".cplt.toml must be re-bound read-only"
         );
+        // #743: the legacy remote directories, where they exist.
+        for d in [".git/remotes", ".git/branches"] {
+            assert!(
+                args.windows(2)
+                    .any(|w| w[0] == "--ro-bind" && w[1] == proj.path().join(d).to_string_lossy()),
+                "{d} must be re-bound read-only"
+            );
+        }
         // #267: goose auto-spawns MCP servers declared here on the next host
         // run. It is `LinuxCoverage::Bwrap`, so the bind must actually reach
         // `build_bwrap_args` — this is the end-to-end pin for the table.
