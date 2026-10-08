@@ -50,9 +50,11 @@ fn read(file: Option<File>, limit: u64) -> io::Result<Option<String>> {
     if file.metadata()?.len() > limit {
         return Ok(None);
     }
+    // One byte past the limit: a file that grew after the fstat is refused,
+    // not silently truncated.
     let mut s = String::new();
-    file.take(limit).read_to_string(&mut s)?;
-    Ok(Some(s))
+    file.take(limit + 1).read_to_string(&mut s)?;
+    Ok((s.len() as u64 <= limit).then_some(s))
 }
 
 #[cfg(test)]

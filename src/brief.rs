@@ -836,12 +836,23 @@ pub fn upsert_managed_block(path: &Path) -> Result<BlockOutcome, String> {
     // link, so nothing rides on this staying race-free.
     agents_md_is_plain(path)?;
 
-    // A FIFO planted here would hang cplt on a plain read (#audit host reads).
-    let existing = match crate::untrusted::read_untrusted(path, 4 * 1024 * 1024) {
+    // A FIFO planted here would hang cplt on a plain read, and a hard link
+    // swapped in after the check above would copy a host file into the
+    // project: refuse both on the opened descriptor.
+    let existing = match crate::untrusted::open_untrusted(path).and_then(|f| {
+        use std::io::Read as _;
+        use std::os::unix::fs::MetadataExt as _;
+        let Some(f) = f.filter(|f| f.metadata().is_ok_and(|m| m.nlink() == 1)) else {
+            return Ok(None);
+        };
+        let mut s = String::new();
+        f.take(4 * 1024 * 1024 + 1).read_to_string(&mut s)?;
+        Ok((s.len() <= 4 * 1024 * 1024).then_some(s))
+    }) {
         Ok(Some(content)) => content,
         Ok(None) => {
             return Err(format!(
-                "cannot read {}: not a regular file, or larger than 4 MiB",
+                "cannot read {}: not a plain regular file, or larger than 4 MiB",
                 path.display()
             ));
         }
