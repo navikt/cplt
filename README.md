@@ -1033,6 +1033,7 @@ The sandbox blocks some workflows on purpose. The common ones and their fixes:
 | Private registry creds blocked | `cplt config set allow.read "~/.m2/settings.xml"` |
 | Internal Maven/Nexus repo unreachable (Gradle/Maven) | `cplt config set proxy.allow_private_domains "intern.example.com"`. An **IP-literal** repository URL cannot be allowed — give the host a DNS name; see below |
 | Playwright Chromium won't launch | Allow cache exec, then disable Chromium's nested sandbox; see below |
+| Puppeteer / `mmdc` fails with `spawn EPERM` or `[object Object]` | Use Playwright's Chromium with `--no-sandbox` and `"pipe": true`; see [Puppeteer](docs/known-impacts.md#puppeteer-and-mermaid-cli-mmdc) |
 
 **Playwright Chromium needs `cplt config set sandbox.allow_cache_exec ms-playwright`,** and Chromium must run without its own nested sandbox. On macOS its helpers cannot initialize a second Seatbelt sandbox inside cplt (`forbidden-sandbox-reinit`); on Linux cplt's seccomp filter blocks the namespace syscalls that sandbox needs. Playwright as a library already launches with `--no-sandbox`, and that same opt-in sets `PLAYWRIGHT_MCP_SANDBOX=false` for Playwright MCP, which would otherwise turn it back on. Any other Chromium launcher needs `--no-sandbox` itself. cplt remains the enforcing kernel boundary, but a compromised renderer then receives the full cplt Playwright profile instead of Chromium's narrower child profile. See [Cache exec](docs/known-impacts.md#cache-exec-playwright-pnpm-dlx-etc) and [SECURITY.md](SECURITY.md#out-of-scope).
 
