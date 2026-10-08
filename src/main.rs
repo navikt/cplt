@@ -8734,15 +8734,21 @@ fn run_config_set(
     let mut removed: Vec<&str> = Vec::new();
     let mut missing: Vec<&str> = Vec::new();
     let result = if unset && !values.is_empty() && op.key_info.value_type.is_array() {
-        values.iter().try_for_each(|val| {
-            config::remove_array_element_in_doc(&mut doc, op.key_info, val).map(|hit| {
-                if hit {
-                    removed.push(val);
-                } else {
-                    missing.push(val);
-                }
+        // Duplicates are a no-op: the first removes the entry, and the rest
+        // must not then warn that it is not set.
+        let mut seen = std::collections::HashSet::new();
+        values
+            .iter()
+            .filter(|v| seen.insert(**v))
+            .try_for_each(|val| {
+                config::remove_array_element_in_doc(&mut doc, op.key_info, val).map(|hit| {
+                    if hit {
+                        removed.push(val);
+                    } else {
+                        missing.push(val);
+                    }
+                })
             })
-        })
     } else if unset {
         config::unset_value_in_doc(&mut doc, op.key_info);
         Ok(())

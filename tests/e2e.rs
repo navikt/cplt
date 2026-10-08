@@ -3619,6 +3619,24 @@ mod e2e_tests {
     }
 
     #[test]
+    fn e2e_config_set_unset_duplicate_values_is_silent() {
+        let fake_home = make_config_home("set-unset-dup");
+        let out = config_set_global(&fake_home, &["allow.localhost", "5", "8099"]);
+        assert!(out.status.success());
+        let out = config_set_global(&fake_home, &["allow.localhost", "--unset", "5", "5"]);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{err}");
+        assert!(!err.contains("not set"), "duplicate must not warn: {err}");
+        let content = std::fs::read_to_string(fake_home.join(".config/cplt/config.toml")).unwrap();
+        assert!(content.contains("8099"), "kept entry gone: {content}");
+        assert!(
+            !content.contains("[5") && !content.contains(" 5,") && !content.contains(" 5]"),
+            "5 remains: {content}"
+        );
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
     fn e2e_config_set_multi_value_rejects_scalar_key() {
         let fake_home = make_config_home("set-multi-scalar");
         let out = config_set_global(&fake_home, &["sandbox.quiet", "true", "false"]);
