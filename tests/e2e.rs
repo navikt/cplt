@@ -9799,6 +9799,34 @@ paths = [
             assert!(!out.contains(SECRET), "{out}");
         }
 
+        /// A live host service shares opencode.db: warn, but still launch.
+        /// v1 credentials on a fresh database: hint at a login.
+        #[test]
+        fn host_service_and_missing_credentials_are_reported() {
+            require_sandbox!();
+            let home = stub_home();
+            let (_, err, code) = home.sh("exit 0");
+            assert_eq!(code, Some(0), "{err}");
+            assert!(!err.contains("host OpenCode service"), "{err}");
+            // No opencode.db yet: the launch went through the first-run gate.
+            let lock = home.h.join(".config/cplt/opencode-v2-first-run.lock");
+            assert!(lock.exists(), "first-run gate not wired");
+            std::fs::write(
+                home.h.join(".local/state/opencode/service.json"),
+                format!("{{\"pid\":{}}}", std::process::id()),
+            )
+            .unwrap();
+            let data = home.h.join(".local/share/opencode");
+            std::fs::create_dir_all(&data).unwrap();
+            std::fs::write(data.join("auth.json"), "{\"github-copilot\":{}}").unwrap();
+            let (out, err, code) = home.sh("echo RAN");
+            assert_eq!(code, Some(0), "{err}");
+            assert!(out.contains("RAN"), "{out}");
+            let pid = format!("host OpenCode service (pid {})", std::process::id());
+            assert!(err.contains(&pid), "{err}");
+            assert!(err.contains("opencode auth login"), "{err}");
+        }
+
         #[test]
         fn ancestor_opencode_json_symlink_is_refused() {
             require_sandbox!();

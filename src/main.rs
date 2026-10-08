@@ -4373,6 +4373,12 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             );
         }
         prepared.add_opencode_v2(session);
+        for w in cplt::opencode_v2::host_warnings(&home_dir) {
+            ui::warn(&w);
+        }
+        if let Some(w) = cplt::opencode_v2::first_run_gate(&home_dir) {
+            ui::warn(&w);
+        }
     }
 
     // #514: shim an agent installed since the last sync. A no-op unless the
