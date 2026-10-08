@@ -4365,7 +4365,9 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         for w in cplt::opencode_v2::host_warnings(&home_dir) {
             ui::warn(&w);
         }
-        cplt::opencode_v2::first_run_gate(&home_dir);
+        if let Some(w) = cplt::opencode_v2::first_run_gate(&home_dir) {
+            ui::warn(&w);
+        }
     }
 
     // #514: shim an agent installed since the last sync. A no-op unless the

@@ -220,7 +220,7 @@ pub fn host_warnings(home: &Path) -> Vec<String> {
         out.push(format!(
             "A host OpenCode service (pid {pid}) is running and shares opencode.db with \
              this session. It may continue this session's unfinished turns outside the \
-             sandbox. Stop it (kill {pid}) to keep all work inside cplt."
+             sandbox. Stop it (`opencode service stop`) to keep all work inside cplt."
         ));
     }
     if logged_out_after_upgrade(&data, &home.join(crate::sandbox::CPLT_STATE_DIR)) {
@@ -235,7 +235,8 @@ pub fn host_warnings(home: &Path) -> Vec<String> {
 
 /// The pid in a service registration, if that process is alive.
 fn host_service_pid(registration: &Path) -> Option<i32> {
-    let body = std::fs::read_to_string(registration).ok()?;
+    // Agent-writable dir: a planted FIFO or symlink must not hang or leak.
+    let body = crate::agent::read_small_regular_file(registration)?;
     let v: serde_json::Value = serde_json::from_str(&body).ok()?;
     let pid = i32::try_from(v.get("pid")?.as_i64()?)
         .ok()
@@ -247,7 +248,7 @@ fn host_service_pid(registration: &Path) -> Option<i32> {
 }
 
 /// `auth.json` holds entries but the database has no credential row. Reads
-/// only the size of `auth.json` and a row count. Once rows are seen a marker
+/// only the size of `auth.json` and a row count. After one count a marker
 /// in cplt's state dir skips the check, so steady-state launch spawns nothing.
 fn logged_out_after_upgrade(data: &Path, cplt_state: &Path) -> bool {
     let marker = cplt_state.join("opencode-v2-credentials-seen");
@@ -258,81 +259,104 @@ fn logged_out_after_upgrade(data: &Path, cplt_state: &Path) -> bool {
     if !db.exists() {
         return true;
     }
-    let Some(sqlite) = crate::git::trusted_binary("sqlite3") else {
+    // No sqlite3, not a plain file, or a schema we do not know: stay quiet.
+    let Some(rows) = sqlite_count(&db, "credential") else {
         return false;
     };
+    // Any answer settles it: hint once at most, then never spawn again.
+    let _ = std::fs::create_dir_all(cplt_state);
+    let _ = std::fs::write(marker, "");
+    rows == 0
+}
+
+/// `SELECT count(*) FROM <table>` on an OpenCode database, read-only. The
+/// data dir is agent-writable, so only a plain file is opened: a planted FIFO
+/// would hang sqlite3, and this runs before the sandbox starts.
+fn sqlite_count(db: &Path, table: &str) -> Option<u64> {
+    if !std::fs::symlink_metadata(db).ok()?.is_file() {
+        return None;
+    }
+    let sqlite = crate::git::trusted_binary("sqlite3")?;
     #[allow(clippy::disallowed_methods)] // resolved above, not a PATH lookup
-    let rows = std::process::Command::new(sqlite)
-        .args(["-readonly", "-batch"])
-        .arg(&db)
-        .arg("SELECT count(*) FROM credential")
+    let o = std::process::Command::new(sqlite)
+        .args(["-readonly", "-batch", "-init", "/dev/null"])
+        .arg(db)
+        .arg(format!("SELECT count(*) FROM {table}"))
+        .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .output()
         .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .trim()
-                .parse::<u64>()
-                .ok()
-        });
-    match rows {
-        Some(0) => true,
-        Some(_) => {
-            let _ = std::fs::create_dir_all(cplt_state);
-            let _ = std::fs::write(marker, "");
-            false
-        }
-        // No sqlite3, or a schema we do not know: stay quiet.
-        None => false,
-    }
+        .filter(|o| o.status.success())?;
+    String::from_utf8_lossy(&o.stdout).trim().parse().ok()
+}
+
+/// The database exists and its schema bootstrap has committed. The file is
+/// created before the migrations run, so existence alone is not enough.
+fn bootstrapped(db: &Path) -> bool {
+    sqlite_count(db, "migration").is_some_and(|n| n > 0)
 }
 
 /// On a first run (no `opencode.db` yet) two services that bootstrap the
 /// database at once can fail with "database is locked": upstream locks the
 /// bootstrap per process only. First launches take a host-side lock in cplt's
-/// state dir; a background thread holds it until the database exists plus a
-/// settle delay, or `limit`. A waiter never blocks longer than `limit`, and
-/// the lock goes with the process if cplt exits sooner.
-///
-/// ponytail: "exists + settle" approximates "bootstrap done"; querying the
-/// migration table would be exact if the settle ever proves too short.
-pub fn first_run_gate(home: &Path) {
+/// state dir; a background thread holds it until the bootstrap has committed,
+/// or `limit`. A waiter never blocks longer than `limit`, and the lock goes
+/// with the process if cplt exits sooner. Returns a warning when the lock
+/// cannot be used at all; the launch then goes ahead ungated.
+pub fn first_run_gate(home: &Path) -> Option<String> {
     let db = xdg_base("XDG_DATA_HOME", home, ".local/share").join("opencode/opencode.db");
     let lock = home
         .join(crate::sandbox::CPLT_STATE_DIR)
         .join("opencode-v2-first-run.lock");
-    gate(db, &lock, std::time::Duration::from_secs(15));
+    gate(db, &lock, std::time::Duration::from_secs(15), bootstrapped)
 }
 
-fn gate(db: PathBuf, lock: &Path, limit: std::time::Duration) {
-    const SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+fn gate(
+    db: PathBuf,
+    lock: &Path,
+    limit: std::time::Duration,
+    ready: fn(&Path) -> bool,
+) -> Option<String> {
     const TICK: std::time::Duration = std::time::Duration::from_millis(100);
     if db.exists() {
-        return;
+        return None;
     }
+    let warn = |e: &dyn std::fmt::Display| {
+        Some(format!(
+            "Cannot serialize OpenCode's first start ({}: {e}); two sessions started \
+             at once may fail with \"database is locked\".",
+            lock.display()
+        ))
+    };
     let file = lock
         .parent()
         .map_or(Ok(()), std::fs::create_dir_all)
         .and_then(|()| std::fs::File::create(lock));
-    let Ok(file) = file else { return };
+    let file = match file {
+        Ok(f) => f,
+        Err(e) => return warn(&e),
+    };
     let start = std::time::Instant::now();
-    while file.try_lock().is_err() {
-        if start.elapsed() >= limit {
-            return;
+    loop {
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) if start.elapsed() < limit => {
+                std::thread::sleep(TICK);
+            }
+            Err(std::fs::TryLockError::WouldBlock) => return None,
+            Err(std::fs::TryLockError::Error(e)) => return warn(&e),
         }
-        std::thread::sleep(TICK);
     }
-    if db.exists() {
-        return; // an earlier launch created it while we waited
+    if ready(&db) {
+        return None; // an earlier launch finished it while we waited
     }
     std::thread::spawn(move || {
-        while !db.exists() && start.elapsed() < limit {
+        while !ready(&db) && start.elapsed() < limit {
             std::thread::sleep(TICK);
         }
-        std::thread::sleep(SETTLE);
         drop(file);
     });
+    None
 }
 
 #[cfg(test)]
@@ -354,6 +378,12 @@ mod tests {
         std::fs::write(&reg, format!("{{\"pid\":{dead}}}")).unwrap();
         assert_eq!(host_service_pid(&reg), None);
         std::fs::write(&reg, "{}").unwrap();
+        assert_eq!(host_service_pid(&reg), None);
+        // A planted FIFO must not hang the launch.
+        std::fs::remove_file(&reg).unwrap();
+        let c = std::ffi::CString::new(reg.to_str().unwrap()).unwrap();
+        // SAFETY: valid C string.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
         assert_eq!(host_service_pid(&reg), None);
     }
 
@@ -379,38 +409,74 @@ mod tests {
             return; // no sqlite3 on this host
         }
         assert!(logged_out_after_upgrade(&data, &st), "no credential rows");
+        let marker = st.join("opencode-v2-credentials-seen");
+        assert!(marker.exists(), "hint once, then skip");
+        assert!(!logged_out_after_upgrade(&data, &st), "marker skips");
+        std::fs::remove_file(&marker).unwrap();
         assert!(sql("INSERT INTO credential VALUES ('c')"));
         assert!(!logged_out_after_upgrade(&data, &st));
-        assert!(st.join("opencode-v2-credentials-seen").exists());
-        assert!(sql("DELETE FROM credential"));
-        assert!(!logged_out_after_upgrade(&data, &st), "marker skips");
+        assert!(marker.exists());
     }
 
     #[test]
-    fn first_run_gate_serializes_until_the_database_exists() {
+    fn sqlite_count_refuses_a_fifo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("opencode.db");
+        let c = std::ffi::CString::new(db.to_str().unwrap()).unwrap();
+        // SAFETY: valid C string.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let t = std::time::Instant::now();
+        assert_eq!(sqlite_count(&db, "credential"), None);
+        assert!(t.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    /// Test stand-in for the migration check: a non-empty file is "done".
+    fn non_empty(db: &Path) -> bool {
+        std::fs::metadata(db).is_ok_and(|m| m.len() > 0)
+    }
+
+    #[test]
+    fn first_run_gate_serializes_until_the_bootstrap_is_done() {
         use std::time::{Duration, Instant};
         let tmp = tempfile::tempdir().unwrap();
         let db = tmp.path().join("opencode.db");
         let lock = tmp.path().join("st/first-run.lock");
         let limit = Duration::from_secs(10);
-        gate(db.clone(), &lock, limit);
+        assert_eq!(gate(db.clone(), &lock, limit, non_empty), None);
         let t = Instant::now();
         let maker = {
             let db = db.clone();
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(300));
-                std::fs::write(db, "").unwrap();
+                // The file appears before the bootstrap commits.
+                std::thread::sleep(Duration::from_millis(200));
+                std::fs::write(&db, "").unwrap();
+                std::thread::sleep(Duration::from_millis(600));
+                std::fs::write(&db, "x").unwrap();
             })
         };
-        gate(db.clone(), &lock, limit);
+        // A second first-run launch, started before the file exists.
+        assert_eq!(gate(db.clone(), &lock, limit, non_empty), None);
         let waited = t.elapsed();
         maker.join().unwrap();
-        // Waits for the database plus the settle delay, not for the limit.
-        assert!(waited >= Duration::from_secs(2), "{waited:?}");
+        assert!(waited >= Duration::from_millis(700), "{waited:?}");
         assert!(waited < limit, "{waited:?}");
         let t = Instant::now();
-        gate(db, &lock, limit);
+        assert_eq!(gate(db, &lock, limit, non_empty), None);
         assert!(t.elapsed() < Duration::from_millis(50), "database exists");
+    }
+
+    #[test]
+    fn first_run_gate_warns_when_the_lock_is_unusable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lock = tmp.path().join("lockdir");
+        std::fs::create_dir(&lock).unwrap(); // File::create on a dir fails
+        let w = gate(
+            tmp.path().join("opencode.db"),
+            &lock,
+            std::time::Duration::from_secs(1),
+            non_empty,
+        );
+        assert!(w.is_some_and(|w| w.contains("database is locked")));
     }
 
     #[test]

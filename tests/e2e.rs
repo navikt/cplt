@@ -9808,6 +9808,9 @@ paths = [
             let (_, err, code) = home.sh("exit 0");
             assert_eq!(code, Some(0), "{err}");
             assert!(!err.contains("host OpenCode service"), "{err}");
+            // No opencode.db yet: the launch went through the first-run gate.
+            let lock = home.h.join(".config/cplt/opencode-v2-first-run.lock");
+            assert!(lock.exists(), "first-run gate not wired");
             std::fs::write(
                 home.h.join(".local/state/opencode/service.json"),
                 format!("{{\"pid\":{}}}", std::process::id()),
