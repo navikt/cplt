@@ -279,12 +279,13 @@ fn probe_command(path: &Path, args: &[&str]) -> std::process::Command {
     cmd
 }
 
-/// [`probe_version`] with its two wall-clock budgets passed in, so a test that
-/// is not about the bounds can give a loaded machine room (#528).
+/// [`probe_version`] with its timeout passed in (#725 retries with a longer one).
 pub(crate) fn probe_version_within(path: &Path, args: &[&str], timeout: Duration) -> VersionProbe {
     probe_version_bounded(path, args, timeout, READ_GRACE)
 }
 
+/// [`probe_version`] with both wall-clock budgets passed in, so a test that
+/// is not about the bounds can give a loaded machine room (#528).
 fn probe_version_bounded(
     path: &Path,
     args: &[&str],

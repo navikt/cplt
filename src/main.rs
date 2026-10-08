@@ -4274,11 +4274,10 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             // the 1.x path lets it attach to the host's service. Fail closed.
             agent::is_opencode_v2(bin, &home_dir).with_context(|| {
                 format!(
-                    "cannot tell which OpenCode major version {} is: `opencode --version` \
-                     gave no usable answer.\nRun `{} --version` to check it, then retry; \
+                    "cannot tell which OpenCode major version {bin} is: `{bin} --version` \
+                     gave no usable answer.\nRun it to check, then retry; \
                      reinstall OpenCode if the command hangs or fails.",
-                    bin.display(),
-                    bin.display()
+                    bin = bin.display()
                 )
             })?
         }
