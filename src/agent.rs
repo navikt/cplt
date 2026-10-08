@@ -329,11 +329,14 @@ pub fn opencode_v2_provider_domains(home: &Path) -> Vec<&'static str> {
 /// missing file, a 1.x database without the table or a failed run is "no".
 #[allow(clippy::disallowed_methods)] // fixed absolute /usr/bin/sqlite3
 fn opencode_db_has_copilot(db: &Path) -> bool {
-    if !db.is_file() {
+    // The db is agent-writable: `symlink_metadata` so a symlink or FIFO there
+    // is "no" (a FIFO would hang sqlite3 before the sandbox starts), and
+    // `-init /dev/null` so no `~/.sqliterc` runs.
+    if !db.symlink_metadata().is_ok_and(|m| m.is_file()) {
         return false;
     }
     std::process::Command::new("/usr/bin/sqlite3")
-        .args(["-readonly", "-batch"])
+        .args(["-init", "/dev/null", "-readonly", "-batch"])
         .arg(db)
         .arg(
             "SELECT 1 FROM credential WHERE integration_id = 'github-copilot' \
@@ -396,25 +399,11 @@ pub(crate) fn opencode_host_login(home: &Path, token: &str) -> Option<String> {
 const SMALL_FILE_LIMIT: u64 = 64 * 1024;
 
 /// Read a file the sandboxed agent can write, without letting it hang the
-/// next launch: `O_NONBLOCK` so opening a planted FIFO returns at once, then
-/// only a regular file of at most [`SMALL_FILE_LIMIT`] bytes is read (a
-/// symlink to `/dev/zero` is a character device and is refused). `None` for
-/// anything else.
+/// next launch. See [`crate::untrusted::read_regular_following`].
 pub(crate) fn read_small_regular_file(path: &Path) -> Option<String> {
-    use std::io::Read as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)
-        .ok()?;
-    let meta = file.metadata().ok()?;
-    if !meta.is_file() || meta.len() > SMALL_FILE_LIMIT {
-        return None;
-    }
-    let mut s = String::new();
-    file.take(SMALL_FILE_LIMIT).read_to_string(&mut s).ok()?;
-    Some(s)
+    crate::untrusted::read_regular_following(path, SMALL_FILE_LIMIT)
+        .ok()
+        .flatten()
 }
 
 /// Read + execute grants for the scripts Claude Code's user-level hooks and
@@ -5388,6 +5377,10 @@ mod tests {
         assert!(!opencode_db_has_copilot(&db));
         sql(r#"INSERT INTO credential VALUES ('github-copilot', '{"type":"oauth"}')"#);
         assert!(opencode_db_has_copilot(&db));
+        // Agent-writable: a symlink to a real db is not followed (#716).
+        let link = tmp.path().join("link.db");
+        std::os::unix::fs::symlink(&db, &link).unwrap();
+        assert!(!opencode_db_has_copilot(&link));
     }
 
     /// #695: a configured gh adds the Copilot hosts only when the overlay

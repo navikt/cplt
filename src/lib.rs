@@ -28,6 +28,7 @@ pub mod shim;
 pub mod subscriptions;
 pub mod trust;
 pub mod ui;
+pub mod untrusted;
 pub mod update;
 pub mod worktrees;
 

@@ -836,8 +836,15 @@ pub fn upsert_managed_block(path: &Path) -> Result<BlockOutcome, String> {
     // link, so nothing rides on this staying race-free.
     agents_md_is_plain(path)?;
 
-    let existing = match std::fs::read_to_string(path) {
-        Ok(content) => content,
+    // A FIFO planted here would hang cplt on a plain read (#audit host reads).
+    let existing = match crate::untrusted::read_untrusted(path, 4 * 1024 * 1024) {
+        Ok(Some(content)) => content,
+        Ok(None) => {
+            return Err(format!(
+                "cannot read {}: not a regular file, or larger than 4 MiB",
+                path.display()
+            ));
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             write_replacing(path, &format!("{block}\n"))?;
             return Ok(BlockOutcome::Created);
@@ -898,6 +905,7 @@ pub fn upsert_managed_block(path: &Path) -> Result<BlockOutcome, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::config::{GhGuardPolicy, GitGuardPolicy, Resolved};
     use std::path::PathBuf;
 

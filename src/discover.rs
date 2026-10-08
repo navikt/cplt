@@ -1391,7 +1391,8 @@ fn gitdir_without_git(dir: &Path) -> Option<PathBuf> {
     //
     // Submodules and `--separate-git-dir` repos have no `commondir`; their
     // pointer already names the common dir, so they fall through unchanged.
-    if let Ok(raw) = std::fs::read_to_string(resolved.join("commondir")) {
+    // `commondir` is agent-writable (not write-denied): refuse a FIFO/symlink.
+    if let Ok(Some(raw)) = crate::untrusted::read_untrusted(&resolved.join("commondir"), 4096) {
         let raw = raw.trim();
         if !raw.is_empty() {
             let common = if Path::new(raw).is_absolute() {
@@ -2010,6 +2011,28 @@ mod tests {
             None,
             "a FIFO .git must be refused, not read"
         );
+    }
+
+    /// `<gitdir>/worktrees/*/commondir` is agent-writable: a FIFO there must
+    /// not hang launch, and a symlink must not be read through.
+    #[test]
+    fn gitdir_without_git_refuses_fifo_or_symlink_commondir() {
+        use crate::untrusted::tests::{bounded, mkfifo};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let wt = root.join("main.git/worktrees/wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let proj = root.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join(".git"), format!("gitdir: {}\n", wt.display())).unwrap();
+        mkfifo(&wt.join("commondir"));
+        let p = proj.clone();
+        assert_eq!(bounded(move || gitdir_without_git(&p)), Some(wt.clone()));
+
+        std::fs::remove_file(wt.join("commondir")).unwrap();
+        std::fs::write(root.join("cd"), "../..").unwrap();
+        std::os::unix::fs::symlink(root.join("cd"), wt.join("commondir")).unwrap();
+        assert_eq!(gitdir_without_git(&proj), Some(wt), "read through symlink");
     }
 
     /// A `.git` symlink to a real gitdir is a supported layout, and git follows
