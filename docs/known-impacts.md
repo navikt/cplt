@@ -488,11 +488,18 @@ for `mmdc -p`:
 }
 ```
 
-Adjust the path to the `chrome-headless-shell` build you have. Alternatives:
-set `PUPPETEER_CACHE_DIR` to a directory under `~/Library/Caches/ms-playwright`
-and pass it with `--pass-env PUPPETEER_CACHE_DIR`, and use `--allow-localhost-any`
-instead of `"pipe": true`. `--no-sandbox` is needed for the same reason as with
-Playwright above.
+Adjust the path to the `chrome-headless-shell` build you have. `--no-sandbox`
+is needed for the same reason as with Playwright above; without it the launch
+fails with `ConnectionClosedError: Connection closed`.
+
+Alternatives: set `PUPPETEER_CACHE_DIR` to a directory under
+`~/Library/Caches/ms-playwright`, download the browser there outside cplt
+(`npx puppeteer browsers install chrome-headless-shell`) and pass the variable
+with `--pass-env PUPPETEER_CACHE_DIR`; then `executablePath` can go. Or use
+`--allow-localhost-any` instead of `"pipe": true`.
+
+`npx -y @mermaid-js/mermaid-cli` fails before any of this with `bad interpreter`;
+see [npx](#npx-and-npm-exec) above.
 
 ## Copilot CLI's own command sandbox (1.0.83+)
 
