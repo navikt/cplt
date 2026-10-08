@@ -4372,7 +4372,9 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
                  (#710). Remove it from deny.env (check the repo's .cplt.toml) to run v2."
             );
         }
-        prepared.add_opencode_v2(session);
+        prepared
+            .add_opencode_v2(session)
+            .map_err(|e| anyhow::anyhow!("Cannot set up the OpenCode v2 session: {e}"))?;
         for w in cplt::opencode_v2::host_warnings(&home_dir) {
             ui::warn(&w);
         }

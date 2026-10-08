@@ -9827,12 +9827,93 @@ paths = [
             assert!(err.contains("opencode auth login"), "{err}");
         }
 
+        /// v2 reads every `AGENTS.md` from the launch dir up to $HOME and
+        /// blocks the session if one is unreadable: plain or dotfile-symlinked
+        /// ones are readable, a link to a credential or a FIFO is refused.
+        #[test]
+        fn ancestor_agents_md_is_readable() {
+            require_sandbox!();
+            let home = stub_home();
+            std::fs::write(home.h.join("work/AGENTS.md"), "ANCESTOR").unwrap();
+            std::fs::create_dir_all(home.h.join("dotfiles")).unwrap();
+            std::fs::write(home.h.join("dotfiles/AGENTS.md"), "HOMEDOT").unwrap();
+            let link = home.h.join("AGENTS.md");
+            symlink(home.h.join("dotfiles/AGENTS.md"), &link).unwrap();
+            let (out, err, code) = home.sh(&format!(
+                "cat {0}/work/AGENTS.md {0}/AGENTS.md",
+                home.h.display()
+            ));
+            assert_eq!(code, Some(0), "{err}");
+            assert!(out.contains("ANCESTOR") && out.contains("HOMEDOT"), "{out}");
+            std::fs::remove_file(&link).unwrap();
+            std::fs::create_dir_all(home.h.join(".ssh")).unwrap();
+            std::fs::write(home.h.join(".ssh/config"), SECRET).unwrap();
+            let c = std::ffi::CString::new(home.h.join("fifo").to_str().unwrap()).unwrap();
+            // SAFETY: valid C string.
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+            std::fs::create_dir_all(home.h.join(".cargo")).unwrap();
+            std::fs::write(home.h.join(".cargo/credentials.toml"), SECRET).unwrap();
+            for target in [".ssh/config", "fifo", ".cargo/credentials.toml"] {
+                symlink(home.h.join(target), &link).unwrap();
+                let (out, err, code) = home.sh("echo RAN");
+                assert_ne!(code, Some(0), "{target}: {err}");
+                assert!(!out.contains("RAN"), "{target}");
+                assert!(err.contains(&link.display().to_string()), "{err}");
+                let to = format!("points to {}", home.h.join(target).display());
+                assert!(err.contains(&to), "{err}");
+                std::fs::remove_file(&link).unwrap();
+            }
+            // A file a later deny covers (deny.paths, the project .env rule)
+            // stays unreadable: the grant goes before the profile's denies.
+            std::fs::write(home.h.join("dotfiles/denied"), SECRET).unwrap();
+            std::fs::write(home.proj.join(".env"), SECRET).unwrap();
+            let deny = home.h.join("dotfiles/denied");
+            for target in [deny.clone(), home.proj.join(".env")] {
+                symlink(&target, &link).unwrap();
+                let o = home
+                    .cmd(&[
+                        "--deny-path",
+                        deny.to_str().unwrap(),
+                        "--",
+                        "cat ~/AGENTS.md",
+                    ])
+                    .output()
+                    .unwrap();
+                let out = String::from_utf8_lossy(&o.stdout);
+                let err = String::from_utf8_lossy(&o.stderr);
+                assert!(!out.contains(SECRET), "{}: {out}\n{err}", target.display());
+                std::fs::remove_file(&link).unwrap();
+            }
+        }
+
+        /// A `.agents` link the agent plants in the project must not make its
+        /// target readable at the next launch (#716 leak).
+        #[test]
+        fn planted_discovery_link_does_not_expose_a_key() {
+            require_sandbox!();
+            let home = stub_home();
+            let key = home.h.join(".ssh/id_ed25519");
+            std::fs::create_dir_all(key.parent().unwrap()).unwrap();
+            std::fs::write(&key, SECRET).unwrap();
+            symlink(&key, home.proj.join(".agents")).unwrap();
+            let (out, err, _) = home.sh(&format!("cat {}", key.display()));
+            assert!(!out.contains(SECRET), "{out}\n{err}");
+            // Outside the project, the same link is refused by name.
+            symlink(&key, home.h.join("work/.agents")).unwrap();
+            let (out, err, code) = home.sh(&format!("cat {}", key.display()));
+            assert_ne!(code, Some(0), "{err}");
+            assert!(!out.contains(SECRET), "{out}");
+            assert!(err.contains(&key.display().to_string()), "{err}");
+        }
+
         #[test]
         fn ancestor_opencode_json_symlink_is_refused() {
             require_sandbox!();
             let home = stub_home();
             let link = home.h.join("work/opencode.json");
-            symlink(home.h.join(".claude/secret"), &link).unwrap();
+            std::fs::create_dir_all(home.h.join(".ssh")).unwrap();
+            std::fs::write(home.h.join(".ssh/config"), SECRET).unwrap();
+            symlink(home.h.join(".ssh/config"), &link).unwrap();
             let (_, err, code) = home.sh("echo RAN");
             assert_ne!(code, Some(0), "{err}");
             assert!(err.contains(&link.display().to_string()), "{err}");

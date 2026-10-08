@@ -32,6 +32,9 @@ pub struct Session {
     pub env: Vec<(String, String)>,
     /// Appended to the end of the macOS profile (last match wins).
     pub sbpl: String,
+    /// File grants placed before the profile's deny rules, so a deny
+    /// (credential, `deny.paths`, `.env`) on the same file still wins.
+    pub sbpl_before_denies: String,
 }
 
 /// An XDG base from the environment, ignoring a relative or empty value as the
@@ -83,9 +86,11 @@ pub fn prepare(scratch: &Path, home: &Path, launch_dir: &Path) -> Result<Session
         config_base.join("opencode/service.json"),
         state_base.join("opencode/service.json"),
     ];
+    let (sbpl_before_denies, sbpl) = profile_tail(home, launch_dir, &files, port)?;
     Ok(Session {
         env,
-        sbpl: profile_tail(home, launch_dir, &files, port)?,
+        sbpl,
+        sbpl_before_denies,
     })
 }
 
@@ -116,7 +121,8 @@ fn free_port() -> std::io::Result<u16> {
         .port())
 }
 
-/// The SBPL rules a v2 session adds.
+/// The SBPL rules a v2 session adds: (file grants that go before the
+/// profile's denies, the tail).
 ///
 /// v2's config discovery resolves `$HOME` and every parent of the working dir,
 /// plus the `.claude`, `.agents` and `.opencode` entries in each, and treats
@@ -134,7 +140,7 @@ fn profile_tail(
     launch_dir: &Path,
     files: &[PathBuf],
     port: u16,
-) -> Result<String, String> {
+) -> Result<(String, String), String> {
     let mut denied = Vec::new();
     for file in files {
         // Resolved per file, so a symlinked `opencode/` dir is covered too.
@@ -149,43 +155,49 @@ fn profile_tail(
     pinned.sort();
     pinned.dedup();
     let mut reads = Vec::new();
+    let mut files = Vec::new();
+    // v2 walks `AGENTS.md` from the launch dir up to `$HOME`, or up to the
+    // project root when the launch dir is outside `$HOME` (instruction.ts).
+    let stop = if launch_dir.starts_with(home) {
+        home.to_path_buf()
+    } else {
+        let git = launch_dir.ancestors().find(|d| d.join(".git").exists());
+        git.unwrap_or(launch_dir).to_path_buf()
+    };
+    let project = launch_dir
+        .ancestors()
+        .find(|d| d.join(".git").exists())
+        .unwrap_or(launch_dir);
     for dir in home.ancestors().chain(launch_dir.ancestors()) {
         reads.push(dir.to_path_buf());
-        for name in [".claude", ".agents", ".opencode"] {
-            let entry = dir.join(name);
-            if let Ok(real) = std::fs::canonicalize(&entry) {
-                reads.push(real);
-            }
-            reads.push(entry);
+        // The project is readable already; an entry there is agent-planted
+        // and must not resolve anywhere for it (#716).
+        if dir.starts_with(project) {
+            continue;
         }
-        // Discovery also resolves each `opencode.json(c)` and reads it as a
-        // config (#718). Granted only as a plain file with one link: a symlink
-        // or a hard link the agent planted could name any file, ~/.ssh too.
-        // Anything else is refused by name rather than left to fail as EPERM.
-        // The launch dir is the project, already readable: nothing to grant.
-        for name in ["opencode.json", "opencode.jsonc"]
-            .iter()
-            .filter(|_| dir != launch_dir)
-        {
-            let file = dir.join(name);
-            let Ok(m) = std::fs::symlink_metadata(&file) else {
-                continue;
-            };
-            if !(m.is_file() && m.nlink() == 1) {
-                return Err(format!(
-                    "{} is a symlink, hard link or directory. OpenCode v2 reads it as \
-                     config, and cplt grants it only as a plain file. Replace it with a \
-                     regular file or move it.",
-                    file.display()
-                ));
+        for name in [".claude", ".agents", ".opencode"] {
+            grant_dir(home, &dir.join(name), &mut reads)?;
+        }
+        // Discovery also resolves and reads each `opencode.json(c)` as config
+        // (#718), and the instruction loader blocks the session when an
+        // `AGENTS.md` it finds cannot be read. The launch dir is the project,
+        // already readable: nothing to grant there.
+        if dir == launch_dir {
+            continue;
+        }
+        let agents = launch_dir.starts_with(dir) && dir.starts_with(&stop);
+        for name in ["opencode.json", "opencode.jsonc", "AGENTS.md"] {
+            if name != "AGENTS.md" || agents {
+                grant_file(home, &dir.join(name), &mut files)?;
             }
-            reads.extend(std::fs::canonicalize(&file));
-            reads.push(file);
         }
     }
     reads.sort();
     reads.dedup();
-    for p in reads.iter().chain(&denied).chain(&pinned) {
+    files.append(&mut reads);
+    files.sort();
+    files.dedup();
+    for p in files.iter().chain(&denied).chain(&pinned) {
         crate::sandbox::validate_sbpl_path(p)?;
     }
     let lit = |ps: &[PathBuf]| {
@@ -193,16 +205,26 @@ fn profile_tail(
             .map(|p| format!(" (literal \"{}\")", p.display()))
             .collect::<String>()
     };
-    Ok(format!(
+    // `file-read*`, not `file-read-data`: Seatbelt lets an allow on the
+    // narrower operation beat a later `file-read*` deny, whatever the order.
+    let before = if files.is_empty() {
+        String::new()
+    } else {
+        format!(
+            ";; OpenCode v2 discovery: dir listings, config and instruction files\n\
+             (allow file-read*{})\n",
+            lit(&files)
+        )
+    };
+    let tail = format!(
         "\n;; OpenCode v2 session service (#710)\n\
-         (allow file-read-data{})\n\
          (deny file-read* file-write*{})\n\
          (deny file-write-unlink{})\n\
          (allow network-outbound (remote ip \"localhost:{port}\"))\n",
-        lit(&reads),
         lit(&denied),
         lit(&pinned),
-    ))
+    );
+    Ok((before, tail))
 }
 
 /// Host-side notes for a v2 launch, read by cplt and never passed into the
@@ -357,6 +379,67 @@ fn gate(
         drop(file);
     });
     None
+}
+
+/// Grants `file` as a literal if it is a plain file with one link, or a
+/// symlink (dotfile managers) whose launch-time target is one. The spelled
+/// and the resolved path are granted, never a subpath, so repointing the link
+/// later exposes nothing. A hard link, directory, FIFO, dangling link or a
+/// target the sandbox denies is refused by name rather than left to fail as
+/// EPERM. The grant itself goes before the profile's denies, so a deny this
+/// check misses (`deny.paths`, `.env`) still wins in the kernel.
+fn grant_file(home: &Path, file: &Path, reads: &mut Vec<PathBuf>) -> Result<(), String> {
+    if std::fs::symlink_metadata(file).is_err() {
+        return Ok(());
+    }
+    let fail = |why: String| {
+        Err(format!(
+            "{why}. OpenCode v2 reads {} at startup and stops when it cannot. \
+             Replace it with a regular file or move it.",
+            file.display()
+        ))
+    };
+    let Ok(real) = std::fs::canonicalize(file) else {
+        return fail(format!("{} is a dangling symlink", file.display()));
+    };
+    let shown = if real == file {
+        file.display().to_string()
+    } else {
+        format!("{} points to {}, which", file.display(), real.display())
+    };
+    if !std::fs::symlink_metadata(&real).is_ok_and(|m| m.is_file() && m.nlink() == 1) {
+        return fail(format!("{shown} is not a regular file with one link"));
+    }
+    if crate::sandbox::first_party_read_target(home, file).as_ref() != Some(&real) {
+        return fail(format!("{shown} is a file the sandbox denies"));
+    }
+    reads.extend([real, file.to_path_buf()]);
+    Ok(())
+}
+
+/// Grants the listing of a `.claude`, `.agents` or `.opencode` entry v2
+/// stats at startup: the spelled path, and its target when that is a
+/// directory outside every sandbox deny. Anything else that exists is
+/// refused, naming link and target: a planted link could name a key.
+fn grant_dir(home: &Path, entry: &Path, reads: &mut Vec<PathBuf>) -> Result<(), String> {
+    reads.push(entry.to_path_buf());
+    if std::fs::symlink_metadata(entry).is_err() {
+        return Ok(());
+    }
+    let real = std::fs::canonicalize(entry);
+    if let Ok(real) = &real
+        && real.is_dir()
+        && !crate::sandbox::dir_overlaps_credentials(home, real)
+    {
+        reads.push(real.clone());
+        return Ok(());
+    }
+    let to = real.map_or_else(|_| "nothing".into(), |r| r.display().to_string());
+    Err(format!(
+        "{} points to {to}, which is not a directory the sandbox allows. OpenCode v2 \
+         reads it at startup. Remove the link or point it at a directory.",
+        entry.display()
+    ))
 }
 
 #[cfg(test)]
@@ -516,8 +599,9 @@ mod tests {
         std::fs::create_dir_all(root.join("cfg")).unwrap();
         std::os::unix::fs::symlink(root.join("dotfiles/opencode"), root.join("cfg/opencode"))
             .unwrap();
-        let tail =
-            profile_tail(&root, &root, &[root.join("cfg/opencode/service.json")], 1).unwrap();
+        let tail = profile_tail(&root, &root, &[root.join("cfg/opencode/service.json")], 1)
+            .unwrap()
+            .1;
         for f in [
             "cfg/opencode/service.json",
             "dotfiles/opencode/service.json",
@@ -542,7 +626,9 @@ mod tests {
         std::fs::create_dir_all(&state).unwrap();
         std::fs::create_dir_all(root.join("proj")).unwrap();
         std::fs::write(state.join("service.json"), "{}").unwrap();
-        let tail = profile_tail(&root, &root, &[state.join("service.json")], 1).unwrap();
+        let tail = profile_tail(&root, &root, &[state.join("service.json")], 1)
+            .unwrap()
+            .1;
         let run = |profile: &str, cmd: &[&str]| {
             std::process::Command::new("/usr/bin/sandbox-exec")
                 .args(["-p", profile])
@@ -561,9 +647,10 @@ mod tests {
         assert!(run("(version 1)(allow default)", &mv), "control");
     }
 
-    /// Kernel check (#718): a plain `opencode.json` in an ancestor of the
-    /// launch dir is readable; a symlink, hard link or directory there is
-    /// refused by name, so it never reaches the file it points at.
+    /// Kernel check (#718): a plain `opencode.json` or `AGENTS.md` in an
+    /// ancestor of the launch dir is readable, and so is a symlink to a plain
+    /// file (at both names); a hard link, directory, FIFO or dangling link
+    /// there is refused by name.
     #[cfg(target_os = "macos")]
     #[test]
     #[allow(clippy::disallowed_methods)] // fixed /usr/bin/sandbox-exec, /bin/cat
@@ -573,7 +660,10 @@ mod tests {
         let (a, b, c) = (root.join("a"), root.join("a/b"), root.join("a/b/c"));
         std::fs::create_dir_all(&c).unwrap();
         std::fs::write(a.join("opencode.json"), "PLAIN").unwrap();
+        std::fs::write(a.join("AGENTS.md"), "AGENTS").unwrap();
         std::fs::write(root.join("secret"), "SECRET").unwrap();
+        std::fs::write(root.join("dot"), "DOT").unwrap();
+        std::os::unix::fs::symlink(root.join("dot"), b.join("AGENTS.md")).unwrap();
         let svc = [root.join("x/service.json")];
         let refused = |f: PathBuf| {
             let err = profile_tail(&root, &c, &svc, 1).unwrap_err();
@@ -582,7 +672,12 @@ mod tests {
                 .or_else(|_| std::fs::remove_dir(&f))
                 .unwrap();
         };
-        std::os::unix::fs::symlink(root.join("secret"), b.join("opencode.json")).unwrap();
+        std::os::unix::fs::symlink(root.join("gone"), b.join("opencode.json")).unwrap();
+        refused(b.join("opencode.json"));
+        let fifo = std::ffi::CString::new(root.join("fifo").to_str().unwrap()).unwrap();
+        // SAFETY: valid C string.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        std::os::unix::fs::symlink(root.join("fifo"), b.join("opencode.json")).unwrap();
         refused(b.join("opencode.json"));
         std::fs::hard_link(root.join("secret"), b.join("opencode.jsonc")).unwrap();
         refused(b.join("opencode.jsonc"));
@@ -590,22 +685,29 @@ mod tests {
         refused(b.join("opencode.json"));
         // In the launch dir (the project, already readable) a link is fine.
         std::os::unix::fs::symlink(root.join("secret"), c.join("opencode.json")).unwrap();
-        let tail = profile_tail(&root, &c, &svc, 1).unwrap();
-        assert!(!tail.contains("c/opencode.json"), "{tail}");
-        let profile = format!(
-            "(version 1)(allow default)(deny file-read-data (subpath \"{}\")){tail}",
-            root.display()
-        );
-        let cat = |p: &Path| {
+        let (before, tail) = profile_tail(&root, &c, &svc, 1).unwrap();
+        assert!(!before.contains("c/opencode.json"), "{before}");
+        let deny_root = format!("(deny file-read* (subpath \"{}\"))", root.display());
+        let cat_with = |profile: &str, p: &Path| {
             let o = std::process::Command::new("/usr/bin/sandbox-exec")
-                .args(["-p", &profile, "/bin/cat"])
+                .args(["-p", profile, "/bin/cat"])
                 .arg(p)
                 .output()
                 .unwrap();
             String::from_utf8_lossy(&o.stdout).into_owned()
         };
+        let profile = format!("(version 1)(allow default){deny_root}{before}{tail}");
+        let cat = |p: &Path| cat_with(&profile, p);
         assert_eq!(cat(&a.join("opencode.json")), "PLAIN");
+        assert_eq!(cat(&a.join("AGENTS.md")), "AGENTS");
+        assert_eq!(cat(&b.join("AGENTS.md")), "DOT", "symlink to a plain file");
         assert_eq!(cat(&root.join("secret")), "", "control: the deny holds");
+        // A deny after the grants (the profile's deny section) still wins.
+        let later = format!(
+            "(version 1)(allow default){before}(deny file-read* (subpath \"{}\")){tail}",
+            root.join("dot").display()
+        );
+        assert_eq!(cat_with(&later, &b.join("AGENTS.md")), "");
     }
 
     #[test]
@@ -639,7 +741,8 @@ mod tests {
                 .contains(&format!("{home}/.local/state/opencode/service.json"))
         );
         for read in [format!("{home}/.claude"), format!("{home}/src"), "/".into()] {
-            assert!(s.sbpl.contains(&format!("(literal \"{read}\")")), "{read}");
+            let lit = format!("(literal \"{read}\")");
+            assert!(s.sbpl_before_denies.contains(&lit), "{read}");
         }
     }
 }
