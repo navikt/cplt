@@ -3785,9 +3785,11 @@ pub const PROTECTED_IN_GITDIR: &[Protected] = &[
     // `remotes/<name>` and `branches/<name>` when `.git/config` does not define
     // it, so a file planted here defines a remote with an agent-chosen URL
     // without touching the denied `config`, and host-side git picks it up after
-    // the session. Nothing current writes either directory; recent `git init`
-    // templates do not create them. On Linux the bubblewrap bind needs the
-    // directory to exist, the same caveat as `info/exclude`.
+    // the session. Nothing current writes either directory. On Linux the
+    // bubblewrap bind needs the directory to exist at launch, and `git init`
+    // has not created either for years, so there the coverage is nominal:
+    // `Bwrap` because the bind is free where it applies, not because it
+    // reaches most repositories (SECURITY.md, "Legacy remote files").
     Protected {
         rel: "remotes",
         tree: true,
