@@ -47,10 +47,14 @@ const PNPM_SHADOW_BASE: &str = ".cplt-pnpm-shadow";
 #[derive(Debug)]
 pub struct ScratchDir {
     path: PathBuf,
-    /// Shared `flock` on the directory while the session runs, so
+    /// Shared `flock` on [`SESSION_MARKER`] while the session runs, so
     /// [`ScratchDir::gc_stale`] can tell a live session from an orphan.
     _lock: Option<std::fs::File>,
 }
+
+/// Lock file marking a scratch dir whose session holds a lock while it runs.
+/// Dirs without it (older cplt, or a failed lock) are left to the 24h sweep.
+const SESSION_MARKER: &str = ".cplt-session";
 
 /// gh token caches cplt writes into the scratch dir (see `sandbox_exec`).
 const GH_TOKEN_FILES: [&str; 2] = [".gh-exec-token", ".gh-token"];
@@ -631,11 +635,7 @@ impl ScratchDir {
             return Err(format!("Scratch dir path unsafe: {e}"));
         }
 
-        let lock = std::fs::File::open(&session_dir).ok().filter(|f| {
-            use std::os::unix::io::AsRawFd;
-            // SAFETY: `f` owns a valid descriptor; the lock lives as long as it.
-            unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_SH) == 0 }
-        });
+        let lock = lock_session(&session_dir);
         Ok(ScratchDir {
             path: session_dir,
             _lock: lock,
@@ -698,8 +698,10 @@ fn gc_stale_session_dirs(base: &Path) {
 
         // A session that crashed or was killed never ran `Drop`, so its gh
         // token cache would sit on disk until the 24h sweep. Remove it now
-        // unless the session still holds its lock.
-        if session_is_orphaned(&path) {
+        // when the dir is marked and its lock is free. Unmarked dirs may be
+        // live sessions of an older cplt: leave them alone.
+        let held = session_lock_held(&path);
+        if held == Some(false) {
             for file in GH_TOKEN_FILES {
                 let _ = std::fs::remove_file(path.join(file));
             }
@@ -712,6 +714,7 @@ fn gc_stale_session_dirs(base: &Path) {
 
         if let Ok(age) = now.duration_since(modified)
             && age > STALE_AGE
+            && held != Some(true)
         {
             use std::os::unix::fs::{MetadataExt, PermissionsExt};
             if metadata.uid() != unsafe { libc::getuid() } {
@@ -728,14 +731,31 @@ fn gc_stale_session_dirs(base: &Path) {
     }
 }
 
-/// True when no running cplt holds the session dir's lock.
-fn session_is_orphaned(dir: &Path) -> bool {
+/// Create [`SESSION_MARKER`] in `dir` and hold a shared lock on it. On
+/// failure the marker is removed, so launches never treat the dir as orphaned.
+fn lock_session(dir: &Path) -> Option<std::fs::File> {
     use std::os::unix::io::AsRawFd;
-    let Ok(f) = std::fs::File::open(dir) else {
-        return false;
-    };
+    let marker = dir.join(SESSION_MARKER);
+    let locked = std::fs::File::create(&marker).ok().filter(|f| {
+        // SAFETY: `f` owns a valid descriptor; the lock lives as long as it.
+        unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_SH) == 0 }
+    });
+    if locked.is_none() {
+        let _ = std::fs::remove_file(&marker);
+        ui::warn(
+            "Warning: cannot lock the scratch dir; stale gh token caches are left to the 24-hour cleanup.",
+        );
+    }
+    locked
+}
+
+/// `None`: the dir has no session marker. `Some(true)`: a running cplt holds
+/// it. `Some(false)`: marked and unlocked, so its session is gone.
+fn session_lock_held(dir: &Path) -> Option<bool> {
+    use std::os::unix::io::AsRawFd;
+    let f = std::fs::File::open(dir.join(SESSION_MARKER)).ok()?;
     // SAFETY: `f` owns a valid descriptor; the lock is released when it drops.
-    unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+    Some(unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0)
 }
 
 /// A short, random, per-session macOS directory for Playwright control sockets.
@@ -1000,17 +1020,25 @@ mod tests {
         assert!(!target.path().join("package-manager-store").exists());
     }
 
-    /// A crashed session's gh token cache goes at the next start; a live
-    /// session's stays (its gh still needs it); `Drop` takes the rest.
+    /// A crashed session's gh token cache goes at the next start. A live
+    /// session's stays, and so does an unmarked dir's (an older cplt that
+    /// takes no lock may still be using it). `Drop` takes the rest.
     #[test]
     fn gc_removes_orphaned_gh_token_caches_only() {
         let home = tempfile::tempdir().unwrap();
         let home = home.path().canonicalize().unwrap();
         let live = ScratchDir::create(&home).unwrap();
-        // A crashed session: a session dir nobody holds a lock on.
-        let orphan = ScratchDir::base(&home).join(generate_session_id().unwrap());
-        std::fs::create_dir(&orphan).unwrap();
-        for dir in [live.path(), orphan.as_path()] {
+        let new_dir = || {
+            let d = ScratchDir::base(&home).join(generate_session_id().unwrap());
+            std::fs::create_dir(&d).unwrap();
+            d
+        };
+        // Crashed session: marked, nobody holds the lock.
+        let orphan = new_dir();
+        std::fs::write(orphan.join(SESSION_MARKER), "").unwrap();
+        // Older cplt (or failed lock): no marker.
+        let unmarked = new_dir();
+        for dir in [live.path(), orphan.as_path(), unmarked.as_path()] {
             for f in GH_TOKEN_FILES {
                 std::fs::write(dir.join(f), "x").unwrap();
             }
@@ -1018,11 +1046,41 @@ mod tests {
         ScratchDir::gc_stale(&home);
         for f in GH_TOKEN_FILES {
             assert!(live.path().join(f).exists(), "live {f} kept");
+            assert!(unmarked.join(f).exists(), "unmarked {f} kept");
             assert!(!orphan.join(f).exists(), "orphan {f} removed");
         }
         let live_path = live.path().to_path_buf();
         drop(live);
         assert!(!live_path.exists(), "Drop removes the session dir");
+    }
+
+    /// A failed lock leaves no marker, so later launches skip the dir.
+    #[test]
+    fn failed_session_lock_leaves_no_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        // Read-only dir: the marker cannot be created, so no lock is taken.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(lock_session(dir.path()).is_none());
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(session_lock_held(dir.path()), None);
+        let ok = tempfile::tempdir().unwrap();
+        let _lock = lock_session(ok.path()).unwrap();
+        assert_eq!(session_lock_held(ok.path()), Some(true));
+    }
+
+    /// The 24h sweep spares a dir whose session still holds the lock.
+    #[test]
+    fn gc_sweep_skips_locked_old_dirs() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let live = ScratchDir::create(&home).unwrap();
+        let old = std::time::SystemTime::now() - STALE_AGE - Duration::from_secs(60);
+        std::fs::File::open(live.path())
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        ScratchDir::gc_stale(&home);
+        assert!(live.path().exists());
     }
 
     #[test]
