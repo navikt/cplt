@@ -251,11 +251,11 @@ impl DetectContext {
         if !self.is_confined(&path) {
             return None;
         }
-        let meta = std::fs::metadata(&path).ok()?;
-        if meta.len() > MAX_READ_SIZE {
-            return None;
-        }
-        std::fs::read_to_string(&path).ok()
+        // Confinement is checked above, so in-project symlinks are fine; the
+        // helper still refuses a FIFO or device and caps the size.
+        crate::untrusted::read_regular_following(&path, MAX_READ_SIZE)
+            .ok()
+            .flatten()
     }
 
     /// Root-level file names, best-effort and unordered.
@@ -1978,6 +1978,13 @@ fn expand_simple_glob(root: &Path, pattern: &str) -> Vec<String> {
 
 // ── Workspace parsers ────────────────────────────────────────────────
 
+/// Workspace manifests are agent-writable: no symlink, FIFO or oversize file.
+fn read_workspace_file(path: &Path) -> Option<String> {
+    crate::untrusted::read_untrusted(path, WORKSPACE_MAX_FILE_SIZE as u64)
+        .ok()
+        .flatten()
+}
+
 /// Parse `pnpm-workspace.yaml` for workspace members.
 fn parse_pnpm_workspace(
     root: &Path,
@@ -1985,14 +1992,9 @@ fn parse_pnpm_workspace(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let path = root.join("pnpm-workspace.yaml");
-    let Ok(content) = std::fs::read_to_string(&path) else {
+    let Some(content) = read_workspace_file(&path) else {
         return;
     };
-
-    // Bound file size
-    if content.len() > WORKSPACE_MAX_FILE_SIZE {
-        return;
-    }
 
     // Simple YAML parsing — look for `packages:` array.
     // We don't pull in a YAML dependency; the format is simple enough.
@@ -2043,12 +2045,9 @@ fn parse_package_json_workspaces(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let path = root.join("package.json");
-    let Ok(content) = std::fs::read_to_string(&path) else {
+    let Some(content) = read_workspace_file(&path) else {
         return;
     };
-    if content.len() > WORKSPACE_MAX_FILE_SIZE {
-        return;
-    }
 
     let json: serde_json::Value = match serde_json::from_str(&content) {
         Ok(v) => v,
@@ -2089,12 +2088,9 @@ fn parse_cargo_workspace(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let path = root.join("Cargo.toml");
-    let Ok(content) = std::fs::read_to_string(&path) else {
+    let Some(content) = read_workspace_file(&path) else {
         return;
     };
-    if content.len() > WORKSPACE_MAX_FILE_SIZE {
-        return;
-    }
 
     let table: toml::Table = match content.parse() {
         Ok(v) => v,
@@ -2146,16 +2142,13 @@ fn parse_gradle_settings(
     members: &mut Vec<WorkspaceMember>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    let content = if let Ok(c) = std::fs::read_to_string(root.join("settings.gradle.kts")) {
+    let content = if let Some(c) = read_workspace_file(&root.join("settings.gradle.kts")) {
         c
-    } else if let Ok(c) = std::fs::read_to_string(root.join("settings.gradle")) {
+    } else if let Some(c) = read_workspace_file(&root.join("settings.gradle")) {
         c
     } else {
         return;
     };
-    if content.len() > WORKSPACE_MAX_FILE_SIZE {
-        return;
-    }
 
     // Match both: include("app", "lib") and include 'app', 'lib'
     // Also: include(":services:api") → services/api
@@ -2207,12 +2200,9 @@ fn parse_go_work(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let path = root.join("go.work");
-    let Ok(content) = std::fs::read_to_string(&path) else {
+    let Some(content) = read_workspace_file(&path) else {
         return;
     };
-    if content.len() > WORKSPACE_MAX_FILE_SIZE {
-        return;
-    }
 
     let mut in_block = false;
     for line in content.lines() {
@@ -2704,6 +2694,44 @@ fn which_exists(binary: &str) -> bool {
 mod tests {
     use super::*;
     use std::fs;
+
+    /// Agent-planted workspace manifests and project files: no hang, no
+    /// symlink read, size capped before reading.
+    #[test]
+    fn workspace_and_read_text_refuse_fifo_symlink_and_huge() {
+        use crate::untrusted::tests::{bounded, mkfifo};
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().canonicalize().unwrap();
+        mkfifo(&root.join("pnpm-workspace.yaml"));
+        mkfifo(&root.join("package.json"));
+        mkfifo(&root.join("go.mod"));
+        let r = root.clone();
+        let (members, _) = bounded(move || discover_workspace_members(&r));
+        assert!(members.is_empty());
+        let r = root.clone();
+        assert!(bounded(move || DetectContext::new(&r).read_text("go.mod")).is_none());
+
+        let e = tempfile::tempdir().unwrap();
+        let root = e.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(root.join("app")).unwrap();
+        fs::write(outside.path().join("ws"), "packages:\n  - app\n").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("ws"), root.join("pnpm-workspace.yaml"))
+            .unwrap();
+        assert!(
+            discover_workspace_members(&root).0.is_empty(),
+            "read through symlink"
+        );
+
+        fs::remove_file(root.join("pnpm-workspace.yaml")).unwrap();
+        let mut big = "packages:\n  - app\n".to_string();
+        big.push_str(&"#".repeat(WORKSPACE_MAX_FILE_SIZE));
+        fs::write(root.join("pnpm-workspace.yaml"), big).unwrap();
+        assert!(
+            discover_workspace_members(&root).0.is_empty(),
+            "oversize read"
+        );
+    }
 
     fn setup_dir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()

@@ -252,8 +252,9 @@ fn opencode_v2_within(bin: &Path, home: &Path, timeouts: [std::time::Duration; 2
         .map_or(0, |d| d.as_nanos());
     let key = format!("{}\t{}\t{mtime}\t", real.display(), meta.len());
     let cache = cache_dir.join("opencode-version");
-    if let Some(v) = std::fs::read_to_string(&cache)
+    if let Some(v) = crate::untrusted::read_untrusted(&cache, SMALL_FILE_LIMIT)
         .ok()
+        .flatten()
         .and_then(|c| c.strip_prefix(&key).map(|v| v.trim().to_string()))
     {
         return Some(major_at_least_2(&v));
@@ -329,20 +330,29 @@ pub fn opencode_v2_provider_domains(home: &Path) -> Vec<&'static str> {
 /// missing file, a 1.x database without the table or a failed run is "no".
 #[allow(clippy::disallowed_methods)] // fixed absolute /usr/bin/sqlite3
 fn opencode_db_has_copilot(db: &Path) -> bool {
-    if !db.is_file() {
+    // The db is agent-writable: `symlink_metadata` so a symlink or FIFO there
+    // is "no" (a FIFO would hang sqlite3 before the sandbox starts), and
+    // `-init /dev/null` so no `~/.sqliterc` runs.
+    if !db.symlink_metadata().is_ok_and(|m| m.is_file()) {
         return false;
     }
-    std::process::Command::new("/usr/bin/sqlite3")
-        .args(["-readonly", "-batch"])
-        .arg(db)
-        .arg(
+    // Bounded: a FIFO swapped in after the check above would otherwise hang
+    // the launch.
+    let Some(db) = db.to_str() else { return false };
+    crate::discover::probe_output(
+        Path::new("/usr/bin/sqlite3"),
+        &[
+            "-init",
+            "/dev/null",
+            "-readonly",
+            "-batch",
+            db,
             "SELECT 1 FROM credential WHERE integration_id = 'github-copilot' \
              AND json_extract(value, '$.metadata.enterpriseUrl') IS NULL LIMIT 1",
-        )
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .is_ok_and(|o| o.status.success() && o.stdout.trim_ascii() == b"1")
+        ],
+        std::time::Duration::from_secs(5),
+    )
+    .is_some_and(|o| o.trim() == "1")
 }
 
 /// `Ok(None)` when the file does not exist, `Ok(Some(body))` when it was
@@ -351,9 +361,30 @@ fn read_opencode_auth_json(path: &Path) -> Result<Option<String>, ()> {
     match path.symlink_metadata() {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(()),
+        // The data dir is agent-writable: a symlink here could point at any
+        // host JSON (gcloud ADC, ~/.docker/config.json) and have it handed
+        // to the agent in OPENCODE_AUTH_CONTENT. Refuse it.
+        Ok(m) if m.is_symlink() => return Err(()),
         Ok(_) => {}
     }
-    read_small_regular_file(path).map(Some).ok_or(())
+    // nlink == 1 on the opened fd: a hard link to a host file is refused too.
+    use std::io::Read as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let file = crate::untrusted::open_untrusted(path)
+        .ok()
+        .flatten()
+        .filter(|f| {
+            f.metadata()
+                .is_ok_and(|m| m.nlink() == 1 && m.len() <= SMALL_FILE_LIMIT)
+        })
+        .ok_or(())?;
+    let mut s = String::new();
+    file.take(SMALL_FILE_LIMIT + 1)
+        .read_to_string(&mut s)
+        .map_err(|_| ())?;
+    (s.len() as u64 <= SMALL_FILE_LIMIT)
+        .then_some(Some(s))
+        .ok_or(())
 }
 
 /// The `OPENCODE_AUTH_CONTENT` value that logs OpenCode in to GitHub Copilot
@@ -387,7 +418,15 @@ fn opencode_auth_overlay(auth_json: Option<&str>, token: &str) -> Option<String>
 
 /// [`opencode_auth_overlay`] for the store in `home`.
 pub(crate) fn opencode_host_login(home: &Path, token: &str) -> Option<String> {
-    let stored = read_opencode_auth_json(&opencode_auth_json(home)?).ok()?;
+    let path = opencode_auth_json(home)?;
+    if path.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+        crate::ui::warn(&format!(
+            "{} is a symlink; skipping the Copilot login handover. Replace it with a plain file.",
+            path.display()
+        ));
+        return None;
+    }
+    let stored = read_opencode_auth_json(&path).ok()?;
     opencode_auth_overlay(stored.as_deref(), token)
 }
 
@@ -396,25 +435,11 @@ pub(crate) fn opencode_host_login(home: &Path, token: &str) -> Option<String> {
 const SMALL_FILE_LIMIT: u64 = 64 * 1024;
 
 /// Read a file the sandboxed agent can write, without letting it hang the
-/// next launch: `O_NONBLOCK` so opening a planted FIFO returns at once, then
-/// only a regular file of at most [`SMALL_FILE_LIMIT`] bytes is read (a
-/// symlink to `/dev/zero` is a character device and is refused). `None` for
-/// anything else.
+/// next launch. See [`crate::untrusted::read_regular_following`].
 pub(crate) fn read_small_regular_file(path: &Path) -> Option<String> {
-    use std::io::Read as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)
-        .ok()?;
-    let meta = file.metadata().ok()?;
-    if !meta.is_file() || meta.len() > SMALL_FILE_LIMIT {
-        return None;
-    }
-    let mut s = String::new();
-    file.take(SMALL_FILE_LIMIT).read_to_string(&mut s).ok()?;
-    Some(s)
+    crate::untrusted::read_regular_following(path, SMALL_FILE_LIMIT)
+        .ok()
+        .flatten()
 }
 
 /// Read + execute grants for the scripts Claude Code's user-level hooks and
@@ -5388,6 +5413,10 @@ mod tests {
         assert!(!opencode_db_has_copilot(&db));
         sql(r#"INSERT INTO credential VALUES ('github-copilot', '{"type":"oauth"}')"#);
         assert!(opencode_db_has_copilot(&db));
+        // Agent-writable: a symlink to a real db is not followed (#716).
+        let link = tmp.path().join("link.db");
+        std::os::unix::fs::symlink(&db, &link).unwrap();
+        assert!(!opencode_db_has_copilot(&link));
     }
 
     /// #695: a configured gh adds the Copilot hosts only when the overlay
@@ -5485,6 +5514,28 @@ mod tests {
     /// #609: the auth file sits in a dir the sandboxed agent can write, so a
     /// planted FIFO, device symlink or huge file must not hang or bloat the
     /// next launch; each is skipped.
+    /// Pre-existing leak: a symlinked auth.json (agent-writable data dir)
+    /// pointing at another host JSON must not reach OPENCODE_AUTH_CONTENT.
+    #[test]
+    fn opencode_host_login_refuses_symlinked_auth_json() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join(".local/share/opencode");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let secret = tmp.path().join("adc.json");
+        std::fs::write(&secret, r#"{"client_secret":"s3cret"}"#).unwrap();
+        std::os::unix::fs::symlink(&secret, dir.join("auth.json")).unwrap();
+        let got = temp_env::with_var("XDG_DATA_HOME", None::<&str>, || {
+            opencode_host_login(tmp.path(), "tok")
+        });
+        assert!(got.is_none(), "handed over through a symlink: {got:?}");
+        std::fs::remove_file(dir.join("auth.json")).unwrap();
+        std::fs::hard_link(&secret, dir.join("auth.json")).unwrap();
+        let got = temp_env::with_var("XDG_DATA_HOME", None::<&str>, || {
+            opencode_host_login(tmp.path(), "tok")
+        });
+        assert!(got.is_none(), "handed over through a hard link: {got:?}");
+    }
+
     #[test]
     fn provider_domains_skips_non_regular_and_oversize_auth_json() {
         let tmp = tempfile::tempdir().expect("tempdir");

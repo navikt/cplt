@@ -4921,7 +4921,9 @@ fn exec_gh_token() -> Option<String> {
     let tmpdir = std::env::var_os(sandbox::GH_TOKEN_DIR_ENV)
         .or_else(|| std::env::var_os("TMPDIR"))
         .filter(|v| !v.is_empty())?;
-    let token = std::fs::read_to_string(Path::new(&tmpdir).join(".gh-exec-token")).ok()?;
+    let token =
+        cplt::untrusted::read_untrusted(&Path::new(&tmpdir).join(".gh-exec-token"), 64 * 1024)
+            .ok()??;
     Some(token.trim().to_string()).filter(|t| !t.is_empty())
 }
 
@@ -4950,8 +4952,8 @@ fn serve_cached_gh_token() -> ExitCode {
 
     let token_path = Path::new(&tmpdir).join(".gh-token");
 
-    match std::fs::read_to_string(&token_path) {
-        Ok(token) if !token.is_empty() => {
+    match cplt::untrusted::read_untrusted(&token_path, 64 * 1024) {
+        Ok(Some(token)) if !token.is_empty() => {
             // Delete the file immediately after reading — one-time use only.
             // Copilot caches the token in memory after first read, so subsequent
             // calls to `gh auth token` by tools/subprocesses will get "not available".

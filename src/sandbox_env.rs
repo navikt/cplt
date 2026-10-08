@@ -371,8 +371,10 @@ fn yarn_major_is_1(dir: &Path) -> Option<bool> {
     if dir.join(".yarnrc.yml").exists() {
         return Some(false);
     }
-    let package_manager = std::fs::read_to_string(dir.join("package.json"))
+    // Agent-writable project files: a planted FIFO must not hang launch.
+    let package_manager = crate::untrusted::read_untrusted(&dir.join("package.json"), 1024 * 1024)
         .ok()
+        .flatten()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .and_then(|v| v.get("packageManager")?.as_str().map(str::to_owned));
     if let Some(pm) = package_manager.filter(|pm| pm.starts_with("yarn@")) {
@@ -382,7 +384,7 @@ fn yarn_major_is_1(dir: &Path) -> Option<bool> {
     // `__metadata` block.
     let mut head = [0u8; 256];
     let n = std::io::Read::read(
-        &mut std::fs::File::open(dir.join("yarn.lock")).ok()?,
+        &mut crate::untrusted::open_untrusted(&dir.join("yarn.lock")).ok()??,
         &mut head,
     )
     .ok()?;
@@ -594,6 +596,35 @@ fn strip_dangerous_node_flags(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Agent-planted package.json / yarn.lock: no hang, no read through a
+    /// symlink, no unbounded read.
+    #[test]
+    fn yarn_probe_refuses_fifo_symlink_and_huge_package_json() {
+        use crate::untrusted::tests::{bounded, mkfifo};
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().to_path_buf();
+        mkfifo(&p.join("package.json"));
+        mkfifo(&p.join("yarn.lock"));
+        let q = p.clone();
+        assert_eq!(bounded(move || yarn_major_is_1(&q)), None);
+
+        let e = tempfile::tempdir().unwrap();
+        let outside = e.path().join("pkg.json");
+        std::fs::write(&outside, r#"{"packageManager":"yarn@1.22.0"}"#).unwrap();
+        let link = e.path().join("proj");
+        std::fs::create_dir(&link).unwrap();
+        std::os::unix::fs::symlink(&outside, link.join("package.json")).unwrap();
+        assert_eq!(yarn_major_is_1(&link), None, "read through symlink");
+
+        let huge = e.path().join("huge");
+        std::fs::create_dir(&huge).unwrap();
+        let mut body = r#"{"packageManager":"yarn@1.22.0","x":""#.to_string();
+        body.push_str(&"x".repeat(2 * 1024 * 1024));
+        body.push_str(r#""}"#);
+        std::fs::write(huge.join("package.json"), body).unwrap();
+        assert_eq!(yarn_major_is_1(&huge), None, "oversize must not be read");
+    }
 
     /// #307: `--inherit-env` silently cancelled `--pass-env`. The inherit
     /// branch stripped every `ENV_ALWAYS_DENY` entry without consulting the
