@@ -205,9 +205,213 @@ fn profile_tail(
     ))
 }
 
+/// Host-side notes for a v2 launch, read by cplt and never passed into the
+/// sandbox:
+///
+/// - a live host service shares `opencode.db` and resumes unfinished turns it
+///   finds there, so it can carry on this session's work outside the sandbox;
+/// - a fresh database skips the legacy `auth.json` import, so a user with v1
+///   credentials starts logged out.
+pub fn host_warnings(home: &Path) -> Vec<String> {
+    let state = xdg_base("XDG_STATE_HOME", home, ".local/state");
+    let data = xdg_base("XDG_DATA_HOME", home, ".local/share").join("opencode");
+    let mut out = Vec::new();
+    if let Some(pid) = host_service_pid(&state.join("opencode/service.json")) {
+        out.push(format!(
+            "A host OpenCode service (pid {pid}) is running and shares opencode.db with \
+             this session. It may continue this session's unfinished turns outside the \
+             sandbox. Stop it (kill {pid}) to keep all work inside cplt."
+        ));
+    }
+    if logged_out_after_upgrade(&data, &home.join(crate::sandbox::CPLT_STATE_DIR)) {
+        out.push(
+            "OpenCode v2 did not import your v1 credentials (auth.json). Run \
+             `opencode auth login`, or `opencode auth import` with an exported file."
+                .into(),
+        );
+    }
+    out
+}
+
+/// The pid in a service registration, if that process is alive.
+fn host_service_pid(registration: &Path) -> Option<i32> {
+    let body = std::fs::read_to_string(registration).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let pid = i32::try_from(v.get("pid")?.as_i64()?)
+        .ok()
+        .filter(|p| *p > 0)?;
+    // SAFETY: signal 0 only checks that the pid exists.
+    let alive = unsafe { libc::kill(pid, 0) } == 0
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    alive.then_some(pid)
+}
+
+/// `auth.json` holds entries but the database has no credential row. Reads
+/// only the size of `auth.json` and a row count. Once rows are seen a marker
+/// in cplt's state dir skips the check, so steady-state launch spawns nothing.
+fn logged_out_after_upgrade(data: &Path, cplt_state: &Path) -> bool {
+    let marker = cplt_state.join("opencode-v2-credentials-seen");
+    if marker.exists() || std::fs::metadata(data.join("auth.json")).map_or(true, |m| m.len() <= 2) {
+        return false;
+    }
+    let db = data.join("opencode.db");
+    if !db.exists() {
+        return true;
+    }
+    let Some(sqlite) = crate::git::trusted_binary("sqlite3") else {
+        return false;
+    };
+    #[allow(clippy::disallowed_methods)] // resolved above, not a PATH lookup
+    let rows = std::process::Command::new(sqlite)
+        .args(["-readonly", "-batch"])
+        .arg(&db)
+        .arg("SELECT count(*) FROM credential")
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse::<u64>()
+                .ok()
+        });
+    match rows {
+        Some(0) => true,
+        Some(_) => {
+            let _ = std::fs::create_dir_all(cplt_state);
+            let _ = std::fs::write(marker, "");
+            false
+        }
+        // No sqlite3, or a schema we do not know: stay quiet.
+        None => false,
+    }
+}
+
+/// On a first run (no `opencode.db` yet) two services that bootstrap the
+/// database at once can fail with "database is locked": upstream locks the
+/// bootstrap per process only. First launches take a host-side lock in cplt's
+/// state dir; a background thread holds it until the database exists plus a
+/// settle delay, or `limit`. A waiter never blocks longer than `limit`, and
+/// the lock goes with the process if cplt exits sooner.
+///
+/// ponytail: "exists + settle" approximates "bootstrap done"; querying the
+/// migration table would be exact if the settle ever proves too short.
+pub fn first_run_gate(home: &Path) {
+    let db = xdg_base("XDG_DATA_HOME", home, ".local/share").join("opencode/opencode.db");
+    let lock = home
+        .join(crate::sandbox::CPLT_STATE_DIR)
+        .join("opencode-v2-first-run.lock");
+    gate(db, &lock, std::time::Duration::from_secs(15));
+}
+
+fn gate(db: PathBuf, lock: &Path, limit: std::time::Duration) {
+    const SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+    const TICK: std::time::Duration = std::time::Duration::from_millis(100);
+    if db.exists() {
+        return;
+    }
+    let file = lock
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::File::create(lock));
+    let Ok(file) = file else { return };
+    let start = std::time::Instant::now();
+    while file.try_lock().is_err() {
+        if start.elapsed() >= limit {
+            return;
+        }
+        std::thread::sleep(TICK);
+    }
+    if db.exists() {
+        return; // an earlier launch created it while we waited
+    }
+    std::thread::spawn(move || {
+        while !db.exists() && start.elapsed() < limit {
+            std::thread::sleep(TICK);
+        }
+        std::thread::sleep(SETTLE);
+        drop(file);
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_service_pid_needs_a_live_process() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = tmp.path().join("service.json");
+        let me = std::process::id();
+        std::fs::write(&reg, format!("{{\"pid\":{me},\"password\":\"x\"}}")).unwrap();
+        assert_eq!(host_service_pid(&reg), Some(me as i32));
+        // A reaped child's pid is free.
+        #[allow(clippy::disallowed_methods)] // test: any short-lived process
+        let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        std::fs::write(&reg, format!("{{\"pid\":{dead}}}")).unwrap();
+        assert_eq!(host_service_pid(&reg), None);
+        std::fs::write(&reg, "{}").unwrap();
+        assert_eq!(host_service_pid(&reg), None);
+    }
+
+    #[test]
+    fn logged_out_after_upgrade_reads_the_credential_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (data, st) = (tmp.path().join("data"), tmp.path().join("st"));
+        std::fs::create_dir_all(&data).unwrap();
+        assert!(!logged_out_after_upgrade(&data, &st), "no auth.json");
+        std::fs::write(data.join("auth.json"), "{}").unwrap();
+        assert!(!logged_out_after_upgrade(&data, &st), "empty auth.json");
+        std::fs::write(data.join("auth.json"), "{\"a\":{}}").unwrap();
+        assert!(logged_out_after_upgrade(&data, &st), "no database yet");
+        let db = data.join("opencode.db");
+        #[allow(clippy::disallowed_methods)] // resolved, not a PATH lookup
+        let sql = |q: &str| {
+            crate::git::trusted_binary("sqlite3")
+                .map(std::process::Command::new)
+                .and_then(|mut c| c.arg(&db).arg(q).status().ok())
+                .is_some_and(|s| s.success())
+        };
+        if !sql("CREATE TABLE credential (id TEXT)") {
+            return; // no sqlite3 on this host
+        }
+        assert!(logged_out_after_upgrade(&data, &st), "no credential rows");
+        assert!(sql("INSERT INTO credential VALUES ('c')"));
+        assert!(!logged_out_after_upgrade(&data, &st));
+        assert!(st.join("opencode-v2-credentials-seen").exists());
+        assert!(sql("DELETE FROM credential"));
+        assert!(!logged_out_after_upgrade(&data, &st), "marker skips");
+    }
+
+    #[test]
+    fn first_run_gate_serializes_until_the_database_exists() {
+        use std::time::{Duration, Instant};
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("opencode.db");
+        let lock = tmp.path().join("st/first-run.lock");
+        let limit = Duration::from_secs(10);
+        gate(db.clone(), &lock, limit);
+        let t = Instant::now();
+        let maker = {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                std::fs::write(db, "").unwrap();
+            })
+        };
+        gate(db.clone(), &lock, limit);
+        let waited = t.elapsed();
+        maker.join().unwrap();
+        // Waits for the database plus the settle delay, not for the limit.
+        assert!(waited >= Duration::from_secs(2), "{waited:?}");
+        assert!(waited < limit, "{waited:?}");
+        let t = Instant::now();
+        gate(db, &lock, limit);
+        assert!(t.elapsed() < Duration::from_millis(50), "database exists");
+    }
 
     #[test]
     fn overlay_links_everything_but_the_service_files() {
