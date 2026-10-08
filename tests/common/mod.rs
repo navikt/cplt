@@ -339,3 +339,59 @@ pub fn bare_origin_repo(dir_in: &Path) -> (tempfile::TempDir, PathBuf, PathBuf) 
     );
     (tmp, work, origin)
 }
+
+/// Send `signal` (e.g. `"INT"`) to the process group led by `pgid`, the way a
+/// terminal Ctrl-C reaches every process in the foreground group.
+///
+/// # Panics
+/// If `kill` cannot be run or fails.
+pub fn signal_group(pgid: u32, signal: &str) {
+    let ok = Command::new("/bin/kill")
+        .args([&format!("-{signal}"), "--", &format!("-{pgid}")])
+        .status()
+        .expect("kill should run")
+        .success();
+    assert!(ok, "kill -{signal} -{pgid} failed");
+}
+
+/// Every process with its environment (`ps -Eww`), one line each, for
+/// finding a session's processes by a unique `HOME=`.
+///
+/// # Panics
+/// If `ps` cannot be run or fails: an empty list must mean no processes.
+#[must_use]
+pub fn processes_with_env() -> Vec<String> {
+    let o = Command::new("/bin/ps")
+        .args(["-Eww", "-axo", "pid=,command="])
+        .output()
+        .expect("ps should run");
+    assert!(o.status.success(), "ps failed: {o:?}");
+    String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Hold `127.0.0.1:<port>` for a test that needs a fixed port listening.
+/// Tests holding the same port serialize on the returned guard. If another
+/// process already holds it, that fails the test in CI; locally the listener
+/// is `None`, after saying so (a real service is running there).
+pub fn hold_port(
+    port: u16,
+) -> (
+    std::sync::MutexGuard<'static, ()>,
+    Option<std::net::TcpListener>,
+) {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let guard = LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        Ok(l) => (guard, Some(l)),
+        Err(e) if std::env::var_os("CI").is_some() => panic!("port {port} busy in CI: {e}"),
+        Err(e) => {
+            eprintln!("NOTE (port {port}): held by another process on this host ({e})");
+            (guard, None)
+        }
+    }
+}

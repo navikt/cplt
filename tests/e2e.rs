@@ -25,7 +25,8 @@ mod e2e_tests {
 
     use crate::common::{
         bare_origin_repo, binary_path, cplt_cmd, cplt_cmd_with_ambient_config, cplt_local, git_cmd,
-        git_ok, home_temp_dir, make_config_home, shim_cmd, temp_repo,
+        git_ok, hold_port, home_temp_dir, make_config_home, processes_with_env, shim_cmd,
+        signal_group, temp_repo,
     };
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -9713,8 +9714,8 @@ paths = [
             require_sandbox!();
             let home = stub_home();
             // Something must listen on 49374 for a refused connect to mean
-            // anything: hold it, unless a host service already does.
-            let _held = std::net::TcpListener::bind("127.0.0.1:49374");
+            // anything: hold it, unless a host service already does (locally).
+            let _held = hold_port(49374);
             let (out, err, code) = home.sh(&format!(
                 r#"h={h}
                 cat "$h/.local/state/opencode/service.json"
@@ -9837,7 +9838,8 @@ paths = [
         #[test]
         fn session_dir_is_removed_after_exit() {
             require_sandbox!();
-            let (out, err, code) = stub_home().sh("echo $XDG_STATE_HOME");
+            let home = stub_home();
+            let (out, err, code) = home.sh("echo $XDG_STATE_HOME");
             assert_eq!(code, Some(0), "{err}");
             let scratch = scratch_of(&out);
             assert!(!scratch.exists(), "{} left behind", scratch.display());
@@ -9870,12 +9872,7 @@ paths = [
                 .unwrap();
             let scratch = scratch_of(&line);
             assert!(scratch.exists(), "{line}");
-            let pg = format!("-{}", c.id());
-            let kill = Command::new("/bin/kill")
-                .args(["-INT", "--", &pg])
-                .status()
-                .unwrap();
-            assert!(kill.success());
+            signal_group(c.id(), "INT");
             (scratch, c.wait().unwrap())
         }
     }
@@ -9918,12 +9915,8 @@ paths = [
         /// environment), allowing the service its 5 s shutdown.
         fn processes(home: &Home) -> Vec<String> {
             let tag = format!("HOME={} ", home.h.display());
-            let o = Command::new("/bin/ps")
-                .args(["-Eww", "-axo", "pid=,command="])
-                .output()
-                .unwrap();
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
+            processes_with_env()
+                .iter()
                 .filter(|l| l.contains(&tag))
                 .map(|l| l.chars().take(200).collect())
                 .collect()
@@ -9968,7 +9961,7 @@ paths = [
                 return;
             };
             let host = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let default = std::net::TcpListener::bind("127.0.0.1:49374").ok();
+            let (_lock, default) = hold_port(49374);
             let port = host.local_addr().unwrap().port();
             let reg = format!(
                 "{{\"port\":{port},\"password\":\"host\",\"url\":\"http://127.0.0.1:{port}\"}}"
@@ -10003,7 +9996,7 @@ paths = [
             };
             use std::os::unix::process::CommandExt;
             let mut c = home
-                .cmd(&["--quiet", "--", "acp"])
+                .cmd(&["--quiet", "--proxy-forced", "--", "acp"])
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -10024,12 +10017,7 @@ paths = [
                 assert!(Instant::now() < deadline, "agent and service: {running:#?}");
                 std::thread::sleep(Duration::from_millis(100));
             }
-            let pg = format!("-{}", c.id());
-            let kill = Command::new("/bin/kill")
-                .args(["-INT", "--", &pg])
-                .status()
-                .unwrap();
-            assert!(kill.success());
+            signal_group(c.id(), "INT");
             c.wait().unwrap();
             assert!(scratch_dirs(&home).is_empty(), "{:?}", scratch_dirs(&home));
             assert_no_process(&home);
