@@ -3577,6 +3577,102 @@ mod e2e_tests {
         let _ = std::fs::remove_dir_all(&fake_home);
     }
 
+    // ── config set with several values ───────────────────────────
+
+    fn config_set_global(home: &Path, args: &[&str]) -> std::process::Output {
+        cplt_cmd()
+            .args(["config", "set"])
+            .args(args)
+            .env("HOME", home.to_str().unwrap())
+            .env_remove("CPLT_CONFIG")
+            .output()
+            .expect("should run")
+    }
+
+    #[test]
+    fn e2e_config_set_multi_value_global_and_unset() {
+        let fake_home = make_config_home("set-multi");
+        let out = config_set_global(&fake_home, &["allow.localhost", "5432", "55432", "8099"]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let content = std::fs::read_to_string(fake_home.join(".config/cplt/config.toml")).unwrap();
+        for port in ["5432", "55432", "8099"] {
+            assert!(content.contains(port), "{port} missing: {content}");
+        }
+
+        let out = config_set_global(&fake_home, &["allow.localhost", "5432", "8099", "--unset"]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let content = std::fs::read_to_string(fake_home.join(".config/cplt/config.toml")).unwrap();
+        assert!(content.contains("55432"), "kept entry gone: {content}");
+        assert!(
+            !content.contains("8099") && !content.contains("[5432") && !content.contains(" 5432"),
+            "removed entries remain: {content}"
+        );
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
+    fn e2e_config_set_multi_value_rejects_scalar_key() {
+        let fake_home = make_config_home("set-multi-scalar");
+        let out = config_set_global(&fake_home, &["sandbox.quiet", "true", "false"]);
+        assert!(!out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("single value"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!fake_home.join(".config/cplt/config.toml").exists());
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    /// One bad value refuses the whole command: the good ones are not written.
+    #[test]
+    fn e2e_config_set_multi_value_one_bad_writes_nothing() {
+        let fake_home = make_config_home("set-multi-bad");
+        let out = config_set_global(&fake_home, &["allow.localhost", "5432", "notaport"]);
+        assert!(!out.status.success(), "a bad port must fail");
+        let content =
+            std::fs::read_to_string(fake_home.join(".config/cplt/config.toml")).unwrap_or_default();
+        assert!(!content.contains("5432"), "partial write: {content}");
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
+    fn e2e_config_set_multi_value_repo() {
+        let repo = make_repo_dir("set-multi-repo");
+        let out = cplt_cmd()
+            .args([
+                "config",
+                "set",
+                "--repo",
+                "allow.localhost",
+                "5432",
+                "55432",
+                "8099",
+                "8100",
+            ])
+            .current_dir(&repo)
+            .output()
+            .expect("should run");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let content = std::fs::read_to_string(repo.join(".cplt.toml")).unwrap();
+        for port in ["5432", "55432", "8099", "8100"] {
+            assert!(content.contains(port), "{port} missing: {content}");
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
     // ── config set --local e2e tests (#340) ──────────────────────
 
     /// The single local file under a fake HOME, or `None` if none was written.
@@ -3590,6 +3686,34 @@ mod e2e_tests {
 
     /// The round trip: write a local value, read it back labelled `(local)`,
     /// and see it in the effective config.
+    #[test]
+    fn e2e_config_set_multi_value_local() {
+        let fake_home = make_config_home("set-multi-local");
+        let repo = temp_repo("navikt/spleis");
+        let out = cplt_local(&fake_home, repo.path())
+            .args([
+                "config",
+                "set",
+                "--local",
+                "allow.localhost",
+                "5432",
+                "8099",
+            ])
+            .output()
+            .expect("should run");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let content = std::fs::read_to_string(local_file(&fake_home).unwrap()).unwrap();
+        assert!(
+            content.contains("5432") && content.contains("8099"),
+            "{content}"
+        );
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
     #[test]
     fn e2e_config_set_local_round_trip() {
         let fake_home = make_config_home("set-local");
