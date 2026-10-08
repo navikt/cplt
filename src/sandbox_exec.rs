@@ -1122,6 +1122,28 @@ fn forward_and_wait(mut child: std::process::Child) -> u8 {
     let child_pid = child.id() as i32;
     install_signal_forwarding(child_pid);
 
+    // Clear CHILD_PID before the child is reaped, so a late SIGTERM/SIGHUP
+    // can never be forwarded to a recycled pid (#724). WNOWAIT waits for exit
+    // but leaves the zombie in place: the pid stays ours until `wait()` below.
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let r = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child_pid as libc::id_t,
+                &raw mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if r == 0 {
+            CHILD_PID.store(0, std::sync::atomic::Ordering::SeqCst);
+            break;
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            break;
+        }
+    }
+
     match child.wait() {
         Ok(status) => status
             .code()
@@ -1334,10 +1356,12 @@ fn spawn_and_wait(cmd: &mut Command) -> u8 {
     status
 }
 
-fn install_signal_forwarding(child_pid: i32) {
-    use std::sync::atomic::{AtomicI32, Ordering};
+/// Pid the SIGTERM/SIGHUP handler forwards to; 0 means none.
+static CHILD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
-    static CHILD_PID: AtomicI32 = AtomicI32::new(0);
+fn install_signal_forwarding(child_pid: i32) {
+    use std::sync::atomic::Ordering;
+
     CHILD_PID.store(child_pid, Ordering::SeqCst);
 
     extern "C" fn forward_signal(sig: i32) {
@@ -1995,6 +2019,27 @@ fn read_confirm_byte(fd: i32) -> ConfirmResult {
             return ConfirmResult::Refused;
         }
         return ConfirmResult::Confirmed;
+    }
+}
+
+#[cfg(test)]
+mod child_pid_tests {
+    use super::*;
+
+    /// #724: once the child is reaped, the forwarding handler must have no pid.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // fixed /bin/sh
+    fn forward_and_wait_clears_child_pid() {
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 3"])
+            .spawn()
+            .unwrap();
+        assert_eq!(forward_and_wait(child), 3);
+        assert_eq!(CHILD_PID.load(std::sync::atomic::Ordering::SeqCst), 0);
+        unsafe {
+            libc::signal(libc::SIGTERM, libc::SIG_DFL);
+            libc::signal(libc::SIGHUP, libc::SIG_DFL);
+        }
     }
 }
 
