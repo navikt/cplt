@@ -32,23 +32,35 @@ struct Entry {
     argv: Vec<String>,
 }
 
-/// Gate side: append one entry. Best effort: a failure costs only the
-/// session-end apply, and the in-session notice still says how to set it.
-pub fn record(scratch: &Path, cwd: &Path, argv: &[String]) {
+/// Gate side: append one entry. `false` when nothing was written, so the
+/// caller can print the `git branch -u` line instead of promising the apply.
+pub fn record(scratch: &Path, cwd: &Path, argv: &[String]) -> bool {
     let Ok(mut line) = serde_json::to_string(&Entry {
         cwd: cwd.to_string_lossy().into_owned(),
         argv: argv.to_vec(),
     }) else {
-        return;
+        return false;
     };
     line.push('\n');
-    let _ = std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .append(true)
         .create(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(scratch.join(FILE))
-        .and_then(|mut f| f.write_all(line.as_bytes()));
+        .and_then(|mut f| f.write_all(line.as_bytes()))
+        .is_ok()
+}
+
+/// The `git branch -u` line for `argv`, with whatever names it carries.
+#[must_use]
+pub fn hint_for(argv: &[String]) -> String {
+    let (remote, branch) = parse(argv).unwrap_or(("<remote>", "<branch>"));
+    Skip {
+        remote: Some(remote.to_string()),
+        branch: Some(branch.to_string()),
+    }
+    .hint()
 }
 
 /// Gate side: the branch `HEAD` names *now*, while the push is being run,
@@ -511,15 +523,27 @@ mod tests {
         let link = d.path().join(FILE);
         std::os::unix::fs::symlink(&real, &link).unwrap();
         assert!(read_entries(&link).is_empty());
-        // The gate refuses to append through it, too.
-        record(d.path(), Path::new("/"), &argv("push -u origin feat"));
+        // The gate refuses to append through it, too, and says so.
+        assert!(!record(
+            d.path(),
+            Path::new("/"),
+            &argv("push -u origin feat")
+        ));
         assert_eq!(read_entries(&real).len(), 1);
+        assert_eq!(
+            hint_for(&argv("push -u origin feat")),
+            "git branch -u origin/feat feat"
+        );
     }
 
+    /// The trusted git, isolated from the developer's global and system
+    /// config (`commit.gpgsign`, `core.hooksPath`, aliases), as
+    /// `tests/common::git_cmd` does.
     fn git(dir: &Path, args: &[&str]) -> String {
-        let o = std::process::Command::new("git")
+        let o = std::process::Command::new(crate::git::trusted_git().unwrap())
             .args(args)
             .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .output()
             .unwrap();

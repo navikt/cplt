@@ -5166,7 +5166,14 @@ fn run_git_gate(
         && let Ok(cwd) = std::env::current_dir()
     {
         let argv = cplt::upstream::resolve_head(real_git, &cwd, args);
-        cplt::upstream::record(Path::new(&scratch), &cwd, &argv);
+        if !cplt::upstream::record(Path::new(&scratch), &cwd, &argv) {
+            // Said now, because the notice below promises an apply that
+            // cannot happen without the entry.
+            eprintln!(
+                "cplt: could not record the upstream for this push. Outside the sandbox, run: {}",
+                cplt::upstream::hint_for(&argv)
+            );
+        }
     }
     perform_gate_effect(real_git, "git", args, effect)
 }
