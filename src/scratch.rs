@@ -735,11 +735,15 @@ fn gc_stale_session_dirs(base: &Path) {
 /// failure the marker is removed, so launches never treat the dir as orphaned.
 fn lock_session(dir: &Path) -> Option<std::fs::File> {
     use std::os::unix::io::AsRawFd;
+    // SAFETY: `f` owns a valid descriptor; the lock lives as long as it.
+    lock_session_with(dir, |f| unsafe {
+        libc::flock(f.as_raw_fd(), libc::LOCK_SH) == 0
+    })
+}
+
+fn lock_session_with(dir: &Path, flock: impl Fn(&std::fs::File) -> bool) -> Option<std::fs::File> {
     let marker = dir.join(SESSION_MARKER);
-    let locked = std::fs::File::create(&marker).ok().filter(|f| {
-        // SAFETY: `f` owns a valid descriptor; the lock lives as long as it.
-        unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_SH) == 0 }
-    });
+    let locked = std::fs::File::create(&marker).ok().filter(|f| flock(f));
     if locked.is_none() {
         let _ = std::fs::remove_file(&marker);
         ui::warn(
@@ -752,8 +756,18 @@ fn lock_session(dir: &Path) -> Option<std::fs::File> {
 /// `None`: the dir has no session marker. `Some(true)`: a running cplt holds
 /// it. `Some(false)`: marked and unlocked, so its session is gone.
 fn session_lock_held(dir: &Path) -> Option<bool> {
+    use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
-    let f = std::fs::File::open(dir.join(SESSION_MARKER)).ok()?;
+    // The agent can write the scratch dir: never follow a symlink, and never
+    // block on a FIFO it left in place of the marker.
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(dir.join(SESSION_MARKER))
+        .ok()?;
+    if !f.metadata().ok()?.is_file() {
+        return None;
+    }
     // SAFETY: `f` owns a valid descriptor; the lock is released when it drops.
     Some(unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0)
 }
@@ -1058,14 +1072,34 @@ mod tests {
     #[test]
     fn failed_session_lock_leaves_no_marker() {
         let dir = tempfile::tempdir().unwrap();
-        // Read-only dir: the marker cannot be created, so no lock is taken.
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
-        assert!(lock_session(dir.path()).is_none());
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(lock_session_with(dir.path(), |_| false).is_none());
+        assert!(!dir.path().join(SESSION_MARKER).exists());
         assert_eq!(session_lock_held(dir.path()), None);
         let ok = tempfile::tempdir().unwrap();
         let _lock = lock_session(ok.path()).unwrap();
         assert_eq!(session_lock_held(ok.path()), Some(true));
+    }
+
+    /// A FIFO or symlink planted as the marker is ignored, without blocking.
+    #[test]
+    fn planted_marker_is_ignored() {
+        let fifo = tempfile::tempdir().unwrap();
+        let path = std::ffi::CString::new(
+            fifo.path()
+                .join(SESSION_MARKER)
+                .as_os_str()
+                .as_encoded_bytes(),
+        )
+        .unwrap();
+        // SAFETY: valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        assert_eq!(session_lock_held(fifo.path()), None);
+
+        let link = tempfile::tempdir().unwrap();
+        let target = link.path().join("target");
+        std::fs::write(&target, "").unwrap();
+        std::os::unix::fs::symlink(&target, link.path().join(SESSION_MARKER)).unwrap();
+        assert_eq!(session_lock_held(link.path()), None);
     }
 
     /// The 24h sweep spares a dir whose session still holds the lock.
