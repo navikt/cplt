@@ -150,6 +150,20 @@ This is a security tool. Changes to sandbox rules, env handling, or network poli
 
 Do not modify `blocked-domains.txt` without reviewing the domain's purpose.
 
+### Files the agent can write
+
+cplt runs outside the sandbox, so treat every path the agent can write as hostile:
+the project, the scratch dir, agent config, state and data dirs, and cplt's own cache.
+
+- Read such files with `untrusted::read_untrusted` or `open_untrusted`. They don't
+  follow symlinks, don't block on a FIFO, accept plain files only and cap the size.
+  Check `is_file()` before handing such a path to a subprocess like `sqlite3`.
+- Never put their contents into the sandbox, an env var or output without that check.
+  A symlinked `auth.json` once leaked another tool's credentials this way.
+- Emit file grants before the deny rules, as `file-read*`. In Seatbelt a narrower
+  allow such as `file-read-data` beats a broader deny, whatever the order.
+- Add a test that plants a FIFO and a symlink.
+
 ### No silent grants
 
 **A grant or setting that cannot be honoured must fail loudly at the point it is
