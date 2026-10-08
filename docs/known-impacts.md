@@ -23,7 +23,7 @@ tracking was recorded. It was not.
 
 | Command | What happens |
 | --- | --- |
-| `git push -u origin <branch>` | With the git guard on: cplt runs the push without `-u` and says so in one line, so git prints no config error. The push succeeds and no upstream is recorded. With the guard off: push succeeds, git prints the error and a false tracking line, exit 0 |
+| `git push -u origin <branch>` | With the git guard on: cplt runs the push without `-u` and says so in one line, so git prints no config error. The push succeeds, and cplt records the upstream after the session if the push qualifies (see below). With the guard off: push succeeds, git prints the error and a false tracking line, exit 0 |
 | `git checkout -b <branch> origin/<base>` | Branch created, tracking **not** recorded, exit 0 |
 | `git branch --set-upstream-to=origin/<base>` | Records nothing, exit 0 |
 | `git config user.name <x>` | Fails loudly, exit 4 |
@@ -34,7 +34,25 @@ The flag does nothing except write that config, so the push itself is
 unchanged, and git has no failed write to report. The one line cplt prints
 instead:
 
-``cplt: pushing without -u, because .git/config is read-only in the sandbox. No upstream is recorded, so name the branch on later pushes: `git push origin HEAD:<branch>`, or run `git branch -u origin/<branch>` outside the sandbox.``
+``cplt: pushing without -u, because .git/config is read-only in the sandbox. cplt records the upstream when the session ends, if the push qualifies; otherwise it prints the `git branch -u` line to run. Until then, name the branch on later pushes: `git push origin HEAD:<branch>`.``
+
+When the session ends, cplt sets `branch.<branch>.remote` and
+`branch.<branch>.merge` itself, outside the sandbox, and prints one line per
+branch. It does this only when all of these hold:
+
+- the command was exactly `git push -u <remote> <branch>` or
+  `git push -u <remote> HEAD`, with no other flags and no `src:dst` refspec
+- the repository is the launch repository or one named with `--repo-dir`, not
+  a clone nested inside one
+- the branch exists locally, the remote is one `git remote` lists, and the git
+  guard would allow `git push <remote> <branch>` under the session's policy
+- the audit reports that the session settled: no process from it was still
+  running. With `--no-audit`, or `cplt exec` in its default quiet mode, there
+  is no such report and nothing is recorded
+- the session had a scratch dir (not `--no-scratch-dir`)
+
+Otherwise cplt prints the line to run yourself:
+`git branch -u <remote>/<branch> <branch>`.
 
 A bundled flag such as `-uf` is left alone and gets the note below. A `-u`
 that is the value of an option (`-o -u`) is not the flag and stays.
@@ -50,7 +68,7 @@ from a pathspec.
 **The shape that works**, and what to tell an agent to do: push with an explicit
 refspec and open the PR with an explicit head, so nothing needs local config.
 To record the upstream anyway, run `git branch -u origin/<branch>` outside the
-sandbox.
+sandbox, or rely on the session-end step above for `git push -u`.
 
 ```bash
 git push origin HEAD:my-branch

@@ -4540,6 +4540,26 @@ pub fn launch_repo_facts(real_git: &Path, dir: &Path, ask_remote: bool) -> (Repo
     })
 }
 
+/// The facts the git gate is launched with: the launch repository's, plus one
+/// member per named root. Shared by the launch and the session-end upstream
+/// apply (`crate::upstream`), so both judge a push by the same answers.
+#[must_use]
+pub fn session_repo_facts(
+    project_dir: &Path,
+    repo_dirs: &[PathBuf],
+    ask_remote: bool,
+) -> (RepoFacts, bool) {
+    let Some(git) = crate::git::trusted_git() else {
+        return Default::default();
+    };
+    let (mut facts, has_remotes) = launch_repo_facts(git, project_dir, ask_remote);
+    facts.named = repo_dirs
+        .iter()
+        .map(|dir| launch_repo_facts(git, dir, ask_remote).0)
+        .collect();
+    (facts, has_remotes)
+}
+
 /// Write `refs/remotes/<remote>/HEAD` -> `refs/remotes/<remote>/<branch>`, what
 /// `git remote set-head <remote> <branch>` records. `symbolic-ref` accepts the
 /// target before a fetch has created it, which set-head does not, and

@@ -4525,7 +4525,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         None
     };
     let mut proxy_handle = proxy_handle;
-    let (exit_code, snapshot) = audit::run(
+    let (exit_code, snapshot, settled) = audit::run(
         &project_dir,
         &resolved.allow_write,
         &repo_paths,
@@ -4559,6 +4559,18 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             })
         },
     );
+    if resolved.git_guard.enabled
+        && !resolved.quiet
+        && let Some(scratch) = scratch_guard.as_ref().map(cplt::scratch::ScratchDir::path)
+    {
+        cplt::upstream::apply(
+            scratch,
+            &project_dir,
+            &repo_paths,
+            &resolved.git_guard,
+            settled,
+        );
+    }
     warn_worktrees_not_audited(
         audit_enabled,
         worktree_root.as_deref(),
@@ -5043,9 +5055,9 @@ fn push_without_upstream(args: &[String]) -> Option<Vec<String>> {
 /// The note printed when [`push_without_upstream`] took `-u` out.
 const UPSTREAM_DROPPED_NOTICE: &str = concat!(
     "cplt: pushing without -u, because .git/config is read-only in the sandbox. ",
-    "No upstream is recorded, so name the branch on later pushes: ",
-    "`git push origin HEAD:<branch>`, or run `git branch -u origin/<branch>` ",
-    "outside the sandbox."
+    "cplt records the upstream when the session ends, if the push qualifies; ",
+    "otherwise it prints the `git branch -u` line to run. Until then, name the ",
+    "branch on later pushes: `git push origin HEAD:<branch>`."
 );
 
 /// The note printed for such a command.
@@ -5131,6 +5143,14 @@ fn run_git_gate(
         real_git,
         repo_facts,
     );
+    // Only a stripped `-u` (macOS) is recorded: the parent sets the upstream
+    // after the session if the push qualifies (see cplt::upstream).
+    if let GateEffect::ExecWithout { .. } = &effect
+        && let Some(scratch) = std::env::var_os(sandbox::SCRATCH_DIR_ENV)
+        && let Ok(cwd) = std::env::current_dir()
+    {
+        cplt::upstream::record(Path::new(&scratch), &cwd, args);
+    }
     perform_gate_effect(real_git, "git", args, effect)
 }
 
@@ -6240,7 +6260,7 @@ fn run_exec_command(
         None
     };
     let mut proxy_handle = proxy_handle;
-    let (exit_code, snapshot) = audit::run(
+    let (exit_code, snapshot, settled) = audit::run(
         &project_dir,
         &resolved.allow_write,
         &repo_paths,
@@ -6274,6 +6294,18 @@ fn run_exec_command(
             })
         },
     );
+    if resolved.git_guard.enabled
+        && !resolved.quiet
+        && let Some(scratch) = scratch_guard.as_ref().map(cplt::scratch::ScratchDir::path)
+    {
+        cplt::upstream::apply(
+            scratch,
+            &project_dir,
+            &repo_paths,
+            &resolved.git_guard,
+            settled,
+        );
+    }
     warn_worktrees_not_audited(
         audit_enabled,
         worktree_root.as_deref(),

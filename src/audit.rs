@@ -1717,6 +1717,9 @@ fn read_small(path: &Path) -> Option<Small> {
 /// `project_dir` is named after the report so the session is never presented as
 /// clean on the strength of a measurement that never looked there (#214).
 ///
+/// The returned `bool` is whether the session's process tree settled; it is
+/// `false` when no probe was armed (audit and observe both off).
+///
 /// Observe-only runs retain descendant settling without printing the audit.
 /// Disabled runs still perform ordinary proxy cleanup through the callback.
 pub fn run<F: FnOnce() -> u8, C: FnOnce() -> Option<proxy::ProxySnapshot>>(
@@ -1727,7 +1730,7 @@ pub fn run<F: FnOnce() -> u8, C: FnOnce() -> Option<proxy::ProxySnapshot>>(
     routing: &str,
     exec: F,
     finalize: C,
-) -> (u8, Option<proxy::ProxySnapshot>) {
+) -> (u8, Option<proxy::ProxySnapshot>, bool) {
     let baseline = (mode == AuditMode::Enabled).then(|| Baseline::capture(project_dir));
     let named: Vec<(PathBuf, Baseline)> = if mode == AuditMode::Enabled {
         named_roots
@@ -1784,7 +1787,7 @@ pub fn run<F: FnOnce() -> u8, C: FnOnce() -> Option<proxy::ProxySnapshot>>(
         ui::warn(line);
     }
     nested_git.report(probed && !settled);
-    (exit_code, snapshot)
+    (exit_code, snapshot, settled)
 }
 
 #[cfg(test)]
@@ -2901,7 +2904,7 @@ mod tests {
     fn disabled_audit_still_runs_finalization_after_exec() {
         let events = std::cell::RefCell::new(Vec::new());
         let dir = tempfile::tempdir().expect("tempdir");
-        let (exit_code, snapshot) = run(
+        let (exit_code, snapshot, _) = run(
             dir.path(),
             &[],
             &[],

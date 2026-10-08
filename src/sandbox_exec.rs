@@ -315,6 +315,9 @@ fn configure_command(
     // - gh proxy: intercepts gh commands and blocks destructive operations
     // - git push prevention: blocks git push while allowing all other git operations
     if let Some(scratch) = scratch_dir {
+        // Where `cplt git-gate` records a `push -u` it stripped. Not TMPDIR:
+        // `--pass-env TMPDIR` points that elsewhere.
+        cmd.env(SCRATCH_DIR_ENV, scratch);
         if gh_guard.enabled {
             // Inject GH_TOKEN into env only when explicitly requested.
             if gh_guard.inject_token {
@@ -630,6 +633,9 @@ fn should_cache_exec_token(
 /// The scratch dir holding `.gh-exec-token`, for `cplt gh-gate`.
 pub const GH_TOKEN_DIR_ENV: &str = "__CPLT_GH_TOKEN_DIR";
 
+/// The session scratch dir, for `cplt git-gate` (see `crate::upstream`).
+pub const SCRATCH_DIR_ENV: &str = "__CPLT_SCRATCH_DIR";
+
 /// The effective child env, `--pass-env` included: a token gh will use there
 /// makes the host credential in `.gh-exec-token` pointless. Blank counts as
 /// unset, as in `cplt gh-gate`.
@@ -903,15 +909,8 @@ fn install_command_wrappers(
         // A missing symref is asked of the remote only when the policy needs
         // the default branch (check.rs `for_launch` decides the same way).
         let ask_remote = git_guard.enabled && git_guard.protect_default_branch_only;
-        let (mut repo_facts, has_remotes) = crate::git::trusted_git()
-            .map(|git| crate::gh_proxy::launch_repo_facts(git, project_dir, ask_remote))
-            .unwrap_or_default();
-        if let Some(git) = crate::git::trusted_git() {
-            repo_facts.named = repo_dirs
-                .iter()
-                .map(|dir| crate::gh_proxy::launch_repo_facts(git, dir, ask_remote).0)
-                .collect();
-        }
+        let (repo_facts, has_remotes) =
+            crate::gh_proxy::session_repo_facts(project_dir, repo_dirs, ask_remote);
         // Two conditions narrow this to the case the operator can act on.
         // `!quiet`, because `cplt exec` defaults to quiet and its stderr must
         // stay clean for pipes (`e2e_exec_no_output_contamination`) — the same
