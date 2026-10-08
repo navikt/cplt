@@ -1102,13 +1102,18 @@ enum ConfigAction {
 
     /// Set a config value. Creates the config file if it doesn't exist.
     ///
+    /// Array keys take several values at once; nothing is written unless
+    /// every value is accepted.
     /// Example: cplt config set sandbox.quiet true
+    /// Example: cplt config set allow.localhost 5432 8099
     Set {
         /// Config key in section.key format (e.g., sandbox.quiet, proxy.port)
         key: String,
 
-        /// Value to set (omit when using --unset)
-        value: Option<String>,
+        /// Value(s) to set. Several only for array keys. With --unset, the
+        /// array elements to remove (omit to remove the whole key)
+        #[arg(value_name = "VALUE")]
+        values: Vec<String>,
 
         /// Append value to an array key instead of replacing.
         /// `set` already appends for array keys, so --append is optional.
@@ -1116,7 +1121,7 @@ enum ConfigAction {
         append: bool,
 
         /// Remove from config. For scalar keys: removes the key entirely.
-        /// For array keys with a value: removes that element from the array.
+        /// For array keys with values: removes those elements from the array.
         /// For array keys without a value: removes the entire key.
         #[arg(long)]
         unset: bool,
@@ -8088,14 +8093,17 @@ fn run_config_command(action: ConfigAction) -> ExitCode {
         ConfigAction::Get { key } => run_config_get(&key),
         ConfigAction::Set {
             key,
-            value,
+            values,
             append,
             unset,
             force,
             repo,
             global: _,
             local,
-        } => run_config_set(&key, value.as_deref(), append, unset, force, repo, local),
+        } => {
+            let values: Vec<&str> = values.iter().map(String::as_str).collect();
+            run_config_set(&key, &values, append, unset, force, repo, local)
+        }
         ConfigAction::Explain { key } => run_config_explain(key.as_deref()),
         ConfigAction::Hosts { agent, json } => run_config_hosts(&agent, json),
         ConfigAction::Local(LocalAction::List) => run_config_local_list(),
@@ -8212,6 +8220,26 @@ fn run_config_show() -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+/// Whether an `--unset` left the repo config's content as it was. Compares
+/// parsed values with empty tables pruned, since the setter may create an
+/// empty `[propose]` or `[deny]` on its way to a value that is not there.
+fn repo_doc_unchanged(before: &str, after: &toml_edit::DocumentMut) -> bool {
+    fn prune(t: &mut toml::Table) {
+        for (_, v) in t.iter_mut() {
+            if let toml::Value::Table(sub) = v {
+                prune(sub);
+            }
+        }
+        t.retain(|_, v| !matches!(v, toml::Value::Table(sub) if sub.is_empty()));
+    }
+    let parse = |s: &str| {
+        let mut t: toml::Table = s.parse().unwrap_or_default();
+        prune(&mut t);
+        t
+    };
+    parse(before) == parse(&after.to_string())
 }
 
 fn display_repo_config(
@@ -8484,7 +8512,7 @@ fn run_config_get(key: &str) -> ExitCode {
 
 fn run_config_set(
     key: &str,
-    value: Option<&str>,
+    values: &[&str],
     append: bool,
     unset: bool,
     force: bool,
@@ -8500,7 +8528,14 @@ fn run_config_set(
     };
 
     // Validate flag combinations
-    if unset && value.is_some() && !key_info.value_type.is_array() {
+    if values.len() > 1 && !key_info.value_type.is_array() {
+        ui::error(&format!(
+            "{key} takes a single value, got {}. Only array keys take several.",
+            values.len()
+        ));
+        return ExitCode::FAILURE;
+    }
+    if unset && !values.is_empty() && !key_info.value_type.is_array() {
         ui::error("--unset does not take a value (except for array keys)");
         return ExitCode::FAILURE;
     }
@@ -8508,7 +8543,7 @@ fn run_config_set(
         ui::error("--unset and --append are mutually exclusive");
         return ExitCode::FAILURE;
     }
-    if !unset && value.is_none() {
+    if !unset && values.is_empty() {
         ui::error(&format!(
             "missing value for {key}\n  Usage: cplt config set {key} <VALUE>"
         ));
@@ -8517,7 +8552,7 @@ fn run_config_set(
 
     // ── Repo mode ───────────────────────────────────────────────────
     if repo {
-        return run_config_set_repo(key, key_info, value, unset, force);
+        return run_config_set_repo(key, key_info, values, unset, force);
     }
 
     // `sandbox.repo_dirs` is local-layer only. Writing it globally would produce
@@ -8529,7 +8564,11 @@ fn run_config_set(
              your global config would attach to every session.\n  \
              Use --local, from inside the launch repository:\n  \
              cplt config set --local {key} {}",
-            value.unwrap_or("<DIR>")
+            if values.is_empty() {
+                "<DIR>".to_string()
+            } else {
+                values.join(" ")
+            }
         ));
         return ExitCode::FAILURE;
     }
@@ -8564,40 +8603,45 @@ fn run_config_set(
     if matches!(
         key,
         "allow.read" | "allow.write" | "allow.exec" | "allow.socket"
-    ) && let Some(val) = value
-        && !unset
+    ) && !unset
     {
         let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
-        let path = config::expand_tilde(val);
-        if let Err(e) = sandbox::validate_grant_path(key, &path, &home) {
-            ui::error(&e);
-            return ExitCode::FAILURE;
-        }
-        // The exec-overlap refusal needs the resolved config the launch builds,
-        // so this is the part of it that a single grant can be judged against:
-        // the trees that are writable whatever else is configured. An overlap
-        // with an `allow.write` the user adds LATER still surfaces at launch.
-        if key == "allow.exec" {
-            let writable =
-                sandbox::session_writable_roots(Path::new("/nonexistent-project"), &[], &[], None);
-            let tool_dirs: Vec<PathBuf> = sandbox::HOME_TOOL_DIRS
-                .iter()
-                .filter(|d| d.write)
-                .map(|d| home.join(d.path))
-                .collect();
-            if let Some(tree) = writable
-                .iter()
-                .chain(tool_dirs.iter())
-                .find(|t| path.starts_with(t) || t.starts_with(&path))
-            {
-                ui::error(&format!(
-                    "allow.exec {val} overlaps {}, which is writable in every session.\n  \
+        for val in values {
+            let path = config::expand_tilde(val);
+            if let Err(e) = sandbox::validate_grant_path(key, &path, &home) {
+                ui::error(&e);
+                return ExitCode::FAILURE;
+            }
+            // The exec-overlap refusal needs the resolved config the launch builds,
+            // so this is the part of it that a single grant can be judged against:
+            // the trees that are writable whatever else is configured. An overlap
+            // with an `allow.write` the user adds LATER still surfaces at launch.
+            if key == "allow.exec" {
+                let writable = sandbox::session_writable_roots(
+                    Path::new("/nonexistent-project"),
+                    &[],
+                    &[],
+                    None,
+                );
+                let tool_dirs: Vec<PathBuf> = sandbox::HOME_TOOL_DIRS
+                    .iter()
+                    .filter(|d| d.write)
+                    .map(|d| home.join(d.path))
+                    .collect();
+                if let Some(tree) = writable
+                    .iter()
+                    .chain(tool_dirs.iter())
+                    .find(|t| path.starts_with(t) || t.starts_with(&path))
+                {
+                    ui::error(&format!(
+                        "allow.exec {val} overlaps {}, which is writable in every session.\n  \
                      A tree that is both writable and executable lets the agent drop a binary \
                      and run it, and neither backend can subtract the write from the exec — so \
                      the launch refuses the pair. Exec grants belong on read-only tool prefixes.",
-                    tree.display()
-                ));
-                return ExitCode::FAILURE;
+                        tree.display()
+                    ));
+                    return ExitCode::FAILURE;
+                }
             }
         }
     }
@@ -8606,10 +8650,7 @@ fn run_config_set(
     // it is refused here too. `config set` accepting a value every launch then
     // rejects is the shape #306 is about, and the golden suite enforces the
     // invariant: what `set` accepts must be launchable.
-    if matches!(key, "proxy.allowed_domains" | "proxy.blocked_domains")
-        && let Some(val) = value
-        && !unset
-    {
+    if matches!(key, "proxy.allowed_domains" | "proxy.blocked_domains") && !unset {
         let project = detect_project_root().unwrap_or_else(|| PathBuf::from("."));
         let grants: Vec<PathBuf> = config::Config::load_file()
             .ok()
@@ -8630,46 +8671,47 @@ fn run_config_set(
             sandbox::session_writable_roots(&project, &[], &grants, scratch_base.as_deref());
         // Judge the path the launch will open: the loader expands a leading
         // `~/`, so a quoted `"~/.config/cplt/…"` must not read as `./~/…`.
-        if let Some(root) = agent_writable_root(&config::expand_tilde(val), &writable) {
-            ui::error(&format!(
-                "{key} = {val} is inside {} — a tree a session can write.\n  \
+        for val in values {
+            if let Some(root) = agent_writable_root(&config::expand_tilde(val), &writable) {
+                ui::error(&format!(
+                    "{key} = {val} is inside {} — a tree a session can write.\n  \
                  The proxy re-reads that file every few seconds, so the agent could edit its \
                  own egress rules mid-session, and the launch refuses it. Put the list \
                  somewhere the session cannot write, such as ~/.config/cplt/.",
-                root.display()
-            ));
-            return ExitCode::FAILURE;
+                    root.display()
+                ));
+                return ExitCode::FAILURE;
+            }
         }
     }
 
     // `../sibling` is how a person names the repository next door. The local
     // layer stores absolute paths only — a relative entry there has no stable
     // anchor — so resolve it here rather than making the user do it (#490).
-    let resolved_value;
-    let value = match (local_project.as_ref(), value) {
-        (Some(_), Some(v)) if config::is_local_path_key(key) => {
+    let mut resolved: Vec<String> = Vec::with_capacity(values.len());
+    for v in values {
+        if local_project.is_some() && config::is_local_path_key(key) {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             // A removal deliberately does not require the directory to still
             // exist: the entry naming a checkout you already deleted is the one
             // most worth removing, and refusing to resolve it left it stuck.
-            let resolved = if unset {
+            let r = if unset {
                 config::resolve_path_entry_for_removal(v, &cwd)
             } else {
                 config::resolve_path_entry(v, &cwd)
             };
-            match resolved {
-                Ok(abs) => {
-                    resolved_value = abs;
-                    Some(resolved_value.as_str())
-                }
+            match r {
+                Ok(abs) => resolved.push(abs),
                 Err(e) => {
                     ui::error(&e.to_string());
                     return ExitCode::FAILURE;
                 }
             }
+        } else {
+            resolved.push((*v).to_string());
         }
-        _ => value,
-    };
+    }
+    let values: Vec<&str> = resolved.iter().map(String::as_str).collect();
 
     let op = match &local_project {
         Some(project_dir) => config::ConfigSetOp::new_local(key, project_dir),
@@ -8683,17 +8725,18 @@ fn run_config_set(
         }
     };
 
-    if !unset
-        && !force
-        && let Some(val) = value
-        && let Some(reason) = config::security_confirmation(op.key_info, val, false)
-    {
-        let scope = if local { "--local " } else { "" };
-        ui::error(&format!(
-            "{key} = {val} {reason}.\n  \
-             Add --force to confirm: cplt config set {scope}{key} {val} --force"
-        ));
-        return ExitCode::FAILURE;
+    if !unset && !force {
+        for val in &values {
+            if let Some(reason) = config::security_confirmation(op.key_info, val, false) {
+                let scope = if local { "--local " } else { "" };
+                ui::error(&format!(
+                    "{key} = {val} {reason}.\n  \
+                     Add --force to confirm: cplt config set {scope}{key} {} --force",
+                    values.join(" ")
+                ));
+                return ExitCode::FAILURE;
+            }
+        }
     }
 
     // Load or create document
@@ -8707,22 +8750,34 @@ fn run_config_set(
     // Refresh the `[local]` header (path, remote, written_at). No-op globally.
     op.stamp_header(&mut doc);
 
-    // Apply modification
-    let mut element_removed = false;
-    let result = if unset {
-        if let Some(val) = value
-            && op.key_info.value_type.is_array()
-        {
-            config::remove_array_element_in_doc(&mut doc, op.key_info, val)
-                .map(|removed| element_removed = removed)
-        } else {
-            config::unset_value_in_doc(&mut doc, op.key_info);
-            Ok(())
-        }
+    // Apply modification: every value into the one document, written once.
+    let mut removed: Vec<&str> = Vec::new();
+    let mut missing: Vec<&str> = Vec::new();
+    let result = if unset && !values.is_empty() && op.key_info.value_type.is_array() {
+        // Duplicates are a no-op: the first removes the entry, and the rest
+        // must not then warn that it is not set.
+        let mut seen = std::collections::HashSet::new();
+        values
+            .iter()
+            .filter(|v| seen.insert(**v))
+            .try_for_each(|val| {
+                config::remove_array_element_in_doc(&mut doc, op.key_info, val).map(|hit| {
+                    if hit {
+                        removed.push(val);
+                    } else {
+                        missing.push(val);
+                    }
+                })
+            })
+    } else if unset {
+        config::unset_value_in_doc(&mut doc, op.key_info);
+        Ok(())
     } else if append || op.key_info.value_type.is_array() {
-        config::append_value_in_doc(&mut doc, op.key_info, value.unwrap())
+        values
+            .iter()
+            .try_for_each(|val| config::append_value_in_doc(&mut doc, op.key_info, val))
     } else {
-        config::set_value_in_doc(&mut doc, op.key_info, value.unwrap())
+        config::set_value_in_doc(&mut doc, op.key_info, values[0])
     };
 
     if let Err(e) = result {
@@ -8766,13 +8821,9 @@ fn run_config_set(
     // so name the stored string, which is what `--unset` actually takes. Same
     // shape as `cplt link --unlink`: one candidate is named, several are all
     // named, and neither removes anything.
-    if let Some(val) = value
-        && !element_removed
-        && unset
-        && op.key_info.value_type.is_array()
-    {
-        let scope = if local { "--local " } else { "" };
-        let stored = config::array_entries_in_doc(&doc, op.key_info);
+    let scope = if local { "--local " } else { "" };
+    let stored = config::array_entries_in_doc(&doc, op.key_info);
+    for val in &missing {
         // No origin reader: these are config entries, not linked repositories,
         // so the final component is the only evidence there is.
         let hint = match cplt::link::choose_unlink(&stored, val, |_: &Path| None) {
@@ -8789,6 +8840,8 @@ fn run_config_set(
             ),
         };
         ui::warn(&format!("{key}: {val} is not set, nothing removed{hint}"));
+    }
+    if !missing.is_empty() && removed.is_empty() {
         return ExitCode::SUCCESS;
     }
 
@@ -8799,23 +8852,22 @@ fn run_config_set(
     }
 
     if unset {
-        if let Some(val) = value
-            && op.key_info.value_type.is_array()
-        {
+        if removed.is_empty() {
+            ui::ok(&format!("{key} removed (will use default)"));
+        } else {
+            let val = removed.join(", ");
             if let Some(remaining) = config::get_value_from_doc(&doc, op.key_info) {
                 ui::ok(&format!("{key}: removed {val} → {remaining}"));
             } else {
                 ui::ok(&format!("{key}: removed {val} (now empty)"));
             }
-        } else {
-            ui::ok(&format!("{key} removed (will use default)"));
         }
     } else if append || op.key_info.value_type.is_array() {
-        let current = config::get_value_from_doc(&doc, op.key_info)
-            .unwrap_or_else(|| value.unwrap().to_string());
+        let current =
+            config::get_value_from_doc(&doc, op.key_info).unwrap_or_else(|| values.join(", "));
         ui::ok(&format!("{key} = {current}"));
     } else {
-        ui::ok(&format!("{key} = {}", value.unwrap()));
+        ui::ok(&format!("{key} = {}", values[0]));
     }
 
     // Config is read once, at launch. A session already running keeps the
@@ -8861,7 +8913,7 @@ fn run_config_set(
 fn run_config_set_repo(
     key: &str,
     key_info: &'static config::ConfigKeyInfo,
-    value: Option<&str>,
+    values: &[&str],
     unset: bool,
     force: bool,
 ) -> ExitCode {
@@ -8885,18 +8937,17 @@ fn run_config_set_repo(
             "{key} is not valid in repo config.\n  \
              Reason: {reason}.\n  \
              Use: cplt config set {scope}{key} {}",
-            value.unwrap_or("<VALUE>")
+            if values.is_empty() {
+                "<VALUE>".to_string()
+            } else {
+                values.join(" ")
+            }
         ));
         return ExitCode::FAILURE;
     };
 
     // Dangerous key safeguard (still applies for repo permissions)
-    if key_info.dangerous
-        && !unset
-        && let Some(val) = value
-        && val == "true"
-        && !force
-    {
+    if key_info.dangerous && !unset && values.contains(&"true") && !force {
         ui::error(&format!(
             "{key} is dangerous. It requests weakened security for anyone approving this repo config.\n  \
              Add --force to confirm: cplt config set --repo {key} true --force"
@@ -8927,16 +8978,31 @@ fn run_config_set_repo(
         toml_edit::DocumentMut::new()
     };
 
-    // Apply modification
-    let val = if unset {
-        value.unwrap_or("")
-    } else {
-        value.unwrap()
-    };
-    if let Err(e) = config::set_repo_value_in_doc(&mut doc, key_info, target, val, unset) {
-        ui::error(&e.to_string());
-        return ExitCode::FAILURE;
+    // Apply every value to the one document; nothing is written unless all
+    // of them, and the result, are valid. A bare --unset removes the key.
+    // An --unset of named values reports each one that was not there, like
+    // the global path, and writes nothing when none of them was.
+    let applied: &[&str] = if values.is_empty() { &[""] } else { values };
+    let mut seen = std::collections::HashSet::new();
+    let mut removed = 0;
+    for val in applied.iter().filter(|v| seen.insert(**v)) {
+        let before = doc.to_string();
+        if let Err(e) = config::set_repo_value_in_doc(&mut doc, key_info, target, val, unset) {
+            ui::error(&format!("{e}\n  No changes were saved."));
+            return ExitCode::FAILURE;
+        }
+        if unset && !val.is_empty() {
+            if repo_doc_unchanged(&before, &doc) {
+                ui::warn(&format!("{key}: {val} is not set, nothing removed"));
+            } else {
+                removed += 1;
+            }
+        }
     }
+    if unset && !values.is_empty() && removed == 0 {
+        return ExitCode::SUCCESS;
+    }
+    let val = values.join(", ");
 
     let output = doc.to_string();
     let written = match repo_config::parse_and_validate(&output) {
@@ -8977,10 +9043,10 @@ fn run_config_set_repo(
     // Only the entry just written: the others were warned about when they
     // were set, and are again at every launch.
     if !unset && target == config::RepoKeyTarget::Deny("paths") {
-        let stored = config::collapse_tilde(val);
+        let stored: Vec<String> = values.iter().map(|v| config::collapse_tilde(v)).collect();
         let globs: Vec<&str> = repo_config::glob_like_deny_paths(&written, &project_dir)
             .into_iter()
-            .filter(|p| *p == val || *p == stored)
+            .filter(|p| values.contains(p) || stored.iter().any(|s| s == p))
             .collect();
         warn_glob_like_deny_paths(&globs, ".cplt.toml");
     }
@@ -9377,7 +9443,7 @@ fn run_link_command(repo: &str, dir: Option<&Path>, unlink: bool) -> ExitCode {
     }
     run_config_set(
         "sandbox.repo_dirs",
-        Some(&found.dir.to_string_lossy()),
+        &[&found.dir.to_string_lossy()],
         false,
         false,
         false,
@@ -9424,7 +9490,7 @@ fn unlink_by_identity(project_dir: &Path, identity: &str) -> ExitCode {
     match cplt::link::choose_unlink(&linked, identity, read_identity) {
         cplt::link::Unlink::Remove(entry) => run_config_set(
             "sandbox.repo_dirs",
-            Some(&entry),
+            &[entry.as_str()],
             false,
             true,
             false,
@@ -9893,7 +9959,7 @@ fn link_proposed_repos(project_dir: &Path, repos: &[String]) -> Vec<trust::Linke
                     continue;
                 } else if run_config_set(
                     "sandbox.repo_dirs",
-                    Some(&path),
+                    &[path.as_str()],
                     false,
                     false,
                     false,
@@ -9979,7 +10045,7 @@ fn unlink_approved_repos(project_dir: &Path, linked: &[trust::LinkedRepo]) {
         println!("  • unlinking {} ({})", repo.identity, repo.path);
         run_config_set(
             "sandbox.repo_dirs",
-            Some(&repo.path),
+            &[repo.path.as_str()],
             false,
             true,
             false,

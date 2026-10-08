@@ -3577,6 +3577,120 @@ mod e2e_tests {
         let _ = std::fs::remove_dir_all(&fake_home);
     }
 
+    // ── config set with several values ───────────────────────────
+
+    fn config_set_global(home: &Path, args: &[&str]) -> std::process::Output {
+        cplt_cmd()
+            .args(["config", "set"])
+            .args(args)
+            .env("HOME", home.to_str().unwrap())
+            .env_remove("CPLT_CONFIG")
+            .output()
+            .expect("should run")
+    }
+
+    #[test]
+    fn e2e_config_set_multi_value_global_and_unset() {
+        let fake_home = make_config_home("set-multi");
+        let out = config_set_global(&fake_home, &["allow.localhost", "5432", "55432", "8099"]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let content = std::fs::read_to_string(fake_home.join(".config/cplt/config.toml")).unwrap();
+        for port in ["5432", "55432", "8099"] {
+            assert!(content.contains(port), "{port} missing: {content}");
+        }
+
+        let out = config_set_global(&fake_home, &["allow.localhost", "5432", "8099", "--unset"]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let content = std::fs::read_to_string(fake_home.join(".config/cplt/config.toml")).unwrap();
+        assert!(content.contains("55432"), "kept entry gone: {content}");
+        assert!(
+            !content.contains("8099") && !content.contains("[5432") && !content.contains(" 5432"),
+            "removed entries remain: {content}"
+        );
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
+    fn e2e_config_set_unset_duplicate_values_is_silent() {
+        let fake_home = make_config_home("set-unset-dup");
+        let out = config_set_global(&fake_home, &["allow.localhost", "5", "8099"]);
+        assert!(out.status.success());
+        let out = config_set_global(&fake_home, &["allow.localhost", "--unset", "5", "5"]);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{err}");
+        assert!(!err.contains("not set"), "duplicate must not warn: {err}");
+        let content = std::fs::read_to_string(fake_home.join(".config/cplt/config.toml")).unwrap();
+        assert!(content.contains("8099"), "kept entry gone: {content}");
+        assert!(
+            !content.contains("[5") && !content.contains(" 5,") && !content.contains(" 5]"),
+            "5 remains: {content}"
+        );
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
+    fn e2e_config_set_multi_value_rejects_scalar_key() {
+        let fake_home = make_config_home("set-multi-scalar");
+        let out = config_set_global(&fake_home, &["sandbox.quiet", "true", "false"]);
+        assert!(!out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("single value"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!fake_home.join(".config/cplt/config.toml").exists());
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    /// One bad value refuses the whole command: the good ones are not written.
+    #[test]
+    fn e2e_config_set_multi_value_one_bad_writes_nothing() {
+        let fake_home = make_config_home("set-multi-bad");
+        let out = config_set_global(&fake_home, &["allow.localhost", "5432", "notaport"]);
+        assert!(!out.status.success(), "a bad port must fail");
+        let content =
+            std::fs::read_to_string(fake_home.join(".config/cplt/config.toml")).unwrap_or_default();
+        assert!(!content.contains("5432"), "partial write: {content}");
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
+    fn e2e_config_set_multi_value_repo() {
+        let repo = make_repo_dir("set-multi-repo");
+        let out = cplt_cmd()
+            .args([
+                "config",
+                "set",
+                "--repo",
+                "allow.localhost",
+                "5432",
+                "55432",
+                "8099",
+                "8100",
+            ])
+            .current_dir(&repo)
+            .output()
+            .expect("should run");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let content = std::fs::read_to_string(repo.join(".cplt.toml")).unwrap();
+        for port in ["5432", "55432", "8099", "8100"] {
+            assert!(content.contains(port), "{port} missing: {content}");
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
     // ── config set --local e2e tests (#340) ──────────────────────
 
     /// The single local file under a fake HOME, or `None` if none was written.
@@ -3590,6 +3704,34 @@ mod e2e_tests {
 
     /// The round trip: write a local value, read it back labelled `(local)`,
     /// and see it in the effective config.
+    #[test]
+    fn e2e_config_set_multi_value_local() {
+        let fake_home = make_config_home("set-multi-local");
+        let repo = temp_repo("navikt/spleis");
+        let out = cplt_local(&fake_home, repo.path())
+            .args([
+                "config",
+                "set",
+                "--local",
+                "allow.localhost",
+                "5432",
+                "8099",
+            ])
+            .output()
+            .expect("should run");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let content = std::fs::read_to_string(local_file(&fake_home).unwrap()).unwrap();
+        assert!(
+            content.contains("5432") && content.contains("8099"),
+            "{content}"
+        );
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
     #[test]
     fn e2e_config_set_local_round_trip() {
         let fake_home = make_config_home("set-local");
@@ -5185,6 +5327,82 @@ paths = [
         assert!(
             !content.contains("allow_jvm_attach"),
             "key should be removed: {content}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn e2e_config_set_repo_unset_warns_for_absent_value() {
+        let repo = make_repo_dir("set-repo-unset-partial");
+        std::fs::write(
+            repo.join(".cplt.toml"),
+            "[propose.allow]\nports = [8080, 9090]\n",
+        )
+        .unwrap();
+
+        let output = cplt_cmd()
+            .args([
+                "config",
+                "set",
+                "--repo",
+                "allow.ports",
+                "8080",
+                "7070",
+                "--unset",
+            ])
+            .current_dir(&repo)
+            .output()
+            .expect("should run");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "unset: {stderr}");
+        assert!(stderr.contains("7070 is not set"), "should warn: {stderr}");
+        assert!(
+            !stderr.contains("8080 is not set"),
+            "8080 was set: {stderr}"
+        );
+
+        let content = std::fs::read_to_string(repo.join(".cplt.toml")).unwrap();
+        assert!(
+            !content.contains("8080"),
+            "8080 should be removed: {content}"
+        );
+        assert!(content.contains("9090"), "9090 should stay: {content}");
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn e2e_config_set_repo_unset_all_absent_writes_nothing() {
+        let repo = make_repo_dir("set-repo-unset-absent");
+        let original = "# keep me\n[propose.allow]\nports = [ 8080 ]\n";
+        std::fs::write(repo.join(".cplt.toml"), original).unwrap();
+
+        let output = cplt_cmd()
+            .args([
+                "config",
+                "set",
+                "--repo",
+                "allow.ports",
+                "7070",
+                "6060",
+                "--unset",
+            ])
+            .current_dir(&repo)
+            .output()
+            .expect("should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "unset: {stderr}");
+        assert!(stderr.contains("7070 is not set"), "should warn: {stderr}");
+        assert!(stderr.contains("6060 is not set"), "should warn: {stderr}");
+        assert!(
+            !format!("{stdout}{stderr}").contains("removed from"),
+            "no removal: {stdout}{stderr}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join(".cplt.toml")).unwrap(),
+            original
         );
 
         let _ = std::fs::remove_dir_all(&repo);

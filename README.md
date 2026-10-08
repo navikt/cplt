@@ -849,6 +849,7 @@ cplt config set gh_guard.enabled false   # opt out of the gh guard entirely
 # Set per-repo policy (committed to .cplt.toml)
 cplt config set --repo sandbox.allow_jvm_attach true
 cplt config set --repo deny.paths "~/secrets"
+cplt config set --repo allow.localhost 5432 8099   # array keys take several values
 
 # Inspect
 cplt config show      # effective config (file + defaults)
