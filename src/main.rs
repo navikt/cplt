@@ -3445,7 +3445,7 @@ fn agent_allowlist(
         && home.is_absolute()
         && agent
             .resolve_binary()
-            .is_ok_and(|bin| agent::is_opencode_v2(&bin, &home));
+            .is_ok_and(|bin| agent::is_opencode_v2(&bin, &home) == Some(true));
     if v2 {
         domains.extend(agent::opencode_v2_provider_domains(&home));
     } else {
@@ -4268,10 +4268,22 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // session gets its own service inside the sandbox (see `opencode_v2`); the
     // Linux backend cannot deny the host service's files inside granted dirs,
     // so it still refuses. --print-profile never runs the agent.
-    let opencode_v2 = matches!(
-        (active_agent, &agent_bin_result),
-        (agent::Agent::OpenCode, Ok(bin)) if !cli.print_profile && agent::is_opencode_v2(bin, &home_dir)
-    );
+    let opencode_v2 = match (active_agent, &agent_bin_result) {
+        (agent::Agent::OpenCode, Ok(bin)) if !cli.print_profile => {
+            // #725: a version cplt cannot read could be v2, and running v2 on
+            // the 1.x path lets it attach to the host's service. Fail closed.
+            agent::is_opencode_v2(bin, &home_dir).with_context(|| {
+                format!(
+                    "cannot tell which OpenCode major version {} is: `opencode --version` \
+                     gave no usable answer.\nRun `{} --version` to check it, then retry; \
+                     reinstall OpenCode if the command hangs or fails.",
+                    bin.display(),
+                    bin.display()
+                )
+            })?
+        }
+        _ => false,
+    };
     if opencode_v2
         && cfg!(not(target_os = "macos"))
         && let Ok(bin) = &agent_bin_result
