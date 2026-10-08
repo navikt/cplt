@@ -382,8 +382,11 @@ impl PreparedSandbox {
             let port = landlock_mod::NetRule { port: session.port };
             // v2's service is a child of the client, so the `/proc/self`
             // grant (the agent's pid) does not reach it, and Bun aborts at
-            // startup without `/proc`. Under bubblewrap that is the session's
-            // own pid namespace.
+            // startup without `/proc`. Only bubblewrap's pid namespace keeps
+            // that read to the session's own processes, so v2 needs it.
+            let Some(w) = &mut self.bwrap_wrapper else {
+                return Err(opencode_v2_needs_bwrap());
+            };
             let read = landlock_mod::FsAccess {
                 read: true,
                 ..landlock_mod::FsAccess::default()
@@ -394,29 +397,24 @@ impl PreparedSandbox {
                 .map(PathBuf::as_path)
                 // The project is readable already, and the agent can plant there.
                 .filter(|p| !p.starts_with(&self.project_dir))
-                .chain([Path::new("/proc")])
                 .map(|path| landlock_mod::FsRule {
                     path: path.to_path_buf(),
                     access: read,
                     nofollow: false,
                 })
                 .collect();
-            if self.bwrap_wrapper.is_none() {
-                ui::warn(
-                    "OpenCode v2 without Bubblewrap: /proc is readable, so the agent can \
-                     see the command lines of your other processes. Install bubblewrap \
-                     to limit it to the session's own processes.",
-                );
-            }
+            w.fs_rules.extend(extra.iter().cloned());
+            w.fs_rules.push(landlock_mod::FsRule {
+                path: PathBuf::from("/proc"),
+                access: read,
+                nofollow: false,
+            });
+            landlock_mod::hide_files(&mut w.fs_rules, &mut w.plain_file, &session.hidden)?;
+            w.net_rules.push(port);
             let p = &mut self.policy;
             p.fs_rules.extend(extra.iter().cloned());
             landlock_mod::hide_files(&mut p.fs_rules, &mut p.plain_file, &session.hidden)?;
             p.net_rules.push(port);
-            if let Some(w) = &mut self.bwrap_wrapper {
-                w.fs_rules.extend(extra);
-                landlock_mod::hide_files(&mut w.fs_rules, &mut w.plain_file, &session.hidden)?;
-                w.net_rules.push(port);
-            }
             self.precomputed.reload(&self.policy)?;
             if self.policy.restrict_net_connect
                 && landlock_mod::available_abi_version().is_some_and(|abi| abi < 4)
@@ -471,6 +469,18 @@ impl PreparedSandbox {
             }
         }
     }
+}
+
+/// Why OpenCode v2 does not run on Linux without bubblewrap, and how to fix it.
+#[cfg(target_os = "linux")]
+pub(crate) fn opencode_v2_needs_bwrap() -> String {
+    format!(
+        "OpenCode v2 on Linux needs Bubblewrap: its service needs /proc, and without \
+         a pid namespace /proc shows the command lines of all your processes. Install \
+         bubblewrap (e.g. apt install bubblewrap) and do not pass --no-bubblewrap; \
+         if it is installed but fails, {}.",
+        crate::doctor::USERNS_HINT
+    )
 }
 
 /// Validate configuration and compile it into a platform-specific sandbox.
@@ -3191,7 +3201,8 @@ mod tests {
     }
 
     /// #719 unit 4: an OpenCode v2 session's port joins the connect allowlist
-    /// of the rules the child gets; the host default port does not.
+    /// of the rules the child gets; the host default port does not. `/proc`
+    /// is read only under bubblewrap, and without it v2 is refused.
     #[cfg(target_os = "linux")]
     #[test]
     fn opencode_v2_session_port_is_allowed_and_the_host_port_is_not() {
@@ -3200,22 +3211,44 @@ mod tests {
         let mut config = test_config(&home, &[]);
         config.use_bubblewrap = Some(false);
         let mut sandbox = prepare(&config).unwrap();
-        sandbox
-            .add_opencode_v2(crate::opencode_v2::Session {
-                env: Vec::new(),
-                port: 50123,
-                hidden: Vec::new(),
-                reads: Vec::new(),
-            })
-            .unwrap();
-        let ports: Vec<u16> = sandbox
-            .precomputed
-            .net_rules
-            .iter()
-            .map(|r| r.port)
-            .collect();
-        assert!(ports.contains(&50123), "{ports:?}");
-        assert!(!ports.contains(&49374), "{ports:?}");
+        let session = || crate::opencode_v2::Session {
+            env: Vec::new(),
+            port: 50123,
+            hidden: Vec::new(),
+            reads: Vec::new(),
+        };
+        let err = sandbox.add_opencode_v2(session()).unwrap_err();
+        assert!(err.contains("needs Bubblewrap"), "{err}");
+        sandbox.bwrap_wrapper = Some(bubblewrap::BubblewrapWrapper {
+            bwrap_path: PathBuf::from("/usr/bin/bwrap"),
+            bwrap_args: vec![],
+            fs_rules: vec![],
+            net_rules: vec![],
+            restrict_net_connect: true,
+            strict: false,
+            deny_mask_count: 0,
+            socket_mask_count: 0,
+            proxy_forced: false,
+            plain_file: None,
+        });
+        sandbox.add_opencode_v2(session()).unwrap();
+        let w = sandbox.bwrap_wrapper.as_ref().unwrap();
+        for ports in [
+            w.net_rules.iter().map(|r| r.port).collect::<Vec<u16>>(),
+            sandbox
+                .precomputed
+                .net_rules
+                .iter()
+                .map(|r| r.port)
+                .collect(),
+        ] {
+            assert!(ports.contains(&50123), "{ports:?}");
+            assert!(!ports.contains(&49374), "{ports:?}");
+        }
+        let proc =
+            |rules: &[landlock_mod::FsRule]| rules.iter().any(|r| r.path == Path::new("/proc"));
+        assert!(proc(&w.fs_rules));
+        assert!(!proc(&sandbox.policy.fs_rules));
     }
 
     /// #252: revoking the root AGENTS.md grant removes exactly that rule, on

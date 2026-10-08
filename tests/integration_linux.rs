@@ -4119,10 +4119,21 @@ print('CONNECTED')
             session_is_private("--use-bubblewrap");
         }
 
+        /// Without bubblewrap /proc would show every host command line, so
+        /// v2 is refused before the agent runs.
         #[test]
-        fn opencode_v2_session_is_private_with_landlock_only() {
+        fn opencode_v2_without_bubblewrap_is_refused() {
             require_landlock!();
-            session_is_private("--no-bubblewrap");
+            let home = home();
+            let o = home
+                .cmd(&home.proj)
+                .args(["--no-bubblewrap", "--", "touch ran"])
+                .output()
+                .unwrap();
+            let err = String::from_utf8_lossy(&o.stderr);
+            assert!(!o.status.success(), "{err}");
+            assert!(err.contains("needs Bubblewrap"), "{err}");
+            assert!(!home.proj.join("ran").exists());
         }
 
         /// 3: a grant above the host files (`allow.read ~/.config`; a launch
@@ -4130,14 +4141,14 @@ print('CONNECTED')
         /// agent runs.
         #[test]
         fn opencode_v2_grant_over_the_service_file_is_refused() {
-            require_landlock!();
+            require_bwrap!();
             let home = home();
             fs::write(home.h.join(".config/opencode/service.json"), "{}").unwrap();
             let o = home
                 .cmd(&home.proj)
                 .arg("--allow-read")
                 .arg(home.h.join(".config"))
-                .args(["--no-bubblewrap", "--", "touch ran"])
+                .args(["--use-bubblewrap", "--", "touch ran"])
                 .output()
                 .unwrap();
             let err = String::from_utf8_lossy(&o.stderr);

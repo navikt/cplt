@@ -481,16 +481,16 @@ pub fn bubblewrap_finding(state: &Bubblewrap, use_bubblewrap: Option<bool>) -> O
                     "bubblewrap is installed but its probe fails ({reason}): the launch falls \
                      back to Landlock + seccomp only."
                 ),
-                userns.then(|| {
-                    "enable user namespaces (sysctl kernel.unprivileged_userns_clone=1; on \
-                     Ubuntu 23.10+ kernel.apparmor_restrict_unprivileged_userns blocks them)"
-                        .to_string()
-                }),
+                userns.then(|| USERNS_HINT.to_string()),
             ))
         }
         _ => None,
     }
 }
+
+/// How to enable the user namespaces bubblewrap needs; also in the OpenCode v2 refusal.
+pub const USERNS_HINT: &str = "enable user namespaces (sysctl kernel.unprivileged_userns_clone=1; on \
+     Ubuntu 23.10+ kernel.apparmor_restrict_unprivileged_userns blocks them)";
 
 // ── Rule: a project on a Windows drive under WSL ───────────────
 

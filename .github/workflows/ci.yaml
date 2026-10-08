@@ -305,7 +305,7 @@ jobs:
             exit 1
           fi
 
-  # The same on Linux (#719), under bubblewrap and plain Landlock.
+  # The same on Linux (#719): v2 needs bubblewrap, and is refused without it.
   opencode-v2-e2e-linux:
     runs-on: ubuntu-latest
     timeout-minutes: 15

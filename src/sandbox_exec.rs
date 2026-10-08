@@ -1579,6 +1579,10 @@ pub fn exec(
             on_launch,
         ) {
             BwrapOutcome::Ran(code) => return code,
+            BwrapOutcome::Fallback if sandbox.opencode_v2 => {
+                ui::error(&super::opencode_v2_needs_bwrap());
+                return 1;
+            }
             BwrapOutcome::Fallback => {
                 ui::warn(if sandbox.agent == crate::agent::Agent::Claude {
                     "Bubblewrap could not start; using Landlock + seccomp only \
