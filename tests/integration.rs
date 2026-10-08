@@ -2468,6 +2468,40 @@ mod macos_tests {
         );
     }
 
+    /// #743: git resolves remote names through the legacy `.git/remotes/<name>`
+    /// and `.git/branches/<name>` files, so planting one defines a remote with
+    /// an agent-chosen URL without writing the denied `.git/config`.
+    #[test]
+    fn real_profile_blocks_git_legacy_remote_writes() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let tmp = project.join(format!(".legacy-remotes-{}", std::process::id()));
+        fs::create_dir_all(tmp.join(".git/remotes")).unwrap();
+        let tmp = fs::canonicalize(&tmp).unwrap();
+        let home = home_dir();
+
+        let opts = default_opts(&tmp, &home);
+        let profile = write_real_profile(&opts);
+
+        let remote = tmp.join(".git/remotes/evil");
+        let branches = tmp.join(".git/branches");
+        let cmd = format!(
+            "echo 'URL: https://example.invalid/x' > '{}' 2>&1; echo EXIT:$?; \
+             mkdir '{}' 2>&1; echo EXIT:$?",
+            remote.display(),
+            branches.display()
+        );
+        let (output, _) = run_sandboxed(&profile, &cmd);
+
+        let planted = remote.exists() || branches.exists();
+        fs::remove_dir_all(&tmp).ok();
+        fs::remove_file(&profile).ok();
+        assert!(
+            !planted && !output.contains("EXIT:0"),
+            "writing .git/remotes or .git/branches should be blocked, got: {output}"
+        );
+    }
+
     /// #313: the nested variant is a regex rather than a path rule, so it needs
     /// its own kernel check — `<root>/<repo>/.cplt.toml` steers a later run
     /// pointed at that repo, which this run was never pointed at.

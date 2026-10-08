@@ -3781,6 +3781,27 @@ pub const PROTECTED_IN_GITDIR: &[Protected] = &[
         why: "local gitignore — hides whatever the agent plants from `git status`",
         linux: LinuxCoverage::Bwrap,
     },
+    // #743: the legacy remote formats. git still resolves a remote name through
+    // `remotes/<name>` and `branches/<name>` when `.git/config` does not define
+    // it, so a file planted here defines a remote with an agent-chosen URL
+    // without touching the denied `config`, and host-side git picks it up after
+    // the session. Nothing current writes either directory; recent `git init`
+    // templates do not create them. On Linux the bubblewrap bind needs the
+    // directory to exist, the same caveat as `info/exclude`.
+    Protected {
+        rel: "remotes",
+        tree: true,
+        nested: true,
+        why: "legacy remote definitions — git resolves remote names through them",
+        linux: LinuxCoverage::Bwrap,
+    },
+    Protected {
+        rel: "branches",
+        tree: true,
+        nested: true,
+        why: "legacy remote definitions — git resolves remote names through them",
+        linux: LinuxCoverage::Bwrap,
+    },
 ];
 
 /// Escape the regex metacharacters that can still appear in a path.
@@ -4845,7 +4866,13 @@ mod tests {
         );
         assert_eq!(
             bwrap(PROTECTED_IN_GITDIR),
-            ["hooks", "refs/remotes/*/HEAD", "info/exclude"],
+            [
+                "hooks",
+                "refs/remotes/*/HEAD",
+                "info/exclude",
+                "remotes",
+                "branches"
+            ],
             "`config`, `commondir` and `modules` are macOS-only; each entry \
              carries the reason in its LinuxCoverage::Gap"
         );
@@ -4867,7 +4894,7 @@ mod tests {
     fn nested_alternation_covers_the_nested_entries() {
         assert_eq!(
             nested_alternation(PROTECTED_IN_GITDIR),
-            "hooks|config|commondir|modules|refs/remotes/[^/]+/HEAD|info/exclude"
+            "hooks|config|commondir|modules|refs/remotes/[^/]+/HEAD|info/exclude|remotes|branches"
         );
         assert_eq!(
             nested_alternation(PROTECTED_IN_ROOT),
