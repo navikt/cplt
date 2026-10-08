@@ -244,7 +244,7 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// so a crate-private item here is unreachable from `main.rs`, which uses this
 /// to print agent versions.
 pub fn probe_version(path: &Path, args: &[&str]) -> VersionProbe {
-    probe_version_within(path, args, PROBE_TIMEOUT, READ_GRACE)
+    probe_version_bounded(path, args, PROBE_TIMEOUT, READ_GRACE)
 }
 
 /// How long the reader may take to hand over stdout once the probe has exited.
@@ -279,9 +279,14 @@ fn probe_command(path: &Path, args: &[&str]) -> std::process::Command {
     cmd
 }
 
-/// [`probe_version`] with its two wall-clock budgets passed in, so a test that
+/// [`probe_version`] with its timeout passed in (#725 retries with a longer one).
+pub(crate) fn probe_version_within(path: &Path, args: &[&str], timeout: Duration) -> VersionProbe {
+    probe_version_bounded(path, args, timeout, READ_GRACE)
+}
+
+/// [`probe_version`] with both wall-clock budgets passed in, so a test that
 /// is not about the bounds can give a loaded machine room (#528).
-fn probe_version_within(
+fn probe_version_bounded(
     path: &Path,
     args: &[&str],
     timeout: Duration,
@@ -2513,14 +2518,14 @@ ELECTRON_RUN_AS_NODE=1 "/Applications/Visual Studio Code.app/Contents/Frameworks
         let dir = tempfile::tempdir().unwrap();
         let ok = fake_binary(dir.path(), "quick", "exec echo GitHub Copilot CLI 1.0.21.");
         assert_eq!(
-            probe_version_within(&ok, &["--version"], ROOM, ROOM),
+            probe_version_bounded(&ok, &["--version"], ROOM, ROOM),
             VersionProbe::Version("1.0.21".to_string())
         );
 
         // Non-zero exit is "ran, said nothing useful" — not a timeout.
         let bad = fake_binary(dir.path(), "broken", "exec false");
         assert_eq!(
-            probe_version_within(&bad, &["--version"], ROOM, ROOM),
+            probe_version_bounded(&bad, &["--version"], ROOM, ROOM),
             VersionProbe::Unknown
         );
     }

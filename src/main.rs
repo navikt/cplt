@@ -3445,7 +3445,7 @@ fn agent_allowlist(
         && home.is_absolute()
         && agent
             .resolve_binary()
-            .is_ok_and(|bin| agent::is_opencode_v2(&bin, &home));
+            .is_ok_and(|bin| agent::is_opencode_v2(&bin, &home) == Some(true));
     if v2 {
         domains.extend(agent::opencode_v2_provider_domains(&home));
     } else {
@@ -4267,10 +4267,21 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // #710: v2 runs tool calls through a background service. Each session
     // gets its own service inside the sandbox (see `opencode_v2`).
     // --print-profile never runs the agent.
-    let opencode_v2 = matches!(
-        (active_agent, &agent_bin_result),
-        (agent::Agent::OpenCode, Ok(bin)) if !cli.print_profile && agent::is_opencode_v2(bin, &home_dir)
-    );
+    let opencode_v2 = match (active_agent, &agent_bin_result) {
+        (agent::Agent::OpenCode, Ok(bin)) if !cli.print_profile => {
+            // #725: a version cplt cannot read could be v2, and running v2 on
+            // the 1.x path lets it attach to the host's service. Fail closed.
+            agent::is_opencode_v2(bin, &home_dir).with_context(|| {
+                format!(
+                    "cannot tell which OpenCode major version {bin} is: `{bin} --version` \
+                     gave no usable answer.\nRun it to check, then retry; \
+                     reinstall OpenCode if the command hangs or fails.",
+                    bin = bin.display()
+                )
+            })?
+        }
+        _ => false,
+    };
     let copilot_install_dir = agent_install_dir(active_agent, &agent_bin_result, &home_dir);
 
     // Discover Electron app bundle when Copilot CLI is installed via VS Code.
