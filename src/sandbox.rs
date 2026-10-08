@@ -74,7 +74,7 @@ pub(crate) mod bubblewrap_probe {
 }
 #[path = "sandbox_exec.rs"]
 mod exec;
-pub use exec::GH_TOKEN_DIR_ENV;
+pub use exec::{GH_TOKEN_DIR_ENV, SCRATCH_DIR_ENV};
 #[path = "sandbox_landlock.rs"]
 pub(crate) mod landlock_mod;
 #[path = "sandbox_policy.rs"]

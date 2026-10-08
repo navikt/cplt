@@ -1480,6 +1480,36 @@ cplt refuses to sandbox overly broad directories that would hand the agent acces
 - **Allow paths** (`--allow-read`, `--allow-write`) are canonicalized, and unresolvable paths are warned about and skipped
 - **Deny paths** (`--deny-path`) are canonicalized, and unresolvable paths cause a **hard error**, because silently dropping a deny rule is a security risk
 
+#### Session-end upstream apply (macOS)
+
+The git gate strips `-u` from `git push -u` and appends `{cwd, argv}` to a file
+in the scratch dir (#402). After the session, the unsandboxed parent reads it
+and may write `.git/config`. That makes the parent the first unsandboxed
+consumer of output the gate wrote, and the gate runs inside the sandbox, so the
+file is agent-controlled. The parent treats every line as hostile:
+
+- It reads the file from its own scratch path, never from `$TMPDIR` or from the
+  `__CPLT_SCRATCH_DIR` variable the gate is given (the agent controls the
+  gate's environment), through `untrusted::read_untrusted` (no symlink,
+  regular file, 64 KiB cap). Nothing happens with `--no-scratch-dir`,
+  `--quiet`, or when the session did not settle.
+- It accepts only `push -u <remote> <branch|HEAD>`. The gate swaps `HEAD` for
+  the branch checked out at push time, so a `git switch` after the push cannot
+  move the tracking onto a branch that was never pushed; the parent checks the
+  result like any other name. Branch and remote names are limited to a narrow
+  character set (no `"`, `[`, `]`, `:`, whitespace, control characters or
+  `@{`).
+- The cwd must be inside a root before any git runs there, and its repository
+  toplevel must equal the project dir or a named root.
+- The branch must exist (`rev-parse --verify --end-of-options refs/heads/<b>`),
+  the remote must be listed by `git remote`, and `gate_git` must allow
+  `push <remote> <b>` with the launch facts.
+
+It then writes exactly two keys, `branch.<b>.remote` and `branch.<b>.merge`
+(always `refs/heads/<b>`), with `git config --local` through `git::command`.
+The worst a forged line can do is set tracking for an existing local branch to
+a remote that already exists in a repository the session was given.
+
 ### Layer 4: Per-repo config trust model (`.cplt.toml`)
 
 Repository maintainers can commit a `.cplt.toml` to configure sandbox settings for all contributors. That creates an attack surface, since a compromised or malicious maintainer could weaken the sandbox for everyone who clones the repo. The trust model addresses this with defense-in-depth.

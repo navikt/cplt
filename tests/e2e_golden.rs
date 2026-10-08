@@ -475,7 +475,8 @@ fn golden_default_policy_pushes_a_feature_branch_and_refuses_the_default_one() {
 /// `git push -u` printed `error: could not write config file .git/config:
 /// Operation not permitted` after a push that worked, because the upstream
 /// write is denied on macOS (navikt/copilot#1348). The guard now runs the push
-/// without `-u` and says so in one line.
+/// without `-u`, says so in one line, and the parent records the upstream
+/// after the session.
 #[test]
 fn golden_push_with_upstream_flag_succeeds_quietly() {
     require_launch!();
@@ -501,6 +502,7 @@ fn golden_push_with_upstream_flag_succeeds_quietly() {
         &[
             "--yes",
             "--no-validate",
+            "--no-quiet",
             "--allow-write",
             &allow,
             "exec",
@@ -524,6 +526,16 @@ fn golden_push_with_upstream_flag_succeeds_quietly() {
     assert!(
         stderr.contains("pushing without -u"),
         "the dropped flag must be named:\n{stderr}"
+    );
+    // The parent records the upstream once the session has settled (#402).
+    let merge = common::git_cmd(&work)
+        .args(["config", "--local", "branch.feature/push-u.merge"])
+        .output()
+        .expect("git should run");
+    assert_eq!(
+        String::from_utf8_lossy(&merge.stdout).trim(),
+        "refs/heads/feature/push-u",
+        "the upstream must be recorded after the session:\n{stderr}"
     );
 
     let _ = std::fs::remove_dir_all(&home);
