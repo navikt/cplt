@@ -554,12 +554,25 @@ fn opencode_custom_config_dir() -> Option<PathBuf> {
         .filter(|p| p.is_absolute())
 }
 
-/// `OPENCODE_CONFIG_DIR` when it is, contains or lies in a credential dir
-/// (`~/.ssh`, `~/.aws`, ...). Its read grant would become a Landlock rule on
-/// Linux, which no deny can narrow, so the launch must refuse it (#720).
+/// The env-relocated config root of `agent` (`CLAUDE_CONFIG_DIR`, `DSH_HOME`,
+/// `OPENCODE_CONFIG_DIR`) when it is, contains or lies in a credential dir
+/// (`~/.ssh`, `~/.aws`, ...). Its grant would become a Landlock rule on Linux,
+/// which no deny can narrow, so the launch must refuse it (#720, #723).
 #[must_use]
-pub fn opencode_config_dir_on_credentials(home: &Path) -> Option<PathBuf> {
-    opencode_custom_config_dir().filter(|d| crate::sandbox::dir_overlaps_credentials(home, d))
+pub fn env_config_dir_on_credentials(agent: Agent, home: &Path) -> Option<(&'static str, PathBuf)> {
+    let var = |v: &str| std::env::var_os(v).filter(|s| !s.is_empty());
+    let found = match agent {
+        Agent::Claude => ("CLAUDE_CONFIG_DIR", var("CLAUDE_CONFIG_DIR")?.into()),
+        Agent::Dsh => {
+            var("DSH_HOME")?;
+            ("DSH_HOME", dsh_home(home))
+        }
+        Agent::OpenCode => ("OPENCODE_CONFIG_DIR", opencode_custom_config_dir()?),
+        _ => return None,
+    };
+    // `$HOME` and its ancestors are left to `first_unsafe_agent_dir`'s broader refusal.
+    (!home.starts_with(&found.1) && crate::sandbox::dir_overlaps_credentials(home, &found.1))
+        .then_some(found)
 }
 
 /// Candidate paths in an OpenCode config: each `plugin[]` entry (string or
@@ -4100,7 +4113,7 @@ mod tests {
     /// #720: on Linux the custom dir's read grant is a Landlock rule no deny
     /// can narrow, so one on or around a credential dir must be refused.
     #[test]
-    fn opencode_config_dir_on_credentials_is_refused() {
+    fn env_config_dir_on_credentials_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
         let home = std::fs::canonicalize(tmp.path()).unwrap();
         std::fs::create_dir_all(home.join(".ssh/sub")).unwrap();
@@ -4113,10 +4126,16 @@ mod tests {
             (".aws", true),
             (".config/oc", false),
         ] {
-            let got = temp_env::with_var("OPENCODE_CONFIG_DIR", Some(home.join(dir)), || {
-                opencode_config_dir_on_credentials(&home)
-            });
-            assert_eq!(got.is_some(), bad, "{dir}");
+            for (agent, var) in [
+                (Agent::OpenCode, "OPENCODE_CONFIG_DIR"),
+                (Agent::Claude, "CLAUDE_CONFIG_DIR"),
+                (Agent::Dsh, "DSH_HOME"),
+            ] {
+                let got = temp_env::with_var(var, Some(home.join(dir)), || {
+                    env_config_dir_on_credentials(agent, &home)
+                });
+                assert_eq!(got.is_some(), bad, "{var}={dir}");
+            }
         }
     }
 

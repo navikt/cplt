@@ -375,6 +375,29 @@ mod e2e_tests {
         );
     }
 
+    /// #723: the launch wiring refuses a `CLAUDE_CONFIG_DIR` or `DSH_HOME` on a
+    /// credential dir, not just the helper.
+    #[test]
+    fn e2e_config_dir_on_credentials_is_refused() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let home = std::fs::canonicalize(home.path()).unwrap();
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        for (agent, var) in [("claude", "CLAUDE_CONFIG_DIR"), ("dsh", "DSH_HOME")] {
+            let output = cplt_cmd()
+                .args(["--print-profile", "--agent", agent])
+                .env("HOME", &home)
+                .env(var, home.join(".ssh"))
+                .current_dir(project_dir())
+                .output()
+                .expect("binary should run");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !output.status.success() && stderr.contains("credential directory"),
+                "{var} on ~/.ssh must abort the launch.\nstderr: {stderr}"
+            );
+        }
+    }
+
     /// The other half of C-02: a dedicated subdirectory is legitimate and must
     /// still produce a writable grant, so the veto does not strand a user who
     /// deliberately relocated their config dir.

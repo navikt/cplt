@@ -5670,14 +5670,11 @@ fn assemble_sandbox(
         );
     }
 
-    if active_agent == agent::Agent::OpenCode
-        && let Some(bad) = agent::opencode_config_dir_on_credentials(home_dir)
-    {
+    if let Some((var, bad)) = agent::env_config_dir_on_credentials(active_agent, home_dir) {
         bail!(
-            "cplt refuses OPENCODE_CONFIG_DIR='{}': it is, or overlaps, a credential \
-             directory the sandbox denies. Point it at a dedicated directory such as '{}'.",
+            "cplt refuses {var}='{}': it is, or overlaps, a credential directory the \
+             sandbox denies. Point it at a dedicated directory instead.",
             bad.display(),
-            home_dir.join(".config/opencode").display(),
         );
     }
     // Pre-create agent directories before entering sandbox.
