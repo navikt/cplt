@@ -1135,11 +1135,14 @@ fn forward_and_wait(mut child: std::process::Child) -> u8 {
                 libc::WEXITED | libc::WNOWAIT,
             )
         };
-        if r == 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+        if r == 0 {
+            CHILD_PID.store(0, std::sync::atomic::Ordering::SeqCst);
+            break;
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
             break;
         }
     }
-    CHILD_PID.store(0, std::sync::atomic::Ordering::SeqCst);
 
     match child.wait() {
         Ok(status) => status
