@@ -316,8 +316,12 @@ fn configure_command(
     // - git push prevention: blocks git push while allowing all other git operations
     if let Some(scratch) = scratch_dir {
         // Where `cplt git-gate` records a `push -u` it stripped. Not TMPDIR:
-        // `--pass-env TMPDIR` points that elsewhere.
-        cmd.env(SCRATCH_DIR_ENV, scratch);
+        // `--pass-env TMPDIR` points that elsewhere. Only when the parent will
+        // read it back (`upstream::apply` runs under the same two conditions),
+        // so the gate's notice never promises a step that will not happen.
+        if git_guard.enabled && !quiet {
+            cmd.env(SCRATCH_DIR_ENV, scratch);
+        }
         if gh_guard.enabled {
             // Inject GH_TOKEN into env only when explicitly requested.
             if gh_guard.inject_token {
@@ -633,7 +637,10 @@ fn should_cache_exec_token(
 /// The scratch dir holding `.gh-exec-token`, for `cplt gh-gate`.
 pub const GH_TOKEN_DIR_ENV: &str = "__CPLT_GH_TOKEN_DIR";
 
-/// The session scratch dir, for `cplt git-gate` (see `crate::upstream`).
+/// The session scratch dir, for `cplt git-gate` (see `crate::upstream`). Set
+/// only when the parent will apply what the gate records there: git guard on
+/// and not `--quiet`. The parent never reads this variable; it uses its own
+/// scratch path.
 pub const SCRATCH_DIR_ENV: &str = "__CPLT_SCRATCH_DIR";
 
 /// The effective child env, `--pass-env` included: a token gh will use there

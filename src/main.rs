@@ -5052,12 +5052,22 @@ fn push_without_upstream(args: &[String]) -> Option<Vec<String>> {
     (kept.len() < args.len()).then_some(kept)
 }
 
-/// The note printed when [`push_without_upstream`] took `-u` out.
+/// The note printed when [`push_without_upstream`] took `-u` out and the
+/// parent will record the upstream at session end (`cplt::upstream`).
 const UPSTREAM_DROPPED_NOTICE: &str = concat!(
     "cplt: pushing without -u, because .git/config is read-only in the sandbox. ",
     "cplt records the upstream when the session ends, if the push qualifies; ",
     "otherwise it prints the `git branch -u` line to run. Until then, name the ",
     "branch on later pushes: `git push origin HEAD:<branch>`."
+);
+
+/// The same note for a run where nothing is recorded (`--quiet`, which
+/// `cplt exec` defaults to): the parent did not hand the gate a scratch dir.
+const UPSTREAM_DROPPED_QUIET_NOTICE: &str = concat!(
+    "cplt: pushing without -u, because .git/config is read-only in the sandbox. ",
+    "No upstream is recorded, so name the branch on later pushes: ",
+    "`git push origin HEAD:<branch>`, or run `git branch -u origin/<branch>` ",
+    "outside the sandbox."
 );
 
 /// The note printed for such a command.
@@ -5099,7 +5109,12 @@ fn decide_git_gate(
     ) {
         Ok(()) => match push_without_upstream(args) {
             Some(args) => GateEffect::ExecWithout {
-                notice: UPSTREAM_DROPPED_NOTICE.to_string(),
+                notice: if std::env::var_os(sandbox::SCRATCH_DIR_ENV).is_some() {
+                    UPSTREAM_DROPPED_NOTICE
+                } else {
+                    UPSTREAM_DROPPED_QUIET_NOTICE
+                }
+                .to_string(),
                 args,
             },
             None => GateEffect::ExecPlain {
@@ -5144,12 +5159,14 @@ fn run_git_gate(
         repo_facts,
     );
     // Only a stripped `-u` (macOS) is recorded: the parent sets the upstream
-    // after the session if the push qualifies (see cplt::upstream).
+    // after the session if the push qualifies (see cplt::upstream). The
+    // variable is set only when the parent will do that.
     if let GateEffect::ExecWithout { .. } = &effect
         && let Some(scratch) = std::env::var_os(sandbox::SCRATCH_DIR_ENV)
         && let Ok(cwd) = std::env::current_dir()
     {
-        cplt::upstream::record(Path::new(&scratch), &cwd, args);
+        let argv = cplt::upstream::resolve_head(real_git, &cwd, args);
+        cplt::upstream::record(Path::new(&scratch), &cwd, &argv);
     }
     perform_gate_effect(real_git, "git", args, effect)
 }

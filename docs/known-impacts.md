@@ -41,18 +41,25 @@ When the session ends, cplt sets `branch.<branch>.remote` and
 branch. It does this only when all of these hold:
 
 - the command was exactly `git push -u <remote> <branch>` or
-  `git push -u <remote> HEAD`, with no other flags and no `src:dst` refspec
+  `git push -u <remote> HEAD`, with no other flags and no `src:dst` refspec.
+  `HEAD` is the branch checked out when the push ran, not at session end
 - the repository is the launch repository or one named with `--repo-dir`, not
   a clone nested inside one
 - the branch exists locally, the remote is one `git remote` lists, and the git
   guard would allow `git push <remote> <branch>` under the session's policy
 - the audit reports that the session settled: no process from it was still
-  running. With `--no-audit`, or `cplt exec` in its default quiet mode, there
-  is no such report and nothing is recorded
+  running. With `--no-audit` there is no such report and nothing is recorded
 - the session had a scratch dir (not `--no-scratch-dir`)
 
 Otherwise cplt prints the line to run yourself:
 `git branch -u <remote>/<branch> <branch>`.
+
+A branch pushed with `-u` more than once gets the remote of the last push.
+
+Under `--quiet`, which `cplt exec` defaults to, nothing is recorded and no
+line is printed at session end. The in-session note says so instead:
+
+``cplt: pushing without -u, because .git/config is read-only in the sandbox. No upstream is recorded, so name the branch on later pushes: `git push origin HEAD:<branch>`, or run `git branch -u origin/<branch>` outside the sandbox.``
 
 A bundled flag such as `-uf` is left alone and gets the note below. A `-u`
 that is the value of an option (`-o -u`) is not the flag and stays.

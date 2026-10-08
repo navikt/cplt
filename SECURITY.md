@@ -1485,12 +1485,17 @@ and may write `.git/config`. That makes the parent the first unsandboxed
 consumer of output the gate wrote, and the gate runs inside the sandbox, so the
 file is agent-controlled. The parent treats every line as hostile:
 
-- It reads the file from its own scratch path, never from `$TMPDIR`, through
-  `untrusted::read_untrusted` (no symlink, regular file, 64 KiB cap). Nothing
-  happens with `--no-scratch-dir` or when the session did not settle.
-- It accepts only `push -u <remote> <branch|HEAD>`. Branch and remote names are
-  limited to a narrow character set (no `"`, `[`, `]`, `:`, whitespace, control
-  characters or `@{`).
+- It reads the file from its own scratch path, never from `$TMPDIR` or from the
+  `__CPLT_SCRATCH_DIR` variable the gate is given (the agent controls the
+  gate's environment), through `untrusted::read_untrusted` (no symlink,
+  regular file, 64 KiB cap). Nothing happens with `--no-scratch-dir`,
+  `--quiet`, or when the session did not settle.
+- It accepts only `push -u <remote> <branch|HEAD>`. The gate swaps `HEAD` for
+  the branch checked out at push time, so a `git switch` after the push cannot
+  move the tracking onto a branch that was never pushed; the parent checks the
+  result like any other name. Branch and remote names are limited to a narrow
+  character set (no `"`, `[`, `]`, `:`, whitespace, control characters or
+  `@{`).
 - The cwd must be inside a root before any git runs there, and its repository
   toplevel must equal the project dir or a named root.
 - The branch must exist (`rev-parse --verify --end-of-options refs/heads/<b>`),

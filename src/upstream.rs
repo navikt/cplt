@@ -51,6 +51,36 @@ pub fn record(scratch: &Path, cwd: &Path, argv: &[String]) {
         .and_then(|mut f| f.write_all(line.as_bytes()));
 }
 
+/// Gate side: the branch `HEAD` names *now*, while the push is being run,
+/// swapped into `argv`. Resolved here rather than at session end, so a later
+/// `git switch` cannot move the tracking onto a branch that was never pushed.
+/// The parent still re-checks the name like any other; this only fixes which
+/// branch is asked about. Unchanged when `HEAD` is detached or git fails.
+#[must_use]
+pub fn resolve_head(real_git: &Path, cwd: &Path, argv: &[String]) -> Vec<String> {
+    let mut argv = argv.to_vec();
+    let Some((_, "HEAD")) = parse(&argv) else {
+        return argv;
+    };
+    // Runs inside the sandbox on the gate's already-resolved git binary, the
+    // same way the gate's own probes do.
+    #[allow(clippy::disallowed_methods)]
+    let head = std::process::Command::new(real_git)
+        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .current_dir(cwd)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|b| safe_name(b));
+    if let Some(b) = head
+        && let Some(slot) = argv.iter().rposition(|a| a == "HEAD")
+    {
+        argv[slot] = b;
+    }
+    argv
+}
+
 /// An upstream that passed every check.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Upstream {
@@ -214,10 +244,13 @@ fn check(
     let cwd = std::fs::canonicalize(&e.cwd)
         .ok()
         .filter(|c| roots.iter().any(|r| c.starts_with(r)));
+    // Equal, not under: a nested clone inside a root is a different repository
+    // that nobody named, and nothing further runs in it.
     let toplevel = cwd
         .as_deref()
         .and_then(|c| git_out(c, &["rev-parse", "--show-toplevel"]))
-        .and_then(|t| std::fs::canonicalize(t).ok());
+        .and_then(|t| std::fs::canonicalize(t).ok())
+        .filter(|t| roots.contains(t));
     let dir = toplevel.clone().unwrap_or_default();
     let head = toplevel
         .as_ref()
@@ -294,7 +327,9 @@ pub fn apply(
     let ask_remote = policy.enabled && policy.protect_default_branch_only;
     let (facts, _) = gh_proxy::session_repo_facts(project_dir, repo_paths, ask_remote);
     let mut seen = HashSet::new();
-    for e in &entries {
+    // Newest first: a branch pushed twice gets the remote of the last push,
+    // which is what the second `-u` would have written.
+    for e in entries.iter().rev() {
         let result = if settled {
             check(e, &roots, policy, &facts)
         } else {
@@ -540,6 +575,52 @@ mod tests {
             protect_default_branch_only: true,
             ..GitGuardPolicy::default()
         }
+    }
+
+    #[test]
+    fn resolve_head_names_the_branch_at_push_time() {
+        let (_d, repo) = fixture();
+        let git_bin = crate::git::trusted_git().unwrap();
+        assert_eq!(
+            resolve_head(git_bin, &repo, &argv("push -u origin HEAD")),
+            argv("push -u origin feat")
+        );
+        // Only the exact shape, and only a branch: detached stays `HEAD`.
+        assert_eq!(
+            resolve_head(git_bin, &repo, &argv("push -u origin HEAD:x")),
+            argv("push -u origin HEAD:x")
+        );
+        git(&repo, &["checkout", "-q", "--detach"]);
+        assert_eq!(
+            resolve_head(git_bin, &repo, &argv("push -u origin HEAD")),
+            argv("push -u origin HEAD")
+        );
+    }
+
+    #[test]
+    fn apply_uses_the_last_push_for_a_branch() {
+        let (_d, repo) = fixture();
+        git(
+            &repo,
+            &["remote", "add", "fork", "https://example.invalid/f/r.git"],
+        );
+        git(&repo, &["update-ref", "refs/remotes/fork/main", "HEAD"]);
+        git(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/fork/HEAD",
+                "refs/remotes/fork/main",
+            ],
+        );
+        let scratch = tempfile::tempdir().unwrap();
+        record(scratch.path(), &repo, &argv("push -u origin feat"));
+        record(scratch.path(), &repo, &argv("push -u fork feat"));
+        apply(scratch.path(), &repo, &[], &policy(), true);
+        assert_eq!(
+            git(&repo, &["config", "--local", "branch.feat.remote"]).trim(),
+            "fork"
+        );
     }
 
     #[test]
