@@ -351,7 +351,7 @@ jobs:
           CPLT_TEST_REQUIRE_SANDBOX: "1"
         shell: bash
         run: |
-          set -o pipefail
+          set -eo pipefail
           cargo test --test integration_linux opencode_v2 -- --nocapture 2>&1 | tee "$RUNNER_TEMP/test-output.log"
           if grep -q "SKIPPED (opencode v2)" "$RUNNER_TEMP/test-output.log"; then
             echo "::error::OpenCode v2 tests skipped although the binary is installed"

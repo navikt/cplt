@@ -1495,6 +1495,19 @@ pub fn hide_files(
 ) -> Result<(), String> {
     let canon = crate::config::canonicalize_deepest;
     let files: Vec<PathBuf> = hidden.iter().map(|f| canon(f)).collect();
+    // A hard link is the same file under another name, which no name-based
+    // rule can keep out.
+    for f in &files {
+        use std::os::unix::fs::MetadataExt as _;
+        if std::fs::symlink_metadata(f).is_ok_and(|m| m.nlink() > 1) {
+            return Err(format!(
+                "OpenCode v2 keeps the host service file {} away from the agent, but it \
+                 has more than one hard link, so another name could expose it. Remove the \
+                 extra link. See https://github.com/navikt/cplt/issues/719",
+                f.display()
+            ));
+        }
+    }
     let mut i = 0;
     while i < rules.len() {
         let dir = canon(&rules[i].path);
@@ -1526,11 +1539,17 @@ pub fn hide_files(
         // A link out of the dir is skipped: the dir rule never reached its
         // target, and Landlock would grant whatever it names (an agent with
         // write access here could have planted `x -> ~/.ssh/id_ed25519`).
+        // The rule names the checked target and is opened without following
+        // links, so an entry swapped for a link after this check fails the
+        // launch instead of moving the grant.
         for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-            let inside = std::fs::canonicalize(e.path()).is_ok_and(|r| r.starts_with(&dir));
-            if inside && !skip.contains(&e.file_name().as_os_str()) {
+            let Ok(real) = std::fs::canonicalize(e.path()) else {
+                continue;
+            };
+            if real.starts_with(&dir) && !skip.contains(&e.file_name().as_os_str()) {
                 rules.push(FsRule {
-                    path: e.path(),
+                    path: real,
+                    nofollow: true,
                     ..rule.clone()
                 });
             }
@@ -6119,6 +6138,7 @@ mod tests {
         for (i, e) in [(0, "agent"), (0, "opencode.json"), (1, "kv.json")] {
             let r = rule_on(&policy, &dirs[i].join(e)).unwrap_or_else(|| panic!("{e}"));
             assert_eq!(r.access, access[i], "{e}");
+            assert!(r.nofollow, "{e}: a swapped-in link must not move the grant");
         }
     }
 
@@ -6184,6 +6204,10 @@ mod tests {
             hide_files(&mut rules, &mut None, &hidden).is_err(),
             "a rule on a link to it"
         );
+        std::fs::hard_link(&hidden[0], home.join(".config/opencode/alias")).unwrap();
+        let mut rules = vec![read(home.join("proj"))];
+        let err = hide_files(&mut rules, &mut None, &hidden).unwrap_err();
+        assert!(err.contains("hard link"), "{err}");
     }
 
     /// The root `AGENTS.md` index still names its rule after an expansion

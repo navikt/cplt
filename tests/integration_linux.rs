@@ -4028,7 +4028,13 @@ print('CONNECTED')
                 .env("OPENCODE_DISABLE_MODELS_FETCH", "1")
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null());
-            for v in ["XDG_CONFIG_HOME", "XDG_STATE_HOME", "OPENCODE_CONFIG_DIR"] {
+            for v in [
+                "XDG_CONFIG_HOME",
+                "XDG_DATA_HOME",
+                "XDG_STATE_HOME",
+                "XDG_CACHE_HOME",
+                "OPENCODE_CONFIG_DIR",
+            ] {
                 host.env_remove(v);
             }
             let host = HostService(host.spawn().unwrap());
