@@ -3234,11 +3234,14 @@ mod tests {
     #[test]
     fn opencode_v2_unknown_probe_is_retried_and_not_cached() {
         use std::os::unix::fs::PermissionsExt;
-        let short = std::time::Duration::from_millis(300);
-        for (name, body) in [
-            ("hang", "sleep 5"),
-            ("garbage", "echo opencode"),
-            ("fail", "echo opencode v2.0.0; exit 1"),
+        // The garbage and fail scripts exit at once, so their budget is only a
+        // ceiling. The hang script must time out; 2 s leaves room for the shell
+        // to start and log the attempt under parallel test load (#735).
+        let secs = std::time::Duration::from_secs;
+        for (name, body, budget) in [
+            ("hang", "sleep 30", secs(2)),
+            ("garbage", "echo opencode", secs(60)),
+            ("fail", "echo opencode v2.0.0; exit 1", secs(60)),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let bin = dir.path().join("opencode");
@@ -3247,7 +3250,7 @@ mod tests {
             std::fs::write(&bin, script).unwrap();
             std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
             let home = dir.path().join("home");
-            assert_eq!(opencode_v2_within(&bin, &home, [short; 2]), None, "{name}");
+            assert_eq!(opencode_v2_within(&bin, &home, [budget; 2]), None, "{name}");
             assert_eq!(
                 std::fs::read_to_string(&count).unwrap().lines().count(),
                 2,
