@@ -9901,7 +9901,7 @@ paths = [
 
         fn run(home: &Home, args: &[&str]) -> String {
             let o = home
-                .cmd(&[&["--quiet", "--"], args].concat())
+                .cmd(&[&["--quiet", "--proxy-forced", "--"], args].concat())
                 .stdin(std::process::Stdio::null())
                 .output()
                 .unwrap();
@@ -10015,9 +10015,15 @@ paths = [
                 assert!(Instant::now() < deadline, "no session dir appeared");
                 std::thread::sleep(Duration::from_millis(100));
             }
-            std::thread::sleep(Duration::from_secs(3));
-            let running = processes(&home);
-            assert!(running.len() >= 2, "agent and service: {running:#?}");
+            // Wait for the agent and the service it spawns.
+            loop {
+                let running = processes(&home);
+                if running.len() >= 2 && running.iter().any(|p| p.contains("serve")) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "agent and service: {running:#?}");
+                std::thread::sleep(Duration::from_millis(100));
+            }
             let pg = format!("-{}", c.id());
             let kill = Command::new("/bin/kill")
                 .args(["-INT", "--", &pg])
