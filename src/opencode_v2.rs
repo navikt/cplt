@@ -387,18 +387,27 @@ fn grant_file(home: &Path, file: &Path, reads: &mut Vec<PathBuf>) -> Result<(), 
     if std::fs::symlink_metadata(file).is_err() {
         return Ok(());
     }
-    let real = std::fs::canonicalize(file).ok().filter(|r| {
-        std::fs::symlink_metadata(r).is_ok_and(|m| m.is_file() && m.nlink() == 1)
-            && crate::sandbox::first_party_read_target(home, file).as_ref() == Some(r)
-    });
-    let Some(real) = real else {
-        return Err(format!(
-            "{} is not a regular file or a symlink to one, or it resolves to a \
-             file the sandbox denies. OpenCode v2 reads it at startup and stops \
-             when it cannot. Replace it with a regular file or move it.",
+    let fail = |why: String| {
+        Err(format!(
+            "{why}. OpenCode v2 reads {} at startup and stops when it cannot. \
+             Replace it with a regular file or move it.",
             file.display()
-        ));
+        ))
     };
+    let Ok(real) = std::fs::canonicalize(file) else {
+        return fail(format!("{} is a dangling symlink", file.display()));
+    };
+    let shown = if real == file {
+        file.display().to_string()
+    } else {
+        format!("{} points to {}, which", file.display(), real.display())
+    };
+    if !std::fs::symlink_metadata(&real).is_ok_and(|m| m.is_file() && m.nlink() == 1) {
+        return fail(format!("{shown} is not a regular file with one link"));
+    }
+    if crate::sandbox::first_party_read_target(home, file).as_ref() != Some(&real) {
+        return fail(format!("{shown} is a file the sandbox denies"));
+    }
     reads.extend([real, file.to_path_buf()]);
     Ok(())
 }

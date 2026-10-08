@@ -9863,6 +9863,8 @@ paths = [
                 assert_ne!(code, Some(0), "{target}: {err}");
                 assert!(!out.contains("RAN"), "{target}");
                 assert!(err.contains(&link.display().to_string()), "{err}");
+                let to = format!("points to {}", home.h.join(target).display());
+                assert!(err.contains(&to), "{err}");
                 std::fs::remove_file(&link).unwrap();
             }
             // A file a later deny covers (deny.paths, the project .env rule)
