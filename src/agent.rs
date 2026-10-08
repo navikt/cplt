@@ -3239,7 +3239,7 @@ mod tests {
         // to start and log the attempt under parallel test load (#735).
         let secs = std::time::Duration::from_secs;
         for (name, body, budget) in [
-            ("hang", "sleep 30", secs(2)),
+            ("hang", "exec sleep 30", secs(2)),
             ("garbage", "echo opencode", secs(60)),
             ("fail", "echo opencode v2.0.0; exit 1", secs(60)),
         ] {
