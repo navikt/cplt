@@ -84,6 +84,15 @@ pub(super) fn apply_deny_env_and_credential(
     }
 }
 
+/// The OpenCode v2 session's variables (#710), set last.
+fn apply_session_env(cmd: &mut Command, sandbox: &super::PreparedSandbox) {
+    // v2 ignores the #695 handover: don't put the gh token where nothing reads it.
+    if sandbox.opencode_v2 {
+        cmd.env_remove("OPENCODE_AUTH_CONTENT");
+    }
+    cmd.envs(sandbox.extra_env.iter().map(|(k, v)| (k, v)));
+}
+
 /// Configure environment, proxy, and common args on a sandboxed Command.
 ///
 /// Both macOS (Seatbelt) and Linux (Landlock) paths call this to apply the
@@ -285,6 +294,10 @@ fn configure_command(
         //     --allow-localhost-any. Without explicit localhost access, the proxy is
         //     the sole mechanism blocking loopback connections (Landlock is port-based
         //     only and cannot distinguish localhost from remote hosts).
+        //   - Linux, OpenCode v2: the session sets NO_PROXY for loopback itself
+        //     (`opencode_v2::prepare`), so its client reaches its service. Loopback
+        //     traffic from any proxy-honouring tool then skips the proxy and its log;
+        //     Landlock still limits it to the allowlisted ports (ABI 4+).
         #[cfg(target_os = "macos")]
         let set_no_proxy = {
             let _ = (allow_localhost, allow_localhost_any); // used on Linux only
@@ -1492,11 +1505,7 @@ pub fn exec(
     );
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
-    // v2 ignores the #695 handover: don't put the gh token where nothing reads it.
-    if sandbox.opencode_v2 {
-        cmd.env_remove("OPENCODE_AUTH_CONTENT");
-    }
-    cmd.envs(sandbox.extra_env.iter().map(|(k, v)| (k, v)));
+    apply_session_env(&mut cmd, sandbox);
     // Nothing the caller was holding open crosses into the agent.
     seal_inherited_fds(&mut cmd, Vec::new());
 
@@ -1574,6 +1583,10 @@ pub fn exec(
             on_launch,
         ) {
             BwrapOutcome::Ran(code) => return code,
+            BwrapOutcome::Fallback if sandbox.opencode_v2 => {
+                ui::error(&super::opencode_v2_needs_bwrap());
+                return 1;
+            }
             BwrapOutcome::Fallback => {
                 ui::warn(if sandbox.agent == crate::agent::Agent::Claude {
                     "Bubblewrap could not start; using Landlock + seccomp only \
@@ -1638,6 +1651,7 @@ pub fn exec(
     );
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
+    apply_session_env(&mut cmd, sandbox);
     // Before the Landlock hook below: that hook opens descriptors of its own,
     // and they must not be sealed.
     seal_inherited_fds(&mut cmd, Vec::new());
@@ -1862,6 +1876,7 @@ fn exec_bwrap(
         sandbox.keychain_substitute.as_ref(),
     );
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
+    apply_session_env(&mut cmd, sandbox);
     // Set the re-entry env AFTER configure_command so a `clear_first` env build
     // cannot wipe them.
     cmd.env(

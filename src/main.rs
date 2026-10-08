@@ -4264,10 +4264,9 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // can be included in the sandbox profile. Failure is deferred —
     // --print-profile doesn't need the binary.
     let agent_bin_result = active_agent.resolve_binary();
-    // #710: v2 runs tool calls through a background service. On macOS each
-    // session gets its own service inside the sandbox (see `opencode_v2`); the
-    // Linux backend cannot deny the host service's files inside granted dirs,
-    // so it still refuses. --print-profile never runs the agent.
+    // #710: v2 runs tool calls through a background service. Each session
+    // gets its own service inside the sandbox (see `opencode_v2`).
+    // --print-profile never runs the agent.
     let opencode_v2 = match (active_agent, &agent_bin_result) {
         (agent::Agent::OpenCode, Ok(bin)) if !cli.print_profile => {
             // #725: a version cplt cannot read could be v2, and running v2 on
@@ -4283,22 +4282,6 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         }
         _ => false,
     };
-    if opencode_v2
-        && cfg!(not(target_os = "macos"))
-        && let Ok(bin) = &agent_bin_result
-    {
-        let s = bin.to_string_lossy();
-        let fix = if s.contains("node_modules") || s.contains("@opencode") {
-            "Stay on 1.x: npm uninstall -g @opencode/cli && npm i -g opencode-ai@1."
-        } else {
-            "Stay on 1.x: reinstall OpenCode 1.x (npm package opencode-ai@1)."
-        };
-        bail!(
-            "OpenCode v2 ({}) is not supported by cplt on Linux yet: \
-             https://github.com/navikt/cplt/issues/710\n{fix}",
-            bin.display()
-        );
-    }
     let copilot_install_dir = agent_install_dir(active_agent, &agent_bin_result, &home_dir);
 
     // Discover Electron app bundle when Copilot CLI is installed via VS Code.

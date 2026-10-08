@@ -1481,6 +1481,95 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     }
 }
 
+/// Keep `hidden` files (an OpenCode v2 session's host `service.json`, #719)
+/// out of every rule. Landlock cannot carve a file out of a granted
+/// directory, so a rule on a file's parent is replaced by one rule per entry,
+/// with the same access, minus the hidden names. Entries the host creates
+/// later are never granted. Any other rule that covers a file (an ancestor,
+/// or a link to it) is refused rather than left to expose it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn hide_files(
+    rules: &mut Vec<FsRule>,
+    plain_file: &mut Option<usize>,
+    hidden: &[PathBuf],
+) -> Result<(), String> {
+    let canon = crate::config::canonicalize_deepest;
+    let files: Vec<PathBuf> = hidden.iter().map(|f| canon(f)).collect();
+    // A hard link is the same file under another name, which no name-based
+    // rule can keep out.
+    for f in &files {
+        use std::os::unix::fs::MetadataExt as _;
+        if std::fs::symlink_metadata(f).is_ok_and(|m| m.nlink() > 1) {
+            return Err(format!(
+                "OpenCode v2 keeps the host service file {} away from the agent, but it \
+                 has more than one hard link, so another name could expose it. Remove the \
+                 extra link. See https://github.com/navikt/cplt/issues/719",
+                f.display()
+            ));
+        }
+    }
+    let mut i = 0;
+    while i < rules.len() {
+        let dir = canon(&rules[i].path);
+        let Some(file) = files.iter().find(|f| f.starts_with(&dir)) else {
+            i += 1;
+            continue;
+        };
+        if file.parent() != Some(dir.as_path()) {
+            return Err(format!(
+                "OpenCode v2 keeps the host service file {} away from the agent, but the \
+                 grant on {} covers it, and Landlock cannot take a file back out of a \
+                 granted directory. Launch from a narrower project dir, or narrow that \
+                 allow.read/allow.write entry. See https://github.com/navikt/cplt/issues/719",
+                file.display(),
+                rules[i].path.display()
+            ));
+        }
+        let rule = rules.remove(i);
+        if let Some(p) = plain_file.as_mut().filter(|p| **p > i) {
+            *p -= 1;
+        }
+        let skip: Vec<_> = files
+            .iter()
+            .filter(|f| f.parent() == Some(dir.as_path()))
+            .filter_map(|f| f.file_name())
+            .collect();
+        // Appended, so the loop checks each entry too: a link to an ancestor
+        // or to the file itself is refused above.
+        // A link out of the dir is skipped: the dir rule never reached its
+        // target, and Landlock would grant whatever it names (an agent with
+        // write access here could have planted `x -> ~/.ssh/id_ed25519`).
+        // The rule names the checked target and is opened without following
+        // links, so an entry swapped for a link after this check fails the
+        // launch instead of moving the grant.
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let Ok(real) = std::fs::canonicalize(e.path()) else {
+                continue;
+            };
+            // A link back to the dir or above it (`ln -s . loop`) would expand
+            // this dir again, forever.
+            if dir.starts_with(&real) {
+                continue;
+            }
+            if real.starts_with(&dir) && !skip.contains(&e.file_name().as_os_str()) {
+                if rules.len() > 100_000 {
+                    return Err(format!(
+                        "{} has too many entries to grant one by one for OpenCode v2. \
+                         See https://github.com/navikt/cplt/issues/719",
+                        dir.display()
+                    ));
+                }
+                rules.push(FsRule {
+                    path: real,
+                    nofollow: true,
+                    ..rule.clone()
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// How [`describe_policy`] lists the root `AGENTS.md` rule (#252), as one
 /// string so `PreparedSandbox::revoke_root_agents_md` can remove exactly it.
 pub(crate) fn root_agents_md_description(file: &Path) -> String {
@@ -1838,9 +1927,6 @@ fn check_proxy_forced_enforceable(
 
 #[cfg(target_os = "linux")]
 pub fn precompute(policy: LandlockPolicy) -> Result<PrecomputedSandbox, String> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
     let abi_version = check_availability()?;
     let seccomp_filter = build_seccomp_filter(policy.proxy_forced);
 
@@ -1891,6 +1977,38 @@ pub fn precompute(policy: LandlockPolicy) -> Result<PrecomputedSandbox, String> 
         }
     }
 
+    let (pre_opened_fds, deferred_paths, deferred_plain_file) = open_fs_rules(&policy)?;
+
+    let net_rules = policy.net_rules.clone();
+    let restrict_net_connect = policy.restrict_net_connect;
+
+    Ok(PrecomputedSandbox {
+        pre_opened_fds,
+        deferred_paths,
+        deferred_plain_file,
+        net_rules,
+        restrict_net_connect,
+        seccomp_filter,
+    })
+}
+
+/// The descriptors and deferred paths [`PrecomputedSandbox`] holds for
+/// `policy.fs_rules`.
+#[cfg(target_os = "linux")]
+#[allow(clippy::type_complexity)]
+fn open_fs_rules(
+    policy: &LandlockPolicy,
+) -> Result<
+    (
+        Vec<(RawFd, FsAccess)>,
+        Vec<(std::ffi::CString, FsAccess)>,
+        Option<(std::ffi::CString, FsAccess)>,
+    ),
+    String,
+> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
     // Pre-open all filesystem paths in the parent process.
     // This avoids CString allocation and open() calls in pre_exec.
     // Paths under /proc/self are magic symlinks that resolve to /proc/<pid> —
@@ -1923,18 +2041,23 @@ pub fn precompute(policy: LandlockPolicy) -> Result<PrecomputedSandbox, String> 
         }
         // Skip paths that don't exist (fd < 0) — the tool may not be installed.
     }
+    Ok((pre_opened_fds, deferred_paths, deferred_plain_file))
+}
 
-    let net_rules = policy.net_rules.clone();
-    let restrict_net_connect = policy.restrict_net_connect;
-
-    Ok(PrecomputedSandbox {
-        pre_opened_fds,
-        deferred_paths,
-        deferred_plain_file,
-        net_rules,
-        restrict_net_connect,
-        seccomp_filter,
-    })
+#[cfg(target_os = "linux")]
+impl PrecomputedSandbox {
+    /// Rebuild the rules from `policy` after it changed (OpenCode v2, #719).
+    pub fn reload(&mut self, policy: &LandlockPolicy) -> Result<(), String> {
+        let (fds, deferred, plain) = open_fs_rules(policy)?;
+        for (fd, _) in std::mem::replace(&mut self.pre_opened_fds, fds) {
+            // SAFETY: an O_PATH descriptor this struct opened and owns.
+            unsafe { libc::close(fd) };
+        }
+        self.deferred_paths = deferred;
+        self.deferred_plain_file = plain;
+        self.net_rules.clone_from(&policy.net_rules);
+        Ok(())
+    }
 }
 
 /// Build the seccomp BPF filter program in the parent process.
@@ -5955,5 +6078,178 @@ mod tests {
                 "ABI::{abi:?} must have discriminant {expected};                  available_abi_version() casts it directly"
             );
         }
+    }
+
+    // ── OpenCode v2 (#719): host service files left out of the rules ──
+
+    /// A fake HOME with both host service files next to other entries, and
+    /// the policy an OpenCode launch from `home/proj` builds.
+    fn opencode_v2_policy(home: &Path, project: &Path) -> (LandlockPolicy, Vec<PathBuf>) {
+        for d in [".config/opencode/agent", ".local/state/opencode", "proj"] {
+            std::fs::create_dir_all(home.join(d)).unwrap();
+        }
+        for f in [
+            ".config/opencode/opencode.json",
+            ".config/opencode/service.json",
+            ".local/state/opencode/service.json",
+            ".local/state/opencode/kv.json",
+        ] {
+            std::fs::write(home.join(f), "x").unwrap();
+        }
+        // CI runners set XDG_CONFIG_HOME; the dirs must sit in this HOME.
+        let unset = [
+            "XDG_CONFIG_HOME",
+            "XDG_STATE_HOME",
+            "XDG_DATA_HOME",
+            "OPENCODE_CONFIG_DIR",
+        ];
+        let dirs =
+            temp_env::with_vars_unset(unset, || crate::agent::Agent::OpenCode.config_dirs(home));
+        let mut config = test_config(project, home);
+        config.agent = crate::agent::Agent::OpenCode;
+        config.agent_dirs = &dirs;
+        let mut policy = generate_policy(&config);
+        // The temp HOME sits under /tmp, which Linux grants: not under test.
+        policy
+            .fs_rules
+            .retain(|r| !(home.starts_with(&r.path) && r.path != home));
+        let hidden = [".config/opencode", ".local/state/opencode"]
+            .iter()
+            .map(|d| home.join(d).join("service.json"))
+            .collect();
+        (policy, hidden)
+    }
+
+    fn rule_on<'a>(policy: &'a LandlockPolicy, path: &Path) -> Option<&'a FsRule> {
+        policy.fs_rules.iter().find(|r| r.path == path)
+    }
+
+    /// Unit 1: the agent dirs become one rule per sibling with the same
+    /// access; no rule names the dirs or a `service.json`.
+    #[test]
+    fn opencode_v2_service_files_leave_the_agent_dir_rules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        let (mut policy, hidden) = opencode_v2_policy(&home, &home.join("proj"));
+        let dirs = [".config/opencode", ".local/state/opencode"].map(|d| home.join(d));
+        let access = dirs
+            .clone()
+            .map(|d| rule_on(&policy, &d).expect("agent dir").access);
+        // A link planted in the writable state dir by an earlier session.
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::write(home.join(".ssh/id_ed25519"), "KEY").unwrap();
+        let planted = dirs[1].join("key");
+        std::os::unix::fs::symlink(home.join(".ssh/id_ed25519"), &planted).unwrap();
+        let mut plain = policy.plain_file;
+        hide_files(&mut policy.fs_rules, &mut plain, &hidden).unwrap();
+        assert!(rule_on(&policy, &planted).is_none(), "link out of the dir");
+        for dir in &dirs {
+            assert!(rule_on(&policy, dir).is_none(), "{}", dir.display());
+            assert!(rule_on(&policy, &dir.join("service.json")).is_none());
+        }
+        for (i, e) in [(0, "agent"), (0, "opencode.json"), (1, "kv.json")] {
+            let r = rule_on(&policy, &dirs[i].join(e)).unwrap_or_else(|| panic!("{e}"));
+            assert_eq!(r.access, access[i], "{e}");
+            assert!(r.nofollow, "{e}: a swapped-in link must not move the grant");
+        }
+    }
+
+    /// Unit 2: a dotfiles-style symlinked `~/.config/opencode`: the rule
+    /// resolves to the real dir, whose entries are granted, its file not.
+    #[test]
+    fn opencode_v2_hiding_follows_a_symlinked_config_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let real = root.join("dotfiles/opencode");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("service.json"), "x").unwrap();
+        std::fs::write(real.join("opencode.json"), "x").unwrap();
+        let link = root.join("home/.config/opencode");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut rules = vec![FsRule {
+            path: link.clone(),
+            access: FsAccess {
+                read: true,
+                ..FsAccess::default()
+            },
+            nofollow: false,
+        }];
+        let mut plain = None;
+        hide_files(&mut rules, &mut plain, &[link.join("service.json")]).unwrap();
+        let paths: Vec<_> = rules.iter().map(|r| r.path.clone()).collect();
+        assert_eq!(paths, [real.join("opencode.json")]);
+    }
+
+    /// Unit 3: a rule above a service file (launch from `$HOME`, or
+    /// `allow.read ~/.config`) or a link to one is refused by name.
+    #[test]
+    fn opencode_v2_refuses_a_rule_covering_a_service_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        let (policy, hidden) = opencode_v2_policy(&home, &home);
+        let mut rules = policy.fs_rules;
+        let err = hide_files(&mut rules, &mut None, &hidden).unwrap_err();
+        assert!(err.contains(&home.display().to_string()), "{err}");
+        assert!(err.contains("issues/719"), "{err}");
+        let read = |p: PathBuf| FsRule {
+            path: p,
+            access: FsAccess {
+                read: true,
+                ..FsAccess::default()
+            },
+            nofollow: false,
+        };
+        let mut rules = vec![read(home.join(".config"))];
+        assert!(
+            hide_files(&mut rules, &mut None, &hidden).is_err(),
+            "allow.read ~/.config"
+        );
+        std::os::unix::fs::symlink(&hidden[0], home.join("proj/svc")).unwrap();
+        let mut rules = vec![read(home.join("proj"))];
+        assert!(
+            hide_files(&mut rules, &mut None, &hidden).is_ok(),
+            "the link itself is not read"
+        );
+        let mut rules = vec![read(home.join("proj/svc"))];
+        assert!(
+            hide_files(&mut rules, &mut None, &hidden).is_err(),
+            "a rule on a link to it"
+        );
+        let state = home.join(".local/state/opencode");
+        std::os::unix::fs::symlink(".", state.join("dot")).unwrap();
+        std::os::unix::fs::symlink("..", state.join("up")).unwrap();
+        let mut rules = vec![read(state.clone())];
+        hide_files(&mut rules, &mut None, &hidden).unwrap();
+        assert!(
+            rules.iter().all(|r| !state.starts_with(&r.path)),
+            "a loop link is skipped"
+        );
+        std::fs::hard_link(&hidden[0], home.join(".config/opencode/alias")).unwrap();
+        let mut rules = vec![read(home.join("proj"))];
+        let err = hide_files(&mut rules, &mut None, &hidden).unwrap_err();
+        assert!(err.contains("hard link"), "{err}");
+    }
+
+    /// The root `AGENTS.md` index still names its rule after an expansion
+    /// removed one before it.
+    #[test]
+    fn opencode_v2_hiding_keeps_the_plain_file_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        let (policy, hidden) = opencode_v2_policy(&home, &home.join("proj"));
+        let mut rules = policy.fs_rules;
+        let agents = home.join("AGENTS.md");
+        rules.push(FsRule {
+            path: agents.clone(),
+            access: FsAccess {
+                read: true,
+                ..FsAccess::default()
+            },
+            nofollow: false,
+        });
+        let mut plain = Some(rules.len() - 1);
+        hide_files(&mut rules, &mut plain, &hidden).unwrap();
+        assert_eq!(rules[plain.unwrap()].path, agents);
     }
 }
