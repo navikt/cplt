@@ -98,12 +98,12 @@ pub use policy::{
     build_credential_grants, copilot_default_pkg_dir, copilot_pkg_dir, copilot_pkg_dirs,
     copilot_ro_protect_paths, credential_link_hop, current_uid, cypress_app_data_dir,
     cypress_app_data_dir_with_env, cypress_runtime_intent, dir_overlaps_credentials,
-    exec_write_conflicts, home_config_link_targets, home_tool_dirs, linux_docker_socket_paths,
-    linux_runtime_dirs, mise_ro_protect_paths, nested_alternation, no_cache_env,
-    no_exec_temp_dir_over, no_exec_tool_dir_over, path_bin_dirs, playwright_runtime_intent,
-    process_env, relocatable_tool_prefix, shim_ro_protect_paths, socket_mask_paths,
-    tool_override_path_is_safe, tool_path_env_overrides, validate_playwright_socket_dir,
-    validate_sbpl_path, xdg_runtime_dir_env,
+    exec_write_conflicts, first_party_read_target, home_config_link_targets, home_tool_dirs,
+    linux_docker_socket_paths, linux_runtime_dirs, mise_ro_protect_paths, nested_alternation,
+    no_cache_env, no_exec_temp_dir_over, no_exec_tool_dir_over, path_bin_dirs,
+    playwright_runtime_intent, process_env, relocatable_tool_prefix, shim_ro_protect_paths,
+    socket_mask_paths, tool_override_path_is_safe, tool_path_env_overrides,
+    validate_playwright_socket_dir, validate_sbpl_path, xdg_runtime_dir_env,
 };
 
 // SBPL profile generation — kept public for unit tests.
@@ -362,6 +362,13 @@ impl PreparedSandbox {
     /// Add an OpenCode v2 session (#710): its rules go at the end of the
     /// profile, where they win, and its variables are set on the child last.
     pub fn add_opencode_v2(&mut self, session: crate::opencode_v2::Session) {
+        // File grants go before the deny section, so every deny still wins.
+        let at = self
+            .profile_text
+            .find(profile::DENY_SECTION)
+            .unwrap_or(self.profile_text.len());
+        self.profile_text
+            .insert_str(at, &session.sbpl_before_denies);
         self.profile_text.push_str(&session.sbpl);
         self.extra_env = session.env;
         self.opencode_v2 = true;

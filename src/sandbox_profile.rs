@@ -2525,6 +2525,9 @@ fn emit_home_config_write_denies(sb: &mut String, config: &SandboxConfig, home: 
     sbpl!(sb);
 }
 
+/// The first line of the deny section; grants inserted before it lose to it.
+pub const DENY_SECTION: &str = ";; Sensitive directories — DENIED";
+
 fn emit_deny_rules(sb: &mut String, config: &SandboxConfig, home: &str) {
     // Sensitive directories — DENY (after allows, so these override)
     //
@@ -2561,7 +2564,7 @@ fn emit_deny_rules(sb: &mut String, config: &SandboxConfig, home: &str) {
         .chain(DENIED_HOME_SUBPATHS.iter().map(|f| spell(f, false)))
         .chain(pnpm_files.iter().map(|f| spell(f, false)))
         .collect();
-    sbpl!(sb, ";; Sensitive directories — DENIED");
+    sbpl!(sb, "{DENY_SECTION}");
     for p in dirs.iter().flatten() {
         sbpl!(sb, "(deny file-read* (subpath \"{p}\"))");
         sbpl!(sb, "(deny file-write* (subpath \"{p}\"))");
