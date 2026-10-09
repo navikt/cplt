@@ -1709,8 +1709,8 @@ fn which_resolved(name: &str) -> Option<PathBuf> {
 /// Find native `.node` modules matching a name in Copilot's package dirs:
 /// the old `~/.copilot/pkg/universal/<ver>/prebuilds/<platform>/` and, since
 /// the 1.0.9x builds from npm and Homebrew,
-/// `<cache>/copilot/pkg/<platform>/<ver>/prebuilds/<platform>/`, with the
-/// cache at `~/Library/Caches` (macOS) or `~/.cache` (Linux).
+/// `<pkg>/<platform>/<ver>/prebuilds/<platform>/`, with `<pkg>` resolved as
+/// the launch resolves it ([`crate::sandbox::copilot_pkg_dir`]).
 fn find_native_modules(home_dir: &Path, module_name: &str) -> Vec<PathBuf> {
     let mut version_dirs: Vec<PathBuf> = Vec::new();
     let read = |d: &Path| -> Vec<PathBuf> {
@@ -1719,10 +1719,16 @@ fn find_native_modules(home_dir: &Path, module_name: &str) -> Vec<PathBuf> {
             .unwrap_or_default()
     };
     version_dirs.extend(read(&home_dir.join(".copilot/pkg/universal")));
-    for cache in ["Library/Caches/copilot/pkg", ".cache/copilot/pkg"] {
-        for platform in read(&home_dir.join(cache)) {
-            version_dirs.extend(read(&platform));
-        }
+    // The launch's own resolver, so `COPILOT_PKG_CACHE_HOME`,
+    // `COPILOT_CACHE_HOME` and `XDG_CACHE_HOME` count as they do for Copilot.
+    let pkg = crate::sandbox::copilot_pkg_dir(
+        &|n: &str| std::env::var_os(n),
+        home_dir,
+        std::env::consts::OS,
+    )
+    .unwrap_or_else(|_| crate::sandbox::copilot_default_pkg_dir(home_dir, std::env::consts::OS));
+    for platform in read(&pkg) {
+        version_dirs.extend(read(&platform));
     }
 
     let mut results = Vec::new();
@@ -2613,18 +2619,20 @@ mod wsl_tool_report_tests {
         let old = home
             .path()
             .join(".copilot/pkg/universal/1.0.20/prebuilds/darwin-arm64");
-        let new = home
-            .path()
-            .join(".cache/copilot/pkg/linux-x64/1.0.94/prebuilds/linux-x64");
-        let mac = home
-            .path()
-            .join("Library/Caches/copilot/pkg/darwin-arm64/1.0.94-5/prebuilds/darwin-arm64");
-        for d in [&old, &new, &mac] {
+        // Where the launch resolves the cache for this host's environment.
+        let new = crate::sandbox::copilot_pkg_dir(
+            &|n: &str| std::env::var_os(n),
+            home.path(),
+            std::env::consts::OS,
+        )
+        .unwrap()
+        .join("p-arch/1.0.94-5/prebuilds/p-arch");
+        for d in [&old, &new] {
             std::fs::create_dir_all(d).unwrap();
             std::fs::write(d.join("keytar.node"), "").unwrap();
         }
         let found = find_native_modules(home.path(), "keytar.node");
-        assert_eq!(found.len(), 3, "{found:?}");
+        assert_eq!(found.len(), 2, "{found:?}");
     }
 
     /// A non-critical tool is only warned about — it is not a broken install.

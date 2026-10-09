@@ -8061,7 +8061,12 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         cfg!(target_os = "linux"),
         std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some(),
         env_token.is_some(),
-        resolved.gh_guard.enabled && resolved.gh_guard.inject_token,
+        // What the launch needs to inject: the guard on, the key set, and a
+        // `gh auth token` that succeeds into a GH_TOKEN deny.env leaves alone.
+        resolved.gh_guard.enabled
+            && resolved.gh_guard.inject_token
+            && auth.gh_cli_auth
+            && gh_exec_token_available(&resolved.deny_env),
     ));
     for message in write_granted_repos_messages(&resolved, &project_dir, &repo_paths)
         .into_iter()
