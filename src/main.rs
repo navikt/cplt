@@ -7620,9 +7620,8 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         Some(p) => format!("user {}", tilde(p)),
         None => "user: none".to_string(),
     }];
-    if let Some(lp) = config::local_path(&project_dir).filter(|p| p.exists()) {
-        // The file name is a hash of the project path: noise in a report.
-        let _ = lp;
+    // The file name is a hash of the project path: noise in a report.
+    if config::local_path(&project_dir).is_some_and(|p| p.exists()) {
         layers.push("local (per-repo)".to_string());
     }
     match repo_config::load_repo_config(&project_dir) {
