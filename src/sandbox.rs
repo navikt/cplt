@@ -1851,6 +1851,32 @@ fn account_mismatch(gh: &str, copilot_acct: Option<&str>) -> Option<String> {
     }
 }
 
+/// Why Copilot keeps the Keychain grant with the key on, so the launch summary
+/// and `cplt doctor` give the same reason (#277). `None` when the key is off
+/// or the agent is not Copilot. Read after [`keychain_substitute`] has run,
+/// since it consults [`ACCOUNT_MISMATCH`].
+#[must_use]
+pub fn keychain_kept_reason(
+    agent: Agent,
+    setting: Option<bool>,
+    deny_env: &[String],
+) -> Option<String> {
+    if agent != Agent::Copilot || !keychain_substitute_enabled(agent, setting) {
+        return None;
+    }
+    let all_denied = agent
+        .keychain_substitute_env_vars()
+        .iter()
+        .all(|v| deny_env.iter().any(|d| d == v));
+    Some(if let Some(why) = ACCOUNT_MISMATCH.get() {
+        format!("{why}: kept to avoid switching account")
+    } else if all_denied {
+        "no token: deny.env strips every token variable".to_string()
+    } else {
+        "no token: gh auth token failed, or gh is not in a trusted bin dir".to_string()
+    })
+}
+
 /// `sandbox.keychain_substitute` as it applies to `agent`. Unset is on for
 /// Copilot and Claude: Copilot's `gh auth token` path and Claude's
 /// `CLAUDE_CODE_OAUTH_TOKEN` are proven, and both keep the grant when there is
@@ -3082,6 +3108,26 @@ fn validate_created_playwright_socket_dir(path: &Path) -> Result<(), String> {
 #[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod tests {
     use super::*;
+
+    #[test]
+    fn keychain_kept_reason_is_copilot_only_and_names_deny_env() {
+        assert_eq!(keychain_kept_reason(Agent::Claude, None, &[]), None);
+        assert_eq!(keychain_kept_reason(Agent::Copilot, Some(false), &[]), None);
+        let all: Vec<String> = ["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"]
+            .map(String::from)
+            .to_vec();
+        if ACCOUNT_MISMATCH.get().is_none() {
+            assert_eq!(
+                keychain_kept_reason(Agent::Copilot, None, &all).as_deref(),
+                Some("no token: deny.env strips every token variable")
+            );
+            assert!(
+                keychain_kept_reason(Agent::Copilot, None, &all[..2])
+                    .unwrap()
+                    .contains("gh auth token failed")
+            );
+        }
+    }
 
     #[test]
     fn claude_keychain_nudge_only_without_token() {

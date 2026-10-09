@@ -617,6 +617,33 @@ mod e2e_tests {
         );
     }
 
+    #[test]
+    fn e2e_doctor_header_has_settings_auth_and_paste_hint() {
+        // `--agent` after `doctor` works like the global flag before it.
+        let output = cplt_cmd()
+            .args(["doctor", "--agent", "shell"])
+            .current_dir(project_dir())
+            .output()
+            .expect("binary should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("agent:       Shell") && stdout.contains("(--agent)"),
+            "doctor --agent picks the agent.\nstdout: {stdout}"
+        );
+        assert!(
+            stdout.contains("settings:    keychain_substitute ") && stdout.contains(" · quiet off"),
+            "the settings line reports the user's quiet, not doctor's own.\nstdout: {stdout}"
+        );
+        assert!(
+            stdout.contains("auth:        none (the shell needs no login)"),
+            "the auth line is per agent.\nstdout: {stdout}"
+        );
+        assert!(
+            stdout.contains("`--verbose` adds absolute paths and is not paste-safe"),
+            "the header ends with the paste hint.\nstdout: {stdout}"
+        );
+    }
+
     /// #604: an allowlist that blocks the agent's hosts failed `cplt check`
     /// while doctor said "No problems found".
     #[test]
