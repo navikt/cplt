@@ -1554,3 +1554,40 @@ fn golden_check_exec_knows_about_named_repositories() {
 
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// `cplt doctor` reports what the launch would refuse or ignore, instead of
+/// "No problems found": a Cypress state directory that is a symlink stops the
+/// launch (#602), and a `[sandbox]` key in `.cplt.toml` is ignored.
+#[test]
+fn golden_doctor_reports_launch_refusals_and_ignored_repo_keys() {
+    let home = make_config_home("golden-doctor-refusals");
+    let repo = temp_repo("navikt/probe");
+    let cfg = home.join(".config/cplt");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(
+        cfg.join("config.toml"),
+        "[sandbox]\nallow_cache_exec = [\"Cypress\"]\n",
+    )
+    .unwrap();
+    std::fs::write(repo.path().join(".cplt.toml"), "[sandbox]\nquiet = true\n").unwrap();
+    let state = cplt::sandbox::cypress_app_data_dir_with_env(&home, &cplt::sandbox::no_cache_env);
+    std::fs::create_dir_all(state.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(repo.path(), &state).unwrap();
+
+    let (out, err, status) = launch(&home, repo.path(), &["--agent", "shell", "doctor"]);
+    assert!(
+        !status.success(),
+        "a refused launch is a blocking finding:\n{out}{err}"
+    );
+    for want in [
+        "The launch refuses to start: Cypress app state",
+        "resolves through a symlink",
+        ".cplt.toml sets sandbox.quiet, which a repository cannot set",
+    ] {
+        assert!(
+            out.contains(want),
+            "doctor must print `{want}`:\n{out}{err}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}
