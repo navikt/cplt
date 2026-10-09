@@ -506,9 +506,12 @@ const GLOBAL_ONLY_TABLES: &[&str] = &["sandbox", "proxy", "gh_guard", "git_guard
 
 /// `[sandbox]`, `[proxy]`, `[gh_guard]` or `[git_guard]` keys in `.cplt.toml`:
 /// the launch ignores every one, so the setting the author wrote is not in
-/// force. Key names only.
+/// force. Key names only. `label` names the file, for a named repository's.
 #[must_use]
-pub fn global_only_repo_keys_finding(repo: &crate::repo_config::RepoConfig) -> Option<Finding> {
+pub fn global_only_repo_keys_finding(
+    repo: &crate::repo_config::RepoConfig,
+    label: &str,
+) -> Option<Finding> {
     let keys: Vec<String> = repo
         .unknown
         .iter()
@@ -523,7 +526,7 @@ pub fn global_only_repo_keys_finding(repo: &crate::repo_config::RepoConfig) -> O
     }
     Some(Finding::warning(
         format!(
-            ".cplt.toml sets {}, which a repository cannot set: the launch ignores {}.",
+            "{label} sets {}, which a repository cannot set: the launch ignores {}.",
             keys.join(", "),
             if keys.len() == 1 { "it" } else { "them" }
         ),
@@ -1536,18 +1539,27 @@ mod tests {
     fn global_only_repo_keys_are_named_and_proposals_are_not() {
         let parse = |t: &str| toml::from_str::<crate::repo_config::RepoConfig>(t).unwrap();
         assert!(
-            global_only_repo_keys_finding(&parse(
-                "[propose]\nallow_docker = true\n[deny]\nenv = [\"X\"]\n"
-            ))
+            global_only_repo_keys_finding(
+                &parse("[propose]\nallow_docker = true\n[deny]\nenv = [\"X\"]\n"),
+                ".cplt.toml"
+            )
             .is_none()
         );
-        let f = global_only_repo_keys_finding(&parse(
-            "[sandbox]\nquiet = true\nallow_cache_exec = [\"x\"]\n[gh_guard]\nenabled = false\n\
+        let f = global_only_repo_keys_finding(
+            &parse(
+                "[sandbox]\nquiet = true\nallow_cache_exec = [\"x\"]\n[gh_guard]\nenabled = false\n\
              [proxy]\nport = 1\n[git_guard]\nmode = \"off\"\n[future]\nx = 1\n",
-        ))
+            ),
+            "~/src/other/.cplt.toml",
+        )
         .expect("global-only keys must be reported");
         assert_eq!(f.level, Level::Warning);
         assert!(f.fix.is_some());
+        assert!(
+            f.message.starts_with("~/src/other/.cplt.toml sets "),
+            "{}",
+            f.message
+        );
         for key in [
             "sandbox.quiet",
             "sandbox.allow_cache_exec",

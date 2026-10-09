@@ -7710,7 +7710,10 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
                     _ => "unknown source",
                 }
             ));
-            findings.extend(doctor::global_only_repo_keys_finding(&loaded.config));
+            findings.extend(doctor::global_only_repo_keys_finding(
+                &loaded.config,
+                ".cplt.toml",
+            ));
         }
         Ok(None) => {}
         Err(_) => layers.push("repo .cplt.toml (unreadable)".to_string()),
@@ -7720,6 +7723,17 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         resolved.preset.map_or("standard (default)", preset_label)
     ));
     println!("config:      {}", layers.join(" · "));
+    // Named repositories' `.cplt.toml` apply too (their `[deny]`), so their
+    // ignored keys count as much as the launch repository's.
+    for root in &repo_roots {
+        if let Ok(Some(loaded)) = repo_config::load_repo_config(&root.dir) {
+            let label = format!("{}/.cplt.toml", tilde(&root.dir));
+            findings.extend(doctor::global_only_repo_keys_finding(
+                &loaded.config,
+                &label,
+            ));
+        }
+    }
     if !unapproved_proposals.is_empty() {
         findings.push(Finding::warning(
             format!(
