@@ -8042,7 +8042,10 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
     findings.extend(doctor::scratch_off_finding(
         resolved.scratch_dir,
         guards_on,
-        resolved.allow_tmp_exec,
+        // Landlock also opens /tmp for exec under `allow_jvm_attach`; the
+        // macOS profile keys on `allow_tmp_exec` alone (`sandbox_landlock.rs`,
+        // `sandbox_profile.rs`).
+        resolved.allow_tmp_exec || (cfg!(target_os = "linux") && resolved.allow_jvm_attach),
     ));
     findings.extend(doctor::quiet_upstream_finding(
         macos,

@@ -1721,14 +1721,20 @@ fn find_native_modules(home_dir: &Path, module_name: &str) -> Vec<PathBuf> {
     version_dirs.extend(read(&home_dir.join(".copilot/pkg/universal")));
     // The launch's own resolver, so `COPILOT_PKG_CACHE_HOME`,
     // `COPILOT_CACHE_HOME` and `XDG_CACHE_HOME` count as they do for Copilot.
-    let pkg = crate::sandbox::copilot_pkg_dir(
-        &|n: &str| std::env::var_os(n),
-        home_dir,
-        std::env::consts::OS,
-    )
-    .unwrap_or_else(|_| crate::sandbox::copilot_default_pkg_dir(home_dir, std::env::consts::OS));
-    for platform in read(&pkg) {
-        version_dirs.extend(read(&platform));
+    // The default is scanned as well: Copilot's loader still looks there for a
+    // newer runtime when a cache variable moves the cache.
+    let os = std::env::consts::OS;
+    let default = crate::sandbox::copilot_default_pkg_dir(home_dir, os);
+    let mut pkg_dirs = vec![default.clone()];
+    if let Ok(moved) = crate::sandbox::copilot_pkg_dir(&|n: &str| std::env::var_os(n), home_dir, os)
+        && moved != default
+    {
+        pkg_dirs.push(moved);
+    }
+    for pkg in pkg_dirs {
+        for platform in read(&pkg) {
+            version_dirs.extend(read(&platform));
+        }
     }
 
     let mut results = Vec::new();
@@ -2619,20 +2625,20 @@ mod wsl_tool_report_tests {
         let old = home
             .path()
             .join(".copilot/pkg/universal/1.0.20/prebuilds/darwin-arm64");
-        // Where the launch resolves the cache for this host's environment.
-        let new = crate::sandbox::copilot_pkg_dir(
-            &|n: &str| std::env::var_os(n),
-            home.path(),
-            std::env::consts::OS,
-        )
-        .unwrap()
-        .join("p-arch/1.0.94-5/prebuilds/p-arch");
+        // The default cache under this temp home, so the test neither reads
+        // nor writes the real cache when a cache variable is set on the host.
+        let new = crate::sandbox::copilot_default_pkg_dir(home.path(), std::env::consts::OS)
+            .join("p-arch/1.0.94-5/prebuilds/p-arch");
         for d in [&old, &new] {
             std::fs::create_dir_all(d).unwrap();
             std::fs::write(d.join("keytar.node"), "").unwrap();
         }
         let found = find_native_modules(home.path(), "keytar.node");
-        assert_eq!(found.len(), 2, "{found:?}");
+        let ours: Vec<_> = found
+            .iter()
+            .filter(|p| p.starts_with(home.path()))
+            .collect();
+        assert_eq!(ours.len(), 2, "{found:?}");
     }
 
     /// A non-critical tool is only warned about — it is not a broken install.
