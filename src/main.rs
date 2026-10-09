@@ -2354,8 +2354,21 @@ fn warn_repo_under_no_exec_cache(
     project_dir: &Path,
     named_roots: &[PathBuf],
 ) {
+    for message in repo_under_no_exec_cache_messages(resolved, home_dir, project_dir, named_roots) {
+        ui::warn(&message);
+    }
+}
+
+/// The messages [`warn_repo_under_no_exec_cache`] prints; `doctor` reports the same.
+fn repo_under_no_exec_cache_messages(
+    resolved: &config::Resolved,
+    home_dir: &Path,
+    project_dir: &Path,
+    named_roots: &[PathBuf],
+) -> Vec<String> {
+    let mut out = Vec::new();
     if !cfg!(target_os = "macos") {
-        return;
+        return out;
     }
     for root in std::iter::once(project_dir).chain(named_roots.iter().map(PathBuf::as_path)) {
         if let Some(dir) = cplt::sandbox::no_exec_tool_dir_over(
@@ -2366,7 +2379,7 @@ fn warn_repo_under_no_exec_cache(
         )
         .or_else(|| cplt::sandbox::no_exec_temp_dir_over(root, resolved.allow_tmp_exec))
         {
-            ui::warn(&format!(
+            out.push(format!(
                 "{} is under {}, where the sandbox denies execute. Its own tools \
                  (node_modules/.bin, build scripts, native addons) will fail with \
                  `Operation not permitted`. Move the checkout out of {}.",
@@ -2376,6 +2389,7 @@ fn warn_repo_under_no_exec_cache(
             ));
         }
     }
+    out
 }
 
 fn warn_write_granted_repos(
@@ -2383,6 +2397,18 @@ fn warn_write_granted_repos(
     project_dir: &Path,
     named_roots: &[PathBuf],
 ) {
+    for message in write_granted_repos_messages(resolved, project_dir, named_roots) {
+        ui::warn(&message);
+    }
+}
+
+/// The messages [`warn_write_granted_repos`] prints; `doctor` reports the same.
+fn write_granted_repos_messages(
+    resolved: &config::Resolved,
+    project_dir: &Path,
+    named_roots: &[PathBuf],
+) -> Vec<String> {
+    let mut out = Vec::new();
     for (grant, repos) in
         write_granted_repos_without_exec(&resolved.allow_write, project_dir, named_roots)
     {
@@ -2414,7 +2440,7 @@ fn warn_write_granted_repos(
                 if repos.len() == 1 { "y" } else { "ies" }
             )
         };
-        ui::warn(&format!(
+        out.push(format!(
             "{subject}. A write grant is deliberately not executable, so its build and \
              tests will not run there: a script fails with `bad interpreter: Operation not \
              permitted`, which names neither cplt nor this grant. To work in it, name it \
@@ -2425,6 +2451,7 @@ fn warn_write_granted_repos(
              into and run."
         ));
     }
+    out
 }
 
 /// Load config, merge CLI flags, resolve paths, detect agent, print info messages.
@@ -7639,6 +7666,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         None
     };
     let mut agent_runnable = false;
+    let mut agent_version: Option<String> = None;
     match &agent_source {
         None => {
             println!("agent:       none (nothing on PATH, no --agent, no sandbox.agent)");
@@ -7652,7 +7680,10 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
             Ok(bin) => {
                 agent_runnable = true;
                 let shown = match discover::probe_version(&bin, &["--version"]) {
-                    discover::VersionProbe::Version(v) => v,
+                    discover::VersionProbe::Version(v) => {
+                        agent_version = Some(v.clone());
+                        v
+                    }
                     discover::VersionProbe::Unknown => "(version unknown)".to_string(),
                     discover::VersionProbe::TimedOut => {
                         findings.push(Finding::warning(
@@ -8006,6 +8037,52 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
     println!("{}", doctor::PASTE_HINT);
     println!();
 
+    // ── mid-session degradations: the launch's own decisions, reported ──
+    let guards_on = resolved.git_guard.enabled || resolved.gh_guard.enabled;
+    findings.extend(doctor::scratch_off_finding(
+        resolved.scratch_dir,
+        guards_on,
+        // Landlock also opens /tmp for exec under `allow_jvm_attach`; the
+        // macOS profile keys on `allow_tmp_exec` alone (`sandbox_landlock.rs`,
+        // `sandbox_profile.rs`).
+        resolved.allow_tmp_exec || (cfg!(target_os = "linux") && resolved.allow_jvm_attach),
+    ));
+    findings.extend(doctor::quiet_upstream_finding(
+        macos,
+        configured_quiet,
+        resolved.git_guard.enabled,
+        resolved.scratch_dir,
+    ));
+    findings.extend(doctor::copilot_own_sandbox_finding(
+        active_agent,
+        agent_version.as_deref(),
+        doctor::copilot_own_sandbox_enabled(&home_dir),
+        !cplt::sandbox::copilot_sandbox_support_overridden(&resolved.pass_env, active_agent),
+    ));
+    findings.extend(doctor::linux_keyring_finding(
+        active_agent,
+        cfg!(target_os = "linux"),
+        std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some(),
+        env_token.is_some(),
+        // What the launch needs to inject: the guard on, the key set, and a
+        // `gh auth token` that succeeds into a GH_TOKEN deny.env leaves alone.
+        resolved.gh_guard.enabled
+            && resolved.gh_guard.inject_token
+            && auth.gh_cli_auth
+            && gh_exec_token_available(&resolved.deny_env),
+    ));
+    for message in write_granted_repos_messages(&resolved, &project_dir, &repo_paths)
+        .into_iter()
+        .chain(repo_under_no_exec_cache_messages(
+            &resolved,
+            &home_dir,
+            &project_dir,
+            &repo_paths,
+        ))
+    {
+        findings.push(Finding::warning(message, None));
+    }
+
     findings.extend(doctor::wsl_drive_project_finding(&project_dir, wsl));
     findings.extend(
         probe
@@ -8123,7 +8200,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
 
     if verbose {
         println!();
-        println!("── inventory ──");
+        println!("── inventory (absolute paths: not paste-safe) ──");
         println!("project:  {}", tilde(&project_dir));
         println!("home:     ~");
         // The effective grants, after presets, repo proposals and the
@@ -8144,7 +8221,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
             );
         }
         println!();
-        discover::discover_all(&home_dir, &project_dir).print_report(&home_dir);
+        discover::discover_all(&home_dir, &project_dir).print_report(&home_dir, active_agent);
         print_project_ecosystems(&project_dir);
     }
 

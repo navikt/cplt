@@ -176,7 +176,12 @@ pub fn discover_copilot(home_dir: &Path) -> CopilotDiscovery {
 
     // Scan for all native modules across all versions
     let mut native_modules = Vec::new();
-    for name in &["keytar.node", "pty.node", "computer.node"] {
+    for name in &[
+        "keytar.node",
+        "pty.node",
+        "computer.node",
+        "cli-native.node",
+    ] {
         for path in find_native_modules(home_dir, name) {
             native_modules.push(NativeModule {
                 name: name.to_string(),
@@ -586,6 +591,16 @@ fn tool_lines(tools: &[ToolInfo], wsl: bool, home: &Path) -> (Vec<String>, bool)
     let lines = tools
         .iter()
         .map(|tool| {
+            // A mise shim canonicalizes to mise itself, which is not where
+            // the tool lives; resolving the real one would mean running mise.
+            if tool.name != "mise" && tool.path.file_name().is_some_and(|f| f == "mise") {
+                return format!(
+                    "  {}\u{2713}{} {}: via mise",
+                    ui::stdout_color(ui::GREEN),
+                    ui::stdout_color(ui::RESET),
+                    tool.name,
+                );
+            }
             if !crate::agent::is_wsl_interop_binary(&tool.path, wsl) {
                 return format!(
                     "  {}\u{2713}{} {}: {}",
@@ -624,8 +639,11 @@ fn tool_lines(tools: &[ToolInfo], wsl: bool, home: &Path) -> (Vec<String>, bool)
 impl Discovery {
     /// Print the full inventory (`cplt doctor --verbose`). Returns true if
     /// nothing it prints is a hard failure; the verdict itself is doctor's.
-    pub fn print_report(&self, home: &Path) -> bool {
+    pub fn print_report(&self, home: &Path, agent: crate::agent::Agent) -> bool {
         let mut critical_ok = true;
+        // The token variables, gh login and keytar are how Copilot signs in;
+        // for any other agent they are noise dressed as warnings.
+        let copilot = agent == crate::agent::Agent::Copilot;
 
         // Auth section
         println!(
@@ -636,10 +654,12 @@ impl Discovery {
             ui::stdout_color(ui::BOLD),
             ui::stdout_color(ui::RESET)
         );
-        if self.auth.env_tokens.is_empty() {
+        if !copilot {
+            // Nothing Copilot-specific to show.
+        } else if self.auth.env_tokens.is_empty() {
             println!(
-                "  {}⚠{} No env token set (COPILOT_GITHUB_TOKEN, GH_TOKEN, GITHUB_TOKEN)",
-                ui::stdout_color(ui::YELLOW),
+                "  {}ℹ{} No env token set (COPILOT_GITHUB_TOKEN, GH_TOKEN, GITHUB_TOKEN)",
+                ui::stdout_color(ui::BLUE),
                 ui::stdout_color(ui::RESET)
             );
         } else {
@@ -651,7 +671,8 @@ impl Discovery {
                 );
             }
         }
-        if self.auth.gh_cli_auth {
+        if !copilot {
+        } else if self.auth.gh_cli_auth {
             println!(
                 "  {}✓{} gh CLI: authenticated (gh auth token succeeds)",
                 ui::stdout_color(ui::GREEN),
@@ -671,20 +692,16 @@ impl Discovery {
             );
         }
         print_keychain_status(self.auth.security_cli_exists);
-        if self.auth.keytar_nodes.is_empty() {
+        // Current Copilot builds sign in without keytar, so its absence is
+        // not a problem; its presence is only a hint at an older install.
+        if copilot && !self.auth.keytar_nodes.is_empty() {
             println!(
-                "  {}⚠{} keytar.node: not found in ~/.copilot/pkg/",
-                ui::stdout_color(ui::YELLOW),
-                ui::stdout_color(ui::RESET)
-            );
-        } else {
-            println!(
-                "  {}✓{} keytar.node: found in ~/.copilot/pkg/",
+                "  {}✓{} keytar.node: found (an older Copilot's keyring module)",
                 ui::stdout_color(ui::GREEN),
                 ui::stdout_color(ui::RESET)
             );
         }
-        if !self.auth.any_auth_available() {
+        if copilot && !self.auth.any_auth_available() {
             println!(
                 "  {}✗{} No auth mechanism available, Copilot will fail to authenticate",
                 ui::stdout_color(ui::RED),
@@ -1689,16 +1706,40 @@ fn which_resolved(name: &str) -> Option<PathBuf> {
     Some(std::fs::canonicalize(&path).unwrap_or(path))
 }
 
-/// Find native `.node` modules matching a name in `~/.copilot/pkg/`.
+/// Find native `.node` modules matching a name in Copilot's package dirs:
+/// the old `~/.copilot/pkg/universal/<ver>/prebuilds/<platform>/` and, since
+/// the 1.0.9x builds from npm and Homebrew,
+/// `<pkg>/<platform>/<ver>/prebuilds/<platform>/`, with `<pkg>` resolved as
+/// the launch resolves it ([`crate::sandbox::copilot_pkg_dir`]).
 fn find_native_modules(home_dir: &Path, module_name: &str) -> Vec<PathBuf> {
-    let pkg_dir = home_dir.join(".copilot/pkg/universal");
-    let Ok(entries) = std::fs::read_dir(&pkg_dir) else {
-        return Vec::new();
+    let mut version_dirs: Vec<PathBuf> = Vec::new();
+    let read = |d: &Path| -> Vec<PathBuf> {
+        std::fs::read_dir(d)
+            .map(|e| e.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default()
     };
+    version_dirs.extend(read(&home_dir.join(".copilot/pkg/universal")));
+    // The launch's own resolver, so `COPILOT_PKG_CACHE_HOME`,
+    // `COPILOT_CACHE_HOME` and `XDG_CACHE_HOME` count as they do for Copilot.
+    // The default is scanned as well: Copilot's loader still looks there for a
+    // newer runtime when a cache variable moves the cache.
+    let os = std::env::consts::OS;
+    let default = crate::sandbox::copilot_default_pkg_dir(home_dir, os);
+    let mut pkg_dirs = vec![default.clone()];
+    if let Ok(moved) = crate::sandbox::copilot_pkg_dir(&|n: &str| std::env::var_os(n), home_dir, os)
+        && moved != default
+    {
+        pkg_dirs.push(moved);
+    }
+    for pkg in pkg_dirs {
+        for platform in read(&pkg) {
+            version_dirs.extend(read(&platform));
+        }
+    }
 
     let mut results = Vec::new();
-    for entry in entries.flatten() {
-        let prebuilds = entry.path().join("prebuilds");
+    for entry in version_dirs {
+        let prebuilds = entry.join("prebuilds");
         if !prebuilds.exists() {
             continue;
         }
@@ -2560,6 +2601,44 @@ mod wsl_tool_report_tests {
             "the line must name the offending path, without the Windows user, got: {}",
             lines[0]
         );
+    }
+
+    /// A mise shim canonicalizes to mise itself; printing that as the tool's
+    /// path was wrong for every mise-managed tool.
+    #[test]
+    fn mise_shim_is_reported_as_via_mise() {
+        let tools = vec![
+            tool("node", "/opt/homebrew/Cellar/mise/1/bin/mise"),
+            tool("mise", "/opt/homebrew/Cellar/mise/1/bin/mise"),
+        ];
+        let (lines, ok) = tool_lines(&tools, false, Path::new("/home/u"));
+        assert!(ok);
+        assert!(lines[0].ends_with("node: via mise"), "{}", lines[0]);
+        assert!(lines[1].contains("mise: /opt/homebrew"), "{}", lines[1]);
+    }
+
+    /// Copilot 1.0.9x keeps its native code in the user cache, not in
+    /// `~/.copilot/pkg`; both layouts must be found.
+    #[test]
+    fn native_modules_are_found_in_both_layouts() {
+        let home = tempfile::tempdir().unwrap();
+        let old = home
+            .path()
+            .join(".copilot/pkg/universal/1.0.20/prebuilds/darwin-arm64");
+        // The default cache under this temp home, so the test neither reads
+        // nor writes the real cache when a cache variable is set on the host.
+        let new = crate::sandbox::copilot_default_pkg_dir(home.path(), std::env::consts::OS)
+            .join("p-arch/1.0.94-5/prebuilds/p-arch");
+        for d in [&old, &new] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("keytar.node"), "").unwrap();
+        }
+        let found = find_native_modules(home.path(), "keytar.node");
+        let ours: Vec<_> = found
+            .iter()
+            .filter(|p| p.starts_with(home.path()))
+            .collect();
+        assert_eq!(ours.len(), 2, "{found:?}");
     }
 
     /// A non-critical tool is only warned about — it is not a broken install.

@@ -731,11 +731,17 @@ mod e2e_tests {
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         assert!(
-            stdout.contains("── inventory ──")
+            stdout.contains("── inventory (absolute paths: not paste-safe) ──")
                 && stdout.contains("[doctor]")
                 && stdout.contains("Tools")
                 && stdout.contains("git"),
             "--verbose appends the old inventory (Tools section with git).\nstdout: {stdout}"
+        );
+        // The token-variable, gh-login and keytar lines are how Copilot signs
+        // in; for any other agent they are noise.
+        assert!(
+            !stdout.contains("No env token set") && !stdout.contains("gh CLI:"),
+            "Copilot-only auth lines shown for the shell.\nstdout: {stdout}"
         );
         // --verbose is what gets attached to bug reports: paste-safe too.
         let home = std::env::var("HOME").expect("HOME");
