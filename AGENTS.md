@@ -41,6 +41,9 @@ mise run check:all-targets # cargo check every release target, to catch breakage
                            # non-native targets (requires user setup)
 ```
 
+On a Mac where Little Snitch only allows the Homebrew `cplt`, run `hack/dev-proxy.sh` and pass
+`--with-proxy --proxy-upstream http://127.0.0.1:18443` to the dev build to give it network access.
+
 ## Code style
 
 - Rust 2024 edition, stable toolchain
