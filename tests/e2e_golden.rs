@@ -1574,9 +1574,17 @@ fn golden_doctor_reports_launch_refusals_and_ignored_repo_keys() {
     std::fs::create_dir_all(state.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink(repo.path(), &state).unwrap();
 
-    let (out, err, status) = launch(&home, repo.path(), &["--agent", "shell", "doctor"]);
+    // On Linux the state dir follows XDG_CONFIG_HOME, which a CI runner may
+    // set: drop it so the dir is the one under the scratch HOME.
+    let output = common::cplt_local(&home, repo.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .args(["--agent", "shell", "doctor"])
+        .output()
+        .expect("cplt should run");
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
     assert!(
-        !status.success(),
+        !output.status.success(),
         "a refused launch is a blocking finding:\n{out}{err}"
     );
     for want in [
