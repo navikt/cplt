@@ -723,6 +723,150 @@ pub fn pts_grant_finding(
     ))
 }
 
+// ── Mid-session degradations ──────────────────────────────────
+
+/// `scratch_dir` off. TMPDIR then stays the system temp dir, where the
+/// sandbox denies exec unless `allow_tmp_exec`, and the git and gh guard
+/// shims are never installed: they live in the scratch dir
+/// (`redirect_to_guard_shim` in `main.rs`).
+#[must_use]
+pub fn scratch_off_finding(scratch_dir: bool, guards_on: bool, tmp_exec: bool) -> Option<Finding> {
+    if scratch_dir {
+        return None;
+    }
+    let mut lost = Vec::new();
+    if !tmp_exec {
+        lost.push(
+            "TMPDIR stays the system temp dir, where the sandbox denies exec, so `go test`, \
+             node-gyp and other builds that run binaries from it fail with `Operation not \
+             permitted`",
+        );
+    }
+    if guards_on {
+        lost.push(
+            "the git and gh guards are not installed, so the guard verdicts above do not apply",
+        );
+    }
+    if lost.is_empty() {
+        return None;
+    }
+    Some(Finding::warning(
+        format!("scratch_dir is off: {}.", lost.join("; ")),
+        Some("cplt config set sandbox.scratch_dir true (or drop --no-scratch-dir)".to_string()),
+    ))
+}
+
+/// `quiet` on macOS, where the git guard strips `-u` from a push because
+/// `.git/config` is read-only: the parent records the upstream after the
+/// session only when not quiet (`cplt::upstream::apply` in `main.rs`).
+#[must_use]
+pub fn quiet_upstream_finding(
+    macos: bool,
+    quiet: bool,
+    git_guard_on: bool,
+    scratch_dir: bool,
+) -> Option<Finding> {
+    (macos && quiet && git_guard_on && scratch_dir).then(|| {
+        Finding::warning(
+            "quiet is on, so cplt does not record the upstream after `git push -u` in the \
+             sandbox (.git/config is read-only there): later pushes need the branch named.",
+            Some(
+                "cplt config set sandbox.quiet false, or run `git branch -u origin/<branch>` \
+                 outside the sandbox"
+                    .to_string(),
+            ),
+        )
+    })
+}
+
+/// Whether `version` (as `--version` printed it, e.g. `1.0.94-5`) is at
+/// least `min`. Unparseable is false.
+fn version_at_least(version: &str, min: (u32, u32, u32)) -> bool {
+    let core = version.trim().trim_start_matches('v');
+    let mut parts = core
+        .split(|c: char| !c.is_ascii_digit())
+        .map(str::parse::<u32>);
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(Ok(a)), Some(Ok(b)), Some(Ok(c))) => (a, b, c) >= min,
+        _ => false,
+    }
+}
+
+/// `sandbox.enabled` in Copilot's `~/.copilot/settings.json`. Off by
+/// default in Copilot, and off here when the file is missing or unreadable.
+#[must_use]
+pub fn copilot_own_sandbox_enabled(home: &Path) -> bool {
+    crate::agent::read_small_regular_file(&home.join(".copilot/settings.json"))
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| {
+            v.pointer("/sandbox/enabled")
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+
+/// Copilot CLI 1.0.83+ has a command sandbox of its own, which cannot start
+/// inside cplt's. cplt turns it off for the session
+/// (`copilot_sandbox_support_overridden`), unless the user passes the
+/// override variable through. Only reported when the user turned it on.
+#[must_use]
+pub fn copilot_own_sandbox_finding(
+    agent: Agent,
+    version: Option<&str>,
+    enabled: bool,
+    handed_back: bool,
+) -> Option<Finding> {
+    if agent != Agent::Copilot
+        || !enabled
+        || !version.is_some_and(|v| version_at_least(v, (1, 0, 83)))
+    {
+        return None;
+    }
+    Some(if handed_back {
+        Finding::warning(
+            "COPILOT_CLI_SANDBOX_SUPPORT_OVERRIDE is passed through, so Copilot tries to start \
+             its own command sandbox inside cplt's, where it cannot: seccomp denies the \
+             namespaces it needs on Linux, and macOS refuses a nested sandbox-exec.",
+            Some("drop COPILOT_CLI_SANDBOX_SUPPORT_OVERRIDE from sandbox.pass_env".to_string()),
+        )
+    } else {
+        Finding::warning(
+            "Copilot's own command sandbox is on in ~/.copilot/settings.json, but cplt turns \
+             it off for the session because it cannot start inside cplt's: shell commands run \
+             with cplt as the only boundary.",
+            Some(
+                "nothing to change; see known-impacts.md, \"Copilot CLI's own command sandbox\""
+                    .to_string(),
+            ),
+        )
+    })
+}
+
+/// Linux: Copilot keeps its login in the Secret Service, reached over D-Bus,
+/// which the sandbox masks (#600). Only when the host has a session bus (so a
+/// keyring login is plausible) and no token reaches Copilot another way.
+#[must_use]
+pub fn linux_keyring_finding(
+    agent: Agent,
+    linux: bool,
+    session_bus: bool,
+    env_token: bool,
+    inject_token: bool,
+) -> Option<Finding> {
+    (linux && agent == Agent::Copilot && session_bus && !env_token && !inject_token).then(|| {
+        Finding::warning(
+            "Copilot keeps its login in the system keyring, which the sandbox cannot reach \
+             (D-Bus is masked): inside cplt it asks you to sign in again, or to store the \
+             token in plain text.",
+            Some(
+                "export COPILOT_GITHUB_TOKEN, or run `gh auth login` on the host and \
+                 `cplt config set gh_guard.inject_token true --force` (needs gh_guard.enabled)"
+                    .to_string(),
+            ),
+        )
+    })
+}
+
 // ── Rendering ──────────────────────────────────────────────────
 
 /// The findings block plus the summary line. `ok` is the one-line "what is
@@ -1510,6 +1654,80 @@ mod tests {
         assert!(f.is_none());
         let (_, auth, _) = auth_report(&decision(Agent::Shell, false), Path::new("/home/u"));
         assert_eq!(auth, "none (the shell needs no login)");
+    }
+
+    #[test]
+    fn scratch_off_names_what_is_lost() {
+        assert!(scratch_off_finding(true, true, false).is_none());
+        let f = scratch_off_finding(false, true, false).unwrap();
+        assert!(f.message.contains("denies exec"), "{}", f.message);
+        assert!(
+            f.message.contains("guards are not installed"),
+            "{}",
+            f.message
+        );
+        let f = scratch_off_finding(false, false, false).unwrap();
+        assert!(!f.message.contains("guards"), "{}", f.message);
+        let f = scratch_off_finding(false, true, true).unwrap();
+        assert!(!f.message.contains("denies exec"), "{}", f.message);
+        assert!(scratch_off_finding(false, false, true).is_none());
+    }
+
+    #[test]
+    fn quiet_upstream_only_where_the_upstream_would_be_recorded() {
+        assert!(quiet_upstream_finding(true, true, true, true).is_some());
+        assert!(
+            quiet_upstream_finding(false, true, true, true).is_none(),
+            "Linux keeps -u"
+        );
+        assert!(quiet_upstream_finding(true, false, true, true).is_none());
+        assert!(quiet_upstream_finding(true, true, false, true).is_none());
+        assert!(quiet_upstream_finding(true, true, true, false).is_none());
+    }
+
+    #[test]
+    fn version_compare() {
+        assert!(version_at_least("1.0.83", (1, 0, 83)));
+        assert!(version_at_least("1.0.94-5", (1, 0, 83)));
+        assert!(version_at_least("v1.1.0", (1, 0, 83)));
+        assert!(!version_at_least("1.0.82", (1, 0, 83)));
+        assert!(!version_at_least("0.9.100", (1, 0, 83)));
+        assert!(!version_at_least("unknown", (1, 0, 83)));
+    }
+
+    #[test]
+    fn copilot_own_sandbox() {
+        let new = Some("1.0.94");
+        assert!(copilot_own_sandbox_finding(Agent::Copilot, new, false, false).is_none());
+        assert!(copilot_own_sandbox_finding(Agent::Copilot, Some("1.0.82"), true, false).is_none());
+        assert!(copilot_own_sandbox_finding(Agent::Copilot, None, true, false).is_none());
+        assert!(copilot_own_sandbox_finding(Agent::Claude, new, true, false).is_none());
+        let off = copilot_own_sandbox_finding(Agent::Copilot, new, true, false).unwrap();
+        assert!(off.message.contains("turns it off"), "{}", off.message);
+        let back = copilot_own_sandbox_finding(Agent::Copilot, new, true, true).unwrap();
+        assert!(back.message.contains("passed through"), "{}", back.message);
+    }
+
+    #[test]
+    fn copilot_own_sandbox_setting_is_read() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(!copilot_own_sandbox_enabled(home.path()));
+        std::fs::create_dir_all(home.path().join(".copilot")).unwrap();
+        let file = home.path().join(".copilot/settings.json");
+        std::fs::write(&file, r#"{"sandbox":{"enabled":true}}"#).unwrap();
+        assert!(copilot_own_sandbox_enabled(home.path()));
+        std::fs::write(&file, r#"{"sandbox":{"enabled":false}}"#).unwrap();
+        assert!(!copilot_own_sandbox_enabled(home.path()));
+    }
+
+    #[test]
+    fn linux_keyring_only_when_no_token_reaches_copilot() {
+        assert!(linux_keyring_finding(Agent::Copilot, true, true, false, false).is_some());
+        assert!(linux_keyring_finding(Agent::Copilot, false, true, false, false).is_none());
+        assert!(linux_keyring_finding(Agent::Copilot, true, false, false, false).is_none());
+        assert!(linux_keyring_finding(Agent::Copilot, true, true, true, false).is_none());
+        assert!(linux_keyring_finding(Agent::Copilot, true, true, false, true).is_none());
+        assert!(linux_keyring_finding(Agent::Claude, true, true, false, false).is_none());
     }
 
     #[test]
