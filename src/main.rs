@@ -2198,6 +2198,82 @@ fn warn_inject_token_without_guard(resolved: &config::Resolved) {
     }
 }
 
+/// `cplt doctor`'s findings for config keys that are set but do nothing, or
+/// that take the agent's token away. Built from the predicates the launch and
+/// `cplt check` warn from, so the three cannot disagree. Names only, never
+/// values. `gh_token` is [`gh_exec_token_available`].
+fn config_findings(
+    resolved: &config::Resolved,
+    agent: agent::Agent,
+    macos: bool,
+    gh_token: bool,
+) -> Vec<cplt::doctor::Finding> {
+    use cplt::doctor::Finding;
+    let mut out = Vec::new();
+    let inert = inject_token_is_inert(&resolved.gh_guard);
+    if inert {
+        out.push(Finding::warning(
+            "gh_guard.inject_token is set but gh_guard.enabled is false, so no token is injected.",
+            Some(
+                "turn the guard on with `cplt config set gh_guard.enabled true`, or remove the \
+                 key with `cplt config set gh_guard.inject_token --unset`"
+                    .to_string(),
+            ),
+        ));
+    }
+    for note in auth_deprecation_notes(
+        &resolved.gh_guard,
+        &resolved.pass_env,
+        agent,
+        macos,
+        gh_token,
+    ) {
+        let fix = if note.starts_with("gh_guard.inject_token") {
+            if inert {
+                continue;
+            }
+            "cplt config set gh_guard.inject_token --unset".to_string()
+        } else {
+            // "<VAR> passed to <agent>: …"
+            let var = note.split(' ').next().unwrap_or_default();
+            format!(
+                "cplt config set sandbox.pass_env {var} --unset, or remove it from the file \
+                 that sets it"
+            )
+        };
+        out.push(Finding::warning(note, Some(fix)));
+    }
+    if resolved.localhost_any_ignored {
+        out.push(Finding::warning(
+            "allow_localhost_any is set, but proxy.forced overrides it: it opens no localhost \
+             port.",
+            Some(
+                "name the ports with sandbox.allow_localhost (or --allow-localhost <PORT>), or \
+                 turn proxy.forced off"
+                    .to_string(),
+            ),
+        ));
+    }
+    let vars = agent.keychain_substitute_env_vars();
+    if !vars.is_empty()
+        && vars
+            .iter()
+            .all(|v| resolved.deny_env.iter().any(|d| d == v))
+    {
+        out.push(Finding::warning(
+            format!(
+                "deny.env strips every token variable {} can sign in with ({}): no token from \
+                 the environment or the gh login reaches it, so it depends on its own stored \
+                 login.",
+                agent.display_name(),
+                vars.join(", ")
+            ),
+            Some("remove one of them from the [deny] env list in .cplt.toml".to_string()),
+        ));
+    }
+    out
+}
+
 /// Repositories reachable only through an `allow.write` grant, which is
 /// writable and deliberately **not** executable.
 ///
@@ -7625,14 +7701,20 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         layers.push("local (per-repo)".to_string());
     }
     match repo_config::load_repo_config(&project_dir) {
-        Ok(Some(loaded)) => layers.push(format!(
-            "repo .cplt.toml ({})",
-            match loaded.source {
-                repo_config::RepoConfigSource::GitHead => "committed",
-                repo_config::RepoConfigSource::WorkingTree => "working tree, not committed",
-                _ => "unknown source",
-            }
-        )),
+        Ok(Some(loaded)) => {
+            layers.push(format!(
+                "repo .cplt.toml ({})",
+                match loaded.source {
+                    repo_config::RepoConfigSource::GitHead => "committed",
+                    repo_config::RepoConfigSource::WorkingTree => "working tree, not committed",
+                    _ => "unknown source",
+                }
+            ));
+            findings.extend(doctor::global_only_repo_keys_finding(
+                &loaded.config,
+                ".cplt.toml",
+            ));
+        }
         Ok(None) => {}
         Err(_) => layers.push("repo .cplt.toml (unreadable)".to_string()),
     }
@@ -7641,6 +7723,17 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         resolved.preset.map_or("standard (default)", preset_label)
     ));
     println!("config:      {}", layers.join(" · "));
+    // Named repositories' `.cplt.toml` apply too (their `[deny]`), so their
+    // ignored keys count as much as the launch repository's.
+    for root in &repo_roots {
+        if let Ok(Some(loaded)) = repo_config::load_repo_config(&root.dir) {
+            let label = format!("{}/.cplt.toml", tilde(&root.dir));
+            findings.extend(doctor::global_only_repo_keys_finding(
+                &loaded.config,
+                &label,
+            ));
+        }
+    }
     if !unapproved_proposals.is_empty() {
         findings.push(Finding::warning(
             format!(
@@ -7746,6 +7839,25 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         keychain_substitute.clone(),
     );
     let policy = sandbox::generate_policy(&sandbox_config);
+    // The cache-exec and Cypress checks the launch refuses on (#602), from the
+    // same function, reusing this policy rather than generating it again.
+    let launch_grants = match sandbox::launch_grants(&sandbox_config, &policy) {
+        Ok(grants) => grants,
+        Err(e) => {
+            findings.push(Finding::blocking(
+                format!("The launch refuses to start: {e}"),
+                "fix the path the message names, or drop the entry with `cplt config set \
+                 sandbox.allow_cache_exec <SUBDIR> --unset`",
+            ));
+            Vec::new()
+        }
+    };
+    findings.extend(config_findings(
+        &resolved,
+        active_agent,
+        cfg!(target_os = "macos"),
+        gh_exec_token_available(&resolved.deny_env),
+    ));
 
     // ── enforcement: the regime, and why ──
     // After the policy: bubblewrap is probed with the wrapper the launch would
@@ -7754,6 +7866,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         resolved.use_bubblewrap,
         resolved.scratch_dir,
         &sandbox_config,
+        &launch_grants,
     );
     #[cfg(target_os = "macos")]
     {
@@ -13913,6 +14026,83 @@ mod tests {
         assert!(
             inject_token_deprecation_line(&policy(true, true), false, true).is_none(),
             "Linux still needs it"
+        );
+    }
+
+    /// Each doctor config finding fires on its condition and only then, and
+    /// names variables, never values.
+    #[test]
+    fn doctor_config_findings_fire_on_their_condition() {
+        let resolve = |toml: &str| {
+            toml::from_str::<config::Config>(toml)
+                .expect("test config parses")
+                .merge(config::CliFlags::default())
+                .expect("test config merges")
+        };
+        let messages = |r: &config::Resolved, agent, macos, gh_token| -> Vec<String> {
+            config_findings(r, agent, macos, gh_token)
+                .into_iter()
+                .inspect(|f| assert!(f.fix.is_some(), "every finding has a fix: {f:?}"))
+                .map(|f| f.message)
+                .collect()
+        };
+        let none = resolve("");
+        assert!(messages(&none, agent::Agent::Copilot, true, true).is_empty());
+
+        // inject_token with the guard off: inert, on any OS, and not also
+        // reported as deprecated.
+        let inert = resolve("[gh_guard]\ninject_token = true\nenabled = false\n");
+        let m = messages(&inert, agent::Agent::Copilot, true, true);
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert!(m[0].contains("no token is injected"), "{m:?}");
+        assert_eq!(
+            messages(&inert, agent::Agent::Copilot, false, true).len(),
+            1
+        );
+
+        // inject_token with the guard on: deprecated on macOS only.
+        let on = resolve("[gh_guard]\ninject_token = true\nenabled = true\n");
+        let m = messages(&on, agent::Agent::Copilot, true, true);
+        assert!(m.len() == 1 && m[0].contains("deprecated"), "{m:?}");
+        assert!(messages(&on, agent::Agent::Copilot, false, true).is_empty());
+
+        // pass_env naming a token gh no longer needs.
+        let pass = resolve("[sandbox]\npass_env = [\"GH_TOKEN\"]\n");
+        let f = config_findings(&pass, agent::Agent::Claude, false, true);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert!(f[0].message.starts_with("GH_TOKEN passed to"), "{f:?}");
+        assert!(
+            f[0].fix
+                .as_deref()
+                .unwrap()
+                .contains("sandbox.pass_env GH_TOKEN --unset")
+        );
+
+        // allow_localhost_any under proxy.forced, after the launch's reconcile.
+        let mut forced = resolve(
+            "[sandbox]\nallow_localhost_any = true\n[proxy]\nenabled = true\nforced = true\n",
+        );
+        assert!(messages(&forced, agent::Agent::Copilot, true, true).is_empty());
+        assert!(forced.reconcile_proxy_forced());
+        let m = messages(&forced, agent::Agent::Copilot, true, true);
+        assert!(m.len() == 1 && m[0].contains("proxy.forced"), "{m:?}");
+
+        // deny.env (repo-only) stripping every token the agent signs in with.
+        let mut denied = resolve("");
+        denied.deny_env = vec!["GH_TOKEN".into(), "GITHUB_TOKEN".into()];
+        assert!(
+            messages(&denied, agent::Agent::Copilot, true, true).is_empty(),
+            "COPILOT_GITHUB_TOKEN still gets through"
+        );
+        denied.deny_env.push("COPILOT_GITHUB_TOKEN".into());
+        let m = messages(&denied, agent::Agent::Copilot, true, true);
+        assert!(
+            m.len() == 1 && m[0].contains("COPILOT_GITHUB_TOKEN, GH_TOKEN, GITHUB_TOKEN"),
+            "{m:?}"
+        );
+        assert!(
+            messages(&denied, agent::Agent::Shell, true, true).is_empty(),
+            "an agent with no token variable has nothing to lose"
         );
     }
 

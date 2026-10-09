@@ -53,13 +53,21 @@ pub(crate) mod bubblewrap_probe {
     /// back to Landlock + seccomp only — for the session paths `config`
     /// carries. What doctor's config leaves out is listed on
     /// [`crate::doctor::bubblewrap_state`].
-    pub(crate) fn test_launch(config: &super::SandboxConfig) -> Result<(), String> {
-        // The canonical cache-exec and Cypress grants the launch would use. A
-        // config that fails their validation never launches; the probe then
-        // checks the rest with the paths as generated.
-        let mut grants = super::validate_cache_exec_dirs(config).unwrap_or_default();
-        grants.extend(super::prepare_cypress_app_data(config, true).unwrap_or_default());
-        let plan = super::bwrap_plan(config, &super::launch_git_dirs(config), &grants);
+    ///
+    /// `grants` are the canonical cache-exec and Cypress grants from
+    /// [`super::launch_grants`]. Doctor validates them once and reports a
+    /// failure as its own finding (#602); with none, the probe checks the
+    /// rest with the paths as generated.
+    pub(crate) fn test_launch(
+        config: &super::SandboxConfig,
+        grants: &[(std::path::PathBuf, std::path::PathBuf)],
+    ) -> Result<(), String> {
+        let plan = super::bwrap_plan(
+            config,
+            &super::launch_git_dirs(config),
+            grants,
+            &std::cell::OnceCell::new(),
+        );
         super::bubblewrap::build_wrapper(
             &plan.policy,
             super::bubblewrap::Overlays {
@@ -509,9 +517,12 @@ pub fn prepare_with_pnpm_shadow(
     validate_playwright_socket_capability(config.playwright_socket_dir)?;
     validate_hard_denied_grants(config)?;
     validate_pnpm_tool_dirs(config)?;
-    let mut canonical_grants = validate_cache_exec_dirs(config)?;
+    // One policy for every check below and the bubblewrap plan, generated on
+    // first use: generating can warn, and a warning should print once (#602).
+    let base = std::cell::OnceCell::new();
+    let mut canonical_grants = validate_cache_exec_dirs(config, &base)?;
     validate_exec_grants(config)?;
-    canonical_grants.extend(prepare_cypress_app_data(config, inspect_only)?);
+    canonical_grants.extend(prepare_cypress_app_data(config, inspect_only, &base)?);
     validate_copilot_cache_env(config)?;
     if !inspect_only {
         create_default_copilot_pkg_dir(config)?;
@@ -530,7 +541,23 @@ pub fn prepare_with_pnpm_shadow(
         pnpm_shadow_dir,
         inspect_only,
         &canonical_grants,
+        &base,
     )
+}
+
+/// The cache-exec and Cypress grants a launch would make, validated exactly
+/// as `prepare` validates them, without creating anything. `Err` is the error
+/// the launch refuses to start with, which `cplt doctor` reports (#602).
+/// `policy` is the caller's `generate_policy(config)`, reused rather than
+/// generated again.
+pub fn launch_grants(
+    config: &SandboxConfig,
+    policy: &LandlockPolicy,
+) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+    let base = std::cell::OnceCell::from(policy.clone());
+    let mut grants = validate_cache_exec_dirs(config, &base)?;
+    grants.extend(prepare_cypress_app_data(config, true, &base)?);
+    Ok(grants)
 }
 
 /// The gitdirs a launch protects beyond the project's own.
@@ -621,7 +648,10 @@ fn validate_pnpm_tool_dirs(config: &SandboxConfig) -> Result<(), String> {
 /// Returns `(path as generated, canonical path)` for each grant, empty on
 /// macOS. Seatbelt matches the resolved path against rules on the literal
 /// cache path, so there a link grants nothing extra.
-fn validate_cache_exec_dirs(config: &SandboxConfig) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+fn validate_cache_exec_dirs(
+    config: &SandboxConfig,
+    base: &std::cell::OnceCell<LandlockPolicy>,
+) -> Result<Vec<(PathBuf, PathBuf)>, String> {
     for subdir in config.allow_cache_exec {
         if !policy::cache_exec_subdir_is_safe(subdir) {
             return Err(format!(
@@ -642,8 +672,12 @@ fn validate_cache_exec_dirs(config: &SandboxConfig) -> Result<Vec<(PathBuf, Path
         .join(".cache");
     let actual_base = crate::config::canonicalize_deepest(&cache_base);
     // The other rules the policy grants, for the overlap check. Generated at
-    // most once: generating warns, and one warning per linked entry is noise.
-    let mut rules: Option<Vec<landlock_mod::FsRule>> = None;
+    // most once (`base`): generating warns, and one warning per use is noise.
+    let rules = || {
+        &base
+            .get_or_init(|| landlock_mod::generate_policy(config))
+            .fs_rules
+    };
     if actual_base != resolved_base {
         if config.refuse_cache_exec_links {
             return Err(format!(
@@ -655,8 +689,7 @@ fn validate_cache_exec_dirs(config: &SandboxConfig) -> Result<Vec<(PathBuf, Path
                 actual_base.display()
             ));
         }
-        let rules = rules.get_or_insert_with(|| landlock_mod::generate_policy(config).fs_rules);
-        if let Some(why) = cache_exec_target_refusal(config, rules, &actual_base, &actual_base) {
+        if let Some(why) = cache_exec_target_refusal(config, rules(), &actual_base, &actual_base) {
             return Err(format!(
                 "Cache-exec root {} resolves through a symlink to {}, and cplt will not grant \
                  write and execute there: {why}. Point ~/.cache at a dedicated directory, or \
@@ -681,8 +714,7 @@ fn validate_cache_exec_dirs(config: &SandboxConfig) -> Result<Vec<(PathBuf, Path
                     resolved.display()
                 ));
             }
-            let rules = rules.get_or_insert_with(|| landlock_mod::generate_policy(config).fs_rules);
-            if let Some(why) = cache_exec_target_refusal(config, rules, &resolved, &actual_base) {
+            if let Some(why) = cache_exec_target_refusal(config, rules(), &resolved, &actual_base) {
                 return Err(format!(
                     "allow_cache_exec path {} resolves through a symlink to {}, and cplt will \
                      not grant write and execute there: {why}. The link sits inside ~/.cache, \
@@ -846,6 +878,7 @@ fn cache_exec_target_refusal(
 fn prepare_cypress_app_data(
     config: &SandboxConfig,
     inspect_only: bool,
+    base: &std::cell::OnceCell<LandlockPolicy>,
 ) -> Result<Option<(PathBuf, PathBuf)>, String> {
     if !policy::cypress_runtime_intent(config.allow_cache_exec, config.allow_cache_exec_any) {
         return Ok(None);
@@ -886,11 +919,12 @@ fn prepare_cypress_app_data(
         }
     }
 
-    let mut executable: Vec<PathBuf> = landlock_mod::generate_policy(config)
+    let mut executable: Vec<PathBuf> = base
+        .get_or_init(|| landlock_mod::generate_policy(config))
         .fs_rules
-        .into_iter()
+        .iter()
         .filter(|rule| rule.access.execute)
-        .map(|rule| rule.path)
+        .map(|rule| rule.path.clone())
         .collect();
     executable.extend(config.electron_app_dir.map(Path::to_path_buf));
 
@@ -2004,6 +2038,7 @@ fn prepare_impl(
     pnpm_shadow_dir: Option<&Path>,
     _inspect_only: bool,
     _canonical_grants: &[(PathBuf, PathBuf)],
+    _base: &std::cell::OnceCell<LandlockPolicy>,
 ) -> Result<PreparedSandbox, String> {
     validate_config_paths(config)?;
     // Interpolated into the profile like every other path — same injection check.
@@ -2383,8 +2418,11 @@ fn bwrap_plan(
     config: &SandboxConfig,
     extra_git_dirs: &[PathBuf],
     canonical_grants: &[(PathBuf, PathBuf)],
+    base: &std::cell::OnceCell<LandlockPolicy>,
 ) -> BwrapPlan {
-    let mut policy = landlock_mod::generate_policy(config);
+    let mut policy = base
+        .get_or_init(|| landlock_mod::generate_policy(config))
+        .clone();
     // The cache-exec and Cypress state rules name the canonical paths
     // validation checked, and are opened without following any symlink.
     // A cache-exec entry whose link sits inside `~/.cache` is never
@@ -2555,6 +2593,7 @@ fn prepare_impl(
     pnpm_shadow_dir: Option<&Path>,
     inspect_only: bool,
     canonical_grants: &[(PathBuf, PathBuf)],
+    base: &std::cell::OnceCell<LandlockPolicy>,
 ) -> Result<PreparedSandbox, String> {
     // Warn about config options that Linux cannot enforce at kernel level.
     // (Deny paths are handled after bwrap resolution below — with Bubblewrap
@@ -2646,7 +2685,7 @@ fn prepare_impl(
         if !inspect_only {
             seed_claude_settings(config);
         }
-        bwrap_plan(config, extra_git_dirs, canonical_grants)
+        bwrap_plan(config, extra_git_dirs, canonical_grants, base)
     };
     let mut profile_text = landlock_mod::describe_policy(&policy);
     // Rebuilt below if the hook grants are dropped on a Landlock-only host.
@@ -3856,6 +3895,9 @@ mod tests {
         };
         assert!(error.contains("resolves through a symlink"), "{error}");
         assert!(error.contains(&project.display().to_string()), "{error}");
+        // `cplt doctor` reports the launch's own refusal, word for word (#602).
+        let policy = landlock_mod::generate_policy(&config);
+        assert_eq!(launch_grants(&config, &policy), Err(error));
     }
 
     #[test]
@@ -4183,7 +4225,7 @@ mod tests {
         config.extra_deny = &deny;
 
         assert!(
-            crate::doctor::bubblewrap_state(None, false, &config).active(),
+            crate::doctor::bubblewrap_state(None, false, &config, &[]).active(),
             "control: bwrap must work here for this test to mean anything"
         );
         bubblewrap::FAIL_PROBE_ON.set(Some(secret.to_string_lossy().into_owned()));
@@ -4193,7 +4235,7 @@ mod tests {
             bubblewrap::Overlays::default(),
             &bubblewrap::DenyMasks::default(),
         );
-        let state = crate::doctor::bubblewrap_state(None, false, &config);
+        let state = crate::doctor::bubblewrap_state(None, false, &config, &[]);
         let launch = prepare(&config).expect("prepare");
         bubblewrap::FAIL_PROBE_ON.set(None);
 
@@ -4233,8 +4275,8 @@ mod tests {
         config.extra_deny = &deny;
 
         bubblewrap::FAIL_PROBE_ON.set(Some(secret.to_string_lossy().into_owned()));
-        let no_scratch = crate::doctor::bubblewrap_state(None, false, &config);
-        let state = crate::doctor::bubblewrap_state(None, true, &config);
+        let no_scratch = crate::doctor::bubblewrap_state(None, false, &config, &[]);
+        let state = crate::doctor::bubblewrap_state(None, true, &config, &[]);
         bubblewrap::FAIL_PROBE_ON.set(None);
 
         assert!(

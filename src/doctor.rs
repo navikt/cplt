@@ -355,12 +355,16 @@ impl Bubblewrap {
 /// directory under `~/.cplt-pnpm-shadow` and grants it read+execute; doctor
 /// will not copy files for a diagnosis), and, if the scratch dir cannot be
 /// created here, the scratch bind and file masks.
+///
+/// `grants` come from [`crate::sandbox::launch_grants`], validated once by the
+/// caller, which reports a failure as its own finding (#602).
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn bubblewrap_state(
     use_bubblewrap: Option<bool>,
     scratch: bool,
     config: &crate::sandbox::SandboxConfig,
+    grants: &[(PathBuf, PathBuf)],
 ) -> Bubblewrap {
     use crate::sandbox::bubblewrap_probe;
     if use_bubblewrap == Some(false) {
@@ -377,7 +381,7 @@ pub fn bubblewrap_state(
             .or_else(|| probe_scratch.as_ref().and_then(ProbeScratch::path)),
         ..config.clone()
     };
-    match bubblewrap_probe::test_launch(&probed) {
+    match bubblewrap_probe::test_launch(&probed, grants) {
         Ok(()) => Bubblewrap::Usable(path),
         Err(reason) => Bubblewrap::Unusable {
             path,
@@ -432,6 +436,7 @@ pub fn bubblewrap_state(
     _use_bubblewrap: Option<bool>,
     _scratch: bool,
     _config: &crate::sandbox::SandboxConfig,
+    _grants: &[(PathBuf, PathBuf)],
 ) -> Bubblewrap {
     Bubblewrap::NotApplicable
 }
@@ -491,6 +496,48 @@ pub fn bubblewrap_finding(state: &Bubblewrap, use_bubblewrap: Option<bool>) -> O
 /// How to enable the user namespaces bubblewrap needs; also in the OpenCode v2 refusal.
 pub const USERNS_HINT: &str = "enable user namespaces (sysctl kernel.unprivileged_userns_clone=1; on \
      Ubuntu 23.10+ kernel.apparmor_restrict_unprivileged_userns blocks them)";
+
+// ── Rule: global-only keys in .cplt.toml ───────────────────────
+
+/// Tables a `.cplt.toml` cannot carry. Its schema has only `[deny]` and
+/// `[propose]`, so the loader files these under unknown keys and the launch
+/// ignores them (#484), with a warning that blames a newer cplt.
+const GLOBAL_ONLY_TABLES: &[&str] = &["sandbox", "proxy", "gh_guard", "git_guard"];
+
+/// `[sandbox]`, `[proxy]`, `[gh_guard]` or `[git_guard]` keys in `.cplt.toml`:
+/// the launch ignores every one, so the setting the author wrote is not in
+/// force. Key names only. `label` names the file, for a named repository's.
+#[must_use]
+pub fn global_only_repo_keys_finding(
+    repo: &crate::repo_config::RepoConfig,
+    label: &str,
+) -> Option<Finding> {
+    let keys: Vec<String> = repo
+        .unknown
+        .iter()
+        .filter(|(table, _)| GLOBAL_ONLY_TABLES.contains(&table.as_str()))
+        .flat_map(|(table, value)| match value.as_table() {
+            Some(t) if !t.is_empty() => t.keys().map(|k| format!("{table}.{k}")).collect(),
+            _ => vec![table.clone()],
+        })
+        .collect();
+    if keys.is_empty() {
+        return None;
+    }
+    Some(Finding::warning(
+        format!(
+            "{label} sets {}, which a repository cannot set: the launch ignores {}.",
+            keys.join(", "),
+            if keys.len() == 1 { "it" } else { "them" }
+        ),
+        Some(
+            "set it in your own config (`cplt config set <key> <value>`, or add --local for \
+             this repository only); a permission the repository needs goes under [propose] \
+             (`cplt config set --repo <key> true`)"
+                .to_string(),
+        ),
+    ))
+}
 
 // ── Rule: a project on a Windows drive under WSL ───────────────
 
@@ -1486,5 +1533,42 @@ mod tests {
         assert!(line.contains("git_guard off"), "{line}");
         assert!(line.contains("allow_cache_exec ms-playwright"), "{line}");
         assert!(settings_line(&r, Agent::Pi, true).contains("keychain_substitute off"));
+    }
+
+    #[test]
+    fn global_only_repo_keys_are_named_and_proposals_are_not() {
+        let parse = |t: &str| toml::from_str::<crate::repo_config::RepoConfig>(t).unwrap();
+        assert!(
+            global_only_repo_keys_finding(
+                &parse("[propose]\nallow_docker = true\n[deny]\nenv = [\"X\"]\n"),
+                ".cplt.toml"
+            )
+            .is_none()
+        );
+        let f = global_only_repo_keys_finding(
+            &parse(
+                "[sandbox]\nquiet = true\nallow_cache_exec = [\"x\"]\n[gh_guard]\nenabled = false\n\
+             [proxy]\nport = 1\n[git_guard]\nmode = \"off\"\n[future]\nx = 1\n",
+            ),
+            "~/src/other/.cplt.toml",
+        )
+        .expect("global-only keys must be reported");
+        assert_eq!(f.level, Level::Warning);
+        assert!(f.fix.is_some());
+        assert!(
+            f.message.starts_with("~/src/other/.cplt.toml sets "),
+            "{}",
+            f.message
+        );
+        for key in [
+            "sandbox.quiet",
+            "sandbox.allow_cache_exec",
+            "gh_guard.enabled",
+            "proxy.port",
+            "git_guard.mode",
+        ] {
+            assert!(f.message.contains(key), "{key} missing: {}", f.message);
+        }
+        assert!(!f.message.contains("future"), "{}", f.message);
     }
 }

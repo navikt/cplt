@@ -952,6 +952,7 @@ mod tests {
             allow_localhost: Vec::new(),
             allow_domains: Vec::new(),
             allow_localhost_any: false,
+            localhost_any_ignored: false,
             allow_env_files: false,
             no_validate: false,
             brief: true,

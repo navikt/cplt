@@ -666,6 +666,7 @@ impl Config {
             allow_localhost,
             allow_domains,
             allow_localhost_any,
+            localhost_any_ignored: false,
             allow_env_files,
             no_validate,
             brief,
@@ -933,6 +934,7 @@ impl Resolved {
     pub fn reconcile_proxy_forced(&mut self) -> bool {
         if self.proxy_forced && self.allow_localhost_any {
             self.allow_localhost_any = false;
+            self.localhost_any_ignored = true;
             return true;
         }
         false
