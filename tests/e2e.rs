@@ -635,7 +635,7 @@ mod e2e_tests {
             "the settings line reports the user's quiet, not doctor's own.\nstdout: {stdout}"
         );
         assert!(
-            stdout.contains("auth:        Shell's own login"),
+            stdout.contains("auth:        none (the shell needs no login)"),
             "the auth line is per agent.\nstdout: {stdout}"
         );
         assert!(

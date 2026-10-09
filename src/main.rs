@@ -7845,8 +7845,14 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         doctor::settings_line(&resolved, active_agent, configured_quiet)
     );
     let macos = cfg!(target_os = "macos");
-    let env_token = active_agent
-        .keychain_substitute_env_vars()
+    // Copilot's token variables are in ENV_ALLOWLIST; Claude's reaches the
+    // agent only through the Keychain trade, which `keychain_substitute` covers.
+    let token_vars: &[&str] = if active_agent == agent::Agent::Copilot {
+        active_agent.keychain_substitute_env_vars()
+    } else {
+        &[]
+    };
+    let env_token = token_vars
         .iter()
         .copied()
         .filter(|v| !resolved.deny_env.iter().any(|d| d == v))

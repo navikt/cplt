@@ -789,8 +789,9 @@ pub fn settings_line(r: &crate::config::Resolved, agent: Agent, quiet: bool) -> 
 }
 
 /// Closes the header: what to paste, and what not to.
-pub const PASTE_HINT: &str = "Paste this default output into an issue: it shows paths as ~/… and \
-     token names only. `--verbose` adds absolute paths and is not paste-safe.";
+pub const PASTE_HINT: &str = "Paste this default output into an issue: paths under your home show \
+     as ~/… and tokens by name only; check any other path before you post. `--verbose` adds \
+     absolute paths and is not paste-safe.";
 
 /// The launch's Keychain/token decision, as doctor reports it.
 pub struct AuthDecision<'a> {
@@ -806,7 +807,8 @@ pub struct AuthDecision<'a> {
     pub env_token: Option<&'a str>,
     /// `gh auth token` succeeds on the host.
     pub gh_login: bool,
-    /// Some other stored login exists (Copilot's keytar module).
+    /// Copilot's keytar module is installed. Whether it holds a login is not
+    /// checked; kept so a Linux keytar user gets no false blocking finding.
     pub other_login: bool,
 }
 
@@ -832,8 +834,12 @@ pub fn auth_report(d: &AuthDecision<'_>, home: &Path) -> (Option<String>, String
             Some(v) => format!("{v} (exported)"),
             None if d.macos && d.agent.needs_keychain() => format!("{name}'s own login (Keychain)"),
             None if d.agent == Agent::Copilot && d.gh_login => "gh login".to_string(),
-            None if d.agent == Agent::Copilot && !d.other_login => "none".to_string(),
-            None => format!("{name}'s own login"),
+            None if d.agent == Agent::Copilot && d.other_login => {
+                "not checked (Copilot's keytar module is installed)".to_string()
+            }
+            None if d.agent == Agent::Copilot => "none".to_string(),
+            None if d.agent == Agent::Shell => "none (the shell needs no login)".to_string(),
+            None => format!("left to {name}: cplt hands over no token"),
         },
     };
     let finding = match d.substitute {
@@ -1455,6 +1461,8 @@ mod tests {
         let (_, auth, f) = auth_report(&d, Path::new("/home/u"));
         assert_eq!(auth, "gh login");
         assert!(f.is_none());
+        let (_, auth, _) = auth_report(&decision(Agent::Shell, false), Path::new("/home/u"));
+        assert_eq!(auth, "none (the shell needs no login)");
     }
 
     #[test]
