@@ -12,7 +12,7 @@
 //! answer from fewer inputs than the launch uses (#447). `main.rs` gathers
 //! those inputs and prints; this module decides.
 
-use crate::agent::{Agent, PACKAGE_REGISTRY_DOMAINS};
+use crate::agent::{Agent, KeychainSubstitute, PACKAGE_REGISTRY_DOMAINS};
 use crate::proxy::NetPolicy;
 use crate::sandbox::LandlockPolicy;
 use std::path::{Path, PathBuf};
@@ -750,6 +750,120 @@ pub fn render(findings: &[Finding], ok: &[String], verbose_hint: bool, home: &Pa
     tilde_in_text(&out, home)
 }
 
+/// The effective settings that most often explain a report, on one line.
+/// `quiet` is passed separately: doctor forces the resolved one on.
+#[must_use]
+pub fn settings_line(r: &crate::config::Resolved, agent: Agent, quiet: bool) -> String {
+    let on = |b: bool| if b { "on" } else { "off" };
+    let guard = |enabled: bool, mode: crate::config::EnforcementMode| {
+        if enabled {
+            mode.to_string()
+        } else {
+            "off".to_string()
+        }
+    };
+    let cache = if r.allow_cache_exec_any {
+        "any".to_string()
+    } else if r.allow_cache_exec.is_empty() {
+        "none".to_string()
+    } else {
+        r.allow_cache_exec.join(",")
+    };
+    format!(
+        "keychain_substitute {} ({}) · quiet {} · git_guard {} · gh_guard {} · \
+         allow_cache_exec {cache} · scratch {}",
+        on(crate::sandbox::keychain_substitute_enabled(
+            agent,
+            r.keychain_substitute
+        )),
+        if r.keychain_substitute.is_some() {
+            "config"
+        } else {
+            "default"
+        },
+        on(quiet),
+        guard(r.git_guard.enabled, r.git_guard.mode),
+        guard(r.gh_guard.enabled, r.gh_guard.mode),
+        on(r.scratch_dir),
+    )
+}
+
+/// Closes the header: what to paste, and what not to.
+pub const PASTE_HINT: &str = "Paste this default output into an issue: it shows paths as ~/… and \
+     token names only. `--verbose` adds absolute paths and is not paste-safe.";
+
+/// The launch's Keychain/token decision, as doctor reports it.
+pub struct AuthDecision<'a> {
+    pub agent: Agent,
+    /// What [`crate::sandbox::keychain_substitute`] returned for this launch.
+    pub substitute: Option<&'a KeychainSubstitute>,
+    /// `sandbox.keychain_substitute` as configured; `None` is the default.
+    pub setting: Option<bool>,
+    /// Why the grant stayed, when the launch would say so.
+    pub kept_reason: Option<&'a str>,
+    pub macos: bool,
+    /// The first of the agent's token variables exported and not in `deny.env`.
+    pub env_token: Option<&'a str>,
+    /// `gh auth token` succeeds on the host.
+    pub gh_login: bool,
+    /// Some other stored login exists (Copilot's keytar module).
+    pub other_login: bool,
+}
+
+/// The Keychain grant (macOS agents that use the Keychain only), the
+/// `auth:` line, and a finding when the source can fail with no fallback.
+/// Token names only, never values.
+#[must_use]
+pub fn auth_report(d: &AuthDecision<'_>, home: &Path) -> (Option<String>, String, Option<Finding>) {
+    let keychain =
+        (d.macos && d.agent.needs_keychain()).then(|| match (d.substitute, d.kept_reason) {
+            (Some(_), _) => "denied".to_string(),
+            (None, Some(why)) => format!("granted ({why})"),
+            (None, None) => "granted".to_string(),
+        });
+    let name = d.agent.display_name();
+    let auth = match d.substitute {
+        Some(KeychainSubstitute::EnvVar(v)) => format!("{v} (exported, used as-is)"),
+        Some(KeychainSubstitute::GhToken { var, .. }) => {
+            format!("`gh auth token` (passed as {var})")
+        }
+        Some(KeychainSubstitute::File(p)) => format!("{} (token file)", tilde(p, home)),
+        None => match d.env_token {
+            Some(v) => format!("{v} (exported)"),
+            None if d.macos && d.agent.needs_keychain() => format!("{name}'s own login (Keychain)"),
+            None if d.agent == Agent::Copilot && d.gh_login => "gh login".to_string(),
+            None if d.agent == Agent::Copilot && !d.other_login => "none".to_string(),
+            None => format!("{name}'s own login"),
+        },
+    };
+    let finding = match d.substitute {
+        Some(KeychainSubstitute::EnvVar(v)) if d.agent == Agent::Copilot => Some(Finding::warning(
+            format!(
+                "{v} is exported, so Copilot gets it as-is instead of the Keychain: cplt \
+                 checks no account and has no fallback, so a stale token means a sign-in \
+                 failure."
+            ),
+            Some(format!(
+                "unset {v}, run `gh auth refresh`, or set sandbox.keychain_substitute=false"
+            )),
+        )),
+        None if d.agent == Agent::Copilot
+            && d.env_token.is_none()
+            && !d.gh_login
+            && !d.other_login
+            && !d.macos =>
+        {
+            Some(Finding::blocking(
+                "No auth for Copilot: gh is not logged in and none of COPILOT_GITHUB_TOKEN, \
+                 GH_TOKEN, GITHUB_TOKEN is set.",
+                "gh auth login",
+            ))
+        }
+        _ => None,
+    };
+    (keychain, auth, finding)
+}
+
 /// Exit non-zero iff something is blocking — the contract the old doctor had
 /// for its "critical" checks.
 #[must_use]
@@ -1244,5 +1358,125 @@ mod tests {
         let f = agent_hosts_finding(Agent::Shell, &net(&defaults, true, &blocked))
             .expect("blocked registry under an allowlist");
         assert!(f.message.contains("pypi.org (BLOCKED)"), "{}", f.message);
+    }
+
+    fn decision(agent: Agent, macos: bool) -> AuthDecision<'static> {
+        AuthDecision {
+            agent,
+            substitute: None,
+            setting: None,
+            kept_reason: None,
+            macos,
+            env_token: None,
+            gh_login: false,
+            other_login: false,
+        }
+    }
+
+    #[test]
+    fn auth_exported_copilot_token_warns_and_names_only() {
+        let sub = KeychainSubstitute::EnvVar("GH_TOKEN");
+        let d = AuthDecision {
+            substitute: Some(&sub),
+            env_token: Some("GH_TOKEN"),
+            ..decision(Agent::Copilot, true)
+        };
+        let (kc, auth, f) = auth_report(&d, Path::new("/Users/u"));
+        assert_eq!(kc.as_deref(), Some("denied"));
+        assert_eq!(auth, "GH_TOKEN (exported, used as-is)");
+        let f = f.expect("an exported token used as-is is a warning");
+        assert_eq!(f.level, Level::Warning);
+        assert!(f.fix.unwrap().contains("gh auth refresh"));
+    }
+
+    #[test]
+    fn auth_gh_token_never_prints_the_value() {
+        let sub = KeychainSubstitute::GhToken {
+            var: "GH_TOKEN",
+            token: crate::agent::SecretToken::new("gho_secret".into()),
+        };
+        let d = AuthDecision {
+            substitute: Some(&sub),
+            ..decision(Agent::Copilot, true)
+        };
+        let (kc, auth, f) = auth_report(&d, Path::new("/Users/u"));
+        assert_eq!(kc.as_deref(), Some("denied"));
+        assert_eq!(auth, "`gh auth token` (passed as GH_TOKEN)");
+        assert!(!auth.contains("gho_secret"));
+        assert!(f.is_none());
+    }
+
+    #[test]
+    fn auth_mismatch_reason_shows_on_the_grant() {
+        let d = AuthDecision {
+            kept_reason: Some("gh is a, Copilot is b: kept to avoid switching account"),
+            ..decision(Agent::Copilot, true)
+        };
+        let (kc, _, _) = auth_report(&d, Path::new("/Users/u"));
+        assert_eq!(
+            kc.as_deref(),
+            Some("granted (gh is a, Copilot is b: kept to avoid switching account)")
+        );
+    }
+
+    #[test]
+    fn auth_claude_never_says_gh() {
+        for macos in [true, false] {
+            let d = AuthDecision {
+                gh_login: true,
+                ..decision(Agent::Claude, macos)
+            };
+            let (kc, auth, f) = auth_report(&d, Path::new("/Users/u"));
+            assert!(!auth.contains("gh"), "{auth}");
+            assert_eq!(kc.is_some(), macos);
+            assert!(f.is_none());
+        }
+        let sub = KeychainSubstitute::EnvVar("CLAUDE_CODE_OAUTH_TOKEN");
+        let d = AuthDecision {
+            substitute: Some(&sub),
+            ..decision(Agent::Claude, true)
+        };
+        let (kc, auth, f) = auth_report(&d, Path::new("/Users/u"));
+        assert_eq!(kc.as_deref(), Some("denied"));
+        assert_eq!(auth, "CLAUDE_CODE_OAUTH_TOKEN (exported, used as-is)");
+        assert!(f.is_none(), "the gh advice is Copilot's");
+    }
+
+    #[test]
+    fn auth_copilot_on_linux_without_login_blocks() {
+        let (kc, auth, f) = auth_report(&decision(Agent::Copilot, false), Path::new("/home/u"));
+        assert!(kc.is_none());
+        assert_eq!(auth, "none");
+        assert_eq!(f.unwrap().level, Level::Blocking);
+        let d = AuthDecision {
+            gh_login: true,
+            ..decision(Agent::Copilot, false)
+        };
+        let (_, auth, f) = auth_report(&d, Path::new("/home/u"));
+        assert_eq!(auth, "gh login");
+        assert!(f.is_none());
+    }
+
+    #[test]
+    fn settings_line_reports_effective_values() {
+        use crate::config::{CliFlags, Config};
+        let mut r = Config::default().merge(CliFlags::default()).unwrap();
+        let line = settings_line(&r, Agent::Copilot, false);
+        assert!(
+            line.starts_with("keychain_substitute on (default) · quiet off"),
+            "{line}"
+        );
+        assert!(line.contains("allow_cache_exec none"), "{line}");
+        r.keychain_substitute = Some(false);
+        r.allow_cache_exec = vec!["ms-playwright".into()];
+        r.git_guard.enabled = false;
+        let line = settings_line(&r, Agent::Copilot, true);
+        assert!(
+            line.starts_with("keychain_substitute off (config) · quiet on"),
+            "{line}"
+        );
+        assert!(line.contains("git_guard off"), "{line}");
+        assert!(line.contains("allow_cache_exec ms-playwright"), "{line}");
+        assert!(settings_line(&r, Agent::Pi, true).contains("keychain_substitute off"));
     }
 }

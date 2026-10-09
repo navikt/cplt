@@ -842,6 +842,10 @@ QUICK START:
         /// agents found on PATH, project ecosystems. Absolute paths.
         #[arg(long)]
         verbose: bool,
+
+        /// Same as the global `--agent`, accepted after `doctor` too.
+        #[arg(long, value_name = "AGENT")]
+        agent: Option<String>,
     },
 
     /// Verify & explain sandbox enforcement.
@@ -1814,6 +1818,9 @@ struct ResolvedContext {
     worktree_root: Option<PathBuf>,
     active_agent: agent::Agent,
     unapproved_proposals: Vec<String>,
+    /// `sandbox.quiet` as the user set it. `cplt doctor` forces the resolved
+    /// one on to silence the summary, and reports this one.
+    configured_quiet: bool,
 }
 
 /// The project-grade roots the sandbox policy grants besides the project: the
@@ -2587,6 +2594,10 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         Ok(r) => r,
         Err(e) => bail!("{e}"),
     };
+    let configured_quiet = resolved.quiet;
+    if cli.doctor {
+        resolved.quiet = true;
+    }
 
     // ── Load and apply per-repo config (.cplt.toml) ──────────────
     let mut unapproved_proposals: Vec<String> = Vec::new();
@@ -3149,6 +3160,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         worktree_root,
         active_agent,
         unapproved_proposals,
+        configured_quiet,
     })
 }
 
@@ -4109,10 +4121,12 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // `cplt doctor` borrows &cli through resolve_context, like check above.
     #[allow(clippy::collapsible_if)]
     if matches!(&cli.command, Some(Command::Doctor { .. })) {
-        if let Some(Command::Doctor { verbose }) = cli.command.take() {
-            // Doctor prints its own header; resolve_context's summary lines
-            // and "no agent" default (see `cli.doctor` there) are for it.
-            cli.quiet = true;
+        if let Some(Command::Doctor { verbose, agent }) = cli.command.take() {
+            // Doctor prints its own header; resolve_context silences its
+            // summary lines and "no agent" default (see `cli.doctor` there).
+            if agent.is_some() {
+                cli.agent = agent;
+            }
             cli.doctor = true;
             return Ok(run_doctor(&cli, verbose));
         }
@@ -4233,7 +4247,6 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // DEPRECATED: use `cplt doctor` subcommand instead
     if cli.doctor {
         ui::warn("--doctor is deprecated, use `cplt doctor` instead");
-        cli.quiet = true;
         return Ok(run_doctor(&cli, false));
     }
 
@@ -4248,6 +4261,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         worktree_root,
         active_agent,
         unapproved_proposals,
+        configured_quiet: _,
     } = resolve_context(&cli, false)?;
 
     let repo_paths: Vec<PathBuf> = repo_roots.iter().map(|r| r.dir.clone()).collect();
@@ -6087,6 +6101,7 @@ fn run_exec_command(
         repo_roots,
         worktree_root,
         unapproved_proposals: _,
+        configured_quiet: _,
         // active_agent from resolve_context is ignored — exec always uses Shell
         active_agent: _,
         launch_dir: _,
@@ -6626,6 +6641,7 @@ fn run_check_command(
         worktree_root,
         active_agent,
         unapproved_proposals: _,
+        configured_quiet: _,
         launch_dir: _,
     } = resolve_context(cli, true)?;
     // The named roots, which `ExecContext::for_launch` turns into the gh scope
@@ -7513,6 +7529,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         active_agent,
         unapproved_proposals,
         launch_dir: _,
+        configured_quiet,
     } = ctx;
     // `doctor` reports the policy a launch would build, so it has to carry the
     // same named roots the launch would (#447).
@@ -7604,7 +7621,9 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         None => "user: none".to_string(),
     }];
     if let Some(lp) = config::local_path(&project_dir).filter(|p| p.exists()) {
-        layers.push(format!("local {}", tilde(&lp)));
+        // The file name is a hash of the project path: noise in a report.
+        let _ = lp;
+        layers.push("local (per-repo)".to_string());
     }
     match repo_config::load_repo_config(&project_dir) {
         Ok(Some(loaded)) => layers.push(format!(
@@ -7725,7 +7744,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
             electron_app_dir: doctor_electron_dir.as_deref(),
             ..SessionPaths::default()
         },
-        keychain_substitute,
+        keychain_substitute.clone(),
     );
     let policy = sandbox::generate_policy(&sandbox_config);
 
@@ -7819,6 +7838,54 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
             ));
         }
     }
+
+    // ── settings and auth: the launch's own Keychain/token decision ──
+    println!(
+        "settings:    {}",
+        doctor::settings_line(&resolved, active_agent, configured_quiet)
+    );
+    let macos = cfg!(target_os = "macos");
+    let env_token = active_agent
+        .keychain_substitute_env_vars()
+        .iter()
+        .copied()
+        .filter(|v| !resolved.deny_env.iter().any(|d| d == v))
+        .find(|v| std::env::var(v).is_ok_and(|t| !t.trim().is_empty()));
+    let claude_nudge = cplt::sandbox::claude_keychain_nudge(
+        active_agent,
+        resolved.keychain_substitute,
+        keychain_substitute.is_some(),
+        macos,
+    )
+    .map(|_| "no CLAUDE_CODE_OAUTH_TOKEN: `claude setup-token` makes one".to_string());
+    let kept_reason = cplt::sandbox::keychain_kept_reason(
+        active_agent,
+        resolved.keychain_substitute,
+        &resolved.deny_env,
+    )
+    .or(claude_nudge);
+    // Doctor path only: `gh auth token` here never runs on a launch.
+    let auth = discover::discover_auth(&home_dir);
+    let (keychain_line, auth_line, auth_finding) = doctor::auth_report(
+        &doctor::AuthDecision {
+            agent: active_agent,
+            substitute: keychain_substitute.as_ref(),
+            setting: resolved.keychain_substitute,
+            kept_reason: kept_reason.as_deref(),
+            macos,
+            env_token,
+            gh_login: auth.gh_cli_auth,
+            other_login: !auth.keytar_nodes.is_empty(),
+        },
+        &home_dir,
+    );
+    if let Some(line) = keychain_line {
+        println!("keychain:    {line}");
+    }
+    println!("auth:        {auth_line}");
+    findings.extend(auth_finding);
+    println!();
+    println!("{}", doctor::PASTE_HINT);
     println!();
 
     findings.extend(doctor::wsl_drive_project_finding(&project_dir, wsl));
@@ -7921,19 +7988,6 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         ));
     }
 
-    // Auth matters to Copilot; the others log in on disk or via --pass-env.
-    let auth = discover::discover_auth(&home_dir);
-    if auth.gh_cli_auth {
-        ok.push("auth: gh CLI".to_string());
-    } else if let Some(var) = auth.env_tokens.first() {
-        ok.push(format!("auth: {var}"));
-    } else if active_agent == agent::Agent::Copilot && !auth.any_auth_available() {
-        findings.push(Finding::blocking(
-            "No auth for Copilot: gh is not logged in and none of COPILOT_GITHUB_TOKEN, \
-             GH_TOKEN, GITHUB_TOKEN is set.",
-            "gh auth login",
-        ));
-    }
     let agents_on_path: Vec<&str> = agent::Agent::ALL
         .iter()
         .filter(|a| **a != agent::Agent::Shell)
@@ -12164,6 +12218,18 @@ mod tests {
                 pair[1]
             );
         }
+    }
+
+    #[test]
+    fn doctor_accepts_agent_after_the_subcommand() {
+        let cli = Cli::try_parse_from(["cplt", "doctor", "--agent", "claude"])
+            .expect("`cplt doctor --agent claude` parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Doctor { agent: Some(ref a), .. }) if a == "claude"
+        ));
+        let cli = Cli::try_parse_from(["cplt", "--agent", "claude", "doctor"]).unwrap();
+        assert_eq!(cli.agent.as_deref(), Some("claude"));
     }
 
     #[test]
