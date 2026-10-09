@@ -15,24 +15,19 @@
 set -euo pipefail
 
 PORT="${DEV_PROXY_PORT:-18443}"
-CPLT="${DEV_PROXY_CPLT:-/opt/homebrew/bin/cplt}"
-
-if [ ! -x "$CPLT" ]; then
-  echo "dev-proxy: $CPLT is not executable; install cplt with Homebrew or set DEV_PROXY_CPLT" >&2
+CPLT="${DEV_PROXY_CPLT:-}"
+if [ -z "$CPLT" ]; then
+  for c in /opt/homebrew/bin/cplt /usr/local/bin/cplt; do
+    [ -x "$c" ] && CPLT="$c" && break
+  done
+fi
+if [ -z "$CPLT" ] || [ ! -x "$CPLT" ]; then
+  echo "dev-proxy: no Homebrew cplt found; install it or set DEV_PROXY_CPLT" >&2
   exit 1
 fi
 
-"$CPLT" --with-proxy --proxy-port "$PORT" --allow-all-domains exec -- sleep 2147483647 &
-pid=$!
-trap 'kill "$pid" 2>/dev/null || true' EXIT INT TERM
-
-# Startup failures (port taken, launch refused) surface within a second.
-sleep 1
-if ! kill -0 "$pid" 2>/dev/null; then
-  echo "dev-proxy: $CPLT exited before the proxy came up (see output above)" >&2
-  exit 1
-fi
-
-echo "dev proxy on 127.0.0.1:$PORT (pid $pid). Pass to the dev build:"
+echo "Starting the dev proxy on 127.0.0.1:$PORT. Pass to the dev build:"
 echo "  --with-proxy --proxy-upstream http://127.0.0.1:$PORT"
-wait "$pid"
+# exec keeps cplt in the foreground: a bind failure is its own non-zero exit,
+# and Ctrl-C reaches it directly, so there is nothing to trap or clean up.
+exec "$CPLT" --with-proxy --proxy-port "$PORT" --allow-all-domains exec -- sleep 2147483647
