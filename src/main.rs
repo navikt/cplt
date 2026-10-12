@@ -4385,7 +4385,9 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // Resolve the agent binary early so its installation directory
     // can be included in the sandbox profile. Failure is deferred —
     // --print-profile doesn't need the binary.
-    let agent_bin_result = active_agent.resolve_binary();
+    let resolved_binary = active_agent.resolve_binary_with_editor_provenance();
+    let editor_launcher = resolved_binary.as_ref().is_ok_and(|(_, editor)| *editor);
+    let agent_bin_result = resolved_binary.map(|(path, _)| path);
     // #710: v2 runs tool calls through a background service. Each session
     // gets its own service inside the sandbox (see `opencode_v2`).
     // --print-profile never runs the agent.
@@ -4500,6 +4502,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     if active_agent == agent::Agent::Copilot {
         agent::validate_copilot_keychain_substitute(
             &agent_bin,
+            editor_launcher,
             prepared.keychain_substitute().is_some(),
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -7851,12 +7854,17 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
     ));
     doctor_exec.sort();
     doctor_exec.dedup();
-    let agent_bin_result = active_agent.resolve_binary();
+    let resolved_binary = active_agent.resolve_binary_with_editor_provenance();
+    let editor_launcher = resolved_binary.as_ref().is_ok_and(|(_, editor)| *editor);
+    let agent_bin_result = resolved_binary.map(|(path, _)| path);
     let doctor_install_dir = agent_install_dir(active_agent, &agent_bin_result, &home_dir);
     if active_agent == agent::Agent::Copilot
         && let Ok(bin) = &agent_bin_result
-        && let Err(e) =
-            agent::validate_copilot_keychain_substitute(bin, keychain_substitute.is_some())
+        && let Err(e) = agent::validate_copilot_keychain_substitute(
+            bin,
+            editor_launcher,
+            keychain_substitute.is_some(),
+        )
     {
         findings.push(Finding::blocking(
             doctor_tilde(&e, &home_dir),

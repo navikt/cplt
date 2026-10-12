@@ -2531,6 +2531,13 @@ impl Agent {
     /// For OpenCode: straightforward PATH search.
     /// For Shell: uses $SHELL or falls back to /bin/zsh (macOS) or /bin/bash.
     pub fn resolve_binary(&self) -> Result<PathBuf, String> {
+        self.resolve_binary_with_editor_provenance()
+            .map(|(path, _)| path)
+    }
+
+    /// Preserve editor provenance independently of the executable's canonical
+    /// path: an editor-directory symlink may point outside that directory.
+    pub fn resolve_binary_with_editor_provenance(&self) -> Result<(PathBuf, bool), String> {
         if matches!(self, Agent::Shell) {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| {
                 if cfg!(target_os = "macos") {
@@ -2541,7 +2548,7 @@ impl Agent {
             });
             let path = PathBuf::from(&shell);
             if path.is_file() {
-                return Ok(path);
+                return Ok((path, false));
             }
             return Err(format!("Shell not found: {shell}"));
         }
@@ -2573,6 +2580,8 @@ impl Agent {
                 if crate::shim::skip_candidate(&candidate) {
                     continue;
                 }
+                let editor_candidate =
+                    matches!(self, Agent::Copilot) && is_copilot_editor_launcher(&candidate);
 
                 // Resolve mise/asdf shims to the real binary to avoid version conflicts
                 // when the project's .tool-versions specifies a different node version.
@@ -2580,13 +2589,15 @@ impl Agent {
                     if self_exe.as_ref() == Some(&real_bin) {
                         continue;
                     }
-                    if matches!(self, Agent::Copilot) && is_copilot_editor_launcher(&real_bin) {
+                    if editor_candidate
+                        || (matches!(self, Agent::Copilot) && is_copilot_editor_launcher(&real_bin))
+                    {
                         if editor_shim.is_none() {
                             editor_shim = Some(real_bin);
                         }
                         continue;
                     }
-                    return Ok(real_bin);
+                    return Ok((real_bin, false));
                 }
 
                 let resolved =
@@ -2615,19 +2626,21 @@ impl Agent {
                 }
 
                 // Copilot-specific: prefer standalone over editor shims
-                if matches!(self, Agent::Copilot) && is_copilot_editor_launcher(&resolved) {
+                if editor_candidate
+                    || (matches!(self, Agent::Copilot) && is_copilot_editor_launcher(&resolved))
+                {
                     if editor_shim.is_none() {
                         editor_shim = Some(resolved);
                     }
                     continue;
                 }
 
-                return Ok(resolved);
+                return Ok((resolved, false));
             }
         }
 
         if let Some(shim) = editor_shim {
-            return Ok(shim);
+            return Ok((shim, true));
         }
 
         let install_hint = match self {
@@ -3080,9 +3093,10 @@ pub fn is_copilot_editor_launcher(path: &Path) -> bool {
 /// whole-Keychain grant silently. The same check feeds launch and doctor.
 pub fn validate_copilot_keychain_substitute(
     path: &Path,
+    editor_launcher: bool,
     substitute_active: bool,
 ) -> Result<(), String> {
-    if cfg!(target_os = "macos") && substitute_active && is_copilot_editor_launcher(path) {
+    if cfg!(target_os = "macos") && substitute_active && editor_launcher {
         return Err(format!(
             "Copilot's editor launcher at {} can require the Keychain even with GH_TOKEN set \
              (#753), but this session denies Keychain access. Install standalone Copilot \
@@ -5810,6 +5824,7 @@ mod tests {
         );
         let old_editor = home.join("old-editor");
         let standalone = home.join("standalone");
+        let linked_editor = home.join("linked/github.copilot-chat/copilotCli");
         for (dir, body) in [
             (&editor, "#!/bin/sh\nexit 0\n"),
             (&old_editor, "#!/bin/sh\n# copilotCLIShim.js\n"),
@@ -5818,7 +5833,10 @@ mod tests {
             std::fs::create_dir_all(dir).unwrap();
             std::fs::write(dir.join("copilot"), body).unwrap();
         }
-        for launcher in [&editor, &old_editor] {
+        std::fs::create_dir_all(&linked_editor).unwrap();
+        std::os::unix::fs::symlink(standalone.join("copilot"), linked_editor.join("copilot"))
+            .unwrap();
+        for launcher in [&editor, &old_editor, &linked_editor] {
             let path = std::env::join_paths([launcher, &standalone]).unwrap();
             temp_env::with_vars(
                 [
@@ -5827,8 +5845,8 @@ mod tests {
                 ],
                 || {
                     assert_eq!(
-                        Agent::Copilot.resolve_binary(),
-                        Ok(standalone.join("copilot"))
+                        Agent::Copilot.resolve_binary_with_editor_provenance(),
+                        Ok((standalone.join("copilot"), false))
                     );
                 },
             );
@@ -5838,10 +5856,13 @@ mod tests {
                     ("PATH", Some(launcher.as_os_str())),
                 ],
                 || {
-                    let bin = Agent::Copilot.resolve_binary().unwrap();
-                    assert_eq!(bin, launcher.join("copilot"));
-                    assert!(validate_copilot_keychain_substitute(&bin, false).is_ok());
-                    let result = validate_copilot_keychain_substitute(&bin, true);
+                    let (bin, editor) = Agent::Copilot
+                        .resolve_binary_with_editor_provenance()
+                        .unwrap();
+                    assert_eq!(bin, launcher.join("copilot").canonicalize().unwrap());
+                    assert!(editor);
+                    assert!(validate_copilot_keychain_substitute(&bin, editor, false).is_ok());
+                    let result = validate_copilot_keychain_substitute(&bin, editor, true);
                     if cfg!(target_os = "macos") {
                         assert!(
                             result
@@ -5854,7 +5875,9 @@ mod tests {
                 },
             );
         }
-        assert!(validate_copilot_keychain_substitute(&standalone.join("copilot"), true).is_ok());
+        assert!(
+            validate_copilot_keychain_substitute(&standalone.join("copilot"), false, true).is_ok()
+        );
     }
 
     #[test]
