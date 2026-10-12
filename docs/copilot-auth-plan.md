@@ -19,7 +19,7 @@ here as work progresses; never include credentials or raw auth logs.
 | M1 Reproduction and credential contract | Native synthetic fixtures complete locally; contract open | 1.0.94-5/1.0.95 metadata roundtrip persists despite env auth; stored/env representations differ and config `authTokens` token/expiry syntax is observed. Exact Keychain serialization, selected account and renewal remain unproven. |
 | M2 cplt opt-in implementation | Future extraction blocked by M1; incident fixes implemented | Doctor/cache corrections use bounded host-pinned, env-cleared lookup, shared config-path resolution and effective denied-env handling on all backends. Selected Copilot-store extraction remains planned. |
 | M3 nav-pilot modes and onboarding | Correction implemented; independent review CONCERNS | No automatic gh action retained. Guided manual recovery requires secure-store verification and stops on plaintext status. Setup/doctor share a trusted clean host probe, clearing five variables with a 5-second bound to prevent ambient/project-shim influence. Reported Go, 99 scripts and budget pass; live recovery remains open. |
-| M4 Automated and live acceptance | Corrected local gates pass; live open | Kernel evidence is private-DB open/access only, not independent find/add denial. Required missing-gh now fails; five offline checks gate local `mise run check` and Linux/macOS CI with required Python. Serial 414 unit/1586 lib and two targeted kernel checks pass. Linux runtime/live OAuth remain open. |
+| M4 Automated and live acceptance | Existing-login headless acceptance passes; lifecycle open | Installed and rebuilt cplt/nav-pilot chains all returned exact `OK`, exit 0, with reported gh substitution and Keychain grant removal. Active gh storage reported keyring and GitHub accepted the stored token. Fresh OAuth, cancellation, account matching, interactive responses, renewal and Linux runtime remain open. |
 | M5 Site and user documentation | Source ready; unpublished | Fresh site 803 checks, smoke and CLI cross-build pass. Recovery injection/prior-setting restoration fixed; safe existing-user no-tools smoke documented. Monorepo checks fail on untouched dead code/staticcheck versions. |
 | M6 Independent review and staged rollout | Independent final review CONCERNS; packaging authorized | Two review corrections are reported verified, with no implementation blocker. Three #757 bot fixes and synthetic/kernel evidence are included in this update. Live acceptance and extraction/default-promotion gates remain open. |
 
@@ -51,8 +51,9 @@ Human OAuth gates do not pause independent work.
 
 Basic gh-token account auth, doctor/cache corrections, serial regression checks
 and site/browser guidance are verified. The incident candidate is implemented
-and checked, with reported CLI and auth-doc review blockers fixed. Host OAuth,
-secure persistence and restart acceptance remain open. Guide source is ready but
+and checked, with reported CLI and auth-doc review blockers fixed. Existing-login
+headless acceptance now passes all four installed/rebuilt chains. Fresh host OAuth,
+new secure persistence and post-OAuth restart acceptance remain open. Guide source is ready but
 unpublished. The cplt draft update includes next-stage synthetic/kernel evidence
 and three bot diagnostics fixes. No automatic gh action is retained in the
 reported CLI correction. Independent final review reports **CONCERNS**, two
@@ -60,6 +61,30 @@ verified corrections and no implementation blocker. Kernel claims remain limited
 to private-database open/access. New-head CI and sibling delivery are separate
 checks. This is draft-review readiness, not completed host recovery or a proven
 credential-extraction lifecycle.
+
+### Existing-login acceptance decision
+
+The user chose an existing-login live gate rather than a fresh OAuth session.
+That narrower criterion is **passed**, not a waiver or completion of the original
+fresh-login criterion. On 2026-10-12, the active gh record reported keyring storage
+and GitHub accepted its stored token; raw output and the account name were withheld.
+
+| Chain | Tested version | Outcome |
+| --- | --- | --- |
+| Installed cplt | `2026.10.08-190103-d4ae77a` | Exit 0, exact `OK` |
+| Installed nav-pilot → installed cplt | `2026.10.08-185134-97d6749` | Exit 0, exact `OK` |
+| Draft cplt | `2026.10.12-171502-0bb451a` | Exit 0, exact `OK` |
+| Draft nav-pilot → draft cplt | `dev`, commit `63667f7c`, built `2026-10-12T17:15:02Z` | Exit 0, exact `OK` |
+
+All summaries reported gh-token substitution and Keychain grant removal. Four
+responses used the existing configured model with tools disabled and closed stdin.
+Normal runtime metadata changed; this is not credential-persistence evidence.
+Account matching and billing identity were not established. Exact commands,
+preliminary rejected attempts, durations and limits are recorded in
+[the live evidence](copilot-auth-testing.md#authorized-existing-state-live-gate).
+Fresh OAuth/browser flow, cancellation, new secure persistence, post-OAuth restart,
+interactive model response and renewal remain outstanding review criteria.
+Copilot-store selection/serialization/extraction remains unproven.
 
 Interactive `/user show` establishes account auth. Interactive model output is
 separate and remains unverified under the two-request cap; the harness correction
@@ -150,13 +175,14 @@ The source of lifecycle requirements and reproduction commands is
 - There is **no live OAuth renewal evidence**. A one-shot request with a gh token
   does not prove secure Copilot persistence, base-token lifetime, refresh-token
   handling, or long-session renewal with an injected Copilot credential.
-- The final full-chain probe stopped before passing a real token. The generated
+- The earlier isolated full-chain probe stopped before passing a real token. The generated
   profile's broad Mach service grants prevented required isolation through the
   supported flag; nested SBPL execution is forbidden. This is a probe limitation,
   not a failed authenticated full-chain run.
 - Installed nav-pilot with empty state had no package and exited 2. That does not
   establish auth behavior of a functioning installed launch chain. The final
-  round used **zero paid prompts**.
+  isolated round used **zero paid prompts**. The later authorized existing-state
+  gate obtained four headless responses through the installed and draft chains.
 - cplt's y/n cancellation check passes with prelaunch `aborted`. This proves
   prelaunch cancellation only, not OAuth cancellation. Safe manual cplt/nav-pilot
   no-tools smoke commands for the existing normal user are documented in the
@@ -487,8 +513,8 @@ and Linux credential-store coverage open; no implementation blocker.
 | CLI delivery | Delivered as draft [#1697](https://github.com/navikt/copilot/pull/1697) | Signed branch `fix/authincident-host-recovery-signed`, head `63667f7c`; both commits reported verified. Original unsigned branch and 4 modified/2 untracked files are preserved. Live acceptance remains open. |
 | Full kernel evidence | Independent find/add denial unproven | Current tests establish private-DB open/access only. Stronger claims need independently reached operations; no broader conclusion from access failure. Required-gh/offline corrections are implemented and checked. |
 | Incident PR | New-head CI pending | Three bot fixes and reviewed synthetic/kernel evidence are included in this update. Prior head's 13 passing checks do not prove the new head. |
-| Immediate incident | Host OAuth/restart acceptance open | User-assisted host sign-in, secure persistence, OAuth cancellation and restart without link hacks. Prelaunch `aborted` is not OAuth cancellation. Record Slack CLI/version, terminal/editor and whether `gh` was used. |
-| Full launch chain | Isolation-safe real-token probe unavailable | A supported isolation method that contains broad Mach grants without nested SBPL, or agreed safe existing-user manual smoke. Empty installed nav-pilot exited 2 because no package was available. |
+| Immediate incident | Existing-login headless gate passed; fresh OAuth/restart open | All four installed/draft chains returned `OK`, exit 0. The user-selected existing-login criterion does not close fresh sign-in, new secure persistence, OAuth cancellation or post-OAuth restart. Record Slack CLI/version, terminal/editor and whether `gh` was used. |
+| Full launch chain | Existing-state wiring passed; isolated real-token gate remains limited | Authorized normal-state smoke passed all four chains. Earlier empty-state nav-pilot lacked a package; isolation-safe full-launch Security framework denial remains unproven. |
 | Model workflow | Interactive model response unverified | Live response evidence within the agreed request budget; synthetic harness checks alone are insufficient. Does not block basic account-auth conclusion. |
 | Full lifecycle | Original 1.0.86 behavior not reproduced | Real-version headless/interactive and relevant post-OAuth evidence. |
 | Full lifecycle | Selection, serialization and renewal unresolved | Close the version-scoped gates in `copilot-auth-contract.md`; experimental active-account and SDK callback evidence alone do not support standalone extraction. |
@@ -496,8 +522,9 @@ and Linux credential-store coverage open; no implementation blocker.
 | Full lifecycle | gh/git independence across modes not proven | Alice/Bob lifecycle plus guarded gh and authorized HTTPS push evidence; explicit unsupported combinations. |
 | Full lifecycle | Linux/MCP coverage unknown | Proven handover/renewal, or explicit scope and unsupported-setting diagnostics. |
 
-The user authorizes existing-user **simulated denied-access tests**. They need
-no logout and must not change stored credentials. Interactive OAuth requires
+The user authorizes existing-user **simulated denied-access tests** and the
+recorded existing-login live gate. Neither requires logout; normal runtime
+metadata changed during live launches. Interactive OAuth requires
 the user. Credential changes, revocation, account switching and Keychain setting
 changes need a disposable account or a separately agreed interactive session
 with tested recovery. Simulated denial proves neither logout nor live renewal.

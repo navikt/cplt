@@ -248,8 +248,9 @@ subshell. Do not print a token.
 
 Complete that login as the user and retain secure credential storage. The probe
 validated that an existing gh login supplies a token accepted by headless Copilot
-and by interactive `/user show` with Keychain denied. The exact nav-pilot handover
-and a restarted interactive model request remain separate acceptance checks.
+and by interactive `/user show` with Keychain denied. The authorized existing-state
+gate below later verified nav-pilot's headless handover. A restarted interactive
+model request remains a separate acceptance check.
 Do not run `/login` again merely because the sandbox cannot open a browser.
 
 For direct Copilot host authentication with a manually opened device URL:
@@ -327,6 +328,94 @@ Keychain isolation. Record versions, the effective credential source from cplt's
 summary, exit status and `OK`. Do not export or print a token, run `/logout`, or
 claim a fresh host login occurred. The evidence above used existing credentials
 only in earlier authorized probes.
+
+### Authorized existing-state live gate
+
+Executed on **2026-10-12**, macOS **26.7.1**, build **25G241**, with explicit
+authorization to use the existing login and normal installed state. This gate
+does not use the empty-home credential-isolation procedure above.
+
+Host preflight used trusted absolute `/opt/homebrew/bin/gh`, with
+`COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`, `GH_HOST` and `GH_REPO` removed
+from each child environment. Other host runtime variables were retained. No
+`CPLT_*`, `NAV_PILOT_*`, `__CPLT*` or standard proxy environment overrides were
+present. Normal global and repository configuration remained effective; their
+private contents were not recorded.
+
+`gh auth status --hostname github.com` exited 0. Its output was captured in
+memory, split into account records, and only the record with `Active account:
+true` was considered. Exactly one active record reported **keyring** storage.
+`gh api --hostname github.com user --jq .login` exited 0 with a valid login name,
+confirming that the stored token was accepted by GitHub. Raw auth output and the
+account name were withheld. gh was **2.102.0**; standalone
+`/opt/homebrew/bin/copilot --no-auto-update --version` reported **1.0.94-5** in the
+normal host state this round.
+
+Built the current sources with `mise run build` in cplt and
+`mise run nav-pilot:build` in the signed Copilot worktree. The latter used the
+actual Go package and task-defined version stamping, not a substitute launcher.
+
+| Real chain | Version | Exit | Model stdout | Duration |
+| --- | --- | --- | --- | --- |
+| Installed cplt | `2026.10.08-190103-d4ae77a` | 0 | Exactly `OK` | 12.6 s |
+| Installed nav-pilot → installed cplt | `2026.10.08-185134-97d6749` | 0 | Exactly `OK` | 13.9 s |
+| Rebuilt cplt | `2026.10.12-171502-0bb451a` | 0 | Exactly `OK` | 25.0 s |
+| Rebuilt nav-pilot → rebuilt cplt | `dev`, commit `63667f7c`, built `2026-10-12T17:15:02Z` | 0 | Exactly `OK` | 17.4 s |
+
+All four launch summaries reported gh-token substitution and removal of the
+Keychain grant. No explicit credential was supplied by the observer. Successful
+model responses establish usable Copilot access for the resolved credential;
+they do not identify the billed account or prove a particular subscription tier.
+
+Exact successful commands, after clearing the five variables above:
+
+```sh
+/opt/homebrew/bin/cplt --agent copilot -- --no-auto-update --disable-builtin-mcps --available-tools= --deny-tool shell --deny-tool write --deny-tool url -s -p 'Reply with OK only. Do not use tools.'
+/opt/homebrew/bin/nav-pilot --client copilot -- --no-auto-update --disable-builtin-mcps --available-tools= --deny-tool shell --deny-tool write --deny-tool url -s -p 'Reply with OK only. Do not use tools.'
+target/debug/cplt --agent copilot -- --no-auto-update --disable-builtin-mcps --available-tools= --deny-tool shell --deny-tool write --deny-tool url -s -p 'Reply with OK only. Do not use tools.'
+PATH="$CPLT_WORKTREE/target/debug:$PATH" "$COPILOT_SIGNED_WORKTREE/cli/nav-pilot/nav-pilot" --client copilot -- --no-auto-update --disable-builtin-mcps --available-tools= --deny-tool shell --deny-tool write --deny-tool url -s -p 'Reply with OK only. Do not use tools.'
+```
+
+`CPLT_WORKTREE` and `COPILOT_SIGNED_WORKTREE` above denote the actual cplt and
+signed Copilot worktrees. Direct cplt commands ran from the cplt repository;
+nav-pilot commands ran from the signed Copilot repository. The draft nav-pilot
+child PATH selected the actual `target/debug/cplt`. No package install, sync or
+fake install state was used. No development proxy or network bypass was needed.
+
+Installed `copilot help permissions` documents that an empty available-tool list
+filters model-visible tools and that explicit deny rules override allow-all
+permissions. Built-in MCPs were disabled. The observer provided
+`stdin=DEVNULL`, captured stdout/stderr internally, required exact `OK` stdout,
+and withheld unexpected raw diagnostics. Each launch had a 150-second deadline,
+a separate process group, TERM/KILL cleanup and child reaping. No timeout, browser
+interaction, new login or plaintext-storage acceptance occurred.
+
+Preliminary CLI-validation attempts rejected `--deny-tool '*'` as invalid before
+a model request. Two attempts to pin `gpt-5-mini`, one per installed chain,
+exited 1 without a response; the nav-pilot diagnostic identified an unavailable
+model. The four successful prompts therefore used the existing configured model.
+Four model responses were obtained. Billing was not queried, and the unavailable
+model attempts are not counted as successful paid requests. No additional model
+prompts were submitted after the four successes.
+
+Normal runtime state changed. Metadata snapshots of `~/.copilot` and
+`~/.nav-pilot`, without opening credential files, found respectively **17/0**,
+**20/2**, **17/0** and **20/2** changed entries for the four successful rows.
+Earlier rejected launches also changed runtime metadata. These are metadata
+counts, not content hashes or evidence of credential persistence. Both project
+worktrees remained clean before this evidence edit.
+
+The installed CLI documents `/user`, but identity was not queried interactively
+because stdin remained closed. **Matching the active gh account to Copilot's
+selected account is unverified.** No credential files were read to infer it.
+This gate covers existing-login full-launch wiring and one headless response per
+chain. It does not cover fresh OAuth, OAuth cancellation, plaintext fallback,
+Copilot-only login, multi-account selection, interactive responses or renewal.
+The earlier isolation gate remains relevant to isolated credential-denial tests;
+it does not prevent this explicitly authorized existing-state test.
+
+Final `mise run check` passed: **414 unit**, **1,586 lib** and **5 offline probe**
+checks; fmt and clippy clean.
 
 ### Installed-code and documentation contract
 
