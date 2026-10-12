@@ -9679,7 +9679,7 @@ paths = [
     /// `/var/folders` are wholesale-writable in the profile, so a fake home
     /// there is writable by that rule and every probe below passes vacuously.
     #[test]
-    fn e2e_pi_trust_lock_is_creatable_but_nothing_else_in_the_root_moves() {
+    fn e2e_pi_startup_locks_are_creatable_but_nothing_else_in_the_root_moves() {
         require_sandbox!();
         let fake_home = home_temp_dir("pi-lock");
         let agent = fake_home.path().join(".pi/agent");
@@ -9690,6 +9690,7 @@ paths = [
         std::fs::write(agent.join("tmp/rg"), "payload").unwrap();
         std::fs::write(agent.join("sessions/evil.js"), "ext").unwrap();
         std::fs::write(agent.join("trust.json"), "{}").unwrap();
+        std::fs::write(agent.join("settings.json"), "{}").unwrap();
         let project = tempfile::tempdir().unwrap();
 
         let out = cplt_cmd()
@@ -9724,16 +9725,29 @@ paths = [
         };
 
         // proper-lockfile's exact sequence: mkdir, utimes (mtime probe), rmdir.
-        assert!(probe(format!("mkdir {a}/trust.json.lock")), "mkdir lock");
-        assert!(
-            probe(format!("touch -m {a}/trust.json.lock")),
-            "utimes lock"
-        );
-        assert!(
-            !probe(format!("touch {a}/trust.json.lock/f")),
-            "nothing may be created inside the lock"
-        );
-        assert!(probe(format!("rmdir {a}/trust.json.lock")), "rmdir lock");
+        for file in ["trust.json", "auth.json", "settings.json"] {
+            let lock = format!("{a}/{file}.lock");
+            assert!(probe(format!("mkdir {lock}")), "mkdir {file}.lock");
+            assert!(probe(format!("touch -m {lock}")), "utimes {file}.lock");
+            assert!(
+                !probe(format!("touch {lock}/f")),
+                "nothing may be created inside {file}.lock"
+            );
+            assert!(probe(format!("rmdir {lock}")), "rmdir {file}.lock");
+            for cmd in [
+                format!("touch {lock}"),
+                format!("ln -s /etc {lock}"),
+                format!("mkfifo {lock}"),
+            ] {
+                assert!(!probe(cmd), "{file}.lock must only allow a directory");
+            }
+        }
+        for file in ["trust.json", "settings.json"] {
+            assert!(
+                !probe(format!("echo evil > {a}/{file}")),
+                "{file} must stay write-denied"
+            );
+        }
 
         // The escapes the root-wide grant allowed, each of which must now fail.
         for (what, cmd) in [
@@ -9759,10 +9773,6 @@ paths = [
                 format!("echo evil > {a}/bin/rg"),
             ),
             ("create a top-level file", format!("touch {a}/newfile")),
-            (
-                "symlink at the lock name",
-                format!("ln -s /etc {a}/trust.json.lock"),
-            ),
         ] {
             assert!(!probe(cmd), "{what} must be denied");
         }

@@ -3602,21 +3602,22 @@ print('CONNECTED')
     }
 
     /// Under bubblewrap the lock grant is live: Pi can `mkdir`/`utimes`/`rmdir`
-    /// `trust.json.lock`, while the exec-only `bin/` and the host-persistence
+    /// startup locks, while the exec-only `bin/` and the host-persistence
     /// dirs cannot be renamed (every one is a mountpoint — EBUSY) and the managed
     /// binary cannot be written. Decided by the kernel, not by a string match:
     /// Landlock's `MakeDir|RemoveDir` on the root is sufficient for a
     /// same-directory rename, so only the mount topology stops `mv bin bin.old`.
     #[test]
-    fn pi_trust_lock_works_under_bwrap_and_bin_cannot_be_renamed() {
+    fn pi_startup_locks_work_under_bwrap_and_bin_cannot_be_renamed() {
         require_bwrap!();
         let home = pi_probe_home("bwrap");
         let project = create_test_project();
         let a = home.join(".pi/agent");
         let a = a.display();
         let script = format!(
-            "mkdir {a}/trust.json.lock && touch -m {a}/trust.json.lock && \
-             rmdir {a}/trust.json.lock && echo LOCK_OK; \
+            "for file in trust.json auth.json settings.json; do \
+             mkdir {a}/$file.lock && touch -m {a}/$file.lock && \
+             rmdir {a}/$file.lock && echo LOCK_OK:$file; done; \
              mv {a}/bin {a}/bin.old 2>/dev/null || echo MV_BIN_DENIED; \
              mv {a}/sessions {a}/extensions 2>/dev/null || echo MV_EXT_DENIED; \
              (echo evil > {a}/bin/rg) 2>/dev/null || echo WRITE_BIN_DENIED"
@@ -3628,7 +3629,9 @@ print('CONNECTED')
              stdout: {stdout}\nstderr: {stderr}"
         );
         for marker in [
-            "LOCK_OK",
+            "LOCK_OK:trust.json",
+            "LOCK_OK:auth.json",
+            "LOCK_OK:settings.json",
             "MV_BIN_DENIED",
             "MV_EXT_DENIED",
             "WRITE_BIN_DENIED",

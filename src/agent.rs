@@ -2045,7 +2045,7 @@ impl Agent {
                 // bubblewrap.
                 //
                 // Cost: Pi can no longer create a NEW top-level entry under
-                // ~/.pi/agent mid-session, except the one named lock directory
+                // ~/.pi/agent mid-session, except the named lock directories
                 // `create_dirs` grants below (and on Linux only under
                 // bubblewrap — see `AgentDir::create_dirs`). The
                 // files it rewrites in place are carved back open below; a
@@ -2084,9 +2084,9 @@ impl Agent {
                             "keybindings.json",
                             "pi-debug.log",
                         ],
-                        // Pi reads its trust store through `proper-lockfile`
+                        // Pi reads auth, settings and its trust store through `proper-lockfile`
                         // 4.1.2, which takes the lock by `mkdir`ing
-                        // `trust.json.lock/`, then `utimes` it (an mtime-
+                        // `<file>.lock/`, then `utimes` it (an mtime-
                         // precision probe — on error it `rmdir`s and fails the
                         // lock), and `rmdir`s it to release. A NEW top-level
                         // directory under the read-only root, which
@@ -2099,7 +2099,11 @@ impl Agent {
                         // place (rename is a directory operation). See
                         // `AgentDir::create_dirs` for the bound and the Linux
                         // caveat.
-                        create_dirs: vec!["trust.json.lock"],
+                        create_dirs: vec![
+                            "trust.json.lock",
+                            "auth.json.lock",
+                            "settings.json.lock",
+                        ],
                         via: vec![],
                     },
                     writable(agent.join("sessions")),

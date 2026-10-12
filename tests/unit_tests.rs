@@ -1926,15 +1926,14 @@ fn create_dirs_grants_keep_existing_files_unwritable_on_both_backends() {
     );
 }
 
-/// Pi can create its trust-store lock (`mkdir ~/.pi/agent/trust.json.lock`, #449)
-/// while `trust.json` and the exec-only `bin/` stay unwritable.
+/// Pi can create its startup locks while settings, trust and bin stay unwritable.
 ///
 /// The Landlock rule set permits MakeDir on the root (asserted here via the
 /// policy's `create_dirs` flag, since Landlock itself only runs on Linux — the
 /// flag builder is what maps it to `AccessFs::MakeDir`, covered by
 /// `create_dirs_maps_to_mkdir_rmdir_only` on Linux).
 #[test]
-fn pi_can_create_the_trust_lock_but_not_write_bin_or_trust_json() {
+fn pi_can_create_startup_locks_but_not_write_bin_settings_or_trust_json() {
     use cplt::agent::Agent;
     let home = std::path::Path::new("/Users/test");
     let agent_dirs = Agent::Pi.config_dirs(home);
@@ -1960,19 +1959,19 @@ fn pi_can_create_the_trust_lock_but_not_write_bin_or_trust_json() {
         "the root must NOT be writable — that would union bin/ into write+exec"
     );
 
-    // trust.json and bin/ stay unwritable (no write grant covers them).
-    assert_eq!(
-        cplt::check::writable_tree_over(&policy, home, &root.join("trust.json")),
-        None,
-        "trust.json must stay unwritable; create_dirs grants mkdir, not file writes"
-    );
+    for file in ["trust.json", "settings.json"] {
+        assert_eq!(
+            cplt::check::writable_tree_over(&policy, home, &root.join(file)),
+            None,
+            "{file} must stay unwritable; create_dirs grants mkdir, not file writes"
+        );
+    }
     assert_eq!(
         cplt::check::writable_tree_over(&policy, home, &root.join("bin")),
         None,
         "bin/ must stay unwritable — the H-13/H-05 narrowing must survive create_dirs"
     );
 
-    // Seatbelt: the lock's mkdir is allowed, trust.json write still denied.
     let profile = generate_profile(
         &SandboxConfig {
             agent: Agent::Pi,
@@ -1981,16 +1980,22 @@ fn pi_can_create_the_trust_lock_but_not_write_bin_or_trust_json() {
         },
         &[],
     );
-    assert!(
-        profile.contains(
-            "(allow file-write* (require-all (literal \"/Users/test/.pi/agent/trust.json.lock\") (vnode-type DIRECTORY)))"
-        ),
-        "Pi must be allowed to mkdir/utimes/rmdir its trust lock:\n{profile}"
-    );
-    assert!(
-        profile.contains("(deny file-write* (subpath \"/Users/test/.pi/agent/trust.json\"))"),
-        "trust.json must still be write-denied:\n{profile}"
-    );
+    for file in ["trust.json", "auth.json", "settings.json"] {
+        assert!(
+            profile.contains(&format!(
+                "(allow file-write* (require-all (literal \"/Users/test/.pi/agent/{file}.lock\") (vnode-type DIRECTORY)))"
+            )),
+            "Pi must be allowed to mkdir/utimes/rmdir {file}.lock:\n{profile}"
+        );
+    }
+    for file in ["trust.json", "settings.json"] {
+        assert!(
+            profile.contains(&format!(
+                "(deny file-write* (subpath \"/Users/test/.pi/agent/{file}\"))"
+            )),
+            "{file} must still be write-denied:\n{profile}"
+        );
+    }
 }
 
 /// A user `allow.write` must NOT reopen the host-persistence denies.
