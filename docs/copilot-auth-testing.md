@@ -35,7 +35,7 @@ the child, and that the persistence scan skips symlinks/FIFOs and detects a toke
 across read boundaries. They do not run Copilot or retrieve credentials.
 `test:probe` is a required dependency of `mise run check` and requires Python 3.
 Linux and macOS CI also run it explicitly, checking `python3 --version` first;
-missing Python fails the job. The PTY case is macOS-only; the other four checks
+missing Python fails the job. The PTY case is macOS-only; the other five checks
 run on both platforms.
 
 ### Synthetic full-pipeline and Security framework evidence
@@ -229,22 +229,29 @@ recognize or open a clicked link is not evidence of a kernel clipboard or URL-co
 restriction.
 
 For a user whose sandboxed `/login` cannot open a browser, run authentication in
-a normal host terminal, then restart nav-pilot:
+a normal host terminal. Start a subshell with `sh`, wait for its prompt, then
+run these checks. Keep it open through verification and restart:
 
 ```sh
-(
-  unset COPILOT_GITHUB_TOKEN GH_TOKEN GITHUB_TOKEN GH_HOST GH_REPO
-  gh auth login --hostname github.com --web &&
-    gh auth status --hostname github.com &&
-    nav-pilot --client copilot
-)
+unset COPILOT_GITHUB_TOKEN GH_TOKEN GITHUB_TOKEN GH_HOST GH_REPO
+gh auth login --hostname github.com --web &&
+  gh auth status --hostname github.com
+gh api --hostname github.com user --jq .login
+```
+
+Before launching anything, manually verify that login and both checks succeeded,
+the active github.com account is the intended gh account, and its status reports
+secure keyring storage. Stop on plaintext storage, ambiguity, the wrong account
+or any failed check. This does not verify Copilot's selected or billed account.
+Do not print a token. Only after verification, in that same subshell:
+
+```sh
+nav-pilot --client copilot
+exit
 ```
 
 The subshell preserves the caller's environment and keeps inherited token and
-host/repository overrides out of both login and restart. Before restarting,
-optionally check the account with `gh api --hostname github.com user --jq .login`
-and confirm `gh auth status` reports secure credential storage, within that same
-subshell. Do not print a token.
+host/repository overrides out of both login and restart.
 
 Complete that login as the user and retain secure credential storage. The probe
 validated that an existing gh login supplies a token accepted by headless Copilot
@@ -312,19 +319,21 @@ confirmation, and cancel if a new login or storage prompt appears:
 ```sh
 (
   unset COPILOT_GITHUB_TOKEN GH_TOKEN GITHUB_TOKEN GH_HOST GH_REPO
-  cplt --agent copilot -- --no-auto-update --disable-builtin-mcps -s -p "Reply with OK only. Do not use tools."
+  cplt --agent copilot -- --no-auto-update --disable-builtin-mcps --available-tools= --deny-tool shell --deny-tool write --deny-tool url -s -p "Reply with OK only. Do not use tools."
 )
 ```
 
 ```sh
 (
   unset COPILOT_GITHUB_TOKEN GH_TOKEN GITHUB_TOKEN GH_HOST GH_REPO
-  nav-pilot --client copilot -- --no-auto-update --disable-builtin-mcps -s -p "Reply with OK only. Do not use tools."
+  nav-pilot --client copilot -- --no-auto-update --disable-builtin-mcps --available-tools= --deny-tool shell --deny-tool write --deny-tool url -s -p "Reply with OK only. Do not use tools."
 )
 ```
 
 These manual commands use the user's normal installed state; they do not claim
-Keychain isolation. Record versions, the effective credential source from cplt's
+Keychain isolation. Tool restrictions use the flags verified in the existing-state
+gate below, not the prompt alone; built-in MCPs are disabled. Record versions,
+the effective credential source from cplt's
 summary, exit status and `OK`. Do not export or print a token, run `/logout`, or
 claim a fresh host login occurred. The evidence above used existing credentials
 only in earlier authorized probes.
@@ -447,24 +456,35 @@ Sources, accessed 2026-10-12:
 
 ### Authenticated lifecycle tests
 
-In the disposable account, authenticate gh on the host with secure storage. Check
-the account, then try a normal prompt without invoking `/login`:
+In the disposable account, start a subshell with `sh` and wait for its prompt.
+Clear overrides, authenticate gh on the host and run the checks:
 
 ```sh
-(
-  unset COPILOT_GITHUB_TOKEN GH_TOKEN GITHUB_TOKEN GH_HOST GH_REPO
-  gh auth login --hostname github.com --web &&
-    gh auth status --hostname github.com &&
-    gh api --hostname github.com user --jq .login &&
-    cplt doctor --agent copilot &&
-    cplt --agent copilot -- -p "Reply with OK only" &&
-    cplt --agent copilot
-)
+unset COPILOT_GITHUB_TOKEN GH_TOKEN GITHUB_TOKEN GH_HOST GH_REPO
+gh auth login --hostname github.com --web &&
+  gh auth status --hostname github.com
+gh api --hostname github.com user --jq .login
 ```
 
-These are procedures for the disposable account, not completed OAuth evidence.
-The subshell preserves the caller's environment. Confirm secure storage from
-`gh auth status` before continuing; cancel any plaintext-storage offer.
+Before launch, manually verify successful checks, the intended active gh account
+and secure keyring storage. Stop on plaintext storage, ambiguity, wrong account
+or any failed check. Only then run, in the same subshell:
+
+```sh
+cplt doctor --agent copilot &&
+  cplt --agent copilot -- --no-auto-update --disable-builtin-mcps --available-tools= --deny-tool shell --deny-tool write --deny-tool url -p "Reply with OK only" &&
+  cplt --agent copilot
+exit
+```
+
+These are procedures, not completed OAuth evidence or proof of Copilot's selected
+identity. The subshell preserves the caller's environment. Cancel any plaintext
+storage offer; do not proceed to interactive launch after a failed request.
+
+The isolated probe also enforces the recorded empty tool list, shell/write/url
+denies and built-in MCP disable flag in both command branches. Offline checks
+capture those commands without making a model request; they do not establish
+new live acceptance or renewal evidence.
 
 Repeat through nav-pilot. Record whether the vault prompt appears automatically
 or only after `/login`, and the error immediately before it. Cancel the plaintext

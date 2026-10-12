@@ -176,6 +176,12 @@ pub fn stored_gh_token_available() -> bool {
     stored_gh_credential().is_some()
 }
 
+/// Wrapper installation only discovers this PATH binary; it never executes it
+/// in the parent. Trusted stored-token retrieval is a separate requirement.
+pub fn gh_wrapper_available() -> bool {
+    crate::sandbox::which_binary("gh").is_some()
+}
+
 /// Cache eligibility is shared with launch so advice cannot promise a channel
 /// that deny.env or the existing credential would suppress. Retrieval and the
 /// guard/scratch settings are separate prerequisites checked by the caller.

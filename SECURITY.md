@@ -559,6 +559,13 @@ A repo `deny.env` naming `GH_TOKEN` removes that environment variable and suppre
 
 Denying only `GITHUB_TOKEN` or `COPILOT_GITHUB_TOKEN` leaves cache eligibility open. A soon-to-be-denied child token does not suppress the exec cache. Injection selects the first of `GH_TOKEN`, `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN` that is not denied. These are the current channel-specific rules, not a uniform "no GitHub credential" policy.
 
+Both cache consumers use `__CPLT_GH_TOKEN_DIR` to locate the actual producer
+scratch directory, including with `--pass-env TMPDIR`. Launch clears an ambient
+locator and sets its own only when caching a retrieved token. A wrapped process
+without that locator does not fall back to a stale token under TMPDIR or TMP.
+This preserves cache-channel denial; it is not a boundary against a same-UID
+agent that can read or modify its own environment and scratch files.
+
 The one-shot cache can supply Copilot when no exported token survives and no gh-token substitute resolves. The exec cache supplies sandboxed gh separately when eligible. Denying `GH_TOKEN` suppresses both caches; it does not guarantee that every credential source is unavailable.
 
 *Possible mitigation:* a repo-scoped MCP proxy or a fine-grained PAT that limits token scope to the current repository. See issue #4.

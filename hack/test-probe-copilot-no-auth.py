@@ -19,6 +19,28 @@ spec.loader.exec_module(probe)
 
 
 class ProbeTests(unittest.TestCase):
+    def test_both_authenticated_commands_enforce_no_tools(self):
+        for interactive in (False, True):
+            results = [subprocess.CompletedProcess([], 0, "1.0.94\n", ""),
+                       subprocess.CompletedProcess([], 0, '(version 1)\n(deny default)\n', ""),
+                       subprocess.CompletedProcess([], 0, "CPLTAUTH7429", "")]
+            argv = ["probe", "--cplt", sys.executable, "--copilot", sys.executable, "--authenticated-gh"]
+            if interactive:
+                argv.append("--interactive")
+            with patch.object(sys, "argv", argv), \
+                    patch.object(probe.platform, "system", return_value="Darwin"), \
+                    patch.object(probe, "run", side_effect=results) as run, \
+                    patch.object(probe, "interactive") as tui, \
+                    patch.object(probe, "stored_gh_token", return_value="synthetic-token"), \
+                    patch.object(probe, "assert_not_persisted"), \
+                    patch.object(probe.signal, "signal"), contextlib.redirect_stdout(io.StringIO()):
+                probe.main()
+                command = (tui if interactive else run).call_args.args[0]
+                self.assertIn("--disable-builtin-mcps", command)
+                self.assertIn("--available-tools=", command)
+                denies = [command[i + 1] for i, arg in enumerate(command) if arg == "--deny-tool"]
+                self.assertEqual(denies, ["shell", "write", "url"])
+
     def test_stored_lookup_strips_overrides_and_withholds_failure_output(self):
         ambient = dict.fromkeys(("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "GH_HOST", "GH_REPO"), "ambient-secret")
         ambient["HOME"] = "/synthetic/home"

@@ -317,6 +317,8 @@ fn configure_command(
     // Install command wrappers if scratch dir exists and features are enabled.
     // - gh proxy: intercepts gh commands and blocks destructive operations
     // - git push prevention: blocks git push while allowing all other git operations
+    // An ambient locator is not a cache grant, even with --pass-env.
+    cmd.env_remove(GH_TOKEN_DIR_ENV);
     if let Some(scratch) = scratch_dir {
         // Where `cplt git-gate` records a `push -u` it stripped. Not TMPDIR:
         // `--pass-env TMPDIR` points that elsewhere. Only when the parent will
@@ -602,14 +604,14 @@ fn cache_gh_token_to_file(
         }
         return;
     };
+    // Both consumers must locate the producer's scratch dir, not an explicitly
+    // passed TMPDIR that may contain another session's stale credential.
+    cmd.env(GH_TOKEN_DIR_ENV, scratch_dir);
     if serve {
         write_token_file(&scratch_dir.join(".gh-token"), &token);
     }
     if exec {
         write_token_file(&scratch_dir.join(".gh-exec-token"), &token);
-        // `--pass-env TMPDIR` points the child's TMPDIR elsewhere; tell the
-        // gate where the cache really is.
-        cmd.env(GH_TOKEN_DIR_ENV, scratch_dir);
         // OpenCode: the same token as its GitHub Copilot login, when the user
         // has none of their own (#695). OpenCode reads OPENCODE_AUTH_CONTENT
         // instead of auth.json, so the real file is never read or rewritten

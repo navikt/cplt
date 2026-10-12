@@ -21,7 +21,7 @@ here as work progresses; never include credentials or raw auth logs.
 | M3 nav-pilot modes and onboarding | Correction implemented; independent review CONCERNS | No automatic gh action retained. Guided manual recovery requires secure-store verification and stops on plaintext status. Setup/doctor share a trusted clean host probe, clearing five variables with a 5-second bound to prevent ambient/project-shim influence. Reported Go, 99 scripts and budget pass; live recovery remains open. |
 | M4 Automated and live acceptance | Existing-login headless acceptance passes; lifecycle open | Installed and rebuilt cplt/nav-pilot chains all returned exact `OK`, exit 0, with reported gh substitution and Keychain grant removal. Active gh storage reported keyring and GitHub accepted the stored token. Fresh OAuth, cancellation, account matching, interactive responses, renewal and Linux runtime remain open. |
 | M5 Site and user documentation | Source ready; unpublished | Fresh site 803 checks, smoke and CLI cross-build pass. Recovery injection/prior-setting restoration fixed; safe existing-user no-tools smoke documented. Monorepo checks fail on untouched dead code/staticcheck versions. |
-| M6 Independent review and staged rollout | Independent final review CONCERNS; packaging authorized | Two review corrections are reported verified, with no implementation blocker. Three #757 bot fixes and synthetic/kernel evidence are included in this update. Live acceptance and extraction/default-promotion gates remain open. |
+| M6 Independent review and staged rollout | Final Astra review CLEAN; packaging authorized | F1–F4 and four follow-up observations are corrected. Final nonblocking test-isolation warning was fixed afterward without production changes. Live lifecycle and extraction/default-promotion gates remain open. |
 
 Latest cross-repository results above are supplied by the coordinating agents.
 Public/installed-code research is recorded in
@@ -43,7 +43,7 @@ Human OAuth gates do not pause independent work.
 | Assignment | Local result and next gate |
 | --- | --- |
 | Contract synthetic experiments and new probe | Exact Node read grant, copied native module and fixture/kernel canaries address the broad-grant review finding. Native 1.0.94-5/1.0.95 results are recorded. Selection, exact Keychain bytes and renewal remain gates. |
-| Full kernel-pipeline tests | Claim narrowed to private-DB open/access; no independent find/add enforcement claim. Missing required gh fails. Five offline checks gate local checks and Linux/macOS CI with required Python; two targeted kernel checks are reported passing. |
+| Full kernel-pipeline tests | Claim narrowed to private-DB open/access; no independent find/add enforcement claim. Missing required gh fails. Six offline checks gate local checks and Linux/macOS CI with required Python; two targeted kernel checks are reported passing. |
 | CLI guided host recovery | No automatic gh action retained. Manual storage verification stops on plaintext; trusted clean setup/doctor probe excludes ambient/project shims. Reported Go/99 scripts/budget pass; host OAuth/secure-persistence/restart remain open. |
 | CI/signing and delivery | Previous #757 head has 13 passing checks. Three bot diagnostics are self-reviewed in this packaging update; new-head CI must be checked separately. Sibling draft [#1697](https://github.com/navikt/copilot/pull/1697) is delivered on a signed branch; both signatures are reported verified. |
 
@@ -56,8 +56,8 @@ headless acceptance now passes all four installed/rebuilt chains. Fresh host OAu
 new secure persistence and post-OAuth restart acceptance remain open. Guide source is ready but
 unpublished. The cplt draft update includes next-stage synthetic/kernel evidence
 and three bot diagnostics fixes. No automatic gh action is retained in the
-reported CLI correction. Independent final review reports **CONCERNS**, two
-verified corrections and no implementation blocker. Kernel claims remain limited
+reported CLI correction. Final Astra review reports **CLEAN**, with its nonblocking
+test-isolation warning subsequently fixed. Kernel claims remain limited
 to private-database open/access. New-head CI and sibling delivery are separate
 checks. This is draft-review readiness, not completed host recovery or a proven
 credential-extraction lifecycle.
@@ -198,7 +198,7 @@ The source of lifecycle requirements and reproduction commands is
   independent final review reports CONCERNS. Prior cancellation was before login but after
   settings save, not live OAuth cancellation. Regular/staged launches do not
   automatically start OAuth.
-- Required missing gh now fails instead of silently skipping. Five offline probe
+- Required missing gh now fails instead of silently skipping. Six offline probe
   checks pass and gate local `mise run check` plus Linux/macOS CI, with Python
   required. These are offline checks, not live credential/renewal evidence.
 
@@ -410,8 +410,9 @@ M1/M4 evidence.
 
 ### M6 Independent review and staged rollout
 
-Independent review used available general agents; explicit model selection was
-unavailable. Do not label these reviews as a requested model-specific review.
+Initial independent review used available general agents; explicit model selection
+was unavailable then. The later actual Astra review provenance is recorded below;
+it does not relabel those initial reviews.
 All three reported CLI blockers and four auth-doc issues are fixed and checked.
 This closes those findings, not future extraction review or live host acceptance.
 
@@ -430,6 +431,89 @@ Gate: independent review findings are resolved and maintainers approve the
 evidence-based promotion. Default remains unchanged until then.
 
 ## Open blockers and authorization
+
+### Astra follow-up on `20b7a83`, 2026-10-12
+
+User-supplied reviewer metadata: model ID `github-copilot/gpt-6-astra`, session
+`ses_ece7c5adcffeK1NVS4ZXjM9i05`, reviewed head `20b7a83`. This records the
+reported review identity, not independent verification of the reviewer runtime.
+The corrections below are approved for packaging after the reported Astra reviews.
+
+| Finding | Disposition |
+| --- | --- |
+| F1 Recovery restarted before manual storage/account verification | Both recovery and disposable-account lifecycle recipes now split checks from launch. Require intended active gh account and secure keyring storage first; stop on failure, plaintext or ambiguity. Copilot's selected/billed account remains unverified. |
+| F2 Launch deprecation eagerly probed gh | Predicate now takes a lazy probe and checks applicability first. All replacement-advice callers skip retrieval without an applicable warning. Panic-on-probe synthetic checks cover defaults, disabled guard and Linux. |
+| F3 One-shot cache used passed TMPDIR instead of producer scratch | Both caches use `__CPLT_GH_TOKEN_DIR`. Launch clears ambient locators and emits its actual scratch locator for either cache. Wrapped consumers without a locator refuse rather than reading stale TMPDIR state. GH_TOKEN denial still suppresses both caches; internal-marker denial is already refused by config validation. |
+| F4 No-tools smoke relied on prompt text | Both manual chains now use the already recorded `--available-tools= --deny-tool shell --deny-tool write --deny-tool url --disable-builtin-mcps` restrictions. No new live requests were made. |
+
+Six-axis self-review of the local follow-up diff:
+
+| Axis | Finding or evidence limit |
+| --- | --- |
+| Correctness | Producer and both consumers agree on the cache locator. A failed cache write still yields refusal, not fallback to another directory; no usable-token guarantee follows from eligibility. |
+| Regression | Direct unwrapped gh-gate keeps legacy TMPDIR/TMP lookup. Wrapped launches require the producer marker; all three backends use shared command setup. Linux kernel runtime was not exercised here. |
+| Edge cases | Full launch preserves a stale token in the explicitly passed TMPDIR, consumes the actual scratch token once and refuses the second read. GH_TOKEN denial plus an ambient passed locator cannot revive that stale token. Same-UID hostile mutation remains outside the cache's confidentiality claim. |
+| Requirement coverage | Four Astra findings have code/docs corrections and synthetic checks. Secure manual verification is a user gate, not evidence of completed OAuth or selected Copilot identity. |
+| Repository standards | Serial required checks, all binary tests, guard suites and four kernel-required Copilot project checks pass. Initial attempts caught a private-helper call, missing fixture git root, an already-forbidden internal deny name and clippy boolean formatting; corrected before final gates. |
+| Scope | No resolver/source-priority/default change, real-home credential probe, paid request, commit or push. Cache locator transport is the only launch behavior change. No generated files or Nais deployment apply. |
+
+Fresh gates after the last code edit, exit 0:
+
+- `RUST_TEST_THREADS=1 mise run --jobs 1 check`: fmt/clippy, 414 unit,
+  1586 lib and five offline probe checks.
+- `RUST_TEST_THREADS=1 mise exec -- cargo test --bin cplt --quiet`: 144.
+- `CPLT_TEST_REQUIRE_SANDBOX=1 RUST_TEST_THREADS=1 mise exec -- cargo test --test e2e_projects copilot_ -- --nocapture`: four, including the new passed-TMPDIR full-launch regression.
+
+- `CPLT_TEST_REQUIRE_SANDBOX=1 RUST_TEST_THREADS=1 mise exec -- cargo test --test e2e_guards --test e2e_git_hardening --quiet`: 178 guard and 13 hardening.
+- `git diff --check`: clean after the final documentation edit.
+
+Initial self-review verdict: **CONCERNS**. Fresh OAuth/secure persistence/restart,
+selected identity, renewal and Linux Secret Service runtime remain open. Later
+Astra verdicts below supersede this correction-review status; new-head CI is separate.
+
+Actual Astra follow-up reported **CONCERNS**, session
+`ses_ece5a39eeffeFQCIKSZg9DcUNG`. F2/F3/F4 were accepted; its four remaining
+observations received these additional corrections before final review:
+
+| Observation | Correction and evidence |
+| --- | --- |
+| Lifecycle baseline still launched before manual verification | Searched every auth recipe in the acceptance guide. Both login recipes now pause after checks for intended active gh account and secure keyring storage, before any launch. No completed-OAuth claim. |
+| One-shot handover ignored wrapper installation | Uses the same PATH discovery as wrapper installation, without executing that binary in the parent. A synthetic successful stored lookup with no launch-PATH gh retains the Linux warning; explicit injection remains separate. |
+| Authenticated probe commands trusted prompt-only no-tools | Both interactive and headless branches share the recorded tool-denial/MCP flags. One new offline check captures both command constructions without gh, OAuth or model requests. |
+| Negative-cache e2e could pass on any subprocess error | Requires command-selected gh wrapper content, status 1 and the exact "No cached token available" refusal for both denial and second consumption. Focused unit coverage checks directory-selector precedence and unwrapped TMPDIR/TMP fallback, not end-to-end token reads through those fallback paths. |
+
+Final local gates, exit 0 after the last code edit: serial
+`mise run --jobs 1 check` passed fmt/clippy, 414 unit, 1586 library and **six**
+offline probe checks; all **145** binary tests passed; four kernel-required
+Copilot project tests, 178 guard and 13 hardening tests passed.
+`git diff --check` is clean after this evidence edit. Earlier five-probe/144-binary
+results above describe the prior correction, not these final gates.
+
+The locator remains advisory session transport, not a same-UID security guard.
+No actual auth/live request occurred during these corrections. All four follow-up
+observations were corrected before the final independent review below.
+
+Final reviewer metadata supplied by the user: `github-copilot/gpt-6-astra`,
+session `ses_ece504710fferJLdzqFNQEPV5D`, verdict **CLEAN** with one nonblocking
+warning. That warning is now corrected: positive wrapper discovery uses a
+temporary executable gh fixture and the actual discovery helper, never executing
+it or requiring host-installed gh; the missing-PATH negative case remains.
+No production code changed for this final correction.
+
+Review scope was `20b7a83` plus the then-uncommitted correction diff, not an exact
+review of the subsequently created commit hash. The packaged commit contains those
+reviewed changes, the final test-only isolation correction and ledger/count updates.
+The earlier four-chain live results tested `0bb451a`/`63667f7c`; no live transport
+rerun occurred, and those results do not validate the new cache-locator behavior.
+
+Fresh final-correction checks, exit 0: the focused binary diagnostic test passed;
+`RUST_TEST_THREADS=1 mise run --jobs 1 check` passed fmt/clippy, 414 unit,
+1586 library and six offline probe checks. Final `git diff --check` is clean.
+
+Sibling final review is reported **CLEAN**, session
+`ses_ece4f68a1ffe7NJcnsrvYwDPaQ`, with all findings fixed. This is reported review
+metadata, not a fresh sibling-code verification in this session. Live lifecycle
+and selected-account uncertainties above remain open despite both review verdicts.
 
 ### Initial cplt packaging review, 2026-10-12
 

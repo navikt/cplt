@@ -332,8 +332,12 @@ def main():
             env["GH_TOKEN"] = token
         prompt = "Reply with the concatenation of CPLT and AUTH and 7429, with no spaces or other text. Do not use tools."
         answer = "CPLTAUTH7429"
+        # These flags were verified by installed help and the existing-state
+        # gate. Prompt text alone does not restrict tool execution.
+        no_tools = ["--no-auto-update", "--disable-builtin-mcps", "--available-tools=",
+                    "--deny-tool", "shell", "--deny-tool", "write", "--deny-tool", "url"]
         if args.interactive:
-            command = sandbox + [str(copilot), "--no-auto-update", "--disable-builtin-mcps"]
+            command = sandbox + [str(copilot)] + no_tools
             env["TERM"] = "xterm-256color"
             try:
                 interactive(command, env, project, bool(token), prompt, args.startup_only)
@@ -342,7 +346,7 @@ def main():
                     assert_not_persisted(root, token)
             print("PASS: real Copilot interactive probe")
             return
-        command = (launch + ["--yes", "--quiet", "--"] if args.full_launch else sandbox + [str(copilot)]) + ["--no-auto-update", "-s", "-p", prompt]
+        command = (launch + ["--yes", "--quiet", "--"] if args.full_launch else sandbox + [str(copilot)]) + no_tools + ["-s", "-p", prompt]
         try:
             result = run(
                 command, env=env, cwd=project, timeout=90,
