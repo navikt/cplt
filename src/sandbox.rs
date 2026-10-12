@@ -34,6 +34,7 @@ use crate::ui;
 #[cfg(target_os = "linux")]
 #[path = "sandbox_bubblewrap.rs"]
 mod bubblewrap;
+pub(crate) use policy::gh_config_dir;
 /// The bounded nested-repository walk, shared with the session-end `.git`
 /// check in `audit` (#576) so both look at the same set.
 pub(crate) use policy::{NESTED_SCAN_LIMIT, WalkExtras, has_dot_git_or_is_bare, repo_walk};

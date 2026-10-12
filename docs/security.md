@@ -13,13 +13,11 @@ For the full security model, threat analysis, and test strategy, see **[SECURITY
 
 ## `~/.config/gh/hosts.yml` is readable
 
-Copilot spawns `gh auth token` to authenticate, which reads `~/.config/gh/hosts.yml`. That file holds a GitHub OAuth token. cplt allows reading `hosts.yml` and `config.yml` only, not the rest of `.config/gh`, for these reasons.
+cplt grants read-only access to gh's `hosts.yml` and `config.yml`, not the whole config directory. The same two files are granted at an absolute `GH_CONFIG_DIR` or `$XDG_CONFIG_HOME/gh` override. `hosts.yml` can contain a plaintext GitHub token, but gh can also keep the secret in the OS credential store.
 
-- Auth needs it. Without `gh` auth, Copilot falls back to Keychain only, and many people rely on the `gh` CLI instead.
-- The access is read-only. The sandbox cannot modify the token file.
-- It is minimal. Only the two files `gh` actually reads are granted. Extensions, state, and everything else under `.config/gh` stay blocked.
-- The token goes where it already goes. It is a GitHub token Copilot already sends to GitHub's API, so an attacker would have to exfiltrate it to a *different* server.
-- The residual risk is real. A compromised Copilot could exfiltrate the token over port 443. Use `--deny-path ~/.config/gh` if that bothers you, and Copilot will use Keychain auth instead.
+Copilot can receive an exported token, a host-retrieved gh token, a one-shot guard cache, or native Keychain access on macOS. The gh guard also has a separate exec-token cache for sandboxed gh. A retrieved token does not prove validity, Copilot entitlement or the account Copilot selected. See [GitHub token handling](../SECURITY.md#github-token-handling-per-agent).
+
+A compromised agent can read a granted plaintext token or a guard cache and use it wherever the network policy permits. `--deny-path ~/.config/gh`, or a deny on the relocated directory, blocks sandboxed file access where enforced. It does **not** prevent cplt from retrieving the token through gh on the host or handing it over through another channel, and does not force Copilot to use its Keychain login. For native-login diagnostics, see [known impacts](known-impacts.md#the-same-vault-prompt-on-macos).
 
 ## Outbound network is port-restricted
 
@@ -28,7 +26,7 @@ This section describes the macOS Seatbelt profile; the Linux equivalents, and wh
 - Only port 443 is allowed. Every other outbound TCP port is blocked at the kernel level.
 - Localhost outbound is blocked on macOS, which keeps the agent away from local services such as databases and dev servers. Landlock has no localhost pinning, so this does not hold on Linux.
 - The SSH agent is blocked on macOS. Unix socket access is denied, so loaded SSH keys cannot be used. On Linux it is not gated by Landlock below kernel 7.1; bubblewrap's private `/tmp` hides the stock OpenSSH socket, but a desktop agent under `$XDG_RUNTIME_DIR` stays reachable.
-- Filesystem isolation is the primary control. Credentials are kernel-blocked whatever the network allows.
+- Filesystem isolation blocks denied credential paths. Auth credentials deliberately handed to the agent remain readable and usable within the allowed network policy.
 - The proxy is on by default, and logs and filters every outbound connection from Copilot, `gh`, and `curl` alike.
 - `cplt config set allow.ports 8443` adds an outbound port to remote hosts. A local dev server or database needs `allow.localhost` instead: `allow.ports` does not open loopback.
 
@@ -53,7 +51,7 @@ No `open` process existed in either run. Separately, the profile's blanket `(all
 
 Both bypasses are one-liners for a hostile agent. A shim would stop an agent that types `open` politely and nothing else, so cplt does not ship one and does not describe this flag as scopable.
 
-**What to do instead.** Leave it off, which is the default. Turn it on only while a sign-in prompt is actually on screen, and turn it back off afterwards. Of the supported agents only Antigravity needs it; Copilot, OpenCode and Claude Code use device flows that print a code and a URL and need no browser at all. `cplt config set sandbox.allow_browser true` is flagged dangerous and asks for confirmation, and `detect` never proposes it.
+**What to do instead.** Leave it off, which is the default. Sign in outside cplt or use an agent's device-code flow and open the URL yourself. Copilot supports `copilot login --device-code`; its default desktop login can launch a browser. If you enable this grant for a flow that needs it, restore the prior setting afterwards. `cplt config set sandbox.allow_browser true` is flagged dangerous and asks for confirmation, and `detect` never proposes it.
 
 ## Limitations
 
@@ -62,7 +60,7 @@ Both bypasses are one-liners for a hostile agent. A shim would stop an agent tha
 - **`sandbox-exec` is deprecated.** Apple has not removed it, but may in a future macOS version.
 - **SBPL has no domain-based filtering.** The optional CONNECT proxy provides domain blocking.
 - **SBPL has no `lsopen` filtering either.** `--allow-browser` is therefore all of Launch Services or none of it, and with it on the agent launches applications outside the sandbox. It cannot be narrowed by a wrapper: see [`--allow-browser` is a sandbox escape](#--allow-browser-is-a-sandbox-escape-and-cannot-be-scoped).
-- **Keychain access is required.** Copilot stores auth tokens in the macOS Keychain.
+- **Keychain access is conditional.** Copilot's native login can use the macOS Keychain. By default cplt drops its broad Keychain grant when an exported or host-retrieved gh token substitutes for it; without a substitute, or on a detected account mismatch, the grant stays. Retrieval and a matching item do not prove the selected account or successful authentication.
 - **Proxy-forced mode is kernel-enforced for connections.** With `--proxy-forced` or `proxy.forced = true` ([#53](https://github.com/navikt/cplt/issues/53), opt-in, off by default), SBPL pins outbound egress to `localhost:<proxy_port>`. Seatbelt can pin to localhost, so there is no residual for connections on macOS: no direct `:443` path exists, and neither raw sockets nor `env -u HTTPS_PROXY` can get around the proxy. DNS lookups through the system resolver remain possible. It fails closed if the proxy cannot start, and conflicts with `--no-proxy`.
 
 ### Linux

@@ -180,6 +180,104 @@ mod project_tests {
 
     // ── TempProject ────────────────────────────────────────────────
 
+    #[test]
+    fn copilot_auth_handover_keeps_keychain_only_without_a_substitute() {
+        use std::os::unix::fs::PermissionsExt;
+        require_sandbox!();
+        let home = home_temp_dir("copilot-auth");
+        let project = TempProject::new("copilot-auth");
+        let bin = home.path().join("bin");
+        let keychains = home.path().join("Library/Keychains");
+        for dir in [&bin, &keychains, &home.path().join("gh")] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let config = home.path().join("cplt.toml");
+        let path = std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
+            .unwrap();
+        let agent = bin.join("copilot");
+        fs::write(
+            &agent,
+            r#"#!/bin/sh
+for arg in "$@"; do
+  if [ "$arg" = --version ]; then echo '1.0.86'; exit 0; fi
+done
+if [ "$GH_TOKEN" = fixture-secret ]; then echo TOKEN_PRESENT; else echo TOKEN_ABSENT; fi
+if /bin/cat "$HOME/Library/Keychains/probe" >/dev/null 2>&1; then
+  echo KEYCHAIN_FILE_READ_ALLOWED
+else
+  echo KEYCHAIN_FILE_READ_DENIED
+fi
+if /bin/sh -c 'echo updated > "$HOME/Library/Keychains/probe"' 2>/dev/null; then
+  echo KEYCHAIN_FILE_WRITE_ALLOWED
+else
+  echo KEYCHAIN_FILE_WRITE_DENIED
+fi
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o755)).unwrap();
+
+        for (enabled, token, denied) in [
+            (true, Some("fixture-secret"), true),
+            (true, None, false),
+            (false, Some("fixture-secret"), false),
+        ] {
+            fs::write(
+                &config,
+                format!("[sandbox]\nkeychain_substitute = {enabled}\n"),
+            )
+            .unwrap();
+            fs::write(keychains.join("probe"), "original").unwrap();
+            let mut cmd = cplt_cmd();
+            cmd.env_clear()
+                .env("CPLT_CONFIG", &config)
+                .env("NO_COLOR", "1")
+                .env("HOME", home.path())
+                .env("GH_CONFIG_DIR", home.path().join("gh"))
+                .env("PATH", &path)
+                .current_dir(project.path())
+                .args([
+                    "--agent",
+                    "copilot",
+                    "--yes",
+                    "--no-validate",
+                    "--no-proxy",
+                    "--no-scratch-dir",
+                ]);
+            if let Some(token) = token {
+                cmd.env("GH_TOKEN", token);
+            }
+            let out = cmd.output().unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                out.status.success(),
+                "key={enabled}, token={token:?}: {stdout}\n{stderr}"
+            );
+            assert!(
+                stdout.contains(if token.is_some() {
+                    "TOKEN_PRESENT"
+                } else {
+                    "TOKEN_ABSENT"
+                }),
+                "{stdout}"
+            );
+            for operation in ["READ", "WRITE"] {
+                let result = if denied { "DENIED" } else { "ALLOWED" };
+                assert!(
+                    stdout.contains(&format!("KEYCHAIN_FILE_{operation}_{result}")),
+                    "{stdout}"
+                );
+            }
+            assert!(!stdout.contains("fixture-secret"), "{stdout}");
+            assert!(!stderr.contains("fixture-secret"), "{stderr}");
+            assert_eq!(
+                fs::read_to_string(keychains.join("probe")).unwrap(),
+                if denied { "original" } else { "updated\n" }
+            );
+        }
+    }
+
     /// A temporary project directory with realistic file structure.
     ///
     /// Backed by a `tempfile::TempDir` so it auto-deletes on drop — including

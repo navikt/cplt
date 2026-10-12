@@ -855,9 +855,9 @@ pub fn linux_keyring_finding(
 ) -> Option<Finding> {
     (linux && agent == Agent::Copilot && session_bus && !env_token && !inject_token).then(|| {
         Finding::warning(
-            "Copilot keeps its login in the system keyring, which the sandbox cannot reach \
-             (D-Bus is masked): inside cplt it asks you to sign in again, or to store the \
-             token in plain text.",
+            "If Copilot's login is in the system keyring, the sandbox cannot reach it \
+             (D-Bus is masked): Copilot may ask you to sign in again or store the token \
+             in plain text. The stored login was not checked.",
             Some(
                 "export COPILOT_GITHUB_TOKEN, or run `gh auth login` on the host and \
                  `cplt config set gh_guard.inject_token true --force` (needs gh_guard.enabled)"
@@ -996,7 +996,7 @@ pub struct AuthDecision<'a> {
     pub macos: bool,
     /// The first of the agent's token variables exported and not in `deny.env`.
     pub env_token: Option<&'a str>,
-    /// `gh auth token` succeeds on the host.
+    /// Trusted gh returned a stored github.com token; validity is not checked.
     pub gh_login: bool,
     /// Copilot's keytar module is installed. Whether it holds a login is not
     /// checked; kept so a Linux keytar user gets no false blocking finding.
@@ -1023,8 +1023,13 @@ pub fn auth_report(d: &AuthDecision<'_>, home: &Path) -> (Option<String>, String
         Some(KeychainSubstitute::File(p)) => format!("{} (token file)", tilde(p, home)),
         None => match d.env_token {
             Some(v) => format!("{v} (exported)"),
-            None if d.macos && d.agent.needs_keychain() => format!("{name}'s own login (Keychain)"),
-            None if d.agent == Agent::Copilot && d.gh_login => "gh login".to_string(),
+            None if d.macos && d.agent.needs_keychain() => {
+                format!("left to {name}: Keychain access granted, stored login not checked")
+            }
+            None if d.agent == Agent::Copilot && d.gh_login => {
+                "stored gh token for github.com found (validity and handover not checked)"
+                    .to_string()
+            }
             None if d.agent == Agent::Copilot && d.other_login => {
                 "not checked (Copilot's keytar module is installed)".to_string()
             }
@@ -1051,8 +1056,9 @@ pub fn auth_report(d: &AuthDecision<'_>, home: &Path) -> (Option<String>, String
             && !d.macos =>
         {
             Some(Finding::blocking(
-                "No auth for Copilot: gh is not logged in and none of COPILOT_GITHUB_TOKEN, \
-                 GH_TOKEN, GITHUB_TOKEN is set.",
+                "No credential source discovered for Copilot: no stored gh token for github.com \
+                 was retrieved and none of COPILOT_GITHUB_TOKEN, GH_TOKEN, GITHUB_TOKEN \
+                 reaches the sandbox.",
                 "gh auth login",
             ))
         }
@@ -1640,6 +1646,16 @@ mod tests {
     }
 
     #[test]
+    fn keychain_grant_does_not_claim_a_stored_login() {
+        for agent in [Agent::Copilot, Agent::Claude] {
+            let (kc, auth, finding) = auth_report(&decision(agent, true), Path::new("/fixture"));
+            assert_eq!(kc.as_deref(), Some("granted"));
+            assert!(auth.contains("stored login not checked"), "{auth}");
+            assert!(finding.is_none());
+        }
+    }
+
+    #[test]
     fn auth_copilot_on_linux_without_login_blocks() {
         let (kc, auth, f) = auth_report(&decision(Agent::Copilot, false), Path::new("/home/u"));
         assert!(kc.is_none());
@@ -1650,7 +1666,10 @@ mod tests {
             ..decision(Agent::Copilot, false)
         };
         let (_, auth, f) = auth_report(&d, Path::new("/home/u"));
-        assert_eq!(auth, "gh login");
+        assert_eq!(
+            auth,
+            "stored gh token for github.com found (validity and handover not checked)"
+        );
         assert!(f.is_none());
         let (_, auth, _) = auth_report(&decision(Agent::Shell, false), Path::new("/home/u"));
         assert_eq!(auth, "none (the shell needs no login)");

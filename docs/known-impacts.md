@@ -122,7 +122,7 @@ broad IPC channel into the whole desktop session, which is why it is masked.
 the token in.
 
 ```bash
-gh auth login                                   # outside cplt, once
+gh auth login --hostname github.com              # outside cplt, once
 cplt config set gh_guard.inject_token true --force   # needs gh_guard.enabled
 ```
 
@@ -133,8 +133,75 @@ of them, through `/proc/<pid>/environ` on Linux or `ps -E` on macOS. See
 persists across sessions, at the cost of a token on disk in the agent's config
 directory.
 
-macOS is unaffected: the Keychain is granted (narrowed per agent by
-`keychain_substitute`).
+### The same vault prompt on macOS
+
+Run `cplt doctor --agent copilot` outside the agent. With `keychain: denied`
+and `auth: gh auth token (passed as GH_TOKEN)`, cplt deliberately removed the
+Keychain grant because it retrieved a replacement credential. This reports
+handover, not token validity, Copilot authorization or the selected account.
+An explicit `/login` can still try to
+store a new credential in the denied Keychain. Cancel the plaintext-storage
+offer while investigating.
+
+Check the gh account and compare ordinary startup with a one-shot request:
+
+```bash
+(
+unset COPILOT_GITHUB_TOKEN GH_TOKEN GITHUB_TOKEN
+gh auth status --hostname github.com
+gh api --hostname github.com user --jq .login
+cplt --agent copilot -- -p "Reply with OK only"
+cplt --agent copilot
+)
+```
+
+Token retrieval does not prove validity or Copilot authorization. Record the
+error before the vault prompt and whether it appeared automatically or after
+`/login`. If both requests fail, compare the same token with the standalone
+Copilot executable outside cplt. Use the absolute path reported by
+`cplt doctor --agent copilot --verbose` to bypass shell aliases and PATH shims.
+Clear all three exported token variables in that comparison too, then assign
+the stored gh token as `GH_TOKEN` for the standalone command. Otherwise an
+exported credential may override the stored one. Use a subshell to preserve
+the calling shell's environment. Do not print tokens or run token assignment
+with shell tracing enabled.
+
+For Copilot's own stored login, sign in with the standalone executable outside
+cplt and verify secure storage. cplt does not extract that credential today.
+To test that login on macOS:
+
+1. Record the prior values and whether each key was explicitly set, including
+   any repository-local override. Run the following from the same repository
+   and config scope used for the launch. These commands write global config;
+   add `--local` when changing a repository-local override:
+
+   ```bash
+   cplt config set sandbox.keychain_substitute false
+   cplt config set gh_guard.inject_token false
+   ```
+
+   Substitution off restores broad Keychain read/write access, not access to
+   just Copilot's item. Injection must also be off: otherwise cplt can still
+   put gh's stored token in Copilot's environment.
+2. Restart with the exported tokens cleared in a subshell:
+
+   ```bash
+   (
+   unset COPILOT_GITHUB_TOKEN GH_TOKEN GITHUB_TOKEN
+   cplt --agent copilot
+   )
+   ```
+
+   This tests native-login availability, not isolation from every gh source.
+   Copilot can still invoke gh, and readable `hosts.yml` or a guard cache can
+   supply a token. A successful request alone does not identify the source.
+3. Restore each key to its actual prior value in the scope you changed.
+   Use `cplt config set <key> --unset` only if that key was originally unset
+   there; otherwise restore its explicit `true` or `false` value. The subshell
+   preserves the calling shell's exported tokens.
+
+Maintainers: [authentication acceptance tests](copilot-auth-testing.md) separate
+automated handover/enforcement checks from live onboarding and renewal evidence.
 
 ## `.env` file blocking
 
@@ -798,19 +865,19 @@ Git commit works for every agent. Whether `git push` works over HTTPS depends on
 
 | Agent                                       | HTTPS push  | Credential source                                                          |
 | ------------------------------------------- | ----------- | -------------------------------------------------------------------------- |
-| `copilot`                                   | ✅ Works     | Keychain is denied by default; `gh` uses the `GH_TOKEN` cplt hands Copilot (from `gh auth token`). Where the grant stays (no token, or an account mismatch), the Keychain is readable, as in the next row |
-| `antigravity`, `claude`, `goose`            | ✅ Works     | Login Keychain is readable, which is where `gh auth login` stores the token |
+| `copilot`                                   | Token source depends on launch | On macOS substitution is on by default, but denies Keychain access only when a substitute resolves. `gh` reads surviving `GH_TOKEN`/`GITHUB_TOKEN`; it ignores `COPILOT_GITHUB_TOKEN`. The guard can supply an exec token when the grant was dropped and gh has no environment token. No substitute, or a detected account mismatch, keeps the Keychain grant |
+| `antigravity`, `claude`, `goose`            | Token source depends on launch | Login Keychain is granted unless the agent's substitution applies. With the gh guard on, its exec token can authenticate gh without that grant |
 | `opencode`, `pi`, `dsh`, `cplt exec`        | ✅ Works     | Keychain is denied. The gh guard reads the token at launch and hands it to `gh` as the exec token when git asks for credentials ([how](gh-guard.md#how-gh-itself-authenticates)). With `gh_guard.enabled = false` these agents need a token in `hosts.yml` or `--pass-env GH_TOKEN` |
 
-Both rows depend on where `gh` keeps the token. An installation that stores it in `~/.config/gh/hosts.yml` rather than the Keychain works for every agent, since that file is readable in every profile, and `--pass-env GH_TOKEN` supplies one regardless of agent.
+Authentication still depends on a valid credential for the target host. A token stored in `hosts.yml` is normally readable by every agent; gh can instead keep the secret in the OS credential store. `--pass-env GH_TOKEN` forwards an exported token regardless of agent, unless `deny.env` removes it.
 
 The Keychain row has one caveat. When the Keychain substitute applies (`sandbox.keychain_substitute`: by default for Copilot and Claude Code, `true` for the others) the Keychain grant is dropped for an agent whose own credential already reaches it another way: `claude` with `CLAUDE_CODE_OAUTH_TOKEN` exported, `antigravity` with its `~/.gemini/antigravity-cli/antigravity-oauth-token` fallback file present. The drop takes `gh`'s Keychain token with it. With the gh guard on, the exec token covers push for those two agents as in the row below; with it off, push fails for them in that configuration. Copilot keeps a token `gh` can use when the one it was handed is `GH_TOKEN` or `GITHUB_TOKEN`, which covers the `gh auth token` handover. A token exported only as `COPILOT_GITHUB_TOKEN` is one `gh` does not read, so there the exec token is written and the gh guard covers push. Push under a dropped grant was not tested. goose, and Antigravity without its fallback file, have no substitute and keep the whole-Keychain grant; that gap is known.
 
 For Claude Code the drop also takes its MCP OAuth tokens, which it keeps in the Keychain on macOS. Each MCP server that uses OAuth asks for one fresh sign-in, and Claude Code then stores the token in plaintext in `~/.claude/.credentials.json`, which the agent can read and write ([credential management](https://code.claude.com/docs/en/authentication.md#credential-management)). Those MCP tokens are exposed instead of the Keychain items the grant reached.
 
-**On Linux the table does not apply.** There is no Keychain grant to drop in the first place; `gh` reads its token from the Secret Service or from `hosts.yml`, and push works wherever that lookup succeeds.
+**On Linux there is no Keychain grant to drop.** Host-side gh can retrieve a stored token from the Secret Service or `hosts.yml`; the guard's exec cache can supply it to sandboxed gh. Direct access to the Secret Service inside the sandbox is not guaranteed.
 
-`~/.config/gh/hosts.yml` and `config.yml` are readable for every agent, so an installation that keeps the token in `hosts.yml` rather than the Keychain works everywhere — unless you take the `--deny-path ~/.config/gh` mitigation from [Honest gaps](../SECURITY.md#honest-gaps), which closes that path too.
+`hosts.yml` and `config.yml` are normally readable for every agent, including at an absolute `GH_CONFIG_DIR` or `$XDG_CONFIG_HOME/gh` override. A `--deny-path` on that directory blocks sandboxed file access where enforced. It does not prevent host-side gh extraction, environment handover or guard token caches; see [Honest gaps](../SECURITY.md#honest-gaps).
 
 Exporting a token in your own shell is not enough on its own: `GH_TOKEN`, `GITHUB_TOKEN` and `COPILOT_GITHUB_TOKEN` are stripped from the environment of every agent except Copilot. Passing one explicitly does work, because `--pass-env` is applied after that suppression: `cplt --pass-env GH_TOKEN exec …` forwards it, and `gh auth status` then reports `Logged in to github.com account … (GH_TOKEN)`. Note that `--pass-env` is a global flag and goes before the subcommand, not after it. A repo `deny.env` naming the variable strips it again.
 

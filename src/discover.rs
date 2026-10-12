@@ -1,12 +1,12 @@
 //! Runtime environment discovery for cplt.
 //!
 //! Probes the local environment to determine:
-//! - Which auth mechanism Copilot will use
+//! - Which credential sources and native auth modules are present
 //! - Where Copilot CLI is installed and what native modules it has
 //! - Which developer tools are available
 //! - Which sandbox-critical paths exist
 //!
-//! All checks are read-only, local (no network), and fast (<500ms total).
+//! Checks are read-only and local (no network); subprocess probes are bounded.
 
 use crate::sandbox::{DENIED_DOTFILES, DENIED_FILES};
 use crate::ui;
@@ -57,9 +57,9 @@ pub enum VersionProbe {
 pub struct AuthDiscovery {
     /// Which env var tokens are set (name only, never the value).
     pub env_tokens: Vec<String>,
-    /// Whether `gh auth token` succeeds.
+    /// Whether trusted gh returns a nonempty stored token for github.com.
     pub gh_cli_auth: bool,
-    /// Whether `~/.config/gh/hosts.yml` exists.
+    /// Whether hosts.yml exists in gh's effective config directory.
     pub gh_config_exists: bool,
     /// Whether `/usr/bin/security` exists and is executable.
     pub security_cli_exists: bool,
@@ -121,29 +121,22 @@ pub struct PathDiscovery {
 const AUTH_ENV_VARS: &[&str] = &["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"];
 
 pub fn discover_auth(home_dir: &Path) -> AuthDiscovery {
+    discover_auth_with(home_dir, stored_gh_token)
+}
+
+fn discover_auth_with(
+    home_dir: &Path,
+    stored_token: impl FnOnce() -> Option<String>,
+) -> AuthDiscovery {
     let env_tokens: Vec<String> = AUTH_ENV_VARS
         .iter()
-        .filter(|var| std::env::var(var).is_ok_and(|v| !v.is_empty()))
+        .filter(|var| std::env::var(var).is_ok_and(|v| !v.trim().is_empty()))
         .map(std::string::ToString::to_string)
         .collect();
 
-    // Trusted path, not PATH (#239): this runs in the unsandboxed parent, and
-    // `gh` is one of the binaries an agent can plant in a write+exec grant. It
-    // also answers the question that actually matters — `extract_gh_token`
-    // consults a trusted `gh` and nothing else, so a `gh` outside those
-    // directories genuinely does not supply the token, whatever it would say
-    // here.
-    let gh_cli_auth = crate::git::trusted_binary("gh").is_some_and(|gh| {
-        #[allow(clippy::disallowed_methods)] // resolved above, not a PATH lookup
-        std::process::Command::new(gh)
-            .args(["auth", "token"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
-    });
+    let gh_cli_auth = stored_token().is_some();
 
-    let gh_config_exists = home_dir.join(".config/gh/hosts.yml").exists();
+    let gh_config_exists = gh_hosts_yml(home_dir).is_some_and(|p| p.exists());
 
     // macOS Keychain CLI — not applicable on Linux.
     let security_cli_exists = probe_security_cli();
@@ -159,8 +152,54 @@ pub fn discover_auth(home_dir: &Path) -> AuthDiscovery {
     }
 }
 
+/// gh's stored github.com token, using the same probe for diagnosis and launch.
+/// A PATH lookup could execute an agent-planted binary outside the sandbox.
+pub(crate) fn stored_gh_token() -> Option<String> {
+    gh_auth_token(&crate::git::trusted_binary("gh")?, PROBE_TIMEOUT)
+}
+
+/// Pin the host and discard exported tokens so discovery cannot mistake an
+/// ambient credential or a GHES login for gh's stored github.com credential.
+#[allow(clippy::disallowed_methods)] // resolved trusted path, or a fixture in tests
+pub(crate) fn gh_auth_token(gh: &Path, timeout: Duration) -> Option<String> {
+    let mut cmd = std::process::Command::new(gh);
+    cmd.args(["auth", "token", "--hostname", "github.com"]);
+    for var in AUTH_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    let buf = bounded_stdout(cmd, timeout)?;
+    let token = String::from_utf8_lossy(&buf).trim().to_string();
+    (!token.is_empty()).then_some(token)
+}
+
+/// Bound both the child and its stdout: a descendant can keep the pipe open
+/// after gh exits. Null stdin prevents credential prompts from reading the TTY.
+pub(crate) fn bounded_stdout(mut cmd: std::process::Command, timeout: Duration) -> Option<Vec<u8>> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let result = stdout.read_to_end(&mut buf);
+        let _ = tx.send(result.map(|_| buf));
+    });
+    let status = crate::audit::wait_timeout(&mut child, timeout)?;
+    let buf = rx.recv_timeout(READ_GRACE).ok()?.ok()?;
+    status.success().then_some(buf)
+}
+
+/// Match gh's config lookup; relative overrides cannot be granted by cplt.
+pub(crate) fn gh_hosts_yml(home: &Path) -> Option<PathBuf> {
+    crate::sandbox::gh_config_dir(home).map(|dir| dir.join("hosts.yml"))
+}
+
 impl AuthDiscovery {
-    /// Returns true if at least one auth mechanism is available.
+    /// A credential source or native auth module was discovered, not validated.
     pub fn any_auth_available(&self) -> bool {
         !self.env_tokens.is_empty()
             || self.gh_cli_auth
@@ -674,19 +713,19 @@ impl Discovery {
         if !copilot {
         } else if self.auth.gh_cli_auth {
             println!(
-                "  {}✓{} gh CLI: authenticated (gh auth token succeeds)",
+                "  {}✓{} gh CLI: stored github.com token found (validity not checked)",
                 ui::stdout_color(ui::GREEN),
                 ui::stdout_color(ui::RESET)
             );
         } else if self.auth.gh_config_exists {
             println!(
-                "  {}⚠{} gh CLI: config exists (~/.config/gh/hosts.yml) but gh auth token fails",
+                "  {}⚠{} gh CLI: hosts.yml exists in the effective config directory, but no stored github.com token was retrieved",
                 ui::stdout_color(ui::YELLOW),
                 ui::stdout_color(ui::RESET)
             );
         } else {
             println!(
-                "  {}⚠{} gh CLI: no config found (~/.config/gh/hosts.yml)",
+                "  {}⚠{} gh CLI: no hosts.yml found in the effective config directory",
                 ui::stdout_color(ui::YELLOW),
                 ui::stdout_color(ui::RESET)
             );
@@ -703,7 +742,7 @@ impl Discovery {
         }
         if copilot && !self.auth.any_auth_available() {
             println!(
-                "  {}✗{} No auth mechanism available, Copilot will fail to authenticate",
+                "  {}✗{} No env token, stored gh token or native auth module discovered; Copilot login is not verified",
                 ui::stdout_color(ui::RED),
                 ui::stdout_color(ui::RESET)
             );
@@ -1022,7 +1061,7 @@ fn print_keychain_status(security_cli_exists: bool) {
     #[cfg(target_os = "macos")]
     if security_cli_exists {
         println!(
-            "  {}✓{} Keychain CLI: /usr/bin/security exists",
+            "  {}✓{} Keychain CLI: /usr/bin/security exists (agent login not checked)",
             ui::stdout_color(ui::GREEN),
             ui::stdout_color(ui::RESET)
         );
@@ -2248,14 +2287,56 @@ mod tests {
     #[test]
     fn auth_discovery_detects_env_vars() {
         temp_env::with_var("COPILOT_GITHUB_TOKEN", Some("test-token-value"), || {
-            // Read under temp_env's lock: another test in this binary sets HOME.
-            let home = PathBuf::from(std::env::var("HOME").unwrap());
-            let auth = discover_auth(&home);
+            let home = tempfile::tempdir().unwrap();
+            let auth = discover_auth_with(home.path(), || None);
             assert!(
                 auth.env_tokens
                     .contains(&"COPILOT_GITHUB_TOKEN".to_string())
             );
         });
+    }
+
+    #[test]
+    fn auth_config_discovery_follows_gh_overrides() {
+        let home = tempfile::tempdir().unwrap();
+        let gh = home.path().join("relocated-gh");
+        let xdg = home.path().join("xdg");
+        for dir in [&gh, &xdg.join("gh")] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("hosts.yml"), "github.com:\n").unwrap();
+        }
+        temp_env::with_vars(
+            [
+                ("GH_CONFIG_DIR", Some(gh.as_os_str())),
+                ("XDG_CONFIG_HOME", Some(xdg.as_os_str())),
+            ],
+            || {
+                assert_eq!(gh_hosts_yml(home.path()), Some(gh.join("hosts.yml")));
+                assert!(discover_auth_with(home.path(), || None).gh_config_exists);
+            },
+        );
+        temp_env::with_vars(
+            [
+                ("GH_CONFIG_DIR", None),
+                ("XDG_CONFIG_HOME", Some(xdg.as_os_str())),
+            ],
+            || {
+                assert_eq!(gh_hosts_yml(home.path()), Some(xdg.join("gh/hosts.yml")));
+                assert!(discover_auth_with(home.path(), || None).gh_config_exists);
+            },
+        );
+        temp_env::with_vars(
+            [("GH_CONFIG_DIR", None::<&str>), ("XDG_CONFIG_HOME", None)],
+            || assert!(!discover_auth_with(home.path(), || None).gh_config_exists),
+        );
+    }
+
+    #[test]
+    fn auth_discovery_retains_only_presence_of_stored_token() {
+        let home = tempfile::tempdir().unwrap();
+        let auth = discover_auth_with(home.path(), || Some("gho_private_fixture".into()));
+        assert!(auth.gh_cli_auth);
+        assert!(!format!("{auth:?}").contains("gho_private_fixture"));
     }
 
     #[test]
