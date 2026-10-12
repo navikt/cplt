@@ -4497,6 +4497,13 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         Ok(path) => path,
         Err(msg) => bail!("{msg}"),
     };
+    if active_agent == agent::Agent::Copilot {
+        agent::validate_copilot_keychain_substitute(
+            &agent_bin,
+            prepared.keychain_substitute().is_some(),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
 
     // #248: the agent binary is spawned by the UNSANDBOXED parent, from wherever
     // it was discovered. #236 moved cplt's own helpers onto trusted-directory
@@ -7846,6 +7853,16 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
     doctor_exec.dedup();
     let agent_bin_result = active_agent.resolve_binary();
     let doctor_install_dir = agent_install_dir(active_agent, &agent_bin_result, &home_dir);
+    if active_agent == agent::Agent::Copilot
+        && let Ok(bin) = &agent_bin_result
+        && let Err(e) =
+            agent::validate_copilot_keychain_substitute(bin, keychain_substitute.is_some())
+    {
+        findings.push(Finding::blocking(
+            doctor_tilde(&e, &home_dir),
+            "brew install --cask copilot-cli",
+        ));
+    }
     let doctor_electron_dir = discover_electron_app_dir(&agent_bin_result, active_agent);
     let sandbox_config = build_sandbox_config(
         &resolved,

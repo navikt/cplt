@@ -1697,6 +1697,10 @@ pub fn which_on_path(name: &str) -> Option<PathBuf> {
 /// [`which_resolved`] for an agent: a cplt PATH shim is skipped, so the path
 /// shown is the real binary the shim stands in for (#514).
 fn real_agent_binary(name: &str) -> Option<PathBuf> {
+    // Doctor must report the standalone Copilot the launch prefers (#753).
+    if name == "copilot" {
+        return crate::agent::Agent::Copilot.resolve_binary().ok();
+    }
     let path = crate::shim::real_binary(name)?;
     Some(std::fs::canonicalize(&path).unwrap_or(path))
 }

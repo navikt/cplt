@@ -2580,7 +2580,7 @@ impl Agent {
                     if self_exe.as_ref() == Some(&real_bin) {
                         continue;
                     }
-                    if matches!(self, Agent::Copilot) && is_editor_shim(&real_bin) {
+                    if matches!(self, Agent::Copilot) && is_copilot_editor_launcher(&real_bin) {
                         if editor_shim.is_none() {
                             editor_shim = Some(real_bin);
                         }
@@ -2615,7 +2615,7 @@ impl Agent {
                 }
 
                 // Copilot-specific: prefer standalone over editor shims
-                if matches!(self, Agent::Copilot) && is_editor_shim(&resolved) {
+                if matches!(self, Agent::Copilot) && is_copilot_editor_launcher(&resolved) {
                     if editor_shim.is_none() {
                         editor_shim = Some(resolved);
                     }
@@ -3060,12 +3060,40 @@ pub fn is_windows_interop_path(path: &Path) -> bool {
         && parts.next().is_some()
 }
 
-/// Check if a copilot binary is a VS Code/Cursor/editor shim script.
-fn is_editor_shim(path: &Path) -> bool {
-    let Ok(content) = std::fs::read_to_string(path) else {
+/// Editor launchers can read the Keychain before Copilot consumes its env token
+/// (#753). Prefer standalone installs even when the editor launcher is not the
+/// older `copilotCLIShim.js` script.
+pub fn is_copilot_editor_launcher(path: &Path) -> bool {
+    let components: Vec<_> = path.components().collect();
+    if components.windows(2).any(|pair| {
+        pair[0].as_os_str() == "github.copilot-chat" && pair[1].as_os_str() == "copilotCli"
+    }) {
+        return true;
+    }
+    let Ok(Some(content)) = crate::untrusted::read_untrusted(path, 64 * 1024) else {
         return false;
     };
     content.starts_with("#!") && content.contains("copilotCLIShim.js")
+}
+
+/// Refuse an editor launch with a denied Keychain rather than restore the
+/// whole-Keychain grant silently. The same check feeds launch and doctor.
+pub fn validate_copilot_keychain_substitute(
+    path: &Path,
+    substitute_active: bool,
+) -> Result<(), String> {
+    if cfg!(target_os = "macos") && substitute_active && is_copilot_editor_launcher(path) {
+        return Err(format!(
+            "Copilot's editor launcher at {} can require the Keychain even with GH_TOKEN set \
+             (#753), but this session denies Keychain access. Install standalone Copilot \
+             outside cplt with `brew install --cask copilot-cli` or \
+             `npm install -g @github/copilot`, put it in PATH, then rerun \
+             `cplt doctor --verbose` to check the selected binary. \
+             Keep sandbox.keychain_substitute enabled.",
+            path.display(),
+        ));
+    }
+    Ok(())
 }
 
 /// Detect if a candidate path (before canonicalization) is a mise or asdf shim.
@@ -5771,6 +5799,62 @@ mod tests {
                 assert_eq!(Agent::auto_detect(), None);
             },
         );
+    }
+
+    #[test]
+    fn copilot_prefers_standalone_over_editor_launchers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        let editor = home.join(
+            "Library/Application Support/Code/User/globalStorage/github.copilot-chat/copilotCli",
+        );
+        let old_editor = home.join("old-editor");
+        let standalone = home.join("standalone");
+        for (dir, body) in [
+            (&editor, "#!/bin/sh\nexit 0\n"),
+            (&old_editor, "#!/bin/sh\n# copilotCLIShim.js\n"),
+            (&standalone, "#!/bin/sh\nexit 0\n"),
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("copilot"), body).unwrap();
+        }
+        for launcher in [&editor, &old_editor] {
+            let path = std::env::join_paths([launcher, &standalone]).unwrap();
+            temp_env::with_vars(
+                [
+                    ("HOME", Some(home.as_os_str())),
+                    ("PATH", Some(path.as_os_str())),
+                ],
+                || {
+                    assert_eq!(
+                        Agent::Copilot.resolve_binary(),
+                        Ok(standalone.join("copilot"))
+                    );
+                },
+            );
+            temp_env::with_vars(
+                [
+                    ("HOME", Some(home.as_os_str())),
+                    ("PATH", Some(launcher.as_os_str())),
+                ],
+                || {
+                    let bin = Agent::Copilot.resolve_binary().unwrap();
+                    assert_eq!(bin, launcher.join("copilot"));
+                    assert!(validate_copilot_keychain_substitute(&bin, false).is_ok());
+                    let result = validate_copilot_keychain_substitute(&bin, true);
+                    if cfg!(target_os = "macos") {
+                        assert!(
+                            result
+                                .unwrap_err()
+                                .contains("brew install --cask copilot-cli")
+                        );
+                    } else {
+                        assert!(result.is_ok());
+                    }
+                },
+            );
+        }
+        assert!(validate_copilot_keychain_substitute(&standalone.join("copilot"), true).is_ok());
     }
 
     #[test]

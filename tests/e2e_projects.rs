@@ -32,6 +32,105 @@ mod project_tests {
 
     static PROJECT_COUNTER: AtomicU32 = AtomicU32::new(0);
 
+    #[test]
+    fn copilot_editor_launcher_has_a_standalone_recovery_with_substitution_on() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = home_temp_dir("copilot-editor");
+        let project = tempfile::tempdir().unwrap();
+        let editor = home.path().join(
+            "Library/Application Support/Code/User/globalStorage/github.copilot-chat/copilotCli",
+        );
+        let standalone = home.path().join("standalone");
+        for dir in [&editor, &standalone] {
+            fs::create_dir_all(dir).unwrap();
+            let bin = dir.join("copilot");
+            fs::write(&bin, "#!/bin/sh\necho '1.0.94-3'\n").unwrap();
+            fs::set_permissions(bin, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let command = |path: &std::ffi::OsStr| {
+            let mut cmd = cplt_cmd();
+            cmd.env_clear()
+                .env("CPLT_CONFIG", crate::common::NO_CONFIG)
+                .env("NO_COLOR", "1")
+                .env("HOME", home.path())
+                .env("PATH", path)
+                .env("GH_TOKEN", "test-token")
+                .current_dir(project.path())
+                .args(["--agent", "copilot"]);
+            cmd
+        };
+        let editor_path = std::env::join_paths([editor.as_path(), Path::new("/usr/bin")]).unwrap();
+        let out = command(&editor_path)
+            .args(["--yes", "--no-validate", "--no-proxy", "--no-scratch-dir"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{stderr}");
+        assert!(
+            stderr.contains("brew install --cask copilot-cli"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("Starting Copilot in sandbox"), "{stderr}");
+
+        let out = command(&editor_path).arg("doctor").output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!out.status.success(), "{stdout}");
+        assert!(stdout.contains("Copilot's editor launcher"), "{stdout}");
+        assert!(
+            !stdout.contains(&home.path().display().to_string()),
+            "{stdout}"
+        );
+
+        let recovered_path = std::env::join_paths([
+            editor.as_path(),
+            standalone.as_path(),
+            Path::new("/usr/bin"),
+        ])
+        .unwrap();
+        let out = command(&recovered_path)
+            .args(["doctor", "--verbose"])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{stdout}");
+        assert!(stdout.contains("~/standalone/copilot"), "{stdout}");
+        assert!(stdout.contains("keychain:    denied"), "{stdout}");
+
+        if !sandbox_exec_available() {
+            assert!(
+                !require_sandbox_enforced(),
+                "sandbox-exec required but unavailable"
+            );
+            eprintln!("SKIPPED: recovered launch requires sandbox-exec");
+            return;
+        }
+        let keychains = home.path().join("Library/Keychains");
+        fs::create_dir_all(&keychains).unwrap();
+        fs::write(keychains.join("probe"), "must remain unreadable").unwrap();
+        fs::write(
+            standalone.join("copilot"),
+            "#!/bin/sh\n\
+             for arg in \"$@\"; do\n\
+               if [ \"$arg\" = --version ]; then echo '1.0.94-3'; exit 0; fi\n\
+             done\n\
+             [ \"$GH_TOKEN\" = test-token ] || exit 42\n\
+             if /bin/cat \"$HOME/Library/Keychains/probe\" 2>/dev/null; then exit 43; fi\n\
+             echo STANDALONE_TOKEN_OK_KEYCHAIN_DENIED\n",
+        )
+        .unwrap();
+        let out = command(&recovered_path)
+            .args(["--yes", "--no-validate", "--no-proxy", "--no-scratch-dir"])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stdout}\n{stderr}");
+        assert!(
+            stdout.contains("STANDALONE_TOKEN_OK_KEYCHAIN_DENIED"),
+            "{stdout}"
+        );
+    }
+
     // ── Guards ─────────────────────────────────────────────────────
 
     fn sandbox_exec_available() -> bool {

@@ -2,6 +2,19 @@
 
 The sandbox is kernel-enforced, so **all restrictions apply to every process spawned inside it**: dev servers, test runners, build tools, package managers. That is deliberate, since a sandboxed agent could otherwise escape by spawning a child process. It does affect some workflows.
 
+## Copilot's VS Code launcher and Keychain substitution
+
+On macOS, an editor-provided Copilot launcher can exit with
+`ERROR: SecItemCopyMatching failed -25300` even when `GH_TOKEN` is supplied
+(#753). cplt refuses that launcher when the Keychain substitute is active.
+It does not restore Keychain access automatically.
+
+Install standalone Copilot outside cplt with `brew install --cask copilot-cli`
+or `npm install -g @github/copilot`, and put it in PATH. cplt prefers the
+standalone install over editor launchers, even when the editor appears first
+in PATH. Check the selected path with `cplt doctor --verbose`, then launch
+`cplt`. Keep `sandbox.keychain_substitute` enabled.
+
 ## Branch tracking is silently dropped
 
 **macOS only.** `.git/config` is write-denied there (it is a `core.hooksPath`

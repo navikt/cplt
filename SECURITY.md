@@ -824,6 +824,15 @@ first Antigravity verification for this change turned out to be — it passed on
 because a stale fallback file happened to exist on the test host. Nobody's
 authentication should change until they ask for it.
 
+**Copilot editor launchers (#753).** A VS Code-provided launcher can require
+the Keychain even with `GH_TOKEN` supplied. On macOS cplt refuses a recognized
+editor launcher when substitution is active and directs the user to install
+standalone Copilot. Binary resolution prefers standalone installs over both
+the older `copilotCLIShim.js` scripts and launchers under
+`github.copilot-chat/copilotCli`. The Keychain deny is unchanged; cplt never
+restores the grant to make an editor launcher work. `doctor` reports the same
+refusal. See [known impacts](docs/known-impacts.md#copilots-vs-code-launcher-and-keychain-substitution).
+
 **If your agent cannot authenticate with the key on:** set
 `sandbox.keychain_substitute = false` (or unset the substitute variable, e.g.
 `CLAUDE_CODE_OAUTH_TOKEN`) and the grant comes back on the next run. If the agent
