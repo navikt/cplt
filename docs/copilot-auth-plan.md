@@ -33,7 +33,7 @@ nav-pilot host-side recovery is implemented and checked.
 | Repository | Branch/delivery | Verified status |
 | --- | --- | --- |
 | cplt | `fix/copilot-incident-auth-recovery`; draft [#757](https://github.com/navikt/cplt/pull/757) | Earlier head `d25e722` has 13 passing CI checks. This update packages bot fixes, native fixtures and corrected kernel/offline gates; new-head CI remains pending. Signing uses existing Git configuration. |
-| copilot/nav-pilot | `fix/authincident-host-recovery`; delivery URL awaits coordinating owner | Guided recovery and shared trusted clean setup/doctor probe have reported Go/99 scripts/budget passes. Final independent review is reported CONCERNS with no implementation blocker. The earlier unsigned-commit blocker is historical; current signing/delivery must be confirmed by that repository's owner. Site 803/smoke/cross-build results are reported evidence. |
+| copilot/nav-pilot | Signed branch `fix/authincident-host-recovery-signed`; draft [#1697](https://github.com/navikt/copilot/pull/1697), head `63667f7c` | Coordinating owner reports signed commits `c3ba938a` and `63667f7c` both verified, with Go checks, 99 scripts, budget checks, site 803 and smoke 54 passing. Original unsigned branch and its 4 modified/2 untracked files are preserved. Final review remains CONCERNS with no implementation blocker; host OAuth/secure-persistence/restart and extraction gates remain open. |
 
 ### Active assignments
 
@@ -45,7 +45,7 @@ Human OAuth gates do not pause independent work.
 | Contract synthetic experiments and new probe | Exact Node read grant, copied native module and fixture/kernel canaries address the broad-grant review finding. Native 1.0.94-5/1.0.95 results are recorded. Selection, exact Keychain bytes and renewal remain gates. |
 | Full kernel-pipeline tests | Claim narrowed to private-DB open/access; no independent find/add enforcement claim. Missing required gh fails. Five offline checks gate local checks and Linux/macOS CI with required Python; two targeted kernel checks are reported passing. |
 | CLI guided host recovery | No automatic gh action retained. Manual storage verification stops on plaintext; trusted clean setup/doctor probe excludes ambient/project shims. Reported Go/99 scripts/budget pass; host OAuth/secure-persistence/restart remain open. |
-| CI/signing and delivery | Previous #757 head has 13 passing checks. Three bot diagnostics are self-reviewed in this packaging update; new-head CI must be checked separately. Sibling signing/delivery is owned by its coordinating agent. |
+| CI/signing and delivery | Previous #757 head has 13 passing checks. Three bot diagnostics are self-reviewed in this packaging update; new-head CI must be checked separately. Sibling draft [#1697](https://github.com/navikt/copilot/pull/1697) is delivered on a signed branch; both signatures are reported verified. |
 
 ### Immediate incident release readiness
 
@@ -484,7 +484,7 @@ and Linux credential-store coverage open; no implementation blocker.
 
 | Scope | Open gate | What closes it |
 | --- | --- | --- |
-| CLI delivery | Current signing/delivery awaits sibling owner | Earlier unsigned-commit status is historical. Coordinating owner supplies current signed head and PR URL; no sibling change is made here. |
+| CLI delivery | Delivered as draft [#1697](https://github.com/navikt/copilot/pull/1697) | Signed branch `fix/authincident-host-recovery-signed`, head `63667f7c`; both commits reported verified. Original unsigned branch and 4 modified/2 untracked files are preserved. Live acceptance remains open. |
 | Full kernel evidence | Independent find/add denial unproven | Current tests establish private-DB open/access only. Stronger claims need independently reached operations; no broader conclusion from access failure. Required-gh/offline corrections are implemented and checked. |
 | Incident PR | New-head CI pending | Three bot fixes and reviewed synthetic/kernel evidence are included in this update. Prior head's 13 passing checks do not prove the new head. |
 | Immediate incident | Host OAuth/restart acceptance open | User-assisted host sign-in, secure persistence, OAuth cancellation and restart without link hacks. Prelaunch `aborted` is not OAuth cancellation. Record Slack CLI/version, terminal/editor and whether `gh` was used. |
