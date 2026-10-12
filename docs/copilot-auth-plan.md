@@ -6,6 +6,8 @@ the host. cplt retrieves that credential before launch and passes it as
 The credential and refresh contract must be proven before extraction is
 implemented or the new behavior becomes a default.
 
+Incident packaging draft: [#757](https://github.com/navikt/cplt/pull/757).
+
 ## Status ledger
 
 Statuses describe evidence, not effort. Close a milestone only when its gate has
