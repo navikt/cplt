@@ -511,6 +511,131 @@ mod macos_tests {
         }
     }
 
+    /// A private, explicitly addressed database avoids the login keychain and
+    /// default/search-list changes. UI is disabled in every helper invocation.
+    #[test]
+    fn security_framework_private_database_access_follows_file_grant() {
+        require_sandbox!();
+        let fixture = crate::common::home_temp_dir("security-framework");
+        let project = fixture.path().join("project");
+        let home = fixture.path().join("home");
+        let keychains = home.join("Library/Keychains");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&keychains).unwrap();
+        let source = project.join("keychain.c");
+        let executable = project.join("keychain-probe");
+        let database = keychains.join("cplt-private-fixture.keychain");
+        fs::write(&source, r#"
+#include <Security/Security.h>
+#include <stdio.h>
+#include <string.h>
+int main(int argc, char **argv) {
+    if (argc != 3) return 40;
+    SecKeychainSetUserInteractionAllowed(false);
+    SecKeychainRef kc = NULL;
+    OSStatus open = strcmp(argv[1], "create") == 0
+        ? SecKeychainCreate(argv[2], 14, "dummy-password", false, NULL, &kc)
+        : SecKeychainOpen(argv[2], &kc);
+    if (open != errSecSuccess || !kc) { printf("OPEN_STATUS=%d\n", (int)open); return 41; }
+    OSStatus status;
+    if (strcmp(argv[1], "read") == 0) {
+        UInt32 length = 0; void *data = NULL;
+        status = SecKeychainFindGenericPassword(kc, 10, "cplt-dummy", 7, "fixture", &length, &data, NULL);
+        if (status == errSecSuccess) {
+            if (length != 5 || memcmp(data, "dummy", 5) != 0) return 42;
+            SecKeychainItemFreeContent(NULL, data);
+        }
+    } else {
+        const char *account = strcmp(argv[1], "create") == 0 ? "fixture" : argv[1];
+        status = SecKeychainAddGenericPassword(kc, 10, "cplt-dummy", (UInt32)strlen(account), account, 5, "dummy", NULL);
+    }
+    printf("API_STATUS=%d\n", (int)status);
+    CFRelease(kc);
+    return status == errSecSuccess ? 0 : 43;
+}
+"#).unwrap();
+        let compile = crate::common::shim_cmd(Path::new("/usr/bin/clang"))
+            .args([
+                "-Wno-deprecated-declarations",
+                "-framework",
+                "Security",
+                "-framework",
+                "CoreFoundation",
+            ])
+            .arg(&source)
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let invoke = |operation: &str, profile: Option<&Path>| {
+            let mut cmd = crate::common::shim_cmd(
+                profile.map_or(executable.as_path(), |_| Path::new("/usr/bin/sandbox-exec")),
+            );
+            if let Some(profile) = profile {
+                cmd.arg("-f").arg(profile).arg(&executable);
+            }
+            cmd.env("HOME", &home)
+                .args([operation])
+                .arg(&database)
+                .output()
+                .unwrap()
+        };
+        for operation in ["create", "read", "outside-write"] {
+            let out = invoke(operation, None);
+            assert!(
+                out.status.success(),
+                "outside {operation}: {}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+            assert!(String::from_utf8_lossy(&out.stdout).contains("API_STATUS=0"));
+        }
+        for (substitute, operation) in [
+            (false, "read"),
+            (false, "allowed-write"),
+            (true, "read"),
+            (true, "denied-write"),
+        ] {
+            let mut opts = default_opts(&project, &home);
+            opts.keychain_substitute = substitute.then_some(
+                cplt::agent::KeychainSubstitute::EnvVar("COPILOT_GITHUB_TOKEN"),
+            );
+            let profile = project.join("profile.sb");
+            fs::write(&profile, generate_profile(&opts, &[])).unwrap();
+            let out = invoke(operation, Some(&profile));
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert_eq!(
+                out.status.success(),
+                !substitute,
+                "substitute={substitute}, {operation}: {stdout}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if substitute {
+                // SecKeychainOpen may refuse the database before find/add. This
+                // proves database access denial, not a separate denial per API.
+                let open_denied = out.status.code() == Some(41)
+                    && stdout.contains("OPEN_STATUS=")
+                    && !stdout.contains("OPEN_STATUS=0");
+                let operation_denied = out.status.code() == Some(43)
+                    && stdout.contains("API_STATUS=")
+                    && !stdout.contains("API_STATUS=0");
+                assert!(
+                    open_denied || operation_denied,
+                    "unexpected helper failure: {stdout}"
+                );
+            } else {
+                assert!(
+                    stdout.contains("API_STATUS=0"),
+                    "find/add did not succeed: {stdout}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn real_profile_runs_pnpm_shadow_without_executing_the_store() {
         require_sandbox!();

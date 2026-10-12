@@ -20,7 +20,8 @@ on one version is not evidence for the other.
 ```sh
 mise run check
 CPLT_TEST_REQUIRE_SANDBOX=1 mise run test:e2e-projects
-python3 hack/test-probe-copilot-no-auth.py
+CPLT_TEST_REQUIRE_SANDBOX=1 mise run test:integration
+mise run test:probe
 ```
 
 `copilot_auth_handover_keeps_keychain_only_without_a_substitute` uses an isolated
@@ -32,6 +33,78 @@ Keychain API enforcement, OAuth sign-in, token validity, account choice or renew
 The offline probe checks verify timeout cleanup kills the process group and reaps
 the child, and that the persistence scan skips symlinks/FIFOs and detects a token
 across read boundaries. They do not run Copilot or retrieve credentials.
+`test:probe` is a required dependency of `mise run check` and requires Python 3.
+Linux and macOS CI also run it explicitly, checking `python3 --version` first;
+missing Python fails the job. The PTY case is macOS-only; the other four checks
+run on both platforms.
+
+### Synthetic full-pipeline and Security framework evidence
+
+Added and executed on macOS on 2026-10-12, using the working-tree cplt test
+binary based on `d25e722`. These tests make no GitHub/model requests and use no
+real credentials. Existing commits are preserved.
+
+`copilot_and_gh_credentials_stay_separate_through_full_launch` exercises CLI
+resolution, repo `deny.env`, environment construction, cache setup, gh-gate and
+the actual Seatbelt launch. The parent runs the normally resolved trusted gh
+against a temporary `hosts.yml` containing a synthetic credential. Only the
+sandboxed Copilot and gh API consumer are fake. The API consumer checks the
+credential received by the real gh-gate without making an HTTP request. The
+test does not substitute a fake trusted parent binary or modify production trust.
+Missing trusted gh fails when `CPLT_TEST_REQUIRE_SANDBOX=1`; local runs without
+that setting explicitly skip this test if gh is unavailable.
+
+| Child condition | Copilot env token | gh exec cache | Fake gh API consumer | Keychain fixture file |
+| --- | --- | --- | --- | --- |
+| Guard on | Explicit Copilot credential | Separate stored-gh credential | Receives stored-gh credential | Denied |
+| Guard off | Explicit Copilot credential | Absent | No credential; hosts file remains denied | Denied |
+| Guard on, inherited `GITHUB_TOKEN` denied | Explicit Copilot credential; denied token absent | Separate stored-gh credential | Receives stored-gh credential | Denied |
+| Guard on, `GH_TOKEN` denied | Explicit Copilot credential | Absent | No credential | Denied |
+| All three token vars denied, guard on/off | Absent | Absent | No credential | Allowed, preserving no-substitute fallback |
+
+The effective-env case fails if an inherited token removed after cache setup
+incorrectly suppresses the gh cache. Outputs never contain any synthetic token.
+Guard-off behavior is an observed lack of the cache channel, not a claim that
+unwrapped real gh can authenticate under the same profile.
+
+`security_framework_private_database_access_follows_file_grant` compiles a
+small Security framework helper. It creates a private
+`cplt-private-fixture.keychain` under the temporary home's `Library/Keychains`,
+with dummy password/data only and user interaction disabled. Every read/add
+specifies that exact database. It calls no default-keychain or search-list setter
+and performs no `SecKeychainDelete`, which itself edits the search list; dropping
+the fixture directory removes its files. Apple's public `StorageManager.cpp`
+documents that private-keychain creation does not add it to the search list;
+the login/System exceptions do not match this path.
+
+Real `SecKeychainFindGenericPassword` and `SecKeychainAddGenericPassword` succeed
+outside the sandbox and with the generated Keychain grant. Under the generated
+substitution profile, access to the explicit private database fails at
+`SecKeychainOpen` or the requested operation. The test pins nonzero Security
+framework status and the matching helper exit code; arbitrary helper failure
+cannot pass. This proves private-database open/access denial, not independent
+denial of both find and add after a successful open, even though broad Mach
+lookup is allowed. It does **not** establish denial of every service-side
+operation on the user's already-open login Keychain, so the existing live-probe
+`securityd` isolation gate remains conservative and unchanged.
+
+`copilot_explicit_credentials_and_deny_env_survive_full_linux_launch` adds a
+Linux-only Landlock launch matrix with separate explicit Copilot/gh env tokens,
+guard on/off and all token names denied. No gh state is configured, so this tests
+effective-env portability, not Linux Secret Service extraction. It cross-compiled
+with `cargo check --test integration_linux --target aarch64-unknown-linux-gnu`.
+No Linux runner was available; kernel execution is **not performed** here. Run:
+
+```sh
+CPLT_TEST_REQUIRE_SANDBOX=1 mise run test:integration-linux
+```
+
+Validation: macOS integration **104 passed, 1 ignored**; e2e projects **77 passed**,
+both with `CPLT_TEST_REQUIRE_SANDBOX=1`; offline probe checks **5 passed**;
+`mise run check` **414 unit and 1,586 lib passed**, fmt and clippy clean. The first
+check run alongside both kernel suites hit three existing short-timeout lib
+tests; repeating the check after those suites completed passed. No real Copilot,
+nav-pilot launch, fresh OAuth, logout, revocation or renewal was tested this round.
 
 ## Baseline and reported failure
 

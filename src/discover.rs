@@ -155,7 +155,56 @@ fn discover_auth_with(
 /// gh's stored github.com token, using the same probe for diagnosis and launch.
 /// A PATH lookup could execute an agent-planted binary outside the sandbox.
 pub(crate) fn stored_gh_token() -> Option<String> {
-    gh_auth_token(&crate::git::trusted_binary("gh")?, PROBE_TIMEOUT)
+    stored_gh_credential().map(|token| token.expose().to_string())
+}
+
+// One bounded probe per process, including failed retrievals. Keep the cached
+// secret redacted and in memory so diagnostics cannot leak it or retry login.
+fn stored_gh_credential() -> Option<&'static crate::agent::SecretToken> {
+    static TOKEN: std::sync::OnceLock<Option<crate::agent::SecretToken>> =
+        std::sync::OnceLock::new();
+    TOKEN
+        .get_or_init(|| {
+            gh_auth_token(&crate::git::trusted_binary("gh")?, PROBE_TIMEOUT)
+                .map(crate::agent::SecretToken::new)
+        })
+        .as_ref()
+}
+
+/// Diagnostics reuse the launch probe without exposing the credential.
+pub fn stored_gh_token_available() -> bool {
+    stored_gh_credential().is_some()
+}
+
+/// Cache eligibility is shared with launch so advice cannot promise a channel
+/// that deny.env or the existing credential would suppress. Retrieval and the
+/// guard/scratch settings are separate prerequisites checked by the caller.
+pub fn gh_token_cache_eligibility(
+    agent: crate::agent::Agent,
+    deny_env: &[String],
+    substitute: Option<&crate::agent::KeychainSubstitute>,
+    hosts_yml_exists: bool,
+    child_gh_token: bool,
+    linux: bool,
+) -> (bool, bool) {
+    use crate::agent::{Agent, KeychainSubstitute};
+    if deny_env.iter().any(|d| d == "GH_TOKEN")
+        || matches!(substitute, Some(KeychainSubstitute::GhToken { .. }))
+    {
+        return (false, false);
+    }
+    let kept = |vars: &[&str]| {
+        vars.iter().any(|var| {
+            !deny_env.iter().any(|d| d == var)
+                && std::env::var(var).is_ok_and(|v| !v.trim().is_empty())
+        })
+    };
+    let serve = agent == Agent::Copilot && !kept(AUTH_ENV_VARS);
+    let exec = hosts_yml_exists
+        && !child_gh_token
+        && (agent != Agent::Copilot
+            || ((linux || substitute.is_some()) && !kept(&["GH_TOKEN", "GITHUB_TOKEN"])));
+    (serve, exec)
 }
 
 /// Pin the host and discard exported tokens so discovery cannot mistake an

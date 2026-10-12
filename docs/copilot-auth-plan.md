@@ -6,7 +6,7 @@ the host. cplt retrieves that credential before launch and passes it as
 The credential and refresh contract must be proven before extraction is
 implemented or the new behavior becomes a default.
 
-Incident packaging draft: [#757](https://github.com/navikt/cplt/pull/757).
+Incident draft PR: [#757](https://github.com/navikt/cplt/pull/757).
 
 ## Status ledger
 
@@ -16,17 +16,36 @@ here as work progresses; never include credentials or raw auth logs.
 
 | Milestone | Status | Evidence or remaining gate |
 | --- | --- | --- |
-| M1 Reproduction and credential contract | Basic auth verified; public-code research recorded | No-auth probes, valid-gh headless request and interactive `/user show` pass on isolated 1.0.94-5. Contract document records different env/stored representations; exact selection, serialization and renewal remain unproven. |
+| M1 Reproduction and credential contract | Native synthetic fixtures complete locally; contract open | 1.0.94-5/1.0.95 metadata roundtrip persists despite env auth; stored/env representations differ and config `authTokens` token/expiry syntax is observed. Exact Keychain serialization, selected account and renewal remain unproven. |
 | M2 cplt opt-in implementation | Future extraction blocked by M1; incident fixes implemented | Doctor/cache corrections use bounded host-pinned, env-cleared lookup, shared config-path resolution and effective denied-env handling on all backends. Selected Copilot-store extraction remains planned. |
-| M3 nav-pilot modes and onboarding | Incident candidate implemented and checked | All three CLI review blockers fixed; Go checks, 93 script cases and budget checks pass. No insecure advice; clean five-variable recovery commands and `env_only`/`gh_only` warnings. Host OAuth/restart acceptance remains open. |
-| M4 Automated and live acceptance | Checks pass; full-chain/live limits recorded | 414 unit, 1586 lib, 178 guard and 13 hardening tests pass. Basic auth verified; prelaunch cancellation passes. Full-chain probe stopped before real token; zero paid prompts in the final round. Full lifecycle remains open. |
-| M5 Site and user documentation | Guide source ready; unpublished | Site 801 checks and smoke pass; browser anchor in generated inventory. Four auth-doc issues fixed, including recovery injection and prior-setting restoration. Safe existing-user no-tools smoke commands documented. |
-| M6 Independent review and staged rollout | Incident review blockers fixed; promotion pending | Available general agents used because explicit model selection was unavailable. Three CLI blockers and four auth-doc issues fixed. Host acceptance and future #264 promotion evidence remain required. cplt incident packaging is authorized as a draft PR. |
+| M3 nav-pilot modes and onboarding | Correction implemented; independent review CONCERNS | No automatic gh action retained. Guided manual recovery requires secure-store verification and stops on plaintext status. Setup/doctor share a trusted clean host probe, clearing five variables with a 5-second bound to prevent ambient/project-shim influence. Reported Go, 99 scripts and budget pass; live recovery remains open. |
+| M4 Automated and live acceptance | Corrected local gates pass; live open | Kernel evidence is private-DB open/access only, not independent find/add denial. Required missing-gh now fails; five offline checks gate local `mise run check` and Linux/macOS CI with required Python. Serial 414 unit/1586 lib and two targeted kernel checks pass. Linux runtime/live OAuth remain open. |
+| M5 Site and user documentation | Source ready; unpublished | Fresh site 803 checks, smoke and CLI cross-build pass. Recovery injection/prior-setting restoration fixed; safe existing-user no-tools smoke documented. Monorepo checks fail on untouched dead code/staticcheck versions. |
+| M6 Independent review and staged rollout | Independent final review CONCERNS; packaging authorized | Two review corrections are reported verified, with no implementation blocker. Three #757 bot fixes and synthetic/kernel evidence are included in this update. Live acceptance and extraction/default-promotion gates remain open. |
 
 Latest cross-repository results above are supplied by the coordinating agents.
 Public/installed-code research is recorded in
 [copilot-auth-contract.md](copilot-auth-contract.md), without credential reads.
 nav-pilot host-side recovery is implemented and checked.
+
+### Current delivery status
+
+| Repository | Branch/delivery | Verified status |
+| --- | --- | --- |
+| cplt | `fix/copilot-incident-auth-recovery`; draft [#757](https://github.com/navikt/cplt/pull/757) | Earlier head `d25e722` has 13 passing CI checks. This update packages bot fixes, native fixtures and corrected kernel/offline gates; new-head CI remains pending. Signing uses existing Git configuration. |
+| copilot/nav-pilot | `fix/authincident-host-recovery`; delivery URL awaits coordinating owner | Guided recovery and shared trusted clean setup/doctor probe have reported Go/99 scripts/budget passes. Final independent review is reported CONCERNS with no implementation blocker. The earlier unsigned-commit blocker is historical; current signing/delivery must be confirmed by that repository's owner. Site 803/smoke/cross-build results are reported evidence. |
+
+### Active assignments
+
+The latest user dispatch continues remaining work against the current PRs.
+Human OAuth gates do not pause independent work.
+
+| Assignment | Local result and next gate |
+| --- | --- |
+| Contract synthetic experiments and new probe | Exact Node read grant, copied native module and fixture/kernel canaries address the broad-grant review finding. Native 1.0.94-5/1.0.95 results are recorded. Selection, exact Keychain bytes and renewal remain gates. |
+| Full kernel-pipeline tests | Claim narrowed to private-DB open/access; no independent find/add enforcement claim. Missing required gh fails. Five offline checks gate local checks and Linux/macOS CI with required Python; two targeted kernel checks are reported passing. |
+| CLI guided host recovery | No automatic gh action retained. Manual storage verification stops on plaintext; trusted clean setup/doctor probe excludes ambient/project shims. Reported Go/99 scripts/budget pass; host OAuth/secure-persistence/restart remain open. |
+| CI/signing and delivery | Previous #757 head has 13 passing checks. Three bot diagnostics are self-reviewed in this packaging update; new-head CI must be checked separately. Sibling signing/delivery is owned by its coordinating agent. |
 
 ### Immediate incident release readiness
 
@@ -34,8 +53,13 @@ Basic gh-token account auth, doctor/cache corrections, serial regression checks
 and site/browser guidance are verified. The incident candidate is implemented
 and checked, with reported CLI and auth-doc review blockers fixed. Host OAuth,
 secure persistence and restart acceptance remain open. Guide source is ready but
-unpublished. cplt incident packaging is authorized as a draft PR. The full credential
-lifecycle is not complete.
+unpublished. The cplt draft update includes next-stage synthetic/kernel evidence
+and three bot diagnostics fixes. No automatic gh action is retained in the
+reported CLI correction. Independent final review reports **CONCERNS**, two
+verified corrections and no implementation blocker. Kernel claims remain limited
+to private-database open/access. New-head CI and sibling delivery are separate
+checks. This is draft-review readiness, not completed host recovery or a proven
+credential-extraction lifecycle.
 
 Interactive `/user show` establishes account auth. Interactive model output is
 separate and remains unverified under the two-request cap; the harness correction
@@ -73,6 +97,30 @@ These recovery gates take priority over future secure-store extraction.
 Recovery guidance now includes clean commands clearing all five auth-affecting
 variables, explicit `env_only`/`gh_only` warnings, injection where needed and
 restoration of the prior setting. It contains no insecure-storage advice.
+
+### User-assisted walkthrough gate
+
+Use the exact commands in
+[browser launch and host recovery](copilot-auth-testing.md#browser-launch-and-host-recovery)
+and [full-pipeline smoke](copilot-auth-testing.md#incident-only-full-pipeline-preflight-and-cancellation).
+
+1. In a normal host terminal, record installed versions and standalone path.
+   Use the documented subshell clearing `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`,
+   `GITHUB_TOKEN`, `GH_HOST` and `GH_REPO`.
+2. If sign-in is needed, the user completes
+   `gh auth login --hostname github.com --web`, checks
+   `gh auth status --hostname github.com`, and confirms secure storage/intended
+   identity. Stop if status reports plaintext storage. gh can fall back to
+   plaintext; do not accept that fallback or treat
+   successful login alone as secure persistence. This validates the gh recovery
+   path only after storage verification, not Copilot-store extraction.
+3. Restart with `nav-pilot --client copilot`; test the installed cplt and nav-pilot
+   no-tools smoke commands at most once per chain. Approve only launch confirmation;
+   cancel on a new login/storage prompt. Record source, exit status and `OK`.
+4. In a separately agreed OAuth session, verify cancellation and restart without
+   plaintext storage. Prelaunch `Aborted by user` does not close this gate.
+
+No logout is needed. The exact reporter CLI and whether they used gh remain unknown.
 
 ## Current evidence and limits
 
@@ -113,6 +161,20 @@ The source of lifecycle requirements and reproduction commands is
   prelaunch cancellation only, not OAuth cancellation. Safe manual cplt/nav-pilot
   no-tools smoke commands for the existing normal user are documented in the
   acceptance guide; host OAuth/restart acceptance is still open.
+- New synthetic full-cplt and macOS kernel checks establish private-database
+  open/access behavior only. They do not independently prove find/add denial.
+  Two targeted kernel tests pass. No OS Keychain search-list changes were made;
+  Linux has cross-compile evidence only.
+- No automatic CLI gh action is retained. Guided manual recovery requires secure
+  storage verification and stops on plaintext status. Setup and doctor share a
+  trusted clean host probe, clearing five variables with a 5-second status bound
+  and preventing ambient/project-shim influence. Go, 99 scripts and budget pass;
+  independent final review reports CONCERNS. Prior cancellation was before login but after
+  settings save, not live OAuth cancellation. Regular/staged launches do not
+  automatically start OAuth.
+- Required missing gh now fails instead of silently skipping. Five offline probe
+  checks pass and gate local `mise run check` plus Linux/macOS CI, with Python
+  required. These are offline checks, not live credential/renewal evidence.
 
 ### Public-code contract findings
 
@@ -120,7 +182,10 @@ The source of lifecycle requirements and reproduction commands is
 evidence from 1.0.86, 1.0.94-5 and 1.0.95 program artifacts, without credential
 reads. Env auth and stored user auth use different representations.
 `activeAccount` is experimental; `lastLoggedInUser` is not authoritative current
-selection. Secure-store secret serialization remains unproven.
+selection. Native synthetic fixtures on 1.0.94-5 and 1.0.95 demonstrate metadata
+roundtrip despite env auth and config `authTokens` object token/expiry syntax.
+These results do not establish exact Keychain serialization, authoritative
+selection or renewal; secure-store secret serialization remains unproven.
 
 The SDK has a renewable token-provider callback. This does not guarantee renewal
 of a standalone env token or Copilot API/session token. Extraction remains gated
@@ -225,12 +290,18 @@ baseline comparison. The opt-in path has tested one-step recovery.
 ### M3 nav-pilot modes and onboarding
 
 Existing nav-pilot modes had 22 passing regression cases. Latest CLI verification
-passes Go checks, 93 script cases and budget checks after all three review
+passes Go checks, 99 script cases and budget checks after all three review
 blockers were fixed. Documentation clarifies exclusive modes and unsupported
 combinations; `env_only`/`gh_only` warnings and clean five-variable recovery
 commands are implemented without insecure advice.
 This does not implement the future selected secure-store credential contract.
 Host-side onboarding is implemented; live host OAuth/restart acceptance is open.
+The next-stage correction retains no automatic host-gh action.
+Guided manual recovery stops on plaintext status; shared trusted
+clean setup/doctor eligibility checks prevent ambient/project-shim influence.
+Reported Go, 99 scripts and budget pass. Independent final review reports
+CONCERNS with no implementation blocker; live secure-storage acceptance remains
+open. Implementation/checks alone do not close it.
 
 - Validate both launch paths against the browser-login reports and immediate
   recovery gates above. Record the exact host login command that succeeds.
@@ -260,12 +331,19 @@ and kernel-enforced Keychain-directory file reads/writes with substitution
 on/off/missing. It does not prove Security framework API denial, OAuth, token
 validity, selected identity or renewal. Test existence is not a recorded pass.
 
-Latest serial checks on 2026-10-12: `mise run check` passed fmt, clippy, 414 unit
-and 1586 lib tests; 178 guard and 13 hardening tests also passed. The earlier
+Latest local next-stage checks on 2026-10-12: 414 unit, 1586 lib, 77 project,
+104 integration with 1 ignored, and 5 probe checks pass. The packaged incident's
+earlier serial fmt/clippy, 178 guard and 13 hardening passes remain recorded below.
+CLI Go, 99 scripts and budget checks pass. The earlier
 concurrency timing flake in
 `agent::tests::opencode_v2_unknown_probe_is_retried_and_not_cached` passed in
 isolation and subsequent full checks. It is not an outstanding incident blocker.
 These checks do not prove the full auth lifecycle.
+Latest correction checks also pass serial `mise run check` with 414 unit and
+1586 lib, five offline probe checks and two targeted kernel checks. Private-DB
+open/access is the kernel claim; independent find/add denial remains unproven.
+Required missing gh fails, and the offline gate is wired into local checks and
+Linux/macOS CI with required Python. Bot fixes are included in this draft update.
 
 - Add resolver/config tests for precedence, selected-account errors, enterprise
   pairing, `deny.env`, malformed/oversized metadata, symlinks and FIFOs.
@@ -288,7 +366,7 @@ separately; ignored smoke tests and simulated denial cannot establish renewal.
 
 ### M5 Site and documentation
 
-The existing site blocker is resolved: old domains were fixed, full 801 checks
+The existing site blocker is resolved: old domains were fixed, fresh 803 checks
 and smoke passed. Browser guidance and its anchor were added to the generated
 inventory. Retain the coordinating work's command/output evidence.
 Four auth-documentation issues are fixed, including recovery injection and
@@ -327,7 +405,7 @@ evidence-based promotion. Default remains unchanged until then.
 
 ## Open blockers and authorization
 
-### cplt packaging review, 2026-10-12
+### Initial cplt packaging review, 2026-10-12
 
 Base: `origin/main`, `05e18eff2027fc9b240ed24902349e31ed9e866c`.
 Reviewed staged, unstaged and all untracked files, plus every included commit.
@@ -350,7 +428,7 @@ remain unverified; macOS file-denial tests do not prove Security framework API
 denial. No generated files changed. Merging into main with successful CI triggers
 four-target release archives, Linux .deb packages and a published GitHub release.
 
-Fresh gates, all final commands exited 0:
+Initial packaging gates, all final commands exited 0. These are prior-head evidence:
 
 - `RUST_TEST_THREADS=1 mise run --jobs 1 check`: fmt, clippy, 414 unit and 1586 lib.
 - `CPLT_TEST_REQUIRE_SANDBOX=1 RUST_TEST_THREADS=1 mise run test:e2e-projects`: 76.
@@ -367,8 +445,48 @@ not rerun here. No login was performed.
 Verdict: **CONCERNS**. Live recovery/lifecycle and Linux credential-store coverage
 remain open warnings. No unresolved implementation blocker for the incident draft.
 
+### Draft update review, 2026-10-12
+
+The user reports independent final review **CONCERNS**, two verified corrections
+and no implementation blocker. This packaging review also inspected every
+untracked file in full, staged/unstaged changes and the full `origin/main` diff
+including both existing commits. Base remains `05e18eff2027fc9b240ed24902349e31ed9e866c`.
+
+| Axis | Finding or evidence limit |
+| --- | --- |
+| Correctness | Removal advice now requires successful stored-token retrieval and an eligible route; failed probes are cached too. Linux warning checks the one-shot route. Private-DB access failure is not independent find/add denial. |
+| Regression | All launch/check/doctor callers use shared eligibility. Process-local credential caching prevents repeated probes, but does not support credential changes during one cplt process. |
+| Edge cases | Offline checks exercise split PTY queries, timeout cleanup, withheld failure output, symlinks/FIFOs and the real-token preflight gate. Contract canaries detect the former broad Node/package grants. |
+| Requirement coverage | Three bot findings map to retrieval-gated advice, effective one-shot handover and host-pinned recovery. Host OAuth, secure persistence, restart and native extraction remain open. |
+| Repository standards | Isolated Rust helpers are used; Python 3 is a required local/CI dependency and is documented in AGENTS.md. Existing signing configuration is retained; no hook bypass or history rewrite. |
+| Scope | New native probe runs synthetic metadata/identity checks only. No login, logout, model request, extraction setting or default promotion is added. Sibling results are reported, not checked here. |
+
+Blast/platform/generated: shared discovery/cache diagnostics affect all agents
+on macOS/Linux; tests add private macOS DB access and Linux explicit-env coverage.
+Native fixtures are version-pinned macOS evidence, not a Linux Secret Service
+contract. No generated files changed. No tenant/on-prem/canary rollout applies;
+successful main CI after merge publishes the four-target release and Linux .deb
+packages. No merge or promotion is authorized.
+
+Fresh packaging gates, exit 0 after the last code edit:
+
+- `RUST_TEST_THREADS=1 mise run --jobs 1 check`: fmt, clippy, 414 unit, 1586 lib
+  and five offline probe checks passed.
+- `RUST_TEST_THREADS=1 cargo test --bin cplt auth_cache_diagnostics_require_retrieval_and_effective_routes -- --exact tests::auth_cache_diagnostics_require_retrieval_and_effective_routes`: one focused diagnostic check passed.
+- `git diff --check`: clean.
+
+Existing coordinated evidence
+is 77 project, 104 integration with 1 ignored, two targeted kernel access checks,
+Linux cross-compile only, native fixture/canary results, and prior 178 guard/13
+hardening passes. Those suites and live probes are not rerun for packaging.
+New-head CI remains pending. Verdict: **CONCERNS**, with live recovery/lifecycle
+and Linux credential-store coverage open; no implementation blocker.
+
 | Scope | Open gate | What closes it |
 | --- | --- | --- |
+| CLI delivery | Current signing/delivery awaits sibling owner | Earlier unsigned-commit status is historical. Coordinating owner supplies current signed head and PR URL; no sibling change is made here. |
+| Full kernel evidence | Independent find/add denial unproven | Current tests establish private-DB open/access only. Stronger claims need independently reached operations; no broader conclusion from access failure. Required-gh/offline corrections are implemented and checked. |
+| Incident PR | New-head CI pending | Three bot fixes and reviewed synthetic/kernel evidence are included in this update. Prior head's 13 passing checks do not prove the new head. |
 | Immediate incident | Host OAuth/restart acceptance open | User-assisted host sign-in, secure persistence, OAuth cancellation and restart without link hacks. Prelaunch `aborted` is not OAuth cancellation. Record Slack CLI/version, terminal/editor and whether `gh` was used. |
 | Full launch chain | Isolation-safe real-token probe unavailable | A supported isolation method that contains broad Mach grants without nested SBPL, or agreed safe existing-user manual smoke. Empty installed nav-pilot exited 2 because no package was available. |
 | Model workflow | Interactive model response unverified | Live response evidence within the agreed request budget; synthetic harness checks alone are insufficient. Does not block basic account-auth conclusion. |
@@ -384,7 +502,8 @@ the user. Credential changes, revocation, account switching and Keychain setting
 changes need a disposable account or a separately agreed interactive session
 with tested recovery. Simulated denial proves neither logout nor live renewal.
 
-The coordinating user authorizes packaging the existing cplt incident changes,
-commits, a normal branch push and a draft PR. Sibling repositories are outside
-this packaging task. Live authentication remains user-assisted; merge, release
-promotion and future credential extraction are not authorized.
+The user authorizes this owner to package all intended cplt changes and the plan,
+commit and normally push the existing branch, and update draft #757. Sibling
+repositories remain outside this packaging task. No history rewrite, hook bypass,
+merge, release promotion or guessed credential extraction is authorized. Live
+OAuth remains user-assisted.

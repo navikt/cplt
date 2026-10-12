@@ -162,6 +162,115 @@ mod linux_tests {
         )
     }
 
+    #[test]
+    fn copilot_explicit_credentials_and_deny_env_survive_full_linux_launch() {
+        use std::os::unix::fs::PermissionsExt;
+        require_landlock!();
+        let fixture = tempfile::Builder::new()
+            .prefix(".cplt-e2e-linux-copilot-auth-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        let project = fixture.path().join("project");
+        let home = fixture.path().join("home");
+        let bin = project.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(home.join(".config/gh")).unwrap();
+        assert!(
+            crate::common::git_cmd(&project)
+                .args(["init", "--quiet"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let agent = bin.join("copilot");
+        fs::write(
+            &agent,
+            r#"#!/bin/sh
+for arg in "$@"; do
+  if [ "$arg" = --version ]; then echo '1.0.94'; exit 0; fi
+done
+case "$COPILOT_GITHUB_TOKEN" in
+  synthetic-copilot) echo COPILOT_PRESENT ;;
+  '') echo COPILOT_ABSENT ;;
+  *) exit 41 ;;
+esac
+case "$GH_TOKEN" in
+  synthetic-gh) echo GH_PRESENT ;;
+  '') echo GH_ABSENT ;;
+  *) exit 42 ;;
+esac
+[ -z "$__CPLT_GH_TOKEN_DIR" ] || exit 43
+echo AGENT_COMPLETED
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(agent, fs::Permissions::from_mode(0o755)).unwrap();
+        let config = home.join("cplt.toml");
+        fs::write(&config, "[sandbox]\nkeychain_substitute = true\n").unwrap();
+        for guard in [false, true] {
+            for denied in [false, true] {
+                fs::write(
+                    project.join(".cplt.toml"),
+                    if denied {
+                        "[deny]\nenv = [\"COPILOT_GITHUB_TOKEN\", \"GH_TOKEN\", \"GITHUB_TOKEN\"]\n"
+                    } else {
+                        "[deny]\nenv = []\n"
+                    },
+                )
+                .unwrap();
+                let out = cplt_cmd()
+                    .env_clear()
+                    .env("CPLT_CONFIG", &config)
+                    .env("NO_COLOR", "1")
+                    .env("HOME", &home)
+                    .env("GH_CONFIG_DIR", home.join(".config/gh"))
+                    .env(
+                        "PATH",
+                        std::env::join_paths([
+                            bin.as_path(),
+                            Path::new("/usr/bin"),
+                            Path::new("/bin"),
+                        ])
+                        .unwrap(),
+                    )
+                    .env("COPILOT_GITHUB_TOKEN", "synthetic-copilot")
+                    .env("GH_TOKEN", "synthetic-gh")
+                    .current_dir(&project)
+                    .args([
+                        "--agent",
+                        "copilot",
+                        "--yes",
+                        "--no-proxy",
+                        "--no-bubblewrap",
+                        "--no-audit",
+                        "--no-git-guard",
+                        if guard { "--gh-guard" } else { "--no-gh-guard" },
+                    ])
+                    .output()
+                    .unwrap();
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                assert!(
+                    out.status.success(),
+                    "guard={guard}, denied={denied}: {stdout}\n{stderr}"
+                );
+                for variable in ["COPILOT", "GH"] {
+                    assert!(
+                        stdout.contains(&format!(
+                            "{variable}_{}",
+                            if denied { "ABSENT" } else { "PRESENT" }
+                        )),
+                        "{stdout}"
+                    );
+                }
+                assert!(stdout.contains("AGENT_COMPLETED"), "{stdout}");
+                for secret in ["synthetic-copilot", "synthetic-gh"] {
+                    assert!(!stdout.contains(secret) && !stderr.contains(secret));
+                }
+            }
+        }
+    }
+
     // ── Filesystem enforcement tests ──────────────────────────────
 
     /// Run a shell command inside the sandbox with a custom HOME directory.

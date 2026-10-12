@@ -97,8 +97,13 @@ def interactive(command, env, project, authenticated, prompt, startup_only=False
         os.setsid()
         fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
 
-    child = subprocess.Popen(command, env=env, cwd=project, stdin=slave,
-                             stdout=slave, stderr=slave, preexec_fn=session)
+    try:
+        child = subprocess.Popen(command, env=env, cwd=project, stdin=slave,
+                                 stdout=slave, stderr=slave, preexec_fn=session)
+    except BaseException:
+        os.close(slave)
+        os.close(master)
+        raise
     os.close(slave)
     transcript = b""
     pending = b""
@@ -117,6 +122,8 @@ def interactive(command, env, project, authenticated, prompt, startup_only=False
                 if not chunk:
                     break
                 transcript += chunk
+                if len(transcript) > 8 * 1024 * 1024:
+                    raise SystemExit("FAIL: interactive output exceeded 8 MiB; raw output withheld")
                 pending += chunk
                 for query, response in (
                     (b"\x1b[6n", b"\x1b[1;1R"),
@@ -179,6 +186,8 @@ def interactive(command, env, project, authenticated, prompt, startup_only=False
                 stage = "answer"
                 transcript = b""
             elif stage == "answer" and b"CPLTAUTH7429" in re.sub(rb"\s+", b"", screen):
+                if b"CPLTAUTH7429" in re.sub(rb"\s+", b"", prompt.encode()):
+                    raise SystemExit("FAIL: expected answer is contained in the input prompt")
                 print("INTERACTIVE=authenticated model response")
                 return
             if child.poll() is not None:

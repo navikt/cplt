@@ -517,15 +517,15 @@ fn should_cache_token(
     deny_env: &[String],
     substitute: Option<&crate::agent::KeychainSubstitute>,
 ) -> bool {
-    if agent != Agent::Copilot || substitute_carries_gh_token(substitute) {
-        return false;
-    }
-    // GH_TOKEN specifically, not any of the three. #225 asks for the cache to
-    // follow the injection target: denying GH_TOKEN is the repo saying "no
-    // GitHub credential", while denying only COPILOT_GITHUB_TOKEN is a narrower
-    // statement that should not cost the agent the cache channel as well.
-    let target_denied = deny_env.iter().any(|d| d == "GH_TOKEN");
-    !target_denied && !child_keeps_a_github_token(deny_env)
+    crate::discover::gh_token_cache_eligibility(
+        agent,
+        deny_env,
+        substitute,
+        false,
+        false,
+        cfg!(target_os = "linux"),
+    )
+    .0
 }
 
 /// Whether to write `.gh-exec-token`, the file `cplt gh-gate` reads to set
@@ -544,17 +544,15 @@ fn should_cache_exec_token(
     substitute: Option<&crate::agent::KeychainSubstitute>,
     hosts_yml_exists: bool,
 ) -> bool {
-    hosts_yml_exists
-        && !substitute_carries_gh_token(substitute)
-        && !deny_env.iter().any(|d| d == "GH_TOKEN")
-        && (agent != Agent::Copilot
-            // gh reads only GH_TOKEN/GITHUB_TOKEN, not COPILOT_GITHUB_TOKEN.
-            // On macOS gh has the Keychain unless a substitute dropped it.
-            || ((cfg!(target_os = "linux") || substitute.is_some())
-                && !GH_TOKEN_VARS[..2].iter().any(|var| {
-                    !deny_env.iter().any(|d| d == var)
-                        && std::env::var(var).is_ok_and(|v| !v.trim().is_empty())
-                })))
+    crate::discover::gh_token_cache_eligibility(
+        agent,
+        deny_env,
+        substitute,
+        hosts_yml_exists,
+        false,
+        cfg!(target_os = "linux"),
+    )
+    .1
 }
 
 /// The scratch dir holding `.gh-exec-token`, for `cplt gh-gate`.

@@ -68,7 +68,55 @@ the source (`cli-main.js:1598`). It manages stored user/provider accounts;
 documents removal from Keychain and persisted state
 (`schemas/api.schema.json:382–393`). Server-side revocation was not established.
 
-## Extraction implementation gate
+## Runnable synthetic evidence
+
+`hack/probe-copilot-auth-contract.py` checks the public generated schema. Adding
+`--node` executes only metadata/identity functions from a copied native module,
+inside Seatbelt with network, Mach lookup, subprocesses and real-home access
+denied except for an exact read grant on the selected Node executable. There is
+no Node-parent or package-subtree grant; the bounded native module is copied into
+the fixture. A Node installation requiring other home-resident libraries fails
+closed. Temporary fixture grants overlapping protected storage are refused.
+It clears the environment, creates disposable config fixtures, verifies
+outside-fixture read/TCP/subprocess denial and rejects symlink/FIFO fixture reads.
+It never runs login, logout, credential resolution or model requests. No Keychain
+is created or queried: no explicit isolated-store override has been established
+for Copilot's native lookup.
+
+The earlier probe granted Node's inferred installation root and the package
+subtree after the home deny. Its isolation claim was too broad: `~/bin/node`
+could reopen the whole home. Corrected kernel checks use copied executables in
+synthetic `~/bin` and `~/.local/bin` layouts. Home, executable-sibling and
+package-parent credential canaries stay unreadable. Negative controls restore
+the old inferred root or an overlapping package grant and make the assertions
+fail. Only synthetic files are used for these controls.
+
+```sh
+python3 hack/probe-copilot-auth-contract.py --package "$PUBLIC_PACKAGE"
+python3 hack/probe-copilot-auth-contract.py --package "$PUBLIC_PACKAGE" --node "$ABSOLUTE_NODE"
+```
+
+On 2026-10-12, `1.0.94-5` and `1.0.95` passed native metadata and serialization
+checks with Node 24. Both retain synthetic `authTokens` values shaped as
+`{token: nonempty string}` or `{token, expiresAt: "2099-01-01T00:00:00Z"}` in
+fresh config directories. Raw strings, empty tokens and invalid expiry strings
+are dropped. This proves config-fallback parsing, **not Keychain serialization**,
+credential validity, expiry enforcement or renewal. Separate fixture directories
+are necessary because native global-state reads cache earlier results.
+
+The raw `globalStateLoadForContext` binding retains `authTokens`, unlike the
+published RPC result schema. Do not infer raw-binding redaction from that schema.
+`authGetLastLoggedInUserForContext` returns synthetic last-sign-in metadata even
+with a dummy `COPILOT_GITHUB_TOKEN` present. It does not resolve effective
+authentication or prove active-account selection. Native identity comparison
+distinguishes stored user and environment identities.
+
+| Version | Schema SHA-256 | Native runtime SHA-256 |
+| --- | --- | --- |
+| `1.0.94-5` | `8053220e3f7939999ba01ea5dbe31ead0534f46f77e360fb45658253559d661e` | `64e83554d1fc455a3b0b5c1b5a92900ffadd586ee3864241d87334005a6a511f` |
+| `1.0.95` | `74e36b714b7b0290e6277625360086735d164df1462266b5cba654507f07a219` | `e6d701d5e79c2848c648194739bec1f418da0b6e193bc47a850bf7e427dd11df` |
+
+## Remaining extraction gate
 
 Before implementing, prove on a pinned version:
 
