@@ -71,7 +71,7 @@ documents removal from Keychain and persisted state
 ## Runnable synthetic evidence
 
 `hack/probe-copilot-auth-contract.py` checks the public generated schema. Adding
-`--node` executes only metadata/identity functions from a copied native module,
+`--node` executes synthetic metadata and native session checks from a copied module,
 inside Seatbelt with network, Mach lookup, subprocesses and real-home access
 denied except for an exact read grant on the selected Node executable. There is
 no Node-parent or package-subtree grant; the bounded native module is copied into
@@ -123,7 +123,10 @@ distinguishes stored user and environment identities.
 ## Native session experiment
 
 The standalone input reads only three bounded regular members from the public
-SEA archive: manifest, generated schema and native runtime. It never launches
+SEA archive: manifest, generated schema and native runtime. It bounds total
+gzip expansion to 256 MiB before tar parsing, including
+unrelated members and extended metadata. The reviewed `1.0.97-2` tar is
+177,036,288 bytes. It never launches
 the installed loader or downloads a package. Native execution requires the
 version/build pin and reviewed runtime SHA-256. Other artifacts fail closed.
 `1.0.94-5` remains schema-only in this probe; native session runs explicitly
@@ -173,7 +176,7 @@ exact-account export path, followed by separate expiry/rotation tests. Do not
 enumerate unrelated account tokens or silently fall back to gh. No production
 extraction or default change follows from these negative offline results.
 
-Five offline regression tests cover public SEA parsing, truncated-input
+Seven offline regression tests cover public SEA parsing, bounded expansion, malformed compression, truncated-input
 sanitization, hash refusal, old-version refusal and false initialization/errors
 from either resolution call. `mise run test:probe` and Linux/macOS CI run them;
 Node is required for the synthetic JS check.

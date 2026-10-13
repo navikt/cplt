@@ -2,6 +2,7 @@
 """Check pinned public Copilot schemas and isolated synthetic native metadata."""
 
 import argparse
+import gzip
 import hashlib
 import io
 import json
@@ -14,6 +15,7 @@ import subprocess
 import struct
 import tarfile
 import tempfile
+import zlib
 
 
 PINS = {"1.0.94-5": "fdeb5949", "1.0.95": "f5ba5057",
@@ -25,6 +27,8 @@ RUNTIMES = {
     '1.0.97-2':'ac5ea364f0c159667ba74957d66053a79a85c12601179f39e8a1d6ebf7f6c3b8',
 }
 TEMP = Path(tempfile.gettempdir())
+# Reviewed 1.0.97-2 expands to 177,036,288 bytes; cap the entire tar before parsing.
+TAR_LIMIT = 256 * 1024 * 1024
 
 SESSION_GATES = r"""
 async function checkSession(server, handle, sessionId, initialized) {
@@ -170,7 +174,7 @@ def standalone_files(executable):
     data = regular_bytes(executable, 256 * 1024 * 1024)
     try:
         return parse_standalone(data)
-    except (struct.error, tarfile.TarError, KeyError, EOFError) as error:
+    except (struct.error, tarfile.TarError, gzip.BadGzipFile, zlib.error, KeyError, EOFError) as error:
         raise ValueError('malformed public SEA archive') from error
 
 
@@ -212,8 +216,12 @@ def parse_standalone(data):
     offset += 8
     if count != 1 or field() != b'copilot.tgz':
         raise ValueError("unknown SEA assets")
+    with gzip.GzipFile(fileobj=io.BytesIO(field())) as compressed:
+        tar_bytes = compressed.read(TAR_LIMIT + 1)
+    if len(tar_bytes) > TAR_LIMIT:
+        raise ValueError('public tar exceeds decompressed limit')
     files = {}
-    with tarfile.open(fileobj=io.BytesIO(field()), mode='r:gz') as archive:
+    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode='r:') as archive:
         for name, limit in [('package.json', 16384), ('schemas/api.schema.json', 8 * 1024 * 1024),
                             ('prebuilds/darwin-arm64/runtime.node', 128 * 1024 * 1024)]:
             member = archive.getmember('package/' + name)

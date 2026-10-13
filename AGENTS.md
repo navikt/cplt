@@ -11,10 +11,10 @@ Always run `mise run check` at the end of a coding session.
 
 | Task | Suite | In sandbox | Linux CI | macOS CI | Requirements |
 |-------------------------|----------------|:----------:|:--------:|:--------:|-------------------------------|
-| `mise run check` | fmt + clippy + unit + lib + offline probe | ✅ | ✅ | ✅ | Python 3 (safe everywhere) |
+| `mise run check` | fmt + clippy + unit + lib + offline probe | ✅ | ✅ | ✅ | Python 3 + Node.js (safe everywhere) |
 | `mise run test:unit` | unit_tests | ✅ | ✅ | ✅ | None |
 | `mise run test:lib` | lib (modules) | ✅ | ✅ | ✅ | None |
-| `mise run test:probe` | offline probe checks | ✅ | ✅ | ✅ | Python 3; PTY case macOS-only |
+| `mise run test:probe` | offline probe checks | ✅ | ✅ | ✅ | Python 3 + Node.js; PTY case macOS-only |
 | `mise run test:integration` | integration | ✅ | ❌ | ✅ | macOS `sandbox-exec` |
 | `mise run test:integration-linux` | integration_linux | ❌ | ✅ | ❌ | Linux with Landlock (5.13+) |
 | `mise run test:network-audit` | network_audit | ✅ | ❌ | ✅ | macOS or Linux; binds localhost TCP |

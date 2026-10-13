@@ -46,6 +46,41 @@ class ContractTests(unittest.TestCase):
                 probe.isolated_native(Path('/synthetic'), Path('/node'))
             spawn.assert_not_called()
 
+    def test_expanding_unrelated_tar_refused_before_parsing(self):
+        payload = io.BytesIO()
+        with probe.tarfile.open(fileobj=payload, mode='w:gz') as archive:
+            member = probe.tarfile.TarInfo('unrelated-large-file')
+            member.size = 65536
+            archive.addfile(member, io.BytesIO(bytes(member.size)))
+        compressed = payload.getvalue()
+        self.assertLess(len(compressed), 1024)
+        field = lambda value: struct.pack('<Q', len(value)) + value
+        blob = bytes(9) + field(b'sea-loader.js') + field(b'loader') + struct.pack('<Q', 1) + field(b'copilot.tgz') + field(compressed)
+        header = struct.pack('<8I', 0xfeedfacf, 0, 0, 0, 1, 56, 0, 0)
+        segment = struct.pack('<II16sQQQQ', 25, 56, b'NODE_SEA', 0, 0, 88, len(blob))
+        with patch.object(probe, 'TAR_LIMIT', 1024), \
+                patch.object(probe, 'regular_bytes', return_value=header + segment + blob), \
+                patch.object(probe.tarfile, 'open') as parse, patch.object(probe.subprocess, 'Popen') as spawn:
+            with self.assertRaisesRegex(ValueError, 'decompressed limit'):
+                probe.standalone_files(Path('synthetic'))
+            parse.assert_not_called()
+            spawn.assert_not_called()
+
+    def test_invalid_deflate_is_sanitized_before_execution(self):
+        compressed = bytes.fromhex('1f8b0800000000000003') + b'\x07' + bytes(8)
+        with self.assertRaises(probe.zlib.error):
+            probe.gzip.decompress(compressed)
+        field = lambda value: struct.pack('<Q', len(value)) + value
+        blob = bytes(9) + field(b'sea-loader.js') + field(b'loader') + struct.pack('<Q', 1) + field(b'copilot.tgz') + field(compressed)
+        header = struct.pack('<8I', 0xfeedfacf, 0, 0, 0, 1, 56, 0, 0)
+        segment = struct.pack('<II16sQQQQ', 25, 56, b'NODE_SEA', 0, 0, 88, len(blob))
+        with patch.object(probe, 'regular_bytes', return_value=header + segment + blob), \
+                patch.object(probe.tarfile, 'open') as parse, patch.object(probe.subprocess, 'Popen') as spawn:
+            with self.assertRaisesRegex(ValueError, 'malformed public SEA archive'):
+                probe.standalone_files(Path('synthetic'))
+            parse.assert_not_called()
+            spawn.assert_not_called()
+
     def test_old_session_version_refuses_before_addon_read(self):
         with patch.object(probe.platform, 'system', return_value='Darwin'), \
                 patch.object(probe, 'regular_bytes', return_value=b'{"version":"1.0.94-5"}') as read:

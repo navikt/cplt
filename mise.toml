@@ -64,7 +64,7 @@ description = "Run unit tests — cross-platform, sandbox-safe"
 run = "sh hack/quiet-test.sh --test unit_tests"
 
 [tasks."test:probe"]
-description = "Run offline probe regression checks (requires Python 3)"
+description = "Run offline probe regression checks (requires Python 3 and Node.js)"
 run = ["python3 -B hack/test-probe-copilot-no-auth.py", "python3 -B hack/test-probe-copilot-auth-contract.py"]
 
 [tasks."test:integration"]
@@ -100,7 +100,7 @@ description = "Run ALL tests including live smoke tests — macOS only, NOT sand
 depends = ["test:all", "test:e2e-live"]
 
 [tasks.check]
-description = "Run all checks (fmt, clippy, test) — works inside sandbox"
+description = "Run all checks (fmt, clippy, test) — sandbox-safe; requires Python 3 and Node.js"
 depends = ["fmt:check", "clippy", "test:unit", "test:lib", "test:probe"]
 
 [tasks.all]
