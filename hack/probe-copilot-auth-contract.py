@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -10,13 +11,42 @@ import platform
 import signal
 import stat
 import subprocess
+import struct
+import tarfile
 import tempfile
 
 
-PINS = {"1.0.94-5": "fdeb5949", "1.0.95": "f5ba5057"}
+PINS = {"1.0.94-5": "fdeb5949", "1.0.95": "f5ba5057",
+        "1.0.96-2": "8227e3a7", "1.0.97-2": "1bc7ab07"}
+RUNTIMES = {
+    '1.0.94-5':'64e83554d1fc455a3b0b5c1b5a92900ffadd586ee3864241d87334005a6a511f',
+    '1.0.95':'e6d701d5e79c2848c648194739bec1f418da0b6e193bc47a850bf7e427dd11df',
+    '1.0.96-2':'0ddd9ea39981870ce8241f2f95d24ce085572e82407d463c500f139ed6c8aa4f',
+    '1.0.97-2':'ac5ea364f0c159667ba74957d66053a79a85c12601179f39e8a1d6ebf7f6c3b8',
+}
 TEMP = Path(tempfile.gettempdir())
 
-NATIVE_CHECK = r"""
+SESSION_GATES = r"""
+async function checkSession(server, handle, sessionId, initialized) {
+  assert.equal(initialized, true);
+  const read = query => server.invokeMethod('session.accounts.get',
+    JSON.stringify({sessionId,query:{kind:query}})).then(JSON.parse);
+  const before = await read('activeAccount');
+  assert(before.ok);
+  assert.deepEqual(before.result,{kind:'activeAccount',account:null});
+  assert.equal(await handle.current(), null);
+  assert.equal(await handle.currentAndApplyToSession(sessionId), null);
+  const after = await read('activeAccount');
+  assert(after.ok);
+  assert.deepEqual(after.result,{kind:'activeAccount',account:null});
+  const status = await read('status');
+  assert(status.ok);
+  assert.equal(status.result.kind,'status');
+  assert.equal(status.result.status.isAuthenticated,false);
+}
+"""
+
+NATIVE_CHECK = SESSION_GATES + r"""
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const net = require('node:net');
@@ -77,6 +107,47 @@ awaitBlocked.then(async () => {
     console.log('STEP credential ' + label + ' retained=' + retained);
   }
   console.log('PASS native serialization: config fallback retains token objects and UTC expiry; drops raw strings, empty tokens and invalid expiry');
+  const scenario = process.env.CPLT_SYNTHETIC_CASE;
+  const cases = {
+    empty:{loggedInUsers:[],authTokens:{}},
+    roster:fixture,
+    hosts:{...fixture,loggedInUsers:[{host:'https://github.com',login:'fixture-bob'},
+                                   {host:'https://fixture.ghe.com',login:'fixture-bob'}]},
+    missing:{...fixture,lastLoggedInUser:{host:'https://github.com',login:'fixture-missing'}},
+    env:fixture,
+    fallback:{...fixture,authTokens:{'https://github.com:fixture-bob':{token:'gho_synthetic_not_a_credential'}}},
+    expired:{...fixture,authTokens:{'https://github.com:fixture-bob':{
+      token:'gho_synthetic_not_a_credential',expiresAt:'2000-01-01T00:00:00Z'}}},
+  };
+  assert(scenario in cases);
+  const sessionRoot = root + '/session-fixture';
+  fs.mkdirSync(sessionRoot);
+  fs.writeFileSync(sessionRoot + '/config.json',JSON.stringify(cases[scenario]));
+  delete process.env.COPILOT_GITHUB_TOKEN;
+  if (scenario === 'env') process.env.COPILOT_GITHUB_TOKEN='gho_synthetic_not_a_credential';
+  const handle = new v.ProcessAuthHandle({configDir:sessionRoot, startupEnvironment:process.env,
+                                         disableAutoLogin:false});
+  const channel = v.sessionHostChannelOpen();
+  const server = new v.JsonrpcServerHandle(channel);
+  const auth = handle.managerConfig();
+  server.setSessionsContext(root + '/sessions', 'session-state');
+  server.setSdkSessionConfig(undefined, false, false, {}, {}, {}, undefined, [],
+    v.sessionConstantsIntegrationId(), root, auth, undefined, undefined, sessionRoot,
+    undefined, false, false);
+  server.setAuthManagerConfig(auth);
+  try {
+    const sessionId = 'synthetic-contract-session';
+    const construction = await v.sessionCreate(JSON.stringify({sessionId,
+      startTimeIso:'2026-10-13T00:00:00Z', workingDirectoryCandidate:root,
+      workingDirectoryConventions:'posix',sessionFsIsLocal:true,
+      processWorkingDirectory:root,defaultIntegrationId:v.sessionConstantsIntegrationId(),
+      updateOptionsJson:'{}',isLocalSession:true,authManagerConfig:auth}));
+    assert.equal(JSON.parse(construction.planJson).nativeSessionId, sessionId);
+    const initialized = await server.initializeSession(sessionId, '2026-10-13T00:00:00Z',
+      null, false, false, null, 'posix', null, 'interactive', null, null, false);
+    await checkSession(server,handle,sessionId,initialized);
+    console.log('PASS session case=' + scenario + ' initialized=true activeAccount=null current=null applied=null');
+  } finally {await server.remove();v.sessionHostChannelClose(channel);handle.dispose();}
   console.log('PASS native: last-sign-in metadata roundtrip; env token does not change that read; raw binding retains empty authTokens unlike RPC schema; user/env identities differ');
 }).catch(() => {console.error('FAIL isolated native assertions; raw output withheld'); process.exitCode=1;});
 """
@@ -94,6 +165,64 @@ def regular_bytes(path, limit):
         return data
 
 
+def standalone_files(executable):
+    """Read only required public SEA archive members, never launch its loader."""
+    data = regular_bytes(executable, 256 * 1024 * 1024)
+    try:
+        return parse_standalone(data)
+    except (struct.error, tarfile.TarError, KeyError, EOFError) as error:
+        raise ValueError('malformed public SEA archive') from error
+
+
+def parse_standalone(data):
+    if data[:4] != b'\xcf\xfa\xed\xfe':
+        raise ValueError("expected little-endian 64-bit Mach-O")
+    offset = 32
+    blob = None
+    for _ in range(struct.unpack_from('<I', data, 16)[0]):
+        command, size = struct.unpack_from('<II', data, offset)
+        if size < 8 or offset + size > len(data):
+            raise ValueError("invalid Mach-O command")
+        if command == 25 and data[offset + 8:offset + 24].rstrip(b'\0') == b'NODE_SEA':
+            if size < 56:
+                raise ValueError('truncated SEA segment command')
+            start, length = struct.unpack_from('<QQ', data, offset + 40)
+            if start > len(data) or length > len(data) - start:
+                raise ValueError('truncated SEA segment')
+            blob = data[start:start + length]
+        offset += size
+    if blob is None:
+        raise ValueError("missing SEA blob")
+    offset = 9
+
+    def field():
+        nonlocal offset
+        length = struct.unpack_from('<Q', blob, offset)[0]
+        offset += 8
+        if length > len(blob) - offset:
+            raise ValueError("invalid SEA field")
+        value = blob[offset:offset + length]
+        offset += length
+        return value
+
+    if field() != b'sea-loader.js':
+        raise ValueError("unknown SEA loader")
+    field()
+    count = struct.unpack_from('<Q', blob, offset)[0]
+    offset += 8
+    if count != 1 or field() != b'copilot.tgz':
+        raise ValueError("unknown SEA assets")
+    files = {}
+    with tarfile.open(fileobj=io.BytesIO(field()), mode='r:gz') as archive:
+        for name, limit in [('package.json', 16384), ('schemas/api.schema.json', 8 * 1024 * 1024),
+                            ('prebuilds/darwin-arm64/runtime.node', 128 * 1024 * 1024)]:
+            member = archive.getmember('package/' + name)
+            if not member.isfile() or member.size > limit:
+                raise ValueError("invalid public archive member")
+            files[name] = archive.extractfile(member).read(limit + 1)
+    return files
+
+
 def schema_checks(package):
     manifest = json.loads(regular_bytes(package / "package.json", 16384))
     version = manifest["version"]
@@ -101,6 +230,9 @@ def schema_checks(package):
         raise ValueError("unsupported version/build; review public code before adding a pin")
     raw = regular_bytes(package / "schemas/api.schema.json", 8 * 1024 * 1024)
     definitions = json.loads(raw)["definitions"]
+    schema = json.loads(raw)
+    assert schema['session']['accounts']['get']['rpcMethod'] == 'session.accounts.get'
+    assert 'sessionId' in schema['session']['accounts']['get']['params']['required']
     user, env = definitions["UserAuthInfo"], definitions["EnvAuthInfo"]
     assert user["required"] == ["type", "host", "login"]
     assert "token" not in user["properties"]
@@ -196,9 +328,14 @@ def isolated_native(package, node):
         raise ValueError("native experiment requires macOS Seatbelt")
     if not TEMP.is_dir():
         raise ValueError("approved temporary parent is unavailable")
+    version = json.loads(regular_bytes(package / 'package.json', 16384))['version']
+    if version == '1.0.94-5':
+        raise ValueError('1.0.94-5 supports schema-only checks; session fixtures require 1.0.95/1.0.96-2/1.0.97-2')
     addon = package / "prebuilds/darwin-arm64/runtime.node"
     addon_bytes = regular_bytes(addon, 128 * 1024 * 1024)
     digest = hashlib.sha256(addon_bytes).hexdigest()
+    if RUNTIMES.get(version) != digest:
+        raise ValueError('unreviewed native artifact; refusing execution')
     with tempfile.TemporaryDirectory(prefix="copilot-contract-", dir=TEMP) as temporary, \
             tempfile.TemporaryDirectory(prefix="copilot-contract-denied-", dir=TEMP) as denied:
         root = Path(temporary).resolve()
@@ -235,39 +372,56 @@ def isolated_native(package, node):
                "GH_CONFIG_DIR": str(home / "gh"),
                "COPILOT_GITHUB_TOKEN": "synthetic-not-a-credential"}
         layout_checks(root, Path(denied).resolve(), node, env)
-        command = ["/usr/bin/sandbox-exec", "-f", str(profile), str(node), str(script),
-                   str(isolated_addon), str(config), str(canary)]
-        with subprocess.Popen(command, env=env, cwd=root, stdin=subprocess.DEVNULL,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              text=True, start_new_session=True) as child:
-            try:
-                stdout, _ = child.communicate(timeout=30)
-            finally:
+        for scenario in ("empty", "roster", "hosts", "missing", "env", "fallback", "expired"):
+            case_root = root / scenario
+            case_root.mkdir()
+            case_config = case_root / 'config'
+            case_config.mkdir()
+            (case_config / 'config.json').write_text(json.dumps(fixture))
+            command = ["/usr/bin/sandbox-exec", "-f", str(profile), str(node), str(script),
+                       str(isolated_addon), str(case_config), str(canary)]
+            with subprocess.Popen(command, env={**env, 'CPLT_SYNTHETIC_CASE':scenario},
+                                  cwd=case_root, stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  text=True, start_new_session=True) as child:
                 try:
-                    os.killpg(child.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                child.wait()
-        for line in stdout.splitlines():
-            if line.startswith(("STEP ", "PASS native")):
-                print(line)
-        if child.returncode or "PASS native:" not in stdout:
-            raise ValueError("isolated native check failed; raw output withheld")
+                    stdout, _ = child.communicate(timeout=30)
+                finally:
+                    try:
+                        os.killpg(child.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    child.wait()
+            for line in stdout.splitlines():
+                if line.startswith('PASS session') or (scenario == 'empty' and line.startswith(('STEP ', 'PASS native'))):
+                    print(line)
+            if child.returncode or "PASS native:" not in stdout or 'PASS session' not in stdout:
+                raise ValueError("isolated native check failed; raw output withheld")
         print(f"PIN runtime_sha256={digest}")
         print("PASS isolation: outside-fixture read, subprocesses and TCP connect denied; home denied except exact Node file; all Mach lookup denied")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--package", type=Path, required=True, help="public extracted program directory")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--package", type=Path, help="public extracted program directory")
+    source.add_argument("--standalone", type=Path, help="installed public Mach-O SEA executable; never launched")
     parser.add_argument("--node", type=Path, help="absolute installed Node path; enables isolated native checks")
     args = parser.parse_args()
-    package = args.package.resolve(strict=True)
-    schema_checks(package)
-    if args.node:
-        if not args.node.is_absolute():
-            parser.error("--node must be absolute")
-        isolated_native(package, args.node.resolve(strict=True))
+    if args.node and not args.node.is_absolute():
+        parser.error("--node must be absolute")
+    with tempfile.TemporaryDirectory(prefix='copilot-public-', dir=TEMP) as temporary:
+        if args.standalone:
+            package = Path(temporary)
+            for name, data in standalone_files(args.standalone.resolve(strict=True)).items():
+                target = package / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
+        else:
+            package = args.package.resolve(strict=True)
+        schema_checks(package)
+        if args.node:
+            isolated_native(package, args.node.resolve(strict=True))
     print("BLOCKED extraction: secure-store serialization, authoritative active selection and standalone renewal unproven")
 
 
