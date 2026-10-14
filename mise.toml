@@ -87,13 +87,21 @@ run = "sh hack/quiet-test.sh --test e2e"
 description = "Run E2E project scaffold tests — macOS only, sandbox-safe"
 run = "sh hack/quiet-test.sh --test e2e_projects"
 
+[tasks."test:e2e-guards"]
+description = "Run gh and git guard E2E tests — macOS only, sandbox-safe"
+run = "sh hack/quiet-test.sh --test e2e_guards"
+
+[tasks."test:e2e-git-hardening"]
+description = "Run parent-side git invocation hardening E2E tests — macOS only, sandbox-safe"
+run = "sh hack/quiet-test.sh --test e2e_git_hardening"
+
 [tasks."test:e2e-live"]
 description = "Run live smoke tests — macOS only, requires Copilot auth + network, NOT sandbox-safe"
 run = "sh hack/quiet-test.sh --test e2e -- --ignored"
 
 [tasks."test:all"]
 description = "Run all test suites except live smoke tests — macOS only, sandbox-safe"
-depends = ["test:unit", "test:lib", "test:integration", "test:e2e", "test:e2e-projects", "test:network-audit"]
+depends = ["test:unit", "test:lib", "test:integration", "test:e2e", "test:e2e-projects", "test:e2e-guards", "test:e2e-git-hardening", "test:network-audit"]
 
 [tasks."test:everything"]
 description = "Run ALL tests including live smoke tests — macOS only, NOT sandbox-safe"

@@ -287,6 +287,9 @@ const RESERVED_DENY_ENV: &[&str] = &[
 /// rather than trusted — but it argues for dropping grants, not for discarding
 /// a repository's restrictions on one platform only.
 ///
+/// Maximum size of `.cplt.toml` (64 KiB).
+pub const MAX_REPO_CONFIG_BYTES: u64 = 64 * 1024;
+
 /// Returns `None` if no `.cplt.toml` exists.
 pub fn load_repo_config(project_dir: &Path) -> Result<Option<LoadedRepoConfig>, String> {
     // Try git HEAD first (tamper-proof source)
@@ -303,39 +306,40 @@ pub fn load_repo_config(project_dir: &Path) -> Result<Option<LoadedRepoConfig>, 
 
     // Fallback: the working tree, on every platform, for `[deny]` only.
     let file_path = project_dir.join(REPO_CONFIG_FILE);
-    // `is_file()` would read a symlink loop or an unstattable file as "no
-    // .cplt.toml" and say nothing. Only an absent file is "none"; any other error
-    // goes to the caller, which warns as it does for an unparseable file (#385).
-    let is_file = match std::fs::metadata(&file_path) {
-        Ok(meta) => meta.is_file(),
-        Err(e) if crate::config::is_absent(&e, &file_path) => false,
+    // Use `read_untrusted` so a planted symlink, FIFO, or multi-gigabyte file
+    // in the working tree is refused without hanging or following the link,
+    // while still reporting an error (rather than silent "no .cplt.toml")
+    // whenever a non-absent entry exists (#385).
+    let content = match crate::untrusted::read_untrusted(&file_path, MAX_REPO_CONFIG_BYTES) {
+        Ok(Some(content)) => content,
+        Ok(None) => {
+            return Err(format!(
+                "Failed to read {}: must be a regular file (not a symlink or FIFO) of at most {MAX_REPO_CONFIG_BYTES} bytes",
+                file_path.display()
+            ));
+        }
+        Err(e) if crate::config::is_absent(&e, &file_path) => return Ok(None),
         Err(e) => return Err(format!("Failed to read {}: {e}", file_path.display())),
     };
-    if is_file {
-        let content = std::fs::read_to_string(&file_path)
-            .map_err(|e| format!("Failed to read {}: {e}", file_path.display()))?;
-        let mut config = parse_repo_config(&content)?;
-        validate_repo_config(&config)?;
-        // The widening proposals are removed HERE, at the boundary, rather than
-        // refused at each place that could approve them. Three separate holes
-        // were found one at a time in the old arrangement — a gitignored file,
-        // a non-git directory, and `--accept-repo-config` — because the guard
-        // lived in `trust_accept` and every other route around it had to
-        // remember the rule. A grant that never leaves this function cannot be
-        // approved by a caller that forgets (#206).
-        let propose_dropped = !proposed_keys(&config.propose).is_empty();
-        config.propose = config.propose.tightenings_only();
-        return Ok(Some(LoadedRepoConfig {
-            config,
-            source: RepoConfigSource::WorkingTree,
-            // The working-tree fallback reads `<project_dir>/.cplt.toml`
-            // literally, so here the project dir *is* the config's directory.
-            dir: canonical(project_dir.to_path_buf()),
-            propose_dropped,
-        }));
-    }
-
-    Ok(None)
+    let mut config = parse_repo_config(&content)?;
+    validate_repo_config(&config)?;
+    // The widening proposals are removed HERE, at the boundary, rather than
+    // refused at each place that could approve them. Three separate holes
+    // were found one at a time in the old arrangement — a gitignored file,
+    // a non-git directory, and `--accept-repo-config` — because the guard
+    // lived in `trust_accept` and every other route around it had to
+    // remember the rule. A grant that never leaves this function cannot be
+    // approved by a caller that forgets (#206).
+    let propose_dropped = !proposed_keys(&config.propose).is_empty();
+    config.propose = config.propose.tightenings_only();
+    Ok(Some(LoadedRepoConfig {
+        config,
+        source: RepoConfigSource::WorkingTree,
+        // The working-tree fallback reads `<project_dir>/.cplt.toml`
+        // literally, so here the project dir *is* the config's directory.
+        dir: canonical(project_dir.to_path_buf()),
+        propose_dropped,
+    }))
 }
 
 /// Canonicalize, keeping the input on failure.
@@ -463,7 +467,10 @@ impl RepoConfigState {
 /// [`load_repo_config`] decides what is applied.
 #[must_use]
 pub fn repo_config_state(project_dir: &Path) -> RepoConfigState {
-    let in_working_tree = project_dir.join(REPO_CONFIG_FILE).is_file();
+    let in_working_tree = project_dir
+        .join(REPO_CONFIG_FILE)
+        .symlink_metadata()
+        .is_ok_and(|m| m.is_file());
 
     // Existence in HEAD is what closes the gitignore hole: `git status` says
     // nothing at all about an ignored file, so it cannot answer this.
@@ -521,6 +528,11 @@ pub fn parse_and_validate(content: &str) -> Result<RepoConfig, String> {
 
 /// Parse TOML content into a RepoConfig.
 fn parse_repo_config(content: &str) -> Result<RepoConfig, String> {
+    if content.len() as u64 > MAX_REPO_CONFIG_BYTES {
+        return Err(format!(
+            "Invalid .cplt.toml: exceeds maximum size of {MAX_REPO_CONFIG_BYTES} bytes"
+        ));
+    }
     toml::from_str(content).map_err(|e| format!("Invalid .cplt.toml: {e}"))
 }
 
@@ -562,8 +574,13 @@ fn reject_root_path(path: &str, context: &str) -> Result<(), String> {
 
 /// Validate the repo config for safety.
 fn validate_repo_config(config: &RepoConfig) -> Result<(), String> {
-    // Validate deny paths don't contain SBPL injection characters or traversal
+    // Validate deny paths don't contain SBPL injection characters, control chars, or traversal
     for path in &config.deny.paths {
+        if path.chars().any(char::is_control) {
+            return Err(format!(
+                "deny.paths entry {path:?} contains control characters"
+            ));
+        }
         reject_path_traversal(path, "deny.paths")?;
         reject_root_path(path, "deny.paths")?;
         crate::sandbox::validate_sbpl_path(&PathBuf::from(path))?;
@@ -578,6 +595,11 @@ fn validate_repo_config(config: &RepoConfig) -> Result<(), String> {
         .chain(config.propose.allow.write.iter())
         .chain(config.propose.allow.socket.iter())
     {
+        if path.chars().any(char::is_control) {
+            return Err(format!(
+                "propose.allow.read/write/socket entry {path:?} contains control characters"
+            ));
+        }
         reject_path_traversal(path, "propose.allow.read/write/socket")?;
         crate::sandbox::validate_sbpl_path(&PathBuf::from(path))?;
     }
@@ -591,6 +613,18 @@ fn validate_repo_config(config: &RepoConfig) -> Result<(), String> {
             return Err(format!(
                 "propose.repos entry {repo:?} is not a repository identity. \
                  Name repositories as <owner>/<name>, for example navikt/cplt."
+            ));
+        }
+    }
+
+    // Validate proposed pass_env vars: must be non-empty alphanumeric/underscore identifiers
+    for var in &config.propose.pass_env {
+        if var.is_empty() {
+            return Err("propose.pass_env contains empty variable name".to_string());
+        }
+        if !var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(format!(
+                "propose.pass_env variable {var:?} contains invalid characters (expected [A-Za-z0-9_])"
             ));
         }
     }
@@ -638,6 +672,11 @@ fn validate_repo_config(config: &RepoConfig) -> Result<(), String> {
             if domain.is_empty() || domain.trim().is_empty() {
                 return Err(format!("{label} contains empty domain name"));
             }
+            if domain.chars().any(char::is_control) {
+                return Err(format!(
+                    "{label} entry {domain:?} contains control characters"
+                ));
+            }
             if domain.contains(char::is_whitespace) {
                 return Err(format!("{label} entry {domain:?} contains whitespace"));
             }
@@ -653,6 +692,12 @@ fn validate_repo_config(config: &RepoConfig) -> Result<(), String> {
                      Name the domain itself and every subdomain is covered"
                 ));
             }
+        }
+    }
+
+    for key in unknown_keys(config) {
+        if key.chars().any(char::is_control) {
+            return Err(format!("unknown key {key:?} contains control characters"));
         }
     }
 
@@ -1670,5 +1715,43 @@ paths = [".env", "certs/server.pem", "~/secrets", "apps/web/.env.local"]
         let config = parse_repo_config(toml_str).unwrap();
         let dir = tempfile::tempdir().unwrap();
         assert!(glob_like_deny_paths(&config, dir.path()).is_empty());
+    }
+
+    #[test]
+    fn working_tree_refuses_fifo_symlink_and_oversize() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap();
+        let cfg = path.join(REPO_CONFIG_FILE);
+
+        crate::untrusted::tests::mkfifo(&cfg);
+        let p = path.clone();
+        assert!(crate::untrusted::tests::bounded(move || load_repo_config(
+            &p
+        )
+        .is_err()));
+        std::fs::remove_file(&cfg).unwrap();
+
+        let target = path.join("real.toml");
+        std::fs::write(&target, "[deny]\npaths = [\"secrets\"]\n").unwrap();
+        std::os::unix::fs::symlink(&target, &cfg).unwrap();
+        assert!(load_repo_config(&path).is_err());
+        std::fs::remove_file(&cfg).unwrap();
+
+        let big = format!("# {}\n", "x".repeat(MAX_REPO_CONFIG_BYTES as usize));
+        assert!(parse_and_validate(&big).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_control_chars_in_proposals() {
+        for bad in [
+            "[propose.allow]\ndomains = [\"evil\\u001b[2K.example.com\"]\n",
+            "[propose.allow]\nread = [\"/tmp/evil\\u001b[2K\"]\n",
+            "[propose]\npass_env = [\"EVIL\\u001b\"]\n",
+        ] {
+            assert!(
+                parse_and_validate(bad).is_err(),
+                "expected error for control characters in: {bad}"
+            );
+        }
     }
 }

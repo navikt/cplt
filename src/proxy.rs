@@ -1416,7 +1416,7 @@ pub fn is_loopback_host(host: &str) -> bool {
     h == "localhost"
         || h.ends_with(".localhost")
         || h.parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
+            .is_ok_and(|ip| ip.to_canonical().is_loopback())
 }
 
 /// Whether `host` is spelled as loopback (see [`is_loopback_host`]) and the
@@ -1478,15 +1478,36 @@ fn handle_connect(
     state: &ProxyState,
     classification: &mut ClassificationGuard,
 ) {
-    // Parse host:port
-    let (host, port) = match target.rsplit_once(':') {
-        Some((h, p)) => (h.to_string(), p.parse::<u16>().unwrap_or(443)),
-        None => (target.to_string(), 443),
+    // Parse host:port, rejecting unbracketed IPv6 literals, non-numeric/zero
+    // ports, userinfo (`@`), path/fragment characters, and control characters
+    // before any DNS lookup or upstream proxy forwarding.
+    let (raw_host, port) = match target.rsplit_once(':') {
+        Some((h, p)) => match p.parse::<u16>() {
+            Ok(port)
+                if port > 0 && (!h.contains(':') || (h.starts_with('[') && h.ends_with(']'))) =>
+            {
+                (h, port)
+            }
+            _ => {
+                log_connection(state, Some(classification), "CONNECT", target, "BLOCKED");
+                reject(&mut client, b"HTTP/1.1 400 Bad Request\r\n\r\n");
+                return;
+            }
+        },
+        None => (target, 443),
     };
 
     // Normalize hostname: lowercase, strip trailing dot (valid DNS but
     // would bypass exact-match rules otherwise).
-    let host = normalize_hostname(&host);
+    let host = normalize_hostname(raw_host);
+    if host.is_empty()
+        || host.contains(['@', '/', '\\', '?', '#'])
+        || host.chars().any(char::is_control)
+    {
+        log_connection(state, Some(classification), "CONNECT", target, "BLOCKED");
+        reject(&mut client, b"HTTP/1.1 400 Bad Request\r\n\r\n");
+        return;
+    }
 
     // Compute localhost bypass before the port check: --allow-localhost <PORT> must
     // also exempt that port from the general port policy (which only lists remote ports
@@ -2181,24 +2202,23 @@ pub fn parse_domain_file(path: &std::path::Path) -> Result<Vec<String>, String> 
 /// Check if a resolved IP address is private/reserved (post-DNS resolution).
 /// This is the primary defense against DNS rebinding attacks.
 pub fn is_private_ip(ip: &std::net::IpAddr) -> bool {
-    match ip {
+    match ip.to_canonical() {
         std::net::IpAddr::V4(v4) => {
             v4.is_loopback()                // 127.0.0.0/8
                 || v4.is_private()           // 10/8, 172.16/12, 192.168/16
                 || v4.is_link_local()        // 169.254.0.0/16
                 || v4.is_unspecified()       // 0.0.0.0
                 || v4.is_broadcast()         // 255.255.255.255
-                || is_cgnat(v4)              // 100.64.0.0/10 (Tailscale, VPN)
-                || is_benchmarking(v4)       // 198.18.0.0/15
-                || is_reserved_v4(v4)        // 240.0.0.0/4
-                || is_protocol_assign(v4) // 192.0.0.0/24
+                || is_cgnat(&v4)             // 100.64.0.0/10 (Tailscale, VPN)
+                || is_benchmarking(&v4)      // 198.18.0.0/15
+                || is_reserved_v4(&v4)       // 240.0.0.0/4
+                || is_protocol_assign(&v4) // 192.0.0.0/24
         }
         std::net::IpAddr::V6(v6) => {
             v6.is_loopback()                 // ::1
                 || v6.is_unspecified()       // ::
-                || is_ula(v6)                // fc00::/7 (private v6)
-                || is_link_local_v6(v6)      // fe80::/10
-                || is_v4_mapped_private(v6) // ::ffff:127.0.0.1 etc.
+                || is_ula(&v6)               // fc00::/7 (private v6)
+                || is_link_local_v6(&v6) // fe80::/10
         }
     }
 }
@@ -2242,7 +2262,7 @@ pub fn resolved_ip_is_blocked(
     }
     // Loopback is reachable only when localhost access was explicitly allowed;
     // every other private/reserved IP is always blocked here.
-    !(ip.is_loopback() && localhost_allowed)
+    !(ip.to_canonical().is_loopback() && localhost_allowed)
 }
 
 /// Why a CONNECT was refused after DNS answered.
@@ -2356,7 +2376,7 @@ pub fn classify_resolved(
         // (`localhost_opt_in`), NOT because the name literally spells
         // "localhost" — so a loopback-aliasing name (`lvh.me`,
         // `127.0.0.1.nip.io`) works with an opt-in and is blocked without.
-        let refusal = if localhost_connect_allowed && !addr.ip().is_loopback() {
+        let refusal = if localhost_connect_allowed && !addr.ip().to_canonical().is_loopback() {
             Some(Refusal::ResolvedNonLoopback)
         } else if resolved_ip_is_blocked(&addr.ip(), host_is_private_domain, localhost_opt_in) {
             Some(Refusal::ResolvedPrivate)
@@ -2380,8 +2400,16 @@ pub fn classify_resolved(
     // the user's machine. So it is connected directly, never forwarded — but
     // only when the user opted into localhost. A private-domain name whose
     // local answer is loopback, without that opt-in, keeps going upstream.
-    if via_upstream && !(localhost_opt_in && allowed.iter().all(|a| a.ip().is_loopback())) {
-        ConnectRoute::Upstream
+    // On the upstream path, any blocked address in a mixed answer must refuse the
+    // whole CONNECT because the upstream proxy receives the hostname, not `allowed`.
+    if via_upstream
+        && !(localhost_opt_in && allowed.iter().all(|a| a.ip().to_canonical().is_loopback()))
+    {
+        if let Some(refusal) = first_refusal {
+            ConnectRoute::Refuse(refusal)
+        } else {
+            ConnectRoute::Upstream
+        }
     } else {
         ConnectRoute::Direct(allowed)
     }
@@ -2428,19 +2456,6 @@ fn is_ula(ip: &std::net::Ipv6Addr) -> bool {
 // IPv6 link-local (RFC 4291)
 fn is_link_local_v6(ip: &std::net::Ipv6Addr) -> bool {
     (ip.segments()[0] & 0xFFC0) == 0xFE80 // fe80::/10
-}
-
-// IPv4-mapped IPv6 addresses with private IPv4
-fn is_v4_mapped_private(ip: &std::net::Ipv6Addr) -> bool {
-    if let Some(v4) = ip.to_ipv4_mapped() {
-        v4.is_loopback()
-            || v4.is_private()
-            || v4.is_link_local()
-            || v4.is_unspecified()
-            || is_cgnat(&v4)
-    } else {
-        false
-    }
 }
 
 fn log_connection(
@@ -2887,11 +2902,11 @@ mod tests {
             classify_resolved(&[lo, public], true, false, true, false),
             ConnectRoute::Upstream
         );
-        // Without the opt-in the loopback address is dropped, leaving only the
-        // public one, which is forwarded.
+        // Without the opt-in the loopback address is blocked, so upstream mode
+        // refuses the mixed answer rather than forwarding the hostname.
         assert_eq!(
             classify_resolved(&[lo, public], true, false, false, false),
-            ConnectRoute::Upstream
+            ConnectRoute::Refuse(Refusal::ResolvedPrivate)
         );
         // A private-domain name whose local answer is loopback is not a local
         // target without the localhost opt-in, so it is still forwarded.
@@ -2918,26 +2933,25 @@ mod tests {
 
     #[test]
     fn blocked_addresses_are_dropped_from_a_mixed_answer() {
-        // Only addresses that pass the guard are ever connected to, so a blocked
-        // one cannot be reached by making the ones before it fail.
+        // Direct mode connects only to addresses that pass the guard, whereas
+        // upstream mode forwards the hostname and must refuse any mixed answer
+        // containing a blocked address.
         let public = addr("93.184.216.34");
         let ula: std::net::SocketAddr = "[fd00::1]:443".parse().unwrap();
         for via_upstream in [false, true] {
-            let keep = |kept: Vec<std::net::SocketAddr>| {
-                if via_upstream {
-                    ConnectRoute::Upstream
-                } else {
-                    ConnectRoute::Direct(kept)
-                }
-            };
             for (answer, kept) in [
                 (vec![public, addr("169.254.169.254")], vec![public]),
                 (vec![addr("10.0.0.5"), public], vec![public]),
                 (vec![public, public, ula], vec![public, public]),
             ] {
+                let expected = if via_upstream {
+                    ConnectRoute::Refuse(Refusal::ResolvedPrivate)
+                } else {
+                    ConnectRoute::Direct(kept)
+                };
                 assert_eq!(
                     classify_resolved(&answer, via_upstream, false, false, false),
-                    keep(kept),
+                    expected,
                     "via_upstream={via_upstream} answer={answer:?}"
                 );
             }
@@ -2956,12 +2970,34 @@ mod tests {
             classify_resolved(&[lo, public], false, true, true, false),
             ConnectRoute::Direct(vec![lo])
         );
-        // An all-public answer keeps every address, in order.
+        // An all-public answer keeps every address, in order, or forwards upstream.
         let other = addr("93.184.216.35");
         assert_eq!(
             classify_resolved(&[public, other], false, false, false, false),
             ConnectRoute::Direct(vec![public, other])
         );
+        assert_eq!(
+            classify_resolved(&[public, other], true, false, false, false),
+            ConnectRoute::Upstream
+        );
+    }
+
+    #[test]
+    fn v4_mapped_ipv6_canonicalized_across_all_guards() {
+        assert!(is_loopback_host("[::ffff:127.0.0.1]"));
+        assert!(is_private_ip(&"::ffff:198.18.0.1".parse().unwrap()));
+        assert!(is_private_ip(&"::ffff:240.0.0.1".parse().unwrap()));
+        assert!(is_private_ip(&"::ffff:100.64.0.1".parse().unwrap()));
+        assert!(resolved_ip_is_blocked(
+            &"::ffff:127.0.0.1".parse().unwrap(),
+            false,
+            false,
+        ));
+        assert!(!resolved_ip_is_blocked(
+            &"::ffff:127.0.0.1".parse().unwrap(),
+            false,
+            true,
+        ));
     }
 
     #[test]

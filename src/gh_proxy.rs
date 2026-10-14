@@ -894,6 +894,26 @@ static POLICY: &[PolicyEntry] = &[
     },
 ];
 
+/// Scan a short-option cluster (`arg[1..]` for a single-dash flag) left-to-right
+/// for the first option in `value_flags`. Returns the matched option character
+/// and any remainder attached to the same token (with an optional leading `=`
+/// stripped). In `spf13/pflag` and POSIX `getopt`, boolean short flags may be
+/// bundled ahead of a value-taking short flag (`-iX DELETE`, `-iXDELETE`,
+/// `-if title=bug`, `-dR owner/repo`).
+fn scan_short_cluster<'a>(
+    cluster: &'a str,
+    value_flags: &[char],
+) -> Option<(char, Option<&'a str>)> {
+    for (byte_idx, ch) in cluster.char_indices() {
+        if value_flags.contains(&ch) {
+            let rest = &cluster[byte_idx + ch.len_utf8()..];
+            let attached = (!rest.is_empty()).then(|| rest.strip_prefix('=').unwrap_or(rest));
+            return Some((ch, attached));
+        }
+    }
+    None
+}
+
 /// Parse a `gh` command line into its structured components.
 ///
 /// Expects `args` to be the arguments *after* the `gh` binary name,
@@ -916,16 +936,16 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
             idx += 1;
             continue;
         }
-        // `-R=owner/repo` (attached-equals form) — strip the leading '=' so the
-        // value is captured. Without this the flag is silently dropped by the
-        // generic `arg.contains('=')` skip below and treated as current-repo.
-        if let Some(val) = arg.strip_prefix("-R=") {
-            global_repo_flag = Some(val.to_string());
-            idx += 1;
-            continue;
-        }
-        if arg.starts_with("-R") && arg.len() > 2 {
-            global_repo_flag = Some(arg[2..].to_string());
+        if !arg.starts_with("--")
+            && arg.len() >= 2
+            && let Some(('R', attached)) = scan_short_cluster(&arg[1..], &['R'])
+        {
+            if let Some(val) = attached {
+                global_repo_flag = Some(val.to_string());
+            } else if idx + 1 < args.len() {
+                global_repo_flag = Some(args[idx + 1].to_string());
+                idx += 1;
+            }
             idx += 1;
             continue;
         }
@@ -935,7 +955,7 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
         }
         // Skip flag and its value if it takes one
         if GLOBAL_FLAGS_WITH_VALUE.contains(&arg) {
-            if (arg == "--repo" || arg == "-R") && idx + 1 < args.len() {
+            if arg == "--repo" && idx + 1 < args.len() {
                 global_repo_flag = Some(args[idx + 1].to_string());
             }
             idx += 1; // skip value
@@ -957,28 +977,22 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
         let mut repo_flag = None;
         let mut api_endpoint = None;
 
-        // Flags that consume the next argument as a value
-        const API_FLAGS_WITH_VALUE: &[&str] = &[
-            "-X",
+        // Long flags that consume the next argument as a value
+        const API_LONG_FLAGS_WITH_VALUE: &[&str] = &[
             "--method",
-            "-R",
             "--repo",
-            "-f",
-            "-F",
             "--field",
             "--raw-field",
             "--input",
-            "-H",
             "--header",
             "--hostname",
-            "-t",
             "--template",
-            "-q",
             "--jq",
             "--cache",
-            "-p",
             "--preview",
         ];
+        // Short flags on `gh api` that consume a value (either attached or as the next token)
+        const API_SHORT_VALUE_FLAGS: &[char] = &['X', 'R', 'f', 'F', 'H', 't', 'q', 'p'];
 
         let mut i = idx;
         while i < args.len() {
@@ -986,17 +1000,7 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
             // Handle --flag=value forms
             if let Some(val) = arg.strip_prefix("--method=") {
                 method = Some(val.to_uppercase());
-            } else if arg.starts_with("-X") && arg.len() > 2 {
-                // -XPOST or -X=POST form (short flag with attached value).
-                // Strip an optional leading '=' so `-X=DELETE` is not read as the
-                // bogus method "=DELETE" (which would bypass the DELETE block).
-                let val = arg[2..].strip_prefix('=').unwrap_or(&arg[2..]);
-                method = Some(val.to_uppercase());
             } else if let Some(val) = arg.strip_prefix("--repo=") {
-                repo_flag = Some(val.to_string());
-            } else if arg.starts_with("-R") && arg.len() > 2 {
-                // Handle both `-Rowner/repo` and `-R=owner/repo`.
-                let val = arg[2..].strip_prefix('=').unwrap_or(&arg[2..]);
                 repo_flag = Some(val.to_string());
             } else if arg.starts_with("--field=")
                 || arg.starts_with("--raw-field=")
@@ -1005,40 +1009,60 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
                 // --field=key=value, --raw-field=key=value, --input=-
                 // These imply a mutating request (POST)
                 has_input_flags = true;
-            } else if (arg.starts_with("-f") && arg.len() > 2 && arg.as_bytes()[2] != b'-')
-                || (arg.starts_with("-F") && arg.len() > 2 && arg.as_bytes()[2] != b'-')
+            } else if !arg.starts_with("--")
+                && arg.starts_with('-')
+                && arg.len() >= 2
+                && let Some((short, attached)) =
+                    scan_short_cluster(&arg[1..], API_SHORT_VALUE_FLAGS)
             {
-                // -ftitle=bug, -Ftitle=bug — combined short flag with attached value
-                has_input_flags = true;
+                let val = if let Some(v) = attached {
+                    Some(v)
+                } else {
+                    i += 1;
+                    args.get(i).copied()
+                };
+                match short {
+                    'X' => {
+                        if let Some(v) = val {
+                            method = Some(v.to_uppercase());
+                        }
+                    }
+                    'R' => {
+                        if let Some(v) = val {
+                            repo_flag = Some(v.to_string());
+                        }
+                    }
+                    'f' | 'F' => {
+                        has_input_flags = true;
+                    }
+                    _ => {}
+                }
             } else if arg.starts_with('-') {
                 match arg {
-                    "-X" | "--method" => {
+                    "--method" => {
                         if i + 1 < args.len() {
                             method = Some(args[i + 1].to_uppercase());
                             i += 1;
                         }
                     }
-                    "-f" | "-F" | "--input" | "--field" | "--raw-field" => {
+                    "--input" | "--field" | "--raw-field" => {
                         has_input_flags = true;
-                        // These take a value argument
                         i += 1;
                     }
-                    "-R" | "--repo" => {
+                    "--repo" => {
                         if i + 1 < args.len() {
                             repo_flag = Some(args[i + 1].to_string());
                             i += 1;
                         }
                     }
-                    f if API_FLAGS_WITH_VALUE.contains(&f) => {
+                    f if API_LONG_FLAGS_WITH_VALUE.contains(&f) => {
                         i += 1; // skip value
                     }
-                    _ => {} // boolean flag, skip
+                    _ => {} // boolean flag or `--flag=value`, skip
                 }
-            } else {
+            } else if api_endpoint.is_none() {
                 // Positional argument — this is the API endpoint
-                if api_endpoint.is_none() {
-                    api_endpoint = Some(arg.to_string());
-                }
+                api_endpoint = Some(arg.to_string());
             }
             i += 1;
         }
@@ -1054,26 +1078,37 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
     }
 
     // Find subcommand (first non-flag argument after command)
+    const SUBCOMMAND_SHORT_VALUE_FLAGS: &[char] = &[
+        'R', 'B', 'H', 'F', 'T', 'L', 'S', 't', 'b', 'l', 'a', 'm', 'q', 'c',
+    ];
     let mut subcommand = None;
     let mut repo_flag = None;
     let mut i = idx;
     while i < args.len() {
         let arg = args[i];
-        // Handle --repo=value and -Rvalue forms
+        // Handle --repo=value and -Rvalue / clustered -dR forms
         if let Some(val) = arg.strip_prefix("--repo=") {
             repo_flag = Some(val.to_string());
             i += 1;
             continue;
         }
-        if arg.starts_with("-R") && arg.len() > 2 {
-            // Handle both `-Rowner/repo` and `-R=owner/repo`
-            let val = arg[2..].strip_prefix('=').unwrap_or(&arg[2..]);
-            repo_flag = Some(val.to_string());
+        if !arg.starts_with("--")
+            && arg.starts_with('-')
+            && arg.len() >= 2
+            && let Some(('R', attached)) =
+                scan_short_cluster(&arg[1..], SUBCOMMAND_SHORT_VALUE_FLAGS)
+        {
+            if let Some(val) = attached {
+                repo_flag = Some(val.to_string());
+            } else if i + 1 < args.len() {
+                repo_flag = Some(args[i + 1].to_string());
+                i += 1;
+            }
             i += 1;
             continue;
         }
         match arg {
-            "-R" | "--repo" => {
+            "--repo" => {
                 if i + 1 < args.len() {
                     repo_flag = Some(args[i + 1].to_string());
                     i += 2;
@@ -2795,13 +2830,18 @@ fn unbindable_push_option<'a>(push_args: &[&'a str]) -> Option<&'a str> {
     None
 }
 
-/// True if `arg` is a force-push *flag* (`--force`, `-f`, or a `--force-with-lease`/
-/// `--force-if-includes` variant, which may carry an `=`-attached value).
+/// True if `arg` is a force-push *flag* (`--force`, `-f`, a bundled short
+/// cluster containing `f`, or a `--force-with-lease`/`--force-if-includes`
+/// variant, which may carry an `=`-attached value).
 fn is_force_push_flag(arg: &str) -> bool {
     arg == "--force"
         || arg == "-f"
         || arg.starts_with("--force-with-lease")
         || arg.starts_with("--force-if-includes")
+        || (!arg.starts_with("--")
+            && arg.starts_with('-')
+            && !arg.starts_with("-o")
+            && arg[1..].contains('f'))
 }
 
 /// Collect the positional arguments (remote, refspecs) from `git push` args,
@@ -2869,9 +2909,8 @@ const SENSITIVE_CONFIG_PREFIXES: &[&str] = &[
 /// The first `-c` / `--config-env` key an agent supplied that matches a
 /// [`SENSITIVE_CONFIG_PREFIXES`] entry, if any.
 ///
-/// Scans both the space-separated form (`-c k=v`, `--config-env k=ENV`) and the
-/// `=`-attached long form (`--config-env=k=ENV`). `-c` has no `=`-attached form:
-/// git always takes its `name=value` as the following token.
+/// Scans the space-separated form (`-c k=v`, `--config-env k=ENV`), the attached
+/// short form (`-ck=v`), and the `=`-attached long form (`--config-env=k=ENV`).
 fn injected_sensitive_config_key(args: &[&str]) -> Option<(&'static str, String)> {
     let sensitive = |kv: &str| -> Option<String> {
         let key = kv.split('=').next().unwrap_or(kv);
@@ -2896,6 +2935,14 @@ fn injected_sensitive_config_key(args: &[&str]) -> Option<(&'static str, String)
                 i += 2;
                 continue;
             }
+        } else if crate::git::VALUE_TAKING_GLOBALS.contains(&arg) {
+            i += 2;
+            continue;
+        } else if !arg.starts_with("--")
+            && let Some(kv) = arg.strip_prefix("-c").filter(|s| !s.is_empty())
+            && let Some(key) = sensitive(kv)
+        {
+            return Some(("-c", key));
         } else if let Some(kv) = arg.strip_prefix("--config-env=")
             && let Some(key) = sensitive(kv)
         {
@@ -2956,6 +3003,11 @@ fn env_injected_sensitive_config_key(vars: &[(String, String)]) -> Option<String
                 if let Some(hit) = sensitive(value) {
                     return Some(hit);
                 }
+            }
+            "GIT_CONFIG_GLOBAL" | "GIT_CONFIG_SYSTEM"
+                if !value.is_empty() && value != "/dev/null" =>
+            {
+                return Some(name.clone());
             }
             _ => {}
         }
@@ -3034,10 +3086,6 @@ fn refspec_target_branch(refspec: &str) -> &str {
 /// (upstream, fork, …) is harmless and must stay allowed.
 const SCOPE_REMOTE: &str = "origin";
 
-/// `git remote add` flags that consume a following value (so the value is not
-/// mistaken for the remote name when locating the positional arguments).
-const REMOTE_ADD_VALUE_FLAGS: &[&str] = &["-t", "-m"];
-
 /// True if a `git remote <verb> …` invocation creates or retargets `origin`'s URL.
 ///
 /// Only the verbs that can point `origin` at a new URL threaten scope integrity:
@@ -3047,32 +3095,14 @@ const REMOTE_ADD_VALUE_FLAGS: &[&str] = &["-t", "-m"];
 /// Non-origin forms (`add upstream`, `rename a b`, `set-url upstream`), plus
 /// `remove`/`rm` and read-only verbs, are left alone.
 fn remote_verb_retargets_origin(verb: &str, verb_args: &[&str]) -> bool {
-    let value_flags: &[&str] = if verb == "add" {
-        REMOTE_ADD_VALUE_FLAGS
-    } else {
-        &[]
-    };
-    // Positional (non-flag) tokens, skipping flags and any values they consume.
-    let mut positionals: Vec<&str> = Vec::new();
-    let mut i = 0;
-    while i < verb_args.len() {
-        let a = verb_args[i];
-        if a.starts_with('-') {
-            if value_flags.contains(&a) {
-                i += 2;
-            } else {
-                i += 1;
-            }
-            continue;
-        }
-        positionals.push(a);
-        i += 1;
-    }
+    let mut positionals = verb_args.iter().copied().filter(|a| !a.starts_with('-'));
     match verb {
-        // `add`/`set-url`: the first positional is the remote name.
-        "add" | "set-url" => positionals.first().copied() == Some(SCOPE_REMOTE),
+        // Any non-flag positional naming `origin` on `add` or `set-url` (regardless
+        // of preceding `-t <branch>`, `--tr <branch>`, or `-m <master>` flags)
+        // targets `origin`.
+        "add" | "set-url" => positionals.any(|a| a == SCOPE_REMOTE),
         // `rename <old> <new>`: only promoting a remote *to* `origin` retargets scope.
-        "rename" => positionals.get(1).copied() == Some(SCOPE_REMOTE),
+        "rename" => positionals.nth(1) == Some(SCOPE_REMOTE),
         _ => false,
     }
 }
@@ -3116,46 +3146,81 @@ fn is_remote_scope_mutation(sub: &str, sub_args: &[&str]) -> bool {
 
 /// True if `git config` args write to a key that can redirect the enforced scope.
 ///
-/// Two key families qualify, both of which persistently change where a github.com
-/// URL resolves:
+/// Key families that qualify:
 ///   • `remote.origin.url` / `remote.origin.pushurl` — the scope is read from
 ///     `origin`, so retargeting its URL is a direct bypass. Non-origin remote
 ///     URLs (`remote.upstream.url`) are harmless and stay allowed.
 ///   • `url.<base>.insteadOf` / `url.<base>.pushInsteadOf` — git's URL-rewrite
 ///     rules silently redirect `fetch`/`pull`/`clone`/`push` transport for any
 ///     matching URL, an equivalent transport-remap (code-injection) vector.
+///   • `include.path` / `includeIf.<cond>.path` — includes an external config
+///     file that can define any of the above.
 ///
-/// Reads (`--get`, `--get-all`, `--get-regexp`, `--list`, and the bare
-/// `git config <key>` form that just prints the value) are allowed; only a key
-/// with a following value (a set) is treated as a scope mutation. Keys are matched
-/// case-insensitively, as git config key names are case-insensitive.
+/// Fails closed on read shape: when a scope-redirecting key appears, only an
+/// invocation whose flags are exclusively known value-less read/location flags
+/// and whose positionals are `[<key>]` or `["get", <key>]` is allowed as a read.
 fn config_sets_remote_url(sub_args: &[&str]) -> bool {
-    const READ_FLAGS: &[&str] = &[
+    const SAFE_READ_FLAGS: &[&str] = &[
         "--get",
         "--get-all",
         "--get-regexp",
         "--get-urlmatch",
         "--list",
         "-l",
+        "--local",
+        "--global",
+        "--system",
+        "--worktree",
+        "--includes",
+        "--no-includes",
+        "-z",
+        "--null",
+        "--name-only",
+        "--show-origin",
+        "--show-scope",
     ];
-    if sub_args
-        .iter()
-        .any(|a| READ_FLAGS.contains(&a.to_lowercase().as_str()))
-    {
+
+    let lowered: Vec<String> = sub_args.iter().map(|a| a.to_lowercase()).collect();
+    if lowered.iter().any(|a| {
+        matches!(a.as_str(), "-e" | "edit")
+            || (a.starts_with("--e") && "--edit".starts_with(a.as_str()))
+    }) {
+        return true;
+    }
+    if lowered.iter().any(|a| {
+        matches!(a.as_str(), "remove-section" | "rename-section")
+            || (a.starts_with("--rem") && "--remove-section".starts_with(a.as_str()))
+            || (a.starts_with("--ren") && "--rename-section".starts_with(a.as_str()))
+    }) {
+        return lowered.iter().any(|a| {
+            !a.starts_with('-')
+                && (a == "remote.origin"
+                    || a == "include"
+                    || a.starts_with("url.")
+                    || a.starts_with("includeif."))
+        });
+    }
+    let touches_scope_key = lowered.iter().any(|key| {
+        key == "remote.origin.url"
+            || key == "remote.origin.pushurl"
+            || key == "include.path"
+            || (key.starts_with("url.")
+                && (key.ends_with(".insteadof") || key.ends_with(".pushinsteadof")))
+            || (key.starts_with("includeif.") && key.ends_with(".path"))
+    });
+    if !touches_scope_key {
         return false;
     }
-    for (idx, arg) in sub_args.iter().enumerate() {
-        let key = arg.to_lowercase();
-        let redirects_scope = key == "remote.origin.url"
-            || key == "remote.origin.pushurl"
-            || (key.starts_with("url.")
-                && (key.ends_with(".insteadof") || key.ends_with(".pushinsteadof")));
-        if redirects_scope {
-            // A non-flag token after the key is the value → this is a write.
-            return sub_args.get(idx + 1).is_some_and(|v| !v.starts_with('-'));
-        }
-    }
-    false
+    let all_flags_safe_read = lowered
+        .iter()
+        .all(|a| !a.starts_with('-') || SAFE_READ_FLAGS.contains(&a.as_str()));
+    let positionals: Vec<&str> = lowered
+        .iter()
+        .map(String::as_str)
+        .filter(|a| !a.starts_with('-'))
+        .collect();
+    let is_read_shape = all_flags_safe_read && matches!(positionals.as_slice(), [_] | ["get", _]);
+    !is_read_shape
 }
 
 /// True if the invocation is `git subtree push` (the only remote-write subtree form).
@@ -3264,7 +3329,7 @@ pub fn gate_git(
     }
 
     if (prevent_push || prevent_force_push)
-        && let Some((flag, key)) = injected_sensitive_config_key(args)
+        && let Some((flag, key)) = injected_sensitive_config_key(&args[..i])
     {
         return Err(Refusal {
             headline: format!(
@@ -3901,18 +3966,6 @@ fn push_target_branches(
 /// influence the verdict.
 const REPO_TARGET_FLAGS: &[&str] = &["-C", "--git-dir", "--work-tree"];
 
-/// Git global flags that consume a following space-separated value, so a scan of
-/// the global-flag prefix never mistakes such a value for a flag of its own.
-const GIT_GLOBAL_FLAGS_WITH_VALUE: &[&str] = &[
-    "-c",
-    "-C",
-    "--git-dir",
-    "--work-tree",
-    "--namespace",
-    "--super-prefix",
-    "--config-env",
-];
-
 /// Index of the git subcommand in `args`, skipping the global flags that
 /// precede it — including those that consume a following space-separated value,
 /// so `git -C /elsewhere push` finds `push` and not `/elsewhere`.
@@ -3920,7 +3973,7 @@ pub fn git_subcommand_index<S: AsRef<str>>(args: &[S]) -> Option<usize> {
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_ref();
-        if GIT_GLOBAL_FLAGS_WITH_VALUE.contains(&arg) {
+        if crate::git::VALUE_TAKING_GLOBALS.contains(&arg) {
             i += 2; // skip flag and its value
             continue;
         }
@@ -3953,7 +4006,7 @@ fn repo_target_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
             i += 2;
             continue;
         }
-        if GIT_GLOBAL_FLAGS_WITH_VALUE.contains(&arg) {
+        if crate::git::VALUE_TAKING_GLOBALS.contains(&arg) {
             i += 2; // a value that must not be scanned as a flag
             continue;
         }
@@ -3962,6 +4015,9 @@ fn repo_target_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
             && REPO_TARGET_FLAGS.contains(&flag)
         {
             out.push(arg);
+        } else if !arg.starts_with("--") && arg.starts_with("-C") && arg.len() > 2 {
+            out.push(&arg[..2]);
+            out.push(&arg[2..]);
         }
         i += 1;
     }
@@ -9698,5 +9754,199 @@ mod tests {
             &RepoFacts::default(),
         );
         assert!(!empty.contains("--repo-facts"), "got: {empty}");
+    }
+
+    #[test]
+    fn gh_clustered_short_flags_are_parsed() {
+        let eval = |args: &[&str]| evaluate(&parse_command(args).expect("parse")).decision;
+        // -iX DELETE and -iXDELETE must be recognized as DELETE, not defaulted to GET
+        assert_eq!(
+            eval(&["api", "-iX", "DELETE", "repos/o/r"]),
+            Decision::Block
+        );
+        assert_eq!(eval(&["api", "-iXDELETE", "repos/o/r"]), Decision::Block);
+        // -if title=bug and -iF count=1 must be recognized as body fields (POST)
+        assert_eq!(
+            eval(&["api", "-if", "title=bug", "repos/o/r/issues"]),
+            Decision::Block
+        );
+        assert_eq!(
+            eval(&["api", "-iftitle=bug", "repos/o/r/issues"]),
+            Decision::Block
+        );
+        assert_eq!(
+            eval(&["api", "-iF", "count=1", "repos/o/r/issues"]),
+            Decision::Block
+        );
+        // -iH <header> must consume its value so a header value cannot spoof api_endpoint
+        let parsed =
+            parse_command(&["api", "-iH", "repos/allowed/repo", "repos/evil/repo"]).expect("parse");
+        assert_eq!(parsed.api_endpoint.as_deref(), Some("repos/evil/repo"));
+        // -dR owner/repo on a subcommand must extract the repo instead of shifting positionals
+        let parsed = parse_command(&["pr", "create", "-dR", "evil/repo"]).expect("parse");
+        assert_eq!(parsed.repo_flag.as_deref(), Some("evil/repo"));
+    }
+
+    #[test]
+    fn git_attached_and_clustered_flags_blocked() {
+        // Attached -c<key>=<val>
+        assert!(gate_git_t(&["-calias.p=push", "p"], true, true, false, &[], None).is_err());
+        // Attached -C<dir> is captured by repo_target_args
+        assert_eq!(
+            repo_target_args(&["-C/tmp/other", "push"]),
+            vec!["-C", "/tmp/other"]
+        );
+        // Clustered force push flags (-uf, -fu)
+        assert!(
+            gate_git_t(
+                &["push", "-uf", "origin", "feature"],
+                true,
+                true,
+                true,
+                &[],
+                None
+            )
+            .is_err()
+        );
+        // git remote add with --track / --master / -ft before remote name
+        assert!(
+            gate_git_t(
+                &[
+                    "remote",
+                    "add",
+                    "--track",
+                    "main",
+                    "origin",
+                    "https://evil.example/r.git"
+                ],
+                true,
+                true,
+                true,
+                &[],
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            gate_git_t(
+                &[
+                    "remote",
+                    "add",
+                    "-ft",
+                    "main",
+                    "origin",
+                    "https://evil.example/r.git"
+                ],
+                true,
+                true,
+                true,
+                &[],
+                None
+            )
+            .is_err()
+        );
+        // git config --unset / --remove-section / -e / --replace-all on remote.origin.url
+        for args in [
+            &["config", "--unset", "remote.origin.url"][..],
+            &["config", "unset", "remote.origin.url"][..],
+            &["config", "--remove-section", "remote.origin"][..],
+            &[
+                "config",
+                "--rename-section",
+                "remote.origin",
+                "remote.backup",
+            ][..],
+            &["config", "-e"][..],
+            &["config", "edit"][..],
+            &[
+                "config",
+                "--replace-all",
+                "remote.origin.url",
+                "https://evil.example/r.git",
+            ][..],
+            &[
+                "config",
+                "remote.origin.url",
+                "--replace-all",
+                "https://evil.example/r.git",
+            ][..],
+        ] {
+            assert!(
+                gate_git_t(args, true, true, true, &[], None).is_err(),
+                "expected {args:?} to be blocked"
+            );
+        }
+        // `--attr-source` takes a value: `--attr-source status push` is a push, not `status`.
+        assert!(
+            gate_git_t(
+                &["--attr-source", "status", "push", "origin", "main"],
+                true,
+                true,
+                false,
+                &[],
+                None,
+            )
+            .is_err()
+        );
+        // Abbreviated `--tr` on `remote add` and smuggled `--comment --get` / `include.path` on `config`.
+        for args in [
+            &[
+                "remote",
+                "add",
+                "--tr",
+                "main",
+                "origin",
+                "https://evil.example/r.git",
+            ][..],
+            &[
+                "config",
+                "--comment",
+                "--get",
+                "remote.origin.url",
+                "https://evil.example/r.git",
+            ][..],
+            &["config", "remote.origin.url", "get"][..],
+            &["config", "include.path", "/tmp/evil"][..],
+            &["config", "includeIf.gitdir:~/work/.path", "/tmp/evil"][..],
+            &["config", "--remove-section", "include"][..],
+            &["config", "--ed"][..],
+        ] {
+            assert!(
+                gate_git_t(args, true, true, true, &[], None).is_err(),
+                "expected {args:?} to be blocked"
+            );
+        }
+        // Subcommand `-c branch.foo` after `switch` is not global `git -c`; `-C -cremote.origin.url=x` is a directory.
+        assert!(gate_git_t(&["switch", "-c", "branch.foo"], true, true, true, &[], None).is_ok());
+        assert!(
+            gate_git_t(
+                &["-C", "-cremote.origin.url=x", "status"],
+                true,
+                true,
+                true,
+                &[],
+                None,
+            )
+            .is_ok()
+        );
+        // GIT_CONFIG_GLOBAL / GIT_CONFIG_SYSTEM injection
+        assert_eq!(
+            env_injected_sensitive_config_key(&[(
+                "GIT_CONFIG_GLOBAL".to_string(),
+                "/tmp/evil".to_string()
+            )]),
+            Some("GIT_CONFIG_GLOBAL".to_string())
+        );
+        assert_eq!(
+            env_injected_sensitive_config_key(&[(
+                "GIT_CONFIG_GLOBAL".to_string(),
+                "/dev/null".to_string()
+            )]),
+            None
+        );
+        // `-BRelease` on `gh pr create` does not shadow `-R other/repo`
+        let parsed =
+            parse_command(&["pr", "create", "-BRelease", "-R", "other/repo"]).expect("parsed");
+        assert_eq!(parsed.repo_flag.as_deref(), Some("other/repo"));
     }
 }

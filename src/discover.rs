@@ -1469,14 +1469,10 @@ fn gitdir_without_git(dir: &Path) -> Option<PathBuf> {
     if meta.is_dir() {
         return std::fs::canonicalize(&dot_git).ok().or(Some(dot_git));
     }
-    // Regular file only. `read_to_string` opens O_RDONLY, which blocks forever
-    // on a FIFO with no writer — an agent that can write `<root>/.git` could
-    // otherwise `mkfifo` it and hang the next launch before the sandbox exists.
-    // Real git checks the same thing and exits rather than blocking.
-    if !meta.is_file() {
-        return None;
-    }
-    let contents = std::fs::read_to_string(&dot_git).ok()?;
+    // Regular file only. `read_regular_following` opens with O_NONBLOCK and
+    // fstats the open fd so neither a planted FIFO nor a TOCTOU swap between
+    // stat and open can block the launch, and caps the read at 4 KiB.
+    let contents = crate::untrusted::read_regular_following(&dot_git, 4096).ok()??;
     let pointer = contents
         .lines()
         .find_map(|l| l.trim().strip_prefix("gitdir:"))?

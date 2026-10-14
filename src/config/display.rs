@@ -490,18 +490,29 @@ pub fn display_config(loaded: Option<&LoadedConfig>, local: Option<&LoadedConfig
         );
     }
     let allow_lifecycle = bools.allow_lifecycle_scripts;
-    println!(
-        "{blue}[cplt]{nc}    allow_lifecycle_scripts = {}{}",
-        allow_lifecycle,
-        preset_label(
-            allow_lifecycle,
+    if allow_lifecycle {
+        let red = ui::stdout_color(ui::RED);
+        println!(
+            "{blue}[cplt]{nc}    allow_lifecycle_scripts = {red}true{nc} ⚠ DANGEROUS{}",
+            preset_label(
+                true,
+                src(
+                    "sandbox",
+                    "allow_lifecycle_scripts",
+                    c.sandbox.allow_lifecycle_scripts.is_some()
+                )
+            )
+        );
+    } else {
+        println!(
+            "{blue}[cplt]{nc}    allow_lifecycle_scripts = false{}",
             src(
                 "sandbox",
                 "allow_lifecycle_scripts",
                 c.sandbox.allow_lifecycle_scripts.is_some()
             )
-        )
-    );
+        );
+    }
     let allow_gpg = c.sandbox.allow_gpg_signing.unwrap_or(false);
     if allow_gpg {
         let red = ui::stdout_color(ui::RED);
@@ -563,16 +574,54 @@ pub fn display_config(loaded: Option<&LoadedConfig>, local: Option<&LoadedConfig
             )
         );
     }
+    if !c.sandbox.allow_cache_exec.is_empty() {
+        println!(
+            "{blue}[cplt]{nc}    allow_cache_exec      = {:?}",
+            c.sandbox.allow_cache_exec
+        );
+    }
+    let allow_cache_exec_any = c.sandbox.allow_cache_exec_any.unwrap_or(false);
+    if allow_cache_exec_any {
+        let red = ui::stdout_color(ui::RED);
+        println!(
+            "{blue}[cplt]{nc}    allow_cache_exec_any  = {red}true{nc} ⚠ DANGEROUS{}",
+            src(
+                "sandbox",
+                "allow_cache_exec_any",
+                c.sandbox.allow_cache_exec_any.is_some()
+            )
+        );
+    } else {
+        println!(
+            "{blue}[cplt]{nc}    allow_cache_exec_any  = false{}",
+            src(
+                "sandbox",
+                "allow_cache_exec_any",
+                c.sandbox.allow_cache_exec_any.is_some()
+            )
+        );
+    }
     let allow_browser = c.sandbox.allow_browser.unwrap_or(false);
-    println!(
-        "{blue}[cplt]{nc}    allow_browser         = {}{}",
-        allow_browser,
-        src(
-            "sandbox",
-            "allow_browser",
-            c.sandbox.allow_browser.is_some()
-        )
-    );
+    if allow_browser {
+        let red = ui::stdout_color(ui::RED);
+        println!(
+            "{blue}[cplt]{nc}    allow_browser         = {red}true{nc} ⚠ DANGEROUS{}",
+            src(
+                "sandbox",
+                "allow_browser",
+                c.sandbox.allow_browser.is_some()
+            )
+        );
+    } else {
+        println!(
+            "{blue}[cplt]{nc}    allow_browser         = false{}",
+            src(
+                "sandbox",
+                "allow_browser",
+                c.sandbox.allow_browser.is_some()
+            )
+        );
+    }
     let keychain_substitute = match c.sandbox.keychain_substitute {
         Some(true) => "true",
         Some(false) => "false",

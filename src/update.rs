@@ -445,7 +445,7 @@ pub fn looks_like_version(s: &str) -> bool {
     let Some((prefix, sha)) = s.rsplit_once('-') else {
         return false;
     };
-    if sha.is_empty() {
+    if sha.is_empty() || sha.len() > 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
         return false;
     }
 
@@ -1346,5 +1346,14 @@ mod tests {
         let bare_tag = "2026.04.13-abc1234";
         let version2 = bare_tag.strip_prefix("cplt/").unwrap_or(bare_tag);
         assert_eq!(version2, "2026.04.13-abc1234");
+    }
+
+    #[test]
+    fn looks_like_version_rejects_non_hex_sha_suffix() {
+        assert!(!looks_like_version("2026.04.13-173045-../../evil"));
+        assert!(!looks_like_version("2026.04.13-not_hex!"));
+        assert!(!looks_like_version(
+            "2026.04.13-173045-0123456789abcdef0123456789abcdef012345678"
+        ));
     }
 }

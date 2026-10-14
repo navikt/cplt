@@ -42,18 +42,26 @@ pub fn is_unsafe_root(path: &std::path::Path, home: &std::path::Path) -> bool {
     let p = path.to_string_lossy();
 
     // Common: filesystem root, home dir, and platform-shared temp/var roots
-    if p == "/" || p == "/tmp" || p == "/var" || path == home {
+    if p == "/" || p.eq_ignore_ascii_case("/tmp") || p.eq_ignore_ascii_case("/var") || path == home
+    {
         return true;
     }
 
-    // macOS-specific unsafe roots
+    // macOS-specific unsafe roots (case-insensitive on default APFS)
     #[cfg(target_os = "macos")]
     {
-        if p == "/Users"
-            || p == "/private/tmp"
-            || p == "/private/var"
-            || p == "/Applications"
-            || p == "/System"
+        if [
+            "/Users",
+            "/private",
+            "/private/tmp",
+            "/private/var",
+            "/Applications",
+            "/System",
+            "/Library",
+        ]
+        .iter()
+        .any(|r| p.eq_ignore_ascii_case(r))
+            || home.to_str().is_some_and(|h| p.eq_ignore_ascii_case(h))
         {
             return true;
         }
@@ -127,9 +135,13 @@ mod tests {
     fn rejects_macos_unsafe_roots() {
         let home = Path::new("/Users/test");
         assert!(is_unsafe_root(Path::new("/Users"), home));
+        assert!(is_unsafe_root(Path::new("/users"), home));
+        assert!(is_unsafe_root(Path::new("/private"), home));
         assert!(is_unsafe_root(Path::new("/private/tmp"), home));
         assert!(is_unsafe_root(Path::new("/Applications"), home));
         assert!(is_unsafe_root(Path::new("/System"), home));
+        assert!(is_unsafe_root(Path::new("/Library"), home));
+        assert!(is_unsafe_root(Path::new("/users/TEST"), home));
     }
 
     #[cfg(target_os = "linux")]

@@ -477,6 +477,14 @@ pub const CONFIG_OVERRIDES: &[(&str, &str, &str)] = &[
         "The parent verifies no signatures. Cost: none. NOTE detect.rs reads \
          commit.gpgsign, which is a config read, not a gpg invocation.",
     ),
+    (
+        "submodule.recurse",
+        "false",
+        "Submodule configs are not scanned by repo_defines_content_filter; \
+         recursing into a submodule during status/diff could execute a \
+         submodule's filter outside the sandbox. Cost: parent-side status/diff \
+         does not recurse into submodules.",
+    ),
 ];
 
 /// Global flags that take their value as a **separate** token, and are therefore
@@ -490,12 +498,13 @@ pub const CONFIG_OVERRIDES: &[(&str, &str, &str)] = &[
 /// cheaper and more fail-closed than teaching the parser to consume values.
 /// `-c` is refused for the same reason plus a second one: config overrides
 /// belong in [`CONFIG_OVERRIDES`], where they are reviewed, not at call sites.
-const VALUE_TAKING_GLOBALS: &[&str] = &[
+pub(crate) const VALUE_TAKING_GLOBALS: &[&str] = &[
     "-C",
     "-c",
     "--git-dir",
     "--work-tree",
     "--namespace",
+    "--super-prefix",
     // Both take a separate-token value in git 2.55. `--attr-source evil diff`
     // would make `subcommand()` return "evil", silently skipping the diff-flag
     // insertion — the exact mis-parse this refusal exists to prevent. And
@@ -504,6 +513,14 @@ const VALUE_TAKING_GLOBALS: &[&str] = &[
     "--config-env",
     "--attr-source",
 ];
+
+fn is_refused_leading_global(arg: &str) -> bool {
+    VALUE_TAKING_GLOBALS.contains(&arg)
+        || (!arg.starts_with("--") && (arg.starts_with("-c") || arg.starts_with("-C")))
+        || arg.starts_with("--super-prefix=")
+        || arg.starts_with("--config-env=")
+        || arg.starts_with("--attr-source=")
+}
 
 /// Subcommands that provably never read working-tree file **content**, and so
 /// can never reach a `.gitattributes` filter or diff driver.
@@ -668,7 +685,7 @@ fn insert_diff_flags<'a>(args: &[&'a str]) -> Vec<&'a str> {
 pub fn command(project_dir: &Path, args: &[&str]) -> Option<Command> {
     if leading_globals(args)
         .iter()
-        .any(|a| VALUE_TAKING_GLOBALS.contains(a))
+        .any(|a| is_refused_leading_global(a))
     {
         // Never silent: this branch is unreachable for every current call
         // site, so reaching it means someone added one and needs to know the
@@ -794,6 +811,7 @@ mod tests {
             ("credential.helper", ""),
             ("uploadpack.packObjectsHook", ""),
             ("gpg.program", "false"),
+            ("submodule.recurse", "false"),
         ];
         let actual: Vec<(&str, &str)> = CONFIG_OVERRIDES.iter().map(|(k, v, _)| (*k, *v)).collect();
         assert_eq!(
@@ -1136,6 +1154,10 @@ mod tests {
         // 2.55, so `--attr-source evil diff` makes `subcommand()` return "evil".
         assert!(command(dir.path(), &["--attr-source", "evil", "diff"]).is_none());
         assert!(command(dir.path(), &["--config-env", "x=Y", "status"]).is_none());
+        assert!(command(dir.path(), &["-ccore.fsmonitor=evil", "status"]).is_none());
+        assert!(command(dir.path(), &["-C/tmp", "diff"]).is_none());
+        assert!(command(dir.path(), &["--config-env=core.fsmonitor=EVIL", "status"]).is_none());
+        assert!(command(dir.path(), &["--attr-source=HEAD", "diff"]).is_none());
         // The single-token forms parse correctly and stay allowed.
         assert!(command(dir.path(), &["--git-dir=/tmp", "rev-parse"]).is_some());
         // Position-sensitive: `--git-dir` AFTER the subcommand is a rev-parse
