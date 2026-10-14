@@ -4258,7 +4258,26 @@ print('CONNECTED')
                 .output()
                 .unwrap();
             let out = String::from_utf8_lossy(&o.stdout);
-            let all = format!("{out}\n{}", String::from_utf8_lossy(&o.stderr));
+            let mut all = format!("{out}\n{}", String::from_utf8_lossy(&o.stderr));
+            if !out.contains("API-OK") {
+                let log = home.h.join(".local/share/opencode/log/opencode.log");
+                match cplt::untrusted::read_untrusted(&log, 256 * 1024) {
+                    Ok(Some(log)) => {
+                        for line in log.lines().filter(|line| line.contains("level=ERROR")) {
+                            all.push_str("\nOpenCode boot log: ");
+                            all.push_str(
+                                &line.replace(&home.h.display().to_string(), "<fixture-home>"),
+                            );
+                        }
+                    }
+                    Ok(None) => {
+                        all.push_str("\nOpenCode boot log refused: not a bounded regular file")
+                    }
+                    Err(error) => {
+                        all.push_str(&format!("\nOpenCode boot log unavailable: {error}"))
+                    }
+                }
+            }
             assert!(o.status.success(), "{all}");
             // 6: neither host file is readable, its password never shows.
             assert!(!out.contains("READ "), "{all}");
