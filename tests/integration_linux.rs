@@ -4233,6 +4233,14 @@ print('CONNECTED')
                 assert!(Instant::now() < deadline, "host service did not register");
                 std::thread::sleep(Duration::from_millis(1));
             }
+            while !home
+                .h
+                .join(".local/share/opencode/opencode.db-wal")
+                .exists()
+            {
+                assert!(Instant::now() < deadline, "host WAL did not appear");
+                std::thread::yield_now();
+            }
             // Diagnostic: keep the host at its published-registration boot stage.
             assert_eq!(unsafe { libc::kill(host.0.id() as i32, libc::SIGSTOP) }, 0);
             let host_pid = host.0.id();
