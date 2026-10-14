@@ -4253,7 +4253,9 @@ print('CONNECTED')
                 P=$(sed -n 's/.*"port":\([0-9]*\).*/\1/p' "$XDG_CONFIG_HOME/opencode/service.json")
                 echo "P=$P"
                 "{oc}" serve --service --print-logs >boot.log 2>&1 &
+                while [ ! -f "$XDG_STATE_HOME/opencode/service.json" ]; do sleep 0.01; done
                 "{oc}" api GET /path >/dev/null && echo API-OK
+                sleep 1
                 dd if=boot.log bs=65536 count=1 2>/dev/null >&2
                 "{oc}" service get
                 c() {{ curl --noproxy '*' -s -m3 -o /dev/null -w '%{{http_code}}' "http://127.0.0.1:$1/"; }}
