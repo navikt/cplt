@@ -4231,7 +4231,7 @@ print('CONNECTED')
             let deadline = Instant::now() + Duration::from_secs(30);
             while !fs::read_to_string(&reg).is_ok_and(|s| s.contains("HOSTPW")) {
                 assert!(Instant::now() < deadline, "host service did not register");
-                std::thread::sleep(Duration::from_millis(200));
+                std::thread::sleep(Duration::from_millis(1));
             }
             let host_pid = host.0.id();
 
