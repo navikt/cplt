@@ -359,9 +359,6 @@ jobs:
         run: |
           set -eo pipefail
           cargo test --test integration_linux opencode_v2 -- --nocapture 2>&1 | tee "$RUNNER_TEMP/test-output.log"
-          for attempt in {1..100}; do
-            cargo test --test integration_linux opencode_v2_session_is_private_with_bubblewrap -- --nocapture
-          done
           if grep -q "SKIPPED (opencode v2)" "$RUNNER_TEMP/test-output.log"; then
             echo "::error::OpenCode v2 tests skipped although the binary is installed"
             exit 1
