@@ -4539,8 +4539,17 @@ int main(int argc, char **argv) {
         require_sandbox!();
         let project = fs::canonicalize(".").unwrap();
         let home = home_dir();
+        // /usr/bin/python3 is an Xcode launcher on CI, not the interpreter.
+        let python = crate::common::shim_cmd(&crate::common::binary_in_path("python3"))
+            .args(["-c", "import sys; print(sys.executable)"])
+            .output()
+            .expect("resolve Python interpreter outside the sandbox");
+        assert!(python.status.success(), "Python interpreter unavailable");
+        let python = PathBuf::from(String::from_utf8(python.stdout).unwrap().trim());
+        let python_read = [python.parent().unwrap().parent().unwrap().to_path_buf()];
         for (enabled, forced) in [(false, false), (true, false), (false, true)] {
             let mut opts = default_opts(&project, &home);
+            opts.extra_read = &python_read;
             opts.allow_localhost_any = enabled;
             opts.proxy_forced = forced;
             let profile = write_real_profile(&opts);
@@ -4608,7 +4617,7 @@ print("SENDFILE_POLICY_OK")
             let output = crate::common::shim_cmd(Path::new("/usr/bin/sandbox-exec"))
                 .arg("-f")
                 .arg(&profile)
-                .arg(crate::common::binary_in_path("python3"))
+                .arg(&python)
                 .arg("-c")
                 .arg(&source)
                 .output()

@@ -3228,7 +3228,9 @@ fn emit_network_rules(
         // Allow that check before denying all addressed IP traffic: putting the
         // local allow after the denies would also permit arbitrary destinations
         // from a loopback-bound socket, including UDP. The remote allows below
-        // still decide which destinations connect/sendto may reach.
+        // still decide which destinations connect/sendto may reach. This also
+        // enables zero-copy on established non-loopback sockets where ordinary
+        // writes already work; it grants neither a connection nor a file read.
         sbpl!(sb, "(allow network-outbound (local ip \"localhost:*\"))");
         sbpl!(sb, "(deny network-outbound (remote ip \"*:*\"))");
     }
