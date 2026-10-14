@@ -4252,7 +4252,9 @@ print('CONNECTED')
                 cat "$HOME/.local/state/opencode/key" 2>/dev/null && echo PLANTED
                 P=$(sed -n 's/.*"port":\([0-9]*\).*/\1/p' "$XDG_CONFIG_HOME/opencode/service.json")
                 echo "P=$P"
+                "{oc}" serve --service --print-logs >boot.log 2>&1 &
                 "{oc}" api GET /path >/dev/null && echo API-OK
+                dd if=boot.log bs=65536 count=1 2>/dev/null >&2
                 "{oc}" service get
                 c() {{ curl --noproxy '*' -s -m3 -o /dev/null -w '%{{http_code}}' "http://127.0.0.1:$1/"; }}
                 echo "SESSION=$(c $P)"
