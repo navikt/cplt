@@ -4233,6 +4233,8 @@ print('CONNECTED')
                 assert!(Instant::now() < deadline, "host service did not register");
                 std::thread::sleep(Duration::from_millis(1));
             }
+            // Diagnostic: keep the host at its published-registration boot stage.
+            assert_eq!(unsafe { libc::kill(host.0.id() as i32, libc::SIGSTOP) }, 0);
             let host_pid = host.0.id();
 
             let script = format!(
@@ -4251,12 +4253,17 @@ print('CONNECTED')
                 reg = reg.display(),
                 oc = oc.display(),
             );
-            let o = home
+            let child = home
                 .cmd(&home.proj)
                 .args([flag, "--", &script])
                 .stdin(std::process::Stdio::null())
-                .output()
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
                 .unwrap();
+            std::thread::sleep(Duration::from_millis(500));
+            assert_eq!(unsafe { libc::kill(host.0.id() as i32, libc::SIGCONT) }, 0);
+            let o = child.wait_with_output().unwrap();
             let out = String::from_utf8_lossy(&o.stdout);
             let mut all = format!("{out}\n{}", String::from_utf8_lossy(&o.stderr));
             if !out.contains("API-OK") {
