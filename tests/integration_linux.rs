@@ -4271,10 +4271,11 @@ print('CONNECTED')
                         }
                     }
                     Ok(None) => {
-                        all.push_str("\nOpenCode boot log refused: not a bounded regular file")
+                        all.push_str("\nOpenCode boot log refused: not a bounded regular file");
                     }
                     Err(error) => {
-                        all.push_str(&format!("\nOpenCode boot log unavailable: {error}"))
+                        all.push_str("\nOpenCode boot log unavailable: ");
+                        all.push_str(&error.to_string());
                     }
                 }
             }
