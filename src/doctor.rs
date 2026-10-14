@@ -842,9 +842,9 @@ pub fn copilot_own_sandbox_finding(
     })
 }
 
-/// Linux: Copilot keeps its login in the Secret Service, reached over D-Bus,
-/// which the sandbox masks (#600). Only when the host has a session bus (so a
-/// keyring login is plausible) and no token reaches Copilot another way.
+/// Linux: native Secret Service access depends on the sandbox backend.
+/// Warn when a session bus makes a keyring login plausible and no token
+/// reaches Copilot another way; this does not check the stored login.
 #[must_use]
 pub fn linux_keyring_finding(
     agent: Agent,
@@ -856,9 +856,8 @@ pub fn linux_keyring_finding(
     (linux && agent == Agent::Copilot && session_bus && !env_token && !stored_token_handover).then(
         || {
             Finding::warning(
-                "If Copilot's login is in the system keyring, the sandbox cannot reach it \
-             (D-Bus is masked): Copilot may ask you to sign in again or store the token \
-             in plain text. The stored login was not checked.",
+                "Native keyring access is not guaranteed in the sandbox; token handover is recommended. \
+             Landlock below ABI v9 does not block pathname bus connections; active bubblewrap masks selected endpoints. The stored login was not checked.",
                 Some(
                     "export a valid COPILOT_GITHUB_TOKEN, or clear COPILOT_GITHUB_TOKEN, GH_TOKEN \
                  and GITHUB_TOKEN in a subshell and run `gh auth login --hostname github.com \
@@ -1760,6 +1759,17 @@ mod tests {
     #[test]
     fn linux_keyring_only_when_no_token_reaches_copilot() {
         let finding = linux_keyring_finding(Agent::Copilot, true, true, false, false).unwrap();
+        assert_eq!(finding.level, Level::Warning);
+        assert!(
+            finding
+                .message
+                .contains("Landlock below ABI v9 does not block pathname bus connections")
+        );
+        assert!(
+            finding
+                .message
+                .contains("active bubblewrap masks selected endpoints")
+        );
         let fix = finding.fix.unwrap();
         assert!(fix.contains("gh auth login --hostname github.com --web"));
         assert!(fix.contains("one-shot cache"));

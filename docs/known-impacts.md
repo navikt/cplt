@@ -100,13 +100,18 @@ not only to repositories named with `--repo-dir`. Tracked in
 [#402](https://github.com/navikt/cplt/issues/402), which also covers whether
 the guard should intercept these forms and fail loudly instead.
 
-## Linux: the system keyring is unreachable, so agents ask you to sign in again
+## Linux: keyring access depends on the backend and agent version
 
 `gnome-keyring`, `kwallet` and anything else behind libsecret are reached over
-D-Bus. The sandbox masks the session bus socket (`$XDG_RUNTIME_DIR/bus`) and
-`/run/dbus/system_bus_socket`, and does not pass `DBUS_SESSION_BUS_ADDRESS`, so
-there is no Secret Service inside it. An agent that keeps its credential there
-finds no vault:
+D-Bus. Removing `DBUS_SESSION_BUS_ADDRESS` only affects discovery, and denying
+keyring files does not block the Secret Service API. On Ubuntu 24.04 in Colima,
+kernel 6.8 reporting Landlock ABI 4, a private Secret Service remained readable
+under Landlock + seccomp using `XDG_RUNTIME_DIR` or a known socket, including
+with all token variables denied. Bubblewrap was untested because namespace
+creation was blocked. See [the measured Linux gap](../SECURITY.md#linux-specific-limitations).
+
+Native login may work or fail depending on the backend and agent version.
+An agent may report:
 
 ```
 ! System vault not available
@@ -115,11 +120,9 @@ finds no vault:
   Store token in plain text config file?
 ```
 
-This is not a distribution problem, and it is not specific to Ubuntu. D-Bus is a
-broad IPC channel into the whole desktop session, which is why it is masked.
-
-**Fix:** authenticate on the host, where the keyring works, and let cplt pass
-the token in.
+That prompt alone does not establish whether the sandbox blocked the bus or
+why authentication failed. Recommended recovery for Copilot is to authenticate
+on the host and let cplt hand over the credential:
 
 ```bash
 gh auth login --hostname github.com              # outside cplt, once
@@ -129,9 +132,10 @@ cplt config set gh_guard.inject_token true --force   # needs gh_guard.enabled
 `--force` is required because putting the token in the environment is a real
 weakening: it is inherited by every process in the sandbox and readable from any
 of them, through `/proc/<pid>/environ` on Linux or `ps -E` on macOS. See
-[gh-guard.md](gh-guard.md). Answering "yes, store in plain text" also works and
-persists across sessions, at the cost of a token on disk in the agent's config
-directory.
+[gh-guard.md](gh-guard.md). A manually supplied, session-only token environment
+is another handover option. Neither method proves that native keyring access
+is blocked. Prefer these to accepting plaintext token storage in the agent's
+config directory.
 
 ### The same vault prompt on macOS
 
@@ -779,12 +783,12 @@ So neither port rules nor proxy-forced mode stop SSH to `ssh.github.com:443`. Wh
 
 ## D-Bus and systemd (Linux) — the session manager is reachable
 
-`XDG_RUNTIME_DIR` is on the environment allowlist, and Landlock cannot restrict `connect()` to a pathname unix socket before ABI v9 (kernel 7.1), so on a current kernel `$XDG_RUNTIME_DIR/bus` is reachable from inside the sandbox unless bubblewrap masks it. This is established by reading the code, not by running it on a host — treat it as reachable rather than demonstrated. `systemd-run --user <cmd>` hands the command to the user's systemd instance, which starts it as a new unit **outside** Landlock, seccomp and the bubblewrap namespaces. The same applies to any other D-Bus service on the session bus that can start a process.
+`XDG_RUNTIME_DIR` is on the environment allowlist, and Landlock cannot restrict `connect()` to a pathname unix socket before ABI v9 (kernel 7.1), so below that ABI `$XDG_RUNTIME_DIR/bus` is reachable from inside the sandbox unless bubblewrap masks it. Private Secret Service reads were demonstrated on ABI 4 as [described above](#linux-keyring-access-depends-on-the-backend-and-agent-version); the session-manager escape remains a code-reading conclusion. `systemd-run --user <cmd>` hands the command to the user's systemd instance, which starts it as a new unit **outside** Landlock, seccomp and the bubblewrap namespaces. The same applies to any other D-Bus service on the session bus that can start a process.
 
-- **With bubblewrap** (the default when `bwrap` is installed) `$XDG_RUNTIME_DIR/bus`, `$XDG_RUNTIME_DIR/systemd` and `/run/dbus/system_bus_socket` are mount-masked, which closes this path
+- **Require `sandbox.use_bubblewrap = true`** for the configured masks over `$XDG_RUNTIME_DIR/bus`, `$XDG_RUNTIME_DIR/systemd` and `/run/dbus/system_bus_socket`. They cover selected known endpoints, not every custom pathname or abstract socket, and were unverified in the measured environment
 - **Without it** — not installed, `--no-bubblewrap`, or an auto-detect fallback at spawn time — nothing closes it below kernel 7.1
-- From kernel 7.1 (Landlock ABI v9) the `connect()` is denied outright, bubblewrap or not
-- If your threat model needs it closed today, install bubblewrap, or run cplt inside a container or VM
+- From kernel 7.1 (Landlock ABI v9), cplt's existing `ResolveUnix` rules mediate pathname connections; writable-tree grants, including `/tmp` and the project, also allow them. ABI v6 abstract-socket scoping does not close the ABI 4–8 pathname gap
+- If your threat model needs it closed, verify the masks in the actual run, or use a container or VM without the host bus exposed
 
 ## UDP is unrestricted outside proxy-forced (Linux)
 
