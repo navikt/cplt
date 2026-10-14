@@ -387,6 +387,20 @@ If you still see this error, check that you have not set `scratch_dir = false` i
 cplt config explain sandbox.scratch_dir
 ```
 
+## Embedded Kafka zero-copy on macOS
+
+Kafka sends log records through Java `FileChannel.transferTo()`, which uses
+Darwin `sendfile()`. Older cplt profiles can permit the localhost connection and
+ordinary writes but deny `sendfile()`, producing `Operation not permitted` in
+`FileDispatcherImpl.transferTo0`, followed by consumer disconnects or EOF.
+
+Updated profiles support this with `sandbox.allow_localhost_any = true`, outside
+`proxy.forced`. The IPv4-stack JVM setting is still required on macOS; do not
+clear the `JAVA_TOOL_OPTIONS` cplt injects. Changing `java.io.tmpdir` or enabling
+JVM attach does not fix this socket check. Explicit per-port localhost grants
+do not enable this zero-copy allowance. It also enables zero-copy on established
+non-loopback sockets; new connections still use the existing destination rules.
+
 ## Cache exec (Playwright, pnpm dlx, etc.)
 
 Some tools unpack and execute binaries straight out of `~/Library/Caches` (macOS) or `~/.cache` (Linux), which is exec-blocked by default:

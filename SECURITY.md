@@ -421,6 +421,20 @@ cplt has a built-in blocklist covering most of these: [`blocked-domains.txt`](bl
 | **5. Binary staging** | Drop RAT into cache dir and execute | **Kernel-blocked by default.** `~/Library/Caches` has no `process-exec` or `file-map-executable`, and `/tmp` exec is denied. `--allow-cache-exec <SUBDIR>` grants exec to one named subdir, and the write+exec risk applies there. `--allow-exec <PATH>` grants exec on a named tool prefix, but never write: a grant overlapping the project dir or an `allow.write` grant is refused at startup on both backends. | ✅ **Stopped** (⚠️ opt-in exemption available) |
 | **Worm propagation** | Republish infected packages | Can't read npm tokens (in ~/.npmrc, kernel-blocked), unless the user turned on `sandbox.allow_build_credentials` or `allow.read ~/.npmrc` | ✅ **Stopped** (⚠️ opt-in exemption available) |
 
+### Localhost zero-copy on macOS
+
+With `--allow-localhost-any`, cplt allows the local-socket check used by Darwin
+`sendfile()`, which has no remote sockaddr. That allow precedes an addressed-IP
+deny and the existing destination allows, so it cannot authorize TCP connections
+or UDP traffic to other destinations merely because the source socket is bound
+to loopback. It is absent under `proxy.forced` and when `allow_localhost_any` is
+off. Kernel tests cover IPv4/IPv6 transfers in both directions and unauthorized
+TCP/UDP destinations with and without explicit loopback binding. The addressless
+check also permits zero-copy on already-established non-loopback sockets; it is
+not a destination check. Ordinary writes already work on established sockets,
+including inherited ones. The new rules preserve restrictions on acquiring a
+connection, not a guarantee that every subsequent send is destination-filtered.
+
 ### Honest gaps
 
 **Network is port-restricted, with optional domain filtering.** SBPL (Seatbelt Profile Language) has no domain-based filtering at the kernel level, and Copilot CLI connects to CDN-backed endpoints (`api.business.githubcopilot.com`) whose IPs change and cannot be enumerated. So we allow outbound TCP on port 443 only, with `--allow-port` for extras such as `--allow-port 80`. On macOS, SSH agent access and localhost outbound are blocked at the kernel level; on Linux neither is, see [Linux-specific limitations](#linux-specific-limitations). That leaves:

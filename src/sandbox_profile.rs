@@ -3223,6 +3223,16 @@ fn emit_network_rules(
         "(allow network-outbound (literal \"/private/var/run/mDNSResponder\"))"
     );
 
+    if allow_localhost_any && !proxy_forced {
+        // Darwin sendfile checks the local socket without a remote sockaddr.
+        // Allow that check before denying all addressed IP traffic: putting the
+        // local allow after the denies would also permit arbitrary destinations
+        // from a loopback-bound socket, including UDP. The remote allows below
+        // still decide which destinations connect/sendto may reach.
+        sbpl!(sb, "(allow network-outbound (local ip \"localhost:*\"))");
+        sbpl!(sb, "(deny network-outbound (remote ip \"*:*\"))");
+    }
+
     // Outbound TCP restricted to port 443 (HTTPS only).
     // All Copilot/GitHub APIs use HTTPS — port 80 is not needed and would
     // allow unencrypted exfiltration. Use --allow-port 80 if required.
@@ -4593,6 +4603,33 @@ mod tests {
             !p.contains("\"*:443\""),
             "proxy_forced must drop the broad *:443 allowance"
         );
+    }
+
+    #[test]
+    fn localhost_sendfile_allow_precedes_remote_denies_and_requires_opt_in() {
+        let project = Path::new("/projects/app");
+        let home = Path::new("/Users/test");
+        let local = "(allow network-outbound (local ip \"localhost:*\"))";
+        let remote_deny = "(deny network-outbound (remote ip \"*:*\"))";
+        for (any, forced) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut opts = test_options(project, home);
+            opts.allow_localhost_any = any;
+            opts.proxy_forced = forced;
+            let profile = generate_profile(&opts, &[]);
+            assert_eq!(profile.contains(local), any && !forced);
+            assert_eq!(profile.contains(remote_deny), any && !forced);
+            if any && !forced {
+                let local_pos = profile.find(local).unwrap();
+                let deny_pos = profile.find(remote_deny).unwrap();
+                let tcp_pos = profile
+                    .find("(deny network-outbound (remote tcp))")
+                    .unwrap();
+                let allow_pos = profile
+                    .find("(allow network-outbound (remote ip \"localhost:*\"))")
+                    .unwrap();
+                assert!(local_pos < deny_pos && deny_pos < tcp_pos && tcp_pos < allow_pos);
+            }
+        }
     }
 
     #[test]

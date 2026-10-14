@@ -4531,6 +4531,99 @@ int main(int argc, char **argv) {
         );
     }
 
+    /// Kafka's FileChannel.transferTo uses Darwin sendfile, whose socket check
+    /// differs from connect/write. Verify both directions and address families,
+    /// and that the local-socket allowance cannot bypass destination filtering.
+    #[test]
+    fn real_profile_localhost_sendfile_preserves_destination_filtering() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        for (enabled, forced) in [(false, false), (true, false), (false, true)] {
+            let mut opts = default_opts(&project, &home);
+            opts.allow_localhost_any = enabled;
+            opts.proxy_forced = forced;
+            let profile = write_real_profile(&opts);
+            let source = format!(
+                r#"
+import errno, os, socket, tempfile
+enabled = {enabled}
+payload = b"embedded-kafka-sendfile"
+for family, address in [(socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")]:
+    with socket.socket(family) as listener, socket.socket(family) as client:
+        listener.settimeout(2)
+        client.settimeout(2)
+        listener.bind((address, 0))
+        listener.listen()
+        try:
+            client.connect(listener.getsockname())
+        except OSError as error:
+            assert not enabled and error.errno == errno.EPERM, error
+            continue
+        assert enabled, "localhost connect allowed without opt-in"
+        with listener.accept()[0] as server, tempfile.TemporaryFile() as records:
+            server.settimeout(2)
+            records.write(payload)
+            records.flush()
+            for sender, receiver in [(client, server), (server, client)]:
+                sent = os.sendfile(sender.fileno(), records.fileno(), 0, len(payload))
+                assert sent == len(payload), sent
+                received = b""
+                while len(received) < len(payload):
+                    chunk = receiver.recv(len(payload) - len(received))
+                    assert chunk, "unexpected EOF"
+                    received += chunk
+                assert received == payload, received
+# Explicit loopback binding exercises the dangerous case for a local filter.
+# Denied documentation addresses require EPERM, not a timeout or route error.
+for family, local, remote in [
+    (socket.AF_INET, "127.0.0.1", "127.0.0.2"),
+    (socket.AF_INET, "127.0.0.1", "192.0.2.1"),
+    (socket.AF_INET6, "::1", "2001:db8::1"),
+    (socket.AF_INET6, "::1", "::ffff:127.0.0.1"),
+]:
+    for kind in [socket.SOCK_STREAM, socket.SOCK_DGRAM]:
+        for bind_local in [False, True]:
+            with socket.socket(family, kind) as peer:
+                peer.settimeout(2)
+                if bind_local:
+                    peer.bind((local, 0))
+                try:
+                    peer.connect((remote, 12345))
+                except OSError as error:
+                    assert error.errno == errno.EPERM, error
+                else:
+                    raise AssertionError("unauthorized destination allowed")
+                if kind == socket.SOCK_DGRAM:
+                    try:
+                        peer.sendto(payload, (remote, 12345))
+                    except OSError as error:
+                        assert error.errno == errno.EPERM, error
+                    else:
+                        raise AssertionError("unauthorized datagram allowed")
+print("SENDFILE_POLICY_OK")
+"#,
+                enabled = if enabled { "True" } else { "False" }
+            );
+            let output = crate::common::shim_cmd(Path::new("/usr/bin/sandbox-exec"))
+                .arg("-f")
+                .arg(&profile)
+                .arg(crate::common::binary_in_path("python3"))
+                .arg("-c")
+                .arg(&source)
+                .output()
+                .expect("run sendfile policy probe");
+            fs::remove_file(&profile).unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("SENDFILE_POLICY_OK"),
+                "allow_localhost_any={enabled}, proxy_forced={forced}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
     #[test]
     fn real_profile_java_localhost_with_prefer_ipv4_stack() {
         require_sandbox!();
