@@ -4231,18 +4231,39 @@ print('CONNECTED')
             let deadline = Instant::now() + Duration::from_secs(30);
             while !fs::read_to_string(&reg).is_ok_and(|s| s.contains("HOSTPW")) {
                 assert!(Instant::now() < deadline, "host service did not register");
-                std::thread::sleep(Duration::from_millis(1));
+                std::thread::sleep(Duration::from_millis(200));
             }
-            while !home
-                .h
-                .join(".local/share/opencode/opencode.db-wal")
-                .exists()
-            {
-                assert!(Instant::now() < deadline, "host WAL did not appear");
-                std::thread::yield_now();
+            // v2 registers before bootstrapping the shared database. Starting
+            // both services then can race CREATE TABLE in a fresh database.
+            loop {
+                let health = Command::new("/usr/bin/curl")
+                    .args([
+                        "--noproxy",
+                        "*",
+                        "--silent",
+                        "--max-time",
+                        "1",
+                        "--output",
+                        "/dev/null",
+                        "--write-out",
+                        "%{http_code}",
+                        "--user",
+                        "opencode:HOSTPW",
+                        "http://127.0.0.1:49374/api/info",
+                    ])
+                    .output()
+                    .unwrap();
+                let status = String::from_utf8_lossy(&health.stdout);
+                if health.status.success() && status == "200" {
+                    break;
+                }
+                assert_ne!(status, "500", "host service boot failed");
+                assert!(
+                    Instant::now() < deadline,
+                    "host service not ready: {status}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
             }
-            // Diagnostic: keep the host at its published-registration boot stage.
-            assert_eq!(unsafe { libc::kill(host.0.id() as i32, libc::SIGSTOP) }, 0);
             let host_pid = host.0.id();
 
             let script = format!(
@@ -4252,11 +4273,7 @@ print('CONNECTED')
                 cat "$HOME/.local/state/opencode/key" 2>/dev/null && echo PLANTED
                 P=$(sed -n 's/.*"port":\([0-9]*\).*/\1/p' "$XDG_CONFIG_HOME/opencode/service.json")
                 echo "P=$P"
-                "{oc}" serve --service --print-logs >boot.log 2>&1 &
-                while [ ! -f "$XDG_STATE_HOME/opencode/service.json" ]; do sleep 0.01; done
                 "{oc}" api GET /path >/dev/null && echo API-OK
-                sleep 1
-                dd if=boot.log bs=65536 count=1 2>/dev/null >&2
                 "{oc}" service get
                 c() {{ curl --noproxy '*' -s -m3 -o /dev/null -w '%{{http_code}}' "http://127.0.0.1:$1/"; }}
                 echo "SESSION=$(c $P)"
@@ -4265,17 +4282,12 @@ print('CONNECTED')
                 reg = reg.display(),
                 oc = oc.display(),
             );
-            let child = home
+            let o = home
                 .cmd(&home.proj)
                 .args([flag, "--", &script])
                 .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
+                .output()
                 .unwrap();
-            std::thread::sleep(Duration::from_millis(500));
-            assert_eq!(unsafe { libc::kill(host.0.id() as i32, libc::SIGCONT) }, 0);
-            let o = child.wait_with_output().unwrap();
             let out = String::from_utf8_lossy(&o.stdout);
             let mut all = format!("{out}\n{}", String::from_utf8_lossy(&o.stderr));
             if !out.contains("API-OK") {
