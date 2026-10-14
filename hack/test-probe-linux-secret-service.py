@@ -7,8 +7,11 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
+from urllib.parse import unquote
+from xml.etree import ElementTree
 
 path = Path(__file__).with_name('probe-linux-secret-service.py')
 spec = importlib.util.spec_from_file_location('probe', path)
@@ -17,6 +20,32 @@ spec.loader.exec_module(probe)
 
 
 class ProbeTests(unittest.TestCase):
+    def test_special_fixture_path_reaches_valid_bus_config(self):
+        with tempfile.TemporaryDirectory(prefix='bus &<>,;% ') as tmp:
+            root = Path(tmp)
+            def inspect_spawn(_processes, args, **_kwargs):
+                config = Path(args[-1].removeprefix('--config-file='))
+                address = ElementTree.parse(config).findtext('listen')
+                self.assertEqual(unquote(address.removeprefix('unix:path=')), str(root / 'run/bus'))
+                self.assertNotIn('&', address)
+                self.assertNotIn(',', address)
+                raise RuntimeError('config inspected')
+            handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}
+            try:
+                with patch.object(probe.sys, 'platform', 'linux'), \
+                        patch.object(probe.sys, 'argv', ['probe', str(path)]), \
+                        patch.object(probe.os, 'getuid', return_value=1001), \
+                        patch.object(probe.os, 'geteuid', return_value=1001), \
+                        patch.object(probe.shutil, 'which', return_value='/fixture/tool'), \
+                        patch.object(probe.tempfile, 'TemporaryDirectory') as directory, \
+                        patch.object(probe, 'spawn', side_effect=inspect_spawn):
+                    directory.return_value.__enter__.return_value = tmp
+                    with self.assertRaisesRegex(RuntimeError, 'config inspected'):
+                        probe.main()
+            finally:
+                for sig, handler in handlers.items():
+                    signal.signal(sig, handler)
+
     def test_uid_and_euid_root_are_refused_before_setup(self):
         for uid, euid in [(0, 1001), (1001, 0)]:
             with self.subTest(uid=uid, euid=euid), \

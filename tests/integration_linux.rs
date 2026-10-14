@@ -1535,7 +1535,7 @@ except OSError as e:
     /// uniquely named dotfile there is reliably ungranted on any host.
     struct OutsideSocket {
         path: PathBuf,
-        _listener: std::os::unix::net::UnixListener,
+        listener: std::os::unix::net::UnixListener,
     }
 
     impl OutsideSocket {
@@ -1547,10 +1547,7 @@ except OSError as e:
             let _ = fs::remove_file(&path);
             let listener =
                 std::os::unix::net::UnixListener::bind(&path).expect("bind UNIX socket in $HOME");
-            Self {
-                path,
-                _listener: listener,
-            }
+            Self { path, listener }
         }
     }
 
@@ -1629,9 +1626,9 @@ except OSError as e:
         fs::create_dir_all(&keyring).unwrap();
         fs::write(keyring.join("login.keyring"), "fixture-keyring").unwrap();
         let sock = OutsideSocket::bind_at(home.join("bus"));
-        sock._listener.set_nonblocking(true).unwrap();
+        sock.listener.set_nonblocking(true).unwrap();
         let project = create_test_project();
-        let script = r#"import socket
+        let script = r"import socket
 from pathlib import Path
 try:
     Path.home().joinpath('.local/share/keyrings/login.keyring').read_bytes()
@@ -1648,7 +1645,7 @@ except PermissionError:
 else:
     s.sendall(b'fixture-request')
     print('SOCKET_SENT')
-"#;
+";
         let out = cplt_cmd()
             .env_clear()
             .env("CPLT_CONFIG", crate::common::NO_CONFIG)
@@ -1681,12 +1678,12 @@ else:
         if landlock_abi_version().is_some_and(|v| v >= 9) {
             assert!(stdout.contains("SOCKET_DENIED"), "{stdout}");
             assert_eq!(
-                sock._listener.accept().unwrap_err().kind(),
+                sock.listener.accept().unwrap_err().kind(),
                 std::io::ErrorKind::WouldBlock
             );
         } else {
             assert!(stdout.contains("SOCKET_SENT"), "{stdout}");
-            let (mut stream, _) = sock._listener.accept().unwrap();
+            let (mut stream, _) = sock.listener.accept().unwrap();
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(3)))
                 .unwrap();

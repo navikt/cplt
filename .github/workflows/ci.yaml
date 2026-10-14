@@ -60,7 +60,7 @@ jobs:
         run: cargo fmt -- --check
 
       - name: Run offline probe checks
-        run: python3 --version && python3 -B hack/test-probe-copilot-no-auth.py && python3 -B hack/test-probe-copilot-auth-contract.py
+        run: python3 --version && python3 -B hack/test-probe-copilot-no-auth.py && python3 -B hack/test-probe-copilot-auth-contract.py && python3 -B hack/test-probe-linux-secret-service.py
 
       - name: Run Clippy
         run: cargo clippy --all-targets -- -D warnings
@@ -158,7 +158,7 @@ jobs:
           sandbox-exec -p '(version 1)(allow default)' /usr/bin/true
 
       - name: Run offline probe checks
-        run: python3 --version && python3 -B hack/test-probe-copilot-no-auth.py && python3 -B hack/test-probe-copilot-auth-contract.py
+        run: python3 --version && python3 -B hack/test-probe-copilot-no-auth.py && python3 -B hack/test-probe-copilot-auth-contract.py && python3 -B hack/test-probe-linux-secret-service.py
 
       - name: Install Java (for JVM integration tests)
         uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # ratchet:actions/setup-java@v6.0.1

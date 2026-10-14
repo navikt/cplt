@@ -14,6 +14,8 @@ import subprocess
 import sys
 import tempfile
 import time
+from urllib.parse import quote
+from xml.sax.saxutils import escape
 
 
 def require(condition, message):
@@ -58,7 +60,7 @@ def cleanup(processes):
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
-            pass
+            pass  # The owned process group has already exited.
         except Exception as error:
             errors.append(error)
         try:
@@ -91,9 +93,9 @@ def main():
         env = {'HOME': tmp, 'PATH': '/usr/bin:/bin', 'XDG_RUNTIME_DIR': str(runtime),
                'XDG_DATA_HOME': str(home / '.local/share'), 'XDG_CONFIG_HOME': str(home / '.config'),
                'CPLT_CONFIG': '/dev/null/nonexistent', 'NO_COLOR': '1', 'LC_ALL': 'C'}
-        address = 'unix:path=' + str(runtime / 'bus')
+        address = 'unix:path=' + quote(str(runtime / 'bus'), safe='/')
         config = home / 'bus.conf'
-        config.write_text('<busconfig><type>session</type><listen>' + address +
+        config.write_text('<busconfig><type>session</type><listen>' + escape(address) +
                           '</listen><policy context="default"><allow send_destination="*"/>'
                           '<allow receive_sender="*"/><allow own="*"/></policy></busconfig>')
         processes = []
@@ -152,7 +154,10 @@ def main():
             keyrings = list((home / '.local/share/keyrings').glob('*.keyring'))
             require(keyrings, 'no persistent dummy keyring file')
             denied = sandbox('echo CHILD_ENTERED; exec /usr/bin/cat "$1"', args=(str(keyrings[0]),))
-            denied_operation(denied, f'cat: {keyrings[0]}: Permission denied')
+            diagnostic = f'cat: {keyrings[0]}: Permission denied'
+            if diagnostic not in denied.stderr.splitlines():
+                diagnostic = f"cat: '{keyrings[0]}': Permission denied"
+            denied_operation(denied, diagnostic)
             missing = sandbox('unset XDG_RUNTIME_DIR; echo CHILD_ENTERED; exec ' + lookup)
             diagnostic = next((line for line in missing.stderr.splitlines() if line ==
                                'secret-tool: Cannot autolaunch D-Bus without X11 $DISPLAY'
