@@ -26,6 +26,12 @@ RUNTIMES = {
     '1.0.96-2':'0ddd9ea39981870ce8241f2f95d24ce085572e82407d463c500f139ed6c8aa4f',
     '1.0.97-2':'ac5ea364f0c159667ba74957d66053a79a85c12601179f39e8a1d6ebf7f6c3b8',
 }
+SCHEMAS = {
+    '1.0.94-5':'8053220e3f7939999ba01ea5dbe31ead0534f46f77e360fb45658253559d661e',
+    '1.0.95':'74e36b714b7b0290e6277625360086735d164df1462266b5cba654507f07a219',
+    '1.0.96-2':'e097216f866cc9215ce9e1ebfd64b5fb3e7eea4ea10e1f8650902c3fc940e526',
+    '1.0.97-2':'b4a368552e04cf508301897fd2c19534462f0e31505a5ad72b5b49274889a609',
+}
 TEMP = Path(tempfile.gettempdir())
 # Reviewed 1.0.97-2 expands to 177,036,288 bytes; cap the entire tar before parsing.
 TAR_LIMIT = 256 * 1024 * 1024
@@ -237,6 +243,9 @@ def schema_checks(package):
     if PINS.get(version) != manifest.get("buildMetadata", {}).get("gitCommit"):
         raise ValueError("unsupported version/build; review public code before adding a pin")
     raw = regular_bytes(package / "schemas/api.schema.json", 8 * 1024 * 1024)
+    digest = hashlib.sha256(raw).hexdigest()
+    if SCHEMAS.get(version) != digest:
+        raise ValueError('unreviewed schema artifact; refusing evidence and execution')
     definitions = json.loads(raw)["definitions"]
     schema = json.loads(raw)
     assert schema['session']['accounts']['get']['rpcMethod'] == 'session.accounts.get'
@@ -256,7 +265,7 @@ def schema_checks(package):
     result = definitions["GitHubTokenAcquireResult"]["anyOf"][0]
     assert result["properties"]["expiresIn"]["minimum"] == 3601
     assert "expiresIn" in result["required"]
-    print(f"PIN version={version} commit={PINS[version]} schema_sha256={hashlib.sha256(raw).hexdigest()}")
+    print(f"PIN version={version} commit={PINS[version]} schema_sha256={digest}")
     print("PASS schema: user/env distinction; last-sign-in is not active-account contract; explicit SDK expiry callback")
 
 
@@ -398,6 +407,7 @@ def isolated_native(package, node):
                     try:
                         os.killpg(child.pid, signal.SIGKILL)
                     except ProcessLookupError:
+                        # Normal completion can remove the process group before cleanup.
                         pass
                     child.wait()
             for line in stdout.splitlines():

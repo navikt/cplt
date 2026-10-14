@@ -128,7 +128,7 @@ gzip expansion to 256 MiB before tar parsing, including
 unrelated members and extended metadata. The reviewed `1.0.97-2` tar is
 177,036,288 bytes. It never launches
 the installed loader or downloads a package. Native execution requires the
-version/build pin and reviewed runtime SHA-256. Other artifacts fail closed.
+version/build pin and reviewed schema/runtime SHA-256. Other artifacts fail closed.
 `1.0.94-5` remains schema-only in this probe; native session runs explicitly
 require `1.0.95`, `1.0.96-2` or `1.0.97-2`. Its earlier metadata results above are
 historical, not a session-compatibility claim.
@@ -176,8 +176,8 @@ exact-account export path, followed by separate expiry/rotation tests. Do not
 enumerate unrelated account tokens or silently fall back to gh. No production
 extraction or default change follows from these negative offline results.
 
-Seven offline regression tests cover public SEA parsing, bounded expansion, malformed compression, truncated-input
-sanitization, hash refusal, old-version refusal and false initialization/errors
+Eight offline regression tests cover public SEA parsing, bounded expansion, malformed compression, truncated-input
+sanitization, schema/runtime hash refusal, old-version refusal and false initialization/errors
 from either resolution call. `mise run test:probe` and Linux/macOS CI run them;
 Node is required for the synthetic JS check.
 

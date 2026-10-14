@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -45,6 +46,34 @@ class ContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'unreviewed native artifact'):
                 probe.isolated_native(Path('/synthetic'), Path('/node'))
             spawn.assert_not_called()
+
+    def test_schema_mismatch_refuses_before_native_execution(self):
+        schema = {'definitions':{'UserAuthInfo':{'required':['type','host','login'],
+                    'properties':{'type':{},'host':{},'login':{}}}}}
+        schema['session'] = {'accounts':{'get':{'rpcMethod':'session.accounts.get',
+                                              'params':{'required':['sessionId']}}}}
+        schema['definitions'].update({
+            'EnvAuthInfo':{'required':['type','host','token','envVar']},
+            'LoggedInUser':{'required':['host','login']},
+            'GlobalStateLoadResult':{'properties':{'lastLoggedInUser':{
+                'description':'Account used for the most recent sign-in.'}}},
+            'AuthReadQuery':{'stability':'experimental'},
+            'AuthReadValue':{'anyOf':[{'properties':{'authInfo':{'$ref':'#/definitions/AuthIdentity'}}}]},
+            'AuthIdentity':{'properties':{}},
+            'GitHubTokenAcquireResult':{'anyOf':[{'properties':{'expiresIn':{'minimum':3601}},
+                                                'required':['expiresIn']}]},
+        })
+        with tempfile.TemporaryDirectory() as temporary:
+            package = Path(temporary)
+            (package / 'schemas').mkdir()
+            (package / 'package.json').write_text(json.dumps({'version':'1.0.95',
+                'buildMetadata':{'gitCommit':probe.PINS['1.0.95']}}))
+            (package / 'schemas/api.schema.json').write_text(json.dumps(schema))
+            with patch.object(sys, 'argv', ['probe','--package',str(package),'--node','/synthetic/node']), \
+                    patch.object(probe, 'isolated_native') as native:
+                with self.assertRaisesRegex(ValueError, 'unreviewed schema artifact'):
+                    probe.main()
+                native.assert_not_called()
 
     def test_expanding_unrelated_tar_refused_before_parsing(self):
         payload = io.BytesIO()
