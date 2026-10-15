@@ -363,10 +363,6 @@ impl Baseline {
     /// baseline" (reported later as change audit unavailable).
     pub fn capture(project_dir: &Path) -> Self {
         let start = Instant::now();
-        let repo_root = git_output(project_dir, &["rev-parse", "--show-toplevel"])
-            .map(|s| PathBuf::from(s.trim_end_matches(['\n', '\r'])))
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| project_dir.to_path_buf());
         // The pinned SHA. If HEAD does not resolve (not a repo, or no commits),
         // we record no baseline rather than erroring.
         let pinned_sha = git_output(project_dir, &["rev-parse", "HEAD"])
@@ -379,6 +375,14 @@ impl Baseline {
         // set) for a genuinely empty untracked set and over-reports.
         let before_status = git_output(project_dir, &["status", "--porcelain", "-z", "-uall"]);
         let before_ok = before_status.is_some();
+        let repo_root = if !before_ok || project_dir.join(".git").symlink_metadata().is_ok() {
+            project_dir.to_path_buf()
+        } else {
+            git_output(project_dir, &["rev-parse", "--show-toplevel"])
+                .map(|s| PathBuf::from(s.trim_end_matches(['\n', '\r'])))
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| project_dir.to_path_buf())
+        };
         let before_untracked_hashes = before_status
             .as_deref()
             .map(|s| fingerprint_untracked(&repo_root, s))

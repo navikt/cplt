@@ -38,6 +38,7 @@ Non-test tasks:
 ```bash
 mise run clippy            # linter
 mise run fmt               # auto-format
+mise run bench:startup     # release startup latency + parent git spawn budget
 mise run check:all-targets # cargo check every release target, to catch breakage on
                            # non-native targets (requires user setup)
 ```
