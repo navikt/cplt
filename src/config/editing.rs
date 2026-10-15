@@ -328,7 +328,10 @@ pub fn security_confirmation(key_info: &ConfigKeyInfo, value: &str, unset: bool)
             ));
         }
     }
-    if key_info.dangerous && value == "true" {
+    if key_info.dangerous
+        && (value == "true"
+            || (!matches!(key_info.value_type, ConfigValueType::Bool) && !value.trim().is_empty()))
+    {
         return Some("weakens sandbox security".to_string());
     }
     let weakens_security = matches!(
@@ -381,6 +384,15 @@ pub fn write_repo_document_atomically(
     path: &Path,
     doc: &toml_edit::DocumentMut,
 ) -> Result<(), ConfigError> {
+    if path
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink())
+    {
+        return Err(ConfigError::Validation(format!(
+            "refusing to write repository config over symlink {}",
+            path.display()
+        )));
+    }
     write_document_atomically_with_mode(path, doc, 0o644)
 }
 
@@ -450,8 +462,12 @@ fn create_unique_temp_file(
 #[cfg(unix)]
 fn existing_or_default_mode(path: &Path, default_mode: u32) -> u32 {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path).map_or(default_mode, |metadata| {
-        metadata.permissions().mode() & 0o777
+    std::fs::symlink_metadata(path).map_or(default_mode, |metadata| {
+        if metadata.file_type().is_symlink() {
+            default_mode
+        } else {
+            metadata.permissions().mode() & 0o777
+        }
     })
 }
 

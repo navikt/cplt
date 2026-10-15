@@ -197,6 +197,22 @@ fn launch_head_cannot_approve_protected_content_not_checked_out() {
 }
 
 #[test]
+fn local_protected_config_and_ignored_dependencies_are_not_part_of_the_snapshot() {
+    let fx = Fixture::new(&tracked_files());
+    write_files(
+        fx.project.path(),
+        &[
+            (".claude/settings.local.json", "{}\n"),
+            ("node_modules/dependency/.claude/settings.json", "{}\n"),
+        ],
+    );
+    let ctx = with_home(fx.home.path(), || fx.ctx());
+    add(&ctx, "clean", "HEAD").unwrap();
+    assert!(!fx.root.join("clean/.claude/settings.local.json").exists());
+    assert!(!fx.root.join("clean/node_modules").exists());
+}
+
+#[test]
 fn launch_protected_aliases_and_mode_mismatch_are_refused() {
     let fx = Fixture::new(&[]);
     write_files(fx.project.path(), &[(".claude/ſettings.json", "{}\n")]);

@@ -301,6 +301,70 @@ pub fn validate_config(toml_text: &str) -> Vec<ConfigDiagnostic> {
                     .to_string(),
             });
         }
+        if sandbox
+            .get("allow_lifecycle_scripts")
+            .and_then(toml::Value::as_bool)
+            == Some(true)
+        {
+            diagnostics.push(ConfigDiagnostic {
+                level: DiagnosticLevel::Warning,
+                message: "sandbox.allow_lifecycle_scripts = true lets npm/yarn/pnpm lifecycle scripts run (DANGEROUS)"
+                    .to_string(),
+            });
+        }
+        if sandbox.get("allow_browser").and_then(toml::Value::as_bool) == Some(true) {
+            diagnostics.push(ConfigDiagnostic {
+                level: DiagnosticLevel::Warning,
+                message: "sandbox.allow_browser = true lets the agent launch applications outside the sandbox via Launch Services (DANGEROUS)"
+                    .to_string(),
+            });
+        }
+    }
+
+    if let Some(gh_guard) = table.get("gh_guard").and_then(|v| v.as_table()) {
+        if gh_guard.get("inject_token").and_then(toml::Value::as_bool) == Some(true) {
+            diagnostics.push(ConfigDiagnostic {
+                level: DiagnosticLevel::Warning,
+                message: "gh_guard.inject_token = true injects GH_TOKEN into the agent environment (DANGEROUS)"
+                    .to_string(),
+            });
+        }
+        if gh_guard
+            .get("allow_api_write")
+            .and_then(toml::Value::as_bool)
+            == Some(true)
+        {
+            diagnostics.push(ConfigDiagnostic {
+                level: DiagnosticLevel::Warning,
+                message: "gh_guard.allow_api_write = true allows 'gh api' write requests in the current repo (DANGEROUS)"
+                    .to_string(),
+            });
+        }
+        if gh_guard
+            .get("allow_pr_merge")
+            .and_then(toml::Value::as_bool)
+            == Some(true)
+        {
+            diagnostics.push(ConfigDiagnostic {
+                level: DiagnosticLevel::Warning,
+                message: "gh_guard.allow_pr_merge = true allows 'gh pr merge' on protected branches (DANGEROUS)"
+                    .to_string(),
+            });
+        }
+    }
+
+    if let Some(allow_push) = table
+        .get("git_guard")
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("allow_push"))
+        .and_then(toml::Value::as_array)
+        && !allow_push.is_empty()
+    {
+        diagnostics.push(ConfigDiagnostic {
+            level: DiagnosticLevel::Warning,
+            message: "git_guard.allow_push defines push exceptions that let the agent push from inside the sandbox (DANGEROUS)"
+                .to_string(),
+        });
     }
 
     if let Some(exec) = table
@@ -835,5 +899,31 @@ some_new_option = true
         let msg = describe_unknown_key("allow.allow");
         assert!(msg.contains("drop the 'allow.' prefix"), "got: {msg}");
         assert!(!msg.contains("move it"), "got: {msg}");
+    }
+
+    #[test]
+    fn validate_warns_for_every_dangerous_registry_key() {
+        for key in crate::config::all_config_keys()
+            .iter()
+            .filter(|k| k.dangerous)
+        {
+            let toml = match (key.section, key.key) {
+                ("allow", "exec") => "[allow]\nexec = [\"/usr/local/bin\"]\n".to_string(),
+                ("git_guard", "allow_push") => {
+                    "[[git_guard.allow_push]]\nremote = \"origin\"\nbranches = [\"feat/*\"]\n"
+                        .to_string()
+                }
+                (sec, k) => format!("[{sec}]\n{k} = true\n"),
+            };
+            let diagnostics = validate_config(&toml);
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|d| d.level == DiagnosticLevel::Warning && d.message.contains("DANGEROUS")),
+                "{}.{} is marked dangerous in registry but validate_config emitted no DANGEROUS warning: {diagnostics:?}",
+                key.section,
+                key.key
+            );
+        }
     }
 }

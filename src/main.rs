@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 use cplt::gradle_init;
 use cplt::{
     agent, audit, brief, check, config, discover, gh_proxy, proxy, repo_config, sandbox, scratch,
-    subscriptions, trust, update,
+    subscriptions, trust, untrusted, update,
 };
 use std::collections::BTreeSet;
 use std::io::{self, IsTerminal, Seek, Write};
@@ -9405,15 +9405,11 @@ fn run_config_set_repo(
     }
 
     // Load or create repo config document
-    let mut doc = if repo_config_path.exists() {
-        let raw = match std::fs::read_to_string(&repo_config_path) {
-            Ok(r) => r,
-            Err(e) => {
-                ui::error(&format!("cannot read {}: {e}", repo_config_path.display()));
-                return ExitCode::FAILURE;
-            }
-        };
-        match raw.parse::<toml_edit::DocumentMut>() {
+    let mut doc = match untrusted::read_untrusted(
+        &repo_config_path,
+        repo_config::MAX_REPO_CONFIG_BYTES,
+    ) {
+        Ok(Some(raw)) => match raw.parse::<toml_edit::DocumentMut>() {
             Ok(d) => d,
             Err(e) => {
                 ui::error(&format!(
@@ -9422,9 +9418,20 @@ fn run_config_set_repo(
                 ));
                 return ExitCode::FAILURE;
             }
+        },
+        Ok(None) => {
+            ui::error(&format!(
+                "cannot read {}: must be a regular file (not a symlink or FIFO) of at most {} bytes",
+                repo_config_path.display(),
+                repo_config::MAX_REPO_CONFIG_BYTES
+            ));
+            return ExitCode::FAILURE;
         }
-    } else {
-        toml_edit::DocumentMut::new()
+        Err(e) if config::is_absent(&e, &repo_config_path) => toml_edit::DocumentMut::new(),
+        Err(e) => {
+            ui::error(&format!("cannot read {}: {e}", repo_config_path.display()));
+            return ExitCode::FAILURE;
+        }
     };
 
     // Apply every value to the one document; nothing is written unless all

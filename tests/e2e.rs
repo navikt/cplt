@@ -3012,7 +3012,7 @@ mod e2e_tests {
                     ("allow_env_files ", "= true (preset)"),
                     ("allow_docker ", "= true ⚠ DANGEROUS (preset)"),
                     ("allow_tmp_exec ", "= true ⚠ DANGEROUS (preset)"),
-                    ("allow_lifecycle_scripts ", "= true (preset)"),
+                    ("allow_lifecycle_scripts ", "= true ⚠ DANGEROUS (preset)"),
                 ],
             ),
             (
@@ -3021,7 +3021,7 @@ mod e2e_tests {
                     ("allow_env_files ", "= false (default)"),
                     ("allow_docker ", "= false (default)"),
                     ("allow_tmp_exec ", "= true ⚠ DANGEROUS (preset)"),
-                    ("allow_lifecycle_scripts ", "= true (preset)"),
+                    ("allow_lifecycle_scripts ", "= true ⚠ DANGEROUS (preset)"),
                 ],
             ),
             ("strict", &[("default_allowlist ", "= true (preset)")]),

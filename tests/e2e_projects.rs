@@ -4609,6 +4609,71 @@ fi
         assert_result_ok(&stdout, &stderr, "write_core_test");
     }
 
+    /// Exercise Kafka's zero-copy path through the full launch pipeline without
+    /// downloading Kafka: the injected IPv4 flag and sendfile policy must both
+    /// reach the agent's child JVM.
+    #[test]
+    fn project_java_localhost_file_channel_transfer() {
+        require_sandbox!();
+        let java = crate::common::binary_in_path("java");
+        let version = crate::common::shim_cmd(&java)
+            .arg("-version")
+            .output()
+            .expect("check Java runtime");
+        if !version.status.success() {
+            assert!(
+                !require_sandbox_enforced(),
+                "Java required for zero-copy test"
+            );
+            eprintln!("SKIPPED: Java runtime unavailable");
+            return;
+        }
+        let project = TempProject::scaffold_maven();
+        project.write_file(
+            "KafkaTransfer.java",
+            r#"
+import java.net.*;
+import java.nio.channels.*;
+import java.nio.file.*;
+import java.util.Arrays;
+public class KafkaTransfer {
+    public static void main(String[] args) throws Exception {
+        if (!Boolean.getBoolean("java.net.preferIPv4Stack"))
+            throw new AssertionError("cplt IPv4 flag missing");
+        byte[] payload = "embedded-kafka-record".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        Path log = Files.createTempFile("kafka-records-", ".log");
+        try {
+            Files.write(log, payload);
+            try (ServerSocketChannel listener = ServerSocketChannel.open()) {
+                listener.bind(new InetSocketAddress("127.0.0.1", 0));
+                try (SocketChannel client = SocketChannel.open(listener.getLocalAddress());
+                     SocketChannel broker = listener.accept();
+                     FileChannel records = FileChannel.open(log, StandardOpenOption.READ)) {
+                    client.socket().setSoTimeout(2000);
+                    long sent = records.transferTo(0, payload.length, broker);
+                    if (sent != payload.length) throw new AssertionError("short transfer: " + sent);
+                    byte[] received = client.socket().getInputStream().readNBytes(payload.length);
+                    if (!Arrays.equals(payload, received)) throw new AssertionError("wrong records");
+                }
+            }
+        } finally {
+            Files.delete(log);
+        }
+        System.out.println("RESULT:java_sendfile:OK");
+    }
+}
+"#,
+        );
+        let fake_dir = create_fake_copilot(&project, "exec java KafkaTransfer.java\n");
+        let (stdout, stderr, success) = run_cplt(
+            &project,
+            &fake_dir,
+            &["--allow-localhost-any", "--no-proxy"],
+        );
+        assert!(success, "stdout: {stdout}\nstderr: {stderr}");
+        assert_result_ok(&stdout, &stderr, "java_sendfile");
+    }
+
     /// Java/Maven env vars pass through the sandbox: MAVEN_OPTS,
     /// JAVA_TOOL_OPTIONS, JAVA_HOME are on the allowlist. CLASSPATH is not.
     #[test]
@@ -5524,6 +5589,9 @@ if echo y > "{root_s}/g" 2>/dev/null; then echo RESULT:write:OK; else echo RESUL
         project.write_file(".cplt.toml", "[propose]\n");
         project.write_file(".github/hooks/pre.sh", "echo hook\n");
         project.git_init();
+        // Local state must neither disable bootstrap nor enter the checkout.
+        project.write_file(".claude/settings.local.json", "{}\n");
+        project.write_file("node_modules/dependency/.claude/settings.json", "{}\n");
         let home = short_home("wt-broker-home");
         let (root, _) = managed_paths(&project, home.path());
         let bin = crate::common::binary_path().display().to_string();
@@ -5532,6 +5600,7 @@ if echo y > "{root_s}/g" 2>/dev/null; then echo RESULT:write:OK; else echo RESUL
 out=$("{bin}" worktree add wt1 HEAD 2>"$TMPDIR/err1"); echo "RESULT:add:$?"
 test "$out" = "$CPLT_WORKTREE_ROOT/wt1" && echo RESULT:path:OK
 test -f "$CPLT_WORKTREE_ROOT/wt1/f.txt" && test -f "$CPLT_WORKTREE_ROOT/wt1/.cplt.toml" && test -f "$CPLT_WORKTREE_ROOT/wt1/.github/hooks/pre.sh" && echo RESULT:complete:OK
+test ! -e "$CPLT_WORKTREE_ROOT/wt1/.claude/settings.local.json" && test ! -e "$CPLT_WORKTREE_ROOT/wt1/node_modules" && echo RESULT:tracked-only:OK
 git -C "$CPLT_WORKTREE_ROOT/wt1" status --porcelain > "$TMPDIR/broker-status" && test ! -s "$TMPDIR/broker-status" && echo RESULT:clean:OK
 git -C "$CPLT_WORKTREE_ROOT/wt1" switch -c broker-feature && echo RESULT:branch:OK
 if printf 'gitdir: /tmp\n' > "$CPLT_WORKTREE_ROOT/wt1/.git"; then echo RESULT:pointer:WRITABLE; else echo RESULT:pointer:denied; fi
@@ -5559,6 +5628,7 @@ test -e "$CPLT_WORKTREE_ROOT/../evil" || echo RESULT:nothing-escaped:OK
         for ok in [
             "path:OK",
             "complete:OK",
+            "tracked-only:OK",
             "clean:OK",
             "branch:OK",
             "pointer:denied",

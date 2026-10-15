@@ -1972,7 +1972,7 @@ pub fn precompute(policy: LandlockPolicy) -> Result<PrecomputedSandbox, String> 
     // pre-create user --allow-write paths, socket paths, or arbitrary writable
     // rules — those require the user to set up the filesystem themselves.
     for path in &policy.precreate_dirs {
-        if !path.exists() {
+        if std::fs::symlink_metadata(path).is_err() {
             let _ = std::fs::create_dir_all(path);
         }
     }

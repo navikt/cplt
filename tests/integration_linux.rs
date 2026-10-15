@@ -1535,7 +1535,7 @@ except OSError as e:
     /// uniquely named dotfile there is reliably ungranted on any host.
     struct OutsideSocket {
         path: PathBuf,
-        _listener: std::os::unix::net::UnixListener,
+        listener: std::os::unix::net::UnixListener,
     }
 
     impl OutsideSocket {
@@ -1547,10 +1547,7 @@ except OSError as e:
             let _ = fs::remove_file(&path);
             let listener =
                 std::os::unix::net::UnixListener::bind(&path).expect("bind UNIX socket in $HOME");
-            Self {
-                path,
-                _listener: listener,
-            }
+            Self { path, listener }
         }
     }
 
@@ -1613,6 +1610,86 @@ except OSError as e:
                  not gated by anything; if this now fails the sandbox got stronger \
                  and the docs are stale.\nstdout: {stdout}\nstderr: {stderr}"
             );
+        }
+    }
+
+    /// A file deny is not a Secret Service boundary: below ABI v9 an agent
+    /// can still send bytes to a denied pathname socket beside that tree.
+    #[test]
+    fn keyring_file_deny_does_not_imply_a_unix_socket_boundary() {
+        use std::io::Read;
+
+        require_landlock!();
+        let fixture = tempdir_outside_tmp();
+        let home = fixture.path().join("home");
+        let keyring = home.join(".local/share/keyrings");
+        fs::create_dir_all(&keyring).unwrap();
+        fs::write(keyring.join("login.keyring"), "fixture-keyring").unwrap();
+        let sock = OutsideSocket::bind_at(home.join("bus"));
+        sock.listener.set_nonblocking(true).unwrap();
+        let project = create_test_project();
+        let script = r"import socket
+from pathlib import Path
+try:
+    Path.home().joinpath('.local/share/keyrings/login.keyring').read_bytes()
+except PermissionError:
+    print('KEYRING_FILE_DENIED')
+else:
+    raise AssertionError('keyring file was readable')
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(3)
+try:
+    s.connect(str(Path.home() / 'bus'))
+except PermissionError:
+    print('SOCKET_DENIED')
+else:
+    s.sendall(b'fixture-request')
+    print('SOCKET_SENT')
+";
+        let out = cplt_cmd()
+            .env_clear()
+            .env("CPLT_CONFIG", crate::common::NO_CONFIG)
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .args([
+                "--agent",
+                "shell",
+                "--yes",
+                "--quiet",
+                "--no-proxy",
+                "--no-bubblewrap",
+                "--no-gh-guard",
+                "--no-git-guard",
+                "--no-audit",
+                "--project-dir",
+            ])
+            .arg(project.path())
+            .arg("--deny-path")
+            .arg(&keyring)
+            .arg("--deny-path")
+            .arg(&sock.path)
+            .args(["--", "-c", "exec python3 -c \"$1\"", "fixture", script])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stdout}\n{stderr}");
+        assert!(stdout.contains("KEYRING_FILE_DENIED"), "{stdout}");
+        if landlock_abi_version().is_some_and(|v| v >= 9) {
+            assert!(stdout.contains("SOCKET_DENIED"), "{stdout}");
+            assert_eq!(
+                sock.listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        } else {
+            assert!(stdout.contains("SOCKET_SENT"), "{stdout}");
+            let (mut stream, _) = sock.listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
+            let mut request = String::new();
+            stream.read_to_string(&mut request).unwrap();
+            assert_eq!(request, "fixture-request");
         }
     }
 
@@ -4156,6 +4233,37 @@ print('CONNECTED')
                 assert!(Instant::now() < deadline, "host service did not register");
                 std::thread::sleep(Duration::from_millis(200));
             }
+            // v2 registers before bootstrapping the shared database. Starting
+            // both services then can race CREATE TABLE in a fresh database.
+            loop {
+                let health = Command::new("/usr/bin/curl")
+                    .args([
+                        "--noproxy",
+                        "*",
+                        "--silent",
+                        "--max-time",
+                        "1",
+                        "--output",
+                        "/dev/null",
+                        "--write-out",
+                        "%{http_code}",
+                        "--user",
+                        "opencode:HOSTPW",
+                        "http://127.0.0.1:49374/api/info",
+                    ])
+                    .output()
+                    .unwrap();
+                let status = String::from_utf8_lossy(&health.stdout);
+                if health.status.success() && status == "200" {
+                    break;
+                }
+                assert_ne!(status, "500", "host service boot failed");
+                assert!(
+                    Instant::now() < deadline,
+                    "host service not ready: {status}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
             let host_pid = host.0.id();
 
             let script = format!(
@@ -4181,7 +4289,27 @@ print('CONNECTED')
                 .output()
                 .unwrap();
             let out = String::from_utf8_lossy(&o.stdout);
-            let all = format!("{out}\n{}", String::from_utf8_lossy(&o.stderr));
+            let mut all = format!("{out}\n{}", String::from_utf8_lossy(&o.stderr));
+            if !out.contains("API-OK") {
+                let log = home.h.join(".local/share/opencode/log/opencode.log");
+                match cplt::untrusted::read_untrusted(&log, 256 * 1024) {
+                    Ok(Some(log)) => {
+                        for line in log.lines().filter(|line| line.contains("level=ERROR")) {
+                            all.push_str("\nOpenCode boot log: ");
+                            all.push_str(
+                                &line.replace(&home.h.display().to_string(), "<fixture-home>"),
+                            );
+                        }
+                    }
+                    Ok(None) => {
+                        all.push_str("\nOpenCode boot log refused: not a bounded regular file");
+                    }
+                    Err(error) => {
+                        all.push_str("\nOpenCode boot log unavailable: ");
+                        all.push_str(&error.to_string());
+                    }
+                }
+            }
             assert!(o.status.success(), "{all}");
             // 6: neither host file is readable, its password never shows.
             assert!(!out.contains("READ "), "{all}");

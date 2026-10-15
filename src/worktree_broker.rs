@@ -154,8 +154,10 @@ impl Context {
         let sha =
             commit_id(&out).map_err(|_| "cannot snapshot launch HEAD: it must name a commit")?;
         let cmd = pinned_common_command(&ctx, &["ls-tree", "-r", "-z", "--full-tree", &sha])?;
-        ctx.protected = protected_tree(run_bounded(cmd, &budget)?, &budget)?;
-        verify_protected_names(project, &ctx.protected, &budget)?;
+        let out = run_bounded(cmd, &budget)?;
+        let tracked = tracked_paths(&out)?;
+        ctx.protected = protected_tree(out, &budget)?;
+        verify_protected_names(project, &ctx.protected, Some(&tracked), &budget)?;
         verify_launch_bytes(&ctx, project, &budget)?;
         Ok(ctx)
     }
@@ -380,7 +382,7 @@ fn add_with_budget(
     let private = staging.join("git");
     checkout(ctx, &private, &job.worktree, &sha, budget)?;
     validate_tree(&job.worktree, budget)?;
-    verify_protected_names(&job.worktree, &ctx.protected, budget)?;
+    verify_protected_names(&job.worktree, &ctx.protected, None, budget)?;
     verify_protected_checkout(ctx, &private, &job.worktree, budget)?;
     check_identity(&ctx.common, &ctx.common_fd)?;
     budget.check()?;
@@ -611,18 +613,46 @@ fn harden_data_query(ctx: &Context, cmd: &mut Command) {
 
 type ProtectedTree = BTreeMap<Vec<u8>, (Vec<u8>, Vec<u8>)>;
 
+/// Launch inspection projects HEAD onto disk. Ignored/local files are neither
+/// trusted nor published, so they must not disable this tracked-only baseline.
+fn tracked_paths(out: &Output) -> Result<std::collections::BTreeSet<Vec<u8>>, String> {
+    let mut paths = std::collections::BTreeSet::new();
+    for entry in out.stdout.split(|b| *b == 0).filter(|e| !e.is_empty()) {
+        let tab = entry
+            .iter()
+            .position(|b| *b == b'\t')
+            .ok_or("invalid git tree entry")?;
+        let mut path = &entry[tab + 1..];
+        loop {
+            paths.insert(path.to_vec());
+            let Some(slash) = path.iter().rposition(|b| *b == b'/') else {
+                break;
+            };
+            path = &path[..slash];
+        }
+    }
+    Ok(paths)
+}
+
 /// Ask the filesystem which entry each protected spelling names. APFS aliases
 /// (including long s and Kelvin sign) are not Unicode lowercase mappings.
 /// Never follow a symlink while resolving a protected name or its ancestors.
 fn verify_protected_names(
     root: &Path,
     expected: &ProtectedTree,
+    tracked: Option<&std::collections::BTreeSet<Vec<u8>>>,
     budget: &Budget<'_>,
 ) -> Result<(), String> {
     use std::os::unix::ffi::OsStrExt;
     let mut found = std::collections::BTreeSet::new();
     let mut stack = vec![root.to_path_buf()];
     let mut count = 0;
+    let included = |path: &Path| {
+        tracked.is_none_or(|paths| {
+            path.strip_prefix(root)
+                .is_ok_and(|rel| paths.contains(rel.as_os_str().as_bytes()))
+        })
+    };
     while let Some(dir) = stack.pop() {
         budget.check()?;
         for protected in crate::sandbox::PROTECTED_IN_ROOT {
@@ -657,6 +687,10 @@ fn verify_protected_names(
                     }
                 }
                 let entry = matching.ok_or("cannot identify protected filesystem entry")?;
+                if !included(&entry) {
+                    present = false;
+                    break;
+                }
                 if metadata.file_type().is_symlink() {
                     return Err("protected filesystem path has a symlink; prepare the worktree outside cplt".into());
                 }
@@ -687,11 +721,12 @@ fn verify_protected_names(
                     for entry in
                         std::fs::read_dir(path).map_err(|_| "cannot list protected tree")?
                     {
-                        pending.push(
-                            entry
-                                .map_err(|_| "cannot read protected tree entry")?
-                                .path(),
-                        );
+                        let path = entry
+                            .map_err(|_| "cannot read protected tree entry")?
+                            .path();
+                        if included(&path) {
+                            pending.push(path);
+                        }
                     }
                 } else {
                     let rel = path
@@ -709,11 +744,14 @@ fn verify_protected_names(
         }
         for entry in std::fs::read_dir(&dir).map_err(|_| "cannot inspect checkout directories")? {
             budget.check()?;
+            let entry = entry.map_err(|_| "cannot inspect checkout directory entry")?;
+            if !included(&entry.path()) {
+                continue;
+            }
             count += 1;
             if count > MAX_TREE_ENTRIES {
                 return Err("checkout exceeds protected-name scan limit".into());
             }
-            let entry = entry.map_err(|_| "cannot inspect checkout directory entry")?;
             if entry.file_name().as_bytes().eq_ignore_ascii_case(b".git") {
                 continue;
             }
