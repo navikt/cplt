@@ -464,14 +464,18 @@ pub(crate) fn build_bwrap_args(
     // ── Read-only overlays for git-persistence paths (Finding 1) ──
     // Emitted last so they shadow the writable project bind above.
     for path in overlays.read_only {
-        // bwrap errors on a non-existent bind source; a read-only bind also
-        // cannot protect a path that does not yet exist. Skip missing paths
-        // (mirrors the writable-bind handling and keeps the probe from failing).
-        if !path.exists() {
-            continue;
+        if path.exists() {
+            let path_str = path.to_string_lossy().into_owned();
+            args.extend(["--ro-bind".to_string(), path_str.clone(), path_str]);
+        } else if is_missing_gitdir_dir_overlay(path, &bound_writable, &bound_readonly) {
+            let path_str = path.to_string_lossy().into_owned();
+            args.extend([
+                "--tmpfs".to_string(),
+                path_str.clone(),
+                "--remount-ro".to_string(),
+                path_str,
+            ]);
         }
-        let path_str = path.to_string_lossy().into_owned();
-        args.extend(["--ro-bind".to_string(), path_str.clone(), path_str]);
     }
 
     // ── Deny-path masks — emitted last so they shadow every earlier bind ──
@@ -538,13 +542,19 @@ pub(crate) fn build_bwrap_args(
         let p = path.to_string_lossy().into_owned();
         args.extend(["--bind".to_string(), p.clone(), p]);
     }
-    for path in overlays
-        .read_only
-        .iter()
-        .filter(|p| under_rebind(p) && p.exists())
-    {
-        let p = path.to_string_lossy().into_owned();
-        args.extend(["--ro-bind".to_string(), p.clone(), p]);
+    for path in overlays.read_only.iter().filter(|p| under_rebind(p)) {
+        if path.exists() {
+            let p = path.to_string_lossy().into_owned();
+            args.extend(["--ro-bind".to_string(), p.clone(), p]);
+        } else if is_missing_gitdir_dir_overlay(path, &bound_writable, &bound_readonly) {
+            let p = path.to_string_lossy().into_owned();
+            args.extend([
+                "--tmpfs".to_string(),
+                p.clone(),
+                "--remount-ro".to_string(),
+                p,
+            ]);
+        }
     }
     if let Some(placeholder) = &deny_masks.placeholder {
         let ph = placeholder.to_string_lossy().into_owned();
@@ -561,6 +571,56 @@ pub(crate) fn build_bwrap_args(
     }
 
     args
+}
+
+/// Whether `path` is a missing `.git/remotes` or `.git/branches` directory
+/// inside an existing gitdir that is reachable in the namespace (#747).
+///
+/// `git init` has not created `remotes` or `branches` for years, so `--ro-bind`
+/// (which requires the source to exist) left both creatable by the agent on
+/// Linux. Because git requires `remotes/<name>` or `branches/<name>` to be a
+/// file inside a directory, mounting an empty read-only tmpfs at the missing
+/// directory path (`--tmpfs <dir> --remount-ro <dir>`) makes `mkdir` fail with
+/// `EEXIST` and any file creation inside fail with `EROFS`, while git treats
+/// the empty directory identically to an absent one.
+///
+/// Requires:
+/// - `path` is named `remotes` or `branches` and is truly absent on the host
+///   (not a broken symlink, over which bwrap cannot create a directory mount
+///   point).
+/// - Its parent exists on the host as a real directory (not a missing `.git` in
+///   a non-git project or a worktree `.git` pointer file).
+/// - If `path` is under `/tmp`, it is inside a host bind mount (`bound_writable`
+///   or `bound_readonly`) rather than the empty `/tmp` tmpfs where the parent
+///   `.git` directory does not exist.
+fn is_missing_gitdir_dir_overlay(
+    path: &Path,
+    bound_writable: &[PathBuf],
+    bound_readonly: &[&Path],
+) -> bool {
+    if !matches!(
+        path.file_name().and_then(|n| n.to_str()),
+        Some("remotes" | "branches")
+    ) {
+        return false;
+    }
+    if path.symlink_metadata().is_ok() {
+        return false;
+    }
+    if !path
+        .parent()
+        .and_then(|p| p.symlink_metadata().ok())
+        .is_some_and(|m| m.is_dir())
+    {
+        return false;
+    }
+    if path.starts_with("/tmp")
+        && !bound_writable.iter().any(|w| path.starts_with(w))
+        && !bound_readonly.iter().any(|ro| path.starts_with(ro))
+    {
+        return false;
+    }
+    true
 }
 
 /// Mount masks for the user's deny paths (`--deny-path` / `deny.paths`).
@@ -3308,5 +3368,52 @@ mod tests {
             "the deny must come after the re-bind: {args:?}"
         );
         assert!(last("--ro-bind", &ro) > rebind, "{args:?}");
+    }
+
+    /// #747: missing `.git/remotes` and `.git/branches` inside a bound git
+    /// repository are synthesized as read-only tmpfs mounts (`--tmpfs <dir>
+    /// --remount-ro <dir>`), including after a re-bind, while missing plain
+    /// files (`.git/packed-refs`) or paths outside any bound tree are skipped.
+    #[test]
+    fn missing_gitdir_dir_overlays_get_readonly_tmpfs_when_under_bound_tree() {
+        let base = non_tmp_tempdir();
+        let repo = base.path().canonicalize().unwrap().join("repo");
+        let git = repo.join(".git");
+        std::fs::create_dir_all(git.join("hooks")).unwrap();
+
+        let overlays_vec = git_persistence_paths(&[repo.as_path()], &[]);
+        let remotes = git.join("remotes");
+        let branches = git.join("branches");
+        let packed_refs = git.join("packed-refs");
+        assert!(overlays_vec.contains(&remotes));
+        assert!(overlays_vec.contains(&branches));
+        assert!(overlays_vec.contains(&packed_refs));
+
+        let rules = [writable_rule(&repo.to_string_lossy())];
+        let overlays = Overlays {
+            read_only: &overlays_vec,
+            pins: &[],
+        };
+        let args = build_bwrap_args(&rules, overlays, &DenyMasks::default());
+        let s = |p: &Path| p.to_string_lossy().into_owned();
+        for dir in [&remotes, &branches] {
+            let d = s(dir);
+            assert!(
+                args.windows(4)
+                    .any(|w| w == ["--tmpfs", &d, "--remount-ro", &d]),
+                "missing {} must get --tmpfs + --remount-ro: {args:?}",
+                dir.display()
+            );
+        }
+        assert!(
+            !args.iter().any(|a| a == &s(&packed_refs)),
+            "missing plain file .git/packed-refs must stay skipped: {args:?}"
+        );
+
+        let unbound = build_bwrap_args(&[], overlays, &DenyMasks::default());
+        assert!(
+            !unbound.iter().any(|a| a == &s(&remotes)),
+            "missing .git/remotes outside any bound tree must not be mounted: {unbound:?}"
+        );
     }
 }

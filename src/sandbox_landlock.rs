@@ -1992,6 +1992,53 @@ pub fn precompute(policy: LandlockPolicy) -> Result<PrecomputedSandbox, String> 
     })
 }
 
+/// Raise the soft open-file limit (`RLIMIT_NOFILE`) toward `rlim_max` when the
+/// current soft limit cannot hold `rule_count` pre-opened `O_PATH` descriptors
+/// plus headroom for the process's other descriptors (#590).
+///
+/// Linux still defaults `rlim_cur` to 1024 while `rlim_max` is typically
+/// 524288 or 1048576. Without this, ~1000 filesystem rules exhaust the soft
+/// limit in `open_fs_rules`. If `rlim_max` itself is too low, the `EMFILE` /
+/// `ENFILE` check in `open_fs_rules` fails closed with an actionable message.
+#[cfg(target_os = "linux")]
+fn ensure_nofile_headroom(rule_count: usize) {
+    const HEADROOM: libc::rlim_t = 256;
+    let needed = (rule_count as libc::rlim_t).saturating_add(HEADROOM);
+    let mut rlim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `rlim` is a valid writable `libc::rlimit`.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) } != 0 {
+        return;
+    }
+    if rlim.rlim_cur >= needed || rlim.rlim_cur >= rlim.rlim_max {
+        return;
+    }
+    let target = if rlim.rlim_max == libc::RLIM_INFINITY {
+        needed
+    } else {
+        needed.min(rlim.rlim_max)
+    };
+    if target > rlim.rlim_cur {
+        rlim.rlim_cur = target;
+        // SAFETY: `rlim` holds `rlim_cur <= rlim_max`.
+        unsafe {
+            libc::setrlimit(libc::RLIMIT_NOFILE, &rlim);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn close_pre_opened_fds(fds: &mut Vec<(RawFd, FsAccess)>) {
+    for (fd, _) in fds.drain(..) {
+        // SAFETY: each `fd` in `fds` was opened by `open_fs_rules` and is owned here.
+        unsafe {
+            libc::close(fd);
+        }
+    }
+}
+
 /// The descriptors and deferred paths [`PrecomputedSandbox`] holds for
 /// `policy.fs_rules`.
 #[cfg(target_os = "linux")]
@@ -2009,6 +2056,8 @@ fn open_fs_rules(
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
+    ensure_nofile_headroom(policy.fs_rules.len());
+
     // Pre-open all filesystem paths in the parent process.
     // This avoids CString allocation and open() calls in pre_exec.
     // Paths under /proc/self are magic symlinks that resolve to /proc/<pid> —
@@ -2017,8 +2066,10 @@ fn open_fs_rules(
     let mut deferred_paths = Vec::new();
     let mut deferred_plain_file = None;
     for (i, rule) in policy.fs_rules.iter().enumerate() {
-        let c_path = CString::new(rule.path.as_os_str().as_bytes())
-            .map_err(|_| format!("Path contains null byte: {}", rule.path.display()))?;
+        let Ok(c_path) = CString::new(rule.path.as_os_str().as_bytes()) else {
+            close_pre_opened_fds(&mut pre_opened_fds);
+            return Err(format!("Path contains null byte: {}", rule.path.display()));
+        };
         if policy.plain_file == Some(i) {
             deferred_plain_file = Some((c_path, rule.access));
             continue;
@@ -2031,10 +2082,21 @@ fn open_fs_rules(
             match open_nofollow_rule(&rule.path) {
                 Ok(Some(fd)) => std::os::fd::IntoRawFd::into_raw_fd(fd),
                 Ok(None) => continue,
-                Err(e) => return Err(nofollow_refusal(&rule.path, &e)),
+                Err(e) => {
+                    close_pre_opened_fds(&mut pre_opened_fds);
+                    return Err(nofollow_refusal(&rule.path, &e));
+                }
             }
         } else {
-            unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) }
+            let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+            if fd < 0 {
+                let err = std::io::Error::last_os_error();
+                if matches!(err.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) {
+                    close_pre_opened_fds(&mut pre_opened_fds);
+                    return Err(nofollow_refusal(&rule.path, &err));
+                }
+            }
+            fd
         };
         if fd >= 0 {
             pre_opened_fds.push((fd, rule.access));
@@ -2498,16 +2560,32 @@ pub(crate) fn apply_landlock_and_seccomp_now(
                 }
             }
         } else {
-            unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) }
+            let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+            if fd < 0 {
+                let err = std::io::Error::last_os_error();
+                if matches!(err.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) {
+                    return Err(std::io::Error::other(NofollowRefused(nofollow_refusal(
+                        &rule.path, &err,
+                    ))));
+                }
+            }
+            fd
         };
         if raw_fd < 0 {
             // Path not present inside the namespace — skip, mirroring precompute().
             continue;
         }
         let path_beneath_rule = create_path_beneath_rule(&raw_fd, &rule.access);
-        created = created
+        let add_res = created
             .add_rule(path_beneath_rule)
-            .map_err(std::io::Error::other)?;
+            .map_err(std::io::Error::other);
+        // SAFETY: `raw_fd` was opened for this iteration only; Landlock copied the
+        // kernel object reference in `add_rule`, so closing it now keeps at most
+        // one rule descriptor open at a time inside the namespace (#590).
+        unsafe {
+            libc::close(raw_fd);
+        }
+        created = add_res?;
     }
 
     if restrict_net_connect {
@@ -2555,9 +2633,17 @@ pub(crate) fn open_nofollow_rule(path: &Path) -> std::io::Result<Option<std::os:
 }
 
 /// The launch-stopping message for a [`FsRule::nofollow`] rule that could not
-/// be opened safely.
-#[cfg(target_os = "linux")]
+/// be opened safely (or any rule that hit `EMFILE`/`ENFILE`, #590).
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn nofollow_refusal(path: &Path, e: &std::io::Error) -> String {
+    if matches!(e.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) {
+        return format!(
+            "Refusing to grant {}: the open-file limit (RLIMIT_NOFILE / `ulimit -n`) was \
+             reached while opening Landlock rule descriptors ({e}). Raise `ulimit -n` or \
+             reduce the number of filesystem grants.",
+            path.display()
+        );
+    }
     let why = match e.raw_os_error() {
         Some(libc::ELOOP) => "a symlink appeared in its path after cplt checked it".to_string(),
         // Older Docker seccomp profiles answer an unknown syscall with EPERM.
@@ -6252,5 +6338,19 @@ mod tests {
         let mut plain = Some(rules.len() - 1);
         hide_files(&mut rules, &mut plain, &hidden).unwrap();
         assert_eq!(rules[plain.unwrap()].path, agents);
+    }
+
+    /// #590: `nofollow_refusal` explains open-file limit exhaustion (`EMFILE` /
+    /// `ENFILE`) with an actionable `ulimit -n` hint instead of falling through
+    /// to the generic error string.
+    #[test]
+    fn nofollow_refusal_reports_emfile_and_enfile_with_open_file_limit_hint() {
+        let path = Path::new("/tmp/some-rule");
+        for errno in [libc::EMFILE, libc::ENFILE] {
+            let err = std::io::Error::from_raw_os_error(errno);
+            let msg = nofollow_refusal(path, &err);
+            assert!(msg.contains("open-file limit"), "got: {msg}");
+            assert!(msg.contains("ulimit -n"), "got: {msg}");
+        }
     }
 }

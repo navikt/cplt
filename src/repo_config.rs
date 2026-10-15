@@ -260,6 +260,7 @@ const RESERVED_DENY_ENV: &[&str] = &[
     "HTTPS_PROXY",
     "http_proxy",
     "https_proxy",
+    "grpc_proxy",
     "NO_PROXY",
     "no_proxy",
     "SSL_CERT_FILE",
@@ -1335,7 +1336,13 @@ preset = \"full-trust\"\n",
     /// on Linux too, which is what made it worth refusing rather than noting.
     #[test]
     fn deny_env_may_not_name_cplts_own_variables() {
-        for name in ["PATH", "HOME", "HTTPS_PROXY", "__CPLT_TRUST_LOCKED"] {
+        for name in [
+            "PATH",
+            "HOME",
+            "HTTPS_PROXY",
+            "grpc_proxy",
+            "__CPLT_TRUST_LOCKED",
+        ] {
             let cfg = parse_repo_config(&format!("[deny]\nenv = [\"{name}\"]\n")).expect("parses");
             let err = validate_repo_config(&cfg).expect_err("must be refused");
             assert!(err.contains(name), "the error must name it: {err}");

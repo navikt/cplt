@@ -88,18 +88,7 @@ pub fn generate_profile_with_playwright_socket_dir(
     let mut sb = String::with_capacity(4096);
     let home = config.home_dir.to_string_lossy();
     let project = config.project_dir.to_string_lossy();
-    // The project directory plus every `--repo-dir` root: the trees that get a
-    // project-grade grant, and therefore the trees every per-root deny table
-    // has to cover. Order puts the project first so the profile reads the way
-    // it did before named roots existed.
-    let project_roots: Vec<String> = std::iter::once(project.clone().into_owned())
-        .chain(
-            config
-                .named_roots
-                .iter()
-                .map(|r| r.to_string_lossy().into_owned()),
-        )
-        .collect();
+    let project_roots = project_roots(config);
 
     // Detect Chromium browser runtime: the user has opted in to executing
     // Playwright's Chromium binaries from ~/Library/Caches/ via allow_cache_exec.
@@ -433,9 +422,39 @@ fn emit_project_access(sb: &mut String, roots: &[String]) {
 /// covered by `emit_nested_gitdir_denies` instead (#247), which is a regex and
 /// therefore macOS only: on Linux that gap stays open outside bubblewrap, the
 /// same limitation already documented for the root case.
+/// The project directory plus every `--repo-dir` root: the trees that get a
+/// project-grade grant, and therefore the trees every per-root deny table
+/// has to cover. Order puts the project first so the profile reads the way
+/// it did before named roots existed.
+fn project_roots(config: &SandboxConfig) -> Vec<String> {
+    std::iter::once(config.project_dir.to_string_lossy().into_owned())
+        .chain(
+            config
+                .named_roots
+                .iter()
+                .map(|r| r.to_string_lossy().into_owned()),
+        )
+        .collect()
+}
+
 fn writable_roots(project_roots: &[String], extra_write: &[PathBuf]) -> Vec<String> {
     let mut roots = project_roots.to_vec();
     for p in extra_write {
+        let s = p.to_string_lossy().into_owned();
+        if !roots.contains(&s) {
+            roots.push(s);
+        }
+    }
+    roots
+}
+
+fn key_file_roots(
+    project_roots: &[String],
+    extra_write: &[PathBuf],
+    extra_read: &[PathBuf],
+) -> Vec<String> {
+    let mut roots = writable_roots(project_roots, extra_write);
+    for p in extra_read {
         let s = p.to_string_lossy().into_owned();
         if !roots.contains(&s) {
             roots.push(s);
@@ -562,13 +581,7 @@ fn emit_sensitive_project_denies(
             &[]
         };
         if !key_patterns.is_empty() {
-            let mut key_roots = roots.clone();
-            for p in extra_read {
-                let s = p.to_string_lossy().into_owned();
-                if !key_roots.contains(&s) {
-                    key_roots.push(s);
-                }
-            }
+            let key_roots = key_file_roots(project_roots, extra_write, extra_read);
             for root in &key_roots {
                 // Not refused: the grant is the user's call. But they should
                 // know it takes the CA bundles with it.
@@ -2538,6 +2551,42 @@ fn emit_home_config_write_denies(sb: &mut String, config: &SandboxConfig, home: 
 /// before every deny, so each deny still wins over them.
 pub const V2_GRANTS: &str = ";; OpenCode v2 grants (#710)";
 
+/// Overridable credential files under `$HOME`: [`DENIED_HOME_SUBPATHS`] plus,
+/// when `protect_pnpm_config` is on, the pnpm token files SBPL can name.
+fn overridable_credential_files(home: &Path, protect_pnpm_config: bool) -> Vec<String> {
+    let pnpm_files = if protect_pnpm_config {
+        pnpm_credential_files(home)
+    } else {
+        Vec::new()
+    };
+    DENIED_HOME_SUBPATHS
+        .iter()
+        .map(|f| (*f).to_string())
+        .chain(
+            pnpm_files
+                .into_iter()
+                .filter(|p| validate_sbpl_path(p).is_ok())
+                .map(|p| p.to_string_lossy().into_owned()),
+        )
+        .collect()
+}
+
+/// Overridable credential files that `extra_read` explicitly re-allows.
+fn registry_config_overrides(
+    home: &str,
+    extra_read: &[PathBuf],
+    protect_pnpm_config: bool,
+) -> Vec<String> {
+    let home_path = Path::new(home);
+    overridable_credential_files(home_path, protect_pnpm_config)
+        .into_iter()
+        .filter(|file| {
+            let full_path = resolved(home_path.join(file));
+            extra_read.iter().any(|p| p == &full_path)
+        })
+        .collect()
+}
+
 fn emit_deny_rules(sb: &mut String, config: &SandboxConfig, home: &str) {
     // Sensitive directories — DENY (after allows, so these override)
     //
@@ -2559,20 +2608,11 @@ fn emit_deny_rules(sb: &mut String, config: &SandboxConfig, home: &str) {
     // (the latter overridable with --allow-read, so no warning).
     // `sandbox.protect_pnpm_config` adds pnpm's token files, absolute paths
     // (`$HOME.join` keeps them as they are), overridable like the subpaths.
-    let pnpm_files: Vec<String> = if config.protect_pnpm_config {
-        pnpm_credential_files(config.home_dir)
-            .iter()
-            .filter(|p| validate_sbpl_path(p).is_ok())
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let overridable = overridable_credential_files(config.home_dir, config.protect_pnpm_config);
     let files: Vec<Vec<String>> = DENIED_FILES
         .iter()
         .map(|f| spell(f, true))
-        .chain(DENIED_HOME_SUBPATHS.iter().map(|f| spell(f, false)))
-        .chain(pnpm_files.iter().map(|f| spell(f, false)))
+        .chain(overridable.iter().map(|f| spell(f, false)))
         .collect();
     sbpl!(sb, ";; Sensitive directories — DENIED");
     for p in dirs.iter().flatten() {
@@ -2725,29 +2765,7 @@ fn emit_registry_config_overrides(
     extra_read: &[PathBuf],
     protect_pnpm_config: bool,
 ) {
-    let home_path = Path::new(home);
-    let mut overrides: Vec<String> = Vec::new();
-
-    // `sandbox.protect_pnpm_config`'s token files are absolute; joining one
-    // onto `$HOME` leaves it as it is.
-    let pnpm_files = if protect_pnpm_config {
-        let mut files = pnpm_credential_files(home_path);
-        files.retain(|p| validate_sbpl_path(p).is_ok());
-        files
-    } else {
-        Vec::new()
-    };
-    let candidates = DENIED_HOME_SUBPATHS
-        .iter()
-        .map(|f| (*f).to_string())
-        .chain(pnpm_files.iter().map(|p| p.to_string_lossy().into_owned()));
-    for file in candidates {
-        let full_path = resolved(home_path.join(&file));
-        if extra_read.iter().any(|p| p == &full_path) {
-            overrides.push(file);
-        }
-    }
-
+    let overrides = registry_config_overrides(home, extra_read, protect_pnpm_config);
     if !overrides.is_empty() {
         sbpl!(
             sb,
@@ -2975,6 +2993,19 @@ fn reallow_below_user_denies(
     }
 }
 
+const GPG_SIGNING_SOCKETS: [&str; 2] = ["S.gpg-agent", "S.keyboxd"];
+
+fn gpg_signing_overlapping_deny<'a>(extra_deny: &'a [PathBuf], home: &str) -> Option<&'a PathBuf> {
+    std::iter::once(".gnupg".to_string())
+        .chain(
+            GPG_SIGNING_ALLOW_FILES
+                .iter()
+                .chain(&GPG_SIGNING_SOCKETS)
+                .map(|f| format!(".gnupg/{f}")),
+        )
+        .find_map(|rel| overlapping_home_deny(extra_deny, home, &rel))
+}
+
 /// Allow GPG commit signing when `--allow-gpg-signing` is set.
 ///
 /// Emitted AFTER `emit_deny_rules` (which denies all of `~/.gnupg`).
@@ -3001,16 +3032,7 @@ fn emit_gpg_signing_rules(
     // `extra_deny` is canonical, and each re-allow below also names where its
     // own path resolves, so a real `~/.gnupg` whose `gpg.conf` links into a
     // denied `~/dotfiles` would otherwise reopen the deny.
-    const SOCKETS: [&str; 2] = ["S.gpg-agent", "S.keyboxd"];
-    let deny = std::iter::once(".gnupg".to_string())
-        .chain(
-            GPG_SIGNING_ALLOW_FILES
-                .iter()
-                .chain(&SOCKETS)
-                .map(|f| format!(".gnupg/{f}")),
-        )
-        .find_map(|rel| overlapping_home_deny(extra_deny, home, &rel));
-    if let Some(deny) = deny {
+    if let Some(deny) = gpg_signing_overlapping_deny(extra_deny, home) {
         withhold_reallow(sb, "GPG signing", "~/.gnupg", deny);
         return;
     }
@@ -3027,7 +3049,7 @@ fn emit_gpg_signing_rules(
     // interface, and the Assuan protocol cannot export keys.
     // file-read* is needed for the inode lookup before connect(2).
     // S.keyboxd is needed for GnuPG 2.4+ with keyboxd-managed public keys.
-    for p in SOCKETS.iter().flat_map(|s| at(s)) {
+    for p in GPG_SIGNING_SOCKETS.iter().flat_map(|s| at(s)) {
         sbpl!(sb, "(allow file-read* (literal \"{p}\"))");
         sbpl!(sb, "(allow network-outbound (literal \"{p}\"))");
     }
@@ -3044,6 +3066,225 @@ fn emit_gpg_signing_rules(
         sbpl!(sb, "(deny file-write* (subpath \"{p}\"))");
     }
     sbpl!(sb);
+}
+
+/// The SBPL profile's `file-read*` denies and their subsequent re-allows, built
+/// from the same tables and helper functions as [`generate_profile`] (#649).
+///
+/// `cplt exec` consults this alongside `LandlockPolicy::fs_rules` when deciding
+/// whether Seatbelt can follow every symlink in a PATH command's chain.
+#[derive(Default)]
+pub struct ReadDenies {
+    rules: Vec<ReadRule>,
+    deny_env_and_keys: bool,
+    key_extension_roots: Vec<PathBuf>,
+    dependency_trees: Vec<PathBuf>,
+}
+
+enum ReadRule {
+    DenySubpath(PathBuf),
+    DenyLiteral(PathBuf),
+    AllowSubpath(PathBuf),
+    AllowLiteral(PathBuf),
+}
+
+impl ReadDenies {
+    /// Build the read-deny model from `config`, matching the emission order in
+    /// [`generate_profile_with_playwright_socket_dir`].
+    #[must_use]
+    pub fn from_config(config: &SandboxConfig) -> Self {
+        let home = config.home_dir.to_string_lossy();
+        let mut rules = Vec::new();
+
+        // 1. `emit_deny_rules`
+        for &d in DENIED_DOTFILES {
+            for p in home_spellings(&home, d) {
+                rules.push(ReadRule::DenySubpath(PathBuf::from(p)));
+            }
+        }
+        let overridable = overridable_credential_files(config.home_dir, config.protect_pnpm_config);
+        for f in DENIED_FILES
+            .iter()
+            .copied()
+            .chain(overridable.iter().map(String::as_str))
+        {
+            for p in home_spellings(&home, f) {
+                rules.push(ReadRule::DenyLiteral(PathBuf::from(p)));
+            }
+        }
+        for path in config.extra_deny {
+            rules.push(ReadRule::DenySubpath(path.clone()));
+            if let Ok(canon) = std::fs::canonicalize(path)
+                && canon != *path
+            {
+                rules.push(ReadRule::DenySubpath(canon));
+            }
+        }
+
+        // 2. `emit_registry_config_overrides`
+        for file in registry_config_overrides(&home, config.extra_read, config.protect_pnpm_config)
+        {
+            for p in home_spellings(&home, &file) {
+                rules.push(ReadRule::AllowLiteral(PathBuf::from(p)));
+            }
+        }
+
+        // 3. `emit_denied_dotfile_overrides`
+        for path in config
+            .extra_read
+            .iter()
+            .chain(config.extra_write)
+            .chain(config.extra_exec)
+        {
+            for p in denied_dotfile_override_paths(config.home_dir, path) {
+                rules.push(ReadRule::AllowSubpath(PathBuf::from(p)));
+            }
+        }
+
+        // 4. `emit_gpg_signing_rules`
+        if config.allow_gpg_signing
+            && gpg_signing_overlapping_deny(config.extra_deny, &home).is_none()
+        {
+            let at = |rel: &str| home_spellings(&home, &format!(".gnupg/{rel}"));
+            for p in GPG_SIGNING_ALLOW_FILES
+                .iter()
+                .chain(&GPG_SIGNING_SOCKETS)
+                .flat_map(|f| at(f))
+            {
+                rules.push(ReadRule::AllowLiteral(PathBuf::from(p)));
+            }
+            for p in at("private-keys-v1.d") {
+                rules.push(ReadRule::DenySubpath(PathBuf::from(p)));
+            }
+            for p in at("secring.gpg") {
+                rules.push(ReadRule::DenyLiteral(PathBuf::from(p)));
+            }
+        }
+
+        // 5. `emit_docker_rules`
+        if config.allow_docker
+            && overlapping_home_deny(config.extra_deny, &home, ".docker").is_none()
+        {
+            for p in home_spellings(&home, ".docker") {
+                rules.push(ReadRule::AllowSubpath(PathBuf::from(p)));
+            }
+            for p in home_spellings(&home, ".docker/trust/private") {
+                rules.push(ReadRule::DenySubpath(PathBuf::from(p)));
+            }
+        }
+
+        // 6. `protect_worktree_staging` (emitted at the tail of the profile)
+        if let Some(root) = config.managed_worktree_root
+            && let Some(base) = root.parent()
+        {
+            let base = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
+            rules.push(ReadRule::DenySubpath(base.join(".staging")));
+        }
+
+        // 7. `emit_sensitive_project_denies`
+        let roots = project_roots(config);
+        let key_extension_roots = if !config.allow_env_files && config.deny_key_files_by_extension {
+            key_file_roots(&roots, config.extra_write, config.extra_read)
+                .into_iter()
+                .map(PathBuf::from)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let dependency_trees = if config.allow_env_files {
+            Vec::new()
+        } else {
+            dependency_source_trees(&home, config.existing_home_tool_dirs)
+                .into_iter()
+                .map(PathBuf::from)
+                .filter(|p| validate_sbpl_path(p).is_ok())
+                .collect()
+        };
+
+        Self {
+            rules,
+            deny_env_and_keys: !config.allow_env_files,
+            key_extension_roots,
+            dependency_trees,
+        }
+    }
+
+    /// Construct a `ReadDenies` carrying only explicit `--deny-path` subpaths.
+    #[must_use]
+    pub fn from_deny_paths(deny_paths: &[PathBuf]) -> Self {
+        let mut rules = Vec::new();
+        for path in deny_paths {
+            rules.push(ReadRule::DenySubpath(path.clone()));
+            if let Ok(canon) = std::fs::canonicalize(path)
+                && canon != *path
+            {
+                rules.push(ReadRule::DenySubpath(canon));
+            }
+        }
+        Self {
+            rules,
+            ..Self::default()
+        }
+    }
+
+    /// Whether `path` is denied for `file-read*` by the profile's deny rules.
+    #[must_use]
+    pub fn denies(&self, path: &Path) -> bool {
+        let mut denied = false;
+        for rule in &self.rules {
+            match rule {
+                ReadRule::DenySubpath(p) if path.starts_with(p) => denied = true,
+                ReadRule::DenyLiteral(p) if path == p => denied = true,
+                ReadRule::AllowSubpath(p) if path.starts_with(p) => denied = false,
+                ReadRule::AllowLiteral(p) if path == p => denied = false,
+                _ => {}
+            }
+        }
+        if denied || !self.deny_env_and_keys {
+            return denied;
+        }
+        let env_component = path.components().any(is_env_prefix_component);
+        let exact_sensitive = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(is_exact_sensitive_filename);
+        let ext_sensitive = !self.key_extension_roots.is_empty()
+            && self
+                .key_extension_roots
+                .iter()
+                .any(|r| path != r && path.starts_with(r))
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(has_key_file_extension);
+        if !env_component && !exact_sensitive && !ext_sensitive {
+            return false;
+        }
+        !self.dependency_trees.iter().any(|tree| {
+            let Ok(rest) = path.strip_prefix(tree) else {
+                return false;
+            };
+            if env_component {
+                rest.components().skip(1).any(is_env_prefix_component)
+            } else {
+                rest.components().count() >= 2
+            }
+        })
+    }
+}
+
+fn is_env_prefix_component(c: std::path::Component<'_>) -> bool {
+    matches!(c, std::path::Component::Normal(s) if s.to_str().is_some_and(|s| s.starts_with(".env.")))
+}
+
+fn is_exact_sensitive_filename(name: &str) -> bool {
+    matches!(name, ".env" | ".pem" | ".key" | ".p12" | ".pfx" | ".jks")
+}
+
+fn has_key_file_extension(name: &str) -> bool {
+    [".pem", ".key", ".p12", ".pfx", ".jks"]
+        .iter()
+        .any(|ext| name.ends_with(ext))
 }
 
 /// Docker/Podman daemon socket paths to allow when `--allow-docker` is set.

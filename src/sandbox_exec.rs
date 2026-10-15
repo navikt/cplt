@@ -298,6 +298,16 @@ fn configure_command(
         cmd.env("HTTPS_PROXY", &proxy_url);
         cmd.env("http_proxy", &proxy_url);
         cmd.env("https_proxy", &proxy_url);
+        // gRPC C-core (Python grpcio, Ruby, PHP, C++) dials 127.0.0.1 from a
+        // dual-stack AF_INET6 socket, which reaches Seatbelt as ::ffff:127.0.0.1
+        // and is denied by `localhost:{port}` (#763). Pointing `grpc_proxy`
+        // (which C-core checks ahead of `https_proxy`) at the proxy's `[::1]`
+        // listener keeps the connection on pure IPv6 loopback, which
+        // `localhost:{port}` matches. macOS only: Linux Landlock filters by
+        // port, not address family, and a container with IPv6 disabled has no
+        // `[::1]`.
+        #[cfg(target_os = "macos")]
+        cmd.env("grpc_proxy", format!("http://[::1]:{port}"));
         // Exclude loopback from proxying when localhost access is explicitly enabled:
         //   - macOS: always excluded — Seatbelt enforces localhost at the kernel level.
         //   - Linux: excluded only when the user opened specific localhost ports or

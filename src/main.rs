@@ -5516,11 +5516,12 @@ fn canonical_exec_binary(found: &Path) -> anyhow::Result<PathBuf> {
 /// is that Seatbelt must also be able to read every symlink on the way to
 /// follow it (`file-read-metadata`, per hop: a mise shim is two links,
 /// `shims/go -> /opt/homebrew/bin/mise -> ../Cellar/...`), so the symlink is
-/// used only when the policy grants read on every link in the chain and no
-/// deny path covers any of them. The deny check is separate because `LandlockPolicy`
-/// holds only grants: Seatbelt emits `deny_paths` after the allows and
-/// Bubblewrap masks them, so a link inside a readable tree can still be
-/// unreadable to the child. Otherwise
+/// used only when the policy grants read on every link in the chain and the
+/// profile does not deny reading any of them (#649). The deny check is
+/// separate because `LandlockPolicy` holds only grants: Seatbelt emits its
+/// built-in and `--deny-path` read denies after the allows and Bubblewrap
+/// masks them, so a link inside a readable tree can still be unreadable to the
+/// child. Otherwise
 /// — and whenever the link and its target share a name, so argv[0] is the same
 /// either way — this returns `canonical`, the pre-#640 behaviour.
 ///
@@ -5530,7 +5531,7 @@ fn exec_invocation_path(
     found: &Path,
     canonical: PathBuf,
     policy: &sandbox::LandlockPolicy,
-    deny_paths: &[PathBuf],
+    read_denies: &sandbox::ReadDenies,
 ) -> PathBuf {
     let Some(name) = found.file_name() else {
         return canonical;
@@ -5559,10 +5560,7 @@ fn exec_invocation_path(
             .iter()
             .any(|rule| rule.access.read && hop.starts_with(&rule.path))
             || tool_read_dirs.iter().any(|dir| hop.starts_with(dir)))
-            && !deny_paths.iter().any(|deny| {
-                hop.starts_with(deny)
-                    || std::fs::canonicalize(deny).is_ok_and(|d| hop.starts_with(d))
-            })
+            && !read_denies.denies(hop)
     };
     // Walk the chain one link at a time, each resolved against its own
     // canonical directory. 40 is the kernel's own symlink limit (MAXSYMLINKS).
@@ -5848,6 +5846,7 @@ struct AssemblyOptions<'a> {
 struct AssembledSandbox {
     prepared: sandbox::PreparedSandbox,
     policy: sandbox::LandlockPolicy,
+    read_denies: sandbox::ReadDenies,
     proxy_handle: Option<proxy::ProxyHandle>,
     scratch_guard: Option<scratch::ScratchDir>,
     pnpm_shadow_guard: Option<scratch::PnpmShadowDir>,
@@ -6145,6 +6144,7 @@ fn assemble_sandbox(
     );
 
     let policy = sandbox::generate_policy(&sandbox_config);
+    let read_denies = sandbox::ReadDenies::from_config(&sandbox_config);
     // Here, not at each caller: the launch, `exec` and `check` all build their
     // policy through this function, and all three must say it.
     if proxy_handle.is_some() {
@@ -6176,6 +6176,7 @@ fn assemble_sandbox(
     Ok(AssembledSandbox {
         prepared,
         policy,
+        read_denies,
         proxy_handle,
         scratch_guard,
         pnpm_shadow_guard,
@@ -6466,13 +6467,13 @@ fn run_exec_command(
     let AssembledSandbox {
         mut prepared,
         policy,
+        read_denies,
         proxy_handle,
         scratch_guard,
         pnpm_shadow_guard,
         #[cfg(target_os = "macos")]
             playwright_socket_guard: _playwright_socket_guard,
         worktree_broker,
-        ..
     } = {
         let mut probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
         // `exec` never writes the managed block, so it gets no read on a root
@@ -6533,7 +6534,7 @@ fn run_exec_command(
         // cplt's own file and is run by the path cplt chose for it.
         let bin = match requested_path.as_deref() {
             Some(found) if bin == canonical => {
-                exec_invocation_path(found, bin, &policy, &resolved.deny_paths)
+                exec_invocation_path(found, bin, &policy, &read_denies)
             }
             _ => bin,
         };
@@ -7000,6 +7001,7 @@ fn run_check_command(
         #[cfg(target_os = "macos")]
             playwright_socket_guard: _playwright_socket_guard,
         worktree_broker: _worktree_broker,
+        ..
     } = prepare_shell_sandbox(
         cli,
         &mut resolved,
@@ -12072,13 +12074,24 @@ mod tests {
             plain_file: None,
         };
 
+        let no_denies = sandbox::ReadDenies::default();
         assert_eq!(
-            exec_invocation_path(&found, canonical.clone(), &policy(vec![rule(true)]), &[]),
+            exec_invocation_path(
+                &found,
+                canonical.clone(),
+                &policy(vec![rule(true)]),
+                &no_denies
+            ),
             shims.join("go"),
             "the link keeps the name the binary dispatches on"
         );
         assert_eq!(
-            exec_invocation_path(&found, canonical.clone(), &policy(vec![rule(false)]), &[]),
+            exec_invocation_path(
+                &found,
+                canonical.clone(),
+                &policy(vec![rule(false)]),
+                &no_denies
+            ),
             canonical,
             "a link the sandbox cannot read would fail to exec: keep the target"
         );
@@ -12088,7 +12101,7 @@ mod tests {
                 &same_name,
                 canonical.clone(),
                 &policy(vec![rule(true)]),
-                &[]
+                &no_denies
             ),
             canonical,
             "same name either way: nothing to preserve, keep the target"
@@ -12098,7 +12111,7 @@ mod tests {
                 &found,
                 canonical.clone(),
                 &policy(vec![rule(true)]),
-                std::slice::from_ref(&shims)
+                &sandbox::ReadDenies::from_deny_paths(std::slice::from_ref(&shims))
             ),
             canonical,
             "a deny path over the link wins over the read grant around it"
@@ -12114,7 +12127,12 @@ mod tests {
         let two_hop = shims.join("go2");
         assert_eq!(canonical_exec_binary(&two_hop).unwrap(), multicall);
         assert_eq!(
-            exec_invocation_path(&two_hop, canonical.clone(), &policy(vec![rule(true)]), &[]),
+            exec_invocation_path(
+                &two_hop,
+                canonical.clone(),
+                &policy(vec![rule(true)]),
+                &no_denies
+            ),
             two_hop,
             "every hop readable: run through the first link"
         );
@@ -12123,10 +12141,180 @@ mod tests {
                 &two_hop,
                 canonical.clone(),
                 &policy(vec![rule(true)]),
-                std::slice::from_ref(&hop_dir)
+                &sandbox::ReadDenies::from_deny_paths(std::slice::from_ref(&hop_dir))
             ),
             canonical,
             "a denied middle hop makes the whole chain unfollowable"
+        );
+    }
+
+    #[test]
+    fn exec_invocation_path_respects_built_in_read_denies() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let home = root.join("home");
+        let project = home.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let multicall = root.join("multicall");
+        std::fs::write(&multicall, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&multicall, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let policy = sandbox::LandlockPolicy {
+            fs_rules: vec![sandbox::FsRule {
+                nofollow: false,
+                path: root.clone(),
+                access: sandbox::FsAccess {
+                    read: true,
+                    execute: true,
+                    ..Default::default()
+                },
+            }],
+            net_rules: Vec::new(),
+            restrict_net_connect: true,
+            proxy_forced: false,
+            home_dir: home.clone(),
+            precreate_dirs: vec![],
+            plain_file: None,
+        };
+
+        // 1. Link inside a built-in denied credential directory (~/.aws/bin/go).
+        let aws_bin = home.join(".aws/bin");
+        std::fs::create_dir_all(&aws_bin).unwrap();
+        let aws_link = aws_bin.join("go");
+        std::os::unix::fs::symlink(&multicall, &aws_link).unwrap();
+
+        // 2. Link inside the real target of a symlinked credential directory (~/.kube -> real-kube).
+        let real_kube = home.join("real-kube");
+        std::fs::create_dir_all(&real_kube).unwrap();
+        std::os::unix::fs::symlink(&real_kube, home.join(".kube")).unwrap();
+        let kube_link = real_kube.join("kubectl");
+        std::os::unix::fs::symlink(&multicall, &kube_link).unwrap();
+
+        // 3. Link named .env / .env.local inside the readable project tree.
+        let env_link = project.join(".env");
+        let env_local_link = project.join(".env.local");
+        std::os::unix::fs::symlink(&multicall, &env_link).unwrap();
+        std::os::unix::fs::symlink(&multicall, &env_local_link).unwrap();
+
+        // 4. Link with a key-file extension / .env inside the project vs inside a dependency source tree (~/.cargo/registry).
+        let pem_link = project.join("tool.pem");
+        let cargo_reg = home.join(".cargo/registry");
+        let cargo_pkg = cargo_reg.join("src/pkg");
+        std::fs::create_dir_all(&cargo_pkg).unwrap();
+        let dep_pem_link = cargo_pkg.join("tool.pem");
+        let dep_env_link = cargo_pkg.join(".env");
+        std::os::unix::fs::symlink(&multicall, &pem_link).unwrap();
+        std::os::unix::fs::symlink(&multicall, &dep_pem_link).unwrap();
+        std::os::unix::fs::symlink(&multicall, &dep_env_link).unwrap();
+
+        let base_extra_read = vec![cargo_reg];
+        let base_cfg = sandbox::SandboxConfig {
+            project_dir: &project,
+            named_roots: &[],
+            named_root_git_dirs: &[],
+            managed_worktree_root: None,
+            worktree_socket: None,
+            home_dir: &home,
+            extra_read: &base_extra_read,
+            extra_write: &[],
+            extra_exec: &[],
+            extra_socket: &[],
+            extra_deny: &[],
+            existing_home_tool_dirs: None,
+            existing_app_dirs: None,
+            extra_ports: &[],
+            localhost_ports: &[],
+            proxy_port: None,
+            proxy_forced: false,
+            allow_env_files: false,
+            allow_localhost_any: false,
+            scratch_dir: None,
+            playwright_socket_dir: None,
+            allow_tmp_exec: false,
+            copilot_install_dir: None,
+            copilot_cache_env: &sandbox::no_cache_env,
+            java_home: None,
+            dotnet_root: None,
+            git_hooks_path: None,
+            git_common_dir: None,
+            root_agents_md: None,
+            allow_gpg_signing: false,
+            deny_clipboard: false,
+            deny_nested_git: false,
+            refuse_cache_exec_links: false,
+            deny_key_files_by_extension: true,
+            protect_pnpm_config: false,
+            deny_copilot_dir_exec: false,
+            allow_jvm_attach: false,
+            allow_msbuild: false,
+            allow_docker: false,
+            electron_app_dir: None,
+            agent: agent::Agent::Copilot,
+            agent_dirs: &[],
+            allow_cache_exec: &[],
+            allow_cache_exec_any: false,
+            allow_browser: false,
+            keychain_substitute: None,
+            use_bubblewrap: None,
+        };
+        let denies = sandbox::ReadDenies::from_config(&base_cfg);
+
+        assert_eq!(
+            exec_invocation_path(&aws_link, multicall.clone(), &policy, &denies),
+            multicall,
+            "a symlink inside ~/.aws is denied by Seatbelt even under a broad read grant"
+        );
+        assert_eq!(
+            exec_invocation_path(&kube_link, multicall.clone(), &policy, &denies),
+            multicall,
+            "a symlink inside the canonical target of ~/.kube is denied too"
+        );
+        assert_eq!(
+            exec_invocation_path(&env_link, multicall.clone(), &policy, &denies),
+            multicall,
+            ".env is denied by the profile's regex rule"
+        );
+        assert_eq!(
+            exec_invocation_path(&env_local_link, multicall.clone(), &policy, &denies),
+            multicall,
+            ".env.* is denied by the profile's regex rule"
+        );
+        assert_eq!(
+            exec_invocation_path(&pem_link, multicall.clone(), &policy, &denies),
+            multicall,
+            "a *.pem link in the project root is denied when deny_key_files_by_extension is on"
+        );
+        assert_eq!(
+            exec_invocation_path(&dep_pem_link, multicall.clone(), &policy, &denies),
+            dep_pem_link,
+            "dependency source trees (~/.cargo/registry) are carved out of the key-file extension deny"
+        );
+        assert_eq!(
+            exec_invocation_path(&dep_env_link, multicall.clone(), &policy, &denies),
+            dep_env_link,
+            "dependency source trees (~/.cargo/registry) are carved out of the .env deny"
+        );
+
+        // With allow_env_files and --allow-read ~/.aws/bin, those links become followable.
+        let extra_read = vec![aws_bin.clone()];
+        let override_cfg = sandbox::SandboxConfig {
+            extra_read: &extra_read,
+            allow_env_files: true,
+            ..base_cfg
+        };
+        let override_denies = sandbox::ReadDenies::from_config(&override_cfg);
+        assert_eq!(
+            exec_invocation_path(&aws_link, multicall.clone(), &policy, &override_denies),
+            aws_link,
+            "--allow-read ~/.aws/bin suppresses the ~/.aws deny for that subpath"
+        );
+        assert_eq!(
+            exec_invocation_path(&env_link, multicall.clone(), &policy, &override_denies),
+            env_link,
+            "--allow-env-files suppresses the .env deny"
         );
     }
 

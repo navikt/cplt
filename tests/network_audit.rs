@@ -359,4 +359,42 @@ mod tests {
         assert!(stderr.contains(&format!("{RECORDED} 0.")), "{stderr}");
         assert!(stderr.contains("does not prove"), "{stderr}");
     }
+
+    /// #763: the proxy listens on `[::1]:<port>` alongside `127.0.0.1:<port>`,
+    /// and on macOS `grpc_proxy` is injected pointing at `http://[::1]:<port>`
+    /// so gRPC C-core connects over pure IPv6 loopback (`::1`), which Seatbelt's
+    /// `localhost:<port>` rule allows.
+    #[test]
+    fn ipv6_loopback_proxy_listener_and_grpc_proxy_reach_origin() {
+        let project = project();
+        let origin = Origin::start();
+        let proxy_var = if cfg!(target_os = "macos") {
+            "$grpc_proxy"
+        } else {
+            "http://[::1]:${HTTPS_PROXY##*:}"
+        };
+        let script = format!(
+            "case \"{proxy_var}\" in http://\\[::1\\]:*) ;; *) printf 'bad proxy: %s\\n' \"{proxy_var}\" >&2; exit 91 ;; esac; \
+             /usr/bin/curl -g --silent --show-error --max-time 5 --proxytunnel --proxy \"{proxy_var}\" --noproxy '' http://127.0.0.1:{}/; \
+             printf 'command-stdout\\n'; exit 37",
+            origin.address.port()
+        );
+        let output = command(&project)
+            .args([
+                "--no-quiet",
+                "--allow-localhost",
+                &origin.address.port().to_string(),
+                "exec",
+                "--",
+                "/bin/sh",
+                "-c",
+                &script,
+            ])
+            .output()
+            .unwrap();
+        let stderr = stderr(&output);
+        assert_eq!(output.status.code(), Some(37), "{stderr}");
+        assert_eq!(output.stdout, b"fixture-ok\ncommand-stdout\n", "{stderr}");
+        assert!(stderr.contains(&format!("{RECORDED} 1.")), "{stderr}");
+    }
 }

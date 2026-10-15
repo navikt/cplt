@@ -942,12 +942,7 @@ pub fn start(opts: ProxyOptions) -> Result<ProxyHandle, String> {
             .map_err(|e| format!("Cannot open proxy log file {}: {e}", log_path.display()))?;
     }
 
-    let addr = format!("127.0.0.1:{}", opts.port);
-    let listener = TcpListener::bind(&addr).map_err(|e| format!("Cannot bind to {addr}: {e}"))?;
-    let actual_port = listener
-        .local_addr()
-        .map_err(|e| format!("Cannot get proxy listen address: {e}"))?
-        .port();
+    let (listeners, actual_port) = bind_listeners(opts.port)?;
 
     // Observation collector, shared between the connection threads (via state)
     // and the returned handle so one final snapshot can freeze the session.
@@ -976,7 +971,7 @@ pub fn start(opts: ProxyOptions) -> Result<ProxyHandle, String> {
         .name("proxy-accept".into())
         .spawn(move || {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                accept_loop(listener, flag, state, active_count);
+                accept_loop(listeners, flag, state, active_count);
             }));
             let closed_at = Instant::now();
             let panicked = outcome.is_err();
@@ -1003,66 +998,149 @@ pub fn start(opts: ProxyOptions) -> Result<ProxyHandle, String> {
     })
 }
 
+/// Bind `127.0.0.1` and `[::1]` on the same port (#763).
+///
+/// gRPC C-core on macOS dials from a dual-stack `AF_INET6` socket, which
+/// reaches Seatbelt as `::ffff:127.0.0.1` when the target is `127.0.0.1` and is
+/// denied by `localhost:{port}`. Listening on `[::1]:{actual_port}` as well
+/// gives C-core a pure IPv6 loopback endpoint that Seatbelt's `localhost:{port}`
+/// rule matches.
+///
+/// With `port == 0`, the kernel picks an ephemeral port on `127.0.0.1` first; if
+/// another local process happens to hold `[::1]` on that port (`AddrInUse`), we
+/// drop the IPv4 listener and try a fresh ephemeral port rather than leaving
+/// `[::1]:{actual_port}` pointed at someone else's listener. On non-macOS hosts
+/// where IPv6 loopback is disabled (`EAFNOSUPPORT` / `EADDRNOTAVAIL`), the IPv4
+/// listener alone is returned.
+fn bind_listeners(port: u16) -> Result<(Vec<TcpListener>, u16), String> {
+    let attempts = if port == 0 { 16 } else { 1 };
+    for attempt in 0..attempts {
+        let addr = format!("127.0.0.1:{port}");
+        let v4 = TcpListener::bind(&addr).map_err(|e| format!("Cannot bind to {addr}: {e}"))?;
+        let actual_port = v4
+            .local_addr()
+            .map_err(|e| format!("Cannot get proxy listen address: {e}"))?
+            .port();
+        match TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, actual_port)) {
+            Ok(v6) => return Ok((vec![v4, v6], actual_port)),
+            Err(e)
+                if port == 0
+                    && e.kind() == std::io::ErrorKind::AddrInUse
+                    && attempt + 1 < attempts => {}
+            Err(e) => {
+                if cfg!(target_os = "macos") || e.kind() == std::io::ErrorKind::AddrInUse {
+                    return Err(format!("Cannot bind to [::1]:{actual_port}: {e}"));
+                }
+                return Ok((vec![v4], actual_port));
+            }
+        }
+    }
+    unreachable!("loop either returns or errors on the final attempt")
+}
+
 fn accept_loop(
-    listener: TcpListener,
+    listeners: Vec<TcpListener>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     state: Arc<ProxyState>,
     active_count: Arc<std::sync::atomic::AtomicUsize>,
 ) {
-    // Blocking accept. `ProxyHandle::shutdown` sets the flag and then
-    // connects once, so a blocked accept() returns and the flag check after it
-    // drops that connection (or any other that raced it) unserved.
+    use std::os::fd::AsRawFd;
+
+    for l in &listeners {
+        let _ = l.set_nonblocking(true);
+    }
+    let mut pfds: Vec<libc::pollfd> = listeners
+        .iter()
+        .map(|l| libc::pollfd {
+            fd: l.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
+    let nfds = libc::nfds_t::try_from(pfds.len()).unwrap_or(0);
+
+    // Poll both listeners (`127.0.0.1` and `[::1]`). `ProxyHandle::shutdown`
+    // sets the flag and connects once to `127.0.0.1`, waking `poll()` so the
+    // loop exits without a second thread or a timeout spin.
     loop {
         if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
             break;
         }
-
-        let Ok((stream, _)) = listener.accept() else {
+        for pfd in &mut pfds {
+            pfd.revents = 0;
+        }
+        // SAFETY: `pfds` is a valid slice of pollfds whose fds live in `listeners`
+        // for the duration of this function.
+        let ready = unsafe { libc::poll(pfds.as_mut_ptr(), nfds, -1) };
+        if ready < 0 {
             continue;
-        };
+        }
         if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
             break;
         }
 
-        stream.set_nodelay(true).ok();
+        for (listener, pfd) in listeners.iter().zip(&pfds) {
+            if pfd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) == 0 {
+                continue;
+            }
+            loop {
+                if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                let (stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                };
+                if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
 
-        // Connection limit
-        let count = active_count.load(std::sync::atomic::Ordering::SeqCst);
-        if count >= MAX_CONNECTIONS {
-            log_connection(&state, None, "REJECT", "connection limit", "LIMIT");
-            drop(stream);
-            continue;
-        }
+                // BSD/macOS accepted sockets inherit O_NONBLOCK from the listener;
+                // connection handlers expect blocking I/O with read/write timeouts.
+                let _ = stream.set_nonblocking(false);
+                stream.set_nodelay(true).ok();
 
-        let Some(classification) = state.domain_collector.admit() else {
-            drop(stream);
-            continue;
-        };
+                // Connection limit
+                let count = active_count.load(std::sync::atomic::Ordering::SeqCst);
+                if count >= MAX_CONNECTIONS {
+                    log_connection(&state, None, "REJECT", "connection limit", "LIMIT");
+                    drop(stream);
+                    continue;
+                }
 
-        active_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let conn_state = state.clone();
-        let counter = active_count.clone();
+                let Some(classification) = state.domain_collector.admit() else {
+                    drop(stream);
+                    continue;
+                };
 
-        if let Err(e) = std::thread::Builder::new()
-            .name("proxy-conn".into())
-            .spawn(move || {
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    handle_connection(stream, &conn_state, classification);
-                }));
-                counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            })
-        {
-            active_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            // On spawn failure, dropping the unstarted guard marks failure and
-            // decrements pending in one collector transaction. Admission stays
-            // open until this accept-loop iteration finishes.
-            log_connection(
-                &state,
-                None,
-                "INTERNAL",
-                "thread-spawn",
-                &format!("FAIL:{e}"),
-            );
+                active_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let conn_state = state.clone();
+                let counter = active_count.clone();
+
+                if let Err(e) =
+                    std::thread::Builder::new()
+                        .name("proxy-conn".into())
+                        .spawn(move || {
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                handle_connection(stream, &conn_state, classification);
+                            }));
+                            counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        })
+                {
+                    active_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    // On spawn failure, dropping the unstarted guard marks failure and
+                    // decrements pending in one collector transaction. Admission stays
+                    // open until this accept-loop iteration finishes.
+                    log_connection(
+                        &state,
+                        None,
+                        "INTERNAL",
+                        "thread-spawn",
+                        &format!("FAIL:{e}"),
+                    );
+                }
+            }
         }
     }
 }
@@ -6247,5 +6325,20 @@ mod tests {
         remote.write_all(b"pong").unwrap();
         client.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"pong");
+    }
+
+    /// #763: `bind_listeners` binds both `127.0.0.1` and `[::1]` on the same
+    /// port, and refuses a fixed port when `[::1]` is already held by another
+    /// listener rather than silently leaving `[::1]:port` pointed elsewhere.
+    #[test]
+    fn bind_listeners_binds_ipv4_and_ipv6_loopback() {
+        let (listeners, port) = bind_listeners(0).expect("ephemeral dual bind");
+        assert!(port > 0);
+        if let Ok(squatter) = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)) {
+            assert_eq!(listeners.len(), 2);
+            let occupied_port = squatter.local_addr().unwrap().port();
+            let err = bind_listeners(occupied_port).unwrap_err();
+            assert!(err.contains("[::1]"), "got: {err}");
+        }
     }
 }
