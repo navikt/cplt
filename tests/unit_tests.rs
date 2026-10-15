@@ -3903,6 +3903,7 @@ fn home_tool_dirs_has_all_runtime_entries() {
         ".cargo/bin",
         ".rustup",
         ".sdkman",
+        "Library/Java/JavaVirtualMachines",
         "go/bin",
     ] {
         assert!(
@@ -3950,6 +3951,20 @@ fn home_tool_dirs_has_all_runtime_entries() {
     assert!(
         !paths.contains(&".config/pnpm"),
         ".config/pnpm should NOT be in HOME_TOOL_DIRS (handled by AppDirs)"
+    );
+}
+
+#[test]
+fn profile_grants_user_java_virtual_machines_read_and_exec() {
+    let p = generate_profile(&base_profile_options(), &[]);
+    let jvms = "/Users/test/Library/Java/JavaVirtualMachines";
+    for op in ["file-read*", "process-exec", "file-map-executable"] {
+        let rule = format!("(allow {op} (subpath \"{jvms}\"))");
+        assert!(p.contains(&rule), "missing {rule} in profile:\n{p}");
+    }
+    assert!(
+        !p.contains(&format!("(allow file-write* (subpath \"{jvms}\"))")),
+        "{jvms} must remain read-only"
     );
 }
 

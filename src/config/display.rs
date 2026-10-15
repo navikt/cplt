@@ -24,6 +24,8 @@ pub fn explain_key(
     };
 
     let (current_value, layer) = get_config_value(key_info, loaded, local);
+    let preset = active_preset(loaded, local);
+    let from_preset = layer == ConfigLayer::Baseline && current_value != key_info.default_display;
     let from_file = layer != ConfigLayer::Baseline;
     let current_value = redact_sensitive_value(key_info, current_value);
     let type_str = type_label(key_info.value_type);
@@ -32,15 +34,20 @@ pub fn explain_key(
     println!("  {}", key_info.description);
 
     // Type and value on one line: "  bool  false" or "  bool  true  (default: false)"
-    if from_file {
+    if from_file || from_preset {
         // Highlight dangerous keys set to true in yellow so the risk is visible.
         let value_color = if key_info.dangerous && current_value == "true" {
             yellow
         } else {
             bold
         };
+        let source = if from_preset {
+            format!("set by preset {preset}")
+        } else {
+            layer.to_string()
+        };
         println!(
-            "  {dim}{type_str}{nc}  {value_color}{current_value}{nc}  {dim}({layer}, default: {default_display}){nc}"
+            "  {dim}{type_str}{nc}  {value_color}{current_value}{nc}  {dim}({source}, default: {default_display}){nc}"
         );
     } else {
         println!("  {dim}{type_str}  {current_value}{nc}");
@@ -79,7 +86,7 @@ fn set_hint(key_info: &ConfigKeyInfo) -> String {
 }
 
 /// Print explanation of all config keys, grouped by section.
-/// Shows the effective value inline: dim for default, bold for config-file override.
+/// Shows the effective value inline: dim for default, bold for config-file or preset override.
 pub fn explain_all(loaded: Option<&LoadedConfig>, local: Option<&LoadedConfig>) {
     use super::registry::CONFIG_KEYS;
 
@@ -104,10 +111,10 @@ pub fn explain_all(loaded: Option<&LoadedConfig>, local: Option<&LoadedConfig>) 
             String::new()
         };
         let (current_value, layer) = get_config_value(key, loaded, local);
-        let from_file = layer != ConfigLayer::Baseline;
+        let overridden = layer != ConfigLayer::Baseline || current_value != key.default_display;
         let current_value = redact_sensitive_value(key, current_value);
         // Dim for default value, bold for override; yellow if dangerous key is enabled.
-        let value_color = if !from_file {
+        let value_color = if !overridden {
             dim
         } else if key.dangerous && current_value == "true" {
             yellow
@@ -129,14 +136,22 @@ pub fn explain_all(loaded: Option<&LoadedConfig>, local: Option<&LoadedConfig>) 
     }
 }
 
+fn active_preset(loaded: Option<&LoadedConfig>, local: Option<&LoadedConfig>) -> Preset {
+    local
+        .and_then(|l| l.config.sandbox.preset)
+        .or_else(|| loaded.and_then(|l| l.config.sandbox.preset))
+        .unwrap_or(Preset::Standard)
+}
+
 /// Get the effective value of a config key, and the layer it came from.
 ///
 /// A bool cannot say which of two files a value came from, which is why this
 /// returns the layer: local, global, or `Baseline` for "no file set it".
 /// The order is the resolver's own — local above global — read off the raw
 /// documents, because this reports what the FILES say and there is no merge to
-/// consult. `ConfigLayer::Baseline` here means "not in any file"; it does not
-/// distinguish a preset baseline from a hardcoded default.
+/// consult. When no file explicitly sets the key, `ConfigLayer::Baseline`
+/// reflects the active preset's baseline for preset-controlled keys, or
+/// `default_display` otherwise (#684).
 pub fn get_config_value(
     key_info: &ConfigKeyInfo,
     loaded: Option<&LoadedConfig>,
@@ -153,7 +168,11 @@ pub fn get_config_value(
         }
     }
 
-    (key_info.default_display.to_string(), ConfigLayer::Baseline)
+    let baseline = active_preset(loaded, local)
+        .baseline()
+        .value_for_key(key_info.section, key_info.key)
+        .unwrap_or_else(|| key_info.default_display.to_string());
+    (baseline, ConfigLayer::Baseline)
 }
 
 fn format_toml_value(val: &toml::Value) -> String {
@@ -1226,5 +1245,47 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn get_config_value_reflects_active_preset_baseline() {
+        use super::super::registry::lookup_key;
+
+        let loaded_from = |raw: &str| LoadedConfig {
+            config: Config::parse(raw).unwrap(),
+            raw: raw.to_string(),
+            path: std::path::PathBuf::from("/tmp/config.toml"),
+        };
+
+        let strict = loaded_from("[sandbox]\npreset = \"strict\"\n");
+        let full_trust = loaded_from("[sandbox]\npreset = \"full-trust\"\n");
+        let explicit_false =
+            loaded_from("[sandbox]\npreset = \"strict\"\n[proxy]\nforced = false\n");
+
+        let proxy_forced = lookup_key("proxy.forced").unwrap();
+        let allow_docker = lookup_key("sandbox.allow_docker").unwrap();
+        let gh_enabled = lookup_key("gh_guard.enabled").unwrap();
+
+        assert_eq!(
+            get_config_value(proxy_forced, Some(&strict), None),
+            ("true".to_string(), ConfigLayer::Baseline)
+        );
+        assert_eq!(
+            get_config_value(proxy_forced, Some(&explicit_false), None),
+            ("false".to_string(), ConfigLayer::Global)
+        );
+        assert_eq!(
+            get_config_value(allow_docker, Some(&full_trust), None),
+            ("true".to_string(), ConfigLayer::Baseline)
+        );
+        assert_eq!(
+            get_config_value(gh_enabled, Some(&full_trust), None),
+            ("false".to_string(), ConfigLayer::Baseline)
+        );
+        // Local preset overrides global preset.
+        assert_eq!(
+            get_config_value(proxy_forced, Some(&strict), Some(&full_trust)),
+            ("false".to_string(), ConfigLayer::Baseline)
+        );
     }
 }

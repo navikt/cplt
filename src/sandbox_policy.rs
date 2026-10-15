@@ -2062,6 +2062,16 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
         map_exec: true,
         write: false,
     },
+    // Per-user macOS JDK directory consulted by `/usr/libexec/java_home`
+    // alongside `/Library/Java/JavaVirtualMachines` (IntelliJ JDK downloader,
+    // user-scoped `.pkg` installs; #694). Read-only so a sandboxed session
+    // cannot plant a JDK binary that runs unsandboxed on the host.
+    HomeToolDir {
+        path: "Library/Java/JavaVirtualMachines",
+        process_exec: true,
+        map_exec: true,
+        write: false,
+    },
     // `deno install` and `deno upgrade` write executables into ~/.deno/bin,
     // which the Deno installer prepends to PATH. Read-only for the same reason
     // as .cargo/bin: a binary dropped there runs unsandboxed on the user's next

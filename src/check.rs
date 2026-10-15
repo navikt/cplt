@@ -35,7 +35,7 @@ use crate::sandbox::{
     DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS, FsAccess, LandlockPolicy,
 };
 #[cfg(target_os = "macos")]
-use crate::sandbox::{PathBinDir, path_bin_dirs};
+use crate::sandbox::{PathBinDir, TOOL_READ_DIRS, path_bin_dirs};
 
 /// Ground-truth (or, for static-only queries, policy) decision for one probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -168,7 +168,7 @@ pub fn explain_path(
     path: &Path,
 ) -> FsExplain {
     let mut acc = FsAccess::default();
-    let mut matched: Option<&PathBuf> = None;
+    let mut matched: Option<&Path> = None;
     for rule in &policy.fs_rules {
         if within(path, &rule.path) {
             acc.read |= rule.access.read;
@@ -177,6 +177,18 @@ pub fn explain_path(
             let longer = matched.is_none_or(|m| rule.path.as_os_str().len() > m.as_os_str().len());
             if longer {
                 matched = Some(&rule.path);
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    for &dir in TOOL_READ_DIRS {
+        let dir_path = Path::new(dir);
+        if within(path, dir_path) {
+            acc.read = true;
+            acc.execute = true;
+            let longer = matched.is_none_or(|m| dir_path.as_os_str().len() > m.as_os_str().len());
+            if longer {
+                matched = Some(dir_path);
             }
         }
     }
@@ -1668,6 +1680,28 @@ mod tests {
             fix.contains("--repo-dir") && fix.contains("not executable"),
             "the fix must name the remedy that actually works for a repository: {fix}"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_tool_read_dirs_are_explained_as_allowed() {
+        let home = Path::new("/Users/u");
+        let proj = Path::new("/Users/u/proj");
+        let p = policy(vec![rule("/Users/u/proj", true, true, true)]);
+        let e = explain_path(
+            &p,
+            home,
+            proj,
+            Path::new("/Library/Java/JavaVirtualMachines/temurin-25.jdk/Contents/Home/bin/java"),
+        );
+        assert_eq!(e.read_decision(), Decision::Allowed);
+        assert_eq!(e.write_decision(), Decision::Blocked);
+        assert!(e.execute);
+        assert_eq!(
+            e.matched_rule.as_deref(),
+            Some("/Library/Java/JavaVirtualMachines")
+        );
+        assert!(e.fix.is_none());
     }
 
     // ── explain_domain ──

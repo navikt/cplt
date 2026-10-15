@@ -261,6 +261,40 @@ impl PresetBaseline {
         }
         names
     }
+
+    /// Baseline value for a config key controlled by this preset, if any.
+    #[must_use]
+    pub fn value_for_key(self, section: &str, key: &str) -> Option<String> {
+        let Self {
+            allow_localhost_any,
+            allow_env_files,
+            allow_tmp_exec,
+            allow_docker,
+            allow_lifecycle_scripts,
+            gh_guard_enabled,
+            git_guard_enabled,
+            git_guard_mode,
+            git_protect_default_branch_only,
+            proxy_forced,
+            default_allowlist,
+        } = self;
+        match (section, key) {
+            ("proxy", "forced") => Some(proxy_forced.to_string()),
+            ("proxy", "default_allowlist") => Some(default_allowlist.to_string()),
+            ("sandbox", "allow_env_files") => Some(allow_env_files.to_string()),
+            ("sandbox", "allow_localhost_any") => Some(allow_localhost_any.to_string()),
+            ("sandbox", "allow_lifecycle_scripts") => Some(allow_lifecycle_scripts.to_string()),
+            ("sandbox", "allow_tmp_exec") => Some(allow_tmp_exec.to_string()),
+            ("sandbox", "allow_docker") => Some(allow_docker.to_string()),
+            ("gh_guard", "enabled") => Some(gh_guard_enabled.to_string()),
+            ("git_guard", "enabled") => Some(git_guard_enabled.to_string()),
+            ("git_guard", "mode") => Some(git_guard_mode.to_string()),
+            ("git_guard", "protect_default_branch_only") => {
+                Some(git_protect_default_branch_only.to_string())
+            }
+            _ => None,
+        }
+    }
 }
 
 impl Preset {

@@ -1523,17 +1523,12 @@ pub fn exec(
             on_launch,
         ) {
             BwrapOutcome::Ran(code) => return code,
-            BwrapOutcome::Fallback if sandbox.opencode_v2 => {
+            BwrapOutcome::Fallback(_) if sandbox.opencode_v2 => {
                 ui::error(&super::opencode_v2_needs_bwrap());
                 return 1;
             }
-            BwrapOutcome::Fallback => {
-                ui::warn(if sandbox.agent == crate::agent::Agent::Claude {
-                    "Bubblewrap could not start; using Landlock + seccomp only \
-                     (Claude hook script grants are not applied)."
-                } else {
-                    "Bubblewrap could not start; using Landlock + seccomp only."
-                });
+            BwrapOutcome::Fallback(reason) => {
+                ui::warn(&format_bwrap_fallback_warning(sandbox.agent, &reason));
                 if wrapper.deny_mask_count > 0 {
                     // prepare() already announced these as enforced.
                     ui::warn(&format!(
@@ -1614,6 +1609,18 @@ pub fn exec(
     spawn_and_wait(&mut cmd)
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn format_bwrap_fallback_warning(agent: crate::agent::Agent, reason: &str) -> String {
+    if agent == crate::agent::Agent::Claude {
+        format!(
+            "Bubblewrap could not start ({reason}); using Landlock + seccomp only \
+             (Claude hook script grants are not applied)."
+        )
+    } else {
+        format!("Bubblewrap could not start ({reason}); using Landlock + seccomp only.")
+    }
+}
+
 /// Outcome of attempting the bubblewrap-wrapped execution.
 #[cfg(target_os = "linux")]
 enum BwrapOutcome {
@@ -1621,7 +1628,7 @@ enum BwrapOutcome {
     /// which is a hard error rather than a fallback); carries the exit code.
     Ran(u8),
     /// bwrap could not start on the auto-detect path — caller should fall back.
-    Fallback,
+    Fallback(String),
 }
 
 #[cfg(target_os = "linux")]
@@ -1887,19 +1894,34 @@ fn exec_bwrap(
         libc::close(read_fd);
     }
 
-    if matches!(confirm, ConfirmResult::Refused) {
-        // The helper printed which grant it refused. Falling back would let
-        // whoever raced the bind mount turn off bubblewrap at will.
-        let _ = forward_and_wait(child);
-        restore_terminal_stop_signals();
-        return BwrapOutcome::Ran(1);
-    }
-    if matches!(confirm, ConfirmResult::Eof) {
-        // Helper never applied the sandbox and never execed the agent — reap
-        // the child and fall back (agent has not run, so no double execution).
-        let _ = forward_and_wait(child);
-        restore_terminal_stop_signals();
-        return bwrap_setup_failed(wrapper, "namespace helper did not apply the sandbox");
+    match confirm {
+        ConfirmResult::Confirmed => {}
+        ConfirmResult::Refused => {
+            // The helper printed which grant it refused. Falling back would let
+            // whoever raced the bind mount turn off bubblewrap at will.
+            let _ = forward_and_wait(child);
+            restore_terminal_stop_signals();
+            return BwrapOutcome::Ran(1);
+        }
+        ConfirmResult::Eof => {
+            // Helper never applied the sandbox and never execed the agent — reap
+            // the child and fall back (agent has not run, so no double execution).
+            let _ = forward_and_wait(child);
+            restore_terminal_stop_signals();
+            return bwrap_setup_failed(wrapper, "namespace helper did not apply the sandbox");
+        }
+        ConfirmResult::Unknown => {
+            // Helper hung or confirm pipe failed before the confirm byte was
+            // written — kill and reap the bwrap child before falling back so the
+            // agent cannot run twice and cplt does not wait forever on a stuck
+            // child (#588).
+            stop_bwrap_child(&mut child);
+            restore_terminal_stop_signals();
+            return bwrap_setup_failed(
+                wrapper,
+                "timed out waiting for namespace helper to apply the sandbox",
+            );
+        }
     }
 
     // Not before the spawn: every failure above can fall back, and the
@@ -1921,7 +1943,7 @@ fn bwrap_setup_failed(
         ui::error(&format!("Bubblewrap requested but {detail}."));
         BwrapOutcome::Ran(1)
     } else {
-        BwrapOutcome::Fallback
+        BwrapOutcome::Fallback(detail.to_string())
     }
 }
 
@@ -1934,15 +1956,16 @@ enum ConfirmResult {
     Eof,
     /// A zero byte: the helper refused a `nofollow` grant and did not start.
     Refused,
-    /// Timed out or errored; treat as "probably running" to avoid a double run.
+    /// Timed out or errored before the helper wrote the confirm byte.
     Unknown,
 }
 
 /// Wait (bounded) for the helper's confirm byte.
 ///
-/// The helper writes the byte within milliseconds of startup; the generous
-/// timeout only guards against a stuck descriptor and is treated as `Unknown`
-/// (proceed to wait) rather than a fallback, so the agent is never run twice.
+/// The helper writes the byte within milliseconds of startup, right before
+/// `execve`. If `poll` times out or reading fails, the caller kills the bwrap
+/// child before treating it as a setup failure (#588), so the agent cannot run
+/// twice and cplt does not block forever waiting on a hung helper.
 #[cfg(target_os = "linux")]
 fn read_confirm_byte(fd: i32) -> ConfirmResult {
     let mut pfd = libc::pollfd {
@@ -1997,6 +2020,28 @@ mod child_pid_tests {
             libc::signal(libc::SIGTERM, libc::SIG_DFL);
             libc::signal(libc::SIGHUP, libc::SIG_DFL);
         }
+    }
+
+    #[test]
+    fn bwrap_fallback_warning_includes_reason() {
+        let msg = format_bwrap_fallback_warning(
+            crate::agent::Agent::Copilot,
+            "namespace helper did not apply the sandbox",
+        );
+        assert_eq!(
+            msg,
+            "Bubblewrap could not start (namespace helper did not apply the sandbox); \
+             using Landlock + seccomp only."
+        );
+        let claude = format_bwrap_fallback_warning(
+            crate::agent::Agent::Claude,
+            "failed to spawn bwrap: No such file or directory",
+        );
+        assert_eq!(
+            claude,
+            "Bubblewrap could not start (failed to spawn bwrap: No such file or directory); \
+             using Landlock + seccomp only (Claude hook script grants are not applied)."
+        );
     }
 }
 
