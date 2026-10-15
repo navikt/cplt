@@ -1798,9 +1798,16 @@ pub fn keychain_substitute(
                 let gh = exec::gh_hosts_yml()
                     .and_then(|p| crate::agent::read_small_regular_file(&p))
                     .and_then(|s| gh_login(&s));
-                if let Some(gh) = &gh
-                    && let Some(why) = account_mismatch(gh, copilot_keychain_acct(gh).as_deref())
-                {
+                let cfg_acct = copilot_config_account(home);
+                let selected = match &cfg_acct {
+                    CopilotConfigAccount::Selected(a) => Some(a.as_str()),
+                    _ => None,
+                };
+                if let Some(why) = copilot_account_mismatch(
+                    gh.as_deref(),
+                    &cfg_acct,
+                    copilot_keychain_acct(selected).as_deref(),
+                ) {
                     let _ = ACCOUNT_MISMATCH.set(why);
                     return None;
                 }
@@ -1819,6 +1826,117 @@ pub fn gh_configured() -> bool {
 /// Why the substitute was skipped for an account mismatch, for the launch
 /// summary to say why the grant stayed.
 pub static ACCOUNT_MISMATCH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+const COPILOT_CONFIG_LIMIT: u64 = 64 * 1024;
+
+/// Selected Copilot account from `~/.copilot/config.json`, shaped `<host>:<login>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopilotConfigAccount {
+    /// Missing file or no stored Copilot account.
+    None,
+    /// Unambiguous `<host>:<login>` selection from `lastLoggedInUser` or a single `loggedInUsers` entry.
+    Selected(String),
+    /// Unreadable or non-regular file, malformed JSON, or ambiguous multi-account state.
+    Ambiguous(String),
+}
+
+/// Read `~/.copilot/config.json` without following symlinks or blocking on a
+/// planted FIFO (`untrusted::read_untrusted`), and resolve the active Copilot
+/// `<host>:<login>` selection.
+#[must_use]
+pub fn copilot_config_account(home: &Path) -> CopilotConfigAccount {
+    let path = home.join(".copilot/config.json");
+    let text = match crate::untrusted::read_untrusted(&path, COPILOT_CONFIG_LIMIT) {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            return CopilotConfigAccount::Ambiguous(
+                "Copilot config.json is not a regular file or exceeds 64 KiB".to_string(),
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return CopilotConfigAccount::None,
+        Err(_) => {
+            return CopilotConfigAccount::Ambiguous(
+                "Copilot config.json could not be read".to_string(),
+            );
+        }
+    };
+    parse_copilot_config_account(&text)
+}
+
+/// Whether `~/.copilot/config.json` records a native Copilot login or an
+/// ambiguous state that prevents falling back cleanly to `gh`.
+#[must_use]
+pub fn copilot_has_native_login(home: &Path) -> bool {
+    !matches!(copilot_config_account(home), CopilotConfigAccount::None)
+}
+
+fn parse_copilot_user(v: &serde_json::Value) -> Option<String> {
+    let host = v.get("host")?.as_str()?.trim().trim_end_matches('/');
+    let login = v.get("login")?.as_str()?.trim();
+    (!host.is_empty() && !login.is_empty()).then(|| format!("{host}:{login}"))
+}
+
+fn parse_copilot_config_account(text: &str) -> CopilotConfigAccount {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return CopilotConfigAccount::Ambiguous("Copilot config.json is malformed".to_string());
+    };
+    let Some(obj) = v.as_object() else {
+        return CopilotConfigAccount::Ambiguous("Copilot config.json is malformed".to_string());
+    };
+    let last = match obj.get("lastLoggedInUser") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(u) => match parse_copilot_user(u) {
+            Some(acct) => Some(acct),
+            None => {
+                return CopilotConfigAccount::Ambiguous(
+                    "Copilot lastLoggedInUser is malformed".to_string(),
+                );
+            }
+        },
+    };
+    let users = match obj.get("loggedInUsers") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(arr)) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for item in arr {
+                let Some(acct) = parse_copilot_user(item) else {
+                    return CopilotConfigAccount::Ambiguous(
+                        "Copilot loggedInUsers is malformed".to_string(),
+                    );
+                };
+                out.push(acct);
+            }
+            out
+        }
+        Some(_) => {
+            return CopilotConfigAccount::Ambiguous(
+                "Copilot loggedInUsers is malformed".to_string(),
+            );
+        }
+    };
+    match last {
+        Some(last) => {
+            if !users.is_empty() && !users.iter().any(|u| u.eq_ignore_ascii_case(&last)) {
+                CopilotConfigAccount::Ambiguous(format!(
+                    "Copilot lastLoggedInUser ({last}) is not in loggedInUsers"
+                ))
+            } else {
+                CopilotConfigAccount::Selected(last)
+            }
+        }
+        None if users.is_empty() => CopilotConfigAccount::None,
+        None => {
+            if users.iter().all(|u| u.eq_ignore_ascii_case(&users[0])) {
+                CopilotConfigAccount::Selected(users.into_iter().next().unwrap())
+            } else {
+                CopilotConfigAccount::Ambiguous(
+                    "Copilot config.json has multiple loggedInUsers without lastLoggedInUser"
+                        .to_string(),
+                )
+            }
+        }
+    }
+}
 
 /// The github.com `user:` from gh's `hosts.yml`.
 fn gh_login(hosts_yml: &str) -> Option<String> {
@@ -1839,10 +1957,10 @@ fn gh_login(hosts_yml: &str) -> Option<String> {
 /// prompts. Unlike `~/.copilot/config.json`, the sandboxed agent cannot
 /// rewrite this without the Keychain grant it is about to lose.
 ///
-/// Tries the item for `gh_login` first, so several stored accounts resolve to
-/// the matching one; otherwise whichever item `security` returns first.
+/// Tries the item for `selected_acct` first when `~/.copilot/config.json`
+/// names a valid selection; otherwise whichever item `security` returns first.
 /// `None` when there is no item, `security` fails, or it outlives 1 s.
-fn copilot_keychain_acct(gh_login: &str) -> Option<String> {
+fn copilot_keychain_acct(selected_acct: Option<&str>) -> Option<String> {
     if !cfg!(target_os = "macos") {
         return None;
     }
@@ -1856,7 +1974,9 @@ fn copilot_keychain_acct(gh_login: &str) -> Option<String> {
         let out = exec::bounded_stdout(cmd, std::time::Duration::from_secs(1))?;
         keychain_acct(&String::from_utf8_lossy(&out))
     };
-    query(Some(&format!("https://github.com:{gh_login}"))).or_else(|| query(None))
+    selected_acct
+        .and_then(|a| query(Some(a)))
+        .or_else(|| query(None))
 }
 
 /// The `"acct"<blob>="..."` value from `security find-generic-password` output.
@@ -1868,6 +1988,31 @@ fn keychain_acct(out: &str) -> Option<String> {
             .strip_suffix('"')?;
         Some(v.to_string())
     })
+}
+
+fn copilot_account_mismatch(
+    gh: Option<&str>,
+    cfg_acct: &CopilotConfigAccount,
+    keychain_acct: Option<&str>,
+) -> Option<String> {
+    let selected = match cfg_acct {
+        CopilotConfigAccount::Ambiguous(why) => return Some(why.clone()),
+        CopilotConfigAccount::Selected(acct) => Some(acct.as_str()),
+        CopilotConfigAccount::None => None,
+    };
+    if let Some(gh) = gh {
+        account_mismatch(gh, selected).or_else(|| account_mismatch(gh, keychain_acct))
+    } else {
+        for acct in [selected, keychain_acct].into_iter().flatten() {
+            if !acct.starts_with("https://github.com:") {
+                return Some(format!(
+                    "gh uses github.com, Copilot is on {}",
+                    acct.rsplit_once(':').map_or(acct, |(h, _)| h)
+                ));
+            }
+        }
+        None
+    }
 }
 
 /// `Some(reason)` when gh's github.com login differs from Copilot's Keychain
@@ -5563,7 +5708,10 @@ mod tests {
 
 #[cfg(test)]
 mod account_tests {
-    use super::{account_mismatch, gh_login, keychain_acct};
+    use super::{
+        COPILOT_CONFIG_LIMIT, CopilotConfigAccount, account_mismatch, copilot_account_mismatch,
+        copilot_config_account, copilot_has_native_login, gh_login, keychain_acct,
+    };
 
     #[test]
     fn reads_gh_login_and_keychain_acct() {
@@ -5592,5 +5740,147 @@ mod account_tests {
         assert!(account_mismatch("alice", Some("https://github.com:bob")).is_some());
         let ghe = account_mismatch("alice", Some("https://ghe.example:alice")).unwrap();
         assert!(ghe.contains("https://ghe.example"));
+    }
+
+    #[test]
+    fn copilot_config_account_selection_and_ambiguity() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(
+            copilot_config_account(home.path()),
+            CopilotConfigAccount::None
+        );
+        assert!(!copilot_has_native_login(home.path()));
+
+        let dir = home.path().join(".copilot");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.json");
+
+        std::fs::write(&cfg, r#"{"loggedInUsers":[]}"#).unwrap();
+        assert_eq!(
+            copilot_config_account(home.path()),
+            CopilotConfigAccount::None
+        );
+        assert!(!copilot_has_native_login(home.path()));
+
+        // Multi-user roster with explicit lastLoggedInUser selects that user.
+        std::fs::write(
+            &cfg,
+            r#"{"lastLoggedInUser":{"host":"https://github.com/","login":"bob"},"loggedInUsers":[{"host":"https://github.com","login":"alice"},{"host":"https://github.com","login":"Bob"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            copilot_config_account(home.path()),
+            CopilotConfigAccount::Selected("https://github.com:bob".into())
+        );
+        assert!(copilot_has_native_login(home.path()));
+        assert_eq!(
+            copilot_account_mismatch(
+                Some("alice"),
+                &copilot_config_account(home.path()),
+                Some("https://github.com:alice")
+            )
+            .as_deref(),
+            Some("gh is alice, Copilot is bob")
+        );
+
+        // Single user in loggedInUsers without lastLoggedInUser is unambiguous.
+        std::fs::write(
+            &cfg,
+            r#"{"loggedInUsers":[{"host":"https://ghe.example.com","login":"alice"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            copilot_config_account(home.path()),
+            CopilotConfigAccount::Selected("https://ghe.example.com:alice".into())
+        );
+        assert!(
+            copilot_account_mismatch(None, &copilot_config_account(home.path()), None)
+                .unwrap()
+                .contains("https://ghe.example.com")
+        );
+
+        // lastLoggedInUser missing from a non-empty loggedInUsers roster is refused.
+        std::fs::write(
+            &cfg,
+            r#"{"lastLoggedInUser":{"host":"https://github.com","login":"charlie"},"loggedInUsers":[{"host":"https://github.com","login":"alice"},{"host":"https://github.com","login":"bob"}]}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            copilot_config_account(home.path()),
+            CopilotConfigAccount::Ambiguous(ref s) if s.contains("not in loggedInUsers")
+        ));
+        assert!(
+            copilot_account_mismatch(
+                Some("alice"),
+                &copilot_config_account(home.path()),
+                Some("https://github.com:alice")
+            )
+            .is_some()
+        );
+
+        // Multiple users without lastLoggedInUser is refused.
+        std::fs::write(
+            &cfg,
+            r#"{"loggedInUsers":[{"host":"https://github.com","login":"alice"},{"host":"https://github.com","login":"bob"}]}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            copilot_config_account(home.path()),
+            CopilotConfigAccount::Ambiguous(ref s) if s.contains("multiple loggedInUsers")
+        ));
+
+        // Malformed JSON or user entry is refused.
+        for bad in [
+            "{not json",
+            r#"{"lastLoggedInUser":{"host":"","login":"alice"}}"#,
+            r#"{"loggedInUsers":[{"host":"https://github.com"}]}"#,
+        ] {
+            std::fs::write(&cfg, bad).unwrap();
+            assert!(
+                matches!(
+                    copilot_config_account(home.path()),
+                    CopilotConfigAccount::Ambiguous(_)
+                ),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn copilot_config_account_refuses_symlink_fifo_and_oversize() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".copilot");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.json");
+
+        // Planted symlink is refused without reading target.
+        let target = home.path().join("target.json");
+        std::fs::write(
+            &target,
+            r#"{"lastLoggedInUser":{"host":"https://github.com","login":"alice"}}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&target, &cfg).unwrap();
+        assert!(matches!(
+            copilot_config_account(home.path()),
+            CopilotConfigAccount::Ambiguous(_)
+        ));
+        std::fs::remove_file(&cfg).unwrap();
+
+        // Planted FIFO is refused without blocking.
+        crate::untrusted::tests::mkfifo(&cfg);
+        let p = home.path().to_path_buf();
+        assert!(matches!(
+            crate::untrusted::tests::bounded(move || copilot_config_account(&p)),
+            CopilotConfigAccount::Ambiguous(_)
+        ));
+        std::fs::remove_file(&cfg).unwrap();
+
+        // Oversized file (> 64 KiB) is refused.
+        std::fs::write(&cfg, " ".repeat((COPILOT_CONFIG_LIMIT + 1) as usize)).unwrap();
+        assert!(matches!(
+            copilot_config_account(home.path()),
+            CopilotConfigAccount::Ambiguous(_)
+        ));
     }
 }

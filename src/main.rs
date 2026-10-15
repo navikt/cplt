@@ -2190,6 +2190,7 @@ fn copilot_stored_token_handover(
     resolved: &config::Resolved,
     substitute: Option<&agent::KeychainSubstitute>,
     stored_token: bool,
+    native_copilot_login: bool,
 ) -> bool {
     if !stored_token || !resolved.gh_guard.enabled || !resolved.scratch_dir {
         return false;
@@ -2202,7 +2203,10 @@ fn copilot_stored_token_handover(
         false,
         true,
     );
-    (resolved.gh_guard.block_auth_token && serve && discover::gh_wrapper_available())
+    (!native_copilot_login
+        && resolved.gh_guard.block_auth_token
+        && serve
+        && discover::gh_wrapper_available())
         || (resolved.gh_guard.inject_token
             && agent::Agent::Copilot
                 .keychain_substitute_env_vars()
@@ -8164,7 +8168,12 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         cfg!(target_os = "linux"),
         std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some(),
         env_token.is_some(),
-        copilot_stored_token_handover(&resolved, keychain_substitute.as_ref(), auth.gh_cli_auth),
+        copilot_stored_token_handover(
+            &resolved,
+            keychain_substitute.as_ref(),
+            auth.gh_cli_auth,
+            cplt::sandbox::copilot_has_native_login(&home_dir),
+        ),
     ));
     for message in write_granted_repos_messages(&resolved, &project_dir, &repo_paths)
         .into_iter()
@@ -14311,11 +14320,25 @@ mod tests {
                     .is_empty()
                 );
                 assert!(
-                    copilot_stored_token_handover(&r, None, true),
-                    "default one-shot route"
+                    copilot_stored_token_handover(&r, None, true, false),
+                    "default one-shot route without native Copilot login"
+                );
+                assert!(
+                    !copilot_stored_token_handover(&r, None, true, true),
+                    "native Copilot login attempts Secret Service before gh auth token"
+                );
+                assert!(
+                    cplt::doctor::linux_keyring_finding(
+                        agent::Agent::Copilot,
+                        true,
+                        true,
+                        false,
+                        copilot_stored_token_handover(&r, None, true, true),
+                    )
+                    .is_some()
                 );
                 temp_env::with_var("PATH", Some("/synthetic/no-gh"), || {
-                    let handover = copilot_stored_token_handover(&r, None, true);
+                    let handover = copilot_stored_token_handover(&r, None, true, false);
                     assert!(
                         !handover,
                         "stored retrieval success does not install a PATH wrapper"
@@ -14331,7 +14354,8 @@ mod tests {
                         .is_some()
                     );
                     r.gh_guard.inject_token = true;
-                    assert!(copilot_stored_token_handover(&r, None, true));
+                    assert!(copilot_stored_token_handover(&r, None, true, false));
+                    assert!(copilot_stored_token_handover(&r, None, true, true));
                     r.gh_guard.inject_token = false;
                 });
                 assert!(
@@ -14340,45 +14364,47 @@ mod tests {
                         true,
                         true,
                         false,
-                        copilot_stored_token_handover(&r, None, true),
+                        copilot_stored_token_handover(&r, None, true, false),
                     )
                     .is_none()
                 );
-                assert!(!copilot_stored_token_handover(&r, None, false));
+                assert!(!copilot_stored_token_handover(&r, None, false, false));
                 r.scratch_dir = false;
                 assert!(!replacement(&r, true, true));
-                assert!(!copilot_stored_token_handover(&r, None, true));
+                assert!(!copilot_stored_token_handover(&r, None, true, false));
                 assert!(
                     cplt::doctor::linux_keyring_finding(
                         agent::Agent::Copilot,
                         true,
                         true,
                         false,
-                        copilot_stored_token_handover(&r, None, true),
+                        copilot_stored_token_handover(&r, None, true, false),
                     )
                     .is_some()
                 );
                 r.scratch_dir = true;
                 r.gh_guard.enabled = false;
                 assert!(!replacement(&r, true, true));
-                assert!(!copilot_stored_token_handover(&r, None, true));
+                assert!(!copilot_stored_token_handover(&r, None, true, false));
                 r.gh_guard.enabled = true;
                 r.gh_guard.block_auth_token = false;
-                assert!(!copilot_stored_token_handover(&r, None, true));
+                assert!(!copilot_stored_token_handover(&r, None, true, false));
                 r.gh_guard.inject_token = true;
-                assert!(copilot_stored_token_handover(&r, None, true));
+                assert!(copilot_stored_token_handover(&r, None, true, false));
+                assert!(copilot_stored_token_handover(&r, None, true, true));
                 r.deny_env = vec!["GH_TOKEN".into()];
                 assert!(!replacement(&r, true, true));
                 assert!(
-                    copilot_stored_token_handover(&r, None, true),
+                    copilot_stored_token_handover(&r, None, true, false),
                     "injection can use GITHUB_TOKEN"
                 );
                 r.gh_guard.inject_token = false;
                 r.gh_guard.block_auth_token = true;
-                assert!(!copilot_stored_token_handover(&r, None, true));
+                assert!(!copilot_stored_token_handover(&r, None, true, false));
                 r.deny_env.clear();
                 let sub = agent::KeychainSubstitute::EnvVar("COPILOT_GITHUB_TOKEN");
-                assert!(copilot_stored_token_handover(&r, Some(&sub), true));
+                assert!(copilot_stored_token_handover(&r, Some(&sub), true, false));
+                assert!(!copilot_stored_token_handover(&r, Some(&sub), true, true));
                 r.inherit_env = true;
                 assert!(!replacement(&r, true, true));
             },

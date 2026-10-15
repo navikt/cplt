@@ -861,9 +861,11 @@ pub fn linux_keyring_finding(
                 Some(
                     "export a valid COPILOT_GITHUB_TOKEN, or clear COPILOT_GITHUB_TOKEN, GH_TOKEN \
                  and GITHUB_TOKEN in a subshell and run `gh auth login --hostname github.com \
-                 --web` on the host. The one-shot cache needs gh_guard.enabled, scratch_dir \
-                 and gh_guard.block_auth_token enabled, with GH_TOKEN not denied; alternatively \
-                 enable gh_guard.inject_token with --force and leave a token variable permitted"
+                 --web` on the host (if ~/.copilot/config.json has a stored Copilot login, also \
+                 run `copilot logout` on the host so Copilot falls back to gh). The one-shot \
+                 cache needs gh_guard.enabled, scratch_dir and gh_guard.block_auth_token enabled, \
+                 with GH_TOKEN not denied; alternatively enable gh_guard.inject_token with \
+                 --force and leave a token variable permitted"
                         .to_string(),
                 ),
             )
