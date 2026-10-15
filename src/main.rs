@@ -6458,6 +6458,7 @@ fn run_exec_command(
 
     // Build the resolved Shell sandbox (discovery → proxy → prepare). Shared
     // with `cplt check`, which runs its probes under the identical policy.
+    #[allow(unused_mut)] // Only macOS adds the broker's final staging pins.
     let AssembledSandbox {
         mut prepared,
         policy,
