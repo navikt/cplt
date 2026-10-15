@@ -1090,11 +1090,7 @@ More: [docs/security.md](docs/security.md#limitations)
 
 Contributions are welcome.
 
-```bash
-git clone https://github.com/navikt/cplt.git && cd cplt
-git config core.hooksPath hack    # enables pre-commit fmt + clippy checks
-mise run check                    # runs fmt, clippy, and tests
-```
+see [CONTRIBUTING.md](CONTRIBUTING.md) for how to contribute
 
 Open an issue before starting a large change. Every PR has to pass CI (fmt, clippy, tests).
 
