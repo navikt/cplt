@@ -12,7 +12,7 @@ Contributions are welcome. For a large change, open an issue first to discuss th
    cd cplt
    ```
 
-3. Install the pinned Rust toolchain and other project tools with [mise](https://mise.jdx.dev/):
+3. Install Python 3 and Node.js separately, ensuring `python3` and `node` are on your PATH, then install the pinned Rust toolchain with [mise](https://mise.jdx.dev/):
 
    ```bash
    mise install
