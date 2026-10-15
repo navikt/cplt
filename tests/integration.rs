@@ -3046,9 +3046,9 @@ int main(int argc, char **argv) {
 
     /// #694: user-installed JDKs in `~/Library/Java/JavaVirtualMachines` must be
     /// discovered by `discover_tools`, readable, executable (`process-exec`),
-    /// mappable (`file-map-executable` for `libjvm.dylib`), and protected against
-    /// writes and ancestor renames even when an overlapping `allow.write` grants
-    /// `~/Library` (including when `JavaVirtualMachines` is a symlink).
+    /// mappable (`file-map-executable` for `libjvm.dylib`), and read-only by
+    /// default. Under an overlapping `allow.write` on `~/Library`, `process-exec`
+    /// is stripped by `emit_user_write_exec_denies` (#243) to prevent write-then-exec.
     #[test]
     #[allow(clippy::disallowed_methods)] // test helper invokes /usr/bin/cc to build Mach-O binary + dylib fixtures
     fn real_profile_user_java_virtual_machines_reads_execs_maps_and_denies_write() {
@@ -3127,29 +3127,21 @@ int main(int argc, char **argv) {
             "discover_tools must find Library/Java/JavaVirtualMachines"
         );
 
-        let library_dir = home_path.join("Library");
-        let extra_write = [library_dir.clone()];
         let mut opts = default_opts(&project_path, &home_path);
         opts.existing_home_tool_dirs = Some(&discovery.existing_home_tool_dirs);
-        opts.extra_write = &extra_write;
         let profile = write_real_profile(&opts);
 
         let jvms = home_path.join("Library/Java/JavaVirtualMachines");
-        let java_parent = home_path.join("Library/Java");
         let cmd = format!(
             "grep -q '21' '{rel}' && echo READ_OK; \
              '{java}' '{dylib}'; \
-             echo ok > '{lib}/sibling' 2>/dev/null && echo LIBRARY_SIBLING_WRITE_OK; \
              echo pwn > '{jvms}/pwn' 2>/dev/null && echo WRITE_RAN; \
              echo pwn > '{java}' 2>/dev/null && echo OVERWRITE_RAN; \
-             mv '{java_parent}' '{java_parent}.bak' 2>/dev/null && echo RENAME_ANCESTOR_RAN; \
              true",
             rel = release_file.display(),
             java = java_bin.display(),
             dylib = dylib.display(),
-            lib = library_dir.display(),
             jvms = jvms.display(),
-            java_parent = java_parent.display(),
         );
         let (output, _) = run_sandboxed(&profile, &cmd);
         fs::remove_file(&profile).ok();
@@ -3166,45 +3158,30 @@ int main(int argc, char **argv) {
             output.contains("MAP_EXEC_OK"),
             "dlopen of Mach-O dylib inside JavaVirtualMachines must succeed: {output}"
         );
-        assert!(
-            output.contains("LIBRARY_SIBLING_WRITE_OK"),
-            "overlapping ~/Library write grant must stay active outside JavaVirtualMachines: {output}"
-        );
-        for forbidden in ["WRITE_RAN", "OVERWRITE_RAN", "RENAME_ANCESTOR_RAN"] {
+        for forbidden in ["WRITE_RAN", "OVERWRITE_RAN"] {
             assert!(
                 !output.contains(forbidden),
-                "{forbidden}: JavaVirtualMachines and its ~/Library/Java ancestor must stay protected under ~/Library write grant: {output}"
+                "{forbidden}: JavaVirtualMachines must be read-only by default: {output}"
             );
         }
 
-        // Symlinked ~/Library/Java/JavaVirtualMachines -> ~/Library/real-jvms:
-        // resolved target must also be write-denied under the ~/Library grant.
-        let sym_home = tempfile::Builder::new()
-            .prefix(".cplt-jvms-sym-")
-            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
-            .unwrap();
-        let sym_home_path = fs::canonicalize(sym_home.path()).unwrap();
-        let real_jvms = sym_home_path.join("Library/real-jvms");
-        fs::create_dir_all(&real_jvms).unwrap();
-        fs::create_dir_all(sym_home_path.join("Library/Java")).unwrap();
-        std::os::unix::fs::symlink(
-            &real_jvms,
-            sym_home_path.join("Library/Java/JavaVirtualMachines"),
-        )
-        .unwrap();
-        let sym_extra_write = [sym_home_path.join("Library")];
-        let mut sym_opts = default_opts(&project_path, &sym_home_path);
-        sym_opts.extra_write = &sym_extra_write;
-        let sym_profile = write_real_profile(&sym_opts);
-        let sym_cmd = format!(
-            "echo pwn > '{real}/pwn' 2>/dev/null && echo SYMLINK_TARGET_WRITE_RAN; true",
-            real = real_jvms.display(),
+        // Under an overlapping allow.write on ~/Library, process-exec is stripped
+        // (#243) so the writable tree cannot become a write-then-exec primitive.
+        let library_dir = home_path.join("Library");
+        let extra_write = [library_dir];
+        let mut writable_opts = default_opts(&project_path, &home_path);
+        writable_opts.existing_home_tool_dirs = Some(&discovery.existing_home_tool_dirs);
+        writable_opts.extra_write = &extra_write;
+        let writable_profile = write_real_profile(&writable_opts);
+        let writable_cmd = format!(
+            "'{java}' 2>/dev/null && echo EXEC_UNDER_WRITE_RAN; true",
+            java = java_bin.display(),
         );
-        let (sym_out, _) = run_sandboxed(&sym_profile, &sym_cmd);
-        fs::remove_file(&sym_profile).ok();
+        let (writable_out, _) = run_sandboxed(&writable_profile, &writable_cmd);
+        fs::remove_file(&writable_profile).ok();
         assert!(
-            !sym_out.contains("SYMLINK_TARGET_WRITE_RAN"),
-            "resolved target of symlinked JavaVirtualMachines must be write-denied: {sym_out}"
+            !writable_out.contains("EXEC_UNDER_WRITE_RAN"),
+            "overlapping allow.write on ~/Library must strip process-exec on JavaVirtualMachines (#243): {writable_out}"
         );
     }
 

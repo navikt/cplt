@@ -2886,9 +2886,8 @@ fn write_exec_deny_comes_after_every_broad_exec_allow() {
         "/Users/test/.bun/install",
         "/Users/test/Library/pnpm/package-manager-store",
         "/Users/test/.local/share/pnpm/package-manager-store",
-        // Executable and write-denied: `emit_copilot_pkg_denies` / `emit_toolchain_write_deny`.
+        // Executable and write-denied: `emit_copilot_pkg_denies`.
         "/Users/test/Library/Caches/copilot/pkg",
-        "/Users/test/Library/Java/JavaVirtualMachines",
     ];
     const PREFIX: &str = "(allow process-exec (subpath \"";
     for (i, _) in p.match_indices(PREFIX) {
@@ -3967,9 +3966,24 @@ fn profile_grants_user_java_virtual_machines_read_and_exec() {
         !p.contains(&format!("(allow file-write* (subpath \"{jvms}\"))")),
         "{jvms} must remain read-only"
     );
+
+    let extra_write = [PathBuf::from("/Users/test/Library")];
+    let p_writable = generate_profile(
+        &SandboxConfig {
+            extra_write: &extra_write,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    let exec_allow = p_writable
+        .rfind(&format!("(allow process-exec (subpath \"{jvms}\"))"))
+        .expect("tool dir exec allow must be emitted");
+    let exec_deny = p_writable
+        .rfind("(deny process-exec (subpath \"/Users/test/Library\"))")
+        .expect("allow.write exec deny must be emitted");
     assert!(
-        p.contains(&format!("(deny file-write* (subpath \"{jvms}\"))")),
-        "{jvms} must have an explicit write deny after user allows:\n{p}"
+        exec_deny > exec_allow,
+        "overlapping allow.write must strip process-exec on {jvms} (#243):\n{p_writable}"
     );
 
     let fake_home = tempfile::tempdir().unwrap();
