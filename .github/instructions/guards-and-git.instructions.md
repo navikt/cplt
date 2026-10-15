@@ -1,5 +1,5 @@
 ---
-applyTo: "src/gh_proxy.rs,src/gh_graphql.rs,src/git.rs,src/shim.rs"
+applyTo: "src/gh_proxy.rs,src/gh_graphql.rs,src/git.rs,src/shim.rs,src/agent.rs,src/opencode_v2.rs,src/gradle_init.rs"
 ---
 
 # Command guards and git hardening review instructions
@@ -12,8 +12,8 @@ applyTo: "src/gh_proxy.rs,src/gh_graphql.rs,src/git.rs,src/shim.rs"
 
 ## Git guard and parent-side `src/git.rs`
 
-- **Sensitive git config keys.** The git guard must block `-c` and `git config` writes to execution and redirection keys including `core.fsmonitor`, `core.sshCommand`, `core.hooksPath`, `core.pager`, `core.editor`, `core.gitProxy`, `diff.external`, `credential.helper`, `filter.*`, `alias.*`, `protocol.*`, and `remote.origin.url`.
-- **Single parent-side choke point.** Every parent-side git command must use `git::trusted_git()`. Because `cplt` runs `git` on untrusted working trees before and after the session, `trusted_git()` must neutralize repo-local `.git/config` execution hooks, filters, pagers, and submodule recursion via `GIT_CONFIG_COUNT` and refuse leading `--git-dir`, `--work-tree`, `-C`, `-c`, `--config-env`, and `--exec-path` flags.
+- **Sensitive git config keys.** The git guard must block `-c` and `git config` writes to execution and redirection keys including `core.fsmonitor`, `core.hooksPath`, `core.sshCommand`, `core.pager`, `core.editor`, `core.gitProxy`, `diff.external`, `credential.helper`, `filter.*`, `alias.*`, `protocol.*`, and `remote.origin.url`.
+- **Single parent-side choke point.** Every parent-side git invocation must go through `git::command(project_dir, args)`, not raw `Command::new(git::trusted_git()?)`. `git::trusted_git()` only resolves the binary path from `TRUSTED_BIN_DIRS`. `git::command()` applies `harden()`, which clears inherited `GIT_*` environment variables, sets `GIT_CONFIG_NOSYSTEM=1` and `GIT_ATTR_NOSYSTEM=1`, prepends `-c` overrides from `CONFIG_OVERRIDES`, inserts `--no-textconv --no-ext-diff` after `diff`, refuses `VALUE_TAKING_GLOBALS` (`-C`, `-c`, `--git-dir`, `--work-tree`, `--namespace`, `--config-env`, `--attr-source`), and refuses worktree-reading subcommands when `repo_defines_content_filter(project_dir)` is true.
 
 ## REST and GraphQL inspection in `src/gh_graphql.rs`
 

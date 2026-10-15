@@ -42,7 +42,7 @@ jobs:
       - name: Validate PR description against template
         env:
           EVENT_NAME: ${{ github.event_name }}
-          ACTOR: ${{ github.actor }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
           python3 - <<'PY'
@@ -52,15 +52,32 @@ jobs:
               print("Not a pull_request event, skipping PR body check.")
               sys.exit(0)
 
-          actor = os.environ.get("ACTOR", "")
-          if actor in ("dependabot[bot]", "github-actions[bot]"):
-              print(f"Automated actor {actor}, skipping PR body check.")
+          author = os.environ.get("PR_AUTHOR", "")
+          if author in ("dependabot[bot]", "github-actions[bot]"):
+              print(f"Automated PR author {author}, skipping PR body check.")
               sys.exit(0)
 
+          def strip_fenced_code(text: str) -> str:
+              out = []
+              fence_char = None
+              fence_len = 0
+              for line in text.splitlines():
+                  if fence_char is None:
+                      m = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+                      if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
+                          fence_char = m.group(1)[0]
+                          fence_len = len(m.group(1))
+                          out.append("CODE_BLOCK")
+                      else:
+                          out.append(line)
+                  elif re.match(rf"^ {{0,3}}{re.escape(fence_char)}{{{fence_len},}}\s*$", line):
+                      fence_char = None
+                      fence_len = 0
+              return "\n".join(out)
+
           raw = os.environ.get("PR_BODY") or ""
-          # Strip HTML comments and neutralize fenced code blocks before structural checks
-          body = re.sub(r"<!--.*?-->", "", raw, flags=re.DOTALL)
-          body_no_code = re.sub(r"^\s*```.*?^\s*```", "CODE_BLOCK", body, flags=re.DOTALL | re.MULTILINE)
+          body = re.sub(r"<!--(?:.*?-->|.*$)", "", raw, flags=re.DOTALL)
+          body_no_code = strip_fenced_code(body)
 
           required = [
               "## Summary",
@@ -73,11 +90,13 @@ jobs:
           positions = {}
           errors = []
           for heading in required:
-              m = re.search(rf"(?m)^{re.escape(heading)}\s*$", body_no_code)
-              if not m:
+              matches = list(re.finditer(rf"(?m)^{re.escape(heading)}\s*$", body_no_code))
+              if not matches:
                   errors.append(f"Missing required section heading '{heading}' in PR description")
+              elif len(matches) > 1:
+                  errors.append(f"Duplicate section heading '{heading}' in PR description")
               else:
-                  positions[heading] = (m.start(), m.end())
+                  positions[heading] = (matches[0].start(), matches[0].end())
 
           if not errors:
               ordered = sorted(positions.items(), key=lambda kv: kv[1][0])

@@ -1,5 +1,5 @@
 ---
-applyTo: "src/sandbox*.rs,src/proxy*.rs"
+applyTo: "src/sandbox*.rs,src/proxy*.rs,src/upstream.rs,src/subscriptions.rs,src/update.rs,src/untrusted.rs,src/scratch.rs,src/audit.rs,src/discover.rs,src/detect.rs"
 ---
 
 # Sandbox, environment, and proxy review instructions

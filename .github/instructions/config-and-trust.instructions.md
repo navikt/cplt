@@ -1,5 +1,5 @@
 ---
-applyTo: "src/config/**/*.rs,src/repo_config.rs,src/trust.rs,src/settings.rs"
+applyTo: "src/config/**/*.rs,src/repo_config.rs,src/trust.rs,src/settings.rs,src/main.rs,src/init.rs"
 ---
 
 # Configuration, repo config, and trust store review instructions
