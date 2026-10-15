@@ -2,6 +2,19 @@
 
 The sandbox is kernel-enforced, so **all restrictions apply to every process spawned inside it**: dev servers, test runners, build tools, package managers. That is deliberate, since a sandboxed agent could otherwise escape by spawning a child process. It does affect some workflows.
 
+## Copilot's VS Code launcher and Keychain substitution
+
+On macOS, an editor-provided Copilot launcher can exit with
+`ERROR: SecItemCopyMatching failed -25300` even when `GH_TOKEN` is supplied
+(#753). cplt refuses that launcher when the Keychain substitute is active.
+It does not restore Keychain access automatically.
+
+Install standalone Copilot outside cplt with `brew install --cask copilot-cli`
+or `npm install -g @github/copilot`, and put it in PATH. cplt prefers the
+standalone install over editor launchers, even when the editor appears first
+in PATH. Check the selected path with `cplt doctor --verbose`, then launch
+`cplt`. Keep `sandbox.keychain_substitute` enabled.
+
 ## Branch tracking is silently dropped
 
 **macOS only.** `.git/config` is write-denied there (it is a `core.hooksPath`
@@ -23,7 +36,7 @@ tracking was recorded. It was not.
 
 | Command | What happens |
 | --- | --- |
-| `git push -u origin <branch>` | With the git guard on: cplt runs the push without `-u` and says so in one line, so git prints no config error. The push succeeds and no upstream is recorded. With the guard off: push succeeds, git prints the error and a false tracking line, exit 0 |
+| `git push -u origin <branch>` | With the git guard on: cplt runs the push without `-u` and says so in one line, so git prints no config error. The push succeeds, and cplt records the upstream after the session if the push qualifies (see below). With the guard off: push succeeds, git prints the error and a false tracking line, exit 0 |
 | `git checkout -b <branch> origin/<base>` | Branch created, tracking **not** recorded, exit 0 |
 | `git branch --set-upstream-to=origin/<base>` | Records nothing, exit 0 |
 | `git config user.name <x>` | Fails loudly, exit 4 |
@@ -33,6 +46,31 @@ For `git push`, cplt removes `-u` and `--set-upstream` before the push runs.
 The flag does nothing except write that config, so the push itself is
 unchanged, and git has no failed write to report. The one line cplt prints
 instead:
+
+``cplt: pushing without -u, because .git/config is read-only in the sandbox. cplt records the upstream when the session ends, if the push qualifies; otherwise it prints the `git branch -u` line to run. Until then, name the branch on later pushes: `git push origin HEAD:<branch>`.``
+
+When the session ends, cplt sets `branch.<branch>.remote` and
+`branch.<branch>.merge` itself, outside the sandbox, and prints one line per
+branch. It does this only when all of these hold:
+
+- the command was exactly `git push -u <remote> <branch>` or
+  `git push -u <remote> HEAD`, with no other flags and no `src:dst` refspec.
+  `HEAD` is the branch checked out when the push ran, not at session end
+- the repository is the launch repository or one named with `--repo-dir`, not
+  a clone nested inside one
+- the branch exists locally, the remote is one `git remote` lists, and the git
+  guard would allow `git push <remote> <branch>` under the session's policy
+- the audit reports that the session settled: no process from it was still
+  running. With `--no-audit` there is no such report and nothing is recorded
+- the session had a scratch dir (not `--no-scratch-dir`)
+
+Otherwise cplt prints the line to run yourself:
+`git branch -u <remote>/<branch> <branch>`.
+
+A branch pushed with `-u` more than once gets the remote of the last push.
+
+Under `--quiet`, which `cplt exec` defaults to, nothing is recorded and no
+line is printed at session end. The in-session note says so instead:
 
 ``cplt: pushing without -u, because .git/config is read-only in the sandbox. No upstream is recorded, so name the branch on later pushes: `git push origin HEAD:<branch>`, or run `git branch -u origin/<branch>` outside the sandbox.``
 
@@ -50,7 +88,7 @@ from a pathspec.
 **The shape that works**, and what to tell an agent to do: push with an explicit
 refspec and open the PR with an explicit head, so nothing needs local config.
 To record the upstream anyway, run `git branch -u origin/<branch>` outside the
-sandbox.
+sandbox, or rely on the session-end step above for `git push -u`.
 
 ```bash
 git push origin HEAD:my-branch
@@ -62,13 +100,18 @@ not only to repositories named with `--repo-dir`. Tracked in
 [#402](https://github.com/navikt/cplt/issues/402), which also covers whether
 the guard should intercept these forms and fail loudly instead.
 
-## Linux: the system keyring is unreachable, so agents ask you to sign in again
+## Linux: keyring access depends on the backend and agent version
 
 `gnome-keyring`, `kwallet` and anything else behind libsecret are reached over
-D-Bus. The sandbox masks the session bus socket (`$XDG_RUNTIME_DIR/bus`) and
-`/run/dbus/system_bus_socket`, and does not pass `DBUS_SESSION_BUS_ADDRESS`, so
-there is no Secret Service inside it. An agent that keeps its credential there
-finds no vault:
+D-Bus. Removing `DBUS_SESSION_BUS_ADDRESS` only affects discovery, and denying
+keyring files does not block the Secret Service API. On Ubuntu 24.04 in Colima,
+kernel 6.8 reporting Landlock ABI 4, a private Secret Service remained readable
+under Landlock + seccomp using `XDG_RUNTIME_DIR` or a known socket, including
+with all token variables denied. Bubblewrap was untested because namespace
+creation was blocked. See [the measured Linux gap](../SECURITY.md#linux-specific-limitations).
+
+Native login may work or fail depending on the backend and agent version.
+An agent may report:
 
 ```
 ! System vault not available
@@ -77,26 +120,92 @@ finds no vault:
   Store token in plain text config file?
 ```
 
-This is not a distribution problem, and it is not specific to Ubuntu. D-Bus is a
-broad IPC channel into the whole desktop session, which is why it is masked.
-
-**Fix:** authenticate on the host, where the keyring works, and let cplt pass
-the token in.
+That prompt alone does not establish whether the sandbox blocked the bus or
+why authentication failed. Recommended recovery for Copilot is to authenticate
+on the host and let cplt hand over the credential:
 
 ```bash
-gh auth login                                   # outside cplt, once
+gh auth login --hostname github.com              # outside cplt, once
 cplt config set gh_guard.inject_token true --force   # needs gh_guard.enabled
 ```
 
 `--force` is required because putting the token in the environment is a real
 weakening: it is inherited by every process in the sandbox and readable from any
 of them, through `/proc/<pid>/environ` on Linux or `ps -E` on macOS. See
-[gh-guard.md](gh-guard.md). Answering "yes, store in plain text" also works and
-persists across sessions, at the cost of a token on disk in the agent's config
-directory.
+[gh-guard.md](gh-guard.md). A manually supplied, session-only token environment
+is another handover option. Neither method proves that native keyring access
+is blocked. Prefer these to accepting plaintext token storage in the agent's
+config directory.
 
-macOS is unaffected: the Keychain is granted (narrowed per agent by
-`keychain_substitute`).
+### The same vault prompt on macOS
+
+Run `cplt doctor --agent copilot` outside the agent. With `keychain: denied`
+and `auth: gh auth token (passed as GH_TOKEN)`, cplt deliberately removed the
+Keychain grant because it retrieved a replacement credential. This reports
+handover, not token validity, Copilot authorization or the selected account.
+An explicit `/login` can still try to
+store a new credential in the denied Keychain. Cancel the plaintext-storage
+offer while investigating.
+
+Check the gh account and compare ordinary startup with a one-shot request:
+
+```bash
+(
+unset COPILOT_GITHUB_TOKEN GH_TOKEN GITHUB_TOKEN
+gh auth status --hostname github.com
+gh api --hostname github.com user --jq .login
+cplt --agent copilot -- -p "Reply with OK only"
+cplt --agent copilot
+)
+```
+
+Token retrieval does not prove validity or Copilot authorization. Record the
+error before the vault prompt and whether it appeared automatically or after
+`/login`. If both requests fail, compare the same token with the standalone
+Copilot executable outside cplt. Use the absolute path reported by
+`cplt doctor --agent copilot --verbose` to bypass shell aliases and PATH shims.
+Clear all three exported token variables in that comparison too, then assign
+the stored gh token as `GH_TOKEN` for the standalone command. Otherwise an
+exported credential may override the stored one. Use a subshell to preserve
+the calling shell's environment. Do not print tokens or run token assignment
+with shell tracing enabled.
+
+For Copilot's own stored login, sign in with the standalone executable outside
+cplt and verify secure storage. cplt does not extract that credential today.
+To test that login on macOS:
+
+1. Record the prior values and whether each key was explicitly set, including
+   any repository-local override. Run the following from the same repository
+   and config scope used for the launch. These commands write global config;
+   add `--local` when changing a repository-local override:
+
+   ```bash
+   cplt config set sandbox.keychain_substitute false
+   cplt config set gh_guard.inject_token false
+   ```
+
+   Substitution off restores broad Keychain read/write access, not access to
+   just Copilot's item. Injection must also be off: otherwise cplt can still
+   put gh's stored token in Copilot's environment.
+2. Restart with the exported tokens cleared in a subshell:
+
+   ```bash
+   (
+   unset COPILOT_GITHUB_TOKEN GH_TOKEN GITHUB_TOKEN
+   cplt --agent copilot
+   )
+   ```
+
+   This tests native-login availability, not isolation from every gh source.
+   Copilot can still invoke gh, and readable `hosts.yml` or a guard cache can
+   supply a token. A successful request alone does not identify the source.
+3. Restore each key to its actual prior value in the scope you changed.
+   Use `cplt config set <key> --unset` only if that key was originally unset
+   there; otherwise restore its explicit `true` or `false` value. The subshell
+   preserves the calling shell's exported tokens.
+
+Maintainers: [authentication acceptance tests](copilot-auth-testing.md) separate
+automated handover/enforcement checks from live onboarding and renewal evidence.
 
 ## `.env` file blocking
 
@@ -281,6 +390,20 @@ If you still see this error, check that you have not set `scratch_dir = false` i
 ```bash
 cplt config explain sandbox.scratch_dir
 ```
+
+## Embedded Kafka zero-copy on macOS
+
+Kafka sends log records through Java `FileChannel.transferTo()`, which uses
+Darwin `sendfile()`. Older cplt profiles can permit the localhost connection and
+ordinary writes but deny `sendfile()`, producing `Operation not permitted` in
+`FileDispatcherImpl.transferTo0`, followed by consumer disconnects or EOF.
+
+Updated profiles support this with `sandbox.allow_localhost_any = true`, outside
+`proxy.forced`. The IPv4-stack JVM setting is still required on macOS; do not
+clear the `JAVA_TOOL_OPTIONS` cplt injects. Changing `java.io.tmpdir` or enabling
+JVM attach does not fix this socket check. Explicit per-port localhost grants
+do not enable this zero-copy allowance. It also enables zero-copy on established
+non-loopback sockets; new connections still use the existing destination rules.
 
 ## Cache exec (Playwright, pnpm dlx, etc.)
 
@@ -471,6 +594,43 @@ CYPRESS_REMOTE_DEBUGGING_PORT=9333 cplt \
 > Chromium launcher still needs `--no-sandbox` of its own. Note that the MCP's
 > README documents an environment variable name the shipped code does not read.
 
+### Puppeteer and mermaid-cli (`mmdc`)
+
+Puppeteer downloads Chrome to `~/.cache/puppeteer`. On macOS cplt never allows
+exec there, and `--allow-cache-exec` only covers `~/Library/Caches/<subdir>`,
+so the launch fails with `Error: spawn EPERM`. Puppeteer also talks to Chrome
+over a localhost WebSocket by default, which fails with
+`connect EPERM 127.0.0.1:<port>` (`mmdc` only prints `[object Object]`).
+
+Point Puppeteer at Playwright's browser and use a pipe instead of a socket.
+With `sandbox.allow_cache_exec ms-playwright` set, a `puppeteer-config.json`
+for `mmdc -p`:
+
+```json
+{
+  "executablePath": "/Users/<you>/Library/Caches/ms-playwright/chromium_headless_shell-<rev>/chrome-headless-shell-mac-arm64/chrome-headless-shell",
+  "args": ["--no-sandbox"],
+  "pipe": true
+}
+```
+
+Adjust the path to the `chrome-headless-shell` build you have. `--no-sandbox`
+is needed for the same reason as with Playwright above; without it the launch
+fails with `ConnectionClosedError: Connection closed`. Puppeteer only guarantees its own bundled
+browser, so a Playwright upgrade can bring a Chromium that this Puppeteer
+version does not support. If launches start failing after an upgrade, use the
+`PUPPETEER_CACHE_DIR` alternative below, which gives Puppeteer its matching
+browser.
+
+Alternatives: set `PUPPETEER_CACHE_DIR` to a directory under
+`~/Library/Caches/ms-playwright`, download the browser there outside cplt
+(`npx puppeteer browsers install chrome-headless-shell`) and pass the variable
+with `--pass-env PUPPETEER_CACHE_DIR`; then `executablePath` can go. Or use
+`--allow-localhost-any` instead of `"pipe": true`.
+
+`npx -y @mermaid-js/mermaid-cli` fails before any of this with `bad interpreter`;
+see [npx](#npx-and-npm-exec) above.
+
 ## Copilot CLI's own command sandbox (1.0.83+)
 
 Copilot CLI sandboxes shell commands itself since 1.0.83, and that sandbox
@@ -640,12 +800,12 @@ So neither port rules nor proxy-forced mode stop SSH to `ssh.github.com:443`. Wh
 
 ## D-Bus and systemd (Linux) — the session manager is reachable
 
-`XDG_RUNTIME_DIR` is on the environment allowlist, and Landlock cannot restrict `connect()` to a pathname unix socket before ABI v9 (kernel 7.1), so on a current kernel `$XDG_RUNTIME_DIR/bus` is reachable from inside the sandbox unless bubblewrap masks it. This is established by reading the code, not by running it on a host — treat it as reachable rather than demonstrated. `systemd-run --user <cmd>` hands the command to the user's systemd instance, which starts it as a new unit **outside** Landlock, seccomp and the bubblewrap namespaces. The same applies to any other D-Bus service on the session bus that can start a process.
+`XDG_RUNTIME_DIR` is on the environment allowlist, and Landlock cannot restrict `connect()` to a pathname unix socket before ABI v9 (kernel 7.1), so below that ABI `$XDG_RUNTIME_DIR/bus` is reachable from inside the sandbox unless bubblewrap masks it. Private Secret Service reads were demonstrated on ABI 4 as [described above](#linux-keyring-access-depends-on-the-backend-and-agent-version); the session-manager escape remains a code-reading conclusion. `systemd-run --user <cmd>` hands the command to the user's systemd instance, which starts it as a new unit **outside** Landlock, seccomp and the bubblewrap namespaces. The same applies to any other D-Bus service on the session bus that can start a process.
 
-- **With bubblewrap** (the default when `bwrap` is installed) `$XDG_RUNTIME_DIR/bus`, `$XDG_RUNTIME_DIR/systemd` and `/run/dbus/system_bus_socket` are mount-masked, which closes this path
+- **Require `sandbox.use_bubblewrap = true`** for the configured masks over `$XDG_RUNTIME_DIR/bus`, `$XDG_RUNTIME_DIR/systemd` and `/run/dbus/system_bus_socket`. They cover selected known endpoints, not every custom pathname or abstract socket, and were unverified in the measured environment
 - **Without it** — not installed, `--no-bubblewrap`, or an auto-detect fallback at spawn time — nothing closes it below kernel 7.1
-- From kernel 7.1 (Landlock ABI v9) the `connect()` is denied outright, bubblewrap or not
-- If your threat model needs it closed today, install bubblewrap, or run cplt inside a container or VM
+- From kernel 7.1 (Landlock ABI v9), cplt's existing `ResolveUnix` rules mediate pathname connections; writable-tree grants, including `/tmp` and the project, also allow them. ABI v6 abstract-socket scoping does not close the ABI 4–8 pathname gap
+- If your threat model needs it closed, verify the masks in the actual run, or use a container or VM without the host bus exposed
 
 ## UDP is unrestricted outside proxy-forced (Linux)
 
@@ -720,25 +880,25 @@ Git commit works for every agent. Whether `git push` works over HTTPS depends on
    ```bash
    gh auth setup-git
    ```
-   `gh auth setup-git` writes the helper with an absolute path (for example `!/opt/homebrew/bin/gh auth git-credential`). With the gh guard on, cplt adds `!gh auth git-credential` as a last helper for `https://github.com` inside the sandbox, so git goes through the gh guard and gets the exec token ([how](gh-guard.md#how-gh-itself-authenticates)). Your own `github.com` helpers run first and win when they return a credential. Your git config is not changed.
+   `gh auth setup-git` writes the helper with an absolute path (for example `!/opt/homebrew/bin/gh auth git-credential`). With the gh guard on, cplt adds `!gh auth git-credential` as a last helper for `https://github.com` inside the sandbox, so git goes through the gh guard and gets the exec token ([how](gh-guard.md#how-gh-itself-authenticates)). Your own `github.com` helpers run first and win when they return a credential. Your git config is not changed. The same helper means the agent can get the token itself; see [the limit](../SECURITY.md#github-token-handling-per-agent).
 
 **Credentials per agent (macOS).** The helper only produces a token if `gh` can reach one from inside the sandbox:
 
 | Agent                                       | HTTPS push  | Credential source                                                          |
 | ------------------------------------------- | ----------- | -------------------------------------------------------------------------- |
-| `copilot`                                   | ✅ Works     | Keychain is denied by default; `gh` uses the `GH_TOKEN` cplt hands Copilot (from `gh auth token`). Where the grant stays (no token, or an account mismatch), the Keychain is readable, as in the next row |
-| `antigravity`, `claude`, `goose`            | ✅ Works     | Login Keychain is readable, which is where `gh auth login` stores the token |
+| `copilot`                                   | Token source depends on launch | On macOS substitution is on by default, but denies Keychain access only when a substitute resolves. `gh` reads surviving `GH_TOKEN`/`GITHUB_TOKEN`; it ignores `COPILOT_GITHUB_TOKEN`. The guard can supply an exec token when the grant was dropped and gh has no environment token. No substitute, or a detected account mismatch, keeps the Keychain grant |
+| `antigravity`, `claude`, `goose`            | Token source depends on launch | Login Keychain is granted unless the agent's substitution applies. With the gh guard on, its exec token can authenticate gh without that grant |
 | `opencode`, `pi`, `dsh`, `cplt exec`        | ✅ Works     | Keychain is denied. The gh guard reads the token at launch and hands it to `gh` as the exec token when git asks for credentials ([how](gh-guard.md#how-gh-itself-authenticates)). With `gh_guard.enabled = false` these agents need a token in `hosts.yml` or `--pass-env GH_TOKEN` |
 
-Both rows depend on where `gh` keeps the token. An installation that stores it in `~/.config/gh/hosts.yml` rather than the Keychain works for every agent, since that file is readable in every profile, and `--pass-env GH_TOKEN` supplies one regardless of agent.
+Authentication still depends on a valid credential for the target host. A token stored in `hosts.yml` is normally readable by every agent; gh can instead keep the secret in the OS credential store. `--pass-env GH_TOKEN` forwards an exported token regardless of agent, unless `deny.env` removes it.
 
 The Keychain row has one caveat. When the Keychain substitute applies (`sandbox.keychain_substitute`: by default for Copilot and Claude Code, `true` for the others) the Keychain grant is dropped for an agent whose own credential already reaches it another way: `claude` with `CLAUDE_CODE_OAUTH_TOKEN` exported, `antigravity` with its `~/.gemini/antigravity-cli/antigravity-oauth-token` fallback file present. The drop takes `gh`'s Keychain token with it. With the gh guard on, the exec token covers push for those two agents as in the row below; with it off, push fails for them in that configuration. Copilot keeps a token `gh` can use when the one it was handed is `GH_TOKEN` or `GITHUB_TOKEN`, which covers the `gh auth token` handover. A token exported only as `COPILOT_GITHUB_TOKEN` is one `gh` does not read, so there the exec token is written and the gh guard covers push. Push under a dropped grant was not tested. goose, and Antigravity without its fallback file, have no substitute and keep the whole-Keychain grant; that gap is known.
 
 For Claude Code the drop also takes its MCP OAuth tokens, which it keeps in the Keychain on macOS. Each MCP server that uses OAuth asks for one fresh sign-in, and Claude Code then stores the token in plaintext in `~/.claude/.credentials.json`, which the agent can read and write ([credential management](https://code.claude.com/docs/en/authentication.md#credential-management)). Those MCP tokens are exposed instead of the Keychain items the grant reached.
 
-**On Linux the table does not apply.** There is no Keychain grant to drop in the first place; `gh` reads its token from the Secret Service or from `hosts.yml`, and push works wherever that lookup succeeds.
+**On Linux there is no Keychain grant to drop.** Host-side gh can retrieve a stored token from the Secret Service or `hosts.yml`; the guard's exec cache can supply it to sandboxed gh. Direct access to the Secret Service inside the sandbox is not guaranteed.
 
-`~/.config/gh/hosts.yml` and `config.yml` are readable for every agent, so an installation that keeps the token in `hosts.yml` rather than the Keychain works everywhere — unless you take the `--deny-path ~/.config/gh` mitigation from [Honest gaps](../SECURITY.md#honest-gaps), which closes that path too.
+`hosts.yml` and `config.yml` are normally readable for every agent, including at an absolute `GH_CONFIG_DIR` or `$XDG_CONFIG_HOME/gh` override. A `--deny-path` on that directory blocks sandboxed file access where enforced. It does not prevent host-side gh extraction, environment handover or guard token caches; see [Honest gaps](../SECURITY.md#honest-gaps).
 
 Exporting a token in your own shell is not enough on its own: `GH_TOKEN`, `GITHUB_TOKEN` and `COPILOT_GITHUB_TOKEN` are stripped from the environment of every agent except Copilot. Passing one explicitly does work, because `--pass-env` is applied after that suppression: `cplt --pass-env GH_TOKEN exec …` forwards it, and `gh auth status` then reports `Logged in to github.com account … (GH_TOKEN)`. Note that `--pass-env` is a global flag and goes before the subcommand, not after it. A repo `deny.env` naming the variable strips it again.
 
@@ -1328,19 +1488,53 @@ Each agent's global config dir is mounted read/write, but the files in it that *
 
 | Agent | Denied | What breaks |
 | --- | --- | --- |
-| Pi | Write-denied: `settings.json`, `trust.json`, `extensions/`, `npm/`, `git/`, `skills/`. Separately, `~/.pi/agent` itself is read-only, with write granted per subdirectory (`sessions/`, `prompts/`, `themes/`, `tools/`, `tmp/`) so that neither `bin/` nor `skills/` is inside a writable tree, plus one named carve-out: the directory `trust.json.lock/` may be created, `utimes`'d and removed — Pi's `proper-lockfile` takes that lock to *read* the trust store at startup (#449) | ⚠️ `pi install`, `/trust`, editing or installing a skill, and every in-session setting that persists to `settings.json`: `/model` (Ctrl+S), `/thinking`, `/settings`. Because the root is read-only, Pi cannot create any other **new** top-level entry under `~/.pi/agent`: a first-ever `pi auth login` (creates `auth.json`) and the managed-binary bootstrap (Pi downloads `fd`/`rg` into `bin/` when they are not on `PATH`) have to run outside cplt. The lock grant is a single literal name, not "new directories": a directory-wide create/remove grant is a rename grant (`mv bin bin.old; mv tmp bin`), which is exactly the escape the read-only root closes. Residual on macOS: a writable sibling can be renamed onto the lock name (`mv tmp trust.json.lock`), which only breaks Pi's own lock. **Linux: Landlock cannot scope creation to a name and same-directory rename needs only the rights a directory-wide grant carries, so the lock grant applies only when bubblewrap is active** (every sibling and `bin/` is then a mountpoint and rename is `EBUSY`). **Without bubblewrap the root stays read-only and Pi does not start** — `cplt doctor` reports why and what to install. Auth is unaffected once `auth.json` exists — Pi uses provider API keys via `--pass-env` |
-| Claude Code | `~/.claude/settings.json`, `statusline.sh`, `plugins/` | ⚠️ Editing `settings.json` (including `hooks`) from inside a session. `commands/`, `agents/` and `skills/` stay writable — and the model can invoke them too, not just the user, so a file planted there reaches a host shell the next time the model picks it (see SECURITY.md, [#366](https://github.com/navikt/cplt/issues/366)). Auth is unaffected — the OAuth token is in the Keychain or `.credentials.json` |
+| Pi | Write-denied: `settings.json`, `trust.json`, `extensions/`, `npm/`, `git/`, `skills/`. Separately, `~/.pi/agent` itself is read-only, with write granted per subdirectory (`sessions/`, `prompts/`, `themes/`, `tools/`, `tmp/`) so that neither `bin/` nor `skills/` is inside a writable tree. Named lock directories `trust.json.lock/`, `auth.json.lock/` and `settings.json.lock/` may be created, timestamped and removed. Pi takes these locks when reading its trust store and settings and refreshing auth availability | ⚠️ `pi install`, `/trust`, editing or installing a skill, and every in-session setting that persists to `settings.json`: `/model` (Ctrl+S), `/thinking`, `/settings`. Because the root is read-only, Pi cannot create any other **new** top-level entry under `~/.pi/agent`: a first-ever `pi auth login` (creates `auth.json`) and the managed-binary bootstrap (Pi downloads `fd`/`rg` into `bin/` when they are not on `PATH`) have to run outside cplt. Lock grants match literal directory names: a directory-wide create/remove grant is a rename grant (`mv bin bin.old; mv tmp bin`), which is exactly the escape the read-only root closes. Residual on macOS: a writable sibling can be renamed onto a lock name (`mv tmp trust.json.lock`), which only breaks Pi's own lock. **Linux: Landlock cannot scope creation to a name and same-directory rename needs only the rights a directory-wide grant carries, so the lock grant applies only when bubblewrap is active** (every sibling and `bin/` is then a mountpoint and rename is `EBUSY`). **Without bubblewrap the root stays read-only and Pi does not start**. `cplt doctor` reports why and what to install. Auth is unaffected once `auth.json` exists. Pi uses provider API keys via `--pass-env` |
+| Claude Code | `~/.claude/settings.json`, `statusline.sh`, `plugins/` | ⚠️ Editing `settings.json` (including `hooks`) from inside a session. `commands/`, `agents/` and `skills/` stay writable — and the model can invoke them too, not just the user, so a file planted there reaches a host shell the next time the model picks it (see SECURITY.md, [#366](https://github.com/navikt/cplt/issues/366)). Auth is unaffected — the OAuth token is in the Keychain or `.credentials.json`. **Hook and status-line scripts outside `~/.claude` ([#702](https://github.com/navikt/cplt/pull/702), [#705](https://github.com/navikt/cplt/issues/705)).** cplt reads the user-level `settings.json` (never `settings.local.json` or a project's `.claude/settings*.json`, which the agent can write) and grants read + execute on the one file each hook or `statusLine` command runs: the command itself, or the script an interpreter (`python3`, `node`, `bash`, `uv run`, ...) is given. Other arguments, such as a log file, are not granted. The granted file is write-protected inside the sandbox. Files in a credential directory or under the Claude config root are skipped. A script inside the project, a `--repo-dir` root, an `allow.write` path or another writable grant gets no extra grant either: it runs under the normal rules for that tree and stays editable. A script that imports sibling files needs `allow.read` on its directory. On Linux the grant applies only when Bubblewrap is active, because only its read-only bind keeps `settings.json` out of the agent's reach. With Landlock alone the whole Claude config root is writable, so cplt drops the grant, warns, and the hook may fail. On Linux, cplt creates a missing `~/.claude/settings.json` (or its `CLAUDE_CONFIG_DIR` equivalent) as `{}` before every launch, with or without Bubblewrap, so Bubblewrap can bind it read-only; an existing file is never overwritten. cplt refuses to start when `CLAUDE_CONFIG_DIR` points at or around a credential directory such as `~/.ssh`. On hosts that run Claude without Bubblewrap (Landlock only), the agent can edit `settings.json` during that session, and a later Bubblewrap launch trusts whatever hook paths it names; only scripts outside writable trees and credential directories get read + exec. |
 | Antigravity | `~/.gemini/config/hooks.json`, `config/mcp_config.json`, `antigravity-cli/bin/` | ⚠️ Editing hooks or MCP server config from inside a session. Auth is unaffected |
 | goose | the whole of `~/.config/goose` is read-only, not just named files | ⚠️ `/mode` and theme changes, the first-run telemetry prompt, and persisted "always allow" tool permissions do not survive a sandboxed session. Run `goose configure` outside cplt. Ordinary sessions are unaffected — goose does not rewrite `config.yaml` while running. Auth is unaffected: secrets come from the keyring or `--pass-env` |
-| DeepSeek Harness | `$DSH_HOME/cordis.patch.yml` (the home-level overlay; `$DSH_HOME` is `~/.dsh` unless set) | ⚠️ The home-level overlay is write-denied because the Loader reads it at boot. `$DSH_HOME/profiles/` itself stays writable — DSH rewrites each profile's constant `cordis.yml` include-root on every boot — so a per-profile `cordis.patch.yml` and installed plugins remain a residual: do profile and `dsh plugin` edits outside cplt, and always launch `dsh` through cplt so any planted plugin still runs sandboxed. DSH's own per-command sandbox does not nest inside cplt's — macOS refuses nested `sandbox-exec` and cplt's seccomp filter denies the `unshare` bwrap needs — so select DSH's shipped `danger-full-access` permission preset and let cplt be the boundary; left on, tool calls fail with a sandbox runner error. Sessions, settings and cache under `$DSH_HOME` stay writable. A relocated `$DSH_HOME` is granted in place of `~/.dsh`; cplt refuses a value that resolves to a system root or your home directory. Auth: pass the key with `--pass-env DEEPSEEK_API_KEY`, or store it in `$DSH_HOME/.env`; a key saved through DSH's own models UI lands in `$DSH_HOME/.credentials.yaml`, inside the same writable root |
-| Copilot | `~/.copilot/settings.json`, `hooks/`, `mcp-config.json`, `lsp-config.json`, `extensions/`, `installed-plugins/`, `pkg/`, `skills/` | ⚠️ `/settings`, `/config`, `/mcp add`, `/lsp`, and editing or planting a file in a skill directory from inside a session. `agents/` and `instructions/` stay writable. Auth, the session store, saved permissions and logs are untouched — Copilot keeps those in other files. `installed-plugins/` may cost plugin self-update at session start; whether it does is unresolved, see SECURITY.md |
-| OpenCode | — | Nothing denied. Its config dir — where skills live, including a relocated `OPENCODE_CONFIG_DIR` — is granted read-only, so it needs no deny entry |
+| DeepSeek Harness | `$DSH_HOME/cordis.patch.yml` (the home-level overlay; `$DSH_HOME` is `~/.dsh` unless set) | ⚠️ The home-level overlay is write-denied because the Loader reads it at boot. `$DSH_HOME/profiles/` itself stays writable — DSH rewrites each profile's constant `cordis.yml` include-root on every boot — so a per-profile `cordis.patch.yml` and installed plugins remain a residual: do profile and `dsh plugin` edits outside cplt, and always launch `dsh` through cplt so any planted plugin still runs sandboxed. DSH's own per-command sandbox does not nest inside cplt's — macOS refuses nested `sandbox-exec` and cplt's seccomp filter denies the `unshare` bwrap needs — so select DSH's shipped `danger-full-access` permission preset and let cplt be the boundary; left on, tool calls fail with a sandbox runner error. Sessions, settings and cache under `$DSH_HOME` stay writable. A relocated `$DSH_HOME` is granted in place of `~/.dsh`; cplt refuses a value that resolves to a system root or your home directory, or that points at or around a credential directory such as `~/.ssh`. Auth: pass the key with `--pass-env DEEPSEEK_API_KEY`, or store it in `$DSH_HOME/.env`; a key saved through DSH's own models UI lands in `$DSH_HOME/.credentials.yaml`, inside the same writable root |
+| Copilot | `~/.copilot/settings.json`, `hooks/`, `mcp-config.json`, `lsp-config.json`, `extensions/`, `installed-plugins/`, `pkg/`, `skills/` | ⚠️ `/settings`, `/config`, `/mcp add`, `/lsp`, and editing or planting a file in a skill directory from inside a session. `agents/` and `instructions/` stay writable. Auth, the session store, saved permissions and logs are untouched — Copilot keeps those in other files. `installed-plugins/` may cost plugin self-update at session start; whether it does is unresolved, see SECURITY.md. **Hook and MCP scripts outside `~/.copilot` (macOS only, [#704](https://github.com/navikt/cplt/issues/704)).** cplt reads `~/.copilot/settings.json`, `hooks/*.json` and `mcp-config.json` (never a project's hook or MCP files, which the agent can write) and grants read + execute on the one file each hook command (`bash`, `command`, or `exec` + `args`) or MCP server `command` + `args` runs: the command itself, or the script an interpreter is given. All three are write-denied inside the sandbox, so the agent cannot add entries. A symlinked hook file or `hooks/` directory is not read. The other rules match the Claude Code grant: no other arguments, the granted file is write-protected, and credential paths and paths under `~/.copilot` are skipped. A script inside the project or another writable grant (for example `proj/mcp/server.js`) gets no extra grant: it runs under the normal project rules and stays editable. Linux is unchanged for now. |
+| OpenCode | — | Nothing denied. Its config dir — where skills live, including a relocated `OPENCODE_CONFIG_DIR` — is granted read-only, so it needs no deny entry. That also means `opencode plugin <module>`, `opencode mcp add` and `opencode agent create` (global) fail inside the sandbox; run them outside cplt. **`file://` plugins and local MCP commands outside the granted dirs (macOS only, [#703](https://github.com/navikt/cplt/issues/703)).** cplt reads the user config (`opencode.json`, `opencode.jsonc` or `config.json` in `~/.config/opencode`, comments allowed) and grants read + execute on each `file://` plugin and on the one file each `mcp.<name>.command` runs: the command itself, or the script an interpreter (`node`, `python3`, `bun`, ...) is given. Other arguments are not granted. The granted file is write-protected inside the sandbox. A project `opencode.json` and `OPENCODE_CONFIG` are not read. OpenCode v2 uses `OPENCODE_CONFIG_DIR` in place of the default dir, so cplt grants it read-only and reads its config the same way; cplt refuses to start when it points at or around a credential directory such as `~/.ssh`. Nothing is granted when the config dir, or a config file it links to, is in a writable tree. On v2, an `opencode.json` or `opencode.jsonc` in a parent of the launch directory is made readable when it is a regular file or a symlink to one (see [OpenCode v2](#opencode-v2-is-refused)). A directory plugin's entrypoint must resolve inside the plugin dir. Files in a credential directory, under the config dir or under OpenCode's data, state or cache dir are skipped. A plugin that imports sibling files needs `allow.read` on its directory. Linux is unchanged. |
+
+**Pi Linux runtime-fallback exception.** The table's read-only root guarantee applies when bubblewrap is unavailable or disabled during preparation. If bubblewrap passes preparation but fails at launch, the existing fallback to plain Landlock retains directory-creation and removal rights without mountpoint protection. That permits replacing `bin/` with a writable sibling, planting code for a later unsandboxed Pi run. The additional lock names do not change Linux rights or cause this gap.
 
 **There is no flag that reopens these.** The denies are emitted at the very end of the profile, after every user `allow.write`, so even `--allow-write ~/.claude/settings.json` does not override them. That is deliberate: before this, `allow.write = ["~/.claude"]` silently reopened the whole set.
 
 **Linux is weaker than macOS here.** Landlock cannot deny a subpath inside an allowed directory, so the denies are carried by the bubblewrap read-only overlay. They hold only when `bwrap` is installed, and only for paths that **already exist** — bubblewrap cannot bind a missing source, so a `extensions/` directory that does not exist yet is unprotected until something creates it. Without bubblewrap the guard does not apply on Linux at all.
 
 goose is the exception to the table's opening sentence: its config dir is granted read-only outright rather than read/write with named denies. A `write_files` carve-out would not work — goose rewrites `config.yaml`, `permission.yaml` and `permissions/tool_permissions.json` by creating a temp file in the directory and renaming over the target, which needs directory write and would hand back the very vector the deny exists to close.
+
+<a id="opencode-v2-is-refused"></a>
+## OpenCode v2
+
+OpenCode v2 (the npm package `@opencode/cli`, which still installs a binary called `opencode`) runs every tool call in a background service, `opencode serve --service`. A service started outside cplt would run them unsandboxed, so each cplt session runs its own service inside the sandbox ([navikt/cplt#710](https://github.com/navikt/cplt/issues/710)). What follows is macOS; Linux differs where [the Linux section](#opencode-v2-on-linux) says:
+
+- The session gets a private `XDG_STATE_HOME`, so OpenCode does not find a service you run on the host, and an `XDG_CONFIG_HOME` that links every entry of your own config dir, and of its `opencode/` dir (or of `OPENCODE_CONFIG_DIR`, when set), except `service.json`. `OPENCODE_CONFIG_DIR` then points at the session copy. In its place cplt writes one with a free loopback port and a random password. The OpenCode client starts the service on that port, inside the sandbox.
+- The sandbox may connect to that port only. The default service port, 49374, stays blocked, and both of your `service.json` files (in the config and state dirs) are unreadable and cannot be moved by renaming a dir above them, also through a symlinked `opencode/` dir.
+- When the session ends, cplt removes these dirs, and the service shuts down within 5 seconds. If cplt itself is killed, its service keeps running, holding `opencode.db`, until the scratch dir is cleaned up: at the first cplt launch after 24 hours.
+- The links are made at launch. A new top-level entry in `~/.config` or `~/.config/opencode` is seen from the next session. Settings OpenCode writes through a rename, such as `cli.json`, land in the session's copy and are lost when it ends. The links also let the agent see the names of everything in `~/.config`, though not read what is behind them.
+- OpenCode reads the names in `$HOME`, in every parent of the launch directory and in the `.claude`, `.agents` and `.opencode` dirs there (also where those are symlinks). The sandbox allows listing those dirs; their files stay denied.
+- OpenCode also reads `opencode.json` and `opencode.jsonc` in every parent of the launch directory and `AGENTS.md` in every parent up to `$HOME` (or up to the repository root outside `$HOME`), and stops the session ("Instruction initialization blocked by unavailable sources") when an `AGENTS.md` it finds cannot be read. cplt makes each of these files readable, by its exact path only, when it is a regular file. A symlink to a regular file also works (dotfile managers such as stow, chezmoi and home-manager), and both the link and the file it points at at launch are made readable. Repointing the link during the session exposes nothing new. cplt refuses to start when one is a hard link, a directory, a FIFO, a dangling link or a link to a file the sandbox denies, and names the file. A file you deny yourself (`deny.paths`, `.env`) stays unreadable; OpenCode then stops the session. This means the agent can read your `~/AGENTS.md` and any `AGENTS.md` in a parent directory. Instruction files are written for the agent, so it is the intended reader; keep nothing else in them.
+- cplt sets `OPENCODE_DISABLE_MODELS_FETCH=1` and `OPENCODE_DISABLE_AUTOUPDATE=1`.
+- Needs the scratch dir: `--no-scratch-dir` refuses v2. A `deny.env` naming `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `OPENCODE_CONFIG_DIR` or one of the two variables above also refuses it.
+
+**Sessions share your database.** `$XDG_DATA_HOME/opencode/opencode.db` holds your sessions and logins and is shared with the host and with other cplt sessions. When an OpenCode v2 service opens it, it resumes every turn that was in flight when another service stopped. That includes a turn started in another repository's sandbox, which then runs with this service's permissions. A service on the host resumes such turns outside the sandbox. Let a turn finish before you stop a session, and do not run an OpenCode v2 service on the host while cplt sessions are open. The first v2 run creates `opencode.db`, so start that first session alone: two first runs at the same moment can fail with "database is locked" (an OpenCode race), and running again works.
+
+<a id="opencode-v2-on-linux"></a>
+**On Linux** ([navikt/cplt#719](https://github.com/navikt/cplt/issues/719)) v2 needs Bubblewrap; without it cplt refuses v2. The session setup is the same, and Landlock inside Bubblewrap does the rest:
+
+- Landlock cannot deny a file inside a granted dir, so cplt grants `~/.config/opencode` and `~/.local/state/opencode` entry by entry, leaving out `service.json`. An entry OpenCode or you create there during the session is not visible until the next one. A symlinked `opencode/` dir is followed, but a symlink inside it that points out of it is not granted: Landlock would grant whatever it names.
+- Any other grant that covers a host `service.json`, such as `allow.read = ["~/.config"]`, refuses v2 with a message naming it. Narrow the grant to run v2.
+- The session port joins the Landlock connect allowlist, and loopback is exempt from the proxy (`NO_PROXY`) so the client reaches its service. Loopback requests from any tool that honours `NO_PROXY` then bypass the proxy, so they do not show in its log. Landlock filters by port on any host, so the session port is open on remote hosts too, as the proxy port already is.
+- Port filtering needs Landlock ABI 4 (kernel 6.7). On older kernels every loopback port is reachable; cplt warns and continues. A host service on 49374 still asks for its password. `--allow-localhost-any` leaves it reachable the same way.
+- `/proc` is readable: the service is a child of the client and does not get the client's `/proc/self` grant, and it stops at startup without `/proc`. Bubblewrap's pid namespace limits that `/proc` to the session's processes. Without it, `/proc` would show the command lines of all your processes, which is why v2 needs Bubblewrap. If Bubblewrap does not start, cplt stops instead of falling back to Landlock only.
+- `AGENTS.md`, `opencode.json` and `opencode.jsonc` in a parent of the launch directory are readable when each is a regular file, or a symlink to one outside the credential dirs; cplt refuses anything else. OpenCode stops when it cannot read an `AGENTS.md` it finds.
+- The service stops with the session.
+- Install Bubblewrap with your package manager (`apt install bubblewrap`) and do not pass `--no-bubblewrap`. Ubuntu 23.10 and later, including 24.04, block it through AppArmor by default (`kernel.apparmor_restrict_unprivileged_userns`); `cplt doctor` says what to change.
+
+GitHub Copilot hosts for the proxy allowlist come from the `credential` table in `opencode.db`, not from `auth.json` or a gh login. cplt opens it read-only with `/usr/bin/sqlite3` and reads only whether a `github-copilot` login exists, never the credential itself. The host gh token handover below does not apply to v2: cplt does not set `OPENCODE_AUTH_CONTENT` for it.
+
+cplt spots v2 from where the binary lives when it can: a path through an `@opencode` npm scope, or an `opencode/<version>` directory (Homebrew, version managers). Anywhere else, such as `~/.opencode/bin` from the upstream installer, it runs `opencode --version` once and caches the answer in `~/.config/cplt/opencode-version` until the binary changes, so later launches spawn nothing extra. The agent cannot write that directory, so it cannot fake the answer. If `opencode --version` fails or times out, cplt assumes 1.x and launches. `--print-profile` does not check.
 
 ## OpenCode: GitHub Copilot login from the host
 
@@ -1408,3 +1602,8 @@ cplt --allow-write /dev -- -p "run the pexpect suite"
 One flag is enough: an `--allow-write` grant also emits the matching read allow, and `openpty()` needs both because it opens the new slave read-write.
 
 Be clear about what that flag buys: it restores read and write on every device node, including the terminals of your other windows. For the length of that session a compromised agent can print whatever it likes into them, set your clipboard, and read what you type in them. Prefer the first option, and keep the second for a single run rather than putting it in `config.toml`.
+
+
+## Stopping cplt from a script
+
+cplt ignores SIGINT while the agent runs, because Ctrl-C already reaches the agent through the terminal. To stop cplt from a script, send SIGTERM, which cplt passes on to the agent.

@@ -1,12 +1,12 @@
 //! Runtime environment discovery for cplt.
 //!
 //! Probes the local environment to determine:
-//! - Which auth mechanism Copilot will use
+//! - Which credential sources and native auth modules are present
 //! - Where Copilot CLI is installed and what native modules it has
 //! - Which developer tools are available
 //! - Which sandbox-critical paths exist
 //!
-//! All checks are read-only, local (no network), and fast (<500ms total).
+//! Checks are read-only and local (no network); subprocess probes are bounded.
 
 use crate::sandbox::{DENIED_DOTFILES, DENIED_FILES};
 use crate::ui;
@@ -57,9 +57,9 @@ pub enum VersionProbe {
 pub struct AuthDiscovery {
     /// Which env var tokens are set (name only, never the value).
     pub env_tokens: Vec<String>,
-    /// Whether `gh auth token` succeeds.
+    /// Whether trusted gh returns a nonempty stored token for github.com.
     pub gh_cli_auth: bool,
-    /// Whether `~/.config/gh/hosts.yml` exists.
+    /// Whether hosts.yml exists in gh's effective config directory.
     pub gh_config_exists: bool,
     /// Whether `/usr/bin/security` exists and is executable.
     pub security_cli_exists: bool,
@@ -121,29 +121,22 @@ pub struct PathDiscovery {
 const AUTH_ENV_VARS: &[&str] = &["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"];
 
 pub fn discover_auth(home_dir: &Path) -> AuthDiscovery {
+    discover_auth_with(home_dir, stored_gh_token)
+}
+
+fn discover_auth_with(
+    home_dir: &Path,
+    stored_token: impl FnOnce() -> Option<String>,
+) -> AuthDiscovery {
     let env_tokens: Vec<String> = AUTH_ENV_VARS
         .iter()
-        .filter(|var| std::env::var(var).is_ok_and(|v| !v.is_empty()))
+        .filter(|var| std::env::var(var).is_ok_and(|v| !v.trim().is_empty()))
         .map(std::string::ToString::to_string)
         .collect();
 
-    // Trusted path, not PATH (#239): this runs in the unsandboxed parent, and
-    // `gh` is one of the binaries an agent can plant in a write+exec grant. It
-    // also answers the question that actually matters — `extract_gh_token`
-    // consults a trusted `gh` and nothing else, so a `gh` outside those
-    // directories genuinely does not supply the token, whatever it would say
-    // here.
-    let gh_cli_auth = crate::git::trusted_binary("gh").is_some_and(|gh| {
-        #[allow(clippy::disallowed_methods)] // resolved above, not a PATH lookup
-        std::process::Command::new(gh)
-            .args(["auth", "token"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
-    });
+    let gh_cli_auth = stored_token().is_some();
 
-    let gh_config_exists = home_dir.join(".config/gh/hosts.yml").exists();
+    let gh_config_exists = gh_hosts_yml(home_dir).is_some_and(|p| p.exists());
 
     // macOS Keychain CLI — not applicable on Linux.
     let security_cli_exists = probe_security_cli();
@@ -159,8 +152,109 @@ pub fn discover_auth(home_dir: &Path) -> AuthDiscovery {
     }
 }
 
+/// gh's stored github.com token, using the same probe for diagnosis and launch.
+/// A PATH lookup could execute an agent-planted binary outside the sandbox.
+pub(crate) fn stored_gh_token() -> Option<String> {
+    stored_gh_credential().map(|token| token.expose().to_string())
+}
+
+// One bounded probe per process, including failed retrievals. Keep the cached
+// secret redacted and in memory so diagnostics cannot leak it or retry login.
+fn stored_gh_credential() -> Option<&'static crate::agent::SecretToken> {
+    static TOKEN: std::sync::OnceLock<Option<crate::agent::SecretToken>> =
+        std::sync::OnceLock::new();
+    TOKEN
+        .get_or_init(|| {
+            gh_auth_token(&crate::git::trusted_binary("gh")?, PROBE_TIMEOUT)
+                .map(crate::agent::SecretToken::new)
+        })
+        .as_ref()
+}
+
+/// Diagnostics reuse the launch probe without exposing the credential.
+pub fn stored_gh_token_available() -> bool {
+    stored_gh_credential().is_some()
+}
+
+/// Wrapper installation only discovers this PATH binary; it never executes it
+/// in the parent. Trusted stored-token retrieval is a separate requirement.
+pub fn gh_wrapper_available() -> bool {
+    crate::sandbox::which_binary("gh").is_some()
+}
+
+/// Cache eligibility is shared with launch so advice cannot promise a channel
+/// that deny.env or the existing credential would suppress. Retrieval and the
+/// guard/scratch settings are separate prerequisites checked by the caller.
+pub fn gh_token_cache_eligibility(
+    agent: crate::agent::Agent,
+    deny_env: &[String],
+    substitute: Option<&crate::agent::KeychainSubstitute>,
+    hosts_yml_exists: bool,
+    child_gh_token: bool,
+    linux: bool,
+) -> (bool, bool) {
+    use crate::agent::{Agent, KeychainSubstitute};
+    if deny_env.iter().any(|d| d == "GH_TOKEN")
+        || matches!(substitute, Some(KeychainSubstitute::GhToken { .. }))
+    {
+        return (false, false);
+    }
+    let kept = |vars: &[&str]| {
+        vars.iter().any(|var| {
+            !deny_env.iter().any(|d| d == var)
+                && std::env::var(var).is_ok_and(|v| !v.trim().is_empty())
+        })
+    };
+    let serve = agent == Agent::Copilot && !kept(AUTH_ENV_VARS);
+    let exec = hosts_yml_exists
+        && !child_gh_token
+        && (agent != Agent::Copilot
+            || ((linux || substitute.is_some()) && !kept(&["GH_TOKEN", "GITHUB_TOKEN"])));
+    (serve, exec)
+}
+
+/// Pin the host and discard exported tokens so discovery cannot mistake an
+/// ambient credential or a GHES login for gh's stored github.com credential.
+#[allow(clippy::disallowed_methods)] // resolved trusted path, or a fixture in tests
+pub(crate) fn gh_auth_token(gh: &Path, timeout: Duration) -> Option<String> {
+    let mut cmd = std::process::Command::new(gh);
+    cmd.args(["auth", "token", "--hostname", "github.com"]);
+    for var in AUTH_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    let buf = bounded_stdout(cmd, timeout)?;
+    let token = String::from_utf8_lossy(&buf).trim().to_string();
+    (!token.is_empty()).then_some(token)
+}
+
+/// Bound both the child and its stdout: a descendant can keep the pipe open
+/// after gh exits. Null stdin prevents credential prompts from reading the TTY.
+pub(crate) fn bounded_stdout(mut cmd: std::process::Command, timeout: Duration) -> Option<Vec<u8>> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let result = stdout.read_to_end(&mut buf);
+        let _ = tx.send(result.map(|_| buf));
+    });
+    let status = crate::audit::wait_timeout(&mut child, timeout)?;
+    let buf = rx.recv_timeout(READ_GRACE).ok()?.ok()?;
+    status.success().then_some(buf)
+}
+
+/// Match gh's config lookup; relative overrides cannot be granted by cplt.
+pub(crate) fn gh_hosts_yml(home: &Path) -> Option<PathBuf> {
+    crate::sandbox::gh_config_dir(home).map(|dir| dir.join("hosts.yml"))
+}
+
 impl AuthDiscovery {
-    /// Returns true if at least one auth mechanism is available.
+    /// A credential source or native auth module was discovered, not validated.
     pub fn any_auth_available(&self) -> bool {
         !self.env_tokens.is_empty()
             || self.gh_cli_auth
@@ -176,7 +270,12 @@ pub fn discover_copilot(home_dir: &Path) -> CopilotDiscovery {
 
     // Scan for all native modules across all versions
     let mut native_modules = Vec::new();
-    for name in &["keytar.node", "pty.node", "computer.node"] {
+    for name in &[
+        "keytar.node",
+        "pty.node",
+        "computer.node",
+        "cli-native.node",
+    ] {
         for path in find_native_modules(home_dir, name) {
             native_modules.push(NativeModule {
                 name: name.to_string(),
@@ -244,7 +343,7 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// so a crate-private item here is unreachable from `main.rs`, which uses this
 /// to print agent versions.
 pub fn probe_version(path: &Path, args: &[&str]) -> VersionProbe {
-    probe_version_within(path, args, PROBE_TIMEOUT, READ_GRACE)
+    probe_version_bounded(path, args, PROBE_TIMEOUT, READ_GRACE)
 }
 
 /// How long the reader may take to hand over stdout once the probe has exited.
@@ -279,9 +378,14 @@ fn probe_command(path: &Path, args: &[&str]) -> std::process::Command {
     cmd
 }
 
-/// [`probe_version`] with its two wall-clock budgets passed in, so a test that
+/// [`probe_version`] with its timeout passed in (#725 retries with a longer one).
+pub(crate) fn probe_version_within(path: &Path, args: &[&str], timeout: Duration) -> VersionProbe {
+    probe_version_bounded(path, args, timeout, READ_GRACE)
+}
+
+/// [`probe_version`] with both wall-clock budgets passed in, so a test that
 /// is not about the bounds can give a loaded machine room (#528).
-fn probe_version_within(
+fn probe_version_bounded(
     path: &Path,
     args: &[&str],
     timeout: Duration,
@@ -291,13 +395,17 @@ fn probe_version_within(
         Ok(buf) => buf,
         Err(probe) => return probe,
     };
-    // Parse "GitHub Copilot CLI 1.0.21." → "1.0.21": first token starting with
-    // a digit, trailing period trimmed.
-    buf.split_whitespace()
+    parse_version(&buf).map_or(VersionProbe::Unknown, VersionProbe::Version)
+}
+
+/// Parse "GitHub Copilot CLI 1.0.21." → "1.0.21" and "opencode v2.0.24" →
+/// "2.0.24" (#710): first token starting with a digit, after an optional `v`,
+/// trailing period trimmed.
+pub fn parse_version(out: &str) -> Option<String> {
+    out.split_whitespace()
+        .map(|w| w.strip_prefix('v').unwrap_or(w))
         .find(|w| w.chars().next().is_some_and(|c| c.is_ascii_digit()))
-        .map_or(VersionProbe::Unknown, |v| {
-            VersionProbe::Version(v.trim_end_matches('.').to_string())
-        })
+        .map(|v| v.trim_end_matches('.').to_string())
 }
 
 /// The raw stdout of `<path> <args>`, under the same bounds as
@@ -577,6 +685,16 @@ fn tool_lines(tools: &[ToolInfo], wsl: bool, home: &Path) -> (Vec<String>, bool)
     let lines = tools
         .iter()
         .map(|tool| {
+            // A mise shim canonicalizes to mise itself, which is not where
+            // the tool lives; resolving the real one would mean running mise.
+            if tool.name != "mise" && tool.path.file_name().is_some_and(|f| f == "mise") {
+                return format!(
+                    "  {}\u{2713}{} {}: via mise",
+                    ui::stdout_color(ui::GREEN),
+                    ui::stdout_color(ui::RESET),
+                    tool.name,
+                );
+            }
             if !crate::agent::is_wsl_interop_binary(&tool.path, wsl) {
                 return format!(
                     "  {}\u{2713}{} {}: {}",
@@ -615,8 +733,11 @@ fn tool_lines(tools: &[ToolInfo], wsl: bool, home: &Path) -> (Vec<String>, bool)
 impl Discovery {
     /// Print the full inventory (`cplt doctor --verbose`). Returns true if
     /// nothing it prints is a hard failure; the verdict itself is doctor's.
-    pub fn print_report(&self, home: &Path) -> bool {
+    pub fn print_report(&self, home: &Path, agent: crate::agent::Agent) -> bool {
         let mut critical_ok = true;
+        // The token variables, gh login and keytar are how Copilot signs in;
+        // for any other agent they are noise dressed as warnings.
+        let copilot = agent == crate::agent::Agent::Copilot;
 
         // Auth section
         println!(
@@ -627,10 +748,12 @@ impl Discovery {
             ui::stdout_color(ui::BOLD),
             ui::stdout_color(ui::RESET)
         );
-        if self.auth.env_tokens.is_empty() {
+        if !copilot {
+            // Nothing Copilot-specific to show.
+        } else if self.auth.env_tokens.is_empty() {
             println!(
-                "  {}⚠{} No env token set (COPILOT_GITHUB_TOKEN, GH_TOKEN, GITHUB_TOKEN)",
-                ui::stdout_color(ui::YELLOW),
+                "  {}ℹ{} No env token set (COPILOT_GITHUB_TOKEN, GH_TOKEN, GITHUB_TOKEN)",
+                ui::stdout_color(ui::BLUE),
                 ui::stdout_color(ui::RESET)
             );
         } else {
@@ -642,42 +765,39 @@ impl Discovery {
                 );
             }
         }
-        if self.auth.gh_cli_auth {
+        if !copilot {
+        } else if self.auth.gh_cli_auth {
             println!(
-                "  {}✓{} gh CLI: authenticated (gh auth token succeeds)",
+                "  {}✓{} gh CLI: stored github.com token found (validity not checked)",
                 ui::stdout_color(ui::GREEN),
                 ui::stdout_color(ui::RESET)
             );
         } else if self.auth.gh_config_exists {
             println!(
-                "  {}⚠{} gh CLI: config exists (~/.config/gh/hosts.yml) but gh auth token fails",
+                "  {}⚠{} gh CLI: hosts.yml exists in the effective config directory, but no stored github.com token was retrieved",
                 ui::stdout_color(ui::YELLOW),
                 ui::stdout_color(ui::RESET)
             );
         } else {
             println!(
-                "  {}⚠{} gh CLI: no config found (~/.config/gh/hosts.yml)",
+                "  {}⚠{} gh CLI: no hosts.yml found in the effective config directory",
                 ui::stdout_color(ui::YELLOW),
                 ui::stdout_color(ui::RESET)
             );
         }
         print_keychain_status(self.auth.security_cli_exists);
-        if self.auth.keytar_nodes.is_empty() {
+        // Current Copilot builds sign in without keytar, so its absence is
+        // not a problem; its presence is only a hint at an older install.
+        if copilot && !self.auth.keytar_nodes.is_empty() {
             println!(
-                "  {}⚠{} keytar.node: not found in ~/.copilot/pkg/",
-                ui::stdout_color(ui::YELLOW),
-                ui::stdout_color(ui::RESET)
-            );
-        } else {
-            println!(
-                "  {}✓{} keytar.node: found in ~/.copilot/pkg/",
+                "  {}✓{} keytar.node: found (an older Copilot's keyring module)",
                 ui::stdout_color(ui::GREEN),
                 ui::stdout_color(ui::RESET)
             );
         }
-        if !self.auth.any_auth_available() {
+        if copilot && !self.auth.any_auth_available() {
             println!(
-                "  {}✗{} No auth mechanism available, Copilot will fail to authenticate",
+                "  {}✗{} No env token, stored gh token or native auth module discovered; Copilot login is not verified",
                 ui::stdout_color(ui::RED),
                 ui::stdout_color(ui::RESET)
             );
@@ -996,7 +1116,7 @@ fn print_keychain_status(security_cli_exists: bool) {
     #[cfg(target_os = "macos")]
     if security_cli_exists {
         println!(
-            "  {}✓{} Keychain CLI: /usr/bin/security exists",
+            "  {}✓{} Keychain CLI: /usr/bin/security exists (agent login not checked)",
             ui::stdout_color(ui::GREEN),
             ui::stdout_color(ui::RESET)
         );
@@ -1349,14 +1469,10 @@ fn gitdir_without_git(dir: &Path) -> Option<PathBuf> {
     if meta.is_dir() {
         return std::fs::canonicalize(&dot_git).ok().or(Some(dot_git));
     }
-    // Regular file only. `read_to_string` opens O_RDONLY, which blocks forever
-    // on a FIFO with no writer — an agent that can write `<root>/.git` could
-    // otherwise `mkfifo` it and hang the next launch before the sandbox exists.
-    // Real git checks the same thing and exits rather than blocking.
-    if !meta.is_file() {
-        return None;
-    }
-    let contents = std::fs::read_to_string(&dot_git).ok()?;
+    // Regular file only. `read_regular_following` opens with O_NONBLOCK and
+    // fstats the open fd so neither a planted FIFO nor a TOCTOU swap between
+    // stat and open can block the launch, and caps the read at 4 KiB.
+    let contents = crate::untrusted::read_regular_following(&dot_git, 4096).ok()??;
     let pointer = contents
         .lines()
         .find_map(|l| l.trim().strip_prefix("gitdir:"))?
@@ -1382,7 +1498,8 @@ fn gitdir_without_git(dir: &Path) -> Option<PathBuf> {
     //
     // Submodules and `--separate-git-dir` repos have no `commondir`; their
     // pointer already names the common dir, so they fall through unchanged.
-    if let Ok(raw) = std::fs::read_to_string(resolved.join("commondir")) {
+    // `commondir` is agent-writable (not write-denied): refuse a FIFO/symlink.
+    if let Ok(Some(raw)) = crate::untrusted::read_untrusted(&resolved.join("commondir"), 4096) {
         let raw = raw.trim();
         if !raw.is_empty() {
             let common = if Path::new(raw).is_absolute() {
@@ -1670,6 +1787,10 @@ pub fn which_on_path(name: &str) -> Option<PathBuf> {
 /// [`which_resolved`] for an agent: a cplt PATH shim is skipped, so the path
 /// shown is the real binary the shim stands in for (#514).
 fn real_agent_binary(name: &str) -> Option<PathBuf> {
+    // Doctor must report the standalone Copilot the launch prefers (#753).
+    if name == "copilot" {
+        return crate::agent::Agent::Copilot.resolve_binary().ok();
+    }
     let path = crate::shim::real_binary(name)?;
     Some(std::fs::canonicalize(&path).unwrap_or(path))
 }
@@ -1679,16 +1800,40 @@ fn which_resolved(name: &str) -> Option<PathBuf> {
     Some(std::fs::canonicalize(&path).unwrap_or(path))
 }
 
-/// Find native `.node` modules matching a name in `~/.copilot/pkg/`.
+/// Find native `.node` modules matching a name in Copilot's package dirs:
+/// the old `~/.copilot/pkg/universal/<ver>/prebuilds/<platform>/` and, since
+/// the 1.0.9x builds from npm and Homebrew,
+/// `<pkg>/<platform>/<ver>/prebuilds/<platform>/`, with `<pkg>` resolved as
+/// the launch resolves it ([`crate::sandbox::copilot_pkg_dir`]).
 fn find_native_modules(home_dir: &Path, module_name: &str) -> Vec<PathBuf> {
-    let pkg_dir = home_dir.join(".copilot/pkg/universal");
-    let Ok(entries) = std::fs::read_dir(&pkg_dir) else {
-        return Vec::new();
+    let mut version_dirs: Vec<PathBuf> = Vec::new();
+    let read = |d: &Path| -> Vec<PathBuf> {
+        std::fs::read_dir(d)
+            .map(|e| e.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default()
     };
+    version_dirs.extend(read(&home_dir.join(".copilot/pkg/universal")));
+    // The launch's own resolver, so `COPILOT_PKG_CACHE_HOME`,
+    // `COPILOT_CACHE_HOME` and `XDG_CACHE_HOME` count as they do for Copilot.
+    // The default is scanned as well: Copilot's loader still looks there for a
+    // newer runtime when a cache variable moves the cache.
+    let os = std::env::consts::OS;
+    let default = crate::sandbox::copilot_default_pkg_dir(home_dir, os);
+    let mut pkg_dirs = vec![default.clone()];
+    if let Ok(moved) = crate::sandbox::copilot_pkg_dir(&|n: &str| std::env::var_os(n), home_dir, os)
+        && moved != default
+    {
+        pkg_dirs.push(moved);
+    }
+    for pkg in pkg_dirs {
+        for platform in read(&pkg) {
+            version_dirs.extend(read(&platform));
+        }
+    }
 
     let mut results = Vec::new();
-    for entry in entries.flatten() {
-        let prebuilds = entry.path().join("prebuilds");
+    for entry in version_dirs {
+        let prebuilds = entry.join("prebuilds");
         if !prebuilds.exists() {
             continue;
         }
@@ -2003,6 +2148,28 @@ mod tests {
         );
     }
 
+    /// `<gitdir>/worktrees/*/commondir` is agent-writable: a FIFO there must
+    /// not hang launch, and a symlink must not be read through.
+    #[test]
+    fn gitdir_without_git_refuses_fifo_or_symlink_commondir() {
+        use crate::untrusted::tests::{bounded, mkfifo};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let wt = root.join("main.git/worktrees/wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let proj = root.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join(".git"), format!("gitdir: {}\n", wt.display())).unwrap();
+        mkfifo(&wt.join("commondir"));
+        let p = proj.clone();
+        assert_eq!(bounded(move || gitdir_without_git(&p)), Some(wt.clone()));
+
+        std::fs::remove_file(wt.join("commondir")).unwrap();
+        std::fs::write(root.join("cd"), "../..").unwrap();
+        std::os::unix::fs::symlink(root.join("cd"), wt.join("commondir")).unwrap();
+        assert_eq!(gitdir_without_git(&proj), Some(wt), "read through symlink");
+    }
+
     /// A `.git` symlink to a real gitdir is a supported layout, and git follows
     /// it. Reading link metadata instead would take the pointer-file branch and
     /// fail with EISDIR, losing the target's denies.
@@ -2171,14 +2338,56 @@ mod tests {
     #[test]
     fn auth_discovery_detects_env_vars() {
         temp_env::with_var("COPILOT_GITHUB_TOKEN", Some("test-token-value"), || {
-            // Read under temp_env's lock: another test in this binary sets HOME.
-            let home = PathBuf::from(std::env::var("HOME").unwrap());
-            let auth = discover_auth(&home);
+            let home = tempfile::tempdir().unwrap();
+            let auth = discover_auth_with(home.path(), || None);
             assert!(
                 auth.env_tokens
                     .contains(&"COPILOT_GITHUB_TOKEN".to_string())
             );
         });
+    }
+
+    #[test]
+    fn auth_config_discovery_follows_gh_overrides() {
+        let home = tempfile::tempdir().unwrap();
+        let gh = home.path().join("relocated-gh");
+        let xdg = home.path().join("xdg");
+        for dir in [&gh, &xdg.join("gh")] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("hosts.yml"), "github.com:\n").unwrap();
+        }
+        temp_env::with_vars(
+            [
+                ("GH_CONFIG_DIR", Some(gh.as_os_str())),
+                ("XDG_CONFIG_HOME", Some(xdg.as_os_str())),
+            ],
+            || {
+                assert_eq!(gh_hosts_yml(home.path()), Some(gh.join("hosts.yml")));
+                assert!(discover_auth_with(home.path(), || None).gh_config_exists);
+            },
+        );
+        temp_env::with_vars(
+            [
+                ("GH_CONFIG_DIR", None),
+                ("XDG_CONFIG_HOME", Some(xdg.as_os_str())),
+            ],
+            || {
+                assert_eq!(gh_hosts_yml(home.path()), Some(xdg.join("gh/hosts.yml")));
+                assert!(discover_auth_with(home.path(), || None).gh_config_exists);
+            },
+        );
+        temp_env::with_vars(
+            [("GH_CONFIG_DIR", None::<&str>), ("XDG_CONFIG_HOME", None)],
+            || assert!(!discover_auth_with(home.path(), || None).gh_config_exists),
+        );
+    }
+
+    #[test]
+    fn auth_discovery_retains_only_presence_of_stored_token() {
+        let home = tempfile::tempdir().unwrap();
+        let auth = discover_auth_with(home.path(), || Some("gho_private_fixture".into()));
+        assert!(auth.gh_cli_auth);
+        assert!(!format!("{auth:?}").contains("gho_private_fixture"));
     }
 
     #[test]
@@ -2349,7 +2558,18 @@ ELECTRON_RUN_AS_NODE=1 "/Applications/Visual Studio Code.app/Contents/Frameworks
     fn fake_binary(dir: &Path, name: &str, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        // Written in-process, the script would be open for writing while other
+        // test threads fork; a fork in that window inherits the descriptor and
+        // our exec fails ETXTBSY. `cp` gives `path` an inode whose only writable
+        // descriptor lives in the child (same fix as copilot_extract's Fixture).
+        let staging = dir.join(format!("{name}.staging"));
+        std::fs::write(&staging, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let copied = std::process::Command::new("cp")
+            .arg(&staging)
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(copied.success(), "cp of the fake binary failed: {copied}");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
     }
@@ -2449,6 +2669,17 @@ ELECTRON_RUN_AS_NODE=1 "/Applications/Visual Studio Code.app/Contents/Frameworks
         }
     }
 
+    #[test]
+    fn parse_version_handles_v_prefix() {
+        assert_eq!(parse_version("1.18.35\n").as_deref(), Some("1.18.35"));
+        assert_eq!(parse_version("opencode v2.0.24").as_deref(), Some("2.0.24"));
+        assert_eq!(
+            parse_version("GitHub Copilot CLI 1.0.21.").as_deref(),
+            Some("1.0.21")
+        );
+        assert_eq!(parse_version("verbose nothing"), None);
+    }
+
     /// The happy path still parses, and a binary that answers is never
     /// misreported as timed out.
     ///
@@ -2464,14 +2695,14 @@ ELECTRON_RUN_AS_NODE=1 "/Applications/Visual Studio Code.app/Contents/Frameworks
         let dir = tempfile::tempdir().unwrap();
         let ok = fake_binary(dir.path(), "quick", "exec echo GitHub Copilot CLI 1.0.21.");
         assert_eq!(
-            probe_version_within(&ok, &["--version"], ROOM, ROOM),
+            probe_version_bounded(&ok, &["--version"], ROOM, ROOM),
             VersionProbe::Version("1.0.21".to_string())
         );
 
         // Non-zero exit is "ran, said nothing useful" — not a timeout.
         let bad = fake_binary(dir.path(), "broken", "exec false");
         assert_eq!(
-            probe_version_within(&bad, &["--version"], ROOM, ROOM),
+            probe_version_bounded(&bad, &["--version"], ROOM, ROOM),
             VersionProbe::Unknown
         );
     }
@@ -2506,6 +2737,44 @@ mod wsl_tool_report_tests {
             "the line must name the offending path, without the Windows user, got: {}",
             lines[0]
         );
+    }
+
+    /// A mise shim canonicalizes to mise itself; printing that as the tool's
+    /// path was wrong for every mise-managed tool.
+    #[test]
+    fn mise_shim_is_reported_as_via_mise() {
+        let tools = vec![
+            tool("node", "/opt/homebrew/Cellar/mise/1/bin/mise"),
+            tool("mise", "/opt/homebrew/Cellar/mise/1/bin/mise"),
+        ];
+        let (lines, ok) = tool_lines(&tools, false, Path::new("/home/u"));
+        assert!(ok);
+        assert!(lines[0].ends_with("node: via mise"), "{}", lines[0]);
+        assert!(lines[1].contains("mise: /opt/homebrew"), "{}", lines[1]);
+    }
+
+    /// Copilot 1.0.9x keeps its native code in the user cache, not in
+    /// `~/.copilot/pkg`; both layouts must be found.
+    #[test]
+    fn native_modules_are_found_in_both_layouts() {
+        let home = tempfile::tempdir().unwrap();
+        let old = home
+            .path()
+            .join(".copilot/pkg/universal/1.0.20/prebuilds/darwin-arm64");
+        // The default cache under this temp home, so the test neither reads
+        // nor writes the real cache when a cache variable is set on the host.
+        let new = crate::sandbox::copilot_default_pkg_dir(home.path(), std::env::consts::OS)
+            .join("p-arch/1.0.94-5/prebuilds/p-arch");
+        for d in [&old, &new] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("keytar.node"), "").unwrap();
+        }
+        let found = find_native_modules(home.path(), "keytar.node");
+        let ours: Vec<_> = found
+            .iter()
+            .filter(|p| p.starts_with(home.path()))
+            .collect();
+        assert_eq!(ours.len(), 2, "{found:?}");
     }
 
     /// A non-critical tool is only warned about — it is not a broken install.

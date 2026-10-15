@@ -344,7 +344,8 @@ pub fn load_cached_domains(set: &SubscriptionSet) -> Vec<String> {
     let mut domains: Vec<String> = Vec::new();
     for sub in &set.blocklists {
         let path = cache_path(&set.cache_dir, &sub.url);
-        if let Ok(contents) = std::fs::read_to_string(&path) {
+        // ~/.cache/cplt is agent-writable: no FIFO, symlink or huge file.
+        if let Ok(Some(contents)) = crate::untrusted::read_untrusted(&path, MAX_FETCH_BYTES) {
             domains.extend(parse_subscription(&contents, &sub.url));
         }
     }
@@ -376,8 +377,9 @@ impl State {
     }
 
     fn load(cache_dir: &Path) -> Self {
-        std::fs::read_to_string(Self::path(cache_dir))
+        crate::untrusted::read_untrusted(&Self::path(cache_dir), 1024 * 1024)
             .ok()
+            .flatten()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default()
     }
@@ -621,6 +623,23 @@ pub fn staleness_warnings(set: &SubscriptionSet, now: SystemTime) -> Vec<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cache dir is agent-writable: FIFOs planted there must not hang.
+    #[test]
+    fn cache_reads_refuse_fifo() {
+        use crate::untrusted::tests::{bounded, mkfifo};
+        let dir = tempfile::tempdir().unwrap();
+        let set = set_with(
+            dir.path(),
+            RefreshInterval::Manual,
+            vec![sub("mem://a", None)],
+        );
+        mkfifo(&cache_path(&set.cache_dir, "mem://a"));
+        mkfifo(&State::path(&set.cache_dir));
+        let d = set.cache_dir.clone();
+        assert!(bounded(move || load_cached_domains(&set)).is_empty());
+        assert!(bounded(move || State::load(&d).get("mem://a").is_none()));
+    }
 
     fn set_with(
         dir: &Path,

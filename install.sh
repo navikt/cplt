@@ -52,7 +52,7 @@ if [[ "$NO_BREW" == false && -z "$VERSION" && -z "$INSTALL_DIR" ]] && command -v
   echo "✓ cplt is ready! (${INSTALLED_VERSION})"
   echo ""
   echo "Get started:"
-  echo "  cplt --doctor             # Check your environment"
+  echo "  cplt doctor             # Check your environment"
   echo "  cplt --shell-install      # Make 'copilot' use the sandboxed version"
   echo "  cplt -- -p \"fix the tests\"  # Run Copilot in sandbox"
   echo ""
@@ -209,6 +209,6 @@ fi
 
 echo ""
 echo "Get started:"
-echo "  cplt --doctor             # Check your environment"
+echo "  cplt doctor             # Check your environment"
 echo "  cplt --shell-install      # Make 'copilot' use the sandboxed version"
 echo "  cplt -- -p \"fix the tests\"  # Run Copilot in sandbox"

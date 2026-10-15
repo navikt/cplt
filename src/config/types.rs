@@ -957,6 +957,9 @@ pub struct Resolved {
     /// never activates one.
     pub allow_domains: Vec<String>,
     pub allow_localhost_any: bool,
+    /// `allow_localhost_any` was asked for but `proxy.forced` turned it off
+    /// (see [`Resolved::reconcile_proxy_forced`]), so `cplt doctor` can say so.
+    pub localhost_any_ignored: bool,
     pub allow_env_files: bool,
     pub no_validate: bool,
     pub brief: bool,

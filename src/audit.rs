@@ -260,6 +260,34 @@ pub fn new_untracked(before: &BTreeSet<String>, after: &BTreeSet<String>) -> Vec
     after.difference(before).cloned().collect()
 }
 
+fn fingerprint_file(full: &Path) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let meta = full.symlink_metadata().ok()?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    meta.file_type().is_symlink().hash(&mut h);
+    if meta.file_type().is_symlink() {
+        std::fs::read_link(full).ok().hash(&mut h);
+    } else {
+        read_small(full).hash(&mut h);
+    }
+    Some(h.finish())
+}
+
+fn fingerprint_untracked(
+    repo_root: &Path,
+    porcelain: &str,
+) -> std::collections::BTreeMap<String, (PathBuf, Option<u64>)> {
+    porcelain
+        .split('\0')
+        .filter_map(|entry| entry.strip_prefix("?? "))
+        .map(|raw| {
+            let full = repo_root.join(raw);
+            let fp = fingerprint_file(&full);
+            (escape_path(raw), (full, fp))
+        })
+        .collect()
+}
+
 /// A single changed file in the final report.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileChange {
@@ -310,11 +338,17 @@ pub enum AuditReport {
 pub struct Baseline {
     start: Instant,
     project_dir: PathBuf,
+    /// Git repository toplevel from `git rev-parse --show-toplevel`, used to
+    /// resolve toplevel-relative `git status --porcelain` paths when
+    /// `project_dir` is a subdirectory of the repository.
+    repo_root: PathBuf,
     /// The pinned commit SHA from `git rev-parse HEAD`, or `None` when the
     /// project is not a git repo / has no commits ("no baseline").
     pinned_sha: Option<String>,
     /// Untracked paths present before the run.
     before_untracked: BTreeSet<String>,
+    /// On-disk path and content fingerprint of untracked paths present before the run.
+    before_untracked_hashes: std::collections::BTreeMap<String, (PathBuf, Option<u64>)>,
     /// Whether the pre-run `git status` actually SUCCEEDED. When it failed,
     /// `before_untracked` is an empty set that does NOT mean "no untracked
     /// files" — using it to compute the after−before delta would over-report
@@ -329,11 +363,23 @@ impl Baseline {
     /// baseline" (reported later as change audit unavailable).
     pub fn capture(project_dir: &Path) -> Self {
         let start = Instant::now();
-        // The pinned SHA. If HEAD does not resolve (not a repo, or no commits),
-        // we record no baseline rather than erroring.
-        let pinned_sha = git_output(project_dir, &["rev-parse", "HEAD"])
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
+        // Query the pinned HEAD SHA and authoritative worktree toplevel in one
+        // `git rev-parse` invocation so `Baseline::capture` stays within its
+        // 3-command startup budget while always using Git's real worktree root.
+        let (pinned_sha, top_from_head) =
+            match git_output(project_dir, &["rev-parse", "HEAD", "--show-toplevel"]) {
+                Some(out) => {
+                    let trimmed = out.trim_end_matches(['\n', '\r']);
+                    let (sha, top) = match trimmed.split_once('\n') {
+                        Some((s, t)) => (s.trim(), t.trim_end_matches(['\n', '\r'])),
+                        None => (trimmed.trim(), ""),
+                    };
+                    let sha = (!sha.is_empty()).then(|| sha.to_string());
+                    let top = (!top.is_empty()).then(|| PathBuf::from(top));
+                    (sha, top)
+                }
+                None => (None, None),
+            };
         // Capture the pre-run untracked set REGARDLESS of whether a baseline
         // commit exists: in a fresh `git init` (no commits) we still want to
         // surface the files the agent creates during the session. Track whether
@@ -341,14 +387,30 @@ impl Baseline {
         // set) for a genuinely empty untracked set and over-reports.
         let before_status = git_output(project_dir, &["status", "--porcelain", "-z", "-uall"]);
         let before_ok = before_status.is_some();
+        let repo_root = top_from_head
+            .or_else(|| {
+                if !before_ok {
+                    return None;
+                }
+                git_output(project_dir, &["rev-parse", "--show-toplevel"])
+                    .map(|s| PathBuf::from(s.trim_end_matches(['\n', '\r'])))
+                    .filter(|p| !p.as_os_str().is_empty())
+            })
+            .unwrap_or_else(|| project_dir.to_path_buf());
+        let before_untracked_hashes = before_status
+            .as_deref()
+            .map(|s| fingerprint_untracked(&repo_root, s))
+            .unwrap_or_default();
         let before_untracked = before_status
             .map(|s| parse_untracked(&s))
             .unwrap_or_default();
         Self {
             start,
             project_dir: project_dir.to_path_buf(),
+            repo_root,
             pinned_sha,
             before_untracked,
+            before_untracked_hashes,
             before_ok,
         }
     }
@@ -373,9 +435,12 @@ impl Baseline {
         // gone, corrupt repo, timeout) — genuinely distinct from `Some(empty)`
         // (git succeeded and reported no untracked files). We must never treat a
         // failure as "no changes".
-        let after_untracked_opt =
-            git_output(&self.project_dir, &["status", "--porcelain", "-z", "-uall"])
-                .map(|s| parse_untracked(&s));
+        let after_status = git_output(&self.project_dir, &["status", "--porcelain", "-z", "-uall"]);
+        let after_untracked_hashes = after_status
+            .as_deref()
+            .map(|s| fingerprint_untracked(&self.repo_root, s))
+            .unwrap_or_default();
+        let after_untracked_opt = after_status.map(|s| parse_untracked(&s));
 
         // Guard against the over-report bias: if the BEFORE `git status` failed
         // yet the AFTER one succeeded, the repo plainly exists (after worked) but
@@ -391,6 +456,24 @@ impl Baseline {
             };
         }
 
+        let modified_untracked = |after: &BTreeSet<String>| -> Vec<String> {
+            self.before_untracked
+                .iter()
+                .filter(|p| {
+                    let before_fp = self.before_untracked_hashes.get(*p).and_then(|(_, fp)| *fp);
+                    let after_fp = if after.contains(*p) {
+                        after_untracked_hashes.get(*p).and_then(|(_, fp)| *fp)
+                    } else {
+                        self.before_untracked_hashes
+                            .get(*p)
+                            .and_then(|(full, _)| fingerprint_file(full))
+                    };
+                    before_fp != after_fp
+                })
+                .cloned()
+                .collect()
+        };
+
         let Some(sha) = self.pinned_sha else {
             // No baseline commit (e.g. fresh `git init`). Tracked-change
             // auditing is unavailable, but we still surface NEW UNTRACKED files
@@ -403,13 +486,14 @@ impl Baseline {
                 };
             };
             let new_files = new_untracked(&self.before_untracked, &after_untracked);
-            if new_files.is_empty() {
+            let mod_files = modified_untracked(&after_untracked);
+            if new_files.is_empty() && mod_files.is_empty() {
                 return AuditReport::Unavailable {
                     duration,
                     exit_code,
                 };
             }
-            let changes = new_files
+            let mut changes: Vec<FileChange> = new_files
                 .into_iter()
                 .map(|path| {
                     let sensitive = classify_path(&path);
@@ -421,7 +505,18 @@ impl Baseline {
                         sensitive,
                     }
                 })
+                .chain(mod_files.into_iter().map(|path| {
+                    let sensitive = classify_path(&path);
+                    FileChange {
+                        path,
+                        added: None,
+                        deleted: None,
+                        is_new_untracked: false,
+                        sensitive,
+                    }
+                }))
                 .collect();
+            changes.sort_by(|a, b| a.path.cmp(&b.path));
             return AuditReport::Available {
                 duration,
                 exit_code,
@@ -461,6 +556,7 @@ impl Baseline {
         };
         // Net NEW untracked files: after-untracked MINUS before-untracked.
         let new_files = new_untracked(&self.before_untracked, &after_untracked);
+        let mod_files = modified_untracked(&after_untracked);
 
         let mut total_added = 0u64;
         let mut total_deleted = 0u64;
@@ -479,12 +575,28 @@ impl Baseline {
             });
         }
         for path in new_files {
+            if changes.iter().any(|c| c.path == path) {
+                continue;
+            }
             let sensitive = classify_path(&path);
             changes.push(FileChange {
                 path,
                 added: None,
                 deleted: None,
                 is_new_untracked: true,
+                sensitive,
+            });
+        }
+        for path in mod_files {
+            if changes.iter().any(|c| c.path == path) {
+                continue;
+            }
+            let sensitive = classify_path(&path);
+            changes.push(FileChange {
+                path,
+                added: None,
+                deleted: None,
+                is_new_untracked: false,
                 sensitive,
             });
         }
@@ -1717,6 +1829,9 @@ fn read_small(path: &Path) -> Option<Small> {
 /// `project_dir` is named after the report so the session is never presented as
 /// clean on the strength of a measurement that never looked there (#214).
 ///
+/// The returned `bool` is whether the session's process tree settled; it is
+/// `false` when no probe was armed (audit and observe both off).
+///
 /// Observe-only runs retain descendant settling without printing the audit.
 /// Disabled runs still perform ordinary proxy cleanup through the callback.
 pub fn run<F: FnOnce() -> u8, C: FnOnce() -> Option<proxy::ProxySnapshot>>(
@@ -1727,7 +1842,7 @@ pub fn run<F: FnOnce() -> u8, C: FnOnce() -> Option<proxy::ProxySnapshot>>(
     routing: &str,
     exec: F,
     finalize: C,
-) -> (u8, Option<proxy::ProxySnapshot>) {
+) -> (u8, Option<proxy::ProxySnapshot>, bool) {
     let baseline = (mode == AuditMode::Enabled).then(|| Baseline::capture(project_dir));
     let named: Vec<(PathBuf, Baseline)> = if mode == AuditMode::Enabled {
         named_roots
@@ -1784,7 +1899,7 @@ pub fn run<F: FnOnce() -> u8, C: FnOnce() -> Option<proxy::ProxySnapshot>>(
         ui::warn(line);
     }
     nested_git.report(probed && !settled);
-    (exit_code, snapshot)
+    (exit_code, snapshot, settled)
 }
 
 #[cfg(test)]
@@ -2703,8 +2818,10 @@ mod tests {
         let base = Baseline {
             start: Instant::now(),
             project_dir: PathBuf::from("/nonexistent"),
+            repo_root: PathBuf::from("/nonexistent"),
             pinned_sha: None,
             before_untracked: BTreeSet::new(),
+            before_untracked_hashes: std::collections::BTreeMap::new(),
             before_ok: true,
         };
         match base.finish(0, true) {
@@ -2722,8 +2839,10 @@ mod tests {
         let base = Baseline {
             start: Instant::now(),
             project_dir: PathBuf::from("/nonexistent"),
+            repo_root: PathBuf::from("/nonexistent"),
             pinned_sha: Some("deadbeef".to_string()),
             before_untracked: BTreeSet::new(),
+            before_untracked_hashes: std::collections::BTreeMap::new(),
             before_ok: true,
         };
         match base.finish(0, true) {
@@ -2759,15 +2878,51 @@ mod tests {
         let base = Baseline {
             start: Instant::now(),
             project_dir: dir.path().to_path_buf(),
+            repo_root: dir.path().to_path_buf(),
             // No baseline commit (fresh init); the after `git status` still works.
             pinned_sha: None,
             // Simulate a failed BEFORE capture: empty set, but NOT trustworthy.
             before_untracked: BTreeSet::new(),
+            before_untracked_hashes: std::collections::BTreeMap::new(),
             before_ok: false,
         };
         match base.finish(0, true) {
             AuditReport::Incomplete { exit_code, .. } => assert_eq!(exit_code, 0),
             other => panic!("expected Incomplete (untrustworthy delta), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finish_reports_modified_preexisting_untracked_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ok = Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(dir.path())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            return;
+        }
+        std::fs::write(dir.path().join("notes.sh"), b"#!/bin/sh\necho safe\n").unwrap();
+        std::fs::write(dir.path().join("untouched.txt"), b"stay\n").unwrap();
+
+        let base = Baseline::capture(dir.path());
+        std::fs::write(dir.path().join("notes.sh"), b"#!/bin/sh\necho tampered\n").unwrap();
+
+        match base.finish(0, true) {
+            AuditReport::Available { changes, .. } => {
+                assert_eq!(
+                    changes.len(),
+                    1,
+                    "only modified untracked file should appear: {changes:?}"
+                );
+                assert_eq!(changes[0].path, "notes.sh");
+                assert!(!changes[0].is_new_untracked);
+                assert_eq!(changes[0].sensitive, Some("shell script"));
+            }
+            other => panic!("expected Available report, got {other:?}"),
         }
     }
 
@@ -2901,7 +3056,7 @@ mod tests {
     fn disabled_audit_still_runs_finalization_after_exec() {
         let events = std::cell::RefCell::new(Vec::new());
         let dir = tempfile::tempdir().expect("tempdir");
-        let (exit_code, snapshot) = run(
+        let (exit_code, snapshot, _) = run(
             dir.path(),
             &[],
             &[],
@@ -3121,6 +3276,68 @@ mod tests {
         assert!(
             lines.contains(&format!("{} ->", root.join("pk").display())),
             "{lines}"
+        );
+    }
+
+    #[test]
+    fn untracked_subdir_and_deleted_files_are_reported() {
+        let Some(git) = crate::git::trusted_git() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let run = |args: &[&str]| {
+            let status = Command::new(git)
+                .current_dir(repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(args)
+                .status()
+                .expect("git runs");
+            assert!(status.success(), "git {args:?}");
+        };
+        run(&["init", "-q"]);
+        run(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@e",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "init",
+        ]);
+
+        let app = repo.join("app");
+        // An empty `.git` directory inside a subdirectory is not a valid gitdir,
+        // so Git walks up to the ancestor repository (`repo`). `Baseline::capture`
+        // must still resolve `repo` via `--show-toplevel` rather than assuming a
+        // `.git` entry at `project_dir` means `project_dir` is the toplevel.
+        std::fs::create_dir_all(app.join(".git")).unwrap();
+        std::fs::write(app.join("notes.txt"), "before\n").unwrap();
+        std::fs::write(app.join("doomed.txt"), "delete me\n").unwrap();
+
+        // Capture from a subdirectory (`--project-dir repo/app`): porcelain
+        // paths are toplevel-relative (`app/notes.txt`), so fingerprinting must
+        // join against the git toplevel rather than `app`.
+        let baseline = Baseline::capture(&app);
+        std::fs::write(app.join("notes.txt"), "after\n").unwrap();
+        std::fs::remove_file(app.join("doomed.txt")).unwrap();
+        let report = baseline.finish(0, true);
+        let AuditReport::Available { changes, .. } = report else {
+            panic!("expected Available, got {report:?}");
+        };
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.path == "app/notes.txt" && !c.is_new_untracked),
+            "modified untracked file under subdirectory project_dir must be reported: {changes:?}"
+        );
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.path == "app/doomed.txt" && !c.is_new_untracked),
+            "deleted pre-existing untracked file must be reported: {changes:?}"
         );
     }
 }

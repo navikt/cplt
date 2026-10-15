@@ -11,35 +11,38 @@ Always run `mise run check` at the end of a coding session.
 
 | Task | Suite | In sandbox | Linux CI | macOS CI | Requirements |
 |-------------------------|----------------|:----------:|:--------:|:--------:|-------------------------------|
-| `mise run check` | fmt + clippy + unit + lib | ✅ | ✅ | ✅ | None (safe everywhere) |
+| `mise run check` | fmt + clippy + unit + lib + offline probe | ✅ | ✅ | ✅ | Python 3 + Node.js (safe everywhere) |
 | `mise run test:unit` | unit_tests | ✅ | ✅ | ✅ | None |
 | `mise run test:lib` | lib (modules) | ✅ | ✅ | ✅ | None |
+| `mise run test:probe` | offline probe checks | ✅ | ✅ | ✅ | Python 3 + Node.js; PTY case macOS-only |
 | `mise run test:integration` | integration | ✅ | ❌ | ✅ | macOS `sandbox-exec` |
 | `mise run test:integration-linux` | integration_linux | ❌ | ✅ | ❌ | Linux with Landlock (5.13+) |
 | `mise run test:network-audit` | network_audit | ✅ | ❌ | ✅ | macOS or Linux; binds localhost TCP |
 | `mise run test:e2e` | e2e | ✅ | ❌ | ✅ | macOS + `copilot` in PATH; checkout not under `/tmp` or `/var/folders` |
 | `mise run test:e2e-projects` | e2e_projects | ✅ | ❌ | ✅ | macOS `sandbox-exec`; checkout not under `/tmp` or `/var/folders` |
+| `mise run test:worktree-broker` | worktree_broker | ❌ | ❌ | ✅ | macOS; real git, binds a Unix socket |
 | `mise run test:e2e-live` | e2e (ignored), 6 smoke tests | ❌ | ❌ | ⚠️ | macOS + Copilot auth + network |
-| `mise run test:all` | the suites above except live, minus the guard suites | ✅ | ❌ | ✅ | macOS + `copilot` in PATH |
+| `mise run test:all` | the suites above except live, including guard and broker suites | ✅ | ❌ | ✅ | macOS + `copilot` in PATH |
 | `mise run test:everything` | all + live | ❌ | ❌ | ⚠️ | macOS + Copilot auth + network |
 | `mise run test` | every suite via `cargo test` | ❌ | ❌ | ✅ | macOS |
 
 Both e2e suites spawn a fake agent binary from inside the project tree, and the sandbox denies exec under `/tmp` and `/var/folders` by design. A checkout there fails nearly every test in `e2e_projects` and hangs `e2e`, with no hint that the location is the cause. Clone somewhere else.
 
-`test:all` has no task for `tests/e2e_guards.rs` or `tests/e2e_git_hardening.rs`,
-so its `depends` list skips both. They are not uncovered: bare `mise run test`
-runs them, and so does macOS CI, which calls `cargo test` directly. Use
-`mise run test` (or `cargo test --test e2e_guards`) when you touch the gh or git
-guard.
+`test:all` includes the gh/git guard, Git-hardening and worktree-broker suites.
+Use their targeted tasks while iterating on those boundaries.
 
 Non-test tasks:
 
 ```bash
 mise run clippy            # linter
 mise run fmt               # auto-format
+mise run bench:startup     # release startup latency + parent git spawn budget
 mise run check:all-targets # cargo check every release target, to catch breakage on
                            # non-native targets (requires user setup)
 ```
+
+On a Mac where Little Snitch only allows the Homebrew `cplt`, run `hack/dev-proxy.sh` and pass
+`--with-proxy --proxy-upstream http://127.0.0.1:18443` to the dev build to give it network access.
 
 ## Code style
 
@@ -68,6 +71,7 @@ set.
 - `src/sandbox_landlock.rs` Landlock LSM + seccomp-BPF (cross-platform policy, Linux-only enforcement)
 - `src/sandbox_bubblewrap.rs` optional bubblewrap namespace layer and in-namespace re-entry (Linux)
 - `src/config/` config file parsing, CLI/config merging, key registry, per-repo keys, `Resolved` struct
+- `src/worktree_broker.rs` parent-side `cplt worktree add` broker and client (#531)
 - `src/discover.rs` runtime environment probing (`cplt doctor`)
 - `src/detect.rs` project and machine ecosystem detectors behind `cplt init`
 - `src/gh_proxy.rs` gh and git command guards, policy tables, wrapper scripts
@@ -149,6 +153,24 @@ This is a security tool. Changes to sandbox rules, env handling, or network poli
 - Update SECURITY.md if the threat model or defense layers change
 
 Do not modify `blocked-domains.txt` without reviewing the domain's purpose.
+
+### Files the agent can write
+
+cplt runs outside the sandbox, so treat every path the agent can write as hostile:
+the project, the scratch dir, agent config, state and data dirs, and cplt's own cache.
+
+- Read such files with `untrusted::read_untrusted(path, limit)`. It doesn't follow
+  symlinks, doesn't block on a FIFO, accepts plain files only and caps the size.
+  `open_untrusted` does the same checks but returns a `File` with no cap: bound
+  any read from it yourself.
+- Before handing such a path to a subprocess like `sqlite3`, check it with
+  `symlink_metadata(..).is_file()`. `Path::is_file()` follows symlinks.
+- Never put their contents into the sandbox, an env var or output without that check.
+  A symlinked `auth.json` once leaked another tool's credentials this way.
+- Emit automatic file grants before the deny rules, as `file-read*`. In Seatbelt a
+  narrower allow such as `file-read-data` beats a broader deny, whatever the order.
+  Explicit overrides the user approved still go after the denies, on purpose.
+- Add a test that plants a FIFO and a symlink.
 
 ### No silent grants
 

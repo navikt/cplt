@@ -477,6 +477,29 @@ pub const CONFIG_OVERRIDES: &[(&str, &str, &str)] = &[
         "The parent verifies no signatures. Cost: none. NOTE detect.rs reads \
          commit.gpgsign, which is a config read, not a gpg invocation.",
     ),
+    (
+        "submodule.recurse",
+        "false",
+        "Submodule configs are not scanned by repo_defines_content_filter; \
+         recursing into a submodule during status/diff could execute a \
+         submodule's filter outside the sandbox. Cost: parent-side status/diff \
+         does not recurse into submodules.",
+    ),
+    (
+        "diff.ignoreSubmodules",
+        "all",
+        "Even with submodule.recurse=false, git status and git diff inspect \
+         initialized submodules to compute dirtiness, which can run a \
+         submodule's filter.*.clean outside the sandbox. Cost: submodule \
+         dirtiness is omitted from parent-side status/diff.",
+    ),
+    (
+        "status.submodulesummary",
+        "0",
+        "Prevents git status from running submodule summary queries in \
+         initialized submodules. Cost: none (parent-side status uses \
+         --porcelain).",
+    ),
 ];
 
 /// Global flags that take their value as a **separate** token, and are therefore
@@ -490,12 +513,13 @@ pub const CONFIG_OVERRIDES: &[(&str, &str, &str)] = &[
 /// cheaper and more fail-closed than teaching the parser to consume values.
 /// `-c` is refused for the same reason plus a second one: config overrides
 /// belong in [`CONFIG_OVERRIDES`], where they are reviewed, not at call sites.
-const VALUE_TAKING_GLOBALS: &[&str] = &[
+pub(crate) const VALUE_TAKING_GLOBALS: &[&str] = &[
     "-C",
     "-c",
     "--git-dir",
     "--work-tree",
     "--namespace",
+    "--super-prefix",
     // Both take a separate-token value in git 2.55. `--attr-source evil diff`
     // would make `subcommand()` return "evil", silently skipping the diff-flag
     // insertion — the exact mis-parse this refusal exists to prevent. And
@@ -505,6 +529,14 @@ const VALUE_TAKING_GLOBALS: &[&str] = &[
     "--attr-source",
 ];
 
+fn is_refused_leading_global(arg: &str) -> bool {
+    VALUE_TAKING_GLOBALS.contains(&arg)
+        || (!arg.starts_with("--") && (arg.starts_with("-c") || arg.starts_with("-C")))
+        || arg.starts_with("--super-prefix=")
+        || arg.starts_with("--config-env=")
+        || arg.starts_with("--attr-source=")
+}
+
 /// Subcommands that provably never read working-tree file **content**, and so
 /// can never reach a `.gitattributes` filter or diff driver.
 ///
@@ -512,6 +544,7 @@ const VALUE_TAKING_GLOBALS: &[&str] = &[
 /// [`repo_defines_content_filter`]. The list is an allowlist on purpose: adding
 /// a new subcommand fails closed rather than silently inheriting an exemption.
 const CONTENT_FREE_SUBCOMMANDS: &[&str] = &[
+    "ls-tree",
     "rev-parse",
     "cat-file",
     "config",
@@ -551,6 +584,11 @@ const GIT_ENV_CLEARED: &[&str] = &[
     "GIT_ATTR_SOURCE",
 ];
 
+#[cfg(test)]
+thread_local! {
+    static HARDENED_COMMANDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Environment applied to every parent-side git invocation.
 ///
 /// Deliberately **not** set here: `GIT_CONFIG_GLOBAL=/dev/null`. cplt reads the
@@ -560,6 +598,9 @@ const GIT_ENV_CLEARED: &[&str] = &[
 /// detection for every hooks user, and buys nothing: the threat is the
 /// *repository's* config, not the user's.
 fn harden(cmd: &mut Command) {
+    #[cfg(test)]
+    HARDENED_COMMANDS.with(|n| n.set(n.get() + 1));
+
     // Cleared unconditionally, so the removal is recorded on the Command (and
     // therefore assertable) whether or not the variable happens to be set.
     for name in GIT_ENV_CLEARED {
@@ -589,6 +630,38 @@ fn harden(cmd: &mut Command) {
     for (key, value, _) in CONFIG_OVERRIDES {
         cmd.arg("-c").arg(format!("{key}={value}"));
     }
+}
+
+/// Broker checkout reads only private administration. Do not route this through
+/// command(): its content-filter probe would discover an ambient repository.
+/// No common config, global config, hooks or transport may enter this command.
+#[allow(clippy::disallowed_methods)] // trusted_git resolves outside agent-writable paths
+pub(crate) fn private_checkout_command(
+    private: &Path,
+    worktree: &Path,
+    sha: &str,
+) -> Option<Command> {
+    let mut cmd = private_data_command(private, worktree)?;
+    cmd.args(["read-tree", "--reset", "-u", sha]);
+    Some(cmd)
+}
+
+/// Private checkout and raw blob verification share the same config isolation.
+#[allow(clippy::disallowed_methods)] // trusted_git resolves outside agent-writable paths
+pub(crate) fn private_data_command(private: &Path, worktree: &Path) -> Option<Command> {
+    let mut cmd = Command::new(trusted_git()?);
+    harden(&mut cmd);
+    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_ALLOW_PROTOCOL", "")
+        .arg("-c")
+        .arg("protocol.allow=never")
+        .arg("--git-dir")
+        .arg(private)
+        .arg("--work-tree")
+        .arg(worktree);
+    Some(cmd)
 }
 
 /// The tokens **before** the subcommand — the only position a git global flag
@@ -668,7 +741,7 @@ fn insert_diff_flags<'a>(args: &[&'a str]) -> Vec<&'a str> {
 pub fn command(project_dir: &Path, args: &[&str]) -> Option<Command> {
     if leading_globals(args)
         .iter()
-        .any(|a| VALUE_TAKING_GLOBALS.contains(a))
+        .any(|a| is_refused_leading_global(a))
     {
         // Never silent: this branch is unreachable for every current call
         // site, so reaching it means someone added one and needs to know the
@@ -794,6 +867,9 @@ mod tests {
             ("credential.helper", ""),
             ("uploadpack.packObjectsHook", ""),
             ("gpg.program", "false"),
+            ("submodule.recurse", "false"),
+            ("diff.ignoreSubmodules", "all"),
+            ("status.submodulesummary", "0"),
         ];
         let actual: Vec<(&str, &str)> = CONFIG_OVERRIDES.iter().map(|(k, v, _)| (*k, *v)).collect();
         assert_eq!(
@@ -1136,6 +1212,10 @@ mod tests {
         // 2.55, so `--attr-source evil diff` makes `subcommand()` return "evil".
         assert!(command(dir.path(), &["--attr-source", "evil", "diff"]).is_none());
         assert!(command(dir.path(), &["--config-env", "x=Y", "status"]).is_none());
+        assert!(command(dir.path(), &["-ccore.fsmonitor=evil", "status"]).is_none());
+        assert!(command(dir.path(), &["-C/tmp", "diff"]).is_none());
+        assert!(command(dir.path(), &["--config-env=core.fsmonitor=EVIL", "status"]).is_none());
+        assert!(command(dir.path(), &["--attr-source=HEAD", "diff"]).is_none());
         // The single-token forms parse correctly and stay allowed.
         assert!(command(dir.path(), &["--git-dir=/tmp", "rev-parse"]).is_some());
         // Position-sensitive: `--git-dir` AFTER the subcommand is a rev-parse
@@ -1321,5 +1401,93 @@ mod tests {
                 "override {key} missing from {args:?}"
             );
         }
+    }
+
+    fn count_git_commands<R>(f: impl FnOnce() -> R) -> (usize, R) {
+        let before = HARDENED_COMMANDS.with(std::cell::Cell::get);
+        let out = f();
+        let after = HARDENED_COMMANDS.with(std::cell::Cell::get);
+        (after - before, out)
+    }
+
+    /// Regression guard for #666: each parent-side startup and audit phase has a
+    /// fixed `git` spawn budget. Asserting the command count rather than wall
+    /// time catches an accidental extra `git` call deterministically on loaded
+    /// CI runners.
+    #[test]
+    fn startup_and_audit_git_command_budget() {
+        let Some(git) = trusted_git() else {
+            return;
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let run_git = |args: &[&str]| {
+            #[allow(clippy::disallowed_methods)] // `git` is `trusted_git()` above
+            Command::new(git)
+                .args(args)
+                .current_dir(&repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("git status")
+                .success()
+        };
+        assert!(run_git(&["init", "-q", "-b", "main", "."]));
+        std::fs::write(repo.join("README.md"), "hello\n").expect("write");
+        assert!(run_git(&["add", "README.md"]));
+        assert!(run_git(&[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "init"
+        ]));
+
+        // 1. Path discovery: a single `rev-parse --git-dir`.
+        let (n, paths) = count_git_commands(|| crate::discover::discover_paths(&home, &repo));
+        assert!(paths.is_git_repo);
+        assert_eq!(n, 1, "discover_paths must run exactly 1 git command");
+
+        // 2. Worktree check on a plain repo: a single `rev-parse --git-common-dir`
+        //    (must not run the second `--absolute-git-dir` query when not a worktree).
+        let (n, (common, problem)) =
+            count_git_commands(|| crate::discover::git_common_dir(&home, &repo, &[]));
+        assert!(common.is_none() && problem.is_none());
+        assert_eq!(
+            n, 1,
+            "git_common_dir on a plain repo must run 1 git command"
+        );
+
+        // 3. Repo config load without `.cplt.toml`: a single `cat-file blob HEAD:.cplt.toml`
+        //    (must not run `rev-parse --show-toplevel` when no config is committed).
+        let (n, loaded) = count_git_commands(|| crate::repo_config::load_repo_config(&repo));
+        assert!(loaded.expect("load_repo_config").is_none());
+        assert_eq!(
+            n, 1,
+            "load_repo_config without .cplt.toml must run 1 git command"
+        );
+
+        // 4. Pre-session audit baseline: `rev-parse HEAD` (1) + `status` (1 filter
+        //    check + 1 status = 2) = 3 git commands.
+        let (n, baseline) = count_git_commands(|| crate::audit::Baseline::capture(&repo));
+        assert_eq!(n, 3, "Baseline::capture must run 3 git commands");
+
+        // 5. Post-session audit finish: `status` (2) + `diff --numstat` (2) = 4 git commands.
+        let (n, report) = count_git_commands(|| baseline.finish(0, true));
+        assert!(matches!(
+            report,
+            crate::audit::AuditReport::Available { .. }
+        ));
+        assert_eq!(n, 4, "Baseline::finish must run 4 git commands");
     }
 }

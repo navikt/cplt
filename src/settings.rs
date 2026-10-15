@@ -101,7 +101,7 @@ impl SettingsApp {
             .or_else(|| std::env::current_dir().ok())
             .ok_or("cannot determine project directory")?;
         let repo_path = project_dir.join(repo_config::REPO_CONFIG_FILE);
-        let repo_doc = load_doc(&repo_path)?;
+        let repo_doc = load_repo_doc(&repo_path)?;
         let local_path = detect_project_root().and_then(|dir| config::local_path(&dir));
         let local_doc = match &local_path {
             Some(path) => load_doc(path)?,
@@ -531,6 +531,23 @@ fn load_doc(path: &std::path::Path) -> Result<toml_edit::DocumentMut, String> {
         .map_err(|error| format!("invalid TOML in {}: {error}", path.display()))
 }
 
+fn load_repo_doc(path: &std::path::Path) -> Result<toml_edit::DocumentMut, String> {
+    let raw = match crate::untrusted::read_untrusted(path, repo_config::MAX_REPO_CONFIG_BYTES) {
+        Ok(Some(raw)) => raw,
+        Ok(None) => {
+            return Err(format!(
+                "cannot read {}: must be a regular file (not a symlink or FIFO) of at most {} bytes",
+                path.display(),
+                repo_config::MAX_REPO_CONFIG_BYTES
+            ));
+        }
+        Err(e) if crate::config::is_absent(&e, path) => return Ok(toml_edit::DocumentMut::new()),
+        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+    };
+    raw.parse()
+        .map_err(|error| format!("invalid TOML in {}: {error}", path.display()))
+}
+
 /// The effective value and source of every key.
 ///
 /// Booleans get their source from the resolver, which returns the layer it
@@ -695,9 +712,11 @@ fn resolved_values(
                 }
                 ("allow", "read") => format_paths(&resolved.allow_read),
                 ("allow", "write") => format_paths(&resolved.allow_write),
+                ("allow", "exec") => format_paths(&resolved.allow_exec),
                 ("allow", "socket") => format_paths(&resolved.allow_socket),
                 ("allow", "ports") => format_values(&resolved.allow_ports),
                 ("allow", "localhost") => format_values(&resolved.allow_localhost),
+                ("allow", "domains") => format_strings(&resolved.allow_domains),
                 ("deny", "paths") => format_paths(&resolved.deny_paths),
                 ("deny", "env") => format_strings(&resolved.deny_env),
                 ("sandbox", "agent") => resolved.agent.clone().unwrap_or_default(),
@@ -759,10 +778,20 @@ fn format_values<T: ToString>(values: &[T]) -> String {
 }
 
 fn repo_proposal_enabled(doc: &toml_edit::DocumentMut, key: &ConfigKeyInfo) -> bool {
+    let propose_key = crate::config::PROPOSE_BOOLS
+        .iter()
+        .find(|row| {
+            row.config_key == (key.section, key.key) || row.ladder_key == (key.section, key.key)
+        })
+        .map_or(key.key, |row| row.key);
     doc.get("propose")
         .and_then(toml_edit::Item::as_table)
-        .and_then(|table| table.get(key.key))
-        .and_then(toml_edit::Item::as_bool)
+        .and_then(|table| {
+            table
+                .get(propose_key)
+                .or_else(|| table.get(key.key))
+                .and_then(toml_edit::Item::as_bool)
+        })
         == Some(true)
 }
 

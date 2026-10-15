@@ -472,6 +472,7 @@ mod macos_tests {
             named_roots: &[],
             named_root_git_dirs: &[],
             managed_worktree_root: None,
+            worktree_socket: None,
             existing_home_tool_dirs: None,
             existing_app_dirs: None,
             extra_ports: &[],
@@ -508,6 +509,131 @@ mod macos_tests {
             allow_browser: false,
             keychain_substitute: None,
             use_bubblewrap: None,
+        }
+    }
+
+    /// A private, explicitly addressed database avoids the login keychain and
+    /// default/search-list changes. UI is disabled in every helper invocation.
+    #[test]
+    fn security_framework_private_database_access_follows_file_grant() {
+        require_sandbox!();
+        let fixture = crate::common::home_temp_dir("security-framework");
+        let project = fixture.path().join("project");
+        let home = fixture.path().join("home");
+        let keychains = home.join("Library/Keychains");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&keychains).unwrap();
+        let source = project.join("keychain.c");
+        let executable = project.join("keychain-probe");
+        let database = keychains.join("cplt-private-fixture.keychain");
+        fs::write(&source, r#"
+#include <Security/Security.h>
+#include <stdio.h>
+#include <string.h>
+int main(int argc, char **argv) {
+    if (argc != 3) return 40;
+    SecKeychainSetUserInteractionAllowed(false);
+    SecKeychainRef kc = NULL;
+    OSStatus open = strcmp(argv[1], "create") == 0
+        ? SecKeychainCreate(argv[2], 14, "dummy-password", false, NULL, &kc)
+        : SecKeychainOpen(argv[2], &kc);
+    if (open != errSecSuccess || !kc) { printf("OPEN_STATUS=%d\n", (int)open); return 41; }
+    OSStatus status;
+    if (strcmp(argv[1], "read") == 0) {
+        UInt32 length = 0; void *data = NULL;
+        status = SecKeychainFindGenericPassword(kc, 10, "cplt-dummy", 7, "fixture", &length, &data, NULL);
+        if (status == errSecSuccess) {
+            if (length != 5 || memcmp(data, "dummy", 5) != 0) return 42;
+            SecKeychainItemFreeContent(NULL, data);
+        }
+    } else {
+        const char *account = strcmp(argv[1], "create") == 0 ? "fixture" : argv[1];
+        status = SecKeychainAddGenericPassword(kc, 10, "cplt-dummy", (UInt32)strlen(account), account, 5, "dummy", NULL);
+    }
+    printf("API_STATUS=%d\n", (int)status);
+    CFRelease(kc);
+    return status == errSecSuccess ? 0 : 43;
+}
+"#).unwrap();
+        let compile = crate::common::shim_cmd(Path::new("/usr/bin/clang"))
+            .args([
+                "-Wno-deprecated-declarations",
+                "-framework",
+                "Security",
+                "-framework",
+                "CoreFoundation",
+            ])
+            .arg(&source)
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let invoke = |operation: &str, profile: Option<&Path>| {
+            let mut cmd = crate::common::shim_cmd(
+                profile.map_or(executable.as_path(), |_| Path::new("/usr/bin/sandbox-exec")),
+            );
+            if let Some(profile) = profile {
+                cmd.arg("-f").arg(profile).arg(&executable);
+            }
+            cmd.env("HOME", &home)
+                .args([operation])
+                .arg(&database)
+                .output()
+                .unwrap()
+        };
+        for operation in ["create", "read", "outside-write"] {
+            let out = invoke(operation, None);
+            assert!(
+                out.status.success(),
+                "outside {operation}: {}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+            assert!(String::from_utf8_lossy(&out.stdout).contains("API_STATUS=0"));
+        }
+        for (substitute, operation) in [
+            (false, "read"),
+            (false, "allowed-write"),
+            (true, "read"),
+            (true, "denied-write"),
+        ] {
+            let mut opts = default_opts(&project, &home);
+            opts.keychain_substitute = substitute.then_some(
+                cplt::agent::KeychainSubstitute::EnvVar("COPILOT_GITHUB_TOKEN"),
+            );
+            let profile = project.join("profile.sb");
+            fs::write(&profile, generate_profile(&opts, &[])).unwrap();
+            let out = invoke(operation, Some(&profile));
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert_eq!(
+                out.status.success(),
+                !substitute,
+                "substitute={substitute}, {operation}: {stdout}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if substitute {
+                // SecKeychainOpen may refuse the database before find/add. This
+                // proves database access denial, not a separate denial per API.
+                let open_denied = out.status.code() == Some(41)
+                    && stdout.contains("OPEN_STATUS=")
+                    && !stdout.contains("OPEN_STATUS=0");
+                let operation_denied = out.status.code() == Some(43)
+                    && stdout.contains("API_STATUS=")
+                    && !stdout.contains("API_STATUS=0");
+                assert!(
+                    open_denied || operation_denied,
+                    "unexpected helper failure: {stdout}"
+                );
+            } else {
+                assert!(
+                    stdout.contains("API_STATUS=0"),
+                    "find/add did not succeed: {stdout}"
+                );
+            }
         }
     }
 
@@ -2231,6 +2357,96 @@ mod macos_tests {
         assert!(!ordinary, "an ordinary writable root keeps the nested deny");
     }
 
+    /// #531 broker: the sandbox connects to the one broker socket it was
+    /// granted, and to no other Unix socket, including a sibling in the same
+    /// directory. Without the grant the connect is refused.
+    #[test]
+    fn real_profile_grants_connect_to_the_broker_socket_only() {
+        require_sandbox!();
+        let home = home_dir();
+        let dir = fs::canonicalize(".")
+            .unwrap()
+            .join(format!(".cplt-brk-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let dir = fs::canonicalize(&dir).unwrap();
+        let granted = dir.join("s");
+        let other = dir.join("o");
+        let _l1 = std::os::unix::net::UnixListener::bind(&granted).unwrap();
+        let _l2 = std::os::unix::net::UnixListener::bind(&other).unwrap();
+
+        let run = |socket: Option<&Path>| {
+            let mut opts = default_opts(&dir, &home);
+            opts.worktree_socket = socket;
+            let profile = write_real_profile(&opts);
+            let probe = format!(
+                "import socket\nfor p in [{g}, {o}]:\n  s = socket.socket(socket.AF_UNIX)\n  \
+                 try:\n    s.connect(p)\n    print('OK', p)\n  except OSError as e:\n    \
+                 print('DENIED', p, e.errno)\n",
+                g = python_path_literal(&granted),
+                o = python_path_literal(&other),
+            );
+            // `-I` keeps the working directory off sys.path: the profile is not
+            // meant to grant that, and the probe is about sockets only.
+            let (output, _) = run_sandboxed(
+                &profile,
+                &python_inline_command(&probe).replacen("python3 -c", "python3 -I -c", 1),
+            );
+            fs::remove_file(&profile).ok();
+            output
+        };
+        let granted_out = run(Some(&granted));
+        let none_out = run(None);
+        fs::remove_dir_all(&dir).ok();
+        let granted_path = granted.display();
+        let other_path = other.display();
+        assert!(
+            granted_out.contains(&format!("OK {granted_path}")),
+            "the granted socket connects: {granted_out}"
+        );
+        assert!(
+            granted_out.contains(&format!("DENIED {other_path}")),
+            "a sibling socket stays closed: {granted_out}"
+        );
+        assert!(
+            !none_out.contains("OK "),
+            "with no grant, nothing connects: {none_out}"
+        );
+    }
+
+    #[test]
+    fn real_profile_staging_deny_beats_overlapping_user_writes() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let temp = tempfile::tempdir_in(&project).unwrap();
+        let base = temp.path().join(".cplt-worktrees");
+        let root = base.join("managed");
+        let staging = base.join(".staging");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("private"), "secret\n").unwrap();
+        let home = home_dir();
+        let writes = [temp.path().to_path_buf()];
+        let mut opts = default_opts(&project, &home);
+        opts.extra_write = &writes;
+        opts.managed_worktree_root = Some(&root);
+        let profile = write_real_profile(&opts);
+        let script = format!(
+            "if cat '{s}/private'; then echo LEAK; else echo READ_DENIED; fi; if touch '{s}/new'; then echo WRITE; else echo WRITE_DENIED; fi; if mv '{b}' '{b}-moved'; then echo MOVED; else echo RENAME_DENIED; fi; touch '{r}/allowed' && echo ROOT_OK",
+            s = staging.display(),
+            b = base.display(),
+            r = root.display()
+        );
+        let (output, _) = run_sandboxed(&profile, &script);
+        fs::remove_file(profile).unwrap();
+        for result in ["READ_DENIED", "WRITE_DENIED", "RENAME_DENIED", "ROOT_OK"] {
+            assert!(output.contains(result), "{output}");
+        }
+        assert_eq!(
+            fs::read_to_string(staging.join("private")).unwrap(),
+            "secret\n"
+        );
+    }
+
     #[test]
     fn real_profile_deny_nested_git_blocks_dot_git_inside_a_gitdir() {
         require_sandbox!();
@@ -2543,6 +2759,40 @@ mod macos_tests {
         assert!(
             output.contains("Operation not permitted") || output.contains("EXIT:1"),
             "writing to .git/info/exclude should be blocked, got: {output}"
+        );
+    }
+
+    /// #743: git resolves remote names through the legacy `.git/remotes/<name>`
+    /// and `.git/branches/<name>` files, so planting one defines a remote with
+    /// an agent-chosen URL without writing the denied `.git/config`.
+    #[test]
+    fn real_profile_blocks_git_legacy_remote_writes() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let tmp = project.join(format!(".legacy-remotes-{}", std::process::id()));
+        fs::create_dir_all(tmp.join(".git/remotes")).unwrap();
+        let tmp = fs::canonicalize(&tmp).unwrap();
+        let home = home_dir();
+
+        let opts = default_opts(&tmp, &home);
+        let profile = write_real_profile(&opts);
+
+        let remote = tmp.join(".git/remotes/evil");
+        let branches = tmp.join(".git/branches");
+        let cmd = format!(
+            "echo 'URL: https://example.invalid/x' > '{}' 2>&1; echo EXIT:$?; \
+             mkdir '{}' 2>&1; echo EXIT:$?",
+            remote.display(),
+            branches.display()
+        );
+        let (output, _) = run_sandboxed(&profile, &cmd);
+
+        let planted = remote.exists() || branches.exists();
+        fs::remove_dir_all(&tmp).ok();
+        fs::remove_file(&profile).ok();
+        assert!(
+            !planted && !output.contains("EXIT:0"),
+            "writing .git/remotes or .git/branches should be blocked, got: {output}"
         );
     }
 
@@ -3296,6 +3546,7 @@ mod macos_tests {
             process_exec: !write,
             write_files: vec![],
             create_dirs: vec![],
+            via: vec![],
         };
         let agent_dirs = vec![
             agent_dir(cache.clone(), true),
@@ -3333,6 +3584,166 @@ mod macos_tests {
             !bin_write.contains("EXIT:0"),
             "~/.cache/opencode/bin must not be writable: {bin_write}"
         );
+    }
+
+    /// #703: a script named by the user `opencode.json` (MCP command) runs,
+    /// but cannot be written; its argument and siblings stay unreadable, and
+    /// the config file itself stays write-denied.
+    #[test]
+    fn real_profile_runs_opencode_config_script_only() {
+        require_sandbox!();
+        let project = tempfile::Builder::new()
+            .prefix(".cplt-ocs-project-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        let home = tempfile::Builder::new()
+            .prefix(".cplt-ocs-home-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        let home = fs::canonicalize(home.path()).unwrap();
+        let cfg = home.join(".config/opencode");
+        let ext = home.join("ext");
+        fs::create_dir_all(&cfg).unwrap();
+        fs::create_dir_all(&ext).unwrap();
+        let script = ext.join("server.sh");
+        fs::write(&script, "#!/bin/sh\necho RAN\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(ext.join("arg.txt"), "SECRET").unwrap();
+        fs::write(
+            cfg.join("opencode.json"),
+            format!(
+                r#"{{"mcp":{{"s":{{"type":"local","command":["{}","{}/arg.txt"]}}}}}}"#,
+                script.display(),
+                ext.display()
+            ),
+        )
+        .unwrap();
+        let agent_dirs = temp_env::with_var_unset("XDG_CONFIG_HOME", || {
+            cplt::agent::Agent::OpenCode.config_dirs(&home)
+        });
+        let mut opts = default_opts(project.path(), &home);
+        opts.agent = cplt::agent::Agent::OpenCode;
+        opts.agent_dirs = &agent_dirs;
+        let profile = write_real_profile(&opts);
+        let run = |cmd: String| run_sandboxed(&profile, &cmd).0;
+        let exec = run(format!("'{}'; echo EXIT:$?", script.display()));
+        let write = run(format!("echo x >> '{}'; echo EXIT:$?", script.display()));
+        let arg = run(format!("cat '{}/arg.txt' 2>&1", ext.display()));
+        let cfg_write = run(format!(
+            "echo x >> '{}'; echo EXIT:$?",
+            cfg.join("opencode.json").display()
+        ));
+        fs::remove_file(&profile).ok();
+        assert!(exec.contains("RAN") && exec.contains("EXIT:0"), "{exec}");
+        assert!(
+            !write.contains("EXIT:0"),
+            "script must not be writable: {write}"
+        );
+        assert!(
+            !arg.contains("SECRET"),
+            "argument must stay unreadable: {arg}"
+        );
+        assert!(
+            !cfg_write.contains("EXIT:0"),
+            "config must not be writable: {cfg_write}"
+        );
+    }
+
+    /// #703: no grant when the OpenCode config dir sits in a writable tree
+    /// (the agent could rewrite it), nor for a directory plugin whose
+    /// `main` escapes the plugin dir.
+    #[test]
+    fn real_profile_refuses_opencode_writable_config_and_escaping_plugin() {
+        require_sandbox!();
+        let project = tempfile::Builder::new()
+            .prefix(".cplt-ocw-project-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        let project = fs::canonicalize(project.path()).unwrap();
+        let home = tempfile::Builder::new()
+            .prefix(".cplt-ocw-home-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        let home = fs::canonicalize(home.path()).unwrap();
+        let ext = home.join("ext");
+        let plug = ext.join("plug");
+        fs::create_dir_all(&plug).unwrap();
+        let script = ext.join("server.sh");
+        fs::write(&script, "#!/bin/sh\necho RAN\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(plug.join("package.json"), r#"{"main":"../server.sh"}"#).unwrap();
+        let config = |cfg: &Path, json: String| {
+            fs::create_dir_all(cfg).unwrap();
+            fs::write(cfg.join("opencode.json"), json).unwrap();
+        };
+        let mcp = format!(
+            r#"{{"mcp":{{"s":{{"type":"local","command":["{}"]}}}}}}"#,
+            script.display()
+        );
+        let check_with = |xdg: &Path, custom: Option<&Path>, extra: &str| {
+            let mut agent_dirs = temp_env::with_vars(
+                [
+                    ("XDG_CONFIG_HOME", Some(xdg)),
+                    ("OPENCODE_CONFIG_DIR", custom),
+                ],
+                || cplt::agent::Agent::OpenCode.config_dirs(&home),
+            );
+            cplt::agent::drop_script_grants_under(&mut agent_dirs, std::slice::from_ref(&project));
+            let mut opts = default_opts(&project, &home);
+            opts.agent = cplt::agent::Agent::OpenCode;
+            opts.agent_dirs = &agent_dirs;
+            let profile = write_real_profile(&opts);
+            let out = run_sandboxed(
+                &profile,
+                &format!("'{}'; echo EXIT:$?; {extra}", script.display()),
+            )
+            .0;
+            fs::remove_file(&profile).ok();
+            out
+        };
+        let check = |xdg: &Path| check_with(xdg, None, "");
+        // Config dir inside the project: the MCP script gets nothing.
+        config(&project.join("xdg/opencode"), mcp.clone());
+        let out = check(&project.join("xdg"));
+        assert!(
+            !out.contains("RAN"),
+            "config in project must grant nothing: {out}"
+        );
+        // Directory plugin whose `main` is `../server.sh`: no grant.
+        let plugin = format!(r#"{{"plugin":["file://{}"]}}"#, plug.display());
+        config(&home.join("xdg/opencode"), plugin);
+        let out = check(&home.join("xdg"));
+        assert!(
+            !out.contains("RAN"),
+            "escaping plugin main must grant nothing: {out}"
+        );
+        // #718: `opencode.json` symlinked into the project: nothing.
+        fs::create_dir_all(home.join("xdg3/opencode")).unwrap();
+        fs::write(project.join("oc.json"), &mcp).unwrap();
+        std::os::unix::fs::symlink(
+            project.join("oc.json"),
+            home.join("xdg3/opencode/opencode.json"),
+        )
+        .unwrap();
+        let out = check(&home.join("xdg3"));
+        assert!(
+            !out.contains("RAN"),
+            "linked config must grant nothing: {out}"
+        );
+        // #718: a custom OPENCODE_CONFIG_DIR is readable and its scripts run,
+        // under the same rules: inside the project it grants no script.
+        let custom = home.join("custom");
+        config(&custom, mcp.clone());
+        fs::write(custom.join("AGENTS.md"), "CUSTOMREAD").unwrap();
+        let cat = format!("cat '{}'", custom.join("AGENTS.md").display());
+        let out = check_with(&home.join("none"), Some(&custom), &cat);
+        assert!(out.contains("RAN") && out.contains("CUSTOMREAD"), "{out}");
+        let out = check_with(&home.join("none"), Some(&project.join("xdg/opencode")), "");
+        assert!(!out.contains("RAN"), "custom dir in project: {out}");
+        // Control: the same MCP config outside any writable tree runs.
+        config(&home.join("xdg2/opencode"), mcp);
+        let out = check(&home.join("xdg2"));
+        assert!(out.contains("RAN"), "control must run: {out}");
     }
 
     // ── .env file read denial ─────────────────────────────────────
@@ -4287,6 +4698,108 @@ mod macos_tests {
             !output.contains("Operation not permitted"),
             "with allow_localhost_any, localhost should not be denied by sandbox, got: {output}"
         );
+    }
+
+    /// Kafka's FileChannel.transferTo uses Darwin sendfile, whose socket check
+    /// differs from connect/write. Verify both directions and address families,
+    /// and that the local-socket allowance cannot bypass destination filtering.
+    #[test]
+    fn real_profile_localhost_sendfile_preserves_destination_filtering() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        // /usr/bin/python3 is an Xcode launcher on CI, not the interpreter.
+        let python = crate::common::shim_cmd(&crate::common::binary_in_path("python3"))
+            .args(["-c", "import sys; print(sys.executable)"])
+            .output()
+            .expect("resolve Python interpreter outside the sandbox");
+        assert!(python.status.success(), "Python interpreter unavailable");
+        let python = PathBuf::from(String::from_utf8(python.stdout).unwrap().trim());
+        let python_read = [python.parent().unwrap().parent().unwrap().to_path_buf()];
+        for (enabled, forced) in [(false, false), (true, false), (false, true)] {
+            let mut opts = default_opts(&project, &home);
+            opts.extra_read = &python_read;
+            opts.allow_localhost_any = enabled;
+            opts.proxy_forced = forced;
+            let profile = write_real_profile(&opts);
+            let source = format!(
+                r#"
+import errno, os, socket, tempfile
+enabled = {enabled}
+payload = b"embedded-kafka-sendfile"
+for family, address in [(socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")]:
+    with socket.socket(family) as listener, socket.socket(family) as client:
+        listener.settimeout(2)
+        client.settimeout(2)
+        listener.bind((address, 0))
+        listener.listen()
+        try:
+            client.connect(listener.getsockname())
+        except OSError as error:
+            assert not enabled and error.errno == errno.EPERM, error
+            continue
+        assert enabled, "localhost connect allowed without opt-in"
+        with listener.accept()[0] as server, tempfile.TemporaryFile() as records:
+            server.settimeout(2)
+            records.write(payload)
+            records.flush()
+            for sender, receiver in [(client, server), (server, client)]:
+                sent = os.sendfile(sender.fileno(), records.fileno(), 0, len(payload))
+                assert sent == len(payload), sent
+                received = b""
+                while len(received) < len(payload):
+                    chunk = receiver.recv(len(payload) - len(received))
+                    assert chunk, "unexpected EOF"
+                    received += chunk
+                assert received == payload, received
+# Explicit loopback binding exercises the dangerous case for a local filter.
+# Denied documentation addresses require EPERM, not a timeout or route error.
+for family, local, remote in [
+    (socket.AF_INET, "127.0.0.1", "127.0.0.2"),
+    (socket.AF_INET, "127.0.0.1", "192.0.2.1"),
+    (socket.AF_INET6, "::1", "2001:db8::1"),
+    (socket.AF_INET6, "::1", "::ffff:127.0.0.1"),
+]:
+    for kind in [socket.SOCK_STREAM, socket.SOCK_DGRAM]:
+        for bind_local in [False, True]:
+            with socket.socket(family, kind) as peer:
+                peer.settimeout(2)
+                if bind_local:
+                    peer.bind((local, 0))
+                try:
+                    peer.connect((remote, 12345))
+                except OSError as error:
+                    assert error.errno == errno.EPERM, error
+                else:
+                    raise AssertionError("unauthorized destination allowed")
+                if kind == socket.SOCK_DGRAM:
+                    try:
+                        peer.sendto(payload, (remote, 12345))
+                    except OSError as error:
+                        assert error.errno == errno.EPERM, error
+                    else:
+                        raise AssertionError("unauthorized datagram allowed")
+print("SENDFILE_POLICY_OK")
+"#,
+                enabled = if enabled { "True" } else { "False" }
+            );
+            let output = crate::common::shim_cmd(Path::new("/usr/bin/sandbox-exec"))
+                .arg("-f")
+                .arg(&profile)
+                .arg(&python)
+                .arg("-c")
+                .arg(&source)
+                .output()
+                .expect("run sendfile policy probe");
+            fs::remove_file(&profile).unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("SENDFILE_POLICY_OK"),
+                "allow_localhost_any={enabled}, proxy_forced={forced}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[test]

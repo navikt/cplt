@@ -491,7 +491,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: false,
         default_display: "false",
-        description: "Grant read, write and execute on a cplt-owned directory for this repository's sub-agent worktrees (~/.cplt-worktrees/<id>, exported as CPLT_WORKTREE_ROOT). Worktrees and branches there persist after the session. macOS only. User config only; .cplt.toml cannot propose it.",
+        description: "Grant read, write and execute on a cplt-owned directory for this repository's sub-agent worktrees (~/.cplt-worktrees/<id>, exported as CPLT_WORKTREE_ROOT). When CPLT_WORKTREE_SOCKET is set, create worktrees with `cplt worktree add <name> <ref>` under the session read policy; protected files must match the launch checkout and HEAD. An unavailable broker warns without removing the managed root. Worktrees and branches persist after the session. macOS only. User config only; .cplt.toml cannot propose it.",
     },
     ConfigKeyInfo {
         section: "sandbox",
@@ -560,7 +560,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         // unremarkable. A user hit exactly that and asked why.
         dangerous: true,
         default_display: "false",
-        description: "Pre-extract GH_TOKEN before sandbox launch (only for Copilot agent).",
+        description: "DEPRECATED on macOS: gh gets its token from the gh guard, Copilot from sandbox.keychain_substitute. Linux native credential access depends on the backend and agent version; use explicit environment handover when needed. Injects the gh token into Copilot's environment. Requires gh_guard.enabled and sandbox.scratch_dir.",
     },
     ConfigKeyInfo {
         section: "gh_guard",

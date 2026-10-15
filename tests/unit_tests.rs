@@ -813,6 +813,7 @@ fn landlock_policy_device_files_have_ioctl() {
         named_roots: &[],
         named_root_git_dirs: &[],
         managed_worktree_root: None,
+        worktree_socket: None,
         existing_home_tool_dirs: None,
         existing_app_dirs: None,
         extra_ports: &[],
@@ -1926,15 +1927,14 @@ fn create_dirs_grants_keep_existing_files_unwritable_on_both_backends() {
     );
 }
 
-/// Pi can create its trust-store lock (`mkdir ~/.pi/agent/trust.json.lock`, #449)
-/// while `trust.json` and the exec-only `bin/` stay unwritable.
+/// Pi can create its startup locks while settings, trust and bin stay unwritable.
 ///
 /// The Landlock rule set permits MakeDir on the root (asserted here via the
 /// policy's `create_dirs` flag, since Landlock itself only runs on Linux — the
 /// flag builder is what maps it to `AccessFs::MakeDir`, covered by
 /// `create_dirs_maps_to_mkdir_rmdir_only` on Linux).
 #[test]
-fn pi_can_create_the_trust_lock_but_not_write_bin_or_trust_json() {
+fn pi_can_create_startup_locks_but_not_write_bin_settings_or_trust_json() {
     use cplt::agent::Agent;
     let home = std::path::Path::new("/Users/test");
     let agent_dirs = Agent::Pi.config_dirs(home);
@@ -1960,19 +1960,19 @@ fn pi_can_create_the_trust_lock_but_not_write_bin_or_trust_json() {
         "the root must NOT be writable — that would union bin/ into write+exec"
     );
 
-    // trust.json and bin/ stay unwritable (no write grant covers them).
-    assert_eq!(
-        cplt::check::writable_tree_over(&policy, home, &root.join("trust.json")),
-        None,
-        "trust.json must stay unwritable; create_dirs grants mkdir, not file writes"
-    );
+    for file in ["trust.json", "settings.json"] {
+        assert_eq!(
+            cplt::check::writable_tree_over(&policy, home, &root.join(file)),
+            None,
+            "{file} must stay unwritable; create_dirs grants mkdir, not file writes"
+        );
+    }
     assert_eq!(
         cplt::check::writable_tree_over(&policy, home, &root.join("bin")),
         None,
         "bin/ must stay unwritable — the H-13/H-05 narrowing must survive create_dirs"
     );
 
-    // Seatbelt: the lock's mkdir is allowed, trust.json write still denied.
     let profile = generate_profile(
         &SandboxConfig {
             agent: Agent::Pi,
@@ -1981,16 +1981,22 @@ fn pi_can_create_the_trust_lock_but_not_write_bin_or_trust_json() {
         },
         &[],
     );
-    assert!(
-        profile.contains(
-            "(allow file-write* (require-all (literal \"/Users/test/.pi/agent/trust.json.lock\") (vnode-type DIRECTORY)))"
-        ),
-        "Pi must be allowed to mkdir/utimes/rmdir its trust lock:\n{profile}"
-    );
-    assert!(
-        profile.contains("(deny file-write* (subpath \"/Users/test/.pi/agent/trust.json\"))"),
-        "trust.json must still be write-denied:\n{profile}"
-    );
+    for file in ["trust.json", "auth.json", "settings.json"] {
+        assert!(
+            profile.contains(&format!(
+                "(allow file-write* (require-all (literal \"/Users/test/.pi/agent/{file}.lock\") (vnode-type DIRECTORY)))"
+            )),
+            "Pi must be allowed to mkdir/utimes/rmdir {file}.lock:\n{profile}"
+        );
+    }
+    for file in ["trust.json", "settings.json"] {
+        assert!(
+            profile.contains(&format!(
+                "(deny file-write* (subpath \"/Users/test/.pi/agent/{file}\"))"
+            )),
+            "{file} must still be write-denied:\n{profile}"
+        );
+    }
 }
 
 /// A user `allow.write` must NOT reopen the host-persistence denies.
@@ -2127,6 +2133,7 @@ fn fish_startup_files_are_write_denied_in_both_granted_dirs() {
             process_exec: false,
             write_files: vec![],
             create_dirs: vec![],
+            via: vec![],
         }
     });
     let conf = std::path::PathBuf::from("/Users/test/.config/fish");
@@ -2500,6 +2507,7 @@ fn a_named_root_is_granted_read_write_and_execute() {
             named_roots: &named,
             named_root_git_dirs: &[],
             managed_worktree_root: None,
+            worktree_socket: None,
             ..base_profile_options()
         },
         &[],
@@ -2519,6 +2527,45 @@ fn a_named_root_is_granted_read_write_and_execute() {
     );
 }
 
+/// #531 broker: the socket grant is one outbound rule on the exact path, and
+/// it is absent when no broker runs. Default-off profiles stay byte-identical.
+#[test]
+fn the_worktree_broker_socket_is_one_exact_outbound_rule_when_set() {
+    let socket = PathBuf::from("/Users/test/.cplt-worktrees/.broker/0123456789abcdef/s");
+    let profile = |sock: Option<&std::path::Path>| {
+        generate_profile(
+            &SandboxConfig {
+                worktree_socket: sock,
+                ..base_profile_options()
+            },
+            &[],
+        )
+    };
+    let off = profile(None);
+    assert!(!off.contains("cplt worktree add"), "{off}");
+    assert_eq!(off, profile(None), "deterministic");
+    let on = profile(Some(&socket));
+    let rule = "(allow network-outbound (remote unix-socket (path-literal \"/Users/test/.cplt-worktrees/.broker/0123456789abcdef/s\")))";
+    assert_eq!(on.matches(rule).count(), 1, "{on}");
+    assert!(
+        !on.contains(
+            "network-bind (local unix-socket (path-literal \"/Users/test/.cplt-worktrees/.broker"
+        ),
+        "outbound only: the sandbox never binds the broker socket\n{on}"
+    );
+    // The block is the comment, the rule and one blank line. Removing exactly
+    // that gives back the off profile.
+    let block = format!(
+        ";; Managed worktree broker socket (cplt worktree add, #531)\n{rule}\n(deny file-write* (subpath \"{}\"))\n\n",
+        socket.parent().unwrap().display()
+    );
+    assert_eq!(
+        on.replace(&block, ""),
+        off,
+        "the block is the whole difference"
+    );
+}
+
 /// #531: the managed worktree root section, with the `.git` create denies of
 /// the #574 re-review, appears only when the root is set.
 #[test]
@@ -2531,6 +2578,7 @@ fn the_managed_worktree_root_section_is_emitted_only_when_set() {
                 named_roots: &named,
                 named_root_git_dirs: &[],
                 managed_worktree_root: managed,
+                worktree_socket: None,
                 ..base_profile_options()
             },
             &[],
@@ -2562,6 +2610,7 @@ fn a_named_root_carries_the_protected_paths() {
             named_roots: &named,
             named_root_git_dirs: &[],
             managed_worktree_root: None,
+            worktree_socket: None,
             ..base_profile_options()
         },
         &[],
@@ -2588,6 +2637,7 @@ fn an_allow_write_over_a_named_roots_parent_does_not_take_its_execute_back() {
             named_roots: &named,
             named_root_git_dirs: &[],
             managed_worktree_root: None,
+            worktree_socket: None,
             extra_write: &write,
             ..base_profile_options()
         },
@@ -2615,6 +2665,7 @@ fn the_landlock_model_grants_a_named_root_the_project_access() {
         named_roots: &named,
         named_root_git_dirs: &[],
         managed_worktree_root: None,
+        worktree_socket: None,
         ..base_profile_options()
     });
     let rule = policy
@@ -2642,6 +2693,7 @@ fn a_named_roots_shared_gitdir_is_granted() {
             named_roots: &named,
             named_root_git_dirs: &gitdirs,
             managed_worktree_root: None,
+            worktree_socket: None,
             ..base_profile_options()
         },
         &[],
@@ -2657,6 +2709,7 @@ fn a_named_roots_shared_gitdir_is_granted() {
         named_roots: &named,
         named_root_git_dirs: &gitdirs,
         managed_worktree_root: None,
+        worktree_socket: None,
         ..base_profile_options()
     });
     let rule = policy
@@ -2685,6 +2738,7 @@ fn base_profile_options() -> SandboxConfig<'static> {
         named_roots: &[],
         named_root_git_dirs: &[],
         managed_worktree_root: None,
+        worktree_socket: None,
         existing_home_tool_dirs: None,
         existing_app_dirs: None,
         extra_ports: &[],
@@ -4224,6 +4278,7 @@ fn allow_localhost_any_affects_both_backends() {
         named_roots: &[],
         named_root_git_dirs: &[],
         managed_worktree_root: None,
+        worktree_socket: None,
         existing_home_tool_dirs: None,
         existing_app_dirs: None,
         extra_ports: &[],
@@ -4293,6 +4348,7 @@ fn config_options_parity_across_backends() {
         named_roots: &[],
         named_root_git_dirs: &[],
         managed_worktree_root: None,
+        worktree_socket: None,
         existing_home_tool_dirs: None,
         existing_app_dirs: None,
         extra_ports: &ports,
@@ -7199,6 +7255,7 @@ fn profile_gpg_signing_deny_path_wins() {
             named_roots: &[],
             named_root_git_dirs: &[],
             managed_worktree_root: None,
+            worktree_socket: None,
             allow_gpg_signing: true,
             ..base_profile_options()
         },
@@ -8282,6 +8339,7 @@ fn profile_docker_withholds_the_overlapping_reallow() {
             named_roots: &[],
             named_root_git_dirs: &[],
             managed_worktree_root: None,
+            worktree_socket: None,
             allow_docker: true,
             ..base_profile_options()
         },
@@ -8469,6 +8527,7 @@ fn profile_socket_skipped_when_deny_path_overlaps() {
             named_roots: &[],
             named_root_git_dirs: &[],
             managed_worktree_root: None,
+            worktree_socket: None,
             ..base_profile_options()
         },
         &[],
@@ -9684,6 +9743,7 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
             process_exec: false,
             write_files: vec!["auth.json"],
             create_dirs: vec![],
+            via: vec![],
         },
         AgentDir {
             path: data_dir.clone(),
@@ -9692,6 +9752,7 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
             process_exec: false,
             write_files: vec![],
             create_dirs: vec![],
+            via: vec![],
         },
         AgentDir {
             path: state_dir.clone(),
@@ -9700,6 +9761,7 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
             process_exec: false,
             write_files: vec![],
             create_dirs: vec![],
+            via: vec![],
         },
         AgentDir {
             path: cache_dir.clone(),
@@ -9708,6 +9770,7 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
             process_exec: false,
             write_files: vec![],
             create_dirs: vec![],
+            via: vec![],
         },
         AgentDir {
             path: cache_dir.join("bin"),
@@ -9716,6 +9779,7 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
             process_exec: true,
             write_files: vec![],
             create_dirs: vec![],
+            via: vec![],
         },
     ];
 
@@ -10455,6 +10519,7 @@ fn landlock_relocated_cargo_bin_is_exec_only_and_registry_is_precreated() {
         named_roots: &[],
         named_root_git_dirs: &[],
         managed_worktree_root: None,
+        worktree_socket: None,
         existing_home_tool_dirs: Some(&dirs),
         existing_app_dirs: None,
         extra_ports: &[],

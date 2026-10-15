@@ -25,7 +25,8 @@ mod e2e_tests {
 
     use crate::common::{
         bare_origin_repo, binary_path, cplt_cmd, cplt_cmd_with_ambient_config, cplt_local, git_cmd,
-        git_ok, home_temp_dir, make_config_home, shim_cmd, temp_repo,
+        git_ok, hold_port, home_temp_dir, make_config_home, processes_with_env, shim_cmd,
+        signal_group, temp_repo,
     };
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -324,6 +325,32 @@ mod e2e_tests {
         );
     }
 
+    /// #703: a missing OpenCode config file must not be created on the host
+    /// (as an empty directory, which OpenCode then fails to read).
+    #[test]
+    fn e2e_opencode_print_profile_creates_no_config_files() {
+        let tmp = tempfile::Builder::new()
+            .prefix(".cplt-ocpp-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("tempdir");
+        let xdg = tmp.path().join("xdg");
+        let output = cplt_cmd()
+            .args(["--print-profile", "--agent", "opencode"])
+            .env("XDG_CONFIG_HOME", &xdg)
+            .current_dir(project_dir())
+            .output()
+            .expect("binary should run");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for f in ["opencode.json", "opencode.jsonc", "config.json"] {
+            let p = xdg.join("opencode").join(f);
+            assert!(!p.exists(), "{} must not be created", p.display());
+        }
+    }
+
     /// Audit C-02: an externally-set `CLAUDE_CONFIG_DIR` pointing at a system
     /// root must not become a writable grant. The refusal fires in
     /// `assemble_sandbox`, which `--print-profile --agent claude` reaches
@@ -347,6 +374,29 @@ mod e2e_tests {
             stderr.contains("config directory") && stderr.contains("too broad"),
             "refusal should name the offending config directory.\nstderr: {stderr}"
         );
+    }
+
+    /// #723: the launch wiring refuses a `CLAUDE_CONFIG_DIR` or `DSH_HOME` on a
+    /// credential dir, not just the helper.
+    #[test]
+    fn e2e_config_dir_on_credentials_is_refused() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let home = std::fs::canonicalize(home.path()).unwrap();
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        for (agent, var) in [("claude", "CLAUDE_CONFIG_DIR"), ("dsh", "DSH_HOME")] {
+            let output = cplt_cmd()
+                .args(["--print-profile", "--agent", agent])
+                .env("HOME", &home)
+                .env(var, home.join(".ssh"))
+                .current_dir(project_dir())
+                .output()
+                .expect("binary should run");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !output.status.success() && stderr.contains("credential directory"),
+                "{var} on ~/.ssh must abort the launch.\nstderr: {stderr}"
+            );
+        }
     }
 
     /// The other half of C-02: a dedicated subdirectory is legitimate and must
@@ -567,6 +617,33 @@ mod e2e_tests {
         );
     }
 
+    #[test]
+    fn e2e_doctor_header_has_settings_auth_and_paste_hint() {
+        // `--agent` after `doctor` works like the global flag before it.
+        let output = cplt_cmd()
+            .args(["doctor", "--agent", "shell"])
+            .current_dir(project_dir())
+            .output()
+            .expect("binary should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("agent:       Shell") && stdout.contains("(--agent)"),
+            "doctor --agent picks the agent.\nstdout: {stdout}"
+        );
+        assert!(
+            stdout.contains("settings:    keychain_substitute ") && stdout.contains(" · quiet off"),
+            "the settings line reports the user's quiet, not doctor's own.\nstdout: {stdout}"
+        );
+        assert!(
+            stdout.contains("auth:        none (the shell needs no login)"),
+            "the auth line is per agent.\nstdout: {stdout}"
+        );
+        assert!(
+            stdout.contains("`--verbose` adds absolute paths and is not paste-safe"),
+            "the header ends with the paste hint.\nstdout: {stdout}"
+        );
+    }
+
     /// #604: an allowlist that blocks the agent's hosts failed `cplt check`
     /// while doctor said "No problems found".
     #[test]
@@ -654,11 +731,17 @@ mod e2e_tests {
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         assert!(
-            stdout.contains("── inventory ──")
+            stdout.contains("── inventory (absolute paths: not paste-safe) ──")
                 && stdout.contains("[doctor]")
                 && stdout.contains("Tools")
                 && stdout.contains("git"),
             "--verbose appends the old inventory (Tools section with git).\nstdout: {stdout}"
+        );
+        // The token-variable, gh-login and keytar lines are how Copilot signs
+        // in; for any other agent they are noise.
+        assert!(
+            !stdout.contains("No env token set") && !stdout.contains("gh CLI:"),
+            "Copilot-only auth lines shown for the shell.\nstdout: {stdout}"
         );
         // --verbose is what gets attached to bug reports: paste-safe too.
         let home = std::env::var("HOME").expect("HOME");
@@ -2929,7 +3012,7 @@ mod e2e_tests {
                     ("allow_env_files ", "= true (preset)"),
                     ("allow_docker ", "= true ⚠ DANGEROUS (preset)"),
                     ("allow_tmp_exec ", "= true ⚠ DANGEROUS (preset)"),
-                    ("allow_lifecycle_scripts ", "= true (preset)"),
+                    ("allow_lifecycle_scripts ", "= true ⚠ DANGEROUS (preset)"),
                 ],
             ),
             (
@@ -2938,7 +3021,7 @@ mod e2e_tests {
                     ("allow_env_files ", "= false (default)"),
                     ("allow_docker ", "= false (default)"),
                     ("allow_tmp_exec ", "= true ⚠ DANGEROUS (preset)"),
-                    ("allow_lifecycle_scripts ", "= true (preset)"),
+                    ("allow_lifecycle_scripts ", "= true ⚠ DANGEROUS (preset)"),
                 ],
             ),
             ("strict", &[("default_allowlist ", "= true (preset)")]),
@@ -3527,6 +3610,120 @@ mod e2e_tests {
         let _ = std::fs::remove_dir_all(&fake_home);
     }
 
+    // ── config set with several values ───────────────────────────
+
+    fn config_set_global(home: &Path, args: &[&str]) -> std::process::Output {
+        cplt_cmd()
+            .args(["config", "set"])
+            .args(args)
+            .env("HOME", home.to_str().unwrap())
+            .env_remove("CPLT_CONFIG")
+            .output()
+            .expect("should run")
+    }
+
+    #[test]
+    fn e2e_config_set_multi_value_global_and_unset() {
+        let fake_home = make_config_home("set-multi");
+        let out = config_set_global(&fake_home, &["allow.localhost", "5432", "55432", "8099"]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let content = std::fs::read_to_string(fake_home.join(".config/cplt/config.toml")).unwrap();
+        for port in ["5432", "55432", "8099"] {
+            assert!(content.contains(port), "{port} missing: {content}");
+        }
+
+        let out = config_set_global(&fake_home, &["allow.localhost", "5432", "8099", "--unset"]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let content = std::fs::read_to_string(fake_home.join(".config/cplt/config.toml")).unwrap();
+        assert!(content.contains("55432"), "kept entry gone: {content}");
+        assert!(
+            !content.contains("8099") && !content.contains("[5432") && !content.contains(" 5432"),
+            "removed entries remain: {content}"
+        );
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
+    fn e2e_config_set_unset_duplicate_values_is_silent() {
+        let fake_home = make_config_home("set-unset-dup");
+        let out = config_set_global(&fake_home, &["allow.localhost", "5", "8099"]);
+        assert!(out.status.success());
+        let out = config_set_global(&fake_home, &["allow.localhost", "--unset", "5", "5"]);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{err}");
+        assert!(!err.contains("not set"), "duplicate must not warn: {err}");
+        let content = std::fs::read_to_string(fake_home.join(".config/cplt/config.toml")).unwrap();
+        assert!(content.contains("8099"), "kept entry gone: {content}");
+        assert!(
+            !content.contains("[5") && !content.contains(" 5,") && !content.contains(" 5]"),
+            "5 remains: {content}"
+        );
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
+    fn e2e_config_set_multi_value_rejects_scalar_key() {
+        let fake_home = make_config_home("set-multi-scalar");
+        let out = config_set_global(&fake_home, &["sandbox.quiet", "true", "false"]);
+        assert!(!out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("single value"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!fake_home.join(".config/cplt/config.toml").exists());
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    /// One bad value refuses the whole command: the good ones are not written.
+    #[test]
+    fn e2e_config_set_multi_value_one_bad_writes_nothing() {
+        let fake_home = make_config_home("set-multi-bad");
+        let out = config_set_global(&fake_home, &["allow.localhost", "5432", "notaport"]);
+        assert!(!out.status.success(), "a bad port must fail");
+        let content =
+            std::fs::read_to_string(fake_home.join(".config/cplt/config.toml")).unwrap_or_default();
+        assert!(!content.contains("5432"), "partial write: {content}");
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
+    fn e2e_config_set_multi_value_repo() {
+        let repo = make_repo_dir("set-multi-repo");
+        let out = cplt_cmd()
+            .args([
+                "config",
+                "set",
+                "--repo",
+                "allow.localhost",
+                "5432",
+                "55432",
+                "8099",
+                "8100",
+            ])
+            .current_dir(&repo)
+            .output()
+            .expect("should run");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let content = std::fs::read_to_string(repo.join(".cplt.toml")).unwrap();
+        for port in ["5432", "55432", "8099", "8100"] {
+            assert!(content.contains(port), "{port} missing: {content}");
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
     // ── config set --local e2e tests (#340) ──────────────────────
 
     /// The single local file under a fake HOME, or `None` if none was written.
@@ -3540,6 +3737,34 @@ mod e2e_tests {
 
     /// The round trip: write a local value, read it back labelled `(local)`,
     /// and see it in the effective config.
+    #[test]
+    fn e2e_config_set_multi_value_local() {
+        let fake_home = make_config_home("set-multi-local");
+        let repo = temp_repo("navikt/spleis");
+        let out = cplt_local(&fake_home, repo.path())
+            .args([
+                "config",
+                "set",
+                "--local",
+                "allow.localhost",
+                "5432",
+                "8099",
+            ])
+            .output()
+            .expect("should run");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let content = std::fs::read_to_string(local_file(&fake_home).unwrap()).unwrap();
+        assert!(
+            content.contains("5432") && content.contains("8099"),
+            "{content}"
+        );
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
     #[test]
     fn e2e_config_set_local_round_trip() {
         let fake_home = make_config_home("set-local");
@@ -5135,6 +5360,82 @@ paths = [
         assert!(
             !content.contains("allow_jvm_attach"),
             "key should be removed: {content}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn e2e_config_set_repo_unset_warns_for_absent_value() {
+        let repo = make_repo_dir("set-repo-unset-partial");
+        std::fs::write(
+            repo.join(".cplt.toml"),
+            "[propose.allow]\nports = [8080, 9090]\n",
+        )
+        .unwrap();
+
+        let output = cplt_cmd()
+            .args([
+                "config",
+                "set",
+                "--repo",
+                "allow.ports",
+                "8080",
+                "7070",
+                "--unset",
+            ])
+            .current_dir(&repo)
+            .output()
+            .expect("should run");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "unset: {stderr}");
+        assert!(stderr.contains("7070 is not set"), "should warn: {stderr}");
+        assert!(
+            !stderr.contains("8080 is not set"),
+            "8080 was set: {stderr}"
+        );
+
+        let content = std::fs::read_to_string(repo.join(".cplt.toml")).unwrap();
+        assert!(
+            !content.contains("8080"),
+            "8080 should be removed: {content}"
+        );
+        assert!(content.contains("9090"), "9090 should stay: {content}");
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn e2e_config_set_repo_unset_all_absent_writes_nothing() {
+        let repo = make_repo_dir("set-repo-unset-absent");
+        let original = "# keep me\n[propose.allow]\nports = [ 8080 ]\n";
+        std::fs::write(repo.join(".cplt.toml"), original).unwrap();
+
+        let output = cplt_cmd()
+            .args([
+                "config",
+                "set",
+                "--repo",
+                "allow.ports",
+                "7070",
+                "6060",
+                "--unset",
+            ])
+            .current_dir(&repo)
+            .output()
+            .expect("should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "unset: {stderr}");
+        assert!(stderr.contains("7070 is not set"), "should warn: {stderr}");
+        assert!(stderr.contains("6060 is not set"), "should warn: {stderr}");
+        assert!(
+            !format!("{stdout}{stderr}").contains("removed from"),
+            "no removal: {stdout}{stderr}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join(".cplt.toml")).unwrap(),
+            original
         );
 
         let _ = std::fs::remove_dir_all(&repo);
@@ -8052,6 +8353,43 @@ paths = [
         );
     }
 
+    /// Ctrl-C reaches both cplt and the agent (same foreground process group).
+    /// cplt must not die from it: it waits for the child, returns the child's
+    /// status and removes the scratch dir.
+    #[test]
+    fn e2e_exec_sigint_to_cplt_waits_for_child_and_cleans_up() {
+        use std::io::{BufRead, BufReader};
+        use std::process::Stdio;
+        require_sandbox!();
+        let mut child = cplt_cmd()
+            .args(["--no-validate", "exec", "--", "/bin/sh", "-c"])
+            .arg("echo \"$TMPDIR\"; sleep 2; echo done; exit 7")
+            .current_dir(project_dir())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("cplt exec should start");
+        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        let tmpdir = lines.next().unwrap().unwrap();
+        assert!(
+            Path::new(&tmpdir).is_dir(),
+            "scratch dir should exist: {tmpdir}"
+        );
+
+        unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
+        let status = child.wait().unwrap();
+
+        assert_eq!(lines.next().unwrap().unwrap(), "done");
+        assert_eq!(
+            status.code(),
+            Some(7),
+            "cplt must return the child's status"
+        );
+        assert!(
+            !Path::new(&tmpdir).exists(),
+            "scratch dir must be removed: {tmpdir}"
+        );
+    }
+
     #[test]
     fn e2e_exec_npmrc_userconfig_absent_without_scratch_dir() {
         require_sandbox!();
@@ -9341,7 +9679,7 @@ paths = [
     /// `/var/folders` are wholesale-writable in the profile, so a fake home
     /// there is writable by that rule and every probe below passes vacuously.
     #[test]
-    fn e2e_pi_trust_lock_is_creatable_but_nothing_else_in_the_root_moves() {
+    fn e2e_pi_startup_locks_are_creatable_but_nothing_else_in_the_root_moves() {
         require_sandbox!();
         let fake_home = home_temp_dir("pi-lock");
         let agent = fake_home.path().join(".pi/agent");
@@ -9352,6 +9690,7 @@ paths = [
         std::fs::write(agent.join("tmp/rg"), "payload").unwrap();
         std::fs::write(agent.join("sessions/evil.js"), "ext").unwrap();
         std::fs::write(agent.join("trust.json"), "{}").unwrap();
+        std::fs::write(agent.join("settings.json"), "{}").unwrap();
         let project = tempfile::tempdir().unwrap();
 
         let out = cplt_cmd()
@@ -9386,16 +9725,29 @@ paths = [
         };
 
         // proper-lockfile's exact sequence: mkdir, utimes (mtime probe), rmdir.
-        assert!(probe(format!("mkdir {a}/trust.json.lock")), "mkdir lock");
-        assert!(
-            probe(format!("touch -m {a}/trust.json.lock")),
-            "utimes lock"
-        );
-        assert!(
-            !probe(format!("touch {a}/trust.json.lock/f")),
-            "nothing may be created inside the lock"
-        );
-        assert!(probe(format!("rmdir {a}/trust.json.lock")), "rmdir lock");
+        for file in ["trust.json", "auth.json", "settings.json"] {
+            let lock = format!("{a}/{file}.lock");
+            assert!(probe(format!("mkdir {lock}")), "mkdir {file}.lock");
+            assert!(probe(format!("touch -m {lock}")), "utimes {file}.lock");
+            assert!(
+                !probe(format!("touch {lock}/f")),
+                "nothing may be created inside {file}.lock"
+            );
+            assert!(probe(format!("rmdir {lock}")), "rmdir {file}.lock");
+            for cmd in [
+                format!("touch {lock}"),
+                format!("ln -s /etc {lock}"),
+                format!("mkfifo {lock}"),
+            ] {
+                assert!(!probe(cmd), "{file}.lock must only allow a directory");
+            }
+        }
+        for file in ["trust.json", "settings.json"] {
+            assert!(
+                !probe(format!("echo evil > {a}/{file}")),
+                "{file} must stay write-denied"
+            );
+        }
 
         // The escapes the root-wide grant allowed, each of which must now fail.
         for (what, cmd) in [
@@ -9421,10 +9773,6 @@ paths = [
                 format!("echo evil > {a}/bin/rg"),
             ),
             ("create a top-level file", format!("touch {a}/newfile")),
-            (
-                "symlink at the lock name",
-                format!("ln -s /etc {a}/trust.json.lock"),
-            ),
         ] {
             assert!(!probe(cmd), "{what} must be denied");
         }
@@ -9434,5 +9782,592 @@ paths = [
             "the managed binary must be byte-for-byte untouched"
         );
         assert!(agent.join("bin").is_dir() && agent.join("extensions").is_dir());
+    }
+
+    /// #710 OpenCode v2 sessions, end to end through the real sandbox. The
+    /// agent is a stub: it answers `--version` like v2 (so cplt takes the v2
+    /// path) and otherwise runs its argument as a shell script inside the
+    /// sandbox, so each probe tests cplt's real profile and environment. HOME
+    /// is a fake one under the real HOME (deny-by-default, unlike TMPDIR).
+    mod opencode_v2 {
+        use super::*;
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        const STUB: &str = "#!/bin/sh\n[ \"$1\" = --version ] && { echo opencode v2.0.24; exit 0; }\nexec /bin/sh -c \"$1\"\n";
+        const SECRET: &str = "HOST-SECRET";
+
+        pub(super) struct Home {
+            _dir: tempfile::TempDir,
+            pub(super) h: PathBuf,
+            pub(super) proj: PathBuf,
+            pub(super) bin: PathBuf,
+        }
+
+        /// A fake HOME with host service files, a user config and the
+        /// discovery dirs v2 lists at startup. `bin` is where `opencode` goes.
+        pub(super) fn home() -> Home {
+            let dir = home_temp_dir("ocv2");
+            let h = std::fs::canonicalize(dir.path()).unwrap();
+            let w = |rel: &str, body: &str| {
+                let p = h.join(rel);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(p, body).unwrap();
+            };
+            w(".config/opencode/opencode.json", "{}");
+            w(".config/opencode/service.json", SECRET);
+            w(".config/git/config", "");
+            w(".local/state/opencode/service.json", SECRET);
+            for d in [".claude", ".agents", ".opencode"] {
+                w(&format!("{d}/secret"), SECRET);
+            }
+            let proj = h.join("work/proj");
+            std::fs::create_dir_all(&proj).unwrap();
+            // Its own repo, so the project is not whatever repo holds the real HOME.
+            assert!(git_ok(&proj, &["init", "-q"]));
+            let bin = h.join(".opencode/bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            Home {
+                _dir: dir,
+                h,
+                proj,
+                bin,
+            }
+        }
+
+        fn stub_home() -> Home {
+            let home = home();
+            let stub = home.bin.join("opencode");
+            std::fs::write(&stub, STUB).unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            home
+        }
+
+        impl Home {
+            pub(super) fn cmd(&self, args: &[&str]) -> Command {
+                let mut cmd = cplt_cmd();
+                cmd.current_dir(&self.proj)
+                    .env("HOME", &self.h)
+                    .env("PATH", format!("{}:/usr/bin:/bin", self.bin.display()));
+                for v in [
+                    "XDG_CONFIG_HOME",
+                    "XDG_DATA_HOME",
+                    "XDG_STATE_HOME",
+                    "XDG_CACHE_HOME",
+                    "OPENCODE_CONFIG_DIR",
+                ] {
+                    cmd.env_remove(v);
+                }
+                cmd.args(["--yes", "--agent", "opencode"]).args(args);
+                cmd
+            }
+
+            /// Run `script` inside the sandbox: (stdout, stderr, exit code).
+            fn sh(&self, script: &str) -> (String, String, Option<i32>) {
+                let o = self.cmd(&["--", script]).output().expect("cplt should run");
+                (
+                    String::from_utf8_lossy(&o.stdout).into_owned(),
+                    String::from_utf8_lossy(&o.stderr).into_owned(),
+                    o.status.code(),
+                )
+            }
+        }
+
+        /// The scratch dir the session ran in, from the XDG_STATE_HOME it printed.
+        fn scratch_of(state: &str) -> PathBuf {
+            PathBuf::from(
+                state
+                    .trim()
+                    .strip_suffix("/opencode-v2/state")
+                    .expect(state),
+            )
+        }
+
+        #[test]
+        fn launches_and_propagates_the_exit_code() {
+            require_sandbox!();
+            let (out, err, code) = stub_home().sh("echo RAN; exit 7");
+            assert_eq!(code, Some(7), "{err}");
+            assert!(out.contains("RAN"), "{out}\n{err}");
+            assert!(!err.contains("issues/710"), "{err}");
+        }
+
+        #[test]
+        fn env_points_at_the_private_session() {
+            require_sandbox!();
+            let home = stub_home();
+            let o = home
+                .cmd(&["--pass-env", "OPENCODE_AUTH_CONTENT", "--", "env"])
+                .env("OPENCODE_AUTH_CONTENT", "AUTH-CANARY")
+                .output()
+                .unwrap();
+            let out = String::from_utf8_lossy(&o.stdout);
+            let err = String::from_utf8_lossy(&o.stderr);
+            assert!(o.status.success(), "{err}");
+            let var = |k: &str| {
+                out.lines()
+                    .find_map(|l| l.strip_prefix(&format!("{k}=")))
+                    .unwrap_or_else(|| panic!("{k} unset:\n{out}"))
+                    .to_string()
+            };
+            let state = var("XDG_STATE_HOME");
+            assert!(state.ends_with("/opencode-v2/state"), "{state}");
+            let config = var("XDG_CONFIG_HOME");
+            assert!(config.ends_with("/opencode-v2/config"), "{config}");
+            assert_eq!(var("OPENCODE_CONFIG_DIR"), format!("{config}/opencode"));
+            assert_eq!(var("OPENCODE_DISABLE_MODELS_FETCH"), "1");
+            assert_eq!(var("OPENCODE_DISABLE_AUTOUPDATE"), "1");
+            assert!(!out.contains("OPENCODE_AUTH_CONTENT"), "{out}");
+        }
+
+        #[test]
+        fn overlay_holds_cplts_service_json_and_links_the_rest() {
+            require_sandbox!();
+            let home = stub_home();
+            let (out, err, code) = home.sh(r#"o="$XDG_CONFIG_HOME/opencode"
+                [ -L "$o/service.json" ] && echo SVC-IS-LINK
+                echo "MODE=$(stat -f %Lp "$o/service.json")"
+                echo "SVC=$(cat "$o/service.json")"
+                echo "OC=$(readlink "$o/opencode.json")"
+                echo "GIT=$(readlink "$XDG_CONFIG_HOME/git")""#);
+            assert_eq!(code, Some(0), "{err}");
+            assert!(!out.contains("SVC-IS-LINK"), "{out}");
+            assert!(out.contains("MODE=600"), "{out}");
+            let svc = out.lines().find_map(|l| l.strip_prefix("SVC=")).unwrap();
+            let v: serde_json::Value = serde_json::from_str(svc).expect(svc);
+            assert!(v["port"].as_u64().is_some_and(|p| p != 49374), "{svc}");
+            assert_eq!(v["password"].as_str().unwrap().len(), 32, "{svc}");
+            let user = home.h.join(".config");
+            let oc = format!("OC={}/opencode/opencode.json", user.display());
+            assert!(out.contains(&oc), "{out}");
+            assert!(
+                out.contains(&format!("GIT={}/git", user.display())),
+                "{out}"
+            );
+        }
+
+        /// Host service files stay unreadable, their dirs cannot be renamed
+        /// away, the default service port is closed and the session's is open.
+        #[test]
+        fn sandbox_denies_the_host_service() {
+            require_sandbox!();
+            let home = stub_home();
+            // Something must listen on 49374 for a refused connect to mean
+            // anything: hold it, unless a host service already does (locally).
+            let _held = hold_port(49374);
+            let (out, err, code) = home.sh(&format!(
+                r#"h={h}
+                cat "$h/.local/state/opencode/service.json"
+                cat "$h/.config/opencode/service.json"
+                mv "$h/.local/state/opencode" "$PWD/moved1" && echo MOVED
+                mv "$h/.config/opencode" "$PWD/moved2" && echo MOVED
+                P=$(sed 's/.*"port":\([0-9]*\).*/\1/' "$XDG_CONFIG_HOME/opencode/service.json")
+                /usr/bin/nc -l 127.0.0.1 "$P" >/dev/null & sleep 0.5
+                /usr/bin/nc -z -G 2 127.0.0.1 "$P" && echo SESSION-PORT-OPEN
+                /usr/bin/nc -z -G 2 127.0.0.1 49374 && echo DEFAULT-PORT-OPEN
+                kill $! 2>/dev/null; exit 0"#,
+                h = home.h.display()
+            ));
+            assert_eq!(code, Some(0), "{err}");
+            assert!(!out.contains(SECRET), "{out}");
+            assert!(!out.contains("MOVED"), "{out}");
+            assert!(out.contains("SESSION-PORT-OPEN"), "{out}\n{err}");
+            assert!(!out.contains("DEFAULT-PORT-OPEN"), "{out}");
+            assert!(home.h.join(".local/state/opencode/service.json").exists());
+        }
+
+        /// A dotfiles-style `~/.config/opencode` symlink: the resolved file is
+        /// denied too.
+        #[test]
+        fn sandbox_denies_host_service_json_behind_a_symlinked_config_dir() {
+            require_sandbox!();
+            let home = stub_home();
+            let dot = home.h.join("dotfiles/opencode");
+            std::fs::create_dir_all(dot.parent().unwrap()).unwrap();
+            std::fs::rename(home.h.join(".config/opencode"), &dot).unwrap();
+            symlink(&dot, home.h.join(".config/opencode")).unwrap();
+            let (out, err, code) = home.sh(&format!(
+                "cat {0}/.config/opencode/service.json {1}/service.json; exit 0",
+                home.h.display(),
+                dot.display()
+            ));
+            assert_eq!(code, Some(0), "{err}");
+            assert!(!out.contains(SECRET), "{out}");
+        }
+
+        /// v2's startup discovery lists $HOME and its .claude, .agents and
+        /// .opencode entries; their contents stay denied.
+        #[test]
+        fn startup_listings_are_allowed_contents_denied() {
+            require_sandbox!();
+            let home = stub_home();
+            let (out, err, code) = home.sh(&format!(
+                r#"cd /; for d in {h} {h}/.claude {h}/.agents {h}/.opencode; do
+                  ls "$d" >/dev/null && echo "LS-OK $d"; cat "$d/secret" 2>/dev/null
+                done; exit 0"#,
+                h = home.h.display()
+            ));
+            assert_eq!(code, Some(0), "{err}");
+            for d in ["", "/.claude", "/.agents", "/.opencode"] {
+                let want = format!("LS-OK {}{d}\n", home.h.display());
+                assert!(out.contains(&want), "{want}\n{out}\n{err}");
+            }
+            assert!(!out.contains(SECRET), "{out}");
+        }
+
+        /// A live host service shares opencode.db: warn, but still launch.
+        /// v1 credentials on a fresh database: hint at a login.
+        #[test]
+        fn host_service_and_missing_credentials_are_reported() {
+            require_sandbox!();
+            let home = stub_home();
+            let (_, err, code) = home.sh("exit 0");
+            assert_eq!(code, Some(0), "{err}");
+            assert!(!err.contains("host OpenCode service"), "{err}");
+            // No opencode.db yet: the launch went through the first-run gate.
+            let lock = home.h.join(".config/cplt/opencode-v2-first-run.lock");
+            assert!(lock.exists(), "first-run gate not wired");
+            std::fs::write(
+                home.h.join(".local/state/opencode/service.json"),
+                format!("{{\"pid\":{}}}", std::process::id()),
+            )
+            .unwrap();
+            let data = home.h.join(".local/share/opencode");
+            std::fs::create_dir_all(&data).unwrap();
+            std::fs::write(data.join("auth.json"), "{\"github-copilot\":{}}").unwrap();
+            let (out, err, code) = home.sh("echo RAN");
+            assert_eq!(code, Some(0), "{err}");
+            assert!(out.contains("RAN"), "{out}");
+            let pid = format!("host OpenCode service (pid {})", std::process::id());
+            assert!(err.contains(&pid), "{err}");
+            assert!(err.contains("opencode auth login"), "{err}");
+        }
+
+        /// v2 reads every `AGENTS.md` from the launch dir up to $HOME and
+        /// blocks the session if one is unreadable: plain or dotfile-symlinked
+        /// ones are readable, a link to a credential or a FIFO is refused.
+        #[test]
+        fn ancestor_agents_md_is_readable() {
+            require_sandbox!();
+            let home = stub_home();
+            std::fs::write(home.h.join("work/AGENTS.md"), "ANCESTOR").unwrap();
+            std::fs::create_dir_all(home.h.join("dotfiles")).unwrap();
+            std::fs::write(home.h.join("dotfiles/AGENTS.md"), "HOMEDOT").unwrap();
+            let link = home.h.join("AGENTS.md");
+            symlink(home.h.join("dotfiles/AGENTS.md"), &link).unwrap();
+            let (out, err, code) = home.sh(&format!(
+                "cat {0}/work/AGENTS.md {0}/AGENTS.md",
+                home.h.display()
+            ));
+            assert_eq!(code, Some(0), "{err}");
+            assert!(out.contains("ANCESTOR") && out.contains("HOMEDOT"), "{out}");
+            std::fs::remove_file(&link).unwrap();
+            std::fs::create_dir_all(home.h.join(".ssh")).unwrap();
+            std::fs::write(home.h.join(".ssh/config"), SECRET).unwrap();
+            let c = std::ffi::CString::new(home.h.join("fifo").to_str().unwrap()).unwrap();
+            // SAFETY: valid C string.
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+            std::fs::create_dir_all(home.h.join(".cargo")).unwrap();
+            std::fs::write(home.h.join(".cargo/credentials.toml"), SECRET).unwrap();
+            for target in [".ssh/config", "fifo", ".cargo/credentials.toml"] {
+                symlink(home.h.join(target), &link).unwrap();
+                let (out, err, code) = home.sh("echo RAN");
+                assert_ne!(code, Some(0), "{target}: {err}");
+                assert!(!out.contains("RAN"), "{target}");
+                assert!(err.contains(&link.display().to_string()), "{err}");
+                let to = format!("points to {}", home.h.join(target).display());
+                assert!(err.contains(&to), "{err}");
+                std::fs::remove_file(&link).unwrap();
+            }
+            // A file a later deny covers (deny.paths, the project .env rule)
+            // stays unreadable: the grant goes before the profile's denies.
+            std::fs::write(home.h.join("dotfiles/denied"), SECRET).unwrap();
+            std::fs::write(home.proj.join(".env"), SECRET).unwrap();
+            let deny = home.h.join("dotfiles/denied");
+            for target in [deny.clone(), home.proj.join(".env")] {
+                symlink(&target, &link).unwrap();
+                let o = home
+                    .cmd(&[
+                        "--deny-path",
+                        deny.to_str().unwrap(),
+                        "--",
+                        "cat ~/AGENTS.md",
+                    ])
+                    .output()
+                    .unwrap();
+                let out = String::from_utf8_lossy(&o.stdout);
+                let err = String::from_utf8_lossy(&o.stderr);
+                assert!(!out.contains(SECRET), "{}: {out}\n{err}", target.display());
+                std::fs::remove_file(&link).unwrap();
+            }
+        }
+
+        /// A `.agents` link the agent plants in the project must not make its
+        /// target readable at the next launch (#716 leak).
+        #[test]
+        fn planted_discovery_link_does_not_expose_a_key() {
+            require_sandbox!();
+            let home = stub_home();
+            let key = home.h.join(".ssh/id_ed25519");
+            std::fs::create_dir_all(key.parent().unwrap()).unwrap();
+            std::fs::write(&key, SECRET).unwrap();
+            symlink(&key, home.proj.join(".agents")).unwrap();
+            let (out, err, _) = home.sh(&format!("cat {}", key.display()));
+            assert!(!out.contains(SECRET), "{out}\n{err}");
+            // Outside the project, the same link is refused by name.
+            symlink(&key, home.h.join("work/.agents")).unwrap();
+            let (out, err, code) = home.sh(&format!("cat {}", key.display()));
+            assert_ne!(code, Some(0), "{err}");
+            assert!(!out.contains(SECRET), "{out}");
+            assert!(err.contains(&key.display().to_string()), "{err}");
+        }
+
+        #[test]
+        fn ancestor_opencode_json_symlink_is_refused() {
+            require_sandbox!();
+            let home = stub_home();
+            let link = home.h.join("work/opencode.json");
+            std::fs::create_dir_all(home.h.join(".ssh")).unwrap();
+            std::fs::write(home.h.join(".ssh/config"), SECRET).unwrap();
+            symlink(home.h.join(".ssh/config"), &link).unwrap();
+            let (_, err, code) = home.sh("echo RAN");
+            assert_ne!(code, Some(0), "{err}");
+            assert!(err.contains(&link.display().to_string()), "{err}");
+            std::fs::remove_file(&link).unwrap();
+            // In the project root (already readable) a link is fine.
+            symlink(
+                home.h.join(".claude/secret"),
+                home.proj.join("opencode.json"),
+            )
+            .unwrap();
+            let (out, err, code) = home.sh("echo RAN");
+            assert_eq!(code, Some(0), "{err}");
+            assert!(out.contains("RAN"));
+        }
+
+        #[test]
+        fn opencode_config_dir_on_ssh_is_refused() {
+            require_sandbox!();
+            let home = stub_home();
+            let ssh = home.h.join(".ssh");
+            std::fs::create_dir_all(&ssh).unwrap();
+            let o = home
+                .cmd(&["--", "echo RAN"])
+                .env("OPENCODE_CONFIG_DIR", &ssh)
+                .output()
+                .unwrap();
+            let err = String::from_utf8_lossy(&o.stderr);
+            assert!(!o.status.success(), "{err}");
+            assert!(err.contains("OPENCODE_CONFIG_DIR"), "{err}");
+            assert!(!String::from_utf8_lossy(&o.stdout).contains("RAN"));
+        }
+
+        #[test]
+        fn concurrent_sessions_get_their_own_service() {
+            require_sandbox!();
+            let home = stub_home();
+            let script = r#"cat "$XDG_CONFIG_HOME/opencode/service.json"; sleep 1"#;
+            let spawn = || {
+                home.cmd(&["--", script])
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            };
+            let (a, b) = (spawn(), spawn());
+            let svc = |c: std::process::Child| -> serde_json::Value {
+                let o = c.wait_with_output().unwrap();
+                serde_json::from_slice(&o.stdout).unwrap()
+            };
+            let (a, b) = (svc(a), svc(b));
+            assert_ne!(a["port"], b["port"]);
+            assert_ne!(a["password"], b["password"]);
+        }
+
+        #[test]
+        fn session_dir_is_removed_after_exit() {
+            require_sandbox!();
+            let home = stub_home();
+            let (out, err, code) = home.sh("echo $XDG_STATE_HOME");
+            assert_eq!(code, Some(0), "{err}");
+            let scratch = scratch_of(&out);
+            assert!(!scratch.exists(), "{} left behind", scratch.display());
+        }
+
+        #[test]
+        fn session_dir_is_removed_after_sigint() {
+            require_sandbox!();
+            let home = stub_home();
+            let mut c = home.cmd(&["--", "echo $XDG_STATE_HOME; exec sleep 30"]);
+            let (scratch, status) = interrupt(&mut c);
+            assert!(!status.success());
+            assert!(!scratch.exists(), "{} left behind", scratch.display());
+        }
+
+        /// Start `cmd` in its own process group, wait for its first stdout
+        /// line (the session's XDG_STATE_HOME), then SIGINT the group the way
+        /// a terminal Ctrl-C does. Returns the scratch dir and cplt's status.
+        pub(super) fn interrupt(cmd: &mut Command) -> (PathBuf, std::process::ExitStatus) {
+            use std::io::BufRead;
+            use std::os::unix::process::CommandExt;
+            let mut c = cmd
+                .stdout(std::process::Stdio::piped())
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(c.stdout.take().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let scratch = scratch_of(&line);
+            assert!(scratch.exists(), "{line}");
+            signal_group(c.id(), "INT");
+            (scratch, c.wait().unwrap())
+        }
+    }
+
+    /// #710 against the real OpenCode v2 binary, without credentials. Runs
+    /// only when `CPLT_E2E_OPENCODE_V2` names the binary (the CI job installs
+    /// a pinned one); skips otherwise.
+    mod opencode_v2_real {
+        use super::opencode_v2::{Home, home};
+        use super::*;
+        use std::time::{Duration, Instant};
+
+        fn real_home() -> Option<Home> {
+            let Some(bin) = std::env::var_os("CPLT_E2E_OPENCODE_V2") else {
+                eprintln!("SKIPPED (opencode v2): CPLT_E2E_OPENCODE_V2 unset");
+                return None;
+            };
+            let bin = std::fs::canonicalize(bin).expect("CPLT_E2E_OPENCODE_V2");
+            let home = home();
+            std::os::unix::fs::symlink(&bin, home.bin.join("opencode")).unwrap();
+            Some(home)
+        }
+
+        fn run(home: &Home, args: &[&str]) -> String {
+            let o = home
+                .cmd(&[&["--quiet", "--proxy-forced", "--"], args].concat())
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            let all = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            assert!(o.status.success(), "{args:?}: {all}");
+            all
+        }
+
+        /// No process of the session left (found by its fake HOME in the
+        /// environment), allowing the service its 5 s shutdown.
+        fn processes(home: &Home) -> Vec<String> {
+            let tag = format!("HOME={} ", home.h.display());
+            processes_with_env()
+                .iter()
+                .filter(|l| l.contains(&tag))
+                .map(|l| l.chars().take(200).collect())
+                .collect()
+        }
+
+        fn assert_no_process(home: &Home) {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                let left = processes(home);
+                if left.is_empty() {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "left running: {left:#?}");
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+
+        fn scratch_dirs(home: &Home) -> Vec<PathBuf> {
+            std::fs::read_dir(home.h.join("Library/Caches/cplt/tmp"))
+                .map(|d| d.flatten().map(|e| e.path()).collect())
+                .unwrap_or_default()
+        }
+
+        #[test]
+        fn debug_config_and_session_list_succeed() {
+            require_sandbox!();
+            let Some(home) = real_home() else {
+                return;
+            };
+            run(&home, &["debug", "config"]);
+            run(&home, &["session", "list"]);
+            assert!(scratch_dirs(&home).is_empty(), "{:?}", scratch_dirs(&home));
+            assert_no_process(&home);
+        }
+
+        /// Host registrations point at listeners the test holds; the session
+        /// must use its own service and never touch them.
+        #[test]
+        fn mcp_list_uses_the_session_service_not_the_host_one() {
+            require_sandbox!();
+            let Some(home) = real_home() else {
+                return;
+            };
+            let host = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let (_lock, default) = hold_port(49374);
+            let port = host.local_addr().unwrap().port();
+            let reg = format!(
+                "{{\"port\":{port},\"password\":\"host\",\"url\":\"http://127.0.0.1:{port}\"}}"
+            );
+            std::fs::write(home.h.join(".local/state/opencode/service.json"), &reg).unwrap();
+            std::fs::write(home.h.join(".config/opencode/service.json"), &reg).unwrap();
+            run(&home, &["mcp", "list"]);
+            // `api` needs a running service; it can only be the session's.
+            run(&home, &["api", "GET", "/path"]);
+            let get = run(&home, &["service", "get"]);
+            let pinned = get
+                .split("\"port\":")
+                .nth(1)
+                .and_then(|r| r.trim_start().split(|c: char| !c.is_ascii_digit()).next())
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or_else(|| panic!("no port: {get}"));
+            assert!(pinned != 49374 && pinned != port, "{get}");
+            for l in std::iter::once(&host).chain(default.as_ref()) {
+                l.set_nonblocking(true).unwrap();
+                assert!(l.accept().is_err(), "host service port was contacted");
+            }
+            assert_no_process(&home);
+        }
+
+        /// Ctrl-C on a long-running session: the session dir and the service
+        /// go with it.
+        #[test]
+        fn sigint_leaves_no_session_or_process() {
+            require_sandbox!();
+            let Some(home) = real_home() else {
+                return;
+            };
+            use std::os::unix::process::CommandExt;
+            let mut c = home
+                .cmd(&["--quiet", "--proxy-forced", "--", "acp"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while scratch_dirs(&home).is_empty() {
+                assert!(Instant::now() < deadline, "no session dir appeared");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            // Wait for the agent and the service it spawns.
+            loop {
+                let running = processes(&home);
+                if running.len() >= 2 && running.iter().any(|p| p.contains("serve")) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "agent and service: {running:#?}");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            signal_group(c.id(), "INT");
+            c.wait().unwrap();
+            assert!(scratch_dirs(&home).is_empty(), "{:?}", scratch_dirs(&home));
+            assert_no_process(&home);
+        }
     }
 }

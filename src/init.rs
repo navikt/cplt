@@ -124,8 +124,24 @@ fn open_config(path: &Path, opts: &mut std::fs::OpenOptions) -> std::io::Result<
 
 fn read_config(path: &Path) -> std::io::Result<String> {
     use std::io::Read;
+    let file = open_config(path, std::fs::OpenOptions::new().read(true))?;
+    let limit = crate::repo_config::MAX_REPO_CONFIG_BYTES;
+    if file.metadata()?.len() > limit {
+        return Err(std::io::Error::other(format!(
+            "{} exceeds the {} KiB size limit",
+            path.display(),
+            limit / 1024
+        )));
+    }
     let mut s = String::new();
-    open_config(path, std::fs::OpenOptions::new().read(true))?.read_to_string(&mut s)?;
+    file.take(limit + 1).read_to_string(&mut s)?;
+    if s.len() as u64 > limit {
+        return Err(std::io::Error::other(format!(
+            "{} exceeds the {} KiB size limit",
+            path.display(),
+            limit / 1024
+        )));
+    }
     Ok(s)
 }
 
@@ -242,14 +258,15 @@ pub fn generate_toml(report: &DetectionReport) -> String {
     if !report.workspace_members.is_empty() {
         writeln!(out, "# Workspace members:").unwrap();
         for member in &report.workspace_members {
+            let rel = sanitize_comment(&member.relative_path);
             let ecosystems: Vec<&str> = member.detections.iter().map(|d| d.name).collect();
             if ecosystems.is_empty() {
-                writeln!(out, "#   {} ({})", member.relative_path, member.source).unwrap();
+                writeln!(out, "#   {} ({})", rel, member.source).unwrap();
             } else {
                 writeln!(
                     out,
                     "#   {} ({}): {}",
-                    member.relative_path,
+                    rel,
                     member.source,
                     ecosystems.join(", ")
                 )
@@ -663,9 +680,23 @@ fn format_provenance(
 
     sources
         .iter()
-        .map(|s| if s == "." { "(root)" } else { s.as_str() })
+        .map(|s| {
+            if s == "." {
+                "(root)".to_string()
+            } else {
+                sanitize_comment(s)
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Replace control characters (including newlines) so untrusted paths cannot
+/// break out of a `#` comment line into live TOML.
+fn sanitize_comment(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 /// Check if a path starts with ~ (home-relative, not appropriate for repo config).
@@ -676,11 +707,21 @@ fn is_home_relative(path: &str) -> bool {
 /// Escape a string for use in TOML basic strings (double-quoted).
 /// Prevents injection of arbitrary TOML via crafted file content.
 fn toml_escape(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Same as [`write_string_array`], but every line is commented out.

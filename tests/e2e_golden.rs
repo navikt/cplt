@@ -475,7 +475,8 @@ fn golden_default_policy_pushes_a_feature_branch_and_refuses_the_default_one() {
 /// `git push -u` printed `error: could not write config file .git/config:
 /// Operation not permitted` after a push that worked, because the upstream
 /// write is denied on macOS (navikt/copilot#1348). The guard now runs the push
-/// without `-u` and says so in one line.
+/// without `-u`, says so in one line, and the parent records the upstream
+/// after the session.
 #[test]
 fn golden_push_with_upstream_flag_succeeds_quietly() {
     require_launch!();
@@ -501,6 +502,7 @@ fn golden_push_with_upstream_flag_succeeds_quietly() {
         &[
             "--yes",
             "--no-validate",
+            "--no-quiet",
             "--allow-write",
             &allow,
             "exec",
@@ -524,6 +526,16 @@ fn golden_push_with_upstream_flag_succeeds_quietly() {
     assert!(
         stderr.contains("pushing without -u"),
         "the dropped flag must be named:\n{stderr}"
+    );
+    // The parent records the upstream once the session has settled (#402).
+    let merge = common::git_cmd(&work)
+        .args(["config", "--local", "branch.feature/push-u.merge"])
+        .output()
+        .expect("git should run");
+    assert_eq!(
+        String::from_utf8_lossy(&merge.stdout).trim(),
+        "refs/heads/feature/push-u",
+        "the upstream must be recorded after the session:\n{stderr}"
     );
 
     let _ = std::fs::remove_dir_all(&home);
@@ -1540,5 +1552,50 @@ fn golden_check_exec_knows_about_named_repositories() {
         "a repository that was never named must still be refused:\n{unrelated}"
     );
 
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// `cplt doctor` reports what the launch would refuse or ignore, instead of
+/// "No problems found": a Cypress state directory that is a symlink stops the
+/// launch (#602), and a `[sandbox]` key in `.cplt.toml` is ignored.
+#[test]
+fn golden_doctor_reports_launch_refusals_and_ignored_repo_keys() {
+    let home = make_config_home("golden-doctor-refusals");
+    let repo = temp_repo("navikt/probe");
+    let cfg = home.join(".config/cplt");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(
+        cfg.join("config.toml"),
+        "[sandbox]\nallow_cache_exec = [\"Cypress\"]\n",
+    )
+    .unwrap();
+    std::fs::write(repo.path().join(".cplt.toml"), "[sandbox]\nquiet = true\n").unwrap();
+    let state = cplt::sandbox::cypress_app_data_dir_with_env(&home, &cplt::sandbox::no_cache_env);
+    std::fs::create_dir_all(state.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(repo.path(), &state).unwrap();
+
+    // On Linux the state dir follows XDG_CONFIG_HOME, which a CI runner may
+    // set: drop it so the dir is the one under the scratch HOME.
+    let output = common::cplt_local(&home, repo.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .args(["--agent", "shell", "doctor"])
+        .output()
+        .expect("cplt should run");
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a refused launch is a blocking finding:\n{out}{err}"
+    );
+    for want in [
+        "The launch refuses to start: Cypress app state",
+        "resolves through a symlink",
+        ".cplt.toml sets sandbox.quiet, which a repository cannot set",
+    ] {
+        assert!(
+            out.contains(want),
+            "doctor must print `{want}`:\n{out}{err}"
+        );
+    }
     let _ = std::fs::remove_dir_all(&home);
 }

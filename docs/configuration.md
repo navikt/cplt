@@ -447,11 +447,61 @@ cplt config set sandbox.allow_git_worktrees true           # every repository
 cplt config set --local sandbox.allow_git_worktrees true   # this checkout only
 ```
 
-Inside the sandbox:
+Inside the sandbox, create a worktree with the managed command:
 
 ```bash
-git worktree add "$CPLT_WORKTREE_ROOT/<name>" -b <branch>
+cplt worktree add <name> <ref>                         # detached at <ref>; prints the path
+git -C "$CPLT_WORKTREE_ROOT/<name>" switch -c <branch>  # only if you want a branch
 ```
+
+`cplt worktree add` checks out `<ref>` (a branch, tag or commit in the local
+repository) with HEAD detached. The broker runs Git under the session's read
+policy, checks the private checkout, and publishes it atomically. It:
+
+- never fetches from a remote and never runs a hook, a filter driver or a
+  config value from the repository. A `filter.*` entry in the repository's or
+  your global git config refuses the command because private checkout cannot
+  reproduce filtered content. Private config, not this preflight check, prevents
+  execution. Git attributes can still transform ordinary files;
+- preserves tracked protected files exactly as recorded in the launch checkout's
+  HEAD, including `.cplt.toml`, `.github/hooks` and nested agent configuration.
+  Adding, removing, changing or renaming any protected file refuses the request,
+  as does changing its executable mode or checkout bytes. Prepare worktrees with
+  different protected content outside cplt. Ordinary tracked files may differ;
+- refuses a symlink that leads out of the worktree, a nested repository or bare
+  repository in the tree, and a name that already exists. An existing worktree
+  is never replaced;
+- also refuses dangling symlinks and symlink targets with `..` after a named
+  component, matching the launch/exit checks;
+- creates no branch, so a refused or failed request leaves no ref behind.
+
+`<name>` is letters, digits, `.`, `_` and `-`, starting with a letter or digit,
+at most 64 characters. Plain `git worktree add` inside the sandbox still works
+as before, but git runs it directly and none of the checks above apply.
+
+The command works only in a session cplt started, on macOS. The worktrees it
+creates outlive the session, like any other in the root.
+The broker requires a launch HEAD commit whose protected bytes and executable
+modes match the checkout. Symlinked protected paths or ancestors, filesystem
+aliases of protected names, and protected files larger than 1 MiB are refused.
+Ordinary Unicode names remain allowed. Tree queries are capped at 1 MiB and
+200,000 entries. Protected names and their declared ancestors must use the exact
+spelling in `PROTECTED_IN_ROOT`, even if a case or Unicode alias is tracked.
+The launch scan follows only tracked HEAD paths and their ancestors. Local or
+ignored protected config and dependency trees are not approved or copied, and
+do not disable the broker. Tracked protected files must still match disk, and
+tracked aliases are refused. Every entry of the staged requested checkout is
+checked before publication. An unavailable launch snapshot disables the broker with a
+warning and leaves `CPLT_WORKTREE_SOCKET` unset; the session and managed root
+remain available. Prepare worktrees outside cplt in that case. No partial
+protected-file snapshot is accepted. A global `filter.*` configuration, including
+Git LFS, can also make this convenience unavailable or refuse requests even
+when the requested tree does not use the filter.
+
+Requests share a serial queue. A client timeout does not cancel a queued request;
+check `$CPLT_WORKTREE_ROOT/<name>` before retrying because it may still publish.
+Private staging cleanup runs after the
+60-second operation budget and can extend shutdown time.
 
 What you get:
 
@@ -926,9 +976,13 @@ If you already export `CLAUDE_CODE_OAUTH_TOKEN`, Claude Code loses the Keychain 
 - run `claude setup-token` again and export the new token, if the old one has expired
 - run `cplt config set sandbox.keychain_substitute false` to keep the Keychain grant
 
-When it applies, it removes the read+write grant on `~/Library/Keychains` for an agent that can authenticate another way, and hands that credential over instead. For Copilot that is a GitHub token: an exported `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN`, or, when none is set, what `gh auth token --hostname github.com` prints at launch, passed in as `GH_TOKEN`. The launch summary shows `Keychain: denied` and names the source. If `gh` is not installed, not signed in, or prints nothing, the Keychain grant stays for that run. On the `gh auth token` path it also stays when `gh`'s github.com login differs from the account on Copilot's `copilot-cli` Keychain item, or that item is for another host such as GitHub Enterprise; the launch summary names both. The account name is read on the host without reading the secret. With several items, cplt compares the one matching gh's login, else the first `security` returns, so it catches a plain mismatch but cannot tell which account Copilot is actively using. With no item, the substitute goes ahead. An exported token skips this check and is used as-is. With the key `false`, the profile and the agent's environment are exactly what they were before the key existed.
+When a substitute resolves, cplt removes the read+write grant on `~/Library/Keychains` and hands over that credential. For Copilot it first selects a nonblank exported `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN` not denied by `deny.env`. Otherwise it retrieves gh's stored token with trusted `gh auth token --hostname github.com`, clearing those three variables from the subprocess, and passes the result into the first permitted name in the order `GH_TOKEN`, `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN`. The retrieval has a 5-second exit timeout and 500 ms stdout-EOF grace. Failed or empty retrieval, no trusted gh, or no permitted name keeps the Keychain grant when no exported substitute resolves.
 
-What it costs for Copilot: the token sits in the agent's environment, Copilot authenticates with `gh`'s token rather than its own stored one, and a token GitHub rejects is a sign-in error where Copilot would otherwise have fallen back to its stored login. If Copilot reports a sign-in error, run `gh auth refresh` or `gh auth login` on the host, unset the stale token variable, or set the key to `false` to get the old behaviour back. The per-agent details, and what was and was not verified, are in [SECURITY.md](../SECURITY.md#keychain-access-is-all-or-nothing).
+On the stored-gh path, a detected mismatch between gh's github.com `user:` and a Copilot `copilot-cli` Keychain item's `acct` also keeps the grant. cplt reads attributes, not the secret. With several items it compares the one matching gh's login, else the first `security` returns. This cannot identify Copilot's actively selected account. Missing metadata, an error or timeout permits substitution; exported tokens skip the check. `gh_guard.inject_token` is a separate channel and does not perform that account comparison.
+
+The launch summary and doctor's `keychain:` and `auth:` lines report the resolved grant and credential source. A retrieved token is not proof of validity, Copilot entitlement, selected account or renewal. A retained grant is not proof of a stored native login. cplt does not extract Copilot's Keychain secret.
+
+The token is readable by every subprocess that inherits the agent's environment. A rejected token with Keychain denied can leave Copilot unable to authenticate; fallback with Keychain granted is version- and credential-specific. Recover the intended gh login on the host with `gh auth refresh --hostname github.com` or `gh auth login --hostname github.com`, or remove a stale exported token. To test native Copilot login, record the prior values and scopes, set **both** `sandbox.keychain_substitute = false` and `gh_guard.inject_token = false`, clear all three exported token variables in a subshell, and restart. Substitution off restores broad Keychain access, not access to one item; gh file/cache sources may still be reachable. Restore each key to its actual prior value and scope, using `--unset` only if it was originally unset there. See the [recovery sequence](known-impacts.md#the-same-vault-prompt-on-macos) and [security details](../SECURITY.md#keychain-access-is-all-or-nothing).
 
 ## No execute on `~/.copilot` (`sandbox.deny_copilot_dir_exec`)
 
@@ -959,12 +1013,12 @@ Keys not covered in a section above. `cplt config explain <key>` prints the same
 | `sandbox.allow_gpg_signing` ⚠️ | `false` | Allows GPG commit and tag signing: read-only access to the public keyring and the GPG agent socket. Private keys stay denied. See [GPG commit signing](known-impacts.md#gpg-commit-signing). |
 | `sandbox.allow_browser` ⚠️ | `false` | macOS Launch Services grant, for OAuth sign-in flows. With it on, the agent can start any application outside the sandbox, and the grant cannot be scoped. See [security](security.md#--allow-browser-is-a-sandbox-escape-and-cannot-be-scoped). |
 | `sandbox.deny_clipboard` | `true` | Denies the macOS clipboard, so `pbpaste` cannot read what you last copied. `--allow-clipboard` lifts it for one run. No effect on Linux. |
-| `allow.socket` | `[]` | Unix socket paths the agent may connect to. Whatever listens on the socket runs outside the sandbox. On Linux it does nothing below kernel 7.1. |
+| `allow.socket` | `[]` | Unix socket paths the agent may connect to. Whatever listens on the socket runs outside the sandbox. Below Landlock ABI v9 (kernel 7.1), these filesystem grants do not mediate pathname socket connections; they are not generally refused when ineffective. From ABI v9, broad writable-tree grants also permit connections within those trees. |
 | `proxy.allow_private_domains` | `[]` | Domains allowed to resolve to private or internal IP addresses, a waiver of the DNS-rebinding guard for intranet services. A name covers its subdomains. See [private-domain waiver](proxy.md#private-domain-waiver). |
 | `gh_guard.mode` | `block` | `block` refuses, `warn` prints a warning and runs the command, `audit` runs it and logs the decision. See [gh guard](gh-guard.md). |
 | `gh_guard.scope_check` | `true` | Refuses write commands aimed at another repository, for example with `-R`. |
-| `gh_guard.block_auth_token` | `true` | Refuses `gh auth token`, so the agent cannot print the token. With `false`, `gh auth token` prints the real token for every agent. |
-| `gh_guard.inject_token` ⚠️ | `false` | For Copilot only, and only while `gh_guard.enabled` is on: puts your `gh` token in the sandbox environment at launch, where every subprocess can read it. The token goes into `GH_TOKEN`, or the next of `GITHUB_TOKEN` and `COPILOT_GITHUB_TOKEN` that `deny.env` leaves in place. Not needed for `gh` itself: the gh guard hands the real `gh` the exec token (see [gh guard](gh-guard.md#how-gh-itself-authenticates)). Skipped when the agent already has a token. |
+| `gh_guard.block_auth_token` | `true` | Intercepts `gh auth token` through the wrapper. Copilot can receive a cached token once when eligible; otherwise it refuses. With `false`, real gh answers from whatever credential source it can reach. Does not prevent reading environment tokens, guard caches or allowed credential-helper output. |
+| `gh_guard.inject_token` ⚠️ | `false` | **Deprecated on macOS.** `gh` gets its token from the gh guard exec token, and Copilot signs in with `sandbox.keychain_substitute = true` (macOS only). On macOS, remove the key; it still works, and cplt prints one line at launch while it is `true`. On Linux it remains a recommended credential handover when native Secret Service authentication fails; native access depends on the backend and agent version, and the keyring is not guaranteed closed. See [Linux keyring access](known-impacts.md#linux-keyring-access-depends-on-the-backend-and-agent-version). For Copilot only, and only while `gh_guard.enabled` is on: puts your `gh` token in the sandbox environment at launch, where every subprocess can read it. The token goes into `GH_TOKEN`, or the next of `GITHUB_TOKEN` and `COPILOT_GITHUB_TOKEN` that `deny.env` leaves in place. Not needed for `gh` itself: the gh guard hands the real `gh` the exec token (see [gh guard](gh-guard.md#how-gh-itself-authenticates)). Skipped when the agent already has a token. |
 | `gh_guard.unknown_command` | `block` | What to do with a `gh` command the guard does not classify: `block` or `allow`. |
 | `gh_guard.allow_api_write` ⚠️ | `false` | Allows `gh api` writes (POST, PATCH, PUT and input flags), scope-checked to the current repository. |
 | `git_guard.enabled` | `true` | Intercepts `git push`, `request-pull` and `send-pack`. See [git guard](git-guard.md). |

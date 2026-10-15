@@ -289,19 +289,19 @@ fn read_target(home: &Path, path: &Path, own: Option<&str>) -> Option<PathBuf> {
     if grant_is_refused(home, path) {
         return None;
     }
-    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    if !is_plain_file_or_absent(&target) {
+    let deepest = crate::config::canonicalize_deepest(path);
+    if !is_plain_file_or_absent(&deepest) {
         return None;
     }
     let in_denied_dir = DENIED_DOTFILES.iter().any(|d| {
         let dir = home.join(d);
-        target.starts_with(&dir) || std::fs::canonicalize(&dir).is_ok_and(|c| target.starts_with(c))
+        deepest.starts_with(&dir) || deepest.starts_with(crate::config::canonicalize_deepest(&dir))
     });
-    let other_entry = denied_entry(DENIED_HOME_SUBPATHS, home, &target, own).is_some();
+    let other_entry = denied_entry(DENIED_HOME_SUBPATHS, home, &deepest, own).is_some();
     if in_denied_dir || other_entry {
         return None;
     }
-    Some(target)
+    Some(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
 }
 
 /// The files `sandbox.allow_build_credentials` grants read-only (#463),
@@ -416,6 +416,11 @@ fn is_plain_file_or_absent(target: &Path) -> bool {
     std::fs::metadata(target).map_or(true, |m| {
         m.is_file() && !(m.nlink() > 1 && m.uid() == current_uid())
     })
+}
+
+/// [`overlaps_credential_entry`] for a whole directory grant at `dir`.
+pub fn dir_overlaps_credentials(home: &Path, dir: &Path) -> bool {
+    overlaps_credential_entry(home, &config::canonicalize_deepest(dir), dir)
 }
 
 /// Whether the canonical `target` lies inside or contains a
@@ -3776,6 +3781,29 @@ pub const PROTECTED_IN_GITDIR: &[Protected] = &[
         why: "local gitignore — hides whatever the agent plants from `git status`",
         linux: LinuxCoverage::Bwrap,
     },
+    // #743: the legacy remote formats. git still resolves a remote name through
+    // `remotes/<name>` and `branches/<name>` when `.git/config` does not define
+    // it, so a file planted here defines a remote with an agent-chosen URL
+    // without touching the denied `config`, and host-side git picks it up after
+    // the session. Nothing current writes either directory. On Linux the
+    // bubblewrap bind needs the directory to exist at launch, and `git init`
+    // has not created either for years, so there the coverage is nominal:
+    // `Bwrap` because the bind is free where it applies, not because it
+    // reaches most repositories (SECURITY.md, "Legacy remote files").
+    Protected {
+        rel: "remotes",
+        tree: true,
+        nested: true,
+        why: "legacy remote definitions — git resolves remote names through them",
+        linux: LinuxCoverage::Bwrap,
+    },
+    Protected {
+        rel: "branches",
+        tree: true,
+        nested: true,
+        why: "legacy remote definitions — git resolves remote names through them",
+        linux: LinuxCoverage::Bwrap,
+    },
 ];
 
 /// Escape the regex metacharacters that can still appear in a path.
@@ -4473,6 +4501,14 @@ mod tests {
         assert_eq!(first_party_read_target(h, &link), None, "link into ~/.ssh");
 
         std::fs::remove_file(&link).unwrap();
+        symlink(h.join(".ssh/id_rsa_future"), &link).unwrap();
+        assert_eq!(
+            first_party_read_target(h, &link),
+            None,
+            "dangling link into ~/.ssh"
+        );
+
+        std::fs::remove_file(&link).unwrap();
         symlink(h.join(".m2/settings.xml"), &link).unwrap();
         assert_eq!(
             first_party_read_target(h, &link),
@@ -4840,7 +4876,13 @@ mod tests {
         );
         assert_eq!(
             bwrap(PROTECTED_IN_GITDIR),
-            ["hooks", "refs/remotes/*/HEAD", "info/exclude"],
+            [
+                "hooks",
+                "refs/remotes/*/HEAD",
+                "info/exclude",
+                "remotes",
+                "branches"
+            ],
             "`config`, `commondir` and `modules` are macOS-only; each entry \
              carries the reason in its LinuxCoverage::Gap"
         );
@@ -4862,7 +4904,7 @@ mod tests {
     fn nested_alternation_covers_the_nested_entries() {
         assert_eq!(
             nested_alternation(PROTECTED_IN_GITDIR),
-            "hooks|config|commondir|modules|refs/remotes/[^/]+/HEAD|info/exclude"
+            "hooks|config|commondir|modules|refs/remotes/[^/]+/HEAD|info/exclude|remotes|branches"
         );
         assert_eq!(
             nested_alternation(PROTECTED_IN_ROOT),

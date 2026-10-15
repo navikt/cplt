@@ -371,8 +371,10 @@ fn yarn_major_is_1(dir: &Path) -> Option<bool> {
     if dir.join(".yarnrc.yml").exists() {
         return Some(false);
     }
-    let package_manager = std::fs::read_to_string(dir.join("package.json"))
+    // Agent-writable project files: a planted FIFO must not hang launch.
+    let package_manager = crate::untrusted::read_untrusted(&dir.join("package.json"), 1024 * 1024)
         .ok()
+        .flatten()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .and_then(|v| v.get("packageManager")?.as_str().map(str::to_owned));
     if let Some(pm) = package_manager.filter(|pm| pm.starts_with("yarn@")) {
@@ -382,7 +384,7 @@ fn yarn_major_is_1(dir: &Path) -> Option<bool> {
     // `__metadata` block.
     let mut head = [0u8; 256];
     let n = std::io::Read::read(
-        &mut std::fs::File::open(dir.join("yarn.lock")).ok()?,
+        &mut crate::untrusted::open_untrusted(&dir.join("yarn.lock")).ok()??,
         &mut head,
     )
     .ok()?;
@@ -539,16 +541,30 @@ pub fn npmrc_userconfig_stale_variants(parent_env: &[(String, String)]) -> Vec<&
         .collect()
 }
 
-/// Dangerous NODE_OPTIONS flags that allow code preloading or module interception.
+/// Dangerous NODE_OPTIONS flags that allow code preloading, module interception,
+/// env-file loading, OpenSSL engine loading, or debugger attachment. Node's
+/// parser accepts both hyphen and underscore spellings for multi-word flags.
 const NODE_OPTIONS_DANGEROUS: &[&str] = &[
     "--require",
     "-r",
     "--loader",
     "--experimental-loader",
+    "--experimental_loader",
     "--import",
     "--experimental-vm-modules",
+    "--experimental_vm_modules",
     "--experimental-policy",
+    "--experimental_policy",
     "--conditions",
+    "-C",
+    "--input-type",
+    "--input_type",
+    "--env-file",
+    "--env_file",
+    "--env-file-if-exists",
+    "--env_file_if_exists",
+    "--openssl-config",
+    "--openssl_config",
 ];
 
 /// Strip dangerous directives from NODE_OPTIONS while preserving safe ones.
@@ -569,22 +585,89 @@ fn sanitize_node_options(vars: &mut Vec<(String, String)>) {
     }
 }
 
+/// Split `NODE_OPTIONS` into `(raw_slice, unquoted_value, had_quotes)` tokens,
+/// grouping `"..."` and `'...'` spans (including backslash-escaped characters
+/// inside quotes) so a quoted value containing spaces is handled as a single
+/// argument rather than leaving interior words behind.
+fn tokenize_node_options(value: &str) -> Vec<(&str, String, bool)> {
+    let mut tokens = Vec::new();
+    let mut chars = value.char_indices().peekable();
+    while let Some(&(start, _)) = chars.peek() {
+        if value[start..].starts_with(char::is_whitespace) {
+            chars.next();
+            continue;
+        }
+        let mut unquoted = String::new();
+        let mut had_quotes = false;
+        let mut in_quote: Option<char> = None;
+        let mut end = value.len();
+        while let Some(&(idx, ch)) = chars.peek() {
+            if let Some(q) = in_quote {
+                chars.next();
+                if ch == '\\'
+                    && let Some(&(_, escaped)) = chars.peek()
+                {
+                    chars.next();
+                    unquoted.push(escaped);
+                } else if ch == q {
+                    in_quote = None;
+                } else {
+                    unquoted.push(ch);
+                }
+            } else if ch == '"' || ch == '\'' {
+                chars.next();
+                had_quotes = true;
+                in_quote = Some(ch);
+            } else if ch.is_whitespace() {
+                end = idx;
+                break;
+            } else {
+                chars.next();
+                unquoted.push(ch);
+            }
+        }
+        if in_quote.is_some() {
+            had_quotes = true;
+        }
+        tokens.push((&value[start..end], unquoted, had_quotes));
+    }
+    tokens
+}
+
 /// Parse NODE_OPTIONS and remove dangerous flags (and their arguments).
 fn strip_dangerous_node_flags(value: &str) -> String {
-    let parts: Vec<&str> = value.split_whitespace().collect();
+    // Node's NODE_OPTIONS parser handles double-quoted strings with backslash
+    // escapes, which can hide spaces or flags from naive whitespace splitting.
+    // Legitimate safe flags (--max-old-space-size=4096, --no-warnings, etc.)
+    // never require quotes; group quoted spans first and drop quoted tokens.
+    let parts = tokenize_node_options(value);
     let mut result = Vec::new();
     let mut i = 0;
     while i < parts.len() {
-        let part = parts[i];
-        // Check if this flag (or its --flag=value form) is dangerous
-        let flag_name = part.split('=').next().unwrap_or(part);
-        if NODE_OPTIONS_DANGEROUS.contains(&flag_name) {
-            // Skip this flag and its argument (if separate, not --flag=value)
-            if !part.contains('=') && i + 1 < parts.len() && !parts[i + 1].starts_with('-') {
+        let (raw, ref part, had_quotes) = parts[i];
+        // Check if this flag (or its --flag=value form) is dangerous, including
+        // attached short forms (`-r./evil.js`, `-Cdevelopment`) and `--inspect*`
+        // / `--debug*` debugger flags.
+        let flag_name = part.split('=').next().unwrap_or(part.as_str());
+        let is_attached_short = (part.starts_with("-r") && part.len() > 2)
+            || (part.starts_with("-C") && part.len() > 2);
+        let is_debugger = flag_name == "--inspect"
+            || flag_name.starts_with("--inspect-")
+            || flag_name.starts_with("--inspect_")
+            || flag_name == "--debug"
+            || flag_name.starts_with("--debug-")
+            || flag_name.starts_with("--debug_");
+        if is_attached_short || is_debugger || NODE_OPTIONS_DANGEROUS.contains(&flag_name) {
+            // Skip this flag and its argument (if separate, not --flag=value or -r<mod>)
+            if !is_attached_short
+                && !part.contains('=')
+                && i + 1 < parts.len()
+                && !parts[i + 1].1.starts_with('-')
+            {
                 i += 1; // skip the argument too
             }
-        } else {
-            result.push(part);
+        } else if !had_quotes {
+            result.push(raw);
         }
         i += 1;
     }
@@ -594,6 +677,35 @@ fn strip_dangerous_node_flags(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Agent-planted package.json / yarn.lock: no hang, no read through a
+    /// symlink, no unbounded read.
+    #[test]
+    fn yarn_probe_refuses_fifo_symlink_and_huge_package_json() {
+        use crate::untrusted::tests::{bounded, mkfifo};
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().to_path_buf();
+        mkfifo(&p.join("package.json"));
+        mkfifo(&p.join("yarn.lock"));
+        let q = p.clone();
+        assert_eq!(bounded(move || yarn_major_is_1(&q)), None);
+
+        let e = tempfile::tempdir().unwrap();
+        let outside = e.path().join("pkg.json");
+        std::fs::write(&outside, r#"{"packageManager":"yarn@1.22.0"}"#).unwrap();
+        let link = e.path().join("proj");
+        std::fs::create_dir(&link).unwrap();
+        std::os::unix::fs::symlink(&outside, link.join("package.json")).unwrap();
+        assert_eq!(yarn_major_is_1(&link), None, "read through symlink");
+
+        let huge = e.path().join("huge");
+        std::fs::create_dir(&huge).unwrap();
+        let mut body = r#"{"packageManager":"yarn@1.22.0","x":""#.to_string();
+        body.push_str(&"x".repeat(2 * 1024 * 1024));
+        body.push_str(r#""}"#);
+        std::fs::write(huge.join("package.json"), body).unwrap();
+        assert_eq!(yarn_major_is_1(&huge), None, "oversize must not be read");
+    }
 
     /// #307: `--inherit-env` silently cancelled `--pass-env`. The inherit
     /// branch stripped every `ENV_ALWAYS_DENY` entry without consulting the
@@ -696,5 +808,31 @@ mod tests {
         assert!(on(repo.path()), "yarn 1 subproject");
         std::fs::write(b.join(".yarnrc.yml"), "").unwrap();
         assert!(!on(repo.path()), "a yarn 2+ subproject next to it");
+    }
+
+    #[test]
+    fn strip_dangerous_node_flags_blocks_attached_and_loader_variants() {
+        let raw = "-r/tmp/evil.js -Ccustom --experimental_loader=/tmp/x.mjs \
+                   --openssl-config=/tmp/o.cnf --env-file=.env --input-type=module \
+                   --inspect=0.0.0.0:9229 \"--require=/tmp/q.js\" --max-old-space-size=4096";
+        assert_eq!(strip_dangerous_node_flags(raw), "--max-old-space-size=4096");
+        assert_eq!(
+            strip_dangerous_node_flags(
+                "--openssl-config /tmp/o.cnf --env-file-if-exists .env --trace-warnings"
+            ),
+            "--trace-warnings"
+        );
+        assert_eq!(
+            strip_dangerous_node_flags(
+                "--diagnostic-dir=\"/tmp/node diagnostic reports\" --no-warnings"
+            ),
+            "--no-warnings"
+        );
+        assert_eq!(
+            strip_dangerous_node_flags(
+                "--require \"/tmp/evil preload.js\" \"--require\" /tmp/other.js --no-warnings"
+            ),
+            "--no-warnings"
+        );
     }
 }

@@ -34,6 +34,7 @@ use crate::ui;
 #[cfg(target_os = "linux")]
 #[path = "sandbox_bubblewrap.rs"]
 mod bubblewrap;
+pub(crate) use policy::gh_config_dir;
 /// The bounded nested-repository walk, shared with the session-end `.git`
 /// check in `audit` (#576) so both look at the same set.
 pub(crate) use policy::{NESTED_SCAN_LIMIT, WalkExtras, has_dot_git_or_is_bare, repo_walk};
@@ -53,13 +54,21 @@ pub(crate) mod bubblewrap_probe {
     /// back to Landlock + seccomp only — for the session paths `config`
     /// carries. What doctor's config leaves out is listed on
     /// [`crate::doctor::bubblewrap_state`].
-    pub(crate) fn test_launch(config: &super::SandboxConfig) -> Result<(), String> {
-        // The canonical cache-exec and Cypress grants the launch would use. A
-        // config that fails their validation never launches; the probe then
-        // checks the rest with the paths as generated.
-        let mut grants = super::validate_cache_exec_dirs(config).unwrap_or_default();
-        grants.extend(super::prepare_cypress_app_data(config, true).unwrap_or_default());
-        let plan = super::bwrap_plan(config, &super::launch_git_dirs(config), &grants);
+    ///
+    /// `grants` are the canonical cache-exec and Cypress grants from
+    /// [`super::launch_grants`]. Doctor validates them once and reports a
+    /// failure as its own finding (#602); with none, the probe checks the
+    /// rest with the paths as generated.
+    pub(crate) fn test_launch(
+        config: &super::SandboxConfig,
+        grants: &[(std::path::PathBuf, std::path::PathBuf)],
+    ) -> Result<(), String> {
+        let plan = super::bwrap_plan(
+            config,
+            &super::launch_git_dirs(config),
+            grants,
+            &std::cell::OnceCell::new(),
+        );
         super::bubblewrap::build_wrapper(
             &plan.policy,
             super::bubblewrap::Overlays {
@@ -74,7 +83,7 @@ pub(crate) mod bubblewrap_probe {
 }
 #[path = "sandbox_exec.rs"]
 mod exec;
-pub use exec::GH_TOKEN_DIR_ENV;
+pub use exec::{GH_TOKEN_DIR_ENV, SCRATCH_DIR_ENV};
 #[path = "sandbox_landlock.rs"]
 pub(crate) mod landlock_mod;
 #[path = "sandbox_policy.rs"]
@@ -97,13 +106,13 @@ pub use policy::{
     TOOL_READ_DIRS, ToolPathEnvVar, ToolPathOverride, ToolRoot, active_tool_dirs, app_dirs,
     build_credential_grants, copilot_default_pkg_dir, copilot_pkg_dir, copilot_pkg_dirs,
     copilot_ro_protect_paths, credential_link_hop, current_uid, cypress_app_data_dir,
-    cypress_app_data_dir_with_env, cypress_runtime_intent, exec_write_conflicts,
-    home_config_link_targets, home_tool_dirs, linux_docker_socket_paths, linux_runtime_dirs,
-    mise_ro_protect_paths, nested_alternation, no_cache_env, no_exec_temp_dir_over,
-    no_exec_tool_dir_over, path_bin_dirs, playwright_runtime_intent, process_env,
-    relocatable_tool_prefix, shim_ro_protect_paths, socket_mask_paths, tool_override_path_is_safe,
-    tool_path_env_overrides, validate_playwright_socket_dir, validate_sbpl_path,
-    xdg_runtime_dir_env,
+    cypress_app_data_dir_with_env, cypress_runtime_intent, dir_overlaps_credentials,
+    exec_write_conflicts, first_party_read_target, home_config_link_targets, home_tool_dirs,
+    linux_docker_socket_paths, linux_runtime_dirs, mise_ro_protect_paths, nested_alternation,
+    no_cache_env, no_exec_temp_dir_over, no_exec_tool_dir_over, path_bin_dirs,
+    playwright_runtime_intent, process_env, relocatable_tool_prefix, shim_ro_protect_paths,
+    socket_mask_paths, tool_override_path_is_safe, tool_path_env_overrides,
+    validate_playwright_socket_dir, validate_sbpl_path, xdg_runtime_dir_env,
 };
 
 // SBPL profile generation — kept public for unit tests.
@@ -176,6 +185,10 @@ pub struct SandboxConfig<'a> {
     /// `Some` adds the macOS pins that only matter with the key on: the root's
     /// name, and each `<gitdir>/worktrees/<name>/commondir` against rewrite.
     pub managed_worktree_root: Option<&'a Path>,
+    /// The broker socket for `cplt worktree add` (#531), granted outbound as
+    /// one exact path. `Some` only with the managed root on, and only from
+    /// `assemble_sandbox` after the broker has bound it.
+    pub worktree_socket: Option<&'a Path>,
     pub home_dir: &'a Path,
     pub extra_read: &'a [PathBuf],
     pub extra_write: &'a [PathBuf],
@@ -319,6 +332,17 @@ pub struct PreparedSandbox {
     /// launcher with [`Self::set_worktree_root`] after `prepare`; the grant
     /// itself comes from `SandboxConfig::named_roots`.
     worktree_root: Option<PathBuf>,
+    /// Exported to the child as `CPLT_WORKTREE_SOCKET`, set by the launcher
+    /// with [`Self::set_worktree_socket`].
+    worktree_socket: Option<PathBuf>,
+    /// Set on the child last, after the sandbox environment (OpenCode v2, #710).
+    extra_env: Vec<(String, String)>,
+    /// An OpenCode v2 session (#710): no gh handover via OPENCODE_AUTH_CONTENT.
+    opencode_v2: bool,
+    /// The rules `precomputed` was built from, kept so an OpenCode v2 session
+    /// can take files out of them (#719).
+    #[cfg(target_os = "linux")]
+    policy: landlock_mod::LandlockPolicy,
     /// Landlock + seccomp pre-computed sandbox data (Linux only).
     /// Built in the parent process; applied in pre_exec.
     #[cfg(target_os = "linux")]
@@ -353,6 +377,94 @@ impl PreparedSandbox {
         self.worktree_root = root.map(Path::to_path_buf);
     }
 
+    /// Name the broker socket to the child as `CPLT_WORKTREE_SOCKET`. Only
+    /// meaningful with the root set: the profile grants the socket and the
+    /// managed root together.
+    pub fn set_worktree_socket(&mut self, socket: Option<&Path>) {
+        self.worktree_socket = socket.map(Path::to_path_buf);
+    }
+
+    /// Reapply after late agent-specific grants, before capturing the broker's
+    /// read policy. Same-user staging privacy comes from Seatbelt, not mode 0700.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn protect_worktree_staging(&mut self) {
+        if let Some(root) = &self.worktree_root {
+            profile::protect_worktree_staging(&mut self.profile_text, root);
+        }
+    }
+
+    /// Add an OpenCode v2 session (#710): its rules go at the end of the
+    /// profile, where they win, and its variables are set on the child last.
+    /// On Linux the host service files leave the Landlock rules and the
+    /// session port joins the connect allowlist (#719), in both the direct
+    /// and the bubblewrap rules.
+    pub fn add_opencode_v2(&mut self, session: crate::opencode_v2::Session) -> Result<(), String> {
+        // File grants go before the denies, so every deny still wins.
+        #[cfg(target_os = "macos")]
+        {
+            let Some(at) = self.profile_text.find(profile::V2_GRANTS) else {
+                return Err("the sandbox profile has no place for the OpenCode v2 grants".into());
+            };
+            self.profile_text
+                .insert_str(at, &session.sbpl_before_denies);
+            self.profile_text.push_str(&session.sbpl);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let port = landlock_mod::NetRule { port: session.port };
+            // v2's service is a child of the client, so the `/proc/self`
+            // grant (the agent's pid) does not reach it, and Bun aborts at
+            // startup without `/proc`. Only bubblewrap's pid namespace keeps
+            // that read to the session's own processes, so v2 needs it.
+            let Some(w) = &mut self.bwrap_wrapper else {
+                return Err(opencode_v2_needs_bwrap());
+            };
+            let read = landlock_mod::FsAccess {
+                read: true,
+                ..landlock_mod::FsAccess::default()
+            };
+            let extra: Vec<landlock_mod::FsRule> = session
+                .reads
+                .iter()
+                .map(PathBuf::as_path)
+                // The project is readable already, and the agent can plant there.
+                .filter(|p| !p.starts_with(&self.project_dir))
+                .map(|path| landlock_mod::FsRule {
+                    path: path.to_path_buf(),
+                    access: read,
+                    nofollow: false,
+                })
+                .collect();
+            w.fs_rules.extend(extra.iter().cloned());
+            w.fs_rules.push(landlock_mod::FsRule {
+                path: PathBuf::from("/proc"),
+                access: read,
+                nofollow: false,
+            });
+            landlock_mod::hide_files(&mut w.fs_rules, &mut w.plain_file, &session.hidden)?;
+            w.net_rules.push(port);
+            let p = &mut self.policy;
+            p.fs_rules.extend(extra.iter().cloned());
+            landlock_mod::hide_files(&mut p.fs_rules, &mut p.plain_file, &session.hidden)?;
+            p.net_rules.push(port);
+            self.precomputed.reload(&self.policy)?;
+            if self.policy.restrict_net_connect
+                && landlock_mod::available_abi_version().is_some_and(|abi| abi < 4)
+            {
+                ui::warn(
+                    "OpenCode v2: this kernel cannot filter TCP ports (Landlock ABI < 4, \
+                     kernel < 6.7), so every loopback port is reachable, including a host \
+                     OpenCode service on 49374 (protected by its password only).",
+                );
+            }
+        }
+        self.extra_env = session.env;
+        self.opencode_v2 = true;
+        #[cfg(target_os = "macos")]
+        self.protect_worktree_staging();
+        Ok(())
+    }
+
     /// Withdraw the read grant on the root `AGENTS.md` (#252).
     ///
     /// The grant is built before cplt writes the managed block, so it assumes
@@ -377,6 +489,10 @@ impl PreparedSandbox {
         if self.precomputed.deferred_plain_file.take().is_none() {
             return;
         }
+        #[cfg(target_os = "linux")]
+        if let Some(i) = self.policy.plain_file.take() {
+            self.policy.fs_rules.remove(i);
+        }
         self.profile_text = self.profile_text.replacen(&chunk, "", 1);
         #[cfg(target_os = "linux")]
         {
@@ -387,6 +503,18 @@ impl PreparedSandbox {
             }
         }
     }
+}
+
+/// Why OpenCode v2 does not run on Linux without bubblewrap, and how to fix it.
+#[cfg(target_os = "linux")]
+pub(crate) fn opencode_v2_needs_bwrap() -> String {
+    format!(
+        "OpenCode v2 on Linux needs Bubblewrap: its service needs /proc, and without \
+         a pid namespace /proc shows the command lines of all your processes. Install \
+         bubblewrap (e.g. apt install bubblewrap) and do not pass --no-bubblewrap; \
+         if it is installed but fails, {}.",
+        crate::doctor::USERNS_HINT
+    )
 }
 
 /// Validate configuration and compile it into a platform-specific sandbox.
@@ -415,9 +543,12 @@ pub fn prepare_with_pnpm_shadow(
     validate_playwright_socket_capability(config.playwright_socket_dir)?;
     validate_hard_denied_grants(config)?;
     validate_pnpm_tool_dirs(config)?;
-    let mut canonical_grants = validate_cache_exec_dirs(config)?;
+    // One policy for every check below and the bubblewrap plan, generated on
+    // first use: generating can warn, and a warning should print once (#602).
+    let base = std::cell::OnceCell::new();
+    let mut canonical_grants = validate_cache_exec_dirs(config, &base)?;
     validate_exec_grants(config)?;
-    canonical_grants.extend(prepare_cypress_app_data(config, inspect_only)?);
+    canonical_grants.extend(prepare_cypress_app_data(config, inspect_only, &base)?);
     validate_copilot_cache_env(config)?;
     if !inspect_only {
         create_default_copilot_pkg_dir(config)?;
@@ -436,7 +567,23 @@ pub fn prepare_with_pnpm_shadow(
         pnpm_shadow_dir,
         inspect_only,
         &canonical_grants,
+        &base,
     )
+}
+
+/// The cache-exec and Cypress grants a launch would make, validated exactly
+/// as `prepare` validates them, without creating anything. `Err` is the error
+/// the launch refuses to start with, which `cplt doctor` reports (#602).
+/// `policy` is the caller's `generate_policy(config)`, reused rather than
+/// generated again.
+pub fn launch_grants(
+    config: &SandboxConfig,
+    policy: &LandlockPolicy,
+) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+    let base = std::cell::OnceCell::from(policy.clone());
+    let mut grants = validate_cache_exec_dirs(config, &base)?;
+    grants.extend(prepare_cypress_app_data(config, true, &base)?);
+    Ok(grants)
 }
 
 /// The gitdirs a launch protects beyond the project's own.
@@ -527,7 +674,10 @@ fn validate_pnpm_tool_dirs(config: &SandboxConfig) -> Result<(), String> {
 /// Returns `(path as generated, canonical path)` for each grant, empty on
 /// macOS. Seatbelt matches the resolved path against rules on the literal
 /// cache path, so there a link grants nothing extra.
-fn validate_cache_exec_dirs(config: &SandboxConfig) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+fn validate_cache_exec_dirs(
+    config: &SandboxConfig,
+    base: &std::cell::OnceCell<LandlockPolicy>,
+) -> Result<Vec<(PathBuf, PathBuf)>, String> {
     for subdir in config.allow_cache_exec {
         if !policy::cache_exec_subdir_is_safe(subdir) {
             return Err(format!(
@@ -548,8 +698,12 @@ fn validate_cache_exec_dirs(config: &SandboxConfig) -> Result<Vec<(PathBuf, Path
         .join(".cache");
     let actual_base = crate::config::canonicalize_deepest(&cache_base);
     // The other rules the policy grants, for the overlap check. Generated at
-    // most once: generating warns, and one warning per linked entry is noise.
-    let mut rules: Option<Vec<landlock_mod::FsRule>> = None;
+    // most once (`base`): generating warns, and one warning per use is noise.
+    let rules = || {
+        &base
+            .get_or_init(|| landlock_mod::generate_policy(config))
+            .fs_rules
+    };
     if actual_base != resolved_base {
         if config.refuse_cache_exec_links {
             return Err(format!(
@@ -561,8 +715,7 @@ fn validate_cache_exec_dirs(config: &SandboxConfig) -> Result<Vec<(PathBuf, Path
                 actual_base.display()
             ));
         }
-        let rules = rules.get_or_insert_with(|| landlock_mod::generate_policy(config).fs_rules);
-        if let Some(why) = cache_exec_target_refusal(config, rules, &actual_base, &actual_base) {
+        if let Some(why) = cache_exec_target_refusal(config, rules(), &actual_base, &actual_base) {
             return Err(format!(
                 "Cache-exec root {} resolves through a symlink to {}, and cplt will not grant \
                  write and execute there: {why}. Point ~/.cache at a dedicated directory, or \
@@ -587,8 +740,7 @@ fn validate_cache_exec_dirs(config: &SandboxConfig) -> Result<Vec<(PathBuf, Path
                     resolved.display()
                 ));
             }
-            let rules = rules.get_or_insert_with(|| landlock_mod::generate_policy(config).fs_rules);
-            if let Some(why) = cache_exec_target_refusal(config, rules, &resolved, &actual_base) {
+            if let Some(why) = cache_exec_target_refusal(config, rules(), &resolved, &actual_base) {
                 return Err(format!(
                     "allow_cache_exec path {} resolves through a symlink to {}, and cplt will \
                      not grant write and execute there: {why}. The link sits inside ~/.cache, \
@@ -752,6 +904,7 @@ fn cache_exec_target_refusal(
 fn prepare_cypress_app_data(
     config: &SandboxConfig,
     inspect_only: bool,
+    base: &std::cell::OnceCell<LandlockPolicy>,
 ) -> Result<Option<(PathBuf, PathBuf)>, String> {
     if !policy::cypress_runtime_intent(config.allow_cache_exec, config.allow_cache_exec_any) {
         return Ok(None);
@@ -792,11 +945,12 @@ fn prepare_cypress_app_data(
         }
     }
 
-    let mut executable: Vec<PathBuf> = landlock_mod::generate_policy(config)
+    let mut executable: Vec<PathBuf> = base
+        .get_or_init(|| landlock_mod::generate_policy(config))
         .fs_rules
-        .into_iter()
+        .iter()
         .filter(|rule| rule.access.execute)
-        .map(|rule| rule.path)
+        .map(|rule| rule.path.clone())
         .collect();
     executable.extend(config.electron_app_dir.map(Path::to_path_buf));
 
@@ -1534,12 +1688,48 @@ pub fn session_writable_roots(
     roots.extend(named_roots.iter().cloned());
     roots.extend(allow_write.iter().cloned());
     roots.extend(scratch_dir.map(Path::to_path_buf));
-    roots.extend(SYSTEM_TEMP_DIRS.iter().map(PathBuf::from));
-    #[cfg(not(target_os = "macos"))]
-    roots.push(PathBuf::from("/dev/shm"));
+    roots.extend(always_writable_roots());
     #[cfg(not(target_os = "macos"))]
     roots.push(PathBuf::from("/tmp"));
     roots
+}
+
+/// The trees writable by construction rather than by config, for callers that
+/// run before a [`SandboxConfig`] exists: the writable tool dirs (env-relocated
+/// ones and their symlink targets included), the app dirs' write paths, the
+/// Cypress state dir, the git common dir, and the system temp dirs. A
+/// hook/MCP script reached through one of these keeps no exec-only grant
+/// (`agent::drop_script_grants_under`); the agent could rewrite the link (#714).
+///
+/// A superset of what a given launch grants (Cypress and every app dir are
+/// included unconditionally): over-including only drops a script grant.
+#[must_use]
+pub fn home_and_temp_writable_roots(
+    home: &Path,
+    tool_dirs: &[policy::ResolvedToolDir],
+    git_common_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    // Vetted like the profile does: a refused target (`~/.cache -> $HOME`)
+    // must not turn all of home into a "writable root" here.
+    let mut roots: Vec<PathBuf> = policy::active_tool_dirs(home, Some(tool_dirs))
+        .into_iter()
+        .filter(|d| d.dir.write)
+        .flat_map(|d| std::iter::once(d.path).chain(d.target))
+        .collect();
+    roots.extend(policy::app_dirs().iter().flat_map(|d| d.write_paths(home)));
+    roots.push(policy::cypress_app_data_dir_with_env(home, &process_env));
+    roots.extend(git_common_dir.map(Path::to_path_buf));
+    roots.extend(always_writable_roots());
+    roots
+}
+
+/// The system temp dirs and, off macOS, `/dev/shm`: writable with no grant
+/// behind them. Shared by every writable-tree list so they cannot drift.
+fn always_writable_roots() -> Vec<PathBuf> {
+    let roots = SYSTEM_TEMP_DIRS.iter().map(PathBuf::from);
+    #[cfg(not(target_os = "macos"))]
+    let roots = roots.chain(std::iter::once(PathBuf::from("/dev/shm")));
+    roots.collect()
 }
 
 /// Names the temp-dir collision in the refusal, and selects its remedy: a temp
@@ -1633,9 +1823,10 @@ pub fn keychain_substitute(
                 let gh = exec::gh_hosts_yml()
                     .and_then(|p| crate::agent::read_small_regular_file(&p))
                     .and_then(|s| gh_login(&s));
-                if let Some(gh) = &gh
-                    && let Some(why) = account_mismatch(gh, copilot_keychain_acct(gh).as_deref())
-                {
+                if let Some(why) = account_mismatch(
+                    gh.as_deref(),
+                    copilot_keychain_acct(gh.as_deref()).as_deref(),
+                ) {
                     let _ = ACCOUNT_MISMATCH.set(why);
                     return None;
                 }
@@ -1655,14 +1846,138 @@ pub fn gh_configured() -> bool {
 /// summary to say why the grant stayed.
 pub static ACCOUNT_MISMATCH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+const COPILOT_CONFIG_LIMIT: u64 = 64 * 1024;
+
+/// Selected Copilot account from `~/.copilot/config.json`, shaped `<host>:<login>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopilotConfigAccount {
+    /// Missing file or no stored Copilot account.
+    None,
+    /// Unambiguous `<host>:<login>` selection from `lastLoggedInUser` or a single `loggedInUsers` entry.
+    Selected(String),
+    /// Unreadable or non-regular file, malformed JSON, or ambiguous multi-account state.
+    Ambiguous(String),
+}
+
+/// Read `~/.copilot/config.json` without following symlinks or blocking on a
+/// planted FIFO (`untrusted::read_untrusted`), and resolve the active Copilot
+/// `<host>:<login>` selection.
+///
+/// Because `~/.copilot` is writable inside the sandbox, callers must never use
+/// this result to re-enable a sandbox grant such as `~/Library/Keychains`.
+#[must_use]
+pub fn copilot_config_account(home: &Path) -> CopilotConfigAccount {
+    let path = home.join(".copilot/config.json");
+    let text = match crate::untrusted::read_untrusted(&path, COPILOT_CONFIG_LIMIT) {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            return CopilotConfigAccount::Ambiguous(
+                "Copilot config.json is not a regular file or exceeds 64 KiB".to_string(),
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return CopilotConfigAccount::None,
+        Err(_) => {
+            return CopilotConfigAccount::Ambiguous(
+                "Copilot config.json could not be read".to_string(),
+            );
+        }
+    };
+    parse_copilot_config_account(&text)
+}
+
+/// Whether `~/.copilot/config.json` records a native Copilot login or an
+/// ambiguous state that prevents falling back cleanly to `gh`.
+#[must_use]
+pub fn copilot_has_native_login(home: &Path) -> bool {
+    !matches!(copilot_config_account(home), CopilotConfigAccount::None)
+}
+
+fn parse_copilot_user(v: &serde_json::Value) -> Option<String> {
+    let raw_host = v.get("host")?.as_str()?;
+    let raw_login = v.get("login")?.as_str()?;
+    if raw_host.chars().any(char::is_control) || raw_login.chars().any(char::is_control) {
+        return None;
+    }
+    let host = raw_host.trim().trim_end_matches('/');
+    let login = raw_login.trim();
+    (!host.is_empty() && !login.is_empty()).then(|| format!("{host}:{login}"))
+}
+
+fn parse_copilot_config_account(text: &str) -> CopilotConfigAccount {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return CopilotConfigAccount::Ambiguous("Copilot config.json is malformed".to_string());
+    };
+    let Some(obj) = v.as_object() else {
+        return CopilotConfigAccount::Ambiguous("Copilot config.json is malformed".to_string());
+    };
+    let last = match obj.get("lastLoggedInUser") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(u) => match parse_copilot_user(u) {
+            Some(acct) => Some(acct),
+            None => {
+                return CopilotConfigAccount::Ambiguous(
+                    "Copilot lastLoggedInUser is malformed".to_string(),
+                );
+            }
+        },
+    };
+    let users = match obj.get("loggedInUsers") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(arr)) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for item in arr {
+                let Some(acct) = parse_copilot_user(item) else {
+                    return CopilotConfigAccount::Ambiguous(
+                        "Copilot loggedInUsers is malformed".to_string(),
+                    );
+                };
+                out.push(acct);
+            }
+            out
+        }
+        Some(_) => {
+            return CopilotConfigAccount::Ambiguous(
+                "Copilot loggedInUsers is malformed".to_string(),
+            );
+        }
+    };
+    match last {
+        Some(last) => {
+            if !users.is_empty() && !users.iter().any(|u| u.eq_ignore_ascii_case(&last)) {
+                CopilotConfigAccount::Ambiguous(format!(
+                    "Copilot lastLoggedInUser ({last}) is not in loggedInUsers"
+                ))
+            } else {
+                CopilotConfigAccount::Selected(last)
+            }
+        }
+        None if users.is_empty() => CopilotConfigAccount::None,
+        None => {
+            if users.iter().all(|u| u.eq_ignore_ascii_case(&users[0])) {
+                CopilotConfigAccount::Selected(users.into_iter().next().unwrap())
+            } else {
+                CopilotConfigAccount::Ambiguous(
+                    "Copilot config.json has multiple loggedInUsers without lastLoggedInUser"
+                        .to_string(),
+                )
+            }
+        }
+    }
+}
+
 /// The github.com `user:` from gh's `hosts.yml`.
 fn gh_login(hosts_yml: &str) -> Option<String> {
     let mut in_github = false;
     for line in hosts_yml.lines() {
         if !line.starts_with(' ') {
             in_github = line.trim_end() == "github.com:";
-        } else if in_github && let Some(u) = line.strip_prefix("    user:") {
-            return Some(u.trim().trim_matches(['"', '\'']).to_string()).filter(|u| !u.is_empty());
+        } else if in_github
+            && let Some(u) = line
+                .strip_prefix("    user:")
+                .or_else(|| line.strip_prefix("  user:"))
+            && let Some(u) = Some(u.trim().trim_matches(['"', '\''])).filter(|u| !u.is_empty())
+        {
+            return Some(u.to_string());
         }
     }
     None
@@ -1677,7 +1992,7 @@ fn gh_login(hosts_yml: &str) -> Option<String> {
 /// Tries the item for `gh_login` first, so several stored accounts resolve to
 /// the matching one; otherwise whichever item `security` returns first.
 /// `None` when there is no item, `security` fails, or it outlives 1 s.
-fn copilot_keychain_acct(gh_login: &str) -> Option<String> {
+fn copilot_keychain_acct(gh_login: Option<&str>) -> Option<String> {
     if !cfg!(target_os = "macos") {
         return None;
     }
@@ -1691,7 +2006,9 @@ fn copilot_keychain_acct(gh_login: &str) -> Option<String> {
         let out = exec::bounded_stdout(cmd, std::time::Duration::from_secs(1))?;
         keychain_acct(&String::from_utf8_lossy(&out))
     };
-    query(Some(&format!("https://github.com:{gh_login}"))).or_else(|| query(None))
+    gh_login
+        .and_then(|u| query(Some(&format!("https://github.com:{u}"))))
+        .or_else(|| query(None))
 }
 
 /// The `"acct"<blob>="..."` value from `security find-generic-password` output.
@@ -1701,16 +2018,25 @@ fn keychain_acct(out: &str) -> Option<String> {
             .trim()
             .strip_prefix("\"acct\"<blob>=\"")?
             .strip_suffix('"')?;
-        Some(v.to_string())
+        (!v.chars().any(char::is_control)).then(|| v.to_string())
     })
 }
 
 /// `Some(reason)` when gh's github.com login differs from Copilot's Keychain
-/// account (another user, or a non-github.com host such as GitHub Enterprise),
-/// so the substitute must not switch identity. `None` (proceed) on a match or
-/// when Copilot's account is unknown.
-fn account_mismatch(gh: &str, copilot_acct: Option<&str>) -> Option<String> {
+/// account (another user, an unknown gh login, or a non-github.com host such
+/// as GitHub Enterprise), so the substitute must not switch identity. `None`
+/// (proceed) on a match or when Copilot's account is unknown.
+fn account_mismatch(gh: Option<&str>, copilot_acct: Option<&str>) -> Option<String> {
     let acct = copilot_acct?;
+    let Some(gh) = gh else {
+        return Some(match acct.strip_prefix("https://github.com:") {
+            Some(cp) => format!("gh account is unknown, Copilot is {cp}"),
+            None => format!(
+                "gh uses github.com, Copilot is on {}",
+                acct.rsplit_once(':').map_or(acct, |(h, _)| h)
+            ),
+        });
+    };
     match acct.strip_prefix("https://github.com:") {
         Some(cp) if cp.eq_ignore_ascii_case(gh) => None,
         Some(cp) => Some(format!("gh is {gh}, Copilot is {cp}")),
@@ -1719,6 +2045,32 @@ fn account_mismatch(gh: &str, copilot_acct: Option<&str>) -> Option<String> {
             acct.rsplit_once(':').map_or(acct, |(h, _)| h)
         )),
     }
+}
+
+/// Why Copilot keeps the Keychain grant with the key on, so the launch summary
+/// and `cplt doctor` give the same reason (#277). `None` when the key is off
+/// or the agent is not Copilot. Read after [`keychain_substitute`] has run,
+/// since it consults [`ACCOUNT_MISMATCH`].
+#[must_use]
+pub fn keychain_kept_reason(
+    agent: Agent,
+    setting: Option<bool>,
+    deny_env: &[String],
+) -> Option<String> {
+    if agent != Agent::Copilot || !keychain_substitute_enabled(agent, setting) {
+        return None;
+    }
+    let all_denied = agent
+        .keychain_substitute_env_vars()
+        .iter()
+        .all(|v| deny_env.iter().any(|d| d == v));
+    Some(if let Some(why) = ACCOUNT_MISMATCH.get() {
+        format!("{why}: kept to avoid switching account")
+    } else if all_denied {
+        "no token: deny.env strips every token variable".to_string()
+    } else {
+        "no token: gh auth token failed, or gh is not in a trusted bin dir".to_string()
+    })
 }
 
 /// `sandbox.keychain_substitute` as it applies to `agent`. Unset is on for
@@ -1848,6 +2200,7 @@ fn prepare_impl(
     pnpm_shadow_dir: Option<&Path>,
     _inspect_only: bool,
     _canonical_grants: &[(PathBuf, PathBuf)],
+    _base: &std::cell::OnceCell<LandlockPolicy>,
 ) -> Result<PreparedSandbox, String> {
     validate_config_paths(config)?;
     // Interpolated into the profile like every other path — same injection check.
@@ -1883,6 +2236,9 @@ fn prepare_impl(
         npmrc_allowed: env::npmrc_explicitly_allowed(config.home_dir, config.extra_read),
         keychain_substitute: config.keychain_substitute.clone(),
         worktree_root: None,
+        worktree_socket: None,
+        extra_env: Vec::new(),
+        opencode_v2: false,
     })
 }
 
@@ -2225,8 +2581,11 @@ fn bwrap_plan(
     config: &SandboxConfig,
     extra_git_dirs: &[PathBuf],
     canonical_grants: &[(PathBuf, PathBuf)],
+    base: &std::cell::OnceCell<LandlockPolicy>,
 ) -> BwrapPlan {
-    let mut policy = landlock_mod::generate_policy(config);
+    let mut policy = base
+        .get_or_init(|| landlock_mod::generate_policy(config))
+        .clone();
     // The cache-exec and Cypress state rules name the canonical paths
     // validation checked, and are opened without following any symlink.
     // A cache-exec entry whose link sits inside `~/.cache` is never
@@ -2330,6 +2689,66 @@ fn overlay_paths(
     (ro_protect, pins)
 }
 
+/// #705: remove the Claude hook-script grants (`claude_hook_script_grants`,
+/// the only read+execute, non-write Claude agent dirs) from the direct-path
+/// `policy`: only bubblewrap's read-only bind keeps `settings.json`, which
+/// names these files, out of the agent's reach.
+/// Returns the dropped paths. Keeps `plain_file` pointing at its rule.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn drop_claude_hook_grants(
+    config: &SandboxConfig,
+    policy: &mut landlock_mod::LandlockPolicy,
+) -> Vec<String> {
+    if config.agent != Agent::Claude {
+        return vec![];
+    }
+    let mut dropped = Vec::new();
+    for hook in config
+        .agent_dirs
+        .iter()
+        .filter(|d| !d.write && d.process_exec)
+    {
+        // The last match: `generate_policy` emits agent dirs after the user's
+        // `allow.exec`, so an identical user rule earlier on stays.
+        let Some(i) = policy
+            .fs_rules
+            .iter()
+            .rposition(|r| r.path == hook.path && r.access.execute && !r.access.write)
+        else {
+            continue;
+        };
+        policy.fs_rules.remove(i);
+        if let Some(p) = policy.plain_file.as_mut().filter(|p| i < **p) {
+            *p -= 1;
+        }
+        dropped.push(hook.path.display().to_string());
+    }
+    dropped
+}
+
+/// #705: bubblewrap re-binds `settings.json` read-only only when it exists
+/// (a bind needs a source). A missing one could be created by the agent in
+/// the writable Claude root, and its hooks would be granted read+execute on
+/// the next launch. Seed it with `{}` (Claude's own default) so the read-only
+/// bind always covers it. Never overwrites.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn seed_claude_settings(config: &SandboxConfig) {
+    if config.agent != Agent::Claude {
+        return;
+    }
+    for dir in config
+        .agent_dirs
+        .iter()
+        .filter(|d| d.write && d.path.is_dir())
+    {
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.path.join("settings.json"))
+            .and_then(|mut f| std::io::Write::write_all(&mut f, b"{}\n"));
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn prepare_impl(
     config: &SandboxConfig,
@@ -2337,6 +2756,7 @@ fn prepare_impl(
     pnpm_shadow_dir: Option<&Path>,
     inspect_only: bool,
     canonical_grants: &[(PathBuf, PathBuf)],
+    base: &std::cell::OnceCell<LandlockPolicy>,
 ) -> Result<PreparedSandbox, String> {
     // Warn about config options that Linux cannot enforce at kernel level.
     // (Deny paths are handled after bwrap resolution below — with Bubblewrap
@@ -2424,8 +2844,15 @@ fn prepare_impl(
         mut ro_protect,
         mut pins,
         deny_masks,
-    } = bwrap_plan(config, extra_git_dirs, canonical_grants);
+    } = {
+        if !inspect_only {
+            seed_claude_settings(config);
+        }
+        bwrap_plan(config, extra_git_dirs, canonical_grants, base)
+    };
     let mut profile_text = landlock_mod::describe_policy(&policy);
+    // Rebuilt below if the hook grants are dropped on a Landlock-only host.
+    let policy_text_len = profile_text.len();
 
     // A withdrawn grant another rule quietly gives back is said out loud
     // (#324). Resolved the way `canonicalize_agent_dirs` resolves the rule.
@@ -2572,11 +2999,29 @@ fn prepare_impl(
     // the root stays read-only and Pi does not start, which `cplt doctor`
     // explains. Cleared here, after `resolve` consumed the rules, so the
     // writable bind it needs is still emitted when bwrap IS active.
+    //
+    // #705: the Claude hook-script grants go from the direct-path policy
+    // always. A wrapper carries its own copy of the rules, so they still apply
+    // under bubblewrap, but an exec-time fallback to plain Landlock does not
+    // get them.
+    let dropped = drop_claude_hook_grants(config, &mut policy);
     if bwrap_wrapper.is_none() {
         let mut cleared = Vec::new();
         for rule in policy.fs_rules.iter_mut().filter(|r| r.access.create_dirs) {
             rule.access.create_dirs = false;
             cleared.push(rule.path.display().to_string());
+        }
+        if !dropped.is_empty() {
+            // `--print-profile` / `cplt check` must not list the dropped grant.
+            profile_text =
+                landlock_mod::describe_policy(&policy) + &profile_text[policy_text_len..];
+            ui::warn(&format!(
+                "Claude hook script grant on {} is NOT applied without Bubblewrap: \
+                 Landlock alone leaves settings.json writable, so the agent could \
+                 name any file there. Hooks that run these scripts may fail. Install \
+                 bubblewrap to enable it.",
+                dropped.join(", ")
+            ));
         }
         if !cleared.is_empty() {
             ui::warn(&format!(
@@ -2640,7 +3085,7 @@ fn prepare_impl(
     // Pre-compute everything in the parent process.
     // ABI check, BPF construction, and all allocation happens here.
     // The pre_exec hook only makes raw syscalls.
-    let precomputed = landlock_mod::precompute(policy)?;
+    let precomputed = landlock_mod::precompute(policy.clone())?;
 
     Ok(PreparedSandbox {
         project_dir: config.project_dir.to_path_buf(),
@@ -2665,6 +3110,10 @@ fn prepare_impl(
         npmrc_allowed: env::npmrc_explicitly_allowed(config.home_dir, config.extra_read),
         keychain_substitute: config.keychain_substitute.clone(),
         worktree_root: None,
+        worktree_socket: None,
+        extra_env: Vec::new(),
+        opencode_v2: false,
+        policy,
         precomputed,
         bwrap_wrapper,
     })
@@ -2706,6 +3155,9 @@ fn validate_config_paths(config: &SandboxConfig) -> Result<(), String> {
     // interpolates it into the managed-root rules as well (#574).
     if let Some(root) = config.managed_worktree_root {
         policy::validate_sbpl_path(root).map_err(|e| format!("Managed worktree root: {e}"))?;
+    }
+    if let Some(socket) = config.worktree_socket {
+        policy::validate_sbpl_path(socket).map_err(|e| format!("Worktree broker socket: {e}"))?;
     }
     if let Some(dir) = config.copilot_install_dir {
         policy::validate_sbpl_path(dir).map_err(|e| format!("Copilot install dir: {e}"))?;
@@ -2864,6 +3316,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn keychain_kept_reason_is_copilot_only_and_names_deny_env() {
+        assert_eq!(keychain_kept_reason(Agent::Claude, None, &[]), None);
+        assert_eq!(keychain_kept_reason(Agent::Copilot, Some(false), &[]), None);
+        let all: Vec<String> = ["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"]
+            .map(String::from)
+            .to_vec();
+        if ACCOUNT_MISMATCH.get().is_none() {
+            assert_eq!(
+                keychain_kept_reason(Agent::Copilot, None, &all).as_deref(),
+                Some("no token: deny.env strips every token variable")
+            );
+            assert!(
+                keychain_kept_reason(Agent::Copilot, None, &all[..2])
+                    .unwrap()
+                    .contains("gh auth token failed")
+            );
+        }
+    }
+
+    #[test]
     fn claude_keychain_nudge_only_without_token() {
         let n = claude_keychain_nudge;
         assert!(n(Agent::Claude, None, false, true).is_some());
@@ -2941,6 +3413,7 @@ mod tests {
             named_roots: &[],
             named_root_git_dirs: &[],
             managed_worktree_root: None,
+            worktree_socket: None,
             existing_home_tool_dirs: None,
             existing_app_dirs: None,
             extra_ports: &[],
@@ -2978,6 +3451,82 @@ mod tests {
             allow_browser: false,
             use_bubblewrap: None,
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn late_opencode_grants_cannot_reopen_broker_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(temp.path()).unwrap();
+        let mut config = test_config(&home, &[]);
+        let root = home.join(".cplt-worktrees/repo");
+        std::fs::create_dir_all(&root).unwrap();
+        config.managed_worktree_root = Some(&root);
+        let mut sandbox = prepare(&config).unwrap();
+        sandbox.set_worktree_root(Some(&root));
+        let grant = format!(
+            "(allow file-read* file-write* (subpath \"{}\"))\n",
+            home.display()
+        );
+        sandbox
+            .add_opencode_v2(crate::opencode_v2::Session {
+                env: Vec::new(),
+                port: 50123,
+                sbpl_before_denies: String::new(),
+                sbpl: grant.clone(),
+            })
+            .unwrap();
+        let text = describe(&sandbox);
+        assert!(text.rfind(";; Broker staging is private").unwrap() > text.rfind(&grant).unwrap());
+    }
+
+    /// #719: v2's port joins the allowlist; /proc requires bubblewrap.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opencode_v2_session_port_is_allowed_and_the_host_port_is_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(temp.path()).unwrap();
+        let mut config = test_config(&home, &[]);
+        config.use_bubblewrap = Some(false);
+        let mut sandbox = prepare(&config).unwrap();
+        let session = || crate::opencode_v2::Session {
+            env: Vec::new(),
+            port: 50123,
+            hidden: Vec::new(),
+            reads: Vec::new(),
+        };
+        let err = sandbox.add_opencode_v2(session()).unwrap_err();
+        assert!(err.contains("needs Bubblewrap"), "{err}");
+        sandbox.bwrap_wrapper = Some(bubblewrap::BubblewrapWrapper {
+            bwrap_path: PathBuf::from("/usr/bin/bwrap"),
+            bwrap_args: vec![],
+            fs_rules: vec![],
+            net_rules: vec![],
+            restrict_net_connect: true,
+            strict: false,
+            deny_mask_count: 0,
+            socket_mask_count: 0,
+            proxy_forced: false,
+            plain_file: None,
+        });
+        sandbox.add_opencode_v2(session()).unwrap();
+        let w = sandbox.bwrap_wrapper.as_ref().unwrap();
+        for ports in [
+            w.net_rules.iter().map(|r| r.port).collect::<Vec<u16>>(),
+            sandbox
+                .precomputed
+                .net_rules
+                .iter()
+                .map(|r| r.port)
+                .collect(),
+        ] {
+            assert!(ports.contains(&50123), "{ports:?}");
+            assert!(!ports.contains(&49374), "{ports:?}");
+        }
+        let proc =
+            |rules: &[landlock_mod::FsRule]| rules.iter().any(|r| r.path == Path::new("/proc"));
+        assert!(proc(&w.fs_rules));
+        assert!(!proc(&sandbox.policy.fs_rules));
     }
 
     /// #252: revoking the root AGENTS.md grant removes exactly that rule, on
@@ -3137,6 +3686,97 @@ mod tests {
     }
 
     #[test]
+    fn claude_settings_seeded_only_when_missing() {
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir(&claude).unwrap();
+        let dirs = [AgentDir {
+            path: claude.clone(),
+            write: true,
+            map_exec: false,
+            process_exec: true,
+            write_files: vec![],
+            create_dirs: vec![],
+            via: vec![],
+        }];
+        let mut config = test_config(home.path(), &[]);
+        config.agent_dirs = &dirs;
+        config.agent = Agent::Copilot;
+        seed_claude_settings(&config);
+        assert!(!claude.join("settings.json").exists());
+        config.agent = Agent::Claude;
+        seed_claude_settings(&config);
+        assert_eq!(
+            std::fs::read_to_string(claude.join("settings.json")).unwrap(),
+            "{}\n"
+        );
+        std::fs::write(claude.join("settings.json"), "{\"a\":1}").unwrap();
+        seed_claude_settings(&config);
+        assert_eq!(
+            std::fs::read_to_string(claude.join("settings.json")).unwrap(),
+            "{\"a\":1}"
+        );
+    }
+
+    #[test]
+    fn claude_hook_grants_are_dropped_and_plain_file_follows() {
+        // #705: without bubblewrap the hook-script grant goes; the Claude
+        // root grant and the plain-file rule stay, the index still on it.
+        let home = Path::new("/h");
+        let hook = AgentDir {
+            path: PathBuf::from("/x/gate.py"),
+            write: false,
+            map_exec: false,
+            process_exec: true,
+            write_files: vec![],
+            create_dirs: vec![],
+            via: vec![],
+        };
+        let root = AgentDir {
+            path: home.join(".claude"),
+            write: true,
+            ..hook.clone()
+        };
+        let dirs = [root, hook];
+        let mut config = test_config(home, &[]);
+        config.agent = Agent::Claude;
+        config.agent_dirs = &dirs;
+        let rule = |p: &str, write| landlock_mod::FsRule {
+            path: PathBuf::from(p),
+            access: landlock_mod::FsAccess {
+                read: true,
+                write,
+                execute: true,
+                ioctl: false,
+                create_dirs: false,
+            },
+            nofollow: false,
+        };
+        let mut policy = landlock_mod::generate_policy(&config);
+        // An identical user `allow.exec` rule comes first and must stay.
+        policy.fs_rules = vec![
+            rule("/x/gate.py", false),
+            rule("/x/gate.py", false),
+            rule("/h/.claude", true),
+            rule("/p", false),
+        ];
+        policy.plain_file = Some(3);
+        let mut other = policy.clone();
+        assert_eq!(
+            drop_claude_hook_grants(&config, &mut policy),
+            ["/x/gate.py"]
+        );
+        assert_eq!(policy.fs_rules.len(), 3);
+        assert_eq!(policy.fs_rules[0].path, Path::new("/x/gate.py"));
+        assert_eq!(
+            policy.fs_rules[policy.plain_file.unwrap()].path,
+            Path::new("/p")
+        );
+        config.agent = Agent::Copilot;
+        assert!(drop_claude_hook_grants(&config, &mut other).is_empty());
+    }
+
+    #[test]
     fn ordinary_exec_grant_is_not_treated_as_a_pnpm_shadow() {
         // A real home: `prepare` creates the Copilot cache in it.
         let (_guard, root) = copilot_cache_tree();
@@ -3168,6 +3808,7 @@ mod tests {
             process_exec: false,
             write_files: vec![],
             create_dirs: vec![],
+            via: vec![],
         }];
         let exec = [home.join(".local")];
         let mut config = test_config(home, &[]);
@@ -3447,6 +4088,9 @@ mod tests {
         };
         assert!(error.contains("resolves through a symlink"), "{error}");
         assert!(error.contains(&project.display().to_string()), "{error}");
+        // `cplt doctor` reports the launch's own refusal, word for word (#602).
+        let policy = landlock_mod::generate_policy(&config);
+        assert_eq!(launch_grants(&config, &policy), Err(error));
     }
 
     #[test]
@@ -3774,7 +4418,7 @@ mod tests {
         config.extra_deny = &deny;
 
         assert!(
-            crate::doctor::bubblewrap_state(None, false, &config).active(),
+            crate::doctor::bubblewrap_state(None, false, &config, &[]).active(),
             "control: bwrap must work here for this test to mean anything"
         );
         bubblewrap::FAIL_PROBE_ON.set(Some(secret.to_string_lossy().into_owned()));
@@ -3784,7 +4428,7 @@ mod tests {
             bubblewrap::Overlays::default(),
             &bubblewrap::DenyMasks::default(),
         );
-        let state = crate::doctor::bubblewrap_state(None, false, &config);
+        let state = crate::doctor::bubblewrap_state(None, false, &config, &[]);
         let launch = prepare(&config).expect("prepare");
         bubblewrap::FAIL_PROBE_ON.set(None);
 
@@ -3824,8 +4468,8 @@ mod tests {
         config.extra_deny = &deny;
 
         bubblewrap::FAIL_PROBE_ON.set(Some(secret.to_string_lossy().into_owned()));
-        let no_scratch = crate::doctor::bubblewrap_state(None, false, &config);
-        let state = crate::doctor::bubblewrap_state(None, true, &config);
+        let no_scratch = crate::doctor::bubblewrap_state(None, false, &config, &[]);
+        let state = crate::doctor::bubblewrap_state(None, true, &config, &[]);
         bubblewrap::FAIL_PROBE_ON.set(None);
 
         assert!(
@@ -4213,6 +4857,7 @@ mod tests {
             process_exec: false,
             write_files: vec!["auth.json"],
             create_dirs: vec![],
+            via: vec![],
         }];
         let exec = [home.join(".config/opencode")];
         let mut config = test_config(home, &[]);
@@ -5110,17 +5755,28 @@ mod tests {
 
 #[cfg(test)]
 mod account_tests {
-    use super::{account_mismatch, gh_login, keychain_acct};
+    use super::{
+        COPILOT_CONFIG_LIMIT, CopilotConfigAccount, account_mismatch, copilot_config_account,
+        copilot_has_native_login, gh_login, keychain_acct,
+    };
 
     #[test]
     fn reads_gh_login_and_keychain_acct() {
         let hosts = "ghe.example:\n    user: other\ngithub.com:\n    users:\n        alice:\n    git_protocol: ssh\n    user: alice\n";
         assert_eq!(gh_login(hosts).as_deref(), Some("alice"));
         assert_eq!(gh_login("ghe.example:\n    user: other\n"), None);
+        assert_eq!(
+            gh_login("github.com:\n  users:\n    alice:\n  user: alice\n").as_deref(),
+            Some("alice")
+        );
         let out = "keychain: \"/x\"\nattributes:\n    \"acct\"<blob>=\"https://github.com:Bob\"\n    \"svce\"<blob>=\"copilot-cli\"\n";
         assert_eq!(
             keychain_acct(out).as_deref(),
             Some("https://github.com:Bob")
+        );
+        assert_eq!(
+            keychain_acct("    \"acct\"<blob>=\"https://github.com:bob\x1b[2J\"\n"),
+            None
         );
         assert_eq!(keychain_acct(""), None);
     }
@@ -5128,16 +5784,146 @@ mod account_tests {
     #[test]
     fn mismatch_decision() {
         assert_eq!(
-            account_mismatch("alice", Some("https://github.com:alice")),
+            account_mismatch(Some("alice"), Some("https://github.com:alice")),
             None
         );
         assert_eq!(
-            account_mismatch("Alice", Some("https://github.com:aLICE")),
+            account_mismatch(Some("Alice"), Some("https://github.com:aLICE")),
             None
         );
-        assert_eq!(account_mismatch("alice", None), None, "unknown proceeds");
-        assert!(account_mismatch("alice", Some("https://github.com:bob")).is_some());
-        let ghe = account_mismatch("alice", Some("https://ghe.example:alice")).unwrap();
+        assert_eq!(
+            account_mismatch(Some("alice"), None),
+            None,
+            "unknown proceeds"
+        );
+        assert_eq!(account_mismatch(None, None), None, "both unknown proceeds");
+        assert!(account_mismatch(Some("alice"), Some("https://github.com:bob")).is_some());
+        assert_eq!(
+            account_mismatch(None, Some("https://github.com:bob")).as_deref(),
+            Some("gh account is unknown, Copilot is bob")
+        );
+        let ghe = account_mismatch(Some("alice"), Some("https://ghe.example:alice")).unwrap();
         assert!(ghe.contains("https://ghe.example"));
+        let ghe_no_gh = account_mismatch(None, Some("https://ghe.example:alice")).unwrap();
+        assert!(ghe_no_gh.contains("https://ghe.example"));
+    }
+
+    #[test]
+    fn copilot_config_account_selection_and_ambiguity() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(
+            copilot_config_account(home.path()),
+            CopilotConfigAccount::None
+        );
+        assert!(!copilot_has_native_login(home.path()));
+
+        let dir = home.path().join(".copilot");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.json");
+
+        std::fs::write(&cfg, r#"{"loggedInUsers":[]}"#).unwrap();
+        assert_eq!(
+            copilot_config_account(home.path()),
+            CopilotConfigAccount::None
+        );
+        assert!(!copilot_has_native_login(home.path()));
+
+        // Multi-user roster with explicit lastLoggedInUser selects that user.
+        std::fs::write(
+            &cfg,
+            r#"{"lastLoggedInUser":{"host":"https://github.com/","login":"bob"},"loggedInUsers":[{"host":"https://github.com","login":"alice"},{"host":"https://github.com","login":"Bob"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            copilot_config_account(home.path()),
+            CopilotConfigAccount::Selected("https://github.com:bob".into())
+        );
+        assert!(copilot_has_native_login(home.path()));
+
+        // Single user in loggedInUsers without lastLoggedInUser is unambiguous.
+        std::fs::write(
+            &cfg,
+            r#"{"loggedInUsers":[{"host":"https://ghe.example.com","login":"alice"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            copilot_config_account(home.path()),
+            CopilotConfigAccount::Selected("https://ghe.example.com:alice".into())
+        );
+
+        // lastLoggedInUser missing from a non-empty loggedInUsers roster is refused.
+        std::fs::write(
+            &cfg,
+            r#"{"lastLoggedInUser":{"host":"https://github.com","login":"charlie"},"loggedInUsers":[{"host":"https://github.com","login":"alice"},{"host":"https://github.com","login":"bob"}]}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            copilot_config_account(home.path()),
+            CopilotConfigAccount::Ambiguous(ref s) if s.contains("not in loggedInUsers")
+        ));
+
+        // Multiple users without lastLoggedInUser is refused.
+        std::fs::write(
+            &cfg,
+            r#"{"loggedInUsers":[{"host":"https://github.com","login":"alice"},{"host":"https://github.com","login":"bob"}]}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            copilot_config_account(home.path()),
+            CopilotConfigAccount::Ambiguous(ref s) if s.contains("multiple loggedInUsers")
+        ));
+
+        // Malformed JSON, missing fields, or control characters are refused.
+        for bad in [
+            "{not json",
+            r#"{"lastLoggedInUser":{"host":"","login":"alice"}}"#,
+            r#"{"loggedInUsers":[{"host":"https://github.com"}]}"#,
+            r#"{"lastLoggedInUser":{"host":"https://github.com","login":"alice\u001b[2J"}}"#,
+            r#"{"loggedInUsers":[{"host":"https://github.com\n","login":"alice"}]}"#,
+        ] {
+            std::fs::write(&cfg, bad).unwrap();
+            assert!(matches!(
+                copilot_config_account(home.path()),
+                CopilotConfigAccount::Ambiguous(ref s) if !s.chars().any(char::is_control)
+            ));
+        }
+    }
+
+    #[test]
+    fn copilot_config_account_refuses_symlink_fifo_and_oversize() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".copilot");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.json");
+
+        // Planted symlink is refused without reading target.
+        let target = home.path().join("target.json");
+        std::fs::write(
+            &target,
+            r#"{"lastLoggedInUser":{"host":"https://github.com","login":"alice"}}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&target, &cfg).unwrap();
+        assert!(matches!(
+            copilot_config_account(home.path()),
+            CopilotConfigAccount::Ambiguous(_)
+        ));
+        std::fs::remove_file(&cfg).unwrap();
+
+        // Planted FIFO is refused without blocking.
+        crate::untrusted::tests::mkfifo(&cfg);
+        let p = home.path().to_path_buf();
+        assert!(matches!(
+            crate::untrusted::tests::bounded(move || copilot_config_account(&p)),
+            CopilotConfigAccount::Ambiguous(_)
+        ));
+        std::fs::remove_file(&cfg).unwrap();
+
+        // Oversized file (> 64 KiB) is refused.
+        std::fs::write(&cfg, " ".repeat((COPILOT_CONFIG_LIMIT + 1) as usize)).unwrap();
+        assert!(matches!(
+            copilot_config_account(home.path()),
+            CopilotConfigAccount::Ambiguous(_)
+        ));
     }
 }

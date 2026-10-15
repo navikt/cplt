@@ -292,6 +292,59 @@ fn worktree_scope_content_filter_is_detected() {
     );
 }
 
+/// An initialized dirty submodule whose `.git/modules/<sub>/config` defines
+/// `filter.*.clean` is not scanned by `repo_defines_content_filter` on the
+/// superproject, so `CONFIG_OVERRIDES` (`diff.ignoreSubmodules=all`,
+/// `status.submodulesummary=0`, `submodule.recurse=false`) must stop parent-side
+/// `git status` and `git diff` from inspecting the submodule and running its
+/// filter.
+#[test]
+fn submodule_content_filter_does_not_execute_in_parent() {
+    let Some(f) = fixture() else {
+        eprintln!("skipping: git unavailable");
+        return;
+    };
+    let sub_origin = f.repo.parent().unwrap().join("sub-origin");
+    std::fs::create_dir_all(&sub_origin).unwrap();
+    assert!(git(&sub_origin, &["init", "-q"]));
+    std::fs::write(sub_origin.join("sub.txt"), "v1\n").unwrap();
+    std::fs::write(sub_origin.join(".gitattributes"), "*.txt filter=evil\n").unwrap();
+    assert!(git(&sub_origin, &["add", "-A"]));
+    assert!(git(&sub_origin, &["commit", "-qm", "sub init"]));
+
+    assert!(git(
+        &f.repo,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            &sub_origin.display().to_string(),
+            "sub",
+        ]
+    ));
+    assert!(git(&f.repo, &["commit", "-qm", "add sub"]));
+
+    let sub_worktree = f.repo.join("sub");
+    assert!(git(
+        &sub_worktree,
+        &[
+            "config",
+            "filter.evil.clean",
+            &f.payload.display().to_string(),
+        ]
+    ));
+    std::fs::write(sub_worktree.join("sub.txt"), "dirty\n").unwrap();
+
+    let baseline = cplt::audit::Baseline::capture(&f.repo);
+    let _ = baseline.finish(0, true);
+    assert!(
+        !f.marker.exists(),
+        "submodule filter.evil.clean executed in the parent process"
+    );
+}
+
 /// A `git` (or `xcrun`) planted on `PATH` never runs in the parent, now that
 /// macOS resolves past the xcrun shim once per process (#666). The committed
 /// `[deny]` path showing up in the profile proves the parent did run git: it

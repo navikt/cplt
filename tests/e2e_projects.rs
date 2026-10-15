@@ -32,6 +32,120 @@ mod project_tests {
 
     static PROJECT_COUNTER: AtomicU32 = AtomicU32::new(0);
 
+    #[test]
+    fn copilot_editor_launcher_has_a_standalone_recovery_with_substitution_on() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = home_temp_dir("copilot-editor");
+        let project = tempfile::tempdir().unwrap();
+        let editor = home.path().join(
+            "Library/Application Support/Code/User/globalStorage/github.copilot-chat/copilotCli",
+        );
+        let standalone = home.path().join("standalone");
+        for dir in [&editor, &standalone] {
+            fs::create_dir_all(dir).unwrap();
+            let bin = dir.join("copilot");
+            fs::write(&bin, "#!/bin/sh\necho '1.0.94-3'\n").unwrap();
+            fs::set_permissions(bin, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let command = |path: &std::ffi::OsStr| {
+            let mut cmd = cplt_cmd();
+            cmd.env_clear()
+                .env("CPLT_CONFIG", crate::common::NO_CONFIG)
+                .env("NO_COLOR", "1")
+                .env("HOME", home.path())
+                .env("PATH", path)
+                .env("GH_TOKEN", "test-token")
+                .current_dir(project.path())
+                .args(["--agent", "copilot"]);
+            cmd
+        };
+        let editor_path = std::env::join_paths([editor.as_path(), Path::new("/usr/bin")]).unwrap();
+        let out = command(&editor_path)
+            .args(["--yes", "--no-validate", "--no-proxy", "--no-scratch-dir"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{stderr}");
+        assert!(
+            stderr.contains("brew install --cask copilot-cli"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("Starting Copilot in sandbox"), "{stderr}");
+
+        let out = command(&editor_path).arg("doctor").output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!out.status.success(), "{stdout}");
+        assert!(stdout.contains("Copilot's editor launcher"), "{stdout}");
+        assert!(
+            !stdout.contains(&home.path().display().to_string()),
+            "{stdout}"
+        );
+
+        // The editor's symlink target has no editor markers or editor path.
+        fs::remove_file(editor.join("copilot")).unwrap();
+        std::os::unix::fs::symlink(standalone.join("copilot"), editor.join("copilot")).unwrap();
+        let out = command(&editor_path)
+            .args(["--yes", "--no-validate", "--no-proxy", "--no-scratch-dir"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{stderr}");
+        assert!(stderr.contains("Copilot's editor launcher"), "{stderr}");
+        let out = command(&editor_path).arg("doctor").output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!out.status.success(), "{stdout}");
+        assert!(stdout.contains("Copilot's editor launcher"), "{stdout}");
+
+        let recovered_path = std::env::join_paths([
+            editor.as_path(),
+            standalone.as_path(),
+            Path::new("/usr/bin"),
+        ])
+        .unwrap();
+        let out = command(&recovered_path)
+            .args(["doctor", "--verbose"])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{stdout}");
+        assert!(stdout.contains("~/standalone/copilot"), "{stdout}");
+        assert!(stdout.contains("keychain:    denied"), "{stdout}");
+
+        if !sandbox_exec_available() {
+            assert!(
+                !require_sandbox_enforced(),
+                "sandbox-exec required but unavailable"
+            );
+            eprintln!("SKIPPED: recovered launch requires sandbox-exec");
+            return;
+        }
+        let keychains = home.path().join("Library/Keychains");
+        fs::create_dir_all(&keychains).unwrap();
+        fs::write(keychains.join("probe"), "must remain unreadable").unwrap();
+        fs::write(
+            standalone.join("copilot"),
+            "#!/bin/sh\n\
+             for arg in \"$@\"; do\n\
+               if [ \"$arg\" = --version ]; then echo '1.0.94-3'; exit 0; fi\n\
+             done\n\
+             [ \"$GH_TOKEN\" = test-token ] || exit 42\n\
+             if /bin/cat \"$HOME/Library/Keychains/probe\" 2>/dev/null; then exit 43; fi\n\
+             echo STANDALONE_TOKEN_OK_KEYCHAIN_DENIED\n",
+        )
+        .unwrap();
+        let out = command(&recovered_path)
+            .args(["--yes", "--no-validate", "--no-proxy", "--no-scratch-dir"])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stdout}\n{stderr}");
+        assert!(
+            stdout.contains("STANDALONE_TOKEN_OK_KEYCHAIN_DENIED"),
+            "{stdout}"
+        );
+    }
+
     // ── Guards ─────────────────────────────────────────────────────
 
     fn sandbox_exec_available() -> bool {
@@ -65,6 +179,435 @@ mod project_tests {
     }
 
     // ── TempProject ────────────────────────────────────────────────
+
+    #[test]
+    fn copilot_auth_handover_keeps_keychain_only_without_a_substitute() {
+        use std::os::unix::fs::PermissionsExt;
+        require_sandbox!();
+        let home = home_temp_dir("copilot-auth");
+        let project = TempProject::new("copilot-auth");
+        let bin = home.path().join("bin");
+        let keychains = home.path().join("Library/Keychains");
+        for dir in [&bin, &keychains, &home.path().join("gh")] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let config = home.path().join("cplt.toml");
+        let path = std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
+            .unwrap();
+        let agent = bin.join("copilot");
+        fs::write(
+            &agent,
+            r#"#!/bin/sh
+for arg in "$@"; do
+  if [ "$arg" = --version ]; then echo '1.0.86'; exit 0; fi
+done
+if [ "$GH_TOKEN" = fixture-secret ]; then echo TOKEN_PRESENT; else echo TOKEN_ABSENT; fi
+if /bin/cat "$HOME/Library/Keychains/probe" >/dev/null 2>&1; then
+  echo KEYCHAIN_FILE_READ_ALLOWED
+else
+  echo KEYCHAIN_FILE_READ_DENIED
+fi
+if /bin/sh -c 'echo updated > "$HOME/Library/Keychains/probe"' 2>/dev/null; then
+  echo KEYCHAIN_FILE_WRITE_ALLOWED
+else
+  echo KEYCHAIN_FILE_WRITE_DENIED
+fi
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o755)).unwrap();
+
+        for (enabled, token, denied) in [
+            (true, Some("fixture-secret"), true),
+            (true, None, false),
+            (false, Some("fixture-secret"), false),
+        ] {
+            fs::write(
+                &config,
+                format!("[sandbox]\nkeychain_substitute = {enabled}\n"),
+            )
+            .unwrap();
+            fs::write(keychains.join("probe"), "original").unwrap();
+            let mut cmd = cplt_cmd();
+            cmd.env_clear()
+                .env("CPLT_CONFIG", &config)
+                .env("NO_COLOR", "1")
+                .env("HOME", home.path())
+                .env("GH_CONFIG_DIR", home.path().join("gh"))
+                .env("PATH", &path)
+                .current_dir(project.path())
+                .args([
+                    "--agent",
+                    "copilot",
+                    "--yes",
+                    "--no-validate",
+                    "--no-proxy",
+                    "--no-scratch-dir",
+                ]);
+            if let Some(token) = token {
+                cmd.env("GH_TOKEN", token);
+            }
+            let out = cmd.output().unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                out.status.success(),
+                "key={enabled}, token={token:?}: {stdout}\n{stderr}"
+            );
+            assert!(
+                stdout.contains(if token.is_some() {
+                    "TOKEN_PRESENT"
+                } else {
+                    "TOKEN_ABSENT"
+                }),
+                "{stdout}"
+            );
+            for operation in ["READ", "WRITE"] {
+                let result = if denied { "DENIED" } else { "ALLOWED" };
+                assert!(
+                    stdout.contains(&format!("KEYCHAIN_FILE_{operation}_{result}")),
+                    "{stdout}"
+                );
+            }
+            assert!(!stdout.contains("fixture-secret"), "{stdout}");
+            assert!(!stderr.contains("fixture-secret"), "{stderr}");
+            assert_eq!(
+                fs::read_to_string(keychains.join("probe")).unwrap(),
+                if denied { "original" } else { "updated\n" }
+            );
+        }
+    }
+
+    #[test]
+    fn copilot_one_shot_cache_uses_scratch_with_passed_tmpdir() {
+        use std::os::unix::fs::PermissionsExt;
+        require_sandbox!();
+        assert!(
+            [
+                "/usr/bin/gh",
+                "/bin/gh",
+                "/usr/local/bin/gh",
+                "/opt/homebrew/bin/gh"
+            ]
+            .iter()
+            .any(|p| Path::new(p).is_file()),
+            "trusted gh required for synthetic stored-token retrieval"
+        );
+        let home = home_temp_dir("copilot-cache-tmpdir");
+        let project = TempProject::new("copilot-cache-tmpdir");
+        project.git_init();
+        let bin = home.path().join("bin");
+        let gh_config = home.path().join("gh");
+        let other = project.path().join("other-tmp");
+        for dir in [&bin, &gh_config, &other] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::write(
+            gh_config.join("hosts.yml"),
+            "github.com:\n    user: fixture\n    oauth_token: synthetic-one-shot-secret\n",
+        )
+        .unwrap();
+        fs::write(other.join(".gh-token"), "synthetic-stale-secret").unwrap();
+        let config = home.path().join("cplt.toml");
+        fs::write(&config, "[sandbox]\nkeychain_substitute = false\n").unwrap();
+        let agent = bin.join("copilot");
+        fs::write(
+            &agent,
+            r#"#!/bin/sh
+for arg in "$@"; do
+  if [ "$arg" = --version ]; then echo '1.0.94'; exit 0; fi
+done
+[ "$TMPDIR" = "$PWD/other-tmp" ] || exit 41
+[ -z "$GH_TOKEN$GITHUB_TOKEN$COPILOT_GITHUB_TOKEN" ] || exit 43
+wrapper=$(command -v gh) || exit 51
+case "$wrapper" in */bin/gh) ;; *) exit 52 ;; esac
+/usr/bin/grep -q 'gh-gate' "$wrapper" || exit 53
+expect_cache_refused() {
+  diagnostic=$(gh auth token 2>&1)
+  status=$?
+  [ "$status" = 1 ] || exit 54
+  [ "$diagnostic" = "⚠️ BLOCKED by sandbox: 'gh auth token'. No cached token available." ] || exit 55
+}
+if [ "$EXPECT_DENIED" = 1 ]; then
+  [ -z "$__CPLT_GH_TOKEN_DIR" ] || exit 44
+  expect_cache_refused
+  echo CACHE_DENIED
+  exit 0
+fi
+[ -n "$__CPLT_GH_TOKEN_DIR" ] && [ "$__CPLT_GH_TOKEN_DIR" != "$TMPDIR" ] || exit 42
+token=$(gh auth token 2>/dev/null) || exit 45
+[ "$token" = synthetic-one-shot-secret ] || exit 46
+[ ! -f "$__CPLT_GH_TOKEN_DIR/.gh-token" ] || exit 47
+expect_cache_refused
+[ "$(/bin/cat "$TMPDIR/.gh-token")" = synthetic-stale-secret ] || exit 49
+echo SCRATCH_CACHE_CONSUMED_ONCE
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths([
+            bin.as_path(),
+            Path::new("/opt/homebrew/bin"),
+            Path::new("/usr/local/bin"),
+            Path::new("/usr/bin"),
+            Path::new("/bin"),
+        ])
+        .unwrap();
+        for deny in ["", "GH_TOKEN"] {
+            let denied = !deny.is_empty();
+            project.write_file(
+                ".cplt.toml",
+                &if denied {
+                    format!("[deny]\nenv = [\"{deny}\"]\n")
+                } else {
+                    String::new()
+                },
+            );
+            let out = cplt_cmd()
+                .env_clear()
+                .env("CPLT_CONFIG", &config)
+                .env("NO_COLOR", "1")
+                .env("HOME", home.path())
+                .env("GH_CONFIG_DIR", &gh_config)
+                .env("PATH", &path)
+                .env("TMPDIR", &other)
+                .env("EXPECT_DENIED", if denied { "1" } else { "0" })
+                // A passed ambient marker must not displace the producer's locator.
+                .env("__CPLT_GH_TOKEN_DIR", &other)
+                .current_dir(project.path())
+                .args([
+                    "--agent",
+                    "copilot",
+                    "--yes",
+                    "--no-validate",
+                    "--no-proxy",
+                    "--no-audit",
+                    "--no-git-guard",
+                    "--gh-guard",
+                    "--pass-env",
+                    "TMPDIR",
+                    "--pass-env",
+                    "EXPECT_DENIED",
+                    "--pass-env",
+                    "__CPLT_GH_TOKEN_DIR",
+                ])
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{stdout}\n{stderr}");
+            assert!(
+                stdout.contains(if denied {
+                    "CACHE_DENIED"
+                } else {
+                    "SCRATCH_CACHE_CONSUMED_ONCE"
+                }),
+                "{stdout}"
+            );
+            for token in ["synthetic-one-shot-secret", "synthetic-stale-secret"] {
+                assert!(!stdout.contains(token) && !stderr.contains(token));
+            }
+            assert_eq!(
+                fs::read_to_string(other.join(".gh-token")).unwrap(),
+                "synthetic-stale-secret"
+            );
+        }
+    }
+
+    #[test]
+    fn copilot_and_gh_credentials_stay_separate_through_full_launch() {
+        use std::os::unix::fs::PermissionsExt;
+        require_sandbox!();
+        let Some(gh) = [
+            "/usr/bin/gh",
+            "/bin/gh",
+            "/usr/local/bin/gh",
+            "/opt/homebrew/bin/gh",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|p| p.is_file()) else {
+            assert!(
+                !require_sandbox_enforced(),
+                "credential-source test requires gh in a trusted install directory"
+            );
+            eprintln!("SKIPPED: credential-source test needs gh in a trusted install directory");
+            return;
+        };
+        let home = home_temp_dir("copilot-credential-sources");
+        let project = TempProject::new("copilot-credential-sources");
+        project.git_init();
+        assert!(
+            git_cmd(project.path())
+                .args([
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://github.com/fixture/repo.git"
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let bin = home.path().join("bin");
+        let gh_config = home.path().join(".config/gh");
+        let keychains = home.path().join("Library/Keychains");
+        for dir in [&bin, &gh_config, &keychains] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        // A real trusted gh reads only this synthetic store; no PATH substitution
+        // or credential-store lookup is needed to exercise parent extraction.
+        fs::write(
+            gh_config.join("hosts.yml"),
+            "github.com:\n    user: fixture-gh\n    oauth_token: synthetic-gh-credential\n    git_protocol: https\n",
+        )
+        .unwrap();
+        fs::write(keychains.join("probe"), "synthetic-keychain-file").unwrap();
+        let agent = bin.join("copilot");
+        fs::write(
+            &agent,
+            r#"#!/bin/sh
+for arg in "$@"; do
+  if [ "$arg" = --version ]; then echo '1.0.94'; exit 0; fi
+done
+case "$COPILOT_GITHUB_TOKEN" in
+  synthetic-copilot-credential) echo COPILOT_SOURCE_EXPLICIT ;;
+  '') echo COPILOT_SOURCE_ABSENT ;;
+  *) exit 41 ;;
+esac
+[ -z "$GH_TOKEN$GITHUB_TOKEN" ] || exit 42
+if [ -n "$__CPLT_GH_TOKEN_DIR" ]; then
+  [ "$(/bin/cat "$__CPLT_GH_TOKEN_DIR/.gh-exec-token")" = synthetic-gh-credential ] || exit 43
+  echo GH_EXEC_CACHE_PRESENT
+else
+  echo GH_EXEC_CACHE_ABSENT
+fi
+if /bin/cat "$HOME/Library/Keychains/probe" >/dev/null 2>&1; then
+  echo KEYCHAIN_FILE_ALLOWED
+else
+  echo KEYCHAIN_FILE_DENIED
+fi
+gh api repos/fixture/repo --hostname github.com || exit 44
+echo AGENT_COMPLETED
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o755)).unwrap();
+        let child_gh = bin.join("gh");
+        // Only the sandboxed gh is fake. It checks the gate's env without making
+        // an HTTP request; the unsandboxed parent still resolves trusted gh.
+        fs::write(&child_gh, r#"#!/bin/sh
+[ "$1 $2" = 'api repos/fixture/repo' ] || exit 45
+token="$GH_TOKEN"
+if [ -z "$token" ]; then
+  if /usr/bin/grep -q 'oauth_token: synthetic-gh-credential' "$HOME/.config/gh/hosts.yml" 2>/dev/null; then token=synthetic-gh-credential; fi
+fi
+case "$token" in
+  synthetic-gh-credential) echo GH_SOURCE_STORED ;;
+  '') echo GH_SOURCE_ABSENT ;;
+  *) exit 46 ;;
+esac
+"#).unwrap();
+        fs::set_permissions(child_gh, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths([
+            bin.as_path(),
+            gh.parent().unwrap(),
+            Path::new("/usr/bin"),
+            Path::new("/bin"),
+        ])
+        .unwrap();
+        let config = home.path().join("cplt.toml");
+        fs::write(&config, "[sandbox]\nkeychain_substitute = true\n").unwrap();
+        for (guard, deny, copilot, cache, stored, keychain) in [
+            (true, "", true, true, true, false),
+            (true, "\"GITHUB_TOKEN\"", true, true, true, false),
+            (false, "", true, false, false, false),
+            (true, "\"GH_TOKEN\"", true, false, false, false),
+            (
+                true,
+                "\"COPILOT_GITHUB_TOKEN\", \"GH_TOKEN\", \"GITHUB_TOKEN\"",
+                false,
+                false,
+                false,
+                true,
+            ),
+            (
+                false,
+                "\"COPILOT_GITHUB_TOKEN\", \"GH_TOKEN\", \"GITHUB_TOKEN\"",
+                false,
+                false,
+                false,
+                true,
+            ),
+        ] {
+            project.write_file(".cplt.toml", &format!("[deny]\nenv = [{deny}]\n"));
+            let mut cmd = cplt_cmd();
+            cmd.env_clear()
+                .env("CPLT_CONFIG", &config)
+                .env("NO_COLOR", "1")
+                .env("HOME", home.path())
+                .env("GH_CONFIG_DIR", &gh_config)
+                .env("PATH", &path)
+                .env("COPILOT_GITHUB_TOKEN", "synthetic-copilot-credential")
+                .current_dir(project.path())
+                .args([
+                    "--agent",
+                    "copilot",
+                    "--yes",
+                    "--no-proxy",
+                    "--no-audit",
+                    "--no-git-guard",
+                    if guard { "--gh-guard" } else { "--no-gh-guard" },
+                ]);
+            if deny == "\"GITHUB_TOKEN\"" {
+                // The effective child env must win over an ambient token that
+                // is removed only after cache setup.
+                cmd.env("GITHUB_TOKEN", "synthetic-denied-credential");
+            }
+            let out = cmd.output().unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                out.status.success(),
+                "guard={guard}, deny={deny}: {stdout}\n{stderr}"
+            );
+            for expected in [
+                if copilot {
+                    "COPILOT_SOURCE_EXPLICIT"
+                } else {
+                    "COPILOT_SOURCE_ABSENT"
+                },
+                if cache {
+                    "GH_EXEC_CACHE_PRESENT"
+                } else {
+                    "GH_EXEC_CACHE_ABSENT"
+                },
+                if stored {
+                    "GH_SOURCE_STORED"
+                } else {
+                    "GH_SOURCE_ABSENT"
+                },
+                if keychain {
+                    "KEYCHAIN_FILE_ALLOWED"
+                } else {
+                    "KEYCHAIN_FILE_DENIED"
+                },
+                "AGENT_COMPLETED",
+            ] {
+                assert!(
+                    stdout.contains(expected),
+                    "expected {expected}: {stdout}\n{stderr}"
+                );
+            }
+            for secret in [
+                "synthetic-copilot-credential",
+                "synthetic-gh-credential",
+                "synthetic-denied-credential",
+            ] {
+                assert!(!stdout.contains(secret) && !stderr.contains(secret));
+            }
+        }
+    }
 
     /// A temporary project directory with realistic file structure.
     ///
@@ -4066,6 +4609,71 @@ fi
         assert_result_ok(&stdout, &stderr, "write_core_test");
     }
 
+    /// Exercise Kafka's zero-copy path through the full launch pipeline without
+    /// downloading Kafka: the injected IPv4 flag and sendfile policy must both
+    /// reach the agent's child JVM.
+    #[test]
+    fn project_java_localhost_file_channel_transfer() {
+        require_sandbox!();
+        let java = crate::common::binary_in_path("java");
+        let version = crate::common::shim_cmd(&java)
+            .arg("-version")
+            .output()
+            .expect("check Java runtime");
+        if !version.status.success() {
+            assert!(
+                !require_sandbox_enforced(),
+                "Java required for zero-copy test"
+            );
+            eprintln!("SKIPPED: Java runtime unavailable");
+            return;
+        }
+        let project = TempProject::scaffold_maven();
+        project.write_file(
+            "KafkaTransfer.java",
+            r#"
+import java.net.*;
+import java.nio.channels.*;
+import java.nio.file.*;
+import java.util.Arrays;
+public class KafkaTransfer {
+    public static void main(String[] args) throws Exception {
+        if (!Boolean.getBoolean("java.net.preferIPv4Stack"))
+            throw new AssertionError("cplt IPv4 flag missing");
+        byte[] payload = "embedded-kafka-record".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        Path log = Files.createTempFile("kafka-records-", ".log");
+        try {
+            Files.write(log, payload);
+            try (ServerSocketChannel listener = ServerSocketChannel.open()) {
+                listener.bind(new InetSocketAddress("127.0.0.1", 0));
+                try (SocketChannel client = SocketChannel.open(listener.getLocalAddress());
+                     SocketChannel broker = listener.accept();
+                     FileChannel records = FileChannel.open(log, StandardOpenOption.READ)) {
+                    client.socket().setSoTimeout(2000);
+                    long sent = records.transferTo(0, payload.length, broker);
+                    if (sent != payload.length) throw new AssertionError("short transfer: " + sent);
+                    byte[] received = client.socket().getInputStream().readNBytes(payload.length);
+                    if (!Arrays.equals(payload, received)) throw new AssertionError("wrong records");
+                }
+            }
+        } finally {
+            Files.delete(log);
+        }
+        System.out.println("RESULT:java_sendfile:OK");
+    }
+}
+"#,
+        );
+        let fake_dir = create_fake_copilot(&project, "exec java KafkaTransfer.java\n");
+        let (stdout, stderr, success) = run_cplt(
+            &project,
+            &fake_dir,
+            &["--allow-localhost-any", "--no-proxy"],
+        );
+        assert!(success, "stdout: {stdout}\nstderr: {stderr}");
+        assert_result_ok(&stdout, &stderr, "java_sendfile");
+    }
+
     /// Java/Maven env vars pass through the sandbox: MAVEN_OPTS,
     /// JAVA_TOOL_OPTIONS, JAVA_HOME are on the allowlist. CLASSPATH is not.
     #[test]
@@ -4630,6 +5238,12 @@ fi
     // Managed worktree root (sandbox.allow_git_worktrees, #531)
     // ============================================================
 
+    /// Keep HOME under the real home directory. A home under /private/tmp would
+    /// change which writes the profile allows, unlike a user's normal session.
+    fn short_home(label: &str) -> tempfile::TempDir {
+        home_temp_dir(label)
+    }
+
     /// Run `cplt exec` of a script inside `project`, with `home` as HOME and
     /// `config` as the config file. The script lives in the project: nothing
     /// else is executable in the sandbox.
@@ -4723,7 +5337,7 @@ r wt_remove 'git worktree remove --force "$R/b"'
         let project = TempProject::new("wt-on");
         project.write_file("f.txt", "x\n");
         project.git_init();
-        let home = TempProject::new("wt-on-home");
+        let home = short_home("wt-on-home");
         let (root, other) = managed_paths(&project, home.path());
         let other_s = other.display().to_string();
         let base_s = other.parent().unwrap().display().to_string();
@@ -4797,7 +5411,7 @@ echo "ROOT:$R"
         let project = TempProject::new("wt-off");
         project.write_file("f.txt", "x\n");
         project.git_init();
-        let home = TempProject::new("wt-off-home");
+        let home = short_home("wt-off-home");
         let (root, _) = managed_paths(&project, home.path());
         let root_s = root.display().to_string();
         let script = format!(
@@ -4887,7 +5501,7 @@ if echo y > "{root_s}/g" 2>/dev/null; then echo RESULT:write:OK; else echo RESUL
             let project = TempProject::new(&format!("wt-links-{name}"));
             project.write_file("f.txt", "x\n");
             project.git_init();
-            let home = TempProject::new(&format!("wt-links-{name}-home"));
+            let home = short_home(&format!("wt-links-{name}-home"));
             let (root, _) = managed_paths(&project, home.path());
             let script = format!(
                 "P=\"$PWD\"\nR=\"$CPLT_WORKTREE_ROOT\"\ngit worktree add -q \"$R/a\" -b a \
@@ -4946,7 +5560,7 @@ if echo y > "{root_s}/g" 2>/dev/null; then echo RESULT:write:OK; else echo RESUL
         let project = TempProject::new("wt-link");
         project.write_file("f.txt", "x\n");
         project.git_init();
-        let home = TempProject::new("wt-link-home");
+        let home = short_home("wt-link-home");
         let (root, other) = managed_paths(&project, home.path());
         std::os::unix::fs::symlink(&other, &root).unwrap();
         let (stdout, stderr, ok) = run_exec_with_home(
@@ -4963,17 +5577,374 @@ if echo y > "{root_s}/g" 2>/dev/null; then echo RESULT:write:OK; else echo RESUL
         );
     }
 
-    /// #574 round 8: with the key off, the session can rewrite a worktree's
-    /// `commondir` in place (only the key-on profile denies it, and the
-    /// key-off profile stays as on main). The session-end check still runs
-    /// whenever the root exists, and names the worktree.
+    /// `cplt worktree add` from inside the sandbox (#531): the parent makes the
+    /// checkout, the agent sees the complete tree at `$CPLT_WORKTREE_ROOT/<name>`,
+    /// a second request for the same name fails without touching the first, and
+    /// a hostile name never reaches git.
+    #[test]
+    fn worktree_add_from_inside_the_sandbox_publishes_a_complete_checkout() {
+        require_sandbox!();
+        let project = TempProject::new("wt-broker");
+        project.write_file("f.txt", "x\n");
+        project.write_file(".cplt.toml", "[propose]\n");
+        project.write_file(".github/hooks/pre.sh", "echo hook\n");
+        project.git_init();
+        // Local state must neither disable bootstrap nor enter the checkout.
+        project.write_file(".claude/settings.local.json", "{}\n");
+        project.write_file("node_modules/dependency/.claude/settings.json", "{}\n");
+        let home = short_home("wt-broker-home");
+        let (root, _) = managed_paths(&project, home.path());
+        let bin = crate::common::binary_path().display().to_string();
+        let script = format!(
+            r#"
+out=$("{bin}" worktree add wt1 HEAD 2>"$TMPDIR/err1"); echo "RESULT:add:$?"
+test "$out" = "$CPLT_WORKTREE_ROOT/wt1" && echo RESULT:path:OK
+test -f "$CPLT_WORKTREE_ROOT/wt1/f.txt" && test -f "$CPLT_WORKTREE_ROOT/wt1/.cplt.toml" && test -f "$CPLT_WORKTREE_ROOT/wt1/.github/hooks/pre.sh" && echo RESULT:complete:OK
+test ! -e "$CPLT_WORKTREE_ROOT/wt1/.claude/settings.local.json" && test ! -e "$CPLT_WORKTREE_ROOT/wt1/node_modules" && echo RESULT:tracked-only:OK
+git -C "$CPLT_WORKTREE_ROOT/wt1" status --porcelain > "$TMPDIR/broker-status" && test ! -s "$TMPDIR/broker-status" && echo RESULT:clean:OK
+git -C "$CPLT_WORKTREE_ROOT/wt1" switch -c broker-feature && echo RESULT:branch:OK
+if printf 'gitdir: /tmp\n' > "$CPLT_WORKTREE_ROOT/wt1/.git"; then echo RESULT:pointer:WRITABLE; else echo RESULT:pointer:denied; fi
+if printf 'changed\n' > "$CPLT_WORKTREE_ROOT/wt1/.cplt.toml"; then echo RESULT:cplt:WRITABLE; else echo RESULT:cplt:denied; fi
+if printf 'changed\n' > "$CPLT_WORKTREE_ROOT/wt1/.github/hooks/pre.sh"; then echo RESULT:hooks:WRITABLE; else echo RESULT:hooks:denied; fi
+mkdir -p "$CPLT_WORKTREE_ROOT/wt1/.claude"
+if printf '{{}}\n' > "$CPLT_WORKTREE_ROOT/wt1/.claude/settings.json"; then echo RESULT:new-settings:WRITABLE; else echo RESULT:new-settings:denied; fi
+if rm "$CPLT_WORKTREE_SOCKET"; then echo RESULT:socket:WRITABLE; else echo RESULT:socket:denied; fi
+if mv "$(dirname "$CPLT_WORKTREE_SOCKET")" "$TMPDIR/stolen-broker"; then echo RESULT:socket-dir:WRITABLE; else echo RESULT:socket-dir:denied; fi
+"{bin}" worktree add wt1 HEAD >/dev/null 2>&1; echo "RESULT:dup:$?"
+"{bin}" worktree add ../evil HEAD >/dev/null 2>&1; echo "RESULT:traversal:$?"
+test -e "$CPLT_WORKTREE_ROOT/../evil" || echo RESULT:nothing-escaped:OK
+"#
+        );
+        let (stdout, stderr, _) = run_exec_with_home(
+            &project,
+            home.path(),
+            "[sandbox]\nallow_git_worktrees = true\n",
+            &script,
+        );
+        assert!(
+            stdout.contains("RESULT:add:0"),
+            "add succeeds.\n{stdout}\n{stderr}"
+        );
+        for ok in [
+            "path:OK",
+            "complete:OK",
+            "tracked-only:OK",
+            "clean:OK",
+            "branch:OK",
+            "pointer:denied",
+            "cplt:denied",
+            "hooks:denied",
+            "new-settings:denied",
+            "socket:denied",
+            "socket-dir:denied",
+            "nothing-escaped:OK",
+        ] {
+            assert!(
+                stdout.contains(&format!("RESULT:{ok}")),
+                "{ok}\n{stdout}\n{stderr}"
+            );
+        }
+        assert!(
+            !stdout.contains("RESULT:dup:0"),
+            "a taken name is refused.\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("RESULT:traversal:0"),
+            "a traversal name is refused.\n{stdout}"
+        );
+        assert!(root.join("wt1/f.txt").is_file(), "published under the root");
+    }
+
+    #[test]
+    fn broker_staging_is_private_under_a_temp_home_write_grant() {
+        require_sandbox!();
+        let project = TempProject::new("wt-private-stage");
+        project.write_file("file", "tracked\n");
+        project.git_init();
+        let home = tempfile::tempdir().unwrap();
+        let staging = home.path().join(".cplt-worktrees/.staging");
+        fs::create_dir_all(staging.join("probe")).unwrap();
+        fs::write(staging.join("probe/index"), "host-private\n").unwrap();
+        let bin = crate::common::binary_path().display().to_string();
+        let config = "[sandbox]\nallow_git_worktrees = true\n";
+        let script = format!(
+            r#"
+stage="$HOME/.cplt-worktrees/.staging"
+if cat "$stage/probe/index"; then echo RESULT:read:WRITABLE; else echo RESULT:read:denied; fi
+if printf x > "$stage/probe/index"; then echo RESULT:write:WRITABLE; else echo RESULT:write:denied; fi
+if ln -sf /etc/passwd "$stage/probe/index"; then echo RESULT:index:WRITABLE; else echo RESULT:index:denied; fi
+if mv "$stage" "$HOME/stolen-stage"; then echo RESULT:stage:WRITABLE; else echo RESULT:stage:denied; fi
+if mv "$HOME/.cplt-worktrees" "$HOME/stolen-base"; then echo RESULT:base:WRITABLE; else echo RESULT:base:denied; fi
+"{bin}" worktree add git HEAD && echo RESULT:checkout:OK
+git -C "$CPLT_WORKTREE_ROOT/git" switch -c private-stage && echo RESULT:branch:OK
+"#
+        );
+        let (stdout, stderr, _) = run_exec_with_home(&project, home.path(), config, &script);
+        for result in [
+            "read:denied",
+            "write:denied",
+            "index:denied",
+            "stage:denied",
+            "base:denied",
+            "checkout:OK",
+            "branch:OK",
+        ] {
+            assert!(
+                stdout.contains(&format!("RESULT:{result}")),
+                "{stdout}\n{stderr}"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(staging.join("probe/index")).unwrap(),
+            "host-private\n"
+        );
+    }
+
+    #[test]
+    fn broker_refuses_bare_markers_and_symlink_dotdot_before_publication() {
+        use std::os::unix::fs::PermissionsExt;
+        require_sandbox!();
+        for bare in [true, false] {
+            let project = TempProject::new("wt-invalid-layout");
+            project.write_file("tracked", "ordinary\n");
+            if bare {
+                project.write_file("bare/HEAD", "ref: refs/heads/main\n");
+                for name in ["objects", "refs"] {
+                    project.write_file(&format!("bare/{name}"), "x\n");
+                    fs::set_permissions(
+                        project.path().join("bare").join(name),
+                        fs::Permissions::from_mode(0o755),
+                    )
+                    .unwrap();
+                }
+            } else {
+                std::os::unix::fs::symlink(".", project.path().join("s")).unwrap();
+                std::os::unix::fs::symlink("s/../absent-outside", project.path().join("escape"))
+                    .unwrap();
+            }
+            project.git_init();
+            let home = short_home("wt-invalid-home");
+            let bin = crate::common::binary_path().display().to_string();
+            let (stdout, stderr, _) = run_exec_with_home(
+                &project,
+                home.path(),
+                "[sandbox]\nallow_git_worktrees = true\n",
+                &format!(
+                    "\"{bin}\" worktree add rejected HEAD; echo RESULT:exit:$?\ntest ! -e \"$CPLT_WORKTREE_ROOT/rejected\" && echo RESULT:absent\n"
+                ),
+            );
+            assert!(stdout.contains("RESULT:exit:1"), "{stdout}\n{stderr}");
+            assert!(stdout.contains("RESULT:absent"), "{stdout}\n{stderr}");
+        }
+    }
+
+    #[test]
+    fn worktree_broker_refuses_agent_authored_protected_tree_entries() {
+        require_sandbox!();
+        let project = TempProject::new("wt-protected-tree");
+        project.write_file("ordinary.txt", "ordinary\n");
+        project.write_file(".cplt.toml", "[propose]\n");
+        project.write_file(".github/hooks/pre.sh", "echo original\n");
+        project.git_init();
+        let home = short_home("wt-protected-home");
+        let bin = crate::common::binary_path().display().to_string();
+        let git = cplt::git::trusted_git().unwrap().display().to_string();
+        let script = format!(
+            r#"
+blob=$(printf '%s\n' '{{"hooks":{{}}}}' | "{git}" hash-object -w --stdin) || exit 1
+export GIT_INDEX_FILE="$TMPDIR/authored-index"
+"{git}" read-tree HEAD || exit 1
+"{git}" update-index --add --cacheinfo 100644 "$blob" .claude/settings.json || exit 1
+tree=$("{git}" write-tree) || exit 1
+commit=$("{git}" -c user.name=test -c user.email=test@example.com commit-tree "$tree" -p HEAD -m authored) || exit 1
+unset GIT_INDEX_FILE
+"{bin}" worktree add hostile "$commit" 2> "$TMPDIR/refusal"; echo RESULT:hostile:$?
+cat "$TMPDIR/refusal"
+test ! -e "$CPLT_WORKTREE_ROOT/hostile" && echo RESULT:absent:OK
+"{bin}" worktree add original HEAD && echo RESULT:original:OK
+"#
+        );
+        let (stdout, stderr, _) = run_exec_with_home(
+            &project,
+            home.path(),
+            "[sandbox]\nallow_git_worktrees = true\n",
+            &script,
+        );
+        assert!(stdout.contains("RESULT:hostile:1"), "{stdout}\n{stderr}");
+        assert!(
+            stdout.contains("protected config differs from launch HEAD"),
+            "{stdout}\n{stderr}"
+        );
+        for result in ["absent:OK", "original:OK"] {
+            assert!(
+                stdout.contains(&format!("RESULT:{result}")),
+                "{stdout}\n{stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_worktree_broker_warns_and_keeps_the_managed_root_without_a_socket() {
+        require_sandbox!();
+        for unborn in [true, false] {
+            let project = TempProject::new("wt-no-bootstrap");
+            if unborn {
+                assert!(crate::common::git_ok(project.path(), &["init", "--quiet"]));
+            } else {
+                project.write_file(".github/hooks/pre.sh", "echo committed\n");
+                project.git_init();
+                project.write_file(".github/hooks/pre.sh", "echo not-committed\n");
+            }
+            let home = short_home("wt-no-bootstrap-home");
+            let (stdout, stderr, ok) = run_exec_with_home(
+                &project,
+                home.path(),
+                "[sandbox]\nallow_git_worktrees = true\n",
+                "test -n \"$CPLT_WORKTREE_ROOT\" && test -d \"$CPLT_WORKTREE_ROOT\" && echo RESULT:root:OK\ntest -z \"${CPLT_WORKTREE_SOCKET-}\" && echo RESULT:no-socket:OK\nprintf x > \"$CPLT_WORKTREE_ROOT/ordinary\" && echo RESULT:write:OK\n",
+            );
+            assert!(ok, "{stdout}\n{stderr}");
+            assert!(
+                stderr.contains("managed-worktree broker unavailable"),
+                "{stderr}"
+            );
+            for result in ["root:OK", "no-socket:OK", "write:OK"] {
+                assert!(
+                    stdout.contains(&format!("RESULT:{result}")),
+                    "{stdout}\n{stderr}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn worktree_broker_cannot_publish_objects_from_a_denied_repository() {
+        require_sandbox!();
+        let project = TempProject::new("wt-denied-source");
+        project.write_file("allowed.txt", "allowed\n");
+        project.git_init();
+        let secret = TempProject::new("wt-secret-source");
+        secret.write_file("secret.txt", "BROKER_DENIED_CONTENT_531\n");
+        secret.git_init();
+        let sha = crate::common::git_cmd(secret.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(sha.status.success());
+        let sha = String::from_utf8(sha.stdout).unwrap().trim().to_string();
+        let tree = crate::common::git_cmd(secret.path())
+            .args(["rev-parse", "HEAD^{tree}"])
+            .output()
+            .unwrap();
+        assert!(tree.status.success());
+        let tree = String::from_utf8(tree.stdout).unwrap().trim().to_string();
+        // Commit and tree are locally readable. Only checkout needs the denied
+        // blob, so this also proves enforcement in read-tree, not just rev-parse.
+        for id in [&sha, &tree] {
+            let relative = format!("objects/{}/{}", &id[..2], &id[2..]);
+            let destination = project.path().join(".git").join(&relative);
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            fs::copy(secret.path().join(".git").join(relative), destination).unwrap();
+        }
+        let head = crate::common::git_cmd(secret.path())
+            .args(["symbolic-ref", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(head.status.success());
+        let head = String::from_utf8(head.stdout).unwrap().trim().to_string();
+        let home = short_home("wt-denied-home");
+        let bin = crate::common::binary_path().display().to_string();
+        let secret_path = secret.canonical_path();
+        let script = format!(
+            r#"
+mkdir -p .git/objects/info alternate-objects/info
+printf '%s\n' "$PWD/alternate-objects" > .git/objects/info/alternates
+printf '%s\n' '{secret}/.git/objects' > alternate-objects/info/alternates
+ln -s '{secret}/.git/{head}' .git/refs/heads/stolen
+"{bin}" worktree add by-ref stolen; echo RESULT:ref:$?
+"{bin}" worktree add by-sha {sha}; echo RESULT:sha:$?
+for wt in by-ref by-sha; do
+    test ! -e "$CPLT_WORKTREE_ROOT/$wt" && echo "RESULT:$wt:absent"
+    test ! -f "$CPLT_WORKTREE_ROOT/$wt/secret.txt" || cat "$CPLT_WORKTREE_ROOT/$wt/secret.txt"
+done
+"{bin}" worktree add allowed HEAD; echo RESULT:allowed:$?
+"#,
+            secret = secret_path.display()
+        );
+        let config = format!(
+            "[sandbox]\nallow_git_worktrees = true\n[allow]\nread = [\"{}\"]\n[deny]\npaths = [\"{}\"]\n",
+            secret_path.display(),
+            secret_path.display()
+        );
+        let (stdout, stderr, _) = run_exec_with_home(&project, home.path(), &config, &script);
+        assert!(
+            !stdout.contains("RESULT:ref:0"),
+            "denied ref was published\n{stdout}\n{stderr}"
+        );
+        assert!(
+            !stdout.contains("RESULT:sha:0"),
+            "denied alternate objects were published\n{stdout}\n{stderr}"
+        );
+        assert!(!stdout.contains("BROKER_DENIED_CONTENT_531"), "{stdout}");
+        for result in ["by-ref:absent", "by-sha:absent", "allowed:0"] {
+            assert!(
+                stdout.contains(&format!("RESULT:{result}")),
+                "{stdout}\n{stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn worktree_broker_config_query_cannot_read_a_denied_include() {
+        require_sandbox!();
+        let project = TempProject::new("wt-denied-config");
+        project.write_file("allowed.txt", "allowed\n");
+        project.git_init();
+        let secret = TempProject::new("wt-secret-config");
+        secret.write_file(
+            "gitconfig",
+            "[filter \"BROKER_DENIED_CONFIG_531\"]\nsmudge = cat\n",
+        );
+        let home = short_home("wt-denied-config-home");
+        let secret_path = secret.canonical_path();
+        let bin = crate::common::binary_path().display().to_string();
+        // Setup is outside the sandbox because the session denies config writes.
+        assert!(crate::common::git_ok(
+            project.path(),
+            &[
+                "config",
+                "include.path",
+                secret_path.join("gitconfig").to_str().unwrap()
+            ]
+        ));
+        let config = format!(
+            "[sandbox]\nallow_git_worktrees = true\n[allow]\nread = [\"{}\"]\n[deny]\npaths = [\"{}\"]\n",
+            secret_path.display(),
+            secret_path.display()
+        );
+        let (stdout, stderr, _) = run_exec_with_home(
+            &project,
+            home.path(),
+            &config,
+            &format!(
+                "\"{bin}\" worktree add allowed HEAD 2>\"$TMPDIR/broker-error\"; echo RESULT:add:$?\ncat \"$TMPDIR/broker-error\"\n"
+            ),
+        );
+        assert!(
+            !stdout.contains("BROKER_DENIED_CONFIG_531"),
+            "config leaked through broker diagnostics\n{stdout}\n{stderr}"
+        );
+        // Git versions may skip unreadable includes or fail the config query.
+        // Both are safe; neither may report a key read outside the policy.
+        assert!(stdout.contains("RESULT:add:"), "{stdout}\n{stderr}");
+    }
+
     #[test]
     fn a_key_off_session_is_checked_at_its_end() {
         require_sandbox!();
         let project = TempProject::new("wt-offend");
         project.write_file("f.txt", "x\n");
         project.git_init();
-        let home = TempProject::new("wt-offend-home");
+        let home = short_home("wt-offend-home");
         let (root, _) = managed_paths(&project, home.path());
         let (stdout, stderr, _) = run_exec_with_home(
             &project,

@@ -666,6 +666,7 @@ impl Config {
             allow_localhost,
             allow_domains,
             allow_localhost_any,
+            localhost_any_ignored: false,
             allow_env_files,
             no_validate,
             brief,
@@ -933,6 +934,7 @@ impl Resolved {
     pub fn reconcile_proxy_forced(&mut self) -> bool {
         if self.proxy_forced && self.allow_localhost_any {
             self.allow_localhost_any = false;
+            self.localhost_any_ignored = true;
             return true;
         }
         false
@@ -1337,23 +1339,13 @@ impl Resolved {
             } else {
                 // Key on for Copilot and still granted: say why, or the
                 // user reads the key as broken (#277).
-                let why =
-                    if crate::sandbox::keychain_substitute_enabled(agent, self.keychain_substitute)
-                        && agent == crate::agent::Agent::Copilot
-                    {
-                        let all_denied = ["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"]
-                            .iter()
-                            .all(|v| self.deny_env.iter().any(|d| d == v));
-                        if let Some(why) = crate::sandbox::ACCOUNT_MISMATCH.get() {
-                            &format!(" ({why}: kept to avoid switching account)")
-                        } else if all_denied {
-                            " (no token: deny.env strips every token variable)"
-                        } else {
-                            " (no token: gh auth token failed, or gh is not in a trusted bin dir)"
-                        }
-                    } else {
-                        ""
-                    };
+                let why = crate::sandbox::keychain_kept_reason(
+                    agent,
+                    self.keychain_substitute,
+                    &self.deny_env,
+                )
+                .map(|why| format!(" ({why})"))
+                .unwrap_or_default();
                 eprintln!(
                     "{blue}[cplt]{nc}    Keychain:      {yellow}allowed{nc}     {dim}~/Library/Keychains — every item {agent} can unlock{why}{nc}"
                 );
@@ -2741,6 +2733,7 @@ validate = false
                 process_exec: false,
                 write_files: vec![],
                 create_dirs: vec![],
+                via: vec![],
             },
             crate::agent::AgentDir {
                 path: home.join(".pi/agent/bin"),
@@ -2749,6 +2742,7 @@ validate = false
                 process_exec: true,
                 write_files: vec![],
                 create_dirs: vec![],
+                via: vec![],
             },
         ];
 
@@ -2864,6 +2858,7 @@ validate = false
             process_exec: true,
             write_files: vec![],
             create_dirs: vec![],
+            via: vec![],
         }];
 
         let mut r = Config::default()
@@ -2899,6 +2894,7 @@ validate = false
             process_exec: true,
             write_files: vec![],
             create_dirs: vec![],
+            via: vec![],
         };
         let rustup = home.join(".rustup").to_string_lossy().into_owned();
         let copilot_dir = copilot.path.to_string_lossy().into_owned();

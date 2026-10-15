@@ -163,10 +163,10 @@ pub static PROPOSE_BOOLS: &[ProposeBoolRow] = &[
 /// Map a global config key to its repo config location.
 /// Returns None if the key is not valid in repo config.
 pub fn repo_key_target(key_info: &ConfigKeyInfo) -> Option<RepoKeyTarget> {
-    if PROPOSE_BOOLS
-        .iter()
-        .any(|row| row.config_key == (key_info.section, key_info.key))
-    {
+    if PROPOSE_BOOLS.iter().any(|row| {
+        row.config_key == (key_info.section, key_info.key)
+            || row.ladder_key == (key_info.section, key_info.key)
+    }) {
         return Some(RepoKeyTarget::ProposeBool);
     }
     match (key_info.section, key_info.key) {
@@ -174,8 +174,10 @@ pub fn repo_key_target(key_info: &ConfigKeyInfo) -> Option<RepoKeyTarget> {
         ("sandbox", "pass_env") => Some(RepoKeyTarget::ProposeStrArray("pass_env")),
         ("allow", "read") => Some(RepoKeyTarget::ProposeAllow("read")),
         ("allow", "write") => Some(RepoKeyTarget::ProposeAllow("write")),
+        ("allow", "socket") => Some(RepoKeyTarget::ProposeAllow("socket")),
         ("allow", "ports") => Some(RepoKeyTarget::ProposeAllow("ports")),
         ("allow", "localhost") => Some(RepoKeyTarget::ProposeAllow("localhost")),
+        ("allow", "domains") => Some(RepoKeyTarget::ProposeAllow("domains")),
         // Propose proxy
         ("proxy", "allow_private_domains") => {
             Some(RepoKeyTarget::ProposeProxy("allow_private_domains"))
@@ -284,8 +286,20 @@ pub fn set_repo_value_in_doc(
                 .as_table_mut()
                 .ok_or_else(|| ConfigError::Validation("invalid [propose] section".to_string()))?;
 
+            let propose_key = PROPOSE_BOOLS
+                .iter()
+                .find(|row| {
+                    row.config_key == (key_info.section, key_info.key)
+                        || row.ladder_key == (key_info.section, key_info.key)
+                })
+                .map_or(key_info.key, |row| row.key);
+
             if unset {
+                section.remove(propose_key);
                 section.remove(key_info.key);
+                if propose_key == "gh_guard" {
+                    section.remove("gh_proxy");
+                }
             } else {
                 let b: bool = value.parse().map_err(|_| {
                     ConfigError::Validation(format!("expected 'true' or 'false', got '{value}'"))
@@ -298,7 +312,10 @@ pub fn set_repo_value_in_doc(
                         key_info.section, key_info.key
                     )));
                 }
-                section[key_info.key] = toml_edit::value(b);
+                if propose_key == "gh_guard" {
+                    section.remove("gh_proxy");
+                }
+                section[propose_key] = toml_edit::value(b);
             }
         }
         // A top-level `[propose]` array — the same shape as `ProposeAllow`
@@ -384,8 +401,8 @@ pub fn set_repo_value_in_doc(
                         arr.push(i64::from(port));
                     }
                 } else {
-                    // For path-type arrays (read, write), store with ~ for portability
-                    let stored = if array_key == "read" || array_key == "write" {
+                    // For path-type arrays (read, write, socket), store with ~ for portability
+                    let stored = if matches!(array_key, "read" | "write" | "socket") {
                         collapse_tilde(value)
                     } else {
                         value.to_string()
@@ -703,5 +720,36 @@ mod tests {
                 "should not duplicate when legacy absolute entry exists, got: {result}"
             );
         });
+    }
+
+    #[test]
+    fn repo_key_target_supports_ladder_guard_keys_and_allow_socket_domains() {
+        for (dotted, expected_key) in [
+            ("gh_guard.enabled", "gh_guard"),
+            ("git_guard.enabled", "git_push_prevention"),
+            ("sandbox.gh_proxy", "gh_guard"),
+        ] {
+            let info = lookup_key(dotted).unwrap();
+            let target = repo_key_target(info).unwrap();
+            assert_eq!(target, RepoKeyTarget::ProposeBool);
+            let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
+            set_repo_value_in_doc(&mut doc, info, target, "true", false).unwrap();
+            assert!(
+                doc.to_string().contains(&format!("{expected_key} = true")),
+                "expected {expected_key} = true in {doc}"
+            );
+        }
+
+        for (dotted, field, sample) in [
+            ("allow.socket", "socket", "/tmp/test.sock"),
+            ("allow.domains", "domains", "api.example.com"),
+        ] {
+            let info = lookup_key(dotted).unwrap();
+            let target = repo_key_target(info).unwrap();
+            assert_eq!(target, RepoKeyTarget::ProposeAllow(field));
+            let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
+            set_repo_value_in_doc(&mut doc, info, target, sample, false).unwrap();
+            assert!(doc.to_string().contains(sample));
+        }
     }
 }

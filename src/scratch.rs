@@ -47,7 +47,19 @@ const PNPM_SHADOW_BASE: &str = ".cplt-pnpm-shadow";
 #[derive(Debug)]
 pub struct ScratchDir {
     path: PathBuf,
+    device: u64,
+    inode: u64,
+    /// Shared `flock` on [`SESSION_MARKER`] while the session runs, so
+    /// [`ScratchDir::gc_stale`] can tell a live session from an orphan.
+    _lock: Option<std::fs::File>,
 }
+
+/// Lock file marking a scratch dir whose session holds a lock while it runs.
+/// Dirs without it (older cplt, or a failed lock) are left to the 24h sweep.
+const SESSION_MARKER: &str = ".cplt-session";
+
+/// gh token caches cplt writes into the scratch dir (see `sandbox_exec`).
+const GH_TOKEN_FILES: [&str; 2] = [".gh-exec-token", ".gh-token"];
 
 /// A read-only executable copy of pnpm outside its writable store.
 ///
@@ -619,13 +631,27 @@ impl ScratchDir {
         // Create session directory with restricted permissions
         create_secure_dir(&session_dir, "scratch dir")?;
 
+        let (device, inode) = match secure_dir_identity(&session_dir, "scratch dir") {
+            Ok(identity) => identity,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&session_dir);
+                return Err(error);
+            }
+        };
+
         // Validate for SBPL injection before we use it in profile generation
         if let Err(e) = validate_sbpl_path(&session_dir) {
             let _ = std::fs::remove_dir_all(&session_dir);
             return Err(format!("Scratch dir path unsafe: {e}"));
         }
 
-        Ok(ScratchDir { path: session_dir })
+        let lock = lock_session(&session_dir);
+        Ok(ScratchDir {
+            path: session_dir,
+            device,
+            inode,
+            _lock: lock,
+        })
     }
 
     /// The directory every scratch dir is created under, whether or not one
@@ -682,6 +708,17 @@ fn gc_stale_session_dirs(base: &Path) {
             continue;
         }
 
+        // A session that crashed or was killed never ran `Drop`, so its gh
+        // token cache would sit on disk until the 24h sweep. Remove it now
+        // when the dir is marked and its lock is free. Unmarked dirs may be
+        // live sessions of an older cplt: leave them alone.
+        let held = session_lock_held(&path);
+        if held == Some(false) {
+            for file in GH_TOKEN_FILES {
+                let _ = std::fs::remove_file(path.join(file));
+            }
+        }
+
         // Check age via directory modification time
         let Ok(modified) = metadata.modified() else {
             continue;
@@ -689,6 +726,7 @@ fn gc_stale_session_dirs(base: &Path) {
 
         if let Ok(age) = now.duration_since(modified)
             && age > STALE_AGE
+            && held != Some(true)
         {
             use std::os::unix::fs::{MetadataExt, PermissionsExt};
             if metadata.uid() != unsafe { libc::getuid() } {
@@ -703,6 +741,47 @@ fn gc_stale_session_dirs(base: &Path) {
             }
         }
     }
+}
+
+/// Create [`SESSION_MARKER`] in `dir` and hold a shared lock on it. On
+/// failure the marker is removed, so launches never treat the dir as orphaned.
+fn lock_session(dir: &Path) -> Option<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: `f` owns a valid descriptor; the lock lives as long as it.
+    lock_session_with(dir, |f| unsafe {
+        libc::flock(f.as_raw_fd(), libc::LOCK_SH) == 0
+    })
+}
+
+fn lock_session_with(dir: &Path, flock: impl Fn(&std::fs::File) -> bool) -> Option<std::fs::File> {
+    let marker = dir.join(SESSION_MARKER);
+    let locked = std::fs::File::create(&marker).ok().filter(|f| flock(f));
+    if locked.is_none() {
+        let _ = std::fs::remove_file(&marker);
+        ui::warn(
+            "Warning: cannot lock the scratch dir; stale gh token caches are left to the 24-hour cleanup.",
+        );
+    }
+    locked
+}
+
+/// `None`: the dir has no session marker. `Some(true)`: a running cplt holds
+/// it. `Some(false)`: marked and unlocked, so its session is gone.
+fn session_lock_held(dir: &Path) -> Option<bool> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    // The agent can write the scratch dir: never follow a symlink, and never
+    // block on a FIFO it left in place of the marker.
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(dir.join(SESSION_MARKER))
+        .ok()?;
+    if !f.metadata().ok()?.is_file() {
+        return None;
+    }
+    // SAFETY: `f` owns a valid descriptor; the lock is released when it drops.
+    Some(unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0)
 }
 
 /// A short, random, per-session macOS directory for Playwright control sockets.
@@ -776,14 +855,7 @@ impl Drop for PlaywrightSocketDir {
 
 impl Drop for ScratchDir {
     fn drop(&mut self) {
-        if self.path.exists()
-            && let Err(e) = std::fs::remove_dir_all(&self.path)
-        {
-            ui::warn(&format!(
-                "Warning: cannot cleanup scratch dir {}: {e}",
-                self.path.display()
-            ));
-        }
+        remove_owned_dir(&self.path, self.device, self.inode, "scratch dir");
     }
 }
 
@@ -810,8 +882,50 @@ fn is_session_id(name: &str) -> bool {
 /// - Is a directory (not a symlink to one)
 /// - Owned by current user
 /// - Permissions are 0700 (set if not)
+fn open_dir_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let open_rdonly = || {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+    };
+    match open_rdonly() {
+        Ok(file) => Ok(file),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            #[cfg(target_os = "macos")]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+                    .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+                let rc = unsafe {
+                    libc::fchmodat(
+                        libc::AT_FDCWD,
+                        c_path.as_ptr(),
+                        0o700,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                };
+                if rc == 0 {
+                    return open_rdonly();
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).is_ok() {
+                    return open_rdonly();
+                }
+            }
+            Err(e)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 pub(crate) fn validate_dir_safety(path: &Path, label: &str) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
+    use std::os::unix::io::AsRawFd;
 
     let metadata = path
         .symlink_metadata()
@@ -840,12 +954,31 @@ pub(crate) fn validate_dir_safety(path: &Path, label: &str) -> Result<(), String
         ));
     }
 
-    // Ensure permissions are 0700
-    let mode = metadata.mode() & 0o777;
-    if mode != 0o700 {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-            .map_err(|e| format!("Cannot set permissions on {}: {e}", path.display()))?;
+    let dir_file =
+        open_dir_nofollow(path).map_err(|e| format!("Cannot open {}: {e}", path.display()))?;
+    let fd_meta = dir_file
+        .metadata()
+        .map_err(|e| format!("Cannot fstat {}: {e}", path.display()))?;
+    if fd_meta.dev() != metadata.dev() || fd_meta.ino() != metadata.ino() {
+        return Err(format!(
+            "{label} {} was replaced during validation",
+            path.display()
+        ));
+    }
+    if fd_meta.uid() != my_uid {
+        return Err(format!(
+            "{label} {} is owned by uid {}, expected {}. cplt refuses to use it",
+            path.display(),
+            fd_meta.uid(),
+            my_uid
+        ));
+    }
+
+    // Ensure permissions are 0700 on the verified fd to avoid path TOCTOU
+    let mode = fd_meta.mode() & 0o777;
+    if mode != 0o700 && unsafe { libc::fchmod(dir_file.as_raw_fd(), 0o700) } != 0 {
+        let e = std::io::Error::last_os_error();
+        return Err(format!("Cannot set permissions on {}: {e}", path.display()));
     }
 
     Ok(())
@@ -872,6 +1005,7 @@ fn secure_dir_identity(path: &Path, label: &str) -> Result<(u64, u64), String> {
 
 fn remove_owned_dir(path: &Path, expected_device: u64, expected_inode: u64, label: &str) {
     use std::os::unix::fs::MetadataExt;
+    use std::os::unix::io::AsRawFd;
 
     let metadata = match path.symlink_metadata() {
         Ok(metadata) => metadata,
@@ -895,14 +1029,32 @@ fn remove_owned_dir(path: &Path, expected_device: u64, expected_inode: u64, labe
         ));
         return;
     }
-    use std::os::unix::fs::PermissionsExt;
-    if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)) {
+    let Ok(dir_file) = open_dir_nofollow(path) else {
+        ui::warn(&format!(
+            "Warning: cannot open {label} {} during cleanup",
+            path.display()
+        ));
+        return;
+    };
+    let Ok(fd_meta) = dir_file.metadata() else {
+        return;
+    };
+    if fd_meta.dev() != expected_device || fd_meta.ino() != expected_inode {
+        ui::warn(&format!(
+            "Warning: refusing to cleanup replaced {label} {}",
+            path.display()
+        ));
+        return;
+    }
+    if unsafe { libc::fchmod(dir_file.as_raw_fd(), 0o700) } != 0 {
+        let error = std::io::Error::last_os_error();
         ui::warn(&format!(
             "Warning: cannot make {label} {} removable during cleanup: {error}",
             path.display()
         ));
         return;
     }
+    drop(dir_file);
     if let Err(error) = std::fs::remove_dir_all(path) {
         ui::warn(&format!(
             "Warning: cannot cleanup {label} {}: {error}",
@@ -965,6 +1117,89 @@ mod tests {
 
         assert!(error.contains("resolves through a symlink"));
         assert!(!target.path().join("package-manager-store").exists());
+    }
+
+    /// A crashed session's gh token cache goes at the next start. A live
+    /// session's stays, and so does an unmarked dir's (an older cplt that
+    /// takes no lock may still be using it). `Drop` takes the rest.
+    #[test]
+    fn gc_removes_orphaned_gh_token_caches_only() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let live = ScratchDir::create(&home).unwrap();
+        let new_dir = || {
+            let d = ScratchDir::base(&home).join(generate_session_id().unwrap());
+            std::fs::create_dir(&d).unwrap();
+            d
+        };
+        // Crashed session: marked, nobody holds the lock.
+        let orphan = new_dir();
+        std::fs::write(orphan.join(SESSION_MARKER), "").unwrap();
+        // Older cplt (or failed lock): no marker.
+        let unmarked = new_dir();
+        for dir in [live.path(), orphan.as_path(), unmarked.as_path()] {
+            for f in GH_TOKEN_FILES {
+                std::fs::write(dir.join(f), "x").unwrap();
+            }
+        }
+        ScratchDir::gc_stale(&home);
+        for f in GH_TOKEN_FILES {
+            assert!(live.path().join(f).exists(), "live {f} kept");
+            assert!(unmarked.join(f).exists(), "unmarked {f} kept");
+            assert!(!orphan.join(f).exists(), "orphan {f} removed");
+        }
+        let live_path = live.path().to_path_buf();
+        drop(live);
+        assert!(!live_path.exists(), "Drop removes the session dir");
+    }
+
+    /// A failed lock leaves no marker, so later launches skip the dir.
+    #[test]
+    fn failed_session_lock_leaves_no_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(lock_session_with(dir.path(), |_| false).is_none());
+        assert!(!dir.path().join(SESSION_MARKER).exists());
+        assert_eq!(session_lock_held(dir.path()), None);
+        let ok = tempfile::tempdir().unwrap();
+        let _lock = lock_session(ok.path()).unwrap();
+        assert_eq!(session_lock_held(ok.path()), Some(true));
+    }
+
+    /// A FIFO or symlink planted as the marker is ignored, without blocking.
+    #[test]
+    fn planted_marker_is_ignored() {
+        let fifo = tempfile::tempdir().unwrap();
+        let path = std::ffi::CString::new(
+            fifo.path()
+                .join(SESSION_MARKER)
+                .as_os_str()
+                .as_encoded_bytes(),
+        )
+        .unwrap();
+        // SAFETY: valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        assert_eq!(session_lock_held(fifo.path()), None);
+
+        let link = tempfile::tempdir().unwrap();
+        let target = link.path().join("target");
+        std::fs::write(&target, "").unwrap();
+        std::os::unix::fs::symlink(&target, link.path().join(SESSION_MARKER)).unwrap();
+        assert_eq!(session_lock_held(link.path()), None);
+    }
+
+    /// The 24h sweep spares a dir whose session still holds the lock.
+    #[test]
+    fn gc_sweep_skips_locked_old_dirs() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let live = ScratchDir::create(&home).unwrap();
+        let old = std::time::SystemTime::now() - STALE_AGE - Duration::from_secs(60);
+        std::fs::File::open(live.path())
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        ScratchDir::gc_stale(&home);
+        assert!(live.path().exists());
     }
 
     #[test]
@@ -1449,5 +1684,50 @@ mod tests {
         assert!(guarded_path.is_symlink());
         assert!(original_path.is_dir());
         assert!(unrelated.is_dir());
+    }
+
+    #[test]
+    fn scratch_dir_cleanup_refuses_replaced_path() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let scratch = ScratchDir::create(&home).unwrap();
+        let path = scratch.path().to_path_buf();
+        let moved = home.join("moved-scratch");
+        let victim = home.join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::write(victim.join("keep.txt"), "keep").unwrap();
+
+        std::fs::rename(&path, &moved).unwrap();
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+
+        drop(scratch);
+
+        assert!(path.is_symlink());
+        assert!(victim.join("keep.txt").exists());
+    }
+
+    #[test]
+    fn mode_0300_dir_is_repaired_and_cleaned_up() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let dir = home.join("no-read-dir");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+
+        validate_dir_safety(&dir, "test dir").expect("mode 0300 dir should be repaired to 0700");
+        let mode = dir.symlink_metadata().unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+
+        let scratch = ScratchDir::create(&home).unwrap();
+        let scratch_path = scratch.path().to_path_buf();
+        std::fs::write(scratch_path.join("file.txt"), "data").unwrap();
+        std::fs::set_permissions(&scratch_path, std::fs::Permissions::from_mode(0o300)).unwrap();
+        drop(scratch);
+        assert!(
+            !scratch_path.exists(),
+            "mode 0300 scratch dir must still be removed on drop"
+        );
     }
 }

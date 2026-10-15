@@ -12,7 +12,7 @@
 //! answer from fewer inputs than the launch uses (#447). `main.rs` gathers
 //! those inputs and prints; this module decides.
 
-use crate::agent::{Agent, PACKAGE_REGISTRY_DOMAINS};
+use crate::agent::{Agent, KeychainSubstitute, PACKAGE_REGISTRY_DOMAINS};
 use crate::proxy::NetPolicy;
 use crate::sandbox::LandlockPolicy;
 use std::path::{Path, PathBuf};
@@ -355,12 +355,16 @@ impl Bubblewrap {
 /// directory under `~/.cplt-pnpm-shadow` and grants it read+execute; doctor
 /// will not copy files for a diagnosis), and, if the scratch dir cannot be
 /// created here, the scratch bind and file masks.
+///
+/// `grants` come from [`crate::sandbox::launch_grants`], validated once by the
+/// caller, which reports a failure as its own finding (#602).
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn bubblewrap_state(
     use_bubblewrap: Option<bool>,
     scratch: bool,
     config: &crate::sandbox::SandboxConfig,
+    grants: &[(PathBuf, PathBuf)],
 ) -> Bubblewrap {
     use crate::sandbox::bubblewrap_probe;
     if use_bubblewrap == Some(false) {
@@ -377,7 +381,7 @@ pub fn bubblewrap_state(
             .or_else(|| probe_scratch.as_ref().and_then(ProbeScratch::path)),
         ..config.clone()
     };
-    match bubblewrap_probe::test_launch(&probed) {
+    match bubblewrap_probe::test_launch(&probed, grants) {
         Ok(()) => Bubblewrap::Usable(path),
         Err(reason) => Bubblewrap::Unusable {
             path,
@@ -432,6 +436,7 @@ pub fn bubblewrap_state(
     _use_bubblewrap: Option<bool>,
     _scratch: bool,
     _config: &crate::sandbox::SandboxConfig,
+    _grants: &[(PathBuf, PathBuf)],
 ) -> Bubblewrap {
     Bubblewrap::NotApplicable
 }
@@ -481,15 +486,57 @@ pub fn bubblewrap_finding(state: &Bubblewrap, use_bubblewrap: Option<bool>) -> O
                     "bubblewrap is installed but its probe fails ({reason}): the launch falls \
                      back to Landlock + seccomp only."
                 ),
-                userns.then(|| {
-                    "enable user namespaces (sysctl kernel.unprivileged_userns_clone=1; on \
-                     Ubuntu 23.10+ kernel.apparmor_restrict_unprivileged_userns blocks them)"
-                        .to_string()
-                }),
+                userns.then(|| USERNS_HINT.to_string()),
             ))
         }
         _ => None,
     }
+}
+
+/// How to enable the user namespaces bubblewrap needs; also in the OpenCode v2 refusal.
+pub const USERNS_HINT: &str = "enable user namespaces (sysctl kernel.unprivileged_userns_clone=1; on \
+     Ubuntu 23.10+ kernel.apparmor_restrict_unprivileged_userns blocks them)";
+
+// ── Rule: global-only keys in .cplt.toml ───────────────────────
+
+/// Tables a `.cplt.toml` cannot carry. Its schema has only `[deny]` and
+/// `[propose]`, so the loader files these under unknown keys and the launch
+/// ignores them (#484), with a warning that blames a newer cplt.
+const GLOBAL_ONLY_TABLES: &[&str] = &["sandbox", "proxy", "gh_guard", "git_guard"];
+
+/// `[sandbox]`, `[proxy]`, `[gh_guard]` or `[git_guard]` keys in `.cplt.toml`:
+/// the launch ignores every one, so the setting the author wrote is not in
+/// force. Key names only. `label` names the file, for a named repository's.
+#[must_use]
+pub fn global_only_repo_keys_finding(
+    repo: &crate::repo_config::RepoConfig,
+    label: &str,
+) -> Option<Finding> {
+    let keys: Vec<String> = repo
+        .unknown
+        .iter()
+        .filter(|(table, _)| GLOBAL_ONLY_TABLES.contains(&table.as_str()))
+        .flat_map(|(table, value)| match value.as_table() {
+            Some(t) if !t.is_empty() => t.keys().map(|k| format!("{table}.{k}")).collect(),
+            _ => vec![table.clone()],
+        })
+        .collect();
+    if keys.is_empty() {
+        return None;
+    }
+    Some(Finding::warning(
+        format!(
+            "{label} sets {}, which a repository cannot set: the launch ignores {}.",
+            keys.join(", "),
+            if keys.len() == 1 { "it" } else { "them" }
+        ),
+        Some(
+            "set it in your own config (`cplt config set <key> <value>`, or add --local for \
+             this repository only); a permission the repository needs goes under [propose] \
+             (`cplt config set --repo <key> true`)"
+                .to_string(),
+        ),
+    ))
 }
 
 // ── Rule: a project on a Windows drive under WSL ───────────────
@@ -676,6 +723,156 @@ pub fn pts_grant_finding(
     ))
 }
 
+// ── Mid-session degradations ──────────────────────────────────
+
+/// `scratch_dir` off. TMPDIR then stays the system temp dir, where the
+/// sandbox denies exec unless `allow_tmp_exec`, and the git and gh guard
+/// shims are never installed: they live in the scratch dir
+/// (`redirect_to_guard_shim` in `main.rs`).
+#[must_use]
+pub fn scratch_off_finding(scratch_dir: bool, guards_on: bool, tmp_exec: bool) -> Option<Finding> {
+    if scratch_dir {
+        return None;
+    }
+    let mut lost = Vec::new();
+    if !tmp_exec {
+        lost.push(
+            "TMPDIR stays the system temp dir, where the sandbox denies exec, so `go test`, \
+             node-gyp and other builds that run binaries from it fail with `Operation not \
+             permitted`",
+        );
+    }
+    if guards_on {
+        lost.push(
+            "the git and gh guards are not installed, so the guard verdicts above do not apply",
+        );
+    }
+    if lost.is_empty() {
+        return None;
+    }
+    Some(Finding::warning(
+        format!("scratch_dir is off: {}.", lost.join("; ")),
+        Some("cplt config set sandbox.scratch_dir true (or drop --no-scratch-dir)".to_string()),
+    ))
+}
+
+/// `quiet` on macOS, where the git guard strips `-u` from a push because
+/// `.git/config` is read-only: the parent records the upstream after the
+/// session only when not quiet (`cplt::upstream::apply` in `main.rs`).
+#[must_use]
+pub fn quiet_upstream_finding(
+    macos: bool,
+    quiet: bool,
+    git_guard_on: bool,
+    scratch_dir: bool,
+) -> Option<Finding> {
+    (macos && quiet && git_guard_on && scratch_dir).then(|| {
+        Finding::warning(
+            "quiet is on, so cplt does not record the upstream after `git push -u` in the \
+             sandbox (.git/config is read-only there): later pushes need the branch named.",
+            Some(
+                "cplt config set sandbox.quiet false, or run `git branch -u origin/<branch>` \
+                 outside the sandbox"
+                    .to_string(),
+            ),
+        )
+    })
+}
+
+/// Whether `version` (as `--version` printed it, e.g. `1.0.94-5`) is at
+/// least `min`. Unparseable is false.
+fn version_at_least(version: &str, min: (u32, u32, u32)) -> bool {
+    let core = version.trim().trim_start_matches('v');
+    let mut parts = core
+        .split(|c: char| !c.is_ascii_digit())
+        .map(str::parse::<u32>);
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(Ok(a)), Some(Ok(b)), Some(Ok(c))) => (a, b, c) >= min,
+        _ => false,
+    }
+}
+
+/// `sandbox.enabled` in Copilot's `~/.copilot/settings.json`. Off by
+/// default in Copilot, and off here when the file is missing or unreadable.
+#[must_use]
+pub fn copilot_own_sandbox_enabled(home: &Path) -> bool {
+    crate::agent::read_small_regular_file(&home.join(".copilot/settings.json"))
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| {
+            v.pointer("/sandbox/enabled")
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+
+/// Copilot CLI 1.0.83+ has a command sandbox of its own, which cannot start
+/// inside cplt's. cplt turns it off for the session
+/// (`copilot_sandbox_support_overridden`), unless the user passes the
+/// override variable through. Only reported when the user turned it on.
+#[must_use]
+pub fn copilot_own_sandbox_finding(
+    agent: Agent,
+    version: Option<&str>,
+    enabled: bool,
+    handed_back: bool,
+) -> Option<Finding> {
+    if agent != Agent::Copilot
+        || !enabled
+        || !version.is_some_and(|v| version_at_least(v, (1, 0, 83)))
+    {
+        return None;
+    }
+    Some(if handed_back {
+        Finding::warning(
+            "COPILOT_CLI_SANDBOX_SUPPORT_OVERRIDE is passed through, so Copilot tries to start \
+             its own command sandbox inside cplt's, where it cannot: seccomp denies the \
+             namespaces it needs on Linux, and macOS refuses a nested sandbox-exec.",
+            Some("drop COPILOT_CLI_SANDBOX_SUPPORT_OVERRIDE from sandbox.pass_env".to_string()),
+        )
+    } else {
+        Finding::warning(
+            "Copilot's own command sandbox is on in ~/.copilot/settings.json, but cplt turns \
+             it off for the session because it cannot start inside cplt's: shell commands run \
+             with cplt as the only boundary.",
+            Some(
+                "nothing to change; see known-impacts.md, \"Copilot CLI's own command sandbox\""
+                    .to_string(),
+            ),
+        )
+    })
+}
+
+/// Linux: native Secret Service access depends on the sandbox backend.
+/// Warn when a session bus makes a keyring login plausible and no token
+/// reaches Copilot another way; this does not check the stored login.
+#[must_use]
+pub fn linux_keyring_finding(
+    agent: Agent,
+    linux: bool,
+    session_bus: bool,
+    env_token: bool,
+    stored_token_handover: bool,
+) -> Option<Finding> {
+    (linux && agent == Agent::Copilot && session_bus && !env_token && !stored_token_handover).then(
+        || {
+            Finding::warning(
+                "Native keyring access is not guaranteed in the sandbox; token handover is recommended. \
+             Landlock below ABI v9 does not block pathname bus connections; active bubblewrap masks selected endpoints. The stored login was not checked.",
+                Some(
+                    "export a valid COPILOT_GITHUB_TOKEN, or clear COPILOT_GITHUB_TOKEN, GH_TOKEN \
+                 and GITHUB_TOKEN in a subshell and run `gh auth login --hostname github.com \
+                 --web` on the host (if ~/.copilot/config.json has a stored Copilot login, also \
+                 run `copilot logout` on the host so Copilot falls back to gh). The one-shot \
+                 cache needs gh_guard.enabled, scratch_dir and gh_guard.block_auth_token enabled, \
+                 with GH_TOKEN not denied; alternatively enable gh_guard.inject_token with \
+                 --force and leave a token variable permitted"
+                        .to_string(),
+                ),
+            )
+        },
+    )
+}
+
 // ── Rendering ──────────────────────────────────────────────────
 
 /// The findings block plus the summary line. `ok` is the one-line "what is
@@ -748,6 +945,137 @@ pub fn render(findings: &[Finding], ok: &[String], verbose_hint: bool, home: &Pa
     };
     let _ = writeln!(out, "{verdict}{hint}");
     tilde_in_text(&out, home)
+}
+
+/// The effective settings that most often explain a report, on one line.
+/// `quiet` is passed separately: doctor forces the resolved one on.
+#[must_use]
+pub fn settings_line(r: &crate::config::Resolved, agent: Agent, quiet: bool) -> String {
+    let on = |b: bool| if b { "on" } else { "off" };
+    let guard = |enabled: bool, mode: crate::config::EnforcementMode| {
+        if enabled {
+            mode.to_string()
+        } else {
+            "off".to_string()
+        }
+    };
+    let cache = if r.allow_cache_exec_any {
+        "any".to_string()
+    } else if r.allow_cache_exec.is_empty() {
+        "none".to_string()
+    } else {
+        r.allow_cache_exec.join(",")
+    };
+    format!(
+        "keychain_substitute {} ({}) · quiet {} · git_guard {} · gh_guard {} · \
+         allow_cache_exec {cache} · scratch {}",
+        on(crate::sandbox::keychain_substitute_enabled(
+            agent,
+            r.keychain_substitute
+        )),
+        if r.keychain_substitute.is_some() {
+            "config"
+        } else {
+            "default"
+        },
+        on(quiet),
+        guard(r.git_guard.enabled, r.git_guard.mode),
+        guard(r.gh_guard.enabled, r.gh_guard.mode),
+        on(r.scratch_dir),
+    )
+}
+
+/// Closes the header: what to paste, and what not to.
+pub const PASTE_HINT: &str = "Paste this default output into an issue: paths under your home show \
+     as ~/… and tokens by name only; check any other path before you post. `--verbose` adds \
+     absolute paths and is not paste-safe.";
+
+/// The launch's Keychain/token decision, as doctor reports it.
+pub struct AuthDecision<'a> {
+    pub agent: Agent,
+    /// What [`crate::sandbox::keychain_substitute`] returned for this launch.
+    pub substitute: Option<&'a KeychainSubstitute>,
+    /// `sandbox.keychain_substitute` as configured; `None` is the default.
+    pub setting: Option<bool>,
+    /// Why the grant stayed, when the launch would say so.
+    pub kept_reason: Option<&'a str>,
+    pub macos: bool,
+    /// The first of the agent's token variables exported and not in `deny.env`.
+    pub env_token: Option<&'a str>,
+    /// Trusted gh returned a stored github.com token; validity is not checked.
+    pub gh_login: bool,
+    /// Copilot's keytar module is installed. Whether it holds a login is not
+    /// checked; kept so a Linux keytar user gets no false blocking finding.
+    pub other_login: bool,
+}
+
+/// The Keychain grant (macOS agents that use the Keychain only), the
+/// `auth:` line, and a finding when the source can fail with no fallback.
+/// Token names only, never values.
+#[must_use]
+pub fn auth_report(d: &AuthDecision<'_>, home: &Path) -> (Option<String>, String, Option<Finding>) {
+    let keychain =
+        (d.macos && d.agent.needs_keychain()).then(|| match (d.substitute, d.kept_reason) {
+            (Some(_), _) => "denied".to_string(),
+            (None, Some(why)) => format!("granted ({why})"),
+            (None, None) => "granted".to_string(),
+        });
+    let name = d.agent.display_name();
+    let auth = match d.substitute {
+        Some(KeychainSubstitute::EnvVar(v)) => format!("{v} (exported, used as-is)"),
+        Some(KeychainSubstitute::GhToken { var, .. }) => {
+            format!("`gh auth token` (passed as {var})")
+        }
+        Some(KeychainSubstitute::File(p)) => format!("{} (token file)", tilde(p, home)),
+        None => match d.env_token {
+            Some(v) => format!("{v} (exported)"),
+            None if d.macos && d.agent.needs_keychain() => {
+                format!("left to {name}: Keychain access granted, stored login not checked")
+            }
+            None if d.agent == Agent::Copilot && d.gh_login => {
+                "stored gh token for github.com found (validity and handover not checked)"
+                    .to_string()
+            }
+            None if d.agent == Agent::Copilot && d.other_login => {
+                "not checked (Copilot's keytar module is installed)".to_string()
+            }
+            None if d.agent == Agent::Copilot => "none".to_string(),
+            None if d.agent == Agent::Shell => "none (the shell needs no login)".to_string(),
+            None => format!("left to {name}: cplt hands over no token"),
+        },
+    };
+    let finding = match d.substitute {
+        Some(KeychainSubstitute::EnvVar(v)) if d.agent == Agent::Copilot => Some(Finding::warning(
+            format!(
+                "{v} is exported, so Copilot gets it as-is instead of the Keychain: cplt \
+                 checks no account and has no fallback, so a stale token means a sign-in \
+                 failure."
+            ),
+            Some(
+                "clear COPILOT_GITHUB_TOKEN, GH_TOKEN and GITHUB_TOKEN in a subshell, then run \
+                 `gh auth login --hostname github.com --web` on the host; to test native login, \
+                 set both sandbox.keychain_substitute=false and gh_guard.inject_token=false \
+                 and restore their actual prior values afterwards"
+                    .to_string(),
+            ),
+        )),
+        None if d.agent == Agent::Copilot
+            && d.env_token.is_none()
+            && !d.gh_login
+            && !d.other_login
+            && !d.macos =>
+        {
+            Some(Finding::blocking(
+                "No credential source discovered for Copilot: no stored gh token for github.com \
+                 was retrieved and none of COPILOT_GITHUB_TOKEN, GH_TOKEN, GITHUB_TOKEN \
+                 reaches the sandbox.",
+                "clear COPILOT_GITHUB_TOKEN, GH_TOKEN and GITHUB_TOKEN in a subshell, then run \
+                 `gh auth login --hostname github.com --web` on the host",
+            ))
+        }
+        _ => None,
+    };
+    (keychain, auth, finding)
 }
 
 /// Exit non-zero iff something is blocking — the contract the old doctor had
@@ -1244,5 +1572,273 @@ mod tests {
         let f = agent_hosts_finding(Agent::Shell, &net(&defaults, true, &blocked))
             .expect("blocked registry under an allowlist");
         assert!(f.message.contains("pypi.org (BLOCKED)"), "{}", f.message);
+    }
+
+    fn decision(agent: Agent, macos: bool) -> AuthDecision<'static> {
+        AuthDecision {
+            agent,
+            substitute: None,
+            setting: None,
+            kept_reason: None,
+            macos,
+            env_token: None,
+            gh_login: false,
+            other_login: false,
+        }
+    }
+
+    #[test]
+    fn auth_exported_copilot_token_warns_and_names_only() {
+        let sub = KeychainSubstitute::EnvVar("GH_TOKEN");
+        let d = AuthDecision {
+            substitute: Some(&sub),
+            env_token: Some("GH_TOKEN"),
+            ..decision(Agent::Copilot, true)
+        };
+        let (kc, auth, f) = auth_report(&d, Path::new("/Users/u"));
+        assert_eq!(kc.as_deref(), Some("denied"));
+        assert_eq!(auth, "GH_TOKEN (exported, used as-is)");
+        let f = f.expect("an exported token used as-is is a warning");
+        assert_eq!(f.level, Level::Warning);
+        assert!(
+            f.fix
+                .unwrap()
+                .contains("gh auth login --hostname github.com --web")
+        );
+    }
+
+    #[test]
+    fn auth_gh_token_never_prints_the_value() {
+        let sub = KeychainSubstitute::GhToken {
+            var: "GH_TOKEN",
+            token: crate::agent::SecretToken::new("gho_secret".into()),
+        };
+        let d = AuthDecision {
+            substitute: Some(&sub),
+            ..decision(Agent::Copilot, true)
+        };
+        let (kc, auth, f) = auth_report(&d, Path::new("/Users/u"));
+        assert_eq!(kc.as_deref(), Some("denied"));
+        assert_eq!(auth, "`gh auth token` (passed as GH_TOKEN)");
+        assert!(!auth.contains("gho_secret"));
+        assert!(f.is_none());
+    }
+
+    #[test]
+    fn auth_mismatch_reason_shows_on_the_grant() {
+        let d = AuthDecision {
+            kept_reason: Some("gh is a, Copilot is b: kept to avoid switching account"),
+            ..decision(Agent::Copilot, true)
+        };
+        let (kc, _, _) = auth_report(&d, Path::new("/Users/u"));
+        assert_eq!(
+            kc.as_deref(),
+            Some("granted (gh is a, Copilot is b: kept to avoid switching account)")
+        );
+    }
+
+    #[test]
+    fn auth_claude_never_says_gh() {
+        for macos in [true, false] {
+            let d = AuthDecision {
+                gh_login: true,
+                ..decision(Agent::Claude, macos)
+            };
+            let (kc, auth, f) = auth_report(&d, Path::new("/Users/u"));
+            assert!(!auth.contains("gh"), "{auth}");
+            assert_eq!(kc.is_some(), macos);
+            assert!(f.is_none());
+        }
+        let sub = KeychainSubstitute::EnvVar("CLAUDE_CODE_OAUTH_TOKEN");
+        let d = AuthDecision {
+            substitute: Some(&sub),
+            ..decision(Agent::Claude, true)
+        };
+        let (kc, auth, f) = auth_report(&d, Path::new("/Users/u"));
+        assert_eq!(kc.as_deref(), Some("denied"));
+        assert_eq!(auth, "CLAUDE_CODE_OAUTH_TOKEN (exported, used as-is)");
+        assert!(f.is_none(), "the gh advice is Copilot's");
+    }
+
+    #[test]
+    fn keychain_grant_does_not_claim_a_stored_login() {
+        for agent in [Agent::Copilot, Agent::Claude] {
+            let (kc, auth, finding) = auth_report(&decision(agent, true), Path::new("/fixture"));
+            assert_eq!(kc.as_deref(), Some("granted"));
+            assert!(auth.contains("stored login not checked"), "{auth}");
+            assert!(finding.is_none());
+        }
+    }
+
+    #[test]
+    fn auth_copilot_on_linux_without_login_blocks() {
+        let (kc, auth, f) = auth_report(&decision(Agent::Copilot, false), Path::new("/home/u"));
+        assert!(kc.is_none());
+        assert_eq!(auth, "none");
+        let finding = f.unwrap();
+        assert_eq!(finding.level, Level::Blocking);
+        let fix = finding.fix.unwrap();
+        assert!(fix.contains("gh auth login --hostname github.com --web"));
+        assert!(fix.contains("COPILOT_GITHUB_TOKEN, GH_TOKEN and GITHUB_TOKEN"));
+        let d = AuthDecision {
+            gh_login: true,
+            ..decision(Agent::Copilot, false)
+        };
+        let (_, auth, f) = auth_report(&d, Path::new("/home/u"));
+        assert_eq!(
+            auth,
+            "stored gh token for github.com found (validity and handover not checked)"
+        );
+        assert!(f.is_none());
+        let (_, auth, _) = auth_report(&decision(Agent::Shell, false), Path::new("/home/u"));
+        assert_eq!(auth, "none (the shell needs no login)");
+    }
+
+    #[test]
+    fn scratch_off_names_what_is_lost() {
+        assert!(scratch_off_finding(true, true, false).is_none());
+        let f = scratch_off_finding(false, true, false).unwrap();
+        assert!(f.message.contains("denies exec"), "{}", f.message);
+        assert!(
+            f.message.contains("guards are not installed"),
+            "{}",
+            f.message
+        );
+        let f = scratch_off_finding(false, false, false).unwrap();
+        assert!(!f.message.contains("guards"), "{}", f.message);
+        let f = scratch_off_finding(false, true, true).unwrap();
+        assert!(!f.message.contains("denies exec"), "{}", f.message);
+        assert!(scratch_off_finding(false, false, true).is_none());
+    }
+
+    #[test]
+    fn quiet_upstream_only_where_the_upstream_would_be_recorded() {
+        assert!(quiet_upstream_finding(true, true, true, true).is_some());
+        assert!(
+            quiet_upstream_finding(false, true, true, true).is_none(),
+            "Linux keeps -u"
+        );
+        assert!(quiet_upstream_finding(true, false, true, true).is_none());
+        assert!(quiet_upstream_finding(true, true, false, true).is_none());
+        assert!(quiet_upstream_finding(true, true, true, false).is_none());
+    }
+
+    #[test]
+    fn version_compare() {
+        assert!(version_at_least("1.0.83", (1, 0, 83)));
+        assert!(version_at_least("1.0.94-5", (1, 0, 83)));
+        assert!(version_at_least("v1.1.0", (1, 0, 83)));
+        assert!(!version_at_least("1.0.82", (1, 0, 83)));
+        assert!(!version_at_least("0.9.100", (1, 0, 83)));
+        assert!(!version_at_least("unknown", (1, 0, 83)));
+    }
+
+    #[test]
+    fn copilot_own_sandbox() {
+        let new = Some("1.0.94");
+        assert!(copilot_own_sandbox_finding(Agent::Copilot, new, false, false).is_none());
+        assert!(copilot_own_sandbox_finding(Agent::Copilot, Some("1.0.82"), true, false).is_none());
+        assert!(copilot_own_sandbox_finding(Agent::Copilot, None, true, false).is_none());
+        assert!(copilot_own_sandbox_finding(Agent::Claude, new, true, false).is_none());
+        let off = copilot_own_sandbox_finding(Agent::Copilot, new, true, false).unwrap();
+        assert!(off.message.contains("turns it off"), "{}", off.message);
+        let back = copilot_own_sandbox_finding(Agent::Copilot, new, true, true).unwrap();
+        assert!(back.message.contains("passed through"), "{}", back.message);
+    }
+
+    #[test]
+    fn copilot_own_sandbox_setting_is_read() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(!copilot_own_sandbox_enabled(home.path()));
+        std::fs::create_dir_all(home.path().join(".copilot")).unwrap();
+        let file = home.path().join(".copilot/settings.json");
+        std::fs::write(&file, r#"{"sandbox":{"enabled":true}}"#).unwrap();
+        assert!(copilot_own_sandbox_enabled(home.path()));
+        std::fs::write(&file, r#"{"sandbox":{"enabled":false}}"#).unwrap();
+        assert!(!copilot_own_sandbox_enabled(home.path()));
+    }
+
+    #[test]
+    fn linux_keyring_only_when_no_token_reaches_copilot() {
+        let finding = linux_keyring_finding(Agent::Copilot, true, true, false, false).unwrap();
+        assert_eq!(finding.level, Level::Warning);
+        assert!(
+            finding
+                .message
+                .contains("Landlock below ABI v9 does not block pathname bus connections")
+        );
+        assert!(
+            finding
+                .message
+                .contains("active bubblewrap masks selected endpoints")
+        );
+        let fix = finding.fix.unwrap();
+        assert!(fix.contains("gh auth login --hostname github.com --web"));
+        assert!(fix.contains("one-shot cache"));
+        assert!(linux_keyring_finding(Agent::Copilot, false, true, false, false).is_none());
+        assert!(linux_keyring_finding(Agent::Copilot, true, false, false, false).is_none());
+        assert!(linux_keyring_finding(Agent::Copilot, true, true, true, false).is_none());
+        assert!(linux_keyring_finding(Agent::Copilot, true, true, false, true).is_none());
+        assert!(linux_keyring_finding(Agent::Claude, true, true, false, false).is_none());
+    }
+
+    #[test]
+    fn settings_line_reports_effective_values() {
+        use crate::config::{CliFlags, Config};
+        let mut r = Config::default().merge(CliFlags::default()).unwrap();
+        let line = settings_line(&r, Agent::Copilot, false);
+        assert!(
+            line.starts_with("keychain_substitute on (default) · quiet off"),
+            "{line}"
+        );
+        assert!(line.contains("allow_cache_exec none"), "{line}");
+        r.keychain_substitute = Some(false);
+        r.allow_cache_exec = vec!["ms-playwright".into()];
+        r.git_guard.enabled = false;
+        let line = settings_line(&r, Agent::Copilot, true);
+        assert!(
+            line.starts_with("keychain_substitute off (config) · quiet on"),
+            "{line}"
+        );
+        assert!(line.contains("git_guard off"), "{line}");
+        assert!(line.contains("allow_cache_exec ms-playwright"), "{line}");
+        assert!(settings_line(&r, Agent::Pi, true).contains("keychain_substitute off"));
+    }
+
+    #[test]
+    fn global_only_repo_keys_are_named_and_proposals_are_not() {
+        let parse = |t: &str| toml::from_str::<crate::repo_config::RepoConfig>(t).unwrap();
+        assert!(
+            global_only_repo_keys_finding(
+                &parse("[propose]\nallow_docker = true\n[deny]\nenv = [\"X\"]\n"),
+                ".cplt.toml"
+            )
+            .is_none()
+        );
+        let f = global_only_repo_keys_finding(
+            &parse(
+                "[sandbox]\nquiet = true\nallow_cache_exec = [\"x\"]\n[gh_guard]\nenabled = false\n\
+             [proxy]\nport = 1\n[git_guard]\nmode = \"off\"\n[future]\nx = 1\n",
+            ),
+            "~/src/other/.cplt.toml",
+        )
+        .expect("global-only keys must be reported");
+        assert_eq!(f.level, Level::Warning);
+        assert!(f.fix.is_some());
+        assert!(
+            f.message.starts_with("~/src/other/.cplt.toml sets "),
+            "{}",
+            f.message
+        );
+        for key in [
+            "sandbox.quiet",
+            "sandbox.allow_cache_exec",
+            "gh_guard.enabled",
+            "proxy.port",
+            "git_guard.mode",
+        ] {
+            assert!(f.message.contains(key), "{key} missing: {}", f.message);
+        }
+        assert!(!f.message.contains("future"), "{}", f.message);
     }
 }

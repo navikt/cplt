@@ -108,7 +108,7 @@ The sandbox blocks access to credentials and secrets in the kernel. Command guar
 | Access macOS Keychain | ⚠️ Allowed (read+write) for agents that store auth there | The grant cannot be scoped to one item, so it reaches every keychain entry the agent can unlock. The Keychain substitute (`sandbox.keychain_substitute`) drops it where the agent can authenticate another way: by default for Copilot (an exported `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN`, else `gh`'s token passed as `GH_TOKEN`) and Claude Code (an exported `CLAUDE_CODE_OAUTH_TOKEN`), opt-in for Antigravity (its fallback token file). Without such a credential the grant stays. See [SECURITY.md](SECURITY.md#keychain-access-is-all-or-nothing) |
 | Outbound network (port 443) | ✅ Allowed | Every other port is blocked. Add extras with `--allow-port` |
 | Localhost outbound | 🔒 Kernel-blocked (macOS), ⚠️ port-based on Linux | Prevents local service access. Inbound still works for the proxy. **Linux:** Landlock rules are port numbers only and cannot tell `localhost:443` from `remote:443`, so a local service on an allowed port is reachable and there is no localhost-specific deny. Use `--with-proxy` for SSRF protection, see [Linux limitations](docs/security.md#linux) |
-| SSH agent (unix socket) | 🔒 Kernel-blocked (macOS), ⚠️ env-only on Linux | Prevents using your loaded keys for git or SSH. It does not block the network path: SSH servers on port 443, such as `ssh.github.com:443`, are reachable, see [SSH over port 443](docs/known-impacts.md#ssh-over-port-443). **Linux:** unix socket `connect()` is not gated, so the withheld `SSH_AUTH_SOCK` is the only barrier and an agent that sets it itself can use the loaded keys. `bwrap` hides the stock OpenSSH socket under `/tmp`, but not a gnome-keyring/gcr or systemd agent under `$XDG_RUNTIME_DIR`. See [Linux limitations](docs/security.md#linux) |
+| SSH agent (unix socket) | 🔒 Kernel-blocked (macOS), ⚠️ backend-dependent on Linux | Prevents using your loaded keys for git or SSH. It does not block the network path: SSH servers on port 443, such as `ssh.github.com:443`, are reachable, see [SSH over port 443](docs/known-impacts.md#ssh-over-port-443). **Linux:** below ABI v9, pathname connections are unmediated, so withholding `SSH_AUTH_SOCK` only affects discovery. ABI v9 mediates connections but also permits them under writable-tree grants. Active `bwrap` hides the stock OpenSSH socket under `/tmp`, but not a gnome-keyring/gcr or systemd agent under `$XDG_RUNTIME_DIR`. See [Linux limitations](docs/security.md#linux) |
 | Developer tools (`~/.cargo`, `~/.gradle`, `~/.m2`, `~/.sdkman`, `~/.jenv`, `~/.pyenv`, `~/.konan`, etc.) | ✅ Allowed (read+write for caches) | Only dirs that exist on disk. Tightened at runtime by what `cplt doctor` detects |
 | Registry credential files (`~/.m2/settings.xml`, `~/.gradle/gradle.properties`, `~/.cargo/credentials`) | 🔒 Kernel-blocked on macOS. On Linux the parent tool dir stays readable | Override with `--allow-read`. See [Private registries](docs/known-impacts.md#private-registries) |
 | Read `~/.npmrc` | 🔒 Kernel-blocked (both platforms) | Override with `--allow-read`. Can break yarn 1 on Linux, see [yarn 1](docs/known-impacts.md#yarn-1-and-unreadable-home-rc-files) |
@@ -425,7 +425,7 @@ That check has two limits, both deliberate. It keys on the *default* automount r
 
 **Bubblewrap.** Ubuntu 23.10+ blocks unprivileged user namespaces through `kernel.apparmor_restrict_unprivileged_userns`, which breaks `bwrap`. That sysctl comes from an Ubuntu kernel patch that is absent from the Microsoft kernel, so the optional Bubblewrap layer is expected to work on Ubuntu-under-WSL2. That is inference from the kernel source, not something we have run. If `bwrap` fails there, please say so in [#189](https://github.com/navikt/cplt/issues/189). cplt's own seccomp filter is a plain `PR_SET_SECCOMP` BPF program, which stacks on top of the filter WSL installs in every process.
 
-**Reporting a problem.** Paste the output of `cplt doctor --verbose`. It shows the kernel, the Landlock ABI, whether Bubblewrap is active or why not, the effective `allow.read`, `allow.write` and `deny.paths` grants, and the tools cplt found, with your home directory written as `~` and a Windows profile as `/mnt/<drive>/Users/~`. It also warns about a project under `/mnt/<drive>/` and about a grant on `/dev` without Bubblewrap, which re-exposes the terminals of your other windows ([known impacts](docs/known-impacts.md#terminal-devices-and-allocating-a-pty)).
+**Reporting a problem.** Paste the output of `cplt doctor`. It shows the kernel, the Landlock ABI and whether Bubblewrap is active or why not, with your home directory written as `~` and a Windows profile as `/mnt/<drive>/Users/~`. `cplt doctor --verbose` adds the effective `allow.read`, `allow.write` and `deny.paths` grants and the tools cplt found, but prints absolute paths, so check it before you paste it anywhere public. It also warns about a project under `/mnt/<drive>/` and about a grant on `/dev` without Bubblewrap, which re-exposes the terminals of your other windows ([known impacts](docs/known-impacts.md#terminal-devices-and-allocating-a-pty)).
 
 > **Not yet verified on a real WSL2 install.** Verified from source: Landlock is compiled in and first in `CONFIG_LSM` on the Microsoft kernel; the `/mnt/<drive>/` detection, the WSL signals it uses, and their error text; that `cplt doctor` fails on such an agent and prints kernel + Landlock ABI; the 5.13+/6.7+ requirements; and that `install.sh` installs the Linux release binary. Still unverified by anyone here: how Landlock behaves on `/mnt/c`, whether Bubblewrap works under WSL2, the exact package versions your distro release ships, and the sequence above end to end. If you run it, please report what actually happened in [#189](https://github.com/navikt/cplt/issues/189).
 
@@ -593,6 +593,7 @@ What passes through:
 | `--allow-clipboard` | Give the agent back the macOS clipboard, which cplt denies by default. Equivalent to `sandbox.deny_clipboard = false` |
 | `--use-bubblewrap` | Linux only. Require the bubblewrap namespace layer (PID, mount, IPC, UTS, cgroup, user namespaces plus a private `/tmp`) on top of Landlock and seccomp. Errors out if `bwrap` is missing. Auto-detected when neither flag is given |
 | `--no-bubblewrap` | Linux only. Never use bubblewrap, even when installed. Falls back to Landlock and seccomp. Use it when bwrap breaks a specific tool |
+| `sandbox.allow_git_worktrees` (config only, macOS) | Let sub-agents create worktrees with `cplt worktree add <name> <ref>` under a cplt-owned root for this repository. Git runs under the session read policy; protected files must match launch HEAD. Off by default. See [Worktrees for sub-agents](docs/configuration.md#worktrees-for-sub-agents-sandboxallow_git_worktrees) |
 
 ### Supported runtimes
 
@@ -611,7 +612,13 @@ cplt auto-discovers installed tools and writes sandbox rules to match. Generally
 | Corepack | none | `COREPACK_*` | none |
 | mise | `.local/share/mise`, `.mise` | `MISE_*` | `mise` |
 
-Run `cplt doctor` to see whether cplt will work here for your agent, and `cplt doctor --verbose` for everything it detected on your machine. Its `guard:` lines show whether the git and gh guards would let a feature-branch push, a push to `main` and `gh pr merge` through in this repository.
+Run `cplt doctor` to see whether cplt will work here for your agent, and `cplt doctor --verbose` for everything it detected on your machine. Its `guard:` lines show whether the git and gh guards would let a feature-branch push, a push to `main` and `gh pr merge` through in this repository. The `settings:` line shows `keychain_substitute`, `quiet`, the guard modes, `allow_cache_exec` and the scratch dir as this launch resolves them. On macOS the `keychain:` line says whether the agent keeps the login Keychain grant, and why. The `auth:` line names where the agent's credential comes from, by variable name and never by value: an exported `GH_TOKEN`, `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN` or `CLAUDE_CODE_OAUTH_TOKEN`, `gh auth token`, or the agent's own login. When Copilot gets an exported token in place of the Keychain, doctor warns: cplt passes the token on unchecked, so a stale one fails sign-in with no fallback. Unset it, run `gh auth refresh`, or set `sandbox.keychain_substitute = false`. It also reports settings the launch refuses or ignores: a cache-exec or Cypress path the launch would refuse, global-only keys in `.cplt.toml`, `gh_guard.inject_token` while the guard is off (or, on macOS, when gh's own token makes it unnecessary), `allow_localhost_any` under `proxy.forced`, a token variable in `pass_env` that gh no longer needs, and a `deny.env` that strips every token variable the agent signs in with.
+
+Doctor also warns about settings that let the agent start but break things mid-session. With `scratch_dir` off, exec from the system temp dir is denied and the git and gh guards are not installed. On macOS with `quiet` on, cplt does not record the upstream after `git push -u`. With Copilot 1.0.83 or later and its own command sandbox turned on in `~/.copilot/settings.json`, cplt turns that sandbox off for the session; if you pass `COPILOT_CLI_SANDBOX_SUPPORT_OVERRIDE` through, Copilot's sandbox fails to start instead. On Linux, doctor warns when Copilot may depend on a keyring login; native access depends on the backend and agent version, and the warning does not prove the Secret Service is blocked. See [Linux keyring access](docs/known-impacts.md#linux-keyring-access-depends-on-the-backend-and-agent-version). Doctor also warns about a repository under `allow.write` that is not a named root, so its scripts cannot run, and about a repository under a cache or temp dir where exec is denied.
+
+In `--verbose`, the auth lines for token variables, the gh login and keytar show only for Copilot, and a tool reached through a mise shim shows as `via mise`.
+
+The default output is written to be pasted into an issue. `--verbose` prints absolute paths and is not. `--agent` works on either side of `doctor`: `cplt doctor --agent claude` is the same as `cplt --agent claude doctor`.
 
 ### Debugging
 
@@ -666,7 +673,7 @@ Pick one with `--agent <name>`, or make it the default with `cplt config set san
 | Agent | `--agent` value | Auto-detected | Auth |
 | --- | --- | --- | --- |
 | GitHub Copilot CLI | `copilot` | yes, priority 1 | GitHub token, from the Keychain or `gh` |
-| [OpenCode](https://opencode.ai/) | `opencode` | yes, priority 2 | Copilot subscription via `/connect`, or `--pass-env ANTHROPIC_API_KEY` |
+| [OpenCode](https://opencode.ai/) | `opencode` | yes, priority 2 | Copilot subscription via `/connect`, or `--pass-env ANTHROPIC_API_KEY`; v2: own sandboxed service per session, needs Bubblewrap on Linux ([#710](docs/known-impacts.md#opencode-v2)) |
 | [Antigravity CLI](https://github.com/google-antigravity/antigravity-cli) | `antigravity`, aliases `agy` and `agi` | yes, priority 3 | Google OAuth in the browser |
 | [Pi](https://github.com/earendil-works/pi) | `pi` | no | `--pass-env ANTHROPIC_API_KEY` and friends |
 | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | `claude`, aliases `cc` and `claude-code` | no | Subscription OAuth in `~/.claude` or the Keychain, `CLAUDE_CODE_OAUTH_TOKEN` (drops the Keychain grant), or `--pass-env ANTHROPIC_API_KEY` |
@@ -849,6 +856,7 @@ cplt config set gh_guard.enabled false   # opt out of the gh guard entirely
 # Set per-repo policy (committed to .cplt.toml)
 cplt config set --repo sandbox.allow_jvm_attach true
 cplt config set --repo deny.paths "~/secrets"
+cplt config set --repo allow.localhost 5432 8099   # array keys take several values
 
 # Inspect
 cplt config show      # effective config (file + defaults)
@@ -1033,6 +1041,7 @@ The sandbox blocks some workflows on purpose. The common ones and their fixes:
 | Private registry creds blocked | `cplt config set allow.read "~/.m2/settings.xml"` |
 | Internal Maven/Nexus repo unreachable (Gradle/Maven) | `cplt config set proxy.allow_private_domains "intern.example.com"`. An **IP-literal** repository URL cannot be allowed — give the host a DNS name; see below |
 | Playwright Chromium won't launch | Allow cache exec, then disable Chromium's nested sandbox; see below |
+| Puppeteer / `mmdc` fails with `spawn EPERM` or `[object Object]` | Use Playwright's Chromium with `--no-sandbox` and `"pipe": true`; see [Puppeteer](docs/known-impacts.md#puppeteer-and-mermaid-cli-mmdc) |
 
 **Playwright Chromium needs `cplt config set sandbox.allow_cache_exec ms-playwright`,** and Chromium must run without its own nested sandbox. On macOS its helpers cannot initialize a second Seatbelt sandbox inside cplt (`forbidden-sandbox-reinit`); on Linux cplt's seccomp filter blocks the namespace syscalls that sandbox needs. Playwright as a library already launches with `--no-sandbox`, and that same opt-in sets `PLAYWRIGHT_MCP_SANDBOX=false` for Playwright MCP, which would otherwise turn it back on. Any other Chromium launcher needs `--no-sandbox` itself. cplt remains the enforcing kernel boundary, but a compromised renderer then receives the full cplt Playwright profile instead of Chromium's narrower child profile. See [Cache exec](docs/known-impacts.md#cache-exec-playwright-pnpm-dlx-etc) and [SECURITY.md](SECURITY.md#out-of-scope).
 
@@ -1083,11 +1092,7 @@ More: [docs/security.md](docs/security.md#limitations)
 
 Contributions are welcome.
 
-```bash
-git clone https://github.com/navikt/cplt.git && cd cplt
-git config core.hooksPath hack    # enables pre-commit fmt + clippy checks
-mise run check                    # runs fmt, clippy, and tests
-```
+see [CONTRIBUTING.md](CONTRIBUTING.md) for how to contribute
 
 Open an issue before starting a large change. Every PR has to pass CI (fmt, clippy, tests).
 

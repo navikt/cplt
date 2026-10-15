@@ -189,7 +189,7 @@ pub fn prepare_root_for(
 ///
 /// `fix` is false for `doctor`, `check` and `--print-profile`: they check
 /// but never create the directory or change its mode.
-fn secure_dir(dir: &Path, label: &str, fix: bool) -> Result<(), String> {
+pub(crate) fn secure_dir(dir: &Path, label: &str, fix: bool) -> Result<(), String> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
     if fix {
         match std::fs::DirBuilder::new().mode(0o700).create(dir) {
@@ -282,7 +282,7 @@ pub fn problem_dirs(problems: &[LinkProblem]) -> Vec<String> {
 
 /// How deep below the root the `.git` walk looks. A tree deeper than this is
 /// a finding, not a pass: past it a `.git` would go unseen.
-const WALK_MAX_DEPTH: usize = 64;
+pub(crate) const WALK_MAX_DEPTH: usize = 64;
 
 /// Default for `sandbox.worktree_walk_max_dirs`: how many directories the
 /// `.git` walk visits (files are not counted, so build output of many small
@@ -336,7 +336,7 @@ pub fn link_problems(common: &Path, root: &Path, max_dirs: usize) -> Vec<LinkPro
 /// Opened `O_NOFOLLOW | O_NONBLOCK` and checked through the descriptor: a
 /// symlink is refused by the kernel, and a FIFO in its place cannot hang the
 /// launch.
-fn read_link_file(path: &Path) -> Result<String, String> {
+pub(crate) fn read_link_file(path: &Path) -> Result<String, String> {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
     let mut file = std::fs::OpenOptions::new()
@@ -590,7 +590,24 @@ fn walk_problems(common: &Path, root: &Path, max_dirs: usize, out: &mut Vec<Link
             counts[top].1 += 1;
             stack.push((path, depth + 1, top));
         }
-        if head && ((objects && refs) || commondir) {
+        for (flag, marker) in [
+            (&mut head, "HEAD"),
+            (&mut objects, "objects"),
+            (&mut refs, "refs"),
+            (&mut commondir, "commondir"),
+        ] {
+            if !*flag {
+                match dir.join(marker).symlink_metadata() {
+                    Ok(_) => *flag = true,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => push(
+                        &dir,
+                        format!("cannot stat {}: {e}", dir.join(marker).display()),
+                    ),
+                }
+            }
+        }
+        if bare_layout(head, objects, refs, commondir) {
             push(
                 &dir,
                 format!(
@@ -620,7 +637,7 @@ fn walk_problems(common: &Path, root: &Path, max_dirs: usize, out: &mut Vec<Link
 /// symlink precedes a `..`: leading `..` climb the link's own directories,
 /// which the walk reached as real directories, and a `..` after a name is
 /// refused.
-fn link_stays_inside(link: &Path, worktree: &Path) -> bool {
+pub(crate) fn link_stays_inside(link: &Path, worktree: &Path) -> bool {
     use std::path::Component;
     let (Ok(target), Some(parent)) = (std::fs::read_link(link), link.parent()) else {
         return false;
@@ -643,6 +660,11 @@ fn link_stays_inside(link: &Path, worktree: &Path) -> bool {
     }
     lexical.starts_with(worktree)
         && std::fs::canonicalize(link).is_ok_and(|c| c.starts_with(worktree))
+}
+
+/// Git accepts executable regular files and links as discovery markers too.
+pub(crate) fn bare_layout(head: bool, objects: bool, refs: bool, commondir: bool) -> bool {
+    head && ((objects && refs) || commondir)
 }
 
 /// One `<root>/<name>/.git` pointer against its admin dir, both directions,

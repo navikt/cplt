@@ -110,7 +110,7 @@ pub fn ensure_copilot_extracted(
     // marker that no longer matches only costs a fresh preflight.
     let cache_file = cache_dir.join("copilot-extracted");
     if let Some(ref bid) = binary_id
-        && let Ok(cached) = std::fs::read_to_string(&cache_file)
+        && let Ok(Some(cached)) = cplt::untrusted::read_untrusted(&cache_file, 64 * 1024)
     {
         let mut lines = cached.lines();
         if let (Some(cached_id), Some(cached_dir)) = (lines.next(), lines.next())

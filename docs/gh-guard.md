@@ -69,7 +69,7 @@ enabled = true              # blocks destructive gh operations
 mode = "block"              # block | warn | audit
 scope_check = true          # enforce repo-scoping on write commands
 block_auth_token = true     # deny "gh auth token" exfiltration
-inject_token = false        # inject GH_TOKEN into sandbox (opt-in)
+inject_token = false        # deprecated on macOS; Linux Copilot may need it
 unknown_command = "block"   # block|allow unrecognized gh commands
 allow_api_write = false     # allow gh api write (POST/PUT/PATCH) to current repo (opt-in)
 allow_pr_merge = false      # allow gh pr merge into a ruleset-protected branch (opt-in)
@@ -266,29 +266,30 @@ This path applies only:
 - when `GH_TOKEN`/`GITHUB_TOKEN` is not already set in the environment
 - when the repo's `[deny] env` does not list `GH_TOKEN`
 
-That last one matters: a repo denying `GH_TOKEN` is saying the agent gets no
-GitHub credential, so the cache is suppressed as well as the environment
-variable. `gh auth token` inside such a sandbox returns nothing and no
+That last one suppresses this token handover, not every credential source:
+the cache is suppressed as well as the environment variable.
+The guarded `gh auth token` returns nothing and no
 `.gh-token` file is written. Denying only `GITHUB_TOKEN` or
 `COPILOT_GITHUB_TOKEN` is a narrower statement and leaves this channel open.
 
 It falls back gracefully if `gh` is not installed or not authenticated.
 
-**On Linux this is often the only way to stay signed in.** The Secret Service
-(gnome-keyring, kwallet, anything behind libsecret) is reached over D-Bus, and
-the sandbox masks the session bus socket and does not pass
-`DBUS_SESSION_BUS_ADDRESS`. An agent that stores its credential in the system
-vault therefore finds none — the Copilot CLI reports `System vault not
-available` and offers to write the token to its config file in plain text — and
-asks you to sign in again every session. Authenticate on the host, where the
-keyring works, and let cplt hand the token in.
+On Linux, host authentication and token handover remain recommended when
+native Secret Service login fails. Stripping `DBUS_SESSION_BUS_ADDRESS` affects
+discovery, not API access: keyring-file denies do not block D-Bus credential
+reads. Native login depends on the backend and agent version; a vault prompt
+alone does not establish the cause. Use `inject_token` or a manually supplied,
+session-only token rather than plaintext storage. See [Linux keyring access](known-impacts.md#linux-keyring-access-depends-on-the-backend-and-agent-version).
 
 `inject_token` requires `gh_guard.enabled`: the injection is part of installing
 the gh wrapper, which the guard owns. With the guard off it does nothing, and
 cplt says so at launch rather than leaving a key that reads as true and has no
 effect.
 
-If you prefer the token in the environment instead, set `inject_token = true`.
+On macOS `inject_token` is deprecated. `gh` gets its token from the exec token,
+and Copilot signs in through `sandbox.keychain_substitute = true`. The key still
+works; while it is `true`, cplt prints one line at launch and `cplt check` lists
+it. On Linux the substitute does nothing, so keep the key set to `true` for the case above, or anywhere you still want the token in the environment.
 `cplt config set` refuses it without `--force`, and `cplt config show` marks it
 `⚠ DANGEROUS`, because the token is then inherited by every process in the
 sandbox — and readable from any of them, through `/proc/<pid>/environ` on Linux

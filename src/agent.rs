@@ -197,6 +197,88 @@ const OPENCODE_DOMAINS: &[&str] = &["opencode.ai", "models.dev"];
 /// BARE domain — see `COPILOT_INFRA_DOMAINS` for the no-glob convention.
 const DEEPSEEK_DOMAINS: &[&str] = &["deepseek.com"];
 
+/// #710: does this resolved `opencode` binary belong to OpenCode v2?
+///
+/// The install path settles most cases with no subprocess: v2 ships as the
+/// npm package `@opencode/cli` (1.x is `opencode-ai`), and Homebrew or a
+/// version manager keeps it under `opencode/<version>`. Anything else (the
+/// upstream installer puts both majors at `~/.opencode/bin`) is asked
+/// `--version` once, and the answer is cached per binary path, size and
+/// mtime, so steady-state launch spawns nothing. An unanswered or unparseable
+/// probe is retried once with a longer timeout; if that also fails and the path
+/// is not the 1.x npm package `opencode-ai`, the verdict is `None` (#725) and
+/// the launch refuses rather than run a possible v2 without its isolation. An
+/// unknown verdict is never cached.
+///
+/// The verdict lives in cplt's state directory, which the sandbox denies, not
+/// in `~/.cache/cplt`, which the agent can write: a forged "1.x" verdict for a
+/// v2 binary would bypass this gate.
+pub fn is_opencode_v2(bin: &Path, home: &Path) -> Option<bool> {
+    opencode_v2_within(
+        bin,
+        home,
+        [
+            crate::discover::PROBE_TIMEOUT,
+            crate::discover::PROBE_TIMEOUT * 3,
+        ],
+    )
+}
+
+fn opencode_v2_within(bin: &Path, home: &Path, timeouts: [std::time::Duration; 2]) -> Option<bool> {
+    let cache_dir = &home.join(crate::sandbox::CPLT_STATE_DIR);
+    let real = std::fs::canonicalize(bin).unwrap_or_else(|_| bin.to_path_buf());
+    let parts: Vec<String> = real
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    // `opencode-v2`: the anomalyco/tap Homebrew formula (Cellar/opencode-v2/<ver>).
+    if parts.iter().any(|p| p == "@opencode" || p == "opencode-v2") {
+        return Some(true);
+    }
+    if let Some([_, ver]) = parts
+        .windows(2)
+        .find(|w| w[0] == "opencode" && crate::discover::parse_version(&w[1]).is_some())
+    {
+        return Some(major_at_least_2(ver));
+    }
+    let is_v1_npm = parts.iter().any(|p| p == "opencode-ai");
+    let Ok(meta) = std::fs::metadata(&real) else {
+        return is_v1_npm.then_some(false);
+    };
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos());
+    let key = format!("{}\t{}\t{mtime}\t", real.display(), meta.len());
+    let cache = cache_dir.join("opencode-version");
+    if let Some(v) = crate::untrusted::read_untrusted(&cache, SMALL_FILE_LIMIT)
+        .ok()
+        .flatten()
+        .and_then(|c| c.strip_prefix(&key).map(|v| v.trim().to_string()))
+    {
+        return Some(major_at_least_2(&v));
+    }
+    for timeout in timeouts {
+        if let crate::discover::VersionProbe::Version(v) =
+            crate::discover::probe_version_within(&real, &["--version"], timeout)
+        {
+            let _ = std::fs::create_dir_all(cache_dir);
+            let _ = std::fs::write(&cache, format!("{key}{v}\n"));
+            return Some(major_at_least_2(&v));
+        }
+    }
+    // The 1.x npm package, reached through a shim that did not canonicalize
+    // into it; v2's packages are all `@opencode/*`, caught above.
+    is_v1_npm.then_some(false)
+}
+
+fn major_at_least_2(version: &str) -> bool {
+    crate::discover::parse_version(version)
+        .and_then(|v| v.split('.').next()?.parse::<u32>().ok())
+        .is_some_and(|major| major >= 2)
+}
+
 /// The provider hosts an OpenCode `auth.json` body calls for. Split from
 /// [`Agent::provider_domains`] so the parse is testable without a home dir.
 /// Anything that is not a JSON object with a `github-copilot` key, including
@@ -228,15 +310,81 @@ fn opencode_auth_json(home: &Path) -> Option<PathBuf> {
     Some(data_base.join("opencode/auth.json"))
 }
 
+/// [`Agent::provider_domains`] for OpenCode v2 (#710): its logins live in
+/// `opencode.db`, and the gh handover does not apply (v2 ignores
+/// `OPENCODE_AUTH_CONTENT`), so only a stored Copilot login adds hosts.
+pub fn opencode_v2_provider_domains(home: &Path) -> Vec<&'static str> {
+    if opencode_auth_json(home)
+        .is_some_and(|p| opencode_db_has_copilot(&p.with_file_name("opencode.db")))
+    {
+        COPILOT_INFRA_DOMAINS.to_vec()
+    } else {
+        Vec::new()
+    }
+}
+
+/// Does OpenCode v2's credential store hold a github.com Copilot login?
+///
+/// Opened read-only by the system sqlite3, and only the integration id and
+/// the enterprise marker are selected: no secret leaves the database. A
+/// missing file, a 1.x database without the table or a failed run is "no".
+#[allow(clippy::disallowed_methods)] // fixed absolute /usr/bin/sqlite3
+fn opencode_db_has_copilot(db: &Path) -> bool {
+    // The db is agent-writable: `symlink_metadata` so a symlink or FIFO there
+    // is "no" (a FIFO would hang sqlite3 before the sandbox starts), and
+    // `-init /dev/null` so no `~/.sqliterc` runs.
+    if !db.symlink_metadata().is_ok_and(|m| m.is_file()) {
+        return false;
+    }
+    // Bounded: a FIFO swapped in after the check above would otherwise hang
+    // the launch.
+    let Some(db) = db.to_str() else { return false };
+    crate::discover::probe_output(
+        Path::new("/usr/bin/sqlite3"),
+        &[
+            "-init",
+            "/dev/null",
+            "-readonly",
+            "-batch",
+            db,
+            "SELECT 1 FROM credential WHERE integration_id = 'github-copilot' \
+             AND json_extract(value, '$.metadata.enterpriseUrl') IS NULL LIMIT 1",
+        ],
+        std::time::Duration::from_secs(5),
+    )
+    .is_some_and(|o| o.trim() == "1")
+}
+
 /// `Ok(None)` when the file does not exist, `Ok(Some(body))` when it was
 /// read, `Err` when it exists but was refused (FIFO, oversize, unreadable).
 fn read_opencode_auth_json(path: &Path) -> Result<Option<String>, ()> {
     match path.symlink_metadata() {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(()),
+        // The data dir is agent-writable: a symlink here could point at any
+        // host JSON (gcloud ADC, ~/.docker/config.json) and have it handed
+        // to the agent in OPENCODE_AUTH_CONTENT. Refuse it.
+        Ok(m) if m.is_symlink() => return Err(()),
         Ok(_) => {}
     }
-    read_small_regular_file(path).map(Some).ok_or(())
+    // nlink == 1 on the opened fd: a hard link to a host file is refused too.
+    use std::io::Read as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let file = crate::untrusted::open_untrusted(path)
+        .ok()
+        .flatten()
+        .filter(|f| {
+            f.metadata()
+                .is_ok_and(|m| m.nlink() == 1 && m.len() <= SMALL_FILE_LIMIT)
+        })
+        .ok_or(())?;
+    let mut s = String::new();
+    file.take(SMALL_FILE_LIMIT + 1)
+        .read_to_string(&mut s)
+        .map_err(|_| ())?;
+    (s.len() as u64 <= SMALL_FILE_LIMIT)
+        .then_some(Some(s))
+        .ok_or(())
 }
 
 /// The `OPENCODE_AUTH_CONTENT` value that logs OpenCode in to GitHub Copilot
@@ -270,7 +418,15 @@ fn opencode_auth_overlay(auth_json: Option<&str>, token: &str) -> Option<String>
 
 /// [`opencode_auth_overlay`] for the store in `home`.
 pub(crate) fn opencode_host_login(home: &Path, token: &str) -> Option<String> {
-    let stored = read_opencode_auth_json(&opencode_auth_json(home)?).ok()?;
+    let path = opencode_auth_json(home)?;
+    if path.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+        crate::ui::warn(&format!(
+            "{} is a symlink; skipping the Copilot login handover. Replace it with a plain file.",
+            path.display()
+        ));
+        return None;
+    }
+    let stored = read_opencode_auth_json(&path).ok()?;
     opencode_auth_overlay(stored.as_deref(), token)
 }
 
@@ -279,25 +435,494 @@ pub(crate) fn opencode_host_login(home: &Path, token: &str) -> Option<String> {
 const SMALL_FILE_LIMIT: u64 = 64 * 1024;
 
 /// Read a file the sandboxed agent can write, without letting it hang the
-/// next launch: `O_NONBLOCK` so opening a planted FIFO returns at once, then
-/// only a regular file of at most [`SMALL_FILE_LIMIT`] bytes is read (a
-/// symlink to `/dev/zero` is a character device and is refused). `None` for
-/// anything else.
+/// next launch. See [`crate::untrusted::read_regular_following`].
 pub(crate) fn read_small_regular_file(path: &Path) -> Option<String> {
-    use std::io::Read as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)
-        .ok()?;
-    let meta = file.metadata().ok()?;
-    if !meta.is_file() || meta.len() > SMALL_FILE_LIMIT {
-        return None;
+    crate::untrusted::read_regular_following(path, SMALL_FILE_LIMIT)
+        .ok()
+        .flatten()
+}
+
+/// Read + execute grants for the scripts Claude Code's user-level hooks and
+/// status line run, so a hook at e.g. `~/.config/claude/hooks/gate.py` does
+/// not fail with "Operation not permitted" and block every tool call.
+///
+/// Source is `<root>/settings.json` only. That file is write-denied in the
+/// sandbox (`host_persistence_denies`), so the agent cannot plant a path here
+/// to read itself into, say, `~/.ssh`. `settings.local.json` and the project's
+/// `.claude/settings*.json` are agent-writable and deliberately not read.
+///
+/// Per command one path is granted: the executable (first token), or, when
+/// that is an interpreter, its first non-flag argument, so both `/x/gate.py`
+/// and `python3 /x/gate.py --log /p/log` grant only `gate.py`. Never other
+/// arguments: the grant write-protects the file, so a log or state file
+/// would become unwritable. Only an absolute path (after `~`/`$HOME`
+/// expansion) to an existing regular file counts. File-level, never the directory: a
+/// script that imports siblings needs an `allow.read` on its dir. The grant is
+/// exec-only, so the file is also write-denied in the sandbox. Skipped, never
+/// refused: paths under `root` or any of `writable` (canonicalized; an exec
+/// grant there would write-protect the agent's own files), credential dirs
+/// and files,
+/// `~/Library/Keychains`, and anything SBPL cannot name.
+///
+/// On Linux `settings.json` is write-denied only under bubblewrap; with
+/// Landlock alone the whole root is writable, so the agent could plant a hook
+/// naming any file and get it granted on the next launch. `prepare_impl`
+/// drops these grants again when bubblewrap does not resolve active (#705).
+fn claude_hook_script_grants(root: &Path, home: &Path, writable: &[PathBuf]) -> Vec<AgentDir> {
+    let Some(text) = read_small_regular_file(&root.join("settings.json")) else {
+        return vec![];
+    };
+    script_grants(claude_hook_script_paths(&text, home), root, home, writable)
+}
+
+/// Copilot CLI's equivalent of [`claude_hook_script_grants`] (#704): the
+/// scripts named by user-level hooks (`hooks.<event>[]` with `bash`,
+/// `command`, or `exec` + `args`) in `<root>/settings.json` and
+/// `<root>/hooks/*.json`, and by `mcpServers.<n>.command` + `args` in
+/// `<root>/mcp-config.json`. All three are `host_persistence_denies`
+/// entries, so the agent cannot plant a path in them. A symlinked file or
+/// `hooks/` dir is not read: Seatbelt matches the resolved path, so the deny
+/// would not cover the target. Project-level config is never read. Same
+/// grant shape and skips as the Claude version; macOS only for the same
+/// reason.
+fn copilot_hook_script_grants(root: &Path, home: &Path) -> Vec<AgentDir> {
+    if !cfg!(target_os = "macos") {
+        return vec![];
     }
-    let mut s = String::new();
-    file.take(SMALL_FILE_LIMIT).read_to_string(&mut s).ok()?;
-    Some(s)
+    let plain = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| !m.file_type().is_symlink());
+    let mut files = vec![root.join("settings.json"), root.join("mcp-config.json")];
+    if plain(&root.join("hooks"))
+        && let Ok(rd) = std::fs::read_dir(root.join("hooks"))
+    {
+        files.extend(
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|e| e == "json")),
+        );
+    }
+    let mut commands: Vec<Vec<String>> = vec![];
+    for f in files.iter().filter(|f| plain(f)) {
+        let Some(v) = read_small_regular_file(f)
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        else {
+            continue;
+        };
+        let with_args = |head: &str, e: &serde_json::Value| {
+            let args = e.get("args").and_then(|a| a.as_array());
+            std::iter::once(head.to_string())
+                .chain(
+                    args.into_iter()
+                        .flatten()
+                        .filter_map(|a| a.as_str())
+                        .map(String::from),
+                )
+                .collect::<Vec<_>>()
+        };
+        for e in v
+            .get("hooks")
+            .and_then(|h| h.as_object())
+            .into_iter()
+            .flat_map(|events| events.values())
+            .filter_map(|e| e.as_array())
+            .flatten()
+        {
+            for key in ["bash", "command"] {
+                commands.extend(e.get(key).and_then(|c| c.as_str()).map(shell_words));
+            }
+            commands.extend(
+                e.get("exec")
+                    .and_then(|c| c.as_str())
+                    .map(|x| with_args(x, e)),
+            );
+        }
+        for s in v
+            .get("mcpServers")
+            .and_then(|m| m.as_object())
+            .into_iter()
+            .flat_map(|m| m.values())
+        {
+            commands.extend(
+                s.get("command")
+                    .and_then(|c| c.as_str())
+                    .map(|x| with_args(x, s)),
+            );
+        }
+    }
+    script_grants(script_paths(commands, home), root, home, &[])
+}
+
+/// Read + execute grants for OpenCode's `file://` plugins and local MCP
+/// server commands in the user config (`opencode.json`, `opencode.jsonc`,
+/// `config.json` in `config_dir`), as [`claude_hook_script_grants`] does for
+/// Claude hooks (#703). The config dir is granted read-only, so the agent
+/// cannot plant a path there. Project config is never read. macOS only, for
+/// the same reason as the Claude grant.
+fn opencode_script_grants(config_dir: &Path, home: &Path, writable: &[PathBuf]) -> Vec<AgentDir> {
+    if !cfg!(target_os = "macos") {
+        return vec![];
+    }
+    const FILES: [&str; 3] = ["opencode.json", "opencode.jsonc", "config.json"];
+    // The config files are trusted only because nothing on their path is
+    // agent-writable. Record every location they resolve through: the
+    // configured dir, each symlink hop, the resolved dir, and for each file
+    // read its own hops and resolved target (a dotfiles-managed
+    // `opencode.json` symlink is fine as long as it points outside every
+    // writable tree). If any of these sits in a project or `allow.write`
+    // tree, the agent could edit the config, or swap the dir with `mv`, and
+    // plant a path for the next launch; `drop_script_grants_under` then drops
+    // every grant.
+    let resolved = |p: &Path| {
+        symlink_locations(p)
+            .into_iter()
+            .chain(std::fs::canonicalize(p).ok())
+    };
+    let mut locs: Vec<PathBuf> = resolved(config_dir).collect();
+    let mut paths = vec![];
+    for f in FILES.iter().map(|f| config_dir.join(f)) {
+        if let Some(t) = read_small_regular_file(&f) {
+            locs.extend(resolved(&f));
+            paths.extend(opencode_script_paths(&t, home));
+        }
+    }
+    let mut out = script_grants(paths, config_dir, home, writable);
+    for g in &mut out {
+        g.via.extend(locs.iter().cloned());
+    }
+    out
+}
+
+/// An absolute `OPENCODE_CONFIG_DIR`, the config dir OpenCode v2 uses in
+/// place of `$XDG_CONFIG_HOME/opencode`.
+fn opencode_custom_config_dir() -> Option<PathBuf> {
+    std::env::var_os("OPENCODE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+}
+
+/// The env-relocated config root of `agent` (`CLAUDE_CONFIG_DIR`, `DSH_HOME`,
+/// `OPENCODE_CONFIG_DIR`) when it is, contains or lies in a credential dir
+/// (`~/.ssh`, `~/.aws`, ...). Its grant would become a Landlock rule on Linux,
+/// which no deny can narrow, so the launch must refuse it (#720, #723).
+#[must_use]
+pub fn env_config_dir_on_credentials(agent: Agent, home: &Path) -> Option<(&'static str, PathBuf)> {
+    let var = |v: &str| std::env::var_os(v).filter(|s| !s.is_empty());
+    let found = match agent {
+        Agent::Claude => ("CLAUDE_CONFIG_DIR", var("CLAUDE_CONFIG_DIR")?.into()),
+        Agent::Dsh => {
+            var("DSH_HOME")?;
+            ("DSH_HOME", dsh_home(home))
+        }
+        Agent::OpenCode => ("OPENCODE_CONFIG_DIR", opencode_custom_config_dir()?),
+        _ => return None,
+    };
+    // `$HOME` and its ancestors are left to `first_unsafe_agent_dir`'s broader refusal.
+    (!home.starts_with(&found.1) && crate::sandbox::dir_overlaps_credentials(home, &found.1))
+        .then_some(found)
+}
+
+/// Candidate paths in an OpenCode config: each `plugin[]` entry (string or
+/// `[spec, options]`) that is a `file://` URL, and the script token of each
+/// `mcp.<name>.command` array.
+fn opencode_script_paths(text: &str, home: &Path) -> Vec<PathBuf> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&strip_jsonc(text)) else {
+        return vec![];
+    };
+    let plugins = v
+        .get("plugin")
+        .and_then(|p| p.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p.as_str().or_else(|| p.get(0)?.as_str()))
+        .filter_map(|p| p.strip_prefix("file://"))
+        .filter_map(|p| expand_home(&percent_decode(p), home))
+        .filter_map(|p| {
+            if p.is_dir() {
+                plugin_entrypoint(&p)
+            } else {
+                Some(p)
+            }
+        });
+    let commands = v
+        .get("mcp")
+        .and_then(|m| m.as_object())
+        .into_iter()
+        .flat_map(|m| m.values())
+        .filter_map(|s| s.get("command")?.as_array())
+        .map(|c| {
+            c.iter()
+                .filter_map(|w| Some(w.as_str()?.to_string()))
+                .collect()
+        });
+    plugins.chain(script_paths(commands, home)).collect()
+}
+
+/// `%XX` decoding for the path of a `file://` URL, as `fileURLToPath` does.
+/// Invalid escapes are kept literally.
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = (b[i] == b'%')
+            .then(|| s.get(i + 1..i + 3))
+            .flatten()
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        if let Some(v) = hex {
+            out.push(v);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The file a directory plugin loads: `package.json` `main`, else
+/// `index.ts` or `index.js`. `None` when that file resolves outside `dir`
+/// (an absolute or `..` `main`, or a symlink out), so the grant cannot be
+/// pointed at an arbitrary file.
+fn plugin_entrypoint(dir: &Path) -> Option<PathBuf> {
+    let real_dir = std::fs::canonicalize(dir).ok()?;
+    let main = read_small_regular_file(&dir.join("package.json"))
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| Some(v.get("main")?.as_str()?.to_string()));
+    main.into_iter()
+        .chain(["index.ts".into(), "index.js".into()])
+        .map(|m| dir.join(m))
+        .find(|p| p.is_file())
+        .filter(|p| std::fs::canonicalize(p).is_ok_and(|r| r.starts_with(&real_dir)))
+}
+
+/// JSONC to JSON: drops `//` and `/* */` comments outside strings and
+/// trailing commas before `}` or `]`.
+fn strip_jsonc(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut in_str = false;
+    while let Some(c) = chars.next() {
+        if in_str {
+            out.push(c);
+            if c == '\\' {
+                out.extend(chars.next());
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match (c, chars.peek()) {
+            ('"', _) => {
+                in_str = true;
+                out.push(c);
+            }
+            ('/', Some('/')) => {
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        out.push(c);
+                        break;
+                    }
+                }
+            }
+            ('/', Some('*')) => {
+                chars.next();
+                let mut prev = ' ';
+                for c in chars.by_ref() {
+                    if prev == '*' && c == '/' {
+                        break;
+                    }
+                    prev = c;
+                }
+                out.push(' ');
+            }
+            (c @ ('}' | ']'), _) => {
+                let t = out.trim_end().len();
+                if out[..t].ends_with(',') {
+                    out.truncate(t - 1);
+                }
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// `~/` and `$HOME/` expansion; `None` unless the result is absolute.
+fn expand_home(w: &str, home: &Path) -> Option<PathBuf> {
+    let w = if let Some(rest) = w.strip_prefix("~/") {
+        home.join(rest)
+    } else if let Some(rest) = w
+        .strip_prefix("$HOME/")
+        .or_else(|| w.strip_prefix("${HOME}/"))
+    {
+        home.join(rest)
+    } else {
+        PathBuf::from(w)
+    };
+    w.is_absolute().then_some(w)
+}
+
+/// Read + exec grants for `paths`, minus anything under `root`/`writable`,
+/// credentials or unnameable in SBPL. See [`claude_hook_script_grants`].
+fn script_grants(
+    paths: Vec<PathBuf>,
+    root: &Path,
+    home: &Path,
+    writable: &[PathBuf],
+) -> Vec<AgentDir> {
+    let own: Vec<PathBuf> = std::iter::once(root)
+        .chain(writable.iter().map(PathBuf::as_path))
+        .flat_map(|p| {
+            [
+                p.to_path_buf(),
+                std::fs::canonicalize(p).unwrap_or_default(),
+            ]
+        })
+        .filter(|p| !p.as_os_str().is_empty())
+        .collect();
+    let mut out: Vec<AgentDir> = vec![];
+    for path in paths {
+        let Ok(real) = std::fs::canonicalize(&path) else {
+            continue;
+        };
+        if !real.is_file() || out.iter().any(|d| d.path == real) {
+            continue;
+        }
+        let sensitive = |p: &Path| {
+            own.iter().any(|o| p.starts_with(o))
+                || p.starts_with(home.join("Library/Keychains"))
+                || crate::sandbox::DENIED_DOTFILES
+                    .iter()
+                    .chain(crate::sandbox::DENIED_FILES)
+                    .any(|d| p.starts_with(home.join(d)))
+                || crate::sandbox::validate_sbpl_path(p).is_err()
+        };
+        let via = symlink_locations(&path);
+        if sensitive(&real) || via.iter().any(|p| sensitive(p)) {
+            continue;
+        }
+        out.push(AgentDir {
+            path: real,
+            write: false,
+            map_exec: false,
+            process_exec: true,
+            write_files: vec![],
+            create_dirs: vec![],
+            via,
+        });
+    }
+    out
+}
+
+/// `path` plus the location of every symlink crossed resolving it, each with
+/// its parent canonicalized. Used to refuse a script grant reached through a
+/// link the agent could rewrite.
+fn symlink_locations(path: &Path) -> Vec<PathBuf> {
+    let canon_parent = |p: &Path| {
+        let parent = p.parent().unwrap_or(Path::new("/"));
+        std::fs::canonicalize(parent)
+            .unwrap_or(parent.to_path_buf())
+            .join(p.file_name().unwrap_or_default())
+    };
+    let mut out = vec![canon_parent(path)];
+    let mut queue = vec![path.to_path_buf()];
+    // Bounded like the kernel's ELOOP; past it canonicalize fails anyway.
+    while let Some(p) = queue.pop().filter(|_| out.len() < 64) {
+        let comps: Vec<_> = p.components().collect();
+        let mut cur = PathBuf::new();
+        for (i, c) in comps.iter().enumerate() {
+            cur.push(c);
+            let Ok(target) = std::fs::read_link(&cur) else {
+                continue;
+            };
+            let link = canon_parent(&cur);
+            out.push(link.clone());
+            let mut next = link.parent().unwrap_or(Path::new("/")).join(target);
+            next.extend(&comps[i + 1..]);
+            queue.push(next);
+            break;
+        }
+    }
+    out
+}
+
+/// Candidate script paths in a Claude `settings.json`: the script token (see
+/// [`script_token`]) of each `hooks.<event>[].hooks[].command` and
+/// `statusLine.command`, if absolute.
+fn claude_hook_script_paths(text: &str, home: &Path) -> Vec<PathBuf> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return vec![];
+    };
+    let mut commands: Vec<&str> = v
+        .get("hooks")
+        .and_then(|h| h.as_object())
+        .into_iter()
+        .flat_map(|events| events.values())
+        .filter_map(|e| e.as_array())
+        .flatten()
+        .filter_map(|m| m.get("hooks")?.as_array())
+        .flatten()
+        .filter_map(|h| h.get("command")?.as_str())
+        .collect();
+    commands.extend(v.pointer("/statusLine/command").and_then(|c| c.as_str()));
+    script_paths(commands.into_iter().map(shell_words), home)
+}
+
+/// The absolute script path (see [`script_token`]) of each command, after
+/// `~` and `$HOME` expansion.
+fn script_paths(commands: impl IntoIterator<Item = Vec<String>>, home: &Path) -> Vec<PathBuf> {
+    commands
+        .into_iter()
+        .filter_map(script_token)
+        .filter_map(|w| expand_home(&w, home))
+        .collect()
+}
+
+/// The file a command runs: the first word, or for an interpreter the first
+/// argument that is not a flag (`uv run` and `uvx` skip `run` too).
+fn script_token(words: Vec<String>) -> Option<String> {
+    const INTERPRETERS: &[&str] = &[
+        "python", "node", "bash", "sh", "zsh", "ruby", "perl", "deno", "bun", "uv", "uvx",
+    ];
+    let mut it = words.into_iter();
+    let first = it.next()?;
+    let name = first.rsplit('/').next().unwrap_or(&first);
+    let name = name.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    if !INTERPRETERS.contains(&name) {
+        return Some(first);
+    }
+    it.find(|w| !w.starts_with('-') && w != "run")
+}
+
+/// Whitespace split honouring single and double quotes. ponytail: no escapes
+/// or `$(...)`; a token it gets wrong is simply not an existing file and is
+/// skipped.
+fn shell_words(cmd: &str) -> Vec<String> {
+    let mut words = vec![];
+    let mut cur = String::new();
+    let mut quote = None;
+    let mut started = false;
+    for c in cmd.chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => cur.push(c),
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                started = true;
+            }
+            (None, c) if c.is_whitespace() => {
+                if started || !cur.is_empty() {
+                    words.push(std::mem::take(&mut cur));
+                }
+                started = false;
+            }
+            (None, c) => cur.push(c),
+        }
+    }
+    if started || !cur.is_empty() {
+        words.push(cur);
+    }
+    words
 }
 
 /// A credential an agent can use instead of the macOS login Keychain (#242).
@@ -952,10 +1577,8 @@ impl Agent {
             // writable grants are the data, state and cache dirs, which hold
             // sessions, logs and downloaded binaries and no skills; the one
             // exec-bearing path among them, `~/.cache/opencode/bin`, is its own
-            // read-only `AgentDir`. A relocated `OPENCODE_CONFIG_DIR` inherits
-            // the same posture — nav-pilot points it at a pinned payload and
-            // hands cplt `--allow-read` on it, which is read-only by
-            // construction. (These
+            // read-only `AgentDir`. A relocated `OPENCODE_CONFIG_DIR` gets
+            // the same read-only grant (#718). (These
             // denies are joined onto writable dirs only, so an entry here would
             // be inert anyway.) The data and state dirs hold sessions, logs and
             // downloaded model weights — nothing goose auto-executes.
@@ -1185,6 +1808,7 @@ impl Agent {
             process_exec: false,
             write_files: vec![],
             create_dirs: vec![],
+            via: vec![],
         };
         match shell_name {
             // Config dir: `fish_variables` (universal variables) is rewritten by
@@ -1226,14 +1850,21 @@ impl Agent {
                 // `sandbox.deny_copilot_dir_exec` drops `process_exec` here on
                 // Linux via `deny_copilot_dir_exec`; it stays set by default
                 // until the key has been out long enough to flip.
-                vec![AgentDir {
-                    path: home.join(".copilot"),
-                    write: true,
-                    map_exec: true,
-                    process_exec: true,
-                    write_files: vec![],
-                    create_dirs: vec![],
-                }]
+                let root = home.join(".copilot");
+                let mut dirs = copilot_hook_script_grants(&root, home);
+                dirs.insert(
+                    0,
+                    AgentDir {
+                        path: root,
+                        write: true,
+                        map_exec: true,
+                        process_exec: true,
+                        write_files: vec![],
+                        create_dirs: vec![],
+                        via: vec![],
+                    },
+                );
+                dirs
             }
             Agent::Shell => {
                 // Shell needs write access to its config/data dirs for history
@@ -1284,8 +1915,30 @@ impl Agent {
                     .ok()
                     .map_or_else(|| home.join(".cache"), PathBuf::from);
                 let cache_dir = cache_base.join("opencode");
+                let writable = [data_dir.clone(), state_dir.clone(), cache_dir.clone()];
+                let mut scripts = opencode_script_grants(&config_dir, home, &writable);
+                // v2 replaces the config dir with `OPENCODE_CONFIG_DIR` and its
+                // overlay links into it; v1 never receives the variable (not in
+                // the env allowlist), so for v1 this grant is unused. Granted
+                // like the default dir, read-only, its scripts under the same
+                // provenance rules (#718).
+                if let Some(custom) = opencode_custom_config_dir().filter(|p| *p != config_dir) {
+                    scripts.extend(opencode_script_grants(&custom, home, &writable));
+                    scripts.insert(
+                        0,
+                        AgentDir {
+                            path: custom,
+                            write: false,
+                            map_exec: false,
+                            process_exec: false,
+                            write_files: vec![],
+                            create_dirs: vec![],
+                            via: vec![],
+                        },
+                    );
+                }
 
-                vec![
+                let mut dirs = vec![
                     AgentDir {
                         path: config_dir,
                         write: false,
@@ -1294,6 +1947,7 @@ impl Agent {
                         // Legacy auth.json (newer versions use account.json in data dir)
                         write_files: vec!["auth.json"],
                         create_dirs: vec![],
+                        via: vec![],
                     },
                     AgentDir {
                         path: data_dir,
@@ -1302,6 +1956,7 @@ impl Agent {
                         process_exec: false,
                         write_files: vec![],
                         create_dirs: vec![],
+                        via: vec![],
                     },
                     AgentDir {
                         path: state_dir,
@@ -1310,6 +1965,7 @@ impl Agent {
                         process_exec: false,
                         write_files: vec![],
                         create_dirs: vec![],
+                        via: vec![],
                     },
                     AgentDir {
                         path: cache_dir.clone(),
@@ -1318,6 +1974,7 @@ impl Agent {
                         process_exec: false,
                         write_files: vec![],
                         create_dirs: vec![],
+                        via: vec![],
                     },
                     AgentDir {
                         // OpenCode downloads managed tool binaries (rg, fd, etc.) here
@@ -1327,8 +1984,11 @@ impl Agent {
                         process_exec: true,
                         write_files: vec![],
                         create_dirs: vec![],
+                        via: vec![],
                     },
-                ]
+                ];
+                dirs.extend(scripts);
+                dirs
             }
             Agent::Antigravity => {
                 // Antigravity stores project config under ~/.gemini/config
@@ -1341,6 +2001,7 @@ impl Agent {
                         process_exec: false,
                         write_files: vec![],
                         create_dirs: vec![],
+                        via: vec![],
                     },
                     AgentDir {
                         path: home.join(".gemini/antigravity-cli"),
@@ -1349,6 +2010,7 @@ impl Agent {
                         process_exec: false,
                         write_files: vec![],
                         create_dirs: vec![],
+                        via: vec![],
                     },
                 ]
             }
@@ -1383,7 +2045,7 @@ impl Agent {
                 // bubblewrap.
                 //
                 // Cost: Pi can no longer create a NEW top-level entry under
-                // ~/.pi/agent mid-session, except the one named lock directory
+                // ~/.pi/agent mid-session, except the named lock directories
                 // `create_dirs` grants below (and on Linux only under
                 // bubblewrap — see `AgentDir::create_dirs`). The
                 // files it rewrites in place are carved back open below; a
@@ -1399,6 +2061,7 @@ impl Agent {
                     process_exec: false,
                     write_files: vec![],
                     create_dirs: vec![],
+                    via: vec![],
                 };
                 vec![
                     AgentDir {
@@ -1421,9 +2084,9 @@ impl Agent {
                             "keybindings.json",
                             "pi-debug.log",
                         ],
-                        // Pi reads its trust store through `proper-lockfile`
+                        // Pi reads auth, settings and its trust store through `proper-lockfile`
                         // 4.1.2, which takes the lock by `mkdir`ing
-                        // `trust.json.lock/`, then `utimes` it (an mtime-
+                        // `<file>.lock/`, then `utimes` it (an mtime-
                         // precision probe — on error it `rmdir`s and fails the
                         // lock), and `rmdir`s it to release. A NEW top-level
                         // directory under the read-only root, which
@@ -1436,7 +2099,12 @@ impl Agent {
                         // place (rename is a directory operation). See
                         // `AgentDir::create_dirs` for the bound and the Linux
                         // caveat.
-                        create_dirs: vec!["trust.json.lock"],
+                        create_dirs: vec![
+                            "trust.json.lock",
+                            "auth.json.lock",
+                            "settings.json.lock",
+                        ],
+                        via: vec![],
                     },
                     writable(agent.join("sessions")),
                     writable(agent.join("prompts")),
@@ -1451,6 +2119,7 @@ impl Agent {
                         process_exec: true,
                         write_files: vec![],
                         create_dirs: vec![],
+                        via: vec![],
                     },
                 ]
             }
@@ -1463,21 +2132,28 @@ impl Agent {
                     .ok()
                     .filter(|s| !s.is_empty());
                 if let Some(dir) = custom_dir {
-                    return vec![AgentDir {
-                        path: PathBuf::from(dir),
-                        write: true,
-                        map_exec: false,
-                        process_exec: false,
-                        write_files: vec![],
-                        create_dirs: vec![],
-                    }];
+                    let root = PathBuf::from(dir);
+                    let mut dirs = claude_hook_script_grants(&root, home, &[]);
+                    dirs.insert(
+                        0,
+                        AgentDir {
+                            path: root,
+                            write: true,
+                            map_exec: false,
+                            process_exec: false,
+                            write_files: vec![],
+                            create_dirs: vec![],
+                            via: vec![],
+                        },
+                    );
+                    return dirs;
                 }
                 // Default layout: ~/.claude holds sessions, projects, history,
                 // settings, and the OAuth token (.credentials.json on Linux).
                 // ~/.claude.json is the top-level config (projects, MCP servers,
                 // account) — a single file at home root, granted via a file path
                 // (Seatbelt subpath / Landlock PathBeneath both match a file).
-                vec![
+                let mut dirs = vec![
                     AgentDir {
                         path: home.join(".claude"),
                         write: true,
@@ -1485,6 +2161,7 @@ impl Agent {
                         process_exec: false,
                         write_files: vec![],
                         create_dirs: vec![],
+                        via: vec![],
                     },
                     AgentDir {
                         path: home.join(".claude.json"),
@@ -1493,8 +2170,16 @@ impl Agent {
                         process_exec: false,
                         write_files: vec![],
                         create_dirs: vec![],
+                        via: vec![],
                     },
-                ]
+                ];
+                let writable: Vec<PathBuf> = dirs.iter().map(|d| d.path.clone()).collect();
+                dirs.extend(claude_hook_script_grants(
+                    &home.join(".claude"),
+                    home,
+                    &writable,
+                ));
+                dirs
             }
             Agent::Goose => {
                 // goose keeps its files under XDG dirs on BOTH macOS and Linux —
@@ -1553,6 +2238,7 @@ impl Agent {
                         process_exec: false,
                         write_files: vec![],
                         create_dirs: vec![],
+                        via: vec![],
                     },
                     AgentDir {
                         path: data_base.join("goose"),
@@ -1561,6 +2247,7 @@ impl Agent {
                         process_exec: false,
                         write_files: vec![],
                         create_dirs: vec![],
+                        via: vec![],
                     },
                     AgentDir {
                         path: state_base.join("goose"),
@@ -1569,6 +2256,7 @@ impl Agent {
                         process_exec: false,
                         write_files: vec![],
                         create_dirs: vec![],
+                        via: vec![],
                     },
                 ]
             }
@@ -1594,6 +2282,7 @@ impl Agent {
                     process_exec: false,
                     write_files: vec![],
                     create_dirs: vec![],
+                    via: vec![],
                 }]
             }
         }
@@ -1846,6 +2535,13 @@ impl Agent {
     /// For OpenCode: straightforward PATH search.
     /// For Shell: uses $SHELL or falls back to /bin/zsh (macOS) or /bin/bash.
     pub fn resolve_binary(&self) -> Result<PathBuf, String> {
+        self.resolve_binary_with_editor_provenance()
+            .map(|(path, _)| path)
+    }
+
+    /// Preserve editor provenance independently of the executable's canonical
+    /// path: an editor-directory symlink may point outside that directory.
+    pub fn resolve_binary_with_editor_provenance(&self) -> Result<(PathBuf, bool), String> {
         if matches!(self, Agent::Shell) {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| {
                 if cfg!(target_os = "macos") {
@@ -1856,7 +2552,7 @@ impl Agent {
             });
             let path = PathBuf::from(&shell);
             if path.is_file() {
-                return Ok(path);
+                return Ok((path, false));
             }
             return Err(format!("Shell not found: {shell}"));
         }
@@ -1888,6 +2584,8 @@ impl Agent {
                 if crate::shim::skip_candidate(&candidate) {
                     continue;
                 }
+                let editor_candidate =
+                    matches!(self, Agent::Copilot) && is_copilot_editor_launcher(&candidate);
 
                 // Resolve mise/asdf shims to the real binary to avoid version conflicts
                 // when the project's .tool-versions specifies a different node version.
@@ -1895,13 +2593,15 @@ impl Agent {
                     if self_exe.as_ref() == Some(&real_bin) {
                         continue;
                     }
-                    if matches!(self, Agent::Copilot) && is_editor_shim(&real_bin) {
+                    if editor_candidate
+                        || (matches!(self, Agent::Copilot) && is_copilot_editor_launcher(&real_bin))
+                    {
                         if editor_shim.is_none() {
                             editor_shim = Some(real_bin);
                         }
                         continue;
                     }
-                    return Ok(real_bin);
+                    return Ok((real_bin, false));
                 }
 
                 let resolved =
@@ -1930,19 +2630,21 @@ impl Agent {
                 }
 
                 // Copilot-specific: prefer standalone over editor shims
-                if matches!(self, Agent::Copilot) && is_editor_shim(&resolved) {
+                if editor_candidate
+                    || (matches!(self, Agent::Copilot) && is_copilot_editor_launcher(&resolved))
+                {
                     if editor_shim.is_none() {
                         editor_shim = Some(resolved);
                     }
                     continue;
                 }
 
-                return Ok(resolved);
+                return Ok((resolved, false));
             }
         }
 
         if let Some(shim) = editor_shim {
-            return Ok(shim);
+            return Ok((shim, true));
         }
 
         let install_hint = match self {
@@ -2141,6 +2843,11 @@ pub struct AgentDir {
     ///   Under bubblewrap any *new* subdirectory name can be made and any
     ///   *empty* one removed, never file content (no `WriteFile`/`MakeReg`).
     pub create_dirs: Vec<&'static str>,
+    /// For a hook/MCP script grant: the path as configured plus every symlink
+    /// location crossed resolving it (see [`symlink_locations`]). A grant is
+    /// dropped when any of these sits in a writable tree, since the agent could
+    /// swap that link for one to any file it wants read. Empty otherwise.
+    pub via: Vec<PathBuf>,
 }
 
 /// The root `dsh` will resolve for its Harness home, mirroring the harness's
@@ -2210,6 +2917,46 @@ pub fn deny_copilot_dir_exec(dirs: &mut [AgentDir], home: &Path) -> bool {
 /// brings the built-in agent dirs in line. Paths that cannot be resolved (a dir
 /// the caller has not created yet, a dangling link) are left as-is so the
 /// caller still emits a rule for the literal path rather than dropping it.
+/// Drop hook/MCP script grants (file-level, exec-only) that sit under a path
+/// the sandbox already makes writable: the project, `--repo-dir` roots,
+/// `allow.write`, the writable home tool dirs, the system temp dirs
+/// ([`crate::sandbox::home_and_temp_writable_roots`]) and the agent's own
+/// writable dirs. Those scripts are already
+/// readable and run under the normal rules for that tree; an exec-only grant
+/// would write-deny the script and pin its parent, so a developer could not
+/// edit their own MCP server or hook. A grant whose configured path or any
+/// symlink crossed resolving it ([`AgentDir::via`]) is in such a tree is
+/// dropped too: the agent could point that link at any file it wants read.
+/// Call after [`canonicalize_agent_dirs`].
+pub fn drop_script_grants_under(dirs: &mut Vec<AgentDir>, writable: &[PathBuf]) {
+    let mut roots: Vec<PathBuf> = writable
+        .iter()
+        .chain(dirs.iter().filter(|d| d.write).map(|d| &d.path))
+        .flat_map(|p| [p.clone(), std::fs::canonicalize(p).unwrap_or_default()])
+        .filter(|p| !p.as_os_str().is_empty())
+        .collect();
+    roots.dedup();
+    dirs.retain(|d| {
+        let script = !d.write && d.process_exec && !d.map_exec && d.path.is_file();
+        let under = |p: &PathBuf| roots.iter().any(|r| path_under(p, r));
+        !(script && (under(&d.path) || d.via.iter().any(under)))
+    });
+}
+
+/// `p` is `root` or inside it. On macOS APFS is case-insensitive by default and
+/// `realpath` keeps the spelling it was given, so `$T/PROJ` and `$T/proj` name
+/// the same tree; compare case-insensitively there (over-matching only drops a
+/// script grant).
+fn path_under(p: &Path, root: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let lower = |x: &Path| PathBuf::from(x.to_string_lossy().to_lowercase());
+        lower(p).starts_with(lower(root))
+    }
+    #[cfg(not(target_os = "macos"))]
+    p.starts_with(root)
+}
+
 pub fn canonicalize_agent_dirs(dirs: &mut [AgentDir]) {
     for dir in dirs {
         if let Ok(resolved) = std::fs::canonicalize(&dir.path) {
@@ -2330,12 +3077,41 @@ pub fn is_windows_interop_path(path: &Path) -> bool {
         && parts.next().is_some()
 }
 
-/// Check if a copilot binary is a VS Code/Cursor/editor shim script.
-fn is_editor_shim(path: &Path) -> bool {
-    let Ok(content) = std::fs::read_to_string(path) else {
+/// Editor launchers can read the Keychain before Copilot consumes its env token
+/// (#753). Prefer standalone installs even when the editor launcher is not the
+/// older `copilotCLIShim.js` script.
+pub fn is_copilot_editor_launcher(path: &Path) -> bool {
+    let components: Vec<_> = path.components().collect();
+    if components.windows(2).any(|pair| {
+        pair[0].as_os_str() == "github.copilot-chat" && pair[1].as_os_str() == "copilotCli"
+    }) {
+        return true;
+    }
+    let Ok(Some(content)) = crate::untrusted::read_untrusted(path, 64 * 1024) else {
         return false;
     };
     content.starts_with("#!") && content.contains("copilotCLIShim.js")
+}
+
+/// Refuse an editor launch with a denied Keychain rather than restore the
+/// whole-Keychain grant silently. The same check feeds launch and doctor.
+pub fn validate_copilot_keychain_substitute(
+    path: &Path,
+    editor_launcher: bool,
+    substitute_active: bool,
+) -> Result<(), String> {
+    if cfg!(target_os = "macos") && substitute_active && editor_launcher {
+        return Err(format!(
+            "Copilot's editor launcher at {} can require the Keychain even with GH_TOKEN set \
+             (#753), but this session denies Keychain access. Install standalone Copilot \
+             outside cplt with `brew install --cask copilot-cli` or \
+             `npm install -g @github/copilot`, put it in PATH, then rerun \
+             `cplt doctor --verbose` to check the selected binary. \
+             Keep sandbox.keychain_substitute enabled.",
+            path.display(),
+        ));
+    }
+    Ok(())
 }
 
 /// Detect if a candidate path (before canonicalization) is a mise or asdf shim.
@@ -2444,6 +3220,445 @@ impl std::fmt::Display for Agent {
 mod tests {
     use super::*;
 
+    #[test]
+    fn opencode_v2_is_detected_from_its_install_path() {
+        let none = Path::new("/nonexistent-cplt-cache");
+        let v2 = |p: &str| is_opencode_v2(Path::new(p), none);
+        assert_eq!(
+            v2("/n/lib/node_modules/@opencode/cli/bin/opencode.exe"),
+            Some(true)
+        );
+        assert_eq!(
+            v2("/n/lib/node_modules/@opencode/cli-darwin-arm64/bin/opencode"),
+            Some(true)
+        );
+        assert_eq!(v2("/brew/Cellar/opencode/2.0.24/bin/opencode"), Some(true));
+        assert_eq!(
+            v2("/brew/Cellar/opencode-v2/2.0.24/bin/opencode"),
+            Some(true)
+        );
+        assert_eq!(v2("/nonexistent-cplt/bin/opencode"), None);
+        assert_eq!(
+            v2("/brew/Cellar/opencode/1.18.35/bin/opencode"),
+            Some(false)
+        );
+        assert_eq!(
+            v2("/n/lib/node_modules/opencode-ai/bin/opencode"),
+            Some(false)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_v2_probe_is_cached() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("opencode");
+        let count = dir.path().join("count");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\necho x >> {}\necho opencode v2.0.24\n",
+                count.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let home = dir.path().join("home");
+        assert_eq!(is_opencode_v2(&bin, &home), Some(true));
+        assert_eq!(is_opencode_v2(&bin, &home), Some(true));
+        assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(), 1);
+        // The verdict must sit where the sandbox denies the agent writes.
+        let state = home.join(crate::sandbox::CPLT_STATE_DIR);
+        assert!(state.join("opencode-version").exists());
+        assert!(crate::sandbox::DENIED_DOTFILES.contains(&crate::sandbox::CPLT_STATE_DIR));
+    }
+
+    /// #725: a probe with no usable answer is retried once, never cached, and
+    /// yields no verdict, so the launch refuses instead of assuming 1.x.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_v2_unknown_probe_is_retried_and_not_cached() {
+        use std::os::unix::fs::PermissionsExt;
+        // The garbage and fail scripts exit at once, so their budget is only a
+        // ceiling. The hang script must time out; 2 s leaves room for the shell
+        // to start and log the attempt under parallel test load (#735).
+        let secs = std::time::Duration::from_secs;
+        for (name, body, budget) in [
+            ("hang", "exec sleep 30", secs(2)),
+            ("garbage", "echo opencode", secs(60)),
+            ("fail", "echo opencode v2.0.0; exit 1", secs(60)),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = dir.path().join("opencode");
+            let count = dir.path().join("count");
+            let script = format!("#!/bin/sh\necho x >> {}\n{body}\n", count.display());
+            std::fs::write(&bin, script).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let home = dir.path().join("home");
+            assert_eq!(opencode_v2_within(&bin, &home, [budget; 2]), None, "{name}");
+            assert_eq!(
+                std::fs::read_to_string(&count).unwrap().lines().count(),
+                2,
+                "{name}: one retry"
+            );
+            let state = home.join(crate::sandbox::CPLT_STATE_DIR);
+            assert!(!state.join("opencode-version").exists(), "{name}: cached");
+        }
+        // A 1.x answer is unchanged.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("opencode");
+        std::fs::write(&bin, "#!/bin/sh\necho 1.18.35\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(is_opencode_v2(&bin, &dir.path().join("home")), Some(false));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn claude_hook_scripts_get_exec_only_file_grants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let home = base.join("home");
+        let root = home.join(".claude");
+        let hooks = base.join("hooks dir");
+        for d in [&root, &hooks, &home.join(".ssh"), &home.join("bin")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let file = |p: PathBuf| {
+            std::fs::write(&p, "#!/bin/sh\n").unwrap();
+            p
+        };
+        let quoted = file(hooks.join("gate.py"));
+        let tilde = file(home.join("bin/status.sh"));
+        let env = file(home.join("bin/env.sh"));
+        let inside = file(root.join("own.sh"));
+        let key = file(home.join(".ssh/id_ed25519"));
+        let logged = file(hooks.join("hook.py"));
+        let log = file(base.join("log.txt"));
+        let plain = file(hooks.join("hook.sh"));
+        let log2 = file(base.join("state.txt"));
+        let cfg = file(home.join(".claude.json"));
+        // A project-level settings file is never read.
+        let project = file(base.join("project.sh"));
+        std::fs::create_dir_all(base.join(".claude")).unwrap();
+        std::fs::write(
+            base.join(".claude/settings.json"),
+            format!(
+                r#"{{"hooks":{{"Stop":[{{"hooks":[{{"command":"{}"}}]}}]}}}}"#,
+                project.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("settings.local.json"),
+            format!(r#"{{"statusLine":{{"command":"{}"}}}}"#, project.display()),
+        )
+        .unwrap();
+        let settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{"matcher": "Bash", "hooks": [
+                    {"type": "command", "command": format!("python3 '{}' --strict", quoted.display())},
+                    {"type": "command", "command": "$HOME/bin/env.sh"},
+                    {"type": "command", "command": format!("{} && cat {}", inside.display(), key.display())},
+                    {"type": "command", "command": "/does/not/exist.sh"},
+                    {"type": "command", "command": format!("python3 -u '{}' --log {}", logged.display(), log.display())},
+                    {"type": "command", "command": format!("'{}' {}", plain.display(), log2.display())},
+                    {"type": "command", "command": format!("{} --x", cfg.display())},
+                ]}],
+            },
+            "statusLine": {"type": "command", "command": "~/bin/status.sh"},
+        });
+        std::fs::write(root.join("settings.json"), settings.to_string()).unwrap();
+
+        let got = claude_hook_script_grants(&root, &home, &[home.join(".claude.json")]);
+        let paths: Vec<_> = got.iter().map(|d| d.path.clone()).collect();
+        assert!(
+            paths.contains(&quoted),
+            "interpreter + quoted script: {paths:?}"
+        );
+        assert!(paths.contains(&env), "$HOME expansion: {paths:?}");
+        assert!(paths.contains(&tilde), "~ expansion: {paths:?}");
+        assert!(!paths.contains(&inside), "already under the config root");
+        assert!(
+            !paths.contains(&key),
+            "credential dir must never be granted"
+        );
+        assert!(
+            !paths.contains(&project),
+            "agent-writable settings are ignored"
+        );
+        assert!(paths.contains(&logged) && paths.contains(&plain));
+        assert!(!paths.contains(&log), "interpreter args are not granted");
+        assert!(!paths.contains(&log2), "script args are not granted");
+        assert!(!paths.contains(&cfg), "agent-writable file is skipped");
+        assert!(got.iter().all(|d| !d.write && d.process_exec));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn opencode_dir_plugin_entrypoint_must_stay_inside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        let cfg = home.join(".config/opencode");
+        let (abs, dotdot, link) = (home.join("abs"), home.join("dotdot"), home.join("link"));
+        for d in [&cfg, &abs, &dotdot, &link] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let secret = home.join("secret.sh");
+        std::fs::write(&secret, "x").unwrap();
+        let main = |d: &Path, m: &str| {
+            std::fs::write(d.join("package.json"), format!(r#"{{"main":"{m}"}}"#)).unwrap();
+        };
+        main(&abs, &secret.display().to_string());
+        main(&dotdot, "../secret.sh");
+        std::os::unix::fs::symlink(&secret, link.join("index.js")).unwrap();
+        std::fs::write(
+            cfg.join("opencode.json"),
+            r#"{"plugin":["file://~/abs","file://~/dotdot","file://~/link"]}"#,
+        )
+        .unwrap();
+        let got = opencode_script_grants(&cfg, &home, &[]);
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn claude_hook_scripts_skip_files_under_symlinked_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let hook = real.join("hook.sh");
+        std::fs::write(&hook, "#!/bin/sh\n").unwrap();
+        std::fs::write(
+            link.join("settings.json"),
+            format!(r#"{{"statusLine":{{"command":"{}"}}}}"#, hook.display()),
+        )
+        .unwrap();
+        assert!(claude_hook_script_grants(&link, &base, &[]).is_empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn copilot_hook_and_mcp_scripts_get_exec_only_file_grants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let home = base.join("home");
+        let root = home.join(".copilot");
+        let ext = base.join("ext");
+        for d in [&root.join("hooks"), &ext, &home.join(".ssh")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let file = |p: PathBuf| {
+            std::fs::write(&p, "#!/bin/sh\n").unwrap();
+            p
+        };
+        let bash = file(ext.join("bash.sh"));
+        let exec = file(ext.join("exec.py"));
+        let setting = file(ext.join("setting.sh"));
+        let server = file(ext.join("server.js"));
+        let log = file(ext.join("log.txt"));
+        let linked = file(ext.join("linked.sh"));
+        let project = file(ext.join("project.sh"));
+        let key = file(home.join(".ssh/id_ed25519"));
+        let inside = file(root.join("own.sh"));
+        let hook = |cmd: serde_json::Value| {
+            serde_json::json!({"version": 1, "hooks": {"preToolUse": [cmd]}}).to_string()
+        };
+        std::fs::write(
+            root.join("hooks/a.json"),
+            hook(serde_json::json!({"type": "command", "bash": format!("'{}' {}", bash.display(), log.display())})),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("hooks/b.json"),
+            hook(serde_json::json!({"type": "command", "exec": "python3", "args": ["-u", exec.display().to_string()]})),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("settings.json"),
+            hook(serde_json::json!({"type": "command", "command": format!("{} && {}", setting.display(), inside.display())})),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("mcp-config.json"),
+            serde_json::json!({"mcpServers": {
+                "a": {"command": "node", "args": [server.display().to_string()]},
+                "b": {"command": key.display().to_string()},
+                "c": {"command": "npx", "args": ["-y", "pkg"]},
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        // A symlinked hook file is not covered by the write deny: not read.
+        let planted = base.join("planted.json");
+        std::fs::write(
+            &planted,
+            hook(serde_json::json!({"bash": linked.display().to_string()})),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&planted, root.join("hooks/c.json")).unwrap();
+        // Project-level config is never read.
+        std::fs::create_dir_all(base.join(".github/hooks")).unwrap();
+        std::fs::write(
+            base.join(".github/hooks/p.json"),
+            hook(serde_json::json!({"bash": project.display().to_string()})),
+        )
+        .unwrap();
+
+        let got = copilot_hook_script_grants(&root, &home);
+        let paths: Vec<_> = got.iter().map(|d| d.path.clone()).collect();
+        for want in [&bash, &exec, &setting, &server] {
+            assert!(paths.contains(want), "{want:?} missing: {paths:?}");
+        }
+        for not in [&log, &linked, &project, &key, &inside] {
+            assert!(!paths.contains(not), "{not:?} granted: {paths:?}");
+        }
+        assert!(got.iter().all(|d| !d.write && d.process_exec));
+    }
+
+    #[test]
+    fn claude_hook_scripts_tolerate_missing_and_bad_settings() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(claude_hook_script_grants(tmp.path(), tmp.path(), &[]).is_empty());
+        std::fs::write(tmp.path().join("settings.json"), "{not json").unwrap();
+        assert!(claude_hook_script_grants(tmp.path(), tmp.path(), &[]).is_empty());
+    }
+
+    #[test]
+    fn strip_jsonc_drops_comments_and_trailing_commas() {
+        let t = "{\n // c\n \"a\": \"x//y /*z*/\", /* b */\n \"b\": [1,2,],\n}";
+        let v: serde_json::Value = serde_json::from_str(&strip_jsonc(t)).unwrap();
+        assert_eq!(v, serde_json::json!({"a": "x//y /*z*/", "b": [1, 2]}));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn opencode_script_grants_plugins_and_mcp_commands() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        let cfg = home.join(".config/opencode");
+        let data = home.join(".local/share/opencode");
+        let ext = home.join("ext");
+        for d in [&cfg, &data, &ext, &home.join(".ssh")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let f = |p: PathBuf| {
+            std::fs::write(&p, "x").unwrap();
+            p
+        };
+        let plugin = f(ext.join("plugin.js"));
+        let arr_plugin = f(ext.join("arr.js"));
+        let server = f(ext.join("server.js"));
+        let direct = f(ext.join("mcp.sh"));
+        let arg = f(ext.join("arg.txt"));
+        let key = f(home.join(".ssh/id_ed25519"));
+        let inside = f(data.join("x.sh"));
+        let project = f(ext.join("project.js"));
+        std::fs::create_dir_all(ext.join("my dir/pkg")).unwrap();
+        let spaced = f(ext.join("my dir/s.js"));
+        let pkg_main = f(ext.join("my dir/pkg/main.js"));
+        std::fs::write(ext.join("my dir/pkg/package.json"), r#"{"main":"main.js"}"#).unwrap();
+        std::fs::write(
+            ext.join("opencode.json"),
+            format!(r#"{{"plugin":["file://{}"]}}"#, project.display()),
+        )
+        .unwrap();
+        std::fs::write(
+            cfg.join("opencode.jsonc"),
+            format!(
+                r#"{{
+  // user config
+  "plugin": ["npm-pkg", "file://~/ext/plugin.js", ["file://{arr}", {{}}], "file://{key}", "file://~/ext/my%20dir/s.js", "file://~/ext/my%20dir/pkg",],
+  "mcp": {{
+    "a": {{"type": "local", "command": ["node", "--x", "{server}", "{arg}"]}},
+    "b": {{"type": "local", "command": ["$HOME/ext/mcp.sh"]}},
+    "c": {{"type": "local", "command": ["{inside}"]}},
+    "d": {{"type": "remote", "url": "https://x"}}, /* trailing */
+  }},
+}}"#,
+                arr = arr_plugin.display(),
+                key = key.display(),
+                server = server.display(),
+                arg = arg.display(),
+                inside = inside.display(),
+            ),
+        )
+        .unwrap();
+        let got = opencode_script_grants(&cfg, &home, &[data]);
+        assert!(
+            ["opencode.json", "config.json"]
+                .iter()
+                .all(|n| !cfg.join(n).exists() && got.iter().all(|d| d.path != cfg.join(n))),
+            "missing config files are neither granted nor created"
+        );
+        let mut paths: Vec<_> = got.iter().map(|d| d.path.clone()).collect();
+        paths.sort();
+        let mut want = vec![plugin, arr_plugin, server, direct, spaced, pkg_main];
+        want.sort();
+        assert_eq!(
+            paths, want,
+            "project config, args, ~/.ssh, writable dir skipped"
+        );
+        assert!(got.iter().all(|d| !d.write && d.process_exec));
+        // A config dir inside a writable tree grants nothing (#703).
+        let mut dirs = got.clone();
+        drop_script_grants_under(&mut dirs, &[home.join(".config")]);
+        assert!(dirs.is_empty(), "{dirs:?}");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn opencode_script_grants_follow_symlinked_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        let proj = home.join("proj");
+        let dots = home.join("dotfiles");
+        let ext = home.join("ext");
+        for d in [&proj, &dots, &ext, &home.join(".config")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let plugin = ext.join("p.js");
+        std::fs::write(&plugin, "x").unwrap();
+        let conf = format!(r#"{{"plugin":["file://{}"]}}"#, plugin.display());
+        let grants = |cfg: &Path| {
+            let mut g = opencode_script_grants(cfg, &home, &[]);
+            drop_script_grants_under(&mut g, std::slice::from_ref(&proj));
+            g
+        };
+        // 1. Config dir is a symlink into the project.
+        std::fs::create_dir_all(proj.join("dotcfg")).unwrap();
+        std::fs::write(proj.join("dotcfg/config.json"), &conf).unwrap();
+        let cfg1 = home.join(".config/oc1");
+        std::os::unix::fs::symlink(proj.join("dotcfg"), &cfg1).unwrap();
+        assert!(grants(&cfg1).is_empty());
+        // 2. Config file is a symlink into the project.
+        let cfg2 = home.join(".config/oc2");
+        std::fs::create_dir_all(&cfg2).unwrap();
+        std::fs::write(proj.join("oc.json"), &conf).unwrap();
+        std::os::unix::fs::symlink(proj.join("oc.json"), cfg2.join("opencode.json")).unwrap();
+        assert!(grants(&cfg2).is_empty());
+        // 3. Dotfiles symlink outside every writable tree is still trusted.
+        let cfg3 = home.join(".config/oc3");
+        std::fs::create_dir_all(&cfg3).unwrap();
+        std::fs::write(dots.join("oc.json"), &conf).unwrap();
+        std::os::unix::fs::symlink(dots.join("oc.json"), cfg3.join("opencode.json")).unwrap();
+        let g = grants(&cfg3);
+        assert_eq!(g.len(), 1, "{g:?}");
+        assert_eq!(g[0].path, plugin);
+    }
+
+    #[test]
+    fn shell_words_honours_quotes() {
+        assert_eq!(
+            shell_words(r#"python3 "/a b/x.py" '/c d' e"#),
+            ["python3", "/a b/x.py", "/c d", "e"]
+        );
+        assert_eq!(shell_words("x ''"), ["x", ""]);
+    }
+
     /// Every `Agent` variant, for the tests that must cover all of them.
     /// `all_agents_covers_every_variant` keeps this honest.
     const ALL_AGENTS: [Agent; 8] = [
@@ -2488,6 +3703,7 @@ mod tests {
             process_exec: false,
             write_files: vec![],
             create_dirs: vec![],
+            via: vec![],
         }
     }
 
@@ -3029,6 +4245,35 @@ mod tests {
             assert!(!cache_bin.write, "cache/bin should not be writable");
             assert!(cache_bin.process_exec, "cache/bin should allow exec");
         });
+    }
+
+    /// #720: on Linux the custom dir's read grant is a Landlock rule no deny
+    /// can narrow, so one on or around a credential dir must be refused.
+    #[test]
+    fn env_config_dir_on_credentials_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(home.join(".ssh/sub")).unwrap();
+        std::fs::create_dir_all(home.join(".config/oc")).unwrap();
+        std::os::unix::fs::symlink(home.join(".ssh"), home.join("link")).unwrap();
+        for (dir, bad) in [
+            (".ssh", true),
+            (".ssh/sub", true),
+            ("link", true),
+            (".aws", true),
+            (".config/oc", false),
+        ] {
+            for (agent, var) in [
+                (Agent::OpenCode, "OPENCODE_CONFIG_DIR"),
+                (Agent::Claude, "CLAUDE_CONFIG_DIR"),
+                (Agent::Dsh, "DSH_HOME"),
+            ] {
+                let got = temp_env::with_var(var, Some(home.join(dir)), || {
+                    env_config_dir_on_credentials(agent, &home)
+                });
+                assert_eq!(got.is_some(), bad, "{var}={dir}");
+            }
+        }
     }
 
     #[test]
@@ -4191,6 +5436,38 @@ mod tests {
         }
     }
 
+    /// #710: v2's login lives in opencode.db's credential table.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn opencode_db_copilot_login_is_detected() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("opencode.db");
+        assert!(!opencode_db_has_copilot(&db));
+        let sql = |q: &str| {
+            assert!(
+                std::process::Command::new("/usr/bin/sqlite3")
+                    .arg(&db)
+                    .arg(q)
+                    .status()
+                    .expect("sqlite3")
+                    .success()
+            );
+        };
+        sql("CREATE TABLE credential (integration_id TEXT, value TEXT)");
+        sql(r#"INSERT INTO credential VALUES ('anthropic', '{"type":"key"}')"#);
+        assert!(!opencode_db_has_copilot(&db));
+        sql(
+            r#"INSERT INTO credential VALUES ('github-copilot', '{"type":"oauth","metadata":{"enterpriseUrl":"x"}}')"#,
+        );
+        assert!(!opencode_db_has_copilot(&db));
+        sql(r#"INSERT INTO credential VALUES ('github-copilot', '{"type":"oauth"}')"#);
+        assert!(opencode_db_has_copilot(&db));
+        // Agent-writable: a symlink to a real db is not followed (#716).
+        let link = tmp.path().join("link.db");
+        std::os::unix::fs::symlink(&db, &link).unwrap();
+        assert!(!opencode_db_has_copilot(&link));
+    }
+
     /// #695: a configured gh adds the Copilot hosts only when the overlay
     /// would apply.
     #[test]
@@ -4286,6 +5563,28 @@ mod tests {
     /// #609: the auth file sits in a dir the sandboxed agent can write, so a
     /// planted FIFO, device symlink or huge file must not hang or bloat the
     /// next launch; each is skipped.
+    /// Pre-existing leak: a symlinked auth.json (agent-writable data dir)
+    /// pointing at another host JSON must not reach OPENCODE_AUTH_CONTENT.
+    #[test]
+    fn opencode_host_login_refuses_symlinked_auth_json() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join(".local/share/opencode");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let secret = tmp.path().join("adc.json");
+        std::fs::write(&secret, r#"{"client_secret":"s3cret"}"#).unwrap();
+        std::os::unix::fs::symlink(&secret, dir.join("auth.json")).unwrap();
+        let got = temp_env::with_var("XDG_DATA_HOME", None::<&str>, || {
+            opencode_host_login(tmp.path(), "tok")
+        });
+        assert!(got.is_none(), "handed over through a symlink: {got:?}");
+        std::fs::remove_file(dir.join("auth.json")).unwrap();
+        std::fs::hard_link(&secret, dir.join("auth.json")).unwrap();
+        let got = temp_env::with_var("XDG_DATA_HOME", None::<&str>, || {
+            opencode_host_login(tmp.path(), "tok")
+        });
+        assert!(got.is_none(), "handed over through a hard link: {got:?}");
+    }
+
     #[test]
     fn provider_domains_skips_non_regular_and_oversize_auth_json() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -4521,6 +5820,71 @@ mod tests {
     }
 
     #[test]
+    fn copilot_prefers_standalone_over_editor_launchers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        let editor = home.join(
+            "Library/Application Support/Code/User/globalStorage/github.copilot-chat/copilotCli",
+        );
+        let old_editor = home.join("old-editor");
+        let standalone = home.join("standalone");
+        let linked_editor = home.join("linked/github.copilot-chat/copilotCli");
+        for (dir, body) in [
+            (&editor, "#!/bin/sh\nexit 0\n"),
+            (&old_editor, "#!/bin/sh\n# copilotCLIShim.js\n"),
+            (&standalone, "#!/bin/sh\nexit 0\n"),
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("copilot"), body).unwrap();
+        }
+        std::fs::create_dir_all(&linked_editor).unwrap();
+        std::os::unix::fs::symlink(standalone.join("copilot"), linked_editor.join("copilot"))
+            .unwrap();
+        for launcher in [&editor, &old_editor, &linked_editor] {
+            let path = std::env::join_paths([launcher, &standalone]).unwrap();
+            temp_env::with_vars(
+                [
+                    ("HOME", Some(home.as_os_str())),
+                    ("PATH", Some(path.as_os_str())),
+                ],
+                || {
+                    assert_eq!(
+                        Agent::Copilot.resolve_binary_with_editor_provenance(),
+                        Ok((standalone.join("copilot"), false))
+                    );
+                },
+            );
+            temp_env::with_vars(
+                [
+                    ("HOME", Some(home.as_os_str())),
+                    ("PATH", Some(launcher.as_os_str())),
+                ],
+                || {
+                    let (bin, editor) = Agent::Copilot
+                        .resolve_binary_with_editor_provenance()
+                        .unwrap();
+                    assert_eq!(bin, launcher.join("copilot").canonicalize().unwrap());
+                    assert!(editor);
+                    assert!(validate_copilot_keychain_substitute(&bin, editor, false).is_ok());
+                    let result = validate_copilot_keychain_substitute(&bin, editor, true);
+                    if cfg!(target_os = "macos") {
+                        assert!(
+                            result
+                                .unwrap_err()
+                                .contains("brew install --cask copilot-cli")
+                        );
+                    } else {
+                        assert!(result.is_ok());
+                    }
+                },
+            );
+        }
+        assert!(
+            validate_copilot_keychain_substitute(&standalone.join("copilot"), false, true).is_ok()
+        );
+    }
+
+    #[test]
     fn resolve_mise_shim_non_shim_dir_returns_none() {
         // A path not in a shims directory should return None immediately
         let candidate = Path::new("/usr/local/bin/copilot");
@@ -4544,5 +5908,178 @@ mod tests {
         let candidate = Path::new("/home/user/.asdf/shims/copilot");
         let result = resolve_mise_shim(candidate, "copilot");
         let _ = result;
+    }
+
+    /// A script inside a writable tree (the project) keeps no exec-only grant,
+    /// so it is not write-denied; one outside keeps its grant.
+    #[test]
+    fn script_grants_under_writable_paths_are_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let proj = base.join("proj");
+        std::fs::create_dir_all(proj.join("mcp")).unwrap();
+        let inside = proj.join("mcp/server.js");
+        let outside = base.join("hook.sh");
+        let bin = base.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for f in [&inside, &outside] {
+            std::fs::write(f, "").unwrap();
+        }
+        let grant = |p: &Path| AgentDir {
+            path: p.to_path_buf(),
+            write: false,
+            map_exec: false,
+            process_exec: true,
+            write_files: vec![],
+            create_dirs: vec![],
+            via: vec![],
+        };
+        let mut dirs = vec![grant(&inside), grant(&outside), grant(&bin)];
+        drop_script_grants_under(&mut dirs, &[proj]);
+        let paths: Vec<_> = dirs.iter().map(|d| d.path.clone()).collect();
+        // `bin` is a directory grant (OpenCode's shape), never dropped here.
+        assert_eq!(paths, vec![outside, bin]);
+    }
+
+    /// A configured script path that is a symlink in a writable tree gets no
+    /// grant, wherever it points: the agent could repoint it at a secret. A
+    /// symlink outside writable trees still resolves and is granted.
+    #[test]
+    fn script_grant_through_writable_symlink_is_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let (proj, out) = (base.join("proj"), base.join("out"));
+        std::fs::create_dir_all(proj.join("sub")).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        let secret = out.join("secret");
+        let hook = out.join("hook.sh");
+        std::fs::write(&secret, "").unwrap();
+        std::fs::write(&hook, "").unwrap();
+        // Direct link in the project; link outside via a dir link in the project.
+        std::os::unix::fs::symlink(&secret, proj.join("evil.sh")).unwrap();
+        std::os::unix::fs::symlink(proj.join("sub"), out.join("d")).unwrap();
+        std::os::unix::fs::symlink(&secret, proj.join("sub/x")).unwrap();
+        std::os::unix::fs::symlink(&hook, out.join("ok.sh")).unwrap();
+        let paths = vec![proj.join("evil.sh"), out.join("d/x"), out.join("ok.sh")];
+        let mut dirs = script_grants(paths, &base.join("root"), &base.join("home"), &[]);
+        drop_script_grants_under(&mut dirs, &[proj]);
+        let got: Vec<_> = dirs.iter().map(|d| d.path.clone()).collect();
+        assert_eq!(got, vec![hook]);
+    }
+
+    /// Links in writable home tool dirs (`~/.cache`, `~/.yarn/bin`) are
+    /// agent-rewritable too, so scripts reached through them lose their grant;
+    /// a plain script elsewhere in home keeps it (#714).
+    #[test]
+    fn script_grant_through_home_tool_dir_symlink_is_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        let tools = home.join("tools");
+        std::fs::create_dir_all(home.join(".cache")).unwrap();
+        std::fs::create_dir_all(home.join(".yarn/bin")).unwrap();
+        std::fs::create_dir_all(&tools).unwrap();
+        let (a, b, ok) = (tools.join("a.sh"), tools.join("b.js"), tools.join("ok.sh"));
+        for f in [&a, &b, &ok] {
+            std::fs::write(f, "").unwrap();
+        }
+        std::os::unix::fs::symlink(&a, home.join(".cache/hook.sh")).unwrap();
+        std::os::unix::fs::symlink(&b, home.join(".yarn/bin/mcp")).unwrap();
+        let paths = vec![
+            home.join(".cache/hook.sh"),
+            home.join(".yarn/bin/mcp"),
+            ok.clone(),
+        ];
+        let mut dirs = script_grants(paths, &home.join("root"), &home, &[]);
+        assert_eq!(dirs.len(), 3);
+        // The tempdir itself sits under a system temp root; keep only home roots.
+        let tool_dirs: Vec<_> = crate::sandbox::HOME_TOOL_DIRS
+            .iter()
+            .map(|d| d.resolve(&home, &[]))
+            .collect();
+        let mut roots = crate::sandbox::home_and_temp_writable_roots(&home, &tool_dirs, None);
+        roots.retain(|r| r.starts_with(&home));
+        drop_script_grants_under(&mut dirs, &roots);
+        let got: Vec<_> = dirs.iter().map(|d| d.path.clone()).collect();
+        assert_eq!(got, vec![ok]);
+    }
+
+    /// `CARGO_HOME` relocated outside home and a worktree's git common dir are
+    /// writable trees too; a script linked from either loses its grant.
+    #[test]
+    fn script_grant_through_relocated_tool_dir_or_git_common_dir_is_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let (home, cargo, git, tools) = (
+            base.join("home"),
+            base.join("cargo"),
+            base.join("repo.git"),
+            base.join("tools"),
+        );
+        for d in [&home, &cargo.join("registry"), &git.join("hooks"), &tools] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let (a, b, ok) = (tools.join("a.sh"), tools.join("b.sh"), tools.join("ok.sh"));
+        for f in [&a, &b, &ok] {
+            std::fs::write(f, "").unwrap();
+        }
+        std::os::unix::fs::symlink(&a, cargo.join("registry/hook")).unwrap();
+        std::os::unix::fs::symlink(&b, git.join("hooks/mcp")).unwrap();
+        let paths = vec![
+            cargo.join("registry/hook"),
+            git.join("hooks/mcp"),
+            ok.clone(),
+        ];
+        let mut dirs = script_grants(paths, &base.join("root"), &home, &[]);
+        assert_eq!(dirs.len(), 3);
+        let relocate = [crate::sandbox::ToolRoot {
+            default: ".cargo",
+            root: cargo.clone(),
+        }];
+        let tool_dirs: Vec<_> = crate::sandbox::HOME_TOOL_DIRS
+            .iter()
+            .map(|d| d.resolve(&home, &relocate))
+            .collect();
+        let mut roots = crate::sandbox::home_and_temp_writable_roots(&home, &tool_dirs, Some(&git));
+        roots.retain(|r| r.starts_with(&base));
+        assert!(roots.iter().any(|r| r.starts_with(&cargo)), "{roots:?}");
+        drop_script_grants_under(&mut dirs, &roots);
+        let got: Vec<_> = dirs.iter().map(|d| d.path.clone()).collect();
+        assert_eq!(got, vec![ok]);
+    }
+
+    /// A tool dir whose symlink target is refused (`~/.cache -> $HOME`) is
+    /// vetted out, so home itself never becomes a writable root.
+    #[test]
+    fn refused_tool_dir_target_is_not_a_writable_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        std::os::unix::fs::symlink(&home, home.join(".cache")).unwrap();
+        let tool_dirs: Vec<_> = crate::sandbox::HOME_TOOL_DIRS
+            .iter()
+            .map(|d| d.resolve(&home, &[]))
+            .collect();
+        let roots = crate::sandbox::home_and_temp_writable_roots(&home, &tool_dirs, None);
+        assert!(!roots.contains(&home), "{roots:?}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn path_under_ignores_case_on_macos() {
+        assert!(path_under(
+            Path::new("/t/PROJ/xdg/hook.sh"),
+            Path::new("/t/proj")
+        ));
+        assert!(!path_under(
+            Path::new("/t/projx/hook.sh"),
+            Path::new("/t/proj")
+        ));
+    }
+
+    /// `/dev/shm` is always writable off macOS, like `/tmp` (#714).
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn home_and_temp_writable_roots_include_dev_shm() {
+        let roots = crate::sandbox::home_and_temp_writable_roots(Path::new("/h"), &[], None);
+        assert!(roots.contains(&PathBuf::from("/dev/shm")));
     }
 }

@@ -209,6 +209,15 @@ If the gate allows the command, the wrapper `exec`s the real `git` and the agent
 sees no difference. If the gate blocks it, the wrapper prints an error and exits
 non-zero.
 
+On macOS the gate runs `git push -u` without `-u`, because the sandbox denies
+the `.git/config` write the flag asks for. It appends the original command and
+working directory to a file in the scratch dir. When the session ends, cplt
+reads that file outside the sandbox, checks each entry against the repository
+and the guard's own policy, and writes only `branch.<b>.remote` and
+`branch.<b>.merge` for those that pass. The checks are listed in
+[known impacts](known-impacts.md#branch-tracking-is-silently-dropped). On Linux
+the flag works as is and nothing is recorded.
+
 ## Blocked commands
 
 | Command | Reason |

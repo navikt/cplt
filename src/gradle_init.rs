@@ -96,6 +96,9 @@ fn gradle_user_home(home: &Path) -> PathBuf {
 /// truncated script — Gradle evaluates every file in init.d, and a partial
 /// Groovy file would fail every build with a syntax error.
 pub fn ensure_init_script(home: &Path) -> std::io::Result<Option<PathBuf>> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
     let gradle_dir = gradle_user_home(home);
     if !gradle_dir.is_dir() {
         return Ok(None);
@@ -103,14 +106,22 @@ pub fn ensure_init_script(home: &Path) -> std::io::Result<Option<PathBuf>> {
     let init_d = gradle_dir.join("init.d");
     std::fs::create_dir_all(&init_d)?;
     let path = init_d.join(SCRIPT_NAME);
-    match std::fs::read_to_string(&path) {
-        Ok(existing) if existing == SCRIPT_BODY => Ok(Some(path)),
+    match crate::untrusted::read_untrusted(&path, 64 * 1024) {
+        Ok(Some(existing)) if existing == SCRIPT_BODY => Ok(Some(path)),
         _ => {
             // Unique temp name avoids concurrent cplt processes clobbering
             // each other's temp file; the .tmp extension means Gradle never
-            // evaluates a leftover temp after a crash.
+            // evaluates a leftover temp after a crash. `create_new` + `O_NOFOLLOW`
+            // refuses a symlink planted in the agent-writable `~/.gradle/init.d`.
             let tmp = init_d.join(format!(".{SCRIPT_NAME}.{}.tmp", std::process::id()));
-            std::fs::write(&tmp, SCRIPT_BODY)?;
+            let _ = std::fs::remove_file(&tmp);
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&tmp)?;
+            file.write_all(SCRIPT_BODY.as_bytes())?;
+            drop(file);
             std::fs::rename(&tmp, &path)?;
             Ok(Some(path))
         }
@@ -210,6 +221,21 @@ mod tests {
             // Stale content gets refreshed
             std::fs::write(&first, "// old version").unwrap();
             ensure_init_script(tmp.path()).unwrap();
+            assert_eq!(std::fs::read_to_string(&first).unwrap(), SCRIPT_BODY);
+
+            // Symlink at target is replaced atomically without modifying the link target
+            let victim = tmp.path().join("victim.txt");
+            std::fs::write(&victim, "keep me").unwrap();
+            std::fs::remove_file(&first).unwrap();
+            std::os::unix::fs::symlink(&victim, &first).unwrap();
+            ensure_init_script(tmp.path()).unwrap();
+            assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+            assert!(
+                !std::fs::symlink_metadata(&first)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
             assert_eq!(std::fs::read_to_string(&first).unwrap(), SCRIPT_BODY);
         });
     }

@@ -162,6 +162,115 @@ mod linux_tests {
         )
     }
 
+    #[test]
+    fn copilot_explicit_credentials_and_deny_env_survive_full_linux_launch() {
+        use std::os::unix::fs::PermissionsExt;
+        require_landlock!();
+        let fixture = tempfile::Builder::new()
+            .prefix(".cplt-e2e-linux-copilot-auth-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        let project = fixture.path().join("project");
+        let home = fixture.path().join("home");
+        let bin = project.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(home.join(".config/gh")).unwrap();
+        assert!(
+            crate::common::git_cmd(&project)
+                .args(["init", "--quiet"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let agent = bin.join("copilot");
+        fs::write(
+            &agent,
+            r#"#!/bin/sh
+for arg in "$@"; do
+  if [ "$arg" = --version ]; then echo '1.0.94'; exit 0; fi
+done
+case "$COPILOT_GITHUB_TOKEN" in
+  synthetic-copilot) echo COPILOT_PRESENT ;;
+  '') echo COPILOT_ABSENT ;;
+  *) exit 41 ;;
+esac
+case "$GH_TOKEN" in
+  synthetic-gh) echo GH_PRESENT ;;
+  '') echo GH_ABSENT ;;
+  *) exit 42 ;;
+esac
+[ -z "$__CPLT_GH_TOKEN_DIR" ] || exit 43
+echo AGENT_COMPLETED
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(agent, fs::Permissions::from_mode(0o755)).unwrap();
+        let config = home.join("cplt.toml");
+        fs::write(&config, "[sandbox]\nkeychain_substitute = true\n").unwrap();
+        for guard in [false, true] {
+            for denied in [false, true] {
+                fs::write(
+                    project.join(".cplt.toml"),
+                    if denied {
+                        "[deny]\nenv = [\"COPILOT_GITHUB_TOKEN\", \"GH_TOKEN\", \"GITHUB_TOKEN\"]\n"
+                    } else {
+                        "[deny]\nenv = []\n"
+                    },
+                )
+                .unwrap();
+                let out = cplt_cmd()
+                    .env_clear()
+                    .env("CPLT_CONFIG", &config)
+                    .env("NO_COLOR", "1")
+                    .env("HOME", &home)
+                    .env("GH_CONFIG_DIR", home.join(".config/gh"))
+                    .env(
+                        "PATH",
+                        std::env::join_paths([
+                            bin.as_path(),
+                            Path::new("/usr/bin"),
+                            Path::new("/bin"),
+                        ])
+                        .unwrap(),
+                    )
+                    .env("COPILOT_GITHUB_TOKEN", "synthetic-copilot")
+                    .env("GH_TOKEN", "synthetic-gh")
+                    .current_dir(&project)
+                    .args([
+                        "--agent",
+                        "copilot",
+                        "--yes",
+                        "--no-proxy",
+                        "--no-bubblewrap",
+                        "--no-audit",
+                        "--no-git-guard",
+                        if guard { "--gh-guard" } else { "--no-gh-guard" },
+                    ])
+                    .output()
+                    .unwrap();
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                assert!(
+                    out.status.success(),
+                    "guard={guard}, denied={denied}: {stdout}\n{stderr}"
+                );
+                for variable in ["COPILOT", "GH"] {
+                    assert!(
+                        stdout.contains(&format!(
+                            "{variable}_{}",
+                            if denied { "ABSENT" } else { "PRESENT" }
+                        )),
+                        "{stdout}"
+                    );
+                }
+                assert!(stdout.contains("AGENT_COMPLETED"), "{stdout}");
+                for secret in ["synthetic-copilot", "synthetic-gh"] {
+                    assert!(!stdout.contains(secret) && !stderr.contains(secret));
+                }
+            }
+        }
+    }
+
     // ── Filesystem enforcement tests ──────────────────────────────
 
     /// Run a shell command inside the sandbox with a custom HOME directory.
@@ -1426,7 +1535,7 @@ except OSError as e:
     /// uniquely named dotfile there is reliably ungranted on any host.
     struct OutsideSocket {
         path: PathBuf,
-        _listener: std::os::unix::net::UnixListener,
+        listener: std::os::unix::net::UnixListener,
     }
 
     impl OutsideSocket {
@@ -1438,10 +1547,7 @@ except OSError as e:
             let _ = fs::remove_file(&path);
             let listener =
                 std::os::unix::net::UnixListener::bind(&path).expect("bind UNIX socket in $HOME");
-            Self {
-                path,
-                _listener: listener,
-            }
+            Self { path, listener }
         }
     }
 
@@ -1504,6 +1610,86 @@ except OSError as e:
                  not gated by anything; if this now fails the sandbox got stronger \
                  and the docs are stale.\nstdout: {stdout}\nstderr: {stderr}"
             );
+        }
+    }
+
+    /// A file deny is not a Secret Service boundary: below ABI v9 an agent
+    /// can still send bytes to a denied pathname socket beside that tree.
+    #[test]
+    fn keyring_file_deny_does_not_imply_a_unix_socket_boundary() {
+        use std::io::Read;
+
+        require_landlock!();
+        let fixture = tempdir_outside_tmp();
+        let home = fixture.path().join("home");
+        let keyring = home.join(".local/share/keyrings");
+        fs::create_dir_all(&keyring).unwrap();
+        fs::write(keyring.join("login.keyring"), "fixture-keyring").unwrap();
+        let sock = OutsideSocket::bind_at(home.join("bus"));
+        sock.listener.set_nonblocking(true).unwrap();
+        let project = create_test_project();
+        let script = r"import socket
+from pathlib import Path
+try:
+    Path.home().joinpath('.local/share/keyrings/login.keyring').read_bytes()
+except PermissionError:
+    print('KEYRING_FILE_DENIED')
+else:
+    raise AssertionError('keyring file was readable')
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(3)
+try:
+    s.connect(str(Path.home() / 'bus'))
+except PermissionError:
+    print('SOCKET_DENIED')
+else:
+    s.sendall(b'fixture-request')
+    print('SOCKET_SENT')
+";
+        let out = cplt_cmd()
+            .env_clear()
+            .env("CPLT_CONFIG", crate::common::NO_CONFIG)
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .args([
+                "--agent",
+                "shell",
+                "--yes",
+                "--quiet",
+                "--no-proxy",
+                "--no-bubblewrap",
+                "--no-gh-guard",
+                "--no-git-guard",
+                "--no-audit",
+                "--project-dir",
+            ])
+            .arg(project.path())
+            .arg("--deny-path")
+            .arg(&keyring)
+            .arg("--deny-path")
+            .arg(&sock.path)
+            .args(["--", "-c", "exec python3 -c \"$1\"", "fixture", script])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stdout}\n{stderr}");
+        assert!(stdout.contains("KEYRING_FILE_DENIED"), "{stdout}");
+        if landlock_abi_version().is_some_and(|v| v >= 9) {
+            assert!(stdout.contains("SOCKET_DENIED"), "{stdout}");
+            assert_eq!(
+                sock.listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        } else {
+            assert!(stdout.contains("SOCKET_SENT"), "{stdout}");
+            let (mut stream, _) = sock.listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
+            let mut request = String::new();
+            stream.read_to_string(&mut request).unwrap();
+            assert_eq!(request, "fixture-request");
         }
     }
 
@@ -3602,21 +3788,22 @@ print('CONNECTED')
     }
 
     /// Under bubblewrap the lock grant is live: Pi can `mkdir`/`utimes`/`rmdir`
-    /// `trust.json.lock`, while the exec-only `bin/` and the host-persistence
+    /// startup locks, while the exec-only `bin/` and the host-persistence
     /// dirs cannot be renamed (every one is a mountpoint — EBUSY) and the managed
     /// binary cannot be written. Decided by the kernel, not by a string match:
     /// Landlock's `MakeDir|RemoveDir` on the root is sufficient for a
     /// same-directory rename, so only the mount topology stops `mv bin bin.old`.
     #[test]
-    fn pi_trust_lock_works_under_bwrap_and_bin_cannot_be_renamed() {
+    fn pi_startup_locks_work_under_bwrap_and_bin_cannot_be_renamed() {
         require_bwrap!();
         let home = pi_probe_home("bwrap");
         let project = create_test_project();
         let a = home.join(".pi/agent");
         let a = a.display();
         let script = format!(
-            "mkdir {a}/trust.json.lock && touch -m {a}/trust.json.lock && \
-             rmdir {a}/trust.json.lock && echo LOCK_OK; \
+            "for file in trust.json auth.json settings.json; do \
+             mkdir {a}/$file.lock && touch -m {a}/$file.lock && \
+             rmdir {a}/$file.lock && echo LOCK_OK:$file; done; \
              mv {a}/bin {a}/bin.old 2>/dev/null || echo MV_BIN_DENIED; \
              mv {a}/sessions {a}/extensions 2>/dev/null || echo MV_EXT_DENIED; \
              (echo evil > {a}/bin/rg) 2>/dev/null || echo WRITE_BIN_DENIED"
@@ -3628,7 +3815,9 @@ print('CONNECTED')
              stdout: {stdout}\nstderr: {stderr}"
         );
         for marker in [
-            "LOCK_OK",
+            "LOCK_OK:trust.json",
+            "LOCK_OK:auth.json",
+            "LOCK_OK:settings.json",
             "MV_BIN_DENIED",
             "MV_EXT_DENIED",
             "WRITE_BIN_DENIED",
@@ -3898,5 +4087,320 @@ print('CONNECTED')
     fn bwrap_refuse_cache_exec_links_refuses_any_component() {
         require_bwrap!();
         assert_linked_entries_refused("--use-bubblewrap");
+    }
+
+    /// #719: OpenCode v2 on Linux, against the real binary when
+    /// `CPLT_E2E_OPENCODE_V2` names it (the CI job installs a pinned one).
+    /// The agent is a stub that answers `--version` like v2 and otherwise runs
+    /// its argument as a shell script in the sandbox; the script drives the
+    /// real client, copied next to it. HOME is a fake one under the real HOME:
+    /// bubblewrap replaces /tmp.
+    mod opencode_v2 {
+        use super::*;
+        use crate::common::home_temp_dir;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        const STUB: &str = "#!/bin/sh\n[ \"$1\" = --version ] && { echo opencode v2.0.24; exit 0; }\nexec /bin/sh -c \"$1\"\n";
+
+        struct Home {
+            _dir: tempfile::TempDir,
+            h: PathBuf,
+            proj: PathBuf,
+            bin: PathBuf,
+        }
+
+        /// A fake HOME with an `opencode` stub on PATH, a user config, an
+        /// `opencode.json` in two ancestors of the project and `~/AGENTS.md`.
+        fn home() -> Home {
+            let dir = home_temp_dir("ocv2");
+            let h = fs::canonicalize(dir.path()).unwrap();
+            let w = |rel: &str, body: &str| {
+                let p = h.join(rel);
+                fs::create_dir_all(p.parent().unwrap()).unwrap();
+                fs::write(p, body).unwrap();
+            };
+            w(".config/opencode/opencode.json", "{}");
+            w("opencode.json", "{}");
+            // v2 blocks the session on an ancestor AGENTS.md it cannot read.
+            w("AGENTS.md", "# home");
+            w(".ssh/id_ed25519", "KEY");
+            fs::create_dir_all(h.join(".local/state/opencode")).unwrap();
+            // Planted by an earlier session in the writable state dir.
+            std::os::unix::fs::symlink(
+                h.join(".ssh/id_ed25519"),
+                h.join(".local/state/opencode/key"),
+            )
+            .unwrap();
+            w("work/opencode.json", "{}");
+            let proj = h.join("work/proj");
+            fs::create_dir_all(&proj).unwrap();
+            let bin = h.join(".opencode/bin");
+            fs::create_dir_all(&bin).unwrap();
+            fs::write(bin.join("opencode"), STUB).unwrap();
+            fs::set_permissions(bin.join("opencode"), fs::Permissions::from_mode(0o755)).unwrap();
+            Home {
+                _dir: dir,
+                h,
+                proj,
+                bin,
+            }
+        }
+
+        impl Home {
+            fn cmd(&self, dir: &Path) -> Command {
+                let mut cmd = cplt_cmd();
+                cmd.current_dir(dir)
+                    .env("HOME", &self.h)
+                    .env("PATH", format!("{}:/usr/bin:/bin", self.bin.display()))
+                    .env("OPENCODE_DISABLE_MODELS_FETCH", "1");
+                for v in [
+                    "XDG_CONFIG_HOME",
+                    "XDG_DATA_HOME",
+                    "XDG_STATE_HOME",
+                    "XDG_CACHE_HOME",
+                    "OPENCODE_CONFIG_DIR",
+                ] {
+                    cmd.env_remove(v);
+                }
+                cmd.args(["--yes", "--quiet", "--agent", "opencode"]);
+                cmd
+            }
+
+            /// Pids of `serve --service` processes running with this HOME.
+            fn services(&self) -> Vec<u32> {
+                let tag = format!("HOME={}", self.h.display());
+                fs::read_dir("/proc")
+                    .unwrap()
+                    .flatten()
+                    .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+                    .filter(|pid| {
+                        let read =
+                            |f: &str| fs::read(format!("/proc/{pid}/{f}")).unwrap_or_default();
+                        let has =
+                            |b: &[u8], s: &str| b.split(|c| *c == 0).any(|x| x == s.as_bytes());
+                        let cmd = read("cmdline");
+                        has(&cmd, "serve") && has(&cmd, "--service") && has(&read("environ"), &tag)
+                    })
+                    .collect()
+            }
+        }
+
+        /// A host service started outside cplt, as a user who runs both.
+        struct HostService(std::process::Child);
+        impl Drop for HostService {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        /// Items 5-8 of the #719 test plan, under `flag`.
+        fn session_is_private(flag: &str) {
+            let Some(real) = std::env::var_os("CPLT_E2E_OPENCODE_V2") else {
+                eprintln!("SKIPPED (opencode v2): CPLT_E2E_OPENCODE_V2 unset");
+                return;
+            };
+            let home = home();
+            let oc = home.bin.join("oc");
+            fs::copy(fs::canonicalize(real).unwrap(), &oc).unwrap();
+            // The host service, registered where an unsandboxed client finds it.
+            fs::write(
+                home.h.join(".config/opencode/service.json"),
+                "{\"port\":49374,\"password\":\"HOSTPW\"}",
+            )
+            .unwrap();
+            let mut host = Command::new(&oc);
+            host.args(["serve", "--service"])
+                .current_dir(&home.h)
+                .env("HOME", &home.h)
+                .env("OPENCODE_DISABLE_MODELS_FETCH", "1")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            for v in [
+                "XDG_CONFIG_HOME",
+                "XDG_DATA_HOME",
+                "XDG_STATE_HOME",
+                "XDG_CACHE_HOME",
+                "OPENCODE_CONFIG_DIR",
+            ] {
+                host.env_remove(v);
+            }
+            let host = HostService(host.spawn().unwrap());
+            let reg = home.h.join(".local/state/opencode/service.json");
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !fs::read_to_string(&reg).is_ok_and(|s| s.contains("HOSTPW")) {
+                assert!(Instant::now() < deadline, "host service did not register");
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            // v2 registers before bootstrapping the shared database. Starting
+            // both services then can race CREATE TABLE in a fresh database.
+            loop {
+                let health = Command::new("/usr/bin/curl")
+                    .args([
+                        "--noproxy",
+                        "*",
+                        "--silent",
+                        "--max-time",
+                        "1",
+                        "--output",
+                        "/dev/null",
+                        "--write-out",
+                        "%{http_code}",
+                        "--user",
+                        "opencode:HOSTPW",
+                        "http://127.0.0.1:49374/api/info",
+                    ])
+                    .output()
+                    .unwrap();
+                let status = String::from_utf8_lossy(&health.stdout);
+                if health.status.success() && status == "200" {
+                    break;
+                }
+                assert_ne!(status, "500", "host service boot failed");
+                assert!(
+                    Instant::now() < deadline,
+                    "host service not ready: {status}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let host_pid = host.0.id();
+
+            let script = format!(
+                r#"for f in "{cfg}" "{reg}"; do cat "$f" >/dev/null 2>&1 && echo "READ $f"; done
+                cat "$HOME/.config/opencode/opencode.json" >/dev/null && echo OCJSON-OK
+                cat "$HOME/AGENTS.md" >/dev/null && echo AGENTS-OK
+                cat "$HOME/.local/state/opencode/key" 2>/dev/null && echo PLANTED
+                P=$(sed -n 's/.*"port":\([0-9]*\).*/\1/p' "$XDG_CONFIG_HOME/opencode/service.json")
+                echo "P=$P"
+                "{oc}" api GET /path >/dev/null && echo API-OK
+                "{oc}" service get
+                c() {{ curl --noproxy '*' -s -m3 -o /dev/null -w '%{{http_code}}' "http://127.0.0.1:$1/"; }}
+                echo "SESSION=$(c $P)"
+                echo "HOST=$(c 49374)""#,
+                cfg = home.h.join(".config/opencode/service.json").display(),
+                reg = reg.display(),
+                oc = oc.display(),
+            );
+            let o = home
+                .cmd(&home.proj)
+                .args([flag, "--", &script])
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            let out = String::from_utf8_lossy(&o.stdout);
+            let mut all = format!("{out}\n{}", String::from_utf8_lossy(&o.stderr));
+            if !out.contains("API-OK") {
+                let log = home.h.join(".local/share/opencode/log/opencode.log");
+                match cplt::untrusted::read_untrusted(&log, 256 * 1024) {
+                    Ok(Some(log)) => {
+                        for line in log.lines().filter(|line| line.contains("level=ERROR")) {
+                            all.push_str("\nOpenCode boot log: ");
+                            all.push_str(
+                                &line.replace(&home.h.display().to_string(), "<fixture-home>"),
+                            );
+                        }
+                    }
+                    Ok(None) => {
+                        all.push_str("\nOpenCode boot log refused: not a bounded regular file");
+                    }
+                    Err(error) => {
+                        all.push_str("\nOpenCode boot log unavailable: ");
+                        all.push_str(&error.to_string());
+                    }
+                }
+            }
+            assert!(o.status.success(), "{all}");
+            // 6: neither host file is readable, its password never shows.
+            assert!(!out.contains("READ "), "{all}");
+            assert!(!all.contains("HOSTPW"), "{all}");
+            // 8: startup with an ungranted HOME and ancestor opencode.json.
+            assert!(out.contains("OCJSON-OK"), "{all}");
+            assert!(out.contains("AGENTS-OK"), "{all}");
+            assert!(!out.contains("PLANTED"), "{all}");
+            // 5: the client runs its own service on the session port.
+            let p: u16 = out
+                .lines()
+                .find_map(|l| l.strip_prefix("P="))
+                .and_then(|p| p.parse().ok())
+                .unwrap_or_else(|| panic!("no session port: {all}"));
+            assert_ne!(p, 49374);
+            assert!(
+                out.contains(&format!("\"port\":{p}")) || out.contains(&format!("\"port\": {p}")),
+                "{all}"
+            );
+            // 6: the session port answers; the host
+            // port is unreachable where the kernel filters ports.
+            assert!(out.contains("API-OK"), "{all}");
+            assert!(
+                out.contains("SESSION=") && !out.contains("SESSION=000"),
+                "{all}"
+            );
+            if landlock_abi_version().is_some_and(|v| v >= 4) {
+                assert!(out.contains("HOST=000"), "{all}");
+            }
+            // 7: no session service outlives cplt; the host one is untouched.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let left: Vec<u32> = home
+                    .services()
+                    .into_iter()
+                    .filter(|p| *p != host_pid)
+                    .collect();
+                if left.is_empty() {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "session service left running: {left:?}"
+                );
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            assert!(home.services().contains(&host_pid), "host service gone");
+        }
+
+        #[test]
+        fn opencode_v2_session_is_private_with_bubblewrap() {
+            require_bwrap!();
+            session_is_private("--use-bubblewrap");
+        }
+
+        /// Without bubblewrap /proc would show every host command line, so
+        /// v2 is refused before the agent runs.
+        #[test]
+        fn opencode_v2_without_bubblewrap_is_refused() {
+            require_landlock!();
+            let home = home();
+            let o = home
+                .cmd(&home.proj)
+                .args(["--no-bubblewrap", "--", "touch ran"])
+                .output()
+                .unwrap();
+            let err = String::from_utf8_lossy(&o.stderr);
+            assert!(!o.status.success(), "{err}");
+            assert!(err.contains("needs Bubblewrap"), "{err}");
+            assert!(!home.proj.join("ran").exists());
+        }
+
+        /// 3: a grant above the host files (`allow.read ~/.config`; a launch
+        /// from HOME is already refused as too broad) is refused before the
+        /// agent runs.
+        #[test]
+        fn opencode_v2_grant_over_the_service_file_is_refused() {
+            require_bwrap!();
+            let home = home();
+            fs::write(home.h.join(".config/opencode/service.json"), "{}").unwrap();
+            let o = home
+                .cmd(&home.proj)
+                .arg("--allow-read")
+                .arg(home.h.join(".config"))
+                .args(["--use-bubblewrap", "--", "touch ran"])
+                .output()
+                .unwrap();
+            let err = String::from_utf8_lossy(&o.stderr);
+            assert!(!o.status.success(), "{err}");
+            assert!(err.contains("issues/719"), "{err}");
+            assert!(!home.proj.join("ran").exists());
+        }
     }
 }

@@ -1232,15 +1232,19 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir(home.path())).unwrap();
         let bin = home.path().join("bin");
-        let fast = std::time::Duration::from_millis(300);
+        // Only the hang must time out; 2 s leaves room for the shell to start
+        // under parallel test load. The other scripts exit at once, so their
+        // budget is only a ceiling (#735, #749).
+        let hang = std::time::Duration::from_secs(2);
+        let ceiling = std::time::Duration::from_secs(60);
         let slow = exe(
             &bin,
             "goose",
             "#!/bin/sh
-exec sleep 3
+exec sleep 30
 ",
         );
-        assert!(!confirmed(home.path(), Agent::Goose, &slow, fast));
+        assert!(!confirmed(home.path(), Agent::Goose, &slow, hang));
         assert!(
             !cached_rejection(home.path(), &slow),
             "a timeout was cached"
@@ -1253,7 +1257,7 @@ echo 'pi 3.14'
 exit 1
 ",
         );
-        assert!(!confirmed(home.path(), Agent::Pi, &failing, fast * 10));
+        assert!(!confirmed(home.path(), Agent::Pi, &failing, ceiling));
         assert!(
             !cached_rejection(home.path(), &failing),
             "a non-zero exit was cached"
@@ -1266,7 +1270,7 @@ exit 1
 echo 'goose version: v3'
 ",
         );
-        assert!(!confirmed(home.path(), Agent::Goose, &pressly, fast * 10));
+        assert!(!confirmed(home.path(), Agent::Goose, &pressly, ceiling));
         assert!(cached_rejection(home.path(), &pressly));
     }
 

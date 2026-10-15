@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 use cplt::gradle_init;
 use cplt::{
     agent, audit, brief, check, config, discover, gh_proxy, proxy, repo_config, sandbox, scratch,
-    subscriptions, trust, update,
+    subscriptions, trust, untrusted, update,
 };
 use std::collections::BTreeSet;
 use std::io::{self, IsTerminal, Seek, Write};
@@ -842,6 +842,10 @@ QUICK START:
         /// agents found on PATH, project ecosystems. Absolute paths.
         #[arg(long)]
         verbose: bool,
+
+        /// Same as the global `--agent`, accepted after `doctor` too.
+        #[arg(long, value_name = "AGENT")]
+        agent: Option<String>,
     },
 
     /// Verify & explain sandbox enforcement.
@@ -871,6 +875,19 @@ NOTE:
   Probes reflect cplt's resolved policy. A passing network probe means only
   that cplt is not blocking the target. It does not mean the host is up, or
   that an arbitrary agent action behaves the same way.")]
+    /// Create a worktree through the managed-worktree broker (#531).
+    ///
+    /// Inside a cplt session with `sandbox.allow_git_worktrees` on,
+    /// `cplt worktree add <name> <ref>` creates a detached worktree under
+    /// `$CPLT_WORKTREE_ROOT` and prints its path. The parent makes the checkout
+    /// under the session read policy, with filters refused and hooks disabled, and publishes it
+    /// only once the tree is validated. A branch is a separate step:
+    /// `git -C <path> switch -c <branch>`.
+    Worktree {
+        #[command(subcommand)]
+        action: WorktreeAction,
+    },
+
     Check {
         #[command(subcommand)]
         target: Option<CheckTarget>,
@@ -1102,13 +1119,18 @@ enum ConfigAction {
 
     /// Set a config value. Creates the config file if it doesn't exist.
     ///
+    /// Array keys take several values at once; nothing is written unless
+    /// every value is accepted.
     /// Example: cplt config set sandbox.quiet true
+    /// Example: cplt config set allow.localhost 5432 8099
     Set {
         /// Config key in section.key format (e.g., sandbox.quiet, proxy.port)
         key: String,
 
-        /// Value to set (omit when using --unset)
-        value: Option<String>,
+        /// Value(s) to set. Several only for array keys. With --unset, the
+        /// array elements to remove (omit to remove the whole key)
+        #[arg(value_name = "VALUE")]
+        values: Vec<String>,
 
         /// Append value to an array key instead of replacing.
         /// `set` already appends for array keys, so --append is optional.
@@ -1116,7 +1138,7 @@ enum ConfigAction {
         append: bool,
 
         /// Remove from config. For scalar keys: removes the key entirely.
-        /// For array keys with a value: removes that element from the array.
+        /// For array keys with values: removes those elements from the array.
         /// For array keys without a value: removes the entire key.
         #[arg(long)]
         unset: bool,
@@ -1185,6 +1207,17 @@ EXAMPLES:
     Explain {
         /// Config key to explain (omit to list all)
         key: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorktreeAction {
+    /// Create a detached worktree `<name>` at commit `<ref>`.
+    Add {
+        /// Directory name under `$CPLT_WORKTREE_ROOT`: letters, digits, `.`, `_`, `-`.
+        name: String,
+        /// Branch, tag or commit to check out.
+        reference: String,
     },
 }
 
@@ -1809,6 +1842,9 @@ struct ResolvedContext {
     worktree_root: Option<PathBuf>,
     active_agent: agent::Agent,
     unapproved_proposals: Vec<String>,
+    /// `sandbox.quiet` as the user set it. `cplt doctor` forces the resolved
+    /// one on to silence the summary, and reports this one.
+    configured_quiet: bool,
 }
 
 /// The project-grade roots the sandbox policy grants besides the project: the
@@ -2108,7 +2144,141 @@ fn inject_token_is_inert(gh_guard: &config::GhGuardPolicy) -> bool {
     gh_guard.inject_token && !gh_guard.enabled
 }
 
-fn warn_inject_token_without_guard(resolved: &config::Resolved) {
+/// One short launch line for a user who set the deprecated key (#695). Only
+/// an explicit `true` reaches here: the default is false and `.cplt.toml`
+/// cannot set it. Skipped when the inert warning above already fires, which
+/// tells them to remove the key anyway. macOS only: on Linux the Keychain
+/// substitute does nothing, and the key is still how Copilot gets a login
+/// past the masked Secret Service. Also skipped without an exec token
+/// (`gh_token`), since then nothing replaces the injected one.
+fn inject_token_deprecation_line(
+    gh_guard: &config::GhGuardPolicy,
+    macos: bool,
+    gh_token: impl FnOnce() -> bool,
+) -> Option<&'static str> {
+    (macos && gh_guard.inject_token && gh_guard.enabled && gh_token()).then_some(
+        "gh_guard.inject_token is deprecated: gh gets its token without it. Remove the key.",
+    )
+}
+
+/// Removal advice needs successful retrieval and an eligible replacement,
+/// not just hosts.yml. Otherwise it can remove the only working credential.
+fn gh_exec_token_available(
+    resolved: &config::Resolved,
+    agent: agent::Agent,
+    substitute: Option<&agent::KeychainSubstitute>,
+) -> bool {
+    if !(cfg!(target_os = "macos") && resolved.gh_guard.inject_token
+        || agent != agent::Agent::Copilot
+            && resolved
+                .pass_env
+                .iter()
+                .any(|v| v == "GH_TOKEN" || v == "GITHUB_TOKEN"))
+    {
+        return false;
+    }
+    gh_exec_token_replacement(
+        resolved,
+        agent,
+        substitute,
+        cplt::sandbox::gh_configured(),
+        discover::stored_gh_token_available,
+    )
+}
+
+fn gh_exec_token_replacement(
+    resolved: &config::Resolved,
+    agent: agent::Agent,
+    substitute: Option<&agent::KeychainSubstitute>,
+    hosts_yml_exists: bool,
+    stored_token: impl FnOnce() -> bool,
+) -> bool {
+    // Test the replacement after removing the passed token, not the current
+    // child env that intentionally suppresses that replacement.
+    let (_, exec) = discover::gh_token_cache_eligibility(
+        agent,
+        &resolved.deny_env,
+        substitute,
+        hosts_yml_exists,
+        false,
+        cfg!(target_os = "linux"),
+    );
+    resolved.gh_guard.enabled
+        && resolved.scratch_dir
+        && !resolved.inherit_env
+        && exec
+        && stored_token()
+}
+
+fn copilot_stored_token_handover(
+    resolved: &config::Resolved,
+    substitute: Option<&agent::KeychainSubstitute>,
+    stored_token: bool,
+    native_copilot_login: bool,
+) -> bool {
+    if !stored_token || !resolved.gh_guard.enabled || !resolved.scratch_dir {
+        return false;
+    }
+    let (serve, _) = discover::gh_token_cache_eligibility(
+        agent::Agent::Copilot,
+        &resolved.deny_env,
+        substitute,
+        false,
+        false,
+        true,
+    );
+    (!native_copilot_login
+        && resolved.gh_guard.block_auth_token
+        && serve
+        && discover::gh_wrapper_available())
+        || (resolved.gh_guard.inject_token
+            && agent::Agent::Copilot
+                .keychain_substitute_env_vars()
+                .iter()
+                .any(|v| !resolved.deny_env.iter().any(|d| d == v)))
+}
+
+/// Notes `cplt check` prints for weaker auth paths that have a replacement (#695).
+fn auth_deprecation_notes(
+    gh_guard: &config::GhGuardPolicy,
+    pass_env: &[String],
+    agent: agent::Agent,
+    macos: bool,
+    gh_token: bool,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    if !gh_token {
+        return notes;
+    }
+    if macos && gh_guard.inject_token {
+        notes.push(
+            "gh_guard.inject_token is deprecated: gh gets its token from the gh guard, and \
+             Copilot can sign in with sandbox.keychain_substitute = true. Remove the key."
+                .to_string(),
+        );
+    }
+    if gh_guard.enabled && agent != agent::Agent::Copilot {
+        for var in ["GH_TOKEN", "GITHUB_TOKEN"] {
+            if pass_env.iter().any(|v| v == var) {
+                notes.push(format!(
+                    "{var} passed to {}: gh no longer needs it; drop it from pass_env \
+                     unless another tool uses it.",
+                    agent.display_name()
+                ));
+            }
+        }
+    }
+    notes
+}
+
+fn warn_inject_token_without_guard(resolved: &config::Resolved, agent: agent::Agent) {
+    if let Some(line) =
+        inject_token_deprecation_line(&resolved.gh_guard, cfg!(target_os = "macos"), || {
+            gh_exec_token_available(resolved, agent, None)
+        })
+    {
+        ui::warn(line);
+    }
     if inject_token_is_inert(&resolved.gh_guard) {
         ui::warn(
             "gh_guard.inject_token is set but gh_guard.enabled is false, so no token is \
@@ -2120,6 +2290,82 @@ fn warn_inject_token_without_guard(resolved: &config::Resolved) {
              entirely.",
         );
     }
+}
+
+/// `cplt doctor`'s findings for config keys that are set but do nothing, or
+/// that take the agent's token away. Built from the predicates the launch and
+/// `cplt check` warn from, so the three cannot disagree. Names only, never
+/// values. `gh_token` is [`gh_exec_token_available`].
+fn config_findings(
+    resolved: &config::Resolved,
+    agent: agent::Agent,
+    macos: bool,
+    gh_token: bool,
+) -> Vec<cplt::doctor::Finding> {
+    use cplt::doctor::Finding;
+    let mut out = Vec::new();
+    let inert = inject_token_is_inert(&resolved.gh_guard);
+    if inert {
+        out.push(Finding::warning(
+            "gh_guard.inject_token is set but gh_guard.enabled is false, so no token is injected.",
+            Some(
+                "turn the guard on with `cplt config set gh_guard.enabled true`, or remove the \
+                 key with `cplt config set gh_guard.inject_token --unset`"
+                    .to_string(),
+            ),
+        ));
+    }
+    for note in auth_deprecation_notes(
+        &resolved.gh_guard,
+        &resolved.pass_env,
+        agent,
+        macos,
+        gh_token,
+    ) {
+        let fix = if note.starts_with("gh_guard.inject_token") {
+            if inert {
+                continue;
+            }
+            "cplt config set gh_guard.inject_token --unset".to_string()
+        } else {
+            // "<VAR> passed to <agent>: …"
+            let var = note.split(' ').next().unwrap_or_default();
+            format!(
+                "cplt config set sandbox.pass_env {var} --unset, or remove it from the file \
+                 that sets it"
+            )
+        };
+        out.push(Finding::warning(note, Some(fix)));
+    }
+    if resolved.localhost_any_ignored {
+        out.push(Finding::warning(
+            "allow_localhost_any is set, but proxy.forced overrides it: it opens no localhost \
+             port.",
+            Some(
+                "name the ports with sandbox.allow_localhost (or --allow-localhost <PORT>), or \
+                 turn proxy.forced off"
+                    .to_string(),
+            ),
+        ));
+    }
+    let vars = agent.keychain_substitute_env_vars();
+    if !vars.is_empty()
+        && vars
+            .iter()
+            .all(|v| resolved.deny_env.iter().any(|d| d == v))
+    {
+        out.push(Finding::warning(
+            format!(
+                "deny.env strips every token variable {} can sign in with ({}): no token from \
+                 the environment or the gh login reaches it, so it depends on its own stored \
+                 login.",
+                agent.display_name(),
+                vars.join(", ")
+            ),
+            Some("remove one of them from the [deny] env list in .cplt.toml".to_string()),
+        ));
+    }
+    out
 }
 
 /// Repositories reachable only through an `allow.write` grant, which is
@@ -2202,8 +2448,21 @@ fn warn_repo_under_no_exec_cache(
     project_dir: &Path,
     named_roots: &[PathBuf],
 ) {
+    for message in repo_under_no_exec_cache_messages(resolved, home_dir, project_dir, named_roots) {
+        ui::warn(&message);
+    }
+}
+
+/// The messages [`warn_repo_under_no_exec_cache`] prints; `doctor` reports the same.
+fn repo_under_no_exec_cache_messages(
+    resolved: &config::Resolved,
+    home_dir: &Path,
+    project_dir: &Path,
+    named_roots: &[PathBuf],
+) -> Vec<String> {
+    let mut out = Vec::new();
     if !cfg!(target_os = "macos") {
-        return;
+        return out;
     }
     for root in std::iter::once(project_dir).chain(named_roots.iter().map(PathBuf::as_path)) {
         if let Some(dir) = cplt::sandbox::no_exec_tool_dir_over(
@@ -2214,7 +2473,7 @@ fn warn_repo_under_no_exec_cache(
         )
         .or_else(|| cplt::sandbox::no_exec_temp_dir_over(root, resolved.allow_tmp_exec))
         {
-            ui::warn(&format!(
+            out.push(format!(
                 "{} is under {}, where the sandbox denies execute. Its own tools \
                  (node_modules/.bin, build scripts, native addons) will fail with \
                  `Operation not permitted`. Move the checkout out of {}.",
@@ -2224,6 +2483,7 @@ fn warn_repo_under_no_exec_cache(
             ));
         }
     }
+    out
 }
 
 fn warn_write_granted_repos(
@@ -2231,6 +2491,18 @@ fn warn_write_granted_repos(
     project_dir: &Path,
     named_roots: &[PathBuf],
 ) {
+    for message in write_granted_repos_messages(resolved, project_dir, named_roots) {
+        ui::warn(&message);
+    }
+}
+
+/// The messages [`warn_write_granted_repos`] prints; `doctor` reports the same.
+fn write_granted_repos_messages(
+    resolved: &config::Resolved,
+    project_dir: &Path,
+    named_roots: &[PathBuf],
+) -> Vec<String> {
+    let mut out = Vec::new();
     for (grant, repos) in
         write_granted_repos_without_exec(&resolved.allow_write, project_dir, named_roots)
     {
@@ -2262,7 +2534,7 @@ fn warn_write_granted_repos(
                 if repos.len() == 1 { "y" } else { "ies" }
             )
         };
-        ui::warn(&format!(
+        out.push(format!(
             "{subject}. A write grant is deliberately not executable, so its build and \
              tests will not run there: a script fails with `bad interpreter: Operation not \
              permitted`, which names neither cplt nor this grant. To work in it, name it \
@@ -2273,6 +2545,7 @@ fn warn_write_granted_repos(
              into and run."
         ));
     }
+    out
 }
 
 /// Load config, merge CLI flags, resolve paths, detect agent, print info messages.
@@ -2518,6 +2791,10 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         Ok(r) => r,
         Err(e) => bail!("{e}"),
     };
+    let configured_quiet = resolved.quiet;
+    if cli.doctor {
+        resolved.quiet = true;
+    }
 
     // ── Load and apply per-repo config (.cplt.toml) ──────────────
     let mut unapproved_proposals: Vec<String> = Vec::new();
@@ -3080,6 +3357,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         worktree_root,
         active_agent,
         unapproved_proposals,
+        configured_quiet,
     })
 }
 
@@ -3377,7 +3655,16 @@ fn agent_allowlist(
         && !deny_env
             .iter()
             .any(|d| d == "GH_TOKEN" || d == "OPENCODE_AUTH_CONTENT");
-    domains.extend(agent.provider_domains(&home, handover));
+    let v2 = agent == agent::Agent::OpenCode
+        && home.is_absolute()
+        && agent
+            .resolve_binary()
+            .is_ok_and(|bin| agent::is_opencode_v2(&bin, &home) == Some(true));
+    if v2 {
+        domains.extend(agent::opencode_v2_provider_domains(&home));
+    } else {
+        domains.extend(agent.provider_domains(&home, handover));
+    }
     domains.into_iter().map(str::to_string).collect()
 }
 
@@ -3994,6 +4281,18 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // The outer matches! guard ensures we only call take() when the variant
     // is definitely Exec — without it, take() would consume any subcommand
     // and leave cli.command = None, silently breaking all other subcommands.
+    // `cplt worktree` runs inside the sandbox, where `__CPLT_WRAPPED` is set, so
+    // it is dispatched before any launch logic and its recursion guard.
+    #[allow(clippy::collapsible_if)]
+    if matches!(&cli.command, Some(Command::Worktree { .. })) {
+        if let Some(Command::Worktree {
+            action: WorktreeAction::Add { name, reference },
+        }) = cli.command.take()
+        {
+            return Ok(cplt::worktree_broker::run_client(&name, &reference));
+        }
+    }
+
     #[allow(clippy::collapsible_if)]
     if matches!(&cli.command, Some(Command::Exec { .. })) {
         if let Some(Command::Exec { shell_cmd, cmd }) = cli.command.take() {
@@ -4031,10 +4330,12 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // `cplt doctor` borrows &cli through resolve_context, like check above.
     #[allow(clippy::collapsible_if)]
     if matches!(&cli.command, Some(Command::Doctor { .. })) {
-        if let Some(Command::Doctor { verbose }) = cli.command.take() {
-            // Doctor prints its own header; resolve_context's summary lines
-            // and "no agent" default (see `cli.doctor` there) are for it.
-            cli.quiet = true;
+        if let Some(Command::Doctor { verbose, agent }) = cli.command.take() {
+            // Doctor prints its own header; resolve_context silences its
+            // summary lines and "no agent" default (see `cli.doctor` there).
+            if agent.is_some() {
+                cli.agent = agent;
+            }
             cli.doctor = true;
             return Ok(run_doctor(&cli, verbose));
         }
@@ -4142,6 +4443,9 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             Command::Exec { .. } => unreachable!("Command::Exec handled before this match"),
             // Check is handled before this match (see above) — unreachable
             Command::Check { .. } => unreachable!("Command::Check handled before this match"),
+            Command::Worktree { .. } => {
+                unreachable!("Command::Worktree handled before this match")
+            }
         });
     }
 
@@ -4155,7 +4459,6 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // DEPRECATED: use `cplt doctor` subcommand instead
     if cli.doctor {
         ui::warn("--doctor is deprecated, use `cplt doctor` instead");
-        cli.quiet = true;
         return Ok(run_doctor(&cli, false));
     }
 
@@ -4170,6 +4473,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         worktree_root,
         active_agent,
         unapproved_proposals,
+        configured_quiet: _,
     } = resolve_context(&cli, false)?;
 
     let repo_paths: Vec<PathBuf> = repo_roots.iter().map(|r| r.dir.clone()).collect();
@@ -4182,7 +4486,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     warn_exec_tool_dir_shadowing(&resolved, &home_dir, active_agent);
     warn_write_granted_repos(&resolved, &project_dir, &repo_paths);
     warn_repo_under_no_exec_cache(&resolved, &home_dir, &project_dir, &repo_paths);
-    warn_inject_token_without_guard(&resolved);
+    warn_inject_token_without_guard(&resolved, active_agent);
 
     // Probe the host for everything the sandbox profile depends on.
     let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
@@ -4190,7 +4494,27 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // Resolve the agent binary early so its installation directory
     // can be included in the sandbox profile. Failure is deferred —
     // --print-profile doesn't need the binary.
-    let agent_bin_result = active_agent.resolve_binary();
+    let resolved_binary = active_agent.resolve_binary_with_editor_provenance();
+    let editor_launcher = resolved_binary.as_ref().is_ok_and(|(_, editor)| *editor);
+    let agent_bin_result = resolved_binary.map(|(path, _)| path);
+    // #710: v2 runs tool calls through a background service. Each session
+    // gets its own service inside the sandbox (see `opencode_v2`).
+    // --print-profile never runs the agent.
+    let opencode_v2 = match (active_agent, &agent_bin_result) {
+        (agent::Agent::OpenCode, Ok(bin)) if !cli.print_profile => {
+            // #725: a version cplt cannot read could be v2, and running v2 on
+            // the 1.x path lets it attach to the host's service. Fail closed.
+            agent::is_opencode_v2(bin, &home_dir).with_context(|| {
+                format!(
+                    "cannot tell which OpenCode major version {bin} is: `{bin} --version` \
+                     gave no usable answer.\nRun it to check, then retry; \
+                     reinstall OpenCode if the command hangs or fails.",
+                    bin = bin.display()
+                )
+            })?
+        }
+        _ => false,
+    };
     let copilot_install_dir = agent_install_dir(active_agent, &agent_bin_result, &home_dir);
 
     // Discover Electron app bundle when Copilot CLI is installed via VS Code.
@@ -4202,10 +4526,11 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         mut prepared,
         policy,
         proxy_handle,
-        scratch_guard: _scratch_guard,
+        scratch_guard,
         pnpm_shadow_guard: _pnpm_shadow_guard,
         #[cfg(target_os = "macos")]
             playwright_socket_guard: _playwright_socket_guard,
+        worktree_broker,
         ..
     } = assemble_sandbox(
         &cli,
@@ -4243,6 +4568,38 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         );
     }
 
+    if opencode_v2 {
+        let Some(scratch) = scratch_guard.as_ref().map(cplt::scratch::ScratchDir::path) else {
+            bail!(
+                "OpenCode v2 keeps its per-session service config in the scratch dir; \
+                 drop --no-scratch-dir (or sandbox.scratch_dir = false) to run it."
+            );
+        };
+        let session = cplt::opencode_v2::prepare(scratch, &home_dir, &launch_dir)
+            .map_err(|e| anyhow::anyhow!("Cannot set up the OpenCode v2 session: {e}"))?;
+        // These variables carry the session's isolation; dropping them would
+        // point OpenCode back at the host service.
+        if let Some((name, _)) = session
+            .env
+            .iter()
+            .find(|(k, _)| resolved.deny_env.contains(k))
+        {
+            bail!(
+                "deny.env names {name}, which cplt must set for an OpenCode v2 session \
+                 (#710). Remove it from deny.env (check the repo's .cplt.toml) to run v2."
+            );
+        }
+        prepared
+            .add_opencode_v2(session)
+            .map_err(|e| anyhow::anyhow!("Cannot set up the OpenCode v2 session: {e}"))?;
+        for w in cplt::opencode_v2::host_warnings(&home_dir) {
+            ui::warn(&w);
+        }
+        if let Some(w) = cplt::opencode_v2::first_run_gate(&home_dir) {
+            ui::warn(&w);
+        }
+    }
+
     // #514: shim an agent installed since the last sync. A no-op unless the
     // user opted in with `--shell-install --shims`.
     sync_shims(&home_dir, cplt::shim::SyncMode::Background);
@@ -4252,6 +4609,14 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         Ok(path) => path,
         Err(msg) => bail!("{msg}"),
     };
+    if active_agent == agent::Agent::Copilot {
+        agent::validate_copilot_keychain_substitute(
+            &agent_bin,
+            editor_launcher,
+            prepared.keychain_substitute().is_some(),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
 
     // #248: the agent binary is spawned by the UNSANDBOXED parent, from wherever
     // it was discovered. #236 moved cplt's own helpers onto trusted-directory
@@ -4352,6 +4717,14 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         &mut prepared,
         probe.root_agents_md.as_deref(),
     );
+    #[cfg(target_os = "macos")]
+    if let Some(broker) = &worktree_broker {
+        broker
+            .set_sandbox(&mut prepared)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = &worktree_broker;
 
     // Compute hardening categories for environment sanitization
     let disabled_categories = resolved.disabled_hardening_categories();
@@ -4402,7 +4775,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         None
     };
     let mut proxy_handle = proxy_handle;
-    let (exit_code, snapshot) = audit::run(
+    let (exit_code, snapshot, settled) = audit::run(
         &project_dir,
         &resolved.allow_write,
         &repo_paths,
@@ -4436,6 +4809,18 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             })
         },
     );
+    if resolved.git_guard.enabled
+        && !resolved.quiet
+        && let Some(scratch) = scratch_guard.as_ref().map(cplt::scratch::ScratchDir::path)
+    {
+        cplt::upstream::apply(
+            scratch,
+            &project_dir,
+            &repo_paths,
+            &resolved.git_guard,
+            settled,
+        );
+    }
     warn_worktrees_not_audited(
         audit_enabled,
         worktree_root.as_deref(),
@@ -4780,10 +5165,10 @@ fn exec_gh_token() -> Option<String> {
     if set("GH_TOKEN") || set("GITHUB_TOKEN") {
         return None;
     }
-    let tmpdir = std::env::var_os(sandbox::GH_TOKEN_DIR_ENV)
-        .or_else(|| std::env::var_os("TMPDIR"))
-        .filter(|v| !v.is_empty())?;
-    let token = std::fs::read_to_string(Path::new(&tmpdir).join(".gh-exec-token")).ok()?;
+    let tmpdir = gh_token_cache_dir()?;
+    let token =
+        cplt::untrusted::read_untrusted(&Path::new(&tmpdir).join(".gh-exec-token"), 64 * 1024)
+            .ok()??;
     Some(token.trim().to_string()).filter(|t| !t.is_empty())
 }
 
@@ -4800,20 +5185,15 @@ fn is_gh_auth_token_request(args: &[String]) -> bool {
 /// Deletes the file after reading so subsequent calls by subprocesses fail.
 /// Returns ExitCode::SUCCESS if token found, FAILURE otherwise.
 fn serve_cached_gh_token() -> ExitCode {
-    // TMPDIR is set to the scratch dir inside the sandbox
-    let tmpdir = std::env::var("TMPDIR")
-        .or_else(|_| std::env::var("TMP"))
-        .unwrap_or_default();
-
-    if tmpdir.is_empty() {
+    let Some(tmpdir) = gh_token_cache_dir() else {
         eprintln!("⚠️ BLOCKED by sandbox: 'gh auth token'. No cached token available.");
         return ExitCode::FAILURE;
-    }
+    };
 
     let token_path = Path::new(&tmpdir).join(".gh-token");
 
-    match std::fs::read_to_string(&token_path) {
-        Ok(token) if !token.is_empty() => {
+    match cplt::untrusted::read_untrusted(&token_path, 64 * 1024) {
+        Ok(Some(token)) if !token.is_empty() => {
             // Delete the file immediately after reading — one-time use only.
             // Copilot caches the token in memory after first read, so subsequent
             // calls to `gh auth token` by tools/subprocesses will get "not available".
@@ -4826,6 +5206,22 @@ fn serve_cached_gh_token() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Both caches live in the actual scratch dir, even with --pass-env TMPDIR.
+/// An explicit marker must not fall back to a different directory on failure.
+fn gh_token_cache_dir() -> Option<std::ffi::OsString> {
+    std::env::var_os(sandbox::GH_TOKEN_DIR_ENV)
+        .or_else(|| {
+            // A wrapped launch without a locator did not grant a cache. Do not
+            // consume a stale token from a caller-supplied temporary directory.
+            if std::env::var_os("__CPLT_WRAPPED").is_some() {
+                None
+            } else {
+                std::env::var_os("TMPDIR").or_else(|| std::env::var_os("TMP"))
+            }
+        })
+        .filter(|v| !v.is_empty())
 }
 
 /// Parse JSON-encoded allow_push rules from the CLI flag.
@@ -4915,8 +5311,18 @@ fn push_without_upstream(args: &[String]) -> Option<Vec<String>> {
     (kept.len() < args.len()).then_some(kept)
 }
 
-/// The note printed when [`push_without_upstream`] took `-u` out.
+/// The note printed when [`push_without_upstream`] took `-u` out and the
+/// parent will record the upstream at session end (`cplt::upstream`).
 const UPSTREAM_DROPPED_NOTICE: &str = concat!(
+    "cplt: pushing without -u, because .git/config is read-only in the sandbox. ",
+    "cplt records the upstream when the session ends, if the push qualifies; ",
+    "otherwise it prints the `git branch -u` line to run. Until then, name the ",
+    "branch on later pushes: `git push origin HEAD:<branch>`."
+);
+
+/// The same note for a run where nothing is recorded (`--quiet`, which
+/// `cplt exec` defaults to): the parent did not hand the gate a scratch dir.
+const UPSTREAM_DROPPED_QUIET_NOTICE: &str = concat!(
     "cplt: pushing without -u, because .git/config is read-only in the sandbox. ",
     "No upstream is recorded, so name the branch on later pushes: ",
     "`git push origin HEAD:<branch>`, or run `git branch -u origin/<branch>` ",
@@ -4962,7 +5368,12 @@ fn decide_git_gate(
     ) {
         Ok(()) => match push_without_upstream(args) {
             Some(args) => GateEffect::ExecWithout {
-                notice: UPSTREAM_DROPPED_NOTICE.to_string(),
+                notice: if std::env::var_os(sandbox::SCRATCH_DIR_ENV).is_some() {
+                    UPSTREAM_DROPPED_NOTICE
+                } else {
+                    UPSTREAM_DROPPED_QUIET_NOTICE
+                }
+                .to_string(),
                 args,
             },
             None => GateEffect::ExecPlain {
@@ -5006,6 +5417,23 @@ fn run_git_gate(
         real_git,
         repo_facts,
     );
+    // Only a stripped `-u` (macOS) is recorded: the parent sets the upstream
+    // after the session if the push qualifies (see cplt::upstream). The
+    // variable is set only when the parent will do that.
+    if let GateEffect::ExecWithout { .. } = &effect
+        && let Some(scratch) = std::env::var_os(sandbox::SCRATCH_DIR_ENV)
+        && let Ok(cwd) = std::env::current_dir()
+    {
+        let argv = cplt::upstream::resolve_head(real_git, &cwd, args);
+        if !cplt::upstream::record(Path::new(&scratch), &cwd, &argv) {
+            // Said now, because the notice below promises an apply that
+            // cannot happen without the entry.
+            eprintln!(
+                "cplt: could not record the upstream for this push. Outside the sandbox, run: {}",
+                cplt::upstream::hint_for(&argv)
+            );
+        }
+    }
     perform_gate_effect(real_git, "git", args, effect)
 }
 
@@ -5425,6 +5853,29 @@ struct AssembledSandbox {
     pnpm_shadow_guard: Option<scratch::PnpmShadowDir>,
     #[cfg(target_os = "macos")]
     playwright_socket_guard: Option<scratch::PlaywrightSocketDir>,
+    /// Serves `cplt worktree add` for as long as the agent runs. Dropping it
+    /// stops the worker and removes the socket.
+    worktree_broker: Option<cplt::worktree_broker::Broker>,
+}
+
+/// Start the managed-worktree broker for a launch (#531), or `None` when the
+/// root is off. Failure disables only the broker convenience, with a warning;
+/// the existing managed-root grant remains available under its usual denies.
+fn start_worktree_broker(
+    probe: &HostProbe,
+    root: &Path,
+) -> anyhow::Result<cplt::worktree_broker::Broker> {
+    let common = cplt::worktrees::repository_common_dir(&probe.project_dir)
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "sandbox.allow_git_worktrees is on, but the project is not a git repository"
+            )
+        })?;
+    let ctx = cplt::worktree_broker::Context::new(&probe.project_dir, &common, root)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    cplt::worktree_broker::Broker::start(ctx)
+        .map_err(|e| anyhow::anyhow!("cannot start the worktree broker: {e}"))
 }
 
 /// Create the automatic macOS Playwright socket capability only for exact
@@ -5549,6 +6000,13 @@ fn assemble_sandbox(
         );
     }
 
+    if let Some((var, bad)) = agent::env_config_dir_on_credentials(active_agent, home_dir) {
+        bail!(
+            "cplt refuses {var}='{}': it is, or overlaps, a credential directory the \
+             sandbox denies. Point it at a dedicated directory instead.",
+            bad.display(),
+        );
+    }
     // Pre-create agent directories before entering sandbox.
     // Agents like OpenCode crash if their data/config dirs don't exist,
     // and the sandbox may block mkdir on parent paths.
@@ -5559,6 +6017,20 @@ fn assemble_sandbox(
     }
     // After pre-creation, so a dir we just made resolves too. See #171.
     agent::canonicalize_agent_dirs(&mut agent_dirs);
+    agent::drop_script_grants_under(
+        &mut agent_dirs,
+        &[
+            std::slice::from_ref(&probe.project_dir),
+            opts.repos.dirs,
+            &resolved.allow_write,
+            &cplt::sandbox::home_and_temp_writable_roots(
+                home_dir,
+                &probe.existing_home_tool_dirs,
+                probe.git_common_dir.as_deref(),
+            ),
+        ]
+        .concat(),
+    );
 
     // An agent config dir can be relocated by an env var the user (or a repo, or
     // an attacker) controls — CLAUDE_CONFIG_DIR is used raw, the XDG_* bases feed
@@ -5573,7 +6045,7 @@ fn assemble_sandbox(
             "cplt refuses to grant the agent the config directory derived from the \
              environment, '{}', it is too broad (a system root, your home directory, \
              or an ancestor of it). Point the relevant variable (CLAUDE_CONFIG_DIR, \
-             DSH_HOME, or an XDG_* base) at a dedicated subdirectory such as '{}'.",
+             DSH_HOME, OPENCODE_CONFIG_DIR, or an XDG_* base) at a dedicated subdirectory such as '{}'.",
             bad.path.display(),
             home_dir.join(".claude").display(),
         );
@@ -5641,7 +6113,21 @@ fn assemble_sandbox(
     extra_exec.extend(pnpm_shadow_path.map(Path::to_path_buf));
     extra_exec.sort();
     extra_exec.dedup();
-    let sandbox_config = build_sandbox_config(
+    // Started before the profile is built, since the profile grants its socket.
+    // Not for a dry check, which must not bind a socket or create the root (#553).
+    let worktree_broker = match (opts.repos.worktree_root, opts.inspect_only) {
+        (Some(root), false) => match start_worktree_broker(probe, root) {
+            Ok(broker) => Some(broker),
+            Err(error) => {
+                ui::warn(&format!(
+                    "managed-worktree broker unavailable: {error}. CPLT_WORKTREE_SOCKET is not set; the managed root remains available. Prepare worktrees outside cplt."
+                ));
+                None
+            }
+        },
+        _ => None,
+    };
+    let mut sandbox_config = build_sandbox_config(
         resolved,
         probe,
         active_agent,
@@ -5672,12 +6158,20 @@ fn assemble_sandbox(
         .use_allowed_file;
         warn_agent_writable_list_files(resolved, use_allowed_file, &policy, home_dir);
     }
+    sandbox_config.worktree_socket = worktree_broker
+        .as_ref()
+        .map(cplt::worktree_broker::Broker::socket);
     // Path validation (SBPL injection checks on macOS) is handled internally by
     // prepare(), so callers don't need to know about backend-specific risks.
     let mut prepared =
         sandbox::prepare_with_pnpm_shadow(&sandbox_config, pnpm_shadow_path, opts.inspect_only)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     prepared.set_worktree_root(opts.repos.worktree_root);
+    prepared.set_worktree_socket(
+        worktree_broker
+            .as_ref()
+            .map(cplt::worktree_broker::Broker::socket),
+    );
 
     Ok(AssembledSandbox {
         prepared,
@@ -5687,6 +6181,7 @@ fn assemble_sandbox(
         pnpm_shadow_guard,
         #[cfg(target_os = "macos")]
         playwright_socket_guard,
+        worktree_broker,
     })
 }
 
@@ -5767,6 +6262,7 @@ fn build_sandbox_config<'a>(
         named_roots: repos.dirs,
         named_root_git_dirs: repos.git_dirs,
         managed_worktree_root: repos.worktree_root,
+        worktree_socket: None,
         existing_home_tool_dirs: Some(&probe.existing_home_tool_dirs),
         existing_app_dirs: Some(&probe.existing_app_dirs),
         extra_ports: &resolved.allow_ports,
@@ -5892,6 +6388,7 @@ fn run_exec_command(
         repo_roots,
         worktree_root,
         unapproved_proposals: _,
+        configured_quiet: _,
         // active_agent from resolve_context is ignored — exec always uses Shell
         active_agent: _,
         launch_dir: _,
@@ -5961,18 +6458,20 @@ fn run_exec_command(
     warn_exec_tool_dir_shadowing(&resolved, &home_dir, active_agent);
     warn_write_granted_repos(&resolved, &project_dir, &repo_paths);
     warn_repo_under_no_exec_cache(&resolved, &home_dir, &project_dir, &repo_paths);
-    warn_inject_token_without_guard(&resolved);
+    warn_inject_token_without_guard(&resolved, active_agent);
 
     // Build the resolved Shell sandbox (discovery → proxy → prepare). Shared
     // with `cplt check`, which runs its probes under the identical policy.
+    #[allow(unused_mut)] // Only macOS adds the broker's final staging pins.
     let AssembledSandbox {
-        prepared,
+        mut prepared,
         policy,
         proxy_handle,
         scratch_guard,
         pnpm_shadow_guard,
         #[cfg(target_os = "macos")]
             playwright_socket_guard: _playwright_socket_guard,
+        worktree_broker,
         ..
     } = {
         let mut probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
@@ -6056,6 +6555,14 @@ fn run_exec_command(
 
     // Preflight: verify the sandbox mechanism works on this system.
     // Respects --no-validate (same as the main agent flow).
+    #[cfg(target_os = "macos")]
+    if let Some(broker) = &worktree_broker {
+        broker
+            .set_sandbox(&mut prepared)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = &worktree_broker;
     if !resolved.no_validate {
         match sandbox::preflight(&prepared) {
             Ok(()) => {}
@@ -6094,7 +6601,7 @@ fn run_exec_command(
         None
     };
     let mut proxy_handle = proxy_handle;
-    let (exit_code, snapshot) = audit::run(
+    let (exit_code, snapshot, settled) = audit::run(
         &project_dir,
         &resolved.allow_write,
         &repo_paths,
@@ -6128,6 +6635,18 @@ fn run_exec_command(
             })
         },
     );
+    if resolved.git_guard.enabled
+        && !resolved.quiet
+        && let Some(scratch) = scratch_guard.as_ref().map(cplt::scratch::ScratchDir::path)
+    {
+        cplt::upstream::apply(
+            scratch,
+            &project_dir,
+            &repo_paths,
+            &resolved.git_guard,
+            settled,
+        );
+    }
     warn_worktrees_not_audited(
         audit_enabled,
         worktree_root.as_deref(),
@@ -6419,6 +6938,7 @@ fn run_check_command(
         worktree_root,
         active_agent,
         unapproved_proposals: _,
+        configured_quiet: _,
         launch_dir: _,
     } = resolve_context(cli, true)?;
     // The named roots, which `ExecContext::for_launch` turns into the gh scope
@@ -6479,6 +6999,7 @@ fn run_check_command(
         pnpm_shadow_guard: _pnpm_shadow_guard,
         #[cfg(target_os = "macos")]
             playwright_socket_guard: _playwright_socket_guard,
+        worktree_broker: _worktree_broker,
     } = prepare_shell_sandbox(
         cli,
         &mut resolved,
@@ -6556,6 +7077,15 @@ fn run_check_command(
         println!("{}", report.to_json());
     } else {
         print!("{}", report.render());
+        for note in auth_deprecation_notes(
+            &resolved.gh_guard,
+            &resolved.pass_env,
+            active_agent,
+            cfg!(target_os = "macos"),
+            gh_exec_token_available(&resolved, active_agent, prepared.keychain_substitute()),
+        ) {
+            println!("\nNote: {note}");
+        }
         // Claude only: for Copilot this would run `gh auth token`.
         let has_token = active_agent == agent::Agent::Claude
             && cplt::sandbox::keychain_substitute(
@@ -7297,6 +7827,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         active_agent,
         unapproved_proposals,
         launch_dir: _,
+        configured_quiet,
     } = ctx;
     // `doctor` reports the policy a launch would build, so it has to carry the
     // same named roots the launch would (#447).
@@ -7330,6 +7861,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         None
     };
     let mut agent_runnable = false;
+    let mut agent_version: Option<String> = None;
     match &agent_source {
         None => {
             println!("agent:       none (nothing on PATH, no --agent, no sandbox.agent)");
@@ -7343,7 +7875,10 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
             Ok(bin) => {
                 agent_runnable = true;
                 let shown = match discover::probe_version(&bin, &["--version"]) {
-                    discover::VersionProbe::Version(v) => v,
+                    discover::VersionProbe::Version(v) => {
+                        agent_version = Some(v.clone());
+                        v
+                    }
                     discover::VersionProbe::Unknown => "(version unknown)".to_string(),
                     discover::VersionProbe::TimedOut => {
                         findings.push(Finding::warning(
@@ -7387,18 +7922,25 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         Some(p) => format!("user {}", tilde(p)),
         None => "user: none".to_string(),
     }];
-    if let Some(lp) = config::local_path(&project_dir).filter(|p| p.exists()) {
-        layers.push(format!("local {}", tilde(&lp)));
+    // The file name is a hash of the project path: noise in a report.
+    if config::local_path(&project_dir).is_some_and(|p| p.exists()) {
+        layers.push("local (per-repo)".to_string());
     }
     match repo_config::load_repo_config(&project_dir) {
-        Ok(Some(loaded)) => layers.push(format!(
-            "repo .cplt.toml ({})",
-            match loaded.source {
-                repo_config::RepoConfigSource::GitHead => "committed",
-                repo_config::RepoConfigSource::WorkingTree => "working tree, not committed",
-                _ => "unknown source",
-            }
-        )),
+        Ok(Some(loaded)) => {
+            layers.push(format!(
+                "repo .cplt.toml ({})",
+                match loaded.source {
+                    repo_config::RepoConfigSource::GitHead => "committed",
+                    repo_config::RepoConfigSource::WorkingTree => "working tree, not committed",
+                    _ => "unknown source",
+                }
+            ));
+            findings.extend(doctor::global_only_repo_keys_finding(
+                &loaded.config,
+                ".cplt.toml",
+            ));
+        }
         Ok(None) => {}
         Err(_) => layers.push("repo .cplt.toml (unreadable)".to_string()),
     }
@@ -7407,6 +7949,17 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         resolved.preset.map_or("standard (default)", preset_label)
     ));
     println!("config:      {}", layers.join(" · "));
+    // Named repositories' `.cplt.toml` apply too (their `[deny]`), so their
+    // ignored keys count as much as the launch repository's.
+    for root in &repo_roots {
+        if let Ok(Some(loaded)) = repo_config::load_repo_config(&root.dir) {
+            let label = format!("{}/.cplt.toml", tilde(&root.dir));
+            findings.extend(doctor::global_only_repo_keys_finding(
+                &loaded.config,
+                &label,
+            ));
+        }
+    }
     if !unapproved_proposals.is_empty() {
         findings.push(Finding::warning(
             format!(
@@ -7452,6 +8005,20 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
     let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
     let mut agent_dirs = resolved.agent_config_dirs(active_agent, &home_dir);
     agent::canonicalize_agent_dirs(&mut agent_dirs);
+    agent::drop_script_grants_under(
+        &mut agent_dirs,
+        &[
+            std::slice::from_ref(&project_dir),
+            &repo_paths[..],
+            &resolved.allow_write,
+            &cplt::sandbox::home_and_temp_writable_roots(
+                &home_dir,
+                &probe.existing_home_tool_dirs,
+                probe.git_common_dir.as_deref(),
+            ),
+        ]
+        .concat(),
+    );
     let keychain_substitute = cplt::sandbox::keychain_substitute(
         active_agent,
         &home_dir,
@@ -7472,8 +8039,23 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
     ));
     doctor_exec.sort();
     doctor_exec.dedup();
-    let agent_bin_result = active_agent.resolve_binary();
+    let resolved_binary = active_agent.resolve_binary_with_editor_provenance();
+    let editor_launcher = resolved_binary.as_ref().is_ok_and(|(_, editor)| *editor);
+    let agent_bin_result = resolved_binary.map(|(path, _)| path);
     let doctor_install_dir = agent_install_dir(active_agent, &agent_bin_result, &home_dir);
+    if active_agent == agent::Agent::Copilot
+        && let Ok(bin) = &agent_bin_result
+        && let Err(e) = agent::validate_copilot_keychain_substitute(
+            bin,
+            editor_launcher,
+            keychain_substitute.is_some(),
+        )
+    {
+        findings.push(Finding::blocking(
+            doctor_tilde(&e, &home_dir),
+            "brew install --cask copilot-cli",
+        ));
+    }
     let doctor_electron_dir = discover_electron_app_dir(&agent_bin_result, active_agent);
     let sandbox_config = build_sandbox_config(
         &resolved,
@@ -7495,9 +8077,28 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
             electron_app_dir: doctor_electron_dir.as_deref(),
             ..SessionPaths::default()
         },
-        keychain_substitute,
+        keychain_substitute.clone(),
     );
     let policy = sandbox::generate_policy(&sandbox_config);
+    // The cache-exec and Cypress checks the launch refuses on (#602), from the
+    // same function, reusing this policy rather than generating it again.
+    let launch_grants = match sandbox::launch_grants(&sandbox_config, &policy) {
+        Ok(grants) => grants,
+        Err(e) => {
+            findings.push(Finding::blocking(
+                format!("The launch refuses to start: {e}"),
+                "fix the path the message names, or drop the entry with `cplt config set \
+                 sandbox.allow_cache_exec <SUBDIR> --unset`",
+            ));
+            Vec::new()
+        }
+    };
+    findings.extend(config_findings(
+        &resolved,
+        active_agent,
+        cfg!(target_os = "macos"),
+        gh_exec_token_available(&resolved, active_agent, keychain_substitute.as_ref()),
+    ));
 
     // ── enforcement: the regime, and why ──
     // After the policy: bubblewrap is probed with the wrapper the launch would
@@ -7506,6 +8107,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         resolved.use_bubblewrap,
         resolved.scratch_dir,
         &sandbox_config,
+        &launch_grants,
     );
     #[cfg(target_os = "macos")]
     {
@@ -7589,7 +8191,107 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
             ));
         }
     }
+
+    // ── settings and auth: the launch's own Keychain/token decision ──
+    println!(
+        "settings:    {}",
+        doctor::settings_line(&resolved, active_agent, configured_quiet)
+    );
+    let macos = cfg!(target_os = "macos");
+    // Copilot's token variables are in ENV_ALLOWLIST; Claude's reaches the
+    // agent only through the Keychain trade, which `keychain_substitute` covers.
+    let token_vars: &[&str] = if active_agent == agent::Agent::Copilot {
+        active_agent.keychain_substitute_env_vars()
+    } else {
+        &[]
+    };
+    let env_token = token_vars
+        .iter()
+        .copied()
+        .filter(|v| !resolved.deny_env.iter().any(|d| d == v))
+        .find(|v| std::env::var(v).is_ok_and(|t| !t.trim().is_empty()));
+    let claude_nudge = cplt::sandbox::claude_keychain_nudge(
+        active_agent,
+        resolved.keychain_substitute,
+        keychain_substitute.is_some(),
+        macos,
+    )
+    .map(|_| "no CLAUDE_CODE_OAUTH_TOKEN: `claude setup-token` makes one".to_string());
+    let kept_reason = cplt::sandbox::keychain_kept_reason(
+        active_agent,
+        resolved.keychain_substitute,
+        &resolved.deny_env,
+    )
+    .or(claude_nudge);
+    // Doctor path only: `gh auth token` here never runs on a launch.
+    let auth = discover::discover_auth(&home_dir);
+    let (keychain_line, auth_line, auth_finding) = doctor::auth_report(
+        &doctor::AuthDecision {
+            agent: active_agent,
+            substitute: keychain_substitute.as_ref(),
+            setting: resolved.keychain_substitute,
+            kept_reason: kept_reason.as_deref(),
+            macos,
+            env_token,
+            gh_login: auth.gh_cli_auth,
+            other_login: !auth.keytar_nodes.is_empty(),
+        },
+        &home_dir,
+    );
+    if let Some(line) = keychain_line {
+        println!("keychain:    {line}");
+    }
+    println!("auth:        {auth_line}");
+    findings.extend(auth_finding);
     println!();
+    println!("{}", doctor::PASTE_HINT);
+    println!();
+
+    // ── mid-session degradations: the launch's own decisions, reported ──
+    let guards_on = resolved.git_guard.enabled || resolved.gh_guard.enabled;
+    findings.extend(doctor::scratch_off_finding(
+        resolved.scratch_dir,
+        guards_on,
+        // Landlock also opens /tmp for exec under `allow_jvm_attach`; the
+        // macOS profile keys on `allow_tmp_exec` alone (`sandbox_landlock.rs`,
+        // `sandbox_profile.rs`).
+        resolved.allow_tmp_exec || (cfg!(target_os = "linux") && resolved.allow_jvm_attach),
+    ));
+    findings.extend(doctor::quiet_upstream_finding(
+        macos,
+        configured_quiet,
+        resolved.git_guard.enabled,
+        resolved.scratch_dir,
+    ));
+    findings.extend(doctor::copilot_own_sandbox_finding(
+        active_agent,
+        agent_version.as_deref(),
+        doctor::copilot_own_sandbox_enabled(&home_dir),
+        !cplt::sandbox::copilot_sandbox_support_overridden(&resolved.pass_env, active_agent),
+    ));
+    findings.extend(doctor::linux_keyring_finding(
+        active_agent,
+        cfg!(target_os = "linux"),
+        std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some(),
+        env_token.is_some(),
+        copilot_stored_token_handover(
+            &resolved,
+            keychain_substitute.as_ref(),
+            auth.gh_cli_auth,
+            cplt::sandbox::copilot_has_native_login(&home_dir),
+        ),
+    ));
+    for message in write_granted_repos_messages(&resolved, &project_dir, &repo_paths)
+        .into_iter()
+        .chain(repo_under_no_exec_cache_messages(
+            &resolved,
+            &home_dir,
+            &project_dir,
+            &repo_paths,
+        ))
+    {
+        findings.push(Finding::warning(message, None));
+    }
 
     findings.extend(doctor::wsl_drive_project_finding(&project_dir, wsl));
     findings.extend(
@@ -7691,19 +8393,6 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         ));
     }
 
-    // Auth matters to Copilot; the others log in on disk or via --pass-env.
-    let auth = discover::discover_auth(&home_dir);
-    if auth.gh_cli_auth {
-        ok.push("auth: gh CLI".to_string());
-    } else if let Some(var) = auth.env_tokens.first() {
-        ok.push(format!("auth: {var}"));
-    } else if active_agent == agent::Agent::Copilot && !auth.any_auth_available() {
-        findings.push(Finding::blocking(
-            "No auth for Copilot: gh is not logged in and none of COPILOT_GITHUB_TOKEN, \
-             GH_TOKEN, GITHUB_TOKEN is set.",
-            "gh auth login",
-        ));
-    }
     let agents_on_path: Vec<&str> = agent::Agent::ALL
         .iter()
         .filter(|a| **a != agent::Agent::Shell)
@@ -7721,7 +8410,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
 
     if verbose {
         println!();
-        println!("── inventory ──");
+        println!("── inventory (absolute paths: not paste-safe) ──");
         println!("project:  {}", tilde(&project_dir));
         println!("home:     ~");
         // The effective grants, after presets, repo proposals and the
@@ -7742,7 +8431,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
             );
         }
         println!();
-        discover::discover_all(&home_dir, &project_dir).print_report(&home_dir);
+        discover::discover_all(&home_dir, &project_dir).print_report(&home_dir, active_agent);
         print_project_ecosystems(&project_dir);
     }
 
@@ -7863,14 +8552,17 @@ fn run_config_command(action: ConfigAction) -> ExitCode {
         ConfigAction::Get { key } => run_config_get(&key),
         ConfigAction::Set {
             key,
-            value,
+            values,
             append,
             unset,
             force,
             repo,
             global: _,
             local,
-        } => run_config_set(&key, value.as_deref(), append, unset, force, repo, local),
+        } => {
+            let values: Vec<&str> = values.iter().map(String::as_str).collect();
+            run_config_set(&key, &values, append, unset, force, repo, local)
+        }
         ConfigAction::Explain { key } => run_config_explain(key.as_deref()),
         ConfigAction::Hosts { agent, json } => run_config_hosts(&agent, json),
         ConfigAction::Local(LocalAction::List) => run_config_local_list(),
@@ -7987,6 +8679,26 @@ fn run_config_show() -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+/// Whether an `--unset` left the repo config's content as it was. Compares
+/// parsed values with empty tables pruned, since the setter may create an
+/// empty `[propose]` or `[deny]` on its way to a value that is not there.
+fn repo_doc_unchanged(before: &str, after: &toml_edit::DocumentMut) -> bool {
+    fn prune(t: &mut toml::Table) {
+        for (_, v) in t.iter_mut() {
+            if let toml::Value::Table(sub) = v {
+                prune(sub);
+            }
+        }
+        t.retain(|_, v| !matches!(v, toml::Value::Table(sub) if sub.is_empty()));
+    }
+    let parse = |s: &str| {
+        let mut t: toml::Table = s.parse().unwrap_or_default();
+        prune(&mut t);
+        t
+    };
+    parse(before) == parse(&after.to_string())
 }
 
 fn display_repo_config(
@@ -8259,7 +8971,7 @@ fn run_config_get(key: &str) -> ExitCode {
 
 fn run_config_set(
     key: &str,
-    value: Option<&str>,
+    values: &[&str],
     append: bool,
     unset: bool,
     force: bool,
@@ -8275,7 +8987,14 @@ fn run_config_set(
     };
 
     // Validate flag combinations
-    if unset && value.is_some() && !key_info.value_type.is_array() {
+    if values.len() > 1 && !key_info.value_type.is_array() {
+        ui::error(&format!(
+            "{key} takes a single value, got {}. Only array keys take several.",
+            values.len()
+        ));
+        return ExitCode::FAILURE;
+    }
+    if unset && !values.is_empty() && !key_info.value_type.is_array() {
         ui::error("--unset does not take a value (except for array keys)");
         return ExitCode::FAILURE;
     }
@@ -8283,7 +9002,7 @@ fn run_config_set(
         ui::error("--unset and --append are mutually exclusive");
         return ExitCode::FAILURE;
     }
-    if !unset && value.is_none() {
+    if !unset && values.is_empty() {
         ui::error(&format!(
             "missing value for {key}\n  Usage: cplt config set {key} <VALUE>"
         ));
@@ -8292,7 +9011,7 @@ fn run_config_set(
 
     // ── Repo mode ───────────────────────────────────────────────────
     if repo {
-        return run_config_set_repo(key, key_info, value, unset, force);
+        return run_config_set_repo(key, key_info, values, unset, force);
     }
 
     // `sandbox.repo_dirs` is local-layer only. Writing it globally would produce
@@ -8304,7 +9023,11 @@ fn run_config_set(
              your global config would attach to every session.\n  \
              Use --local, from inside the launch repository:\n  \
              cplt config set --local {key} {}",
-            value.unwrap_or("<DIR>")
+            if values.is_empty() {
+                "<DIR>".to_string()
+            } else {
+                values.join(" ")
+            }
         ));
         return ExitCode::FAILURE;
     }
@@ -8339,40 +9062,45 @@ fn run_config_set(
     if matches!(
         key,
         "allow.read" | "allow.write" | "allow.exec" | "allow.socket"
-    ) && let Some(val) = value
-        && !unset
+    ) && !unset
     {
         let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
-        let path = config::expand_tilde(val);
-        if let Err(e) = sandbox::validate_grant_path(key, &path, &home) {
-            ui::error(&e);
-            return ExitCode::FAILURE;
-        }
-        // The exec-overlap refusal needs the resolved config the launch builds,
-        // so this is the part of it that a single grant can be judged against:
-        // the trees that are writable whatever else is configured. An overlap
-        // with an `allow.write` the user adds LATER still surfaces at launch.
-        if key == "allow.exec" {
-            let writable =
-                sandbox::session_writable_roots(Path::new("/nonexistent-project"), &[], &[], None);
-            let tool_dirs: Vec<PathBuf> = sandbox::HOME_TOOL_DIRS
-                .iter()
-                .filter(|d| d.write)
-                .map(|d| home.join(d.path))
-                .collect();
-            if let Some(tree) = writable
-                .iter()
-                .chain(tool_dirs.iter())
-                .find(|t| path.starts_with(t) || t.starts_with(&path))
-            {
-                ui::error(&format!(
-                    "allow.exec {val} overlaps {}, which is writable in every session.\n  \
+        for val in values {
+            let path = config::expand_tilde(val);
+            if let Err(e) = sandbox::validate_grant_path(key, &path, &home) {
+                ui::error(&e);
+                return ExitCode::FAILURE;
+            }
+            // The exec-overlap refusal needs the resolved config the launch builds,
+            // so this is the part of it that a single grant can be judged against:
+            // the trees that are writable whatever else is configured. An overlap
+            // with an `allow.write` the user adds LATER still surfaces at launch.
+            if key == "allow.exec" {
+                let writable = sandbox::session_writable_roots(
+                    Path::new("/nonexistent-project"),
+                    &[],
+                    &[],
+                    None,
+                );
+                let tool_dirs: Vec<PathBuf> = sandbox::HOME_TOOL_DIRS
+                    .iter()
+                    .filter(|d| d.write)
+                    .map(|d| home.join(d.path))
+                    .collect();
+                if let Some(tree) = writable
+                    .iter()
+                    .chain(tool_dirs.iter())
+                    .find(|t| path.starts_with(t) || t.starts_with(&path))
+                {
+                    ui::error(&format!(
+                        "allow.exec {val} overlaps {}, which is writable in every session.\n  \
                      A tree that is both writable and executable lets the agent drop a binary \
                      and run it, and neither backend can subtract the write from the exec — so \
                      the launch refuses the pair. Exec grants belong on read-only tool prefixes.",
-                    tree.display()
-                ));
-                return ExitCode::FAILURE;
+                        tree.display()
+                    ));
+                    return ExitCode::FAILURE;
+                }
             }
         }
     }
@@ -8381,10 +9109,7 @@ fn run_config_set(
     // it is refused here too. `config set` accepting a value every launch then
     // rejects is the shape #306 is about, and the golden suite enforces the
     // invariant: what `set` accepts must be launchable.
-    if matches!(key, "proxy.allowed_domains" | "proxy.blocked_domains")
-        && let Some(val) = value
-        && !unset
-    {
+    if matches!(key, "proxy.allowed_domains" | "proxy.blocked_domains") && !unset {
         let project = detect_project_root().unwrap_or_else(|| PathBuf::from("."));
         let grants: Vec<PathBuf> = config::Config::load_file()
             .ok()
@@ -8405,46 +9130,47 @@ fn run_config_set(
             sandbox::session_writable_roots(&project, &[], &grants, scratch_base.as_deref());
         // Judge the path the launch will open: the loader expands a leading
         // `~/`, so a quoted `"~/.config/cplt/…"` must not read as `./~/…`.
-        if let Some(root) = agent_writable_root(&config::expand_tilde(val), &writable) {
-            ui::error(&format!(
-                "{key} = {val} is inside {} — a tree a session can write.\n  \
+        for val in values {
+            if let Some(root) = agent_writable_root(&config::expand_tilde(val), &writable) {
+                ui::error(&format!(
+                    "{key} = {val} is inside {} — a tree a session can write.\n  \
                  The proxy re-reads that file every few seconds, so the agent could edit its \
                  own egress rules mid-session, and the launch refuses it. Put the list \
                  somewhere the session cannot write, such as ~/.config/cplt/.",
-                root.display()
-            ));
-            return ExitCode::FAILURE;
+                    root.display()
+                ));
+                return ExitCode::FAILURE;
+            }
         }
     }
 
     // `../sibling` is how a person names the repository next door. The local
     // layer stores absolute paths only — a relative entry there has no stable
     // anchor — so resolve it here rather than making the user do it (#490).
-    let resolved_value;
-    let value = match (local_project.as_ref(), value) {
-        (Some(_), Some(v)) if config::is_local_path_key(key) => {
+    let mut resolved: Vec<String> = Vec::with_capacity(values.len());
+    for v in values {
+        if local_project.is_some() && config::is_local_path_key(key) {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             // A removal deliberately does not require the directory to still
             // exist: the entry naming a checkout you already deleted is the one
             // most worth removing, and refusing to resolve it left it stuck.
-            let resolved = if unset {
+            let r = if unset {
                 config::resolve_path_entry_for_removal(v, &cwd)
             } else {
                 config::resolve_path_entry(v, &cwd)
             };
-            match resolved {
-                Ok(abs) => {
-                    resolved_value = abs;
-                    Some(resolved_value.as_str())
-                }
+            match r {
+                Ok(abs) => resolved.push(abs),
                 Err(e) => {
                     ui::error(&e.to_string());
                     return ExitCode::FAILURE;
                 }
             }
+        } else {
+            resolved.push((*v).to_string());
         }
-        _ => value,
-    };
+    }
+    let values: Vec<&str> = resolved.iter().map(String::as_str).collect();
 
     let op = match &local_project {
         Some(project_dir) => config::ConfigSetOp::new_local(key, project_dir),
@@ -8458,17 +9184,18 @@ fn run_config_set(
         }
     };
 
-    if !unset
-        && !force
-        && let Some(val) = value
-        && let Some(reason) = config::security_confirmation(op.key_info, val, false)
-    {
-        let scope = if local { "--local " } else { "" };
-        ui::error(&format!(
-            "{key} = {val} {reason}.\n  \
-             Add --force to confirm: cplt config set {scope}{key} {val} --force"
-        ));
-        return ExitCode::FAILURE;
+    if !unset && !force {
+        for val in &values {
+            if let Some(reason) = config::security_confirmation(op.key_info, val, false) {
+                let scope = if local { "--local " } else { "" };
+                ui::error(&format!(
+                    "{key} = {val} {reason}.\n  \
+                     Add --force to confirm: cplt config set {scope}{key} {} --force",
+                    values.join(" ")
+                ));
+                return ExitCode::FAILURE;
+            }
+        }
     }
 
     // Load or create document
@@ -8482,22 +9209,34 @@ fn run_config_set(
     // Refresh the `[local]` header (path, remote, written_at). No-op globally.
     op.stamp_header(&mut doc);
 
-    // Apply modification
-    let mut element_removed = false;
-    let result = if unset {
-        if let Some(val) = value
-            && op.key_info.value_type.is_array()
-        {
-            config::remove_array_element_in_doc(&mut doc, op.key_info, val)
-                .map(|removed| element_removed = removed)
-        } else {
-            config::unset_value_in_doc(&mut doc, op.key_info);
-            Ok(())
-        }
+    // Apply modification: every value into the one document, written once.
+    let mut removed: Vec<&str> = Vec::new();
+    let mut missing: Vec<&str> = Vec::new();
+    let result = if unset && !values.is_empty() && op.key_info.value_type.is_array() {
+        // Duplicates are a no-op: the first removes the entry, and the rest
+        // must not then warn that it is not set.
+        let mut seen = std::collections::HashSet::new();
+        values
+            .iter()
+            .filter(|v| seen.insert(**v))
+            .try_for_each(|val| {
+                config::remove_array_element_in_doc(&mut doc, op.key_info, val).map(|hit| {
+                    if hit {
+                        removed.push(val);
+                    } else {
+                        missing.push(val);
+                    }
+                })
+            })
+    } else if unset {
+        config::unset_value_in_doc(&mut doc, op.key_info);
+        Ok(())
     } else if append || op.key_info.value_type.is_array() {
-        config::append_value_in_doc(&mut doc, op.key_info, value.unwrap())
+        values
+            .iter()
+            .try_for_each(|val| config::append_value_in_doc(&mut doc, op.key_info, val))
     } else {
-        config::set_value_in_doc(&mut doc, op.key_info, value.unwrap())
+        config::set_value_in_doc(&mut doc, op.key_info, values[0])
     };
 
     if let Err(e) = result {
@@ -8541,13 +9280,9 @@ fn run_config_set(
     // so name the stored string, which is what `--unset` actually takes. Same
     // shape as `cplt link --unlink`: one candidate is named, several are all
     // named, and neither removes anything.
-    if let Some(val) = value
-        && !element_removed
-        && unset
-        && op.key_info.value_type.is_array()
-    {
-        let scope = if local { "--local " } else { "" };
-        let stored = config::array_entries_in_doc(&doc, op.key_info);
+    let scope = if local { "--local " } else { "" };
+    let stored = config::array_entries_in_doc(&doc, op.key_info);
+    for val in &missing {
         // No origin reader: these are config entries, not linked repositories,
         // so the final component is the only evidence there is.
         let hint = match cplt::link::choose_unlink(&stored, val, |_: &Path| None) {
@@ -8564,6 +9299,8 @@ fn run_config_set(
             ),
         };
         ui::warn(&format!("{key}: {val} is not set, nothing removed{hint}"));
+    }
+    if !missing.is_empty() && removed.is_empty() {
         return ExitCode::SUCCESS;
     }
 
@@ -8574,23 +9311,22 @@ fn run_config_set(
     }
 
     if unset {
-        if let Some(val) = value
-            && op.key_info.value_type.is_array()
-        {
+        if removed.is_empty() {
+            ui::ok(&format!("{key} removed (will use default)"));
+        } else {
+            let val = removed.join(", ");
             if let Some(remaining) = config::get_value_from_doc(&doc, op.key_info) {
                 ui::ok(&format!("{key}: removed {val} → {remaining}"));
             } else {
                 ui::ok(&format!("{key}: removed {val} (now empty)"));
             }
-        } else {
-            ui::ok(&format!("{key} removed (will use default)"));
         }
     } else if append || op.key_info.value_type.is_array() {
-        let current = config::get_value_from_doc(&doc, op.key_info)
-            .unwrap_or_else(|| value.unwrap().to_string());
+        let current =
+            config::get_value_from_doc(&doc, op.key_info).unwrap_or_else(|| values.join(", "));
         ui::ok(&format!("{key} = {current}"));
     } else {
-        ui::ok(&format!("{key} = {}", value.unwrap()));
+        ui::ok(&format!("{key} = {}", values[0]));
     }
 
     // Config is read once, at launch. A session already running keeps the
@@ -8636,7 +9372,7 @@ fn run_config_set(
 fn run_config_set_repo(
     key: &str,
     key_info: &'static config::ConfigKeyInfo,
-    value: Option<&str>,
+    values: &[&str],
     unset: bool,
     force: bool,
 ) -> ExitCode {
@@ -8660,18 +9396,17 @@ fn run_config_set_repo(
             "{key} is not valid in repo config.\n  \
              Reason: {reason}.\n  \
              Use: cplt config set {scope}{key} {}",
-            value.unwrap_or("<VALUE>")
+            if values.is_empty() {
+                "<VALUE>".to_string()
+            } else {
+                values.join(" ")
+            }
         ));
         return ExitCode::FAILURE;
     };
 
     // Dangerous key safeguard (still applies for repo permissions)
-    if key_info.dangerous
-        && !unset
-        && let Some(val) = value
-        && val == "true"
-        && !force
-    {
+    if key_info.dangerous && !unset && values.contains(&"true") && !force {
         ui::error(&format!(
             "{key} is dangerous. It requests weakened security for anyone approving this repo config.\n  \
              Add --force to confirm: cplt config set --repo {key} true --force"
@@ -8680,15 +9415,11 @@ fn run_config_set_repo(
     }
 
     // Load or create repo config document
-    let mut doc = if repo_config_path.exists() {
-        let raw = match std::fs::read_to_string(&repo_config_path) {
-            Ok(r) => r,
-            Err(e) => {
-                ui::error(&format!("cannot read {}: {e}", repo_config_path.display()));
-                return ExitCode::FAILURE;
-            }
-        };
-        match raw.parse::<toml_edit::DocumentMut>() {
+    let mut doc = match untrusted::read_untrusted(
+        &repo_config_path,
+        repo_config::MAX_REPO_CONFIG_BYTES,
+    ) {
+        Ok(Some(raw)) => match raw.parse::<toml_edit::DocumentMut>() {
             Ok(d) => d,
             Err(e) => {
                 ui::error(&format!(
@@ -8697,21 +9428,47 @@ fn run_config_set_repo(
                 ));
                 return ExitCode::FAILURE;
             }
+        },
+        Ok(None) => {
+            ui::error(&format!(
+                "cannot read {}: must be a regular file (not a symlink or FIFO) of at most {} bytes",
+                repo_config_path.display(),
+                repo_config::MAX_REPO_CONFIG_BYTES
+            ));
+            return ExitCode::FAILURE;
         }
-    } else {
-        toml_edit::DocumentMut::new()
+        Err(e) if config::is_absent(&e, &repo_config_path) => toml_edit::DocumentMut::new(),
+        Err(e) => {
+            ui::error(&format!("cannot read {}: {e}", repo_config_path.display()));
+            return ExitCode::FAILURE;
+        }
     };
 
-    // Apply modification
-    let val = if unset {
-        value.unwrap_or("")
-    } else {
-        value.unwrap()
-    };
-    if let Err(e) = config::set_repo_value_in_doc(&mut doc, key_info, target, val, unset) {
-        ui::error(&e.to_string());
-        return ExitCode::FAILURE;
+    // Apply every value to the one document; nothing is written unless all
+    // of them, and the result, are valid. A bare --unset removes the key.
+    // An --unset of named values reports each one that was not there, like
+    // the global path, and writes nothing when none of them was.
+    let applied: &[&str] = if values.is_empty() { &[""] } else { values };
+    let mut seen = std::collections::HashSet::new();
+    let mut removed = 0;
+    for val in applied.iter().filter(|v| seen.insert(**v)) {
+        let before = doc.to_string();
+        if let Err(e) = config::set_repo_value_in_doc(&mut doc, key_info, target, val, unset) {
+            ui::error(&format!("{e}\n  No changes were saved."));
+            return ExitCode::FAILURE;
+        }
+        if unset && !val.is_empty() {
+            if repo_doc_unchanged(&before, &doc) {
+                ui::warn(&format!("{key}: {val} is not set, nothing removed"));
+            } else {
+                removed += 1;
+            }
+        }
     }
+    if unset && !values.is_empty() && removed == 0 {
+        return ExitCode::SUCCESS;
+    }
+    let val = values.join(", ");
 
     let output = doc.to_string();
     let written = match repo_config::parse_and_validate(&output) {
@@ -8752,10 +9509,10 @@ fn run_config_set_repo(
     // Only the entry just written: the others were warned about when they
     // were set, and are again at every launch.
     if !unset && target == config::RepoKeyTarget::Deny("paths") {
-        let stored = config::collapse_tilde(val);
+        let stored: Vec<String> = values.iter().map(|v| config::collapse_tilde(v)).collect();
         let globs: Vec<&str> = repo_config::glob_like_deny_paths(&written, &project_dir)
             .into_iter()
-            .filter(|p| *p == val || *p == stored)
+            .filter(|p| values.contains(p) || stored.iter().any(|s| s == p))
             .collect();
         warn_glob_like_deny_paths(&globs, ".cplt.toml");
     }
@@ -9152,7 +9909,7 @@ fn run_link_command(repo: &str, dir: Option<&Path>, unlink: bool) -> ExitCode {
     }
     run_config_set(
         "sandbox.repo_dirs",
-        Some(&found.dir.to_string_lossy()),
+        &[&found.dir.to_string_lossy()],
         false,
         false,
         false,
@@ -9199,7 +9956,7 @@ fn unlink_by_identity(project_dir: &Path, identity: &str) -> ExitCode {
     match cplt::link::choose_unlink(&linked, identity, read_identity) {
         cplt::link::Unlink::Remove(entry) => run_config_set(
             "sandbox.repo_dirs",
-            Some(&entry),
+            &[entry.as_str()],
             false,
             true,
             false,
@@ -9668,7 +10425,7 @@ fn link_proposed_repos(project_dir: &Path, repos: &[String]) -> Vec<trust::Linke
                     continue;
                 } else if run_config_set(
                     "sandbox.repo_dirs",
-                    Some(&path),
+                    &[path.as_str()],
                     false,
                     false,
                     false,
@@ -9754,7 +10511,7 @@ fn unlink_approved_repos(project_dir: &Path, linked: &[trust::LinkedRepo]) {
         println!("  • unlinking {} ({})", repo.identity, repo.path);
         run_config_set(
             "sandbox.repo_dirs",
-            Some(&repo.path),
+            &[repo.path.as_str()],
             false,
             true,
             false,
@@ -11876,6 +12633,18 @@ mod tests {
     }
 
     #[test]
+    fn doctor_accepts_agent_after_the_subcommand() {
+        let cli = Cli::try_parse_from(["cplt", "doctor", "--agent", "claude"])
+            .expect("`cplt doctor --agent claude` parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Doctor { agent: Some(ref a), .. }) if a == "claude"
+        ));
+        let cli = Cli::try_parse_from(["cplt", "--agent", "claude", "doctor"]).unwrap();
+        assert_eq!(cli.agent.as_deref(), Some("claude"));
+    }
+
+    #[test]
     fn resume_and_continue_conflict() {
         let result = Cli::try_parse_from(["cplt", "--resume", "--continue"]);
         assert!(result.is_err());
@@ -12538,6 +13307,48 @@ mod tests {
         );
         // The serve-once cache is separate: `gh auth token` never reads this file.
         assert!(!dir.path().join(".gh-token").exists());
+    }
+
+    #[test]
+    fn unwrapped_cache_lookup_preserves_tmpdir_and_tmp_fallback() {
+        temp_env::with_vars(
+            [
+                (sandbox::GH_TOKEN_DIR_ENV, None),
+                ("__CPLT_WRAPPED", None),
+                ("TMPDIR", Some("/legacy-tmpdir")),
+                ("TMP", Some("/legacy-tmp")),
+            ],
+            || assert_eq!(gh_token_cache_dir(), Some("/legacy-tmpdir".into())),
+        );
+        temp_env::with_vars(
+            [
+                (sandbox::GH_TOKEN_DIR_ENV, None),
+                ("__CPLT_WRAPPED", None),
+                ("TMPDIR", None),
+                ("TMP", Some("/legacy-tmp")),
+            ],
+            || assert_eq!(gh_token_cache_dir(), Some("/legacy-tmp".into())),
+        );
+    }
+
+    #[test]
+    fn wrapped_cache_lookup_requires_a_locator() {
+        temp_env::with_vars(
+            [
+                (sandbox::GH_TOKEN_DIR_ENV, None),
+                ("__CPLT_WRAPPED", Some("1")),
+                ("TMPDIR", Some("/stale")),
+                ("TMP", Some("/also-stale")),
+            ],
+            || assert!(gh_token_cache_dir().is_none()),
+        );
+        temp_env::with_vars(
+            [
+                (sandbox::GH_TOKEN_DIR_ENV, Some("")),
+                ("TMPDIR", Some("/stale")),
+            ],
+            || assert!(gh_token_cache_dir().is_none()),
+        );
     }
 
     #[test]
@@ -13525,6 +14336,286 @@ mod tests {
         assert!(!inject_token_is_inert(&policy(true, true)), "doing its job");
         assert!(!inject_token_is_inert(&policy(false, false)));
         assert!(!inject_token_is_inert(&policy(false, true)));
+    }
+
+    /// The launch line shows only for an explicit `true` with the guard on.
+    #[test]
+    fn inject_token_deprecation_line_only_when_set() {
+        let policy = |inject: bool, enabled: bool| config::GhGuardPolicy {
+            inject_token: inject,
+            enabled,
+            ..config::GhGuardPolicy::default()
+        };
+        assert!(
+            inject_token_deprecation_line(&config::GhGuardPolicy::default(), true, || panic!(
+                "default must not probe gh"
+            ))
+            .is_none()
+        );
+        assert!(
+            inject_token_deprecation_line(&policy(false, true), true, || panic!(
+                "unset must not probe gh"
+            ))
+            .is_none()
+        );
+        assert!(
+            inject_token_deprecation_line(&policy(true, false), true, || panic!(
+                "guard off must not probe gh"
+            ))
+            .is_none(),
+            "inert warning covers it"
+        );
+        assert!(inject_token_deprecation_line(&policy(true, true), true, || true).is_some());
+        assert!(
+            inject_token_deprecation_line(&policy(true, true), true, || false).is_none(),
+            "nothing replaces the injected token without an exec token"
+        );
+        assert!(
+            inject_token_deprecation_line(&policy(true, true), false, || panic!(
+                "Linux must not probe gh for deprecation"
+            ))
+            .is_none(),
+            "Linux still needs it"
+        );
+    }
+
+    /// Each doctor config finding fires on its condition and only then, and
+    /// names variables, never values.
+    #[test]
+    fn auth_cache_diagnostics_require_retrieval_and_effective_routes() {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = tempfile::tempdir().unwrap();
+        let gh = bin.path().join("gh");
+        std::fs::write(&gh, "#!/bin/sh\nexit 99\n").unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        temp_env::with_vars(
+            [
+                ("GH_TOKEN", None::<&str>),
+                ("GITHUB_TOKEN", None),
+                ("COPILOT_GITHUB_TOKEN", None),
+                ("PATH", bin.path().to_str()),
+            ],
+            || {
+                assert!(
+                    discover::gh_wrapper_available(),
+                    "fixture discovered without execution"
+                );
+                let mut r = config::Config::default()
+                    .merge(config::CliFlags::default())
+                    .unwrap();
+                r.gh_guard.enabled = true;
+                r.scratch_dir = true;
+                r.gh_guard.block_auth_token = true;
+                r.pass_env = vec!["GH_TOKEN".into()];
+                let replacement = |r: &config::Resolved, hosts, retrieved| {
+                    gh_exec_token_replacement(r, agent::Agent::OpenCode, None, hosts, || retrieved)
+                };
+                assert!(
+                    !replacement(&r, true, false),
+                    "hosts.yml is not a credential"
+                );
+                assert!(replacement(&r, true, true));
+                assert!(!replacement(&r, false, true));
+                assert!(
+                    config_findings(
+                        &r,
+                        agent::Agent::OpenCode,
+                        false,
+                        replacement(&r, true, false)
+                    )
+                    .is_empty()
+                );
+                assert!(
+                    copilot_stored_token_handover(&r, None, true, false),
+                    "default one-shot route without native Copilot login"
+                );
+                assert!(
+                    !copilot_stored_token_handover(&r, None, true, true),
+                    "native Copilot login attempts Secret Service before gh auth token"
+                );
+                assert!(
+                    cplt::doctor::linux_keyring_finding(
+                        agent::Agent::Copilot,
+                        true,
+                        true,
+                        false,
+                        copilot_stored_token_handover(&r, None, true, true),
+                    )
+                    .is_some()
+                );
+                temp_env::with_var("PATH", Some("/synthetic/no-gh"), || {
+                    let handover = copilot_stored_token_handover(&r, None, true, false);
+                    assert!(
+                        !handover,
+                        "stored retrieval success does not install a PATH wrapper"
+                    );
+                    assert!(
+                        cplt::doctor::linux_keyring_finding(
+                            agent::Agent::Copilot,
+                            true,
+                            true,
+                            false,
+                            handover,
+                        )
+                        .is_some()
+                    );
+                    r.gh_guard.inject_token = true;
+                    assert!(copilot_stored_token_handover(&r, None, true, false));
+                    assert!(copilot_stored_token_handover(&r, None, true, true));
+                    r.gh_guard.inject_token = false;
+                });
+                assert!(
+                    cplt::doctor::linux_keyring_finding(
+                        agent::Agent::Copilot,
+                        true,
+                        true,
+                        false,
+                        copilot_stored_token_handover(&r, None, true, false),
+                    )
+                    .is_none()
+                );
+                assert!(!copilot_stored_token_handover(&r, None, false, false));
+                r.scratch_dir = false;
+                assert!(!replacement(&r, true, true));
+                assert!(!copilot_stored_token_handover(&r, None, true, false));
+                assert!(
+                    cplt::doctor::linux_keyring_finding(
+                        agent::Agent::Copilot,
+                        true,
+                        true,
+                        false,
+                        copilot_stored_token_handover(&r, None, true, false),
+                    )
+                    .is_some()
+                );
+                r.scratch_dir = true;
+                r.gh_guard.enabled = false;
+                assert!(!replacement(&r, true, true));
+                assert!(!copilot_stored_token_handover(&r, None, true, false));
+                r.gh_guard.enabled = true;
+                r.gh_guard.block_auth_token = false;
+                assert!(!copilot_stored_token_handover(&r, None, true, false));
+                r.gh_guard.inject_token = true;
+                assert!(copilot_stored_token_handover(&r, None, true, false));
+                assert!(copilot_stored_token_handover(&r, None, true, true));
+                r.deny_env = vec!["GH_TOKEN".into()];
+                assert!(!replacement(&r, true, true));
+                assert!(
+                    copilot_stored_token_handover(&r, None, true, false),
+                    "injection can use GITHUB_TOKEN"
+                );
+                r.gh_guard.inject_token = false;
+                r.gh_guard.block_auth_token = true;
+                assert!(!copilot_stored_token_handover(&r, None, true, false));
+                r.deny_env.clear();
+                let sub = agent::KeychainSubstitute::EnvVar("COPILOT_GITHUB_TOKEN");
+                assert!(copilot_stored_token_handover(&r, Some(&sub), true, false));
+                assert!(!copilot_stored_token_handover(&r, Some(&sub), true, true));
+                r.inherit_env = true;
+                assert!(!replacement(&r, true, true));
+            },
+        );
+    }
+
+    #[test]
+    fn doctor_config_findings_fire_on_their_condition() {
+        let resolve = |toml: &str| {
+            toml::from_str::<config::Config>(toml)
+                .expect("test config parses")
+                .merge(config::CliFlags::default())
+                .expect("test config merges")
+        };
+        let messages = |r: &config::Resolved, agent, macos, gh_token| -> Vec<String> {
+            config_findings(r, agent, macos, gh_token)
+                .into_iter()
+                .inspect(|f| assert!(f.fix.is_some(), "every finding has a fix: {f:?}"))
+                .map(|f| f.message)
+                .collect()
+        };
+        let none = resolve("");
+        assert!(messages(&none, agent::Agent::Copilot, true, true).is_empty());
+
+        // inject_token with the guard off: inert, on any OS, and not also
+        // reported as deprecated.
+        let inert = resolve("[gh_guard]\ninject_token = true\nenabled = false\n");
+        let m = messages(&inert, agent::Agent::Copilot, true, true);
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert!(m[0].contains("no token is injected"), "{m:?}");
+        assert_eq!(
+            messages(&inert, agent::Agent::Copilot, false, true).len(),
+            1
+        );
+
+        // inject_token with the guard on: deprecated on macOS only.
+        let on = resolve("[gh_guard]\ninject_token = true\nenabled = true\n");
+        let m = messages(&on, agent::Agent::Copilot, true, true);
+        assert!(m.len() == 1 && m[0].contains("deprecated"), "{m:?}");
+        assert!(messages(&on, agent::Agent::Copilot, false, true).is_empty());
+
+        // pass_env naming a token gh no longer needs.
+        let pass = resolve("[sandbox]\npass_env = [\"GH_TOKEN\"]\n");
+        let f = config_findings(&pass, agent::Agent::Claude, false, true);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert!(f[0].message.starts_with("GH_TOKEN passed to"), "{f:?}");
+        assert!(
+            f[0].fix
+                .as_deref()
+                .unwrap()
+                .contains("sandbox.pass_env GH_TOKEN --unset")
+        );
+
+        // allow_localhost_any under proxy.forced, after the launch's reconcile.
+        let mut forced = resolve(
+            "[sandbox]\nallow_localhost_any = true\n[proxy]\nenabled = true\nforced = true\n",
+        );
+        assert!(messages(&forced, agent::Agent::Copilot, true, true).is_empty());
+        assert!(forced.reconcile_proxy_forced());
+        let m = messages(&forced, agent::Agent::Copilot, true, true);
+        assert!(m.len() == 1 && m[0].contains("proxy.forced"), "{m:?}");
+
+        // deny.env (repo-only) stripping every token the agent signs in with.
+        let mut denied = resolve("");
+        denied.deny_env = vec!["GH_TOKEN".into(), "GITHUB_TOKEN".into()];
+        assert!(
+            messages(&denied, agent::Agent::Copilot, true, true).is_empty(),
+            "COPILOT_GITHUB_TOKEN still gets through"
+        );
+        denied.deny_env.push("COPILOT_GITHUB_TOKEN".into());
+        let m = messages(&denied, agent::Agent::Copilot, true, true);
+        assert!(
+            m.len() == 1 && m[0].contains("COPILOT_GITHUB_TOKEN, GH_TOKEN, GITHUB_TOKEN"),
+            "{m:?}"
+        );
+        assert!(
+            messages(&denied, agent::Agent::Shell, true, true).is_empty(),
+            "an agent with no token variable has nothing to lose"
+        );
+    }
+
+    #[test]
+    fn check_notes_name_inject_token_and_gh_token_pass_env() {
+        let mut g = config::GhGuardPolicy::default();
+        assert!(auth_deprecation_notes(&g, &[], agent::Agent::Claude, true, true).is_empty());
+        g.inject_token = true;
+        g.enabled = true;
+        let env = vec!["GH_TOKEN".to_string()];
+        let claude = auth_deprecation_notes(&g, &env, agent::Agent::Claude, true, true);
+        assert_eq!(claude.len(), 2, "{claude:?}");
+        assert!(claude[0].contains("keychain_substitute"));
+        assert!(claude[1].starts_with("GH_TOKEN passed to"));
+        // Copilot's own login may use GH_TOKEN, so no pass_env note there.
+        assert_eq!(
+            auth_deprecation_notes(&g, &env, agent::Agent::Copilot, true, true).len(),
+            1
+        );
+        // Linux: no inject_token note, the pass_env note stays.
+        assert_eq!(
+            auth_deprecation_notes(&g, &env, agent::Agent::Claude, false, true).len(),
+            1
+        );
+        // No exec token (gh not logged in, or GH_TOKEN denied): GH_TOKEN in
+        // pass_env is the only token, so no note tells the user to drop it.
+        assert!(auth_deprecation_notes(&g, &env, agent::Agent::Claude, true, false).is_empty());
     }
 
     /// The shape a user hit: two repositories side by side under one
