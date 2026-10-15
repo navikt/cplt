@@ -485,6 +485,21 @@ pub const CONFIG_OVERRIDES: &[(&str, &str, &str)] = &[
          submodule's filter outside the sandbox. Cost: parent-side status/diff \
          does not recurse into submodules.",
     ),
+    (
+        "diff.ignoreSubmodules",
+        "all",
+        "Even with submodule.recurse=false, git status and git diff inspect \
+         initialized submodules to compute dirtiness, which can run a \
+         submodule's filter.*.clean outside the sandbox. Cost: submodule \
+         dirtiness is omitted from parent-side status/diff.",
+    ),
+    (
+        "status.submodulesummary",
+        "0",
+        "Prevents git status from running submodule summary queries in \
+         initialized submodules. Cost: none (parent-side status uses \
+         --porcelain).",
+    ),
 ];
 
 /// Global flags that take their value as a **separate** token, and are therefore
@@ -812,6 +827,8 @@ mod tests {
             ("uploadpack.packObjectsHook", ""),
             ("gpg.program", "false"),
             ("submodule.recurse", "false"),
+            ("diff.ignoreSubmodules", "all"),
+            ("status.submodulesummary", "0"),
         ];
         let actual: Vec<(&str, &str)> = CONFIG_OVERRIDES.iter().map(|(k, v, _)| (*k, *v)).collect();
         assert_eq!(

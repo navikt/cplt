@@ -3899,7 +3899,6 @@ fn start_proxy_if_enabled(
     for (key, file) in [
         ("proxy.allowed_domains", allowed_domains_file.as_ref()),
         ("proxy.blocked_domains", blocked_file.as_ref()),
-        ("config file (--config)", config_path),
     ] {
         let Some(file) = file else { continue };
         if let Some(root) = agent_writable_root(file, &writable) {

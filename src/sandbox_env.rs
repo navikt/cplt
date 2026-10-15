@@ -585,25 +585,70 @@ fn sanitize_node_options(vars: &mut Vec<(String, String)>) {
     }
 }
 
+/// Split `NODE_OPTIONS` into `(raw_slice, unquoted_value, had_quotes)` tokens,
+/// grouping `"..."` and `'...'` spans (including backslash-escaped characters
+/// inside quotes) so a quoted value containing spaces is handled as a single
+/// argument rather than leaving interior words behind.
+fn tokenize_node_options(value: &str) -> Vec<(&str, String, bool)> {
+    let mut tokens = Vec::new();
+    let mut chars = value.char_indices().peekable();
+    while let Some(&(start, _)) = chars.peek() {
+        if value[start..].starts_with(char::is_whitespace) {
+            chars.next();
+            continue;
+        }
+        let mut unquoted = String::new();
+        let mut had_quotes = false;
+        let mut in_quote: Option<char> = None;
+        let mut end = value.len();
+        while let Some(&(idx, ch)) = chars.peek() {
+            if let Some(q) = in_quote {
+                chars.next();
+                if ch == '\\'
+                    && let Some(&(_, escaped)) = chars.peek()
+                {
+                    chars.next();
+                    unquoted.push(escaped);
+                } else if ch == q {
+                    in_quote = None;
+                } else {
+                    unquoted.push(ch);
+                }
+            } else if ch == '"' || ch == '\'' {
+                chars.next();
+                had_quotes = true;
+                in_quote = Some(ch);
+            } else if ch.is_whitespace() {
+                end = idx;
+                break;
+            } else {
+                chars.next();
+                unquoted.push(ch);
+            }
+        }
+        if in_quote.is_some() {
+            had_quotes = true;
+        }
+        tokens.push((&value[start..end], unquoted, had_quotes));
+    }
+    tokens
+}
+
 /// Parse NODE_OPTIONS and remove dangerous flags (and their arguments).
 fn strip_dangerous_node_flags(value: &str) -> String {
     // Node's NODE_OPTIONS parser handles double-quoted strings with backslash
     // escapes, which can hide spaces or flags from naive whitespace splitting.
     // Legitimate safe flags (--max-old-space-size=4096, --no-warnings, etc.)
-    // never require quotes; if quotes appear, drop the quoted tokens.
-    let parts: Vec<&str> = value.split_whitespace().collect();
+    // never require quotes; group quoted spans first and drop quoted tokens.
+    let parts = tokenize_node_options(value);
     let mut result = Vec::new();
     let mut i = 0;
     while i < parts.len() {
-        let part = parts[i];
-        if part.contains('"') || part.contains('\'') {
-            i += 1;
-            continue;
-        }
+        let (raw, ref part, had_quotes) = parts[i];
         // Check if this flag (or its --flag=value form) is dangerous, including
         // attached short forms (`-r./evil.js`, `-Cdevelopment`) and `--inspect*`
         // / `--debug*` debugger flags.
-        let flag_name = part.split('=').next().unwrap_or(part);
+        let flag_name = part.split('=').next().unwrap_or(part.as_str());
         let is_attached_short = (part.starts_with("-r") && part.len() > 2)
             || (part.starts_with("-C") && part.len() > 2);
         let is_debugger = flag_name == "--inspect"
@@ -617,12 +662,12 @@ fn strip_dangerous_node_flags(value: &str) -> String {
             if !is_attached_short
                 && !part.contains('=')
                 && i + 1 < parts.len()
-                && !parts[i + 1].starts_with('-')
+                && !parts[i + 1].1.starts_with('-')
             {
                 i += 1; // skip the argument too
             }
-        } else {
-            result.push(part);
+        } else if !had_quotes {
+            result.push(raw);
         }
         i += 1;
     }
@@ -776,6 +821,18 @@ mod tests {
                 "--openssl-config /tmp/o.cnf --env-file-if-exists .env --trace-warnings"
             ),
             "--trace-warnings"
+        );
+        assert_eq!(
+            strip_dangerous_node_flags(
+                "--diagnostic-dir=\"/tmp/node diagnostic reports\" --no-warnings"
+            ),
+            "--no-warnings"
+        );
+        assert_eq!(
+            strip_dangerous_node_flags(
+                "--require \"/tmp/evil preload.js\" \"--require\" /tmp/other.js --no-warnings"
+            ),
+            "--no-warnings"
         );
     }
 }

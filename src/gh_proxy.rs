@@ -914,6 +914,75 @@ fn scan_short_cluster<'a>(
     None
 }
 
+fn find_subcommand_hint<'a>(command: &str, args: &'a [&'a str]) -> Option<&'a str> {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i];
+        if matches!(arg, "--repo" | "-R") {
+            i += 2;
+            continue;
+        }
+        if !arg.starts_with('-')
+            && POLICY
+                .iter()
+                .any(|p| p.command == command && p.subcommand == arg && p.subcommand != ANY)
+        {
+            return Some(arg);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Short flags that consume a value argument for a given `(command, subcommand)`.
+///
+/// In `gh` (`spf13/pflag`), the same short flag character can be boolean on one
+/// subcommand (`gh pr review -a` = `--approve`) and value-taking on another
+/// (`gh pr create -a` = `--assignee`). Resolving per `(command, subcommand)`
+/// ensures `-aRother/repo` on `pr review` still surfaces `-R`, while `-rRiley`
+/// on `pr create` does not mistake `Riley` for `-R iley`.
+fn subcommand_short_value_flags(command: &str, subcommand: Option<&str>) -> &'static [char] {
+    match (command, subcommand) {
+        ("pr", Some("list")) => &['R', 'a', 'A', 'B', 'H', 'q', 'l', 'L', 'S', 's', 't'],
+        ("pr", Some("view" | "status")) => &['R', 'q', 't'],
+        ("pr", Some("diff")) => &['R', 'e'],
+        ("pr", Some("checks")) => &['R', 'i', 'q', 't'],
+        ("pr", Some("checkout")) => &['R', 'b'],
+        ("pr", Some("create")) => &['R', 'a', 'B', 'b', 'F', 'H', 'l', 'm', 'p', 'r', 'T', 't'],
+        ("pr", Some("comment" | "review")) => &['R', 'b', 'F'],
+        ("pr", Some("edit")) => &['R', 'B', 'b', 'F', 'm', 't'],
+        ("pr", Some("close" | "reopen")) => &['R', 'c'],
+        ("pr", Some("merge")) => &['R', 'A', 'b', 'F', 't'],
+        ("pr", Some("ready" | "update-branch")) => &['R'],
+        ("issue", Some("list")) => &['R', 'a', 'A', 'q', 'l', 'L', 'm', 'S', 's', 't'],
+        ("issue", Some("view" | "status")) => &['R', 'q', 't'],
+        ("issue", Some("create")) => &['R', 'a', 'b', 'F', 'l', 'm', 'p', 'T', 't'],
+        ("issue", Some("comment")) => &['R', 'b', 'F'],
+        ("issue", Some("edit")) => &['R', 'b', 'F', 'm', 't'],
+        ("issue", Some("close")) => &['R', 'c', 'r'],
+        ("issue", Some("reopen")) => &['R', 'c'],
+        ("issue", Some("develop")) => &['R', 'b', 'n'],
+        ("label", Some("list")) => &['R', 'q', 'L', 'S', 't'],
+        ("label", Some("create")) => &['R', 'c', 'd'],
+        ("label", Some("edit")) => &['R', 'c', 'd', 'n'],
+        ("run", Some("list")) => &['R', 'b', 'c', 'e', 'q', 'L', 's', 't', 'u', 'w'],
+        ("run", Some("view")) => &['R', 'a', 'j', 'q', 't'],
+        ("run", Some("download")) => &['R', 'D', 'n', 'p'],
+        ("run", Some("watch")) => &['R', 'i'],
+        ("workflow", Some("list")) => &['R', 'q', 'L', 't'],
+        ("workflow", Some("view")) => &['R', 'r'],
+        ("release", Some("list")) => &['R', 'q', 'L', 'O', 't'],
+        ("release", Some("view" | "verify" | "verify-asset")) => &['R', 'q', 't'],
+        ("release", Some("download")) => &['R', 'A', 'D', 'O', 'p'],
+        ("cache", Some("list")) => &['R', 'q', 'k', 'L', 'O', 'r', 'S', 't'],
+        ("secret", Some("list")) => &['R', 'a', 'e', 'q', 'o', 't'],
+        ("variable", Some("list" | "get")) => &['R', 'e', 'q', 'o', 't'],
+        ("repo", Some("view")) => &['b', 'q', 't'],
+        ("repo", Some("list")) => &['q', 'l', 'L', 't'],
+        _ => &['R', 'B', 'H', 'F', 'T', 'L', 'S', 't', 'b', 'l', 'm', 'q'],
+    }
+}
+
 /// Parse a `gh` command line into its structured components.
 ///
 /// Expects `args` to be the arguments *after* the `gh` binary name,
@@ -1077,10 +1146,11 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
         });
     }
 
-    // Find subcommand (first non-flag argument after command)
-    const SUBCOMMAND_SHORT_VALUE_FLAGS: &[char] = &[
-        'R', 'B', 'H', 'F', 'T', 'L', 'S', 't', 'b', 'l', 'a', 'm', 'q', 'c',
-    ];
+    // Find subcommand (first non-flag argument after command) and resolve
+    // short-option arity for that (command, subcommand) pair so boolean flags
+    // (`pr review -aRother/repo`) do not mask `-R` and value-taking flags
+    // (`pr create -rRiley`) do not misread an uppercase `R` in the value.
+    let sub_hint = find_subcommand_hint(&command, &args[idx..]);
     let mut subcommand = None;
     let mut repo_flag = None;
     let mut i = idx;
@@ -1092,11 +1162,12 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
             i += 1;
             continue;
         }
+        let value_flags =
+            subcommand_short_value_flags(&command, subcommand.as_deref().or(sub_hint));
         if !arg.starts_with("--")
             && arg.starts_with('-')
             && arg.len() >= 2
-            && let Some(('R', attached)) =
-                scan_short_cluster(&arg[1..], SUBCOMMAND_SHORT_VALUE_FLAGS)
+            && let Some(('R', attached)) = scan_short_cluster(&arg[1..], value_flags)
         {
             if let Some(val) = attached {
                 repo_flag = Some(val.to_string());
@@ -3191,14 +3262,14 @@ fn config_sets_remote_url(sub_args: &[&str]) -> bool {
         matches!(a.as_str(), "remove-section" | "rename-section")
             || (a.starts_with("--rem") && "--remove-section".starts_with(a.as_str()))
             || (a.starts_with("--ren") && "--rename-section".starts_with(a.as_str()))
+    }) && lowered.iter().any(|a| {
+        !a.starts_with('-')
+            && (a == "remote.origin"
+                || a == "include"
+                || a.starts_with("url.")
+                || a.starts_with("includeif."))
     }) {
-        return lowered.iter().any(|a| {
-            !a.starts_with('-')
-                && (a == "remote.origin"
-                    || a == "include"
-                    || a.starts_with("url.")
-                    || a.starts_with("includeif."))
-        });
+        return true;
     }
     let touches_scope_key = lowered.iter().any(|key| {
         key == "remote.origin.url"
@@ -9948,5 +10019,36 @@ mod tests {
         let parsed =
             parse_command(&["pr", "create", "-BRelease", "-R", "other/repo"]).expect("parsed");
         assert_eq!(parsed.repo_flag.as_deref(), Some("other/repo"));
+        // `-a` on `gh pr review` is boolean (`--approve`), so `-aRother/repo` and `-aR other/repo` extract `other/repo`
+        let parsed = parse_command(&["pr", "review", "123", "-aRother/repo"]).expect("parsed");
+        assert_eq!(parsed.repo_flag.as_deref(), Some("other/repo"));
+        let parsed = parse_command(&["pr", "review", "123", "-aR", "other/repo"]).expect("parsed");
+        assert_eq!(parsed.repo_flag.as_deref(), Some("other/repo"));
+        // `-r` on `gh pr create` is value-taking (`--reviewer`), so `-rRiley` is not misread as `-R iley`
+        let parsed = parse_command(&["pr", "create", "-rRiley"]).expect("parsed");
+        assert_eq!(parsed.repo_flag, None);
+        // `remove-section` / `rename-section` passed as the value for `include.path` or `remote.origin.url`
+        assert!(
+            gate_git_t(
+                &["config", "include.path", "remove-section"],
+                true,
+                true,
+                true,
+                &[],
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            gate_git_t(
+                &["config", "remote.origin.url", "rename-section"],
+                true,
+                true,
+                true,
+                &[],
+                None,
+            )
+            .is_err()
+        );
     }
 }

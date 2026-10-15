@@ -260,20 +260,30 @@ pub fn new_untracked(before: &BTreeSet<String>, after: &BTreeSet<String>) -> Vec
     after.difference(before).cloned().collect()
 }
 
-fn fingerprint_untracked(
-    project_dir: &Path,
-    porcelain: &str,
-) -> std::collections::BTreeMap<String, u64> {
+fn fingerprint_file(full: &Path) -> Option<u64> {
     use std::hash::{Hash, Hasher};
+    let meta = full.symlink_metadata().ok()?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    meta.file_type().is_symlink().hash(&mut h);
+    if meta.file_type().is_symlink() {
+        std::fs::read_link(full).ok().hash(&mut h);
+    } else {
+        read_small(full).hash(&mut h);
+    }
+    Some(h.finish())
+}
+
+fn fingerprint_untracked(
+    repo_root: &Path,
+    porcelain: &str,
+) -> std::collections::BTreeMap<String, (PathBuf, Option<u64>)> {
     porcelain
         .split('\0')
         .filter_map(|entry| entry.strip_prefix("?? "))
         .map(|raw| {
-            let full = project_dir.join(raw);
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            std::fs::read_link(&full).ok().hash(&mut h);
-            read_small(&full).hash(&mut h);
-            (escape_path(raw), h.finish())
+            let full = repo_root.join(raw);
+            let fp = fingerprint_file(&full);
+            (escape_path(raw), (full, fp))
         })
         .collect()
 }
@@ -328,13 +338,17 @@ pub enum AuditReport {
 pub struct Baseline {
     start: Instant,
     project_dir: PathBuf,
+    /// Git repository toplevel from `git rev-parse --show-toplevel`, used to
+    /// resolve toplevel-relative `git status --porcelain` paths when
+    /// `project_dir` is a subdirectory of the repository.
+    repo_root: PathBuf,
     /// The pinned commit SHA from `git rev-parse HEAD`, or `None` when the
     /// project is not a git repo / has no commits ("no baseline").
     pinned_sha: Option<String>,
     /// Untracked paths present before the run.
     before_untracked: BTreeSet<String>,
-    /// Content fingerprints of untracked paths present before the run.
-    before_untracked_hashes: std::collections::BTreeMap<String, u64>,
+    /// On-disk path and content fingerprint of untracked paths present before the run.
+    before_untracked_hashes: std::collections::BTreeMap<String, (PathBuf, Option<u64>)>,
     /// Whether the pre-run `git status` actually SUCCEEDED. When it failed,
     /// `before_untracked` is an empty set that does NOT mean "no untracked
     /// files" — using it to compute the after−before delta would over-report
@@ -349,6 +363,10 @@ impl Baseline {
     /// baseline" (reported later as change audit unavailable).
     pub fn capture(project_dir: &Path) -> Self {
         let start = Instant::now();
+        let repo_root = git_output(project_dir, &["rev-parse", "--show-toplevel"])
+            .map(|s| PathBuf::from(s.trim_end_matches(['\n', '\r'])))
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| project_dir.to_path_buf());
         // The pinned SHA. If HEAD does not resolve (not a repo, or no commits),
         // we record no baseline rather than erroring.
         let pinned_sha = git_output(project_dir, &["rev-parse", "HEAD"])
@@ -363,7 +381,7 @@ impl Baseline {
         let before_ok = before_status.is_some();
         let before_untracked_hashes = before_status
             .as_deref()
-            .map(|s| fingerprint_untracked(project_dir, s))
+            .map(|s| fingerprint_untracked(&repo_root, s))
             .unwrap_or_default();
         let before_untracked = before_status
             .map(|s| parse_untracked(&s))
@@ -371,6 +389,7 @@ impl Baseline {
         Self {
             start,
             project_dir: project_dir.to_path_buf(),
+            repo_root,
             pinned_sha,
             before_untracked,
             before_untracked_hashes,
@@ -401,7 +420,7 @@ impl Baseline {
         let after_status = git_output(&self.project_dir, &["status", "--porcelain", "-z", "-uall"]);
         let after_untracked_hashes = after_status
             .as_deref()
-            .map(|s| fingerprint_untracked(&self.project_dir, s))
+            .map(|s| fingerprint_untracked(&self.repo_root, s))
             .unwrap_or_default();
         let after_untracked_opt = after_status.map(|s| parse_untracked(&s));
 
@@ -420,9 +439,19 @@ impl Baseline {
         }
 
         let modified_untracked = |after: &BTreeSet<String>| -> Vec<String> {
-            after
-                .intersection(&self.before_untracked)
-                .filter(|p| self.before_untracked_hashes.get(*p) != after_untracked_hashes.get(*p))
+            self.before_untracked
+                .iter()
+                .filter(|p| {
+                    let before_fp = self.before_untracked_hashes.get(*p).and_then(|(_, fp)| *fp);
+                    let after_fp = if after.contains(*p) {
+                        after_untracked_hashes.get(*p).and_then(|(_, fp)| *fp)
+                    } else {
+                        self.before_untracked_hashes
+                            .get(*p)
+                            .and_then(|(full, _)| fingerprint_file(full))
+                    };
+                    before_fp != after_fp
+                })
                 .cloned()
                 .collect()
         };
@@ -2771,6 +2800,7 @@ mod tests {
         let base = Baseline {
             start: Instant::now(),
             project_dir: PathBuf::from("/nonexistent"),
+            repo_root: PathBuf::from("/nonexistent"),
             pinned_sha: None,
             before_untracked: BTreeSet::new(),
             before_untracked_hashes: std::collections::BTreeMap::new(),
@@ -2791,6 +2821,7 @@ mod tests {
         let base = Baseline {
             start: Instant::now(),
             project_dir: PathBuf::from("/nonexistent"),
+            repo_root: PathBuf::from("/nonexistent"),
             pinned_sha: Some("deadbeef".to_string()),
             before_untracked: BTreeSet::new(),
             before_untracked_hashes: std::collections::BTreeMap::new(),
@@ -2829,6 +2860,7 @@ mod tests {
         let base = Baseline {
             start: Instant::now(),
             project_dir: dir.path().to_path_buf(),
+            repo_root: dir.path().to_path_buf(),
             // No baseline commit (fresh init); the after `git status` still works.
             pinned_sha: None,
             // Simulate a failed BEFORE capture: empty set, but NOT trustworthy.
@@ -3226,6 +3258,64 @@ mod tests {
         assert!(
             lines.contains(&format!("{} ->", root.join("pk").display())),
             "{lines}"
+        );
+    }
+
+    #[test]
+    fn untracked_subdir_and_deleted_files_are_reported() {
+        let Some(git) = crate::git::trusted_git() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let run = |args: &[&str]| {
+            let status = Command::new(git)
+                .current_dir(repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(args)
+                .status()
+                .expect("git runs");
+            assert!(status.success(), "git {args:?}");
+        };
+        run(&["init", "-q"]);
+        run(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@e",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "init",
+        ]);
+
+        let app = repo.join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("notes.txt"), "before\n").unwrap();
+        std::fs::write(app.join("doomed.txt"), "delete me\n").unwrap();
+
+        // Capture from a subdirectory (`--project-dir repo/app`): porcelain
+        // paths are toplevel-relative (`app/notes.txt`), so fingerprinting must
+        // join against the git toplevel rather than `app`.
+        let baseline = Baseline::capture(&app);
+        std::fs::write(app.join("notes.txt"), "after\n").unwrap();
+        std::fs::remove_file(app.join("doomed.txt")).unwrap();
+        let report = baseline.finish(0, true);
+        let AuditReport::Available { changes, .. } = report else {
+            panic!("expected Available, got {report:?}");
+        };
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.path == "app/notes.txt" && !c.is_new_untracked),
+            "modified untracked file under subdirectory project_dir must be reported: {changes:?}"
+        );
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.path == "app/doomed.txt" && !c.is_new_untracked),
+            "deleted pre-existing untracked file must be reported: {changes:?}"
         );
     }
 }
