@@ -384,6 +384,15 @@ impl PreparedSandbox {
         self.worktree_socket = socket.map(Path::to_path_buf);
     }
 
+    /// Reapply after late agent-specific grants, before capturing the broker's
+    /// read policy. Same-user staging privacy comes from Seatbelt, not mode 0700.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn protect_worktree_staging(&mut self) {
+        if let Some(root) = &self.worktree_root {
+            profile::protect_worktree_staging(&mut self.profile_text, root);
+        }
+    }
+
     /// Add an OpenCode v2 session (#710): its rules go at the end of the
     /// profile, where they win, and its variables are set on the child last.
     /// On Linux the host service files leave the Landlock rules and the
@@ -451,6 +460,8 @@ impl PreparedSandbox {
         }
         self.extra_env = session.env;
         self.opencode_v2 = true;
+        #[cfg(target_os = "macos")]
+        self.protect_worktree_staging();
         Ok(())
     }
 
@@ -3306,9 +3317,34 @@ mod tests {
         }
     }
 
-    /// #719 unit 4: an OpenCode v2 session's port joins the connect allowlist
-    /// of the rules the child gets; the host default port does not. `/proc`
-    /// is read only under bubblewrap, and without it v2 is refused.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn late_opencode_grants_cannot_reopen_broker_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(temp.path()).unwrap();
+        let mut config = test_config(&home, &[]);
+        let root = home.join(".cplt-worktrees/repo");
+        std::fs::create_dir_all(&root).unwrap();
+        config.managed_worktree_root = Some(&root);
+        let mut sandbox = prepare(&config).unwrap();
+        sandbox.set_worktree_root(Some(&root));
+        let grant = format!(
+            "(allow file-read* file-write* (subpath \"{}\"))\n",
+            home.display()
+        );
+        sandbox
+            .add_opencode_v2(crate::opencode_v2::Session {
+                env: Vec::new(),
+                port: 50123,
+                sbpl_before_denies: String::new(),
+                sbpl: grant.clone(),
+            })
+            .unwrap();
+        let text = describe(&sandbox);
+        assert!(text.rfind(";; Broker staging is private").unwrap() > text.rfind(&grant).unwrap());
+    }
+
+    /// #719: v2's port joins the allowlist; /proc requires bubblewrap.
     #[cfg(target_os = "linux")]
     #[test]
     fn opencode_v2_session_port_is_allowed_and_the_host_port_is_not() {

@@ -4716,7 +4716,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     #[cfg(target_os = "macos")]
     if let Some(broker) = &worktree_broker {
         broker
-            .set_sandbox(&prepared)
+            .set_sandbox(&mut prepared)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
     #[cfg(not(target_os = "macos"))]
@@ -6459,7 +6459,7 @@ fn run_exec_command(
     // Build the resolved Shell sandbox (discovery → proxy → prepare). Shared
     // with `cplt check`, which runs its probes under the identical policy.
     let AssembledSandbox {
-        prepared,
+        mut prepared,
         policy,
         proxy_handle,
         scratch_guard,
@@ -6553,7 +6553,7 @@ fn run_exec_command(
     #[cfg(target_os = "macos")]
     if let Some(broker) = &worktree_broker {
         broker
-            .set_sandbox(&prepared)
+            .set_sandbox(&mut prepared)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
     #[cfg(not(target_os = "macos"))]

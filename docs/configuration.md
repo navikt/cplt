@@ -471,6 +471,8 @@ policy, checks the private checkout, and publishes it atomically. It:
 - refuses a symlink that leads out of the worktree, a nested repository or bare
   repository in the tree, and a name that already exists. An existing worktree
   is never replaced;
+- also refuses dangling symlinks and symlink targets with `..` after a named
+  component, matching the launch/exit checks;
 - creates no branch, so a refused or failed request leaves no ref behind.
 
 `<name>` is letters, digits, `.`, `_` and `-`, starting with a letter or digit,

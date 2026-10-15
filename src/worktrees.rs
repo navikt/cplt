@@ -590,7 +590,7 @@ fn walk_problems(common: &Path, root: &Path, max_dirs: usize, out: &mut Vec<Link
             counts[top].1 += 1;
             stack.push((path, depth + 1, top));
         }
-        if head && ((objects && refs) || commondir) {
+        if bare_layout(head, objects, refs, commondir) {
             push(
                 &dir,
                 format!(
@@ -620,7 +620,7 @@ fn walk_problems(common: &Path, root: &Path, max_dirs: usize, out: &mut Vec<Link
 /// symlink precedes a `..`: leading `..` climb the link's own directories,
 /// which the walk reached as real directories, and a `..` after a name is
 /// refused.
-fn link_stays_inside(link: &Path, worktree: &Path) -> bool {
+pub(crate) fn link_stays_inside(link: &Path, worktree: &Path) -> bool {
     use std::path::Component;
     let (Ok(target), Some(parent)) = (std::fs::read_link(link), link.parent()) else {
         return false;
@@ -643,6 +643,11 @@ fn link_stays_inside(link: &Path, worktree: &Path) -> bool {
     }
     lexical.starts_with(worktree)
         && std::fs::canonicalize(link).is_ok_and(|c| c.starts_with(worktree))
+}
+
+/// Git accepts executable regular files and links as discovery markers too.
+pub(crate) fn bare_layout(head: bool, objects: bool, refs: bool, commondir: bool) -> bool {
+    head && ((objects && refs) || commondir)
 }
 
 /// One `<root>/<name>/.git` pointer against its admin dir, both directions,

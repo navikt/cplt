@@ -2336,6 +2336,40 @@ int main(int argc, char **argv) {
     }
 
     #[test]
+    fn real_profile_staging_deny_beats_overlapping_user_writes() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let temp = tempfile::tempdir_in(&project).unwrap();
+        let base = temp.path().join(".cplt-worktrees");
+        let root = base.join("managed");
+        let staging = base.join(".staging");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("private"), "secret\n").unwrap();
+        let home = home_dir();
+        let writes = [temp.path().to_path_buf()];
+        let mut opts = default_opts(&project, &home);
+        opts.extra_write = &writes;
+        opts.managed_worktree_root = Some(&root);
+        let profile = write_real_profile(&opts);
+        let script = format!(
+            "if cat '{s}/private'; then echo LEAK; else echo READ_DENIED; fi; if touch '{s}/new'; then echo WRITE; else echo WRITE_DENIED; fi; if mv '{b}' '{b}-moved'; then echo MOVED; else echo RENAME_DENIED; fi; touch '{r}/allowed' && echo ROOT_OK",
+            s = staging.display(),
+            b = base.display(),
+            r = root.display()
+        );
+        let (output, _) = run_sandboxed(&profile, &script);
+        fs::remove_file(profile).unwrap();
+        for result in ["READ_DENIED", "WRITE_DENIED", "RENAME_DENIED", "ROOT_OK"] {
+            assert!(output.contains(result), "{output}");
+        }
+        assert_eq!(
+            fs::read_to_string(staging.join("private")).unwrap(),
+            "secret\n"
+        );
+    }
+
+    #[test]
     fn real_profile_deny_nested_git_blocks_dot_git_inside_a_gitdir() {
         require_sandbox!();
         let project = fs::canonicalize(".").unwrap();

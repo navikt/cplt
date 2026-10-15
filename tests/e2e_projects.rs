@@ -5656,6 +5656,89 @@ test -e "$CPLT_WORKTREE_ROOT/../evil" || echo RESULT:nothing-escaped:OK
     }
 
     #[test]
+    fn broker_staging_is_private_under_a_temp_home_write_grant() {
+        require_sandbox!();
+        let project = TempProject::new("wt-private-stage");
+        project.write_file("file", "tracked\n");
+        project.git_init();
+        let home = tempfile::tempdir().unwrap();
+        let staging = home.path().join(".cplt-worktrees/.staging");
+        fs::create_dir_all(staging.join("probe")).unwrap();
+        fs::write(staging.join("probe/index"), "host-private\n").unwrap();
+        let bin = crate::common::binary_path().display().to_string();
+        let config = "[sandbox]\nallow_git_worktrees = true\n";
+        let script = format!(
+            r#"
+stage="$HOME/.cplt-worktrees/.staging"
+if cat "$stage/probe/index"; then echo RESULT:read:WRITABLE; else echo RESULT:read:denied; fi
+if printf x > "$stage/probe/index"; then echo RESULT:write:WRITABLE; else echo RESULT:write:denied; fi
+if ln -sf /etc/passwd "$stage/probe/index"; then echo RESULT:index:WRITABLE; else echo RESULT:index:denied; fi
+if mv "$stage" "$HOME/stolen-stage"; then echo RESULT:stage:WRITABLE; else echo RESULT:stage:denied; fi
+if mv "$HOME/.cplt-worktrees" "$HOME/stolen-base"; then echo RESULT:base:WRITABLE; else echo RESULT:base:denied; fi
+"{bin}" worktree add git HEAD && echo RESULT:checkout:OK
+git -C "$CPLT_WORKTREE_ROOT/git" switch -c private-stage && echo RESULT:branch:OK
+"#
+        );
+        let (stdout, stderr, _) = run_exec_with_home(&project, home.path(), config, &script);
+        for result in [
+            "read:denied",
+            "write:denied",
+            "index:denied",
+            "stage:denied",
+            "base:denied",
+            "checkout:OK",
+            "branch:OK",
+        ] {
+            assert!(
+                stdout.contains(&format!("RESULT:{result}")),
+                "{stdout}\n{stderr}"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(staging.join("probe/index")).unwrap(),
+            "host-private\n"
+        );
+    }
+
+    #[test]
+    fn broker_refuses_bare_markers_and_symlink_dotdot_before_publication() {
+        use std::os::unix::fs::PermissionsExt;
+        require_sandbox!();
+        for bare in [true, false] {
+            let project = TempProject::new("wt-invalid-layout");
+            project.write_file("tracked", "ordinary\n");
+            if bare {
+                project.write_file("bare/HEAD", "ref: refs/heads/main\n");
+                for name in ["objects", "refs"] {
+                    project.write_file(&format!("bare/{name}"), "x\n");
+                    fs::set_permissions(
+                        project.path().join("bare").join(name),
+                        fs::Permissions::from_mode(0o755),
+                    )
+                    .unwrap();
+                }
+            } else {
+                std::os::unix::fs::symlink(".", project.path().join("s")).unwrap();
+                std::os::unix::fs::symlink("s/../absent-outside", project.path().join("escape"))
+                    .unwrap();
+            }
+            project.git_init();
+            let home = short_home("wt-invalid-home");
+            let bin = crate::common::binary_path().display().to_string();
+            let (stdout, stderr, _) = run_exec_with_home(
+                &project,
+                home.path(),
+                "[sandbox]\nallow_git_worktrees = true\n",
+                &format!(
+                    "\"{bin}\" worktree add rejected HEAD; echo RESULT:exit:$?\ntest ! -e \"$CPLT_WORKTREE_ROOT/rejected\" && echo RESULT:absent\n"
+                ),
+            );
+            assert!(stdout.contains("RESULT:exit:1"), "{stdout}\n{stderr}");
+            assert!(stdout.contains("RESULT:absent"), "{stdout}\n{stderr}");
+        }
+    }
+
+    #[test]
     fn worktree_broker_refuses_agent_authored_protected_tree_entries() {
         require_sandbox!();
         let project = TempProject::new("wt-protected-tree");

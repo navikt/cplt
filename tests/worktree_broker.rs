@@ -136,6 +136,46 @@ fn tracked_files() -> Vec<(&'static str, &'static str)> {
 }
 
 #[test]
+fn public_git_names_do_not_collide_with_private_metadata() {
+    for name in ["git", "GIT"] {
+        let fx = Fixture::new(&tracked_files());
+        fx.add(name, "HEAD").unwrap();
+        assert!(fx.root.join(name).join("src/a.txt").is_file());
+    }
+}
+
+#[test]
+fn executable_bare_markers_are_refused() {
+    let fx = Fixture::new(&[
+        ("bare/HEAD", "ref: refs/heads/main\n"),
+        ("bare/objects", "x"),
+        ("bare/refs", "x"),
+    ]);
+    for name in ["objects", "refs"] {
+        std::fs::set_permissions(
+            fx.project.path().join("bare").join(name),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+    commit_all(fx.project.path());
+    assert!(
+        fx.add("bare", "HEAD")
+            .unwrap_err()
+            .contains("bare git repository")
+    );
+}
+
+#[test]
+fn symlink_dotdot_escape_is_refused() {
+    let fx = Fixture::new(&tracked_files());
+    symlink(".", fx.project.path().join("s")).unwrap();
+    symlink("s/../absent-outside", fx.project.path().join("escape")).unwrap();
+    commit_all(fx.project.path());
+    assert!(fx.add("escape", "HEAD").unwrap_err().contains("symlink"));
+}
+
+#[test]
 fn filesystem_protected_aliases_are_refused_but_ordinary_unicode_is_allowed() {
     for path in [
         ".claude/ſettings.json",
@@ -715,7 +755,13 @@ fn common_filter_added_after_preflight_never_executes() {
     let writer = std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if std::fs::read_dir(&staging).is_ok_and(|mut entries| entries.next().is_some()) {
+            // Context construction also uses staging for launch-byte copies.
+            // Only the request's private admin proves preflight has finished.
+            if std::fs::read_dir(&staging).is_ok_and(|entries| {
+                entries
+                    .flatten()
+                    .any(|entry| entry.path().join(".git-admin/HEAD").is_file())
+            }) {
                 std::fs::write(&config, malicious).unwrap();
                 return;
             }

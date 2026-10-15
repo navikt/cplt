@@ -30,7 +30,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 #[cfg(target_os = "macos")]
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -234,7 +234,8 @@ impl Broker {
     /// Capture the final session policy, after all PreparedSandbox amendments.
     /// Linux never starts this broker and must not treat a policy summary as SBPL.
     #[cfg(target_os = "macos")]
-    pub fn set_sandbox(&self, sandbox: &crate::sandbox::PreparedSandbox) -> Result<(), String> {
+    pub fn set_sandbox(&self, sandbox: &mut crate::sandbox::PreparedSandbox) -> Result<(), String> {
+        sandbox.protect_worktree_staging();
         self.read_policy
             .set(crate::sandbox::describe(sandbox).to_string())
             .map_err(|_| "worktree broker read policy was already installed".into())
@@ -379,7 +380,7 @@ fn add_with_budget(
         final_git: ctx.root.join(name).join(".git"),
         published: false,
     };
-    let private = staging.join("git");
+    let private = staging.join(".git-admin");
     checkout(ctx, &private, &job.worktree, &sha, budget)?;
     validate_tree(&job.worktree, budget)?;
     verify_protected_names(&job.worktree, &ctx.protected, None, budget)?;
@@ -394,8 +395,15 @@ fn add_with_budget(
         "gitdir",
         format!("{}\n", job.final_git.display()).as_bytes(),
     )?;
-    let mut index =
-        File::open(private.join("index")).map_err(|e| format!("cannot open private index: {e}"))?;
+    let mut index = open_at(
+        &open_dir(&private)?,
+        "index",
+        libc::O_RDONLY | libc::O_NONBLOCK,
+    )?;
+    let metadata = index.metadata().map_err(|_| "cannot stat private index")?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err("private index is not a singly linked regular file".into());
+    }
     let mut target = admin.create_file("index")?;
     let mut buf = [0; 8192];
     loop {
@@ -1061,20 +1069,17 @@ fn validate_tree(worktree: &Path, budget: &Budget<'_>) -> Result<(), String> {
                 .map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
             // Bare-repo markers are checked by name for every entry type: `refs`
             // and `objects` are directories, `HEAD` a file.
-            match name.as_ref() {
-                "HEAD" if !ft.is_dir() => has_head = true,
-                "refs" if ft.is_dir() => has_refs = true,
-                "objects" if ft.is_dir() => has_objects = true,
-                "commondir" => has_commondir = true,
-                _ => {}
-            }
+            has_head |= name.eq_ignore_ascii_case("HEAD");
+            has_refs |= name.eq_ignore_ascii_case("refs");
+            has_objects |= name.eq_ignore_ascii_case("objects");
+            has_commondir |= name.eq_ignore_ascii_case("commondir");
             if ft.is_symlink() {
                 check_symlink(&path, &root)?;
             } else if ft.is_dir() {
                 stack.push(path);
             }
         }
-        if has_head && ((has_objects && has_refs) || has_commondir) {
+        if worktrees::bare_layout(has_head, has_objects, has_refs, has_commondir) {
             return Err(format!(
                 "{} looks like a bare git repository; refusing to publish it",
                 dir.strip_prefix(worktree).unwrap_or(&dir).display()
@@ -1086,8 +1091,8 @@ fn validate_tree(worktree: &Path, budget: &Budget<'_>) -> Result<(), String> {
 
 /// A symlink must resolve to something inside `root`. Absolute targets are
 /// refused outright. A relative target is resolved through the filesystem when
-/// it exists, so a link to a link that leaves the tree is caught, and lexically
-/// when it dangles.
+/// it exists. Dangling links and a `..` after a named component fail closed,
+/// using the same rule as the launch/exit worktree checks.
 fn check_symlink(link: &Path, root: &Path) -> Result<(), String> {
     let target =
         std::fs::read_link(link).map_err(|e| format!("cannot read {}: {e}", link.display()))?;
@@ -1098,33 +1103,8 @@ fn check_symlink(link: &Path, root: &Path) -> Result<(), String> {
             rel.display()
         )
     };
-    if target.is_absolute() {
+    if target.is_absolute() || !worktrees::link_stays_inside(link, root) {
         return Err(escapes());
-    }
-    if let Ok(resolved) = std::fs::canonicalize(link) {
-        return if resolved.starts_with(root) {
-            Ok(())
-        } else {
-            Err(escapes())
-        };
-    }
-    // Dangling: walk the components lexically from the link's directory.
-    let mut depth: i64 = link
-        .parent()
-        .and_then(|p| p.strip_prefix(root).ok())
-        .map_or(0, |p| {
-            i64::try_from(p.components().count()).unwrap_or(i64::MAX)
-        });
-    for c in target.components() {
-        match c {
-            Component::ParentDir => depth -= 1,
-            Component::Normal(_) => depth += 1,
-            Component::CurDir => {}
-            _ => return Err(escapes()),
-        }
-        if depth < 0 {
-            return Err(escapes());
-        }
     }
     Ok(())
 }

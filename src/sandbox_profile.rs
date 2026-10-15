@@ -294,6 +294,9 @@ pub fn generate_profile_with_playwright_socket_dir(
     // MUST stay last: see `emit_exec_write_denies`. An exec grant that could be
     // reopened for writing by a later allow is a write-then-exec path.
     emit_exec_write_denies(&mut sb, config.extra_exec);
+    if let Some(root) = config.managed_worktree_root {
+        protect_worktree_staging(&mut sb, root);
+    }
 
     sb
 }
@@ -3077,6 +3080,29 @@ fn emit_worktree_broker(sb: &mut String, socket: Option<&Path>) {
         sbpl!(sb, "(deny file-write* (subpath \"{}\"))", dir.display());
     }
     sbpl!(sb);
+}
+
+/// A temp HOME or user write grant may cover the broker base. Deny staging
+/// explicitly and pin its ancestors without denying managed-root descendants.
+/// The broker child adds access only to its random request directory afterwards.
+pub(super) fn protect_worktree_staging(sb: &mut String, root: &Path) {
+    // prepare validates the managed-root spelling; non-existent paths are also
+    // used by pure profile tests. Real launches already created the base.
+    let base = root.parent().expect("managed root has a base");
+    let base = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
+    sbpl!(sb, ";; Broker staging is private even below user grants");
+    sbpl!(
+        sb,
+        "(deny file-read* file-write* (subpath \"{}/.staging\"))",
+        base.display()
+    );
+    for ancestor in base.ancestors().filter(|p| p.parent().is_some()) {
+        sbpl!(
+            sb,
+            "(deny file-write* (literal \"{}\"))",
+            ancestor.display()
+        );
+    }
 }
 
 fn emit_socket_rules(sb: &mut String, allow_socket: &[PathBuf], extra_deny: &[PathBuf]) {
