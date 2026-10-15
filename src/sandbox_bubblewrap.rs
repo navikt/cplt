@@ -3420,7 +3420,7 @@ mod tests {
         let canon_base = base.path().canonicalize().unwrap();
         let masks = DenyMasks {
             dirs: vec![canon_base.clone()],
-            credential_dirs: vec![canon_base],
+            credential_dirs: vec![(canon_base.clone(), canon_base)],
             ..Default::default()
         };
         let rebind_args = build_bwrap_args(&rules, overlays, &masks);
