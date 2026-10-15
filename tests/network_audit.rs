@@ -366,6 +366,11 @@ mod tests {
     /// `localhost:<port>` rule allows.
     #[test]
     fn ipv6_loopback_proxy_listener_and_grpc_proxy_reach_origin() {
+        if cfg!(target_os = "linux")
+            && std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)).is_err()
+        {
+            return;
+        }
         let project = project();
         let origin = Origin::start();
         let proxy_var = if cfg!(target_os = "macos") {

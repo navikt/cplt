@@ -6144,7 +6144,7 @@ fn assemble_sandbox(
     );
 
     let policy = sandbox::generate_policy(&sandbox_config);
-    let read_denies = sandbox::ReadDenies::from_config(&sandbox_config);
+    let read_denies = sandbox::ReadDenies::from_config_for_current_os(&sandbox_config);
     // Here, not at each caller: the launch, `exec` and `check` all build their
     // policy through this function, and all three must say it.
     if proxy_handle.is_some() {

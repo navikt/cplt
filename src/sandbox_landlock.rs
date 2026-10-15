@@ -2009,7 +2009,7 @@ fn ensure_nofile_headroom(rule_count: usize) {
         rlim_max: 0,
     };
     // SAFETY: `rlim` is a valid writable `libc::rlimit`.
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) } != 0 {
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut rlim) } != 0 {
         return;
     }
     if rlim.rlim_cur >= needed || rlim.rlim_cur >= rlim.rlim_max {
@@ -2024,7 +2024,7 @@ fn ensure_nofile_headroom(rule_count: usize) {
         rlim.rlim_cur = target;
         // SAFETY: `rlim` holds `rlim_cur <= rlim_max`.
         unsafe {
-            libc::setrlimit(libc::RLIMIT_NOFILE, &rlim);
+            libc::setrlimit(libc::RLIMIT_NOFILE, &raw const rlim);
         }
     }
 }
@@ -2110,6 +2110,11 @@ fn open_fs_rules(
 impl PrecomputedSandbox {
     /// Rebuild the rules from `policy` after it changed (OpenCode v2, #719).
     pub fn reload(&mut self, policy: &LandlockPolicy) -> Result<(), String> {
+        ensure_nofile_headroom(
+            self.pre_opened_fds
+                .len()
+                .saturating_add(policy.fs_rules.len()),
+        );
         let (fds, deferred, plain) = open_fs_rules(policy)?;
         for (fd, _) in std::mem::replace(&mut self.pre_opened_fds, fds) {
             // SAFETY: an O_PATH descriptor this struct opened and owns.

@@ -3582,6 +3582,50 @@ print('CONNECTED')
     }
 
     #[test]
+    fn bwrap_protects_missing_git_remotes_and_branches_dirs() {
+        // #747: modern `git init` omits `.git/remotes` and `.git/branches`.
+        // Under bubblewrap, both must be mounted as read-only tmpfs so the
+        // sandboxed child cannot plant legacy remote files there, while
+        // regular `.git` operations (like writing `.git/COMMIT_EDITMSG`) work.
+        require_bwrap!();
+        let dir = non_tmp_tempdir();
+        let project = dir.path().canonicalize().unwrap();
+        let git_dir = project.join(".git");
+        fs::create_dir_all(git_dir.join("hooks")).unwrap();
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(
+            git_dir.join("config"),
+            "[core]\n\trepositoryformatversion = 0\n",
+        )
+        .unwrap();
+        assert!(!git_dir.join("remotes").exists());
+        assert!(!git_dir.join("branches").exists());
+
+        let (code, stdout, stderr) = run_sandboxed_with_flags(
+            &project,
+            &["--use-bubblewrap"],
+            "sh -c '\
+                (echo \"URL: https://evil.example/repo\" > .git/remotes/origin) 2>/dev/null \
+                    && echo REMOTES-WRITTEN || echo REMOTES-DENIED; \
+                (echo \"https://evil.example/repo\" > .git/branches/origin) 2>/dev/null \
+                    && echo BRANCHES-WRITTEN || echo BRANCHES-DENIED; \
+                (rmdir .git/remotes) 2>/dev/null \
+                    && echo RMDIR-OK || echo RMDIR-DENIED; \
+                echo msg > .git/COMMIT_EDITMSG && echo COMMIT-MSG-OK'",
+        );
+        assert!(
+            code == 0
+                && stdout.contains("REMOTES-DENIED")
+                && stdout.contains("BRANCHES-DENIED")
+                && stdout.contains("RMDIR-DENIED")
+                && stdout.contains("COMMIT-MSG-OK")
+                && !git_dir.join("remotes/origin").exists()
+                && !git_dir.join("branches/origin").exists(),
+            "code: {code}, stdout: {stdout}, stderr: {stderr}"
+        );
+    }
+
+    #[test]
     fn bwrap_deny_mask_placeholder_cannot_be_softened() {
         // The placeholder lives inside the writable scratch bind (TMPDIR); a
         // self ro-bind must make chmod through that path fail, or the agent

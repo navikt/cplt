@@ -3084,8 +3084,10 @@ pub struct ReadDenies {
 enum ReadRule {
     DenySubpath(PathBuf),
     DenyLiteral(PathBuf),
+    DenyPrefix(String),
     AllowSubpath(PathBuf),
     AllowLiteral(PathBuf),
+    AllowPrefix(String),
 }
 
 impl ReadDenies {
@@ -3095,6 +3097,26 @@ impl ReadDenies {
     pub fn from_config(config: &SandboxConfig) -> Self {
         let home = config.home_dir.to_string_lossy();
         let mut rules = Vec::new();
+
+        // 0. `emit_tool_dirs` cache-prefix denies and `emit_user_allows`
+        for &prefix in DENIED_CACHE_PREFIXES {
+            for base in home_spellings(&home, "Library/Caches") {
+                rules.push(ReadRule::DenyPrefix(format!("{base}/{prefix}")));
+            }
+        }
+        for base in home_spellings(&home, "Library/Caches") {
+            rules.push(ReadRule::AllowPrefix(format!("{base}/com.apple.dt.")));
+        }
+        for path in config
+            .extra_read
+            .iter()
+            .chain(config.extra_write)
+            .chain(config.extra_exec)
+        {
+            if validate_sbpl_path(path).is_ok() {
+                rules.push(ReadRule::AllowSubpath(path.clone()));
+            }
+        }
 
         // 1. `emit_deny_rules`
         for &d in DENIED_DOTFILES {
@@ -3209,6 +3231,23 @@ impl ReadDenies {
         }
     }
 
+    /// Build the read-deny model enforced on the current OS.
+    ///
+    /// Seatbelt's regex project `.env` and key-file denies are macOS-only
+    /// (`LinuxCoverage::Gap` on Landlock/bubblewrap), so non-macOS callers omit
+    /// `deny_env_and_keys` and `Library/Caches` prefix rules.
+    #[must_use]
+    pub fn from_config_for_current_os(config: &SandboxConfig) -> Self {
+        let mut denies = Self::from_config(config);
+        if !cfg!(target_os = "macos") {
+            denies.deny_env_and_keys = false;
+            denies
+                .rules
+                .retain(|r| !matches!(r, ReadRule::DenyPrefix(_) | ReadRule::AllowPrefix(_)));
+        }
+        denies
+    }
+
     /// Construct a `ReadDenies` carrying only explicit `--deny-path` subpaths.
     #[must_use]
     pub fn from_deny_paths(deny_paths: &[PathBuf]) -> Self {
@@ -3235,8 +3274,14 @@ impl ReadDenies {
             match rule {
                 ReadRule::DenySubpath(p) if path.starts_with(p) => denied = true,
                 ReadRule::DenyLiteral(p) if path == p => denied = true,
+                ReadRule::DenyPrefix(p) if path.to_str().is_some_and(|s| s.starts_with(p)) => {
+                    denied = true;
+                }
                 ReadRule::AllowSubpath(p) if path.starts_with(p) => denied = false,
                 ReadRule::AllowLiteral(p) if path == p => denied = false,
+                ReadRule::AllowPrefix(p) if path.to_str().is_some_and(|s| s.starts_with(p)) => {
+                    denied = false;
+                }
                 _ => {}
             }
         }
@@ -6554,5 +6599,35 @@ mod tests {
                 violations(&pinned)
             );
         }
+    }
+
+    #[test]
+    fn read_denies_models_cache_prefixes_and_user_allows() {
+        let project = Path::new("/projects/app");
+        let home = Path::new("/Users/test");
+        let allow_safari = [PathBuf::from("/Users/test/Library/Caches/com.apple.Safari")];
+        let mut opts = test_options(project, home);
+        let denies = ReadDenies::from_config(&opts);
+        assert!(
+            denies.denies(Path::new(
+                "/Users/test/Library/Caches/com.apple.Safari/Cache.db"
+            )),
+            "DENIED_CACHE_PREFIXES entry must be denied by default"
+        );
+        assert!(
+            !denies.denies(Path::new(
+                "/Users/test/Library/Caches/com.apple.dt.Xcode/DerivedData/info.plist"
+            )),
+            "com.apple.dt. Xcode cache exception must not be denied"
+        );
+
+        opts.extra_read = &allow_safari;
+        let denies_with_allow = ReadDenies::from_config(&opts);
+        assert!(
+            !denies_with_allow.denies(Path::new(
+                "/Users/test/Library/Caches/com.apple.Safari/Cache.db"
+            )),
+            "--allow-read on a denied cache prefix must clear the read deny"
+        );
     }
 }
