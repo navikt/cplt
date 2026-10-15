@@ -5826,11 +5826,10 @@ mod account_tests {
             r#"{"loggedInUsers":[{"host":"https://github.com\n","login":"alice"}]}"#,
         ] {
             std::fs::write(&cfg, bad).unwrap();
-            let res = copilot_config_account(home.path());
-            assert!(
-                matches!(res, CopilotConfigAccount::Ambiguous(ref s) if !s.chars().any(char::is_control)),
-                "{bad}: {res:?}"
-            );
+            assert!(matches!(
+                copilot_config_account(home.path()),
+                CopilotConfigAccount::Ambiguous(ref s) if !s.chars().any(char::is_control)
+            ));
         }
     }
 
