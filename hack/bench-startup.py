@@ -58,7 +58,14 @@ __attribute__((constructor))
 static void init_interpose(void) {
     root_pid = getpid();
     const char *env_log = getenv("CPLT_SPAWN_LOG");
-    if (env_log) log_path = strdup(env_log);
+    if (env_log) {
+        log_path = strdup(env_log);
+        int fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0600);
+        if (fd >= 0) {
+            (void)write(fd, "__init__\\n", 9);
+            close(fd);
+        }
+    }
     unsetenv("DYLD_INSERT_LIBRARIES");
     unsetenv("CPLT_SPAWN_LOG");
 }
@@ -120,10 +127,13 @@ def count_spawns(cplt: Path, args: list[str], cwd: Path, env: dict[str, str], dy
     run_env = dict(env)
     run_env["DYLD_INSERT_LIBRARIES"] = str(dylib)
     run_env["CPLT_SPAWN_LOG"] = str(log_file)
-    subprocess.run([str(cplt), *args], cwd=cwd, env=run_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
-    if not log_file.is_file():
-        return 0, 0
-    lines = [line.strip() for line in log_file.read_text().splitlines() if line.strip()]
+    res = subprocess.run([str(cplt), *args], cwd=cwd, env=run_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+    if res.returncode != 0 or not log_file.is_file():
+        return None, None
+    raw_lines = [line.strip() for line in log_file.read_text().splitlines() if line.strip()]
+    if "__init__" not in raw_lines:
+        return None, None
+    lines = [line for line in raw_lines if line != "__init__"]
     git_spawns = sum(1 for line in lines if os.path.basename(line) == "git")
     return git_spawns, len(lines)
 
@@ -201,8 +211,11 @@ def main() -> int:
             for _ in range(args.warmup):
                 subprocess.run([str(cplt), *cmd_args], cwd=repo, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, check=True)
 
-            git_spawns, total_spawns = count_spawns(cplt, cmd_args, repo, env, dylib)
-            if git_spawns is not None and git_spawns > git_budget:
+            git_spawns, posix_spawns = count_spawns(cplt, cmd_args, repo, env, dylib)
+            if git_spawns is None:
+                if args.check_spawns:
+                    spawn_failures.append(f"{label}: spawn instrumentation unavailable or failed")
+            elif git_spawns > git_budget:
                 spawn_failures.append(f"{label}: spawned git {git_spawns} times (budget <= {git_budget})")
 
             samples: list[float] = []
@@ -218,7 +231,7 @@ def main() -> int:
                 "p95_ms": round(percentile(samples, 95), 1),
                 "stdev_ms": round(statistics.stdev(samples), 1) if len(samples) > 1 else 0.0,
                 "git_spawns": git_spawns,
-                "total_spawns": total_spawns,
+                "posix_spawns": posix_spawns,
                 "git_budget": git_budget,
                 "issue_666_ms": issue_666_ms,
             }
@@ -250,7 +263,7 @@ def main() -> int:
         print(f"\nSaved results to {args.save}")
 
     if spawn_failures:
-        print("\nParent git spawn budget exceeded:", file=sys.stderr)
+        print("\nParent git spawn check failed:", file=sys.stderr)
         for msg in spawn_failures:
             print(f"  - {msg}", file=sys.stderr)
         if args.check_spawns:
