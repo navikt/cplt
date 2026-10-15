@@ -189,7 +189,7 @@ pub fn prepare_root_for(
 ///
 /// `fix` is false for `doctor`, `check` and `--print-profile`: they check
 /// but never create the directory or change its mode.
-fn secure_dir(dir: &Path, label: &str, fix: bool) -> Result<(), String> {
+pub(crate) fn secure_dir(dir: &Path, label: &str, fix: bool) -> Result<(), String> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
     if fix {
         match std::fs::DirBuilder::new().mode(0o700).create(dir) {
@@ -336,7 +336,7 @@ pub fn link_problems(common: &Path, root: &Path, max_dirs: usize) -> Vec<LinkPro
 /// Opened `O_NOFOLLOW | O_NONBLOCK` and checked through the descriptor: a
 /// symlink is refused by the kernel, and a FIFO in its place cannot hang the
 /// launch.
-fn read_link_file(path: &Path) -> Result<String, String> {
+pub(crate) fn read_link_file(path: &Path) -> Result<String, String> {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
     let mut file = std::fs::OpenOptions::new()

@@ -20,6 +20,7 @@ Always run `mise run check` at the end of a coding session.
 | `mise run test:network-audit` | network_audit | ✅ | ❌ | ✅ | macOS or Linux; binds localhost TCP |
 | `mise run test:e2e` | e2e | ✅ | ❌ | ✅ | macOS + `copilot` in PATH; checkout not under `/tmp` or `/var/folders` |
 | `mise run test:e2e-projects` | e2e_projects | ✅ | ❌ | ✅ | macOS `sandbox-exec`; checkout not under `/tmp` or `/var/folders` |
+| `mise run test:worktree-broker` | worktree_broker | ❌ | ❌ | ✅ | macOS; real git, binds a Unix socket |
 | `mise run test:e2e-live` | e2e (ignored), 6 smoke tests | ❌ | ❌ | ⚠️ | macOS + Copilot auth + network |
 | `mise run test:all` | the suites above except live, minus the guard suites | ✅ | ❌ | ✅ | macOS + `copilot` in PATH |
 | `mise run test:everything` | all + live | ❌ | ❌ | ⚠️ | macOS + Copilot auth + network |
@@ -72,6 +73,7 @@ set.
 - `src/sandbox_landlock.rs` Landlock LSM + seccomp-BPF (cross-platform policy, Linux-only enforcement)
 - `src/sandbox_bubblewrap.rs` optional bubblewrap namespace layer and in-namespace re-entry (Linux)
 - `src/config/` config file parsing, CLI/config merging, key registry, per-repo keys, `Resolved` struct
+- `src/worktree_broker.rs` parent-side `cplt worktree add` broker and client (#531)
 - `src/discover.rs` runtime environment probing (`cplt doctor`)
 - `src/detect.rs` project and machine ecosystem detectors behind `cplt init`
 - `src/gh_proxy.rs` gh and git command guards, policy tables, wrapper scripts

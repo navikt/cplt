@@ -130,6 +130,7 @@ fn configure_command(
     // suppress the extraction. See `child_keeps_a_github_token`.
     deny_env: &[String],
     worktree_root: Option<&Path>,
+    worktree_socket: Option<&Path>,
     // The Keychain substitute this run resolved. A `GhToken` one already puts
     // gh's token in the child, so neither channel below runs `gh` again.
     keychain_substitute: Option<&crate::agent::KeychainSubstitute>,
@@ -262,6 +263,12 @@ fn configure_command(
     match worktree_root {
         Some(root) => cmd.env(crate::worktrees::ENV, root),
         None => cmd.env_remove(crate::worktrees::ENV),
+    };
+    // Same rule for the broker socket (#531): the path is the one the launcher
+    // bound and granted, so an inherited value must never survive.
+    match worktree_socket {
+        Some(socket) => cmd.env(crate::worktree_broker::SOCKET_ENV, socket),
+        None => cmd.env_remove(crate::worktree_broker::SOCKET_ENV),
     };
 
     // Point the agent at its own brief, so it does not have to know the
@@ -1433,6 +1440,7 @@ pub fn exec(
         sandbox.playwright_runtime,
         deny_env,
         sandbox.worktree_root.as_deref(),
+        sandbox.worktree_socket.as_deref(),
         sandbox.keychain_substitute.as_ref(),
     );
 
@@ -1579,6 +1587,7 @@ pub fn exec(
         sandbox.playwright_runtime,
         deny_env,
         sandbox.worktree_root.as_deref(),
+        sandbox.worktree_socket.as_deref(),
         sandbox.keychain_substitute.as_ref(),
     );
 
@@ -1805,6 +1814,7 @@ fn exec_bwrap(
         sandbox.playwright_runtime,
         deny_env,
         sandbox.worktree_root.as_deref(),
+        sandbox.worktree_socket.as_deref(),
         sandbox.keychain_substitute.as_ref(),
     );
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());

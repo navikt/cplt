@@ -593,6 +593,7 @@ What passes through:
 | `--allow-clipboard` | Give the agent back the macOS clipboard, which cplt denies by default. Equivalent to `sandbox.deny_clipboard = false` |
 | `--use-bubblewrap` | Linux only. Require the bubblewrap namespace layer (PID, mount, IPC, UTS, cgroup, user namespaces plus a private `/tmp`) on top of Landlock and seccomp. Errors out if `bwrap` is missing. Auto-detected when neither flag is given |
 | `--no-bubblewrap` | Linux only. Never use bubblewrap, even when installed. Falls back to Landlock and seccomp. Use it when bwrap breaks a specific tool |
+| `sandbox.allow_git_worktrees` (config only, macOS) | Let sub-agents create worktrees with `cplt worktree add <name> <ref>` under a cplt-owned root for this repository. Git runs under the session read policy; protected files must match launch HEAD. Off by default. See [Worktrees for sub-agents](docs/configuration.md#worktrees-for-sub-agents-sandboxallow_git_worktrees) |
 
 ### Supported runtimes
 

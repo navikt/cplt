@@ -319,8 +319,11 @@ pub fn generate_session_brief(facts: &BriefFacts) -> String {
         let _ = write!(
             out,
             "## Worktrees\n\n\
-             Create worktrees for parallel work under `$CPLT_WORKTREE_ROOT` ({root}): \
-             `git worktree add \"$CPLT_WORKTREE_ROOT/<name>\" -b <branch>`. You have read, \
+             Create worktrees for parallel work under `$CPLT_WORKTREE_ROOT` ({root}) with \
+             `cplt worktree add <name> <ref>`, which prints the path. It checks out `<ref>` \
+             detached, from local refs only; for a branch run \
+             `git -C <path> switch -c <branch>`. Prefer `cplt worktree add` over plain \
+             `git worktree add`, which runs git directly without cplt's checks. You have read, \
              write and execute there, and not in other repositories' roots. It belongs to this repository \
              only. Worktrees and branches you create persist after the session; cplt never \
              removes them. The end-of-session audit does not cover them. Do not run \

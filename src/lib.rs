@@ -31,6 +31,7 @@ pub mod ui;
 pub mod untrusted;
 pub mod update;
 pub mod upstream;
+pub mod worktree_broker;
 pub mod worktrees;
 
 /// Safety check: reject overly broad project roots.

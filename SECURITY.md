@@ -676,6 +676,95 @@ does not:
   scope, the audit's repository list, or the trust store. Approval stays keyed
   on the repository (#527), so launching from a managed worktree uses the
   existing approval and creates none.
+- **`cplt worktree add`: the parent makes the checkout.** The sandboxed
+  `cplt worktree add <name> <ref>` sends one request to a per-session Unix
+  socket, `$CPLT_WORKTREE_SOCKET`. The sandbox may connect to that one path
+  (`network-outbound`, `path-literal`) and to nothing else. The socket is in a
+  short random directory under `/private/tmp`, mode 0700, using the existing
+  private socket-directory guard. Its exact directory has a write deny,
+  including rename and unlink; no directory read or execution grant is added.
+  Socket length is independent of HOME. No secret: the client is
+  the sandboxed agent, the authority the sandbox already has. The parent
+  checks out `<ref>` detached into `~/.cplt-worktrees/.staging`, which the
+  sandbox cannot write, then validates the tree and renames it into the root
+  with `renameatx_np(RENAME_EXCL)`. A name that exists is refused, never
+  replaced. Rules:
+   - The ref is resolved with an explicit, launch-pinned common git directory,
+     never by rediscovering the launch checkout. Both `GIT_COMMON_DIR` and
+     `--git-dir` name it. Directory identities are checked before use. No fetch,
+     no remote: `GIT_NO_LAZY_FETCH=1`, `protocol.allow=never`, and an empty
+     `GIT_ALLOW_PROTOCOL` also deny per-protocol config overrides.
+   - Before the agent starts, bootstrap Git queries freeze the launch checkout's
+     HEAD and its protected tree entries. They are hardened content-free queries;
+     tree enumeration explicitly pins the common directory. The snapshot stays
+     private and contains path bytes, regular-file mode and blob id, never file
+     contents. Replacement objects are disabled throughout broker Git use.
+     Launch HEAD must name a commit; tree queries fail closed at 1 MiB or 200,000
+     entries. No incomplete snapshot is accepted.
+   - Every request-time broker Git child, including config queries and ref resolution, runs
+     under `/usr/bin/sandbox-exec -p` with an immutable copy of the final session
+     profile. Without that profile, requests fail closed. Kernel read denies
+     apply to symlinked refs, config includes and recursive object alternates.
+     Checkout adds read/write only for this request's private staging directory,
+     with execution there denied. It grants no additional common, base or
+      source-directory access. Private config prevents executable drivers;
+      Seatbelt prevents publishing data the caller cannot read.
+   - Requested protected paths must equal the frozen launch snapshot, derived
+     from `PROTECTED_IN_ROOT` with its subtree and nested flags. Matching uses
+     conservative ASCII case folding; comparison preserves exact path bytes,
+     mode and blob id. Additions, deletions, changes and case renames refuse the
+     request before checkout. Symlinks and gitlinks at protected paths or their
+     ancestors are refused. After checkout, raw protected bytes are hashed with
+     filters disabled and compared again: attributes such as `ident` must not
+     transform a protected file. Different protected content requires preparing
+     the worktree outside cplt, with no new approval path.
+  - Hooks are off (`core.hooksPath=/dev/null`). A `filter.*` entry in any
+    config scope, including the user's global config, refuses the request,
+     because private checkout cannot reproduce filtered content. The refusal
+     names keys only. It is not a security barrier: checkout uses private
+     config, HEAD, index and objects with an alternate pointing to the pinned
+     common objects. `git read-tree --reset -u <commit>` runs in private staging
+     with `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_NOSYSTEM=1`; no common
+     config or linked-worktree admin is loaded. Config edits after preflight
+     cannot install filters or promisor fetches in this checkout. Alternates
+     can load further objects, not config. Git parsing corrupt objects remains
+      an accepted dependency risk.
+     This is not a promise of raw-byte fidelity for ordinary files: Git
+     attributes may transform them, and private config ignores user checkout
+     settings. Only protected files receive the raw-byte equality check.
+  - Refused in the tree: a symlink that is absolute or resolves outside the
+    worktree, a `.git` other than the pointer, and a bare repository layout
+     (`HEAD` with `objects` and `refs`, or with `commondir`). The tree must hold
+     at most 200,000 entries.
+  - The `.git` pointer is written as `gitdir: <common>/worktrees/<id>`, and the
+     admin `gitdir` back link is set to the final path before the rename.
+     Admin directories use random `cplt-<hex>` names, `mkdirat` and no-follow
+     directory descriptors. HEAD, commondir, gitdir and index use exclusive
+     no-follow opens; no existing file is truncated. No host git runs against
+     this shared admin directory after installation.
+  - No branch is created. A failed request removes the staging directory and
+     its own admin files through the saved descriptor. Only an empty directory
+     whose inode still matches is removed. Agent namespaces are never deleted
+     recursively.
+  - Requests are served one at a time. A base lock (`~/.cplt-worktrees/.lock`)
+    serialises sessions. Each request line is at most 4 KiB, each reply is at
+     most 4 KiB. Reading the request has an absolute 10 s deadline. One 60 s
+     operation deadline covers nonblocking lock acquisition, all Git commands,
+     output draining and validation. Output is capped at 1 MiB per stream.
+     Shutdown cancels request reads, lock waits and commands. The client waits
+      70 s for a reply; socket writes have a 10 s timeout.
+     Private staging deletion and failed-job cleanup run outside that operation
+     budget. Filesystem stalls and large cleanup work can extend shutdown time;
+     the 60 s budget is not a comprehensive wall-clock bound.
+  - Plain `git worktree add` in the sandbox is unchanged: it runs git directly
+    and gets none of the checks above. The launch-time and exit-time link
+    checks still cover what it creates.
+  - Not covered: a session killed mid-request (`kill -9`) leaves its socket
+    directory, and any half-made staging directory and admin dir, behind.
+    Nothing outside the private socket directory, `.staging` and
+    `<common>/worktrees` is touched,
+    and `git worktree prune` clears an admin dir whose path is gone. A stale
+    staging directory is not removed automatically.
 - **No isolation between sub-agents.** All worktrees in a session share one
   grant. A sub-agent can write every other sub-agent's worktree, and every
   sub-agent can still write the launch checkout. The root keeps parallel work

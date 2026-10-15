@@ -5173,6 +5173,12 @@ fi
     // Managed worktree root (sandbox.allow_git_worktrees, #531)
     // ============================================================
 
+    /// Keep HOME under the real home directory. A home under /private/tmp would
+    /// change which writes the profile allows, unlike a user's normal session.
+    fn short_home(label: &str) -> tempfile::TempDir {
+        home_temp_dir(label)
+    }
+
     /// Run `cplt exec` of a script inside `project`, with `home` as HOME and
     /// `config` as the config file. The script lives in the project: nothing
     /// else is executable in the sandbox.
@@ -5266,7 +5272,7 @@ r wt_remove 'git worktree remove --force "$R/b"'
         let project = TempProject::new("wt-on");
         project.write_file("f.txt", "x\n");
         project.git_init();
-        let home = TempProject::new("wt-on-home");
+        let home = short_home("wt-on-home");
         let (root, other) = managed_paths(&project, home.path());
         let other_s = other.display().to_string();
         let base_s = other.parent().unwrap().display().to_string();
@@ -5340,7 +5346,7 @@ echo "ROOT:$R"
         let project = TempProject::new("wt-off");
         project.write_file("f.txt", "x\n");
         project.git_init();
-        let home = TempProject::new("wt-off-home");
+        let home = short_home("wt-off-home");
         let (root, _) = managed_paths(&project, home.path());
         let root_s = root.display().to_string();
         let script = format!(
@@ -5430,7 +5436,7 @@ if echo y > "{root_s}/g" 2>/dev/null; then echo RESULT:write:OK; else echo RESUL
             let project = TempProject::new(&format!("wt-links-{name}"));
             project.write_file("f.txt", "x\n");
             project.git_init();
-            let home = TempProject::new(&format!("wt-links-{name}-home"));
+            let home = short_home(&format!("wt-links-{name}-home"));
             let (root, _) = managed_paths(&project, home.path());
             let script = format!(
                 "P=\"$PWD\"\nR=\"$CPLT_WORKTREE_ROOT\"\ngit worktree add -q \"$R/a\" -b a \
@@ -5489,7 +5495,7 @@ if echo y > "{root_s}/g" 2>/dev/null; then echo RESULT:write:OK; else echo RESUL
         let project = TempProject::new("wt-link");
         project.write_file("f.txt", "x\n");
         project.git_init();
-        let home = TempProject::new("wt-link-home");
+        let home = short_home("wt-link-home");
         let (root, other) = managed_paths(&project, home.path());
         std::os::unix::fs::symlink(&other, &root).unwrap();
         let (stdout, stderr, ok) = run_exec_with_home(
@@ -5506,17 +5512,253 @@ if echo y > "{root_s}/g" 2>/dev/null; then echo RESULT:write:OK; else echo RESUL
         );
     }
 
-    /// #574 round 8: with the key off, the session can rewrite a worktree's
-    /// `commondir` in place (only the key-on profile denies it, and the
-    /// key-off profile stays as on main). The session-end check still runs
-    /// whenever the root exists, and names the worktree.
+    /// `cplt worktree add` from inside the sandbox (#531): the parent makes the
+    /// checkout, the agent sees the complete tree at `$CPLT_WORKTREE_ROOT/<name>`,
+    /// a second request for the same name fails without touching the first, and
+    /// a hostile name never reaches git.
+    #[test]
+    fn worktree_add_from_inside_the_sandbox_publishes_a_complete_checkout() {
+        require_sandbox!();
+        let project = TempProject::new("wt-broker");
+        project.write_file("f.txt", "x\n");
+        project.write_file(".cplt.toml", "[propose]\n");
+        project.write_file(".github/hooks/pre.sh", "echo hook\n");
+        project.git_init();
+        let home = short_home("wt-broker-home");
+        let (root, _) = managed_paths(&project, home.path());
+        let bin = crate::common::binary_path().display().to_string();
+        let script = format!(
+            r#"
+out=$("{bin}" worktree add wt1 HEAD 2>"$TMPDIR/err1"); echo "RESULT:add:$?"
+test "$out" = "$CPLT_WORKTREE_ROOT/wt1" && echo RESULT:path:OK
+test -f "$CPLT_WORKTREE_ROOT/wt1/f.txt" && test -f "$CPLT_WORKTREE_ROOT/wt1/.cplt.toml" && test -f "$CPLT_WORKTREE_ROOT/wt1/.github/hooks/pre.sh" && echo RESULT:complete:OK
+git -C "$CPLT_WORKTREE_ROOT/wt1" status --porcelain > "$TMPDIR/broker-status" && test ! -s "$TMPDIR/broker-status" && echo RESULT:clean:OK
+git -C "$CPLT_WORKTREE_ROOT/wt1" switch -c broker-feature && echo RESULT:branch:OK
+if printf 'gitdir: /tmp\n' > "$CPLT_WORKTREE_ROOT/wt1/.git"; then echo RESULT:pointer:WRITABLE; else echo RESULT:pointer:denied; fi
+if printf 'changed\n' > "$CPLT_WORKTREE_ROOT/wt1/.cplt.toml"; then echo RESULT:cplt:WRITABLE; else echo RESULT:cplt:denied; fi
+if printf 'changed\n' > "$CPLT_WORKTREE_ROOT/wt1/.github/hooks/pre.sh"; then echo RESULT:hooks:WRITABLE; else echo RESULT:hooks:denied; fi
+mkdir -p "$CPLT_WORKTREE_ROOT/wt1/.claude"
+if printf '{{}}\n' > "$CPLT_WORKTREE_ROOT/wt1/.claude/settings.json"; then echo RESULT:new-settings:WRITABLE; else echo RESULT:new-settings:denied; fi
+if rm "$CPLT_WORKTREE_SOCKET"; then echo RESULT:socket:WRITABLE; else echo RESULT:socket:denied; fi
+if mv "$(dirname "$CPLT_WORKTREE_SOCKET")" "$TMPDIR/stolen-broker"; then echo RESULT:socket-dir:WRITABLE; else echo RESULT:socket-dir:denied; fi
+"{bin}" worktree add wt1 HEAD >/dev/null 2>&1; echo "RESULT:dup:$?"
+"{bin}" worktree add ../evil HEAD >/dev/null 2>&1; echo "RESULT:traversal:$?"
+test -e "$CPLT_WORKTREE_ROOT/../evil" || echo RESULT:nothing-escaped:OK
+"#
+        );
+        let (stdout, stderr, _) = run_exec_with_home(
+            &project,
+            home.path(),
+            "[sandbox]\nallow_git_worktrees = true\n",
+            &script,
+        );
+        assert!(
+            stdout.contains("RESULT:add:0"),
+            "add succeeds.\n{stdout}\n{stderr}"
+        );
+        for ok in [
+            "path:OK",
+            "complete:OK",
+            "clean:OK",
+            "branch:OK",
+            "pointer:denied",
+            "cplt:denied",
+            "hooks:denied",
+            "new-settings:denied",
+            "socket:denied",
+            "socket-dir:denied",
+            "nothing-escaped:OK",
+        ] {
+            assert!(
+                stdout.contains(&format!("RESULT:{ok}")),
+                "{ok}\n{stdout}\n{stderr}"
+            );
+        }
+        assert!(
+            !stdout.contains("RESULT:dup:0"),
+            "a taken name is refused.\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("RESULT:traversal:0"),
+            "a traversal name is refused.\n{stdout}"
+        );
+        assert!(root.join("wt1/f.txt").is_file(), "published under the root");
+    }
+
+    #[test]
+    fn worktree_broker_refuses_agent_authored_protected_tree_entries() {
+        require_sandbox!();
+        let project = TempProject::new("wt-protected-tree");
+        project.write_file("ordinary.txt", "ordinary\n");
+        project.write_file(".cplt.toml", "[propose]\n");
+        project.write_file(".github/hooks/pre.sh", "echo original\n");
+        project.git_init();
+        let home = short_home("wt-protected-home");
+        let bin = crate::common::binary_path().display().to_string();
+        let git = cplt::git::trusted_git().unwrap().display().to_string();
+        let script = format!(
+            r#"
+blob=$(printf '%s\n' '{{"hooks":{{}}}}' | "{git}" hash-object -w --stdin) || exit 1
+export GIT_INDEX_FILE="$TMPDIR/authored-index"
+"{git}" read-tree HEAD || exit 1
+"{git}" update-index --add --cacheinfo 100644 "$blob" .claude/settings.json || exit 1
+tree=$("{git}" write-tree) || exit 1
+commit=$("{git}" -c user.name=test -c user.email=test@example.com commit-tree "$tree" -p HEAD -m authored) || exit 1
+unset GIT_INDEX_FILE
+"{bin}" worktree add hostile "$commit" 2> "$TMPDIR/refusal"; echo RESULT:hostile:$?
+cat "$TMPDIR/refusal"
+test ! -e "$CPLT_WORKTREE_ROOT/hostile" && echo RESULT:absent:OK
+"{bin}" worktree add original HEAD && echo RESULT:original:OK
+"#
+        );
+        let (stdout, stderr, _) = run_exec_with_home(
+            &project,
+            home.path(),
+            "[sandbox]\nallow_git_worktrees = true\n",
+            &script,
+        );
+        assert!(stdout.contains("RESULT:hostile:1"), "{stdout}\n{stderr}");
+        assert!(
+            stdout.contains("protected config differs from launch HEAD"),
+            "{stdout}\n{stderr}"
+        );
+        for result in ["absent:OK", "original:OK"] {
+            assert!(
+                stdout.contains(&format!("RESULT:{result}")),
+                "{stdout}\n{stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn worktree_broker_cannot_publish_objects_from_a_denied_repository() {
+        require_sandbox!();
+        let project = TempProject::new("wt-denied-source");
+        project.write_file("allowed.txt", "allowed\n");
+        project.git_init();
+        let secret = TempProject::new("wt-secret-source");
+        secret.write_file("secret.txt", "BROKER_DENIED_CONTENT_531\n");
+        secret.git_init();
+        let sha = crate::common::git_cmd(secret.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(sha.status.success());
+        let sha = String::from_utf8(sha.stdout).unwrap().trim().to_string();
+        let tree = crate::common::git_cmd(secret.path())
+            .args(["rev-parse", "HEAD^{tree}"])
+            .output()
+            .unwrap();
+        assert!(tree.status.success());
+        let tree = String::from_utf8(tree.stdout).unwrap().trim().to_string();
+        // Commit and tree are locally readable. Only checkout needs the denied
+        // blob, so this also proves enforcement in read-tree, not just rev-parse.
+        for id in [&sha, &tree] {
+            let relative = format!("objects/{}/{}", &id[..2], &id[2..]);
+            let destination = project.path().join(".git").join(&relative);
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            fs::copy(secret.path().join(".git").join(relative), destination).unwrap();
+        }
+        let head = crate::common::git_cmd(secret.path())
+            .args(["symbolic-ref", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(head.status.success());
+        let head = String::from_utf8(head.stdout).unwrap().trim().to_string();
+        let home = short_home("wt-denied-home");
+        let bin = crate::common::binary_path().display().to_string();
+        let secret_path = secret.canonical_path();
+        let script = format!(
+            r#"
+mkdir -p .git/objects/info alternate-objects/info
+printf '%s\n' "$PWD/alternate-objects" > .git/objects/info/alternates
+printf '%s\n' '{secret}/.git/objects' > alternate-objects/info/alternates
+ln -s '{secret}/.git/{head}' .git/refs/heads/stolen
+"{bin}" worktree add by-ref stolen; echo RESULT:ref:$?
+"{bin}" worktree add by-sha {sha}; echo RESULT:sha:$?
+for wt in by-ref by-sha; do
+    test ! -e "$CPLT_WORKTREE_ROOT/$wt" && echo "RESULT:$wt:absent"
+    test ! -f "$CPLT_WORKTREE_ROOT/$wt/secret.txt" || cat "$CPLT_WORKTREE_ROOT/$wt/secret.txt"
+done
+"{bin}" worktree add allowed HEAD; echo RESULT:allowed:$?
+"#,
+            secret = secret_path.display()
+        );
+        let config = format!(
+            "[sandbox]\nallow_git_worktrees = true\n[allow]\nread = [\"{}\"]\n[deny]\npaths = [\"{}\"]\n",
+            secret_path.display(),
+            secret_path.display()
+        );
+        let (stdout, stderr, _) = run_exec_with_home(&project, home.path(), &config, &script);
+        assert!(
+            !stdout.contains("RESULT:ref:0"),
+            "denied ref was published\n{stdout}\n{stderr}"
+        );
+        assert!(
+            !stdout.contains("RESULT:sha:0"),
+            "denied alternate objects were published\n{stdout}\n{stderr}"
+        );
+        assert!(!stdout.contains("BROKER_DENIED_CONTENT_531"), "{stdout}");
+        for result in ["by-ref:absent", "by-sha:absent", "allowed:0"] {
+            assert!(
+                stdout.contains(&format!("RESULT:{result}")),
+                "{stdout}\n{stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn worktree_broker_config_query_cannot_read_a_denied_include() {
+        require_sandbox!();
+        let project = TempProject::new("wt-denied-config");
+        project.write_file("allowed.txt", "allowed\n");
+        project.git_init();
+        let secret = TempProject::new("wt-secret-config");
+        secret.write_file(
+            "gitconfig",
+            "[filter \"BROKER_DENIED_CONFIG_531\"]\nsmudge = cat\n",
+        );
+        let home = short_home("wt-denied-config-home");
+        let secret_path = secret.canonical_path();
+        let bin = crate::common::binary_path().display().to_string();
+        // Setup is outside the sandbox because the session denies config writes.
+        assert!(crate::common::git_ok(
+            project.path(),
+            &[
+                "config",
+                "include.path",
+                secret_path.join("gitconfig").to_str().unwrap()
+            ]
+        ));
+        let config = format!(
+            "[sandbox]\nallow_git_worktrees = true\n[allow]\nread = [\"{}\"]\n[deny]\npaths = [\"{}\"]\n",
+            secret_path.display(),
+            secret_path.display()
+        );
+        let (stdout, stderr, _) = run_exec_with_home(
+            &project,
+            home.path(),
+            &config,
+            &format!(
+                "\"{bin}\" worktree add allowed HEAD 2>\"$TMPDIR/broker-error\"; echo RESULT:add:$?\ncat \"$TMPDIR/broker-error\"\n"
+            ),
+        );
+        assert!(
+            !stdout.contains("BROKER_DENIED_CONFIG_531"),
+            "config leaked through broker diagnostics\n{stdout}\n{stderr}"
+        );
+        // Git versions may skip unreadable includes or fail the config query.
+        // Both are safe; neither may report a key read outside the policy.
+        assert!(stdout.contains("RESULT:add:"), "{stdout}\n{stderr}");
+    }
+
     #[test]
     fn a_key_off_session_is_checked_at_its_end() {
         require_sandbox!();
         let project = TempProject::new("wt-offend");
         project.write_file("f.txt", "x\n");
         project.git_init();
-        let home = TempProject::new("wt-offend-home");
+        let home = short_home("wt-offend-home");
         let (root, _) = managed_paths(&project, home.path());
         let (stdout, stderr, _) = run_exec_with_home(
             &project,

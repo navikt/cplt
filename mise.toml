@@ -87,13 +87,17 @@ run = "sh hack/quiet-test.sh --test e2e"
 description = "Run E2E project scaffold tests — macOS only, sandbox-safe"
 run = "sh hack/quiet-test.sh --test e2e_projects"
 
+[tasks."test:worktree-broker"]
+description = "Run managed-worktree broker tests (cplt worktree add) — macOS only, sandbox-safe"
+run = "sh hack/quiet-test.sh --test worktree_broker"
+
 [tasks."test:e2e-live"]
 description = "Run live smoke tests — macOS only, requires Copilot auth + network, NOT sandbox-safe"
 run = "sh hack/quiet-test.sh --test e2e -- --ignored"
 
 [tasks."test:all"]
 description = "Run all test suites except live smoke tests — macOS only, sandbox-safe"
-depends = ["test:unit", "test:lib", "test:integration", "test:e2e", "test:e2e-projects", "test:network-audit"]
+depends = ["test:unit", "test:lib", "test:integration", "test:e2e", "test:e2e-projects", "test:network-audit", "test:worktree-broker"]
 
 [tasks."test:everything"]
 description = "Run ALL tests including live smoke tests — macOS only, NOT sandbox-safe"

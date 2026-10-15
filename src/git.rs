@@ -512,6 +512,7 @@ const VALUE_TAKING_GLOBALS: &[&str] = &[
 /// [`repo_defines_content_filter`]. The list is an allowlist on purpose: adding
 /// a new subcommand fails closed rather than silently inheriting an exemption.
 const CONTENT_FREE_SUBCOMMANDS: &[&str] = &[
+    "ls-tree",
     "rev-parse",
     "cat-file",
     "config",
@@ -589,6 +590,38 @@ fn harden(cmd: &mut Command) {
     for (key, value, _) in CONFIG_OVERRIDES {
         cmd.arg("-c").arg(format!("{key}={value}"));
     }
+}
+
+/// Broker checkout reads only private administration. Do not route this through
+/// command(): its content-filter probe would discover an ambient repository.
+/// No common config, global config, hooks or transport may enter this command.
+#[allow(clippy::disallowed_methods)] // trusted_git resolves outside agent-writable paths
+pub(crate) fn private_checkout_command(
+    private: &Path,
+    worktree: &Path,
+    sha: &str,
+) -> Option<Command> {
+    let mut cmd = private_data_command(private, worktree)?;
+    cmd.args(["read-tree", "--reset", "-u", sha]);
+    Some(cmd)
+}
+
+/// Private checkout and raw blob verification share the same config isolation.
+#[allow(clippy::disallowed_methods)] // trusted_git resolves outside agent-writable paths
+pub(crate) fn private_data_command(private: &Path, worktree: &Path) -> Option<Command> {
+    let mut cmd = Command::new(trusted_git()?);
+    harden(&mut cmd);
+    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_ALLOW_PROTOCOL", "")
+        .arg("-c")
+        .arg("protocol.allow=never")
+        .arg("--git-dir")
+        .arg(private)
+        .arg("--work-tree")
+        .arg(worktree);
+    Some(cmd)
 }
 
 /// The tokens **before** the subcommand — the only position a git global flag

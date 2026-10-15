@@ -875,6 +875,19 @@ NOTE:
   Probes reflect cplt's resolved policy. A passing network probe means only
   that cplt is not blocking the target. It does not mean the host is up, or
   that an arbitrary agent action behaves the same way.")]
+    /// Create a worktree through the managed-worktree broker (#531).
+    ///
+    /// Inside a cplt session with `sandbox.allow_git_worktrees` on,
+    /// `cplt worktree add <name> <ref>` creates a detached worktree under
+    /// `$CPLT_WORKTREE_ROOT` and prints its path. The parent makes the checkout
+    /// under the session read policy, with filters refused and hooks disabled, and publishes it
+    /// only once the tree is validated. A branch is a separate step:
+    /// `git -C <path> switch -c <branch>`.
+    Worktree {
+        #[command(subcommand)]
+        action: WorktreeAction,
+    },
+
     Check {
         #[command(subcommand)]
         target: Option<CheckTarget>,
@@ -1194,6 +1207,17 @@ EXAMPLES:
     Explain {
         /// Config key to explain (omit to list all)
         key: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorktreeAction {
+    /// Create a detached worktree `<name>` at commit `<ref>`.
+    Add {
+        /// Directory name under `$CPLT_WORKTREE_ROOT`: letters, digits, `.`, `_`, `-`.
+        name: String,
+        /// Branch, tag or commit to check out.
+        reference: String,
     },
 }
 
@@ -4253,6 +4277,18 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // The outer matches! guard ensures we only call take() when the variant
     // is definitely Exec — without it, take() would consume any subcommand
     // and leave cli.command = None, silently breaking all other subcommands.
+    // `cplt worktree` runs inside the sandbox, where `__CPLT_WRAPPED` is set, so
+    // it is dispatched before any launch logic and its recursion guard.
+    #[allow(clippy::collapsible_if)]
+    if matches!(&cli.command, Some(Command::Worktree { .. })) {
+        if let Some(Command::Worktree {
+            action: WorktreeAction::Add { name, reference },
+        }) = cli.command.take()
+        {
+            return Ok(cplt::worktree_broker::run_client(&name, &reference));
+        }
+    }
+
     #[allow(clippy::collapsible_if)]
     if matches!(&cli.command, Some(Command::Exec { .. })) {
         if let Some(Command::Exec { shell_cmd, cmd }) = cli.command.take() {
@@ -4403,6 +4439,9 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             Command::Exec { .. } => unreachable!("Command::Exec handled before this match"),
             // Check is handled before this match (see above) — unreachable
             Command::Check { .. } => unreachable!("Command::Check handled before this match"),
+            Command::Worktree { .. } => {
+                unreachable!("Command::Worktree handled before this match")
+            }
         });
     }
 
@@ -4487,6 +4526,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         pnpm_shadow_guard: _pnpm_shadow_guard,
         #[cfg(target_os = "macos")]
             playwright_socket_guard: _playwright_socket_guard,
+        worktree_broker,
         ..
     } = assemble_sandbox(
         &cli,
@@ -4673,6 +4713,14 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         &mut prepared,
         probe.root_agents_md.as_deref(),
     );
+    #[cfg(target_os = "macos")]
+    if let Some(broker) = &worktree_broker {
+        broker
+            .set_sandbox(&prepared)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = &worktree_broker;
 
     // Compute hardening categories for environment sanitization
     let disabled_categories = resolved.disabled_hardening_categories();
@@ -5801,6 +5849,29 @@ struct AssembledSandbox {
     pnpm_shadow_guard: Option<scratch::PnpmShadowDir>,
     #[cfg(target_os = "macos")]
     playwright_socket_guard: Option<scratch::PlaywrightSocketDir>,
+    /// Serves `cplt worktree add` for as long as the agent runs. Dropping it
+    /// stops the worker and removes the socket.
+    worktree_broker: Option<cplt::worktree_broker::Broker>,
+}
+
+/// Start the managed-worktree broker for a launch (#531), or `None` when the
+/// root is off. Refuses the launch if the broker cannot start: the sandbox
+/// would otherwise grant a worktree root that nothing can populate safely.
+fn start_worktree_broker(
+    probe: &HostProbe,
+    root: &Path,
+) -> anyhow::Result<cplt::worktree_broker::Broker> {
+    let common = cplt::worktrees::repository_common_dir(&probe.project_dir)
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "sandbox.allow_git_worktrees is on, but the project is not a git repository"
+            )
+        })?;
+    let ctx = cplt::worktree_broker::Context::new(&probe.project_dir, &common, root)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    cplt::worktree_broker::Broker::start(ctx)
+        .map_err(|e| anyhow::anyhow!("cannot start the worktree broker: {e}"))
 }
 
 /// Create the automatic macOS Playwright socket capability only for exact
@@ -6038,7 +6109,13 @@ fn assemble_sandbox(
     extra_exec.extend(pnpm_shadow_path.map(Path::to_path_buf));
     extra_exec.sort();
     extra_exec.dedup();
-    let sandbox_config = build_sandbox_config(
+    // Started before the profile is built, since the profile grants its socket.
+    // Not for a dry check, which must not bind a socket or create the root (#553).
+    let worktree_broker = match (opts.repos.worktree_root, opts.inspect_only) {
+        (Some(root), false) => Some(start_worktree_broker(probe, root)?),
+        _ => None,
+    };
+    let mut sandbox_config = build_sandbox_config(
         resolved,
         probe,
         active_agent,
@@ -6069,12 +6146,20 @@ fn assemble_sandbox(
         .use_allowed_file;
         warn_agent_writable_list_files(resolved, use_allowed_file, &policy, home_dir);
     }
+    sandbox_config.worktree_socket = worktree_broker
+        .as_ref()
+        .map(cplt::worktree_broker::Broker::socket);
     // Path validation (SBPL injection checks on macOS) is handled internally by
     // prepare(), so callers don't need to know about backend-specific risks.
     let mut prepared =
         sandbox::prepare_with_pnpm_shadow(&sandbox_config, pnpm_shadow_path, opts.inspect_only)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     prepared.set_worktree_root(opts.repos.worktree_root);
+    prepared.set_worktree_socket(
+        worktree_broker
+            .as_ref()
+            .map(cplt::worktree_broker::Broker::socket),
+    );
 
     Ok(AssembledSandbox {
         prepared,
@@ -6084,6 +6169,7 @@ fn assemble_sandbox(
         pnpm_shadow_guard,
         #[cfg(target_os = "macos")]
         playwright_socket_guard,
+        worktree_broker,
     })
 }
 
@@ -6164,6 +6250,7 @@ fn build_sandbox_config<'a>(
         named_roots: repos.dirs,
         named_root_git_dirs: repos.git_dirs,
         managed_worktree_root: repos.worktree_root,
+        worktree_socket: None,
         existing_home_tool_dirs: Some(&probe.existing_home_tool_dirs),
         existing_app_dirs: Some(&probe.existing_app_dirs),
         extra_ports: &resolved.allow_ports,
@@ -6371,6 +6458,7 @@ fn run_exec_command(
         pnpm_shadow_guard,
         #[cfg(target_os = "macos")]
             playwright_socket_guard: _playwright_socket_guard,
+        worktree_broker,
         ..
     } = {
         let mut probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
@@ -6454,6 +6542,14 @@ fn run_exec_command(
 
     // Preflight: verify the sandbox mechanism works on this system.
     // Respects --no-validate (same as the main agent flow).
+    #[cfg(target_os = "macos")]
+    if let Some(broker) = &worktree_broker {
+        broker
+            .set_sandbox(&prepared)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = &worktree_broker;
     if !resolved.no_validate {
         match sandbox::preflight(&prepared) {
             Ok(()) => {}
@@ -6890,6 +6986,7 @@ fn run_check_command(
         pnpm_shadow_guard: _pnpm_shadow_guard,
         #[cfg(target_os = "macos")]
             playwright_socket_guard: _playwright_socket_guard,
+        worktree_broker: _worktree_broker,
     } = prepare_shell_sandbox(
         cli,
         &mut resolved,
