@@ -1135,6 +1135,60 @@ EOF
         );
     }
 
+    /// #694: `~/Library/Java/JavaVirtualMachines` in the unified `HOME_TOOL_DIRS`
+    /// table must be discovered by `discover_tools` and granted read + execute
+    /// (without write) under Landlock when present in a fake home outside `/tmp`.
+    #[test]
+    fn landlock_user_java_virtual_machines_allows_read_and_exec_but_denies_write() {
+        require_landlock!();
+        let project = create_test_project();
+        let home = home_outside_tmp("jvms-home");
+        let jdk_home = home
+            .path()
+            .join("Library/Java/JavaVirtualMachines/temurin-21.jdk/Contents/Home");
+        fs::create_dir_all(jdk_home.join("bin")).unwrap();
+        fs::write(jdk_home.join("release"), "JAVA_VERSION=\"21\"\n").unwrap();
+        let java_bin = jdk_home.join("bin/java");
+        fs::write(
+            &java_bin,
+            "#!/bin/sh\ncat \"$(dirname \"$0\")/../release\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(
+            &java_bin,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+
+        let discovery = cplt::discover::discover_tools(home.path(), &[]);
+        assert!(
+            discovery
+                .existing_home_tool_dirs
+                .contains(&"Library/Java/JavaVirtualMachines".to_string()),
+            "discover_tools must record Library/Java/JavaVirtualMachines"
+        );
+
+        let jvms = home.path().join("Library/Java/JavaVirtualMachines");
+        let cmd = format!(
+            "'{java}' && echo EXEC_READ_OK; \
+             echo pwn > '{jvms}/pwn' 2>/dev/null && echo WRITE_RAN; \
+             echo pwn > '{java}' 2>/dev/null && echo OVERWRITE_RAN; \
+             true",
+            java = java_bin.display(),
+            jvms = jvms.display(),
+        );
+        let (code, stdout, stderr) = run_sandboxed_home(project.path(), home.path(), &cmd);
+        assert_eq!(code, 0, "stderr: {stderr}");
+        assert!(
+            stdout.contains("JAVA_VERSION=\"21\"") && stdout.contains("EXEC_READ_OK"),
+            "JDK binary must execute and read release file under Landlock — stdout: {stdout}, stderr: {stderr}"
+        );
+        assert!(
+            !stdout.contains("WRITE_RAN") && !stdout.contains("OVERWRITE_RAN"),
+            "Library/Java/JavaVirtualMachines must remain read-only under Landlock — stdout: {stdout}"
+        );
+    }
+
     /// The overlap refusal is a startup error, not a warning, and it names both
     /// grants. Same refusal on macOS — the point is that the two backends agree.
     #[test]

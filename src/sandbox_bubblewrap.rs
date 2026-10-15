@@ -1344,16 +1344,18 @@ fn run_inner() {
         return;
     }
 
-    // Signal the parent that the sandbox is in force, then close the pipe so it
-    // does not leak into the agent.
-    if let Some(fd) = std::env::var_os(ENV_CONFIRM_FD)
+    // Signal the parent that the sandbox is in force and wait for its ack byte
+    // before handing off to the agent (#588). If the parent timed out on the
+    // confirm handshake and closed its end of the socketpair, the ack read sees
+    // EOF/ECONNRESET and we exit without calling `execve` — preventing double
+    // execution on auto-mode fallback.
+    let Some(confirm_fd) = std::env::var_os(ENV_CONFIRM_FD)
         .and_then(|v| v.to_str().and_then(|s| s.parse::<i32>().ok()))
-    {
-        let byte = [1u8];
-        unsafe {
-            libc::write(fd, byte.as_ptr().cast(), 1);
-            libc::close(fd);
-        }
+    else {
+        return;
+    };
+    if !super::exec::confirm_and_wait_for_ack(confirm_fd) {
+        return;
     }
 
     // Scrub our private env before handing off to the agent.

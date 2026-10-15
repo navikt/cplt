@@ -1779,17 +1779,17 @@ fn exec_bwrap(
     }
     let (policy_read_fd, policy_write_fd) = (policy_fds[0], policy_fds[1]);
 
-    // Confirm pipe: read end stays in the parent, write end is inherited
-    // through bwrap into the helper.
-    let mut fds = [0i32; 2];
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+    // Bidirectional confirm channel: `read_fd` stays in the parent, `write_fd`
+    // is inherited through bwrap into the helper. The helper writes `1` once
+    // Landlock + seccomp are applied and waits for a `1` ack byte from the
+    // parent before calling `execve` (#588).
+    let Ok((read_fd, write_fd)) = confirm_socketpair() else {
         unsafe {
             libc::close(policy_read_fd);
             libc::close(policy_write_fd);
         }
         return bwrap_setup_failed(wrapper, "cannot create confirm pipe");
-    }
-    let (read_fd, write_fd) = (fds[0], fds[1]);
+    };
 
     let mut bwrap_argv = wrapper.bwrap_args.clone();
     bwrap_argv.push("--".to_string());
@@ -1856,7 +1856,7 @@ fn exec_bwrap(
     };
 
     // Close the parent's copies: the helper has its own inherited descriptors,
-    // and dropping the confirm write end makes EOF observable if the helper
+    // and dropping the confirm peer end makes EOF observable if the helper
     // never writes the confirm byte.
     unsafe {
         libc::close(policy_read_fd);
@@ -1904,17 +1904,19 @@ fn exec_bwrap(
             return BwrapOutcome::Ran(1);
         }
         ConfirmResult::Eof => {
-            // Helper never applied the sandbox and never execed the agent — reap
-            // the child and fall back (agent has not run, so no double execution).
+            // Helper never completed the confirm handshake and never execed the
+            // agent — reap the child and fall back (agent has not run, so no
+            // double execution).
             let _ = forward_and_wait(child);
             restore_terminal_stop_signals();
             return bwrap_setup_failed(wrapper, "namespace helper did not apply the sandbox");
         }
         ConfirmResult::Unknown => {
-            // Helper hung or confirm pipe failed before the confirm byte was
-            // written — kill and reap the bwrap child before falling back so the
-            // agent cannot run twice and cplt does not wait forever on a stuck
-            // child (#588).
+            // Helper hung or confirm channel timed out before the handshake
+            // completed. Because `read_fd` is closed above without writing the
+            // ack byte, a helper that wrote its confirm byte right after `poll`
+            // timed out will see EOF/ECONNRESET on its ack read and exit without
+            // calling `execve`. Kill and reap `bwrap` before falling back (#588).
             stop_bwrap_child(&mut child);
             restore_terminal_stop_signals();
             return bwrap_setup_failed(
@@ -1947,12 +1949,94 @@ fn bwrap_setup_failed(
     }
 }
 
-/// Result of waiting for the confirm byte from the bwrap re-entry helper.
-#[cfg(target_os = "linux")]
+/// Create a bidirectional confirm channel (`AF_UNIX` stream socketpair with
+/// `FD_CLOEXEC` on both ends) for the parent <-> bwrap helper handshake (#588).
+#[cfg(any(target_os = "linux", test))]
+fn confirm_socketpair() -> Result<(i32, i32), i32> {
+    let mut fds = [0i32; 2];
+    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO));
+    }
+    for fd in fds {
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+            let err = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO);
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
+            return Err(err);
+        }
+        #[cfg(target_os = "macos")]
+        unsafe {
+            let one: libc::c_int = 1;
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_NOSIGPIPE,
+                (&raw const one).cast(),
+                #[allow(clippy::cast_possible_truncation)]
+                (std::mem::size_of::<libc::c_int>() as libc::socklen_t),
+            );
+        }
+    }
+    Ok((fds[0], fds[1]))
+}
+
+/// Signal the parent that the sandbox is in force and wait for its ack byte
+/// before closing `fd` and returning `true` to allow `execve` (#588).
+///
+/// A one-way confirm byte is racy at the timeout boundary: if `poll` in the
+/// parent returns `0` and the parent is descheduled before closing the channel
+/// and killing `bwrap`, the helper could write its confirm byte and `execve`
+/// the agent before `SIGKILL` lands — causing auto-mode fallback to run the
+/// agent a second time. Waiting for the parent's ack byte makes the parent's
+/// decision authoritative: on timeout the parent closes its end without sending
+/// an ack, so the helper's read returns EOF (or `ECONNRESET`) and the helper
+/// exits without ever executing the agent.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn confirm_and_wait_for_ack(fd: i32) -> bool {
+    let byte = [1u8];
+    let wrote = loop {
+        #[cfg(target_os = "linux")]
+        let n = unsafe { libc::send(fd, byte.as_ptr().cast(), 1, libc::MSG_NOSIGNAL) };
+        #[cfg(not(target_os = "linux"))]
+        let n = unsafe { libc::write(fd, byte.as_ptr().cast(), 1) };
+        if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        break n == 1;
+    };
+    let acked = if wrote {
+        let mut ack = [0u8; 1];
+        loop {
+            let n = unsafe { libc::read(fd, ack.as_mut_ptr().cast(), 1) };
+            if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            break n == 1 && ack[0] == 1;
+        }
+    } else {
+        false
+    };
+    unsafe {
+        libc::close(fd);
+    }
+    acked
+}
+
+/// Result of waiting for the confirm handshake from the bwrap re-entry helper.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfirmResult {
-    /// The helper applied the sandbox and is about to run the agent.
+    /// The helper applied the sandbox, received the parent's ack, and will run
+    /// the agent.
     Confirmed,
-    /// All write ends closed with no byte — the helper did not apply the sandbox.
+    /// All peer ends closed before handshake completion — the helper did not
+    /// start the agent.
     Eof,
     /// A zero byte: the helper refused a `nofollow` grant and did not start.
     Refused,
@@ -1960,21 +2044,28 @@ enum ConfirmResult {
     Unknown,
 }
 
-/// Wait (bounded) for the helper's confirm byte.
-///
-/// The helper writes the byte within milliseconds of startup, right before
-/// `execve`. If `poll` times out or reading fails, the caller kills the bwrap
-/// child before treating it as a setup failure (#588), so the agent cannot run
-/// twice and cplt does not block forever waiting on a hung helper.
 #[cfg(target_os = "linux")]
 fn read_confirm_byte(fd: i32) -> ConfirmResult {
+    read_confirm_byte_with_timeout(fd, 15_000)
+}
+
+/// Wait (bounded) for the helper's confirm byte and send back the ack byte that
+/// authorizes the helper to `execve` the agent (#588).
+///
+/// If `poll` times out or reading fails, no ack byte is sent and the caller
+/// closes `fd` + kills the `bwrap` child before treating it as a setup failure.
+/// Even if the helper wrote its confirm byte right after `poll` returned `0`,
+/// it remains blocked waiting for the ack byte until `close(fd)` unblocks it
+/// with EOF/`ECONNRESET`, preventing the agent from starting before `SIGKILL`.
+#[cfg(any(target_os = "linux", test))]
+fn read_confirm_byte_with_timeout(fd: i32, timeout_ms: i32) -> ConfirmResult {
     let mut pfd = libc::pollfd {
         fd,
         events: libc::POLLIN,
         revents: 0,
     };
     loop {
-        let r = unsafe { libc::poll(&raw mut pfd, 1, 15_000) };
+        let r = unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) };
         if r < 0 {
             if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                 continue;
@@ -1982,7 +2073,7 @@ fn read_confirm_byte(fd: i32) -> ConfirmResult {
             return ConfirmResult::Unknown;
         }
         if r == 0 {
-            return ConfirmResult::Unknown; // timeout
+            return ConfirmResult::Unknown; // timeout — do not ack
         }
         let mut buf = [0u8; 1];
         let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), 1) };
@@ -1998,7 +2089,21 @@ fn read_confirm_byte(fd: i32) -> ConfirmResult {
         if buf[0] == 0 {
             return ConfirmResult::Refused;
         }
-        return ConfirmResult::Confirmed;
+        let ack = [1u8];
+        loop {
+            #[cfg(target_os = "linux")]
+            let w = unsafe { libc::send(fd, ack.as_ptr().cast(), 1, libc::MSG_NOSIGNAL) };
+            #[cfg(not(target_os = "linux"))]
+            let w = unsafe { libc::write(fd, ack.as_ptr().cast(), 1) };
+            if w < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return if w == 1 {
+                ConfirmResult::Confirmed
+            } else {
+                ConfirmResult::Eof
+            };
+        }
     }
 }
 
@@ -2041,6 +2146,59 @@ mod child_pid_tests {
             claude,
             "Bubblewrap could not start (failed to spawn bwrap: No such file or directory); \
              using Landlock + seccomp only (Claude hook script grants are not applied)."
+        );
+    }
+
+    /// #588 review: verify the 2-way confirm handshake both on the happy path
+    /// and when the helper writes its confirm byte in the race window after
+    /// `poll` returns `0` (timeout) and before the parent closes `read_fd`.
+    #[test]
+    fn confirm_handshake_succeeds_and_blocks_helper_at_timeout_boundary() {
+        // 1. Happy path: parent receives confirm byte and sends ack; helper
+        //    receives ack and is authorized to exec the agent.
+        let (parent_fd, child_fd) = confirm_socketpair().unwrap();
+        let helper = std::thread::spawn(move || confirm_and_wait_for_ack(child_fd));
+        assert_eq!(
+            read_confirm_byte_with_timeout(parent_fd, 5_000),
+            ConfirmResult::Confirmed
+        );
+        unsafe {
+            libc::close(parent_fd);
+        }
+        assert!(
+            helper.join().unwrap(),
+            "helper must receive ack and proceed when parent confirms"
+        );
+
+        // 2. Timeout boundary race: parent `poll` times out (`Unknown`), and
+        //    before the parent closes `parent_fd`, the helper writes its
+        //    confirm byte `[1u8]` and waits for the ack byte. When the parent
+        //    then closes `parent_fd` without sending an ack, the helper must
+        //    return `false` so the agent is never executed before fallback.
+        let (parent_fd, child_fd) = confirm_socketpair().unwrap();
+        assert_eq!(
+            read_confirm_byte_with_timeout(parent_fd, 10),
+            ConfirmResult::Unknown
+        );
+        let helper = std::thread::spawn(move || confirm_and_wait_for_ack(child_fd));
+        // Wait until the helper's confirm byte arrives on `parent_fd`, proving
+        // the write landed in the post-timeout window before `close(parent_fd)`.
+        let mut pfd = libc::pollfd {
+            fd: parent_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let polled = unsafe { libc::poll(&raw mut pfd, 1, 5_000) };
+        assert!(
+            polled > 0,
+            "helper confirm byte must arrive in socket buffer"
+        );
+        unsafe {
+            libc::close(parent_fd);
+        }
+        assert!(
+            !helper.join().unwrap(),
+            "helper must NOT proceed to execve when confirm arrives after parent timeout"
         );
     }
 }

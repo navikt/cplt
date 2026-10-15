@@ -2886,8 +2886,9 @@ fn write_exec_deny_comes_after_every_broad_exec_allow() {
         "/Users/test/.bun/install",
         "/Users/test/Library/pnpm/package-manager-store",
         "/Users/test/.local/share/pnpm/package-manager-store",
-        // Executable and write-denied: `emit_copilot_pkg_denies` follows.
+        // Executable and write-denied: `emit_copilot_pkg_denies` / `emit_toolchain_write_deny`.
         "/Users/test/Library/Caches/copilot/pkg",
+        "/Users/test/Library/Java/JavaVirtualMachines",
     ];
     const PREFIX: &str = "(allow process-exec (subpath \"";
     for (i, _) in p.match_indices(PREFIX) {
@@ -3966,6 +3967,44 @@ fn profile_grants_user_java_virtual_machines_read_and_exec() {
         !p.contains(&format!("(allow file-write* (subpath \"{jvms}\"))")),
         "{jvms} must remain read-only"
     );
+    assert!(
+        p.contains(&format!("(deny file-write* (subpath \"{jvms}\"))")),
+        "{jvms} must have an explicit write deny after user allows:\n{p}"
+    );
+
+    let fake_home = tempfile::tempdir().unwrap();
+    let jvms_dir = fake_home
+        .path()
+        .join("Library/Java/JavaVirtualMachines/temurin-21.jdk/Contents/Home");
+    std::fs::create_dir_all(&jvms_dir).unwrap();
+    let discovery = cplt::discover::discover_tools(fake_home.path(), &[]);
+    assert!(
+        discovery
+            .existing_home_tool_dirs
+            .iter()
+            .any(|d| d.dir.path == "Library/Java/JavaVirtualMachines"),
+        "discover_tools must record Library/Java/JavaVirtualMachines when present"
+    );
+
+    let mut opts = base_profile_options();
+    opts.home_dir = fake_home.path();
+    opts.existing_home_tool_dirs = Some(&discovery.existing_home_tool_dirs);
+    let policy = generate_policy(&opts);
+    let expected = fake_home.path().join("Library/Java/JavaVirtualMachines");
+    let rule = policy
+        .fs_rules
+        .iter()
+        .find(|r| r.path == expected)
+        .unwrap_or_else(|| {
+            panic!(
+                "missing Landlock rule for {}: {:?}",
+                expected.display(),
+                policy.fs_rules
+            )
+        });
+    assert!(rule.access.read, "Landlock rule must grant read");
+    assert!(rule.access.execute, "Landlock rule must grant execute");
+    assert!(!rule.access.write, "Landlock rule must not grant write");
 }
 
 // ============================================================

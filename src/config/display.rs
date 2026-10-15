@@ -143,15 +143,29 @@ fn active_preset(loaded: Option<&LoadedConfig>, local: Option<&LoadedConfig>) ->
         .unwrap_or(Preset::Standard)
 }
 
+fn legacy_guard_alias<'a>(
+    root: &'a toml::Table,
+    key_info: &ConfigKeyInfo,
+) -> Option<&'a toml::Value> {
+    let legacy_key = match (key_info.section, key_info.key) {
+        ("gh_guard", "enabled") => "gh_proxy",
+        ("git_guard", "enabled") => "git_push_prevention",
+        _ => return None,
+    };
+    root.get("sandbox").and_then(|s| s.get(legacy_key))
+}
+
 /// Get the effective value of a config key, and the layer it came from.
 ///
 /// A bool cannot say which of two files a value came from, which is why this
 /// returns the layer: local, global, or `Baseline` for "no file set it".
 /// The order is the resolver's own — local above global — read off the raw
 /// documents, because this reports what the FILES say and there is no merge to
-/// consult. When no file explicitly sets the key, `ConfigLayer::Baseline`
-/// reflects the active preset's baseline for preset-controlled keys, or
-/// `default_display` otherwise (#684).
+/// consult. Within each file layer, modern guard keys take precedence over
+/// their legacy `[sandbox]` aliases (`gh_proxy`, `git_push_prevention`). When
+/// no file explicitly sets the key, `ConfigLayer::Baseline` reflects the active
+/// preset's baseline for preset-controlled keys, or `default_display` otherwise
+/// (#684).
 pub fn get_config_value(
     key_info: &ConfigKeyInfo,
     loaded: Option<&LoadedConfig>,
@@ -163,6 +177,7 @@ pub fn get_config_value(
             && let Some(val) = root
                 .get(key_info.section)
                 .and_then(|section| section.get(key_info.key))
+                .or_else(|| legacy_guard_alias(&root, key_info))
         {
             return (format_toml_value(val), layer);
         }
@@ -1286,6 +1301,47 @@ mod tests {
         assert_eq!(
             get_config_value(proxy_forced, Some(&strict), Some(&full_trust)),
             ("false".to_string(), ConfigLayer::Baseline)
+        );
+
+        // Legacy guard aliases beat preset baseline, modern keys win within a
+        // file, and local values win over global values.
+        let git_enabled = lookup_key("git_guard.enabled").unwrap();
+        let permissive_with_legacy = loaded_from(
+            "[sandbox]\npreset = \"permissive\"\ngh_proxy = true\ngit_push_prevention = true\n",
+        );
+        assert_eq!(
+            get_config_value(gh_enabled, Some(&permissive_with_legacy), None),
+            ("true".to_string(), ConfigLayer::Global)
+        );
+        assert_eq!(
+            get_config_value(git_enabled, Some(&permissive_with_legacy), None),
+            ("true".to_string(), ConfigLayer::Global)
+        );
+
+        let modern_beats_legacy = loaded_from(
+            "[sandbox]\ngh_proxy = true\ngit_push_prevention = true\n\
+             [gh_guard]\nenabled = false\n\
+             [git_guard]\nenabled = false\n",
+        );
+        assert_eq!(
+            get_config_value(gh_enabled, Some(&modern_beats_legacy), None),
+            ("false".to_string(), ConfigLayer::Global)
+        );
+        assert_eq!(
+            get_config_value(git_enabled, Some(&modern_beats_legacy), None),
+            ("false".to_string(), ConfigLayer::Global)
+        );
+
+        let local_legacy = loaded_from("[sandbox]\ngh_proxy = true\ngit_push_prevention = true\n");
+        let global_modern_off =
+            loaded_from("[gh_guard]\nenabled = false\n[git_guard]\nenabled = false\n");
+        assert_eq!(
+            get_config_value(gh_enabled, Some(&global_modern_off), Some(&local_legacy)),
+            ("true".to_string(), ConfigLayer::Local)
+        );
+        assert_eq!(
+            get_config_value(git_enabled, Some(&global_modern_off), Some(&local_legacy)),
+            ("true".to_string(), ConfigLayer::Local)
         );
     }
 }

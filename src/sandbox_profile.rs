@@ -239,7 +239,7 @@ pub fn generate_profile_with_playwright_socket_dir(
     // write allow above. It ends with K/N's lock `file-write-data` allow,
     // which is why it sits here and not at the tail: the denies below
     // (nested `.git` creation, #576) must follow every write allow.
-    emit_toolchain_write_deny(&mut sb, &home, config.extra_deny);
+    emit_toolchain_write_deny(&mut sb, config, &home);
     // Sensitive project file denies MUST come after all user-configured allows.
     // SBPL uses last-match-wins, so a user allow like `allow.read = ["~/Repos"]`
     // would override the .env deny if emitted before it.
@@ -1973,7 +1973,7 @@ fn emit_toolchain_exec(sb: &mut String, home: &str) {
 /// `allow.write` covering `~/.gradle` (or any parent) would otherwise override
 /// a write-deny emitted alongside the exec allow and silently reopen the hole.
 /// Same rationale as `emit_dotnet_exec_denies`.
-fn emit_toolchain_write_deny(sb: &mut String, home: &str, extra_deny: &[PathBuf]) {
+fn emit_toolchain_write_deny(sb: &mut String, config: &SandboxConfig, home: &str) {
     sbpl!(
         sb,
         ";; Provisioned toolchains — exec-allowed paths stay read-only"
@@ -1981,13 +1981,28 @@ fn emit_toolchain_write_deny(sb: &mut String, home: &str, extra_deny: &[PathBuf]
     for dir in PROVISIONED_TOOLCHAINS {
         sbpl!(sb, "(deny file-write* (subpath \"{home}/{dir}\"))");
     }
+    // Keep ~/Library/Java/JavaVirtualMachines (and its validated resolved
+    // target when symlinked) read-only even if the user granted write to an
+    // enclosing tree such as ~/Library (#694).
+    let jvms_spellings = home_spellings(home, "Library/Java/JavaVirtualMachines");
+    let jvms_targets: Vec<PathBuf> = jvms_spellings.iter().map(PathBuf::from).collect();
+    for p in &jvms_spellings {
+        sbpl!(sb, "(deny file-write* (subpath \"{p}\"))");
+    }
+    for pin in super::home_config_target_pins(config, &jvms_targets) {
+        if let Some(s) = pin.to_str()
+            && validate_sbpl_path(&pin).is_ok()
+        {
+            sbpl!(sb, "(deny file-write-unlink (literal \"{s}\"))");
+        }
+    }
     // K/N opens this lock for writing on every build, toolchain present or
     // not. Data only: no create, unlink, link or chmod, so the file K/N
     // created (0644) cannot be swapped for or turned into an executable.
     // Emitted after the user's `--deny-path` rules, so it would reopen one
     // covering the lock: withheld then, like the opt-in re-allows.
     const LOCK: &str = ".konan/dependencies/cache/.lock";
-    if let Some(deny) = overlapping_home_deny(extra_deny, home, LOCK) {
+    if let Some(deny) = overlapping_home_deny(config.extra_deny, home, LOCK) {
         withhold_reallow(sb, "Kotlin/Native", &format!("~/{LOCK}"), deny);
     } else {
         sbpl!(sb, "(allow file-write-data (literal \"{home}/{LOCK}\"))");
@@ -2472,6 +2487,11 @@ fn emit_user_write_exec_denies(
             .map(|e| Path::new(home).join(e.path)),
     );
     carve_outs.extend(copilot_pkg.iter().map(PathBuf::from));
+    carve_outs.extend(
+        home_spellings(home, "Library/Java/JavaVirtualMachines")
+            .into_iter()
+            .map(PathBuf::from),
+    );
     for path in carve_outs.iter().filter(|p| granted(p)) {
         if validate_sbpl_path(path).is_err() {
             continue;
@@ -4913,10 +4933,11 @@ mod tests {
             std::path::Path::new("/projects/app"),
             std::path::Path::new("/Users/test"),
         );
-        // Worst case: user write grants over both stores.
+        // Worst case: user write grants over all stores.
         let extra_write = [
             PathBuf::from("/Users/test/.gradle"),
             PathBuf::from("/Users/test/.konan"),
+            PathBuf::from("/Users/test/Library"),
         ];
         opts.extra_write = &extra_write;
         let p = generate_profile(&opts, &[]);
@@ -4926,7 +4947,11 @@ mod tests {
             .find(&lock_rule)
             .unwrap_or_else(|| panic!("lock data-write allow missing\n{p}"));
 
-        for toolchain in PROVISIONED_TOOLCHAINS {
+        for toolchain in PROVISIONED_TOOLCHAINS
+            .iter()
+            .copied()
+            .chain(std::iter::once("Library/Java/JavaVirtualMachines"))
+        {
             let tree = PathBuf::from(format!("/Users/test/{toolchain}"));
             let deny_rule = format!(r#"(deny file-write* (subpath "{}"))"#, tree.display());
             let deny = p.find(&deny_rule).expect("toolchain write deny missing");
@@ -4952,6 +4977,10 @@ mod tests {
                 );
             }
         }
+        assert!(
+            p.contains(r#"(deny file-write-unlink (literal "/Users/test/Library/Java"))"#),
+            "~/Library/Java must be pinned against rename when ~/Library is writable:\n{p}"
+        );
         for line in p.lines().filter(|l| l.contains(lock)) {
             assert!(
                 line.starts_with("(allow file-write-data "),
