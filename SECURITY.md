@@ -731,8 +731,16 @@ does not:
      apply to symlinked refs, config includes and recursive object alternates.
      Checkout adds read/write only for this request's private staging directory,
      with execution there denied. It grants no additional common, base or
-      source-directory access. Private config prevents executable drivers;
-      Seatbelt prevents publishing data the caller cannot read.
+     source-directory access. Private config prevents executable drivers;
+     Seatbelt prevents publishing data the caller cannot read.
+     The agent profile explicitly denies staging reads and writes even when
+     HOME is under temp or a user grant overlaps the base. Literal ancestor
+     write denies pin the base against rename without blocking managed-root
+     descendants. These rules are reapplied after OpenCode v2 amendments and
+     before the broker captures the final profile. Only a broker Git child gets
+     the exact random staging exception, with execution still denied there.
+     The host opens the private index no-follow/nonblocking and requires a
+     regular file with link count one before copying it into shared admin.
    - Requested protected paths must equal the frozen launch snapshot, derived
      from `PROTECTED_IN_ROOT` with its subtree and nested flags. Matching uses
      conservative ASCII case folding; comparison preserves exact path bytes,
@@ -762,10 +770,15 @@ does not:
      This is not a promise of raw-byte fidelity for ordinary files: Git
      attributes may transform them, and private config ignores user checkout
      settings. Only protected files receive the raw-byte equality check.
-  - Refused in the tree: a symlink that is absolute or resolves outside the
+   - Refused in the tree: a symlink that is absolute, dangling, uses `..` after
+     a named component, or resolves outside the
     worktree, a `.git` other than the pointer, and a bare repository layout
      (`HEAD` with `objects` and `refs`, or with `commondir`). The tree must hold
-     at most 200,000 entries.
+      at most 200,000 entries.
+     Bare markers are case-insensitive and counted regardless of file type,
+     including executable regular files and symlinks, using the same predicate
+     as the launch/exit checks. Private metadata uses `.git-admin`, a spelling
+     excluded from public names, so names such as `git` and `GIT` cannot collide.
   - The `.git` pointer is written as `gitdir: <common>/worktrees/<id>`, and the
      admin `gitdir` back link is set to the final path before the rename.
      Admin directories use random `cplt-<hex>` names, `mkdirat` and no-follow
