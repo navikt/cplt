@@ -483,7 +483,13 @@ The broker requires a launch HEAD commit whose protected bytes and executable
 modes match the checkout. Symlinked protected paths or ancestors, filesystem
 aliases of protected names, and protected files larger than 1 MiB are refused.
 Ordinary Unicode names remain allowed. Tree queries are capped at 1 MiB and
-200,000 entries. An unavailable launch snapshot disables the broker with a
+200,000 entries. Protected names and their declared ancestors must use the exact
+spelling in `PROTECTED_IN_ROOT`, even if a case or Unicode alias is tracked.
+Untracked or ignored protected files also disable the broker. The launch scan
+walks local directories, including ignored `node_modules` and `target` trees,
+except `.git`, and is capped at 200,000 entries and the operation time budget.
+Large local trees can therefore make the broker unavailable even when HEAD is
+small. An unavailable launch snapshot disables the broker with a
 warning and leaves `CPLT_WORKTREE_SOCKET` unset; the session and managed root
 remain available. Prepare worktrees outside cplt in that case. No partial
 protected-file snapshot is accepted. A global `filter.*` configuration, including

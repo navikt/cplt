@@ -8,7 +8,7 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -781,18 +781,74 @@ fn slow_request_bytes_do_not_restart_the_read_deadline() {
     let fx = Fixture::new(&tracked_files());
     let broker = with_home(fx.home.path(), || Broker::start(fx.ctx())).unwrap();
     let mut stream = UnixStream::connect(broker.socket()).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
+    stream.set_nonblocking(true).unwrap();
     let started = Instant::now();
+    let mut reply = String::new();
     for _ in 0..11 {
-        stream.write_all(b" ").unwrap();
+        match stream.write_all(b" ") {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                assert!(
+                    started.elapsed() >= Duration::from_secs(10),
+                    "broker closed before the read deadline: {e}"
+                );
+                break;
+            }
+            Err(e) => panic!("unexpected request write failure: {e}"),
+        }
+        let mut byte = [0];
+        match stream.read(&mut byte) {
+            Ok(0) => {
+                assert!(started.elapsed() >= Duration::from_secs(10), "early EOF");
+                break;
+            }
+            Ok(_) => {
+                assert!(
+                    started.elapsed() >= Duration::from_secs(10),
+                    "early response"
+                );
+                reply.push(char::from(byte[0]));
+                break;
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(e) => panic!("unexpected request read failure: {e}"),
+        }
         std::thread::sleep(Duration::from_millis(950));
     }
-    let mut reply = String::new();
-    BufReader::new(&stream).read_line(&mut reply).unwrap();
-    assert!(reply.contains("request read deadline exceeded"), "{reply}");
-    assert!(started.elapsed() < Duration::from_secs(13));
+    while !reply.ends_with('\n') {
+        assert!(
+            started.elapsed() < Duration::from_secs(13),
+            "deadline restarted"
+        );
+        let mut byte = [0];
+        match stream.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => reply.push(char::from(byte[0])),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("unexpected reply read failure: {e}"),
+        }
+    }
+    // EOF without a reply is valid once the deadline closes the peer. Any
+    // response must still identify the deadline, not an unrelated refusal.
+    assert!(
+        reply.is_empty() || reply.contains("request read deadline exceeded"),
+        "{reply}"
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_secs(10),
+        "early deadline: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(13),
+        "deadline restarted: {elapsed:?}"
+    );
 }
 
 #[test]
