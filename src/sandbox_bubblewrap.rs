@@ -3417,18 +3417,28 @@ mod tests {
             "missing .git/remotes outside any bound tree must not be mounted: {unbound:?}"
         );
 
+        let canon_base = base.path().canonicalize().unwrap();
         let masks = DenyMasks {
-            dirs: vec![base.path().canonicalize().unwrap()],
+            dirs: vec![canon_base.clone()],
+            credential_dirs: vec![canon_base],
             ..Default::default()
         };
         let rebind_args = build_bwrap_args(&rules, overlays, &masks);
-        let rebind_pos = rebind_args
+        let first_bind = rebind_args
             .windows(3)
             .position(|w| w == ["--bind", &s(&repo), &s(&repo)])
+            .expect("expected phase-1 writable bind of repo");
+        let rebind_pos = rebind_args
+            .windows(3)
+            .rposition(|w| w == ["--bind", &s(&repo), &s(&repo)])
             .expect("expected phase-3 writable rebind of repo");
+        assert!(
+            rebind_pos > first_bind,
+            "phase-3 must emit a second --bind after the credential mask: {rebind_args:?}"
+        );
         let tmpfs_pos = rebind_args
             .windows(4)
-            .position(|w| w == ["--tmpfs", &s(&remotes), "--remount-ro", &s(&remotes)])
+            .rposition(|w| w == ["--tmpfs", &s(&remotes), "--remount-ro", &s(&remotes)])
             .expect("expected phase-3 read-only tmpfs on missing .git/remotes");
         assert!(
             tmpfs_pos > rebind_pos,

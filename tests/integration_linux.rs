@@ -3588,7 +3588,7 @@ print('CONNECTED')
         // sandboxed child cannot plant legacy remote files there, while
         // regular `.git` operations (like writing `.git/COMMIT_EDITMSG`) work.
         require_bwrap!();
-        let dir = non_tmp_tempdir();
+        let dir = create_deny_project();
         let project = dir.path().canonicalize().unwrap();
         let git_dir = project.join(".git");
         fs::create_dir_all(git_dir.join("hooks")).unwrap();
