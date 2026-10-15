@@ -65,7 +65,7 @@ run = "sh hack/quiet-test.sh --test unit_tests"
 
 [tasks."test:probe"]
 description = "Run offline probe regression checks (requires Python 3 and Node.js)"
-run = ["python3 -B hack/test-probe-copilot-no-auth.py", "python3 -B hack/test-probe-copilot-auth-contract.py", "python3 -B hack/test-probe-linux-secret-service.py"]
+run = ["python3 -B hack/test-probe-copilot-no-auth.py", "python3 -B hack/test-probe-copilot-auth-contract.py", "python3 -B hack/test-probe-linux-secret-service.py", "python3 -B hack/test-check-pr-body.py"]
 
 [tasks."test:integration"]
 description = "Run integration tests — macOS only, sandbox-safe"

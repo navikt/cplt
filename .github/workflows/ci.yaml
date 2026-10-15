@@ -24,7 +24,10 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Body/title-only edits (`pull_request` + `edited` with no base-branch change)
+  # run in a separate `-body` concurrency group so fixing a PR description never
+  # cancels an in-progress 6-minute test run (#769).
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ (github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.base) && 'body' || 'code' }}
   cancel-in-progress: true
 
 permissions:
@@ -38,92 +41,24 @@ jobs:
     name: PR body template check
     runs-on: ubuntu-latest
     timeout-minutes: 2
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # ratchet:actions/checkout@v7.0.1
+
       - name: Validate PR description against template
         env:
+          GH_TOKEN: ${{ github.token }}
           EVENT_NAME: ${{ github.event_name }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_BODY: ${{ github.event.pull_request.body }}
-        run: |
-          python3 - <<'PY'
-          import os, re, sys
-
-          if os.environ.get("EVENT_NAME") != "pull_request":
-              print("Not a pull_request event, skipping PR body check.")
-              sys.exit(0)
-
-          author = os.environ.get("PR_AUTHOR", "")
-          if author in ("dependabot[bot]", "github-actions[bot]"):
-              print(f"Automated PR author {author}, skipping PR body check.")
-              sys.exit(0)
-
-          def strip_fenced_code(text: str) -> str:
-              out = []
-              fence_char = None
-              fence_len = 0
-              for line in text.splitlines():
-                  if fence_char is None:
-                      m = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
-                      if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
-                          fence_char = m.group(1)[0]
-                          fence_len = len(m.group(1))
-                          out.append("CODE_BLOCK")
-                      else:
-                          out.append(line)
-                  elif re.match(rf"^ {{0,3}}{re.escape(fence_char)}{{{fence_len},}}\s*$", line):
-                      fence_char = None
-                      fence_len = 0
-              return "\n".join(out)
-
-          raw = os.environ.get("PR_BODY") or ""
-          body = re.sub(r"<!--(?:.*?-->|.*$)", "", raw, flags=re.DOTALL)
-          body_no_code = strip_fenced_code(body)
-
-          required = [
-              "## Summary",
-              "## Risk profile & rollout",
-              "## Platform parity",
-              "## Security considerations",
-              "## Test plan",
-          ]
-
-          positions = {}
-          errors = []
-          for heading in required:
-              matches = list(re.finditer(rf"(?m)^{re.escape(heading)}\s*$", body_no_code))
-              if not matches:
-                  errors.append(f"Missing required section heading '{heading}' in PR description")
-              elif len(matches) > 1:
-                  errors.append(f"Duplicate section heading '{heading}' in PR description")
-              else:
-                  positions[heading] = (matches[0].start(), matches[0].end())
-
-          if not errors:
-              ordered = sorted(positions.items(), key=lambda kv: kv[1][0])
-              for idx, (heading, (_, end_pos)) in enumerate(ordered):
-                  next_start = ordered[idx + 1][1][0] if idx + 1 < len(ordered) else len(body_no_code)
-                  section = body_no_code[end_pos:next_start]
-                  next_h2 = re.search(r"(?m)^##\s+", section)
-                  if next_h2:
-                      section = section[:next_h2.start()]
-                  if heading == "## Risk profile & rollout":
-                      if not re.search(r"(?m)^\s*-\s*\[[xX]\]\s+\S+", section):
-                          errors.append(
-                              "Section '## Risk profile & rollout' must have at least one checked option"
-                          )
-                  elif not section.strip():
-                      errors.append(f"Section '{heading}' must not be empty")
-
-          if errors:
-              for err in errors:
-                  print(f"::error::{err}")
-              sys.exit(1)
-
-          print("PR description satisfies all required template sections.")
-          PY
+        run: python3 -B hack/check-pr-body.py --fetch-live
 
   # Unit tests run on Linux (fast, no macOS dependency)
   unit-tests:
+    if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base != null
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -149,7 +84,7 @@ jobs:
         run: cargo fmt -- --check
 
       - name: Run offline probe checks
-        run: python3 --version && python3 -B hack/test-probe-copilot-no-auth.py && python3 -B hack/test-probe-copilot-auth-contract.py && python3 -B hack/test-probe-linux-secret-service.py
+        run: python3 --version && python3 -B hack/test-probe-copilot-no-auth.py && python3 -B hack/test-probe-copilot-auth-contract.py && python3 -B hack/test-probe-linux-secret-service.py && python3 -B hack/test-check-pr-body.py
 
       - name: Run Clippy
         run: cargo clippy --all-targets -- -D warnings
@@ -186,6 +121,7 @@ jobs:
 
   # Integration tests need macOS for sandbox-exec
   integration-tests:
+    if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base != null
     runs-on: macos-latest
     timeout-minutes: 15
     steps:
@@ -247,7 +183,7 @@ jobs:
           sandbox-exec -p '(version 1)(allow default)' /usr/bin/true
 
       - name: Run offline probe checks
-        run: python3 --version && python3 -B hack/test-probe-copilot-no-auth.py && python3 -B hack/test-probe-copilot-auth-contract.py && python3 -B hack/test-probe-linux-secret-service.py
+        run: python3 --version && python3 -B hack/test-probe-copilot-no-auth.py && python3 -B hack/test-probe-copilot-auth-contract.py && python3 -B hack/test-probe-linux-secret-service.py && python3 -B hack/test-check-pr-body.py
 
       - name: Install Java (for JVM integration tests)
         uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # ratchet:actions/setup-java@v6.0.1
@@ -356,6 +292,7 @@ jobs:
   # credentials. The integration job covers the same ground with a stub; this
   # checks the real client finds and reaches its own per-session service.
   opencode-v2-e2e:
+    if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base != null
     runs-on: macos-latest
     timeout-minutes: 15
     steps:
@@ -402,6 +339,7 @@ jobs:
 
   # The same on Linux (#719): v2 needs bubblewrap, and is refused without it.
   opencode-v2-e2e-linux:
+    if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base != null
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -455,6 +393,7 @@ jobs:
 
   # Linux integration tests — Landlock kernel enforcement (requires Linux 5.13+)
   linux-integration-tests:
+    if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base != null
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -614,7 +553,7 @@ jobs:
   # Build test binaries on PRs — downloadable from the workflow run page.
   # Lets testers try changes without installing the Rust toolchain.
   build-test-binaries:
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && (github.event.action != 'edited' || github.event.changes.base != null)
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
@@ -679,15 +618,42 @@ jobs:
     needs: [pr-body-check, unit-tests, integration-tests, opencode-v2-e2e, opencode-v2-e2e-linux, linux-integration-tests]
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      checks: read
+      pull-requests: read
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # ratchet:actions/checkout@v7.0.1
+
       - name: Require all gating jobs to have succeeded
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          BASE_CHANGED: ${{ github.event.changes.base != null }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BODY_RESULT: ${{ needs.pr-body-check.result }}
+          CODE_RESULTS: ${{ format('{0},{1},{2},{3},{4}', needs.unit-tests.result, needs.integration-tests.result, needs.opencode-v2-e2e.result, needs.opencode-v2-e2e-linux.result, needs.linux-integration-tests.result) }}
         run: |
-          results='${{ join(needs.*.result, ',') }}'
-          echo "gating job results: $results"
-          for r in $(echo "$results" | tr ',' ' '); do
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ] && [ "$EVENT_ACTION" = "edited" ] && [ "$BASE_CHANGED" = "false" ]; then
+            if [ "$BODY_RESULT" != "success" ]; then
+              echo "::error::ci-ok: PR body template check did not succeed (result: $BODY_RESULT)"
+              exit 1
+            fi
+            python3 -B hack/check-pr-body.py --fetch-live --verify-code-checks
+            exit 0
+          fi
+
+          echo "gating code job results: $CODE_RESULTS"
+          for r in $(echo "$CODE_RESULTS" | tr ',' ' '); do
             if [ "$r" != "success" ]; then
               echo "::error::ci-ok: a required job did not succeed (result: $r)"
               exit 1
             fi
           done
+          python3 -B hack/check-pr-body.py --fetch-live
           echo "ci-ok: all required jobs succeeded"
