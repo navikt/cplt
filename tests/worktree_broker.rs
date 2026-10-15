@@ -602,6 +602,59 @@ fn refuses_links_that_leave_the_tree_and_bare_repositories() {
     let err = fx.add("wt1", "HEAD").expect_err("bare repo refused");
     assert!(err.contains("bare git repository"), "{err}");
     assert!(!fx.root.join("wt1").exists());
+
+    // Case-insensitive APFS folds `ſ` (U+017F) to `s`, so Git resolves `objects`
+    // and `refs` to `objectſ` and `refſ`.
+    let fx = Fixture::new(&tracked_files());
+    write_files(
+        fx.project.path(),
+        &[
+            ("sub/HEAD", "ref: refs/heads/main\n"),
+            ("sub/object\u{017f}/keep", "x"),
+            ("sub/ref\u{017f}/keep", "x"),
+            ("sub/config", "[core]\n\tfsmonitor = false\n"),
+        ],
+    );
+    commit_all(fx.project.path());
+    if fx
+        .project
+        .path()
+        .join("sub/objects")
+        .symlink_metadata()
+        .is_ok()
+    {
+        let err = fx
+            .add("wt-apfs", "HEAD")
+            .expect_err("APFS bare repo alias refused");
+        assert!(err.contains("bare git repository"), "{err}");
+        assert!(!fx.root.join("wt-apfs").exists());
+    }
+
+    // The worktree directory is depth 1 below the managed root, so 63 nested
+    // directories (depth 64) pass both the broker and the launch/exit walker,
+    // while 64 nested directories (depth 65) are refused before publication.
+    let fx = Fixture::new(&tracked_files());
+    let depth_63 = (0..63).map(|_| "d").collect::<Vec<_>>().join("/") + "/leaf.txt";
+    write_files(fx.project.path(), &[(&depth_63, "ok\n")]);
+    commit_all(fx.project.path());
+    fx.add("wt-depth-64", "HEAD").expect("depth 64 allowed");
+    assert!(
+        cplt::worktrees::link_problems(
+            &fx.common,
+            &fx.root,
+            cplt::worktrees::DEFAULT_WALK_MAX_DIRS,
+        )
+        .is_empty()
+    );
+
+    let depth_64 = (0..64).map(|_| "d").collect::<Vec<_>>().join("/") + "/leaf.txt";
+    write_files(fx.project.path(), &[(&depth_64, "too-deep\n")]);
+    commit_all(fx.project.path());
+    let err = fx
+        .add("wt-depth-65", "HEAD")
+        .expect_err("depth 65 refused before publication");
+    assert!(err.contains("levels below the worktree root"), "{err}");
+    assert!(!fx.root.join("wt-depth-65").exists());
 }
 
 #[test]

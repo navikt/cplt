@@ -282,7 +282,7 @@ pub fn problem_dirs(problems: &[LinkProblem]) -> Vec<String> {
 
 /// How deep below the root the `.git` walk looks. A tree deeper than this is
 /// a finding, not a pass: past it a `.git` would go unseen.
-const WALK_MAX_DEPTH: usize = 64;
+pub(crate) const WALK_MAX_DEPTH: usize = 64;
 
 /// Default for `sandbox.worktree_walk_max_dirs`: how many directories the
 /// `.git` walk visits (files are not counted, so build output of many small
@@ -589,6 +589,23 @@ fn walk_problems(common: &Path, root: &Path, max_dirs: usize, out: &mut Vec<Link
             };
             counts[top].1 += 1;
             stack.push((path, depth + 1, top));
+        }
+        for (flag, marker) in [
+            (&mut head, "HEAD"),
+            (&mut objects, "objects"),
+            (&mut refs, "refs"),
+            (&mut commondir, "commondir"),
+        ] {
+            if !*flag {
+                match dir.join(marker).symlink_metadata() {
+                    Ok(_) => *flag = true,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => push(
+                        &dir,
+                        format!("cannot stat {}: {e}", dir.join(marker).display()),
+                    ),
+                }
+            }
         }
         if bare_layout(head, objects, refs, commondir) {
             push(

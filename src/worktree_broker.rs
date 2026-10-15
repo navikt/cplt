@@ -1037,9 +1037,9 @@ fn checkout(
 fn validate_tree(worktree: &Path, budget: &Budget<'_>) -> Result<(), String> {
     let root =
         std::fs::canonicalize(worktree).map_err(|e| format!("cannot resolve worktree: {e}"))?;
-    let mut stack = vec![worktree.to_path_buf()];
+    let mut stack = vec![(worktree.to_path_buf(), 1usize)];
     let mut seen = 0usize;
-    while let Some(dir) = stack.pop() {
+    while let Some((dir, depth)) = stack.pop() {
         let mut has_head = false;
         let mut has_objects = false;
         let mut has_refs = false;
@@ -1076,7 +1076,30 @@ fn validate_tree(worktree: &Path, budget: &Budget<'_>) -> Result<(), String> {
             if ft.is_symlink() {
                 check_symlink(&path, &root)?;
             } else if ft.is_dir() {
-                stack.push(path);
+                if depth + 1 > worktrees::WALK_MAX_DEPTH {
+                    return Err(format!(
+                        "{} is more than {} levels below the worktree root; refusing to publish it",
+                        path.strip_prefix(worktree).unwrap_or(&path).display(),
+                        worktrees::WALK_MAX_DEPTH
+                    ));
+                }
+                stack.push((path, depth + 1));
+            }
+        }
+        for (flag, marker) in [
+            (&mut has_head, "HEAD"),
+            (&mut has_objects, "objects"),
+            (&mut has_refs, "refs"),
+            (&mut has_commondir, "commondir"),
+        ] {
+            if !*flag {
+                match dir.join(marker).symlink_metadata() {
+                    Ok(_) => *flag = true,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(format!("cannot stat {}: {e}", dir.join(marker).display()));
+                    }
+                }
             }
         }
         if worktrees::bare_layout(has_head, has_objects, has_refs, has_commondir) {
