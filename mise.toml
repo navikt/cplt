@@ -138,3 +138,8 @@ run = "cargo run -- -- --version"
 [tasks.setup-hooks]
 description = "Install git pre-commit hook"
 run = "git config core.hooksPath hack && echo 'Git hooks path set to hack/.'"
+
+[tasks."bench:startup"]
+description = "Measure cplt release startup latency and parent git spawn budget"
+run = "python3 -B hack/bench-startup.py"
+

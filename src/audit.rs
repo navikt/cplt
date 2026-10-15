@@ -363,15 +363,23 @@ impl Baseline {
     /// baseline" (reported later as change audit unavailable).
     pub fn capture(project_dir: &Path) -> Self {
         let start = Instant::now();
-        let repo_root = git_output(project_dir, &["rev-parse", "--show-toplevel"])
-            .map(|s| PathBuf::from(s.trim_end_matches(['\n', '\r'])))
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| project_dir.to_path_buf());
-        // The pinned SHA. If HEAD does not resolve (not a repo, or no commits),
-        // we record no baseline rather than erroring.
-        let pinned_sha = git_output(project_dir, &["rev-parse", "HEAD"])
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
+        // Query the pinned HEAD SHA and authoritative worktree toplevel in one
+        // `git rev-parse` invocation so `Baseline::capture` stays within its
+        // 3-command startup budget while always using Git's real worktree root.
+        let (pinned_sha, top_from_head) =
+            match git_output(project_dir, &["rev-parse", "HEAD", "--show-toplevel"]) {
+                Some(out) => {
+                    let trimmed = out.trim_end_matches(['\n', '\r']);
+                    let (sha, top) = match trimmed.split_once('\n') {
+                        Some((s, t)) => (s.trim(), t.trim_end_matches(['\n', '\r'])),
+                        None => (trimmed.trim(), ""),
+                    };
+                    let sha = (!sha.is_empty()).then(|| sha.to_string());
+                    let top = (!top.is_empty()).then(|| PathBuf::from(top));
+                    (sha, top)
+                }
+                None => (None, None),
+            };
         // Capture the pre-run untracked set REGARDLESS of whether a baseline
         // commit exists: in a fresh `git init` (no commits) we still want to
         // surface the files the agent creates during the session. Track whether
@@ -379,6 +387,16 @@ impl Baseline {
         // set) for a genuinely empty untracked set and over-reports.
         let before_status = git_output(project_dir, &["status", "--porcelain", "-z", "-uall"]);
         let before_ok = before_status.is_some();
+        let repo_root = top_from_head
+            .or_else(|| {
+                if !before_ok {
+                    return None;
+                }
+                git_output(project_dir, &["rev-parse", "--show-toplevel"])
+                    .map(|s| PathBuf::from(s.trim_end_matches(['\n', '\r'])))
+                    .filter(|p| !p.as_os_str().is_empty())
+            })
+            .unwrap_or_else(|| project_dir.to_path_buf());
         let before_untracked_hashes = before_status
             .as_deref()
             .map(|s| fingerprint_untracked(&repo_root, s))
@@ -3291,7 +3309,11 @@ mod tests {
         ]);
 
         let app = repo.join("app");
-        std::fs::create_dir_all(&app).unwrap();
+        // An empty `.git` directory inside a subdirectory is not a valid gitdir,
+        // so Git walks up to the ancestor repository (`repo`). `Baseline::capture`
+        // must still resolve `repo` via `--show-toplevel` rather than assuming a
+        // `.git` entry at `project_dir` means `project_dir` is the toplevel.
+        std::fs::create_dir_all(app.join(".git")).unwrap();
         std::fs::write(app.join("notes.txt"), "before\n").unwrap();
         std::fs::write(app.join("doomed.txt"), "delete me\n").unwrap();
 
