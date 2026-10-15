@@ -5631,6 +5631,39 @@ test ! -e "$CPLT_WORKTREE_ROOT/hostile" && echo RESULT:absent:OK
     }
 
     #[test]
+    fn unavailable_worktree_broker_warns_and_keeps_the_managed_root_without_a_socket() {
+        require_sandbox!();
+        for unborn in [true, false] {
+            let project = TempProject::new("wt-no-bootstrap");
+            if unborn {
+                assert!(crate::common::git_ok(project.path(), &["init", "--quiet"]));
+            } else {
+                project.write_file(".github/hooks/pre.sh", "echo committed\n");
+                project.git_init();
+                project.write_file(".github/hooks/pre.sh", "echo not-committed\n");
+            }
+            let home = short_home("wt-no-bootstrap-home");
+            let (stdout, stderr, ok) = run_exec_with_home(
+                &project,
+                home.path(),
+                "[sandbox]\nallow_git_worktrees = true\n",
+                "test -n \"$CPLT_WORKTREE_ROOT\" && test -d \"$CPLT_WORKTREE_ROOT\" && echo RESULT:root:OK\ntest -z \"${CPLT_WORKTREE_SOCKET-}\" && echo RESULT:no-socket:OK\nprintf x > \"$CPLT_WORKTREE_ROOT/ordinary\" && echo RESULT:write:OK\n",
+            );
+            assert!(ok, "{stdout}\n{stderr}");
+            assert!(
+                stderr.contains("managed-worktree broker unavailable"),
+                "{stderr}"
+            );
+            for result in ["root:OK", "no-socket:OK", "write:OK"] {
+                assert!(
+                    stdout.contains(&format!("RESULT:{result}")),
+                    "{stdout}\n{stderr}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn worktree_broker_cannot_publish_objects_from_a_denied_repository() {
         require_sandbox!();
         let project = TempProject::new("wt-denied-source");

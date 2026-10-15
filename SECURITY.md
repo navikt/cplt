@@ -701,6 +701,12 @@ does not:
      contents. Replacement objects are disabled throughout broker Git use.
      Launch HEAD must name a commit; tree queries fail closed at 1 MiB or 200,000
      entries. No incomplete snapshot is accepted.
+     HEAD alone is not approval: protected files in the launch checkout must
+     exist with the recorded raw bytes and executable modes. The bootstrap
+     opens ancestors and files no-follow, copies at most 1 MiB per file into
+     private staging and hashes those copies without filters. A mismatch,
+     unborn HEAD or unavailable snapshot disables the broker with a warning
+     and no socket variable; the session's existing managed-root grant remains.
    - Every request-time broker Git child, including config queries and ref resolution, runs
      under `/usr/bin/sandbox-exec -p` with an immutable copy of the final session
      profile. Without that profile, requests fail closed. Kernel read denies
@@ -718,6 +724,12 @@ does not:
      filters disabled and compared again: attributes such as `ident` must not
      transform a protected file. Different protected content requires preparing
      the worktree outside cplt, with no new approval path.
+     ASCII matching is only the early tree check. At launch and before publish,
+     every root/nested protected spelling is looked up through the filesystem,
+     component by component without following symlinks. Its actual directory
+     entry must use the exact declared spelling, and every protected file must
+     occur in the approved snapshot. This rejects APFS aliases such as
+     `ſettings.json` and `hooKs` without rejecting unrelated Unicode names.
   - Hooks are off (`core.hooksPath=/dev/null`). A `filter.*` entry in any
     config scope, including the user's global config, refuses the request,
      because private checkout cannot reproduce filtered content. The refusal
@@ -756,6 +768,9 @@ does not:
      Private staging deletion and failed-job cleanup run outside that operation
      budget. Filesystem stalls and large cleanup work can extend shutdown time;
      the 60 s budget is not a comprehensive wall-clock bound.
+     Queue time is outside each request's operation budget. A 70 s client
+     timeout does not cancel queued work; diagnostics tell the caller to check
+     the destination before retrying.
   - Plain `git worktree add` in the sandbox is unchanged: it runs git directly
     and gets none of the checks above. The launch-time and exit-time link
     checks still cover what it creates.

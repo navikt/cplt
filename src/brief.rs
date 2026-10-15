@@ -319,8 +319,10 @@ pub fn generate_session_brief(facts: &BriefFacts) -> String {
         let _ = write!(
             out,
             "## Worktrees\n\n\
-             Create worktrees for parallel work under `$CPLT_WORKTREE_ROOT` ({root}) with \
-             `cplt worktree add <name> <ref>`, which prints the path. It checks out `<ref>` \
+             Worktrees for parallel work belong under `$CPLT_WORKTREE_ROOT` ({root}). \
+             Only when `$CPLT_WORKTREE_SOCKET` is set, use \
+             `cplt worktree add <name> <ref>`, which prints the path. Otherwise ask the user \
+             to prepare worktrees outside cplt. The broker checks out `<ref>` \
              detached, from local refs only; for a branch run \
              `git -C <path> switch -c <branch>`. Prefer `cplt worktree add` over plain \
              `git worktree add`, which runs git directly without cplt's checks. You have read, \

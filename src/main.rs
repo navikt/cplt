@@ -5855,8 +5855,8 @@ struct AssembledSandbox {
 }
 
 /// Start the managed-worktree broker for a launch (#531), or `None` when the
-/// root is off. Refuses the launch if the broker cannot start: the sandbox
-/// would otherwise grant a worktree root that nothing can populate safely.
+/// root is off. Failure disables only the broker convenience, with a warning;
+/// the existing managed-root grant remains available under its usual denies.
 fn start_worktree_broker(
     probe: &HostProbe,
     root: &Path,
@@ -6112,7 +6112,15 @@ fn assemble_sandbox(
     // Started before the profile is built, since the profile grants its socket.
     // Not for a dry check, which must not bind a socket or create the root (#553).
     let worktree_broker = match (opts.repos.worktree_root, opts.inspect_only) {
-        (Some(root), false) => Some(start_worktree_broker(probe, root)?),
+        (Some(root), false) => match start_worktree_broker(probe, root) {
+            Ok(broker) => Some(broker),
+            Err(error) => {
+                ui::warn(&format!(
+                    "managed-worktree broker unavailable: {error}. CPLT_WORKTREE_SOCKET is not set; the managed root remains available. Prepare worktrees outside cplt."
+                ));
+                None
+            }
+        },
         _ => None,
     };
     let mut sandbox_config = build_sandbox_config(

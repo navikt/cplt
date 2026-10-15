@@ -136,6 +136,110 @@ fn tracked_files() -> Vec<(&'static str, &'static str)> {
 }
 
 #[test]
+fn filesystem_protected_aliases_are_refused_but_ordinary_unicode_is_allowed() {
+    for path in [
+        ".claude/ſettings.json",
+        "nested/.github/hoo\u{212a}s/payload",
+        "nested/.claude/ſettings.json",
+    ] {
+        let fx = Fixture::new(&tracked_files());
+        let ctx = with_home(fx.home.path(), || fx.ctx());
+        write_files(fx.project.path(), &[(path, "payload\n")]);
+        commit_all(fx.project.path());
+        let err = add(&ctx, "alias", "HEAD").unwrap_err();
+        assert!(
+            err.contains("protected filesystem name is an alias"),
+            "{path}: {err}"
+        );
+        assert!(!fx.root.join("alias").exists());
+        assert!(fx.admin_entries().is_empty());
+    }
+    let fx = Fixture::new(&tracked_files());
+    let ctx = with_home(fx.home.path(), || fx.ctx());
+    write_files(fx.project.path(), &[("blåbær/日本語.txt", "allowed\n")]);
+    commit_all(fx.project.path());
+    add(&ctx, "unicode", "HEAD").unwrap();
+    assert_eq!(
+        std::fs::read_to_string(fx.root.join("unicode/blåbær/日本語.txt")).unwrap(),
+        "allowed\n"
+    );
+}
+
+#[test]
+fn launch_head_cannot_approve_protected_content_not_checked_out() {
+    let fx = Fixture::new(&tracked_files());
+    write_files(
+        fx.project.path(),
+        &[(".github/hooks/pre.sh", "echo malicious\n")],
+    );
+    commit_all(fx.project.path());
+    write_files(
+        fx.project.path(),
+        &[(".github/hooks/pre.sh", "echo hook\n")],
+    );
+    let err = with_home(fx.home.path(), || {
+        Context::new(fx.project.path(), &fx.common, &fx.root)
+    })
+    .unwrap_err();
+    assert!(
+        err.contains("protected launch bytes differ from HEAD"),
+        "{err}"
+    );
+    let fx = Fixture::new(&[]);
+    write_files(fx.project.path(), &[(".claude/settings.json", "{}\n")]);
+    commit_all(fx.project.path());
+    std::fs::remove_file(fx.project.path().join(".claude/settings.json")).unwrap();
+    assert!(
+        Context::new(fx.project.path(), &fx.common, &fx.root)
+            .unwrap_err()
+            .contains("protected filesystem content differs")
+    );
+}
+
+#[test]
+fn launch_protected_aliases_and_mode_mismatch_are_refused() {
+    let fx = Fixture::new(&[]);
+    write_files(fx.project.path(), &[(".claude/ſettings.json", "{}\n")]);
+    commit_all(fx.project.path());
+    assert!(
+        Context::new(fx.project.path(), &fx.common, &fx.root)
+            .unwrap_err()
+            .contains("alias")
+    );
+    let fx = Fixture::new(&tracked_files());
+    std::fs::set_permissions(
+        fx.project.path().join(".github/hooks/pre.sh"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    assert!(
+        Context::new(fx.project.path(), &fx.common, &fx.root)
+            .unwrap_err()
+            .contains("mode differs")
+    );
+}
+
+#[test]
+fn launch_protected_fifo_and_symlink_are_never_read() {
+    use std::os::unix::ffi::OsStrExt;
+    for fifo in [false, true] {
+        let fx = Fixture::new(&tracked_files());
+        let hook = fx.project.path().join(".github/hooks/pre.sh");
+        std::fs::remove_file(&hook).unwrap();
+        if fifo {
+            let name = std::ffi::CString::new(hook.as_os_str().as_bytes()).unwrap();
+            // SAFETY: name is a live NUL-terminated filename.
+            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        } else {
+            symlink("/etc/passwd", hook).unwrap();
+        }
+        let started = Instant::now();
+        assert!(Context::new(fx.project.path(), &fx.common, &fx.root).is_err());
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+}
+
+#[test]
 fn protected_content_is_frozen_before_refs_can_move() {
     for (label, path, body) in [
         ("new settings", ".claude/settings.json", "{\"hooks\":{}}\n"),

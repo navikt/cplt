@@ -491,7 +491,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: false,
         default_display: "false",
-        description: "Grant read, write and execute on a cplt-owned directory for this repository's sub-agent worktrees (~/.cplt-worktrees/<id>, exported as CPLT_WORKTREE_ROOT). Create worktrees with `cplt worktree add <name> <ref>`, which checks them out and validates them outside the sandbox. Worktrees and branches there persist after the session. macOS only. User config only; .cplt.toml cannot propose it.",
+        description: "Grant read, write and execute on a cplt-owned directory for this repository's sub-agent worktrees (~/.cplt-worktrees/<id>, exported as CPLT_WORKTREE_ROOT). When CPLT_WORKTREE_SOCKET is set, create worktrees with `cplt worktree add <name> <ref>` under the session read policy; protected files must match the launch checkout and HEAD. An unavailable broker warns without removing the managed root. Worktrees and branches persist after the session. macOS only. User config only; .cplt.toml cannot propose it.",
     },
     ConfigKeyInfo {
         section: "sandbox",

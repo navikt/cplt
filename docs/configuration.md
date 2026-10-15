@@ -479,9 +479,20 @@ as before, but git runs it directly and none of the checks above apply.
 
 The command works only in a session cplt started, on macOS. The worktrees it
 creates outlive the session, like any other in the root.
-The launch HEAD must name a commit. Tree queries are capped at 1 MiB and 200,000
-entries; exceeding either limit refuses startup or the request. No partial
-protected-file snapshot is accepted. Private staging cleanup runs after the
+The broker requires a launch HEAD commit whose protected bytes and executable
+modes match the checkout. Symlinked protected paths or ancestors, filesystem
+aliases of protected names, and protected files larger than 1 MiB are refused.
+Ordinary Unicode names remain allowed. Tree queries are capped at 1 MiB and
+200,000 entries. An unavailable launch snapshot disables the broker with a
+warning and leaves `CPLT_WORKTREE_SOCKET` unset; the session and managed root
+remain available. Prepare worktrees outside cplt in that case. No partial
+protected-file snapshot is accepted. A global `filter.*` configuration, including
+Git LFS, can also make this convenience unavailable or refuse requests even
+when the requested tree does not use the filter.
+
+Requests share a serial queue. A client timeout does not cancel a queued request;
+check `$CPLT_WORKTREE_ROOT/<name>` before retrying because it may still publish.
+Private staging cleanup runs after the
 60-second operation budget and can extend shutdown time.
 
 What you get:

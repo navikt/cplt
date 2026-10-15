@@ -155,6 +155,8 @@ impl Context {
             commit_id(&out).map_err(|_| "cannot snapshot launch HEAD: it must name a commit")?;
         let cmd = pinned_common_command(&ctx, &["ls-tree", "-r", "-z", "--full-tree", &sha])?;
         ctx.protected = protected_tree(run_bounded(cmd, &budget)?, &budget)?;
+        verify_protected_names(project, &ctx.protected, &budget)?;
+        verify_launch_bytes(&ctx, project, &budget)?;
         Ok(ctx)
     }
 
@@ -378,6 +380,7 @@ fn add_with_budget(
     let private = staging.join("git");
     checkout(ctx, &private, &job.worktree, &sha, budget)?;
     validate_tree(&job.worktree, budget)?;
+    verify_protected_names(&job.worktree, &ctx.protected, budget)?;
     verify_protected_checkout(ctx, &private, &job.worktree, budget)?;
     check_identity(&ctx.common, &ctx.common_fd)?;
     budget.check()?;
@@ -607,6 +610,183 @@ fn harden_data_query(ctx: &Context, cmd: &mut Command) {
 }
 
 type ProtectedTree = BTreeMap<Vec<u8>, (Vec<u8>, Vec<u8>)>;
+
+/// Ask the filesystem which entry each protected spelling names. APFS aliases
+/// (including long s and Kelvin sign) are not Unicode lowercase mappings.
+/// Never follow a symlink while resolving a protected name or its ancestors.
+fn verify_protected_names(
+    root: &Path,
+    expected: &ProtectedTree,
+    budget: &Budget<'_>,
+) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut found = std::collections::BTreeSet::new();
+    let mut stack = vec![root.to_path_buf()];
+    let mut count = 0;
+    while let Some(dir) = stack.pop() {
+        budget.check()?;
+        for protected in crate::sandbox::PROTECTED_IN_ROOT {
+            if dir != root && !protected.nested {
+                continue;
+            }
+            let mut actual = dir.clone();
+            let mut present = true;
+            for component in protected.rel.split('/') {
+                let lookup = actual.join(component);
+                let metadata = match lookup.symlink_metadata() {
+                    Ok(metadata) => metadata,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        present = false;
+                        break;
+                    }
+                    Err(_) => return Err("cannot resolve protected filesystem name".into()),
+                };
+                let mut matching = None;
+                for entry in
+                    std::fs::read_dir(&actual).map_err(|_| "cannot list protected parent")?
+                {
+                    budget.check()?;
+                    let entry = entry.map_err(|_| "cannot read protected parent entry")?;
+                    let m = entry
+                        .path()
+                        .symlink_metadata()
+                        .map_err(|_| "cannot stat protected parent entry")?;
+                    if m.dev() == metadata.dev() && m.ino() == metadata.ino() {
+                        matching = Some(entry.path());
+                        break;
+                    }
+                }
+                let entry = matching.ok_or("cannot identify protected filesystem entry")?;
+                if metadata.file_type().is_symlink() {
+                    return Err("protected filesystem path has a symlink; prepare the worktree outside cplt".into());
+                }
+                // Exact spelling is required even when an alias was in HEAD.
+                if entry.file_name() != Some(std::ffi::OsStr::new(component)) {
+                    return Err(
+                        "protected filesystem name is an alias; prepare the worktree outside cplt"
+                            .into(),
+                    );
+                }
+                actual = entry;
+            }
+            if !present {
+                continue;
+            }
+            let mut pending = vec![actual];
+            let mut protected_entries = 0;
+            while let Some(path) = pending.pop() {
+                budget.check()?;
+                protected_entries += 1;
+                if protected_entries > MAX_TREE_ENTRIES {
+                    return Err("protected filesystem tree exceeds entry limit".into());
+                }
+                let meta = path
+                    .symlink_metadata()
+                    .map_err(|_| "cannot stat protected entry")?;
+                if meta.is_dir() && protected.tree {
+                    for entry in
+                        std::fs::read_dir(path).map_err(|_| "cannot list protected tree")?
+                    {
+                        pending.push(
+                            entry
+                                .map_err(|_| "cannot read protected tree entry")?
+                                .path(),
+                        );
+                    }
+                } else {
+                    let rel = path
+                        .strip_prefix(root)
+                        .map_err(|_| "protected path escaped checkout")?
+                        .as_os_str()
+                        .as_bytes()
+                        .to_vec();
+                    if !meta.is_file() || !expected.contains_key(&rel) {
+                        return Err("protected filesystem content differs from launch HEAD; prepare the worktree outside cplt".into());
+                    }
+                    found.insert(rel);
+                }
+            }
+        }
+        for entry in std::fs::read_dir(&dir).map_err(|_| "cannot inspect checkout directories")? {
+            budget.check()?;
+            count += 1;
+            if count > MAX_TREE_ENTRIES {
+                return Err("checkout exceeds protected-name scan limit".into());
+            }
+            let entry = entry.map_err(|_| "cannot inspect checkout directory entry")?;
+            if entry.file_name().as_bytes().eq_ignore_ascii_case(b".git") {
+                continue;
+            }
+            if entry
+                .file_type()
+                .map_err(|_| "cannot stat checkout directory")?
+                .is_dir()
+            {
+                stack.push(entry.path());
+            }
+        }
+    }
+    if found.len() != expected.len() {
+        return Err("protected filesystem content differs from launch HEAD; prepare the worktree outside cplt".into());
+    }
+    Ok(())
+}
+
+/// HEAD is agent-mutable across sessions. Trust only protected content actually
+/// checked out at launch, read through no-follow directory and file descriptors.
+fn verify_launch_bytes(ctx: &Context, project: &Path, budget: &Budget<'_>) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+    let staging = new_staging_dir(&ctx.base)?;
+    let _cleanup = Job {
+        staging: staging.clone(),
+        admin: None,
+        worktree: staging.clone(),
+        final_git: PathBuf::new(),
+        published: false,
+    };
+    let root = open_dir(project)?;
+    for (number, (path, (mode, id))) in ctx.protected.iter().enumerate() {
+        budget.check()?;
+        let mut parent = root.try_clone().map_err(|_| "cannot pin launch checkout")?;
+        let parts: Vec<_> = path.split(|b| *b == b'/').collect();
+        for part in &parts[..parts.len() - 1] {
+            parent = open_at(
+                &parent,
+                std::str::from_utf8(part).map_err(|_| "protected launch path is not UTF-8")?,
+                libc::O_RDONLY | libc::O_DIRECTORY,
+            )?;
+        }
+        let name = std::str::from_utf8(parts.last().unwrap())
+            .map_err(|_| "protected launch path is not UTF-8")?;
+        let source = open_at(&parent, name, libc::O_RDONLY | libc::O_NONBLOCK)?;
+        let metadata = source
+            .metadata()
+            .map_err(|_| "cannot stat launch protected file")?;
+        if !metadata.is_file()
+            || metadata.len() > 1024 * 1024
+            || (metadata.mode() & 0o111 != 0) != (mode == b"100755")
+        {
+            return Err("protected launch file or mode differs from HEAD".into());
+        }
+        let copy = staging.join(number.to_string());
+        let mut target = File::create(&copy).map_err(|_| "cannot copy launch protected file")?;
+        let n = std::io::copy(&mut source.take(1024 * 1024 + 1), &mut target)
+            .map_err(|_| "cannot read launch protected file")?;
+        if n > 1024 * 1024 {
+            return Err("launch protected file exceeds 1 MiB".into());
+        }
+        let path = std::str::from_utf8(copy.as_os_str().as_bytes())
+            .map_err(|_| "private launch path is not UTF-8")?;
+        let out = run_bounded(
+            pinned_common_command(ctx, &["hash-object", "--no-filters", "--", path])?,
+            budget,
+        )?;
+        if !out.status.success() || out.stdout.strip_suffix(b"\n") != Some(id.as_slice()) {
+            return Err("protected launch bytes differ from HEAD; restore the trusted checkout outside cplt".into());
+        }
+    }
+    Ok(())
+}
 
 /// Keep exact path bytes, mode and blob id. Case folding is only for matching
 /// deny-table names, so renames and colliding aliases cannot compare equal.
@@ -1300,7 +1480,9 @@ pub fn run_client(name: &str, reference: &str) -> ExitCode {
     }
     let mut reply = Vec::new();
     if let Err(e) = (&stream).take(MAX_LINE).read_to_end(&mut reply) {
-        eprintln!("cplt worktree: no reply from the broker: {e}");
+        eprintln!(
+            "cplt worktree: no reply from the broker: {e}. The request may still publish; check $CPLT_WORKTREE_ROOT/{name} before retrying."
+        );
         return ExitCode::FAILURE;
     }
     match serde_json::from_slice::<Response>(&reply) {
@@ -1317,7 +1499,9 @@ pub fn run_client(name: &str, reference: &str) -> ExitCode {
             ExitCode::FAILURE
         }
         _ => {
-            eprintln!("cplt worktree: the broker sent an unreadable reply");
+            eprintln!(
+                "cplt worktree: the broker sent an unreadable reply. The request may have published; check $CPLT_WORKTREE_ROOT/{name} before retrying."
+            );
             ExitCode::FAILURE
         }
     }
