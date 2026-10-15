@@ -1164,7 +1164,8 @@ EOF
         assert!(
             discovery
                 .existing_home_tool_dirs
-                .contains(&"Library/Java/JavaVirtualMachines".to_string()),
+                .iter()
+                .any(|d| d.dir.path == "Library/Java/JavaVirtualMachines"),
             "discover_tools must record Library/Java/JavaVirtualMachines"
         );
 
