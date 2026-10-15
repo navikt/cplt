@@ -584,6 +584,11 @@ const GIT_ENV_CLEARED: &[&str] = &[
     "GIT_ATTR_SOURCE",
 ];
 
+#[cfg(test)]
+thread_local! {
+    static HARDENED_COMMANDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Environment applied to every parent-side git invocation.
 ///
 /// Deliberately **not** set here: `GIT_CONFIG_GLOBAL=/dev/null`. cplt reads the
@@ -593,6 +598,9 @@ const GIT_ENV_CLEARED: &[&str] = &[
 /// detection for every hooks user, and buys nothing: the threat is the
 /// *repository's* config, not the user's.
 fn harden(cmd: &mut Command) {
+    #[cfg(test)]
+    HARDENED_COMMANDS.with(|n| n.set(n.get() + 1));
+
     // Cleared unconditionally, so the removal is recorded on the Command (and
     // therefore assertable) whether or not the variable happens to be set.
     for name in GIT_ENV_CLEARED {
@@ -1393,5 +1401,93 @@ mod tests {
                 "override {key} missing from {args:?}"
             );
         }
+    }
+
+    fn count_git_commands<R>(f: impl FnOnce() -> R) -> (usize, R) {
+        let before = HARDENED_COMMANDS.with(std::cell::Cell::get);
+        let out = f();
+        let after = HARDENED_COMMANDS.with(std::cell::Cell::get);
+        (after - before, out)
+    }
+
+    /// Regression guard for #666: each parent-side startup and audit phase has a
+    /// fixed `git` spawn budget. Asserting the command count rather than wall
+    /// time catches an accidental extra `git` call deterministically on loaded
+    /// CI runners.
+    #[test]
+    fn startup_and_audit_git_command_budget() {
+        let Some(git) = trusted_git() else {
+            return;
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let run_git = |args: &[&str]| {
+            #[allow(clippy::disallowed_methods)] // `git` is `trusted_git()` above
+            Command::new(git)
+                .args(args)
+                .current_dir(&repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("git status")
+                .success()
+        };
+        assert!(run_git(&["init", "-q", "-b", "main", "."]));
+        std::fs::write(repo.join("README.md"), "hello\n").expect("write");
+        assert!(run_git(&["add", "README.md"]));
+        assert!(run_git(&[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "init"
+        ]));
+
+        // 1. Path discovery: a single `rev-parse --git-dir`.
+        let (n, paths) = count_git_commands(|| crate::discover::discover_paths(&home, &repo));
+        assert!(paths.is_git_repo);
+        assert_eq!(n, 1, "discover_paths must run exactly 1 git command");
+
+        // 2. Worktree check on a plain repo: a single `rev-parse --git-common-dir`
+        //    (must not run the second `--absolute-git-dir` query when not a worktree).
+        let (n, (common, problem)) =
+            count_git_commands(|| crate::discover::git_common_dir(&home, &repo, &[]));
+        assert!(common.is_none() && problem.is_none());
+        assert_eq!(
+            n, 1,
+            "git_common_dir on a plain repo must run 1 git command"
+        );
+
+        // 3. Repo config load without `.cplt.toml`: a single `cat-file blob HEAD:.cplt.toml`
+        //    (must not run `rev-parse --show-toplevel` when no config is committed).
+        let (n, loaded) = count_git_commands(|| crate::repo_config::load_repo_config(&repo));
+        assert!(loaded.expect("load_repo_config").is_none());
+        assert_eq!(
+            n, 1,
+            "load_repo_config without .cplt.toml must run 1 git command"
+        );
+
+        // 4. Pre-session audit baseline: `rev-parse HEAD` (1) + `status` (1 filter
+        //    check + 1 status = 2) = 3 git commands.
+        let (n, baseline) = count_git_commands(|| crate::audit::Baseline::capture(&repo));
+        assert_eq!(n, 3, "Baseline::capture must run 3 git commands");
+
+        // 5. Post-session audit finish: `status` (2) + `diff --numstat` (2) = 4 git commands.
+        let (n, report) = count_git_commands(|| baseline.finish(0, true));
+        assert!(matches!(
+            report,
+            crate::audit::AuditReport::Available { .. }
+        ));
+        assert_eq!(n, 4, "Baseline::finish must run 4 git commands");
     }
 }

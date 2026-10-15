@@ -15,6 +15,7 @@ on:
   # stack rebasing at once runs in parallel and each PR only cancels its own
   # older runs.
   pull_request:
+    types: [opened, edited, synchronize, reopened]
   # Run the required checks on the merge queue's temporary ref. The ruleset
   # requires unit-tests / integration-tests / linux-integration-tests before
   # merge; without this trigger those checks never report in the merge_group
@@ -33,6 +34,94 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  pr-body-check:
+    name: PR body template check
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Validate PR description against template
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          python3 - <<'PY'
+          import os, re, sys
+
+          if os.environ.get("EVENT_NAME") != "pull_request":
+              print("Not a pull_request event, skipping PR body check.")
+              sys.exit(0)
+
+          author = os.environ.get("PR_AUTHOR", "")
+          if author in ("dependabot[bot]", "github-actions[bot]"):
+              print(f"Automated PR author {author}, skipping PR body check.")
+              sys.exit(0)
+
+          def strip_fenced_code(text: str) -> str:
+              out = []
+              fence_char = None
+              fence_len = 0
+              for line in text.splitlines():
+                  if fence_char is None:
+                      m = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+                      if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
+                          fence_char = m.group(1)[0]
+                          fence_len = len(m.group(1))
+                          out.append("CODE_BLOCK")
+                      else:
+                          out.append(line)
+                  elif re.match(rf"^ {{0,3}}{re.escape(fence_char)}{{{fence_len},}}\s*$", line):
+                      fence_char = None
+                      fence_len = 0
+              return "\n".join(out)
+
+          raw = os.environ.get("PR_BODY") or ""
+          body = re.sub(r"<!--(?:.*?-->|.*$)", "", raw, flags=re.DOTALL)
+          body_no_code = strip_fenced_code(body)
+
+          required = [
+              "## Summary",
+              "## Risk profile & rollout",
+              "## Platform parity",
+              "## Security considerations",
+              "## Test plan",
+          ]
+
+          positions = {}
+          errors = []
+          for heading in required:
+              matches = list(re.finditer(rf"(?m)^{re.escape(heading)}\s*$", body_no_code))
+              if not matches:
+                  errors.append(f"Missing required section heading '{heading}' in PR description")
+              elif len(matches) > 1:
+                  errors.append(f"Duplicate section heading '{heading}' in PR description")
+              else:
+                  positions[heading] = (matches[0].start(), matches[0].end())
+
+          if not errors:
+              ordered = sorted(positions.items(), key=lambda kv: kv[1][0])
+              for idx, (heading, (_, end_pos)) in enumerate(ordered):
+                  next_start = ordered[idx + 1][1][0] if idx + 1 < len(ordered) else len(body_no_code)
+                  section = body_no_code[end_pos:next_start]
+                  next_h2 = re.search(r"(?m)^##\s+", section)
+                  if next_h2:
+                      section = section[:next_h2.start()]
+                  if heading == "## Risk profile & rollout":
+                      if not re.search(r"(?m)^\s*-\s*\[[xX]\]\s+\S+", section):
+                          errors.append(
+                              "Section '## Risk profile & rollout' must have at least one checked option"
+                          )
+                  elif not section.strip():
+                      errors.append(f"Section '{heading}' must not be empty")
+
+          if errors:
+              for err in errors:
+                  print(f"::error::{err}")
+              sys.exit(1)
+
+          print("PR description satisfies all required template sections.")
+          PY
+
   # Unit tests run on Linux (fast, no macOS dependency)
   unit-tests:
     runs-on: ubuntu-latest
@@ -587,7 +676,7 @@ jobs:
   ci-ok:
     name: ci-ok
     if: ${{ always() }}
-    needs: [unit-tests, integration-tests, opencode-v2-e2e, opencode-v2-e2e-linux, linux-integration-tests]
+    needs: [pr-body-check, unit-tests, integration-tests, opencode-v2-e2e, opencode-v2-e2e-linux, linux-integration-tests]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
