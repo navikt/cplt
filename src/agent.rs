@@ -992,6 +992,38 @@ impl std::fmt::Display for KeychainSubstitute {
     }
 }
 
+/// Verify that `~/.gemini/antigravity-cli/antigravity-oauth-token` is a regular
+/// file holding a token `agy`'s `keyringAuth.TryAuth` will accept.
+fn has_valid_antigravity_oauth_token(path: &Path) -> bool {
+    let Ok(Some(raw)) = crate::untrusted::read_untrusted(path, 64 * 1024) else {
+        return false;
+    };
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    let Some(obj) = val.as_object() else {
+        return false;
+    };
+    let non_empty_in = |m: &serde_json::Map<String, serde_json::Value>, k: &str| {
+        m.get(k)
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty())
+    };
+    let has_token = match obj.get("token") {
+        Some(serde_json::Value::String(s)) => !s.trim().is_empty(),
+        Some(serde_json::Value::Object(m)) => {
+            non_empty_in(m, "access_token") || non_empty_in(m, "refresh_token")
+        }
+        _ => false,
+    };
+    // `keyringAuth.TryAuth` (`keyring.go:51`): a `"gcp"` token with neither
+    // `project_id` nor `user_tier` is rejected as incomplete GCP onboarding.
+    let gcp_complete = obj.get("auth_method").and_then(|v| v.as_str()) != Some("gcp")
+        || non_empty_in(obj, "project_id")
+        || non_empty_in(obj, "user_tier");
+    has_token && gcp_complete
+}
+
 /// Supported AI coding agents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1367,18 +1399,17 @@ impl Agent {
         }
         // Antigravity's `agy` falls back to a plaintext token file when its
         // keyring is unavailable ("Failed to load token from keyring, falling
-        // back to file"). The file is a *fallback*, not a mirror: a healthy
-        // keyring is written in place and the file is never created, so its mere
-        // existence is the only safe signal that the agent can still
-        // authenticate without the grant. cplt already grants
-        // `~/.gemini/antigravity-cli` read+write, so refreshes persist there.
+        // back to file"). The file is a *fallback*, not a mirror: when the
+        // keyring succeeds outside cplt, `agy` updates the keyring and leaves
+        // any older fallback file untouched. An earlier aborted or incomplete
+        // login inside cplt can leave a GCP token file without `project_id` or
+        // `user_tier`, which `agy`'s `keyringAuth.TryAuth` rejects as
+        // unauthenticated ("incomplete GCP onboarding"). Validate with
+        // `read_untrusted` so a symlink, FIFO, directory or incomplete token
+        // never drops the Keychain grant.
         if *self == Agent::Antigravity {
             let token = home.join(".gemini/antigravity-cli/antigravity-oauth-token");
-            // `is_file()` as well as non-empty: a directory reports a non-zero
-            // len (64 on macOS, 4096 on ext4), so a stray directory at this path
-            // would read as a valid credential and drop the Keychain grant,
-            // stranding the agent at a browser re-login it cannot reach.
-            if std::fs::metadata(&token).is_ok_and(|m| m.is_file() && m.len() > 0) {
+            if has_valid_antigravity_oauth_token(&token) {
                 return Some(KeychainSubstitute::File(token));
             }
         }
@@ -4448,6 +4479,78 @@ mod tests {
         assert!(
             Agent::Antigravity.auth_env_hint().is_empty(),
             "antigravity uses oauth/keychain auth, no env hints"
+        );
+    }
+
+    #[test]
+    fn antigravity_keychain_substitute_requires_complete_untrusted_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let cli_dir = home.join(".gemini/antigravity-cli");
+        std::fs::create_dir_all(&cli_dir).unwrap();
+        let token = cli_dir.join("antigravity-oauth-token");
+
+        let check = |enabled: bool, macos: bool| {
+            Agent::Antigravity.credential_outside_keychain_on(home, &[], enabled, macos)
+        };
+
+        // Missing file -> keep Keychain.
+        assert_eq!(check(true, true), None);
+
+        // Incomplete GCP onboarding (no project_id or user_tier) -> keep Keychain.
+        for bad in [
+            "",
+            "not json",
+            "{}",
+            r#"{"token":{}}"#,
+            r#"{"token":{"access_token":"ya29.tok"},"auth_method":"gcp"}"#,
+            r#"{"token":{"access_token":"ya29.tok"},"auth_method":"gcp","project_id":"  ","user_tier":""}"#,
+        ] {
+            std::fs::write(&token, bad).unwrap();
+            assert_eq!(check(true, true), None, "accepted incomplete token: {bad}");
+        }
+
+        // Complete GCP token (with project_id or user_tier) -> drop Keychain on macOS when enabled.
+        for good in [
+            r#"{"token":{"access_token":"ya29.tok","refresh_token":"1//ref"},"auth_method":"gcp","project_id":"my-proj"}"#,
+            r#"{"token":{"refresh_token":"1//ref"},"auth_method":"gcp","user_tier":"standard"}"#,
+        ] {
+            std::fs::write(&token, good).unwrap();
+            assert_eq!(
+                check(true, true),
+                Some(KeychainSubstitute::File(token.clone())),
+                "rejected valid token: {good}"
+            );
+            assert_eq!(check(false, true), None);
+            assert_eq!(check(true, false), None);
+        }
+
+        // Planted symlink pointing at a valid token -> refused.
+        let real = home.join("real-token.json");
+        std::fs::write(
+            &real,
+            r#"{"token":{"access_token":"ya29.tok"},"auth_method":"gcp","project_id":"my-proj"}"#,
+        )
+        .unwrap();
+        std::fs::remove_file(&token).unwrap();
+        std::os::unix::fs::symlink(&real, &token).unwrap();
+        assert_eq!(check(true, true), None, "must refuse planted symlink");
+        std::fs::remove_file(&token).unwrap();
+
+        // Planted directory -> refused.
+        std::fs::create_dir(&token).unwrap();
+        assert_eq!(check(true, true), None, "must refuse directory");
+        std::fs::remove_dir(&token).unwrap();
+
+        // Planted FIFO -> refused without blocking.
+        crate::untrusted::tests::mkfifo(&token);
+        let home_owned = home.to_path_buf();
+        assert_eq!(
+            crate::untrusted::tests::bounded(move || {
+                Agent::Antigravity.credential_outside_keychain_on(&home_owned, &[], true, true)
+            }),
+            None,
+            "must refuse planted FIFO without blocking"
         );
     }
 

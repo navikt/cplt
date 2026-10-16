@@ -997,7 +997,7 @@ If the stored login is missing, sign in with the standalone agent outside cplt.
 |---|---|---|---|
 | Copilot | A nonblank exported token survives `deny.env`, or stored gh retrieval succeeds into a permitted name without a detected account mismatch | that GitHub token, in the environment | cplt does not renew it; Copilot's API/session-token renewal under this handover was not established |
 | Claude Code | `CLAUDE_CODE_OAUTH_TOKEN` is set | that OAuth token | none — see below |
-| Antigravity | `~/.gemini/antigravity-cli/antigravity-oauth-token` exists and is non-empty | that file | refreshes into that file |
+| Antigravity | `~/.gemini/antigravity-cli/antigravity-oauth-token` holds a complete token (including `project_id` or `user_tier` for GCP auth) | that file | refreshes into that file |
 | goose | never (provider-dependent) | — | some providers refresh through the keyring mid-session |
 
 The trade is not free. Whole-Keychain read+write is exchanged for a full OAuth
@@ -1056,16 +1056,20 @@ credential handover must establish its lifetime and renewal path.
   write. Those MCP tokens are exposed; that is a smaller blast radius than every
   Keychain item whose ACL lets the agent through.
 - **Antigravity** — no broker; the grant is dropped only when `agy`'s fallback
-  token file is already there. `agy` prefers its keyring and writes the file only
+  token file is already there and holds a complete credential (`token` plus
+  `project_id` or `user_tier` when `auth_method` is `"gcp"`). `agy` prefers its
+  keyring and writes the file only
   when the keyring fails: its own strings are "Failed to save token to keyring,
   falling back to file", "Failed to load token from keyring, falling back to
   file" and "Keyring SaveToken timed out ... falling back to file storage". So a
-  user whose keyring works has **no** such file, and deleting the grant outright
+  user whose keyring works has **no** such file (or only a stale incomplete GCP
+  token left by an earlier aborted sign-in when the keyring was denied), and
+  deleting the grant outright
   strands them — verified by execution: with the file moved aside, `agy models`
   under cplt's real profile returns exit 0, and under the same profile minus the
   two Keychain rules it exits 1 with "Please sign in to view available models".
   Recovering from that needs a browser re-login, and `--allow-browser` is off by
-  default. When the file *is* present the trade is safe, also verified: `agy
+  default. When a complete token file *is* present the trade is safe, also verified: `agy
   models` authenticated, refreshed an already-expired access token, and persisted
   the new one there, with `~/Library/Keychains` denied. Note the honest cost —
   that file holds a refresh token in plaintext at mode 0600 — but `agy` put it
@@ -1073,8 +1077,8 @@ credential handover must establish its lifetime and renewal path.
   `agy logout` outside cplt clears the keyring but can leave the fallback file
   behind, so a cplt session keeps authenticating with a credential the user
   believes is revoked. Every other way the file goes bad — missing, empty,
-  unreadable, corrupt, expired past its refresh token — surfaces as a plain sign-in
-  error.
+  incomplete, unreadable, corrupt, expired past its refresh token — either keeps
+  the Keychain grant or surfaces as a plain sign-in error.
 
 - **goose** — not eligible, and that is a finding rather than a
   gap. goose's `Config::get_secret` does read the uppercased environment
