@@ -1009,19 +1009,20 @@ fn has_valid_antigravity_oauth_token(path: &Path) -> bool {
             .and_then(|v| v.as_str())
             .is_some_and(|s| !s.trim().is_empty())
     };
-    let has_token = match obj.get("token") {
-        Some(serde_json::Value::String(s)) => !s.trim().is_empty(),
-        Some(serde_json::Value::Object(m)) => {
-            non_empty_in(m, "access_token") || non_empty_in(m, "refresh_token")
-        }
-        _ => false,
-    };
-    // `keyringAuth.TryAuth` (`keyring.go:51`): a `"gcp"` token with neither
-    // `project_id` nor `user_tier` is rejected as incomplete GCP onboarding.
-    let gcp_complete = obj.get("auth_method").and_then(|v| v.as_str()) != Some("gcp")
-        || non_empty_in(obj, "project_id")
-        || non_empty_in(obj, "user_tier");
-    has_token && gcp_complete
+    let has_token = obj
+        .get("token")
+        .and_then(|v| v.as_object())
+        .is_some_and(|m| non_empty_in(m, "access_token") || non_empty_in(m, "refresh_token"));
+    // `oauthConfigFor` + `keyringAuth.TryAuth` (`keyring.go:51`): without
+    // `wif_provider`, `getOauthParams` only accepts `"gcp"` or `"consumer"`,
+    // and `"gcp"` additionally requires `project_id` or `user_tier`.
+    let auth_valid = non_empty_in(obj, "wif_provider")
+        || match obj.get("auth_method").and_then(|v| v.as_str()) {
+            Some("gcp") => non_empty_in(obj, "project_id") || non_empty_in(obj, "user_tier"),
+            Some("consumer") => true,
+            _ => false,
+        };
+    has_token && auth_valid
 }
 
 /// Supported AI coding agents.
@@ -4497,12 +4498,15 @@ mod tests {
         // Missing file -> keep Keychain.
         assert_eq!(check(true, true), None);
 
-        // Incomplete GCP onboarding (no project_id or user_tier) -> keep Keychain.
+        // Incomplete or invalid token -> keep Keychain.
         for bad in [
             "",
             "not json",
             "{}",
             r#"{"token":{}}"#,
+            r#"{"token":"ya29.tok","auth_method":"gcp","project_id":"my-proj"}"#,
+            r#"{"token":{"access_token":"ya29.tok"}}"#,
+            r#"{"token":{"access_token":"ya29.tok"},"auth_method":"GCP","project_id":"my-proj"}"#,
             r#"{"token":{"access_token":"ya29.tok"},"auth_method":"gcp"}"#,
             r#"{"token":{"access_token":"ya29.tok"},"auth_method":"gcp","project_id":"  ","user_tier":""}"#,
         ] {
@@ -4510,10 +4514,12 @@ mod tests {
             assert_eq!(check(true, true), None, "accepted incomplete token: {bad}");
         }
 
-        // Complete GCP token (with project_id or user_tier) -> drop Keychain on macOS when enabled.
+        // Complete token (GCP with project_id/user_tier, consumer, or WIF) -> drop Keychain on macOS when enabled.
         for good in [
             r#"{"token":{"access_token":"ya29.tok","refresh_token":"1//ref"},"auth_method":"gcp","project_id":"my-proj"}"#,
             r#"{"token":{"refresh_token":"1//ref"},"auth_method":"gcp","user_tier":"standard"}"#,
+            r#"{"token":{"access_token":"ya29.tok"},"auth_method":"consumer"}"#,
+            r#"{"token":{"access_token":"ya29.tok"},"wif_provider":"projects/1/locations/global/workloadIdentityPools/p/providers/pr"}"#,
         ] {
             std::fs::write(&token, good).unwrap();
             assert_eq!(

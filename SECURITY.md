@@ -1073,7 +1073,10 @@ credential handover must establish its lifetime and renewal path.
   models` authenticated, refreshed an already-expired access token, and persisted
   the new one there, with `~/Library/Keychains` denied. Note the honest cost —
   that file holds a refresh token in plaintext at mode 0600 — but `agy` put it
-  there itself, with or without cplt. One case fails silently rather than loudly:
+  there itself, with or without cplt. Because `~/.gemini/antigravity-cli` must
+  stay writable for `agy` to persist refreshed tokens, a compromised session can
+  delete or corrupt `antigravity-oauth-token` so the next launch falls back to
+  granting `~/Library/Keychains`. One case fails silently rather than loudly:
   `agy logout` outside cplt clears the keyring but can leave the fallback file
   behind, so a cplt session keeps authenticating with a credential the user
   believes is revoked. Every other way the file goes bad — missing, empty,
