@@ -3634,24 +3634,23 @@ print('CONNECTED')
         require_bwrap!();
         let dir = create_deny_project();
         let project = dir.path().canonicalize().unwrap();
-        let outer_git = project.join(".git");
-        fs::create_dir_all(outer_git.join("hooks")).unwrap();
-        fs::write(outer_git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
-        fs::write(
-            outer_git.join("config"),
-            "[core]\n\trepositoryformatversion = 0\n",
-        )
-        .unwrap();
+        assert!(
+            crate::common::git_cmd(&project)
+                .args(["init", "--quiet"])
+                .status()
+                .unwrap()
+                .success()
+        );
 
         let inner = project.join("packages/inner");
-        let inner_git = inner.join(".git");
-        fs::create_dir_all(inner_git.join("hooks")).unwrap();
-        fs::write(inner_git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
-        fs::write(
-            inner_git.join("config"),
-            "[core]\n\trepositoryformatversion = 0\n",
-        )
-        .unwrap();
+        fs::create_dir_all(&inner).unwrap();
+        assert!(
+            crate::common::git_cmd(&inner)
+                .args(["init", "--quiet"])
+                .status()
+                .unwrap()
+                .success()
+        );
 
         let inner_str = inner.to_string_lossy().into_owned();
         let (code, stdout, stderr) = run_sandboxed_with_flags(
@@ -3659,8 +3658,8 @@ print('CONNECTED')
             &["--use-bubblewrap", "--repo-dir", &inner_str],
             "sh -c '\
                 echo ok > packages/inner/work.txt && echo WORK-OK || echo WORK-DENIED; \
-                (echo pwn >> packages/inner/.git/config) 2>/dev/null \
-                    && echo GIT-CONFIG-WRITTEN || echo GIT-CONFIG-DENIED; \
+                (echo pwn > packages/inner/.git/hooks/pre-commit) 2>/dev/null \
+                    && echo GIT-HOOKS-WRITTEN || echo GIT-HOOKS-DENIED; \
                 (mv packages/inner packages/inner-moved) 2>/dev/null \
                     && echo INNER-MOVED || echo INNER-PINNED; \
                 (mv packages packages-moved) 2>/dev/null \
@@ -3669,10 +3668,11 @@ print('CONNECTED')
         assert!(
             code == 0
                 && stdout.contains("WORK-OK")
-                && stdout.contains("GIT-CONFIG-DENIED")
+                && stdout.contains("GIT-HOOKS-DENIED")
                 && stdout.contains("INNER-PINNED")
                 && stdout.contains("ANCESTOR-PINNED")
                 && inner.join("work.txt").exists()
+                && !inner.join(".git/hooks/pre-commit").exists()
                 && !project.join("packages/inner-moved").exists()
                 && !project.join("packages-moved").exists(),
             "code: {code}, stdout: {stdout}, stderr: {stderr}"
