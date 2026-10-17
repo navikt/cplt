@@ -1102,6 +1102,24 @@ pub(crate) fn rename_pin_paths(write_roots: &[&Path], git_dirs: &[&Path]) -> Vec
         for rel in ancestors(PROTECTED_IN_ROOT) {
             paths.extend(expand_rel(root, rel));
         }
+        // When a writable root (such as a `--repo-dir` or a nested repository)
+        // sits inside an outer writable root, pin the nested root directory
+        // itself and every intermediate ancestor below the outer root so the
+        // whole repository directory cannot be renamed aside (`mv sub sub.bak`)
+        // to replace it with a freshly initialized repo for the next session.
+        let outer = write_roots
+            .iter()
+            .copied()
+            .filter(|w| *root != *w && root.starts_with(w))
+            .min_by_key(|w| w.components().count());
+        if let Some(outer) = outer {
+            for anc in root
+                .ancestors()
+                .take_while(|a| a.starts_with(outer) && *a != outer)
+            {
+                paths.push(anc.to_path_buf());
+            }
+        }
     }
     for dir in git_dirs {
         paths.extend(gitdir_pins(dir));
@@ -3443,6 +3461,47 @@ mod tests {
         assert!(
             tmpfs_pos > rebind_pos,
             "phase-3 read-only tmpfs on .git/remotes must follow the writable rebind: {rebind_args:?}"
+        );
+    }
+
+    #[test]
+    fn nested_repo_roots_in_rename_pin_paths_pins_root_and_intermediate_ancestors() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let project = base.path().join("tilleggsstonader");
+        let direct = project.join("sak");
+        let deep = project.join("apps/frontend");
+        let sibling = base.path().join("other");
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        std::fs::create_dir_all(direct.join(".git")).unwrap();
+        std::fs::create_dir_all(deep.join(".git")).unwrap();
+        std::fs::create_dir_all(sibling.join(".git")).unwrap();
+
+        let roots = [
+            project.as_path(),
+            direct.as_path(),
+            deep.as_path(),
+            sibling.as_path(),
+        ];
+        let pins = rename_pin_paths(&roots, &[], None, &[]);
+        assert!(
+            pins.contains(&direct),
+            "nested direct child root must be pinned: {pins:?}"
+        );
+        assert!(
+            pins.contains(&deep),
+            "nested deep child root must be pinned: {pins:?}"
+        );
+        assert!(
+            pins.contains(&project.join("apps")),
+            "intermediate ancestor between outer writable root and nested root must be pinned: {pins:?}"
+        );
+        assert!(
+            !pins.contains(&project),
+            "outer project root itself is already a mount point and not a nested child: {pins:?}"
+        );
+        assert!(
+            !pins.contains(&sibling),
+            "sibling root outside outer writable tree is not nested: {pins:?}"
         );
     }
 }

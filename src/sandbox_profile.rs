@@ -1304,6 +1304,54 @@ fn emit_git_persistence_denies(
             emit_gitdir_dot_git_create_deny(sb, gitdir);
         }
     }
+    // Pin any named root (`--repo-dir` / `sandbox.repo_dirs`) nested inside an
+    // outer writable root (`project_dir` or `extra_write`), along with any
+    // intermediate ancestor directories below that outer root.
+    //
+    // `emit_gitdir_denies` pins `<named>/.git`, which prevents `mv sub/.git`.
+    // Without pinning `<named>` itself, an agent in Session 1 can rename the
+    // whole nested repository directory aside (`mv sub sub.bak && mkdir sub`),
+    // run `git -C sub init && git -C sub remote add origin <attacker>`, and
+    // leave it for Session 2 — which validates `sub` at launch and grants `gh`
+    // and `git push` scope to `<attacker>` without any `.git` rule having fired.
+    let mut nested_root_pins: Vec<&Path> = Vec::new();
+    for nr_str in project_roots.iter().skip(1) {
+        if managed_worktree_root.is_some_and(|m| m.to_string_lossy() == *nr_str) {
+            continue;
+        }
+        let nr = Path::new(nr_str);
+        let outer = project_roots
+            .first()
+            .map(Path::new)
+            .into_iter()
+            .chain(extra_write.iter().map(PathBuf::as_path))
+            .filter(|w| nr != *w && nr.starts_with(w))
+            .min_by_key(|w| w.components().count());
+        if let Some(outer) = outer {
+            for anc in nr
+                .ancestors()
+                .take_while(|a| a.starts_with(outer) && *a != outer)
+            {
+                if !nested_root_pins.contains(&anc) {
+                    nested_root_pins.push(anc);
+                }
+            }
+        }
+    }
+    if !nested_root_pins.is_empty() {
+        sbpl!(
+            sb,
+            ";; Nested named roots: pin directory path against rename-aside"
+        );
+        for anc in nested_root_pins {
+            sbpl!(
+                sb,
+                "(deny file-write-unlink (literal \"{}\"))",
+                anc.display()
+            );
+        }
+        sbpl!(sb);
+    }
     // `<gitdir>/worktrees/<name>/config.worktree` is read as repository config
     // when `extensions.worktreeConfig` is set, so it is another core.hooksPath
     // vector — one per worktree. `<name>` is unknown when the profile is
@@ -6629,5 +6677,39 @@ mod tests {
             )),
             "--allow-read on a denied cache prefix must clear the read deny"
         );
+    }
+
+    #[test]
+    fn nested_named_root_has_a_pinned_parent_chain() {
+        let project = Path::new("/projects/tilleggsstonader");
+        let home = Path::new("/Users/test");
+        let direct_child = PathBuf::from("/projects/tilleggsstonader/sak");
+        let deep_child = PathBuf::from("/projects/tilleggsstonader/apps/frontend");
+        let sibling = PathBuf::from("/projects/other-repo");
+        let named = [direct_child, deep_child, sibling];
+        let mut opts = test_options(project, home);
+        opts.named_roots = &named;
+        let profile = generate_profile(&opts, &[]);
+
+        for pinned in [
+            "/projects/tilleggsstonader/sak",
+            "/projects/tilleggsstonader/apps/frontend",
+            "/projects/tilleggsstonader/apps",
+        ] {
+            let rule = format!("(deny file-write-unlink (literal \"{pinned}\"))");
+            assert!(
+                profile.contains(&rule),
+                "nested named_root ancestor {pinned} must be pinned against rename:\n{profile}"
+            );
+        }
+        // Neither the outer project root nor a sibling outside the project gets a
+        // nested-root unlink pin.
+        for not_pinned in ["/projects/tilleggsstonader", "/projects/other-repo"] {
+            let rule = format!("(deny file-write-unlink (literal \"{not_pinned}\"))");
+            assert!(
+                !profile.contains(&rule),
+                "{not_pinned} is not a nested root inside an outer writable tree:\n{profile}"
+            );
+        }
     }
 }

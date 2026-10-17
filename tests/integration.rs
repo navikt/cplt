@@ -5868,4 +5868,53 @@ except Exception as e:
             "--print-profile must not create AGENTS.md"
         );
     }
+
+    #[test]
+    fn real_profile_nested_named_root_cannot_be_renamed_aside() {
+        require_sandbox!();
+        let fixture = crate::common::home_temp_dir("nested-named-root");
+        let project = fs::canonicalize(fixture.path()).unwrap();
+        let child = project.join("apps/sak");
+        fs::create_dir_all(child.join(".git/hooks")).unwrap();
+        fs::write(child.join("src.txt"), "initial").unwrap();
+
+        let home = home_dir();
+        let named = [child.clone()];
+        let mut opts = default_opts(&project, &home);
+        opts.named_roots = &named;
+        let profile = write_real_profile(&opts);
+
+        // Files inside the nested named_root remain writable.
+        let write_cmd = format!("echo updated > '{}'", child.join("src.txt").display());
+        let (out, ok) = run_sandboxed(&profile, &write_cmd);
+        assert!(
+            ok,
+            "writing normal files inside nested named_root must succeed: {out}"
+        );
+
+        // Renaming the nested named_root itself must be denied by the kernel.
+        let mv_child = format!(
+            "mv '{}' '{}'",
+            child.display(),
+            project.join("apps/sak.aside").display()
+        );
+        let (_, mv_child_ok) = run_sandboxed(&profile, &mv_child);
+        assert!(
+            !mv_child_ok,
+            "renaming nested named_root must be denied so its .git/hooks deny cannot be bypassed"
+        );
+
+        // Renaming an intermediate ancestor between project_dir and the nested named_root must also be denied.
+        let mv_parent = format!(
+            "mv '{}' '{}'",
+            project.join("apps").display(),
+            project.join("apps.aside").display()
+        );
+        let (_, mv_parent_ok) = run_sandboxed(&profile, &mv_parent);
+        fs::remove_file(&profile).ok();
+        assert!(
+            !mv_parent_ok,
+            "renaming intermediate ancestor of nested named_root must be denied"
+        );
+    }
 }

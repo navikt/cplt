@@ -2548,6 +2548,114 @@ fn write_granted_repos_messages(
     out
 }
 
+/// Direct child git repositories inside `project_dir` when `project_dir` is
+/// itself a git repository and the children are not registered in `named_roots`
+/// (`sandbox.repo_dirs` / `--repo-dir`).
+///
+/// In a nested "agent-repo" layout (an outer git checkout containing sibling
+/// service checkouts in subdirectories), the outer repository's `.gitignore`
+/// typically ignores the child checkouts. That hides their files from `@`
+/// file-picker autocomplete in the agent, leaves their `.git` directories
+/// outside the session's `git push -u` / `gh` scope, and leaves their `.git`
+/// persistence paths unpinned unless they are named in `sandbox.repo_dirs`.
+///
+/// Uses `symlink_metadata` throughout so symlinks in an untrusted project tree
+/// are never followed.
+fn unlinked_child_repos(project_dir: &Path, named_roots: &[PathBuf]) -> Vec<PathBuf> {
+    const SCAN_LIMIT: usize = 256;
+    let is_plain_git_marker = |dir: &Path| {
+        std::fs::symlink_metadata(dir.join(".git")).is_ok_and(|m| m.is_dir() || m.is_file())
+    };
+    if !is_plain_git_marker(project_dir) {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(project_dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten().take(SCAN_LIMIT) {
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if !ft.is_dir() {
+            // Skip files and symlinks (`FileType::is_dir` on a `DirEntry` does
+            // not follow symlinks).
+            continue;
+        }
+        let name = entry.file_name();
+        if name.as_os_str().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        if !is_plain_git_marker(&path) {
+            continue;
+        }
+        let already_named = named_roots.iter().any(|n| {
+            n == &path
+                || (std::fs::canonicalize(&path)
+                    .ok()
+                    .zip(std::fs::canonicalize(n).ok())
+                    .is_some_and(|(a, b)| a == b))
+        });
+        if !already_named {
+            out.push(path);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Sanitize a path's final component for terminal display so an untrusted
+/// directory name cannot inject control characters or ANSI sequences.
+fn sanitize_repo_dir_name(path: &Path) -> String {
+    let raw = path
+        .file_name()
+        .map_or_else(|| path.to_string_lossy(), |n| n.to_string_lossy());
+    raw.chars()
+        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+        .collect()
+}
+
+/// The messages [`warn_unlinked_child_repos`] prints; `doctor` reports the same.
+fn unlinked_child_repos_messages(project_dir: &Path, named_roots: &[PathBuf]) -> Vec<String> {
+    const LIST_LIMIT: usize = 5;
+    let repos = unlinked_child_repos(project_dir, named_roots);
+    if repos.is_empty() {
+        return Vec::new();
+    }
+    let shown = repos.len().min(LIST_LIMIT);
+    let mut names = repos
+        .iter()
+        .take(shown)
+        .map(|r| sanitize_repo_dir_name(r))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if repos.len() > shown {
+        use std::fmt::Write as _;
+        let _ = write!(names, " and {} more", repos.len() - shown);
+    }
+    let first_name = sanitize_repo_dir_name(&repos[0]);
+    let noun = if repos.len() == 1 {
+        "nested git repository"
+    } else {
+        "nested git repositories"
+    };
+    vec![format!(
+        "Project directory contains {noun} not linked in `sandbox.repo_dirs`: {names}. \
+         Unlinked child repos are hidden from `@` file autocomplete when gitignored by the \
+         parent repo, and their `.git/config` is not in session scope for `git push -u` or \
+         `gh`. Link {} with `cplt config set --local sandbox.repo_dirs {first_name}` \
+         (or pass `--repo-dir {first_name}`).",
+        if repos.len() == 1 { "it" } else { "each repo" }
+    )]
+}
+
+fn warn_unlinked_child_repos(project_dir: &Path, named_roots: &[PathBuf]) {
+    for message in unlinked_child_repos_messages(project_dir, named_roots) {
+        ui::warn(&message);
+    }
+}
+
 /// Load config, merge CLI flags, resolve paths, detect agent, print info messages.
 fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContext> {
     // Canonicalize CLI paths for consistency with config path handling
@@ -4487,6 +4595,9 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     warn_write_granted_repos(&resolved, &project_dir, &repo_paths);
     warn_repo_under_no_exec_cache(&resolved, &home_dir, &project_dir, &repo_paths);
     warn_inject_token_without_guard(&resolved, active_agent);
+    if !resolved.quiet {
+        warn_unlinked_child_repos(&project_dir, &repo_paths);
+    }
 
     // Probe the host for everything the sandbox profile depends on.
     let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
@@ -4758,7 +4869,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     };
 
     // Build agent args: extra args (e.g. --no-auto-update) + forwarded convenience flags + explicit -- args
-    let copilot_args = build_copilot_args(&cli, &active_agent);
+    let copilot_args = build_copilot_args(&cli, &active_agent, &repo_paths);
 
     // Run agent inside sandbox, wrapped in the post-session audit lifecycle.
     // The audit is on by default and suppressed by --no-audit or --quiet. The
@@ -4864,14 +4975,19 @@ fn main() -> ExitCode {
 
 /// Build the argument vector for the agent binary.
 /// Prepends agent-specific args (e.g. --no-auto-update for Copilot),
-/// then forwarded convenience flags, then explicit -- args.
-fn build_copilot_args(cli: &Cli, agent: &agent::Agent) -> Vec<String> {
+/// then multi-repo workspace roots (--add-dir), then forwarded convenience flags,
+/// then explicit -- args.
+fn build_copilot_args(cli: &Cli, agent: &agent::Agent, repo_dirs: &[PathBuf]) -> Vec<String> {
     let mut args = Vec::new();
 
     // Agent-specific args (e.g. --no-auto-update for Copilot)
     for extra in agent.extra_args() {
         args.push((*extra).to_string());
     }
+
+    // Register linked repositories (`--repo-dir` / `sandbox.repo_dirs`) as
+    // additional workspace roots for agents that support `--add-dir`.
+    args.extend(agent.repo_dir_args(repo_dirs));
 
     // Translate cplt's session-management convenience flags (--resume,
     // --continue, --remote, --name) into the agent's native flags. Unsupported
@@ -5329,6 +5445,19 @@ const UPSTREAM_DROPPED_QUIET_NOTICE: &str = concat!(
     "outside the sandbox."
 );
 
+/// The same note when the push runs in a repository outside session scope (e.g.
+/// an unlinked child repository inside the project directory). The parent only
+/// applies recorded upstreams to the launch repository and `--repo-dir` roots,
+/// so claiming the upstream was recorded here would be false.
+const UPSTREAM_UNLINKED_NOTICE: &str = concat!(
+    "cplt: pushing without -u, because .git/config is read-only in the sandbox. ",
+    "This repository is not a linked session root (`--repo-dir` / `sandbox.repo_dirs`), ",
+    "so cplt will not write its .git/config when the session ends. Name the branch on ",
+    "later pushes (`git push origin HEAD:<branch>`), link the repo with ",
+    "`cplt config set --local sandbox.repo_dirs <dir>`, or run ",
+    "`git branch -u origin/<branch>` outside the sandbox."
+);
+
 /// The note printed for such a command.
 const TRACKING_DROPPED_NOTICE: &str = concat!(
     "cplt: this records branch tracking in .git/config, which the sandbox denies. ",
@@ -5368,7 +5497,9 @@ fn decide_git_gate(
     ) {
         Ok(()) => match push_without_upstream(args) {
             Some(args) => GateEffect::ExecWithout {
-                notice: if std::env::var_os(sandbox::SCRATCH_DIR_ENV).is_some() {
+                notice: if !repo_facts.is_in_scope(&arg_refs, Some(real_git)) {
+                    UPSTREAM_UNLINKED_NOTICE
+                } else if std::env::var_os(sandbox::SCRATCH_DIR_ENV).is_some() {
                     UPSTREAM_DROPPED_NOTICE
                 } else {
                     UPSTREAM_DROPPED_QUIET_NOTICE
@@ -5417,10 +5548,12 @@ fn run_git_gate(
         real_git,
         repo_facts,
     );
-    // Only a stripped `-u` (macOS) is recorded: the parent sets the upstream
-    // after the session if the push qualifies (see cplt::upstream). The
-    // variable is set only when the parent will do that.
-    if let GateEffect::ExecWithout { .. } = &effect
+    // Only a stripped `-u` (macOS) in a repository in session scope is
+    // recorded: the parent sets the upstream after the session if the push
+    // qualifies (see cplt::upstream). The variable is set only when the parent
+    // will do that.
+    if let GateEffect::ExecWithout { notice, .. } = &effect
+        && notice == UPSTREAM_DROPPED_NOTICE
         && let Some(scratch) = std::env::var_os(sandbox::SCRATCH_DIR_ENV)
         && let Ok(cwd) = std::env::current_dir()
     {
@@ -8291,6 +8424,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
             &project_dir,
             &repo_paths,
         ))
+        .chain(unlinked_child_repos_messages(&project_dir, &repo_paths))
     {
         findings.push(Finding::warning(message, None));
     }
@@ -12726,14 +12860,14 @@ mod tests {
     #[test]
     fn copilot_auto_resume_when_no_args() {
         let cli = parse(&[]);
-        let args = build_copilot_args(&cli, &agent::Agent::Copilot);
+        let args = build_copilot_args(&cli, &agent::Agent::Copilot, &[]);
         assert_eq!(args, vec!["--no-auto-update", "--resume"]);
     }
 
     #[test]
     fn no_forwarded_flags() {
         let cli = parse(&["--", "-p", "fix tests"]);
-        let args = build_copilot_args(&cli, &agent::Agent::Copilot);
+        let args = build_copilot_args(&cli, &agent::Agent::Copilot, &[]);
         // --no-auto-update is injected as Copilot extra arg; no auto-resume (has args)
         assert_eq!(args, vec!["--no-auto-update", "-p", "fix tests"]);
     }
@@ -12741,28 +12875,28 @@ mod tests {
     #[test]
     fn resume_interactive() {
         let cli = parse(&["--resume"]);
-        let args = build_copilot_args(&cli, &agent::Agent::Copilot);
+        let args = build_copilot_args(&cli, &agent::Agent::Copilot, &[]);
         assert_eq!(args, vec!["--no-auto-update", "--resume"]);
     }
 
     #[test]
     fn resume_with_session_name() {
         let cli = parse(&["--resume=my-task"]);
-        let args = build_copilot_args(&cli, &agent::Agent::Copilot);
+        let args = build_copilot_args(&cli, &agent::Agent::Copilot, &[]);
         assert_eq!(args, vec!["--no-auto-update", "--resume=my-task"]);
     }
 
     #[test]
     fn continue_session() {
         let cli = parse(&["--continue"]);
-        let args = build_copilot_args(&cli, &agent::Agent::Copilot);
+        let args = build_copilot_args(&cli, &agent::Agent::Copilot, &[]);
         assert_eq!(args, vec!["--no-auto-update", "--continue"]);
     }
 
     #[test]
     fn remote_flag() {
         let cli = parse(&["--remote"]);
-        let args = build_copilot_args(&cli, &agent::Agent::Copilot);
+        let args = build_copilot_args(&cli, &agent::Agent::Copilot, &[]);
         // --remote with no explicit args: auto-resume is also injected
         assert_eq!(args, vec!["--no-auto-update", "--remote", "--resume"]);
     }
@@ -12770,14 +12904,14 @@ mod tests {
     #[test]
     fn name_session() {
         let cli = parse(&["--name", "my-refactor"]);
-        let args = build_copilot_args(&cli, &agent::Agent::Copilot);
+        let args = build_copilot_args(&cli, &agent::Agent::Copilot, &[]);
         assert_eq!(args, vec!["--no-auto-update", "--name", "my-refactor"]);
     }
 
     #[test]
     fn combined_forwarded_and_passthrough() {
         let cli = parse(&["--remote", "--name", "task", "--", "-p", "fix tests"]);
-        let args = build_copilot_args(&cli, &agent::Agent::Copilot);
+        let args = build_copilot_args(&cli, &agent::Agent::Copilot, &[]);
         assert_eq!(
             args,
             vec![
@@ -12841,7 +12975,7 @@ mod tests {
     #[test]
     fn forwarded_flags_prepended_before_passthrough() {
         let cli = parse(&["--resume=s1", "--remote", "--", "--other"]);
-        let args = build_copilot_args(&cli, &agent::Agent::Copilot);
+        let args = build_copilot_args(&cli, &agent::Agent::Copilot, &[]);
         assert_eq!(
             args,
             vec!["--no-auto-update", "--remote", "--resume=s1", "--other"]
@@ -12852,29 +12986,29 @@ mod tests {
     fn opencode_maps_session_flags() {
         // Bare --resume maps to opencode's --continue; --remote is dropped.
         let cli = parse(&["--resume", "--remote", "--", "-p", "fix"]);
-        let args = build_copilot_args(&cli, &agent::Agent::OpenCode);
+        let args = build_copilot_args(&cli, &agent::Agent::OpenCode, &[]);
         assert_eq!(args, vec!["--continue", "-p", "fix"]);
     }
 
     #[test]
     fn opencode_continue_and_session() {
         let cli = parse(&["--continue"]);
-        let args = build_copilot_args(&cli, &agent::Agent::OpenCode);
+        let args = build_copilot_args(&cli, &agent::Agent::OpenCode, &[]);
         assert_eq!(args, vec!["--continue"]);
 
         let cli = parse(&["--resume=sess-7"]);
-        let args = build_copilot_args(&cli, &agent::Agent::OpenCode);
+        let args = build_copilot_args(&cli, &agent::Agent::OpenCode, &[]);
         assert_eq!(args, vec!["--session", "sess-7"]);
     }
 
     #[test]
     fn antigravity_maps_session_flags() {
         let cli = parse(&["--continue"]);
-        let args = build_copilot_args(&cli, &agent::Agent::Antigravity);
+        let args = build_copilot_args(&cli, &agent::Agent::Antigravity, &[]);
         assert_eq!(args, vec!["--continue"]);
 
         let cli = parse(&["--resume=conv-9", "--", "-p", "fix"]);
-        let args = build_copilot_args(&cli, &agent::Agent::Antigravity);
+        let args = build_copilot_args(&cli, &agent::Agent::Antigravity, &[]);
         assert_eq!(args, vec!["--conversation", "conv-9", "-p", "fix"]);
     }
 
@@ -12882,8 +13016,36 @@ mod tests {
     fn opencode_no_auto_resume() {
         // OpenCode is not in the auto-resume set: no args means no injected flags.
         let cli = parse(&[]);
-        let args = build_copilot_args(&cli, &agent::Agent::OpenCode);
+        let args = build_copilot_args(&cli, &agent::Agent::OpenCode, &[]);
         assert!(args.is_empty());
+    }
+
+    #[test]
+    fn repo_dirs_forwarded_as_add_dir_without_disabling_auto_resume() {
+        let cli = parse(&[]);
+        let repo_dirs = vec![PathBuf::from("/work/sub-a"), PathBuf::from("/work/sub-b")];
+        let copilot_args = build_copilot_args(&cli, &agent::Agent::Copilot, &repo_dirs);
+        assert_eq!(
+            copilot_args,
+            vec![
+                "--no-auto-update",
+                "--add-dir",
+                "/work/sub-a",
+                "--add-dir",
+                "/work/sub-b",
+                "--resume"
+            ]
+        );
+
+        let claude_args = build_copilot_args(&cli, &agent::Agent::Claude, &repo_dirs);
+        assert_eq!(
+            claude_args,
+            vec!["--add-dir", "/work/sub-a", "--add-dir", "/work/sub-b"]
+        );
+
+        // Agents without an additional-workspace flag receive no extra args.
+        let opencode_args = build_copilot_args(&cli, &agent::Agent::OpenCode, &repo_dirs);
+        assert!(opencode_args.is_empty());
     }
 
     // ── `cplt exec` binary resolution (`redirect_to_guard_shim`) ──────────
@@ -13685,7 +13847,7 @@ mod tests {
     #[test]
     fn opencode_passthrough_only() {
         let cli = parse(&["--", "run", "fix tests"]);
-        let args = build_copilot_args(&cli, &agent::Agent::OpenCode);
+        let args = build_copilot_args(&cli, &agent::Agent::OpenCode, &[]);
         assert_eq!(args, vec!["run", "fix tests"]);
     }
 
@@ -15321,5 +15483,97 @@ mod tests {
         assert_eq!(v["state"], "none");
         assert_eq!(v["proposed"], serde_json::json!([]));
         assert_eq!(v["command"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn unlinked_child_repos_detects_plain_child_repos_and_ignores_symlinks() {
+        let (_g, project) = canonical_tempdir();
+        std::fs::create_dir_all(project.join("sak/.git")).unwrap();
+        std::fs::create_dir_all(project.join("frontend/.git")).unwrap();
+
+        // When project_dir itself is not a git repo, no nested-repo warning is emitted.
+        assert!(unlinked_child_repos(&project, &[]).is_empty());
+
+        // Once project_dir is a git repo, direct child repos are detected.
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        let found = unlinked_child_repos(&project, &[]);
+        assert_eq!(found, vec![project.join("frontend"), project.join("sak")]);
+
+        // Symlinked child directory or symlinked .git marker is ignored.
+        let (_g2, outside) = canonical_tempdir();
+        std::fs::create_dir_all(outside.join(".git")).unwrap();
+        std::os::unix::fs::symlink(&outside, project.join("symlink-dir")).unwrap();
+        std::fs::create_dir_all(project.join("symlink-git")).unwrap();
+        std::os::unix::fs::symlink(outside.join(".git"), project.join("symlink-git/.git")).unwrap();
+        let found_with_symlinks = unlinked_child_repos(&project, &[]);
+        assert_eq!(
+            found_with_symlinks,
+            vec![project.join("frontend"), project.join("sak")]
+        );
+
+        // Naming a child repo in `named_roots` removes it from the unlinked list.
+        let remaining = unlinked_child_repos(&project, &[project.join("sak")]);
+        assert_eq!(remaining, vec![project.join("frontend")]);
+        let msgs = unlinked_child_repos_messages(&project, &[project.join("sak")]);
+        assert_eq!(msgs.len(), 1);
+        assert!(
+            msgs[0].contains("cplt config set --local sandbox.repo_dirs frontend"),
+            "unexpected message: {}",
+            msgs[0]
+        );
+    }
+
+    #[test]
+    fn sanitize_repo_dir_name_replaces_control_characters() {
+        let p = Path::new("/tmp/evil\x1b[31m\nrepo");
+        let sanitized = sanitize_repo_dir_name(p);
+        assert!(!sanitized.chars().any(char::is_control));
+        assert_eq!(sanitized, "evil\u{fffd}[31m\u{fffd}repo");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn decide_git_gate_emits_unlinked_notice_for_push_u_outside_session_scope() {
+        let (_g, outer) = canonical_tempdir();
+        let inner = outer.join("child");
+        std::fs::create_dir_all(&inner).unwrap();
+        git_in(&outer, &["init", "--quiet"]);
+        git_in(&inner, &["init", "--quiet"]);
+
+        let real_git = cplt::git::trusted_git().expect("trusted git");
+        let facts = gh_proxy::RepoFacts {
+            project_dir: outer.to_string_lossy().into_owned(),
+            git_common_dir: outer.join(".git").to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+
+        // Pushing with `-u` targeting the unlinked child repo (`-C child`) must
+        // strip `-u` and emit UPSTREAM_UNLINKED_NOTICE instead of promising to
+        // record the upstream.
+        let args = vec![
+            "-C".to_string(),
+            inner.to_string_lossy().into_owned(),
+            "push".to_string(),
+            "-u".to_string(),
+            "origin".to_string(),
+            "feature-x".to_string(),
+        ];
+        let effect = decide_git_gate(
+            &args,
+            config::EnforcementMode::Block,
+            false,
+            true,
+            true,
+            &[],
+            real_git,
+            &facts,
+        );
+        match effect {
+            GateEffect::ExecWithout { notice, args } => {
+                assert_eq!(notice, UPSTREAM_UNLINKED_NOTICE);
+                assert!(!args.iter().any(|a| a == "-u"));
+            }
+            other => panic!("expected ExecWithout, got {other:?}"),
+        }
     }
 }

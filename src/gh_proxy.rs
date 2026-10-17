@@ -3730,12 +3730,7 @@ pub fn gate_git(
             // said the rules fell back to matching by URL alone. The condition
             // here and the one that warns at launch are now each other's
             // negation.
-            let scope_known = !repo_facts.git_common_dir.is_empty()
-                || repo_facts
-                    .named
-                    .iter()
-                    .any(|n| !n.git_common_dir.is_empty());
-            let in_scope = !scope_known || repo_facts.describes(&repo_args, real_git);
+            let in_scope = repo_facts.is_in_scope(args, real_git);
             let authorized = in_scope
                 && match push_target_branches(push_args, real_git, &repo_args) {
                     PushTargets::Branches(branches) if !branches.is_empty() => {
@@ -4399,6 +4394,21 @@ impl RepoFacts {
     /// Whether the push runs in a repository this session has in scope.
     fn describes(&self, repo_args: &[&str], real_git: Option<&Path>) -> bool {
         self.target(repo_args, real_git).is_some()
+    }
+
+    /// Whether a `git` command (`args` starting after the binary name) runs in
+    /// a repository this session has in scope. Returns `true` when no scope
+    /// facts were captured at launch so callers degrade gracefully when parent
+    /// git is unavailable.
+    pub fn is_in_scope(&self, args: &[&str], real_git: Option<&Path>) -> bool {
+        let scope_known = !self.git_common_dir.is_empty()
+            || self.named.iter().any(|n| !n.git_common_dir.is_empty());
+        if !scope_known {
+            return true;
+        }
+        let i = git_subcommand_index(args).unwrap_or(args.len());
+        let repo_args = repo_target_args(&args[..i]);
+        self.describes(&repo_args, real_git)
     }
 
     fn describes_self(&self, repo_args: &[&str], real_git: Option<&Path>) -> bool {

@@ -1261,6 +1261,33 @@ impl Agent {
         args
     }
 
+    /// Additional workspace roots (`--repo-dir` / `sandbox.repo_dirs`) translated
+    /// into the agent's native multi-root workspace flags.
+    ///
+    /// Both Copilot CLI and Claude Code index only their launch directory for `@`
+    /// file mentions and `AGENTS.md` / `CLAUDE.md` discovery unless additional
+    /// directories are registered via `--add-dir <dir>`. Passing `repo_dirs` here
+    /// keeps the agent's workspace view aligned with the repositories `cplt`
+    /// granted read/write/exec and guard scope to.
+    pub fn repo_dir_args(&self, repo_dirs: &[PathBuf]) -> Vec<String> {
+        match self {
+            Agent::Copilot | Agent::Claude => {
+                let mut args = Vec::with_capacity(repo_dirs.len() * 2);
+                for dir in repo_dirs {
+                    args.push("--add-dir".to_string());
+                    args.push(dir.to_string_lossy().into_owned());
+                }
+                args
+            }
+            Agent::OpenCode
+            | Agent::Antigravity
+            | Agent::Goose
+            | Agent::Dsh
+            | Agent::Pi
+            | Agent::Shell => Vec::new(),
+        }
+    }
+
     /// Whether this agent needs macOS Keychain access for auth tokens.
     ///
     /// Copilot stores GitHub auth tokens in the Keychain (`copilot-cli`).
