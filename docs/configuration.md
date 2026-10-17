@@ -104,12 +104,27 @@ A flag *adds to* the persisted set rather than replacing it, so a one-off
 **For a repository nested inside the project, it declares identity, not
 access.** A nested checkout already sits inside the project directory, so the
 agent could always read, write and build there — the project directory is
-granted as one subtree. What `--repo-dir` adds is that `gh` may target it:
-`gh pr create -R navikt/sykepenger-model` is allowed, the gh scope set includes
-it, and `GH_REPO` pinning accounts for it.
+granted as one subtree. What `--repo-dir` adds is that:
 
-It also decides what the post-session audit measures. Each named repository is
-audited on its own lines, against its own baseline:
+- **`gh` may target it:** `gh pr create -R navikt/sykepenger-model` is allowed,
+  the gh scope set includes it, and `GH_REPO` pinning accounts for it.
+- **The agent indexes it (`--add-dir`):** Copilot CLI and Claude Code receive
+  `--add-dir <dir>` for each additional repository, so `@` file autocomplete and
+  agent instruction discovery (`AGENTS.md`, `CLAUDE.md`) work even when the
+  nested directory is listed in the parent repository's `.gitignore`.
+- **`git push -u` upstreams are recorded at session exit:** Because `.git/config`
+  is read-only inside the sandbox, `cplt` strips `-u` / `--set-upstream` inside
+  the sandbox and applies `branch.<name>.remote` and `branch.<name>.merge` from
+  the parent process when the session ends — for every named repository, not only
+  the launch one.
+
+When an interactive launch finds immediate child git repositories inside the
+project directory that are not yet linked, `cplt` prints a startup hint naming
+the `cplt link` or `cplt config set --local sandbox.repo_dirs` command to bring
+them into scope.
+
+Naming a repository also decides what the post-session audit measures. Each
+named repository is audited on its own lines, against its own baseline:
 
 ```
 [cplt] Session ended (exit 0, 41s)
@@ -119,7 +134,7 @@ audited on its own lines, against its own baseline:
 [cplt]   src/Vedtaksperiode.kt  +4 -0
 ```
 
-That report is the reason to name a repository even when the agent could
+That report is another reason to name a repository even when the agent could
 already write to it. A checkout keeps its own git history, so the launch
 repository's `git status` sees it as a single entry — or, when it is
 gitignored, as nothing at all. Before it had a report of its own, a session
