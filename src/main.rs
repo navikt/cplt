@@ -2605,15 +2605,21 @@ fn unlinked_child_repos(project_dir: &Path, named_roots: &[PathBuf]) -> Vec<Path
     out
 }
 
+/// Sanitize text for terminal display so an untrusted directory name or path
+/// cannot inject control characters or ANSI sequences.
+fn sanitize_terminal_text(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+        .collect()
+}
+
 /// Sanitize a path's final component for terminal display so an untrusted
 /// directory name cannot inject control characters or ANSI sequences.
 fn sanitize_repo_dir_name(path: &Path) -> String {
     let raw = path
         .file_name()
         .map_or_else(|| path.to_string_lossy(), |n| n.to_string_lossy());
-    raw.chars()
-        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
-        .collect()
+    sanitize_terminal_text(&raw)
 }
 
 /// The messages [`warn_unlinked_child_repos`] prints; `doctor` reports the same.
@@ -2634,7 +2640,8 @@ fn unlinked_child_repos_messages(project_dir: &Path, named_roots: &[PathBuf]) ->
         use std::fmt::Write as _;
         let _ = write!(names, " and {} more", repos.len() - shown);
     }
-    let first_name = sh_quote(&sanitize_repo_dir_name(&repos[0]));
+    let first_path = sh_quote(&sanitize_terminal_text(&repos[0].to_string_lossy()));
+    let project_path = sh_quote(&sanitize_terminal_text(&project_dir.to_string_lossy()));
     let noun = if repos.len() == 1 {
         "nested git repository"
     } else {
@@ -2644,8 +2651,8 @@ fn unlinked_child_repos_messages(project_dir: &Path, named_roots: &[PathBuf]) ->
         "Project directory contains {noun} not linked in `sandbox.repo_dirs`: {names}. \
          Unlinked child repos are hidden from `@` file autocomplete when gitignored by the \
          parent repo, and their `.git/config` is not in session scope for `git push -u` or \
-         `gh`. Link {} with `cplt config set --local sandbox.repo_dirs {first_name}` \
-         (or pass `--repo-dir {first_name}`).",
+         `gh`. Link {} with `(cd {project_path} && cplt config set --local sandbox.repo_dirs {first_path})` \
+         (or pass `--repo-dir {first_path}`).",
         if repos.len() == 1 { "it" } else { "each repo" }
     )]
 }
@@ -4987,17 +4994,49 @@ fn build_copilot_args(cli: &Cli, agent: &agent::Agent, repo_dirs: &[PathBuf]) ->
 
     // Register linked repositories (`--repo-dir` / `sandbox.repo_dirs`) as
     // additional workspace roots for agents that support `--add-dir`.
-    args.extend(agent.repo_dir_args(repo_dirs));
+    let repo_dir_flags = agent.repo_dir_args(repo_dirs);
 
     // Translate cplt's session-management convenience flags (--resume,
     // --continue, --remote, --name) into the agent's native flags. Unsupported
     // flags are dropped per agent (see Agent::session_args).
-    args.extend(agent.session_args(
+    let session_flags = agent.session_args(
         cli.resume.as_deref(),
         cli.continue_session,
         cli.session_name.as_deref(),
         cli.remote,
-    ));
+    );
+
+    // Claude Code defines `--add-dir <directories...>` as a variadic Commander
+    // option, so any non-option token immediately following `--add-dir <dir>`
+    // is consumed as another directory rather than the positional prompt.
+    // When `session_flags` is empty and `cli.copilot_args` begins with a
+    // positional argument:
+    // - If `cli.copilot_args` contains no subsequent option flags, terminate
+    //   `--add-dir` with `--` before the positional prompt.
+    // - If `cli.copilot_args` also contains option flags (e.g.
+    //   `cplt --agent claude -- "prompt" --model sonnet`), emit the leading
+    //   positional arguments before `--add-dir` so `--` is not needed and the
+    //   trailing option flags stay options.
+    let claude_variadic_hazard = matches!(agent, agent::Agent::Claude)
+        && !repo_dir_flags.is_empty()
+        && session_flags.is_empty()
+        && cli
+            .copilot_args
+            .first()
+            .is_some_and(|a| !a.starts_with('-'));
+
+    if claude_variadic_hazard
+        && let Some(first_opt_idx) = cli.copilot_args.iter().position(|a| a.starts_with('-'))
+    {
+        args.extend(cli.copilot_args[..first_opt_idx].iter().cloned());
+        args.extend(repo_dir_flags);
+        args.extend(session_flags);
+        args.extend(cli.copilot_args[first_opt_idx..].iter().cloned());
+        return args;
+    }
+
+    args.extend(repo_dir_flags);
+    args.extend(session_flags);
 
     // Auto-resume: when no explicit args are given and no session flags are set,
     // default to --resume so the agent continues the previous session.
@@ -5009,6 +5048,9 @@ fn build_copilot_args(cli: &Cli, agent: &agent::Agent, repo_dirs: &[PathBuf]) ->
         args.push("--resume".into());
     }
 
+    if claude_variadic_hazard {
+        args.push("--".into());
+    }
     args.extend(cli.copilot_args.iter().cloned());
     args
 }
@@ -13048,6 +13090,63 @@ mod tests {
         assert!(opencode_args.is_empty());
     }
 
+    #[test]
+    fn claude_repo_dirs_preserve_positional_prompt_and_forwarded_options() {
+        let repo_dirs = vec![PathBuf::from("/work/sub-a")];
+
+        // A positional prompt immediately after `--` must be separated from
+        // Claude's variadic `--add-dir <directories...>` by `--` so Claude does
+        // not consume the prompt as a second directory.
+        let cli = parse(&["--", "explain this code"]);
+        assert_eq!(
+            build_copilot_args(&cli, &agent::Agent::Claude, &repo_dirs),
+            vec!["--add-dir", "/work/sub-a", "--", "explain this code"]
+        );
+
+        // Forwarded session flags (e.g. `--continue`) start with `-`, which
+        // terminates `--add-dir` on its own; `--continue` must remain an option
+        // rather than being pushed behind `--`.
+        let cli = parse(&["--continue", "--", "explain this code"]);
+        assert_eq!(
+            build_copilot_args(&cli, &agent::Agent::Claude, &repo_dirs),
+            vec![
+                "--add-dir",
+                "/work/sub-a",
+                "--continue",
+                "explain this code"
+            ]
+        );
+
+        // Passthrough options starting with `-` also terminate `--add-dir` and
+        // must remain options.
+        let cli = parse(&["--", "--model", "sonnet", "explain this code"]);
+        assert_eq!(
+            build_copilot_args(&cli, &agent::Agent::Claude, &repo_dirs),
+            vec![
+                "--add-dir",
+                "/work/sub-a",
+                "--model",
+                "sonnet",
+                "explain this code"
+            ]
+        );
+
+        // A positional prompt followed by passthrough options places the
+        // positional prompt before `--add-dir` so neither the prompt is
+        // consumed as a directory nor `--model` is turned into a positional arg.
+        let cli = parse(&["--", "explain this code", "--model", "sonnet"]);
+        assert_eq!(
+            build_copilot_args(&cli, &agent::Agent::Claude, &repo_dirs),
+            vec![
+                "explain this code",
+                "--add-dir",
+                "/work/sub-a",
+                "--model",
+                "sonnet"
+            ]
+        );
+    }
+
     // ── `cplt exec` binary resolution (`redirect_to_guard_shim`) ──────────
 
     /// GHSA-qcgr-j4mx-f92r: `cplt exec -- git push` executed the parent PATH's
@@ -15516,28 +15615,61 @@ mod tests {
         assert_eq!(remaining, vec![project.join("frontend")]);
         let msgs = unlinked_child_repos_messages(&project, &[project.join("sak")]);
         assert_eq!(msgs.len(), 1);
+        let expected_project = sh_quote(&project.to_string_lossy());
+        let expected_child = sh_quote(&project.join("frontend").to_string_lossy());
+        let expected_cmd = format!(
+            "(cd {expected_project} && cplt config set --local sandbox.repo_dirs {expected_child})"
+        );
+        let expected_flag = format!("--repo-dir {expected_child}");
         assert!(
-            msgs[0].contains("cplt config set --local sandbox.repo_dirs 'frontend'"),
-            "unexpected message: {}",
+            msgs[0].contains(&expected_cmd),
+            "expected `{expected_cmd}` in: {}",
             msgs[0]
         );
+        assert!(
+            msgs[0].contains(&expected_flag),
+            "expected `{expected_flag}` in: {}",
+            msgs[0]
+        );
+
+        // Whether launched from a nested subdirectory of the project or from
+        // outside via `--project-dir`, the suggested command cd's to the
+        // project root and passes the absolute child path so both work from
+        // the caller's shell cwd.
+        let subdir = project.join("src/nested");
+        std::fs::create_dir_all(&subdir).unwrap();
+        let (_g3, outside_cwd) = canonical_tempdir();
+        for launch_cwd in [&subdir, &outside_cwd] {
+            assert!(
+                launch_cwd.exists(),
+                "launch context {} must exist",
+                launch_cwd.display()
+            );
+            let ctx_msgs = unlinked_child_repos_messages(&project, &[project.join("sak")]);
+            assert_eq!(ctx_msgs, msgs);
+        }
     }
 
     #[test]
     fn unlinked_child_repos_messages_shell_quotes_hostile_directory_names() {
-        for (raw_name, expected_quoted) in [
-            ("my repo", "'my repo'"),
-            ("$(id)", "'$(id)'"),
-            ("it's-a-repo", "'it'\\''s-a-repo'"),
-        ] {
+        for raw_name in ["my repo", "$(id)", "it's-a-repo", "evil\x1b[31mrepo"] {
             let (_g, project) = canonical_tempdir();
             std::fs::create_dir_all(project.join(".git")).unwrap();
-            std::fs::create_dir_all(project.join(raw_name).join(".git")).unwrap();
+            let child = project.join(raw_name);
+            std::fs::create_dir_all(child.join(".git")).unwrap();
             let msgs = unlinked_child_repos_messages(&project, &[]);
             assert_eq!(msgs.len(), 1, "{raw_name}");
-            let expected_cmd =
-                format!("cplt config set --local sandbox.repo_dirs {expected_quoted}");
-            let expected_flag = format!("--repo-dir {expected_quoted}");
+            assert!(
+                !msgs[0].chars().any(char::is_control),
+                "control characters must be sanitized: {}",
+                msgs[0]
+            );
+            let expected_project = sh_quote(&sanitize_terminal_text(&project.to_string_lossy()));
+            let expected_child = sh_quote(&sanitize_terminal_text(&child.to_string_lossy()));
+            let expected_cmd = format!(
+                "(cd {expected_project} && cplt config set --local sandbox.repo_dirs {expected_child})"
+            );
+            let expected_flag = format!("--repo-dir {expected_child}");
             assert!(
                 msgs[0].contains(&expected_cmd),
                 "expected `{expected_cmd}` in: {}",

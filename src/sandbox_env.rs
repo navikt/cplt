@@ -248,6 +248,21 @@ pub fn build_sandbox_env(
         }
     }
 
+    // Claude Code only loads `CLAUDE.md` and `.claude/rules/` from `--add-dir`
+    // directories when `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1` is set
+    // in the environment. Inject it by default for Claude launches so linked
+    // repositories (`--repo-dir` / `sandbox.repo_dirs`) get their instructions
+    // loaded automatically unless the user explicitly set or denied the var.
+    if agent == Agent::Claude {
+        const VAR: &str = "CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD";
+        let user_set = extra_pass_env.iter().any(|v| v == VAR)
+            || parent_env.iter().any(|(k, v)| k == VAR && !v.is_empty());
+        if !user_set {
+            env.vars.retain(|(k, _)| k != VAR);
+            env.vars.push((VAR.to_string(), "1".to_string()));
+        }
+    }
+
     // Redirect temp directories to scratch dir if provided.
     // --scratch-dir means "redirect TMPDIR to the scratch dir" — this overrides any
     // inherited or allowlisted TMPDIR value. The user can prevent this for a specific
@@ -833,6 +848,35 @@ mod tests {
                 "--require \"/tmp/evil preload.js\" \"--require\" /tmp/other.js --no-warnings"
             ),
             "--no-warnings"
+        );
+    }
+
+    #[test]
+    fn claude_injects_additional_directories_claude_md_unless_overridden_or_denied() {
+        const VAR: &str = "CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD";
+        let env = build_sandbox_env(&[], &[], false, &[], None, None, Agent::Claude);
+        assert_eq!(
+            env.vars
+                .iter()
+                .find(|(k, _)| k == VAR)
+                .map(|(_, v)| v.as_str()),
+            Some("1")
+        );
+
+        // Non-Claude agents do not get the variable injected.
+        let copilot_env = build_sandbox_env(&[], &[], false, &[], None, None, Agent::Copilot);
+        assert!(!copilot_env.vars.iter().any(|(k, _)| k == VAR));
+
+        // Explicit user value (e.g. "0") is preserved.
+        let parent = vec![(VAR.to_string(), "0".to_string())];
+        let env_override = build_sandbox_env(&parent, &[], false, &[], None, None, Agent::Claude);
+        assert_eq!(
+            env_override
+                .vars
+                .iter()
+                .find(|(k, _)| k == VAR)
+                .map(|(_, v)| v.as_str()),
+            Some("0")
         );
     }
 }

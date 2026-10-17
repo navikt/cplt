@@ -1266,7 +1266,10 @@ impl Agent {
     ///
     /// Both Copilot CLI and Claude Code index only their launch directory for `@`
     /// file mentions and `AGENTS.md` / `CLAUDE.md` discovery unless additional
-    /// directories are registered via `--add-dir <dir>`. Passing `repo_dirs` here
+    /// directories are registered via `--add-dir <dir>` (with
+    /// `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1` set for Claude Code in
+    /// [`crate::sandbox::build_sandbox_env`] so `CLAUDE.md` and `.claude/rules/`
+    /// in added directories are loaded automatically). Passing `repo_dirs` here
     /// keeps the agent's workspace view aligned with the repositories `cplt`
     /// granted read/write/exec and guard scope to.
     pub fn repo_dir_args(&self, repo_dirs: &[PathBuf]) -> Vec<String> {
