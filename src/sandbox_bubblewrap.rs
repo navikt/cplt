@@ -3482,7 +3482,7 @@ mod tests {
             deep.as_path(),
             sibling.as_path(),
         ];
-        let pins = rename_pin_paths(&roots, &[], None, &[]);
+        let pins = rename_pin_paths(&roots, &[]);
         assert!(
             pins.contains(&direct),
             "nested direct child root must be pinned: {pins:?}"

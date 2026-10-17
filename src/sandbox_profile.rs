@@ -1321,9 +1321,8 @@ fn emit_git_persistence_denies(
         }
         let nr = Path::new(nr_str);
         let outer = project_roots
-            .first()
+            .iter()
             .map(Path::new)
-            .into_iter()
             .chain(extra_write.iter().map(PathBuf::as_path))
             .filter(|w| nr != *w && nr.starts_with(w))
             .min_by_key(|w| w.components().count());
@@ -6686,7 +6685,9 @@ mod tests {
         let direct_child = PathBuf::from("/projects/tilleggsstonader/sak");
         let deep_child = PathBuf::from("/projects/tilleggsstonader/apps/frontend");
         let sibling = PathBuf::from("/projects/other-repo");
-        let named = [direct_child, deep_child, sibling];
+        let outer_named = PathBuf::from("/work/outer");
+        let inner_named = PathBuf::from("/work/outer/apps/child");
+        let named = [direct_child, deep_child, sibling, outer_named, inner_named];
         let mut opts = test_options(project, home);
         opts.named_roots = &named;
         let profile = generate_profile(&opts, &[]);
@@ -6695,6 +6696,8 @@ mod tests {
             "/projects/tilleggsstonader/sak",
             "/projects/tilleggsstonader/apps/frontend",
             "/projects/tilleggsstonader/apps",
+            "/work/outer/apps/child",
+            "/work/outer/apps",
         ] {
             let rule = format!("(deny file-write-unlink (literal \"{pinned}\"))");
             assert!(
@@ -6702,9 +6705,13 @@ mod tests {
                 "nested named_root ancestor {pinned} must be pinned against rename:\n{profile}"
             );
         }
-        // Neither the outer project root nor a sibling outside the project gets a
-        // nested-root unlink pin.
-        for not_pinned in ["/projects/tilleggsstonader", "/projects/other-repo"] {
+        // Neither the outer project root, a sibling outside the project, nor an
+        // outer named root itself gets a nested-root unlink pin.
+        for not_pinned in [
+            "/projects/tilleggsstonader",
+            "/projects/other-repo",
+            "/work/outer",
+        ] {
             let rule = format!("(deny file-write-unlink (literal \"{not_pinned}\"))");
             assert!(
                 !profile.contains(&rule),

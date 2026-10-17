@@ -63,23 +63,46 @@ pub fn hint_for(argv: &[String]) -> String {
     .hint()
 }
 
-/// Gate side: the branch `HEAD` names *now*, while the push is being run,
-/// swapped into `argv`. Resolved here rather than at session end, so a later
-/// `git switch` cannot move the tracking onto a branch that was never pushed.
-/// The parent still re-checks the name like any other; this only fixes which
-/// branch is asked about. Unchanged when `HEAD` is detached or git fails.
+/// Gate side: fold a single leading `-C <dir>` (or `-C<dir>`) before `push`
+/// into `cwd` and strip it from `argv` so `git -C <linked_repo> push -u …`
+/// records the target repository's directory and a `push …` argv that [`parse`]
+/// accepts. Any other global flags are left untouched so [`parse`] rejects them.
 #[must_use]
-pub fn resolve_head(real_git: &Path, cwd: &Path, argv: &[String]) -> Vec<String> {
-    let mut argv = argv.to_vec();
+fn normalize_invocation(cwd: &Path, argv: &[String]) -> (PathBuf, Vec<String>) {
+    if let [flag, dir, rest @ ..] = argv
+        && flag == "-C"
+        && rest.first().is_some_and(|s| s == "push")
+    {
+        return (cwd.join(dir), rest.to_vec());
+    }
+    if let [flag, rest @ ..] = argv
+        && let Some(dir) = flag.strip_prefix("-C")
+        && !dir.is_empty()
+        && rest.first().is_some_and(|s| s == "push")
+    {
+        return (cwd.join(dir), rest.to_vec());
+    }
+    (cwd.to_path_buf(), argv.to_vec())
+}
+
+/// Gate side: the effective `(cwd, argv)` with a single leading `-C <dir>`
+/// folded into `cwd` and the branch `HEAD` names *now*, while the push is being
+/// run, swapped into `argv`. Resolved here rather than at session end, so a
+/// later `git switch` cannot move the tracking onto a branch that was never
+/// pushed. The parent still re-checks the name like any other; this only fixes
+/// which branch is asked about. Unchanged when `HEAD` is detached or git fails.
+#[must_use]
+pub fn resolve_head(real_git: &Path, cwd: &Path, argv: &[String]) -> (PathBuf, Vec<String>) {
+    let (cwd, mut argv) = normalize_invocation(cwd, argv);
     let Some((_, "HEAD")) = parse(&argv) else {
-        return argv;
+        return (cwd, argv);
     };
     // Runs inside the sandbox on the gate's already-resolved git binary, the
     // same way the gate's own probes do.
     #[allow(clippy::disallowed_methods)]
     let head = std::process::Command::new(real_git)
         .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .current_dir(cwd)
+        .current_dir(&cwd)
         .output()
         .ok()
         .filter(|o| o.status.success())
@@ -90,7 +113,7 @@ pub fn resolve_head(real_git: &Path, cwd: &Path, argv: &[String]) -> Vec<String>
     {
         argv[slot] = b;
     }
-    argv
+    (cwd, argv)
 }
 
 /// An upstream that passed every check.
@@ -607,17 +630,24 @@ mod tests {
         let git_bin = crate::git::trusted_git().unwrap();
         assert_eq!(
             resolve_head(git_bin, &repo, &argv("push -u origin HEAD")),
-            argv("push -u origin feat")
+            (repo.clone(), argv("push -u origin feat"))
+        );
+        // A single leading `-C <dir>` is folded into `cwd` and stripped from
+        // `argv` so `git -C <linked_repo> push -u` records the linked repo.
+        let parent = repo.parent().unwrap();
+        assert_eq!(
+            resolve_head(git_bin, parent, &argv("-C repo push -u origin HEAD")),
+            (parent.join("repo"), argv("push -u origin feat"))
         );
         // Only the exact shape, and only a branch: detached stays `HEAD`.
         assert_eq!(
             resolve_head(git_bin, &repo, &argv("push -u origin HEAD:x")),
-            argv("push -u origin HEAD:x")
+            (repo.clone(), argv("push -u origin HEAD:x"))
         );
         git(&repo, &["checkout", "-q", "--detach"]);
         assert_eq!(
             resolve_head(git_bin, &repo, &argv("push -u origin HEAD")),
-            argv("push -u origin HEAD")
+            (repo.clone(), argv("push -u origin HEAD"))
         );
     }
 

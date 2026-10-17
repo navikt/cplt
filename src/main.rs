@@ -2634,7 +2634,7 @@ fn unlinked_child_repos_messages(project_dir: &Path, named_roots: &[PathBuf]) ->
         use std::fmt::Write as _;
         let _ = write!(names, " and {} more", repos.len() - shown);
     }
-    let first_name = sanitize_repo_dir_name(&repos[0]);
+    let first_name = sh_quote(&sanitize_repo_dir_name(&repos[0]));
     let noun = if repos.len() == 1 {
         "nested git repository"
     } else {
@@ -5557,7 +5557,7 @@ fn run_git_gate(
         && let Some(scratch) = std::env::var_os(sandbox::SCRATCH_DIR_ENV)
         && let Ok(cwd) = std::env::current_dir()
     {
-        let argv = cplt::upstream::resolve_head(real_git, &cwd, args);
+        let (cwd, argv) = cplt::upstream::resolve_head(real_git, &cwd, args);
         if !cplt::upstream::record(Path::new(&scratch), &cwd, &argv) {
             // Said now, because the notice below promises an apply that
             // cannot happen without the entry.
@@ -15517,10 +15517,38 @@ mod tests {
         let msgs = unlinked_child_repos_messages(&project, &[project.join("sak")]);
         assert_eq!(msgs.len(), 1);
         assert!(
-            msgs[0].contains("cplt config set --local sandbox.repo_dirs frontend"),
+            msgs[0].contains("cplt config set --local sandbox.repo_dirs 'frontend'"),
             "unexpected message: {}",
             msgs[0]
         );
+    }
+
+    #[test]
+    fn unlinked_child_repos_messages_shell_quotes_hostile_directory_names() {
+        for (raw_name, expected_quoted) in [
+            ("my repo", "'my repo'"),
+            ("$(id)", "'$(id)'"),
+            ("it's-a-repo", "'it'\\''s-a-repo'"),
+        ] {
+            let (_g, project) = canonical_tempdir();
+            std::fs::create_dir_all(project.join(".git")).unwrap();
+            std::fs::create_dir_all(project.join(raw_name).join(".git")).unwrap();
+            let msgs = unlinked_child_repos_messages(&project, &[]);
+            assert_eq!(msgs.len(), 1, "{raw_name}");
+            let expected_cmd =
+                format!("cplt config set --local sandbox.repo_dirs {expected_quoted}");
+            let expected_flag = format!("--repo-dir {expected_quoted}");
+            assert!(
+                msgs[0].contains(&expected_cmd),
+                "expected `{expected_cmd}` in: {}",
+                msgs[0]
+            );
+            assert!(
+                msgs[0].contains(&expected_flag),
+                "expected `{expected_flag}` in: {}",
+                msgs[0]
+            );
+        }
     }
 
     #[test]
