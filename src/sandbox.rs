@@ -1922,7 +1922,14 @@ fn parse_copilot_user(v: &serde_json::Value) -> Option<String> {
 }
 
 fn parse_copilot_config_account(text: &str) -> CopilotConfigAccount {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+    // Copilot 1.0.101 writes `//` comment lines above the JSON. Drop whole
+    // comment lines only, so `//` inside values (https://) is untouched.
+    let text: String = text
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
         return CopilotConfigAccount::Ambiguous("Copilot config.json is malformed".to_string());
     };
     let Some(obj) = v.as_object() else {
@@ -6055,6 +6062,21 @@ mod account_tests {
             copilot_config_account(home.path()),
             CopilotConfigAccount::Ambiguous(_)
         ));
+    }
+
+    #[test]
+    fn copilot_config_with_comment_header_parses() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".copilot")).unwrap();
+        std::fs::write(
+            home.path().join(".copilot/config.json"),
+            "// User settings belong in settings.json.\n// This file is managed automatically.\n{\n  \"lastLoggedInUser\": {\"host\": \"https://github.com\", \"login\": \"alice\"}\n}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            copilot_config_account(home.path()),
+            CopilotConfigAccount::Selected("https://github.com:alice".to_string())
+        );
     }
 
     #[test]
