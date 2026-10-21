@@ -1951,7 +1951,7 @@ mod tests {
         ctx.allow_rootless_docker = true;
         let e = explain_exec(&["docker".into(), "ps".into()], &ctx);
         assert_eq!(e.decision, Decision::Allowed);
-        assert!(e.reason.contains("allow_rootless_docker"), "{}", e.reason);
+        assert!(e.reason.contains("allow_rootless_docker"));
     }
 
     #[test]

@@ -1124,7 +1124,10 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     };
     for path in docker_sockets {
         fs_rules.push(FsRule {
-            nofollow: false,
+            // A rootless entry lives in a dir the user owns, so a link there
+            // (`$XDG_RUNTIME_DIR/docker.sock -> /run/docker.sock`) swapped in
+            // after the policy was built must fail closed, not move the grant.
+            nofollow: docker == policy::DockerAccess::Rootless,
             path,
             access: FsAccess {
                 read: true,
@@ -3310,6 +3313,10 @@ mod tests {
         ] {
             assert!(!has(denied), "{} must not be granted", denied.display());
         }
+        assert!(
+            rule.nofollow,
+            "a rootless grant must not follow a link swapped in later"
+        );
     }
 
     /// `~/.testcontainers.properties` is read-only under `--allow-docker` (#209).

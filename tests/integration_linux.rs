@@ -1891,6 +1891,79 @@ else:
         );
     }
 
+    /// `--allow-rootless-docker` (#782) through the CLI and bubblewrap: the
+    /// rootless socket under `$XDG_RUNTIME_DIR` is masked by default and
+    /// reachable with the flag, while a colima socket (standing in for the
+    /// rootful endpoints, which a test cannot bind) stays masked. With
+    /// `--allow-docker` both are reachable. Both dirs sit under the real $HOME
+    /// because `build_deny_masks` skips /tmp.
+    #[test]
+    fn rootless_docker_exposes_only_the_rootless_socket() {
+        require_landlock!();
+        if !bwrap_available() {
+            assert!(
+                !require_sandbox_enforced(),
+                "Bubblewrap required by CPLT_TEST_REQUIRE_SANDBOX but unavailable"
+            );
+            eprintln!("SKIPPED: bwrap not available");
+            return;
+        }
+        if !have_python3() {
+            eprintln!("SKIPPED: python3 not available");
+            return;
+        }
+        let root = home_dir().join(format!(".cplt-test-rootless-{}", std::process::id()));
+        let xdg = root.join("xdg");
+        let colima_home = root.join("colima");
+        let colima_dir = colima_home.join("work");
+        if fs::create_dir_all(&xdg).is_err() || fs::create_dir_all(&colima_dir).is_err() {
+            eprintln!("SKIPPED: cannot create {}", root.display());
+            return;
+        }
+        let _cleanup = RemoveDirOnDrop(Some(root.clone()));
+        let rootless = OutsideSocket::bind_at(xdg.join("docker.sock"));
+        let rootful = OutsideSocket::bind_at(colima_dir.join("docker.sock"));
+        let rootless_str = rootless.path.to_string_lossy().into_owned();
+        let rootful_str = rootful.path.to_string_lossy().into_owned();
+        let project = create_test_project();
+        let env = [
+            ("XDG_RUNTIME_DIR", xdg.as_path()),
+            ("COLIMA_HOME", colima_home.as_path()),
+        ];
+        let script = format!(
+            "{}{}",
+            unix_connect_probe(&rootless_str),
+            unix_connect_probe(&rootful_str)
+        );
+        let run = |flags: &[&str]| {
+            let (_, out, err) = run_sandboxed_with_flags_env(project.path(), flags, &env, &script);
+            let lines: Vec<String> = out.lines().map(str::to_string).collect();
+            (lines, err)
+        };
+        let connected =
+            |lines: &[String], i: usize| lines.get(i).is_some_and(|l| l.contains("CONNECTED"));
+
+        let (off, off_err) = run(&["--use-bubblewrap"]);
+        assert!(
+            !connected(&off, 0) && !connected(&off, 1),
+            "default must mask both sockets: {off:?}\nstderr: {off_err}"
+        );
+        let (rl, rl_err) = run(&["--use-bubblewrap", "--allow-rootless-docker"]);
+        assert!(
+            connected(&rl, 0),
+            "--allow-rootless-docker must expose {rootless_str}: {rl:?}\nstderr: {rl_err}"
+        );
+        assert!(
+            !connected(&rl, 1),
+            "--allow-rootless-docker must keep {rootful_str} masked: {rl:?}\nstderr: {rl_err}"
+        );
+        let (all, all_err) = run(&["--use-bubblewrap", "--allow-docker"]);
+        assert!(
+            connected(&all, 0) && connected(&all, 1),
+            "--allow-docker must expose both: {all:?}\nstderr: {all_err}"
+        );
+    }
+
     #[test]
     fn abi_v9_gates_unix_socket_connect_without_bwrap() {
         // Kernel 7.1+ only. Deliberately NOT `require_landlock!(9)`: that

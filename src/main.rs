@@ -8358,7 +8358,13 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
             &home_dir,
             resolved.allow_docker,
             resolved.allow_rootless_docker,
-            bubblewrap.active() || sandbox::available_abi_version().is_some_and(|abi| abi >= 9),
+            // Doctor builds no deny masks of its own. A socket file is masked
+            // with the placeholder, which needs the scratch dir; a directory
+            // is masked by a tmpfs.
+            &|p: &Path| {
+                sandbox::available_abi_version().is_some_and(|abi| abi >= 9)
+                    || (bubblewrap.active() && (resolved.scratch_dir || p.is_dir()))
+            },
         ) {
             println!("             {line}");
         }

@@ -2246,6 +2246,26 @@ fn prepare_impl(
     })
 }
 
+/// The container-socket line for the launch banner and `cplt doctor` (#782):
+/// which rootless and rootful sockets exist and whether the agent reaches
+/// them. `blocked` answers per socket, from the masks actually emitted (or
+/// ABI v9), so a mask bubblewrap dropped is never reported as present.
+#[cfg(target_os = "linux")]
+pub fn container_socket_line(
+    home: &Path,
+    allow_docker: bool,
+    allow_rootless_docker: bool,
+    blocked: &dyn Fn(&Path) -> bool,
+) -> Option<String> {
+    policy::container_socket_line(
+        home,
+        policy::current_uid(),
+        policy::xdg_runtime_dir_env().as_deref(),
+        policy::DockerAccess::from_flags(allow_docker, allow_rootless_docker),
+        blocked,
+    )
+}
+
 /// Report which of the three UNIX-socket regimes this run lands in.
 ///
 /// Pathname UNIX sockets are the one part of the Linux policy where the
@@ -2261,35 +2281,23 @@ fn prepare_impl(
 /// Kernel 7.1 lands mid-2026, so the third row is the common case today and
 /// the message must not pretend otherwise. This mirrors the style of the other
 /// Linux enforceability notes above rather than adding a new surface.
-/// The container-socket line for the launch banner and `cplt doctor` (#782):
-/// which rootless and rootful sockets exist and whether the agent reaches
-/// them. `rootful_blocked` is true only under active bubblewrap or ABI v9.
 #[cfg(target_os = "linux")]
-pub fn container_socket_line(
-    home: &Path,
-    allow_docker: bool,
-    allow_rootless_docker: bool,
-    rootful_blocked: bool,
-) -> Option<String> {
-    policy::container_socket_line(
-        home,
-        policy::current_uid(),
-        policy::xdg_runtime_dir_env().as_deref(),
-        policy::DockerAccess::from_flags(allow_docker, allow_rootless_docker),
-        rootful_blocked,
-    )
-}
-
-#[cfg(target_os = "linux")]
-fn report_unix_socket_regime(config: &SandboxConfig, bwrap_active: bool, socket_masks: usize) {
+fn report_unix_socket_regime(
+    config: &SandboxConfig,
+    masks: Option<&bubblewrap::DenyMasks>,
+    socket_masks: usize,
+) {
     use landlock::ABI;
 
+    let bwrap_active = masks.is_some();
     let v9 = landlock_mod::check_availability().is_ok_and(|abi| abi >= ABI::V9);
+    let blocked =
+        |p: &Path| v9 || masks.is_some_and(|m| p.canonicalize().is_ok_and(|c| m.covers(&c)));
     if let Some(line) = container_socket_line(
         config.home_dir,
         config.allow_docker,
         config.allow_rootless_docker,
-        v9 || bwrap_active,
+        &blocked,
     ) {
         ui::info(&line);
     }
@@ -3078,7 +3086,7 @@ fn prepare_impl(
     // hole is closed (or that it is still open when it is not).
     report_unix_socket_regime(
         config,
-        bwrap_wrapper.is_some(),
+        bwrap_wrapper.is_some().then_some(&deny_masks),
         deny_masks.socket_mask_count(),
     );
 
