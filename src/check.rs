@@ -938,8 +938,9 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
         } else if ctx.allow_rootless_docker {
             ExecExplain {
                 decision: Decision::Allowed,
-                reason: "Rootless Docker/Podman access is enabled (allow_rootless_docker=on); \
-                         rootful daemon sockets stay masked."
+                reason: "Rootless Docker/Podman access is enabled (allow_rootless_docker=on). \
+                         Rootful daemon sockets are masked only under Bubblewrap or Landlock \
+                         ABI v9+; otherwise they stay reachable."
                     .to_string(),
                 fix: None,
                 objection: None,

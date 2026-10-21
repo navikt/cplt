@@ -1117,7 +1117,9 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     let xdg = policy::xdg_runtime_dir_env();
     let docker_sockets = match docker {
         policy::DockerAccess::All => policy::linux_docker_socket_paths(home, uid, xdg.as_deref()),
-        policy::DockerAccess::Rootless => policy::linux_rootless_socket_paths(uid, xdg.as_deref()),
+        policy::DockerAccess::Rootless => {
+            policy::linux_rootless_socket_paths(home, uid, xdg.as_deref())
+        }
         policy::DockerAccess::Off => Vec::new(),
     };
     for path in docker_sockets {

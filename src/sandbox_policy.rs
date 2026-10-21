@@ -721,7 +721,7 @@ pub fn socket_mask_paths(
     match docker {
         DockerAccess::Off => paths.extend(linux_docker_socket_paths(home, uid, xdg_runtime_dir)),
         DockerAccess::Rootless => {
-            let rootless = linux_rootless_socket_paths(uid, xdg_runtime_dir);
+            let rootless = linux_rootless_socket_paths(home, uid, xdg_runtime_dir);
             paths.extend(
                 linux_docker_socket_paths(home, uid, xdg_runtime_dir)
                     .into_iter()
@@ -773,7 +773,7 @@ pub fn container_socket_line(
     docker: DockerAccess,
     rootful_blocked: bool,
 ) -> Option<String> {
-    let rootless: Vec<PathBuf> = linux_rootless_socket_paths(uid, xdg_runtime_dir);
+    let rootless: Vec<PathBuf> = linux_rootless_socket_paths(home, uid, xdg_runtime_dir);
     let (mut exposed, mut rootful) = (Vec::new(), Vec::new());
     for p in linux_docker_socket_paths(home, uid, xdg_runtime_dir) {
         if !p.exists() {
@@ -817,11 +817,65 @@ pub fn container_socket_line(
 /// The rootless Docker/Podman endpoints: `docker.sock` and `podman/` in each
 /// runtime dir. Both daemons run as the user, so a container started through
 /// them has the user's rights and no more (#782).
-pub fn linux_rootless_socket_paths(uid: u32, xdg_runtime_dir: Option<&Path>) -> Vec<PathBuf> {
+///
+/// `$XDG_RUNTIME_DIR` comes from the environment, so `XDG_RUNTIME_DIR=/run`
+/// would otherwise make `/run/docker.sock` "rootless". Any entry that equals,
+/// contains or sits under a rootful, Docker Desktop or Colima endpoint is
+/// dropped, compared both lexically (with `..` resolved) and through
+/// symlinks (`/var/run -> /run`). A dropped entry stays masked.
+pub fn linux_rootless_socket_paths(
+    home: &Path,
+    uid: u32,
+    xdg_runtime_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    let forms = |p: &Path| {
+        let mut lexical = PathBuf::new();
+        for c in p.components() {
+            match c {
+                std::path::Component::ParentDir => {
+                    lexical.pop();
+                }
+                std::path::Component::CurDir => {}
+                c => lexical.push(c),
+            }
+        }
+        let resolved = crate::config::canonicalize_deepest(&lexical);
+        [lexical, resolved]
+    };
+    let fixed: Vec<PathBuf> = linux_fixed_docker_socket_paths(home, uid)
+        .iter()
+        .flat_map(|p| forms(p))
+        .collect();
+    runtime_dir_socket_paths(uid, xdg_runtime_dir)
+        .into_iter()
+        .filter(|r| {
+            !forms(r)
+                .iter()
+                .any(|r| fixed.iter().any(|f| r.starts_with(f) || f.starts_with(r)))
+        })
+        .collect()
+}
+
+/// `docker.sock` and `podman/` in every runtime dir, unfiltered: the mask list
+/// takes all of them, whatever `$XDG_RUNTIME_DIR` says.
+fn runtime_dir_socket_paths(uid: u32, xdg_runtime_dir: Option<&Path>) -> Vec<PathBuf> {
     linux_runtime_dirs(uid, xdg_runtime_dir)
         .iter()
         .flat_map(|d| [d.join("docker.sock"), d.join("podman")])
         .collect()
+}
+
+/// The endpoints that never count as rootless: the system daemons, Docker
+/// Desktop and Colima.
+fn linux_fixed_docker_socket_paths(home: &Path, uid: u32) -> Vec<PathBuf> {
+    let mut paths = vec![
+        PathBuf::from("/run/docker.sock"),
+        PathBuf::from("/var/run/docker.sock"),
+        PathBuf::from("/run/podman"),
+        home.join(".docker").join("desktop").join("docker.sock"),
+    ];
+    paths.extend(colima_socket_paths(home, uid));
+    paths
 }
 
 /// The runtime directories a session socket can live in: systemd's
@@ -907,7 +961,7 @@ pub fn linux_docker_socket_paths(
         PathBuf::from("/run/docker.sock"),
         PathBuf::from("/var/run/docker.sock"),
     ];
-    paths.extend(linux_rootless_socket_paths(uid, xdg_runtime_dir));
+    paths.extend(runtime_dir_socket_paths(uid, xdg_runtime_dir));
     paths.push(PathBuf::from("/run/podman"));
     paths.push(home.join(".docker").join("desktop").join("docker.sock"));
     paths.extend(colima_socket_paths(home, uid));
@@ -4396,7 +4450,7 @@ mod tests {
                 "{kept} must stay masked"
             );
         }
-        for lifted in linux_rootless_socket_paths(1000, Some(xdg)) {
+        for lifted in linux_rootless_socket_paths(home, 1000, Some(xdg)) {
             assert!(
                 !rootless.contains(&lifted),
                 "{} must be lifted",
@@ -4420,6 +4474,38 @@ mod tests {
 
     /// The banner must not claim rootful sockets are masked when nothing
     /// masks them (bubblewrap inactive, Landlock below ABI v9).
+    /// A hostile or odd `$XDG_RUNTIME_DIR` must not turn a rootful endpoint
+    /// into a "rootless" one: it stays masked and is never granted.
+    #[test]
+    fn rootless_sockets_never_include_a_rootful_endpoint() {
+        let home = tempfile::tempdir().unwrap();
+        let desktop = home.path().join(".docker/desktop");
+        let fixed = linux_fixed_docker_socket_paths(home.path(), 1000);
+        let link_dir = tempfile::tempdir().unwrap();
+        let link = link_dir.path().join("run");
+        std::os::unix::fs::symlink("/run", &link).unwrap();
+        let mut cases = vec![
+            Path::new("/run"),
+            Path::new("/var/run"),
+            Path::new("/run/user/../"),
+            desktop.as_path(),
+        ];
+        // Through a symlink: only resolvable where /run exists.
+        if Path::new("/run").exists() {
+            cases.push(link.as_path());
+        }
+        for xdg in cases {
+            let rootless = linux_rootless_socket_paths(home.path(), 1000, Some(xdg));
+            for f in &fixed {
+                assert!(!rootless.contains(f), "{xdg:?}: {f:?} granted as rootless");
+            }
+            let masks = socket_mask_paths(home.path(), 1000, Some(xdg), DockerAccess::Rootless);
+            for f in &fixed {
+                assert!(masks.contains(f), "{xdg:?}: {f:?} must stay masked");
+            }
+        }
+    }
+
     #[test]
     fn container_socket_line_never_claims_an_absent_mask() {
         let home = Path::new("/fake/user");

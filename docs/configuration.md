@@ -1029,6 +1029,8 @@ Keys not covered in a section above. `cplt config explain <key>` prints the same
 | Key | Default | What it does |
 |---|---|---|
 | `sandbox.allow_env_files` | `false` | Lets the agent read, write and delete `.env*`, `.pem` and `.key` files in the project. See [known impacts](known-impacts.md). |
+| `sandbox.allow_docker` ⚠️ | `false` | Grants the Docker/Podman/Colima/OrbStack daemon sockets and `~/.docker` read-only. Container mounts bypass the sandbox. See [known impacts](known-impacts.md#docker-and-testcontainers). |
+| `sandbox.allow_rootless_docker` ⚠️ | `false` | Linux only. Grants just the rootless sockets under `$XDG_RUNTIME_DIR` (`docker.sock`, `podman/`); rootful sockets stay masked, no `~/.docker`. A rootless container still runs as you, outside the sandbox. `allow_docker` wins if both are set. No effect on macOS. |
 | `sandbox.allow_lifecycle_scripts` ⚠️ | `false` | Lets npm, yarn and pnpm run lifecycle scripts (`postinstall`, `prepare` and so on). |
 | `sandbox.allow_tmp_exec` ⚠️ | `false` | Allows executing binaries from `/tmp` and `/var/folders`. The per-session scratch directory usually covers the same need. |
 | `sandbox.allow_gpg_signing` ⚠️ | `false` | Allows GPG commit and tag signing: read-only access to the public keyring and the GPG agent socket. Private keys stay denied. See [GPG commit signing](known-impacts.md#gpg-commit-signing). |
