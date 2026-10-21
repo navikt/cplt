@@ -1030,12 +1030,12 @@ The sandbox blocks some workflows on purpose. The common ones and their fixes:
 | Impact | Fix |
 |---|---|
 | `.env` files blocked | `cplt config set sandbox.allow_env_files true` |
-| npm postinstall hooks blocked | `cplt config set sandbox.allow_lifecycle_scripts true` |
-| `go test` / `mise run` blocked (temp exec) | The scratch dir is on by default. If you still need it, `cplt config set sandbox.allow_tmp_exec true` |
+| npm postinstall hooks blocked | `cplt config set sandbox.allow_lifecycle_scripts true --force` |
+| `go test` / `mise run` blocked (temp exec) | The scratch dir is on by default. If you still need it, `cplt config set sandbox.allow_tmp_exec true --force` |
 | Localhost connections blocked | `cplt config set allow.localhost 3000`, or `cplt config set sandbox.allow_localhost_any true` |
-| Docker blocked | `cplt config set sandbox.allow_docker true` ⚠️ (Linux, rootless Podman/Docker only: `sandbox.allow_rootless_docker`) |
+| Docker blocked | `cplt config set sandbox.allow_docker true --force` ⚠️ (Linux, rootless Podman/Docker only: `sandbox.allow_rootless_docker`) |
 | SSH fails (no key) | Use HTTPS remotes instead |
-| GPG signing disabled | `cplt config set sandbox.allow_gpg_signing true` |
+| GPG signing disabled | `cplt config set sandbox.allow_gpg_signing true --force` |
 | JVM MockK/Mockito fails | `cplt config set sandbox.allow_jvm_attach true` |
 | `dotnet build` MSBuild worker nodes blocked | `cplt config set sandbox.allow_msbuild true` |
 | Private registry creds blocked | `cplt config set allow.read "~/.m2/settings.xml"` |

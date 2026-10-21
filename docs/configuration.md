@@ -663,8 +663,8 @@ When your startup command gets long, move the repeated flags into config. Your p
 
 ```bash
 cplt config set sandbox.allow_localhost_any true  # tools that grab random localhost ports
-cplt config set sandbox.allow_docker true         # Gradle, Testcontainers, Docker
-cplt config set sandbox.allow_rootless_docker true  # Linux: rootless Podman/Docker only
+cplt config set sandbox.allow_docker true --force         # Gradle, Testcontainers, Docker
+cplt config set sandbox.allow_rootless_docker true --force  # Linux: rootless Podman/Docker only
 cplt config set sandbox.allow_jvm_attach true     # Gradle daemon, MockK, Mockito inline mocking
 cplt config set allow.read ~/code/work/.gitconfig-nav  # host files the agent should always read
 ```
@@ -853,7 +853,7 @@ cplt config hosts --agent copilot --json  # an agent's effective hosts (built-in
 Off by default. Marked dangerous. Config-only: there is no CLI flag, and `.cplt.toml` cannot set it.
 
 ```bash
-cplt config set sandbox.allow_build_credentials true
+cplt config set sandbox.allow_build_credentials true --force
 ```
 
 It grants read access to three files, and nothing else:

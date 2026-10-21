@@ -336,7 +336,7 @@ This stops supply chain attacks through postinstall hooks, but it may break pack
 **Fix:**
 
 ```bash
-cplt config set sandbox.allow_lifecycle_scripts true
+cplt config set sandbox.allow_lifecycle_scripts true --force
 ```
 
 Or for a single run: `cplt --allow-lifecycle-scripts -- -p "install dependencies"`
@@ -370,7 +370,7 @@ cplt --allow-localhost-any --allow-tmp-exec --allow-jvm-attach -- -p "run tests"
 
 # Or set permanently:
 cplt config set sandbox.allow_localhost_any true
-cplt config set sandbox.allow_tmp_exec true
+cplt config set sandbox.allow_tmp_exec true --force
 cplt config set sandbox.allow_jvm_attach true
 ```
 
@@ -746,7 +746,7 @@ Docker is **intentionally blocked**. `~/.docker` is denied, and on macOS the Doc
 **Opting in (⚠️ dangerous):** if you understand the risks (container mounts bypass the sandbox entirely), you can allow Docker access:
 
 ```bash
-cplt config set sandbox.allow_docker true
+cplt config set sandbox.allow_docker true --force
 # or per-session:
 cplt --allow-docker
 ```
@@ -754,7 +754,7 @@ cplt --allow-docker
 **Rootless Podman or Docker on Linux (⚠️ dangerous):** `sandbox.allow_rootless_docker` (`--allow-rootless-docker`) grants only the sockets under `$XDG_RUNTIME_DIR` (`docker.sock` and `podman/`). `/run/docker.sock`, `/var/run/docker.sock`, `/run/podman`, Docker Desktop and Colima stay masked, and `~/.docker` stays denied. Point the client at the socket with `DOCKER_HOST=unix://$XDG_RUNTIME_DIR/podman/podman.sock`. A rootless container still runs as you, outside the sandbox, and can mount your home directory. The rootful sockets are only masked when bubblewrap is active or Landlock is ABI v9 (kernel 7.1+); the launch banner says which. `allow_docker` wins if both are set. On macOS the key has no effect and warns.
 
 ```bash
-cplt config set sandbox.allow_rootless_docker true
+cplt config set sandbox.allow_rootless_docker true --force
 # or per-session:
 cplt --allow-rootless-docker
 ```
@@ -982,7 +982,7 @@ GPG commit and tag signing is **disabled by default** because `~/.gnupg` is bloc
 If you want Copilot commits signed, say because branch protection requires signatures:
 
 ```bash
-cplt config set sandbox.allow_gpg_signing true
+cplt config set sandbox.allow_gpg_signing true --force
 ```
 
 Or for a single run: `cplt --allow-gpg-signing`

@@ -51,7 +51,7 @@ No `open` process existed in either run. Separately, the profile's blanket `(all
 
 Both bypasses are one-liners for a hostile agent. A shim would stop an agent that types `open` politely and nothing else, so cplt does not ship one and does not describe this flag as scopable.
 
-**What to do instead.** Leave it off, which is the default. Sign in outside cplt or use an agent's device-code flow and open the URL yourself. Copilot supports `copilot login --device-code`; its default desktop login can launch a browser. If you enable this grant for a flow that needs it, restore the prior setting afterwards. `cplt config set sandbox.allow_browser true` is flagged dangerous and asks for confirmation, and `detect` never proposes it.
+**What to do instead.** Leave it off, which is the default. Sign in outside cplt or use an agent's device-code flow and open the URL yourself. Copilot supports `copilot login --device-code`; its default desktop login can launch a browser. If you enable this grant for a flow that needs it, restore the prior setting afterwards. `cplt config set sandbox.allow_browser true --force` is flagged dangerous and asks for confirmation, and `detect` never proposes it.
 
 ## Limitations
 
