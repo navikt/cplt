@@ -909,6 +909,21 @@ mod tests {
         assert!(!is_key_approved(&entry, "allow_docker"));
     }
 
+    /// An existing `allow_docker` approval does not cover the new rootless key,
+    /// and the other way round (#782).
+    #[test]
+    fn allow_docker_approval_does_not_cover_rootless_docker() {
+        let entry = TrustEntry {
+            accepted: AcceptedProposals {
+                keys: vec!["allow_docker".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(is_key_approved(&entry, "allow_docker"));
+        assert!(!is_key_approved(&entry, "allow_rootless_docker"));
+    }
+
     #[test]
     fn filter_approved_returns_intersection() {
         let entry = TrustEntry {
@@ -1087,6 +1102,7 @@ approved_at = "2026-05-01T12:00:00Z"
             allow_msbuild: _,
             gradle_init: _,
             allow_docker: _,
+            allow_rootless_docker: _,
             allow_tmp_exec: _,
             allow_gpg_signing: _,
             allow_lifecycle_scripts: _,
@@ -1135,6 +1151,13 @@ approved_at = "2026-05-01T12:00:00Z"
                 "allow_docker",
                 ProposeSection {
                     allow_docker: Some(true),
+                    ..Default::default()
+                },
+            ),
+            (
+                "allow_rootless_docker",
+                ProposeSection {
+                    allow_rootless_docker: Some(true),
                     ..Default::default()
                 },
             ),

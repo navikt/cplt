@@ -78,6 +78,7 @@ pub struct ProposeSection {
     /// through the same trust review as other sandbox relaxations.
     pub gradle_init: Option<bool>,
     pub allow_docker: Option<bool>,
+    pub allow_rootless_docker: Option<bool>,
     pub allow_tmp_exec: Option<bool>,
     pub allow_gpg_signing: Option<bool>,
     pub allow_lifecycle_scripts: Option<bool>,
@@ -156,6 +157,7 @@ impl ProposeSection {
             allow_msbuild: _,
             gradle_init: _,
             allow_docker: _,
+            allow_rootless_docker: _,
             allow_tmp_exec: _,
             allow_gpg_signing: _,
             allow_lifecycle_scripts: _,
@@ -856,6 +858,10 @@ pub const PROPOSE_COSTS: &[(&str, &str)] = &[
     (
         "allow_docker",
         "grants access to the Docker socket, effectively root on the host",
+    ),
+    (
+        "allow_rootless_docker",
+        "grants the rootless Docker/Podman sockets; a container runs as you, outside the sandbox",
     ),
     ("allow_tmp_exec", "allows code execution from /tmp"),
     (
@@ -1582,6 +1588,12 @@ allow_network = true
             ..Default::default()
         };
         assert_eq!(proposed_keys(&propose), vec!["allow_docker"]);
+
+        let rootless = ProposeSection {
+            allow_rootless_docker: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(proposed_keys(&rootless), vec!["allow_rootless_docker"]);
 
         // A file proposing ONLY guards puts nothing up for approval at all.
         let guards_only = ProposeSection {

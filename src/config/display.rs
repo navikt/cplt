@@ -584,6 +584,17 @@ pub fn display_config(loaded: Option<&LoadedConfig>, local: Option<&LoadedConfig
             src("sandbox", "allow_docker", c.sandbox.allow_docker.is_some())
         );
     }
+    if bools.allow_rootless_docker {
+        let red = ui::stdout_color(ui::RED);
+        println!(
+            "{blue}[cplt]{nc}    allow_rootless_docker = {red}true{nc} ⚠ DANGEROUS{}",
+            src(
+                "sandbox",
+                "allow_rootless_docker",
+                c.sandbox.allow_rootless_docker.is_some()
+            )
+        );
+    }
     let allow_tmp = bools.allow_tmp_exec;
     if allow_tmp {
         let red = ui::stdout_color(ui::RED);

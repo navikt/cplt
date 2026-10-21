@@ -502,6 +502,7 @@ impl Config {
         let deny_copilot_dir_exec = bools.deny_copilot_dir_exec;
 
         let allow_docker = bools.allow_docker;
+        let allow_rootless_docker = bools.allow_rootless_docker;
 
         let allow_tmp_exec = bools.allow_tmp_exec;
 
@@ -686,6 +687,7 @@ impl Config {
             refuse_invalid_repo_config,
             deny_copilot_dir_exec,
             allow_docker,
+            allow_rootless_docker,
             allow_tmp_exec,
             allow_cache_exec,
             allow_cache_exec_any,
@@ -1302,6 +1304,11 @@ impl Resolved {
             let red = ui::color(ui::RED);
             eprintln!(
                 "{blue}[cplt]{nc}    Docker:        {red}ALLOWED{nc}     {dim}⚠ container mounts bypass sandbox (--allow-docker){nc}"
+            );
+        } else if self.allow_rootless_docker {
+            let red = ui::color(ui::RED);
+            eprintln!(
+                "{blue}[cplt]{nc}    Docker:        {red}ROOTLESS{nc}    {dim}⚠ rootless containers run as you, outside the sandbox (--allow-rootless-docker){nc}"
             );
         }
         if self.allow_jvm_attach {

@@ -976,6 +976,7 @@ mod tests {
             allow_jvm_attach: false,
             gradle_init: false,
             allow_docker: false,
+            allow_rootless_docker: false,
             // #257 added this after this branch forked; the fixture is a
             // full literal, so every new field lands here.
             keychain_substitute: Some(false),

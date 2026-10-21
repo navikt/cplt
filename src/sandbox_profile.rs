@@ -4385,6 +4385,20 @@ mod tests {
         assert_eq!(profile(false), profile(true));
     }
 
+    /// `sandbox.allow_rootless_docker` is Linux-only (#782): it must not
+    /// widen the macOS profile.
+    #[test]
+    fn allow_rootless_docker_leaves_the_macos_profile_unchanged() {
+        let project = Path::new("/Users/test/repo");
+        let home = Path::new("/Users/test");
+        let profile = |on: bool| {
+            let mut opts = test_options(project, home);
+            opts.allow_rootless_docker = on;
+            generate_profile(&opts, &[])
+        };
+        assert_eq!(profile(false), profile(true));
+    }
+
     /// `--project-dir <subdir>` with `sandbox.agents_md`: the root AGENTS.md
     /// cplt writes is readable as one literal, and nothing else in the root
     /// is granted (#252). A refused path emits nothing.
@@ -4644,6 +4658,7 @@ mod tests {
             allow_jvm_attach: false,
             allow_msbuild: false,
             allow_docker: false,
+            allow_rootless_docker: false,
             electron_app_dir: None,
             agent: crate::agent::Agent::Copilot,
             agent_dirs: &[],

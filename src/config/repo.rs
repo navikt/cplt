@@ -100,6 +100,14 @@ pub static PROPOSE_BOOLS: &[ProposeBoolRow] = &[
         tighten_only: false,
     },
     ProposeBoolRow {
+        key: "allow_rootless_docker",
+        config_key: ("sandbox", "allow_rootless_docker"),
+        ladder_key: ("sandbox", "allow_rootless_docker"),
+        propose: |p| p.allow_rootless_docker,
+        apply: |r| r.allow_rootless_docker = true,
+        tighten_only: false,
+    },
+    ProposeBoolRow {
         key: "allow_tmp_exec",
         config_key: ("sandbox", "allow_tmp_exec"),
         ladder_key: ("sandbox", "allow_tmp_exec"),

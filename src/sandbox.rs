@@ -97,18 +97,19 @@ mod profile;
 
 pub use policy::{
     AppDir, AppDirKind, BUILD_CREDENTIAL_FILES, CPLT_STATE_DIR, CacheEnv, DENIED_DOTFILES,
-    DENIED_FILES, DENIED_HOME_SUBPATHS, ENV_ALLOWLIST, ENV_PREFIX_ALLOWLIST, EXEC_IN_WRITABLE,
-    ExecInWritable, HARDENING_ENV_VARS, HOME_TOOL_DIRS, HardeningCategory, HardeningEnvVar,
-    HomeToolDir, LinuxCoverage, PLAYWRIGHT_SOCKET_BASE_MAX_BYTES, PLAYWRIGHT_SOCKET_DIR_PREFIX,
-    PLAYWRIGHT_SOCKET_PATH_LIMIT, PLAYWRIGHT_SOCKET_ROOT, PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX,
-    PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir,
-    SENSITIVE_KEY_FILE_EXTENSION_PATTERNS, SENSITIVE_PROJECT_PATTERNS, TOOL_PATH_ENV_VARS,
-    TOOL_READ_DIRS, ToolPathEnvVar, ToolPathOverride, ToolRoot, active_tool_dirs, app_dirs,
-    build_credential_grants, copilot_default_pkg_dir, copilot_pkg_dir, copilot_pkg_dirs,
-    copilot_ro_protect_paths, credential_link_hop, current_uid, cypress_app_data_dir,
-    cypress_app_data_dir_with_env, cypress_runtime_intent, dir_overlaps_credentials,
-    exec_write_conflicts, first_party_read_target, home_config_link_targets, home_tool_dirs,
-    linux_docker_socket_paths, linux_runtime_dirs, mise_ro_protect_paths, nested_alternation,
+    DENIED_FILES, DENIED_HOME_SUBPATHS, DockerAccess, ENV_ALLOWLIST, ENV_PREFIX_ALLOWLIST,
+    EXEC_IN_WRITABLE, ExecInWritable, HARDENING_ENV_VARS, HOME_TOOL_DIRS, HardeningCategory,
+    HardeningEnvVar, HomeToolDir, LinuxCoverage, PLAYWRIGHT_SOCKET_BASE_MAX_BYTES,
+    PLAYWRIGHT_SOCKET_DIR_PREFIX, PLAYWRIGHT_SOCKET_PATH_LIMIT, PLAYWRIGHT_SOCKET_ROOT,
+    PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir,
+    Protected, ResolvedToolDir, SENSITIVE_KEY_FILE_EXTENSION_PATTERNS, SENSITIVE_PROJECT_PATTERNS,
+    TOOL_PATH_ENV_VARS, TOOL_READ_DIRS, ToolPathEnvVar, ToolPathOverride, ToolRoot,
+    active_tool_dirs, app_dirs, build_credential_grants, copilot_default_pkg_dir, copilot_pkg_dir,
+    copilot_pkg_dirs, copilot_ro_protect_paths, credential_link_hop, current_uid,
+    cypress_app_data_dir, cypress_app_data_dir_with_env, cypress_runtime_intent,
+    dir_overlaps_credentials, exec_write_conflicts, first_party_read_target,
+    home_config_link_targets, home_tool_dirs, linux_docker_socket_paths,
+    linux_rootless_socket_paths, linux_runtime_dirs, mise_ro_protect_paths, nested_alternation,
     no_cache_env, no_exec_temp_dir_over, no_exec_tool_dir_over, path_bin_dirs,
     playwright_runtime_intent, process_env, relocatable_tool_prefix, shim_ro_protect_paths,
     socket_mask_paths, tool_override_path_is_safe, tool_path_env_overrides,
@@ -264,6 +265,9 @@ pub struct SandboxConfig<'a> {
     pub allow_msbuild: bool,
     /// Allow Docker/Colima/OrbStack access (daemon socket + ~/.docker read).
     pub allow_docker: bool,
+    /// Allow only the rootless Docker/Podman sockets under `$XDG_RUNTIME_DIR`
+    /// (Linux only, #782). Ignored when `allow_docker` is set.
+    pub allow_rootless_docker: bool,
     /// Electron app bundle Contents directory (macOS only, ignored on Linux).
     pub electron_app_dir: Option<&'a Path>,
     /// Which AI coding agent is being sandboxed.
@@ -2257,11 +2261,39 @@ fn prepare_impl(
 /// Kernel 7.1 lands mid-2026, so the third row is the common case today and
 /// the message must not pretend otherwise. This mirrors the style of the other
 /// Linux enforceability notes above rather than adding a new surface.
+/// The container-socket line for the launch banner and `cplt doctor` (#782):
+/// which rootless and rootful sockets exist and whether the agent reaches
+/// them. `rootful_blocked` is true only under active bubblewrap or ABI v9.
 #[cfg(target_os = "linux")]
-fn report_unix_socket_regime(bwrap_active: bool, socket_masks: usize) {
+pub fn container_socket_line(
+    home: &Path,
+    allow_docker: bool,
+    allow_rootless_docker: bool,
+    rootful_blocked: bool,
+) -> Option<String> {
+    policy::container_socket_line(
+        home,
+        policy::current_uid(),
+        policy::xdg_runtime_dir_env().as_deref(),
+        policy::DockerAccess::from_flags(allow_docker, allow_rootless_docker),
+        rootful_blocked,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn report_unix_socket_regime(config: &SandboxConfig, bwrap_active: bool, socket_masks: usize) {
     use landlock::ABI;
 
-    if landlock_mod::check_availability().is_ok_and(|abi| abi >= ABI::V9) {
+    let v9 = landlock_mod::check_availability().is_ok_and(|abi| abi >= ABI::V9);
+    if let Some(line) = container_socket_line(
+        config.home_dir,
+        config.allow_docker,
+        config.allow_rootless_docker,
+        v9 || bwrap_active,
+    ) {
+        ui::info(&line);
+    }
+    if v9 {
         ui::info(
             "UNIX-socket connect is kernel-enforced (Landlock ABI v9+): the agent can \
              only reach sockets the policy grants.",
@@ -2649,7 +2681,7 @@ fn bwrap_plan(
         config.home_dir,
         policy::current_uid(),
         policy::xdg_runtime_dir_env().as_deref(),
-        config.allow_docker,
+        policy::DockerAccess::from_flags(config.allow_docker, config.allow_rootless_docker),
     )
     .into_iter()
     .filter(|p| p.exists())
@@ -2817,6 +2849,13 @@ fn prepare_impl(
              any registry credentials stored inline in config.json and, unlike macOS, \
              ~/.docker/trust/private: Landlock cannot deny a subpath of a granted \
              directory.",
+        );
+    } else if config.allow_rootless_docker {
+        ui::warn(
+            "--allow-rootless-docker on Linux grants the rootless Docker/Podman sockets \
+             under $XDG_RUNTIME_DIR. A rootless container runs as you, outside the \
+             sandbox, and can mount your home directory. Rootful sockets stay masked \
+             only where Bubblewrap is active or Landlock is ABI v9+.",
         );
     }
     // Finding 2: on Linux, allow_localhost_any drops EVERY Landlock TCP-connect
@@ -3037,7 +3076,11 @@ fn prepare_impl(
     // UNIX-socket reachability has three distinct regimes and they are not
     // interchangeable, so say which one this run is in rather than implying the
     // hole is closed (or that it is still open when it is not).
-    report_unix_socket_regime(bwrap_wrapper.is_some(), deny_masks.socket_mask_count());
+    report_unix_socket_regime(
+        config,
+        bwrap_wrapper.is_some(),
+        deny_masks.socket_mask_count(),
+    );
 
     if !config.extra_deny.is_empty() {
         if bwrap_wrapper.is_some() {
@@ -3443,6 +3486,7 @@ mod tests {
             allow_jvm_attach: false,
             allow_msbuild: false,
             allow_docker: false,
+            allow_rootless_docker: false,
             electron_app_dir: None,
             agent: Agent::Copilot,
             agent_dirs: &[],

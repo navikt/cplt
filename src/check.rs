@@ -664,6 +664,8 @@ fn random_port_advice(proxy_forced: bool) -> &'static str {
 /// The exec-relevant slice of the resolved policy, for [`explain_exec`].
 pub struct ExecContext<'a> {
     allow_docker: bool,
+    /// Linux only: a no-op on macOS, so it allows nothing there (#782).
+    allow_rootless_docker: bool,
     allow_tmp_exec: bool,
     gh_guard: &'a crate::config::GhGuardPolicy,
     git_guard: &'a crate::config::GitGuardPolicy,
@@ -729,6 +731,7 @@ impl<'a> ExecContext<'a> {
         }
         Self {
             allow_docker: resolved.allow_docker,
+            allow_rootless_docker: cfg!(target_os = "linux") && resolved.allow_rootless_docker,
             allow_tmp_exec: resolved.allow_tmp_exec,
             gh_guard: &resolved.gh_guard,
             git_guard: &resolved.git_guard,
@@ -929,6 +932,15 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
             ExecExplain {
                 decision: Decision::Allowed,
                 reason: "Docker access is enabled (allow_docker=on).".to_string(),
+                fix: None,
+                objection: None,
+            }
+        } else if ctx.allow_rootless_docker {
+            ExecExplain {
+                decision: Decision::Allowed,
+                reason: "Rootless Docker/Podman access is enabled (allow_rootless_docker=on); \
+                         rootful daemon sockets stay masked."
+                    .to_string(),
                 fix: None,
                 objection: None,
             }
@@ -1909,6 +1921,7 @@ mod tests {
         // what keeps `for_launch` the only way in from anywhere else.
         ExecContext {
             allow_docker,
+            allow_rootless_docker: false,
             allow_tmp_exec: false,
             gh_guard: gh,
             git_guard: git,
@@ -1927,6 +1940,17 @@ mod tests {
         let e = explain_exec(&["docker".into(), "ps".into()], &ctx);
         assert_eq!(e.decision, Decision::Blocked);
         assert!(e.fix.as_deref().unwrap().contains("--allow-docker"));
+    }
+
+    #[test]
+    fn docker_allowed_under_rootless_docker() {
+        let gh = GhGuardPolicy::default();
+        let git = GitGuardPolicy::default();
+        let mut ctx = exec_ctx(&gh, &git, false);
+        ctx.allow_rootless_docker = true;
+        let e = explain_exec(&["docker".into(), "ps".into()], &ctx);
+        assert_eq!(e.decision, Decision::Allowed);
+        assert!(e.reason.contains("allow_rootless_docker"), "{}", e.reason);
     }
 
     #[test]

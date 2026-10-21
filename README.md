@@ -1033,7 +1033,7 @@ The sandbox blocks some workflows on purpose. The common ones and their fixes:
 | npm postinstall hooks blocked | `cplt config set sandbox.allow_lifecycle_scripts true` |
 | `go test` / `mise run` blocked (temp exec) | The scratch dir is on by default. If you still need it, `cplt config set sandbox.allow_tmp_exec true` |
 | Localhost connections blocked | `cplt config set allow.localhost 3000`, or `cplt config set sandbox.allow_localhost_any true` |
-| Docker blocked | `cplt config set sandbox.allow_docker true` ⚠️ |
+| Docker blocked | `cplt config set sandbox.allow_docker true` ⚠️ (Linux, rootless Podman/Docker only: `sandbox.allow_rootless_docker`) |
 | SSH fails (no key) | Use HTTPS remotes instead |
 | GPG signing disabled | `cplt config set sandbox.allow_gpg_signing true` |
 | JVM MockK/Mockito fails | `cplt config set sandbox.allow_jvm_attach true` |

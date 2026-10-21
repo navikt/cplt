@@ -728,6 +728,10 @@ pub struct SandboxConfig {
     /// bypassing sandbox filesystem restrictions. Only enable if you trust the
     /// agent's container usage.
     pub allow_docker: Option<bool>,
+    /// Allow only the rootless Docker/Podman sockets under `$XDG_RUNTIME_DIR`
+    /// (default: false, Linux only, #782). DANGEROUS: a rootless container
+    /// runs as you, outside the sandbox. `allow_docker` wins if both are set.
+    pub allow_rootless_docker: Option<bool>,
     /// Allow process execution from system temp directories (default: false).
     /// DANGEROUS: re-enables exec from /private/tmp and /private/var/folders.
     pub allow_tmp_exec: Option<bool>,
@@ -1013,6 +1017,7 @@ pub struct Resolved {
     pub refuse_invalid_repo_config: bool,
     pub deny_copilot_dir_exec: bool,
     pub allow_docker: bool,
+    pub allow_rootless_docker: bool,
     pub allow_tmp_exec: bool,
     pub allow_cache_exec: Vec<String>,
     pub allow_cache_exec_any: bool,
@@ -1106,6 +1111,7 @@ pub struct CliFlags {
     pub allow_msbuild: bool,
     /// Preset-controlled toggle (see `allow_localhost_any`).
     pub allow_docker: FeatureToggle,
+    pub allow_rootless_docker: FeatureToggle,
     /// Preset-controlled toggle (see `allow_localhost_any`).
     pub allow_tmp_exec: FeatureToggle,
     pub allow_cache_exec: Vec<String>,

@@ -751,6 +751,14 @@ cplt config set sandbox.allow_docker true
 cplt --allow-docker
 ```
 
+**Rootless Podman or Docker on Linux (⚠️ dangerous):** `sandbox.allow_rootless_docker` (`--allow-rootless-docker`) grants only the sockets under `$XDG_RUNTIME_DIR` (`docker.sock` and `podman/`). `/run/docker.sock`, `/var/run/docker.sock`, `/run/podman`, Docker Desktop and Colima stay masked, and `~/.docker` stays denied. Point the client at the socket with `DOCKER_HOST=unix://$XDG_RUNTIME_DIR/podman/podman.sock`. A rootless container still runs as you, outside the sandbox, and can mount your home directory. The rootful sockets are only masked when bubblewrap is active or Landlock is ABI v9 (kernel 7.1+); the launch banner says which. `allow_docker` wins if both are set. On macOS the key has no effect and warns.
+
+```bash
+cplt config set sandbox.allow_rootless_docker true
+# or per-session:
+cplt --allow-rootless-docker
+```
+
 ## SSH agent blocking
 
 SSH agent access is blocked on macOS (the agent socket is not reachable — the profile's `(deny default)` covers `network-outbound` to unix sockets) and `SSH_AUTH_SOCK` is stripped from the environment on both platforms. `~/.ssh` is denied as well, so there is no key file to fall back on. Unless the agent reaches a loaded agent socket (possible on Linux, see the caveat below), this means:

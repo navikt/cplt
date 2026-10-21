@@ -842,6 +842,7 @@ fn landlock_policy_device_files_have_ioctl() {
         allow_jvm_attach: false,
         allow_msbuild: false,
         allow_docker: false,
+        allow_rootless_docker: false,
         electron_app_dir: None,
         agent: cplt::agent::Agent::Copilot,
         agent_dirs: &[],
@@ -2767,6 +2768,7 @@ fn base_profile_options() -> SandboxConfig<'static> {
         allow_jvm_attach: false,
         allow_msbuild: false,
         allow_docker: false,
+        allow_rootless_docker: false,
         electron_app_dir: None,
         agent: cplt::agent::Agent::Copilot,
         agent_dirs: &[],
@@ -4375,6 +4377,7 @@ fn allow_localhost_any_affects_both_backends() {
         allow_jvm_attach: false,
         allow_msbuild: false,
         allow_docker: false,
+        allow_rootless_docker: false,
         electron_app_dir: None,
         agent: cplt::agent::Agent::Copilot,
         agent_dirs: &[],
@@ -4445,6 +4448,7 @@ fn config_options_parity_across_backends() {
         allow_jvm_attach: true,
         allow_msbuild: false,
         allow_docker: false,
+        allow_rootless_docker: false,
         electron_app_dir: None,
         agent: cplt::agent::Agent::Copilot,
         agent_dirs: &[],
@@ -8351,6 +8355,7 @@ fn profile_docker_enabled_allows_config_and_sockets() {
     let p = generate_profile(
         &SandboxConfig {
             allow_docker: true,
+            allow_rootless_docker: false,
             ..base_profile_options()
         },
         &[],
@@ -8409,6 +8414,7 @@ fn profile_docker_withholds_the_overlapping_reallow() {
             managed_worktree_root: None,
             worktree_socket: None,
             allow_docker: true,
+            allow_rootless_docker: false,
             ..base_profile_options()
         },
         &[],
@@ -8448,6 +8454,7 @@ fn profile_docker_grants_running_colima_profiles_only_their_socket() {
             &SandboxConfig {
                 home_dir: home.path(),
                 allow_docker: true,
+                allow_rootless_docker: false,
                 ..base_profile_options()
             },
             &[],
@@ -8514,6 +8521,7 @@ fn profile_docker_testcontainers_properties_follows_safe_symlinks_only() {
                 &SandboxConfig {
                     home_dir: h,
                     allow_docker: true,
+                    allow_rootless_docker: false,
                     extra_deny: deny,
                     ..base_profile_options()
                 },
@@ -10132,6 +10140,7 @@ protect_pnpm_config = false
 refuse_invalid_repo_config = false
 deny_copilot_dir_exec = false
 allow_docker = false
+allow_rootless_docker = false
 allow_cache_exec = []
 allow_cache_exec_any = false
 allow_browser = false
@@ -10616,6 +10625,7 @@ fn landlock_relocated_cargo_bin_is_exec_only_and_registry_is_precreated() {
         allow_jvm_attach: false,
         allow_msbuild: false,
         allow_docker: false,
+        allow_rootless_docker: false,
         electron_app_dir: None,
         agent: cplt::agent::Agent::Copilot,
         agent_dirs: &[],
@@ -11147,8 +11157,12 @@ fn repo_config_state_not_a_git_repo() {
 
 #[test]
 fn socket_masks_cover_the_escape_sockets() {
-    let masks =
-        cplt::sandbox::socket_mask_paths(std::path::Path::new("/fake/user"), 1000, None, false);
+    let masks = cplt::sandbox::socket_mask_paths(
+        std::path::Path::new("/fake/user"),
+        1000,
+        None,
+        cplt::sandbox::DockerAccess::Off,
+    );
     for expected in [
         "/run/user/1000/bus",          // D-Bus session bus -> systemd-run --user
         "/run/user/1000/systemd",      // systemd's private socket
@@ -11193,8 +11207,12 @@ fn docker_socket_list_follows_the_home_dir() {
 
 #[test]
 fn allow_docker_lifts_only_the_container_masks() {
-    let with_docker =
-        cplt::sandbox::socket_mask_paths(std::path::Path::new("/fake/user"), 1000, None, true);
+    let with_docker = cplt::sandbox::socket_mask_paths(
+        std::path::Path::new("/fake/user"),
+        1000,
+        None,
+        cplt::sandbox::DockerAccess::All,
+    );
     let docker_paths =
         cplt::sandbox::linux_docker_socket_paths(std::path::Path::new("/fake/user"), 1000, None);
 
@@ -11221,8 +11239,13 @@ fn allow_docker_lifts_only_the_container_masks() {
     }
     assert_eq!(
         with_docker.len() + docker_paths.len(),
-        cplt::sandbox::socket_mask_paths(std::path::Path::new("/fake/user"), 1000, None, false)
-            .len(),
+        cplt::sandbox::socket_mask_paths(
+            std::path::Path::new("/fake/user"),
+            1000,
+            None,
+            cplt::sandbox::DockerAccess::Off
+        )
+        .len(),
         "allow_docker must differ from the default set by exactly the container sockets"
     );
 }
@@ -11241,7 +11264,7 @@ fn socket_masks_follow_a_relocated_xdg_runtime_dir() {
         std::path::Path::new("/fake/user"),
         1000,
         Some(xdg),
-        false,
+        cplt::sandbox::DockerAccess::Off,
     );
     for expected in [
         "/run/somewhere-else/1000/bus",
@@ -11272,7 +11295,7 @@ fn relative_xdg_runtime_dir_is_ignored() {
         std::path::Path::new("/fake/user"),
         1000,
         Some(std::path::Path::new("relative/dir")),
-        false,
+        cplt::sandbox::DockerAccess::Off,
     );
     assert!(
         !masks
@@ -11282,8 +11305,13 @@ fn relative_xdg_runtime_dir_is_ignored() {
     );
     assert_eq!(
         masks.len(),
-        cplt::sandbox::socket_mask_paths(std::path::Path::new("/fake/user"), 1000, None, false)
-            .len(),
+        cplt::sandbox::socket_mask_paths(
+            std::path::Path::new("/fake/user"),
+            1000,
+            None,
+            cplt::sandbox::DockerAccess::Off
+        )
+        .len(),
         "a rejected value must leave the list exactly as it was"
     );
 }
@@ -11292,8 +11320,12 @@ fn relative_xdg_runtime_dir_is_ignored() {
 fn socket_masks_follow_the_uid() {
     // The runtime-dir entries are per-user; a hardcoded uid would mask nothing
     // on any host but the developer's.
-    let masks =
-        cplt::sandbox::socket_mask_paths(std::path::Path::new("/fake/user"), 4242, None, false);
+    let masks = cplt::sandbox::socket_mask_paths(
+        std::path::Path::new("/fake/user"),
+        4242,
+        None,
+        cplt::sandbox::DockerAccess::Off,
+    );
     assert!(
         masks
             .iter()

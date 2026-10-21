@@ -429,6 +429,18 @@ that Docker volume mounts are an escape hatch from the sandbox."
     #[arg(long)]
     no_allow_docker: bool,
 
+    /// Linux only: allow just the rootless Docker/Podman sockets under
+    /// $XDG_RUNTIME_DIR, keeping /run/docker.sock and other rootful sockets
+    /// masked (DANGEROUS). A rootless container runs as you, outside the
+    /// sandbox, and can mount your home directory. No ~/.docker grant.
+    /// --allow-docker wins if both are set. No effect on macOS.
+    #[arg(long)]
+    allow_rootless_docker: bool,
+
+    /// Force rootless Docker access off, overriding a config value.
+    #[arg(long)]
+    no_allow_rootless_docker: bool,
+
     /// Allow process execution from system temp directories (DANGEROUS).
     /// Prefer --scratch-dir which creates a controlled executable temp dir.
     #[arg(
@@ -2888,6 +2900,10 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         allow_jvm_attach: cli.allow_jvm_attach,
         allow_msbuild: cli.allow_msbuild,
         allow_docker: config::FeatureToggle::from_pair(cli.allow_docker, cli.no_allow_docker),
+        allow_rootless_docker: config::FeatureToggle::from_pair(
+            cli.allow_rootless_docker,
+            cli.no_allow_rootless_docker,
+        ),
         allow_tmp_exec: config::FeatureToggle::from_pair(cli.allow_tmp_exec, cli.no_allow_tmp_exec),
         allow_cache_exec: cli.allow_cache_exec.clone(),
         allow_cache_exec_any: cli.allow_cache_exec_any,
@@ -6173,6 +6189,14 @@ fn assemble_sandbox(
              allow, not a rule of its own, so dropping it needs a separate check.",
         );
     }
+    #[cfg(target_os = "macos")]
+    if resolved.allow_rootless_docker && !resolved.allow_docker {
+        ui::warn(
+            "sandbox.allow_rootless_docker has no effect on macOS: Docker Desktop, \
+             Colima and OrbStack all run as you in a VM, so there is no rootful socket \
+             to keep masked. Container sockets stay denied; use --allow-docker for them.",
+        );
+    }
 
     if let Some((var, bad)) = agent::env_config_dir_on_credentials(active_agent, home_dir) {
         bail!(
@@ -6467,6 +6491,7 @@ fn build_sandbox_config<'a>(
         allow_jvm_attach: resolved.allow_jvm_attach,
         allow_msbuild: resolved.allow_msbuild,
         allow_docker: resolved.allow_docker,
+        allow_rootless_docker: resolved.allow_rootless_docker,
         electron_app_dir: session.electron_app_dir,
         agent,
         agent_dirs,
@@ -6603,6 +6628,10 @@ fn run_exec_command(
     if resolved.allow_docker {
         ui::warn(
             "exec: --allow-docker is active, so container volume mounts bypass sandbox filesystem restrictions",
+        );
+    } else if resolved.allow_rootless_docker {
+        ui::warn(
+            "exec: --allow-rootless-docker is active, so rootless container volume mounts bypass sandbox filesystem restrictions",
         );
     }
     if resolved.allow_tmp_exec {
@@ -8325,6 +8354,14 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
                  shims, Pi bin/, unix-socket masks)"
             );
         }
+        if let Some(line) = sandbox::container_socket_line(
+            &home_dir,
+            resolved.allow_docker,
+            resolved.allow_rootless_docker,
+            bubblewrap.active() || sandbox::available_abi_version().is_some_and(|abi| abi >= 9),
+        ) {
+            println!("             {line}");
+        }
         if resolved.use_bubblewrap == Some(true) && !bubblewrap.active() {
             findings.push(Finding::blocking(
                 format!(
@@ -8973,6 +9010,7 @@ fn display_repo_config(
             ("allow_msbuild", rc.propose.allow_msbuild),
             ("gradle_init", rc.propose.gradle_init),
             ("allow_docker", rc.propose.allow_docker),
+            ("allow_rootless_docker", rc.propose.allow_rootless_docker),
             ("allow_tmp_exec", rc.propose.allow_tmp_exec),
             ("allow_gpg_signing", rc.propose.allow_gpg_signing),
             (
@@ -12427,6 +12465,7 @@ mod tests {
             allow_jvm_attach: false,
             allow_msbuild: false,
             allow_docker: false,
+            allow_rootless_docker: false,
             electron_app_dir: None,
             agent: agent::Agent::Copilot,
             agent_dirs: &[],

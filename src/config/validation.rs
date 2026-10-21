@@ -302,6 +302,17 @@ pub fn validate_config(toml_text: &str) -> Vec<ConfigDiagnostic> {
             });
         }
         if sandbox
+            .get("allow_rootless_docker")
+            .and_then(toml::Value::as_bool)
+            == Some(true)
+        {
+            diagnostics.push(ConfigDiagnostic {
+                level: DiagnosticLevel::Warning,
+                message: "sandbox.allow_rootless_docker = true exposes the rootless Docker/Podman sockets; a container runs as you and its mounts bypass the sandbox (DANGEROUS)"
+                    .to_string(),
+            });
+        }
+        if sandbox
             .get("allow_lifecycle_scripts")
             .and_then(toml::Value::as_bool)
             == Some(true)

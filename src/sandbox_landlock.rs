@@ -1107,24 +1107,33 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     // writable+executable config dir would be a binary-drop path. Unlike
     // macOS there is no carve-out for `~/.docker/trust/private`: Landlock
     // cannot deny a subpath of a granted directory.
+    //
+    // `--allow-rootless-docker` (#782) grants only the rootless sockets under
+    // the runtime dirs: no rootful socket, no `~/.docker`, no Testcontainers
+    // config. Rootless Podman is reached through `DOCKER_HOST`.
+    let docker =
+        policy::DockerAccess::from_flags(config.allow_docker, config.allow_rootless_docker);
+    let uid = policy::current_uid();
+    let xdg = policy::xdg_runtime_dir_env();
+    let docker_sockets = match docker {
+        policy::DockerAccess::All => policy::linux_docker_socket_paths(home, uid, xdg.as_deref()),
+        policy::DockerAccess::Rootless => policy::linux_rootless_socket_paths(uid, xdg.as_deref()),
+        policy::DockerAccess::Off => Vec::new(),
+    };
+    for path in docker_sockets {
+        fs_rules.push(FsRule {
+            nofollow: false,
+            path,
+            access: FsAccess {
+                read: true,
+                write: true,
+                execute: false,
+                ioctl: false,
+                create_dirs: false,
+            },
+        });
+    }
     if config.allow_docker {
-        for path in policy::linux_docker_socket_paths(
-            home,
-            policy::current_uid(),
-            policy::xdg_runtime_dir_env().as_deref(),
-        ) {
-            fs_rules.push(FsRule {
-                nofollow: false,
-                path,
-                access: FsAccess {
-                    read: true,
-                    write: true,
-                    execute: false,
-                    ioctl: false,
-                    create_dirs: false,
-                },
-            });
-        }
         fs_rules.push(FsRule {
             nofollow: false,
             path: home.join(".docker"),
@@ -3089,6 +3098,7 @@ mod tests {
             allow_jvm_attach: false,
             allow_msbuild: false,
             allow_docker: false,
+            allow_rootless_docker: false,
             electron_app_dir: None,
             agent: crate::agent::Agent::Copilot,
             agent_dirs: &[],
@@ -3240,7 +3250,12 @@ mod tests {
         let (policy, masks) = temp_env::with_var("COLIMA_HOME", Some(colima_home.path()), || {
             let mut config = test_config(&project, home.path());
             config.allow_docker = true;
-            let masks = policy::socket_mask_paths(home.path(), policy::current_uid(), None, false);
+            let masks = policy::socket_mask_paths(
+                home.path(),
+                policy::current_uid(),
+                None,
+                policy::DockerAccess::Off,
+            );
             (generate_policy(&config), masks)
         });
 
@@ -3255,6 +3270,44 @@ mod tests {
             masks.contains(&sock),
             "without --allow-docker it must be masked"
         );
+    }
+
+    /// `--allow-rootless-docker` (#782) grants read+write on the runtime-dir
+    /// Podman/Docker sockets only: no rootful socket, no colima profile, no
+    /// `~/.docker`, no Testcontainers config.
+    #[test]
+    fn rootless_docker_grants_only_the_rootless_sockets() {
+        let project = PathBuf::from("/fake/user/project");
+        let home = tempfile::tempdir().unwrap();
+        let colima_home = tempfile::tempdir().unwrap();
+        let profile = colima_home.path().join("work");
+        std::fs::create_dir(&profile).unwrap();
+        let sock = profile.join("docker.sock");
+        let _l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+
+        let policy = temp_env::with_var("COLIMA_HOME", Some(colima_home.path()), || {
+            let mut config = test_config(&project, home.path());
+            config.allow_rootless_docker = true;
+            generate_policy(&config)
+        });
+        let has = |p: &Path| policy.fs_rules.iter().any(|r| r.path == p);
+
+        let podman = PathBuf::from(format!("/run/user/{}/podman", policy::current_uid()));
+        let rule = policy
+            .fs_rules
+            .iter()
+            .find(|r| r.path == podman)
+            .expect("the rootless podman dir should be granted");
+        assert!(rule.access.read && rule.access.write && !rule.access.execute);
+        for denied in [
+            Path::new("/run/podman"),
+            Path::new("/run/docker.sock"),
+            sock.as_path(),
+            &home.path().join(".docker"),
+            &home.path().join(".testcontainers.properties"),
+        ] {
+            assert!(!has(denied), "{} must not be granted", denied.display());
+        }
     }
 
     /// `~/.testcontainers.properties` is read-only under `--allow-docker` (#209).

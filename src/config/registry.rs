@@ -447,6 +447,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "sandbox",
+        key: "allow_rootless_docker",
+        value_type: ConfigValueType::Bool,
+        dangerous: true,
+        default_display: "false",
+        description: "⚠️  DANGEROUS: Linux only. Allow the rootless Docker/Podman sockets under $XDG_RUNTIME_DIR, keep the rootful ones masked. A rootless container runs as you, outside the sandbox. No ~/.docker grant. allow_docker wins if both are set. No effect on macOS.",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
         key: "allow_cache_exec",
         value_type: ConfigValueType::StrArray,
         dangerous: false,
@@ -1122,6 +1130,13 @@ bool_keys! {
         config = |c: &Config| c.sandbox.allow_docker,
         baseline = |b: PresetBaseline| b.allow_docker,
         resolved = |r: &Resolved| r.allow_docker;
+
+    /// Not in any preset (#782): full-trust already has `allow_docker`.
+    allow_rootless_docker, "sandbox", "allow_rootless_docker",
+        cli = |c: &CliFlags| c.allow_rootless_docker,
+        config = |c: &Config| c.sandbox.allow_rootless_docker,
+        baseline = |_: PresetBaseline| false,
+        resolved = |r: &Resolved| r.allow_rootless_docker;
 
     /// One-way: `--allow-cache-exec-any` only.
     allow_cache_exec_any, "sandbox", "allow_cache_exec_any",
