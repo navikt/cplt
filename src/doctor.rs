@@ -859,13 +859,12 @@ pub fn linux_keyring_finding(
                 "Native keyring access is not guaranteed in the sandbox; token handover is recommended. \
              Landlock below ABI v9 does not block pathname bus connections; active bubblewrap masks selected endpoints. The stored login was not checked.",
                 Some(
-                    "export a valid COPILOT_GITHUB_TOKEN, or clear COPILOT_GITHUB_TOKEN, GH_TOKEN \
-                 and GITHUB_TOKEN in a subshell and run `gh auth login --hostname github.com \
-                 --web` on the host (if ~/.copilot/config.json has a stored Copilot login, also \
-                 run `copilot logout` on the host so Copilot falls back to gh). The one-shot \
-                 cache needs gh_guard.enabled, scratch_dir and gh_guard.block_auth_token enabled, \
-                 with GH_TOKEN not denied; alternatively enable gh_guard.inject_token with \
-                 --force and leave a token variable permitted"
+                    "set gh_guard.inject_token = true (with --force) and leave a token variable \
+                 permitted, or export a valid COPILOT_GITHUB_TOKEN. cplt reads Copilot's own \
+                 keyring login with `secret-tool` on the host when it can; that failed here \
+                 (secret-tool missing, keyring locked, no stored item, or the account did not \
+                 match gh's). Copilot inside the sandbox then reports \"Saved sign-in could not \
+                 be read from credential storage\""
                         .to_string(),
                 ),
             )
@@ -1027,6 +1026,9 @@ pub fn auth_report(d: &AuthDecision<'_>, home: &Path) -> (Option<String>, String
             format!("`gh auth token` (passed as {var})")
         }
         Some(KeychainSubstitute::File(p)) => format!("{} (token file)", tilde(p, home)),
+        Some(KeychainSubstitute::SecretService(_)) => {
+            "Copilot's keyring login (read on the host, passed as COPILOT_GITHUB_TOKEN)".to_string()
+        }
         None => match d.env_token {
             Some(v) => format!("{v} (exported)"),
             None if d.macos && d.agent.needs_keychain() => {
@@ -1773,8 +1775,9 @@ mod tests {
                 .contains("active bubblewrap masks selected endpoints")
         );
         let fix = finding.fix.unwrap();
-        assert!(fix.contains("gh auth login --hostname github.com --web"));
-        assert!(fix.contains("one-shot cache"));
+        assert!(fix.contains("gh_guard.inject_token = true"));
+        assert!(fix.contains("Saved sign-in could not be read from credential storage"));
+        assert!(!fix.contains("copilot logout"));
         assert!(linux_keyring_finding(Agent::Copilot, false, true, false, false).is_none());
         assert!(linux_keyring_finding(Agent::Copilot, true, false, false, false).is_none());
         assert!(linux_keyring_finding(Agent::Copilot, true, true, true, false).is_none());

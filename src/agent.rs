@@ -946,6 +946,11 @@ pub enum KeychainSubstitute {
         var: &'static str,
         token: SecretToken,
     },
+    /// Copilot on Linux only: Copilot's own stored login, read on the host from
+    /// the Secret Service with `secret-tool` and set in the child as
+    /// `COPILOT_GITHUB_TOKEN` (#600). The sandbox masks the session bus, so
+    /// Copilot could not read it itself.
+    SecretService(SecretToken),
 }
 
 /// A token that never prints: `Debug` redacts it, and there is no `Display`.
@@ -977,6 +982,9 @@ impl KeychainSubstitute {
         match self {
             KeychainSubstitute::EnvVar(v) => std::env::var(v).ok().map(|val| (*v, val)),
             KeychainSubstitute::GhToken { var, token } => Some((var, token.expose().to_string())),
+            KeychainSubstitute::SecretService(token) => {
+                Some(("COPILOT_GITHUB_TOKEN", token.expose().to_string()))
+            }
             KeychainSubstitute::File(_) => None,
         }
     }
@@ -988,6 +996,9 @@ impl std::fmt::Display for KeychainSubstitute {
             KeychainSubstitute::EnvVar(v) => write!(f, "${v}"),
             KeychainSubstitute::File(p) => write!(f, "{}", p.display()),
             KeychainSubstitute::GhToken { var, .. } => write!(f, "gh's token as ${var}"),
+            KeychainSubstitute::SecretService(_) => {
+                write!(f, "Copilot's keyring login as $COPILOT_GITHUB_TOKEN")
+            }
         }
     }
 }

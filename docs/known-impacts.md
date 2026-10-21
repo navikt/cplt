@@ -121,8 +121,27 @@ An agent may report:
 ```
 
 That prompt alone does not establish whether the sandbox blocked the bus or
-why authentication failed. Recommended recovery for Copilot is to authenticate
-on the host and let cplt hand over the credential:
+why authentication failed.
+
+**Copilot's own keyring login.** Copilot 1.0.101 and later fail inside cplt
+with `Saved sign-in could not be read from credential storage` when the login
+is in the Secret Service and the sandbox masks the bus. With
+`sandbox.keychain_substitute` on (the default for Copilot), cplt reads that
+login on the host before launch and passes it to Copilot as
+`COPILOT_GITHUB_TOKEN`. It takes the account from `lastLoggedInUser` in
+`~/.copilot/config.json` and runs one
+`secret-tool lookup service copilot-cli username <host>:<login>`, capped at one
+second. cplt skips the lookup when a token variable is already exported, when
+`deny.env` strips `COPILOT_GITHUB_TOKEN`, and when the config names more than
+one account or an account other than gh's github.com login. The config file is
+writable from inside the sandbox, so it must not be able to pick another stored
+login. `secret-tool` comes from the `libsecret-tools` package and must be in a
+trusted bin directory such as `/usr/bin` (not `PATH`). `copilot logout` does not exist in
+current Copilot and does not help.
+
+If the lookup finds nothing (no `secret-tool`, a locked keyring, no stored item
+or an account mismatch), `cplt doctor` warns, and the fallback for Copilot is
+to authenticate on the host and let cplt hand over gh's credential:
 
 ```bash
 gh auth login --hostname github.com              # outside cplt, once

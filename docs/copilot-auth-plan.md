@@ -26,7 +26,7 @@
 1. Read `~/.copilot/config.json` with `untrusted::read_untrusted` so a planted symlink, FIFO, or oversized file in `~/.copilot` never blocks or leaks host files.
 2. Resolve the active Copilot account from `lastLoggedInUser` and `loggedInUsers` by reading `host` and `login`. Refuse substitution when `lastLoggedInUser` is missing from a non-empty `loggedInUsers` list or when multiple accounts exist without `lastLoggedInUser`.
 3. On macOS, `keychain_substitute` checks only host Keychain item attributes (`copilot-cli`) against `gh`'s `github.com` login when deciding whether to keep the `~/Library/Keychains` grant, because `~/.copilot/config.json` is writable inside the sandbox. The P2 host resolver will use `~/.copilot/config.json` to select the exact Keychain item without restoring the Keychain grant on ambiguity or mismatch.
-4. On Linux, treat a native stored login in `~/.copilot/config.json` as requiring an injected environment token or `copilot logout` on the host, because Copilot queries Secret Service before falling back to `gh auth token`.
+4. On Linux, read a native stored login named in `~/.copilot/config.json` from the Secret Service on the host (`secret-tool lookup service copilot-cli username <host>:<login>`) and pass it as `COPILOT_GITHUB_TOKEN` (#600). When that fails, fall back to `gh_guard.inject_token`; `copilot logout` does not exist in current Copilot.
 
 ## Verification split
 

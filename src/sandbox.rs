@@ -1814,6 +1814,20 @@ pub fn keychain_substitute(
     deny_env: &[String],
     setting: Option<bool>,
 ) -> Option<crate::agent::KeychainSubstitute> {
+    if cfg!(target_os = "linux") {
+        return secret_service_substitute(
+            agent,
+            home,
+            deny_env,
+            keychain_substitute_enabled(agent, setting),
+            || {
+                exec::gh_hosts_yml()
+                    .and_then(|p| crate::agent::read_small_regular_file(&p))
+                    .and_then(|s| gh_login(&s))
+            },
+            secret_tool_lookup,
+        );
+    }
     keychain_substitute_with(
         agent,
         home,
@@ -2128,6 +2142,69 @@ pub(crate) fn keychain_substitute_with(
         var,
         token: crate::agent::SecretToken::new(extract()?),
     })
+}
+
+/// Linux, Copilot only (#600): Copilot's own login from the Secret Service,
+/// read on the host because the sandbox masks the session bus. Skipped when a
+/// token variable already reaches Copilot (it wins over the keyring), when
+/// `COPILOT_GITHUB_TOKEN` is denied, and when `~/.copilot/config.json` names no
+/// single account or one that differs from gh's: that file is writable inside
+/// the sandbox, so it must not pick another stored login. Any failure keeps
+/// today's behaviour; `cplt doctor` names the fix.
+pub(crate) fn secret_service_substitute(
+    agent: Agent,
+    home: &Path,
+    deny_env: &[String],
+    enabled: bool,
+    gh: impl FnOnce() -> Option<String>,
+    lookup: impl FnOnce(&str) -> Option<String>,
+) -> Option<crate::agent::KeychainSubstitute> {
+    if !enabled || agent != Agent::Copilot {
+        return None;
+    }
+    let permitted = |v: &&&str| !deny_env.iter().any(|d| d == **v);
+    if !permitted(&&"COPILOT_GITHUB_TOKEN")
+        || agent
+            .keychain_substitute_env_vars()
+            .iter()
+            .filter(permitted)
+            .any(|v| std::env::var(v).is_ok_and(|t| !t.trim().is_empty()))
+    {
+        return None;
+    }
+    let CopilotConfigAccount::Selected(acct) = copilot_config_account(home) else {
+        return None;
+    };
+    if account_mismatch(gh().as_deref(), Some(&acct)).is_some() {
+        return None;
+    }
+    let token = lookup(&acct)?;
+    let token = token.trim();
+    (!token.is_empty() && !token.chars().any(char::is_control)).then(|| {
+        crate::agent::KeychainSubstitute::SecretService(crate::agent::SecretToken::new(
+            token.to_string(),
+        ))
+    })
+}
+
+/// `secret-tool` arguments for Copilot's item: `service=copilot-cli`,
+/// `username=<host>:<login>` (probed on Copilot 1.0.26 and 1.0.101, #600).
+fn secret_tool_args(acct: &str) -> [&str; 5] {
+    ["lookup", "service", "copilot-cli", "username", acct]
+}
+
+/// One `secret-tool lookup` from a trusted bin dir, no shell, 1 s cap. A
+/// locked keyring may wait on an unlock prompt; the cap kills it.
+fn secret_tool_lookup(acct: &str) -> Option<String> {
+    let bin = crate::git::TRUSTED_BIN_DIRS
+        .iter()
+        .map(|d| Path::new(d).join("secret-tool"))
+        .find(|p| crate::git::is_executable_file(p))?;
+    #[allow(clippy::disallowed_methods)] // absolute path from a trusted bin dir
+    let mut cmd = std::process::Command::new(bin);
+    cmd.args(secret_tool_args(acct));
+    let out = exec::bounded_stdout(cmd, std::time::Duration::from_secs(1))?;
+    String::from_utf8(out).ok()
 }
 
 /// Human-readable representation of the sandbox policy.
@@ -5809,7 +5886,8 @@ mod tests {
 mod account_tests {
     use super::{
         COPILOT_CONFIG_LIMIT, CopilotConfigAccount, account_mismatch, copilot_config_account,
-        copilot_has_native_login, gh_login, keychain_acct,
+        copilot_has_native_login, gh_login, keychain_acct, secret_service_substitute,
+        secret_tool_args,
     };
 
     #[test]
@@ -5977,5 +6055,96 @@ mod account_tests {
             copilot_config_account(home.path()),
             CopilotConfigAccount::Ambiguous(_)
         ));
+    }
+
+    #[test]
+    fn secret_tool_args_name_copilots_item() {
+        assert_eq!(
+            secret_tool_args("https://github.com:alice"),
+            [
+                "lookup",
+                "service",
+                "copilot-cli",
+                "username",
+                "https://github.com:alice"
+            ]
+        );
+    }
+
+    #[test]
+    fn secret_service_substitute_paths() {
+        use crate::agent::{Agent, KeychainSubstitute};
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".copilot")).unwrap();
+        let cfg = home.path().join(".copilot/config.json");
+        std::fs::write(
+            &cfg,
+            r#"{"lastLoggedInUser":{"host":"https://github.com/","login":"alice"}}"#,
+        )
+        .unwrap();
+        let h = home.path();
+        let alice = || Some("alice".to_string());
+        let ok = |acct: &str| {
+            assert_eq!(acct, "https://github.com:alice");
+            Some("gho_x\n".to_string())
+        };
+        let never = |_: &str| -> Option<String> { panic!("lookup must not run") };
+        let vars = [
+            ("COPILOT_GITHUB_TOKEN", None::<&str>),
+            ("GH_TOKEN", None),
+            ("GITHUB_TOKEN", None),
+        ];
+        temp_env::with_vars(vars, || {
+            // Happy path: token trimmed, set as COPILOT_GITHUB_TOKEN.
+            let sub = secret_service_substitute(Agent::Copilot, h, &[], true, alice, ok).unwrap();
+            assert_eq!(
+                sub.env_value(),
+                Some(("COPILOT_GITHUB_TOKEN", "gho_x".to_string()))
+            );
+            assert!(matches!(sub, KeychainSubstitute::SecretService(_)));
+            assert!(!format!("{sub:?}{sub}").contains("gho_x"));
+            // Off, other agent, denied var: no lookup.
+            assert!(
+                secret_service_substitute(Agent::Copilot, h, &[], false, alice, never).is_none()
+            );
+            assert!(secret_service_substitute(Agent::Claude, h, &[], true, alice, never).is_none());
+            let deny = ["COPILOT_GITHUB_TOKEN".to_string()];
+            assert!(
+                secret_service_substitute(Agent::Copilot, h, &deny, true, alice, never).is_none()
+            );
+            // gh is someone else, or unknown: refused.
+            let bob = || Some("bob".to_string());
+            assert!(secret_service_substitute(Agent::Copilot, h, &[], true, bob, never).is_none());
+            assert!(
+                secret_service_substitute(Agent::Copilot, h, &[], true, || None, never).is_none()
+            );
+            // Missing, locked or empty item: fallback.
+            assert!(
+                secret_service_substitute(Agent::Copilot, h, &[], true, alice, |_| None).is_none()
+            );
+            assert!(
+                secret_service_substitute(Agent::Copilot, h, &[], true, alice, |_| Some(
+                    " \n".into()
+                ))
+                .is_none()
+            );
+        });
+        // An exported token wins: skip.
+        temp_env::with_var("GH_TOKEN", Some("t"), || {
+            assert!(
+                secret_service_substitute(Agent::Copilot, h, &[], true, alice, never).is_none()
+            );
+        });
+        // Ambiguous config: refused.
+        std::fs::write(
+            &cfg,
+            r#"{"loggedInUsers":[{"host":"https://github.com","login":"alice"},{"host":"https://github.com","login":"bob"}]}"#,
+        )
+        .unwrap();
+        temp_env::with_vars(vars, || {
+            assert!(
+                secret_service_substitute(Agent::Copilot, h, &[], true, alice, never).is_none()
+            );
+        });
     }
 }
