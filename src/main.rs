@@ -8504,6 +8504,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
             auth.gh_cli_auth,
             cplt::sandbox::copilot_has_native_login(&home_dir),
         ),
+        cplt::sandbox::secret_service_skip_reason(resolved.keychain_substitute, &resolved.deny_env),
     ));
     for message in write_granted_repos_messages(&resolved, &project_dir, &repo_paths)
         .into_iter()
@@ -14938,6 +14939,7 @@ mod tests {
                         true,
                         false,
                         copilot_stored_token_handover(&r, None, true, true),
+                        ""
                     )
                     .is_some()
                 );
@@ -14954,6 +14956,7 @@ mod tests {
                             true,
                             false,
                             handover,
+                            ""
                         )
                         .is_some()
                     );
@@ -14969,6 +14972,7 @@ mod tests {
                         true,
                         false,
                         copilot_stored_token_handover(&r, None, true, false),
+                        ""
                     )
                     .is_none()
                 );
@@ -14983,6 +14987,7 @@ mod tests {
                         true,
                         false,
                         copilot_stored_token_handover(&r, None, true, false),
+                        ""
                     )
                     .is_some()
                 );

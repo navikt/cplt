@@ -2194,6 +2194,21 @@ pub(crate) fn secret_service_substitute(
     })
 }
 
+/// Why [`secret_service_substitute`] gave no token, for `cplt doctor`. Only
+/// the skips decided before the lookup are told apart; the rest is one bucket.
+#[must_use]
+pub fn secret_service_skip_reason(setting: Option<bool>, deny_env: &[String]) -> &'static str {
+    if !keychain_substitute_enabled(Agent::Copilot, setting) {
+        "sandbox.keychain_substitute is off, so no lookup ran"
+    } else if deny_env.iter().any(|d| d == "COPILOT_GITHUB_TOKEN") {
+        "deny.env strips COPILOT_GITHUB_TOKEN, so no lookup ran"
+    } else {
+        "no single account in ~/.copilot/config.json matching gh's github.com login (or gh \
+         is not logged in), or the `secret-tool` lookup found nothing (not installed in a \
+         trusted bin dir, keyring locked, or no stored item)"
+    }
+}
+
 /// `secret-tool` arguments for Copilot's item: `service=copilot-cli`,
 /// `username=<host>:<login>` (probed on Copilot 1.0.26 and 1.0.101, #600).
 fn secret_tool_args(acct: &str) -> [&str; 5] {
@@ -2210,8 +2225,16 @@ fn secret_tool_lookup(acct: &str) -> Option<String> {
     #[allow(clippy::disallowed_methods)] // absolute path from a trusted bin dir
     let mut cmd = std::process::Command::new(bin);
     cmd.args(secret_tool_args(acct));
-    let out = exec::bounded_stdout(cmd, std::time::Duration::from_secs(1))?;
-    String::from_utf8(out).ok()
+    let cap = std::time::Duration::from_secs(1);
+    let start = std::time::Instant::now();
+    let out = exec::bounded_stdout(cmd, cap);
+    if out.is_none() && start.elapsed() >= cap {
+        crate::ui::warn(
+            "secret-tool did not answer within 1 s (keyring locked?): Copilot gets no keyring \
+             login. Unlock the keyring at login, or set gh_guard.inject_token = true --force",
+        );
+    }
+    String::from_utf8(out?).ok()
 }
 
 /// Human-readable representation of the sandbox policy.
@@ -2397,7 +2420,7 @@ fn report_unix_socket_regime(
              container runtimes); any other pathname socket on the host stays reachable."
         ));
     } else {
-        ui::warn(
+        crate::ui::warn(
             "UNIX sockets are NOT restricted in this run: Landlock cannot gate connect(2) \
              below ABI v9 (kernel 7.1) and Bubblewrap is not active, so nothing masks them. \
              An agent can reach the D-Bus session bus or a container daemon socket and \
@@ -2886,7 +2909,7 @@ fn prepare_impl(
     // (Deny paths are handled after bwrap resolution below — with Bubblewrap
     // they ARE enforced, via mount masks.)
     if !config.allow_env_files {
-        ui::warn(
+        crate::ui::warn(
             "allow_env_files=false is not fully enforceable on Linux: \
              Landlock grants the project directory full read access, so .env files \
              within it remain readable. Differs from macOS Seatbelt behavior.",
@@ -2897,7 +2920,7 @@ fn prepare_impl(
     if config.proxy_port.is_none()
         && (!config.localhost_ports.is_empty() || config.allow_localhost_any)
     {
-        ui::warn(
+        crate::ui::warn(
             "Localhost protection limited on Linux without proxy: \
              Landlock cannot distinguish localhost from remote hosts. \
              Use --with-proxy for localhost SSRF protection.",
@@ -2919,7 +2942,7 @@ fn prepare_impl(
     // A restriction the user asked for and cannot have is said out loud, not
     // dropped (AGENTS.md "No silent grants").
     if config.deny_nested_git {
-        ui::warn(
+        crate::ui::warn(
             "sandbox.deny_nested_git has no effect on Linux: Landlock cannot deny a \
              path inside a tree it allows, and bubblewrap only protects paths that \
              exist at launch. A .git created during the session is reported when it \
@@ -2927,14 +2950,14 @@ fn prepare_impl(
         );
     }
     if config.deny_key_files_by_extension {
-        ui::warn(
+        crate::ui::warn(
             "sandbox.deny_key_files_by_extension has no effect on Linux: Landlock \
              cannot deny files by name pattern, so .pem, .key, .p12, .pfx and .jks \
              files in the project stay readable.",
         );
     }
     if config.allow_docker {
-        ui::warn(
+        crate::ui::warn(
             "--allow-docker on Linux grants the Docker/Podman daemon sockets and \
              exempts them from the Bubblewrap socket masks — daemon socket access is \
              effectively host root. ~/.docker is readable (not writable), including \
@@ -2943,7 +2966,7 @@ fn prepare_impl(
              directory.",
         );
     } else if config.allow_rootless_docker {
-        ui::warn(
+        crate::ui::warn(
             "--allow-rootless-docker on Linux grants the rootless Docker/Podman sockets \
              under $XDG_RUNTIME_DIR. A rootless container runs as you, outside the \
              sandbox, and can mount your home directory. Rootful sockets stay masked \
@@ -2957,7 +2980,7 @@ fn prepare_impl(
     // macOS still pins localhost at the kernel level, so this is Linux-specific.
     // proxy.forced supersedes it (reconciled earlier) and is the safe choice.
     if config.allow_localhost_any {
-        ui::warn(
+        crate::ui::warn(
             "--allow-localhost-any DISABLES kernel network restriction entirely on Linux: \
              Landlock is port-based and cannot allow 'all localhost ports' without allowing \
              the same ports on every remote host, so ALL Landlock TCP-connect rules are dropped \

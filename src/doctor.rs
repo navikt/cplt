@@ -852,21 +852,19 @@ pub fn linux_keyring_finding(
     session_bus: bool,
     env_token: bool,
     stored_token_handover: bool,
+    why: &str,
 ) -> Option<Finding> {
     (linux && agent == Agent::Copilot && session_bus && !env_token && !stored_token_handover).then(
         || {
             Finding::warning(
                 "Native keyring access is not guaranteed in the sandbox; token handover is recommended. \
              Landlock below ABI v9 does not block pathname bus connections; active bubblewrap masks selected endpoints. The stored login was not checked.",
-                Some(
+                Some(format!(
                     "set gh_guard.inject_token = true (with --force) and leave a token variable \
-                 permitted, or export a valid COPILOT_GITHUB_TOKEN. cplt reads Copilot's own \
-                 keyring login with `secret-tool` on the host when it can; that failed here \
-                 (secret-tool missing, keyring locked, no stored item, or the account did not \
-                 match gh's). Copilot inside the sandbox then reports \"Saved sign-in could not \
-                 be read from credential storage\""
-                        .to_string(),
-                ),
+                 permitted, or export a valid COPILOT_GITHUB_TOKEN. cplt did not pass Copilot's \
+                 own keyring login: {why}. Copilot inside the sandbox then reports \"Saved \
+                 sign-in could not be read from credential storage\""
+                )),
             )
         },
     )
@@ -1762,7 +1760,7 @@ mod tests {
 
     #[test]
     fn linux_keyring_only_when_no_token_reaches_copilot() {
-        let finding = linux_keyring_finding(Agent::Copilot, true, true, false, false).unwrap();
+        let finding = linux_keyring_finding(Agent::Copilot, true, true, false, false, "").unwrap();
         assert_eq!(finding.level, Level::Warning);
         assert!(
             finding
@@ -1778,11 +1776,11 @@ mod tests {
         assert!(fix.contains("gh_guard.inject_token = true"));
         assert!(fix.contains("Saved sign-in could not be read from credential storage"));
         assert!(!fix.contains("copilot logout"));
-        assert!(linux_keyring_finding(Agent::Copilot, false, true, false, false).is_none());
-        assert!(linux_keyring_finding(Agent::Copilot, true, false, false, false).is_none());
-        assert!(linux_keyring_finding(Agent::Copilot, true, true, true, false).is_none());
-        assert!(linux_keyring_finding(Agent::Copilot, true, true, false, true).is_none());
-        assert!(linux_keyring_finding(Agent::Claude, true, true, false, false).is_none());
+        assert!(linux_keyring_finding(Agent::Copilot, false, true, false, false, "").is_none());
+        assert!(linux_keyring_finding(Agent::Copilot, true, false, false, false, "").is_none());
+        assert!(linux_keyring_finding(Agent::Copilot, true, true, true, false, "").is_none());
+        assert!(linux_keyring_finding(Agent::Copilot, true, true, false, true, "").is_none());
+        assert!(linux_keyring_finding(Agent::Claude, true, true, false, false, "").is_none());
     }
 
     #[test]

@@ -132,16 +132,28 @@ login on the host before launch and passes it to Copilot as
 `~/.copilot/config.json` and runs one
 `secret-tool lookup service copilot-cli username <host>:<login>`, capped at one
 second. cplt skips the lookup when a token variable is already exported, when
-`deny.env` strips `COPILOT_GITHUB_TOKEN`, and when the config names more than
-one account or an account other than gh's github.com login. The config file is
-writable from inside the sandbox, so it must not be able to pick another stored
-login. `secret-tool` comes from the `libsecret-tools` package and must be in a
-trusted bin directory such as `/usr/bin` (not `PATH`). `copilot logout` does not exist in
-current Copilot and does not help.
+`deny.env` strips `COPILOT_GITHUB_TOKEN`, when the config has no
+`lastLoggedInUser` and lists several accounts, and when the account is not gh's
+github.com login (or gh is not logged in). The config file is writable from
+inside the sandbox, so it must not be able to pick another stored login.
+`secret-tool` comes from the `libsecret-tools` package and must be in a trusted
+bin directory such as `/usr/bin` (not `PATH`). With the keyring locked, the
+lookup can open an unlock dialog at every launch; cplt kills it after one second
+and prints a warning. `copilot logout` does not exist in current Copilot and
+does not help.
 
-If the lookup finds nothing (no `secret-tool`, a locked keyring, no stored item
-or an account mismatch), `cplt doctor` warns, and the fallback for Copilot is
-to authenticate on the host and let cplt hand over gh's credential:
+This handover needs no `--force`, unlike `gh_guard.inject_token` below. The
+token is Copilot's own login, handed to the agent that already owns it, the same
+trade as the macOS Keychain substitute. It still sits in the agent's
+environment, so every process in the sandbox can read it through
+`/proc/<pid>/environ`. That is less than the alternatives: `inject_token` puts
+gh's token there, which is a separate credential the agent would not otherwise
+hold, and reaching the Secret Service directly would expose every item in the
+keyring. Set `sandbox.keychain_substitute = false` to turn the lookup off.
+
+If no lookup runs or it finds nothing, `cplt doctor` warns and says which case
+applies. The fallback for Copilot is to authenticate on the host and let cplt
+hand over gh's credential:
 
 ```bash
 gh auth login --hostname github.com              # outside cplt, once

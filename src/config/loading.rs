@@ -1332,7 +1332,12 @@ impl Resolved {
             );
         }
         #[cfg(not(target_os = "macos"))]
-        let _ = keychain;
+        if let Some(source) = keychain {
+            // Linux has no Keychain grant; say which credential was handed over.
+            eprintln!(
+                "{blue}[cplt]{nc}    Login:         {yellow}passed{nc}      {dim}{source} (in the agent's environment){nc}"
+            );
+        }
         if agent.needs_keychain() {
             // The launch's own decision, not a recomputation: for Copilot it can
             // rest on a `gh auth token` call this summary should not repeat.
