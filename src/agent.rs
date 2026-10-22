@@ -214,17 +214,18 @@ const DEEPSEEK_DOMAINS: &[&str] = &["deepseek.com"];
 /// in `~/.cache/cplt`, which the agent can write: a forged "1.x" verdict for a
 /// v2 binary would bypass this gate.
 pub fn is_opencode_v2(bin: &Path, home: &Path) -> Option<bool> {
-    opencode_v2_within(
-        bin,
-        home,
-        [
-            crate::discover::PROBE_TIMEOUT,
-            crate::discover::PROBE_TIMEOUT * 3,
-        ],
-    )
+    opencode_v2_within(bin, home, |real, timeout| {
+        crate::discover::probe_version_within(real, &["--version"], timeout)
+    })
 }
 
-fn opencode_v2_within(bin: &Path, home: &Path, timeouts: [std::time::Duration; 2]) -> Option<bool> {
+/// [`is_opencode_v2`] with the probe passed in, so a test can make an attempt
+/// time out without racing a real child against the clock.
+fn opencode_v2_within(
+    bin: &Path,
+    home: &Path,
+    mut probe: impl FnMut(&Path, std::time::Duration) -> crate::discover::VersionProbe,
+) -> Option<bool> {
     let cache_dir = &home.join(crate::sandbox::CPLT_STATE_DIR);
     let real = std::fs::canonicalize(bin).unwrap_or_else(|_| bin.to_path_buf());
     let parts: Vec<String> = real
@@ -259,10 +260,9 @@ fn opencode_v2_within(bin: &Path, home: &Path, timeouts: [std::time::Duration; 2
     {
         return Some(major_at_least_2(&v));
     }
-    for timeout in timeouts {
-        if let crate::discover::VersionProbe::Version(v) =
-            crate::discover::probe_version_within(&real, &["--version"], timeout)
-        {
+    let first = crate::discover::PROBE_TIMEOUT;
+    for timeout in [first, first * 3] {
+        if let crate::discover::VersionProbe::Version(v) = probe(&real, timeout) {
             let _ = std::fs::create_dir_all(cache_dir);
             let _ = std::fs::write(&cache, format!("{key}{v}\n"));
             return Some(major_at_least_2(&v));
@@ -3543,14 +3543,19 @@ mod tests {
     #[test]
     fn opencode_v2_unknown_probe_is_retried_and_not_cached() {
         use std::os::unix::fs::PermissionsExt;
-        // The garbage and fail scripts exit at once, so their budget is only a
-        // ceiling. The hang script must time out; 2 s leaves room for the shell
-        // to start and log the attempt under parallel test load (#735).
-        let secs = std::time::Duration::from_secs;
-        for (name, body, budget) in [
-            ("hang", "exec sleep 30", secs(2)),
-            ("garbage", "echo opencode", secs(60)),
-            ("fail", "echo opencode v2.0.0; exit 1", secs(60)),
+        // The hang case gets an injected probe that reports a timeout, so the
+        // count does not depend on a killed shell having logged its start
+        // (#735). The real timeout path is covered in discover.rs.
+        use crate::discover::{VersionProbe, probe_version_within};
+        // The real scripts exit at once; 60 s is only a ceiling.
+        let real = |p: &Path, _| {
+            probe_version_within(p, &["--version"], std::time::Duration::from_secs(60))
+        };
+        let hang = |_: &Path, _| VersionProbe::TimedOut;
+        for (name, body, timed_out) in [
+            ("hang", "", true),
+            ("garbage", "echo opencode", false),
+            ("fail", "echo opencode v2.0.0; exit 1", false),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let bin = dir.path().join("opencode");
@@ -3559,12 +3564,21 @@ mod tests {
             std::fs::write(&bin, script).unwrap();
             std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
             let home = dir.path().join("home");
-            assert_eq!(opencode_v2_within(&bin, &home, [budget; 2]), None, "{name}");
-            assert_eq!(
-                std::fs::read_to_string(&count).unwrap().lines().count(),
-                2,
-                "{name}: one retry"
-            );
+            let mut timeouts = Vec::new();
+            let verdict = opencode_v2_within(&bin, &home, |p, t| {
+                timeouts.push(t);
+                if timed_out { hang(p, t) } else { real(p, t) }
+            });
+            assert_eq!(verdict, None, "{name}");
+            let first = crate::discover::PROBE_TIMEOUT;
+            assert_eq!(timeouts, [first, first * 3], "{name}: one longer retry");
+            if !timed_out {
+                assert_eq!(
+                    std::fs::read_to_string(&count).unwrap().lines().count(),
+                    2,
+                    "{name}: one retry"
+                );
+            }
             let state = home.join(crate::sandbox::CPLT_STATE_DIR);
             assert!(!state.join("opencode-version").exists(), "{name}: cached");
         }
