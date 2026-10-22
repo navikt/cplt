@@ -284,51 +284,69 @@ fn global_config_file(user_oc: &Path) -> Option<PathBuf> {
     found.next().is_none().then_some(file)
 }
 
-/// Route the user's GitHub MCP entries through the read-only proxy (#797):
-/// starts it and adds the `OPENCODE_CONFIG_CONTENT` overlay to `session`.
-/// Returns the proxy's port for the sandbox to allow. Only reads config and
-/// asks gh for a token when such an entry exists, so other launches pay
-/// nothing. `deny.env` naming `GH_TOKEN` or `OPENCODE_CONFIG_CONTENT` turns
-/// it off, like the #695 handover.
+/// Route the user's GitHub MCP entries through cplt's proxy (#797): serve
+/// the endpoint on the proxy port and add the `OPENCODE_CONFIG_CONTENT`
+/// overlay to `session`. Returns whether it did.
+///
+/// Only the user's own config counts (see
+/// [`crate::github_mcp::configured_servers`]); the host
+/// `OPENCODE_CONFIG_CONTENT` only when `reaches` says it gets into the
+/// sandbox, since OpenCode only sees it then. The token is asked for only
+/// once an entry is found, so other launches pay nothing. `deny.env` naming
+/// `GH_TOKEN` or `OPENCODE_CONFIG_CONTENT` turns it off, like the #695 handover.
 pub fn github_mcp(
     session: &mut Session,
     home: &Path,
-    launch_dir: &Path,
     deny_env: &[String],
-    log: crate::github_mcp::Log,
-) -> Option<u16> {
+    reaches: impl Fn(&str) -> bool,
+    proxy_port: Option<u16>,
+    token: impl FnOnce() -> Option<crate::agent::SecretToken>,
+) -> bool {
     const VAR: &str = "OPENCODE_CONFIG_CONTENT";
     if deny_env.iter().any(|d| d == "GH_TOKEN" || d == VAR) {
-        return None;
+        return false;
     }
-    let user_oc = std::env::var_os("OPENCODE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .unwrap_or_else(|| xdg_base("XDG_CONFIG_HOME", home, ".config").join("opencode"));
-    let existing = std::env::var(VAR).ok();
-    let names = crate::github_mcp::configured_servers(&user_oc, launch_dir, existing.as_deref());
+    let host_var = |v: &str| reaches(v).then(|| std::env::var_os(v)).flatten();
+    let mut dirs = vec![xdg_base("XDG_CONFIG_HOME", home, ".config").join("opencode")];
+    dirs.extend(
+        std::env::var_os("OPENCODE_CONFIG_DIR")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute()),
+    );
+    // The host's own OPENCODE_CONFIG never reaches v2: the session sets its
+    // own, naming the global file already read from `dirs` (#806).
+    let existing = host_var(VAR).and_then(|v| v.into_string().ok());
+    let names = crate::github_mcp::configured_servers(&dirs, None, existing.as_deref());
     if names.is_empty() {
-        return None;
+        return false;
     }
-    let Some(token) = crate::discover::stored_gh_token() else {
+    let Some(port) = proxy_port else {
+        crate::ui::warn(
+            "GitHub MCP in OpenCode goes through cplt's proxy, which is off: left as configured.",
+        );
+        return false;
+    };
+    let Some(token) = token() else {
         crate::ui::warn("GitHub MCP in OpenCode needs your gh login: run `gh auth login`.");
-        return None;
+        return false;
     };
-    let proxy = match crate::github_mcp::start(token, log) {
-        Ok(p) => p,
-        Err(e) => {
-            crate::ui::warn(&format!("GitHub MCP proxy not started: {e}"));
-            return None;
+    let added = crate::github_mcp::new_secret().and_then(|secret| {
+        let url = format!("http://127.0.0.1:{port}/{secret}");
+        let value = crate::github_mcp::overlay(existing.as_deref(), &names, &url)
+            .ok_or(format!("{VAR} is not a JSON object"))?;
+        crate::github_mcp::install(token, &secret)?;
+        Ok(value)
+    });
+    match added {
+        Ok(value) => {
+            session.env.push((VAR.into(), value));
+            true
         }
-    };
-    let Some(value) = crate::github_mcp::overlay(existing.as_deref(), &names, &proxy.url) else {
-        crate::ui::warn(&format!(
-            "{VAR} is not a JSON object; GitHub MCP left as configured."
-        ));
-        return None;
-    };
-    session.env.push((VAR.into(), value));
-    Some(proxy.port)
+        Err(e) => {
+            crate::ui::warn(&format!("GitHub MCP left as configured: {e}."));
+            false
+        }
+    }
 }
 
 /// `overlay` = a link per entry of `user`, except `opencode`, which becomes a
@@ -1042,6 +1060,65 @@ mod tests {
         std::os::unix::fs::symlink(home.join("dot.md"), &f).unwrap();
         grant_file(&home, &f, &mut reads).unwrap();
         assert_eq!(reads, [home.join("dot.md"), f]);
+    }
+
+    /// Every path where the GitHub MCP overlay must not happen (#797), and
+    /// where the token must not even be asked for.
+    #[test]
+    fn github_mcp_stays_off_without_its_preconditions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let oc = tmp.path().join(".config/opencode");
+        std::fs::create_dir_all(&oc).unwrap();
+        let entry = r#"{"mcp":{"servers":{"gh":{"type":"remote","url":"https://api.githubcopilot.com/mcp"}}}}"#;
+        let vars = [
+            ("XDG_CONFIG_HOME", None::<&str>),
+            ("XDG_STATE_HOME", None),
+            ("OPENCODE_CONFIG_DIR", None),
+            ("OPENCODE_CONFIG", None),
+            ("OPENCODE_CONFIG_CONTENT", Some(entry)),
+        ];
+        temp_env::with_vars(vars, || {
+            let mut s = prepare(tmp.path(), tmp.path(), &tmp.path().join("src/repo")).unwrap();
+            let n = s.env.len();
+            let deny = |d: &[&str]| d.iter().map(ToString::to_string).collect::<Vec<_>>();
+            let never = || -> Option<crate::agent::SecretToken> { panic!("token asked for") };
+            let all = |_: &str| true;
+            // Host content that does not reach the sandbox does not count.
+            assert!(!github_mcp(
+                &mut s,
+                tmp.path(),
+                &[],
+                |_| false,
+                Some(1),
+                never
+            ));
+            // deny.env turns it off, for either variable.
+            for d in ["GH_TOKEN", "OPENCODE_CONFIG_CONTENT"] {
+                assert!(!github_mcp(
+                    &mut s,
+                    tmp.path(),
+                    &deny(&[d]),
+                    all,
+                    Some(1),
+                    never
+                ));
+            }
+            // No proxy: nothing to serve it on.
+            assert!(!github_mcp(&mut s, tmp.path(), &[], all, None, never));
+            // No gh login.
+            assert!(!github_mcp(&mut s, tmp.path(), &[], all, Some(1), || None));
+            // The same from the user config file.
+            std::fs::write(oc.join("opencode.json"), entry).unwrap();
+            assert!(!github_mcp(
+                &mut s,
+                tmp.path(),
+                &[],
+                |_| false,
+                Some(1),
+                || None
+            ));
+            assert_eq!(s.env.len(), n);
+        });
     }
 
     #[test]

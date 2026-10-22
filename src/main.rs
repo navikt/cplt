@@ -4733,22 +4733,20 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         let mut session = cplt::opencode_v2::prepare(scratch, &home_dir, &launch_dir)
             .map_err(|e| anyhow::anyhow!("Cannot set up the OpenCode v2 session: {e}"))?;
         v2_model = std::mem::replace(&mut session.model, Err(())).ok();
-        let mcp_port = resolved
-            .github_mcp_proxy
-            .then(|| {
-                let log = cplt::github_mcp::Log {
-                    level: resolved.proxy_log_level,
-                    file: resolved.proxy_log_file.clone(),
-                };
-                cplt::opencode_v2::github_mcp(
-                    &mut session,
-                    &home_dir,
-                    &launch_dir,
-                    &resolved.deny_env,
-                    log,
-                )
-            })
-            .flatten();
+        if resolved.github_mcp_proxy {
+            let reaches = |v: &str| {
+                !resolved.deny_env.iter().any(|d| d == v)
+                    && (resolved.inherit_env || resolved.pass_env.iter().any(|p| p == v))
+            };
+            cplt::opencode_v2::github_mcp(
+                &mut session,
+                &home_dir,
+                &resolved.deny_env,
+                reaches,
+                proxy_handle.as_ref().map(|h| h.port),
+                cplt::discover::stored_gh_secret,
+            );
+        }
         // These variables carry the session's isolation; dropping them would
         // point OpenCode back at the host service.
         if let Some((name, _)) = session
@@ -4764,11 +4762,6 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         prepared
             .add_opencode_v2(session)
             .map_err(|e| anyhow::anyhow!("Cannot set up the OpenCode v2 session: {e}"))?;
-        if let Some(port) = mcp_port {
-            prepared
-                .allow_session_port(port)
-                .map_err(|e| anyhow::anyhow!("Cannot open the GitHub MCP proxy port: {e}"))?;
-        }
         for w in cplt::opencode_v2::host_warnings(&home_dir) {
             ui::warn(&w);
         }

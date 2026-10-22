@@ -2,9 +2,13 @@
 //!
 //! GitHub's OAuth has no dynamic client registration, so OpenCode cannot log
 //! in to `api.githubcopilot.com/mcp` itself, and cplt strips `GH_TOKEN` for
-//! it. When the user's OpenCode config names that server, cplt starts a
-//! listener on `127.0.0.1` and points the entry at it with `"oauth": false`.
-//! The listener adds the host's gh token and forwards every request to one
+//! it. When the user's own OpenCode config names that server, cplt serves an
+//! endpoint at a random secret path on its existing CONNECT proxy port and
+//! points the entry at it with `"oauth": false`. No new port is opened: on
+//! Linux, Landlock port rules cannot be pinned to loopback, so a new port
+//! would be open to every host.
+//!
+//! The endpoint adds the host's gh token and forwards every request to one
 //! fixed upstream, the read-only endpoint, with `X-MCP-Readonly` and
 //! `X-MCP-Lockdown` forced on. The token never enters the sandbox through
 //! this path; the agent gets a read-only, lockdown view of GitHub.
@@ -12,13 +16,15 @@
 //! cplt has no TLS stack, so the upstream leg runs through the system `curl`
 //! (trusted dirs only), one process per request. The token and the request
 //! reach curl on stdin as a config file, never in argv, and `-q` keeps the
-//! user's `~/.curlrc` out. The listener path carries a random secret, so other
-//! local processes cannot spend the token.
+//! user's `~/.curlrc` out.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
+
+use crate::agent::SecretToken;
 
 use serde_json::{Map, Value};
 
@@ -26,7 +32,6 @@ use crate::proxy::ProxyLogLevel;
 
 /// The only place requests go, whatever URL the user's entry names.
 pub const UPSTREAM: &str = "https://api.githubcopilot.com/mcp/readonly";
-const MAX_HEAD: usize = 64 * 1024;
 const MAX_BODY: usize = 4 * 1024 * 1024;
 const CONFIG_LIMIT: u64 = 1024 * 1024;
 
@@ -99,29 +104,21 @@ fn object_at<'a>(map: &'a mut Map<String, Value>, key: &str) -> Option<&'a mut M
         .as_object_mut()
 }
 
-/// The GitHub MCP entries in the config OpenCode will load: the user's config
-/// dir, `OPENCODE_CONFIG`, project files from `launch_dir` up to the repo
-/// root, and `OPENCODE_CONFIG_CONTENT`. Project files are agent-writable, but
-/// all they can do here is ask for the read-only proxy.
-pub fn configured_servers(user_oc: &Path, launch_dir: &Path, content: Option<&str>) -> Vec<Entry> {
-    let mut files: Vec<PathBuf> = ["config.json", "opencode.json", "opencode.jsonc"]
+/// The GitHub MCP entries in the config files the user controls: the config
+/// dirs (`$XDG_CONFIG_HOME/opencode`, `OPENCODE_CONFIG_DIR`), `OPENCODE_CONFIG`
+/// and `OPENCODE_CONFIG_CONTENT`. Project files are agent-writable and never
+/// count: an agent must not be able to switch on spending the user's token.
+/// `nav-pilot mcp enable --client opencode` writes the user config dir.
+pub fn configured_servers(
+    dirs: &[PathBuf],
+    config_file: Option<&Path>,
+    content: Option<&str>,
+) -> Vec<Entry> {
+    let mut files: Vec<PathBuf> = dirs
         .iter()
-        .map(|f| user_oc.join(f))
+        .flat_map(|d| ["config.json", "opencode.json", "opencode.jsonc"].map(|f| d.join(f)))
         .collect();
-    files.extend(std::env::var_os("OPENCODE_CONFIG").map(PathBuf::from));
-    for dir in launch_dir.ancestors() {
-        for f in [
-            "opencode.json",
-            "opencode.jsonc",
-            ".opencode/opencode.json",
-            ".opencode/opencode.jsonc",
-        ] {
-            files.push(dir.join(f));
-        }
-        if dir.join(".git").exists() {
-            break;
-        }
-    }
+    files.extend(config_file.map(Path::to_path_buf));
     let mut texts: Vec<String> = files
         .iter()
         .filter_map(|f| {
@@ -141,14 +138,7 @@ pub fn configured_servers(user_oc: &Path, launch_dir: &Path, content: Option<&st
     names
 }
 
-/// A running proxy: point OpenCode at `url`; the sandbox must allow `port`.
-pub struct Proxy {
-    pub port: u16,
-    pub url: String,
-}
-
 /// Where request lines go: the proxy's log level and `--proxy-log` file.
-#[derive(Clone)]
 pub struct Log {
     pub level: ProxyLogLevel,
     pub file: Option<PathBuf>,
@@ -157,7 +147,8 @@ pub struct Log {
 impl Log {
     fn line(&self, method: &str, status: &str) {
         let method = method.escape_debug().to_string();
-        if self.level.should_log(status) {
+        let status = status.escape_debug().to_string();
+        if self.level.should_log(&status) {
             eprintln!(
                 "{}[github-mcp]{} {} {method} {UPSTREAM} → {status}",
                 crate::ui::color(crate::ui::YELLOW),
@@ -180,50 +171,87 @@ impl Log {
     }
 }
 
-/// Bind the listener and serve in the background for the life of the process.
-pub fn start(token: String, log: Log) -> Result<Proxy, String> {
-    let curl = crate::git::trusted_binary("curl").ok_or("no curl in the trusted dirs")?;
-    serve(token, log, curl, UPSTREAM)
+/// What the proxy serves at the secret path.
+pub struct Endpoint {
+    token: SecretToken,
+    path: String,
+    curl: PathBuf,
+    upstream: String,
 }
 
-fn serve(token: String, log: Log, curl: PathBuf, upstream: &'static str) -> Result<Proxy, String> {
-    let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
-    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
-    let secret = crate::scratch::generate_session_id()?;
-    let url = format!("http://127.0.0.1:{port}/{secret}");
-    let path = format!("/{secret}");
-    std::thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            let (token, log, curl, path) = (token.clone(), log.clone(), curl.clone(), path.clone());
-            std::thread::spawn(move || handle(stream, &token, &log, &curl, &path, upstream));
-        }
-    });
-    Ok(Proxy { port, url })
+/// ponytail: one endpoint per process, which is one cplt session; a
+/// per-proxy field would be needed to serve two.
+static ENDPOINT: OnceLock<Endpoint> = OnceLock::new();
+
+/// A fresh secret for the endpoint path.
+pub fn new_secret() -> Result<String, String> {
+    crate::scratch::generate_session_id()
+}
+
+/// Serve the endpoint at `/<secret>` on the running proxy.
+pub fn install(token: SecretToken, secret: &str) -> Result<(), String> {
+    let curl = crate::git::trusted_binary("curl").ok_or("no curl in the trusted dirs")?;
+    install_endpoint(Endpoint {
+        token,
+        path: format!("/{secret}"),
+        curl,
+        upstream: UPSTREAM.into(),
+    })
+}
+
+fn install_endpoint(ep: Endpoint) -> Result<(), String> {
+    ENDPOINT
+        .set(ep)
+        .map_err(|_| "the GitHub MCP endpoint is already set".to_string())
+}
+
+/// The endpoint, when `target` is exactly its path. Constant-time, so the
+/// secret cannot be guessed a byte at a time.
+pub(crate) fn endpoint_for(target: &str) -> Option<&'static Endpoint> {
+    let ep = ENDPOINT.get()?;
+    let (a, b) = (target.as_bytes(), ep.path.as_bytes());
+    // The length is public (a fixed-size secret); only the bytes are compared
+    // in constant time.
+    if a.len() != b.len() {
+        return None;
+    }
+    let diff = a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y));
+    (diff == 0).then_some(ep)
 }
 
 /// Client headers that never reach upstream: credentials and MCP mode
-/// switches are cplt's to set; the rest are hop-by-hop or curl's job.
+/// switches are cplt's to set (`X-MCP-Toolsets` only picks tool groups and
+/// passes); the rest are hop-by-hop or curl's job.
 fn forwarded(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
-    !(n.starts_with("x-mcp-")
-        || n.starts_with("proxy-")
-        || matches!(
-            n.as_str(),
-            "authorization"
-                | "cookie"
-                | "host"
-                | "content-length"
-                | "connection"
-                | "keep-alive"
-                | "transfer-encoding"
-                | "te"
-                | "trailer"
-                | "upgrade"
-                | "expect"
-        ))
+    n == "x-mcp-toolsets"
+        || !(n.starts_with("x-mcp-")
+            || n.starts_with("proxy-")
+            || matches!(
+                n.as_str(),
+                "authorization"
+                    | "cookie"
+                    | "host"
+                    | "content-length"
+                    | "connection"
+                    | "keep-alive"
+                    | "transfer-encoding"
+                    | "te"
+                    | "trailer"
+                    | "upgrade"
+                    | "expect"
+            ))
 }
 
-/// A quoted curl config value.
+/// A header name or value that could break out of its line: any control
+/// byte but HTAB, or DEL. Checked before anything is quoted for curl.
+fn bad_header_byte(s: &str) -> bool {
+    s.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7f)
+}
+
+/// A quoted curl config value. curl unescapes `\\r`, `\\n` and `\\t` again,
+/// so the body round-trips exactly; headers never reach here with a control
+/// byte (see [`bad_header_byte`]), and NUL is refused for both.
 fn quote(out: &mut Vec<u8>, value: &[u8]) {
     out.push(b'"');
     for &b in value {
@@ -239,16 +267,22 @@ fn quote(out: &mut Vec<u8>, value: &[u8]) {
     out.extend_from_slice(b"\"\n");
 }
 
-/// The curl config for one request. Upstream, credential and MCP mode come
-/// from cplt alone; the client supplies only the method, its other headers
-/// and the body.
+/// The curl config for one request, or `None` for a header with a control
+/// byte. Upstream, credential and MCP mode come from cplt alone; the client
+/// supplies only the method, its other headers and the body.
 fn curl_config(
     upstream: &str,
     method: &str,
     headers: &[(String, String)],
     body: &[u8],
     token: &str,
-) -> Vec<u8> {
+) -> Option<Vec<u8>> {
+    if headers
+        .iter()
+        .any(|(k, v)| bad_header_byte(k) || bad_header_byte(v))
+    {
+        return None;
+    }
     let mut c = Vec::new();
     let mut opt = |name: &str, value: &[u8]| {
         c.extend_from_slice(name.as_bytes());
@@ -270,7 +304,7 @@ fn curl_config(
     if !body.is_empty() {
         opt("data-raw", body);
     }
-    c
+    Some(c)
 }
 
 fn reply(stream: &mut TcpStream, status: &str) {
@@ -280,107 +314,129 @@ fn reply(stream: &mut TcpStream, status: &str) {
     );
 }
 
-/// One request per connection: read it, run curl, stream its answer back.
-fn handle(mut stream: TcpStream, token: &str, log: &Log, curl: &Path, path: &str, upstream: &str) {
-    let Ok(read_half) = stream.try_clone() else {
-        return;
-    };
-    let mut reader = BufReader::new(read_half.take((MAX_HEAD + MAX_BODY) as u64));
-    let mut line = String::new();
-    if reader.read_line(&mut line).is_err() {
-        return;
-    }
-    let mut parts = line.split_whitespace();
-    let (method, target) = (
-        parts.next().unwrap_or_default().to_string(),
-        parts.next().unwrap_or_default(),
-    );
-    if target != path {
-        reply(&mut stream, "404 Not Found");
-        return log.line(&method, "BLOCKED-PATH");
-    }
-    if !matches!(method.as_str(), "GET" | "POST" | "DELETE") {
-        reply(&mut stream, "405 Method Not Allowed");
-        return log.line(&method, "BLOCKED-METHOD");
-    }
-    let mut headers = Vec::new();
-    let mut head = line.len();
-    loop {
-        line.clear();
-        if reader.read_line(&mut line).unwrap_or(0) == 0 || head > MAX_HEAD {
-            reply(&mut stream, "400 Bad Request");
-            return log.line(&method, "FAIL bad request");
+impl Endpoint {
+    /// One request, whose head the proxy has read (its size cap, deadline and
+    /// connection limit apply); the body is still in `client`. Runs curl and
+    /// streams its answer back.
+    pub(crate) fn serve(&self, mut client: TcpStream, head: &[u8], log: &Log) {
+        let head = String::from_utf8_lossy(head);
+        let mut lines = head.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l));
+        let method = lines
+            .next()
+            .and_then(|l| l.split(' ').next())
+            .unwrap_or_default()
+            .to_string();
+        if !matches!(method.as_str(), "GET" | "POST" | "DELETE") {
+            reply(&mut client, "405 Method Not Allowed");
+            return log.line(&method, "BLOCKED-METHOD");
         }
-        head += line.len();
-        let l = line.trim_end_matches(['\r', '\n']);
-        if l.is_empty() {
-            break;
+        let headers: Vec<(String, String)> = lines
+            .take_while(|l| !l.is_empty())
+            .map(|l| match l.split_once(':') {
+                Some((k, v)) => (k.trim().to_string(), v.trim().to_string()),
+                // A line without a colon is malformed; make it fail the check.
+                None => (String::new(), "\u{0}".into()),
+            })
+            .collect();
+        let header = |name: &str| {
+            headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+        };
+        if header("transfer-encoding").is_some() {
+            reply(&mut client, "411 Length Required");
+            return log.line(&method, "FAIL chunked request");
         }
-        if let Some((k, v)) = l.split_once(':') {
-            headers.push((k.trim().to_string(), v.trim().to_string()));
+        let len = match header("content-length").map(str::parse::<usize>) {
+            None => 0,
+            Some(Ok(n)) if n <= MAX_BODY => n,
+            _ => {
+                reply(&mut client, "413 Content Too Large");
+                return log.line(&method, "FAIL body length");
+            }
+        };
+        let mut body = vec![0; len];
+        if client.read_exact(&mut body).is_err() || body.contains(&0) {
+            reply(&mut client, "400 Bad Request");
+            return log.line(&method, "FAIL bad body");
         }
-    }
-    let header = |name: &str| {
-        headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
-    };
-    if header("transfer-encoding").is_some() {
-        reply(&mut stream, "411 Length Required");
-        return log.line(&method, "FAIL chunked request");
-    }
-    let len: usize = header("content-length")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    let mut body = vec![0; len];
-    if len > MAX_BODY || reader.read_exact(&mut body).is_err() || body.contains(&0) {
-        reply(&mut stream, "400 Bad Request");
-        return log.line(&method, "FAIL bad body");
-    }
-
-    #[allow(clippy::disallowed_methods)] // resolved trusted path, or a fixture in tests
-    let mut cmd = Command::new(curl);
-    // -q first: no ~/.curlrc. No redirects; https only for the real upstream.
-    cmd.args([
-        "-q",
-        "-sS",
-        "-N",
-        "-i",
-        "--http1.1",
-        "--max-redirs",
-        "0",
-        "-K",
-        "-",
-    ]);
-    if upstream.starts_with("https://") {
-        cmd.args(["--proto", "=https"]);
-    }
-    let Ok(mut child) = cmd
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        reply(&mut stream, "502 Bad Gateway");
-        return log.line(&method, "FAIL curl");
-    };
-    let config = curl_config(upstream, &method, &headers, &body, token);
-    let wrote = child
-        .stdin
-        .take()
-        .is_some_and(|mut s| s.write_all(&config).is_ok());
-    let status = match child.stdout.take() {
-        Some(out) if wrote => relay(out, &mut stream),
-        _ => None,
-    };
-    let _ = child.kill();
-    let _ = child.wait();
-    if let Some(code) = status {
-        log.line(&method, &format!("FORWARDED {code}"));
-    } else {
-        reply(&mut stream, "502 Bad Gateway");
-        log.line(&method, "FAIL upstream");
+        let Some(config) = curl_config(
+            &self.upstream,
+            &method,
+            &headers,
+            &body,
+            self.token.expose(),
+        ) else {
+            reply(&mut client, "400 Bad Request");
+            return log.line(&method, "FAIL bad header");
+        };
+        #[allow(clippy::disallowed_methods)] // resolved trusted path, or a fixture in tests
+        let mut cmd = Command::new(&self.curl);
+        // -q first: no ~/.curlrc. No redirects; https only for the real upstream.
+        cmd.args([
+            "-q",
+            "-sS",
+            "-N",
+            "-i",
+            "--http1.1",
+            "--suppress-connect-headers",
+            "--max-redirs",
+            "0",
+            "-K",
+            "-",
+        ]);
+        if self.upstream.starts_with("https://") {
+            cmd.args(["--proto", "=https"]);
+        }
+        cmd.env_remove("SSLKEYLOGFILE");
+        let Ok(mut child) = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        else {
+            reply(&mut client, "502 Bad Gateway");
+            return log.line(&method, "FAIL curl did not start");
+        };
+        // Bounded, and drained so curl never blocks on a full pipe.
+        let stderr = child.stderr.take().map(|e| {
+            std::thread::spawn(move || {
+                let mut e = e;
+                let mut buf = Vec::new();
+                let _ = e.by_ref().take(2048).read_to_end(&mut buf);
+                let _ = std::io::copy(&mut e, &mut std::io::sink());
+                buf
+            })
+        });
+        let wrote = child
+            .stdin
+            .take()
+            .is_some_and(|mut s| s.write_all(&config).is_ok());
+        let status = match child.stdout.take() {
+            Some(out) if wrote => relay(out, &mut client),
+            _ => None,
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Some(code) = status {
+            // A GET answered 405 is the MCP spec's "no standalone SSE stream",
+            // which GitHub returns on every session: not an error.
+            let expected = method == "GET" && code == "405";
+            let verdict = if code.starts_with(['4', '5']) && !expected {
+                "FAIL"
+            } else {
+                "FORWARDED"
+            };
+            log.line(&method, &format!("{verdict} {code}"));
+        } else {
+            reply(&mut client, "502 Bad Gateway");
+            let err = stderr
+                .and_then(|t| t.join().ok())
+                .map(|b| String::from_utf8_lossy(&b).replace(self.token.expose(), "<token>"))
+                .unwrap_or_default();
+            log.line(&method, &format!("FAIL upstream: {}", err.trim()));
+        }
     }
 }
 
@@ -422,6 +478,19 @@ fn relay(out: impl Read, client: &mut TcpStream) -> Option<String> {
     Some(code)
 }
 
+/// Install a test endpoint with `upstream` (the real one is pinned).
+#[cfg(test)]
+pub(crate) fn install_for_test(upstream: &str, token: &str, secret: &str) -> Option<()> {
+    let curl = crate::git::trusted_binary("curl")?;
+    install_endpoint(Endpoint {
+        token: SecretToken::new(token.into()),
+        path: format!("/{secret}"),
+        curl,
+        upstream: upstream.into(),
+    })
+    .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,7 +516,7 @@ mod tests {
     }
 
     #[test]
-    fn finds_entries_in_jsonc_and_content() {
+    fn finds_entries_in_user_config_only() {
         let dir = tempfile::tempdir().unwrap();
         let oc = dir.path().join("oc");
         std::fs::create_dir(&oc).unwrap();
@@ -458,43 +527,43 @@ mod tests {
                                    "other": {"type": "remote", "url": "https://example.com/mcp"},}}}"#,
         )
         .unwrap();
-        let project = dir.path().join("p");
-        std::fs::create_dir_all(project.join(".git")).unwrap();
+        let file = dir.path().join("custom.json");
+        std::fs::write(
+            &file,
+            r#"{"mcp":{"old":{"type":"remote","url":"https://api.githubcopilot.com/mcp/"}}}"#,
+        )
+        .unwrap();
         let content = r#"{"mcp":{"servers":{"gh2":{"url":"https://api.githubcopilot.com/mcp"}}}}"#;
         assert_eq!(
-            configured_servers(&oc, &project, Some(content)),
-            [(true, "gh".to_string()), (true, "gh2".to_string())]
+            configured_servers(&[oc], Some(&file), Some(content)),
+            [
+                (false, "old".to_string()),
+                (true, "gh".to_string()),
+                (true, "gh2".to_string())
+            ]
         );
-        let legacy =
-            r#"{"mcp":{"old":{"type":"remote","url":"https://api.githubcopilot.com/mcp/"}}}"#;
-        assert_eq!(
-            configured_servers(&project, &project, Some(legacy)),
-            [(false, "old".to_string())]
-        );
-        assert!(configured_servers(&project, &project, None).is_empty());
+        // Nothing else is read: a project dir is not one of the inputs.
+        assert_eq!(configured_servers(&[], None, None), []);
     }
 
     #[test]
     fn overlay_keeps_the_users_keys() {
         let existing = r#"{"model":"x","mcp":{"servers":{"gh":{"enabled":true,"headers":{"a":"b"}},"o":{"url":"u"}}}}"#;
-        let v: Value = serde_json::from_str(
-            &overlay(Some(existing), &[(true, "gh".into())], "http://p").unwrap(),
-        )
-        .unwrap();
+        let gh = [(true, "gh".to_string())];
+        let v: Value =
+            serde_json::from_str(&overlay(Some(existing), &gh, "http://p").unwrap()).unwrap();
         assert_eq!(v["model"], "x");
         assert_eq!(v["mcp"]["servers"]["o"]["url"], "u");
-        let gh = &v["mcp"]["servers"]["gh"];
+        let e = &v["mcp"]["servers"]["gh"];
         assert_eq!(
             (
-                gh["url"].as_str(),
-                gh["oauth"].as_bool(),
-                gh["enabled"].as_bool()
+                e["url"].as_str(),
+                e["oauth"].as_bool(),
+                e["enabled"].as_bool()
             ),
             (Some("http://p"), Some(false), Some(true))
         );
-        let fresh: Value =
-            serde_json::from_str(&overlay(None, &[(true, "gh".into())], "http://p").unwrap())
-                .unwrap();
+        let fresh: Value = serde_json::from_str(&overlay(None, &gh, "http://p").unwrap()).unwrap();
         assert_eq!(fresh["mcp"]["servers"]["gh"]["type"], "remote");
         let old: Value =
             serde_json::from_str(&overlay(None, &[(false, "gh".into())], "http://p").unwrap())
@@ -506,138 +575,71 @@ mod tests {
             ),
             (Some(false), None)
         );
-        assert_eq!(
-            overlay(Some("[1]"), &[(true, "gh".into())], "http://p"),
-            None
-        );
-        assert_eq!(
-            overlay(Some("{\"mcp\":1}"), &[(true, "gh".into())], "http://p"),
-            None
-        );
+        assert_eq!(overlay(Some("[1]"), &gh, "http://p"), None);
+        assert_eq!(overlay(Some("{\"mcp\":1}"), &gh, "http://p"), None);
+    }
+
+    fn hdrs(list: &[(&str, &str)]) -> Vec<(String, String)> {
+        list.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
     fn config_pins_upstream_and_forces_headers() {
-        let headers = [
+        let headers = hdrs(&[
             ("Authorization", "Bearer agent"),
             ("x-mcp-readonly", "false"),
-            ("X-MCP-Toolsets", "all"),
+            ("X-MCP-Lockdown", "false"),
+            ("X-MCP-Toolsets", "repos"),
             ("Host", "evil"),
-            ("Mcp-Session-Id", "s\"1\nurl = \"https://evil\""),
-        ]
-        .map(|(k, v)| (k.to_string(), v.to_string()));
-        let c =
-            String::from_utf8(curl_config(UPSTREAM, "POST", &headers, b"{\"a\":1}", "T")).unwrap();
+            ("Cookie", "c"),
+            ("Mcp-Session-Id", "s\"1\\"),
+        ]);
+        let c = String::from_utf8(
+            curl_config(UPSTREAM, "POST", &headers, b"{\"a\":\n1}", "T").unwrap(),
+        )
+        .unwrap();
         let lines: Vec<&str> = c.lines().collect();
         assert_eq!(lines.iter().filter(|l| l.starts_with("url = ")).count(), 1);
         assert_eq!(lines[0], format!("url = \"{UPSTREAM}\""));
-        assert!(!c.contains("agent") && !c.contains("Toolsets") && !c.contains("evil\"\n"));
-        assert!(!c.to_lowercase().contains("readonly: false") && !c.contains("Host:"));
+        assert!(!c.contains("agent") && !c.contains("Host:") && !c.contains("Cookie"));
+        assert!(!c.to_lowercase().contains(": false"), "{c}");
         for h in [
             "Authorization: Bearer T",
             "X-MCP-Readonly: true",
             "X-MCP-Lockdown: true",
+            "X-MCP-Toolsets: repos",
+            r#"Mcp-Session-Id: s\"1\\"#,
         ] {
-            assert!(c.contains(&format!("header = \"{h}\"")), "{c}");
+            assert!(c.contains(&format!("header = \"{h}\"")), "{h}: {c}");
         }
-        assert!(c.contains(r#"header = "Mcp-Session-Id: s\"1\nurl = \"https://evil\"""#));
-        assert!(c.contains(r#"data-raw = "{\"a\":1}""#));
+        assert!(c.contains(r#"data-raw = "{\"a\":\n1}""#));
     }
 
-    /// Crosses the real seam: a client request through the listener and the
-    /// system curl to a fake upstream, which sees only what cplt allows.
     #[test]
-    fn forwards_through_curl_to_a_fake_upstream() {
-        let Some(curl) = crate::git::trusted_binary("curl") else {
-            return;
-        };
-        let up = TcpListener::bind("127.0.0.1:0").unwrap();
-        let upstream: &'static str = format!(
-            "http://127.0.0.1:{}/mcp/readonly",
-            up.local_addr().unwrap().port()
-        )
-        .leak();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let (s, _) = up.accept().unwrap();
-            let mut r = BufReader::new(s.try_clone().unwrap());
-            let mut req = String::new();
-            loop {
-                let mut l = String::new();
-                r.read_line(&mut l).unwrap();
-                req += &l;
-                if l == "\r\n" {
-                    break;
-                }
-            }
-            let mut body = [0; 7];
-            r.read_exact(&mut body).unwrap();
-            tx.send((req, body)).unwrap();
-            let mut s = s;
-            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n7\r\ndata:1\n\r\n").unwrap();
-            s.flush().unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            s.write_all(b"7\r\ndata:2\n\r\n0\r\n\r\n").unwrap();
-        });
-        let log = Log {
-            level: ProxyLogLevel::None,
-            file: None,
-        };
-        let p = serve("TOKEN".into(), log, curl, upstream).unwrap();
-        let path = p
-            .url
-            .split_once(&format!(":{}", p.port))
-            .unwrap()
-            .1
-            .to_string();
-
-        let mut bad = TcpStream::connect(("127.0.0.1", p.port)).unwrap();
-        bad.write_all(b"GET /mcp HTTP/1.1\r\n\r\n").unwrap();
-        let mut resp = String::new();
-        bad.read_to_string(&mut resp).unwrap();
-        assert!(resp.starts_with("HTTP/1.1 404"), "{resp}");
-
-        let mut c = TcpStream::connect(("127.0.0.1", p.port)).unwrap();
-        write!(
-            c,
-            "POST {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer agent\r\nX-MCP-Lockdown: false\r\n\
-             Accept: text/event-stream\r\nContent-Length: 7\r\n\r\n{{\"a\":1}}"
-        )
-        .unwrap();
-        let (req, body) = rx.recv().unwrap();
-        let lower = req.to_lowercase();
-        assert!(req.starts_with("POST /mcp/readonly HTTP/1.1"), "{req}");
-        assert!(
-            lower.contains("authorization: bearer token\r\n") && !lower.contains("bearer agent"),
-            "{req}"
-        );
-        assert!(
-            lower.contains("x-mcp-lockdown: true") && !lower.contains("lockdown: false"),
-            "{req}"
-        );
-        assert!(
-            lower.contains("x-mcp-readonly: true") && lower.contains("accept: text/event-stream"),
-            "{req}"
-        );
-        assert_eq!(&body, b"{\"a\":1}");
-
-        // The first event arrives before the upstream sends the second.
-        let mut r = BufReader::new(c);
-        let mut first = String::new();
-        let started = std::time::Instant::now();
-        while !first.contains("data:1") {
-            r.read_line(&mut first).unwrap();
+    fn control_bytes_in_headers_are_refused() {
+        for (k, v) in [
+            ("Mcp-Session-Id", "s\rurl = \"https://evil\""),
+            ("Mcp-Session-Id", "s\nurl = \"https://evil\""),
+            ("Mcp-Session-Id", "s\u{0}"),
+            ("Mcp-Session-Id", "s\u{b}"),
+            ("Mcp-Session-Id", "s\u{7f}"),
+            ("X-A\r", "v"),
+        ] {
+            assert_eq!(
+                curl_config(UPSTREAM, "POST", &hdrs(&[(k, v)]), b"", "T"),
+                None,
+                "{k:?}: {v:?}"
+            );
         }
-        assert!(
-            started.elapsed() < std::time::Duration::from_millis(250),
-            "buffered"
-        );
-        assert!(
-            first.starts_with("HTTP/1.1 200")
-                && !first.to_lowercase().contains("transfer-encoding")
-        );
-        let mut rest = String::new();
-        r.read_to_string(&mut rest).unwrap();
-        assert_eq!(rest, "data:2\n");
+        assert!(curl_config(UPSTREAM, "POST", &hdrs(&[("A", "x\ty")]), b"", "T").is_some());
+    }
+
+    #[test]
+    fn endpoint_path_must_match_exactly() {
+        // Nothing installed in this process yet, or the seam test's endpoint.
+        assert!(endpoint_for("/").is_none());
+        assert!(endpoint_for("").is_none());
     }
 }

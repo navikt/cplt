@@ -487,29 +487,6 @@ impl PreparedSandbox {
         Ok(())
     }
 
-    /// Open one more loopback port to an OpenCode v2 session, for the GitHub
-    /// MCP proxy (#797). Call after [`Self::add_opencode_v2`].
-    pub fn allow_session_port(&mut self, port: u16) -> Result<(), String> {
-        #[cfg(target_os = "macos")]
-        {
-            use std::fmt::Write as _;
-            let _ = writeln!(
-                self.profile_text,
-                ";; GitHub MCP proxy (#797)\n(allow network-outbound (remote ip \"localhost:{port}\"))"
-            );
-        }
-        #[cfg(target_os = "linux")]
-        {
-            let rule = landlock_mod::NetRule { port };
-            if let Some(w) = &mut self.bwrap_wrapper {
-                w.net_rules.push(rule);
-            }
-            self.policy.net_rules.push(rule);
-            self.precomputed.reload(&self.policy)?;
-        }
-        Ok(())
-    }
-
     /// Withdraw the read grant on the root `AGENTS.md` (#252).
     ///
     /// The grant is built before cplt writes the managed block, so it assumes

@@ -1202,6 +1202,16 @@ fn handle_connection(
 
     if method.eq_ignore_ascii_case("CONNECT") {
         handle_connect(client, target, state, &mut classification);
+    } else if let Some(endpoint) = crate::github_mcp::endpoint_for(target) {
+        // OpenCode's GitHub MCP entry (#797): served on this port so the
+        // sandbox needs no new one. The head was read under this proxy's size
+        // cap and deadline, and the connection counts against its limit.
+        classification.complete(None);
+        let log = crate::github_mcp::Log {
+            level: state.log_level,
+            file: state.log_file.clone(),
+        };
+        endpoint.serve(client, &head, &log);
     } else {
         // For non-CONNECT, send a simple error — the sandbox should force
         // CONNECT via proxy env vars for HTTPS traffic
@@ -4174,6 +4184,95 @@ mod tests {
         assert!(!logged.contains("s3cret"));
         assert_eq!(logged.matches("***@example.invalid:443").count(), 3);
         assert!(!format!("{snapshot:?}").contains("secret"));
+    }
+
+    /// #797, across the real seam: a request to the secret path on the proxy
+    /// port goes through the system curl to a fake upstream, which sees only
+    /// what cplt allows; a wrong path stays the proxy's plain 405.
+    #[test]
+    fn github_mcp_endpoint_forwards_through_curl() {
+        use std::io::BufRead;
+        let up = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream = format!(
+            "http://127.0.0.1:{}/mcp/readonly",
+            up.local_addr().unwrap().port()
+        );
+        assert!(
+            crate::github_mcp::install_for_test(&upstream, "TOKEN", "s3cr3t").is_some(),
+            "no curl in the trusted dirs: this test cannot run without it"
+        );
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut s, _) = up.accept().unwrap();
+            let mut r = std::io::BufReader::new(s.try_clone().unwrap());
+            let mut req = String::new();
+            loop {
+                let mut l = String::new();
+                r.read_line(&mut l).unwrap();
+                req += &l;
+                if l == "\r\n" {
+                    break;
+                }
+            }
+            let mut body = [0; 7];
+            r.read_exact(&mut body).unwrap();
+            tx.send((req, body)).unwrap();
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n7\r\ndata:1\n\r\n").unwrap();
+            s.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            s.write_all(b"7\r\ndata:2\n\r\n0\r\n\r\n").unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let p = head_test_proxy(1, Duration::from_secs(10), dir.path().join("log"));
+
+        let mut bad = TcpStream::connect(("127.0.0.1", p.port)).unwrap();
+        bad.write_all(b"GET /s3cr3u HTTP/1.1\r\n\r\n").unwrap();
+        assert!(read_status_line(&mut bad).starts_with("HTTP/1.1 405"));
+
+        let mut c = TcpStream::connect(("127.0.0.1", p.port)).unwrap();
+        c.write_all(
+            b"POST /s3cr3t HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer agent\r\n\
+              X-MCP-Lockdown: false\r\nAccept: text/event-stream\r\nContent-Length: 7\r\n\r\n{\"a\":1}",
+        )
+        .unwrap();
+        let (req, body) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let lower = req.to_lowercase();
+        assert!(req.starts_with("POST /mcp/readonly HTTP/1.1"), "{req}");
+        assert!(lower.contains("authorization: bearer token\r\n"), "{req}");
+        assert!(!lower.contains("bearer agent"), "{req}");
+        assert!(
+            lower.contains("x-mcp-lockdown: true") && !lower.contains("lockdown: false"),
+            "{req}"
+        );
+        assert!(lower.contains("x-mcp-readonly: true"), "{req}");
+        assert!(lower.contains("accept: text/event-stream"), "{req}");
+        assert_eq!(&body, b"{\"a\":1}");
+
+        // The first event arrives before the upstream sends the second.
+        let mut r = std::io::BufReader::new(c);
+        let mut first = String::new();
+        let started = Instant::now();
+        while !first.contains("data:1") {
+            r.read_line(&mut first).unwrap();
+        }
+        assert!(started.elapsed() < Duration::from_millis(250), "buffered");
+        assert!(first.starts_with("HTTP/1.1 200"));
+        assert!(!first.to_lowercase().contains("transfer-encoding"));
+        let mut rest = String::new();
+        r.read_to_string(&mut rest).unwrap();
+        assert_eq!(rest, "data:2\n");
+
+        // A CR inside a header value is refused before curl sees it.
+        let mut cr = TcpStream::connect(("127.0.0.1", p.port)).unwrap();
+        cr.write_all(b"GET /s3cr3t HTTP/1.1\r\nMcp-Session-Id: a\rurl = \"http://x\"\r\n\r\n")
+            .unwrap();
+        assert!(read_status_line(&mut cr).starts_with("HTTP/1.1 400"));
+        // An oversized Content-Length is refused before any allocation.
+        let mut big = TcpStream::connect(("127.0.0.1", p.port)).unwrap();
+        big.write_all(b"POST /s3cr3t HTTP/1.1\r\nContent-Length: 9223372036854775807\r\n\r\n")
+            .unwrap();
+        assert!(read_status_line(&mut big).starts_with("HTTP/1.1 413"));
+        p.shutdown();
     }
 
     /// Proxy that lets CONNECT reach `origin_port` on IPv4 loopback directly.

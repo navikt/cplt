@@ -152,6 +152,11 @@ fn discover_auth_with(
     }
 }
 
+/// [`stored_gh_token`] kept redacted, for the GitHub MCP endpoint (#797).
+pub fn stored_gh_secret() -> Option<crate::agent::SecretToken> {
+    stored_gh_credential().cloned()
+}
+
 /// gh's stored github.com token, using the same probe for diagnosis and launch.
 /// A PATH lookup could execute an agent-planted binary outside the sandbox.
 pub(crate) fn stored_gh_token() -> Option<String> {

@@ -1073,27 +1073,31 @@ login, and OpenCode cannot get one inside cplt: GitHub's OAuth has no dynamic
 client registration, and cplt strips `GH_TOKEN` for OpenCode. With OpenCode v2,
 cplt fixes this with no setup.
 
-When OpenCode's config (your config dir, `OPENCODE_CONFIG`, the project's
-`opencode.json(c)` up to the repo root, or `OPENCODE_CONFIG_CONTENT`) has an
-`mcp.servers` entry (or a legacy `mcp.<name>` entry) whose URL is `https://api.githubcopilot.com/mcp` or
-`/mcp/readonly`, cplt:
+cplt looks for an entry whose URL is `https://api.githubcopilot.com/mcp` or
+`/mcp/readonly`, under `mcp.servers` or the older `mcp.<name>`. It only looks in
+config you control: `opencode.json(c)` and `config.json` in your OpenCode config
+dir (where `nav-pilot mcp enable --client opencode` writes), plus
+`OPENCODE_CONFIG_CONTENT` when it reaches the sandbox (`--pass-env` or
+`--inherit-env`). A project's `opencode.json` never turns it on,
+because the agent can write it. When cplt finds an entry, it:
 
 1. gets your gh token on the host (`gh auth token`, as for the gh guard);
-2. starts a proxy on `127.0.0.1` with a random port and a random secret path,
-   and opens only that port to the sandbox;
-3. sets `OPENCODE_CONFIG_CONTENT` so that entry points at the proxy with
-   `"oauth": false`. Any `OPENCODE_CONFIG_CONTENT` you set yourself is merged,
-   not replaced.
+2. serves an endpoint at a random secret path on its proxy port. No new port is
+   opened to the sandbox;
+3. sets `OPENCODE_CONFIG_CONTENT` so that entry points at the endpoint with
+   `"oauth": false`. An `OPENCODE_CONFIG_CONTENT` that reaches the sandbox is
+   merged, not replaced.
 
-The proxy sends every request to `https://api.githubcopilot.com/mcp/readonly`,
+The endpoint sends every request to `https://api.githubcopilot.com/mcp/readonly`,
 whatever URL the entry names. It adds the token and forces `X-MCP-Readonly: true`
-and `X-MCP-Lockdown: true`, and it drops any `Authorization`, `Cookie` or
-`X-MCP-*` header from the agent. The token stays on the host. Streaming
-responses pass through as they arrive. Requests are logged like proxy requests
-(`[github-mcp]` lines, and `--proxy-log`).
+and `X-MCP-Lockdown: true`. Any `Authorization` the entry sets is replaced, and
+`Cookie` and other `X-MCP-*` headers from the agent are dropped; `X-MCP-Toolsets`
+passes through. A header with a control character is refused. The token stays
+on the host. Streaming responses pass through as they arrive. Requests are
+logged like proxy requests (`[github-mcp]` lines, and `--proxy-log`).
 
-Without a gh login, cplt leaves the entry alone and prints one line: run
-`gh auth login`. OpenCode v1 entries are left alone.
+Without a gh login, or with the proxy off (`--no-proxy`), cplt leaves the entry
+alone and prints one line. OpenCode v1 entries are left alone.
 
 Turn it off with `sandbox.github_mcp_proxy = false`, or for one run with
 `--no-github-mcp-proxy`. `deny.env` naming `GH_TOKEN` or
