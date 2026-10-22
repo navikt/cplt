@@ -138,16 +138,20 @@ pub enum VersionStatus {
 
 /// Fetch the latest release from GitHub.
 pub fn fetch_latest_release(current_version: &str) -> Result<Release, UpdateError> {
-    let url = format!("{RELEASES_API}?per_page=20");
-    let body = curl_get_json(&url, current_version)?;
+    latest_release_via(|url| curl_get_json(url, current_version))
+}
 
-    let releases: Vec<serde_json::Value> = serde_json::from_str(&body)?;
+fn latest_release_via(
+    get: impl Fn(&str) -> Result<String, UpdateError>,
+) -> Result<Release, UpdateError> {
+    let releases: Vec<serde_json::Value> =
+        serde_json::from_str(&get(&format!("{RELEASES_API}?per_page=20"))?)?;
     if let Some(release) = releases.iter().find_map(as_release) {
         return Ok(release);
     }
     // The anonymous list endpoint sometimes returns `[]` for a public repo
     // that has releases; `/latest` still answers then.
-    let body = curl_get_json(&format!("{RELEASES_API}/latest"), current_version)?;
+    let body = get(&format!("{RELEASES_API}/latest"))?;
     as_release(&serde_json::from_str(&body)?).ok_or(UpdateError::NoRelease)
 }
 
@@ -1366,5 +1370,33 @@ mod tests {
         assert!(as_release(&rel(good, true, false)).is_none());
         assert!(as_release(&rel(good, false, true)).is_none());
         assert!(as_release(&rel("v1.0", false, false)).is_none());
+    }
+
+    #[test]
+    fn latest_release_falls_back_only_when_the_list_has_none() {
+        let tag = "2026.10.22-140206-df61740";
+        let one = |t: &str| serde_json::json!({ "tag_name": t }).to_string();
+        let calls = std::cell::RefCell::new(Vec::new());
+        let get = |list: String| {
+            let calls = &calls;
+            let latest = one(tag);
+            move |url: &str| {
+                calls.borrow_mut().push(url.to_string());
+                Ok(if url.ends_with("/latest") {
+                    latest.clone()
+                } else {
+                    list.clone()
+                })
+            }
+        };
+        assert_eq!(latest_release_via(get("[]".into())).unwrap().version, tag);
+        assert_eq!(calls.borrow().len(), 2);
+        calls.borrow_mut().clear();
+        let listed = format!("[{}]", one("2026.10.21-115541-d962b89"));
+        assert_eq!(
+            latest_release_via(get(listed)).unwrap().version,
+            "2026.10.21-115541-d962b89"
+        );
+        assert_eq!(calls.borrow().len(), 1);
     }
 }
