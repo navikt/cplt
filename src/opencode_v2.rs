@@ -69,6 +69,12 @@ pub(crate) fn xdg_base(var: &str, home: &Path, default: &str) -> PathBuf {
         .unwrap_or_else(|| home.join(default))
 }
 
+/// Where OpenCode keeps its snapshot git directories: `<data>/opencode/snapshot`,
+/// one store per project (v1) or per project and worktree (v2).
+pub fn snapshot_root(home: &Path) -> PathBuf {
+    xdg_base("XDG_DATA_HOME", home, ".local/share").join("opencode/snapshot")
+}
+
 /// Set up the session under `scratch` and return its env and profile tail.
 pub fn prepare(scratch: &Path, home: &Path, launch_dir: &Path) -> Result<Session, String> {
     let config_base = xdg_base("XDG_CONFIG_HOME", home, ".config");

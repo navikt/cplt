@@ -1598,6 +1598,198 @@ impl NestedGit {
     }
 }
 
+/// OpenCode's snapshot git directories, `<data>/opencode/snapshot/<id>` (v1)
+/// and `<data>/opencode/snapshot/<id>/<hash>` (v2), recorded before the
+/// session and checked after it.
+///
+/// # Why
+///
+/// They sit in OpenCode's data dir, which the sandbox grants writable, and
+/// outside every root [`NestedGit`] walks. OpenCode runs git in them on its
+/// next run, and when that run is outside cplt, a hook or a config key naming
+/// a program runs that program on the host. OpenCode writes the config once
+/// when it creates a store and never writes a hook, so a store that is new or
+/// changed and carries either is reported, the same way as a planted `.git`.
+///
+/// Read with [`crate::untrusted`]: a symlinked or non-regular config is
+/// reported, not followed.
+pub struct SnapshotStores {
+    root: PathBuf,
+    before: std::collections::BTreeMap<PathBuf, String>,
+}
+
+impl SnapshotStores {
+    pub fn capture(root: PathBuf) -> Self {
+        let before = snapshot_stores(&root)
+            .into_iter()
+            .map(|s| {
+                let state = store_state(&s).0;
+                (s, state)
+            })
+            .collect();
+        Self { root, before }
+    }
+
+    /// One line per store that is new or changed and holds a hook or a
+    /// program-running config key.
+    fn lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        for store in snapshot_stores(&self.root) {
+            let (state, findings) = store_state(&store);
+            if findings.is_empty() || self.before.get(&store) == Some(&state) {
+                continue;
+            }
+            lines.push(format!(
+                "  {}: {}",
+                esc_path(&store),
+                escape_path(&findings.join(", "))
+            ));
+        }
+        lines
+    }
+
+    pub fn report(&self) {
+        let lines = self.lines();
+        if lines.is_empty() {
+            return;
+        }
+        ui::error(
+            "An OpenCode snapshot store was created or changed during this session and \
+             holds a git hook or a config key that runs a program. OpenCode runs git in \
+             these stores, and outside cplt that program runs on the host. Do not run \
+             OpenCode outside cplt until you have checked them, or delete the store \
+             (OpenCode recreates it):",
+        );
+        for l in &lines {
+            ui::error(l);
+        }
+    }
+}
+
+/// Every git directory (a directory holding `HEAD`) one or two levels below
+/// `root`. Symlinked entries are not followed.
+fn snapshot_stores(root: &Path) -> Vec<PathBuf> {
+    let subdirs = |d: &Path| -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = std::fs::read_dir(d)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .map(|e| e.path())
+            .collect();
+        v.sort();
+        v
+    };
+    let is_store = |d: &Path| std::fs::symlink_metadata(d.join("HEAD")).is_ok();
+    let mut stores = Vec::new();
+    for d in subdirs(root) {
+        if is_store(&d) {
+            stores.push(d);
+        } else {
+            stores.extend(subdirs(&d).into_iter().filter(|s| is_store(s)));
+        }
+    }
+    stores
+}
+
+/// A store's config files and hook names, as one comparable string, and what
+/// in them could run a program.
+fn store_state(store: &Path) -> (String, Vec<String>) {
+    let mut state = String::new();
+    let mut findings = Vec::new();
+    for name in [
+        "config",
+        "opencode.gitconfig",
+        "config.worktree",
+        "commondir",
+    ] {
+        match crate::untrusted::read_untrusted(&store.join(name), 1 << 20) {
+            Ok(Some(text)) => {
+                if name == "commondir" {
+                    findings.push("commondir".to_string());
+                }
+                for key in risky_config_keys(&text) {
+                    findings.push(format!("{name}: {key}"));
+                }
+                state += &[name, "\0", &text, "\0"].concat();
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            _ => {
+                findings.push(format!("{name}: not a plain readable file"));
+                state += &[name, "\0?\0"].concat();
+            }
+        }
+    }
+    let hooks = store.join("hooks");
+    if std::fs::symlink_metadata(&hooks).is_ok_and(|m| !m.is_dir()) {
+        findings.push("hooks: not a directory".to_string());
+    }
+    let mut names: Vec<String> = std::fs::read_dir(&hooks)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    for n in &names {
+        // Git runs a hook by its exact name; the `.sample`s `git init` copies
+        // never run.
+        if !n.ends_with(".sample") {
+            findings.push(format!("hook {n}"));
+        }
+        state += &["hook\0", n, "\0"].concat();
+    }
+    (state, findings)
+}
+
+/// Config keys that make git run a program, or read config from elsewhere.
+///
+/// ponytail: a line-based key match, not a git config parser. A continuation
+/// line or a quoted `=` can hide a key from it; the change itself still shows
+/// in the store's state, so upgrade to `git config --list --file` (run with
+/// no hooks and no includes) if that matters.
+fn risky_config_keys(text: &str) -> Vec<String> {
+    const KEYS: &[&str] = &[
+        "hookspath",
+        "fsmonitor",
+        "command",
+        "pager",
+        "editor",
+        "askpass",
+        "textconv",
+        "external",
+        "helper",
+        "gitproxy",
+        "clean",
+        "smudge",
+        "process",
+    ];
+    let mut found = Vec::new();
+    for line in text.lines() {
+        let line = line.trim().to_ascii_lowercase();
+        if line.starts_with('[') {
+            if line.starts_with("[includeif") {
+                found.push(line);
+            }
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let (key, value) = (key.trim(), value.trim().trim_matches('"'));
+        let benign = match key {
+            "fsmonitor" => matches!(value, "false" | "no" | "off" | "0"),
+            // OpenCode's own include of its settings file.
+            "path" => value == "opencode.gitconfig",
+            _ => false,
+        };
+        if !benign && (key == "path" || KEYS.iter().any(|k| key.contains(k))) {
+            found.push(key.to_string());
+        }
+    }
+    found
+}
+
 /// Agent-chosen names: escaped like every other audit path.
 fn esc_path(p: &Path) -> String {
     escape_path(&p.to_string_lossy())
@@ -3338,6 +3530,106 @@ mod tests {
                 .iter()
                 .any(|c| c.path == "app/doomed.txt" && !c.is_new_untracked),
             "deleted pre-existing untracked file must be reported: {changes:?}"
+        );
+    }
+
+    /// A store laid out the way OpenCode v2 creates one: `git init` with
+    /// `GIT_DIR` (the template's sample hooks included), its settings file,
+    /// and the include appended to `config`.
+    fn opencode_store(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        let ok = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir)
+            .env("GIT_DIR", dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .expect("git init")
+            .success();
+        assert!(ok);
+        std::fs::write(
+            dir.join("opencode.gitconfig"),
+            "[core]\n\tautocrlf = false\n\tlongpaths = true\n\tfsmonitor = false\n\
+             \tuntrackedCache = true\n\t# A comment.\n\tsplitIndex = false\n\
+             [feature]\n\tmanyFiles = true\n[index]\n\tversion = 4\n",
+        )
+        .unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("config"))
+            .unwrap();
+        f.write_all(b"\n[include]\n\tpath = opencode.gitconfig\n")
+            .unwrap();
+    }
+
+    fn append(path: &Path, text: &str) {
+        let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        f.write_all(text.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn snapshot_stores_created_cleanly_are_not_reported() {
+        let root = tempfile::tempdir().unwrap();
+        let stores = SnapshotStores::capture(root.path().to_path_buf());
+        opencode_store(&root.path().join("proj/abc"));
+        opencode_store(&root.path().join("v1proj"));
+        assert_eq!(stores.lines(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn snapshot_store_plants_are_reported() {
+        let root = tempfile::tempdir().unwrap();
+        let (a, b, c) = (
+            root.path().join("p/a"),
+            root.path().join("p/b"),
+            root.path().join("v1"),
+        );
+        opencode_store(&a);
+        opencode_store(&b);
+        opencode_store(&c);
+        let stores = SnapshotStores::capture(root.path().to_path_buf());
+        append(&a.join("config"), "[core]\n\thooksPath = /tmp/x\n");
+        std::fs::write(b.join("hooks/post-index-change"), "#!/bin/sh\n").unwrap();
+        append(
+            &c.join("opencode.gitconfig"),
+            "[core]\n\tfsmonitor = /tmp/x\n",
+        );
+        let new = root.path().join("p/new");
+        opencode_store(&new);
+        append(&new.join("config"), "[filter \"x\"]\n\tclean = /tmp/x\n");
+        let lines = stores.lines();
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(lines[0].contains("hookspath"), "{lines:?}");
+        assert!(lines[1].contains("hook post-index-change"), "{lines:?}");
+        assert!(lines[2].contains("clean"), "{lines:?}");
+        assert!(
+            lines[3].contains("opencode.gitconfig: fsmonitor"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn snapshot_store_symlinked_config_is_reported_not_followed() {
+        let root = tempfile::tempdir().unwrap();
+        let stores = SnapshotStores::capture(root.path().to_path_buf());
+        let s = root.path().join("p/s");
+        opencode_store(&s);
+        std::fs::remove_file(s.join("opencode.gitconfig")).unwrap();
+        std::os::unix::fs::symlink("/dev/null", s.join("opencode.gitconfig")).unwrap();
+        let lines = stores.lines();
+        assert!(
+            lines.len() == 1 && lines[0].contains("not a plain readable file"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn risky_config_keys_leave_ordinary_settings_alone() {
+        assert!(risky_config_keys("[core]\n\tlongpaths = true\n\tfsmonitor = false\n").is_empty());
+        assert_eq!(
+            risky_config_keys("[core]\n\tsshCommand = x\n[includeIf \"gitdir:/\"]\n\tpath = /x\n"),
+            ["sshcommand", "[includeif \"gitdir:/\"]", "path"]
         );
     }
 }
