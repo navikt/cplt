@@ -732,6 +732,7 @@ fn plugin_dir_grants(dirs: Vec<PathBuf>, home: &Path, writable: &[PathBuf]) -> V
         if sensitive(&real) || via.iter().any(|p| sensitive(p)) {
             continue;
         }
+        // ponytail: native `.node` addons need file-map-executable, which is not granted.
         out.push(AgentDir {
             path: real,
             write: false,
@@ -3089,7 +3090,8 @@ pub fn deny_copilot_dir_exec(dirs: &mut [AgentDir], home: &Path) -> bool {
 /// brings the built-in agent dirs in line. Paths that cannot be resolved (a dir
 /// the caller has not created yet, a dangling link) are left as-is so the
 /// caller still emits a rule for the literal path rather than dropping it.
-/// Drop hook/MCP script grants (file-level, exec-only) that sit under a path
+/// Drop hook/MCP script grants (file-level, exec-only) and OpenCode v2
+/// plugin-dir grants (read-only, [`plugin_dir_grants`]) that sit under a path
 /// the sandbox already makes writable: the project, `--repo-dir` roots,
 /// `allow.write`, the writable home tool dirs, the system temp dirs
 /// ([`crate::sandbox::home_and_temp_writable_roots`]) and the agent's own
@@ -3109,7 +3111,11 @@ pub fn drop_script_grants_under(dirs: &mut Vec<AgentDir>, writable: &[PathBuf]) 
         .collect();
     roots.dedup();
     dirs.retain(|d| {
-        let script = !d.write && d.process_exec && !d.map_exec && d.path.is_file();
+        // Script grants, and OpenCode v2's read-only plugin-dir grants (the
+        // only non-exec grants that carry `via`).
+        let script = !d.write
+            && !d.map_exec
+            && ((d.process_exec && d.path.is_file()) || (!d.process_exec && !d.via.is_empty()));
         let under = |p: &PathBuf| roots.iter().any(|r| path_under(p, r));
         !(script && (under(&d.path) || d.via.iter().any(under)))
     });
@@ -3851,6 +3857,14 @@ mod tests {
             got.iter()
                 .all(|d| !d.write && d.process_exec == (d.path == mcp))
         );
+        // A config dir inside a writable tree grants nothing, plugin dirs included.
+        let mut dirs = got.clone();
+        drop_script_grants_under(&mut dirs, &[home.join(".config")]);
+        assert!(dirs.is_empty(), "{dirs:?}");
+        // A plugin dir inside the project is dropped by its path.
+        let mut dirs = got;
+        drop_script_grants_under(&mut dirs, std::slice::from_ref(&ext));
+        assert!(dirs.iter().all(|d| !d.path.starts_with(&ext)), "{dirs:?}");
     }
 
     #[test]
