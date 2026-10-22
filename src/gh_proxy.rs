@@ -2787,6 +2787,13 @@ const GIT_ALLOWED_SUBCOMMANDS: &[&str] = &[
     "mailinfo",
     "mailsplit",
     "stripspace",
+    "check-ignore",
+    "show-index",
+    // Plumbing: index and tree objects. OpenCode v2 snapshots run these against
+    // its own `--git-dir` (#738). They write the index and loose objects, never
+    // a ref, and as builtins they cannot be shadowed by an alias.
+    "update-index",
+    "write-tree",
     // Plumbing: packing (local)
     "pack-objects",
     "unpack-objects",
@@ -6353,6 +6360,31 @@ mod tests {
             force_only(&["status"]).is_ok(),
             "force-push-only must still allow ordinary read commands"
         );
+    }
+
+    #[test]
+    fn git_opencode_v2_snapshot_plumbing_allowed_under_push_prevention() {
+        // The argv shapes OpenCode v2's snapshot code runs (#738).
+        for sub in [
+            &[
+                "update-index",
+                "--add",
+                "--remove",
+                "--replace",
+                "-z",
+                "--stdin",
+            ][..],
+            &["write-tree"],
+            &["check-ignore", "--no-index", "--stdin", "-z"],
+            &["show-index"],
+        ] {
+            let mut args = vec!["--git-dir", "/tmp/snap", "--work-tree", "/tmp/wt"];
+            args.extend_from_slice(sub);
+            assert!(
+                gate_git(&args, true, true, false, &[], None, &RepoFacts::default()).is_ok(),
+                "{args:?}"
+            );
+        }
     }
 
     #[test]
