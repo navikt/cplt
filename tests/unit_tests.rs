@@ -10115,6 +10115,7 @@ agent = "copilot"
 preset = "standard"
 validate = true
 brief = false
+github_mcp_proxy = true
 agents_md = false
 allow_env_files = false
 allow_localhost_any = false

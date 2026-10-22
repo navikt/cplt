@@ -166,6 +166,10 @@ pub fn default_config_contents() -> String {
 # touches the project directory.
 # brief = false
 #
+# OpenCode: route a GitHub MCP entry (api.githubcopilot.com/mcp) through a
+# host-side read-only proxy holding your gh login (default: true).
+# github_mcp_proxy = true
+#
 # EXPERIMENTAL (unstable, may be removed): also inject the managed cplt sandbox
 # block into the project's AGENTS.md on every launch (default: false). Requires
 # brief = true, and writes into your repo — review and commit it yourself.

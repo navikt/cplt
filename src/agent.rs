@@ -883,7 +883,7 @@ fn plugin_entrypoint(dir: &Path, v2: bool) -> Option<PathBuf> {
 
 /// JSONC to JSON: drops `//` and `/* */` comments outside strings and
 /// trailing commas before `}` or `]`.
-fn strip_jsonc(text: &str) -> String {
+pub(crate) fn strip_jsonc(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     let mut in_str = false;

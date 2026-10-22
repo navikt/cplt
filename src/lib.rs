@@ -15,6 +15,7 @@ pub mod doctor;
 pub mod gh_graphql;
 pub mod gh_proxy;
 pub mod git;
+pub mod github_mcp;
 pub mod gradle_init;
 pub mod init;
 pub mod link;

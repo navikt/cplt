@@ -47,7 +47,7 @@ impl ProxyLogLevel {
     }
 
     /// Whether this status should be logged at the given level.
-    fn should_log(self, status: &str) -> bool {
+    pub(crate) fn should_log(self, status: &str) -> bool {
         match self {
             Self::None => false,
             Self::Error => is_error_status(status),
@@ -2627,7 +2627,7 @@ fn log_connection(
     }
 }
 
-fn chrono_now() -> String {
+pub(crate) fn chrono_now() -> String {
     use std::time::SystemTime;
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -2639,7 +2639,7 @@ fn chrono_now() -> String {
     format!("{hours:02}:{mins:02}:{s:02}")
 }
 
-fn iso_now() -> String {
+pub(crate) fn iso_now() -> String {
     use std::time::SystemTime;
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)

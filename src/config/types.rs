@@ -651,6 +651,9 @@ pub struct SandboxConfig {
     /// (default: false — opt-in). Enable with `--brief` or
     /// `sandbox.brief = true`.
     pub brief: Option<bool>,
+    /// Route OpenCode's GitHub MCP entry through cplt's read-only proxy
+    /// (default: true, #797).
+    pub github_mcp_proxy: Option<bool>,
     /// Also inject the managed sandbox block into the project's `AGENTS.md`
     /// (default: false — opt-in, since it writes into the user's repo).
     /// Requires `brief`: with the brief off, this never fires.
@@ -1001,6 +1004,7 @@ pub struct Resolved {
     pub allow_env_files: bool,
     pub no_validate: bool,
     pub brief: bool,
+    pub github_mcp_proxy: bool,
     pub agents_md: bool,
     pub pass_env: Vec<String>,
     pub inherit_env: bool,
@@ -1097,6 +1101,8 @@ pub struct CliFlags {
     /// Tri-state so a config `sandbox.brief = true` can be turned off for one
     /// run without editing the config.
     pub brief: FeatureToggle,
+    /// `--github-mcp-proxy` / `--no-github-mcp-proxy` (#797).
+    pub github_mcp_proxy: FeatureToggle,
     /// `--agents-md` / `--no-agents-md`: the managed AGENTS.md block for this
     /// run. Still gated on `brief`, exactly like `sandbox.agents_md`, so
     /// `--no-brief` suppresses it too.

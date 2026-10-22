@@ -284,6 +284,53 @@ fn global_config_file(user_oc: &Path) -> Option<PathBuf> {
     found.next().is_none().then_some(file)
 }
 
+/// Route the user's GitHub MCP entries through the read-only proxy (#797):
+/// starts it and adds the `OPENCODE_CONFIG_CONTENT` overlay to `session`.
+/// Returns the proxy's port for the sandbox to allow. Only reads config and
+/// asks gh for a token when such an entry exists, so other launches pay
+/// nothing. `deny.env` naming `GH_TOKEN` or `OPENCODE_CONFIG_CONTENT` turns
+/// it off, like the #695 handover.
+pub fn github_mcp(
+    session: &mut Session,
+    home: &Path,
+    launch_dir: &Path,
+    deny_env: &[String],
+    log: crate::github_mcp::Log,
+) -> Option<u16> {
+    const VAR: &str = "OPENCODE_CONFIG_CONTENT";
+    if deny_env.iter().any(|d| d == "GH_TOKEN" || d == VAR) {
+        return None;
+    }
+    let user_oc = std::env::var_os("OPENCODE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| xdg_base("XDG_CONFIG_HOME", home, ".config").join("opencode"));
+    let existing = std::env::var(VAR).ok();
+    let names = crate::github_mcp::configured_servers(&user_oc, launch_dir, existing.as_deref());
+    if names.is_empty() {
+        return None;
+    }
+    let Some(token) = crate::discover::stored_gh_token() else {
+        crate::ui::warn("GitHub MCP in OpenCode needs your gh login: run `gh auth login`.");
+        return None;
+    };
+    let proxy = match crate::github_mcp::start(token, log) {
+        Ok(p) => p,
+        Err(e) => {
+            crate::ui::warn(&format!("GitHub MCP proxy not started: {e}"));
+            return None;
+        }
+    };
+    let Some(value) = crate::github_mcp::overlay(existing.as_deref(), &names, &proxy.url) else {
+        crate::ui::warn(&format!(
+            "{VAR} is not a JSON object; GitHub MCP left as configured."
+        ));
+        return None;
+    };
+    session.env.push((VAR.into(), value));
+    Some(proxy.port)
+}
+
 /// `overlay` = a link per entry of `user`, except `opencode`, which becomes a
 /// real dir holding a link per entry of `user_oc` except `service.json`, and
 /// `opencode.json(c)` when `explicit` (v2 loads it via `OPENCODE_CONFIG`).

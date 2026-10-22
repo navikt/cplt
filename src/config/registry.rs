@@ -239,6 +239,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "sandbox",
+        key: "github_mcp_proxy",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "true",
+        description: "OpenCode v2: route a GitHub MCP entry through a host-side read-only proxy holding the gh login.",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
         key: "brief",
         value_type: ConfigValueType::Bool,
         dangerous: false,
@@ -966,6 +974,12 @@ bool_keys! {
         config = |c: &Config| c.sandbox.validate,
         baseline = |_: PresetBaseline| true,
         resolved = |r: &Resolved| !r.no_validate;
+
+    github_mcp_proxy, "sandbox", "github_mcp_proxy",
+        cli = |c: &CliFlags| c.github_mcp_proxy,
+        config = |c: &Config| c.sandbox.github_mcp_proxy,
+        baseline = |_: PresetBaseline| true,
+        resolved = |r: &Resolved| r.github_mcp_proxy;
 
     brief, "sandbox", "brief",
         cli = |c: &CliFlags| c.brief,
