@@ -158,6 +158,24 @@ Fake
         self.assertTrue(any("'integration-tests' is still in_progress" in e for e in errors))
         self.assertTrue(any("'linux-integration-tests' has not started" in e for e in errors))
 
+    def test_verify_code_checks_waits_for_pending_code_run(self):
+        env = {
+            "EVENT_NAME": "pull_request",
+            "PR_AUTHOR": "octocat",
+            "GITHUB_REPOSITORY": "navikt/cplt",
+            "PR_BODY": VALID_BODY,
+            "HEAD_SHA": "abcdef1234567",
+            "CI_OK_WAIT_SECONDS": "600",
+        }
+        results = [["ci-ok: required check 'unit-tests' is still in_progress on abcdef1; x"], []]
+        out = io.StringIO()
+        with patch.dict(os.environ, env, clear=True), patch.object(
+            check_pr_body, "verify_code_checks", side_effect=results
+        ), patch.object(check_pr_body.time, "sleep") as sleep, contextlib.redirect_stdout(out):
+            rc = check_pr_body.main(["--verify-code-checks"])
+        self.assertEqual(rc, 0)
+        sleep.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
