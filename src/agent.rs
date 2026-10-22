@@ -595,7 +595,7 @@ fn opencode_script_grants(config_dir: &Path, home: &Path, writable: &[PathBuf]) 
 }
 
 /// Read-only grants for the OpenCode 2.x config sources outside its config
-/// dir (#800): the root-owned system dir (`/Library/Application
+/// dir (#800): the admin-managed system dir (`/Library/Application
 /// Support/opencode`, `/etc/opencode`), and in each `.opencode` dir from `cwd`
 /// up to `/` (e.g. `~/.opencode`) its `plugin`, `plugins` and
 /// `opencode.json(c)`, plus the plugin and MCP grants of their config. The
@@ -622,8 +622,11 @@ fn opencode_extra_config_grants(
             out.extend(opencode_script_grants(&dir, home, writable));
         }
     }
+    let keychains = home.join("Library/Keychains");
     let unsafe_ = |p: &Path| {
-        crate::sandbox::dir_overlaps_credentials(home, p)
+        p.starts_with(&keychains)
+            || keychains.starts_with(p)
+            || crate::sandbox::dir_overlaps_credentials(home, p)
             || crate::sandbox::validate_sbpl_path(p).is_err()
     };
     for path in paths {
