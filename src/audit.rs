@@ -1743,7 +1743,17 @@ impl SnapshotStores {
             findings: vec!["a symlink".into()],
         };
         let mut out = Vec::new();
-        for (d1, t1) in lstat_entries(&self.root) {
+        let unlistable = |path: &Path, e: io::Error| StoreEntry {
+            path: path.to_path_buf(),
+            state: "unlistable".into(),
+            findings: vec![format!("could not be listed ({e})")],
+        };
+        let top = match lstat_entries(&self.root) {
+            Ok(v) => v,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return vec![unlistable(&self.root, e)],
+        };
+        for (d1, t1) in top {
             if t1.is_symlink() {
                 out.push(link(d1));
                 continue;
@@ -1754,7 +1764,14 @@ impl SnapshotStores {
             if is_store(&d1) {
                 out.push(self.store_entry(d1.clone()));
             }
-            for (d2, t2) in lstat_entries(&d1) {
+            let level2 = match lstat_entries(&d1) {
+                Ok(v) => v,
+                Err(e) => {
+                    out.push(unlistable(&d1, e));
+                    continue;
+                }
+            };
+            for (d2, t2) in level2 {
                 if t2.is_symlink() {
                     out.push(link(d2));
                 } else if t2.is_dir() && is_store(&d2) {
@@ -1916,12 +1933,18 @@ impl SnapshotStores {
         if std::fs::symlink_metadata(&hooks).is_ok_and(|m| !m.is_dir()) {
             findings.push("hooks: not a directory".to_string());
         }
-        let mut names: Vec<std::ffi::OsString> = std::fs::read_dir(&hooks)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.file_name())
-            .collect();
+        let mut names: Vec<std::ffi::OsString> = Vec::new();
+        match std::fs::read_dir(&hooks).and_then(|rd| {
+            rd.map(|e| e.map(|e| e.file_name()))
+                .collect::<io::Result<Vec<_>>>()
+        }) {
+            Ok(v) => names = v,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                findings.push(format!("hooks: could not be listed ({e})"));
+                state += "hooks\0?\0";
+            }
+        }
         names.sort();
         for n in &names {
             let shown = n.to_string_lossy();
@@ -1930,14 +1953,33 @@ impl SnapshotStores {
             if shown.ends_with(".sample") {
                 continue;
             }
+            // Type, mode and link target, none followed, and bounded content
+            // below: a hook rewritten, re-aimed or made executable under the
+            // same name is a change.
+            let path = hooks.join(n);
+            let meta = std::fs::symlink_metadata(&path).ok().map(|m| {
+                use std::os::unix::fs::MetadataExt;
+                (m.mode(), m.size(), m.ino(), m.ctime(), m.ctime_nsec())
+            });
+            state += &[
+                format!("{meta:?}{:?}", std::fs::read_link(&path).ok()).as_str(),
+                "\0",
+            ]
+            .concat();
             // A byte-identical copy of a template hook is what `git init`
-            // put there.
-            let body = read_bytes_untrusted(&hooks.join(n));
+            // put there, with the same exec bit (git skips a non-executable
+            // hook, so `chmod +x` alone arms one).
+            let body = read_bytes_untrusted(&path);
+            let exec = |m: (u32, u64, u64, i64, i64)| m.0 & 0o111 != 0;
             let from_template = body.as_ref().is_some_and(|b| {
-                self.templates
-                    .get_or_init(template_dirs)
-                    .iter()
-                    .any(|t| std::fs::read(t.join("hooks").join(n)).is_ok_and(|tb| &tb == b))
+                self.templates.get_or_init(template_dirs).iter().any(|t| {
+                    let tp = t.join("hooks").join(n);
+                    std::fs::read(&tp).is_ok_and(|tb| &tb == b)
+                        && std::fs::metadata(&tp).ok().map(|m| {
+                            use std::os::unix::fs::PermissionsExt;
+                            m.permissions().mode() & 0o111 != 0
+                        }) == meta.map(exec)
+                })
             });
             if !from_template {
                 findings.push(format!("hook {shown}"));
@@ -1973,20 +2015,22 @@ fn print_quarantined(results: &[(StoreEntry, io::Result<PathBuf>)], headline: &s
 
 /// `dir`'s entries with their own type (`lstat`, links not followed), sorted.
 /// Quarantined names are skipped: OpenCode never opens them.
-fn lstat_entries(dir: &Path) -> Vec<(PathBuf, std::fs::FileType)> {
-    let mut v: Vec<_> = std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| {
-            !e.file_name()
-                .to_string_lossy()
-                .contains(".cplt-quarantine-")
-        })
-        .filter_map(|e| Some((e.path(), e.file_type().ok()?)))
-        .collect();
+/// A listing error is an error, never an empty directory: git can still open
+/// a known name inside a directory it cannot list.
+fn lstat_entries(dir: &Path) -> io::Result<Vec<(PathBuf, std::fs::FileType)>> {
+    let mut v = Vec::new();
+    for e in std::fs::read_dir(dir)? {
+        let e = e?;
+        if !e
+            .file_name()
+            .to_string_lossy()
+            .contains(".cplt-quarantine-")
+        {
+            v.push((e.path(), e.file_type()?));
+        }
+    }
     v.sort_by(|a, b| a.0.cmp(&b.0));
-    v
+    Ok(v)
 }
 
 fn is_store(d: &Path) -> bool {
@@ -4232,5 +4276,89 @@ mod tests {
                 std::fs::copy(e.path(), to.join(e.file_name())).unwrap();
             }
         }
+    }
+
+    fn chmod(p: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn unlistable_project_and_hooks_dirs_are_findings() {
+        let root = tempfile::tempdir().unwrap();
+        let (a, b) = (root.path().join("p/a"), root.path().join("q/b"));
+        opencode_store(&a);
+        opencode_store(&b);
+        let stores = cap(root.path());
+        std::fs::write(a.join("hooks/post-index-change"), "#!/bin/sh\n").unwrap();
+        // Search permission kept, listing taken away.
+        chmod(&a.join("hooks"), 0o311);
+        chmod(&root.path().join("q"), 0o311);
+        let lines = flagged_lines(&stores);
+        chmod(&a.join("hooks"), 0o755);
+        chmod(&root.path().join("q"), 0o755);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].contains("p/a: hooks: could not be listed"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[1].ends_with("/q: could not be listed (Permission denied (os error 13))"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_template_hook_changed_under_its_name_is_caught() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let tpl = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tpl.path().join("hooks")).unwrap();
+        let t = tpl.path().join("hooks/pre-commit");
+        std::fs::write(&t, "#!/bin/sh\nsecrets\n").unwrap();
+        chmod(&t, 0o644);
+        let (a, b, c) = (
+            root.path().join("p/a"),
+            root.path().join("p/b"),
+            root.path().join("p/c"),
+        );
+        for s in [&a, &b, &c] {
+            opencode_store(s);
+            std::fs::copy(&t, s.join("hooks/pre-commit")).unwrap();
+            chmod(&s.join("hooks/pre-commit"), 0o644);
+        }
+        let stores = SnapshotStores::capture_with(
+            root.path().to_path_buf(),
+            Some(vec![tpl.path().to_path_buf()]),
+            None,
+        );
+        assert!(
+            a.exists() && b.exists() && c.exists(),
+            "template copies are clean"
+        );
+        // Content, exec bit, and a link to the template's own file.
+        std::fs::write(a.join("hooks/pre-commit"), "#!/bin/sh\nevil\n").unwrap();
+        chmod(&b.join("hooks/pre-commit"), 0o755);
+        std::fs::remove_file(c.join("hooks/pre-commit")).unwrap();
+        std::os::unix::fs::symlink(&t, c.join("hooks/pre-commit")).unwrap();
+        let lines = flagged_lines(&stores);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(
+            lines.iter().all(|l| l.ends_with("hook pre-commit")),
+            "{lines:?}"
+        );
+        assert_eq!(
+            std::fs::metadata(&t).unwrap().permissions().mode() & 0o111,
+            0
+        );
+    }
+
+    #[test]
+    fn an_include_differing_only_in_case_is_flagged() {
+        let keys = |t: &str| crate::with_env_lock_no_xdg(|| risky_config_keys(t)).unwrap();
+        assert_eq!(
+            keys("[include]\n\tpath = OpenCode.gitconfig\n"),
+            ["include.path"]
+        );
     }
 }
