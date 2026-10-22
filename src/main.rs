@@ -3768,6 +3768,9 @@ fn agent_allowlist(
     allowed_domains_file: bool,
     deny_env: &[String],
 ) -> Vec<String> {
+    if !default_allowlist && !allowed_domains_file {
+        return Vec::new();
+    }
     let v2 = agent == agent::Agent::OpenCode
         && agent.resolve_binary().is_ok_and(|bin| {
             let home = std::env::var_os("HOME")
