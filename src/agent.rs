@@ -1978,9 +1978,8 @@ impl Agent {
                 let data_dir = data_base.join("opencode");
 
                 // Respect XDG_STATE_HOME for state dir (locks, history, statistics)
-                let state_base = std::env::var("XDG_STATE_HOME")
-                    .ok()
-                    .map_or_else(|| home.join(".local/state"), PathBuf::from);
+                let state_base =
+                    crate::opencode_v2::xdg_base("XDG_STATE_HOME", home, ".local/state");
                 let state_dir = state_base.join("opencode");
 
                 // Respect XDG_CACHE_HOME for cache dir (managed tool binaries in bin/)
@@ -2300,9 +2299,8 @@ impl Agent {
                 let data_base = std::env::var("XDG_DATA_HOME")
                     .ok()
                     .map_or_else(|| home.join(".local/share"), PathBuf::from);
-                let state_base = std::env::var("XDG_STATE_HOME")
-                    .ok()
-                    .map_or_else(|| home.join(".local/state"), PathBuf::from);
+                let state_base =
+                    crate::opencode_v2::xdg_base("XDG_STATE_HOME", home, ".local/state");
                 vec![
                     AgentDir {
                         path: config_base.join("goose"),

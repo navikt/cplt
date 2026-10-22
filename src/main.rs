@@ -4729,7 +4729,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         };
         let session = cplt::opencode_v2::prepare(scratch, &home_dir, &launch_dir)
             .map_err(|e| anyhow::anyhow!("Cannot set up the OpenCode v2 session: {e}"))?;
-        v2_model = Some(session.model.clone());
+        v2_model = session.model.clone().ok();
         // These variables carry the session's isolation; dropping them would
         // point OpenCode back at the host service.
         if let Some((name, _)) = session

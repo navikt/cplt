@@ -37,8 +37,10 @@ pub struct Session {
     pub env: Vec<(String, String)>,
     /// The session service's loopback port.
     pub port: u16,
-    /// The host `model.json` as copied in, for [`save_model`] at exit.
-    pub model: Option<String>,
+    /// The host `model.json` as copied in (`Ok(None)`: there was none), for
+    /// [`save_model`] at exit. `Err`: the host file was refused or not
+    /// copied, so it is left alone.
+    pub model: Result<Option<String>, ()>,
     /// Appended to the end of the macOS profile (last match wins).
     #[cfg(target_os = "macos")]
     pub sbpl: String,
@@ -59,7 +61,7 @@ pub struct Session {
 
 /// An XDG base from the environment, ignoring a relative or empty value as the
 /// spec says, else `$HOME/<default>`.
-fn xdg_base(var: &str, home: &Path, default: &str) -> PathBuf {
+pub(crate) fn xdg_base(var: &str, home: &Path, default: &str) -> PathBuf {
     std::env::var_os(var)
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
@@ -148,28 +150,37 @@ const MODEL_LIMIT: u64 = 1 << 20;
 /// `prompt-history.jsonl` to the host file, created empty (0600) if missing so
 /// concurrent sessions share it. The host side never reads the history. Best
 /// effort: a failure costs the user their favourites, not the session.
-fn carry_in_state(host: &Path, own: &Path) -> Option<String> {
+fn carry_in_state(host: &Path, own: &Path) -> Result<Option<String>, ()> {
     let history = host.join("prompt-history.jsonl");
-    // O_NOFOLLOW: the host state dir is agent-writable, so a planted link
-    // must not make cplt create a file elsewhere.
+    // The host state dir is agent-writable: O_NOFOLLOW so a planted link
+    // does not make cplt create a file elsewhere, O_NONBLOCK so a planted
+    // FIFO does not hang the launch.
     let made = std::fs::create_dir_all(host).and_then(|()| {
-        std::fs::OpenOptions::new()
+        let f = std::fs::OpenOptions::new()
             .append(true)
             .create(true)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&history)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(&history)?;
+        if !f.metadata()?.is_file() {
+            return Err(std::io::Error::other("not a regular file"));
+        }
+        Ok(())
     });
     if let Err(e) =
-        made.and_then(|_| std::os::unix::fs::symlink(&history, own.join("prompt-history.jsonl")))
+        made.and_then(|()| std::os::unix::fs::symlink(&history, own.join("prompt-history.jsonl")))
     {
         crate::ui::warn(&format!("OpenCode v2: prompt history not shared: {e}"));
     }
-    let text = crate::untrusted::read_untrusted(&host.join("model.json"), MODEL_LIMIT)
-        .ok()
-        .flatten()?;
-    std::fs::write(own.join("model.json"), &text).ok()?;
-    Some(text)
+    let text = match crate::untrusted::read_untrusted(&host.join("model.json"), MODEL_LIMIT) {
+        Ok(Some(t)) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // A link (a dotfile manager's), FIFO or oversized file: never copied
+        // back over.
+        _ => return Err(()),
+    };
+    std::fs::write(own.join("model.json"), &text).map_err(|_| ())?;
+    Ok(Some(text))
 }
 
 /// Copy the session's `model.json` back to the host if it changed since
@@ -918,7 +929,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (host, own) = (tmp.path().join("host"), tmp.path().join("own"));
         std::fs::create_dir_all(&own).unwrap();
-        assert_eq!(carry_in_state(&host, &own), None, "no host model.json");
+        assert_eq!(carry_in_state(&host, &own), Ok(None), "no host model.json");
         let history = host.join("prompt-history.jsonl");
         assert_eq!(
             std::fs::read_link(own.join("prompt-history.jsonl")).unwrap(),
@@ -928,7 +939,7 @@ mod tests {
         std::fs::remove_file(own.join("prompt-history.jsonl")).unwrap();
 
         std::fs::write(host.join("model.json"), r#"{"a":1}"#).unwrap();
-        let before = carry_in_state(&host, &own);
+        let before = carry_in_state(&host, &own).unwrap();
         assert_eq!(before.as_deref(), Some(r#"{"a":1}"#));
         assert_eq!(
             std::fs::read_to_string(own.join("model.json")).unwrap(),
@@ -968,5 +979,28 @@ mod tests {
             2,
             "no temp left behind"
         );
+
+        // A refused host model.json (here a dotfile link) is never copied back.
+        let target = tmp.path().join("dotfile.json");
+        std::fs::write(&target, r#"{"d":1}"#).unwrap();
+        std::fs::remove_file(host.join("model.json")).unwrap();
+        std::os::unix::fs::symlink(&target, host.join("model.json")).unwrap();
+        std::fs::remove_file(own.join("prompt-history.jsonl")).unwrap();
+        assert_eq!(carry_in_state(&host, &own), Err(()));
+    }
+
+    /// A FIFO planted at the host history file must not hang the launch.
+    #[test]
+    fn history_fifo_does_not_hang() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (host, own) = (tmp.path().join("host"), tmp.path().join("own"));
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::create_dir_all(&own).unwrap();
+        let fifo =
+            std::ffi::CString::new(host.join("prompt-history.jsonl").to_str().unwrap()).unwrap();
+        // SAFETY: valid C string.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert_eq!(carry_in_state(&host, &own), Ok(None));
+        assert!(std::fs::symlink_metadata(own.join("prompt-history.jsonl")).is_err());
     }
 }
