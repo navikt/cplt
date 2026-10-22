@@ -452,6 +452,11 @@ impl PreparedSandbox {
                     nofollow: true,
                 }))
                 .collect();
+            // The wrapper's mounts were built before this file was granted;
+            // without a bind it stays read-only under `--ro-bind / /`.
+            for path in &session.writes {
+                bubblewrap::bind_late_writable(&mut w.bwrap_args, path)?;
+            }
             w.fs_rules.extend(extra.iter().cloned());
             w.fs_rules.push(landlock_mod::FsRule {
                 path: PathBuf::from("/proc"),
@@ -3820,13 +3825,18 @@ mod tests {
         let mut config = test_config(&home, &[]);
         config.use_bubblewrap = Some(false);
         let mut sandbox = prepare(&config).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let history = std::fs::canonicalize(tmp.path())
+            .unwrap()
+            .join("prompt-history.jsonl");
+        std::fs::write(&history, "").unwrap();
         let session = || crate::opencode_v2::Session {
             env: Vec::new(),
             port: 50123,
             model: Err(()),
             hidden: Vec::new(),
             reads: Vec::new(),
-            writes: vec![PathBuf::from("/s/opencode/prompt-history.jsonl")],
+            writes: vec![history.clone()],
         };
         let err = sandbox.add_opencode_v2(session()).unwrap_err();
         assert!(err.contains("needs Bubblewrap"), "{err}");
@@ -3871,6 +3881,12 @@ mod tests {
                         && r.nofollow)
             );
         }
+        let h = history.to_string_lossy();
+        assert!(
+            w.bwrap_args
+                .windows(3)
+                .any(|a| a[0] == "--bind" && a[1] == h && a[2] == h)
+        );
     }
 
     /// #252: revoking the root AGENTS.md grant removes exactly that rule, on

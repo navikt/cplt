@@ -3182,7 +3182,11 @@ pub fn deny_copilot_dir_exec(dirs: &mut [AgentDir], home: &Path) -> bool {
 pub fn drop_opencode_v2_state_dir(dirs: &mut Vec<AgentDir>, home: &Path) {
     let state =
         crate::opencode_v2::xdg_base("XDG_STATE_HOME", home, ".local/state").join("opencode");
-    dirs.retain(|d| d.path != state);
+    // When another grant names the same dir (state and data both at
+    // `/x/opencode`), that grant is still needed: v2 keeps opencode.db there.
+    if dirs.iter().filter(|d| d.path == state).count() == 1 {
+        dirs.retain(|d| d.path != state);
+    }
 }
 
 /// Drop hook/MCP script grants (file-level, exec-only) and OpenCode v2
@@ -5712,6 +5716,22 @@ mod tests {
                 drop_opencode_v2_state_dir(&mut dirs, Path::new("/Users/test"));
                 assert!(!dirs.iter().any(|d| d.path.starts_with(&state)), "v2");
                 assert_eq!(dirs.len(), before - 1, "nothing else dropped");
+            },
+        );
+        // State and data in one dir: the data grant v2 needs stays.
+        temp_env::with_vars(
+            [
+                ("XDG_STATE_HOME", Some("/xdg/same")),
+                ("XDG_DATA_HOME", Some("/xdg/same")),
+                ("OPENCODE_CONFIG_DIR", None),
+            ],
+            || {
+                let mut dirs = Agent::OpenCode.config_dirs(Path::new("/Users/test"));
+                let before = dirs.len();
+                drop_opencode_v2_state_dir(&mut dirs, Path::new("/Users/test"));
+                assert_eq!(dirs.len(), before);
+                let same = Path::new("/xdg/same/opencode");
+                assert!(dirs.iter().any(|d| d.path == same && d.write));
             },
         );
     }

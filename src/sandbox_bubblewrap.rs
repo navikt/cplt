@@ -1224,6 +1224,25 @@ fn nofollow_bind_path(path: &Path) -> Option<PathBuf> {
     Some(path.to_path_buf())
 }
 
+/// Bind a file granted after [`build_wrapper`] (OpenCode v2's host prompt
+/// history, #796) writable, where the writable binds go: after the base
+/// mounts, before every deny mask and read-only overlay, so those still win.
+pub(crate) fn bind_late_writable(args: &mut Vec<String>, path: &Path) -> Result<(), String> {
+    let p = nofollow_bind_path(path).ok_or_else(|| {
+        format!(
+            "{} cannot be bound without following a link",
+            path.display()
+        )
+    })?;
+    let p = p.to_string_lossy().into_owned();
+    let at = args
+        .windows(2)
+        .position(|w| w[0] == "--tmpfs" && w[1] == "/tmp")
+        .map_or(args.len(), |i| i + 2);
+    args.splice(at..at, ["--bind".to_string(), p.clone(), p]);
+    Ok(())
+}
+
 /// The rules that shape the mounts: every rule but the root `AGENTS.md`
 /// (#252). Outside /tmp that rule needs no mount (`--ro-bind / /` shows it),
 /// but under the private /tmp it would get its own `--ro-bind`, decided at
@@ -1510,6 +1529,32 @@ fn exec_agent(argv: &[String]) {
 
 #[cfg(test)]
 mod tests {
+    /// #796: a late writable file lands among the writable binds, before
+    /// the deny masks and overlays that must still cover it.
+    #[test]
+    fn late_writable_bind_goes_before_masks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = std::fs::canonicalize(tmp.path()).unwrap().join("h.jsonl");
+        std::fs::write(&f, "").unwrap();
+        let f = f.to_string_lossy().into_owned();
+        let mut args: Vec<String> = [
+            "--ro-bind",
+            "/",
+            "/",
+            "--tmpfs",
+            "/tmp",
+            "--ro-bind",
+            "m",
+            "x",
+        ]
+        .map(String::from)
+        .into();
+        bind_late_writable(&mut args, Path::new(&f)).unwrap();
+        assert_eq!(args[5..8], ["--bind".to_string(), f.clone(), f]);
+        assert_eq!(args[8], "--ro-bind");
+        assert!(bind_late_writable(&mut args, &tmp.path().join("missing")).is_err());
+    }
+
     use super::*;
 
     fn writable_rule(path: &str) -> FsRule {
