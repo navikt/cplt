@@ -142,38 +142,33 @@ pub fn fetch_latest_release(current_version: &str) -> Result<Release, UpdateErro
     let body = curl_get_json(&url, current_version)?;
 
     let releases: Vec<serde_json::Value> = serde_json::from_str(&body)?;
-
-    for rel in &releases {
-        // Skip drafts and prereleases
-        if rel
-            .get("draft")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        if rel
-            .get("prerelease")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        {
-            continue;
-        }
-
-        if let Some(tag) = rel.get("tag_name").and_then(|v| v.as_str()) {
-            // Accept both "cplt/VERSION" and bare "VERSION" tag formats
-            let version = tag.strip_prefix("cplt/").unwrap_or(tag);
-            // Validate it looks like a version (YYYY.MM.DD-HHMMSS-SHA or legacy formats)
-            if looks_like_version(version) {
-                return Ok(Release {
-                    tag: tag.to_string(),
-                    version: version.to_string(),
-                });
-            }
-        }
+    if let Some(release) = releases.iter().find_map(as_release) {
+        return Ok(release);
     }
+    // The anonymous list endpoint sometimes returns `[]` for a public repo
+    // that has releases; `/latest` still answers then.
+    let body = curl_get_json(&format!("{RELEASES_API}/latest"), current_version)?;
+    as_release(&serde_json::from_str(&body)?).ok_or(UpdateError::NoRelease)
+}
 
-    Err(UpdateError::NoRelease)
+/// A published, non-prerelease release with a cplt version tag.
+fn as_release(rel: &serde_json::Value) -> Option<Release> {
+    let flag = |k| {
+        rel.get(k)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    };
+    if flag("draft") || flag("prerelease") {
+        return None;
+    }
+    let tag = rel.get("tag_name")?.as_str()?;
+    // Accept both "cplt/VERSION" and bare "VERSION" tag formats
+    let version = tag.strip_prefix("cplt/").unwrap_or(tag);
+    // Validate it looks like a version (YYYY.MM.DD-HHMMSS-SHA or legacy formats)
+    looks_like_version(version).then(|| Release {
+        tag: tag.to_string(),
+        version: version.to_string(),
+    })
 }
 
 /// Compare current version against the latest release.
@@ -1355,5 +1350,21 @@ mod tests {
         assert!(!looks_like_version(
             "2026.04.13-173045-0123456789abcdef0123456789abcdef012345678"
         ));
+    }
+
+    #[test]
+    fn as_release_skips_drafts_prereleases_and_bad_tags() {
+        let rel = |tag: &str, draft: bool, pre: bool| serde_json::json!({ "tag_name": tag, "draft": draft, "prerelease": pre });
+        let good = "2026.10.22-140206-df61740";
+        assert_eq!(as_release(&rel(good, false, false)).unwrap().version, good);
+        assert_eq!(
+            as_release(&rel(&format!("cplt/{good}"), false, false))
+                .unwrap()
+                .version,
+            good
+        );
+        assert!(as_release(&rel(good, true, false)).is_none());
+        assert!(as_release(&rel(good, false, true)).is_none());
+        assert!(as_release(&rel("v1.0", false, false)).is_none());
     }
 }
