@@ -3345,6 +3345,42 @@ mod tests {
         );
     }
 
+    /// `XDG_RUNTIME_DIR` inside a Colima dir with no live socket yet gets no
+    /// rule under that dir: a profile started later would be connectable on
+    /// ABI v9 (#785).
+    #[test]
+    fn rootless_docker_grants_nothing_under_a_colima_dir() {
+        let project = PathBuf::from("/fake/user/project");
+        let home = tempfile::tempdir().unwrap();
+        let colima_home = tempfile::tempdir().unwrap();
+        let profile = std::fs::canonicalize(colima_home.path())
+            .unwrap()
+            .join("work");
+        std::fs::create_dir(&profile).unwrap();
+
+        let policy = temp_env::with_vars(
+            [
+                ("COLIMA_HOME", Some(colima_home.path().as_os_str())),
+                ("XDG_RUNTIME_DIR", Some(profile.as_os_str())),
+            ],
+            || {
+                let mut config = test_config(&project, home.path());
+                config.allow_rootless_docker = true;
+                generate_policy(&config)
+            },
+        );
+        // Other XDG_RUNTIME_DIR users (mise, D-Bus) are not container sockets.
+        for name in ["docker.sock", "podman", "libpod"] {
+            let p = profile.join(name);
+            assert!(
+                !policy.fs_rules.iter().any(|r| r.path.starts_with(&p)),
+                "{} granted",
+                p.display()
+            );
+        }
+        assert!(!profile.join("libpod").exists(), "no libpod/ made in it");
+    }
+
     /// `~/.testcontainers.properties` is read-only under `--allow-docker` (#209).
     #[test]
     fn allow_docker_grants_testcontainers_properties_read_only() {

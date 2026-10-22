@@ -880,7 +880,11 @@ fn drop_rootful_overlaps(
     also_rootful: &[PathBuf],
     candidates: Vec<PathBuf>,
 ) -> Vec<PathBuf> {
+    // `resolved` is taken from the raw path, so a `..` after a symlink is
+    // walked the way the kernel walks it; `lexical` catches what a dangling
+    // tail hides from it.
     let forms = |p: &Path| {
+        let resolved = crate::config::canonicalize_deepest(p);
         let mut lexical = PathBuf::new();
         for c in p.components() {
             match c {
@@ -891,7 +895,6 @@ fn drop_rootful_overlaps(
                 c => lexical.push(c),
             }
         }
-        let resolved = crate::config::canonicalize_deepest(&lexical);
         [lexical, resolved]
     };
     // The Colima dirs themselves, not just their live sockets: a profile
@@ -4595,6 +4598,31 @@ mod tests {
                 assert!(masks.contains(f), "{xdg:?}: {f:?} must stay masked");
             }
         }
+    }
+
+    /// `link/..` names the link target's parent, not the link's: a Colima dir
+    /// spelled that way still drops a rootless entry under it (review on #804).
+    #[test]
+    fn rootful_overlap_follows_a_symlink_before_dotdot() {
+        let home = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
+        std::fs::create_dir_all(base.join("actual/nested")).unwrap();
+        std::fs::create_dir_all(base.join("actual/colima/work")).unwrap();
+        std::os::unix::fs::symlink(base.join("actual/nested"), base.join("link")).unwrap();
+        let spelled = base.join("link/../colima");
+        let xdg = base.join("actual/colima/work");
+        let rootless = temp_env::with_vars(
+            [
+                ("COLIMA_HOME", Some(spelled.as_os_str())),
+                ("XDG_CONFIG_HOME", None),
+            ],
+            || linux_rootless_socket_paths(home.path(), 1000, Some(&xdg)),
+        );
+        assert!(
+            !rootless.iter().any(|p| p.starts_with(&xdg)),
+            "{rootless:?}"
+        );
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// `$XDG_RUNTIME_DIR` under a Colima dir grants nothing, even before any
