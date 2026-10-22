@@ -1850,6 +1850,18 @@ impl SnapshotStores {
             "commondir",
         ] {
             let path = store.join(name);
+            let stat_key = |m: &std::fs::Metadata| {
+                format!(
+                    "{} {} {} {}.{} {}.{}",
+                    m.dev(),
+                    m.ino(),
+                    m.size(),
+                    m.mtime(),
+                    m.mtime_nsec(),
+                    m.ctime(),
+                    m.ctime_nsec()
+                )
+            };
             let meta = match std::fs::symlink_metadata(&path) {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                 Ok(m) if m.is_file() => m,
@@ -1859,29 +1871,38 @@ impl SnapshotStores {
                     continue;
                 }
             };
-            let key = format!(
-                "{} {} {} {}.{} {}.{}",
-                meta.dev(),
-                meta.ino(),
-                meta.size(),
-                meta.mtime(),
-                meta.mtime_nsec(),
-                meta.ctime(),
-                meta.ctime_nsec()
-            );
-            state += &[name, "\0", &key, "\0"].concat();
+            let lkey = stat_key(&meta);
+            state += &[name, "\0", &lkey, "\0"].concat();
             if name == "commondir" {
                 findings.push("commondir".to_string());
                 continue;
             }
-            if self.cache.borrow().get(&path) == Some(&key) {
-                self.seen.borrow_mut().insert(path, key);
+            // A hit names an inode whose content was parsed clean before.
+            if self.cache.borrow().get(&path) == Some(&lkey) {
+                self.seen.borrow_mut().insert(path, lkey);
                 continue;
             }
-            let keys = crate::untrusted::read_untrusted(&path, 1 << 20)
+            // A miss is parsed, and its verdict keyed, from one descriptor:
+            // the path, looked up twice, could be swapped in between and a
+            // hostile config cached as clean.
+            let mut text = String::new();
+            let parsed = crate::untrusted::open_untrusted(&path)
                 .ok()
                 .flatten()
-                .and_then(|text| risky_config_keys(&text));
+                .and_then(|f| {
+                    let m = f.metadata().ok()?;
+                    // Larger: never parsed in part, so never cached clean.
+                    if m.len() > 1 << 20 {
+                        return None;
+                    }
+                    let key = stat_key(&m);
+                    f.take(1 << 20).read_to_string(&mut text).ok()?;
+                    Some(key)
+                });
+            let (key, keys) = match parsed {
+                Some(key) => (key, risky_config_keys(&text)),
+                None => (String::new(), None),
+            };
             match keys {
                 Some(keys) if keys.is_empty() => {
                     self.cache.borrow_mut().insert(path.clone(), key.clone());
