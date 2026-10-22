@@ -3224,6 +3224,24 @@ print('CONNECTED')
         );
     }
 
+    /// #790: the `/proc/self` rule bound to the first child's pid, so a
+    /// process it started got EACCES on its own `/proc/self/*` (podman:
+    /// "cannot retrieve cmd line"). `cat` here is the shell's child.
+    #[test]
+    fn bwrap_grandchild_reads_its_own_proc_self() {
+        require_bwrap!();
+        let project = create_test_project();
+
+        let (exit, stdout, stderr) = run_sandboxed_bwrap(
+            project.path(),
+            "cat /proc/self/cmdline >/dev/null && cat /proc/self/status >/dev/null && echo PROC_OK",
+        );
+        assert!(
+            exit == 0 && stdout.contains("PROC_OK"),
+            "a grandchild must read /proc/self — stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+
     #[test]
     fn bwrap_preserves_environment_variables() {
         require_bwrap!();

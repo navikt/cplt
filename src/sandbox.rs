@@ -1813,7 +1813,18 @@ pub fn keychain_substitute(
     home: &Path,
     deny_env: &[String],
     setting: Option<bool>,
+    writable: &[PathBuf],
 ) -> Option<crate::agent::KeychainSubstitute> {
+    if cfg!(target_os = "linux") {
+        return secret_service_substitute(
+            agent,
+            home,
+            deny_env,
+            keychain_substitute_enabled(agent, setting),
+            || exec::gh_hosts_yml().and_then(|p| anchored_gh_login(&p, writable)),
+            secret_tool_lookup,
+        );
+    }
     keychain_substitute_with(
         agent,
         home,
@@ -1824,9 +1835,7 @@ pub fn keychain_substitute(
             // Maintainer call: never switch identity silently. gh signed in as
             // someone other than Copilot's own login keeps the grant (#696).
             if agent == Agent::Copilot {
-                let gh = exec::gh_hosts_yml()
-                    .and_then(|p| crate::agent::read_small_regular_file(&p))
-                    .and_then(|s| gh_login(&s));
+                let gh = exec::gh_hosts_yml().and_then(|p| anchored_gh_login(&p, writable));
                 if let Some(why) = account_mismatch(
                     gh.as_deref(),
                     copilot_keychain_acct(gh.as_deref()).as_deref(),
@@ -1908,7 +1917,14 @@ fn parse_copilot_user(v: &serde_json::Value) -> Option<String> {
 }
 
 fn parse_copilot_config_account(text: &str) -> CopilotConfigAccount {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+    // Copilot 1.0.101 writes `//` comment lines above the JSON. Drop whole
+    // comment lines only, so `//` inside values (https://) is untouched.
+    let text: String = text
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
         return CopilotConfigAccount::Ambiguous("Copilot config.json is malformed".to_string());
     };
     let Some(obj) = v.as_object() else {
@@ -1967,6 +1983,28 @@ fn parse_copilot_config_account(text: &str) -> CopilotConfigAccount {
             }
         }
     }
+}
+
+/// gh's github.com login from `hosts`, only when the agent cannot have
+/// written it: neither the path as named nor its real path inside a tree in
+/// `writable`. `GH_CONFIG_DIR` or `XDG_CONFIG_HOME` can point gh into a
+/// writable tree, and this login is the anchor that stops the sandboxed agent
+/// from choosing whose stored token cplt reads (#787 review).
+fn anchored_gh_login(hosts: &Path, writable: &[PathBuf]) -> Option<String> {
+    // Both the path as named (a link the agent could re-point) and where it
+    // really points. A dotfile-manager link to a tree the agent cannot write
+    // (stow, chezmoi, home-manager) stays usable.
+    let real = std::fs::canonicalize(hosts).ok()?;
+    let inside = |p: &Path| {
+        writable
+            .iter()
+            .any(|w| p.starts_with(w) || std::fs::canonicalize(w).is_ok_and(|w| p.starts_with(w)))
+    };
+    if inside(hosts) || inside(&real) {
+        return None;
+    }
+    let text = crate::untrusted::read_untrusted(&real, COPILOT_CONFIG_LIMIT).ok()??;
+    gh_login(&text)
 }
 
 /// The github.com `user:` from gh's `hosts.yml`.
@@ -2128,6 +2166,90 @@ pub(crate) fn keychain_substitute_with(
         var,
         token: crate::agent::SecretToken::new(extract()?),
     })
+}
+
+/// Linux, Copilot only (#600): Copilot's own login from the Secret Service,
+/// read on the host because the sandbox masks the session bus. Skipped when a
+/// token variable already reaches Copilot (it wins over the keyring), when
+/// `COPILOT_GITHUB_TOKEN` is denied, and when `~/.copilot/config.json` names no
+/// single account or one that differs from gh's: that file is writable inside
+/// the sandbox, so it must not pick another stored login. Any failure keeps
+/// today's behaviour; `cplt doctor` names the fix.
+pub(crate) fn secret_service_substitute(
+    agent: Agent,
+    home: &Path,
+    deny_env: &[String],
+    enabled: bool,
+    gh: impl FnOnce() -> Option<String>,
+    lookup: impl FnOnce(&str) -> Option<String>,
+) -> Option<crate::agent::KeychainSubstitute> {
+    if !enabled || agent != Agent::Copilot {
+        return None;
+    }
+    let permitted = |v: &&&str| !deny_env.iter().any(|d| d == **v);
+    if !permitted(&&"COPILOT_GITHUB_TOKEN")
+        || agent
+            .keychain_substitute_env_vars()
+            .iter()
+            .filter(permitted)
+            .any(|v| std::env::var(v).is_ok_and(|t| !t.trim().is_empty()))
+    {
+        return None;
+    }
+    let CopilotConfigAccount::Selected(acct) = copilot_config_account(home) else {
+        return None;
+    };
+    if account_mismatch(gh().as_deref(), Some(&acct)).is_some() {
+        return None;
+    }
+    let token = lookup(&acct)?;
+    let token = token.trim();
+    (!token.is_empty() && !token.chars().any(char::is_control)).then(|| {
+        crate::agent::KeychainSubstitute::SecretService(crate::agent::SecretToken::new(
+            token.to_string(),
+        ))
+    })
+}
+
+/// Why [`secret_service_substitute`] gave no token, for `cplt doctor`. Only
+/// the skips decided before the lookup are told apart; the rest is one bucket.
+#[must_use]
+pub fn secret_service_skip_reason(setting: Option<bool>, deny_env: &[String]) -> &'static str {
+    if !keychain_substitute_enabled(Agent::Copilot, setting) {
+        "sandbox.keychain_substitute is off, so no lookup ran"
+    } else if deny_env.iter().any(|d| d == "COPILOT_GITHUB_TOKEN") {
+        "deny.env strips COPILOT_GITHUB_TOKEN, so no lookup ran"
+    } else {
+        "no single account in ~/.copilot/config.json matching gh's github.com login (or gh \
+         is not logged in), or the `secret-tool` lookup found nothing (not installed in a \
+         trusted bin dir, keyring locked, or no stored item)"
+    }
+}
+
+/// `secret-tool` arguments for Copilot's item: `service=copilot-cli`,
+/// `username=<host>:<login>` (probed on Copilot 1.0.26 and 1.0.101, #600).
+fn secret_tool_args(acct: &str) -> [&str; 5] {
+    ["lookup", "service", "copilot-cli", "username", acct]
+}
+
+/// Set when the lookup hit its cap, so the launch can warn unless `--quiet`.
+pub static SECRET_TOOL_TIMED_OUT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// One `secret-tool lookup` from a trusted bin dir, no shell, 1 s cap. A
+/// locked keyring may wait on an unlock prompt; the cap kills it.
+fn secret_tool_lookup(acct: &str) -> Option<String> {
+    let bin = crate::git::trusted_binary("secret-tool")?;
+    #[allow(clippy::disallowed_methods)] // resolved into a trusted bin root
+    let mut cmd = std::process::Command::new(bin);
+    cmd.args(secret_tool_args(acct));
+    let cap = std::time::Duration::from_secs(1);
+    let start = std::time::Instant::now();
+    let out = exec::bounded_stdout(cmd, cap);
+    if out.is_none() && start.elapsed() >= cap {
+        SECRET_TOOL_TIMED_OUT.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    String::from_utf8(out?).ok()
 }
 
 /// Human-readable representation of the sandbox policy.
@@ -2313,7 +2435,7 @@ fn report_unix_socket_regime(
              container runtimes); any other pathname socket on the host stays reachable."
         ));
     } else {
-        ui::warn(
+        crate::ui::warn(
             "UNIX sockets are NOT restricted in this run: Landlock cannot gate connect(2) \
              below ABI v9 (kernel 7.1) and Bubblewrap is not active, so nothing masks them. \
              An agent can reach the D-Bus session bus or a container daemon socket and \
@@ -2789,6 +2911,15 @@ fn seed_claude_settings(config: &SandboxConfig) {
     }
 }
 
+/// Said at launch, or at a spawn-time bwrap fallback, when the `/proc` grant
+/// (#790) is withheld because nothing hides the host's processes.
+#[cfg(target_os = "linux")]
+pub(crate) const PROC_SELF_LIMIT_WARNING: &str = "Without Bubblewrap only the agent's first process can read its own /proc/self \
+     (cmdline, stat, status); processes it starts get EACCES, so tools such as podman \
+     fail with \"cannot retrieve cmd line\". Granting /proc would expose every host \
+     process's command line. Install bubblewrap, or pass --allow-read /proc if that is \
+     acceptable.";
+
 #[cfg(target_os = "linux")]
 fn prepare_impl(
     config: &SandboxConfig,
@@ -2802,7 +2933,7 @@ fn prepare_impl(
     // (Deny paths are handled after bwrap resolution below — with Bubblewrap
     // they ARE enforced, via mount masks.)
     if !config.allow_env_files {
-        ui::warn(
+        crate::ui::warn(
             "allow_env_files=false is not fully enforceable on Linux: \
              Landlock grants the project directory full read access, so .env files \
              within it remain readable. Differs from macOS Seatbelt behavior.",
@@ -2813,7 +2944,7 @@ fn prepare_impl(
     if config.proxy_port.is_none()
         && (!config.localhost_ports.is_empty() || config.allow_localhost_any)
     {
-        ui::warn(
+        crate::ui::warn(
             "Localhost protection limited on Linux without proxy: \
              Landlock cannot distinguish localhost from remote hosts. \
              Use --with-proxy for localhost SSRF protection.",
@@ -2835,7 +2966,7 @@ fn prepare_impl(
     // A restriction the user asked for and cannot have is said out loud, not
     // dropped (AGENTS.md "No silent grants").
     if config.deny_nested_git {
-        ui::warn(
+        crate::ui::warn(
             "sandbox.deny_nested_git has no effect on Linux: Landlock cannot deny a \
              path inside a tree it allows, and bubblewrap only protects paths that \
              exist at launch. A .git created during the session is reported when it \
@@ -2843,14 +2974,14 @@ fn prepare_impl(
         );
     }
     if config.deny_key_files_by_extension {
-        ui::warn(
+        crate::ui::warn(
             "sandbox.deny_key_files_by_extension has no effect on Linux: Landlock \
              cannot deny files by name pattern, so .pem, .key, .p12, .pfx and .jks \
              files in the project stay readable.",
         );
     }
     if config.allow_docker {
-        ui::warn(
+        crate::ui::warn(
             "--allow-docker on Linux grants the Docker/Podman daemon sockets and \
              exempts them from the Bubblewrap socket masks — daemon socket access is \
              effectively host root. ~/.docker is readable (not writable), including \
@@ -2859,7 +2990,7 @@ fn prepare_impl(
              directory.",
         );
     } else if config.allow_rootless_docker {
-        ui::warn(
+        crate::ui::warn(
             "--allow-rootless-docker on Linux grants the rootless Docker/Podman sockets \
              under $XDG_RUNTIME_DIR. A rootless container runs as you, outside the \
              sandbox, and can mount your home directory. Rootful sockets stay masked \
@@ -2873,7 +3004,7 @@ fn prepare_impl(
     // macOS still pins localhost at the kernel level, so this is Linux-specific.
     // proxy.forced supersedes it (reconciled earlier) and is the safe choice.
     if config.allow_localhost_any {
-        ui::warn(
+        crate::ui::warn(
             "--allow-localhost-any DISABLES kernel network restriction entirely on Linux: \
              Landlock is port-based and cannot allow 'all localhost ports' without allowing \
              the same ports on every remote host, so ALL Landlock TCP-connect rules are dropped \
@@ -2897,6 +3028,18 @@ fn prepare_impl(
         }
         bwrap_plan(config, extra_git_dirs, canonical_grants, base)
     };
+    // #790: the `/proc/self` rule binds to the first child's `/proc/<pid>`,
+    // so every process it starts gets EACCES on its own `/proc/self/*`
+    // (podman: "cannot retrieve cmd line"). Under bubblewrap `/proc` is a
+    // fresh mount of a new pid namespace and lists only sandbox processes,
+    // so read on all of it exposes nothing from the host. Pushed last, so
+    // the Landlock-only path below can pop it again before anything else
+    // touches the rule indices.
+    let proc_grant =
+        !config.allow_jvm_attach && !config.extra_read.iter().any(|p| p == Path::new("/proc"));
+    if proc_grant {
+        policy.fs_rules.push(landlock_mod::proc_read_rule());
+    }
     let mut profile_text = landlock_mod::describe_policy(&policy);
     // Rebuilt below if the hook grants are dropped on a Landlock-only host.
     let policy_text_len = profile_text.len();
@@ -3051,8 +3194,24 @@ fn prepare_impl(
     // always. A wrapper carries its own copy of the rules, so they still apply
     // under bubblewrap, but an exec-time fallback to plain Landlock does not
     // get them.
+    // Without bubblewrap `/proc` lists every host process, and Landlock's
+    // ptrace scoping hides `environ`/`mem` but not `cmdline`/`stat`, so the
+    // grant is withdrawn and the limit said out loud.
+    // Popped from the direct-path policy always: the wrapper already holds its
+    // own copy, and a spawn-time fallback to plain Landlock runs this one.
+    let proc_dropped = proc_grant && policy.fs_rules.pop().is_some();
+    if let Some(w) = bwrap_wrapper.as_mut() {
+        w.proc_limited_on_fallback = proc_dropped;
+    }
     let dropped = drop_claude_hook_grants(config, &mut policy);
     if bwrap_wrapper.is_none() {
+        if proc_dropped {
+            ui::warn(PROC_SELF_LIMIT_WARNING);
+        }
+        if proc_dropped && dropped.is_empty() {
+            profile_text =
+                landlock_mod::describe_policy(&policy) + &profile_text[policy_text_len..];
+        }
         let mut cleared = Vec::new();
         for rule in policy.fs_rules.iter_mut().filter(|r| r.access.create_dirs) {
             rule.access.create_dirs = false;
@@ -3558,6 +3717,7 @@ mod tests {
             strict: false,
             deny_mask_count: 0,
             socket_mask_count: 0,
+            proc_limited_on_fallback: false,
             proxy_forced: false,
             plain_file: None,
         });
@@ -3635,6 +3795,7 @@ mod tests {
                 strict: false,
                 deny_mask_count: 0,
                 socket_mask_count: 0,
+                proc_limited_on_fallback: false,
                 proxy_forced: false,
                 plain_file: Some(1),
             });
@@ -4582,6 +4743,31 @@ mod tests {
         // Control: with a working probe the same setup does create it.
         let prepared = prepare(&config).expect("prepare");
         assert!(prepared.bwrap_wrapper.is_some() && target.is_file());
+    }
+
+    /// #790: `/proc` read goes to the bwrap helper only. The direct policy —
+    /// what a spawn-time fallback to plain Landlock runs — must not carry it,
+    /// and the wrapper must know to warn on that fallback.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_grant_reaches_the_wrapper_and_not_the_fallback() {
+        if bubblewrap::check_availability().is_none() {
+            eprintln!("skipped: bwrap not installed");
+            return;
+        }
+        let tmp = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("tempdir");
+        let home = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let config = test_config(&home, &[]);
+        let proc_rule = |r: &landlock_mod::FsRule| r.path == Path::new("/proc");
+
+        let prepared = prepare(&config).expect("prepare");
+        let w = prepared.bwrap_wrapper.as_ref().expect("bwrap active");
+        assert!(w.fs_rules.iter().any(proc_rule), "helper gets /proc");
+        assert!(w.proc_limited_on_fallback);
+        assert!(
+            !prepared.policy.fs_rules.iter().any(proc_rule),
+            "the fallback policy must not grant /proc"
+        );
     }
 
     /// What a launch under Bubblewrap does with the plan: create each entry,
@@ -5808,8 +5994,9 @@ mod tests {
 #[cfg(test)]
 mod account_tests {
     use super::{
-        COPILOT_CONFIG_LIMIT, CopilotConfigAccount, account_mismatch, copilot_config_account,
-        copilot_has_native_login, gh_login, keychain_acct,
+        COPILOT_CONFIG_LIMIT, CopilotConfigAccount, account_mismatch, anchored_gh_login,
+        copilot_config_account, copilot_has_native_login, gh_login, keychain_acct,
+        secret_service_substitute, secret_tool_args,
     };
 
     #[test]
@@ -5977,5 +6164,151 @@ mod account_tests {
             copilot_config_account(home.path()),
             CopilotConfigAccount::Ambiguous(_)
         ));
+    }
+
+    #[test]
+    fn copilot_config_with_comment_header_parses() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".copilot")).unwrap();
+        std::fs::write(
+            home.path().join(".copilot/config.json"),
+            "// User settings belong in settings.json.\n// This file is managed automatically.\n{\n  \"lastLoggedInUser\": {\"host\": \"https://github.com\", \"login\": \"alice\"}\n}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            copilot_config_account(home.path()),
+            CopilotConfigAccount::Selected("https://github.com:alice".to_string())
+        );
+    }
+
+    #[test]
+    fn gh_login_anchor_refuses_agent_writable_hosts_yml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ro = tmp.path().join("ro");
+        let rw = tmp.path().join("rw");
+        std::fs::create_dir_all(&ro).unwrap();
+        std::fs::create_dir_all(&rw).unwrap();
+        let yml = "github.com:\n    user: alice\n";
+        let good = ro.join("hosts.yml");
+        std::fs::write(&good, yml).unwrap();
+        let planted = rw.join("hosts.yml");
+        std::fs::write(&planted, yml).unwrap();
+        let link = ro.join("link.yml");
+        std::os::unix::fs::symlink(&good, &link).unwrap();
+        let writable = vec![rw.clone()];
+        assert_eq!(
+            anchored_gh_login(&good, &writable).as_deref(),
+            Some("alice")
+        );
+        // A dotfile-manager link to a non-writable target is accepted.
+        assert_eq!(
+            anchored_gh_login(&link, &writable).as_deref(),
+            Some("alice")
+        );
+        // Inside a writable tree, a link into one, a link placed in one, or
+        // missing: no anchor.
+        assert!(anchored_gh_login(&planted, &writable).is_none());
+        let into = ro.join("into.yml");
+        std::os::unix::fs::symlink(&planted, &into).unwrap();
+        assert!(anchored_gh_login(&into, &writable).is_none());
+        let placed = rw.join("placed.yml");
+        std::os::unix::fs::symlink(&good, &placed).unwrap();
+        assert!(anchored_gh_login(&placed, &writable).is_none());
+        assert!(anchored_gh_login(&ro.join("nope.yml"), &writable).is_none());
+        // A symlinked parent into the writable tree is caught via the real path.
+        let via = tmp.path().join("via");
+        std::os::unix::fs::symlink(&rw, &via).unwrap();
+        assert!(anchored_gh_login(&via.join("hosts.yml"), &writable).is_none());
+    }
+
+    #[test]
+    fn secret_tool_args_name_copilots_item() {
+        assert_eq!(
+            secret_tool_args("https://github.com:alice"),
+            [
+                "lookup",
+                "service",
+                "copilot-cli",
+                "username",
+                "https://github.com:alice"
+            ]
+        );
+    }
+
+    #[test]
+    fn secret_service_substitute_paths() {
+        use crate::agent::{Agent, KeychainSubstitute};
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".copilot")).unwrap();
+        let cfg = home.path().join(".copilot/config.json");
+        std::fs::write(
+            &cfg,
+            r#"{"lastLoggedInUser":{"host":"https://github.com/","login":"alice"}}"#,
+        )
+        .unwrap();
+        let h = home.path();
+        let alice = || Some("alice".to_string());
+        let ok = |acct: &str| {
+            assert_eq!(acct, "https://github.com:alice");
+            Some("gho_x\n".to_string())
+        };
+        let never = |_: &str| -> Option<String> { panic!("lookup must not run") };
+        let vars = [
+            ("COPILOT_GITHUB_TOKEN", None::<&str>),
+            ("GH_TOKEN", None),
+            ("GITHUB_TOKEN", None),
+        ];
+        temp_env::with_vars(vars, || {
+            // Happy path: token trimmed, set as COPILOT_GITHUB_TOKEN.
+            let sub = secret_service_substitute(Agent::Copilot, h, &[], true, alice, ok).unwrap();
+            assert_eq!(
+                sub.env_value(),
+                Some(("COPILOT_GITHUB_TOKEN", "gho_x".to_string()))
+            );
+            assert!(matches!(sub, KeychainSubstitute::SecretService(_)));
+            assert!(!format!("{sub:?}{sub}").contains("gho_x"));
+            // Off, other agent, denied var: no lookup.
+            assert!(
+                secret_service_substitute(Agent::Copilot, h, &[], false, alice, never).is_none()
+            );
+            assert!(secret_service_substitute(Agent::Claude, h, &[], true, alice, never).is_none());
+            let deny = ["COPILOT_GITHUB_TOKEN".to_string()];
+            assert!(
+                secret_service_substitute(Agent::Copilot, h, &deny, true, alice, never).is_none()
+            );
+            // gh is someone else, or unknown: refused.
+            let bob = || Some("bob".to_string());
+            assert!(secret_service_substitute(Agent::Copilot, h, &[], true, bob, never).is_none());
+            assert!(
+                secret_service_substitute(Agent::Copilot, h, &[], true, || None, never).is_none()
+            );
+            // Missing, locked or empty item: fallback.
+            assert!(
+                secret_service_substitute(Agent::Copilot, h, &[], true, alice, |_| None).is_none()
+            );
+            assert!(
+                secret_service_substitute(Agent::Copilot, h, &[], true, alice, |_| Some(
+                    " \n".into()
+                ))
+                .is_none()
+            );
+        });
+        // An exported token wins: skip.
+        temp_env::with_var("GH_TOKEN", Some("t"), || {
+            assert!(
+                secret_service_substitute(Agent::Copilot, h, &[], true, alice, never).is_none()
+            );
+        });
+        // Ambiguous config: refused.
+        std::fs::write(
+            &cfg,
+            r#"{"loggedInUsers":[{"host":"https://github.com","login":"alice"},{"host":"https://github.com","login":"bob"}]}"#,
+        )
+        .unwrap();
+        temp_env::with_vars(vars, || {
+            assert!(
+                secret_service_substitute(Agent::Copilot, h, &[], true, alice, never).is_none()
+            );
+        });
     }
 }

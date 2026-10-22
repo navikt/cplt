@@ -122,6 +122,9 @@ pub(crate) struct BubblewrapWrapper {
     /// masks the D-Bus / systemd / container sockets are reachable again and
     /// Landlock cannot substitute for them below ABI v9 (kernel 7.1).
     pub socket_mask_count: usize,
+    /// The `/proc` read grant (#790) is in `fs_rules` but not in the direct
+    /// policy, so a fallback must say processes lose their `/proc/self`.
+    pub proc_limited_on_fallback: bool,
     /// Whether egress is locked to the proxy port (`proxy.forced`). Needed
     /// in-namespace so the helper builds the same seccomp filter as the
     /// fork-based path (the UDP/raw-socket denial is gated on it).
@@ -1200,6 +1203,7 @@ pub(crate) fn build_wrapper(
         strict,
         deny_mask_count: deny_masks.mask_count(),
         socket_mask_count: deny_masks.socket_mask_count(),
+        proc_limited_on_fallback: false,
         proxy_forced: policy.proxy_forced,
         plain_file: policy.plain_file,
     })
@@ -1585,6 +1589,7 @@ mod tests {
             strict: false,
             deny_mask_count: 0,
             socket_mask_count: 0,
+            proc_limited_on_fallback: false,
             proxy_forced: false,
             plain_file: policy.plain_file,
         };
@@ -1611,6 +1616,7 @@ mod tests {
             strict: false,
             deny_mask_count: 0,
             socket_mask_count: 0,
+            proc_limited_on_fallback: false,
             proxy_forced: false,
             plain_file: None,
         }

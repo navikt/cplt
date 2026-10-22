@@ -121,8 +121,39 @@ An agent may report:
 ```
 
 That prompt alone does not establish whether the sandbox blocked the bus or
-why authentication failed. Recommended recovery for Copilot is to authenticate
-on the host and let cplt hand over the credential:
+why authentication failed.
+
+**Copilot's own keyring login.** Copilot 1.0.101 and later fail inside cplt
+with `Saved sign-in could not be read from credential storage` when the login
+is in the Secret Service and the sandbox masks the bus. With
+`sandbox.keychain_substitute` on (the default for Copilot), cplt reads that
+login on the host before launch and passes it to Copilot as
+`COPILOT_GITHUB_TOKEN`. It takes the account from `lastLoggedInUser` in
+`~/.copilot/config.json` and runs one
+`secret-tool lookup service copilot-cli username <host>:<login>`, capped at one
+second. cplt skips the lookup when a token variable is already exported, when
+`deny.env` strips `COPILOT_GITHUB_TOKEN`, when the config has no
+`lastLoggedInUser` and lists several accounts, and when the account is not gh's
+github.com login (or gh is not logged in). The config file is writable from
+inside the sandbox, so it must not be able to pick another stored login.
+`secret-tool` comes from the `libsecret-tools` package and must be in a trusted
+bin directory such as `/usr/bin` (not `PATH`). With the keyring locked, the
+lookup can open an unlock dialog at every launch; cplt kills it after one second
+and prints a warning. `copilot logout` does not exist in current Copilot and
+does not help.
+
+This handover needs no `--force`, unlike `gh_guard.inject_token` below. The
+token is Copilot's own login, handed to the agent that already owns it, the same
+trade as the macOS Keychain substitute. It still sits in the agent's
+environment, so every process in the sandbox can read it through
+`/proc/<pid>/environ`. That is less than the alternatives: `inject_token` puts
+gh's token there, which is a separate credential the agent would not otherwise
+hold, and reaching the Secret Service directly would expose every item in the
+keyring. Set `sandbox.keychain_substitute = false` to turn the lookup off.
+
+If no lookup runs or it finds nothing, `cplt doctor` warns and says which case
+applies. The fallback for Copilot is to authenticate on the host and let cplt
+hand over gh's credential:
 
 ```bash
 gh auth login --hostname github.com              # outside cplt, once
@@ -758,6 +789,15 @@ cplt config set sandbox.allow_rootless_docker true --force
 # or per-session:
 cplt --allow-rootless-docker
 ```
+
+For Podman, use the remote client: `podman --remote` with `CONTAINER_HOST=unix://$XDG_RUNTIME_DIR/podman/podman.sock` (or the `docker` CLI with `DOCKER_HOST`). Both variables pass through to the agent. Local `podman` cannot work inside the sandbox: it needs user namespaces, and the seccomp filter blocks them. Both docker keys also grant `$XDG_RUNTIME_DIR/libpod` read-write, where Podman writes its lock and tmp files even in remote mode.
+
+```bash
+export CONTAINER_HOST=unix://$XDG_RUNTIME_DIR/podman/podman.sock
+podman --remote images
+```
+
+**`/proc/self` for child processes:** under bubblewrap the agent's whole `/proc` is readable, because bubblewrap mounts a fresh `/proc` for a new pid namespace that lists only sandbox processes. Without bubblewrap only the agent's first process can read its own `/proc/self/cmdline`, `stat` and `status`; anything it starts gets `EACCES`, and tools that read their own command line (Podman: `cannot retrieve cmd line`) fail. cplt does not grant `/proc` there, since it would expose the command line of every host process, and says so at launch. Install bubblewrap, or pass `--allow-read /proc` if that exposure is acceptable.
 
 ## SSH agent blocking
 

@@ -89,6 +89,22 @@ pub struct FsAccess {
     pub create_dirs: bool,
 }
 
+/// Read-only on all of `/proc`: `--allow-jvm-attach`, and under bubblewrap
+/// always (#790, see `prepare_impl`).
+pub fn proc_read_rule() -> FsRule {
+    FsRule {
+        nofollow: false,
+        path: PathBuf::from("/proc"),
+        access: FsAccess {
+            read: true,
+            write: false,
+            execute: false,
+            ioctl: false,
+            create_dirs: false,
+        },
+    }
+}
+
 /// A filesystem access rule: allow `access` on `path` and its subtree.
 ///
 /// Landlock is deny-by-default — only paths with explicit rules are
@@ -927,17 +943,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     // /proc/<target_pid>/cmdline, /proc/<target_pid>/root/tmp/, etc.
     // Only granted with allow_jvm_attach since /proc can expose process info.
     if config.allow_jvm_attach {
-        fs_rules.push(FsRule {
-            nofollow: false,
-            path: PathBuf::from("/proc"),
-            access: FsAccess {
-                read: true,
-                write: false,
-                execute: false,
-                ioctl: false,
-                create_dirs: false,
-            },
-        });
+        fs_rules.push(proc_read_rule());
     }
 
     // ── Extra read paths from config ──
@@ -1122,7 +1128,19 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         }
         policy::DockerAccess::Off => Vec::new(),
     };
-    for path in docker_sockets {
+    let podman_state = match docker {
+        policy::DockerAccess::Off => Vec::new(),
+        _ => policy::linux_podman_state_dirs(home, uid, xdg.as_deref()),
+    };
+    // A rule on a missing path is skipped and bwrap drops its bind, so a
+    // first `podman --remote` could not create `libpod/` in the read-only
+    // runtime dir. Make it here, before the mount plan, the way Podman
+    // would (0700, never through a link, never the runtime dir itself).
+    for dir in &podman_state {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let _ = std::fs::DirBuilder::new().mode(0o700).create(dir);
+    }
+    for path in docker_sockets.into_iter().chain(podman_state) {
         fs_rules.push(FsRule {
             // A rootless entry lives in a dir the user owns, so a link there
             // (`$XDG_RUNTIME_DIR/docker.sock -> /run/docker.sock`) swapped in
@@ -3304,6 +3322,14 @@ mod tests {
             .find(|r| r.path == podman)
             .expect("the rootless podman dir should be granted");
         assert!(rule.access.read && rule.access.write && !rule.access.execute);
+        let libpod = podman.with_file_name("libpod");
+        assert!(
+            policy
+                .fs_rules
+                .iter()
+                .any(|r| r.path == libpod && r.access.write),
+            "#790: podman --remote writes its lock files under libpod/"
+        );
         for denied in [
             Path::new("/run/podman"),
             Path::new("/run/docker.sock"),
