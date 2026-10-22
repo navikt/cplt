@@ -21,7 +21,10 @@
 //! registration with it, and the service shuts itself down within 5 s when its
 //! registration is gone; a crashed session's dir goes with the scratch GC.
 //! The database (`$XDG_DATA_HOME/opencode/opencode.db`) stays shared with the
-//! host. Overlay entries are a snapshot: a top-level entry the user creates
+//! host. So are the TUI's favourite models and prompt history (#793): the
+//! host `model.json` is copied in and, when the session changed it, back out
+//! at exit; `prompt-history.jsonl` is a link to the host file, which the
+//! host state dir grant already makes writable. Overlay entries are a snapshot: a top-level entry the user creates
 //! during the session is not seen until the next one.
 
 use std::io::Write;
@@ -34,6 +37,8 @@ pub struct Session {
     pub env: Vec<(String, String)>,
     /// The session service's loopback port.
     pub port: u16,
+    /// The host `model.json` as copied in, for [`save_model`] at exit.
+    pub model: Option<String>,
     /// Appended to the end of the macOS profile (last match wins).
     #[cfg(target_os = "macos")]
     pub sbpl: String,
@@ -73,7 +78,9 @@ pub fn prepare(scratch: &Path, home: &Path, launch_dir: &Path) -> Result<Session
         .unwrap_or_else(|| config_base.join("opencode"));
     let config = scratch.join("opencode-v2/config");
     let state = scratch.join("opencode-v2/state");
-    std::fs::create_dir_all(&state).map_err(|e| format!("{}: {e}", state.display()))?;
+    std::fs::create_dir_all(state.join("opencode"))
+        .map_err(|e| format!("{}: {e}", state.display()))?;
+    let model = carry_in_state(&state_base.join("opencode"), &state.join("opencode"));
     build_overlay(&config_base, &user_oc, &config)
         .map_err(|e| format!("{}: {e}", config.display()))?;
     let port = free_port().map_err(|e| format!("no free loopback port: {e}"))?;
@@ -119,6 +126,7 @@ pub fn prepare(scratch: &Path, home: &Path, launch_dir: &Path) -> Result<Session
     Ok(Session {
         env,
         port,
+        model,
         #[cfg(target_os = "macos")]
         sbpl,
         #[cfg(target_os = "macos")]
@@ -131,6 +139,74 @@ pub fn prepare(scratch: &Path, home: &Path, launch_dir: &Path) -> Result<Session
         #[cfg(not(target_os = "macos"))]
         reads,
     })
+}
+
+/// Cap on `model.json` read back from the session.
+const MODEL_LIMIT: u64 = 1 << 20;
+
+/// Copy the host `model.json` into the session's state dir and link
+/// `prompt-history.jsonl` to the host file, created empty (0600) if missing so
+/// concurrent sessions share it. The host side never reads the history. Best
+/// effort: a failure costs the user their favourites, not the session.
+fn carry_in_state(host: &Path, own: &Path) -> Option<String> {
+    let history = host.join("prompt-history.jsonl");
+    // O_NOFOLLOW: the host state dir is agent-writable, so a planted link
+    // must not make cplt create a file elsewhere.
+    let made = std::fs::create_dir_all(host).and_then(|()| {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&history)
+    });
+    if let Err(e) =
+        made.and_then(|_| std::os::unix::fs::symlink(&history, own.join("prompt-history.jsonl")))
+    {
+        crate::ui::warn(&format!("OpenCode v2: prompt history not shared: {e}"));
+    }
+    let text = crate::untrusted::read_untrusted(&host.join("model.json"), MODEL_LIMIT)
+        .ok()
+        .flatten()?;
+    std::fs::write(own.join("model.json"), &text).ok()?;
+    Some(text)
+}
+
+/// Copy the session's `model.json` back to the host if it changed since
+/// [`prepare`] copied it in. Last session to exit wins. The file is
+/// agent-written: read without following links, size-capped, and kept only
+/// if it is JSON. Failures warn and never fail the session.
+pub fn save_model(scratch: &Path, home: &Path, before: Option<&str>) {
+    let host = xdg_base("XDG_STATE_HOME", home, ".local/state").join("opencode");
+    if let Err(e) = save_model_to(&scratch.join("opencode-v2/state/opencode"), &host, before) {
+        crate::ui::warn(&format!("OpenCode v2: favourite models not saved: {e}"));
+    }
+}
+
+fn save_model_to(own: &Path, host: &Path, before: Option<&str>) -> Result<(), String> {
+    let text = match crate::untrusted::read_untrusted(&own.join("model.json"), MODEL_LIMIT) {
+        Ok(Some(t)) => t,
+        Ok(None) => return Err("model.json is not a regular file of at most 1 MiB".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.to_string()),
+    };
+    if before == Some(text.as_str()) {
+        return Ok(());
+    }
+    serde_json::from_str::<serde_json::Value>(&text)
+        .map_err(|e| format!("model.json is not JSON: {e}"))?;
+    let tmp = host.join(format!(".model.json.cplt-{}", std::process::id()));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .and_then(|mut f| f.write_all(text.as_bytes()))
+        .and_then(|()| std::fs::rename(&tmp, host.join("model.json")))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            e.to_string()
+        })
 }
 
 /// `overlay` = a link per entry of `user`, except `opencode`, which becomes a
@@ -833,5 +909,64 @@ mod tests {
                 assert!(s.sbpl_before_denies.contains(&lit), "{read}");
             }
         }
+    }
+
+    /// #793: `model.json` comes in, goes back out only when changed and valid,
+    /// and the prompt history is a link to the host file.
+    #[test]
+    fn state_carries_models_and_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (host, own) = (tmp.path().join("host"), tmp.path().join("own"));
+        std::fs::create_dir_all(&own).unwrap();
+        assert_eq!(carry_in_state(&host, &own), None, "no host model.json");
+        let history = host.join("prompt-history.jsonl");
+        assert_eq!(
+            std::fs::read_link(own.join("prompt-history.jsonl")).unwrap(),
+            history
+        );
+        assert_eq!(std::fs::metadata(&history).unwrap().mode() & 0o777, 0o600);
+        std::fs::remove_file(own.join("prompt-history.jsonl")).unwrap();
+
+        std::fs::write(host.join("model.json"), r#"{"a":1}"#).unwrap();
+        let before = carry_in_state(&host, &own);
+        assert_eq!(before.as_deref(), Some(r#"{"a":1}"#));
+        assert_eq!(
+            std::fs::read_to_string(own.join("model.json")).unwrap(),
+            r#"{"a":1}"#
+        );
+
+        // Unchanged: the host file is left alone even if it moved on meanwhile.
+        std::fs::write(host.join("model.json"), r#"{"other":1}"#).unwrap();
+        save_model_to(&own, &host, before.as_deref()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(host.join("model.json")).unwrap(),
+            r#"{"other":1}"#
+        );
+
+        std::fs::write(own.join("model.json"), r#"{"b":2}"#).unwrap();
+        save_model_to(&own, &host, before.as_deref()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(host.join("model.json")).unwrap(),
+            r#"{"b":2}"#
+        );
+
+        let refused = |own_model: &dyn Fn(&Path)| {
+            let _ = std::fs::remove_file(own.join("model.json"));
+            own_model(&own.join("model.json"));
+            assert!(save_model_to(&own, &host, before.as_deref()).is_err());
+            assert_eq!(
+                std::fs::read_to_string(host.join("model.json")).unwrap(),
+                r#"{"b":2}"#
+            );
+        };
+        refused(&|p| std::fs::write(p, "not json").unwrap());
+        refused(&|p| std::fs::write(p, vec![b' '; MODEL_LIMIT as usize + 1]).unwrap());
+        std::fs::write(tmp.path().join("secret"), r#"{"s":1}"#).unwrap();
+        refused(&|p| std::os::unix::fs::symlink(tmp.path().join("secret"), p).unwrap());
+        assert_eq!(
+            std::fs::read_dir(&host).unwrap().count(),
+            2,
+            "no temp left behind"
+        );
     }
 }

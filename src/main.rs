@@ -4719,6 +4719,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         );
     }
 
+    let mut v2_model = None;
     if opencode_v2 {
         let Some(scratch) = scratch_guard.as_ref().map(cplt::scratch::ScratchDir::path) else {
             bail!(
@@ -4728,6 +4729,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         };
         let session = cplt::opencode_v2::prepare(scratch, &home_dir, &launch_dir)
             .map_err(|e| anyhow::anyhow!("Cannot set up the OpenCode v2 session: {e}"))?;
+        v2_model = Some(session.model.clone());
         // These variables carry the session's isolation; dropping them would
         // point OpenCode back at the host service.
         if let Some((name, _)) = session
@@ -4960,6 +4962,12 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             })
         },
     );
+    if let (Some(before), Some(scratch)) = (
+        &v2_model,
+        scratch_guard.as_ref().map(cplt::scratch::ScratchDir::path),
+    ) {
+        cplt::opencode_v2::save_model(scratch, &home_dir, before.as_deref());
+    }
     if resolved.git_guard.enabled
         && !resolved.quiet
         && let Some(scratch) = scratch_guard.as_ref().map(cplt::scratch::ScratchDir::path)

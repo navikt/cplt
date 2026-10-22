@@ -3683,6 +3683,7 @@ mod tests {
             .add_opencode_v2(crate::opencode_v2::Session {
                 env: Vec::new(),
                 port: 50123,
+                model: None,
                 sbpl_before_denies: String::new(),
                 sbpl: grant.clone(),
             })
