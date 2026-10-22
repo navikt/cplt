@@ -1347,14 +1347,9 @@ fn detect_project_root() -> Option<PathBuf> {
 /// `None` when `dir` is not in a repository (or there is no trusted git, in
 /// which case nothing can be verified and the caller must refuse).
 fn git_toplevel(dir: &Path) -> Option<PathBuf> {
-    let output = cplt::git::command(dir, &["rev-parse", "--show-toplevel"])?
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let path = String::from_utf8(output.stdout).ok()?;
-    std::fs::canonicalize(path.trim()).ok()
+    cplt::git::project_root(dir)
+        .ok()
+        .and_then(|p| std::fs::canonicalize(p).ok())
 }
 
 /// Where a named repository root came from.
