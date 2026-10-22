@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 
 REQUIRED_HEADINGS = (
     "## Summary",
@@ -273,11 +274,22 @@ def main(argv: list[str] | None = None) -> int:
     if args.verify_code_checks:
         repo = os.environ.get("GITHUB_REPOSITORY", "")
         head_sha = os.environ.get("HEAD_SHA", "")
-        try:
-            check_errors = verify_code_checks(repo, head_sha)
-        except Exception as exc:
-            print(f"::error::Failed to verify code check-runs on {head_sha[:7]}: {exc}")
-            return 1
+        # A body edit right after a push starts this run while the code run's
+        # tests are still going. Failing now leaves a failed ci-ok check that
+        # GitHub keeps counting even after the code run's ci-ok succeeds, so
+        # wait for the tests to finish instead (CI_OK_WAIT_SECONDS, default 0).
+        deadline = time.monotonic() + int(os.environ.get("CI_OK_WAIT_SECONDS", "0"))
+        while True:
+            try:
+                check_errors = verify_code_checks(repo, head_sha)
+            except Exception as exc:
+                print(f"::error::Failed to verify code check-runs on {head_sha[:7]}: {exc}")
+                return 1
+            pending = any(" is still " in e or " has not started " in e for e in check_errors)
+            if not pending or time.monotonic() >= deadline:
+                break
+            print(f"ci-ok: code checks on {head_sha[:7]} not finished yet, waiting...", flush=True)
+            time.sleep(20)
         if check_errors:
             for err in check_errors:
                 print(f"::error::{err}")
