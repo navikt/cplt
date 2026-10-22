@@ -1561,7 +1561,7 @@ pub fn exec(
                     ));
                 }
                 if wrapper.proc_limited_on_fallback {
-                    ui::warn(&super::proc_self_limit_warning());
+                    ui::warn(&super::proc_self_limit_text(super::ProcAdvice::SpawnFailed));
                 }
                 // fall through to the direct path
             }
@@ -2138,6 +2138,13 @@ mod child_pid_tests {
             libc::signal(libc::SIGTERM, libc::SIG_DFL);
             libc::signal(libc::SIGHUP, libc::SIG_DFL);
         }
+    }
+
+    #[test]
+    fn spawn_fallback_proc_warning_does_not_say_install() {
+        let w = crate::sandbox::proc_self_limit_text(crate::sandbox::ProcAdvice::SpawnFailed);
+        assert!(!w.contains("Install bubblewrap"));
+        assert!(w.contains("cplt doctor"));
     }
 
     #[test]

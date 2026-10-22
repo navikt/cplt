@@ -2985,24 +2985,43 @@ fn seed_claude_settings(config: &SandboxConfig) {
     }
 }
 
-/// Said at launch, or at a spawn-time bwrap fallback, when the `/proc` grant
-/// (#790) is withheld because nothing hides the host's processes.
+/// Said at launch, when the `/proc` grant (#790) is withheld because nothing
+/// hides the host's processes.
 #[cfg(target_os = "linux")]
 pub(crate) fn proc_self_limit_warning() -> String {
-    proc_self_limit_text(bubblewrap::PROBE_FAILED.load(std::sync::atomic::Ordering::Relaxed))
+    proc_self_limit_text(
+        if bubblewrap::PROBE_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+            ProcAdvice::ProbeFailed
+        } else {
+            ProcAdvice::Install
+        },
+    )
+}
+
+/// What to tell the user to do about the missing Bubblewrap.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) enum ProcAdvice {
+    Install,
+    ProbeFailed,
+    /// bwrap passed its probe but failed at spawn time (fallback).
+    SpawnFailed,
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn proc_self_limit_text(probe_failed: bool) -> String {
+pub(crate) fn proc_self_limit_text(advice: ProcAdvice) -> String {
     format!(
         "Without Bubblewrap only the agent's first process can read its own /proc/self \
          (cmdline, stat, status); processes it starts get EACCES, so tools such as podman \
          fail with \"cannot retrieve cmd line\". Granting /proc would expose every host \
          process's command line. {}, or pass --allow-read /proc if that is acceptable.",
-        if probe_failed {
-            "Bubblewrap is installed but its probe failed: run `cplt doctor` for the fix"
-        } else {
-            "Install bubblewrap"
+        match advice {
+            ProcAdvice::Install => "Install bubblewrap",
+            ProcAdvice::ProbeFailed => {
+                "Bubblewrap is installed but its probe failed: run `cplt doctor` for the fix"
+            }
+            ProcAdvice::SpawnFailed => {
+                "Bubblewrap could not start this run: run `cplt doctor` for the fix"
+            }
         }
     )
 }
@@ -6083,10 +6102,10 @@ mod tests {
 #[cfg(test)]
 mod account_tests {
     use super::{
-        COPILOT_CONFIG_LIMIT, CopilotConfigAccount, SecretServiceSkip, account_mismatch,
-        anchored_gh_login, copilot_config_account, copilot_has_native_login, gh_login,
-        hosts_agent_writable, keychain_acct, proc_self_limit_text, secret_service_substitute,
-        secret_tool_args, unix_sockets_unrestricted,
+        COPILOT_CONFIG_LIMIT, CopilotConfigAccount, ProcAdvice, SecretServiceSkip,
+        account_mismatch, anchored_gh_login, copilot_config_account, copilot_has_native_login,
+        gh_login, hosts_agent_writable, keychain_acct, proc_self_limit_text,
+        secret_service_substitute, secret_tool_args, unix_sockets_unrestricted,
     };
 
     #[test]
@@ -6353,8 +6372,8 @@ mod account_tests {
 
     #[test]
     fn proc_warning_tells_probe_failure_from_missing_bwrap() {
-        assert!(proc_self_limit_text(false).contains("Install bubblewrap, or pass"));
-        let failed = proc_self_limit_text(true);
+        assert!(proc_self_limit_text(ProcAdvice::Install).contains("Install bubblewrap, or pass"));
+        let failed = proc_self_limit_text(ProcAdvice::ProbeFailed);
         assert!(!failed.contains("Install bubblewrap"));
         assert!(failed.contains(
             "Bubblewrap is installed but its probe failed: run `cplt doctor` for the fix, or \
