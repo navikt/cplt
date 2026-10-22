@@ -3683,7 +3683,7 @@ mod tests {
             .add_opencode_v2(crate::opencode_v2::Session {
                 env: Vec::new(),
                 port: 50123,
-                model: Ok(None),
+                model: Err(()),
                 sbpl_before_denies: String::new(),
                 sbpl: grant.clone(),
             })
@@ -3704,7 +3704,7 @@ mod tests {
         let session = || crate::opencode_v2::Session {
             env: Vec::new(),
             port: 50123,
-            model: Ok(None),
+            model: Err(()),
             hidden: Vec::new(),
             reads: Vec::new(),
         };

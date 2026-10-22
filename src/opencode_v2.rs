@@ -37,10 +37,11 @@ pub struct Session {
     pub env: Vec<(String, String)>,
     /// The session service's loopback port.
     pub port: u16,
-    /// The host `model.json` as copied in (`Ok(None)`: there was none), for
-    /// [`save_model`] at exit. `Err`: the host file was refused or not
-    /// copied, so it is left alone.
-    pub model: Result<Option<String>, ()>,
+    /// The session's own state dir, opened before the agent runs, and the host
+    /// `model.json` as copied in (`None`: there was none), for [`save_model`]
+    /// at exit. `Err`: the host file was refused or not copied, so it is left
+    /// alone.
+    pub model: Result<(std::fs::File, Option<String>), ()>,
     /// Appended to the end of the macOS profile (last match wins).
     #[cfg(target_os = "macos")]
     pub sbpl: String,
@@ -82,7 +83,9 @@ pub fn prepare(scratch: &Path, home: &Path, launch_dir: &Path) -> Result<Session
     let state = scratch.join("opencode-v2/state");
     std::fs::create_dir_all(state.join("opencode"))
         .map_err(|e| format!("{}: {e}", state.display()))?;
-    let model = carry_in_state(&state_base.join("opencode"), &state.join("opencode"));
+    // Opened now, before the agent can swap the dir for a link (#793).
+    let model = carry_in_state(&state_base.join("opencode"), &state.join("opencode"))
+        .and_then(|m| Ok((open_dir(&state.join("opencode")).map_err(|_| ())?, m)));
     build_overlay(&config_base, &user_oc, &config)
         .map_err(|e| format!("{}: {e}", config.display()))?;
     let port = free_port().map_err(|e| format!("no free loopback port: {e}"))?;
@@ -187,15 +190,22 @@ fn carry_in_state(host: &Path, own: &Path) -> Result<Option<String>, ()> {
 /// [`prepare`] copied it in. Last session to exit wins. The file is
 /// agent-written: read without following links, size-capped, and kept only
 /// if it is JSON. Failures warn and never fail the session.
-pub fn save_model(scratch: &Path, home: &Path, before: Option<&str>) {
+pub fn save_model(own: &std::fs::File, home: &Path, before: Option<&str>) {
     let host = xdg_base("XDG_STATE_HOME", home, ".local/state").join("opencode");
-    if let Err(e) = save_model_to(&scratch.join("opencode-v2/state/opencode"), &host, before) {
+    if let Err(e) = save_model_to(own, &host, before) {
         crate::ui::warn(&format!("OpenCode v2: favourite models not saved: {e}"));
     }
 }
 
-fn save_model_to(own: &Path, host: &Path, before: Option<&str>) -> Result<(), String> {
-    let text = match crate::untrusted::read_untrusted(&own.join("model.json"), MODEL_LIMIT) {
+fn open_dir(dir: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dir)
+}
+
+fn save_model_to(own: &std::fs::File, host: &Path, before: Option<&str>) -> Result<(), String> {
+    let text = match crate::untrusted::read_untrusted_at(own, "model.json", MODEL_LIMIT) {
         Ok(Some(t)) => t,
         Ok(None) => return Err("model.json is not a regular file of at most 1 MiB".into()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -940,6 +950,7 @@ mod tests {
 
         std::fs::write(host.join("model.json"), r#"{"a":1}"#).unwrap();
         let before = carry_in_state(&host, &own).unwrap();
+        let dir = open_dir(&own).unwrap();
         assert_eq!(before.as_deref(), Some(r#"{"a":1}"#));
         assert_eq!(
             std::fs::read_to_string(own.join("model.json")).unwrap(),
@@ -948,14 +959,14 @@ mod tests {
 
         // Unchanged: the host file is left alone even if it moved on meanwhile.
         std::fs::write(host.join("model.json"), r#"{"other":1}"#).unwrap();
-        save_model_to(&own, &host, before.as_deref()).unwrap();
+        save_model_to(&dir, &host, before.as_deref()).unwrap();
         assert_eq!(
             std::fs::read_to_string(host.join("model.json")).unwrap(),
             r#"{"other":1}"#
         );
 
         std::fs::write(own.join("model.json"), r#"{"b":2}"#).unwrap();
-        save_model_to(&own, &host, before.as_deref()).unwrap();
+        save_model_to(&dir, &host, before.as_deref()).unwrap();
         assert_eq!(
             std::fs::read_to_string(host.join("model.json")).unwrap(),
             r#"{"b":2}"#
@@ -964,7 +975,7 @@ mod tests {
         let refused = |own_model: &dyn Fn(&Path)| {
             let _ = std::fs::remove_file(own.join("model.json"));
             own_model(&own.join("model.json"));
-            assert!(save_model_to(&own, &host, before.as_deref()).is_err());
+            assert!(save_model_to(&dir, &host, before.as_deref()).is_err());
             assert_eq!(
                 std::fs::read_to_string(host.join("model.json")).unwrap(),
                 r#"{"b":2}"#
@@ -987,6 +998,25 @@ mod tests {
         std::os::unix::fs::symlink(&target, host.join("model.json")).unwrap();
         std::fs::remove_file(own.join("prompt-history.jsonl")).unwrap();
         assert_eq!(carry_in_state(&host, &own), Err(()));
+    }
+
+    /// The copy-back reads through the dir opened at prepare: a link swapped
+    /// in for the session's state dir is not followed.
+    #[test]
+    fn copy_back_ignores_a_swapped_state_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (host, own) = (tmp.path().join("host"), tmp.path().join("own"));
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::create_dir_all(&own).unwrap();
+        let dir = open_dir(&own).unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("model.json"), r#"{"secret":1}"#).unwrap();
+        std::fs::rename(&own, tmp.path().join("old")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &own).unwrap();
+        save_model_to(&dir, &host, None).unwrap();
+        assert!(!host.join("model.json").exists());
+        assert!(open_dir(&own).is_err(), "a link is not opened as the dir");
     }
 
     /// A FIFO planted at the host history file must not hang the launch.

@@ -32,6 +32,33 @@ pub fn read_regular_following(path: &Path, limit: u64) -> io::Result<Option<Stri
     read(open(path, 0)?, limit)
 }
 
+/// Like [`read_untrusted`] for `name` inside an already open `dir`, so a
+/// link swapped in for the dir itself cannot redirect the read.
+pub fn read_untrusted_at(dir: &File, name: &str, limit: u64) -> io::Result<Option<String>> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    let c = std::ffi::CString::new(name).map_err(io::Error::other)?;
+    // SAFETY: `dir` is an open descriptor and `c` is NUL-terminated.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let e = io::Error::last_os_error();
+        return if e.raw_os_error() == Some(libc::ELOOP) {
+            Ok(None)
+        } else {
+            Err(e)
+        };
+    }
+    // SAFETY: openat returned a new descriptor that we now own.
+    let file = unsafe { File::from_raw_fd(fd) };
+    let file = file.metadata()?.is_file().then_some(file);
+    read(file, limit)
+}
+
 fn open(path: &Path, extra: libc::c_int) -> io::Result<Option<File>> {
     let file = match std::fs::OpenOptions::new()
         .read(true)
