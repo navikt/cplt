@@ -9854,6 +9854,7 @@ paths = [
                     "XDG_STATE_HOME",
                     "XDG_CACHE_HOME",
                     "OPENCODE_CONFIG_DIR",
+                    "OPENCODE_CONFIG",
                 ] {
                     cmd.env_remove(v);
                 }

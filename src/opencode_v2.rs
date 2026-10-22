@@ -976,6 +976,7 @@ mod tests {
                 ("XDG_CONFIG_HOME", None::<&str>),
                 ("XDG_STATE_HOME", None),
                 ("OPENCODE_CONFIG", None),
+                ("OPENCODE_CONFIG_DIR", None),
             ],
             || prepare(tmp.path(), tmp.path(), &tmp.path().join("src/repo")).unwrap(),
         );
