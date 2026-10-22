@@ -581,7 +581,7 @@ fn opencode_script_grants(config_dir: &Path, home: &Path, writable: &[PathBuf]) 
     for f in FILES.iter().map(|f| config_dir.join(f)) {
         if let Some(t) = read_small_regular_file(&f) {
             locs.extend(resolved(&f));
-            paths.extend(opencode_script_paths(&t, home));
+            paths.extend(opencode_script_paths(&t, config_dir, home));
         }
     }
     let mut out = script_grants(paths, config_dir, home, writable);
@@ -622,8 +622,11 @@ pub fn env_config_dir_on_credentials(agent: Agent, home: &Path) -> Option<(&'sta
 
 /// Candidate paths in an OpenCode config: each `plugin[]` entry (string or
 /// `[spec, options]`) that is a `file://` URL, and the script token of each
-/// `mcp.<name>.command` array.
-fn opencode_script_paths(text: &str, home: &Path) -> Vec<PathBuf> {
+/// `mcp.<name>.command` array. Also the OpenCode 2.x schema (#717): each
+/// `plugins[]` entry (string or `{package}`) that is a `file://` URL, an
+/// absolute path or a `./`/`../` path relative to `base` (the config dir)
+/// naming a plugin directory, and `mcp.servers.<name>.command`.
+fn opencode_script_paths(text: &str, base: &Path, home: &Path) -> Vec<PathBuf> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&strip_jsonc(text)) else {
         return vec![];
     };
@@ -637,23 +640,55 @@ fn opencode_script_paths(text: &str, home: &Path) -> Vec<PathBuf> {
         .filter_map(|p| expand_home(&percent_decode(p), home))
         .filter_map(|p| {
             if p.is_dir() {
-                plugin_entrypoint(&p)
+                plugin_entrypoint(&p, false)
             } else {
                 Some(p)
             }
         });
+    // v2 skips npm names and `-name` removals, and refuses a file target:
+    // only a directory is loaded, through its entrypoint.
+    let v2_plugins = v
+        .get("plugins")
+        .and_then(|p| p.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p.as_str().or_else(|| p.get("package")?.as_str()))
+        .filter_map(|p| {
+            if let Some(u) = p.strip_prefix("file://") {
+                Some(PathBuf::from(percent_decode(u)))
+            } else if p.starts_with("./") || p.starts_with("../") {
+                Some(base.join(p))
+            } else {
+                Some(PathBuf::from(p)).filter(|p| p.is_absolute())
+            }
+        })
+        .filter(|p| p.is_dir())
+        .filter_map(|p| plugin_entrypoint(&p, true));
+    let servers = |m: &serde_json::Value| -> Vec<serde_json::Value> {
+        m.as_object()
+            .into_iter()
+            .flat_map(|m| m.values().cloned())
+            .collect()
+    };
     let commands = v
         .get("mcp")
-        .and_then(|m| m.as_object())
+        .map(|m| {
+            let mut all = servers(m);
+            all.extend(m.get("servers").map(servers).unwrap_or_default());
+            all
+        })
+        .unwrap_or_default()
         .into_iter()
-        .flat_map(|m| m.values())
-        .filter_map(|s| s.get("command")?.as_array())
+        .filter_map(|s| s.get("command")?.as_array().cloned())
         .map(|c| {
             c.iter()
                 .filter_map(|w| Some(w.as_str()?.to_string()))
                 .collect()
         });
-    plugins.chain(script_paths(commands, home)).collect()
+    plugins
+        .chain(v2_plugins)
+        .chain(script_paths(commands, home))
+        .collect()
 }
 
 /// `%XX` decoding for the path of a `file://` URL, as `fileURLToPath` does.
@@ -679,15 +714,21 @@ fn percent_decode(s: &str) -> String {
 }
 
 /// The file a directory plugin loads: `package.json` `main`, else
-/// `index.ts` or `index.js`. `None` when that file resolves outside `dir`
+/// `index.ts` or `index.js`. OpenCode 2.x (`v2`) ignores `main` and tries
+/// `server` before `index`. `None` when that file resolves outside `dir`
 /// (an absolute or `..` `main`, or a symlink out), so the grant cannot be
 /// pointed at an arbitrary file.
-fn plugin_entrypoint(dir: &Path) -> Option<PathBuf> {
+fn plugin_entrypoint(dir: &Path, v2: bool) -> Option<PathBuf> {
     let real_dir = std::fs::canonicalize(dir).ok()?;
-    let main = read_small_regular_file(&dir.join("package.json"))
+    let main = (!v2)
+        .then(|| read_small_regular_file(&dir.join("package.json")))
+        .flatten()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
         .and_then(|v| Some(v.get("main")?.as_str()?.to_string()));
+    // ponytail: .ts/.js only; Bun's full module resolution (.mjs, server/index) is not mirrored.
+    let v2_names: &[&str] = if v2 { &["server.ts", "server.js"] } else { &[] };
     main.into_iter()
+        .chain(v2_names.iter().map(|n| (*n).to_string()))
         .chain(["index.ts".into(), "index.js".into()])
         .map(|m| dir.join(m))
         .find(|p| p.is_file())
@@ -3680,6 +3721,61 @@ mod tests {
         let mut dirs = got.clone();
         drop_script_grants_under(&mut dirs, &[home.join(".config")]);
         assert!(dirs.is_empty(), "{dirs:?}");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn opencode_script_grants_v2_plugins_and_mcp_servers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        let cfg = home.join(".config/opencode");
+        let ext = home.join("ext");
+        for d in [
+            &cfg.join("rel"),
+            &ext.join("srv"),
+            &ext.join("idx"),
+            &ext.join("pkg"),
+        ] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let f = |p: PathBuf| {
+            std::fs::write(&p, "x").unwrap();
+            p
+        };
+        let srv = f(ext.join("srv/server.ts"));
+        f(ext.join("srv/index.ts"));
+        let idx = f(ext.join("idx/index.js"));
+        let rel = f(cfg.join("rel/index.ts"));
+        // v2 ignores `main` and refuses a file target.
+        std::fs::write(ext.join("pkg/package.json"), r#"{"main":"m.js"}"#).unwrap();
+        f(ext.join("pkg/m.js"));
+        let file = f(ext.join("file.js"));
+        let mcp = f(ext.join("mcp.sh"));
+        std::fs::write(
+            cfg.join("opencode.json"),
+            format!(
+                r#"{{"plugins": ["npm-pkg", "-gone", "file://{srv}", {{"package": "{idx}", "options": {{}}}}, "./rel", "{pkg}", "{file}"],
+  "mcp": {{"timeout": {{"startup": 1}}, "servers": {{
+    "a": {{"type": "local", "command": ["{mcp}", "--x"]}},
+    "b": {{"type": "remote", "url": "https://x"}}}}}}}}"#,
+                srv = ext.join("srv").display(),
+                idx = ext.join("idx").display(),
+                pkg = ext.join("pkg").display(),
+                file = file.display(),
+                mcp = mcp.display(),
+            ),
+        )
+        .unwrap();
+        let mut paths: Vec<_> = opencode_script_grants(&cfg, &home, &[])
+            .into_iter()
+            .map(|d| d.path)
+            .collect();
+        paths.sort();
+        let mut want = vec![srv, idx, mcp];
+        want.sort();
+        // `./rel` resolves into the read-only config dir, granted already.
+        assert!(rel.starts_with(&cfg));
+        assert_eq!(paths, want);
     }
 
     #[test]
