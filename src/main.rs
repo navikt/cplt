@@ -6356,6 +6356,14 @@ fn assemble_sandbox(
              login. Unlock the keyring at login, or set gh_guard.inject_token = true --force",
         );
     }
+    if !resolved.quiet
+        && let Some(skip) = cplt::sandbox::SECRET_SERVICE_SKIP.get()
+    {
+        ui::warn(&format!(
+            "Copilot gets no keyring login: {}",
+            skip.reason(home_dir)
+        ));
+    }
 
     let mut extra_exec = resolved.allow_exec.clone();
     extra_exec.extend(pnpm_exec_grants(
@@ -8548,7 +8556,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         doctor::copilot_own_sandbox_enabled(&home_dir),
         !cplt::sandbox::copilot_sandbox_support_overridden(&resolved.pass_env, active_agent),
     ));
-    findings.extend(doctor::linux_keyring_finding(
+    let keyring = doctor::linux_keyring_finding(
         active_agent,
         cfg!(target_os = "linux"),
         std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some(),
@@ -8563,8 +8571,22 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
             auth.gh_cli_auth,
             cplt::sandbox::copilot_has_native_login(&home_dir),
         ),
-        cplt::sandbox::secret_service_skip_reason(resolved.keychain_substitute, &resolved.deny_env),
-    ));
+        &cplt::sandbox::secret_service_skip_reason(
+            resolved.keychain_substitute,
+            &resolved.deny_env,
+            &home_dir,
+        ),
+    );
+    // A recorded skip has one specific fix: lead with it, not a clause in the fix.
+    findings.extend(keyring.map(|mut f| {
+        if let Some(skip) = cplt::sandbox::SECRET_SERVICE_SKIP.get() {
+            f.message = format!(
+                "Copilot's keyring login was not passed to the sandbox: {}",
+                skip.reason(&home_dir)
+            );
+        }
+        f
+    }));
     for message in write_granted_repos_messages(&resolved, &project_dir, &repo_paths)
         .into_iter()
         .chain(repo_under_no_exec_cache_messages(

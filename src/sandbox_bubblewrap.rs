@@ -179,6 +179,11 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// Set when an installed bwrap failed its probe and the launch fell back, so
+/// the socket warning points at the namespace fix instead of an install.
+pub(crate) static PROBE_FAILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Test that bubblewrap can actually create the namespaces we use.
 ///
 /// Runs `bwrap <production args> /bin/true`. The args come straight from
@@ -1170,6 +1175,9 @@ pub(crate) fn resolve(
         None => match build_wrapper(policy, overlays, deny_masks, false) {
             Ok(wrapper) => Ok(Some(wrapper)),
             Err(e) => {
+                if e.starts_with("bwrap test failed") {
+                    PROBE_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 crate::ui::warn(&format!(
                     "Bubblewrap unavailable ({e}). Using Landlock + seccomp only."
                 ));
