@@ -3704,6 +3704,7 @@ mod tests {
         let session = || crate::opencode_v2::Session {
             env: Vec::new(),
             port: 50123,
+            model: Ok(None),
             hidden: Vec::new(),
             reads: Vec::new(),
         };
