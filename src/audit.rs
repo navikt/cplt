@@ -1623,12 +1623,28 @@ impl NestedGit {
 ///
 /// Read with [`crate::untrusted`]: a symlinked or non-regular config is
 /// reported, not followed.
+///
+/// # Fast on a warm launch
+///
+/// A store is compared by `lstat` of its files, not their content, and git
+/// parses a config only when its `lstat` (device, inode, size, mtime, ctime)
+/// is not in the clean-verdict cache in cplt's state dir, which the sandbox
+/// denies. Only clean verdicts are cached; the ctime cannot be set back, so a
+/// rewrite always misses. The template dirs are looked up at most once, and
+/// only when a store has a hook that is not a `.sample`.
 pub struct SnapshotStores {
     root: PathBuf,
     /// The user's git template dirs: `git init` copies their hooks into every
     /// new store, so a hook identical to one of them is not a plant.
-    templates: Vec<PathBuf>,
+    templates: std::cell::OnceCell<Vec<PathBuf>>,
     before: std::collections::BTreeMap<PathBuf, String>,
+    cache_file: Option<PathBuf>,
+    /// Config path -> `lstat` key, for configs git found clean.
+    cache: std::cell::RefCell<std::collections::HashMap<PathBuf, String>>,
+    /// The clean verdicts the latest scan confirmed: what gets saved.
+    seen: std::cell::RefCell<std::collections::HashMap<PathBuf, String>>,
+    /// What the cache file holds now, so an unchanged cache is not rewritten.
+    loaded: std::cell::RefCell<std::collections::HashMap<PathBuf, String>>,
 }
 
 /// One entry below the snapshot root: a store, or something where a store
@@ -1640,59 +1656,109 @@ struct StoreEntry {
 }
 
 impl SnapshotStores {
-    pub fn capture(root: PathBuf) -> Self {
-        Self::capture_with(root, template_dirs())
+    /// `cache_file`: where clean verdicts are kept between launches.
+    pub fn capture(root: PathBuf, cache_file: PathBuf) -> Self {
+        Self::capture_with(root, None, Some(cache_file))
     }
 
-    fn capture_with(root: PathBuf, templates: Vec<PathBuf>) -> Self {
+    fn capture_with(
+        root: PathBuf,
+        templates: Option<Vec<PathBuf>>,
+        cache_file: Option<PathBuf>,
+    ) -> Self {
+        // Missing or unreadable: everything is parsed again. A line that does
+        // not parse is just not a cache hit.
+        let cache: std::collections::HashMap<PathBuf, String> = cache_file
+            .as_deref()
+            .and_then(|f| std::fs::read_to_string(f).ok())
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| {
+                let (k, p) = l.split_once('\t')?;
+                Some((PathBuf::from(p), k.to_string()))
+            })
+            .collect();
         let mut s = Self {
             root,
-            templates,
+            templates: templates.map(std::cell::OnceCell::from).unwrap_or_default(),
             before: std::collections::BTreeMap::new(),
+            cache_file,
+            loaded: std::cell::RefCell::new(cache.clone()),
+            cache: std::cell::RefCell::new(cache),
+            seen: std::cell::RefCell::default(),
         };
         // Left by a session that was killed before its check, or from before
         // this check existed: moved aside before the agent starts.
-        let flagged = s.scan().into_iter().filter(|e| !e.findings.is_empty());
-        let moved = s.quarantine(flagged.collect());
+        let (flagged, clean): (Vec<_>, Vec<_>) =
+            s.scan().into_iter().partition(|e| !e.findings.is_empty());
+        let moved = s.quarantine(flagged);
         print_quarantined(
             &moved,
             "An OpenCode snapshot store already held a git hook, a config key that \
              runs a program, or a link before this session started.",
         );
-        s.before = s.scan().into_iter().map(|e| (e.path, e.state)).collect();
+        // What was moved is gone; the rest is the baseline, without a second
+        // walk.
+        s.before = clean.into_iter().map(|e| (e.path, e.state)).collect();
+        s.save_cache();
         s
     }
 
-    /// Every store, and every odd entry where a store would be. Both levels,
-    /// always: a `HEAD` planted in `<id>` must not hide `<id>/<hash>`.
+    /// Replace the cache with what the latest scan found clean, atomically.
+    fn save_cache(&self) {
+        let Some(file) = &self.cache_file else { return };
+        if *self.seen.borrow() == *self.loaded.borrow() {
+            return;
+        }
+        let mut body = String::new();
+        for (p, k) in self.seen.borrow().iter() {
+            // A name with a tab or newline is just never cached.
+            if let Some(p) = p.to_str().filter(|p| !p.contains(['\t', '\n'])) {
+                body += &[k.as_str(), "\t", p, "\n"].concat();
+            }
+        }
+        let tmp = file.with_extension(format!("tmp-{}", std::process::id()));
+        let ok = file
+            .parent()
+            .is_some_and(|d| std::fs::create_dir_all(d).is_ok())
+            && std::fs::write(&tmp, body).is_ok()
+            && std::fs::rename(&tmp, file).is_ok();
+        if ok {
+            self.loaded.replace(self.seen.borrow().clone());
+        }
+        if !ok {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    /// Every store, and every symlink where a store would be. Both levels,
+    /// always: a `HEAD` planted in `<id>` must not hide `<id>/<hash>`. Plain
+    /// files (`.DS_Store`) are ignored: OpenCode opens `<id>/<hash>/HEAD`,
+    /// which no file at either level can stand in for.
     fn scan(&self) -> Vec<StoreEntry> {
-        let odd = |path: PathBuf, t: std::fs::FileType| StoreEntry {
+        self.seen.borrow_mut().clear();
+        let link = |path: PathBuf| StoreEntry {
             path,
-            state: "odd".into(),
-            findings: vec![if t.is_symlink() {
-                "a symlink".into()
-            } else {
-                "not a directory".into()
-            }],
+            state: "link".into(),
+            findings: vec!["a symlink".into()],
         };
         let mut out = Vec::new();
         for (d1, t1) in lstat_entries(&self.root) {
-            if !t1.is_dir() {
-                out.push(odd(d1, t1));
+            if t1.is_symlink() {
+                out.push(link(d1));
                 continue;
             }
-            let v1_store = is_store(&d1);
-            if v1_store {
+            if !t1.is_dir() {
+                continue;
+            }
+            if is_store(&d1) {
                 out.push(self.store_entry(d1.clone()));
             }
             for (d2, t2) in lstat_entries(&d1) {
-                if t2.is_dir() {
-                    if is_store(&d2) {
-                        out.push(self.store_entry(d2));
-                    }
-                } else if t2.is_symlink() || !v1_store {
-                    // A v1 store's own files (`HEAD`, `config`) are expected.
-                    out.push(odd(d2, t2));
+                if t2.is_symlink() {
+                    out.push(link(d2));
+                } else if t2.is_dir() && is_store(&d2) {
+                    out.push(self.store_entry(d2));
                 }
             }
         }
@@ -1737,6 +1803,7 @@ impl SnapshotStores {
     /// `settled`: the session's processes had all exited before this check.
     pub fn report(&self, settled: bool) {
         let (flagged, gone) = self.flagged();
+        self.save_cache();
         print_quarantined(
             &self.quarantine(flagged),
             "An OpenCode snapshot store was created or changed during this session and \
@@ -1762,12 +1829,101 @@ impl SnapshotStores {
     }
 
     fn store_entry(&self, path: PathBuf) -> StoreEntry {
-        let (state, findings) = store_state(&path, &self.templates);
+        let (state, findings) = self.store_state(&path);
         StoreEntry {
             path,
             state,
             findings,
         }
+    }
+
+    /// A store's config files and hooks, as one comparable string, and what
+    /// in them could run a program.
+    fn store_state(&self, store: &Path) -> (String, Vec<String>) {
+        use std::os::unix::fs::MetadataExt;
+        let mut state = String::new();
+        let mut findings = Vec::new();
+        for name in [
+            "config",
+            "opencode.gitconfig",
+            "config.worktree",
+            "commondir",
+        ] {
+            let path = store.join(name);
+            let meta = match std::fs::symlink_metadata(&path) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Ok(m) if m.is_file() => m,
+                _ => {
+                    findings.push(format!("{name}: not a plain readable file"));
+                    state += &[name, "\0?\0"].concat();
+                    continue;
+                }
+            };
+            let key = format!(
+                "{} {} {} {}.{} {}.{}",
+                meta.dev(),
+                meta.ino(),
+                meta.size(),
+                meta.mtime(),
+                meta.mtime_nsec(),
+                meta.ctime(),
+                meta.ctime_nsec()
+            );
+            state += &[name, "\0", &key, "\0"].concat();
+            if name == "commondir" {
+                findings.push("commondir".to_string());
+                continue;
+            }
+            if self.cache.borrow().get(&path) == Some(&key) {
+                self.seen.borrow_mut().insert(path, key);
+                continue;
+            }
+            let keys = crate::untrusted::read_untrusted(&path, 1 << 20)
+                .ok()
+                .flatten()
+                .and_then(|text| risky_config_keys(&text));
+            match keys {
+                Some(keys) if keys.is_empty() => {
+                    self.cache.borrow_mut().insert(path.clone(), key.clone());
+                    self.seen.borrow_mut().insert(path, key);
+                }
+                Some(keys) => findings.extend(keys.into_iter().map(|k| format!("{name}: {k}"))),
+                None => findings.push(format!("{name}: git could not read it")),
+            }
+        }
+        let hooks = store.join("hooks");
+        if std::fs::symlink_metadata(&hooks).is_ok_and(|m| !m.is_dir()) {
+            findings.push("hooks: not a directory".to_string());
+        }
+        let mut names: Vec<std::ffi::OsString> = std::fs::read_dir(&hooks)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        names.sort();
+        for n in &names {
+            let shown = n.to_string_lossy();
+            state += &["hook\0", &shown, "\0"].concat();
+            // Git runs a hook by its exact name; the `.sample`s never run.
+            if shown.ends_with(".sample") {
+                continue;
+            }
+            // A byte-identical copy of a template hook is what `git init`
+            // put there.
+            let body = read_bytes_untrusted(&hooks.join(n));
+            let from_template = body.as_ref().is_some_and(|b| {
+                self.templates
+                    .get_or_init(template_dirs)
+                    .iter()
+                    .any(|t| std::fs::read(t.join("hooks").join(n)).is_ok_and(|tb| &tb == b))
+            });
+            if !from_template {
+                findings.push(format!("hook {shown}"));
+            }
+            state += &[format!("{body:?}").as_str(), "\0"].concat();
+        }
+        (state, findings)
     }
 }
 
@@ -1854,67 +2010,6 @@ fn read_bytes_untrusted(path: &Path) -> Option<Vec<u8>> {
     let mut buf = Vec::new();
     f.take(1 << 20).read_to_end(&mut buf).ok()?;
     Some(buf)
-}
-
-/// A store's config files and hooks, as one comparable string, and what in
-/// them could run a program.
-fn store_state(store: &Path, templates: &[PathBuf]) -> (String, Vec<String>) {
-    let mut state = String::new();
-    let mut findings = Vec::new();
-    for name in [
-        "config",
-        "opencode.gitconfig",
-        "config.worktree",
-        "commondir",
-    ] {
-        match crate::untrusted::read_untrusted(&store.join(name), 1 << 20) {
-            Ok(Some(text)) => {
-                if name == "commondir" {
-                    findings.push("commondir".to_string());
-                } else {
-                    match risky_config_keys(&text) {
-                        Some(keys) => {
-                            findings.extend(keys.into_iter().map(|k| format!("{name}: {k}")));
-                        }
-                        None => findings.push(format!("{name}: git could not read it")),
-                    }
-                }
-                state += &[name, "\0", &text, "\0"].concat();
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            _ => {
-                findings.push(format!("{name}: not a plain readable file"));
-                state += &[name, "\0?\0"].concat();
-            }
-        }
-    }
-    let hooks = store.join("hooks");
-    if std::fs::symlink_metadata(&hooks).is_ok_and(|m| !m.is_dir()) {
-        findings.push("hooks: not a directory".to_string());
-    }
-    let mut names: Vec<std::ffi::OsString> = std::fs::read_dir(&hooks)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.file_name())
-        .collect();
-    names.sort();
-    for n in &names {
-        let body = read_bytes_untrusted(&hooks.join(n));
-        let shown = n.to_string_lossy();
-        // Git runs a hook by its exact name; the `.sample`s never run, and a
-        // byte-identical copy of a template hook is what `git init` put there.
-        let from_template = body.as_ref().is_some_and(|b| {
-            templates
-                .iter()
-                .any(|t| std::fs::read(t.join("hooks").join(n)).is_ok_and(|tb| &tb == b))
-        });
-        if !shown.ends_with(".sample") && !from_template {
-            findings.push(format!("hook {shown}"));
-        }
-        state += &["hook\0", &shown, "\0", &format!("{body:?}"), "\0"].concat();
-    }
-    (state, findings)
 }
 
 /// Config keys that make git run a program or read config from elsewhere,
@@ -3812,7 +3907,7 @@ mod tests {
     }
 
     fn cap(root: &Path) -> SnapshotStores {
-        SnapshotStores::capture_with(root.to_path_buf(), vec![])
+        SnapshotStores::capture_with(root.to_path_buf(), Some(vec![]), None)
     }
 
     fn flagged_lines(stores: &SnapshotStores) -> Vec<String> {
@@ -3931,8 +4026,11 @@ mod tests {
         let tpl = tempfile::tempdir().unwrap();
         std::fs::create_dir(tpl.path().join("hooks")).unwrap();
         std::fs::write(tpl.path().join("hooks/pre-commit"), "#!/bin/sh\nsecrets\n").unwrap();
-        let stores =
-            SnapshotStores::capture_with(root.path().to_path_buf(), vec![tpl.path().to_path_buf()]);
+        let stores = SnapshotStores::capture_with(
+            root.path().to_path_buf(),
+            Some(vec![tpl.path().to_path_buf()]),
+            None,
+        );
         let (a, b) = (root.path().join("p/a"), root.path().join("p/b"));
         opencode_store(&a);
         opencode_store(&b);
@@ -4015,5 +4113,103 @@ mod tests {
             keys("[core]\n\tsshCommand = x\n[includeIf \"gitdir:/\"]\n\tpath = /x\n"),
             ["core.sshcommand", "includeif.gitdir:/.path"]
         );
+    }
+
+    #[test]
+    fn plain_files_at_either_level_are_ignored() {
+        let root = tempfile::tempdir().unwrap();
+        opencode_store(&root.path().join("p/s"));
+        let stores = cap(root.path());
+        std::fs::write(root.path().join(".DS_Store"), "x").unwrap();
+        std::fs::write(root.path().join("p/.DS_Store"), "x").unwrap();
+        std::fs::write(root.path().join("p/s.swp"), "x").unwrap();
+        assert!(flagged_lines(&stores).is_empty());
+        assert!(root.path().join("p/.DS_Store").exists());
+    }
+
+    #[test]
+    fn the_clean_cache_is_written_and_never_hides_a_change() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let cache = state.path().join("c/clean");
+        let s = root.path().join("p/s");
+        opencode_store(&s);
+        let cap_cached = || {
+            SnapshotStores::capture_with(
+                root.path().to_path_buf(),
+                Some(vec![]),
+                Some(cache.clone()),
+            )
+        };
+        cap_cached();
+        let body = std::fs::read_to_string(&cache).unwrap();
+        assert_eq!(body.lines().count(), 2, "{body}");
+        // Same size, same mtime: only the ctime and content differ.
+        let cfg = s.join("config");
+        let old = std::fs::metadata(&cfg).unwrap();
+        let text = std::fs::read_to_string(&cfg).unwrap();
+        let planted = text.replacen("bare = true", "editor = /x", 1);
+        assert_eq!(planted.len(), text.len(), "test needs a same-length edit");
+        std::fs::write(&cfg, planted).unwrap();
+        let f = std::fs::File::options().write(true).open(&cfg).unwrap();
+        f.set_modified(old.modified().unwrap()).unwrap();
+        drop(f);
+        cap_cached();
+        assert!(!s.exists(), "the plant must be parsed and quarantined");
+    }
+
+    #[test]
+    fn a_corrupt_cache_means_a_rescan() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let cache = state.path().join("clean");
+        let s = root.path().join("p/s");
+        opencode_store(&s);
+        append(&s.join("config"), "[core]\n\thooksPath = /x\n");
+        std::fs::write(
+            &cache,
+            format!("garbage\n1 2\t{}\n\0\0", s.join("config").display()),
+        )
+        .unwrap();
+        SnapshotStores::capture_with(root.path().to_path_buf(), Some(vec![]), Some(cache.clone()));
+        assert!(!s.exists());
+    }
+
+    /// Capture time for 200 stores, cold (no cache) and warm. Run by hand:
+    /// `cargo test --lib snapshot_capture_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing, run by hand"]
+    fn snapshot_capture_timing() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let cache = state.path().join("clean");
+        let first = root.path().join("p0/s");
+        opencode_store(&first);
+        for i in 0..200 {
+            let to = root.path().join(format!("p{}/s{i}", i / 4));
+            if to != first {
+                std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+                copy_dir(&first, &to);
+            }
+        }
+        let time = || {
+            let t = Instant::now();
+            SnapshotStores::capture_with(root.path().to_path_buf(), None, Some(cache.clone()));
+            t.elapsed()
+        };
+        let cold = time();
+        let warm: Vec<_> = (0..5).map(|_| time()).collect();
+        eprintln!("200 stores: cold {cold:?}, warm {warm:?}");
+    }
+
+    fn copy_dir(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for e in std::fs::read_dir(from).unwrap().flatten() {
+            if e.file_type().unwrap().is_dir() {
+                copy_dir(&e.path(), &to.join(e.file_name()));
+            } else {
+                std::fs::copy(e.path(), to.join(e.file_name())).unwrap();
+            }
+        }
     }
 }

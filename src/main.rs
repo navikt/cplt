@@ -4930,8 +4930,14 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     let mut proxy_handle = proxy_handle;
     // OpenCode's snapshot stores sit in its writable data dir, outside every
     // root the `.git` check walks; unsandboxed OpenCode runs git in them.
-    let opencode_stores = (active_agent == agent::Agent::OpenCode)
-        .then(|| audit::SnapshotStores::capture(cplt::opencode_v2::snapshot_root(&home_dir)));
+    let opencode_stores = (active_agent == agent::Agent::OpenCode).then(|| {
+        audit::SnapshotStores::capture(
+            cplt::opencode_v2::snapshot_root(&home_dir),
+            home_dir
+                .join(cplt::sandbox::CPLT_STATE_DIR)
+                .join("opencode-snapshot-clean"),
+        )
+    });
     let (exit_code, snapshot, settled) = audit::run(
         &project_dir,
         &resolved.allow_write,
