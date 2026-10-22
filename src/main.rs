@@ -2690,7 +2690,10 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             Ok(root) => std::fs::canonicalize(&root).unwrap_or(root),
             Err(reason) => {
                 ui::warn(&match reason {
-                    Some(r) => format!("No git repo detected, using cwd (git: {r})"),
+                    Some(r) => format!(
+                        "No git repo detected, using cwd (git: {})",
+                        sanitize_terminal_text(&r)
+                    ),
                     None => "No git repo detected, using cwd".to_string(),
                 });
                 std::env::current_dir()
