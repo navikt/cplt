@@ -8413,18 +8413,21 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
                  shims, Pi bin/, unix-socket masks)"
             );
         }
+        let landlock_v9 = sandbox::available_abi_version().is_some_and(|abi| abi >= 9);
         if let Some(line) = sandbox::container_socket_line(
             &home_dir,
             resolved.allow_docker,
             resolved.allow_rootless_docker,
-            // Doctor builds no deny masks of its own. A socket file is masked
-            // with the placeholder, which needs the scratch dir; a directory
-            // is masked by a tmpfs.
-            &|p: &Path| {
-                sandbox::available_abi_version().is_some_and(|abi| abi >= 9)
-                    || (bubblewrap.active() && (resolved.scratch_dir || p.is_dir()))
-            },
+            // Doctor builds no deny masks of its own (that would mkdir the
+            // scratch placeholder), so a bubblewrap mask is reported as
+            // conditional below.
+            &|_: &Path| landlock_v9 || bubblewrap.active(),
         ) {
+            let line = if landlock_v9 {
+                line
+            } else {
+                line.replace("rootful masked:", "rootful masked if bubblewrap starts:")
+            };
             println!("             {line}");
         }
         if resolved.use_bubblewrap == Some(true) && !bubblewrap.active() {
