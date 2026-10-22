@@ -3768,6 +3768,25 @@ fn agent_allowlist(
     allowed_domains_file: bool,
     deny_env: &[String],
 ) -> Vec<String> {
+    let v2 = agent == agent::Agent::OpenCode
+        && agent.resolve_binary().is_ok_and(|bin| {
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_default();
+            home.is_absolute() && agent::is_opencode_v2(&bin, &home) == Some(true)
+        });
+    agent_allowlist_for(agent, default_allowlist, allowed_domains_file, deny_env, v2)
+}
+
+/// [`agent_allowlist`] with the OpenCode v1/v2 decision passed in, so tests
+/// do not depend on the `opencode` installed on the host (#788).
+fn agent_allowlist_for(
+    agent: agent::Agent,
+    default_allowlist: bool,
+    allowed_domains_file: bool,
+    deny_env: &[String],
+    v2: bool,
+) -> Vec<String> {
     let mut domains = if default_allowlist {
         agent.default_allowed_domains()
     } else if allowed_domains_file {
@@ -3786,11 +3805,6 @@ fn agent_allowlist(
         && !deny_env
             .iter()
             .any(|d| d == "GH_TOKEN" || d == "OPENCODE_AUTH_CONTENT");
-    let v2 = agent == agent::Agent::OpenCode
-        && home.is_absolute()
-        && agent
-            .resolve_binary()
-            .is_ok_and(|bin| agent::is_opencode_v2(&bin, &home) == Some(true));
     if v2 {
         domains.extend(agent::opencode_v2_provider_domains(&home));
     } else {
@@ -15428,13 +15442,14 @@ mod tests {
             Some(tmp.path().to_str().expect("utf-8 path")),
             || {
                 let copilot = "githubcopilot.com".to_string();
-                assert!(
-                    agent_allowlist(agent::Agent::OpenCode, false, true, &[]).contains(&copilot)
-                );
-                assert!(
-                    agent_allowlist(agent::Agent::OpenCode, true, false, &[]).contains(&copilot)
-                );
-                assert!(agent_allowlist(agent::Agent::OpenCode, false, false, &[]).is_empty());
+                let a = |default, file, v2| {
+                    agent_allowlist_for(agent::Agent::OpenCode, default, file, &[], v2)
+                };
+                assert!(a(false, true, false).contains(&copilot));
+                assert!(a(true, false, false).contains(&copilot));
+                assert!(a(false, false, false).is_empty());
+                // v2 reads opencode.db, not auth.json: no db, no Copilot hosts.
+                assert!(!a(false, true, true).contains(&copilot));
             },
         );
     }
@@ -15451,7 +15466,9 @@ mod tests {
             [("XDG_DATA_HOME", Some(p)), ("GH_CONFIG_DIR", Some(p))],
             || {
                 let copilot = "githubcopilot.com".to_string();
-                let a = |d: &[String]| agent_allowlist(agent::Agent::OpenCode, false, true, d);
+                let a = |d: &[String]| {
+                    agent_allowlist_for(agent::Agent::OpenCode, false, true, d, false)
+                };
                 assert!(a(&[]).contains(&copilot));
                 for v in ["GH_TOKEN", "OPENCODE_AUTH_CONTENT"] {
                     assert!(!a(&[v.to_string()]).contains(&copilot), "{v}");
