@@ -1630,40 +1630,108 @@ impl SnapshotStores {
         Self { root, before }
     }
 
-    /// One line per store that is new or changed and holds a hook or a
-    /// program-running config key.
-    fn lines(&self) -> Vec<String> {
-        let mut lines = Vec::new();
-        for store in snapshot_stores(&self.root) {
-            let (state, findings) = store_state(&store);
-            if findings.is_empty() || self.before.get(&store) == Some(&state) {
-                continue;
-            }
-            lines.push(format!(
-                "  {}: {}",
-                esc_path(&store),
-                escape_path(&findings.join(", "))
-            ));
-        }
-        lines
+    /// Every store that is new or changed and holds a hook or a
+    /// program-running config key, with what was found in it.
+    fn flagged(&self) -> Vec<(PathBuf, String)> {
+        snapshot_stores(&self.root)
+            .into_iter()
+            .filter_map(|store| {
+                let (state, findings) = store_state(&store);
+                (!findings.is_empty() && self.before.get(&store) != Some(&state))
+                    .then(|| (store, findings.join(", ")))
+            })
+            .collect()
+    }
+
+    /// Move each flagged store aside, so the next OpenCode run, in or out of
+    /// cplt, creates a clean one instead of running git in it. OpenCode opens
+    /// a store by its exact name (`<id>` or `<id>/<hash>`) and never lists
+    /// the directory, so it does not pick up the quarantined name.
+    fn quarantine(&self) -> Vec<(PathBuf, io::Result<PathBuf>, String)> {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        self.flagged()
+            .into_iter()
+            .map(|(store, found)| {
+                let moved = quarantine_store(&self.root, &store, ts);
+                (store, moved, found)
+            })
+            .collect()
     }
 
     pub fn report(&self) {
-        let lines = self.lines();
-        if lines.is_empty() {
+        let results = self.quarantine();
+        if results.is_empty() {
             return;
         }
         ui::error(
             "An OpenCode snapshot store was created or changed during this session and \
              holds a git hook or a config key that runs a program. OpenCode runs git in \
-             these stores, and outside cplt that program runs on the host. Do not run \
-             OpenCode outside cplt until you have checked them, or delete the store \
-             (OpenCode recreates it):",
+             these stores, and outside cplt that program would run on the host.",
         );
-        for l in &lines {
-            ui::error(l);
+        for (store, moved, found) in &results {
+            match moved {
+                Ok(to) => ui::error(&format!(
+                    "  {}: {} (moved to {}; OpenCode creates a clean store on its next \
+                     run, and only that project's undo history is lost)",
+                    esc_path(store),
+                    escape_path(found),
+                    esc_path(to)
+                )),
+                Err(e) => ui::error(&format!(
+                    "  {}: {} (could not move it aside: {e}. Do not run OpenCode outside \
+                     cplt until you have deleted this directory; OpenCode recreates it)",
+                    esc_path(store),
+                    escape_path(found)
+                )),
+            }
         }
     }
+}
+
+/// Rename `store` to `<store>.cplt-quarantine-<ts>` in its own parent,
+/// resolving every step from `root` with `O_NOFOLLOW`: the snapshot tree is
+/// agent-writable, so a component swapped for a symlink since the scan must
+/// not move something elsewhere. `renameat` does not follow the last name.
+fn quarantine_store(root: &Path, store: &Path, ts: u64) -> io::Result<PathBuf> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    let invalid = || io::Error::from(io::ErrorKind::InvalidInput);
+    let open_dir = |at: libc::c_int, name: &CString| -> io::Result<OwnedFd> {
+        // SAFETY: a valid C string and dir fd; the result is checked.
+        let fd = unsafe {
+            libc::openat(
+                at,
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` was just opened and is owned here.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    };
+    let cstr = |b: &[u8]| CString::new(b).map_err(|_| invalid());
+    let rel = store.strip_prefix(root).map_err(|_| invalid())?;
+    let mut parts: Vec<&std::ffi::OsStr> = rel.iter().collect();
+    let name = parts.pop().ok_or_else(invalid)?;
+    let mut dir = open_dir(libc::AT_FDCWD, &cstr(root.as_os_str().as_bytes())?)?;
+    for p in parts {
+        dir = open_dir(dir.as_raw_fd(), &cstr(p.as_bytes())?)?;
+    }
+    let mut new_name = name.to_os_string();
+    new_name.push(format!(".cplt-quarantine-{ts}"));
+    let (from, to) = (cstr(name.as_bytes())?, cstr(new_name.as_bytes())?);
+    // SAFETY: valid C strings and an open dir fd; the result is checked.
+    let rc =
+        unsafe { libc::renameat(dir.as_raw_fd(), from.as_ptr(), dir.as_raw_fd(), to.as_ptr()) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(store.with_file_name(new_name))
 }
 
 /// Every git directory (a directory holding `HEAD`) one or two levels below
@@ -3538,15 +3606,18 @@ mod tests {
     /// and the include appended to `config`.
     fn opencode_store(dir: &Path) {
         std::fs::create_dir_all(dir).unwrap();
-        let ok = Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(dir)
-            .env("GIT_DIR", dir)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .status()
-            .expect("git init")
-            .success();
+        // Under the env lock: another test can be changing PATH meanwhile.
+        let ok = crate::with_env_lock_no_xdg(|| {
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(dir)
+                .env("GIT_DIR", dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .status()
+                .expect("git init")
+                .success()
+        });
         assert!(ok);
         std::fs::write(
             dir.join("opencode.gitconfig"),
@@ -3568,13 +3639,66 @@ mod tests {
         f.write_all(text.as_bytes()).unwrap();
     }
 
+    fn flagged_lines(stores: &SnapshotStores) -> Vec<String> {
+        stores
+            .flagged()
+            .into_iter()
+            .map(|(p, f)| format!("{}: {f}", p.display()))
+            .collect()
+    }
+
+    #[test]
+    fn flagged_store_is_quarantined_and_clean_store_left_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let (bad, good) = (root.path().join("p/bad"), root.path().join("p/good"));
+        opencode_store(&bad);
+        opencode_store(&good);
+        let stores = SnapshotStores::capture(root.path().to_path_buf());
+        append(&bad.join("config"), "[core]\n\thooksPath = /tmp/x\n");
+        let results = stores.quarantine();
+        assert_eq!(results.len(), 1);
+        let to = results[0].1.as_ref().expect("renamed");
+        assert!(!bad.exists() && to.join("HEAD").exists(), "{to:?}");
+        assert!(
+            to.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("bad.cplt-quarantine-")
+        );
+        assert!(good.join("HEAD").exists());
+    }
+
+    #[test]
+    fn quarantine_does_not_follow_a_symlinked_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let victim = elsewhere.path().join("s");
+        opencode_store(&victim);
+        // The project dir was swapped for a link after the scan recorded it.
+        std::os::unix::fs::symlink(elsewhere.path(), root.path().join("p")).unwrap();
+        let err = quarantine_store(root.path(), &root.path().join("p/s"), 1);
+        assert!(err.is_err(), "{err:?}");
+        assert!(victim.join("HEAD").exists());
+        // And a symlinked store itself is renamed as a link, never followed.
+        std::fs::create_dir(root.path().join("q")).unwrap();
+        std::os::unix::fs::symlink(&victim, root.path().join("q/s")).unwrap();
+        let to = quarantine_store(root.path(), &root.path().join("q/s"), 1).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&to)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(victim.join("HEAD").exists());
+    }
+
     #[test]
     fn snapshot_stores_created_cleanly_are_not_reported() {
         let root = tempfile::tempdir().unwrap();
         let stores = SnapshotStores::capture(root.path().to_path_buf());
         opencode_store(&root.path().join("proj/abc"));
         opencode_store(&root.path().join("v1proj"));
-        assert_eq!(stores.lines(), Vec::<String>::new());
+        assert_eq!(flagged_lines(&stores), Vec::<String>::new());
     }
 
     #[test]
@@ -3598,7 +3722,7 @@ mod tests {
         let new = root.path().join("p/new");
         opencode_store(&new);
         append(&new.join("config"), "[filter \"x\"]\n\tclean = /tmp/x\n");
-        let lines = stores.lines();
+        let lines = flagged_lines(&stores);
         assert_eq!(lines.len(), 4, "{lines:?}");
         assert!(lines[0].contains("hookspath"), "{lines:?}");
         assert!(lines[1].contains("hook post-index-change"), "{lines:?}");
@@ -3617,7 +3741,7 @@ mod tests {
         opencode_store(&s);
         std::fs::remove_file(s.join("opencode.gitconfig")).unwrap();
         std::os::unix::fs::symlink("/dev/null", s.join("opencode.gitconfig")).unwrap();
-        let lines = stores.lines();
+        let lines = flagged_lines(&stores);
         assert!(
             lines.len() == 1 && lines[0].contains("not a plain readable file"),
             "{lines:?}"
