@@ -24,7 +24,7 @@
 //! host. So are the TUI's favourite models and prompt history (#793): the
 //! host `model.json` is copied in and, when the session changed it, back out
 //! at exit; `prompt-history.jsonl` is a link to the host file, which the
-//! host state dir grant already makes writable. Overlay entries are a snapshot: a top-level entry the user creates
+//! one host state file the session is granted (#796). Overlay entries are a snapshot: a top-level entry the user creates
 //! during the session is not seen until the next one.
 
 use std::io::Write;
@@ -58,6 +58,10 @@ pub struct Session {
     /// `AGENTS.md` that exists but cannot be read blocks the session.
     #[cfg(not(target_os = "macos"))]
     pub reads: Vec<PathBuf>,
+    /// The host `prompt-history.jsonl`, spelled and resolved: the one host
+    /// state file a v2 session reads and writes (#796).
+    #[cfg(not(target_os = "macos"))]
+    pub writes: Vec<PathBuf>,
 }
 
 /// An XDG base from the environment, ignoring a relative or empty value as the
@@ -128,8 +132,27 @@ pub fn prepare(scratch: &Path, home: &Path, launch_dir: &Path) -> Result<Session
         config_base.join("opencode/service.json"),
         state_base.join("opencode/service.json"),
     ];
+    // The host state dir is not granted to a v2 session (#796); only the
+    // history file its link points to is, once `carry_in_state` made it.
+    let history = state_base.join("opencode/prompt-history.jsonl");
+    let mut writes = Vec::new();
+    if std::fs::symlink_metadata(&history).is_ok_and(|m| m.is_file()) {
+        writes.extend([crate::config::canonicalize_deepest(&history), history]);
+        writes.dedup();
+    }
     #[cfg(target_os = "macos")]
-    let (sbpl_before_denies, sbpl) = profile_tail(home, launch_dir, &files, port)?;
+    let (sbpl_before_denies, sbpl) = {
+        let (mut before, tail) = profile_tail(home, launch_dir, &files, port)?;
+        for p in &writes {
+            crate::sandbox::validate_sbpl_path(p)?;
+            before.extend([
+                "(allow file-read* file-write* (literal \"",
+                &p.display().to_string(),
+                "\"))\n",
+            ]);
+        }
+        (before, tail)
+    };
     // Landlock does not gate the startup stat/realpath calls; only the files
     // v2 reads need a grant.
     #[cfg(not(target_os = "macos"))]
@@ -151,6 +174,8 @@ pub fn prepare(scratch: &Path, home: &Path, launch_dir: &Path) -> Result<Session
             .collect(),
         #[cfg(not(target_os = "macos"))]
         reads,
+        #[cfg(not(target_os = "macos"))]
+        writes,
     })
 }
 
@@ -1019,6 +1044,17 @@ mod tests {
                 assert!(s.sbpl_before_denies.contains(&lit), "{read}");
             }
         }
+        // #796: the history file is the one host state file granted.
+        let history = tmp
+            .path()
+            .join(".local/state/opencode/prompt-history.jsonl");
+        #[cfg(target_os = "macos")]
+        assert!(s.sbpl_before_denies.contains(&format!(
+            "(allow file-read* file-write* (literal \"{}\"))",
+            history.display()
+        )));
+        #[cfg(not(target_os = "macos"))]
+        assert!(s.writes.contains(&history));
     }
 
     /// #793: `model.json` comes in, goes back out only when changed and valid,

@@ -4688,6 +4688,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             electron_app_dir: electron_app_dir.as_deref(),
             pnpm_candidate: None,
             inspect_only: cli.print_profile,
+            opencode_v2,
         },
     )?;
 
@@ -6074,6 +6075,8 @@ struct AssemblyOptions<'a> {
     /// (`--print-profile`, `cplt check`), so preparing it must not write to
     /// the host (#553).
     inspect_only: bool,
+    /// An OpenCode v2 session: the host state dir is not granted (#796).
+    opencode_v2: bool,
 }
 
 /// A fully-built sandbox plus the live resources it depends on.
@@ -6234,6 +6237,9 @@ fn assemble_sandbox(
             home_dir,
             &probe.project_dir,
         ));
+    }
+    if opts.opencode_v2 {
+        agent::drop_opencode_v2_state_dir(&mut agent_dirs, home_dir);
     }
     // A restriction the user asked for and cannot have is said out loud, not
     // dropped (AGENTS.md "No silent grants").
@@ -6612,6 +6618,7 @@ fn prepare_shell_sandbox(
             pnpm_candidate: None,
             // `cplt check` only reports on the policy.
             inspect_only: true,
+            opencode_v2: false,
         },
     )
 }
@@ -6783,6 +6790,7 @@ fn run_exec_command(
                 electron_app_dir: None,
                 pnpm_candidate,
                 inspect_only: cli.print_profile,
+                opencode_v2: false,
             },
         )?
     };

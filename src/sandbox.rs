@@ -439,6 +439,19 @@ impl PreparedSandbox {
                     nofollow: false,
                 })
                 .collect();
+            // The host prompt history, the one host state file v2 keeps (#796).
+            let extra: Vec<landlock_mod::FsRule> = extra
+                .into_iter()
+                .chain(session.writes.iter().map(|path| landlock_mod::FsRule {
+                    path: path.clone(),
+                    access: landlock_mod::FsAccess {
+                        read: true,
+                        write: true,
+                        ..landlock_mod::FsAccess::default()
+                    },
+                    nofollow: true,
+                }))
+                .collect();
             w.fs_rules.extend(extra.iter().cloned());
             w.fs_rules.push(landlock_mod::FsRule {
                 path: PathBuf::from("/proc"),
@@ -3813,6 +3826,7 @@ mod tests {
             model: Err(()),
             hidden: Vec::new(),
             reads: Vec::new(),
+            writes: vec![PathBuf::from("/s/opencode/prompt-history.jsonl")],
         };
         let err = sandbox.add_opencode_v2(session()).unwrap_err();
         assert!(err.contains("needs Bubblewrap"), "{err}");
@@ -3847,6 +3861,16 @@ mod tests {
             |rules: &[landlock_mod::FsRule]| rules.iter().any(|r| r.path == Path::new("/proc"));
         assert!(proc(&w.fs_rules));
         assert!(!proc(&sandbox.policy.fs_rules));
+        // #796: the history file is granted read-write, in both rule sets.
+        for rules in [&w.fs_rules, &sandbox.policy.fs_rules] {
+            assert!(
+                rules
+                    .iter()
+                    .any(|r| r.path.ends_with("prompt-history.jsonl")
+                        && r.access.write
+                        && r.nofollow)
+            );
+        }
     }
 
     /// #252: revoking the root AGENTS.md grant removes exactly that rule, on

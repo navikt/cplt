@@ -3175,6 +3175,16 @@ pub fn deny_copilot_dir_exec(dirs: &mut [AgentDir], home: &Path) -> bool {
 /// brings the built-in agent dirs in line. Paths that cannot be resolved (a dir
 /// the caller has not created yet, a dangling link) are left as-is so the
 /// caller still emits a rule for the literal path rather than dropping it.
+/// #796: an OpenCode v2 session keeps its state in scratch and reaches the
+/// host state dir only for `prompt-history.jsonl`, granted by
+/// `opencode_v2::prepare` once that file exists. Drop the dir-wide grant v1
+/// still needs (kv.json, model.json, locks).
+pub fn drop_opencode_v2_state_dir(dirs: &mut Vec<AgentDir>, home: &Path) {
+    let state =
+        crate::opencode_v2::xdg_base("XDG_STATE_HOME", home, ".local/state").join("opencode");
+    dirs.retain(|d| d.path != state);
+}
+
 /// Drop hook/MCP script grants (file-level, exec-only) and OpenCode v2
 /// plugin-dir grants (read-only, [`plugin_dir_grants`]) that sit under a path
 /// the sandbox already makes writable: the project, `--repo-dir` roots,
@@ -5681,6 +5691,27 @@ mod tests {
                 assert!(paths.contains(&PathBuf::from("/xdg/cfg/goose")));
                 assert!(paths.contains(&PathBuf::from("/xdg/data/goose")));
                 assert!(paths.contains(&PathBuf::from("/xdg/state/goose")));
+            },
+        );
+    }
+
+    /// #796: v1 keeps the whole host state dir writable; v2 loses it (its
+    /// history file is granted by `opencode_v2::prepare`).
+    #[test]
+    fn opencode_state_dir_grant_is_v1_only() {
+        temp_env::with_vars(
+            [
+                ("XDG_STATE_HOME", Some("/xdg/state")),
+                ("OPENCODE_CONFIG_DIR", None),
+            ],
+            || {
+                let state = PathBuf::from("/xdg/state/opencode");
+                let mut dirs = Agent::OpenCode.config_dirs(Path::new("/Users/test"));
+                assert!(dirs.iter().any(|d| d.path == state && d.write), "v1");
+                let before = dirs.len();
+                drop_opencode_v2_state_dir(&mut dirs, Path::new("/Users/test"));
+                assert!(!dirs.iter().any(|d| d.path.starts_with(&state)), "v2");
+                assert_eq!(dirs.len(), before - 1, "nothing else dropped");
             },
         );
     }
