@@ -2789,6 +2789,15 @@ fn seed_claude_settings(config: &SandboxConfig) {
     }
 }
 
+/// Said at launch, or at a spawn-time bwrap fallback, when the `/proc` grant
+/// (#790) is withheld because nothing hides the host's processes.
+#[cfg(target_os = "linux")]
+pub(crate) const PROC_SELF_LIMIT_WARNING: &str = "Without Bubblewrap only the agent's first process can read its own /proc/self \
+     (cmdline, stat, status); processes it starts get EACCES, so tools such as podman \
+     fail with \"cannot retrieve cmd line\". Granting /proc would expose every host \
+     process's command line. Install bubblewrap, or pass --allow-read /proc if that is \
+     acceptable.";
+
 #[cfg(target_os = "linux")]
 fn prepare_impl(
     config: &SandboxConfig,
@@ -2904,7 +2913,8 @@ fn prepare_impl(
     // so read on all of it exposes nothing from the host. Pushed last, so
     // the Landlock-only path below can pop it again before anything else
     // touches the rule indices.
-    let proc_grant = !config.allow_jvm_attach;
+    let proc_grant =
+        !config.allow_jvm_attach && !config.extra_read.iter().any(|p| p == Path::new("/proc"));
     if proc_grant {
         policy.fs_rules.push(landlock_mod::proc_read_rule());
     }
@@ -3065,17 +3075,16 @@ fn prepare_impl(
     // Without bubblewrap `/proc` lists every host process, and Landlock's
     // ptrace scoping hides `environ`/`mem` but not `cmdline`/`stat`, so the
     // grant is withdrawn and the limit said out loud.
-    let proc_dropped = proc_grant && bwrap_wrapper.is_none() && policy.fs_rules.pop().is_some();
+    // Popped from the direct-path policy always: the wrapper already holds its
+    // own copy, and a spawn-time fallback to plain Landlock runs this one.
+    let proc_dropped = proc_grant && policy.fs_rules.pop().is_some();
+    if let Some(w) = bwrap_wrapper.as_mut() {
+        w.proc_limited_on_fallback = proc_dropped;
+    }
     let dropped = drop_claude_hook_grants(config, &mut policy);
     if bwrap_wrapper.is_none() {
         if proc_dropped {
-            ui::warn(
-                "Without Bubblewrap only the agent's first process can read its own \
-                 /proc/self (cmdline, stat, status); processes it starts get EACCES, so \
-                 tools such as podman fail with \"cannot retrieve cmd line\". Granting \
-                 /proc would expose every host process's command line. Install \
-                 bubblewrap, or pass --allow-read /proc if that is acceptable.",
-            );
+            ui::warn(PROC_SELF_LIMIT_WARNING);
         }
         if proc_dropped && dropped.is_empty() {
             profile_text =
@@ -3586,6 +3595,7 @@ mod tests {
             strict: false,
             deny_mask_count: 0,
             socket_mask_count: 0,
+            proc_limited_on_fallback: false,
             proxy_forced: false,
             plain_file: None,
         });
@@ -3663,6 +3673,7 @@ mod tests {
                 strict: false,
                 deny_mask_count: 0,
                 socket_mask_count: 0,
+                proc_limited_on_fallback: false,
                 proxy_forced: false,
                 plain_file: Some(1),
             });
@@ -4610,6 +4621,31 @@ mod tests {
         // Control: with a working probe the same setup does create it.
         let prepared = prepare(&config).expect("prepare");
         assert!(prepared.bwrap_wrapper.is_some() && target.is_file());
+    }
+
+    /// #790: `/proc` read goes to the bwrap helper only. The direct policy —
+    /// what a spawn-time fallback to plain Landlock runs — must not carry it,
+    /// and the wrapper must know to warn on that fallback.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_grant_reaches_the_wrapper_and_not_the_fallback() {
+        if bubblewrap::check_availability().is_none() {
+            eprintln!("skipped: bwrap not installed");
+            return;
+        }
+        let tmp = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("tempdir");
+        let home = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let config = test_config(&home, &[]);
+        let proc_rule = |r: &landlock_mod::FsRule| r.path == Path::new("/proc");
+
+        let prepared = prepare(&config).expect("prepare");
+        let w = prepared.bwrap_wrapper.as_ref().expect("bwrap active");
+        assert!(w.fs_rules.iter().any(proc_rule), "helper gets /proc");
+        assert!(w.proc_limited_on_fallback);
+        assert!(
+            !prepared.policy.fs_rules.iter().any(proc_rule),
+            "the fallback policy must not grant /proc"
+        );
     }
 
     /// What a launch under Bubblewrap does with the plan: create each entry,

@@ -1560,6 +1560,9 @@ pub fn exec(
                         wrapper.socket_mask_count
                     ));
                 }
+                if wrapper.proc_limited_on_fallback {
+                    ui::warn(super::PROC_SELF_LIMIT_WARNING);
+                }
                 // fall through to the direct path
             }
         }
