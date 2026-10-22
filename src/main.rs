@@ -6299,6 +6299,14 @@ fn assemble_sandbox(
         &resolved.deny_env,
         resolved.keychain_substitute,
     );
+    if !resolved.quiet
+        && cplt::sandbox::SECRET_TOOL_TIMED_OUT.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        ui::warn(
+            "secret-tool did not answer within 1 s (keyring locked?): Copilot gets no keyring \
+             login. Unlock the keyring at login, or set gh_guard.inject_token = true --force",
+        );
+    }
 
     let mut extra_exec = resolved.allow_exec.clone();
     extra_exec.extend(pnpm_exec_grants(

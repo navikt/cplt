@@ -2215,6 +2215,10 @@ fn secret_tool_args(acct: &str) -> [&str; 5] {
     ["lookup", "service", "copilot-cli", "username", acct]
 }
 
+/// Set when the lookup hit its cap, so the launch can warn unless `--quiet`.
+pub static SECRET_TOOL_TIMED_OUT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// One `secret-tool lookup` from a trusted bin dir, no shell, 1 s cap. A
 /// locked keyring may wait on an unlock prompt; the cap kills it.
 fn secret_tool_lookup(acct: &str) -> Option<String> {
@@ -2229,10 +2233,7 @@ fn secret_tool_lookup(acct: &str) -> Option<String> {
     let start = std::time::Instant::now();
     let out = exec::bounded_stdout(cmd, cap);
     if out.is_none() && start.elapsed() >= cap {
-        crate::ui::warn(
-            "secret-tool did not answer within 1 s (keyring locked?): Copilot gets no keyring \
-             login. Unlock the keyring at login, or set gh_guard.inject_token = true --force",
-        );
+        SECRET_TOOL_TIMED_OUT.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     String::from_utf8(out?).ok()
 }
