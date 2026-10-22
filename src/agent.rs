@@ -578,13 +578,16 @@ fn opencode_script_grants(config_dir: &Path, home: &Path, writable: &[PathBuf]) 
     };
     let mut locs: Vec<PathBuf> = resolved(config_dir).collect();
     let mut paths = vec![];
+    let mut dirs = vec![];
     for f in FILES.iter().map(|f| config_dir.join(f)) {
         if let Some(t) = read_small_regular_file(&f) {
             locs.extend(resolved(&f));
-            paths.extend(opencode_script_paths(&t, config_dir, home));
+            paths.extend(opencode_script_paths(&t, home));
+            dirs.extend(opencode_v2_plugin_dirs(&t, config_dir));
         }
     }
     let mut out = script_grants(paths, config_dir, home, writable);
+    out.extend(plugin_dir_grants(dirs, home, writable));
     for g in &mut out {
         g.via.extend(locs.iter().cloned());
     }
@@ -622,11 +625,9 @@ pub fn env_config_dir_on_credentials(agent: Agent, home: &Path) -> Option<(&'sta
 
 /// Candidate paths in an OpenCode config: each `plugin[]` entry (string or
 /// `[spec, options]`) that is a `file://` URL, and the script token of each
-/// `mcp.<name>.command` array. Also the OpenCode 2.x schema (#717): each
-/// `plugins[]` entry (string or `{package}`) that is a `file://` URL, an
-/// absolute path or a `./`/`../` path relative to `base` (the config dir)
-/// naming a plugin directory, and `mcp.servers.<name>.command`.
-fn opencode_script_paths(text: &str, base: &Path, home: &Path) -> Vec<PathBuf> {
+/// `mcp.<name>.command` array, or OpenCode 2.x's `mcp.servers.<name>.command`
+/// (#717).
+fn opencode_script_paths(text: &str, home: &Path) -> Vec<PathBuf> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&strip_jsonc(text)) else {
         return vec![];
     };
@@ -645,25 +646,6 @@ fn opencode_script_paths(text: &str, base: &Path, home: &Path) -> Vec<PathBuf> {
                 Some(p)
             }
         });
-    // v2 skips npm names and `-name` removals, and refuses a file target:
-    // only a directory is loaded, through its entrypoint.
-    let v2_plugins = v
-        .get("plugins")
-        .and_then(|p| p.as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|p| p.as_str().or_else(|| p.get("package")?.as_str()))
-        .filter_map(|p| {
-            if let Some(u) = p.strip_prefix("file://") {
-                Some(PathBuf::from(percent_decode(u)))
-            } else if p.starts_with("./") || p.starts_with("../") {
-                Some(base.join(p))
-            } else {
-                Some(PathBuf::from(p)).filter(|p| p.is_absolute())
-            }
-        })
-        .filter(|p| p.is_dir())
-        .filter_map(|p| plugin_entrypoint(&p, true));
     let servers = |m: &serde_json::Value| -> Vec<serde_json::Value> {
         m.as_object()
             .into_iter()
@@ -685,10 +667,82 @@ fn opencode_script_paths(text: &str, base: &Path, home: &Path) -> Vec<PathBuf> {
                 .filter_map(|w| Some(w.as_str()?.to_string()))
                 .collect()
         });
-    plugins
-        .chain(v2_plugins)
-        .chain(script_paths(commands, home))
+    plugins.chain(script_paths(commands, home)).collect()
+}
+
+/// Local plugin directories in an OpenCode 2.x config (#717): each
+/// `plugins[]` entry (string or `{package}`) that is a `file://` URL, an
+/// absolute path, or `./`/`../` relative to `base` (the config dir). npm
+/// names and `-name` removals are skipped; v2 refuses a file target, so only
+/// directories count.
+fn opencode_v2_plugin_dirs(text: &str, base: &Path) -> Vec<PathBuf> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&strip_jsonc(text)) else {
+        return vec![];
+    };
+    v.get("plugins")
+        .and_then(|p| p.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p.as_str().or_else(|| p.get("package")?.as_str()))
+        .filter_map(|p| {
+            let p = if let Some(u) = p.strip_prefix("file://") {
+                PathBuf::from(percent_decode(u))
+            } else if p.starts_with("./") || p.starts_with("../") {
+                base.join(p)
+            } else {
+                PathBuf::from(p)
+            };
+            p.is_absolute().then_some(p)
+        })
+        .filter(|p| p.is_dir())
         .collect()
+}
+
+/// Read-only grants for OpenCode 2.x plugin directories. A v2 plugin is a
+/// directory imported in-process (its entrypoint plus siblings and
+/// `node_modules`), so the whole directory is readable; nothing is exec'd,
+/// so unlike [`script_grants`] there is no exec. Refused like a script: a
+/// directory in or containing a writable tree, a credential entry or the
+/// Keychains, reached through such a link, unnameable in SBPL, or without a
+/// `server`/`index` entrypoint inside it. The config dir is not refused: it is
+/// read-only, and a `./plugin` symlink out of it (dotfiles) is fine.
+fn plugin_dir_grants(dirs: Vec<PathBuf>, home: &Path, writable: &[PathBuf]) -> Vec<AgentDir> {
+    let own: Vec<PathBuf> = writable
+        .iter()
+        .flat_map(|p| [p.clone(), std::fs::canonicalize(p).unwrap_or_default()])
+        .filter(|p| !p.as_os_str().is_empty())
+        .collect();
+    let mut out: Vec<AgentDir> = vec![];
+    for dir in dirs {
+        let Ok(real) = std::fs::canonicalize(&dir) else {
+            continue;
+        };
+        if out.iter().any(|d| d.path == real) || plugin_entrypoint(&dir, true).is_none() {
+            continue;
+        }
+        let keychains = home.join("Library/Keychains");
+        let sensitive = |p: &Path| {
+            own.iter().any(|o| p.starts_with(o) || o.starts_with(p))
+                || p.starts_with(&keychains)
+                || keychains.starts_with(p)
+                || crate::sandbox::dir_overlaps_credentials(home, p)
+                || crate::sandbox::validate_sbpl_path(p).is_err()
+        };
+        let via = symlink_locations(&dir);
+        if sensitive(&real) || via.iter().any(|p| sensitive(p)) {
+            continue;
+        }
+        out.push(AgentDir {
+            path: real,
+            write: false,
+            map_exec: false,
+            process_exec: false,
+            write_files: vec![],
+            create_dirs: vec![],
+            via,
+        });
+    }
+    out
 }
 
 /// `%XX` decoding for the path of a `file://` URL, as `fileURLToPath` does.
@@ -715,7 +769,7 @@ fn percent_decode(s: &str) -> String {
 
 /// The file a directory plugin loads: `package.json` `main`, else
 /// `index.ts` or `index.js`. OpenCode 2.x (`v2`) ignores `main` and tries
-/// `server` before `index`. `None` when that file resolves outside `dir`
+/// `server` before `index`, with Bun's extensions. `None` when that file resolves outside `dir`
 /// (an absolute or `..` `main`, or a symlink out), so the grant cannot be
 /// pointed at an arbitrary file.
 fn plugin_entrypoint(dir: &Path, v2: bool) -> Option<PathBuf> {
@@ -725,10 +779,14 @@ fn plugin_entrypoint(dir: &Path, v2: bool) -> Option<PathBuf> {
         .flatten()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
         .and_then(|v| Some(v.get("main")?.as_str()?.to_string()));
-    // ponytail: .ts/.js only; Bun's full module resolution (.mjs, server/index) is not mirrored.
-    let v2_names: &[&str] = if v2 { &["server.ts", "server.js"] } else { &[] };
+    // v2 resolves `server`, then `index`, as Bun does: by extension, then as a directory.
+    const EXTS: [&str; 6] = ["ts", "tsx", "js", "jsx", "mjs", "cjs"];
+    let v2_names = ["server", "server/index", "index"]
+        .into_iter()
+        .filter(|_| v2)
+        .flat_map(|n| EXTS.map(|e| format!("{n}.{e}")));
     main.into_iter()
-        .chain(v2_names.iter().map(|n| (*n).to_string()))
+        .chain(v2_names)
         .chain(["index.ts".into(), "index.js".into()])
         .map(|m| dir.join(m))
         .find(|p| p.is_file())
@@ -3730,11 +3788,15 @@ mod tests {
         let home = std::fs::canonicalize(tmp.path()).unwrap();
         let cfg = home.join(".config/opencode");
         let ext = home.join("ext");
+        let data = home.join(".local/share/opencode");
         for d in [
             &cfg.join("rel"),
             &ext.join("srv"),
             &ext.join("idx"),
             &ext.join("pkg"),
+            &home.join("dots/lp/server"),
+            &data.join("w"),
+            &home.join(".ssh"),
         ] {
             std::fs::create_dir_all(d).unwrap();
         }
@@ -3742,19 +3804,23 @@ mod tests {
             std::fs::write(&p, "x").unwrap();
             p
         };
-        let srv = f(ext.join("srv/server.ts"));
-        f(ext.join("srv/index.ts"));
-        let idx = f(ext.join("idx/index.js"));
-        let rel = f(cfg.join("rel/index.ts"));
-        // v2 ignores `main` and refuses a file target.
+        f(ext.join("srv/server.tsx"));
+        f(ext.join("idx/index.js"));
+        f(cfg.join("rel/index.ts"));
+        // A dotfiles symlink out of the read-only config dir, `server/index.*`.
+        f(home.join("dots/lp/server/index.mjs"));
+        std::os::unix::fs::symlink(home.join("dots/lp"), cfg.join("link")).unwrap();
+        // v2 ignores `main` (no entrypoint) and refuses a file target.
         std::fs::write(ext.join("pkg/package.json"), r#"{"main":"m.js"}"#).unwrap();
         f(ext.join("pkg/m.js"));
         let file = f(ext.join("file.js"));
+        f(data.join("w/index.js"));
+        f(home.join("index.js"));
         let mcp = f(ext.join("mcp.sh"));
         std::fs::write(
             cfg.join("opencode.json"),
             format!(
-                r#"{{"plugins": ["npm-pkg", "-gone", "file://{srv}", {{"package": "{idx}", "options": {{}}}}, "./rel", "{pkg}", "{file}"],
+                r#"{{"plugins": ["npm-pkg", "-gone", "file://{srv}", {{"package": "{idx}", "options": {{}}}}, "./rel", "./link", "{pkg}", "{file}", "{w}", "file://{home}", "file://rel"],
   "mcp": {{"timeout": {{"startup": 1}}, "servers": {{
     "a": {{"type": "local", "command": ["{mcp}", "--x"]}},
     "b": {{"type": "remote", "url": "https://x"}}}}}}}}"#,
@@ -3762,20 +3828,29 @@ mod tests {
                 idx = ext.join("idx").display(),
                 pkg = ext.join("pkg").display(),
                 file = file.display(),
+                w = data.join("w").display(),
+                home = home.display(),
                 mcp = mcp.display(),
             ),
         )
         .unwrap();
-        let mut paths: Vec<_> = opencode_script_grants(&cfg, &home, &[])
-            .into_iter()
-            .map(|d| d.path)
-            .collect();
+        let got = opencode_script_grants(&cfg, &home, &[data]);
+        let mut paths: Vec<_> = got.iter().map(|d| d.path.clone()).collect();
         paths.sort();
-        let mut want = vec![srv, idx, mcp];
+        let mut want = vec![
+            ext.join("srv"),
+            ext.join("idx"),
+            cfg.join("rel"),
+            home.join("dots/lp"),
+            mcp.clone(),
+        ];
         want.sort();
-        // `./rel` resolves into the read-only config dir, granted already.
-        assert!(rel.starts_with(&cfg));
-        assert_eq!(paths, want);
+        assert_eq!(paths, want, "writable, $HOME and file targets skipped");
+        // Plugin dirs are read-only and not exec; the MCP script is exec.
+        assert!(
+            got.iter()
+                .all(|d| !d.write && d.process_exec == (d.path == mcp))
+        );
     }
 
     #[test]
