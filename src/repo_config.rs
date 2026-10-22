@@ -360,18 +360,9 @@ fn canonical(path: PathBuf) -> PathBuf {
 /// The git toplevel for `project_dir` — the directory `HEAD:.cplt.toml`
 /// resolves against. `None` when git cannot answer (not a repo, git missing).
 fn git_toplevel(project_dir: &Path) -> Option<PathBuf> {
-    let output = crate::git::command(project_dir, &["rev-parse", "--show-toplevel"])?
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let root = String::from_utf8(output.stdout).ok()?;
-    let root = root.trim();
-    if root.is_empty() {
-        return None;
-    }
-    Some(PathBuf::from(root))
+    crate::git::project_root(project_dir)
+        .ok()
+        .filter(|root| !root.as_os_str().is_empty())
 }
 
 /// Whether `.cplt.toml` is committed at HEAD, which is the copy
