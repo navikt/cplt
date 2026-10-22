@@ -594,6 +594,59 @@ fn opencode_script_grants(config_dir: &Path, home: &Path, writable: &[PathBuf]) 
     out
 }
 
+/// Read-only grants for the OpenCode 2.x config sources outside its config
+/// dir (#800): the root-owned system dir (`/Library/Application
+/// Support/opencode`, `/etc/opencode`), and in each `.opencode` dir from `cwd`
+/// up to `/` (e.g. `~/.opencode`) its `plugin`, `plugins` and
+/// `opencode.json(c)`, plus the plugin and MCP grants of their config. The
+/// rest of an ancestor `.opencode` stays denied (#729). An entry that is or
+/// reaches into a credential tree is skipped. Each grant carries `via`, so
+/// [`drop_script_grants_under`] drops any in a writable tree.
+fn opencode_extra_config_grants(
+    system: &Path,
+    cwd: &Path,
+    home: &Path,
+    writable: &[PathBuf],
+) -> Vec<AgentDir> {
+    let mut out = vec![];
+    let mut paths = vec![system.to_path_buf()];
+    for dir in
+        std::iter::once(system.to_path_buf()).chain(cwd.ancestors().map(|a| a.join(".opencode")))
+    {
+        if dir != system {
+            paths.extend(
+                ["plugin", "plugins", "opencode.json", "opencode.jsonc"].map(|n| dir.join(n)),
+            );
+        }
+        if dir.is_dir() {
+            out.extend(opencode_script_grants(&dir, home, writable));
+        }
+    }
+    let unsafe_ = |p: &Path| {
+        crate::sandbox::dir_overlaps_credentials(home, p)
+            || crate::sandbox::validate_sbpl_path(p).is_err()
+    };
+    for path in paths {
+        let Ok(real) = std::fs::canonicalize(&path) else {
+            continue;
+        };
+        let via = symlink_locations(&path);
+        if unsafe_(&real) || via.iter().any(|p| unsafe_(p)) {
+            continue;
+        }
+        out.push(AgentDir {
+            path: real,
+            write: false,
+            map_exec: false,
+            process_exec: false,
+            write_files: vec![],
+            create_dirs: vec![],
+            via,
+        });
+    }
+    out
+}
+
 /// An absolute `OPENCODE_CONFIG_DIR`, the config dir OpenCode v2 uses in
 /// place of `$XDG_CONFIG_HOME/opencode`.
 fn opencode_custom_config_dir() -> Option<PathBuf> {
@@ -2108,6 +2161,20 @@ impl Agent {
                             via: vec![],
                         },
                     );
+                }
+
+                let system = if cfg!(target_os = "macos") {
+                    "/Library/Application Support/opencode"
+                } else {
+                    "/etc/opencode"
+                };
+                if let Ok(cwd) = std::env::current_dir() {
+                    scripts.extend(opencode_extra_config_grants(
+                        Path::new(system),
+                        &cwd,
+                        home,
+                        &writable,
+                    ));
                 }
 
                 let mut dirs = vec![
@@ -3863,6 +3930,52 @@ mod tests {
         let mut dirs = got;
         drop_script_grants_under(&mut dirs, std::slice::from_ref(&ext));
         assert!(dirs.iter().all(|d| !d.path.starts_with(&ext)), "{dirs:?}");
+    }
+
+    #[test]
+    fn opencode_extra_config_grants_system_and_parent_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        let sys = home.join("sys");
+        let proj = home.join("a/proj");
+        for d in [
+            sys.clone(),
+            home.join(".opencode/plugins"),
+            home.join("a/.opencode/plugin"),
+            proj.join(".opencode/plugin"),
+            proj.join("sub"),
+            home.join(".ssh"),
+        ] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(home.join(".opencode/opencode.json"), "{}").unwrap();
+        std::fs::write(home.join(".opencode/secret"), "x").unwrap();
+        // A `plugins` link into a credential dir is refused.
+        std::os::unix::fs::symlink(home.join(".ssh"), home.join("a/.opencode/plugins")).unwrap();
+        let got = opencode_extra_config_grants(&sys, &proj.join("sub"), &home, &[]);
+        let paths: Vec<_> = got.iter().map(|d| d.path.clone()).collect();
+        assert_eq!(
+            paths,
+            [
+                sys.clone(),
+                proj.join(".opencode/plugin"),
+                home.join("a/.opencode/plugin"),
+                home.join(".opencode/plugins"),
+                home.join(".opencode/opencode.json"),
+            ]
+        );
+        assert!(
+            got.iter()
+                .all(|d| !d.write && !d.process_exec && !d.via.is_empty())
+        );
+        // The project's own `.opencode` is in a writable tree and dropped.
+        let mut dirs = got;
+        drop_script_grants_under(&mut dirs, std::slice::from_ref(&proj));
+        assert!(dirs.iter().all(|d| !d.path.starts_with(&proj)), "{dirs:?}");
+        assert_eq!(dirs.len(), 4);
+        // A missing system dir grants nothing.
+        let got = opencode_extra_config_grants(&home.join("none"), &home, &home, &[]);
+        assert_eq!(got.len(), 2);
     }
 
     #[test]
