@@ -4970,7 +4970,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         cplt::opencode_v2::save_model(own, &home_dir, before.as_deref());
     }
     if let Some(stores) = opencode_stores {
-        stores.report();
+        stores.report(settled);
     }
     if resolved.git_guard.enabled
         && !resolved.quiet

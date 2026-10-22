@@ -24,7 +24,7 @@ use crate::{proxy, sandbox, ui};
 use std::collections::BTreeSet;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -1599,8 +1599,8 @@ impl NestedGit {
 }
 
 /// OpenCode's snapshot git directories, `<data>/opencode/snapshot/<id>` (v1)
-/// and `<data>/opencode/snapshot/<id>/<hash>` (v2), recorded before the
-/// session and checked after it.
+/// and `<data>/opencode/snapshot/<id>/<hash>` (v2), checked before and after
+/// an OpenCode session.
 ///
 /// # Why
 ///
@@ -1608,86 +1608,382 @@ impl NestedGit {
 /// outside every root [`NestedGit`] walks. OpenCode runs git in them on its
 /// next run, and when that run is outside cplt, a hook or a config key naming
 /// a program runs that program on the host. OpenCode writes the config once
-/// when it creates a store and never writes a hook, so a store that is new or
-/// changed and carries either is reported, the same way as a planted `.git`.
+/// when it creates a store and never writes a hook.
+///
+/// # What is done
+///
+/// Both levels are always scanned with `lstat`. A store with a hook that is
+/// neither a `.sample` nor a copy from the user's git template, a
+/// program-running config key (as git itself parses the file), a
+/// `commondir`, or a config that is not a plain file is moved aside with
+/// [`quarantine_store`]; so is a symlink or a non-directory where a store
+/// would be. At capture this covers what an earlier, unchecked session left;
+/// after the session it covers anything new or changed. A store that
+/// disappeared during the session is reported.
 ///
 /// Read with [`crate::untrusted`]: a symlinked or non-regular config is
 /// reported, not followed.
 pub struct SnapshotStores {
     root: PathBuf,
+    /// The user's git template dirs: `git init` copies their hooks into every
+    /// new store, so a hook identical to one of them is not a plant.
+    templates: Vec<PathBuf>,
     before: std::collections::BTreeMap<PathBuf, String>,
+}
+
+/// One entry below the snapshot root: a store, or something where a store
+/// would be.
+struct StoreEntry {
+    path: PathBuf,
+    state: String,
+    findings: Vec<String>,
 }
 
 impl SnapshotStores {
     pub fn capture(root: PathBuf) -> Self {
-        let before = snapshot_stores(&root)
-            .into_iter()
-            .map(|s| {
-                let state = store_state(&s).0;
-                (s, state)
-            })
+        Self::capture_with(root, template_dirs())
+    }
+
+    fn capture_with(root: PathBuf, templates: Vec<PathBuf>) -> Self {
+        let mut s = Self {
+            root,
+            templates,
+            before: std::collections::BTreeMap::new(),
+        };
+        // Left by a session that was killed before its check, or from before
+        // this check existed: moved aside before the agent starts.
+        let flagged = s.scan().into_iter().filter(|e| !e.findings.is_empty());
+        let moved = s.quarantine(flagged.collect());
+        print_quarantined(
+            &moved,
+            "An OpenCode snapshot store already held a git hook, a config key that \
+             runs a program, or a link before this session started.",
+        );
+        s.before = s.scan().into_iter().map(|e| (e.path, e.state)).collect();
+        s
+    }
+
+    /// Every store, and every odd entry where a store would be. Both levels,
+    /// always: a `HEAD` planted in `<id>` must not hide `<id>/<hash>`.
+    fn scan(&self) -> Vec<StoreEntry> {
+        let odd = |path: PathBuf, t: std::fs::FileType| StoreEntry {
+            path,
+            state: "odd".into(),
+            findings: vec![if t.is_symlink() {
+                "a symlink".into()
+            } else {
+                "not a directory".into()
+            }],
+        };
+        let mut out = Vec::new();
+        for (d1, t1) in lstat_entries(&self.root) {
+            if !t1.is_dir() {
+                out.push(odd(d1, t1));
+                continue;
+            }
+            let v1_store = is_store(&d1);
+            if v1_store {
+                out.push(self.store_entry(d1.clone()));
+            }
+            for (d2, t2) in lstat_entries(&d1) {
+                if t2.is_dir() {
+                    if is_store(&d2) {
+                        out.push(self.store_entry(d2));
+                    }
+                } else if t2.is_symlink() || !v1_store {
+                    // A v1 store's own files (`HEAD`, `config`) are expected.
+                    out.push(odd(d2, t2));
+                }
+            }
+        }
+        out
+    }
+
+    /// New or changed entries with findings, and stores gone since capture.
+    fn flagged(&self) -> (Vec<StoreEntry>, Vec<PathBuf>) {
+        let now = self.scan();
+        let gone = self
+            .before
+            .keys()
+            .filter(|p| !now.iter().any(|e| &e.path == *p))
+            // OpenCode builds a store as `<hash>.init-*` and renames it.
+            .filter(|p| !p.to_string_lossy().contains(".init-"))
+            .cloned()
             .collect();
-        Self { root, before }
-    }
-
-    /// Every store that is new or changed and holds a hook or a
-    /// program-running config key, with what was found in it.
-    fn flagged(&self) -> Vec<(PathBuf, String)> {
-        snapshot_stores(&self.root)
+        let flagged = now
             .into_iter()
-            .filter_map(|store| {
-                let (state, findings) = store_state(&store);
-                (!findings.is_empty() && self.before.get(&store) != Some(&state))
-                    .then(|| (store, findings.join(", ")))
-            })
-            .collect()
+            .filter(|e| !e.findings.is_empty() && self.before.get(&e.path) != Some(&e.state))
+            .collect();
+        (flagged, gone)
     }
 
-    /// Move each flagged store aside, so the next OpenCode run, in or out of
-    /// cplt, creates a clean one instead of running git in it. OpenCode opens
-    /// a store by its exact name (`<id>` or `<id>/<hash>`) and never lists
-    /// the directory, so it does not pick up the quarantined name.
-    fn quarantine(&self) -> Vec<(PathBuf, io::Result<PathBuf>, String)> {
+    /// Move each entry aside, so the next OpenCode run, in or out of cplt,
+    /// creates a clean store instead of running git in it. OpenCode opens a
+    /// store by its exact name (`<id>` or `<id>/<hash>`) and never lists the
+    /// directory, so it does not pick up the quarantined name.
+    fn quarantine(&self, entries: Vec<StoreEntry>) -> Vec<(StoreEntry, io::Result<PathBuf>)> {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        self.flagged()
+        entries
             .into_iter()
-            .map(|(store, found)| {
-                let moved = quarantine_store(&self.root, &store, ts);
-                (store, moved, found)
+            .map(|e| {
+                let moved = quarantine_store(&self.root, &e.path, ts);
+                (e, moved)
             })
             .collect()
     }
 
-    pub fn report(&self) {
-        let results = self.quarantine();
-        if results.is_empty() {
-            return;
-        }
-        ui::error(
+    /// `settled`: the session's processes had all exited before this check.
+    pub fn report(&self, settled: bool) {
+        let (flagged, gone) = self.flagged();
+        print_quarantined(
+            &self.quarantine(flagged),
             "An OpenCode snapshot store was created or changed during this session and \
-             holds a git hook or a config key that runs a program. OpenCode runs git in \
-             these stores, and outside cplt that program would run on the host.",
+             holds a git hook, a config key that runs a program, or a link. OpenCode \
+             runs git in these stores, and outside cplt that program would run on the \
+             host.",
         );
-        for (store, moved, found) in &results {
-            match moved {
-                Ok(to) => ui::error(&format!(
-                    "  {}: {} (moved to {}; OpenCode creates a clean store on its next \
-                     run, and only that project's undo history is lost)",
-                    esc_path(store),
-                    escape_path(found),
-                    esc_path(to)
-                )),
-                Err(e) => ui::error(&format!(
-                    "  {}: {} (could not move it aside: {e}. Do not run OpenCode outside \
-                     cplt until you have deleted this directory; OpenCode recreates it)",
-                    esc_path(store),
-                    escape_path(found)
-                )),
+        if !gone.is_empty() {
+            ui::error(
+                "These OpenCode snapshot stores were moved or removed during this session. \
+                 If one comes back, check it before running OpenCode outside cplt:",
+            );
+            for p in &gone {
+                ui::error(&format!("  {}", esc_path(p)));
+            }
+        }
+        if !settled {
+            ui::warn(
+                "The session left processes running, so an OpenCode snapshot store they \
+                 change after this check is not reported.",
+            );
+        }
+    }
+
+    fn store_entry(&self, path: PathBuf) -> StoreEntry {
+        let (state, findings) = store_state(&path, &self.templates);
+        StoreEntry {
+            path,
+            state,
+            findings,
+        }
+    }
+}
+
+fn print_quarantined(results: &[(StoreEntry, io::Result<PathBuf>)], headline: &str) {
+    if results.is_empty() {
+        return;
+    }
+    ui::error(headline);
+    for (e, moved) in results {
+        let found = escape_path(&e.findings.join(", "));
+        match moved {
+            Ok(to) => ui::error(&format!(
+                "  {}: {found} (moved to {}; OpenCode creates a clean store on its next \
+                 run, and only that project's undo history is lost)",
+                esc_path(&e.path),
+                esc_path(to)
+            )),
+            Err(err) => ui::error(&format!(
+                "  {}: {found} (could not move it aside: {err}. Do not run OpenCode \
+                 outside cplt until you have deleted it; OpenCode recreates it)",
+                esc_path(&e.path)
+            )),
+        }
+    }
+}
+
+/// `dir`'s entries with their own type (`lstat`, links not followed), sorted.
+/// Quarantined names are skipped: OpenCode never opens them.
+fn lstat_entries(dir: &Path) -> Vec<(PathBuf, std::fs::FileType)> {
+    let mut v: Vec<_> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| {
+            !e.file_name()
+                .to_string_lossy()
+                .contains(".cplt-quarantine-")
+        })
+        .filter_map(|e| Some((e.path(), e.file_type().ok()?)))
+        .collect();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
+}
+
+fn is_store(d: &Path) -> bool {
+    std::fs::symlink_metadata(d.join("HEAD")).is_ok()
+}
+
+/// The user's git template dirs, where `git init` takes a new store's hooks
+/// from: `GIT_TEMPLATE_DIR`, `init.templateDir` and git's built-in default.
+/// Only read: `git config --get` and `git --exec-path` run no hooks.
+#[allow(clippy::disallowed_methods)] // a resolved `trusted_git()` path, not a bare name
+fn template_dirs() -> Vec<PathBuf> {
+    let Some(git) = crate::git::trusted_git() else {
+        return Vec::new();
+    };
+    let ask = |args: &[&str]| -> Option<PathBuf> {
+        let out = Command::new(git)
+            .args(args)
+            .current_dir("/")
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        let s = String::from_utf8(out.stdout).ok()?;
+        let s = s.trim();
+        (out.status.success() && !s.is_empty()).then(|| PathBuf::from(s))
+    };
+    let mut dirs: Vec<PathBuf> = std::env::var_os("GIT_TEMPLATE_DIR")
+        .map(PathBuf::from)
+        .into_iter()
+        .collect();
+    dirs.extend(ask(&["config", "--get", "--path", "init.templateDir"]));
+    // `<prefix>/libexec/git-core` -> `<prefix>/share/git-core/templates`.
+    dirs.extend(
+        ask(&["--exec-path"])
+            .and_then(|p| Some(p.parent()?.parent()?.join("share/git-core/templates"))),
+    );
+    dirs
+}
+
+/// A file's bytes, up to 1 MiB, without following a link at the last step.
+fn read_bytes_untrusted(path: &Path) -> Option<Vec<u8>> {
+    let f = crate::untrusted::open_untrusted(path).ok()??;
+    let mut buf = Vec::new();
+    f.take(1 << 20).read_to_end(&mut buf).ok()?;
+    Some(buf)
+}
+
+/// A store's config files and hooks, as one comparable string, and what in
+/// them could run a program.
+fn store_state(store: &Path, templates: &[PathBuf]) -> (String, Vec<String>) {
+    let mut state = String::new();
+    let mut findings = Vec::new();
+    for name in [
+        "config",
+        "opencode.gitconfig",
+        "config.worktree",
+        "commondir",
+    ] {
+        match crate::untrusted::read_untrusted(&store.join(name), 1 << 20) {
+            Ok(Some(text)) => {
+                if name == "commondir" {
+                    findings.push("commondir".to_string());
+                } else {
+                    match risky_config_keys(&text) {
+                        Some(keys) => {
+                            findings.extend(keys.into_iter().map(|k| format!("{name}: {k}")));
+                        }
+                        None => findings.push(format!("{name}: git could not read it")),
+                    }
+                }
+                state += &[name, "\0", &text, "\0"].concat();
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            _ => {
+                findings.push(format!("{name}: not a plain readable file"));
+                state += &[name, "\0?\0"].concat();
             }
         }
     }
+    let hooks = store.join("hooks");
+    if std::fs::symlink_metadata(&hooks).is_ok_and(|m| !m.is_dir()) {
+        findings.push("hooks: not a directory".to_string());
+    }
+    let mut names: Vec<std::ffi::OsString> = std::fs::read_dir(&hooks)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    names.sort();
+    for n in &names {
+        let body = read_bytes_untrusted(&hooks.join(n));
+        let shown = n.to_string_lossy();
+        // Git runs a hook by its exact name; the `.sample`s never run, and a
+        // byte-identical copy of a template hook is what `git init` put there.
+        let from_template = body.as_ref().is_some_and(|b| {
+            templates
+                .iter()
+                .any(|t| std::fs::read(t.join("hooks").join(n)).is_ok_and(|tb| &tb == b))
+        });
+        if !shown.ends_with(".sample") && !from_template {
+            findings.push(format!("hook {shown}"));
+        }
+        state += &["hook\0", &shown, "\0", &format!("{body:?}"), "\0"].concat();
+    }
+    (state, findings)
+}
+
+/// Config keys that make git run a program or read config from elsewhere,
+/// from git's own parse of `text` (no includes, no other config, no hooks).
+/// `None` when git cannot be run or cannot parse it.
+#[allow(clippy::disallowed_methods)] // a resolved `trusted_git()` path, not a bare name
+fn risky_config_keys(text: &str) -> Option<Vec<String>> {
+    let mut child = Command::new(crate::git::trusted_git()?)
+        .args(["config", "--file", "-", "--no-includes", "--list", "-z"])
+        .env_clear()
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .current_dir("/")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdin = child.stdin.take()?;
+    let input = text.to_owned();
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(input.as_bytes());
+    });
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    let status = wait_timeout(&mut child, GIT_TIMEOUT);
+    let _ = writer.join();
+    let out = reader.join().ok()?;
+    if !status?.success() {
+        return None;
+    }
+    let mut found = Vec::new();
+    for entry in out.split(|&b| b == 0).filter(|e| !e.is_empty()) {
+        let entry = String::from_utf8_lossy(entry);
+        let (key, value) = entry.split_once('\n').unwrap_or((&entry, ""));
+        let last = key.rsplit('.').next().unwrap_or(key);
+        let risky = match last {
+            "fsmonitor" => !matches!(value, "false" | "no" | "off" | "0"),
+            // OpenCode's own include of its settings file, exactly.
+            "path" if key == "include.path" => value != "opencode.gitconfig",
+            _ => {
+                key.starts_with("includeif.")
+                    || key.starts_with("pager.")
+                    || last.ends_with("command")
+                    || [
+                        "hookspath",
+                        "pager",
+                        "editor",
+                        "askpass",
+                        "textconv",
+                        "external",
+                        "helper",
+                        "gitproxy",
+                        "clean",
+                        "smudge",
+                        "process",
+                    ]
+                    .contains(&last)
+            }
+        };
+        if risky {
+            found.push(key.to_string());
+        }
+    }
+    Some(found)
 }
 
 /// Rename `store` to `<store>.cplt-quarantine-<ts>` in its own parent,
@@ -1732,130 +2028,6 @@ fn quarantine_store(root: &Path, store: &Path, ts: u64) -> io::Result<PathBuf> {
         return Err(io::Error::last_os_error());
     }
     Ok(store.with_file_name(new_name))
-}
-
-/// Every git directory (a directory holding `HEAD`) one or two levels below
-/// `root`. Symlinked entries are not followed.
-fn snapshot_stores(root: &Path) -> Vec<PathBuf> {
-    let subdirs = |d: &Path| -> Vec<PathBuf> {
-        let mut v: Vec<PathBuf> = std::fs::read_dir(d)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-            .map(|e| e.path())
-            .collect();
-        v.sort();
-        v
-    };
-    let is_store = |d: &Path| std::fs::symlink_metadata(d.join("HEAD")).is_ok();
-    let mut stores = Vec::new();
-    for d in subdirs(root) {
-        if is_store(&d) {
-            stores.push(d);
-        } else {
-            stores.extend(subdirs(&d).into_iter().filter(|s| is_store(s)));
-        }
-    }
-    stores
-}
-
-/// A store's config files and hook names, as one comparable string, and what
-/// in them could run a program.
-fn store_state(store: &Path) -> (String, Vec<String>) {
-    let mut state = String::new();
-    let mut findings = Vec::new();
-    for name in [
-        "config",
-        "opencode.gitconfig",
-        "config.worktree",
-        "commondir",
-    ] {
-        match crate::untrusted::read_untrusted(&store.join(name), 1 << 20) {
-            Ok(Some(text)) => {
-                if name == "commondir" {
-                    findings.push("commondir".to_string());
-                }
-                for key in risky_config_keys(&text) {
-                    findings.push(format!("{name}: {key}"));
-                }
-                state += &[name, "\0", &text, "\0"].concat();
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            _ => {
-                findings.push(format!("{name}: not a plain readable file"));
-                state += &[name, "\0?\0"].concat();
-            }
-        }
-    }
-    let hooks = store.join("hooks");
-    if std::fs::symlink_metadata(&hooks).is_ok_and(|m| !m.is_dir()) {
-        findings.push("hooks: not a directory".to_string());
-    }
-    let mut names: Vec<String> = std::fs::read_dir(&hooks)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
-    names.sort();
-    for n in &names {
-        // Git runs a hook by its exact name; the `.sample`s `git init` copies
-        // never run.
-        if !n.ends_with(".sample") {
-            findings.push(format!("hook {n}"));
-        }
-        state += &["hook\0", n, "\0"].concat();
-    }
-    (state, findings)
-}
-
-/// Config keys that make git run a program, or read config from elsewhere.
-///
-/// ponytail: a line-based key match, not a git config parser. A continuation
-/// line or a quoted `=` can hide a key from it; the change itself still shows
-/// in the store's state, so upgrade to `git config --list --file` (run with
-/// no hooks and no includes) if that matters.
-fn risky_config_keys(text: &str) -> Vec<String> {
-    const KEYS: &[&str] = &[
-        "hookspath",
-        "fsmonitor",
-        "command",
-        "pager",
-        "editor",
-        "askpass",
-        "textconv",
-        "external",
-        "helper",
-        "gitproxy",
-        "clean",
-        "smudge",
-        "process",
-    ];
-    let mut found = Vec::new();
-    for line in text.lines() {
-        let line = line.trim().to_ascii_lowercase();
-        if line.starts_with('[') {
-            if line.starts_with("[includeif") {
-                found.push(line);
-            }
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let (key, value) = (key.trim(), value.trim().trim_matches('"'));
-        let benign = match key {
-            "fsmonitor" => matches!(value, "false" | "no" | "off" | "0"),
-            // OpenCode's own include of its settings file.
-            "path" => value == "opencode.gitconfig",
-            _ => false,
-        };
-        if !benign && (key == "path" || KEYS.iter().any(|k| key.contains(k))) {
-            found.push(key.to_string());
-        }
-    }
-    found
 }
 
 /// Agent-chosen names: escaped like every other audit path.
@@ -3639,11 +3811,16 @@ mod tests {
         f.write_all(text.as_bytes()).unwrap();
     }
 
+    fn cap(root: &Path) -> SnapshotStores {
+        SnapshotStores::capture_with(root.to_path_buf(), vec![])
+    }
+
     fn flagged_lines(stores: &SnapshotStores) -> Vec<String> {
         stores
             .flagged()
+            .0
             .into_iter()
-            .map(|(p, f)| format!("{}: {f}", p.display()))
+            .map(|e| format!("{}: {}", e.path.display(), e.findings.join(", ")))
             .collect()
     }
 
@@ -3653,9 +3830,9 @@ mod tests {
         let (bad, good) = (root.path().join("p/bad"), root.path().join("p/good"));
         opencode_store(&bad);
         opencode_store(&good);
-        let stores = SnapshotStores::capture(root.path().to_path_buf());
+        let stores = cap(root.path());
         append(&bad.join("config"), "[core]\n\thooksPath = /tmp/x\n");
-        let results = stores.quarantine();
+        let results = stores.quarantine(stores.flagged().0);
         assert_eq!(results.len(), 1);
         let to = results[0].1.as_ref().expect("renamed");
         assert!(!bad.exists() && to.join("HEAD").exists(), "{to:?}");
@@ -3666,6 +3843,19 @@ mod tests {
                 .starts_with("bad.cplt-quarantine-")
         );
         assert!(good.join("HEAD").exists());
+        // The quarantined store is never scanned again.
+        assert!(flagged_lines(&cap(root.path())).is_empty());
+    }
+
+    #[test]
+    fn a_plant_present_at_capture_is_quarantined_before_the_session() {
+        let root = tempfile::tempdir().unwrap();
+        let s = root.path().join("p/s");
+        opencode_store(&s);
+        std::fs::write(s.join("hooks/post-index-change"), "#!/bin/sh\n").unwrap();
+        let stores = cap(root.path());
+        assert!(!s.exists());
+        assert!(flagged_lines(&stores).is_empty());
     }
 
     #[test]
@@ -3679,23 +3869,88 @@ mod tests {
         let err = quarantine_store(root.path(), &root.path().join("p/s"), 1);
         assert!(err.is_err(), "{err:?}");
         assert!(victim.join("HEAD").exists());
-        // And a symlinked store itself is renamed as a link, never followed.
-        std::fs::create_dir(root.path().join("q")).unwrap();
-        std::os::unix::fs::symlink(&victim, root.path().join("q/s")).unwrap();
-        let to = quarantine_store(root.path(), &root.path().join("q/s"), 1).unwrap();
-        assert!(
-            std::fs::symlink_metadata(&to)
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
+    }
+
+    #[test]
+    fn symlinks_at_either_level_are_flagged_and_moved_as_links() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let victim = elsewhere.path().join("s");
+        opencode_store(&victim);
+        std::fs::write(victim.join("hooks/post-index-change"), "#!/bin/sh\n").unwrap();
+        std::fs::create_dir(root.path().join("p")).unwrap();
+        let stores = cap(root.path());
+        std::os::unix::fs::symlink(&victim, root.path().join("p/s")).unwrap();
+        std::os::unix::fs::symlink(&victim, root.path().join("v1")).unwrap();
+        let lines = flagged_lines(&stores);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines.iter().all(|l| l.ends_with("a symlink")), "{lines:?}");
+        for (e, moved) in stores.quarantine(stores.flagged().0) {
+            let to = moved.unwrap();
+            assert!(
+                std::fs::symlink_metadata(&to)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert!(!e.path.exists());
+        }
         assert!(victim.join("HEAD").exists());
+    }
+
+    #[test]
+    fn a_head_in_the_project_dir_does_not_hide_its_stores() {
+        let root = tempfile::tempdir().unwrap();
+        let s = root.path().join("p/s");
+        opencode_store(&s);
+        let stores = cap(root.path());
+        std::fs::write(root.path().join("p/HEAD"), "ref: refs/heads/main\n").unwrap();
+        append(&s.join("config"), "[core]\n\thooksPath = /tmp/x\n");
+        let lines = flagged_lines(&stores);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("p/s: config: core.hookspath")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_store_removed_during_the_session_is_reported() {
+        let root = tempfile::tempdir().unwrap();
+        let s = root.path().join("p/s");
+        opencode_store(&s);
+        let stores = cap(root.path());
+        std::fs::rename(&s, root.path().join("elsewhere")).unwrap();
+        assert_eq!(stores.flagged().1, vec![s]);
+    }
+
+    #[test]
+    fn a_hook_copied_from_the_users_template_is_not_flagged() {
+        let root = tempfile::tempdir().unwrap();
+        let tpl = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tpl.path().join("hooks")).unwrap();
+        std::fs::write(tpl.path().join("hooks/pre-commit"), "#!/bin/sh\nsecrets\n").unwrap();
+        let stores =
+            SnapshotStores::capture_with(root.path().to_path_buf(), vec![tpl.path().to_path_buf()]);
+        let (a, b) = (root.path().join("p/a"), root.path().join("p/b"));
+        opencode_store(&a);
+        opencode_store(&b);
+        std::fs::copy(
+            tpl.path().join("hooks/pre-commit"),
+            a.join("hooks/pre-commit"),
+        )
+        .unwrap();
+        std::fs::write(b.join("hooks/pre-commit"), "#!/bin/sh\nevil\n").unwrap();
+        let lines = flagged_lines(&stores);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("p/b: hook pre-commit"), "{lines:?}");
     }
 
     #[test]
     fn snapshot_stores_created_cleanly_are_not_reported() {
         let root = tempfile::tempdir().unwrap();
-        let stores = SnapshotStores::capture(root.path().to_path_buf());
+        let stores = cap(root.path());
         opencode_store(&root.path().join("proj/abc"));
         opencode_store(&root.path().join("v1proj"));
         assert_eq!(flagged_lines(&stores), Vec::<String>::new());
@@ -3712,23 +3967,24 @@ mod tests {
         opencode_store(&a);
         opencode_store(&b);
         opencode_store(&c);
-        let stores = SnapshotStores::capture(root.path().to_path_buf());
-        append(&a.join("config"), "[core]\n\thooksPath = /tmp/x\n");
+        let stores = cap(root.path());
+        // Section header and key on one line, which git accepts.
+        append(&a.join("config"), "[core] hooksPath = /tmp/x\n");
         std::fs::write(b.join("hooks/post-index-change"), "#!/bin/sh\n").unwrap();
         append(
             &c.join("opencode.gitconfig"),
-            "[core]\n\tfsmonitor = /tmp/x\n",
+            "[include] path = /tmp/evil\n",
         );
         let new = root.path().join("p/new");
         opencode_store(&new);
         append(&new.join("config"), "[filter \"x\"]\n\tclean = /tmp/x\n");
         let lines = flagged_lines(&stores);
         assert_eq!(lines.len(), 4, "{lines:?}");
-        assert!(lines[0].contains("hookspath"), "{lines:?}");
+        assert!(lines[0].contains("core.hookspath"), "{lines:?}");
         assert!(lines[1].contains("hook post-index-change"), "{lines:?}");
-        assert!(lines[2].contains("clean"), "{lines:?}");
+        assert!(lines[2].contains("filter.x.clean"), "{lines:?}");
         assert!(
-            lines[3].contains("opencode.gitconfig: fsmonitor"),
+            lines[3].contains("opencode.gitconfig: include.path"),
             "{lines:?}"
         );
     }
@@ -3736,7 +3992,7 @@ mod tests {
     #[test]
     fn snapshot_store_symlinked_config_is_reported_not_followed() {
         let root = tempfile::tempdir().unwrap();
-        let stores = SnapshotStores::capture(root.path().to_path_buf());
+        let stores = cap(root.path());
         let s = root.path().join("p/s");
         opencode_store(&s);
         std::fs::remove_file(s.join("opencode.gitconfig")).unwrap();
@@ -3749,11 +4005,15 @@ mod tests {
     }
 
     #[test]
-    fn risky_config_keys_leave_ordinary_settings_alone() {
-        assert!(risky_config_keys("[core]\n\tlongpaths = true\n\tfsmonitor = false\n").is_empty());
+    fn risky_config_keys_come_from_gits_own_parse() {
+        let keys = |t: &str| crate::with_env_lock_no_xdg(|| risky_config_keys(t)).unwrap();
+        assert!(
+            keys("[core]\n\tlongpaths = true\n\tfsmonitor = false\n\t# editor = x\n").is_empty()
+        );
+        assert!(keys("[include]\n\tpath = opencode.gitconfig\n").is_empty());
         assert_eq!(
-            risky_config_keys("[core]\n\tsshCommand = x\n[includeIf \"gitdir:/\"]\n\tpath = /x\n"),
-            ["sshcommand", "[includeif \"gitdir:/\"]", "path"]
+            keys("[core]\n\tsshCommand = x\n[includeIf \"gitdir:/\"]\n\tpath = /x\n"),
+            ["core.sshcommand", "includeif.gitdir:/.path"]
         );
     }
 }
