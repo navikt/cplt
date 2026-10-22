@@ -1132,6 +1132,14 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         policy::DockerAccess::Off => Vec::new(),
         _ => policy::linux_podman_state_dirs(home, uid, xdg.as_deref()),
     };
+    // A rule on a missing path is skipped and bwrap drops its bind, so a
+    // first `podman --remote` could not create `libpod/` in the read-only
+    // runtime dir. Make it here, before the mount plan, the way Podman
+    // would (0700, never through a link, never the runtime dir itself).
+    for dir in &podman_state {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let _ = std::fs::DirBuilder::new().mode(0o700).create(dir);
+    }
     for path in docker_sockets.into_iter().chain(podman_state) {
         fs_rules.push(FsRule {
             // A rootless entry lives in a dir the user owns, so a link there
