@@ -6232,6 +6232,14 @@ fn assemble_sandbox(
 
     // Compute agent-specific sandbox directories
     let mut agent_dirs = resolved.agent_config_dirs(active_agent, home_dir);
+    // OpenCode v2 config sources outside its config dir, walked from its
+    // launch dir, the project dir (#800).
+    if active_agent == agent::Agent::OpenCode {
+        agent_dirs.extend(agent::opencode_launch_config_grants(
+            home_dir,
+            &probe.project_dir,
+        ));
+    }
     // A restriction the user asked for and cannot have is said out loud, not
     // dropped (AGENTS.md "No silent grants").
     #[cfg(target_os = "macos")]
@@ -8291,6 +8299,12 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
     // ── the policy a launch would build, for the rules below ──
     let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
     let mut agent_dirs = resolved.agent_config_dirs(active_agent, &home_dir);
+    if active_agent == agent::Agent::OpenCode {
+        agent_dirs.extend(agent::opencode_launch_config_grants(
+            &home_dir,
+            &project_dir,
+        ));
+    }
     agent::canonicalize_agent_dirs(&mut agent_dirs);
     agent::drop_script_grants_under(
         &mut agent_dirs,

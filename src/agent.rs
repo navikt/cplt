@@ -558,6 +558,18 @@ fn copilot_hook_script_grants(root: &Path, home: &Path) -> Vec<AgentDir> {
 /// cannot plant a path there. Project config is never read. macOS only, for
 /// the same reason as the Claude grant.
 fn opencode_script_grants(config_dir: &Path, home: &Path, writable: &[PathBuf]) -> Vec<AgentDir> {
+    opencode_config_grants(config_dir, true, home, writable)
+}
+
+/// [`opencode_script_grants`] for a config dir that is the provenance of the
+/// config but, unless `readable`, not itself granted: a script inside it is
+/// then granted like any other.
+fn opencode_config_grants(
+    config_dir: &Path,
+    readable: bool,
+    home: &Path,
+    writable: &[PathBuf],
+) -> Vec<AgentDir> {
     if !cfg!(target_os = "macos") {
         return vec![];
     }
@@ -586,7 +598,8 @@ fn opencode_script_grants(config_dir: &Path, home: &Path, writable: &[PathBuf]) 
             dirs.extend(opencode_v2_plugin_dirs(&t, config_dir));
         }
     }
-    let mut out = script_grants(paths, config_dir, home, writable);
+    let root = if readable { config_dir } else { Path::new("") };
+    let mut out = script_grants(paths, root, home, writable);
     out.extend(plugin_dir_grants(dirs, home, writable));
     for g in &mut out {
         g.via.extend(locs.iter().cloned());
@@ -602,6 +615,17 @@ fn opencode_script_grants(config_dir: &Path, home: &Path, writable: &[PathBuf]) 
 /// rest of an ancestor `.opencode` stays denied (#729). An entry that is or
 /// reaches into a credential tree is skipped. Each grant carries `via`, so
 /// [`drop_script_grants_under`] drops any in a writable tree.
+#[must_use]
+pub fn opencode_launch_config_grants(home: &Path, launch_dir: &Path) -> Vec<AgentDir> {
+    let system = if cfg!(target_os = "macos") {
+        "/Library/Application Support/opencode"
+    } else {
+        "/etc/opencode"
+    };
+    opencode_extra_config_grants(Path::new(system), launch_dir, home, &[])
+}
+
+/// See [`opencode_launch_config_grants`]; `cwd` is OpenCode's launch dir.
 fn opencode_extra_config_grants(
     system: &Path,
     cwd: &Path,
@@ -619,7 +643,7 @@ fn opencode_extra_config_grants(
             );
         }
         if dir.is_dir() {
-            out.extend(opencode_script_grants(&dir, home, writable));
+            out.extend(opencode_config_grants(&dir, dir == system, home, writable));
         }
     }
     let keychains = home.join("Library/Keychains");
@@ -633,8 +657,15 @@ fn opencode_extra_config_grants(
         let Ok(real) = std::fs::canonicalize(&path) else {
             continue;
         };
+        // A config file must be a plain first-party file (a hardlink to a
+        // key is refused); anything else must be a dir.
+        let ok = if path.extension().is_some() {
+            real.is_file() && crate::sandbox::first_party_read_target(home, &path).is_some()
+        } else {
+            real.is_dir()
+        };
         let via = symlink_locations(&path);
-        if unsafe_(&real) || via.iter().any(|p| unsafe_(p)) {
+        if !ok || unsafe_(&real) || via.iter().any(|p| unsafe_(p)) {
             continue;
         }
         out.push(AgentDir {
@@ -2164,20 +2195,6 @@ impl Agent {
                             via: vec![],
                         },
                     );
-                }
-
-                let system = if cfg!(target_os = "macos") {
-                    "/Library/Application Support/opencode"
-                } else {
-                    "/etc/opencode"
-                };
-                if let Ok(cwd) = std::env::current_dir() {
-                    scripts.extend(opencode_extra_config_grants(
-                        Path::new(system),
-                        &cwd,
-                        home,
-                        &writable,
-                    ));
                 }
 
                 let mut dirs = vec![
@@ -3979,6 +3996,52 @@ mod tests {
         // A missing system dir grants nothing.
         let got = opencode_extra_config_grants(&home.join("none"), &home, &home, &[]);
         assert_eq!(got.len(), 2);
+        // The walk starts at the launch dir passed in, not cplt's cwd.
+        let got = opencode_launch_config_grants(&home, &proj.join("sub"));
+        assert!(
+            got.iter()
+                .any(|d| d.path == home.join("a/.opencode/plugin"))
+        );
+    }
+
+    #[test]
+    fn opencode_extra_config_grants_refuse_linked_or_dir_configs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::create_dir_all(home.join(".opencode/opencode.jsonc")).unwrap();
+        std::fs::write(home.join(".ssh/id_ed25519"), "key").unwrap();
+        // A hardlink to a key and a dir named like a config get nothing.
+        std::fs::hard_link(
+            home.join(".ssh/id_ed25519"),
+            home.join(".opencode/opencode.json"),
+        )
+        .unwrap();
+        let got = opencode_extra_config_grants(&home.join("none"), &home, &home, &[]);
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn opencode_extra_config_grants_scripts_inside_ancestor_opencode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        let mcp = home.join(".opencode/mcp/server.js");
+        std::fs::create_dir_all(mcp.parent().unwrap()).unwrap();
+        std::fs::write(&mcp, "x").unwrap();
+        std::fs::write(
+            home.join(".opencode/opencode.json"),
+            format!(
+                r#"{{"mcp": {{"servers": {{"a": {{"type": "local", "command": ["{}"]}}}}}}}}"#,
+                mcp.display()
+            ),
+        )
+        .unwrap();
+        let got = opencode_extra_config_grants(&home.join("none"), &home, &home, &[]);
+        assert!(
+            got.iter().any(|d| d.path == mcp && d.process_exec),
+            "{got:?}"
+        );
     }
 
     #[test]
