@@ -1813,6 +1813,7 @@ pub fn keychain_substitute(
     home: &Path,
     deny_env: &[String],
     setting: Option<bool>,
+    writable: &[PathBuf],
 ) -> Option<crate::agent::KeychainSubstitute> {
     if cfg!(target_os = "linux") {
         return secret_service_substitute(
@@ -1820,11 +1821,7 @@ pub fn keychain_substitute(
             home,
             deny_env,
             keychain_substitute_enabled(agent, setting),
-            || {
-                exec::gh_hosts_yml()
-                    .and_then(|p| crate::agent::read_small_regular_file(&p))
-                    .and_then(|s| gh_login(&s))
-            },
+            || exec::gh_hosts_yml().and_then(|p| anchored_gh_login(&p, writable)),
             secret_tool_lookup,
         );
     }
@@ -1838,9 +1835,7 @@ pub fn keychain_substitute(
             // Maintainer call: never switch identity silently. gh signed in as
             // someone other than Copilot's own login keeps the grant (#696).
             if agent == Agent::Copilot {
-                let gh = exec::gh_hosts_yml()
-                    .and_then(|p| crate::agent::read_small_regular_file(&p))
-                    .and_then(|s| gh_login(&s));
+                let gh = exec::gh_hosts_yml().and_then(|p| anchored_gh_login(&p, writable));
                 if let Some(why) = account_mismatch(
                     gh.as_deref(),
                     copilot_keychain_acct(gh.as_deref()).as_deref(),
@@ -1988,6 +1983,30 @@ fn parse_copilot_config_account(text: &str) -> CopilotConfigAccount {
             }
         }
     }
+}
+
+/// gh's github.com login from `hosts`, only when the agent cannot have
+/// written it: not a symlink, and its real path outside every tree in
+/// `writable`. `GH_CONFIG_DIR` or `XDG_CONFIG_HOME` can point gh into a
+/// writable tree, and this login is the anchor that stops the sandboxed agent
+/// from choosing whose stored token cplt reads (#787 review).
+fn anchored_gh_login(hosts: &Path, writable: &[PathBuf]) -> Option<String> {
+    if std::fs::symlink_metadata(hosts)
+        .ok()?
+        .file_type()
+        .is_symlink()
+    {
+        return None;
+    }
+    let real = std::fs::canonicalize(hosts).ok()?;
+    if writable
+        .iter()
+        .any(|w| real.starts_with(w) || std::fs::canonicalize(w).is_ok_and(|w| real.starts_with(w)))
+    {
+        return None;
+    }
+    let text = crate::untrusted::read_untrusted(&real, COPILOT_CONFIG_LIMIT).ok()??;
+    gh_login(&text)
 }
 
 /// The github.com `user:` from gh's `hosts.yml`.
@@ -2222,11 +2241,8 @@ pub static SECRET_TOOL_TIMED_OUT: std::sync::atomic::AtomicBool =
 /// One `secret-tool lookup` from a trusted bin dir, no shell, 1 s cap. A
 /// locked keyring may wait on an unlock prompt; the cap kills it.
 fn secret_tool_lookup(acct: &str) -> Option<String> {
-    let bin = crate::git::TRUSTED_BIN_DIRS
-        .iter()
-        .map(|d| Path::new(d).join("secret-tool"))
-        .find(|p| crate::git::is_executable_file(p))?;
-    #[allow(clippy::disallowed_methods)] // absolute path from a trusted bin dir
+    let bin = crate::git::trusted_binary("secret-tool")?;
+    #[allow(clippy::disallowed_methods)] // resolved into a trusted bin root
     let mut cmd = std::process::Command::new(bin);
     cmd.args(secret_tool_args(acct));
     let cap = std::time::Duration::from_secs(1);
@@ -5916,9 +5932,9 @@ mod tests {
 #[cfg(test)]
 mod account_tests {
     use super::{
-        COPILOT_CONFIG_LIMIT, CopilotConfigAccount, account_mismatch, copilot_config_account,
-        copilot_has_native_login, gh_login, keychain_acct, secret_service_substitute,
-        secret_tool_args,
+        COPILOT_CONFIG_LIMIT, CopilotConfigAccount, account_mismatch, anchored_gh_login,
+        copilot_config_account, copilot_has_native_login, gh_login, keychain_acct,
+        secret_service_substitute, secret_tool_args,
     };
 
     #[test]
@@ -6101,6 +6117,35 @@ mod account_tests {
             copilot_config_account(home.path()),
             CopilotConfigAccount::Selected("https://github.com:alice".to_string())
         );
+    }
+
+    #[test]
+    fn gh_login_anchor_refuses_agent_writable_hosts_yml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ro = tmp.path().join("ro");
+        let rw = tmp.path().join("rw");
+        std::fs::create_dir_all(&ro).unwrap();
+        std::fs::create_dir_all(&rw).unwrap();
+        let yml = "github.com:\n    user: alice\n";
+        let good = ro.join("hosts.yml");
+        std::fs::write(&good, yml).unwrap();
+        let planted = rw.join("hosts.yml");
+        std::fs::write(&planted, yml).unwrap();
+        let link = ro.join("link.yml");
+        std::os::unix::fs::symlink(&good, &link).unwrap();
+        let writable = vec![rw.clone()];
+        assert_eq!(
+            anchored_gh_login(&good, &writable).as_deref(),
+            Some("alice")
+        );
+        // Inside a writable tree, a symlink, or missing: no anchor.
+        assert!(anchored_gh_login(&planted, &writable).is_none());
+        assert!(anchored_gh_login(&link, &writable).is_none());
+        assert!(anchored_gh_login(&ro.join("nope.yml"), &writable).is_none());
+        // A symlinked parent into the writable tree is caught via the real path.
+        let via = tmp.path().join("via");
+        std::os::unix::fs::symlink(&rw, &via).unwrap();
+        assert!(anchored_gh_login(&via.join("hosts.yml"), &writable).is_none());
     }
 
     #[test]

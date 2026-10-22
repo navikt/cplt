@@ -5930,6 +5930,32 @@ fn is_same_file(real: &Path, name: &str) -> bool {
 /// build one by hand and get a deterministic `SandboxConfig` without depending
 /// on whether the machine running it happens to have a JAVA_HOME, a git
 /// checkout, or any particular tool installed.
+/// Every tree the session can write, for refusing a credential anchor the
+/// agent could have planted (`sandbox::keychain_substitute`). Over-including
+/// only falls back to the no-substitute path.
+fn session_writable_everywhere(
+    probe: &HostProbe,
+    repos: &[PathBuf],
+    allow_write: &[PathBuf],
+    agent_dirs: &[agent::AgentDir],
+) -> Vec<PathBuf> {
+    let scratch = scratch::ScratchDir::base(&probe.home_dir);
+    let mut roots =
+        sandbox::session_writable_roots(&probe.project_dir, repos, allow_write, Some(&scratch));
+    roots.extend(cplt::sandbox::home_and_temp_writable_roots(
+        &probe.home_dir,
+        &probe.existing_home_tool_dirs,
+        probe.git_common_dir.as_deref(),
+    ));
+    roots.extend(
+        agent_dirs
+            .iter()
+            .filter(|d| d.write)
+            .map(|d| d.path.clone()),
+    );
+    roots
+}
+
 struct HostProbe {
     home_dir: PathBuf,
     project_dir: PathBuf,
@@ -6298,6 +6324,7 @@ fn assemble_sandbox(
         home_dir,
         &resolved.deny_env,
         resolved.keychain_substitute,
+        &session_writable_everywhere(probe, opts.repos.dirs, &resolved.allow_write, &agent_dirs),
     );
     if !resolved.quiet
         && cplt::sandbox::SECRET_TOOL_TIMED_OUT.load(std::sync::atomic::Ordering::Relaxed)
@@ -7307,6 +7334,7 @@ fn run_check_command(
                 &home_dir,
                 &resolved.deny_env,
                 resolved.keychain_substitute,
+                &[],
             )
             .is_some();
         if let Some(nudge) = cplt::sandbox::claude_keychain_nudge(
@@ -8238,6 +8266,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         &home_dir,
         &resolved.deny_env,
         resolved.keychain_substitute,
+        &session_writable_everywhere(&probe, &repo_paths, &resolved.allow_write, &agent_dirs),
     );
     let doctor_pnpm = resolve_exec_binary("pnpm").ok();
     let doctor_pnpm_shadowed = doctor_pnpm
