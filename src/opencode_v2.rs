@@ -92,7 +92,8 @@ pub fn prepare(scratch: &Path, home: &Path, launch_dir: &Path) -> Result<Session
     // Opened now, before the agent can swap the dir for a link (#793).
     let model = carry_in_state(&state_base.join("opencode"), &state.join("opencode"))
         .and_then(|m| Ok((open_dir(&state.join("opencode")).map_err(|_| ())?, m)));
-    build_overlay(&config_base, &user_oc, &config)
+    let explicit = global_config_file(&user_oc);
+    build_overlay(&config_base, &user_oc, &config, explicit.is_some())
         .map_err(|e| format!("{}: {e}", config.display()))?;
     let port = free_port().map_err(|e| format!("no free loopback port: {e}"))?;
     let password = crate::scratch::generate_session_id()?;
@@ -104,7 +105,7 @@ pub fn prepare(scratch: &Path, home: &Path, launch_dir: &Path) -> Result<Session
         .open(config.join("opencode/service.json"))
         .and_then(|mut f| f.write_all(body.as_bytes()))
         .map_err(|e| format!("cannot write service.json: {e}"))?;
-    let env = vec![
+    let mut env = vec![
         ("XDG_CONFIG_HOME".into(), config.display().to_string()),
         ("XDG_STATE_HOME".into(), state.display().to_string()),
         (
@@ -121,6 +122,7 @@ pub fn prepare(scratch: &Path, home: &Path, launch_dir: &Path) -> Result<Session
         #[cfg(not(target_os = "macos"))]
         ("no_proxy".into(), "localhost,127.0.0.1,::1".into()),
     ];
+    env.extend(explicit.map(|f| ("OPENCODE_CONFIG".into(), f.display().to_string())));
     let files = [
         user_oc.join("service.json"),
         config_base.join("opencode/service.json"),
@@ -236,9 +238,35 @@ fn save_model_to(own: &std::fs::File, host: &Path, before: Option<&str>) -> Resu
         })
 }
 
+/// The user's global `opencode.json(c)`, spelled under `user_oc`, for v2 to
+/// load through `OPENCODE_CONFIG`. v2 resolves `./` and `../` paths in a
+/// config (plugins, `{file:}`, instructions) against the path it loaded it
+/// from, without realpath, so through an overlay link they would point into
+/// scratch (#806). This is the same spelling the plugin grants resolve
+/// against (`agent::opencode_script_grants`). `None`, keeping the overlay
+/// link, when the user sets `OPENCODE_CONFIG` themselves or both files exist
+/// (v2 takes only one explicit file).
+fn global_config_file(user_oc: &Path) -> Option<PathBuf> {
+    if std::env::var_os("OPENCODE_CONFIG").is_some_and(|v| !v.is_empty()) {
+        return None;
+    }
+    let mut found = ["opencode.json", "opencode.jsonc"]
+        .map(|n| user_oc.join(n))
+        .into_iter()
+        .filter(|f| std::fs::symlink_metadata(f).is_ok());
+    let file = found.next()?;
+    found.next().is_none().then_some(file)
+}
+
 /// `overlay` = a link per entry of `user`, except `opencode`, which becomes a
-/// real dir holding a link per entry of `user_oc` except `service.json`.
-fn build_overlay(user: &Path, user_oc: &Path, overlay: &Path) -> std::io::Result<()> {
+/// real dir holding a link per entry of `user_oc` except `service.json`, and
+/// `opencode.json(c)` when `explicit` (v2 loads it via `OPENCODE_CONFIG`).
+fn build_overlay(
+    user: &Path,
+    user_oc: &Path,
+    overlay: &Path,
+    explicit: bool,
+) -> std::io::Result<()> {
     let own = overlay.join("opencode");
     std::fs::create_dir_all(&own)?;
     for (from, to, skip) in [(user, overlay, "opencode"), (user_oc, &own, "service.json")] {
@@ -246,7 +274,9 @@ fn build_overlay(user: &Path, user_oc: &Path, overlay: &Path) -> std::io::Result
             continue;
         };
         for e in entries.flatten() {
-            if e.file_name() != skip {
+            let name = e.file_name();
+            let config = to == own && (name == "opencode.json" || name == "opencode.jsonc");
+            if name != skip && !(explicit && config) {
                 std::os::unix::fs::symlink(e.path(), to.join(e.file_name()))?;
             }
         }
@@ -714,6 +744,52 @@ mod tests {
         assert!(w.is_some_and(|w| w.contains("database is locked")));
     }
 
+    /// #806: the one global config is loaded by its real path, not through
+    /// an overlay link; both files present, or the user's own
+    /// `OPENCODE_CONFIG`, keep today's links.
+    #[test]
+    fn global_config_is_loaded_by_its_real_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let oc = tmp.path().join("opencode");
+        std::fs::create_dir_all(&oc).unwrap();
+        let unset = |f: fn(&Path) -> Option<PathBuf>, oc: &Path| {
+            temp_env::with_var("OPENCODE_CONFIG", None::<&str>, || f(oc))
+        };
+        assert_eq!(unset(global_config_file, &oc), None, "no config");
+        std::fs::write(oc.join("opencode.jsonc"), "{}").unwrap();
+        assert_eq!(
+            unset(global_config_file, &oc),
+            Some(oc.join("opencode.jsonc"))
+        );
+        temp_env::with_var("OPENCODE_CONFIG", Some("/x/own.json"), || {
+            assert_eq!(global_config_file(&oc), None, "user's own");
+        });
+        std::fs::write(oc.join("opencode.json"), "{}").unwrap();
+        assert_eq!(unset(global_config_file, &oc), None, "both files");
+
+        std::fs::remove_file(oc.join("opencode.json")).unwrap();
+        std::fs::create_dir(oc.join("agent")).unwrap();
+        let ov = tmp.path().join("ov");
+        build_overlay(tmp.path(), &oc, &ov, true).unwrap();
+        assert!(std::fs::symlink_metadata(ov.join("opencode/opencode.jsonc")).is_err());
+        assert!(ov.join("opencode/agent").is_dir());
+
+        let s = temp_env::with_vars(
+            [
+                ("XDG_CONFIG_HOME", Some(tmp.path().to_str().unwrap())),
+                ("XDG_STATE_HOME", None),
+                ("OPENCODE_CONFIG", None),
+                ("OPENCODE_CONFIG_DIR", None),
+            ],
+            || prepare(&tmp.path().join("s"), tmp.path(), &tmp.path().join("r")).unwrap(),
+        );
+        let env: std::collections::HashMap<_, _> = s.env.into_iter().collect();
+        assert_eq!(
+            env["OPENCODE_CONFIG"],
+            oc.join("opencode.jsonc").display().to_string()
+        );
+    }
+
     #[test]
     fn overlay_links_everything_but_the_service_files() {
         let tmp = tempfile::tempdir().unwrap();
@@ -723,7 +799,7 @@ mod tests {
         std::fs::write(user.join("opencode/opencode.json"), "{}").unwrap();
         std::fs::write(user.join("opencode/service.json"), "{\"password\":\"x\"}").unwrap();
         let ov = tmp.path().join("ov");
-        build_overlay(&user, &user.join("opencode"), &ov).unwrap();
+        build_overlay(&user, &user.join("opencode"), &ov, false).unwrap();
         assert_eq!(
             std::fs::read_link(ov.join("git")).unwrap(),
             user.join("git")
@@ -738,7 +814,13 @@ mod tests {
         assert!(!ov.join("opencode/service.json").exists());
         // A user without a config dir still gets the overlay.
         let missing = tmp.path().join("missing");
-        build_overlay(&missing, &missing.join("opencode"), &tmp.path().join("ov2")).unwrap();
+        build_overlay(
+            &missing,
+            &missing.join("opencode"),
+            &tmp.path().join("ov2"),
+            false,
+        )
+        .unwrap();
         assert!(tmp.path().join("ov2/opencode").is_dir());
     }
 
@@ -895,7 +977,11 @@ mod tests {
     fn prepare_writes_a_private_service_config() {
         let tmp = tempfile::tempdir().unwrap();
         let s = temp_env::with_vars(
-            [("XDG_CONFIG_HOME", None::<&str>), ("XDG_STATE_HOME", None)],
+            [
+                ("XDG_CONFIG_HOME", None::<&str>),
+                ("XDG_STATE_HOME", None),
+                ("OPENCODE_CONFIG", None),
+            ],
             || prepare(tmp.path(), tmp.path(), &tmp.path().join("src/repo")).unwrap(),
         );
         let file = tmp.path().join("opencode-v2/config/opencode/service.json");
@@ -908,6 +994,7 @@ mod tests {
         let env: std::collections::HashMap<_, _> = s.env.into_iter().collect();
         assert!(env["XDG_STATE_HOME"].ends_with("opencode-v2/state"));
         assert_eq!(env["OPENCODE_DISABLE_MODELS_FETCH"], "1");
+        assert!(!env.contains_key("OPENCODE_CONFIG"), "no user config");
         assert_eq!(u64::from(s.port), port);
         #[cfg(not(target_os = "macos"))]
         for f in [".config/opencode", ".local/state/opencode"] {

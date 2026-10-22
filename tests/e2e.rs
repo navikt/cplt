@@ -9927,7 +9927,8 @@ paths = [
                 [ -L "$o/service.json" ] && echo SVC-IS-LINK
                 echo "MODE=$(stat -f %Lp "$o/service.json")"
                 echo "SVC=$(cat "$o/service.json")"
-                echo "OC=$(readlink "$o/opencode.json")"
+                [ -e "$o/opencode.json" ] && echo OC-IN-OVERLAY
+                echo "OC=$OPENCODE_CONFIG"
                 echo "GIT=$(readlink "$XDG_CONFIG_HOME/git")""#);
             assert_eq!(code, Some(0), "{err}");
             assert!(!out.contains("SVC-IS-LINK"), "{out}");
@@ -9938,7 +9939,9 @@ paths = [
             assert_eq!(v["password"].as_str().unwrap().len(), 32, "{svc}");
             let user = home.h.join(".config");
             let oc = format!("OC={}/opencode/opencode.json", user.display());
+            // #806: loaded by its real path, so `../` resolves from there.
             assert!(out.contains(&oc), "{out}");
+            assert!(!out.contains("OC-IN-OVERLAY"), "{out}");
             assert!(
                 out.contains(&format!("GIT={}/git", user.display())),
                 "{out}"
