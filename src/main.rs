@@ -3768,6 +3768,26 @@ fn agent_allowlist(
     allowed_domains_file: bool,
     deny_env: &[String],
 ) -> Vec<String> {
+    agent_allowlist_with(
+        agent,
+        default_allowlist,
+        allowed_domains_file,
+        deny_env,
+        |home| {
+            agent
+                .resolve_binary()
+                .is_ok_and(|bin| agent::is_opencode_v2(&bin, home) == Some(true))
+        },
+    )
+}
+
+fn agent_allowlist_with(
+    agent: agent::Agent,
+    default_allowlist: bool,
+    allowed_domains_file: bool,
+    deny_env: &[String],
+    is_opencode_v2: impl FnOnce(&Path) -> bool,
+) -> Vec<String> {
     let mut domains = if default_allowlist {
         agent.default_allowed_domains()
     } else if allowed_domains_file {
@@ -3786,11 +3806,7 @@ fn agent_allowlist(
         && !deny_env
             .iter()
             .any(|d| d == "GH_TOKEN" || d == "OPENCODE_AUTH_CONTENT");
-    let v2 = agent == agent::Agent::OpenCode
-        && home.is_absolute()
-        && agent
-            .resolve_binary()
-            .is_ok_and(|bin| agent::is_opencode_v2(&bin, &home) == Some(true));
+    let v2 = agent == agent::Agent::OpenCode && home.is_absolute() && is_opencode_v2(&home);
     if v2 {
         domains.extend(agent::opencode_v2_provider_domains(&home));
     } else {
@@ -15428,13 +15444,10 @@ mod tests {
             Some(tmp.path().to_str().expect("utf-8 path")),
             || {
                 let copilot = "githubcopilot.com".to_string();
-                assert!(
-                    agent_allowlist(agent::Agent::OpenCode, false, true, &[]).contains(&copilot)
-                );
-                assert!(
-                    agent_allowlist(agent::Agent::OpenCode, true, false, &[]).contains(&copilot)
-                );
-                assert!(agent_allowlist(agent::Agent::OpenCode, false, false, &[]).is_empty());
+                let a = |d, f| agent_allowlist_with(agent::Agent::OpenCode, d, f, &[], |_| false);
+                assert!(a(false, true).contains(&copilot));
+                assert!(a(true, false).contains(&copilot));
+                assert!(a(false, false).is_empty());
             },
         );
     }
@@ -15451,11 +15464,48 @@ mod tests {
             [("XDG_DATA_HOME", Some(p)), ("GH_CONFIG_DIR", Some(p))],
             || {
                 let copilot = "githubcopilot.com".to_string();
-                let a = |d: &[String]| agent_allowlist(agent::Agent::OpenCode, false, true, d);
+                let a = |d: &[String]| {
+                    agent_allowlist_with(agent::Agent::OpenCode, false, true, d, |_| false)
+                };
                 assert!(a(&[]).contains(&copilot));
                 for v in ["GH_TOKEN", "OPENCODE_AUTH_CONTENT"] {
                     assert!(!a(&[v.to_string()]).contains(&copilot), "{v}");
                 }
+            },
+        );
+    }
+
+    /// #788: OpenCode v2 provider hosts are loaded from `opencode.db`.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn agent_allowlist_adds_opencode_v2_copilot_provider_hosts() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("opencode");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let db = dir.join("opencode.db");
+        let Ok(status) = std::process::Command::new("/usr/bin/sqlite3")
+            .arg(&db)
+            .arg("CREATE TABLE credential (integration_id TEXT, value TEXT);")
+            .status()
+        else {
+            return;
+        };
+        if !status.success() {
+            return;
+        }
+        let _ = std::process::Command::new("/usr/bin/sqlite3")
+            .arg(&db)
+            .arg(r#"INSERT INTO credential VALUES ('github-copilot', '{"type":"oauth"}');"#)
+            .status();
+        temp_env::with_var(
+            "XDG_DATA_HOME",
+            Some(tmp.path().to_str().expect("utf-8 path")),
+            || {
+                let copilot = "githubcopilot.com".to_string();
+                let a = |d, f| agent_allowlist_with(agent::Agent::OpenCode, d, f, &[], |_| true);
+                assert!(a(false, true).contains(&copilot));
+                assert!(a(true, false).contains(&copilot));
+                assert!(a(false, false).is_empty());
             },
         );
     }
