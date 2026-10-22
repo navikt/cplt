@@ -137,7 +137,11 @@ pub fn prepare(scratch: &Path, home: &Path, launch_dir: &Path) -> Result<Session
     let history = state_base.join("opencode/prompt-history.jsonl");
     let mut writes = Vec::new();
     if std::fs::symlink_metadata(&history).is_ok_and(|m| m.is_file()) {
-        writes.extend([crate::config::canonicalize_deepest(&history), history]);
+        writes.push(crate::config::canonicalize_deepest(&history));
+        // Seatbelt matches the spelled path too; a Landlock rule is opened
+        // without following links, so it takes the resolved path only.
+        #[cfg(target_os = "macos")]
+        writes.push(history);
         writes.dedup();
     }
     #[cfg(target_os = "macos")]
@@ -1055,6 +1059,35 @@ mod tests {
         )));
         #[cfg(not(target_os = "macos"))]
         assert!(s.writes.contains(&history));
+    }
+
+    /// #796: a linked state dir component (Fedora Atomic's `/home`, a
+    /// dotfiles-linked `~/.local/state`) must not reach a `nofollow` rule.
+    #[test]
+    fn history_grant_resolves_a_linked_state_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let linked = tmp.path().join("linked");
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        let scratch = tmp.path().join("scratch");
+        let s = temp_env::with_vars(
+            [
+                ("XDG_CONFIG_HOME", None::<&str>),
+                ("XDG_STATE_HOME", Some(linked.to_str().unwrap())),
+            ],
+            || prepare(&scratch, tmp.path(), &tmp.path().join("src/repo")).unwrap(),
+        );
+        let resolved = std::fs::canonicalize(&real)
+            .unwrap()
+            .join("opencode/prompt-history.jsonl");
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(s.writes, [resolved]);
+        #[cfg(target_os = "macos")]
+        for p in [resolved, linked.join("opencode/prompt-history.jsonl")] {
+            let lit = format!("(literal \"{}\")", p.display());
+            assert!(s.sbpl_before_denies.contains(&lit), "{lit}");
+        }
     }
 
     /// #793: `model.json` comes in, goes back out only when changed and valid,
