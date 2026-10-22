@@ -1986,23 +1986,21 @@ fn parse_copilot_config_account(text: &str) -> CopilotConfigAccount {
 }
 
 /// gh's github.com login from `hosts`, only when the agent cannot have
-/// written it: not a symlink, and its real path outside every tree in
+/// written it: neither the path as named nor its real path inside a tree in
 /// `writable`. `GH_CONFIG_DIR` or `XDG_CONFIG_HOME` can point gh into a
 /// writable tree, and this login is the anchor that stops the sandboxed agent
 /// from choosing whose stored token cplt reads (#787 review).
 fn anchored_gh_login(hosts: &Path, writable: &[PathBuf]) -> Option<String> {
-    if std::fs::symlink_metadata(hosts)
-        .ok()?
-        .file_type()
-        .is_symlink()
-    {
-        return None;
-    }
+    // Both the path as named (a link the agent could re-point) and where it
+    // really points. A dotfile-manager link to a tree the agent cannot write
+    // (stow, chezmoi, home-manager) stays usable.
     let real = std::fs::canonicalize(hosts).ok()?;
-    if writable
-        .iter()
-        .any(|w| real.starts_with(w) || std::fs::canonicalize(w).is_ok_and(|w| real.starts_with(w)))
-    {
+    let inside = |p: &Path| {
+        writable
+            .iter()
+            .any(|w| p.starts_with(w) || std::fs::canonicalize(w).is_ok_and(|w| p.starts_with(w)))
+    };
+    if inside(hosts) || inside(&real) {
         return None;
     }
     let text = crate::untrusted::read_untrusted(&real, COPILOT_CONFIG_LIMIT).ok()??;
@@ -6138,9 +6136,20 @@ mod account_tests {
             anchored_gh_login(&good, &writable).as_deref(),
             Some("alice")
         );
-        // Inside a writable tree, a symlink, or missing: no anchor.
+        // A dotfile-manager link to a non-writable target is accepted.
+        assert_eq!(
+            anchored_gh_login(&link, &writable).as_deref(),
+            Some("alice")
+        );
+        // Inside a writable tree, a link into one, a link placed in one, or
+        // missing: no anchor.
         assert!(anchored_gh_login(&planted, &writable).is_none());
-        assert!(anchored_gh_login(&link, &writable).is_none());
+        let into = ro.join("into.yml");
+        std::os::unix::fs::symlink(&planted, &into).unwrap();
+        assert!(anchored_gh_login(&into, &writable).is_none());
+        let placed = rw.join("placed.yml");
+        std::os::unix::fs::symlink(&good, &placed).unwrap();
+        assert!(anchored_gh_login(&placed, &writable).is_none());
         assert!(anchored_gh_login(&ro.join("nope.yml"), &writable).is_none());
         // A symlinked parent into the writable tree is caught via the real path.
         let via = tmp.path().join("via");
