@@ -8418,10 +8418,16 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
             &home_dir,
             resolved.allow_docker,
             resolved.allow_rootless_docker,
-            // Doctor builds no deny masks of its own (that would mkdir the
-            // scratch placeholder), so a bubblewrap mask is reported as
-            // conditional below.
-            &|_: &Path| landlock_v9 || bubblewrap.active(),
+            // Doctor builds no deny masks of its own, so a bubblewrap mask is
+            // reported as conditional below.
+            &|p: &Path| {
+                doctor_rootful_blocked(
+                    landlock_v9,
+                    bubblewrap.active(),
+                    resolved.scratch_dir,
+                    p.is_dir(),
+                )
+            },
         ) {
             let line = if landlock_v9 {
                 line
@@ -11890,9 +11896,28 @@ fn start_denial_stream() -> Option<std::process::Child> {
     }
 }
 
+/// Whether doctor may report a rootful socket as masked. A socket file is
+/// masked with the placeholder, which needs the scratch dir; a directory is
+/// masked by a tmpfs.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn doctor_rootful_blocked(landlock_v9: bool, bwrap: bool, scratch_dir: bool, is_dir: bool) -> bool {
+    landlock_v9 || (bwrap && (scratch_dir || is_dir))
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod tests {
+    /// `--no-scratch-dir` drops file masks, so doctor must not call a rootful
+    /// socket file masked then (review on #804).
+    #[test]
+    fn doctor_rootful_blocked_needs_scratch_for_a_socket_file() {
+        assert!(!super::doctor_rootful_blocked(false, true, false, false));
+        assert!(super::doctor_rootful_blocked(false, true, false, true));
+        assert!(super::doctor_rootful_blocked(false, true, true, false));
+        assert!(!super::doctor_rootful_blocked(false, false, true, true));
+        assert!(super::doctor_rootful_blocked(true, false, false, false));
+    }
+
     /// #608: `cplt config hosts --json` is built from the same lists the proxy
     /// uses, so nav-pilot reading it cannot drift from what cplt enforces.
     #[test]
