@@ -1561,7 +1561,7 @@ pub fn exec(
                     ));
                 }
                 if wrapper.proc_limited_on_fallback {
-                    ui::warn(super::PROC_SELF_LIMIT_WARNING);
+                    ui::warn(&super::proc_self_limit_warning());
                 }
                 // fall through to the direct path
             }

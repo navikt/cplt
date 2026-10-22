@@ -2988,11 +2988,24 @@ fn seed_claude_settings(config: &SandboxConfig) {
 /// Said at launch, or at a spawn-time bwrap fallback, when the `/proc` grant
 /// (#790) is withheld because nothing hides the host's processes.
 #[cfg(target_os = "linux")]
-pub(crate) const PROC_SELF_LIMIT_WARNING: &str = "Without Bubblewrap only the agent's first process can read its own /proc/self \
-     (cmdline, stat, status); processes it starts get EACCES, so tools such as podman \
-     fail with \"cannot retrieve cmd line\". Granting /proc would expose every host \
-     process's command line. Install bubblewrap, or pass --allow-read /proc if that is \
-     acceptable.";
+pub(crate) fn proc_self_limit_warning() -> String {
+    proc_self_limit_text(bubblewrap::PROBE_FAILED.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn proc_self_limit_text(probe_failed: bool) -> String {
+    format!(
+        "Without Bubblewrap only the agent's first process can read its own /proc/self \
+         (cmdline, stat, status); processes it starts get EACCES, so tools such as podman \
+         fail with \"cannot retrieve cmd line\". Granting /proc would expose every host \
+         process's command line. {}, or pass --allow-read /proc if that is acceptable.",
+        if probe_failed {
+            "Bubblewrap is installed but its probe failed: run `cplt doctor` for the fix"
+        } else {
+            "Install bubblewrap"
+        }
+    )
+}
 
 #[cfg(target_os = "linux")]
 fn prepare_impl(
@@ -3280,7 +3293,7 @@ fn prepare_impl(
     let dropped = drop_claude_hook_grants(config, &mut policy);
     if bwrap_wrapper.is_none() {
         if proc_dropped {
-            ui::warn(PROC_SELF_LIMIT_WARNING);
+            ui::warn(&proc_self_limit_warning());
         }
         if proc_dropped && dropped.is_empty() {
             profile_text =
@@ -6072,8 +6085,8 @@ mod account_tests {
     use super::{
         COPILOT_CONFIG_LIMIT, CopilotConfigAccount, SecretServiceSkip, account_mismatch,
         anchored_gh_login, copilot_config_account, copilot_has_native_login, gh_login,
-        hosts_agent_writable, keychain_acct, secret_service_substitute, secret_tool_args,
-        unix_sockets_unrestricted,
+        hosts_agent_writable, keychain_acct, proc_self_limit_text, secret_service_substitute,
+        secret_tool_args, unix_sockets_unrestricted,
     };
 
     #[test]
@@ -6319,6 +6332,17 @@ mod account_tests {
             "gh's login file ~/proj/.gh/hosts.yml is in a path the agent can write, so cplt \
              does not trust the account it names; move gh's config out of the writable paths"
         );
+    }
+
+    #[test]
+    fn proc_warning_tells_probe_failure_from_missing_bwrap() {
+        assert!(proc_self_limit_text(false).contains("Install bubblewrap, or pass"));
+        let failed = proc_self_limit_text(true);
+        assert!(!failed.contains("Install bubblewrap"));
+        assert!(failed.contains(
+            "Bubblewrap is installed but its probe failed: run `cplt doctor` for the fix, or \
+             pass --allow-read /proc"
+        ));
     }
 
     #[test]

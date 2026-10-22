@@ -6348,7 +6348,15 @@ fn assemble_sandbox(
         resolved.keychain_substitute,
         &session_writable_everywhere(probe, opts.repos.dirs, &resolved.allow_write, &agent_dirs),
     );
+    // Doctor's suppression: a token handed over another way makes the keyring moot.
+    let keyring_moot = copilot_stored_token_handover(
+        resolved,
+        keychain_substitute.as_ref(),
+        cplt::sandbox::gh_configured(),
+        cplt::sandbox::copilot_has_native_login(home_dir),
+    );
     if !resolved.quiet
+        && !keyring_moot
         && cplt::sandbox::SECRET_TOOL_TIMED_OUT.load(std::sync::atomic::Ordering::Relaxed)
     {
         ui::warn(
@@ -6357,6 +6365,7 @@ fn assemble_sandbox(
         );
     }
     if !resolved.quiet
+        && !keyring_moot
         && let Some(skip) = cplt::sandbox::SECRET_SERVICE_SKIP.get()
     {
         ui::warn(&format!(
@@ -8581,9 +8590,14 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
     findings.extend(keyring.map(|mut f| {
         if let Some(skip) = cplt::sandbox::SECRET_SERVICE_SKIP.get() {
             f.message = format!(
-                "Copilot's keyring login was not passed to the sandbox: {}",
-                skip.reason(&home_dir)
+                "Copilot's keyring login was not passed to the sandbox. {}",
+                f.message
             );
+            f.fix = Some(format!(
+                "{}. Or set gh_guard.inject_token = true (with --force), or export a valid \
+                 COPILOT_GITHUB_TOKEN",
+                skip.reason(&home_dir)
+            ));
         }
         f
     }));
