@@ -2897,6 +2897,17 @@ fn prepare_impl(
         }
         bwrap_plan(config, extra_git_dirs, canonical_grants, base)
     };
+    // #790: the `/proc/self` rule binds to the first child's `/proc/<pid>`,
+    // so every process it starts gets EACCES on its own `/proc/self/*`
+    // (podman: "cannot retrieve cmd line"). Under bubblewrap `/proc` is a
+    // fresh mount of a new pid namespace and lists only sandbox processes,
+    // so read on all of it exposes nothing from the host. Pushed last, so
+    // the Landlock-only path below can pop it again before anything else
+    // touches the rule indices.
+    let proc_grant = !config.allow_jvm_attach;
+    if proc_grant {
+        policy.fs_rules.push(landlock_mod::proc_read_rule());
+    }
     let mut profile_text = landlock_mod::describe_policy(&policy);
     // Rebuilt below if the hook grants are dropped on a Landlock-only host.
     let policy_text_len = profile_text.len();
@@ -3051,8 +3062,25 @@ fn prepare_impl(
     // always. A wrapper carries its own copy of the rules, so they still apply
     // under bubblewrap, but an exec-time fallback to plain Landlock does not
     // get them.
+    // Without bubblewrap `/proc` lists every host process, and Landlock's
+    // ptrace scoping hides `environ`/`mem` but not `cmdline`/`stat`, so the
+    // grant is withdrawn and the limit said out loud.
+    let proc_dropped = proc_grant && bwrap_wrapper.is_none() && policy.fs_rules.pop().is_some();
     let dropped = drop_claude_hook_grants(config, &mut policy);
     if bwrap_wrapper.is_none() {
+        if proc_dropped {
+            ui::warn(
+                "Without Bubblewrap only the agent's first process can read its own \
+                 /proc/self (cmdline, stat, status); processes it starts get EACCES, so \
+                 tools such as podman fail with \"cannot retrieve cmd line\". Granting \
+                 /proc would expose every host process's command line. Install \
+                 bubblewrap, or pass --allow-read /proc if that is acceptable.",
+            );
+        }
+        if proc_dropped && dropped.is_empty() {
+            profile_text =
+                landlock_mod::describe_policy(&policy) + &profile_text[policy_text_len..];
+        }
         let mut cleared = Vec::new();
         for rule in policy.fs_rules.iter_mut().filter(|r| r.access.create_dirs) {
             rule.access.create_dirs = false;

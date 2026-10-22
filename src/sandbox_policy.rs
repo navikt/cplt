@@ -840,6 +840,30 @@ pub fn linux_rootless_socket_paths(
     uid: u32,
     xdg_runtime_dir: Option<&Path>,
 ) -> Vec<PathBuf> {
+    drop_rootful_overlaps(home, uid, runtime_dir_socket_paths(uid, xdg_runtime_dir))
+}
+
+/// `libpod/` in every runtime dir: Podman writes its tmp and lock files there
+/// even with `--remote` (#790). Granted read-write under either docker key;
+/// the agent already drives Podman through the socket, so this adds nothing.
+/// Filtered like [`linux_rootless_socket_paths`], so `XDG_RUNTIME_DIR=/run/podman`
+/// cannot turn it into a grant inside the rootful Podman endpoint.
+pub fn linux_podman_state_dirs(
+    home: &Path,
+    uid: u32,
+    xdg_runtime_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    let dirs = linux_runtime_dirs(uid, xdg_runtime_dir)
+        .iter()
+        .map(|d| d.join("libpod"))
+        .collect();
+    drop_rootful_overlaps(home, uid, dirs)
+}
+
+/// Drop every candidate that equals, contains or sits under a rootful, Docker
+/// Desktop or Colima endpoint, lexically and through symlinks; return the rest
+/// resolved.
+fn drop_rootful_overlaps(home: &Path, uid: u32, candidates: Vec<PathBuf>) -> Vec<PathBuf> {
     let forms = |p: &Path| {
         let mut lexical = PathBuf::new();
         for c in p.components() {
@@ -861,7 +885,7 @@ pub fn linux_rootless_socket_paths(
     // Returned resolved, so the Landlock rule (opened with no symlink
     // following) names a link-free path, and a link swapped in later fails
     // the launch instead of moving the grant.
-    runtime_dir_socket_paths(uid, xdg_runtime_dir)
+    candidates
         .into_iter()
         .filter_map(|r| {
             let [lexical, resolved] = forms(&r);
@@ -4485,6 +4509,24 @@ mod tests {
             DockerAccess::Rootless
         );
         assert_eq!(DockerAccess::from_flags(false, false), DockerAccess::Off);
+    }
+
+    /// #790: Podman's `libpod/` state dir in each runtime dir, never one
+    /// inside a rootful endpoint.
+    #[test]
+    fn podman_state_dirs_follow_the_rootless_filter() {
+        let home = Path::new("/fake/user");
+        assert_eq!(
+            linux_podman_state_dirs(home, 1000, Some(Path::new("/run/xdg/1000"))),
+            [
+                PathBuf::from("/run/user/1000/libpod"),
+                PathBuf::from("/run/xdg/1000/libpod")
+            ]
+        );
+        assert_eq!(
+            linux_podman_state_dirs(home, 1000, Some(Path::new("/run/podman"))),
+            [PathBuf::from("/run/user/1000/libpod")]
+        );
     }
 
     /// The banner must not claim rootful sockets are masked when nothing

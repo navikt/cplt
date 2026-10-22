@@ -759,6 +759,15 @@ cplt config set sandbox.allow_rootless_docker true --force
 cplt --allow-rootless-docker
 ```
 
+For Podman, use the remote client: `podman --remote` with `CONTAINER_HOST=unix://$XDG_RUNTIME_DIR/podman/podman.sock` (or the `docker` CLI with `DOCKER_HOST`). Both variables pass through to the agent. Local `podman` cannot work inside the sandbox: it needs user namespaces, and the seccomp filter blocks them. Both docker keys also grant `$XDG_RUNTIME_DIR/libpod` read-write, where Podman writes its lock and tmp files even in remote mode.
+
+```bash
+export CONTAINER_HOST=unix://$XDG_RUNTIME_DIR/podman/podman.sock
+podman --remote images
+```
+
+**`/proc/self` for child processes:** under bubblewrap the agent's whole `/proc` is readable, because bubblewrap mounts a fresh `/proc` for a new pid namespace that lists only sandbox processes. Without bubblewrap only the agent's first process can read its own `/proc/self/cmdline`, `stat` and `status`; anything it starts gets `EACCES`, and tools that read their own command line (Podman: `cannot retrieve cmd line`) fail. cplt does not grant `/proc` there, since it would expose the command line of every host process, and says so at launch. Install bubblewrap, or pass `--allow-read /proc` if that exposure is acceptable.
+
 ## SSH agent blocking
 
 SSH agent access is blocked on macOS (the agent socket is not reachable — the profile's `(deny default)` covers `network-outbound` to unix sockets) and `SSH_AUTH_SOCK` is stripped from the environment on both platforms. `~/.ssh` is denied as well, so there is no key file to fall back on. Unless the agent reaches a loaded agent socket (possible on Linux, see the caveat below), this means:
