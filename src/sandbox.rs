@@ -1823,11 +1823,10 @@ pub fn keychain_substitute(
             keychain_substitute_enabled(agent, setting),
             || {
                 let hosts = exec::gh_hosts_yml()?;
-                if hosts_agent_writable(&hosts, writable) {
+                anchored_gh_login(&hosts, writable).unwrap_or_else(|()| {
                     let _ = SECRET_SERVICE_SKIP.set(SecretServiceSkip::GhHostsWritable(hosts));
-                    return None;
-                }
-                anchored_gh_login(&hosts, writable)
+                    None
+                })
             },
             secret_tool_lookup,
         );
@@ -1842,7 +1841,7 @@ pub fn keychain_substitute(
             // Maintainer call: never switch identity silently. gh signed in as
             // someone other than Copilot's own login keeps the grant (#696).
             if agent == Agent::Copilot {
-                let gh = exec::gh_hosts_yml().and_then(|p| anchored_gh_login(&p, writable));
+                let gh = exec::gh_hosts_yml().and_then(|p| anchored_gh_login(&p, writable).ok()?);
                 if let Some(why) = account_mismatch(
                     gh.as_deref(),
                     copilot_keychain_acct(gh.as_deref()).as_deref(),
@@ -1996,30 +1995,31 @@ fn parse_copilot_config_account(text: &str) -> CopilotConfigAccount {
 /// written it: neither the path as named nor its real path inside a tree in
 /// `writable`. `GH_CONFIG_DIR` or `XDG_CONFIG_HOME` can point gh into a
 /// writable tree, and this login is the anchor that stops the sandboxed agent
-/// from choosing whose stored token cplt reads (#787 review).
-fn anchored_gh_login(hosts: &Path, writable: &[PathBuf]) -> Option<String> {
-    let real = std::fs::canonicalize(hosts).ok()?;
-    if hosts_agent_writable(hosts, writable) {
-        return None;
+/// from choosing whose stored token cplt reads (#787 review). `Err` is that
+/// refusal; a path that does not resolve gives no login (fail closed). The
+/// path is resolved once, and the check and the read both use that result.
+fn anchored_gh_login(hosts: &Path, writable: &[PathBuf]) -> Result<Option<String>, ()> {
+    let Ok(real) = std::fs::canonicalize(hosts) else {
+        return Ok(None);
+    };
+    if hosts_agent_writable(hosts, &real, writable) {
+        return Err(());
     }
-    let text = crate::untrusted::read_untrusted(&real, COPILOT_CONFIG_LIMIT).ok()??;
-    gh_login(&text)
+    let text = crate::untrusted::read_untrusted(&real, COPILOT_CONFIG_LIMIT);
+    Ok(text.ok().flatten().as_deref().and_then(gh_login))
 }
 
-/// `hosts` exists and the agent could have written it: the path as named (a
-/// link the agent could re-point) or where it really points lies in a tree in
-/// `writable`. A dotfile-manager link to a tree the agent cannot write (stow,
-/// chezmoi, home-manager) stays usable.
-fn hosts_agent_writable(hosts: &Path, writable: &[PathBuf]) -> bool {
-    let Ok(real) = std::fs::canonicalize(hosts) else {
-        return false;
-    };
+/// The agent could have written `hosts`: the path as named (a link the agent
+/// could re-point) or `real`, where it resolved, lies in a tree in `writable`.
+/// A dotfile-manager link to a tree the agent cannot write (stow, chezmoi,
+/// home-manager) stays usable.
+fn hosts_agent_writable(hosts: &Path, real: &Path, writable: &[PathBuf]) -> bool {
     let inside = |p: &Path| {
         writable
             .iter()
             .any(|w| p.starts_with(w) || std::fs::canonicalize(w).is_ok_and(|w| p.starts_with(w)))
     };
-    inside(hosts) || inside(&real)
+    inside(hosts) || inside(real)
 }
 
 /// The github.com `user:` from gh's `hosts.yml`.
@@ -6287,35 +6287,52 @@ mod account_tests {
         std::os::unix::fs::symlink(&good, &link).unwrap();
         let writable = vec![rw.clone()];
         assert_eq!(
-            anchored_gh_login(&good, &writable).as_deref(),
+            anchored_gh_login(&good, &writable).unwrap().as_deref(),
             Some("alice")
         );
         // A dotfile-manager link to a non-writable target is accepted.
         assert_eq!(
-            anchored_gh_login(&link, &writable).as_deref(),
+            anchored_gh_login(&link, &writable).unwrap().as_deref(),
             Some("alice")
         );
         // Inside a writable tree, a link into one, a link placed in one, or
         // missing: no anchor.
-        assert!(anchored_gh_login(&planted, &writable).is_none());
+        assert!(!matches!(
+            anchored_gh_login(&planted, &writable),
+            Ok(Some(_))
+        ));
         let into = ro.join("into.yml");
         std::os::unix::fs::symlink(&planted, &into).unwrap();
-        assert!(anchored_gh_login(&into, &writable).is_none());
+        assert!(!matches!(anchored_gh_login(&into, &writable), Ok(Some(_))));
         let placed = rw.join("placed.yml");
         std::os::unix::fs::symlink(&good, &placed).unwrap();
-        assert!(anchored_gh_login(&placed, &writable).is_none());
-        assert!(anchored_gh_login(&ro.join("nope.yml"), &writable).is_none());
+        assert!(!matches!(
+            anchored_gh_login(&placed, &writable),
+            Ok(Some(_))
+        ));
+        assert!(!matches!(
+            anchored_gh_login(&ro.join("nope.yml"), &writable),
+            Ok(Some(_))
+        ));
         // A symlinked parent into the writable tree is caught via the real path.
         let via = tmp.path().join("via");
         std::os::unix::fs::symlink(&rw, &via).unwrap();
-        assert!(anchored_gh_login(&via.join("hosts.yml"), &writable).is_none());
+        assert!(!matches!(
+            anchored_gh_login(&via.join("hosts.yml"), &writable),
+            Ok(Some(_))
+        ));
         // The refusals that doctor and launch name, and not a missing file.
         for p in [&planted, &into, &placed, &via.join("hosts.yml")] {
-            assert!(hosts_agent_writable(p, &writable), "{}", p.display());
+            assert_eq!(anchored_gh_login(p, &writable), Err(()), "{}", p.display());
         }
-        assert!(!hosts_agent_writable(&good, &writable));
-        assert!(!hosts_agent_writable(&link, &writable));
-        assert!(!hosts_agent_writable(&ro.join("nope.yml"), &writable));
+        // Resolution failure refuses (no login), without a writable verdict.
+        assert_eq!(anchored_gh_login(&ro.join("nope.yml"), &writable), Ok(None));
+        let dangling = ro.join("dangling.yml");
+        std::os::unix::fs::symlink(ro.join("gone.yml"), &dangling).unwrap();
+        assert_eq!(anchored_gh_login(&dangling, &writable), Ok(None));
+        // The check runs on the real path it is given, not a fresh resolution.
+        assert!(hosts_agent_writable(&good, &planted, &writable));
+        assert!(!hosts_agent_writable(&good, &good, &writable));
     }
 
     #[test]
