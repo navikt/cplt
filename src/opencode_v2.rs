@@ -244,12 +244,9 @@ fn save_model_to(own: &std::fs::File, host: &Path, before: Option<&str>) -> Resu
 /// from, without realpath, so through an overlay link they would point into
 /// scratch (#806). This is the same spelling the plugin grants resolve
 /// against (`agent::opencode_script_grants`). `None`, keeping the overlay
-/// link, when the user sets `OPENCODE_CONFIG` themselves or both files exist
-/// (v2 takes only one explicit file).
+/// link, when both files exist (v2 takes only one explicit file). A user's
+/// own `OPENCODE_CONFIG` is not passed into the sandbox, so it is ignored.
 fn global_config_file(user_oc: &Path) -> Option<PathBuf> {
-    if std::env::var_os("OPENCODE_CONFIG").is_some_and(|v| !v.is_empty()) {
-        return None;
-    }
     let mut found = ["opencode.json", "opencode.jsonc"]
         .map(|n| user_oc.join(n))
         .into_iter()
@@ -745,27 +742,25 @@ mod tests {
     }
 
     /// #806: the one global config is loaded by its real path, not through
-    /// an overlay link; both files present, or the user's own
-    /// `OPENCODE_CONFIG`, keep today's links.
+    /// an overlay link; both files present keep today's links.
     #[test]
     fn global_config_is_loaded_by_its_real_path() {
         let tmp = tempfile::tempdir().unwrap();
         let oc = tmp.path().join("opencode");
         std::fs::create_dir_all(&oc).unwrap();
-        let unset = |f: fn(&Path) -> Option<PathBuf>, oc: &Path| {
-            temp_env::with_var("OPENCODE_CONFIG", None::<&str>, || f(oc))
-        };
-        assert_eq!(unset(global_config_file, &oc), None, "no config");
+
+        assert_eq!(global_config_file(&oc), None, "no config");
         std::fs::write(oc.join("opencode.jsonc"), "{}").unwrap();
-        assert_eq!(
-            unset(global_config_file, &oc),
-            Some(oc.join("opencode.jsonc"))
-        );
+        assert_eq!(global_config_file(&oc), Some(oc.join("opencode.jsonc")));
         temp_env::with_var("OPENCODE_CONFIG", Some("/x/own.json"), || {
-            assert_eq!(global_config_file(&oc), None, "user's own");
+            assert_eq!(
+                global_config_file(&oc),
+                Some(oc.join("opencode.jsonc")),
+                "dropped anyway"
+            );
         });
         std::fs::write(oc.join("opencode.json"), "{}").unwrap();
-        assert_eq!(unset(global_config_file, &oc), None, "both files");
+        assert_eq!(global_config_file(&oc), None, "both files");
 
         std::fs::remove_file(oc.join("opencode.json")).unwrap();
         std::fs::create_dir(oc.join("agent")).unwrap();
