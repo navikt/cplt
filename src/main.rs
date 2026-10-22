@@ -1337,18 +1337,9 @@ fn source_label(source: repo_config::RepoConfigSource) -> &'static str {
     }
 }
 
+/// The repo containing the process cwd; no project dir is known yet.
 fn detect_project_root() -> Option<PathBuf> {
-    // Resolves the repo containing the process cwd — no project dir is known
-    // at this point. Hardened all the same: cwd may be inside a hostile repo.
-    let output = cplt::git::command(std::path::Path::new("."), &["rev-parse", "--show-toplevel"])?
-        .output()
-        .ok()?;
-    if output.status.success() {
-        let path = String::from_utf8(output.stdout).ok()?;
-        Some(PathBuf::from(path.trim()))
-    } else {
-        None
-    }
+    cplt::git::project_root(Path::new(".")).ok()
 }
 
 /// The toplevel of the git repository containing `dir`, canonicalized.
@@ -2695,19 +2686,18 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
     let project_dir = match &cli.project_dir {
         Some(p) => std::fs::canonicalize(p)
             .map_err(|e| anyhow::anyhow!("Cannot resolve project dir: {e}"))?,
-        None => {
-            if let Some(root) = detect_project_root() {
-                match std::fs::canonicalize(&root) {
-                    Ok(p) => p,
-                    Err(_) => root,
-                }
-            } else {
-                ui::warn("No git repo detected, using cwd");
+        None => match cplt::git::project_root(Path::new(".")) {
+            Ok(root) => std::fs::canonicalize(&root).unwrap_or(root),
+            Err(reason) => {
+                ui::warn(&match reason {
+                    Some(r) => format!("No git repo detected, using cwd (git: {r})"),
+                    None => "No git repo detected, using cwd".to_string(),
+                });
                 std::env::current_dir()
                     .and_then(std::fs::canonicalize)
                     .map_err(|e| anyhow::anyhow!("Cannot resolve cwd: {e}"))?
             }
-        }
+        },
     };
     let invocation_dir = std::env::current_dir()
         .and_then(std::fs::canonicalize)

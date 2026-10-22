@@ -765,6 +765,29 @@ pub fn command(project_dir: &Path, args: &[&str]) -> Option<Command> {
     Some(cmd)
 }
 
+/// The toplevel of the git repository containing `dir`, not canonicalized.
+///
+/// `Err` carries the first nonempty line of git's stderr, or the spawn error,
+/// so the caller can say *why* detection failed. `Err(None)` means git gave
+/// no reason (no trusted git, or a refused invocation).
+///
+/// Hardened like every other call: `dir` may be inside a hostile repo.
+pub fn project_root(dir: &Path) -> Result<PathBuf, Option<String>> {
+    let output = command(dir, &["rev-parse", "--show-toplevel"])
+        .ok_or(None)?
+        .output()
+        .map_err(|e| Some(e.to_string()))?;
+    if output.status.success() {
+        let path = String::from_utf8(output.stdout).map_err(|_| None)?;
+        return Ok(PathBuf::from(path.trim()));
+    }
+    Err(String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_owned))
+}
+
 /// True when the repository at `project_dir` defines a content filter in its
 /// **own** (`local` or `worktree` scope) config.
 ///
@@ -846,6 +869,17 @@ fn warn_refused_once() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_root_reports_gits_reason_outside_a_repo() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = project_root(dir.path()).expect_err("tempdir is not a repo");
+        assert!(
+            err.as_deref()
+                .is_some_and(|e| e.contains("not a git repository")),
+            "{err:?}"
+        );
+    }
 
     /// The full expected table, spelled out independently of
     /// [`CONFIG_OVERRIDES`] — a test that only iterates the const cannot notice
