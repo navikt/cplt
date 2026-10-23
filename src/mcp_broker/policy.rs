@@ -255,9 +255,31 @@ pub fn on_server(line: &str, spec: &Spec, pending: &mut Pending) -> Action {
 }
 
 /// An auth failure in a server response, for mirroring to cplt's output.
+/// Only the error fields count: a JSON-RPC `error`, or the text of a tool
+/// result flagged `isError`. A successful result that merely mentions
+/// "not logged in" (a doc page, a log line) is not one.
 pub(crate) fn auth_error(line: &str) -> bool {
-    let l = line.to_ascii_lowercase();
-    l.contains("unauthenticated") || l.contains("not logged in") || l.contains("please log in")
+    let Ok(msg) = serde_json::from_str::<Value>(line) else {
+        return false;
+    };
+    let mut texts: Vec<String> = Vec::new();
+    if let Some(e) = msg.get("error") {
+        texts.push(e.to_string());
+    }
+    if msg.pointer("/result/isError") == Some(&Value::Bool(true)) {
+        let content = msg.pointer("/result/content").and_then(Value::as_array);
+        texts.extend(
+            content
+                .into_iter()
+                .flatten()
+                .filter_map(|c| c.get("text").and_then(Value::as_str))
+                .map(str::to_string),
+        );
+    }
+    texts.iter().any(|t| {
+        let l = t.to_ascii_lowercase();
+        l.contains("unauthenticated") || l.contains("not logged in") || l.contains("please log in")
+    })
 }
 
 #[cfg(test)]
@@ -433,6 +455,23 @@ mod tests {
             Action::Drop
         );
         assert!(p.0.is_empty());
+    }
+
+    #[test]
+    fn auth_errors_only_from_error_fields() {
+        for l in [
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"Unauthenticated"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[{"type":"text","text":"not logged in, run nais login"}]}}"#,
+        ] {
+            assert!(auth_error(l), "{l}");
+        }
+        for l in [
+            r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"docs: if you are not logged in, run nais login"}]}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"x","description":"please log in first"}]}}"#,
+            "not logged in",
+        ] {
+            assert!(!auth_error(l), "{l}");
+        }
     }
 
     #[test]
