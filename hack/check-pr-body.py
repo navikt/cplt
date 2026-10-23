@@ -28,6 +28,8 @@ REQUIRED_CODE_JOBS = (
     "opencode-v2-e2e",
     "opencode-v2-e2e-linux",
     "linux-integration-tests",
+    "mcp-broker-e2e-ubuntu-22.04",
+    "mcp-broker-e2e-ubuntu-24.04",
 )
 
 TEMPLATE_EXAMPLE = """```markdown

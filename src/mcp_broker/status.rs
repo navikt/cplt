@@ -9,8 +9,16 @@ use super::credential::credential_ok;
 use super::spec::{Detected, spec_dir};
 use super::{SCHEMA_VERSIONS, STATUS_VERSION};
 
-/// `cplt mcp status --json`.
-pub fn status_json(found: &Detected, enabled: bool, probe: bool) -> Value {
+/// `cplt mcp status --json`. `supported`: this host can run the broker
+/// (on Linux, only under Bubblewrap with the bus masked, #834).
+/// `off_reason`: why the broker would be off for this launch (#838).
+pub fn status_json(
+    found: &Detected,
+    enabled: bool,
+    probe: bool,
+    supported: bool,
+    off_reason: Option<&str>,
+) -> Value {
     let mut servers: Vec<Value> = found
         .specs
         .iter()
@@ -35,7 +43,8 @@ pub fn status_json(found: &Detected, enabled: bool, probe: bool) -> Value {
     json!({
         "version": STATUS_VERSION,
         "schema": SCHEMA_VERSIONS,
-        "platform_supported": cfg!(target_os = "macos"),
+        "platform_supported": supported,
+        "off_reason": off_reason,
         "servers": servers,
         "rejected": found.rejected,
     })
@@ -43,13 +52,23 @@ pub fn status_json(found: &Detected, enabled: bool, probe: bool) -> Value {
 
 /// `cplt mcp status [--json]`. Reads the specs as a launch from the current
 /// directory would, without starting anything.
-pub fn run_status(as_json: bool, home: &Path, found: &Detected, enabled: bool) -> ExitCode {
-    let status = status_json(found, enabled && cfg!(target_os = "macos"), true);
+pub fn run_status(
+    as_json: bool,
+    home: &Path,
+    found: &Detected,
+    enabled: bool,
+    refusal: Option<&str>,
+) -> ExitCode {
+    let supported = refusal.is_none();
+    let status = status_json(found, enabled && supported, true, supported, refusal);
     if as_json {
         println!("{status}");
         return ExitCode::SUCCESS;
     }
     println!("MCP broker specs in {}", spec_dir(home).display());
+    if let Some(why) = refusal {
+        println!("  broker off for this launch: {why}");
+    }
     for s in status["servers"].as_array().into_iter().flatten() {
         println!(
             "  {}  {}  credential_ok: {}",

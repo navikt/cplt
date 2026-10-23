@@ -2557,6 +2557,266 @@ fn report_unix_socket_regime(
     }
 }
 
+/// Why the MCP broker (#834) cannot serve a launch with `config`, or `None`.
+///
+/// The broker's point is that the agent cannot reach the server's credential.
+/// On Linux that credential sits behind the D-Bus Secret Service, and below
+/// Landlock ABI v9 only bubblewrap's bus masks keep the agent off the bus
+/// (SECURITY.md, Linux limitation 3). So the broker runs only where the
+/// launch's own wrapper builds and masks every bus endpoint that exists.
+/// Probed with the launch's rules, as `cplt doctor` does.
+#[cfg(target_os = "linux")]
+pub fn mcp_broker_refusal(config: &SandboxConfig) -> Option<String> {
+    if let Some(why) = mcp_flag_conflict(config.allow_gpg_signing, config.allow_rootless_docker) {
+        return Some(why);
+    }
+    // Planned as the launch will be: with a broker socket, so with its masks.
+    let probe_socket = Path::new("/tmp/cplt-mcp-probe/m");
+    let config = &SandboxConfig {
+        mcp_socket: Some(probe_socket),
+        ..config.clone()
+    };
+    let base = std::cell::OnceCell::new();
+    let grants = launch_grants(
+        config,
+        base.get_or_init(|| landlock_mod::generate_policy(config)),
+    )
+    .unwrap_or_default();
+    let plan = bwrap_plan(config, &launch_git_dirs(config), &grants, &base);
+    let wrapper = if config.use_bubblewrap == Some(false) {
+        Err("it is turned off".to_string())
+    } else {
+        bubblewrap::build_wrapper(
+            &plan.policy,
+            bubblewrap::Overlays {
+                read_only: &plan.ro_protect,
+                pins: &plan.pins,
+            },
+            &plan.deny_masks,
+            false,
+        )
+        .map(|_| ())
+    };
+    mcp_refusal_text(
+        wrapper,
+        &plan.deny_masks,
+        &plan.policy.fs_rules,
+        &mcp_bus_endpoints(),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn mcp_broker_refusal(_: &SandboxConfig) -> Option<String> {
+    None
+}
+
+/// The refusal line for [`mcp_broker_refusal`] and the backstop in
+/// `prepare`: `wrapper` is whether bubblewrap wraps the run.
+#[cfg(target_os = "linux")]
+fn mcp_refusal_text(
+    wrapper: Result<(), String>,
+    masks: &bubblewrap::DenyMasks,
+    rules: &[landlock_mod::FsRule],
+    bus: &BusEndpoints,
+) -> Option<String> {
+    const FIX: &str = "Run `cplt doctor`, or set sandbox.mcp_broker = false";
+    if let Err(e) = wrapper {
+        let fix = if bubblewrap::check_availability().is_none() {
+            format!("Install it: {}.", crate::doctor::BWRAP_INSTALL_HINT)
+        } else if let Some(fix) = crate::doctor::apparmor_fix() {
+            fix
+        } else {
+            "Run `cplt doctor` to see what blocks it.".to_string()
+        };
+        return Some(format!(
+            "the MCP broker needs Bubblewrap on Linux, and Bubblewrap is not usable ({}): \
+             without its bus masks the agent could read the server's credential over D-Bus. \
+             {fix}\nOr set sandbox.mcp_broker = false",
+            strip_control(&e)
+        ));
+    }
+    if bus.other {
+        return Some(format!(
+            "DBUS_SESSION_BUS_ADDRESS names a transport other than a unix socket, which \
+             bubblewrap cannot mask. {FIX}"
+        ));
+    }
+    if bus.abstract_socket
+        && !landlock_mod::check_availability().is_ok_and(|abi| abi >= landlock::ABI::V6)
+    {
+        return Some(format!(
+            "DBUS_SESSION_BUS_ADDRESS names an abstract socket, which only Landlock ABI v6 \
+             (kernel 6.12) can keep from the agent. {FIX}"
+        ));
+    }
+    let open: Vec<String> = bus
+        .paths
+        .iter()
+        .filter(|p| {
+            p.canonicalize()
+                .is_ok_and(|c| !masks.covers(&c) && !hidden_by_private_mount(&c, rules))
+        })
+        .map(|p| strip_control(&p.display().to_string()))
+        .collect();
+    (!open.is_empty()).then(|| {
+        format!(
+            "the MCP broker needs Bubblewrap to hide every D-Bus endpoint, and {} is not \
+             masked. {FIX}",
+            open.join(", ")
+        )
+    })
+}
+
+/// `prepare`'s half of the broker's fail-closed rule: refuse unless
+/// bubblewrap wraps the run with every bus endpoint hidden and the socket
+/// itself unmasked, then make that bubblewrap strict, so a spawn-time
+/// failure stops the run instead of falling back to Landlock alone.
+#[cfg(target_os = "linux")]
+fn mcp_backstop(
+    socket: &Path,
+    wrapper: Option<&mut bubblewrap::BubblewrapWrapper>,
+    masks: &bubblewrap::DenyMasks,
+    rules: &[landlock_mod::FsRule],
+    bus: &BusEndpoints,
+) -> Result<(), String> {
+    let resolved = wrapper
+        .as_ref()
+        .map(|_| ())
+        .ok_or_else(|| "it did not resolve".to_string());
+    if let Some(e) = mcp_refusal_text(resolved, masks, rules, bus) {
+        return Err(e);
+    }
+    // A user deny path over the socket would leave the shim nothing to
+    // reach, silently.
+    if masks.covers(socket) {
+        return Err(format!(
+            "a deny path masks the MCP broker socket {}; set sandbox.mcp_broker = false",
+            socket.display()
+        ));
+    }
+    if let Some(w) = wrapper {
+        w.strict = true;
+    }
+    Ok(())
+}
+
+/// bwrap's own `--tmpfs /tmp`, `--dev` and `--proc` hide the host's copy of
+/// a path under them, unless a grant there binds it back in (#838). Read-only
+/// grants count: bwrap binds those under /tmp too (#299), and a read-only
+/// bind does not stop `connect(2)`.
+#[cfg(target_os = "linux")]
+fn hidden_by_private_mount(path: &Path, rules: &[landlock_mod::FsRule]) -> bool {
+    ["/tmp", "/dev", "/proc", "/sys"]
+        .iter()
+        .any(|m| path.starts_with(m))
+        && !rules
+            .iter()
+            .filter(|r| r.path != Path::new("/tmp"))
+            .any(|r| path.starts_with(&r.path))
+}
+
+/// Env-derived text (paths, bwrap's error) without control characters, for
+/// a line printed to the terminal.
+#[cfg(target_os = "linux")]
+fn strip_control(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
+/// The broker hides the runtime dirs, where the gpg-agent and rootless
+/// container sockets live, so a run asking for those keeps the flag and
+/// goes without the broker (#838).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn mcp_flag_conflict(gpg: bool, rootless_docker: bool) -> Option<String> {
+    let flags: Vec<&str> = [
+        (gpg, "--allow-gpg-signing"),
+        (rootless_docker, "--allow-rootless-docker"),
+    ]
+    .into_iter()
+    .filter_map(|(on, f)| on.then_some(f))
+    .collect();
+    (!flags.is_empty()).then(|| {
+        format!(
+            "{} needs sockets in the runtime dir, which the MCP broker hides from the \
+             sandbox. Keep the flag and pass --no-mcp-broker <id>, or drop the flag to use \
+             the broker",
+            flags.join(" and ")
+        )
+    })
+}
+
+/// Where a D-Bus bus can be reached, for the MCP broker's masks (#834).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Default, PartialEq, Eq)]
+struct BusEndpoints {
+    /// Masked whole: every runtime dir (the session bus, systemd, keyring
+    /// sockets), `/run/dbus`, and each `unix:path=`/`unix:dir=` the session
+    /// address names.
+    paths: Vec<PathBuf>,
+    /// `unix:abstract=` or `unix:tmpdir=` (abstract on Linux): no path to mask.
+    abstract_socket: bool,
+    /// A non-unix transport (tcp, ...).
+    other: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn mcp_bus_endpoints() -> BusEndpoints {
+    let mut bus = std::env::var("DBUS_SESSION_BUS_ADDRESS")
+        .map(|a| parse_dbus_address(&a))
+        .unwrap_or_default();
+    let mut paths = policy::linux_runtime_dirs(
+        policy::current_uid(),
+        policy::xdg_runtime_dir_env().as_deref(),
+    );
+    paths.push(PathBuf::from("/run/dbus"));
+    paths.append(&mut bus.paths);
+    bus.paths = paths;
+    bus
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+/// The endpoints in a D-Bus address list (`unix:path=/x;unix:abstract=y`).
+fn parse_dbus_address(addr: &str) -> BusEndpoints {
+    let mut out = BusEndpoints::default();
+    for entry in addr.split(';').filter(|e| !e.trim().is_empty()) {
+        let Some(keys) = entry.trim().strip_prefix("unix:") else {
+            out.other = true;
+            continue;
+        };
+        for (k, v) in keys.split(',').filter_map(|kv| kv.split_once('=')) {
+            match k {
+                "path" | "dir" => out.paths.push(PathBuf::from(dbus_unescape(v))),
+                "abstract" | "tmpdir" => out.abstract_socket = true,
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+/// D-Bus address values escape bytes as `%XX`.
+fn dbus_unescape(v: &str) -> String {
+    let b = v.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && let Some(byte) = v
+                .get(i + 1..i + 3)
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+        {
+            out.push(byte);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// The no-bubblewrap socket warning; `probe_failed` means bwrap is installed
 /// but could not create its namespaces, so installing it is not the fix.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -2945,6 +3205,11 @@ fn bwrap_plan(
         policy::DockerAccess::from_flags(config.allow_docker, config.allow_rootless_docker),
     )
     .into_iter()
+    .chain(if config.mcp_socket.is_some() {
+        mcp_bus_endpoints().paths
+    } else {
+        Vec::new()
+    })
     .filter(|p| p.exists())
     .collect();
     let deny_masks = bubblewrap::build_deny_masks(
@@ -3239,6 +3504,20 @@ fn prepare_impl(
         },
         &deny_masks,
     )?;
+
+    // #834: the launch checked this before starting the broker
+    // (`mcp_broker_refusal`); this is the backstop. Strict, so a spawn-time
+    // bwrap failure stops the run instead of falling back to plain Landlock
+    // with the bus reachable.
+    if let Some(socket) = config.mcp_socket {
+        mcp_backstop(
+            socket,
+            bwrap_wrapper.as_mut(),
+            &deny_masks,
+            &policy.fs_rules,
+            &mcp_bus_endpoints(),
+        )?;
+    }
 
     // #553: a home Git config file a link points at inside a writable tree,
     // but which does not exist yet, gets no bind, so the agent could create
@@ -3697,6 +3976,125 @@ fn validate_created_playwright_socket_dir(path: &Path) -> Result<(), String> {
 #[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unmasked_bus_refuses_the_broker() {
+        // Outside /tmp, so bwrap's private /tmp does not hide it.
+        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let bus_path = dir.path().join("session-bus");
+        std::fs::write(&bus_path, "").unwrap();
+        let bus = BusEndpoints {
+            paths: vec![bus_path.clone()],
+            ..Default::default()
+        };
+        let masks = bubblewrap::DenyMasks::default();
+        let why = mcp_refusal_text(Ok(()), &masks, &[], &bus).expect("refused");
+        assert!(why.contains("session-bus"), "{why}");
+        assert!(
+            mcp_refusal_text(Err("no".into()), &masks, &[], &BusEndpoints::default()).is_some()
+        );
+        assert_eq!(
+            mcp_refusal_text(Ok(()), &masks, &[], &BusEndpoints::default()),
+            None
+        );
+        // Masked: accepted.
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let canon = bus_path.canonicalize().unwrap();
+        let masks =
+            bubblewrap::build_deny_masks(&[], std::slice::from_ref(&canon), &[], Some(&scratch));
+        assert_eq!(mcp_refusal_text(Ok(()), &masks, &[], &bus), None);
+        // A session bus named only by DBUS_SESSION_BUS_ADDRESS is one of the
+        // endpoints checked.
+        assert_eq!(
+            parse_dbus_address("unix:path=/var/tmp/session-bus").paths,
+            [PathBuf::from("/var/tmp/session-bus")]
+        );
+        assert!(hidden_by_private_mount(Path::new("/tmp/x"), &[]));
+        assert!(!hidden_by_private_mount(
+            Path::new("/var/tmp/session-bus"),
+            &[]
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_bus_under_the_private_tmp_counts_as_hidden() {
+        use landlock_mod::{FsAccess, FsRule};
+        let rule = |p: &str, write: bool| FsRule {
+            nofollow: false,
+            path: PathBuf::from(p),
+            access: FsAccess {
+                read: true,
+                write,
+                execute: false,
+                ioctl: false,
+                create_dirs: false,
+            },
+        };
+        let tmp_rule = [rule("/tmp", true)];
+        assert!(hidden_by_private_mount(
+            Path::new("/tmp/dbus-x/bus"),
+            &tmp_rule
+        ));
+        assert!(hidden_by_private_mount(Path::new("/dev/shm/bus"), &[]));
+        assert!(!hidden_by_private_mount(Path::new("/run/user/1/bus"), &[]));
+        // Bound back in by a writable grant: reachable again.
+        let back = [rule("/tmp", true), rule("/tmp/proj", true)];
+        assert!(!hidden_by_private_mount(Path::new("/tmp/proj/bus"), &back));
+        // So does a read-only one: bwrap binds it, and connect ignores ro.
+        assert!(!hidden_by_private_mount(
+            Path::new("/tmp/ro/bus"),
+            &[rule("/tmp/ro", false)]
+        ));
+        assert_eq!(strip_control("a\x1b[31mb\nc"), "a?[31mb?c");
+    }
+
+    #[test]
+    fn gpg_and_rootless_docker_turn_the_broker_off() {
+        assert_eq!(mcp_flag_conflict(false, false), None);
+        let gpg = mcp_flag_conflict(true, false).unwrap();
+        assert!(gpg.starts_with("--allow-gpg-signing needs"), "{gpg}");
+        assert!(gpg.contains("--no-mcp-broker <id>"), "{gpg}");
+        let both = mcp_flag_conflict(true, true).unwrap();
+        assert!(
+            both.contains("--allow-gpg-signing and --allow-rootless-docker"),
+            "{both}"
+        );
+        let json = crate::mcp_broker::status_json(
+            &crate::mcp_broker::Detected::default(),
+            false,
+            false,
+            false,
+            Some(&both),
+        );
+        assert_eq!(json["platform_supported"], false);
+        assert_eq!(json["off_reason"], both.as_str());
+    }
+
+    #[test]
+    fn dbus_addresses_name_their_endpoints() {
+        use super::{BusEndpoints, parse_dbus_address};
+        use std::path::PathBuf;
+        assert_eq!(
+            parse_dbus_address("unix:path=/run/user/1000/bus"),
+            BusEndpoints {
+                paths: vec![PathBuf::from("/run/user/1000/bus")],
+                ..Default::default()
+            }
+        );
+        let off = parse_dbus_address("unix:path=/var/x%20y/bus,guid=1;unix:dir=/srv/d");
+        assert_eq!(
+            off.paths,
+            [PathBuf::from("/var/x y/bus"), PathBuf::from("/srv/d")]
+        );
+        assert!(!off.abstract_socket && !off.other);
+        assert!(parse_dbus_address("unix:abstract=/tmp/dbus-XYZ,guid=1").abstract_socket);
+        assert!(parse_dbus_address("unix:tmpdir=/tmp").abstract_socket);
+        assert!(parse_dbus_address("tcp:host=localhost,port=1").other);
+        assert_eq!(parse_dbus_address(""), BusEndpoints::default());
+    }
 
     #[test]
     fn keychain_kept_reason_is_copilot_only_and_names_deny_env() {

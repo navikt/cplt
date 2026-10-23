@@ -26,9 +26,26 @@ pub fn run_stdio(id: &str) -> ExitCode {
         return ExitCode::FAILURE;
     };
     std::thread::spawn(move || {
-        let _ = std::io::copy(&mut std::io::stdin().lock(), &mut up);
+        pump(&mut std::io::stdin().lock(), &mut up);
         let _ = up.shutdown(std::net::Shutdown::Write);
     });
-    let _ = std::io::copy(&mut stream, &mut std::io::stdout().lock());
+    pump(&mut stream, &mut std::io::stdout().lock());
     ExitCode::SUCCESS
+}
+
+/// Copy until EOF, flushing each chunk. Not `io::copy`: on Linux it
+/// splices socket to pipe, and the reply never reached the client (#834).
+fn pump(from: &mut impl std::io::Read, to: &mut impl Write) {
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        match from.read(&mut buf) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Ok(0) | Err(_) => return,
+            Ok(n) => {
+                if to.write_all(&buf[..n]).and_then(|()| to.flush()).is_err() {
+                    return;
+                }
+            }
+        }
+    }
 }

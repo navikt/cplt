@@ -391,6 +391,64 @@ jobs:
             exit 1
           fi
 
+  # MCP host broker (#834) with real bubblewrap on both supported Ubuntu
+  # LTS releases. 24.04 gets the AppArmor profile users are told to install,
+  # not the sysctl, so the documented fix is what CI measures.
+  mcp-broker-e2e:
+    if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base != null
+    name: mcp-broker-e2e-${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # ratchet:actions/checkout@v7.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # ratchet:dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94"
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # ratchet:actions/cache@v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.os }}-mcp-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ matrix.os }}-mcp-cargo-
+
+      - name: Install bubblewrap (and the AppArmor userns profile where needed)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          # The fix cplt prints (src/doctor.rs, apparmor_fix_text): Ubuntu's own
+          # profile when shipped, else a written one.
+          if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)" = "1" ] \
+            && [ -f /etc/apparmor.d/bwrap-userns-restrict ]; then
+            sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+          elif [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)" = "1" ]; then
+            sudo tee /etc/apparmor.d/bwrap >/dev/null <<'EOF'
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          profile bwrap /usr/bin/bwrap flags=(unconfined) {
+            userns,
+            include if exists <local/bwrap>
+          }
+          EOF
+            sudo apparmor_parser -r /etc/apparmor.d/bwrap
+          fi
+          bwrap --unshare-user --unshare-pid --ro-bind / / --proc /proc --dev /dev --tmpfs /tmp /bin/true
+
+      - name: Run the MCP broker e2e
+        env:
+          CPLT_TEST_REQUIRE_SANDBOX: "1"
+        run: cargo test --test mcp_broker -- --nocapture
+
   # Linux integration tests — Landlock kernel enforcement (requires Linux 5.13+)
   linux-integration-tests:
     if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base != null
@@ -615,7 +673,7 @@ jobs:
   ci-ok:
     name: ci-ok
     if: ${{ always() }}
-    needs: [pr-body-check, unit-tests, integration-tests, opencode-v2-e2e, opencode-v2-e2e-linux, linux-integration-tests]
+    needs: [pr-body-check, unit-tests, integration-tests, opencode-v2-e2e, opencode-v2-e2e-linux, linux-integration-tests, mcp-broker-e2e]
     runs-on: ubuntu-latest
     # Body-edit runs wait for the code run's tests (CI_OK_WAIT_SECONDS below).
     timeout-minutes: 30
@@ -638,7 +696,7 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           CI_OK_WAIT_SECONDS: "1500"
           BODY_RESULT: ${{ needs.pr-body-check.result }}
-          CODE_RESULTS: ${{ format('{0},{1},{2},{3},{4}', needs.unit-tests.result, needs.integration-tests.result, needs.opencode-v2-e2e.result, needs.opencode-v2-e2e-linux.result, needs.linux-integration-tests.result) }}
+          CODE_RESULTS: ${{ format('{0},{1},{2},{3},{4},{5}', needs.unit-tests.result, needs.integration-tests.result, needs.opencode-v2-e2e.result, needs.opencode-v2-e2e-linux.result, needs.linux-integration-tests.result, needs.mcp-broker-e2e.result) }}
         run: |
           set -euo pipefail
           if [ "$EVENT_NAME" = "pull_request" ] && [ "$EVENT_ACTION" = "edited" ] && [ "$BASE_CHANGED" = "false" ]; then

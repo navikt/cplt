@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-#[cfg(target_os = "macos")]
 use super::egress::egress_tunnel;
 use super::policy::{Action, Pending, auth_error, error_line, on_client, on_server};
 use super::spec::Spec;
@@ -95,6 +94,8 @@ pub struct Broker {
     socket: PathBuf,
     #[cfg(target_os = "macos")]
     _dir: crate::scratch::PlaywrightSocketDir,
+    #[cfg(not(target_os = "macos"))]
+    _dir: SocketDir,
     shared: Arc<Shared>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -102,10 +103,12 @@ pub struct Broker {
 impl Broker {
     /// Bind the socket and serve `specs`. The child's egress goes through the
     /// proxy on `proxy_port`, whose allowlist already holds the specs' hosts.
-    #[cfg(target_os = "macos")]
     pub fn start(specs: Vec<Spec>, home: &Path, log: Log) -> Result<Self, String> {
         use std::os::unix::fs::PermissionsExt;
+        #[cfg(target_os = "macos")]
         let dir = crate::scratch::PlaywrightSocketDir::create()?;
+        #[cfg(not(target_os = "macos"))]
+        let dir = SocketDir::create()?;
         let socket = dir.path().join("m");
         let listener = std::os::unix::net::UnixListener::bind(&socket)
             .map_err(|e| format!("cannot bind {}: {e}", socket.display()))?;
@@ -192,12 +195,6 @@ impl Broker {
         })
     }
 
-    /// Linux needs a bwrap bind for the socket first (phase 1b).
-    #[cfg(not(target_os = "macos"))]
-    pub fn start(_: Vec<Spec>, _: &Path, _: Log) -> Result<Self, String> {
-        Err("the MCP broker runs on macOS only for now".into())
-    }
-
     /// The socket path the sandbox profile grants connect to.
     pub fn socket(&self) -> &Path {
         &self.socket
@@ -205,6 +202,57 @@ impl Broker {
 
     pub fn specs(&self) -> impl Iterator<Item = &Spec> {
         self.shared.servers.values().map(|s| &s.spec)
+    }
+}
+
+/// Linux (#834): a private 0700 dir under `/tmp` for the one socket.
+/// Bubblewrap binds the socket itself past its private `/tmp`. Not in the
+/// runtime dir: with the broker on, bubblewrap hides the runtime dirs whole
+/// (the bus lives there), and a user `--deny-path` cannot mask `/tmp`.
+/// Removed on drop.
+#[cfg(not(target_os = "macos"))]
+struct SocketDir {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(not(target_os = "macos"))]
+impl SocketDir {
+    fn create() -> Result<Self, String> {
+        const LABEL: &str = "MCP broker socket dir";
+        let path = Path::new("/tmp").join(format!(
+            "cplt-mcp-{}",
+            crate::scratch::generate_session_id()?
+        ));
+        crate::scratch::create_secure_dir(&path, LABEL)?;
+        let (device, inode) =
+            crate::scratch::secure_dir_identity(&path, LABEL).inspect_err(|_| {
+                let _ = std::fs::remove_dir(&path);
+            })?;
+        Ok(Self {
+            path,
+            device,
+            inode,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Removed only if it is still the directory `create` made (device and
+/// inode, no symlink), as for the Playwright socket dir.
+#[cfg(not(target_os = "macos"))]
+impl Drop for SocketDir {
+    fn drop(&mut self) {
+        crate::scratch::remove_owned_dir(
+            &self.path,
+            self.device,
+            self.inode,
+            "MCP broker socket dir",
+        );
     }
 }
 
@@ -274,12 +322,9 @@ pub(crate) fn spawn_child(shared: &Shared, server: &Server) -> std::io::Result<C
     let proxy = format!("http://127.0.0.1:{}", server.egress_port.unwrap_or(0));
     #[allow(clippy::disallowed_methods)] // resolved in the trusted dirs at load
     let mut cmd = Command::new(&spec.program);
-    cmd.args(&spec.command[1..])
-        .env_clear()
-        .env("HOME", &shared.home)
-        .env("PATH", crate::git::TRUSTED_BIN_DIRS.join(":"))
-        .env("TMPDIR", std::env::temp_dir())
-        .env("HTTPS_PROXY", &proxy)
+    cmd.args(&spec.command[1..]);
+    host_env(&mut cmd, &shared.home);
+    cmd.env("HTTPS_PROXY", &proxy)
         .env("HTTP_PROXY", &proxy)
         .env("https_proxy", &proxy)
         .env("http_proxy", &proxy)
@@ -292,10 +337,36 @@ pub(crate) fn spawn_child(shared: &Shared, server: &Server) -> std::io::Result<C
         // ponytail: stderr dropped; route it to the proxy log, bounded and
         // redacted, when a server's own diagnostics are needed.
         .stderr(Stdio::null());
-    if let Some(lang) = std::env::var_os("LANG") {
-        cmd.env("LANG", lang);
-    }
     cmd.spawn()
+}
+
+/// The host child's environment, also the credential probe's on Linux, so
+/// the two never disagree. Cleared, then: HOME, the trusted PATH, TMPDIR,
+/// LANG, and on Linux the session bus (`DBUS_SESSION_BUS_ADDRESS`,
+/// `XDG_RUNTIME_DIR`), which go-keyring needs to reach the Secret Service
+/// on the host. The child runs on the host, not in the sandbox.
+pub(crate) fn host_env(cmd: &mut Command, home: &Path) {
+    cmd.env_clear();
+    for (k, v) in host_env_pairs(home, &|k| std::env::var_os(k)) {
+        cmd.env(k, v);
+    }
+}
+
+fn host_env_pairs(
+    home: &Path,
+    get: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<(&'static str, std::ffi::OsString)> {
+    let mut env = vec![
+        ("HOME", home.as_os_str().to_owned()),
+        ("PATH", crate::git::TRUSTED_BIN_DIRS.join(":").into()),
+        ("TMPDIR", std::env::temp_dir().into_os_string()),
+    ];
+    let mut keep = vec!["LANG"];
+    if cfg!(target_os = "linux") {
+        keep.extend(["DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR"]);
+    }
+    env.extend(keep.into_iter().filter_map(|k| get(k).map(|v| (k, v))));
+    env
 }
 
 /// One client connection: the id line, then JSON-RPC lines both ways until
@@ -464,7 +535,6 @@ pub(crate) fn serve(shared: &Shared, stream: UnixStream) {
 
 #[cfg(test)]
 // Most of these need the macOS-only runtime.
-#[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
 mod tests {
     use super::*;
     use crate::mcp_broker::test_util::*;
@@ -478,6 +548,29 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use serde_json::Value;
+
+    #[test]
+    fn the_host_child_keeps_the_session_bus_on_linux_only() {
+        let get = |k: &str| {
+            matches!(
+                k,
+                "DBUS_SESSION_BUS_ADDRESS" | "XDG_RUNTIME_DIR" | "LANG" | "SECRET"
+            )
+            .then(|| std::ffi::OsString::from(format!("v-{k}")))
+        };
+        let env = host_env_pairs(Path::new("/home/u"), &get);
+        let names: Vec<&str> = env.iter().map(|(k, _)| *k).collect();
+        assert!(
+            names.contains(&"HOME") && names.contains(&"LANG"),
+            "{names:?}"
+        );
+        assert!(
+            !names.contains(&"SECRET"),
+            "nothing else from cplt's env: {names:?}"
+        );
+        let bus = names.contains(&"DBUS_SESSION_BUS_ADDRESS") && names.contains(&"XDG_RUNTIME_DIR");
+        assert_eq!(bus, cfg!(target_os = "linux"), "{names:?}");
+    }
 
     #[test]
     fn kill_terminates_and_never_signals_a_reaped_child() {
@@ -507,7 +600,6 @@ mod tests {
         assert!(matches!(c.lock().unwrap().try_wait(), Ok(Some(_))));
     }
 
-    #[cfg(target_os = "macos")]
     fn cat_broker() -> Broker {
         let mut spec = check(base()).unwrap();
         spec.command = vec!["cat".into()];
@@ -515,16 +607,16 @@ mod tests {
         Broker::start(vec![spec], Path::new("/tmp"), Log { file: None }).unwrap()
     }
 
-    #[cfg(target_os = "macos")]
     fn connect(b: &Broker) -> (UnixStream, BufReader<UnixStream>) {
         let mut s = UnixStream::connect(b.socket()).unwrap();
         writeln!(s, "io.github.nais/nais-mcp").unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        // A hang bound, not a latency check: under the full suite a spawn can
+        // stall for seconds.
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
         let r = BufReader::new(s.try_clone().unwrap());
         (s, r)
     }
 
-    #[cfg(target_os = "macos")]
     fn wait_free(b: &Broker) {
         let server = &b.shared.servers["io.github.nais/nais-mcp"];
         let start = Instant::now();
@@ -537,7 +629,6 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_second_client_is_refused() {
         let b = cat_broker();
@@ -552,7 +643,6 @@ mod tests {
         assert!(l.contains("already has a client"), "{l}");
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn the_restart_budget_stops_respawns() {
         let b = cat_broker();
@@ -581,12 +671,10 @@ mod tests {
         assert!(Permit::take(&open).is_some());
     }
 
-    #[cfg(target_os = "macos")]
     fn sh_broker(script: &str) -> Broker {
         sh_broker_with(script, true)
     }
 
-    #[cfg(target_os = "macos")]
     fn sh_broker_with(script: &str, egress: bool) -> Broker {
         let mut spec = check(base()).unwrap();
         if !egress {
@@ -597,7 +685,6 @@ mod tests {
         Broker::start(vec![spec], Path::new("/tmp"), Log { file: None }).unwrap()
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn the_child_runs_in_root_with_a_cleared_env() {
         let b = sh_broker(
@@ -612,7 +699,6 @@ mod tests {
         assert_eq!(v["result"]["pp"], "none", "{l}");
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn no_child_after_stop() {
         let b = cat_broker();
@@ -635,7 +721,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn no_egress_hosts_no_listener() {
         let script = r#"read l; printf '{"jsonrpc":"2.0","id":1,"result":{"p":"%s"}}\n' "$HTTPS_PROXY"; cat >/dev/null"#;
