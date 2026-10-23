@@ -20,12 +20,10 @@ fn hex(bytes: &[u8]) -> String {
 
 fn path(home: &Path, project: &Path, topic: &str) -> PathBuf {
     let project = std::fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf());
-    home.join(crate::sandbox::CPLT_STATE_DIR)
-        .join("launch")
-        .join(format!(
-            "{}-{topic}",
-            &hex(project.to_string_lossy().as_bytes())[..32]
-        ))
+    crate::sandbox::cplt_state_file(home, "launch").join(format!(
+        "{}-{topic}",
+        &hex(project.to_string_lossy().as_bytes())[..32]
+    ))
 }
 
 /// True when `content` differs from what was recorded for `topic` in this
@@ -47,6 +45,10 @@ pub fn changed(home: &Path, project: &Path, topic: &str, content: &str) -> bool 
 mod tests {
     #[test]
     fn changed_once_then_quiet_per_project_and_topic() {
+        crate::with_env_lock_no_xdg(inner);
+    }
+
+    fn inner() {
         let home = tempfile::tempdir().unwrap();
         let (a, b) = (home.path().join("a"), home.path().join("b"));
         assert!(super::changed(home.path(), &a, "t", "x"));

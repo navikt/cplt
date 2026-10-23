@@ -47,8 +47,41 @@ pub const DENIED_DOTFILES: &[&str] = &[
     NAV_PILOT_STATE_DIR,
 ];
 
-/// cplt's own state directory, relative to `$HOME`.
+/// cplt's legacy state directory, relative to `$HOME`. Still denied: state
+/// written before #830 lives here, and [`cplt_state_file`] still reads it.
 pub const CPLT_STATE_DIR: &str = ".config/cplt";
+
+/// cplt's state directory: `$XDG_CONFIG_HOME/cplt` when `XDG_CONFIG_HOME` is
+/// absolute, else `~/.config/cplt` — the root the MCP broker spec reader uses
+/// (#830). `config.toml` does not move: it stays at `CPLT_CONFIG` or
+/// `~/.config/cplt/config.toml`, which nav-pilot mirrors.
+#[must_use]
+pub fn cplt_state_dir(home: &Path) -> PathBuf {
+    crate::opencode_v2::xdg_base("XDG_CONFIG_HOME", home, ".config").join("cplt")
+}
+
+/// `name` in [`cplt_state_dir`], or in the legacy `~/.config/cplt` when only
+/// that copy exists, so state from before #830 keeps working.
+#[must_use]
+pub fn cplt_state_file(home: &Path, name: &str) -> PathBuf {
+    let new = cplt_state_dir(home).join(name);
+    let old = home.join(CPLT_STATE_DIR).join(name);
+    if !new.exists() && old.exists() {
+        old
+    } else {
+        new
+    }
+}
+
+/// Every directory holding cplt state: the config dir (`CPLT_CONFIG` can move
+/// it), the resolved state root, and the legacy root.
+fn cplt_state_dirs(home: &Path) -> [Option<PathBuf>; 3] {
+    [
+        config::config_dir(),
+        Some(cplt_state_dir(home)),
+        Some(home.join(CPLT_STATE_DIR)),
+    ]
+}
 
 /// nav-pilot's state directory, relative to `$HOME`.
 pub const NAV_PILOT_STATE_DIR: &str = ".nav-pilot";
@@ -178,7 +211,7 @@ pub fn denied_dotfile_dir(home: &Path, path: &Path) -> Option<&'static str> {
 pub fn cplt_state_dir_grant(home: &Path, path: &Path) -> Option<PathBuf> {
     let canon = resolver(home);
     let resolved = canon(path);
-    [config::config_dir(), Some(home.join(CPLT_STATE_DIR))]
+    cplt_state_dirs(home)
         .into_iter()
         .flatten()
         .find(|dir| resolved.starts_with(canon(dir)) || path.starts_with(dir))
@@ -437,7 +470,7 @@ fn overlaps_credential_entry(home: &Path, target: &Path, own: &Path) -> bool {
         .iter()
         .chain(DENIED_FILES)
         .any(|d| overlaps(canon(&home.join(d))))
-        || [config::config_dir(), Some(home.join(CPLT_STATE_DIR))]
+        || cplt_state_dirs(home)
             .into_iter()
             .flatten()
             .any(|dir| overlaps(canon(&dir)))
@@ -4760,6 +4793,39 @@ mod tests {
     }
 
     use super::*;
+
+    /// #830: the state root follows an absolute `XDG_CONFIG_HOME`, falls
+    /// back to `~/.config/cplt`, and reads a legacy file when only it exists.
+    #[test]
+    fn cplt_state_dir_follows_xdg_with_legacy_fallback() {
+        let home = tempfile::tempdir().unwrap();
+        let xdg = tempfile::tempdir().unwrap();
+        let h = home.path();
+        let legacy = h.join(CPLT_STATE_DIR);
+        temp_env::with_var_unset("XDG_CONFIG_HOME", || {
+            assert_eq!(cplt_state_dir(h), legacy);
+        });
+        temp_env::with_var("XDG_CONFIG_HOME", Some("relative"), || {
+            assert_eq!(cplt_state_dir(h), legacy);
+        });
+        temp_env::with_vars(
+            [("XDG_CONFIG_HOME", Some(xdg.path())), ("CPLT_CONFIG", None)],
+            || {
+                let new = xdg.path().join("cplt");
+                assert_eq!(cplt_state_dir(h), new);
+                assert_eq!(cplt_state_file(h, "f"), new.join("f"));
+                std::fs::create_dir_all(&legacy).unwrap();
+                std::fs::write(legacy.join("f"), "").unwrap();
+                assert_eq!(cplt_state_file(h, "f"), legacy.join("f"));
+                std::fs::create_dir_all(&new).unwrap();
+                std::fs::write(new.join("f"), "").unwrap();
+                assert_eq!(cplt_state_file(h, "f"), new.join("f"));
+                // Never-grant covers both roots.
+                assert!(cplt_state_dir_grant(h, &new.join("x")).is_some());
+                assert!(cplt_state_dir_grant(h, &legacy.join("x")).is_some());
+            },
+        );
+    }
 
     /// The read grant follows gh's own lookup order, not a fixed ~/.config/gh.
     #[test]

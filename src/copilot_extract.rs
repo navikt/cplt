@@ -4,14 +4,14 @@
 //! into the platform cache on first run. The sandbox denies writes to that cache,
 //! so `cplt` has to force the extraction before entering it (#166).
 
-use cplt::sandbox::{CPLT_STATE_DIR, CacheEnv, copilot_pkg_dir, process_env};
+use cplt::sandbox::{CacheEnv, copilot_pkg_dir, cplt_state_file, process_env};
 use cplt::ui;
 use std::path::Path;
 use std::path::PathBuf;
 
 /// Copilot's SEA extraction directory for this platform, resolved the way
-/// Copilot resolves it (`copilot_pkg_dir`, #374), plus the directory that
-/// holds cplt's `copilot-extracted` fast-path marker.
+/// Copilot resolves it (`copilot_pkg_dir`, #374), plus the path of
+/// cplt's `copilot-extracted` fast-path marker.
 ///
 /// The marker lives in cplt's state directory, which the sandbox denies
 /// outright (`DENIED_DOTFILES`), not in `~/Library/Caches/cplt` or
@@ -30,7 +30,7 @@ fn copilot_cache_dirs(
     };
     Ok((
         copilot_pkg_dir(env, home, std::env::consts::OS)?.join(format!("{platform}-{arch}")),
-        home.join(CPLT_STATE_DIR),
+        cplt_state_file(home, "copilot-extracted"),
     ))
 }
 
@@ -96,7 +96,7 @@ pub fn ensure_copilot_extracted(
     // A cache variable cplt refuses (#374) is an error here too. `prepare`
     // has already stopped on one in a writable tree; this catches the unsafe
     // kind for any caller that did not go through it.
-    let (pkg_base, cache_dir) = copilot_cache_dirs(&process_env, home, arch)?;
+    let (pkg_base, cache_file) = copilot_cache_dirs(&process_env, home, arch)?;
 
     // Compute binary identity for the fast-path cache.
     // Works for any file type: Mach-O binary (Homebrew), node/shell wrapper (npm).
@@ -108,7 +108,6 @@ pub fn ensure_copilot_extracted(
     // identity and the verdict from the last successful run: the extraction
     // directory, or `NOT_NEEDED`. Either is re-checked against the disk, so a
     // marker that no longer matches only costs a fresh preflight.
-    let cache_file = cache_dir.join("copilot-extracted");
     if let Some(ref bid) = binary_id
         && let Ok(Some(cached)) = cplt::untrusted::read_untrusted(&cache_file, 64 * 1024)
     {
@@ -181,7 +180,9 @@ pub fn ensure_copilot_extracted(
         if let Some(verdict) = verdict {
             // Persist the verdict against the binary identity.
             if let Some(ref bid) = binary_id {
-                let _ = std::fs::create_dir_all(&cache_dir);
+                if let Some(dir) = cache_file.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
                 let _ = std::fs::write(&cache_file, format!("{bid}\n{verdict}"));
             }
             return Ok(());
@@ -932,7 +933,10 @@ mod copilot_extraction_tests {
         }
 
         fn run(&self) -> Result<(), String> {
-            ensure_copilot_extracted(&self.bin, &self.home, &self.project)
+            // #830: the marker path reads XDG_CONFIG_HOME; keep it in the fixture.
+            temp_env::with_var_unset("XDG_CONFIG_HOME", || {
+                ensure_copilot_extracted(&self.bin, &self.home, &self.project)
+            })
         }
 
         fn complete_dir(&self, name: &str) {
@@ -956,10 +960,9 @@ mod copilot_extraction_tests {
                 "aarch64" => "arm64",
                 _ => "x64",
             };
-            copilot_cache_dirs(&|_| None, &self.home, arch)
-                .unwrap()
-                .1
-                .join("copilot-extracted")
+            temp_env::with_var_unset("XDG_CONFIG_HOME", || {
+                copilot_cache_dirs(&|_| None, &self.home, arch).unwrap().1
+            })
         }
 
         fn entries(&self) -> Vec<String> {
@@ -1027,7 +1030,9 @@ mod copilot_extraction_tests {
     fn marker_lives_in_the_sandbox_denied_state_dir() {
         let f = fixture("marker-dir", COUNTS_NEVER_EXTRACTS);
         assert!(f.run().is_ok());
-        assert!(f.cache_file().starts_with(f.home.join(CPLT_STATE_DIR)));
+        let state =
+            temp_env::with_var_unset("XDG_CONFIG_HOME", || cplt::sandbox::cplt_state_dir(&f.home));
+        assert!(f.cache_file().starts_with(state));
         assert!(f.cache_file().exists());
     }
 

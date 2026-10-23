@@ -2659,7 +2659,17 @@ fn emit_deny_rules(sb: &mut String, config: &SandboxConfig, home: &str) {
         }
         spellings(&named, &target)
     };
-    let dirs: Vec<Vec<String>> = DENIED_DOTFILES.iter().map(|d| spell(d, true)).collect();
+    // cplt's resolved state root (`$XDG_CONFIG_HOME/cplt`, #830) next to the
+    // legacy `~/.config/cplt` entry; an absolute path survives `home.join`.
+    let state = crate::sandbox::cplt_state_dir(Path::new(home));
+    let dirs: Vec<Vec<String>> = DENIED_DOTFILES
+        .iter()
+        .map(|d| spell(d, true))
+        .chain(
+            (state != Path::new(home).join(crate::sandbox::CPLT_STATE_DIR))
+                .then(|| spell(&state.to_string_lossy(), false)),
+        )
+        .collect();
     // Hard-denied files, then the credential files inside allowed tool dirs
     // (the latter overridable with --allow-read, so no warning).
     // `sandbox.protect_pnpm_config` adds pnpm's token files, absolute paths
@@ -4107,6 +4117,24 @@ mod tests {
                     "(allow file-read* (literal \"/Users/test/{rel}\"))"
                 )),
                 "{rel} is not in the shared list and must not be granted"
+            );
+        }
+    }
+
+    /// #830: both cplt state roots are denied for write — the resolved
+    /// `$XDG_CONFIG_HOME/cplt` and the legacy `~/.config/cplt`.
+    #[test]
+    fn profile_denies_both_cplt_state_roots() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let p = temp_env::with_vars(
+            [("XDG_CONFIG_HOME", Some("/xdg")), ("CPLT_CONFIG", None)],
+            || generate_profile(&test_options(project, home), &[]),
+        );
+        for dir in ["/xdg/cplt", "/Users/test/.config/cplt"] {
+            assert!(
+                p.contains(&format!("(deny file-write* (subpath \"{dir}\"))")),
+                "{dir} must be write-denied"
             );
         }
     }
