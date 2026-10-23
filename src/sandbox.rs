@@ -3815,6 +3815,7 @@ mod tests {
                 env: Vec::new(),
                 port: 50123,
                 model: Err(()),
+                tui: Vec::new(),
                 sbpl_before_denies: String::new(),
                 sbpl: grant.clone(),
             })
@@ -3841,6 +3842,7 @@ mod tests {
             env: Vec::new(),
             port: 50123,
             model: Err(()),
+            tui: Vec::new(),
             hidden: Vec::new(),
             reads: Vec::new(),
             writes: vec![history.clone()],
