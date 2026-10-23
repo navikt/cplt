@@ -5712,7 +5712,7 @@ except Exception as e:
         let profile = generate_profile(&opts, &[]);
 
         assert!(
-            profile.contains("(allow network-outbound (remote ip \"localhost:45123\"))"),
+            profile.contains("(allow network-outbound (remote tcp \"localhost:45123\"))"),
             "proxy-forced profile must pin outbound to localhost:45123, got:\n{profile}"
         );
         assert!(
