@@ -17,6 +17,7 @@ pub mod gh_proxy;
 pub mod git;
 pub mod github_mcp;
 pub mod gradle_init;
+pub mod host_fix;
 pub mod init;
 pub mod launch_state;
 pub mod link;

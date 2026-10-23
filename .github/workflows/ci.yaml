@@ -444,7 +444,108 @@ jobs:
           fi
           bwrap --unshare-user --unshare-pid --ro-bind / / --proc /proc --dev /dev --tmpfs /tmp /bin/true
 
-      - name: Run the MCP broker e2e
+      - name: Install a session bus
+        run: sudo apt-get install -y dbus
+
+      - name: Run the MCP broker e2e under a real session bus
+        env:
+          CPLT_TEST_REQUIRE_SANDBOX: "1"
+          CPLT_TEST_REQUIRE_SESSION_BUS: "1"
+        run: |
+          # A path socket outside /tmp, so the bus masks are what hides it,
+          # not the private /tmp.
+          sed "s|<listen>.*</listen>|<listen>unix:path=$HOME/cplt-ci-session-bus</listen>|" \
+            /usr/share/dbus-1/session.conf > "$RUNNER_TEMP/session.conf"
+          cargo build --test mcp_broker
+          dbus-run-session --config-file="$RUNNER_TEMP/session.conf" -- \
+            sh -c 'echo "bus: $DBUS_SESSION_BUS_ADDRESS"; cargo test --test mcp_broker -- --nocapture'
+
+  # `cplt doctor --fix` (#841) on a stock 24.04 runner: the AppArmor userns
+  # block is live, the fix runs through the runner's passwordless sudo in a
+  # real TTY, and every refusal runs nothing.
+  # `profile`: own writes /etc/apparmor.d/bwrap; shipped puts Ubuntu's
+  # bwrap-userns-restrict (apparmor-profiles) in /etc/apparmor.d first, so
+  # the fix loads that one. Both end with the broker e2e.
+  doctor-fix-e2e:
+    if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base != null
+    name: doctor-fix-e2e-${{ matrix.profile }}
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [own, shipped]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # ratchet:actions/checkout@v7.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # ratchet:dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94"
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # ratchet:actions/cache@v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-24.04-doctor-fix-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ubuntu-24.04-doctor-fix-cargo-
+
+      - name: Build cplt
+        run: cargo build
+
+      - name: Install bubblewrap and assert the userns block is live
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          test "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = 1
+          if bwrap --unshare-user --ro-bind / / /bin/true; then
+            echo "::error::bwrap --unshare-user works before the fix; nothing to test"
+            exit 1
+          fi
+          echo "userns block live: bwrap --unshare-user fails"
+          if [ "${{ matrix.profile }}" = shipped ]; then
+            sudo apt-get install -y apparmor-profiles
+            sudo cp /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/
+          fi
+          ls -l /etc/apparmor.d/ | grep -i bwrap || echo "no bwrap profile in /etc/apparmor.d"
+          bwrap --unshare-user --ro-bind / / /bin/true 2>/dev/null && { echo "::error::unblocked before the fix"; exit 1; } || true
+
+      - name: Refusals print the commands and run nothing
+        run: |
+          set -u
+          cplt="$PWD/target/debug/cplt"
+          blocked() { ! bwrap --unshare-user --ro-bind / / /bin/true 2>/dev/null; }
+          check() { # name, output
+            echo "--- $1"; echo "$2" | tail -40
+            echo "$2" | grep -q '/usr/bin/sudo /usr/sbin/apparmor_parser -r /etc/apparmor.d/bwrap' || { echo "::error::$1: commands not shown"; exit 1; }
+            echo "$2" | grep -q "Not offering to run it" || { echo "::error::$1: no refusal"; exit 1; }
+            echo "$2" | grep -q "Fix now?" && { echo "::error::$1: it asked"; exit 1; }
+            blocked || { echo "::error::$1: the fix ran"; exit 1; }
+          }
+          check "--yes in a TTY" "$(printf 'y\n' | env -u CI script -q -e -c "$cplt --yes doctor --fix" /dev/null 2>&1 || true)"
+          check "non-TTY" "$(printf 'y\n' | env -u CI "$cplt" doctor --fix 2>&1 || true)"
+          check "--print-profile" "$(printf 'y\n' | env -u CI script -q -e -c "$cplt --print-profile doctor --fix" /dev/null 2>&1 || true)"
+          check "CI set" "$(printf 'y\n' | CI=true script -q -e -c "$cplt doctor --fix" /dev/null 2>&1 || true)"
+          check "inside cplt" "$(printf 'y\n' | env -u CI __CPLT_WRAPPED=1 script -q -e -c "$cplt doctor --fix" /dev/null 2>&1 || true)"
+
+      - name: doctor --fix in a real TTY applies the fix
+        run: |
+          out="$(printf 'y\n' | env -u CI script -q -e -c "$PWD/target/debug/cplt doctor --fix" /dev/null 2>&1 || true)"
+          echo "$out" | tail -40
+          echo "$out" | grep -q "Fix now?" || { echo "::error::not offered"; exit 1; }
+          echo "$out" | grep -q "Fixed: bubblewrap now starts." || { echo "::error::re-check did not pass"; exit 1; }
+          # The diagnosis after the fix is the fixed host's.
+          after="$(echo "$out" | sed -n '/Fixed: bubblewrap now starts./,$p')"
+          echo "$after" | grep -q "probe fails" && { echo "::error::the re-diagnosis still reports the bwrap failure"; exit 1; }
+          echo "$after" | grep -qi "bubblewrap" || { echo "::error::no re-diagnosis after the fix"; exit 1; }
+          echo "re-diagnosis after the fix:"; echo "$after" | grep -i "bubblewrap"
+          bwrap --unshare-user --ro-bind / / /bin/true
+          echo "after the fix: bwrap --unshare-user succeeds"
+
+      - name: The MCP broker works after the fix
         env:
           CPLT_TEST_REQUIRE_SANDBOX: "1"
         run: cargo test --test mcp_broker -- --nocapture
@@ -673,7 +774,7 @@ jobs:
   ci-ok:
     name: ci-ok
     if: ${{ always() }}
-    needs: [pr-body-check, unit-tests, integration-tests, opencode-v2-e2e, opencode-v2-e2e-linux, linux-integration-tests, mcp-broker-e2e]
+    needs: [pr-body-check, unit-tests, integration-tests, opencode-v2-e2e, opencode-v2-e2e-linux, linux-integration-tests, mcp-broker-e2e, doctor-fix-e2e]
     runs-on: ubuntu-latest
     # Body-edit runs wait for the code run's tests (CI_OK_WAIT_SECONDS below).
     timeout-minutes: 30
@@ -696,7 +797,7 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           CI_OK_WAIT_SECONDS: "1500"
           BODY_RESULT: ${{ needs.pr-body-check.result }}
-          CODE_RESULTS: ${{ format('{0},{1},{2},{3},{4},{5}', needs.unit-tests.result, needs.integration-tests.result, needs.opencode-v2-e2e.result, needs.opencode-v2-e2e-linux.result, needs.linux-integration-tests.result, needs.mcp-broker-e2e.result) }}
+          CODE_RESULTS: ${{ format('{0},{1},{2},{3},{4},{5},{6}', needs.unit-tests.result, needs.integration-tests.result, needs.opencode-v2-e2e.result, needs.opencode-v2-e2e-linux.result, needs.linux-integration-tests.result, needs.mcp-broker-e2e.result, needs.doctor-fix-e2e.result) }}
         run: |
           set -euo pipefail
           if [ "$EVENT_NAME" = "pull_request" ] && [ "$EVENT_ACTION" = "edited" ] && [ "$BASE_CHANGED" = "false" ]; then

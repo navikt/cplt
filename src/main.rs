@@ -898,6 +898,12 @@ QUICK START:
         /// Same as the global `--agent`, accepted after `doctor` too.
         #[arg(long, value_name = "AGENT")]
         agent: Option<String>,
+
+        /// Offer to fix what has a known host fix (installing bubblewrap,
+        /// Ubuntu's AppArmor user-namespace profile): shows the commands, asks,
+        /// runs them with sudo, then re-checks. Interactive terminals only.
+        #[arg(long)]
+        fix: bool,
     },
 
     /// Verify & explain sandbox enforcement.
@@ -4569,14 +4575,19 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // `cplt doctor` borrows &cli through resolve_context, like check above.
     #[allow(clippy::collapsible_if)]
     if matches!(&cli.command, Some(Command::Doctor { .. })) {
-        if let Some(Command::Doctor { verbose, agent }) = cli.command.take() {
+        if let Some(Command::Doctor {
+            verbose,
+            agent,
+            fix,
+        }) = cli.command.take()
+        {
             // Doctor prints its own header; resolve_context silences its
             // summary lines and "no agent" default (see `cli.doctor` there).
             if agent.is_some() {
                 cli.agent = agent;
             }
             cli.doctor = true;
-            return Ok(run_doctor(&cli, verbose));
+            return Ok(run_doctor(&cli, verbose, fix));
         }
     }
 
@@ -4701,7 +4712,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // DEPRECATED: use `cplt doctor` subcommand instead
     if cli.doctor {
         ui::warn("--doctor is deprecated, use `cplt doctor` instead");
-        return Ok(run_doctor(&cli, false));
+        return Ok(run_doctor(&cli, false, false));
     }
 
     // Resolve config, paths, and agent
@@ -6657,7 +6668,19 @@ fn assemble_sandbox(
         if found.specs.is_empty() {
             return None;
         }
-        if let Some(why) = sandbox::mcp_broker_refusal(&sandbox_config) {
+        let mut refused = sandbox::mcp_broker_refusal(&sandbox_config);
+        // A launch, not `--print-profile`: offer the host fix, then judge again.
+        if refused.is_some()
+            && !opts.inspect_only
+            && let Some(p) = cplt::host_fix::launch_problem(&sandbox_config)
+        {
+            ui::warn(refused.as_deref().unwrap_or_default());
+            let fixed = || sandbox::mcp_wrapper_error(&sandbox_config).is_none();
+            if cplt::host_fix::offer(p, resolved.yes, false, Some(home_dir), &fixed) {
+                refused = sandbox::mcp_broker_refusal(&sandbox_config);
+            }
+        }
+        if let Some(why) = refused {
             ui::warn(&format!(
                 "MCP broker off, {} left as configured: {why}.",
                 found
@@ -8327,7 +8350,7 @@ fn kernel_release() -> String {
 /// Degrades rather than errors: when the launch cannot even resolve (bad
 /// config, unsafe root), that is the one blocking finding and the header
 /// still prints.
-fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
+fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     use cplt::doctor::{self, Finding, Level};
 
     let wsl = cfg!(target_os = "linux") && agent::is_wsl();
@@ -9046,6 +9069,32 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         println!();
         discover::discover_all(&home_dir, &project_dir).print_report(&home_dir, active_agent);
         print_project_ecosystems(&project_dir);
+    }
+
+    if fix {
+        match cplt::host_fix::problem(&bubblewrap, doctor::apparmor_restricts_userns()) {
+            Some(p) => {
+                println!();
+                let fixed = || {
+                    matches!(
+                        doctor::bubblewrap_state(
+                            resolved.use_bubblewrap,
+                            resolved.scratch_dir,
+                            &sandbox_config,
+                            &launch_grants,
+                        ),
+                        doctor::Bubblewrap::Usable(_)
+                    )
+                };
+                if cplt::host_fix::offer(p, cli.yes, cli.print_profile, None, &fixed) {
+                    // Diagnose again, so the findings and the exit status
+                    // are those of the fixed host.
+                    println!();
+                    return run_doctor(cli, verbose, false);
+                }
+            }
+            None => println!("\n--fix: nothing here has an automatic fix."),
+        }
     }
 
     if doctor::exit_nonzero(&findings) {

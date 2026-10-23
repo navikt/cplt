@@ -30,6 +30,8 @@ REQUIRED_CODE_JOBS = (
     "linux-integration-tests",
     "mcp-broker-e2e-ubuntu-22.04",
     "mcp-broker-e2e-ubuntu-24.04",
+    "doctor-fix-e2e-own",
+    "doctor-fix-e2e-shipped",
 )
 
 TEMPLATE_EXAMPLE = """```markdown

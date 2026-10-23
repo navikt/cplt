@@ -550,6 +550,15 @@ pub fn apparmor_fix_text(shipped: bool) -> String {
         APPARMOR_BWRAP_FIX.to_string()
     }
 }
+/// The profile [`APPARMOR_BWRAP_FIX`] writes, exactly.
+pub const APPARMOR_BWRAP_PROFILE: &str = "abi <abi/4.0>,
+include <tunables/global>
+
+profile bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+  include if exists <local/bwrap>
+}
+";
 
 /// How to install bubblewrap where cplt looks for it.
 pub const BWRAP_INSTALL_HINT: &str = "sudo apt install bubblewrap (or your distro's package; it must land in a trusted \

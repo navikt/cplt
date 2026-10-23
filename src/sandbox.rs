@@ -2570,6 +2570,32 @@ pub fn mcp_broker_refusal(config: &SandboxConfig) -> Option<String> {
     if let Some(why) = mcp_flag_conflict(config.allow_gpg_signing, config.allow_rootless_docker) {
         return Some(why);
     }
+    let (wrapper, plan) = mcp_wrapper(config);
+    mcp_refusal_text(
+        wrapper,
+        &plan.deny_masks,
+        &plan.policy.fs_rules,
+        &mcp_bus_endpoints(),
+    )
+}
+
+/// Why the broker run's own Bubblewrap wrapper does not build here (bwrap
+/// missing, turned off, or its probe with the launch's rules failing), or
+/// `None` when it does. The re-check after a host fix.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn mcp_wrapper_error(config: &SandboxConfig) -> Option<String> {
+    mcp_wrapper(config).0.err()
+}
+
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub fn mcp_wrapper_error(_: &SandboxConfig) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn mcp_wrapper(config: &SandboxConfig) -> (Result<(), String>, BwrapPlan) {
     // Planned as the launch will be: with a broker socket, so with its masks.
     let probe_socket = Path::new("/tmp/cplt-mcp-probe/m");
     let config = &SandboxConfig {
@@ -2597,12 +2623,7 @@ pub fn mcp_broker_refusal(config: &SandboxConfig) -> Option<String> {
         )
         .map(|_| ())
     };
-    mcp_refusal_text(
-        wrapper,
-        &plan.deny_masks,
-        &plan.policy.fs_rules,
-        &mcp_bus_endpoints(),
-    )
+    (wrapper, plan)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -2728,7 +2749,7 @@ fn strip_control(s: &str) -> String {
 /// container sockets live, so a run asking for those keeps the flag and
 /// goes without the broker (#838).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn mcp_flag_conflict(gpg: bool, rootless_docker: bool) -> Option<String> {
+pub(crate) fn mcp_flag_conflict(gpg: bool, rootless_docker: bool) -> Option<String> {
     let flags: Vec<&str> = [
         (gpg, "--allow-gpg-signing"),
         (rootless_docker, "--allow-rootless-docker"),

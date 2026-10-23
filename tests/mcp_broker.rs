@@ -106,6 +106,25 @@ for line in sys.stdin:
     });
     std::fs::write(spec_dir.join("io.example__fake-mcp.json"), spec.to_string()).unwrap();
 
+    // A real session bus (CI runs this under `dbus-run-session`): reachable
+    // here on the host, the control, and hidden from the agent below.
+    let session_bus = std::env::var("DBUS_SESSION_BUS_ADDRESS")
+        .ok()
+        .and_then(|a| {
+            a.split([';', ','])
+                .find_map(|p| p.strip_prefix("unix:path=").map(str::to_string))
+        });
+    if let Some(bus) = &session_bus {
+        std::os::unix::net::UnixStream::connect(bus).unwrap_or_else(|e| {
+            panic!("control: the session bus {bus} is not reachable on the host: {e}")
+        });
+    }
+    if std::env::var("CPLT_TEST_REQUIRE_SESSION_BUS").as_deref() == Ok("1") {
+        assert!(
+            session_bus.is_some(),
+            "no unix:path= session bus in DBUS_SESSION_BUS_ADDRESS"
+        );
+    }
     let fake = fake_agent_dir("copilot");
     let agent = fake.path().join("copilot");
     // The real interpreter, not the /usr/bin/python3 stub: the stub runs
@@ -162,8 +181,11 @@ if sys.platform.startswith("linux"):
     if rt:
         print("RTBUS:" + str(reach(rt + "/bus")), flush=True)
     print("TMP:" + ",".join(sorted(os.listdir("/tmp"))), flush=True)
+    if "{session_bus}":
+        print("SESSBUS:" + str(reach("{session_bus}")), flush=True)
 "#,
-            cplt = binary_path().display()
+            cplt = binary_path().display(),
+            session_bus = session_bus.as_deref().unwrap_or("")
         ),
     )
     .unwrap();
@@ -249,6 +271,12 @@ if sys.platform.startswith("linux"):
                 stdout.contains("SYSBUS:False"),
                 "system bus reachable: {stdout}"
             );
+            if session_bus.is_some() {
+                assert!(
+                    stdout.contains("SESSBUS:False"),
+                    "the real session bus is reachable from the sandbox: {stdout}"
+                );
+            }
             if runtime.is_some() {
                 assert!(
                     stdout.contains("RTBUS:False"),
