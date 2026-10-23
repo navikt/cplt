@@ -512,7 +512,7 @@ jobs:
             echo "$2" | grep -q "Fix now?" && { echo "::error::$1: it asked"; exit 1; }
             blocked || { echo "::error::$1: the fix ran"; exit 1; }
           }
-          check "--yes in a TTY" "$(printf 'y\n' | env -u CI script -q -e -c "$cplt doctor --fix --yes" /dev/null 2>&1 || true)"
+          check "--yes in a TTY" "$(printf 'y\n' | env -u CI script -q -e -c "$cplt --yes doctor --fix" /dev/null 2>&1 || true)"
           check "non-TTY" "$(printf 'y\n' | env -u CI "$cplt" doctor --fix 2>&1 || true)"
           check "CI set" "$(printf 'y\n' | CI=true script -q -e -c "$cplt doctor --fix" /dev/null 2>&1 || true)"
           check "inside cplt" "$(printf 'y\n' | env -u CI __CPLT_WRAPPED=1 script -q -e -c "$cplt doctor --fix" /dev/null 2>&1 || true)"
