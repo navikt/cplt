@@ -517,7 +517,9 @@ pub(crate) fn serve(shared: &Shared, stream: UnixStream) {
         })
     };
 
-    // Deadline: once a second, time out requests past CALL_TIMEOUT.
+    // Deadline: about ten times a second, time out requests past
+    // CALL_TIMEOUT. Written under the pending lock, so a reused id never
+    // gets the stale error.
     let done = Arc::new(AtomicBool::new(false));
     let ticker = {
         let (client, stdin, pending, done) = (
@@ -529,16 +531,17 @@ pub(crate) fn serve(shared: &Shared, stream: UnixStream) {
         let (log, id) = (shared.log.clone(), spec.id.clone());
         std::thread::spawn(move || {
             while !done.load(Ordering::Acquire) {
-                std::thread::sleep(Duration::from_secs(1));
-                let expired = match pending.lock() {
-                    Ok(mut p) => p.evict(CALL_TIMEOUT),
-                    Err(_) => break,
-                };
-                for (error, cancel) in expired {
+                let Ok(mut p) = pending.lock() else { break };
+                for (error, cancel) in p.evict(CALL_TIMEOUT) {
                     log.line(&id, "FAIL request timed out");
                     write_line(&client, &error);
                     write_line(&stdin, &cancel);
                 }
+                drop(p);
+                if done.load(Ordering::Acquire) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
             }
         })
     };

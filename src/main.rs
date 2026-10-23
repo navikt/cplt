@@ -3805,12 +3805,14 @@ struct DomainAllowlistDecision {
 }
 
 /// An empty 0700 dir standing in for the project when `cplt mcp status`
-/// runs where a launch would refuse (home, `/`). Removed on drop.
-struct NeutralProject(PathBuf);
+/// runs where a launch would refuse (home, `/`). Random name, removed on drop.
+struct NeutralProject {
+    _dir: tempfile::TempDir,
+    path: PathBuf,
+}
 
 impl NeutralProject {
     fn if_needed() -> anyhow::Result<Option<Self>> {
-        use std::os::unix::fs::DirBuilderExt;
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_default();
@@ -3821,18 +3823,12 @@ impl NeutralProject {
         if !cplt::is_unsafe_root(&root, &home) {
             return Ok(None);
         }
-        let dir = std::env::temp_dir().join(format!("cplt-mcp-status-{}", std::process::id()));
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&dir)
-            .with_context(|| format!("cannot create {}", dir.display()))?;
-        Ok(Some(Self(std::fs::canonicalize(&dir)?)))
-    }
-}
-
-impl Drop for NeutralProject {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir(&self.0);
+        let dir = tempfile::Builder::new()
+            .prefix("cplt-mcp-status-")
+            .tempdir()
+            .context("cannot create the stand-in project for mcp status")?;
+        let path = std::fs::canonicalize(dir.path())?;
+        Ok(Some(Self { _dir: dir, path }))
     }
 }
 
@@ -4755,7 +4751,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         _ => None,
     };
     if let Some(n) = &neutral {
-        cli.project_dir = Some(n.0.clone());
+        cli.project_dir = Some(n.path.clone());
     }
 
     // Resolve config, paths, and agent
