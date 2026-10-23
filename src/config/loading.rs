@@ -1953,9 +1953,7 @@ const QUIET_TIP_LAUNCHES: u32 = 3;
 /// sandbox-denied, so the agent cannot reset or silence the count. A read or
 /// write failure shows the tip: it is advice, and a missing file is a new user.
 fn quiet_tip_due(home: &Path) -> bool {
-    let file = home
-        .join(crate::sandbox::CPLT_STATE_DIR)
-        .join("quiet-tip-shown");
+    let file = crate::sandbox::cplt_state_file(home, "quiet-tip-shown");
     let shown: u32 = std::fs::read_to_string(&file)
         .ok()
         .and_then(|s| s.trim().parse().ok())

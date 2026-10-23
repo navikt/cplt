@@ -4,7 +4,7 @@
 //! into the platform cache on first run. The sandbox denies writes to that cache,
 //! so `cplt` has to force the extraction before entering it (#166).
 
-use cplt::sandbox::{CPLT_STATE_DIR, CacheEnv, copilot_pkg_dir, process_env};
+use cplt::sandbox::{CacheEnv, copilot_pkg_dir, cplt_state_dir, process_env};
 use cplt::ui;
 use std::path::Path;
 use std::path::PathBuf;
@@ -30,7 +30,7 @@ fn copilot_cache_dirs(
     };
     Ok((
         copilot_pkg_dir(env, home, std::env::consts::OS)?.join(format!("{platform}-{arch}")),
-        home.join(CPLT_STATE_DIR),
+        cplt_state_dir(home),
     ))
 }
 
@@ -1027,7 +1027,7 @@ mod copilot_extraction_tests {
     fn marker_lives_in_the_sandbox_denied_state_dir() {
         let f = fixture("marker-dir", COUNTS_NEVER_EXTRACTS);
         assert!(f.run().is_ok());
-        assert!(f.cache_file().starts_with(f.home.join(CPLT_STATE_DIR)));
+        assert!(f.cache_file().starts_with(cplt_state_dir(&f.home)));
         assert!(f.cache_file().exists());
     }
 

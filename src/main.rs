@@ -5100,9 +5100,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     let opencode_stores = (active_agent == agent::Agent::OpenCode).then(|| {
         audit::SnapshotStores::capture(
             cplt::opencode_v2::snapshot_root(&home_dir),
-            home_dir
-                .join(cplt::sandbox::CPLT_STATE_DIR)
-                .join("opencode-snapshot-clean"),
+            cplt::sandbox::cplt_state_file(&home_dir, "opencode-snapshot-clean"),
         )
     });
     let (exit_code, snapshot, settled) = audit::run(
