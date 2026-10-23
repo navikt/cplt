@@ -3575,7 +3575,20 @@ mod tests {
             let bin = dir.path().join("opencode");
             let count = dir.path().join("count");
             let script = format!("#!/bin/sh\necho x >> {}\n{body}\n", count.display());
-            std::fs::write(&bin, script).unwrap();
+            // Written in-process, the script would be open for writing while
+            // other test threads fork; a fork in that window inherits the
+            // descriptor and the exec fails ETXTBSY. `cp` gives `bin` an inode
+            // whose only writable descriptor lives in the child (as in
+            // discover.rs `fake_binary`).
+            let staging = dir.path().join("opencode.staging");
+            std::fs::write(&staging, script).unwrap();
+            #[allow(clippy::disallowed_methods)] // absolute: other tests swap PATH
+            let copied = std::process::Command::new("/bin/cp")
+                .arg(&staging)
+                .arg(&bin)
+                .status()
+                .unwrap();
+            assert!(copied.success(), "cp of the fake binary failed: {copied}");
             std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
             let home = dir.path().join("home");
             let mut timeouts = Vec::new();
@@ -3593,8 +3606,10 @@ mod tests {
                     "{name}: one retry"
                 );
             }
-            let state = home.join(crate::sandbox::CPLT_STATE_DIR);
-            assert!(!state.join("opencode-version").exists(), "{name}: cached");
+            let cache = crate::with_env_lock_no_xdg(|| {
+                crate::sandbox::cplt_state_file(&home, "opencode-version")
+            });
+            assert!(!cache.exists(), "{name}: cached");
         }
         // A 1.x answer is unchanged.
         let dir = tempfile::tempdir().unwrap();
