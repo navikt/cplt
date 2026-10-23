@@ -1092,17 +1092,26 @@ mod e2e_tests {
 
     #[test]
     fn e2e_print_profile_allow_write() {
-        let allow_dir =
-            std::env::temp_dir().join(format!("cplt-e2e-allow-write-{}", std::process::id()));
+        print_profile_grants_write("--allow-write");
+    }
+
+    /// `--allow-write-state` differs only in the exit audit; the grant is the same.
+    #[test]
+    fn e2e_print_profile_allow_write_state() {
+        print_profile_grants_write("--allow-write-state");
+    }
+
+    fn print_profile_grants_write(flag: &str) {
+        let allow_dir = std::env::temp_dir().join(format!(
+            "cplt-e2e{}-{}",
+            flag.trim_start_matches('-'),
+            std::process::id()
+        ));
         std::fs::create_dir_all(&allow_dir).unwrap();
         let allow_dir_canonical = std::fs::canonicalize(&allow_dir).unwrap();
 
         let output = cplt_cmd()
-            .args([
-                "--allow-write",
-                &allow_dir.to_string_lossy(),
-                "--print-profile",
-            ])
+            .args([flag, &allow_dir.to_string_lossy(), "--print-profile"])
             .current_dir(project_dir())
             .output()
             .expect("binary should run");
@@ -1115,11 +1124,11 @@ mod e2e_tests {
         assert!(output.status.success());
         assert!(
             stdout.contains(&format!("(allow file-read* (subpath \"{allow_str}\"))")),
-            "--allow-write should grant read.\nstdout: {stdout}"
+            "{flag} should grant read.\nstdout: {stdout}"
         );
         assert!(
             stdout.contains(&format!("(allow file-write* (subpath \"{allow_str}\"))")),
-            "--allow-write should grant write.\nstdout: {stdout}"
+            "{flag} should grant write.\nstdout: {stdout}"
         );
     }
 

@@ -276,6 +276,13 @@ struct Cli {
     #[arg(long = "allow-write", value_name = "PATH")]
     allow_write: Vec<PathBuf>,
 
+    /// Like --allow-write, for a tool's own state (caches, session stores).
+    /// The grant is identical; the exit audit leaves these paths out of its
+    /// "writable paths NOT audited" warning, and --verbose lists them as tool
+    /// state instead. Can be specified multiple times.
+    #[arg(long = "allow-write-state", value_name = "PATH")]
+    allow_write_state: Vec<PathBuf>,
+
     /// DANGEROUS: let the agent execute binaries from a tree outside the
     /// default tool directories, e.g. a relocated Homebrew or toolchain prefix.
     /// Grants read + execute, never write. Refused for an unsafe root (/, /tmp,
@@ -1692,6 +1699,15 @@ fn prompt_confirm(auto_yes: bool, quiet: bool) -> Result<(), String> {
     }
 }
 
+/// The `--allow-write-state` grants, resolved the way `resolve_context` adds
+/// them to `allow_write`, so the audit can tell them apart (it warns there).
+fn write_state_paths(cli: &Cli) -> Vec<PathBuf> {
+    cli.allow_write_state
+        .iter()
+        .filter_map(|p| std::fs::canonicalize(p).ok())
+        .collect()
+}
+
 /// Canonicalize a list of allow paths, warning on failures and dropping one
 /// whose spelling takes a symlink into a credential (#551).
 fn canonicalize_paths(paths: &[PathBuf], flag_name: &str) -> Vec<PathBuf> {
@@ -2744,7 +2760,11 @@ fn warn_unlinked_child_repos(home_dir: &Path, project_dir: &Path, named_roots: &
 fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContext> {
     // Canonicalize CLI paths for consistency with config path handling
     let cli_allow_read = canonicalize_paths(&cli.allow_read, "--allow-read");
-    let cli_allow_write = canonicalize_paths(&cli.allow_write, "--allow-write");
+    let mut cli_allow_write = canonicalize_paths(&cli.allow_write, "--allow-write");
+    cli_allow_write.extend(canonicalize_paths(
+        &cli.allow_write_state,
+        "--allow-write-state",
+    ));
     let cli_allow_exec = canonicalize_paths(&cli.allow_exec, "--allow-exec");
     let cli_allow_socket = canonicalize_paths(&cli.allow_socket, "--allow-socket");
     let cli_deny_paths = canonicalize_deny_paths(&cli.deny_paths)?;
@@ -5122,6 +5142,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     let (exit_code, snapshot, settled) = audit::run(
         &project_dir,
         &resolved.allow_write,
+        &write_state_paths(&cli),
         &repo_paths,
         audit::AuditMode::for_run(audit_enabled, cli.observe_domains),
         &routing,
@@ -7182,6 +7203,7 @@ fn run_exec_command(
     let (exit_code, snapshot, settled) = audit::run(
         &project_dir,
         &resolved.allow_write,
+        &write_state_paths(cli),
         &repo_paths,
         audit::AuditMode::for_run(audit_enabled, cli.observe_domains),
         &routing,
