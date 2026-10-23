@@ -565,6 +565,14 @@ pub fn prepare_with_pnpm_shadow(
     pnpm_shadow_dir: Option<&Path>,
     inspect_only: bool,
 ) -> Result<PreparedSandbox, String> {
+    crate::env_read_lock(|| prepare_locked(config, pnpm_shadow_dir, inspect_only))
+}
+
+fn prepare_locked(
+    config: &SandboxConfig,
+    pnpm_shadow_dir: Option<&Path>,
+    inspect_only: bool,
+) -> Result<PreparedSandbox, String> {
     validate_playwright_socket_capability(config.playwright_socket_dir)?;
     validate_hard_denied_grants(config)?;
     validate_pnpm_tool_dirs(config)?;

@@ -85,6 +85,14 @@ pub fn generate_profile_with_playwright_socket_dir(
     extra_git_dirs: &[PathBuf],
     playwright_socket_dir: Option<&Path>,
 ) -> String {
+    crate::env_read_lock(|| profile_locked(config, extra_git_dirs, playwright_socket_dir))
+}
+
+fn profile_locked(
+    config: &SandboxConfig,
+    extra_git_dirs: &[PathBuf],
+    playwright_socket_dir: Option<&Path>,
+) -> String {
     let mut sb = String::with_capacity(4096);
     let home = config.home_dir.to_string_lossy();
     let project = config.project_dir.to_string_lossy();
