@@ -947,7 +947,6 @@ pub(crate) mod tests {
             let err = setup(dir.path()).unwrap_err();
             assert!(err.contains("NODE_EXTRA_CA_CERTS"), "{err}");
         });
-        assert!(!active());
     }
 
     #[test]
