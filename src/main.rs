@@ -6676,7 +6676,7 @@ fn assemble_sandbox(
         {
             ui::warn(refused.as_deref().unwrap_or_default());
             let fixed = || sandbox::mcp_wrapper_error(&sandbox_config).is_none();
-            if cplt::host_fix::offer(p, resolved.yes, Some(home_dir), &fixed) {
+            if cplt::host_fix::offer(p, resolved.yes, false, Some(home_dir), &fixed) {
                 refused = sandbox::mcp_broker_refusal(&sandbox_config);
             }
         }
@@ -9086,7 +9086,12 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
                         doctor::Bubblewrap::Usable(_)
                     )
                 };
-                cplt::host_fix::offer(p, cli.yes, None, &fixed);
+                if cplt::host_fix::offer(p, cli.yes, cli.print_profile, None, &fixed) {
+                    // Diagnose again, so the findings and the exit status
+                    // are those of the fixed host.
+                    println!();
+                    return run_doctor(cli, verbose, false);
+                }
             }
             None => println!("\n--fix: nothing here has an automatic fix."),
         }

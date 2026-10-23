@@ -122,9 +122,16 @@ pub fn steps(problem: Problem, os_release: &str, shipped: bool) -> Option<&'stat
 
 /// Why the fix is shown but not offered, or `None` when it may be offered.
 #[must_use]
-pub fn refusal(yes: bool, tty: bool, env_set: &dyn Fn(&str) -> bool) -> Option<&'static str> {
+pub fn refusal(
+    yes: bool,
+    inspect: bool,
+    tty: bool,
+    env_set: &dyn Fn(&str) -> bool,
+) -> Option<&'static str> {
     if env_set("__CPLT_WRAPPED") {
         Some("this is inside a cplt sandbox")
+    } else if inspect {
+        Some("--print-profile only inspects")
     } else if yes {
         Some("--yes is set")
     } else if env_set("CI") {
@@ -163,15 +170,15 @@ fn resolved(step: &Step, find: &dyn Fn(&str) -> Option<String>) -> Result<Vec<St
         .collect()
 }
 
-/// The commands as they will run. File content is printed by the finding
-/// or refusal above this, so it is named here, not repeated.
+/// The commands as they will run, with any file content in full: the
+/// prompt never relies on a diagnostic printed (or skipped) before it.
 fn render(steps: &[Step], find: &dyn Fn(&str) -> Option<String>) -> String {
     steps
         .iter()
         .map(|s| {
             let cmd = resolved(s, find).map_or_else(|_| s.argv.join(" "), |a| a.join(" "));
             match s.stdin {
-                Some(_) => format!("  {cmd}   (writes the profile shown above)\n"),
+                Some(body) => format!("  {cmd} >/dev/null <<'EOF'\n{body}EOF\n"),
                 None => format!("  {cmd}\n"),
             }
         })
@@ -199,12 +206,14 @@ fn decline_file(home: &std::path::Path) -> std::path::PathBuf {
 
 /// Show the fix for `problem`, and on an interactive host offer to run it,
 /// then re-check with `recheck` (the launch's own bubblewrap probe).
+/// `inspect`: `--print-profile`, which shows the commands and runs nothing.
 /// `remember`: a launch, whose "no" is remembered for this cplt version
 /// under that home, so the next launch only prints a one-line hint;
 /// `cplt doctor --fix` always asks. Returns whether the problem is gone.
 pub fn offer(
     problem: Problem,
     yes: bool,
+    inspect: bool,
     remember: Option<&std::path::Path>,
     recheck: &dyn Fn() -> bool,
 ) -> bool {
@@ -221,7 +230,7 @@ pub fn offer(
     let shipped = std::path::Path::new(SHIPPED_BWRAP_PROFILE).exists();
     let existing = std::fs::read_to_string(PROFILE_PATH).ok();
     let tty = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
-    let why = refusal(yes, tty, &|k| std::env::var_os(k).is_some());
+    let why = refusal(yes, inspect, tty, &|k| std::env::var_os(k).is_some());
     let ask = || {
         eprint!("Fix now? sudo will ask for your password. [Y/n] ");
         let _ = std::io::stderr().flush();
@@ -374,16 +383,19 @@ mod tests {
     }
 
     #[test]
-    fn commands_are_shown_absolute_and_the_file_once() {
+    fn commands_are_shown_absolute_with_the_file_in_full() {
         let text = render(APPARMOR, &fake);
         assert_eq!(
             text,
-            "  /usr/bin/sudo /usr/bin/tee /etc/apparmor.d/bwrap   (writes the profile shown above)\n  \
-             /usr/bin/sudo /usr/bin/apparmor_parser -r /etc/apparmor.d/bwrap\n"
+            format!(
+                "  /usr/bin/sudo /usr/bin/tee /etc/apparmor.d/bwrap >/dev/null <<'EOF'\n\
+                 {APPARMOR_BWRAP_PROFILE}EOF\n  \
+                 /usr/bin/sudo /usr/bin/apparmor_parser -r /etc/apparmor.d/bwrap\n"
+            )
         );
         assert!(
-            !text.contains("userns,"),
-            "the profile is printed by the finding, not here"
+            text.contains("  userns,\n"),
+            "the profile is in the prompt itself"
         );
         assert_eq!(
             render(APT, &fake),
@@ -407,13 +419,26 @@ mod tests {
     #[test]
     fn offered_only_interactively_and_on_the_host() {
         let none = |_: &str| false;
-        assert_eq!(refusal(false, true, &none), None);
-        assert!(refusal(true, true, &none).unwrap().contains("--yes"));
-        assert!(refusal(false, false, &none).unwrap().contains("terminal"));
-        assert!(refusal(false, true, &|k| k == "CI").unwrap().contains("CI"));
+        assert_eq!(refusal(false, false, true, &none), None);
+        assert!(
+            refusal(false, true, true, &none)
+                .unwrap()
+                .contains("--print-profile")
+        );
+        assert!(refusal(true, false, true, &none).unwrap().contains("--yes"));
+        assert!(
+            refusal(false, false, false, &none)
+                .unwrap()
+                .contains("terminal")
+        );
+        assert!(
+            refusal(false, false, true, &|k| k == "CI")
+                .unwrap()
+                .contains("CI")
+        );
         let sandboxed = |k: &str| k == "__CPLT_WRAPPED";
         assert!(
-            refusal(false, true, &sandboxed)
+            refusal(false, false, true, &sandboxed)
                 .unwrap()
                 .contains("sandbox")
         );

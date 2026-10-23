@@ -527,6 +527,7 @@ jobs:
           }
           check "--yes in a TTY" "$(printf 'y\n' | env -u CI script -q -e -c "$cplt --yes doctor --fix" /dev/null 2>&1 || true)"
           check "non-TTY" "$(printf 'y\n' | env -u CI "$cplt" doctor --fix 2>&1 || true)"
+          check "--print-profile" "$(printf 'y\n' | env -u CI script -q -e -c "$cplt --print-profile doctor --fix" /dev/null 2>&1 || true)"
           check "CI set" "$(printf 'y\n' | CI=true script -q -e -c "$cplt doctor --fix" /dev/null 2>&1 || true)"
           check "inside cplt" "$(printf 'y\n' | env -u CI __CPLT_WRAPPED=1 script -q -e -c "$cplt doctor --fix" /dev/null 2>&1 || true)"
 
@@ -536,6 +537,11 @@ jobs:
           echo "$out" | tail -40
           echo "$out" | grep -q "Fix now?" || { echo "::error::not offered"; exit 1; }
           echo "$out" | grep -q "Fixed: bubblewrap now starts." || { echo "::error::re-check did not pass"; exit 1; }
+          # The diagnosis after the fix is the fixed host's.
+          after="$(echo "$out" | sed -n '/Fixed: bubblewrap now starts./,$p')"
+          echo "$after" | grep -q "probe fails" && { echo "::error::the re-diagnosis still reports the bwrap failure"; exit 1; }
+          echo "$after" | grep -qi "bubblewrap" || { echo "::error::no re-diagnosis after the fix"; exit 1; }
+          echo "re-diagnosis after the fix:"; echo "$after" | grep -i "bubblewrap"
           bwrap --unshare-user --ro-bind / / /bin/true
           echo "after the fix: bwrap --unshare-user succeeds"
 
