@@ -1,7 +1,8 @@
 # Design: a generic MCP host broker
 
-Status: proposal, revised 2026-10-23 with the owner's decisions (section 0).
-Design only; nothing here is implemented.
+Status: phase 1 implemented (#824, #834), revised 2026-10-23 with the
+owner's decisions (section 0). Where this text and the code differ, the code
+and [SECURITY.md](../../SECURITY.md) describe what ships.
 Refs [#821](https://github.com/navikt/cplt/issues/821), [#807](https://github.com/navikt/cplt/pull/807), [#797](https://github.com/navikt/cplt/issues/797), [#820](https://github.com/navikt/cplt/issues/820).
 
 Code citations are against `origin/main` at the time of writing. Claims

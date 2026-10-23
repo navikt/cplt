@@ -1125,11 +1125,15 @@ on the host, outside the sandbox, and points your client's entry at
   the same command under another name. An entry of yours with exactly the id
   as its name is not disabled (that would turn off cplt's too); cplt relies on
   `--additional-mcp-config` taking precedence over it, which Copilot does not
-  document. OpenCode v2 gets an overlay in `OPENCODE_CONFIG_CONTENT`.
+  document. No automated test covers that precedence, since it needs a
+  logged-in Copilot CLI. OpenCode v2 gets an overlay in `OPENCODE_CONFIG_CONTENT`.
   Your config files are not changed.
 - A spec cplt refuses prints one line at launch, and the entry stays as
-  configured. `cplt mcp status --json`, run in the project, lists the specs, their
-  state and the reasons for any refusal, checked as a launch there would.
+  configured. `cplt mcp status --json` lists the specs, their
+  state and the reasons for any refusal, checked as a launch from the current
+  project would. It also works outside a project (from `~`, say), checking
+  against an empty project and reporting `"project": null`. A probe that
+  times out reports `"credential_ok": null` with `"credential_note": "timed out"`.
 
 With no spec files nothing changes. Turn the broker off with
 `sandbox.mcp_broker = false`, or turn off one server for a run with

@@ -33,6 +33,8 @@ pub const MECHANISMS: &[Credential] = &[
         command: Some(&["nais", "alpha", "mcp", "serve"]),
         probe: Some(&["auth", "print-access-token", "-n"]),
     },
+    // A server with no host login: nothing to probe, any trusted command.
+    // Not emitted by nav-pilot today; the broker e2e tests run on it.
     Credential {
         name: "none",
         command: None,
