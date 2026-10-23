@@ -25,11 +25,13 @@ pub struct Credential {
 
 /// The table.
 pub const MECHANISMS: &[Credential] = &[
-    // nais reads its own keychain item; cplt never touches it.
+    // nais reads its own keychain item; cplt never touches it. The probe
+    // needs -n: without it nais prints the gcloud token, which the MCP
+    // server does not use, so an expired gcloud login read as logged out.
     Credential {
         name: "nais-keychain",
         command: Some(&["nais", "alpha", "mcp", "serve"]),
-        probe: Some(&["auth", "print-access-token"]),
+        probe: Some(&["auth", "print-access-token", "-n"]),
     },
     Credential {
         name: "none",
@@ -86,5 +88,16 @@ pub fn credential_ok(spec: &Spec) -> Option<bool> {
             return Some(false);
         }
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nais_probe_checks_the_nais_login_not_gcloud() {
+        let m = Credential::parse("nais-keychain").unwrap();
+        assert_eq!(m.probe, Some(&["auth", "print-access-token", "-n"][..]));
     }
 }
