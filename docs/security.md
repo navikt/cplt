@@ -23,7 +23,7 @@ A compromised agent can read a granted plaintext token or a guard cache and use 
 
 This section describes the macOS Seatbelt profile; the Linux equivalents, and where they fall short, are in [Limitations](#linux) below. SBPL accepts only `*` or `localhost` as the host in a `remote ip` rule. There is no way to name an address or a range, and Copilot connects to CDN-backed endpoints whose IPs change (`api.business.githubcopilot.com`, `api.githubcopilot.com`, `proxy.business.githubcopilot.com`), so enumerating them was never an option either. What is left is the port.
 
-- Only port 443 is allowed. Every other outbound TCP port is blocked at the kernel level.
+- Only port 443 is allowed. Every other outbound TCP port is blocked at the kernel level. The rule is TCP-only, so UDP/443 (QUIC/HTTP3) is blocked too and HTTP/3 clients fall back to TCP ([#815](https://github.com/navikt/cplt/issues/815)).
 - Localhost outbound is blocked on macOS, which keeps the agent away from local services such as databases and dev servers. Landlock has no localhost pinning, so this does not hold on Linux.
 - The SSH agent is blocked on macOS. Unix socket access is denied, so loaded SSH keys cannot be used. On Linux it is not gated by Landlock below kernel 7.1; bubblewrap's private `/tmp` hides the stock OpenSSH socket, but a desktop agent under `$XDG_RUNTIME_DIR` stays reachable.
 - Filesystem isolation blocks denied credential paths. Auth credentials deliberately handed to the agent remain readable and usable within the allowed network policy.

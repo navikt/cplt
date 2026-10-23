@@ -521,7 +521,7 @@ pub fn generate_session_brief(facts: &BriefFacts) -> String {
 
 /// Can an outbound connection to port 22 leave the sandbox at all?
 ///
-/// Default egress is `*:443` only — SBPL emits one `(remote ip "*:443")`, and
+/// Default egress is `*:443` only — SBPL emits one `(remote tcp "*:443")`, and
 /// the Landlock seed is a single `NetRule { port: 443 }`. So port 22 needs an
 /// explicit `allow.ports = [22]`…
 ///

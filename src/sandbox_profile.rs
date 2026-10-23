@@ -3659,7 +3659,9 @@ fn emit_network_rules(
     // which is precisely what this mode exists to take away. `main.rs` warns
     // when the two are combined, so the narrowing is never silent.
     if !proxy_forced {
-        sbpl!(sb, "(allow network-outbound (remote ip \"*:443\"))");
+        // TCP only (#815): `remote ip` would also let UDP/443 out, i.e. QUIC/HTTP3
+        // straight past the proxy. HTTP/3 clients fall back to TCP.
+        sbpl!(sb, "(allow network-outbound (remote tcp \"*:443\"))");
 
         // Extra ports (e.g., MCP servers, custom services)
         for port in extra_ports {
@@ -3682,10 +3684,11 @@ fn emit_network_rules(
 
     // Carve-outs for specific localhost ports (proxy, MCP servers, dev servers).
     // These come AFTER the deny so they override it (last-match-wins in SBPL).
+    // The CONNECT proxy speaks TCP only (#815).
     if let Some(port) = proxy_port {
         sbpl!(
             sb,
-            "(allow network-outbound (remote ip \"localhost:{port}\"))"
+            "(allow network-outbound (remote tcp \"localhost:{port}\"))"
         );
     }
     for port in localhost_ports {
@@ -4859,7 +4862,9 @@ mod tests {
         assert!(!opts.proxy_forced);
         let p = generate_profile(&opts, &[]);
 
-        assert!(p.contains("(allow network-outbound (remote ip \"*:443\"))"));
+        assert!(p.contains("(allow network-outbound (remote tcp \"*:443\"))"));
+        // #815: must not be family-agnostic, or UDP/443 (QUIC) bypasses the proxy.
+        assert!(!p.contains("(remote ip \"*:443\")"));
     }
 
     #[test]
@@ -5011,7 +5016,7 @@ mod tests {
         let p = generate_profile(&opts, &[]);
 
         assert!(
-            p.contains("(allow network-outbound (remote ip \"localhost:8080\"))"),
+            p.contains("(allow network-outbound (remote tcp \"localhost:8080\"))"),
             "proxy_forced must pin outbound to the localhost proxy port"
         );
         assert!(
@@ -5073,7 +5078,7 @@ mod tests {
             "proxy_forced must not emit a direct remote path for an extra port"
         );
         assert!(
-            forced.contains("(allow network-outbound (remote ip \"localhost:8080\"))"),
+            forced.contains("(allow network-outbound (remote tcp \"localhost:8080\"))"),
             "proxy_forced still pins egress to the localhost proxy port"
         );
     }

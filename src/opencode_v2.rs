@@ -471,7 +471,7 @@ fn profile_tail(
         "\n;; OpenCode v2 session service (#710)\n\
          (deny file-read* file-write*{})\n\
          (deny file-write-unlink{})\n\
-         (allow network-outbound (remote ip \"localhost:{port}\"))\n",
+         (allow network-outbound (remote tcp \"localhost:{port}\"))\n",
         lit(&denied),
         lit(&pinned),
     );
@@ -1163,7 +1163,7 @@ mod tests {
         {
             assert!(
                 s.sbpl
-                    .contains(&format!("(remote ip \"localhost:{port}\")"))
+                    .contains(&format!("(remote tcp \"localhost:{port}\")"))
             );
             assert!(!s.sbpl.contains("49374"));
             let home = tmp.path().display();
