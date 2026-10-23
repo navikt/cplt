@@ -17,11 +17,11 @@ marked **(unverified)** were not checked against source or by running them.
 | D4 | Spec format | Built from standard MCP `server.json` fields; only what the spec lacks goes in a namespaced `_meta` extension (section 5.2). Any spec-compliant registry could feed cplt |
 | D5 | Clients | All, from phase 1: Copilot CLI (`--disable-mcp-server` + `--additional-mcp-config`), OpenCode (`OPENCODE_CONFIG_CONTENT`), pi where possible |
 | D6 | Local transport | stdio over a per-session Unix socket. Client entry: `command: cplt mcp-stdio <id>`, piped to the host child, after `src/worktree_broker.rs`. macOS first; Linux needs a bwrap bind (later). Remote kind (GitHub) keeps the HTTP proxy path |
-| D7 | Host child | Unsandboxed in phase 1, env cleared, egress pinned with `HTTPS_PROXY` to cplt's CONNECT proxy, allowed to the spec's hosts only. File profile later; Linux will need the D-Bus session socket (nais uses go-keyring) |
+| D7 | Host child | Unsandboxed in phase 1, env cleared, egress pinned with `HTTPS_PROXY` to cplt's CONNECT proxy, allowed to the spec's hosts only. File profile later; it must allow writes to nais's config dir and the keyring (refresh rewrites both), and on Linux the D-Bus session socket (nais uses go-keyring) |
 | D8 | Tools | Read-only by default. Writes opted in per server with `nav-pilot mcp enable --tools`, written to the user's cplt config. New or unclassified tools refused until re-consent. Write tools off by default for brokered servers |
 | D9 | GraphQL | Broker refuses a `mutation` or `subscription` keyword, or more than one operation, with a simple check. File the nais/cli fix first (it checks only `Operations[0]`) |
 | D10 | Login | nav-pilot runs `nais login -n` / `gh auth login` on the host after a yes; with `--json` or no tty it only prints the command. Nais status: `nais auth print-access-token` |
-| D11 | Without cplt | `mcp list` PATH `direct` says "no read-only guarantee"; nav-pilot warns or refuses on enabling `execute_graphql` outside cplt. A gh login mid-session needs a restart; the error says so |
+| D11 | Without cplt | `mcp list` PATH `direct` says "no read-only guarantee"; nav-pilot warns or refuses on enabling `execute_graphql` outside cplt. A gh login mid-session needs a restart; the error says so. The kind A part may change once #820 lands (section 8) |
 | D12 | Errors | Broker DENIED and auth errors are mirrored to cplt's launch output or proxy log, not only to the agent |
 | D13 | DoS | Cap in-flight requests per child. `notifications/tools/list_changed` is not delivered; documented |
 | D14 | Out of scope | IDE servers. Figma OAuth is a later phase. No user-declared rows |
@@ -323,6 +323,12 @@ Invariants enforced at load (D2):
 3. Write or external tools only with `writeConsent: true`; `host-exec`
    never.
 4. Upstream `https` only; command from trusted dirs only.
+5. Tool policy comes only from the spec. A tool not in `tools.allow` is
+   refused, whatever cplt's own tables say; cplt has no compiled-in tool
+   classes, so a cplt release can never make a tool callable without
+   nav-pilot re-consent.
+6. No credential placeholders in a spec. The credential's form (prefix,
+   auth style) comes from the source in cplt's table, never from the spec.
 
 ### 5.4 Transports
 
@@ -333,7 +339,11 @@ connect on that one socket. The client entry becomes
 `command: ["cplt", "mcp-stdio", "<id>"]`. That shim, running inside the
 sandbox, connects to the socket, sends the id, and copies stdin/stdout.
 The host side spawns or reuses the child and pipes bytes; it parses
-JSON-RPC lines only to apply policy. No secret path is needed: as in the
+JSON-RPC lines only to apply policy. Supported MCP protocol versions:
+2025-06-18 and 2025-11-25, which carry one JSON-RPC message per line on
+stdio; the broker checks `protocolVersion` in `initialize` and refuses
+others. JSON-RPC batch arrays are rejected with an error; there is no
+legacy (2025-03-26) batch handling. No secret path is needed: as in the
 worktree broker, the client is the sandboxed agent, which already holds
 that authority. Linux needs a bwrap bind of the socket directory; it comes
 after macOS.
@@ -366,9 +376,9 @@ mechanism's status probe; no secret is printed.
 | Spawn | Lazy, on the first socket connection for that id |
 | Concurrency | One child per server per session; in-flight requests capped per child (default 8), excess gets a JSON-RPC error (D13) |
 | Timeouts | Per-call deadline (120 s); idle child stopped after 10 min |
-| Restart | On exit, respawn on the next call; at most 3 per minute, then refuse with a log line |
+| Sessions and restart | The MCP session is tied to the child's lifetime. When the child exits or is replaced (crash, idle stop, auth restart), the broker closes every client socket bound to it. cplt cannot replay `initialize` over stdio, so the shim exits, the client sees the server process end, and it reconnects and re-initializes against a fresh child. Respawn at most 3 per minute, then refuse with a log line. (An HTTP 404 for an unknown `Mcp-Session-Id` applies only to the remote path) |
 | Notifications | Server-initiated messages outside a request (including `notifications/tools/list_changed`) are not delivered (D13) |
-| Shutdown | Children in cplt's process group, killed on exit |
+| Shutdown | The broker owns each child explicitly: it keeps the `Child` handle, and on session exit (and on idle stop) sends SIGTERM, waits a short grace, sends SIGKILL, then `wait()`s to reap, as the curl path does (`src/github_mcp.rs:420-421`). It does not rely on the process group: cplt does not kill the session's group (`src/audit.rs:1137-1148`) |
 
 ### 5.7 The host child (D7)
 
@@ -378,8 +388,12 @@ mechanism's status probe; no secret is printed.
   a separate policy for the child's proxy connections **(open: one proxy
   with per-client policy, or a second listener)**.
 - **Files:** unrestricted in phase 1. A child profile comes later: read its
-  binary, its config dir and the keychain on macOS; on Linux, the D-Bus
-  session socket for go-keyring (Secret Service). Whether nais runs under
+  binary; read and **write** its config dir (refresh rewrites
+  `nais-credentials.json.enc`) and the keyring (refresh replaces the
+  encryption key; nais/cli `internal/naisapi/auth/oidcuser.go`,
+  `oidcUser.Refresh` → `storeOIDCUser`); on macOS the keychain file rules
+  and securityd; on Linux the D-Bus session socket for go-keyring (Secret
+  Service). Whether nais runs under
   such a profile is **(unverified)**.
 - The child is trusted code acting on attacker-chosen arguments; that is
   the residual the later profile narrows.
@@ -390,9 +404,10 @@ mechanism's status probe; no secret is printed.
 
 - Filter `tools/list` to `tools.allow`.
 - Refuse any other `tools/call` with a JSON-RPC error; log it (D12).
-- A tool the server reports that the spec does not classify is refused
-  until `enable` is re-run (D8).
-- Batches: if any member is refused, refuse the batch.
+- A tool the server reports that is not in the spec's `tools.allow` is
+  refused until `enable` is re-run (D8, invariant 5). The allow list is
+  the only source of tool policy; cplt never classifies tools itself.
+- JSON-RPC batch arrays are rejected (5.4).
 
 GitHub keeps its upstream `/readonly` endpoint and forced headers, which
 are stronger than a filter.
@@ -404,11 +419,23 @@ nais refuses non-query operations, but checks only the first operation
 and sends no `operationName` ([L335-L338](https://github.com/nais/cli/blob/44c28bca52f3d9e21e1174b1ae0d6727620d2832/internal/mcp/tools/graphql.go#L335-L338)).
 Whether the Nais API rejects a multi-operation document is **(unverified)**.
 
-The broker's `graphql-read-only` check (D9): strip strings and comments,
-then refuse if the `query` argument contains the keyword `mutation` or
-`subscription` at an operation position, or more than one operation
-definition. False positives (a field literally named `mutation`) are
-acceptable: they fail closed. Upstream fix: file on nais/cli first.
+nais's other checks also miss fragments: `checkForSecrets` does not
+traverse named fragment definitions, and `calculateQueryDepth` counts a
+spread as one level, so a query can hide a forbidden selection in a
+fragment.
+
+The broker's `graphql-read-only` check (D9) looks at the whole document,
+every definition including fragments: strip strings and comments, then
+refuse if any operation definition has a type other than `query` (the
+`mutation` or `subscription` keyword anywhere at a definition position),
+or if there is more than one operation definition. Anything the check
+cannot parse is refused. False positives (a field literally named
+`mutation`) are acceptable: they fail closed.
+
+Limit: the check is about operation type only. It does not judge what a
+query selects, so selections hidden in fragments (secret fields, depth)
+remain nais's job. Upstream fix, filed first: check every operation, and
+traverse fragments in the secret and depth checks.
 
 ### 6.3 Limits of argument inspection
 
@@ -430,17 +457,27 @@ blast radius to read-only tools with the user's identity.
 
 ## 7. Credentials
 
-cplt's mechanism table (D3), hand-kept:
+cplt's mechanism table (D3), hand-kept, split into where the credential
+comes from (source) and how it reaches the upstream (delivery), to match
+#820's rule shape:
 
-| Mechanism | How cplt resolves it | Status probe | Kind |
-|-----------|----------------------|--------------|------|
-| `gh-token` | Trusted `gh auth token` lookup (`src/discover.rs:155`), held as `SecretToken`; later #820's credential source (section 8) | Lookup succeeds | A |
-| `nais-keychain` | Ambient: cplt spawns the fixed `nais alpha mcp serve`; nais reads its own keychain item (macOS) or Secret Service (Linux, go-keyring) | `nais auth print-access-token` exits 0 | C |
-| `none` | Nothing | n/a | C without secrets |
+| Mechanism | Source | Delivery | Status probe | Kind |
+|-----------|--------|----------|--------------|------|
+| `gh-token` | Trusted `gh auth token` lookup (`src/discover.rs:155`), held as `SecretToken`; later #820's credential source (section 8) | `Authorization: Bearer` added by the broker's HTTP path | Lookup succeeds | A |
+| `nais-keychain` | Ambient: nais reads its own keychain item (macOS) or Secret Service (Linux, go-keyring); cplt never touches it | None by cplt: cplt spawns the fixed `nais alpha mcp serve`, which uses it | `nais auth print-access-token` exits 0 | C |
+| `none` | Nothing | Nothing | n/a | C without secrets |
+
+Linux residual for `nais-keychain`: without active bubblewrap (or below
+Landlock ABI v9), the agent can read Secret Service directly over D-Bus,
+including nais's item, whatever the broker does (SECURITY.md:1589-1606).
+The broker keeps the credential out of the sandbox's config and env; it
+does not close that D-Bus path. Phase 1b must require bubblewrap's bus
+masks, or state the exposure at launch.
 
 A new mechanism is a cplt change; a new server using an existing one is
 not. GitHub token refresh: read at launch; a login mid-session needs a
-restart, and the error says so (D11).
+restart, and the error says so (D11). This may change for kind A once
+#820 lands, if injection resolves the token per request.
 
 Note: the gh token is still reachable in the sandbox through the exec token
 and `OPENCODE_AUTH_CONTENT` (SECURITY.md:32-38). The broker removes one
@@ -464,7 +501,8 @@ is on hold.
 | Credential resolution | The broker consumes #820's credential-source interface instead of owning token plumbing. Section 7's `gh-token` row becomes a reference to #820's credential source once that exists; until then the broker uses today's lookup (`src/discover.rs:155`) behind the same shape. Design against it, do not block on it | Agreed direction |
 | Remote MCP upstreams | With TLS termination, kind A (GitHub) could use injection on the normal CONNECT path, with no secret path. The broker would keep only policy (forced headers, tool filter) | **Open.** TLS termination (rustls/rcgen plus per-runtime CA env) is not owner-approved; #807's secret path stays until it is |
 | Stdio and keychain servers | Injection cannot help: the credential is used by a host process, not sent by the agent. Nais needs the broker either way | Settled |
-| Host list | Copilot sends its long-lived token straight to `*.githubcopilot.com`, so any injection host list must include it (and it is also the GitHub MCP upstream) | Input for #820 |
+| Host list | Copilot sends its long-lived token straight to `*.githubcopilot.com`, so any injection host list must include it | Input for #820 |
+| Path scope | `api.githubcopilot.com` is also the GitHub MCP host. Injecting there for every path would give the agent the full `/mcp` endpoint with the user's token, bypassing the read-only kind A. So a read-only kind A depends on #820 rules having a path scope that excludes `/mcp` (or pins it to `/mcp/readonly` with forced headers) | **Open**, input for #820 |
 | Policy | Injection alone does not filter tools or force read-only; the broker owns that | Settled |
 | Order | Phase 1 (Nais) does not depend on #820 | Settled |
 
@@ -480,8 +518,9 @@ Attacker: the sandboxed agent or content steering it.
 | Secret path leaks (remote kind) | Per-session, loopback, never logged; 128-bit, constant-time compare (`src/github_mcp.rs:208-220`) |
 | SSRF | Remote: pinned upstream, no redirects, https only (`src/github_mcp.rs:34`, `:377-391`). Child: egress pinned to `egressHosts` via the proxy |
 | Host-exec through the child | Phase 1 residual: unsandboxed child. Env cleared, egress pinned, read-only tools; file profile later |
+| Agent reads the credential directly (Linux) | Without active bubblewrap, Secret Service is reachable over D-Bus (SECURITY.md:1589-1606); see section 7 |
 | Header injection | Control bytes refused, auth and `X-MCP-*` stripped (`src/github_mcp.rs:225-250`) |
-| JSON-RPC smuggling | Every message parsed; batch refused if any member is |
+| JSON-RPC smuggling | Every message parsed; batch arrays rejected; protocol version checked |
 | DoS | In-flight cap per child, restart budget, deadlines, message cap. Hurts only the agent's own session |
 
 ## 10. Migration of `github_mcp.rs`
@@ -502,7 +541,7 @@ Not in phase 1 (D15). When a third server arrives:
 | Phase | Scope | Exit |
 |-------|-------|------|
 | 1 | Nais (#821) in OpenCode, Copilot CLI and pi where possible: spec schema v1 and loader, `nais-keychain` mechanism, `cplt mcp-stdio` over a Unix socket (macOS), host child with cleared env and egress pin, read allowlist, GraphQL check, `cplt mcp status --json`, mirrored errors. nav-pilot: `_meta` fields in the registry, spec writing, login after a yes, `mcp list` LOGIN and PATH | Nais works under cplt on macOS in both clients with no keychain grant; mutations and multi-op documents refused |
-| 1b | Linux: bwrap bind for the socket; Secret Service | Linux e2e |
+| 1b | Linux: bwrap bind for the socket; Secret Service; require bubblewrap's bus masks or warn about the D-Bus exposure | Linux e2e |
 | 2 | GitHub on the shared model, when a third server arrives | #807 tests unchanged |
 | 3 | Child file profile | nais measured under it |
 | 4 | Figma OAuth in the broker | — |
@@ -520,7 +559,7 @@ Not in phase 1 (D15). When a third server arrives:
 
 ## 13. Issues to file
 
-- nais/cli: check every operation in `execute_graphql`, not only `Operations[0]` (file first, D9).
+- nais/cli: check every operation in `execute_graphql`, not only `Operations[0]`, and traverse named fragments in `checkForSecrets` and `calculateQueryDepth` (file first, D9).
 - navikt/cplt: phase 1 broker for Nais (spec loader v1, `nais-keychain`, `cplt mcp-stdio`, child env and egress pin, tool allowlist, GraphQL check, mirrored errors), superseding the plan in #821.
 - navikt/cplt: `cplt mcp status --json`.
 - navikt/cplt: Copilot CLI overlay with `--disable-mcp-server` and `--additional-mcp-config`.
