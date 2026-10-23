@@ -5420,42 +5420,45 @@ mod tests {
     /// loses execute and keeps read and write; every other rule is unchanged.
     #[test]
     fn deny_copilot_dir_exec_drops_only_execute_on_dot_copilot() {
-        let project = PathBuf::from("/fake/user/project");
-        let home = PathBuf::from("/fake/user");
-        // No `~/.copilot` entry: reported, so a relocated dir is not silent.
-        let mut claude_dirs = crate::agent::Agent::Claude.config_dirs(&home);
-        assert!(!crate::agent::deny_copilot_dir_exec(
-            &mut claude_dirs,
-            &home
-        ));
-        let rules = |deny: bool| {
-            let mut agent_dirs = crate::agent::Agent::Copilot.config_dirs(&home);
-            if deny {
-                assert!(crate::agent::deny_copilot_dir_exec(&mut agent_dirs, &home));
+        // Policy generation reads HOME/XDG/PATH: hold the env lock (#832).
+        crate::with_env_lock_no_xdg(|| {
+            let project = PathBuf::from("/fake/user/project");
+            let home = PathBuf::from("/fake/user");
+            // No `~/.copilot` entry: reported, so a relocated dir is not silent.
+            let mut claude_dirs = crate::agent::Agent::Claude.config_dirs(&home);
+            assert!(!crate::agent::deny_copilot_dir_exec(
+                &mut claude_dirs,
+                &home
+            ));
+            let rules = |deny: bool| {
+                let mut agent_dirs = crate::agent::Agent::Copilot.config_dirs(&home);
+                if deny {
+                    assert!(crate::agent::deny_copilot_dir_exec(&mut agent_dirs, &home));
+                }
+                let mut config = test_config(&project, &home);
+                config.agent_dirs = &agent_dirs;
+                generate_policy(&config).fs_rules
+            };
+            let (off, on) = (rules(false), rules(true));
+            assert_eq!(off.len(), on.len());
+            let dot_copilot = home.join(".copilot");
+            for (a, b) in off.iter().zip(&on) {
+                assert_eq!(a.path, b.path);
+                if a.path == dot_copilot {
+                    assert!(a.access.execute, "key off keeps execute");
+                    assert!(!b.access.execute, "key on drops execute");
+                    assert!(b.access.read && b.access.write, "read and write stay");
+                    let restored = FsAccess {
+                        execute: true,
+                        ..b.access
+                    };
+                    assert_eq!(a.access, restored, "only execute differs");
+                } else {
+                    assert_eq!(a.access, b.access, "{} must not change", a.path.display());
+                }
             }
-            let mut config = test_config(&project, &home);
-            config.agent_dirs = &agent_dirs;
-            generate_policy(&config).fs_rules
-        };
-        let (off, on) = (rules(false), rules(true));
-        assert_eq!(off.len(), on.len());
-        let dot_copilot = home.join(".copilot");
-        for (a, b) in off.iter().zip(&on) {
-            assert_eq!(a.path, b.path);
-            if a.path == dot_copilot {
-                assert!(a.access.execute, "key off keeps execute");
-                assert!(!b.access.execute, "key on drops execute");
-                assert!(b.access.read && b.access.write, "read and write stay");
-                let restored = FsAccess {
-                    execute: true,
-                    ..b.access
-                };
-                assert_eq!(a.access, restored, "only execute differs");
-            } else {
-                assert_eq!(a.access, b.access, "{} must not change", a.path.display());
-            }
-        }
-        assert!(on.iter().any(|r| r.path == dot_copilot));
+            assert!(on.iter().any(|r| r.path == dot_copilot));
+        });
     }
 
     /// Rules for Copilot with the key on and `~/.copilot` resolved to `copilot`,
