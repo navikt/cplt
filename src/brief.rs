@@ -930,6 +930,7 @@ mod tests {
             bool_layers: Vec::new(),
             with_proxy: true,
             proxy_forced: false,
+            inject_github_token: false,
             github_mcp_proxy: true,
             mcp_broker: true,
             proxy_port: 0,

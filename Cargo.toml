@@ -7,15 +7,19 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1.0.102"
+base64 = "0.23"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
 directories = "6.0.0"
 libc = "0.2"
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1"
 serde_json = "1"
 sha2 = { version = "0.11.0", default-features = false }
+time = "0.3"
 thiserror = "2.0.18"
 toml = "1.1"
 toml_edit = "0.25"

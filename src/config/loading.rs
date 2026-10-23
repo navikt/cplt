@@ -645,6 +645,7 @@ impl Config {
             bool_layers: bools.layers.clone(),
             repo_private_domains: Vec::new(),
             proxy_forced,
+            inject_github_token: bools.inject_github_token,
             proxy_port,
             blocked_domains,
             allowed_domains,
@@ -4123,6 +4124,14 @@ mod precedence {
                 get: |r| r.proxy_forced,
                 default: false,
                 preset: Some((Preset::Strict, true)),
+            },
+            Ladder {
+                key: "proxy.inject_github_token",
+                cli_on: Some(|c| c.inject_github_token = FeatureToggle::ForceOn),
+                cli_off: Some(|c| c.inject_github_token = FeatureToggle::ForceOff),
+                get: |r| r.inject_github_token,
+                default: false,
+                preset: None,
             },
             Ladder {
                 key: "proxy.default_allowlist",

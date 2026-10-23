@@ -163,6 +163,17 @@ struct Cli {
     #[arg(long)]
     no_proxy_forced: bool,
 
+    /// Give the agent a placeholder GitHub token and have the proxy put the
+    /// real one back for GitHub hosts only (default off;
+    /// `proxy.inject_github_token`). Falls back to the real token, with one
+    /// line, if setup fails.
+    #[arg(long, conflicts_with = "no_inject_github_token")]
+    inject_github_token: bool,
+
+    /// Hand the agent the real GitHub token for this run.
+    #[arg(long)]
+    no_inject_github_token: bool,
+
     /// Port for the local proxy to listen on [default: ephemeral port].
     /// Only relevant when --with-proxy is enabled.
     #[arg(long, value_name = "PORT")]
@@ -2900,6 +2911,10 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         preset: cli.preset,
         proxy: config::FeatureToggle::from_pair(cli.with_proxy, cli.no_proxy),
         proxy_forced: config::FeatureToggle::from_pair(cli.proxy_forced, cli.no_proxy_forced),
+        inject_github_token: config::FeatureToggle::from_pair(
+            cli.inject_github_token,
+            cli.no_inject_github_token,
+        ),
         proxy_port: cli.proxy_port,
         blocked_domains: cli.blocked_domains.clone(),
         allowed_domains: cli.allowed_domains.clone(),
@@ -6519,6 +6534,20 @@ fn assemble_sandbox(
         opts.repos.dirs,
     )?;
     let proxy_port_for_profile = proxy_handle.as_ref().map(|h| h.port);
+
+    // #820: opt-in. Any failure keeps today's behaviour, said in one line.
+    if resolved.inject_github_token {
+        let setup = match (proxy_handle.is_some(), scratch_path) {
+            (false, _) => Err("the proxy is off".to_string()),
+            (_, None) => Err("there is no scratch dir".to_string()),
+            (true, Some(scratch)) => cplt::token_inject::setup(scratch),
+        };
+        if let Err(e) = setup {
+            ui::warn(&format!(
+                "GitHub token injection is off for this run ({e}): the agent gets the real token."
+            ));
+        }
+    }
 
     // #242: drop the whole-Keychain grant only when the agent can authenticate
     // without it. Resolved against `deny_env` because that list is stripped from

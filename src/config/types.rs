@@ -502,6 +502,9 @@ pub struct ProxyConfig {
     /// restricted to the proxy port only (no direct `*:443`). Fails closed:
     /// if the proxy cannot start, the agent is not launched. See #53.
     pub forced: Option<bool>,
+    /// Put the real GitHub token back in at the proxy and give the sandbox a
+    /// placeholder (default: false, #820).
+    pub inject_github_token: Option<bool>,
     /// Proxy listen port (default: 0, OS-assigned ephemeral port).
     pub port: Option<u16>,
     /// Path to blocked domains file.
@@ -956,6 +959,8 @@ pub struct Resolved {
     /// Force all egress through the proxy (proxy mandatory, kernel egress
     /// restricted to the proxy port, fail-closed). See #53.
     pub proxy_forced: bool,
+    /// Proxy-side GitHub token injection (#820).
+    pub inject_github_token: bool,
     pub proxy_port: u16,
     pub blocked_domains: Option<PathBuf>,
     pub allowed_domains: Option<PathBuf>,
@@ -1070,6 +1075,8 @@ pub struct CliFlags {
     pub preset: Option<Preset>,
     pub proxy: FeatureToggle,
     pub proxy_forced: FeatureToggle,
+    /// `--inject-github-token` / `--no-inject-github-token` (#820).
+    pub inject_github_token: FeatureToggle,
     pub proxy_port: Option<u16>,
     pub blocked_domains: Option<PathBuf>,
     pub allowed_domains: Option<PathBuf>,

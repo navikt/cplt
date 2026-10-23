@@ -50,6 +50,10 @@ pub fn default_config_contents() -> String {
 # kernel-level egress to the proxy port only (no direct *:443). Fails closed.
 # If the proxy cannot start, the agent is not launched. (default: false)
 # forced = false
+# Give the agent a placeholder GitHub token; the proxy puts the real one back
+# for api.github.com, github.com and *.githubcopilot.com only. Falls back to the
+# real token, with one line, if setup fails. (default: false)
+# inject_github_token = false
 # port = 0  # 0 = OS-assigned ephemeral port (avoids conflicts, default)
 # blocked_domains = "~/.config/cplt/blocked-domains.txt"
 # allowed_domains = "~/.config/cplt/allowed-domains.txt"

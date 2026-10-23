@@ -60,6 +60,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "proxy",
+        key: "inject_github_token",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "false",
+        description: "Give the agent a placeholder GitHub token; the proxy puts the real one back for GitHub hosts only (TLS terminated with a per-session CA). Falls back to the real token if setup fails.",
+    },
+    ConfigKeyInfo {
+        section: "proxy",
         key: "port",
         value_type: ConfigValueType::U16,
         dangerous: false,
@@ -968,6 +976,12 @@ bool_keys! {
         config = |c: &Config| c.proxy.forced,
         baseline = |b: PresetBaseline| b.proxy_forced,
         resolved = |r: &Resolved| r.proxy_forced;
+
+    inject_github_token, "proxy", "inject_github_token",
+        cli = |c: &CliFlags| c.inject_github_token,
+        config = |c: &Config| c.proxy.inject_github_token,
+        baseline = |_: PresetBaseline| false,
+        resolved = |r: &Resolved| r.inject_github_token;
 
     default_allowlist, "proxy", "default_allowlist",
         cli = |c: &CliFlags| c.default_allowlist,

@@ -1733,7 +1733,15 @@ fn handle_connect(
         }
         ConnectRoute::Direct(addrs) => {
             let skipped: Vec<_> = resolved.iter().filter(|a| !addrs.contains(a)).collect();
-            connect_direct(client, &addrs, &skipped, target, state, classification);
+            connect_direct(
+                client,
+                &addrs,
+                &skipped,
+                (&host, port),
+                target,
+                state,
+                classification,
+            );
         }
     }
 }
@@ -1751,6 +1759,7 @@ fn connect_direct(
     mut client: TcpStream,
     addrs: &[std::net::SocketAddr],
     skipped: &[&std::net::SocketAddr],
+    (host, port): (&str, u16),
     target: &str,
     state: &ProxyState,
     classification: &mut ClassificationGuard,
@@ -1803,7 +1812,7 @@ fn connect_direct(
     }
 
     // Bidirectional relay
-    relay(client, remote, state.timeout);
+    relay_or_intercept(client, remote, host, port, state.timeout);
 }
 
 /// Forward a CONNECT tunnel through the configured upstream (corporate) proxy.
@@ -1921,7 +1930,25 @@ fn connect_via_upstream(
         return;
     }
 
-    relay(client, remote, state.timeout);
+    relay_or_intercept(client, remote, host, port, state.timeout);
+}
+
+/// Splice an approved tunnel, or, for a GitHub host while token injection is
+/// on (#820), terminate it and put the real token back. Called only after
+/// every policy gate passed: interception changes what is relayed, never
+/// what is allowed.
+fn relay_or_intercept(
+    client: TcpStream,
+    remote: TcpStream,
+    host: &str,
+    port: u16,
+    timeout: Duration,
+) {
+    if crate::token_inject::active() && crate::token_inject::intercepts(host, port) {
+        crate::token_inject::serve(client, remote, host, timeout);
+    } else {
+        relay(client, remote, timeout);
+    }
 }
 
 /// Read and interpret the upstream proxy's response to our CONNECT request.

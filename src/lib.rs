@@ -29,6 +29,7 @@ pub mod scratch;
 pub mod settings;
 pub mod shim;
 pub mod subscriptions;
+pub mod token_inject;
 pub mod trust;
 pub mod ui;
 pub mod untrusted;
