@@ -498,9 +498,7 @@ pub fn host_warnings(home: &Path) -> Vec<String> {
     }
     if logged_out_after_upgrade(
         &data,
-        crate::sandbox::cplt_state_file(home, "opencode-v2-credentials-seen")
-            .parent()
-            .unwrap_or(home),
+        &crate::sandbox::cplt_state_file(home, "opencode-v2-credentials-seen"),
     ) {
         out.push(
             "OpenCode v2 did not import your v1 credentials (auth.json). Run \
@@ -528,8 +526,7 @@ fn host_service_pid(registration: &Path) -> Option<i32> {
 /// `auth.json` holds entries but the database has no credential row. Reads
 /// only the size of `auth.json` and a row count. After one count a marker
 /// in cplt's state dir skips the check, so steady-state launch spawns nothing.
-fn logged_out_after_upgrade(data: &Path, cplt_state: &Path) -> bool {
-    let marker = cplt_state.join("opencode-v2-credentials-seen");
+fn logged_out_after_upgrade(data: &Path, marker: &Path) -> bool {
     if marker.exists() || std::fs::metadata(data.join("auth.json")).map_or(true, |m| m.len() <= 2) {
         return false;
     }
@@ -542,7 +539,9 @@ fn logged_out_after_upgrade(data: &Path, cplt_state: &Path) -> bool {
         return false;
     };
     // Any answer settles it: hint once at most, then never spawn again.
-    let _ = std::fs::create_dir_all(cplt_state);
+    if let Some(dir) = marker.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
     let _ = std::fs::write(marker, "");
     rows == 0
 }
@@ -756,7 +755,8 @@ mod tests {
     #[test]
     fn logged_out_after_upgrade_reads_the_credential_count() {
         let tmp = tempfile::tempdir().unwrap();
-        let (data, st) = (tmp.path().join("data"), tmp.path().join("st"));
+        let data = tmp.path().join("data");
+        let st = tmp.path().join("st/opencode-v2-credentials-seen");
         std::fs::create_dir_all(&data).unwrap();
         assert!(!logged_out_after_upgrade(&data, &st), "no auth.json");
         std::fs::write(data.join("auth.json"), "{}").unwrap();
@@ -775,7 +775,7 @@ mod tests {
             return; // no sqlite3 on this host
         }
         assert!(logged_out_after_upgrade(&data, &st), "no credential rows");
-        let marker = st.join("opencode-v2-credentials-seen");
+        let marker = st.clone();
         assert!(marker.exists(), "hint once, then skip");
         assert!(!logged_out_after_upgrade(&data, &st), "marker skips");
         std::fs::remove_file(&marker).unwrap();

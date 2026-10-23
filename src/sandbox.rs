@@ -568,6 +568,7 @@ pub fn prepare_with_pnpm_shadow(
     validate_playwright_socket_capability(config.playwright_socket_dir)?;
     validate_hard_denied_grants(config)?;
     validate_pnpm_tool_dirs(config)?;
+    validate_cplt_state_root(config)?;
     // One policy for every check below and the bubblewrap plan, generated on
     // first use: generating can warn, and a warning should print once (#602).
     let base = std::cell::OnceCell::new();
@@ -1170,6 +1171,29 @@ fn validate_exec_grants(config: &SandboxConfig) -> Result<(), String> {
                  instead of pretending to. {remedy}",
                 exec.display(),
                 write.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// cplt's state root moved by `XDG_CONFIG_HOME` (#830) must not lie in a tree
+/// the agent can write: it could forge `opencode-snapshot-clean` and skip the
+/// audit scan. The legacy `~/.config/cplt` is a denied dotfile already.
+fn validate_cplt_state_root(config: &SandboxConfig) -> Result<(), String> {
+    let state = policy::cplt_state_dir(config.home_dir);
+    if state == config.home_dir.join(CPLT_STATE_DIR) {
+        return Ok(());
+    }
+    let resolved = crate::config::canonicalize_deepest(&state);
+    for (tree, source) in canonical_writable_trees(config) {
+        if resolved.starts_with(&tree) {
+            return Err(format!(
+                "cplt's state directory {} is inside {source} {}, which is writable in the \
+                 sandbox. Move XDG_CONFIG_HOME out of {}, or drop that write grant.",
+                state.display(),
+                tree.display(),
+                tree.display()
             ));
         }
     }
@@ -3592,6 +3616,9 @@ fn validate_config_paths(config: &SandboxConfig) -> Result<(), String> {
         }
     }
 
+    // #830: the profile names the state root, which XDG_CONFIG_HOME can set.
+    policy::validate_sbpl_path(&policy::cplt_state_dir(config.home_dir))
+        .map_err(|e| format!("cplt state dir (XDG_CONFIG_HOME): {e}"))?;
     Ok(())
 }
 
@@ -4750,7 +4777,9 @@ mod tests {
         let xdg = home.join("x\"dg");
         temp_env::with_var("XDG_CONFIG_HOME", Some(&xdg), || {
             let mut config = test_config(&home, &[]);
-            assert!(super::validate_config_paths(&config).is_ok(), "key off");
+            // #830: the state root follows XDG_CONFIG_HOME into the profile.
+            let err = super::validate_config_paths(&config).expect_err("key off");
+            assert!(err.contains("cplt state dir"), "{err}");
             config.protect_pnpm_config = true;
             let err = super::validate_config_paths(&config).expect_err("must refuse");
             assert!(err.contains("sandbox.protect_pnpm_config"), "{err}");
@@ -5412,6 +5441,36 @@ mod tests {
         config.extra_read = &[];
         config.extra_write = &granted;
         assert_eq!(validate_hard_denied_grants(&config), Ok(()));
+    }
+
+    /// #830: a state root moved into a writable tree by XDG_CONFIG_HOME is
+    /// refused; the agent could forge `opencode-snapshot-clean`.
+    #[test]
+    fn prepare_rejects_a_state_root_inside_the_project() {
+        let home = Path::new("/fake/test");
+        let config = test_config(home, &[]);
+        let error = temp_env::with_var("XDG_CONFIG_HOME", Some("/project/xdg"), || {
+            prepare(&config).err().expect("must be refused")
+        });
+        assert!(
+            error.contains("Move XDG_CONFIG_HOME out of /project"),
+            "{error}"
+        );
+    }
+
+    /// #830: XDG_CONFIG_HOME is interpolated into the profile, so an SBPL
+    /// payload in it refuses the launch.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prepare_rejects_sbpl_injection_via_xdg_config_home() {
+        let home = Path::new("/fake/test");
+        let config = test_config(home, &[]);
+        let error = temp_env::with_var(
+            "XDG_CONFIG_HOME",
+            Some("/x\")) (allow file-write* (subpath \"/"),
+            || validate_config_paths(&config).expect_err("must be refused"),
+        );
+        assert!(error.contains("XDG_CONFIG_HOME"), "{error}");
     }
 
     /// cplt's own state directory is the exception to the per-file override:
