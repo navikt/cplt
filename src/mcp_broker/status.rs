@@ -23,12 +23,18 @@ pub fn status_json(
         .specs
         .iter()
         .map(|s| {
+            let (ok, note) = if probe {
+                credential_ok(s)
+            } else {
+                (None, None)
+            };
             json!({
                 "id": s.id,
                 "state": if enabled { "brokered" } else { "off" },
                 "transport": "unix",
                 "credential": s.credential,
-                "credential_ok": if probe { credential_ok(s) } else { None },
+                "credential_ok": ok,
+                "credential_note": note,
                 "tools_allowed": s.allow.len(),
                 "clients": super::client::WIRED_CLIENTS,
             })
