@@ -933,7 +933,10 @@ mod copilot_extraction_tests {
         }
 
         fn run(&self) -> Result<(), String> {
-            ensure_copilot_extracted(&self.bin, &self.home, &self.project)
+            // #830: the marker path reads XDG_CONFIG_HOME; keep it in the fixture.
+            temp_env::with_var_unset("XDG_CONFIG_HOME", || {
+                ensure_copilot_extracted(&self.bin, &self.home, &self.project)
+            })
         }
 
         fn complete_dir(&self, name: &str) {
@@ -957,7 +960,9 @@ mod copilot_extraction_tests {
                 "aarch64" => "arm64",
                 _ => "x64",
             };
-            copilot_cache_dirs(&|_| None, &self.home, arch).unwrap().1
+            temp_env::with_var_unset("XDG_CONFIG_HOME", || {
+                copilot_cache_dirs(&|_| None, &self.home, arch).unwrap().1
+            })
         }
 
         fn entries(&self) -> Vec<String> {
@@ -1025,10 +1030,9 @@ mod copilot_extraction_tests {
     fn marker_lives_in_the_sandbox_denied_state_dir() {
         let f = fixture("marker-dir", COUNTS_NEVER_EXTRACTS);
         assert!(f.run().is_ok());
-        assert!(
-            f.cache_file()
-                .starts_with(cplt::sandbox::cplt_state_dir(&f.home))
-        );
+        let state =
+            temp_env::with_var_unset("XDG_CONFIG_HOME", || cplt::sandbox::cplt_state_dir(&f.home));
+        assert!(f.cache_file().starts_with(state));
         assert!(f.cache_file().exists());
     }
 

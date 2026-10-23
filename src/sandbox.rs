@@ -568,7 +568,11 @@ pub fn prepare_with_pnpm_shadow(
     validate_playwright_socket_capability(config.playwright_socket_dir)?;
     validate_hard_denied_grants(config)?;
     validate_pnpm_tool_dirs(config)?;
-    validate_cplt_state_root(config)?;
+    // Inspect-only callers (`--print-profile`, `cplt mcp status`) never
+    // launch, so nothing can forge the state; they report instead.
+    if !inspect_only {
+        validate_cplt_state_root(config)?;
+    }
     // One policy for every check below and the bubblewrap plan, generated on
     // first use: generating can warn, and a warning should print once (#602).
     let base = std::cell::OnceCell::new();
@@ -3617,8 +3621,12 @@ fn validate_config_paths(config: &SandboxConfig) -> Result<(), String> {
     }
 
     // #830: the profile names the state root, which XDG_CONFIG_HOME can set.
-    policy::validate_sbpl_path(&policy::cplt_state_dir(config.home_dir))
-        .map_err(|e| format!("cplt state dir (XDG_CONFIG_HOME): {e}"))?;
+    // The resolved target too: a symlink to an unsafe path would drop its deny.
+    let state = policy::cplt_state_dir(config.home_dir);
+    for p in [state.clone(), crate::config::canonicalize_deepest(&state)] {
+        policy::validate_sbpl_path(&p)
+            .map_err(|e| format!("cplt state dir (XDG_CONFIG_HOME): {e}"))?;
+    }
     Ok(())
 }
 
@@ -5456,6 +5464,25 @@ mod tests {
             error.contains("Move XDG_CONFIG_HOME out of /project"),
             "{error}"
         );
+    }
+
+    /// #830: a safe XDG_CONFIG_HOME whose state root is a symlink to an
+    /// unsafe target is refused too: the deny would name only the safe path.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn validate_rejects_a_state_root_linked_to_an_unsafe_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let bad = root.join("b\"ad");
+        std::fs::create_dir_all(&bad).unwrap();
+        let xdg = root.join("xdg");
+        std::fs::create_dir_all(&xdg).unwrap();
+        std::os::unix::fs::symlink(&bad, xdg.join("cplt")).unwrap();
+        let config = test_config(&root, &[]);
+        let error = temp_env::with_var("XDG_CONFIG_HOME", Some(&xdg), || {
+            validate_config_paths(&config).expect_err("must be refused")
+        });
+        assert!(error.contains("b\"ad"), "{error}");
     }
 
     /// #830: XDG_CONFIG_HOME is interpolated into the profile, so an SBPL
