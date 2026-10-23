@@ -4795,7 +4795,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             playwright_socket_guard: _playwright_socket_guard,
         worktree_broker,
         mcp_broker,
-        mcp_supported,
+        mcp_refusal,
         ..
     } = assemble_sandbox(
         &cli,
@@ -4830,7 +4830,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             &home_dir,
             &found,
             resolved.mcp_broker,
-            mcp_supported,
+            mcp_refusal.as_deref(),
         ));
     }
 
@@ -6287,8 +6287,8 @@ struct AssembledSandbox {
     worktree_broker: Option<cplt::worktree_broker::Broker>,
     /// Serves `cplt mcp-stdio` (#824). Dropping it stops every child.
     mcp_broker: Option<cplt::mcp_broker::Broker>,
-    /// With `mcp_probe`: whether the broker can run on this host.
-    mcp_supported: bool,
+    /// With `mcp_probe`: why the broker cannot run for this launch.
+    mcp_refusal: Option<String>,
 }
 
 /// Start the managed-worktree broker for a launch (#531), or `None` when the
@@ -6676,7 +6676,10 @@ fn assemble_sandbox(
             .inspect_err(|e| ui::warn(&format!("MCP broker unavailable: {e}. Left as configured.")))
             .ok()
     });
-    let mcp_supported = opts.mcp_probe && sandbox::mcp_broker_refusal(&sandbox_config).is_none();
+    let mcp_refusal = opts
+        .mcp_probe
+        .then(|| sandbox::mcp_broker_refusal(&sandbox_config))
+        .flatten();
     let read_denies = sandbox::ReadDenies::from_config_for_current_os(&sandbox_config);
     // Here, not at each caller: the launch, `exec` and `check` all build their
     // policy through this function, and all three must say it.
@@ -6718,7 +6721,7 @@ fn assemble_sandbox(
         playwright_socket_guard,
         worktree_broker,
         mcp_broker,
-        mcp_supported,
+        mcp_refusal,
     })
 }
 
@@ -7020,7 +7023,7 @@ fn run_exec_command(
             playwright_socket_guard: _playwright_socket_guard,
         worktree_broker,
         mcp_broker: _,
-        mcp_supported: _,
+        mcp_refusal: _,
     } = {
         let mut probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
         // `exec` never writes the managed block, so it gets no read on a root

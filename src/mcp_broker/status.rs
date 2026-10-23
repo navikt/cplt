@@ -11,7 +11,14 @@ use super::{SCHEMA_VERSIONS, STATUS_VERSION};
 
 /// `cplt mcp status --json`. `supported`: this host can run the broker
 /// (on Linux, only under Bubblewrap with the bus masked, #834).
-pub fn status_json(found: &Detected, enabled: bool, probe: bool, supported: bool) -> Value {
+/// `off_reason`: why the broker would be off for this launch (#838).
+pub fn status_json(
+    found: &Detected,
+    enabled: bool,
+    probe: bool,
+    supported: bool,
+    off_reason: Option<&str>,
+) -> Value {
     let mut servers: Vec<Value> = found
         .specs
         .iter()
@@ -37,6 +44,7 @@ pub fn status_json(found: &Detected, enabled: bool, probe: bool, supported: bool
         "version": STATUS_VERSION,
         "schema": SCHEMA_VERSIONS,
         "platform_supported": supported,
+        "off_reason": off_reason,
         "servers": servers,
         "rejected": found.rejected,
     })
@@ -49,14 +57,18 @@ pub fn run_status(
     home: &Path,
     found: &Detected,
     enabled: bool,
-    supported: bool,
+    refusal: Option<&str>,
 ) -> ExitCode {
-    let status = status_json(found, enabled && supported, true, supported);
+    let supported = refusal.is_none();
+    let status = status_json(found, enabled && supported, true, supported, refusal);
     if as_json {
         println!("{status}");
         return ExitCode::SUCCESS;
     }
     println!("MCP broker specs in {}", spec_dir(home).display());
+    if let Some(why) = refusal {
+        println!("  broker off for this launch: {why}");
+    }
     for s in status["servers"].as_array().into_iter().flatten() {
         println!(
             "  {}  {}  credential_ok: {}",

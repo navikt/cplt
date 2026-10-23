@@ -2559,6 +2559,9 @@ fn report_unix_socket_regime(
 /// Probed with the launch's rules, as `cplt doctor` does.
 #[cfg(target_os = "linux")]
 pub fn mcp_broker_refusal(config: &SandboxConfig) -> Option<String> {
+    if let Some(why) = mcp_flag_conflict(config.allow_gpg_signing, config.allow_rootless_docker) {
+        return Some(why);
+    }
     // Planned as the launch will be: with a broker socket, so with its masks.
     let probe_socket = Path::new("/tmp/cplt-mcp-probe/m");
     let config = &SandboxConfig {
@@ -2639,6 +2642,28 @@ fn mcp_refusal_text(wrapper: Result<(), String>, masks: &bubblewrap::DenyMasks) 
             "the MCP broker needs Bubblewrap to hide every D-Bus endpoint, and {} is not \
              masked. {FIX}",
             open.join(", ")
+        )
+    })
+}
+
+/// The broker hides the runtime dirs, where the gpg-agent and rootless
+/// container sockets live, so a run asking for those keeps the flag and
+/// goes without the broker (#838).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn mcp_flag_conflict(gpg: bool, rootless_docker: bool) -> Option<String> {
+    let flags: Vec<&str> = [
+        (gpg, "--allow-gpg-signing"),
+        (rootless_docker, "--allow-rootless-docker"),
+    ]
+    .into_iter()
+    .filter_map(|(on, f)| on.then_some(f))
+    .collect();
+    (!flags.is_empty()).then(|| {
+        format!(
+            "{} needs sockets in the runtime dir, which the MCP broker hides from the \
+             sandbox. Keep the flag and pass --no-mcp-broker <id>, or drop the flag to use \
+             the broker",
+            flags.join(" and ")
         )
     })
 }
@@ -3886,6 +3911,28 @@ fn validate_created_playwright_socket_dir(path: &Path) -> Result<(), String> {
 #[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpg_and_rootless_docker_turn_the_broker_off() {
+        assert_eq!(mcp_flag_conflict(false, false), None);
+        let gpg = mcp_flag_conflict(true, false).unwrap();
+        assert!(gpg.starts_with("--allow-gpg-signing needs"), "{gpg}");
+        assert!(gpg.contains("--no-mcp-broker <id>"), "{gpg}");
+        let both = mcp_flag_conflict(true, true).unwrap();
+        assert!(
+            both.contains("--allow-gpg-signing and --allow-rootless-docker"),
+            "{both}"
+        );
+        let json = crate::mcp_broker::status_json(
+            &crate::mcp_broker::Detected::default(),
+            false,
+            false,
+            false,
+            Some(&both),
+        );
+        assert_eq!(json["platform_supported"], false);
+        assert_eq!(json["off_reason"], both.as_str());
+    }
 
     #[test]
     fn dbus_addresses_name_their_endpoints() {
