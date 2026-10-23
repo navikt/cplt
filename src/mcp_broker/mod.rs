@@ -1,5 +1,6 @@
 //! Host-side MCP broker for local stdio servers (phase 1 of
-//! `docs/design/mcp-host-broker.md`, #824). macOS only; Linux refuses.
+//! `docs/design/mcp-host-broker.md`, #824). On Linux (#834) only under
+//! Bubblewrap with the bus sockets masked; see `sandbox::mcp_broker_refusal`.
 //!
 //! nav-pilot writes one broker spec per server into
 //! `$XDG_CONFIG_HOME/cplt/mcp/`: a standard MCP `server.json` plus the
@@ -14,9 +15,6 @@
 //! granted root and the sandbox may connect to that one path. There is no
 //! secret: the client is the sandboxed agent, and it can only name a server
 //! the user's spec already declares.
-
-// Linux builds the policy and client code but never starts the runtime (1b).
-#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
 use std::time::Duration;
 

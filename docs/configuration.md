@@ -1133,8 +1133,10 @@ on the host, outside the sandbox, and points your client's entry at
 
 With no spec files nothing changes. Turn the broker off with
 `sandbox.mcp_broker = false`, or turn off one server for a run with
-`--no-mcp-broker <id>`. Linux is not supported yet: cplt says so at launch and
-leaves the entries as configured.
+`--no-mcp-broker <id>`. On Linux the broker runs only under Bubblewrap with
+the D-Bus and systemd sockets masked, since without those masks the agent can
+read the server's credential from the Secret Service. Where Bubblewrap is not
+usable, cplt says so at launch and leaves the entries as configured.
 ## GitHub token injection (`proxy.inject_github_token`)
 
 Off by default. With `proxy.inject_github_token = true`, or

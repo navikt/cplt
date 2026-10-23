@@ -462,7 +462,13 @@ fn probe_reason(raw: &str, home: &Path) -> String {
 /// launch runs Landlock + seccomp only and says so in one line nobody reads.
 /// `use_bubblewrap = true` has its own blocking finding; `false` was a choice.
 #[must_use]
-pub fn bubblewrap_finding(state: &Bubblewrap, use_bubblewrap: Option<bool>) -> Option<Finding> {
+/// `apparmor_fix`: [`apparmor_fix`], passed in so tests do not depend on
+/// the host's sysctl or /etc/apparmor.d.
+pub fn bubblewrap_finding(
+    state: &Bubblewrap,
+    use_bubblewrap: Option<bool>,
+    apparmor_fix: Option<String>,
+) -> Option<Finding> {
     if use_bubblewrap.is_some() {
         return None;
     }
@@ -470,28 +476,84 @@ pub fn bubblewrap_finding(state: &Bubblewrap, use_bubblewrap: Option<bool>) -> O
         Bubblewrap::NotInstalled => Some(Finding::warning(
             "bubblewrap is not installed: the launch runs Landlock + seccomp only, without the \
              mount-level protections listed above.",
-            Some(
-                "sudo apt install bubblewrap (or your distro's package; it must land in a trusted \
-                 system directory such as /usr/bin or /usr/local/bin)"
-                    .to_string(),
-            ),
+            Some(BWRAP_INSTALL_HINT.to_string()),
         )),
         Bubblewrap::Unusable { reason, .. } => {
             let lower = reason.to_ascii_lowercase();
             // bwrap says "No permissions to create new namespace" or fails
             // "setting up uid map" when unprivileged user namespaces are off.
             let userns = lower.contains("namespace") || lower.contains("uid map");
+            // Read from the sysctl, not the error text (#834).
+            let hint = if apparmor_fix.is_some() {
+                apparmor_fix
+            } else {
+                userns.then(|| USERNS_HINT.to_string())
+            };
             Some(Finding::warning(
                 format!(
                     "bubblewrap is installed but its probe fails ({reason}): the launch falls \
                      back to Landlock + seccomp only."
                 ),
-                userns.then(|| USERNS_HINT.to_string()),
+                hint,
             ))
         }
         _ => None,
     }
 }
+
+/// Ubuntu 23.10+ (`kernel.apparmor_restrict_unprivileged_userns = 1`) lets
+/// only programs with an AppArmor `userns` profile create user namespaces,
+/// and Ubuntu ships none for bwrap.
+#[must_use]
+pub fn apparmor_restricts_userns() -> bool {
+    std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+        .is_ok_and(|v| v.trim() == "1")
+}
+
+/// The one-time fix for [`apparmor_restricts_userns`]: a profile that lets
+/// /usr/bin/bwrap, and only it, create user namespaces.
+pub const APPARMOR_BWRAP_FIX: &str = "AppArmor blocks bubblewrap's user namespaces \
+(kernel.apparmor_restrict_unprivileged_userns = 1). Allow them for bwrap only, once:
+  sudo tee /etc/apparmor.d/bwrap >/dev/null <<'EOF'
+abi <abi/4.0>,
+include <tunables/global>
+
+profile bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+  include if exists <local/bwrap>
+}
+EOF
+  sudo apparmor_parser -r /etc/apparmor.d/bwrap";
+
+/// Ubuntu 24.04's own profile for bwrap, shipped but not always loaded.
+pub const SHIPPED_BWRAP_PROFILE: &str = "/etc/apparmor.d/bwrap-userns-restrict";
+
+/// The AppArmor fix for this host, when [`apparmor_restricts_userns`]: load
+/// Ubuntu's own bwrap profile if it is there, else write one. Never both,
+/// which would be two profiles for /usr/bin/bwrap.
+#[must_use]
+pub fn apparmor_fix() -> Option<String> {
+    apparmor_restricts_userns()
+        .then(|| apparmor_fix_text(std::path::Path::new(SHIPPED_BWRAP_PROFILE).exists()))
+}
+
+/// [`apparmor_fix`]'s text; `shipped`: [`SHIPPED_BWRAP_PROFILE`] exists.
+#[must_use]
+pub fn apparmor_fix_text(shipped: bool) -> String {
+    if shipped {
+        format!(
+            "AppArmor blocks bubblewrap's user namespaces \
+             (kernel.apparmor_restrict_unprivileged_userns = 1). Load the profile Ubuntu \
+             ships for bwrap, once:\n  sudo apparmor_parser -r {SHIPPED_BWRAP_PROFILE}"
+        )
+    } else {
+        APPARMOR_BWRAP_FIX.to_string()
+    }
+}
+
+/// How to install bubblewrap where cplt looks for it.
+pub const BWRAP_INSTALL_HINT: &str = "sudo apt install bubblewrap (or your distro's package; it must land in a trusted \
+     system directory such as /usr/bin or /usr/local/bin)";
 
 /// How to enable the user namespaces bubblewrap needs; also in the OpenCode v2 refusal.
 pub const USERNS_HINT: &str = "enable user namespaces (sysctl kernel.unprivileged_userns_clone=1; on \
@@ -1330,29 +1392,47 @@ mod tests {
     #[test]
     fn bubblewrap_finding_only_on_auto_detect_without_a_usable_bwrap() {
         let missing = Bubblewrap::NotInstalled;
-        let f = bubblewrap_finding(&missing, None).expect("not installed warns");
+        let f = bubblewrap_finding(&missing, None, None).expect("not installed warns");
         assert_eq!(f.level, Level::Warning);
         let fix = f.fix.unwrap();
         assert!(fix.contains("apt install bubblewrap"));
         assert!(fix.contains("/usr/local/bin"), "not only /usr/bin: {fix}");
         // `true` has its own blocking finding; `false` was a choice.
-        assert!(bubblewrap_finding(&missing, Some(true)).is_none());
-        assert!(bubblewrap_finding(&missing, Some(false)).is_none());
-        assert!(bubblewrap_finding(&Bubblewrap::Usable("/usr/bin/bwrap".into()), None).is_none());
-        assert!(bubblewrap_finding(&Bubblewrap::NotApplicable, None).is_none());
+        assert!(bubblewrap_finding(&missing, Some(true), None).is_none());
+        assert!(bubblewrap_finding(&missing, Some(false), None).is_none());
+        assert!(
+            bubblewrap_finding(&Bubblewrap::Usable("/usr/bin/bwrap".into()), None, None).is_none()
+        );
+        assert!(bubblewrap_finding(&Bubblewrap::NotApplicable, None, None).is_none());
 
         let userns = Bubblewrap::Unusable {
             path: "/usr/bin/bwrap".into(),
             reason: "bwrap: setting up uid map: Permission denied".into(),
         };
-        let f = bubblewrap_finding(&userns, None).expect("unusable warns");
+        let f = bubblewrap_finding(&userns, None, None).expect("unusable warns");
         assert!(f.message.contains("uid map"));
         assert!(f.fix.unwrap().contains("unprivileged_userns_clone"));
         let other = Bubblewrap::Unusable {
             path: "/usr/bin/bwrap".into(),
             reason: "bwrap: Can't mount proc".into(),
         };
-        assert!(bubblewrap_finding(&other, None).unwrap().fix.is_none());
+        assert!(
+            bubblewrap_finding(&other, None, None)
+                .unwrap()
+                .fix
+                .is_none()
+        );
+        // The sysctl, not the error text, picks the AppArmor fix (#834).
+        let fix = bubblewrap_finding(&other, None, Some(apparmor_fix_text(false)))
+            .unwrap()
+            .fix
+            .unwrap();
+        assert!(fix.contains("profile bwrap /usr/bin/bwrap"), "{fix}");
+        assert!(fix.contains("userns,"), "{fix}");
+        assert!(
+            fix.contains("apparmor_parser -r /etc/apparmor.d/bwrap"),
+            "{fix}"
+        );
     }
 
     #[test]

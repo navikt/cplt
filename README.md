@@ -967,6 +967,8 @@ What cplt does not protect against:
 - Network attacks on allowed domains. If github.com is allowed, the agent can read and write there
 - macOS Keychain access, for agents that store auth there. Contents are password-protected, and `sandbox.keychain_substitute` can trade the grant away where an agent has another credential
 
+The MCP host broker, which keeps a local MCP server's credential out of the sandbox, runs on macOS and on Linux under Bubblewrap. On Ubuntu 24.04 that takes a one-time AppArmor profile, which cplt prints. Without Bubblewrap cplt refuses the broker. See the [platform table](SECURITY.md#mcp-host-broker-where-it-runs).
+
 Our priorities, in order: **correct** (every claim is tested, every edge case has a CVE or research reference), **transparent** ([SECURITY.md](SECURITY.md) hides nothing), **simple** (one binary, zero config required, sane defaults), and **useful** (get out of the way and let the agent work, safely).
 
 More: [docs/security.md](docs/security.md) · [SECURITY.md](SECURITY.md)

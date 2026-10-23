@@ -1030,6 +1030,24 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         });
     }
 
+    // ── MCP broker socket (#834): one exact path. Read+write is what
+    // `connect(2)` needs from ABI v9; under bubblewrap it is also the writable
+    // bind that carries the socket past the private /tmp. `prepare` refuses a
+    // socket without bubblewrap, since below v9 nothing else masks D-Bus.
+    if let Some(socket) = config.mcp_socket {
+        fs_rules.push(FsRule {
+            nofollow: false,
+            path: socket.to_path_buf(),
+            access: FsAccess {
+                read: true,
+                write: true,
+                execute: false,
+                ioctl: false,
+                create_dirs: false,
+            },
+        });
+    }
+
     // ── GPG signing files (read-only subset of ~/.gnupg) ──
     if config.allow_gpg_signing {
         for &file in policy::GPG_SIGNING_ALLOW_FILES {
@@ -4148,6 +4166,44 @@ mod tests {
         assert!(rule.access.write);
         assert!(!rule.access.execute);
         assert!(!rule.access.ioctl);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mcp_socket_is_one_read_write_rule_and_a_bwrap_bind() {
+        let project = PathBuf::from("/fake/user/project");
+        let home = PathBuf::from("/fake/user");
+        let mut config = test_config(&project, &home);
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("m");
+        let _l = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        config.mcp_socket = Some(&socket);
+        let policy = generate_policy(&config);
+        let rule = policy
+            .fs_rules
+            .iter()
+            .find(|r| r.path == socket)
+            .expect("the socket gets a rule");
+        assert!(rule.access.read && rule.access.write);
+        assert!(!rule.access.execute && !rule.access.create_dirs);
+        let s = socket.to_string_lossy().into_owned();
+        let args = super::super::bubblewrap::build_bwrap_args(
+            &policy.fs_rules,
+            super::super::bubblewrap::Overlays::default(),
+            &super::super::bubblewrap::DenyMasks::default(),
+        );
+        let tmpfs = args.iter().position(|a| a == "--tmpfs").unwrap();
+        let bind = args
+            .windows(3)
+            .position(|w| w[0] == "--bind" && w[1] == s && w[2] == s)
+            .expect("the socket is bound into the namespace");
+        assert!(bind > tmpfs, "after the private /tmp, or it is hidden");
+        assert!(
+            !args
+                .windows(2)
+                .any(|w| w[0] == "--bind" && w[1] == dir.path().to_string_lossy()),
+            "only the socket, not its directory"
+        );
     }
 
     #[test]

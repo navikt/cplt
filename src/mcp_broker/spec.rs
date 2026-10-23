@@ -465,21 +465,9 @@ pub(crate) fn load_with(
 /// Launch detection: load, print one line per rejected spec. The launch
 /// always continues.
 pub fn detect(home: &Path, writable: &[PathBuf], disabled: &[String]) -> Detected {
-    let mut found = load(&spec_dir(home), writable, disabled);
+    let found = load(&spec_dir(home), writable, disabled);
     for r in &found.rejected {
         crate::ui::warn(&r.line());
-    }
-    if !cfg!(target_os = "macos") && !found.specs.is_empty() {
-        crate::ui::warn(&format!(
-            "the MCP broker runs on macOS only for now: {} left as configured.",
-            found
-                .specs
-                .iter()
-                .map(|s| s.id.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-        found.specs.clear();
     }
     found
 }

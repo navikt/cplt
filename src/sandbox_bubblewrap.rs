@@ -886,11 +886,18 @@ pub(crate) fn build_deny_masks(
 
 /// Create the mode-000 empty file used as the bind source for file masks.
 fn create_mask_placeholder(scratch: &Path) -> Result<PathBuf, String> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::OpenOptionsExt;
     let path = scratch.join("deny-mask");
-    std::fs::write(&path, b"").map_err(|e| format!("write {}: {e}", path.display()))?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
-        .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+    // Planned more than once per launch (the MCP broker check, #834, then
+    // `prepare`): the earlier copy is mode 000, so write would fail. The
+    // agent has not started yet, so the file is still cplt's own.
+    let _ = std::fs::remove_file(&path);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o000)
+        .open(&path)
+        .map_err(|e| format!("create {}: {e}", path.display()))?;
     Ok(path)
 }
 
@@ -3028,6 +3035,21 @@ mod tests {
             .position(|w| w[0] == "--tmpfs" && w[1] == dir_canon)
             .unwrap();
         assert!(file_pos < dir_pos, "file masks must precede dir masks");
+    }
+
+    #[test]
+    fn a_second_plan_still_masks_files() {
+        // #834: the MCP broker check plans the masks before `prepare` does.
+        let base = non_tmp_tempdir();
+        let scratch = base.path().join("scratch");
+        std::fs::create_dir(&scratch).expect("scratch");
+        let bus = base.path().join("bus");
+        std::fs::write(&bus, "").expect("bus");
+        let bus = bus.canonicalize().unwrap();
+        for _ in 0..2 {
+            let masks = build_deny_masks(&[], std::slice::from_ref(&bus), &[], Some(&scratch));
+            assert!(masks.covers(&bus), "{:?}", masks.placeholder_error);
+        }
     }
 
     #[test]

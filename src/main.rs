@@ -4795,6 +4795,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             playwright_socket_guard: _playwright_socket_guard,
         worktree_broker,
         mcp_broker,
+        mcp_supported,
         ..
     } = assemble_sandbox(
         &cli,
@@ -4815,6 +4816,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             inspect_only: cli.print_profile || mcp_status.is_some(),
             opencode_v2,
             mcp: mcp_status.is_none().then_some(&mcp_found),
+            mcp_probe: mcp_status.is_some(),
         },
     )?;
     // `cplt mcp status`: the same specs, judged by this launch's final policy.
@@ -4828,6 +4830,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             &home_dir,
             &found,
             resolved.mcp_broker,
+            mcp_supported,
         ));
     }
 
@@ -6259,6 +6262,8 @@ struct AssemblyOptions<'a> {
     /// Brokered MCP servers to serve (#824); `None` off the launch path.
     /// Checked against the final policy before the broker starts.
     mcp: Option<&'a cplt::mcp_broker::Detected>,
+    /// `cplt mcp status`: probe whether this host can run the broker (#834).
+    mcp_probe: bool,
 }
 
 /// A fully-built sandbox plus the live resources it depends on.
@@ -6282,6 +6287,8 @@ struct AssembledSandbox {
     worktree_broker: Option<cplt::worktree_broker::Broker>,
     /// Serves `cplt mcp-stdio` (#824). Dropping it stops every child.
     mcp_broker: Option<cplt::mcp_broker::Broker>,
+    /// With `mcp_probe`: whether the broker can run on this host.
+    mcp_supported: bool,
 }
 
 /// Start the managed-worktree broker for a launch (#531), or `None` when the
@@ -6650,6 +6657,18 @@ fn assemble_sandbox(
         if found.specs.is_empty() {
             return None;
         }
+        if let Some(why) = sandbox::mcp_broker_refusal(&sandbox_config) {
+            ui::warn(&format!(
+                "MCP broker off, {} left as configured: {why}.",
+                found
+                    .specs
+                    .iter()
+                    .map(|s| s.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            return None;
+        }
         let log = cplt::mcp_broker::Log {
             file: resolved.proxy_log_file.clone(),
         };
@@ -6657,6 +6676,7 @@ fn assemble_sandbox(
             .inspect_err(|e| ui::warn(&format!("MCP broker unavailable: {e}. Left as configured.")))
             .ok()
     });
+    let mcp_supported = opts.mcp_probe && sandbox::mcp_broker_refusal(&sandbox_config).is_none();
     let read_denies = sandbox::ReadDenies::from_config_for_current_os(&sandbox_config);
     // Here, not at each caller: the launch, `exec` and `check` all build their
     // policy through this function, and all three must say it.
@@ -6698,6 +6718,7 @@ fn assemble_sandbox(
         playwright_socket_guard,
         worktree_broker,
         mcp_broker,
+        mcp_supported,
     })
 }
 
@@ -6848,6 +6869,7 @@ fn prepare_shell_sandbox(
             inspect_only: true,
             opencode_v2: false,
             mcp: None,
+            mcp_probe: false,
         },
     )
 }
@@ -6998,6 +7020,7 @@ fn run_exec_command(
             playwright_socket_guard: _playwright_socket_guard,
         worktree_broker,
         mcp_broker: _,
+        mcp_supported: _,
     } = {
         let mut probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
         // `exec` never writes the managed block, so it gets no read on a root
@@ -7022,6 +7045,7 @@ fn run_exec_command(
                 inspect_only: cli.print_profile,
                 opencode_v2: false,
                 mcp: None,
+                mcp_probe: false,
             },
         )?
     };
@@ -8722,6 +8746,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         findings.extend(doctor::bubblewrap_finding(
             &bubblewrap,
             resolved.use_bubblewrap,
+            doctor::apparmor_fix(),
         ));
     }
 

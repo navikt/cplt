@@ -345,8 +345,10 @@ stdio; the broker checks `protocolVersion` in `initialize` and refuses
 others. JSON-RPC batch arrays are rejected with an error; there is no
 legacy (2025-03-26) batch handling. No secret path is needed: as in the
 worktree broker, the client is the sandboxed agent, which already holds
-that authority. Linux needs a bwrap bind of the socket directory; it comes
-after macOS.
+that authority. On Linux (#834) the socket sits in a 0700
+`/tmp/cplt-mcp-<id>/`, and Bubblewrap binds the
+socket file itself past its private `/tmp`; the Landlock rule is read+write
+on that one path, which is what `connect(2)` needs from ABI v9.
 
 **Remote (kind A): HTTP on the proxy port behind a secret path**, as #807.
 Kept until a third server makes the shared model worth it (D15).
@@ -471,8 +473,11 @@ Linux residual for `nais-keychain`: without active bubblewrap (or below
 Landlock ABI v9), the agent can read Secret Service directly over D-Bus,
 including nais's item, whatever the broker does (SECURITY.md:1589-1606).
 The broker keeps the credential out of the sandbox's config and env; it
-does not close that D-Bus path. Phase 1b must require bubblewrap's bus
-masks, or state the exposure at launch.
+does not close that D-Bus path. Phase 1b (#834) therefore refuses the
+broker unless Bubblewrap wraps the run and masks every bus and systemd socket
+that exists (`sandbox::mcp_broker_refusal`), and makes that run's Bubblewrap
+strict, so a spawn-time failure stops the run rather than falling back to
+Landlock alone. The sandbox gets no D-Bus; the host child keeps it.
 
 A new mechanism is a cplt change; a new server using an existing one is
 not. GitHub token refresh: read at launch; a login mid-session needs a
