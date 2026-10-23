@@ -58,8 +58,6 @@ const SYSTEM_BUNDLES: &[&str] = &[
 
 const CA_FILE_LIMIT: u64 = 8 * 1024 * 1024;
 const MAX_HEAD: usize = 64 * 1024;
-/// How long one turn of the duplex loop waits on each side.
-const POLL: Duration = Duration::from_millis(10);
 
 pub const FULL_BUNDLE: &str = "cplt-ca-bundle.pem";
 pub const NODE_BUNDLE: &str = "cplt-node-ca.pem";
@@ -103,11 +101,32 @@ pub fn setup(scratch: &Path) -> Result<(), String> {
 }
 
 /// Read a PEM file the user named, which may sit somewhere the agent can
-/// write: no symlinks, no FIFOs, capped. Kept only when it holds a cert.
+/// write: no symlinks, no FIFOs, capped. `None` when it holds no cert.
 fn read_ca_file(path: &Path) -> Option<String> {
     let text = crate::untrusted::read_untrusted(path, CA_FILE_LIMIT).ok()??;
-    text.contains("-----BEGIN CERTIFICATE-----")
-        .then(|| format!("{}\n", text.trim_end()))
+    let pem = certs_only(&text);
+    (!pem.is_empty()).then_some(pem)
+}
+
+/// Only the CERTIFICATE blocks of `text`, re-encoded. The bundles are
+/// agent-readable, and a combined cert-and-key file must not carry its key
+/// into them.
+fn certs_only(text: &str) -> String {
+    CertificateDer::pem_slice_iter(text.as_bytes())
+        .flatten()
+        .map(|der| {
+            let b64 = B64.encode(der.as_ref());
+            let lines: Vec<&str> = b64
+                .as_bytes()
+                .chunks(64)
+                .map(|c| std::str::from_utf8(c).unwrap_or_default())
+                .collect();
+            format!(
+                "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+                lines.join("\n")
+            )
+        })
+        .collect()
 }
 
 fn build(system: &str, user: &str, scratch: &Path) -> Result<Injector, String> {
@@ -282,20 +301,28 @@ fn real_for(placeholder: &str) -> Option<SecretToken> {
 /// its environment with a placeholder. Runs after every other env step, so
 /// nothing set later can bring a real token back. A no-op when injection is
 /// off.
-pub fn apply_to_child(cmd: &mut Command) {
+///
+/// `inherit_env` says whether the child inherits the parent environment.
+/// Without it the child gets only what was set on `cmd`, and this must never
+/// add a variable the allowlist kept out.
+pub fn apply_to_child(cmd: &mut Command, inherit_env: bool) {
     let Some(inj) = INJECTOR.get() else {
         return;
     };
-    mask_child_env(cmd);
+    mask_child_env(cmd, inherit_env);
     cmd.env("SSL_CERT_FILE", &inj.full_bundle);
     cmd.env("GIT_SSL_CAINFO", &inj.full_bundle);
     cmd.env("NODE_EXTRA_CA_CERTS", &inj.node_bundle);
 }
 
-fn mask_child_env(cmd: &mut Command) {
-    // The child sees explicit entries over inherited ones.
-    let mut env: HashMap<String, Option<String>> =
-        std::env::vars().map(|(k, v)| (k, Some(v))).collect();
+fn mask_child_env(cmd: &mut Command, inherit_env: bool) {
+    // The env the child actually gets: explicit entries, over inherited ones
+    // only in inherit mode. Masking only ever rewrites a value in it.
+    let mut env: HashMap<String, Option<String>> = if inherit_env {
+        std::env::vars().map(|(k, v)| (k, Some(v))).collect()
+    } else {
+        HashMap::new()
+    };
     for (k, v) in cmd.get_envs() {
         env.insert(
             k.to_string_lossy().into_owned(),
@@ -390,9 +417,9 @@ pub fn swap_authorization(value: &str) -> Option<String> {
 fn rewrite_head(host: &str, head: &str) -> String {
     let mut lines = head.split("\r\n");
     let request_line = lines.next().unwrap_or("");
-    let mut parts = request_line.split(' ');
-    let (method, target) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
-    let inject = may_inject(host, method, target);
+    // Anything but exactly `METHOD TARGET VERSION` gets no token.
+    let parts: Vec<&str> = request_line.split_whitespace().collect();
+    let inject = matches!(parts[..], [method, target, _] if may_inject(host, method, target));
     let headers: Vec<&str> = lines.filter(|l| !l.is_empty()).collect();
     let upgrade = headers.iter().any(|l| {
         l.split_once(':')
@@ -464,7 +491,17 @@ fn serve_inner(
         .and_then(|()| up.write_all(&rest))
         .and_then(|()| up.flush())
         .map_err(|e| e.to_string())?;
-    duplex(&mut down, &mut up, timeout);
+    duplex(
+        Side {
+            conn: down.conn.into(),
+            sock: down.sock,
+        },
+        Side {
+            conn: up.conn.into(),
+            sock: up.sock,
+        },
+        timeout,
+    );
     Ok(())
 }
 
@@ -538,61 +575,120 @@ fn is_wait(e: &std::io::Error) -> bool {
     )
 }
 
-/// Pump both directions on one thread until either side closes or nothing
-/// moves for an hour (the plain relay's ceiling).
+/// One TLS side of an intercepted tunnel.
+struct Side {
+    conn: rustls::Connection,
+    sock: TcpStream,
+}
+
+/// Pump both directions until either side closes, a write cannot finish, or
+/// nothing moves for an hour (the plain relay's ceiling).
 ///
-/// ponytail: polls each side every 10 ms instead of `poll(2)` on both fds,
-/// since rustls may hold decrypted bytes the socket no longer shows. Fine for
-/// a handful of GitHub connections; switch to readiness polling if it shows
-/// up in profiles.
-fn duplex(
-    down: &mut rustls::StreamOwned<ServerConnection, TcpStream>,
-    up: &mut rustls::StreamOwned<ClientConnection, TcpStream>,
-    timeout: Duration,
-) {
+/// One thread, woken by `poll(2)` on both sockets rather than two pump
+/// threads: a rustls connection is one state machine for both directions
+/// and cannot be split across threads without a lock around every record.
+/// Plaintext rustls already holds is drained before each wait, so nothing
+/// sits behind a socket that shows no new bytes. Writes go through
+/// `write_tls` on sockets with a write timeout; rustls keeps the unsent tail,
+/// so a timeout is a retry, not a truncated record (the `write_bounded`
+/// rule).
+fn duplex(down: Side, up: Side, timeout: Duration) {
+    use std::os::fd::AsRawFd as _;
     const CEILING: Duration = Duration::from_secs(3600);
-    for s in [&down.sock, &up.sock] {
-        s.set_read_timeout(Some(POLL)).ok();
-        s.set_write_timeout(Some(timeout)).ok();
+    let mut sides = [down, up];
+    for s in &sides {
+        s.sock.set_write_timeout(Some(timeout)).ok();
     }
-    let mut buf = vec![0u8; 16 * 1024];
+    let mut buf = vec![0u8; 64 * 1024];
     let mut last = Instant::now();
-    loop {
-        let mut moved = false;
-        match down.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                if up.write_all(&buf[..n]).and_then(|()| up.flush()).is_err() {
-                    break;
-                }
-                moved = true;
+    'run: loop {
+        {
+            let [a, b] = &mut sides;
+            if !forward(a, b, &mut buf, &mut last, CEILING)
+                || !forward(b, a, &mut buf, &mut last, CEILING)
+            {
+                break;
             }
-            Err(e) if is_wait(&e) => {}
-            Err(_) => break,
         }
-        match up.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                if down
-                    .write_all(&buf[..n])
-                    .and_then(|()| down.flush())
-                    .is_err()
-                {
-                    break;
-                }
-                moved = true;
+        let mut fds = sides.each_ref().map(|s| libc::pollfd {
+            fd: s.sock.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        });
+        // SAFETY: `fds` is a live array of two initialised pollfds.
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, 1000) };
+        if n < 0 {
+            if std::io::Error::last_os_error().kind() == ErrorKind::Interrupted {
+                continue;
             }
-            Err(e) if is_wait(&e) => {}
-            Err(_) => break,
+            break;
         }
-        if moved {
-            last = Instant::now();
-        } else if last.elapsed() >= CEILING {
+        for (side, fd) in sides.iter_mut().zip(fds) {
+            if fd.revents == 0 {
+                continue;
+            }
+            match side.conn.read_tls(&mut side.sock) {
+                Ok(0) => break 'run,
+                Ok(_) => {
+                    last = Instant::now();
+                    if side.conn.process_new_packets().is_err() {
+                        break 'run;
+                    }
+                }
+                Err(e) if is_wait(&e) => {}
+                Err(_) => break 'run,
+            }
+        }
+        if last.elapsed() >= CEILING {
             break;
         }
     }
-    down.conn.send_close_notify();
-    let _ = down.flush();
+    for side in &mut sides {
+        side.conn.send_close_notify();
+        let _ = flush_tls(side, &mut last, CEILING);
+    }
+}
+
+/// Move all plaintext `src` holds to `dst`, and send what either owes its
+/// socket. False when the tunnel should end.
+fn forward(
+    src: &mut Side,
+    dst: &mut Side,
+    buf: &mut [u8],
+    last: &mut Instant,
+    ceiling: Duration,
+) -> bool {
+    loop {
+        match src.conn.reader().read(buf) {
+            // Clean close_notify from this side.
+            Ok(0) => return false,
+            Ok(n) => {
+                if dst.conn.writer().write_all(&buf[..n]).is_err() || !flush_tls(dst, last, ceiling)
+                {
+                    return false;
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+            Err(_) => return false,
+        }
+    }
+    flush_tls(src, last, ceiling)
+}
+
+fn flush_tls(side: &mut Side, last: &mut Instant, ceiling: Duration) -> bool {
+    while side.conn.wants_write() {
+        match side.conn.write_tls(&mut side.sock) {
+            Ok(0) => return false,
+            Ok(_) => *last = Instant::now(),
+            Err(e) if is_wait(&e) => {
+                if last.elapsed() >= ceiling {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -717,7 +813,7 @@ pub(crate) mod tests {
         cmd.env("GH_TOKEN", real);
         cmd.env("OPENCODE_AUTH_CONTENT", format!(r#"{{"t":"{real}"}}"#));
         cmd.env("COPILOT_GITHUB_TOKEN", "not-a-github-token");
-        mask_child_env(&mut cmd);
+        mask_child_env(&mut cmd, true);
         let env: HashMap<String, String> = cmd
             .get_envs()
             .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v?.to_str()?.to_string())))
@@ -727,6 +823,62 @@ pub(crate) mod tests {
         assert_eq!(env["OPENCODE_AUTH_CONTENT"], format!(r#"{{"t":"{p}"}}"#));
         assert_eq!(env["COPILOT_GITHUB_TOKEN"], "not-a-github-token");
         assert_eq!(real_for(p).unwrap().expose(), real);
+    }
+
+    /// Clear mode (the default launch): a token only the parent holds must
+    /// not be added to the child, masked or not.
+    #[test]
+    fn clear_mode_never_adds_parent_vars() {
+        let real = "gho_ParentOnly0123456789abcdefghijklmnop";
+        temp_env::with_vars(
+            [
+                ("GH_TOKEN", Some(real)),
+                ("OPENCODE_AUTH_CONTENT", Some(real)),
+            ],
+            || {
+                #[allow(clippy::disallowed_methods)] // never spawned; only its env is read
+                let mut cmd = Command::new("true");
+                cmd.env_clear();
+                cmd.env("KEEP", "1");
+                mask_child_env(&mut cmd, false);
+                let names: Vec<_> = cmd.get_envs().map(|(k, _)| k.to_owned()).collect();
+                assert_eq!(names, vec![std::ffi::OsString::from("KEEP")]);
+            },
+        );
+    }
+
+    #[test]
+    fn bundles_carry_certificates_only() {
+        let (_, _, cert) = new_ca().unwrap();
+        let key = rcgen::KeyPair::generate().unwrap().serialize_pem();
+        let out = certs_only(&format!("{key}{cert}"));
+        assert_eq!(out.trim(), cert.trim().replace("\r\n", "\n"));
+        assert!(!out.contains("PRIVATE KEY"));
+        assert_eq!(certs_only(&key), "");
+    }
+
+    #[test]
+    fn malformed_request_lines_get_no_token() {
+        let real = "ghs_RequestLine0123456789abcdefghijklmn";
+        let p = register(real);
+        for line in [
+            "POST\t/mcp HTTP/1.1",
+            "POST  /mcp HTTP/1.1",
+            "GET /user",
+            "GET /user HTTP/1.1 extra",
+        ] {
+            let out = rewrite_head(
+                "api.githubcopilot.com",
+                &format!("{line}\r\nAuthorization: Bearer {p}"),
+            );
+            assert!(!out.contains(real), "{line}");
+        }
+        // Extra whitespace alone does not block a legitimate request.
+        let out = rewrite_head(
+            "api.github.com",
+            &format!("GET  /user HTTP/1.1\r\nAuthorization: Bearer {p}"),
+        );
+        assert!(out.contains(real));
     }
 
     #[test]
@@ -762,6 +914,7 @@ pub(crate) mod tests {
     #[test]
     fn tunnel_swaps_the_token_through_tls() {
         use std::net::TcpListener;
+        const BIG: usize = 16 * 1024 * 1024;
         let real = "gho_Tunnel0123456789abcdefghijklmnopqrstu";
         let p = register(real);
 
@@ -788,8 +941,14 @@ pub(crate) mod tests {
             let (s, _) = origin.accept().unwrap();
             let mut tls = rustls::StreamOwned::new(ServerConnection::new(ocfg).unwrap(), s);
             let (head, _) = read_head(&mut tls, Duration::from_secs(10)).unwrap();
-            tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
-                .unwrap();
+            // A large body: the tunnel must not throttle (git clone).
+            tls.write_all(
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {BIG}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .unwrap();
+            tls.write_all(&vec![b'x'; BIG - 2]).unwrap();
+            tls.write_all(b"ok").unwrap();
             tls.conn.send_close_notify();
             let _ = tls.flush();
             head
@@ -837,9 +996,16 @@ pub(crate) mod tests {
             .as_bytes(),
         )
         .unwrap();
+        let started = Instant::now();
         let mut resp = Vec::new();
         let _ = c.read_to_end(&mut resp);
-        assert!(String::from_utf8_lossy(&resp).ends_with("ok"));
+        assert!(resp.len() > BIG && resp.ends_with(b"ok"));
+        // The old 10 ms poll managed about 1.5 MB/s: 16 MiB took over 10 s.
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
 
         let head = seen.join().unwrap();
         assert!(head.contains(&format!("Authorization: Bearer {real}")));
