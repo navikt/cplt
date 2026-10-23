@@ -26,6 +26,18 @@ pub struct SandboxEnv {
 /// to other agents. These contain GitHub auth tokens that OpenCode doesn't need.
 const COPILOT_ONLY_VARS: &[&str] = &["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"];
 
+/// Provider keys OpenCode's voice mode (GPT-Live, OpenCode 2.1.3+) reads
+/// straight from the environment, ignoring `enabled_providers` (#814). Stripped
+/// for `--agent opencode` in every mode, `--pass-env` included, so a voice
+/// session cannot send audio to a provider other than GitHub Copilot.
+const OPENCODE_VOICE_VARS: &[&str] = &[
+    "OPENAI_API_KEY",
+    "XAI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GOOGLE_GENERATIVE_AI_API_KEY",
+    "GEMINI_API_KEY",
+];
+
 /// Environment variable prefix that is Copilot-specific.
 const COPILOT_ONLY_PREFIXES: &[&str] = &["COPILOT_"];
 
@@ -244,6 +256,27 @@ pub fn build_sandbox_env(
             env.vars.push((
                 "CLAUDE_CONFIG_DIR".to_string(),
                 format!("{state_base}/opencode/claude-config"),
+            ));
+        }
+    }
+
+    if agent == Agent::OpenCode {
+        let stripped: Vec<&str> = OPENCODE_VOICE_VARS
+            .iter()
+            .copied()
+            .filter(|v| parent_env.iter().any(|(k, _)| k == v))
+            .collect();
+        env.vars
+            .retain(|(k, _)| !OPENCODE_VOICE_VARS.contains(&k.as_str()));
+        if inherit_env {
+            env.remove
+                .extend(OPENCODE_VOICE_VARS.iter().map(ToString::to_string));
+        }
+        if !stripped.is_empty() {
+            // Names only, never values.
+            crate::ui::info(&format!(
+                "Stripped for OpenCode (voice provider keys): {}",
+                stripped.join(", ")
             ));
         }
     }
@@ -849,6 +882,43 @@ mod tests {
             ),
             "--no-warnings"
         );
+    }
+
+    #[test]
+    fn opencode_strips_voice_provider_keys_in_every_mode() {
+        let parent: Vec<(String, String)> = OPENCODE_VOICE_VARS
+            .iter()
+            .map(|k| (k.to_string(), "secret".to_string()))
+            .collect();
+        let pass: Vec<String> = OPENCODE_VOICE_VARS
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        // Sanitized mode drops them even when named in --pass-env.
+        let env = build_sandbox_env(&parent, &pass, false, &[], None, None, Agent::OpenCode);
+        for v in OPENCODE_VOICE_VARS {
+            assert!(!env.vars.iter().any(|(k, _)| k == v), "{v} leaked");
+        }
+        // Without --pass-env the generic allowlist already keeps them out.
+        let env = build_sandbox_env(&parent, &[], false, &[], None, None, Agent::Shell);
+        assert!(
+            env.vars
+                .iter()
+                .all(|(k, _)| !OPENCODE_VOICE_VARS.contains(&k.as_str()))
+        );
+        // Inherit mode removes them.
+        let env = build_sandbox_env(&parent, &pass, true, &[], None, None, Agent::OpenCode);
+        for v in OPENCODE_VOICE_VARS {
+            assert!(env.remove.iter().any(|k| k == v), "{v} not removed");
+        }
+        // Other agents keep an explicit --pass-env.
+        for agent in [Agent::Pi, Agent::Goose, Agent::Claude] {
+            let env = build_sandbox_env(&parent, &pass, false, &[], None, None, agent);
+            assert!(
+                env.vars.iter().any(|(k, _)| k == "OPENAI_API_KEY"),
+                "{agent:?}"
+            );
+        }
     }
 
     #[test]
