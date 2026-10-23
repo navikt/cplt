@@ -773,12 +773,18 @@ fn install_command_wrappers(
             match crate::gh_proxy::launch_repo(real_git, project_dir) {
                 Ok(repo) => repo_scope.push(repo),
                 Err(reason) => {
-                    SCOPE_WARNED.call_once(|| {
-                        ui::warn(&format!(
-                            "gh guard could not capture repository scope: {reason}. \
-                             Scope-checked commands will be blocked."
-                        ));
-                    });
+                    // No remote (or no repository): nothing to fix, and
+                    // nothing a scope could name. Only --verbose says so.
+                    let actionable =
+                        crate::gh_proxy::launch_repo_facts(real_git, project_dir, false).1;
+                    if actionable || ui::verbose() {
+                        SCOPE_WARNED.call_once(|| {
+                            ui::warn(&format!(
+                                "gh guard could not capture repository scope: {reason}. \
+                                 Scope-checked commands will be blocked."
+                            ));
+                        });
+                    }
                 }
             }
             for dir in repo_dirs {

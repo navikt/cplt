@@ -884,11 +884,35 @@ fn grant_dir(home: &Path, entry: &Path, reads: &mut Vec<PathBuf>) -> Result<(), 
         reads.push(real.clone());
         return Ok(());
     }
-    let to = real.map_or_else(|_| "nothing".into(), |r| r.display().to_string());
+    let cause = match &real {
+        Err(_) => "is a dangling symlink".to_string(),
+        Ok(r) if !r.is_dir() => format!("resolves to {}, which is not a directory", r.display()),
+        Ok(r) => format!(
+            "resolves to {}, which holds or sits inside a path the sandbox denies \
+             (credentials or cplt's own state)",
+            r.display()
+        ),
+    };
+    let parent = entry.parent().unwrap_or(entry);
+    // $HOME and its parents are listed from any launch dir.
+    let elsewhere = if home.starts_with(parent) {
+        String::new()
+    } else {
+        format!(
+            "  - launch from a directory outside {} (another checkout or worktree);\n",
+            parent.display()
+        )
+    };
     Err(format!(
-        "{} points to {to}, which is not a directory the sandbox allows. OpenCode v2 \
-         reads it at startup. Remove the link or point it at a directory.",
-        entry.display()
+        "{} {cause}.\n  \
+         OpenCode v2 lists every .claude, .agents and .opencode entry in $HOME and in \
+         each parent of the launch directory at startup, and stops if it cannot. cplt \
+         will not open this one to it.\n  \
+         To fix it, do one of these:\n  \
+         - point the entry at a plain directory with no credentials in it, or remove it;\n\
+         {elsewhere}  \
+         - run another agent for this project, e.g. --agent copilot.",
+        entry.display(),
     ))
 }
 
@@ -1147,6 +1171,24 @@ mod tests {
         let cat = state.join("service.json");
         assert!(!run(&guarded, &["/bin/cat", cat.to_str().unwrap()]));
         assert!(run("(version 1)(allow default)", &mv), "control");
+    }
+
+    /// A refused ancestor `.claude` says why and what to do instead.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn refused_ancestor_dir_entry_names_cause_and_remedy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let (home, a, c) = (root.join("h"), root.join("a"), root.join("a/b/c"));
+        std::fs::create_dir_all(&c).unwrap();
+        std::os::unix::fs::symlink(root.join("gone"), a.join(".claude")).unwrap();
+        let err = profile_tail(&home, &c, &[root.join("x/service.json")], 1).unwrap_err();
+        assert!(err.contains("is a dangling symlink"), "{err}");
+        assert!(
+            err.contains(&format!("launch from a directory outside {}", a.display())),
+            "{err}"
+        );
+        assert!(err.contains("--agent"), "{err}");
     }
 
     /// Kernel check (#718): a plain `opencode.json` or `AGENTS.md` in an

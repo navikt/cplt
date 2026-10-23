@@ -276,6 +276,13 @@ struct Cli {
     #[arg(long = "allow-write", value_name = "PATH")]
     allow_write: Vec<PathBuf>,
 
+    /// Like --allow-write, for a tool's own state (caches, session stores).
+    /// The grant is identical; the exit audit leaves these paths out of its
+    /// "writable paths NOT audited" warning, and --verbose lists them as tool
+    /// state instead. Can be specified multiple times.
+    #[arg(long = "allow-write-state", value_name = "PATH")]
+    allow_write_state: Vec<PathBuf>,
+
     /// DANGEROUS: let the agent execute binaries from a tree outside the
     /// default tool directories, e.g. a relocated Homebrew or toolchain prefix.
     /// Grants read + execute, never write. Refused for an unsafe root (/, /tmp,
@@ -1633,6 +1640,39 @@ use cplt::ui;
 const CONFIRM_PROMPT: &str =
     "Proceed? (skip once with --yes, or always with `cplt config set sandbox.yes true`) [y/N] ";
 
+/// Whether a controlling terminal is there to prompt on.
+fn has_tty() -> bool {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .is_ok()
+}
+
+/// Ask before launching unless `--yes` was given or this exact profile was
+/// confirmed before on a TTY, then record the profile as confirmed. Recording
+/// only after a yes means a declined launch prompts again next time. The
+/// record lives in cplt's state dir, which the sandbox denies, so the agent
+/// cannot mark a widened profile as confirmed.
+fn confirm_launch(
+    resolved: &config::Resolved,
+    confirm: Option<&cplt::launch_state::Confirmation>,
+    home: &Path,
+    project: &Path,
+) -> anyhow::Result<()> {
+    let seen = confirm.is_some_and(|c| c.confirmed);
+    if seen && !resolved.yes && ui::verbose() {
+        ui::info("Profile unchanged since you last confirmed it; not asking again");
+    }
+    if let Err(e) = prompt_confirm(resolved.yes || seen, resolved.quiet) {
+        bail!("{e}");
+    }
+    if let Some(c) = confirm {
+        c.record(home, project);
+    }
+    Ok(())
+}
+
 /// Prompt the user to confirm the sandbox configuration.
 ///
 /// Returns Ok(()) if the user confirms, Err with message if they decline or
@@ -1684,6 +1724,15 @@ fn prompt_confirm(auto_yes: bool, quiet: bool) -> Result<(), String> {
     } else {
         Err("Aborted by user".to_string())
     }
+}
+
+/// The `--allow-write-state` grants, resolved the way `resolve_context` adds
+/// them to `allow_write`, so the audit can tell them apart (it warns there).
+fn write_state_paths(cli: &Cli) -> Vec<PathBuf> {
+    cli.allow_write_state
+        .iter()
+        .filter_map(|p| std::fs::canonicalize(p).ok())
+        .collect()
 }
 
 /// Canonicalize a list of allow paths, warning on failures and dropping one
@@ -2738,7 +2787,11 @@ fn warn_unlinked_child_repos(home_dir: &Path, project_dir: &Path, named_roots: &
 fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContext> {
     // Canonicalize CLI paths for consistency with config path handling
     let cli_allow_read = canonicalize_paths(&cli.allow_read, "--allow-read");
-    let cli_allow_write = canonicalize_paths(&cli.allow_write, "--allow-write");
+    let mut cli_allow_write = canonicalize_paths(&cli.allow_write, "--allow-write");
+    cli_allow_write.extend(canonicalize_paths(
+        &cli.allow_write_state,
+        "--allow-write-state",
+    ));
     let cli_allow_exec = canonicalize_paths(&cli.allow_exec, "--allow-exec");
     let cli_allow_socket = canonicalize_paths(&cli.allow_socket, "--allow-socket");
     let cli_deny_paths = canonicalize_deny_paths(&cli.deny_paths)?;
@@ -4987,22 +5040,24 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     }
 
     // Print comprehensive summary and confirm before launching Copilot
-    if !resolved.quiet {
-        resolved.print_summary(
+    let confirm = if resolved.quiet {
+        if !unapproved_proposals.is_empty() {
+            ui::warn(&untrusted_repo_config_notice(unapproved_proposals.len()));
+        }
+        None
+    } else {
+        Some(resolved.print_summary(
             &project_dir,
             &home_dir,
             active_agent,
             prepared.keychain_substitute(),
             &repo_rows,
             worktree_root.as_deref(),
-            cli.verbose || cli.print_profile || !resolved.yes,
-        );
-    } else if !unapproved_proposals.is_empty() {
-        ui::warn(&untrusted_repo_config_notice(unapproved_proposals.len()));
-    }
-    if let Err(e) = prompt_confirm(resolved.yes, resolved.quiet) {
-        bail!("{e}");
-    }
+            cli.verbose || cli.print_profile,
+            has_tty(),
+        ))
+    };
+    confirm_launch(&resolved, confirm.as_ref(), &home_dir, &project_dir)?;
 
     // Ensure Copilot's bundled runtime is extracted before entering the sandbox.
     // Writes to copilot/pkg are denied inside the sandbox (write-then-exec defense),
@@ -5108,6 +5163,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     let (exit_code, snapshot, settled) = audit::run(
         &project_dir,
         &resolved.allow_write,
+        &write_state_paths(&cli),
         &repo_paths,
         audit::AuditMode::for_run(audit_enabled, cli.observe_domains),
         &routing,
@@ -7098,7 +7154,7 @@ fn run_exec_command(
     }
 
     // Summary (only shown with --no-quiet)
-    if !resolved.quiet {
+    let confirm = (!resolved.quiet).then(|| {
         resolved.print_summary(
             &project_dir,
             &home_dir,
@@ -7106,12 +7162,11 @@ fn run_exec_command(
             prepared.keychain_substitute(),
             &repo_rows,
             worktree_root.as_deref(),
-            cli.verbose || cli.print_profile || !resolved.yes,
-        );
-    }
-    if let Err(e) = prompt_confirm(resolved.yes, resolved.quiet) {
-        bail!("{e}");
-    }
+            cli.verbose || cli.print_profile,
+            has_tty(),
+        )
+    });
+    confirm_launch(&resolved, confirm.as_ref(), &home_dir, &project_dir)?;
 
     let disabled_categories = resolved.disabled_hardening_categories();
 
@@ -7132,6 +7187,7 @@ fn run_exec_command(
     let (exit_code, snapshot, settled) = audit::run(
         &project_dir,
         &resolved.allow_write,
+        &write_state_paths(cli),
         &repo_paths,
         audit::AuditMode::for_run(audit_enabled, cli.observe_domains),
         &routing,
