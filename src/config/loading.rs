@@ -1953,9 +1953,9 @@ const QUIET_TIP_LAUNCHES: u32 = 3;
 /// sandbox-denied, so the agent cannot reset or silence the count. A read or
 /// write failure shows the tip: it is advice, and a missing file is a new user.
 fn quiet_tip_due(home: &Path) -> bool {
-    let file = home
-        .join(crate::sandbox::CPLT_STATE_DIR)
-        .join("quiet-tip-shown");
+    let name = "quiet-tip-shown";
+    let file =
+        crate::sandbox::cplt_state_dir_for(&crate::sandbox::process_env, home, name).join(name);
     let shown: u32 = std::fs::read_to_string(&file)
         .ok()
         .and_then(|s| s.trim().parse().ok())
@@ -1977,17 +1977,20 @@ mod tests {
 
     #[test]
     fn quiet_tip_shows_on_the_first_launches_only() {
-        let home = tempfile::tempdir().unwrap();
-        for _ in 0..QUIET_TIP_LAUNCHES {
-            assert!(quiet_tip_due(home.path()));
-        }
-        assert!(!quiet_tip_due(home.path()));
-        // The count lives in the sandbox-denied state dir, not a cache.
-        let file = home
-            .path()
-            .join(crate::sandbox::CPLT_STATE_DIR)
-            .join("quiet-tip-shown");
-        assert_eq!(std::fs::read_to_string(file).unwrap(), "3");
+        // Unset so the state lands in the temp home, not the real XDG dir.
+        temp_env::with_var_unset("XDG_CONFIG_HOME", || {
+            let home = tempfile::tempdir().unwrap();
+            for _ in 0..QUIET_TIP_LAUNCHES {
+                assert!(quiet_tip_due(home.path()));
+            }
+            assert!(!quiet_tip_due(home.path()));
+            // The count lives in the sandbox-denied state dir, not a cache.
+            let file = home
+                .path()
+                .join(crate::sandbox::CPLT_STATE_DIR)
+                .join("quiet-tip-shown");
+            assert_eq!(std::fs::read_to_string(file).unwrap(), "3");
+        });
     }
 
     #[test]

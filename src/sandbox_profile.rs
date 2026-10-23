@@ -21,16 +21,17 @@ macro_rules! sbpl {
 
 use super::SandboxConfig;
 use super::policy::{
-    CacheEnv, DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS,
-    DEPENDENCY_SOURCE_TREES, EXEC_IN_WRITABLE, GPG_SIGNING_ALLOW_FILES, HOME_CONFIG_FILES,
-    HomeToolDir, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir,
-    SENSITIVE_KEY_FILE_EXTENSION_PATTERNS, SENSITIVE_PROJECT_PATTERNS, SYSTEM_READ_FILES,
-    TOOL_READ_DIRS, XCODE_SELECT_LINK, active_tool_dirs, ancestor_alternation, app_dirs,
-    colima_socket_paths, copilot_default_pkg_dir, current_uid, cypress_app_data_dir_with_env,
-    cypress_runtime_intent, escape_regex, first_party_read_target, grant_is_refused,
-    home_config_link_targets, missing_home_config_link_targets, nested_alternation, path_bin_dirs,
-    playwright_runtime_intent, pnpm_config_dirs, pnpm_credential_files, read_only_home_config,
-    rel_is_glob, rel_regex, validate_playwright_socket_dir, validate_sbpl_path,
+    CPLT_STATE_DIR, CacheEnv, DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES,
+    DENIED_HOME_SUBPATHS, DEPENDENCY_SOURCE_TREES, EXEC_IN_WRITABLE, GPG_SIGNING_ALLOW_FILES,
+    HOME_CONFIG_FILES, HomeToolDir, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected,
+    ResolvedToolDir, SENSITIVE_KEY_FILE_EXTENSION_PATTERNS, SENSITIVE_PROJECT_PATTERNS,
+    SYSTEM_READ_FILES, TOOL_READ_DIRS, XCODE_SELECT_LINK, active_tool_dirs, ancestor_alternation,
+    app_dirs, colima_socket_paths, copilot_default_pkg_dir, current_uid,
+    cypress_app_data_dir_with_env, cypress_runtime_intent, escape_regex, first_party_read_target,
+    grant_is_refused, home_config_link_targets, missing_home_config_link_targets,
+    nested_alternation, path_bin_dirs, playwright_runtime_intent, pnpm_config_dirs,
+    pnpm_credential_files, read_only_home_config, rel_is_glob, rel_regex,
+    validate_playwright_socket_dir, validate_sbpl_path, xdg_state_dir,
 };
 
 /// Device nodes a sandboxed process may open for writing, by exact path.
@@ -2659,7 +2660,23 @@ fn emit_deny_rules(sb: &mut String, config: &SandboxConfig, home: &str) {
         }
         spellings(&named, &target)
     };
-    let dirs: Vec<Vec<String>> = DENIED_DOTFILES.iter().map(|d| spell(d, true)).collect();
+    // `$XDG_CONFIG_HOME/cplt` holds cplt's state when that variable moves it
+    // (#830), and is denied like `~/.config/cplt`. `cplt_state_dir` only
+    // returns UTF-8 paths, and the legacy one is already in the list.
+    // Denied even when this launch keeps state in the legacy dir: then nothing
+    // of cplt's is there, and a later launch may use it.
+    let legacy_state = Path::new(home).join(CPLT_STATE_DIR);
+    let moved_state: Vec<String> = xdg_state_dir(config.copilot_cache_env)
+        .filter(|dir| *dir != legacy_state)
+        .and_then(|dir| dir.to_str().map(str::to_owned))
+        .into_iter()
+        .collect();
+    let dirs: Vec<Vec<String>> = DENIED_DOTFILES
+        .iter()
+        .copied()
+        .chain(moved_state.iter().map(String::as_str))
+        .map(|d| spell(d, true))
+        .collect();
     // Hard-denied files, then the credential files inside allowed tool dirs
     // (the latter overridable with --allow-read, so no warning).
     // `sandbox.protect_pnpm_config` adds pnpm's token files, absolute paths
@@ -4280,6 +4297,40 @@ mod tests {
                 "a directory grant must produce no post-deny re-allow:\n{p}"
             );
         }
+    }
+
+    /// With `XDG_CONFIG_HOME` set, cplt's state lives in `$XDG_CONFIG_HOME/cplt`
+    /// and is denied like `~/.config/cplt`, which stays denied too (#830).
+    #[test]
+    fn profile_denies_the_xdg_state_dir_and_the_legacy_one() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let env = |name: &str| {
+            (name == "XDG_CONFIG_HOME").then(|| std::ffi::OsString::from("/Users/test/xdg"))
+        };
+        let mut opts = test_options(project, home);
+        opts.copilot_cache_env = &env;
+        let p = generate_profile(&opts, &[]);
+        for dir in ["/Users/test/xdg/cplt", "/Users/test/.config/cplt"] {
+            for op in ["file-read*", "file-write*"] {
+                let rule = format!(r#"(deny {op} (subpath "{dir}"))"#);
+                assert!(p.contains(&rule), "missing {rule}:\n{p}");
+            }
+        }
+    }
+
+    /// Without `XDG_CONFIG_HOME` the only state directory denied is `~/.config/cplt`.
+    #[test]
+    fn profile_without_xdg_config_home_names_only_the_legacy_state_dir() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let p = generate_profile(&test_options(project, home), &[]);
+        assert_eq!(
+            p.matches(r#"(deny file-read* (subpath "/Users/test/.config/cplt"))"#)
+                .count(),
+            1
+        );
+        assert!(!p.contains("xdg"), "{p}");
     }
 
     /// H-06: an explicit `--deny-path` on an *ancestor* of a path

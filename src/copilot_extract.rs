@@ -4,7 +4,7 @@
 //! into the platform cache on first run. The sandbox denies writes to that cache,
 //! so `cplt` has to force the extraction before entering it (#166).
 
-use cplt::sandbox::{CPLT_STATE_DIR, CacheEnv, copilot_pkg_dir, process_env};
+use cplt::sandbox::{CacheEnv, copilot_pkg_dir, cplt_state_dir_for, process_env};
 use cplt::ui;
 use std::path::Path;
 use std::path::PathBuf;
@@ -30,7 +30,7 @@ fn copilot_cache_dirs(
     };
     Ok((
         copilot_pkg_dir(env, home, std::env::consts::OS)?.join(format!("{platform}-{arch}")),
-        home.join(CPLT_STATE_DIR),
+        cplt_state_dir_for(env, home, "copilot-extracted"),
     ))
 }
 
@@ -74,6 +74,16 @@ pub fn ensure_copilot_extracted(
     home: &Path,
     project_dir: &Path,
 ) -> Result<(), String> {
+    ensure_copilot_extracted_in(&process_env, copilot_bin, home, project_dir)
+}
+
+/// [`ensure_copilot_extracted`] with the environment passed in.
+fn ensure_copilot_extracted_in(
+    env: &CacheEnv,
+    copilot_bin: &Path,
+    home: &Path,
+    project_dir: &Path,
+) -> Result<(), String> {
     // Security guard: this preflight executes `copilot --version` outside the
     // sandbox. If PATH resolves to a project-local wrapper script, that script
     // would run unsandboxed with full user privileges before trust lock applies.
@@ -96,7 +106,7 @@ pub fn ensure_copilot_extracted(
     // A cache variable cplt refuses (#374) is an error here too. `prepare`
     // has already stopped on one in a writable tree; this catches the unsafe
     // kind for any caller that did not go through it.
-    let (pkg_base, cache_dir) = copilot_cache_dirs(&process_env, home, arch)?;
+    let (pkg_base, cache_dir) = copilot_cache_dirs(env, home, arch)?;
 
     // Compute binary identity for the fast-path cache.
     // Works for any file type: Mach-O binary (Homebrew), node/shell wrapper (npm).
@@ -823,6 +833,7 @@ fn find_complete_dir_for_version(pkg_base: &Path, version: &str) -> Option<Strin
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod copilot_extraction_tests {
     use super::*;
+    use cplt::sandbox::CPLT_STATE_DIR;
 
     /// #374: the directory the preflight polls follows Copilot's cache
     /// variables; cplt's own marker directory does not move with them.
@@ -932,7 +943,7 @@ mod copilot_extraction_tests {
         }
 
         fn run(&self) -> Result<(), String> {
-            ensure_copilot_extracted(&self.bin, &self.home, &self.project)
+            ensure_copilot_extracted_in(&|_| None, &self.bin, &self.home, &self.project)
         }
 
         fn complete_dir(&self, name: &str) {

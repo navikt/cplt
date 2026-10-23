@@ -105,15 +105,16 @@ pub use policy::{
     Protected, ResolvedToolDir, SENSITIVE_KEY_FILE_EXTENSION_PATTERNS, SENSITIVE_PROJECT_PATTERNS,
     TOOL_PATH_ENV_VARS, TOOL_READ_DIRS, ToolPathEnvVar, ToolPathOverride, ToolRoot,
     active_tool_dirs, app_dirs, build_credential_grants, copilot_default_pkg_dir, copilot_pkg_dir,
-    copilot_pkg_dirs, copilot_ro_protect_paths, credential_link_hop, current_uid,
-    cypress_app_data_dir, cypress_app_data_dir_with_env, cypress_runtime_intent,
-    dir_overlaps_credentials, exec_write_conflicts, first_party_read_target,
-    home_config_link_targets, home_tool_dirs, linux_docker_socket_paths,
-    linux_rootless_socket_paths, linux_runtime_dirs, mise_ro_protect_paths, nested_alternation,
-    no_cache_env, no_exec_temp_dir_over, no_exec_tool_dir_over, path_bin_dirs,
+    copilot_pkg_dirs, copilot_ro_protect_paths, cplt_state_dir, cplt_state_dir_for,
+    cplt_state_dirs, credential_link_hop, current_uid, cypress_app_data_dir,
+    cypress_app_data_dir_with_env, cypress_runtime_intent, dir_overlaps_credentials,
+    exec_write_conflicts, first_party_read_target, home_config_link_targets, home_tool_dirs,
+    linux_docker_socket_paths, linux_rootless_socket_paths, linux_runtime_dirs,
+    mise_ro_protect_paths, nested_alternation, no_cache_env, no_exec_temp_dir_over,
+    no_exec_tool_dir_over, path_bin_dirs, pin_legacy_state_dir_if_inside,
     playwright_runtime_intent, process_env, relocatable_tool_prefix, shim_ro_protect_paths,
     socket_mask_paths, tool_override_path_is_safe, tool_path_env_overrides,
-    validate_playwright_socket_dir, validate_sbpl_path, xdg_runtime_dir_env,
+    validate_playwright_socket_dir, validate_sbpl_path, xdg_runtime_dir_env, xdg_state_dir,
 };
 
 // SBPL profile generation — kept public for unit tests.
@@ -567,6 +568,7 @@ pub fn prepare_with_pnpm_shadow(
 ) -> Result<PreparedSandbox, String> {
     validate_playwright_socket_capability(config.playwright_socket_dir)?;
     validate_hard_denied_grants(config)?;
+    keep_state_out_of_grants(config);
     validate_pnpm_tool_dirs(config)?;
     // One policy for every check below and the bubblewrap plan, generated on
     // first use: generating can warn, and a warning should print once (#602).
@@ -1054,6 +1056,54 @@ fn validate_hard_denied_grants(config: &SandboxConfig) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The trees the sandbox grants (every writable tree, named roots, read
+/// grants) that `$XDG_CONFIG_HOME/cplt` must stay out of (#830).
+fn state_grant_trees(config: &SandboxConfig) -> Vec<PathBuf> {
+    canonical_writable_trees(config)
+        .into_iter()
+        .map(|(t, _)| t)
+        .chain(config.named_roots.iter().cloned())
+        .chain(config.extra_read.iter().cloned())
+        .collect()
+}
+
+/// The moved state directory and the granted tree it lies inside, if any.
+#[cfg(test)]
+fn state_dir_in_grant(config: &SandboxConfig) -> Option<(PathBuf, PathBuf)> {
+    policy::xdg_state_dir_inside(
+        config.copilot_cache_env,
+        config.home_dir,
+        &state_grant_trees(config),
+    )
+}
+
+/// Backstop for the launch-time pin in `main`: keep state in the legacy,
+/// always-denied `~/.config/cplt` when the XDG location is inside a grant.
+fn keep_state_out_of_grants(config: &SandboxConfig) {
+    if let Some((dir, tree)) = policy::pin_legacy_state_dir_if_inside(
+        config.copilot_cache_env,
+        config.home_dir,
+        &state_grant_trees(config),
+    ) {
+        crate::ui::warn(&state_pinned_message(&dir, &tree));
+    }
+}
+
+/// The one line printed when state stays in `~/.config/cplt`, with control
+/// characters in the paths replaced.
+#[must_use]
+pub fn state_pinned_message(dir: &Path, tree: &Path) -> String {
+    format!(
+        "cplt state stays in ~/.config/cplt: {} is inside the sandbox's grant on {}. \
+         Point XDG_CONFIG_HOME elsewhere to move it.",
+        dir.display(),
+        tree.display()
+    )
+    .chars()
+    .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+    .collect()
 }
 
 /// Refuse one grant that no launch can honour, with the reason.
@@ -5421,6 +5471,26 @@ mod tests {
     /// them is self-perpetuating. Refused as a subtree, on every grant key,
     /// including a path that does not exist yet (naming a file before creating
     /// it would otherwise walk straight through a canonicalize-only check).
+    /// #830: an `XDG_CONFIG_HOME` inside a grant is detected, so the launch
+    /// keeps state in the always-denied `~/.config/cplt`.
+    #[test]
+    fn state_dir_inside_a_grant_is_detected() {
+        let home = Path::new("/fake/test");
+        let granted = vec![PathBuf::from("/granted/tree")];
+        let mut config = test_config(home, &[]);
+        config.extra_write = &granted;
+        let env = |name: &str| {
+            (name == "XDG_CONFIG_HOME").then(|| std::ffi::OsString::from("/granted/tree/cfg"))
+        };
+        config.copilot_cache_env = &env;
+        assert_eq!(
+            state_dir_in_grant(&config),
+            Some((PathBuf::from("/granted/tree/cfg/cplt"), granted[0].clone()))
+        );
+        config.extra_write = &[];
+        assert_eq!(state_dir_in_grant(&config), None);
+    }
+
     #[test]
     fn prepare_rejects_a_grant_inside_the_cplt_state_directory() {
         let home = Path::new("/fake/test");

@@ -20,7 +20,7 @@ fn hex(bytes: &[u8]) -> String {
 
 fn path(home: &Path, project: &Path, topic: &str) -> PathBuf {
     let project = std::fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf());
-    home.join(crate::sandbox::CPLT_STATE_DIR)
+    crate::sandbox::cplt_state_dir_for(&crate::sandbox::process_env, home, "launch")
         .join("launch")
         .join(format!(
             "{}-{topic}",
@@ -47,13 +47,16 @@ pub fn changed(home: &Path, project: &Path, topic: &str, content: &str) -> bool 
 mod tests {
     #[test]
     fn changed_once_then_quiet_per_project_and_topic() {
-        let home = tempfile::tempdir().unwrap();
-        let (a, b) = (home.path().join("a"), home.path().join("b"));
-        assert!(super::changed(home.path(), &a, "t", "x"));
-        assert!(!super::changed(home.path(), &a, "t", "x"));
-        assert!(super::changed(home.path(), &b, "t", "x"));
-        assert!(super::changed(home.path(), &a, "u", "x"));
-        assert!(super::changed(home.path(), &a, "t", "y"));
-        assert!(!super::changed(home.path(), &a, "t", "y"));
+        // Unset so the state lands in the temp home, not the real XDG dir.
+        temp_env::with_var_unset("XDG_CONFIG_HOME", || {
+            let home = tempfile::tempdir().unwrap();
+            let (a, b) = (home.path().join("a"), home.path().join("b"));
+            assert!(super::changed(home.path(), &a, "t", "x"));
+            assert!(!super::changed(home.path(), &a, "t", "x"));
+            assert!(super::changed(home.path(), &b, "t", "x"));
+            assert!(super::changed(home.path(), &a, "u", "x"));
+            assert!(super::changed(home.path(), &a, "t", "y"));
+            assert!(!super::changed(home.path(), &a, "t", "y"));
+        });
     }
 }

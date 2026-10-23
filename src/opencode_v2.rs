@@ -496,7 +496,12 @@ pub fn host_warnings(home: &Path) -> Vec<String> {
              sandbox. Stop it (`opencode service stop`) to keep all work inside cplt."
         ));
     }
-    if logged_out_after_upgrade(&data, &home.join(crate::sandbox::CPLT_STATE_DIR)) {
+    let state = crate::sandbox::cplt_state_dir_for(
+        &crate::sandbox::process_env,
+        home,
+        "opencode-v2-credentials-seen",
+    );
+    if logged_out_after_upgrade(&data, &state) {
         out.push(
             "OpenCode v2 did not import your v1 credentials (auth.json). Run \
              `opencode auth login`, or `opencode auth import` with an exported file."
@@ -578,9 +583,9 @@ fn bootstrapped(db: &Path) -> bool {
 /// cannot be used at all; the launch then goes ahead ungated.
 pub fn first_run_gate(home: &Path) -> Option<String> {
     let db = xdg_base("XDG_DATA_HOME", home, ".local/share").join("opencode/opencode.db");
-    let lock = home
-        .join(crate::sandbox::CPLT_STATE_DIR)
-        .join("opencode-v2-first-run.lock");
+    let name = "opencode-v2-first-run.lock";
+    let lock =
+        crate::sandbox::cplt_state_dir_for(&crate::sandbox::process_env, home, name).join(name);
     gate(db, &lock, std::time::Duration::from_secs(15), bootstrapped)
 }
 
