@@ -6540,7 +6540,11 @@ fn assemble_sandbox(
         let setup = match (proxy_handle.is_some(), scratch_path) {
             (false, _) => Err("the proxy is off".to_string()),
             (_, None) => Err("there is no scratch dir".to_string()),
-            (true, Some(scratch)) => cplt::token_inject::setup(scratch),
+            (true, Some(scratch)) => match cplt::token_inject::denied_ca_var(&resolved.deny_env) {
+                // The CA variables are how the agent trusts the proxy.
+                Some(v) => Err(format!("deny.env names {v}")),
+                None => cplt::token_inject::setup(scratch),
+            },
         };
         if let Err(e) = setup {
             ui::warn(&format!(

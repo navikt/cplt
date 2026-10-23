@@ -41,6 +41,9 @@ const PREFIXES: &[&str] = &["github_pat_", "gho_", "ghp_", "ghu_", "ghs_", "ghr_
 /// Variables that carry a whole GitHub token into the child.
 const TOKEN_VARS: &[&str] = &["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"];
 
+/// Variables whose value may embed a GitHub token among other text.
+const EMBEDDING_VARS: &[&str] = &["OPENCODE_AUTH_CONTENT"];
+
 /// User CA files already in the environment. Concatenated into cplt's
 /// bundles, never replaced: a corporate TLS-inspecting proxy breaks
 /// otherwise.
@@ -58,6 +61,18 @@ const SYSTEM_BUNDLES: &[&str] = &[
 
 const CA_FILE_LIMIT: u64 = 8 * 1024 * 1024;
 const MAX_HEAD: usize = 64 * 1024;
+
+/// The variables that point the agent at the session bundles.
+pub const CA_VARS: &[&str] = &["SSL_CERT_FILE", "GIT_SSL_CAINFO", "NODE_EXTRA_CA_CERTS"];
+
+/// The first CA variable `deny_env` names. Injection cannot honour such a
+/// denial and still have the agent trust the proxy, so it falls back.
+pub fn denied_ca_var(deny_env: &[String]) -> Option<&'static str> {
+    CA_VARS
+        .iter()
+        .copied()
+        .find(|v| deny_env.iter().any(|d| d == v))
+}
 
 pub const FULL_BUNDLE: &str = "cplt-ca-bundle.pem";
 pub const NODE_BUNDLE: &str = "cplt-node-ca.pem";
@@ -89,11 +104,18 @@ pub fn setup(scratch: &Path) -> Result<(), String> {
         .iter()
         .find_map(|p| read_ca_file(Path::new(p)))
         .ok_or("no system CA bundle found")?;
-    let user: String = USER_CA_VARS
-        .iter()
-        .filter_map(std::env::var_os)
-        .filter_map(|p| read_ca_file(Path::new(&p)))
-        .collect();
+    // A CA the user set but cplt cannot load would be missing from the
+    // bundles and break every client behind a corporate proxy: fall back.
+    let mut user = String::new();
+    for var in USER_CA_VARS {
+        let Some(path) = std::env::var_os(var).filter(|p| !p.is_empty()) else {
+            continue;
+        };
+        user.push_str(
+            &read_ca_file(Path::new(&path))
+                .ok_or_else(|| format!("cannot load the CA file in {var}"))?,
+        );
+    }
     let injector = build(&system, &user, scratch)?;
     INJECTOR
         .set(injector)
@@ -273,6 +295,33 @@ fn remember(real: &str) -> String {
     p
 }
 
+/// Substrings of `value` shaped like a GitHub token: a known prefix at a
+/// word start, then `[A-Za-z0-9_]`.
+fn embedded_tokens(value: &str) -> Vec<&str> {
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let bytes = value.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let at_start = i == 0 || !word(bytes[i - 1]);
+        if at_start
+            && PREFIXES
+                .iter()
+                .any(|p| bytes[i..].starts_with(p.as_bytes()))
+        {
+            let end = bytes[i..]
+                .iter()
+                .position(|&b| !word(b))
+                .map_or(bytes.len(), |n| i + n);
+            out.push(&value[i..end]);
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Every known real token in `value` replaced by its placeholder.
 fn mask_within(value: &str) -> String {
     let tokens = TOKENS
@@ -338,6 +387,15 @@ fn mask_child_env(cmd: &mut Command, inherit_env: bool) {
             }
         }
     }
+    // Values that embed a token, such as OpenCode's auth JSON, even one no
+    // other channel registered.
+    for name in EMBEDDING_VARS {
+        if let Some(Some(v)) = env.get(*name) {
+            for candidate in embedded_tokens(v) {
+                remember(candidate);
+            }
+        }
+    }
     for (k, v) in &env {
         if let Some(v) = v {
             let masked = mask_within(v);
@@ -376,8 +434,17 @@ pub fn may_inject(host: &str, method: &str, target: &str) -> bool {
         return true;
     }
     // Absolute-form targets carry scheme and authority first.
-    let path = match target.split_once("://") {
-        Some((_, rest)) => rest.find('/').map_or("", |i| &rest[i..]),
+    // Absolute form only when the target starts with a scheme: a `://` in
+    // the query of an origin-form target must not move the path check.
+    let lower = target.to_ascii_lowercase();
+    let path = match ["https://", "http://"]
+        .iter()
+        .find(|s| lower.starts_with(**s))
+    {
+        Some(scheme) => {
+            let rest = &target[scheme.len()..];
+            rest.find(['/', '?', '#']).map_or("", |i| &rest[i..])
+        }
         None => target,
     };
     let first = path
@@ -768,6 +835,9 @@ pub(crate) mod tests {
             "/%6dcp",
             "/./mcp",
             "https://api.githubcopilot.com/mcp/x",
+            "HTTPS://api.githubcopilot.com/mcp",
+            "/mcp?next=https://x/responses",
+            "/mcp#https://x/responses",
         ] {
             assert!(!may_inject(h, "POST", t), "{t}");
         }
@@ -845,6 +915,46 @@ pub(crate) mod tests {
                 assert_eq!(names, vec![std::ffi::OsString::from("KEEP")]);
             },
         );
+    }
+
+    #[test]
+    fn explicit_auth_content_token_is_masked() {
+        let real = "ghu_AuthContent0123456789abcdefghijklmn";
+        #[allow(clippy::disallowed_methods)] // never spawned; only its env is read
+        let mut cmd = Command::new("true");
+        cmd.env_clear();
+        let json = format!(r#"{{"github-copilot":{{"refresh":"{real}","x":"gho_"}}}}"#);
+        cmd.env("OPENCODE_AUTH_CONTENT", &json);
+        mask_child_env(&mut cmd, false);
+        let got = cmd
+            .get_envs()
+            .find_map(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+            .unwrap();
+        assert!(!got.contains(real) && got.contains("\"x\":\"gho_\""));
+        assert_eq!(got.len(), json.len());
+        assert_eq!(
+            embedded_tokens("xgho_abc gho_def_1 ëgho_g"),
+            vec!["gho_def_1", "gho_g"] // and no panic on non-ASCII
+        );
+    }
+
+    #[test]
+    fn unloadable_user_ca_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_pem = dir.path().join("corp.pem");
+        std::fs::write(&not_pem, "not a certificate").unwrap();
+        temp_env::with_var("NODE_EXTRA_CA_CERTS", Some(&not_pem), || {
+            let err = setup(dir.path()).unwrap_err();
+            assert!(err.contains("NODE_EXTRA_CA_CERTS"), "{err}");
+        });
+        assert!(!active());
+    }
+
+    #[test]
+    fn denied_ca_var_blocks_injection() {
+        assert_eq!(denied_ca_var(&["FOO".into()]), None);
+        let name = CA_VARS[1].to_string();
+        assert_eq!(denied_ca_var(&[name]), Some(CA_VARS[1]));
     }
 
     #[test]
