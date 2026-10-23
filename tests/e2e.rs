@@ -10718,9 +10718,15 @@ print('TCP_' + ('OK' if r == 0 else errno.errorcode.get(r, str(r))))
                 stdout.contains("UDP_EPERM"),
                 "forced={forced}: UDP/443 must be denied\nstdout: {stdout}\nstderr: {stderr}"
             );
-            assert_eq!(
-                stdout.contains("TCP_EPERM"),
-                forced,
+            // A positive marker each way: a probe that dies before the TCP
+            // line must fail the test, not pass it.
+            let tcp_ok = if forced {
+                stdout.contains("TCP_EPERM")
+            } else {
+                stdout.contains("TCP_OK") || stdout.contains("TCP_EINPROGRESS")
+            };
+            assert!(
+                tcp_ok,
                 "forced={forced}: TCP/443 must be allowed only outside proxy-forced\n\
                  stdout: {stdout}\nstderr: {stderr}"
             );
