@@ -88,12 +88,25 @@ pub(super) fn apply_deny_env_and_credential(
 }
 
 /// The OpenCode v2 session's variables (#710), set last.
-fn apply_session_env(cmd: &mut Command, sandbox: &super::PreparedSandbox) {
+///
+/// Runs after the deny sweep, so it skips denied names itself: `deny_env`
+/// must win over the session's own variables too (#814).
+fn apply_session_env(
+    cmd: &mut Command,
+    opencode_v2: bool,
+    extra_env: &[(String, String)],
+    deny_env: &[String],
+) {
     // v2 ignores the #695 handover: don't put the gh token where nothing reads it.
-    if sandbox.opencode_v2 {
+    if opencode_v2 {
         cmd.env_remove("OPENCODE_AUTH_CONTENT");
     }
-    cmd.envs(sandbox.extra_env.iter().map(|(k, v)| (k, v)));
+    cmd.envs(
+        extra_env
+            .iter()
+            .filter(|(k, _)| !deny_env.contains(k))
+            .map(|(k, v)| (k, v)),
+    );
 }
 
 /// Configure environment, proxy, and common args on a sandboxed Command.
@@ -1455,7 +1468,7 @@ pub fn exec(
     );
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
-    apply_session_env(&mut cmd, sandbox);
+    apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
     // Nothing the caller was holding open crosses into the agent.
     seal_inherited_fds(&mut cmd, Vec::new());
 
@@ -1600,7 +1613,7 @@ pub fn exec(
     );
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
-    apply_session_env(&mut cmd, sandbox);
+    apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
     // Before the Landlock hook below: that hook opens descriptors of its own,
     // and they must not be sealed.
     seal_inherited_fds(&mut cmd, Vec::new());
@@ -1838,7 +1851,7 @@ fn exec_bwrap(
         sandbox.keychain_substitute.as_ref(),
     );
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
-    apply_session_env(&mut cmd, sandbox);
+    apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
     // Set the re-entry env AFTER configure_command so a `clear_first` env build
     // cannot wipe them.
     cmd.env(
@@ -2695,6 +2708,18 @@ mod keychain_substitute_tests {
             let set: Vec<_> = cmd.get_envs().collect();
             assert_eq!(set, vec![("FOO".as_ref(), None)]);
         });
+    }
+
+    #[test]
+    fn session_env_skips_denied_names() {
+        let mut cmd = Command::new("/usr/bin/true");
+        let extra = vec![
+            ("OPENAI_API_KEY".to_string(), "x".to_string()),
+            ("KEEP".to_string(), "y".to_string()),
+        ];
+        apply_session_env(&mut cmd, false, &extra, &["OPENAI_API_KEY".to_string()]);
+        let set: Vec<_> = cmd.get_envs().collect();
+        assert_eq!(set, vec![("KEEP".as_ref(), Some("y".as_ref()))]);
     }
 
     /// `--deny-env` (#814) beats a `--pass-env` value already set on the

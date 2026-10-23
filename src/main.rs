@@ -2918,8 +2918,11 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         Ok(r) => r,
         Err(e) => bail!("{e}"),
     };
-    // `.cplt.toml`'s deny.env extends this list later, with sort + dedup.
+    // `.cplt.toml`'s deny.env extends this list later; dedup here too for
+    // launches without one.
     resolved.deny_env.extend(cli.deny_env.iter().cloned());
+    resolved.deny_env.sort_unstable();
+    resolved.deny_env.dedup();
     let configured_quiet = resolved.quiet;
     if cli.doctor {
         resolved.quiet = true;

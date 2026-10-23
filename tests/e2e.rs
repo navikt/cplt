@@ -6922,6 +6922,69 @@ paths = [
         let _ = std::fs::remove_dir_all(&repo);
     }
 
+    /// CLI `--deny-env` and repo `deny.env` merge, and both beat
+    /// `--inherit-env` and `--pass-env` (#814).
+    #[test]
+    fn e2e_cli_deny_env_merges_with_repo_deny_env() {
+        require_sandbox!();
+        let (repo, config_file) =
+            make_trust_repo("cli-deny-env", "[deny]\nenv = [\"VAULT_TOKEN\"]\n");
+        let fake_dir = tempfile::Builder::new()
+            .prefix(".cplt-e2e-fake-cli-deny-env-")
+            .tempdir_in(project_dir())
+            .expect("create fake copilot dir");
+        let script = fake_dir.path().join("copilot");
+        std::fs::write(&script, "#!/bin/sh\nenv | sort\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!("{}:{current_path}", fake_dir.path().display());
+
+        let output = cplt_cmd()
+            .args([
+                "--yes",
+                "--no-validate",
+                "--inherit-env",
+                "--pass-env",
+                "OPENAI_API_KEY",
+                "--deny-env",
+                "OPENAI_API_KEY",
+                "--deny-env",
+                "OPENAI_API_KEY",
+                "--",
+                "--version",
+            ])
+            .current_dir(&repo)
+            .env("PATH", &new_path)
+            .env("CPLT_CONFIG", config_file.to_str().unwrap())
+            .env("VAULT_TOKEN", "vault-secret-123")
+            .env("OPENAI_API_KEY", "openai-secret-456")
+            .env("CPLT_E2E_KEEP", "kept-789")
+            .output()
+            .expect("should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stdout.contains("vault-secret-123"),
+            "repo deny.env lost: {stdout}"
+        );
+        assert!(
+            !stdout.contains("openai-secret-456"),
+            "--deny-env lost: {stdout}"
+        );
+        assert!(stdout.contains("kept-789"), "control var missing: {stdout}");
+        assert!(
+            !stderr.contains("OPENAI_API_KEY, OPENAI_API_KEY"),
+            "denied list not deduplicated: {stderr}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
     #[test]
     fn e2e_accept_repo_config_flag_does_not_persist() {
         require_sandbox!();
