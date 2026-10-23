@@ -6672,10 +6672,11 @@ fn assemble_sandbox(
         // A launch, not `--print-profile`: offer the host fix, then judge again.
         if refused.is_some()
             && !opts.inspect_only
-            && let Some(p) = cplt::host_fix::launch_problem()
+            && let Some(p) = cplt::host_fix::launch_problem(&sandbox_config)
         {
             ui::warn(refused.as_deref().unwrap_or_default());
-            if cplt::host_fix::offer(p, resolved.yes) {
+            let fixed = || sandbox::mcp_wrapper_error(&sandbox_config).is_none();
+            if cplt::host_fix::offer(p, resolved.yes, Some(home_dir), &fixed) {
                 refused = sandbox::mcp_broker_refusal(&sandbox_config);
             }
         }
@@ -9074,7 +9075,18 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
         match cplt::host_fix::problem(&bubblewrap, doctor::apparmor_restricts_userns()) {
             Some(p) => {
                 println!();
-                cplt::host_fix::offer(p, cli.yes);
+                let fixed = || {
+                    matches!(
+                        doctor::bubblewrap_state(
+                            resolved.use_bubblewrap,
+                            resolved.scratch_dir,
+                            &sandbox_config,
+                            &launch_grants,
+                        ),
+                        doctor::Bubblewrap::Usable(_)
+                    )
+                };
+                cplt::host_fix::offer(p, cli.yes, None, &fixed);
             }
             None => println!("\n--fix: nothing here has an automatic fix."),
         }

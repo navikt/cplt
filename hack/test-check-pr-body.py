@@ -114,7 +114,8 @@ Fake
                 {"id": 24, "name": "linux-integration-tests", "status": "completed", "conclusion": "success", "app_slug": "github-actions"},
                 {"id": 25, "name": "mcp-broker-e2e-ubuntu-22.04", "status": "completed", "conclusion": "success", "app_slug": "github-actions"},
                 {"id": 26, "name": "mcp-broker-e2e-ubuntu-24.04", "status": "completed", "conclusion": "success", "app_slug": "github-actions"},
-                {"id": 27, "name": "doctor-fix-e2e", "status": "completed", "conclusion": "success", "app_slug": "github-actions"},
+                {"id": 27, "name": "doctor-fix-e2e-own", "status": "completed", "conclusion": "success", "app_slug": "github-actions"},
+                {"id": 28, "name": "doctor-fix-e2e-shipped", "status": "completed", "conclusion": "success", "app_slug": "github-actions"},
                 {"id": 50, "name": "unit-tests", "status": "completed", "conclusion": "skipped", "app_slug": "github-actions"},
                 {"id": 51, "name": "integration-tests", "status": "completed", "conclusion": "skipped", "app_slug": "github-actions"},
             ]
@@ -154,7 +155,8 @@ Fake
                 {"id": 23, "name": "opencode-v2-e2e-linux", "status": "completed", "conclusion": "success", "app_slug": "github-actions"},
                 {"id": 25, "name": "mcp-broker-e2e-ubuntu-22.04", "status": "completed", "conclusion": "success", "app_slug": "github-actions"},
                 {"id": 26, "name": "mcp-broker-e2e-ubuntu-24.04", "status": "completed", "conclusion": "success", "app_slug": "github-actions"},
-                {"id": 27, "name": "doctor-fix-e2e", "status": "completed", "conclusion": "success", "app_slug": "github-actions"},
+                {"id": 27, "name": "doctor-fix-e2e-own", "status": "completed", "conclusion": "success", "app_slug": "github-actions"},
+                {"id": 28, "name": "doctor-fix-e2e-shipped", "status": "completed", "conclusion": "success", "app_slug": "github-actions"},
             ]
         )
         with patch.object(check_pr_body, "run_gh_api", return_value=check_runs_lines):

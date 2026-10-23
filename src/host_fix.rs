@@ -65,17 +65,31 @@ pub fn problem(state: &Bubblewrap, apparmor: bool) -> Option<Problem> {
 
 /// The problem that keeps the MCP broker from starting at launch, if it has
 /// a fix here: bwrap missing, or AppArmor blocking its user namespaces.
+/// Nothing when bubblewrap is turned off or a flag rules the broker out,
+/// since no host fix changes that.
 #[must_use]
-pub fn launch_problem() -> Option<Problem> {
+pub fn launch_problem(config: &crate::sandbox::SandboxConfig) -> Option<Problem> {
     #[cfg(target_os = "linux")]
     {
+        if config.use_bubblewrap == Some(false)
+            || crate::sandbox::mcp_flag_conflict(
+                config.allow_gpg_signing,
+                config.allow_rootless_docker,
+            )
+            .is_some()
+        {
+            return None;
+        }
         if crate::sandbox::bubblewrap_probe::check_availability().is_none() {
             return Some(Problem::BwrapMissing);
         }
-        if crate::doctor::apparmor_restricts_userns() && !recheck() {
+        if crate::doctor::apparmor_restricts_userns()
+            && crate::sandbox::mcp_wrapper_error(config).is_some()
+        {
             return Some(Problem::AppArmorUserns);
         }
     }
+    let _ = config;
     None
 }
 
@@ -122,102 +136,198 @@ pub fn refusal(yes: bool, tty: bool, env_set: &dyn Fn(&str) -> bool) -> Option<&
     }
 }
 
-/// The commands as a user would type them, with any file content in full.
-#[must_use]
-pub fn render(steps: &[Step]) -> String {
+/// Root-owned dirs the fixed commands are resolved from; never `PATH`.
+const SYSTEM_DIRS: &[&str] = &["/usr/sbin", "/sbin", "/usr/bin", "/bin"];
+
+/// `name` from [`SYSTEM_DIRS`], or `None`.
+fn system_binary(name: &str) -> Option<String> {
+    use std::os::unix::fs::PermissionsExt;
+    SYSTEM_DIRS.iter().map(|d| format!("{d}/{name}")).find(|p| {
+        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    })
+}
+
+/// A step's argv with every program absolute: `sudo` and the command it
+/// runs. `None` when either is missing from [`SYSTEM_DIRS`].
+fn resolved(step: &Step, find: &dyn Fn(&str) -> Option<String>) -> Result<Vec<String>, String> {
+    step.argv
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            if i < 2 {
+                find(a).ok_or_else(|| format!("{a} is not in {}", SYSTEM_DIRS.join(", ")))
+            } else {
+                Ok((*a).to_string())
+            }
+        })
+        .collect()
+}
+
+/// The commands as they will run. File content is printed by the finding
+/// or refusal above this, so it is named here, not repeated.
+fn render(steps: &[Step], find: &dyn Fn(&str) -> Option<String>) -> String {
     steps
         .iter()
         .map(|s| {
-            let cmd = s.argv.join(" ");
+            let cmd = resolved(s, find).map_or_else(|_| s.argv.join(" "), |a| a.join(" "));
             match s.stdin {
-                Some(body) => format!("  {cmd} >/dev/null <<'EOF'\n{body}EOF\n"),
+                Some(_) => format!("  {cmd}   (writes the profile shown above)\n"),
                 None => format!("  {cmd}\n"),
             }
         })
         .collect()
 }
 
+/// Whether an answer to "[Y/n]" is a yes: only "", "y" or "yes". `None`
+/// (end of input, a read error) and anything else is a no.
+fn consents(answer: Option<&str>) -> bool {
+    answer.is_some_and(|a| matches!(a.trim().to_lowercase().as_str(), "" | "y" | "yes"))
+}
+
+/// What [`apply`] ended with.
+#[derive(Debug, PartialEq, Eq)]
+enum Outcome {
+    Fixed,
+    NotFixed,
+    Declined,
+}
+
+/// The state file a launch-time decline is remembered in, per cplt version.
+fn decline_file(home: &std::path::Path) -> std::path::PathBuf {
+    crate::sandbox::cplt_state_file(home, "host-fix-declined")
+}
+
 /// Show the fix for `problem`, and on an interactive host offer to run it,
-/// then re-check. Returns whether the problem is now gone.
-pub fn offer(problem: Problem, yes: bool) -> bool {
+/// then re-check with `recheck` (the launch's own bubblewrap probe).
+/// `remember`: a launch, whose "no" is remembered for this cplt version
+/// under that home, so the next launch only prints a one-line hint;
+/// `cplt doctor --fix` always asks. Returns whether the problem is gone.
+pub fn offer(
+    problem: Problem,
+    yes: bool,
+    remember: Option<&std::path::Path>,
+    recheck: &dyn Fn() -> bool,
+) -> bool {
+    let version = env!("CARGO_PKG_VERSION");
+    if let Some(home) = remember
+        && std::fs::read_to_string(decline_file(home)).is_ok_and(|v| v.trim() == version)
+    {
+        eprintln!(
+            "A host fix is available; you declined it before. Run `cplt doctor --fix` to apply it."
+        );
+        return false;
+    }
     let os_release = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
     let shipped = std::path::Path::new(SHIPPED_BWRAP_PROFILE).exists();
+    let existing = std::fs::read_to_string(PROFILE_PATH).ok();
     let tty = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
     let why = refusal(yes, tty, &|k| std::env::var_os(k).is_some());
     let ask = || {
         eprint!("Fix now? sudo will ask for your password. [Y/n] ");
         let _ = std::io::stderr().flush();
         let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer).is_ok()
-            && !matches!(answer.trim().to_lowercase().as_str(), "n" | "no")
+        let read = match std::io::stdin().read_line(&mut answer) {
+            Ok(0) | Err(_) => None,
+            Ok(_) => Some(answer.as_str()),
+        };
+        consents(read)
     };
-    let (ok, text) = apply(steps(problem, &os_release, shipped), why, ask, run, recheck);
+    let (outcome, text) = apply(
+        steps(problem, &os_release, shipped),
+        why,
+        existing.as_deref(),
+        &system_binary,
+        ask,
+        run,
+        recheck,
+    );
     eprint!("{text}");
-    ok
+    if outcome == Outcome::Declined
+        && let Some(home) = remember
+    {
+        let file = decline_file(home);
+        let _ = file.parent().map(std::fs::create_dir_all);
+        let _ = std::fs::write(file, version);
+    }
+    outcome == Outcome::Fixed
 }
 
-/// [`offer`] with its terminal, runner and re-check passed in. Returns
-/// whether the problem is gone, and what to print.
+/// [`offer`] with its terminal, lookups, runner and re-check passed in.
+/// `existing`: the current content of the profile a step overwrites.
 fn apply(
     steps: Option<&[Step]>,
     refused: Option<&str>,
+    existing: Option<&str>,
+    find: &dyn Fn(&str) -> Option<String>,
     ask: impl FnOnce() -> bool,
-    mut run: impl FnMut(&Step) -> Result<(), String>,
+    mut run: impl FnMut(&[String], Option<&str>) -> Result<(), String>,
     recheck: impl FnOnce() -> bool,
-) -> (bool, String) {
+) -> (Outcome, String) {
     let Some(steps) = steps else {
         return (
-            false,
+            Outcome::NotFixed,
             "No automatic fix for this distribution: install bubblewrap from its packages.\n"
                 .into(),
         );
     };
-    let shown = format!("The fix:\n{}", render(steps));
+    let mut shown = format!("The fix:\n{}", render(steps, find));
+    if let Some(old) = existing
+        && steps
+            .iter()
+            .any(|s| s.argv.contains(&PROFILE_PATH) && s.stdin.is_some())
+    {
+        let nl = if old.ends_with('\n') { "" } else { "\n" };
+        shown = format!(
+            "{shown}{PROFILE_PATH} exists and will be overwritten. Its content now:\n{old}{nl}"
+        );
+    }
     if let Some(why) = refused {
         return (
-            false,
+            Outcome::NotFixed,
             format!("{shown}Not offering to run it ({why}). Run the commands above yourself.\n"),
         );
     }
     eprint!("{shown}");
     if !ask() {
-        return (false, "Not fixed.\n".into());
+        return (Outcome::Declined, "Not fixed.\n".into());
     }
     for step in steps {
-        if let Err(e) = run(step) {
+        let argv = match resolved(step, find) {
+            Ok(a) => a,
+            Err(e) => return (Outcome::NotFixed, format!("{e}. Not fixed.\n")),
+        };
+        if let Err(e) = run(&argv, step.stdin) {
             return (
-                false,
-                format!("`{}` failed: {e}. Not fixed.\n", step.argv.join(" ")),
+                Outcome::NotFixed,
+                format!("`{}` failed: {e}. Not fixed.\n", argv.join(" ")),
             );
         }
     }
     if recheck() {
-        (true, "Fixed: bubblewrap now starts.\n".into())
+        (Outcome::Fixed, "Fixed: bubblewrap now starts.\n".into())
     } else {
         (
-            false,
+            Outcome::NotFixed,
             "The commands ran, but bubblewrap still does not start. Run `cplt doctor`.\n".into(),
         )
     }
 }
 
-fn run(step: &Step) -> Result<(), String> {
-    let (program, args) = step.argv.split_first().ok_or("empty command")?;
-    // Only root-owned system dirs for sudo, not Homebrew's.
-    let path = crate::git::trusted_binary(program)
-        .filter(|p| p.starts_with("/usr/bin") || p.starts_with("/bin"))
-        .ok_or_else(|| format!("{program} is not in /usr/bin or /bin"))?;
-    #[allow(clippy::disallowed_methods)] // resolved in the trusted dirs above
-    let mut cmd = Command::new(path);
-    cmd.args(args);
-    if step.stdin.is_some() {
+/// Run one resolved step: an empty environment but a fixed `PATH`, so
+/// nothing from the caller's environment reaches sudo.
+fn run(argv: &[String], stdin: Option<&str>) -> Result<(), String> {
+    let (program, args) = argv.split_first().ok_or("empty command")?;
+    #[allow(clippy::disallowed_methods)] // absolute, from SYSTEM_DIRS
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .env_clear()
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
+    if stdin.is_some() {
         cmd.stdin(Stdio::piped()).stdout(Stdio::null());
     }
     let mut child = cmd.spawn().map_err(|e| e.to_string())?;
-    if let (Some(body), Some(mut stdin)) = (step.stdin, child.stdin.take()) {
-        stdin
-            .write_all(body.as_bytes())
-            .map_err(|e| e.to_string())?;
+    if let (Some(body), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        pipe.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
     }
     let status = child.wait().map_err(|e| e.to_string())?;
     if status.success() {
@@ -225,20 +335,6 @@ fn run(step: &Step) -> Result<(), String> {
     } else {
         Err(status.to_string())
     }
-}
-
-/// bwrap is installed in a trusted dir and can create a user namespace.
-fn recheck() -> bool {
-    let Some(bwrap) = crate::git::trusted_binary("bwrap") else {
-        return false;
-    };
-    #[allow(clippy::disallowed_methods)] // resolved in the trusted dirs above
-    Command::new(bwrap)
-        .args(["--unshare-user", "--ro-bind", "/", "/", "/bin/true"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
 }
 
 #[cfg(test)]
@@ -273,16 +369,39 @@ mod tests {
         }
     }
 
+    fn fake(name: &str) -> Option<String> {
+        (name != "missing").then(|| format!("/usr/bin/{name}"))
+    }
+
     #[test]
-    fn commands_and_the_file_are_shown_in_full() {
-        let text = render(APPARMOR);
-        assert!(text.contains("sudo tee /etc/apparmor.d/bwrap >/dev/null <<'EOF'\n"));
-        assert!(text.contains(APPARMOR_BWRAP_PROFILE));
-        assert!(text.contains("  userns,\n"));
-        assert!(text.ends_with("sudo apparmor_parser -r /etc/apparmor.d/bwrap\n"));
-        assert_eq!(render(APT), "  sudo apt-get install -y bubblewrap\n");
+    fn commands_are_shown_absolute_and_the_file_once() {
+        let text = render(APPARMOR, &fake);
+        assert_eq!(
+            text,
+            "  /usr/bin/sudo /usr/bin/tee /etc/apparmor.d/bwrap   (writes the profile shown above)\n  \
+             /usr/bin/sudo /usr/bin/apparmor_parser -r /etc/apparmor.d/bwrap\n"
+        );
+        assert!(
+            !text.contains("userns,"),
+            "the profile is printed by the finding, not here"
+        );
+        assert_eq!(
+            render(APT, &fake),
+            "  /usr/bin/sudo /usr/bin/apt-get install -y bubblewrap\n"
+        );
         // The doctor text a user copies and the table agree.
         assert!(crate::doctor::APPARMOR_BWRAP_FIX.contains(APPARMOR_BWRAP_PROFILE));
+    }
+
+    #[test]
+    fn only_empty_y_and_yes_consent() {
+        for yes in ["", "\n", "y", "Y\n", "yes", " YES \n"] {
+            assert!(consents(Some(yes)), "{yes:?}");
+        }
+        for no in ["n", "N\n", "no", "q", "yep", "nope", "x\n"] {
+            assert!(!consents(Some(no)), "{no:?}");
+        }
+        assert!(!consents(None), "end of input is a no");
     }
 
     #[test]
@@ -315,60 +434,127 @@ mod tests {
         assert_eq!(problem(&Bubblewrap::Disabled, true), None);
     }
 
+    type Ran = std::cell::RefCell<Vec<String>>;
+    fn runner(ran: &Ran) -> impl FnMut(&[String], Option<&str>) -> Result<(), String> + '_ {
+        |argv, _| {
+            ran.borrow_mut().push(argv.join(" "));
+            Ok(())
+        }
+    }
+    fn never(_: &[String], _: Option<&str>) -> Result<(), String> {
+        panic!("ran without consent")
+    }
+
     #[test]
     fn apply_runs_the_table_only_after_yes() {
-        let mut ran = Vec::new();
-        let (ok, text) = apply(
+        let ran = Ran::default();
+        let (out, text) = apply(
             Some(APPARMOR),
             None,
+            None,
+            &fake,
             || true,
-            |s| {
-                ran.push(s.argv.join(" "));
-                Ok(())
-            },
+            runner(&ran),
             || true,
         );
-        assert!(ok, "{text}");
+        assert_eq!(out, Outcome::Fixed, "{text}");
         assert_eq!(
-            ran,
+            *ran.borrow(),
             [
-                "sudo tee /etc/apparmor.d/bwrap",
-                "sudo apparmor_parser -r /etc/apparmor.d/bwrap"
+                "/usr/bin/sudo /usr/bin/tee /etc/apparmor.d/bwrap",
+                "/usr/bin/sudo /usr/bin/apparmor_parser -r /etc/apparmor.d/bwrap"
             ]
         );
 
-        let never = |_: &Step| -> Result<(), String> { panic!("ran without consent") };
-        let (ok, text) = apply(
+        let (out, text) = apply(
             Some(APT),
             Some("--yes is set"),
+            None,
+            &fake,
             || panic!("asked"),
             never,
             || true,
         );
+        assert_eq!(out, Outcome::NotFixed);
         assert!(
-            !ok && text.contains("sudo apt-get install -y bubblewrap") && text.contains("--yes")
+            text.contains("apt-get install -y bubblewrap") && text.contains("--yes"),
+            "{text}"
         );
-        let (ok, text) = apply(Some(APT), None, || false, never, || true);
-        assert!(!ok && text.contains("Not fixed"));
-        let (ok, _) = apply(None, None, || panic!("asked"), never, || true);
-        assert!(!ok);
+        let (out, text) = apply(Some(APT), None, None, &fake, || false, never, || true);
+        assert_eq!(out, Outcome::Declined);
+        assert!(text.contains("Not fixed"));
+        let (out, _) = apply(None, None, None, &fake, || panic!("asked"), never, || true);
+        assert_eq!(out, Outcome::NotFixed);
+    }
+
+    #[test]
+    fn apply_names_an_overwritten_profile_and_refuses_unresolved_commands() {
+        let (_, text) = apply(
+            Some(APPARMOR),
+            Some("CI is set"),
+            Some("profile old {}\n"),
+            &fake,
+            || panic!(),
+            never,
+            || true,
+        );
+        assert!(text.contains("/etc/apparmor.d/bwrap exists and will be overwritten. Its content now:\nprofile old {}\n"), "{text}");
+        let (_, text) = apply(
+            Some(APT),
+            Some("CI is set"),
+            Some("old"),
+            &fake,
+            || panic!(),
+            never,
+            || true,
+        );
+        assert!(
+            !text.contains("overwritten"),
+            "apt does not touch the profile: {text}"
+        );
+
+        let none = |_: &str| None;
+        let (out, text) = apply(
+            Some(APT),
+            None,
+            None,
+            &none,
+            || true,
+            never,
+            || panic!("rechecked"),
+        );
+        assert_eq!(out, Outcome::NotFixed);
+        assert!(
+            text.contains("sudo is not in /usr/sbin, /sbin, /usr/bin, /bin"),
+            "{text}"
+        );
     }
 
     #[test]
     fn apply_stops_at_a_failed_step_and_reports_a_failed_recheck() {
-        let mut ran = 0;
-        let (ok, text) = apply(
+        let ran = std::cell::Cell::new(0);
+        let fail = |_: &[String], _: Option<&str>| {
+            ran.set(ran.get() + 1);
+            Err("exit status: 1".to_string())
+        };
+        let (out, text) = apply(
             Some(APPARMOR),
             None,
+            None,
+            &fake,
             || true,
-            |_| {
-                ran += 1;
-                Err("exit status: 1".into())
-            },
+            fail,
             || panic!("rechecked"),
         );
-        assert!(!ok && ran == 1 && text.contains("`sudo tee /etc/apparmor.d/bwrap` failed"));
-        let (ok, text) = apply(Some(APT), None, || true, |_| Ok(()), || false);
-        assert!(!ok && text.contains("still does not start"));
+        assert_eq!(out, Outcome::NotFixed);
+        assert!(
+            ran.get() == 1
+                && text.contains("`/usr/bin/sudo /usr/bin/tee /etc/apparmor.d/bwrap` failed"),
+            "{text}"
+        );
+        let ok = |_: &[String], _: Option<&str>| Ok(());
+        let (out, text) = apply(Some(APT), None, None, &fake, || true, ok, || false);
+        assert_eq!(out, Outcome::NotFixed);
+        assert!(text.contains("still does not start"));
     }
 }

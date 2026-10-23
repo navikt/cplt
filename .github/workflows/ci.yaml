@@ -463,8 +463,16 @@ jobs:
   # `cplt doctor --fix` (#841) on a stock 24.04 runner: the AppArmor userns
   # block is live, the fix runs through the runner's passwordless sudo in a
   # real TTY, and every refusal runs nothing.
+  # `profile`: own writes /etc/apparmor.d/bwrap; shipped puts Ubuntu's
+  # bwrap-userns-restrict (apparmor-profiles) in /etc/apparmor.d first, so
+  # the fix loads that one. Both end with the broker e2e.
   doctor-fix-e2e:
     if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base != null
+    name: doctor-fix-e2e-${{ matrix.profile }}
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [own, shipped]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -498,7 +506,12 @@ jobs:
             exit 1
           fi
           echo "userns block live: bwrap --unshare-user fails"
+          if [ "${{ matrix.profile }}" = shipped ]; then
+            sudo apt-get install -y apparmor-profiles
+            sudo cp /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/
+          fi
           ls -l /etc/apparmor.d/ | grep -i bwrap || echo "no bwrap profile in /etc/apparmor.d"
+          bwrap --unshare-user --ro-bind / / /bin/true 2>/dev/null && { echo "::error::unblocked before the fix"; exit 1; } || true
 
       - name: Refusals print the commands and run nothing
         run: |
@@ -507,7 +520,7 @@ jobs:
           blocked() { ! bwrap --unshare-user --ro-bind / / /bin/true 2>/dev/null; }
           check() { # name, output
             echo "--- $1"; echo "$2" | tail -40
-            echo "$2" | grep -q 'sudo apparmor_parser -r /etc/apparmor.d/bwrap' || { echo "::error::$1: commands not shown"; exit 1; }
+            echo "$2" | grep -q '/usr/bin/sudo /usr/sbin/apparmor_parser -r /etc/apparmor.d/bwrap' || { echo "::error::$1: commands not shown"; exit 1; }
             echo "$2" | grep -q "Not offering to run it" || { echo "::error::$1: no refusal"; exit 1; }
             echo "$2" | grep -q "Fix now?" && { echo "::error::$1: it asked"; exit 1; }
             blocked || { echo "::error::$1: the fix ran"; exit 1; }
@@ -525,6 +538,11 @@ jobs:
           echo "$out" | grep -q "Fixed: bubblewrap now starts." || { echo "::error::re-check did not pass"; exit 1; }
           bwrap --unshare-user --ro-bind / / /bin/true
           echo "after the fix: bwrap --unshare-user succeeds"
+
+      - name: The MCP broker works after the fix
+        env:
+          CPLT_TEST_REQUIRE_SANDBOX: "1"
+        run: cargo test --test mcp_broker -- --nocapture
 
   # Linux integration tests — Landlock kernel enforcement (requires Linux 5.13+)
   linux-integration-tests:
