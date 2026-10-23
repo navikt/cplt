@@ -498,6 +498,7 @@ jobs:
             exit 1
           fi
           echo "userns block live: bwrap --unshare-user fails"
+          ls -l /etc/apparmor.d/ | grep -i bwrap || echo "no bwrap profile in /etc/apparmor.d"
 
       - name: Refusals print the commands and run nothing
         run: |
@@ -505,7 +506,7 @@ jobs:
           cplt="$PWD/target/debug/cplt"
           blocked() { ! bwrap --unshare-user --ro-bind / / /bin/true 2>/dev/null; }
           check() { # name, output
-            echo "--- $1"; echo "$2" | sed -n '/The fix:/,$p'
+            echo "--- $1"; echo "$2" | tail -40
             echo "$2" | grep -q 'sudo apparmor_parser -r /etc/apparmor.d/bwrap' || { echo "::error::$1: commands not shown"; exit 1; }
             echo "$2" | grep -q "Not offering to run it" || { echo "::error::$1: no refusal"; exit 1; }
             echo "$2" | grep -q "Fix now?" && { echo "::error::$1: it asked"; exit 1; }
@@ -519,7 +520,7 @@ jobs:
       - name: doctor --fix in a real TTY applies the fix
         run: |
           out="$(printf 'y\n' | env -u CI script -q -e -c "$PWD/target/debug/cplt doctor --fix" /dev/null 2>&1 || true)"
-          echo "$out" | sed -n '/The fix:/,$p'
+          echo "$out" | tail -40
           echo "$out" | grep -q "Fix now?" || { echo "::error::not offered"; exit 1; }
           echo "$out" | grep -q "Fixed: bubblewrap now starts." || { echo "::error::re-check did not pass"; exit 1; }
           bwrap --unshare-user --ro-bind / / /bin/true
