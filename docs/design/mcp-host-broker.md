@@ -1,593 +1,530 @@
 # Design: a generic MCP host broker
 
-Status: proposal, 2026-10-23. Design only, nothing here is implemented.
-Refs [#821](https://github.com/navikt/cplt/issues/821), [#807](https://github.com/navikt/cplt/pull/807), [#797](https://github.com/navikt/cplt/issues/797).
+Status: proposal, revised 2026-10-23 with the owner's decisions (section 0).
+Design only; nothing here is implemented.
+Refs [#821](https://github.com/navikt/cplt/issues/821), [#807](https://github.com/navikt/cplt/pull/807), [#797](https://github.com/navikt/cplt/issues/797), [#820](https://github.com/navikt/cplt/issues/820).
 
-Code citations are against `origin/main` at the time of writing. Claims marked
-**(unverified)** were not checked against source or by running them.
+Code citations are against `origin/main` at the time of writing. Claims
+marked **(unverified)** were not checked against source or by running them.
+
+## 0. Decisions (owner, 2026-10-23)
+
+| # | Topic | Decision |
+|---|-------|----------|
+| D1 | Boundary | cplt stays generic and knows nothing about Nav's registry. It owns a broker spec schema, hard invariants, credential resolution, enforcement, the runtime and `cplt mcp status --json`. nav-pilot, the trusted launcher outside the sandbox, owns the registry, consent, per-client config and the host login UX. It turns registry entries into specs and hands them to cplt through a stable interface (section 5) |
+| D2 | Invariants | Credential never enters the sandbox; pinned upstream or command; read-only by default; `host-exec` never brokered. cplt rejects a spec that breaks one |
+| D3 | Compiled-in knowledge | cplt keeps a hand-kept table of **credential mechanisms** only (gh token; nais keychain via `nais alpha mcp serve`). Tool policy is never compiled in |
+| D4 | Spec format | Built from standard MCP `server.json` fields; only what the spec lacks goes in a namespaced `_meta` extension (section 5.2). Any spec-compliant registry could feed cplt |
+| D5 | Clients | All, from phase 1: Copilot CLI (`--disable-mcp-server` + `--additional-mcp-config`), OpenCode (`OPENCODE_CONFIG_CONTENT`), pi where possible |
+| D6 | Local transport | stdio over a per-session Unix socket. Client entry: `command: cplt mcp-stdio <id>`, piped to the host child, after `src/worktree_broker.rs`. macOS first; Linux needs a bwrap bind (later). Remote kind (GitHub) keeps the HTTP proxy path |
+| D7 | Host child | Unsandboxed in phase 1, env cleared, egress pinned with `HTTPS_PROXY` to cplt's CONNECT proxy, allowed to the spec's hosts only. File profile later; Linux will need the D-Bus session socket (nais uses go-keyring) |
+| D8 | Tools | Read-only by default. Writes opted in per server with `nav-pilot mcp enable --tools`, written to the user's cplt config. New or unclassified tools refused until re-consent. Write tools off by default for brokered servers |
+| D9 | GraphQL | Broker refuses a `mutation` or `subscription` keyword, or more than one operation, with a simple check. File the nais/cli fix first (it checks only `Operations[0]`) |
+| D10 | Login | nav-pilot runs `nais login -n` / `gh auth login` on the host after a yes; with `--json` or no tty it only prints the command. Nais status: `nais auth print-access-token` |
+| D11 | Without cplt | `mcp list` PATH `direct` says "no read-only guarantee"; nav-pilot warns or refuses on enabling `execute_graphql` outside cplt. A gh login mid-session needs a restart; the error says so |
+| D12 | Errors | Broker DENIED and auth errors are mirrored to cplt's launch output or proxy log, not only to the agent |
+| D13 | DoS | Cap in-flight requests per child. `notifications/tools/list_changed` is not delivered; documented |
+| D14 | Out of scope | IDE servers. Figma OAuth is a later phase. No user-declared rows |
+| D15 | Phasing | Phase 1 = Nais (#821) in all clients, read allowlist, egress pin; extract shared pieces only as needed. GitHub moves to the shared model when a third server arrives. Then the child sandbox, then Figma OAuth |
+
+These replace the earlier open questions Q1-Q10; section 12 keeps only
+what is still open.
 
 ## 1. Problem and goals
 
-cplt's sandbox keeps credentials out of the agent. MCP servers need
-credentials. Today the two meet in three ways, all bad:
+cplt keeps credentials out of the agent. MCP servers need credentials.
+Today that fails three ways:
 
-- **The server cannot log in.** GitHub's remote MCP needs OAuth without
-  dynamic client registration, so OpenCode cannot get a token
-  ([#797](https://github.com/navikt/cplt/issues/797)).
-- **The server needs a grant cplt will not give.** `nais alpha mcp serve` runs
-  as a child of the agent, inside the sandbox, and needs the macOS login
-  keychain plus `~/Library/Application Support/nais/nais-credentials.json.enc`.
-  Granting `~/Library/Keychains` exposes every silently readable keychain item
-  (SECURITY.md:924-945, "Keychain access is all-or-nothing").
-- **The token is handed to the agent.** `--pass-env GH_TOKEN` and similar work,
-  and are what cplt is trying to stop.
+- **The server cannot log in.** GitHub's remote MCP has OAuth without
+  dynamic client registration, so OpenCode cannot get a token (#797).
+- **The server needs a grant cplt will not give.** `nais alpha mcp serve`
+  runs as a child of the agent, inside the sandbox, and needs the macOS
+  login keychain plus `~/Library/Application Support/nais/nais-credentials.json.enc`.
+  Granting `~/Library/Keychains` exposes every silently readable item
+  (SECURITY.md:924-945).
+- **The token is handed to the agent** with `--pass-env`, which cplt is
+  trying to stop.
 
-[#807](https://github.com/navikt/cplt/pull/807) fixed GitHub with a one-off
-module, `src/github_mcp.rs`. #821 needs the same for Nais, and the owner
-expects more. This document asks what the second, third and tenth server
-should look like.
-
-Goals:
+#807 fixed GitHub with a one-off module, `src/github_mcp.rs`. #821 needs
+Nais, and more servers will follow.
 
 | # | Goal | Test |
 |---|------|------|
 | G1 | Credentials never enter the sandbox | No token, keychain or credential-file grant; the agent sees an MCP endpoint, not a secret |
-| G2 | Just works | A user who ran `nav-pilot mcp enable` and logged in on the host (`gh auth login`, `nais login -n`) needs no cplt config |
-| G3 | Scales to N servers | Adding a server is a declaration plus review, not a new Rust module |
+| G2 | Just works | After `nav-pilot mcp enable <name>` and a host login, no cplt config is needed |
+| G3 | Scales to N servers | A new server is a registry entry plus, at most, a credential mechanism in cplt |
 | G4 | No break for existing users | `sandbox.github_mcp_proxy` and `--no-github-mcp-proxy` keep working |
-| G5 | Policy is enforced outside the agent | Read-only and tool limits hold even against a hostile agent |
+| G5 | Policy holds against a hostile agent | Read-only and tool limits are enforced outside the sandbox |
 
-Non-goals: a general MCP gateway for other machines, multi-user serving, and
-replacing the agent's own MCP permission prompts.
+Non-goals: a gateway for other machines, multi-user serving, replacing
+the client's own permission prompts.
 
 ## 2. User experience
 
-The broker is plumbing. What users see is whether `nav-pilot mcp enable
-<name>` gives them working tools. This section sets the target first; the
-rest of the document serves it.
-
-Clients in scope: Copilot CLI and OpenCode, the two `nav-pilot mcp enable
---client` targets (navikt/copilot `cli/nav-pilot/internal/cli/mcp_cmd.go:135-137`).
-Claude Code and VS Code matter as comparisons and for users who configure
-them by hand. pi has no built-in MCP client **(unverified)**, so it is out
-of scope until it has one.
+Clients: Copilot CLI and OpenCode (the `nav-pilot mcp enable --client`
+targets, navikt/copilot `cli/nav-pilot/internal/cli/mcp_cmd.go:135-137`),
+and pi where it can host MCP **(unverified: pi has no built-in MCP client
+as far as checked)**. Claude Code and VS Code appear as comparisons.
 
 ### 2.1 Today's journeys
 
 | Server | Client | What the user does | Where it breaks | What they see |
 |--------|--------|--------------------|-----------------|---------------|
 | GitHub | OpenCode, no cplt | `nav-pilot mcp enable io.github.navikt/github-mcp --client opencode` | OpenCode tries OAuth; GitHub has no DCR | `Incompatible auth server: does not support dynamic client registration` (#797) |
-| GitHub | OpenCode, cplt before #807 | Same | Same, and `GH_TOKEN` is stripped, so the bearer-header workaround fails too | `needs authentication` in `opencode mcp list` (#807 e2e) |
-| GitHub | OpenCode, cplt with #807 | Same | Works if `gh auth login` was done on the host | Without it: "GitHub MCP in OpenCode needs your gh login: run `gh auth login`." (`src/opencode_v2.rs:330`) |
-| GitHub | Copilot CLI | Nothing: built in | Works; Copilot holds the token | Nothing |
-| Figma | OpenCode | `nav-pilot mcp enable com.figma/figma-mcp`, then `opencode mcp auth` | Under cplt strict mode, OAuth needs `api.figma.com`; the browser hand-off needs `--allow-browser` or a copied URL | Host consent prompt from nav-pilot (navikt/copilot#1272), then the client's OAuth errors. No summary of the Slack threads was found in the issues, so no Figma error text is quoted |
-| Nais | any | `nais login -n` on the host, then a hand-written stdio entry (registry `setupInstructions`; `nav-pilot mcp enable` does not support it) | Under cplt the server runs in the sandbox and cannot read the keychain | Connects, then every call fails: `unauthenticated: please log in with nais login -n` (#821), though the user is logged in |
-| Stdio, no secrets (Playwright, next-devtools) | any | `nav-pilot mcp enable <name>` | Missing runtime or a cplt cache rule | `mcp list` shows the problem and the fix (`mcp_cmd.go:489-498`) |
-
-Nais is the worst case: the error names a fix the user has already run.
+| GitHub | OpenCode, cplt before #807 | Same | `GH_TOKEN` is stripped too | `needs authentication` (#807 e2e) |
+| GitHub | OpenCode, cplt with #807 | Same | Works after `gh auth login` on the host | Otherwise: "GitHub MCP in OpenCode needs your gh login: run `gh auth login`." (`src/opencode_v2.rs:330`) |
+| GitHub | Copilot CLI | Nothing; built in | Works; Copilot holds the token | Nothing |
+| Figma | OpenCode | `nav-pilot mcp enable com.figma/figma-mcp`, then `opencode mcp auth` | Strict mode needs `api.figma.com`; the browser hand-off needs `--allow-browser` or a copied URL | nav-pilot host consent (navikt/copilot#1272), then client OAuth errors. No Slack summary was found in the issues, so no Figma error is quoted |
+| Nais | any | `nais login -n`, then a hand-written stdio entry (`nav-pilot mcp enable` does not support it) | Under cplt the server is sandboxed and cannot read the keychain | Every call fails: `unauthenticated: please log in with nais login -n` (#821), though the user is logged in |
+| Stdio, no secrets | any | `nav-pilot mcp enable <name>` | Missing runtime or a cache rule | `mcp list` problem plus fix (`mcp_cmd.go:489-498`) |
 
 ### 2.2 Target journey
-
-One command, the same everywhere:
 
 ```text
 $ nav-pilot mcp enable io.github.nais/nais-mcp
   Nais MCP: 12 read-only tools. Login: nais (not logged in).
   Run `nais login -n` now? [Y/n]
   ...browser opens on the host...
-  Enabled for opencode and copilot. Under cplt it runs on the host, outside the sandbox, read-only.
+  Enabled for opencode and copilot. Under cplt it runs on the host, read-only.
 ```
 
-Rules:
-
-1. **Login happens on the host, once, prompted by nav-pilot**, with the
-   tool's own command (`gh auth login`, `nais login -n`) or, for OAuth
-   servers, a browser flow run outside the sandbox. The agent is never
-   asked to log in.
-2. **Same config with or without cplt.** nav-pilot writes the client's
-   normal entry (remote URL or stdio command). cplt overlays it at launch,
-   as #807 does; outside cplt the entry works as written. The user's file
-   never holds a cplt URL or a token.
-3. **Same behaviour in every client.** The tool set, read-only state and
-   error texts depend on the server and policy, not the client. Where a
-   client cannot do something (2.6), nav-pilot says so at enable time, not
-   at the first call.
-4. **No cplt config for the common case.** Opt-outs exist; nothing has to
-   be turned on.
+1. Login happens on the host, once, run by nav-pilot after a yes (D10).
+   The agent is never asked to log in.
+2. The user's client config is the same with or without cplt. cplt
+   overlays it at launch; the file never holds a cplt path or a token.
+3. Tool set, read-only state and error text depend on the spec, not the
+   client.
+4. No cplt config to write by hand. nav-pilot writes the spec (section 5).
 
 ### 2.3 Who owns what
 
 | Owner | Owns | Does not own |
 |-------|------|--------------|
-| Registry (`allowlist.json`) | Identity, transport, upstream URL, tools and risk classes (`toolRisk`), host needs (`sandboxHosts`), setup steps. **New:** `auth.kind` (none, host-cli, oauth, ambient-stdio), `auth.loginCommand`, `auth.statusCommand`, `minCplt` | Enforcement; anything that runs |
-| nav-pilot | Writing each client's config, consent, preflight (binary present, logged in, cplt version), `mcp list` and doctor, running the login command on the host | Holding tokens; runtime policy |
-| cplt | The reviewed broker table, spawning and proxying, policy (tool filter, read-only, GraphQL check), the config overlay, one-line launch warnings | Writing user config; consent UI |
-| Client | Connecting, showing tools, its own per-call permission prompts | Credentials, for brokered servers |
+| Registry (any spec-compliant MCP Registry) | `server.json` plus the `_meta` extension: identity, transport, upstream, tools, risk classes, hosts, credential mechanism, login and status commands | Anything that runs |
+| nav-pilot | Fetching the registry, consent, client config, preflight, host login, writing the broker spec into the user's cplt config, `mcp list` | Tokens; runtime enforcement |
+| cplt | Spec schema and validation, invariants, credential mechanisms, broker runtime, policy enforcement, client overlays at launch, `cplt mcp status --json` | Registry knowledge; consent UI |
+| Client | Connecting, showing tools, per-call prompts | Credentials for brokered servers |
 
 The registry declares, nav-pilot asks, cplt enforces. navikt/copilot#1272
-chose the same chain for egress ("registry changes ... must never grant
-egress by themselves"); the broker reuses it.
+chose the same chain for egress.
 
 ### 2.4 Status and diagnostics
 
-Extend `nav-pilot mcp list`. It already prints a problem and a `Fix:` line
-per server (`mcp_cmd.go:139-145`, `:249`). Target:
+`nav-pilot mcp list` already prints a problem and a `Fix:` line per server
+(`mcp_cmd.go:139-145`, `:249`). Target:
 
 ```text
-SERVER        CLIENTS            LOGIN               PATH          TOOLS
-github-mcp    opencode, copilot  gh: ok              cplt broker   10 read
-nais-mcp      opencode           nais: expired       cplt broker   12 read
-figma-mcp     opencode           oauth: in client    direct        4 read, 10 off (external)
-playwright    copilot            none needed         sandbox       13 read/write, 3 off
+SERVER        CLIENTS            LOGIN            PATH                              TOOLS
+github-mcp    opencode, copilot  gh: ok           cplt broker                       10 read
+nais-mcp      opencode, copilot  nais: expired    cplt broker                       12 read
+figma-mcp     opencode           oauth: client    direct (no read-only guarantee)   4 read, 10 off
+playwright    copilot            none             sandbox                           13 read/write, 3 off
 
   nais-mcp: login expired.  Fix: nais login -n
 ```
 
-LOGIN comes from the registry's `auth.statusCommand` (`gh auth status`;
-the nais equivalent is **(unverified)**). PATH comes from a new
-`cplt mcp status --json`, which runs launch detection without starting
-anything. `cplt doctor` shows the same rows.
+LOGIN runs the spec's status command (`gh auth status`, `nais auth
+print-access-token`, output discarded). PATH comes from `cplt mcp status
+--json` (section 5.5). `cplt doctor` shows the same rows.
 
-Every error, whether from cplt at launch, a broker JSON-RPC error or
-nav-pilot, follows one pattern: **what is wrong, then the exact command that
-fixes it.** The broker turns a child's auth failure into
-`nais-mcp: not logged in on the host. Fix: nais login -n (outside the agent)`,
-so the agent can relay it.
+Every error is "what is wrong. Fix: exact command", in nav-pilot, at cplt
+launch, in the proxy log and in the broker's JSON-RPC errors (D12).
 
 ### 2.5 Consent and visibility
 
-- **At enable, once per server:** show the risk classes and what is on.
-  Read tools are on. `write` is on by default in nav-pilot today
-  (navikt/copilot `cli/nav-pilot/internal/provider/mcp_tools.go:46-55`), but should be **off for brokered servers**,
-  because the broker runs them outside the sandbox. `external` asks.
-  `host-exec` asks with a warning and is never brokered.
-- **At launch:** silent, except one line per brokered server on the first
-  launch after enable, and a line when a server is skipped (no login,
-  proxy off).
-- **In session:** the client's own per-call prompts. The broker adds no
-  prompts; it refuses with a clear error the agent sees.
-- **Changes need new consent:** a registry update that adds a tool or
-  raises its class leaves it off until the user re-runs enable. nav-pilot
-  already narrows approvals (`cli/nav-pilot/internal/provider/mcp_servers.go:130`).
-
-All prompting happens at enable time. cplt never prompts per session or per
-call.
+- **At enable, once per server:** risk classes and what is on. Brokered
+  servers get read tools only (D8); writes need `--tools`. `external` asks;
+  `host-exec` is never brokered.
+- **At launch:** one line per brokered server on the first launch after a
+  change, and a line when one is skipped (no login, proxy off).
+- **In session:** only the client's prompts. The broker refuses with an
+  error the agent sees and cplt logs.
+- **Changes:** a registry update that adds a tool or raises its class
+  leaves it refused until the user re-runs `enable` (D8; nav-pilot already
+  narrows approvals, `cli/nav-pilot/internal/provider/mcp_servers.go:130`).
 
 ### 2.6 Client differences
 
-| Difference | Copilot CLI | OpenCode | Hidden by | Leaks when |
-|------------|-------------|----------|-----------|------------|
-| OAuth without DCR (GitHub) | Built-in GitHub login | Fails | Broker (kind A) | OpenCode outside cplt: nav-pilot must warn |
-| OAuth with DCR (Figma) | Supported; tokens in `~/.copilot/mcp-oauth-config/` (SECURITY.md:75) | Supported; `opencode mcp auth` | Not hidden; the client does it | Browser hand-off from inside cplt |
-| stdio vs HTTP | Both | Both | Under cplt, the broker turns a stdio server into an HTTP entry | Outside cplt the client spawns stdio itself |
-| Tool filtering | `tools` list in the entry | Permission rules | Broker filters `tools/list` for brokered servers | Other servers rely on the client's filter |
-| Config overlay | No env overlay known **(unverified)** | `OPENCODE_CONFIG_CONTENT` | cplt overlay | Copilot needs another mechanism before it can use the broker (Q2) |
-| Fixed headers (`X-MCP-Readonly`) | Entry `headers` | Entry `headers` | Broker forces them | Outside cplt they are only as fixed as the config file |
+| Difference | Copilot CLI | OpenCode | pi | Hidden by |
+|------------|-------------|----------|----|-----------|
+| Launch overlay | `--disable-mcp-server <name>` (removes the user's entry for the session) plus `--additional-mcp-config <json\|@file>` (adds the brokered one); both in `copilot --help` (1.0.x) | `OPENCODE_CONFIG_CONTENT`, deep-merged (`src/github_mcp.rs:75-99`) | **(unverified)** | cplt |
+| OAuth without DCR (GitHub) | Built-in GitHub login | Fails | n/a | Broker, remote kind |
+| OAuth with DCR (Figma) | Client does it; tokens in `~/.copilot/mcp-oauth-config/` (SECURITY.md:75) | `opencode mcp auth` | n/a | Not hidden until the Figma phase |
+| Local server | `command` + `args` | `command` array | **(unverified)** | Both get `cplt mcp-stdio <id>` |
+| Tool filtering | `tools` list | Permission rules | | Broker filters `tools/list` |
 
-What cannot be hidden: outside cplt there is no broker, so read-only and
-tool limits are only as strong as the client config. `mcp list` should say
-so (PATH `direct`).
+What cannot be hidden: without cplt there is no broker, so limits are only
+as strong as the client config (D11).
 
 ### 2.7 Failure modes and recovery
 
 | Failure | Detected by | User sees | Recovery |
 |---------|-------------|-----------|----------|
-| Login missing or expired | nav-pilot preflight; cplt at launch (kind A); broker on the first auth error (kind C) | `<server>: not logged in on the host. Fix: <loginCommand>` | Run it on the host. Kind A re-fetches the token on 401; whether a kind C child picks up a new login without restart is **(unverified)**, so the broker restarts it on an auth error |
-| CLI missing | nav-pilot preflight; cplt (not in trusted dirs) | `nais is not installed. Fix: <install command from the registry>` | Install; restart the session |
-| Old cplt (no broker, or no row) | nav-pilot compares `cplt --version` with `minCplt` | `cplt <v> cannot broker nais-mcp. Fix: brew upgrade cplt` | Upgrade. Until then the entry runs as configured and fails as today |
-| Server down, upstream 5xx | Broker | JSON-RPC error with the upstream status; a proxy log line | Retry; nothing to fix locally |
-| Child crashes in a loop | Broker restart budget | `nais-mcp stopped after 3 restarts; see the proxy log` | `--proxy-log-level all`; report upstream |
-| Proxy off (`--no-proxy`) | cplt at launch | "goes through cplt's proxy, which is off: left as configured" (`src/opencode_v2.rs:324-326`) | Turn the proxy back on |
+| Login missing or expired | nav-pilot preflight; cplt at launch; broker on an auth error | `<server>: not logged in on the host. Fix: <login command>` | Run it on the host. Kind C: broker restarts the child on the next call. GitHub: the token is read at launch, so "restart the session" is part of the message (D11) |
+| CLI missing | nav-pilot preflight; cplt (binary not in trusted dirs) | `nais is not installed. Fix: <install hint from the spec>` | Install, restart |
+| Old cplt | nav-pilot compares `cplt mcp status --json`'s `schema` with what it writes | `cplt <v> cannot read broker spec v<n>. Fix: brew upgrade cplt` | Upgrade; until then nav-pilot does not write the spec |
+| Server down | Broker | JSON-RPC error with the upstream status; proxy log line | Retry |
+| Child crash loop | Restart budget | `nais-mcp stopped after 3 restarts; see the proxy log` | `--proxy-log-level all` |
+| Proxy off | cplt at launch | "goes through cplt's proxy, which is off: left as configured" (`src/opencode_v2.rs:324-326`) | Turn the proxy on |
 
 ### 2.8 How others present MCP auth
 
 | Product | How the user logs in | Where tokens live | Notes |
 |---------|----------------------|-------------------|-------|
-| Copilot CLI | Built-in GitHub MCP uses the CLI's login; other remote servers through OAuth | `~/.copilot/mcp-oauth-config/` (SECURITY.md:75) | Enterprise registry and allowlist control which servers ([docs](https://docs.github.com/en/copilot/how-tos/administer-copilot/manage-mcp-usage/configure-mcp-registry)) |
-| VS Code | Prompts when a server needs auth; uses its GitHub and Microsoft auth providers where they match, else DCR **(unverified)** | VS Code secret storage **(unverified)** | Closest to "just works" for GitHub |
-| Claude Code | `/mcp`, pick the server, authenticate in the browser | macOS Keychain (SECURITY.md:1052-1058) | Local servers run unsandboxed ([docs](https://code.claude.com/docs/en/sandboxing)) |
-| Docker MCP Toolkit | Desktop UI or `docker mcp oauth authorize <server>`; API keys via `docker mcp secret set` **(unverified)** | Docker's secret store | Gateway injects credentials into server containers ([docs](https://docs.docker.com/ai/mcp-gateway/)) |
+| Copilot CLI | Built-in GitHub MCP uses the CLI login; other remotes via OAuth | `~/.copilot/mcp-oauth-config/` (SECURITY.md:75) | Enterprise registry allowlist ([docs](https://docs.github.com/en/copilot/how-tos/administer-copilot/manage-mcp-usage/configure-mcp-registry)) |
+| VS Code | Prompt on auth; its GitHub and Microsoft providers where they match, else DCR **(unverified)** | Secret storage **(unverified)** | Closest to "just works" for GitHub |
+| Claude Code | `/mcp`, authenticate in the browser | macOS Keychain (SECURITY.md:1052-1058) | Local servers run unsandboxed ([docs](https://code.claude.com/docs/en/sandboxing)) |
+| Docker MCP Toolkit | Desktop UI or `docker mcp oauth authorize`; `docker mcp secret set` **(unverified)** | Docker's secret store | Gateway injects credentials ([docs](https://docs.docker.com/ai/mcp-gateway/)) |
 
-The common pattern: log in once, outside the conversation, through a
-command or UI the vendor owns, and keep tokens out of the model's reach.
-Docker's gateway is closest to this design: credentials live with the
-gateway, not the client.
+Common pattern: log in once, outside the conversation, through the
+vendor's command or UI; keep tokens out of the model's reach.
 
 ## 3. Taxonomy of servers
 
-Registry entries from navikt/copilot `apps/mcp-registry/allowlist.json`.
-
-| Kind | Example | Where it runs today under cplt | Credential | Broker role |
-|------|---------|-------------------------------|------------|-------------|
-| A. Remote HTTP, host CLI token | GitHub (`api.githubcopilot.com/mcp`) | Agent connects out through the CONNECT proxy | `gh auth token` on the host | Reverse proxy that adds the token (what #807 does) |
-| B. Remote HTTP, OAuth with DCR or CIMD | Figma (`mcp.figma.com/mcp`, `sandboxHosts: ["api.figma.com"]`) | Agent does OAuth itself; tokens land in OpenCode's data dir, inside the sandbox | OAuth tokens held by the client | Optional: broker as the OAuth client, see section 7 |
-| C. Local stdio, host credentials | Nais (`nais alpha mcp serve`) | Child of the agent, inside the sandbox; fails without a keychain grant | Keychain item + encrypted file | Spawn on the host, bridge stdio to HTTP |
-| D. Local stdio, no secrets | next-devtools, svelte, playwright, chrome-devtools | Child of the agent, inside the sandbox | None | **None.** Keep them in the sandbox |
-| E. IDE localhost server | IntelliJ (`http://127.0.0.1:64342/sse`), Aksel Arcade (`127.0.0.1:3846`) | Agent connects to loopback, which needs the localhost opt-in | IDE-side, often none | Out of scope; see open question Q6 |
-| F. Remote HTTP, no auth | Aksel, Astro docs, mcp-onboarding | Agent connects out through the CONNECT proxy | None | None |
-
-The broker is for A, C, and maybe B. D and F gain nothing and would lose the
-sandbox (D) or add a hop (F). E is a different problem: the IDE already runs
-outside the sandbox and its tools are classed `host-exec` in the registry.
+| Kind | Example | Today under cplt | Credential | Broker role |
+|------|---------|------------------|------------|-------------|
+| A. Remote HTTP, host CLI token | GitHub | Through the CONNECT proxy | `gh auth token` | HTTP reverse proxy that adds the token (#807) |
+| B. Remote HTTP, OAuth (DCR/CIMD) | Figma | Client does OAuth inside the sandbox | Client-held tokens | Later phase (D14) |
+| C. Local stdio, host credentials | Nais | Child of the agent, sandboxed; fails | Keychain + file | Host child behind `cplt mcp-stdio` (D6) |
+| D. Local stdio, no secrets | Playwright, next-devtools | Child of the agent, sandboxed | None | None; stays sandboxed |
+| E. IDE localhost | IntelliJ, Aksel Arcade | Loopback opt-in | IDE-side | Out of scope (D14) |
+| F. Remote, no auth | Aksel, Astro docs | Through the CONNECT proxy | None | None |
 
 ## 4. Prior art
 
-| Project | What it does | What to take | Notes |
-|---------|--------------|--------------|-------|
-| [Docker MCP Gateway](https://docs.docker.com/ai/mcp-gateway/) ([source](https://github.com/docker/mcp-gateway)) | One gateway process; each server in its own container with restricted privileges, network and resources; starts servers on demand; injects secrets centrally; profiles choose which servers a client sees | Lazy start, one gateway for N servers, secrets injected at the gateway, per-server isolation | Per-tool filtering and interceptors not described on the overview page **(unverified)** |
-| [Stacklok ToolHive](https://docs.stacklok.com/toolhive/) | Runs servers in containers behind a proxy that exposes HTTP; secrets manager; network filtering; tool name/description filtering in its gateway; authz policies ([reference](https://docs.stacklok.com/toolhive/reference/authz-policy-reference)) | Stdio servers fronted by HTTP, tool filtering at the proxy, a declarative policy file | Cedar as the policy language **(unverified)** |
-| [mcp-proxy](https://github.com/sparfenyuk/mcp-proxy), [supergateway](https://github.com/supercorp-ai/supergateway) | Bridges stdio to SSE/streamable HTTP and back | The bridge is small: one child, JSON-RPC lines on stdin/stdout, sessions mapped to the child | Both bind a port with no auth by default **(unverified)**; cplt must not copy that |
-| [Claude Code sandboxing](https://code.claude.com/docs/en/sandboxing) | Sandbox covers shell commands only; "local MCP servers ... run with your full access" | Confirms the gap: a mainstream agent leaves MCP servers unsandboxed | |
-| [GitHub Copilot MCP registry and allowlist](https://docs.github.com/en/copilot/how-tos/administer-copilot/manage-mcp-usage/configure-mcp-registry) | Enterprise registry (v0.1 API) lists allowed servers; GitHub calls it "not the recommended method for restricting access" and points to `managed-settings.json` | The registry as the source of which servers exist, not as an enforcement point | Which clients enforce it is not stated on that page |
-| [Copilot CLI](https://docs.github.com/en/copilot/how-tos/use-copilot-agents/use-copilot-cli) | Built-in `github-mcp-server` remote; user servers in `~/.copilot/mcp-config.json` | cplt already grants its MCP commands (SECURITY.md:64) | Copilot keeps `GH_TOKEN` (SECURITY.md:25-28), so kind A matters less there |
-| [MCP authorization spec](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization) | OAuth 2.1, protected resource metadata, DCR, and Client ID Metadata Documents (CIMD) | The broker can be the OAuth client for B | |
-| [MCP security best practices](https://modelcontextprotocol.io/specification/2025-06-18/basic/security_best_practices) | Token passthrough: servers "MUST NOT accept any tokens that were not explicitly issued for the MCP server". Confused deputy: proxies with a static client ID "MUST implement per-client consent". Local servers: "Execute MCP server commands in a sandboxed environment"; stdio proxies "SHOULD implement sandboxing ... for spawned processes" and must not expose spawn to a stolen proxy token | See sections 6-8 | |
-| [OpenCode MCP config](https://opencode.ai/docs/mcp-servers/) | `type: local` (`command`, `environment`) or `type: remote` (`url`, `headers`, `oauth`, `oauth: false`), `enabled`, `timeout` | The overlay target: a broker entry is `type: remote`, `oauth: false`, URL on the proxy port | |
+| Project | What it does | What to take |
+|---------|--------------|--------------|
+| [Docker MCP Gateway](https://docs.docker.com/ai/mcp-gateway/) ([source](https://github.com/docker/mcp-gateway)) | One gateway; each server in a restricted container; started on demand; secrets injected centrally | Lazy start, credentials at the gateway, per-server isolation |
+| [Stacklok ToolHive](https://docs.stacklok.com/toolhive/) | Servers in containers behind an HTTP proxy; secrets; network filtering; tool filtering; [authz policies](https://docs.stacklok.com/toolhive/reference/authz-policy-reference) | Tool filtering at the proxy; declarative policy |
+| [mcp-proxy](https://github.com/sparfenyuk/mcp-proxy), [supergateway](https://github.com/supercorp-ai/supergateway) | stdio to HTTP bridges | Confirms the bridge is small. Their unauthenticated ports **(unverified)** are what the Unix socket avoids |
+| [Claude Code sandboxing](https://code.claude.com/docs/en/sandboxing) | Sandbox covers shell only; local MCP servers "run with your full access" | The gap is common |
+| [GitHub Copilot MCP registry](https://docs.github.com/en/copilot/how-tos/administer-copilot/manage-mcp-usage/configure-mcp-registry) | v0.1 registry lists allowed servers; GitHub says it is not the recommended restriction | Registry as catalogue, not enforcement |
+| [MCP server.json schema](https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json) | Standard server description: `packages[]`, `remotes[]`, `_meta` | Base of the broker spec (D4) |
+| [MCP authorization](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization) | OAuth 2.1, DCR, CIMD | For the Figma phase |
+| [MCP security best practices](https://modelcontextprotocol.io/specification/2025-06-18/basic/security_best_practices) | No token passthrough ("MUST NOT accept any tokens that were not explicitly issued for the MCP server"); per-client consent for OAuth proxies; sandbox spawned stdio servers; stdio proxies must not let a stolen proxy token spawn commands | Sections 6-8 |
+| [OpenCode MCP config](https://opencode.ai/docs/mcp-servers/) | `local` (`command`, `environment`) or `remote` (`url`, `headers`, `oauth`) | Overlay target |
 
-Is the broker "token passthrough"? No. The agent never holds the upstream
-token; the broker accepts no client token and drops any `Authorization` the
-client sends (`src/github_mcp.rs:225-244`). The broker is a local client of the
-upstream acting with the user's identity, which is the pattern the spec
-describes for MCP proxies. The confused-deputy rule bites only if the broker
-runs an OAuth flow for many clients; here it has exactly one client per
-session, behind a secret path (section 7).
+The broker is not token passthrough: the agent never holds the upstream
+token and any client `Authorization` is dropped (`src/github_mcp.rs:225-244`).
+The spec's "proxy spawns arbitrary commands" risk does not apply: the
+command comes from a spec the agent cannot write, and the socket only
+selects an already declared id.
 
-## 5. Architecture options
+## 5. Architecture
 
-### 5.1 The options
+### 5.1 Options considered
 
-| | O1. Per-server modules (status quo) | O2. Generic declarative broker in cplt | O3. Separate daemon |
+| | O1. Per-server modules (status quo) | O2. Generic broker in cplt, specs from nav-pilot | O3. Separate daemon |
 |---|---|---|---|
-| Shape | One Rust module per server, like `github_mcp.rs` | One module, servers declared as data; kind A and C handlers | Long-lived host process (cplt-mcpd or ToolHive/Docker) shared across sessions |
-| Adding server N | New module, tests, review | New declaration, review | New declaration, daemon config |
-| Lifetime | cplt session | cplt session | Independent; outlives sessions |
-| Secret path / port | Proxy port, one static endpoint (`src/github_mcp.rs:182-184`) | Proxy port, one path per server | Its own port or socket; needs a grant per session |
-| Trust | Hard-coded | cplt-reviewed table, gated by user config | Daemon config |
-| Cost | Grows linearly; each module re-solves header rules, logging, limits | One-time | New install, upgrade and crash story; Linux Landlock cannot pin a new port to loopback (`src/github_mcp.rs:7-9`) |
-| Fit with G2 | Good | Good | Poor: users must install and run it |
+| New server | New Rust module | Registry entry; a credential mechanism only if new | Daemon config |
+| Trust | Hard-coded | Spec in the user's cplt config, validated against invariants | Daemon config |
+| Fit with G2 | Good | Good | Poor: users install and run it |
 
-O3 fails G2 and adds a port the sandbox must reach. Docker/ToolHive would
-also need Docker or Podman on every laptop. O1 is fine for two servers and
-wrong for ten. **O2 is the recommendation**, keeping O1's proven pieces.
+O2, per D1.
 
-### 5.2 Where trust comes from
+### 5.2 The broker spec: server.json plus `_meta`
 
-Three inputs can name a server. They differ in who can write them.
+The registry is a spec-compliant MCP Registry; `apps/mcp-registry` entries
+declare `"$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json"`.
+The spec nav-pilot hands cplt is one `server.json` per server, using
+standard fields wherever they exist:
 
-| Source | Writable by agent? | May it enable a broker? |
-|--------|-------------------|-------------------------|
-| cplt's built-in server table (compiled in) | No | Defines what *can* be brokered: command, credential source, upstream, policy |
-| User's OpenCode config dir, `OPENCODE_CONFIG_CONTENT` when it reaches the sandbox (`src/opencode_v2.rs:297-322`) | No (config dir is read-only in the sandbox, SECURITY.md:82) | Yes: an entry that matches a table row turns it on (G2) |
-| User cplt config (`~/.config/cplt/config.toml`) | No | Yes: opt-out per server, and later opt-in to extra servers |
-| Repo config (`opencode.json`, `.cplt.toml`, `.mcp.json`) | Yes | **Never.** Same rule as today (`src/github_mcp.rs:107-111`) |
-| nav-pilot registry (`allowlist.json`) | No, but remote and mutable | Not at launch. Used at build or review time to generate or check the table |
+| Need | server.json field | Notes |
+|------|-------------------|-------|
+| Identity | `name`, `version` | Reverse-DNS name; also the broker id |
+| Remote upstream | `remotes[].type`, `.url`, `.headers` | Fixed headers (`X-MCP-Readonly`) already live here for GitHub |
+| Packaged local server | `packages[]` with `registryType`, `identifier`, `runtimeHint`, `transport.type: stdio`, `packageArguments`, `environmentVariables` | Covers npm, pypi, oci, nuget, mcpb |
+| Host binary (`nais`) | **none** | server.json has no registryType for "a CLI already on the host". Goes in `_meta` (`command`) |
+| Credential mechanism | **none** | `_meta` |
+| Tools and risk classes | **none** | `_meta` |
+| Read-only policy, argument checks | **none** | `_meta` |
+| Egress hosts | **none** (only implied by `remotes[].url`) | `_meta` |
+| Login / status commands | **none** | `_meta` |
 
-Rule: **the command, credential source and upstream come only from cplt's
-table.** User config only selects rows. That keeps a malicious or
-prompt-injected config from making cplt spawn an arbitrary host command with
-the user's credentials, which is the spec's "stdio proxy" escalation.
+Proposed extension key: `_meta["io.github.navikt/broker"]` on the
+server.json, version 1:
 
-Why not read the registry at launch? It would make a network fetch part of
-the trust chain and let a registry edit change what runs unsandboxed on every
-laptop, with no cplt release. The registry stays the catalogue and approval
-record; cplt's table is the enforcement copy. A CI check in navikt/copilot can
-flag registry entries of kind A or C that cplt's table lacks.
-
-A user-declared server (`[[mcp_broker.servers]]` in cplt config) is a
-possible later phase. It would be "user runs this command on the host
-anyway", so no worse than running the server outside cplt, but it moves an
-unsandboxed process under cplt's name. Defer it (Q3).
-
-### 5.3 How a server is declared
-
-A table row (Rust data, not a config file in phase 1):
-
-```text
-id:          nais
-match:       local entry whose command is [nais, alpha, mcp, serve, ...]
-             (or registry name io.github.nais/nais-mcp as the entry key)
-kind:        stdio
-command:     nais alpha mcp serve        # resolved from trusted dirs only
-args_policy: fixed; user args --team/--environment passed if on an allowlist
-env:         cleared, then HOME, PATH(trusted), LANG, XDG_*; nothing from the agent
-credential:  ambient (the binary reads its own keychain item on the host)
-policy:      tools allow = registry read tools; execute_graphql gated (6.2)
-limits:      body 4 MiB, 1 child, idle timeout, restart budget
-opt_out:     sandbox.mcp_broker.nais = false / --no-mcp-broker nais
+```json
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.nais/nais-mcp",
+  "version": "7.0.1",
+  "_meta": {
+    "io.github.navikt/broker": {
+      "v": 1,
+      "credential": "nais-keychain",
+      "command": ["nais", "alpha", "mcp", "serve"],
+      "egressHosts": ["console.nav.cloud.nais.io"],
+      "tools": {
+        "allow": ["get_nais_context", "execute_graphql", "validate_graphql", "schema_list_types"],
+        "classes": {}
+      },
+      "argChecks": {"execute_graphql": "graphql-read-only"},
+      "login": {"run": "nais login -n", "status": "nais auth print-access-token"}
+    }
+  }
+}
 ```
 
-```text
-id:          github
-match:       remote url api.githubcopilot.com/mcp or /mcp/readonly (src/github_mcp.rs:39-48)
-kind:        http
-upstream:    https://api.githubcopilot.com/mcp/readonly   # pinned (src/github_mcp.rs:34)
-credential:  gh auth token (src/discover.rs:155)
-headers:     force X-MCP-Readonly: true, X-MCP-Lockdown: true; pass X-MCP-Toolsets
-opt_out:     sandbox.github_mcp_proxy = false / --no-github-mcp-proxy  (kept)
+(The Nais egress host above is a placeholder **(unverified)**; phase 1
+measures what nais calls.)
+
+| Field | Type | Meaning | cplt check |
+|-------|------|---------|-----------|
+| `v` | int | Extension version | Unknown major: spec rejected |
+| `credential` | string | Name in cplt's mechanism table (D3): `gh-token`, `nais-keychain`, `none` | Must exist in the table; the mechanism fixes what the command or upstream may be |
+| `command` | string[] | Host binary and args (kind C, when no `packages[]` fits) | First element resolved in trusted dirs only; must match the mechanism's allowed command |
+| `egressHosts` | string[] | Hosts the child may reach via the CONNECT proxy | Bare public hostnames; same validation as #1272 profiles |
+| `tools.allow` | string[] | Tools the user consented to | Any tool not listed is refused; `host-exec` class in `classes` is refused at load |
+| `tools.classes` | map | Risk class per tool (`write`, `external`, `host-exec`; absent = read) | A `write`/`external` tool in `allow` needs `writeConsent: true` |
+| `writeConsent` | bool | Set by `enable --tools` | Default false |
+| `argChecks` | map | Named, cplt-implemented checks per tool | Unknown check name: spec rejected |
+| `login` | object | Commands nav-pilot runs and cplt quotes in errors | Not executed by cplt |
+
+Where today's custom fields live, and where they should:
+
+| Field | In `allowlist.json` (source) | As served by the registry | Should be |
+|-------|------------------------------|---------------------------|-----------|
+| `tools` | Top level of each server object | `_meta["io.github.navikt/registry"].tools` on the list response (`apps/mcp-registry/types.go:119-122`) | Response `_meta` (curation by the registry). Copied into the broker extension by nav-pilot |
+| `toolRisk` | Top level | Same `_meta` key | Same |
+| `sandboxHosts` | Top level | Same `_meta` key (`apps/mcp-registry/README.md:142`) | Same; becomes `egressHosts` in the broker extension |
+| `setupInstructions` | Top level | Same `_meta` key | Same (UI text, never reaches cplt) |
+| Nais launch command | Only as prose in `setupInstructions`; no `packages[]` | Not machine-readable | New `_meta` field (`command`), since server.json cannot express a host CLI |
+| Credential, login/status | Absent | Absent | New `_meta` fields |
+
+`allowlist.json` mixes non-standard keys into the server object; the
+registry moves them into the response `_meta`, which keeps the served
+`server.json` valid. nav-pilot already reads them from there
+(navikt/copilot `cli/nav-pilot/internal/provider/opencode_mcp.go:185-213`).
+cplt reads only `server.json` plus `io.github.navikt/broker`, not the
+registry's response shape, so any compliant registry plus that extension
+can feed it.
+
+### 5.3 The interface between nav-pilot and cplt
+
+| Aspect | Specification |
+|--------|---------------|
+| Location | `$XDG_CONFIG_HOME/cplt/mcp/<name-with-slashes-as-__>.json`, one file per server. User config dir, outside every sandbox grant, so the agent cannot write it. The per-server toggle stays in `config.toml`: `sandbox.mcp_broker.<id> = false` |
+| Writer | nav-pilot only, atomically (temp file + rename), mode 0600 |
+| Reader | cplt at launch, with `untrusted::read_untrusted` and a size cap, like `src/github_mcp.rs:112-139`. Symlinks and files in a writable tree are refused, as for OpenCode config (SECURITY.md:82) |
+| Versioning | `v` in the extension. cplt reports the versions it reads in `cplt mcp status --json` (`"schema": [1]`); nav-pilot writes the highest common one, or refuses with "upgrade cplt" |
+| Rejection | A spec that fails validation or an invariant is not loaded. cplt prints one line at launch (`nais-mcp: broker spec rejected: tools.allow has host-exec tool X. Fix: nav-pilot mcp enable io.github.nais/nais-mcp`), and lists it under `rejected` in `cplt mcp status --json`. The client entry is left as configured. Never a launch failure |
+| Per-run override | `--no-mcp-broker <id>` (repeatable), like `--deny-env` |
+| Repo config | Never read for specs |
+
+Invariants enforced at load (D2):
+
+1. `credential` names a mechanism in cplt's table, and the command or
+   upstream matches what that mechanism allows (for `gh-token`, upstream
+   `https://api.githubcopilot.com/mcp/readonly` only).
+2. No secret value anywhere in the spec (no header value matching a token
+   pattern; `environmentVariables` with `isSecret: true` refused unless the
+   mechanism supplies them).
+3. Write or external tools only with `writeConsent: true`; `host-exec`
+   never.
+4. Upstream `https` only; command from trusted dirs only.
+
+### 5.4 Transports
+
+**Local (kind C): stdio over a Unix socket (D6).** At launch cplt creates a
+per-session socket directory outside every granted root, as the worktree
+broker does (`src/worktree_broker.rs:1-20`), and grants the sandbox
+connect on that one socket. The client entry becomes
+`command: ["cplt", "mcp-stdio", "<id>"]`. That shim, running inside the
+sandbox, connects to the socket, sends the id, and copies stdin/stdout.
+The host side spawns or reuses the child and pipes bytes; it parses
+JSON-RPC lines only to apply policy. No secret path is needed: as in the
+worktree broker, the client is the sandboxed agent, which already holds
+that authority. Linux needs a bwrap bind of the socket directory; it comes
+after macOS.
+
+**Remote (kind A): HTTP on the proxy port behind a secret path**, as #807.
+Kept until a third server makes the shared model worth it (D15).
+
+### 5.5 `cplt mcp status --json`
+
+```json
+{"schema": [1],
+ "servers": [
+  {"id": "io.github.nais/nais-mcp", "state": "brokered", "transport": "unix",
+   "credential": "nais-keychain", "credential_ok": true,
+   "tools_allowed": 12, "clients": ["opencode", "copilot"]},
+  {"id": "io.github.navikt/github-mcp", "state": "brokered", "transport": "http",
+   "credential": "gh-token", "credential_ok": true}
+ ],
+ "rejected": [{"file": "…/mcp/x.json", "reason": "…", "fix": "…"}]}
 ```
 
-### 5.4 Transport and endpoint
-
-Keep #807's choice: streamable HTTP on the existing CONNECT proxy port, at
-`http://127.0.0.1:<port>/<128-bit secret>`, one secret per server per
-session. Reasons, all already measured in #807:
-
-- No new sandbox rule. On Linux a Landlock port rule cannot be limited to
-  loopback (`src/github_mcp.rs:7-9`, SECURITY.md:40).
-- The proxy's head size cap, head deadline and 64-connection limit apply
-  (`src/proxy.rs:87`, `src/proxy.rs:1163-1187`, `src/proxy.rs:1226`).
-- OpenCode remote entries take a plain URL (`oauth: false`).
-
-Change needed: `endpoint_for` (`src/github_mcp.rs:210-220`) becomes a lookup
-over a small map of `secret -> server`, still constant time per comparison.
-Dispatch stays at `src/proxy.rs:1205`.
-
-The worktree broker's per-session Unix socket (`src/worktree_broker.rs:1-20`)
-is the other precedent. It is better isolation, but OpenCode cannot point a
-remote MCP entry at a Unix socket **(unverified)**, so it does not fit here.
-
-### 5.5 The stdio bridge
-
-Streamable HTTP to one stdio child:
-
-1. `POST` with a JSON-RPC message or batch: write it to the child's stdin as
-   one line. For requests, read stdout until the matching `id`(s) answer and
-   return `application/json` (or `text/event-stream` if the child sends
-   progress or server requests first).
-2. Notifications and responses from the client: write, return `202`.
-3. `GET` (standalone SSE stream): return `405`, as GitHub does and the spec
-   allows; server-initiated messages that arrive outside a request are
-   buffered to the next response or dropped with a log line. Revisit if a
-   server needs sampling or elicitation.
-4. `DELETE`: end the MCP session; the child stays for the next one.
-5. `Mcp-Session-Id`: the broker issues its own random ID on `initialize`; one
-   live session per child. A second `initialize` restarts the child (OpenCode
-   reconnects this way **(unverified)**).
-
-A demultiplexer thread owns stdout and routes by `id`. Child stderr goes to
-the proxy log, bounded and redacted, like curl's (`src/github_mcp.rs:403-411`).
-
-Alternative for Nais: `nais alpha mcp serve --transport http --listen
-127.0.0.1:<port>` (checked with `nais alpha mcp serve --help`, Nais CLI
-7.0.1). The broker would reverse-proxy to it like kind A. It saves the bridge
-but adds an unauthenticated loopback listener that any local process can
-call, and the default `--listen :8080` binds all interfaces. Use stdio.
+Runs launch detection without starting a child. `credential_ok` uses the
+mechanism's status probe; no secret is printed.
 
 ### 5.6 Lifecycle
 
 | Aspect | Proposal |
 |--------|----------|
-| Detection | At launch, as today (`src/main.rs:4749-4761`): scan user config, match table rows, check preconditions (proxy on, binary in trusted dirs, credential present). Missing login: one warning line naming the fix, entry left alone (`src/opencode_v2.rs:323-331`) |
-| Spawn | Lazy, on the first request to that server's path. Keeps launch fast and costs nothing for unused servers |
-| Concurrency | One child per server per session. Requests serialised per JSON-RPC id, not per HTTP connection; several in flight |
-| Timeouts | Per-request deadline (default 120 s, per-row override); idle child killed after 10 min and respawned lazily |
-| Restart | On child exit, the next request respawns; at most 3 restarts per minute, then 503 with a log line |
-| Shutdown | Children are in cplt's process group and are killed on session exit, like the curl children (`src/github_mcp.rs:420-421`) |
-| Kind A | One curl per request, as today. A persistent upstream connection is a later optimisation |
+| Detection | At launch: load specs, check credential presence; on failure one line with the fix, entry left alone |
+| Spawn | Lazy, on the first socket connection for that id |
+| Concurrency | One child per server per session; in-flight requests capped per child (default 8), excess gets a JSON-RPC error (D13) |
+| Timeouts | Per-call deadline (120 s); idle child stopped after 10 min |
+| Restart | On exit, respawn on the next call; at most 3 per minute, then refuse with a log line |
+| Notifications | Server-initiated messages outside a request (including `notifications/tools/list_changed`) are not delivered (D13) |
+| Shutdown | Children in cplt's process group, killed on exit |
+
+### 5.7 The host child (D7)
+
+- **Env:** cleared, then `HOME`, `PATH` (trusted dirs), `LANG`, `TMPDIR`
+  (host), and `HTTPS_PROXY`/`HTTP_PROXY` pointing at cplt's CONNECT proxy.
+- **Egress:** the proxy allows the child only `egressHosts`. Phase 1 uses
+  a separate policy for the child's proxy connections **(open: one proxy
+  with per-client policy, or a second listener)**.
+- **Files:** unrestricted in phase 1. A child profile comes later: read its
+  binary, its config dir and the keychain on macOS; on Linux, the D-Bus
+  session socket for go-keyring (Secret Service). Whether nais runs under
+  such a profile is **(unverified)**.
+- The child is trusted code acting on attacker-chosen arguments; that is
+  the residual the later profile narrows.
 
 ## 6. Policy at the broker
 
-The broker is outside the sandbox, so its policy is the only boundary left
-for the server's actions. Policy in the agent (OpenCode permission rules
-written by nav-pilot) is advisory: the agent controls the client.
+### 6.1 Tools
 
-### 6.1 Tool allow and deny
+- Filter `tools/list` to `tools.allow`.
+- Refuse any other `tools/call` with a JSON-RPC error; log it (D12).
+- A tool the server reports that the spec does not classify is refused
+  until `enable` is re-run (D8).
+- Batches: if any member is refused, refuse the batch.
 
-The registry classes each tool: unlisted is `read`, else `write`,
-`external` or `host-exec` (navikt/copilot
-`cli/nav-pilot/internal/provider/mcp_tools.go:21-28`). `nav-pilot mcp enable`
-turns on read and write and asks for the rest
-(`cli/nav-pilot/internal/cli/mcp_tools.go:17-18`).
+GitHub keeps its upstream `/readonly` endpoint and forced headers, which
+are stronger than a filter.
 
-At the broker:
+### 6.2 GraphQL (`execute_graphql`)
 
-- **`tools/list`**: filter the response to allowed tools, so the agent never
-  sees the rest.
-- **`tools/call`**: refuse a tool not on the list with a JSON-RPC error. Do
-  not rely on the filtered list; the agent can call any name.
-- Default allow set for a brokered server: `read` only. `write` and
-  `external` need a per-server user opt-in in cplt config. `host-exec` is
-  never brokered.
-- Unknown tools (a server update adds one) are denied until the table
-  classifies them. This fails closed and costs a cplt release per new tool;
-  see Q4.
+nais refuses non-query operations, but checks only the first operation
+([graphql.go L499-L506](https://github.com/nais/cli/blob/44c28bca52f3d9e21e1174b1ae0d6727620d2832/internal/mcp/tools/graphql.go#L499-L506)),
+and sends no `operationName` ([L335-L338](https://github.com/nais/cli/blob/44c28bca52f3d9e21e1174b1ae0d6727620d2832/internal/mcp/tools/graphql.go#L335-L338)).
+Whether the Nais API rejects a multi-operation document is **(unverified)**.
 
-GitHub today filters nothing at the broker and relies on upstream
-`/readonly` + `X-MCP-Readonly`, which is stronger than any filter cplt could
-write. Keep that and add the filter only where no upstream mode exists.
-
-### 6.2 Read-only mode and the GraphQL mutation problem
-
-Nais exposes `execute_graphql`. It is the one tool that matters. Options:
-
-| Option | Strength | Cost |
-|--------|----------|------|
-| a. Rely on nais's own check | nais parses the query against the schema and refuses a first operation that is not a query, plus secret-related fields and over-deep queries ([graphql.go](https://github.com/nais/cli/blob/44c28bca52f3d9e21e1174b1ae0d6727620d2832/internal/mcp/tools/graphql.go#L296-L330), [L499-L506](https://github.com/nais/cli/blob/44c28bca52f3d9e21e1174b1ae0d6727620d2832/internal/mcp/tools/graphql.go#L499-L506)). MCP.md says "All operations are read-only" | Only the **first** operation is checked. The request sent has no `operationName` ([L335-L338](https://github.com/nais/cli/blob/44c28bca52f3d9e21e1174b1ae0d6727620d2832/internal/mcp/tools/graphql.go#L335-L338)), so a spec-compliant server should reject a multi-operation document; whether the Nais API does is **(unverified)** |
-| b. Broker parses the operation | Defence in depth: refuse any document that contains `mutation` or `subscription` operations, or more than one operation | Needs a GraphQL lexer in cplt (no crate today); a lexer-level check for operation keywords outside strings and comments is about 100 lines |
-| c. Upstream read-only credential | Strongest: a token or role that cannot mutate | Not offered by Nais today **(unverified)**; would need nais/cli or Nais API work |
-| d. Deny `execute_graphql` | Trivially safe | Removes most of the server's value |
-
-Recommendation: a + b now, ask Nais for c. b closes the multi-operation gap
-regardless of server behaviour. There is no `--read-only` flag in
-`nais alpha mcp serve --help` (7.0.1).
-
-General rule for the table: a row may mark a tool `arg_check = graphql_query`
-(or a future kind). Argument checks are named, reviewed functions, not a
-pattern language.
+The broker's `graphql-read-only` check (D9): strip strings and comments,
+then refuse if the `query` argument contains the keyword `mutation` or
+`subscription` at an operation position, or more than one operation
+definition. False positives (a field literally named `mutation`) are
+acceptable: they fail closed. Upstream fix: file on nais/cli first.
 
 ### 6.3 Limits of argument inspection
 
-Argument inspection only works where the argument has a grammar the broker
-fully understands (GraphQL operation type, a fixed enum). It does not work
-for free text, URLs fetched by the server, file paths on the host, or
-anything the server interprets later. Do not promise more. When a tool's
-safety depends on unparseable input, the answer is deny or an upstream mode.
+Checks work only on arguments with a grammar the broker understands. Free
+text, URLs the server fetches, and host paths cannot be checked; such
+tools are denied or need an upstream mode.
 
-### 6.4 Audit logging
+### 6.4 Audit, size, rate
 
-One line per JSON-RPC call in the proxy log and `--proxy-log`, extending the
-`[github-mcp]` format (`src/github_mcp.rs:148-171`):
-`[mcp:<id>] <time> tools/call <tool> → ALLOWED|DENIED <reason>|FAIL <code>`.
-Log method and tool name, never arguments or results (they can carry data
-and secrets). Escape every agent-supplied string (`escape_debug`, as now).
-Redact the token from child stderr and curl stderr (`src/github_mcp.rs:434-437`).
+- One line per call: `[mcp:<id>] <time> tools/call <tool> → ALLOWED|DENIED <reason>|FAIL <code>`.
+  No arguments or results. Agent strings escaped (`src/github_mcp.rs:148-171`).
+- Child stderr to the proxy log, bounded and redacted.
+- Message cap 4 MiB each way; nais `--rate-limit` passed through.
 
-### 6.5 Rate and size limits
+### 6.5 Prompt injection
 
-- Body cap 4 MiB, chunked requests refused, only GET, POST and DELETE
-  (`src/github_mcp.rs:329-363`); keep for all servers.
-- Response cap per call (default 16 MiB) to protect the agent's context and
-  memory.
-- Calls per minute per server; nais already has `--rate-limit` (default 25),
-  so pass it and add a broker cap for servers without one.
-
-### 6.6 Prompt-injection exposure
-
-The broker does not reduce prompt injection: tool results (issue bodies,
-Nais resource descriptions) reach the model unchanged. It limits the blast
-radius: a hijacked agent gets read-only tools, not the token. Adding a
-brokered server widens what an injected agent can read, and with the user's
-identity. Read-only defaults matter for that reason. No content filtering is
-proposed.
+Not reduced: tool results reach the model unchanged. The broker limits the
+blast radius to read-only tools with the user's identity.
 
 ## 7. Credentials
 
-| Source | Kind | How the broker gets it | Stays on host? |
-|--------|------|------------------------|----------------|
-| `gh auth token` | A | Existing trusted lookup, 5 s timeout, token in `SecretToken` (SECURITY.md:36, `src/discover.rs:155`) | Yes on this channel. But the agent can already get the gh token through the exec token and `OPENCODE_AUTH_CONTENT` (SECURITY.md:32-38); #731 tracks a narrower token |
-| Keychain + file (nais) | C | Ambient: the child runs on the host and reads its own item; cplt never reads it | Yes |
-| Linux Secret Service | C | Same, ambient, via the host's D-Bus session. Where nais stores it on Linux is **(unverified)** | Yes |
-| Env-var API keys | A or C | Read from the host env at launch, passed to the child or header, never to the sandbox | Yes |
-| OAuth tokens (Figma) | B | See below | Yes, if the broker is the client |
+cplt's mechanism table (D3), hand-kept:
 
-Refresh: kind C refreshes itself (the child owns its login). Kind A gets
-the token once per session today; a long session can outlive it. Proposal:
-on an upstream `401`, re-run the lookup once and retry.
+| Mechanism | How cplt resolves it | Status probe | Kind |
+|-----------|----------------------|--------------|------|
+| `gh-token` | Trusted `gh auth token` lookup (`src/discover.rs:155`), held as `SecretToken`; later #820's credential source (section 8) | Lookup succeeds | A |
+| `nais-keychain` | Ambient: cplt spawns the fixed `nais alpha mcp serve`; nais reads its own keychain item (macOS) or Secret Service (Linux, go-keyring) | `nais auth print-access-token` exits 0 | C |
+| `none` | Nothing | n/a | C without secrets |
 
-**OAuth for kind B.** Today OpenCode does Figma's OAuth inside the sandbox
-and stores the tokens where the agent can read them. The broker could be the
-OAuth client instead: discover protected resource metadata, register with
-DCR or present a CIMD client ID, open the browser on the host (cplt is
-outside the sandbox and needs no `--allow-browser`), receive the code on a
-loopback redirect, and keep the tokens in the host keychain. The agent then
-sees only the secret-path endpoint.
+A new mechanism is a cplt change; a new server using an existing one is
+not. GitHub token refresh: read at launch; a login mid-session needs a
+restart, and the error says so (D11).
 
-That is a real OAuth client in cplt: PKCE, state, loopback listener, token
-store, refresh. The confused-deputy MUSTs apply only to proxies that accept
-dynamic registration from many clients; the broker has one client and no
-registration endpoint, so it does not apply. It is worth doing only if
-OAuth tokens in OpenCode's data dir are judged a problem. Defer (Q5).
+Note: the gh token is still reachable in the sandbox through the exec token
+and `OPENCODE_AUTH_CONTENT` (SECURITY.md:32-38). The broker removes one
+channel; #731 and #820 address the rest.
 
-## 8. Threat model
+## 8. Relation to #820 (proxy-side token injection)
 
-Attacker: the sandboxed agent, or content that steers it. Assets: host
-credentials, host code execution, the user's identity at upstream services.
+#820 (spike in session token-flow-spike-820) asks whether the CONNECT
+proxy can terminate TLS for `api.github.com` and `github.com` and inject
+the token there, so the agent gets a placeholder.
 
-| Threat | Today (#807) | With the broker | Mitigation |
-|--------|--------------|-----------------|------------|
-| Agent reads the secret path | It can: the URL is in `OPENCODE_CONFIG_CONTENT`, in its env | Same | Accepted. The secret only stops *other* local processes and non-sandbox users from using the endpoint. The agent is the intended client |
-| Secret leaks out (logs, transcript, a commit) | Valid only for the session and only on loopback | Same | Per-session secret, loopback bind; never logged (logs show the server id, not the path) |
-| Guessing the path | 128 bits, constant-time compare (`src/github_mcp.rs:208-220`) | Same, per server | |
-| SSRF via the broker | Upstream pinned; redirects off; https only (`src/github_mcp.rs:34`, `:377-391`) | Same for kind A. Kind C children make their own requests; the broker cannot see them | No client-controlled URL ever. A child's own egress is bounded only by its sandbox (next row) |
-| Malicious repo config enabling a server | Repo config ignored | Same | Section 5.2: only user config selects, only cplt's table defines |
-| Host-exec through the server process | n/a (curl only) | **New.** The stdio child runs on the host, unsandboxed. A bug in it, or a tool that reads files or runs commands, is a host escape | Spawn the child in its own narrow sandbox profile (below) |
-| Header injection | Control bytes refused, auth and `X-MCP-*` stripped (`src/github_mcp.rs:225-250`) | Same code for kind A; kind C has no upstream headers | Reuse the functions |
-| JSON-RPC smuggling (batch with a denied call, duplicate ids) | n/a | New | Parse every message; deny the whole batch if any member is denied; broker owns id mapping |
-| DoS | 64 connections, head cap, 4 MiB body (`src/proxy.rs:87`) | Plus child restarts and slow calls | Restart budget, per-call deadline, response cap, rate limit. A DoS only hurts the agent's own session |
-| Credential theft by reading the child | n/a | The child runs as the same UID outside the sandbox; the agent cannot reach its memory or files because the sandbox blocks them | Child sandbox must deny the agent's writable roots as *exec* sources: the child never runs a binary the agent could have written |
+Input from the spike: #820 plans a generic injection layer. Each per-host
+rule has a host pattern, a credential source on the host, an auth style
+(Bearer, token, or Basic in base64) and a prefix-preserving placeholder.
+It is not built and touches nothing in `src/` yet; if approved it touches
+`src/proxy.rs` and `src/agent.rs:1124-1177`. #822 (forced-proxy default)
+is on hold.
 
-**A narrower sandbox for the child.** Moving nais out of the agent's sandbox
-trades "keychain readable by the agent" for "nais unsandboxed". The second
-is much better, since the agent controls only tool arguments, not code, but
-still more than needed. The broker should spawn the child under a dedicated
-profile from the existing profile generators (`src/sandbox_profile.rs:55`
-and the Landlock/bwrap backends):
+| Topic | Relation | Status |
+|-------|----------|--------|
+| Credential resolution | The broker consumes #820's credential-source interface instead of owning token plumbing. Section 7's `gh-token` row becomes a reference to #820's credential source once that exists; until then the broker uses today's lookup (`src/discover.rs:155`) behind the same shape. Design against it, do not block on it | Agreed direction |
+| Remote MCP upstreams | With TLS termination, kind A (GitHub) could use injection on the normal CONNECT path, with no secret path. The broker would keep only policy (forced headers, tool filter) | **Open.** TLS termination (rustls/rcgen plus per-runtime CA env) is not owner-approved; #807's secret path stays until it is |
+| Stdio and keychain servers | Injection cannot help: the credential is used by a host process, not sent by the agent. Nais needs the broker either way | Settled |
+| Host list | Copilot sends its long-lived token straight to `*.githubcopilot.com`, so any injection host list must include it (and it is also the GitHub MCP upstream) | Input for #820 |
+| Policy | Injection alone does not filter tools or force read-only; the broker owns that | Settled |
+| Order | Phase 1 (Nais) does not depend on #820 | Settled |
 
-- read: its binary, its config dir (`~/Library/Application Support/nais`),
-  system libraries; on macOS the keychain file rules and securityd lookup
-  (needed for the credential), which is acceptable because the child is
-  trusted code, not the agent;
-- write: its own log or cache dir only; no project, no home;
-- network: through cplt's CONNECT proxy, allowlisted to the row's hosts;
-- no exec of anything outside trusted dirs.
+## 9. Threat model
 
-Whether `nais` runs under such a profile (Go binary, keychain via
-Security.framework) is **(unverified)**; phase 2 must measure it. If it does
-not, ship unsandboxed with the residual documented in SECURITY.md, as the
-status of every other host-side helper.
+Attacker: the sandboxed agent or content steering it.
 
-## 9. Migration of `github_mcp.rs`
+| Threat | Mitigation |
+|--------|------------|
+| Agent writes or changes a spec | Specs live in the user's cplt config, outside every grant; repo config never read |
+| Spec asks for something dangerous (arbitrary command, secret in a header, host-exec tool) | Invariants at load (5.3); command must match the credential mechanism |
+| Agent connects to the socket | Intended; it can only pick a declared id |
+| Secret path leaks (remote kind) | Per-session, loopback, never logged; 128-bit, constant-time compare (`src/github_mcp.rs:208-220`) |
+| SSRF | Remote: pinned upstream, no redirects, https only (`src/github_mcp.rs:34`, `:377-391`). Child: egress pinned to `egressHosts` via the proxy |
+| Host-exec through the child | Phase 1 residual: unsandboxed child. Env cleared, egress pinned, read-only tools; file profile later |
+| Header injection | Control bytes refused, auth and `X-MCP-*` stripped (`src/github_mcp.rs:225-250`) |
+| JSON-RPC smuggling | Every message parsed; batch refused if any member is |
+| DoS | In-flight cap per child, restart budget, deadlines, message cap. Hurts only the agent's own session |
 
-`github_mcp.rs` becomes the first kind-A row. Nothing user-visible changes.
+## 10. Migration of `github_mcp.rs`
 
-1. Move the static single endpoint (`src/github_mcp.rs:182-206`) to a
-   registry of endpoints keyed by secret; `endpoint_for` looks up all.
-2. Split the module: transport pieces (head parsing, header rules, curl
-   config, relay, log) into `mcp_broker/http.rs`; GitHub-specific constants
-   (`UPSTREAM`, URL match, forced headers) into the row.
-3. Generalise `opencode_v2::github_mcp` (`src/opencode_v2.rs:297-350`) to
-   loop over rows. It already merges one `OPENCODE_CONFIG_CONTENT` overlay;
-   rows share it.
-4. Config: keep `sandbox.github_mcp_proxy` and `--[no-]github-mcp-proxy`
-   (`src/config/registry.rs:242-246`, `:978-982`) as the GitHub row's toggle,
-   forever. New rows use `sandbox.mcp_broker.<id>` and
-   `--no-mcp-broker <id>`. A global `sandbox.mcp_broker = false` turns all
-   off. Explicit `sandbox.github_mcp_proxy` wins over the global key for
-   GitHub, so nobody's setting changes meaning.
-5. Log prefix stays `[github-mcp]` for GitHub; new rows use `[mcp:<id>]`.
-6. The existing seam test (`src/proxy.rs:4193`) and off-path test
-   (`src/opencode_v2.rs:1068`) must pass unchanged; that is the refactor's
-   acceptance test.
+Not in phase 1 (D15). When a third server arrives:
 
-## 10. Recommendation
+1. GitHub gets a spec (`credential: gh-token`, `remotes[]` with the
+   read-only URL and forced headers) written by nav-pilot.
+2. `sandbox.github_mcp_proxy` and `--no-github-mcp-proxy` stay, as aliases
+   for the GitHub id's toggle. Without a spec file cplt keeps today's
+   built-in detection, so users without a newer nav-pilot see no change.
+3. Shared pieces move out of `github_mcp.rs` (head parsing, header rules,
+   log). The seam test (`src/proxy.rs:4193`) and off-path test
+   (`src/opencode_v2.rs:1068`) must pass unchanged.
 
-Build O2: a declarative broker inside cplt, servers defined by a compiled-in
-table, enabled by the user's own client config, served on the proxy port
-behind a secret path per server.
+## 11. Phases
 
 | Phase | Scope | Exit |
 |-------|-------|------|
-| 1 | Refactor `github_mcp.rs` into the broker with one kind-A row; multi-endpoint lookup; no behaviour change | #807's tests pass unchanged; e2e on macOS |
-| 2 | Kind C stdio bridge; Nais row (#821) with read-only tool allow list, GraphQL operation check, lazy spawn, restart budget; measure the child sandbox | Nais works under cplt with no keychain grant, mutation and multi-op documents refused at the broker, macOS and Linux e2e |
-| 2b (navikt/copilot, alongside 2) | Registry `auth` fields; `nav-pilot mcp enable` supports Nais, runs login preflight; `mcp list` LOGIN and PATH columns via `cplt mcp status --json` | Section 2.2 journey works end to end for Nais in OpenCode |
-| 3 | Tool filtering for all rows from registry classes; audit lines; response cap and rate limit | |
-| 4 | Child sandbox profile on by default, if phase 2's measurement allows | |
-| 5 (optional) | Broker as OAuth client for kind B (Figma); user-declared rows | Owner decision |
+| 1 | Nais (#821) in OpenCode, Copilot CLI and pi where possible: spec schema v1 and loader, `nais-keychain` mechanism, `cplt mcp-stdio` over a Unix socket (macOS), host child with cleared env and egress pin, read allowlist, GraphQL check, `cplt mcp status --json`, mirrored errors. nav-pilot: `_meta` fields in the registry, spec writing, login after a yes, `mcp list` LOGIN and PATH | Nais works under cplt on macOS in both clients with no keychain grant; mutations and multi-op documents refused |
+| 1b | Linux: bwrap bind for the socket; Secret Service | Linux e2e |
+| 2 | GitHub on the shared model, when a third server arrives | #807 tests unchanged |
+| 3 | Child file profile | nais measured under it |
+| 4 | Figma OAuth in the broker | — |
 
-Copilot CLI and other agents: same broker, new overlay writers. Not in
-scope until an agent needs it (Q2).
+## 12. Still open
 
-### Open questions for the owner
+- How the child's proxy egress is told apart from the agent's (one proxy
+  with per-client policy, or a second listener).
+- Nais egress hosts (measure in phase 1).
+- pi: whether it can host MCP at all, and how cplt overlays it.
+- Exact extension key name (`io.github.navikt/broker`), and whether the
+  registry should serve it directly in `server.json` `_meta` or nav-pilot
+  should build it from the response `_meta`.
+- How kind A relates to #820 once the spike reports (section 8).
 
-- **Q1.** Is unsandboxed `nais` on the host acceptable for phase 2, with the
-  child sandbox in phase 4? Or must the child sandbox ship with Nais?
-- **Q2.** Should Copilot CLI and other agents use the broker too (for
-  example, the read-only GitHub guarantee for Copilot, #797's third
-  question), or stay OpenCode-only for now?
-- **Q3.** Should users be able to declare their own brokered servers in cplt
-  config, or only cplt's reviewed table?
-- **Q4.** Unknown tools after a server update: deny until cplt is released
-  (safe, slower), or allow `read` by default (convenient)?
-- **Q5.** Is Figma's OAuth token sitting in OpenCode's data dir a problem
-  worth a broker OAuth client?
-- **Q6.** IDE localhost servers (IntelliJ, Aksel Arcade): out of scope for
-  the broker, agreed?
-- **Q7.** May `write`-class tools be opted in per server in cplt config, or
-  is the broker read-only by policy?
-- **Q8.** Should the table be generated from the registry in CI, or kept by
-  hand with a registry consistency check?
-- **Q9.** May `nav-pilot mcp enable` run the login command (`nais login -n`,
-  `gh auth login`) itself after a yes, or only print it?
-- **Q10.** Should brokered servers turn `write` tools off by default, even
-  though `nav-pilot mcp enable` turns them on for other servers?
+## 13. Issues to file
 
-### Issues to file
-
-- navikt/cplt: phase 1 refactor (github_mcp into broker, no behaviour change).
-- navikt/cplt: phase 2 stdio bridge and Nais row, superseding the plan in #821.
-- navikt/cplt: child sandbox profile for brokered servers (measure nais first).
-- navikt/cplt: re-fetch the gh token on upstream 401.
-- nais/cli: check every operation, not only the first, in `execute_graphql`; ask for a read-only credential or `--read-only` mode.
-- navikt/copilot: `nav-pilot mcp list` LOGIN and PATH columns, login preflight at enable, `cplt mcp status --json` consumer.
-- navikt/cplt: `cplt mcp status --json` for nav-pilot and doctor.
-- navikt/copilot: registry metadata (`auth.kind`, `auth.loginCommand`, `auth.statusCommand`, `minCplt`) for broker kinds (credential source) and a CI check against cplt's table; update the nais `setupInstructions` once phase 2 ships.
+- nais/cli: check every operation in `execute_graphql`, not only `Operations[0]` (file first, D9).
+- navikt/cplt: phase 1 broker for Nais (spec loader v1, `nais-keychain`, `cplt mcp-stdio`, child env and egress pin, tool allowlist, GraphQL check, mirrored errors), superseding the plan in #821.
+- navikt/cplt: `cplt mcp status --json`.
+- navikt/cplt: Copilot CLI overlay with `--disable-mcp-server` and `--additional-mcp-config`.
+- navikt/cplt: Linux socket bind and Secret Service for the broker.
+- navikt/cplt: child file profile (later).
+- navikt/copilot: broker `_meta` extension in the registry (`credential`, `command`, `egressHosts`, `login`), Nais `packages`/`command` entry, docs for the extension.
+- navikt/copilot: nav-pilot writes broker specs, `enable --tools` write consent, login after a yes, `mcp list` LOGIN and PATH, warn or refuse `execute_graphql` without cplt.
