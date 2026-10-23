@@ -995,7 +995,7 @@ pub(crate) fn create_secure_dir(path: &Path, label: &str) -> Result<(), String> 
         .map_err(|e| format!("Cannot create {label} {}: {e}", path.display()))
 }
 
-fn secure_dir_identity(path: &Path, label: &str) -> Result<(u64, u64), String> {
+pub(crate) fn secure_dir_identity(path: &Path, label: &str) -> Result<(u64, u64), String> {
     use std::os::unix::fs::MetadataExt;
 
     validate_dir_safety(path, label)?;
@@ -1005,7 +1005,12 @@ fn secure_dir_identity(path: &Path, label: &str) -> Result<(u64, u64), String> {
     Ok((metadata.dev(), metadata.ino()))
 }
 
-fn remove_owned_dir(path: &Path, expected_device: u64, expected_inode: u64, label: &str) {
+pub(crate) fn remove_owned_dir(
+    path: &Path,
+    expected_device: u64,
+    expected_inode: u64,
+    label: &str,
+) {
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::io::AsRawFd;
 

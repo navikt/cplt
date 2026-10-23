@@ -1666,6 +1666,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_broker_makes_bubblewrap_strict_or_refuses() {
+        use super::super::{BusEndpoints, mcp_backstop};
+        let socket = Path::new("/tmp/cplt-mcp-x/m");
+        let none = BusEndpoints::default();
+        let mut w = wrapper_for(vec![]);
+        assert!(!w.strict, "premise: auto-detect");
+        mcp_backstop(socket, Some(&mut w), &DenyMasks::default(), &[], &none).unwrap();
+        assert!(w.strict, "no Landlock-only fallback while the broker runs");
+        let err = mcp_backstop(socket, None, &DenyMasks::default(), &[], &none).unwrap_err();
+        assert!(err.contains("Bubblewrap"), "{err}");
+    }
+
     fn wrapper_for(fs_rules: Vec<FsRule>) -> BubblewrapWrapper {
         BubblewrapWrapper {
             bwrap_path: PathBuf::from("/usr/bin/bwrap"),

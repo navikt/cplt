@@ -211,29 +211,48 @@ impl Broker {
 /// (the bus lives there), and a user `--deny-path` cannot mask `/tmp`.
 /// Removed on drop.
 #[cfg(not(target_os = "macos"))]
-struct SocketDir(PathBuf);
+struct SocketDir {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
 
 #[cfg(not(target_os = "macos"))]
 impl SocketDir {
     fn create() -> Result<Self, String> {
+        const LABEL: &str = "MCP broker socket dir";
         let path = Path::new("/tmp").join(format!(
             "cplt-mcp-{}",
             crate::scratch::generate_session_id()?
         ));
-        crate::scratch::create_secure_dir(&path, "MCP broker socket dir")?;
-        Ok(Self(path))
+        crate::scratch::create_secure_dir(&path, LABEL)?;
+        let (device, inode) =
+            crate::scratch::secure_dir_identity(&path, LABEL).inspect_err(|_| {
+                let _ = std::fs::remove_dir(&path);
+            })?;
+        Ok(Self {
+            path,
+            device,
+            inode,
+        })
     }
 
     fn path(&self) -> &Path {
-        &self.0
+        &self.path
     }
 }
 
+/// Removed only if it is still the directory `create` made (device and
+/// inode, no symlink), as for the Playwright socket dir.
 #[cfg(not(target_os = "macos"))]
 impl Drop for SocketDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(self.0.join("m"));
-        let _ = std::fs::remove_dir(&self.0);
+        crate::scratch::remove_owned_dir(
+            &self.path,
+            self.device,
+            self.inode,
+            "MCP broker socket dir",
+        );
     }
 }
 
@@ -303,12 +322,9 @@ pub(crate) fn spawn_child(shared: &Shared, server: &Server) -> std::io::Result<C
     let proxy = format!("http://127.0.0.1:{}", server.egress_port.unwrap_or(0));
     #[allow(clippy::disallowed_methods)] // resolved in the trusted dirs at load
     let mut cmd = Command::new(&spec.program);
-    cmd.args(&spec.command[1..])
-        .env_clear()
-        .env("HOME", &shared.home)
-        .env("PATH", crate::git::TRUSTED_BIN_DIRS.join(":"))
-        .env("TMPDIR", std::env::temp_dir())
-        .env("HTTPS_PROXY", &proxy)
+    cmd.args(&spec.command[1..]);
+    host_env(&mut cmd, &shared.home);
+    cmd.env("HTTPS_PROXY", &proxy)
         .env("HTTP_PROXY", &proxy)
         .env("https_proxy", &proxy)
         .env("http_proxy", &proxy)
@@ -321,10 +337,36 @@ pub(crate) fn spawn_child(shared: &Shared, server: &Server) -> std::io::Result<C
         // ponytail: stderr dropped; route it to the proxy log, bounded and
         // redacted, when a server's own diagnostics are needed.
         .stderr(Stdio::null());
-    if let Some(lang) = std::env::var_os("LANG") {
-        cmd.env("LANG", lang);
-    }
     cmd.spawn()
+}
+
+/// The host child's environment, also the credential probe's on Linux, so
+/// the two never disagree. Cleared, then: HOME, the trusted PATH, TMPDIR,
+/// LANG, and on Linux the session bus (`DBUS_SESSION_BUS_ADDRESS`,
+/// `XDG_RUNTIME_DIR`), which go-keyring needs to reach the Secret Service
+/// on the host. The child runs on the host, not in the sandbox.
+pub(crate) fn host_env(cmd: &mut Command, home: &Path) {
+    cmd.env_clear();
+    for (k, v) in host_env_pairs(home, &|k| std::env::var_os(k)) {
+        cmd.env(k, v);
+    }
+}
+
+fn host_env_pairs(
+    home: &Path,
+    get: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<(&'static str, std::ffi::OsString)> {
+    let mut env = vec![
+        ("HOME", home.as_os_str().to_owned()),
+        ("PATH", crate::git::TRUSTED_BIN_DIRS.join(":").into()),
+        ("TMPDIR", std::env::temp_dir().into_os_string()),
+    ];
+    let mut keep = vec!["LANG"];
+    if cfg!(target_os = "linux") {
+        keep.extend(["DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR"]);
+    }
+    env.extend(keep.into_iter().filter_map(|k| get(k).map(|v| (k, v))));
+    env
 }
 
 /// One client connection: the id line, then JSON-RPC lines both ways until
@@ -506,6 +548,29 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use serde_json::Value;
+
+    #[test]
+    fn the_host_child_keeps_the_session_bus_on_linux_only() {
+        let get = |k: &str| {
+            matches!(
+                k,
+                "DBUS_SESSION_BUS_ADDRESS" | "XDG_RUNTIME_DIR" | "LANG" | "SECRET"
+            )
+            .then(|| std::ffi::OsString::from(format!("v-{k}")))
+        };
+        let env = host_env_pairs(Path::new("/home/u"), &get);
+        let names: Vec<&str> = env.iter().map(|(k, _)| *k).collect();
+        assert!(
+            names.contains(&"HOME") && names.contains(&"LANG"),
+            "{names:?}"
+        );
+        assert!(
+            !names.contains(&"SECRET"),
+            "nothing else from cplt's env: {names:?}"
+        );
+        let bus = names.contains(&"DBUS_SESSION_BUS_ADDRESS") && names.contains(&"XDG_RUNTIME_DIR");
+        assert_eq!(bus, cfg!(target_os = "linux"), "{names:?}");
+    }
 
     #[test]
     fn kill_terminates_and_never_signals_a_reaped_child() {

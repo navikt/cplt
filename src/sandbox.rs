@@ -2589,7 +2589,12 @@ pub fn mcp_broker_refusal(config: &SandboxConfig) -> Option<String> {
         )
         .map(|_| ())
     };
-    mcp_refusal_text(wrapper, &plan.deny_masks, &plan.policy.fs_rules)
+    mcp_refusal_text(
+        wrapper,
+        &plan.deny_masks,
+        &plan.policy.fs_rules,
+        &mcp_bus_endpoints(),
+    )
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -2604,6 +2609,7 @@ fn mcp_refusal_text(
     wrapper: Result<(), String>,
     masks: &bubblewrap::DenyMasks,
     rules: &[landlock_mod::FsRule],
+    bus: &BusEndpoints,
 ) -> Option<String> {
     const FIX: &str = "Run `cplt doctor`, or set sandbox.mcp_broker = false";
     if let Err(e) = wrapper {
@@ -2621,7 +2627,6 @@ fn mcp_refusal_text(
             strip_control(&e)
         ));
     }
-    let bus = mcp_bus_endpoints();
     if bus.other {
         return Some(format!(
             "DBUS_SESSION_BUS_ADDRESS names a transport other than a unix socket, which \
@@ -2652,6 +2657,39 @@ fn mcp_refusal_text(
             open.join(", ")
         )
     })
+}
+
+/// `prepare`'s half of the broker's fail-closed rule: refuse unless
+/// bubblewrap wraps the run with every bus endpoint hidden and the socket
+/// itself unmasked, then make that bubblewrap strict, so a spawn-time
+/// failure stops the run instead of falling back to Landlock alone.
+#[cfg(target_os = "linux")]
+fn mcp_backstop(
+    socket: &Path,
+    wrapper: Option<&mut bubblewrap::BubblewrapWrapper>,
+    masks: &bubblewrap::DenyMasks,
+    rules: &[landlock_mod::FsRule],
+    bus: &BusEndpoints,
+) -> Result<(), String> {
+    let resolved = wrapper
+        .as_ref()
+        .map(|_| ())
+        .ok_or_else(|| "it did not resolve".to_string());
+    if let Some(e) = mcp_refusal_text(resolved, masks, rules, bus) {
+        return Err(e);
+    }
+    // A user deny path over the socket would leave the shim nothing to
+    // reach, silently.
+    if masks.covers(socket) {
+        return Err(format!(
+            "a deny path masks the MCP broker socket {}; set sandbox.mcp_broker = false",
+            socket.display()
+        ));
+    }
+    if let Some(w) = wrapper {
+        w.strict = true;
+    }
+    Ok(())
 }
 
 /// bwrap's own `--tmpfs /tmp`, `--dev` and `--proc` hide the host's copy of
@@ -3463,27 +3501,14 @@ fn prepare_impl(
     // (`mcp_broker_refusal`); this is the backstop. Strict, so a spawn-time
     // bwrap failure stops the run instead of falling back to plain Landlock
     // with the bus reachable.
-    if config.mcp_socket.is_some() {
-        let wrapper = bwrap_wrapper
-            .as_ref()
-            .map(|_| ())
-            .ok_or_else(|| "it did not resolve".to_string());
-        if let Some(e) = mcp_refusal_text(wrapper, &deny_masks, &policy.fs_rules) {
-            return Err(e);
-        }
-        // A user deny path over the socket would leave the shim nothing to
-        // reach, silently.
-        if let Some(socket) = config.mcp_socket
-            && deny_masks.covers(socket)
-        {
-            return Err(format!(
-                "a deny path masks the MCP broker socket {}; set sandbox.mcp_broker = false",
-                socket.display()
-            ));
-        }
-        if let Some(w) = bwrap_wrapper.as_mut() {
-            w.strict = true;
-        }
+    if let Some(socket) = config.mcp_socket {
+        mcp_backstop(
+            socket,
+            bwrap_wrapper.as_mut(),
+            &deny_masks,
+            &policy.fs_rules,
+            &mcp_bus_endpoints(),
+        )?;
     }
 
     // #553: a home Git config file a link points at inside a writable tree,
@@ -3943,6 +3968,47 @@ fn validate_created_playwright_socket_dir(path: &Path) -> Result<(), String> {
 #[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unmasked_bus_refuses_the_broker() {
+        // Outside /tmp, so bwrap's private /tmp does not hide it.
+        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let bus_path = dir.path().join("session-bus");
+        std::fs::write(&bus_path, "").unwrap();
+        let bus = BusEndpoints {
+            paths: vec![bus_path.clone()],
+            ..Default::default()
+        };
+        let masks = bubblewrap::DenyMasks::default();
+        let why = mcp_refusal_text(Ok(()), &masks, &[], &bus).expect("refused");
+        assert!(why.contains("session-bus"), "{why}");
+        assert!(
+            mcp_refusal_text(Err("no".into()), &masks, &[], &BusEndpoints::default()).is_some()
+        );
+        assert_eq!(
+            mcp_refusal_text(Ok(()), &masks, &[], &BusEndpoints::default()),
+            None
+        );
+        // Masked: accepted.
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let canon = bus_path.canonicalize().unwrap();
+        let masks =
+            bubblewrap::build_deny_masks(&[], std::slice::from_ref(&canon), &[], Some(&scratch));
+        assert_eq!(mcp_refusal_text(Ok(()), &masks, &[], &bus), None);
+        // A session bus named only by DBUS_SESSION_BUS_ADDRESS is one of the
+        // endpoints checked.
+        assert_eq!(
+            parse_dbus_address("unix:path=/var/tmp/session-bus").paths,
+            [PathBuf::from("/var/tmp/session-bus")]
+        );
+        assert!(hidden_by_private_mount(Path::new("/tmp/x"), &[]));
+        assert!(!hidden_by_private_mount(
+            Path::new("/var/tmp/session-bus"),
+            &[]
+        ));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
