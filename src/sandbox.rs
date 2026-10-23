@@ -2589,7 +2589,7 @@ pub fn mcp_broker_refusal(config: &SandboxConfig) -> Option<String> {
         )
         .map(|_| ())
     };
-    mcp_refusal_text(wrapper, &plan.deny_masks)
+    mcp_refusal_text(wrapper, &plan.deny_masks, &plan.policy.fs_rules)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -2600,7 +2600,11 @@ pub fn mcp_broker_refusal(_: &SandboxConfig) -> Option<String> {
 /// The refusal line for [`mcp_broker_refusal`] and the backstop in
 /// `prepare`: `wrapper` is whether bubblewrap wraps the run.
 #[cfg(target_os = "linux")]
-fn mcp_refusal_text(wrapper: Result<(), String>, masks: &bubblewrap::DenyMasks) -> Option<String> {
+fn mcp_refusal_text(
+    wrapper: Result<(), String>,
+    masks: &bubblewrap::DenyMasks,
+    rules: &[landlock_mod::FsRule],
+) -> Option<String> {
     const FIX: &str = "Run `cplt doctor`, or set sandbox.mcp_broker = false";
     if let Err(e) = wrapper {
         let fix = if bubblewrap::check_availability().is_none() {
@@ -2611,9 +2615,10 @@ fn mcp_refusal_text(wrapper: Result<(), String>, masks: &bubblewrap::DenyMasks) 
             "Run `cplt doctor` to see what blocks it.".to_string()
         };
         return Some(format!(
-            "the MCP broker needs Bubblewrap on Linux, and Bubblewrap is not usable ({e}): \
+            "the MCP broker needs Bubblewrap on Linux, and Bubblewrap is not usable ({}): \
              without its bus masks the agent could read the server's credential over D-Bus. \
-             {fix}\nOr set sandbox.mcp_broker = false"
+             {fix}\nOr set sandbox.mcp_broker = false",
+            strip_control(&e)
         ));
     }
     let bus = mcp_bus_endpoints();
@@ -2634,8 +2639,11 @@ fn mcp_refusal_text(wrapper: Result<(), String>, masks: &bubblewrap::DenyMasks) 
     let open: Vec<String> = bus
         .paths
         .iter()
-        .filter(|p| p.canonicalize().is_ok_and(|c| !masks.covers(&c)))
-        .map(|p| p.display().to_string())
+        .filter(|p| {
+            p.canonicalize()
+                .is_ok_and(|c| !masks.covers(&c) && !hidden_by_private_mount(&c, rules))
+        })
+        .map(|p| strip_control(&p.display().to_string()))
         .collect();
     (!open.is_empty()).then(|| {
         format!(
@@ -2644,6 +2652,30 @@ fn mcp_refusal_text(wrapper: Result<(), String>, masks: &bubblewrap::DenyMasks) 
             open.join(", ")
         )
     })
+}
+
+/// bwrap's own `--tmpfs /tmp`, `--dev` and `--proc` hide the host's copy of
+/// a path under them, unless a grant there binds it back in (#838). Read-only
+/// grants count: bwrap binds those under /tmp too (#299), and a read-only
+/// bind does not stop `connect(2)`.
+#[cfg(target_os = "linux")]
+fn hidden_by_private_mount(path: &Path, rules: &[landlock_mod::FsRule]) -> bool {
+    ["/tmp", "/dev", "/proc", "/sys"]
+        .iter()
+        .any(|m| path.starts_with(m))
+        && !rules
+            .iter()
+            .filter(|r| r.path != Path::new("/tmp"))
+            .any(|r| path.starts_with(&r.path))
+}
+
+/// Env-derived text (paths, bwrap's error) without control characters, for
+/// a line printed to the terminal.
+#[cfg(target_os = "linux")]
+fn strip_control(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
 }
 
 /// The broker hides the runtime dirs, where the gpg-agent and rootless
@@ -3436,7 +3468,7 @@ fn prepare_impl(
             .as_ref()
             .map(|_| ())
             .ok_or_else(|| "it did not resolve".to_string());
-        if let Some(e) = mcp_refusal_text(wrapper, &deny_masks) {
+        if let Some(e) = mcp_refusal_text(wrapper, &deny_masks, &policy.fs_rules) {
             return Err(e);
         }
         // A user deny path over the socket would leave the shim nothing to
@@ -3911,6 +3943,39 @@ fn validate_created_playwright_socket_dir(path: &Path) -> Result<(), String> {
 #[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_bus_under_the_private_tmp_counts_as_hidden() {
+        use landlock_mod::{FsAccess, FsRule};
+        let rule = |p: &str, write: bool| FsRule {
+            nofollow: false,
+            path: PathBuf::from(p),
+            access: FsAccess {
+                read: true,
+                write,
+                execute: false,
+                ioctl: false,
+                create_dirs: false,
+            },
+        };
+        let tmp_rule = [rule("/tmp", true)];
+        assert!(hidden_by_private_mount(
+            Path::new("/tmp/dbus-x/bus"),
+            &tmp_rule
+        ));
+        assert!(hidden_by_private_mount(Path::new("/dev/shm/bus"), &[]));
+        assert!(!hidden_by_private_mount(Path::new("/run/user/1/bus"), &[]));
+        // Bound back in by a writable grant: reachable again.
+        let back = [rule("/tmp", true), rule("/tmp/proj", true)];
+        assert!(!hidden_by_private_mount(Path::new("/tmp/proj/bus"), &back));
+        // So does a read-only one: bwrap binds it, and connect ignores ro.
+        assert!(!hidden_by_private_mount(
+            Path::new("/tmp/ro/bus"),
+            &[rule("/tmp/ro", false)]
+        ));
+        assert_eq!(strip_control("a\x1b[31mb\nc"), "a?[31mb?c");
+    }
 
     #[test]
     fn gpg_and_rootless_docker_turn_the_broker_off() {
