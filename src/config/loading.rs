@@ -1123,7 +1123,8 @@ impl Resolved {
         repos: &[super::types::RepoSummaryRow],
         worktree_root: Option<&std::path::Path>,
         full: bool,
-    ) {
+        tty: bool,
+    ) -> crate::launch_state::Confirmation {
         let blue = ui::color(ui::BLUE);
         let dim = ui::color(ui::DIM);
         let green = ui::color(ui::GREEN);
@@ -1580,10 +1581,19 @@ impl Resolved {
             let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
             stable.push(format!("{} {mtime:?}", path.display()));
         }
+        let stable = stable.join("\n");
         let topic = format!("summary-{}", agent.display_name());
-        let changed =
-            crate::launch_state::changed(home_dir, project_dir, &topic, &stable.join("\n"));
-        if full || changed {
+        let changed = crate::launch_state::changed(home_dir, project_dir, &topic, &stable);
+        let confirm = crate::launch_state::Confirmation::new(
+            home_dir,
+            project_dir,
+            agent.display_name(),
+            stable,
+            tty,
+        );
+        // The prompt shows what it asks about: the full table, unless this
+        // exact profile was confirmed before (then there is no prompt).
+        if full || changed || (!self.yes && !confirm.confirmed) {
             for line in &lines {
                 eprintln!("{line}");
             }
@@ -1592,7 +1602,7 @@ impl Resolved {
                     "{blue}[cplt]{nc}  {yellow}Tip:{nc}            {dim}use --quiet, or cplt config set sandbox.quiet true{nc}"
                 );
             }
-            return;
+            return confirm;
         }
         eprintln!(
             "{blue}[cplt]{nc} {}",
@@ -1601,6 +1611,7 @@ impl Resolved {
         for line in lines.iter().filter(|l| l.contains('\u{26a0}')) {
             eprintln!("{line}");
         }
+        confirm
     }
 
     /// The one-line steady-state summary: repositories, writable paths,
