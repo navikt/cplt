@@ -943,7 +943,13 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let not_pem = dir.path().join("corp.pem");
         std::fs::write(&not_pem, "not a certificate").unwrap();
-        temp_env::with_var("NODE_EXTRA_CA_CERTS", Some(&not_pem), || {
+        // Other CA vars may be set by CI or a parallel test; pin them unset.
+        let vars = [
+            ("SSL_CERT_FILE", None),
+            ("GIT_SSL_CAINFO", None),
+            ("NODE_EXTRA_CA_CERTS", Some(not_pem.as_os_str())),
+        ];
+        temp_env::with_vars(vars, || {
             let err = setup(dir.path()).unwrap_err();
             assert!(err.contains("NODE_EXTRA_CA_CERTS"), "{err}");
         });
