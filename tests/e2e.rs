@@ -2467,6 +2467,41 @@ mod e2e_tests {
         assert!(reason.contains("writable in the sandbox"), "{bad}");
     }
 
+    /// `cplt mcp status` from the home dir, where a launch refuses to run:
+    /// the specs live in the user config dir, so it reads them, with no
+    /// project.
+    #[test]
+    fn e2e_mcp_status_works_from_home() {
+        // Outside every git repo, so the home dir itself is the root.
+        let home = tempfile::tempdir().unwrap();
+        let home_path = std::fs::canonicalize(home.path()).unwrap();
+        let dir = home_path.join(".config/cplt/mcp");
+        std::fs::create_dir_all(&dir).unwrap();
+        let spec = serde_json::json!({
+            "name": "io.example/fake-mcp",
+            "_meta": {"io.github.navikt/broker": {
+                "v": 1, "credential": "none", "command": ["python3", "x.py"],
+                "tools": {"allow": ["echo"]}
+            }}
+        });
+        std::fs::write(dir.join("io.example__fake-mcp.json"), spec.to_string()).unwrap();
+        let out = cplt_cmd()
+            .args(["--agent", "copilot", "mcp", "status", "--json"])
+            .env("HOME", &home_path)
+            .env_remove("XDG_CONFIG_HOME")
+            .current_dir(&home_path)
+            .output()
+            .expect("binary should run");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stdout}\n{stderr}");
+        let v: serde_json::Value = serde_json::from_str(stdout.lines().last().unwrap_or(""))
+            .unwrap_or_else(|_| panic!("{stdout}\n{stderr}"));
+        assert!(v["project"].is_null(), "{v}");
+        // Listed, or rejected because the temp dir is writable: either way read.
+        assert!(v.to_string().contains("fake-mcp"), "{v}");
+    }
+
     /// The whole chain: shim → cplt → sandbox → the real agent, with the shim
     /// directory first on PATH. cplt must skip its own shim when it resolves
     /// the agent (without the skip it launches the shim inside the sandbox,

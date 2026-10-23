@@ -33,6 +33,8 @@ pub const MECHANISMS: &[Credential] = &[
         command: Some(&["nais", "alpha", "mcp", "serve"]),
         probe: Some(&["auth", "print-access-token", "-n"]),
     },
+    // A server with no host login: nothing to probe, any trusted command.
+    // Not emitted by nav-pilot today; the broker e2e tests run on it.
     Credential {
         name: "none",
         command: None,
@@ -65,35 +67,48 @@ impl Serialize for Credential {
     }
 }
 
-/// The mechanism's status probe, without printing anything it outputs.
-/// `None` when the mechanism has none.
-pub fn credential_ok(spec: &Spec) -> Option<bool> {
-    let args = spec.credential.probe?;
+/// The mechanism's status probe, without printing anything it outputs:
+/// whether the login is usable, `None` when unknown, with a note saying why
+/// it is unknown. `(None, None)` when the mechanism has no probe.
+pub fn credential_ok(spec: &Spec) -> (Option<bool>, Option<&'static str>) {
+    let Some(args) = spec.credential.probe else {
+        return (None, None);
+    };
+    probe(&spec.program, args, PROBE_TIMEOUT)
+}
+
+fn probe(
+    program: &std::path::Path,
+    args: &[&str],
+    timeout: Duration,
+) -> (Option<bool>, Option<&'static str>) {
     #[allow(clippy::disallowed_methods)] // resolved in the trusted dirs at load
-    let mut cmd = Command::new(&spec.program);
-    // Linux: the child's own environment (#838), so the probe finds the
-    // Secret Service exactly when the server would. macOS keeps cplt's.
-    #[cfg(target_os = "linux")]
+    let mut cmd = Command::new(program);
+    // The child's own environment (#838), so the probe finds the login
+    // exactly when the server would.
     if let Some(home) = std::env::var_os("HOME") {
         super::runtime::host_env(&mut cmd, std::path::Path::new(&home));
         cmd.current_dir("/");
     }
-    let mut child = cmd
+    let Ok(mut child) = cmd
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .ok()?;
+    else {
+        return (None, Some("cannot run the probe"));
+    };
     let start = Instant::now();
     loop {
         if let Ok(Some(status)) = child.try_wait() {
-            return Some(status.success());
+            return (Some(status.success()), None);
         }
-        if start.elapsed() > PROBE_TIMEOUT {
+        // A slow keychain or network is not a logged-out user.
+        if start.elapsed() > timeout {
             let _ = child.kill();
             let _ = child.wait();
-            return Some(false);
+            return (None, Some("timed out"));
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -107,5 +122,19 @@ mod tests {
     fn nais_probe_checks_the_nais_login_not_gcloud() {
         let m = Credential::parse("nais-keychain").unwrap();
         assert_eq!(m.probe, Some(&["auth", "print-access-token", "-n"][..]));
+    }
+
+    #[test]
+    fn a_probe_timeout_is_unknown_not_logged_out() {
+        let sh = std::path::Path::new("/bin/sh");
+        let short = Duration::from_millis(200);
+        assert_eq!(
+            probe(sh, &["-c", "sleep 5"], short),
+            (None, Some("timed out"))
+        );
+        // Generous: a spawn can stall for seconds under load.
+        let long = Duration::from_secs(30);
+        assert_eq!(probe(sh, &["-c", "exit 1"], long), (Some(false), None));
+        assert_eq!(probe(sh, &["-c", "exit 0"], long), (Some(true), None));
     }
 }

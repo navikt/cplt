@@ -4085,10 +4085,12 @@ mod tests {
         );
         let json = crate::mcp_broker::status_json(
             &crate::mcp_broker::Detected::default(),
+            None,
             false,
             false,
             false,
             Some(&both),
+            &[],
         );
         assert_eq!(json["platform_supported"], false);
         assert_eq!(json["off_reason"], both.as_str());

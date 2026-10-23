@@ -12,55 +12,85 @@ use super::{SCHEMA_VERSIONS, STATUS_VERSION};
 /// `cplt mcp status --json`. `supported`: this host can run the broker
 /// (on Linux, only under Bubblewrap with the bus masked, #834).
 /// `off_reason`: why the broker would be off for this launch (#838).
+/// `project`: the project the writable-tree checks ran against, `None`
+/// outside one (they then ran against an empty project).
+/// `clients`: the clients this launch would point at the broker.
 pub fn status_json(
     found: &Detected,
+    project: Option<&Path>,
     enabled: bool,
     probe: bool,
     supported: bool,
     off_reason: Option<&str>,
+    clients: &[&str],
 ) -> Value {
     let mut servers: Vec<Value> = found
         .specs
         .iter()
         .map(|s| {
+            let (ok, note) = if probe {
+                credential_ok(s)
+            } else {
+                (None, None)
+            };
             json!({
                 "id": s.id,
                 "state": if enabled { "brokered" } else { "off" },
                 "transport": "unix",
                 "credential": s.credential,
-                "credential_ok": if probe { credential_ok(s) } else { None },
+                "credential_ok": ok,
+                "credential_note": note,
                 "tools_allowed": s.allow.len(),
-                "clients": super::client::WIRED_CLIENTS,
+                "clients": if enabled { clients } else { &[] },
             })
         })
         .collect();
-    servers.extend(
-        found
-            .disabled
-            .iter()
-            .map(|id| json!({"id": id, "state": "off"})),
-    );
+    servers.extend(found.disabled.iter().map(|id| {
+        // Skipped before loading: nothing else is known about it.
+        json!({
+            "id": id,
+            "state": "off",
+            "transport": null,
+            "credential": null,
+            "credential_ok": null,
+            "credential_note": null,
+            "tools_allowed": null,
+            "clients": [],
+        })
+    }));
     json!({
         "version": STATUS_VERSION,
         "schema": SCHEMA_VERSIONS,
         "platform_supported": supported,
         "off_reason": off_reason,
+        "project": project.map(|p| p.display().to_string()),
         "servers": servers,
         "rejected": found.rejected,
     })
 }
 
 /// `cplt mcp status [--json]`. Reads the specs as a launch from the current
-/// directory would, without starting anything.
+/// directory would, without starting anything; outside a project, as a
+/// launch from an empty one would.
 pub fn run_status(
     as_json: bool,
     home: &Path,
+    project: Option<&Path>,
     found: &Detected,
     enabled: bool,
     refusal: Option<&str>,
+    clients: &[&str],
 ) -> ExitCode {
     let supported = refusal.is_none();
-    let status = status_json(found, enabled && supported, true, supported, refusal);
+    let status = status_json(
+        found,
+        project,
+        enabled && supported,
+        true,
+        supported,
+        refusal,
+        clients,
+    );
     if as_json {
         println!("{status}");
         return ExitCode::SUCCESS;
@@ -81,4 +111,33 @@ pub fn run_status(
         println!("  {}", r.line());
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disabled_rows_carry_every_field() {
+        let found = Detected {
+            disabled: vec!["io.example/x".into()],
+            ..Default::default()
+        };
+        let v = status_json(&found, None, true, false, true, None, &["copilot"]);
+        let row = &v["servers"][0];
+        for k in [
+            "id",
+            "state",
+            "transport",
+            "credential",
+            "credential_ok",
+            "credential_note",
+            "tools_allowed",
+            "clients",
+        ] {
+            assert!(row.get(k).is_some(), "{k} missing: {row}");
+        }
+        assert_eq!(row["state"], "off");
+        assert_eq!(row["clients"], json!([]));
+    }
 }

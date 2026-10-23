@@ -14,26 +14,37 @@ use serde_json::Value;
 use super::egress::egress_tunnel;
 use super::policy::{Action, Pending, auth_error, error_line, on_client, on_server};
 use super::spec::Spec;
-use super::{DENIED, KILL_GRACE, MAX_MESSAGE, SPAWNS_PER_MINUTE};
+use super::{CALL_TIMEOUT, DENIED, KILL_GRACE, MAX_MESSAGE, SPAWNS_PER_MINUTE};
 
 /// Where broker lines go: cplt's terminal output and the `--proxy-log` file.
 #[derive(Clone)]
 pub struct Log {
+    pub level: crate::proxy::ProxyLogLevel,
     pub file: Option<PathBuf>,
 }
 
+/// DENIED, auth and other failures reach the terminal at every level (D12);
+/// the rest only at `--proxy-log-level all`.
+fn to_terminal(level: crate::proxy::ProxyLogLevel, text: &str) -> bool {
+    text.contains("DENIED")
+        || text.starts_with("FAIL")
+        || text.starts_with("stopped")
+        || level == crate::proxy::ProxyLogLevel::All
+}
+
 impl Log {
-    /// Every line (DENIED, auth, restart budget) reaches the terminal (D12)
-    /// and the log file.
+    /// Every line reaches the log file; see [`to_terminal`] for the terminal.
     pub(crate) fn line(&self, id: &str, text: &str) {
         let id = id.escape_debug().to_string();
         let text = text.escape_debug().to_string();
-        eprintln!(
-            "{}[mcp:{id}]{} {} {text}",
-            crate::ui::color(crate::ui::YELLOW),
-            crate::ui::color(crate::ui::RESET),
-            crate::proxy::chrono_now()
-        );
+        if to_terminal(self.level, &text) {
+            eprintln!(
+                "{}[mcp:{id}]{} {} {text}",
+                crate::ui::color(crate::ui::YELLOW),
+                crate::ui::color(crate::ui::RESET),
+                crate::proxy::chrono_now()
+            );
+        }
         if let Some(path) = &self.file
             && let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
@@ -340,11 +351,12 @@ pub(crate) fn spawn_child(shared: &Shared, server: &Server) -> std::io::Result<C
     cmd.spawn()
 }
 
-/// The host child's environment, also the credential probe's on Linux, so
-/// the two never disagree. Cleared, then: HOME, the trusted PATH, TMPDIR,
-/// LANG, and on Linux the session bus (`DBUS_SESSION_BUS_ADDRESS`,
-/// `XDG_RUNTIME_DIR`), which go-keyring needs to reach the Secret Service
-/// on the host. The child runs on the host, not in the sandbox.
+/// The host child's environment, also the credential probe's, so the two
+/// never disagree. Cleared, then: HOME, the trusted PATH, TMPDIR, LANG, and
+/// on Linux the session bus (`DBUS_SESSION_BUS_ADDRESS`, `XDG_RUNTIME_DIR`),
+/// which go-keyring needs to reach the Secret Service on the host, and
+/// `XDG_CONFIG_HOME`/`XDG_DATA_HOME`, where nais (`os.UserConfigDir`) keeps
+/// its login. The child runs on the host, not in the sandbox.
 pub(crate) fn host_env(cmd: &mut Command, home: &Path) {
     cmd.env_clear();
     for (k, v) in host_env_pairs(home, &|k| std::env::var_os(k)) {
@@ -363,7 +375,12 @@ fn host_env_pairs(
     ];
     let mut keep = vec!["LANG"];
     if cfg!(target_os = "linux") {
-        keep.extend(["DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR"]);
+        keep.extend([
+            "DBUS_SESSION_BUS_ADDRESS",
+            "XDG_RUNTIME_DIR",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+        ]);
     }
     env.extend(keep.into_iter().filter_map(|k| get(k).map(|v| (k, v))));
     env
@@ -434,6 +451,7 @@ pub(crate) fn serve(shared: &Shared, stream: UnixStream) {
         spawns.push_back(Instant::now());
         match spawn_child(shared, server) {
             Ok(c) => {
+                shared.log.line(&spec.id, "started");
                 let c = Arc::new(Mutex::new(c));
                 *slot = Some(Arc::clone(&c));
                 c
@@ -499,6 +517,35 @@ pub(crate) fn serve(shared: &Shared, stream: UnixStream) {
         })
     };
 
+    // Deadline: about ten times a second, time out requests past
+    // CALL_TIMEOUT. Written under the pending lock, so a reused id never
+    // gets the stale error.
+    let done = Arc::new(AtomicBool::new(false));
+    let ticker = {
+        let (client, stdin, pending, done) = (
+            Arc::clone(&client),
+            Arc::clone(&stdin),
+            Arc::clone(&pending),
+            Arc::clone(&done),
+        );
+        let (log, id) = (shared.log.clone(), spec.id.clone());
+        std::thread::spawn(move || {
+            while !done.load(Ordering::Acquire) {
+                let Ok(mut p) = pending.lock() else { break };
+                for (error, cancel) in p.evict(CALL_TIMEOUT) {
+                    log.line(&id, "FAIL request timed out");
+                    write_line(&client, &error);
+                    write_line(&stdin, &cancel);
+                }
+                drop(p);
+                if done.load(Ordering::Acquire) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        })
+    };
+
     // Client → server.
     while let Some(line) = read_line(&mut reader, MAX_MESSAGE) {
         let action = match pending.lock() {
@@ -523,6 +570,7 @@ pub(crate) fn serve(shared: &Shared, stream: UnixStream) {
         }
     }
     // Client gone (or the socket was closed): end the child.
+    done.store(true, Ordering::Release);
     drop(stdin);
     if let Ok(mut slot) = server.child.lock()
         && slot.as_ref().is_some_and(|c| Arc::ptr_eq(c, &child))
@@ -531,6 +579,7 @@ pub(crate) fn serve(shared: &Shared, stream: UnixStream) {
     }
     kill(&child);
     let _ = out.join();
+    let _ = ticker.join();
 }
 
 #[cfg(test)]
@@ -550,11 +599,16 @@ mod tests {
     use serde_json::Value;
 
     #[test]
-    fn the_host_child_keeps_the_session_bus_on_linux_only() {
+    fn the_host_child_keeps_the_bus_and_xdg_dirs_on_linux_only() {
         let get = |k: &str| {
             matches!(
                 k,
-                "DBUS_SESSION_BUS_ADDRESS" | "XDG_RUNTIME_DIR" | "LANG" | "SECRET"
+                "DBUS_SESSION_BUS_ADDRESS"
+                    | "XDG_RUNTIME_DIR"
+                    | "XDG_CONFIG_HOME"
+                    | "XDG_DATA_HOME"
+                    | "LANG"
+                    | "SECRET"
             )
             .then(|| std::ffi::OsString::from(format!("v-{k}")))
         };
@@ -568,8 +622,32 @@ mod tests {
             !names.contains(&"SECRET"),
             "nothing else from cplt's env: {names:?}"
         );
-        let bus = names.contains(&"DBUS_SESSION_BUS_ADDRESS") && names.contains(&"XDG_RUNTIME_DIR");
-        assert_eq!(bus, cfg!(target_os = "linux"), "{names:?}");
+        for k in [
+            "DBUS_SESSION_BUS_ADDRESS",
+            "XDG_RUNTIME_DIR",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+        ] {
+            assert_eq!(
+                names.contains(&k),
+                cfg!(target_os = "linux"),
+                "{k}: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn failures_reach_the_terminal_at_every_level() {
+        use crate::proxy::ProxyLogLevel::{All, Blocked, None as Silent};
+        for level in [Silent, Blocked, All] {
+            assert!(to_terminal(level, "tools/call → DENIED tool"));
+            assert!(to_terminal(level, "egress → DENIED example.com"));
+            assert!(to_terminal(level, "FAIL not logged in on the host."));
+            assert!(to_terminal(level, "stopped after 3 restarts in a minute"));
+        }
+        assert!(!to_terminal(Silent, "started"));
+        assert!(!to_terminal(Blocked, "started"));
+        assert!(to_terminal(All, "started"));
     }
 
     #[test]
@@ -604,7 +682,15 @@ mod tests {
         let mut spec = check(base()).unwrap();
         spec.command = vec!["cat".into()];
         spec.program = "/bin/cat".into();
-        Broker::start(vec![spec], Path::new("/tmp"), Log { file: None }).unwrap()
+        Broker::start(
+            vec![spec],
+            Path::new("/tmp"),
+            Log {
+                level: crate::proxy::ProxyLogLevel::None,
+                file: None,
+            },
+        )
+        .unwrap()
     }
 
     fn connect(b: &Broker) -> (UnixStream, BufReader<UnixStream>) {
@@ -682,7 +768,15 @@ mod tests {
         }
         spec.command = vec!["sh".into(), "-c".into(), script.into()];
         spec.program = "/bin/sh".into();
-        Broker::start(vec![spec], Path::new("/tmp"), Log { file: None }).unwrap()
+        Broker::start(
+            vec![spec],
+            Path::new("/tmp"),
+            Log {
+                level: crate::proxy::ProxyLogLevel::None,
+                file: None,
+            },
+        )
+        .unwrap()
     }
 
     #[test]
