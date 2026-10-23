@@ -4085,6 +4085,7 @@ mod tests {
         );
         let json = crate::mcp_broker::status_json(
             &crate::mcp_broker::Detected::default(),
+            None,
             false,
             false,
             false,

@@ -3804,6 +3804,38 @@ struct DomainAllowlistDecision {
     force_proxy_on: bool,
 }
 
+/// An empty 0700 dir standing in for the project when `cplt mcp status`
+/// runs where a launch would refuse (home, `/`). Removed on drop.
+struct NeutralProject(PathBuf);
+
+impl NeutralProject {
+    fn if_needed() -> anyhow::Result<Option<Self>> {
+        use std::os::unix::fs::DirBuilderExt;
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        let home = std::fs::canonicalize(&home).unwrap_or(home);
+        let cwd = std::env::current_dir()?;
+        let root = cplt::git::project_root(&cwd).unwrap_or(cwd);
+        let root = std::fs::canonicalize(&root).unwrap_or(root);
+        if !cplt::is_unsafe_root(&root, &home) {
+            return Ok(None);
+        }
+        let dir = std::env::temp_dir().join(format!("cplt-mcp-status-{}", std::process::id()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .with_context(|| format!("cannot create {}", dir.display()))?;
+        Ok(Some(Self(std::fs::canonicalize(&dir)?)))
+    }
+}
+
+impl Drop for NeutralProject {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.0);
+    }
+}
+
 /// Show allowlist refusals by default, but honor an explicitly chosen log level.
 fn proxy_log_level(
     configured: proxy::ProxyLogLevel,
@@ -4715,6 +4747,17 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         return Ok(run_doctor(&cli, false, false));
     }
 
+    // `cplt mcp status` from outside any project (`~`, `/`): the specs live
+    // in the user config dir, so judge them against an empty project of
+    // cplt's own, and report no project. A launch still refuses these roots.
+    let neutral = match mcp_status {
+        Some(_) if cli.project_dir.is_none() => NeutralProject::if_needed()?,
+        _ => None,
+    };
+    if let Some(n) = &neutral {
+        cli.project_dir = Some(n.0.clone());
+    }
+
     // Resolve config, paths, and agent
     let ResolvedContext {
         mut resolved,
@@ -4738,7 +4781,9 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
 
     warn_exec_tool_dir_shadowing(&resolved, &home_dir, active_agent);
     warn_write_granted_repos(&resolved, &project_dir, &repo_paths);
-    warn_repo_under_no_exec_cache(&resolved, &home_dir, &project_dir, &repo_paths);
+    if neutral.is_none() {
+        warn_repo_under_no_exec_cache(&resolved, &home_dir, &project_dir, &repo_paths);
+    }
     warn_inject_token_without_guard(&resolved, active_agent);
     if !resolved.quiet {
         warn_unlinked_child_repos(&home_dir, &project_dir, &repo_paths);
@@ -4839,6 +4884,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         return Ok(cplt::mcp_broker::run_status(
             json,
             &home_dir,
+            neutral.is_none().then_some(project_dir.as_path()),
             &found,
             resolved.mcp_broker,
             mcp_refusal.as_deref(),

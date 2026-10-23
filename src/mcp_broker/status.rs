@@ -12,8 +12,11 @@ use super::{SCHEMA_VERSIONS, STATUS_VERSION};
 /// `cplt mcp status --json`. `supported`: this host can run the broker
 /// (on Linux, only under Bubblewrap with the bus masked, #834).
 /// `off_reason`: why the broker would be off for this launch (#838).
+/// `project`: the project the writable-tree checks ran against, `None`
+/// outside one (they then ran against an empty project).
 pub fn status_json(
     found: &Detected,
+    project: Option<&Path>,
     enabled: bool,
     probe: bool,
     supported: bool,
@@ -51,22 +54,32 @@ pub fn status_json(
         "schema": SCHEMA_VERSIONS,
         "platform_supported": supported,
         "off_reason": off_reason,
+        "project": project.map(|p| p.display().to_string()),
         "servers": servers,
         "rejected": found.rejected,
     })
 }
 
 /// `cplt mcp status [--json]`. Reads the specs as a launch from the current
-/// directory would, without starting anything.
+/// directory would, without starting anything; outside a project, as a
+/// launch from an empty one would.
 pub fn run_status(
     as_json: bool,
     home: &Path,
+    project: Option<&Path>,
     found: &Detected,
     enabled: bool,
     refusal: Option<&str>,
 ) -> ExitCode {
     let supported = refusal.is_none();
-    let status = status_json(found, enabled && supported, true, supported, refusal);
+    let status = status_json(
+        found,
+        project,
+        enabled && supported,
+        true,
+        supported,
+        refusal,
+    );
     if as_json {
         println!("{status}");
         return ExitCode::SUCCESS;
