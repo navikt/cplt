@@ -90,6 +90,16 @@ pub fn is_unsafe_root(path: &std::path::Path, home: &std::path::Path) -> bool {
     false
 }
 
+/// Run `f` holding temp_env's reentrant lock in tests, so code that reads
+/// XDG_CONFIG_HOME (the state root, #830) never sees a value another test
+/// set mid-run. A plain call outside tests.
+pub(crate) fn env_read_lock<R>(f: impl FnOnce() -> R) -> R {
+    #[cfg(test)]
+    return temp_env::with_vars(Vec::<(&str, Option<&str>)>::new(), f);
+    #[cfg(not(test))]
+    f()
+}
+
 /// Run `f` holding `temp_env`'s lock, with every XDG base variable unset.
 ///
 /// `temp_env` mutates the real process environment, so a test that reads
