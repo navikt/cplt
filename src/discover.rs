@@ -2241,83 +2241,86 @@ mod tests {
     /// each shape below places the hooks somewhere different.
     #[test]
     fn git_dir_of_resolves_every_repo_shape() {
-        let base = tempfile::tempdir().expect("tempdir");
-        let git = |args: &[&str], cwd: &Path| {
-            let ok = std::process::Command::new("git")
-                .args(args)
-                .current_dir(cwd)
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_AUTHOR_NAME", "t")
-                .env("GIT_AUTHOR_EMAIL", "t@e")
-                .env("GIT_COMMITTER_NAME", "t")
-                .env("GIT_COMMITTER_EMAIL", "t@e")
-                .output()
-                .expect("run git")
-                .status
-                .success();
-            assert!(ok, "git {args:?} should succeed");
-        };
+        // Spawns `cp`/`git`/`sleep` by name: hold the env lock so no test swaps PATH (#832).
+        crate::with_env_lock_no_xdg(|| {
+            let base = tempfile::tempdir().expect("tempdir");
+            let git = |args: &[&str], cwd: &Path| {
+                let ok = std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(cwd)
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("GIT_AUTHOR_NAME", "t")
+                    .env("GIT_AUTHOR_EMAIL", "t@e")
+                    .env("GIT_COMMITTER_NAME", "t")
+                    .env("GIT_COMMITTER_EMAIL", "t@e")
+                    .output()
+                    .expect("run git")
+                    .status
+                    .success();
+                assert!(ok, "git {args:?} should succeed");
+            };
 
-        // Not a repo, and not inside one: a no-op, never an error.
-        let plain = base.path().join("plain");
-        std::fs::create_dir(&plain).unwrap();
-        // A tempdir can itself live inside a repo (TMPDIR under a checkout), and
-        // git would then walk up and find that one — assert only when it does not.
-        if git_dir_of(base.path()).is_none() {
+            // Not a repo, and not inside one: a no-op, never an error.
+            let plain = base.path().join("plain");
+            std::fs::create_dir(&plain).unwrap();
+            // A tempdir can itself live inside a repo (TMPDIR under a checkout), and
+            // git would then walk up and find that one — assert only when it does not.
+            if git_dir_of(base.path()).is_none() {
+                assert!(
+                    git_dir_of(&plain).is_none(),
+                    "a path outside any repo must resolve to None"
+                );
+            }
             assert!(
-                git_dir_of(&plain).is_none(),
-                "a path outside any repo must resolve to None"
+                git_dir_of(&base.path().join("does-not-exist")).is_none(),
+                "a path that does not exist must resolve to None"
             );
-        }
-        assert!(
-            git_dir_of(&base.path().join("does-not-exist")).is_none(),
-            "a path that does not exist must resolve to None"
-        );
 
-        // Normal repo, and a subdirectory of it: the repo's own .git.
-        let repo = base.path().join("repo");
-        std::fs::create_dir(&repo).unwrap();
-        git(&["init", "--quiet"], &repo);
-        git(&["commit", "--quiet", "--allow-empty", "-m", "x"], &repo);
-        let repo_git = std::fs::canonicalize(repo.join(".git")).unwrap();
-        assert_eq!(git_dir_of(&repo), Some(repo_git.clone()));
-        let sub = repo.join("sub");
-        std::fs::create_dir(&sub).unwrap();
-        assert_eq!(
-            git_dir_of(&sub),
-            Some(repo_git.clone()),
-            "a grant inside a repo resolves to that repo's .git"
-        );
+            // Normal repo, and a subdirectory of it: the repo's own .git.
+            let repo = base.path().join("repo");
+            std::fs::create_dir(&repo).unwrap();
+            git(&["init", "--quiet"], &repo);
+            git(&["commit", "--quiet", "--allow-empty", "-m", "x"], &repo);
+            let repo_git = std::fs::canonicalize(repo.join(".git")).unwrap();
+            assert_eq!(git_dir_of(&repo), Some(repo_git.clone()));
+            let sub = repo.join("sub");
+            std::fs::create_dir(&sub).unwrap();
+            assert_eq!(
+                git_dir_of(&sub),
+                Some(repo_git.clone()),
+                "a grant inside a repo resolves to that repo's .git"
+            );
 
-        // Worktree: the shared .git of the MAIN repo, not <worktree>/.git.
-        let wt = base.path().join("wt");
-        git(
-            &[
-                "worktree",
-                "add",
-                "--quiet",
-                "-b",
-                "b2",
-                wt.to_str().unwrap(),
-            ],
-            &repo,
-        );
-        assert_eq!(
-            git_dir_of(&wt),
-            Some(repo_git),
-            "a worktree resolves to the main repo's shared .git"
-        );
+            // Worktree: the shared .git of the MAIN repo, not <worktree>/.git.
+            let wt = base.path().join("wt");
+            git(
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "-b",
+                    "b2",
+                    wt.to_str().unwrap(),
+                ],
+                &repo,
+            );
+            assert_eq!(
+                git_dir_of(&wt),
+                Some(repo_git),
+                "a worktree resolves to the main repo's shared .git"
+            );
 
-        // Bare repo: the repo directory itself (hooks live at <root>/hooks).
-        let bare = base.path().join("bare.git");
-        std::fs::create_dir(&bare).unwrap();
-        git(&["init", "--bare", "--quiet"], &bare);
-        assert_eq!(
-            git_dir_of(&bare),
-            Some(std::fs::canonicalize(&bare).unwrap()),
-            "a bare repo resolves to itself"
-        );
+            // Bare repo: the repo directory itself (hooks live at <root>/hooks).
+            let bare = base.path().join("bare.git");
+            std::fs::create_dir(&bare).unwrap();
+            git(&["init", "--bare", "--quiet"], &bare);
+            assert_eq!(
+                git_dir_of(&bare),
+                Some(std::fs::canonicalize(&bare).unwrap()),
+                "a bare repo resolves to itself"
+            );
+        });
     }
 
     #[test]
@@ -2588,47 +2591,50 @@ ELECTRON_RUN_AS_NODE=1 "/Applications/Visual Studio Code.app/Contents/Frameworks
     #[cfg(unix)]
     #[test]
     fn version_probe_gives_up_on_a_binary_that_never_exits() {
-        let dir = tempfile::tempdir().unwrap();
-        // The fake ticks a file for as long as it lives, so its liveness is
-        // observable from the filesystem: no `pgrep`, no `ps`, nothing that can
-        // be absent from the machine and turn the orphan check below into a
-        // silent pass.
-        let heartbeat = dir.path().join("alive");
-        let bin = fake_binary(
-            dir.path(),
-            "wedged",
-            &format!(
-                "exec sh -c 'while : ; do printf x >> \"{}\" ; sleep 0.2 ; done'",
-                heartbeat.display()
-            ),
-        );
+        // Spawns `cp`/`git`/`sleep` by name: hold the env lock so no test swaps PATH (#832).
+        crate::with_env_lock_no_xdg(|| {
+            let dir = tempfile::tempdir().unwrap();
+            // The fake ticks a file for as long as it lives, so its liveness is
+            // observable from the filesystem: no `pgrep`, no `ps`, nothing that can
+            // be absent from the machine and turn the orphan check below into a
+            // silent pass.
+            let heartbeat = dir.path().join("alive");
+            let bin = fake_binary(
+                dir.path(),
+                "wedged",
+                &format!(
+                    "exec sh -c 'while : ; do printf x >> \"{}\" ; sleep 0.2 ; done'",
+                    heartbeat.display()
+                ),
+            );
 
-        let start = Instant::now();
-        let outcome = probe_version(&bin, &["--version"]);
-        let elapsed = start.elapsed();
+            let start = Instant::now();
+            let outcome = probe_version(&bin, &["--version"]);
+            let elapsed = start.elapsed();
 
-        assert_eq!(
-            outcome,
-            VersionProbe::TimedOut,
-            "a wedged probe reports TimedOut"
-        );
-        assert!(
-            elapsed < PROBE_TIMEOUT * 3,
-            "probe should return near PROBE_TIMEOUT, took {elapsed:?}"
-        );
+            assert_eq!(
+                outcome,
+                VersionProbe::TimedOut,
+                "a wedged probe reports TimedOut"
+            );
+            assert!(
+                elapsed < PROBE_TIMEOUT * 3,
+                "probe should return near PROBE_TIMEOUT, took {elapsed:?}"
+            );
 
-        // Killing without reaping turns one hang into an orphan that outlives
-        // the command — the exact state found on the machine in #298. Dropping
-        // the Child handle does not do this, so prove the process is gone: a
-        // dead ticker stops growing its file.
-        let ticks = || std::fs::metadata(&heartbeat).map_or(0, |m| m.len());
-        let before = ticks();
-        assert!(
-            before > 0,
-            "the fake never ran, so the check proves nothing"
-        );
-        std::thread::sleep(Duration::from_millis(800));
-        assert_eq!(ticks(), before, "timed-out probe left the child running");
+            // Killing without reaping turns one hang into an orphan that outlives
+            // the command — the exact state found on the machine in #298. Dropping
+            // the Child handle does not do this, so prove the process is gone: a
+            // dead ticker stops growing its file.
+            let ticks = || std::fs::metadata(&heartbeat).map_or(0, |m| m.len());
+            let before = ticks();
+            assert!(
+                before > 0,
+                "the fake never ran, so the check proves nothing"
+            );
+            std::thread::sleep(Duration::from_millis(800));
+            assert_eq!(ticks(), before, "timed-out probe left the child running");
+        });
     }
 
     /// A probe that exits but leaves a child holding its stdout must still
@@ -2637,20 +2643,23 @@ ELECTRON_RUN_AS_NODE=1 "/Applications/Visual Studio Code.app/Contents/Frameworks
     #[cfg(unix)]
     #[test]
     fn version_probe_gives_up_when_a_grandchild_holds_the_pipe() {
-        let dir = tempfile::tempdir().unwrap();
-        // Bounded on purpose: the grandchild only has to outlive the probe's
-        // read grace, and a short sleep cleans itself up instead of needing a
-        // `pkill` this test cannot guarantee exists.
-        let bin = fake_binary(dir.path(), "forker", "sleep 30 &\nexit 0");
+        // Spawns `cp`/`git`/`sleep` by name: hold the env lock so no test swaps PATH (#832).
+        crate::with_env_lock_no_xdg(|| {
+            let dir = tempfile::tempdir().unwrap();
+            // Bounded on purpose: the grandchild only has to outlive the probe's
+            // read grace, and a short sleep cleans itself up instead of needing a
+            // `pkill` this test cannot guarantee exists.
+            let bin = fake_binary(dir.path(), "forker", "sleep 30 &\nexit 0");
 
-        let start = Instant::now();
-        let outcome = probe_version(&bin, &["--version"]);
-        assert_eq!(outcome, VersionProbe::Unknown);
-        assert!(
-            start.elapsed() < PROBE_TIMEOUT,
-            "a held-open pipe must not extend the probe, took {:?}",
-            start.elapsed()
-        );
+            let start = Instant::now();
+            let outcome = probe_version(&bin, &["--version"]);
+            assert_eq!(outcome, VersionProbe::Unknown);
+            assert!(
+                start.elapsed() < PROBE_TIMEOUT,
+                "a held-open pipe must not extend the probe, took {:?}",
+                start.elapsed()
+            );
+        });
     }
 
     /// #374: doctor and discovery run `copilot --version` outside the sandbox

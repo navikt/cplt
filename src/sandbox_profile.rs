@@ -4375,20 +4375,23 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn deny_copilot_dir_exec_leaves_the_macos_profile_unchanged() {
-        let project = Path::new("/Users/test/repo");
-        let home = Path::new("/Users/test");
-        let profile = |on: bool| {
-            let mut r = crate::config::Config::default()
-                .merge(crate::config::CliFlags::default())
-                .expect("default config merges");
-            r.deny_copilot_dir_exec = on;
-            let dirs = r.agent_config_dirs(crate::agent::Agent::Copilot, home);
-            let mut opts = test_options(project, home);
-            opts.agent = crate::agent::Agent::Copilot;
-            opts.agent_dirs = &dirs;
-            generate_profile(&opts, &[])
-        };
-        assert_eq!(profile(false), profile(true));
+        // Policy generation reads HOME/XDG/PATH: hold the env lock (#832).
+        crate::with_env_lock_no_xdg(|| {
+            let project = Path::new("/Users/test/repo");
+            let home = Path::new("/Users/test");
+            let profile = |on: bool| {
+                let mut r = crate::config::Config::default()
+                    .merge(crate::config::CliFlags::default())
+                    .expect("default config merges");
+                r.deny_copilot_dir_exec = on;
+                let dirs = r.agent_config_dirs(crate::agent::Agent::Copilot, home);
+                let mut opts = test_options(project, home);
+                opts.agent = crate::agent::Agent::Copilot;
+                opts.agent_dirs = &dirs;
+                generate_profile(&opts, &[])
+            };
+            assert_eq!(profile(false), profile(true));
+        });
     }
 
     /// `sandbox.allow_rootless_docker` is Linux-only (#782): it must not
