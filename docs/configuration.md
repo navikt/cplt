@@ -1128,6 +1128,9 @@ on the host, outside the sandbox, and points your client's entry at
   document. No automated test covers that precedence, since it needs a
   logged-in Copilot CLI. OpenCode v2 gets an overlay in `OPENCODE_CONFIG_CONTENT`.
   Your config files are not changed.
+- Broker DENIED and FAIL lines (refused calls and egress, login failures)
+  reach the terminal at every `--proxy-log-level`, `none` included (D12).
+  Other broker lines print only at `all`. The `--proxy-log` file gets them all.
 - A spec cplt refuses prints one line at launch, and the entry stays as
   configured. `cplt mcp status --json` lists the specs, their
   state and the reasons for any refusal, checked as a launch from the current
