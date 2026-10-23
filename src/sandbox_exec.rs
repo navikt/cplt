@@ -2696,6 +2696,23 @@ mod keychain_substitute_tests {
             assert_eq!(set, vec![("FOO".as_ref(), None)]);
         });
     }
+
+    /// `--deny-env` (#814) beats a `--pass-env` value already set on the
+    /// command; without it the value stays.
+    #[test]
+    fn deny_env_strips_a_passed_var_and_absence_keeps_it() {
+        let mut cmd = Command::new("/usr/bin/true");
+        cmd.env("OPENAI_API_KEY", "x");
+        apply_deny_env_and_credential(&mut cmd, &["OPENAI_API_KEY".to_string()], None);
+        let set: Vec<_> = cmd.get_envs().collect();
+        assert_eq!(set, vec![("OPENAI_API_KEY".as_ref(), None)]);
+
+        let mut cmd = Command::new("/usr/bin/true");
+        cmd.env("OPENAI_API_KEY", "x");
+        apply_deny_env_and_credential(&mut cmd, &[], None);
+        let set: Vec<_> = cmd.get_envs().collect();
+        assert_eq!(set, vec![("OPENAI_API_KEY".as_ref(), Some("x".as_ref()))]);
+    }
 }
 
 #[cfg(test)]

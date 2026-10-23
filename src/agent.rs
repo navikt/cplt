@@ -2681,12 +2681,15 @@ impl Agent {
             Agent::OpenCode => &[
                 // Anthropic
                 "ANTHROPIC_API_KEY",
-                // OpenAI, xAI and Google keys are stripped for OpenCode (#814):
-                // its voice mode reads them past enabled_providers.
+                // OpenAI + Azure OpenAI
+                "OPENAI_API_KEY",
                 "AZURE_OPENAI_API_KEY",
                 // AWS Bedrock (bearer token auth — SigV4 via AWS_ACCESS_KEY_ID requires --pass-env per-var)
                 "AWS_BEARER_TOKEN_BEDROCK",
+                // Google
+                "GEMINI_API_KEY",
                 // Popular API providers
+                "XAI_API_KEY",
                 "MISTRAL_API_KEY",
                 "DEEPSEEK_API_KEY",
                 "GROQ_API_KEY",
@@ -4784,9 +4787,9 @@ mod tests {
     fn opencode_auth_env_hints() {
         let hints = Agent::OpenCode.auth_env_hint();
         assert!(hints.contains(&"ANTHROPIC_API_KEY"));
-        assert!(!hints.contains(&"OPENAI_API_KEY"));
+        assert!(hints.contains(&"OPENAI_API_KEY"));
         assert!(hints.contains(&"AWS_BEARER_TOKEN_BEDROCK"));
-        assert!(!hints.contains(&"XAI_API_KEY"));
+        assert!(hints.contains(&"XAI_API_KEY"));
         assert!(hints.contains(&"MISTRAL_API_KEY"));
         assert!(hints.contains(&"DEEPSEEK_API_KEY"));
         assert!(hints.contains(&"GROQ_API_KEY"));
