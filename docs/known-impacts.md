@@ -837,7 +837,7 @@ Granting the key file hands the agent the key itself: a file the agent can read,
 
 cplt never inspects what travels over an allowed connection. Two paths reach an SSH server on 443:
 
-- **Default mode.** The sandbox allows outbound TCP to any remote host on port 443 (`(allow network-outbound (remote ip "*:443"))` on macOS, a port-443 Landlock rule on Linux with kernel 6.7+; older Linux kernels have no kernel port rule at all). `ssh` does not honour `HTTPS_PROXY`, so it connects directly and the proxy never sees it. Domain allowlists and blocklists do not apply to it.
+- **Default mode.** The sandbox allows outbound TCP to any remote host on port 443 (`(allow network-outbound (remote tcp "*:443"))` on macOS, a port-443 Landlock rule on Linux with kernel 6.7+; older Linux kernels have no kernel port rule at all). `ssh` does not honour `HTTPS_PROXY`, so it connects directly and the proxy never sees it. Domain allowlists and blocklists do not apply to it.
 - **Proxy-forced mode** (`proxy.forced`, also set by `--preset strict`). Direct `:443` is closed in the kernel and `allow.ports` opens no kernel port either, so `ssh -p 22` and a direct `ssh -p 443` both fail. An ssh `ProxyCommand` that speaks HTTP CONNECT to cplt's proxy still gets through: the proxy accepts port 443, and its domain matching covers subdomains, so a `github.com` allowlist entry, which the Copilot default allowlist has, also allows `ssh.github.com`. The proxy forwards bytes without looking at them, so an SSH session inside the tunnel looks like any other.
 
 So neither port rules nor proxy-forced mode stop SSH to `ssh.github.com:443`. What stops it from being useful is that the agent has no key. On Linux below kernel 7.1 that is not guaranteed either: an agent that finds a loaded SSH agent socket (see above) has a key, and needs no configuration change to reach `ssh.github.com:443` with it. This is not specific to SSH: any protocol can run over an allowed 443 connection.
@@ -863,7 +863,7 @@ Landlock gates UDP only at ABI v10 and cplt handles TCP connect alone, so outbou
 - Outside `proxy.forced` the rule is deliberately not applied — denying `SOCK_DGRAM` would break `getaddrinfo(3)`, and so all DNS, for every non-proxied tool
 - DNS tunnelling, QUIC/HTTP-3, and plain UDP exfiltration are not covered by any cplt layer on Linux outside `proxy.forced`
 - The proxy log is therefore not a complete record of what left the machine on Linux
-- macOS restricts UDP but does not route it through the proxy either: `remote ip "*:443"` covers UDP as well as TCP, so in default mode QUIC/HTTP-3 on 443 leaves without being logged there too. Only under `proxy.forced`, where the `*:443` allow is dropped and `(deny default)` closes the rest, is the macOS proxy log complete
+- macOS allows only TCP on 443 and on `--allow-port` ports ([#815](https://github.com/navikt/cplt/issues/815)), so UDP to remote hosts is denied in every mode and HTTP/3 clients fall back to TCP. Loopback UDP stays open under `--allow-localhost`. Direct TCP/443 still bypasses the proxy outside `proxy.forced`, so only there is the macOS proxy log complete
 
 ## macOS protected folders (Desktop, Documents)
 

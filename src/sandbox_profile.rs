@@ -3658,8 +3658,8 @@ fn emit_network_rules(
     // blocks all remote TCP, which is the safe failure rather than an open one.
     //
     // `extra_ports` (#297) is gated on the same condition, and for the same
-    // reason. `(remote ip "*:{port}")` is a direct path to ANY remote host on
-    // that port, family-agnostic so it carries UDP too — a channel the proxy
+    // reason. `(remote tcp "*:{port}")` is a direct path to ANY remote host on
+    // that port (TCP only since #815) — a channel the proxy
     // never sees, that `allowed_domains`/`blocked_domains` never filter, and
     // that no cooperating localhost process is needed to reach. Leaving it
     // ungated made the "no residual" claim above false for every user who
@@ -3669,11 +3669,13 @@ fn emit_network_rules(
     // which is precisely what this mode exists to take away. `main.rs` warns
     // when the two are combined, so the narrowing is never silent.
     if !proxy_forced {
-        sbpl!(sb, "(allow network-outbound (remote ip \"*:443\"))");
+        // TCP only (#815): `remote ip` would also let UDP/443 out, i.e. QUIC/HTTP3
+        // straight past the proxy. HTTP/3 clients fall back to TCP.
+        sbpl!(sb, "(allow network-outbound (remote tcp \"*:443\"))");
 
         // Extra ports (e.g., MCP servers, custom services)
         for port in extra_ports {
-            sbpl!(sb, "(allow network-outbound (remote ip \"*:{port}\"))");
+            sbpl!(sb, "(allow network-outbound (remote tcp \"*:{port}\"))");
         }
     }
 
@@ -3692,10 +3694,11 @@ fn emit_network_rules(
 
     // Carve-outs for specific localhost ports (proxy, MCP servers, dev servers).
     // These come AFTER the deny so they override it (last-match-wins in SBPL).
+    // The CONNECT proxy speaks TCP only (#815).
     if let Some(port) = proxy_port {
         sbpl!(
             sb,
-            "(allow network-outbound (remote ip \"localhost:{port}\"))"
+            "(allow network-outbound (remote tcp \"localhost:{port}\"))"
         );
     }
     for port in localhost_ports {
@@ -4890,7 +4893,9 @@ mod tests {
         assert!(!opts.proxy_forced);
         let p = generate_profile(&opts, &[]);
 
-        assert!(p.contains("(allow network-outbound (remote ip \"*:443\"))"));
+        assert!(p.contains("(allow network-outbound (remote tcp \"*:443\"))"));
+        // #815: must not be family-agnostic, or UDP/443 (QUIC) bypasses the proxy.
+        assert!(!p.contains("(remote ip \"*:443\")"));
     }
 
     #[test]
@@ -5042,7 +5047,7 @@ mod tests {
         let p = generate_profile(&opts, &[]);
 
         assert!(
-            p.contains("(allow network-outbound (remote ip \"localhost:8080\"))"),
+            p.contains("(allow network-outbound (remote tcp \"localhost:8080\"))"),
             "proxy_forced must pin outbound to the localhost proxy port"
         );
         assert!(
@@ -5080,7 +5085,7 @@ mod tests {
 
     #[test]
     fn extra_ports_are_direct_egress_in_default_mode_only() {
-        // #297: `--allow-port 9999` emits `(remote ip "*:9999")`, a direct path
+        // #297: `--allow-port 9999` emits `(remote tcp "*:9999")`, a direct path
         // to any remote host on that port. Under proxy_forced that path must be
         // gone, or the "no residual" claim on the rule above is false. The same
         // options run both ways, so the assertion can only pass by the gate.
@@ -5092,7 +5097,7 @@ mod tests {
         opts.extra_ports = &ports;
         let default_mode = generate_profile(&opts, &[]);
         assert!(
-            default_mode.contains("(allow network-outbound (remote ip \"*:9999\"))"),
+            default_mode.contains("(allow network-outbound (remote tcp \"*:9999\"))"),
             "default mode must still honour --allow-port"
         );
 
@@ -5104,7 +5109,7 @@ mod tests {
             "proxy_forced must not emit a direct remote path for an extra port"
         );
         assert!(
-            forced.contains("(allow network-outbound (remote ip \"localhost:8080\"))"),
+            forced.contains("(allow network-outbound (remote tcp \"localhost:8080\"))"),
             "proxy_forced still pins egress to the localhost proxy port"
         );
     }

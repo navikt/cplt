@@ -307,7 +307,7 @@ mod e2e_tests {
         assert!(output.status.success());
         // Port-restricted outbound (443 only, no blanket allow)
         assert!(
-            stdout.contains("(allow network-outbound (remote ip \"*:443\"))"),
+            stdout.contains("(allow network-outbound (remote tcp \"*:443\"))"),
             "profile should allow port 443.\nstdout: {stdout}"
         );
         assert!(
@@ -1062,7 +1062,7 @@ mod e2e_tests {
 
         assert!(output.status.success());
         assert!(
-            stdout.contains("(allow network-outbound (remote ip \"*:8080\"))"),
+            stdout.contains("(allow network-outbound (remote tcp \"*:8080\"))"),
             "--allow-port 8080 should appear.\nstdout: {stdout}"
         );
     }
@@ -10668,6 +10668,68 @@ paths = [
             c.wait().unwrap();
             assert!(scratch_dirs(&home).is_empty(), "{:?}", scratch_dirs(&home));
             assert_no_process(&home);
+        }
+    }
+
+    /// #815: UDP/443 (QUIC/HTTP3) must not leave the sandbox, in default
+    /// mode or under proxy-forced, while default-mode TCP/443 still may.
+    /// TEST-NET-1 (192.0.2.1) keeps it offline: the kernel's answer to a
+    /// non-blocking connect or a sendto is EPERM when Seatbelt denies it and
+    /// anything else (EINPROGRESS, a send, a route error) when it allows it.
+    #[test]
+    fn e2e_udp_443_is_denied_and_tcp_443_is_not() {
+        const PROBE: &str = r#"python3 -c "
+import errno, socket
+u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+try:
+    u.sendto(b'q', ('192.0.2.1', 443)); print('UDP_SENT')
+except OSError as e:
+    print('UDP_' + errno.errorcode.get(e.errno, str(e.errno)))
+t = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+t.setblocking(False)
+r = t.connect_ex(('192.0.2.1', 443))
+print('TCP_' + ('OK' if r == 0 else errno.errorcode.get(r, str(r))))
+""#;
+        let project = tempfile::tempdir().unwrap();
+        let port = (24200 + std::process::id() % 800).to_string();
+        for (forced, extra) in [
+            (false, vec![]),
+            (
+                true,
+                vec![
+                    "--with-proxy",
+                    "--proxy-port",
+                    port.as_str(),
+                    "--proxy-forced",
+                ],
+            ),
+        ] {
+            let out = cplt_cmd()
+                .args(["--yes", "--no-validate", "--quiet", "--agent", "shell"])
+                .arg("--project-dir")
+                .arg(project.path())
+                .args(&extra)
+                .args(["--", "-c", PROBE])
+                .output()
+                .expect("run cplt");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stdout.contains("UDP_EPERM"),
+                "forced={forced}: UDP/443 must be denied\nstdout: {stdout}\nstderr: {stderr}"
+            );
+            // A positive marker each way: a probe that dies before the TCP
+            // line must fail the test, not pass it.
+            let tcp_ok = if forced {
+                stdout.contains("TCP_EPERM")
+            } else {
+                stdout.contains("TCP_OK") || stdout.contains("TCP_EINPROGRESS")
+            };
+            assert!(
+                tcp_ok,
+                "forced={forced}: TCP/443 must be allowed only outside proxy-forced\n\
+                 stdout: {stdout}\nstderr: {stderr}"
+            );
         }
     }
 }

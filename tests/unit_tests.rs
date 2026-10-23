@@ -3336,11 +3336,11 @@ fn profile_restricts_outbound_tcp() {
         "Profile must deny general TCP before port allows"
     );
     assert!(
-        p.contains("(allow network-outbound (remote ip \"*:443\"))"),
+        p.contains("(allow network-outbound (remote tcp \"*:443\"))"),
         "Profile must allow port 443"
     );
     assert!(
-        !p.contains("(allow network-outbound (remote ip \"*:80\"))"),
+        !p.contains("(allow network-outbound (remote tcp \"*:80\"))"),
         "Profile must NOT allow port 80 by default (HTTPS only)"
     );
     assert!(
@@ -3371,15 +3371,15 @@ fn profile_extra_ports_adds_allows() {
         &[],
     );
     assert!(
-        p.contains("(allow network-outbound (remote ip \"*:8080\"))"),
+        p.contains("(allow network-outbound (remote tcp \"*:8080\"))"),
         "Profile must allow extra port 8080"
     );
     assert!(
-        p.contains("(allow network-outbound (remote ip \"*:3000\"))"),
+        p.contains("(allow network-outbound (remote tcp \"*:3000\"))"),
         "Profile must allow extra port 3000"
     );
     assert!(
-        p.contains("(allow network-outbound (remote ip \"*:443\"))"),
+        p.contains("(allow network-outbound (remote tcp \"*:443\"))"),
         "Profile must still allow port 443"
     );
 }
@@ -3409,7 +3409,7 @@ fn profile_proxy_port_allows_localhost() {
         &[],
     );
     assert!(
-        p.contains("(allow network-outbound (remote ip \"localhost:18080\"))"),
+        p.contains("(allow network-outbound (remote tcp \"localhost:18080\"))"),
         "Profile must allow localhost proxy port"
     );
     assert!(
@@ -3860,7 +3860,7 @@ fn profile_allows_all_localhost_when_flag_set() {
         "Profile must still deny general TCP"
     );
     assert!(
-        p.contains("(allow network-outbound (remote ip \"*:443\"))"),
+        p.contains("(allow network-outbound (remote tcp \"*:443\"))"),
         "Profile must still allow port 443"
     );
 }
