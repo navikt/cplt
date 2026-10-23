@@ -1062,7 +1062,7 @@ mod e2e_tests {
 
         assert!(output.status.success());
         assert!(
-            stdout.contains("(allow network-outbound (remote ip \"*:8080\"))"),
+            stdout.contains("(allow network-outbound (remote tcp \"*:8080\"))"),
             "--allow-port 8080 should appear.\nstdout: {stdout}"
         );
     }

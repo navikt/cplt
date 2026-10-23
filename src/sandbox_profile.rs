@@ -3648,8 +3648,8 @@ fn emit_network_rules(
     // blocks all remote TCP, which is the safe failure rather than an open one.
     //
     // `extra_ports` (#297) is gated on the same condition, and for the same
-    // reason. `(remote ip "*:{port}")` is a direct path to ANY remote host on
-    // that port, family-agnostic so it carries UDP too — a channel the proxy
+    // reason. `(remote tcp "*:{port}")` is a direct path to ANY remote host on
+    // that port (TCP only since #815) — a channel the proxy
     // never sees, that `allowed_domains`/`blocked_domains` never filter, and
     // that no cooperating localhost process is needed to reach. Leaving it
     // ungated made the "no residual" claim above false for every user who
@@ -3665,7 +3665,7 @@ fn emit_network_rules(
 
         // Extra ports (e.g., MCP servers, custom services)
         for port in extra_ports {
-            sbpl!(sb, "(allow network-outbound (remote ip \"*:{port}\"))");
+            sbpl!(sb, "(allow network-outbound (remote tcp \"*:{port}\"))");
         }
     }
 
@@ -5054,7 +5054,7 @@ mod tests {
 
     #[test]
     fn extra_ports_are_direct_egress_in_default_mode_only() {
-        // #297: `--allow-port 9999` emits `(remote ip "*:9999")`, a direct path
+        // #297: `--allow-port 9999` emits `(remote tcp "*:9999")`, a direct path
         // to any remote host on that port. Under proxy_forced that path must be
         // gone, or the "no residual" claim on the rule above is false. The same
         // options run both ways, so the assertion can only pass by the gate.
@@ -5066,7 +5066,7 @@ mod tests {
         opts.extra_ports = &ports;
         let default_mode = generate_profile(&opts, &[]);
         assert!(
-            default_mode.contains("(allow network-outbound (remote ip \"*:9999\"))"),
+            default_mode.contains("(allow network-outbound (remote tcp \"*:9999\"))"),
             "default mode must still honour --allow-port"
         );
 

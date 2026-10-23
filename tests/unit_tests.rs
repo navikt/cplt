@@ -3340,7 +3340,7 @@ fn profile_restricts_outbound_tcp() {
         "Profile must allow port 443"
     );
     assert!(
-        !p.contains("(allow network-outbound (remote ip \"*:80\"))"),
+        !p.contains("(allow network-outbound (remote tcp \"*:80\"))"),
         "Profile must NOT allow port 80 by default (HTTPS only)"
     );
     assert!(
@@ -3371,11 +3371,11 @@ fn profile_extra_ports_adds_allows() {
         &[],
     );
     assert!(
-        p.contains("(allow network-outbound (remote ip \"*:8080\"))"),
+        p.contains("(allow network-outbound (remote tcp \"*:8080\"))"),
         "Profile must allow extra port 8080"
     );
     assert!(
-        p.contains("(allow network-outbound (remote ip \"*:3000\"))"),
+        p.contains("(allow network-outbound (remote tcp \"*:3000\"))"),
         "Profile must allow extra port 3000"
     );
     assert!(
