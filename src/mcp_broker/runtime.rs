@@ -14,7 +14,7 @@ use serde_json::Value;
 use super::egress::egress_tunnel;
 use super::policy::{Action, Pending, auth_error, error_line, on_client, on_server};
 use super::spec::Spec;
-use super::{DENIED, KILL_GRACE, MAX_MESSAGE, SPAWNS_PER_MINUTE};
+use super::{CALL_TIMEOUT, DENIED, KILL_GRACE, MAX_MESSAGE, SPAWNS_PER_MINUTE};
 
 /// Where broker lines go: cplt's terminal output and the `--proxy-log` file.
 #[derive(Clone)]
@@ -499,6 +499,32 @@ pub(crate) fn serve(shared: &Shared, stream: UnixStream) {
         })
     };
 
+    // Deadline: once a second, time out requests past CALL_TIMEOUT.
+    let done = Arc::new(AtomicBool::new(false));
+    let ticker = {
+        let (client, stdin, pending, done) = (
+            Arc::clone(&client),
+            Arc::clone(&stdin),
+            Arc::clone(&pending),
+            Arc::clone(&done),
+        );
+        let (log, id) = (shared.log.clone(), spec.id.clone());
+        std::thread::spawn(move || {
+            while !done.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_secs(1));
+                let expired = match pending.lock() {
+                    Ok(mut p) => p.evict(CALL_TIMEOUT),
+                    Err(_) => break,
+                };
+                for (error, cancel) in expired {
+                    log.line(&id, "FAIL request timed out");
+                    write_line(&client, &error);
+                    write_line(&stdin, &cancel);
+                }
+            }
+        })
+    };
+
     // Client → server.
     while let Some(line) = read_line(&mut reader, MAX_MESSAGE) {
         let action = match pending.lock() {
@@ -523,6 +549,7 @@ pub(crate) fn serve(shared: &Shared, stream: UnixStream) {
         }
     }
     // Client gone (or the socket was closed): end the child.
+    done.store(true, Ordering::Release);
     drop(stdin);
     if let Ok(mut slot) = server.child.lock()
         && slot.as_ref().is_some_and(|c| Arc::ptr_eq(c, &child))
@@ -531,6 +558,7 @@ pub(crate) fn serve(shared: &Shared, stream: UnixStream) {
     }
     kill(&child);
     let _ = out.join();
+    let _ = ticker.join();
 }
 
 #[cfg(test)]

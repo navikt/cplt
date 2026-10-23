@@ -377,7 +377,7 @@ mechanism's status probe; no secret is printed.
 | Detection | At launch: load specs, check credential presence; on failure one line with the fix, entry left alone |
 | Spawn | Lazy, on the first socket connection for that id |
 | Concurrency | One child per server per session; in-flight requests capped per child (default 8), excess gets a JSON-RPC error (D13) |
-| Timeouts | Per-call deadline (120 s); idle child stopped after 10 min |
+| Timeouts | Per-call deadline (120 s): the client gets a JSON-RPC timeout error (-32603), the server a `notifications/cancelled`, and a late response is dropped. A client cancel frees the slot the same way. Idle child stopped after 10 min (not yet implemented) |
 | Sessions and restart | The MCP session is tied to the child's lifetime. When the child exits or is replaced (crash, idle stop, auth restart), the broker closes every client socket bound to it. cplt cannot replay `initialize` over stdio, so the shim exits, the client sees the server process end, and it reconnects and re-initializes against a fresh child. Respawn at most 3 per minute, then refuse with a log line. (An HTTP 404 for an unknown `Mcp-Session-Id` applies only to the remote path) |
 | Notifications | Server-initiated messages outside a request (including `notifications/tools/list_changed`) are not delivered (D13) |
 | Shutdown | The broker owns each child explicitly: it keeps the `Child` handle, and on session exit (and on idle stop) sends SIGTERM, waits a short grace, sends SIGKILL, then `wait()`s to reap, as the curl path does (`src/github_mcp.rs:420-421`). It does not rely on the process group: cplt does not kill the session's group (`src/audit.rs:1137-1148`) |

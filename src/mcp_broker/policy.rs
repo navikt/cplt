@@ -1,6 +1,7 @@
 //! Policy on the JSON-RPC stream, one line at a time.
 
 use std::collections::{BTreeSet, HashMap};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -19,9 +20,32 @@ pub enum Action {
     Drop,
 }
 
-/// Requests from the client awaiting a server response: id → method.
+/// Requests from the client awaiting a server response: id → (the id
+/// itself, when it was sent).
 #[derive(Default)]
-pub struct Pending(HashMap<String, String>);
+pub struct Pending(HashMap<String, (Value, Instant)>);
+
+impl Pending {
+    /// Drop requests older than `deadline` (design 5.6). For each, a timeout
+    /// error for the client and a cancel for the server; a late response is
+    /// then dropped as unsolicited.
+    pub fn evict(&mut self, deadline: Duration) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        self.0.retain(|_, (id, sent)| {
+            if sent.elapsed() < deadline {
+                return true;
+            }
+            out.push((
+                error_line(id, -32603, "cplt: request timed out"),
+                json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                       "params": {"requestId": id, "reason": "cplt: timed out"}})
+                .to_string(),
+            ));
+            false
+        });
+        out
+    }
+}
 
 pub(crate) fn error_line(id: &Value, code: i64, message: &str) -> String {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}).to_string()
@@ -67,6 +91,14 @@ pub fn on_client(line: &str, spec: &Spec, pending: &mut Pending) -> Action {
     let Some(id) = obj.get("id") else {
         // Notifications: only the ones a client sends, never a method that
         // policy checks (a server may answer an id-less call anyway).
+        // A cancel frees its slot; the late response is then dropped. One
+        // for an id not in flight has nothing to cancel.
+        if method == "notifications/cancelled" {
+            let req = msg.pointer("/params/requestId").map(Value::to_string);
+            if req.and_then(|r| pending.0.remove(&r)).is_none() {
+                return Action::Drop;
+            }
+        }
         return if CLIENT_NOTIFICATIONS.contains(&method) {
             Action::Forward(msg.to_string())
         } else {
@@ -141,7 +173,9 @@ pub fn on_client(line: &str, spec: &Spec, pending: &mut Pending) -> Action {
             Some(format!("{method} → DENIED in-flight cap")),
         );
     }
-    pending.0.insert(id.to_string(), method.to_string());
+    pending
+        .0
+        .insert(id.to_string(), (id.clone(), Instant::now()));
     // Re-serialized: the server parses exactly what was checked, whatever
     // its JSON parser does with duplicate keys or odd escapes.
     Action::Forward(msg.to_string())
@@ -202,14 +236,14 @@ pub fn on_server(line: &str, spec: &Spec, pending: &mut Pending) -> Action {
             None => Action::Drop,
         };
     }
-    let Some(method) = obj
+    if obj
         .get("id")
         .and_then(|id| pending.0.remove(&id.to_string()))
-    else {
+        .is_none()
+    {
         return Action::Drop;
-    };
+    }
     // Filtered whatever the request was: an id cannot smuggle a tool list.
-    let _ = method;
     if let Some(Value::Array(tools)) = obj.get_mut("result").and_then(|r| r.get_mut("tools")) {
         tools.retain(|t| {
             t.get("name")
@@ -339,6 +373,66 @@ mod tests {
             on_client(r#"{"jsonrpc":"2.0","id":99,"method":"ping"}"#, &s, &mut p),
             Action::Reply(..)
         ));
+    }
+
+    #[test]
+    fn cancelled_calls_free_their_slots() {
+        let s = check(base()).unwrap();
+        let mut p = Pending::default();
+        let call = |i: usize| {
+            json!({"jsonrpc":"2.0","id":i,"method":"tools/call","params":{"name":"get_nais_context","arguments":{}}}).to_string()
+        };
+        for i in 0..MAX_IN_FLIGHT {
+            assert!(matches!(
+                on_client(&call(i), &s, &mut p),
+                Action::Forward(_)
+            ));
+        }
+        assert!(matches!(
+            on_client(&call(99), &s, &mut p),
+            Action::Reply(..)
+        ));
+        for i in 0..MAX_IN_FLIGHT {
+            let c = json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":i}}).to_string();
+            assert!(matches!(on_client(&c, &s, &mut p), Action::Forward(_)));
+        }
+        // A cancel for nothing in flight goes nowhere.
+        let stray =
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":0}}"#;
+        assert_eq!(on_client(stray, &s, &mut p), Action::Drop);
+        assert!(matches!(
+            on_client(&call(99), &s, &mut p),
+            Action::Forward(_)
+        ));
+        // The late response to a cancelled call is dropped.
+        let late = r#"{"jsonrpc":"2.0","id":3,"result":{}}"#;
+        assert_eq!(on_server(late, &s, &mut p), Action::Drop);
+    }
+
+    #[test]
+    fn old_requests_are_evicted_with_a_timeout() {
+        let s = check(base()).unwrap();
+        let mut p = Pending::default();
+        let ping = r#"{"jsonrpc":"2.0","id":"x","method":"ping"}"#;
+        assert!(matches!(on_client(ping, &s, &mut p), Action::Forward(_)));
+        assert!(p.evict(Duration::from_secs(120)).is_empty());
+        let out = p.evict(Duration::ZERO);
+        assert_eq!(out.len(), 1);
+        let err: Value = serde_json::from_str(&out[0].0).unwrap();
+        assert_eq!(err["id"], "x");
+        assert!(
+            err["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("timed out")
+        );
+        let cancel: Value = serde_json::from_str(&out[0].1).unwrap();
+        assert_eq!(cancel["params"]["requestId"], "x");
+        assert_eq!(
+            on_server(r#"{"jsonrpc":"2.0","id":"x","result":{}}"#, &s, &mut p),
+            Action::Drop
+        );
+        assert!(p.0.is_empty());
     }
 
     #[test]
