@@ -19,21 +19,32 @@ use super::{CALL_TIMEOUT, DENIED, KILL_GRACE, MAX_MESSAGE, SPAWNS_PER_MINUTE};
 /// Where broker lines go: cplt's terminal output and the `--proxy-log` file.
 #[derive(Clone)]
 pub struct Log {
+    pub level: crate::proxy::ProxyLogLevel,
     pub file: Option<PathBuf>,
 }
 
+/// DENIED, auth and other failures reach the terminal at every level (D12);
+/// the rest only at `--proxy-log-level all`.
+fn to_terminal(level: crate::proxy::ProxyLogLevel, text: &str) -> bool {
+    text.contains("DENIED")
+        || text.starts_with("FAIL")
+        || text.starts_with("stopped")
+        || level == crate::proxy::ProxyLogLevel::All
+}
+
 impl Log {
-    /// Every line (DENIED, auth, restart budget) reaches the terminal (D12)
-    /// and the log file.
+    /// Every line reaches the log file; see [`to_terminal`] for the terminal.
     pub(crate) fn line(&self, id: &str, text: &str) {
         let id = id.escape_debug().to_string();
         let text = text.escape_debug().to_string();
-        eprintln!(
-            "{}[mcp:{id}]{} {} {text}",
-            crate::ui::color(crate::ui::YELLOW),
-            crate::ui::color(crate::ui::RESET),
-            crate::proxy::chrono_now()
-        );
+        if to_terminal(self.level, &text) {
+            eprintln!(
+                "{}[mcp:{id}]{} {} {text}",
+                crate::ui::color(crate::ui::YELLOW),
+                crate::ui::color(crate::ui::RESET),
+                crate::proxy::chrono_now()
+            );
+        }
         if let Some(path) = &self.file
             && let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
@@ -440,6 +451,7 @@ pub(crate) fn serve(shared: &Shared, stream: UnixStream) {
         spawns.push_back(Instant::now());
         match spawn_child(shared, server) {
             Ok(c) => {
+                shared.log.line(&spec.id, "started");
                 let c = Arc::new(Mutex::new(c));
                 *slot = Some(Arc::clone(&c));
                 c
@@ -622,6 +634,20 @@ mod tests {
     }
 
     #[test]
+    fn failures_reach_the_terminal_at_every_level() {
+        use crate::proxy::ProxyLogLevel::{All, Blocked, None as Silent};
+        for level in [Silent, Blocked, All] {
+            assert!(to_terminal(level, "tools/call → DENIED tool"));
+            assert!(to_terminal(level, "egress → DENIED example.com"));
+            assert!(to_terminal(level, "FAIL not logged in on the host."));
+            assert!(to_terminal(level, "stopped after 3 restarts in a minute"));
+        }
+        assert!(!to_terminal(Silent, "started"));
+        assert!(!to_terminal(Blocked, "started"));
+        assert!(to_terminal(All, "started"));
+    }
+
+    #[test]
     fn kill_terminates_and_never_signals_a_reaped_child() {
         #[allow(clippy::disallowed_methods)]
         let c = Command::new("/bin/sleep").arg("30").spawn().unwrap();
@@ -653,7 +679,15 @@ mod tests {
         let mut spec = check(base()).unwrap();
         spec.command = vec!["cat".into()];
         spec.program = "/bin/cat".into();
-        Broker::start(vec![spec], Path::new("/tmp"), Log { file: None }).unwrap()
+        Broker::start(
+            vec![spec],
+            Path::new("/tmp"),
+            Log {
+                level: crate::proxy::ProxyLogLevel::None,
+                file: None,
+            },
+        )
+        .unwrap()
     }
 
     fn connect(b: &Broker) -> (UnixStream, BufReader<UnixStream>) {
@@ -731,7 +765,15 @@ mod tests {
         }
         spec.command = vec!["sh".into(), "-c".into(), script.into()];
         spec.program = "/bin/sh".into();
-        Broker::start(vec![spec], Path::new("/tmp"), Log { file: None }).unwrap()
+        Broker::start(
+            vec![spec],
+            Path::new("/tmp"),
+            Log {
+                level: crate::proxy::ProxyLogLevel::None,
+                file: None,
+            },
+        )
+        .unwrap()
     }
 
     #[test]

@@ -6739,6 +6739,7 @@ fn assemble_sandbox(
             return None;
         }
         let log = cplt::mcp_broker::Log {
+            level: resolved.proxy_log_level,
             file: resolved.proxy_log_file.clone(),
         };
         cplt::mcp_broker::Broker::start(found.specs, home_dir, log)
