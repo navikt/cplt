@@ -340,11 +340,12 @@ pub(crate) fn spawn_child(shared: &Shared, server: &Server) -> std::io::Result<C
     cmd.spawn()
 }
 
-/// The host child's environment, also the credential probe's on Linux, so
-/// the two never disagree. Cleared, then: HOME, the trusted PATH, TMPDIR,
-/// LANG, and on Linux the session bus (`DBUS_SESSION_BUS_ADDRESS`,
-/// `XDG_RUNTIME_DIR`), which go-keyring needs to reach the Secret Service
-/// on the host. The child runs on the host, not in the sandbox.
+/// The host child's environment, also the credential probe's, so the two
+/// never disagree. Cleared, then: HOME, the trusted PATH, TMPDIR, LANG, and
+/// on Linux the session bus (`DBUS_SESSION_BUS_ADDRESS`, `XDG_RUNTIME_DIR`),
+/// which go-keyring needs to reach the Secret Service on the host, and
+/// `XDG_CONFIG_HOME`/`XDG_DATA_HOME`, where nais (`os.UserConfigDir`) keeps
+/// its login. The child runs on the host, not in the sandbox.
 pub(crate) fn host_env(cmd: &mut Command, home: &Path) {
     cmd.env_clear();
     for (k, v) in host_env_pairs(home, &|k| std::env::var_os(k)) {
@@ -363,7 +364,12 @@ fn host_env_pairs(
     ];
     let mut keep = vec!["LANG"];
     if cfg!(target_os = "linux") {
-        keep.extend(["DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR"]);
+        keep.extend([
+            "DBUS_SESSION_BUS_ADDRESS",
+            "XDG_RUNTIME_DIR",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+        ]);
     }
     env.extend(keep.into_iter().filter_map(|k| get(k).map(|v| (k, v))));
     env
@@ -578,11 +584,16 @@ mod tests {
     use serde_json::Value;
 
     #[test]
-    fn the_host_child_keeps_the_session_bus_on_linux_only() {
+    fn the_host_child_keeps_the_bus_and_xdg_dirs_on_linux_only() {
         let get = |k: &str| {
             matches!(
                 k,
-                "DBUS_SESSION_BUS_ADDRESS" | "XDG_RUNTIME_DIR" | "LANG" | "SECRET"
+                "DBUS_SESSION_BUS_ADDRESS"
+                    | "XDG_RUNTIME_DIR"
+                    | "XDG_CONFIG_HOME"
+                    | "XDG_DATA_HOME"
+                    | "LANG"
+                    | "SECRET"
             )
             .then(|| std::ffi::OsString::from(format!("v-{k}")))
         };
@@ -596,8 +607,18 @@ mod tests {
             !names.contains(&"SECRET"),
             "nothing else from cplt's env: {names:?}"
         );
-        let bus = names.contains(&"DBUS_SESSION_BUS_ADDRESS") && names.contains(&"XDG_RUNTIME_DIR");
-        assert_eq!(bus, cfg!(target_os = "linux"), "{names:?}");
+        for k in [
+            "DBUS_SESSION_BUS_ADDRESS",
+            "XDG_RUNTIME_DIR",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+        ] {
+            assert_eq!(
+                names.contains(&k),
+                cfg!(target_os = "linux"),
+                "{k}: {names:?}"
+            );
+        }
     }
 
     #[test]

@@ -71,9 +71,8 @@ pub fn credential_ok(spec: &Spec) -> Option<bool> {
     let args = spec.credential.probe?;
     #[allow(clippy::disallowed_methods)] // resolved in the trusted dirs at load
     let mut cmd = Command::new(&spec.program);
-    // Linux: the child's own environment (#838), so the probe finds the
-    // Secret Service exactly when the server would. macOS keeps cplt's.
-    #[cfg(target_os = "linux")]
+    // The child's own environment (#838), so the probe finds the login
+    // exactly when the server would.
     if let Some(home) = std::env::var_os("HOME") {
         super::runtime::host_env(&mut cmd, std::path::Path::new(&home));
         cmd.current_dir("/");
