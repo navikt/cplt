@@ -4888,6 +4888,12 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             &found,
             resolved.mcp_broker,
             mcp_refusal.as_deref(),
+            // The clients a launch would point at the broker.
+            match active_agent {
+                agent::Agent::Copilot => &["copilot"],
+                agent::Agent::OpenCode if opencode_v2 => &["opencode"],
+                _ => &[],
+            },
         ));
     }
 

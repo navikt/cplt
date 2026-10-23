@@ -14,6 +14,7 @@ use super::{SCHEMA_VERSIONS, STATUS_VERSION};
 /// `off_reason`: why the broker would be off for this launch (#838).
 /// `project`: the project the writable-tree checks ran against, `None`
 /// outside one (they then ran against an empty project).
+/// `clients`: the clients this launch would point at the broker.
 pub fn status_json(
     found: &Detected,
     project: Option<&Path>,
@@ -21,6 +22,7 @@ pub fn status_json(
     probe: bool,
     supported: bool,
     off_reason: Option<&str>,
+    clients: &[&str],
 ) -> Value {
     let mut servers: Vec<Value> = found
         .specs
@@ -39,16 +41,23 @@ pub fn status_json(
                 "credential_ok": ok,
                 "credential_note": note,
                 "tools_allowed": s.allow.len(),
-                "clients": super::client::WIRED_CLIENTS,
+                "clients": if enabled { clients } else { &[] },
             })
         })
         .collect();
-    servers.extend(
-        found
-            .disabled
-            .iter()
-            .map(|id| json!({"id": id, "state": "off"})),
-    );
+    servers.extend(found.disabled.iter().map(|id| {
+        // Skipped before loading: nothing else is known about it.
+        json!({
+            "id": id,
+            "state": "off",
+            "transport": null,
+            "credential": null,
+            "credential_ok": null,
+            "credential_note": null,
+            "tools_allowed": null,
+            "clients": [],
+        })
+    }));
     json!({
         "version": STATUS_VERSION,
         "schema": SCHEMA_VERSIONS,
@@ -70,6 +79,7 @@ pub fn run_status(
     found: &Detected,
     enabled: bool,
     refusal: Option<&str>,
+    clients: &[&str],
 ) -> ExitCode {
     let supported = refusal.is_none();
     let status = status_json(
@@ -79,6 +89,7 @@ pub fn run_status(
         true,
         supported,
         refusal,
+        clients,
     );
     if as_json {
         println!("{status}");
@@ -100,4 +111,33 @@ pub fn run_status(
         println!("  {}", r.line());
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disabled_rows_carry_every_field() {
+        let found = Detected {
+            disabled: vec!["io.example/x".into()],
+            ..Default::default()
+        };
+        let v = status_json(&found, None, true, false, true, None, &["copilot"]);
+        let row = &v["servers"][0];
+        for k in [
+            "id",
+            "state",
+            "transport",
+            "credential",
+            "credential_ok",
+            "credential_note",
+            "tools_allowed",
+            "clients",
+        ] {
+            assert!(row.get(k).is_some(), "{k} missing: {row}");
+        }
+        assert_eq!(row["state"], "off");
+        assert_eq!(row["clients"], json!([]));
+    }
 }
