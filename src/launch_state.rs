@@ -26,6 +26,46 @@ fn path(home: &Path, project: &Path, topic: &str) -> PathBuf {
     ))
 }
 
+/// Launch-state files untouched this long belong to projects no longer used.
+// ponytail: fixed 90 days, make it configurable if someone needs longer memory.
+const LAUNCH_STATE_MAX_AGE: std::time::Duration = std::time::Duration::from_hours(24 * 90);
+
+/// Delete launch-state files older than [`LAUNCH_STATE_MAX_AGE`]. One
+/// `readdir`, no recursion; only regular files we own, never through a
+/// symlink. Call only after the state dir passed validation.
+pub fn prune(home: &Path) {
+    prune_dir(
+        &crate::sandbox::cplt_state_file(home, "launch"),
+        LAUNCH_STATE_MAX_AGE,
+    );
+}
+
+fn prune_dir(dir: &Path, max_age: std::time::Duration) {
+    use std::os::unix::fs::MetadataExt;
+    if !dir.symlink_metadata().is_ok_and(|m| m.is_dir()) {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(m) = path.symlink_metadata() else {
+            continue;
+        };
+        let old = m
+            .modified()
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age > max_age);
+        // unlink never follows a link, but skip anything not a plain file anyway.
+        if m.file_type().is_file() && m.uid() == unsafe { libc::getuid() } && old {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 /// Open `file` without following a symlink and without blocking on a FIFO,
 /// and refuse anything but a regular file: a planted link or pipe must never
 /// be read or written through.
@@ -49,9 +89,19 @@ fn read(file: &Path) -> Option<String> {
 }
 
 /// True when `content` is what was last recorded for `topic` in this project.
+///
+/// A match bumps the file's mtime, so [`prune`] keeps projects still in use.
 pub fn matches(home: &Path, project: &Path, topic: &str, content: &str) -> bool {
-    read(&path(home, project, topic))
-        .is_some_and(|old| old.lines().next().map(str::trim) == Some(&hex(content.as_bytes())))
+    let Some(mut f) = open_regular(&path(home, project, topic), false) else {
+        return false;
+    };
+    let mut old = String::new();
+    let hit = std::io::Read::read_to_string(&mut f, &mut old).is_ok()
+        && old.lines().next().map(str::trim) == Some(&hex(content.as_bytes()));
+    if hit {
+        let _ = f.set_modified(std::time::SystemTime::now());
+    }
+    hit
 }
 
 /// Record `content` for `topic` in this project.
@@ -202,6 +252,54 @@ impl Confirmation {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    #[test]
+    fn prune_removes_old_files_keeps_fresh_and_link_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("t");
+        std::fs::write(&target, "x").unwrap();
+        let (old, fresh, link) = (
+            dir.path().join("old"),
+            dir.path().join("fresh"),
+            dir.path().join("link"),
+        );
+        std::fs::write(&old, "x").unwrap();
+        std::fs::write(&fresh, "x").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let past = std::time::SystemTime::now() - LAUNCH_STATE_MAX_AGE * 2;
+        for f in [&old, &target] {
+            std::fs::File::options()
+                .write(true)
+                .open(f)
+                .unwrap()
+                .set_modified(past)
+                .unwrap();
+        }
+        prune_dir(dir.path(), LAUNCH_STATE_MAX_AGE);
+        assert!(!old.exists());
+        assert!(fresh.exists());
+        assert!(target.exists() && link.symlink_metadata().is_ok());
+    }
+
+    #[test]
+    fn a_match_keeps_the_file_from_pruning() {
+        crate::with_env_lock_no_xdg(|| {
+            let home = tempfile::tempdir().unwrap();
+            let p = home.path().join("p");
+            record(home.path(), &p, "t", "x");
+            let file = path(home.path(), &p, "t");
+            let past = std::time::SystemTime::now() - LAUNCH_STATE_MAX_AGE * 2;
+            std::fs::File::open(&file)
+                .unwrap()
+                .set_modified(past)
+                .unwrap();
+            assert!(matches(home.path(), &p, "t", "x"));
+            prune(home.path());
+            assert!(file.exists());
+        });
+    }
+
     #[test]
     fn changed_once_then_quiet_per_project_and_topic() {
         crate::with_env_lock_no_xdg(inner);

@@ -745,6 +745,54 @@ fn gc_stale_session_dirs(base: &Path) {
     }
 }
 
+/// Remove directories in `base` whose name passes `name_ok` and whose mtime is
+/// older than `max_age`. Same rules as [`gc_stale_session_dirs`]: no symlinks,
+/// real directories only, owned by us. Best-effort, one `readdir`.
+pub(crate) fn sweep_old_dirs(base: &Path, name_ok: impl Fn(&str) -> bool, max_age: Duration) {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = path.symlink_metadata() else {
+            continue;
+        };
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || metadata.uid() != unsafe { libc::getuid() }
+            || !entry.file_name().to_str().is_some_and(&name_ok)
+        {
+            continue;
+        }
+        let old = metadata
+            .modified()
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age > max_age);
+        if old {
+            if let Ok(dir) = open_dir_nofollow(&path) {
+                let _ = dir.set_permissions(std::fs::Permissions::from_mode(0o700));
+            }
+            let _ = remove_tree(&path);
+        }
+    }
+}
+
+/// Socket dirs left behind by a killed session (Drop never ran).
+#[cfg(target_os = "macos")]
+const SOCKET_STALE_AGE: Duration = Duration::from_hours(24 * 7);
+
+/// Our socket-dir name, and no running session holds its lock: a live
+/// session keeps its dir however old it is.
+#[cfg(target_os = "macos")]
+fn socket_dir_sweepable(root: &Path, name: &str) -> bool {
+    name.strip_prefix(PLAYWRIGHT_SOCKET_DIR_PREFIX)
+        .is_some_and(is_session_id)
+        && session_lock_held(&root.join(name)) != Some(true)
+}
+
 /// Create [`SESSION_MARKER`] in `dir` and hold a shared lock on it. On
 /// failure the marker is removed, so launches never treat the dir as orphaned.
 fn lock_session(dir: &Path) -> Option<std::fs::File> {
@@ -797,6 +845,7 @@ pub struct SessionSocketDir {
     path: PathBuf,
     device: u64,
     inode: u64,
+    _lock: Option<std::fs::File>,
 }
 
 #[cfg(target_os = "macos")]
@@ -815,6 +864,7 @@ impl SessionSocketDir {
         {
             return Err("Playwright socket root is not the expected real directory".to_string());
         }
+        sweep_old_dirs(root, |n| socket_dir_sweepable(root, n), SOCKET_STALE_AGE);
 
         let session_id = generate_session_id()?;
         Self::create_for_session_id(&session_id)
@@ -835,10 +885,12 @@ impl SessionSocketDir {
             }
         };
 
+        let lock = lock_session(&path);
         Ok(Self {
             path,
             device,
             inode,
+            _lock: lock,
         })
     }
 
@@ -874,7 +926,7 @@ pub(crate) fn generate_session_id() -> Result<String, String> {
 }
 
 /// Check if a string looks like one of our session IDs (32-char hex).
-fn is_session_id(name: &str) -> bool {
+pub(crate) fn is_session_id(name: &str) -> bool {
     name.len() == 32 && name.chars().all(|c| c.is_ascii_hexdigit())
 }
 
@@ -1166,6 +1218,85 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    fn age(path: &std::path::Path, by: std::time::Duration) {
+        let t = std::time::SystemTime::now() - by;
+        std::fs::File::open(path).unwrap().set_modified(t).unwrap();
+    }
+
+    /// Set the link's own mtime, not its target's.
+    fn age_link(path: &std::path::Path, by: std::time::Duration) {
+        use std::os::unix::ffi::OsStrExt;
+        let secs = (std::time::SystemTime::now() - by)
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let tv = libc::timeval {
+            tv_sec: secs as libc::time_t,
+            tv_usec: 0,
+        };
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::lutimes(c.as_ptr(), [tv, tv].as_ptr()) }, 0);
+    }
+
+    fn check_sweep(
+        old_name: &str,
+        fresh_name: &str,
+        held_name: Option<&str>,
+        filter: impl Fn(&Path, &str) -> bool,
+        max: Duration,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("keep");
+        std::fs::create_dir(&target).unwrap();
+        let dir = |n: &str| {
+            let d = tmp.path().join(n);
+            std::fs::create_dir(&d).unwrap();
+            d
+        };
+        let (old, fresh, unmatched) = (dir(old_name), dir(fresh_name), dir("not-ours"));
+        std::fs::write(old.join("f"), "x").unwrap();
+        let held = held_name.map(dir);
+        let _lock = held.as_deref().map(lock_session);
+        // A name the filter accepts, so only the no-follow check protects it.
+        let link = tmp.path().join(old_name.replace('a', "b"));
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        for d in [&old, &unmatched, &target].into_iter().chain(held.as_ref()) {
+            age(d, max * 2);
+        }
+        age_link(&link, max * 2);
+        sweep_old_dirs(tmp.path(), |n| filter(tmp.path(), n), max);
+        assert!(!old.exists(), "old dir removed");
+        assert!(fresh.exists(), "fresh dir kept");
+        assert!(unmatched.exists(), "old dir with a foreign name kept");
+        assert!(held.is_none_or(|h| h.exists()), "dir with a held lock kept");
+        assert!(
+            target.exists() && link.symlink_metadata().is_ok(),
+            "link target untouched"
+        );
+    }
+
+    #[test]
+    fn sweep_removes_old_update_staging_dirs() {
+        let id = |c: char| c.to_string().repeat(32);
+        let f = |_: &Path, n: &str| is_session_id(n);
+        check_sweep(&id('a'), &id('c'), None, f, Duration::from_hours(24));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sweep_removes_old_socket_dirs() {
+        let id = |c: char| format!("cplt-pw-{}", c.to_string().repeat(32));
+        check_sweep(
+            &id('a'),
+            &id('c'),
+            Some(&id('d')),
+            socket_dir_sweepable,
+            SOCKET_STALE_AGE,
+        );
+    }
+
     #[test]
     fn the_eacces_chmod_never_follows_a_link() {
         use std::os::unix::fs::PermissionsExt;
@@ -1185,7 +1316,6 @@ mod tests {
         assert_eq!(mode, 0o700);
     }
 
-    use super::*;
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -1829,6 +1959,7 @@ mod tests {
             path: guarded_path.clone(),
             device: metadata.dev(),
             inode: metadata.ino(),
+            _lock: None,
         };
         drop(guard);
 
