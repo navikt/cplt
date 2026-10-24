@@ -661,6 +661,7 @@ impl Config {
             allow_private_domains,
             allow_read,
             allow_write,
+            tool_roots: Vec::new(),
             allow_exec,
             allow_socket,
             deny_paths,

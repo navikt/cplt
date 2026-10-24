@@ -953,6 +953,7 @@ mod tests {
             repo_private_domains: Vec::new(),
             allow_read: Vec::new(),
             allow_write: Vec::new(),
+            tool_roots: Vec::new(),
             allow_exec: Vec::new(),
             allow_socket: Vec::new(),
             deny_paths: Vec::new(),

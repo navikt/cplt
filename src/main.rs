@@ -1858,6 +1858,7 @@ fn merge_tool_path_env_overrides(resolved: &mut config::Resolved, home: &Path) -
             target.push(path);
         }
     }
+    resolved.tool_roots.clone_from(&roots);
     roots
 }
 
@@ -14316,6 +14317,27 @@ mod tests {
     /// before TMPDIR changes keeps every other test's temp dirs where they were.
     fn pin_tempfile_dir() {
         let _ = tempfile::env::override_temp_dir(&std::env::temp_dir());
+    }
+
+    /// A tool root relocated by parent env (`CARGO_HOME`) is part of the
+    /// launch confirmation hash, though it is not in the summary table.
+    #[test]
+    fn cargo_home_changes_the_policy_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let cargo = dir.path().join("cargo");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&cargo).unwrap();
+        let fp = |cargo_home: Option<&Path>| {
+            temp_env::with_var("CARGO_HOME", cargo_home, || {
+                let mut r = config::Config::default()
+                    .merge(config::CliFlags::default())
+                    .unwrap();
+                merge_tool_path_env_overrides(&mut r, &home);
+                r.policy_fingerprint()
+            })
+        };
+        assert_ne!(fp(None), fp(Some(&cargo)));
     }
 
     #[test]

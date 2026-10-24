@@ -994,6 +994,9 @@ pub struct Resolved {
     pub repo_private_domains: Vec<String>,
     pub allow_read: Vec<PathBuf>,
     pub allow_write: Vec<PathBuf>,
+    /// Tool roots relocated by parent env (`CARGO_HOME`, ...), set by the host
+    /// probe. Kept here so the launch confirmation hash covers them.
+    pub tool_roots: Vec<crate::sandbox::ToolRoot>,
     /// Trees the agent may execute binaries from (`allow.exec` / `--allow-exec`).
     /// Read + execute, never write — see `sandbox::validate_exec_grants`.
     pub allow_exec: Vec<PathBuf>,
