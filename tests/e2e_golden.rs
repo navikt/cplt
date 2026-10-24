@@ -691,6 +691,13 @@ fn nested_repo(parent: &Path) -> String {
 /// hole.
 const SKIPPED: &[(&str, &str)] = &[
     (
+        "proxy.inject_github_token",
+        "whether it launches depends on the host's CA setup: an unloadable \
+         `SSL_CERT_FILE` on the runner makes the launch refuse on purpose, \
+         since falling back would hand over the real token. `e2e_projects.rs` \
+         covers the refusals.",
+    ),
+    (
         "git_guard.allow_push",
         "an array of tables, which `config set` has no spelling for at all — it \
          is edited by hand. The refusal is asserted below instead of a launch.",

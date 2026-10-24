@@ -487,6 +487,40 @@ echo SCRATCH_CACHE_CONSUMED_ONCE
         assert!(stderr.contains("the proxy is off"), "{stderr}");
     }
 
+    /// A CA variable denied on the command line refuses the launch too.
+    #[test]
+    fn inject_github_token_refuses_cli_denied_ca_var() {
+        require_sandbox!();
+        let home = home_temp_dir("inject-cli-deny");
+        let project = tempfile::tempdir().unwrap();
+        let out = cplt_cmd()
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join(".config"))
+            .env("XDG_STATE_HOME", home.path().join(".state"))
+            .env("GH_TOKEN", "ghp_e2e_real_token")
+            .current_dir(project.path())
+            .args([
+                "--yes",
+                "--inject-github-token",
+                "--deny-env",
+                "GIT_SSL_CAINFO",
+                "--pass-env",
+                "GH_TOKEN",
+                "--agent",
+                "shell",
+                "--",
+                "-c",
+                "echo TOKEN=$GH_TOKEN",
+            ])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{stdout}\n{stderr}");
+        assert!(!stdout.contains("ghp_e2e_real_token"), "{stdout}");
+        assert!(stderr.contains("deny.env names GIT_SSL_CAINFO"), "{stderr}");
+    }
+
     #[test]
     fn copilot_and_gh_credentials_stay_separate_through_full_launch() {
         use std::os::unix::fs::PermissionsExt;
