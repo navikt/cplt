@@ -2681,6 +2681,7 @@ fn pin_state_out_of_grants(
     home_dir: &Path,
     project_dir: &Path,
     roots: &[PathBuf],
+    tool_dirs: &[sandbox::ResolvedToolDir],
     active_agent: agent::Agent,
 ) {
     let mut trees = vec![project_dir.to_path_buf()];
@@ -2691,7 +2692,7 @@ fn pin_state_out_of_grants(
     let common = discover::git_common_dir(home_dir, project_dir, &resolved.allow_write).0;
     trees.extend(sandbox::home_and_temp_writable_roots(
         home_dir,
-        &[],
+        tool_dirs,
         common.as_deref(),
     ));
     trees.extend(
@@ -4772,13 +4773,6 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     let repo_paths: Vec<PathBuf> = repo_roots.iter().map(|r| r.dir.clone()).collect();
     let repo_git_dirs = sandbox::named_root_git_dirs(&repo_paths);
     let policy_roots = policy_roots(&repo_paths, worktree_root.as_deref());
-    pin_state_out_of_grants(
-        &resolved,
-        &home_dir,
-        &project_dir,
-        &policy_roots,
-        active_agent,
-    );
     // Built once: the brief, the startup summary and `doctor` must not each
     // resolve the identities separately and risk disagreeing.
     let repo_rows = repo_summary_rows(&project_dir, &repo_roots);
@@ -4787,12 +4781,22 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     warn_write_granted_repos(&resolved, &project_dir, &repo_paths);
     warn_repo_under_no_exec_cache(&resolved, &home_dir, &project_dir, &repo_paths);
     warn_inject_token_without_guard(&resolved, active_agent);
-    if !resolved.quiet {
-        warn_unlinked_child_repos(&home_dir, &project_dir, &repo_paths);
-    }
 
     // Probe the host for everything the sandbox profile depends on.
     let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
+    // After the probe, which adds env-relocated tool grants (GOCACHE, ...) to
+    // `resolved`, and before the first state read below.
+    pin_state_out_of_grants(
+        &resolved,
+        &home_dir,
+        &project_dir,
+        &policy_roots,
+        &probe.existing_home_tool_dirs,
+        active_agent,
+    );
+    if !resolved.quiet {
+        warn_unlinked_child_repos(&home_dir, &project_dir, &repo_paths);
+    }
 
     // Resolve the agent binary early so its installation directory
     // can be included in the sandbox profile. Failure is deferred —

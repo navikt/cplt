@@ -580,7 +580,7 @@ fn prepare_locked(
     // Inspect-only callers (`--print-profile`, `cplt mcp status`) never
     // launch, so nothing can forge the state; they report instead.
     if !inspect_only {
-        keep_cplt_state_out_of_grants(config);
+        keep_cplt_state_out_of_grants(config)?;
     }
     // One policy for every check below and the bubblewrap plan, generated on
     // first use: generating can warn, and a warning should print once (#602).
@@ -1195,7 +1195,10 @@ fn validate_exec_grants(config: &SandboxConfig) -> Result<(), String> {
 /// audit scan. When it does, state stays in the legacy `~/.config/cplt`, a
 /// denied dotfile, for this launch. `main` pins this before any state read;
 /// this is the backstop with the fully resolved grants.
-fn keep_cplt_state_out_of_grants(config: &SandboxConfig) {
+///
+/// When the legacy root is exposed too (linked into a granted tree), there is
+/// nowhere safe to keep state, and the launch is refused.
+fn keep_cplt_state_out_of_grants(config: &SandboxConfig) -> Result<(), String> {
     let trees: Vec<PathBuf> = canonical_writable_trees(config)
         .into_iter()
         .map(|(t, _)| t)
@@ -1203,6 +1206,26 @@ fn keep_cplt_state_out_of_grants(config: &SandboxConfig) {
     if let Some((dir, tree)) = policy::pin_legacy_state_dir_if_inside(config.home_dir, &trees) {
         crate::ui::warn(&policy::state_pinned_message(&dir, &tree));
     }
+    let state = policy::cplt_state_dir(config.home_dir);
+    let legacy = config.home_dir.join(CPLT_STATE_DIR);
+    // Only after a pin: without XDG this is the long-standing layout, which
+    // the dotfile-link checks handle.
+    if state == legacy && policy::xdg_state_dir(config.home_dir).is_some() {
+        let resolved = crate::config::canonicalize_deepest(&legacy);
+        if let Some(tree) = trees
+            .iter()
+            .find(|t| resolved != legacy && resolved.starts_with(t))
+        {
+            return Err(format!(
+                "cplt's state directory {} resolves to {}, inside {}, which is writable \
+                 in the sandbox. Move it out of that tree.",
+                legacy.display(),
+                resolved.display(),
+                tree.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// [`writable_trees`] canonicalized, for matching against the canonical paths
@@ -3921,9 +3944,14 @@ fn validate_config_paths(config: &SandboxConfig) -> Result<(), String> {
         }
     }
 
-    // #830: the profile names the state root, which XDG_CONFIG_HOME can set;
-    // `policy::xdg_state_dir` only returns a path, named and resolved, that
-    // passes `validate_sbpl_path`, so there is nothing left to refuse here.
+    // #830: the profile names the state root. An unusable XDG one falls back
+    // to the legacy root (`policy::xdg_state_dir`); the root in use, and its
+    // resolved target, must still be nameable, or a link out of
+    // `~/.config/cplt` would drop its deny.
+    let state = policy::cplt_state_dir(config.home_dir);
+    for p in [state.clone(), crate::config::canonicalize_deepest(&state)] {
+        policy::validate_sbpl_path(&p).map_err(|e| format!("cplt state dir: {e}"))?;
+    }
     Ok(())
 }
 
@@ -5920,6 +5948,24 @@ mod tests {
 
     /// #830: XDG_CONFIG_HOME is interpolated into the profile, so one with an
     /// SBPL payload is ignored and state stays in `~/.config/cplt`.
+    /// #830 review: with XDG unset, a legacy `~/.config/cplt` linked to an
+    /// unsafe target is still refused, as before: its deny would be dropped.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn legacy_state_root_linked_to_an_unsafe_target_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let bad = root.join("cp)lt");
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::create_dir_all(root.join(".config")).unwrap();
+        std::os::unix::fs::symlink(&bad, root.join(CPLT_STATE_DIR)).unwrap();
+        let config = test_config(&root, &[]);
+        let error = temp_env::with_var_unset("XDG_CONFIG_HOME", || {
+            validate_config_paths(&config).expect_err("must be refused")
+        });
+        assert!(error.contains("cp)lt"), "{error}");
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn sbpl_injection_via_xdg_config_home_falls_back() {
