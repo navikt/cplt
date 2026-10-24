@@ -275,7 +275,7 @@ measures what nais calls.)
 | `v` | int | Extension version | Unknown major: spec rejected |
 | `credential` | string | Name in cplt's mechanism table (D3): `gh-token`, `nais-keychain`, `none` | Must exist in the table; the mechanism fixes what the command or upstream may be |
 | `command` | string[] | Host binary and args (kind C, when no `packages[]` fits) | First element resolved in trusted dirs only; must match the mechanism's allowed command |
-| `egressHosts` | string[] | Hosts the child may reach via the CONNECT proxy | Bare public hostnames; same validation as #1272 profiles; a host on cplt's built-in blocked-domains list is refused |
+| `egressHosts` | string[] | Hosts the child may reach via the CONNECT proxy | Bare public hostnames; same validation as #1272 profiles; a host on cplt's built-in blocked-domains list is refused (only the built-in list, not a user blocklist) |
 | `tools.allow` | string[] | Tools the user consented to | Any tool not listed is refused; `host-exec` class in `classes` is refused at load |
 | `tools.classes` | map | Risk class per tool (`write`, `external`, `host-exec`; absent = read) | A `write`/`external` tool in `allow` needs `writeConsent: true` |
 | `writeConsent` | bool | Set by `enable --tools` | Default false |

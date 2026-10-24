@@ -325,7 +325,8 @@ pub(crate) fn looks_like_secret(s: &str) -> bool {
             .any(|p| lower.starts_with(p) && s.len() > p.len())
 }
 
-/// A bare public hostname: no scheme, port, IP literal, wildcard or
+/// A bare public hostname not on the built-in blocklist (only that list:
+/// a user blocklist is not consulted): no scheme, port, IP literal, wildcard or
 /// localhost.
 pub(crate) fn check_host(host: &str) -> Result<(), String> {
     let bad = || {

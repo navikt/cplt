@@ -2237,6 +2237,8 @@ fn risky_config_keys(text: &str) -> Option<Vec<String>> {
                     .iter()
                     .any(|p| key.starts_with(p))
             }
+            // protocol.allow / protocol.<name>.allow can enable ext::.
+            "allow" if key.starts_with("protocol.") => value != "never",
             // A shell alias runs on `git <alias>`.
             _ if key.starts_with("alias.") => value.trim_start().starts_with('!'),
             _ => {
@@ -2259,6 +2261,10 @@ fn risky_config_keys(text: &str) -> Option<Vec<String>> {
                         "receivepack",
                         // sendemail.smtpServer may name a program
                         "smtpserver",
+                        // interactive.diffFilter runs a program
+                        "difffilter",
+                        // init.templateDir copies hooks into new repos
+                        "templatedir",
                         "pager",
                         "editor",
                         "askpass",
@@ -4347,6 +4353,17 @@ mod tests {
                     [credential]\n\thelper = x\n[alias]\n\tx = !sh\n\tst = status\n\
                     [mergetool \"t\"]\n\tpath = /tmp/x\n[web]\n\tbrowser = b\n";
         assert_eq!(keys(exec).len(), 17, "{:?}", keys(exec));
+        assert_eq!(
+            keys("[interactive]\n\tdiffFilter = x\n[init]\n\ttemplateDir = /t\n"),
+            ["interactive.difffilter", "init.templatedir"]
+        );
+        assert_eq!(
+            keys(
+                "[protocol]\n\tallow = always\n[protocol \"ext\"]\n\tallow = user\n\
+                  [protocol \"file\"]\n\tallow = never\n"
+            ),
+            ["protocol.allow", "protocol.ext.allow"]
+        );
     }
 
     #[test]
