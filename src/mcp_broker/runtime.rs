@@ -334,7 +334,7 @@ pub(crate) fn spawn_child(shared: &Shared, server: &Server) -> std::io::Result<C
     #[allow(clippy::disallowed_methods)] // resolved in the trusted dirs at load
     let mut cmd = Command::new(&spec.program);
     cmd.args(&spec.command[1..]);
-    host_env(&mut cmd, &shared.home);
+    host_env(&mut cmd, &shared.home, spec.credential.keychain);
     cmd.env("HTTPS_PROXY", &proxy)
         .env("HTTP_PROXY", &proxy)
         .env("https_proxy", &proxy)
@@ -353,19 +353,21 @@ pub(crate) fn spawn_child(shared: &Shared, server: &Server) -> std::io::Result<C
 
 /// The host child's environment, also the credential probe's, so the two
 /// never disagree. Cleared, then: HOME, the trusted PATH, TMPDIR, LANG, and
-/// on Linux the session bus (`DBUS_SESSION_BUS_ADDRESS`, `XDG_RUNTIME_DIR`),
-/// which go-keyring needs to reach the Secret Service on the host, and
+/// on Linux, for a `keychain` mechanism only, the session bus
+/// (`DBUS_SESSION_BUS_ADDRESS`, `XDG_RUNTIME_DIR`), which go-keyring needs
+/// to reach the Secret Service on the host, and
 /// `XDG_CONFIG_HOME`/`XDG_DATA_HOME`, where nais (`os.UserConfigDir`) keeps
 /// its login. The child runs on the host, not in the sandbox.
-pub(crate) fn host_env(cmd: &mut Command, home: &Path) {
+pub(crate) fn host_env(cmd: &mut Command, home: &Path, keychain: bool) {
     cmd.env_clear();
-    for (k, v) in host_env_pairs(home, &|k| std::env::var_os(k)) {
+    for (k, v) in host_env_pairs(home, keychain, &|k| std::env::var_os(k)) {
         cmd.env(k, v);
     }
 }
 
 fn host_env_pairs(
     home: &Path,
+    keychain: bool,
     get: &dyn Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Vec<(&'static str, std::ffi::OsString)> {
     let mut env = vec![
@@ -375,12 +377,10 @@ fn host_env_pairs(
     ];
     let mut keep = vec!["LANG"];
     if cfg!(target_os = "linux") {
-        keep.extend([
-            "DBUS_SESSION_BUS_ADDRESS",
-            "XDG_RUNTIME_DIR",
-            "XDG_CONFIG_HOME",
-            "XDG_DATA_HOME",
-        ]);
+        keep.extend(["XDG_CONFIG_HOME", "XDG_DATA_HOME"]);
+        if keychain {
+            keep.extend(["DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR"]);
+        }
     }
     env.extend(keep.into_iter().filter_map(|k| get(k).map(|v| (k, v))));
     env
@@ -624,7 +624,7 @@ mod tests {
             )
             .then(|| std::ffi::OsString::from(format!("v-{k}")))
         };
-        let env = host_env_pairs(Path::new("/home/u"), &get);
+        let env = host_env_pairs(Path::new("/home/u"), true, &get);
         let names: Vec<&str> = env.iter().map(|(k, _)| *k).collect();
         assert!(
             names.contains(&"HOME") && names.contains(&"LANG"),
@@ -646,6 +646,14 @@ mod tests {
                 "{k}: {names:?}"
             );
         }
+        // The session bus only for a mechanism that reads the keychain.
+        let bare = host_env_pairs(Path::new("/home/u"), false, &get);
+        assert!(
+            !bare
+                .iter()
+                .any(|(k, _)| matches!(*k, "DBUS_SESSION_BUS_ADDRESS" | "XDG_RUNTIME_DIR")),
+            "{bare:?}"
+        );
     }
 
     #[test]

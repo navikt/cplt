@@ -325,7 +325,8 @@ pub(crate) fn looks_like_secret(s: &str) -> bool {
             .any(|p| lower.starts_with(p) && s.len() > p.len())
 }
 
-/// A bare public hostname: no scheme, port, IP literal, wildcard or
+/// A bare public hostname not on the built-in blocklist (only that list:
+/// a user blocklist is not consulted): no scheme, port, IP literal, wildcard or
 /// localhost.
 pub(crate) fn check_host(host: &str) -> Result<(), String> {
     let bad = || {
@@ -350,6 +351,12 @@ pub(crate) fn check_host(host: &str) -> Result<(), String> {
         })
     {
         return bad();
+    }
+    // The proxy refuses these for the agent; a spec does not get them back.
+    if crate::proxy::is_blocked_in_list(host, &crate::proxy::builtin_blocklist()) {
+        return Err(format!(
+            "egressHosts entry {host} is on cplt's blocked-domains list"
+        ));
     }
     Ok(())
 }
@@ -656,6 +663,14 @@ mod tests {
         drop_writable(&mut found, |p| (p == f).then(|| PathBuf::from("/grant")));
         assert!(found.specs.is_empty());
         assert!(found.rejected[0].reason.contains("/grant"));
+    }
+
+    #[test]
+    fn a_blocked_egress_host_is_refused() {
+        assert!(check_host("console.nav.cloud.nais.io").is_ok());
+        for h in ["webhook.site", "x.webhook.site"] {
+            assert!(check_host(h).unwrap_err().contains("blocked"), "{h}");
+        }
     }
 
     #[test]

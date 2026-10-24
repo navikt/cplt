@@ -623,7 +623,9 @@ pub fn opencode_launch_config_grants(home: &Path, launch_dir: &Path) -> Vec<Agen
     } else {
         "/etc/opencode"
     };
-    opencode_extra_config_grants(Path::new(system), launch_dir, home, &[])
+    opencode_extra_config_grants(Path::new(system), launch_dir, home, &[], unsafe {
+        libc::getuid()
+    })
 }
 
 /// See [`opencode_launch_config_grants`]; `cwd` is OpenCode's launch dir.
@@ -632,12 +634,21 @@ fn opencode_extra_config_grants(
     cwd: &Path,
     home: &Path,
     writable: &[PathBuf],
+    uid: u32,
 ) -> Vec<AgentDir> {
+    use std::os::unix::fs::MetadataExt as _;
     let mut out = vec![];
     let mut paths = vec![system.to_path_buf()];
     for dir in
         std::iter::once(system.to_path_buf()).chain(cwd.ancestors().map(|a| a.join(".opencode")))
     {
+        // An ancestor `.opencode` another user owns (a shared `/tmp`, a
+        // group dir) is theirs to plant in: skip it. Root's is trusted.
+        if dir != system
+            && std::fs::symlink_metadata(&dir).is_ok_and(|m| m.uid() != uid && m.uid() != 0)
+        {
+            continue;
+        }
         if dir != system {
             paths.extend(
                 ["plugin", "plugins", "opencode.json", "opencode.jsonc"].map(|n| dir.join(n)),
@@ -3996,6 +4007,10 @@ mod tests {
         assert!(dirs.iter().all(|d| !d.path.starts_with(&ext)), "{dirs:?}");
     }
 
+    fn me() -> u32 {
+        unsafe { libc::getuid() }
+    }
+
     #[test]
     fn opencode_extra_config_grants_system_and_parent_walk() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4016,7 +4031,7 @@ mod tests {
         std::fs::write(home.join(".opencode/secret"), "x").unwrap();
         // A `plugins` link into a credential dir is refused.
         std::os::unix::fs::symlink(home.join(".ssh"), home.join("a/.opencode/plugins")).unwrap();
-        let got = opencode_extra_config_grants(&sys, &proj.join("sub"), &home, &[]);
+        let got = opencode_extra_config_grants(&sys, &proj.join("sub"), &home, &[], me());
         let paths: Vec<_> = got.iter().map(|d| d.path.clone()).collect();
         assert_eq!(
             paths,
@@ -4038,7 +4053,7 @@ mod tests {
         assert!(dirs.iter().all(|d| !d.path.starts_with(&proj)), "{dirs:?}");
         assert_eq!(dirs.len(), 4);
         // A missing system dir grants nothing.
-        let got = opencode_extra_config_grants(&home.join("none"), &home, &home, &[]);
+        let got = opencode_extra_config_grants(&home.join("none"), &home, &home, &[], me());
         assert_eq!(got.len(), 2);
         // The walk starts at the launch dir passed in, not cplt's cwd.
         let got = opencode_launch_config_grants(&home, &proj.join("sub"));
@@ -4046,6 +4061,21 @@ mod tests {
             got.iter()
                 .any(|d| d.path == home.join("a/.opencode/plugin"))
         );
+    }
+
+    #[test]
+    fn opencode_extra_config_grants_skip_ancestors_owned_by_others() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(home.join(".opencode/plugin")).unwrap();
+        let none = home.join("none");
+        let me = unsafe { libc::getuid() };
+        assert!(!opencode_extra_config_grants(&none, &home, &home, &[], me).is_empty());
+        if me != 0 {
+            // As another user, an ancestor `.opencode` owned by us is foreign.
+            let got = opencode_extra_config_grants(&none, &home, &home, &[], me + 1);
+            assert!(got.is_empty(), "{got:?}");
+        }
     }
 
     #[test]
@@ -4061,7 +4091,7 @@ mod tests {
             home.join(".opencode/opencode.json"),
         )
         .unwrap();
-        let got = opencode_extra_config_grants(&home.join("none"), &home, &home, &[]);
+        let got = opencode_extra_config_grants(&home.join("none"), &home, &home, &[], me());
         assert!(got.is_empty(), "{got:?}");
     }
 
@@ -4081,7 +4111,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let got = opencode_extra_config_grants(&home.join("none"), &home, &home, &[]);
+        let got = opencode_extra_config_grants(&home.join("none"), &home, &home, &[], me());
         assert!(
             got.iter().any(|d| d.path == mcp && d.process_exec),
             "{got:?}"

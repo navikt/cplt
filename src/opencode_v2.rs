@@ -163,7 +163,10 @@ pub fn prepare(scratch: &Path, home: &Path, launch_dir: &Path) -> Result<Session
     // history file its link points to is, once `carry_in_state` made it.
     let history = state_base.join("opencode/prompt-history.jsonl");
     let mut writes = Vec::new();
-    if std::fs::symlink_metadata(&history).is_ok_and(|m| m.is_file()) {
+    // Like `grant_file`: one link, ours.
+    if std::fs::symlink_metadata(&history)
+        .is_ok_and(|m| m.is_file() && m.nlink() == 1 && m.uid() == unsafe { libc::getuid() })
+    {
         writes.push(crate::config::canonicalize_deepest(&history));
         // Seatbelt matches the spelled path too; a Landlock rule is opened
         // without following links, so it takes the resolved path only.
@@ -1437,6 +1440,32 @@ mod tests {
             let lit = format!("(literal \"{}\")", p.display());
             assert!(s.sbpl_before_denies.contains(&lit), "{lit}");
         }
+    }
+
+    /// A hard-linked history file is never granted, like `grant_file`.
+    #[test]
+    fn history_grant_refuses_a_hard_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state/opencode");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(tmp.path().join("other"), "x").unwrap();
+        let history = state.join("prompt-history.jsonl");
+        std::fs::hard_link(tmp.path().join("other"), &history).unwrap();
+        let scratch = tmp.path().join("scratch");
+        let s = temp_env::with_vars(
+            [
+                ("XDG_CONFIG_HOME", None::<&str>),
+                (
+                    "XDG_STATE_HOME",
+                    Some(tmp.path().join("state").to_str().unwrap()),
+                ),
+            ],
+            || prepare(&scratch, tmp.path(), &tmp.path().join("src/repo")).unwrap(),
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert!(s.writes.is_empty(), "{:?}", s.writes);
+        #[cfg(target_os = "macos")]
+        assert!(!s.sbpl_before_denies.contains("prompt-history.jsonl"));
     }
 
     /// #793: `model.json` comes in, goes back out only when changed and valid,

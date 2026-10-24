@@ -275,7 +275,7 @@ measures what nais calls.)
 | `v` | int | Extension version | Unknown major: spec rejected |
 | `credential` | string | Name in cplt's mechanism table (D3): `gh-token`, `nais-keychain`, `none` | Must exist in the table; the mechanism fixes what the command or upstream may be |
 | `command` | string[] | Host binary and args (kind C, when no `packages[]` fits) | First element resolved in trusted dirs only; must match the mechanism's allowed command |
-| `egressHosts` | string[] | Hosts the child may reach via the CONNECT proxy | Bare public hostnames; same validation as #1272 profiles |
+| `egressHosts` | string[] | Hosts the child may reach via the CONNECT proxy | Bare public hostnames; same validation as #1272 profiles; a host on cplt's built-in blocked-domains list is refused (only the built-in list, not a user blocklist) |
 | `tools.allow` | string[] | Tools the user consented to | Any tool not listed is refused; `host-exec` class in `classes` is refused at load |
 | `tools.classes` | map | Risk class per tool (`write`, `external`, `host-exec`; absent = read) | A `write`/`external` tool in `allow` needs `writeConsent: true` |
 | `writeConsent` | bool | Set by `enable --tools` | Default false |
@@ -390,6 +390,11 @@ mechanism's status probe; no secret is printed.
 - **Egress:** the proxy allows the child only `egressHosts`. Phase 1 uses
   a separate policy for the child's proxy connections **(open: one proxy
   with per-client policy, or a second listener)**.
+  This control is **advisory**: the child is unsandboxed and only gets
+  `HTTPS_PROXY`. A child that ignores the variable, or opens its own
+  sockets, reaches any host directly. It keeps a cooperating server on its
+  hosts; it does not contain a hostile one. That needs the child profile
+  below.
 - **Files:** unrestricted in phase 1. A child profile comes later: read its
   binary; read and **write** its config dir (refresh rewrites
   `nais-credentials.json.enc`) and the keyring (refresh replaces the
@@ -522,7 +527,7 @@ Attacker: the sandboxed agent or content steering it.
 | Spec asks for something dangerous (arbitrary command, secret in a header, host-exec tool) | Invariants at load (5.3); command must match the credential mechanism |
 | Agent connects to the socket | Intended; it can only pick a declared id |
 | Secret path leaks (remote kind) | Per-session, loopback, never logged; 128-bit, constant-time compare (`src/github_mcp.rs:208-220`) |
-| SSRF | Remote: pinned upstream, no redirects, https only (`src/github_mcp.rs:34`, `:377-391`). Child: egress pinned to `egressHosts` via the proxy |
+| SSRF | Remote: pinned upstream, no redirects, https only (`src/github_mcp.rs:34`, `:377-391`). Child: egress pinned to `egressHosts` via the proxy, advisory only (5.7) |
 | Host-exec through the child | Phase 1 residual: unsandboxed child. Env cleared, egress pinned, read-only tools; file profile later |
 | Agent reads the credential directly (Linux) | Without active bubblewrap, Secret Service is reachable over D-Bus (SECURITY.md:1589-1606); see section 7 |
 | Header injection | Control bytes refused, auth and `X-MCP-*` stripped (`src/github_mcp.rs:225-250`) |

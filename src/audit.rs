@@ -1766,6 +1766,10 @@ pub struct SnapshotStores {
     loaded: std::cell::RefCell<std::collections::HashMap<PathBuf, String>>,
 }
 
+/// First line of the clean-verdict cache. Bump the number whenever
+/// `risky_config_keys` or the hook checks change what counts as clean.
+const CLEAN_CACHE_HEADER: &str = "cplt-clean-cache 2\n";
+
 /// One entry below the snapshot root: a store, or something where a store
 /// would be.
 struct StoreEntry {
@@ -1787,9 +1791,12 @@ impl SnapshotStores {
     ) -> Self {
         // Missing or unreadable: everything is parsed again. A line that does
         // not parse is just not a cache hit.
+        // A cache from another classifier policy (or from before the header)
+        // is dropped whole: its clean verdicts used older rules.
         let cache: std::collections::HashMap<PathBuf, String> = cache_file
             .as_deref()
             .and_then(|f| std::fs::read_to_string(f).ok())
+            .and_then(|b| Some(b.strip_prefix(CLEAN_CACHE_HEADER)?.to_string()))
             .unwrap_or_default()
             .lines()
             .filter_map(|l| {
@@ -1829,7 +1836,7 @@ impl SnapshotStores {
         if *self.seen.borrow() == *self.loaded.borrow() {
             return;
         }
-        let mut body = String::new();
+        let mut body = String::from(CLEAN_CACHE_HEADER);
         for (p, k) in self.seen.borrow().iter() {
             // A name with a tab or newline is just never cached.
             if let Some(p) = p.to_str().filter(|p| !p.contains(['\t', '\n'])) {
@@ -2239,12 +2246,43 @@ fn risky_config_keys(text: &str) -> Option<Vec<String>> {
             "fsmonitor" => !matches!(value, "false" | "no" | "off" | "0"),
             // OpenCode's own include of its settings file, exactly.
             "path" if key == "include.path" => value != "opencode.gitconfig",
+            // The program a browser, man viewer or diff/merge tool runs.
+            // Other `*.path` keys fall through to the general rules.
+            "path"
+                if ["browser.", "man.", "difftool.", "mergetool."]
+                    .iter()
+                    .any(|p| key.starts_with(p)) =>
+            {
+                true
+            }
+            // protocol.allow / protocol.<name>.allow can enable ext::.
+            "allow" if key.starts_with("protocol.") => value != "never",
+            // A shell alias runs on `git <alias>`.
+            _ if key.starts_with("alias.") => value.trim_start().starts_with('!'),
             _ => {
                 key.starts_with("includeif.")
                     || key.starts_with("pager.")
                     || last.ends_with("command")
+                    // uploadpack.packObjectsHook, core.hooksPath and kin.
+                    || last.ends_with("hook")
+                    || last.ends_with("hooks")
+                    || last.ends_with("hookspath")
                     || [
-                        "hookspath",
+                        // gpg.program, gpg.<format>.program
+                        "program",
+                        // merge.<driver>.driver
+                        "driver",
+                        // mergetool/difftool/man.<tool>.cmd
+                        "cmd",
+                        // remote.<name>.uploadpack, .receivepack
+                        "uploadpack",
+                        "receivepack",
+                        // sendemail.smtpServer may name a program
+                        "smtpserver",
+                        // interactive.diffFilter runs a program
+                        "difffilter",
+                        // init.templateDir copies hooks into new repos
+                        "templatedir",
                         "pager",
                         "editor",
                         "askpass",
@@ -4322,6 +4360,28 @@ mod tests {
             keys("[core]\n\tsshCommand = x\n[includeIf \"gitdir:/\"]\n\tpath = /x\n"),
             ["core.sshcommand", "includeif.gitdir:/.path"]
         );
+        // Every key below makes git run a program.
+        let exec = "[commit]\n\tgpgsign = true\n[gpg]\n\tprogram = /tmp/x\n\
+                    [gpg \"ssh\"]\n\tprogram = /tmp/x\n[merge \"m\"]\n\tdriver = /tmp/x\n\
+                    [uploadpack]\n\tpackObjectsHook = /tmp/x\n[mergetool \"t\"]\n\tcmd = /tmp/x\n\
+                    [remote \"o\"]\n\tuploadpack = /tmp/x\n\treceivepack = /tmp/x\n\
+                    [sendemail]\n\tsmtpServer = /tmp/x\n[core]\n\thooksPath = /tmp\n\
+                    \tfsmonitor = /tmp/x\n[diff \"d\"]\n\ttextconv = /tmp/x\n\
+                    [filter \"f\"]\n\tclean = x\n\tsmudge = x\n\tprocess = x\n\
+                    [credential]\n\thelper = x\n[alias]\n\tx = !sh\n\tst = status\n\
+                    [mergetool \"t\"]\n\tpath = /tmp/x\n[web]\n\tbrowser = b\n";
+        assert_eq!(keys(exec).len(), 17, "{:?}", keys(exec));
+        assert_eq!(
+            keys("[interactive]\n\tdiffFilter = x\n[init]\n\ttemplateDir = /t\n"),
+            ["interactive.difffilter", "init.templatedir"]
+        );
+        assert_eq!(
+            keys(
+                "[protocol]\n\tallow = always\n[protocol \"ext\"]\n\tallow = user\n\
+                  [protocol \"file\"]\n\tallow = never\n"
+            ),
+            ["protocol.allow", "protocol.ext.allow"]
+        );
     }
 
     #[test]
@@ -4352,7 +4412,7 @@ mod tests {
         };
         cap_cached();
         let body = std::fs::read_to_string(&cache).unwrap();
-        assert_eq!(body.lines().count(), 2, "{body}");
+        assert_eq!(body.lines().count(), 3, "{body}");
         // Same size, same mtime: only the ctime and content differ.
         let cfg = s.join("config");
         let old = std::fs::metadata(&cfg).unwrap();
@@ -4365,6 +4425,42 @@ mod tests {
         drop(f);
         cap_cached();
         assert!(!s.exists(), "the plant must be parsed and quarantined");
+    }
+
+    #[test]
+    fn a_legacy_cache_is_not_trusted_after_a_rule_change() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let cache = state.path().join("clean");
+        let s = root.path().join("p/s");
+        opencode_store(&s);
+        let cfg = s.join("config");
+        append(&cfg, "[gpg]\n\tprogram = /x\n");
+        // An old cplt cached this inode clean, in the old headerless format.
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::symlink_metadata(&cfg).unwrap();
+        let lkey = format!(
+            "{} {} {} {}.{} {}.{}",
+            m.dev(),
+            m.ino(),
+            m.size(),
+            m.mtime(),
+            m.mtime_nsec(),
+            m.ctime(),
+            m.ctime_nsec()
+        );
+        std::fs::write(&cache, format!("{lkey}\t{}\n", cfg.display())).unwrap();
+        SnapshotStores::capture_with(root.path().to_path_buf(), Some(vec![]), Some(cache.clone()));
+        assert!(!s.exists(), "a stale clean verdict must not hide the plant");
+    }
+
+    #[test]
+    fn other_path_keys_fall_through() {
+        let keys = |t: &str| crate::with_env_lock_no_xdg(|| risky_config_keys(t)).unwrap();
+        assert_eq!(
+            keys("[alias]\n\tpath = !sh\n[pager]\n\tpath = x\n[core]\n\tpath = x\n"),
+            ["alias.path", "pager.path"]
+        );
     }
 
     #[test]
