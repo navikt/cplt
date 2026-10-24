@@ -185,6 +185,19 @@ pub fn fake_agent(name: &str, body: &str) -> tempfile::TempDir {
     dir
 }
 
+/// The opt-in to the real `HOME`, for tests that need what lives there (real
+/// toolchains, paths under the checkout's HOME). `XDG_CONFIG_HOME` is the
+/// cplt state root, so pointing it at [`scratch_home`] keeps launch state
+/// out of the real `~/.config/cplt`.
+///
+/// The launch dir is created up front: cplt falls back to the legacy
+/// `~/.config/cplt/launch` while the new one does not exist yet.
+pub fn with_real_home(cmd: &mut Command) {
+    let xdg = scratch_home().join(".config");
+    std::fs::create_dir_all(xdg.join("cplt/launch")).expect("scratch launch dir");
+    cmd.env("HOME", real_home()).env("XDG_CONFIG_HOME", xdg);
+}
+
 /// A cplt PATH shim (#514) run directly, isolated the way [`cplt_cmd`] is: the
 /// shim execs `cplt`, which then reads no ambient config unless the test
 /// points `CPLT_CONFIG` somewhere itself. The environment is cleared, so the

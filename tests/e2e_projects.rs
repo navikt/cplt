@@ -27,7 +27,16 @@ mod project_tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
-    use crate::common::{cplt_cmd, git_cmd, home_temp_dir};
+    use crate::common::{git_cmd, home_temp_dir};
+
+    /// These tests drive real toolchains (Go, Gradle, .NET, Maven caches)
+    /// that live under the real HOME, so they run with it, and with cplt's
+    /// state moved to the scratch HOME so no launch state lands in it.
+    fn cplt_cmd() -> std::process::Command {
+        let mut cmd = crate::common::cplt_cmd();
+        crate::common::with_real_home(&mut cmd);
+        cmd
+    }
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static PROJECT_COUNTER: AtomicU32 = AtomicU32::new(0);
