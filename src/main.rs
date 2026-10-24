@@ -2671,6 +2671,47 @@ fn unlinked_child_repos(project_dir: &Path, named_roots: &[PathBuf]) -> Vec<Path
     out
 }
 
+/// #830: keep cplt's state in `~/.config/cplt` for this launch when
+/// `$XDG_CONFIG_HOME/cplt` lies inside a tree the sandbox will grant. Runs
+/// before any state is read (`launch_state`, the snapshot marker), so a file
+/// the agent planted there in an earlier session is never trusted.
+/// `sandbox::prepare` repeats the check with the fully resolved grants.
+fn pin_state_out_of_grants(
+    resolved: &config::Resolved,
+    home_dir: &Path,
+    project_dir: &Path,
+    roots: &[PathBuf],
+    tool_dirs: &[sandbox::ResolvedToolDir],
+    active_agent: agent::Agent,
+) {
+    let mut trees = vec![project_dir.to_path_buf()];
+    trees.extend(roots.iter().cloned());
+    trees.extend(resolved.allow_read.iter().cloned());
+    trees.extend(resolved.allow_write.iter().cloned());
+    // Temp dirs and the git common dir are writable with no grant behind them.
+    let common = discover::git_common_dir(home_dir, project_dir, &resolved.allow_write).0;
+    trees.extend(sandbox::home_and_temp_writable_roots(
+        home_dir,
+        tool_dirs,
+        common.as_deref(),
+    ));
+    trees.extend(
+        sandbox::HOME_TOOL_DIRS
+            .iter()
+            .filter(|d| d.write)
+            .map(|d| home_dir.join(d.path)),
+    );
+    for dir in resolved.agent_config_dirs(active_agent, home_dir) {
+        trees.extend(dir.write_files.iter().map(|f| dir.path.join(f)));
+        if dir.write {
+            trees.push(dir.path);
+        }
+    }
+    if let Some((dir, tree)) = sandbox::pin_legacy_state_dir_if_inside(home_dir, &trees) {
+        ui::warn(&sandbox::state_pinned_message(&dir, &tree));
+    }
+}
+
 /// Sanitize text for terminal display so an untrusted directory name or path
 /// cannot inject control characters or ANSI sequences.
 fn sanitize_terminal_text(s: &str) -> String {
@@ -4781,12 +4822,22 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         warn_repo_under_no_exec_cache(&resolved, &home_dir, &project_dir, &repo_paths);
     }
     warn_inject_token_without_guard(&resolved, active_agent);
-    if !resolved.quiet {
-        warn_unlinked_child_repos(&home_dir, &project_dir, &repo_paths);
-    }
 
     // Probe the host for everything the sandbox profile depends on.
     let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
+    // After the probe, which adds env-relocated tool grants (GOCACHE, ...) to
+    // `resolved`, and before the first state read below.
+    pin_state_out_of_grants(
+        &resolved,
+        &home_dir,
+        &project_dir,
+        &policy_roots,
+        &probe.existing_home_tool_dirs,
+        active_agent,
+    );
+    if !resolved.quiet {
+        warn_unlinked_child_repos(&home_dir, &project_dir, &repo_paths);
+    }
 
     // Resolve the agent binary early so its installation directory
     // can be included in the sandbox profile. Failure is deferred —
