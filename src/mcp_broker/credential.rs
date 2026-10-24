@@ -21,6 +21,9 @@ pub struct Credential {
     /// Arguments to the spec's own program that exit 0 when the host login
     /// is usable (output discarded); `None` when there is nothing to probe.
     pub probe: Option<&'static [&'static str]>,
+    /// The host login lives in the OS keychain: on Linux the child gets the
+    /// session bus to reach the Secret Service.
+    pub keychain: bool,
 }
 
 /// The table.
@@ -32,6 +35,7 @@ pub const MECHANISMS: &[Credential] = &[
         name: "nais-keychain",
         command: Some(&["nais", "alpha", "mcp", "serve"]),
         probe: Some(&["auth", "print-access-token", "-n"]),
+        keychain: true,
     },
     // A server with no host login: nothing to probe, any trusted command.
     // Not emitted by nav-pilot today; the broker e2e tests run on it.
@@ -39,6 +43,7 @@ pub const MECHANISMS: &[Credential] = &[
         name: "none",
         command: None,
         probe: None,
+        keychain: false,
     },
 ];
 
@@ -74,22 +79,25 @@ pub fn credential_ok(spec: &Spec) -> (Option<bool>, Option<&'static str>) {
     let Some(args) = spec.credential.probe else {
         return (None, None);
     };
-    probe(&spec.program, args, PROBE_TIMEOUT)
+    probe(&spec.program, args, spec.credential.keychain, PROBE_TIMEOUT)
 }
 
 fn probe(
     program: &std::path::Path,
     args: &[&str],
+    keychain: bool,
     timeout: Duration,
 ) -> (Option<bool>, Option<&'static str>) {
     #[allow(clippy::disallowed_methods)] // resolved in the trusted dirs at load
     let mut cmd = Command::new(program);
     // The child's own environment (#838), so the probe finds the login
     // exactly when the server would.
-    if let Some(home) = std::env::var_os("HOME") {
-        super::runtime::host_env(&mut cmd, std::path::Path::new(&home));
-        cmd.current_dir("/");
-    }
+    // No HOME, no probe: never cplt's own env and the project as cwd.
+    let Some(home) = std::env::var_os("HOME") else {
+        return (None, Some("HOME is not set"));
+    };
+    super::runtime::host_env(&mut cmd, std::path::Path::new(&home), keychain);
+    cmd.current_dir("/");
     let Ok(mut child) = cmd
         .args(args)
         .stdin(Stdio::null())
@@ -125,16 +133,35 @@ mod tests {
     }
 
     #[test]
-    fn a_probe_timeout_is_unknown_not_logged_out() {
+    fn no_home_no_probe() {
+        // Without HOME the probe would run with cplt's whole env and cwd.
         let sh = std::path::Path::new("/bin/sh");
-        let short = Duration::from_millis(200);
-        assert_eq!(
-            probe(sh, &["-c", "sleep 5"], short),
-            (None, Some("timed out"))
-        );
-        // Generous: a spawn can stall for seconds under load.
-        let long = Duration::from_secs(30);
-        assert_eq!(probe(sh, &["-c", "exit 1"], long), (Some(false), None));
-        assert_eq!(probe(sh, &["-c", "exit 0"], long), (Some(true), None));
+        let r = temp_env::with_var_unset("HOME", || {
+            probe(sh, &["-c", "exit 0"], false, Duration::from_secs(30))
+        });
+        assert_eq!(r, (None, Some("HOME is not set")));
+    }
+
+    #[test]
+    fn a_probe_timeout_is_unknown_not_logged_out() {
+        // HOME stays put: another test unsets it.
+        crate::with_env_lock_no_xdg(|| {
+            let sh = std::path::Path::new("/bin/sh");
+            let short = Duration::from_millis(200);
+            assert_eq!(
+                probe(sh, &["-c", "sleep 5"], false, short),
+                (None, Some("timed out"))
+            );
+            // Generous: a spawn can stall for seconds under load.
+            let long = Duration::from_secs(30);
+            assert_eq!(
+                probe(sh, &["-c", "exit 1"], false, long),
+                (Some(false), None)
+            );
+            assert_eq!(
+                probe(sh, &["-c", "exit 0"], false, long),
+                (Some(true), None)
+            );
+        });
     }
 }
