@@ -5869,7 +5869,6 @@ except Exception as e:
                 "--project-dir",
                 &project.to_string_lossy(),
             ])
-            .env("HOME", home_dir())
             .output()
             .expect("Failed to run cplt --print-profile");
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -5907,7 +5906,6 @@ except Exception as e:
                 "--project-dir",
                 &project.to_string_lossy(),
             ])
-            .env("HOME", home_dir())
             .env("CPLT_CONFIG", &config)
             .output()
             .expect("Failed to run cplt --print-profile");
