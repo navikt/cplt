@@ -39,8 +39,20 @@ const LAUNCH: &[&str] = &["--no-quiet", "--yes", "--no-validate", "exec", "--"];
 fn launch_agent(home: &Path, repo: &Path) -> (String, String, bool) {
     let mut args = LAUNCH.to_vec();
     args.push(TRUE_BIN);
-    let (stdout, stderr, status) = launch(home, repo, &args);
-    (stdout, stderr, status.success())
+    // The host's CA variables are not part of the config under test: an
+    // unloadable `SSL_CERT_FILE` on a runner would make
+    // `proxy.inject_github_token` refuse, on purpose, for a reason this suite
+    // does not check. The system bundle is used instead.
+    let mut cmd = common::cplt_local(home, repo);
+    for var in cplt::token_inject::USER_CA_VARS {
+        cmd.env_remove(var);
+    }
+    let out = cmd.args(&args).output().expect("cplt should run");
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.success(),
+    )
 }
 
 /// When `CPLT_TEST_REQUIRE_SANDBOX=1` is set (CI), a missing sandbox capability
@@ -690,13 +702,6 @@ fn nested_repo(parent: &Path) -> String {
 /// printed by the test, so a skip is a stated exception rather than a silent
 /// hole.
 const SKIPPED: &[(&str, &str)] = &[
-    (
-        "proxy.inject_github_token",
-        "whether it launches depends on the host's CA setup: an unloadable \
-         `SSL_CERT_FILE` on the runner makes the launch refuse on purpose, \
-         since falling back would hand over the real token. `e2e_projects.rs` \
-         covers the refusals.",
-    ),
     (
         "git_guard.allow_push",
         "an array of tables, which `config set` has no spelling for at all — it \
