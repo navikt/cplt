@@ -1683,14 +1683,21 @@ fn confirm_launch(
         if ui::verbose() {
             ui::info("Profile unchanged since you last confirmed it; not asking again");
         }
+        if let Some(c) = confirm {
+            c.record_display(home, project);
+        }
         return Ok(());
     }
     if let Err(e) = prompt_confirm(resolved.yes, resolved.quiet, agent) {
         bail!("{e}");
     }
     // Only a person who answered y records; `--yes` answered nothing.
-    if let Some(c) = confirm.filter(|c| should_record(c, resolved.yes)) {
-        c.record(home, project);
+    if let Some(c) = confirm {
+        if should_record(c, resolved.yes) {
+            c.record(home, project);
+        }
+        // After the answer: a declined launch keeps the old display record.
+        c.record_display(home, project);
     }
     Ok(())
 }
@@ -4902,10 +4909,6 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         &probe.existing_home_tool_dirs,
         active_agent,
     );
-    if !resolved.quiet {
-        warn_unlinked_child_repos(&home_dir, &project_dir, &repo_paths);
-    }
-
     // Resolve the agent binary early so its installation directory
     // can be included in the sandbox profile. Failure is deferred —
     // --print-profile doesn't need the binary.
@@ -4989,6 +4992,11 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             mcp_probe: mcp_status.is_some(),
         },
     )?;
+    // Only after `prepare` validated the state dir: no launch-state read or
+    // write before that. Inspect-only runs skip that check, so no hint there.
+    if !resolved.quiet && !cli.print_profile && mcp_status.is_none() {
+        warn_unlinked_child_repos(&home_dir, &project_dir, &repo_paths);
+    }
     // `cplt mcp status`: the same specs, judged by this launch's final policy.
     if let Some(json) = mcp_status {
         let mut found = mcp_found;
