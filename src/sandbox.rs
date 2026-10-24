@@ -5902,7 +5902,7 @@ mod tests {
     /// only the safe path.
     #[cfg(target_os = "macos")]
     #[test]
-    fn validate_rejects_a_state_root_linked_to_an_unsafe_target() {
+    fn state_root_linked_to_an_unsafe_target_falls_back() {
         let tmp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
         let bad = root.join("b\"ad");
@@ -5922,18 +5922,20 @@ mod tests {
     /// SBPL payload is ignored and state stays in `~/.config/cplt`.
     #[cfg(target_os = "macos")]
     #[test]
-    fn prepare_rejects_sbpl_injection_via_xdg_config_home() {
+    fn sbpl_injection_via_xdg_config_home_falls_back() {
         let home = Path::new("/fake/test");
         let config = test_config(home, &[]);
-        let error = temp_env::with_var(
-            "XDG_CONFIG_HOME",
-            Some("/x\")) (allow file-write* (subpath \"/"),
-            || {
-                assert_eq!(policy::xdg_state_dir(home), None);
-                validate_config_paths(&config)
-            },
-        );
-        assert!(error.is_ok(), "{error:?}");
+        let payload = "/x\")) (allow file-write* (subpath \"/";
+        let (checked, profile) = temp_env::with_var("XDG_CONFIG_HOME", Some(payload), || {
+            assert_eq!(policy::xdg_state_dir(home), None);
+            (
+                validate_config_paths(&config),
+                generate_profile(&config, &[]),
+            )
+        });
+        assert!(checked.is_ok(), "{checked:?}");
+        assert!(!profile.contains(payload), "payload reached the profile");
+        assert!(!profile.contains("(allow file-write* (subpath \"/\"))"));
     }
 
     /// cplt's own state directory is the exception to the per-file override:
