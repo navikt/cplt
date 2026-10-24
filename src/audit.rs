@@ -693,11 +693,18 @@ impl AuditReport {
             return None;
         };
         Some((!changes.is_empty()).then(|| {
-            format!(
-                "{} file{} (+{total_added} -{total_deleted})",
+            let files = format!(
+                "{} file{}",
                 changes.len(),
                 if changes.len() == 1 { "" } else { "s" },
-            )
+            );
+            // Untracked files carry no line counts; "(+0 -0)" would read as
+            // "nothing changed".
+            if *total_added == 0 && *total_deleted == 0 {
+                files
+            } else {
+                format!("{files} (+{total_added} -{total_deleted})")
+            }
         }))
     }
 
@@ -1929,8 +1936,9 @@ impl SnapshotStores {
             .collect()
     }
 
-    /// `settled`: the session's processes had all exited before this check.
-    pub fn report(&self, settled: bool) {
+    /// `unsettled`: a settle probe ran and saw session processes still alive.
+    /// Without a probe (`--quiet`, `--no-audit`) nothing is known, so no warning.
+    pub fn report(&self, unsettled: bool) {
         let (flagged, gone) = self.flagged();
         self.save_cache();
         print_quarantined(
@@ -1949,7 +1957,7 @@ impl SnapshotStores {
                 ui::error(&format!("  {}", esc_path(p)));
             }
         }
-        if !settled {
+        if unsettled {
             ui::warn(
                 "The session left processes running, so an OpenCode snapshot store they \
                  change after this check is not reported.",

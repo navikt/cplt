@@ -1605,11 +1605,6 @@ impl Resolved {
             for line in &lines {
                 eprintln!("{line}");
             }
-            if quiet_tip_due(home_dir) {
-                eprintln!(
-                    "{blue}[cplt]{nc}  {yellow}Tip:{nc}            {dim}use --quiet, or cplt config set sandbox.quiet true{nc}"
-                );
-            }
             return confirm;
         }
         eprintln!(
@@ -1622,14 +1617,32 @@ impl Resolved {
         confirm
     }
 
-    /// Every resolved setting, minus the per-launch proxy port, for the
-    /// launch confirmation hash.
+    /// Every resolved setting, minus the per-launch proxy port and the
+    /// UI-only fields, for the launch confirmation hash. `-y`, `--quiet` or
+    /// `--no-audit` change what cplt prints, not what the agent can reach.
+    /// `no_validate` stays: skipping the sandbox self-check deserves a prompt.
     #[must_use]
     pub fn policy_fingerprint(&self) -> String {
-        format!("{self:?}").replace(
+        const UI_ONLY: [&str; 5] = ["yes", "quiet", "audit", "brief", "bool_layers"];
+        let pretty = format!("{self:#?}").replace(
             &format!("proxy_port: {},", self.proxy_port),
             "proxy_port: PORT,",
-        )
+        );
+        // Top-level fields sit at four spaces; deeper lines belong to the
+        // field above them.
+        let mut skip = false;
+        pretty
+            .lines()
+            .filter(|l| {
+                if let Some(field) = l.strip_prefix("    ").filter(|f| !f.starts_with(' ')) {
+                    skip = field
+                        .split_once(':')
+                        .is_some_and(|(name, _)| UI_ONLY.contains(&name));
+                }
+                !skip
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// The one-line steady-state summary: repositories, writable paths,
@@ -1974,29 +1987,6 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-/// Launches that still show the `--quiet` tip (#666).
-const QUIET_TIP_LAUNCHES: u32 = 3;
-
-/// True for the first [`QUIET_TIP_LAUNCHES`] summaries, counted in cplt's state
-/// directory next to the Copilot extraction verdict. That directory is
-/// sandbox-denied, so the agent cannot reset or silence the count. A read or
-/// write failure shows the tip: it is advice, and a missing file is a new user.
-fn quiet_tip_due(home: &Path) -> bool {
-    let file = crate::sandbox::cplt_state_file(home, "quiet-tip-shown");
-    let shown: u32 = std::fs::read_to_string(&file)
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0);
-    if shown >= QUIET_TIP_LAUNCHES {
-        return false;
-    }
-    if let Some(dir) = file.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let _ = std::fs::write(&file, (shown + 1).to_string());
-    true
-}
-
 #[cfg(test)]
 mod tests {
     /// The launch confirmation must change with every widening the table
@@ -2029,24 +2019,35 @@ mod tests {
         }
     }
 
+    /// `-y`, `--quiet` and `--no-audit` change what cplt prints, not the
+    /// boundary, so toggling them must not re-prompt.
+    #[test]
+    fn policy_fingerprint_ignores_ui_only_flags() {
+        let fp = Config::default()
+            .merge(CliFlags::default())
+            .expect("default config merges")
+            .policy_fingerprint();
+        let ui = Config::default()
+            .merge(CliFlags {
+                yes: FeatureToggle::ForceOn,
+                quiet: FeatureToggle::ForceOn,
+                audit: FeatureToggle::ForceOff,
+                ..CliFlags::default()
+            })
+            .expect("ui flags merge");
+        assert_eq!(ui.policy_fingerprint(), fp);
+        // Skipping the sandbox self-check is not UI-only: it must re-prompt.
+        let skip = Config::default()
+            .merge(CliFlags {
+                no_validate: true,
+                ..CliFlags::default()
+            })
+            .expect("--no-validate merges");
+        assert_ne!(skip.policy_fingerprint(), fp, "--no-validate");
+    }
+
     use super::super::types::{FeatureToggle, Preset};
     use super::*;
-
-    #[test]
-    fn quiet_tip_shows_on_the_first_launches_only() {
-        crate::with_env_lock_no_xdg(quiet_tip_shows_on_the_first_launches_only_inner);
-    }
-
-    fn quiet_tip_shows_on_the_first_launches_only_inner() {
-        let home = tempfile::tempdir().unwrap();
-        for _ in 0..QUIET_TIP_LAUNCHES {
-            assert!(quiet_tip_due(home.path()));
-        }
-        assert!(!quiet_tip_due(home.path()));
-        // The count lives in the sandbox-denied state dir, not a cache.
-        let file = crate::sandbox::cplt_state_file(home.path(), "quiet-tip-shown");
-        assert_eq!(std::fs::read_to_string(file).unwrap(), "3");
-    }
 
     #[test]
     fn default_config_is_valid_toml() {

@@ -64,7 +64,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: false,
         default_display: "false",
-        description: "Give the agent a placeholder GitHub token; the proxy puts the real one back for GitHub hosts only (TLS terminated with a per-session CA). Falls back to the real token if setup fails.",
+        description: "Give the agent a placeholder GitHub token; the proxy puts the real one back for GitHub hosts only (TLS terminated with a per-session CA). Refuses the launch if setup fails.",
     },
     ConfigKeyInfo {
         section: "proxy",
@@ -371,7 +371,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: false,
         default_display: "false",
-        description: "Hide the startup configuration summary (sandbox rules, network, env info).",
+        description: "Hide the startup configuration summary (sandbox rules, network, env info) and the exit audit. Without sandbox.yes, cplt asks for confirmation every launch, since the summary is hidden.",
     },
     ConfigKeyInfo {
         section: "sandbox",
