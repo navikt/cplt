@@ -793,14 +793,14 @@ fn session_lock_held(dir: &Path) -> Option<bool> {
 /// rules. The guard must outlive every sandboxed child that uses its path.
 #[cfg(target_os = "macos")]
 #[derive(Debug)]
-pub struct PlaywrightSocketDir {
+pub struct SessionSocketDir {
     path: PathBuf,
     device: u64,
     inode: u64,
 }
 
 #[cfg(target_os = "macos")]
-impl PlaywrightSocketDir {
+impl SessionSocketDir {
     /// Atomically create a cplt-owned Playwright socket base under `/private/tmp`.
     pub fn create() -> Result<Self, String> {
         let root = Path::new(PLAYWRIGHT_SOCKET_ROOT);
@@ -849,7 +849,7 @@ impl PlaywrightSocketDir {
 }
 
 #[cfg(target_os = "macos")]
-impl Drop for PlaywrightSocketDir {
+impl Drop for SessionSocketDir {
     fn drop(&mut self) {
         remove_owned_dir(&self.path, self.device, self.inode, "Playwright socket dir");
     }
@@ -1750,7 +1750,7 @@ mod tests {
         use crate::sandbox::{PLAYWRIGHT_SOCKET_PATH_LIMIT, PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX};
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-        let guard = PlaywrightSocketDir::create().unwrap();
+        let guard = SessionSocketDir::create().unwrap();
         let path = guard.path().to_path_buf();
         let sibling = tempfile::Builder::new()
             .prefix("cplt-pw-test-sibling-")
@@ -1794,7 +1794,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn playwright_socket_dir_collision_preserves_existing_directory() {
-        let guard = PlaywrightSocketDir::create().unwrap();
+        let guard = SessionSocketDir::create().unwrap();
         let path = guard.path().to_path_buf();
         let session_id = path
             .file_name()
@@ -1802,7 +1802,7 @@ mod tests {
             .and_then(|name| name.strip_prefix(PLAYWRIGHT_SOCKET_DIR_PREFIX))
             .unwrap();
 
-        let collision = PlaywrightSocketDir::create_for_session_id(session_id);
+        let collision = SessionSocketDir::create_for_session_id(session_id);
         assert!(collision.is_err());
         assert!(path.is_dir(), "collision handling must preserve the owner");
 
@@ -1825,7 +1825,7 @@ mod tests {
         std::fs::create_dir(&unrelated).unwrap();
         std::os::unix::fs::symlink(&unrelated, &guarded_path).unwrap();
 
-        let guard = PlaywrightSocketDir {
+        let guard = SessionSocketDir {
             path: guarded_path.clone(),
             device: metadata.dev(),
             inode: metadata.ino(),

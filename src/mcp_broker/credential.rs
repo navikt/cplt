@@ -128,8 +128,30 @@ mod tests {
 
     #[test]
     fn nais_probe_checks_the_nais_login_not_gcloud() {
+        // Through the probe, against a fake nais that is logged in only for
+        // the `-n` (nais) token and not for the bare (gcloud) one.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let nais = dir.path().join("nais");
+        let staging = dir.path().join("nais.staging");
+        std::fs::write(
+            &staging,
+            "#!/bin/sh\n[ \"$*\" = \"auth print-access-token -n\" ]\n",
+        )
+        .unwrap();
+        // `cp`, not a direct write: see the ETXTBSY note in agent.rs.
+        #[allow(clippy::disallowed_methods)]
+        let copied = Command::new("/bin/cp").arg(&staging).arg(&nais).status();
+        assert!(copied.unwrap().success());
+        std::fs::set_permissions(&nais, std::fs::Permissions::from_mode(0o755)).unwrap();
         let m = Credential::parse("nais-keychain").unwrap();
-        assert_eq!(m.probe, Some(&["auth", "print-access-token", "-n"][..]));
+        let long = Duration::from_secs(30);
+        let got = crate::with_env_lock_no_xdg(|| probe(&nais, m.probe.unwrap(), m.keychain, long));
+        assert_eq!(got, (Some(true), None));
+        let gcloud = crate::with_env_lock_no_xdg(|| {
+            probe(&nais, &["auth", "print-access-token"], true, long)
+        });
+        assert_eq!(gcloud, (Some(false), None), "the fake must tell them apart");
     }
 
     #[test]

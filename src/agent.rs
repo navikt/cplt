@@ -3568,9 +3568,8 @@ mod tests {
     #[test]
     fn opencode_v2_unknown_probe_is_retried_and_not_cached() {
         use std::os::unix::fs::PermissionsExt;
-        // The hang case gets an injected probe that reports a timeout, so the
-        // count does not depend on a killed shell having logged its start
-        // (#735). The real timeout path is covered in discover.rs.
+        // The hang case gets an injected probe that reports a timeout (#735).
+        // The real timeout path is covered in discover.rs.
         use crate::discover::{VersionProbe, probe_version_within};
         // The real scripts exit at once; 60 s is only a ceiling.
         let real = |p: &Path, _| {
@@ -3584,8 +3583,7 @@ mod tests {
         ] {
             let dir = tempfile::tempdir().unwrap();
             let bin = dir.path().join("opencode");
-            let count = dir.path().join("count");
-            let script = format!("#!/bin/sh\necho x >> {}\n{body}\n", count.display());
+            let script = format!("#!/bin/sh\n{body}\n");
             // Written in-process, the script would be open for writing while
             // other test threads fork; a fork in that window inherits the
             // descriptor and the exec fails ETXTBSY. `cp` gives `bin` an inode
@@ -3609,14 +3607,9 @@ mod tests {
             });
             assert_eq!(verdict, None, "{name}");
             let first = crate::discover::PROBE_TIMEOUT;
+            // Counted at the probe closure, the one seam every attempt
+            // crosses: one first try, one longer retry.
             assert_eq!(timeouts, [first, first * 3], "{name}: one longer retry");
-            if !timed_out {
-                assert_eq!(
-                    std::fs::read_to_string(&count).unwrap().lines().count(),
-                    2,
-                    "{name}: one retry"
-                );
-            }
             let cache = crate::with_env_lock_no_xdg(|| {
                 crate::sandbox::cplt_state_file(&home, "opencode-version")
             });

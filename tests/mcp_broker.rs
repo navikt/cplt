@@ -7,49 +7,7 @@ mod common;
 
 use std::process::Command;
 
-use common::{binary_path, cplt_cmd, home_temp_dir};
-
-fn project_dir() -> std::path::PathBuf {
-    std::fs::canonicalize(".").unwrap()
-}
-
-/// The sandbox this host launches with: Seatbelt, or Bubblewrap (the broker
-/// needs it on Linux). Under `CPLT_TEST_REQUIRE_SANDBOX=1` a missing one fails.
-fn sandbox_usable() -> bool {
-    let ok = if cfg!(target_os = "macos") {
-        Command::new("sandbox-exec")
-            .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
-            .output()
-    } else {
-        Command::new("bwrap")
-            .args(["--unshare-user", "--ro-bind", "/", "/", "--proc", "/proc"])
-            .args(["--dev", "/dev", "/bin/true"])
-            .output()
-    }
-    .is_ok_and(|o| o.status.success());
-    if !ok {
-        assert!(
-            std::env::var("CPLT_TEST_REQUIRE_SANDBOX").as_deref() != Ok("1"),
-            "sandbox required by CPLT_TEST_REQUIRE_SANDBOX but unavailable"
-        );
-        eprintln!("SKIPPED: sandbox not available");
-    }
-    ok
-}
-
-/// A dir under the checkout (exec is denied under /tmp) holding an
-/// executable `name`, which the test then fills in.
-fn fake_agent_dir(name: &str) -> tempfile::TempDir {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = tempfile::Builder::new()
-        .prefix(".cplt-e2e-fake-copilot-")
-        .tempdir_in(project_dir())
-        .expect("create fake agent dir");
-    let script = dir.path().join(name);
-    std::fs::write(&script, "#!/bin/sh\n").unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    dir
-}
+use common::{binary_path, cplt_cmd, fake_agent, home_temp_dir, project_dir, sandbox_usable};
 
 /// MCP host broker (#824), end to end through cplt: a broker spec for a
 /// fake stdio server, a fake Copilot that drives `cplt mcp-stdio` from
@@ -125,7 +83,7 @@ for line in sys.stdin:
             "no unix:path= session bus in DBUS_SESSION_BUS_ADDRESS"
         );
     }
-    let fake = fake_agent_dir("copilot");
+    let fake = fake_agent("copilot", "");
     let agent = fake.path().join("copilot");
     // The real interpreter, not the /usr/bin/python3 stub: the stub runs
     // xcodebuild, which fails inside the sandbox on CI runners.

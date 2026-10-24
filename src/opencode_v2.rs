@@ -1418,9 +1418,14 @@ mod tests {
         let linked = tmp.path().join("linked");
         std::os::unix::fs::symlink(&real, &linked).unwrap();
         let scratch = tmp.path().join("scratch");
+        // Every base the prepare reads is pinned, not just the two under test,
+        // so the developer's shell cannot leak a data or config dir in.
         let s = temp_env::with_vars(
             [
                 ("XDG_CONFIG_HOME", None::<&str>),
+                ("XDG_DATA_HOME", None),
+                ("XDG_CACHE_HOME", None),
+                ("OPENCODE_CONFIG_DIR", None),
                 ("XDG_STATE_HOME", Some(linked.to_str().unwrap())),
             ],
             || prepare(&scratch, tmp.path(), &tmp.path().join("src/repo")).unwrap(),

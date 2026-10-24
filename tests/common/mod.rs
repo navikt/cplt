@@ -22,6 +22,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// A `CPLT_CONFIG` value that can never name a real file: `/dev/null` is a
@@ -44,6 +45,7 @@ pub fn binary_path() -> PathBuf {
 pub fn cplt_cmd() -> Command {
     let mut cmd = Command::new(binary_path());
     cmd.env("CPLT_CONFIG", NO_CONFIG);
+    with_scratch_home(&mut cmd);
     // Greppable stderr. The summary pads its columns and colours them, so a
     // test that reads it either matches the escape codes or settles for a
     // case-insensitive substring — which is what the one test reading the
@@ -55,6 +57,157 @@ pub fn cplt_cmd() -> Command {
     // `gh guard:` and `on` on exactly the machines least likely to be watched.
     cmd.env_remove("FORCE_COLOR");
     cmd
+}
+
+/// The developer's real `HOME`. A test that needs it opts in explicitly with
+/// `.env("HOME", real_home())`; everything else gets [`scratch_home`].
+///
+/// # Panics
+/// If `HOME` is unset.
+#[must_use]
+pub fn real_home() -> PathBuf {
+    PathBuf::from(std::env::var_os("HOME").expect("HOME should be set"))
+}
+
+/// One scratch `HOME` per test process, the default for every [`cplt_cmd`].
+///
+/// Since #831 every launch writes `~/.config/cplt/launch/*`, and the suites
+/// left thousands of files in the developer's real HOME. The scratch HOME
+/// lives *under* the real HOME rather than in `/tmp`: the sandbox makes `/tmp`
+/// writable wholesale, so a `/tmp` HOME is not the deny-by-default tree the
+/// suites assert on.
+///
+/// Statics are never dropped, so cleanup happens on the next run: creating
+/// one removes every sibling whose pid is no longer alive. So the last run
+/// always leaves one `~/.cplt-test-home-<pid>` dir behind until the next.
+///
+/// # Panics
+/// If the directory cannot be created.
+#[must_use]
+pub fn scratch_home() -> &'static Path {
+    static HOME: OnceLock<PathBuf> = OnceLock::new();
+    HOME.get_or_init(|| {
+        let real = real_home();
+        let prefix = ".cplt-test-home-";
+        for e in std::fs::read_dir(&real).into_iter().flatten().flatten() {
+            let name = e.file_name();
+            let Some(pid) = name.to_str().and_then(|n| n.strip_prefix(prefix)) else {
+                continue;
+            };
+            let alive = Command::new("/bin/kill")
+                .args(["-0", pid])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+            if !alive {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+        let name = format!("{prefix}{}", std::process::id());
+        let home = real.join(&name);
+        if std::fs::create_dir_all(&home).is_ok() {
+            return home;
+        }
+        // Inside a cplt session the HOME root is not writable: fall back to
+        // the temp dir, and say so, since that tree is not deny-by-default.
+        let tmp = std::env::temp_dir().join(name);
+        eprintln!(
+            "NOTE: {} is not writable; scratch HOME is {} instead",
+            real.display(),
+            tmp.display()
+        );
+        std::fs::create_dir_all(&tmp).expect("scratch HOME should be creatable");
+        tmp
+    })
+}
+
+/// Point `HOME` at [`scratch_home`] and drop the XDG base directories, so
+/// they derive from whatever `HOME` the test ends up setting rather than from
+/// the developer's shell. A test that sets `HOME` itself afterwards wins.
+pub fn with_scratch_home(cmd: &mut Command) {
+    cmd.env("HOME", scratch_home())
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .env_remove("XDG_CACHE_HOME");
+}
+
+/// The checkout, canonicalized: the tree the suites build fixtures in when
+/// the sandbox must execute them (exec is denied under `/tmp`).
+///
+/// It is also why a test that launches *in* the checkout can see warnings a
+/// fresh project would not: when the checkout is a linked worktree whose
+/// shared `.git` lies outside the [`scratch_home`] HOME, cplt says so on
+/// stderr. A test asserting clean stderr builds its project under
+/// [`scratch_home`] instead (see `e2e_exec_no_output_contamination`).
+///
+/// # Panics
+/// If the working directory cannot be resolved.
+#[must_use]
+pub fn project_dir() -> PathBuf {
+    std::fs::canonicalize(".").unwrap()
+}
+
+/// Whether this host can launch the sandbox: Seatbelt on macOS, Bubblewrap
+/// elsewhere. Under `CPLT_TEST_REQUIRE_SANDBOX=1` (CI) a missing one fails
+/// the test instead of skipping it.
+///
+/// # Panics
+/// If the sandbox is required but unavailable.
+#[must_use]
+pub fn sandbox_usable() -> bool {
+    let ok = if cfg!(target_os = "macos") {
+        Command::new("sandbox-exec")
+            .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
+            .output()
+    } else {
+        Command::new("bwrap")
+            .args(["--unshare-user", "--ro-bind", "/", "/", "--proc", "/proc"])
+            .args(["--dev", "/dev", "/bin/true"])
+            .output()
+    }
+    .is_ok_and(|o| o.status.success());
+    if !ok {
+        assert!(
+            std::env::var("CPLT_TEST_REQUIRE_SANDBOX").as_deref() != Ok("1"),
+            "sandbox required by CPLT_TEST_REQUIRE_SANDBOX but unavailable"
+        );
+        eprintln!("SKIPPED: sandbox not available (likely already sandboxed)");
+    }
+    ok
+}
+
+/// A dir under the checkout (exec is denied under `/tmp`) holding an
+/// executable `name` that runs `body` under `/bin/sh`. Removed on drop,
+/// panics included; the `.cplt-e2e-` prefix keeps the defensive
+/// `.gitignore` pattern effective if a run is killed.
+///
+/// # Panics
+/// If the directory or script cannot be created.
+#[must_use]
+pub fn fake_agent(name: &str, body: &str) -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::Builder::new()
+        .prefix(".cplt-e2e-fake-copilot-")
+        .tempdir_in(project_dir())
+        .expect("create fake agent dir");
+    let script = dir.path().join(name);
+    std::fs::write(&script, format!("#!/bin/sh\n{body}")).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    dir
+}
+
+/// The opt-in to the real `HOME`, for tests that need what lives there (real
+/// toolchains, paths under the checkout's HOME). `XDG_CONFIG_HOME` is the
+/// cplt state root, so pointing it at [`scratch_home`] keeps launch state
+/// out of the real `~/.config/cplt`.
+///
+/// The launch dir is created up front: cplt falls back to the legacy
+/// `~/.config/cplt/launch` while the new one does not exist yet.
+pub fn with_real_home(cmd: &mut Command) {
+    let xdg = scratch_home().join(".config");
+    std::fs::create_dir_all(xdg.join("cplt/launch")).expect("scratch launch dir");
+    cmd.env("HOME", real_home()).env("XDG_CONFIG_HOME", xdg);
 }
 
 /// A cplt PATH shim (#514) run directly, isolated the way [`cplt_cmd`] is: the
@@ -95,6 +248,55 @@ pub fn binary_in_path(name: &str) -> PathBuf {
         .map(|dir| dir.join(name))
         .find(|path| path.is_file())
         .unwrap_or_else(|| panic!("{name} should be available in PATH"))
+}
+
+/// A `python3` that runs inside the sandbox, or `None` after saying why the
+/// test is skipped.
+///
+/// The first `python3` on a developer's PATH is often a version-manager shim
+/// (mise, asdf, pyenv) that reads its config from HOME and fails under the
+/// sandbox; the interpreter it points at lives under HOME too, which the
+/// sandbox denies. So: the first PATH entry that is neither a shim nor under
+/// HOME, then `/usr/bin/python3`, and only one that starts inside a real cplt
+/// sandbox: one that runs on the host but not in the sandbox skips the test.
+#[must_use]
+///
+/// The path comes back shell-quoted, ready to splice into a `sh -c` line.
+pub fn sandbox_python3() -> Option<String> {
+    let in_sandbox = |p: &Path| {
+        let Ok(proj) = tempfile::tempdir_in(scratch_home()) else {
+            return false;
+        };
+        cplt_cmd()
+            .args(["--yes", "--no-validate", "--quiet", "--agent", "shell"])
+            .arg("--project-dir")
+            .arg(proj.path())
+            .args(["--", "-c", "\"$0\" -c pass"])
+            .arg(p)
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
+    let home = real_home();
+    let found = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .filter(|dir| {
+            !dir.starts_with(&home) && !dir.components().any(|c| c.as_os_str() == "shims")
+        })
+        .map(|dir| dir.join("python3"))
+        .chain(std::iter::once(PathBuf::from("/usr/bin/python3")))
+        .find(|p| {
+            p.is_file()
+                && Command::new(p)
+                    .args(["-c", "pass"])
+                    .output()
+                    .is_ok_and(|o| o.status.success())
+                && in_sandbox(p)
+        });
+    if found.is_none() {
+        eprintln!(
+            "SKIP: no python3 that runs inside the sandbox (non-shim, outside HOME, or /usr/bin/python3)"
+        );
+    }
+    found.map(|p| format!("'{}'", p.display().to_string().replace('\'', "'\\''")))
 }
 
 /// A native test command with no developer configuration or environment.

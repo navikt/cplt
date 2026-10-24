@@ -24,17 +24,14 @@ mod e2e_tests {
     use std::process::Command;
 
     use crate::common::{
-        bare_origin_repo, binary_path, cplt_cmd, cplt_cmd_with_ambient_config, cplt_local, git_cmd,
-        git_ok, hold_port, home_temp_dir, make_config_home, processes_with_env, shim_cmd,
+        bare_origin_repo, binary_path, cplt_cmd, cplt_cmd_with_ambient_config, cplt_local,
+        fake_agent, git_cmd, git_ok, hold_port, home_temp_dir, make_config_home,
+        processes_with_env, project_dir, real_home, sandbox_usable, scratch_home, shim_cmd,
         signal_group, temp_repo,
     };
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static FAKE_COPILOT_COUNTER: AtomicU32 = AtomicU32::new(0);
-
-    fn project_dir() -> PathBuf {
-        std::fs::canonicalize(".").unwrap()
-    }
 
     /// Check if `copilot` CLI is available. Tests that require it should call this
     /// and return early if false — allows the test suite to pass in CI where
@@ -44,25 +41,6 @@ mod e2e_tests {
             .arg("copilot")
             .output()
             .is_ok_and(|o| o.status.success())
-    }
-
-    /// Check if sandbox-exec can apply a trivial profile.
-    /// Returns false when running inside an existing sandbox (nested sandbox-exec is denied).
-    fn sandbox_exec_available() -> bool {
-        Command::new("sandbox-exec")
-            .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
-            .output()
-            .is_ok_and(|o| o.status.success())
-    }
-
-    /// When `CPLT_TEST_REQUIRE_SANDBOX=1` is set (CI), a missing sandbox
-    /// capability must FAIL the test rather than silently skip. This mirrors the
-    /// Linux `require_sandbox_enforced()` in `integration_linux.rs` and closes the
-    /// gap where a `sandbox-exec`/Seatbelt regression on the macOS runner would
-    /// leave CI green because every enforcement test self-skipped. Default (unset)
-    /// behaviour is unchanged for local dev / nested-sandbox runs.
-    fn require_sandbox_enforced() -> bool {
-        std::env::var("CPLT_TEST_REQUIRE_SANDBOX").as_deref() == Ok("1")
     }
 
     /// Skip guard — call at the top of tests that need the REAL Copilot CLI.
@@ -88,18 +66,11 @@ mod e2e_tests {
     /// Skip guard — call at the top of tests that invoke sandbox-exec.
     ///
     /// Skips when already inside a sandbox (nested sandbox-exec is denied by
-    /// macOS). Under `CPLT_TEST_REQUIRE_SANDBOX=1` the skip branch panics instead,
-    /// so a missing/broken `sandbox-exec` on the CI runner turns the job red.
+    /// macOS). Under `CPLT_TEST_REQUIRE_SANDBOX=1` [`sandbox_usable`] panics
+    /// instead, so a broken `sandbox-exec` on the CI runner turns the job red.
     macro_rules! require_sandbox {
         () => {
-            if !sandbox_exec_available() {
-                if require_sandbox_enforced() {
-                    panic!(
-                        "sandbox-exec required by CPLT_TEST_REQUIRE_SANDBOX but unavailable \
-                         (a trivial profile failed to apply — Seatbelt/sandbox-exec regression?)"
-                    );
-                }
-                eprintln!("SKIPPED: sandbox-exec not available (likely already sandboxed)");
+            if !sandbox_usable() {
                 return;
             }
         };
@@ -705,7 +676,10 @@ mod e2e_tests {
 
     #[test]
     fn e2e_doctor_hides_the_home_directory() {
+        // Real HOME, opted in: the checkout must sit under the HOME doctor
+        // shortens to `~`. Doctor writes no launch state.
         let output = cplt_cmd()
+            .env("HOME", real_home())
             .args(["--agent", "shell", "doctor"])
             .current_dir(project_dir())
             .output()
@@ -723,7 +697,9 @@ mod e2e_tests {
 
     #[test]
     fn e2e_doctor_verbose_prints_the_inventory() {
+        // Real HOME, opted in, for the same reason as the test above.
         let output = cplt_cmd()
+            .env("HOME", real_home())
             .args(["--agent", "shell", "doctor", "--verbose"])
             .current_dir(project_dir())
             .output()
@@ -1228,18 +1204,7 @@ mod e2e_tests {
     /// including on panic (Drop runs during unwind). The `.cplt-e2e-` prefix
     /// keeps the single defensive `.gitignore` pattern effective on SIGKILL.
     fn create_fake_copilot() -> tempfile::TempDir {
-        let dir = tempfile::Builder::new()
-            .prefix(".cplt-e2e-fake-copilot-")
-            .tempdir_in(project_dir())
-            .expect("create fake copilot dir");
-        let script = dir.path().join("copilot");
-        std::fs::write(&script, "#!/bin/sh\nenv | sort\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        dir
+        fake_agent("copilot", "env | sort\n")
     }
 
     /// Run cplt with fake copilot and capture the environment output.
@@ -2232,19 +2197,10 @@ mod e2e_tests {
     /// A fake agent under the checkout (exec is denied under /tmp), printing
     /// each argument on its own line so the argv can be compared exactly.
     fn fake_agent_dir(name: &str) -> tempfile::TempDir {
-        let dir = tempfile::Builder::new()
-            .prefix(".cplt-e2e-fake-copilot-")
-            .tempdir_in(project_dir())
-            .expect("create fake agent dir");
-        let script = dir.path().join(name);
-        std::fs::write(
-            &script,
-            "#!/bin/sh\necho REAL-AGENT\nfor arg in \"$@\"; do echo \"ARG:$arg\"; done\n",
+        fake_agent(
+            name,
+            "echo REAL-AGENT\nfor arg in \"$@\"; do echo \"ARG:$arg\"; done\n",
         )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        dir
     }
 
     /// Install the shims into a fresh HOME with `fake` on PATH, as a user would.
@@ -5042,11 +4998,7 @@ paths = [
         // rather than the profile string: a relative deny path in a committed
         // `.cplt.toml`, written the way people actually write one, blocks the
         // read. Pre-fix this printed the file contents.
-        if !sandbox_exec_available() {
-            assert!(
-                !require_sandbox_enforced(),
-                "CPLT_TEST_REQUIRE_SANDBOX=1 but sandbox-exec is unavailable"
-            );
+        if !sandbox_usable() {
             return;
         }
         let repo =
@@ -7052,17 +7004,7 @@ paths = [
         require_sandbox!();
         let (repo, config_file) =
             make_trust_repo("cli-deny-env", "[deny]\nenv = [\"VAULT_TOKEN\"]\n");
-        let fake_dir = tempfile::Builder::new()
-            .prefix(".cplt-e2e-fake-cli-deny-env-")
-            .tempdir_in(project_dir())
-            .expect("create fake copilot dir");
-        let script = fake_dir.path().join("copilot");
-        std::fs::write(&script, "#!/bin/sh\nenv | sort\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        let fake_dir = create_fake_copilot();
         let current_path = std::env::var("PATH").unwrap_or_default();
         let new_path = format!("{}:{current_path}", fake_dir.path().display());
 
@@ -7070,6 +7012,7 @@ paths = [
             .args([
                 "--yes",
                 "--no-validate",
+                "--verbose",
                 "--inherit-env",
                 "--pass-env",
                 "OPENAI_API_KEY",
@@ -7100,9 +7043,22 @@ paths = [
             "--deny-env lost: {stdout}"
         );
         assert!(stdout.contains("kept-789"), "control var missing: {stdout}");
+        // Positive, so a summary that stops printing the list fails here
+        // instead of passing a negative match on nothing.
+        let denied: Vec<&str> = stderr
+            .lines()
+            .filter(|l| l.contains("Denied env:"))
+            .collect();
+        assert_eq!(
+            denied.len(),
+            1,
+            "--verbose must print one denied list: {stderr}"
+        );
         assert!(
-            !stderr.contains("OPENAI_API_KEY, OPENAI_API_KEY"),
-            "denied list not deduplicated: {stderr}"
+            denied[0]
+                .trim_end()
+                .ends_with("Denied env:    OPENAI_API_KEY, VAULT_TOKEN"),
+            "denied list not merged and deduplicated: {stderr}"
         );
 
         let _ = std::fs::remove_dir_all(&repo);
@@ -8398,14 +8354,61 @@ paths = [
         );
     }
 
+    /// The brief exit tier (output policy): without --verbose a session that
+    /// changed a project file ends on one line with a count, and the
+    /// per-file list stays behind --verbose.
+    #[test]
+    fn e2e_session_exit_is_one_line_without_verbose() {
+        require_sandbox!();
+        let proj = tempfile::tempdir_in(scratch_home()).expect("project dir");
+        assert!(git_ok(proj.path(), &["init", "--quiet", "-b", "main"]));
+        assert!(git_ok(
+            proj.path(),
+            &["commit", "--quiet", "--allow-empty", "-m", "init"]
+        ));
+        let output = cplt_cmd()
+            .args(["--yes", "--no-validate", "--agent", "shell"])
+            .arg("--project-dir")
+            .arg(proj.path())
+            .args(["--", "-c", "echo x > brief-exit-marker.txt"])
+            .current_dir(proj.path())
+            .output()
+            .expect("cplt should run");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "stderr: {stderr}");
+        assert!(
+            proj.path().join("brief-exit-marker.txt").exists(),
+            "test premise: the session must change a project file.\nstderr: {stderr}"
+        );
+        let ended: Vec<&str> = stderr
+            .lines()
+            .filter(|l| l.contains("Session ended"))
+            .collect();
+        assert_eq!(ended.len(), 1, "one session line.\nstderr: {stderr}");
+        assert!(
+            ended[0].contains("Session ended (exit 0, ")
+                && ended[0].contains(" · project changes: "),
+            "the brief line carries the exit and a change count.\nstderr: {stderr}"
+        );
+        assert!(
+            !stderr.contains("brief-exit-marker.txt"),
+            "the per-file list belongs to --verbose.\nstderr: {stderr}"
+        );
+    }
+
     #[test]
     fn e2e_exec_no_output_contamination() {
         // exec must not contaminate stdout or stderr with cplt startup messages —
         // both must be clean so it is safe to use in pipes and shell aliases.
         require_sandbox!();
+        // Not the checkout: when that is a linked worktree whose shared `.git`
+        // sits outside the scratch HOME, cplt rightly warns on stderr. Nor
+        // `/tmp`, which resolves under /private/var/folders and warns too.
+        let proj = tempfile::tempdir_in(scratch_home()).expect("project dir");
+        assert!(git_ok(proj.path(), &["init", "--quiet"]));
         let output = cplt_cmd()
             .args(["--no-validate", "exec", "--", "/usr/bin/true"])
-            .current_dir(project_dir())
+            .current_dir(proj.path())
             .output()
             .expect("cplt exec should run");
 
@@ -8760,9 +8763,14 @@ paths = [
             .expect("cplt should print the explicit-override profile");
         assert!(profile.status.success());
         let profile = String::from_utf8_lossy(&profile.stdout);
+        // Not a bare `/private/tmp/cplt-pw-` match: the session socket dir is
+        // shared with the MCP and worktree brokers, whose connect-only grants
+        // land in every profile. Only the Playwright grant may bind there.
         assert!(
             !profile.contains("Per-session Playwright control sockets")
-                && !profile.contains("/private/tmp/cplt-pw-"),
+                && !profile.contains(
+                    "(allow network-bind (local unix-socket (subpath \"/private/tmp/cplt-pw-"
+                ),
             "caller-owned override must not receive an automatic socket grant"
         );
     }
@@ -9261,8 +9269,7 @@ paths = [
     fn e2e_check_path_protected_blocked() {
         require_sandbox!();
         let proj = check_project();
-        let home = std::env::var("HOME").expect("HOME");
-        let ssh = format!("{home}/.ssh");
+        let ssh = format!("{}/.ssh", scratch_home().display());
         let output = cplt_cmd()
             .args(["--agent", "shell"])
             .arg("--project-dir")
@@ -10568,7 +10575,10 @@ paths = [
     /// anything else (EINPROGRESS, a send, a route error) when it allows it.
     #[test]
     fn e2e_udp_443_is_denied_and_tcp_443_is_not() {
-        const PROBE: &str = r#"python3 -c "
+        let Some(py) = crate::common::sandbox_python3() else {
+            return;
+        };
+        const PROBE: &str = r#"-c "
 import errno, socket
 u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 try:
@@ -10599,7 +10609,7 @@ print('TCP_' + ('OK' if r == 0 else errno.errorcode.get(r, str(r))))
                 .arg("--project-dir")
                 .arg(project.path())
                 .args(&extra)
-                .args(["--", "-c", PROBE])
+                .args(["--", "-c", &format!("{py} {PROBE}")])
                 .output()
                 .expect("run cplt");
             let stdout = String::from_utf8_lossy(&out.stdout);
