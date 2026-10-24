@@ -71,28 +71,45 @@ fi
 # install from it. An existing script install outside /usr/bin keeps the direct
 # download: switching it to apt would leave two copies on PATH.
 
-# Any failure here removes the list it wrote and falls through to the direct
-# download, so a broken step never leaves a dead apt source behind.
+# The archive key is pinned: a key with any other fingerprint is refused, so a
+# hijacked page or TLS connection cannot take over later `apt upgrade` runs.
+# Cross-checked against keyring/ in github.com/navikt/apt and the InRelease
+# signature. Rotating the key means updating this value.
+NAV_APT_KEY_FPR=B92E9C7EDBF0BD72F026B189FFB2724BF4A12D28
+
+# Any failure here removes the key and list it wrote and falls through to the
+# direct download, so a broken step never leaves a dead apt source behind.
 apt_install() {
   local keyring=/usr/share/keyrings/navikt-archive-keyring.gpg
   local list=/etc/apt/sources.list.d/navikt.list
-  local key_tmp
+  local key_tmp fprs reason=""
   key_tmp="$(mktemp)"
-  curl -fsSL -o "$key_tmp" https://navikt.github.io/apt/keyring/navikt-archive-keyring.gpg \
-    && test -s "$key_tmp" \
-    && sudo install -m 644 "$key_tmp" "$keyring" \
-    && echo "deb [signed-by=${keyring}] https://navikt.github.io/apt stable main" \
-      | sudo tee "$list" >/dev/null \
-    && sudo apt-get update -qq -o Dir::Etc::sourcelist="$list" \
-      -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 </dev/null \
-    && sudo apt-get install -y cplt </dev/null
-  local rc=$?
-  rm -f "$key_tmp"
-  if [[ $rc -ne 0 ]]; then
-    sudo rm -f "$list" 2>/dev/null || true
-    echo "! apt install failed, falling back to direct download (--no-apt skips apt)"
+  if ! curl -fsSL -o "$key_tmp" https://navikt.github.io/apt/keyring/navikt-archive-keyring.gpg \
+    || ! test -s "$key_tmp"; then
+    reason="could not download the archive key"
+  else
+    fprs="$(gpg --show-keys --with-colons "$key_tmp" 2>/dev/null | awk -F: '$1 == "fpr" {print $10}')"
+    if [[ "$fprs" != "$NAV_APT_KEY_FPR" ]]; then
+      reason="archive key fingerprint does not match ${NAV_APT_KEY_FPR} (got: ${fprs:-none})"
+    elif ! sudo install -m 644 "$key_tmp" "$keyring"; then
+      reason="could not install the archive key"
+    elif ! echo "deb [signed-by=${keyring}] https://navikt.github.io/apt stable main" \
+      | sudo tee "$list" >/dev/null; then
+      reason="could not write ${list}"
+    elif ! sudo apt-get update -qq -o Dir::Etc::sourcelist="$list" \
+      -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 </dev/null; then
+      reason="apt-get update failed"
+    elif ! sudo apt-get install -y cplt </dev/null; then
+      reason="apt-get install cplt failed"
+    fi
   fi
-  return $rc
+  rm -f "$key_tmp"
+  if [[ -n "$reason" ]]; then
+    sudo rm -f "$list" "$keyring" 2>/dev/null || true
+    echo "! apt install failed: ${reason}"
+    echo "  Falling back to direct download (--no-apt skips apt)"
+    return 1
+  fi
 }
 
 EXISTING="$(command -v "$BINARY" 2>/dev/null || true)"
@@ -104,6 +121,8 @@ if [[ "$NO_APT" == false && -z "$VERSION" && -z "$INSTALL_DIR" && "$(uname -s)" 
   && command -v apt-get &>/dev/null && command -v sudo &>/dev/null \
   && { sudo -n true 2>/dev/null || [[ -r /dev/tty ]]; } \
   && [[ -z "$EXISTING" || "$EXISTING" == /usr/bin/cplt ]] \
+  && { command -v gpg &>/dev/null \
+    || { echo "→ gpg not found, so the apt archive key cannot be checked; using direct download"; false; }; } \
   && echo "→ Adding the Nav apt archive (https://navikt.github.io/apt)..." \
   && apt_install; then
   echo ""
@@ -199,35 +218,30 @@ fi
 # ─── Verify checksum ─────────────────────────────────────────────────────────
 
 echo "→ Verifying checksum..."
-if curl -fsSL -o "${TMP_DIR}/SHA256SUMS" "$CHECKSUM_URL" 2>/dev/null; then
-  # `|| true`: under `set -euo pipefail` a non-matching grep exits 1, pipefail
-  # propagates it, and the assignment trips `set -e` — killing the script with a
-  # bare `exit 1` and making the empty-EXPECTED branch below unreachable.
-  EXPECTED=$(grep -F "${ASSET}" "${TMP_DIR}/SHA256SUMS" | awk '{print $1}' || true)
-  if [[ -z "$EXPECTED" ]]; then
-    echo "  ⚠ No checksum entry found for ${ASSET} (skipping verification)"
-  else
-    if command -v sha256sum &>/dev/null; then
-      ACTUAL=$(sha256sum "${TMP_DIR}/${ASSET}" | awk '{print $1}')
-    elif command -v shasum &>/dev/null; then
-      ACTUAL=$(shasum -a 256 "${TMP_DIR}/${ASSET}" | awk '{print $1}')
-    else
-      echo "  ⚠ Neither sha256sum nor shasum found (skipping verification)"
-      ACTUAL=""
-    fi
-    if [[ -n "$ACTUAL" && "$EXPECTED" != "$ACTUAL" ]]; then
-      echo "Error: Checksum mismatch!"
-      echo "  Expected: ${EXPECTED}"
-      echo "  Got:      ${ACTUAL}"
-      exit 1
-    fi
-    if [[ -n "$ACTUAL" ]]; then
-      echo "  ✓ Checksum verified"
-    fi
-  fi
-else
-  echo "  ⚠ Could not download checksums (skipping verification)"
+if ! curl -fsSL -o "${TMP_DIR}/SHA256SUMS" "$CHECKSUM_URL"; then
+  echo "Error: Could not download ${CHECKSUM_URL}"
+  exit 1
 fi
+EXPECTED=$(awk -v a="${ASSET}" '$2 == a || $2 == "*" a {print $1}' "${TMP_DIR}/SHA256SUMS")
+if [[ -z "$EXPECTED" ]]; then
+  echo "Error: No checksum entry for ${ASSET} in SHA256SUMS"
+  exit 1
+fi
+if command -v sha256sum &>/dev/null; then
+  ACTUAL=$(sha256sum "${TMP_DIR}/${ASSET}" | awk '{print $1}')
+elif command -v shasum &>/dev/null; then
+  ACTUAL=$(shasum -a 256 "${TMP_DIR}/${ASSET}" | awk '{print $1}')
+else
+  echo "Error: Neither sha256sum nor shasum found; cannot verify the download"
+  exit 1
+fi
+if [[ "$EXPECTED" != "$ACTUAL" ]]; then
+  echo "Error: Checksum mismatch!"
+  echo "  Expected: ${EXPECTED}"
+  echo "  Got:      ${ACTUAL}"
+  exit 1
+fi
+echo "  ✓ Checksum verified"
 
 # ─── Extract and install ─────────────────────────────────────────────────────
 
