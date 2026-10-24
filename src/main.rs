@@ -165,8 +165,8 @@ struct Cli {
 
     /// Give the agent a placeholder GitHub token and have the proxy put the
     /// real one back for GitHub hosts only (default off;
-    /// `proxy.inject_github_token`). Falls back to the real token, with one
-    /// line, if setup fails.
+    /// `proxy.inject_github_token`). Refuses the launch, saying what to
+    /// fix, if setup fails.
     #[arg(long, conflicts_with = "no_inject_github_token")]
     inject_github_token: bool,
 
@@ -6708,26 +6708,56 @@ fn assemble_sandbox(
     )?;
     let proxy_port_for_profile = proxy_handle.as_ref().map(|h| h.port);
 
-    // #820: opt-in. Any failure keeps today's behaviour, said in one line.
+    // #820: opt-in. The user asked for the token to be masked, so any reason
+    // injection cannot run refuses the launch: falling back would hand the
+    // agent the real token they asked to keep from it.
     if resolved.inject_github_token {
-        let setup = match (proxy_handle.is_some(), scratch_path) {
-            (false, _) => Err("the proxy is off".to_string()),
-            (_, None) => Err("there is no scratch dir".to_string()),
-            (true, Some(scratch)) => match cplt::token_inject::denied_ca_var(&resolved.deny_env) {
-                // The CA variables are how the agent trusts the proxy. Never
-                // fall back to the real token because of a deny: refuse.
-                Some(v) => anyhow::bail!(
-                    "--inject-github-token cannot run while deny.env names {v}: the agent \
-                     needs it to trust the proxy, and without injection it would get the \
-                     real token. Remove {v} from deny.env, or drop --inject-github-token."
-                ),
-                None => cplt::token_inject::setup(scratch),
-            },
+        let refuse = |why: String, fix: &str| {
+            anyhow::anyhow!(
+                "--inject-github-token cannot run: {why}. Without injection the agent \
+                 would get the real token, so cplt stops here.\n  {fix}, or drop \
+                 --inject-github-token."
+            )
         };
-        if let Err(e) = setup {
-            ui::warn(&format!(
-                "GitHub token injection is off for this run ({e}): the agent gets the real token."
+        if proxy_handle.is_none() {
+            return Err(refuse(
+                "the proxy is off".into(),
+                "Turn the proxy on (drop --no-proxy)",
             ));
+        }
+        let Some(scratch) = scratch_path else {
+            return Err(refuse(
+                "there is no scratch dir".into(),
+                "Make the cplt scratch dir under your home directory creatable",
+            ));
+        };
+        // The CA variables are how the agent trusts the proxy.
+        if let Some(v) = cplt::token_inject::denied_ca_var(&resolved.deny_env) {
+            return Err(refuse(
+                format!("deny.env names {v}, which the agent needs to trust the proxy"),
+                &format!("Remove {v} from deny.env"),
+            ));
+        }
+        // A CA file the agent can rewrite would let it choose what the
+        // bundles trust next session.
+        let writable =
+            session_writable_everywhere(probe, opts.repos.dirs, &resolved.allow_write, &agent_dirs);
+        for var in cplt::token_inject::USER_CA_VARS {
+            let Some(path) = std::env::var_os(var).filter(|p| !p.is_empty()) else {
+                continue;
+            };
+            if let Some(root) = agent_writable_root(Path::new(&path), &writable) {
+                return Err(refuse(
+                    format!(
+                        "{var} points inside {}, a tree the agent can write",
+                        root.display()
+                    ),
+                    &format!("Point {var} at a CA file outside the session's writable trees"),
+                ));
+            }
+        }
+        if let Err(e) = cplt::token_inject::setup(scratch) {
+            return Err(refuse(e, "Fix the CA setup named above"));
         }
     }
 

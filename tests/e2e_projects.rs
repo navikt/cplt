@@ -448,9 +448,43 @@ echo SCRATCH_CACHE_CONSUMED_ONCE
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
-            !stdout.contains("ghp_e2e_real_token"),
-            "real token reached the agent:\n{stdout}\n{stderr}"
+            stdout.contains("TOKEN=ghp_") && !stdout.contains("ghp_e2e_real_token"),
+            "placeholder did not reach the agent:\n{stdout}\n{stderr}"
         );
+    }
+
+    /// Asked for injection but the proxy is off: refuse, never hand over the
+    /// real token.
+    #[test]
+    fn inject_github_token_refuses_without_proxy() {
+        require_sandbox!();
+        let home = home_temp_dir("inject-no-proxy");
+        let project = tempfile::tempdir().unwrap();
+        let out = cplt_cmd()
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join(".config"))
+            .env("XDG_STATE_HOME", home.path().join(".state"))
+            .env("GH_TOKEN", "ghp_e2e_real_token")
+            .current_dir(project.path())
+            .args([
+                "--yes",
+                "--no-proxy",
+                "--inject-github-token",
+                "--pass-env",
+                "GH_TOKEN",
+                "--agent",
+                "shell",
+                "--",
+                "-c",
+                "echo TOKEN=$GH_TOKEN",
+            ])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{stdout}\n{stderr}");
+        assert!(!stdout.contains("ghp_e2e_real_token"), "{stdout}");
+        assert!(stderr.contains("the proxy is off"), "{stderr}");
     }
 
     #[test]
