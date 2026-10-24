@@ -4309,6 +4309,86 @@ mod tests {
         p.shutdown();
     }
 
+    /// #820, through `relay_or_intercept`: with the injector installed, a
+    /// GitHub CONNECT is terminated with a session leaf and any other host is
+    /// relayed untouched.
+    ///
+    /// The injector is process-global and stays installed for the rest of
+    /// this binary. That is safe only because no other lib test CONNECTs to a
+    /// GitHub host on 443 or spawns a session through `apply_to_child`.
+    #[test]
+    fn connect_is_intercepted_for_github_and_relayed_otherwise() {
+        require_localhost_tcp!();
+        use std::io::BufRead;
+        let scratch = tempfile::tempdir().unwrap();
+        // `setup` reads the user CA variables: pin them under temp_env's lock.
+        let ca_vars = [
+            ("SSL_CERT_FILE", None::<&str>),
+            ("GIT_SSL_CAINFO", None),
+            ("NODE_EXTRA_CA_CERTS", None),
+        ];
+        temp_env::with_vars(ca_vars, || {
+            if !crate::token_inject::active() {
+                crate::token_inject::setup(scratch.path()).expect("injection setup");
+            }
+        });
+        let session_ca = std::fs::read(scratch.path().join(crate::token_inject::NODE_BUNDLE))
+            .expect("this test must be the one that set the injector up");
+
+        // It speaks no TLS: only the injector can finish a handshake for
+        // api.github.com, and a relayed tunnel hands it the bytes as sent.
+        let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        let resolver: ResolverFn = Arc::new(move |_h: &str, _p: u16| Some(origin_addr));
+        // Loopback stands in for the public origin: opt into it.
+        let p = make_proxy_with_resolver(vec![], true, Some(resolver));
+        let connect = |target: &str| {
+            let mut s = TcpStream::connect(("127.0.0.1", p.port)).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let target = format!("{target}:443");
+            write!(s, "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").unwrap();
+            let mut r = std::io::BufReader::new(s.try_clone().unwrap());
+            let (mut line, mut blank) = (String::new(), String::new());
+            r.read_line(&mut line).unwrap();
+            r.read_line(&mut blank).unwrap();
+            (line, s)
+        };
+
+        let (line, mut relayed) = connect("example.com");
+        assert_eq!(line, "HTTP/1.1 200 Connection Established\r\n");
+        let (mut upstream, _) = origin.accept().unwrap();
+        upstream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        relayed.write_all(b"plain").unwrap();
+        let mut got = [0u8; 5];
+        upstream.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"plain", "a non-GitHub tunnel must be relayed as is");
+
+        let mut roots = rustls::RootCertStore::empty();
+        for der in rustls::pki_types::pem::PemObject::pem_slice_iter(&session_ca) {
+            let der: rustls::pki_types::CertificateDer = der.unwrap();
+            roots.add(der).unwrap();
+        }
+        let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let mut tls =
+            rustls::ClientConnection::new(Arc::new(cfg), "api.github.com".try_into().unwrap())
+                .unwrap();
+        let (line, mut tunnel) = connect("api.github.com");
+        assert_eq!(line, "HTTP/1.1 200 Connection Established\r\n");
+        while tls.is_handshaking() {
+            tls.complete_io(&mut tunnel)
+                .expect("no handshake with a session leaf: the tunnel was not intercepted");
+        }
+        p.shutdown();
+    }
+
     /// Proxy that lets CONNECT reach `origin_port` on IPv4 loopback directly.
     fn head_test_proxy(origin_port: u16, timeout: Duration, log: PathBuf) -> ProxyHandle {
         let loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();

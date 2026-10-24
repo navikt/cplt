@@ -7068,6 +7068,7 @@ paths = [
             .args([
                 "--yes",
                 "--no-validate",
+                "--verbose",
                 "--inherit-env",
                 "--pass-env",
                 "OPENAI_API_KEY",
@@ -7098,9 +7099,22 @@ paths = [
             "--deny-env lost: {stdout}"
         );
         assert!(stdout.contains("kept-789"), "control var missing: {stdout}");
+        // Positive, so a summary that stops printing the list fails here
+        // instead of passing a negative match on nothing.
+        let denied: Vec<&str> = stderr
+            .lines()
+            .filter(|l| l.contains("Denied env:"))
+            .collect();
+        assert_eq!(
+            denied.len(),
+            1,
+            "--verbose must print one denied list: {stderr}"
+        );
         assert!(
-            !stderr.contains("OPENAI_API_KEY, OPENAI_API_KEY"),
-            "denied list not deduplicated: {stderr}"
+            denied[0]
+                .trim_end()
+                .ends_with("Denied env:    OPENAI_API_KEY, VAULT_TOKEN"),
+            "denied list not merged and deduplicated: {stderr}"
         );
 
         let _ = std::fs::remove_dir_all(&repo);
@@ -8393,6 +8407,48 @@ paths = [
             std::fs::read_to_string(&agents).unwrap(),
             "root-agents-marker\n",
             "exec must not write the managed block"
+        );
+    }
+
+    /// The brief exit tier (output policy): without --verbose a session that
+    /// changed a project file ends on one line with a count, and the
+    /// per-file list stays behind --verbose.
+    #[test]
+    fn e2e_session_exit_is_one_line_without_verbose() {
+        require_sandbox!();
+        let proj = tempfile::tempdir_in(scratch_home()).expect("project dir");
+        assert!(git_ok(proj.path(), &["init", "--quiet", "-b", "main"]));
+        assert!(git_ok(
+            proj.path(),
+            &["commit", "--quiet", "--allow-empty", "-m", "init"]
+        ));
+        let output = cplt_cmd()
+            .args(["--yes", "--no-validate", "--agent", "shell"])
+            .arg("--project-dir")
+            .arg(proj.path())
+            .args(["--", "-c", "echo x > brief-exit-marker.txt"])
+            .current_dir(proj.path())
+            .output()
+            .expect("cplt should run");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "stderr: {stderr}");
+        assert!(
+            proj.path().join("brief-exit-marker.txt").exists(),
+            "test premise: the session must change a project file.\nstderr: {stderr}"
+        );
+        let ended: Vec<&str> = stderr
+            .lines()
+            .filter(|l| l.contains("Session ended"))
+            .collect();
+        assert_eq!(ended.len(), 1, "one session line.\nstderr: {stderr}");
+        assert!(
+            ended[0].contains("Session ended (exit 0, ")
+                && ended[0].contains(" · project changes: "),
+            "the brief line carries the exit and a change count.\nstderr: {stderr}"
+        );
+        assert!(
+            !stderr.contains("brief-exit-marker.txt"),
+            "the per-file list belongs to --verbose.\nstderr: {stderr}"
         );
     }
 
