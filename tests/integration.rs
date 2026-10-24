@@ -5056,6 +5056,9 @@ public class T2 {
 
     #[test]
     fn real_profile_allows_jvm_attach_socket_in_tmp() {
+        let Some(py) = crate::common::sandbox_python3() else {
+            return;
+        };
         require_sandbox!();
         let project = fs::canonicalize(".").unwrap();
         let home = home_dir();
@@ -5064,7 +5067,9 @@ public class T2 {
         let profile = write_real_profile(&opts);
 
         // Simulate JVM Attach API: bind+connect a .java_pid<PID> socket
-        let cmd = r#"python3 -c "
+        let cmd = format!(
+            "{py} -c \"{}\"",
+            r"
 import socket, os, threading, time
 SOCK = '/tmp/.java_pid99999'
 try: os.unlink(SOCK)
@@ -5089,8 +5094,9 @@ c.close()
 s.close()
 os.unlink(SOCK)
 t.join(2)
-""#;
-        let (output, _) = run_sandboxed(&profile, cmd);
+"
+        );
+        let (output, _) = run_sandboxed(&profile, &cmd);
 
         fs::remove_file(&profile).ok();
         assert!(
@@ -5101,6 +5107,9 @@ t.join(2)
 
     #[test]
     fn real_profile_allows_jvm_attach_socket_in_var_folders() {
+        let Some(py) = crate::common::sandbox_python3() else {
+            return;
+        };
         require_sandbox!();
         let project = fs::canonicalize(".").unwrap();
         let home = home_dir();
@@ -5110,7 +5119,9 @@ t.join(2)
 
         // The JDK on macOS uses confstr(_CS_DARWIN_USER_TEMP_DIR) which returns
         // /var/folders/<xx>/<hash>/T/ — test bind+accept+connect at this path.
-        let cmd = r#"python3 -c "
+        let cmd = format!(
+            "{py} -c \"{}\"",
+            r"
 import socket, os, threading, time, ctypes, ctypes.util
 # Get the real darwin user temp dir via confstr(_CS_DARWIN_USER_TEMP_DIR = 65537)
 libc = ctypes.CDLL(ctypes.util.find_library('c'))
@@ -5140,8 +5151,9 @@ c.close()
 s.close()
 os.unlink(SOCK)
 t.join(2)
-""#;
-        let (output, _) = run_sandboxed(&profile, cmd);
+"
+        );
+        let (output, _) = run_sandboxed(&profile, &cmd);
 
         fs::remove_file(&profile).ok();
         assert!(
@@ -5152,6 +5164,9 @@ t.join(2)
 
     #[test]
     fn real_profile_allows_msbuild_socket_in_tmp() {
+        let Some(py) = crate::common::sandbox_python3() else {
+            return;
+        };
         require_sandbox!();
         let project = fs::canonicalize(".").unwrap();
         let home = home_dir();
@@ -5160,7 +5175,9 @@ t.join(2)
         let profile = write_real_profile(&opts);
 
         // Simulate MSBuild worker-node IPC: bind+connect a MSBuild<pid> socket
-        let cmd = r#"python3 -c "
+        let cmd = format!(
+            "{py} -c \"{}\"",
+            r"
 import socket, os, threading, time
 SOCK = '/tmp/MSBuild99999'
 try: os.unlink(SOCK)
@@ -5185,8 +5202,9 @@ c.close()
 s.close()
 os.unlink(SOCK)
 t.join(2)
-""#;
-        let (output, _) = run_sandboxed(&profile, cmd);
+"
+        );
+        let (output, _) = run_sandboxed(&profile, &cmd);
 
         fs::remove_file(&profile).ok();
         assert!(
@@ -5197,6 +5215,9 @@ t.join(2)
 
     #[test]
     fn real_profile_blocks_msbuild_socket_without_flag() {
+        let Some(py) = crate::common::sandbox_python3() else {
+            return;
+        };
         require_sandbox!();
         let project = fs::canonicalize(".").unwrap();
         let home = home_dir();
@@ -5204,7 +5225,9 @@ t.join(2)
         let profile = write_real_profile(&opts);
 
         // Without --allow-msbuild, binding a MSBuild<pid> socket must be denied.
-        let cmd = r#"python3 -c "
+        let cmd = format!(
+            "{py} -c \"{}\"",
+            r"
 import socket, os
 SOCK = '/tmp/MSBuild88888'
 try: os.unlink(SOCK)
@@ -5222,8 +5245,9 @@ except OSError as e:
         print(f'ERROR:{e}')
 finally:
     s.close()
-""#;
-        let (output, _) = run_sandboxed(&profile, cmd);
+"
+        );
+        let (output, _) = run_sandboxed(&profile, &cmd);
 
         fs::remove_file(&profile).ok();
         assert!(
@@ -5234,6 +5258,9 @@ finally:
 
     #[test]
     fn real_profile_blocks_ssh_agent_socket() {
+        let Some(py) = crate::common::sandbox_python3() else {
+            return;
+        };
         require_sandbox!();
         let project = fs::canonicalize(".").unwrap();
         let home = home_dir();
@@ -5242,7 +5269,9 @@ finally:
 
         // SSH_AUTH_SOCK on macOS is /private/tmp/com.apple.launchd.*/Listeners
         // The sandbox must NOT allow connecting to it — even though .java_pid* is allowed.
-        let cmd = r#"python3 -c "
+        let cmd = format!(
+            "{py} -c \"{}\"",
+            r"
 import socket, os
 sock_path = os.environ.get('SSH_AUTH_SOCK', '')
 if not sock_path:
@@ -5261,8 +5290,9 @@ else:
             print(f'ERROR:{e}')
     finally:
         s.close()
-""#;
-        let (output, _) = run_sandboxed(&profile, cmd);
+"
+        );
+        let (output, _) = run_sandboxed(&profile, &cmd);
 
         fs::remove_file(&profile).ok();
         // If no SSH agent running, skip the assertion
@@ -5276,6 +5306,9 @@ else:
 
     #[test]
     fn real_profile_blocks_arbitrary_unix_socket_in_tmp() {
+        let Some(py) = crate::common::sandbox_python3() else {
+            return;
+        };
         require_sandbox!();
         let project = fs::canonicalize(".").unwrap();
         let home = home_dir();
@@ -5283,7 +5316,9 @@ else:
         let profile = write_real_profile(&opts);
 
         // Non-.java_pid sockets in /tmp must be blocked
-        let cmd = r#"python3 -c "
+        let cmd = format!(
+            "{py} -c \"{}\"",
+            r"
 import socket, os
 SOCK = '/tmp/.cplt_evil_test'
 try: os.unlink(SOCK)
@@ -5303,8 +5338,9 @@ except OSError as e:
         print(f'ERROR:{e}')
 finally:
     s.close()
-""#;
-        let (output, _) = run_sandboxed(&profile, cmd);
+"
+        );
+        let (output, _) = run_sandboxed(&profile, &cmd);
 
         fs::remove_file(&profile).ok();
         assert!(
@@ -5321,7 +5357,7 @@ finally:
         let mut opts = default_opts(&project, &home);
         let allow_cache_exec = ["ms-playwright".to_string()];
         opts.allow_cache_exec = &allow_cache_exec;
-        let socket_guard = cplt::scratch::PlaywrightSocketDir::create().unwrap();
+        let socket_guard = cplt::scratch::SessionSocketDir::create().unwrap();
         let sibling = tempfile::Builder::new()
             .prefix("cplt-pw-integration-sibling-")
             .tempdir_in("/private/tmp")
@@ -5572,7 +5608,8 @@ if not owned_ok or sibling_result != 'SIBLING_BLOCKED':
 
     #[test]
     fn binary_rejects_home_project_dir() {
-        let home = std::env::var("HOME").unwrap();
+        // The HOME cplt sees, which `cplt_cmd` points at a scratch dir.
+        let home = crate::common::scratch_home().display().to_string();
         let output = cplt_cmd()
             .args(["--project-dir", &home, "--no-validate", "--", "--version"])
             .output()
@@ -5595,6 +5632,9 @@ if not owned_ok or sibling_result != 'SIBLING_BLOCKED':
 
     #[test]
     fn real_profile_allows_localhost_tcp_bind() {
+        let Some(py) = crate::common::sandbox_python3() else {
+            return;
+        };
         require_sandbox!();
         let project = fs::canonicalize(".").unwrap();
         let home = home_dir();
@@ -5604,7 +5644,9 @@ if not owned_ok or sibling_result != 'SIBLING_BLOCKED':
         // IPv4 localhost bind
         let (output, success) = run_sandboxed(
             &profile,
-            r#"python3 -c "
+            &format!(
+                "{py} -c \"{}\"",
+                r"
 import socket
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -5613,7 +5655,8 @@ s.listen(1)
 port = s.getsockname()[1]
 s.close()
 print(f'OK:{port}')
-""#,
+"
+            ),
         );
         assert!(
             success && output.contains("OK:"),
@@ -5623,7 +5666,9 @@ print(f'OK:{port}')
         // IPv6 localhost bind
         let (output, success) = run_sandboxed(
             &profile,
-            r#"python3 -c "
+            &format!(
+                "{py} -c \"{}\"",
+                r"
 import socket
 s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -5632,7 +5677,8 @@ s.listen(1)
 port = s.getsockname()[1]
 s.close()
 print(f'OK:{port}')
-""#,
+"
+            ),
         );
         assert!(
             success && output.contains("OK:"),
@@ -5647,6 +5693,9 @@ print(f'OK:{port}')
     /// This test documents the gap: wildcard bind is NOT denied by the sandbox.
     #[test]
     fn real_profile_wildcard_bind_is_sbpl_limitation() {
+        let Some(py) = crate::common::sandbox_python3() else {
+            return;
+        };
         require_sandbox!();
         let project = fs::canonicalize(".").unwrap();
         let home = home_dir();
@@ -5655,7 +5704,9 @@ print(f'OK:{port}')
 
         let (output, success) = run_sandboxed(
             &profile,
-            r#"python3 -c "
+            &format!(
+                "{py} -c \"{}\"",
+                r"
 import socket
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -5666,7 +5717,8 @@ try:
     print('ALLOWED')
 except Exception as e:
     print(f'DENIED:{e}')
-""#,
+"
+            ),
         );
 
         // This SHOULD be denied but SBPL can't distinguish localhost from INADDR_ANY.
@@ -5817,7 +5869,6 @@ except Exception as e:
                 "--project-dir",
                 &project.to_string_lossy(),
             ])
-            .env("HOME", home_dir())
             .output()
             .expect("Failed to run cplt --print-profile");
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -5855,7 +5906,6 @@ except Exception as e:
                 "--project-dir",
                 &project.to_string_lossy(),
             ])
-            .env("HOME", home_dir())
             .env("CPLT_CONFIG", &config)
             .output()
             .expect("Failed to run cplt --print-profile");

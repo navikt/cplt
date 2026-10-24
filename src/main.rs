@@ -6466,7 +6466,7 @@ struct AssembledSandbox {
     scratch_guard: Option<scratch::ScratchDir>,
     pnpm_shadow_guard: Option<scratch::PnpmShadowDir>,
     #[cfg(target_os = "macos")]
-    playwright_socket_guard: Option<scratch::PlaywrightSocketDir>,
+    playwright_socket_guard: Option<scratch::SessionSocketDir>,
     /// Serves `cplt worktree add` for as long as the agent runs. Dropping it
     /// stops the worker and removes the socket.
     worktree_broker: Option<cplt::worktree_broker::Broker>,
@@ -6502,7 +6502,7 @@ fn start_worktree_broker(
 #[cfg(target_os = "macos")]
 fn create_playwright_socket_dir(
     resolved: &config::Resolved,
-) -> anyhow::Result<Option<scratch::PlaywrightSocketDir>> {
+) -> anyhow::Result<Option<scratch::SessionSocketDir>> {
     let intent = sandbox::playwright_runtime_intent(
         &resolved.allow_cache_exec,
         resolved.allow_cache_exec_any,
@@ -6535,7 +6535,7 @@ fn create_playwright_socket_dir(
         return Ok(None);
     }
 
-    scratch::PlaywrightSocketDir::create()
+    scratch::SessionSocketDir::create()
         .map(Some)
         .map_err(|error| anyhow::anyhow!("Cannot create Playwright socket dir: {error}"))
 }
@@ -6600,7 +6600,7 @@ fn assemble_sandbox(
     #[cfg(target_os = "macos")]
     let playwright_socket_path = playwright_socket_guard
         .as_ref()
-        .map(cplt::scratch::PlaywrightSocketDir::path);
+        .map(cplt::scratch::SessionSocketDir::path);
     #[cfg(not(target_os = "macos"))]
     let playwright_socket_path = None;
 
@@ -15353,16 +15353,29 @@ mod tests {
     /// never in the main checkout it shares a `.git` with.
     #[test]
     fn agents_md_path_is_worktree_root_in_linked_worktree() {
-        let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("main");
-        std::fs::create_dir(&main).unwrap();
-        git_in(&main, &["init", "--quiet"]);
-        git_in(&main, &["commit", "--quiet", "--allow-empty", "-m", "init"]);
-        git_in(&main, &["worktree", "add", "--quiet", "../wt"]);
-        let wt = std::fs::canonicalize(dir.path().join("wt")).unwrap();
-        let sub = wt.join("src");
-        std::fs::create_dir(&sub).unwrap();
-        assert_eq!(agents_md_path(&sub), Some(wt.join("AGENTS.md")));
+        // The git spawns read HOME and XDG, which other tests in this binary
+        // set through temp_env, so hold its lock. The bin crate cannot reach
+        // the lib's cfg(test) `with_env_lock_no_xdg`; this is its body.
+        temp_env::with_vars_unset(
+            [
+                "XDG_CONFIG_HOME",
+                "XDG_DATA_HOME",
+                "XDG_STATE_HOME",
+                "XDG_CACHE_HOME",
+            ],
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let main = dir.path().join("main");
+                std::fs::create_dir(&main).unwrap();
+                git_in(&main, &["init", "--quiet"]);
+                git_in(&main, &["commit", "--quiet", "--allow-empty", "-m", "init"]);
+                git_in(&main, &["worktree", "add", "--quiet", "../wt"]);
+                let wt = std::fs::canonicalize(dir.path().join("wt")).unwrap();
+                let sub = wt.join("src");
+                std::fs::create_dir(&sub).unwrap();
+                assert_eq!(agents_md_path(&sub), Some(wt.join("AGENTS.md")));
+            },
+        );
     }
 
     /// A bare repo has no work tree, so there is nothing to commit the managed
