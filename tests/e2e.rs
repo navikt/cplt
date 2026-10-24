@@ -24,17 +24,14 @@ mod e2e_tests {
     use std::process::Command;
 
     use crate::common::{
-        bare_origin_repo, binary_path, cplt_cmd, cplt_cmd_with_ambient_config, cplt_local, git_cmd,
-        git_ok, hold_port, home_temp_dir, make_config_home, processes_with_env, real_home,
-        scratch_home, shim_cmd, signal_group, temp_repo,
+        bare_origin_repo, binary_path, cplt_cmd, cplt_cmd_with_ambient_config, cplt_local,
+        fake_agent, git_cmd, git_ok, hold_port, home_temp_dir, make_config_home,
+        processes_with_env, project_dir, real_home, sandbox_usable, scratch_home, shim_cmd,
+        signal_group, temp_repo,
     };
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static FAKE_COPILOT_COUNTER: AtomicU32 = AtomicU32::new(0);
-
-    fn project_dir() -> PathBuf {
-        std::fs::canonicalize(".").unwrap()
-    }
 
     /// Check if `copilot` CLI is available. Tests that require it should call this
     /// and return early if false — allows the test suite to pass in CI where
@@ -44,25 +41,6 @@ mod e2e_tests {
             .arg("copilot")
             .output()
             .is_ok_and(|o| o.status.success())
-    }
-
-    /// Check if sandbox-exec can apply a trivial profile.
-    /// Returns false when running inside an existing sandbox (nested sandbox-exec is denied).
-    fn sandbox_exec_available() -> bool {
-        Command::new("sandbox-exec")
-            .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
-            .output()
-            .is_ok_and(|o| o.status.success())
-    }
-
-    /// When `CPLT_TEST_REQUIRE_SANDBOX=1` is set (CI), a missing sandbox
-    /// capability must FAIL the test rather than silently skip. This mirrors the
-    /// Linux `require_sandbox_enforced()` in `integration_linux.rs` and closes the
-    /// gap where a `sandbox-exec`/Seatbelt regression on the macOS runner would
-    /// leave CI green because every enforcement test self-skipped. Default (unset)
-    /// behaviour is unchanged for local dev / nested-sandbox runs.
-    fn require_sandbox_enforced() -> bool {
-        std::env::var("CPLT_TEST_REQUIRE_SANDBOX").as_deref() == Ok("1")
     }
 
     /// Skip guard — call at the top of tests that need the REAL Copilot CLI.
@@ -88,18 +66,11 @@ mod e2e_tests {
     /// Skip guard — call at the top of tests that invoke sandbox-exec.
     ///
     /// Skips when already inside a sandbox (nested sandbox-exec is denied by
-    /// macOS). Under `CPLT_TEST_REQUIRE_SANDBOX=1` the skip branch panics instead,
-    /// so a missing/broken `sandbox-exec` on the CI runner turns the job red.
+    /// macOS). Under `CPLT_TEST_REQUIRE_SANDBOX=1` [`sandbox_usable`] panics
+    /// instead, so a broken `sandbox-exec` on the CI runner turns the job red.
     macro_rules! require_sandbox {
         () => {
-            if !sandbox_exec_available() {
-                if require_sandbox_enforced() {
-                    panic!(
-                        "sandbox-exec required by CPLT_TEST_REQUIRE_SANDBOX but unavailable \
-                         (a trivial profile failed to apply — Seatbelt/sandbox-exec regression?)"
-                    );
-                }
-                eprintln!("SKIPPED: sandbox-exec not available (likely already sandboxed)");
+            if !sandbox_usable() {
                 return;
             }
         };
@@ -1233,18 +1204,7 @@ mod e2e_tests {
     /// including on panic (Drop runs during unwind). The `.cplt-e2e-` prefix
     /// keeps the single defensive `.gitignore` pattern effective on SIGKILL.
     fn create_fake_copilot() -> tempfile::TempDir {
-        let dir = tempfile::Builder::new()
-            .prefix(".cplt-e2e-fake-copilot-")
-            .tempdir_in(project_dir())
-            .expect("create fake copilot dir");
-        let script = dir.path().join("copilot");
-        std::fs::write(&script, "#!/bin/sh\nenv | sort\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        dir
+        fake_agent("copilot", "env | sort\n")
     }
 
     /// Run cplt with fake copilot and capture the environment output.
@@ -2230,19 +2190,10 @@ mod e2e_tests {
     /// A fake agent under the checkout (exec is denied under /tmp), printing
     /// each argument on its own line so the argv can be compared exactly.
     fn fake_agent_dir(name: &str) -> tempfile::TempDir {
-        let dir = tempfile::Builder::new()
-            .prefix(".cplt-e2e-fake-copilot-")
-            .tempdir_in(project_dir())
-            .expect("create fake agent dir");
-        let script = dir.path().join(name);
-        std::fs::write(
-            &script,
-            "#!/bin/sh\necho REAL-AGENT\nfor arg in \"$@\"; do echo \"ARG:$arg\"; done\n",
+        fake_agent(
+            name,
+            "echo REAL-AGENT\nfor arg in \"$@\"; do echo \"ARG:$arg\"; done\n",
         )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        dir
     }
 
     /// Install the shims into a fresh HOME with `fake` on PATH, as a user would.
@@ -5040,11 +4991,7 @@ paths = [
         // rather than the profile string: a relative deny path in a committed
         // `.cplt.toml`, written the way people actually write one, blocks the
         // read. Pre-fix this printed the file contents.
-        if !sandbox_exec_available() {
-            assert!(
-                !require_sandbox_enforced(),
-                "CPLT_TEST_REQUIRE_SANDBOX=1 but sandbox-exec is unavailable"
-            );
+        if !sandbox_usable() {
             return;
         }
         let repo =
@@ -7050,17 +6997,7 @@ paths = [
         require_sandbox!();
         let (repo, config_file) =
             make_trust_repo("cli-deny-env", "[deny]\nenv = [\"VAULT_TOKEN\"]\n");
-        let fake_dir = tempfile::Builder::new()
-            .prefix(".cplt-e2e-fake-cli-deny-env-")
-            .tempdir_in(project_dir())
-            .expect("create fake copilot dir");
-        let script = fake_dir.path().join("copilot");
-        std::fs::write(&script, "#!/bin/sh\nenv | sort\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        let fake_dir = create_fake_copilot();
         let current_path = std::env::var("PATH").unwrap_or_default();
         let new_path = format!("{}:{current_path}", fake_dir.path().display());
 

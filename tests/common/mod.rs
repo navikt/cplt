@@ -119,6 +119,71 @@ pub fn with_scratch_home(cmd: &mut Command) {
         .env_remove("XDG_CACHE_HOME");
 }
 
+/// The checkout, canonicalized: the tree the suites build fixtures in when
+/// the sandbox must execute them (exec is denied under `/tmp`).
+///
+/// It is also why a test that launches *in* the checkout can see warnings a
+/// fresh project would not: when the checkout is a linked worktree whose
+/// shared `.git` lies outside the [`scratch_home`] HOME, cplt says so on
+/// stderr. A test asserting clean stderr builds its project under
+/// [`scratch_home`] instead (see `e2e_exec_no_output_contamination`).
+///
+/// # Panics
+/// If the working directory cannot be resolved.
+#[must_use]
+pub fn project_dir() -> PathBuf {
+    std::fs::canonicalize(".").unwrap()
+}
+
+/// Whether this host can launch the sandbox: Seatbelt on macOS, Bubblewrap
+/// elsewhere. Under `CPLT_TEST_REQUIRE_SANDBOX=1` (CI) a missing one fails
+/// the test instead of skipping it.
+///
+/// # Panics
+/// If the sandbox is required but unavailable.
+#[must_use]
+pub fn sandbox_usable() -> bool {
+    let ok = if cfg!(target_os = "macos") {
+        Command::new("sandbox-exec")
+            .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
+            .output()
+    } else {
+        Command::new("bwrap")
+            .args(["--unshare-user", "--ro-bind", "/", "/", "--proc", "/proc"])
+            .args(["--dev", "/dev", "/bin/true"])
+            .output()
+    }
+    .is_ok_and(|o| o.status.success());
+    if !ok {
+        assert!(
+            std::env::var("CPLT_TEST_REQUIRE_SANDBOX").as_deref() != Ok("1"),
+            "sandbox required by CPLT_TEST_REQUIRE_SANDBOX but unavailable"
+        );
+        eprintln!("SKIPPED: sandbox not available (likely already sandboxed)");
+    }
+    ok
+}
+
+/// A dir under the checkout (exec is denied under `/tmp`) holding an
+/// executable `name` that runs `body` under `/bin/sh`. Removed on drop,
+/// panics included; the `.cplt-e2e-` prefix keeps the defensive
+/// `.gitignore` pattern effective if a run is killed.
+///
+/// # Panics
+/// If the directory or script cannot be created.
+#[must_use]
+pub fn fake_agent(name: &str, body: &str) -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::Builder::new()
+        .prefix(".cplt-e2e-fake-copilot-")
+        .tempdir_in(project_dir())
+        .expect("create fake agent dir");
+    let script = dir.path().join(name);
+    std::fs::write(&script, format!("#!/bin/sh\n{body}")).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    dir
+}
+
 /// A cplt PATH shim (#514) run directly, isolated the way [`cplt_cmd`] is: the
 /// shim execs `cplt`, which then reads no ambient config unless the test
 /// points `CPLT_CONFIG` somewhere itself. The environment is cleared, so the
