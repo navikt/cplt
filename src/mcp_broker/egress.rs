@@ -22,6 +22,10 @@ pub fn egress_allowed(target: &str, hosts: &[String]) -> Result<String, String> 
     {
         return Err("not a hostname".into());
     }
+    // An allowed parent never lets a blocked child through.
+    if crate::proxy::is_blocked_in_list(&host, &crate::proxy::builtin_blocklist()) {
+        return Err(format!("{host} is on cplt's blocked-domains list"));
+    }
     if crate::proxy::is_domain_match(&host, hosts) {
         Ok(host)
     } else {
@@ -93,6 +97,9 @@ mod tests {
         assert!(egress_allowed("console.nav.cloud.nais.io:80", &hosts).is_err());
         assert!(egress_allowed("evilconsole.nav.cloud.nais.io:443", &hosts).is_err());
         assert!(egress_allowed("example.com:443", &hosts).is_err());
+        let parent = vec!["mozilla.org".to_string()];
+        assert!(egress_allowed("www.mozilla.org:443", &parent).is_ok());
+        assert!(egress_allowed("paste.mozilla.org:443", &parent).is_err());
         assert!(crate::proxy::is_private_ip(&"127.0.0.1".parse().unwrap()));
         assert!(crate::proxy::is_private_ip(&"10.1.2.3".parse().unwrap()));
         assert!(crate::proxy::is_private_ip(
