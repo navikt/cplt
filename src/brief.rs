@@ -954,6 +954,7 @@ mod tests {
             allow_read: Vec::new(),
             allow_write: Vec::new(),
             tool_roots: Vec::new(),
+            allow_write_state: Vec::new(),
             allow_exec: Vec::new(),
             allow_socket: Vec::new(),
             deny_paths: Vec::new(),

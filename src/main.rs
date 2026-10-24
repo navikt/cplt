@@ -1661,7 +1661,7 @@ fn has_tty() -> bool {
 /// record lives in cplt's state dir, which the sandbox denies, so the agent
 /// cannot mark a widened profile as confirmed.
 ///
-/// Untrusted `.cplt.toml` keys (`pending`) always ask. Only a launch where a
+/// Untrusted `.cplt.toml` keys and an explicit `--no-yes` (`pending`) always ask. Only a launch where a
 /// person saw the full table on a TTY records: a scripted `--yes` run must not
 /// pre-confirm the next interactive one.
 fn confirm_launch(
@@ -1736,15 +1736,6 @@ fn prompt_confirm(auto_yes: bool, quiet: bool) -> Result<(), String> {
     } else {
         Err("Aborted by user".to_string())
     }
-}
-
-/// The `--allow-write-state` grants, resolved the way `resolve_context` adds
-/// them to `allow_write`, so the audit can tell them apart (it warns there).
-fn write_state_paths(cli: &Cli) -> Vec<PathBuf> {
-    cli.allow_write_state
-        .iter()
-        .filter_map(|p| std::fs::canonicalize(p).ok())
-        .collect()
 }
 
 /// Canonicalize a list of allow paths, warning on failures and dropping one
@@ -2801,10 +2792,8 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
     // Canonicalize CLI paths for consistency with config path handling
     let cli_allow_read = canonicalize_paths(&cli.allow_read, "--allow-read");
     let mut cli_allow_write = canonicalize_paths(&cli.allow_write, "--allow-write");
-    cli_allow_write.extend(canonicalize_paths(
-        &cli.allow_write_state,
-        "--allow-write-state",
-    ));
+    let cli_allow_write_state = canonicalize_paths(&cli.allow_write_state, "--allow-write-state");
+    cli_allow_write.extend(cli_allow_write_state.iter().cloned());
     let cli_allow_exec = canonicalize_paths(&cli.allow_exec, "--allow-exec");
     let cli_allow_socket = canonicalize_paths(&cli.allow_socket, "--allow-socket");
     let cli_deny_paths = canonicalize_deny_paths(&cli.deny_paths)?;
@@ -3057,6 +3046,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         Ok(r) => r,
         Err(e) => bail!("{e}"),
     };
+    resolved.allow_write_state = cli_allow_write_state;
     // `.cplt.toml`'s deny.env extends this list later; dedup here too for
     // launches without one.
     resolved.deny_env.extend(cli.deny_env.iter().cloned());
@@ -5081,7 +5071,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     confirm_launch(
         &resolved,
         confirm.as_ref(),
-        !unapproved_proposals.is_empty(),
+        !unapproved_proposals.is_empty() || cli.no_yes,
         &home_dir,
         &project_dir,
     )?;
@@ -5190,7 +5180,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     let (exit_code, snapshot, settled) = audit::run(
         &project_dir,
         &resolved.allow_write,
-        &write_state_paths(&cli),
+        &resolved.allow_write_state,
         &repo_paths,
         audit::AuditMode::for_run(audit_enabled, cli.observe_domains),
         &routing,
@@ -7232,7 +7222,7 @@ fn run_exec_command(
     confirm_launch(
         &resolved,
         confirm.as_ref(),
-        !unapproved_proposals.is_empty(),
+        !unapproved_proposals.is_empty() || cli.no_yes,
         &home_dir,
         &project_dir,
     )?;
@@ -7256,7 +7246,7 @@ fn run_exec_command(
     let (exit_code, snapshot, settled) = audit::run(
         &project_dir,
         &resolved.allow_write,
-        &write_state_paths(cli),
+        &resolved.allow_write_state,
         &repo_paths,
         audit::AuditMode::for_run(audit_enabled, cli.observe_domains),
         &routing,

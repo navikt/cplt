@@ -997,6 +997,9 @@ pub struct Resolved {
     /// Tool roots relocated by parent env (`CARGO_HOME`, ...), set by the host
     /// probe. Kept here so the launch confirmation hash covers them.
     pub tool_roots: Vec<crate::sandbox::ToolRoot>,
+    /// The `--allow-write-state` grants (also in `allow_write`), as resolved
+    /// once at launch; the exit audit leaves them out of its unaudited list.
+    pub allow_write_state: Vec<PathBuf>,
     /// Trees the agent may execute binaries from (`allow.exec` / `--allow-exec`).
     /// Read + execute, never write — see `sandbox::validate_exec_grants`.
     pub allow_exec: Vec<PathBuf>,

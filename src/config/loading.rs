@@ -662,6 +662,7 @@ impl Config {
             allow_read,
             allow_write,
             tool_roots: Vec::new(),
+            allow_write_state: Vec::new(),
             allow_exec,
             allow_socket,
             deny_paths,

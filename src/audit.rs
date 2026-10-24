@@ -2605,7 +2605,7 @@ pub fn run<F: FnOnce() -> u8, C: FnOnce() -> Option<proxy::ProxySnapshot>>(
             for p in state {
                 ui::info(&format!(
                     "Tool state (writable, not audited): {}",
-                    p.display()
+                    escape_path(&p.display().to_string())
                 ));
             }
         }
