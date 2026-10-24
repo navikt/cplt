@@ -25,8 +25,8 @@ mod e2e_tests {
 
     use crate::common::{
         bare_origin_repo, binary_path, cplt_cmd, cplt_cmd_with_ambient_config, cplt_local, git_cmd,
-        git_ok, hold_port, home_temp_dir, make_config_home, processes_with_env, shim_cmd,
-        signal_group, temp_repo,
+        git_ok, hold_port, home_temp_dir, make_config_home, processes_with_env, real_home,
+        scratch_home, shim_cmd, signal_group, temp_repo,
     };
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -705,7 +705,10 @@ mod e2e_tests {
 
     #[test]
     fn e2e_doctor_hides_the_home_directory() {
+        // Real HOME, opted in: the checkout must sit under the HOME doctor
+        // shortens to `~`. Doctor writes no launch state.
         let output = cplt_cmd()
+            .env("HOME", real_home())
             .args(["--agent", "shell", "doctor"])
             .current_dir(project_dir())
             .output()
@@ -723,7 +726,9 @@ mod e2e_tests {
 
     #[test]
     fn e2e_doctor_verbose_prints_the_inventory() {
+        // Real HOME, opted in, for the same reason as the test above.
         let output = cplt_cmd()
+            .env("HOME", real_home())
             .args(["--agent", "shell", "doctor", "--verbose"])
             .current_dir(project_dir())
             .output()
@@ -8396,9 +8401,14 @@ paths = [
         // exec must not contaminate stdout or stderr with cplt startup messages —
         // both must be clean so it is safe to use in pipes and shell aliases.
         require_sandbox!();
+        // Not the checkout: when that is a linked worktree whose shared `.git`
+        // sits outside the scratch HOME, cplt rightly warns on stderr. Nor
+        // `/tmp`, which resolves under /private/var/folders and warns too.
+        let proj = tempfile::tempdir_in(scratch_home()).expect("project dir");
+        assert!(git_ok(proj.path(), &["init", "--quiet"]));
         let output = cplt_cmd()
             .args(["--no-validate", "exec", "--", "/usr/bin/true"])
-            .current_dir(project_dir())
+            .current_dir(proj.path())
             .output()
             .expect("cplt exec should run");
 
@@ -8753,9 +8763,14 @@ paths = [
             .expect("cplt should print the explicit-override profile");
         assert!(profile.status.success());
         let profile = String::from_utf8_lossy(&profile.stdout);
+        // Not a bare `/private/tmp/cplt-pw-` match: the session socket dir is
+        // shared with the MCP and worktree brokers, whose connect-only grants
+        // land in every profile. Only the Playwright grant may bind there.
         assert!(
             !profile.contains("Per-session Playwright control sockets")
-                && !profile.contains("/private/tmp/cplt-pw-"),
+                && !profile.contains(
+                    "(allow network-bind (local unix-socket (subpath \"/private/tmp/cplt-pw-"
+                ),
             "caller-owned override must not receive an automatic socket grant"
         );
     }
@@ -9254,8 +9269,7 @@ paths = [
     fn e2e_check_path_protected_blocked() {
         require_sandbox!();
         let proj = check_project();
-        let home = std::env::var("HOME").expect("HOME");
-        let ssh = format!("{home}/.ssh");
+        let ssh = format!("{}/.ssh", scratch_home().display());
         let output = cplt_cmd()
             .args(["--agent", "shell"])
             .arg("--project-dir")
@@ -10561,7 +10575,10 @@ paths = [
     /// anything else (EINPROGRESS, a send, a route error) when it allows it.
     #[test]
     fn e2e_udp_443_is_denied_and_tcp_443_is_not() {
-        const PROBE: &str = r#"python3 -c "
+        let Some(py) = crate::common::sandbox_python3() else {
+            return;
+        };
+        const PROBE: &str = r#"-c "
 import errno, socket
 u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 try:
@@ -10592,7 +10609,7 @@ print('TCP_' + ('OK' if r == 0 else errno.errorcode.get(r, str(r))))
                 .arg("--project-dir")
                 .arg(project.path())
                 .args(&extra)
-                .args(["--", "-c", PROBE])
+                .args(["--", "-c", &format!("{py} {PROBE}")])
                 .output()
                 .expect("run cplt");
             let stdout = String::from_utf8_lossy(&out.stdout);

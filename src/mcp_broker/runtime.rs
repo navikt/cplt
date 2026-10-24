@@ -104,7 +104,7 @@ impl Drop for Permit {
 pub struct Broker {
     socket: PathBuf,
     #[cfg(target_os = "macos")]
-    _dir: crate::scratch::PlaywrightSocketDir,
+    _dir: crate::scratch::SessionSocketDir,
     #[cfg(not(target_os = "macos"))]
     _dir: SocketDir,
     shared: Arc<Shared>,
@@ -117,7 +117,7 @@ impl Broker {
     pub fn start(specs: Vec<Spec>, home: &Path, log: Log) -> Result<Self, String> {
         use std::os::unix::fs::PermissionsExt;
         #[cfg(target_os = "macos")]
-        let dir = crate::scratch::PlaywrightSocketDir::create()?;
+        let dir = crate::scratch::SessionSocketDir::create()?;
         #[cfg(not(target_os = "macos"))]
         let dir = SocketDir::create()?;
         let socket = dir.path().join("m");

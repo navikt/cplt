@@ -6446,7 +6446,7 @@ struct AssembledSandbox {
     scratch_guard: Option<scratch::ScratchDir>,
     pnpm_shadow_guard: Option<scratch::PnpmShadowDir>,
     #[cfg(target_os = "macos")]
-    playwright_socket_guard: Option<scratch::PlaywrightSocketDir>,
+    playwright_socket_guard: Option<scratch::SessionSocketDir>,
     /// Serves `cplt worktree add` for as long as the agent runs. Dropping it
     /// stops the worker and removes the socket.
     worktree_broker: Option<cplt::worktree_broker::Broker>,
@@ -6482,7 +6482,7 @@ fn start_worktree_broker(
 #[cfg(target_os = "macos")]
 fn create_playwright_socket_dir(
     resolved: &config::Resolved,
-) -> anyhow::Result<Option<scratch::PlaywrightSocketDir>> {
+) -> anyhow::Result<Option<scratch::SessionSocketDir>> {
     let intent = sandbox::playwright_runtime_intent(
         &resolved.allow_cache_exec,
         resolved.allow_cache_exec_any,
@@ -6515,7 +6515,7 @@ fn create_playwright_socket_dir(
         return Ok(None);
     }
 
-    scratch::PlaywrightSocketDir::create()
+    scratch::SessionSocketDir::create()
         .map(Some)
         .map_err(|error| anyhow::anyhow!("Cannot create Playwright socket dir: {error}"))
 }
@@ -6580,7 +6580,7 @@ fn assemble_sandbox(
     #[cfg(target_os = "macos")]
     let playwright_socket_path = playwright_socket_guard
         .as_ref()
-        .map(cplt::scratch::PlaywrightSocketDir::path);
+        .map(cplt::scratch::SessionSocketDir::path);
     #[cfg(not(target_os = "macos"))]
     let playwright_socket_path = None;
 

@@ -4210,7 +4210,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn validates_only_a_live_created_playwright_socket_capability() {
-        let guard = crate::scratch::PlaywrightSocketDir::create().expect("create socket dir");
+        let guard = crate::scratch::SessionSocketDir::create().expect("create socket dir");
         let path = guard.path().to_path_buf();
 
         validate_playwright_socket_capability(Some(&path)).expect("live capability must validate");

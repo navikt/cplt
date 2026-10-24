@@ -177,7 +177,7 @@ impl Context {
 pub struct Broker {
     socket: PathBuf,
     #[cfg(target_os = "macos")]
-    _socket_dir: crate::scratch::PlaywrightSocketDir,
+    _socket_dir: crate::scratch::SessionSocketDir,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     #[cfg(target_os = "macos")]
@@ -190,7 +190,7 @@ impl Broker {
     #[cfg(target_os = "macos")]
     pub fn start(ctx: Context) -> Result<Self, String> {
         secure_dir(&ctx.base, "worktree base")?;
-        let socket_dir = crate::scratch::PlaywrightSocketDir::create()?;
+        let socket_dir = crate::scratch::SessionSocketDir::create()?;
         let socket = socket_dir.path().join("s");
         if socket.as_os_str().len() > SOCKET_PATH_MAX {
             return Err("the worktree broker socket exceeds the Unix socket path limit".into());
