@@ -113,7 +113,7 @@ pub fn changed_fields(
     }
     let new = field_lines(fields);
     let new: Vec<&str> = new.lines().skip(1).collect();
-    let name = |l: &str| l.split_once(' ').map_or(l, |(n, _)| n).to_string();
+    let name = |l: &str| l.rsplit_once(' ').map_or(l, |(n, _)| n).to_string();
     new.iter()
         .filter(|l| !old.contains(l))
         .chain(old.iter().filter(|l| !new.contains(l)))
@@ -252,7 +252,7 @@ mod tests {
         use super::Confirmation;
         let home = tempfile::tempdir().unwrap();
         let (h, p) = (home.path(), home.path().join("p"));
-        let f = |a: &str, b: &str| vec![("a".to_string(), a.to_string()), ("b".into(), b.into())];
+        let f = |a: &str, b: &str| vec![("a".to_string(), a.to_string()), ("b c".into(), b.into())];
         let c = |content: &str, fields, tty| {
             Confirmation::new(h, &p, "A", content.into(), tty).with_fields(fields)
         };
@@ -263,10 +263,10 @@ mod tests {
         // so the old profile stays quiet afterwards.
         let changed = c("y", f("1", "3"), true);
         assert!(changed.display_changed(h, &p));
-        assert_eq!(changed.changed_fields(h, &p), ["b"]);
+        assert_eq!(changed.changed_fields(h, &p), ["b c"]);
         // Each name once, even when a field appears twice.
         let twice = vec![("b".to_string(), "9".to_string()), ("b".into(), "8".into())];
-        assert_eq!(c("z", twice, true).changed_fields(h, &p), ["a", "b"]);
+        assert_eq!(c("z", twice, true).changed_fields(h, &p), ["a", "b", "b c"]);
         assert!(!c("x", f("1", "2"), true).display_changed(h, &p));
         // An accepted headless launch updates the display, never the confirmation.
         c("y", f("1", "3"), false).record_display(h, &p);
