@@ -16,8 +16,8 @@
 //! are agent-writable; editing them changes only what the agent trusts,
 //! never what the proxy trusts, which is held in memory.
 //!
-//! Any setup failure leaves injection off and the real token in place, with
-//! one line at launch: never a failed launch.
+//! Any setup failure refuses the launch with a message saying what to fix:
+//! never a silent fallback to the real token.
 
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
@@ -47,7 +47,7 @@ const EMBEDDING_VARS: &[&str] = &["OPENCODE_AUTH_CONTENT"];
 /// User CA files already in the environment. Concatenated into cplt's
 /// bundles, never replaced: a corporate TLS-inspecting proxy breaks
 /// otherwise.
-const USER_CA_VARS: &[&str] = &["SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS", "GIT_SSL_CAINFO"];
+pub const USER_CA_VARS: &[&str] = &["SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS", "GIT_SSL_CAINFO"];
 
 /// System root bundles, first hit wins: macOS / Alpine / Arch, Debian /
 /// Ubuntu, Fedora / RHEL, openSUSE.
@@ -105,7 +105,7 @@ pub fn setup(scratch: &Path) -> Result<(), String> {
         .find_map(|p| read_ca_file(Path::new(p)))
         .ok_or("no system CA bundle found")?;
     // A CA the user set but cplt cannot load would be missing from the
-    // bundles and break every client behind a corporate proxy: fall back.
+    // bundles and break every client behind a corporate proxy: refuse.
     let mut user = String::new();
     for var in USER_CA_VARS {
         let Some(path) = std::env::var_os(var).filter(|p| !p.is_empty()) else {

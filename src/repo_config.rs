@@ -254,7 +254,9 @@ pub struct LoadedRepoConfig {
 }
 
 /// Environment variables a `.cplt.toml` may not deny, because cplt sets them
-/// for the agent itself. Prefix `__CPLT_` is refused separately.
+/// for the agent itself. Prefix `__CPLT_` is refused separately. Every
+/// `token_inject::CA_VARS` entry must be here: denying one would switch token
+/// injection off and hand the agent the real token (tested below).
 const RESERVED_DENY_ENV: &[&str] = &[
     "PATH",
     "HOME",
@@ -267,6 +269,7 @@ const RESERVED_DENY_ENV: &[&str] = &[
     "no_proxy",
     "SSL_CERT_FILE",
     "NODE_EXTRA_CA_CERTS",
+    "GIT_SSL_CAINFO",
     "REQUESTS_CA_BUNDLE",
 ];
 
@@ -1099,6 +1102,13 @@ preset = \"full-trust\"\n",
         assert!(toml::from_str::<RepoConfig>("this is = = not toml [[[\n").is_err());
     }
     use super::*;
+
+    #[test]
+    fn every_token_inject_ca_var_is_reserved() {
+        for v in crate::token_inject::CA_VARS {
+            assert!(RESERVED_DENY_ENV.contains(v), "{v} must be reserved");
+        }
+    }
 
     /// Runs a git command in `dir` with a fixed identity, for the loader tests.
     #[allow(clippy::disallowed_methods)] // test fixture: PATH is the harness's, not an agent's
