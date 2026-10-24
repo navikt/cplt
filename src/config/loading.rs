@@ -1579,29 +1579,62 @@ impl Resolved {
             .map(|l| strip_ansi(l).replace(&port, "localhost:PORT"))
             .collect();
         stable.push(agent.display_name().to_string());
+        let mut fields = vec![("table".to_string(), stable.join("\n"))];
         if let Some(path) = &self.allowed_domains {
             let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
-            stable.push(format!("{} {mtime:?}", path.display()));
+            let line = format!("{} {mtime:?}", path.display());
+            fields.push(("allowlist file".into(), line.clone()));
+            stable.push(line);
         }
         // The table does not show every widening (domain lists, hardening
         // toggles), so the confirmation also covers every resolved setting.
         // ponytail: Debug output, so a new Resolved field is covered for free;
         // it may re-prompt once after an upgrade that changes the format.
-        stable.push(self.policy_fingerprint());
+        let fingerprint = self.policy_fingerprint();
+        // Top-level fields sit at four spaces; deeper lines belong to the
+        // field above them.
+        for line in fingerprint.lines() {
+            match line.strip_prefix("    ").filter(|f| !f.starts_with(' ')) {
+                Some(field) => fields.push((
+                    field.split_once(':').map_or(field, |(n, _)| n).to_string(),
+                    line.to_string(),
+                )),
+                None => {
+                    if let Some((_, value)) = fields.last_mut() {
+                        value.push('\n');
+                        value.push_str(line);
+                    }
+                }
+            }
+        }
+        stable.push(fingerprint);
         let stable = stable.join("\n");
-        let topic = format!("summary-{}", agent.display_name());
-        let changed = crate::launch_state::changed(home_dir, project_dir, &topic, &stable);
         let mut confirm = crate::launch_state::Confirmation::new(
             home_dir,
             project_dir,
             agent.display_name(),
             stable,
             tty,
-        );
-        // The prompt shows what it asks about: the full table, unless this
-        // exact profile was confirmed before (then there is no prompt).
+        )
+        .with_fields(fields);
+        // With a TTY: the full table once per change, and whenever there is a
+        // prompt. Headless: only the profile last confirmed on a TTY is quiet.
+        let changed = if tty {
+            confirm.display_changed(home_dir, project_dir)
+        } else {
+            !confirm.seen
+        };
         if full || changed || (!self.yes && !confirm.confirmed) {
             confirm.shown = tty;
+            if changed {
+                let names = confirm.changed_fields(home_dir, project_dir);
+                if !names.is_empty() {
+                    eprintln!(
+                        "{blue}[cplt]{nc} Changed since last launch: {}",
+                        names.join(", ")
+                    );
+                }
+            }
             for line in &lines {
                 eprintln!("{line}");
             }

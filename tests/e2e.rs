@@ -1344,11 +1344,11 @@ mod e2e_tests {
         );
     }
 
-    /// Output policy: the full table prints when the effective profile changed
-    /// since the last launch in this project, CLI flags included, and a single
-    /// summary line otherwise.
+    /// Output policy, headless: only a profile last confirmed on a TTY prints
+    /// the single summary line, and a headless `--yes` launch records nothing,
+    /// so the full table prints every time here (no TTY ever confirmed it).
     #[test]
-    fn e2e_summary_table_reprints_when_a_cli_flag_changes_the_profile() {
+    fn e2e_headless_launch_never_records_the_profile() {
         require_sandbox!();
         let (_, fake_dir) = cplt_cmd_with_fake_copilot();
         let home = tempfile::tempdir().unwrap();
@@ -1374,8 +1374,8 @@ mod e2e_tests {
         let first = launch(&[]);
         assert!(first.contains("Sandbox Configuration"), "{first}");
         let second = launch(&[]);
-        assert!(!second.contains("Sandbox Configuration"), "{second}");
-        assert!(second.contains("unchanged since last launch"), "{second}");
+        assert!(second.contains("Sandbox Configuration"), "{second}");
+        assert!(!second.contains("Changed since last launch"), "{second}");
         let third = launch(&["--allow-read", "/usr/share"]);
         assert!(
             third.contains("Sandbox Configuration") && third.contains("Extra read"),
