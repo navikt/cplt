@@ -78,7 +78,8 @@ pub fn real_home() -> PathBuf {
 /// suites assert on.
 ///
 /// Statics are never dropped, so cleanup happens on the next run: creating
-/// one removes every sibling whose pid is no longer alive.
+/// one removes every sibling whose pid is no longer alive. So the last run
+/// always leaves one `~/.cplt-test-home-<pid>` dir behind until the next.
 ///
 /// # Panics
 /// If the directory cannot be created.
@@ -231,9 +232,22 @@ pub fn binary_in_path(name: &str) -> PathBuf {
 /// (mise, asdf, pyenv) that reads its config from HOME and fails under the
 /// sandbox; the interpreter it points at lives under HOME too, which the
 /// sandbox denies. So: the first PATH entry that is neither a shim nor under
-/// HOME, then `/usr/bin/python3`, and only one that actually starts.
+/// HOME, then `/usr/bin/python3`, and only one that starts inside a real cplt
+/// sandbox: one that runs on the host but not in the sandbox skips the test.
 #[must_use]
 pub fn sandbox_python3() -> Option<String> {
+    let in_sandbox = |p: &Path| {
+        let Ok(proj) = tempfile::tempdir_in(scratch_home()) else {
+            return false;
+        };
+        cplt_cmd()
+            .args(["--yes", "--no-validate", "--quiet", "--agent", "shell"])
+            .arg("--project-dir")
+            .arg(proj.path())
+            .args(["--", "-c", &format!("{} -c pass", p.display())])
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
     let home = real_home();
     let found = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
         .filter(|dir| {
@@ -247,9 +261,12 @@ pub fn sandbox_python3() -> Option<String> {
                     .args(["-c", "pass"])
                     .output()
                     .is_ok_and(|o| o.status.success())
+                && in_sandbox(p)
         });
     if found.is_none() {
-        eprintln!("SKIP: no non-shim python3 outside HOME on PATH or at /usr/bin/python3");
+        eprintln!(
+            "SKIP: no python3 that runs inside the sandbox (non-shim, outside HOME, or /usr/bin/python3)"
+        );
     }
     found.map(|p| p.display().to_string())
 }

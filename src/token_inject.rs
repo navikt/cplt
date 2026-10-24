@@ -1113,9 +1113,18 @@ pub(crate) mod tests {
             .as_bytes(),
         )
         .unwrap();
+        let started = Instant::now();
         let mut resp = Vec::new();
         let _ = c.read_to_end(&mut resp);
         assert!(resp.len() > BIG && resp.ends_with(b"ok"));
+        // The old 10 ms poll managed about 1.5 MB/s: 16 MiB took over 10 s.
+        // The bound is loose so a loaded runner passes; that regression
+        // would still take minutes at git-clone sizes and shows up here.
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "{:?}",
+            started.elapsed()
+        );
 
         let head = seen.join().unwrap();
         assert!(head.contains(&format!("Authorization: Bearer {real}")));
