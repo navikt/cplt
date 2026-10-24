@@ -1594,7 +1594,11 @@ impl Resolved {
         // Top-level fields sit at four spaces; deeper lines belong to the
         // field above them.
         for line in fingerprint.lines() {
-            match line.strip_prefix("    ").filter(|f| !f.starts_with(' ')) {
+            // A field starts with an identifier; `],` or `},` closes the one above.
+            match line
+                .strip_prefix("    ")
+                .filter(|f| f.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_'))
+            {
                 Some(field) => fields.push((
                     field.split_once(':').map_or(field, |(n, _)| n).to_string(),
                     line.to_string(),
