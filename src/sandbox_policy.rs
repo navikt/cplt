@@ -126,6 +126,18 @@ pub fn state_pinned_message(dir: &Path, tree: &Path) -> String {
     .collect()
 }
 
+/// Print [`state_pinned_message`] when it differs from the last launch in
+/// this project (output policy, "changed" tier); otherwise only in
+/// `--verbose`.
+pub fn report_state_pinned(home: &Path, project: &Path, dir: &Path, tree: &Path) {
+    let line = state_pinned_message(dir, tree);
+    if crate::launch_state::changed(home, project, "state-pinned", &line) {
+        crate::ui::warn(&line);
+    } else if crate::ui::verbose() {
+        crate::ui::info(&line);
+    }
+}
+
 /// `name` in [`cplt_state_dir`], or in the legacy `~/.config/cplt` when only
 /// that copy exists, so state from before #830 keeps working.
 #[must_use]

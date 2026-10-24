@@ -633,7 +633,7 @@ The default output is written to be pasted into an issue. `--verbose` prints abs
 | `--show-denials` | Stream macOS sandbox denial logs in real time |
 | `--no-validate` | Skip the startup check that verifies sandbox restrictions are active |
 | `-y, --yes` | Skip the interactive confirmation prompt. On a TTY cplt asks only on the first launch in a project and when the profile changed since the last confirmed launch; with `--quiet` it asks every time, since the table is hidden. Required when stdin is not a TTY, so CI and scripts need it. Also `sandbox.yes = true` in config (`cplt config set sandbox.yes true`), which skips the prompt on every launch; `--no-yes` brings it back for one run |
-| `-q, --quiet` | Suppress the startup banner and non-essential messages. Errors and warnings still print. Also `sandbox.quiet = true` in config |
+| `-q, --quiet` | Suppress the startup banner, the exit audit and non-essential messages. Errors and warnings still print. Without `--yes`, cplt asks for confirmation every launch, since the table is hidden. Also `sandbox.quiet = true` in config |
 | `--no-quiet` | Override `sandbox.quiet = true` and show the startup summary anyway |
 | `--no-audit` | Skip the post-session change report. cplt normally diffs the working tree against a baseline commit pinned before the run and lists what the session touched, flagging sensitive paths. `-q` suppresses it too |
 | `--init-config` | Create a starter config file at `~/.config/cplt/config.toml` and exit |
@@ -852,7 +852,7 @@ cplt settings
 
 # Set global preferences
 cplt config set sandbox.quiet true
-cplt config set sandbox.yes true         # stop asking "Proceed?" at every launch; the summary still prints
+cplt config set sandbox.yes true         # never ask "Proceed?", even when the profile changed; the summary still prints
 cplt config set proxy.blocked_domains "~/.config/cplt/blocked-domains.txt"
 cplt config set git_guard.mode warn      # observe pushes instead of blocking them
 cplt config set gh_guard.enabled false   # opt out of the gh guard entirely

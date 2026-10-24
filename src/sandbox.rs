@@ -112,9 +112,9 @@ pub use policy::{
     linux_rootless_socket_paths, linux_runtime_dirs, mise_ro_protect_paths, nested_alternation,
     no_cache_env, no_exec_temp_dir_over, no_exec_tool_dir_over, path_bin_dirs,
     pin_legacy_state_dir_if_inside, playwright_runtime_intent, process_env,
-    relocatable_tool_prefix, shim_ro_protect_paths, socket_mask_paths, state_pinned_message,
-    tool_override_path_is_safe, tool_path_env_overrides, validate_playwright_socket_dir,
-    validate_sbpl_path, xdg_runtime_dir_env, xdg_state_dir,
+    relocatable_tool_prefix, report_state_pinned, shim_ro_protect_paths, socket_mask_paths,
+    state_pinned_message, tool_override_path_is_safe, tool_path_env_overrides,
+    validate_playwright_socket_dir, validate_sbpl_path, xdg_runtime_dir_env, xdg_state_dir,
 };
 
 // SBPL profile generation — kept public for unit tests.
@@ -1204,7 +1204,7 @@ fn keep_cplt_state_out_of_grants(config: &SandboxConfig) -> Result<(), String> {
         .map(|(t, _)| t)
         .collect();
     if let Some((dir, tree)) = policy::pin_legacy_state_dir_if_inside(config.home_dir, &trees) {
-        crate::ui::warn(&policy::state_pinned_message(&dir, &tree));
+        policy::report_state_pinned(config.home_dir, config.project_dir, &dir, &tree);
     }
     let state = policy::cplt_state_dir(config.home_dir);
     let legacy = config.home_dir.join(CPLT_STATE_DIR);
