@@ -2231,12 +2231,34 @@ fn risky_config_keys(text: &str) -> Option<Vec<String>> {
             "fsmonitor" => !matches!(value, "false" | "no" | "off" | "0"),
             // OpenCode's own include of its settings file, exactly.
             "path" if key == "include.path" => value != "opencode.gitconfig",
+            // The program a browser, man viewer or diff/merge tool runs.
+            "path" if !key.starts_with("includeif.") => {
+                ["browser.", "man.", "difftool.", "mergetool."]
+                    .iter()
+                    .any(|p| key.starts_with(p))
+            }
+            // A shell alias runs on `git <alias>`.
+            _ if key.starts_with("alias.") => value.trim_start().starts_with('!'),
             _ => {
                 key.starts_with("includeif.")
                     || key.starts_with("pager.")
                     || last.ends_with("command")
+                    // uploadpack.packObjectsHook, core.hooksPath and kin.
+                    || last.ends_with("hook")
+                    || last.ends_with("hooks")
+                    || last.ends_with("hookspath")
                     || [
-                        "hookspath",
+                        // gpg.program, gpg.<format>.program
+                        "program",
+                        // merge.<driver>.driver
+                        "driver",
+                        // mergetool/difftool/man.<tool>.cmd
+                        "cmd",
+                        // remote.<name>.uploadpack, .receivepack
+                        "uploadpack",
+                        "receivepack",
+                        // sendemail.smtpServer may name a program
+                        "smtpserver",
                         "pager",
                         "editor",
                         "askpass",
@@ -4314,6 +4336,17 @@ mod tests {
             keys("[core]\n\tsshCommand = x\n[includeIf \"gitdir:/\"]\n\tpath = /x\n"),
             ["core.sshcommand", "includeif.gitdir:/.path"]
         );
+        // Every key below makes git run a program.
+        let exec = "[commit]\n\tgpgsign = true\n[gpg]\n\tprogram = /tmp/x\n\
+                    [gpg \"ssh\"]\n\tprogram = /tmp/x\n[merge \"m\"]\n\tdriver = /tmp/x\n\
+                    [uploadpack]\n\tpackObjectsHook = /tmp/x\n[mergetool \"t\"]\n\tcmd = /tmp/x\n\
+                    [remote \"o\"]\n\tuploadpack = /tmp/x\n\treceivepack = /tmp/x\n\
+                    [sendemail]\n\tsmtpServer = /tmp/x\n[core]\n\thooksPath = /tmp\n\
+                    \tfsmonitor = /tmp/x\n[diff \"d\"]\n\ttextconv = /tmp/x\n\
+                    [filter \"f\"]\n\tclean = x\n\tsmudge = x\n\tprocess = x\n\
+                    [credential]\n\thelper = x\n[alias]\n\tx = !sh\n\tst = status\n\
+                    [mergetool \"t\"]\n\tpath = /tmp/x\n[web]\n\tbrowser = b\n";
+        assert_eq!(keys(exec).len(), 17, "{:?}", keys(exec));
     }
 
     #[test]
