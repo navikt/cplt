@@ -117,7 +117,7 @@ The sandbox blocks access to credentials and secrets in the kernel. Command guar
 | Read `~/.kube`, `~/.docker`, `~/.nais` | 🔒 Kernel-blocked | |
 | Read `~/.password-store`, `~/.terraform.d` | 🔒 Kernel-blocked | |
 | Read `~/.config/gcloud`, `~/.config/op` | 🔒 Kernel-blocked | Individual files are overridable with `--allow-read`. See [Cloud credentials](docs/known-impacts.md#cloud-credential-directories) |
-| Read or write `~/.config/cplt` (and `$XDG_CONFIG_HOME/cplt`), `~/.nav-pilot` | 🔒 Kernel-blocked | Tool state that decides what the *next* launch may do. `~/.config/cplt` is un-overridable as a whole subtree; inside `~/.nav-pilot`, a named path stays grantable so a pinned agentpakke payload can be read |
+| Read or write `~/.config/cplt` (and `$XDG_CONFIG_HOME/cplt`), `~/.nav-pilot` | 🔒 Kernel-blocked | Tool state that decides what the *next* launch may do. `config.toml`, `trust/`, `local/` and `update/` stay in `~/.config/cplt`; launch state and markers follow `$XDG_CONFIG_HOME/cplt`. `~/.config/cplt` is un-overridable as a whole subtree; inside `~/.nav-pilot`, a named path stays grantable so a pinned agentpakke payload can be read |
 | Read `~/.netrc`, `~/.pypirc`, `~/.vault-token` | 🔒 Kernel-blocked | Un-overridable on both platforms. Naming one in `allow.read` is a startup error |
 | Read `~/.gem/credentials` | 🔒 Kernel-blocked | Un-overridable on both platforms. Naming one in `allow.read` is a startup error |
 | `gh` CLI destructive operations (merge, delete, release) | 🔒 Command-gated (on by default) | Opt out with `--no-gh-guard`. See [gh guard](docs/gh-guard.md) |
@@ -264,9 +264,9 @@ with its own maintainer. Its publish job runs hourly and pulls the newest `.deb`
 from each tool's latest release, so a release cut minutes ago takes up to an
 hour to become installable that way.
 
-The package puts the binary at `/usr/bin/cplt`, and upgrades ride
-`sudo apt upgrade` from then on. `cplt update` refuses to touch an apt install
-and points at `sudo apt upgrade` instead: replacing the binary behind dpkg's
+The package puts the binary at `/usr/bin/cplt`. Upgrade it with
+`sudo apt update && sudo apt install --only-upgrade cplt`. `cplt update` refuses
+to touch an apt install and prints that command instead: replacing the binary behind dpkg's
 back would be undone by the next `apt` run.
 
 Without the archive, the same `.deb` is a release asset:

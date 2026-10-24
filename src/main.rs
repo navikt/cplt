@@ -765,7 +765,9 @@ enum Command {
     /// Manage cplt configuration.
     ///
     /// cplt reads config from `~/.config/cplt/config.toml` by default
-    /// (override with `CPLT_CONFIG`).
+    /// (override with `CPLT_CONFIG`). `config.toml`, `trust/`, `local/` and
+    /// `update/` stay in `~/.config/cplt` even when `XDG_CONFIG_HOME` is set;
+    /// launch state and markers follow `XDG_CONFIG_HOME`.
     ///
     /// Use `cplt config explain` to learn what each key does, `show` to see the
     /// merged result, `set` to save values, and `validate` to catch typos early.
@@ -9713,6 +9715,12 @@ fn run_config_path(local: bool) -> ExitCode {
     }
     if let Some(p) = config::config_path() {
         println!("{}", p.display());
+        // stderr, and only for a person: `$EDITOR $(cplt config path)` stays clean.
+        if io::stderr().is_terminal() {
+            ui::info(
+                "config.toml, trust/, local/ and update/ stay in ~/.config/cplt; launch state and markers follow XDG_CONFIG_HOME.",
+            );
+        }
         ExitCode::SUCCESS
     } else {
         ui::error("Cannot determine config path ($HOME not set)");

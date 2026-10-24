@@ -267,6 +267,8 @@ fi
 
 echo ""
 echo "Get started:"
-echo "  cplt doctor             # Check your environment"
-echo "  cplt --shell-install      # Make 'copilot' use the sandboxed version"
+echo "  cplt doctor                 # Check your environment"
+echo "  cplt --shell-install        # Make 'copilot' use the sandboxed version"
 echo "  cplt -- -p \"fix the tests\"  # Run Copilot in sandbox"
+echo ""
+echo "Upgrade later with: cplt update"
