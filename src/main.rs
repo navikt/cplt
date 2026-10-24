@@ -6714,28 +6714,27 @@ fn assemble_sandbox(
     if resolved.inject_github_token {
         let refuse = |why: String, fix: &str| {
             anyhow::anyhow!(
-                "--inject-github-token cannot run: {why}. Without injection the agent \
-                 would get the real token, so cplt stops here.\n  {fix}, or drop \
-                 --inject-github-token."
+                "--inject-github-token cannot run ({why}), and without it the agent \
+                 would get the real token: {fix}, or drop --inject-github-token."
             )
         };
         if proxy_handle.is_none() {
             return Err(refuse(
                 "the proxy is off".into(),
-                "Turn the proxy on (drop --no-proxy)",
+                "drop --no-proxy or set proxy.enabled = true",
             ));
         }
         let Some(scratch) = scratch_path else {
             return Err(refuse(
                 "there is no scratch dir".into(),
-                "Make the cplt scratch dir under your home directory creatable",
+                "make the cplt scratch dir under your home directory creatable",
             ));
         };
         // The CA variables are how the agent trusts the proxy.
         if let Some(v) = cplt::token_inject::denied_ca_var(&resolved.deny_env) {
             return Err(refuse(
                 format!("deny.env names {v}, which the agent needs to trust the proxy"),
-                &format!("Remove {v} from deny.env"),
+                &format!("remove {v} from deny.env"),
             ));
         }
         // A CA file the agent can rewrite would let it choose what the
@@ -6752,12 +6751,19 @@ fn assemble_sandbox(
                         "{var} points inside {}, a tree the agent can write",
                         root.display()
                     ),
-                    &format!("Point {var} at a CA file outside the session's writable trees"),
+                    &format!("point {var} at a CA file outside the session's writable trees"),
                 ));
             }
         }
         if let Err(e) = cplt::token_inject::setup(scratch) {
-            return Err(refuse(e, "Fix the CA setup named above"));
+            let fix = if e.starts_with("no system CA bundle") {
+                "install the system CA bundle (ca-certificates)"
+            } else if e.starts_with("cannot load the CA file in") {
+                "point that variable at a readable PEM file, or unset it"
+            } else {
+                "rerun, and report it if it persists"
+            };
+            return Err(refuse(e, fix));
         }
     }
 
