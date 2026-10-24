@@ -521,13 +521,23 @@ pub(crate) fn serve(shared: &Shared, stream: UnixStream) {
     // CALL_TIMEOUT. Written under the pending lock, so a reused id never
     // gets the stale error.
     let done = Arc::new(AtomicBool::new(false));
+    // Cancels go through a bounded channel to a writer thread: a child that
+    // stops reading stdin must not stall the ticker (the timeout replies
+    // still go out). The writer unblocks when the child is killed.
+    let (cancel_tx, cancel_rx) = std::sync::mpsc::sync_channel::<String>(64);
+    let canceller = {
+        let stdin = Arc::clone(&stdin);
+        std::thread::spawn(move || {
+            while let Ok(c) = cancel_rx.recv() {
+                if !write_line(&stdin, &c) {
+                    break;
+                }
+            }
+        })
+    };
     let ticker = {
-        let (client, stdin, pending, done) = (
-            Arc::clone(&client),
-            Arc::clone(&stdin),
-            Arc::clone(&pending),
-            Arc::clone(&done),
-        );
+        let (client, pending, done) =
+            (Arc::clone(&client), Arc::clone(&pending), Arc::clone(&done));
         let (log, id) = (shared.log.clone(), spec.id.clone());
         std::thread::spawn(move || {
             while !done.load(Ordering::Acquire) {
@@ -535,7 +545,8 @@ pub(crate) fn serve(shared: &Shared, stream: UnixStream) {
                 for (error, cancel) in p.evict(CALL_TIMEOUT) {
                     log.line(&id, "FAIL request timed out");
                     write_line(&client, &error);
-                    write_line(&stdin, &cancel);
+                    // Best effort: a full queue means the child is stuck.
+                    let _ = cancel_tx.try_send(cancel);
                 }
                 drop(p);
                 if done.load(Ordering::Acquire) {
@@ -580,6 +591,7 @@ pub(crate) fn serve(shared: &Shared, stream: UnixStream) {
     kill(&child);
     let _ = out.join();
     let _ = ticker.join();
+    let _ = canceller.join();
 }
 
 #[cfg(test)]
@@ -791,6 +803,39 @@ mod tests {
         let v: Value = serde_json::from_str(&l).unwrap();
         assert_eq!(v["result"]["cwd"], "/", "{l}");
         assert_eq!(v["result"]["pp"], "none", "{l}");
+    }
+
+    #[test]
+    fn a_child_that_stops_reading_stdin_does_not_stall_timeouts() {
+        let b = sh_broker("sleep 60");
+        let (mut a, mut ra) = connect(&b);
+        let req = |id: u32, pad: usize| {
+            format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"ping","params":{{"p":"{}"}}}}"#,
+                "x".repeat(pad)
+            )
+        };
+        // Two small requests, then one that fills the pipe and blocks the
+        // client-to-server thread in write.
+        writeln!(a, "{}", req(1, 0)).unwrap();
+        writeln!(a, "{}", req(2, 0)).unwrap();
+        writeln!(a, "{}", req(3, 3 * 1024 * 1024)).unwrap();
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let mut l = String::new();
+            ra.read_line(&mut l).unwrap();
+            let v: Value = serde_json::from_str(&l).unwrap();
+            assert!(
+                v["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("timed out"),
+                "{l}"
+            );
+            ids.push(v["id"].as_u64().unwrap());
+        }
+        ids.sort_unstable();
+        assert_eq!(ids, [1, 2, 3]);
     }
 
     #[test]

@@ -38,7 +38,7 @@ const SPAWNS_PER_MINUTE: usize = 3;
 const KILL_GRACE: Duration = Duration::from_secs(2);
 /// Per-call deadline (design 5.6): past it the client gets a timeout error
 /// and the slot is freed.
-const CALL_TIMEOUT: Duration = Duration::from_secs(120);
+const CALL_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 120 });
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// JSON-RPC error code for a request the broker refuses.
 const DENIED: i64 = -32001;

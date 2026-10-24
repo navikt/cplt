@@ -4885,11 +4885,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             resolved.mcp_broker,
             mcp_refusal.as_deref(),
             // The clients a launch would point at the broker.
-            match active_agent {
-                agent::Agent::Copilot => &["copilot"],
-                agent::Agent::OpenCode if opencode_v2 => &["opencode"],
-                _ => &[],
-            },
+            mcp_status_clients(active_agent, opencode_v2, &resolved.deny_env),
         ));
     }
 
@@ -12321,9 +12317,40 @@ fn doctor_rootful_blocked(landlock_v9: bool, bwrap: bool, scratch_dir: bool, is_
     landlock_v9 || (bwrap && (scratch_dir || is_dir))
 }
 
+/// The clients a launch would point at the broker. OpenCode is rewired
+/// through `OPENCODE_CONFIG_CONTENT`, so denying it leaves OpenCode out.
+fn mcp_status_clients(
+    agent: agent::Agent,
+    opencode_v2: bool,
+    deny_env: &[String],
+) -> &'static [&'static str] {
+    match agent {
+        agent::Agent::Copilot => &["copilot"],
+        agent::Agent::OpenCode
+            if opencode_v2 && !deny_env.iter().any(|d| d == "OPENCODE_CONFIG_CONTENT") =>
+        {
+            &["opencode"]
+        }
+        _ => &[],
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod tests {
+    /// Review on #846: status must not claim OpenCode when the overlay is skipped.
+    #[test]
+    fn mcp_status_leaves_opencode_out_when_its_config_var_is_denied() {
+        let deny = vec!["OPENCODE_CONFIG_CONTENT".to_string()];
+        let oc = agent::Agent::OpenCode;
+        assert_eq!(super::mcp_status_clients(oc, true, &[]), ["opencode"]);
+        assert!(super::mcp_status_clients(oc, true, &deny).is_empty());
+        assert_eq!(
+            super::mcp_status_clients(agent::Agent::Copilot, false, &deny),
+            ["copilot"]
+        );
+    }
+
     /// `--no-scratch-dir` drops file masks, so doctor must not call a rootful
     /// socket file masked then (review on #804).
     #[test]
