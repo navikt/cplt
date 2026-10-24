@@ -117,7 +117,7 @@ The sandbox blocks access to credentials and secrets in the kernel. Command guar
 | Read `~/.kube`, `~/.docker`, `~/.nais` | 🔒 Kernel-blocked | |
 | Read `~/.password-store`, `~/.terraform.d` | 🔒 Kernel-blocked | |
 | Read `~/.config/gcloud`, `~/.config/op` | 🔒 Kernel-blocked | Individual files are overridable with `--allow-read`. See [Cloud credentials](docs/known-impacts.md#cloud-credential-directories) |
-| Read or write `~/.config/cplt` (and `$XDG_CONFIG_HOME/cplt`), `~/.nav-pilot` | 🔒 Kernel-blocked | Tool state that decides what the *next* launch may do. `~/.config/cplt` is un-overridable as a whole subtree; inside `~/.nav-pilot`, a named path stays grantable so a pinned agentpakke payload can be read |
+| Read or write `~/.config/cplt` (and `$XDG_CONFIG_HOME/cplt`), `~/.nav-pilot` | 🔒 Kernel-blocked | Tool state that decides what the *next* launch may do. `config.toml`, `trust/`, `local/` and `update/` stay in `~/.config/cplt`; launch state and markers follow `$XDG_CONFIG_HOME/cplt`. `~/.config/cplt` is un-overridable as a whole subtree; inside `~/.nav-pilot`, a named path stays grantable so a pinned agentpakke payload can be read |
 | Read `~/.netrc`, `~/.pypirc`, `~/.vault-token` | 🔒 Kernel-blocked | Un-overridable on both platforms. Naming one in `allow.read` is a startup error |
 | Read `~/.gem/credentials` | 🔒 Kernel-blocked | Un-overridable on both platforms. Naming one in `allow.read` is a startup error |
 | `gh` CLI destructive operations (merge, delete, release) | 🔒 Command-gated (on by default) | Opt out with `--no-gh-guard`. See [gh guard](docs/gh-guard.md) |
@@ -264,9 +264,9 @@ with its own maintainer. Its publish job runs hourly and pulls the newest `.deb`
 from each tool's latest release, so a release cut minutes ago takes up to an
 hour to become installable that way.
 
-The package puts the binary at `/usr/bin/cplt`, and upgrades ride
-`sudo apt upgrade` from then on. `cplt update` refuses to touch an apt install
-and points at `sudo apt upgrade` instead: replacing the binary behind dpkg's
+The package puts the binary at `/usr/bin/cplt`. Upgrade it with
+`sudo apt update && sudo apt install --only-upgrade cplt`. `cplt update` refuses
+to touch an apt install and prints that command instead: replacing the binary behind dpkg's
 back would be undone by the next `apt` run.
 
 Without the archive, the same `.deb` is a release asset:
@@ -633,7 +633,7 @@ The default output is written to be pasted into an issue. `--verbose` prints abs
 | `--show-denials` | Stream macOS sandbox denial logs in real time |
 | `--no-validate` | Skip the startup check that verifies sandbox restrictions are active |
 | `-y, --yes` | Skip the interactive confirmation prompt. On a TTY cplt asks only on the first launch in a project and when the profile changed since the last confirmed launch; with `--quiet` it asks every time, since the table is hidden. Required when stdin is not a TTY, so CI and scripts need it. Also `sandbox.yes = true` in config (`cplt config set sandbox.yes true`), which skips the prompt on every launch; `--no-yes` brings it back for one run |
-| `-q, --quiet` | Suppress the startup banner and non-essential messages. Errors and warnings still print. Also `sandbox.quiet = true` in config |
+| `-q, --quiet` | Suppress the startup banner, the exit audit and non-essential messages. Errors and warnings still print. Without `--yes`, cplt asks for confirmation every launch, since the table is hidden. Also `sandbox.quiet = true` in config |
 | `--no-quiet` | Override `sandbox.quiet = true` and show the startup summary anyway |
 | `--no-audit` | Skip the post-session change report. cplt normally diffs the working tree against a baseline commit pinned before the run and lists what the session touched, flagging sensitive paths. `-q` suppresses it too |
 | `--init-config` | Create a starter config file at `~/.config/cplt/config.toml` and exit |
@@ -852,7 +852,7 @@ cplt settings
 
 # Set global preferences
 cplt config set sandbox.quiet true
-cplt config set sandbox.yes true         # stop asking "Proceed?" at every launch; the summary still prints
+cplt config set sandbox.yes true         # never ask "Proceed?", even when the profile changed; the summary still prints
 cplt config set proxy.blocked_domains "~/.config/cplt/blocked-domains.txt"
 cplt config set git_guard.mode warn      # observe pushes instead of blocking them
 cplt config set gh_guard.enabled false   # opt out of the gh guard entirely

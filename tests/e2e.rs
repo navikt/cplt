@@ -1392,7 +1392,14 @@ mod e2e_tests {
             let out = cmd
                 .current_dir(fake_dir.path())
                 .env("HOME", home.path())
-                .args(["--yes", "--no-validate", "--no-proxy"])
+                // The checkout's .cplt.toml is untrusted in this HOME, and
+                // pending keys always force the full table.
+                .args([
+                    "--yes",
+                    "--no-validate",
+                    "--no-proxy",
+                    "--accept-repo-config",
+                ])
                 .args(extra)
                 .args(["--", "--version"])
                 .output()

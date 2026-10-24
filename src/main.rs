@@ -675,9 +675,10 @@ actually on screen, then turn it back off."
     doctor: bool,
 
     /// Skip the interactive confirmation prompt and proceed immediately.
-    /// The sandbox configuration summary is still printed for auditability.
-    /// Required when stdin is not a TTY (CI, scripts, piped input).
-    /// Can also be set in config: sandbox.yes = true
+    /// Without it, cplt asks on a TTY only on the first launch in a project and
+    /// when the profile changed; with --quiet it asks every launch, since the
+    /// table is hidden. Required when stdin is not a TTY (CI, scripts, piped
+    /// input). Can also be set in config: sandbox.yes = true
     #[arg(long, short = 'y')]
     yes: bool,
 
@@ -695,6 +696,8 @@ actually on screen, then turn it back off."
     /// Suppress the startup configuration summary and non-essential messages.
     /// cplt always shows errors and warnings. Use this once you have reviewed
     /// the sandbox settings and no longer need to see them every time.
+    /// It also hides the exit audit, and without --yes it asks for
+    /// confirmation every launch, since the table is hidden.
     /// Can also be set in config: sandbox.quiet = true
     #[arg(long, short = 'q')]
     quiet: bool,
@@ -762,7 +765,9 @@ enum Command {
     /// Manage cplt configuration.
     ///
     /// cplt reads config from `~/.config/cplt/config.toml` by default
-    /// (override with `CPLT_CONFIG`).
+    /// (override with `CPLT_CONFIG`). `config.toml`, `trust/`, `local/` and
+    /// `update/` stay in `~/.config/cplt` even when `XDG_CONFIG_HOME` is set;
+    /// launch state and markers follow `XDG_CONFIG_HOME`.
     ///
     /// Use `cplt config explain` to learn what each key does, `show` to see the
     /// merged result, `set` to save values, and `validate` to catch typos early.
@@ -964,6 +969,7 @@ NOTE:
     #[command(name = "mcp-stdio", hide = true)]
     McpStdio { id: String },
 
+    /// Probe what the sandbox allows, such as `cplt check path PATH`.
     Check {
         #[command(subcommand)]
         target: Option<CheckTarget>,
@@ -1670,26 +1676,36 @@ fn confirm_launch(
     pending: bool,
     home: &Path,
     project: &Path,
+    agent: cplt::agent::Agent,
 ) -> anyhow::Result<()> {
     let seen = !pending && confirm.is_some_and(|c| c.confirmed);
     if seen && !resolved.yes {
         if ui::verbose() {
             ui::info("Profile unchanged since you last confirmed it; not asking again");
         }
-    } else if let Err(e) = prompt_confirm(resolved.yes, resolved.quiet) {
+        return Ok(());
+    }
+    if let Err(e) = prompt_confirm(resolved.yes, resolved.quiet, agent) {
         bail!("{e}");
     }
-    if let Some(c) = confirm.filter(|c| c.shown) {
+    // Only a person who answered y records; `--yes` answered nothing.
+    if let Some(c) = confirm.filter(|c| should_record(c, resolved.yes)) {
         c.record(home, project);
     }
     Ok(())
+}
+
+/// A confirmation records only after the full table was shown on a TTY and a
+/// person typed y. `--yes` skips the question, so it must not record.
+fn should_record(confirm: &cplt::launch_state::Confirmation, auto_yes: bool) -> bool {
+    confirm.shown && !auto_yes
 }
 
 /// Prompt the user to confirm the sandbox configuration.
 ///
 /// Returns Ok(()) if the user confirms, Err with message if they decline or
 /// if no TTY is available without --yes.
-fn prompt_confirm(auto_yes: bool, quiet: bool) -> Result<(), String> {
+fn prompt_confirm(auto_yes: bool, quiet: bool, agent: cplt::agent::Agent) -> Result<(), String> {
     if auto_yes {
         if !quiet && ui::verbose() {
             ui::info("Auto-confirmed (--yes)");
@@ -1711,9 +1727,10 @@ fn prompt_confirm(auto_yes: bool, quiet: bool) -> Result<(), String> {
 
     if quiet {
         eprint!(
-            "{}[cplt]{} Proceed with sandboxed Copilot? (run without --quiet to review config) [y/N] ",
+            "{}[cplt]{} Proceed with sandboxed {}? (run without --quiet to review config) [y/N] ",
             ui::color(ui::BLUE),
-            ui::color(ui::RESET)
+            ui::color(ui::RESET),
+            agent.display_name()
         );
     } else {
         eprint!(
@@ -2755,7 +2772,7 @@ fn pin_state_out_of_grants(
         }
     }
     if let Some((dir, tree)) = sandbox::pin_legacy_state_dir_if_inside(home_dir, &trees) {
-        ui::warn(&sandbox::state_pinned_message(&dir, &tree));
+        sandbox::report_state_pinned(&dir, &tree);
     }
 }
 
@@ -5159,7 +5176,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             prepared.keychain_substitute(),
             &repo_rows,
             worktree_root.as_deref(),
-            cli.verbose || cli.print_profile,
+            cli.verbose || cli.print_profile || !unapproved_proposals.is_empty(),
             has_tty(),
         ))
     };
@@ -5169,6 +5186,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         !unapproved_proposals.is_empty() || cli.no_yes,
         &home_dir,
         &project_dir,
+        active_agent,
     )?;
 
     // Ensure Copilot's bundled runtime is extracted before entering the sandbox.
@@ -5272,12 +5290,13 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             cplt::sandbox::cplt_state_file(&home_dir, "opencode-snapshot-clean"),
         )
     });
+    let audit_mode = audit::AuditMode::for_run(audit_enabled, cli.observe_domains);
     let (exit_code, snapshot, settled) = audit::run(
         &project_dir,
         &resolved.allow_write,
         &resolved.allow_write_state,
         &repo_paths,
-        audit::AuditMode::for_run(audit_enabled, cli.observe_domains),
+        audit_mode,
         &routing,
         || {
             sandbox::exec_sandboxed(
@@ -5312,7 +5331,8 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     }
     cplt::opencode_v2::save_tui(&v2_tui);
     if let Some(stores) = opencode_stores {
-        stores.report(settled);
+        // Same rule as the nested repo check: only a probe that ran can say so.
+        stores.report(audit_mode != audit::AuditMode::Disabled && !settled);
     }
     if resolved.git_guard.enabled
         && !resolved.quiet
@@ -7352,7 +7372,7 @@ fn run_exec_command(
             prepared.keychain_substitute(),
             &repo_rows,
             worktree_root.as_deref(),
-            cli.verbose || cli.print_profile,
+            cli.verbose || cli.print_profile || !unapproved_proposals.is_empty(),
             has_tty(),
         )
     });
@@ -7362,6 +7382,7 @@ fn run_exec_command(
         !unapproved_proposals.is_empty() || cli.no_yes,
         &home_dir,
         &project_dir,
+        active_agent,
     )?;
 
     let disabled_categories = resolved.disabled_hardening_categories();
@@ -9735,6 +9756,12 @@ fn run_config_path(local: bool) -> ExitCode {
     }
     if let Some(p) = config::config_path() {
         println!("{}", p.display());
+        // stderr, and only for a person: `$EDITOR $(cplt config path)` stays clean.
+        if io::stderr().is_terminal() {
+            ui::info(
+                "config.toml, trust/, local/ and update/ stay in ~/.config/cplt; launch state and markers follow XDG_CONFIG_HOME.",
+            );
+        }
         ExitCode::SUCCESS
     } else {
         ui::error("Cannot determine config path ($HOME not set)");
@@ -15469,6 +15496,25 @@ mod tests {
             matches!(&effect, GateEffect::ExecWithout { args, .. } if *args == a(&["push", "origin", "feat"])),
             "an allowed push -u must run without -u"
         );
+    }
+
+    /// Only a typed y records the confirmation: a `--yes` run on a TTY saw
+    /// the table but answered nothing, so the next interactive launch asks.
+    #[test]
+    fn yes_on_a_tty_does_not_record_the_confirmation() {
+        // tty false: `new` reads no state file, so the test touches no HOME.
+        let mut c = cplt::launch_state::Confirmation::new(
+            Path::new("/nonexistent"),
+            Path::new("/nonexistent"),
+            "Copilot",
+            "profile".into(),
+            false,
+        );
+        c.shown = true;
+        assert!(!should_record(&c, true), "--yes must not record");
+        assert!(should_record(&c, false), "a typed y records");
+        c.shown = false;
+        assert!(!should_record(&c, false), "no table, no record");
     }
 
     /// The launch prompt names how to skip it, and the command it names works.

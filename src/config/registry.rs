@@ -371,7 +371,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: false,
         default_display: "false",
-        description: "Hide the startup configuration summary (sandbox rules, network, env info).",
+        description: "Hide the startup configuration summary (sandbox rules, network, env info) and the exit audit. Without sandbox.yes, cplt asks for confirmation every launch, since the summary is hidden.",
     },
     ConfigKeyInfo {
         section: "sandbox",
