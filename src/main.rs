@@ -3804,6 +3804,34 @@ struct DomainAllowlistDecision {
     force_proxy_on: bool,
 }
 
+/// An empty 0700 dir standing in for the project when `cplt mcp status`
+/// runs where a launch would refuse (home, `/`). Random name, removed on drop.
+struct NeutralProject {
+    _dir: tempfile::TempDir,
+    path: PathBuf,
+}
+
+impl NeutralProject {
+    fn if_needed() -> anyhow::Result<Option<Self>> {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        let home = std::fs::canonicalize(&home).unwrap_or(home);
+        let cwd = std::env::current_dir()?;
+        let root = cplt::git::project_root(&cwd).unwrap_or(cwd);
+        let root = std::fs::canonicalize(&root).unwrap_or(root);
+        if !cplt::is_unsafe_root(&root, &home) {
+            return Ok(None);
+        }
+        let dir = tempfile::Builder::new()
+            .prefix("cplt-mcp-status-")
+            .tempdir()
+            .context("cannot create the stand-in project for mcp status")?;
+        let path = std::fs::canonicalize(dir.path())?;
+        Ok(Some(Self { _dir: dir, path }))
+    }
+}
+
 /// Show allowlist refusals by default, but honor an explicitly chosen log level.
 fn proxy_log_level(
     configured: proxy::ProxyLogLevel,
@@ -4715,6 +4743,17 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         return Ok(run_doctor(&cli, false, false));
     }
 
+    // `cplt mcp status` from outside any project (`~`, `/`): the specs live
+    // in the user config dir, so judge them against an empty project of
+    // cplt's own, and report no project. A launch still refuses these roots.
+    let neutral = match mcp_status {
+        Some(_) if cli.project_dir.is_none() => NeutralProject::if_needed()?,
+        _ => None,
+    };
+    if let Some(n) = &neutral {
+        cli.project_dir = Some(n.path.clone());
+    }
+
     // Resolve config, paths, and agent
     let ResolvedContext {
         mut resolved,
@@ -4738,7 +4777,9 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
 
     warn_exec_tool_dir_shadowing(&resolved, &home_dir, active_agent);
     warn_write_granted_repos(&resolved, &project_dir, &repo_paths);
-    warn_repo_under_no_exec_cache(&resolved, &home_dir, &project_dir, &repo_paths);
+    if neutral.is_none() {
+        warn_repo_under_no_exec_cache(&resolved, &home_dir, &project_dir, &repo_paths);
+    }
     warn_inject_token_without_guard(&resolved, active_agent);
     if !resolved.quiet {
         warn_unlinked_child_repos(&home_dir, &project_dir, &repo_paths);
@@ -4839,9 +4880,12 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         return Ok(cplt::mcp_broker::run_status(
             json,
             &home_dir,
+            neutral.is_none().then_some(project_dir.as_path()),
             &found,
             resolved.mcp_broker,
             mcp_refusal.as_deref(),
+            // The clients a launch would point at the broker.
+            mcp_status_clients(active_agent, opencode_v2, &resolved.deny_env),
         ));
     }
 
@@ -6693,6 +6737,7 @@ fn assemble_sandbox(
             return None;
         }
         let log = cplt::mcp_broker::Log {
+            level: resolved.proxy_log_level,
             file: resolved.proxy_log_file.clone(),
         };
         cplt::mcp_broker::Broker::start(found.specs, home_dir, log)
@@ -12272,9 +12317,40 @@ fn doctor_rootful_blocked(landlock_v9: bool, bwrap: bool, scratch_dir: bool, is_
     landlock_v9 || (bwrap && (scratch_dir || is_dir))
 }
 
+/// The clients a launch would point at the broker. OpenCode is rewired
+/// through `OPENCODE_CONFIG_CONTENT`, so denying it leaves OpenCode out.
+fn mcp_status_clients(
+    agent: agent::Agent,
+    opencode_v2: bool,
+    deny_env: &[String],
+) -> &'static [&'static str] {
+    match agent {
+        agent::Agent::Copilot => &["copilot"],
+        agent::Agent::OpenCode
+            if opencode_v2 && !deny_env.iter().any(|d| d == "OPENCODE_CONFIG_CONTENT") =>
+        {
+            &["opencode"]
+        }
+        _ => &[],
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod tests {
+    /// Review on #846: status must not claim OpenCode when the overlay is skipped.
+    #[test]
+    fn mcp_status_leaves_opencode_out_when_its_config_var_is_denied() {
+        let deny = vec!["OPENCODE_CONFIG_CONTENT".to_string()];
+        let oc = agent::Agent::OpenCode;
+        assert_eq!(super::mcp_status_clients(oc, true, &[]), ["opencode"]);
+        assert!(super::mcp_status_clients(oc, true, &deny).is_empty());
+        assert_eq!(
+            super::mcp_status_clients(agent::Agent::Copilot, false, &deny),
+            ["copilot"]
+        );
+    }
+
     /// `--no-scratch-dir` drops file masks, so doctor must not call a rootful
     /// socket file masked then (review on #804).
     #[test]
