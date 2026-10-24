@@ -126,11 +126,23 @@ pub fn state_pinned_message(dir: &Path, tree: &Path) -> String {
     .collect()
 }
 
-/// Print [`state_pinned_message`] when it differs from the last launch in
-/// this project (output policy, "changed" tier); otherwise only in
-/// `--verbose`.
-pub fn report_state_pinned(home: &Path, project: &Path, dir: &Path, tree: &Path) {
-    let line = state_pinned_message(dir, tree);
+static STATE_PINNED_LINE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Hold [`state_pinned_message`] until [`flush_state_pinned`]: the legacy
+/// state dir is not validated yet, so nothing may read or write it here.
+pub fn report_state_pinned(dir: &Path, tree: &Path) {
+    if let Ok(mut held) = STATE_PINNED_LINE.lock() {
+        *held = Some(state_pinned_message(dir, tree));
+    }
+}
+
+/// After the state dir passed validation: print the held line when it
+/// differs from the last launch in this project (output policy, "changed"
+/// tier); otherwise only in `--verbose`.
+pub fn flush_state_pinned(home: &Path, project: &Path) {
+    let Some(line) = STATE_PINNED_LINE.lock().ok().and_then(|mut h| h.take()) else {
+        return;
+    };
     if crate::launch_state::changed(home, project, "state-pinned", &line) {
         crate::ui::warn(&line);
     } else if crate::ui::verbose() {
@@ -4611,6 +4623,17 @@ fn dedup(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    /// The pinned-state line touches no state file before validation: a
+    /// planted symlink or FIFO there must not be written to or block.
+    #[test]
+    fn state_pinned_report_defers_all_state_access() {
+        let home = tempfile::tempdir().unwrap();
+        report_state_pinned(Path::new("/x/cplt"), Path::new("/x"));
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+        crate::with_env_lock_no_xdg(|| flush_state_pinned(home.path(), Path::new("/p")));
+        assert!(STATE_PINNED_LINE.lock().unwrap().is_none(), "flushed once");
+    }
+
     /// `--allow-rootless-docker` (#782) lifts the runtime-dir sockets only;
     /// every rootful, Desktop and colima mask stays. Off and All are unchanged.
     #[test]

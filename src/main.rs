@@ -2772,7 +2772,7 @@ fn pin_state_out_of_grants(
         }
     }
     if let Some((dir, tree)) = sandbox::pin_legacy_state_dir_if_inside(home_dir, &trees) {
-        sandbox::report_state_pinned(home_dir, project_dir, &dir, &tree);
+        sandbox::report_state_pinned(&dir, &tree);
     }
 }
 

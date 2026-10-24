@@ -1204,7 +1204,7 @@ fn keep_cplt_state_out_of_grants(config: &SandboxConfig) -> Result<(), String> {
         .map(|(t, _)| t)
         .collect();
     if let Some((dir, tree)) = policy::pin_legacy_state_dir_if_inside(config.home_dir, &trees) {
-        policy::report_state_pinned(config.home_dir, config.project_dir, &dir, &tree);
+        policy::report_state_pinned(&dir, &tree);
     }
     let state = policy::cplt_state_dir(config.home_dir);
     let legacy = config.home_dir.join(CPLT_STATE_DIR);
@@ -1225,6 +1225,8 @@ fn keep_cplt_state_out_of_grants(config: &SandboxConfig) -> Result<(), String> {
             ));
         }
     }
+    // Only now is the state dir known to sit outside every grant.
+    policy::flush_state_pinned(config.home_dir, config.project_dir);
     Ok(())
 }
 
