@@ -55,9 +55,75 @@ pub const CPLT_STATE_DIR: &str = ".config/cplt";
 /// absolute, else `~/.config/cplt` — the root the MCP broker spec reader uses
 /// (#830). `config.toml` does not move: it stays at `CPLT_CONFIG` or
 /// `~/.config/cplt/config.toml`, which nav-pilot mirrors.
+///
+/// The legacy directory is used instead when the XDG path is not UTF-8 or has
+/// a character the Seatbelt profile cannot hold (named or resolved), and for
+/// the rest of the process once [`pin_legacy_state_dir_if_inside`] pinned it.
 #[must_use]
 pub fn cplt_state_dir(home: &Path) -> PathBuf {
-    crate::opencode_v2::xdg_base("XDG_CONFIG_HOME", home, ".config").join("cplt")
+    if LEGACY_STATE_PINNED.load(std::sync::atomic::Ordering::Relaxed) {
+        return home.join(CPLT_STATE_DIR);
+    }
+    xdg_state_dir(home).unwrap_or_else(|| home.join(CPLT_STATE_DIR))
+}
+
+/// `$XDG_CONFIG_HOME/cplt` when `XDG_CONFIG_HOME` moves the state root to a
+/// usable path, before any pin. The profile denies it even when pinned.
+#[must_use]
+pub fn xdg_state_dir(home: &Path) -> Option<PathBuf> {
+    let dir = crate::opencode_v2::xdg_base("XDG_CONFIG_HOME", home, ".config").join("cplt");
+    let usable = |p: &Path| p.to_str().is_some() && validate_sbpl_path(p).is_ok();
+    (dir != home.join(CPLT_STATE_DIR)
+        && usable(&dir)
+        && usable(&config::canonicalize_deepest(&dir)))
+    .then_some(dir)
+}
+
+static LEGACY_STATE_PINNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `$XDG_CONFIG_HOME/cplt` and the first of `trees` it lies inside, compared
+/// as spelled and resolved. `None` when state is not moved or is outside.
+#[must_use]
+pub fn xdg_state_dir_inside(home: &Path, trees: &[PathBuf]) -> Option<(PathBuf, PathBuf)> {
+    let dir = xdg_state_dir(home)?;
+    let canon = config::canonicalize_deepest;
+    let resolved = canon(&dir);
+    trees
+        .iter()
+        .find(|t| dir.starts_with(t) || resolved.starts_with(canon(t)))
+        .map(|t| (dir.clone(), t.clone()))
+}
+
+/// Keep state in `~/.config/cplt` for the rest of this process when
+/// `$XDG_CONFIG_HOME/cplt` lies inside one of `trees`, the sandbox's grants:
+/// there the agent could forge it. Returns the pair to report, once; `None`
+/// when nothing moved or it was pinned already.
+pub fn pin_legacy_state_dir_if_inside(
+    home: &Path,
+    trees: &[PathBuf],
+) -> Option<(PathBuf, PathBuf)> {
+    if LEGACY_STATE_PINNED.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let found = xdg_state_dir_inside(home, trees)?;
+    LEGACY_STATE_PINNED.store(true, std::sync::atomic::Ordering::Relaxed);
+    Some(found)
+}
+
+/// The one line printed when state stays in `~/.config/cplt`, with control
+/// characters in the paths replaced.
+#[must_use]
+pub fn state_pinned_message(dir: &Path, tree: &Path) -> String {
+    format!(
+        "cplt state stays in ~/.config/cplt: {} is inside the sandbox's grant on {}. \
+         Point XDG_CONFIG_HOME elsewhere to move it.",
+        dir.display(),
+        tree.display()
+    )
+    .chars()
+    .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+    .collect()
 }
 
 /// `name` in [`cplt_state_dir`], or in the legacy `~/.config/cplt` when only
@@ -78,7 +144,8 @@ pub fn cplt_state_file(home: &Path, name: &str) -> PathBuf {
 fn cplt_state_dirs(home: &Path) -> [Option<PathBuf>; 3] {
     [
         config::config_dir(),
-        Some(cplt_state_dir(home)),
+        // The XDG root even when this launch pinned state away from it.
+        xdg_state_dir(home),
         Some(home.join(CPLT_STATE_DIR)),
     ]
 }
@@ -4825,6 +4892,40 @@ mod tests {
                 assert!(cplt_state_dir_grant(h, &legacy.join("x")).is_some());
             },
         );
+    }
+
+    /// #830: an `XDG_CONFIG_HOME` the Seatbelt profile cannot hold, or that is
+    /// not UTF-8, leaves state in `~/.config/cplt`.
+    #[test]
+    fn unusable_xdg_config_home_keeps_the_legacy_state_dir() {
+        use std::os::unix::ffi::OsStrExt;
+        let home = Path::new("/fake/home");
+        let legacy = home.join(CPLT_STATE_DIR);
+        let bad = [
+            std::ffi::OsString::from("/x/q\"uote"),
+            std::ffi::OsString::from("/x/pa)ren"),
+            std::ffi::OsStr::from_bytes(b"/x/\xff").to_os_string(),
+        ];
+        for v in bad {
+            temp_env::with_var("XDG_CONFIG_HOME", Some(&v), || {
+                assert_eq!(xdg_state_dir(home), None, "{v:?}");
+                assert_eq!(cplt_state_dir(home), legacy, "{v:?}");
+            });
+        }
+    }
+
+    /// The pure half of the pin: inside a granted tree is detected, outside not.
+    #[test]
+    fn xdg_state_dir_inside_a_grant_is_detected() {
+        let home = Path::new("/fake/home");
+        let tree = PathBuf::from("/granted/tree");
+        temp_env::with_var("XDG_CONFIG_HOME", Some("/granted/tree/cfg"), || {
+            assert_eq!(
+                xdg_state_dir_inside(home, std::slice::from_ref(&tree)),
+                Some((PathBuf::from("/granted/tree/cfg/cplt"), tree.clone()))
+            );
+            assert_eq!(xdg_state_dir_inside(home, &[PathBuf::from("/other")]), None);
+        });
     }
 
     /// The read grant follows gh's own lookup order, not a fixed ~/.config/gh.

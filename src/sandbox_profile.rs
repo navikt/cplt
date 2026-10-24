@@ -2669,14 +2669,12 @@ fn emit_deny_rules(sb: &mut String, config: &SandboxConfig, home: &str) {
     };
     // cplt's resolved state root (`$XDG_CONFIG_HOME/cplt`, #830) next to the
     // legacy `~/.config/cplt` entry; an absolute path survives `home.join`.
-    let state = crate::sandbox::cplt_state_dir(Path::new(home));
+    // Denied even when this launch pinned state to the legacy dir.
+    let state = crate::sandbox::xdg_state_dir(Path::new(home));
     let dirs: Vec<Vec<String>> = DENIED_DOTFILES
         .iter()
         .map(|d| spell(d, true))
-        .chain(
-            (state != Path::new(home).join(crate::sandbox::CPLT_STATE_DIR))
-                .then(|| spell(&state.to_string_lossy(), false)),
-        )
+        .chain(state.map(|s| spell(&s.to_string_lossy(), false)))
         .collect();
     // Hard-denied files, then the credential files inside allowed tool dirs
     // (the latter overridable with --allow-read, so no warning).

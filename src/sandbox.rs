@@ -111,9 +111,10 @@ pub use policy::{
     first_party_read_target, home_config_link_targets, home_tool_dirs, linux_docker_socket_paths,
     linux_rootless_socket_paths, linux_runtime_dirs, mise_ro_protect_paths, nested_alternation,
     no_cache_env, no_exec_temp_dir_over, no_exec_tool_dir_over, path_bin_dirs,
-    playwright_runtime_intent, process_env, relocatable_tool_prefix, shim_ro_protect_paths,
-    socket_mask_paths, tool_override_path_is_safe, tool_path_env_overrides,
-    validate_playwright_socket_dir, validate_sbpl_path, xdg_runtime_dir_env,
+    pin_legacy_state_dir_if_inside, playwright_runtime_intent, process_env,
+    relocatable_tool_prefix, shim_ro_protect_paths, socket_mask_paths, state_pinned_message,
+    tool_override_path_is_safe, tool_path_env_overrides, validate_playwright_socket_dir,
+    validate_sbpl_path, xdg_runtime_dir_env, xdg_state_dir,
 };
 
 // SBPL profile generation — kept public for unit tests.
@@ -579,7 +580,7 @@ fn prepare_locked(
     // Inspect-only callers (`--print-profile`, `cplt mcp status`) never
     // launch, so nothing can forge the state; they report instead.
     if !inspect_only {
-        validate_cplt_state_root(config)?;
+        keep_cplt_state_out_of_grants(config);
     }
     // One policy for every check below and the bubblewrap plan, generated on
     // first use: generating can warn, and a warning should print once (#602).
@@ -1191,25 +1192,17 @@ fn validate_exec_grants(config: &SandboxConfig) -> Result<(), String> {
 
 /// cplt's state root moved by `XDG_CONFIG_HOME` (#830) must not lie in a tree
 /// the agent can write: it could forge `opencode-snapshot-clean` and skip the
-/// audit scan. The legacy `~/.config/cplt` is a denied dotfile already.
-fn validate_cplt_state_root(config: &SandboxConfig) -> Result<(), String> {
-    let state = policy::cplt_state_dir(config.home_dir);
-    if state == config.home_dir.join(CPLT_STATE_DIR) {
-        return Ok(());
+/// audit scan. When it does, state stays in the legacy `~/.config/cplt`, a
+/// denied dotfile, for this launch. `main` pins this before any state read;
+/// this is the backstop with the fully resolved grants.
+fn keep_cplt_state_out_of_grants(config: &SandboxConfig) {
+    let trees: Vec<PathBuf> = canonical_writable_trees(config)
+        .into_iter()
+        .map(|(t, _)| t)
+        .collect();
+    if let Some((dir, tree)) = policy::pin_legacy_state_dir_if_inside(config.home_dir, &trees) {
+        crate::ui::warn(&policy::state_pinned_message(&dir, &tree));
     }
-    let resolved = crate::config::canonicalize_deepest(&state);
-    for (tree, source) in canonical_writable_trees(config) {
-        if resolved.starts_with(&tree) {
-            return Err(format!(
-                "cplt's state directory {} is inside {source} {}, which is writable in the \
-                 sandbox. Move XDG_CONFIG_HOME out of {}, or drop that write grant.",
-                state.display(),
-                tree.display(),
-                tree.display()
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// [`writable_trees`] canonicalized, for matching against the canonical paths
@@ -3928,13 +3921,9 @@ fn validate_config_paths(config: &SandboxConfig) -> Result<(), String> {
         }
     }
 
-    // #830: the profile names the state root, which XDG_CONFIG_HOME can set.
-    // The resolved target too: a symlink to an unsafe path would drop its deny.
-    let state = policy::cplt_state_dir(config.home_dir);
-    for p in [state.clone(), crate::config::canonicalize_deepest(&state)] {
-        policy::validate_sbpl_path(&p)
-            .map_err(|e| format!("cplt state dir (XDG_CONFIG_HOME): {e}"))?;
-    }
+    // #830: the profile names the state root, which XDG_CONFIG_HOME can set;
+    // `policy::xdg_state_dir` only returns a path, named and resolved, that
+    // passes `validate_sbpl_path`, so there is nothing left to refuse here.
     Ok(())
 }
 
@@ -5214,9 +5203,8 @@ mod tests {
         let xdg = home.join("x\"dg");
         temp_env::with_var("XDG_CONFIG_HOME", Some(&xdg), || {
             let mut config = test_config(&home, &[]);
-            // #830: the state root follows XDG_CONFIG_HOME into the profile.
-            let err = super::validate_config_paths(&config).expect_err("key off");
-            assert!(err.contains("cplt state dir"), "{err}");
+            // #830: an unnameable XDG state root falls back, so key off is fine.
+            assert!(super::validate_config_paths(&config).is_ok());
             config.protect_pnpm_config = true;
             let err = super::validate_config_paths(&config).expect_err("must refuse");
             assert!(err.contains("sandbox.protect_pnpm_config"), "{err}");
@@ -5881,22 +5869,37 @@ mod tests {
     }
 
     /// #830: a state root moved into a writable tree by XDG_CONFIG_HOME is
-    /// refused; the agent could forge `opencode-snapshot-clean`.
+    /// detected, so the launch keeps state in `~/.config/cplt`; the agent
+    /// could forge `opencode-snapshot-clean` there. Checked without pinning:
+    /// the pin is process-wide (see tests/state_pin.rs).
     #[test]
-    fn prepare_rejects_a_state_root_inside_the_project() {
+    fn a_state_root_inside_the_project_is_detected() {
         let home = Path::new("/fake/test");
         let config = test_config(home, &[]);
-        let error = temp_env::with_var("XDG_CONFIG_HOME", Some("/project/xdg"), || {
-            prepare(&config).err().expect("must be refused")
+        let trees: Vec<PathBuf> = canonical_writable_trees(&config)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        temp_env::with_var("XDG_CONFIG_HOME", Some("/project/xdg"), || {
+            let (dir, tree) = policy::xdg_state_dir_inside(home, &trees).expect("inside");
+            assert_eq!(dir, Path::new("/project/xdg/cplt"));
+            assert!(dir.starts_with(&tree), "{tree:?}");
+            let line = policy::state_pinned_message(&dir, &tree);
+            assert!(
+                line.starts_with("cplt state stays in ~/.config/cplt"),
+                "{line}"
+            );
         });
-        assert!(
-            error.contains("Move XDG_CONFIG_HOME out of /project"),
-            "{error}"
+        assert_eq!(
+            policy::state_pinned_message(Path::new("/a\x1b[2Jb"), Path::new("/a")),
+            policy::state_pinned_message(Path::new("/a\u{fffd}[2Jb"), Path::new("/a")),
+            "control characters are replaced"
         );
     }
 
     /// #830: a safe XDG_CONFIG_HOME whose state root is a symlink to an
-    /// unsafe target is refused too: the deny would name only the safe path.
+    /// unsafe target leaves state in `~/.config/cplt`: the deny would name
+    /// only the safe path.
     #[cfg(target_os = "macos")]
     #[test]
     fn validate_rejects_a_state_root_linked_to_an_unsafe_target() {
@@ -5908,14 +5911,15 @@ mod tests {
         std::fs::create_dir_all(&xdg).unwrap();
         std::os::unix::fs::symlink(&bad, xdg.join("cplt")).unwrap();
         let config = test_config(&root, &[]);
-        let error = temp_env::with_var("XDG_CONFIG_HOME", Some(&xdg), || {
-            validate_config_paths(&config).expect_err("must be refused")
+        temp_env::with_var("XDG_CONFIG_HOME", Some(&xdg), || {
+            assert_eq!(policy::xdg_state_dir(&root), None);
+            assert_eq!(policy::cplt_state_dir(&root), root.join(CPLT_STATE_DIR));
+            assert!(validate_config_paths(&config).is_ok());
         });
-        assert!(error.contains("b\"ad"), "{error}");
     }
 
-    /// #830: XDG_CONFIG_HOME is interpolated into the profile, so an SBPL
-    /// payload in it refuses the launch.
+    /// #830: XDG_CONFIG_HOME is interpolated into the profile, so one with an
+    /// SBPL payload is ignored and state stays in `~/.config/cplt`.
     #[cfg(target_os = "macos")]
     #[test]
     fn prepare_rejects_sbpl_injection_via_xdg_config_home() {
@@ -5924,9 +5928,12 @@ mod tests {
         let error = temp_env::with_var(
             "XDG_CONFIG_HOME",
             Some("/x\")) (allow file-write* (subpath \"/"),
-            || validate_config_paths(&config).expect_err("must be refused"),
+            || {
+                assert_eq!(policy::xdg_state_dir(home), None);
+                validate_config_paths(&config)
+            },
         );
-        assert!(error.contains("XDG_CONFIG_HOME"), "{error}");
+        assert!(error.is_ok(), "{error:?}");
     }
 
     /// cplt's own state directory is the exception to the per-file override:
