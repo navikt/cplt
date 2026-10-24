@@ -895,33 +895,50 @@ fn open_dir_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
     match open_rdonly() {
         Ok(file) => Ok(file),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            #[cfg(target_os = "macos")]
-            {
-                use std::os::unix::ffi::OsStrExt;
-                let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
-                    .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
-                let rc = unsafe {
-                    libc::fchmodat(
-                        libc::AT_FDCWD,
-                        c_path.as_ptr(),
-                        0o700,
-                        libc::AT_SYMLINK_NOFOLLOW,
-                    )
-                };
-                if rc == 0 {
-                    return open_rdonly();
-                }
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).is_ok() {
-                    return open_rdonly();
-                }
+            if chmod_700_nofollow(path).is_ok() {
+                return open_rdonly();
             }
             Err(e)
         }
         Err(e) => Err(e),
+    }
+}
+
+/// `chmod 0700` on `path` itself, never on what a link there points to.
+fn chmod_700_nofollow(path: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+        let rc = unsafe {
+            libc::fchmodat(
+                libc::AT_FDCWD,
+                c_path.as_ptr(),
+                0o700,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    // Linux: an O_PATH fd on the entry itself (a link fails O_DIRECTORY),
+    // then chmod through /proc, which reaches that inode and nothing else.
+    // Portable where fchmodat's AT_SYMLINK_NOFOLLOW is not (glibc < 2.32).
+    #[cfg(not(target_os = "macos"))]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        use std::os::unix::io::AsRawFd;
+        let fd = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?;
+        std::fs::set_permissions(
+            format!("/proc/self/fd/{}", fd.as_raw_fd()),
+            std::fs::Permissions::from_mode(0o700),
+        )
     }
 }
 
@@ -1149,6 +1166,25 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_eacces_chmod_never_follows_a_link() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let _ = super::chmod_700_nofollow(&link);
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
+        // A plain dir is still fixed.
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o000)).unwrap();
+        super::chmod_700_nofollow(&target).unwrap();
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
