@@ -34,7 +34,7 @@ The hooks run formatting and Clippy checks before commits. `mise run check` runs
 Every line cplt prints at launch or exit belongs to one of four tiers. Pick the tier before you add a line.
 
 - **Act now:** always shown, kept short. The user has to do something, or there is a risk. Examples: untrusted `.cplt.toml` keys, `⚠ GPG signing allowed`, a refused launch.
-- **Changed:** shown once when something changed since the last launch in this project, then silent. `src/launch_state.rs` records what was shown. The sandbox table and the nested-repo hint work this way. The launch prompt does too, keyed on what the user last said yes to: a TTY launch whose profile matches the last confirmed one (topic `confirmed-<agent>`, recorded only after a yes or `--yes`) skips `Proceed?`.
+- **Changed:** shown once when something changed since the last launch in this project, then silent. `src/launch_state.rs` records what was shown. The sandbox table and the nested-repo hint work this way. The launch prompt does too, keyed on what the user last said yes to: a TTY launch whose profile matches the last confirmed one (topic `confirmed-<agent>`, recorded only when someone saw the full table on a TTY and confirmed it, and never while `.cplt.toml` keys await approval) skips `Proceed?`.
 - **Steady state:** silent, or one summary line at most.
 - **Detail:** only on request: `--verbose`, `--print-profile` or `cplt doctor`.
 

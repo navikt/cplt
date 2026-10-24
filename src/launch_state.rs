@@ -53,13 +53,16 @@ pub fn changed(home: &Path, project: &Path, topic: &str, content: &str) -> bool 
 
 /// The launch profile the confirmation prompt is about (output policy, "Act
 /// now"): a TTY launch skips the prompt only when this matches the profile the
-/// user last said yes to. [`Confirmation::record`] runs only after a yes or
-/// `--yes`, so a declined launch never counts as confirmed.
+/// user last said yes to. [`Confirmation::record`] runs only after a person saw
+/// the table on a TTY and said yes, so a declined or scripted launch never counts.
 pub struct Confirmation {
     topic: String,
     content: String,
     /// The same profile was confirmed before (and a TTY is there to ask on).
     pub confirmed: bool,
+    /// The full table was printed with a TTY present, so a person saw what
+    /// they confirm. Only then may [`Confirmation::record`] run.
+    pub shown: bool,
 }
 
 impl Confirmation {
@@ -71,6 +74,7 @@ impl Confirmation {
             topic,
             content,
             confirmed,
+            shown: false,
         }
     }
 

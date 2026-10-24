@@ -1660,20 +1660,26 @@ fn has_tty() -> bool {
 /// only after a yes means a declined launch prompts again next time. The
 /// record lives in cplt's state dir, which the sandbox denies, so the agent
 /// cannot mark a widened profile as confirmed.
+///
+/// Untrusted `.cplt.toml` keys (`pending`) always ask. Only a launch where a
+/// person saw the full table on a TTY records: a scripted `--yes` run must not
+/// pre-confirm the next interactive one.
 fn confirm_launch(
     resolved: &config::Resolved,
     confirm: Option<&cplt::launch_state::Confirmation>,
+    pending: bool,
     home: &Path,
     project: &Path,
 ) -> anyhow::Result<()> {
-    let seen = confirm.is_some_and(|c| c.confirmed);
-    if seen && !resolved.yes && ui::verbose() {
-        ui::info("Profile unchanged since you last confirmed it; not asking again");
-    }
-    if let Err(e) = prompt_confirm(resolved.yes || seen, resolved.quiet) {
+    let seen = !pending && confirm.is_some_and(|c| c.confirmed);
+    if seen && !resolved.yes {
+        if ui::verbose() {
+            ui::info("Profile unchanged since you last confirmed it; not asking again");
+        }
+    } else if let Err(e) = prompt_confirm(resolved.yes, resolved.quiet) {
         bail!("{e}");
     }
-    if let Some(c) = confirm {
+    if let Some(c) = confirm.filter(|c| c.shown) {
         c.record(home, project);
     }
     Ok(())
@@ -5071,7 +5077,13 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             has_tty(),
         ))
     };
-    confirm_launch(&resolved, confirm.as_ref(), &home_dir, &project_dir)?;
+    confirm_launch(
+        &resolved,
+        confirm.as_ref(),
+        !unapproved_proposals.is_empty(),
+        &home_dir,
+        &project_dir,
+    )?;
 
     // Ensure Copilot's bundled runtime is extracted before entering the sandbox.
     // Writes to copilot/pkg are denied inside the sandbox (write-then-exec defense),
@@ -7011,7 +7023,7 @@ fn run_exec_command(
         project_dir,
         repo_roots,
         worktree_root,
-        unapproved_proposals: _,
+        unapproved_proposals,
         configured_quiet: _,
         // active_agent from resolve_context is ignored — exec always uses Shell
         active_agent: _,
@@ -7216,7 +7228,13 @@ fn run_exec_command(
             has_tty(),
         )
     });
-    confirm_launch(&resolved, confirm.as_ref(), &home_dir, &project_dir)?;
+    confirm_launch(
+        &resolved,
+        confirm.as_ref(),
+        !unapproved_proposals.is_empty(),
+        &home_dir,
+        &project_dir,
+    )?;
 
     let disabled_categories = resolved.disabled_hardening_categories();
 
