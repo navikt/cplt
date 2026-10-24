@@ -264,7 +264,8 @@ fn opencode_v2_within(
     for timeout in [first, first * 3] {
         if let crate::discover::VersionProbe::Version(v) = probe(&real, timeout) {
             let _ = std::fs::create_dir_all(cache_dir);
-            let _ = std::fs::write(&cache, format!("{key}{v}\n"));
+            // Before `prepare` validates the state dir: never through a link.
+            crate::launch_state::write_regular(&cache, &format!("{key}{v}\n"));
             return Some(major_at_least_2(&v));
         }
     }
@@ -3560,6 +3561,13 @@ mod tests {
         let state = home.join(crate::sandbox::CPLT_STATE_DIR);
         assert!(state.join("opencode-version").exists());
         assert!(crate::sandbox::DENIED_DOTFILES.contains(&crate::sandbox::CPLT_STATE_DIR));
+        // A planted symlink at the cache path is never written through.
+        let sentinel = dir.path().join("sentinel");
+        std::fs::write(&sentinel, "keep").unwrap();
+        std::fs::remove_file(state.join("opencode-version")).unwrap();
+        std::os::unix::fs::symlink(&sentinel, state.join("opencode-version")).unwrap();
+        assert_eq!(is_opencode_v2(&bin, &home), Some(true));
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "keep");
     }
 
     /// #725: a probe with no usable answer is retried once, never cached, and
