@@ -661,6 +661,8 @@ impl Config {
             allow_private_domains,
             allow_read,
             allow_write,
+            tool_roots: Vec::new(),
+            allow_write_state: Vec::new(),
             allow_exec,
             allow_socket,
             deny_paths,
@@ -1123,7 +1125,8 @@ impl Resolved {
         repos: &[super::types::RepoSummaryRow],
         worktree_root: Option<&std::path::Path>,
         full: bool,
-    ) {
+        tty: bool,
+    ) -> crate::launch_state::Confirmation {
         let blue = ui::color(ui::BLUE);
         let dim = ui::color(ui::DIM);
         let green = ui::color(ui::GREEN);
@@ -1580,10 +1583,25 @@ impl Resolved {
             let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
             stable.push(format!("{} {mtime:?}", path.display()));
         }
+        // The table does not show every widening (domain lists, hardening
+        // toggles), so the confirmation also covers every resolved setting.
+        // ponytail: Debug output, so a new Resolved field is covered for free;
+        // it may re-prompt once after an upgrade that changes the format.
+        stable.push(self.policy_fingerprint());
+        let stable = stable.join("\n");
         let topic = format!("summary-{}", agent.display_name());
-        let changed =
-            crate::launch_state::changed(home_dir, project_dir, &topic, &stable.join("\n"));
-        if full || changed {
+        let changed = crate::launch_state::changed(home_dir, project_dir, &topic, &stable);
+        let mut confirm = crate::launch_state::Confirmation::new(
+            home_dir,
+            project_dir,
+            agent.display_name(),
+            stable,
+            tty,
+        );
+        // The prompt shows what it asks about: the full table, unless this
+        // exact profile was confirmed before (then there is no prompt).
+        if full || changed || (!self.yes && !confirm.confirmed) {
+            confirm.shown = tty;
             for line in &lines {
                 eprintln!("{line}");
             }
@@ -1592,7 +1610,7 @@ impl Resolved {
                     "{blue}[cplt]{nc}  {yellow}Tip:{nc}            {dim}use --quiet, or cplt config set sandbox.quiet true{nc}"
                 );
             }
-            return;
+            return confirm;
         }
         eprintln!(
             "{blue}[cplt]{nc} {}",
@@ -1601,6 +1619,17 @@ impl Resolved {
         for line in lines.iter().filter(|l| l.contains('\u{26a0}')) {
             eprintln!("{line}");
         }
+        confirm
+    }
+
+    /// Every resolved setting, minus the per-launch proxy port, for the
+    /// launch confirmation hash.
+    #[must_use]
+    pub fn policy_fingerprint(&self) -> String {
+        format!("{self:?}").replace(
+            &format!("proxy_port: {},", self.proxy_port),
+            "proxy_port: PORT,",
+        )
     }
 
     /// The one-line steady-state summary: repositories, writable paths,
@@ -1970,6 +1999,36 @@ fn quiet_tip_due(home: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// The launch confirmation must change with every widening the table
+    /// hides, and not with the per-launch proxy port.
+    #[test]
+    fn policy_fingerprint_covers_widenings_not_the_port() {
+        let base = || {
+            Config::default()
+                .merge(CliFlags::default())
+                .expect("default config merges")
+        };
+        let fp = base().policy_fingerprint();
+        let mut r = base();
+        r.proxy_port += 1;
+        assert_eq!(r.policy_fingerprint(), fp, "proxy port");
+        type Widen = fn(&mut Resolved);
+        let widened: [(&str, Widen); 3] = [
+            ("--allow-all-domains", |r| r.allow_all_domains = true),
+            ("proxy.allow_domains", |r| {
+                r.allow_domains.push("evil.example".into());
+            }),
+            ("hardening toggle", |r| {
+                r.deny_nested_git = !r.deny_nested_git;
+            }),
+        ];
+        for (name, widen) in widened {
+            let mut r = base();
+            widen(&mut r);
+            assert_ne!(r.policy_fingerprint(), fp, "{name}");
+        }
+    }
+
     use super::super::types::{FeatureToggle, Preset};
     use super::*;
 

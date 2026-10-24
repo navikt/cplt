@@ -1185,9 +1185,17 @@ pub(crate) fn wait_timeout(
 /// Paths inside `project_dir` are omitted: the project's own `git status`
 /// already covers them. (A grant pointing at a git-ignored subdirectory is a
 /// residual — git does not report those either, and this function cannot tell.)
-fn unaudited_roots<'a>(project_dir: &Path, allow_write: &'a [PathBuf]) -> Vec<&'a Path> {
+///
+/// `state` grants (`--allow-write-state`) are omitted too: the user declared
+/// them tool state, and `run` lists them under `--verbose` instead.
+fn unaudited_roots<'a>(
+    project_dir: &Path,
+    allow_write: &'a [PathBuf],
+    state: &[PathBuf],
+) -> Vec<&'a Path> {
     allow_write
         .iter()
+        .filter(|p| !state.contains(p))
         .map(PathBuf::as_path)
         .filter(|p| !p.starts_with(project_dir))
         .collect()
@@ -2530,9 +2538,11 @@ fn read_small(path: &Path) -> Option<Small> {
 ///
 /// Observe-only runs retain descendant settling without printing the audit.
 /// Disabled runs still perform ordinary proxy cleanup through the callback.
+#[allow(clippy::too_many_arguments)]
 pub fn run<F: FnOnce() -> u8, C: FnOnce() -> Option<proxy::ProxySnapshot>>(
     project_dir: &Path,
     allow_write: &[PathBuf],
+    state: &[PathBuf],
     named_roots: &[PathBuf],
     mode: AuditMode,
     routing: &str,
@@ -2577,7 +2587,7 @@ pub fn run<F: FnOnce() -> u8, C: FnOnce() -> Option<proxy::ProxySnapshot>>(
     if let Some(baseline) = baseline {
         let mut report = baseline.finish_at(exit_code, settled, project_audit_finished_at);
         report.drop_named_roots(project_dir, named_roots);
-        let unaudited = unaudited_roots(project_dir, allow_write);
+        let unaudited = unaudited_roots(project_dir, allow_write, state);
         let folded = report.print(unaudited.len());
         for (dir, baseline) in named {
             baseline
@@ -2590,6 +2600,14 @@ pub fn run<F: FnOnce() -> u8, C: FnOnce() -> Option<proxy::ProxySnapshot>>(
         }
         if !folded && let Some(line) = unaudited_warning(project_dir, &unaudited) {
             ui::warn(&line);
+        }
+        if ui::verbose() {
+            for p in state {
+                ui::info(&format!(
+                    "Tool state (writable, not audited): {}",
+                    escape_path(&p.display().to_string())
+                ));
+            }
         }
     }
     if let Some(line) = mode.unsettled_warning().filter(|_| !settled) {
@@ -3215,7 +3233,8 @@ mod tests {
         assert!(
             unaudited_roots(
                 &project,
-                &[PathBuf::from("/w/app/vendor"), PathBuf::from("/w/app")]
+                &[PathBuf::from("/w/app/vendor"), PathBuf::from("/w/app")],
+                &[]
             )
             .is_empty()
         );
@@ -3227,11 +3246,22 @@ mod tests {
                     PathBuf::from("/w/app/vendor"),
                     PathBuf::from("/w/lib"),
                     PathBuf::from("/w/app-tools"),
-                ]
+                ],
+                &[]
             ),
             vec![Path::new("/w/lib"), Path::new("/w/app-tools")]
         );
-        assert!(unaudited_roots(&project, &[]).is_empty());
+        assert!(unaudited_roots(&project, &[], &[]).is_empty());
+        // --allow-write-state grants are tool state, not unaudited roots.
+        let state = [PathBuf::from("/h/.cache/tool")];
+        assert_eq!(
+            unaudited_roots(
+                &project,
+                &[PathBuf::from("/w/lib"), state[0].clone()],
+                &state
+            ),
+            vec![Path::new("/w/lib")]
+        );
     }
 
     /// A named root is a repository reported on its own lines. The launch
@@ -3755,6 +3785,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let (exit_code, snapshot, _) = run(
             dir.path(),
+            &[],
             &[],
             &[],
             AuditMode::Disabled,
