@@ -746,6 +746,12 @@ fn create_stage_dir(home: &Path) -> Result<PathBuf, UpdateError> {
     }
     crate::scratch::validate_dir_safety(&canonical_base, "Update staging base")
         .map_err(UpdateError::Io)?;
+    // Staging dirs of a killed update never got cleaned up.
+    crate::scratch::sweep_old_dirs(
+        &canonical_base,
+        crate::scratch::is_session_id,
+        std::time::Duration::from_hours(24),
+    );
 
     let dir = canonical_base.join(crate::scratch::generate_session_id().map_err(UpdateError::Io)?);
     crate::scratch::create_secure_dir(&dir, "update staging dir").map_err(UpdateError::Io)?;

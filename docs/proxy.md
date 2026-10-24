@@ -475,6 +475,8 @@ At log level `all`, every connection attempt is printed to stderr in real time:
 2025-01-15T14:23:04Z CONNECT pastebin.com:443 BLOCKED
 ```
 
+The file is append-only. cplt never rotates or truncates it, and MCP broker lines go to the same file. Rotate it yourself (for example with `newsyslog` or `logrotate`) or delete it now and then.
+
 ### Status codes
 
 | Status | Meaning | Action |
