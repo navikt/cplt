@@ -414,6 +414,45 @@ echo SCRATCH_CACHE_CONSUMED_ONCE
         }
     }
 
+    /// An unapproved `.cplt.toml` denying a CA variable must not turn token
+    /// injection off and hand the agent the real token.
+    #[test]
+    fn inject_github_token_survives_a_repo_denying_a_ca_var() {
+        require_sandbox!();
+        let home = home_temp_dir("inject-ca-deny");
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join(".cplt.toml"),
+            "[deny]\nenv=[\"GIT_SSL_CAINFO\"]",
+        )
+        .unwrap();
+        let out = cplt_cmd()
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join(".config"))
+            .env("XDG_STATE_HOME", home.path().join(".state"))
+            .env("GH_TOKEN", "ghp_e2e_real_token")
+            .current_dir(project.path())
+            .args([
+                "--yes",
+                "--inject-github-token",
+                "--pass-env",
+                "GH_TOKEN",
+                "--agent",
+                "shell",
+                "--",
+                "-c",
+                "echo TOKEN=$GH_TOKEN",
+            ])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stdout.contains("ghp_e2e_real_token"),
+            "real token reached the agent:\n{stdout}\n{stderr}"
+        );
+    }
+
     #[test]
     fn copilot_and_gh_credentials_stay_separate_through_full_launch() {
         use std::os::unix::fs::PermissionsExt;

@@ -6714,8 +6714,13 @@ fn assemble_sandbox(
             (false, _) => Err("the proxy is off".to_string()),
             (_, None) => Err("there is no scratch dir".to_string()),
             (true, Some(scratch)) => match cplt::token_inject::denied_ca_var(&resolved.deny_env) {
-                // The CA variables are how the agent trusts the proxy.
-                Some(v) => Err(format!("deny.env names {v}")),
+                // The CA variables are how the agent trusts the proxy. Never
+                // fall back to the real token because of a deny: refuse.
+                Some(v) => anyhow::bail!(
+                    "--inject-github-token cannot run while deny.env names {v}: the agent \
+                     needs it to trust the proxy, and without injection it would get the \
+                     real token. Remove {v} from deny.env, or drop --inject-github-token."
+                ),
                 None => cplt::token_inject::setup(scratch),
             },
         };
