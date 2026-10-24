@@ -1620,16 +1620,10 @@ impl Resolved {
     /// Every resolved setting, minus the per-launch proxy port and the
     /// UI-only fields, for the launch confirmation hash. `-y`, `--quiet` or
     /// `--no-audit` change what cplt prints, not what the agent can reach.
+    /// `no_validate` stays: skipping the sandbox self-check deserves a prompt.
     #[must_use]
     pub fn policy_fingerprint(&self) -> String {
-        const UI_ONLY: [&str; 6] = [
-            "yes",
-            "quiet",
-            "audit",
-            "no_validate",
-            "brief",
-            "bool_layers",
-        ];
+        const UI_ONLY: [&str; 5] = ["yes", "quiet", "audit", "brief", "bool_layers"];
         let pretty = format!("{self:#?}").replace(
             &format!("proxy_port: {},", self.proxy_port),
             "proxy_port: PORT,",
@@ -2038,11 +2032,18 @@ mod tests {
                 yes: FeatureToggle::ForceOn,
                 quiet: FeatureToggle::ForceOn,
                 audit: FeatureToggle::ForceOff,
-                no_validate: true,
                 ..CliFlags::default()
             })
             .expect("ui flags merge");
         assert_eq!(ui.policy_fingerprint(), fp);
+        // Skipping the sandbox self-check is not UI-only: it must re-prompt.
+        let skip = Config::default()
+            .merge(CliFlags {
+                no_validate: true,
+                ..CliFlags::default()
+            })
+            .expect("--no-validate merges");
+        assert_ne!(skip.policy_fingerprint(), fp, "--no-validate");
     }
 
     use super::super::types::{FeatureToggle, Preset};
