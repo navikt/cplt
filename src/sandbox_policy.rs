@@ -268,8 +268,10 @@ pub fn denied_dotfile_dir(home: &Path, path: &Path) -> Option<&'static str> {
 /// that can write any of them approves its own next launch, and the widening
 /// perpetuates itself.
 ///
-/// Both locations are checked: `$HOME/.config/cplt` and whatever `CPLT_CONFIG`
-/// relocates the directory to, since the override moves the real files.
+/// All three locations in [`cplt_state_dirs`] are checked: the config
+/// directory (wherever `CPLT_CONFIG` relocates it, since the override moves
+/// the real files), the XDG state root even when this launch pinned state
+/// elsewhere, and `$HOME/.config/cplt`.
 /// The grant is resolved with [`config::canonicalize_deepest`] so a path that
 /// does not exist yet still matches — otherwise the check is sidestepped by
 /// naming a file before creating it — and the lexical form is compared too, so

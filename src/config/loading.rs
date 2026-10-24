@@ -2003,10 +2003,14 @@ mod tests {
     /// hides, and not with the per-launch proxy port.
     #[test]
     fn policy_fingerprint_covers_widenings_not_the_port() {
+        // `merge` reads HOME and XDG, which other tests set through
+        // temp_env: hold its lock.
         let base = || {
-            Config::default()
-                .merge(CliFlags::default())
-                .expect("default config merges")
+            crate::with_env_lock_no_xdg(|| {
+                Config::default()
+                    .merge(CliFlags::default())
+                    .expect("default config merges")
+            })
         };
         let fp = base().policy_fingerprint();
         let mut r = base();

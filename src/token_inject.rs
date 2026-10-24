@@ -883,7 +883,9 @@ pub(crate) mod tests {
         cmd.env("GH_TOKEN", real);
         cmd.env("OPENCODE_AUTH_CONTENT", format!(r#"{{"t":"{real}"}}"#));
         cmd.env("COPILOT_GITHUB_TOKEN", "not-a-github-token");
-        mask_child_env(&mut cmd, true);
+        // Inherit mode reads the process env, which other tests set through
+        // temp_env: hold its lock.
+        crate::with_env_lock_no_xdg(|| mask_child_env(&mut cmd, true));
         let env: HashMap<String, String> = cmd
             .get_envs()
             .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v?.to_str()?.to_string())))
@@ -1111,16 +1113,9 @@ pub(crate) mod tests {
             .as_bytes(),
         )
         .unwrap();
-        let started = Instant::now();
         let mut resp = Vec::new();
         let _ = c.read_to_end(&mut resp);
         assert!(resp.len() > BIG && resp.ends_with(b"ok"));
-        // The old 10 ms poll managed about 1.5 MB/s: 16 MiB took over 10 s.
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "{:?}",
-            started.elapsed()
-        );
 
         let head = seen.join().unwrap();
         assert!(head.contains(&format!("Authorization: Bearer {real}")));

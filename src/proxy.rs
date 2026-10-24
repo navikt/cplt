@@ -4232,6 +4232,7 @@ mod tests {
             "no curl in the trusted dirs: this test cannot run without it"
         );
         let (tx, rx) = mpsc::channel();
+        let (go, wait) = mpsc::channel::<()>();
         std::thread::spawn(move || {
             let (mut s, _) = up.accept().unwrap();
             let mut r = std::io::BufReader::new(s.try_clone().unwrap());
@@ -4249,7 +4250,9 @@ mod tests {
             tx.send((req, body)).unwrap();
             s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n7\r\ndata:1\n\r\n").unwrap();
             s.flush().unwrap();
-            std::thread::sleep(Duration::from_millis(300));
+            // The second event waits until the client has the first, so a
+            // proxy that buffered the stream would deadlock the read below.
+            let _ = wait.recv();
             s.write_all(b"7\r\ndata:2\n\r\n0\r\n\r\n").unwrap();
         });
         let dir = tempfile::tempdir().unwrap();
@@ -4278,14 +4281,15 @@ mod tests {
         assert!(lower.contains("accept: text/event-stream"), "{req}");
         assert_eq!(&body, b"{\"a\":1}");
 
-        // The first event arrives before the upstream sends the second.
+        // The first event arrives before the upstream sends the second. A
+        // buffering proxy fails here on the read timeout instead of hanging.
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         let mut r = std::io::BufReader::new(c);
         let mut first = String::new();
-        let started = Instant::now();
         while !first.contains("data:1") {
             r.read_line(&mut first).unwrap();
         }
-        assert!(started.elapsed() < Duration::from_millis(250), "buffered");
+        go.send(()).unwrap();
         assert!(first.starts_with("HTTP/1.1 200"));
         assert!(!first.to_lowercase().contains("transfer-encoding"));
         let mut rest = String::new();

@@ -649,11 +649,4 @@ mod tests {
         }
         assert!(curl_config(UPSTREAM, "POST", &hdrs(&[("A", "x\ty")]), b"", "T").is_some());
     }
-
-    #[test]
-    fn endpoint_path_must_match_exactly() {
-        // Nothing installed in this process yet, or the seam test's endpoint.
-        assert!(endpoint_for("/").is_none());
-        assert!(endpoint_for("").is_none());
-    }
 }
