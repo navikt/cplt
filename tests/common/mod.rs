@@ -103,9 +103,21 @@ pub fn scratch_home() -> &'static Path {
                 let _ = std::fs::remove_dir_all(e.path());
             }
         }
-        let home = real.join(format!("{prefix}{}", std::process::id()));
-        std::fs::create_dir_all(&home).expect("scratch HOME should be creatable");
-        home
+        let name = format!("{prefix}{}", std::process::id());
+        let home = real.join(&name);
+        if std::fs::create_dir_all(&home).is_ok() {
+            return home;
+        }
+        // Inside a cplt session the HOME root is not writable: fall back to
+        // the temp dir, and say so, since that tree is not deny-by-default.
+        let tmp = std::env::temp_dir().join(name);
+        eprintln!(
+            "NOTE: {} is not writable; scratch HOME is {} instead",
+            real.display(),
+            tmp.display()
+        );
+        std::fs::create_dir_all(&tmp).expect("scratch HOME should be creatable");
+        tmp
     })
 }
 
@@ -248,6 +260,8 @@ pub fn binary_in_path(name: &str) -> PathBuf {
 /// HOME, then `/usr/bin/python3`, and only one that starts inside a real cplt
 /// sandbox: one that runs on the host but not in the sandbox skips the test.
 #[must_use]
+///
+/// The path comes back shell-quoted, ready to splice into a `sh -c` line.
 pub fn sandbox_python3() -> Option<String> {
     let in_sandbox = |p: &Path| {
         let Ok(proj) = tempfile::tempdir_in(scratch_home()) else {
@@ -257,7 +271,8 @@ pub fn sandbox_python3() -> Option<String> {
             .args(["--yes", "--no-validate", "--quiet", "--agent", "shell"])
             .arg("--project-dir")
             .arg(proj.path())
-            .args(["--", "-c", &format!("{} -c pass", p.display())])
+            .args(["--", "-c", "\"$0\" -c pass"])
+            .arg(p)
             .output()
             .is_ok_and(|o| o.status.success())
     };
@@ -281,7 +296,7 @@ pub fn sandbox_python3() -> Option<String> {
             "SKIP: no python3 that runs inside the sandbox (non-shim, outside HOME, or /usr/bin/python3)"
         );
     }
-    found.map(|p| p.display().to_string())
+    found.map(|p| format!("'{}'", p.display().to_string().replace('\'', "'\\''")))
 }
 
 /// A native test command with no developer configuration or environment.

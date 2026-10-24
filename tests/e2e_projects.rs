@@ -5064,7 +5064,8 @@ esac
 
         // Create fake .m2 and .gradle dirs under the real HOME so the
         // sandbox profile's home-tool-dir rules apply.
-        let home = std::env::var("HOME").expect("HOME must be set");
+        // The HOME the child runs with: see `cplt_cmd` above.
+        let home = crate::common::real_home().display().to_string();
         let m2_dir = PathBuf::from(&home).join(".m2/repository/com/example");
         let gradle_dir = PathBuf::from(&home).join(".gradle/caches/test-cplt-e2e");
 
@@ -5145,7 +5146,8 @@ fi
         require_sandbox!();
         let project = TempProject::scaffold_maven();
 
-        let home = std::env::var("HOME").expect("HOME must be set");
+        // The HOME the child runs with: see `cplt_cmd` above.
+        let home = crate::common::real_home().display().to_string();
         let socket_dir = PathBuf::from(&home).join(".gradle/daemon/cplt-test");
         fs::create_dir_all(&socket_dir).ok();
 

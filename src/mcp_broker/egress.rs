@@ -153,8 +153,20 @@ mod tests {
         (line.trim_end().to_string(), client)
     }
 
+    /// Inside a cplt session localhost TCP is denied, as in the proxy tests.
+    fn localhost_tcp_blocked() -> bool {
+        let blocked = std::env::var("__CPLT_WRAPPED").is_ok();
+        if blocked {
+            eprintln!("SKIPPED: egress tests require localhost TCP (blocked inside cplt sandbox)");
+        }
+        blocked
+    }
+
     #[test]
     fn an_allowed_connect_gets_200_and_relays() {
+        if localhost_tcp_blocked() {
+            return;
+        }
         use std::io::Read;
         let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = upstream.local_addr().unwrap();
@@ -179,6 +191,9 @@ mod tests {
 
     #[test]
     fn an_allowed_host_on_a_private_address_is_not_dialled() {
+        if localhost_tcp_blocked() {
+            return;
+        }
         // `localhost` passes the name check and resolves only to loopback,
         // which the real dial drops before connecting.
         assert_eq!(
