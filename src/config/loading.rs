@@ -1617,13 +1617,9 @@ impl Resolved {
             tty,
         )
         .with_fields(fields);
-        // With a TTY: the full table once per change, and whenever there is a
-        // prompt. Headless: only the profile last confirmed on a TTY is quiet.
-        let changed = if tty {
-            confirm.display_changed(home_dir, project_dir)
-        } else {
-            !confirm.seen
-        };
+        // The full table once per change since the last accepted launch
+        // (TTY or headless), and whenever there is a prompt.
+        let changed = confirm.display_changed(home_dir, project_dir);
         if full || changed || (!self.yes && !confirm.confirmed) {
             confirm.shown = tty;
             if changed {

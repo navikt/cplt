@@ -1344,11 +1344,11 @@ mod e2e_tests {
         );
     }
 
-    /// Output policy, headless: only a profile last confirmed on a TTY prints
-    /// the single summary line, and a headless `--yes` launch records nothing,
-    /// so the full table prints every time here (no TTY ever confirmed it).
+    /// Output policy, headless `--yes`: the full table once per change since
+    /// the last accepted launch, the summary line otherwise. A headless run
+    /// never confirms the profile for a TTY launch.
     #[test]
-    fn e2e_headless_launch_never_records_the_profile() {
+    fn e2e_headless_summary_follows_the_display_hash() {
         require_sandbox!();
         let (_, fake_dir) = cplt_cmd_with_fake_copilot();
         let home = tempfile::tempdir().unwrap();
@@ -1374,8 +1374,14 @@ mod e2e_tests {
         let first = launch(&[]);
         assert!(first.contains("Sandbox Configuration"), "{first}");
         let second = launch(&[]);
-        assert!(second.contains("Sandbox Configuration"), "{second}");
-        assert!(!second.contains("Changed since last launch"), "{second}");
+        assert!(!second.contains("Sandbox Configuration"), "{second}");
+        assert!(second.contains("unchanged since last launch"), "{second}");
+        let launch_dir = home.path().join(".config/cplt/launch");
+        let confirmed = std::fs::read_dir(&launch_dir)
+            .expect("the display hash lives here")
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().contains("confirmed-"));
+        assert!(!confirmed, "a headless run must not pre-confirm the TTY");
         let third = launch(&["--allow-read", "/usr/share"]);
         assert!(
             third.contains("Sandbox Configuration") && third.contains("Extra read"),

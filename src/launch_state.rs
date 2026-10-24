@@ -135,11 +135,8 @@ pub struct Confirmation {
     display_topic: String,
     content: String,
     fields: Vec<(String, String)>,
-    tty: bool,
     /// The same profile was confirmed before (and a TTY is there to ask on).
     pub confirmed: bool,
-    /// The same profile was confirmed before, TTY or not.
-    pub seen: bool,
     /// The full table was printed with a TTY present, so a person saw what
     /// they confirm. Only then may [`Confirmation::record`] run.
     pub shown: bool,
@@ -155,9 +152,7 @@ impl Confirmation {
             display_topic: format!("summary-{agent}"),
             content,
             fields: Vec::new(),
-            tty,
             confirmed: tty && seen,
-            seen,
             shown: false,
         }
     }
@@ -175,34 +170,26 @@ impl Confirmation {
         !matches(home, project, &self.display_topic, &self.content)
     }
 
-    /// Field names that changed since the record this launch is compared
-    /// with: the last accepted TTY launch, or headless the last confirmation.
+    /// Field names that changed since the last accepted launch.
     pub fn changed_fields(&self, home: &Path, project: &Path) -> Vec<String> {
-        let topic = if self.tty {
-            &self.display_topic
-        } else {
-            &self.topic
-        };
-        changed_fields(home, project, topic, &self.fields)
+        changed_fields(home, project, &self.display_topic, &self.fields)
     }
 
     pub fn record(&self, home: &Path, project: &Path) {
         record_fields(home, project, &self.topic, &self.content, &self.fields);
     }
 
-    /// The launch went ahead: remember what was shown, so it is not shown in
-    /// full again. Only with a TTY, and only after the launch was accepted, so
-    /// a declined launch leaves the old record in place.
+    /// The launch went ahead (TTY or headless `--yes`): remember what was
+    /// shown, so it is not shown in full again. Display only; a declined
+    /// launch never gets here, so the old record stays.
     pub fn record_display(&self, home: &Path, project: &Path) {
-        if self.tty {
-            record_fields(
-                home,
-                project,
-                &self.display_topic,
-                &self.content,
-                &self.fields,
-            );
-        }
+        record_fields(
+            home,
+            project,
+            &self.display_topic,
+            &self.content,
+            &self.fields,
+        );
     }
 }
 
@@ -271,9 +258,10 @@ mod tests {
         assert!(changed.display_changed(h, &p));
         assert_eq!(changed.changed_fields(h, &p), ["b"]);
         assert!(!c("x", f("1", "2"), true).display_changed(h, &p));
-        // Headless never records.
+        // An accepted headless launch updates the display, never the confirmation.
         c("y", f("1", "3"), false).record_display(h, &p);
-        assert!(c("y", f("1", "3"), true).display_changed(h, &p));
+        assert!(!c("y", f("1", "3"), true).display_changed(h, &p));
+        assert!(!c("y", f("1", "3"), true).confirmed);
     }
 
     #[test]
