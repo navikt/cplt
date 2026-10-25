@@ -728,20 +728,67 @@ mod tests {
         let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = |l: &std::net::TcpListener| l.local_addr().unwrap().port();
         let home = std::env::temp_dir().canonicalize().unwrap();
-        let profile = crate::sandbox::mcp_child_profile(&home, &[], Some(port(&allowed))).unwrap();
-        let nc = |host: &str, p: u16| {
+        // Written with the /var spelling: child_command canonicalizes, so
+        // the test must too, or a /private/var mismatch would pass silently.
+        let wdir = home.join(format!("cplt-849-wd-{}", std::process::id()));
+        std::fs::create_dir_all(&wdir).unwrap();
+        let profile = crate::sandbox::mcp_child_profile(
+            &home,
+            &[wdir.canonicalize().unwrap()],
+            Some(port(&allowed)),
+        )
+        .unwrap();
+        let run = |args: &[&str]| {
             Command::new("/usr/bin/sandbox-exec")
-                .args(["-p", &profile, "--", "/usr/bin/nc", "-z", "-G", "2", host])
-                .arg(p.to_string())
+                .args(["-p", &profile, "--"])
+                .args(args)
                 .output()
                 .unwrap()
                 .status
                 .success()
         };
+        let nc = |host: &str, p: u16| run(&["/usr/bin/nc", "-z", "-G", "2", host, &p.to_string()]);
         assert!(nc("127.0.0.1", port(&allowed)), "egress port refused");
         assert!(!nc("127.0.0.1", port(&other)), "another local port reached");
         assert!(!nc("1.1.1.1", 443), "a remote host reached");
-        // And no writes outside its dirs.
+        // A unix socket under ~/.gradle (a daemon's) and a listener: denied.
+        // `home` is the profile's HOME, so this is the path the agent
+        // profile's Gradle rule would have opened.
+        let sock_dir = home.join(".gradle");
+        std::fs::create_dir_all(&sock_dir).unwrap();
+        let sock = sock_dir.join(format!("cplt-849-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        // The real interpreter, not the /usr/bin stub, which runs xcodebuild
+        // and fails inside a sandbox on CI runners (as in tests/mcp_broker.rs).
+        let out = Command::new("/usr/bin/python3")
+            .args(["-c", "import sys; print(sys.executable)"])
+            .output()
+            .unwrap();
+        let py_bin = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        let py_bin = py_bin.as_str();
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let s = format!(
+            "import socket;socket.socket(socket.AF_UNIX).connect({:?})",
+            sock.display().to_string()
+        );
+        let host = |a: &[&str]| Command::new(a[0]).args(&a[1..]).status().unwrap().success();
+        assert!(
+            host(&[py_bin, "-c", &s]),
+            "control: socket unreachable on the host"
+        );
+        assert!(!run(&[py_bin, "-c", &s]), "reached a ~/.gradle socket");
+        drop(listener);
+        let _ = std::fs::remove_file(&sock);
+        let py = "import socket;s=socket.socket();s.bind(('127.0.0.1',0));s.listen()";
+        assert!(host(&[py_bin, "-c", py]), "control: bind fails on the host");
+        assert!(!run(&[py_bin, "-c", py]), "bound a listener");
+        // Writes: inside a write_dir yes, elsewhere no.
+        let inside = wdir.join("ok");
+        assert!(
+            run(&["/usr/bin/touch", &inside.display().to_string()]),
+            "write_dir not writable"
+        );
+        let _ = std::fs::remove_dir_all(&wdir);
         let st = Command::new("/usr/bin/sandbox-exec")
             .args(["-p", &profile, "--", "/usr/bin/touch"])
             .arg(home.join(format!("cplt-849-w-{}", std::process::id())))

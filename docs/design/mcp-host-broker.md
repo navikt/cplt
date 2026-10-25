@@ -391,12 +391,16 @@ mechanism's status probe; no secret is printed.
   a separate policy for the child's proxy connections **(open: one proxy
   with per-client policy, or a second listener)**.
   On macOS this is **enforced** (#849): the child runs under
-  `sandbox-exec` with `mcp_child_profile` (`src/sandbox_profile.rs`), built
-  from the agent profile's own header, process and proxy-forced network
-  rules. Outbound TCP reaches only `localhost:<egress port>`; a direct
+  `sandbox-exec` with `mcp_child_profile` (`src/sandbox_profile.rs`),
+  built from the agent profile's header and process rules plus a network
+  block of its own: mDNSResponder and `localhost:<egress port>`, nothing
+  else (no listener, no unix sockets such as a Gradle daemon's). A direct
   connect to any other host or local port fails with `EPERM`, UDP is
   denied, and with no `egressHosts` there is no TCP at all. Name lookups
-  through mDNSResponder stay open, as for the agent. On Linux the control is
+  stay open, as for the agent. `mach-lookup` is unscoped (securityd needs
+  it), so a binary could in theory reach the network through an XPC
+  service such as `nsurlsessiond`. This contains the nais workload; it is
+  not a full jail for an arbitrary hostile binary. On Linux the control is
   still **advisory**: the child gets only `HTTPS_PROXY`. A network
   namespace cannot reach the proxy on the host's loopback, and the agent
   sandbox has no namespace path to reuse (Landlock is port-based and cannot

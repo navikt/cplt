@@ -339,15 +339,20 @@ pub(crate) fn mcp_child_profile(
         sbpl!(sb, "(allow file-write* (subpath \"{}\"))", d.display());
     }
     sbpl!(sb);
-    emit_network_rules(
-        &mut sb,
-        &home.to_string_lossy(),
-        &[],
-        false,
-        proxy_port,
-        &[],
-        true,
+    // Its own network block, not the agent's: no Gradle daemon sockets
+    // (code outside any sandbox), no bind or inbound (a stdio server needs
+    // no listener). DNS, then TCP to its egress proxy only.
+    sbpl!(sb, ";; Network: DNS and the egress proxy only");
+    sbpl!(
+        sb,
+        "(allow network-outbound (literal \"/private/var/run/mDNSResponder\"))"
     );
+    if let Some(port) = proxy_port {
+        sbpl!(
+            sb,
+            "(allow network-outbound (remote tcp \"localhost:{port}\"))"
+        );
+    }
     Ok(sb)
 }
 
