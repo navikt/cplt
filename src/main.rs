@@ -4999,6 +4999,18 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     }
     // `cplt mcp status`: the same specs, judged by this launch's final policy.
     if let Some(json) = mcp_status {
+        // Unfiltered status reports OpenCode v2 when it is installed, whatever
+        // agent this run selected (#857). Best effort: an unreadable version
+        // leaves it out.
+        let status_opencode_v2 = if cli.agent.is_none() && active_agent != agent::Agent::OpenCode {
+            agent::Agent::OpenCode
+                .resolve_binary_with_editor_provenance()
+                .ok()
+                .and_then(|(bin, _)| agent::is_opencode_v2(&bin, &home_dir))
+                .unwrap_or(false)
+        } else {
+            opencode_v2
+        };
         let mut found = mcp_found;
         cplt::mcp_broker::drop_writable(&mut found, |p| {
             cplt::check::writable_tree_on_path(&policy, &home_dir, p).map(|(_, tree)| tree)
@@ -5011,7 +5023,12 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             resolved.mcp_broker,
             mcp_refusal.as_deref(),
             // The clients a launch would point at the broker.
-            mcp_status_clients(active_agent, opencode_v2, &resolved.deny_env),
+            // No `--agent`: every client the broker wires (#857).
+            mcp_status_clients(
+                cli.agent.is_some().then_some(active_agent),
+                status_opencode_v2,
+                &resolved.deny_env,
+            ),
         ));
     }
 
@@ -12511,18 +12528,17 @@ fn doctor_rootful_blocked(landlock_v9: bool, bwrap: bool, scratch_dir: bool, is_
 
 /// The clients a launch would point at the broker. OpenCode is rewired
 /// through `OPENCODE_CONFIG_CONTENT`, so denying it leaves OpenCode out.
+/// `None` (no `--agent`) means every client the broker wires.
 fn mcp_status_clients(
-    agent: agent::Agent,
+    agent: Option<agent::Agent>,
     opencode_v2: bool,
     deny_env: &[String],
 ) -> &'static [&'static str] {
+    let opencode = opencode_v2 && !deny_env.iter().any(|d| d == "OPENCODE_CONFIG_CONTENT");
     match agent {
-        agent::Agent::Copilot => &["copilot"],
-        agent::Agent::OpenCode
-            if opencode_v2 && !deny_env.iter().any(|d| d == "OPENCODE_CONFIG_CONTENT") =>
-        {
-            &["opencode"]
-        }
+        None if opencode => &["copilot", "opencode"],
+        None | Some(agent::Agent::Copilot) => &["copilot"],
+        Some(agent::Agent::OpenCode) if opencode => &["opencode"],
         _ => &[],
     }
 }
@@ -12534,13 +12550,25 @@ mod tests {
     #[test]
     fn mcp_status_leaves_opencode_out_when_its_config_var_is_denied() {
         let deny = vec!["OPENCODE_CONFIG_CONTENT".to_string()];
-        let oc = agent::Agent::OpenCode;
+        let oc = Some(agent::Agent::OpenCode);
         assert_eq!(super::mcp_status_clients(oc, true, &[]), ["opencode"]);
         assert!(super::mcp_status_clients(oc, true, &deny).is_empty());
         assert_eq!(
-            super::mcp_status_clients(agent::Agent::Copilot, false, &deny),
+            super::mcp_status_clients(Some(agent::Agent::Copilot), false, &deny),
             ["copilot"]
         );
+    }
+
+    /// #857: outside a launch (no `--agent`) report every brokered client.
+    #[test]
+    fn mcp_status_without_agent_lists_every_wired_client() {
+        let deny = vec!["OPENCODE_CONFIG_CONTENT".to_string()];
+        assert_eq!(
+            super::mcp_status_clients(None, true, &[]),
+            ["copilot", "opencode"]
+        );
+        assert_eq!(super::mcp_status_clients(None, true, &deny), ["copilot"]);
+        assert_eq!(super::mcp_status_clients(None, false, &[]), ["copilot"]);
     }
 
     /// `--no-scratch-dir` drops file masks, so doctor must not call a rootful

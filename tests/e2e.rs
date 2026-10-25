@@ -2480,6 +2480,59 @@ mod e2e_tests {
         assert!(v.to_string().contains("fake-mcp"), "{v}");
     }
 
+    /// #857: without `--agent`, status lists OpenCode v2 next to the selected
+    /// Copilot; `--agent copilot` keeps it to Copilot.
+    #[test]
+    fn e2e_mcp_status_without_agent_lists_opencode_v2() {
+        let home = home_temp_dir("mcp-status-clients");
+        let home_path = std::fs::canonicalize(home.path()).unwrap();
+        let dir = home_path.join(".config/cplt/mcp");
+        std::fs::create_dir_all(&dir).unwrap();
+        let spec = serde_json::json!({
+            "name": "io.example/fake-mcp",
+            "_meta": {"io.github.navikt/broker": {
+                "v": 1, "credential": "none", "command": ["python3", "x.py"],
+                "tools": {"allow": ["echo"]}
+            }}
+        });
+        std::fs::write(dir.join("io.example__fake-mcp.json"), spec.to_string()).unwrap();
+        let copilot = fake_agent_dir("copilot");
+        // An `opencode-v2` path component marks v2 without running it.
+        let oc_dir = home_path.join("opencode-v2/bin");
+        std::fs::create_dir_all(&oc_dir).unwrap();
+        let oc = oc_dir.join("opencode");
+        std::fs::write(&oc, "#!/bin/sh\necho 2.0.0\n").unwrap();
+        std::fs::set_permissions(&oc, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}:/usr/bin:/bin",
+            copilot.path().display(),
+            oc_dir.display()
+        );
+        let clients = |args: &[&str]| {
+            let out = cplt_cmd()
+                .args(args)
+                .args(["mcp", "status", "--json"])
+                .env("HOME", &home_path)
+                .env("PATH", &path)
+                .env_remove("XDG_CONFIG_HOME")
+                .current_dir(project_dir())
+                .output()
+                .expect("binary should run");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let v: serde_json::Value = serde_json::from_str(stdout.lines().last().unwrap_or(""))
+                .unwrap_or_else(|_| panic!("{stdout}\n{stderr}"));
+            v["servers"][0]["clients"].clone()
+        };
+        let all = clients(&[]);
+        assert!(all.to_string().contains("opencode"), "{all}");
+        let copilot_only = clients(&["--agent", "copilot"]);
+        assert!(
+            !copilot_only.to_string().contains("opencode"),
+            "{copilot_only}"
+        );
+    }
+
     /// The whole chain: shim → cplt → sandbox → the real agent, with the shim
     /// directory first on PATH. cplt must skip its own shim when it resolves
     /// the agent (without the skip it launches the shim inside the sandbox,
