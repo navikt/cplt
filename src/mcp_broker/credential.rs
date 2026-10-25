@@ -24,6 +24,9 @@ pub struct Credential {
     /// The host login lives in the OS keychain: on Linux the child gets the
     /// session bus to reach the Secret Service.
     pub keychain: bool,
+    /// Under `HOME`, the only places the macOS child sandbox lets the server
+    /// write, besides its temp dir: its own config (a refreshed login).
+    pub write_dirs: &'static [&'static str],
 }
 
 /// The table.
@@ -36,6 +39,8 @@ pub const MECHANISMS: &[Credential] = &[
         command: Some(&["nais", "alpha", "mcp", "serve"]),
         probe: Some(&["auth", "print-access-token", "-n"]),
         keychain: true,
+        // os.UserConfigDir on macOS: nais-credentials.json.enc.
+        write_dirs: &["Library/Application Support/nais"],
     },
     // A server with no host login: nothing to probe, any trusted command.
     // Not emitted by nav-pilot today; the broker e2e tests run on it.
@@ -44,6 +49,7 @@ pub const MECHANISMS: &[Credential] = &[
         command: None,
         probe: None,
         keychain: false,
+        write_dirs: &[],
     },
 ];
 

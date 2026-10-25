@@ -307,6 +307,45 @@ fn profile_locked(
     sb
 }
 
+/// The Seatbelt profile for a brokered MCP server child (#849). It runs on
+/// the host with the user's own login, so reads stay open (its credential
+/// file, the keychain via securityd, the system); what it loses is the
+/// network and most writes. Outbound TCP reaches only `localhost:{proxy_port}`,
+/// its egress proxy, through the same proxy-forced rules as the agent
+/// (no port means no TCP at all). Writes go only to `write_dirs`, which the
+/// caller canonicalizes; an SBPL-unsafe path is an error, never dropped.
+pub(crate) fn mcp_child_profile(
+    home: &Path,
+    write_dirs: &[PathBuf],
+    proxy_port: Option<u16>,
+) -> Result<String, String> {
+    for d in write_dirs {
+        super::policy::validate_sbpl_path(d)?;
+    }
+    super::policy::validate_sbpl_path(home)?;
+    let mut sb = String::new();
+    emit_header(&mut sb, "brokered MCP server child");
+    emit_process_rules(&mut sb);
+    sbpl!(sb, ";; Reads: open. The child holds the host login anyway.");
+    sbpl!(sb, "(allow file-read*)");
+    sbpl!(sb, ";; Mach IPC (Keychain via securityd, DNS)");
+    sbpl!(sb, "(allow mach-lookup)");
+    for d in write_dirs {
+        sbpl!(sb, "(allow file-write* (subpath \"{}\"))", d.display());
+    }
+    sbpl!(sb);
+    emit_network_rules(
+        &mut sb,
+        &home.to_string_lossy(),
+        &[],
+        false,
+        proxy_port,
+        &[],
+        true,
+    );
+    Ok(sb)
+}
+
 // ── Profile section helpers ────────────────────────────────────
 //
 // Each function writes a contiguous SBPL block to the output string.
