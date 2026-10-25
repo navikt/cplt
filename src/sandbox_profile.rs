@@ -330,6 +330,11 @@ pub(crate) fn mcp_child_profile(
     sbpl!(sb, "(allow file-read*)");
     sbpl!(sb, ";; Mach IPC (Keychain via securityd, DNS)");
     sbpl!(sb, "(allow mach-lookup)");
+    // `security add-generic-password` (go-keyring's refresh) posts this.
+    sbpl!(
+        sb,
+        "(allow ipc-posix-shm* (ipc-posix-name \"com.apple.AppleDatabaseChanged\"))"
+    );
     for d in write_dirs {
         sbpl!(sb, "(allow file-write* (subpath \"{}\"))", d.display());
     }
