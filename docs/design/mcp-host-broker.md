@@ -412,7 +412,11 @@ mechanism's status probe; no secret is printed.
   `nais-credentials.json.enc`). The keychain is reached through securityd
   (`mach-lookup`, as in the agent profile); go-keyring's `security`
   helper also needs `ipc-posix-shm` on `com.apple.AppleDatabaseChanged` to
-  post a keychain change. Measured 2026-10-25: `nais auth
+  post a keychain change. A refresh also rewrites the login keychain file
+  from the caller's process (a `login.keychain-db.sb-*` temp file, then a
+  rename), so a `keychain` mechanism may write exactly
+  `~/Library/Keychains/login.keychain-db` and its `.sb-*` siblings; without
+  it `security` exits 161 and the refresh is lost (measured 2026-10-25). Measured 2026-10-25: `nais auth
   print-access-token -n` exits 0 under the profile (network opened for the
   check) with no file or keychain denials. On Linux, files are still
   unrestricted.

@@ -317,6 +317,7 @@ fn profile_locked(
 pub(crate) fn mcp_child_profile(
     home: &Path,
     write_dirs: &[PathBuf],
+    keychain: bool,
     proxy_port: Option<u16>,
 ) -> Result<String, String> {
     for d in write_dirs {
@@ -337,6 +338,16 @@ pub(crate) fn mcp_child_profile(
     );
     for d in write_dirs {
         sbpl!(sb, "(allow file-write* (subpath \"{}\"))", d.display());
+    }
+    if keychain {
+        // Security.framework rewrites the file keychain in the caller's
+        // process: a temp file beside login.keychain-db, then a rename.
+        // Only that file and its temp siblings, not the Keychains dir.
+        let dir = super::policy::escape_regex(&home.join("Library/Keychains").to_string_lossy());
+        sbpl!(
+            sb,
+            "(allow file-write* (regex #\"^{dir}/login\\.keychain-db(\\.sb-[^/]+)?$\"))"
+        );
     }
     sbpl!(sb);
     // Its own network block, not the agent's: no Gradle daemon sockets

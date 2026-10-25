@@ -418,8 +418,8 @@ fn child_command(spec: &Spec, home: &Path, egress: Option<u16>) -> std::io::Resu
         .into_iter()
         .map(|d| d.canonicalize().unwrap_or(d))
         .collect();
-    let profile =
-        crate::sandbox::mcp_child_profile(home, &dirs, egress).map_err(std::io::Error::other)?;
+    let profile = crate::sandbox::mcp_child_profile(home, &dirs, spec.credential.keychain, egress)
+        .map_err(std::io::Error::other)?;
     let mut cmd = Command::new("/usr/bin/sandbox-exec");
     cmd.arg("-p")
         .arg(profile)
@@ -735,6 +735,7 @@ mod tests {
         let profile = crate::sandbox::mcp_child_profile(
             &home,
             &[wdir.canonicalize().unwrap()],
+            false,
             Some(port(&allowed)),
         )
         .unwrap();
