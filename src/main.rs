@@ -4999,6 +4999,18 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     }
     // `cplt mcp status`: the same specs, judged by this launch's final policy.
     if let Some(json) = mcp_status {
+        // Unfiltered status reports OpenCode v2 when it is installed, whatever
+        // agent this run selected (#857). Best effort: an unreadable version
+        // leaves it out.
+        let status_opencode_v2 = if cli.agent.is_none() && active_agent != agent::Agent::OpenCode {
+            agent::Agent::OpenCode
+                .resolve_binary_with_editor_provenance()
+                .ok()
+                .and_then(|(bin, _)| agent::is_opencode_v2(&bin, &home_dir))
+                .unwrap_or(false)
+        } else {
+            opencode_v2
+        };
         let mut found = mcp_found;
         cplt::mcp_broker::drop_writable(&mut found, |p| {
             cplt::check::writable_tree_on_path(&policy, &home_dir, p).map(|(_, tree)| tree)
@@ -5014,7 +5026,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             // No `--agent`: every client the broker wires (#857).
             mcp_status_clients(
                 cli.agent.is_some().then_some(active_agent),
-                opencode_v2,
+                status_opencode_v2,
                 &resolved.deny_env,
             ),
         ));
