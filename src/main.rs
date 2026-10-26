@@ -2455,7 +2455,7 @@ fn state_split_finding(home: &Path) -> Option<cplt::doctor::Finding> {
     if !in_xdg.is_empty() && legacy.join(sandbox::XDG_PINNED_MARKER).exists() {
         return Some(Finding::warning(
             format!(
-                "cplt ignores {}: it was inside the sandbox's grant, so the agent could have                  written it. cplt uses {}.",
+                "cplt ignores {}: it was inside the sandbox's grant, so the agent could have written it. cplt uses {}.",
                 tilde(&xdg),
                 tilde(&legacy)
             ),
@@ -2499,7 +2499,7 @@ fn state_split_finding(home: &Path) -> Option<cplt::doctor::Finding> {
         .collect();
     Some(Finding::warning(
         format!(
-            "cplt state is split: {} in {}, {} in {}. cplt writes to {} and still reads              approvals from both.",
+            "cplt state is split: {} in {}, {} in {}. cplt writes to {} and still reads approvals from both.",
             in_legacy.join(", "),
             tilde(&legacy),
             in_xdg.join(", "),
