@@ -5,18 +5,21 @@ use std::path::{Component, Path, PathBuf};
 use super::error::ConfigError;
 use super::types::{CONFIG_DIR, CONFIG_FILE};
 
-/// Return the config file path.
-/// Checks `CPLT_CONFIG` env var first, then `~/.config/cplt/config.toml`.
+/// Return the config file path: `CPLT_CONFIG` when set, else `config.toml`
+/// in [`config_dir`].
 pub fn config_path() -> Option<PathBuf> {
     if let Ok(custom) = std::env::var("CPLT_CONFIG") {
         return Some(expand_tilde(&custom));
     }
-    std::env::var("HOME")
-        .ok()
-        .map(|h| PathBuf::from(h).join(CONFIG_DIR).join(CONFIG_FILE))
+    config_dir().map(|d| d.join(CONFIG_FILE))
 }
 
-/// Return the cplt config directory path (`~/.config/cplt/`).
+/// Return the cplt config directory: the parent of `CPLT_CONFIG` when set,
+/// else `$XDG_CONFIG_HOME/cplt` when it already holds `config.toml` or
+/// `trust/` (#851), else `~/.config/cplt`.
+///
+/// The XDG root is never used when it is unusable for the sandbox profile or
+/// lies inside a grant (see [`xdg_config_root`]).
 pub fn config_dir() -> Option<PathBuf> {
     if let Ok(custom) = std::env::var("CPLT_CONFIG") {
         // If custom config path is set, use its parent directory
@@ -24,9 +27,72 @@ pub fn config_dir() -> Option<PathBuf> {
             .parent()
             .map(std::path::Path::to_path_buf);
     }
-    std::env::var("HOME")
-        .ok()
-        .map(|h| PathBuf::from(h).join(CONFIG_DIR))
+    let home = PathBuf::from(std::env::var("HOME").ok()?);
+    let legacy = home.join(CONFIG_DIR);
+    Some(
+        xdg_config_root(&home)
+            .filter(|x| x.join(CONFIG_FILE).exists() || x.join("trust").exists())
+            .unwrap_or(legacy),
+    )
+}
+
+/// Every directory approvals (`trust/`, `local/`) are read from, the one
+/// [`config_dir`] resolves to first. Writes go to the first only. With
+/// `CPLT_CONFIG` set that is its parent alone, as before #851.
+#[must_use]
+pub fn approval_dirs() -> Vec<PathBuf> {
+    let Some(first) = config_dir() else {
+        return Vec::new();
+    };
+    let mut dirs = vec![first];
+    if std::env::var_os("CPLT_CONFIG").is_none()
+        && let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+    {
+        for d in [Some(home.join(CONFIG_DIR)), xdg_config_root(&home)]
+            .into_iter()
+            .flatten()
+        {
+            if !dirs.contains(&d) {
+                dirs.push(d);
+            }
+        }
+    }
+    dirs
+}
+
+/// `name` under the first of [`approval_dirs`] that has it, joined below
+/// `sub`; the write location when none does.
+#[must_use]
+pub fn approval_file(sub: &str, name: &str) -> Option<PathBuf> {
+    let dirs = approval_dirs();
+    let write = dirs.first()?.join(sub).join(name);
+    Some(
+        dirs.iter()
+            .map(|d| d.join(sub).join(name))
+            .find(|p| p.symlink_metadata().is_ok())
+            .unwrap_or(write),
+    )
+}
+
+/// `$XDG_CONFIG_HOME/cplt` as a candidate for config and approvals: `None`
+/// when state is not moved, the path is unsafe for the profile, this process
+/// pinned state out of a grant, or an earlier launch did (the
+/// [`crate::sandbox::XDG_PINNED_MARKER`] in `~/.config/cplt`). The persisted
+/// pin matters: while the XDG root lay inside a grant the agent could write
+/// it, so nothing found there afterwards is trusted.
+#[must_use]
+pub fn xdg_config_root(home: &Path) -> Option<PathBuf> {
+    use crate::sandbox as policy;
+    if policy::cplt_state_dir(home) == home.join(CONFIG_DIR)
+        || home
+            .join(CONFIG_DIR)
+            .join(policy::XDG_PINNED_MARKER)
+            .symlink_metadata()
+            .is_ok()
+    {
+        return None;
+    }
+    policy::xdg_state_dir(home)
 }
 
 /// Generate a default config file with comments explaining each option.

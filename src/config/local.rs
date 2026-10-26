@@ -86,12 +86,24 @@ pub fn local_dir() -> Option<PathBuf> {
     Some(config_dir()?.join(LOCAL_DIR))
 }
 
-/// The local config file for `project_dir`, whether or not it exists.
-pub fn local_path(project_dir: &Path) -> Option<PathBuf> {
+fn local_file_name(project_dir: &Path) -> String {
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(canonical_key(project_dir).as_bytes());
     let name: String = hash.iter().map(|b| format!("{b:02x}")).collect();
-    Some(local_dir()?.join(format!("{name}.toml")))
+    format!("{name}.toml")
+}
+
+/// The local config file for `project_dir`, whether or not it exists: the
+/// first copy found in [`super::approval_dirs`] (#851), else
+/// [`local_write_path`].
+pub fn local_path(project_dir: &Path) -> Option<PathBuf> {
+    super::approval_file(LOCAL_DIR, &local_file_name(project_dir))
+}
+
+/// Where a write of the local config for `project_dir` goes: `local/` in the
+/// resolved config dir, never the other root.
+pub fn local_write_path(project_dir: &Path) -> Option<PathBuf> {
+    Some(local_dir()?.join(local_file_name(project_dir)))
 }
 
 /// Load the local config for `project_dir`.
@@ -371,16 +383,14 @@ pub fn stamp_local_header(doc: &mut toml_edit::DocumentMut, project_dir: &Path) 
 /// `config local list` still shows the file, since an unreadable orphan is
 /// exactly what a user needs to be told about.
 pub fn list_local() -> Vec<(PathBuf, String)> {
-    let Some(dir) = local_dir() else {
-        return Vec::new();
-    };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    let mut out: Vec<(PathBuf, String)> = entries
-        .flatten()
-        .map(|entry| entry.path())
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<(PathBuf, String)> = super::approval_dirs()
+        .into_iter()
+        .filter_map(|d| std::fs::read_dir(d.join(LOCAL_DIR)).ok())
+        .flat_map(|entries| entries.flatten().map(|entry| entry.path()))
         .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
+        // The first root's copy is the one in force; later ones are shadowed.
+        .filter(|path| seen.insert(path.file_name().map(std::ffi::OsStr::to_owned)))
         .map(|path| {
             let recorded = std::fs::read_to_string(&path)
                 .ok()

@@ -17,11 +17,22 @@ fn xdg_inside_allow_write_pins_state_to_the_legacy_dir() {
     let xdg = granted.join("cfg");
     let legacy = home.join(CPLT_STATE_DIR);
 
-    temp_env::with_var("XDG_CONFIG_HOME", Some(&xdg), || {
+    // #851: config in the XDG root follows the pin too.
+    std::fs::create_dir_all(xdg.join("cplt")).unwrap();
+    std::fs::write(xdg.join("cplt/config.toml"), "").unwrap();
+    let vars = [
+        ("XDG_CONFIG_HOME", Some(xdg.as_os_str())),
+        ("HOME", Some(home.as_os_str())),
+        ("CPLT_CONFIG", None),
+    ];
+    temp_env::with_vars(vars, || {
         assert_eq!(cplt_state_dir(&home), xdg.join("cplt"));
+        assert_eq!(cplt::config::config_dir(), Some(xdg.join("cplt")));
         let pinned = pin_legacy_state_dir_if_inside(&home, std::slice::from_ref(&granted));
         assert_eq!(pinned, Some((xdg.join("cplt"), granted.clone())));
         assert_eq!(cplt_state_dir(&home), legacy);
+        assert_eq!(cplt::config::config_dir(), Some(legacy.clone()));
+        assert_eq!(cplt::config::approval_dirs(), vec![legacy.clone()]);
         // Reported once.
         assert_eq!(
             pin_legacy_state_dir_if_inside(&home, &[PathBuf::from(&granted)]),
@@ -33,7 +44,7 @@ fn xdg_inside_allow_write_pins_state_to_the_legacy_dir() {
     });
     assert!(legacy.join("launch").read_dir().unwrap().next().is_some());
     assert!(
-        !xdg.join("cplt").exists(),
+        !xdg.join("cplt/launch").exists(),
         "nothing written under the grant"
     );
 }
