@@ -1155,7 +1155,7 @@ A token read inside the sandbox is then useless anywhere else.
   (`gho_…`, `github_pat_…`). It replaces the token in `GH_TOKEN`,
   `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN`, `OPENCODE_AUTH_CONTENT` and the gh
   guard's token files.
-- For `api.github.com`, `github.com` and `*.githubcopilot.com` on port 443, the
+- For `api.github.com`, `github.com`, `uploads.github.com` and `*.githubcopilot.com` on port 443, the
   proxy terminates TLS with a CA created in memory for this session. It swaps
   the placeholder for the real token in the `Authorization` header (`Bearer`,
   `token`, or `Basic` where the password is the placeholder) and connects

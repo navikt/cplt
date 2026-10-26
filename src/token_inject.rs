@@ -4,7 +4,7 @@
 //! The sandbox gets a placeholder in place of each GitHub token cplt hands
 //! it. The placeholder has the real token's prefix and length, because
 //! Copilot checks the prefix before it sends anything. For CONNECTs to
-//! `api.github.com`, `github.com` and `*.githubcopilot.com` on 443, the proxy
+//! `api.github.com`, `github.com`, `uploads.github.com` and `*.githubcopilot.com` on 443, the proxy
 //! terminates TLS with a leaf signed by a CA that exists only in this
 //! process's memory, puts the real token back in the `Authorization` header
 //! and opens its own TLS connection upstream. Every other host keeps the
@@ -410,7 +410,11 @@ fn mask_child_env(cmd: &mut Command, inherit_env: bool) {
 
 /// Does a CONNECT to `host:port` get TLS termination?
 pub fn intercepts(host: &str, port: u16) -> bool {
-    port == 443 && (host == "api.github.com" || host == "github.com" || is_copilot_host(host))
+    port == 443
+        && (host == "api.github.com"
+            || host == "github.com"
+            || host == "uploads.github.com"
+            || is_copilot_host(host))
 }
 
 fn is_copilot_host(host: &str) -> bool {
@@ -1002,6 +1006,8 @@ pub(crate) mod tests {
     fn intercepts_only_github_hosts_on_443() {
         assert!(intercepts("api.github.com", 443));
         assert!(intercepts("github.com", 443));
+        assert!(intercepts("uploads.github.com", 443));
+        assert!(!intercepts("evil.uploads.github.com", 443));
         assert!(intercepts("api.individual.githubcopilot.com", 443));
         assert!(!intercepts("githubcopilot.com", 443));
         assert!(!intercepts("api.github.com", 80));
