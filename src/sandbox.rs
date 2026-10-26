@@ -1227,7 +1227,7 @@ fn keep_cplt_state_out_of_grants(config: &SandboxConfig) -> Result<(), String> {
         }
     }
     // Only now is the state dir known to sit outside every grant.
-    policy::flush_state_pinned(config.home_dir, config.project_dir);
+    policy::flush_state_pinned(config.home_dir, config.project_dir)?;
     crate::launch_state::prune(config.home_dir);
     Ok(())
 }

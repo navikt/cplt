@@ -2449,13 +2449,10 @@ fn state_split_finding(home: &Path) -> Option<cplt::doctor::Finding> {
             .collect()
     };
     let (in_legacy, in_xdg) = (items(&legacy), items(&xdg));
-    if in_legacy.is_empty() || in_xdg.is_empty() {
-        return None;
-    }
-    let used = config::config_dir()?;
-    let other = if used == xdg { &legacy } else { &xdg };
     let tilde = |p: &Path| doctor_tilde(&p.display().to_string(), home);
-    if legacy.join(sandbox::XDG_PINNED_MARKER).exists() {
+    // Before the split test: a user whose only state is under XDG has lost
+    // it to the marker, and this is where they learn why.
+    if !in_xdg.is_empty() && legacy.join(sandbox::XDG_PINNED_MARKER).exists() {
         return Some(Finding::warning(
             format!(
                 "cplt ignores {}: it was inside the sandbox's grant, so the agent could have                  written it. cplt uses {}.",
@@ -2463,8 +2460,10 @@ fn state_split_finding(home: &Path) -> Option<cplt::doctor::Finding> {
                 tilde(&legacy)
             ),
             Some(format!(
-                "review {} and move what you want to keep, then `rm {}`",
+                "point XDG_CONFIG_HOME outside every sandbox grant, review {0} and move what \
+                 you want to keep to {1}, delete the rest of {0}, then `rm {2}`",
                 tilde(&xdg),
+                tilde(&legacy),
                 sh_quote(
                     &legacy
                         .join(sandbox::XDG_PINNED_MARKER)
@@ -2474,6 +2473,11 @@ fn state_split_finding(home: &Path) -> Option<cplt::doctor::Finding> {
             )),
         ));
     }
+    if in_legacy.is_empty() || in_xdg.is_empty() {
+        return None;
+    }
+    let used = config::config_dir()?;
+    let other = if used == xdg { &legacy } else { &xdg };
     let moves: Vec<String> = items(other)
         .into_iter()
         .map(|i| {
@@ -15941,6 +15945,11 @@ mod tests {
             assert!(fix.starts_with("mv -n "), "{fix}");
             assert!(fix.contains("/xdg/cplt/trust"), "{fix}");
             assert!(legacy.join("trust").exists(), "nothing is moved");
+            // State only under XDG, ignored after a pin: still reported.
+            std::fs::remove_dir_all(legacy.join("trust")).unwrap();
+            std::fs::write(legacy.join(sandbox::XDG_PINNED_MARKER), "").unwrap();
+            let f = state_split_finding(&home).expect("marker");
+            assert!(f.message.contains("ignores"), "{}", f.message);
         });
     }
 
