@@ -347,6 +347,7 @@ pub(crate) fn mcp_child_profile(
         // `.fl<hex>` is the AtomicFile lock taken before the rewrite.
         let kc = home.join("Library/Keychains");
         let kc = kc.canonicalize().unwrap_or(kc);
+        super::policy::validate_sbpl_path(&kc)?;
         let dir = super::policy::escape_regex(&kc.to_string_lossy());
         sbpl!(
             sb,
