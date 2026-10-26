@@ -368,12 +368,28 @@ fn log_stderr(mut r: impl BufRead, log: &Log, id: &str) {
             Ok(0) | Err(_) => return,
             Ok(_) => {}
         }
+        // Longer than the cap: drop the whole line, never log it in pieces
+        // (a token cut at the seam would pass redaction as two short runs).
+        let overlong = buf.len() as u64 == STDERR_LINE && buf.last() != Some(&b'\n');
+        if overlong {
+            let mut tail = Vec::new();
+            while let Ok(n) = r.by_ref().take(STDERR_LINE).read_until(b'\n', &mut tail) {
+                if n == 0 || tail.last() == Some(&b'\n') {
+                    break;
+                }
+                tail.clear();
+            }
+        }
         if logged >= STDERR_CAP {
             continue;
         }
         logged += 1;
-        let line = redact(String::from_utf8_lossy(&buf).trim_end());
-        log.line(id, &format!("stderr: {line}"));
+        if overlong {
+            log.line(id, "stderr: [line over 512 bytes dropped]");
+        } else {
+            let line = redact(String::from_utf8_lossy(&buf).trim_end());
+            log.line(id, &format!("stderr: {line}"));
+        }
         if logged >= STDERR_CAP {
             log.line(id, "stderr: (cap reached, rest not logged)");
         }
@@ -399,6 +415,26 @@ fn redact(line: &str) -> String {
     out
 }
 
+/// `path` with its nearest existing ancestor canonicalized and the missing
+/// tail appended, so a grant on a not-yet-created dir under a symlinked
+/// parent still names the path Seatbelt will see.
+fn resolve_existing_prefix(path: &Path) -> PathBuf {
+    let mut tail = Vec::new();
+    let mut cur = path;
+    loop {
+        if let Ok(real) = cur.canonicalize() {
+            return tail.iter().rev().fold(real, |p, c| p.join(c));
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name.to_owned());
+                cur = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
 /// The server's command. On macOS it runs under `sandbox-exec` with
 /// [`crate::sandbox::mcp_child_profile`]: TCP only to its egress proxy,
 /// writes only to its credential's `write_dirs` and its temp dir (#849).
@@ -413,10 +449,10 @@ fn child_command(spec: &Spec, home: &Path, egress: Option<u16>) -> std::io::Resu
     let mut dirs = vec![std::env::temp_dir()];
     dirs.extend(spec.credential.write_dirs.iter().map(|d| home.join(d)));
     // Seatbelt matches resolved paths (/var is /private/var). A dir that does
-    // not exist yet keeps its spelling: a fresh login creates it.
+    // not exist yet (a fresh login creates it) resolves through its parents.
     let dirs: Vec<_> = dirs
         .into_iter()
-        .map(|d| d.canonicalize().unwrap_or(d))
+        .map(|d| resolve_existing_prefix(&d))
         .collect();
     let profile = crate::sandbox::mcp_child_profile(home, &dirs, spec.credential.keychain, egress)
         .map_err(std::io::Error::other)?;
@@ -688,6 +724,39 @@ mod tests {
 
     use serde_json::Value;
 
+    /// As `tests/common::sandbox_usable`: false where sandbox-exec cannot
+    /// apply a profile (inside cplt's own sandbox), unless CI requires it.
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::disallowed_methods)] // fixed /usr/bin path
+    fn sandbox_usable() -> bool {
+        let ok = Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        assert!(
+            ok || std::env::var("CPLT_TEST_REQUIRE_SANDBOX").as_deref() != Ok("1"),
+            "sandbox required by CPLT_TEST_REQUIRE_SANDBOX but unavailable"
+        );
+        ok
+    }
+
+    #[test]
+    fn resolve_existing_prefix_keeps_the_missing_tail() {
+        let tmp = std::env::temp_dir();
+        let real = tmp.canonicalize().unwrap();
+        let p = tmp.join("cplt-849-missing/a/b");
+        assert_eq!(
+            resolve_existing_prefix(&p),
+            real.join("cplt-849-missing/a/b")
+        );
+        let link = real.join(format!("cplt-849-link-{}", std::process::id()));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let got = resolve_existing_prefix(&link.join("nais"));
+        let _ = std::fs::remove_file(&link);
+        assert_eq!(got, real.join("nais"));
+    }
+
     #[test]
     fn redact_masks_token_shaped_runs_only() {
         assert_eq!(
@@ -708,11 +777,18 @@ mod tests {
             file: Some(file.clone()),
         };
         let mut input = String::from("secret ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+        // A token across the 512-byte cut must not leak its tail.
+        input.push_str(&"y ".repeat(250));
+        input.push_str(" ghp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n");
         input.push_str(&"x \n".repeat(20_000));
         log_stderr(std::io::Cursor::new(input), &log, "t");
         let out = std::fs::read_to_string(&file).unwrap();
         let _ = std::fs::remove_file(&file);
-        assert!(!out.contains("ghp_"), "{out}");
+        assert!(
+            !out.contains("ghp_") && !out.contains("bbbb") && !out.contains("y y"),
+            "{out}"
+        );
+        assert!(out.contains("[line over 512 bytes dropped]"), "{out}");
         assert!(out.contains("cap reached"));
         assert_eq!(out.lines().count(), STDERR_CAP + 1);
     }
@@ -724,6 +800,9 @@ mod tests {
     #[test]
     #[allow(clippy::disallowed_methods)] // fixed /usr/bin paths
     fn child_profile_keychain_write_needs_the_keychain_grant() {
+        if !sandbox_usable() {
+            return;
+        }
         let home = std::env::temp_dir()
             .canonicalize()
             .unwrap()
@@ -784,6 +863,9 @@ mod tests {
     #[test]
     #[allow(clippy::disallowed_methods)] // fixed /usr/bin paths
     fn child_profile_allows_only_the_egress_port() {
+        if !sandbox_usable() {
+            return;
+        }
         let allowed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = |l: &std::net::TcpListener| l.local_addr().unwrap().port();
