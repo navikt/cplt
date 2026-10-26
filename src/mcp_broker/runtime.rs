@@ -717,6 +717,66 @@ mod tests {
         assert_eq!(out.lines().count(), STDERR_CAP + 1);
     }
 
+    /// #849 refresh bug: Security.framework rewrites a file keychain in the
+    /// caller (temp sibling, then rename). keychain=true must allow it, and
+    /// keychain=false is the control. Only an explicit temp keychain is used.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[allow(clippy::disallowed_methods)] // fixed /usr/bin paths
+    fn child_profile_keychain_write_needs_the_keychain_grant() {
+        let home = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("cplt-849-kc-{}", std::process::id()));
+        let dir = home.join("Library/Keychains");
+        std::fs::create_dir_all(&dir).unwrap();
+        let kc = dir.join("login.keychain-db");
+        let kc = kc.to_str().unwrap();
+        let sec = |args: &[&str]| Command::new("/usr/bin/security").args(args).output();
+        let Ok(made) = sec(&["create-keychain", "-p", "test", kc]) else {
+            let _ = std::fs::remove_dir_all(&home);
+            return;
+        };
+        // create-keychain also adds it to the user's search list: remove it
+        // (and the files) whatever happens below. A new keychain is unlocked.
+        struct Cleanup<'a>(&'a str, &'a Path);
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                let _ = Command::new("/usr/bin/security")
+                    .args(["delete-keychain", self.0])
+                    .output();
+                let _ = std::fs::remove_dir_all(self.1);
+            }
+        }
+        let _cleanup = Cleanup(kc, &home);
+        assert!(made.status.success(), "create-keychain failed");
+        let add = |keychain: bool, acct: &str| {
+            let profile = crate::sandbox::mcp_child_profile(&home, &[], keychain, None).unwrap();
+            Command::new("/usr/bin/sandbox-exec")
+                .args(["-p", &profile, "--", "/usr/bin/security"])
+                .args([
+                    "add-generic-password",
+                    "-U",
+                    "-a",
+                    acct,
+                    "-s",
+                    "cplt-test",
+                    "-w",
+                    "x",
+                    kc,
+                ])
+                .env("HOME", &home)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        };
+        let denied = !add(false, "t0");
+        let allowed = add(true, "t1");
+        assert!(denied, "control: keychain=false still wrote the keychain");
+        assert!(allowed, "keychain=true could not write the keychain");
+    }
+
     /// The kernel, not the profile text: inside the child profile a TCP
     /// connect reaches only the egress port, not another local port and not
     /// a remote host.
