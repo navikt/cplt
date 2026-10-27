@@ -64,7 +64,7 @@ const GH_TOKEN_FILES: [&str; 2] = [".gh-exec-token", ".gh-token"];
 /// A read-only executable copy of pnpm outside its writable store.
 ///
 /// pnpm's standalone executable can be hardlinked into
-/// `$PNPM_HOME/store/v*/links/*/pnpm`. The kernel then evaluates execution
+/// `$PNPM_HOME/store/v*/links/**/pnpm` (pnpm 11 nests it 7 levels deep). The kernel then evaluates execution
 /// against that writable store inode even when PATH names the global install.
 /// Copying the file breaks the hardlink relationship. The sandbox grants this
 /// unique directory read+execute, never write, and prepends it to PATH.
@@ -82,7 +82,12 @@ impl PnpmShadowDir {
     /// Copy `pnpm` when it shares an inode with a pnpm store hardlink.
     pub fn create_if_needed(home_dir: &Path, pnpm: &Path) -> Result<Option<Self>, String> {
         ensure_pnpm_package_manager_stores(home_dir)?;
-        if !pnpm_requires_shadow(home_dir, pnpm)? {
+        // pnpm 11 puts a `/bin/sh` launcher on PATH that execs the real
+        // binary, a symlink into the store. Shadow the binary; `source`
+        // stays the PATH entry so direct launches still map to the shadow.
+        let binary = pnpm_cmd_shim_target(home_dir, pnpm);
+        let binary = binary.as_deref().unwrap_or(pnpm);
+        if !pnpm_requires_shadow(home_dir, binary)? {
             return Ok(None);
         }
         use std::os::unix::fs::MetadataExt;
@@ -125,9 +130,21 @@ impl PnpmShadowDir {
         create_secure_dir(&session_dir, "pnpm shadow dir")?;
         let identity = secure_dir_identity(&session_dir, "pnpm shadow dir")?;
         let shadow = session_dir.join("pnpm");
-        if let Err(error) = copy_executable(pnpm, &shadow) {
+        if let Err(error) = copy_executable(binary, &shadow) {
             let _ = std::fs::remove_dir_all(&session_dir);
             return Err(error);
+        }
+        // @pnpm/exe 11 loads `dist/pnpm.mjs` next to its executable. Link it
+        // read-only: Seatbelt and Landlock check exec on the resolved store
+        // path, so nothing under it becomes executable.
+        if let Some(dist) = std::fs::canonicalize(binary)
+            .ok()
+            .and_then(|real| real.parent().map(|dir| dir.join("dist")))
+            .filter(|dist| dist.is_dir())
+            && let Err(error) = std::os::unix::fs::symlink(&dist, session_dir.join("dist"))
+        {
+            let _ = std::fs::remove_dir_all(&session_dir);
+            return Err(format!("Cannot link pnpm dist into shadow: {error}"));
         }
         use std::os::unix::fs::PermissionsExt;
         if let Err(error) =
@@ -261,6 +278,38 @@ pub fn pnpm_requires_shadow(home_dir: &Path, pnpm: &Path) -> Result<bool, String
     pnpm_has_store_alias_in(pnpm, &roots)
 }
 
+/// The binary a pnpm cmd-shim launcher execs, when it lies in a pnpm home.
+///
+/// pnpm writes `$PNPM_HOME/bin/pnpm` as a small `/bin/sh` script ending in
+/// `# cmd-shim-target=<path>`. Anything else returns `None`.
+pub fn pnpm_cmd_shim_target(home_dir: &Path, pnpm: &Path) -> Option<PathBuf> {
+    let roots: Vec<PathBuf> = pnpm_home_roots(home_dir)
+        .into_iter()
+        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .collect();
+    pnpm_cmd_shim_target_in(pnpm, &roots)
+}
+
+fn pnpm_cmd_shim_target_in(pnpm: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
+    use std::io::Read;
+
+    let mut script = Vec::new();
+    std::fs::File::open(pnpm)
+        .ok()?
+        .take(4096)
+        .read_to_end(&mut script)
+        .ok()?;
+    if !script.starts_with(b"#!/bin/sh") {
+        return None;
+    }
+    let target = String::from_utf8_lossy(&script)
+        .lines()
+        .find_map(|line| line.strip_prefix("# cmd-shim-target="))
+        .map(PathBuf::from)?;
+    let target = std::fs::canonicalize(target).ok()?;
+    (target.is_file() && roots.iter().any(|root| target.starts_with(root))).then_some(target)
+}
+
 fn pnpm_has_store_alias_in(pnpm: &Path, roots: &[PathBuf]) -> Result<bool, String> {
     use std::os::unix::fs::MetadataExt;
 
@@ -287,25 +336,47 @@ fn pnpm_has_store_alias_in(pnpm: &Path, roots: &[PathBuf]) -> Result<bool, Strin
             if !name.to_string_lossy().starts_with('v') {
                 continue;
             }
-            let links = version.path().join("links");
-            let Ok(packages) = std::fs::read_dir(links) else {
-                continue;
-            };
-            for package in packages.flatten() {
-                let candidate = package.path().join("pnpm");
-                let Ok(metadata) = candidate.symlink_metadata() else {
-                    continue;
-                };
-                if metadata.file_type().is_file()
-                    && metadata.dev() == source.dev()
-                    && metadata.ino() == source.ino()
-                {
-                    return Ok(true);
-                }
+            if store_links_contain_inode(&version.path().join("links"), 0, &source) {
+                return Ok(true);
             }
         }
     }
     Ok(false)
+}
+
+/// Directory levels below `links/` to search. pnpm 11 nests the binary at
+/// `links/@pnpm/exe/<version>/<hash>/node_modules/@pnpm/exe/pnpm` (7 levels).
+const PNPM_LINKS_MAX_DEPTH: usize = 8;
+
+/// Bounded walk for a regular file named `pnpm` sharing `source`'s inode.
+/// Symlinks are never followed: `DirEntry::file_type` does not resolve them.
+fn store_links_contain_inode(dir: &Path, depth: usize, source: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    if depth > PNPM_LINKS_MAX_DEPTH {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            if store_links_contain_inode(&entry.path(), depth + 1, source) {
+                return true;
+            }
+        } else if file_type.is_file()
+            && entry.file_name() == "pnpm"
+            && entry
+                .metadata()
+                .is_ok_and(|m| m.dev() == source.dev() && m.ino() == source.ino())
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn lock_pnpm_shadow_base(
@@ -472,12 +543,14 @@ fn gc_stale_pnpm_shadows(base: &Path, base_file: &std::fs::File) {
             continue;
         }
 
-        let pnpm = c"pnpm";
         // SAFETY: both descriptors and C strings are valid for the calls. All
         // operations are anchored to the validated directory descriptors, so
         // replacing the base pathname cannot redirect cleanup elsewhere.
-        unsafe {
-            libc::unlinkat(child.as_raw_fd(), pnpm.as_ptr(), 0);
+        // `dist` is a symlink; unlinkat removes the link, not its target.
+        for entry in [c"pnpm", c"dist"] {
+            unsafe {
+                libc::unlinkat(child.as_raw_fd(), entry.as_ptr(), 0);
+            }
         }
         // SAFETY: same as above; AT_REMOVEDIR removes only the opened base's
         // immediate UUID-named child and fails if unexpected entries remain.
@@ -1524,6 +1597,52 @@ mod tests {
     }
 
     #[test]
+    fn pnpm_11_launcher_shadows_the_store_binary_it_execs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Layout written by `pnpm add --global @pnpm/exe@11.5.1`.
+        let home = tempfile::tempdir().unwrap();
+        let pnpm_home = home.path().join("Library/pnpm");
+        let exe =
+            pnpm_home.join("store/v11/links/@pnpm/exe/11.5.1/6d9e6c9c/node_modules/@pnpm/exe");
+        let modules = pnpm_home.join("global/v11/4c2a-1a17dcdd4ea/node_modules/@pnpm");
+        let bin = pnpm_home.join("bin");
+        for dir in [&exe.join("dist"), &modules, &bin] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(exe.join("pnpm"), b"\xcf\xfa\xed\xfe").unwrap();
+        std::fs::write(exe.join("dist/pnpm.mjs"), b"").unwrap();
+        std::os::unix::fs::symlink(&exe, modules.join("exe")).unwrap();
+        let target = modules.join("exe/pnpm");
+        let launcher = bin.join("pnpm");
+        std::fs::write(
+            &launcher,
+            format!(
+                "#!/bin/sh\nbasedir=$(dirname \"$(echo \"$0\" | sed -e 's,\\\\,/,g')\")\n\n\
+                 exec \"$basedir/../global/v11/4c2a-1a17dcdd4ea/node_modules/@pnpm/exe/pnpm\"   \"$@\"\n\
+                 exit $?\n# cmd-shim-target={}\n",
+                target.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let shadow = PnpmShadowDir::create_if_needed(home.path(), &launcher)
+            .unwrap()
+            .expect("a launcher into the store needs a shadow");
+        assert_eq!(std::fs::read(shadow.binary()).unwrap(), b"\xcf\xfa\xed\xfe");
+        assert!(shadow.path().join("dist/pnpm.mjs").exists());
+        assert!(shadow.shadows(&launcher));
+        let session_path = shadow.path().to_path_buf();
+        drop(shadow);
+        assert!(!session_path.exists());
+        assert!(
+            exe.join("dist/pnpm.mjs").exists(),
+            "cleanup must not follow dist"
+        );
+    }
+
+    #[test]
     fn pnpm_shadow_breaks_store_hardlink_and_cleans_up() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
@@ -1669,6 +1788,43 @@ mod tests {
         cleanup_stale_pnpm_shadows(home.path()).unwrap();
 
         assert!(live.exists());
+    }
+
+    #[test]
+    fn pnpm_11_deep_store_alias_is_detected() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let pnpm_home = home.path().join("Library/pnpm");
+        let hash = "f46248bbf917cdf17e3592d9b231e3a131c0bbe510c80cdc381baf092bbd7728";
+        let exe = pnpm_home.join(format!(
+            "store/v11/links/@pnpm/exe/11.5.1/{hash}/node_modules/@pnpm/exe"
+        ));
+        let platform = pnpm_home.join(format!(
+            "store/v11/links/@pnpm/macos-arm64/11.5.1/{hash}/node_modules/@pnpm/macos-arm64"
+        ));
+        let global = pnpm_home.join("global/v11/node_modules/@pnpm/exe");
+        for dir in [&exe, &platform, &global] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        // @pnpm/exe's setup.js hardlinks the platform binary as exe/pnpm,
+        // so both store paths and the global install share one inode.
+        let binary = platform.join("pnpm");
+        std::fs::write(&binary, b"\xcf\xfa\xed\xfe").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::hard_link(&binary, exe.join("pnpm")).unwrap();
+        let pnpm = global.join("pnpm");
+        std::fs::hard_link(&binary, &pnpm).unwrap();
+
+        assert!(
+            pnpm_has_store_alias_in(&pnpm, &[pnpm_home.join("store")]).unwrap(),
+            "a pnpm 11 deep store alias must be detected"
+        );
+
+        let unrelated = global.join("other");
+        std::fs::write(&unrelated, b"x").unwrap();
+        std::fs::hard_link(&unrelated, global.join("other2")).unwrap();
+        assert!(!pnpm_has_store_alias_in(&unrelated, &[pnpm_home.join("store")]).unwrap());
     }
 
     #[test]
