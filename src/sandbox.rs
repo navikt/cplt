@@ -326,6 +326,9 @@ pub struct PreparedSandbox {
     /// runtime rules. Chromium cannot nest its own sandbox inside cplt's, so
     /// this also turns off Playwright MCP's nested sandbox for the child.
     playwright_runtime: bool,
+    /// `allow_cache_exec` covers `ms-playwright/puppeteer`: the whole
+    /// `ms-playwright` tree or that subdir, not a pinned browser dir (#742).
+    puppeteer_cache_exec: bool,
     proxy_port: Option<u16>,
     agent: Agent,
     /// Specific localhost ports the user has explicitly opened.
@@ -2492,6 +2495,10 @@ fn prepare_impl(
             config.allow_cache_exec,
             config.allow_cache_exec_any,
         ),
+        puppeteer_cache_exec: config
+            .allow_cache_exec
+            .iter()
+            .any(|e| e == "ms-playwright" || e == "ms-playwright/puppeteer"),
         proxy_port: config.proxy_port,
         agent: config.agent,
         allow_localhost: config.localhost_ports.to_vec(),
@@ -3822,6 +3829,10 @@ fn prepare_impl(
             config.allow_cache_exec,
             config.allow_cache_exec_any,
         ),
+        puppeteer_cache_exec: config
+            .allow_cache_exec
+            .iter()
+            .any(|e| e == "ms-playwright" || e == "ms-playwright/puppeteer"),
         proxy_port: config.proxy_port,
         agent: config.agent,
         allow_localhost: config.localhost_ports.to_vec(),

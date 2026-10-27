@@ -515,24 +515,31 @@ pub fn puppeteer_cache_dir(
     .then(|| home.join("Library/Caches/ms-playwright/puppeteer"))
 }
 
-/// Whether `dir` holds a Puppeteer config (cosmiconfig names, or a
-/// `puppeteer` key in `package.json`).
+/// Whether `dir` holds a Puppeteer config: cosmiconfig's names in `dir` or
+/// `dir/.config`, or a `puppeteer` key in `package.json`.
 fn has_puppeteer_config(dir: &Path) -> bool {
-    let named = std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .any(|e| {
-            let n = e.file_name();
-            let n = n.to_string_lossy();
-            n.starts_with(".puppeteerrc") || n.starts_with("puppeteer.config.")
-        });
-    named
-        || crate::untrusted::read_untrusted(&dir.join("package.json"), 1024 * 1024)
+    let rc = |d: &Path, prefix: &str| {
+        std::fs::read_dir(d)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with(prefix))
+    };
+    if rc(dir, ".puppeteerrc")
+        || rc(dir, "puppeteer.config.")
+        || rc(&dir.join(".config"), "puppeteerrc")
+    {
+        return true;
+    }
+    // A manifest that exists but cannot be read safely (a symlink, a FIFO)
+    // counts as config: Puppeteer may still load it.
+    let pkg = dir.join("package.json");
+    pkg.symlink_metadata().is_ok()
+        && crate::untrusted::read_untrusted(&pkg, 1024 * 1024)
             .ok()
             .flatten()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .is_some_and(|v| v.get("puppeteer").is_some())
+            .is_none_or(|v| v.get("puppeteer").is_some())
 }
 
 /// Whether to tell Copilot CLI that this host cannot sandbox commands.
@@ -843,6 +850,22 @@ mod tests {
         std::fs::remove_file(p.join("package.json")).unwrap();
         std::fs::write(p.join(".puppeteerrc.cjs"), "").unwrap();
         assert_eq!(puppeteer_cache_dir(h, &[], true), None);
+        std::fs::remove_file(p.join(".puppeteerrc.cjs")).unwrap();
+        std::fs::create_dir(p.join(".config")).unwrap();
+        std::fs::write(p.join(".config/puppeteerrc.json"), "{}").unwrap();
+        assert_eq!(
+            puppeteer_cache_dir(h, &[], true),
+            None,
+            ".config/puppeteerrc"
+        );
+        std::fs::remove_file(p.join(".config/puppeteerrc.json")).unwrap();
+        std::fs::write(p.join("real.json"), "{}").unwrap();
+        std::os::unix::fs::symlink(p.join("real.json"), p.join("package.json")).unwrap();
+        assert_eq!(
+            puppeteer_cache_dir(h, &[], true),
+            None,
+            "unreadable manifest"
+        );
     }
 
     /// yarn 1 reads `ignore-scripts` only from `YARN_IGNORE_SCRIPTS`; yarn 2+

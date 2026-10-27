@@ -634,7 +634,8 @@ so the launch fails with `Error: spawn EPERM`. (On Linux, `allow_cache_exec pupp
 over a localhost WebSocket by default, which fails with
 `connect EPERM 127.0.0.1:<port>` (`mmdc` only prints `[object Object]`).
 
-With `sandbox.allow_cache_exec ms-playwright` set, cplt sets
+With `sandbox.allow_cache_exec ms-playwright` (or `ms-playwright/puppeteer`; a
+pinned browser dir such as `ms-playwright/chromium-<rev>` does not cover it) set, cplt sets
 `PUPPETEER_CACHE_DIR=~/Library/Caches/ms-playwright/puppeteer` for the agent on
 macOS, a directory that opt-in already makes executable (#742). Install
 Puppeteer's browser there once, inside cplt (Chrome's download host must be
@@ -644,8 +645,9 @@ allowed by your network policy) or outside it with the same variable:
 PUPPETEER_CACHE_DIR=~/Library/Caches/ms-playwright/puppeteer npx puppeteer browsers install chrome-headless-shell
 ```
 
-Then launch with `"args": ["--no-sandbox"]` and `"pipe": true` and no
-`executablePath`. cplt leaves the variable alone when a Puppeteer config (`.puppeteerrc*`, `puppeteer.config.*`, or a `puppeteer` key in `package.json`) sits in the launch dir or above it, since that may pin its own `cacheDirectory`; `--pass-env PUPPETEER_CACHE_DIR` also keeps your own value, or Puppeteer's default when you have none. Run the install from the project that has Puppeteer (or mermaid-cli) installed, so it fetches the build that version expects.
+Then launch with `"headless": "shell"` (so Puppeteer uses the
+`chrome-headless-shell` you installed), `"args": ["--no-sandbox"]` and
+`"pipe": true`, and no `executablePath`. cplt leaves the variable alone when a Puppeteer config (`.puppeteerrc*`, `puppeteer.config.*`, or a `puppeteer` key in `package.json`) sits in the launch dir or above it, since that may pin its own `cacheDirectory`; `--pass-env PUPPETEER_CACHE_DIR` also keeps your own value, or Puppeteer's default when you have none. Run the install from the project that has Puppeteer (or mermaid-cli) installed, so it fetches the build that version expects.
 
 The older route still works: point Puppeteer at Playwright's browser. A
 `puppeteer-config.json` for `mmdc -p`:
