@@ -242,7 +242,7 @@ automated handover/enforcement checks from live onboarding and renewal evidence.
 
 **macOS only.** Landlock cannot deny a file inside a granted directory, so on Linux these files stay readable and writable (the proxy's domain filtering limits where a read secret can be sent; nothing denies the read; see [security.md](security.md)).
 
-`.env` and `.env.*` files are **blocked from reading and writing** by default, and so are files named exactly `.pem`, `.key`, `.p12`, `.pfx` or `.jks`. A key file with a longer name, such as `server.pem`, is blocked only with [`sandbox.deny_key_files_by_extension`](configuration.md#denying-key-files-by-extension-sandboxdeny_key_files_by_extension). This stops a rogue agent exfiltrating secrets, but it has side effects.
+`.env` and `.env.*` files are **blocked from reading and writing** by default, and so are files named exactly `.pem`, `.key`, `.p12`, `.pfx` or `.jks`, and SSH private keys named `id_rsa`, `id_dsa`, `id_ecdsa` or `id_ed25519`. A key file with a longer name, such as `server.pem`, is blocked only with [`sandbox.deny_key_files_by_extension`](configuration.md#denying-key-files-by-extension-sandboxdeny_key_files_by_extension). This stops a rogue agent exfiltrating secrets, but it has side effects.
 
 **The rule is a pattern on the file name, not a location**, so it applies everywhere the sandbox can reach. The two extracted dependency stores are carved back out for *reading* (#477), because a `.env` there is package content. A `--deny-path` or `deny.paths` entry inside or above one of those stores still wins over the carve-out (#597). Everywhere else the name is enough to deny it:
 
@@ -254,6 +254,7 @@ automated handover/enforcement checks from live onboarding and renewal evidence.
 | `npm run dev` (Node.js)        | ⚠️ May fail | Apps using `dotenv` to load config will get `undefined` env vars      |
 | `npm test` / `vitest`          | ⚠️ May fail | Tests that depend on `.env` for config won't find the values          |
 | TLS dev servers (`.pem` certs) | ✅ Works    | `server.pem`, `localhost.key` stay readable by default. Blocked with `sandbox.deny_key_files_by_extension`, which also blocks a project virtualenv's `certifi/cacert.pem` |
+| SSH key test fixtures          | ⚠️ Blocked  | A file named `id_rsa`, `id_dsa`, `id_ecdsa` or `id_ed25519` (such as `testdata/id_rsa`) is denied anywhere, including inside `node_modules`, a virtualenv or a vendored package (only the Go and Cargo stores are exempt), so a test that reads it fails. `.pub` files stay readable. Rename the fixture (`id_rsa.fixture`) or use `--allow-env-files` |
 | `.env.example`                 | ⚠️ Blocked  | Matches the `.env.*` pattern; use `--allow-env-files` if needed       |
 | Writing `.env` files           | ❌ Blocked  | Write and delete are denied as well as read, so an agent cannot create a `.env` from a template or remove one; use `--allow-env-files` if needed |
 | `go mod verify`, `cargo` over an extracted crate | ✅ Works | Read is re-allowed under `~/go/pkg/mod` and `~/.cargo/registry`: a `.env` there is a library's test fixture (`gotenv` ships one), not your secret, and the content is checksum-verified and came from a registry. Write stays denied, and so does read under a path you deny |

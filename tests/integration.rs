@@ -4105,6 +4105,9 @@ int main(int argc, char **argv) {
             "keystore.p12",
             "cert.pfx",
             "store.jks",
+            "AuthKey_ABC.p8",
+            "deploy.ppk",
+            "release.keystore",
         ];
         for name in keys {
             fs::write(tmp.join("certs").join(name), "KEY\n").unwrap();
@@ -4202,6 +4205,103 @@ int main(int argc, char **argv) {
             !dir_list.1,
             "a directory named bundle.pem cannot be listed, got: {}",
             dir_list.0
+        );
+    }
+
+    #[test]
+    fn real_profile_denies_ssh_private_keys_by_name() {
+        // #595: `id_rsa` and friends are denied by default, anywhere, for read,
+        // write and delete. `.pub` and lookalikes stay readable,
+        // `--allow-env-files` lifts the deny, and a grant naming one key file
+        // keeps working.
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let tmp = project.join(format!(".cplt-sshkey-{}", std::process::id()));
+        fs::create_dir_all(tmp.join("testdata")).unwrap();
+        let keys = ["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"];
+        for name in keys {
+            fs::write(tmp.join("testdata").join(name), "KEY\n").unwrap();
+        }
+        for name in ["id_rsa.pub", "id_ed25519.pub", "id_rsa.bak", "xid_rsa"] {
+            fs::write(tmp.join("testdata").join(name), "PUBLIC\n").unwrap();
+        }
+        let tmp = fs::canonicalize(&tmp).unwrap();
+        let home = home_dir();
+        let cat = |profile: &PathBuf, name: &str| {
+            let path = tmp.join("testdata").join(name);
+            run_sandboxed(profile, &format!("cat '{}'", path.display()))
+        };
+
+        let def = write_real_profile(&default_opts(&tmp, &home));
+        let denied: Vec<_> = keys.iter().map(|k| (*k, cat(&def, k))).collect();
+        let public: Vec<_> = ["id_rsa.pub", "id_ed25519.pub", "id_rsa.bak", "xid_rsa"]
+            .iter()
+            .map(|k| (*k, cat(&def, k)))
+            .collect();
+        let tampered: Vec<_> = keys
+            .iter()
+            .map(|k| {
+                let path = tmp.join("testdata").join(k);
+                let cmd = format!(
+                    "printf GONE > '{p}' 2>&1; rm '{p}' 2>&1; echo EXIT:$?",
+                    p = path.display()
+                );
+                let (output, _) = run_sandboxed(&def, &cmd);
+                (*k, output, fs::read_to_string(&path).ok())
+            })
+            .collect();
+
+        let mut opts = default_opts(&tmp, &home);
+        opts.allow_env_files = true;
+        let env_ok = write_real_profile(&opts);
+        let recovered = cat(&env_ok, "id_rsa");
+
+        let granted_key = tmp.join("testdata/id_ed25519");
+        let grant = [granted_key.clone()];
+        let mut opts = default_opts(&tmp, &home);
+        opts.extra_read = &grant;
+        let named = write_real_profile(&opts);
+        let named_ok = cat(&named, "id_ed25519");
+        let sibling = cat(&named, "id_rsa");
+
+        fs::remove_dir_all(&tmp).ok();
+        for f in [&def, &env_ok, &named] {
+            fs::remove_file(f).ok();
+        }
+
+        for (name, (output, success)) in denied {
+            assert!(
+                !success && !output.contains("KEY"),
+                "{name} must be denied by default, got: {output}"
+            );
+        }
+        for (name, (output, success)) in public {
+            assert!(
+                success && output.contains("PUBLIC"),
+                "{name} must stay readable, got: {output}"
+            );
+        }
+        for (name, output, content) in tampered {
+            assert_eq!(
+                content.as_deref(),
+                Some("KEY\n"),
+                "{name} must survive overwrite and rm, got: {output}"
+            );
+        }
+        assert!(
+            recovered.1 && recovered.0.contains("KEY"),
+            "--allow-env-files lifts the deny, got: {}",
+            recovered.0
+        );
+        assert!(
+            named_ok.1 && named_ok.0.contains("KEY"),
+            "a grant naming the key file keeps working, got: {}",
+            named_ok.0
+        );
+        assert!(
+            !sibling.1 && !sibling.0.contains("KEY"),
+            "a grant on one key does not open the others, got: {}",
+            sibling.0
         );
     }
 

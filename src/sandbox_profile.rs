@@ -24,13 +24,14 @@ use super::policy::{
     CacheEnv, DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS,
     DEPENDENCY_SOURCE_TREES, EXEC_IN_WRITABLE, GPG_SIGNING_ALLOW_FILES, HOME_CONFIG_FILES,
     HomeToolDir, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir,
-    SENSITIVE_KEY_FILE_EXTENSION_PATTERNS, SENSITIVE_PROJECT_PATTERNS, SYSTEM_READ_FILES,
-    TOOL_READ_DIRS, XCODE_SELECT_LINK, active_tool_dirs, ancestor_alternation, app_dirs,
-    colima_socket_paths, copilot_default_pkg_dir, current_uid, cypress_app_data_dir_with_env,
-    cypress_runtime_intent, escape_regex, first_party_read_target, grant_is_refused,
-    home_config_link_targets, missing_home_config_link_targets, nested_alternation, path_bin_dirs,
-    playwright_runtime_intent, pnpm_config_dirs, pnpm_credential_files, read_only_home_config,
-    rel_is_glob, rel_regex, validate_playwright_socket_dir, validate_sbpl_path,
+    SENSITIVE_KEY_FILE_EXTENSION_PATTERNS, SENSITIVE_PROJECT_PATTERNS, SSH_PRIVATE_KEY_NAMES,
+    SYSTEM_READ_FILES, TOOL_READ_DIRS, XCODE_SELECT_LINK, active_tool_dirs, ancestor_alternation,
+    app_dirs, colima_socket_paths, copilot_default_pkg_dir, current_uid,
+    cypress_app_data_dir_with_env, cypress_runtime_intent, escape_regex, first_party_read_target,
+    grant_is_refused, home_config_link_targets, missing_home_config_link_targets,
+    nested_alternation, path_bin_dirs, playwright_runtime_intent, pnpm_config_dirs,
+    pnpm_credential_files, read_only_home_config, rel_is_glob, rel_regex,
+    validate_playwright_socket_dir, validate_sbpl_path,
 };
 
 /// Device nodes a sandboxed process may open for writing, by exact path.
@@ -260,6 +261,14 @@ fn profile_locked(
         config.existing_home_tool_dirs,
         config.extra_deny,
     );
+    if !config.allow_env_files {
+        emit_named_ssh_key_grants(
+            &mut sb,
+            config.extra_read,
+            config.extra_write,
+            config.extra_deny,
+        );
+    }
     // Same reason, and one more: the worktree common-dir allow is emitted early
     // (so DENIED_DOTFILES still wins over it), which would leave its denies
     // reopenable by any later allow if they were emitted alongside it.
@@ -2949,6 +2958,35 @@ fn denied_dotfile_override_paths(home: &Path, path: &Path) -> Vec<String> {
         return forms;
     }
     Vec::new()
+}
+
+/// Keep a grant that names an SSH private key file itself working (#595).
+///
+/// The default `id_rsa`/`id_ed25519`/... deny comes after every user allow, so
+/// without this `--allow-read ~/.ssh/id_ed25519`, accepted before #595, would
+/// silently stop working. Only a grant whose last component is the key name
+/// is honoured: a grant on a directory (`~/.ssh`, a repo) keeps the deny for
+/// the keys inside it. An overlapping `--deny-path` still wins.
+fn emit_named_ssh_key_grants(
+    sb: &mut String,
+    extra_read: &[PathBuf],
+    extra_write: &[PathBuf],
+    extra_deny: &[PathBuf],
+) {
+    let named_key = |p: &&PathBuf| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| SSH_PRIVATE_KEY_NAMES.contains(&n))
+            && overlapping_deny(extra_deny, p).is_none()
+            && validate_sbpl_path(p).is_ok()
+    };
+    for p in extra_read.iter().filter(named_key) {
+        sbpl!(sb, "(allow file-read* (literal \"{}\"))", p.display());
+    }
+    for p in extra_write.iter().filter(named_key) {
+        sbpl!(sb, "(allow file-read* (literal \"{}\"))", p.display());
+        sbpl!(sb, "(allow file-write* (literal \"{}\"))", p.display());
+    }
 }
 
 /// Re-allow specific files inside DENIED_DOTFILES directories when the user
