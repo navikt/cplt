@@ -1863,7 +1863,7 @@ mod tests {
 
     /// Run git in `dir`, ignoring the developer's own git config.
     fn git_in(dir: &Path, args: &[&str]) -> bool {
-        std::process::Command::new("git")
+        std::process::Command::new(crate::git::trusted_git().expect("trusted git"))
             .args(args)
             .current_dir(dir)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -2245,19 +2245,20 @@ mod tests {
         crate::with_env_lock_no_xdg(|| {
             let base = tempfile::tempdir().expect("tempdir");
             let git = |args: &[&str], cwd: &Path| {
-                let ok = std::process::Command::new("git")
-                    .args(args)
-                    .current_dir(cwd)
-                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                    .env("GIT_CONFIG_NOSYSTEM", "1")
-                    .env("GIT_AUTHOR_NAME", "t")
-                    .env("GIT_AUTHOR_EMAIL", "t@e")
-                    .env("GIT_COMMITTER_NAME", "t")
-                    .env("GIT_COMMITTER_EMAIL", "t@e")
-                    .output()
-                    .expect("run git")
-                    .status
-                    .success();
+                let ok =
+                    std::process::Command::new(crate::git::trusted_git().expect("trusted git"))
+                        .args(args)
+                        .current_dir(cwd)
+                        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                        .env("GIT_CONFIG_NOSYSTEM", "1")
+                        .env("GIT_AUTHOR_NAME", "t")
+                        .env("GIT_AUTHOR_EMAIL", "t@e")
+                        .env("GIT_COMMITTER_NAME", "t")
+                        .env("GIT_COMMITTER_EMAIL", "t@e")
+                        .output()
+                        .expect("run git")
+                        .status
+                        .success();
                 assert!(ok, "git {args:?} should succeed");
             };
 
@@ -2572,7 +2573,7 @@ ELECTRON_RUN_AS_NODE=1 "/Applications/Visual Studio Code.app/Contents/Frameworks
         // descriptor lives in the child (same fix as copilot_extract's Fixture).
         let staging = dir.join(format!("{name}.staging"));
         std::fs::write(&staging, format!("#!/bin/sh\n{body}\n")).unwrap();
-        let copied = std::process::Command::new("cp")
+        let copied = std::process::Command::new("/bin/cp")
             .arg(&staging)
             .arg(&path)
             .status()

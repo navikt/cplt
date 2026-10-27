@@ -24,13 +24,14 @@ use super::policy::{
     CacheEnv, DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS,
     DEPENDENCY_SOURCE_TREES, EXEC_IN_WRITABLE, GPG_SIGNING_ALLOW_FILES, HOME_CONFIG_FILES,
     HomeToolDir, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir,
-    SENSITIVE_KEY_FILE_EXTENSION_PATTERNS, SENSITIVE_PROJECT_PATTERNS, SYSTEM_READ_FILES,
-    TOOL_READ_DIRS, XCODE_SELECT_LINK, active_tool_dirs, ancestor_alternation, app_dirs,
-    colima_socket_paths, copilot_default_pkg_dir, current_uid, cypress_app_data_dir_with_env,
-    cypress_runtime_intent, escape_regex, first_party_read_target, grant_is_refused,
-    home_config_link_targets, missing_home_config_link_targets, nested_alternation, path_bin_dirs,
-    playwright_runtime_intent, pnpm_config_dirs, pnpm_credential_files, read_only_home_config,
-    rel_is_glob, rel_regex, validate_playwright_socket_dir, validate_sbpl_path,
+    SENSITIVE_KEY_FILE_EXTENSION_PATTERNS, SENSITIVE_PROJECT_PATTERNS, SSH_PRIVATE_KEY_NAMES,
+    SYSTEM_READ_FILES, TOOL_READ_DIRS, XCODE_SELECT_LINK, active_tool_dirs, ancestor_alternation,
+    app_dirs, colima_socket_paths, copilot_default_pkg_dir, current_uid,
+    cypress_app_data_dir_with_env, cypress_runtime_intent, escape_regex, first_party_read_target,
+    grant_is_refused, home_config_link_targets, missing_home_config_link_targets,
+    nested_alternation, path_bin_dirs, playwright_runtime_intent, pnpm_config_dirs,
+    pnpm_credential_files, read_only_home_config, rel_is_glob, rel_regex,
+    validate_playwright_socket_dir, validate_sbpl_path,
 };
 
 /// Device nodes a sandboxed process may open for writing, by exact path.
@@ -260,6 +261,14 @@ fn profile_locked(
         config.existing_home_tool_dirs,
         config.extra_deny,
     );
+    if !config.allow_env_files {
+        emit_named_ssh_key_grants(
+            &mut sb,
+            config.extra_read,
+            config.extra_write,
+            config.extra_deny,
+        );
+    }
     // Same reason, and one more: the worktree common-dir allow is emitted early
     // (so DENIED_DOTFILES still wins over it), which would leave its denies
     // reopenable by any later allow if they were emitted alongside it.
@@ -305,6 +314,71 @@ fn profile_locked(
     }
 
     sb
+}
+
+/// The Seatbelt profile for a brokered MCP server child (#849). It runs on
+/// the host with the user's own login, so reads stay open (its credential
+/// file, the keychain via securityd, the system); what it loses is the
+/// network and most writes. Outbound TCP reaches only `localhost:{proxy_port}`,
+/// its egress proxy, through the same proxy-forced rules as the agent
+/// (no port means no TCP at all). Writes go only to `write_dirs`, which the
+/// caller canonicalizes; an SBPL-unsafe path is an error, never dropped.
+pub(crate) fn mcp_child_profile(
+    home: &Path,
+    write_dirs: &[PathBuf],
+    keychain: bool,
+    proxy_port: Option<u16>,
+) -> Result<String, String> {
+    for d in write_dirs {
+        super::policy::validate_sbpl_path(d)?;
+    }
+    super::policy::validate_sbpl_path(home)?;
+    let mut sb = String::new();
+    emit_header(&mut sb, "brokered MCP server child");
+    emit_process_rules(&mut sb);
+    sbpl!(sb, ";; Reads: open. The child holds the host login anyway.");
+    sbpl!(sb, "(allow file-read*)");
+    sbpl!(sb, ";; Mach IPC (Keychain via securityd, DNS)");
+    sbpl!(sb, "(allow mach-lookup)");
+    // `security add-generic-password` (go-keyring's refresh) posts this.
+    sbpl!(
+        sb,
+        "(allow ipc-posix-shm* (ipc-posix-name \"com.apple.AppleDatabaseChanged\"))"
+    );
+    for d in write_dirs {
+        sbpl!(sb, "(allow file-write* (subpath \"{}\"))", d.display());
+    }
+    if keychain {
+        // Security.framework rewrites the file keychain in the caller's
+        // process: a temp file beside login.keychain-db, then a rename.
+        // Only that file and its temp siblings, not the Keychains dir.
+        // Canonical, as Seatbelt matches resolved paths (a symlinked HOME).
+        // `.fl<hex>` is the AtomicFile lock taken before the rewrite.
+        let kc = home.join("Library/Keychains");
+        let kc = kc.canonicalize().unwrap_or(kc);
+        super::policy::validate_sbpl_path(&kc)?;
+        let dir = super::policy::escape_regex(&kc.to_string_lossy());
+        sbpl!(
+            sb,
+            "(allow file-write* (regex #\"^{dir}/(login\\.keychain-db(\\.sb-[^/]+)?|\\.fl[0-9A-F]+)$\"))"
+        );
+    }
+    sbpl!(sb);
+    // Its own network block, not the agent's: no Gradle daemon sockets
+    // (code outside any sandbox), no bind or inbound (a stdio server needs
+    // no listener). DNS, then TCP to its egress proxy only.
+    sbpl!(sb, ";; Network: DNS and the egress proxy only");
+    sbpl!(
+        sb,
+        "(allow network-outbound (literal \"/private/var/run/mDNSResponder\"))"
+    );
+    if let Some(port) = proxy_port {
+        sbpl!(
+            sb,
+            "(allow network-outbound (remote tcp \"localhost:{port}\"))"
+        );
+    }
+    Ok(sb)
 }
 
 // ── Profile section helpers ────────────────────────────────────
@@ -2886,6 +2960,35 @@ fn denied_dotfile_override_paths(home: &Path, path: &Path) -> Vec<String> {
     Vec::new()
 }
 
+/// Keep a grant that names an SSH private key file itself working (#595).
+///
+/// The default `id_rsa`/`id_ed25519`/... deny comes after every user allow, so
+/// without this `--allow-read ~/.ssh/id_ed25519`, accepted before #595, would
+/// silently stop working. Only a grant whose last component is the key name
+/// is honoured: a grant on a directory (`~/.ssh`, a repo) keeps the deny for
+/// the keys inside it. An overlapping `--deny-path` still wins.
+fn emit_named_ssh_key_grants(
+    sb: &mut String,
+    extra_read: &[PathBuf],
+    extra_write: &[PathBuf],
+    extra_deny: &[PathBuf],
+) {
+    let named_key = |p: &&PathBuf| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| SSH_PRIVATE_KEY_NAMES.contains(&n))
+            && overlapping_deny(extra_deny, p).is_none()
+            && validate_sbpl_path(p).is_ok()
+    };
+    for p in extra_read.iter().filter(named_key) {
+        sbpl!(sb, "(allow file-read* (literal \"{}\"))", p.display());
+    }
+    for p in extra_write.iter().filter(named_key) {
+        sbpl!(sb, "(allow file-read* (literal \"{}\"))", p.display());
+        sbpl!(sb, "(allow file-write* (literal \"{}\"))", p.display());
+    }
+}
+
 /// Re-allow specific files inside DENIED_DOTFILES directories when the user
 /// has explicitly approved them via `allow.read` or `allow.write`.
 ///
@@ -3755,6 +3858,52 @@ fn emit_network_rules(
 // These assert the generated profile *string* contains the right rules. They
 // do NOT prove the macOS kernel enforces them — that is verified at runtime by
 // the `integration` suite, which can only run on macOS/CI.
+
+#[cfg(test)]
+mod mcp_child_profile_tests {
+    use super::mcp_child_profile;
+    use std::path::{Path, PathBuf};
+
+    const ANY_TCP: &str = "(allow network-outbound (remote tcp";
+
+    #[test]
+    fn proxy_port_is_the_only_tcp_allow() {
+        let p = mcp_child_profile(Path::new("/Users/u"), &[], false, Some(4242)).unwrap();
+        assert_eq!(p.matches(ANY_TCP).count(), 1, "{p}");
+        assert!(p.contains("(allow network-outbound (remote tcp \"localhost:4242\"))"));
+        assert!(
+            !p.contains("network-bind") && !p.contains("network-inbound"),
+            "{p}"
+        );
+        assert!(!p.contains(".gradle"), "{p}");
+    }
+
+    #[test]
+    fn no_proxy_port_means_no_tcp() {
+        let p = mcp_child_profile(Path::new("/Users/u"), &[], false, None).unwrap();
+        assert!(!p.contains(ANY_TCP), "{p}");
+        assert!(p.contains("(deny default)"));
+    }
+
+    #[test]
+    fn write_grants_are_the_given_dirs_and_keychain_only_on_request() {
+        let dirs = [PathBuf::from("/Users/u/Library/Application Support/nais")];
+        let p = mcp_child_profile(Path::new("/Users/u"), &dirs, false, None).unwrap();
+        assert!(p.contains(
+            "(allow file-write* (subpath \"/Users/u/Library/Application Support/nais\"))"
+        ));
+        assert!(!p.contains("Keychains"), "{p}");
+        let k = mcp_child_profile(Path::new("/Users/u"), &dirs, true, None).unwrap();
+        assert!(k.contains("/Users/u/Library/Keychains/"), "{k}");
+    }
+
+    #[test]
+    fn sbpl_unsafe_paths_are_refused() {
+        let bad = [PathBuf::from("/tmp/x\")) (allow default")];
+        assert!(mcp_child_profile(Path::new("/Users/u"), &bad, false, None).is_err());
+        assert!(mcp_child_profile(Path::new("/Users/u\""), &[], false, None).is_err());
+    }
+}
 
 #[cfg(test)]
 mod tests {

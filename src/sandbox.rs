@@ -121,6 +121,7 @@ pub use policy::{
 // SBPL profile generation — kept public for unit tests.
 // The SBPL module is pure string manipulation with no macOS dependencies,
 // so tests run cross-platform even though the output is macOS-specific.
+pub(crate) use profile::mcp_child_profile;
 pub use profile::{ReadDenies, generate_profile, generate_profile_with_playwright_socket_dir};
 
 // Environment construction — already platform-agnostic.
@@ -253,8 +254,8 @@ pub struct SandboxConfig<'a> {
     /// through a symlink inside `~/.cache` rather than grant its target with a
     /// warning. Linux only; see [`validate_cache_exec_dirs`].
     pub refuse_cache_exec_links: bool,
-    /// `sandbox.deny_key_files_by_extension`: deny `*.pem`, `*.key`, `*.p12`,
-    /// `*.pfx` and `*.jks` by extension, not only files named exactly `.pem`.
+    /// `sandbox.deny_key_files_by_extension`: deny key files by extension
+    /// ([`SENSITIVE_KEY_FILE_EXTENSION_PATTERNS`]), not only files named exactly `.pem`.
     /// macOS only; Linux has no name-pattern denies.
     pub deny_key_files_by_extension: bool,
     /// `sandbox.protect_pnpm_config`: pnpm's XDG config dir is read-only and
@@ -2564,6 +2565,31 @@ fn report_unix_socket_regime(
             "UNIX-socket connect is kernel-enforced (Landlock ABI v9+): the agent can \
              only reach sockets the policy grants.",
         );
+    } else if let Some(n) = masks
+        .map(bubblewrap::DenyMasks::socket_unmasked_count)
+        .filter(|&n| n > 0)
+    {
+        // A present socket that got no mask (#805): say so, never "0 masked".
+        crate::ui::warn(&format!(
+            "UNIX-socket connect is NOT kernel-enforced (needs Landlock ABI v9 / kernel 7.1), \
+             and {n} known escape socket(s) (D-Bus, systemd, container runtimes) could not be \
+             masked{}: the agent can reach them.",
+            masks
+                .and_then(bubblewrap::DenyMasks::placeholder_error)
+                .map(|e| format!(" ({e})"))
+                .unwrap_or_default()
+        ));
+    } else if bwrap_active && socket_masks == 0 {
+        // Only sockets that exist get a mask, so zero means none of the paths
+        // this run would mask exist or are visible to this user (#805). Docker
+        // sockets a docker key allows are not in that set; the container line
+        // above reports them.
+        ui::info(
+            "UNIX-socket connect is NOT kernel-enforced (needs Landlock ABI v9 / kernel 7.1). \
+             Bubblewrap masks no escape sockets: none of the ones it would mask (D-Bus, \
+             systemd, container runtimes not allowed by a docker key) exist or are visible \
+             to this user. Any other pathname socket on the host stays reachable.",
+        );
     } else if bwrap_active {
         ui::info(&format!(
             "UNIX-socket connect is NOT kernel-enforced (needs Landlock ABI v9 / kernel 7.1). \
@@ -3445,8 +3471,8 @@ fn prepare_impl(
     if config.deny_key_files_by_extension {
         crate::ui::warn(
             "sandbox.deny_key_files_by_extension has no effect on Linux: Landlock \
-             cannot deny files by name pattern, so .pem, .key, .p12, .pfx and .jks \
-             files in the project stay readable.",
+             cannot deny files by name pattern, so key files such as server.pem, \
+             tls.key or release.keystore in the project stay readable.",
         );
     }
     if config.allow_docker {
@@ -6650,7 +6676,7 @@ mod tests {
         // deny, but the filter itself would go untested).
         let base = std::fs::canonicalize(tmp.path()).expect("canonicalize base");
         let git = |args: &[&str], cwd: &Path| {
-            let ok = std::process::Command::new("git")
+            let ok = std::process::Command::new(crate::git::trusted_git().expect("trusted git"))
                 .args(args)
                 .current_dir(cwd)
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")

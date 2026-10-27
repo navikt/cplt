@@ -331,9 +331,7 @@ pub(crate) fn spawn_child(shared: &Shared, server: &Server) -> std::io::Result<C
     // No egress hosts, no listener: port 0 cannot be connected to, so every
     // proxied request fails at once instead of going out direct.
     let proxy = format!("http://127.0.0.1:{}", server.egress_port.unwrap_or(0));
-    #[allow(clippy::disallowed_methods)] // resolved in the trusted dirs at load
-    let mut cmd = Command::new(&spec.program);
-    cmd.args(&spec.command[1..]);
+    let mut cmd = child_command(spec, &shared.home, server.egress_port)?;
     host_env(&mut cmd, &shared.home, spec.credential.keychain);
     cmd.env("HTTPS_PROXY", &proxy)
         .env("HTTP_PROXY", &proxy)
@@ -345,10 +343,126 @@ pub(crate) fn spawn_child(shared: &Shared, server: &Server) -> std::io::Result<C
         .current_dir("/")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        // ponytail: stderr dropped; route it to the proxy log, bounded and
-        // redacted, when a server's own diagnostics are needed.
-        .stderr(Stdio::null());
-    cmd.spawn()
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    if let Some(err) = child.stderr.take() {
+        let (log, id) = (shared.log.clone(), spec.id.clone());
+        std::thread::spawn(move || log_stderr(BufReader::new(err), &log, &id));
+    }
+    Ok(child)
+}
+
+/// Lines of a child's stderr logged per child, and bytes per line.
+const STDERR_CAP: usize = 64;
+const STDERR_LINE: u64 = 512;
+
+/// The child's stderr to the broker log, line by line, each line redacted,
+/// until [`STDERR_CAP`] lines; the rest is drained unlogged so the child
+/// never blocks on a full pipe.
+fn log_stderr(mut r: impl BufRead, log: &Log, id: &str) {
+    let mut logged = 0;
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match r.by_ref().take(STDERR_LINE).read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+        // Longer than the cap: drop the whole line, never log it in pieces
+        // (a token cut at the seam would pass redaction as two short runs).
+        let overlong = buf.len() as u64 == STDERR_LINE && buf.last() != Some(&b'\n');
+        if overlong {
+            let mut tail = Vec::new();
+            while let Ok(n) = r.by_ref().take(STDERR_LINE).read_until(b'\n', &mut tail) {
+                if n == 0 || tail.last() == Some(&b'\n') {
+                    break;
+                }
+                tail.clear();
+            }
+        }
+        if logged >= STDERR_CAP {
+            continue;
+        }
+        logged += 1;
+        if overlong {
+            log.line(id, "stderr: [line over 512 bytes dropped]");
+        } else {
+            let line = redact(String::from_utf8_lossy(&buf).trim_end());
+            log.line(id, &format!("stderr: {line}"));
+        }
+        if logged >= STDERR_CAP {
+            log.line(id, "stderr: (cap reached, rest not logged)");
+        }
+    }
+}
+
+/// Mask anything token-shaped: a run of 20 or more token characters (JWTs,
+/// API keys, hex digests, base64) becomes `[redacted]`.
+fn redact(line: &str) -> String {
+    let tok = |c: char| c.is_ascii_alphanumeric() || "-_.=+/".contains(c);
+    let mut out = String::new();
+    let mut run = String::new();
+    for c in line.chars().chain(std::iter::once(' ')) {
+        if tok(c) {
+            run.push(c);
+            continue;
+        }
+        out.push_str(if run.len() >= 20 { "[redacted]" } else { &run });
+        run.clear();
+        out.push(c);
+    }
+    out.pop();
+    out
+}
+
+/// `path` with its nearest existing ancestor canonicalized and the missing
+/// tail appended, so a grant on a not-yet-created dir under a symlinked
+/// parent still names the path Seatbelt will see.
+fn resolve_existing_prefix(path: &Path) -> PathBuf {
+    let mut tail = Vec::new();
+    let mut cur = path;
+    loop {
+        if let Ok(real) = cur.canonicalize() {
+            return tail.iter().rev().fold(real, |p, c| p.join(c));
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name.to_owned());
+                cur = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// The server's command. On macOS it runs under `sandbox-exec` with
+/// [`crate::sandbox::mcp_child_profile`]: TCP only to its egress proxy,
+/// writes only to its credential's `write_dirs` and its temp dir (#849).
+/// Elsewhere the child is not network-sandboxed (see the design doc).
+#[allow(clippy::disallowed_methods)] // resolved in the trusted dirs at load; sandbox-exec is fixed
+fn child_command(spec: &Spec, home: &Path, egress: Option<u16>) -> std::io::Result<Command> {
+    if !cfg!(target_os = "macos") {
+        let mut cmd = Command::new(&spec.program);
+        cmd.args(&spec.command[1..]);
+        return Ok(cmd);
+    }
+    let mut dirs = vec![std::env::temp_dir()];
+    dirs.extend(spec.credential.write_dirs.iter().map(|d| home.join(d)));
+    // Seatbelt matches resolved paths (/var is /private/var). A dir that does
+    // not exist yet (a fresh login creates it) resolves through its parents.
+    let dirs: Vec<_> = dirs
+        .into_iter()
+        .map(|d| resolve_existing_prefix(&d))
+        .collect();
+    let profile = crate::sandbox::mcp_child_profile(home, &dirs, spec.credential.keychain, egress)
+        .map_err(std::io::Error::other)?;
+    let mut cmd = Command::new("/usr/bin/sandbox-exec");
+    cmd.arg("-p")
+        .arg(profile)
+        .arg("--")
+        .arg(&spec.program)
+        .args(&spec.command[1..]);
+    Ok(cmd)
 }
 
 /// The host child's environment, also the credential probe's, so the two
@@ -609,6 +723,222 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use serde_json::Value;
+
+    /// As `tests/common::sandbox_usable`: false where sandbox-exec cannot
+    /// apply a profile (inside cplt's own sandbox), unless CI requires it.
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::disallowed_methods)] // fixed /usr/bin path
+    fn sandbox_usable() -> bool {
+        let ok = Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        assert!(
+            ok || std::env::var("CPLT_TEST_REQUIRE_SANDBOX").as_deref() != Ok("1"),
+            "sandbox required by CPLT_TEST_REQUIRE_SANDBOX but unavailable"
+        );
+        ok
+    }
+
+    #[test]
+    fn resolve_existing_prefix_keeps_the_missing_tail() {
+        let tmp = std::env::temp_dir();
+        let real = tmp.canonicalize().unwrap();
+        let p = tmp.join("cplt-849-missing/a/b");
+        assert_eq!(
+            resolve_existing_prefix(&p),
+            real.join("cplt-849-missing/a/b")
+        );
+        let link = real.join(format!("cplt-849-link-{}", std::process::id()));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let got = resolve_existing_prefix(&link.join("nais"));
+        let _ = std::fs::remove_file(&link);
+        assert_eq!(got, real.join("nais"));
+    }
+
+    #[test]
+    fn redact_masks_token_shaped_runs_only() {
+        assert_eq!(
+            redact("error: token eyJhbGciOiJIUzI1NiJ9.e30.abc expired"),
+            "error: token [redacted] expired"
+        );
+        assert_eq!(
+            redact("dial tcp: connect refused"),
+            "dial tcp: connect refused"
+        );
+    }
+
+    #[test]
+    fn stderr_is_capped_and_redacted() {
+        let file = std::env::temp_dir().join(format!("cplt-849-stderr-{}.log", std::process::id()));
+        let log = Log {
+            level: crate::proxy::ProxyLogLevel::default(),
+            file: Some(file.clone()),
+        };
+        let mut input = String::from("secret ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+        // A token across the 512-byte cut must not leak its tail.
+        input.push_str(&"y ".repeat(250));
+        input.push_str(" ghp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n");
+        input.push_str(&"x \n".repeat(20_000));
+        log_stderr(std::io::Cursor::new(input), &log, "t");
+        let out = std::fs::read_to_string(&file).unwrap();
+        let _ = std::fs::remove_file(&file);
+        assert!(
+            !out.contains("ghp_") && !out.contains("bbbb") && !out.contains("y y"),
+            "{out}"
+        );
+        assert!(out.contains("[line over 512 bytes dropped]"), "{out}");
+        assert!(out.contains("cap reached"));
+        assert_eq!(out.lines().count(), STDERR_CAP + 1);
+    }
+
+    /// #849 refresh bug: Security.framework rewrites a file keychain in the
+    /// caller (temp sibling, then rename). keychain=true must allow it, and
+    /// keychain=false is the control. Only an explicit temp keychain is used.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[allow(clippy::disallowed_methods)] // fixed /usr/bin paths
+    fn child_profile_keychain_write_needs_the_keychain_grant() {
+        if !sandbox_usable() {
+            return;
+        }
+        let home = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("cplt-849-kc-{}", std::process::id()));
+        let dir = home.join("Library/Keychains");
+        std::fs::create_dir_all(&dir).unwrap();
+        let kc = dir.join("login.keychain-db");
+        let kc = kc.to_str().unwrap();
+        let sec = |args: &[&str]| Command::new("/usr/bin/security").args(args).output();
+        let Ok(made) = sec(&["create-keychain", "-p", "test", kc]) else {
+            let _ = std::fs::remove_dir_all(&home);
+            return;
+        };
+        // create-keychain also adds it to the user's search list: remove it
+        // (and the files) whatever happens below. A new keychain is unlocked.
+        struct Cleanup<'a>(&'a str, &'a Path);
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                let _ = Command::new("/usr/bin/security")
+                    .args(["delete-keychain", self.0])
+                    .output();
+                let _ = std::fs::remove_dir_all(self.1);
+            }
+        }
+        let _cleanup = Cleanup(kc, &home);
+        assert!(made.status.success(), "create-keychain failed");
+        let add = |keychain: bool, acct: &str| {
+            let profile = crate::sandbox::mcp_child_profile(&home, &[], keychain, None).unwrap();
+            Command::new("/usr/bin/sandbox-exec")
+                .args(["-p", &profile, "--", "/usr/bin/security"])
+                .args([
+                    "add-generic-password",
+                    "-U",
+                    "-a",
+                    acct,
+                    "-s",
+                    "cplt-test",
+                    "-w",
+                    "x",
+                    kc,
+                ])
+                .env("HOME", &home)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        };
+        let denied = !add(false, "t0");
+        let allowed = add(true, "t1");
+        assert!(denied, "control: keychain=false still wrote the keychain");
+        assert!(allowed, "keychain=true could not write the keychain");
+    }
+
+    /// The kernel, not the profile text: inside the child profile a TCP
+    /// connect reaches only the egress port, not another local port and not
+    /// a remote host.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[allow(clippy::disallowed_methods)] // fixed /usr/bin paths
+    fn child_profile_allows_only_the_egress_port() {
+        if !sandbox_usable() {
+            return;
+        }
+        let allowed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = |l: &std::net::TcpListener| l.local_addr().unwrap().port();
+        let home = std::env::temp_dir().canonicalize().unwrap();
+        // Written with the /var spelling: child_command canonicalizes, so
+        // the test must too, or a /private/var mismatch would pass silently.
+        let wdir = home.join(format!("cplt-849-wd-{}", std::process::id()));
+        std::fs::create_dir_all(&wdir).unwrap();
+        let profile = crate::sandbox::mcp_child_profile(
+            &home,
+            &[wdir.canonicalize().unwrap()],
+            false,
+            Some(port(&allowed)),
+        )
+        .unwrap();
+        let run = |args: &[&str]| {
+            Command::new("/usr/bin/sandbox-exec")
+                .args(["-p", &profile, "--"])
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        };
+        let nc = |host: &str, p: u16| run(&["/usr/bin/nc", "-z", "-G", "2", host, &p.to_string()]);
+        assert!(nc("127.0.0.1", port(&allowed)), "egress port refused");
+        assert!(!nc("127.0.0.1", port(&other)), "another local port reached");
+        assert!(!nc("1.1.1.1", 443), "a remote host reached");
+        // A unix socket under ~/.gradle (a daemon's) and a listener: denied.
+        // `home` is the profile's HOME, so this is the path the agent
+        // profile's Gradle rule would have opened.
+        let sock_dir = home.join(".gradle");
+        std::fs::create_dir_all(&sock_dir).unwrap();
+        let sock = sock_dir.join(format!("cplt-849-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        // The real interpreter, not the /usr/bin stub, which runs xcodebuild
+        // and fails inside a sandbox on CI runners (as in tests/mcp_broker.rs).
+        let out = Command::new("/usr/bin/python3")
+            .args(["-c", "import sys; print(sys.executable)"])
+            .output()
+            .unwrap();
+        let py_bin = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        let py_bin = py_bin.as_str();
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let s = format!(
+            "import socket;socket.socket(socket.AF_UNIX).connect({:?})",
+            sock.display().to_string()
+        );
+        let host = |a: &[&str]| Command::new(a[0]).args(&a[1..]).status().unwrap().success();
+        assert!(
+            host(&[py_bin, "-c", &s]),
+            "control: socket unreachable on the host"
+        );
+        assert!(!run(&[py_bin, "-c", &s]), "reached a ~/.gradle socket");
+        drop(listener);
+        let _ = std::fs::remove_file(&sock);
+        let py = "import socket;s=socket.socket();s.bind(('127.0.0.1',0));s.listen()";
+        assert!(host(&[py_bin, "-c", py]), "control: bind fails on the host");
+        assert!(!run(&[py_bin, "-c", py]), "bound a listener");
+        // Writes: inside a write_dir yes, elsewhere no.
+        let inside = wdir.join("ok");
+        assert!(
+            run(&["/usr/bin/touch", &inside.display().to_string()]),
+            "write_dir not writable"
+        );
+        let _ = std::fs::remove_dir_all(&wdir);
+        let st = Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", &profile, "--", "/usr/bin/touch"])
+            .arg(home.join(format!("cplt-849-w-{}", std::process::id())))
+            .status()
+            .unwrap();
+        assert!(!st.success(), "wrote outside write_dirs");
+    }
 
     #[test]
     fn the_host_child_keeps_the_bus_and_xdg_dirs_on_linux_only() {

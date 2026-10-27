@@ -492,7 +492,7 @@ mod tests {
             vec!["init", "-q"],
             vec!["remote", "add", "origin", url.as_str()],
         ] {
-            let ok = std::process::Command::new("git")
+            let ok = std::process::Command::new(crate::git::trusted_git().expect("trusted git"))
                 .args(&args)
                 .current_dir(dir)
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -509,7 +509,7 @@ mod tests {
     /// Run git in `dir`, asserting success.
     #[allow(clippy::disallowed_methods)] // test fixture: PATH is the harness's, not an agent's
     fn git_in(dir: &Path, args: &[&str]) {
-        let ok = std::process::Command::new("git")
+        let ok = std::process::Command::new(crate::git::trusted_git().expect("trusted git"))
             .args(args)
             .current_dir(dir)
             .env("GIT_AUTHOR_NAME", "t")

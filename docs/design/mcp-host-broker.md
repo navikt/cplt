@@ -18,7 +18,7 @@ marked **(unverified)** were not checked against source or by running them.
 | D4 | Spec format | Built from standard MCP `server.json` fields; only what the spec lacks goes in a namespaced `_meta` extension (section 5.2). Any spec-compliant registry could feed cplt |
 | D5 | Clients | All, from phase 1: Copilot CLI (`--disable-mcp-server` + `--additional-mcp-config`), OpenCode (`OPENCODE_CONFIG_CONTENT`), pi where possible |
 | D6 | Local transport | stdio over a per-session Unix socket. Client entry: `command: cplt mcp-stdio <id>`, piped to the host child, after `src/worktree_broker.rs`. macOS first; Linux needs a bwrap bind (later). Remote kind (GitHub) keeps the HTTP proxy path |
-| D7 | Host child | Unsandboxed in phase 1, env cleared, egress pinned with `HTTPS_PROXY` to cplt's CONNECT proxy, allowed to the spec's hosts only. File profile later; it must allow writes to nais's config dir and the keyring (refresh rewrites both), and on Linux the D-Bus session socket (nais uses go-keyring) |
+| D7 | Host child | Sandboxed on macOS since #849 (TCP only to its egress proxy, writes only to its temp and config dirs); unsandboxed on Linux. Phase 1 was unsandboxed, env cleared, egress pinned with `HTTPS_PROXY` to cplt's CONNECT proxy, allowed to the spec's hosts only. File profile later; it must allow writes to nais's config dir and the keyring (refresh rewrites both), and on Linux the D-Bus session socket (nais uses go-keyring) |
 | D8 | Tools | Read-only by default. Writes opted in per server with `nav-pilot mcp enable --tools`, written to the user's cplt config. New or unclassified tools refused until re-consent. Write tools off by default for brokered servers |
 | D9 | GraphQL | Broker refuses a `mutation` or `subscription` keyword, or more than one operation, with a simple check. File the nais/cli fix first (it checks only `Operations[0]`) |
 | D10 | Login | nav-pilot runs `nais login -n` / `gh auth login` on the host after a yes; with `--json` or no tty it only prints the command. Nais status: `nais auth print-access-token` |
@@ -390,21 +390,42 @@ mechanism's status probe; no secret is printed.
 - **Egress:** the proxy allows the child only `egressHosts`. Phase 1 uses
   a separate policy for the child's proxy connections **(open: one proxy
   with per-client policy, or a second listener)**.
-  This control is **advisory**: the child is unsandboxed and only gets
-  `HTTPS_PROXY`. A child that ignores the variable, or opens its own
-  sockets, reaches any host directly. It keeps a cooperating server on its
-  hosts; it does not contain a hostile one. That needs the child profile
-  below.
-- **Files:** unrestricted in phase 1. A child profile comes later: read its
-  binary; read and **write** its config dir (refresh rewrites
-  `nais-credentials.json.enc`) and the keyring (refresh replaces the
-  encryption key; nais/cli `internal/naisapi/auth/oidcuser.go`,
-  `oidcUser.Refresh` → `storeOIDCUser`); on macOS the keychain file rules
-  and securityd; on Linux the D-Bus session socket for go-keyring (Secret
-  Service). Whether nais runs under
-  such a profile is **(unverified)**.
-- The child is trusted code acting on attacker-chosen arguments; that is
-  the residual the later profile narrows.
+  On macOS this is **enforced** (#849): the child runs under
+  `sandbox-exec` with `mcp_child_profile` (`src/sandbox_profile.rs`),
+  built from the agent profile's header and process rules plus a network
+  block of its own: mDNSResponder and `localhost:<egress port>`, nothing
+  else (no listener, no unix sockets such as a Gradle daemon's). A direct
+  connect to any other host or local port fails with `EPERM`, UDP is
+  denied, and with no `egressHosts` there is no TCP at all. Name lookups
+  stay open, as for the agent. `mach-lookup` is unscoped (securityd needs
+  it), so a binary could in theory reach the network through an XPC
+  service such as `nsurlsessiond`. This contains the nais workload; it is
+  not a full jail for an arbitrary hostile binary. On Linux the control is
+  still **advisory**: the child gets only `HTTPS_PROXY`. A network
+  namespace cannot reach the proxy on the host's loopback, and the agent
+  sandbox has no namespace path to reuse (Landlock is port-based and cannot
+  pin to localhost, #114), so Linux is left open rather than half-done.
+- **Files (macOS):** reads are open (the child holds the host login anyway,
+  and its egress is pinned). Writes go only to its temp dir and the
+  mechanism's `write_dirs` under `HOME`: for `nais-keychain`,
+  `~/Library/Application Support/nais` (refresh rewrites
+  `nais-credentials.json.enc`). The keychain is reached through securityd
+  (`mach-lookup`, as in the agent profile); go-keyring's `security`
+  helper also needs `ipc-posix-shm` on `com.apple.AppleDatabaseChanged` to
+  post a keychain change. A refresh also rewrites the login keychain file
+  from the caller's process (a `login.keychain-db.sb-*` temp file, then a
+  rename), so a `keychain` mechanism may write exactly
+  `~/Library/Keychains/login.keychain-db` and its `.sb-*` siblings; without
+  it `security` exits 161 and the refresh is lost (measured 2026-10-25). Measured 2026-10-25: `nais auth
+  print-access-token -n` exits 0 under the profile (network opened for the
+  check) with no file or keychain denials. On Linux, files are still
+  unrestricted.
+- The child is trusted code acting on attacker-chosen arguments; on Linux
+  that residual is unchanged.
+- **Stderr:** to the broker log (`--proxy-log`, and the terminal at
+  `--proxy-log-level all`), at most 64 lines of 512 bytes per child, every
+  run of 20 or more token characters replaced by `[redacted]`. The child's
+  environment is never logged.
 
 ## 6. Policy at the broker
 
@@ -455,7 +476,7 @@ tools are denied or need an upstream mode.
 
 - One line per call: `[mcp:<id>] <time> tools/call <tool> → ALLOWED|DENIED <reason>|FAIL <code>`.
   No arguments or results. Agent strings escaped (`src/github_mcp.rs:148-171`).
-- Child stderr to the proxy log, bounded and redacted.
+- Child stderr to the proxy log, bounded and redacted (5.7).
 - Message cap 4 MiB each way; nais `--rate-limit` passed through.
 
 ### 6.5 Prompt injection
@@ -527,8 +548,8 @@ Attacker: the sandboxed agent or content steering it.
 | Spec asks for something dangerous (arbitrary command, secret in a header, host-exec tool) | Invariants at load (5.3); command must match the credential mechanism |
 | Agent connects to the socket | Intended; it can only pick a declared id |
 | Secret path leaks (remote kind) | Per-session, loopback, never logged; 128-bit, constant-time compare (`src/github_mcp.rs:208-220`) |
-| SSRF | Remote: pinned upstream, no redirects, https only (`src/github_mcp.rs:34`, `:377-391`). Child: egress pinned to `egressHosts` via the proxy, advisory only (5.7) |
-| Host-exec through the child | Phase 1 residual: unsandboxed child. Env cleared, egress pinned, read-only tools; file profile later |
+| SSRF | Remote: pinned upstream, no redirects, https only (`src/github_mcp.rs:34`, `:377-391`). Child: egress pinned to `egressHosts` via the proxy, enforced by Seatbelt on macOS, advisory on Linux (5.7) |
+| Host-exec through the child | Env cleared, egress pinned, read-only tools. macOS: child profile limits network to the proxy and writes to its own dirs. Linux: unsandboxed child |
 | Agent reads the credential directly (Linux) | Without active bubblewrap, Secret Service is reachable over D-Bus (SECURITY.md:1589-1606); see section 7 |
 | Header injection | Control bytes refused, auth and `X-MCP-*` stripped (`src/github_mcp.rs:225-250`) |
 | JSON-RPC smuggling | Every message parsed; batch arrays rejected; protocol version checked |

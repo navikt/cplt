@@ -931,9 +931,9 @@ It has no effect on Linux, where the launch says so. Landlock cannot deny a path
 
 ## Denying key files by extension (`sandbox.deny_key_files_by_extension`)
 
-The default deny for key files is a pattern on the whole file name. It blocks a file named exactly `.pem`, `.key`, `.p12`, `.pfx` or `.jks`, but not `server.pem`, `tls.key` or `keystore.jks`. Those stay readable and writable.
+The default deny for key files is a pattern on the whole file name. It blocks a file named exactly `.pem`, `.key`, `.p12`, `.pfx` or `.jks`, but not `server.pem`, `tls.key` or `keystore.jks`. Those stay readable and writable. SSH private keys named `id_rsa`, `id_dsa`, `id_ecdsa` or `id_ed25519` (not their `.pub` files) are denied by default as well, because no public certificate uses those names.
 
-`sandbox.deny_key_files_by_extension` also denies any file whose name ends in one of those extensions, for read and write, on macOS. A name that only contains the extension (`x.key.bak`) is not affected. A directory whose name ends in one (`certs.pem/`) is denied itself, so it cannot be listed, but the files inside it stay readable.
+`sandbox.deny_key_files_by_extension` also denies any file whose name ends in one of those extensions, or in `.p8` (App Store Connect and APNs keys), `.ppk` (PuTTY keys) or `.keystore` (Android signing keys), for read and write, on macOS. A name that only contains the extension (`x.key.bak`) is not affected. A directory whose name ends in one (`certs.pem/`) is denied itself, so it cannot be listed, but the files inside it stay readable.
 
 The extension denies apply only inside the trees you granted: the project, every `--repo-dir` root, and every `allow.write` and `allow.read` path. They are not global, unlike the exact-name patterns, because `*.pem` also matches the system CA bundles (`/etc/ssl/cert.pem`, Homebrew's `cert.pem`) that curl, git and pip need for HTTPS. Those stay readable unless you grant a tree that contains them. Such a grant (`--allow-read /`, or one covering `/private/etc/ssl`, `/opt/homebrew/etc`, `/usr/local/etc`, `/opt/homebrew/Cellar` or `/usr/local/Cellar`) is not refused, but the launch warns about it. The Cellar holds the real files behind Homebrew's symlinks, such as each Homebrew Python's `certifi/cacert.pem`. The warning does not cover python.org's installer: a grant over `/Library/Frameworks/Python.framework` denies its `certifi/cacert.pem` without a warning.
 
@@ -945,7 +945,8 @@ Off by default, because it blocks files that work today, anywhere inside a grant
 
 - a local HTTPS dev server that reads its certificate or key from the project
 - tests that load a key or keystore fixture from the project
-- a Java or Android build that signs with a `.jks` or `.p12` in the project
+- a Java or Android build that signs with a `.jks`, `.p12` or `.keystore` in the project, such as a committed Android `debug.keystore`
+- an iOS release script (fastlane) that reads an App Store Connect `.p8` key from the project
 - a CA bundle inside a granted tree. A Python virtualenv in the project ships `certifi/cacert.pem`, so `pip` and `requests` from that venv fail TLS verification. A wide grant such as `allow.read = ["~"]` puts every tool's bundled `cacert.pem` under the deny, and a grant that covers `/etc` or `/opt/homebrew` puts the system bundles there too
 - a package under `node_modules` or a vendored dependency that reads a `.pem` it ships
 

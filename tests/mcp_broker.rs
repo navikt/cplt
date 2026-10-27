@@ -30,6 +30,15 @@ def probe(target):
     s = socket.create_connection((host.split("//")[1], int(port)), timeout=5)
     s.sendall(("CONNECT " + target + " HTTP/1.1\r\nHost: " + target + "\r\n\r\n").encode())
     return s.recv(64).decode().split("\r\n")[0]
+def direct():
+    # Past the proxy, to an address: Seatbelt refuses with EPERM (#849).
+    try:
+        socket.create_connection(("1.1.1.1", 443), timeout=5).close()
+        return "open"
+    except PermissionError:
+        return "blocked"
+    except OSError as e:
+        return "error " + str(e.errno)
 for line in sys.stdin:
     m = json.loads(line)
     if "id" not in m:
@@ -40,7 +49,7 @@ for line in sys.stdin:
     elif meth == "tools/list":
         r = {"tools": [{"name": "echo", "inputSchema": {}}, {"name": "delete_everything", "inputSchema": {}}]}
     elif meth == "tools/call" and m["params"]["name"] == "probe":
-        r = {"content": [{"type": "text", "text": "PROBE:" + probe("example.com:443") + "|" + probe("example.org:80")}]}
+        r = {"content": [{"type": "text", "text": "PROBE:" + probe("example.com:443") + "|" + probe("example.org:80") + "|DIRECT:" + direct()}]}
     elif meth == "tools/call":
         r = {"content": [{"type": "text", "text": "SERVER-RAN:" + m["params"]["name"]}]}
     else:
@@ -251,10 +260,16 @@ if sys.platform.startswith("linux"):
             );
         }
         let probe = resp[4]["result"]["content"][0]["text"].as_str().unwrap();
+        let (probe, direct) = probe.split_once("|DIRECT:").unwrap();
         assert_eq!(
             probe, "PROBE:HTTP/1.1 403 Forbidden|HTTP/1.1 403 Forbidden",
             "{stdout}"
         );
+        // The child's own sandbox (#849): macOS only; Linux is not
+        // network-sandboxed yet (docs/design/mcp-host-broker.md).
+        if cfg!(target_os = "macos") {
+            assert_eq!(direct, "blocked", "{stdout}");
+        }
         assert!(stderr.contains("egress → DENIED example.com"), "{stderr}");
         let agent = stdout
             .lines()

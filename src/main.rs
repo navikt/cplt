@@ -8061,7 +8061,7 @@ fn tracked_sensitive_files(project_dir: &Path, key_files_by_extension: bool) -> 
 /// Whether a file name matches [`sandbox::SENSITIVE_PROJECT_PATTERNS`].
 ///
 /// Hand-matched rather than compiled: those patterns are SBPL regex source for
-/// the macOS profile, and cplt has no regex engine linked. The list is seven
+/// the macOS profile, and cplt has no regex engine linked. The list is a few
 /// fixed shapes, so a `ends_with` each is the whole implementation — and
 /// `sensitive_basename_matches_the_profile_patterns` fails if the constant
 /// grows, so a new pattern cannot be silently unmatched here.
@@ -8070,10 +8070,17 @@ fn tracked_sensitive_files(project_dir: &Path, key_files_by_extension: bool) -> 
 /// (`sandbox.deny_key_files_by_extension`) is on, matching the profile.
 fn is_sensitive_basename(base: &str, by_extension: bool) -> bool {
     const KEYS: [&str; 5] = [".pem", ".key", ".p12", ".pfx", ".jks"];
+    const EXTRA_KEYS: [&str; 3] = [".p8", ".ppk", ".keystore"];
+    const SSH_KEYS: [&str; 4] = ["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"];
     base == ".env"
         || base.starts_with(".env.")
         || KEYS.contains(&base)
-        || (by_extension && KEYS.iter().any(|ext| base.ends_with(ext)))
+        || SSH_KEYS.contains(&base)
+        || (by_extension
+            && KEYS
+                .iter()
+                .chain(&EXTRA_KEYS)
+                .any(|ext| base.ends_with(ext)))
 }
 
 /// Whether any of `files` is sensitive only through
@@ -8150,8 +8157,8 @@ fn build_battery(
             fix: Some(
                 "Untrack it (`git rm --cached <FILE>`) and add it to .gitignore — an ignored \
                  file is never hashed, and a secret-shaped file does not belong in the \
-                 repository. `--allow-env-files` also works but unblocks every .env, .pem, \
-                 .key, .p12, .pfx and .jks in the project."
+                 repository. `--allow-env-files` also works but unblocks every .env, key \
+                 file and SSH private key (id_rsa) in the project."
                     .to_string(),
             ),
             note: None,
@@ -12809,7 +12816,7 @@ mod tests {
     fn managed_worktree_root_is_refused_on_linux() {
         let home = tempfile::tempdir().expect("tempdir");
         let repo = tempfile::tempdir().expect("tempdir");
-        let ok = std::process::Command::new("git")
+        let ok = std::process::Command::new(cplt::git::trusted_git().expect("trusted git"))
             .args(["init", "-q"])
             .current_dir(repo.path())
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -12999,13 +13006,13 @@ mod tests {
     fn sensitive_basename_matches_the_profile_patterns() {
         assert_eq!(
             sandbox::SENSITIVE_PROJECT_PATTERNS.len(),
-            7,
+            8,
             "a pattern was added or removed; teach `is_sensitive_basename` about it \
              and update this count"
         );
         assert_eq!(
             sandbox::SENSITIVE_KEY_FILE_EXTENSION_PATTERNS.len(),
-            5,
+            8,
             "a key file extension was added or removed; teach `is_sensitive_basename` \
              about it and update this count"
         );
@@ -13020,6 +13027,8 @@ mod tests {
                 ".p12",
                 ".pfx",
                 ".jks",
+                "id_rsa",
+                "id_ed25519",
             ] {
                 assert!(
                     is_sensitive_basename(name, by_ext),
@@ -13032,6 +13041,9 @@ mod tests {
                 ".envrc",
                 "README.md",
                 "monkey.jks.bak",
+                "id_rsa.pub",
+                "id_ed25519.pub",
+                "ca-bundle.crt",
             ] {
                 assert!(
                     !is_sensitive_basename(name, by_ext),
@@ -13048,6 +13060,9 @@ mod tests {
             "cert.p12",
             "cert.pfx",
             "keystore.jks",
+            "AuthKey_ABC123.p8",
+            "release.keystore",
+            "deploy.ppk",
         ] {
             assert!(
                 is_sensitive_basename(name, true),
@@ -15278,7 +15293,7 @@ mod tests {
     /// identity, panicking on failure: a fixture that quietly failed would
     /// leave the test asserting nothing.
     fn git_in(dir: &Path, args: &[&str]) {
-        let status = std::process::Command::new("git")
+        let status = std::process::Command::new(cplt::git::trusted_git().expect("trusted git"))
             .args(args)
             .current_dir(dir)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -15506,7 +15521,7 @@ mod tests {
     /// `git init` in `dir`; `false` when this machine has no usable git, which
     /// makes every `--repo-dir` case untestable and the caller returns early.
     fn init_repo(dir: &Path) -> bool {
-        std::process::Command::new("git")
+        std::process::Command::new(cplt::git::trusted_git().expect("trusted git"))
             .args(["init", "--quiet"])
             .current_dir(dir)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
