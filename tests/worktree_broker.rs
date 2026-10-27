@@ -805,28 +805,33 @@ fn common_filter_added_after_preflight_never_executes() {
         marker.display(),
         marker.display()
     );
-    let writer = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            // Context construction also uses staging for launch-byte copies.
-            // Only the request's private admin proves preflight has finished.
-            if std::fs::read_dir(&staging).is_ok_and(|entries| {
-                entries
-                    .flatten()
-                    .any(|entry| entry.path().join(".git-admin/HEAD").is_file())
-            }) {
-                std::fs::write(&config, malicious).unwrap();
-                return;
+    // Start the writer's deadline under ENV_LOCK, not before waiting on it:
+    // under a parallel run other tests can hold the lock past 10 s (#827).
+    let result = with_home(fx.home.path(), || {
+        let writer = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                // Context construction also uses staging for launch-byte copies.
+                // Only the request's private admin proves preflight has finished.
+                if std::fs::read_dir(&staging).is_ok_and(|entries| {
+                    entries
+                        .flatten()
+                        .any(|entry| entry.path().join(".git-admin/HEAD").is_file())
+                }) {
+                    std::fs::write(&config, malicious).unwrap();
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "checkout did not reach private staging"
+                );
+                std::thread::sleep(Duration::from_millis(1));
             }
-            assert!(
-                Instant::now() < deadline,
-                "checkout did not reach private staging"
-            );
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        });
+        let result = add(&fx.ctx(), "wt1", "HEAD");
+        writer.join().unwrap();
+        result
     });
-    let result = fx.add("wt1", "HEAD");
-    writer.join().unwrap();
     result.expect("config changed only after preflight");
     assert!(
         !marker.exists(),
@@ -853,9 +858,14 @@ fn a_symlink_or_fifo_worktrees_namespace_is_never_followed() {
         } else {
             symlink(victim.path(), &path).unwrap();
         }
-        let started = Instant::now();
-        assert!(fx.add("wt1", "HEAD").is_err());
-        assert!(started.elapsed() < Duration::from_secs(5));
+        // Time only `add`, not the wait for ENV_LOCK: under a parallel run
+        // other tests can hold it for longer than the bound (#827).
+        let (result, elapsed) = with_home(fx.home.path(), || {
+            let started = Instant::now();
+            (add(&fx.ctx(), "wt1", "HEAD"), started.elapsed())
+        });
+        assert!(result.is_err());
+        assert!(elapsed < Duration::from_secs(5), "add took {elapsed:?}");
         assert_eq!(std::fs::read_dir(victim.path()).unwrap().count(), 1);
         assert!(!fx.root.join("wt1").exists());
     }
