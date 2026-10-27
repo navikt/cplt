@@ -868,7 +868,13 @@ pub(crate) fn build_deny_masks(
         .count();
     let socket_unmasked = socket_canon
         .iter()
-        .filter(|p| !p.starts_with("/tmp") && skipped.contains(p))
+        .filter(|p| {
+            // bwrap gives these fresh mounts, which hide the host socket.
+            !["/tmp", "/proc", "/dev", "/sys"]
+                .iter()
+                .any(|m| p.starts_with(m))
+                && skipped.contains(p)
+        })
         .count();
     // Counted by origin, not as "everything that is not a socket mask": a path
     // the user denied that also appears in the built-in set is still a deny
