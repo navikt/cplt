@@ -2885,11 +2885,11 @@ pub(crate) fn mcp_flag_conflict(gpg: bool, rootless_docker: bool) -> Option<Stri
 /// Where a D-Bus bus can be reached, for the MCP broker's masks (#834).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug, Default, PartialEq, Eq)]
-struct BusEndpoints {
+pub(crate) struct BusEndpoints {
     /// Masked whole: every runtime dir (the session bus, systemd, keyring
     /// sockets), `/run/dbus`, and each `unix:path=`/`unix:dir=` the session
     /// address names.
-    paths: Vec<PathBuf>,
+    pub(crate) paths: Vec<PathBuf>,
     /// `unix:abstract=` or `unix:tmpdir=` (abstract on Linux): no path to mask.
     abstract_socket: bool,
     /// A non-unix transport (tcp, ...).
@@ -2913,7 +2913,7 @@ fn mcp_bus_endpoints() -> BusEndpoints {
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 /// The endpoints in a D-Bus address list (`unix:path=/x;unix:abstract=y`).
-fn parse_dbus_address(addr: &str) -> BusEndpoints {
+pub(crate) fn parse_dbus_address(addr: &str) -> BusEndpoints {
     let mut out = BusEndpoints::default();
     for entry in addr.split(';').filter(|e| !e.trim().is_empty()) {
         let Some(keys) = entry.trim().strip_prefix("unix:") else {

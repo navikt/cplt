@@ -69,6 +69,9 @@ pub(crate) struct Server {
     /// Linux: the same proxy as a unix socket, bound into the child's
     /// network namespace, where host loopback is out of reach (#849).
     egress_socket: Option<PathBuf>,
+    /// Linux, `keychain` mechanisms: where this server's xdg-dbus-proxy
+    /// listens, in the broker's 0700 socket dir.
+    bus_socket: PathBuf,
 }
 
 pub(crate) struct Shared {
@@ -166,6 +169,7 @@ impl Broker {
                 spawns: Mutex::new(VecDeque::new()),
                 egress_port,
                 egress_socket,
+                bus_socket: dir.path().join(format!("b{n}")),
             };
             servers.insert(server.spec.id.clone(), server);
         }
@@ -375,16 +379,13 @@ pub(crate) fn spawn_child(shared: &Shared, server: &Server) -> std::io::Result<C
     // No egress hosts, no listener: port 0 cannot be connected to, so every
     // proxied request fails at once instead of going out direct.
     let proxy = format!("http://127.0.0.1:{}", server.egress_port.unwrap_or(0));
-    let (mut cmd, relay) = child_command(
-        spec,
-        &shared.home,
-        server.egress_port,
-        server.egress_socket.as_deref(),
-    )?;
+    let (mut cmd, setup) = child_command(shared, server)?;
     host_env(&mut cmd, &shared.home, spec.credential.keychain);
-    if let Some(relay) = relay {
-        // The Linux child's private /tmp is the only temp dir it can write.
-        cmd.env(RELAY_ENV, relay).env("TMPDIR", "/tmp");
+    for k in &setup.unset {
+        cmd.env_remove(k);
+    }
+    for (k, v) in &setup.env {
+        cmd.env(k, v);
     }
     cmd.env("HTTPS_PROXY", &proxy)
         .env("HTTP_PROXY", &proxy)
@@ -398,6 +399,8 @@ pub(crate) fn spawn_child(shared: &Shared, server: &Server) -> std::io::Result<C
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
+    // The bus proxy's sync pipe now lives in bwrap alone.
+    drop(setup);
     if let Some(err) = child.stderr.take() {
         let (log, id) = (shared.log.clone(), spec.id.clone());
         std::thread::spawn(move || log_stderr(BufReader::new(err), &log, &id));
@@ -494,15 +497,10 @@ fn resolve_existing_prefix(path: &Path) -> PathBuf {
 /// On Linux it runs under bwrap with its own network namespace, see
 /// [`linux_child_command`]. Nowhere does it run unsandboxed.
 #[allow(clippy::disallowed_methods)] // resolved in the trusted dirs at load; sandbox-exec is fixed
-fn child_command(
-    spec: &Spec,
-    home: &Path,
-    egress: Option<u16>,
-    egress_socket: Option<&Path>,
-) -> std::io::Result<(Command, Option<String>)> {
+fn child_command(shared: &Shared, server: &Server) -> std::io::Result<(Command, ChildSetup)> {
+    let (spec, home, egress) = (&server.spec, shared.home.as_path(), server.egress_port);
     if cfg!(target_os = "linux") {
-        return linux_child_command(spec, home, egress, egress_socket)
-            .map(|(cmd, relay)| (cmd, Some(relay)));
+        return linux_child_command(shared, server);
     }
     if !cfg!(target_os = "macos") {
         return Err(std::io::Error::other(
@@ -525,21 +523,31 @@ fn child_command(
         .arg("--")
         .arg(&spec.program)
         .args(&spec.command[1..]);
-    Ok((cmd, None))
+    Ok((cmd, ChildSetup::default()))
 }
+
+/// What the child's command needs past [`host_env`], and what must live
+/// until it is spawned.
+#[derive(Default)]
+struct ChildSetup {
+    env: Vec<(&'static str, std::ffi::OsString)>,
+    unset: Vec<&'static str>,
+    /// The read end of the bus proxy's `--fd` pipe, handed to bwrap as its
+    /// `--sync-fd`: the proxy exits when bwrap, and so the child, is gone.
+    sync: Option<std::io::PipeReader>,
+}
+
+/// Where the filtered session bus appears inside the Linux child.
+const CHILD_BUS_SOCKET: &str = "/run/cplt-bus";
 
 /// The Linux child (#849): `bwrap <`[`child_bwrap_args`]`> -- <this
 /// binary>` with [`RELAY_ENV`] naming the port and the server's argv, so
-/// it starts as the egress relay, which runs the server. Fails, never falls back, when
-/// bwrap is missing; when bwrap cannot build the namespaces it exits
-/// before the server starts.
+/// it starts as the egress relay, which runs the server. Fails, never
+/// falls back, when bwrap is missing; when bwrap cannot build the
+/// namespaces it exits before the server starts.
 #[allow(clippy::disallowed_methods)] // bwrap from the trusted dirs; cplt is this binary
-fn linux_child_command(
-    spec: &Spec,
-    home: &Path,
-    egress: Option<u16>,
-    egress_socket: Option<&Path>,
-) -> std::io::Result<(Command, String)> {
+fn linux_child_command(shared: &Shared, server: &Server) -> std::io::Result<(Command, ChildSetup)> {
+    let spec = &server.spec;
     #[cfg(target_os = "linux")]
     let bwrap = crate::sandbox::bubblewrap_probe::check_availability();
     #[cfg(not(target_os = "linux"))]
@@ -551,7 +559,7 @@ fn linux_child_command(
     let config_home = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
-        .unwrap_or_else(|| home.join(".config"));
+        .unwrap_or_else(|| shared.home.join(".config"));
     let write_dirs: Vec<PathBuf> = spec
         .credential
         .linux_write_dirs
@@ -566,35 +574,147 @@ fn linux_child_command(
             .mode(0o700)
             .create(d)?;
     }
-    let bus = spec
-        .credential
-        .keychain
-        .then(|| std::env::var("DBUS_SESSION_BUS_ADDRESS").ok())
-        .flatten()
-        .and_then(|a| session_bus_path(&a));
     let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    let mut setup = ChildSetup::default();
+    let mut bus = None;
+    if spec.credential.keychain {
+        let addr = std::env::var("DBUS_SESSION_BUS_ADDRESS").ok();
+        match pick_session_bus(addr.as_deref(), runtime.as_deref(), is_socket) {
+            None => shared.log.line(
+                &spec.id,
+                "FAIL no session bus on the host, so no keychain login for the server",
+            ),
+            Some(real) => match start_bus_proxy(&real, &server.bus_socket) {
+                Ok(sync) => {
+                    setup.sync = Some(sync);
+                    bus = Some(server.bus_socket.as_path());
+                }
+                Err(e) => shared.log.line(
+                    &spec.id,
+                    &format!("FAIL no session bus for the server, so no keychain login: {e}"),
+                ),
+            },
+        }
+    }
+    if bus.is_some() {
+        let addr = format!("unix:path={CHILD_BUS_SOCKET}");
+        setup.env.push(("DBUS_SESSION_BUS_ADDRESS", addr.into()));
+    } else {
+        setup.unset.push("DBUS_SESSION_BUS_ADDRESS");
+    }
+    let mut argv = vec![spec.program.to_string_lossy().into_owned()];
+    argv.extend(spec.command[1..].iter().cloned());
+    let relay = serde_json::json!([server.egress_port.unwrap_or(0), argv]).to_string();
+    setup.env.extend([
+        (RELAY_ENV, relay.into()),
+        // The private /tmp is the only temp dir it can write.
+        ("TMPDIR", "/tmp".into()),
+        ("XDG_CONFIG_HOME", config_home.into_os_string()),
+    ]);
+    let current_system = std::fs::read_link("/run/current-system").ok();
     let mut cmd = Command::new(bwrap);
     cmd.args(child_bwrap_args(
         &write_dirs,
         runtime.as_deref(),
-        bus.as_deref(),
-        egress_socket,
-    ))
-    .arg("--")
-    .arg(cplt);
-    let mut argv = vec![spec.program.to_string_lossy().into_owned()];
-    argv.extend(spec.command[1..].iter().cloned());
-    let relay = serde_json::json!([egress.unwrap_or(0), argv]).to_string();
-    Ok((cmd, relay))
+        current_system.as_deref(),
+        bus,
+        server.egress_socket.as_deref(),
+    ));
+    if let Some(sync) = &setup.sync {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+        let fd = sync.as_raw_fd();
+        cmd.args(["--sync-fd", "3"]);
+        // SAFETY: only dup2/fcntl, async-signal-safe, between fork and exec.
+        unsafe {
+            cmd.pre_exec(move || {
+                let r = if fd == 3 {
+                    libc::fcntl(3, libc::F_SETFD, 0)
+                } else {
+                    libc::dup2(fd, 3)
+                };
+                if r < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    cmd.arg("--").arg(cplt);
+    Ok((cmd, setup))
 }
 
-/// The socket path of a `unix:path=` session bus address. An abstract or
-/// TCP bus lives in the host's network namespace and is out of reach.
-fn session_bus_path(addr: &str) -> Option<PathBuf> {
-    addr.split(';')
-        .find_map(|a| a.strip_prefix("unix:"))
-        .and_then(|kv| kv.split(',').find_map(|p| p.strip_prefix("path=")))
-        .map(PathBuf::from)
+fn is_socket(p: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    std::fs::metadata(p).is_ok_and(|m| m.file_type().is_socket())
+}
+
+/// The host's session bus socket: the first `unix:path=` in `addr` that is
+/// a socket, or with no address set, `$XDG_RUNTIME_DIR/bus`. An abstract
+/// or TCP bus lives in the host's network namespace and is out of reach.
+fn pick_session_bus(
+    addr: Option<&str>,
+    runtime_dir: Option<&Path>,
+    is_socket: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    match addr {
+        Some(a) => crate::sandbox::parse_dbus_address(a)
+            .paths
+            .into_iter()
+            .find(|p| is_socket(p)),
+        None => runtime_dir.map(|d| d.join("bus")).filter(|p| is_socket(p)),
+    }
+}
+
+/// The D-Bus spelling of `unix:path=<path>`: bytes outside the safe set
+/// as `%XX`.
+fn dbus_path_address(path: &Path) -> String {
+    use std::fmt::Write as _;
+    use std::os::unix::ffi::OsStrExt;
+    let mut out = String::from("unix:path=");
+    for &b in path.as_os_str().as_bytes() {
+        if b.is_ascii_alphanumeric() || b"-_/.\\*".contains(&b) {
+            out.push(char::from(b));
+        } else {
+            let _ = write!(out, "%{b:02x}");
+        }
+    }
+    out
+}
+
+/// What the filtered bus lets the child talk to: the Secret Service only.
+/// go-keyring makes every call there (open session, search, unlock, the
+/// prompt objects and their signals, get secret). xdg-dbus-proxy itself
+/// always passes the bus driver's `Hello`, `AddMatch` and the like.
+const BUS_TALK: &[&str] = &["--talk=org.freedesktop.secrets"];
+
+/// Start xdg-dbus-proxy (from the trusted dirs, never `PATH`) on `socket`,
+/// filtering the host bus at `real` to [`BUS_TALK`], as Flatpak does. Its
+/// `--fd` is the write end of a pipe: it writes one byte when it listens,
+/// and exits once the read end, returned here, is closed.
+#[allow(clippy::disallowed_methods)] // from crate::git::trusted_binary
+fn start_bus_proxy(real: &Path, socket: &Path) -> std::io::Result<std::io::PipeReader> {
+    let proxy = crate::git::trusted_binary("xdg-dbus-proxy").ok_or_else(|| {
+        std::io::Error::other("xdg-dbus-proxy is not installed in the trusted dirs")
+    })?;
+    let _ = std::fs::remove_file(socket);
+    let (mut ready, w) = std::io::pipe()?;
+    let mut child = Command::new(proxy)
+        .arg(dbus_path_address(real))
+        .arg(socket)
+        .arg("--filter")
+        .args(BUS_TALK)
+        .arg("--fd=1")
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(w)
+        .stderr(Stdio::null())
+        .spawn()?;
+    let ok = ready.read_exact(&mut [0u8]);
+    // Reaped whenever it exits, with the child or on its own.
+    std::thread::spawn(move || child.wait());
+    ok.map_err(|_| std::io::Error::other("xdg-dbus-proxy exited before it was ready"))?;
+    Ok(ready)
 }
 
 /// bwrap's arguments for the Linux child, before `--`: every namespace
@@ -606,6 +726,7 @@ fn session_bus_path(addr: &str) -> Option<PathBuf> {
 fn child_bwrap_args(
     write_dirs: &[PathBuf],
     runtime_dir: Option<&Path>,
+    current_system: Option<&Path>,
     bus: Option<&Path>,
     egress_socket: Option<&Path>,
 ) -> Vec<std::ffi::OsString> {
@@ -633,6 +754,15 @@ fn child_bwrap_args(
     .into_iter()
     .map(Into::into)
     .collect();
+    // NixOS: the system profile (and the trusted /run/current-system/sw/bin)
+    // is a link into the read-only store; keep it under the private /run.
+    if let Some(target) = current_system {
+        a.extend([
+            "--symlink".into(),
+            target.into(),
+            "/run/current-system".into(),
+        ]);
+    }
     if let Some(rt) = runtime_dir.filter(|d| !d.starts_with("/run") && !d.starts_with("/tmp")) {
         a.extend(["--tmpfs".into(), rt.into()]);
     }
@@ -643,7 +773,7 @@ fn child_bwrap_args(
         bind("--bind", d, d);
     }
     if let Some(bus) = bus {
-        bind("--ro-bind", bus, bus);
+        bind("--ro-bind", bus, Path::new(CHILD_BUS_SOCKET));
     }
     if let Some(sock) = egress_socket {
         bind("--ro-bind", sock, Path::new(CHILD_EGRESS_SOCKET));
@@ -943,21 +1073,23 @@ mod tests {
         assert_eq!(got, real.join("nais"));
     }
 
+    fn strings(a: Vec<std::ffi::OsString>) -> Vec<String> {
+        a.into_iter().map(|a| a.into_string().unwrap()).collect()
+    }
+
     /// #849: the Linux child's namespace. Every namespace, the network one
     /// included; the host root read-only with private /tmp and /run, and
-    /// only then the write dirs, the bus socket and the egress socket, so
+    /// only then the write dirs, the filtered bus and the egress socket, so
     /// no tmpfs hides them.
     #[test]
     fn child_bwrap_args_isolate_the_network_and_bind_only_the_grants() {
-        let args: Vec<String> = child_bwrap_args(
+        let args = strings(child_bwrap_args(
             &[PathBuf::from("/home/u/.config/nais")],
             Some(Path::new("/run/user/1000")),
-            Some(Path::new("/run/user/1000/bus")),
+            None,
+            Some(Path::new("/tmp/cplt-mcp-x/b0")),
             Some(Path::new("/tmp/cplt-mcp-x/e0")),
-        )
-        .into_iter()
-        .map(|a| a.into_string().unwrap())
-        .collect();
+        ));
         let s = args.join(" ");
         for ns in ["user", "pid", "ipc", "uts", "cgroup", "net"] {
             assert!(args.contains(&format!("--unshare-{ns}")), "{s}");
@@ -965,10 +1097,9 @@ mod tests {
         assert!(args.contains(&"--die-with-parent".into()), "{s}");
         let tail = "--ro-bind / / --proc /proc --dev /dev --tmpfs /tmp --tmpfs /run \
                     --bind /home/u/.config/nais /home/u/.config/nais \
-                    --ro-bind /run/user/1000/bus /run/user/1000/bus \
+                    --ro-bind /tmp/cplt-mcp-x/b0 /run/cplt-bus \
                     --ro-bind /tmp/cplt-mcp-x/e0 /tmp/cplt-egress.sock";
         assert!(s.ends_with(tail), "{s}");
-        // Writable binds: the write dir alone.
         let writable: Vec<_> = args
             .windows(2)
             .filter(|w| w[0] == "--bind")
@@ -978,10 +1109,13 @@ mod tests {
 
         // No egress, no bus: neither socket is bound. A runtime dir outside
         // /run gets its own tmpfs.
-        let bare: Vec<String> = child_bwrap_args(&[], Some(Path::new("/var/rt")), None, None)
-            .into_iter()
-            .map(|a| a.into_string().unwrap())
-            .collect();
+        let bare = strings(child_bwrap_args(
+            &[],
+            Some(Path::new("/var/rt")),
+            None,
+            None,
+            None,
+        ));
         assert!(bare.contains(&"--unshare-net".into()));
         assert!(
             bare.ends_with(&["--tmpfs".into(), "/var/rt".into()]),
@@ -990,22 +1124,72 @@ mod tests {
         assert!(
             !bare
                 .iter()
-                .any(|a| a == "--bind" || a == CHILD_EGRESS_SOCKET)
+                .any(|a| a == "--bind" || a == CHILD_EGRESS_SOCKET || a == CHILD_BUS_SOCKET)
+        );
+    }
+
+    /// NixOS: a program under /run/current-system/sw/bin (a trusted dir)
+    /// still resolves after the private /run, through the restored link.
+    #[test]
+    fn child_bwrap_args_keep_nixos_current_system() {
+        let store = Path::new("/nix/store/abc-nixos-system");
+        let args = strings(child_bwrap_args(&[], None, Some(store), None, None));
+        let s = args.join(" ");
+        assert!(
+            s.contains("--tmpfs /run --symlink /nix/store/abc-nixos-system /run/current-system"),
+            "{s}"
+        );
+        let program = Path::new("/run/current-system/sw/bin/nais");
+        let rest = program.strip_prefix("/run/current-system").unwrap();
+        assert_eq!(
+            store.join(rest),
+            Path::new("/nix/store/abc-nixos-system/sw/bin/nais")
         );
     }
 
     #[test]
-    fn session_bus_path_takes_a_unix_path_only() {
+    fn pick_session_bus_takes_an_existing_socket_only() {
+        let sock = |p: &Path| p == Path::new("/run/user/1000/bus") || p == Path::new("/x y/bus");
+        let rt = Some(Path::new("/run/user/1000"));
         assert_eq!(
-            session_bus_path("unix:path=/run/user/1000/bus,guid=abc"),
+            pick_session_bus(Some("unix:path=/run/user/1000/bus,guid=abc"), None, sock),
+            Some(PathBuf::from("/run/user/1000/bus"))
+        );
+        // Escaped, and a later entry when the first is not a socket.
+        assert_eq!(
+            pick_session_bus(Some("unix:path=/gone;unix:path=/x%20y/bus"), None, sock),
+            Some(PathBuf::from("/x y/bus"))
+        );
+        assert_eq!(
+            pick_session_bus(Some("unix:abstract=/tmp/dbus-x"), rt, sock),
+            None
+        );
+        assert_eq!(
+            pick_session_bus(Some("tcp:host=localhost,port=1"), rt, sock),
+            None
+        );
+        // Unset: the runtime dir's bus, if it is there.
+        assert_eq!(
+            pick_session_bus(None, rt, sock),
             Some(PathBuf::from("/run/user/1000/bus"))
         );
         assert_eq!(
-            session_bus_path("unix:guid=abc,path=/run/user/1000/bus"),
-            Some(PathBuf::from("/run/user/1000/bus"))
+            pick_session_bus(None, Some(Path::new("/var/rt")), sock),
+            None
         );
-        assert_eq!(session_bus_path("unix:abstract=/tmp/dbus-x,guid=abc"), None);
-        assert_eq!(session_bus_path("tcp:host=localhost,port=1"), None);
+        assert_eq!(pick_session_bus(None, None, sock), None);
+    }
+
+    #[test]
+    fn dbus_path_address_escapes() {
+        assert_eq!(
+            dbus_path_address(Path::new("/run/user/1000/bus")),
+            "unix:path=/run/user/1000/bus"
+        );
+        assert_eq!(
+            dbus_path_address(Path::new("/x y,z")),
+            "unix:path=/x%20y%2cz"
+        );
     }
 
     #[test]

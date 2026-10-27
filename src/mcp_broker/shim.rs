@@ -86,11 +86,17 @@ extern "C" fn relay_entry() {
     let Some(v) = std::env::var_os(RELAY_ENV) else {
         return;
     };
-    let code = match serde_json::from_slice::<(u16, Vec<String>)>(v.as_encoded_bytes()) {
+    std::process::exit(relay(v.as_encoded_bytes()));
+}
+
+/// [`RELAY_ENV`]'s payload run: the server's exit code, 126 for a payload
+/// that does not parse.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn relay(payload: &[u8]) -> i32 {
+    match serde_json::from_slice::<(u16, Vec<String>)>(payload) {
         Ok((port, argv)) => run_egress_relay(port, &argv),
         Err(_) => 126,
-    };
-    std::process::exit(code);
+    }
 }
 
 /// The egress relay, run by bwrap inside the Linux child's fresh network
@@ -99,7 +105,7 @@ extern "C" fn relay_entry() {
 /// the broker's egress proxy bound in from the host, and run the server
 /// with this process's stdio and environment. Returns the server's exit
 /// code; the listener is up before the server starts.
-#[cfg(target_os = "linux")]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn run_egress_relay(port: u16, argv: &[String]) -> i32 {
     let Some((program, args)) = argv.split_first() else {
         return 126;
@@ -137,5 +143,19 @@ fn run_egress_relay(port: u16, argv: &[String]) -> i32 {
             eprintln!("cplt egress relay: cannot run the server: {e}");
             127
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::relay;
+
+    #[test]
+    fn relay_refuses_a_malformed_payload_and_runs_the_server_on_port_0() {
+        assert_eq!(relay(b"not json"), 126);
+        assert_eq!(relay(b"[1, []]"), 126, "no program");
+        // Port 0: no listener, the server still runs; its status comes back.
+        assert_eq!(relay(br#"[0, ["/bin/sh", "-c", "exit 7"]]"#), 7);
+        assert_eq!(relay(br#"[0, ["/nonexistent/server"]]"#), 127);
     }
 }
