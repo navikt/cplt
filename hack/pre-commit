@@ -1,6 +1,13 @@
 #!/bin/sh
 set -e
 
+# Use the toolchain pinned in mise.toml (the one CI uses), not rustup's
+# default: newer clippy releases add lints the tree does not pass yet.
+if [ -z "${RUSTUP_TOOLCHAIN:-}" ] && command -v rustup >/dev/null 2>&1; then
+    pin=$(sed -n 's/^rust = "\(.*\)"$/\1/p' "$(git rev-parse --show-toplevel)/mise.toml")
+    if [ -n "$pin" ]; then export RUSTUP_TOOLCHAIN="$pin"; fi
+fi
+
 echo "Running cargo fmt --check..."
 cargo fmt -- --check || {
     echo "Format check failed. Run 'cargo fmt' to fix."
