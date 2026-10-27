@@ -393,7 +393,8 @@ pub fn yarn1_ignore_scripts(
 /// any store setting is in sight: in the environment, the global config, or a
 /// `pnpm-workspace.yaml`/`.npmrc` in the launch dir, its ancestors or its
 /// direct subdirectories. A file that exists but cannot be read counts as a
-/// setting. Nothing is set unless the store already exists.
+/// setting. Nothing is set unless the store already exists and no
+/// `deny.paths` entry overlaps it.
 ///
 /// ponytail: a store setting more than one level below the launch dir is not
 /// seen and gets overridden. pnpm 10 reads `npm_config_store_dir` instead
@@ -402,6 +403,7 @@ pub fn pnpm_store_dir(
     home: &Path,
     launch_dir: &Path,
     parent_env: &[(String, String)],
+    deny: &[PathBuf],
 ) -> Option<PathBuf> {
     let get = |k: &str| {
         parent_env
@@ -457,8 +459,14 @@ pub fn pnpm_store_dir(
     }
     // Landlock cannot grant a missing store, and its parent is read-only, so
     // pnpm could not create it: leave pnpm to its per-project fallback.
+    // A deny on or around the store withholds its write grant (#597), so pnpm
+    // could not use it: keep the per-project fallback.
     let store = pnpm_home.join("store");
-    store.is_dir().then_some(store)
+    let real = std::fs::canonicalize(&store).ok()?;
+    let denied = deny
+        .iter()
+        .any(|d| real.starts_with(d) || d.starts_with(&real) || store.starts_with(d));
+    (real.is_dir() && !denied).then_some(store)
 }
 
 /// `Some(true)` for a yarn 1 project, `Some(false)` for yarn 2+, `None` when
@@ -869,7 +877,7 @@ mod tests {
         } else {
             h.join(".local/share/pnpm")
         };
-        let at = |e: &[(String, String)]| pnpm_store_dir(h, &proj, e);
+        let at = |e: &[(String, String)]| pnpm_store_dir(h, &proj, e, &[]);
         assert_eq!(at(&[]), None, "no store yet");
         std::fs::create_dir_all(default.join("store")).unwrap();
         assert_eq!(at(&[]), Some(default.join("store")));
@@ -878,10 +886,24 @@ mod tests {
             at(&env(&[("PNPM_HOME", pnpm_home)])),
             Some(default.join("store"))
         );
+        let other = h.join("opt/pnpm");
         assert_eq!(
-            at(&env(&[("PNPM_HOME", "/opt/pnpm")])),
+            at(&env(&[("PNPM_HOME", other.to_str().unwrap())])),
             None,
-            "writable home"
+            "no store"
+        );
+        std::fs::create_dir_all(other.join("store")).unwrap();
+        assert_eq!(
+            at(&env(&[("PNPM_HOME", other.to_str().unwrap())])),
+            Some(other.join("store")),
+            "relocated PNPM_HOME"
+        );
+        assert_eq!(at(&env(&[("PNPM_HOME", "rel/pnpm")])), None);
+        let real_default = std::fs::canonicalize(&default).unwrap();
+        assert_eq!(
+            pnpm_store_dir(h, &proj, &[], &[real_default]),
+            None,
+            "denied"
         );
         assert_eq!(at(&env(&[("pnpm_config_store_dir", "/x")])), None);
         assert_eq!(at(&env(&[("NPM_CONFIG_STORE_DIR", "/x")])), None);
