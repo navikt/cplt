@@ -185,6 +185,9 @@ fn configure_command(
     if super::env::yarn1_ignore_scripts(launch_dir, extra_pass_env, disabled_categories) {
         cmd.env("YARN_IGNORE_SCRIPTS", "true");
     }
+    if let Some(store) = super::env::pnpm_store_dir(home_dir, launch_dir, &parent_env) {
+        cmd.env("pnpm_config_store_dir", store);
+    }
 
     // The cplt PATH shim dir (#514) stays outside: in here the agent's own
     // name must resolve to the real binary, not to a shim that would start
