@@ -104,6 +104,23 @@ fn apply_pnpm_store(cmd: &mut Command, sandbox: &super::PreparedSandbox, launch_
     }
 }
 
+/// Point Puppeteer at the executable `ms-playwright` cache on macOS (#742).
+fn apply_puppeteer_cache(
+    cmd: &mut Command,
+    sandbox: &super::PreparedSandbox,
+    launch_dir: &Path,
+    extra_pass_env: &[String],
+) {
+    if let Some(dir) = super::env::puppeteer_cache_dir(
+        &sandbox.home_dir,
+        launch_dir,
+        extra_pass_env,
+        sandbox.playwright_runtime && sandbox.puppeteer_cache_exec,
+    ) {
+        cmd.env("PUPPETEER_CACHE_DIR", dir);
+    }
+}
+
 fn apply_session_env(
     cmd: &mut Command,
     opencode_v2: bool,
@@ -1492,6 +1509,7 @@ pub fn exec(
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
     apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
     apply_pnpm_store(&mut cmd, sandbox, launch_dir);
+    apply_puppeteer_cache(&mut cmd, sandbox, launch_dir, extra_pass_env);
     // Last env step: no real GitHub token may be set after it (#820).
     crate::token_inject::apply_to_child(&mut cmd, inherit_env);
     // Nothing the caller was holding open crosses into the agent.
@@ -1640,6 +1658,7 @@ pub fn exec(
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
     apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
     apply_pnpm_store(&mut cmd, sandbox, launch_dir);
+    apply_puppeteer_cache(&mut cmd, sandbox, launch_dir, extra_pass_env);
     // Last env step: no real GitHub token may be set after it (#820).
     crate::token_inject::apply_to_child(&mut cmd, inherit_env);
     // Before the Landlock hook below: that hook opens descriptors of its own,
@@ -1881,6 +1900,7 @@ fn exec_bwrap(
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
     apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
     apply_pnpm_store(&mut cmd, sandbox, launch_dir);
+    apply_puppeteer_cache(&mut cmd, sandbox, launch_dir, extra_pass_env);
     // Last env step: no real GitHub token may be set after it (#820).
     crate::token_inject::apply_to_child(&mut cmd, inherit_env);
     // Set the re-entry env AFTER configure_command so a `clear_first` env build

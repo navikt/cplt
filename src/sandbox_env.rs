@@ -582,6 +582,56 @@ pub fn playwright_mcp_sandbox_disabled(
             .any(|var| var == "PLAYWRIGHT_MCP_SANDBOX")
 }
 
+/// Where Puppeteer should keep its browsers on macOS, or `None` (#742).
+///
+/// Puppeteer defaults to `~/.cache/puppeteer`, which cplt never makes
+/// executable on macOS. Under the `ms-playwright` opt-in, the subdir
+/// `ms-playwright/puppeteer` is executable and gets the Chromium runtime rules
+/// already, so pointing Puppeteer there needs no new exec root. Playwright's
+/// cache cleanup only removes `<browser>-<rev>` dirs, so it leaves this one
+/// alone. `--pass-env PUPPETEER_CACHE_DIR` hands the choice back to the
+/// caller, and a Puppeteer config file in the launch dir or above it (which
+/// may pin `cacheDirectory`, outranked by the variable) makes cplt back off.
+pub fn puppeteer_cache_dir(
+    home: &Path,
+    launch_dir: &Path,
+    extra_pass_env: &[String],
+    playwright_runtime: bool,
+) -> Option<PathBuf> {
+    (cfg!(target_os = "macos")
+        && playwright_runtime
+        && !extra_pass_env.iter().any(|v| v == "PUPPETEER_CACHE_DIR")
+        && !launch_dir.ancestors().any(has_puppeteer_config))
+    .then(|| home.join("Library/Caches/ms-playwright/puppeteer"))
+}
+
+/// Whether `dir` holds a Puppeteer config: cosmiconfig's names in `dir` or
+/// `dir/.config`, or a `puppeteer` key in `package.json`.
+fn has_puppeteer_config(dir: &Path) -> bool {
+    let rc = |d: &Path, prefix: &str| {
+        std::fs::read_dir(d)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with(prefix))
+    };
+    if rc(dir, ".puppeteerrc")
+        || rc(dir, "puppeteer.config.")
+        || rc(&dir.join(".config"), "puppeteerrc")
+    {
+        return true;
+    }
+    // A manifest that exists but cannot be read safely (a symlink, a FIFO)
+    // counts as config: Puppeteer may still load it.
+    let pkg = dir.join("package.json");
+    pkg.symlink_metadata().is_ok()
+        && crate::untrusted::read_untrusted(&pkg, 1024 * 1024)
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .is_none_or(|v| v.get("puppeteer").is_some())
+}
+
 /// Whether to tell Copilot CLI that this host cannot sandbox commands.
 ///
 /// Copilot CLI has had a command sandbox of its own since 1.0.83, and on Linux
@@ -923,6 +973,55 @@ mod tests {
         // Unreadable counts as a setting.
         std::fs::create_dir(proj.join(".npmrc")).unwrap();
         assert_eq!(at(&[]), None);
+    }
+
+    #[test]
+    fn puppeteer_cache_dir_needs_playwright_intent_on_macos() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path();
+        let h = Path::new("/h");
+        let puppeteer_cache_dir = |h, e: &[String], on| puppeteer_cache_dir(h, p, e, on);
+        assert_eq!(puppeteer_cache_dir(h, &[], false), None);
+        let want =
+            cfg!(target_os = "macos").then(|| h.join("Library/Caches/ms-playwright/puppeteer"));
+        assert_eq!(puppeteer_cache_dir(h, &[], true), want);
+        let own = vec!["PUPPETEER_CACHE_DIR".to_string()];
+        assert_eq!(puppeteer_cache_dir(h, &own, true), None);
+        std::fs::write(
+            p.join("package.json"),
+            r#"{"devDependencies":{"puppeteer":"1"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            puppeteer_cache_dir(h, &[], true),
+            want,
+            "a dependency is not config"
+        );
+        std::fs::write(
+            p.join("package.json"),
+            r#"{"puppeteer":{"cacheDirectory":"x"}}"#,
+        )
+        .unwrap();
+        assert_eq!(puppeteer_cache_dir(h, &[], true), None);
+        std::fs::remove_file(p.join("package.json")).unwrap();
+        std::fs::write(p.join(".puppeteerrc.cjs"), "").unwrap();
+        assert_eq!(puppeteer_cache_dir(h, &[], true), None);
+        std::fs::remove_file(p.join(".puppeteerrc.cjs")).unwrap();
+        std::fs::create_dir(p.join(".config")).unwrap();
+        std::fs::write(p.join(".config/puppeteerrc.json"), "{}").unwrap();
+        assert_eq!(
+            puppeteer_cache_dir(h, &[], true),
+            None,
+            ".config/puppeteerrc"
+        );
+        std::fs::remove_file(p.join(".config/puppeteerrc.json")).unwrap();
+        std::fs::write(p.join("real.json"), "{}").unwrap();
+        std::os::unix::fs::symlink(p.join("real.json"), p.join("package.json")).unwrap();
+        assert_eq!(
+            puppeteer_cache_dir(h, &[], true),
+            None,
+            "unreadable manifest"
+        );
     }
 
     /// yarn 1 reads `ignore-scripts` only from `YARN_IGNORE_SCRIPTS`; yarn 2+
