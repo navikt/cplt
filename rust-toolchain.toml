@@ -1,0 +1,4 @@
+[toolchain]
+# Keep in step with mise.toml and the toolchain in .github/workflows.
+channel = "1.94"
+components = ["clippy", "rustfmt"]
