@@ -8157,8 +8157,8 @@ fn build_battery(
             fix: Some(
                 "Untrack it (`git rm --cached <FILE>`) and add it to .gitignore — an ignored \
                  file is never hashed, and a secret-shaped file does not belong in the \
-                 repository. `--allow-env-files` also works but unblocks every .env, .pem, \
-                 .key, .p12, .pfx and .jks in the project."
+                 repository. `--allow-env-files` also works but unblocks every .env, key \
+                 file and SSH private key (id_rsa) in the project."
                     .to_string(),
             ),
             note: None,

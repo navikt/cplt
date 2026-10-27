@@ -253,8 +253,8 @@ pub struct SandboxConfig<'a> {
     /// through a symlink inside `~/.cache` rather than grant its target with a
     /// warning. Linux only; see [`validate_cache_exec_dirs`].
     pub refuse_cache_exec_links: bool,
-    /// `sandbox.deny_key_files_by_extension`: deny `*.pem`, `*.key`, `*.p12`,
-    /// `*.pfx` and `*.jks` by extension, not only files named exactly `.pem`.
+    /// `sandbox.deny_key_files_by_extension`: deny key files by extension
+    /// ([`SENSITIVE_KEY_FILE_EXTENSION_PATTERNS`]), not only files named exactly `.pem`.
     /// macOS only; Linux has no name-pattern denies.
     pub deny_key_files_by_extension: bool,
     /// `sandbox.protect_pnpm_config`: pnpm's XDG config dir is read-only and
@@ -3445,8 +3445,8 @@ fn prepare_impl(
     if config.deny_key_files_by_extension {
         crate::ui::warn(
             "sandbox.deny_key_files_by_extension has no effect on Linux: Landlock \
-             cannot deny files by name pattern, so .pem, .key, .p12, .pfx and .jks \
-             files in the project stay readable.",
+             cannot deny files by name pattern, so key files such as server.pem, \
+             tls.key or release.keystore in the project stay readable.",
         );
     }
     if config.allow_docker {

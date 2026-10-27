@@ -945,7 +945,8 @@ Off by default, because it blocks files that work today, anywhere inside a grant
 
 - a local HTTPS dev server that reads its certificate or key from the project
 - tests that load a key or keystore fixture from the project
-- a Java or Android build that signs with a `.jks` or `.p12` in the project
+- a Java or Android build that signs with a `.jks`, `.p12` or `.keystore` in the project, such as a committed Android `debug.keystore`
+- an iOS release script (fastlane) that reads an App Store Connect `.p8` key from the project
 - a CA bundle inside a granted tree. A Python virtualenv in the project ships `certifi/cacert.pem`, so `pip` and `requests` from that venv fail TLS verification. A wide grant such as `allow.read = ["~"]` puts every tool's bundled `cacert.pem` under the deny, and a grant that covers `/etc` or `/opt/homebrew` puts the system bundles there too
 - a package under `node_modules` or a vendored dependency that reads a `.pem` it ships
 
