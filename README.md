@@ -171,24 +171,27 @@ Tools such as VS Code agent mode rely mainly on UI permissions. cplt enforces it
 | --- | --- | --- |
 | Language / delivery | Single Rust binary | Node.js + npm package + external deps |
 | Linux backend | Landlock LSM (no deps, no namespaces) | bubblewrap (container via user namespaces) |
-| Environment filtering | Strict allowlist + suffix-deny (`_TOKEN`, `_SECRET`) | Inherits full parent env (secrets pass through) |
+| Environment filtering | Strict allowlist + suffix-deny (`_TOKEN`, `_SECRET`) | Inherits the parent env on macOS and Linux. Variables listed under `credentials.envVars` can be withheld or masked |
 | Credential dir protection | 15+ dirs denied by default | User must configure manually |
-| DNS rebinding protection | ✅ Post-DNS IP checked against private ranges | ❌ Not implemented |
+| Resolved-address checks | Post-DNS IP checked against loopback, link-local and private ranges (RFC 1918) by default | Post-DNS IP checked against loopback, link-local, cloud metadata and the host's own addresses. Private ranges only when listed in `deniedResolvedAddresses` |
 | Network proxy | HTTP CONNECT + domain allow/block | HTTP + SOCKS5 + experimental TLS MITM |
 | SSH git | No key: agent socket denied at kernel on macOS, on Linux only `SSH_AUTH_SOCK` is withheld. The transport is not blocked, `ssh.github.com:443` is reachable | Proxied via SOCKS5 |
 | Package manager scripts | Blocked by default (`npm_config_ignore_scripts`, `pnpm_config_ignore_scripts`, `YARN_IGNORE_SCRIPTS`, `YARN_ENABLE_SCRIPTS`). Yarn 2+ still runs the project's own scripts | Not blocked |
 | Agent support | Copilot, OpenCode, Gemini, Antigravity, Pi, Claude Code, goose, DSH, Shell | Claude Code |
-| Config | TOML (global + per-repo) | JSON (global only) + `--control-fd` live updates |
+| Credential injection | Opt-in placeholder GitHub token, real token restored at the proxy (`proxy.inject_github_token`) | Opt-in masking and injection at the proxy for listed variables, AWS SigV4 re-signing |
+| Config | TOML (global + per-repo) | JSON (`~/.srt-settings.json` or `--settings`) + `--control-fd` live updates |
 | Library API | ❌ Binary only | ✅ Embeddable TypeScript library |
 
-cplt is more secure out of the box: env filtering, credential protection, DNS rebinding checks, lifecycle script blocking. srt is more flexible: SOCKS5, TLS inspection, per-request callbacks, library embedding. The Linux backend choice matters. bwrap needs workarounds on Ubuntu 24.04+ because of AppArmor userns restrictions, while Landlock requires kernel 5.13 or newer but has zero external dependencies.
+Both check where an allowed hostname resolves. The difference is private ranges: cplt blocks them by default, srt only when you list them. cplt has more on by default: env filtering, credential directory protection, lifecycle script blocking. srt is more flexible: SOCKS5, TLS inspection, per-request callbacks, library embedding. The Linux backend choice matters. bwrap needs workarounds on Ubuntu 24.04+ because of AppArmor userns restrictions, while Landlock requires kernel 5.13 or newer but has zero external dependencies.
 
 ### GitHub Copilot CLI's own sandbox
 
-Copilot CLI has shipped with a local sandbox since June 2026, included in the
-standard seat. It runs shell commands through Microsoft MXC with restricted
-filesystem, network and system access, on macOS, Linux and Windows.
-`/sandbox enable` turns it on.
+Copilot CLI has a local sandbox, in public preview and included in the
+standard seat. It runs shell commands through Microsoft Execution Containers
+(MXC) with restricted filesystem, network and system access, on macOS, Linux
+and recent Windows 11 builds. It is off by default. `/sandbox enable` or
+`--sandbox` turns it on. With git and `gh` authentication enabled, sandboxed
+tools get placeholders and a local proxy supplies the real credentials.
 
 If that covers you, use it. It costs nothing extra, and it runs on Windows,
 which cplt does not.
@@ -196,18 +199,19 @@ which cplt does not.
 Two things it does not do.
 
 Policy lives with the administrator, not the repository. Enterprises set
-sandbox policy through Intune or another MDM. Nothing sits next to the code,
-so a rule that matters for one repository cannot follow it to a contributor,
-to CI, or to a laptop the MDM does not manage. In cplt the policy is
+sandbox policy through server-managed, MDM-managed or file-based managed
+settings. Nothing sits next to the code, so a rule that matters for one
+repository cannot follow it to a contributor, to CI, or to a machine the
+administrator does not manage. In cplt the policy is
 `.cplt.toml` in the repository. Reviewers see changes to it in the pull
 request, and the file can tighten a developer's own configuration but never
 loosen it.
 
 It confines the process, not what the process does with credentials it
 holds. The `/sandbox` tabs cover the filesystem, the network and system
-capabilities, and inside a Git repository the agent is granted read and write
-on `.git` by default. A sandboxed agent still has your `gh` token and your
-push access. Pushing a branch, merging a pull request and deleting a
+capabilities. Masking keeps the token value out of the sandbox, but the
+proxy still authenticates the agent's `git` and `gh` calls, so the agent keeps
+your push access. Pushing a branch, merging a pull request and deleting a
 repository are all well-formed API calls from an authorised client, and a
 filesystem or network rule has no opinion about them. cplt wraps `git` and
 `gh` instead. The agent commits, branches and rebases freely. `gh pr merge`,
@@ -217,7 +221,8 @@ filesystem or network rule has no opinion about them. cplt wraps `git` and
 `git_guard.mode = "warn"` to only warn.
 
 Running both is reasonable. MXC confines the process. The guards decide what
-the agent may do with the credentials it holds.
+the agent may do with the credentials it holds. The user documentation is on
+[ki-utvikling.nav.no](https://ki-utvikling.nav.no/cplt).
 
 ### Honest gaps
 
