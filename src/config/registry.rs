@@ -455,6 +455,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "sandbox",
+        key: "skip_untrusted_opencode_config",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "false",
+        description: "OpenCode only: in a repository whose .cplt.toml has no current `cplt trust` approval, set OPENCODE_DISABLE_PROJECT_CONFIG, so OpenCode skips the repository's opencode.json(c), .opencode directories (plugins, agents, commands), skills and project AGENTS.md. Your global OpenCode config still loads (on OpenCode 1.x, global skills in ~/.claude/skills and ~/.agents/skills do not). An approved repository keeps today's behaviour.",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
         key: "deny_copilot_dir_exec",
         value_type: ConfigValueType::Bool,
         dangerous: false,
@@ -1159,6 +1167,14 @@ bool_keys! {
         config = |c: &Config| c.sandbox.refuse_invalid_repo_config,
         baseline = |_: PresetBaseline| false,
         resolved = |r: &Resolved| r.refuse_invalid_repo_config;
+
+    /// Config-only and off by default (#732): it drops a repository's own
+    /// OpenCode config and plugins until the repository is trusted.
+    skip_untrusted_opencode_config, "sandbox", "skip_untrusted_opencode_config",
+        cli = |_: &CliFlags| FeatureToggle::UseDefault,
+        config = |c: &Config| c.sandbox.skip_untrusted_opencode_config,
+        baseline = |_: PresetBaseline| false,
+        resolved = |r: &Resolved| r.skip_untrusted_opencode_config;
 
     /// Config-only and off by default (staged rollout, #324): it withdraws a
     /// grant a plugin or MCP server stored under `~/.copilot` may rely on.

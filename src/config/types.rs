@@ -730,6 +730,9 @@ pub struct SandboxConfig {
     /// parsed, instead of warning and launching without its `[deny]`
     /// (default: false, #385 M-01).
     pub refuse_invalid_repo_config: Option<bool>,
+    /// For an OpenCode launch in a repository with no `cplt trust` approval,
+    /// set `OPENCODE_DISABLE_PROJECT_CONFIG` (default: false, #732).
+    pub skip_untrusted_opencode_config: Option<bool>,
     /// Withdraw execve from `~/.copilot` (default: false, Linux only, #324).
     pub deny_copilot_dir_exec: Option<bool>,
     /// Allow Docker/Colima/OrbStack access inside the sandbox (default: false).
@@ -1034,6 +1037,7 @@ pub struct Resolved {
     pub deny_key_files_by_extension: bool,
     pub protect_pnpm_config: bool,
     pub refuse_invalid_repo_config: bool,
+    pub skip_untrusted_opencode_config: bool,
     pub deny_copilot_dir_exec: bool,
     pub allow_docker: bool,
     pub allow_rootless_docker: bool,
