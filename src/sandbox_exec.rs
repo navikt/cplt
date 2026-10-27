@@ -213,6 +213,10 @@ fn configure_command(
     if super::env::playwright_mcp_sandbox_disabled(extra_pass_env, playwright_runtime) {
         cmd.env("PLAYWRIGHT_MCP_SANDBOX", "false");
     }
+    if let Some(dir) = super::env::puppeteer_cache_dir(home_dir, extra_pass_env, playwright_runtime)
+    {
+        cmd.env("PUPPETEER_CACHE_DIR", dir);
+    }
 
     // Copilot CLI 1.0.83 gave itself a command sandbox that cannot start inside
     // cplt's: on Linux it builds a network namespace, and cplt's seccomp filter

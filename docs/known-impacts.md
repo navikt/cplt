@@ -634,9 +634,21 @@ so the launch fails with `Error: spawn EPERM`. Puppeteer also talks to Chrome
 over a localhost WebSocket by default, which fails with
 `connect EPERM 127.0.0.1:<port>` (`mmdc` only prints `[object Object]`).
 
-Point Puppeteer at Playwright's browser and use a pipe instead of a socket.
-With `sandbox.allow_cache_exec ms-playwright` set, a `puppeteer-config.json`
-for `mmdc -p`:
+With `sandbox.allow_cache_exec ms-playwright` set, cplt sets
+`PUPPETEER_CACHE_DIR=~/Library/Caches/ms-playwright/puppeteer` for the agent on
+macOS, a directory that opt-in already makes executable (#742). Install
+Puppeteer's browser there once, inside cplt (Chrome's download host must be
+allowed by your network policy) or outside it with the same variable:
+
+```bash
+PUPPETEER_CACHE_DIR=~/Library/Caches/ms-playwright/puppeteer npx puppeteer browsers install chrome-headless-shell
+```
+
+Then launch with `"args": ["--no-sandbox"]` and `"pipe": true` and no
+`executablePath`. `--pass-env PUPPETEER_CACHE_DIR` keeps your own value instead.
+
+The older route still works: point Puppeteer at Playwright's browser. A
+`puppeteer-config.json` for `mmdc -p`:
 
 ```json
 {
@@ -650,15 +662,8 @@ Adjust the path to the `chrome-headless-shell` build you have. `--no-sandbox`
 is needed for the same reason as with Playwright above; without it the launch
 fails with `ConnectionClosedError: Connection closed`. Puppeteer only guarantees its own bundled
 browser, so a Playwright upgrade can bring a Chromium that this Puppeteer
-version does not support. If launches start failing after an upgrade, use the
-`PUPPETEER_CACHE_DIR` alternative below, which gives Puppeteer its matching
-browser.
-
-Alternatives: set `PUPPETEER_CACHE_DIR` to a directory under
-`~/Library/Caches/ms-playwright`, download the browser there outside cplt
-(`npx puppeteer browsers install chrome-headless-shell`) and pass the variable
-with `--pass-env PUPPETEER_CACHE_DIR`; then `executablePath` can go. Or use
-`--allow-localhost-any` instead of `"pipe": true`.
+version does not support, which is why the cache route above is preferred.
+`--allow-localhost-any` instead of `"pipe": true` also works.
 
 `npx -y @mermaid-js/mermaid-cli` fails before any of this with `bad interpreter`;
 see [npx](#npx-and-npm-exec) above.

@@ -3,7 +3,7 @@
 //! Filters the parent environment through an allowlist and injects
 //! hardening variables (e.g. `TMPDIR`, `NODE_OPTIONS`).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::agent::Agent;
 
@@ -492,6 +492,25 @@ pub fn playwright_mcp_sandbox_disabled(
             .any(|var| var == "PLAYWRIGHT_MCP_SANDBOX")
 }
 
+/// Where Puppeteer should keep its browsers on macOS, or `None` (#742).
+///
+/// Puppeteer defaults to `~/.cache/puppeteer`, which cplt never makes
+/// executable on macOS. Under the `ms-playwright` opt-in, the subdir
+/// `ms-playwright/puppeteer` is executable and gets the Chromium runtime rules
+/// already, so pointing Puppeteer there needs no new exec root. Playwright's
+/// cache cleanup only removes `<browser>-<rev>` dirs, so it leaves this one
+/// alone. `--pass-env PUPPETEER_CACHE_DIR` hands the choice back to the caller.
+pub fn puppeteer_cache_dir(
+    home: &Path,
+    extra_pass_env: &[String],
+    playwright_runtime: bool,
+) -> Option<PathBuf> {
+    (cfg!(target_os = "macos")
+        && playwright_runtime
+        && !extra_pass_env.iter().any(|v| v == "PUPPETEER_CACHE_DIR"))
+    .then(|| home.join("Library/Caches/ms-playwright/puppeteer"))
+}
+
 /// Whether to tell Copilot CLI that this host cannot sandbox commands.
 ///
 /// Copilot CLI has had a command sandbox of its own since 1.0.83, and on Linux
@@ -767,6 +786,17 @@ mod tests {
             "the default is unchanged: {:?}",
             not_asked.remove
         );
+    }
+
+    #[test]
+    fn puppeteer_cache_dir_needs_playwright_intent_on_macos() {
+        let h = Path::new("/h");
+        assert_eq!(puppeteer_cache_dir(h, &[], false), None);
+        let want =
+            cfg!(target_os = "macos").then(|| h.join("Library/Caches/ms-playwright/puppeteer"));
+        assert_eq!(puppeteer_cache_dir(h, &[], true), want);
+        let own = vec!["PUPPETEER_CACHE_DIR".to_string()];
+        assert_eq!(puppeteer_cache_dir(h, &own, true), None);
     }
 
     /// yarn 1 reads `ignore-scripts` only from `YARN_IGNORE_SCRIPTS`; yarn 2+
