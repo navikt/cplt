@@ -499,6 +499,7 @@ impl Config {
         let protect_pnpm_config = bools.protect_pnpm_config;
 
         let refuse_invalid_repo_config = bools.refuse_invalid_repo_config;
+        let skip_untrusted_opencode_config = bools.skip_untrusted_opencode_config;
         let deny_copilot_dir_exec = bools.deny_copilot_dir_exec;
 
         let allow_docker = bools.allow_docker;
@@ -690,6 +691,7 @@ impl Config {
             deny_key_files_by_extension,
             protect_pnpm_config,
             refuse_invalid_repo_config,
+            skip_untrusted_opencode_config,
             deny_copilot_dir_exec,
             allow_docker,
             allow_rootless_docker,
@@ -4423,6 +4425,14 @@ mod precedence {
                 cli_on: None,
                 cli_off: None,
                 get: |r| r.refuse_invalid_repo_config,
+                default: false,
+                preset: None,
+            },
+            Ladder {
+                key: "sandbox.skip_untrusted_opencode_config",
+                cli_on: None,
+                cli_off: None,
+                get: |r| r.skip_untrusted_opencode_config,
                 default: false,
                 preset: None,
             },

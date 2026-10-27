@@ -10157,6 +10157,64 @@ paths = [
             assert_eq!(var("OPENCODE_DISABLE_MODELS_FETCH"), "1");
             assert_eq!(var("OPENCODE_DISABLE_AUTOUPDATE"), "1");
             assert!(!out.contains("OPENCODE_AUTH_CONTENT"), "{out}");
+            // #732 is opt-in: off by default, project config loads as before.
+            assert!(!out.contains("PROJECT_CONFIG"), "{out}");
+        }
+
+        /// #732: with the key on, an untrusted repo gets OpenCode's project
+        /// config switched off; a repo with a `cplt trust` approval does not.
+        #[test]
+        fn untrusted_repo_skips_project_config_when_opted_in() {
+            require_sandbox!();
+            let home = stub_home();
+            let cfg = home.h.join(".config/cplt/config.toml");
+            std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+            std::fs::write(&cfg, "[sandbox]\nskip_untrusted_opencode_config = true\n").unwrap();
+            let run = |extra: &[&str]| {
+                let mut args = extra.to_vec();
+                args.extend(["--", "env"]);
+                let o = home.cmd(&args).env("CPLT_CONFIG", &cfg).output().unwrap();
+                assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+                (
+                    String::from_utf8_lossy(&o.stdout).into_owned(),
+                    String::from_utf8_lossy(&o.stderr).into_owned(),
+                )
+            };
+            let skipped = |out: &str| {
+                out.contains("\nOPENCODE_DISABLE_PROJECT_CONFIG=1\n")
+                    && out.contains("\nOPENCODE_CONFIG_PROJECT_DISABLE=1\n")
+            };
+            let (out, err) = run(&[]);
+            assert!(skipped(&out), "{out}");
+            assert!(err.contains("not approved"), "{err}");
+            // Said once, not on every launch.
+            assert!(!run(&[]).1.contains("not approved"));
+
+            // An approval on file whose proposal no longer matches grants
+            // nothing at launch, so it does not trust the repo here either.
+            let mut entry = cplt::trust::TrustEntry::default();
+            entry.repo.git_dir = std::fs::canonicalize(home.proj.join(".git"))
+                .unwrap()
+                .display()
+                .to_string();
+            let file = home.h.join(format!(
+                ".config/cplt/trust/{}.toml",
+                cplt::trust::repo_fingerprint(&home.proj)
+            ));
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, toml::to_string(&entry).unwrap()).unwrap();
+            std::fs::write(
+                home.proj.join(".cplt.toml"),
+                "[propose]\nallow_localhost_any = true\n",
+            )
+            .unwrap();
+            assert!(git_ok(&home.proj, &["add", ".cplt.toml"]));
+            assert!(git_ok(&home.proj, &["commit", "-qm", "propose"]));
+            assert!(skipped(&run(&[]).0));
+
+            // An approved proposal trusts the repo: project config loads.
+            let (out, _) = run(&["--accept-repo-config"]);
+            assert!(!out.contains("PROJECT_CONFIG"), "{out}");
         }
 
         #[test]

@@ -87,6 +87,15 @@ const TUI_DIR: &str = "latest/tui";
 /// and the open tabs per directory.
 const TUI_FILES: [&str; 2] = ["highlights.json", "tabs.json"];
 
+/// Turn off OpenCode's project config: `.opencode` dirs (plugins included),
+/// `opencode.json(c)` and project `AGENTS.md`. v1 reads the second name
+/// (`packages/opencode/src/config/paths.ts`); v2 reads the first, falling back
+/// to the second (`packages/cli/src/server-process.ts`), so both are set.
+pub const PROJECT_CONFIG_OFF: [&str; 2] = [
+    "OPENCODE_CONFIG_PROJECT_DISABLE",
+    "OPENCODE_DISABLE_PROJECT_CONFIG",
+];
+
 /// An XDG base from the environment, ignoring a relative or empty value as the
 /// spec says, else `$HOME/<default>`.
 pub(crate) fn xdg_base(var: &str, home: &Path, default: &str) -> PathBuf {

@@ -387,6 +387,11 @@ impl PreparedSandbox {
         self.worktree_root = root.map(Path::to_path_buf);
     }
 
+    /// Set `vars` on the child last, after the sandbox environment (#732).
+    pub fn add_env(&mut self, vars: impl IntoIterator<Item = (String, String)>) {
+        self.extra_env.extend(vars);
+    }
+
     /// Name the broker socket to the child as `CPLT_WORKTREE_SOCKET`. Only
     /// meaningful with the root set: the profile grants the socket and the
     /// managed root together.

@@ -1978,6 +1978,9 @@ struct ResolvedContext {
     worktree_root: Option<PathBuf>,
     active_agent: agent::Agent,
     unapproved_proposals: Vec<String>,
+    /// The launch approved this repository's `.cplt.toml`: a current
+    /// `cplt trust` approval bound to it, or `--accept-repo-config` (#732).
+    repo_trusted: bool,
     /// `sandbox.quiet` as the user set it. `cplt doctor` forces the resolved
     /// one on to silence the summary, and reports this one.
     configured_quiet: bool,
@@ -3204,6 +3207,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
     // Kept for the warning below, which names what each unapproved key would
     // grant. `repos` in particular is opaque as a bare key name.
     let mut repo_propose = repo_config::ProposeSection::default();
+    let mut repo_trusted = false;
     match repo_config::load_repo_config(&project_dir) {
         Ok(Some(loaded)) => {
             if !resolved.quiet {
@@ -3265,6 +3269,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
 
             // Determine approved keys
             let approved_keys: Vec<String> = if cli.accept_repo_config {
+                repo_trusted = true;
                 // --accept-repo-config approves for ONE run and persists
                 // nothing. `repos` is the opposite shape: approving it writes
                 // named roots into the local config, which outlives the run. A
@@ -3281,6 +3286,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                 // `cplt trust show --json` and `cplt config show` use it too.
                 let entry = trust::load_trust(&project_dir);
                 let verdict = trust::verdict(entry.as_ref(), &project_dir, &loaded);
+                repo_trusted = verdict == trust::Verdict::Status(trust::ApprovalStatus::Current);
                 let proposes_nothing =
                     repo_config::proposed_keys(&loaded.config.propose).is_empty();
                 let nothing_proposed = !loaded.propose_dropped && proposes_nothing;
@@ -3766,6 +3772,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         worktree_root,
         active_agent,
         unapproved_proposals,
+        repo_trusted,
         configured_quiet,
     })
 }
@@ -4957,6 +4964,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         worktree_root,
         active_agent,
         unapproved_proposals,
+        repo_trusted,
         configured_quiet: _,
     } = resolve_context(&cli, false)?;
 
@@ -5186,6 +5194,40 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         }
         if let Some(w) = cplt::opencode_v2::first_run_gate(&home_dir) {
             ui::warn(&w);
+        }
+    }
+
+    // #732: a repository nobody approved does not get to configure OpenCode.
+    if active_agent == agent::Agent::OpenCode && resolved.skip_untrusted_opencode_config {
+        // v1 still reads project `.claude/skills` and `.agents/skills` with
+        // project config off; only this switch stops that, global ones too.
+        let skills_off = (!opencode_v2).then_some("OPENCODE_DISABLE_EXTERNAL_SKILLS");
+        let vars: Vec<&str> = cplt::opencode_v2::PROJECT_CONFIG_OFF
+            .into_iter()
+            .chain(skills_off)
+            .collect();
+        if !repo_trusted {
+            if let Some(name) = vars
+                .iter()
+                .find(|n| resolved.deny_env.iter().any(|d| d == *n))
+            {
+                bail!(
+                    "deny.env names {name}, which sandbox.skip_untrusted_opencode_config must \
+                     set (#732). Remove it from deny.env (check the repo's .cplt.toml)."
+                );
+            }
+            prepared.add_env(vars.iter().map(|n| ((*n).to_string(), "1".to_string())));
+        }
+        // Told once per change (output policy, "Changed"), not every launch.
+        let state = if repo_trusted { "loaded" } else { "skipped" };
+        if cplt::launch_state::changed(&home_dir, &project_dir, "opencode-project-config", state)
+            && !repo_trusted
+            && !resolved.quiet
+        {
+            ui::info(
+                "This repository's .cplt.toml is not approved, so OpenCode skips its project \
+                 config and plugins. `cplt trust accept` approves it.",
+            );
         }
     }
 
@@ -7274,6 +7316,7 @@ fn run_exec_command(
         repo_roots,
         worktree_root,
         unapproved_proposals,
+        repo_trusted: _,
         configured_quiet: _,
         // active_agent from resolve_context is ignored — exec always uses Shell
         active_agent: _,
@@ -7841,6 +7884,7 @@ fn run_check_command(
         worktree_root,
         active_agent,
         unapproved_proposals: _,
+        repo_trusted: _,
         configured_quiet: _,
         launch_dir: _,
     } = resolve_context(cli, true)?;
@@ -8738,6 +8782,7 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
         worktree_root,
         active_agent,
         unapproved_proposals,
+        repo_trusted: _,
         launch_dir: _,
         configured_quiet,
     } = ctx;

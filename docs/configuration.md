@@ -797,6 +797,7 @@ The settings below are machine-specific or local CLI preferences, so `.cplt.toml
 | `sandbox.deny_key_files_by_extension` | a staged hardening switch, see [Denying key files by extension](#denying-key-files-by-extension-sandboxdeny_key_files_by_extension) |
 | `sandbox.protect_pnpm_config` | a staged hardening switch, see [Protecting pnpm's global config](#protecting-pnpms-global-config-sandboxprotect_pnpm_config) |
 | `sandbox.refuse_invalid_repo_config` | decides how a repo's own broken config is treated, so the repo cannot set it; see [Refusing an invalid `.cplt.toml`](#refusing-an-invalid-cplttoml-sandboxrefuse_invalid_repo_config) |
+| `sandbox.skip_untrusted_opencode_config` | decides what an untrusted repo may configure, so the repo cannot set it; see [OpenCode project config in untrusted repositories](#opencode-project-config-in-untrusted-repositories-sandboxskip_untrusted_opencode_config) |
 | `sandbox.deny_copilot_dir_exec` | a staged hardening switch, see [No execute on `~/.copilot`](#no-execute-on-copilot-sandboxdeny_copilot_dir_exec) |
 | `sandbox.inherit_env` | too dangerous for repo config, it would affect every team member |
 | `sandbox.allow_build_credentials` | hands the agent the user's own registry tokens from `$HOME`, and a repo cannot grant home paths |
@@ -891,6 +892,20 @@ With the key on, cplt refuses to launch instead, for both cases: a file it canno
 It is off by default, and it is set in your own config, never in `.cplt.toml`. Turning it on means that anyone who can write a repository's `.cplt.toml` can stop every launch there. That includes an earlier agent session on either platform, in the launch repository or a named one. A session can commit a broken `.cplt.toml` into HEAD, and that commit shows in `git log`. On the Landlock-only Linux path a session can also edit the uncommitted working-tree file. The refusal is loud and names the file, so this can stop your work but cannot weaken the sandbox.
 
 The key catches broken or mistyped files. It is not a defence against an adversarial session: a session that can commit a broken file can just as easily commit a valid one with the `[deny]` section removed, and cplt applies that without complaint. With the key off, cplt launches as before.
+
+## OpenCode project config in untrusted repositories (`sandbox.skip_untrusted_opencode_config`)
+
+OpenCode reads configuration from the repository it runs in: `opencode.json` and `opencode.jsonc`, the `.opencode` directory (plugins, agents, commands) and the project's `AGENTS.md`. A plugin is code that runs inside the agent. A cloned repository can therefore change how the agent behaves, or switch off a plugin you rely on, without you doing anything ([#732](https://github.com/navikt/cplt/issues/732)).
+
+```bash
+cplt config set sandbox.skip_untrusted_opencode_config true
+```
+
+With the key on, an OpenCode launch in a repository whose `.cplt.toml` is not approved sets `OPENCODE_DISABLE_PROJECT_CONFIG=1` and `OPENCODE_CONFIG_PROJECT_DISABLE=1`. OpenCode then skips the repository's config files, `.opencode` directories and `AGENTS.md`, in 1.x and 2.x alike. Your global OpenCode config, plugins and `AGENTS.md` still load. OpenCode documents the variable in its [CLI reference](https://opencode.ai/docs/cli/#environment-variables); 2.x reads `OPENCODE_CONFIG_PROJECT_DISABLE` first and falls back to it ([`server-process.ts`](https://github.com/anomalyco/opencode/blob/v2.2.0/packages/cli/src/server-process.ts)). OpenCode 1.x still reads `.claude/skills` and `.agents/skills` in the repository with project config off, so for 1.x cplt also sets `OPENCODE_DISABLE_EXTERNAL_SKILLS=1`, which drops your global skills in those two directories as well. 2.x skips the repository's skills with project config and keeps your global ones. cplt prints one line when a repository switches between skipped and loaded, not on every launch.
+
+A repository counts as trusted when the launch applies its `.cplt.toml` proposals: a current `cplt trust accept` approval bound to this repository, or `--accept-repo-config` for one run. An approval copied onto the same origin URL in a different clone does not count, and neither does an approval the repository's `[propose]` section has changed since. An approval needs a `[propose]` section, so a repository without one stays untrusted while the key is on. `cplt exec` does not apply the key.
+
+The key is off by default, and it is set in your own config, never in `.cplt.toml`. If `deny.env` names either variable, the launch stops, because cplt cannot apply the key without them. Other agents are not affected.
 
 ## Symlinked cache-exec entries (`sandbox.refuse_cache_exec_links`)
 
