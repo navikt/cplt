@@ -173,21 +173,20 @@ Tools such as VS Code agent mode rely mainly on UI permissions. cplt enforces it
 | Linux backend | Landlock LSM (no deps, no namespaces) | bubblewrap (container via user namespaces) |
 | Environment filtering | Strict allowlist + suffix-deny (`_TOKEN`, `_SECRET`) | Inherits the parent env on macOS and Linux. Variables listed under `credentials.envVars` can be withheld or masked |
 | Credential dir protection | 15+ dirs denied by default | User must configure manually |
-| Resolved-address checks | Post-DNS IP checked against loopback, link-local and private ranges (RFC 1918) by default | Post-DNS IP checked against loopback, link-local, cloud metadata and the host's own addresses. Private ranges only when listed in `deniedResolvedAddresses` |
+| Resolved-address checks | Post-DNS IP checked against loopback, link-local, RFC 1918, CGNAT and IPv6 ULA ranges by default | Post-DNS IP checked against loopback, link-local, cloud metadata and the host's own addresses. Private ranges only when listed in `deniedResolvedAddresses` |
 | Network proxy | HTTP CONNECT + domain allow/block | HTTP + SOCKS5 + experimental TLS MITM |
 | SSH git | No key: agent socket denied at kernel on macOS, on Linux only `SSH_AUTH_SOCK` is withheld. The transport is not blocked, `ssh.github.com:443` is reachable | Proxied via SOCKS5 |
 | Package manager scripts | Blocked by default (`npm_config_ignore_scripts`, `pnpm_config_ignore_scripts`, `YARN_IGNORE_SCRIPTS`, `YARN_ENABLE_SCRIPTS`). Yarn 2+ still runs the project's own scripts | Not blocked |
 | Agent support | Copilot, OpenCode, Gemini, Antigravity, Pi, Claude Code, goose, DSH, Shell | Claude Code |
-| Credential injection | Opt-in placeholder GitHub token, real token restored at the proxy (`proxy.inject_github_token`) | Opt-in masking and injection at the proxy for listed variables, AWS SigV4 re-signing |
+| Credential injection | Opt-in placeholder GitHub token, real token restored at the proxy (`proxy.inject_github_token`) | Opt-in masking and injection at the proxy for listed variables, AWS SigV4 re-signing (`credentials.sigv4`) |
 | Config | TOML (global + per-repo) | JSON (`~/.srt-settings.json` or `--settings`) + `--control-fd` live updates |
 | Library API | ❌ Binary only | ✅ Embeddable TypeScript library |
 
-Both check where an allowed hostname resolves. The difference is private ranges: cplt blocks them by default, srt only when you list them. cplt has more on by default: env filtering, credential directory protection, lifecycle script blocking. srt is more flexible: SOCKS5, TLS inspection, per-request callbacks, library embedding. The Linux backend choice matters. bwrap needs workarounds on Ubuntu 24.04+ because of AppArmor userns restrictions, while Landlock requires kernel 5.13 or newer but has zero external dependencies.
+Both check where an allowed hostname resolves. They differ on private ranges: cplt blocks them by default, srt only when you list them. cplt has more on by default: env filtering, credential directory protection, lifecycle script blocking. srt is more flexible: SOCKS5, TLS inspection, per-request callbacks, library embedding. The Linux backend choice matters. bwrap needs workarounds on Ubuntu 24.04+ because of AppArmor userns restrictions, while Landlock requires kernel 5.13 or newer but has zero external dependencies.
 
 ### GitHub Copilot CLI's own sandbox
 
-Copilot CLI has a local sandbox, in public preview and included in the
-standard seat. It runs shell commands through Microsoft Execution Containers
+Copilot CLI has a local sandbox, included in the standard seat. It runs shell commands through Microsoft Execution Containers
 (MXC) with restricted filesystem, network and system access, on macOS, Linux
 and recent Windows 11 builds. It is off by default. `/sandbox enable` or
 `--sandbox` turns it on. With git and `gh` authentication enabled, sandboxed
@@ -221,7 +220,9 @@ filesystem or network rule has no opinion about them. cplt wraps `git` and
 `git_guard.mode = "warn"` to only warn.
 
 Running both is reasonable. MXC confines the process. The guards decide what
-the agent may do with the credentials it holds. The user documentation is on
+the agent may do with the credentials it holds.
+
+The user documentation is on
 [ki-utvikling.nav.no](https://ki-utvikling.nav.no/cplt).
 
 ### Honest gaps
