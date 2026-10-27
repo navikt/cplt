@@ -380,6 +380,8 @@ Or just run `/usr/local/bin/cplt` explicitly and skip PATH resolution entirely.
 
 ### Windows (WSL2)
 
+The step-by-step guide for Nav developers is [cplt on Windows (WSL2)](https://ki-utvikling.nav.no/cplt/windows) on ki-utvikling.nav.no. This section is the reference behind it.
+
 cplt has no Windows sandbox backend. Enforcement is Apple Seatbelt on macOS and Landlock LSM on Linux, so there is nothing to run natively on Windows. The supported route is [WSL2](https://learn.microsoft.com/windows/wsl/install), where cplt is an ordinary Linux install and the sandbox is kernel-enforced. Every Microsoft kernel branch builds `CONFIG_SECURITY_LANDLOCK=y` and lists `landlock` first in `CONFIG_LSM` ([`config-wsl`](https://github.com/microsoft/WSL2-Linux-Kernel/blob/master/arch/x86/configs/config-wsl)), shipped since kernel 5.15.57.1, and WSL's default kernel command line sets no `lsm=` override.
 
 In PowerShell, once:
