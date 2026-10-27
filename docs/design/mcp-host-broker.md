@@ -434,20 +434,42 @@ mechanism's status probe; no secret is printed.
   `~/Library/Keychains/login.keychain-db` and its `.sb-*` siblings; without
   it `security` exits 161 and the refresh is lost (measured 2026-10-25). Measured 2026-10-25: `nais auth
   print-access-token -n` exits 0 under the profile (network opened for the
-  check) with no file or keychain denials. - **Files (Linux):** `--ro-bind / /`, so reads are open as on macOS and
+  check) with no file or keychain denials.
+- **Files (Linux):** `--ro-bind / /`, so reads are open as on macOS and
   every write outside the grants fails with `EROFS`. Granted: a private
   tmpfs `/tmp` (`TMPDIR=/tmp`), the mechanism's `linux_write_dirs` under
   `XDG_CONFIG_HOME` (default `~/.config`; for `nais-keychain`,
-  `~/.config/nais`, created 0700 if missing) bound writable, and fresh
-  `/proc` and `/dev`. `/run`, and `XDG_RUNTIME_DIR` if it lives elsewhere,
-  are private tmpfs, which hides the system bus, a docker socket and the
-  rest of the host's runtime sockets. For a `keychain` mechanism the one
-  session-bus socket named by a `unix:path=` `DBUS_SESSION_BUS_ADDRESS` is
-  bound back (go-keyring reaches the Secret Service through it). An
-  abstract or TCP bus address is out of reach from the namespace, so on
-  such a host the keychain is unreachable and nais reports it is not
-  logged in. Unix sockets elsewhere under the read-only root (in `HOME`,
+  `~/.config/nais`, created 0700 if missing) bound writable, with
+  `XDG_CONFIG_HOME` set to that resolved dir, and fresh `/proc` and
+  `/dev`. `/run`, and `XDG_RUNTIME_DIR` if it lives elsewhere, are private
+  tmpfs, which hides the system bus, a docker socket and the rest of the
+  host's runtime sockets. On NixOS `/run/current-system` is restored as a
+  symlink to its store path, so `/run/current-system/sw/bin` still
+  resolves. Unix sockets elsewhere under the read-only root (in `HOME`,
   say) stay connectable.
+- **Session bus (Linux):** never the host bus itself. The unfiltered user
+  bus reaches `systemd --user` (`StartTransientUnit`) and D-Bus
+  activation, which is host exec. For a `keychain` mechanism the broker
+  runs `xdg-dbus-proxy` (trusted dirs only, never `PATH`) on a socket in
+  its 0700 session dir, as Flatpak does: `--filter
+  --talk=org.freedesktop.secrets`, nothing else. go-keyring makes every
+  call to the Secret Service (open session, search, unlock, the prompt
+  objects and their signals, get secret); the proxy itself passes the bus
+  driver's `Hello`, `AddMatch` and similar. bwrap binds that socket alone
+  at `/run/cplt-bus`, and the child gets
+  `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/cplt-bus`. A call to any other
+  name, `org.freedesktop.systemd1` included, or `StartServiceByName` for
+  one, is refused by the proxy (`tests: keychain_child_reaches_only_the_secret_service`).
+  The proxy's `--fd` pipe is bwrap's `--sync-fd`, so it exits with the
+  child. The host bus is the first `unix:path=` socket in
+  `DBUS_SESSION_BUS_ADDRESS` (or `$XDG_RUNTIME_DIR/bus` when that is
+  unset); an abstract or TCP address is out of reach. With no host bus,
+  or without xdg-dbus-proxy (one `FAIL` line in the broker log; `cplt
+  doctor` warns and `--fix` installs it), the child gets no bus and no
+  `DBUS_SESSION_BUS_ADDRESS`, and nais reports it is not logged in. Other
+  mechanisms never get a bus. Residual: anything the Secret Service
+  serves the user, every item of the login collection included, is
+  reachable through that one name.
 - The child is trusted code acting on attacker-chosen arguments.
 - **Stderr:** to the broker log (`--proxy-log`, and the terminal at
   `--proxy-log-level all`), at most 64 lines of 512 bytes per child, every
@@ -576,7 +598,7 @@ Attacker: the sandboxed agent or content steering it.
 | Agent connects to the socket | Intended; it can only pick a declared id |
 | Secret path leaks (remote kind) | Per-session, loopback, never logged; 128-bit, constant-time compare (`src/github_mcp.rs:208-220`) |
 | SSRF | Remote: pinned upstream, no redirects, https only (`src/github_mcp.rs:34`, `:377-391`). Child: egress pinned to `egressHosts` via the proxy, enforced by Seatbelt on macOS and by a bwrap network namespace on Linux (5.7) |
-| Host-exec through the child | Env cleared, egress pinned, read-only tools. macOS: child profile limits network to the proxy and writes to its own dirs. Linux: unsandboxed child |
+| Host-exec through the child | Env cleared, egress pinned, read-only tools. macOS: child profile limits network to the proxy and writes to its own dirs. Linux: bwrap child with no network but the proxy, a read-only root, and a session bus filtered to `org.freedesktop.secrets` |
 | Agent reads the credential directly (Linux) | Without active bubblewrap, Secret Service is reachable over D-Bus (SECURITY.md:1589-1606); see section 7 |
 | Header injection | Control bytes refused, auth and `X-MCP-*` stripped (`src/github_mcp.rs:225-250`) |
 | JSON-RPC smuggling | Every message parsed; batch arrays rejected; protocol version checked |
