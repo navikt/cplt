@@ -2579,13 +2579,15 @@ fn report_unix_socket_regime(
                 .unwrap_or_default()
         ));
     } else if bwrap_active && socket_masks == 0 {
-        // Only sockets that exist get a mask, so zero means none of the known
-        // paths exist or are visible to this user (#805).
+        // Only sockets that exist get a mask, so zero means none of the paths
+        // this run would mask exist or are visible to this user (#805). Docker
+        // sockets a docker key allows are not in that set; the container line
+        // above reports them.
         ui::info(
             "UNIX-socket connect is NOT kernel-enforced (needs Landlock ABI v9 / kernel 7.1). \
-             None of the known escape sockets (D-Bus, systemd, container runtimes) exist or \
-             are visible to this user, so Bubblewrap has nothing to mask; any other pathname \
-             socket on the host stays reachable.",
+             Bubblewrap masks no escape sockets: none of the ones it would mask (D-Bus, \
+             systemd, container runtimes not allowed by a docker key) exist or are visible \
+             to this user. Any other pathname socket on the host stays reachable.",
         );
     } else if bwrap_active {
         ui::info(&format!(
