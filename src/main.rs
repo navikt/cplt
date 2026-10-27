@@ -8061,7 +8061,7 @@ fn tracked_sensitive_files(project_dir: &Path, key_files_by_extension: bool) -> 
 /// Whether a file name matches [`sandbox::SENSITIVE_PROJECT_PATTERNS`].
 ///
 /// Hand-matched rather than compiled: those patterns are SBPL regex source for
-/// the macOS profile, and cplt has no regex engine linked. The list is seven
+/// the macOS profile, and cplt has no regex engine linked. The list is a few
 /// fixed shapes, so a `ends_with` each is the whole implementation — and
 /// `sensitive_basename_matches_the_profile_patterns` fails if the constant
 /// grows, so a new pattern cannot be silently unmatched here.
@@ -8070,10 +8070,17 @@ fn tracked_sensitive_files(project_dir: &Path, key_files_by_extension: bool) -> 
 /// (`sandbox.deny_key_files_by_extension`) is on, matching the profile.
 fn is_sensitive_basename(base: &str, by_extension: bool) -> bool {
     const KEYS: [&str; 5] = [".pem", ".key", ".p12", ".pfx", ".jks"];
+    const EXTRA_KEYS: [&str; 3] = [".p8", ".ppk", ".keystore"];
+    const SSH_KEYS: [&str; 4] = ["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"];
     base == ".env"
         || base.starts_with(".env.")
         || KEYS.contains(&base)
-        || (by_extension && KEYS.iter().any(|ext| base.ends_with(ext)))
+        || SSH_KEYS.contains(&base)
+        || (by_extension
+            && KEYS
+                .iter()
+                .chain(&EXTRA_KEYS)
+                .any(|ext| base.ends_with(ext)))
 }
 
 /// Whether any of `files` is sensitive only through
@@ -12999,13 +13006,13 @@ mod tests {
     fn sensitive_basename_matches_the_profile_patterns() {
         assert_eq!(
             sandbox::SENSITIVE_PROJECT_PATTERNS.len(),
-            7,
+            8,
             "a pattern was added or removed; teach `is_sensitive_basename` about it \
              and update this count"
         );
         assert_eq!(
             sandbox::SENSITIVE_KEY_FILE_EXTENSION_PATTERNS.len(),
-            5,
+            8,
             "a key file extension was added or removed; teach `is_sensitive_basename` \
              about it and update this count"
         );
@@ -13020,6 +13027,8 @@ mod tests {
                 ".p12",
                 ".pfx",
                 ".jks",
+                "id_rsa",
+                "id_ed25519",
             ] {
                 assert!(
                     is_sensitive_basename(name, by_ext),
@@ -13032,6 +13041,9 @@ mod tests {
                 ".envrc",
                 "README.md",
                 "monkey.jks.bak",
+                "id_rsa.pub",
+                "id_ed25519.pub",
+                "ca-bundle.crt",
             ] {
                 assert!(
                     !is_sensitive_basename(name, by_ext),
@@ -13048,6 +13060,9 @@ mod tests {
             "cert.p12",
             "cert.pfx",
             "keystore.jks",
+            "AuthKey_ABC123.p8",
+            "release.keystore",
+            "deploy.ppk",
         ] {
             assert!(
                 is_sensitive_basename(name, true),

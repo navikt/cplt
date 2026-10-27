@@ -1288,6 +1288,10 @@ pub const SENSITIVE_PROJECT_PATTERNS: &[&str] = &[
     r"\.p12$",
     r"\.pfx$",
     r"\.jks$",
+    // SSH private keys by their default names (#595). Only ever private keys
+    // (the public halves end in `.pub`), so unlike `*.pem` they are safe as a
+    // global default.
+    r"id_(rsa|dsa|ecdsa|ed25519)$",
 ];
 
 /// Private key file patterns that match by extension, added with
@@ -1316,6 +1320,9 @@ pub const SENSITIVE_KEY_FILE_EXTENSION_PATTERNS: &[&str] = &[
     r"[^/]*\.p12$",
     r"[^/]*\.pfx$",
     r"[^/]*\.jks$",
+    r"[^/]*\.p8$",
+    r"[^/]*\.ppk$",
+    r"[^/]*\.keystore$",
 ];
 
 /// Dependency trees where [`SENSITIVE_PROJECT_PATTERNS`] is collateral rather

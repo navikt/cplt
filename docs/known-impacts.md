@@ -242,7 +242,7 @@ automated handover/enforcement checks from live onboarding and renewal evidence.
 
 **macOS only.** Landlock cannot deny a file inside a granted directory, so on Linux these files stay readable and writable (the proxy's domain filtering limits where a read secret can be sent; nothing denies the read; see [security.md](security.md)).
 
-`.env` and `.env.*` files are **blocked from reading and writing** by default, and so are files named exactly `.pem`, `.key`, `.p12`, `.pfx` or `.jks`. A key file with a longer name, such as `server.pem`, is blocked only with [`sandbox.deny_key_files_by_extension`](configuration.md#denying-key-files-by-extension-sandboxdeny_key_files_by_extension). This stops a rogue agent exfiltrating secrets, but it has side effects.
+`.env` and `.env.*` files are **blocked from reading and writing** by default, and so are files named exactly `.pem`, `.key`, `.p12`, `.pfx` or `.jks`, and SSH private keys named `id_rsa`, `id_dsa`, `id_ecdsa` or `id_ed25519`. A key file with a longer name, such as `server.pem`, is blocked only with [`sandbox.deny_key_files_by_extension`](configuration.md#denying-key-files-by-extension-sandboxdeny_key_files_by_extension). This stops a rogue agent exfiltrating secrets, but it has side effects.
 
 **The rule is a pattern on the file name, not a location**, so it applies everywhere the sandbox can reach. The two extracted dependency stores are carved back out for *reading* (#477), because a `.env` there is package content. A `--deny-path` or `deny.paths` entry inside or above one of those stores still wins over the carve-out (#597). Everywhere else the name is enough to deny it:
 
