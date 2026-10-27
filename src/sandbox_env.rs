@@ -3,7 +3,7 @@
 //! Filters the parent environment through an allowlist and injects
 //! hardening variables (e.g. `TMPDIR`, `NODE_OPTIONS`).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::agent::Agent;
 
@@ -377,6 +377,96 @@ pub fn yarn1_ignore_scripts(
         .filter_map(|e| yarn_major_is_1(&e.path()))
         .collect();
     !kids.is_empty() && kids.iter().all(|&yarn1| yarn1)
+}
+
+/// The store to name in `pnpm_config_store_dir`, or `None` to leave pnpm alone
+/// (#637).
+///
+/// With no store configured, pnpm probes for one by creating `_tmp_*` directly
+/// in its home dir. cplt keeps the default `$PNPM_HOME` read-only (it is on
+/// `PATH`) and grants write only on its `store/`, so the probe fails and pnpm
+/// falls back to a `.pnpm-store` beside each project. Naming the store skips
+/// the probe and lands on the one pnpm picks outside the sandbox, which is
+/// already writable. No grant changes.
+///
+/// pnpm ranks the environment above every config file, so this backs off when
+/// any store setting is in sight: in the environment, the global config, or a
+/// `pnpm-workspace.yaml`/`.npmrc` in the launch dir, its ancestors or its
+/// direct subdirectories. A file that exists but cannot be read counts as a
+/// setting. Nothing is set unless the store already exists and no
+/// `deny.paths` entry overlaps it.
+///
+/// ponytail: a store setting more than one level below the launch dir is not
+/// seen and gets overridden. pnpm 10 reads `npm_config_store_dir` instead
+/// (which npm warns about), so it keeps the per-project store.
+pub fn pnpm_store_dir(
+    home: &Path,
+    launch_dir: &Path,
+    parent_env: &[(String, String)],
+    deny: &[PathBuf],
+) -> Option<PathBuf> {
+    let get = |k: &str| {
+        parent_env
+            .iter()
+            .find(|(n, v)| n == k && !v.is_empty())
+            .map(|(_, v)| PathBuf::from(v))
+    };
+    if parent_env
+        .iter()
+        .any(|(k, _)| k.to_ascii_lowercase().ends_with("config_store_dir"))
+    {
+        return None;
+    }
+    let default = if cfg!(target_os = "macos") {
+        home.join("Library/pnpm")
+    } else {
+        home.join(".local/share/pnpm")
+    };
+    // `$PNPM_HOME` is a relocatable tool root: read-only itself, `store/`
+    // writable, wherever it lives. Without it pnpm uses the default, except on
+    // Linux with `XDG_DATA_HOME` set, where cplt grants nothing for the store.
+    let pnpm_home = match get("PNPM_HOME") {
+        Some(h) if h.is_absolute() => h,
+        Some(_) => return None,
+        None if !cfg!(target_os = "macos") && get("XDG_DATA_HOME").is_some() => return None,
+        None => default,
+    };
+    let config_home = get("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config"));
+    let mut files = vec![
+        home.join("Library/Preferences/pnpm/config.yaml"),
+        config_home.join("pnpm/config.yaml"),
+        config_home.join("pnpm/rc"),
+    ];
+    let kids = std::fs::read_dir(launch_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path());
+    for dir in launch_dir.ancestors().map(Path::to_path_buf).chain(kids) {
+        files.push(dir.join("pnpm-workspace.yaml"));
+        files.push(dir.join(".npmrc"));
+    }
+    let sets_store = |f: &PathBuf| {
+        f.symlink_metadata().is_ok()
+            && crate::untrusted::read_regular_following(f, 1024 * 1024)
+                .ok()
+                .flatten()
+                .is_none_or(|s| s.contains("storeDir") || s.contains("store-dir"))
+    };
+    if files.iter().any(sets_store) {
+        return None;
+    }
+    // Landlock cannot grant a missing store, and its parent is read-only, so
+    // pnpm could not create it: leave pnpm to its per-project fallback.
+    // A deny on or around the store withholds its write grant (#597), so pnpm
+    // could not use it: keep the per-project fallback.
+    let store = pnpm_home.join("store");
+    let real = std::fs::canonicalize(&store).ok()?;
+    let denied = deny
+        .iter()
+        .any(|d| real.starts_with(d) || d.starts_with(&real) || store.starts_with(d));
+    (real.is_dir() && !denied).then_some(store)
 }
 
 /// `Some(true)` for a yarn 1 project, `Some(false)` for yarn 2+, `None` when
@@ -767,6 +857,72 @@ mod tests {
             "the default is unchanged: {:?}",
             not_asked.remove
         );
+    }
+
+    /// #637: name pnpm's default store unless a store setting is in sight.
+    #[test]
+    fn pnpm_store_dir_backs_off_for_any_store_setting() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        let proj = h.join("src/app");
+        std::fs::create_dir_all(proj.join("web")).unwrap();
+        std::fs::create_dir_all(h.join(".config/pnpm")).unwrap();
+        let env = |kv: &[(&str, &str)]| -> Vec<(String, String)> {
+            kv.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let default = if cfg!(target_os = "macos") {
+            h.join("Library/pnpm")
+        } else {
+            h.join(".local/share/pnpm")
+        };
+        let at = |e: &[(String, String)]| pnpm_store_dir(h, &proj, e, &[]);
+        assert_eq!(at(&[]), None, "no store yet");
+        std::fs::create_dir_all(default.join("store")).unwrap();
+        assert_eq!(at(&[]), Some(default.join("store")));
+        let pnpm_home = default.to_str().unwrap();
+        assert_eq!(
+            at(&env(&[("PNPM_HOME", pnpm_home)])),
+            Some(default.join("store"))
+        );
+        let other = h.join("opt/pnpm");
+        assert_eq!(
+            at(&env(&[("PNPM_HOME", other.to_str().unwrap())])),
+            None,
+            "no store"
+        );
+        std::fs::create_dir_all(other.join("store")).unwrap();
+        assert_eq!(
+            at(&env(&[("PNPM_HOME", other.to_str().unwrap())])),
+            Some(other.join("store")),
+            "relocated PNPM_HOME"
+        );
+        assert_eq!(at(&env(&[("PNPM_HOME", "rel/pnpm")])), None);
+        let real_default = std::fs::canonicalize(&default).unwrap();
+        assert_eq!(
+            pnpm_store_dir(h, &proj, &[], &[real_default]),
+            None,
+            "denied"
+        );
+        assert_eq!(at(&env(&[("pnpm_config_store_dir", "/x")])), None);
+        assert_eq!(at(&env(&[("NPM_CONFIG_STORE_DIR", "/x")])), None);
+
+        for f in [
+            proj.join("web/pnpm-workspace.yaml"),
+            proj.join("pnpm-workspace.yaml"),
+            h.join("src/.npmrc"),
+            h.join(".config/pnpm/config.yaml"),
+        ] {
+            std::fs::write(&f, "packages: []\n").unwrap();
+            assert!(at(&[]).is_some(), "{f:?} without a store setting");
+            std::fs::write(&f, "storeDir: /Volumes/x\n").unwrap();
+            assert_eq!(at(&[]), None, "{f:?}");
+            std::fs::remove_file(&f).unwrap();
+        }
+        // Unreadable counts as a setting.
+        std::fs::create_dir(proj.join(".npmrc")).unwrap();
+        assert_eq!(at(&[]), None);
     }
 
     /// yarn 1 reads `ignore-scripts` only from `YARN_IGNORE_SCRIPTS`; yarn 2+
