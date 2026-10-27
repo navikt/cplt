@@ -1678,6 +1678,7 @@ mod tests {
     /// xdg-dbus-proxy (CI: the mcp-broker-e2e job, under dbus-run-session).
     #[test]
     #[cfg(target_os = "linux")]
+    #[allow(clippy::disallowed_methods)] // /bin/sh, absolute
     fn keychain_child_reaches_only_the_secret_service() {
         let required = std::env::var("CPLT_TEST_REQUIRE_SESSION_BUS").as_deref() == Ok("1");
         let addr = std::env::var("DBUS_SESSION_BUS_ADDRESS").ok();
