@@ -393,8 +393,7 @@ pub fn yarn1_ignore_scripts(
 /// any store setting is in sight: in the environment, the global config, or a
 /// `pnpm-workspace.yaml`/`.npmrc` in the launch dir, its ancestors or its
 /// direct subdirectories. A file that exists but cannot be read counts as a
-/// setting. A non-default `$PNPM_HOME` is writable as a whole, so the probe
-/// works there and nothing is set.
+/// setting. Nothing is set unless the store already exists.
 ///
 /// ponytail: a store setting more than one level below the launch dir is not
 /// seen and gets overridden. pnpm 10 reads `npm_config_store_dir` instead
@@ -421,13 +420,15 @@ pub fn pnpm_store_dir(
     } else {
         home.join(".local/share/pnpm")
     };
-    let pnpm_home = get("PNPM_HOME").unwrap_or_else(|| match get("XDG_DATA_HOME") {
-        Some(d) if !cfg!(target_os = "macos") => d.join("pnpm"),
-        _ => default.clone(),
-    });
-    if pnpm_home != default {
-        return None;
-    }
+    // `$PNPM_HOME` is a relocatable tool root: read-only itself, `store/`
+    // writable, wherever it lives. Without it pnpm uses the default, except on
+    // Linux with `XDG_DATA_HOME` set, where cplt grants nothing for the store.
+    let pnpm_home = match get("PNPM_HOME") {
+        Some(h) if h.is_absolute() => h,
+        Some(_) => return None,
+        None if !cfg!(target_os = "macos") && get("XDG_DATA_HOME").is_some() => return None,
+        None => default,
+    };
     let config_home = get("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config"));
     let mut files = vec![
         home.join("Library/Preferences/pnpm/config.yaml"),
@@ -444,7 +445,6 @@ pub fn pnpm_store_dir(
         files.push(dir.join("pnpm-workspace.yaml"));
         files.push(dir.join(".npmrc"));
     }
-    files.push(home.join(".npmrc"));
     let sets_store = |f: &PathBuf| {
         f.symlink_metadata().is_ok()
             && crate::untrusted::read_regular_following(f, 1024 * 1024)
@@ -455,7 +455,10 @@ pub fn pnpm_store_dir(
     if files.iter().any(sets_store) {
         return None;
     }
-    Some(default.join("store"))
+    // Landlock cannot grant a missing store, and its parent is read-only, so
+    // pnpm could not create it: leave pnpm to its per-project fallback.
+    let store = pnpm_home.join("store");
+    store.is_dir().then_some(store)
 }
 
 /// `Some(true)` for a yarn 1 project, `Some(false)` for yarn 2+, `None` when
@@ -867,6 +870,8 @@ mod tests {
             h.join(".local/share/pnpm")
         };
         let at = |e: &[(String, String)]| pnpm_store_dir(h, &proj, e);
+        assert_eq!(at(&[]), None, "no store yet");
+        std::fs::create_dir_all(default.join("store")).unwrap();
         assert_eq!(at(&[]), Some(default.join("store")));
         let pnpm_home = default.to_str().unwrap();
         assert_eq!(
