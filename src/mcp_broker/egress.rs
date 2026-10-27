@@ -1,6 +1,6 @@
 //! The child's own CONNECT proxy, allowing only its `egressHosts`.
 
-use std::io::Write;
+use std::io::{Error, ErrorKind, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
@@ -38,28 +38,46 @@ const EGRESS_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One child connection to its egress proxy: a CONNECT head (read with the
 /// proxy's own reader, which leaves a pipelined ClientHello in the socket),
-/// the policy check, then the proxy's relay. Anything else gets 403.
+/// the policy check, then the proxy's relay. A refusal gets 403, a failed
+/// dial 502 (504 on a timeout).
 /// Addresses the proxy calls private (loopback, LAN, CGNAT, reserved) are
 /// never dialled, so an allowed name cannot steer the child inward.
 pub(crate) fn egress_tunnel(client: TcpStream, hosts: &[String], log: &Log, id: &str) {
     egress_tunnel_via(client, hosts, log, id, dial_public);
 }
 
+/// The dial's policy refusal: `host` resolves only to private addresses.
+#[derive(Debug)]
+struct NoPublicAddress;
+
+impl std::fmt::Display for NoPublicAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("no public address")
+    }
+}
+
+impl std::error::Error for NoPublicAddress {}
+
 /// Resolve `host` and connect to its first reachable public address.
-fn dial_public(host: &str) -> Result<TcpStream, String> {
+/// A host with no public address is refused ([`NoPublicAddress`]); any other
+/// error is a failed dial, of the kind of the last attempt.
+fn dial_public(host: &str) -> Result<TcpStream, Error> {
     let addrs: Vec<_> = (host, 443)
         .to_socket_addrs()
-        .map_err(|e| format!("{host}: {e}"))?
+        .map_err(|e| Error::new(e.kind(), format!("{host}: {e}")))?
         .filter(|a| !crate::proxy::is_private_ip(&a.ip()))
         .collect();
-    let mut last = String::from("no public address");
+    if addrs.is_empty() {
+        return Err(Error::other(NoPublicAddress));
+    }
+    let mut last = Error::other("unreachable");
     for a in &addrs {
         match TcpStream::connect_timeout(a, EGRESS_TIMEOUT) {
             Ok(s) => return Ok(s),
-            Err(e) => last = format!("{a}: {e}"),
+            Err(e) => last = Error::new(e.kind(), format!("{a}: {e}")),
         }
     }
-    Err(format!("CONNECT-FAIL {host} ({last})"))
+    Err(Error::new(last.kind(), format!("{host} ({last})")))
 }
 
 /// [`egress_tunnel`] with the upstream dial injected, so a test can reach an
@@ -69,7 +87,7 @@ fn egress_tunnel_via(
     hosts: &[String],
     log: &Log,
     id: &str,
-    dial: impl FnOnce(&str) -> Result<TcpStream, String>,
+    dial: impl FnOnce(&str) -> Result<TcpStream, Error>,
 ) {
     let _ = client.set_nonblocking(false);
     let _ = client.set_read_timeout(Some(EGRESS_TIMEOUT));
@@ -82,12 +100,31 @@ fn egress_tunnel_via(
         (Some("CONNECT"), Some(target)) => egress_allowed(target, hosts),
         _ => Err("only CONNECT is proxied".into()),
     };
-    let upstream = decision.and_then(|host| dial(&host));
-    let upstream = match upstream {
+    let deny = |mut client: TcpStream, why: String| {
+        log.line(id, &format!("egress → DENIED {why}"));
+        let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
+    };
+    let host = match decision {
+        Ok(h) => h,
+        Err(why) => return deny(client, why),
+    };
+    let upstream = match dial(&host) {
         Ok(u) => u,
-        Err(why) => {
-            log.line(id, &format!("egress → DENIED {why}"));
-            let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
+        Err(e)
+            if e.get_ref()
+                .is_some_and(<dyn std::error::Error + Send + Sync>::is::<NoPublicAddress>) =>
+        {
+            return deny(client, format!("{host} ({e})"));
+        }
+        Err(e) => {
+            // A network failure, not a policy refusal (#858).
+            log.line(id, &format!("egress → connect failed {e}"));
+            let status = if e.kind() == ErrorKind::TimedOut {
+                "504 Gateway Timeout"
+            } else {
+                "502 Bad Gateway"
+            };
+            let _ = write!(client, "HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n");
             return;
         }
     };
@@ -132,21 +169,25 @@ mod tests {
     }
 
     /// One CONNECT for `target` through [`egress_tunnel_via`]: the response
-    /// line, and the client end positioned after the response head.
+    /// line, the client end positioned after the response head, and what the
+    /// proxy logged.
     fn connect(
         target: &str,
         hosts: &[String],
-        dial: impl FnOnce(&str) -> Result<TcpStream, String> + Send + 'static,
-    ) -> (String, TcpStream) {
+        dial: impl FnOnce(&str) -> Result<TcpStream, Error> + Send + 'static,
+    ) -> (String, TcpStream, String) {
         use std::io::{BufRead, BufReader};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (server, _) = listener.accept().unwrap();
         let hosts = hosts.to_vec();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let file = Some(path.clone());
         std::thread::spawn(move || {
             let log = Log {
                 level: crate::proxy::ProxyLogLevel::None,
-                file: None,
+                file,
             };
             egress_tunnel_via(server, &hosts, &log, "t", dial);
         });
@@ -161,7 +202,9 @@ mod tests {
         r.read_line(&mut line).unwrap();
         let mut blank = String::new();
         r.read_line(&mut blank).unwrap();
-        (line.trim_end().to_string(), client)
+        // The proxy logs before it answers.
+        let log = std::fs::read_to_string(&path).unwrap_or_default();
+        (line.trim_end().to_string(), client, log)
     }
 
     /// Inside a cplt session localhost TCP is denied, as in the proxy tests.
@@ -188,9 +231,9 @@ mod tests {
             s.write_all(&buf).unwrap();
         });
         let hosts = vec!["example.org".to_string()];
-        let (line, mut client) = connect("api.example.org:443", &hosts, move |host| {
+        let (line, mut client, _) = connect("api.example.org:443", &hosts, move |host| {
             assert_eq!(host, "api.example.org");
-            TcpStream::connect(addr).map_err(|e| e.to_string())
+            TcpStream::connect(addr)
         });
         assert_eq!(line, "HTTP/1.1 200 Connection Established");
         client.write_all(b"hello").unwrap();
@@ -208,11 +251,51 @@ mod tests {
         // `localhost` passes the name check and resolves only to loopback,
         // which the real dial drops before connecting.
         assert_eq!(
-            dial_public("localhost").unwrap_err(),
-            "CONNECT-FAIL localhost (no public address)"
+            dial_public("localhost").unwrap_err().to_string(),
+            "no public address"
         );
         let hosts = vec!["localhost".to_string()];
-        let (line, _) = connect("localhost:443", &hosts, dial_public);
+        let (line, _, _) = connect("localhost:443", &hosts, dial_public);
         assert_eq!(line, "HTTP/1.1 403 Forbidden");
+    }
+
+    #[test]
+    fn a_failed_dial_is_a_gateway_error_not_a_denial() {
+        if localhost_tcp_blocked() {
+            return;
+        }
+        let hosts = vec!["example.org".to_string()];
+        // A refused port: bind, note the address, close.
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let (line, _, log) = connect("example.org:443", &hosts, move |_| TcpStream::connect(addr));
+        assert_eq!(line, "HTTP/1.1 502 Bad Gateway");
+        assert!(
+            log.contains("connect failed") && !log.contains("DENIED"),
+            "{log}"
+        );
+        let (line, _, log) = connect("example.org:443", &hosts, |_| {
+            Err(Error::new(ErrorKind::TimedOut, "timed out"))
+        });
+        assert_eq!(line, "HTTP/1.1 504 Gateway Timeout");
+        assert!(
+            log.contains("connect failed timed out") && !log.contains("DENIED"),
+            "{log}"
+        );
+        // A transport EACCES (a host firewall) is a failed dial too.
+        let (line, _, log) = connect("example.org:443", &hosts, |_| {
+            Err(Error::from(ErrorKind::PermissionDenied))
+        });
+        assert_eq!(line, "HTTP/1.1 502 Bad Gateway");
+        assert!(!log.contains("DENIED"), "{log}");
+        // A policy refusal never reaches the dial and keeps its 403.
+        let (line, _, log) = connect("evil.example.com:443", &hosts, |_| unreachable!());
+        assert_eq!(line, "HTTP/1.1 403 Forbidden");
+        assert!(
+            log.contains("egress → DENIED evil.example.com is not in egressHosts"),
+            "{log}"
+        );
     }
 }
