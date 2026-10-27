@@ -91,6 +91,19 @@ pub(super) fn apply_deny_env_and_credential(
 ///
 /// Runs after the deny sweep, so it skips denied names itself: `deny_env`
 /// must win over the session's own variables too (#814).
+/// Name pnpm's shared store for the child when that is safe (#637).
+fn apply_pnpm_store(cmd: &mut Command, sandbox: &super::PreparedSandbox, launch_dir: &Path) {
+    let parent_env: Vec<(String, String)> = std::env::vars().collect();
+    if let Some(store) = super::env::pnpm_store_dir(
+        &sandbox.home_dir,
+        launch_dir,
+        &parent_env,
+        &sandbox.extra_deny,
+    ) {
+        cmd.env("pnpm_config_store_dir", store);
+    }
+}
+
 /// Point Puppeteer at the executable `ms-playwright` cache on macOS (#742).
 fn apply_puppeteer_cache(
     cmd: &mut Command,
@@ -1495,6 +1508,7 @@ pub fn exec(
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
     apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
+    apply_pnpm_store(&mut cmd, sandbox, launch_dir);
     apply_puppeteer_cache(&mut cmd, sandbox, launch_dir, extra_pass_env);
     // Last env step: no real GitHub token may be set after it (#820).
     crate::token_inject::apply_to_child(&mut cmd, inherit_env);
@@ -1643,6 +1657,7 @@ pub fn exec(
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
     apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
+    apply_pnpm_store(&mut cmd, sandbox, launch_dir);
     apply_puppeteer_cache(&mut cmd, sandbox, launch_dir, extra_pass_env);
     // Last env step: no real GitHub token may be set after it (#820).
     crate::token_inject::apply_to_child(&mut cmd, inherit_env);
@@ -1884,6 +1899,7 @@ fn exec_bwrap(
     );
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
     apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
+    apply_pnpm_store(&mut cmd, sandbox, launch_dir);
     apply_puppeteer_cache(&mut cmd, sandbox, launch_dir, extra_pass_env);
     // Last env step: no real GitHub token may be set after it (#820).
     crate::token_inject::apply_to_child(&mut cmd, inherit_env);

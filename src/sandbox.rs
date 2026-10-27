@@ -338,6 +338,9 @@ pub struct PreparedSandbox {
     /// Whether the user explicitly re-allowed `$HOME/.npmrc` via `allow.read`.
     /// Suppresses the `NPM_CONFIG_USERCONFIG` redirect (see #180).
     npmrc_allowed: bool,
+    /// The user's `--deny-path`/`deny.paths`; a denied pnpm store is not named
+    /// to pnpm (#637).
+    extra_deny: Vec<PathBuf>,
     /// The credential forwarded into the sandbox in place of the Keychain
     /// grant, if any (#242). `None` on every run where the trade did not apply.
     pub(crate) keychain_substitute: Option<crate::agent::KeychainSubstitute>,
@@ -2504,6 +2507,7 @@ fn prepare_impl(
         allow_localhost: config.localhost_ports.to_vec(),
         allow_localhost_any: config.allow_localhost_any,
         npmrc_allowed: env::npmrc_explicitly_allowed(config.home_dir, config.extra_read),
+        extra_deny: config.extra_deny.to_vec(),
         keychain_substitute: config.keychain_substitute.clone(),
         worktree_root: None,
         worktree_socket: None,
@@ -3838,6 +3842,7 @@ fn prepare_impl(
         allow_localhost: config.localhost_ports.to_vec(),
         allow_localhost_any: config.allow_localhost_any,
         npmrc_allowed: env::npmrc_explicitly_allowed(config.home_dir, config.extra_read),
+        extra_deny: config.extra_deny.to_vec(),
         keychain_substitute: config.keychain_substitute.clone(),
         worktree_root: None,
         worktree_socket: None,
