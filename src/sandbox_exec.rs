@@ -213,7 +213,8 @@ fn configure_command(
     if super::env::playwright_mcp_sandbox_disabled(extra_pass_env, playwright_runtime) {
         cmd.env("PLAYWRIGHT_MCP_SANDBOX", "false");
     }
-    if let Some(dir) = super::env::puppeteer_cache_dir(home_dir, extra_pass_env, playwright_runtime)
+    if let Some(dir) =
+        super::env::puppeteer_cache_dir(home_dir, launch_dir, extra_pass_env, playwright_runtime)
     {
         cmd.env("PUPPETEER_CACHE_DIR", dir);
     }

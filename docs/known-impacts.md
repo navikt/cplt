@@ -630,7 +630,7 @@ CYPRESS_REMOTE_DEBUGGING_PORT=9333 cplt \
 
 Puppeteer downloads Chrome to `~/.cache/puppeteer`. On macOS cplt never allows
 exec there, and `--allow-cache-exec` only covers `~/Library/Caches/<subdir>`,
-so the launch fails with `Error: spawn EPERM`. Puppeteer also talks to Chrome
+so the launch fails with `Error: spawn EPERM`. (On Linux, `allow_cache_exec puppeteer` already covers `~/.cache/puppeteer`.) Puppeteer also talks to Chrome
 over a localhost WebSocket by default, which fails with
 `connect EPERM 127.0.0.1:<port>` (`mmdc` only prints `[object Object]`).
 
@@ -645,7 +645,7 @@ PUPPETEER_CACHE_DIR=~/Library/Caches/ms-playwright/puppeteer npx puppeteer brows
 ```
 
 Then launch with `"args": ["--no-sandbox"]` and `"pipe": true` and no
-`executablePath`. `--pass-env PUPPETEER_CACHE_DIR` keeps your own value instead.
+`executablePath`. cplt leaves the variable alone when a Puppeteer config (`.puppeteerrc*`, `puppeteer.config.*`, or a `puppeteer` key in `package.json`) sits in the launch dir or above it, since that may pin its own `cacheDirectory`; `--pass-env PUPPETEER_CACHE_DIR` also keeps your own value, or Puppeteer's default when you have none. Run the install from the project that has Puppeteer (or mermaid-cli) installed, so it fetches the build that version expects.
 
 The older route still works: point Puppeteer at Playwright's browser. A
 `puppeteer-config.json` for `mmdc -p`:

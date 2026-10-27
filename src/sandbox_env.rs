@@ -499,16 +499,40 @@ pub fn playwright_mcp_sandbox_disabled(
 /// `ms-playwright/puppeteer` is executable and gets the Chromium runtime rules
 /// already, so pointing Puppeteer there needs no new exec root. Playwright's
 /// cache cleanup only removes `<browser>-<rev>` dirs, so it leaves this one
-/// alone. `--pass-env PUPPETEER_CACHE_DIR` hands the choice back to the caller.
+/// alone. `--pass-env PUPPETEER_CACHE_DIR` hands the choice back to the
+/// caller, and a Puppeteer config file in the launch dir or above it (which
+/// may pin `cacheDirectory`, outranked by the variable) makes cplt back off.
 pub fn puppeteer_cache_dir(
     home: &Path,
+    launch_dir: &Path,
     extra_pass_env: &[String],
     playwright_runtime: bool,
 ) -> Option<PathBuf> {
     (cfg!(target_os = "macos")
         && playwright_runtime
-        && !extra_pass_env.iter().any(|v| v == "PUPPETEER_CACHE_DIR"))
+        && !extra_pass_env.iter().any(|v| v == "PUPPETEER_CACHE_DIR")
+        && !launch_dir.ancestors().any(has_puppeteer_config))
     .then(|| home.join("Library/Caches/ms-playwright/puppeteer"))
+}
+
+/// Whether `dir` holds a Puppeteer config (cosmiconfig names, or a
+/// `puppeteer` key in `package.json`).
+fn has_puppeteer_config(dir: &Path) -> bool {
+    let named = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|e| {
+            let n = e.file_name();
+            let n = n.to_string_lossy();
+            n.starts_with(".puppeteerrc") || n.starts_with("puppeteer.config.")
+        });
+    named
+        || crate::untrusted::read_untrusted(&dir.join("package.json"), 1024 * 1024)
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .is_some_and(|v| v.get("puppeteer").is_some())
 }
 
 /// Whether to tell Copilot CLI that this host cannot sandbox commands.
@@ -790,13 +814,35 @@ mod tests {
 
     #[test]
     fn puppeteer_cache_dir_needs_playwright_intent_on_macos() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path();
         let h = Path::new("/h");
+        let puppeteer_cache_dir = |h, e: &[String], on| puppeteer_cache_dir(h, p, e, on);
         assert_eq!(puppeteer_cache_dir(h, &[], false), None);
         let want =
             cfg!(target_os = "macos").then(|| h.join("Library/Caches/ms-playwright/puppeteer"));
         assert_eq!(puppeteer_cache_dir(h, &[], true), want);
         let own = vec!["PUPPETEER_CACHE_DIR".to_string()];
         assert_eq!(puppeteer_cache_dir(h, &own, true), None);
+        std::fs::write(
+            p.join("package.json"),
+            r#"{"devDependencies":{"puppeteer":"1"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            puppeteer_cache_dir(h, &[], true),
+            want,
+            "a dependency is not config"
+        );
+        std::fs::write(
+            p.join("package.json"),
+            r#"{"puppeteer":{"cacheDirectory":"x"}}"#,
+        )
+        .unwrap();
+        assert_eq!(puppeteer_cache_dir(h, &[], true), None);
+        std::fs::remove_file(p.join("package.json")).unwrap();
+        std::fs::write(p.join(".puppeteerrc.cjs"), "").unwrap();
+        assert_eq!(puppeteer_cache_dir(h, &[], true), None);
     }
 
     /// yarn 1 reads `ignore-scripts` only from `YARN_IGNORE_SCRIPTS`; yarn 2+
