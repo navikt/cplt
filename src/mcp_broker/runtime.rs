@@ -23,10 +23,11 @@ pub struct Log {
     pub file: Option<PathBuf>,
 }
 
-/// DENIED, auth and other failures reach the terminal at every level (D12);
+/// DENIED, failed egress dials, auth and other failures reach the terminal at every level (D12);
 /// the rest only at `--proxy-log-level all`.
 fn to_terminal(level: crate::proxy::ProxyLogLevel, text: &str) -> bool {
     text.contains("DENIED")
+        || text.contains("connect failed")
         || text.starts_with("FAIL")
         || text.starts_with("stopped")
         || level == crate::proxy::ProxyLogLevel::All
@@ -991,6 +992,10 @@ mod tests {
         use crate::proxy::ProxyLogLevel::{All, Blocked, None as Silent};
         for level in [Silent, Blocked, All] {
             assert!(to_terminal(level, "tools/call → DENIED tool"));
+            assert!(to_terminal(
+                level,
+                "egress → connect failed example.com (timed out)"
+            ));
             assert!(to_terminal(level, "egress → DENIED example.com"));
             assert!(to_terminal(level, "FAIL not logged in on the host."));
             assert!(to_terminal(level, "stopped after 3 restarts in a minute"));
