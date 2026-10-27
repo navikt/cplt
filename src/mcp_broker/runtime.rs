@@ -1673,6 +1673,87 @@ mod tests {
         );
     }
 
+    /// #849: a keychain server's bus is xdg-dbus-proxy, filtered to the
+    /// Secret Service. Runs where the host has a session bus, dbus-send and
+    /// xdg-dbus-proxy (CI: the mcp-broker-e2e job, under dbus-run-session).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn keychain_child_reaches_only_the_secret_service() {
+        let required = std::env::var("CPLT_TEST_REQUIRE_SESSION_BUS").as_deref() == Ok("1");
+        let addr = std::env::var("DBUS_SESSION_BUS_ADDRESS").ok();
+        let rt = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+        let ready = pick_session_bus(addr.as_deref(), rt.as_deref(), is_socket).is_some()
+            && crate::git::trusted_binary("xdg-dbus-proxy").is_some()
+            && crate::git::trusted_binary("dbus-send").is_some();
+        assert!(
+            ready || !required,
+            "no session bus, xdg-dbus-proxy or dbus-send"
+        );
+        if !ready {
+            return;
+        }
+        let send = "dbus-send --session --print-reply";
+        let ping = "/ org.freedesktop.DBus.Peer.Ping";
+        let start = "--dest=org.freedesktop.DBus / org.freedesktop.DBus.StartServiceByName \
+                     string:org.freedesktop.systemd1 uint32:0";
+        // Host control: the real bus answers for itself ("not provided by
+        // any .service files"); the proxy refuses with a bare error name.
+        let host = Command::new("/bin/sh")
+            .args([
+                "-c",
+                &format!("{send} --dest=org.freedesktop.systemd1 {ping} 2>&1"),
+            ])
+            .output()
+            .unwrap();
+        let host = String::from_utf8_lossy(&host.stdout);
+        assert!(host.contains("not provided by any"), "control: {host}");
+        let q = |cmd: &str| format!(r#"$({cmd} 2>&1 | tr -d '"\\\n')"#);
+        let b = sh_broker(&format!(
+            r#"read l; printf '{{"jsonrpc":"2.0","id":1,"result":{{"addr":"%s","secrets":"%s","systemd":"%s","start":"%s"}}}}\n' "$DBUS_SESSION_BUS_ADDRESS" "{}" "{}" "{}"; cat >/dev/null"#,
+            q(&format!("{send} --dest=org.freedesktop.secrets {ping}")),
+            q(&format!("{send} --dest=org.freedesktop.systemd1 {ping}")),
+            q(&format!("{send} {start}")),
+        ));
+        let (mut a, mut ra) = connect(&b);
+        writeln!(a, r#"{{"jsonrpc":"2.0","id":1,"method":"ping"}}"#).unwrap();
+        let mut l = String::new();
+        ra.read_line(&mut l).unwrap();
+        let v: Value = serde_json::from_str(&l).unwrap_or_else(|e| panic!("{e}: {l}"));
+        let r = &v["result"];
+        assert_eq!(r["addr"], "unix:path=/run/cplt-bus", "{l}");
+        // The Secret Service request reaches the real bus.
+        assert!(
+            r["secrets"]
+                .as_str()
+                .unwrap()
+                .contains("not provided by any"),
+            "{l}"
+        );
+        // systemd and activation of anything else are refused by the proxy.
+        for k in ["systemd", "start"] {
+            let got = r[k].as_str().unwrap();
+            assert!(
+                got.contains("ServiceUnknown") && !got.contains("not provided"),
+                "{k}: {l}"
+            );
+        }
+        // The proxy lives as long as the child.
+        let bus = b.shared.servers["io.github.nais/nais-mcp"]
+            .bus_socket
+            .clone();
+        assert!(UnixStream::connect(&bus).is_ok(), "proxy not up");
+        drop((a, ra));
+        wait_free(&b);
+        let start = Instant::now();
+        while UnixStream::connect(&bus).is_ok() {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "proxy outlived the child"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     #[test]
     fn no_egress_hosts_no_listener() {
         let script = r#"read l; printf '{"jsonrpc":"2.0","id":1,"result":{"p":"%s"}}\n' "$HTTPS_PROXY"; cat >/dev/null"#;

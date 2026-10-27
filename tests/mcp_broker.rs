@@ -42,6 +42,18 @@ def direct():
         if e.errno == errno.ENETUNREACH and sys.platform.startswith("linux"):
             return "blocked"
         return "error " + str(e.errno)
+def home_write():
+    # The Linux child's root is read-only: EROFS outside its grants.
+    try:
+        open(os.path.join(os.environ["HOME"], "x"), "w").close()
+        return "open"
+    except OSError as e:
+        return errno.errorcode.get(e.errno, str(e.errno))
+def sandbox():
+    if not sys.platform.startswith("linux"):
+        return ""
+    return ("|HOME:" + home_write() + "|TMP:" + ",".join(sorted(os.listdir("/tmp")))
+            + "|BUS:" + os.environ.get("DBUS_SESSION_BUS_ADDRESS", "none"))
 for line in sys.stdin:
     m = json.loads(line)
     if "id" not in m:
@@ -52,7 +64,7 @@ for line in sys.stdin:
     elif meth == "tools/list":
         r = {"tools": [{"name": "echo", "inputSchema": {}}, {"name": "delete_everything", "inputSchema": {}}]}
     elif meth == "tools/call" and m["params"]["name"] == "probe":
-        r = {"content": [{"type": "text", "text": "PROBE:" + probe("example.com:443") + "|" + probe("example.org:80") + "|DIRECT:" + direct()}]}
+        r = {"content": [{"type": "text", "text": "PROBE:" + probe("example.com:443") + "|" + probe("example.org:80") + "|DIRECT:" + direct() + sandbox()}]}
     elif meth == "tools/call":
         r = {"content": [{"type": "text", "text": "SERVER-RAN:" + m["params"]["name"]}]}
     else:
@@ -264,6 +276,15 @@ if sys.platform.startswith("linux"):
         }
         let probe = resp[4]["result"]["content"][0]["text"].as_str().unwrap();
         let (probe, direct) = probe.split_once("|DIRECT:").unwrap();
+        let (direct, sandbox) = direct.split_once('|').unwrap_or((direct, ""));
+        if cfg!(target_os = "linux") {
+            // Read-only root, a private /tmp holding only the egress socket,
+            // and no bus for a server whose credential is not the keychain.
+            assert_eq!(
+                sandbox, "HOME:EROFS|TMP:cplt-egress.sock|BUS:none",
+                "{stdout}"
+            );
+        }
         assert_eq!(
             probe, "PROBE:HTTP/1.1 403 Forbidden|HTTP/1.1 403 Forbidden",
             "{stdout}"
