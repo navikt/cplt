@@ -10186,9 +10186,9 @@ paths = [
             };
             let (out, err) = run(&[]);
             assert!(skipped(&out), "{out}");
-            assert!(err.contains("not approved"), "{err}");
+            assert!(err.contains("no approved proposals"), "{err}");
             // Said once, not on every launch.
-            assert!(!run(&[]).1.contains("not approved"));
+            assert!(!run(&[]).1.contains("no approved proposals"));
 
             // An approval on file whose proposal no longer matches grants
             // nothing at launch, so it does not trust the repo here either.
@@ -10212,9 +10212,67 @@ paths = [
             assert!(git_ok(&home.proj, &["commit", "-qm", "propose"]));
             assert!(skipped(&run(&[]).0));
 
+            // A retired approval (`trust accept --all`, kept for its linked
+            // repos) matches the proposal but approves no key: still skipped.
+            let propose: cplt::repo_config::ProposeSection =
+                toml::from_str("allow_localhost_any = true").unwrap();
+            entry.accepted.content_hash = cplt::trust::proposal_content_hash(&propose);
+            std::fs::write(&file, toml::to_string(&entry).unwrap()).unwrap();
+            assert!(skipped(&run(&[]).0));
+
             // An approved proposal trusts the repo: project config loads.
             let (out, _) = run(&["--accept-repo-config"]);
             assert!(!out.contains("PROJECT_CONFIG"), "{out}");
+        }
+
+        /// #732 on OpenCode 1.x: project skills ignore the project-config
+        /// switch there, so the skills switch is set too; denying any of the
+        /// three variables refuses the launch instead of dropping it.
+        #[test]
+        fn untrusted_repo_on_v1_also_turns_off_skills() {
+            require_sandbox!();
+            let home = home();
+            let stub = home.bin.join("opencode");
+            std::fs::write(&stub, STUB.replace("opencode v2.0.24", "1.19.4")).unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let cfg = home.h.join(".config/cplt/config.toml");
+            std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+            std::fs::write(&cfg, "[sandbox]\nskip_untrusted_opencode_config = true\n").unwrap();
+            let o = home
+                .cmd(&["--", "env"])
+                .env("CPLT_CONFIG", &cfg)
+                .output()
+                .unwrap();
+            let out = String::from_utf8_lossy(&o.stdout);
+            assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+            assert!(
+                out.contains("\nOPENCODE_DISABLE_EXTERNAL_SKILLS=1\n"),
+                "{out}"
+            );
+            assert!(
+                out.contains("\nOPENCODE_DISABLE_PROJECT_CONFIG=1\n"),
+                "{out}"
+            );
+            // A v1 session is not a v2 one.
+            assert!(!out.contains("opencode-v2"), "{out}");
+
+            // A repository's own [deny] cannot switch the key off.
+            std::fs::write(
+                home.proj.join(".cplt.toml"),
+                "[deny]\nenv = [\"OPENCODE_DISABLE_EXTERNAL_SKILLS\"]\n",
+            )
+            .unwrap();
+            assert!(git_ok(&home.proj, &["add", ".cplt.toml"]));
+            assert!(git_ok(&home.proj, &["commit", "-qm", "deny"]));
+            let o = home
+                .cmd(&["--", "echo RAN"])
+                .env("CPLT_CONFIG", &cfg)
+                .output()
+                .unwrap();
+            let err = String::from_utf8_lossy(&o.stderr);
+            assert!(!o.status.success(), "{err}");
+            assert!(!String::from_utf8_lossy(&o.stdout).contains("RAN"));
+            assert!(err.contains("OPENCODE_DISABLE_EXTERNAL_SKILLS"), "{err}");
         }
 
         #[test]

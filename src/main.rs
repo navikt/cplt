@@ -3286,7 +3286,9 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                 // `cplt trust show --json` and `cplt config show` use it too.
                 let entry = trust::load_trust(&project_dir);
                 let verdict = trust::verdict(entry.as_ref(), &project_dir, &loaded);
-                repo_trusted = verdict == trust::Verdict::Status(trust::ApprovalStatus::Current);
+                // A retired approval kept only for its linked repos is Current
+                // with no keys: it approves nothing, so it trusts nothing.
+                repo_trusted = !trust::granted_keys(entry.as_ref(), verdict).is_empty();
                 let proposes_nothing =
                     repo_config::proposed_keys(&loaded.config.propose).is_empty();
                 let nothing_proposed = !loaded.propose_dropped && proposes_nothing;
@@ -5225,8 +5227,8 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             && !resolved.quiet
         {
             ui::info(
-                "This repository's .cplt.toml is not approved, so OpenCode skips its project \
-                 config and plugins. `cplt trust accept` approves it.",
+                "This repository's .cplt.toml has no approved proposals, so OpenCode skips its \
+                 project config and plugins (sandbox.skip_untrusted_opencode_config).",
             );
         }
     }
