@@ -10700,8 +10700,8 @@ print('TCP_' + ('OK' if r == 0 else errno.errorcode.get(r, str(r))))
             writable: &'static [&'static str],
             /// Readable, not writable: read-only grants and persistence denies.
             read_only: &'static [&'static str],
-            /// A substring the stub's argv must contain.
-            argv: &'static str,
+            /// What cplt passes before the user args (exact, space-separated).
+            extra_args: &'static str,
         }
 
         fn run(c: &Case) {
@@ -10721,8 +10721,13 @@ print('TCP_' + ('OK' if r == 0 else errno.errorcode.get(r, str(r))))
             for rel in c.read_only {
                 put(rel, "RO-CONTENT");
             }
+            // HOME is deny-by-default, so the two in HOME only show nothing
+            // there leaks through a grant. The project is granted read/write:
+            // only the secret-file denies keep the last two out.
             put(".ssh/id_ed25519", SECRET);
             put(".aws/credentials", SECRET);
+            put("work/proj/.env", SECRET);
+            put("work/proj/id_ed25519", SECRET);
             put("outside/file", "x");
             let proj = h.join("work/proj");
             std::fs::create_dir_all(&proj).unwrap();
@@ -10743,7 +10748,7 @@ print('TCP_' + ('OK' if r == 0 else errno.errorcode.get(r, str(r))))
                     "cat '{rel}'; echo; echo y >> '{rel}' && echo 'WROTE:{rel}'"
                 );
             }
-            script += "cat .ssh/id_ed25519 .aws/credentials\n";
+            script += "cat .ssh/id_ed25519 .aws/credentials work/proj/.env work/proj/id_ed25519\n";
             script += "echo y >> outside/file && echo 'WROTE:outside'\n";
             script += "env; echo DONE; exit 7\n";
 
@@ -10772,7 +10777,10 @@ print('TCP_' + ('OK' if r == 0 else errno.errorcode.get(r, str(r))))
             let ctx = format!("[{}]\n{out}\n{err}", c.agent);
             assert_eq!(o.status.code(), Some(7), "{ctx}");
             assert!(out.contains("DONE"), "{ctx}");
-            assert!(out.contains(c.argv), "argv {:?}: {ctx}", c.argv);
+            assert!(
+                out.contains(&format!("ARGV:{}cd \"$HOME\"", c.extra_args)),
+                "argv: {ctx}"
+            );
             for rel in c.writable {
                 assert!(
                     out.contains(&format!("WROTE:{rel}\n")),
@@ -10809,7 +10817,7 @@ print('TCP_' + ('OK' if r == 0 else errno.errorcode.get(r, str(r))))
                 bin: "goose",
                 writable: &[".local/share/goose", ".local/state/goose"],
                 read_only: &[".config/goose/config.yaml"],
-                argv: "ARGV:",
+                extra_args: "",
             });
         }
 
@@ -10821,7 +10829,7 @@ print('TCP_' + ('OK' if r == 0 else errno.errorcode.get(r, str(r))))
                 bin: "dsh",
                 writable: &[".dsh", ".dsh/profiles/default"],
                 read_only: &[".dsh/cordis.patch.yml"],
-                argv: "ARGV:",
+                extra_args: "",
             });
         }
 
@@ -10836,7 +10844,7 @@ print('TCP_' + ('OK' if r == 0 else errno.errorcode.get(r, str(r))))
                     ".gemini/config/hooks.json",
                     ".gemini/config/mcp_config.json",
                 ],
-                argv: "ARGV:",
+                extra_args: "",
             });
         }
 
@@ -10848,7 +10856,7 @@ print('TCP_' + ('OK' if r == 0 else errno.errorcode.get(r, str(r))))
                 bin: "claude",
                 writable: &[".claude"],
                 read_only: &[".claude/settings.json", ".claude/statusline.sh"],
-                argv: "ARGV:",
+                extra_args: "",
             });
         }
 
@@ -10860,7 +10868,7 @@ print('TCP_' + ('OK' if r == 0 else errno.errorcode.get(r, str(r))))
                 bin: "copilot",
                 writable: &[".copilot", ".copilot/session-state"],
                 read_only: &[".copilot/settings.json", ".copilot/mcp-config.json"],
-                argv: "--no-auto-update",
+                extra_args: "--no-auto-update ",
             });
         }
 
@@ -10872,7 +10880,7 @@ print('TCP_' + ('OK' if r == 0 else errno.errorcode.get(r, str(r))))
                 bin: "pi",
                 writable: &[".pi/agent/sessions"],
                 read_only: &[".pi/agent/settings.json"],
-                argv: "ARGV:",
+                extra_args: "",
             });
         }
     }
