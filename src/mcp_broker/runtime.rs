@@ -1697,8 +1697,10 @@ mod tests {
         let ping = "/ org.freedesktop.DBus.Peer.Ping";
         let start = "--dest=org.freedesktop.DBus / org.freedesktop.DBus.StartServiceByName \
                      string:org.freedesktop.systemd1 uint32:0";
-        // Host control: the real bus answers for itself ("not provided by
-        // any .service files"); the proxy refuses with a bare error name.
+        // The proxy refuses with a bare error name; the real bus answers
+        // for itself (no service file, or a failed activation on a host
+        // that can activate systemd). The host's own answer is the control.
+        let refused = "ServiceUnknown: org.freedesktop.DBus.Error.ServiceUnknown";
         let host = Command::new("/bin/sh")
             .args([
                 "-c",
@@ -1707,7 +1709,10 @@ mod tests {
             .output()
             .unwrap();
         let host = String::from_utf8_lossy(&host.stdout);
-        assert!(host.contains("not provided by any"), "control: {host}");
+        assert!(
+            host.starts_with("Error ") && !host.contains(refused),
+            "control: {host}"
+        );
         let q = |cmd: &str| format!(r#"$({cmd} 2>&1 | tr -d '"\\\n')"#);
         let b = sh_broker(&format!(
             r#"read l; printf '{{"jsonrpc":"2.0","id":1,"result":{{"addr":"%s","secrets":"%s","systemd":"%s","start":"%s"}}}}\n' "$DBUS_SESSION_BUS_ADDRESS" "{}" "{}" "{}"; cat >/dev/null"#,
@@ -1723,20 +1728,12 @@ mod tests {
         let r = &v["result"];
         assert_eq!(r["addr"], "unix:path=/run/cplt-bus", "{l}");
         // The Secret Service request reaches the real bus.
-        assert!(
-            r["secrets"]
-                .as_str()
-                .unwrap()
-                .contains("not provided by any"),
-            "{l}"
-        );
+        let secrets = r["secrets"].as_str().unwrap();
+        assert!(!secrets.contains(refused), "{l}");
         // systemd and activation of anything else are refused by the proxy.
         for k in ["systemd", "start"] {
             let got = r[k].as_str().unwrap();
-            assert!(
-                got.contains("ServiceUnknown") && !got.contains("not provided"),
-                "{k}: {l}"
-            );
+            assert!(got.contains(refused), "{k}: {l}");
         }
         // The proxy lives as long as the child.
         let bus = b.shared.servers["io.github.nais/nais-mcp"]
