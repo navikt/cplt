@@ -1113,7 +1113,7 @@ preset = \"full-trust\"\n",
     /// Runs a git command in `dir` with a fixed identity, for the loader tests.
     #[allow(clippy::disallowed_methods)] // test fixture: PATH is the harness's, not an agent's
     fn git_in(dir: &Path, args: &[&str]) {
-        let ok = std::process::Command::new("git")
+        let ok = std::process::Command::new(crate::git::trusted_git().expect("trusted git"))
             .args(args)
             .current_dir(dir)
             .env("GIT_AUTHOR_NAME", "t")

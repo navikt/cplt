@@ -33,6 +33,17 @@ mod e2e_tests {
 
     static FAKE_COPILOT_COUNTER: AtomicU32 = AtomicU32::new(0);
 
+    /// A fixture-name suffix unique across processes. The counter alone
+    /// repeats in every run, so two suites running at once (another worktree,
+    /// a parallel `mise run`) wiped and reused each other's temp dirs (#713).
+    fn next_id() -> String {
+        format!(
+            "{}-{}",
+            std::process::id(),
+            FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
     /// Check if `copilot` CLI is available. Tests that require it should call this
     /// and return early if false — allows the test suite to pass in CI where
     /// Copilot CLI is not installed.
@@ -2885,10 +2896,8 @@ mod e2e_tests {
 
     #[test]
     fn e2e_config_validate_no_config_succeeds() {
-        let fake_home = std::env::temp_dir().join(format!(
-            ".cplt-e2e-config-validate-{}",
-            FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
+        let fake_home =
+            std::env::temp_dir().join(format!(".cplt-e2e-config-validate-{}", next_id()));
         let _ = std::fs::remove_dir_all(&fake_home);
         std::fs::create_dir_all(&fake_home).unwrap();
 
@@ -2918,10 +2927,7 @@ mod e2e_tests {
 
     #[test]
     fn e2e_config_validate_valid_config_succeeds() {
-        let fake_home = std::env::temp_dir().join(format!(
-            ".cplt-e2e-config-valid-{}",
-            FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
+        let fake_home = std::env::temp_dir().join(format!(".cplt-e2e-config-valid-{}", next_id()));
         let _ = std::fs::remove_dir_all(&fake_home);
         std::fs::create_dir_all(&fake_home).unwrap();
 
@@ -3011,10 +3017,7 @@ mod e2e_tests {
 
     #[test]
     fn e2e_config_validate_typo_fails() {
-        let fake_home = std::env::temp_dir().join(format!(
-            ".cplt-e2e-config-typo-{}",
-            FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
+        let fake_home = std::env::temp_dir().join(format!(".cplt-e2e-config-typo-{}", next_id()));
         let _ = std::fs::remove_dir_all(&fake_home);
         std::fs::create_dir_all(&fake_home).unwrap();
 
@@ -3042,10 +3045,7 @@ mod e2e_tests {
 
     #[test]
     fn e2e_config_show_displays_config() {
-        let fake_home = std::env::temp_dir().join(format!(
-            ".cplt-e2e-config-show-{}",
-            FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
+        let fake_home = std::env::temp_dir().join(format!(".cplt-e2e-config-show-{}", next_id()));
         let _ = std::fs::remove_dir_all(&fake_home);
         std::fs::create_dir_all(&fake_home).unwrap();
 
@@ -3086,10 +3086,8 @@ mod e2e_tests {
     /// not print `forced = false` and an `allow_localhost_any` that seems to apply.
     #[test]
     fn e2e_config_show_marks_localhost_any_ignored_under_strict() {
-        let fake_home = std::env::temp_dir().join(format!(
-            ".cplt-e2e-config-show-strict-{}",
-            FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
+        let fake_home =
+            std::env::temp_dir().join(format!(".cplt-e2e-config-show-strict-{}", next_id()));
         let _ = std::fs::remove_dir_all(&fake_home);
         std::fs::create_dir_all(&fake_home).unwrap();
         let config_file = fake_home.join("config.toml");
@@ -3134,10 +3132,8 @@ mod e2e_tests {
     /// file value, not the resolver's.
     #[test]
     fn e2e_config_show_reports_preset_resolved_toggles() {
-        let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
-            "cplt-e2e-config-show-preset-{}",
-            FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
+        let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("cplt-e2e-config-show-preset-{}", next_id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let config_file = dir.join("config.toml");
@@ -3234,10 +3230,8 @@ mod e2e_tests {
 
     #[test]
     fn e2e_config_show_no_config_shows_defaults() {
-        let fake_home = std::env::temp_dir().join(format!(
-            ".cplt-e2e-config-show-none-{}",
-            FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
+        let fake_home =
+            std::env::temp_dir().join(format!(".cplt-e2e-config-show-none-{}", next_id()));
         let _ = std::fs::remove_dir_all(&fake_home);
         std::fs::create_dir_all(&fake_home).unwrap();
 
@@ -3265,10 +3259,7 @@ mod e2e_tests {
 
     #[test]
     fn e2e_config_init_creates_file() {
-        let fake_home = std::env::temp_dir().join(format!(
-            ".cplt-e2e-config-init-{}",
-            FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
+        let fake_home = std::env::temp_dir().join(format!(".cplt-e2e-config-init-{}", next_id()));
         let _ = std::fs::remove_dir_all(&fake_home);
         std::fs::create_dir_all(&fake_home).unwrap();
 
@@ -3294,10 +3285,8 @@ mod e2e_tests {
 
     #[test]
     fn e2e_config_init_refuses_overwrite() {
-        let fake_home = std::env::temp_dir().join(format!(
-            ".cplt-e2e-config-init-ow-{}",
-            FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
+        let fake_home =
+            std::env::temp_dir().join(format!(".cplt-e2e-config-init-ow-{}", next_id()));
         let _ = std::fs::remove_dir_all(&fake_home);
         let config_dir = fake_home.join(".config/cplt");
         std::fs::create_dir_all(&config_dir).unwrap();
@@ -3321,10 +3310,8 @@ mod e2e_tests {
     #[test]
     fn e2e_init_config_flag_still_works() {
         // Verify the legacy --init-config flag still works
-        let fake_home = std::env::temp_dir().join(format!(
-            ".cplt-e2e-init-config-legacy-{}",
-            FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
+        let fake_home =
+            std::env::temp_dir().join(format!(".cplt-e2e-init-config-legacy-{}", next_id()));
         let _ = std::fs::remove_dir_all(&fake_home);
         std::fs::create_dir_all(&fake_home).unwrap();
 
@@ -4763,10 +4750,7 @@ mod e2e_tests {
     // ── config set --repo e2e tests ──────────────────────────────
 
     fn make_repo_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            ".cplt-e2e-repo-{label}-{}",
-            FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
+        let dir = std::env::temp_dir().join(format!(".cplt-e2e-repo-{label}-{}", next_id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // Initialize git repo (required for repo detection)
@@ -5921,9 +5905,14 @@ paths = [
     /// Create a git repo with a committed .cplt.toml and an isolated config dir.
     /// Returns (repo_dir, config_file_path).
     fn make_trust_repo(label: &str, cplt_toml_content: &str) -> (PathBuf, PathBuf) {
-        let id = FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let repo = std::env::temp_dir().join(format!(".cplt-e2e-trust-{label}-{id}"));
-        let _ = std::fs::remove_dir_all(&repo);
+        let id = next_id();
+        // In a parent of its own: the propose/link tests create sibling
+        // repositories beside it (`e2e-model`, `e2e-claim`, ...), and in the
+        // shared temp dir every concurrent test's repo was a sibling too.
+        let repo = std::env::temp_dir()
+            .join(format!(".cplt-e2e-trust-{label}-{id}"))
+            .join("repo");
+        let _ = std::fs::remove_dir_all(repo.parent().unwrap());
         std::fs::create_dir_all(&repo).unwrap();
 
         // Init git repo and commit .cplt.toml
@@ -7902,10 +7891,8 @@ paths = [
     #[test]
     fn e2e_exec_does_not_warn_about_an_agent_it_does_not_run() {
         require_sandbox!();
-        let fake_home = std::env::temp_dir().join(format!(
-            ".cplt-e2e-exec-agent-warn-{}",
-            FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
+        let fake_home =
+            std::env::temp_dir().join(format!(".cplt-e2e-exec-agent-warn-{}", next_id()));
         let _ = std::fs::remove_dir_all(&fake_home);
         std::fs::create_dir_all(fake_home.join(".copilot")).unwrap();
         std::fs::create_dir_all(fake_home.join(".rustup")).unwrap();

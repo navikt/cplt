@@ -826,7 +826,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
         let git = |args: &[&str]| {
-            std::process::Command::new("git")
+            std::process::Command::new(crate::git::trusted_git().expect("trusted git"))
                 .current_dir(repo)
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .env("GIT_CONFIG_NOSYSTEM", "1")

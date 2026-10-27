@@ -856,7 +856,7 @@ mod tests {
 
     #[allow(clippy::disallowed_methods)] // test fixture setup, isolated config
     fn git_in(dir: &Path, args: &[&str]) -> bool {
-        std::process::Command::new("git")
+        std::process::Command::new(crate::git::trusted_git().expect("trusted git"))
             .args(args)
             .current_dir(dir)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
