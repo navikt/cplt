@@ -1294,6 +1294,9 @@ pub const SENSITIVE_PROJECT_PATTERNS: &[&str] = &[
     r"id_(rsa|dsa|ecdsa|ed25519)$",
 ];
 
+/// The SSH private key names [`SENSITIVE_PROJECT_PATTERNS`] denies (#595).
+pub const SSH_PRIVATE_KEY_NAMES: &[&str] = &["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"];
+
 /// Private key file patterns that match by extension, added with
 /// `sandbox.deny_key_files_by_extension`.
 ///

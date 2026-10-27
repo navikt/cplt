@@ -3571,7 +3571,7 @@ fn profile_allows_env_files_when_flag_set() {
     );
 }
 
-const KEY_FILE_EXTENSIONS: &[&str] = &["pem", "key", "p12", "pfx", "jks"];
+const KEY_FILE_EXTENSIONS: &[&str] = &["pem", "key", "p12", "pfx", "jks", "p8", "ppk", "keystore"];
 
 #[test]
 fn profile_omits_key_file_extension_denies_by_default() {
