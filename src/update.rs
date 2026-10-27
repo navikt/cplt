@@ -710,14 +710,21 @@ fn extract_archive(archive: &Path, dest: &Path) -> Result<(), UpdateError> {
     }
 }
 
-/// Staging base for downloads, relative to `$HOME`.
+/// Staging base for downloads: `update/` in cplt's state dir, the XDG one
+/// unless it was pinned out of a grant (#851).
 ///
 /// Deliberately *not* the system temp directory. Every cplt sandbox can write
 /// throughout `/tmp` and `/var/folders`, so a same-UID process could swap the
-/// archive or the extracted binary between validation and use. `~/.config/cplt`
-/// is a hard deny for sandboxed agents (see `sandbox_policy::DENIED_DOTFILES`),
-/// which takes that reach away.
-const STAGE_BASE: &str = ".config/cplt/update";
+/// archive or the extracted binary between validation and use. cplt's state
+/// dirs are a hard deny for sandboxed agents (see
+/// `sandbox_policy::cplt_state_dir_grant`), which takes that reach away.
+fn stage_base(home: &Path) -> PathBuf {
+    let root = match crate::config::xdg_config_root(home) {
+        Some(_) => crate::sandbox::cplt_state_dir(home),
+        None => home.join(crate::sandbox::CPLT_STATE_DIR),
+    };
+    root.join("update")
+}
 
 /// Create a private staging directory for the update process.
 ///
@@ -726,7 +733,7 @@ const STAGE_BASE: &str = ".config/cplt/update";
 /// than adopting a directory someone else planted — the "check then create"
 /// version this replaces did adopt it.
 fn create_stage_dir(home: &Path) -> Result<PathBuf, UpdateError> {
-    let base = home.join(STAGE_BASE);
+    let base = stage_base(home);
     std::fs::create_dir_all(&base)
         .map_err(|e| UpdateError::Io(format!("Cannot create staging base: {e}")))?;
 
@@ -737,11 +744,14 @@ fn create_stage_dir(home: &Path) -> Result<PathBuf, UpdateError> {
         .map_err(|e| UpdateError::Io(format!("Cannot canonicalize home dir: {e}")))?;
     let canonical_base = std::fs::canonicalize(&base)
         .map_err(|e| UpdateError::Io(format!("Cannot canonicalize staging base: {e}")))?;
-    if canonical_base != canonical_home.join(STAGE_BASE) {
+    let expected = base
+        .strip_prefix(home)
+        .map_or_else(|_| base.clone(), |rel| canonical_home.join(rel));
+    if canonical_base != expected {
         return Err(UpdateError::Io(format!(
             "Staging base resolved to {} but expected {}. An ancestor may be a symlink",
             canonical_base.display(),
-            canonical_home.join(STAGE_BASE).display()
+            expected.display()
         )));
     }
     crate::scratch::validate_dir_safety(&canonical_base, "Update staging base")
@@ -996,16 +1006,21 @@ mod tests {
     #[test]
     fn stage_dir_is_private_unpredictable_and_exclusive() {
         let home = tempfile::tempdir().expect("tempdir");
-        let a = create_stage_dir(home.path()).expect("first stage dir");
-        let b = create_stage_dir(home.path()).expect("second stage dir");
+        let (a, b) = crate::with_env_lock_no_xdg(|| {
+            (
+                create_stage_dir(home.path()).expect("first stage dir"),
+                create_stage_dir(home.path()).expect("second stage dir"),
+            )
+        });
 
         // Under cplt's own config dir, never the system temp dir: every cplt
         // sandbox can write throughout /tmp and /var/folders, and `.config/cplt`
         // is a hard deny (see `profile_denies_write_to_cplt_config_dir`).
         // Asserted against the caller's home rather than `env::temp_dir()`,
         // because the fake home in this test is itself a temp directory.
-        assert_eq!(STAGE_BASE, ".config/cplt/update");
-        let base = std::fs::canonicalize(home.path()).unwrap().join(STAGE_BASE);
+        let base = std::fs::canonicalize(home.path())
+            .unwrap()
+            .join(".config/cplt/update");
         assert!(
             a.starts_with(&base),
             "stage dir {} is not under {}",

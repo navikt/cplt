@@ -104,17 +104,18 @@ pub use policy::{
     PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir,
     Protected, ResolvedToolDir, SENSITIVE_KEY_FILE_EXTENSION_PATTERNS, SENSITIVE_PROJECT_PATTERNS,
     TOOL_PATH_ENV_VARS, TOOL_READ_DIRS, ToolPathEnvVar, ToolPathOverride, ToolRoot,
-    active_tool_dirs, app_dirs, build_credential_grants, copilot_default_pkg_dir, copilot_pkg_dir,
-    copilot_pkg_dirs, copilot_ro_protect_paths, cplt_state_dir, cplt_state_file,
-    credential_link_hop, current_uid, cypress_app_data_dir, cypress_app_data_dir_with_env,
-    cypress_runtime_intent, dir_overlaps_credentials, exec_write_conflicts,
-    first_party_read_target, home_config_link_targets, home_tool_dirs, linux_docker_socket_paths,
-    linux_rootless_socket_paths, linux_runtime_dirs, mise_ro_protect_paths, nested_alternation,
-    no_cache_env, no_exec_temp_dir_over, no_exec_tool_dir_over, path_bin_dirs,
-    pin_legacy_state_dir_if_inside, playwright_runtime_intent, process_env,
-    relocatable_tool_prefix, report_state_pinned, shim_ro_protect_paths, socket_mask_paths,
-    state_pinned_message, tool_override_path_is_safe, tool_path_env_overrides,
-    validate_playwright_socket_dir, validate_sbpl_path, xdg_runtime_dir_env, xdg_state_dir,
+    XDG_PINNED_MARKER, active_tool_dirs, app_dirs, build_credential_grants,
+    copilot_default_pkg_dir, copilot_pkg_dir, copilot_pkg_dirs, copilot_ro_protect_paths,
+    cplt_state_dir, cplt_state_file, credential_link_hop, current_uid, cypress_app_data_dir,
+    cypress_app_data_dir_with_env, cypress_runtime_intent, dir_overlaps_credentials,
+    exec_write_conflicts, first_party_read_target, home_config_link_targets, home_tool_dirs,
+    linux_docker_socket_paths, linux_rootless_socket_paths, linux_runtime_dirs,
+    mise_ro_protect_paths, nested_alternation, no_cache_env, no_exec_temp_dir_over,
+    no_exec_tool_dir_over, path_bin_dirs, pin_legacy_state_dir_if_inside,
+    playwright_runtime_intent, process_env, relocatable_tool_prefix, report_state_pinned,
+    shim_ro_protect_paths, socket_mask_paths, state_pinned_message, tool_override_path_is_safe,
+    tool_path_env_overrides, validate_playwright_socket_dir, validate_sbpl_path,
+    xdg_runtime_dir_env, xdg_state_dir,
 };
 
 // SBPL profile generation — kept public for unit tests.
@@ -1226,7 +1227,7 @@ fn keep_cplt_state_out_of_grants(config: &SandboxConfig) -> Result<(), String> {
         }
     }
     // Only now is the state dir known to sit outside every grant.
-    policy::flush_state_pinned(config.home_dir, config.project_dir);
+    policy::flush_state_pinned(config.home_dir, config.project_dir)?;
     crate::launch_state::prune(config.home_dir);
     Ok(())
 }

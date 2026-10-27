@@ -29,16 +29,17 @@ pub use editing::{
 pub use error::{ConfigError, IN_SANDBOX_HINT, is_absent};
 pub use loading::exec_tool_dir_warning;
 pub use local::{
-    is_local_path_key, list_local, load_local, local_dir, local_path, parse_local_doc,
-    resolve_path_entry, resolve_path_entry_for_removal, stamp_local_header,
+    is_local_path_key, list_local, load_local, local_dir, local_path, local_write_path,
+    parse_local_doc, resolve_path_entry, resolve_path_entry_for_removal, stamp_local_header,
     validate_local_document,
 };
 pub(crate) use path::MAXSYMLINKS;
 pub use path::canonicalize_deepest;
 pub(crate) use path::lexically_normalized;
 pub use path::{
-    CustomConfigVerdict, allow_path_credential_hop, classify_custom_config, collapse_tilde,
-    config_dir, config_path, credential_hop_message, default_config_contents, expand_tilde,
+    CustomConfigVerdict, allow_path_credential_hop, approval_dirs, approval_file,
+    classify_custom_config, collapse_tilde, config_dir, config_path, credential_hop_message,
+    default_config_contents, expand_tilde, xdg_config_root,
 };
 pub use registry::{
     BoolKeyRow, ConfigKeyInfo, ConfigLayer, ConfigValueType, all_config_keys, bool_key,

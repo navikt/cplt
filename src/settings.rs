@@ -409,12 +409,10 @@ impl SettingsApp {
                 .map_err(|error| format!("refusing to write invalid global config: {error}"))?;
         }
         if write_local {
-            let path = self
-                .local_path
-                .clone()
-                .ok_or("local settings need a git repository")?;
             let project_dir =
                 detect_project_root().ok_or("local settings need a git repository")?;
+            // Written to the resolved config dir even when read from the other (#851).
+            let path = config::local_write_path(&project_dir).ok_or("$HOME is not set")?;
             // Same header the writer stamps at `config set --local`: the
             // recorded remote must be the normalized one the loader compares
             // against, or the next launch trips the staleness wire.
@@ -423,6 +421,7 @@ impl SettingsApp {
                 .map_err(|error| format!("refusing to write invalid local config: {error}"))?;
             write_document_atomically(&path, &local).map_err(|error| error.to_string())?;
             self.local_doc = local;
+            self.local_path = Some(path);
         }
         if write_global {
             write_document_atomically(&self.global_path, &global)

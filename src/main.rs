@@ -2433,6 +2433,83 @@ fn warn_inject_token_without_guard(resolved: &config::Resolved, agent: agent::Ag
 /// that take the agent's token away. Built from the predicates the launch and
 /// `cplt check` warn from, so the three cannot disagree. Names only, never
 /// values. `gh_token` is [`gh_exec_token_available`].
+/// `cplt doctor`: config and approvals in both `~/.config/cplt` and
+/// `$XDG_CONFIG_HOME/cplt` (#851). Nothing is moved; the fix is the `mv`.
+fn state_split_finding(home: &Path) -> Option<cplt::doctor::Finding> {
+    use cplt::doctor::Finding;
+    if std::env::var_os("CPLT_CONFIG").is_some() {
+        return None;
+    }
+    let legacy = home.join(sandbox::CPLT_STATE_DIR);
+    let xdg = sandbox::xdg_state_dir(home)?;
+    let items = |d: &Path| -> Vec<&'static str> {
+        ["config.toml", "trust", "local"]
+            .into_iter()
+            .filter(|i| d.join(i).symlink_metadata().is_ok())
+            .collect()
+    };
+    let (in_legacy, in_xdg) = (items(&legacy), items(&xdg));
+    let tilde = |p: &Path| doctor_tilde(&p.display().to_string(), home);
+    // Before the split test: a user whose only state is under XDG has lost
+    // it to the marker, and this is where they learn why.
+    if !in_xdg.is_empty() && legacy.join(sandbox::XDG_PINNED_MARKER).exists() {
+        return Some(Finding::warning(
+            format!(
+                "cplt ignores {}: it was inside the sandbox's grant, so the agent could have written it. cplt uses {}.",
+                tilde(&xdg),
+                tilde(&legacy)
+            ),
+            Some(format!(
+                "point XDG_CONFIG_HOME outside every sandbox grant, review {0} and move what \
+                 you want to keep to {1}, delete the rest of {0}, then `rm {2}`",
+                tilde(&xdg),
+                tilde(&legacy),
+                sh_quote(
+                    &legacy
+                        .join(sandbox::XDG_PINNED_MARKER)
+                        .display()
+                        .to_string()
+                )
+            )),
+        ));
+    }
+    if in_legacy.is_empty() || in_xdg.is_empty() {
+        return None;
+    }
+    let used = config::config_dir()?;
+    let other = if used == xdg { &legacy } else { &xdg };
+    let moves: Vec<String> = items(other)
+        .into_iter()
+        .map(|i| {
+            let (from, to) = (other.join(i), used.join(i));
+            if i != "config.toml" && to.is_dir() {
+                format!(
+                    "mv -n {}/* {}/",
+                    sh_quote(&from.display().to_string()),
+                    sh_quote(&to.display().to_string())
+                )
+            } else {
+                format!(
+                    "mv -n {} {}",
+                    sh_quote(&from.display().to_string()),
+                    sh_quote(&to.display().to_string())
+                )
+            }
+        })
+        .collect();
+    Some(Finding::warning(
+        format!(
+            "cplt state is split: {} in {}, {} in {}. cplt writes to {} and still reads approvals from both.",
+            in_legacy.join(", "),
+            tilde(&legacy),
+            in_xdg.join(", "),
+            tilde(&xdg),
+            tilde(&used)
+        ),
+        Some(moves.join(" && ")),
+    ))
+}
+
 fn config_findings(
     resolved: &config::Resolved,
     agent: agent::Agent,
@@ -8928,6 +9005,7 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
             Vec::new()
         }
     };
+    findings.extend(std::env::var_os("HOME").and_then(|h| state_split_finding(Path::new(&h))));
     findings.extend(config_findings(
         &resolved,
         active_agent,
@@ -9784,7 +9862,7 @@ fn run_config_path(local: bool) -> ExitCode {
         // stderr, and only for a person: `$EDITOR $(cplt config path)` stays clean.
         if io::stderr().is_terminal() {
             ui::info(
-                "config.toml, trust/, local/ and update/ stay in ~/.config/cplt; launch state and markers follow XDG_CONFIG_HOME.",
+                "config.toml, trust/ and local/ live in $XDG_CONFIG_HOME/cplt once config.toml or trust/ exists there, else in ~/.config/cplt.",
             );
         }
         ExitCode::SUCCESS
@@ -15840,6 +15918,39 @@ mod tests {
                 assert!(!replacement(&r, true, true));
             },
         );
+    }
+
+    #[test]
+    fn doctor_reports_state_split_across_both_roots() {
+        let home = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(home.path()).unwrap();
+        let xdg = home.join("xdg");
+        let (legacy, xdg_root) = (home.join(".config/cplt"), xdg.join("cplt"));
+        let vars = [
+            ("HOME", Some(home.as_os_str())),
+            ("XDG_CONFIG_HOME", Some(xdg.as_os_str())),
+            ("CPLT_CONFIG", None),
+        ];
+        temp_env::with_vars(vars, || {
+            std::fs::create_dir_all(legacy.join("trust")).unwrap();
+            assert!(
+                state_split_finding(&home).is_none(),
+                "one root is not split"
+            );
+            std::fs::create_dir_all(&xdg_root).unwrap();
+            std::fs::write(xdg_root.join("config.toml"), "").unwrap();
+            let f = state_split_finding(&home).expect("split");
+            assert!(f.message.contains("split"), "{}", f.message);
+            let fix = f.fix.unwrap();
+            assert!(fix.starts_with("mv -n "), "{fix}");
+            assert!(fix.contains("/xdg/cplt/trust"), "{fix}");
+            assert!(legacy.join("trust").exists(), "nothing is moved");
+            // State only under XDG, ignored after a pin: still reported.
+            std::fs::remove_dir_all(legacy.join("trust")).unwrap();
+            std::fs::write(legacy.join(sandbox::XDG_PINNED_MARKER), "").unwrap();
+            let f = state_split_finding(&home).expect("marker");
+            assert!(f.message.contains("ignores"), "{}", f.message);
+        });
     }
 
     #[test]

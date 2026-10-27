@@ -79,6 +79,12 @@ pub fn xdg_state_dir(home: &Path) -> Option<PathBuf> {
     .then_some(dir)
 }
 
+/// Written to `~/.config/cplt` when a launch pins state out of a grant. From
+/// then on config and approvals are never read from `$XDG_CONFIG_HOME/cplt`
+/// (#851): the agent could have written them. Delete it once
+/// `XDG_CONFIG_HOME` points outside the grant.
+pub const XDG_PINNED_MARKER: &str = "xdg-pinned";
+
 static LEGACY_STATE_PINNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -139,15 +145,26 @@ pub fn report_state_pinned(dir: &Path, tree: &Path) {
 /// After the state dir passed validation: print the held line when it
 /// differs from the last launch in this project (output policy, "changed"
 /// tier); otherwise only in `--verbose`.
-pub fn flush_state_pinned(home: &Path, project: &Path) {
+///
+/// # Errors
+/// When the [`XDG_PINNED_MARKER`] cannot be written: without it the next
+/// launch would read config and approvals the agent could forge, so the
+/// launch is refused.
+pub fn flush_state_pinned(home: &Path, project: &Path) -> Result<(), String> {
     let Some(line) = STATE_PINNED_LINE.lock().ok().and_then(|mut h| h.take()) else {
-        return;
+        return Ok(());
     };
+    let legacy = home.join(CPLT_STATE_DIR);
+    let marker = legacy.join(XDG_PINNED_MARKER);
+    std::fs::create_dir_all(&legacy)
+        .and_then(|()| std::fs::write(&marker, format!("{line}\n")))
+        .map_err(|e| format!("cannot write {}: {e}. {line}", marker.display()))?;
     if crate::launch_state::changed(home, project, "state-pinned", &line) {
         crate::ui::warn(&line);
     } else if crate::ui::verbose() {
         crate::ui::info(&line);
     }
+    Ok(())
 }
 
 /// `name` in [`cplt_state_dir`], or in the legacy `~/.config/cplt` when only
@@ -4632,7 +4649,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         report_state_pinned(Path::new("/x/cplt"), Path::new("/x"));
         assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
-        crate::with_env_lock_no_xdg(|| flush_state_pinned(home.path(), Path::new("/p")));
+        crate::with_env_lock_no_xdg(|| flush_state_pinned(home.path(), Path::new("/p"))).unwrap();
         assert!(STATE_PINNED_LINE.lock().unwrap().is_none(), "flushed once");
     }
 

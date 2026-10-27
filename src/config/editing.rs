@@ -577,7 +577,14 @@ impl ConfigSetOp {
         } else {
             validate_global_document(doc)?;
         }
-        write_document_atomically(&self.path, doc)
+        match &self.project_dir {
+            // Read from whichever root has it, written to the resolved one (#851).
+            Some(dir) => write_document_atomically(
+                &super::local::local_write_path(dir).ok_or(ConfigError::NoHome)?,
+                doc,
+            ),
+            None => write_document_atomically(&self.path, doc),
+        }
     }
 }
 

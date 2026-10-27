@@ -229,7 +229,8 @@ pub fn trust_dir() -> Option<PathBuf> {
 /// Returns `None` if no trust file exists (repo has never been approved).
 pub fn load_trust(project_dir: &Path) -> Option<TrustEntry> {
     let fingerprint = repo_fingerprint(project_dir);
-    let trust_file = trust_dir()?.join(format!("{fingerprint}.toml"));
+    // Either root's approval counts (#851); the resolved one first.
+    let trust_file = crate::config::approval_file(TRUST_DIR, &format!("{fingerprint}.toml"))?;
 
     let content = std::fs::read_to_string(&trust_file).ok()?;
     toml::from_str(&content).ok()
@@ -262,13 +263,13 @@ pub fn save_trust(project_dir: &Path, entry: &TrustEntry) -> Result<(), String> 
 /// Remove the trust entry for a repository.
 pub fn revoke_trust(project_dir: &Path) -> Result<(), String> {
     let fingerprint = repo_fingerprint(project_dir);
-    let Some(dir) = trust_dir() else {
-        return Ok(());
-    };
-    let trust_file = dir.join(format!("{fingerprint}.toml"));
-
-    if trust_file.exists() {
-        std::fs::remove_file(&trust_file).map_err(|e| format!("Cannot remove trust file: {e}"))?;
+    // From every root it is read from, or the other copy would keep it trusted.
+    for dir in crate::config::approval_dirs() {
+        let trust_file = dir.join(TRUST_DIR).join(format!("{fingerprint}.toml"));
+        if trust_file.symlink_metadata().is_ok() {
+            std::fs::remove_file(&trust_file)
+                .map_err(|e| format!("Cannot remove trust file: {e}"))?;
+        }
     }
     Ok(())
 }
