@@ -121,6 +121,7 @@ pub use policy::{
 // SBPL profile generation — kept public for unit tests.
 // The SBPL module is pure string manipulation with no macOS dependencies,
 // so tests run cross-platform even though the output is macOS-specific.
+pub(crate) use profile::mcp_child_profile;
 pub use profile::{ReadDenies, generate_profile, generate_profile_with_playwright_socket_dir};
 
 // Environment construction — already platform-agnostic.

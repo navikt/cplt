@@ -307,6 +307,71 @@ fn profile_locked(
     sb
 }
 
+/// The Seatbelt profile for a brokered MCP server child (#849). It runs on
+/// the host with the user's own login, so reads stay open (its credential
+/// file, the keychain via securityd, the system); what it loses is the
+/// network and most writes. Outbound TCP reaches only `localhost:{proxy_port}`,
+/// its egress proxy, through the same proxy-forced rules as the agent
+/// (no port means no TCP at all). Writes go only to `write_dirs`, which the
+/// caller canonicalizes; an SBPL-unsafe path is an error, never dropped.
+pub(crate) fn mcp_child_profile(
+    home: &Path,
+    write_dirs: &[PathBuf],
+    keychain: bool,
+    proxy_port: Option<u16>,
+) -> Result<String, String> {
+    for d in write_dirs {
+        super::policy::validate_sbpl_path(d)?;
+    }
+    super::policy::validate_sbpl_path(home)?;
+    let mut sb = String::new();
+    emit_header(&mut sb, "brokered MCP server child");
+    emit_process_rules(&mut sb);
+    sbpl!(sb, ";; Reads: open. The child holds the host login anyway.");
+    sbpl!(sb, "(allow file-read*)");
+    sbpl!(sb, ";; Mach IPC (Keychain via securityd, DNS)");
+    sbpl!(sb, "(allow mach-lookup)");
+    // `security add-generic-password` (go-keyring's refresh) posts this.
+    sbpl!(
+        sb,
+        "(allow ipc-posix-shm* (ipc-posix-name \"com.apple.AppleDatabaseChanged\"))"
+    );
+    for d in write_dirs {
+        sbpl!(sb, "(allow file-write* (subpath \"{}\"))", d.display());
+    }
+    if keychain {
+        // Security.framework rewrites the file keychain in the caller's
+        // process: a temp file beside login.keychain-db, then a rename.
+        // Only that file and its temp siblings, not the Keychains dir.
+        // Canonical, as Seatbelt matches resolved paths (a symlinked HOME).
+        // `.fl<hex>` is the AtomicFile lock taken before the rewrite.
+        let kc = home.join("Library/Keychains");
+        let kc = kc.canonicalize().unwrap_or(kc);
+        super::policy::validate_sbpl_path(&kc)?;
+        let dir = super::policy::escape_regex(&kc.to_string_lossy());
+        sbpl!(
+            sb,
+            "(allow file-write* (regex #\"^{dir}/(login\\.keychain-db(\\.sb-[^/]+)?|\\.fl[0-9A-F]+)$\"))"
+        );
+    }
+    sbpl!(sb);
+    // Its own network block, not the agent's: no Gradle daemon sockets
+    // (code outside any sandbox), no bind or inbound (a stdio server needs
+    // no listener). DNS, then TCP to its egress proxy only.
+    sbpl!(sb, ";; Network: DNS and the egress proxy only");
+    sbpl!(
+        sb,
+        "(allow network-outbound (literal \"/private/var/run/mDNSResponder\"))"
+    );
+    if let Some(port) = proxy_port {
+        sbpl!(
+            sb,
+            "(allow network-outbound (remote tcp \"localhost:{port}\"))"
+        );
+    }
+    Ok(sb)
+}
+
 // ── Profile section helpers ────────────────────────────────────
 //
 // Each function writes a contiguous SBPL block to the output string.
@@ -3755,6 +3820,52 @@ fn emit_network_rules(
 // These assert the generated profile *string* contains the right rules. They
 // do NOT prove the macOS kernel enforces them — that is verified at runtime by
 // the `integration` suite, which can only run on macOS/CI.
+
+#[cfg(test)]
+mod mcp_child_profile_tests {
+    use super::mcp_child_profile;
+    use std::path::{Path, PathBuf};
+
+    const ANY_TCP: &str = "(allow network-outbound (remote tcp";
+
+    #[test]
+    fn proxy_port_is_the_only_tcp_allow() {
+        let p = mcp_child_profile(Path::new("/Users/u"), &[], false, Some(4242)).unwrap();
+        assert_eq!(p.matches(ANY_TCP).count(), 1, "{p}");
+        assert!(p.contains("(allow network-outbound (remote tcp \"localhost:4242\"))"));
+        assert!(
+            !p.contains("network-bind") && !p.contains("network-inbound"),
+            "{p}"
+        );
+        assert!(!p.contains(".gradle"), "{p}");
+    }
+
+    #[test]
+    fn no_proxy_port_means_no_tcp() {
+        let p = mcp_child_profile(Path::new("/Users/u"), &[], false, None).unwrap();
+        assert!(!p.contains(ANY_TCP), "{p}");
+        assert!(p.contains("(deny default)"));
+    }
+
+    #[test]
+    fn write_grants_are_the_given_dirs_and_keychain_only_on_request() {
+        let dirs = [PathBuf::from("/Users/u/Library/Application Support/nais")];
+        let p = mcp_child_profile(Path::new("/Users/u"), &dirs, false, None).unwrap();
+        assert!(p.contains(
+            "(allow file-write* (subpath \"/Users/u/Library/Application Support/nais\"))"
+        ));
+        assert!(!p.contains("Keychains"), "{p}");
+        let k = mcp_child_profile(Path::new("/Users/u"), &dirs, true, None).unwrap();
+        assert!(k.contains("/Users/u/Library/Keychains/"), "{k}");
+    }
+
+    #[test]
+    fn sbpl_unsafe_paths_are_refused() {
+        let bad = [PathBuf::from("/tmp/x\")) (allow default")];
+        assert!(mcp_child_profile(Path::new("/Users/u"), &bad, false, None).is_err());
+        assert!(mcp_child_profile(Path::new("/Users/u\""), &[], false, None).is_err());
+    }
+}
 
 #[cfg(test)]
 mod tests {
