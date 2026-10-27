@@ -24,20 +24,23 @@ fn e2e_mcp_broker_filters_tools_and_refuses_calls() {
     let server = home_path.join("fake_mcp.py");
     std::fs::write(
         &server,
-        r#"import sys, json, os, socket
+        r#"import sys, json, os, socket, errno
 def probe(target):
     host, port = os.environ["HTTPS_PROXY"].rsplit(":", 1)
     s = socket.create_connection((host.split("//")[1], int(port)), timeout=5)
     s.sendall(("CONNECT " + target + " HTTP/1.1\r\nHost: " + target + "\r\n\r\n").encode())
     return s.recv(64).decode().split("\r\n")[0]
 def direct():
-    # Past the proxy, to an address: Seatbelt refuses with EPERM (#849).
+    # Past the proxy, to an address (#849): Seatbelt refuses with EPERM; in
+    # the Linux child's own network namespace there is no route.
     try:
         socket.create_connection(("1.1.1.1", 443), timeout=5).close()
         return "open"
     except PermissionError:
         return "blocked"
     except OSError as e:
+        if e.errno == errno.ENETUNREACH and sys.platform.startswith("linux"):
+            return "blocked"
         return "error " + str(e.errno)
 for line in sys.stdin:
     m = json.loads(line)
@@ -265,11 +268,10 @@ if sys.platform.startswith("linux"):
             probe, "PROBE:HTTP/1.1 403 Forbidden|HTTP/1.1 403 Forbidden",
             "{stdout}"
         );
-        // The child's own sandbox (#849): macOS only; Linux is not
-        // network-sandboxed yet (docs/design/mcp-host-broker.md).
-        if cfg!(target_os = "macos") {
-            assert_eq!(direct, "blocked", "{stdout}");
-        }
+        // The child's own sandbox (#849): the 403s above came back through
+        // the egress proxy (on Linux over the bound socket and the relay in
+        // the child's namespace), and a connect past it fails.
+        assert_eq!(direct, "blocked", "{stdout}");
         assert!(stderr.contains("egress → DENIED example.com"), "{stderr}");
         let agent = stdout
             .lines()

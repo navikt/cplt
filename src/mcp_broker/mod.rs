@@ -61,7 +61,7 @@ mod status;
 
 pub use client::{apply_opencode_overlay, copilot_launch_args};
 pub use runtime::{Broker, Log};
-pub use shim::run_stdio;
+pub use shim::{run_egress_relay, run_stdio};
 pub use spec::{Detected, Spec, detect, drop_writable, load, spec_dir};
 pub use status::{run_status, status_json};
 

@@ -27,6 +27,9 @@ pub struct Credential {
     /// Under `HOME`, the only places the macOS child sandbox lets the server
     /// write, besides its temp dir: its own config (a refreshed login).
     pub write_dirs: &'static [&'static str],
+    /// The same for the Linux child (bwrap), under `XDG_CONFIG_HOME`
+    /// (default `~/.config`); the rest of the filesystem is read-only.
+    pub linux_write_dirs: &'static [&'static str],
 }
 
 /// The table.
@@ -41,6 +44,8 @@ pub const MECHANISMS: &[Credential] = &[
         keychain: true,
         // os.UserConfigDir on macOS: nais-credentials.json.enc.
         write_dirs: &["Library/Application Support/nais"],
+        // os.UserConfigDir on Linux.
+        linux_write_dirs: &["nais"],
     },
     // A server with no host login: nothing to probe, any trusted command.
     // Not emitted by nav-pilot today; the broker e2e tests run on it.
@@ -50,6 +55,7 @@ pub const MECHANISMS: &[Credential] = &[
         probe: None,
         keychain: false,
         write_dirs: &[],
+        linux_write_dirs: &[],
     },
 ];
 

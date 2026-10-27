@@ -65,6 +65,9 @@ pub(crate) struct Server {
     /// This server's own CONNECT proxy, allowing only its `egressHosts`;
     /// `None` when it has none, so there is nothing to listen for.
     egress_port: Option<u16>,
+    /// Linux: the same proxy as a unix socket, bound into the child's
+    /// network namespace, where host loopback is out of reach (#849).
+    egress_socket: Option<PathBuf>,
 }
 
 pub(crate) struct Shared {
@@ -130,8 +133,9 @@ impl Broker {
             .set_nonblocking(true)
             .map_err(|e| format!("cannot poll {}: {e}", socket.display()))?;
         let mut egress = Vec::new();
+        let mut egress_unix = Vec::new();
         let mut servers = BTreeMap::new();
-        for spec in specs {
+        for (n, spec) in specs.into_iter().enumerate() {
             let egress_port = if spec.egress_hosts.is_empty() {
                 None
             } else {
@@ -142,11 +146,25 @@ impl Broker {
                 egress.push((spec.id.clone(), l));
                 Some(port)
             };
+            let egress_socket = match egress_port {
+                Some(port) if cfg!(target_os = "linux") => {
+                    let path = dir.path().join(format!("e{n}"));
+                    let l = std::os::unix::net::UnixListener::bind(&path)
+                        .and_then(|l| l.set_nonblocking(true).map(|()| l))
+                        .map_err(|e| format!("cannot bind {}: {e}", path.display()))?;
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                        .map_err(|e| format!("cannot restrict {}: {e}", path.display()))?;
+                    egress_unix.push((l, port));
+                    Some(path)
+                }
+                _ => None,
+            };
             let server = Server {
                 spec,
                 child: Mutex::new(None),
                 spawns: Mutex::new(VecDeque::new()),
                 egress_port,
+                egress_socket,
             };
             servers.insert(server.spec.id.clone(), server);
         }
@@ -174,6 +192,30 @@ impl Broker {
                             std::thread::spawn(move || {
                                 let _permit = permit;
                                 egress_tunnel(stream, &hosts, &log, &id);
+                            });
+                        }
+                        Err(_) => std::thread::sleep(Duration::from_millis(50)),
+                    }
+                }
+            });
+        }
+        // The host end of the Linux child's egress hop: each connection on
+        // the unix socket goes on to the TCP proxy above, which decides.
+        for (l, port) in egress_unix {
+            let s = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                while !s.stop.load(Ordering::Acquire) {
+                    match l.accept() {
+                        Ok((stream, _)) => {
+                            let Some(permit) = Permit::take(&s.open) else {
+                                continue;
+                            };
+                            std::thread::spawn(move || {
+                                let _permit = permit;
+                                let _ = stream.set_nonblocking(false);
+                                if let Ok(up) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+                                    super::shim::pipe(up, stream);
+                                }
                             });
                         }
                         Err(_) => std::thread::sleep(Duration::from_millis(50)),
@@ -332,8 +374,17 @@ pub(crate) fn spawn_child(shared: &Shared, server: &Server) -> std::io::Result<C
     // No egress hosts, no listener: port 0 cannot be connected to, so every
     // proxied request fails at once instead of going out direct.
     let proxy = format!("http://127.0.0.1:{}", server.egress_port.unwrap_or(0));
-    let mut cmd = child_command(spec, &shared.home, server.egress_port)?;
+    let mut cmd = child_command(
+        spec,
+        &shared.home,
+        server.egress_port,
+        server.egress_socket.as_deref(),
+    )?;
     host_env(&mut cmd, &shared.home, spec.credential.keychain);
+    if cfg!(target_os = "linux") {
+        // The child's private /tmp: the only temp dir it can write.
+        cmd.env("TMPDIR", "/tmp");
+    }
     cmd.env("HTTPS_PROXY", &proxy)
         .env("HTTP_PROXY", &proxy)
         .env("https_proxy", &proxy)
@@ -439,13 +490,22 @@ fn resolve_existing_prefix(path: &Path) -> PathBuf {
 /// The server's command. On macOS it runs under `sandbox-exec` with
 /// [`crate::sandbox::mcp_child_profile`]: TCP only to its egress proxy,
 /// writes only to its credential's `write_dirs` and its temp dir (#849).
-/// Elsewhere the child is not network-sandboxed (see the design doc).
+/// On Linux it runs under bwrap with its own network namespace, see
+/// [`linux_child_command`]. Nowhere does it run unsandboxed.
 #[allow(clippy::disallowed_methods)] // resolved in the trusted dirs at load; sandbox-exec is fixed
-fn child_command(spec: &Spec, home: &Path, egress: Option<u16>) -> std::io::Result<Command> {
+fn child_command(
+    spec: &Spec,
+    home: &Path,
+    egress: Option<u16>,
+    egress_socket: Option<&Path>,
+) -> std::io::Result<Command> {
+    if cfg!(target_os = "linux") {
+        return linux_child_command(spec, home, egress, egress_socket);
+    }
     if !cfg!(target_os = "macos") {
-        let mut cmd = Command::new(&spec.program);
-        cmd.args(&spec.command[1..]);
-        return Ok(cmd);
+        return Err(std::io::Error::other(
+            "no sandbox for the MCP server child on this OS",
+        ));
     }
     let mut dirs = vec![std::env::temp_dir()];
     dirs.extend(spec.credential.write_dirs.iter().map(|d| home.join(d)));
@@ -464,6 +524,134 @@ fn child_command(spec: &Spec, home: &Path, egress: Option<u16>) -> std::io::Resu
         .arg(&spec.program)
         .args(&spec.command[1..]);
     Ok(cmd)
+}
+
+/// Where the egress socket appears inside the Linux child's namespace.
+const CHILD_EGRESS_SOCKET: &str = "/tmp/cplt-egress.sock";
+
+/// The Linux child (#849): `bwrap <`[`child_bwrap_args`]`> -- cplt
+/// mcp-egress-relay ... -- <program> ...`. Fails, never falls back, when
+/// bwrap is missing; when bwrap cannot build the namespaces it exits
+/// before the server starts.
+#[allow(clippy::disallowed_methods)] // bwrap from the trusted dirs; cplt is this binary
+fn linux_child_command(
+    spec: &Spec,
+    home: &Path,
+    egress: Option<u16>,
+    egress_socket: Option<&Path>,
+) -> std::io::Result<Command> {
+    #[cfg(target_os = "linux")]
+    let bwrap = crate::sandbox::bubblewrap_probe::check_availability();
+    #[cfg(not(target_os = "linux"))]
+    let bwrap: Option<PathBuf> = None;
+    let bwrap = bwrap.ok_or_else(|| {
+        std::io::Error::other("bwrap not found; the MCP server child does not run unsandboxed")
+    })?;
+    let cplt = std::env::current_exe()?;
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| home.join(".config"));
+    let write_dirs: Vec<PathBuf> = spec
+        .credential
+        .linux_write_dirs
+        .iter()
+        .map(|d| config_home.join(d))
+        .collect();
+    // bwrap cannot bind a missing source; a first login creates it anyway.
+    for d in &write_dirs {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(d)?;
+    }
+    let bus = spec
+        .credential
+        .keychain
+        .then(|| std::env::var("DBUS_SESSION_BUS_ADDRESS").ok())
+        .flatten()
+        .and_then(|a| session_bus_path(&a));
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    let mut cmd = Command::new(bwrap);
+    cmd.args(child_bwrap_args(
+        &write_dirs,
+        runtime.as_deref(),
+        bus.as_deref(),
+        egress_socket,
+    ))
+    .arg("--")
+    .arg(cplt)
+    .arg("mcp-egress-relay")
+    .arg(CHILD_EGRESS_SOCKET)
+    .arg(egress.unwrap_or(0).to_string())
+    .arg("--")
+    .arg(&spec.program)
+    .args(&spec.command[1..]);
+    Ok(cmd)
+}
+
+/// The socket path of a `unix:path=` session bus address. An abstract or
+/// TCP bus lives in the host's network namespace and is out of reach.
+fn session_bus_path(addr: &str) -> Option<PathBuf> {
+    addr.split(';')
+        .find_map(|a| a.strip_prefix("unix:"))
+        .and_then(|kv| kv.split(',').find_map(|p| p.strip_prefix("path=")))
+        .map(PathBuf::from)
+}
+
+/// bwrap's arguments for the Linux child, before `--`: every namespace
+/// bwrap has, the network one included, so the only way out is the egress
+/// socket. The host root read-only; private `/tmp` and `/run` (hiding the
+/// host's sockets there, the system bus and docker's among them) and, if
+/// it lives elsewhere, a private runtime dir; then writable `write_dirs`,
+/// the session bus socket alone, and the egress socket.
+fn child_bwrap_args(
+    write_dirs: &[PathBuf],
+    runtime_dir: Option<&Path>,
+    bus: Option<&Path>,
+    egress_socket: Option<&Path>,
+) -> Vec<std::ffi::OsString> {
+    let mut a: Vec<std::ffi::OsString> = [
+        "--unshare-user",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--unshare-cgroup",
+        "--unshare-net",
+        "--die-with-parent",
+        "--new-session",
+        "--ro-bind",
+        "/",
+        "/",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--tmpfs",
+        "/tmp",
+        "--tmpfs",
+        "/run",
+    ]
+    .into_iter()
+    .map(Into::into)
+    .collect();
+    if let Some(rt) = runtime_dir.filter(|d| !d.starts_with("/run") && !d.starts_with("/tmp")) {
+        a.extend(["--tmpfs".into(), rt.into()]);
+    }
+    let mut bind = |flag: &str, src: &Path, dst: &Path| {
+        a.extend([flag.into(), src.into(), dst.into()]);
+    };
+    for d in write_dirs {
+        bind("--bind", d, d);
+    }
+    if let Some(bus) = bus {
+        bind("--ro-bind", bus, bus);
+    }
+    if let Some(sock) = egress_socket {
+        bind("--ro-bind", sock, Path::new(CHILD_EGRESS_SOCKET));
+    }
+    a
 }
 
 /// The host child's environment, also the credential probe's, so the two
@@ -756,6 +944,71 @@ mod tests {
         let got = resolve_existing_prefix(&link.join("nais"));
         let _ = std::fs::remove_file(&link);
         assert_eq!(got, real.join("nais"));
+    }
+
+    /// #849: the Linux child's namespace. Every namespace, the network one
+    /// included; the host root read-only with private /tmp and /run, and
+    /// only then the write dirs, the bus socket and the egress socket, so
+    /// no tmpfs hides them.
+    #[test]
+    fn child_bwrap_args_isolate_the_network_and_bind_only_the_grants() {
+        let args: Vec<String> = child_bwrap_args(
+            &[PathBuf::from("/home/u/.config/nais")],
+            Some(Path::new("/run/user/1000")),
+            Some(Path::new("/run/user/1000/bus")),
+            Some(Path::new("/tmp/cplt-mcp-x/e0")),
+        )
+        .into_iter()
+        .map(|a| a.into_string().unwrap())
+        .collect();
+        let s = args.join(" ");
+        for ns in ["user", "pid", "ipc", "uts", "cgroup", "net"] {
+            assert!(args.contains(&format!("--unshare-{ns}")), "{s}");
+        }
+        assert!(args.contains(&"--die-with-parent".into()), "{s}");
+        let tail = "--ro-bind / / --proc /proc --dev /dev --tmpfs /tmp --tmpfs /run \
+                    --bind /home/u/.config/nais /home/u/.config/nais \
+                    --ro-bind /run/user/1000/bus /run/user/1000/bus \
+                    --ro-bind /tmp/cplt-mcp-x/e0 /tmp/cplt-egress.sock";
+        assert!(s.ends_with(tail), "{s}");
+        // Writable binds: the write dir alone.
+        let writable: Vec<_> = args
+            .windows(2)
+            .filter(|w| w[0] == "--bind")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(writable, ["/home/u/.config/nais"], "{s}");
+
+        // No egress, no bus: neither socket is bound. A runtime dir outside
+        // /run gets its own tmpfs.
+        let bare: Vec<String> = child_bwrap_args(&[], Some(Path::new("/var/rt")), None, None)
+            .into_iter()
+            .map(|a| a.into_string().unwrap())
+            .collect();
+        assert!(bare.contains(&"--unshare-net".into()));
+        assert!(
+            bare.ends_with(&["--tmpfs".into(), "/var/rt".into()]),
+            "{bare:?}"
+        );
+        assert!(
+            !bare
+                .iter()
+                .any(|a| a == "--bind" || a == CHILD_EGRESS_SOCKET)
+        );
+    }
+
+    #[test]
+    fn session_bus_path_takes_a_unix_path_only() {
+        assert_eq!(
+            session_bus_path("unix:path=/run/user/1000/bus,guid=abc"),
+            Some(PathBuf::from("/run/user/1000/bus"))
+        );
+        assert_eq!(
+            session_bus_path("unix:guid=abc,path=/run/user/1000/bus"),
+            Some(PathBuf::from("/run/user/1000/bus"))
+        );
+        assert_eq!(session_bus_path("unix:abstract=/tmp/dbus-x,guid=abc"), None);
+        assert_eq!(session_bus_path("tcp:host=localhost,port=1"), None);
     }
 
     #[test]
