@@ -2564,6 +2564,15 @@ fn report_unix_socket_regime(
             "UNIX-socket connect is kernel-enforced (Landlock ABI v9+): the agent can \
              only reach sockets the policy grants.",
         );
+    } else if bwrap_active && socket_masks == 0 {
+        // Only sockets that exist get a mask (#805). Zero means none of the
+        // known paths for this uid exist, not that a present one went unmasked.
+        ui::info(
+            "UNIX-socket connect is NOT kernel-enforced (needs Landlock ABI v9 / kernel 7.1). \
+             None of the known escape sockets (D-Bus, systemd, container runtimes) exist \
+             for this user, so Bubblewrap has nothing to mask; any other pathname socket \
+             on the host stays reachable.",
+        );
     } else if bwrap_active {
         ui::info(&format!(
             "UNIX-socket connect is NOT kernel-enforced (needs Landlock ABI v9 / kernel 7.1). \
