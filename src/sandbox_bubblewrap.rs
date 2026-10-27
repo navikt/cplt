@@ -653,6 +653,10 @@ pub(crate) struct DenyMasks {
     /// How many of the built-in socket masks are actually covered — by their
     /// own entry, or by an ancestor directory mask that shadows them.
     socket_masks: usize,
+    /// Built-in sockets that exist but got no mask (no placeholder, e.g.
+    /// `--no-scratch-dir`), so they stay reachable. Ones under `/tmp` are not
+    /// counted: the private `/tmp` tmpfs already hides them (#805).
+    socket_unmasked: usize,
     /// How many entries came from the user's deny paths. Tracked separately so
     /// the deny-path diagnostics report only what the user asked for.
     user_masks: usize,
@@ -694,6 +698,11 @@ impl DenyMasks {
         self.socket_masks
     }
 
+    /// Built-in sockets that exist on the host and are still reachable.
+    pub(crate) fn socket_unmasked_count(&self) -> usize {
+        self.socket_unmasked
+    }
+
     pub(crate) fn skipped(&self) -> &[PathBuf] {
         &self.skipped
     }
@@ -731,7 +740,8 @@ impl DenyMasks {
 /// `socket_masks` carries the built-in UNIX-socket set (see
 /// [`crate::sandbox::policy::socket_mask_paths`]). It goes through exactly the
 /// same machinery — the caller has already dropped the entries that do not
-/// exist on this host, so nothing from it should ever land in `skipped` — and
+/// exist on this host; one lands in `skipped` only without a placeholder or
+/// under `/tmp`, and outside `/tmp` it counts in `socket_unmasked` (#805) — and
 /// is only counted separately so the deny-path diagnostics keep reporting the
 /// user's own paths.
 ///
@@ -856,6 +866,10 @@ pub(crate) fn build_deny_masks(
         .iter()
         .filter(|p| kept_dirs.iter().any(|k| p.starts_with(k)) || files.contains(p))
         .count();
+    let socket_unmasked = socket_canon
+        .iter()
+        .filter(|p| !p.starts_with("/tmp") && skipped.contains(p))
+        .count();
     // Counted by origin, not as "everything that is not a socket mask": a path
     // the user denied that also appears in the built-in set is still a deny
     // path they asked for, and subtracting it would drop the "Deny paths
@@ -877,6 +891,7 @@ pub(crate) fn build_deny_masks(
         placeholder,
         skipped,
         socket_masks,
+        socket_unmasked,
         user_masks,
         placeholder_error,
         credential_dirs,
@@ -3104,6 +3119,19 @@ mod tests {
             build_deny_masks(&[], std::slice::from_ref(&denied), &[], Some(&scratch2));
         assert_eq!(only_sockets.mask_count(), 0);
         assert_eq!(only_sockets.socket_mask_count(), 1);
+        assert_eq!(only_sockets.socket_unmasked_count(), 0);
+    }
+
+    #[test]
+    fn a_socket_left_unmasked_is_counted_as_reachable() {
+        // No scratch dir means no placeholder, so a file socket gets no mask.
+        // The launch line must not read that as "no socket exists" (#805).
+        let base = non_tmp_tempdir();
+        let sock = base.path().join("bus");
+        std::fs::write(&sock, "").expect("bus");
+        let masks = build_deny_masks(&[], &[sock], &[], None);
+        assert_eq!(masks.socket_mask_count(), 0);
+        assert_eq!(masks.socket_unmasked_count(), 1);
     }
 
     #[test]
