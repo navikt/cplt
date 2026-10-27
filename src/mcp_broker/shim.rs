@@ -1,10 +1,8 @@
 //! `cplt mcp-stdio <id>`, the sandbox side.
 
-use std::ffi::OsString;
 use std::io::Write;
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{Shutdown, TcpStream};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
 use std::process::ExitCode;
 
 use super::SOCKET_ENV;
@@ -69,30 +67,56 @@ pub(crate) fn pipe(tcp: TcpStream, unix: UnixStream) {
     let _ = back.join();
 }
 
-/// `cplt mcp-egress-relay <socket> <port> <program> [args]`, run by bwrap
-/// inside the Linux child's fresh network namespace (#849): listen on
-/// `127.0.0.1:<port>` there (the port `HTTPS_PROXY` names), relay each
-/// connection to `<socket>`, the broker's egress proxy bound in from the
-/// host, and run the server with this process's stdio and environment.
-/// Exits with the server's status; the listener is up before it starts.
-pub fn run_egress_relay(socket: PathBuf, port: u16, argv: &[OsString]) -> ExitCode {
+/// Set by the broker on bwrap for the Linux child (#849): JSON
+/// `[port, program, args...]`. Its presence makes this process the egress
+/// relay, dispatched before `main` as bwrap's own re-entry helper is, so
+/// any binary carrying this crate (cplt, its unit tests) can play it.
+pub(crate) const RELAY_ENV: &str = "__CPLT_MCP_EGRESS_RELAY";
+
+/// Where the egress socket appears inside the Linux child's namespace.
+pub(crate) const CHILD_EGRESS_SOCKET: &str = "/tmp/cplt-egress.sock";
+
+#[cfg(target_os = "linux")]
+#[used]
+#[unsafe(link_section = ".init_array")]
+static RELAY_CTOR: extern "C" fn() = relay_entry;
+
+#[cfg(target_os = "linux")]
+extern "C" fn relay_entry() {
+    let Some(v) = std::env::var_os(RELAY_ENV) else {
+        return;
+    };
+    let code = match serde_json::from_slice::<(u16, Vec<String>)>(v.as_encoded_bytes()) {
+        Ok((port, argv)) => run_egress_relay(port, &argv),
+        Err(_) => 126,
+    };
+    std::process::exit(code);
+}
+
+/// The egress relay, run by bwrap inside the Linux child's fresh network
+/// namespace (#849): listen on `127.0.0.1:<port>` there (the port
+/// `HTTPS_PROXY` names), relay each connection to [`CHILD_EGRESS_SOCKET`],
+/// the broker's egress proxy bound in from the host, and run the server
+/// with this process's stdio and environment. Returns the server's exit
+/// code; the listener is up before the server starts.
+#[cfg(target_os = "linux")]
+fn run_egress_relay(port: u16, argv: &[String]) -> i32 {
     let Some((program, args)) = argv.split_first() else {
-        return ExitCode::FAILURE;
+        return 126;
     };
     // Port 0: no egress hosts, so no listener; every proxied request fails.
     if port != 0 {
-        let listener = match TcpListener::bind(("127.0.0.1", port)) {
+        let listener = match std::net::TcpListener::bind(("127.0.0.1", port)) {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("cplt mcp-egress-relay: cannot listen on {port}: {e}");
-                return ExitCode::FAILURE;
+                eprintln!("cplt egress relay: cannot listen on {port}: {e}");
+                return 126;
             }
         };
         std::thread::spawn(move || {
             for conn in listener.incoming().flatten() {
-                let socket = socket.clone();
                 std::thread::spawn(move || {
-                    if let Ok(up) = UnixStream::connect(&socket) {
+                    if let Ok(up) = UnixStream::connect(CHILD_EGRESS_SOCKET) {
                         pipe(conn, up);
                     }
                 });
@@ -100,16 +124,18 @@ pub fn run_egress_relay(socket: PathBuf, port: u16, argv: &[OsString]) -> ExitCo
         });
     }
     #[allow(clippy::disallowed_methods)] // the spec's program, resolved on the host at load
-    let status = std::process::Command::new(program).args(args).status();
+    let status = std::process::Command::new(program)
+        .args(args)
+        .env_remove(RELAY_ENV)
+        .status();
     match status {
         Ok(s) => {
             use std::os::unix::process::ExitStatusExt;
-            let code = s.code().or(s.signal().map(|n| 128 + n)).unwrap_or(1);
-            ExitCode::from(u8::try_from(code).unwrap_or(1))
+            s.code().or(s.signal().map(|n| 128 + n)).unwrap_or(1)
         }
         Err(e) => {
-            eprintln!("cplt mcp-egress-relay: cannot run the server: {e}");
-            ExitCode::FAILURE
+            eprintln!("cplt egress relay: cannot run the server: {e}");
+            127
         }
     }
 }

@@ -13,6 +13,7 @@ use serde_json::Value;
 
 use super::egress::egress_tunnel;
 use super::policy::{Action, Pending, auth_error, error_line, on_client, on_server};
+use super::shim::{CHILD_EGRESS_SOCKET, RELAY_ENV};
 use super::spec::Spec;
 use super::{CALL_TIMEOUT, DENIED, KILL_GRACE, MAX_MESSAGE, SPAWNS_PER_MINUTE};
 
@@ -374,16 +375,16 @@ pub(crate) fn spawn_child(shared: &Shared, server: &Server) -> std::io::Result<C
     // No egress hosts, no listener: port 0 cannot be connected to, so every
     // proxied request fails at once instead of going out direct.
     let proxy = format!("http://127.0.0.1:{}", server.egress_port.unwrap_or(0));
-    let mut cmd = child_command(
+    let (mut cmd, relay) = child_command(
         spec,
         &shared.home,
         server.egress_port,
         server.egress_socket.as_deref(),
     )?;
     host_env(&mut cmd, &shared.home, spec.credential.keychain);
-    if cfg!(target_os = "linux") {
-        // The child's private /tmp: the only temp dir it can write.
-        cmd.env("TMPDIR", "/tmp");
+    if let Some(relay) = relay {
+        // The Linux child's private /tmp is the only temp dir it can write.
+        cmd.env(RELAY_ENV, relay).env("TMPDIR", "/tmp");
     }
     cmd.env("HTTPS_PROXY", &proxy)
         .env("HTTP_PROXY", &proxy)
@@ -498,9 +499,10 @@ fn child_command(
     home: &Path,
     egress: Option<u16>,
     egress_socket: Option<&Path>,
-) -> std::io::Result<Command> {
+) -> std::io::Result<(Command, Option<String>)> {
     if cfg!(target_os = "linux") {
-        return linux_child_command(spec, home, egress, egress_socket);
+        return linux_child_command(spec, home, egress, egress_socket)
+            .map(|(cmd, relay)| (cmd, Some(relay)));
     }
     if !cfg!(target_os = "macos") {
         return Err(std::io::Error::other(
@@ -523,14 +525,12 @@ fn child_command(
         .arg("--")
         .arg(&spec.program)
         .args(&spec.command[1..]);
-    Ok(cmd)
+    Ok((cmd, None))
 }
 
-/// Where the egress socket appears inside the Linux child's namespace.
-const CHILD_EGRESS_SOCKET: &str = "/tmp/cplt-egress.sock";
-
-/// The Linux child (#849): `bwrap <`[`child_bwrap_args`]`> -- cplt
-/// mcp-egress-relay ... -- <program> ...`. Fails, never falls back, when
+/// The Linux child (#849): `bwrap <`[`child_bwrap_args`]`> -- <this
+/// binary>` with [`RELAY_ENV`] naming the port and the server's argv, so
+/// it starts as the egress relay, which runs the server. Fails, never falls back, when
 /// bwrap is missing; when bwrap cannot build the namespaces it exits
 /// before the server starts.
 #[allow(clippy::disallowed_methods)] // bwrap from the trusted dirs; cplt is this binary
@@ -539,7 +539,7 @@ fn linux_child_command(
     home: &Path,
     egress: Option<u16>,
     egress_socket: Option<&Path>,
-) -> std::io::Result<Command> {
+) -> std::io::Result<(Command, String)> {
     #[cfg(target_os = "linux")]
     let bwrap = crate::sandbox::bubblewrap_probe::check_availability();
     #[cfg(not(target_os = "linux"))]
@@ -581,14 +581,11 @@ fn linux_child_command(
         egress_socket,
     ))
     .arg("--")
-    .arg(cplt)
-    .arg("mcp-egress-relay")
-    .arg(CHILD_EGRESS_SOCKET)
-    .arg(egress.unwrap_or(0).to_string())
-    .arg("--")
-    .arg(&spec.program)
-    .args(&spec.command[1..]);
-    Ok(cmd)
+    .arg(cplt);
+    let mut argv = vec![spec.program.to_string_lossy().into_owned()];
+    argv.extend(spec.command[1..].iter().cloned());
+    let relay = serde_json::json!([egress.unwrap_or(0), argv]).to_string();
+    Ok((cmd, relay))
 }
 
 /// The socket path of a `unix:path=` session bus address. An abstract or

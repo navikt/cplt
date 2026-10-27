@@ -969,16 +969,6 @@ NOTE:
     #[command(name = "mcp-stdio", hide = true)]
     McpStdio { id: String },
 
-    /// Inside the Linux MCP child's network namespace (#849): relay
-    /// `127.0.0.1:<port>` to the broker's egress socket, then run the server.
-    #[command(name = "mcp-egress-relay", hide = true)]
-    McpEgressRelay {
-        socket: PathBuf,
-        port: u16,
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
-        argv: Vec<std::ffi::OsString>,
-    },
-
     /// Probe what the sandbox allows, such as `cplt check path PATH`.
     Check {
         #[command(subcommand)]
@@ -4845,9 +4835,6 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     let mut mcp_status = None;
     match cli.command.take() {
         Some(Command::McpStdio { id }) => return Ok(cplt::mcp_broker::run_stdio(&id)),
-        Some(Command::McpEgressRelay { socket, port, argv }) => {
-            return Ok(cplt::mcp_broker::run_egress_relay(socket, port, &argv));
-        }
         Some(Command::Mcp {
             action: McpAction::Status { json },
         }) => mcp_status = Some(json),
@@ -5012,7 +4999,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             Command::Worktree { .. } => {
                 unreachable!("Command::Worktree handled before this match")
             }
-            Command::Mcp { .. } | Command::McpStdio { .. } | Command::McpEgressRelay { .. } => {
+            Command::Mcp { .. } | Command::McpStdio { .. } => {
                 unreachable!("Command::Mcp handled before this match")
             }
         });

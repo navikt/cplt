@@ -410,7 +410,9 @@ mechanism's status probe; no secret is printed.
   the host's loopback, so the broker also serves each egress proxy as a
   0600 unix socket in its socket dir and bwrap binds that socket alone
   into the namespace at `/tmp/cplt-egress.sock`. Inside, bwrap starts
-  `cplt mcp-egress-relay`, which listens on `127.0.0.1:<egress port>`
+  cplt again with `__CPLT_MCP_EGRESS_RELAY` set, which an `.init_array`
+  constructor dispatches before `main` (as bwrap's re-entry helper is).
+  That relay listens on `127.0.0.1:<egress port>`
   (the port `HTTPS_PROXY` names), relays each connection to that socket,
   and then runs the server. On the host each unix connection goes on to
   the TCP egress proxy, which makes the decision. With no `egressHosts`
