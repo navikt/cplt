@@ -2565,6 +2565,31 @@ fn report_unix_socket_regime(
             "UNIX-socket connect is kernel-enforced (Landlock ABI v9+): the agent can \
              only reach sockets the policy grants.",
         );
+    } else if let Some(n) = masks
+        .map(bubblewrap::DenyMasks::socket_unmasked_count)
+        .filter(|&n| n > 0)
+    {
+        // A present socket that got no mask (#805): say so, never "0 masked".
+        crate::ui::warn(&format!(
+            "UNIX-socket connect is NOT kernel-enforced (needs Landlock ABI v9 / kernel 7.1), \
+             and {n} known escape socket(s) (D-Bus, systemd, container runtimes) could not be \
+             masked{}: the agent can reach them.",
+            masks
+                .and_then(bubblewrap::DenyMasks::placeholder_error)
+                .map(|e| format!(" ({e})"))
+                .unwrap_or_default()
+        ));
+    } else if bwrap_active && socket_masks == 0 {
+        // Only sockets that exist get a mask, so zero means none of the paths
+        // this run would mask exist or are visible to this user (#805). Docker
+        // sockets a docker key allows are not in that set; the container line
+        // above reports them.
+        ui::info(
+            "UNIX-socket connect is NOT kernel-enforced (needs Landlock ABI v9 / kernel 7.1). \
+             Bubblewrap masks no escape sockets: none of the ones it would mask (D-Bus, \
+             systemd, container runtimes not allowed by a docker key) exist or are visible \
+             to this user. Any other pathname socket on the host stays reachable.",
+        );
     } else if bwrap_active {
         ui::info(&format!(
             "UNIX-socket connect is NOT kernel-enforced (needs Landlock ABI v9 / kernel 7.1). \
