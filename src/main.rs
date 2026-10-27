@@ -12809,7 +12809,7 @@ mod tests {
     fn managed_worktree_root_is_refused_on_linux() {
         let home = tempfile::tempdir().expect("tempdir");
         let repo = tempfile::tempdir().expect("tempdir");
-        let ok = std::process::Command::new("git")
+        let ok = std::process::Command::new(cplt::git::trusted_git().expect("trusted git"))
             .args(["init", "-q"])
             .current_dir(repo.path())
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -15278,7 +15278,7 @@ mod tests {
     /// identity, panicking on failure: a fixture that quietly failed would
     /// leave the test asserting nothing.
     fn git_in(dir: &Path, args: &[&str]) {
-        let status = std::process::Command::new("git")
+        let status = std::process::Command::new(cplt::git::trusted_git().expect("trusted git"))
             .args(args)
             .current_dir(dir)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -15506,7 +15506,7 @@ mod tests {
     /// `git init` in `dir`; `false` when this machine has no usable git, which
     /// makes every `--repo-dir` case untestable and the caller returns early.
     fn init_repo(dir: &Path) -> bool {
-        std::process::Command::new("git")
+        std::process::Command::new(cplt::git::trusted_git().expect("trusted git"))
             .args(["init", "--quiet"])
             .current_dir(dir)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")

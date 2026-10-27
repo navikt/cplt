@@ -7112,16 +7112,11 @@ mod tests {
         Some((tmp, repo))
     }
 
-    /// `git` if it runs, probed directly rather than through `which` so the
-    /// tests do not silently skip on a machine that has git but no `which`.
-    /// `Command` resolves the bare name through PATH.
+    /// The trusted git, by absolute path, as production resolves it. Never a
+    /// bare `git`: other tests in this binary swap `PATH` through temp_env, and
+    /// a PATH lookup that lands mid-swap fails to spawn (#840).
     fn which_git() -> Option<PathBuf> {
-        std::process::Command::new("git")
-            .arg("--version")
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|_| PathBuf::from("git"))
+        crate::git::trusted_git().map(Path::to_path_buf)
     }
 
     /// `which_git()` or a LOUD skip. A silent `return` on a git-less host would

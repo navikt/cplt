@@ -861,7 +861,7 @@ mod copilot_extraction_tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             // A test may have chmod 000'd a dir; make it removable again.
-            let _ = std::process::Command::new("chmod")
+            let _ = std::process::Command::new("/bin/chmod")
                 .args(["-R", "u+rwX"])
                 .arg(&self.root)
                 .status();
@@ -923,7 +923,7 @@ mod copilot_extraction_tests {
                 ),
             )
             .unwrap();
-            let copied = std::process::Command::new("cp")
+            let copied = std::process::Command::new("/bin/cp")
                 .arg(&staging)
                 .arg(bin)
                 .status()

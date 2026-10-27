@@ -6650,7 +6650,7 @@ mod tests {
         // deny, but the filter itself would go untested).
         let base = std::fs::canonicalize(tmp.path()).expect("canonicalize base");
         let git = |args: &[&str], cwd: &Path| {
-            let ok = std::process::Command::new("git")
+            let ok = std::process::Command::new(crate::git::trusted_git().expect("trusted git"))
                 .args(args)
                 .current_dir(cwd)
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")

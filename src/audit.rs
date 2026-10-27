@@ -3632,7 +3632,7 @@ mod tests {
     #[test]
     fn finish_reports_incomplete_when_before_status_failed() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let ok = Command::new("git")
+        let ok = Command::new(crate::git::trusted_git().expect("trusted git"))
             .args(["init"])
             .current_dir(dir.path())
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -3668,7 +3668,7 @@ mod tests {
     #[test]
     fn finish_reports_modified_preexisting_untracked_file() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let ok = Command::new("git")
+        let ok = Command::new(crate::git::trusted_git().expect("trusted git"))
             .args(["init", "-q", "-b", "main"])
             .current_dir(dir.path())
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -4122,7 +4122,7 @@ mod tests {
         std::fs::create_dir_all(dir).unwrap();
         // Under the env lock: another test can be changing PATH meanwhile.
         let ok = crate::with_env_lock_no_xdg(|| {
-            Command::new("git")
+            Command::new(crate::git::trusted_git().expect("trusted git"))
                 .args(["init", "-q"])
                 .current_dir(dir)
                 .env("GIT_DIR", dir)

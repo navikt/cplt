@@ -1463,7 +1463,7 @@ approved_at = "2026-05-01T12:00:00Z"
     fn approval_covers_every_worktree_of_the_approved_repository() {
         let base = tempfile::tempdir().expect("tempdir");
         let git = |args: &[&str], cwd: &Path| {
-            let ok = std::process::Command::new("git")
+            let ok = std::process::Command::new(crate::git::trusted_git().expect("trusted git"))
                 .args(args)
                 .current_dir(cwd)
                 // The machine's own git config must not decide whether the
