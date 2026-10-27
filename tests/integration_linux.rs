@@ -4732,7 +4732,7 @@ print('CONNECTED')
 
             fn probe(&self) -> String {
                 format!(
-                    "{hook}; echo x >> {hook} && echo HOOK-WRITABLE; \
+                    "exec 2>/dev/null; {hook}; echo x >> {hook} && echo HOOK-WRITABLE; \
                      echo x >> {s} && echo SETTINGS-WRITABLE; \
                      echo x > $HOME/.claude/other && echo ROOT-WRITABLE; exit 0",
                     hook = self.hook.display(),
