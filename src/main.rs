@@ -9310,6 +9310,23 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
             doctor::apparmor_fix(),
         ));
     }
+    // Brokered servers with a keychain login reach the bus only through
+    // xdg-dbus-proxy on Linux (#849).
+    let keychain_servers: Vec<String> = if cfg!(target_os = "linux") {
+        cplt::mcp_broker::load(&cplt::mcp_broker::spec_dir(&home_dir), &[], &[])
+            .specs
+            .into_iter()
+            .filter(|s| s.credential.keychain)
+            .map(|s| s.id)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let dbus_proxy_found = doctor::dbus_proxy_installed;
+    findings.extend(doctor::dbus_proxy_finding(
+        &keychain_servers,
+        dbus_proxy_found(),
+    ));
 
     // ── guards: the three verdicts an agent workflow hits first ──
     // The same decision `cplt check exec` and the launch make, for this repo.
@@ -9608,10 +9625,15 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     }
 
     if fix {
-        match cplt::host_fix::problem(&bubblewrap, doctor::apparmor_restricts_userns()) {
+        let dbus = (!keychain_servers.is_empty() && !dbus_proxy_found())
+            .then_some(cplt::host_fix::Problem::DbusProxyMissing);
+        match cplt::host_fix::problem(&bubblewrap, doctor::apparmor_restricts_userns()).or(dbus) {
             Some(p) => {
                 println!();
                 let fixed = || {
+                    if p == cplt::host_fix::Problem::DbusProxyMissing {
+                        return dbus_proxy_found();
+                    }
                     matches!(
                         doctor::bubblewrap_state(
                             resolved.use_bubblewrap,

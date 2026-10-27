@@ -19,6 +19,19 @@ pub enum Problem {
     BwrapMissing,
     /// `kernel.apparmor_restrict_unprivileged_userns = 1` and bwrap's probe fails.
     AppArmorUserns,
+    /// No xdg-dbus-proxy in a trusted directory: a brokered MCP server with
+    /// a keychain login gets no session bus (#849).
+    DbusProxyMissing,
+}
+
+impl Problem {
+    /// The tool the fix makes work.
+    fn tool(self) -> &'static str {
+        match self {
+            Problem::DbusProxyMissing => "xdg-dbus-proxy",
+            _ => "bubblewrap",
+        }
+    }
 }
 
 /// One command. `stdin` is fed to it; a `tee` step's stdout is discarded.
@@ -50,6 +63,14 @@ const APT: &[Step] = &[Step {
 }];
 const DNF: &[Step] = &[Step {
     argv: &["sudo", "dnf", "install", "-y", "bubblewrap"],
+    stdin: None,
+}];
+const APT_DBUS_PROXY: &[Step] = &[Step {
+    argv: &["sudo", "apt-get", "install", "-y", "xdg-dbus-proxy"],
+    stdin: None,
+}];
+const DNF_DBUS_PROXY: &[Step] = &[Step {
+    argv: &["sudo", "dnf", "install", "-y", "xdg-dbus-proxy"],
     stdin: None,
 }];
 
@@ -102,17 +123,18 @@ pub fn steps(problem: Problem, os_release: &str, shipped: bool) -> Option<&'stat
     match problem {
         Problem::AppArmorUserns if shipped => Some(APPARMOR_SHIPPED),
         Problem::AppArmorUserns => Some(APPARMOR),
-        Problem::BwrapMissing => {
+        Problem::BwrapMissing | Problem::DbusProxyMissing => {
             let ids: Vec<&str> = os_release
                 .lines()
                 .filter_map(|l| l.strip_prefix("ID=").or_else(|| l.strip_prefix("ID_LIKE=")))
                 .flat_map(|v| v.trim_matches(['"', '\'']).split_whitespace())
                 .collect();
             let any = |names: &[&str]| ids.iter().any(|id| names.contains(id));
+            let dbus = problem == Problem::DbusProxyMissing;
             if any(&["debian", "ubuntu"]) {
-                Some(APT)
+                Some(if dbus { APT_DBUS_PROXY } else { APT })
             } else if any(&["fedora", "rhel", "centos"]) {
-                Some(DNF)
+                Some(if dbus { DNF_DBUS_PROXY } else { DNF })
             } else {
                 None
             }
@@ -242,6 +264,7 @@ pub fn offer(
         consents(read)
     };
     let (outcome, text) = apply(
+        problem.tool(),
         steps(problem, &os_release, shipped),
         why,
         existing.as_deref(),
@@ -263,7 +286,9 @@ pub fn offer(
 
 /// [`offer`] with its terminal, lookups, runner and re-check passed in.
 /// `existing`: the current content of the profile a step overwrites.
+#[allow(clippy::too_many_arguments)] // the tool name plus the injected seams
 fn apply(
+    what: &str,
     steps: Option<&[Step]>,
     refused: Option<&str>,
     existing: Option<&str>,
@@ -275,8 +300,7 @@ fn apply(
     let Some(steps) = steps else {
         return (
             Outcome::NotFixed,
-            "No automatic fix for this distribution: install bubblewrap from its packages.\n"
-                .into(),
+            format!("No automatic fix for this distribution: install {what} from its packages.\n"),
         );
     };
     let mut shown = format!("The fix:\n{}", render(steps, find));
@@ -313,11 +337,11 @@ fn apply(
         }
     }
     if recheck() {
-        (Outcome::Fixed, "Fixed: bubblewrap now starts.\n".into())
+        (Outcome::Fixed, format!("Fixed: {what} now starts.\n"))
     } else {
         (
             Outcome::NotFixed,
-            "The commands ran, but bubblewrap still does not start. Run `cplt doctor`.\n".into(),
+            format!("The commands ran, but {what} still does not start. Run `cplt doctor`.\n"),
         )
     }
 }
@@ -358,6 +382,14 @@ mod tests {
         let rocky = "ID=\"rocky\"\nID_LIKE=\"rhel centos fedora\"\n";
         let arch = "ID=arch\n";
         let missing = |os| steps(Problem::BwrapMissing, os, false);
+        assert_eq!(
+            steps(Problem::DbusProxyMissing, "ID=ubuntu\n", false),
+            Some(APT_DBUS_PROXY)
+        );
+        assert_eq!(
+            steps(Problem::DbusProxyMissing, "ID=fedora\n", false),
+            Some(DNF_DBUS_PROXY)
+        );
         assert_eq!(missing(ubuntu), Some(APT));
         assert_eq!(missing(mint), Some(APT));
         assert_eq!(missing(fedora), Some(DNF));
@@ -474,6 +506,7 @@ mod tests {
     fn apply_runs_the_table_only_after_yes() {
         let ran = Ran::default();
         let (out, text) = apply(
+            "bubblewrap",
             Some(APPARMOR),
             None,
             None,
@@ -492,6 +525,7 @@ mod tests {
         );
 
         let (out, text) = apply(
+            "bubblewrap",
             Some(APT),
             Some("--yes is set"),
             None,
@@ -505,16 +539,35 @@ mod tests {
             text.contains("apt-get install -y bubblewrap") && text.contains("--yes"),
             "{text}"
         );
-        let (out, text) = apply(Some(APT), None, None, &fake, || false, never, || true);
+        let (out, text) = apply(
+            "bubblewrap",
+            Some(APT),
+            None,
+            None,
+            &fake,
+            || false,
+            never,
+            || true,
+        );
         assert_eq!(out, Outcome::Declined);
         assert!(text.contains("Not fixed"));
-        let (out, _) = apply(None, None, None, &fake, || panic!("asked"), never, || true);
+        let (out, _) = apply(
+            "bubblewrap",
+            None,
+            None,
+            None,
+            &fake,
+            || panic!("asked"),
+            never,
+            || true,
+        );
         assert_eq!(out, Outcome::NotFixed);
     }
 
     #[test]
     fn apply_names_an_overwritten_profile_and_refuses_unresolved_commands() {
         let (_, text) = apply(
+            "bubblewrap",
             Some(APPARMOR),
             Some("CI is set"),
             Some("profile old {}\n"),
@@ -525,6 +578,7 @@ mod tests {
         );
         assert!(text.contains("/etc/apparmor.d/bwrap exists and will be overwritten. Its content now:\nprofile old {}\n"), "{text}");
         let (_, text) = apply(
+            "bubblewrap",
             Some(APT),
             Some("CI is set"),
             Some("old"),
@@ -540,6 +594,7 @@ mod tests {
 
         let none = |_: &str| None;
         let (out, text) = apply(
+            "bubblewrap",
             Some(APT),
             None,
             None,
@@ -563,6 +618,7 @@ mod tests {
             Err("exit status: 1".to_string())
         };
         let (out, text) = apply(
+            "bubblewrap",
             Some(APPARMOR),
             None,
             None,
@@ -578,7 +634,16 @@ mod tests {
             "{text}"
         );
         let ok = |_: &[String], _: Option<&str>| Ok(());
-        let (out, text) = apply(Some(APT), None, None, &fake, || true, ok, || false);
+        let (out, text) = apply(
+            "bubblewrap",
+            Some(APT),
+            None,
+            None,
+            &fake,
+            || true,
+            ok,
+            || false,
+        );
         assert_eq!(out, Outcome::NotFixed);
         assert!(text.contains("still does not start"));
     }

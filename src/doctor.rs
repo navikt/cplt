@@ -458,6 +458,34 @@ fn probe_reason(raw: &str, home: &Path) -> String {
     )
 }
 
+/// xdg-dbus-proxy in a trusted dir, the one the broker runs (#849).
+#[must_use]
+pub fn dbus_proxy_installed() -> bool {
+    crate::git::trusted_binary("xdg-dbus-proxy").is_some()
+}
+
+/// A brokered MCP server whose login lives in the keychain gets the
+/// session bus only through xdg-dbus-proxy, filtered to the Secret Service
+/// (#849). `servers`: the ids of such specs; `found`: the proxy is in a
+/// trusted dir.
+#[must_use]
+pub fn dbus_proxy_finding(servers: &[String], found: bool) -> Option<Finding> {
+    (!servers.is_empty() && !found).then(|| {
+        Finding::warning(
+            format!(
+                "xdg-dbus-proxy is not installed: the brokered MCP server(s) {} get no session \
+                 bus, so they cannot read their keychain login.",
+                servers.join(", ")
+            ),
+            Some(
+                "install xdg-dbus-proxy from your distribution's packages, or run \
+                 `cplt doctor --fix`"
+                    .to_string(),
+            ),
+        )
+    })
+}
+
 /// Auto-detect (`use_bubblewrap` unset) found no usable bubblewrap, so the
 /// launch runs Landlock + seccomp only and says so in one line nobody reads.
 /// `use_bubblewrap = true` has its own blocking finding; `false` was a choice.
@@ -1446,6 +1474,10 @@ mod tests {
 
     #[test]
     fn bubblewrap_finding_only_on_auto_detect_without_a_usable_bwrap() {
+        assert!(dbus_proxy_finding(&[], false).is_none());
+        assert!(dbus_proxy_finding(&["nais".into()], true).is_none());
+        let f = dbus_proxy_finding(&["nais".into()], false).expect("missing proxy warns");
+        assert!(f.message.contains("nais"), "{}", f.message);
         let missing = Bubblewrap::NotInstalled;
         let f = bubblewrap_finding(&missing, None, None).expect("not installed warns");
         assert_eq!(f.level, Level::Warning);
