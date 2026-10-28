@@ -799,14 +799,14 @@ What stays open:
 
 ## Tools that ignore `HTTPS_PROXY` under `proxy.forced`
 
-`proxy.forced` is on for new installs ([#822](https://github.com/navikt/cplt/issues/822)): the installer writes `forced = true` into a new `config.toml`. An existing install keeps its setting, and `cplt doctor` suggests turning it on. Under `proxy.forced` the proxy is the only way out, so a tool that does not use `HTTP(S)_PROXY` cannot reach the network at all:
+`proxy.forced` is on in configs created by `cplt config init` ([#822](https://github.com/navikt/cplt/issues/822)), except on Linux below Landlock ABI 4. Without the key it stays off: an existing config keeps its setting, and `cplt doctor` suggests turning it on. Under `proxy.forced` the proxy is the only way out, so a tool that does not use `HTTP(S)_PROXY` cannot reach the network at all:
 
 | What | Under `proxy.forced` | Fix |
 |---|---|---|
 | Node.js `fetch()` below 24.5 (undici ignores `HTTPS_PROXY`) | ❌ `EAI_AGAIN` on Linux, `connect EPERM` on macOS | Use Node 24.5 or newer, which honours the `NODE_USE_ENV_PROXY=1` cplt sets, or a proxy-aware client |
 | `curl --noproxy '*'`, or anything that resolves names itself (Go/Rust binaries without proxy support) | ❌ `Could not resolve host` (curl exit code 6) on Linux | Drop `--noproxy`, or make the tool read `HTTPS_PROXY` |
 | QUIC / HTTP/3 | ❌ UDP is blocked | Clients fall back to TCP through the proxy |
-| JVM builds (Gradle, Maven) | ❌ see [Localhost blocking](#localhost-blocking) and [Gradle plugin workers](#gradle-plugin-workers-and-java_tool_options) | Pin the ports, or `--no-proxy-forced` |
+| JVM builds (Gradle, Maven) | ❌ see [Localhost blocking](#localhost-blocking) and [Gradle plugin workers](#gradle-plugin-workers-and-java_tool_options) | macOS: pin the ports. Linux: `--no-proxy-forced`, because the JDK's UDP socket gets `EPERM` whatever the ports |
 | curl, npm, pip and Python `urllib` through the proxy | ✅ Works | |
 
 On Linux, DNS inside the sandbox does not work under `proxy.forced`: a seccomp rule allows only TCP sockets, so `getaddrinfo` cannot open its UDP socket (see [UDP is unrestricted outside proxy-forced](#udp-is-unrestricted-outside-proxy-forced-linux)). Proxy-aware tools are unaffected, because the proxy resolves names. A DNS error inside the sandbox means the tool bypassed the proxy, not that the network is down. cplt says so once per project at launch, and in the agent brief when `sandbox.brief` is on.
