@@ -10837,6 +10837,7 @@ mod agent_stubs {
 
     const STUB: &str = "#!/bin/sh\nfor a; do last=$a; done\n[ \"$last\" = --version ] && { echo GitHub Copilot CLI 1.0.63.; exit 0; }\necho \"ARGV:$*\"\nexec /bin/sh -c \"$last\"\n";
     const SECRET: &str = "HOST-SECRET";
+    const PROJ_SECRET: &str = "PROJ-SECRET";
 
     /// What one agent's sandbox must look like. Paths are HOME-relative.
     struct Case {
@@ -10869,11 +10870,11 @@ mod agent_stubs {
         }
         // HOME is deny-by-default, so the two in HOME only show nothing
         // there leaks through a grant. The project is granted read/write:
-        // only the secret-file denies keep the last two out.
+        // only the secret-file denies keep the last two out (macOS only).
         put(".ssh/id_ed25519", SECRET);
         put(".aws/credentials", SECRET);
-        put("work/proj/.env", SECRET);
-        put("work/proj/id_ed25519", SECRET);
+        put("work/proj/.env", PROJ_SECRET);
+        put("work/proj/id_ed25519", PROJ_SECRET);
         put("outside/file", "x");
         let proj = h.join("work/proj");
         std::fs::create_dir_all(&proj).unwrap();
@@ -10947,6 +10948,10 @@ mod agent_stubs {
             "read-only files must be readable: {ctx}"
         );
         assert!(!out.contains(SECRET), "credential readable: {ctx}");
+        // Linux cannot deny single files inside the project: Landlock grants
+        // the project dir full read, and cplt warns that .env stays readable.
+        #[cfg(target_os = "macos")]
+        assert!(!out.contains(PROJ_SECRET), "project secret readable: {ctx}");
         assert!(!out.contains("WROTE:outside\n"), "{ctx}");
         assert_eq!(
             std::fs::read_to_string(h.join("outside/file")).unwrap(),
