@@ -64,7 +64,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: false,
         default_display: "false",
-        description: "Give the agent a placeholder GitHub token; the proxy puts the real one back for GitHub hosts only (TLS terminated with a per-session CA). Refuses the launch if setup fails.",
+        description: "Give the agent a placeholder GitHub token; the proxy puts the real one back for GitHub hosts only (TLS terminated with a per-session CA). Refuses the launch if setup fails. `cplt config init` writes it as true; without the key it is off.",
     },
     ConfigKeyInfo {
         section: "proxy",

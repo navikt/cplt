@@ -4647,4 +4647,155 @@ print('CONNECTED')
             assert!(!home.proj.join("ran").exists());
         }
     }
+
+    /// #712 Claude hook-script grants (#707) through the real sandbox. The
+    /// agent is a `claude` stub that runs its last argument as a shell
+    /// script. HOME is a fixture under the scratch HOME: bubblewrap replaces
+    /// /tmp, and the hook script must sit outside it.
+    mod claude_hooks {
+        use super::*;
+        use crate::common::scratch_home;
+        use std::os::unix::fs::PermissionsExt;
+
+        const STUB: &str = "#!/bin/sh\nfor a; do last=$a; done\nexec /bin/sh -c \"$last\"\n";
+
+        struct Home {
+            _dir: tempfile::TempDir,
+            h: PathBuf,
+            proj: PathBuf,
+            hook: PathBuf,
+        }
+
+        /// A fake HOME with a `claude` stub and an executable hook script
+        /// outside every writable tree. `settings` (if any) names the hook.
+        fn home(settings: bool) -> Home {
+            let dir = tempfile::Builder::new()
+                .prefix(".cplt-e2e-claude-hooks-")
+                .tempdir_in(scratch_home())
+                .unwrap();
+            let h = fs::canonicalize(dir.path()).unwrap();
+            let exe = |p: &Path, body: &str| {
+                fs::create_dir_all(p.parent().unwrap()).unwrap();
+                fs::write(p, body).unwrap();
+                fs::set_permissions(p, fs::Permissions::from_mode(0o755)).unwrap();
+            };
+            let hook = h.join("hooks/gate.sh");
+            exe(&hook, "#!/bin/sh\necho HOOK-RAN\n");
+            exe(&h.join(".local/bin/claude"), STUB);
+            fs::create_dir_all(h.join(".claude")).unwrap();
+            if settings {
+                let json = format!(
+                    r#"{{"hooks":{{"PreToolUse":[{{"hooks":[{{"type":"command","command":"{}"}}]}}]}}}}"#,
+                    hook.display()
+                );
+                fs::write(h.join(".claude/settings.json"), json).unwrap();
+            }
+            let proj = h.join("work/proj");
+            fs::create_dir_all(&proj).unwrap();
+            Home {
+                _dir: dir,
+                h,
+                proj,
+                hook,
+            }
+        }
+
+        impl Home {
+            /// Run `script` as the claude agent under `flag`: (code, stdout, stderr).
+            fn run(&self, flag: &str, script: &str) -> (i32, String, String) {
+                let mut cmd = cplt_cmd();
+                for v in [
+                    "XDG_CONFIG_HOME",
+                    "XDG_DATA_HOME",
+                    "XDG_STATE_HOME",
+                    "XDG_CACHE_HOME",
+                    "CLAUDE_CONFIG_DIR",
+                ] {
+                    cmd.env_remove(v);
+                }
+                let o = cmd
+                    .current_dir(&self.proj)
+                    .env("HOME", &self.h)
+                    .env(
+                        "PATH",
+                        format!("{}:/usr/bin:/bin", self.h.join(".local/bin").display()),
+                    )
+                    .args(["--yes", "--agent", "claude", flag, "--", script])
+                    .output()
+                    .expect("cplt should run");
+                (
+                    o.status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&o.stdout).into_owned(),
+                    String::from_utf8_lossy(&o.stderr).into_owned(),
+                )
+            }
+
+            fn probe(&self) -> String {
+                format!(
+                    "exec 2>/dev/null; {hook}; echo x >> {hook} && echo HOOK-WRITABLE; \
+                     echo x >> {s} && echo SETTINGS-WRITABLE; \
+                     echo x > $HOME/.claude/other && echo ROOT-WRITABLE; exit 0",
+                    hook = self.hook.display(),
+                    s = self.h.join(".claude/settings.json").display()
+                )
+            }
+        }
+
+        /// Under bubblewrap the hook runs, and neither it nor `settings.json`
+        /// (which names it) can be written. The rest of the root stays writable.
+        #[test]
+        fn bwrap_grants_the_hook_read_exec_only() {
+            require_bwrap!();
+            let home = home(true);
+            let (code, out, err) = home.run("--use-bubblewrap", &home.probe());
+            assert_eq!(code, 0, "{out}\n{err}");
+            assert!(out.contains("HOOK-RAN"), "hook did not run:\n{out}\n{err}");
+            assert!(!out.contains("HOOK-WRITABLE"), "{out}");
+            assert!(!out.contains("SETTINGS-WRITABLE"), "{out}");
+            assert!(out.contains("ROOT-WRITABLE"), "{out}\n{err}");
+            assert_eq!(
+                fs::read_to_string(&home.hook).unwrap(),
+                "#!/bin/sh\necho HOOK-RAN\n"
+            );
+        }
+
+        /// A missing `settings.json` is seeded as `{}` before launch, so the
+        /// read-only bind covers it and the agent cannot plant hooks.
+        #[test]
+        fn bwrap_seeds_a_missing_settings_json_read_only() {
+            require_bwrap!();
+            let home = home(false);
+            let s = home.h.join(".claude/settings.json");
+            let (code, out, err) = home.run(
+                "--use-bubblewrap",
+                &format!(
+                    "echo PLANTED > {} && echo SETTINGS-WRITABLE; exit 0",
+                    s.display()
+                ),
+            );
+            assert_eq!(code, 0, "{out}\n{err}");
+            assert!(!out.contains("SETTINGS-WRITABLE"), "{out}");
+            assert_eq!(fs::read_to_string(&s).unwrap(), "{}\n");
+        }
+
+        /// Landlock alone leaves the whole root writable, so the hook gets no
+        /// grant, and cplt says so instead of refusing the launch.
+        #[test]
+        fn landlock_only_drops_the_hook_grant() {
+            require_landlock!();
+            let home = home(true);
+            let (code, out, err) = home.run("--no-bubblewrap", &home.probe());
+            assert_eq!(code, 0, "{out}\n{err}");
+            assert!(!out.contains("HOOK-RAN"), "hook ran without bwrap:\n{out}");
+            assert!(out.contains("ROOT-WRITABLE"), "{out}\n{err}");
+            let hook = home.hook.display().to_string();
+            assert!(
+                err.lines()
+                    .any(|l| l.contains("Claude hook script grant on")
+                        && l.contains("NOT applied without Bubblewrap")
+                        && l.contains(&hook)),
+                "missing cplt warning naming {hook}:\n{err}"
+            );
+        }
+    }
 }

@@ -2513,6 +2513,27 @@ fn state_split_finding(home: &Path) -> Option<cplt::doctor::Finding> {
     ))
 }
 
+/// #820: configs from `cplt config init` turn proxy-side token injection on;
+/// older configs never had the key. Nudge those, never flip them. An explicit
+/// `false` silences it.
+fn inject_github_token_nudge(resolved: &config::Resolved) -> Option<cplt::doctor::Finding> {
+    let unset =
+        resolved.bool_layer("proxy", "inject_github_token") == Some(config::ConfigLayer::Baseline);
+    (unset && resolved.with_proxy).then(|| {
+        cplt::doctor::Finding::warning(
+            "proxy.inject_github_token is not set, so the agent gets your real GitHub token. \
+             New configs turn it on: the agent gets a placeholder and the proxy adds the token \
+             for GitHub hosts only.",
+            Some(
+                "`cplt config set proxy.inject_github_token true`, or `false` to keep the token \
+                 in the sandbox (GitHub Packages, ghcr.io or GitHub Enterprise with that token) \
+                 and silence this"
+                    .to_string(),
+            ),
+        )
+    })
+}
+
 fn config_findings(
     resolved: &config::Resolved,
     agent: agent::Agent,
@@ -2554,6 +2575,7 @@ fn config_findings(
         };
         out.push(Finding::warning(note, Some(fix)));
     }
+    out.extend(inject_github_token_nudge(resolved));
     if resolved.localhost_any_ignored {
         out.push(Finding::warning(
             "allow_localhost_any is set, but proxy.forced overrides it: it opens no localhost \
@@ -6878,10 +6900,24 @@ fn assemble_sandbox(
     // injection cannot run refuses the launch: falling back would hand the
     // agent the real token they asked to keep from it.
     if resolved.inject_github_token {
+        // #820: new configs set the key, so the user may never have typed the flag.
+        let (name, off) = if resolved.bool_layer("proxy", "inject_github_token")
+            == Some(config::ConfigLayer::Cli)
+        {
+            (
+                "--inject-github-token",
+                "pass --no-inject-github-token in its place",
+            )
+        } else {
+            (
+                "proxy.inject_github_token",
+                "pass --no-inject-github-token, or set proxy.inject_github_token = false",
+            )
+        };
         let refuse = |why: String, fix: &str| {
             anyhow::anyhow!(
-                "--inject-github-token cannot run ({why}), and without it the agent \
-                 would get the real token: {fix}, or drop --inject-github-token."
+                "{name} cannot run ({why}), and without it the agent \
+                 would get the real token: {fix}, or {off}."
             )
         };
         if proxy_handle.is_none() {
@@ -8035,6 +8071,9 @@ fn run_check_command(
             gh_exec_token_available(&resolved, active_agent, prepared.keychain_substitute()),
         ) {
             println!("\nNote: {note}");
+        }
+        if let Some(n) = inject_github_token_nudge(&resolved) {
+            println!("\nNote: {} Fix: {}", n.message, n.fix.unwrap_or_default());
         }
         // Claude only: for Copilot this would run `gh auth token`.
         let has_token = active_agent == agent::Agent::Claude
@@ -15861,9 +15900,12 @@ mod tests {
                     discover::gh_wrapper_available(),
                     "fixture discovered without execution"
                 );
-                let mut r = config::Config::default()
-                    .merge(config::CliFlags::default())
-                    .unwrap();
+                // An explicit key: the #820 nudge is not under test here.
+                let mut r =
+                    toml::from_str::<config::Config>("[proxy]\ninject_github_token = false\n")
+                        .unwrap()
+                        .merge(config::CliFlags::default())
+                        .unwrap();
                 r.gh_guard.enabled = true;
                 r.scratch_dir = true;
                 r.gh_guard.block_auth_token = true;
@@ -16026,6 +16068,8 @@ mod tests {
         let messages = |r: &config::Resolved, agent, macos, gh_token| -> Vec<String> {
             config_findings(r, agent, macos, gh_token)
                 .into_iter()
+                // The #820 nudge has its own test.
+                .filter(|f| !f.message.starts_with("proxy.inject_github_token"))
                 .inspect(|f| assert!(f.fix.is_some(), "every finding has a fix: {f:?}"))
                 .map(|f| f.message)
                 .collect()
@@ -16052,7 +16096,8 @@ mod tests {
 
         // pass_env naming a token gh no longer needs.
         let pass = resolve("[sandbox]\npass_env = [\"GH_TOKEN\"]\n");
-        let f = config_findings(&pass, agent::Agent::Claude, false, true);
+        let mut f = config_findings(&pass, agent::Agent::Claude, false, true);
+        f.retain(|f| !f.message.starts_with("proxy.inject_github_token"));
         assert_eq!(f.len(), 1, "{f:?}");
         assert!(f[0].message.starts_with("GH_TOKEN passed to"), "{f:?}");
         assert!(
@@ -16088,6 +16133,47 @@ mod tests {
             messages(&denied, agent::Agent::Shell, true, true).is_empty(),
             "an agent with no token variable has nothing to lose"
         );
+    }
+
+    /// #820: an existing config without the key gets a nudge, never a flip;
+    /// an explicit value, or the proxy off, silences it.
+    #[test]
+    fn inject_github_token_nudge_only_when_unset() {
+        let resolve = |toml: &str| {
+            toml::from_str::<config::Config>(toml)
+                .expect("test config parses")
+                .merge(config::CliFlags::default())
+                .expect("test config merges")
+        };
+        let old = resolve("");
+        assert!(
+            !old.inject_github_token,
+            "existing configs keep the real token"
+        );
+        let n = inject_github_token_nudge(&old).expect("unset key is nudged");
+        assert!(n.fix.unwrap().contains("proxy.inject_github_token true"));
+        for toml in [
+            "[proxy]\ninject_github_token = false\n",
+            "[proxy]\ninject_github_token = true\n",
+            "[proxy]\nenabled = false\n",
+        ] {
+            assert!(
+                inject_github_token_nudge(&resolve(toml)).is_none(),
+                "{toml}"
+            );
+        }
+        let cli = toml::from_str::<config::Config>("")
+            .unwrap()
+            .merge(config::CliFlags {
+                inject_github_token: config::FeatureToggle::ForceOff,
+                ..config::CliFlags::default()
+            })
+            .unwrap();
+        assert!(inject_github_token_nudge(&cli).is_none());
+        // A fresh `cplt config init` file turns it on.
+        let fresh = resolve(&config::default_config_contents());
+        assert!(fresh.inject_github_token);
+        assert!(inject_github_token_nudge(&fresh).is_none());
     }
 
     #[test]

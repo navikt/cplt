@@ -25,8 +25,8 @@ use super::policy::{
     DEPENDENCY_SOURCE_TREES, EXEC_IN_WRITABLE, GPG_SIGNING_ALLOW_FILES, HOME_CONFIG_FILES,
     HomeToolDir, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir,
     SENSITIVE_KEY_FILE_EXTENSION_PATTERNS, SENSITIVE_PROJECT_PATTERNS, SSH_PRIVATE_KEY_NAMES,
-    SYSTEM_READ_FILES, TOOL_READ_DIRS, XCODE_SELECT_LINK, active_tool_dirs, ancestor_alternation,
-    app_dirs, colima_socket_paths, copilot_default_pkg_dir, current_uid,
+    SYSTEM_READ_FILES, TOOL_READ_DIRS, XCODE_SELECT_LINK, YARN_CONFIG_DIR, active_tool_dirs,
+    ancestor_alternation, app_dirs, colima_socket_paths, copilot_default_pkg_dir, current_uid,
     cypress_app_data_dir_with_env, cypress_runtime_intent, escape_regex, first_party_read_target,
     grant_is_refused, home_config_link_targets, missing_home_config_link_targets,
     nested_alternation, path_bin_dirs, playwright_runtime_intent, pnpm_config_dirs,
@@ -1129,6 +1129,25 @@ fn emit_system_access(
     // is already left out.
     for p in crate::sandbox::policy::gh_config_files_elsewhere(Path::new(home)) {
         emit_home_config_read(sb, home, &p.to_string_lossy());
+    }
+    // The directory node only, not its contents (#881). Seatbelt matches the
+    // resolved path, so a linked `~/.config` needs the target named too,
+    // unless it is or holds a credential directory. Directories only, so a
+    // regular file hardlinked there (a key, say) is not read through it.
+    let yarn_dir = Path::new(home).join(YARN_CONFIG_DIR);
+    let dir_read = |p: &Path| {
+        format!(
+            "(allow file-read* (require-all (literal \"{}\") (vnode-type DIRECTORY)))",
+            p.display()
+        )
+    };
+    sbpl!(sb, "{}", dir_read(&yarn_dir));
+    if let Ok(target) = std::fs::canonicalize(&yarn_dir)
+        && target != yarn_dir
+        && validate_sbpl_path(&target).is_ok()
+        && crate::sandbox::policy::refused_first_party_dir(Path::new(home), &yarn_dir).is_none()
+    {
+        sbpl!(sb, "{}", dir_read(&target));
     }
     sbpl!(sb);
 }
@@ -4245,6 +4264,7 @@ mod tests {
             .expect("home config section")
             .lines()
             .take_while(|l| !l.is_empty())
+            .filter(|l| !l.contains("(vnode-type DIRECTORY)"))
             .map(|l| {
                 l.strip_prefix("(allow file-read* (literal \"/Users/test/")
                     .and_then(|l| l.strip_suffix("\"))"))
@@ -4253,6 +4273,12 @@ mod tests {
             .collect();
         let expected: std::collections::BTreeSet<&str> =
             HOME_CONFIG_FILES.iter().copied().collect();
+        // Plus yarn's config dir: the node, not its contents, and only as a
+        // directory, so a file hardlinked there is not read through it.
+        assert!(p.contains(&format!(
+            "(allow file-read* (require-all (literal \"/Users/test/{YARN_CONFIG_DIR}\") \
+             (vnode-type DIRECTORY)))"
+        )));
         assert_eq!(
             section, expected,
             "macOS home config grants drifted from the shared list"
