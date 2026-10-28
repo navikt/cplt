@@ -4623,7 +4623,16 @@ fn capture_launch_facts(
                 // a private repository over HTTPS would never answer ls-remote.
                 match parse_repo_from_url(&url) {
                     Some(repo) => gh_default_branch(&repo, left),
-                    None => ls_remote_default_branch(&url, left),
+                    None => ls_remote_default_branch(&url, left).unwrap_or_else(|failed| {
+                        if crate::ui::verbose() {
+                            crate::ui::info(&format!(
+                                "default branch of remote {remote}: {failed} (pushes fail closed)"
+                            ));
+                        }
+                        #[cfg(test)]
+                        LAST_ASK_FAILED.with(|f| f.set(Some(failed)));
+                        None
+                    }),
                 }
             });
         let Some(Some(branch)) = answers.next() else {
@@ -4765,13 +4774,21 @@ const LS_REMOTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5)
 /// settings) plays no part, and `GIT_ALLOW_PROTOCOL` refuses `ext::` whatever
 /// the URL says. It also runs in a new session: with no controlling terminal,
 /// ssh cannot open `/dev/tty` to ask for a passphrase mid-launch.
-fn ls_remote_default_branch(url: &str, timeout: std::time::Duration) -> Option<String> {
+///
+/// `Ok(None)` is the remote's answer: no symref, or git refused the URL.
+/// `Err` means the remote was never heard from, so the caller can tell a
+/// loaded machine apart from a remote with no HEAD.
+fn ls_remote_default_branch(
+    url: &str,
+    timeout: std::time::Duration,
+) -> Result<Option<String>, AskFailed> {
     use std::io::Read as _;
     use std::os::unix::process::CommandExt as _;
     let mut cmd = crate::git::command(
         Path::new("/"),
         &["ls-remote", "--symref", "--", url, "HEAD"],
-    )?;
+    )
+    .ok_or(AskFailed::Spawn)?;
     cmd.env("GIT_ALLOW_PROTOCOL", "file:git:http:https:ssh")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
@@ -4782,8 +4799,8 @@ fn ls_remote_default_branch(url: &str, timeout: std::time::Duration) -> Option<S
             Ok(())
         });
     }
-    let mut child = cmd.spawn().ok()?;
-    let mut stdout = child.stdout.take()?;
+    let mut child = cmd.spawn().map_err(|_| AskFailed::Spawn)?;
+    let mut stdout = child.stdout.take().ok_or(AskFailed::Spawn)?;
     let reader = std::thread::spawn(move || {
         let mut buf = String::new();
         let _ = stdout.read_to_string(&mut buf);
@@ -4803,15 +4820,41 @@ fn ls_remote_default_branch(url: &str, timeout: std::time::Duration) -> Option<S
                     unsafe { libc::kill(-pid, libc::SIGKILL) };
                 }
                 let _ = child.wait();
-                return None;
+                return Err(AskFailed::Timeout);
             }
         }
     };
-    let out = reader.join().ok()?;
-    if !status.success() {
-        return None;
+    let out = reader.join().unwrap_or_default();
+    Ok(status
+        .success()
+        .then(|| parse_ls_remote_head(&out))
+        .flatten())
+}
+
+/// Why `ls-remote` gave no answer at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AskFailed {
+    /// git could not be started (no trusted git, or the spawn itself failed).
+    Spawn,
+    /// The launch budget ran out first.
+    Timeout,
+}
+
+impl std::fmt::Display for AskFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            AskFailed::Spawn => "git ls-remote could not start",
+            AskFailed::Timeout => "git ls-remote timed out",
+        })
     }
-    parse_ls_remote_head(&out)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The last [`AskFailed`] a launch on this thread met, for tests that must
+    /// tell a loaded machine apart from a wrong answer.
+    static LAST_ASK_FAILED: std::cell::Cell<Option<AskFailed>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// `ref: refs/heads/<branch>\tHEAD` out of `git ls-remote --symref` output.
@@ -9199,7 +9242,15 @@ mod tests {
             "premise: no local symref"
         );
 
+        LAST_ASK_FAILED.with(|f| f.set(None));
         let facts = capture_repo_facts_at_launch(&git, &repo, true);
+        if let Some(failed) = LAST_ASK_FAILED.with(std::cell::Cell::take) {
+            // A loaded machine (#840): git did not start or did not finish in
+            // the launch budget. That must fail closed, not bake a guess.
+            assert!(facts.default_branches.is_empty(), "{failed}: nothing baked");
+            eprintln!("skipping the rest: {failed}");
+            return;
+        }
         assert_eq!(
             facts.default_branches.get("origin").map(String::as_str),
             Some("trunk"),
@@ -9313,6 +9364,11 @@ mod tests {
         let facts = capture_repo_facts_at_launch(&git, &repo, true);
         assert!(facts.default_branches.is_empty(), "nothing to bake");
         assert!(push("feature/x", &facts).is_err(), "fails closed");
+        assert_eq!(
+            ls_remote_default_branch("/nonexistent/cplt-origin", LS_REMOTE_TIMEOUT),
+            Ok(None),
+            "a remote that answers no is an answer, not a failure to ask"
+        );
 
         // A remote that never answers (a listener that accepts the connection
         // and says nothing) is cut off at the timeout, and fails closed too.
@@ -9323,6 +9379,11 @@ mod tests {
         let facts = capture_repo_facts_at_launch(&git, &repo, true);
         let waited = started.elapsed();
         assert!(facts.default_branches.is_empty(), "nothing to bake");
+        assert_eq!(
+            LAST_ASK_FAILED.with(std::cell::Cell::take),
+            Some(AskFailed::Timeout),
+            "a hung remote is reported as a timeout"
+        );
         assert!(
             waited >= std::time::Duration::from_millis(4500),
             "premise: the remote must actually have hung, returned after {waited:?}"
