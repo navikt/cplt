@@ -247,6 +247,9 @@ pub struct SandboxConfig<'a> {
     pub root_agents_md: Option<&'a Path>,
     pub allow_gpg_signing: bool,
     pub deny_clipboard: bool,
+    /// `proxy.deny_dns` under `proxy.forced` (#653): close the resolver
+    /// socket and the dnssd Mach services. macOS only.
+    pub deny_dns: bool,
     /// `sandbox.deny_nested_git` (#576): deny creating a `.git` entry below a
     /// writable root. macOS only; Linux has no way to express it.
     pub deny_nested_git: bool,
@@ -4311,6 +4314,7 @@ mod tests {
             root_agents_md: None,
             allow_gpg_signing: false,
             deny_clipboard: false,
+            deny_dns: false,
             deny_nested_git: false,
             refuse_cache_exec_links: false,
             deny_key_files_by_extension: false,

@@ -2483,7 +2483,10 @@ fn git_gate_allows_a_push_from_a_worktree_of_the_launch_repository() {
     // that is a normal way to work, not a bypass.
     let launch = temp_repo_live("navikt/cplt", "main", &[]);
     let facts = launch_facts(launch.path());
-    let wt = launch.path().parent().unwrap().join("cplt-wt");
+    // A directory of its own: a fixed name in the shared temp dir collides
+    // with this test in another process running at the same time.
+    let wt_parent = tempfile::tempdir().unwrap();
+    let wt = wt_parent.path().join("cplt-wt");
     assert!(git_ok(
         launch.path(),
         &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "wt/x"],
@@ -2506,8 +2509,6 @@ fn git_gate_allows_a_push_from_a_worktree_of_the_launch_repository() {
         !stderr.contains("does not run in the repository this session was launched in"),
         "a worktree of the launch repository is the launch repository.\nstderr: {stderr}"
     );
-
-    std::fs::remove_dir_all(&wt).ok();
 }
 
 // ============================================================

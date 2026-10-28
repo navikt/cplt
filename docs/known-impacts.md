@@ -770,6 +770,49 @@ When the proxy is on (the default), cplt injects the standard `HTTP(S)_PROXY` en
 
 cplt does not restrict outbound *domains* by default, but the proxy still enforces the port policy, the private-IP and localhost safeguards, and any configured allowlist or blocklist. To see what happened, run with the proxy log (`--proxy-log <file>` or `--proxy-log-level all`) and look for `BLOCKED` lines. If nothing was blocked, the request left cplt and the fault is client-side. `BLOCKED-*` lines mean a port or a configured list stopped it, a policy question rather than a client bug.
 
+## DNS lockdown (`proxy.deny_dns`, macOS)
+
+Off by default. With `proxy.forced` on, `cplt config set proxy.deny_dns true` takes the system resolver away from the agent: the profile drops the `/private/var/run/mDNSResponder` socket and denies the mDNSResponder Mach services (`com.apple.dnssd.service`, `com.apple.mDNSResponder.*`). A DNS query can then no longer carry data out past the proxy ([#653](https://github.com/navikt/cplt/issues/653)). The agent's own processes can then only reach a name through the proxy, which resolves the host name in the `CONNECT` request, so the allowlist and the proxy log see those lookups.
+
+Without `proxy.forced` the key does nothing and cplt says so at launch.
+
+`proxy.forced` on its own, with or without this key, also denies `com.apple.nsurlsessiond`. That daemon runs background `URLSession` transfers outside the sandbox and the proxy, so macOS tools that hand downloads or uploads to a background session (some Swift and Xcode tooling, `softwareupdate`-style downloaders) fail under `proxy.forced`.
+
+Checked with cplt on macOS 26 ([#653](https://github.com/navikt/cplt/issues/653)):
+
+| Tool | With `deny_dns` | Why |
+| --- | --- | --- |
+| `curl`, `git` over HTTPS, `gh`, Node.js `fetch` (cplt sets `NODE_USE_ENV_PROXY`), Python `urllib` | ✅ works | sends the host name to the proxy, resolves nothing itself |
+| `getaddrinfo` callers: Node.js `dns.lookup`, Python `socket.getaddrinfo`, `dscacheutil` | ❌ "not known" / `ENOTFOUND` | they ask the system resolver, which is closed |
+| `ssh` (also `git@github.com:`) | ❌ "Could not resolve hostname" | port 22 is closed under `proxy.forced` anyway |
+| NSURLSession, Swift `URLSession`, `nscurl` | ❌ NSURLError -1003 | ignores `HTTPS_PROXY` and resolves through `com.apple.dnssd.service`; under `proxy.forced` alone it already fails at connect |
+| A client that resolves first, then connects through the proxy by IP | ❌ | resolve before the proxy, so it gets no address. Check its proxy settings for a "remote DNS" or `socks5h`-style option |
+
+Expected to work but not run in this check: the Copilot CLI, OpenCode and Claude Code, `npm`, `pip` and Go programs, all of which hand the host name to `HTTPS_PROXY`. A tool that fails only with `deny_dns` resolves names itself; turn the key off for that run's config, or run the tool outside cplt.
+
+What stays open:
+
+- System daemons that do network work for the agent resolve outside the sandbox. `trustd` is needed for TLS: when the agent has a crafted certificate verified, trustd looks up and fetches the certificate's AIA, OCSP or CRL URLs, so a name the agent picks still reaches DNS.
+- Loopback UDP to a port opened with `allow.localhost` (`--allow-localhost <PORT>`) reaches a local resolver if one listens there.
+
+**Linux:** the key has no effect, and cplt says so at launch. `proxy.forced` already blocks direct UDP DNS there. Lookups through a local Unix-socket resolver (nss-resolve, nscd) below kernel 7.1 are not closed and not tested; a full fix needs the network namespace tracked in [#114](https://github.com/navikt/cplt/issues/114).
+
+## Tools that ignore `HTTPS_PROXY` under `proxy.forced`
+
+`proxy.forced` is on in configs created by `cplt config init` ([#822](https://github.com/navikt/cplt/issues/822)), except on Linux below Landlock ABI 4. Without the key it stays off: an existing config keeps its setting, and `cplt doctor` suggests turning it on. Under `proxy.forced` the proxy is the only way out, so a tool that does not use `HTTP(S)_PROXY` cannot reach the network at all:
+
+| What | Under `proxy.forced` | Fix |
+|---|---|---|
+| Node.js `fetch()` below 24.5 (undici ignores `HTTPS_PROXY`) | ❌ `EAI_AGAIN` on Linux, `connect EPERM` on macOS | Use Node 24.5 or newer, which honours the `NODE_USE_ENV_PROXY=1` cplt sets, or a proxy-aware client |
+| `curl --noproxy '*'`, or anything that resolves names itself (Go/Rust binaries without proxy support) | ❌ `Could not resolve host` (curl exit code 6) on Linux | Drop `--noproxy`, or make the tool read `HTTPS_PROXY` |
+| QUIC / HTTP/3 | ❌ UDP is blocked | Clients fall back to TCP through the proxy |
+| JVM builds (Gradle, Maven) | ❌ see [Localhost blocking](#localhost-blocking) and [Gradle plugin workers](#gradle-plugin-workers-and-java_tool_options) | macOS: pin the ports. Linux: `--no-proxy-forced`, because the JDK's UDP socket gets `EPERM` whatever the ports |
+| curl, npm, pip and Python `urllib` through the proxy | ✅ Works | |
+
+On Linux, DNS inside the sandbox does not work under `proxy.forced`: a seccomp rule allows only TCP sockets, so `getaddrinfo` cannot open its UDP socket (see [UDP is unrestricted outside proxy-forced](#udp-is-unrestricted-outside-proxy-forced-linux)). Proxy-aware tools are unaffected, because the proxy resolves names. A DNS error inside the sandbox means the tool bypassed the proxy, not that the network is down. cplt says so once per project at launch, and in the agent brief when `sandbox.brief` is on.
+
+**Recovery:** `--no-proxy-forced` for one run, or `cplt config set proxy.forced false` to keep it off.
+
 ## Docker and Testcontainers
 
 Docker is **intentionally blocked**. `~/.docker` is denied, and on macOS the Docker socket is not reachable, since `(deny default)` covers `network-outbound` to unix sockets. Docker gives near-root access to the host system, which defeats the purpose of sandboxing.

@@ -806,6 +806,7 @@ The settings below are machine-specific or local CLI preferences, so `.cplt.toml
 | `sandbox.allow_cache_exec_any` | too broad for repo policy |
 | `proxy.enabled` | local proxy preference |
 | `proxy.forced` | forcing all egress through the proxy is a local security preference, not project policy |
+| `proxy.deny_dns` | closing DNS is a local security preference that goes with `proxy.forced` |
 | `proxy.port` | port conflicts are machine-specific |
 | `proxy.log_file` | local log path |
 | `proxy.log_level` | local verbosity preference |
@@ -1070,7 +1071,7 @@ Keys not covered in a section above. `cplt config explain <key>` prints the same
 
 ## Configuration file
 
-The config file lives at `~/.config/cplt/config.toml`. `cplt config init` writes a commented starter template there. It covers `[proxy]`, `[proxy.subscriptions]`, `[allow]`, `[deny]`, `[sandbox]`, `[gh_guard]`, and `[git_guard]`, with every key commented out and documented inline, so a fresh file changes nothing until you uncomment something. Run it and read the result rather than copying a snippet from here, since the template is generated from `src/config/path.rs` and moves with the code:
+The config file lives at `~/.config/cplt/config.toml`. `cplt config init` writes a commented starter template there. It covers `[proxy]`, `[proxy.subscriptions]`, `[allow]`, `[deny]`, `[sandbox]`, `[gh_guard]`, and `[git_guard]`, with every key documented inline. One key is set: `proxy.forced = true` ([#822](https://github.com/navikt/cplt/issues/822)), left commented out on Linux below Landlock ABI 4, where forced mode cannot launch. Every other key is commented out. An existing config is never changed: without the key `proxy.forced` stays off, and `cplt doctor` suggests it. Run it and read the result rather than copying a snippet from here, since the template is generated from `src/config/path.rs` and moves with the code:
 
 ```bash
 cplt config init

@@ -309,6 +309,27 @@ else
   echo "✓ cplt is ready! (${INSTALLED_VERSION})"
 fi
 
+# ─── Starter config ──────────────────────────────────────────────────────────
+# New users get the defaults `cplt config init` writes. An existing config
+# (file, symlink or dangling symlink) is never touched; init refuses it too.
+# Skipped as root or under sudo: HOME may be another user's and the file
+# would get the wrong owner. Skipped next to an xdg-pinned marker too: the
+# user's config may then live under XDG_CONFIG_HOME.
+
+if [[ "$(id -u)" != 0 && -z "${SUDO_USER:-}" ]]; then
+  if CONFIG_PATH=$("${INSTALL_DIR}/${BINARY}" config path 2>/dev/null) && [[ -n "$CONFIG_PATH" ]]; then
+    if [[ ! -e "$CONFIG_PATH" && ! -L "$CONFIG_PATH" && ! -e "$(dirname "$CONFIG_PATH")/xdg-pinned" ]]; then
+      if "${INSTALL_DIR}/${BINARY}" config init </dev/null >/dev/null 2>&1; then
+        echo "  ✓ Created starter config: ${CONFIG_PATH}"
+      else
+        echo "⚠ Could not create a starter config. Run 'cplt config init' later."
+      fi
+    fi
+  else
+    echo "⚠ Could not resolve the config path. Run 'cplt config init' later."
+  fi
+fi
+
 echo ""
 echo "Get started:"
 echo "  cplt doctor                 # Check your environment"

@@ -60,6 +60,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "proxy",
+        key: "deny_dns",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "false",
+        description: "macOS, with proxy.forced only: deny the agent the system resolver (the mDNSResponder socket and its Mach services), so names are looked up only by the proxy and a DNS query cannot carry data out. Tools that resolve a name before using the proxy stop working; see docs/known-impacts.md. No effect on Linux.",
+    },
+    ConfigKeyInfo {
+        section: "proxy",
         key: "inject_github_token",
         value_type: ConfigValueType::Bool,
         dangerous: false,
@@ -984,6 +992,13 @@ bool_keys! {
         config = |c: &Config| c.proxy.forced,
         baseline = |b: PresetBaseline| b.proxy_forced,
         resolved = |r: &Resolved| r.proxy_forced;
+
+    /// Config-only (#653). Takes effect only together with `proxy_forced`.
+    deny_dns, "proxy", "deny_dns",
+        cli = |_: &CliFlags| FeatureToggle::UseDefault,
+        config = |c: &Config| c.proxy.deny_dns,
+        baseline = |_: PresetBaseline| false,
+        resolved = |r: &Resolved| r.deny_dns;
 
     inject_github_token, "proxy", "inject_github_token",
         cli = |c: &CliFlags| c.inject_github_token,

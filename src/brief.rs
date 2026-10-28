@@ -396,6 +396,13 @@ pub fn generate_session_brief(facts: &BriefFacts) -> String {
                  is blocked by the kernel and there is no route around the \
                  proxy.\n",
             );
+            if cfg!(target_os = "linux") {
+                out.push_str(
+                    "- DNS and UDP are blocked too. A DNS error (`EAI_AGAIN`, \
+                     `Could not resolve host`) means the tool ignores \
+                     `HTTPS_PROXY`, not that the network is down.\n",
+                );
+            }
         } else {
             out.push_str(
                 "- Only the proxy enforces that. `proxy_forced` is off this \
@@ -930,6 +937,7 @@ mod tests {
             bool_layers: Vec::new(),
             with_proxy: true,
             proxy_forced: false,
+            deny_dns: false,
             inject_github_token: false,
             github_mcp_proxy: true,
             mcp_broker: true,
