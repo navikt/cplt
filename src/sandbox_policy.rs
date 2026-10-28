@@ -1801,9 +1801,8 @@ pub const ENV_PREFIX_ALLOWLIST: &[&str] = &[
     "AGY_",            // Antigravity CLI runtime configuration
     // OpenTelemetry vendor-neutral configuration (OTEL_SERVICE_NAME, OTEL_EXPORTER_OTLP_ENDPOINT,
     // OTEL_EXPORTER_OTLP_PROTOCOL, OTEL_RESOURCE_ATTRIBUTES, OTEL_LOG_LEVEL, etc.).
-    // OTEL_EXPORTER_OTLP_HEADERS may carry opt-in auth headers (e.g. "Authorization=Bearer
-    // <token>"); this is an accepted trade-off in the same class as GH_TOKEN — only present
-    // when the user has explicitly configured an exporter. The is_secret_suffix deny-list
+    // OTEL_EXPORTER_OTLP_HEADERS (and its _TRACES/_METRICS/_LOGS variants) pass with the
+    // Authorization pair removed (redact_otlp_auth in sandbox_env.rs, #878). The is_secret_suffix deny-list
     // still strips any OTEL_*_TOKEN / _AUTH / _SECRET / _KEY / _PASSWORD / _CREDENTIALS vars.
     "OTEL_",
 ];

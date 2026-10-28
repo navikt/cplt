@@ -185,7 +185,7 @@ pub fn build_sandbox_env(
             {
                 // Avoid duplicates from the explicit allowlist
                 if !env.vars.iter().any(|(k, _)| k == key) {
-                    env.vars.push((key.clone(), val.clone()));
+                    env.vars.push((key.clone(), redact_otlp_auth(key, val)));
                 }
             }
         }
@@ -829,8 +829,47 @@ fn strip_dangerous_node_flags(value: &str) -> String {
     result.join(" ")
 }
 
+/// Drop the `Authorization` pair from an OTLP headers value (#878). The other
+/// headers pass through so the exporter keeps working; the bearer token does not
+/// reach the sandbox. Never fails: a value without the pair is returned as is.
+fn redact_otlp_auth(key: &str, val: &str) -> String {
+    let is_headers = key == "OTEL_EXPORTER_OTLP_HEADERS"
+        || ["TRACES", "METRICS", "LOGS"]
+            .iter()
+            .any(|s| key == format!("OTEL_EXPORTER_OTLP_{s}_HEADERS"));
+    if !is_headers {
+        return val.to_string();
+    }
+    val.split(',')
+        .filter(|pair| {
+            !pair
+                .split('=')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("authorization")
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn otlp_headers_drop_only_authorization() {
+        assert_eq!(
+            redact_otlp_auth(
+                "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+                "x-team=a, authorization=Bearer t,b=c"
+            ),
+            "x-team=a,b=c"
+        );
+        assert_eq!(
+            redact_otlp_auth("OTEL_SERVICE_NAME", "Authorization=x"),
+            "Authorization=x"
+        );
+    }
+
     use super::*;
 
     /// Agent-planted package.json / yarn.lock: no hang, no read through a
