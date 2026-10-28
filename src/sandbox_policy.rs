@@ -231,8 +231,8 @@ pub const DENIED_FILES: &[&str] = &[
 /// globally. They hold patterns, not secrets. The shell
 /// rc files (`~/.zshrc` and friends) and `~/.node_repl_history` were
 /// Linux-only and routinely hold exported tokens. Neither backend grants them
-/// now. `~/.config/mise` is not here because the mise `AppDir` already covers
-/// it on both.
+/// now. The mise `AppDir` grants `~/.config/mise` only while `XDG_CONFIG_HOME`
+/// is unset; `~/.config/mise/config.toml` is listed for when it is not.
 pub const HOME_CONFIG_FILES: &[&str] = &[
     ".gitconfig",
     ".gitconfig.local",
@@ -245,6 +245,13 @@ pub const HOME_CONFIG_FILES: &[&str] = &[
     ".config/gh/config.yml",
     // mise/asdf global tool versions.
     ".tool-versions",
+    // mise looks for `.config/mise/config.toml` in every ancestor of the
+    // working directory, `$HOME` included, whatever `XDG_CONFIG_HOME` says.
+    // With `XDG_CONFIG_HOME` pointed elsewhere the mise AppDir grant follows
+    // it, this read gets EPERM, and mise stops. One file, read-only: it is
+    // what mise already reads with `XDG_CONFIG_HOME` unset. No write deny,
+    // like `.tool-versions`: `~/.config` is not writable by default.
+    ".config/mise/config.toml",
     // pnpm's global settings on macOS. The pnpm AppDir entry resolves to the
     // XDG spelling (~/.config/pnpm) only, so the native config dir needs its
     // own grant. One file, not the dir: `pnpm login` and `pnpm config set
@@ -2762,13 +2769,16 @@ pub fn shim_ro_protect_paths(home: &Path) -> Vec<PathBuf> {
 ///
 /// Every entry except the ones named here, so a file added to
 /// [`HOME_CONFIG_FILES`] gets the write deny unless someone decides otherwise.
-/// The `gh` files and `.tool-versions` are readable but carry no read-only
-/// claim: they never had a `$HOME` write deny.
+/// The `gh` files, `.tool-versions` and mise's `config.toml` are readable but
+/// carry no read-only claim: they never had a `$HOME` write deny.
 pub fn read_only_home_config() -> impl Iterator<Item = &'static str> {
     HOME_CONFIG_FILES.iter().copied().filter(|f| {
         !matches!(
             *f,
-            ".config/gh/hosts.yml" | ".config/gh/config.yml" | ".tool-versions"
+            ".config/gh/hosts.yml"
+                | ".config/gh/config.yml"
+                | ".tool-versions"
+                | ".config/mise/config.toml"
         )
     })
 }
@@ -5416,7 +5426,7 @@ mod tests {
 
     /// The read-only files are git's and pnpm's macOS config, drawn from the
     /// shared read list (#524, #547). Pinning the exact set makes a new entry
-    /// a deliberate choice: `gh` and `.tool-versions` stay out.
+    /// a deliberate choice: `gh`, `.tool-versions` and mise stay out.
     #[test]
     fn read_only_home_config_is_the_protected_subset_of_home_config_files() {
         let ro: Vec<&str> = read_only_home_config().collect();
