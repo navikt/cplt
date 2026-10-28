@@ -2280,22 +2280,23 @@ fn warn_glob_like_deny_paths(globs: &[&str], label: &str) {
 /// vault cannot reach one and asks the user to log in again every session.
 /// Injecting a token extracted in the parent is the way out, and a user who
 /// sets it while the guard is off gets no token and no explanation.
-fn inject_token_is_inert(gh_guard: &config::GhGuardPolicy) -> bool {
-    gh_guard.inject_token && !gh_guard.enabled
+/// Linux only: on macOS the key does nothing either way (#877), and the
+/// no-op line says so instead.
+fn inject_token_is_inert(gh_guard: &config::GhGuardPolicy, macos: bool) -> bool {
+    gh_guard.inject_token && !gh_guard.enabled && !macos
 }
 
 /// One short launch line for a user who set the deprecated key (#695). On
 /// macOS the key is a no-op (#877) that is still accepted. Only an explicit
 /// `true` reaches here: the default is false and `.cplt.toml` cannot set it.
-/// Skipped when the inert warning above already fires, which tells them to
-/// remove the key anyway. On Linux the key still works: the Keychain
+/// Fires with the guard off too: the inert warning is Linux-only. On Linux the key still works: the Keychain
 /// substitute does nothing there, and the key is how Copilot gets a login
 /// past the masked Secret Service.
 fn inject_token_deprecation_line(
     gh_guard: &config::GhGuardPolicy,
     macos: bool,
 ) -> Option<&'static str> {
-    (macos && gh_guard.inject_token && gh_guard.enabled).then_some(INJECT_TOKEN_NOOP)
+    (macos && gh_guard.inject_token).then_some(INJECT_TOKEN_NOOP)
 }
 
 const INJECT_TOKEN_NOOP: &str = "gh_guard.inject_token no longer has an effect on macOS: gh gets \
@@ -2414,7 +2415,7 @@ fn warn_inject_token_without_guard(resolved: &config::Resolved) {
     {
         ui::warn(line);
     }
-    if inject_token_is_inert(&resolved.gh_guard) {
+    if inject_token_is_inert(&resolved.gh_guard, cfg!(target_os = "macos")) {
         ui::warn(
             "gh_guard.inject_token is set but gh_guard.enabled is false, so no token is \
              injected: the injection runs as part of installing the gh wrapper, which the \
@@ -2537,7 +2538,7 @@ fn config_findings(
 ) -> Vec<cplt::doctor::Finding> {
     use cplt::doctor::Finding;
     let mut out = Vec::new();
-    let inert = inject_token_is_inert(&resolved.gh_guard);
+    let inert = inject_token_is_inert(&resolved.gh_guard, macos);
     if inert {
         out.push(Finding::warning(
             "gh_guard.inject_token is set but gh_guard.enabled is false, so no token is injected.",
@@ -15902,10 +15903,20 @@ mod tests {
             enabled,
             ..config::GhGuardPolicy::default()
         };
-        assert!(inject_token_is_inert(&policy(true, false)), "set but inert");
-        assert!(!inject_token_is_inert(&policy(true, true)), "doing its job");
-        assert!(!inject_token_is_inert(&policy(false, false)));
-        assert!(!inject_token_is_inert(&policy(false, true)));
+        assert!(
+            inject_token_is_inert(&policy(true, false), false),
+            "set but inert"
+        );
+        assert!(
+            !inject_token_is_inert(&policy(true, true), false),
+            "doing its job"
+        );
+        assert!(!inject_token_is_inert(&policy(false, false), false));
+        assert!(!inject_token_is_inert(&policy(false, true), false));
+        assert!(
+            !inject_token_is_inert(&policy(true, false), true),
+            "macOS: no-op line instead"
+        );
     }
 
     /// The launch line shows only for an explicit `true` with the guard on.
@@ -15919,8 +15930,8 @@ mod tests {
         assert!(inject_token_deprecation_line(&config::GhGuardPolicy::default(), true).is_none());
         assert!(inject_token_deprecation_line(&policy(false, true), true).is_none());
         assert!(
-            inject_token_deprecation_line(&policy(true, false), true).is_none(),
-            "inert warning covers it"
+            inject_token_deprecation_line(&policy(true, false), true).is_some(),
+            "macOS, guard off: no-op line, not the inert one"
         );
         assert!(inject_token_deprecation_line(&policy(true, true), true).is_some());
         assert!(
@@ -16136,11 +16147,13 @@ mod tests {
         let inert = resolve("[gh_guard]\ninject_token = true\nenabled = false\n");
         let m = messages(&inert, agent::Agent::Copilot, true, true);
         assert_eq!(m.len(), 1, "{m:?}");
-        assert!(m[0].contains("no token is injected"), "{m:?}");
-        assert_eq!(
-            messages(&inert, agent::Agent::Copilot, false, true).len(),
-            1
+        assert!(
+            m[0].contains("no longer has an effect"),
+            "macOS: no-op text {m:?}"
         );
+        let m = messages(&inert, agent::Agent::Copilot, false, true);
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert!(m[0].contains("no token is injected"), "{m:?}");
 
         // inject_token with the guard on: a no-op on macOS only.
         let on = resolve("[gh_guard]\ninject_token = true\nenabled = true\n");
