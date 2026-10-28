@@ -8,6 +8,10 @@ if [ -z "${RUSTUP_TOOLCHAIN:-}" ] && command -v rustup >/dev/null 2>&1; then
     if [ -n "$pin" ]; then export RUSTUP_TOOLCHAIN="$pin"; fi
 fi
 
+# A Rust earlier on PATH (Homebrew's, say) ignores RUSTUP_TOOLCHAIN and
+# rust-toolchain.toml, so put the pinned toolchain's bin dir first.
+if bin=$(rustup which cargo 2>/dev/null); then PATH="$(dirname "$bin"):$PATH"; fi
+
 echo "Running cargo fmt --check..."
 cargo fmt -- --check || {
     echo "Format check failed. Run 'cargo fmt' to fix."
