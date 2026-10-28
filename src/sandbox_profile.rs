@@ -961,6 +961,12 @@ fn emit_system_access(
             sb,
             r#"(deny mach-lookup (global-name-regex #"^com\.apple\.(dnssd\.|mDNSResponder)"))"#
         );
+        // A background URLSession hands the request to nsurlsessiond, which
+        // resolves and connects outside the sandbox and the proxy.
+        sbpl!(
+            sb,
+            r#"(deny mach-lookup (global-name-regex #"^com\.apple\.nsurlsessiond"))"#
+        );
     }
     sbpl!(sb);
 
@@ -3860,6 +3866,13 @@ fn emit_network_rules(
     //   4. Most build tools (Gradle, Kotlin) bind to 127.0.0.1 explicitly
     sbpl!(sb, "(allow network-bind (local ip \"*:*\"))");
     sbpl!(sb, "(allow network-inbound (local ip \"*:*\"))");
+    if deny_dns {
+        // An explicit deny, so an `allow.socket` entry cannot reopen it.
+        sbpl!(
+            sb,
+            "(deny network-outbound (literal \"/private/var/run/mDNSResponder\"))"
+        );
+    }
 
     // Allow Unix domain sockets in writable tool dirs (Gradle/Kotlin daemon IPC).
     // Gradle 6+ uses UDS in ~/.gradle/daemon/<version>/ for client-daemon comms.
@@ -5240,6 +5253,20 @@ mod tests {
         assert!(
             !p[deny..].contains("(allow mach-lookup"),
             "no later mach-lookup allow may reopen dnssd"
+        );
+        assert!(
+            p[deny..].contains(
+                r#"(deny mach-lookup (global-name-regex #"^com\.apple\.nsurlsessiond"))"#
+            )
+        );
+        // An allow.socket entry for the resolver must not reopen it.
+        let sock_entry = [std::path::PathBuf::from("/private/var/run/mDNSResponder")];
+        opts.extra_socket = &sock_entry;
+        let p = generate_profile(&opts, &[]);
+        let last = p.lines().rfind(|l| l.contains("mDNSResponder"));
+        assert_eq!(
+            last,
+            Some(r#"(deny network-outbound (literal "/private/var/run/mDNSResponder"))"#)
         );
     }
 

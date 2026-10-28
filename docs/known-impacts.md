@@ -772,7 +772,7 @@ cplt does not restrict outbound *domains* by default, but the proxy still enforc
 
 ## DNS lockdown (`proxy.deny_dns`, macOS)
 
-Off by default. With `proxy.forced` on, `cplt config set proxy.deny_dns true` takes the system resolver away from the agent: the profile drops the `/private/var/run/mDNSResponder` socket and denies the mDNSResponder Mach services (`com.apple.dnssd.service`, `com.apple.mDNSResponder.*`). A DNS query can then no longer carry data out past the proxy ([#653](https://github.com/navikt/cplt/issues/653)). Only the proxy resolves names, from the host name in the `CONNECT` request, so the allowlist and the proxy log see every lookup that leads to a connection.
+Off by default. With `proxy.forced` on, `cplt config set proxy.deny_dns true` takes the system resolver away from the agent: the profile drops the `/private/var/run/mDNSResponder` socket and denies the mDNSResponder Mach services (`com.apple.dnssd.service`, `com.apple.mDNSResponder.*`) and `com.apple.nsurlsessiond`, which runs background `URLSession` transfers outside the sandbox. A DNS query can then no longer carry data out past the proxy ([#653](https://github.com/navikt/cplt/issues/653)). The agent's own processes can then only reach a name through the proxy, which resolves the host name in the `CONNECT` request, so the allowlist and the proxy log see those lookups.
 
 Without `proxy.forced` the key does nothing and cplt says so at launch.
 
@@ -788,7 +788,10 @@ Checked with cplt on macOS 26 ([#653](https://github.com/navikt/cplt/issues/653)
 
 Expected to work but not run in this check: the Copilot CLI, OpenCode and Claude Code, `npm`, `pip` and Go programs, all of which hand the host name to `HTTPS_PROXY`. A tool that fails only with `deny_dns` resolves names itself; turn the key off for that run's config, or run the tool outside cplt.
 
-What stays open: system daemons that do network work for the agent, such as `trustd` fetching OCSP or CRL URLs, resolve outside the sandbox. Loopback UDP named with `--allow-localhost <PORT>` reaches a local resolver if one listens on that port.
+What stays open:
+
+- System daemons that do network work for the agent resolve outside the sandbox. `trustd` is needed for TLS: when the agent has a crafted certificate verified, trustd looks up and fetches the certificate's AIA, OCSP or CRL URLs, so a name the agent picks still reaches DNS.
+- Loopback UDP to a port opened with `allow.localhost` (`--allow-localhost <PORT>`) reaches a local resolver if one listens there.
 
 **Linux:** the key has no effect, and cplt says so at launch. `proxy.forced` already blocks direct UDP DNS there. Lookups through a local Unix-socket resolver (nss-resolve, nscd) below kernel 7.1 are not closed and not tested; a full fix needs the network namespace tracked in [#114](https://github.com/navikt/cplt/issues/114).
 
