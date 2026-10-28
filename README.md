@@ -568,7 +568,7 @@ What passes through:
 | Copilot config | `COPILOT_DEBUG`, `COPILOT_*` | Prefix allowlist |
 | Language runtimes | `NODE_*`, `GOPATH`, `CARGO_HOME`, `JAVA_HOME`, `VIRTUAL_ENV`, `PYTHONPATH` | Explicit allowlist |
 | Tool managers | `NVM_*`, `FNM_*`, `PYENV_*`, `MISE_*`, `SDKMAN_*`, `COREPACK_*`, `YARN_*` | Prefix allowlist |
-| OpenTelemetry | `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_*` | Prefix allowlist (`OTEL_EXPORTER_OTLP_HEADERS` may carry opt-in auth) |
+| OpenTelemetry | `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_*` | Prefix allowlist; the `Authorization` entry in `OTEL_EXPORTER_OTLP_HEADERS` (and the `_TRACES`/`_METRICS`/`_LOGS` variants) is removed unless named with `--pass-env`; other headers, including vendor keys such as `x-honeycomb-team`, `api-key` and `dd-api-key`, still pass |
 | XDG dirs | `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME` | Explicit allowlist |
 | gh config | `GH_CONFIG_DIR` | Explicit allowlist. Its `hosts.yml` and `config.yml` are readable |
 
