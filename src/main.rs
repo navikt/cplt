@@ -2300,8 +2300,8 @@ fn inject_token_deprecation_line(
 }
 
 const INJECT_TOKEN_NOOP: &str = "gh_guard.inject_token no longer has an effect on macOS: gh gets \
-     its token from the gh guard, and Copilot signs in with sandbox.keychain_substitute = true. \
-     Remove the key.";
+     its token from the gh guard, and Copilot signs in through the Keychain substitute, which \
+     needs sandbox.keychain_substitute = true. Remove the key.";
 
 /// Removal advice needs successful retrieval and an eligible replacement,
 /// not just hosts.yml. Otherwise it can remove the only working credential.
@@ -2310,12 +2310,11 @@ fn gh_exec_token_available(
     agent: agent::Agent,
     substitute: Option<&agent::KeychainSubstitute>,
 ) -> bool {
-    if !(cfg!(target_os = "macos") && resolved.gh_guard.inject_token
-        || agent != agent::Agent::Copilot
-            && resolved
-                .pass_env
-                .iter()
-                .any(|v| v == "GH_TOKEN" || v == "GITHUB_TOKEN"))
+    if agent == agent::Agent::Copilot
+        || !resolved
+            .pass_env
+            .iter()
+            .any(|v| v == "GH_TOKEN" || v == "GITHUB_TOKEN")
     {
         return false;
     }

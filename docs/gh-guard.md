@@ -288,7 +288,8 @@ has no effect. On macOS the key has no effect either way, and cplt prints the
 no-op line below.
 
 On macOS `inject_token` has no effect. `gh` gets its token from the exec token,
-and Copilot signs in through `sandbox.keychain_substitute = true`. cplt still
+and Copilot signs in through the Keychain substitute, which needs
+`sandbox.keychain_substitute = true` (the default for Copilot). cplt still
 accepts the key and never refuses a launch over it; while it is `true`, cplt
 prints one line at launch and `cplt check` lists it. Remove it. On Linux the substitute does nothing, so keep the key set to `true` for the case above, or anywhere you still want the token in the environment.
 `cplt config set` refuses it without `--force`, and `cplt config show` marks it
