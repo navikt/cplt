@@ -10949,9 +10949,19 @@ mod agent_stubs {
         );
         assert!(!out.contains(SECRET), "credential readable: {ctx}");
         // Linux cannot deny single files inside the project: Landlock grants
-        // the project dir full read, and cplt warns that .env stays readable.
+        // the project dir full read, and cplt warns that .env stays readable
+        // (#178; see tests/integration_linux.rs:2407). Pin both, so closing
+        // the gap fails here loudly and gets this branch updated.
         #[cfg(target_os = "macos")]
         assert!(!out.contains(PROJ_SECRET), "project secret readable: {ctx}");
+        #[cfg(target_os = "linux")]
+        {
+            assert!(out.contains(PROJ_SECRET), "Linux gap closed? {ctx}");
+            assert!(
+                err.contains("allow_env_files=false is not fully enforceable"),
+                "{ctx}"
+            );
+        }
         assert!(!out.contains("WROTE:outside\n"), "{ctx}");
         assert_eq!(
             std::fs::read_to_string(h.join("outside/file")).unwrap(),
