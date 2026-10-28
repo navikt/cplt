@@ -129,6 +129,11 @@ const SENSITIVE_PATTERNS: &[(Matcher, &str)] = &[
     (Matcher::Name(".cplt.toml"), "sandbox config"),
 ];
 
+/// `git status` honours ignore rules, so writes under ignored build or
+/// dependency directories never reach the audit (#878, M-05). A clean result
+/// says so rather than reading as a full clean bill.
+const NO_CHANGES: &str = "no project file changes (git-ignored files not checked)";
+
 /// Return the basename (path component after the last `/`) of a repo-relative
 /// path. git always emits forward-slash separators, so this is portable.
 fn basename(path: &str) -> &str {
@@ -665,7 +670,7 @@ impl AuditReport {
             ui::info(&format!(
                 "{ended} · {}{unaudited}",
                 count.as_deref().map_or_else(
-                    || "no project file changes".to_string(),
+                    || NO_CHANGES.to_string(),
                     |c| format!("project changes: {c}")
                 )
             ));
@@ -782,8 +787,10 @@ impl AuditReport {
                 }
                 if changes.is_empty() {
                     match root {
-                        None => ui::info("no project file changes"),
-                        Some(path) => ui::info(&format!("no file changes in {path}")),
+                        None => ui::info(NO_CHANGES),
+                        Some(path) => ui::info(&format!(
+                            "no file changes in {path} (git-ignored files not checked)"
+                        )),
                     }
                     return;
                 }
