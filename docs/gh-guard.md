@@ -69,7 +69,7 @@ enabled = true              # blocks destructive gh operations
 mode = "block"              # block | warn | audit
 scope_check = true          # enforce repo-scoping on write commands
 block_auth_token = true     # deny "gh auth token" exfiltration
-inject_token = false        # deprecated on macOS; Linux Copilot may need it
+inject_token = false        # no effect on macOS; Linux Copilot may need it
 unknown_command = "block"   # block|allow unrecognized gh commands
 allow_api_write = false     # allow gh api write (POST/PUT/PATCH) to current repo (opt-in)
 allow_pr_merge = false      # allow gh pr merge into a ruleset-protected branch (opt-in)
@@ -283,13 +283,15 @@ session-only token rather than plaintext storage. See [Linux keyring access](kno
 
 `inject_token` requires `gh_guard.enabled`: the injection is part of installing
 the gh wrapper, which the guard owns. With the guard off it does nothing, and
-cplt says so at launch rather than leaving a key that reads as true and has no
-effect.
+on Linux cplt says so at launch rather than leaving a key that reads as true and
+has no effect. On macOS the key has no effect either way, and cplt prints the
+no-op line below.
 
-On macOS `inject_token` is deprecated. `gh` gets its token from the exec token,
-and Copilot signs in through `sandbox.keychain_substitute = true`. The key still
-works; while it is `true`, cplt prints one line at launch and `cplt check` lists
-it. On Linux the substitute does nothing, so keep the key set to `true` for the case above, or anywhere you still want the token in the environment.
+On macOS `inject_token` has no effect. `gh` gets its token from the exec token,
+and Copilot signs in through the Keychain substitute, which needs
+`sandbox.keychain_substitute = true` (the default for Copilot). cplt still
+accepts the key and never refuses a launch over it; while it is `true`, cplt
+prints one line at launch and `cplt check` lists it. Remove it. On Linux the substitute does nothing, so keep the key set to `true` for the case above, or anywhere you still want the token in the environment.
 `cplt config set` refuses it without `--force`, and `cplt config show` marks it
 `⚠ DANGEROUS`, because the token is then inherited by every process in the
 sandbox — and readable from any of them, through `/proc/<pid>/environ` on Linux

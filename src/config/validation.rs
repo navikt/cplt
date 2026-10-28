@@ -336,7 +336,7 @@ pub fn validate_config(toml_text: &str) -> Vec<ConfigDiagnostic> {
         if gh_guard.get("inject_token").and_then(toml::Value::as_bool) == Some(true) {
             diagnostics.push(ConfigDiagnostic {
                 level: DiagnosticLevel::Warning,
-                message: "gh_guard.inject_token = true injects GH_TOKEN into the agent environment (DANGEROUS)"
+                message: "gh_guard.inject_token = true injects GH_TOKEN into the agent environment on Linux (DANGEROUS); no effect on macOS"
                     .to_string(),
             });
         }

@@ -10823,210 +10823,237 @@ print('TCP_' + ('OK' if r == 0 else errno.errorcode.get(r, str(r))))
             );
         }
     }
+}
 
-    /// #728 One stub per agent, end to end through the real sandbox. The stub
-    /// is named like the agent's binary, answers `--version`, echoes its argv
-    /// and runs its last argument as a shell script, so each probe tests
-    /// cplt's real profile and environment for that agent. HOME is a fixture
-    /// under the scratch HOME, which is deny-by-default.
-    mod agent_stubs {
-        use super::*;
-        use std::fmt::Write as _;
-        use std::os::unix::fs::PermissionsExt;
+/// #728 One stub per agent, end to end through the real sandbox. The stub
+/// is named like the agent's binary, answers `--version`, echoes its argv
+/// and runs its last argument as a shell script, so each probe tests
+/// cplt's real profile and environment for that agent. HOME is a fixture
+/// under the scratch HOME, which is deny-by-default.
+mod agent_stubs {
+    use crate::common::{cplt_cmd, git_ok, sandbox_usable, scratch_home};
+    use std::fmt::Write as _;
+    use std::os::unix::fs::PermissionsExt;
 
-        const STUB: &str = "#!/bin/sh\nfor a; do last=$a; done\n[ \"$last\" = --version ] && { echo GitHub Copilot CLI 1.0.63.; exit 0; }\necho \"ARGV:$*\"\nexec /bin/sh -c \"$last\"\n";
-        const SECRET: &str = "HOST-SECRET";
+    const STUB: &str = "#!/bin/sh\nfor a; do last=$a; done\n[ \"$last\" = --version ] && { echo GitHub Copilot CLI 1.0.63.; exit 0; }\necho \"ARGV:$*\"\nexec /bin/sh -c \"$last\"\n";
+    const SECRET: &str = "HOST-SECRET";
+    const PROJ_SECRET: &str = "PROJ-SECRET";
 
-        /// What one agent's sandbox must look like. Paths are HOME-relative.
-        struct Case {
-            agent: &'static str,
-            bin: &'static str,
-            /// Granted dirs the agent writes into.
-            writable: &'static [&'static str],
-            /// Readable, not writable: read-only grants and persistence denies.
-            read_only: &'static [&'static str],
-            /// What cplt passes before the user args (exact, space-separated).
-            extra_args: &'static str,
+    /// What one agent's sandbox must look like. Paths are HOME-relative.
+    struct Case {
+        agent: &'static str,
+        bin: &'static str,
+        /// Granted dirs the agent writes into.
+        writable: &'static [&'static str],
+        /// Readable, not writable: read-only grants and persistence denies.
+        read_only: &'static [&'static str],
+        /// What cplt passes before the user args (exact, space-separated).
+        extra_args: &'static str,
+    }
+
+    fn run(c: &Case) {
+        let dir = tempfile::Builder::new()
+            .prefix(".cplt-e2e-stub-")
+            .tempdir_in(scratch_home())
+            .unwrap();
+        let h = std::fs::canonicalize(dir.path()).unwrap();
+        let put = |rel: &str, body: &str| {
+            let p = h.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        for rel in c.writable {
+            std::fs::create_dir_all(h.join(rel)).unwrap();
         }
+        for rel in c.read_only {
+            put(rel, "RO-CONTENT");
+        }
+        // HOME is deny-by-default, so the two in HOME only show nothing
+        // there leaks through a grant. The project is granted read/write:
+        // only the secret-file denies keep the last two out (macOS only).
+        put(".ssh/id_ed25519", SECRET);
+        put(".aws/credentials", SECRET);
+        put("work/proj/.env", PROJ_SECRET);
+        put("work/proj/id_ed25519", PROJ_SECRET);
+        put("outside/file", "x");
+        let proj = h.join("work/proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        assert!(git_ok(&proj, &["init", "-q"]));
+        let bin = h.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let stub = bin.join(c.bin);
+        std::fs::write(&stub, STUB).unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        fn run(c: &Case) {
-            let dir = tempfile::Builder::new()
-                .prefix(".cplt-e2e-stub-")
-                .tempdir_in(scratch_home())
-                .unwrap();
-            let h = std::fs::canonicalize(dir.path()).unwrap();
-            let put = |rel: &str, body: &str| {
-                let p = h.join(rel);
-                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-                std::fs::write(p, body).unwrap();
-            };
-            for rel in c.writable {
-                std::fs::create_dir_all(h.join(rel)).unwrap();
-            }
-            for rel in c.read_only {
-                put(rel, "RO-CONTENT");
-            }
-            // HOME is deny-by-default, so the two in HOME only show nothing
-            // there leaks through a grant. The project is granted read/write:
-            // only the secret-file denies keep the last two out.
-            put(".ssh/id_ed25519", SECRET);
-            put(".aws/credentials", SECRET);
-            put("work/proj/.env", SECRET);
-            put("work/proj/id_ed25519", SECRET);
-            put("outside/file", "x");
-            let proj = h.join("work/proj");
-            std::fs::create_dir_all(&proj).unwrap();
-            assert!(git_ok(&proj, &["init", "-q"]));
-            let bin = h.join("bin");
-            std::fs::create_dir_all(&bin).unwrap();
-            let stub = bin.join(c.bin);
-            std::fs::write(&stub, STUB).unwrap();
-            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut script = String::from("cd \"$HOME\"\n");
+        for rel in c.writable {
+            let _ = writeln!(script, "echo x > '{rel}/.probe' && echo 'WROTE:{rel}'");
+        }
+        for rel in c.read_only {
+            let _ = writeln!(
+                script,
+                "cat '{rel}'; echo; echo y >> '{rel}' && echo 'WROTE:{rel}'"
+            );
+        }
+        script += "cat .ssh/id_ed25519 .aws/credentials work/proj/.env work/proj/id_ed25519\n";
+        script += "echo y >> outside/file && echo 'WROTE:outside'\n";
+        script += "env; echo DONE; exit 7\n";
 
-            let mut script = String::from("cd \"$HOME\"\n");
-            for rel in c.writable {
-                let _ = writeln!(script, "echo x > '{rel}/.probe' && echo 'WROTE:{rel}'");
-            }
-            for rel in c.read_only {
-                let _ = writeln!(
-                    script,
-                    "cat '{rel}'; echo; echo y >> '{rel}' && echo 'WROTE:{rel}'"
-                );
-            }
-            script += "cat .ssh/id_ed25519 .aws/credentials work/proj/.env work/proj/id_ed25519\n";
-            script += "echo y >> outside/file && echo 'WROTE:outside'\n";
-            script += "env; echo DONE; exit 7\n";
-
-            let mut cmd = cplt_cmd();
-            for v in [
-                "XDG_CONFIG_HOME",
-                "XDG_DATA_HOME",
-                "XDG_STATE_HOME",
-                "XDG_CACHE_HOME",
-                "DSH_HOME",
-                "CLAUDE_CONFIG_DIR",
-                "COPILOT_HOME",
-            ] {
-                cmd.env_remove(v);
-            }
-            let o = cmd
-                .current_dir(&proj)
-                .env("HOME", &h)
-                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
-                .env("AWS_SECRET_ACCESS_KEY", "AWS-CANARY")
-                .args(["--yes", "--agent", c.agent, "--", &script])
-                .output()
-                .expect("cplt should run");
-            let out = String::from_utf8_lossy(&o.stdout);
-            let err = String::from_utf8_lossy(&o.stderr);
-            let ctx = format!("[{}]\n{out}\n{err}", c.agent);
-            assert_eq!(o.status.code(), Some(7), "{ctx}");
-            assert!(out.contains("DONE"), "{ctx}");
+        let mut cmd = cplt_cmd();
+        for v in [
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "XDG_CACHE_HOME",
+            "DSH_HOME",
+            "CLAUDE_CONFIG_DIR",
+            "COPILOT_HOME",
+        ] {
+            cmd.env_remove(v);
+        }
+        let o = cmd
+            .current_dir(&proj)
+            .env("HOME", &h)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("AWS_SECRET_ACCESS_KEY", "AWS-CANARY")
+            .args(["--yes", "--agent", c.agent, "--", &script])
+            .output()
+            .expect("cplt should run");
+        let out = String::from_utf8_lossy(&o.stdout);
+        let err = String::from_utf8_lossy(&o.stderr);
+        let ctx = format!("[{}]\n{out}\n{err}", c.agent);
+        assert_eq!(o.status.code(), Some(7), "{ctx}");
+        assert!(out.contains("DONE"), "{ctx}");
+        assert!(
+            out.contains(&format!("ARGV:{}cd \"$HOME\"", c.extra_args)),
+            "argv: {ctx}"
+        );
+        for rel in c.writable {
             assert!(
-                out.contains(&format!("ARGV:{}cd \"$HOME\"", c.extra_args)),
-                "argv: {ctx}"
+                out.contains(&format!("WROTE:{rel}\n")),
+                "{rel} not writable: {ctx}"
             );
-            for rel in c.writable {
-                assert!(
-                    out.contains(&format!("WROTE:{rel}\n")),
-                    "{rel} not writable: {ctx}"
-                );
-                assert!(h.join(rel).join(".probe").exists(), "{rel}: {ctx}");
-            }
-            for rel in c.read_only {
-                assert!(
-                    !out.contains(&format!("WROTE:{rel}\n")),
-                    "{rel} writable: {ctx}"
-                );
-                assert_eq!(std::fs::read_to_string(h.join(rel)).unwrap(), "RO-CONTENT");
-            }
-            assert_eq!(
-                out.matches("RO-CONTENT").count(),
-                c.read_only.len(),
-                "read-only files must be readable: {ctx}"
+            assert!(h.join(rel).join(".probe").exists(), "{rel}: {ctx}");
+        }
+        for rel in c.read_only {
+            assert!(
+                !out.contains(&format!("WROTE:{rel}\n")),
+                "{rel} writable: {ctx}"
             );
-            assert!(!out.contains(SECRET), "credential readable: {ctx}");
-            assert!(!out.contains("WROTE:outside\n"), "{ctx}");
-            assert_eq!(
-                std::fs::read_to_string(h.join("outside/file")).unwrap(),
-                "x"
+            assert_eq!(std::fs::read_to_string(h.join(rel)).unwrap(), "RO-CONTENT");
+        }
+        assert_eq!(
+            out.matches("RO-CONTENT").count(),
+            c.read_only.len(),
+            "read-only files must be readable: {ctx}"
+        );
+        assert!(!out.contains(SECRET), "credential readable: {ctx}");
+        // Linux cannot deny single files inside the project: Landlock grants
+        // the project dir full read, and cplt warns that .env stays readable
+        // (#178; see tests/integration_linux.rs:2407). Pin both, so closing
+        // the gap fails here loudly and gets this branch updated.
+        #[cfg(target_os = "macos")]
+        assert!(!out.contains(PROJ_SECRET), "project secret readable: {ctx}");
+        #[cfg(target_os = "linux")]
+        {
+            assert!(out.contains(PROJ_SECRET), "Linux gap closed? {ctx}");
+            assert!(
+                err.contains("allow_env_files=false is not fully enforceable"),
+                "{ctx}"
             );
-            assert!(!out.contains("AWS-CANARY"), "AWS secret leaked: {ctx}");
         }
+        assert!(!out.contains("WROTE:outside\n"), "{ctx}");
+        assert_eq!(
+            std::fs::read_to_string(h.join("outside/file")).unwrap(),
+            "x"
+        );
+        assert!(!out.contains("AWS-CANARY"), "AWS secret leaked: {ctx}");
+    }
 
-        #[test]
-        fn goose() {
-            require_sandbox!();
-            run(&Case {
-                agent: "goose",
-                bin: "goose",
-                writable: &[".local/share/goose", ".local/state/goose"],
-                read_only: &[".config/goose/config.yaml"],
-                extra_args: "",
-            });
+    #[test]
+    fn goose() {
+        if !sandbox_usable() {
+            return;
         }
+        run(&Case {
+            agent: "goose",
+            bin: "goose",
+            writable: &[".local/share/goose", ".local/state/goose"],
+            read_only: &[".config/goose/config.yaml"],
+            extra_args: "",
+        });
+    }
 
-        #[test]
-        fn dsh() {
-            require_sandbox!();
-            run(&Case {
-                agent: "dsh",
-                bin: "dsh",
-                writable: &[".dsh", ".dsh/profiles/default"],
-                read_only: &[".dsh/cordis.patch.yml"],
-                extra_args: "",
-            });
+    #[test]
+    fn dsh() {
+        if !sandbox_usable() {
+            return;
         }
+        run(&Case {
+            agent: "dsh",
+            bin: "dsh",
+            writable: &[".dsh", ".dsh/profiles/default"],
+            read_only: &[".dsh/cordis.patch.yml"],
+            extra_args: "",
+        });
+    }
 
-        #[test]
-        fn antigravity() {
-            require_sandbox!();
-            run(&Case {
-                agent: "agy",
-                bin: "agy",
-                writable: &[".gemini/config", ".gemini/antigravity-cli"],
-                read_only: &[
-                    ".gemini/config/hooks.json",
-                    ".gemini/config/mcp_config.json",
-                ],
-                extra_args: "",
-            });
+    #[test]
+    fn antigravity() {
+        if !sandbox_usable() {
+            return;
         }
+        run(&Case {
+            agent: "agy",
+            bin: "agy",
+            writable: &[".gemini/config", ".gemini/antigravity-cli"],
+            read_only: &[
+                ".gemini/config/hooks.json",
+                ".gemini/config/mcp_config.json",
+            ],
+            extra_args: "",
+        });
+    }
 
-        #[test]
-        fn claude() {
-            require_sandbox!();
-            run(&Case {
-                agent: "claude",
-                bin: "claude",
-                writable: &[".claude"],
-                read_only: &[".claude/settings.json", ".claude/statusline.sh"],
-                extra_args: "",
-            });
+    #[test]
+    fn claude() {
+        if !sandbox_usable() {
+            return;
         }
+        run(&Case {
+            agent: "claude",
+            bin: "claude",
+            writable: &[".claude"],
+            read_only: &[".claude/settings.json", ".claude/statusline.sh"],
+            extra_args: "",
+        });
+    }
 
-        #[test]
-        fn copilot() {
-            require_sandbox!();
-            run(&Case {
-                agent: "copilot",
-                bin: "copilot",
-                writable: &[".copilot", ".copilot/session-state"],
-                read_only: &[".copilot/settings.json", ".copilot/mcp-config.json"],
-                extra_args: "--no-auto-update ",
-            });
+    #[test]
+    fn copilot() {
+        if !sandbox_usable() {
+            return;
         }
+        run(&Case {
+            agent: "copilot",
+            bin: "copilot",
+            writable: &[".copilot", ".copilot/session-state"],
+            read_only: &[".copilot/settings.json", ".copilot/mcp-config.json"],
+            extra_args: "--no-auto-update ",
+        });
+    }
 
-        #[test]
-        fn pi() {
-            require_sandbox!();
-            run(&Case {
-                agent: "pi",
-                bin: "pi",
-                writable: &[".pi/agent/sessions"],
-                read_only: &[".pi/agent/settings.json"],
-                extra_args: "",
-            });
+    #[test]
+    fn pi() {
+        if !sandbox_usable() {
+            return;
         }
+        run(&Case {
+            agent: "pi",
+            bin: "pi",
+            writable: &[".pi/agent/sessions"],
+            read_only: &[".pi/agent/settings.json"],
+            extra_args: "",
+        });
     }
 }
