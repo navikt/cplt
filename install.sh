@@ -312,12 +312,13 @@ fi
 # ─── Starter config ──────────────────────────────────────────────────────────
 # New users get the defaults `cplt config init` writes. An existing config
 # (file, symlink or dangling symlink) is never touched; init refuses it too.
-# Skipped as root: under sudo, HOME may be the invoking user's and the file
-# would end up root-owned.
+# Skipped as root or under sudo: HOME may be another user's and the file
+# would get the wrong owner. Skipped next to an xdg-pinned marker too: the
+# user's config may then live under XDG_CONFIG_HOME.
 
-if [[ "$(id -u)" != 0 ]]; then
+if [[ "$(id -u)" != 0 && -z "${SUDO_USER:-}" ]]; then
   if CONFIG_PATH=$("${INSTALL_DIR}/${BINARY}" config path 2>/dev/null) && [[ -n "$CONFIG_PATH" ]]; then
-    if [[ ! -e "$CONFIG_PATH" && ! -L "$CONFIG_PATH" ]]; then
+    if [[ ! -e "$CONFIG_PATH" && ! -L "$CONFIG_PATH" && ! -e "$(dirname "$CONFIG_PATH")/xdg-pinned" ]]; then
       if "${INSTALL_DIR}/${BINARY}" config init </dev/null >/dev/null 2>&1; then
         echo "  ✓ Created starter config: ${CONFIG_PATH}"
       else
