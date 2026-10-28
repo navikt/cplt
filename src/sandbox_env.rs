@@ -185,7 +185,12 @@ pub fn build_sandbox_env(
             {
                 // Avoid duplicates from the explicit allowlist
                 if !env.vars.iter().any(|(k, _)| k == key) {
-                    env.vars.push((key.clone(), redact_otlp_auth(key, val)));
+                    let val = if extra_pass_env.iter().any(|p| p == key) {
+                        val.clone()
+                    } else {
+                        redact_otlp_auth(key, val)
+                    };
+                    env.vars.push((key.clone(), val));
                 }
             }
         }
@@ -845,9 +850,8 @@ fn redact_otlp_auth(key: &str, val: &str) -> String {
             !pair
                 .split('=')
                 .next()
-                .unwrap_or("")
-                .trim()
-                .eq_ignore_ascii_case("authorization")
+                .map(|k| crate::agent::percent_decode(k.trim()))
+                .is_some_and(|k| k.trim().eq_ignore_ascii_case("authorization"))
         })
         .collect::<Vec<_>>()
         .join(",")
@@ -855,6 +859,8 @@ fn redact_otlp_auth(key: &str, val: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn otlp_headers_drop_only_authorization() {
         assert_eq!(
@@ -865,12 +871,28 @@ mod tests {
             "x-team=a,b=c"
         );
         assert_eq!(
+            redact_otlp_auth("OTEL_EXPORTER_OTLP_HEADERS", "%41uthorization=t,x=y"),
+            "x=y"
+        );
+        assert_eq!(
+            redact_otlp_auth("OTEL_EXPORTER_OTLP_HEADERS", "Authorization=x"),
+            ""
+        );
+        assert_eq!(
             redact_otlp_auth("OTEL_SERVICE_NAME", "Authorization=x"),
             "Authorization=x"
         );
-    }
 
-    use super::*;
+        let key = "OTEL_EXPORTER_OTLP_HEADERS";
+        let raw = "Authorization=Bearer t,x=y";
+        let parent = vec![(key.to_string(), raw.to_string())];
+        let get = |e: &SandboxEnv| e.vars.iter().find(|(k, _)| k == key).unwrap().1.clone();
+        let env = build_sandbox_env(&parent, &[], false, &[], None, None, Agent::Shell);
+        assert_eq!(get(&env), "x=y");
+        let pass = [key.to_string()];
+        let env = build_sandbox_env(&parent, &pass, false, &[], None, None, Agent::Shell);
+        assert_eq!(get(&env), raw, "--pass-env keeps the full value");
+    }
 
     /// Agent-planted package.json / yarn.lock: no hang, no read through a
     /// symlink, no unbounded read.

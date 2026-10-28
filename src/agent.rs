@@ -847,7 +847,7 @@ fn plugin_dir_grants(dirs: Vec<PathBuf>, home: &Path, writable: &[PathBuf]) -> V
 
 /// `%XX` decoding for the path of a `file://` URL, as `fileURLToPath` does.
 /// Invalid escapes are kept literally.
-fn percent_decode(s: &str) -> String {
+pub(crate) fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
