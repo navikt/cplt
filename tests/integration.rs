@@ -494,6 +494,7 @@ mod macos_tests {
             root_agents_md: None,
             allow_gpg_signing: false,
             deny_clipboard: false,
+            deny_dns: false,
             deny_nested_git: false,
             refuse_cache_exec_links: false,
             deny_key_files_by_extension: false,
@@ -5930,6 +5931,52 @@ except Exception as e:
         assert!(
             !output.contains("DENIED_REACHED"),
             "a port NOT named in the profile must be blocked by the kernel, got:\n{output}"
+        );
+    }
+
+    /// #653: `proxy.deny_dns` closes both resolver paths in the kernel. libc
+    /// `getaddrinfo` (python) goes through the mDNSResponder socket;
+    /// Network.framework (`nscurl`, NSURLSession) through the
+    /// com.apple.dnssd.service Mach port. NSURLError -1003 is "host not
+    /// found"; without the lockdown nscurl resolves and then fails at connect
+    /// (forced proxy), so it reports a different error.
+    #[test]
+    fn real_profile_deny_dns_blocks_name_resolution() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        let cmd = "/usr/bin/python3 -c 'import socket; socket.getaddrinfo(\"example.org\", 443)' \
+                   >/dev/null 2>&1 && echo LIBC_RESOLVED; \
+                   /usr/bin/perl -e 'alarm 10; exec \"/usr/bin/nscurl\", \"https://example.org\"' 2>&1";
+        let run = |deny_dns: bool| {
+            let mut opts = default_opts(&project, &home);
+            opts.proxy_forced = true;
+            opts.proxy_port = Some(1);
+            opts.deny_dns = deny_dns;
+            let path = std::env::temp_dir()
+                .join(format!("cplt-denydns-{deny_dns}-{}.sb", std::process::id()));
+            fs::write(&path, generate_profile(&opts, &[])).unwrap();
+            let (out, _) = run_sandboxed(&path, cmd);
+            fs::remove_file(&path).ok();
+            out
+        };
+        let open = run(false);
+        if !open.contains("LIBC_RESOLVED") {
+            eprintln!("SKIP: example.org does not resolve on this host (offline?): {open}");
+            return;
+        }
+        assert!(
+            !open.contains("Code=-1003"),
+            "control: nscurl must resolve without deny_dns, got:\n{open}"
+        );
+        let closed = run(true);
+        assert!(
+            !closed.contains("LIBC_RESOLVED"),
+            "deny_dns must block getaddrinfo, got:\n{closed}"
+        );
+        assert!(
+            closed.contains("Code=-1003"),
+            "deny_dns must block Network.framework resolution, got:\n{closed}"
         );
     }
 

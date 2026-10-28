@@ -144,6 +144,7 @@ fn profile_locked(
         allow_chromium_runtime,
         allow_cypress_runtime,
         config.deny_clipboard,
+        config.deny_dns,
     );
     emit_tool_dirs(
         &mut sb,
@@ -235,6 +236,7 @@ fn profile_locked(
         config.proxy_port,
         config.localhost_ports,
         config.proxy_forced,
+        config.deny_dns,
     );
     // Keep PATH-resolved bin and shim locations read-only after user allows.
     // The pnpm rule re-allows its two writable stores, so all security denies
@@ -931,6 +933,7 @@ fn emit_system_access(
     allow_chromium_runtime: bool,
     allow_cypress_runtime: bool,
     deny_clipboard: bool,
+    deny_dns: bool,
 ) {
     // Mach IPC — Node.js and macOS frameworks need service lookups
     // (Keychain, security framework, DNS, system services)
@@ -943,6 +946,20 @@ fn emit_system_access(
         sbpl!(
             sb,
             r#"(deny mach-lookup (global-name-regex #"^com\.apple\.pasteboard(\.|$)"))"#
+        );
+    }
+    if deny_dns {
+        // #653: Network.framework (NSURLSession, Swift) resolves through
+        // com.apple.dnssd.service even with the resolver socket closed.
+        // Matches every mDNSResponder service: dnssd.service,
+        // mDNSResponder.control, .log_utility and mDNSResponder_Helper.
+        sbpl!(
+            sb,
+            ";; DNS lockdown (proxy.deny_dns): mDNSResponder Mach services"
+        );
+        sbpl!(
+            sb,
+            r#"(deny mach-lookup (global-name-regex #"^com\.apple\.(dnssd\.|mDNSResponder)"))"#
         );
     }
     sbpl!(sb);
@@ -3716,6 +3733,7 @@ fn emit_docker_rules(sb: &mut String, home: &str, allow_docker: bool, extra_deny
     sbpl!(sb);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_network_rules(
     sb: &mut String,
     home: &str,
@@ -3724,6 +3742,7 @@ fn emit_network_rules(
     proxy_port: Option<u16>,
     localhost_ports: &[u16],
     proxy_forced: bool,
+    deny_dns: bool,
 ) {
     // Network — outbound restricted to HTTPS/HTTP, localhost blocked by default.
     // Copilot CLI connects directly to api.githubcopilot.com:443 etc.
@@ -3733,10 +3752,16 @@ fn emit_network_rules(
 
     // DNS resolution — only the specific mDNSResponder socket, NOT all unix-sockets.
     // Blocking (remote unix-socket) prevents SSH agent access via launchd sockets.
-    sbpl!(
-        sb,
-        "(allow network-outbound (literal \"/private/var/run/mDNSResponder\"))"
-    );
+    // `deny_dns` (#653, only set under proxy_forced) leaves it out: then only
+    // the proxy resolves names, and a query cannot carry data past it.
+    if deny_dns {
+        sbpl!(sb, ";; DNS lockdown (proxy.deny_dns): no resolver socket");
+    } else {
+        sbpl!(
+            sb,
+            "(allow network-outbound (literal \"/private/var/run/mDNSResponder\"))"
+        );
+    }
 
     if allow_localhost_any && !proxy_forced {
         // Darwin sendfile checks the local socket without a remote sockaddr.
@@ -4846,6 +4871,7 @@ mod tests {
             root_agents_md: None,
             allow_gpg_signing: false,
             deny_clipboard: false,
+            deny_dns: false,
             deny_nested_git: false,
             refuse_cache_exec_links: false,
             deny_key_files_by_extension: false,
@@ -5186,6 +5212,34 @@ mod tests {
                 && after.contains(r#"(allow file-write* (subpath "/dev"))"#),
             "--allow-write /dev must restore both halves, or the break-glass \
              documented in known-impacts.md does not work"
+        );
+    }
+
+    #[test]
+    fn deny_dns_closes_resolver_socket_and_dnssd_mach() {
+        // #653: socket for libc getaddrinfo, Mach for Network.framework.
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let sock = r#"(allow network-outbound (literal "/private/var/run/mDNSResponder"))"#;
+        let mach =
+            r#"(deny mach-lookup (global-name-regex #"^com\.apple\.(dnssd\.|mDNSResponder)"))"#;
+        let mut opts = test_options(project, home);
+        opts.proxy_forced = true;
+        opts.proxy_port = Some(8080);
+        let open = generate_profile(&opts, &[]);
+        assert!(open.contains(sock) && !open.contains(mach));
+        opts.deny_dns = true;
+        let p = generate_profile(&opts, &[]);
+        assert!(!p.contains(sock), "deny_dns must drop the resolver socket");
+        // Last match wins: the Mach deny must follow the blanket allow.
+        let allow = p.find("(allow mach-lookup)\n").unwrap();
+        let deny = p
+            .find(mach)
+            .expect("deny_dns must deny the dnssd Mach services");
+        assert!(deny > allow);
+        assert!(
+            !p[deny..].contains("(allow mach-lookup"),
+            "no later mach-lookup allow may reopen dnssd"
         );
     }
 
