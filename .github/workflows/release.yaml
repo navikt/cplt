@@ -210,6 +210,19 @@ jobs:
            Linux, so an agent only reaches the files and hosts you allow.
           CONTROL
           sed -i 's/^          //' "$root/DEBIAN/control"
+          # postinst runs as root with no user HOME, so it cannot tell whether
+          # a config exists. Print the hint on a fresh install only (`$2` is
+          # the previously configured version, empty on first install) and
+          # never fail the install.
+          cat > "$root/DEBIAN/postinst" <<'POSTINST'
+          #!/bin/sh
+          if [ "$1" = configure ] && [ -z "$2" ]; then
+            echo "cplt: no config yet? Run 'cplt config init' to get the recommended defaults."
+          fi
+          exit 0
+          POSTINST
+          sed -i 's/^          //' "$root/DEBIAN/postinst"
+          chmod 0755 "$root/DEBIAN/postinst"
           cp LICENSE "$root/usr/share/doc/cplt/copyright"
           dpkg-deb --root-owner-group --build "$root" "cplt_${VERSION}_${ARCH}.deb"
           dpkg-deb --info "cplt_${VERSION}_${ARCH}.deb"
