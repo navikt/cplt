@@ -857,6 +857,42 @@ mod tests {
         assert!(allowed, "keychain=true could not write the keychain");
     }
 
+    /// The kernel, not the profile text: the child cannot look up
+    /// nsurlsessiond, which would fetch URLs past the egress rule. The
+    /// control is the same profile without the deny.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[allow(clippy::disallowed_methods)] // fixed /usr/bin paths
+    fn child_profile_denies_nsurlsessiond_lookup() {
+        if !sandbox_usable() {
+            return;
+        }
+        // The real interpreter, not the /usr/bin stub (see below).
+        let out = Command::new("/usr/bin/python3")
+            .args(["-c", "import sys; print(sys.executable)"])
+            .output()
+            .unwrap();
+        let py_bin = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        let probe = "import ctypes,sys;l=ctypes.CDLL('/usr/lib/libSystem.B.dylib');\
+            p=ctypes.c_uint();sys.exit(l.bootstrap_look_up(\
+            ctypes.c_uint.in_dll(l,'bootstrap_port'),b'com.apple.nsurlsessiond',ctypes.byref(p)) != 0)";
+        let home = std::env::temp_dir().canonicalize().unwrap();
+        let profile = crate::sandbox::mcp_child_profile(&home, &[], false, None).unwrap();
+        let reach = |profile: &str| {
+            Command::new("/usr/bin/sandbox-exec")
+                .args(["-p", profile, "--", &py_bin, "-I", "-c", probe])
+                .status()
+                .unwrap()
+                .success()
+        };
+        let control = profile.replace(
+            r#"(deny mach-lookup (global-name "com.apple.nsurlsessiond"))"#,
+            "",
+        );
+        assert!(reach(&control), "control: nsurlsessiond unreachable");
+        assert!(!reach(&profile), "child looked up nsurlsessiond");
+    }
+
     /// The kernel, not the profile text: inside the child profile a TCP
     /// connect reaches only the egress port, not another local port and not
     /// a remote host.

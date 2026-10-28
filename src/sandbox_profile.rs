@@ -325,6 +325,9 @@ fn profile_locked(
 /// its egress proxy, through the same proxy-forced rules as the agent
 /// (no port means no TCP at all). Writes go only to `write_dirs`, which the
 /// caller canonicalizes; an SBPL-unsafe path is an error, never dropped.
+pub(crate) const NSURLSESSIOND_DENY: &str =
+    r#"(deny mach-lookup (global-name "com.apple.nsurlsessiond"))"#;
+
 pub(crate) fn mcp_child_profile(
     home: &Path,
     write_dirs: &[PathBuf],
@@ -342,6 +345,9 @@ pub(crate) fn mcp_child_profile(
     sbpl!(sb, "(allow file-read*)");
     sbpl!(sb, ";; Mach IPC (Keychain via securityd, DNS)");
     sbpl!(sb, "(allow mach-lookup)");
+    // nsurlsessiond fetches URLs for its caller from its own process, past
+    // the egress rule below. Last match wins, so this deny must follow.
+    sbpl!(sb, "{NSURLSESSIOND_DENY}");
     // `security add-generic-password` (go-keyring's refresh) posts this.
     sbpl!(
         sb,
@@ -3955,6 +3961,14 @@ mod mcp_child_profile_tests {
         assert!(!p.contains("Keychains"), "{p}");
         let k = mcp_child_profile(Path::new("/Users/u"), &dirs, true, None).unwrap();
         assert!(k.contains("/Users/u/Library/Keychains/"), "{k}");
+    }
+
+    #[test]
+    fn nsurlsessiond_is_denied_after_the_mach_allow() {
+        let p = mcp_child_profile(Path::new("/Users/u"), &[], false, Some(4242)).unwrap();
+        let allow = p.find("(allow mach-lookup)").unwrap();
+        let deny = p.find(super::NSURLSESSIOND_DENY).expect("deny present");
+        assert!(deny > allow, "deny must follow the allow (last match wins)");
     }
 
     #[test]
