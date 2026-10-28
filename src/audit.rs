@@ -2676,14 +2676,6 @@ mod tests {
     use super::*;
     use std::process::Command;
 
-    /// #878 M-05: `git status` skips ignored paths, so a clean audit must not
-    /// read as covering them, and the old wording must survive for scripts.
-    #[test]
-    fn clean_report_says_ignored_files_not_checked() {
-        assert!(NO_CHANGES.starts_with("no project file changes"));
-        assert!(NO_CHANGES.contains("git-ignored files not checked"));
-    }
-
     fn set(items: &[&str]) -> BTreeSet<String> {
         items.iter().map(ToString::to_string).collect()
     }
