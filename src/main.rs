@@ -6904,7 +6904,10 @@ fn assemble_sandbox(
         let (name, off) = if resolved.bool_layer("proxy", "inject_github_token")
             == Some(config::ConfigLayer::Cli)
         {
-            ("--inject-github-token", "drop --inject-github-token")
+            (
+                "--inject-github-token",
+                "pass --no-inject-github-token in its place",
+            )
         } else {
             (
                 "proxy.inject_github_token",
