@@ -772,9 +772,11 @@ cplt does not restrict outbound *domains* by default, but the proxy still enforc
 
 ## DNS lockdown (`proxy.deny_dns`, macOS)
 
-Off by default. With `proxy.forced` on, `cplt config set proxy.deny_dns true` takes the system resolver away from the agent: the profile drops the `/private/var/run/mDNSResponder` socket and denies the mDNSResponder Mach services (`com.apple.dnssd.service`, `com.apple.mDNSResponder.*`) and `com.apple.nsurlsessiond`, which runs background `URLSession` transfers outside the sandbox. A DNS query can then no longer carry data out past the proxy ([#653](https://github.com/navikt/cplt/issues/653)). The agent's own processes can then only reach a name through the proxy, which resolves the host name in the `CONNECT` request, so the allowlist and the proxy log see those lookups.
+Off by default. With `proxy.forced` on, `cplt config set proxy.deny_dns true` takes the system resolver away from the agent: the profile drops the `/private/var/run/mDNSResponder` socket and denies the mDNSResponder Mach services (`com.apple.dnssd.service`, `com.apple.mDNSResponder.*`). A DNS query can then no longer carry data out past the proxy ([#653](https://github.com/navikt/cplt/issues/653)). The agent's own processes can then only reach a name through the proxy, which resolves the host name in the `CONNECT` request, so the allowlist and the proxy log see those lookups.
 
 Without `proxy.forced` the key does nothing and cplt says so at launch.
+
+`proxy.forced` on its own, with or without this key, also denies `com.apple.nsurlsessiond`. That daemon runs background `URLSession` transfers outside the sandbox and the proxy, so macOS tools that hand downloads or uploads to a background session (some Swift and Xcode tooling, `softwareupdate`-style downloaders) fail under `proxy.forced`.
 
 Checked with cplt on macOS 26 ([#653](https://github.com/navikt/cplt/issues/653)):
 

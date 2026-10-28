@@ -961,12 +961,6 @@ fn emit_system_access(
             sb,
             r#"(deny mach-lookup (global-name-regex #"^com\.apple\.(dnssd\.|mDNSResponder)"))"#
         );
-        // A background URLSession hands the request to nsurlsessiond, which
-        // resolves and connects outside the sandbox and the proxy.
-        sbpl!(
-            sb,
-            r#"(deny mach-lookup (global-name-regex #"^com\.apple\.nsurlsessiond"))"#
-        );
     }
     sbpl!(sb);
 
@@ -3866,6 +3860,15 @@ fn emit_network_rules(
     //   4. Most build tools (Gradle, Kotlin) bind to 127.0.0.1 explicitly
     sbpl!(sb, "(allow network-bind (local ip \"*:*\"))");
     sbpl!(sb, "(allow network-inbound (local ip \"*:*\"))");
+    if proxy_forced {
+        // A background URLSession hands the transfer to nsurlsessiond, which
+        // resolves and connects outside the sandbox and the proxy. Follows
+        // the blanket (allow mach-lookup) in emit_system_access.
+        sbpl!(
+            sb,
+            r#"(deny mach-lookup (global-name-regex #"^com\.apple\.nsurlsessiond"))"#
+        );
+    }
     if deny_dns {
         // An explicit deny, so an `allow.socket` entry cannot reopen it.
         sbpl!(
@@ -5239,8 +5242,18 @@ mod tests {
         let mut opts = test_options(project, home);
         opts.proxy_forced = true;
         opts.proxy_port = Some(8080);
+        let nsurl = r#"(deny mach-lookup (global-name-regex #"^com\.apple\.nsurlsessiond"))"#;
         let open = generate_profile(&opts, &[]);
         assert!(open.contains(sock) && !open.contains(mach));
+        // nsurlsessiond is closed under plain proxy_forced, after the allow.
+        let at = open
+            .find(nsurl)
+            .expect("proxy_forced must deny nsurlsessiond");
+        assert!(at > open.find("(allow mach-lookup)\n").unwrap());
+        assert!(!open[at..].contains("(allow mach-lookup"));
+        opts.proxy_forced = false;
+        assert!(!generate_profile(&opts, &[]).contains(nsurl));
+        opts.proxy_forced = true;
         opts.deny_dns = true;
         let p = generate_profile(&opts, &[]);
         assert!(!p.contains(sock), "deny_dns must drop the resolver socket");
