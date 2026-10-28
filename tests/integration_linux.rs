@@ -368,7 +368,8 @@ echo AGENT_COMPLETED
         let store_pnpm = store.join("pnpm");
         let new_alias = store.join("new-alias");
         let managed_pnpm = package_manager_store.join("pnpm");
-        fs::write(&source, "#!/bin/sh\nprintf 'shadow:OK\\n'\n").expect("write pnpm");
+        // A real binary: the shadow copies nothing but ELF or Mach-O.
+        fs::copy(env!("CARGO_BIN_EXE_cplt"), &source).expect("copy a real binary as fake pnpm");
         fs::write(&standalone, "#!/bin/sh\nprintf 'standalone:OK\\n'\n")
             .expect("write standalone executable");
         fs::hard_link(&source, &store_pnpm).expect("hardlink pnpm into store");
@@ -382,7 +383,7 @@ echo AGENT_COMPLETED
              if ln '{standalone}' '{new_alias}'; then printf 'link:FAIL\\n'; else printf 'link:OK\\n'; fi; \
              '{standalone}'; \
              if '{store_pnpm}'; then printf 'store:FAIL\\n'; else printf 'store:OK\\n'; fi; \
-             '{managed_pnpm}'; pnpm",
+             '{managed_pnpm}'; pnpm --version",
             store_pnpm = store_pnpm.display(),
             standalone = standalone.display(),
             new_alias = new_alias.display(),
@@ -417,7 +418,10 @@ echo AGENT_COMPLETED
         assert!(stdout.contains("standalone:OK"), "{stdout}");
         assert!(stdout.contains("store:OK"), "{stdout}");
         assert!(stdout.contains("managed:OK"), "{stdout}");
-        assert!(stdout.contains("shadow:OK"), "{stdout}");
+        assert!(
+            stdout.contains(&format!("cplt {}", env!("CARGO_PKG_VERSION"))),
+            "{stdout}"
+        );
     }
 
     /// Create a fake HOME with populated sensitive directories for hermetic testing.

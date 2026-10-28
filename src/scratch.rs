@@ -309,7 +309,8 @@ fn pnpm_shadow_source_in(
         return Ok(None);
     }
     let mut magic = [0u8; 4];
-    file.read_exact_at(&mut magic, 0)
+    let read = file
+        .read_at(&mut magic, 0)
         .map_err(|e| format!("Cannot read pnpm executable {}: {e}", path.display()))?;
     const BINARY_MAGIC: [[u8; 4]; 6] = [
         *b"\x7fELF",
@@ -319,11 +320,11 @@ fn pnpm_shadow_source_in(
         [0xfe, 0xed, 0xfa, 0xce],
         [0xca, 0xfe, 0xba, 0xbe],
     ];
-    if !BINARY_MAGIC.contains(&magic) {
-        return Err(format!(
-            "Refusing to shadow pnpm executable {}: not a Mach-O or ELF binary",
-            path.display()
-        ));
+    // Never copy anything else out of the store: a script such as the
+    // `pnpm.mjs` the JS package's launcher hands to node needs no shadow,
+    // and a planted link to a secret must not land in one.
+    if read < magic.len() || !BINARY_MAGIC.contains(&magic) {
+        return Ok(None);
     }
     Ok(Some(PnpmShadowSource { path, file }))
 }
@@ -1798,9 +1799,41 @@ mod tests {
         let pnpm = store.join("pnpm");
         std::fs::write(&pnpm, b"-----BEGIN OPENSSH PRIVATE KEY-----\n").unwrap();
 
-        let error = PnpmShadowDir::create_if_needed(home.path(), &pnpm)
-            .expect_err("a non-binary store file must be refused");
-        assert!(error.contains("not a Mach-O or ELF"), "{error}");
+        assert!(
+            PnpmShadowDir::create_if_needed(home.path(), &pnpm)
+                .unwrap()
+                .is_none(),
+            "a non-binary store file must never be copied into a shadow"
+        );
+    }
+
+    #[test]
+    fn pnpm_js_package_launcher_needs_no_shadow() {
+        // Layout written by `pnpm add --global pnpm@11` (the JS package).
+        let home = tempfile::tempdir().unwrap();
+        let pnpm_home = home.path().join("Library/pnpm");
+        let package = pnpm_home.join("store/v11/links/@/pnpm/11.5.1/abc/node_modules/pnpm");
+        let bin = pnpm_home.join("bin");
+        std::fs::create_dir_all(package.join("bin")).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let target = package.join("bin/pnpm.mjs");
+        std::fs::write(&target, b"#!/usr/bin/env node\nimport '../dist/pnpm.mjs'\n").unwrap();
+        let launcher = bin.join("pnpm");
+        std::fs::write(
+            &launcher,
+            format!(
+                "#!/bin/sh\nexec node \"{}\" \"$@\"\n# cmd-shim-target={}\n",
+                target.display(),
+                target.display()
+            ),
+        )
+        .unwrap();
+
+        assert!(
+            PnpmShadowDir::create_if_needed(home.path(), &launcher)
+                .expect("the launch must proceed")
+                .is_none()
+        );
     }
 
     #[test]
