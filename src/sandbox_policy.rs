@@ -252,6 +252,15 @@ pub const HOME_CONFIG_FILES: &[&str] = &[
     // what mise already reads with `XDG_CONFIG_HOME` unset. Read-only like
     // git's config, because the host's mise runs its `[hooks]` and `[tasks]`.
     ".config/mise/config.toml",
+    // yarn 1's rc files (#881): it stops on EPERM from any of them, as from
+    // [`YARN_CONFIG_DIR`]. `~/.yarnrc` exists for nearly every yarn 1 user,
+    // since yarn writes `lastUpdateCheck` there; it also reads a Berry
+    // `.yarnrc.yml` next to it. Each can hold a registry token, which the
+    // agent can then read; `~/.npmrc`, where yarn 1 also looks for tokens,
+    // stays denied.
+    ".yarnrc",
+    ".yarnrc.yml",
+    ".config/yarn/config",
     // pnpm's global settings on macOS. The pnpm AppDir entry resolves to the
     // XDG spelling (~/.config/pnpm) only, so the native config dir needs its
     // own grant. One file, not the dir: `pnpm login` and `pnpm config set
@@ -260,6 +269,16 @@ pub const HOME_CONFIG_FILES: &[&str] = &[
     // pnpm trusts outside the sandbox.
     "Library/Preferences/pnpm/config.yaml",
 ];
+
+/// yarn 1's config dir, relative to `$HOME` (yarn hardcodes it, ignoring
+/// `XDG_CONFIG_HOME`). yarn tries the directory itself as an rc file and skips
+/// only ENOENT and EISDIR, so a denied read (EPERM) stops it (#881). macOS
+/// grants the directory node alone, which turns that into EISDIR. Landlock
+/// cannot grant a directory without what is below it, which adds `global/`
+/// (packages from `yarn global add`); a link onto or around a credential
+/// directory gets no grant there. yarn 1 writes
+/// its own settings to `~/.yarnrc`, not here.
+pub const YARN_CONFIG_DIR: &str = ".config/yarn";
 
 /// The [`DENIED_FILES`] entry `path` names, if any.
 ///
@@ -5421,10 +5440,12 @@ mod tests {
         assert!(cplt_state_dir_grant(&home, &target.join(".config/cplt/x")).is_some());
     }
 
-    /// The read-only files are git's and pnpm's macOS config, drawn from the
-    /// shared read list (#524, #547). Pinning the exact set makes a new entry
-    /// a deliberate choice: `gh` and `.tool-versions` stay out; mise's `config.toml` is in, since the
-    /// host's mise runs its hooks and tasks.
+    /// The read-only files are git's, mise's, yarn 1's and pnpm's macOS
+    /// config, drawn from the shared read list (#524, #547, #887, #881).
+    /// Pinning the exact set makes a new entry a deliberate choice: `gh` and
+    /// `.tool-versions` stay out. mise's `config.toml` and yarn's rc files are
+    /// in: the host's mise runs hooks and tasks from it, and `yarn-path` is
+    /// code the host's yarn runs.
     #[test]
     fn read_only_home_config_is_the_protected_subset_of_home_config_files() {
         let ro: Vec<&str> = read_only_home_config().collect();
@@ -5439,6 +5460,9 @@ mod tests {
                 ".config/git/ignore",
                 ".config/git/attributes",
                 ".config/mise/config.toml",
+                ".yarnrc",
+                ".yarnrc.yml",
+                ".config/yarn/config",
                 "Library/Preferences/pnpm/config.yaml",
             ]
         );
