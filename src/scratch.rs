@@ -85,13 +85,11 @@ impl PnpmShadowDir {
         // pnpm 11 puts a `/bin/sh` launcher on PATH that execs the real
         // binary, a symlink into the store. Shadow the binary; `source`
         // stays the PATH entry so direct launches still map to the shadow.
-        let binary = pnpm_cmd_shim_target(home_dir, pnpm);
-        let binary = binary.as_deref().unwrap_or(pnpm);
-        if !pnpm_requires_shadow(home_dir, binary)? {
+        let Some(source) = pnpm_shadow_source(home_dir, pnpm)? else {
             return Ok(None);
-        }
+        };
         use std::os::unix::fs::MetadataExt;
-        let source = std::fs::metadata(pnpm)
+        let entry = std::fs::metadata(pnpm)
             .map_err(|e| format!("Cannot inspect pnpm executable {}: {e}", pnpm.display()))?;
 
         let base = home_dir.join(PNPM_SHADOW_BASE);
@@ -130,16 +128,17 @@ impl PnpmShadowDir {
         create_secure_dir(&session_dir, "pnpm shadow dir")?;
         let identity = secure_dir_identity(&session_dir, "pnpm shadow dir")?;
         let shadow = session_dir.join("pnpm");
-        if let Err(error) = copy_executable(binary, &shadow) {
+        if let Err(error) = copy_executable(&source.file, &shadow) {
             let _ = std::fs::remove_dir_all(&session_dir);
             return Err(error);
         }
         // @pnpm/exe 11 loads `dist/pnpm.mjs` next to its executable. Link it
         // read-only: Seatbelt and Landlock check exec on the resolved store
         // path, so nothing under it becomes executable.
-        if let Some(dist) = std::fs::canonicalize(binary)
-            .ok()
-            .and_then(|real| real.parent().map(|dir| dir.join("dist")))
+        if let Some(dist) = source
+            .path
+            .parent()
+            .map(|dir| dir.join("dist"))
             .filter(|dist| dist.is_dir())
             && let Err(error) = std::os::unix::fs::symlink(&dist, session_dir.join("dist"))
         {
@@ -168,8 +167,8 @@ impl PnpmShadowDir {
             path: session_dir,
             device: identity.0,
             inode: identity.1,
-            source_device: source.dev(),
-            source_inode: source.ino(),
+            source_device: entry.dev(),
+            source_inode: entry.ino(),
             _lock: session_lock,
         }))
     }
@@ -249,18 +248,16 @@ fn ensure_pnpm_package_manager_stores(home_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn copy_executable(source: &Path, destination: &Path) -> Result<(), String> {
+fn copy_executable(mut source: &std::fs::File, destination: &Path) -> Result<(), String> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-    let mut source_file = std::fs::File::open(source)
-        .map_err(|e| format!("Cannot open pnpm executable {}: {e}", source.display()))?;
     let mut destination_file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o500)
         .open(destination)
         .map_err(|e| format!("Cannot create pnpm shadow {}: {e}", destination.display()))?;
-    std::io::copy(&mut source_file, &mut destination_file)
+    std::io::copy(&mut source, &mut destination_file)
         .map_err(|e| format!("Cannot copy pnpm executable into shadow: {e}"))?;
     destination_file
         .sync_all()
@@ -269,13 +266,88 @@ fn copy_executable(source: &Path, destination: &Path) -> Result<(), String> {
         .map_err(|e| format!("Cannot set pnpm shadow permissions: {e}"))
 }
 
-/// Whether pnpm must run from a read-only shadow instead of its source inode.
-pub fn pnpm_requires_shadow(home_dir: &Path, pnpm: &Path) -> Result<bool, String> {
+/// The store binary pnpm runs from, opened once so the shadow copies exactly
+/// what was checked.
+pub struct PnpmShadowSource {
+    /// Symlink-free path the file was opened at.
+    pub path: PathBuf,
+    file: std::fs::File,
+}
+
+/// The binary pnpm must run from a read-only shadow, or `None` if it runs
+/// from its own inode. Follows a pnpm 11 cmd-shim launcher to the binary it
+/// execs. The binary lives in the sandbox-writable store, so it is opened
+/// without following a symlink in any component, checked on that fd, and
+/// refused unless it is a Mach-O or ELF executable.
+pub fn pnpm_shadow_source(
+    home_dir: &Path,
+    pnpm: &Path,
+) -> Result<Option<PnpmShadowSource>, String> {
+    let binary = pnpm_cmd_shim_target(home_dir, pnpm);
+    let binary = binary.as_deref().unwrap_or(pnpm);
     let roots: Vec<PathBuf> = pnpm_home_roots(home_dir)
         .into_iter()
         .filter_map(|root| std::fs::canonicalize(root.join("store")).ok())
         .collect();
-    pnpm_has_store_alias_in(pnpm, &roots)
+    pnpm_shadow_source_in(binary, &roots)
+}
+
+fn pnpm_shadow_source_in(
+    binary: &Path,
+    roots: &[PathBuf],
+) -> Result<Option<PnpmShadowSource>, String> {
+    use std::os::unix::fs::FileExt;
+
+    let path = std::fs::canonicalize(binary)
+        .map_err(|e| format!("Cannot resolve pnpm executable {}: {e}", binary.display()))?;
+    let file = open_no_symlinks(&path)
+        .map_err(|e| format!("Cannot open pnpm executable {}: {e}", path.display()))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("Cannot inspect pnpm executable {}: {e}", path.display()))?;
+    if !meta.is_file() || !pnpm_has_store_alias_in(&path, &meta, roots) {
+        return Ok(None);
+    }
+    let mut magic = [0u8; 4];
+    file.read_exact_at(&mut magic, 0)
+        .map_err(|e| format!("Cannot read pnpm executable {}: {e}", path.display()))?;
+    const BINARY_MAGIC: [[u8; 4]; 6] = [
+        *b"\x7fELF",
+        [0xcf, 0xfa, 0xed, 0xfe],
+        [0xce, 0xfa, 0xed, 0xfe],
+        [0xfe, 0xed, 0xfa, 0xcf],
+        [0xfe, 0xed, 0xfa, 0xce],
+        [0xca, 0xfe, 0xba, 0xbe],
+    ];
+    if !BINARY_MAGIC.contains(&magic) {
+        return Err(format!(
+            "Refusing to shadow pnpm executable {}: not a Mach-O or ELF binary",
+            path.display()
+        ));
+    }
+    Ok(Some(PnpmShadowSource { path, file }))
+}
+
+/// Open read-only, failing on a symlink in any path component.
+fn open_no_symlinks(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::sandbox::openat2_no_symlinks(
+            libc::AT_FDCWD,
+            path,
+            libc::O_RDONLY | libc::O_CLOEXEC,
+            0,
+        )
+        .map(std::fs::File::from)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW_ANY)
+            .open(path)
+    }
 }
 
 /// The binary a pnpm cmd-shim launcher execs, when it lies in a pnpm home.
@@ -310,20 +382,12 @@ fn pnpm_cmd_shim_target_in(pnpm: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
     (target.is_file() && roots.iter().any(|root| target.starts_with(root))).then_some(target)
 }
 
-fn pnpm_has_store_alias_in(pnpm: &Path, roots: &[PathBuf]) -> Result<bool, String> {
+fn pnpm_has_store_alias_in(pnpm: &Path, source: &std::fs::Metadata, roots: &[PathBuf]) -> bool {
     use std::os::unix::fs::MetadataExt;
-
-    let pnpm = std::fs::canonicalize(pnpm)
-        .map_err(|e| format!("Cannot resolve pnpm executable {}: {e}", pnpm.display()))?;
-    let source = std::fs::metadata(&pnpm)
-        .map_err(|e| format!("Cannot inspect pnpm executable {}: {e}", pnpm.display()))?;
-    if !source.is_file() {
-        return Ok(false);
-    }
 
     for root in roots {
         if pnpm.starts_with(root) {
-            return Ok(true);
+            return true;
         }
         if source.nlink() < 2 {
             continue;
@@ -336,12 +400,12 @@ fn pnpm_has_store_alias_in(pnpm: &Path, roots: &[PathBuf]) -> Result<bool, Strin
             if !name.to_string_lossy().starts_with('v') {
                 continue;
             }
-            if store_links_contain_inode(&version.path().join("links"), 0, &source) {
-                return Ok(true);
+            if store_links_contain_inode(&version.path().join("links"), 0, source) {
+                return true;
             }
         }
     }
-    Ok(false)
+    false
 }
 
 /// Directory levels below `links/` to search. pnpm 11 nests the binary at
@@ -1654,7 +1718,7 @@ mod tests {
         std::fs::create_dir_all(&global).unwrap();
         std::fs::create_dir_all(&links).unwrap();
         let pnpm = global.join("pnpm");
-        std::fs::write(&pnpm, b"#!/bin/sh\nprintf shadow\n").unwrap();
+        std::fs::write(&pnpm, b"\xcf\xfa\xed\xfe").unwrap();
         std::fs::set_permissions(&pnpm, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::hard_link(&pnpm, links.join("pnpm")).unwrap();
 
@@ -1691,7 +1755,7 @@ mod tests {
         let store = home.path().join("Library/pnpm/store/v10/links/package");
         std::fs::create_dir_all(&store).unwrap();
         let pnpm = store.join("pnpm");
-        std::fs::write(&pnpm, b"#!/bin/sh\n").unwrap();
+        std::fs::write(&pnpm, b"\xcf\xfa\xed\xfe").unwrap();
         std::fs::set_permissions(&pnpm, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         assert!(
@@ -1699,6 +1763,44 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn pnpm_shadow_refuses_a_symlinked_store_binary() {
+        let home = tempfile::tempdir().unwrap();
+        let store = home.path().join("Library/pnpm/store/v10/links/package");
+        std::fs::create_dir_all(&store).unwrap();
+        let secret = home.path().join("id_ed25519");
+        std::fs::write(&secret, b"\xcf\xfa\xed\xfesecret").unwrap();
+        let pnpm = store.join("pnpm");
+        std::os::unix::fs::symlink(&secret, &pnpm).unwrap();
+        let roots = [std::fs::canonicalize(home.path().join("Library/pnpm/store")).unwrap()];
+
+        // The canonical store path, swapped for a link after canonicalize.
+        let canonical = std::fs::canonicalize(&store).unwrap().join("pnpm");
+        assert!(open_no_symlinks(&canonical).is_err());
+        // A parent directory swapped for a link.
+        let real = home.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("pnpm"), b"\xcf\xfa\xed\xfe").unwrap();
+        let linked = std::fs::canonicalize(home.path()).unwrap().join("linked");
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        assert!(open_no_symlinks(&linked.join("pnpm")).is_err());
+        // Resolved outside the store, the target is never shadowed.
+        assert!(pnpm_shadow_source_in(&pnpm, &roots).unwrap().is_none());
+    }
+
+    #[test]
+    fn pnpm_shadow_refuses_a_non_binary_store_file() {
+        let home = tempfile::tempdir().unwrap();
+        let store = home.path().join("Library/pnpm/store/v10/links/package");
+        std::fs::create_dir_all(&store).unwrap();
+        let pnpm = store.join("pnpm");
+        std::fs::write(&pnpm, b"-----BEGIN OPENSSH PRIVATE KEY-----\n").unwrap();
+
+        let error = PnpmShadowDir::create_if_needed(home.path(), &pnpm)
+            .expect_err("a non-binary store file must be refused");
+        assert!(error.contains("not a Mach-O or ELF"), "{error}");
     }
 
     #[test]
@@ -1730,7 +1832,7 @@ mod tests {
         std::fs::create_dir_all(&global).unwrap();
         std::fs::create_dir_all(&links).unwrap();
         let pnpm = global.join("pnpm");
-        std::fs::write(&pnpm, b"#!/bin/sh\n").unwrap();
+        std::fs::write(&pnpm, b"\xcf\xfa\xed\xfe").unwrap();
         std::fs::set_permissions(&pnpm, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::hard_link(&pnpm, links.join("pnpm")).unwrap();
 
@@ -1817,14 +1919,20 @@ mod tests {
         std::fs::hard_link(&binary, &pnpm).unwrap();
 
         assert!(
-            pnpm_has_store_alias_in(&pnpm, &[pnpm_home.join("store")]).unwrap(),
+            pnpm_shadow_source_in(&pnpm, &[pnpm_home.join("store")])
+                .unwrap()
+                .is_some(),
             "a pnpm 11 deep store alias must be detected"
         );
 
         let unrelated = global.join("other");
         std::fs::write(&unrelated, b"x").unwrap();
         std::fs::hard_link(&unrelated, global.join("other2")).unwrap();
-        assert!(!pnpm_has_store_alias_in(&unrelated, &[pnpm_home.join("store")]).unwrap());
+        assert!(
+            pnpm_shadow_source_in(&unrelated, &[pnpm_home.join("store")])
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1838,12 +1946,14 @@ mod tests {
         std::fs::create_dir_all(&global).unwrap();
         std::fs::create_dir_all(&links).unwrap();
         let pnpm = global.join("pnpm");
-        std::fs::write(&pnpm, b"#!/bin/sh\n").unwrap();
+        std::fs::write(&pnpm, b"\xcf\xfa\xed\xfe").unwrap();
         std::fs::set_permissions(&pnpm, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::hard_link(&pnpm, links.join("pnpm")).unwrap();
 
         assert!(
-            pnpm_has_store_alias_in(&pnpm, &[pnpm_home.join("store")]).unwrap(),
+            pnpm_shadow_source_in(&pnpm, &[pnpm_home.join("store")])
+                .unwrap()
+                .is_some(),
             "a custom PNPM_HOME store alias must be detected"
         );
     }

@@ -1582,7 +1582,7 @@ Linux-specific tool directories use XDG-style paths:
 | Directory | Permissions | Rationale |
 |-----------|------------|-----------|
 | `~/.cache` | read+write | XDG cache dir (pip, go-build, etc.) |
-| `~/.local/share/pnpm` | read-only root with exact grants for existing PATH executables; `store/` read+write; `package-manager-store/` read+write+exec | A pnpm executable that resolves into `store/` (a hardlink at any depth under `store/v*/links/`, or the store binary a pnpm 11 `bin/pnpm` launcher execs) is copied to a per-session read-only shadow before launch, with a read-only `dist` link beside it, so the content-addressable store remains non-executable. `package-manager-store/` deliberately downloads and runs packageManager-pinned versions |
+| `~/.local/share/pnpm` | read-only root with exact grants for existing PATH executables; `store/` read+write; `package-manager-store/` read+write+exec | A pnpm executable that resolves into `store/` (a hardlink at any depth under `store/v*/links/`, or the store binary a pnpm 11 `bin/pnpm` launcher execs) is copied to a per-session read-only shadow before launch, with a `dist` symlink into the writable, non-executable store beside it, so the content-addressable store remains non-executable. `package-manager-store/` deliberately downloads and runs packageManager-pinned versions |
 | `~/.local/bin` | read+exec | User-installed binaries |
 | `~/.local/share/mise` | read+write+exec | mise tool installations |
 

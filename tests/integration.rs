@@ -667,7 +667,7 @@ int main(int argc, char **argv) {
         let new_alias = store.join("new-alias");
         let other = store.join("not-pnpm");
         let managed_pnpm = package_manager_store.join("v10/pnpm");
-        fs::write(&source, "#!/bin/sh\nprintf 'pnpm hardlink ran\\n'\n").expect("write fake pnpm");
+        fs::copy(env!("CARGO_BIN_EXE_cplt"), &source).expect("copy a real binary as fake pnpm");
         fs::write(&standalone, "#!/bin/sh\nprintf 'standalone ran\\n'\n")
             .expect("write standalone executable");
         fs::hard_link(&source, &pnpm).expect("create pnpm hardlink");
@@ -692,9 +692,9 @@ int main(int argc, char **argv) {
              chmod 755 '{managed_pnpm}' && '{managed_pnpm}' && \
              if ln '{standalone}' '{new_alias}'; then printf 'link:FAIL\n'; else printf 'link:OK\n'; fi && \
              '{standalone}' && \
-             PATH='{shadow}:/usr/bin:/bin' pnpm && \
+             PATH='{shadow}:/usr/bin:/bin' pnpm --version && \
              printf compromised > '{pnpm}' && \
-             PATH='{shadow}:/usr/bin:/bin' pnpm",
+             PATH='{shadow}:/usr/bin:/bin' pnpm --version",
             managed_dir = managed_pnpm.parent().unwrap().display(),
             managed_pnpm = managed_pnpm.display(),
             standalone = standalone.display(),
@@ -717,7 +717,9 @@ int main(int argc, char **argv) {
             "a read-only executable must not be linkable into the writable store: {output}"
         );
         assert_eq!(
-            output.matches("pnpm hardlink ran").count(),
+            output
+                .matches(&format!("cplt {}", env!("CARGO_PKG_VERSION")))
+                .count(),
             2,
             "mutating the store inode must not change the copied shadow: {output}"
         );
