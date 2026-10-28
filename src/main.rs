@@ -2280,26 +2280,28 @@ fn warn_glob_like_deny_paths(globs: &[&str], label: &str) {
 /// vault cannot reach one and asks the user to log in again every session.
 /// Injecting a token extracted in the parent is the way out, and a user who
 /// sets it while the guard is off gets no token and no explanation.
-fn inject_token_is_inert(gh_guard: &config::GhGuardPolicy) -> bool {
-    gh_guard.inject_token && !gh_guard.enabled
+/// Linux only: on macOS the key does nothing either way (#877), and the
+/// no-op line says so instead.
+fn inject_token_is_inert(gh_guard: &config::GhGuardPolicy, macos: bool) -> bool {
+    gh_guard.inject_token && !gh_guard.enabled && !macos
 }
 
-/// One short launch line for a user who set the deprecated key (#695). Only
-/// an explicit `true` reaches here: the default is false and `.cplt.toml`
-/// cannot set it. Skipped when the inert warning above already fires, which
-/// tells them to remove the key anyway. macOS only: on Linux the Keychain
-/// substitute does nothing, and the key is still how Copilot gets a login
-/// past the masked Secret Service. Also skipped without an exec token
-/// (`gh_token`), since then nothing replaces the injected one.
+/// One short launch line for a user who set the deprecated key (#695). On
+/// macOS the key is a no-op (#877) that is still accepted. Only an explicit
+/// `true` reaches here: the default is false and `.cplt.toml` cannot set it.
+/// Fires with the guard off too: the inert warning is Linux-only. On Linux the key still works: the Keychain
+/// substitute does nothing there, and the key is how Copilot gets a login
+/// past the masked Secret Service.
 fn inject_token_deprecation_line(
     gh_guard: &config::GhGuardPolicy,
     macos: bool,
-    gh_token: impl FnOnce() -> bool,
 ) -> Option<&'static str> {
-    (macos && gh_guard.inject_token && gh_guard.enabled && gh_token()).then_some(
-        "gh_guard.inject_token is deprecated: gh gets its token without it. Remove the key.",
-    )
+    (macos && gh_guard.inject_token).then_some(INJECT_TOKEN_NOOP)
 }
+
+const INJECT_TOKEN_NOOP: &str = "gh_guard.inject_token no longer has an effect on macOS: gh gets \
+     its token from the gh guard, and Copilot signs in through the Keychain substitute, which \
+     needs sandbox.keychain_substitute = true. Remove the key.";
 
 /// Removal advice needs successful retrieval and an eligible replacement,
 /// not just hosts.yml. Otherwise it can remove the only working credential.
@@ -2308,12 +2310,11 @@ fn gh_exec_token_available(
     agent: agent::Agent,
     substitute: Option<&agent::KeychainSubstitute>,
 ) -> bool {
-    if !(cfg!(target_os = "macos") && resolved.gh_guard.inject_token
-        || agent != agent::Agent::Copilot
-            && resolved
-                .pass_env
-                .iter()
-                .any(|v| v == "GH_TOKEN" || v == "GITHUB_TOKEN"))
+    if agent == agent::Agent::Copilot
+        || !resolved
+            .pass_env
+            .iter()
+            .any(|v| v == "GH_TOKEN" || v == "GITHUB_TOKEN")
     {
         return false;
     }
@@ -2372,6 +2373,7 @@ fn copilot_stored_token_handover(
         && serve
         && discover::gh_wrapper_available())
         || (resolved.gh_guard.inject_token
+            && !cfg!(target_os = "macos")
             && agent::Agent::Copilot
                 .keychain_substitute_env_vars()
                 .iter()
@@ -2387,15 +2389,11 @@ fn auth_deprecation_notes(
     gh_token: bool,
 ) -> Vec<String> {
     let mut notes = Vec::new();
+    if macos && gh_guard.inject_token {
+        notes.push(INJECT_TOKEN_NOOP.to_string());
+    }
     if !gh_token {
         return notes;
-    }
-    if macos && gh_guard.inject_token {
-        notes.push(
-            "gh_guard.inject_token is deprecated: gh gets its token from the gh guard, and \
-             Copilot can sign in with sandbox.keychain_substitute = true. Remove the key."
-                .to_string(),
-        );
     }
     if gh_guard.enabled && agent != agent::Agent::Copilot {
         for var in ["GH_TOKEN", "GITHUB_TOKEN"] {
@@ -2411,15 +2409,12 @@ fn auth_deprecation_notes(
     notes
 }
 
-fn warn_inject_token_without_guard(resolved: &config::Resolved, agent: agent::Agent) {
-    if let Some(line) =
-        inject_token_deprecation_line(&resolved.gh_guard, cfg!(target_os = "macos"), || {
-            gh_exec_token_available(resolved, agent, None)
-        })
+fn warn_inject_token_without_guard(resolved: &config::Resolved) {
+    if let Some(line) = inject_token_deprecation_line(&resolved.gh_guard, cfg!(target_os = "macos"))
     {
         ui::warn(line);
     }
-    if inject_token_is_inert(&resolved.gh_guard) {
+    if inject_token_is_inert(&resolved.gh_guard, cfg!(target_os = "macos")) {
         ui::warn(
             "gh_guard.inject_token is set but gh_guard.enabled is false, so no token is \
              injected: the injection runs as part of installing the gh wrapper, which the \
@@ -2542,7 +2537,7 @@ fn config_findings(
 ) -> Vec<cplt::doctor::Finding> {
     use cplt::doctor::Finding;
     let mut out = Vec::new();
-    let inert = inject_token_is_inert(&resolved.gh_guard);
+    let inert = inject_token_is_inert(&resolved.gh_guard, macos);
     if inert {
         out.push(Finding::warning(
             "gh_guard.inject_token is set but gh_guard.enabled is false, so no token is injected.",
@@ -5029,7 +5024,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     if neutral.is_none() {
         warn_repo_under_no_exec_cache(&resolved, &home_dir, &project_dir, &repo_paths);
     }
-    warn_inject_token_without_guard(&resolved, active_agent);
+    warn_inject_token_without_guard(&resolved);
 
     // Probe the host for everything the sandbox profile depends on.
     let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
@@ -7470,7 +7465,7 @@ fn run_exec_command(
     warn_exec_tool_dir_shadowing(&resolved, &home_dir, active_agent);
     warn_write_granted_repos(&resolved, &project_dir, &repo_paths);
     warn_repo_under_no_exec_cache(&resolved, &home_dir, &project_dir, &repo_paths);
-    warn_inject_token_without_guard(&resolved, active_agent);
+    warn_inject_token_without_guard(&resolved);
 
     // Build the resolved Shell sandbox (discovery → proxy → prepare). Shared
     // with `cplt check`, which runs its probes under the identical policy.
@@ -15907,10 +15902,20 @@ mod tests {
             enabled,
             ..config::GhGuardPolicy::default()
         };
-        assert!(inject_token_is_inert(&policy(true, false)), "set but inert");
-        assert!(!inject_token_is_inert(&policy(true, true)), "doing its job");
-        assert!(!inject_token_is_inert(&policy(false, false)));
-        assert!(!inject_token_is_inert(&policy(false, true)));
+        assert!(
+            inject_token_is_inert(&policy(true, false), false),
+            "set but inert"
+        );
+        assert!(
+            !inject_token_is_inert(&policy(true, true), false),
+            "doing its job"
+        );
+        assert!(!inject_token_is_inert(&policy(false, false), false));
+        assert!(!inject_token_is_inert(&policy(false, true), false));
+        assert!(
+            !inject_token_is_inert(&policy(true, false), true),
+            "macOS: no-op line instead"
+        );
     }
 
     /// The launch line shows only for an explicit `true` with the guard on.
@@ -15921,35 +15926,15 @@ mod tests {
             enabled,
             ..config::GhGuardPolicy::default()
         };
+        assert!(inject_token_deprecation_line(&config::GhGuardPolicy::default(), true).is_none());
+        assert!(inject_token_deprecation_line(&policy(false, true), true).is_none());
         assert!(
-            inject_token_deprecation_line(&config::GhGuardPolicy::default(), true, || panic!(
-                "default must not probe gh"
-            ))
-            .is_none()
+            inject_token_deprecation_line(&policy(true, false), true).is_some(),
+            "macOS, guard off: no-op line, not the inert one"
         );
+        assert!(inject_token_deprecation_line(&policy(true, true), true).is_some());
         assert!(
-            inject_token_deprecation_line(&policy(false, true), true, || panic!(
-                "unset must not probe gh"
-            ))
-            .is_none()
-        );
-        assert!(
-            inject_token_deprecation_line(&policy(true, false), true, || panic!(
-                "guard off must not probe gh"
-            ))
-            .is_none(),
-            "inert warning covers it"
-        );
-        assert!(inject_token_deprecation_line(&policy(true, true), true, || true).is_some());
-        assert!(
-            inject_token_deprecation_line(&policy(true, true), true, || false).is_none(),
-            "nothing replaces the injected token without an exec token"
-        );
-        assert!(
-            inject_token_deprecation_line(&policy(true, true), false, || panic!(
-                "Linux must not probe gh for deprecation"
-            ))
-            .is_none(),
+            inject_token_deprecation_line(&policy(true, true), false).is_none(),
             "Linux still needs it"
         );
     }
@@ -16040,8 +16025,10 @@ mod tests {
                         .is_some()
                     );
                     r.gh_guard.inject_token = true;
-                    assert!(copilot_stored_token_handover(&r, None, true, false));
-                    assert!(copilot_stored_token_handover(&r, None, true, true));
+                    // A no-op on macOS (#877), so no handover there.
+                    let linux = !cfg!(target_os = "macos");
+                    assert_eq!(copilot_stored_token_handover(&r, None, true, false), linux);
+                    assert_eq!(copilot_stored_token_handover(&r, None, true, true), linux);
                     r.gh_guard.inject_token = false;
                 });
                 assert!(
@@ -16078,12 +16065,14 @@ mod tests {
                 r.gh_guard.block_auth_token = false;
                 assert!(!copilot_stored_token_handover(&r, None, true, false));
                 r.gh_guard.inject_token = true;
-                assert!(copilot_stored_token_handover(&r, None, true, false));
-                assert!(copilot_stored_token_handover(&r, None, true, true));
+                let linux = !cfg!(target_os = "macos");
+                assert_eq!(copilot_stored_token_handover(&r, None, true, false), linux);
+                assert_eq!(copilot_stored_token_handover(&r, None, true, true), linux);
                 r.deny_env = vec!["GH_TOKEN".into()];
                 assert!(!replacement(&r, true, true));
-                assert!(
+                assert_eq!(
                     copilot_stored_token_handover(&r, None, true, false),
+                    linux,
                     "injection can use GITHUB_TOKEN"
                 );
                 r.gh_guard.inject_token = false;
@@ -16157,16 +16146,21 @@ mod tests {
         let inert = resolve("[gh_guard]\ninject_token = true\nenabled = false\n");
         let m = messages(&inert, agent::Agent::Copilot, true, true);
         assert_eq!(m.len(), 1, "{m:?}");
-        assert!(m[0].contains("no token is injected"), "{m:?}");
-        assert_eq!(
-            messages(&inert, agent::Agent::Copilot, false, true).len(),
-            1
+        assert!(
+            m[0].contains("no longer has an effect"),
+            "macOS: no-op text {m:?}"
         );
+        let m = messages(&inert, agent::Agent::Copilot, false, true);
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert!(m[0].contains("no token is injected"), "{m:?}");
 
-        // inject_token with the guard on: deprecated on macOS only.
+        // inject_token with the guard on: a no-op on macOS only.
         let on = resolve("[gh_guard]\ninject_token = true\nenabled = true\n");
         let m = messages(&on, agent::Agent::Copilot, true, true);
-        assert!(m.len() == 1 && m[0].contains("deprecated"), "{m:?}");
+        assert!(
+            m.len() == 1 && m[0].contains("no longer has an effect"),
+            "{m:?}"
+        );
         assert!(messages(&on, agent::Agent::Copilot, false, true).is_empty());
 
         // pass_env naming a token gh no longer needs.
@@ -16274,7 +16268,11 @@ mod tests {
         );
         // No exec token (gh not logged in, or GH_TOKEN denied): GH_TOKEN in
         // pass_env is the only token, so no note tells the user to drop it.
-        assert!(auth_deprecation_notes(&g, &env, agent::Agent::Claude, true, false).is_empty());
+        // The inject_token note stays: on macOS the key is a no-op (#877).
+        assert_eq!(
+            auth_deprecation_notes(&g, &env, agent::Agent::Claude, true, false).len(),
+            1
+        );
     }
 
     /// The shape a user hit: two repositories side by side under one

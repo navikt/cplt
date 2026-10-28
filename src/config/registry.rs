@@ -608,7 +608,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         // unremarkable. A user hit exactly that and asked why.
         dangerous: true,
         default_display: "false",
-        description: "DEPRECATED on macOS: gh gets its token from the gh guard, Copilot from sandbox.keychain_substitute. Linux native credential access depends on the backend and agent version; use explicit environment handover when needed. Injects the gh token into Copilot's environment. Requires gh_guard.enabled and sandbox.scratch_dir.",
+        description: "DEPRECATED: no effect on macOS, where gh gets its token from the gh guard, Copilot from sandbox.keychain_substitute. Linux native credential access depends on the backend and agent version; use explicit environment handover when needed. On Linux, injects the gh token into Copilot's environment. Requires gh_guard.enabled and sandbox.scratch_dir.",
     },
     ConfigKeyInfo {
         section: "gh_guard",

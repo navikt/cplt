@@ -287,6 +287,82 @@ fi
         }
     }
 
+    /// #877: on macOS a stale `gh_guard.inject_token = true` is a no-op. The
+    /// launch still succeeds, and no token variable reaches Copilot.
+    #[test]
+    fn inject_token_is_a_noop_on_macos() {
+        use std::os::unix::fs::PermissionsExt;
+        require_sandbox!();
+        let home = home_temp_dir("inject-token-noop");
+        let project = TempProject::new("inject-token-noop");
+        project.git_init();
+        let bin = home.path().join("bin");
+        let gh_config = home.path().join("gh");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&gh_config).unwrap();
+        fs::write(
+            gh_config.join("hosts.yml"),
+            "github.com:\n    user: fixture\n    oauth_token: synthetic-inject-secret\n",
+        )
+        .unwrap();
+        let config = home.path().join("cplt.toml");
+        fs::write(
+            &config,
+            "[sandbox]\nkeychain_substitute = false\n\n[gh_guard]\nenabled = true\ninject_token = true\n",
+        )
+        .unwrap();
+        let agent = bin.join("copilot");
+        fs::write(
+            &agent,
+            r#"#!/bin/sh
+for arg in "$@"; do
+  if [ "$arg" = --version ]; then echo '1.0.94'; exit 0; fi
+done
+[ -z "$GH_TOKEN$GITHUB_TOKEN$COPILOT_GITHUB_TOKEN" ] || exit 43
+echo NO_TOKEN_IN_ENV
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths([
+            bin.as_path(),
+            Path::new("/opt/homebrew/bin"),
+            Path::new("/usr/local/bin"),
+            Path::new("/usr/bin"),
+            Path::new("/bin"),
+        ])
+        .unwrap();
+        let out = cplt_cmd()
+            .env_clear()
+            .env("CPLT_CONFIG", &config)
+            .env("NO_COLOR", "1")
+            .env("HOME", home.path())
+            .env("GH_CONFIG_DIR", &gh_config)
+            .env("PATH", &path)
+            .current_dir(project.path())
+            .args([
+                "--agent",
+                "copilot",
+                "--yes",
+                "--no-validate",
+                "--no-proxy",
+                "--no-audit",
+                "--no-git-guard",
+                "--gh-guard",
+            ])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stdout}\n{stderr}");
+        assert!(stdout.contains("NO_TOKEN_IN_ENV"), "{stdout}");
+        assert!(stderr.contains("no longer has an effect"), "{stderr}");
+        assert!(
+            !stdout.contains("synthetic-inject-secret")
+                && !stderr.contains("synthetic-inject-secret")
+        );
+    }
+
     #[test]
     fn copilot_one_shot_cache_uses_scratch_with_passed_tmpdir() {
         use std::os::unix::fs::PermissionsExt;
