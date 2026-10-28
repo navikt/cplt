@@ -186,7 +186,7 @@ Both check where an allowed hostname resolves. They differ on private ranges: cp
 
 ### GitHub Copilot CLI's own sandbox
 
-Copilot CLI has a local sandbox, included in the standard seat. It runs shell commands through Microsoft Execution Containers
+Copilot CLI has a local sandbox, included in the standard seat and [generally available since October 7, 2026](https://github.blog/changelog/2026-10-07-local-sandboxing-for-github-copilot-now-generally-available/). It runs shell commands through Microsoft Execution Containers
 (MXC) with restricted filesystem, network and system access, on macOS, Linux
 and recent Windows 11 builds. It is off by default. `/sandbox enable` or
 `--sandbox` turns it on. With git and `gh` authentication enabled, sandboxed
