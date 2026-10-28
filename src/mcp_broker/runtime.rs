@@ -611,7 +611,13 @@ pub(crate) fn serve(shared: &Shared, stream: UnixStream) {
                     log.line(&spec.id, &format!("FAIL not logged in on the host.{fix}"));
                 }
                 let action = match pending.lock() {
-                    Ok(mut p) => on_server(&line, &spec, &mut p),
+                    Ok(mut p) => {
+                        let a = on_server(&line, &spec, &mut p);
+                        if let Some(text) = p.1.take() {
+                            log.line(&spec.id, &text);
+                        }
+                        a
+                    }
                     Err(_) => break,
                 };
                 match action {

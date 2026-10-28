@@ -21,9 +21,14 @@ pub enum Action {
 }
 
 /// Requests from the client awaiting a server response: id → (the id
-/// itself, when it was sent).
+/// itself, when it was sent, the tool for a `tools/call`). `done` holds the
+/// audit line for the last `tools/call` answered (design 6.4), for the
+/// caller to log: tool, outcome and duration, never arguments or results.
 #[derive(Default)]
-pub struct Pending(HashMap<String, (Value, Instant)>);
+pub struct Pending(
+    HashMap<String, (Value, Instant, Option<String>)>,
+    pub Option<String>,
+);
 
 impl Pending {
     /// Drop requests older than `deadline` (design 5.6). For each, a timeout
@@ -31,7 +36,7 @@ impl Pending {
     /// then dropped as unsolicited.
     pub fn evict(&mut self, deadline: Duration) -> Vec<(String, String)> {
         let mut out = Vec::new();
-        self.0.retain(|_, (id, sent)| {
+        self.0.retain(|_, (id, sent, _)| {
             if sent.elapsed() < deadline {
                 return true;
             }
@@ -173,9 +178,13 @@ pub fn on_client(line: &str, spec: &Spec, pending: &mut Pending) -> Action {
             Some(format!("{method} → DENIED in-flight cap")),
         );
     }
+    let tool = (method == "tools/call")
+        .then(|| msg.pointer("/params/name").and_then(Value::as_str))
+        .flatten()
+        .map(str::to_string);
     pending
         .0
-        .insert(id.to_string(), (id.clone(), Instant::now()));
+        .insert(id.to_string(), (id.clone(), Instant::now(), tool));
     // Re-serialized: the server parses exactly what was checked, whatever
     // its JSON parser does with duplicate keys or odd escapes.
     Action::Forward(msg.to_string())
@@ -236,12 +245,24 @@ pub fn on_server(line: &str, spec: &Spec, pending: &mut Pending) -> Action {
             None => Action::Drop,
         };
     }
-    if obj
+    let Some((_, sent, tool)) = obj
         .get("id")
         .and_then(|id| pending.0.remove(&id.to_string()))
-        .is_none()
-    {
+    else {
         return Action::Drop;
+    };
+    if let Some(tool) = tool {
+        let outcome = if let Some(code) = obj.get("error").and_then(|e| e.get("code")) {
+            format!("FAIL {code}")
+        } else if obj.get("result").and_then(|r| r.get("isError")) == Some(&Value::Bool(true)) {
+            "FAIL tool error".into()
+        } else {
+            "ALLOWED".into()
+        };
+        pending.1 = Some(format!(
+            "tools/call {tool} → {outcome} {}ms",
+            sent.elapsed().as_millis()
+        ));
     }
     // Filtered whatever the request was: an id cannot smuggle a tool list.
     if let Some(Value::Array(tools)) = obj.get_mut("result").and_then(|r| r.get_mut("tools")) {
@@ -429,6 +450,58 @@ mod tests {
         // The late response to a cancelled call is dropped.
         let late = r#"{"jsonrpc":"2.0","id":3,"result":{}}"#;
         assert_eq!(on_server(late, &s, &mut p), Action::Drop);
+    }
+
+    #[test]
+    fn each_tools_call_leaves_one_audit_line_without_arguments() {
+        let s = check(base()).unwrap();
+        let mut p = Pending::default();
+        let call = |i: u8, t: &str| {
+            json!({"jsonrpc":"2.0","id":i,"method":"tools/call","params":{"name":t,"arguments":{"team":"s3cr3t-arg"}}}).to_string()
+        };
+        assert!(matches!(
+            on_client(&call(1, "get_nais_context"), &s, &mut p),
+            Action::Forward(_)
+        ));
+        on_server(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"text":"s3cr3t-res"}]}}"#,
+            &s,
+            &mut p,
+        );
+        let allowed = p.1.take().unwrap();
+        assert!(
+            allowed.starts_with("tools/call get_nais_context → ALLOWED ")
+                && allowed.ends_with("ms"),
+            "{allowed}"
+        );
+        assert!(matches!(
+            on_client(&call(2, "get_nais_context"), &s, &mut p),
+            Action::Forward(_)
+        ));
+        on_server(
+            r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32603,"message":"s3cr3t-res"}}"#,
+            &s,
+            &mut p,
+        );
+        let failed = p.1.take().unwrap();
+        assert!(
+            failed.starts_with("tools/call get_nais_context → FAIL -32603 "),
+            "{failed}"
+        );
+        let Action::Reply(_, Some(denied)) = on_client(&call(3, "delete_app"), &s, &mut p) else {
+            panic!("not denied");
+        };
+        assert!(
+            denied.starts_with("tools/call → DENIED tool \"delete_app\""),
+            "{denied}"
+        );
+        for l in [&allowed, &failed, &denied] {
+            assert!(!l.contains("s3cr3t"), "{l}");
+        }
+        // Other methods leave no audit line.
+        on_client(r#"{"jsonrpc":"2.0","id":4,"method":"ping"}"#, &s, &mut p);
+        on_server(r#"{"jsonrpc":"2.0","id":4,"result":{}}"#, &s, &mut p);
+        assert!(p.1.is_none());
     }
 
     #[test]
