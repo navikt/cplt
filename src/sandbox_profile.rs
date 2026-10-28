@@ -323,6 +323,16 @@ fn profile_locked(
     sb
 }
 
+/// Mach services the MCP child may look up beyond bsd.sb's (#911).
+/// Measured 2026-10-28 with nais 7.0.3 under this profile with the allow
+/// replaced by `(allow mach-lookup (with report))` and `log stream
+/// --predicate 'sender == "Sandbox"'`: startup, `tools/list`,
+/// `get_nais_context`, `nais auth print-access-token -n`, and go-keyring's
+/// keychain write (`security add-generic-password -U`, find, delete on a temp
+/// keychain). The only name reported was securityd's, used by the `security`
+/// helper; nais itself looked up none.
+pub(crate) const MCP_CHILD_MACH_SERVICES: &[&str] = &["com.apple.SecurityServer"];
+
 /// The Seatbelt profile for a brokered MCP server child (#849). It runs on
 /// the host with the user's own login, so reads stay open (its credential
 /// file, the keychain via securityd, the system); what it loses is the
@@ -330,9 +340,6 @@ fn profile_locked(
 /// its egress proxy, through the same proxy-forced rules as the agent
 /// (no port means no TCP at all). Writes go only to `write_dirs`, which the
 /// caller canonicalizes; an SBPL-unsafe path is an error, never dropped.
-pub(crate) const NSURLSESSIOND_DENY: &str =
-    r#"(deny mach-lookup (global-name "com.apple.nsurlsessiond"))"#;
-
 pub(crate) fn mcp_child_profile(
     home: &Path,
     write_dirs: &[PathBuf],
@@ -348,11 +355,13 @@ pub(crate) fn mcp_child_profile(
     emit_process_rules(&mut sb);
     sbpl!(sb, ";; Reads: open. The child holds the host login anyway.");
     sbpl!(sb, "(allow file-read*)");
-    sbpl!(sb, ";; Mach IPC (Keychain via securityd, DNS)");
-    sbpl!(sb, "(allow mach-lookup)");
-    // nsurlsessiond fetches URLs for its caller from its own process, past
-    // the egress rule below. Last match wins, so this deny must follow.
-    sbpl!(sb, "{NSURLSESSIOND_DENY}");
+    // Only the Mach services a real `nais alpha mcp serve` looked up (#911),
+    // not every service: one that acts for its caller (nsurlsessiond) would
+    // be a way around the network rules. bsd.sb's own allows still apply.
+    sbpl!(sb, ";; Mach IPC: measured services only");
+    for name in MCP_CHILD_MACH_SERVICES {
+        sbpl!(sb, "(allow mach-lookup (global-name \"{name}\"))");
+    }
     // `security add-generic-password` (go-keyring's refresh) posts this.
     sbpl!(
         sb,
@@ -4039,11 +4048,19 @@ mod mcp_child_profile_tests {
     }
 
     #[test]
-    fn nsurlsessiond_is_denied_after_the_mach_allow() {
-        let p = mcp_child_profile(Path::new("/Users/u"), &[], false, Some(4242)).unwrap();
-        let allow = p.find("(allow mach-lookup)").unwrap();
-        let deny = p.find(super::NSURLSESSIOND_DENY).expect("deny present");
-        assert!(deny > allow, "deny must follow the allow (last match wins)");
+    fn mach_lookup_allows_exactly_the_measured_names() {
+        let p = mcp_child_profile(Path::new("/Users/u"), &[], true, Some(1)).unwrap();
+        assert!(!p.contains("(allow mach-lookup)"), "{p}");
+        let allows: Vec<&str> = p
+            .lines()
+            .filter(|l| l.contains("mach-lookup"))
+            .filter(|l| !l.starts_with(";;"))
+            .collect();
+        assert_eq!(
+            allows,
+            ["(allow mach-lookup (global-name \"com.apple.SecurityServer\"))"],
+            "{p}"
+        );
     }
 
     #[test]

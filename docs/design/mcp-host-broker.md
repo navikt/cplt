@@ -397,11 +397,16 @@ mechanism's status probe; no secret is printed.
   else (no listener, no unix sockets such as a Gradle daemon's). A direct
   connect to any other host or local port fails with `EPERM`, UDP is
   denied, and with no `egressHosts` there is no TCP at all. Name lookups
-  stay open, as for the agent. `mach-lookup` is unscoped (securityd needs
-  it) except for `com.apple.nsurlsessiond`, which is denied because it
-  fetches URLs for its caller. A binary could in theory still reach the
-  network through another XPC service that does the same. This contains the nais workload; it is
-  not a full jail for an arbitrary hostile binary. On Linux the control is
+  stay open, as for the agent. `mach-lookup` allows only `com.apple.SecurityServer`
+  beyond `bsd.sb` (#911), so XPC services that act for the caller, such as
+  `nsurlsessiond`, are out of reach. The list was measured 2026-10-28 with
+  nais 7.0.3: the allow replaced by `(allow mach-lookup (with report))`,
+  `log stream --predicate 'sender == "Sandbox"'` running, then startup,
+  `tools/list`, `get_nais_context`, `nais auth print-access-token -n` and
+  go-keyring's `security add-generic-password -U` on a temp keychain. Only
+  the `security` helper looked up anything, and only securityd. securityd
+  and the `bsd.sb` services still act for the child, so this contains the
+  nais workload; it is not a full jail for an arbitrary hostile binary. On Linux the control is
   still **advisory**: the child gets only `HTTPS_PROXY`. A network
   namespace cannot reach the proxy on the host's loopback, and the agent
   sandbox has no namespace path to reuse (Landlock is port-based and cannot
@@ -411,7 +416,7 @@ mechanism's status probe; no secret is printed.
   mechanism's `write_dirs` under `HOME`: for `nais-keychain`,
   `~/Library/Application Support/nais` (refresh rewrites
   `nais-credentials.json.enc`). The keychain is reached through securityd
-  (`mach-lookup`, as in the agent profile); go-keyring's `security`
+  (`com.apple.SecurityServer`, the one allowed Mach service); go-keyring's `security`
   helper also needs `ipc-posix-shm` on `com.apple.AppleDatabaseChanged` to
   post a keychain change. A refresh also rewrites the login keychain file
   from the caller's process (a `login.keychain-db.sb-*` temp file, then a
