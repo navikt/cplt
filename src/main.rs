@@ -9610,7 +9610,9 @@ fn init_config() -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    if path.exists() {
+    // symlink_metadata: a dangling symlink counts as existing, so init never
+    // writes through it.
+    if path.symlink_metadata().is_ok() {
         ui::error(&format!(
             "Config file already exists: {}\nEdit it directly, or remove it first to regenerate.",
             path.display()
@@ -9626,7 +9628,15 @@ fn init_config() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    match std::fs::write(&path, config::default_config_contents()) {
+    // create_new (O_EXCL) closes the race with the check above.
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .and_then(|mut f| {
+            std::io::Write::write_all(&mut f, config::default_config_contents().as_bytes())
+        });
+    match written {
         Ok(()) => {
             ui::ok(&format!("Config file created: {}", path.display()));
             ui::info("Edit it to customize sandbox defaults.");
