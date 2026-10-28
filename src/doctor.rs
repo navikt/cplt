@@ -1153,13 +1153,16 @@ pub fn auth_report(d: &AuthDecision<'_>, home: &Path) -> (Option<String>, String
 /// new configs (#822). Shown only while no layer and no preset set
 /// `proxy.forced`; setting it either way silences it. Never changes anything.
 #[must_use]
-pub fn proxy_forced_nudge(r: &crate::config::Resolved) -> Option<Finding> {
+pub fn proxy_forced_nudge(r: &crate::config::Resolved, can_force: bool) -> Option<Finding> {
+    if !r.with_proxy || !can_force {
+        return None;
+    }
     let unset = r.bool_layer("proxy", "forced") == Some(crate::config::ConfigLayer::Baseline);
     (unset && r.preset.is_none() && !r.proxy_forced).then(|| {
         Finding::warning(
             "proxy.forced is off, so a tool that ignores HTTPS_PROXY can connect around the \
-             proxy. New installs turn it on. With it on, DNS and UDP are blocked in the \
-             sandbox (see docs/known-impacts.md).",
+             proxy. New configs turn it on. With it on, direct connects fail, and on Linux \
+             DNS and UDP are blocked too (see docs/known-impacts.md).",
             Some(
                 "cplt config set proxy.forced true, or `cplt config set proxy.forced false` to \
                  keep it off and silence this"
@@ -1192,13 +1195,16 @@ mod tests {
         // Existing install, no key: nudged, and the value is still off.
         let old = r("");
         assert!(!old.proxy_forced);
-        assert!(proxy_forced_nudge(&old).is_some());
+        assert!(proxy_forced_nudge(&old, true).is_some());
+        // Never suggest what would refuse every launch.
+        assert!(proxy_forced_nudge(&old, false).is_none());
+        assert!(proxy_forced_nudge(&r("[proxy]\nenabled = false\n"), true).is_none());
         // New install (seeded template), explicit off, or a preset: silent.
         let new = r(&crate::config::default_config_contents());
         assert!(new.proxy_forced);
-        assert!(proxy_forced_nudge(&new).is_none());
-        assert!(proxy_forced_nudge(&r("[proxy]\nforced = false\n")).is_none());
-        assert!(proxy_forced_nudge(&r("[sandbox]\npreset = \"permissive\"\n")).is_none());
+        assert!(proxy_forced_nudge(&new, true).is_none());
+        assert!(proxy_forced_nudge(&r("[proxy]\nforced = false\n"), true).is_none());
+        assert!(proxy_forced_nudge(&r("[sandbox]\npreset = \"permissive\"\n"), true).is_none());
     }
 
     fn policy(rules: Vec<(&str, bool, bool)>) -> LandlockPolicy {

@@ -114,8 +114,8 @@ pub fn default_config_contents() -> String {
 # enabled = true
 # Force all egress through the proxy: makes the proxy mandatory and restricts
 # kernel-level egress to the proxy port only (no direct *:443). Fails closed.
-# If the proxy cannot start, the agent is not launched. DNS and UDP are blocked
-# in the sandbox, so a tool that ignores HTTPS_PROXY cannot resolve names.
+# If the proxy cannot start, the agent is not launched. A tool that ignores
+# HTTPS_PROXY cannot connect; on Linux DNS and UDP are blocked too.
 # On for new configs; without this line the default is false. Turn it off for
 # one run with --no-proxy-forced. See docs/known-impacts.md.
 forced = true

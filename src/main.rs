@@ -4342,9 +4342,13 @@ fn start_proxy_if_enabled(
         // The remaining incompatibility is an explicitly disabled proxy.
         if !resolved.with_proxy {
             bail!(
-                "conflicting options: --proxy-forced requires the proxy, but it was \
+                "conflicting options: proxy.forced ({}) requires the proxy, but it was \
                  explicitly disabled (--no-proxy or proxy.enabled = false). \
-                 Remove one of them."
+                 Remove one of them, or turn forced off with --no-proxy-forced or \
+                 `cplt config set proxy.forced false`.",
+                resolved
+                    .bool_layer("proxy", "forced")
+                    .map_or_else(|| "set".to_string(), |l| l.to_string())
             );
         }
         resolved.with_proxy = true;
@@ -9137,7 +9141,12 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
         }
     };
     findings.extend(std::env::var_os("HOME").and_then(|h| state_split_finding(Path::new(&h))));
-    findings.extend(doctor::proxy_forced_nudge(&resolved));
+    // Linux below Landlock ABI 4 refuses every forced launch: no nudge there.
+    #[cfg(target_os = "linux")]
+    let can_force = sandbox::available_abi_version().is_some_and(|abi| abi >= 4);
+    #[cfg(not(target_os = "linux"))]
+    let can_force = true;
+    findings.extend(doctor::proxy_forced_nudge(&resolved, can_force));
     findings.extend(config_findings(
         &resolved,
         active_agent,
@@ -9652,17 +9661,31 @@ fn init_config() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // Forced proxy is the new default (#822), except where it cannot launch:
+    // Linux below Landlock ABI 4 refuses every forced launch.
+    #[cfg(target_os = "linux")]
+    let can_force = sandbox::available_abi_version().is_some_and(|abi| abi >= 4);
+    #[cfg(not(target_os = "linux"))]
+    let can_force = true;
+    let mut contents = config::default_config_contents();
+    if !can_force {
+        contents = contents.replace("\nforced = true\n", "\n# forced = true\n");
+    }
     // create_new (O_EXCL) closes the race with the check above.
     let written = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&path)
-        .and_then(|mut f| {
-            std::io::Write::write_all(&mut f, config::default_config_contents().as_bytes())
-        });
+        .and_then(|mut f| std::io::Write::write_all(&mut f, contents.as_bytes()));
     match written {
         Ok(()) => {
             ui::ok(&format!("Config file created: {}", path.display()));
+            if can_force {
+                ui::info(
+                    "proxy.forced = true: all traffic goes through the proxy. Turn it off with \
+                     `cplt config set proxy.forced false`.",
+                );
+            }
             ui::info("Edit it to customize sandbox defaults.");
             ExitCode::SUCCESS
         }
