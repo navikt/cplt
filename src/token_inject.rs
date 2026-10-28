@@ -387,11 +387,15 @@ fn mask_child_env(cmd: &mut Command, inherit_env: bool) {
             }
         }
     }
-    // Values that embed a token, such as OpenCode's auth JSON, even one no
-    // other channel registered.
-    for name in EMBEDDING_VARS {
-        if let Some(Some(v)) = env.get(*name) {
-            for candidate in embedded_tokens(v) {
+    // Values that embed a token, such as OpenCode's auth JSON or a
+    // `--pass-env GITHUB_PAT`, even one no other channel registered.
+    for (k, v) in &env {
+        let Some(v) = v else { continue };
+        let named = EMBEDDING_VARS.contains(&k.as_str());
+        // Outside the named vars, only token-length matches: a path segment
+        // such as `gho_build` must not be rewritten. Real tokens are 40+.
+        for candidate in embedded_tokens(v) {
+            if named || candidate.len() >= 40 {
                 remember(candidate);
             }
         }
@@ -942,6 +946,28 @@ pub(crate) mod tests {
             embedded_tokens("xgho_abc gho_def_1 ëgho_g"),
             vec!["gho_def_1", "gho_g"] // and no panic on non-ASCII
         );
+    }
+
+    /// #820 review: a token in a variable cplt does not name (`--pass-env
+    /// GITHUB_PAT`) is masked too; a short `gho_` path segment is not.
+    #[test]
+    fn token_in_any_variable_is_masked() {
+        let real = "github_pat_AnyVar0123456789abcdefghijklmnopqrstuv";
+        #[allow(clippy::disallowed_methods)] // never spawned; only its env is read
+        let mut cmd = Command::new("true");
+        cmd.env_clear();
+        cmd.env("GITHUB_PAT", real);
+        cmd.env("BUILD_DIR", "/tmp/gho_build");
+        mask_child_env(&mut cmd, false);
+        let get = |name: &str| {
+            cmd.get_envs()
+                .find(|(k, _)| *k == name)
+                .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+                .unwrap()
+        };
+        let pat = get("GITHUB_PAT");
+        assert!(pat != real && pat.starts_with("github_pat_") && pat.len() == real.len());
+        assert_eq!(get("BUILD_DIR"), "/tmp/gho_build");
     }
 
     #[test]

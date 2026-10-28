@@ -118,8 +118,11 @@ pub fn default_config_contents() -> String {
 # forced = false
 # Give the agent a placeholder GitHub token; the proxy puts the real one back
 # for api.github.com, github.com, uploads.github.com and *.githubcopilot.com
-# only. Refuses the launch, saying what to fix, if setup fails. (default: false)
-# inject_github_token = false
+# only. Refuses the launch, saying what to fix, if setup fails. On in configs
+# written by `cplt config init`; without the key it is off (#820). Set it to
+# false if a tool inside the sandbox sends the token elsewhere (GitHub
+# Packages, ghcr.io, GitHub Enterprise): those hosts get the placeholder.
+inject_github_token = true
 # port = 0  # 0 = OS-assigned ephemeral port (avoids conflicts, default)
 # blocked_domains = "~/.config/cplt/blocked-domains.txt"
 # allowed_domains = "~/.config/cplt/allowed-domains.txt"
@@ -741,6 +744,8 @@ mod tests {
         let contents = default_config_contents();
         let config: Config = toml::from_str(&contents).unwrap();
         assert!(config.proxy.enabled.is_none());
+        // #820: new configs opt in; the built-in default stays off.
+        assert_eq!(config.proxy.inject_github_token, Some(true));
     }
 
     #[test]

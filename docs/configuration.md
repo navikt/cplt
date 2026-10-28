@@ -1162,15 +1162,22 @@ read the server's credential from the Secret Service. Where Bubblewrap is not
 usable, cplt says so at launch and leaves the entries as configured.
 ## GitHub token injection (`proxy.inject_github_token`)
 
-Off by default. With `proxy.inject_github_token = true`, or
-`--inject-github-token` for one run, the agent gets a placeholder instead of
-your GitHub token, and cplt's proxy puts the real token back on the way out.
-A token read inside the sandbox is then useless anywhere else.
+On for new installs, off for existing ones. `cplt config init` writes
+`inject_github_token = true`; a config file without the key keeps the old
+behaviour, and `cplt doctor` and `cplt check` suggest turning it on while the
+proxy is on. Set the key
+to `true` or `false` to choose and to silence that note. `--inject-github-token`
+and `--no-inject-github-token` override it for one run.
+
+With it on, the agent gets a placeholder instead of your GitHub token, and
+cplt's proxy puts the real token back on the way out. A token read inside the
+sandbox is then useless anywhere else.
 
 - The placeholder has the same prefix and length as the real token
   (`gho_…`, `github_pat_…`). It replaces the token in `GH_TOKEN`,
-  `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN`, `OPENCODE_AUTH_CONTENT` and the gh
-  guard's token files.
+  `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN`, `OPENCODE_AUTH_CONTENT`, any other
+  variable that contains a `gh?_`/`github_pat_` token, and the gh guard's
+  token files. A token without one of those prefixes is passed unmasked.
 - For `api.github.com`, `github.com`, `uploads.github.com` and `*.githubcopilot.com` on port 443, the
   proxy terminates TLS with a CA created in memory for this session. It swaps
   the placeholder for the real token in the `Authorization` header (`Bearer`,
@@ -1183,13 +1190,24 @@ A token read inside the sandbox is then useless anywhere else.
   `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS` or `GIT_SSL_CAINFO`, plus cplt's CA.
   `NODE_EXTRA_CA_CERTS` gets your CA plus cplt's. A corporate CA keeps working.
 
-It needs the proxy and the scratch dir. If any step fails, cplt prints one line
-and the agent gets the real token as before.
+It needs the proxy and the scratch dir. If a step fails (`--no-proxy`, no
+scratch dir, a CA variable in `deny.env` or pointing into a tree the agent can
+write, an unreadable CA file, no system CA bundle), cplt
+refuses the launch and says what to fix. It never falls back to handing over
+the real token. Use `--no-inject-github-token` for one run, or set the key to
+`false`.
+
+What breaks with it on: every host other than the ones above gets the
+placeholder. A tool in the sandbox that sends the same token to GitHub Packages
+(`npm.pkg.github.com`, `maven.pkg.github.com`), `ghcr.io` or a GitHub
+Enterprise host gets `401`. A client that ignores the CA variables fails TLS to
+GitHub; Copilot reports that as "not authenticated". Copilot, `gh` and `git`
+honour them on macOS and Linux, including Copilot's Linux login through
+`gh_guard.inject_token`. Fix: set `proxy.inject_github_token = false`.
 
 Not covered yet: gh's `hosts.yml` stays readable, so a token stored there (Linux
-without a keyring, or insecure storage) is still reachable; GitHub Enterprise
-hosts; and the agent can still use the token through the proxy against the
-GitHub hosts above. The default will flip separately.
+without a keyring, or insecure storage) is still reachable; and the agent can
+still use the token through the proxy against the GitHub hosts above.
 
 ## Agent sandbox brief (`sandbox.brief`, `sandbox.agents_md`) — EXPERIMENTAL
 
