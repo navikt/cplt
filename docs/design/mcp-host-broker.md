@@ -398,8 +398,9 @@ mechanism's status probe; no secret is printed.
   connect to any other host or local port fails with `EPERM`, UDP is
   denied, and with no `egressHosts` there is no TCP at all. Name lookups
   stay open, as for the agent. `mach-lookup` is unscoped (securityd needs
-  it), so a binary could in theory reach the network through an XPC
-  service such as `nsurlsessiond`. This contains the nais workload; it is
+  it) except for `com.apple.nsurlsessiond`, which is denied because it
+  fetches URLs for its caller. A binary could in theory still reach the
+  network through another XPC service that does the same. This contains the nais workload; it is
   not a full jail for an arbitrary hostile binary. On Linux the control is
   still **advisory**: the child gets only `HTTPS_PROXY`. A network
   namespace cannot reach the proxy on the host's loopback, and the agent
