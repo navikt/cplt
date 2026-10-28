@@ -283,8 +283,9 @@ session-only token rather than plaintext storage. See [Linux keyring access](kno
 
 `inject_token` requires `gh_guard.enabled`: the injection is part of installing
 the gh wrapper, which the guard owns. With the guard off it does nothing, and
-cplt says so at launch rather than leaving a key that reads as true and has no
-effect.
+on Linux cplt says so at launch rather than leaving a key that reads as true and
+has no effect. On macOS the key has no effect either way, and cplt prints the
+no-op line below.
 
 On macOS `inject_token` has no effect. `gh` gets its token from the exec token,
 and Copilot signs in through `sandbox.keychain_substitute = true`. cplt still
