@@ -9839,8 +9839,10 @@ fn existing_app_dirs_per_path_filtering() {
         p.contains(&data_str),
         "mise data dir (present in existing_app_dirs) should appear in profile"
     );
+    // Quoted: the dir as an SBPL path, not a prefix of the
+    // `.config/mise/config.toml` home config grant inside it.
     assert!(
-        !p.contains(&config_str),
+        !p.contains(&format!("\"{config_str}\"")),
         "mise config dir (absent from existing_app_dirs) should NOT appear in profile — per-path filtering must work"
     );
 }
