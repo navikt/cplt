@@ -6796,6 +6796,20 @@ fn assemble_sandbox(
              allow, not a rule of its own, so dropping it needs a separate check.",
         );
     }
+    // #653: the lockdown needs the forced proxy, which then resolves names.
+    if resolved.deny_dns && !resolved.proxy_forced {
+        ui::warn(
+            "proxy.deny_dns has no effect without proxy.forced: DNS stays open to the \
+             agent. Turn on proxy.forced (or use --preset strict) to close it.",
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    if resolved.deny_dns && resolved.proxy_forced {
+        ui::warn(
+            "proxy.deny_dns has no effect on Linux: proxy.forced already blocks direct \
+             UDP DNS there. See docs/known-impacts.md for what stays open.",
+        );
+    }
     #[cfg(target_os = "macos")]
     if resolved.allow_rootless_docker && !resolved.allow_docker {
         ui::warn(
@@ -7245,6 +7259,7 @@ fn build_sandbox_config<'a>(
         root_agents_md: probe.root_agents_md.as_deref(),
         allow_gpg_signing: resolved.allow_gpg_signing,
         deny_clipboard: resolved.deny_clipboard,
+        deny_dns: resolved.deny_dns && resolved.proxy_forced,
         deny_nested_git: resolved.deny_nested_git,
         refuse_cache_exec_links: resolved.refuse_cache_exec_links,
         deny_key_files_by_extension: resolved.deny_key_files_by_extension,
@@ -13399,6 +13414,7 @@ mod tests {
             root_agents_md: None,
             allow_gpg_signing: false,
             deny_clipboard: false,
+            deny_dns: false,
             deny_nested_git: false,
             refuse_cache_exec_links: false,
             deny_key_files_by_extension: true,

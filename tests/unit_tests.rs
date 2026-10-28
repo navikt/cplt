@@ -835,6 +835,7 @@ fn landlock_policy_device_files_have_ioctl() {
         root_agents_md: None,
         allow_gpg_signing: false,
         deny_clipboard: false,
+        deny_dns: false,
         deny_nested_git: false,
         refuse_cache_exec_links: false,
         deny_key_files_by_extension: false,
@@ -2799,6 +2800,7 @@ fn base_profile_options() -> SandboxConfig<'static> {
         root_agents_md: None,
         allow_gpg_signing: false,
         deny_clipboard: false,
+        deny_dns: false,
         deny_nested_git: false,
         refuse_cache_exec_links: false,
         deny_key_files_by_extension: false,
@@ -4409,6 +4411,7 @@ fn allow_localhost_any_affects_both_backends() {
         root_agents_md: None,
         allow_gpg_signing: false,
         deny_clipboard: false,
+        deny_dns: false,
         deny_nested_git: false,
         refuse_cache_exec_links: false,
         deny_key_files_by_extension: false,
@@ -4481,6 +4484,7 @@ fn config_options_parity_across_backends() {
         root_agents_md: None,
         allow_gpg_signing: true,
         deny_clipboard: false,
+        deny_dns: false,
         deny_nested_git: false,
         refuse_cache_exec_links: false,
         deny_key_files_by_extension: false,
@@ -10040,6 +10044,7 @@ fn no_pasteboard_rule_when_deny_clipboard_is_off() {
     let p = generate_profile(
         &SandboxConfig {
             deny_clipboard: false,
+            deny_dns: false,
             deny_nested_git: false,
             refuse_cache_exec_links: false,
             deny_key_files_by_extension: false,
@@ -10133,6 +10138,7 @@ fn registry_keys_match_validate_all_valid_keys_fixture() {
 [proxy]
 enabled = false
 forced = false
+deny_dns = false
 inject_github_token = false
 port = 18080
 upstream = "http://corp-proxy.example.com:8080"
@@ -10668,6 +10674,7 @@ fn landlock_relocated_cargo_bin_is_exec_only_and_registry_is_precreated() {
         root_agents_md: None,
         allow_gpg_signing: false,
         deny_clipboard: false,
+        deny_dns: false,
         deny_nested_git: false,
         refuse_cache_exec_links: false,
         deny_key_files_by_extension: false,

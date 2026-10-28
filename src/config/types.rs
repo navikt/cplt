@@ -502,6 +502,9 @@ pub struct ProxyConfig {
     /// restricted to the proxy port only (no direct `*:443`). Fails closed:
     /// if the proxy cannot start, the agent is not launched. See #53.
     pub forced: Option<bool>,
+    /// macOS: close the system resolver to the agent under `forced` (#653),
+    /// so a name can only be looked up by the proxy (default: false).
+    pub deny_dns: Option<bool>,
     /// Put the real GitHub token back in at the proxy and give the sandbox a
     /// placeholder (default: false, #820).
     pub inject_github_token: Option<bool>,
@@ -962,6 +965,8 @@ pub struct Resolved {
     /// Force all egress through the proxy (proxy mandatory, kernel egress
     /// restricted to the proxy port, fail-closed). See #53.
     pub proxy_forced: bool,
+    /// `proxy.deny_dns` (#653), raw. Only takes effect with `proxy_forced`.
+    pub deny_dns: bool,
     /// Proxy-side GitHub token injection (#820).
     pub inject_github_token: bool,
     pub proxy_port: u16,

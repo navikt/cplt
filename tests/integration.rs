@@ -494,6 +494,7 @@ mod macos_tests {
             root_agents_md: None,
             allow_gpg_signing: false,
             deny_clipboard: false,
+            deny_dns: false,
             deny_nested_git: false,
             refuse_cache_exec_links: false,
             deny_key_files_by_extension: false,
@@ -5933,6 +5934,59 @@ except Exception as e:
         );
     }
 
+    /// #653: `proxy.deny_dns` closes both resolver paths in the kernel. libc
+    /// `getaddrinfo` (python) goes through the mDNSResponder socket;
+    /// Network.framework (`nscurl`, NSURLSession) through the
+    /// com.apple.dnssd.service Mach port. NSURLError -1003 is "host not
+    /// found"; without the lockdown nscurl resolves and then fails at connect
+    /// (forced proxy), so it reports a different error.
+    #[test]
+    fn real_profile_deny_dns_blocks_name_resolution() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        let cmd = "/usr/bin/python3 -c 'import socket; socket.getaddrinfo(\"example.org\", 443)' \
+                   >/dev/null 2>&1 && echo LIBC_RESOLVED; \
+                   /usr/bin/perl -e 'alarm 10; exec \"/usr/bin/nscurl\", \"https://example.org\"' 2>&1";
+        let run = |deny_dns: bool| {
+            let mut opts = default_opts(&project, &home);
+            opts.proxy_forced = true;
+            opts.proxy_port = Some(1);
+            opts.deny_dns = deny_dns;
+            let path = std::env::temp_dir()
+                .join(format!("cplt-denydns-{deny_dns}-{}.sb", std::process::id()));
+            fs::write(&path, generate_profile(&opts, &[])).unwrap();
+            let (out, _) = run_sandboxed(&path, cmd);
+            fs::remove_file(&path).ok();
+            out
+        };
+        let open = run(false);
+        // Skip only when the host itself cannot resolve; a sandboxed control
+        // that fails while the host resolves is a broken profile.
+        use std::net::ToSocketAddrs;
+        if ("example.org", 443).to_socket_addrs().is_err() {
+            eprintln!("SKIP: example.org does not resolve on this host (offline?)");
+            return;
+        }
+        assert!(
+            open.contains("LIBC_RESOLVED"),
+            "control: getaddrinfo must work without deny_dns, got:\n{open}"
+        );
+        assert!(
+            !open.contains("Code=-1003"),
+            "control: nscurl must resolve without deny_dns, got:\n{open}"
+        );
+        let closed = run(true);
+        assert!(
+            !closed.contains("LIBC_RESOLVED"),
+            "deny_dns must block getaddrinfo, got:\n{closed}"
+        );
+        assert!(
+            closed.contains("Code=-1003"),
+            "deny_dns must block Network.framework resolution, got:\n{closed}"
+        );
+    }
+
     /// Contrast control that keeps the negative assertion above meaningful: the
     /// DEFAULT profile (proxy_forced = false) DOES allow `*:443`. Without this,
     /// "profile lacks *:443" could pass vacuously if the rule were renamed or
@@ -5975,6 +6029,50 @@ except Exception as e:
         assert!(
             !stdout.contains("\"*:443\""),
             "`--proxy-forced --print-profile` must not allow direct *:443 egress, got:\n{stdout}"
+        );
+    }
+
+    /// #653: `proxy.deny_dns` reaches the profile from config, and only
+    /// together with `proxy.forced`.
+    #[test]
+    fn binary_print_profile_deny_dns_needs_proxy_forced() {
+        let project = fs::canonicalize(".").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        let dnssd =
+            r#"(deny mach-lookup (global-name-regex #"^com\.apple\.(dnssd\.|mDNSResponder)"))"#;
+        let profile = |forced: bool| {
+            fs::write(
+                &cfg,
+                format!("[proxy]\nforced = {forced}\ndeny_dns = true\n"),
+            )
+            .unwrap();
+            let out = cplt_cmd()
+                .env("CPLT_CONFIG", &cfg)
+                .args([
+                    "--print-profile",
+                    "--project-dir",
+                    &project.to_string_lossy(),
+                ])
+                .output()
+                .expect("Failed to run cplt --print-profile");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let on = profile(true);
+        assert!(
+            on.contains(dnssd),
+            "forced + deny_dns must deny dnssd:\n{on}"
+        );
+        assert!(
+            !on.contains("(allow network-outbound (literal \"/private/var/run/mDNSResponder\"))")
+        );
+        let off = profile(false);
+        assert!(
+            !off.contains(dnssd),
+            "deny_dns alone must not change the profile"
+        );
+        assert!(
+            off.contains("(allow network-outbound (literal \"/private/var/run/mDNSResponder\"))")
         );
     }
 

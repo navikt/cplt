@@ -336,7 +336,7 @@ pub fn security_confirmation(key_info: &ConfigKeyInfo, value: &str, unset: bool)
     }
     let weakens_security = matches!(
         (key_info.section, key_info.key, value),
-        ("proxy", "enabled" | "forced" | "default_allowlist", "false")
+        ("proxy", "enabled" | "forced" | "deny_dns" | "default_allowlist", "false")
             | ("sandbox", "validate" | "audit", "false")
             | ("sandbox", "use_bubblewrap", "false")
             | (
