@@ -4788,7 +4788,14 @@ print('CONNECTED')
             assert_eq!(code, 0, "{out}\n{err}");
             assert!(!out.contains("HOOK-RAN"), "hook ran without bwrap:\n{out}");
             assert!(out.contains("ROOT-WRITABLE"), "{out}\n{err}");
-            assert!(err.contains(&home.hook.display().to_string()), "{err}");
+            let hook = home.hook.display().to_string();
+            assert!(
+                err.lines()
+                    .any(|l| l.contains("Claude hook script grant on")
+                        && l.contains("NOT applied without Bubblewrap")
+                        && l.contains(&hook)),
+                "missing cplt warning naming {hook}:\n{err}"
+            );
         }
     }
 }
