@@ -388,8 +388,9 @@ fn configure_command(
             cmd.env(SCRATCH_DIR_ENV, scratch);
         }
         if gh_guard.enabled {
-            // Inject GH_TOKEN into env only when explicitly requested.
-            if gh_guard.inject_token {
+            // Inject GH_TOKEN into env only when explicitly requested. A no-op
+            // on macOS (#877): the exec token and Keychain substitute replace it.
+            if inject_token_applies(gh_guard, cfg!(target_os = "macos")) {
                 inject_gh_token_if_needed(cmd, agent, deny_env, keychain_substitute);
             }
             // Cache token to file so the wrapper can serve `gh auth token`
@@ -504,6 +505,12 @@ fn substitute_carries_gh_token(substitute: Option<&crate::agent::KeychainSubstit
         substitute,
         Some(crate::agent::KeychainSubstitute::GhToken { .. })
     )
+}
+
+/// `gh_guard.inject_token` puts a token in the agent env on Linux only. On
+/// macOS it is an accepted no-op (#877): launch warns, never refuses.
+fn inject_token_applies(gh_guard: &crate::config::GhGuardPolicy, macos: bool) -> bool {
+    gh_guard.inject_token && !macos
 }
 
 fn inject_gh_token_if_needed(
@@ -2481,6 +2488,23 @@ echo gho_stored_fixture"#,
                 assert!(!substitute_carries_gh_token(None));
             },
         );
+    }
+
+    #[test]
+    fn inject_token_is_a_noop_on_macos() {
+        let g = crate::config::GhGuardPolicy {
+            inject_token: true,
+            ..Default::default()
+        };
+        assert!(
+            !inject_token_applies(&g, true),
+            "macOS: no token in the env"
+        );
+        assert!(inject_token_applies(&g, false), "Linux keeps injecting");
+        assert!(!inject_token_applies(
+            &crate::config::GhGuardPolicy::default(),
+            false
+        ));
     }
 
     /// Injecting into a denied name hands the token to a variable that is
