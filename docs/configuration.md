@@ -1071,7 +1071,7 @@ Keys not covered in a section above. `cplt config explain <key>` prints the same
 
 ## Configuration file
 
-The config file lives at `~/.config/cplt/config.toml`. `cplt config init` writes a commented starter template there. It covers `[proxy]`, `[proxy.subscriptions]`, `[allow]`, `[deny]`, `[sandbox]`, `[gh_guard]`, and `[git_guard]`, with every key commented out and documented inline, so a fresh file changes nothing until you uncomment something. Run it and read the result rather than copying a snippet from here, since the template is generated from `src/config/path.rs` and moves with the code:
+The config file lives at `~/.config/cplt/config.toml`. `cplt config init` writes a commented starter template there. It covers `[proxy]`, `[proxy.subscriptions]`, `[allow]`, `[deny]`, `[sandbox]`, `[gh_guard]`, and `[git_guard]`, with every key documented inline. One key is set: `proxy.forced = true`, the default for new installs ([#822](https://github.com/navikt/cplt/issues/822)). Every other key is commented out. The installer (`install.sh`) runs `cplt config init` on a new install. It never touches an existing install: there `proxy.forced` stays off until you set it, and `cplt doctor` suggests it. Run it and read the result rather than copying a snippet from here, since the template is generated from `src/config/path.rs` and moves with the code:
 
 ```bash
 cplt config init

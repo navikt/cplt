@@ -2937,6 +2937,17 @@ fn unlinked_child_repos_messages(project_dir: &Path, named_roots: &[PathBuf]) ->
     )]
 }
 
+/// What a tool that ignores `HTTPS_PROXY` sees under `proxy.forced`, so the
+/// error is not read as a network outage (#822).
+#[cfg(target_os = "linux")]
+const FORCED_PROXY_NOTE: &str = "proxy.forced is on: DNS and UDP are blocked in the sandbox. \
+     A tool that ignores HTTPS_PROXY fails with a DNS error (EAI_AGAIN, \"Could not resolve \
+     host\"), not a network outage. Turn it off for one run with --no-proxy-forced.";
+#[cfg(not(target_os = "linux"))]
+const FORCED_PROXY_NOTE: &str = "proxy.forced is on: only the proxy is reachable, and UDP \
+     (QUIC) is blocked. A tool that ignores HTTPS_PROXY fails with \"Operation not \
+     permitted\" when it connects. Turn it off for one run with --no-proxy-forced.";
+
 fn warn_unlinked_child_repos(home_dir: &Path, project_dir: &Path, named_roots: &[PathBuf]) {
     // A hint, not a risk: shown once per set of unlinked repos (output policy).
     // An empty set is recorded too, so a repo that comes back shows again.
@@ -5105,6 +5116,18 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // write before that. Inspect-only runs skip that check, so no hint there.
     if !resolved.quiet && !cli.print_profile && mcp_status.is_none() {
         warn_unlinked_child_repos(&home_dir, &project_dir, &repo_paths);
+        // Changed tier: once per project when forced proxy turns on (#822).
+        // Off is recorded too, so turning it back on shows the note again.
+        let note = if resolved.proxy_forced {
+            FORCED_PROXY_NOTE
+        } else {
+            ""
+        };
+        if cplt::launch_state::changed(&home_dir, &project_dir, "proxy-forced", note)
+            && !note.is_empty()
+        {
+            ui::info(note);
+        }
     }
     // `cplt mcp status`: the same specs, judged by this launch's final policy.
     if let Some(json) = mcp_status {
@@ -9114,6 +9137,7 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
         }
     };
     findings.extend(std::env::var_os("HOME").and_then(|h| state_split_finding(Path::new(&h))));
+    findings.extend(doctor::proxy_forced_nudge(&resolved));
     findings.extend(config_findings(
         &resolved,
         active_agent,

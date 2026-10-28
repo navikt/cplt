@@ -114,8 +114,11 @@ pub fn default_config_contents() -> String {
 # enabled = true
 # Force all egress through the proxy: makes the proxy mandatory and restricts
 # kernel-level egress to the proxy port only (no direct *:443). Fails closed.
-# If the proxy cannot start, the agent is not launched. (default: false)
-# forced = false
+# If the proxy cannot start, the agent is not launched. DNS and UDP are blocked
+# in the sandbox, so a tool that ignores HTTPS_PROXY cannot resolve names.
+# On for new configs; without this line the default is false. Turn it off for
+# one run with --no-proxy-forced. See docs/known-impacts.md.
+forced = true
 # Give the agent a placeholder GitHub token; the proxy puts the real one back
 # for api.github.com, github.com, uploads.github.com and *.githubcopilot.com
 # only. Refuses the launch, saying what to fix, if setup fails. On in configs
@@ -746,6 +749,9 @@ mod tests {
         assert!(config.proxy.enabled.is_none());
         // #820: new configs opt in; the built-in default stays off.
         assert_eq!(config.proxy.inject_github_token, Some(true));
+        // New configs start with forced proxy on (#822); a missing key stays off.
+        assert_eq!(config.proxy.forced, Some(true));
+        assert_eq!(Config::default().proxy.forced, None);
     }
 
     #[test]

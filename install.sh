@@ -48,11 +48,22 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+EXISTING="$(command -v "$BINARY" 2>/dev/null || true)"
+# A new install starts from the current defaults (proxy.forced on, #822): seed
+# config.toml only when no cplt was on PATH and no cplt state exists yet. An
+# existing user is never changed; `cplt doctor` nudges them instead.
+seed_config() {
+  [[ -z "$EXISTING" && ! -e "$HOME/.config/cplt" && -z "${CPLT_CONFIG:-}" ]] || return 0
+  [[ "${XDG_CONFIG_HOME:-}" == /* && -e "${XDG_CONFIG_HOME}/cplt" ]] && return 0
+  "$1" config init >/dev/null 2>&1 && echo "  ✓ Created ~/.config/cplt/config.toml (proxy.forced on)" || true
+}
+
 # ─── Homebrew install (macOS) ────────────────────────────────────────────────
 
 if [[ "$NO_BREW" == false && -z "$VERSION" && -z "$INSTALL_DIR" ]] && command -v brew &>/dev/null; then
   echo "→ Installing via Homebrew..."
   brew install navikt/tap/cplt
+  seed_config cplt
   echo ""
   INSTALLED_VERSION=$(cplt --version 2>/dev/null || echo "unknown")
   echo "✓ cplt is ready! (${INSTALLED_VERSION})"
@@ -144,7 +155,6 @@ apt_install() {
   return 1
 }
 
-EXISTING="$(command -v "$BINARY" 2>/dev/null || true)"
 DEB_ARCH="$(dpkg --print-architecture 2>/dev/null || true)"
 # sudo must work without asking, or have a terminal to ask on: under curl | bash
 # stdin is the script, not the user.
@@ -155,6 +165,7 @@ if [[ "$NO_APT" == false && -z "$VERSION" && -z "$INSTALL_DIR" && "$(uname -s)" 
   && [[ -z "$EXISTING" || "$EXISTING" == /usr/bin/cplt ]] \
   && echo "→ Adding the Nav apt archive (https://navikt.github.io/apt)..." \
   && apt_install; then
+  seed_config /usr/bin/cplt
   echo ""
   echo "✓ cplt is ready! ($(cplt --version 2>/dev/null || echo unknown))"
   echo ""
@@ -280,6 +291,7 @@ chmod +x "${TMP_DIR}/${BINARY}"
 mv "${TMP_DIR}/${BINARY}" "${INSTALL_DIR}/${BINARY}"
 
 echo "  ✓ Installed to ${INSTALL_DIR}/${BINARY}"
+seed_config "${INSTALL_DIR}/${BINARY}"
 
 # ─── Verify ──────────────────────────────────────────────────────────────────
 

@@ -797,6 +797,22 @@ What stays open:
 
 **Linux:** the key has no effect, and cplt says so at launch. `proxy.forced` already blocks direct UDP DNS there. Lookups through a local Unix-socket resolver (nss-resolve, nscd) below kernel 7.1 are not closed and not tested; a full fix needs the network namespace tracked in [#114](https://github.com/navikt/cplt/issues/114).
 
+## Tools that ignore `HTTPS_PROXY` under `proxy.forced`
+
+`proxy.forced` is on for new installs ([#822](https://github.com/navikt/cplt/issues/822)): the installer writes `forced = true` into a new `config.toml`. An existing install keeps its setting, and `cplt doctor` suggests turning it on. Under `proxy.forced` the proxy is the only way out, so a tool that does not use `HTTP(S)_PROXY` cannot reach the network at all:
+
+| What | Under `proxy.forced` | Fix |
+|---|---|---|
+| Node.js `fetch()` below 24.5 (undici ignores `HTTPS_PROXY`) | ❌ `EAI_AGAIN` on Linux, `connect EPERM` on macOS | Use Node 24.5 or newer, which honours the `NODE_USE_ENV_PROXY=1` cplt sets, or a proxy-aware client |
+| `curl --noproxy '*'`, or anything that resolves names itself (Go/Rust binaries without proxy support) | ❌ `Could not resolve host` (curl exit code 6) on Linux | Drop `--noproxy`, or make the tool read `HTTPS_PROXY` |
+| QUIC / HTTP/3 | ❌ UDP is blocked | Clients fall back to TCP through the proxy |
+| JVM builds (Gradle, Maven) | ❌ see [Localhost blocking](#localhost-blocking) and [Gradle plugin workers](#gradle-plugin-workers-and-java_tool_options) | Pin the ports, or `--no-proxy-forced` |
+| curl, npm, pip and Python `urllib` through the proxy | ✅ Works | |
+
+On Linux, DNS inside the sandbox does not work under `proxy.forced`: a seccomp rule allows only TCP sockets, so `getaddrinfo` cannot open its UDP socket (see [UDP is unrestricted outside proxy-forced](#udp-is-unrestricted-outside-proxy-forced-linux)). Proxy-aware tools are unaffected, because the proxy resolves names. A DNS error inside the sandbox means the tool bypassed the proxy, not that the network is down. cplt says so once per project at launch, and in the agent brief when `sandbox.brief` is on.
+
+**Recovery:** `--no-proxy-forced` for one run, or `cplt config set proxy.forced false` to keep it off.
+
 ## Docker and Testcontainers
 
 Docker is **intentionally blocked**. `~/.docker` is denied, and on macOS the Docker socket is not reachable, since `(deny default)` covers `network-outbound` to unix sockets. Docker gives near-root access to the host system, which defeats the purpose of sandboxing.
