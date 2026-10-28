@@ -3308,6 +3308,35 @@ mod e2e_tests {
     }
 
     #[test]
+    fn e2e_config_init_refuses_dangling_symlink() {
+        let fake_home =
+            std::env::temp_dir().join(format!(".cplt-e2e-config-init-ln-{}", next_id()));
+        let _ = std::fs::remove_dir_all(&fake_home);
+        let config_dir = fake_home.join(".config/cplt");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let target = fake_home.join("target.toml");
+        let link = config_dir.join("config.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let output = cplt_cmd()
+            .args(["config", "init"])
+            .env("HOME", fake_home.to_str().unwrap())
+            .env_remove("CPLT_CONFIG")
+            .env_remove("XDG_CONFIG_HOME")
+            .output()
+            .expect("should run");
+
+        assert!(
+            !output.status.success(),
+            "init must refuse a dangling symlink"
+        );
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(!target.exists(), "init must not write through the symlink");
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
     fn e2e_init_config_flag_still_works() {
         // Verify the legacy --init-config flag still works
         let fake_home =
