@@ -1237,6 +1237,30 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
             },
         });
     }
+    // yarn 1 (#881), checked like an AppDir: a link onto or around a
+    // credential directory is refused, any other link is followed.
+    // The grant covers `config` too, so it is skipped when `config` is one
+    // the file check refuses (a hardlinked key, say).
+    // ponytail: checks `config` only, not every file under `global/`.
+    let yarn_dir = home.join(policy::YARN_CONFIG_DIR);
+    let yarn_rc = yarn_dir.join("config");
+    if std::fs::metadata(&yarn_dir).is_ok_and(|m| m.is_dir())
+        && !refused_link(home, &yarn_dir, "yarn config directory")
+        && (yarn_rc.symlink_metadata().is_err()
+            || policy::first_party_read_target(home, &yarn_rc).is_some())
+    {
+        fs_rules.push(FsRule {
+            nofollow: false,
+            path: yarn_dir,
+            access: FsAccess {
+                read: true,
+                write: false,
+                execute: false,
+                ioctl: false,
+                create_dirs: false,
+            },
+        });
+    }
 
     // ── Agent-specific directories ──
     if config.agent.needs_copilot_dir() {
@@ -5372,6 +5396,39 @@ mod tests {
             "should block at least 26 dangerous syscalls, got {}",
             names.len()
         );
+    }
+
+    #[test]
+    fn yarn_config_dir_is_read_only_and_never_a_credential_link() {
+        crate::with_env_lock_no_xdg(|| {
+            let project = PathBuf::from("/fake/user/project");
+            let home = tempfile::tempdir().unwrap();
+            let home = home.path();
+            let yarn = home.join(policy::YARN_CONFIG_DIR);
+            let rule_for = |home: &Path| {
+                generate_policy(&test_config(&project, home))
+                    .fs_rules
+                    .into_iter()
+                    .find(|r| r.path == yarn)
+            };
+            assert!(rule_for(home).is_none(), "absent dir: no rule");
+
+            std::fs::create_dir_all(home.join(".ssh")).unwrap();
+            std::fs::create_dir_all(home.join(".config")).unwrap();
+            std::os::unix::fs::symlink(home.join(".ssh"), &yarn).unwrap();
+            assert!(rule_for(home).is_none(), "a link onto ~/.ssh is refused");
+
+            std::fs::remove_file(&yarn).unwrap();
+            std::fs::create_dir(&yarn).unwrap();
+            let rule = rule_for(home).expect("real dir is granted");
+            assert!(rule.access.read);
+            assert!(!rule.access.write && !rule.access.execute);
+
+            let key = home.join(".ssh/id_ed25519");
+            std::fs::write(&key, "key").unwrap();
+            std::fs::hard_link(&key, yarn.join("config")).unwrap();
+            assert!(rule_for(home).is_none(), "a hardlinked key as `config`");
+        });
     }
 
     #[test]

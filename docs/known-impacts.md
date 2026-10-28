@@ -1336,7 +1336,7 @@ One consequence is worth knowing: on Linux, where `.git/config` is writable, an 
 - as the user config. cplt sets `NPM_CONFIG_USERCONFIG` to a path inside the session scratch dir that deliberately does not exist, so that read fails with `ENOENT`, which yarn 1 tolerates, instead of the denial errno, which it does not ([#180](https://github.com/navikt/cplt/issues/180));
 - on its walk up from the project directory, which checks `.npmrc` in every parent directory up to `/`. A project anywhere under `$HOME` passes `~/.npmrc` on the way, and no variable turns that walk off. The macOS profile also hides the file's metadata, so yarn's existence check sees no file and skips it.
 
-Nothing is granted: `~/.npmrc` stays unreadable either way. `~/.yarnrc` is a separate loader and still needs `allow.read`; see below.
+Nothing is granted: `~/.npmrc` stays unreadable either way. `~/.yarnrc` is a separate loader, which cplt grants read-only; see below.
 
 **On Linux the walk is not covered.** Landlock does not restrict `stat` or `access`, so yarn 1 sees `~/.npmrc` as present on the walk and aborts on the `EACCES` when the project is under `$HOME`. Use one of the fixes below. The redirect still covers the user-config read.
 
@@ -1368,7 +1368,7 @@ If you do need the registry auth in `~/.npmrc`, allow it instead:
 cplt config set allow.read "~/.npmrc"
 ```
 
-Or for a single run: `cplt --allow-read ~/.npmrc`. Deleting an `~/.npmrc` you do not use works just as well. Neither fix covers a `~/.yarnrc`. See below.
+Or for a single run: `cplt --allow-read ~/.npmrc`. Deleting an `~/.npmrc` you do not use works just as well. `~/.yarnrc` is granted separately. See below.
 
 **Why only yarn 1.** `~/.npmrc` is denied by default because it commonly holds a registry token. Every package manager reads it; only yarn 1 treats an *unreadable* one as fatal. Both of its config loaders, `NpmRegistry.getPossibleConfigLocations` (which is what reaches `~/.npmrc`) and `parseRcPaths` (which reads the `.yarnrc` family), tolerate a *missing* file and rethrow everything else:
 
@@ -1384,15 +1384,15 @@ Or for a single run: `cplt --allow-read ~/.npmrc`. Deleting an `~/.npmrc` you do
 
 npm, pnpm and bun all carry on past a denied `~/.npmrc` and install normally from the public registry ([navikt/cplt#180](https://github.com/navikt/cplt/issues/180) measured npm 10.9.8, pnpm 11.22.0 and bun 1.4.0). The trigger is therefore the file's *existence*, not its contents. An `~/.npmrc` holding nothing but `save-exact=true` breaks yarn 1 exactly as a token-bearing one does.
 
-**It is not only `~/.npmrc`, and the automatic fix does not cover the rest.** `parseRcPaths` fails the same way on `~/.yarnrc` when it exists. `NPM_CONFIG_USERCONFIG` does not reach that loader, so the redirect above leaves this crash in place, as does allowing `~/.npmrc`:
+**It is not only `~/.npmrc`.** `parseRcPaths` fails the same way on `~/.yarnrc` when it exists, and on `~/.yarnrc.yml`, `~/.config/yarn/config` and the `~/.config/yarn` directory itself. `NPM_CONFIG_USERCONFIG` does not reach that loader. Before [#881](https://github.com/navikt/cplt/issues/881) this was the result:
 
 ```
 error Error: EPERM: operation not permitted, open '/Users/you/.yarnrc'
 ```
 
-`~/.yarnrc` is not in any deny list. Like most home dotfiles it is simply never granted, since the sandbox enumerates the specific `$HOME` config files tools need rather than granting `$HOME` wholesale. Allow it the same way (`cplt config set allow.read "~/.yarnrc"`) if you keep one.
+cplt now grants those files read-only, and the `~/.config/yarn` directory entry (on Linux, the directory with its contents). They can hold a registry token, which the agent can then read. To keep one out, move the token to `~/.npmrc`, which stays denied, or add the file to `deny`.
 
-**Why `NPM_CONFIG_USERCONFIG` works.** It is on cplt's environment allowlist because it names a path rather than carrying a secret, and yarn 1's npmrc loader honours it: `mergeEnv('npm_config_')` lowercases the variable into `config.userconfig`, which replaces the `~/.npmrc` entry in `getPossibleConfigLocations`. That list is gated on an existence check before the read, so a path that does not exist is skipped rather than read. Because that lowercasing collapses every spelling into one entry, and an *empty* value is falsy enough to fall back to `~/.npmrc`, cplt also removes any other-cased `npm_config_userconfig` from the child environment when it injects — otherwise a stray empty one could win the merge and undo the redirect. This is why cplt injects the variable rather than granting the file. `allow.read` fixes the crash by handing the credential over, the redirect fixes it by removing the need. npm and pnpm honour the same variable and could not read `~/.npmrc` in the sandbox anyway, so nothing changes for them. It redirects only the npmrc loader, so a `~/.yarnrc` still needs the treatment above.
+**Why `NPM_CONFIG_USERCONFIG` works.** It is on cplt's environment allowlist because it names a path rather than carrying a secret, and yarn 1's npmrc loader honours it: `mergeEnv('npm_config_')` lowercases the variable into `config.userconfig`, which replaces the `~/.npmrc` entry in `getPossibleConfigLocations`. That list is gated on an existence check before the read, so a path that does not exist is skipped rather than read. Because that lowercasing collapses every spelling into one entry, and an *empty* value is falsy enough to fall back to `~/.npmrc`, cplt also removes any other-cased `npm_config_userconfig` from the child environment when it injects — otherwise a stray empty one could win the merge and undo the redirect. This is why cplt injects the variable rather than granting the file. `allow.read` fixes the crash by handing the credential over, the redirect fixes it by removing the need. npm and pnpm honour the same variable and could not read `~/.npmrc` in the sandbox anyway, so nothing changes for them. It redirects only the npmrc loader; `~/.yarnrc` is covered by the grant above.
 
 The XDG variables, by contrast, do not help. yarn 1's `.yarnrc` scan builds its own path list with hardcoded `~/.yarnrc` entries and runs before the XDG-aware `getConfigDir()` is consulted, so neither `XDG_CONFIG_HOME` nor `XDG_DATA_HOME` removes those paths from the list. yarn 2+ (berry) uses a different config loader and is unaffected.
 

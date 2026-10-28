@@ -1480,11 +1480,14 @@ fn plan_missing_home_config_targets(config: &SandboxConfig) -> Vec<Result<Missin
             if missing == leaf {
                 return Some(Ok((None, leaf)));
             }
-            let git_under_linked_config = rel.starts_with(".config/git/")
-                && home.join(".config").is_symlink()
-                && leaf.parent() == Some(missing)
-                && missing.file_name() == Some(std::ffi::OsStr::new("git"));
-            if !git_under_linked_config {
+            // A tool's dir under a linked `~/.config` (#881): the one directory
+            // cplt creates, so the agent cannot plant a config there.
+            let tool_under_linked_config = ["git", "mise", "yarn"].iter().any(|tool| {
+                Path::new(rel).starts_with(Path::new(".config").join(tool))
+                    && missing.file_name() == Some(std::ffi::OsStr::new(tool))
+            }) && home.join(".config").is_symlink()
+                && leaf.parent() == Some(missing);
+            if !tool_under_linked_config {
                 return refuse(format!("{} does not exist", missing.display()));
             }
             Some(Ok((Some(missing.to_path_buf()), leaf)))
@@ -3176,8 +3179,8 @@ fn create_missing_home_config(config: &SandboxConfig, inspect_only: bool) -> Vec
         match result {
             Ok(paths) => made.extend(paths),
             Err(what) => ui::warn(&format!(
-                "Could not create {what}. Git on the host reads it through your home Git \
-                 config symlink once it exists, and it sits in a writable tree, so the \
+                "Could not create {what}. Git or yarn on the host reads it through your \
+                 home config symlink once it exists, and it sits in a writable tree, so the \
                  agent can create it in this run."
             )),
         }
@@ -3185,9 +3188,9 @@ fn create_missing_home_config(config: &SandboxConfig, inspect_only: bool) -> Vec
     if !inspect_only && !made.is_empty() {
         let list: Vec<String> = made.iter().map(|p| p.display().to_string()).collect();
         ui::info(&format!(
-            "Created empty {} so Bubblewrap can bind it read-only: git on the host \
-             reads it through your home Git config symlink, and it sits in a writable \
-             tree. Git reads an empty one the same as a missing one, but `git config \
+            "Created empty {} so Bubblewrap can bind it read-only: git or yarn on the \
+             host reads it through your home config symlink, and it sits in a writable \
+             tree. Both read an empty one the same as a missing one, but `git config \
              --global` writes to ~/.config/git/config once it exists and ~/.gitconfig \
              does not.",
             list.join(", ")
@@ -5560,8 +5563,10 @@ mod tests {
         let mut config = test_config(&home, &[]);
         config.project_dir = &project;
 
-        let (created, _) = create_missing(&config);
+        let (created, refused) = create_missing(&config);
         let git = dot_config.join("git");
+        let yarn = dot_config.join("yarn");
+        let mise = dot_config.join("mise");
         assert_eq!(
             created,
             vec![
@@ -5569,9 +5574,15 @@ mod tests {
                 git.join("attributes"),
                 git.join("config"),
                 git.join("ignore"),
+                mise.clone(),
+                mise.join("config.toml"),
+                yarn.clone(),
+                yarn.join("config"),
             ]
         );
+        assert!(refused.is_empty(), "{refused:?}");
         assert!(git.symlink_metadata().unwrap().is_dir());
+        assert!(yarn.symlink_metadata().unwrap().is_dir());
     }
 
     /// A dangling `~/.gitconfig` whose directory is missing gets no directory:
