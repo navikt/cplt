@@ -613,13 +613,19 @@ fn linux_child_command(shared: &Shared, server: &Server) -> std::io::Result<(Com
     ]);
     let current_system = std::fs::read_link("/run/current-system").ok();
     let mut cmd = Command::new(bwrap);
-    cmd.args(child_bwrap_args(
-        &write_dirs,
-        runtime.as_deref(),
-        current_system.as_deref(),
+    let nix_sockets: Vec<PathBuf> = NIX_SOCKET_DIRS
+        .iter()
+        .map(PathBuf::from)
+        .filter(|d| d.is_dir())
+        .collect();
+    cmd.args(child_bwrap_args(&ChildMounts {
+        write_dirs: &write_dirs,
+        runtime_dir: runtime.as_deref(),
+        current_system: current_system.as_deref(),
+        nix_sockets: &nix_sockets,
         bus,
-        server.egress_socket.as_deref(),
-    ));
+        egress_socket: server.egress_socket.as_deref(),
+    }));
     if let Some(sync) = &setup.sync {
         use std::os::fd::AsRawFd;
         use std::os::unix::process::CommandExt;
@@ -723,13 +729,33 @@ fn start_bus_proxy(real: &Path, socket: &Path) -> std::io::Result<std::io::PipeR
 /// host's sockets there, the system bus and docker's among them) and, if
 /// it lives elsewhere, a private runtime dir; then writable `write_dirs`,
 /// the session bus socket alone, and the egress socket.
-fn child_bwrap_args(
-    write_dirs: &[PathBuf],
-    runtime_dir: Option<&Path>,
-    current_system: Option<&Path>,
-    bus: Option<&Path>,
-    egress_socket: Option<&Path>,
-) -> Vec<std::ffi::OsString> {
+/// What [`child_bwrap_args`] mounts, found on the host by
+/// [`linux_child_command`].
+#[derive(Default)]
+struct ChildMounts<'a> {
+    write_dirs: &'a [PathBuf],
+    runtime_dir: Option<&'a Path>,
+    current_system: Option<&'a Path>,
+    /// The Nix daemon's socket dirs that exist on this host.
+    nix_sockets: &'a [PathBuf],
+    bus: Option<&'a Path>,
+    egress_socket: Option<&'a Path>,
+}
+
+/// The Nix daemon's socket dirs. Reaching the daemon builds as a trusted
+/// user (root on the host) or fetches through fixed-output derivations,
+/// past the egress proxy.
+const NIX_SOCKET_DIRS: &[&str] = &["/nix/var/nix/daemon-socket", "/nix/var/nix/gc-socket"];
+
+fn child_bwrap_args(m: &ChildMounts) -> Vec<std::ffi::OsString> {
+    let ChildMounts {
+        write_dirs,
+        runtime_dir,
+        current_system,
+        nix_sockets,
+        bus,
+        egress_socket,
+    } = *m;
     let mut a: Vec<std::ffi::OsString> = [
         "--unshare-user",
         "--unshare-pid",
@@ -765,6 +791,9 @@ fn child_bwrap_args(
     }
     if let Some(rt) = runtime_dir.filter(|d| !d.starts_with("/run") && !d.starts_with("/tmp")) {
         a.extend(["--tmpfs".into(), rt.into()]);
+    }
+    for d in nix_sockets {
+        a.extend(["--tmpfs".into(), d.into()]);
     }
     let mut bind = |flag: &str, src: &Path, dst: &Path| {
         a.extend([flag.into(), src.into(), dst.into()]);
@@ -1083,13 +1112,13 @@ mod tests {
     /// no tmpfs hides them.
     #[test]
     fn child_bwrap_args_isolate_the_network_and_bind_only_the_grants() {
-        let args = strings(child_bwrap_args(
-            &[PathBuf::from("/home/u/.config/nais")],
-            Some(Path::new("/run/user/1000")),
-            None,
-            Some(Path::new("/tmp/cplt-mcp-x/b0")),
-            Some(Path::new("/tmp/cplt-mcp-x/e0")),
-        ));
+        let args = strings(child_bwrap_args(&ChildMounts {
+            write_dirs: &[PathBuf::from("/home/u/.config/nais")],
+            runtime_dir: Some(Path::new("/run/user/1000")),
+            bus: Some(Path::new("/tmp/cplt-mcp-x/b0")),
+            egress_socket: Some(Path::new("/tmp/cplt-mcp-x/e0")),
+            ..ChildMounts::default()
+        }));
         let s = args.join(" ");
         for ns in ["user", "pid", "ipc", "uts", "cgroup", "net"] {
             assert!(args.contains(&format!("--unshare-{ns}")), "{s}");
@@ -1109,13 +1138,10 @@ mod tests {
 
         // No egress, no bus: neither socket is bound. A runtime dir outside
         // /run gets its own tmpfs.
-        let bare = strings(child_bwrap_args(
-            &[],
-            Some(Path::new("/var/rt")),
-            None,
-            None,
-            None,
-        ));
+        let bare = strings(child_bwrap_args(&ChildMounts {
+            runtime_dir: Some(Path::new("/var/rt")),
+            ..ChildMounts::default()
+        }));
         assert!(bare.contains(&"--unshare-net".into()));
         assert!(
             bare.ends_with(&["--tmpfs".into(), "/var/rt".into()]),
@@ -1128,12 +1154,31 @@ mod tests {
         );
     }
 
+    /// NixOS: the daemon's socket dirs get a tmpfs each, so the child
+    /// cannot ask the daemon to build (as root) or fetch (past the proxy).
+    #[test]
+    fn child_bwrap_args_hide_the_nix_daemon() {
+        let dirs: Vec<PathBuf> = NIX_SOCKET_DIRS.iter().map(PathBuf::from).collect();
+        let s = strings(child_bwrap_args(&ChildMounts {
+            nix_sockets: &dirs,
+            ..ChildMounts::default()
+        }))
+        .join(" ");
+        assert!(
+            s.contains("--tmpfs /nix/var/nix/daemon-socket --tmpfs /nix/var/nix/gc-socket"),
+            "{s}"
+        );
+    }
+
     /// NixOS: a program under /run/current-system/sw/bin (a trusted dir)
     /// still resolves after the private /run, through the restored link.
     #[test]
     fn child_bwrap_args_keep_nixos_current_system() {
         let store = Path::new("/nix/store/abc-nixos-system");
-        let args = strings(child_bwrap_args(&[], None, Some(store), None, None));
+        let args = strings(child_bwrap_args(&ChildMounts {
+            current_system: Some(store),
+            ..ChildMounts::default()
+        }));
         let s = args.join(" ");
         assert!(
             s.contains("--tmpfs /run --symlink /nix/store/abc-nixos-system /run/current-system"),
