@@ -941,6 +941,7 @@ mod tests {
             inject_github_token: false,
             github_mcp_proxy: true,
             mcp_broker: true,
+            strip_otlp_vendor_auth: false,
             proxy_port: 0,
             blocked_domains: None,
             allowed_domains: None,

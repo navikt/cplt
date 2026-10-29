@@ -10170,6 +10170,7 @@ validate = true
 brief = false
 github_mcp_proxy = true
 mcp_broker = true
+strip_otlp_vendor_auth = true
 agents_md = false
 allow_env_files = false
 allow_localhost_any = false

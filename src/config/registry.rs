@@ -271,6 +271,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "sandbox",
+        key: "strip_otlp_vendor_auth",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "false",
+        description: "Also strip x-honeycomb-team, api-key, x-api-key and dd-api-key from OTEL_EXPORTER_OTLP_*HEADERS, like Authorization. --pass-env keeps the raw value. Written as true by `cplt config init`.",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
         key: "brief",
         value_type: ConfigValueType::Bool,
         dangerous: false,
@@ -1032,6 +1040,13 @@ bool_keys! {
         config = |c: &Config| c.sandbox.mcp_broker,
         baseline = |_: PresetBaseline| true,
         resolved = |r: &Resolved| r.mcp_broker;
+
+    /// Config-only (#878). Seeded true by `cplt config init`.
+    strip_otlp_vendor_auth, "sandbox", "strip_otlp_vendor_auth",
+        cli = |_: &CliFlags| FeatureToggle::UseDefault,
+        config = |c: &Config| c.sandbox.strip_otlp_vendor_auth,
+        baseline = |_: PresetBaseline| false,
+        resolved = |r: &Resolved| r.strip_otlp_vendor_auth;
 
     brief, "sandbox", "brief",
         cli = |c: &CliFlags| c.brief,
