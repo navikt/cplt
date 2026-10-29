@@ -429,6 +429,9 @@ fn configure_command(
     } else if let Some(shadow) = pnpm_shadow_dir {
         prepend_path(cmd, &[shadow]);
     }
+    if pnpm_shadow_dir.is_some() {
+        append_pnpm_home_dirs(cmd, &crate::scratch::pnpm_home_roots(home_dir));
+    }
 }
 
 /// Inject GH_TOKEN into the command env if not already present.
@@ -1085,6 +1088,44 @@ fn prepend_path(cmd: &mut Command, prefixes: &[&Path]) {
     if let Ok(path) = std::env::join_paths(paths) {
         cmd.env("PATH", path);
     }
+}
+
+/// Put each pnpm home's launcher dir on PATH, after the shadow (#882).
+///
+/// pnpm's `pnpm setup` rc block prepends `$PNPM_HOME/bin` when it is not on
+/// PATH yet. That puts the `/bin/sh` launcher ahead of the shadow, and the
+/// launcher execs the store binary, which the sandbox denies. Already being on
+/// PATH, behind the shadow, keeps the rc block from doing that.
+fn append_pnpm_home_dirs(cmd: &mut Command, roots: &[PathBuf]) {
+    let Some(path) = cmd
+        .get_envs()
+        .find(|(k, _)| *k == "PATH")
+        .and_then(|(_, v)| v.map(std::ffi::OsStr::to_os_string))
+    else {
+        return;
+    };
+    let paths = with_pnpm_home_dirs(std::env::split_paths(&path).collect(), roots);
+    if let Ok(path) = std::env::join_paths(paths) {
+        cmd.env("PATH", path);
+    }
+}
+
+/// `paths` plus every existing `<root>/bin`, and `<root>` itself when it holds
+/// a `pnpm` (the pnpm 10 layout), each appended only when absent.
+fn with_pnpm_home_dirs(mut paths: Vec<PathBuf>, roots: &[PathBuf]) -> Vec<PathBuf> {
+    for root in roots {
+        let bin = root.join("bin");
+        let candidates = [
+            bin.is_dir().then_some(bin),
+            (root.is_dir() && root.join("pnpm").symlink_metadata().is_ok()).then(|| root.clone()),
+        ];
+        for dir in candidates.into_iter().flatten() {
+            if !paths.contains(&dir) {
+                paths.push(dir);
+            }
+        }
+    }
+    paths
 }
 
 /// Find an executable in PATH by name.
@@ -2338,6 +2379,32 @@ mod child_pid_tests {
             !helper.join().unwrap(),
             "helper must NOT proceed to execve when confirm arrives after parent timeout"
         );
+    }
+}
+
+#[cfg(test)]
+mod pnpm_path_tests {
+    use super::*;
+
+    #[test]
+    fn pnpm_home_dirs_follow_the_shadow_only_when_absent_and_present() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("Library/pnpm");
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let shadow = PathBuf::from("/shadow");
+        let parent = PathBuf::from("/usr/bin");
+        let roots = vec![root.clone(), home.path().join("missing")];
+
+        let absent = with_pnpm_home_dirs(vec![shadow.clone(), parent.clone()], &roots);
+        assert_eq!(absent, vec![shadow.clone(), parent.clone(), bin.clone()]);
+
+        let present = vec![shadow.clone(), bin.clone(), parent.clone()];
+        assert_eq!(with_pnpm_home_dirs(present.clone(), &roots), present);
+
+        std::fs::remove_dir(&bin).unwrap();
+        let missing = with_pnpm_home_dirs(vec![shadow.clone(), parent.clone()], &roots);
+        assert_eq!(missing, vec![shadow, parent]);
     }
 }
 

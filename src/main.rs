@@ -9186,6 +9186,26 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     ));
     doctor_exec.sort();
     doctor_exec.dedup();
+    // pnpm's rc block prepends `$PNPM_HOME/bin` when it is missing from PATH,
+    // and its launcher then runs the store binary instead of the shadow.
+    let launch_path: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    for root in scratch::pnpm_home_roots(&home_dir) {
+        let bin = root.join("bin");
+        if scratch::pnpm_cmd_shim_target(&home_dir, &bin.join("pnpm")).is_some()
+            && !launch_path.contains(&bin)
+        {
+            findings.push(Finding::warning(
+                format!(
+                    "{} is not on PATH, so pnpm's shell setup puts its launcher ahead of cplt's pnpm copy, and pnpm fails in the sandbox.",
+                    doctor_tilde(&bin.display().to_string(), &home_dir)
+                ),
+                Some("put $PNPM_HOME/bin on the PATH you launch cplt from".to_string()),
+            ));
+            break;
+        }
+    }
     let resolved_binary = active_agent.resolve_binary_with_editor_provenance();
     let editor_launcher = resolved_binary.as_ref().is_ok_and(|(_, editor)| *editor);
     let agent_bin_result = resolved_binary.map(|(path, _)| path);
