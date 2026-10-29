@@ -464,7 +464,9 @@ still runs on the host.
   `cplt doctor` warns, as it adds kernel surface, not host privilege. On NixOS `/run/current-system` is restored as a
   symlink to its store path, so `/run/current-system/sw/bin` still
   resolves. Unix sockets elsewhere under the read-only root (under
-  `/var`, say) stay connectable.
+  `/var`, say) stay connectable, and copies of `HOME` elsewhere in the
+  root (btrfs snapshots, a second bind mount) stay readable: hiding
+  `HOME`, and the XDG config and data dirs outside it, is a denylist.
 - **Session bus (Linux):** never the host bus itself. The unfiltered user
   bus reaches `systemd --user` (`StartTransientUnit`) and D-Bus
   activation, which is host exec. For a `keychain` mechanism the broker
