@@ -2,6 +2,7 @@
 //! Hand-kept; tool policy is never here. A new server on an existing
 //! mechanism needs no change; a new mechanism is one row.
 
+#[cfg(test)]
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -109,18 +110,16 @@ pub fn credential_ok(spec: &Spec) -> (Option<bool>, Option<&'static str>) {
     let Some(args) = spec.credential.probe else {
         return (None, None);
     };
-    if cfg!(target_os = "linux") {
-        return sandboxed_probe(spec, args, PROBE_TIMEOUT);
-    }
-    probe(&spec.program, args, spec.credential.keychain, PROBE_TIMEOUT)
+    sandboxed_probe(spec, args, PROBE_TIMEOUT)
 }
 
-/// Linux: the probe in the server's own sandbox (#849). The server can write
+/// The probe in the server's own sandbox (#849, #930). The server can write
 /// its config dir, and nais reads `config.yaml` there on every run: its
 /// values set any flag, so a planted `nais: false` would turn the probe into
 /// a gcloud call. Run on the host, the probe would act on what the
-/// sandboxed server wrote. Here it gets the same bwrap namespace, filtered
-/// bus and egress proxy, through a broker serving this one spec.
+/// sandboxed server wrote. Here it gets the same sandbox and egress proxy
+/// (Linux: bwrap namespace and filtered bus; macOS: `mcp_child_profile`),
+/// through a broker serving this one spec.
 fn sandboxed_probe(
     spec: &Spec,
     args: &[&str],
@@ -143,6 +142,9 @@ fn sandboxed_probe(
     wait(child, timeout)
 }
 
+/// The probe run directly, for tests only: the control the sandboxed
+/// probe is measured against.
+#[cfg(test)]
 fn probe(
     program: &std::path::Path,
     args: &[&str],
@@ -251,12 +253,81 @@ mod tests {
         assert!(!home.path().join("x").exists());
     }
 
+    /// #930: on macOS the probe runs under the child's Seatbelt profile. A
+    /// `nais: false` planted in the config dir the server can write turns
+    /// the stand-in nais into its "gcloud" path, which writes outside that
+    /// dir. The kernel refuses the write; run directly (the control) it lands.
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::disallowed_methods)] // fixed /usr/bin path
+    fn a_planted_config_cannot_make_the_macos_probe_escape() {
+        let usable = std::process::Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !usable {
+            assert!(
+                std::env::var("CPLT_TEST_REQUIRE_SANDBOX").as_deref() != Ok("1"),
+                "sandbox required by CPLT_TEST_REQUIRE_SANDBOX but unavailable"
+            );
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        // Not under the temp dir, which the profile lets the child write.
+        let home = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let home_path = home.path().canonicalize().unwrap();
+        let config = home_path.join("Library/Application Support/nais");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("config.yaml"), "nais: false\n").unwrap();
+        let (seen, escaped) = (config.join("seen"), home_path.join("escaped"));
+        // The stand-in nais ignores argv: `nais: false` in config.yaml means
+        // "run gcloud", which writes outside the config dir. `seen`, inside
+        // it, shows the script got as far as that write.
+        let nais = home_path.join("nais");
+        let staging = home_path.join("nais.staging");
+        std::fs::write(
+            &staging,
+            "#!/bin/sh\nd=\"$HOME/Library/Application Support/nais\"\n\
+             grep -q 'nais: false' \"$d/config.yaml\" || exit 2\n\
+             : > \"$d/seen\"\n: > \"$HOME/escaped\"\n",
+        )
+        .unwrap();
+        // `cp`, not a direct write: see the ETXTBSY note in agent.rs.
+        let copied = Command::new("/bin/cp").arg(&staging).arg(&nais).status();
+        assert!(copied.unwrap().success());
+        std::fs::set_permissions(&nais, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut spec = super::super::test_util::check(super::super::test_util::base()).unwrap();
+        spec.program = nais.clone();
+        let got = crate::with_env_lock_no_xdg(|| {
+            temp_env::with_var("HOME", Some(&home_path), || credential_ok(&spec))
+        });
+        assert!(seen.exists(), "the probe never reached the planted path");
+        assert_eq!(got, (Some(false), None), "the planted path was not refused");
+        assert!(
+            !escaped.exists(),
+            "the probe wrote outside the server's dirs"
+        );
+        // Control: the same probe on the host follows the planted value.
+        let args = spec.credential.probe.unwrap();
+        let host = crate::with_env_lock_no_xdg(|| {
+            temp_env::with_var("HOME", Some(&home_path), || {
+                probe(&nais, args, false, Duration::from_secs(30))
+            })
+        });
+        assert_eq!(
+            host,
+            (Some(true), None),
+            "control: the fake did not take the planted path"
+        );
+        assert!(escaped.exists());
+    }
+
     #[test]
     fn no_home_no_probe() {
         // Without HOME the probe would run with cplt's whole env and cwd.
-        let sh = std::path::Path::new("/bin/sh");
+        let spec = super::super::test_util::check(super::super::test_util::base()).unwrap();
         let r = temp_env::with_var_unset("HOME", || {
-            probe(sh, &["-c", "exit 0"], false, Duration::from_secs(30))
+            sandboxed_probe(&spec, &["-c", "exit 0"], Duration::from_secs(30))
         });
         assert_eq!(r, (None, Some("HOME is not set")));
     }

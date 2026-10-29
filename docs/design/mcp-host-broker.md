@@ -369,13 +369,14 @@ Kept until a third server makes the shared model worth it (D15).
  "rejected": [{"file": "…/mcp/x.json", "reason": "…", "fix": "…"}]}
 ```
 
-Runs launch detection without starting a child. `credential_ok` uses the
-mechanism's status probe; no secret is printed. On Linux the probe runs in
-the server's own sandbox (bwrap, filtered bus, egress proxy), through a
-broker serving that one spec: the server can write `~/.config/nais`, and
-nais reads `config.yaml` there on every run, whose values set any flag
-(a planted `nais: false` turns the probe into a gcloud call). On macOS it
-still runs on the host.
+Runs launch detection without starting the server. `credential_ok` uses the
+mechanism's status probe; no secret is printed. The probe runs in the
+server's own sandbox, through a broker serving that one spec: on Linux
+bwrap, filtered bus and egress proxy; on macOS `mcp_child_profile` and
+egress proxy (#930). The server can write its config dir
+(`~/.config/nais`, `~/Library/Application Support/nais`), and nais reads
+`config.yaml` there on every run, whose values set any flag (a planted
+`nais: false` turns the probe into a gcloud call).
 
 ### 5.6 Lifecycle
 
