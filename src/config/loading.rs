@@ -523,6 +523,7 @@ impl Config {
         let _ = bools.keychain_substitute; // resolved per agent at launch
         let keychain_substitute = self.sandbox.keychain_substitute;
         let allow_git_worktrees = bools.allow_git_worktrees;
+        let allow_git_config_write = bools.allow_git_config_write;
         let worktree_walk_max_dirs = self
             .sandbox
             .worktree_walk_max_dirs
@@ -707,6 +708,7 @@ impl Config {
             keychain_substitute,
             allow_build_credentials,
             allow_git_worktrees,
+            allow_git_config_write,
             worktree_walk_max_dirs,
             scratch_dir,
             use_bubblewrap,
@@ -4530,6 +4532,14 @@ mod precedence {
                 cli_off: None,
                 get: |r| r.allow_git_worktrees,
                 default: false,
+                preset: None,
+            },
+            Ladder {
+                key: "sandbox.allow_git_config_write",
+                cli_on: None,
+                cli_off: None,
+                get: |r| r.allow_git_config_write,
+                default: true,
                 preset: None,
             },
             Ladder {

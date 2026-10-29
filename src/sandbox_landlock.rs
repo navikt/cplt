@@ -3175,6 +3175,7 @@ mod tests {
             allow_cache_exec_any: false,
             allow_browser: false,
             use_bubblewrap: None,
+            allow_git_config_write: true,
             keychain_substitute: None,
         }
     }

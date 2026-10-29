@@ -567,6 +567,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "sandbox",
+        key: "allow_git_config_write",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "true",
+        description: "Linux: let the agent write .git/config, so in-session `git config` and `git remote` work. A written .git/config can set core.hooksPath or core.fsmonitor, which run unsandboxed on your next git command. New configs set it to false: .git/config is then bound read-only, and the launch refuses without bubblewrap. Unset keeps it writable. macOS always denies the write. User config only.",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
         key: "worktree_walk_max_dirs",
         value_type: ConfigValueType::U64,
         dangerous: false,
@@ -1294,6 +1302,14 @@ bool_keys! {
         config = |c: &Config| c.sandbox.allow_git_worktrees,
         baseline = |_: PresetBaseline| false,
         resolved = |r: &Resolved| r.allow_git_worktrees;
+
+    /// Config-only (#386). Baseline `true` keeps existing Linux configs as
+    /// they were; `cplt config init` writes `false`.
+    allow_git_config_write, "sandbox", "allow_git_config_write",
+        cli = |_: &CliFlags| FeatureToggle::UseDefault,
+        config = |c: &Config| c.sandbox.allow_git_config_write,
+        baseline = |_: PresetBaseline| true,
+        resolved = |r: &Resolved| r.allow_git_config_write;
 
     /// The config layer folds in the deprecated `sandbox.gh_proxy` spelling.
     gh_guard_enabled, "gh_guard", "enabled",

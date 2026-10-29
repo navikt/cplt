@@ -4947,6 +4947,7 @@ mod tests {
             allow_browser: false,
             keychain_substitute: None,
             use_bubblewrap: None,
+            allow_git_config_write: true,
         }
     }
 

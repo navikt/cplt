@@ -396,6 +396,13 @@ strip_otlp_vendor_auth = true
 # session; cplt never removes them. macOS only. Global or local config only.
 # allow_git_worktrees = false
 #
+# Linux: let the agent write .git/config (in-session `git config`, `git remote`).
+# A written .git/config can set core.hooksPath or core.fsmonitor, which run
+# unsandboxed on your next git command. Off for new configs: .git/config is
+# bound read-only, and the launch refuses without bubblewrap. Without this line
+# it stays writable. macOS always denies the write.
+allow_git_config_write = false
+#
 # Suppress the startup configuration summary and non-essential messages.
 # Errors and warnings are always shown. Useful once you've reviewed the
 # sandbox settings and don't need to see them every time.
