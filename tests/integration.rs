@@ -3595,16 +3595,12 @@ int main(int argc, char **argv) {
         );
     }
 
-    /// `~/.copilot/skills/` is unwritable, and `~/.copilot/agents/` still is not
-    /// (navikt/copilot#858).
-    ///
-    /// A skill is the instructions the model is offered in the next session and
-    /// it names the scripts that session runs, so an agent that can edit one
-    /// edits its own future instructions. Skills arrive by install, which
-    /// refuses to run inside cplt anyway; `agents/` and `instructions/` are
-    /// Copilot's in-session authoring surface and keep the dir-wide grant.
+    /// `~/.copilot/skills/` and `agents/` are unwritable, and so is
+    /// `permissions-config.json` even through a rename, which is how Copilot
+    /// replaces its JSON files (navikt/copilot#858, #906). With
+    /// `allow_copilot_host_persistence` on, `agents/` is writable again.
     #[test]
-    fn real_profile_blocks_copilot_skills_write_but_not_agents() {
+    fn real_profile_blocks_copilot_skills_and_agents_write() {
         require_sandbox!();
         let project = fs::canonicalize(".").unwrap();
         let temp_home = tempfile::tempdir().unwrap();
@@ -3620,6 +3616,8 @@ int main(int argc, char **argv) {
         let mut opts = default_opts(&project, &home);
         opts.agent_dirs = &agent_dirs;
         let profile = write_real_profile(&opts);
+        opts.allow_copilot_host_persistence = true;
+        let kept_profile = write_real_profile(&opts);
 
         let overwrite = format!(
             "echo 'run this instead' > '{}' 2>&1; echo EXIT:$?",
@@ -3635,9 +3633,20 @@ int main(int argc, char **argv) {
             "echo body > '{}' 2>&1; echo EXIT:$?",
             agents.join("cplt-test-agent.md").display()
         );
-        let (agent_output, agent_success) = run_sandboxed(&profile, &author);
+        let (agent_output, _) = run_sandboxed(&profile, &author);
+        let perms = home.join(".copilot/permissions-config.json");
+        let tmp = home.join(".copilot/perms.tmp");
+        let rename = format!(
+            "echo '{{}}' > '{}' && mv '{}' '{}' 2>&1; echo EXIT:$?",
+            tmp.display(),
+            tmp.display(),
+            perms.display()
+        );
+        let (rename_output, _) = run_sandboxed(&profile, &rename);
+        let (kept_output, kept_success) = run_sandboxed(&kept_profile, &author);
 
         fs::remove_file(&profile).ok();
+        fs::remove_file(&kept_profile).ok();
         assert!(
             skill_output.contains("Operation not permitted") || skill_output.contains("EXIT:1"),
             "an existing skill must not be rewritable from inside a session: {skill_output}"
@@ -3647,9 +3656,16 @@ int main(int argc, char **argv) {
             "a new file must not be plantable in a skill directory: {plant_output}"
         );
         assert!(
-            agent_success && agent_output.contains("EXIT:0"),
-            "agents/ is Copilot's in-session authoring surface and stays \
-             writable — the deny is on skills/ alone: {agent_output}"
+            !agent_output.contains("EXIT:0"),
+            "a custom agent's mcp-servers command runs on the host: {agent_output}"
+        );
+        assert!(
+            !rename_output.contains("EXIT:0") && !perms.exists(),
+            "a rename must not create saved approvals: {rename_output}"
+        );
+        assert!(
+            kept_success && kept_output.contains("EXIT:0"),
+            "the opt-in keeps agents/ writable: {kept_output}"
         );
     }
 
