@@ -635,7 +635,7 @@ fn linux_child_command(
         (RELAY_ENV, relay.into()),
         // The private /tmp is the only temp dir it can write.
         ("TMPDIR", "/tmp".into()),
-        ("XDG_CONFIG_HOME", config_home.into_os_string()),
+        ("XDG_CONFIG_HOME", config_home.clone().into_os_string()),
     ]);
     let current_system = std::fs::read_link("/run/current-system").ok();
     let mut cmd = Command::new(bwrap);
@@ -648,7 +648,12 @@ fn linux_child_command(
             home.display()
         )));
     }
-    let tmpfs_home = (!home.starts_with("/tmp") && !home.starts_with("/run")).then_some(home);
+    // HOME, then the config and data dirs nais may be pointed at outside it:
+    // each hidden unless /tmp, /run or an earlier one covers it already.
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute() && spec.credential.keychain);
+    let hide = hidden_dirs(home, &config_home, data_home.as_deref());
     let read_paths: Vec<PathBuf> = spec
         .credential
         .linux_read_paths
@@ -661,7 +666,7 @@ fn linux_child_command(
         .filter(|d| d.is_dir())
         .collect();
     cmd.args(child_bwrap_args(&ChildMounts {
-        home: tmpfs_home,
+        hide: &hide,
         write_dirs: &write_dirs,
         read_paths: &read_paths,
         relay_exe: Some(&cplt),
@@ -824,8 +829,9 @@ fn start_bus_proxy(
 /// [`linux_child_command`].
 #[derive(Default)]
 struct ChildMounts<'a> {
-    /// `HOME`, when it gets an empty tmpfs (not under the private /tmp).
-    home: Option<&'a Path>,
+    /// Dirs that get an empty tmpfs, remounted read-only once the grants
+    /// are bound: `HOME`, and the XDG config and data dirs outside it.
+    hide: &'a [PathBuf],
     write_dirs: &'a [PathBuf],
     /// Bound back read-only under the empty `HOME`.
     read_paths: &'a [PathBuf],
@@ -867,12 +873,34 @@ fn disables_userns(bwrap: &Path) -> bool {
     })
 }
 
-/// `bubblewrap 0.9.0` and later than 0.8: true.
+/// `bubblewrap 0.9.0` and later than 0.8: true. The version is the first
+/// word shaped `N.N`, so a distro suffix after it does not count.
 fn version_has_disable_userns(out: &str) -> bool {
-    let v = out.trim().rsplit(' ').next().unwrap_or("");
-    let mut n = v.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
-    let (major, minor) = (n.next().unwrap_or(0), n.next().unwrap_or(0));
-    (major, minor) >= (0, 8)
+    let version = out.split_whitespace().find_map(|w| {
+        let mut n = w.split('.');
+        let major = n.next()?.parse::<u32>().ok()?;
+        let minor: String = n.next()?.chars().take_while(char::is_ascii_digit).collect();
+        Some((major, minor.parse::<u32>().ok()?))
+    });
+    version.is_some_and(|v| v >= (0, 8))
+}
+
+/// What gets an empty tmpfs in the Linux child: `home`, `config_home` and
+/// `data_home` (the dirs `host_env_pairs` hands over), less those under
+/// `/tmp`, `/run` or one already in the list.
+fn hidden_dirs(home: &Path, config_home: &Path, data_home: Option<&Path>) -> Vec<PathBuf> {
+    let mut hide: Vec<PathBuf> = Vec::new();
+    for d in [Some(home), Some(config_home), data_home]
+        .into_iter()
+        .flatten()
+    {
+        let covered =
+            d.starts_with("/tmp") || d.starts_with("/run") || hide.iter().any(|h| d.starts_with(h));
+        if !covered {
+            hide.push(d.to_path_buf());
+        }
+    }
+    hide
 }
 
 /// Where the relay (this binary) appears inside the Linux child.
@@ -885,7 +913,7 @@ const NIX_SOCKET_DIRS: &[&str] = &["/nix/var/nix/daemon-socket", "/nix/var/nix/g
 
 fn child_bwrap_args(m: &ChildMounts) -> Vec<std::ffi::OsString> {
     let ChildMounts {
-        home,
+        hide,
         write_dirs,
         read_paths,
         runtime_dir,
@@ -938,7 +966,7 @@ fn child_bwrap_args(m: &ChildMounts) -> Vec<std::ffi::OsString> {
     for d in nix_sockets {
         a.extend(["--tmpfs".into(), d.into()]);
     }
-    if let Some(h) = home {
+    for h in hide {
         a.extend(["--tmpfs".into(), h.into()]);
     }
     let mut bind = |flag: &str, src: &Path, dst: &Path| {
@@ -950,8 +978,8 @@ fn child_bwrap_args(m: &ChildMounts) -> Vec<std::ffi::OsString> {
     for p in read_paths {
         bind("--ro-bind-try", p, p);
     }
-    if let Some(h) = home {
-        // The empty HOME itself read-only, as the rest of the root is.
+    for h in hide {
+        // The empty dir itself read-only, as the rest of the root is.
         a.extend(["--remount-ro".into(), h.into()]);
     }
     let mut bind = |flag: &str, src: &Path, dst: &Path| {
@@ -1284,7 +1312,7 @@ mod tests {
     #[test]
     fn child_bwrap_args_isolate_the_network_and_bind_only_the_grants() {
         let args = strings(child_bwrap_args(&ChildMounts {
-            home: Some(Path::new("/home/u")),
+            hide: &[PathBuf::from("/home/u")],
             write_dirs: &[PathBuf::from("/home/u/.config/nais")],
             read_paths: &[PathBuf::from("/home/u/.netrc")],
             relay_exe: Some(Path::new("/home/u/.local/bin/cplt")),
@@ -1366,6 +1394,8 @@ mod tests {
             ("bubblewrap 0.8.0\n", true),
             ("bubblewrap 0.11.0", true),
             ("bubblewrap 1.0", true),
+            ("bubblewrap 0.9.0 (distro)", true),
+            ("bubblewrap 0.6.1 (Ubuntu 1.2)", false),
             ("", false),
         ] {
             assert_eq!(version_has_disable_userns(out), want, "{out:?}");
@@ -1396,6 +1426,40 @@ mod tests {
         .join(" ");
         assert!(
             s.contains("--tmpfs /nix/var/nix/daemon-socket --tmpfs /nix/var/nix/gc-socket"),
+            "{s}"
+        );
+        // After the root bind, or the root would cover it again.
+        assert!(
+            s.find("--ro-bind / /") < s.find("--tmpfs /nix/var/nix/daemon-socket"),
+            "{s}"
+        );
+    }
+
+    /// Config and data dirs outside HOME are hidden like HOME, before the
+    /// grant in them is bound, and remounted read-only after it.
+    #[test]
+    fn xdg_dirs_outside_home_are_hidden_too() {
+        let h = |c: &str, d: Option<&str>| {
+            hidden_dirs(Path::new("/home/u"), Path::new(c), d.map(Path::new))
+        };
+        assert_eq!(h("/home/u/.config", None), [PathBuf::from("/home/u")]);
+        assert_eq!(
+            h("/srv/cfg", Some("/srv/data")),
+            ["/home/u", "/srv/cfg", "/srv/data"].map(PathBuf::from)
+        );
+        assert_eq!(h("/tmp/cfg", Some("/run/d")), [PathBuf::from("/home/u")]);
+        let hide = h("/srv/cfg", None);
+        let s = strings(child_bwrap_args(&ChildMounts {
+            hide: &hide,
+            write_dirs: &[PathBuf::from("/srv/cfg/nais")],
+            ..ChildMounts::default()
+        }))
+        .join(" ");
+        assert!(
+            s.contains(
+                "--tmpfs /home/u --tmpfs /srv/cfg --bind /srv/cfg/nais /srv/cfg/nais \
+                 --remount-ro /home/u --remount-ro /srv/cfg"
+            ),
             "{s}"
         );
     }
