@@ -2005,7 +2005,7 @@ pub fn gh_configured() -> bool {
 /// summary to say why the grant stayed.
 pub static ACCOUNT_MISMATCH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-const COPILOT_CONFIG_LIMIT: u64 = 64 * 1024;
+pub(crate) const COPILOT_CONFIG_LIMIT: u64 = 64 * 1024;
 
 /// Selected Copilot account from `~/.copilot/config.json`, shaped `<host>:<login>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4686,6 +4686,7 @@ mod tests {
         let claude = home.path().join(".claude");
         std::fs::create_dir(&claude).unwrap();
         let dirs = [AgentDir {
+            is_file: false,
             path: claude.clone(),
             write: true,
             map_exec: false,
@@ -4719,6 +4720,7 @@ mod tests {
         // root grant and the plain-file rule stay, the index still on it.
         let home = Path::new("/h");
         let hook = AgentDir {
+            is_file: false,
             path: PathBuf::from("/x/gate.py"),
             write: false,
             map_exec: false,
@@ -4728,6 +4730,7 @@ mod tests {
             via: vec![],
         };
         let root = AgentDir {
+            is_file: false,
             path: home.join(".claude"),
             write: true,
             ..hook.clone()
@@ -4797,6 +4800,7 @@ mod tests {
     fn exec_grant_over_an_agent_data_dir_is_refused() {
         let home = Path::new("/fake/test");
         let agent_dirs = [AgentDir {
+            is_file: false,
             path: home.join(".local/share/opencode"),
             write: true,
             map_exec: false,
@@ -5881,6 +5885,7 @@ mod tests {
     fn exec_grant_over_a_writable_agent_file_is_refused() {
         let home = Path::new("/fake/test");
         let agent_dirs = [AgentDir {
+            is_file: false,
             path: home.join(".config/opencode"),
             write: false,
             map_exec: false,

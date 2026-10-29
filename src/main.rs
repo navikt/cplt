@@ -5572,6 +5572,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             .iter()
             .filter(|f| !before.contains(f))
         {
+            let added = sanitize_terminal_text(added);
             ui::warn(&format!(
                 "Copilot now trusts {added}: this session added it to \
                  ~/.copilot/config.json trustedFolders, so host sessions there skip the \

@@ -681,6 +681,7 @@ fn opencode_extra_config_grants(
             continue;
         }
         out.push(AgentDir {
+            is_file: real.is_file(),
             path: real,
             write: false,
             map_exec: false,
@@ -833,6 +834,7 @@ fn plugin_dir_grants(dirs: Vec<PathBuf>, home: &Path, writable: &[PathBuf]) -> V
         }
         // ponytail: native `.node` addons need file-map-executable, which is not granted.
         out.push(AgentDir {
+            is_file: false,
             path: real,
             write: false,
             map_exec: false,
@@ -1001,6 +1003,7 @@ fn script_grants(
             continue;
         }
         out.push(AgentDir {
+            is_file: false,
             path: real,
             write: false,
             map_exec: false,
@@ -2114,6 +2117,7 @@ impl Agent {
     /// vacuously. Renaming `fish` to `fishX` here left the whole suite green.
     fn shell_config_dirs(shell_name: &str, config_base: &Path, data_base: &Path) -> Vec<AgentDir> {
         let writable = |path: PathBuf| AgentDir {
+            is_file: false,
             path,
             write: true,
             map_exec: false,
@@ -2167,6 +2171,7 @@ impl Agent {
                 dirs.insert(
                     0,
                     AgentDir {
+                        is_file: false,
                         path: root,
                         write: true,
                         map_exec: true,
@@ -2238,6 +2243,7 @@ impl Agent {
                     scripts.insert(
                         0,
                         AgentDir {
+                            is_file: false,
                             path: custom,
                             write: false,
                             map_exec: false,
@@ -2251,6 +2257,7 @@ impl Agent {
 
                 let mut dirs = vec![
                     AgentDir {
+                        is_file: false,
                         path: config_dir,
                         write: false,
                         map_exec: false,
@@ -2261,6 +2268,7 @@ impl Agent {
                         via: vec![],
                     },
                     AgentDir {
+                        is_file: false,
                         path: data_dir,
                         write: true,
                         map_exec: false,
@@ -2270,6 +2278,7 @@ impl Agent {
                         via: vec![],
                     },
                     AgentDir {
+                        is_file: false,
                         path: state_dir,
                         write: true,
                         map_exec: false,
@@ -2279,6 +2288,7 @@ impl Agent {
                         via: vec![],
                     },
                     AgentDir {
+                        is_file: false,
                         path: cache_dir.clone(),
                         write: true,
                         map_exec: false,
@@ -2288,6 +2298,7 @@ impl Agent {
                         via: vec![],
                     },
                     AgentDir {
+                        is_file: false,
                         // OpenCode downloads managed tool binaries (rg, fd, etc.) here
                         path: cache_dir.join("bin"),
                         write: false,
@@ -2306,6 +2317,7 @@ impl Agent {
                 // and runtime/session data under ~/.gemini/antigravity-cli.
                 vec![
                     AgentDir {
+                        is_file: false,
                         path: home.join(".gemini/config"),
                         write: true,
                         map_exec: false,
@@ -2315,6 +2327,7 @@ impl Agent {
                         via: vec![],
                     },
                     AgentDir {
+                        is_file: false,
                         path: home.join(".gemini/antigravity-cli"),
                         write: true,
                         map_exec: false,
@@ -2366,6 +2379,7 @@ impl Agent {
                 // docs/known-impacts.md.
                 let agent = home.join(".pi/agent");
                 let writable = |path: PathBuf| AgentDir {
+                    is_file: false,
                     path,
                     write: true,
                     map_exec: false,
@@ -2376,6 +2390,7 @@ impl Agent {
                 };
                 vec![
                     AgentDir {
+                        is_file: false,
                         path: agent.clone(),
                         write: false,
                         map_exec: false,
@@ -2423,6 +2438,7 @@ impl Agent {
                     writable(agent.join("tools")),
                     writable(agent.join("tmp")),
                     AgentDir {
+                        is_file: false,
                         path: agent.join("bin"),
                         write: false,
                         map_exec: false,
@@ -2448,6 +2464,7 @@ impl Agent {
                     dirs.insert(
                         0,
                         AgentDir {
+                            is_file: false,
                             path: root,
                             write: true,
                             map_exec: false,
@@ -2466,6 +2483,7 @@ impl Agent {
                 // (Seatbelt subpath / Landlock PathBeneath both match a file).
                 let mut dirs = vec![
                     AgentDir {
+                        is_file: false,
                         path: home.join(".claude"),
                         write: true,
                         map_exec: false,
@@ -2475,6 +2493,7 @@ impl Agent {
                         via: vec![],
                     },
                     AgentDir {
+                        is_file: true,
                         path: home.join(".claude.json"),
                         write: true,
                         map_exec: false,
@@ -2542,6 +2561,7 @@ impl Agent {
                     crate::opencode_v2::xdg_base("XDG_STATE_HOME", home, ".local/state");
                 vec![
                     AgentDir {
+                        is_file: false,
                         path: config_base.join("goose"),
                         write: false,
                         map_exec: false,
@@ -2551,6 +2571,7 @@ impl Agent {
                         via: vec![],
                     },
                     AgentDir {
+                        is_file: false,
                         path: data_base.join("goose"),
                         write: true,
                         map_exec: false,
@@ -2560,6 +2581,7 @@ impl Agent {
                         via: vec![],
                     },
                     AgentDir {
+                        is_file: false,
                         path: state_base.join("goose"),
                         write: true,
                         map_exec: false,
@@ -2586,6 +2608,7 @@ impl Agent {
                 // writable set, with no error naming the cause ("No silent
                 // grants"). Mirrors `CLAUDE_CONFIG_DIR` above.
                 vec![AgentDir {
+                    is_file: false,
                     path: dsh_home(home),
                     write: true,
                     map_exec: false,
@@ -3158,6 +3181,10 @@ pub struct AgentDir {
     /// dropped when any of these sits in a writable tree, since the agent could
     /// swap that link for one to any file it wants read. Empty otherwise.
     pub via: Vec<PathBuf>,
+    /// The grant names a file (`~/.claude.json`), not a directory, whether
+    /// or not it exists yet. A file grant is never pinned against rename:
+    /// the agent saves it by an atomic rename (#923).
+    pub is_file: bool,
 }
 
 /// The root `dsh` will resolve for its Harness home, mirroring the harness's
@@ -3206,17 +3233,22 @@ pub const COPILOT_PERSISTENCE_OPT_OUT: &[&str] = &["agents", "permissions-config
 /// so it is not denied.
 #[must_use]
 pub fn copilot_trusted_folders(home: &Path) -> Vec<String> {
-    std::fs::read_to_string(home.join(".copilot/config.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&strip_jsonc(&s)).ok())
-        .and_then(|v| {
-            v.get("trustedFolders")?.as_array().map(|a| {
-                a.iter()
-                    .filter_map(|e| e.as_str().map(str::to_string))
-                    .collect()
-            })
+    // Agent-writable: no FIFO hang, symlink follow or unbounded read.
+    crate::untrusted::read_untrusted(
+        &home.join(".copilot/config.json"),
+        crate::sandbox::COPILOT_CONFIG_LIMIT,
+    )
+    .ok()
+    .flatten()
+    .and_then(|s| serde_json::from_str::<serde_json::Value>(&strip_jsonc(&s)).ok())
+    .and_then(|v| {
+        v.get("trustedFolders")?.as_array().map(|a| {
+            a.iter()
+                .filter_map(|e| e.as_str().map(str::to_string))
+                .collect()
         })
-        .unwrap_or_default()
+    })
+    .unwrap_or_default()
 }
 
 /// `sandbox.deny_copilot_dir_exec` (#324): withdraw execve from `~/.copilot`.
@@ -4269,6 +4301,7 @@ mod tests {
 
     fn agent_dir(path: PathBuf) -> AgentDir {
         AgentDir {
+            is_file: false,
             path,
             write: true,
             map_exec: false,
@@ -4640,6 +4673,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(copilot_trusted_folders(tmp.path()), ["/a", "/b"]);
+    }
+
+    #[test]
+    fn copilot_trusted_folders_refuses_untrusted_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".copilot");
+        std::fs::create_dir(&dir).unwrap();
+        let cfg = dir.join("config.json");
+        let real = tmp.path().join("real.json");
+        std::fs::write(&real, "{\"trustedFolders\":[\"/a\"]}").unwrap();
+        std::os::unix::fs::symlink(&real, &cfg).unwrap();
+        assert!(copilot_trusted_folders(tmp.path()).is_empty(), "symlink");
+        std::fs::remove_file(&cfg).unwrap();
+        let c = std::ffi::CString::new(cfg.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(copilot_trusted_folders(tmp.path()).is_empty(), "fifo");
+        std::fs::remove_file(&cfg).unwrap();
+        let big = usize::try_from(crate::sandbox::COPILOT_CONFIG_LIMIT).unwrap() + 1;
+        let mut body = "{\"trustedFolders\":[\"/a\"]}".to_string();
+        body.push_str(&" ".repeat(big));
+        std::fs::write(&cfg, body).unwrap();
+        assert!(copilot_trusted_folders(tmp.path()).is_empty(), "oversized");
     }
 
     #[test]
@@ -6647,6 +6703,7 @@ mod tests {
             std::fs::write(f, "").unwrap();
         }
         let grant = |p: &Path| AgentDir {
+            is_file: false,
             path: p.to_path_buf(),
             write: false,
             map_exec: false,

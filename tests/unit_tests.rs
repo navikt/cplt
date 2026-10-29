@@ -2153,6 +2153,7 @@ fn fish_startup_files_are_write_denied_in_both_granted_dirs() {
     // is the profile, not the XDG resolution.
     let agent_dirs = ["/Users/test/.config/fish", "/Users/test/.local/share/fish"].map(|p| {
         cplt::agent::AgentDir {
+            is_file: false,
             path: std::path::PathBuf::from(p),
             write: true,
             map_exec: false,
@@ -9892,6 +9893,7 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
 
     let agent_dirs = vec![
         AgentDir {
+            is_file: false,
             path: config_dir.clone(),
             write: false,
             map_exec: false,
@@ -9901,6 +9903,7 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
             via: vec![],
         },
         AgentDir {
+            is_file: false,
             path: data_dir.clone(),
             write: true,
             map_exec: false,
@@ -9910,6 +9913,7 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
             via: vec![],
         },
         AgentDir {
+            is_file: false,
             path: state_dir.clone(),
             write: true,
             map_exec: false,
@@ -9919,6 +9923,7 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
             via: vec![],
         },
         AgentDir {
+            is_file: false,
             path: cache_dir.clone(),
             write: true,
             map_exec: false,
@@ -9928,6 +9933,7 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
             via: vec![],
         },
         AgentDir {
+            is_file: false,
             path: cache_dir.join("bin"),
             write: false,
             map_exec: false,

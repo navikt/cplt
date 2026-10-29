@@ -2943,6 +2943,7 @@ validate = false
 
         let agent_dirs = vec![
             crate::agent::AgentDir {
+                is_file: false,
                 path: home.join(".pi/agent"),
                 write: true,
                 map_exec: false,
@@ -2952,6 +2953,7 @@ validate = false
                 via: vec![],
             },
             crate::agent::AgentDir {
+                is_file: false,
                 path: home.join(".pi/agent/bin"),
                 write: false,
                 map_exec: false,
@@ -3068,6 +3070,7 @@ validate = false
         let bin = home.join(".pi/agent/bin");
         assert!(!bin.exists(), "the fixture must leave the bin dir absent");
         let agent_dirs = vec![crate::agent::AgentDir {
+            is_file: false,
             path: bin.clone(),
             write: false,
             map_exec: false,
@@ -3104,6 +3107,7 @@ validate = false
     fn exec_tool_dir_warning_scopes_the_linux_sentence_to_where_it_is_true() {
         let home = PathBuf::from("/home/u");
         let copilot = crate::agent::AgentDir {
+            is_file: false,
             path: home.join(".copilot"),
             write: true,
             map_exec: true,

@@ -3819,6 +3819,7 @@ int main(int argc, char **argv) {
         let ran = format!("cplt {}", env!("CARGO_PKG_VERSION"));
 
         let agent_dir = |path: PathBuf, write: bool| cplt::agent::AgentDir {
+            is_file: false,
             path,
             write,
             map_exec: false,

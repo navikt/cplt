@@ -663,7 +663,10 @@ fn emit_sensitive_project_denies(
         sb,
         ";; Writable roots — no rename/unlink of the root itself"
     );
-    for root in &roots {
+    // Directory grants only: a file has no protected descendants, and an
+    // `allow.write` file must stay replaceable by atomic rename. A missing
+    // grant is pinned, since it may be created as a directory.
+    for root in roots.iter().filter(|r| !Path::new(r.as_str()).is_file()) {
         sbpl!(sb, "(deny file-write-unlink (literal \"{root}\"))");
     }
     // The same for the writable home tool dirs that carry denies (#923).
@@ -672,6 +675,16 @@ fn emit_sensitive_project_denies(
     // mise's data dir is left out: `mise implode` removes it (residual).
     for dir in HOME_DENY_ROOTS {
         sbpl!(sb, "(deny file-write-unlink (literal \"{home}/{dir}\"))");
+    }
+    // A symlinked one (`~/.m2 -> ~/maven-cache`) is granted at its target,
+    // which Seatbelt matches, so the target is pinned too.
+    for d in active_tool_dirs(Path::new(home), tool_dirs) {
+        let named = HOME_DENY_ROOTS
+            .iter()
+            .any(|dir| d.path == Path::new(home).join(dir));
+        if let Some(t) = d.target.filter(|t| named && validate_sbpl_path(t).is_ok()) {
+            sbpl!(sb, "(deny file-write-unlink (literal \"{}\"))", t.display());
+        }
     }
     sbpl!(sb);
 
@@ -1443,7 +1456,7 @@ fn emit_host_persistence_denies(
             .host_persistence_roots(agent_dirs)
             // A file grant is never pinned, even before it exists (#923
             // review): Claude's first save of `~/.claude.json` is a rename.
-            .filter(|d| d.write && d.path.extension().is_none() && !d.path.is_file())
+            .filter(|d| d.write && !d.is_file)
         {
             let p = d.path.display();
             sbpl!(sb, "(deny file-write-unlink (literal \"{p}\"))");
@@ -7015,6 +7028,53 @@ mod tests {
                     .contains("(deny file-write-unlink (literal \"/Users/test/.claude.json\"))")
             );
             assert!(profile.contains("(deny file-write-unlink (literal \"/Users/test/.claude\"))"));
+        }
+
+        /// #923 review: a symlinked tool root is pinned at its target too,
+        /// a dotted agent dir is pinned, a file grant is not, and an
+        /// `allow.write` file stays replaceable while a missing root is pinned.
+        #[test]
+        fn root_pins_follow_grant_kind_and_symlinks() {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path().canonicalize().unwrap();
+            let project = home.join("app");
+            std::fs::create_dir_all(home.join("maven-cache")).unwrap();
+            std::fs::create_dir_all(home.join("copilot.state")).unwrap();
+            std::fs::create_dir_all(&project).unwrap();
+            std::os::unix::fs::symlink(home.join("maven-cache"), home.join(".m2")).unwrap();
+            std::fs::write(project.join("result.json"), "{}").unwrap();
+            let tool_dirs: Vec<_> = crate::sandbox::policy::HOME_TOOL_DIRS
+                .iter()
+                .map(|d| d.resolve(&home, &[]))
+                .collect();
+            let dir = |path: PathBuf, is_file: bool| AgentDir {
+                is_file,
+                path,
+                write: true,
+                map_exec: false,
+                process_exec: false,
+                write_files: vec![],
+                create_dirs: vec![],
+                via: vec![],
+            };
+            let dirs = [
+                dir(home.join("copilot.state"), false),
+                dir(home.join("missing.json"), true),
+            ];
+            let extra_write = [project.join("result.json"), home.join("later")];
+            let mut opts = test_options(&project, &home);
+            opts.agent = crate::agent::Agent::Copilot;
+            opts.agent_dirs = &dirs;
+            opts.extra_write = &extra_write;
+            opts.existing_home_tool_dirs = Some(&tool_dirs);
+            let p = generate_profile(&opts, &[]);
+            let pin = |d: &Path| format!("(deny file-write-unlink (literal \"{}\"))", d.display());
+            for d in ["maven-cache", "copilot.state", "later"] {
+                assert!(p.contains(&pin(&home.join(d))), "{d} must be pinned:\n{p}");
+            }
+            for d in [home.join("missing.json"), project.join("result.json")] {
+                assert!(!p.contains(&pin(&d)), "{} must not be pinned", d.display());
+            }
         }
 
         /// The invariant, over every agent: the write-deny set is
