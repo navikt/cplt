@@ -30,6 +30,11 @@ pub struct Credential {
     /// The same for the Linux child (bwrap), under `XDG_CONFIG_HOME`
     /// (default `~/.config`); the rest of the filesystem is read-only.
     pub linux_write_dirs: &'static [&'static str],
+    /// Linux: the child's `HOME` is an empty tmpfs; these paths under it are
+    /// bound back read-only, besides `linux_write_dirs`. Only what the
+    /// server reads: anything else in `HOME` (a Docker socket, say) stays
+    /// out of its reach.
+    pub linux_read_paths: &'static [&'static str],
 }
 
 /// The table.
@@ -46,6 +51,14 @@ pub const MECHANISMS: &[Credential] = &[
         write_dirs: &["Library/Application Support/nais"],
         // os.UserConfigDir on Linux.
         linux_write_dirs: &["nais"],
+        // None. Found by reading nais/cli (dbbfe2e, 2026-10-29) for
+        // `alpha mcp serve` and `auth print-access-token -n`: naistrix reads
+        // `$XDG_CONFIG_HOME/nais/config.yaml`, the login is
+        // `nais-credentials.json.enc` beside it (both in the write dir), its
+        // key is in the Secret Service (the bus), and the issuer and console
+        // host come from built-in defaults, env and that file. Neither path
+        // touches kubeconfig, gcloud or anything else in HOME.
+        linux_read_paths: &[],
     },
     // A server with no host login: nothing to probe, any trusted command.
     // Not emitted by nav-pilot today; the broker e2e tests run on it.
@@ -56,6 +69,7 @@ pub const MECHANISMS: &[Credential] = &[
         keychain: false,
         write_dirs: &[],
         linux_write_dirs: &[],
+        linux_read_paths: &[],
     },
 ];
 

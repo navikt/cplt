@@ -613,13 +613,32 @@ fn linux_child_command(shared: &Shared, server: &Server) -> std::io::Result<(Com
     ]);
     let current_system = std::fs::read_link("/run/current-system").ok();
     let mut cmd = Command::new(bwrap);
+    // An empty HOME, bar the mechanism's grants. One under the private /tmp
+    // or /run is empty already; `/` (or a relative HOME) cannot be hidden.
+    let home = shared.home.as_path();
+    if !home.is_absolute() || home.parent().is_none() {
+        return Err(std::io::Error::other(format!(
+            "HOME {} cannot be hidden from the MCP server child",
+            home.display()
+        )));
+    }
+    let tmpfs_home = (!home.starts_with("/tmp") && !home.starts_with("/run")).then_some(home);
+    let read_paths: Vec<PathBuf> = spec
+        .credential
+        .linux_read_paths
+        .iter()
+        .map(|p| home.join(p))
+        .collect();
     let nix_sockets: Vec<PathBuf> = NIX_SOCKET_DIRS
         .iter()
         .map(PathBuf::from)
         .filter(|d| d.is_dir())
         .collect();
     cmd.args(child_bwrap_args(&ChildMounts {
+        home: tmpfs_home,
         write_dirs: &write_dirs,
+        read_paths: &read_paths,
+        relay_exe: Some(&cplt),
         runtime_dir: runtime.as_deref(),
         current_system: current_system.as_deref(),
         nix_sockets: &nix_sockets,
@@ -646,7 +665,7 @@ fn linux_child_command(shared: &Shared, server: &Server) -> std::io::Result<(Com
             });
         }
     }
-    cmd.arg("--").arg(cplt);
+    cmd.arg("--").arg(CHILD_RELAY_EXE);
     Ok((cmd, setup))
 }
 
@@ -733,14 +752,23 @@ fn start_bus_proxy(real: &Path, socket: &Path) -> std::io::Result<std::io::PipeR
 /// [`linux_child_command`].
 #[derive(Default)]
 struct ChildMounts<'a> {
+    /// `HOME`, when it gets an empty tmpfs (not under the private /tmp).
+    home: Option<&'a Path>,
     write_dirs: &'a [PathBuf],
+    /// Bound back read-only under the empty `HOME`.
+    read_paths: &'a [PathBuf],
     runtime_dir: Option<&'a Path>,
     current_system: Option<&'a Path>,
     /// The Nix daemon's socket dirs that exist on this host.
     nix_sockets: &'a [PathBuf],
     bus: Option<&'a Path>,
     egress_socket: Option<&'a Path>,
+    /// This binary, bound in at [`CHILD_RELAY_EXE`]: it may live in `HOME`.
+    relay_exe: Option<&'a Path>,
 }
+
+/// Where the relay (this binary) appears inside the Linux child.
+const CHILD_RELAY_EXE: &str = "/run/cplt-relay";
 
 /// The Nix daemon's socket dirs. Reaching the daemon builds as a trusted
 /// user (root on the host) or fetches through fixed-output derivations,
@@ -749,12 +777,15 @@ const NIX_SOCKET_DIRS: &[&str] = &["/nix/var/nix/daemon-socket", "/nix/var/nix/g
 
 fn child_bwrap_args(m: &ChildMounts) -> Vec<std::ffi::OsString> {
     let ChildMounts {
+        home,
         write_dirs,
+        read_paths,
         runtime_dir,
         current_system,
         nix_sockets,
         bus,
         egress_socket,
+        relay_exe,
     } = *m;
     let mut a: Vec<std::ffi::OsString> = [
         "--unshare-user",
@@ -795,11 +826,27 @@ fn child_bwrap_args(m: &ChildMounts) -> Vec<std::ffi::OsString> {
     for d in nix_sockets {
         a.extend(["--tmpfs".into(), d.into()]);
     }
+    if let Some(h) = home {
+        a.extend(["--tmpfs".into(), h.into()]);
+    }
     let mut bind = |flag: &str, src: &Path, dst: &Path| {
         a.extend([flag.into(), src.into(), dst.into()]);
     };
     for d in write_dirs {
         bind("--bind", d, d);
+    }
+    for p in read_paths {
+        bind("--ro-bind-try", p, p);
+    }
+    if let Some(h) = home {
+        // The empty HOME itself read-only, as the rest of the root is.
+        a.extend(["--remount-ro".into(), h.into()]);
+    }
+    let mut bind = |flag: &str, src: &Path, dst: &Path| {
+        a.extend([flag.into(), src.into(), dst.into()]);
+    };
+    if let Some(exe) = relay_exe {
+        bind("--ro-bind", exe, Path::new(CHILD_RELAY_EXE));
     }
     if let Some(bus) = bus {
         bind("--ro-bind", bus, Path::new(CHILD_BUS_SOCKET));
@@ -1113,7 +1160,10 @@ mod tests {
     #[test]
     fn child_bwrap_args_isolate_the_network_and_bind_only_the_grants() {
         let args = strings(child_bwrap_args(&ChildMounts {
+            home: Some(Path::new("/home/u")),
             write_dirs: &[PathBuf::from("/home/u/.config/nais")],
+            read_paths: &[PathBuf::from("/home/u/.netrc")],
+            relay_exe: Some(Path::new("/home/u/.local/bin/cplt")),
             runtime_dir: Some(Path::new("/run/user/1000")),
             bus: Some(Path::new("/tmp/cplt-mcp-x/b0")),
             egress_socket: Some(Path::new("/tmp/cplt-mcp-x/e0")),
@@ -1125,7 +1175,11 @@ mod tests {
         }
         assert!(args.contains(&"--die-with-parent".into()), "{s}");
         let tail = "--ro-bind / / --proc /proc --dev /dev --tmpfs /tmp --tmpfs /run \
+                    --tmpfs /home/u \
                     --bind /home/u/.config/nais /home/u/.config/nais \
+                    --ro-bind-try /home/u/.netrc /home/u/.netrc \
+                    --remount-ro /home/u \
+                    --ro-bind /home/u/.local/bin/cplt /run/cplt-relay \
                     --ro-bind /tmp/cplt-mcp-x/b0 /run/cplt-bus \
                     --ro-bind /tmp/cplt-mcp-x/e0 /tmp/cplt-egress.sock";
         assert!(s.ends_with(tail), "{s}");

@@ -21,7 +21,11 @@ fn e2e_mcp_broker_filters_tools_and_refuses_calls() {
     }
     let home = home_temp_dir("mcp-broker");
     let home_path = std::fs::canonicalize(home.path()).unwrap();
-    let server = home_path.join("fake_mcp.py");
+    // Outside HOME: the Linux child's HOME is an empty tmpfs.
+    let server_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let server = std::fs::canonicalize(server_dir.path())
+        .unwrap()
+        .join("fake_mcp.py");
     std::fs::write(
         &server,
         r#"import sys, json, os, socket, errno
@@ -49,10 +53,22 @@ def home_write():
         return "open"
     except OSError as e:
         return errno.errorcode.get(e.errno, str(e.errno))
+def reach(path):
+    c = socket.socket(socket.AF_UNIX)
+    c.settimeout(2)
+    try:
+        c.connect(path)
+        return "open"
+    except OSError:
+        return "closed"
 def sandbox():
     if not sys.platform.startswith("linux"):
         return ""
-    return ("|HOME:" + home_write() + "|TMP:" + ",".join(sorted(os.listdir("/tmp")))
+    home = os.environ["HOME"]
+    return ("|HOME:" + home_write() + "|HOMELS:" + ",".join(sorted(os.listdir(home)))
+            + "|XSOCK:" + reach(os.path.join(home, "x.sock"))
+            + "|NIX:" + reach("/nix/var/nix/daemon-socket/socket")
+            + "|TMP:" + ",".join(sorted(os.listdir("/tmp")))
             + "|BUS:" + os.environ.get("DBUS_SESSION_BUS_ADDRESS", "none"))
 for line in sys.stdin:
     m = json.loads(line)
@@ -171,6 +187,11 @@ if sys.platform.startswith("linux"):
         ),
     )
     .unwrap();
+    // A socket in HOME, as Docker Desktop's: the host reaches it (the
+    // control), the Linux child must not.
+    let x_sock = home_path.join("x.sock");
+    let _x = std::os::unix::net::UnixListener::bind(&x_sock).unwrap();
+    std::os::unix::net::UnixStream::connect(&x_sock).expect("control: x.sock on the host");
     // A fake session bus in a runtime dir of our own: the broker must hide it.
     let fake_rt = home_path.join("runtime");
     std::fs::create_dir(&fake_rt).unwrap();
@@ -278,10 +299,11 @@ if sys.platform.startswith("linux"):
         let (probe, direct) = probe.split_once("|DIRECT:").unwrap();
         let (direct, sandbox) = direct.split_once('|').unwrap_or((direct, ""));
         if cfg!(target_os = "linux") {
-            // Read-only root, a private /tmp holding only the egress socket,
-            // and no bus for a server whose credential is not the keychain.
+            // An empty, read-only HOME (no grants for credential `none`), so
+            // no socket in it; no Nix daemon; a private /tmp holding only
+            // the egress socket; and no bus for a non-keychain server.
             assert_eq!(
-                sandbox, "HOME:EROFS|TMP:cplt-egress.sock|BUS:none",
+                sandbox, "HOME:EROFS|HOMELS:|XSOCK:closed|NIX:closed|TMP:cplt-egress.sock|BUS:none",
                 "{stdout}"
             );
         }
