@@ -8976,6 +8976,19 @@ fn kernel_release() -> String {
         .into_owned()
 }
 
+/// The pnpm launcher dir doctor should warn about, if any: the first of
+/// `bins` (every spelling of every `$PNPM_HOME/bin` holding a launcher) when
+/// none of them is on the launch PATH and no shadow is coming. Exact
+/// strings, as pnpm's rc block compares them: `bin/` is not `bin`.
+fn pnpm_bin_missing_from_path<'a>(
+    launch_path: &[PathBuf],
+    bins: &'a [PathBuf],
+    shadowed: bool,
+) -> Option<&'a PathBuf> {
+    let on_path = |b: &PathBuf| launch_path.iter().any(|p| p.as_os_str() == b.as_os_str());
+    (!shadowed && !bins.iter().any(on_path)).then(|| bins.first())?
+}
+
 /// `cplt doctor`. Findings first; the inventory only under `--verbose`.
 ///
 /// Built from the launch's own resolution (`resolve_context`, `HostProbe`,
@@ -9045,7 +9058,7 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
         active_agent,
         unapproved_proposals,
         repo_trusted: _,
-        launch_dir: _,
+        launch_dir,
         configured_quiet,
     } = ctx;
     // `doctor` reports the policy a launch would build, so it has to carry the
@@ -9267,24 +9280,33 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     doctor_exec.dedup();
     // pnpm's rc block prepends `$PNPM_HOME/bin` when it is missing from PATH,
     // and its launcher then runs the store binary instead of the shadow.
+    // A shadow, from the PATH pnpm or a pinned one, gets `$PNPM_HOME/bin`
+    // appended at launch, so only an unshadowed launch needs it on PATH.
+    let pnpm_will_shadow = doctor_pnpm_shadowed
+        || (doctor_pnpm.is_some() && scratch::pinned_pnpm_shadow_applies(&home_dir, &launch_dir));
     let launch_path: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
-    for root in scratch::pnpm_home_roots(&home_dir) {
-        let bin = root.join("bin");
-        if scratch::pnpm_cmd_shim_target(&home_dir, &bin.join("pnpm")).is_some()
-            && !doctor_pnpm_shadowed
-            && !launch_path.contains(&bin)
-        {
-            findings.push(Finding::warning(
-                format!(
-                    "{} is not on PATH, so pnpm's shell setup puts its launcher ahead of cplt's pnpm copy, and pnpm may fail in the sandbox.",
-                    doctor_tilde(&bin.display().to_string(), &home_dir)
-                ),
-                Some("put $PNPM_HOME/bin on the PATH you launch cplt from".to_string()),
-            ));
-            break;
-        }
+    let env_home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut pnpm_bins: Vec<PathBuf> = scratch::pnpm_path_roots(&home_dir, env_home.as_deref())
+        .into_iter()
+        .map(|root| root.join("bin"))
+        .filter(|bin| scratch::pnpm_cmd_shim_target(&home_dir, &bin.join("pnpm")).is_some())
+        .collect();
+    // Name the spelling the user wrote: the literal `$HOME`, not the canonical one.
+    pnpm_bins.sort_by_key(|bin| !env_home.as_deref().is_some_and(|h| bin.starts_with(h)));
+    if let Some(bin) = pnpm_bin_missing_from_path(&launch_path, &pnpm_bins, pnpm_will_shadow) {
+        let shown = doctor_tilde(&bin.display().to_string(), &home_dir);
+        let shown = match env_home.as_deref() {
+            Some(h) => doctor_tilde(&shown, h),
+            None => shown,
+        };
+        findings.push(Finding::warning(
+            format!(
+                "{shown} is not on PATH, so pnpm's shell setup puts its launcher ahead of cplt's pnpm copy, and pnpm may fail in the sandbox."
+            ),
+            Some("put $PNPM_HOME/bin on the PATH you launch cplt from".to_string()),
+        ));
     }
     let resolved_binary = active_agent.resolve_binary_with_editor_provenance();
     let editor_launcher = resolved_binary.as_ref().is_ok_and(|(_, editor)| *editor);
@@ -13026,6 +13048,45 @@ fn mcp_status_clients(
         None | Some(agent::Agent::Copilot) => &["copilot"],
         Some(agent::Agent::OpenCode) if opencode => &["opencode"],
         _ => &[],
+    }
+}
+
+#[cfg(test)]
+mod pnpm_doctor_tests {
+    use super::*;
+
+    #[test]
+    fn pnpm_bin_warning_needs_exact_entry_and_no_shadow() {
+        let bin = PathBuf::from("/h/Library/pnpm/bin");
+        let bins = vec![bin.clone()];
+        let on = vec![PathBuf::from("/usr/bin"), bin.clone()];
+        let slashed = vec![PathBuf::from("/h/Library/pnpm/bin/")];
+        assert_eq!(pnpm_bin_missing_from_path(&on, &bins, false), None);
+        assert_eq!(
+            pnpm_bin_missing_from_path(&slashed, &bins, false),
+            Some(&bin)
+        );
+        assert_eq!(pnpm_bin_missing_from_path(&[], &bins, false), Some(&bin));
+        // A shadow (PATH or pinned, #890) gets the dir appended at launch.
+        assert_eq!(pnpm_bin_missing_from_path(&[], &bins, true), None);
+        assert_eq!(pnpm_bin_missing_from_path(&[], &[], false), None);
+    }
+
+    /// A symlinked `$HOME`: either spelling on PATH satisfies pnpm's rc block.
+    #[test]
+    fn pnpm_bin_warning_accepts_the_literal_home_spelling() {
+        let literal = PathBuf::from("/Users/x/Library/pnpm/bin");
+        let canonical = PathBuf::from("/private/Users/x/Library/pnpm/bin");
+        let bins = vec![literal.clone(), canonical.clone()];
+        assert_eq!(
+            pnpm_bin_missing_from_path(std::slice::from_ref(&literal), &bins, false),
+            None
+        );
+        assert_eq!(pnpm_bin_missing_from_path(&[canonical], &bins, false), None);
+        assert_eq!(
+            pnpm_bin_missing_from_path(&[], &bins, false),
+            Some(&literal)
+        );
     }
 }
 

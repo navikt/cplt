@@ -430,7 +430,11 @@ fn configure_command(
         prepend_path(cmd, &[shadow]);
     }
     if pnpm_shadow_dir.is_some() {
-        append_pnpm_home_dirs(cmd, &crate::scratch::pnpm_home_roots(home_dir));
+        let env_home = std::env::var_os("HOME").map(PathBuf::from);
+        append_pnpm_home_dirs(
+            cmd,
+            &crate::scratch::pnpm_path_roots(home_dir, env_home.as_deref()),
+        );
     }
 }
 
@@ -2411,6 +2415,56 @@ mod pnpm_path_tests {
         std::fs::remove_dir(&bin).unwrap();
         let missing = with_pnpm_home_dirs(vec![shadow.clone(), parent.clone()], &roots);
         assert_eq!(missing, vec![shadow, parent]);
+    }
+
+    #[test]
+    fn pnpm10_root_is_appended_when_it_holds_pnpm() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join(".local/share/pnpm");
+        std::fs::create_dir_all(&root).unwrap();
+        let roots = vec![root.clone()];
+        assert!(with_pnpm_home_dirs(vec![], &roots).is_empty());
+        std::os::unix::fs::symlink("/nonexistent", root.join("pnpm")).unwrap();
+        assert_eq!(with_pnpm_home_dirs(vec![], &roots), vec![root]);
+    }
+
+    #[test]
+    fn symlinked_home_appends_the_literal_spelling_too() {
+        let real = tempfile::tempdir().unwrap();
+        let real_home = real.path().canonicalize().unwrap();
+        std::fs::create_dir_all(real_home.join("Library/pnpm/bin")).unwrap();
+        let links = tempfile::tempdir().unwrap();
+        let link_home = links.path().join("home");
+        std::os::unix::fs::symlink(&real_home, &link_home).unwrap();
+
+        let roots = crate::scratch::pnpm_path_roots(&real_home, Some(&link_home));
+        let paths = with_pnpm_home_dirs(vec![PathBuf::from("/shadow")], &roots);
+        assert!(paths.contains(&real_home.join("Library/pnpm/bin")));
+        assert!(paths.contains(&link_home.join("Library/pnpm/bin")));
+    }
+
+    /// With `--pass-env PATH` the command already carries a PATH; the dirs
+    /// go after it, and an entry it already has is not repeated.
+    #[test]
+    fn append_keeps_a_passed_path_and_dedupes() {
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join("Library/pnpm/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let roots = vec![home.path().join("Library/pnpm")];
+        #[allow(clippy::disallowed_methods)] // never spawned
+        let mut cmd = Command::new("true");
+        cmd.env("PATH", "/shadow:/custom");
+        append_pnpm_home_dirs(&mut cmd, &roots);
+        let path = |cmd: &Command| {
+            cmd.get_envs()
+                .find(|(k, _)| *k == "PATH")
+                .and_then(|(_, v)| v.map(std::ffi::OsStr::to_os_string))
+                .unwrap()
+        };
+        let want = format!("/shadow:/custom:{}", bin.display());
+        assert_eq!(path(&cmd), std::ffi::OsString::from(&want));
+        append_pnpm_home_dirs(&mut cmd, &roots);
+        assert_eq!(path(&cmd), std::ffi::OsString::from(&want));
     }
 }
 

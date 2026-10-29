@@ -743,6 +743,28 @@ pub fn pnpm_home_roots(home_dir: &Path) -> Vec<PathBuf> {
     roots
 }
 
+/// [`pnpm_home_roots`] for `home_dir` and for the literal `env_home`.
+///
+/// `home_dir` is canonical, but `pnpm setup` writes `PNPM_HOME` with the
+/// `$HOME` it saw, and its rc block compares PATH entries as strings. When
+/// `$HOME` is a symlink only the literal spelling matches.
+pub fn pnpm_path_roots(home_dir: &Path, env_home: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots = pnpm_home_roots(home_dir);
+    if let Some(home) = env_home.filter(|h| h.is_absolute() && *h != home_dir) {
+        roots.extend(pnpm_home_roots(home));
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+/// Whether the launch dir pins a pnpm already in the store, which cplt
+/// shadows instead of whatever pnpm is on PATH (#890).
+pub fn pinned_pnpm_shadow_applies(home_dir: &Path, launch_dir: &Path) -> bool {
+    pinned_pnpm_binary(home_dir, launch_dir)
+        .is_some_and(|binary| matches!(pnpm_store_binary_source(home_dir, &binary), Ok(Some(_))))
+}
+
 /// Whether a pnpm executable needs an exact file-level execute grant.
 pub fn pnpm_needs_exec_grant(home_dir: &Path, pnpm: &Path) -> bool {
     let roots: Vec<PathBuf> = pnpm_home_roots(home_dir)
