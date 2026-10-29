@@ -1120,7 +1120,7 @@ fn with_pnpm_home_dirs(mut paths: Vec<PathBuf>, roots: &[PathBuf]) -> Vec<PathBu
             (root.is_dir() && root.join("pnpm").symlink_metadata().is_ok()).then(|| root.clone()),
         ];
         for dir in candidates.into_iter().flatten() {
-            if !paths.contains(&dir) {
+            if !paths.iter().any(|p| p.as_os_str() == dir.as_os_str()) {
                 paths.push(dir);
             }
         }
@@ -2401,6 +2401,12 @@ mod pnpm_path_tests {
 
         let present = vec![shadow.clone(), bin.clone(), parent.clone()];
         assert_eq!(with_pnpm_home_dirs(present.clone(), &roots), present);
+
+        // The rc block matches strings, so `bin/` does not count as `bin`.
+        let slashed = PathBuf::from(format!("{}/", bin.display()));
+        let trailing = with_pnpm_home_dirs(vec![shadow.clone(), slashed.clone()], &roots);
+        assert_eq!(trailing.len(), 3);
+        assert_eq!(trailing[2].as_os_str(), bin.as_os_str());
 
         std::fs::remove_dir(&bin).unwrap();
         let missing = with_pnpm_home_dirs(vec![shadow.clone(), parent.clone()], &roots);

@@ -850,7 +850,7 @@ int main(int argc, char **argv) {
             pnpm_home.display(),
         );
         let project_dir = project.path().to_string_lossy().into_owned();
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_cplt"))
+        let output = cplt_cmd()
             .args([
                 "--yes",
                 "--no-validate",

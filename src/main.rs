@@ -9194,11 +9194,12 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     for root in scratch::pnpm_home_roots(&home_dir) {
         let bin = root.join("bin");
         if scratch::pnpm_cmd_shim_target(&home_dir, &bin.join("pnpm")).is_some()
+            && !doctor_pnpm_shadowed
             && !launch_path.contains(&bin)
         {
             findings.push(Finding::warning(
                 format!(
-                    "{} is not on PATH, so pnpm's shell setup puts its launcher ahead of cplt's pnpm copy, and pnpm fails in the sandbox.",
+                    "{} is not on PATH, so pnpm's shell setup puts its launcher ahead of cplt's pnpm copy, and pnpm may fail in the sandbox.",
                     doctor_tilde(&bin.display().to_string(), &home_dir)
                 ),
                 Some("put $PNPM_HOME/bin on the PATH you launch cplt from".to_string()),

@@ -409,10 +409,7 @@ echo AGENT_COMPLETED
         require_landlock!();
         use std::os::unix::fs::PermissionsExt;
 
-        let project = tempfile::Builder::new()
-            .prefix(".cplt-pnpm-project-")
-            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
-            .expect("create project");
+        let project = create_test_project();
         let home = tempfile::Builder::new()
             .prefix(".cplt-pnpm-home-")
             .tempdir_in(env!("CARGO_MANIFEST_DIR"))
@@ -440,7 +437,7 @@ echo AGENT_COMPLETED
             pnpm_home.display(),
         );
         let project_dir = project.path().to_string_lossy().into_owned();
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_cplt"))
+        let output = cplt_cmd()
             .args([
                 "--yes",
                 "--no-validate",
