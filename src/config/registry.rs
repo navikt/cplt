@@ -481,7 +481,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         section: "sandbox",
         key: "allow_copilot_host_persistence",
         value_type: ConfigValueType::Bool,
-        dangerous: false,
+        dangerous: true,
         default_display: "true (false in new configs)",
         description: "Copilot only: keep ~/.copilot/agents/ and ~/.copilot/permissions-config.json writable inside the sandbox. A custom agent there can start an MCP server command when a later host session selects it, and saved tool approvals skip prompts in later host sessions (#906). Set false to deny both writes: saving a tool approval inside cplt then fails for that session, and you add custom agents from a host shell.",
     },

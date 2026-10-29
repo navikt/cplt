@@ -3178,6 +3178,20 @@ fn unmasked_credential_warnings(
 #[cfg(target_os = "linux")]
 fn create_missing_home_config(config: &SandboxConfig, inspect_only: bool) -> Vec<PathBuf> {
     let mut made = Vec::new();
+    // #906: an empty `~/.copilot/agents`, so its read-only bind holds on a
+    // fresh install. Not `policy.precreate_dirs`: that runs in `precompute()`,
+    // after the overlay set is built. `permissions-config.json` is not
+    // created (an empty file is not valid JSON), so that deny stays nominal
+    // until Copilot first writes it.
+    let agents = config.home_dir.join(".copilot/agents");
+    if config.agent == crate::agent::Agent::Copilot
+        && !config.allow_copilot_host_persistence
+        && config.home_dir.join(".copilot").is_dir()
+        && std::fs::symlink_metadata(&agents).is_err()
+        && (inspect_only || std::fs::create_dir(&agents).is_ok())
+    {
+        made.push(agents);
+    }
     for planned in plan_missing_home_config_targets(config) {
         let result = planned.and_then(|(dir, file)| {
             if inspect_only {
@@ -3195,8 +3209,9 @@ fn create_missing_home_config(config: &SandboxConfig, inspect_only: bool) -> Vec
             )),
         }
     }
-    if !inspect_only && !made.is_empty() {
-        let list: Vec<String> = made.iter().map(|p| p.display().to_string()).collect();
+    let git_made = made.iter().filter(|p| !p.ends_with(".copilot/agents"));
+    if !inspect_only && git_made.clone().next().is_some() {
+        let list: Vec<String> = git_made.map(|p| p.display().to_string()).collect();
         ui::info(&format!(
             "Created empty {} so Bubblewrap can bind it read-only: git or yarn on the \
              host reads it through your home config symlink, and it sits in a writable \

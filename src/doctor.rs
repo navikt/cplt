@@ -1188,8 +1188,9 @@ pub fn copilot_persistence_nudge(
              agent there can run a command when a later host session selects it, and saved \
              approvals skip prompts there. New configs deny both (see SECURITY.md).",
             Some(
-                "cplt config set sandbox.allow_copilot_host_persistence false, or set it to \
-                 true to keep them writable and silence this"
+                "cplt config set sandbox.allow_copilot_host_persistence false, or \
+                 `cplt config set --force sandbox.allow_copilot_host_persistence true` to \
+                 keep them writable and silence this"
                     .to_string(),
             ),
         )

@@ -1048,7 +1048,7 @@ Copilot loads `~/.copilot/agents/` and `~/.copilot/permissions-config.json` in e
 cplt config set sandbox.allow_copilot_host_persistence false
 ```
 
-With the key off, saving a tool approval inside cplt fails for that session, and you add custom agents from a shell outside cplt. cplt also warns after the session when Copilot trusted a new folder. A config without the key keeps both writable, and `cplt doctor` suggests the change. Set the key to `true` to keep them writable and silence that. On Linux the deny needs bubblewrap and only covers paths that already exist. See [SECURITY.md](../SECURITY.md).
+With the key off, saving a tool approval inside cplt fails for that session, and you add custom agents from a shell outside cplt. cplt also warns after the session when Copilot trusted a new folder. A config without the key keeps both writable, and `cplt doctor` suggests the change. Set the key to `true` (`cplt config set --force sandbox.allow_copilot_host_persistence true`) to keep them writable and silence that. On Linux the deny needs bubblewrap and only covers paths that already exist. See [SECURITY.md](../SECURITY.md).
 
 ## Other keys
 

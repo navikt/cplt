@@ -1408,6 +1408,21 @@ fn emit_host_persistence_denies(
         let p = parent.display();
         sbpl!(sb, "(deny file-write-unlink (literal \"{p}\"))");
     }
+    // The same pin for the writable dir the denies above are joined onto
+    // (#923): `mv ~/.copilot <project>/.x && ln -s <project>/.x ~/.copilot`
+    // moved every deny out from under its path, since the rules name
+    // `~/.copilot/...` and the files now live elsewhere. No agent renames
+    // its own home dir. A file grant (`~/.claude.json`) is left alone: the
+    // agent replaces it by rename, and the denies joined onto it are inert.
+    if !agent.host_persistence_denies().is_empty() {
+        for d in agent
+            .host_persistence_roots(agent_dirs)
+            .filter(|d| d.write && !d.path.is_file())
+        {
+            let p = d.path.display();
+            sbpl!(sb, "(deny file-write-unlink (literal \"{p}\"))");
+        }
+    }
     if wrote_header {
         sbpl!(sb);
     }
@@ -6842,7 +6857,12 @@ mod tests {
 
         /// Every denied path in `profile` with a renameable ancestor, as
         /// `(denied path, renameable ancestor, rule text)`.
-        fn violations(profile: &str) -> Vec<(String, String, String)> {
+        ///
+        /// `cross` lists ancestors that are also checked for a move to any
+        /// writable destination followed by a symlink back (#923). It is the
+        /// agent's config roots only: other writable roots (the project, tool
+        /// dirs) have the same shape and are not modelled here yet.
+        fn violations(profile: &str, cross: &[String]) -> Vec<(String, String, String)> {
             let rules = parse_rules(profile);
             let mut out: Vec<(String, String, String)> = Vec::new();
             for rule in rules.iter().filter(|r| !r.allow && r.op == "file-write*") {
@@ -6856,7 +6876,30 @@ mod tests {
                     // So skip this depth and keep climbing, never stop early.
                     let mut sibling = segs[..depth - 1].to_vec();
                     sibling.push(PROBE.to_string());
-                    if !allowed(&rules, &sibling, CREATE) {
+                    // Or anywhere else writable, when the old name can then be
+                    // recreated as a symlink: `mv ~/.copilot <project>/.x &&
+                    // ln -s <project>/.x ~/.copilot` reaches the same files
+                    // (#923). An agent dir's own grant covers its literal path.
+                    let elsewhere = cross.contains(&format!("/{}", segs[..depth].join("/")))
+                        && allowed(&rules, &segs[..depth], CREATE)
+                        && rules.iter().any(|r| {
+                            r.allow && r.pat.tail == Tail::OrDeeper && {
+                                let mut dest: Vec<String> = r
+                                    .pat
+                                    .segs
+                                    .iter()
+                                    .filter_map(|s| match s {
+                                        Seg::Lit(l) => Some(l.clone()),
+                                        _ => None,
+                                    })
+                                    .collect();
+                                dest.len() == r.pat.segs.len() && {
+                                    dest.push(PROBE.to_string());
+                                    allowed(&rules, &dest, CREATE)
+                                }
+                            }
+                        });
+                    if !allowed(&rules, &sibling, CREATE) && !elsewhere {
                         continue;
                     }
                     // A position the rule already wildcards is no escape: the
@@ -6924,7 +6967,12 @@ mod tests {
                 for &agent in crate::agent::Agent::ALL {
                     let name = format!("{agent:?}");
                     let profile = representative_profile(agent);
-                    for (denied, ancestor, rule) in violations(&profile) {
+                    let dirs = agent.config_dirs(Path::new("/Users/test"));
+                    let cross: Vec<String> = agent
+                        .host_persistence_roots(&dirs)
+                        .map(|d| d.path.display().to_string())
+                        .collect();
+                    for (denied, ancestor, rule) in violations(&profile, &cross) {
                         let key = (name.clone(), denied.clone(), ancestor.clone());
                         if KNOWN_UNFIXED
                             .iter()
@@ -6977,7 +7025,7 @@ mod tests {
             // `$HOME` spellings sit under the writable temp dir here, which a
             // real project and home do not.
             let targets = [dots.join("ssh/.ssh"), dots.join("git/.gitconfig")];
-            let found: Vec<_> = violations(&profile)
+            let found: Vec<_> = violations(&profile, &[])
                 .into_iter()
                 .filter(|(denied, _, _)| targets.iter().any(|t| Path::new(denied).starts_with(t)))
                 .collect();
@@ -6993,15 +7041,15 @@ mod tests {
 (allow file-write* (subpath \"/w\"))
 (deny file-write* (subpath \"/w/keep/pkg\"))
 ";
-            let found = violations(profile);
+            let found = violations(profile, &[]);
             assert_eq!(found.len(), 1, "expected exactly one violation: {found:?}");
             assert_eq!(found[0].1, "/w/keep", "{found:?}");
 
             let pinned = format!("{profile}(deny file-write-unlink (literal \"/w/keep\"))\n");
             assert!(
-                violations(&pinned).is_empty(),
+                violations(&pinned, &[]).is_empty(),
                 "the pin must clear it: {:?}",
-                violations(&pinned)
+                violations(&pinned, &[])
             );
         }
     }

@@ -1942,6 +1942,20 @@ impl Agent {
     /// [`Agent::host_persistence_paths`], minus [`COPILOT_PERSISTENCE_OPT_OUT`]
     /// when `sandbox.allow_copilot_host_persistence` is on (#906). This is what
     /// both backends call.
+    /// The grants [`Agent::host_persistence_denies`] are joined onto: every
+    /// top-level dir, meaning one not nested inside another of the agent's
+    /// grants.
+    pub fn host_persistence_roots<'a>(
+        &self,
+        dirs: &'a [AgentDir],
+    ) -> impl Iterator<Item = &'a AgentDir> {
+        dirs.iter().filter(move |d| {
+            !dirs
+                .iter()
+                .any(|other| other.path != d.path && d.path.starts_with(&other.path))
+        })
+    }
+
     pub fn host_persistence_paths_with(
         &self,
         dirs: &[AgentDir],
@@ -1952,12 +1966,7 @@ impl Agent {
         } else {
             &[]
         };
-        dirs.iter()
-            .filter(|d| {
-                !dirs
-                    .iter()
-                    .any(|other| other.path != d.path && d.path.starts_with(&other.path))
-            })
+        self.host_persistence_roots(dirs)
             .flat_map(|d| {
                 self.host_persistence_denies()
                     .iter()
@@ -3199,7 +3208,7 @@ pub const COPILOT_PERSISTENCE_OPT_OUT: &[&str] = &["agents", "permissions-config
 pub fn copilot_trusted_folders(home: &Path) -> Vec<String> {
     std::fs::read_to_string(home.join(".copilot/config.json"))
         .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&strip_jsonc(&s)).ok())
         .and_then(|v| {
             v.get("trustedFolders")?.as_array().map(|a| {
                 a.iter()
@@ -4625,7 +4634,9 @@ mod tests {
         std::fs::create_dir(tmp.path().join(".copilot")).unwrap();
         std::fs::write(
             tmp.path().join(".copilot/config.json"),
-            r#"{"firstLaunchAt":"x","trustedFolders":["/a","/b"]}"#,
+            // The header Copilot CLI 1.0.104 writes.
+            "// User settings belong in settings.json.\n// This file is managed \
+             automatically.\n{\"firstLaunchAt\":\"x\",\"trustedFolders\":[\"/a\",\"/b\"]}\n",
         )
         .unwrap();
         assert_eq!(copilot_trusted_folders(tmp.path()), ["/a", "/b"]);

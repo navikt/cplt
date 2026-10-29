@@ -3643,6 +3643,7 @@ int main(int argc, char **argv) {
             perms.display()
         );
         let (rename_output, _) = run_sandboxed(&profile, &rename);
+        let tmp_written = tmp.exists();
         let (kept_output, kept_success) = run_sandboxed(&kept_profile, &author);
 
         fs::remove_file(&profile).ok();
@@ -3660,12 +3661,54 @@ int main(int argc, char **argv) {
             "a custom agent's mcp-servers command runs on the host: {agent_output}"
         );
         assert!(
+            tmp_written,
+            "the probe must get as far as the rename: {rename_output}"
+        );
+        assert!(
             !rename_output.contains("EXIT:0") && !perms.exists(),
             "a rename must not create saved approvals: {rename_output}"
         );
         assert!(
             kept_success && kept_output.contains("EXIT:0"),
             "the opt-in keeps agents/ writable: {kept_output}"
+        );
+    }
+
+    /// #923: `mv ~/.copilot <project>/.x && ln -s <project>/.x ~/.copilot`
+    /// used to move every Copilot deny out from under its path. The config
+    /// dir is pinned, so the move fails and the deny still holds.
+    #[test]
+    fn real_profile_pins_the_copilot_dir_against_move_and_symlink() {
+        require_sandbox!();
+        let temp_home = tempfile::tempdir().unwrap();
+        let home = fs::canonicalize(temp_home.path()).unwrap();
+        let project = home.join("proj");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(home.join(".copilot/hooks")).unwrap();
+
+        let agent_dirs = cplt::agent::Agent::Copilot.config_dirs(&home);
+        let mut opts = default_opts(&project, &home);
+        opts.agent_dirs = &agent_dirs;
+        let profile = write_real_profile(&opts);
+
+        let copilot = home.join(".copilot");
+        let moved = project.join(".x");
+        let attack = format!(
+            "mv '{c}' '{m}' 2>&1; echo MV:$?; ln -s '{m}' '{c}' 2>&1; \
+             echo '{{}}' > '{c}/hooks/evil.json' 2>&1; echo EXIT:$?",
+            c = copilot.display(),
+            m = moved.display()
+        );
+        let (output, _) = run_sandboxed(&profile, &attack);
+        fs::remove_file(&profile).ok();
+
+        assert!(
+            !output.contains("MV:0") && !moved.exists(),
+            "~/.copilot must not be movable from inside the sandbox: {output}"
+        );
+        assert!(
+            !copilot.join("hooks/evil.json").exists(),
+            "a hook must not be plantable after the move: {output}"
         );
     }
 
