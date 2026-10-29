@@ -390,6 +390,38 @@ pub fn bubblewrap_state(
     }
 }
 
+/// The configured deny paths the launch's wrapper would leave unmasked
+/// (#386), probed with the same scratch dir [`bubblewrap_state`] makes, so a
+/// missing mask placeholder counts as it would on launch.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn unmasked_deny_paths(
+    scratch: bool,
+    config: &crate::sandbox::SandboxConfig,
+    grants: &[(PathBuf, PathBuf)],
+) -> Vec<PathBuf> {
+    let probe_scratch =
+        (scratch && config.scratch_dir.is_none()).then(|| ProbeScratch::create(config.home_dir));
+    let probed = crate::sandbox::SandboxConfig {
+        scratch_dir: config
+            .scratch_dir
+            .or_else(|| probe_scratch.as_ref().and_then(ProbeScratch::path)),
+        ..config.clone()
+    };
+    crate::sandbox::bubblewrap_probe::unmasked_user_denies(&probed, grants)
+}
+
+/// Not Linux: nothing is masked, so nothing is reported.
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub fn unmasked_deny_paths(
+    _scratch: bool,
+    _config: &crate::sandbox::SandboxConfig,
+    _grants: &[(PathBuf, PathBuf)],
+) -> Vec<PathBuf> {
+    Vec::new()
+}
+
 /// A session scratch dir for one probe. Dropping it removes the dir and then
 /// every ancestor `ScratchDir::create` had to make, so doctor leaves nothing
 /// behind on a host that never launched.
@@ -1177,16 +1209,16 @@ pub fn proxy_forced_nudge(r: &crate::config::Resolved, can_force: bool) -> Optio
 /// that bubblewrap is not there to enforce, or one it cannot mask. Silent
 /// once the key is set either way. Never changes anything.
 #[must_use]
-pub fn refuse_unenforced_nudge(r: &crate::config::Resolved, bwrap: &Bubblewrap) -> Option<Finding> {
+pub fn refuse_unenforced_nudge(
+    r: &crate::config::Resolved,
+    bwrap: &Bubblewrap,
+    unmasked: &[PathBuf],
+) -> Option<Finding> {
     let unset =
         r.bool_layer("sandbox", "refuse_unenforced") == Some(crate::config::ConfigLayer::Baseline);
     let applies = match bwrap {
         Bubblewrap::NotApplicable => false,
-        Bubblewrap::Usable(_) => r.deny_paths.iter().any(|p| {
-            ["/proc", "/dev", "/sys", "/tmp"]
-                .iter()
-                .any(|root| p.starts_with(root))
-        }),
+        Bubblewrap::Usable(_) => !unmasked.is_empty(),
         _ => true,
     };
     (unset && applies && !r.deny_paths.is_empty()).then(|| {
@@ -1250,23 +1282,24 @@ mod tests {
         let deny = "[deny]\npaths = [\"/dev\"]\n";
         let old = r(deny);
         assert!(!old.refuse_unenforced);
-        assert!(refuse_unenforced_nudge(&old, &Bubblewrap::NotInstalled).is_some());
+        assert!(refuse_unenforced_nudge(&old, &Bubblewrap::NotInstalled, &[]).is_some());
+        let dev = [PathBuf::from("/dev")];
         assert!(
-            refuse_unenforced_nudge(&old, &usable).is_some(),
-            "/dev cannot be masked"
+            refuse_unenforced_nudge(&old, &usable, &dev).is_some(),
+            "the probe left /dev unmasked"
         );
-        assert!(refuse_unenforced_nudge(&old, &Bubblewrap::NotApplicable).is_none());
+        assert!(refuse_unenforced_nudge(&old, &Bubblewrap::NotApplicable, &[]).is_none());
         let maskable = r(concat!(
             "[deny]\npaths = [\"",
             env!("CARGO_MANIFEST_DIR"),
             "\"]\n"
         ));
-        assert!(refuse_unenforced_nudge(&maskable, &usable).is_none());
-        assert!(refuse_unenforced_nudge(&r(""), &Bubblewrap::NotInstalled).is_none());
+        assert!(refuse_unenforced_nudge(&maskable, &usable, &[]).is_none());
+        assert!(refuse_unenforced_nudge(&r(""), &Bubblewrap::NotInstalled, &[]).is_none());
         let set = |v: bool| r(&format!("[sandbox]\nrefuse_unenforced = {v}\n{deny}"));
         assert!(set(true).refuse_unenforced);
-        assert!(refuse_unenforced_nudge(&set(true), &Bubblewrap::Disabled).is_none());
-        assert!(refuse_unenforced_nudge(&set(false), &Bubblewrap::Disabled).is_none());
+        assert!(refuse_unenforced_nudge(&set(true), &Bubblewrap::Disabled, &[]).is_none());
+        assert!(refuse_unenforced_nudge(&set(false), &Bubblewrap::Disabled, &[]).is_none());
     }
 
     #[test]

@@ -81,6 +81,34 @@ pub(crate) mod bubblewrap_probe {
         )
         .map(|_| ())
     }
+
+    /// The configured deny paths that exist but get no mask in the wrapper
+    /// `prepare` would build for `config` (#386): the exact set a launch with
+    /// `sandbox.refuse_unenforced` refuses on, placeholder failures included.
+    pub(crate) fn unmasked_user_denies(
+        config: &super::SandboxConfig,
+        grants: &[(std::path::PathBuf, std::path::PathBuf)],
+    ) -> Vec<std::path::PathBuf> {
+        let plan = super::bwrap_plan(
+            config,
+            &super::launch_git_dirs(config),
+            grants,
+            &std::cell::OnceCell::new(),
+        );
+        config
+            .extra_deny
+            .iter()
+            .filter(|d| !super::deny_path_absent(d))
+            .filter(|d| {
+                let canon = d.canonicalize().unwrap_or_else(|_| (*d).clone());
+                plan.deny_masks
+                    .skipped()
+                    .iter()
+                    .any(|p| *p == canon || p == *d)
+            })
+            .cloned()
+            .collect()
+    }
 }
 #[path = "sandbox_exec.rs"]
 mod exec;
@@ -263,6 +291,10 @@ pub struct SandboxConfig<'a> {
     /// `sandbox.refuse_unenforced` (#386): refuse a launch whose configured
     /// deny paths this host cannot enforce, instead of warning. Linux only.
     pub refuse_unenforced: bool,
+    /// The proxy is configured on (`proxy.enabled`, forced or observe mode),
+    /// whether or not this run started it. Inspection never starts it, so
+    /// the #386 network check reads this there instead of `proxy_port`.
+    pub proxy_enabled: bool,
     /// `sandbox.deny_key_files_by_extension`: deny key files by extension
     /// ([`SENSITIVE_KEY_FILE_EXTENSION_PATTERNS`]), not only files named exactly `.pem`.
     /// macOS only; Linux has no name-pattern denies.
@@ -3551,6 +3583,24 @@ pub(crate) fn proc_self_limit_text(advice: ProcAdvice) -> String {
     )
 }
 
+/// Whether this run sends egress through the proxy (#386). A launch knows
+/// the port it started; inspection never starts the proxy, so it goes by the
+/// configured intent and `--print-profile` refuses exactly when a launch does.
+/// Not the net rules: `extra_ports` and `localhost_ports` add non-443 rules too.
+#[cfg(target_os = "linux")]
+fn proxy_routes_egress(config: &SandboxConfig, inspect_only: bool) -> bool {
+    config.proxy_port.is_some() || (inspect_only && config.proxy_enabled)
+}
+
+/// A deny path that is certainly not there, so it denies nothing (#386).
+/// Only `NotFound` counts: any other error (EACCES on a mode-000 parent,
+/// say) may hide a real path the agent could later reach.
+#[cfg(target_os = "linux")]
+fn deny_path_absent(path: &Path) -> bool {
+    path.symlink_metadata()
+        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+}
+
 /// The #386 check: the configured deny paths this launch cannot enforce,
 /// each with its reason, as the refusal text. `None` when all are enforced.
 /// A path that does not exist denies nothing, so it never refuses; only a
@@ -3564,7 +3614,7 @@ fn unenforced_refusal(
     let mut lines = Vec::new();
     for deny in config.extra_deny {
         let shown = strip_control(&deny.display().to_string());
-        if deny.symlink_metadata().is_err() {
+        if deny_path_absent(deny) {
             crate::ui::warn(&format!(
                 "deny path {shown} (from .cplt.toml) does not exist, so it denies nothing."
             ));
@@ -3967,17 +4017,24 @@ fn prepare_impl(
     // #386: a configured deny the backend cannot honour refuses the launch
     // when `sandbox.refuse_unenforced` is on (new configs); unset keeps the
     // warnings below. Built-in controls are not counted here.
-    if config.refuse_unenforced
-        && let Some(refusal) = unenforced_refusal(config, bwrap_wrapper.is_some(), &deny_masks)
-    {
-        return Err(refusal);
+    if config.refuse_unenforced {
+        if let Some(refusal) = unenforced_refusal(config, bwrap_wrapper.is_some(), &deny_masks) {
+            return Err(refusal);
+        }
+        // Strict, so a spawn-time bwrap failure stops the run instead of
+        // falling back to Landlock and dropping the masks it just vouched for.
+        if let Some(w) = bwrap_wrapper.as_mut()
+            && config.extra_deny.iter().any(|d| !deny_path_absent(d))
+        {
+            w.strict = true;
+        }
     }
     // #386: Landlock below ABI v4 cannot filter TCP, so without the proxy the
     // configured port/domain restriction would be dropped (the "UNRESTRICTED"
     // warning in `sandbox_landlock`).
     if config.refuse_unenforced
         && policy.restrict_net_connect
-        && !policy.net_rules.iter().any(|r| r.port != 443)
+        && !proxy_routes_egress(config, inspect_only)
         && landlock_mod::check_availability().is_ok_and(|abi| abi < landlock::ABI::V4)
     {
         return Err(
@@ -4529,6 +4586,7 @@ mod tests {
             deny_nested_git: false,
             refuse_cache_exec_links: false,
             refuse_unenforced: false,
+            proxy_enabled: false,
             deny_key_files_by_extension: false,
             protect_pnpm_config: false,
             deny_copilot_dir_exec: false,
@@ -5135,6 +5193,55 @@ mod tests {
                 r.err()
             );
         }
+    }
+
+    /// #386: only `NotFound` exempts a deny path. EACCES (a mode-000 parent)
+    /// may hide a real path, so it still counts as one to enforce.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_not_found_exempts_a_deny_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        assert!(deny_path_absent(&dir.path().join("not-there")));
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("secret"), "x").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let hidden = locked.join("secret");
+        let readable = hidden.symlink_metadata().is_ok();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if !readable {
+            assert!(!deny_path_absent(&hidden), "EACCES must not exempt");
+        }
+    }
+
+    /// #386: the ABI v1-v3 network check goes by the proxy, not by non-443
+    /// net rules (`extra_ports` / `localhost_ports` add those), and
+    /// inspection goes by the configured intent since it never starts it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proxy_routes_egress_ignores_port_rules_and_inspects_intent() {
+        let home = PathBuf::from("/home/u");
+        let ports = [8443];
+        let mut config = test_config(&home, &[]);
+        config.extra_ports = &ports;
+        config.localhost_ports = &[3000];
+        assert!(
+            !proxy_routes_egress(&config, false),
+            "port rules are no proxy"
+        );
+        assert!(!proxy_routes_egress(&config, true));
+        config.proxy_enabled = true;
+        assert!(
+            proxy_routes_egress(&config, true),
+            "inspect: configured intent"
+        );
+        assert!(
+            !proxy_routes_egress(&config, false),
+            "a launch counts the proxy it started"
+        );
+        config.proxy_port = Some(8080);
+        assert!(proxy_routes_egress(&config, false));
     }
 
     /// The reproduced attack: a planted `~/.cache/ms-playwright` aimed at a
