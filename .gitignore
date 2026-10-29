@@ -13,3 +13,4 @@
 .claude/
 tc/
 target-clean/
+/.tmp*/
