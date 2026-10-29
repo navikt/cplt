@@ -364,18 +364,12 @@ pub fn pnpm_cmd_shim_target(home_dir: &Path, pnpm: &Path) -> Option<PathBuf> {
 }
 
 fn pnpm_cmd_shim_target_in(pnpm: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
-    use std::io::Read;
-
-    let mut script = Vec::new();
-    std::fs::File::open(pnpm)
-        .ok()?
-        .take(4096)
-        .read_to_end(&mut script)
-        .ok()?;
-    if !script.starts_with(b"#!/bin/sh") {
+    // The agent can swap a FIFO in for the shim; this read is unsandboxed.
+    let script = crate::untrusted::read_regular_following(pnpm, 4096).ok()??;
+    if !script.starts_with("#!/bin/sh") {
         return None;
     }
-    let target = String::from_utf8_lossy(&script)
+    let target = script
         .lines()
         .find_map(|line| line.strip_prefix("# cmd-shim-target="))
         .map(PathBuf::from)?;
@@ -1808,7 +1802,23 @@ mod tests {
     }
 
     #[test]
+    fn pnpm_cmd_shim_fifo_is_refused_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pnpm");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c` is NUL-terminated.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(pnpm_cmd_shim_target_in(&fifo, &[dir.path().to_path_buf()]).is_none());
+    }
+
+    #[test]
     fn pnpm_js_package_launcher_needs_no_shadow() {
+        for script in ["pnpm.mjs", "pnpm.cjs"] {
+            js_package_launcher_needs_no_shadow(script);
+        }
+    }
+
+    fn js_package_launcher_needs_no_shadow(script: &str) {
         // Layout written by `pnpm add --global pnpm@11` (the JS package).
         let home = tempfile::tempdir().unwrap();
         let pnpm_home = home.path().join("Library/pnpm");
@@ -1816,7 +1826,7 @@ mod tests {
         let bin = pnpm_home.join("bin");
         std::fs::create_dir_all(package.join("bin")).unwrap();
         std::fs::create_dir_all(&bin).unwrap();
-        let target = package.join("bin/pnpm.mjs");
+        let target = package.join("bin").join(script);
         std::fs::write(&target, b"#!/usr/bin/env node\nimport '../dist/pnpm.mjs'\n").unwrap();
         let launcher = bin.join("pnpm");
         std::fs::write(
