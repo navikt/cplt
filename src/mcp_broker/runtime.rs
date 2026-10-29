@@ -206,6 +206,11 @@ impl Broker {
         }
         // The host end of the Linux child's egress hop: each connection on
         // the unix socket goes on to the TCP proxy above, which decides.
+        // It takes a permit here and another at the TCP proxy, so a Linux
+        // child's tunnel counts twice against MAX_CONNECTIONS: at most 16
+        // of them at once. Deliberate: the hop's own thread needs a bound
+        // before it connects, and sharing one permit across the two
+        // listeners would need a handshake between them.
         for (l, port) in egress_unix {
             let s = Arc::clone(&shared);
             std::thread::spawn(move || {
