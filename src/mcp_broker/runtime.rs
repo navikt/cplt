@@ -595,6 +595,7 @@ fn linux_child_command(
         std::io::Error::other("bwrap not found; the MCP server child does not run unsandboxed")
     })?;
     let cplt = std::env::current_exe()?;
+    let disable_userns = disables_userns(&bwrap);
     let config_home = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
@@ -678,6 +679,7 @@ fn linux_child_command(
         write_dirs: &write_dirs,
         read_paths: &read_paths,
         relay_exe: Some(&cplt),
+        disable_userns,
         runtime_dir: runtime.as_deref(),
         current_system: current_system.as_deref(),
         nix_sockets: &nix_sockets,
@@ -804,6 +806,42 @@ struct ChildMounts<'a> {
     egress_socket: Option<&'a Path>,
     /// This binary, bound in at [`CHILD_RELAY_EXE`]: it may live in `HOME`.
     relay_exe: Option<&'a Path>,
+    /// bwrap 0.8+: `--disable-userns`, no nested user namespaces.
+    disable_userns: bool,
+}
+
+/// Whether this host's bwrap has `--disable-userns` (0.8+), from
+/// `bwrap --version`; `None` without a trusted bwrap. Ubuntu 22.04 ships
+/// 0.6: there the child runs without it, and `cplt doctor` warns.
+pub fn bwrap_disables_userns() -> Option<bool> {
+    #[cfg(target_os = "linux")]
+    let bwrap = crate::sandbox::bubblewrap_probe::check_availability();
+    #[cfg(not(target_os = "linux"))]
+    let bwrap: Option<PathBuf> = None;
+    bwrap.map(|b| disables_userns(&b))
+}
+
+#[allow(clippy::disallowed_methods)] // bwrap from the trusted dirs
+fn disables_userns(bwrap: &Path) -> bool {
+    static ANSWER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ANSWER.get_or_init(|| {
+        Command::new(bwrap)
+            .arg("--version")
+            .env_clear()
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .is_some_and(|o| version_has_disable_userns(&String::from_utf8_lossy(&o.stdout)))
+    })
+}
+
+/// `bubblewrap 0.9.0` and later than 0.8: true.
+fn version_has_disable_userns(out: &str) -> bool {
+    let v = out.trim().rsplit(' ').next().unwrap_or("");
+    let mut n = v.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
+    let (major, minor) = (n.next().unwrap_or(0), n.next().unwrap_or(0));
+    (major, minor) >= (0, 8)
 }
 
 /// Where the relay (this binary) appears inside the Linux child.
@@ -825,6 +863,7 @@ fn child_bwrap_args(m: &ChildMounts) -> Vec<std::ffi::OsString> {
         bus,
         egress_socket,
         relay_exe,
+        disable_userns,
     } = *m;
     let mut a: Vec<std::ffi::OsString> = [
         "--unshare-user",
@@ -850,6 +889,9 @@ fn child_bwrap_args(m: &ChildMounts) -> Vec<std::ffi::OsString> {
     .into_iter()
     .map(Into::into)
     .collect();
+    if disable_userns {
+        a.push("--disable-userns".into());
+    }
     // NixOS: the system profile (and the trusted /run/current-system/sw/bin)
     // is a link into the read-only store; keep it under the private /run.
     if let Some(target) = current_system {
@@ -1245,6 +1287,31 @@ mod tests {
                 .iter()
                 .any(|a| a == "--bind" || a == CHILD_EGRESS_SOCKET || a == CHILD_BUS_SOCKET)
         );
+    }
+
+    #[test]
+    fn disable_userns_from_bwrap_0_8() {
+        for (out, want) in [
+            ("bubblewrap 0.6.1\n", false),
+            ("bubblewrap 0.8.0\n", true),
+            ("bubblewrap 0.11.0", true),
+            ("bubblewrap 1.0", true),
+            ("", false),
+        ] {
+            assert_eq!(version_has_disable_userns(out), want, "{out:?}");
+        }
+        let on = strings(child_bwrap_args(&ChildMounts {
+            disable_userns: true,
+            ..ChildMounts::default()
+        }));
+        let at = |a: &[String], f: &str| a.iter().position(|x| x == f);
+        // After --unshare-user, which it needs.
+        assert!(
+            at(&on, "--disable-userns") > at(&on, "--unshare-user"),
+            "{on:?}"
+        );
+        let off = strings(child_bwrap_args(&ChildMounts::default()));
+        assert!(at(&off, "--disable-userns").is_none());
     }
 
     /// NixOS: the daemon's socket dirs get a tmpfs each, so the child

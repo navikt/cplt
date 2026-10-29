@@ -9312,16 +9312,23 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     }
     // Brokered servers with a keychain login reach the bus only through
     // xdg-dbus-proxy on Linux (#849).
-    let keychain_servers: Vec<String> = if cfg!(target_os = "linux") {
-        cplt::mcp_broker::load(&cplt::mcp_broker::spec_dir(&home_dir), &[], &[])
-            .specs
-            .into_iter()
-            .filter(|s| s.credential.keychain)
-            .map(|s| s.id)
-            .collect()
+    let broker_specs = if cfg!(target_os = "linux") {
+        cplt::mcp_broker::load(&cplt::mcp_broker::spec_dir(&home_dir), &[], &[]).specs
     } else {
         Vec::new()
     };
+    let keychain_servers: Vec<String> = broker_specs
+        .iter()
+        .filter(|s| s.credential.keychain)
+        .map(|s| s.id.clone())
+        .collect();
+    let broker_servers: Vec<String> = broker_specs.iter().map(|s| s.id.clone()).collect();
+    if !broker_servers.is_empty() {
+        findings.extend(doctor::disable_userns_finding(
+            &broker_servers,
+            cplt::mcp_broker::bwrap_disables_userns(),
+        ));
+    }
     let dbus_proxy_found = doctor::dbus_proxy_installed;
     findings.extend(doctor::dbus_proxy_finding(
         &keychain_servers,

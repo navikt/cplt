@@ -486,6 +486,24 @@ pub fn dbus_proxy_finding(servers: &[String], found: bool) -> Option<Finding> {
     })
 }
 
+/// bwrap before 0.8 has no `--disable-userns`, so a brokered MCP server
+/// child on Linux may create nested user namespaces (#849): more kernel
+/// surface, no host privilege. The child still starts. `servers`: the
+/// brokered spec ids; `supported`: [`crate::mcp_broker::bwrap_disables_userns`].
+#[must_use]
+pub fn disable_userns_finding(servers: &[String], supported: Option<bool>) -> Option<Finding> {
+    (!servers.is_empty() && supported == Some(false)).then(|| {
+        Finding::warning(
+            format!(
+                "bubblewrap is older than 0.8: the brokered MCP server(s) {} run without \
+                 --disable-userns, so they can create nested user namespaces.",
+                servers.join(", ")
+            ),
+            Some("upgrade bubblewrap to 0.8 or later".to_string()),
+        )
+    })
+}
+
 /// Auto-detect (`use_bubblewrap` unset) found no usable bubblewrap, so the
 /// launch runs Landlock + seccomp only and says so in one line nobody reads.
 /// `use_bubblewrap = true` has its own blocking finding; `false` was a choice.
@@ -1474,6 +1492,10 @@ mod tests {
 
     #[test]
     fn bubblewrap_finding_only_on_auto_detect_without_a_usable_bwrap() {
+        assert!(disable_userns_finding(&["nais".into()], Some(true)).is_none());
+        assert!(disable_userns_finding(&["nais".into()], None).is_none());
+        assert!(disable_userns_finding(&[], Some(false)).is_none());
+        assert!(disable_userns_finding(&["nais".into()], Some(false)).is_some());
         assert!(dbus_proxy_finding(&[], false).is_none());
         assert!(dbus_proxy_finding(&["nais".into()], true).is_none());
         let f = dbus_proxy_finding(&["nais".into()], false).expect("missing proxy warns");
