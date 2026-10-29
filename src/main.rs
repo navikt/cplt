@@ -7362,6 +7362,7 @@ fn build_sandbox_config<'a>(
         allow_browser: resolved.allow_browser,
         keychain_substitute,
         use_bubblewrap: resolved.use_bubblewrap,
+        allow_git_config_write: resolved.allow_git_config_write,
     }
 }
 
@@ -9231,6 +9232,11 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
         &sandbox_config,
         &launch_grants,
     );
+    #[cfg(target_os = "linux")]
+    findings.extend(doctor::git_config_write_nudge(
+        &resolved,
+        matches!(bubblewrap, doctor::Bubblewrap::Usable(_)),
+    ));
     #[cfg(target_os = "macos")]
     {
         if Path::new("/usr/bin/sandbox-exec").exists() {
@@ -13559,6 +13565,7 @@ mod tests {
             allow_browser: false,
             keychain_substitute: None,
             use_bubblewrap: None,
+            allow_git_config_write: true,
         };
         let denies = sandbox::ReadDenies::from_config(&base_cfg);
 

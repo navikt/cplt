@@ -17,10 +17,11 @@ in PATH. Check the selected path with `cplt doctor --verbose`, then launch
 
 ## Branch tracking is silently dropped
 
-**macOS only.** `.git/config` is write-denied there (it is a `core.hooksPath`
-and `url.*.insteadOf` vector). Landlock cannot deny a file inside a writable
-directory, so on Linux the file stays writable and branch tracking is recorded
-normally — the whole of this section applies to macOS sessions.
+`.git/config` is write-denied on macOS (it is a `core.hooksPath` and
+`url.*.insteadOf` vector), and on Linux when `sandbox.allow_git_config_write =
+false`, which new configs set. On Linux the error reads `Device or resource
+busy` instead of `Operation not permitted`. A Linux config without the key
+keeps the file writable, and branch tracking is recorded normally there.
 
 The commands that record branch tracking write to that file, and git treats the
 failure as non-fatal: it prints the error, prints a success line that is
@@ -96,7 +97,10 @@ gh pr create -R <owner>/<repo> --head my-branch
 ```
 
 On macOS this applies to every writable root, the launch repository included,
-not only to repositories named with `--repo-dir`. Tracked in
+not only to repositories named with `--repo-dir`. On Linux it applies with
+`sandbox.allow_git_config_write = false`, to the same roots, but a nested
+repository is covered only if the bounded scan finds it (three levels down,
+20 000 directories in total). Tracked in
 [#402](https://github.com/navikt/cplt/issues/402), which also covers whether
 the guard should intercept these forms and fail loudly instead.
 
@@ -1021,12 +1025,15 @@ Some git operations are blocked to prevent persistence attacks that would surviv
 | `git checkout/merge/rebase/branch` | ✅ Works     | Branch operations work normally                                   |
 | `git fetch/pull/push` (HTTPS)      | ✅ Works, except a default-branch push | Port 443 allowed, `gh auth git-credential` provides credentials. The git guard refuses pushes to `main`/`master` and every force push, see [Git workflow](#git-workflow-commit--push) |
 | `git fetch/pull/push` (SSH)        | ❌ No key on macOS | SSH agent socket and `~/.ssh` denied, so authentication fails; use HTTPS. The network path is open on 443 (`ssh.github.com:443`), see [SSH over port 443](#ssh-over-port-443). On Linux only `SSH_AUTH_SOCK` is withheld |
-| `git config` (local)               | ❌ Blocked on macOS | `.git/config` is write-protected on macOS, which prevents `url.*.insteadOf` hijacking. Applies to the project, to every named repository (`--repo-dir`), to every `allow.write` grant, and to any repository nested under one. Landlock cannot deny a file inside a writable root, so it stays writable on Linux |
+| `git config` (local)               | ❌ Blocked on macOS | `.git/config` is write-protected on macOS, which prevents `url.*.insteadOf` hijacking. Applies to the project, to every named repository (`--repo-dir`), to every `allow.write` grant, and to any repository nested under one. Blocked on Linux too with `sandbox.allow_git_config_write = false` (new configs, needs Bubblewrap) |
 | `git config --global`              | ❌ Blocked   | Git config and `~/.gitignore_global` are read-only                 |
-| `git remote set-url`               | ❌ Blocked on macOS | Writes to `.git/config`, which stays writable on Linux |
+| `git remote set-url`               | ❌ Blocked on macOS | Writes to `.git/config`; on Linux blocked only with `sandbox.allow_git_config_write = false` |
 | `git submodule add`                | ❌ Blocked on macOS | `.gitmodules` is write-protected on macOS. Writable on Linux, same Landlock limit (supply chain vector) |
 | Creating git hooks                 | ❌ Blocked   | `.git/hooks/` is write-protected in the project, in every named repository (`--repo-dir`), in every `allow.write` grant, and in any repository nested under one, hooks run unsandboxed. On Linux this needs the Bubblewrap layer, and nested repositories are found by a bounded scan: three levels down, 20 000 directories in total, symlinks not followed. A repository deeper than that, past the cap, bare, or a nested worktree/submodule stays writable there. See [security.md](security.md) |
-| `git init` / `git clone`           | ❌ Blocked on macOS | Both write `.git/config` and `.git/hooks/`, which are protected anywhere under a writable root. Clone outside the sandbox, then point cplt at the result. Writable on Linux, same Landlock limit |
+| `git init` / `git clone`           | ❌ Blocked on macOS | Both write `.git/config` and `.git/hooks/`, which are protected anywhere under a writable root. Clone outside the sandbox, then point cplt at the result. They work on Linux, also with `sandbox.allow_git_config_write = false`: a bind covers only a `.git/config` that exists at launch, so a repository created in the session stays writable |
+| `git submodule update --init`      | ❌ Blocked on macOS | Records each submodule's URL in `.git/config`. On Linux blocked with `sandbox.allow_git_config_write = false` |
+| `git sparse-checkout init/set`     | ❌ Blocked on macOS | Writes `core.sparseCheckout` (and `config.worktree`) into the git config. On Linux blocked with `sandbox.allow_git_config_write = false` |
+| `gh pr checkout` (fork PR)         | ❌ Blocked on macOS | Adds a remote and branch tracking for the fork to `.git/config`. A PR from the same repository works. On Linux blocked with `sandbox.allow_git_config_write = false`. Check out fork PRs outside the sandbox |
 | `mv` / `rm -rf` of `.git`, `.github`, `.agents`, `.claude`, `.opencode`, `.pi` | ❌ Blocked   | A path deny only holds while the path still denotes what it protects. Moving one of these directories aside, writing `hooks/`, `plugins/` or `settings.json` under the new name and moving it back planted a file that runs on the host, unsandboxed, in a later session (GHSA-39xf-9j26-f82m). The directories themselves stay writable — only renaming and removing the directory is refused. macOS uses `file-write-unlink`; on Linux this needs the Bubblewrap layer, which makes each a mountpoint so `rename`/`rmdir` return `EBUSY` |
 | `mv` / `rm -rf` of `~/Library/Caches/copilot`, `~/.cache/opencode` | ❌ Blocked   | Same shape, one tree over: both hold binaries the host executes later (`copilot/pkg`, `opencode/bin`), and both sit in a writable cache, so a rename would let an agent swap the contents out from under the write-deny that protects them (GHSA-8qmv-wxp3-526v, GHSA-7mcc-xg5v-hv8v). The caches stay fully writable — managed binaries still download, extract and update — only the directory name is pinned. macOS uses `file-write-unlink`; on Linux this needs the Bubblewrap layer, which makes each a mountpoint so `rename`/`rmdir` return `EBUSY` |
 | macOS: `mv` / `rm -rf` of a directory above a symlinked credential or git config target, e.g. `ssh/` and `git/` in a stow dotfiles repo (`~/.ssh -> ~/dotfiles/ssh/.ssh`) opened as the project | ❌ Blocked   | The credential and git config denies are emitted at the link target, and a deny there holds only while the directories above it keep their names: `mv ssh ssh2` would move the key out from under it. Every directory between the outermost writable tree and the target is pinned with `file-write-unlink`; it stays writable. The writable tree root itself is not pinned |

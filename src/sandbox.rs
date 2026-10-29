@@ -308,6 +308,10 @@ pub struct SandboxConfig<'a> {
     /// - `Some(false)`: Never use bwrap (Landlock+seccomp only)
     /// - `None`: Auto-detect and use if available (graceful degradation)
     pub use_bubblewrap: Option<bool>,
+    /// `sandbox.allow_git_config_write` (#386). Linux only: `false` binds
+    /// every `<gitdir>/config` read-only and refuses to launch without
+    /// bubblewrap. macOS denies the write either way.
+    pub allow_git_config_write: bool,
 }
 
 /// A validated, platform-specific sandbox ready for execution.
@@ -3008,6 +3012,16 @@ fn pin_paths(
     // walk-aroundable by `mv .git g2 && mkdir .git`.
     write_roots.extend(nested_repos.iter().map(PathBuf::as_path));
     let mut pins = bubblewrap::rename_pin_paths(&write_roots, &git_dirs);
+    // #386: the ancestors of the `config.worktree` binds in `ro_protect_paths`.
+    if !config.allow_git_config_write {
+        for dir in &git_dirs {
+            let linked = linked_worktree_dirs(dir);
+            if !linked.is_empty() {
+                pins.push(dir.join("worktrees"));
+            }
+            pins.extend(linked);
+        }
+    }
     // GHSA-8qmv-wxp3-526v, Linux half. A read-only bind pins a path's content,
     // not its name: `~/.cache/copilot` sits inside the writable `~/.cache`
     // grant, so moving it aside left `pkg` writable under a name no bind
@@ -3070,6 +3084,26 @@ fn pin_paths(
     pins
 }
 
+/// The refusal when `.git/config` must be read-only but bubblewrap does not
+/// wrap the run (#386).
+#[cfg(target_os = "linux")]
+const GIT_CONFIG_NEEDS_BWRAP: &str = "sandbox.allow_git_config_write = false needs \
+     Bubblewrap to make .git/config read-only, and Bubblewrap is not in use. Run \
+     `cplt doctor` to see why, or run `cplt config set sandbox.allow_git_config_write \
+     true` to let the agent write .git/config.";
+
+/// `<gitdir>/worktrees/<name>` for each linked worktree (#386). Its
+/// `config.worktree` is bound read-only, and both it and `worktrees/` are
+/// rename-pinned so `mv .git/worktrees/wt …` cannot walk around the bind.
+/// Kept here rather than as a `PROTECTED_IN_GITDIR` row because it applies
+/// only with `sandbox.allow_git_config_write = false`; macOS already denies it.
+#[cfg(target_os = "linux")]
+fn linked_worktree_dirs(git_dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(git_dir.join("worktrees"))
+        .map(|it| it.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default()
+}
+
 #[cfg(target_os = "linux")]
 fn ro_protect_paths(
     config: &SandboxConfig,
@@ -3090,6 +3124,36 @@ fn ro_protect_paths(
     // with an any-depth regex, and bubblewrap needs the paths named.
     write_roots.extend(nested_repos.iter().map(PathBuf::as_path));
     let mut ro_protect = bubblewrap::git_persistence_paths(&write_roots, &git_dirs);
+    // #386: `.git/config` read-only, as on macOS, unless the user opted in.
+    // git writes `config.lock` beside it and renames it over; the rename onto
+    // a bind fails with EBUSY and git removes the lock itself, so no stale
+    // lock is left. Missing paths are skipped like every other entry.
+    //
+    // Also bound: a `.git` gitdir pointer file (a worktree or `--separate-git-dir`
+    // checkout), which would otherwise repoint the repository at a gitdir the
+    // agent wrote, and every `config.worktree`, which git reads with
+    // `extensions.worktreeConfig`. Only files that exist at launch are covered.
+    if !config.allow_git_config_write {
+        for root in &write_roots {
+            let dot_git = root.join(".git");
+            if dot_git.is_file() {
+                ro_protect.push(dot_git.clone());
+            }
+            ro_protect.push(dot_git.join("config"));
+            ro_protect.push(dot_git.join("config.worktree"));
+        }
+        for dir in &git_dirs {
+            ro_protect.push(dir.join("config"));
+            ro_protect.push(dir.join("config.worktree"));
+            ro_protect.extend(
+                linked_worktree_dirs(dir)
+                    .into_iter()
+                    .map(|w| w.join("config.worktree")),
+            );
+        }
+        ro_protect.sort();
+        ro_protect.dedup();
+    }
 
     // #237: same class, different tree — the agent's own config dir is granted
     // writable, and some files in it auto-execute on the host the next time the
@@ -3654,6 +3718,15 @@ fn prepare_impl(
             &policy.fs_rules,
             &mcp_bus_endpoints(),
         )?;
+    }
+
+    // #386: only bubblewrap can make `.git/config` read-only. Strict, so a
+    // spawn-time bwrap failure stops the run instead of falling back.
+    if !config.allow_git_config_write {
+        let Some(w) = bwrap_wrapper.as_mut() else {
+            return Err(GIT_CONFIG_NEEDS_BWRAP.to_string());
+        };
+        w.strict = true;
     }
 
     // #553: a home Git config file a link points at inside a writable tree,
@@ -4381,6 +4454,7 @@ mod tests {
             allow_cache_exec_any: false,
             allow_browser: false,
             use_bubblewrap: None,
+            allow_git_config_write: true,
         }
     }
 

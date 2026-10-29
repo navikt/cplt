@@ -853,6 +853,7 @@ fn landlock_policy_device_files_have_ioctl() {
         allow_cache_exec_any: false,
         allow_browser: false,
         use_bubblewrap: None,
+        allow_git_config_write: true,
         keychain_substitute: None,
     });
 
@@ -2820,6 +2821,7 @@ fn base_profile_options() -> SandboxConfig<'static> {
         allow_browser: false,
         keychain_substitute: None,
         use_bubblewrap: None,
+        allow_git_config_write: true,
     }
 }
 
@@ -4431,6 +4433,7 @@ fn allow_localhost_any_affects_both_backends() {
         allow_cache_exec_any: false,
         allow_browser: false,
         use_bubblewrap: None,
+        allow_git_config_write: true,
         keychain_substitute: None,
     });
     assert!(
@@ -4505,6 +4508,7 @@ fn config_options_parity_across_backends() {
         allow_cache_exec_any: false,
         allow_browser: false,
         use_bubblewrap: None,
+        allow_git_config_write: true,
         keychain_substitute: None,
     };
 
@@ -10210,6 +10214,7 @@ allow_browser = false
 keychain_substitute = false
 allow_build_credentials = false
 allow_git_worktrees = false
+allow_git_config_write = true
 worktree_walk_max_dirs = 100000
 git_push_prevention = false
 
@@ -10699,6 +10704,7 @@ fn landlock_relocated_cargo_bin_is_exec_only_and_registry_is_precreated() {
         allow_cache_exec_any: false,
         allow_browser: false,
         use_bubblewrap: None,
+        allow_git_config_write: true,
         keychain_substitute: None,
     });
     let rule = |p: &str| {
