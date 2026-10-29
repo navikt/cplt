@@ -330,13 +330,15 @@ fn pnpm_shadow_source_in(
 }
 
 /// Open read-only, failing on a symlink in any path component.
+/// `O_NONBLOCK` so a FIFO swapped in by the sandbox opens at once and fails
+/// the caller's regular-file check instead of hanging.
 fn open_no_symlinks(path: &Path) -> std::io::Result<std::fs::File> {
     #[cfg(target_os = "linux")]
     {
         crate::sandbox::openat2_no_symlinks(
             libc::AT_FDCWD,
             path,
-            libc::O_RDONLY | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK,
             0,
         )
         .map(std::fs::File::from)
@@ -346,7 +348,7 @@ fn open_no_symlinks(path: &Path) -> std::io::Result<std::fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
         std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW_ANY)
+            .custom_flags(libc::O_NOFOLLOW_ANY | libc::O_NONBLOCK)
             .open(path)
     }
 }
@@ -1783,6 +1785,19 @@ mod tests {
         assert!(open_no_symlinks(&linked.join("pnpm")).is_err());
         // Resolved outside the store, the target is never shadowed.
         assert!(pnpm_shadow_source_in(&pnpm, &roots).unwrap().is_none());
+    }
+
+    #[test]
+    fn pnpm_shadow_refuses_a_store_fifo_without_blocking() {
+        let home = tempfile::tempdir().unwrap();
+        let store = home.path().join("Library/pnpm/store/v10/links/package");
+        std::fs::create_dir_all(&store).unwrap();
+        let fifo = std::fs::canonicalize(&store).unwrap().join("pnpm");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c` is NUL-terminated.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let roots = [std::fs::canonicalize(home.path().join("Library/pnpm/store")).unwrap()];
+        assert!(pnpm_shadow_source_in(&fifo, &roots).unwrap().is_none());
     }
 
     #[test]
