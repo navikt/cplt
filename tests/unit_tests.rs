@@ -1126,13 +1126,19 @@ fn profile_denies_writes_at_a_symlinked_home_git_config_target() {
             dir.display()
         );
     }
-    for dir in [&project, &named, &other, &root] {
+    // The writable roots themselves are pinned (#923); the dir above them is not.
+    for dir in [&project, &named, &other] {
         assert!(
-            !p.contains(&unlink(dir)),
-            "{} is a writable root or above one and must stay movable:\n{p}",
+            p.contains(&unlink(dir)),
+            "{} is a writable root:\n{p}",
             dir.display()
         );
     }
+    assert!(
+        !p.contains(&unlink(&root)),
+        "{} is above a writable root and must stay movable:\n{p}",
+        root.display()
+    );
 }
 
 /// `~/.config` links into the project and has no `git` directory yet. A deny
