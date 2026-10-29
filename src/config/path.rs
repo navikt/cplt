@@ -233,6 +233,12 @@ inject_github_token = true
 #   allow_tmp_exec = false
 # preset = "standard"
 #
+# Copilot: deny writes to ~/.copilot/agents/ and permissions-config.json, which
+# a later host session loads (#906). Saving a tool approval inside cplt then
+# fails; do it from a host shell. Off for new configs; without this line the
+# default is true (writable).
+allow_copilot_host_persistence = false
+#
 # Run sandbox-exec validation test on every launch (default: true).
 # Disable to save ~200ms startup if you trust your config.
 # validate = true
@@ -764,6 +770,12 @@ mod tests {
         // New configs start with forced proxy on (#822); a missing key stays off.
         assert_eq!(config.proxy.forced, Some(true));
         assert_eq!(Config::default().proxy.forced, None);
+        // #906: new configs deny Copilot's agents/ and saved approvals.
+        assert_eq!(config.sandbox.allow_copilot_host_persistence, Some(false));
+        assert_eq!(
+            Config::default().sandbox.allow_copilot_host_persistence,
+            None
+        );
         // #878: vendor OTLP auth headers stripped for new configs only.
         assert_eq!(config.sandbox.strip_otlp_vendor_auth, Some(true));
         assert_eq!(Config::default().sandbox.strip_otlp_vendor_auth, None);

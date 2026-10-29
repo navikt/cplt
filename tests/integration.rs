@@ -501,6 +501,7 @@ mod macos_tests {
             deny_key_files_by_extension: false,
             protect_pnpm_config: false,
             deny_copilot_dir_exec: false,
+            allow_copilot_host_persistence: false,
             allow_jvm_attach: false,
             allow_msbuild: false,
             allow_docker: false,
@@ -3596,16 +3597,12 @@ int main(int argc, char **argv) {
         );
     }
 
-    /// `~/.copilot/skills/` is unwritable, and `~/.copilot/agents/` still is not
-    /// (navikt/copilot#858).
-    ///
-    /// A skill is the instructions the model is offered in the next session and
-    /// it names the scripts that session runs, so an agent that can edit one
-    /// edits its own future instructions. Skills arrive by install, which
-    /// refuses to run inside cplt anyway; `agents/` and `instructions/` are
-    /// Copilot's in-session authoring surface and keep the dir-wide grant.
+    /// `~/.copilot/skills/` and `agents/` are unwritable, and so is
+    /// `permissions-config.json` even through a rename, which is how Copilot
+    /// replaces its JSON files (navikt/copilot#858, #906). With
+    /// `allow_copilot_host_persistence` on, `agents/` is writable again.
     #[test]
-    fn real_profile_blocks_copilot_skills_write_but_not_agents() {
+    fn real_profile_blocks_copilot_skills_and_agents_write() {
         require_sandbox!();
         let project = fs::canonicalize(".").unwrap();
         let temp_home = tempfile::tempdir().unwrap();
@@ -3621,6 +3618,8 @@ int main(int argc, char **argv) {
         let mut opts = default_opts(&project, &home);
         opts.agent_dirs = &agent_dirs;
         let profile = write_real_profile(&opts);
+        opts.allow_copilot_host_persistence = true;
+        let kept_profile = write_real_profile(&opts);
 
         let overwrite = format!(
             "echo 'run this instead' > '{}' 2>&1; echo EXIT:$?",
@@ -3636,9 +3635,21 @@ int main(int argc, char **argv) {
             "echo body > '{}' 2>&1; echo EXIT:$?",
             agents.join("cplt-test-agent.md").display()
         );
-        let (agent_output, agent_success) = run_sandboxed(&profile, &author);
+        let (agent_output, _) = run_sandboxed(&profile, &author);
+        let perms = home.join(".copilot/permissions-config.json");
+        let tmp = home.join(".copilot/perms.tmp");
+        let rename = format!(
+            "echo '{{}}' > '{}' && mv '{}' '{}' 2>&1; echo EXIT:$?",
+            tmp.display(),
+            tmp.display(),
+            perms.display()
+        );
+        let (rename_output, _) = run_sandboxed(&profile, &rename);
+        let tmp_written = tmp.exists();
+        let (kept_output, kept_success) = run_sandboxed(&kept_profile, &author);
 
         fs::remove_file(&profile).ok();
+        fs::remove_file(&kept_profile).ok();
         assert!(
             skill_output.contains("Operation not permitted") || skill_output.contains("EXIT:1"),
             "an existing skill must not be rewritable from inside a session: {skill_output}"
@@ -3648,10 +3659,133 @@ int main(int argc, char **argv) {
             "a new file must not be plantable in a skill directory: {plant_output}"
         );
         assert!(
-            agent_success && agent_output.contains("EXIT:0"),
-            "agents/ is Copilot's in-session authoring surface and stays \
-             writable — the deny is on skills/ alone: {agent_output}"
+            !agent_output.contains("EXIT:0"),
+            "a custom agent's mcp-servers command runs on the host: {agent_output}"
         );
+        assert!(
+            tmp_written,
+            "the probe must get as far as the rename: {rename_output}"
+        );
+        assert!(
+            !rename_output.contains("EXIT:0") && !perms.exists(),
+            "a rename must not create saved approvals: {rename_output}"
+        );
+        assert!(
+            kept_success && kept_output.contains("EXIT:0"),
+            "the opt-in keeps agents/ writable: {kept_output}"
+        );
+    }
+
+    /// #923: `mv ~/.copilot <project>/.x && ln -s <project>/.x ~/.copilot`
+    /// used to move every Copilot deny out from under its path. The config
+    /// dir is pinned, so the move fails and the deny still holds.
+    #[test]
+    fn real_profile_pins_the_copilot_dir_against_move_and_symlink() {
+        require_sandbox!();
+        let temp_home = tempfile::tempdir().unwrap();
+        let home = fs::canonicalize(temp_home.path()).unwrap();
+        let project = home.join("proj");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(home.join(".copilot/hooks")).unwrap();
+
+        let agent_dirs = cplt::agent::Agent::Copilot.config_dirs(&home);
+        let mut opts = default_opts(&project, &home);
+        opts.agent_dirs = &agent_dirs;
+        let profile = write_real_profile(&opts);
+
+        let copilot = home.join(".copilot");
+        let moved = project.join(".x");
+        let attack = format!(
+            "mv '{c}' '{m}' 2>&1; echo MV:$?; ln -s '{m}' '{c}' 2>&1; \
+             echo '{{}}' > '{c}/hooks/evil.json' 2>&1; echo EXIT:$?",
+            c = copilot.display(),
+            m = moved.display()
+        );
+        let (output, _) = run_sandboxed(&profile, &attack);
+        fs::remove_file(&profile).ok();
+
+        assert!(
+            !output.contains("MV:0") && !moved.exists(),
+            "~/.copilot must not be movable from inside the sandbox: {output}"
+        );
+        assert!(
+            !copilot.join("hooks/evil.json").exists(),
+            "a hook must not be plantable after the move: {output}"
+        );
+    }
+
+    /// #923, for every writable root: the project and a tool dir can no longer
+    /// be moved aside and symlinked back, which took every deny under them
+    /// along. Ordinary git work in the project still succeeds.
+    #[test]
+    fn real_profile_pins_writable_roots_against_move_and_symlink() {
+        require_sandbox!();
+        let temp_home = tempfile::tempdir().unwrap();
+        let home = fs::canonicalize(temp_home.path()).unwrap();
+        let project = home.join("proj");
+        let other = home.join("other");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        fs::create_dir_all(home.join(".m2")).unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&project)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ]);
+
+        let extra_write = [other.clone()];
+        let mut opts = default_opts(&project, &home);
+        opts.extra_write = &extra_write;
+        let profile = write_real_profile(&opts);
+
+        let attack = |root: &Path, planted: &str| {
+            let moved = other.join("x");
+            let cmd = format!(
+                "mv '{r}' '{m}' 2>&1; echo MV:$?; ln -s '{m}' '{r}' 2>&1; \
+                 echo evil > '{r}/{planted}' 2>&1",
+                r = root.display(),
+                m = moved.display()
+            );
+            let (out, _) = run_sandboxed(&profile, &cmd);
+            assert!(
+                !out.contains("MV:0") && !moved.exists(),
+                "{} moved: {out}",
+                root.display()
+            );
+            assert!(!root.join(planted).exists(), "{planted} planted: {out}");
+        };
+        attack(&project, ".git/hooks/pre-commit");
+        attack(&home.join(".m2"), "settings.xml");
+
+        let work = format!(
+            "export HOME='{h}' GIT_CONFIG_NOSYSTEM=1; cd '{p}' && git checkout -q -b feat && git -c user.name=t -c user.email=t@t \
+             commit -q --allow-empty -m two && git gc -q && \
+             git worktree add -q '{o}/wt' && echo GIT:OK",
+            h = home.display(),
+            p = project.display(),
+            o = other.display()
+        );
+        let (out, _) = run_sandboxed(&profile, &work);
+        fs::remove_file(&profile).ok();
+        assert!(out.contains("GIT:OK"), "git work must still succeed: {out}");
     }
 
     /// OpenCode's managed tools in `~/.cache/opencode/bin` are executable,
@@ -3686,6 +3820,7 @@ int main(int argc, char **argv) {
         let ran = format!("cplt {}", env!("CARGO_PKG_VERSION"));
 
         let agent_dir = |path: PathBuf, write: bool| cplt::agent::AgentDir {
+            is_file: false,
             path,
             write,
             map_exec: false,

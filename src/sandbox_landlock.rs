@@ -3163,6 +3163,7 @@ mod tests {
             deny_key_files_by_extension: false,
             protect_pnpm_config: false,
             deny_copilot_dir_exec: false,
+            allow_copilot_host_persistence: false,
             allow_jvm_attach: false,
             allow_msbuild: false,
             allow_docker: false,
@@ -5061,6 +5062,7 @@ mod tests {
             symlink(home.join(".aws"), &app).unwrap();
 
             let dir = |path: PathBuf, write_files: Vec<&'static str>| crate::agent::AgentDir {
+                is_file: false,
                 path,
                 write: true,
                 map_exec: false,
@@ -5662,6 +5664,7 @@ mod tests {
         let home = PathBuf::from("/fake/user");
         let agent_dirs = vec![
             crate::agent::AgentDir {
+                is_file: false,
                 path: home.join(".config/opencode"),
                 write: false,
                 map_exec: false,
@@ -5671,6 +5674,7 @@ mod tests {
                 via: vec![],
             },
             crate::agent::AgentDir {
+                is_file: false,
                 path: home.join(".local/share/opencode"),
                 write: true,
                 map_exec: false,
@@ -5680,6 +5684,7 @@ mod tests {
                 via: vec![],
             },
             crate::agent::AgentDir {
+                is_file: false,
                 path: home.join(".local/state/opencode"),
                 write: true,
                 map_exec: false,
@@ -5689,6 +5694,7 @@ mod tests {
                 via: vec![],
             },
             crate::agent::AgentDir {
+                is_file: false,
                 path: home.join(".cache/opencode"),
                 write: true,
                 map_exec: false,
@@ -5698,6 +5704,7 @@ mod tests {
                 via: vec![],
             },
             crate::agent::AgentDir {
+                is_file: false,
                 path: home.join(".cache/opencode/bin"),
                 write: false,
                 map_exec: false,
