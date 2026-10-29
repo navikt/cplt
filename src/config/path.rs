@@ -233,6 +233,12 @@ inject_github_token = true
 #   allow_tmp_exec = false
 # preset = "standard"
 #
+# Linux: refuse to launch when a deny.paths entry cannot be enforced (no usable
+# bubblewrap, or a path under /proc, /dev, /sys or /tmp), or when Landlock is
+# below ABI v4 and no proxy is on. A missing deny path only warns. On for new
+# configs; without this line cplt warns and launches. false = warn and launch.
+refuse_unenforced = true
+#
 # Copilot: deny writes to ~/.copilot/agents/ and permissions-config.json, which
 # a later host session loads (#906). Saving a tool approval inside cplt then
 # fails; do it from a host shell. Off for new configs; without this line the
@@ -770,6 +776,9 @@ mod tests {
         // New configs start with forced proxy on (#822); a missing key stays off.
         assert_eq!(config.proxy.forced, Some(true));
         assert_eq!(Config::default().proxy.forced, None);
+        // #386: new configs refuse what they cannot enforce; unset warns.
+        assert_eq!(config.sandbox.refuse_unenforced, Some(true));
+        assert_eq!(Config::default().sandbox.refuse_unenforced, None);
         // #906: new configs deny Copilot's agents/ and saved approvals.
         assert_eq!(config.sandbox.allow_copilot_host_persistence, Some(false));
         assert_eq!(

@@ -447,6 +447,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "sandbox",
+        key: "refuse_unenforced",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "false",
+        description: "Linux only: refuse to launch when a deny.paths / --deny-path entry cannot be enforced (no usable bubblewrap, or a path under /proc, /dev, /sys or /tmp), or when Landlock is below ABI v4 and no proxy is configured. A deny path that does not exist only warns. On in new configs; without the key cplt warns and launches. Set it to false to launch with the warning (#386).",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
         key: "refuse_cache_exec_links",
         value_type: ConfigValueType::Bool,
         dangerous: false,
@@ -1203,6 +1211,14 @@ bool_keys! {
         config = |c: &Config| c.sandbox.refuse_cache_exec_links,
         baseline = |_: PresetBaseline| false,
         resolved = |r: &Resolved| r.refuse_cache_exec_links;
+
+    /// Config-only; `config init` writes `true` (#386). Unset keeps the
+    /// warning, so existing configs launch as before.
+    refuse_unenforced, "sandbox", "refuse_unenforced",
+        cli = |_: &CliFlags| FeatureToggle::UseDefault,
+        config = |c: &Config| c.sandbox.refuse_unenforced,
+        baseline = |_: PresetBaseline| false,
+        resolved = |r: &Resolved| r.refuse_unenforced;
 
     /// Config-only and off by default (staged rollout): it blocks key and
     /// certificate files that are readable today, such as a dev server's

@@ -823,6 +823,7 @@ The settings below are machine-specific or local CLI preferences, so `.cplt.toml
 | `sandbox.audit` | local output preference, not project sandbox policy |
 | `sandbox.gradle_init` | writes to the machine's Gradle user home, not project policy |
 | `sandbox.deny_nested_git` | a staged hardening switch, see [Blocking new nested `.git` entries](#blocking-new-nested-git-entries-sandboxdeny_nested_git) |
+| `sandbox.refuse_unenforced` | depends on what the machine can enforce, see [Refusing deny paths this host cannot enforce](#refusing-deny-paths-this-host-cannot-enforce-sandboxrefuse_unenforced) |
 | `sandbox.refuse_cache_exec_links` | a staged hardening switch, see [Symlinked cache-exec entries](#symlinked-cache-exec-entries-sandboxrefuse_cache_exec_links) |
 | `sandbox.deny_key_files_by_extension` | a staged hardening switch, see [Denying key files by extension](#denying-key-files-by-extension-sandboxdeny_key_files_by_extension) |
 | `sandbox.protect_pnpm_config` | a staged hardening switch, see [Protecting pnpm's global config](#protecting-pnpms-global-config-sandboxprotect_pnpm_config) |
@@ -939,6 +940,26 @@ With the key on, an OpenCode launch in a repository whose `.cplt.toml` is not ap
 A repository counts as trusted when the launch applies its `.cplt.toml` proposals: a current `cplt trust accept` approval bound to this repository, or `--accept-repo-config` for one run. An approval copied onto the same origin URL in a different clone does not count, and neither does an approval the repository's `[propose]` section has changed since, or one `cplt trust accept --all` retired. An approval needs a `[propose]` section, so a repository without one stays untrusted while the key is on; turn the key off to load its config. `cplt exec` does not apply the key.
 
 The key is off by default, and it is set in your own config, never in `.cplt.toml`. If `deny.env` names either variable, the launch stops, because cplt cannot apply the key without them. Other agents are not affected.
+
+## Refusing deny paths this host cannot enforce (`sandbox.refuse_unenforced`)
+
+Linux only. With the key on, cplt refuses to launch in these cases:
+
+- `deny.paths` or `--deny-path` is set and Bubblewrap is not used. Landlock alone cannot deny a path inside a directory the sandbox allows. Bubblewrap can be missing, blocked (for example by AppArmor), or turned off with `sandbox.use_bubblewrap = false` or `--no-bubblewrap`. The error says which, and how to fix it.
+- Bubblewrap is used, but cannot mask a deny path: a path under `/proc`, `/dev`, `/sys` or `/tmp`, or a failure to create the mask file. The error names each path and the reason.
+- Landlock is below ABI v4 (kernel older than 6.7) and no proxy is configured, so outbound connections cannot be restricted.
+
+A deny path that does not exist denies nothing, so it only warns. Only a repository `.cplt.toml` can name such a path: entries in your own config and on the command line must exist when cplt loads them.
+
+`cplt check` and `--print-profile` refuse in the same cases as a launch.
+
+`cplt config init` writes `refuse_unenforced = true`. A config without the key keeps the old behaviour: cplt warns and launches. `cplt doctor` suggests the key when it would change something on this host. To keep launching with the warning:
+
+```bash
+cplt config set sandbox.refuse_unenforced false
+```
+
+The key does not cover built-in protections that need Bubblewrap, or `sandbox.deny_nested_git` and `sandbox.deny_key_files_by_extension`. They still warn and launch.
 
 ## Symlinked cache-exec entries (`sandbox.refuse_cache_exec_links`)
 

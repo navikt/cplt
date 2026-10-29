@@ -7376,6 +7376,8 @@ fn build_sandbox_config<'a>(
         netns: resolved.netns,
         deny_nested_git: resolved.deny_nested_git,
         refuse_cache_exec_links: resolved.refuse_cache_exec_links,
+        refuse_unenforced: resolved.refuse_unenforced,
+        proxy_enabled: resolved.with_proxy,
         deny_key_files_by_extension: resolved.deny_key_files_by_extension,
         protect_pnpm_config: resolved.protect_pnpm_config,
         deny_copilot_dir_exec: resolved.deny_copilot_dir_exec,
@@ -9262,6 +9264,13 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
         &sandbox_config,
         &launch_grants,
     );
+    let unmasked =
+        doctor::unmasked_deny_paths(resolved.scratch_dir, &sandbox_config, &launch_grants);
+    findings.extend(doctor::refuse_unenforced_nudge(
+        &resolved,
+        &bubblewrap,
+        &unmasked,
+    ));
     #[cfg(target_os = "linux")]
     findings.extend(doctor::git_config_write_nudge(
         &resolved,
@@ -13609,6 +13618,8 @@ mod tests {
             netns: false,
             deny_nested_git: false,
             refuse_cache_exec_links: false,
+            refuse_unenforced: false,
+            proxy_enabled: false,
             deny_key_files_by_extension: true,
             protect_pnpm_config: false,
             deny_copilot_dir_exec: false,

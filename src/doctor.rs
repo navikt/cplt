@@ -390,6 +390,38 @@ pub fn bubblewrap_state(
     }
 }
 
+/// The configured deny paths the launch's wrapper would leave unmasked
+/// (#386), probed with the same scratch dir [`bubblewrap_state`] makes, so a
+/// missing mask placeholder counts as it would on launch.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn unmasked_deny_paths(
+    scratch: bool,
+    config: &crate::sandbox::SandboxConfig,
+    grants: &[(PathBuf, PathBuf)],
+) -> Vec<PathBuf> {
+    let probe_scratch =
+        (scratch && config.scratch_dir.is_none()).then(|| ProbeScratch::create(config.home_dir));
+    let probed = crate::sandbox::SandboxConfig {
+        scratch_dir: config
+            .scratch_dir
+            .or_else(|| probe_scratch.as_ref().and_then(ProbeScratch::path)),
+        ..config.clone()
+    };
+    crate::sandbox::bubblewrap_probe::unmasked_user_denies(&probed, grants)
+}
+
+/// Not Linux: nothing is masked, so nothing is reported.
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub fn unmasked_deny_paths(
+    _scratch: bool,
+    _config: &crate::sandbox::SandboxConfig,
+    _grants: &[(PathBuf, PathBuf)],
+) -> Vec<PathBuf> {
+    Vec::new()
+}
+
 /// A session scratch dir for one probe. Dropping it removes the dir and then
 /// every ancestor `ScratchDir::create` had to make, so doctor leaves nothing
 /// behind on a host that never launched.
@@ -1218,6 +1250,38 @@ pub fn proxy_forced_nudge(r: &crate::config::Resolved, can_force: bool) -> Optio
     })
 }
 
+/// The nudge for a config from before `sandbox.refuse_unenforced` (#386).
+/// Shown only where it would change something on this host: a deny path
+/// that bubblewrap is not there to enforce, or one it cannot mask. Silent
+/// once the key is set either way. Never changes anything.
+#[must_use]
+pub fn refuse_unenforced_nudge(
+    r: &crate::config::Resolved,
+    bwrap: &Bubblewrap,
+    unmasked: &[PathBuf],
+) -> Option<Finding> {
+    let unset =
+        r.bool_layer("sandbox", "refuse_unenforced") == Some(crate::config::ConfigLayer::Baseline);
+    let applies = match bwrap {
+        Bubblewrap::NotApplicable => false,
+        Bubblewrap::Usable(_) => !unmasked.is_empty(),
+        _ => true,
+    };
+    (unset && applies && !r.deny_paths.is_empty()).then(|| {
+        Finding::warning(
+            "A deny path in your config is not enforced on this host (bubblewrap is not \
+             usable, or cannot mask the path). cplt warns and launches anyway. New configs \
+             refuse the launch instead.",
+            Some(
+                "cplt config set sandbox.refuse_unenforced true, or \
+                 `cplt config set sandbox.refuse_unenforced false` to keep the warning and \
+                 silence this"
+                    .to_string(),
+            ),
+        )
+    })
+}
+
 /// The nudge for an install from before Copilot's `agents/` and
 /// `permissions-config.json` were denied for new configs (#906). Shown only
 /// while no layer sets `sandbox.allow_copilot_host_persistence`.
@@ -1276,6 +1340,38 @@ pub fn exit_nonzero(findings: &[Finding]) -> bool {
 mod tests {
     use super::*;
     use crate::sandbox::{FsAccess, FsRule};
+
+    #[test]
+    fn refuse_unenforced_nudge_only_when_unset() {
+        let r = |toml: &str| {
+            toml::from_str::<crate::config::Config>(toml)
+                .unwrap()
+                .merge(crate::config::CliFlags::default())
+                .unwrap()
+        };
+        let usable = Bubblewrap::Usable(PathBuf::from("/usr/bin/bwrap"));
+        let deny = "[deny]\npaths = [\"/dev\"]\n";
+        let old = r(deny);
+        assert!(!old.refuse_unenforced);
+        assert!(refuse_unenforced_nudge(&old, &Bubblewrap::NotInstalled, &[]).is_some());
+        let dev = [PathBuf::from("/dev")];
+        assert!(
+            refuse_unenforced_nudge(&old, &usable, &dev).is_some(),
+            "the probe left /dev unmasked"
+        );
+        assert!(refuse_unenforced_nudge(&old, &Bubblewrap::NotApplicable, &[]).is_none());
+        let maskable = r(concat!(
+            "[deny]\npaths = [\"",
+            env!("CARGO_MANIFEST_DIR"),
+            "\"]\n"
+        ));
+        assert!(refuse_unenforced_nudge(&maskable, &usable, &[]).is_none());
+        assert!(refuse_unenforced_nudge(&r(""), &Bubblewrap::NotInstalled, &[]).is_none());
+        let set = |v: bool| r(&format!("[sandbox]\nrefuse_unenforced = {v}\n{deny}"));
+        assert!(set(true).refuse_unenforced);
+        assert!(refuse_unenforced_nudge(&set(true), &Bubblewrap::Disabled, &[]).is_none());
+        assert!(refuse_unenforced_nudge(&set(false), &Bubblewrap::Disabled, &[]).is_none());
+    }
 
     #[test]
     fn copilot_persistence_nudge_only_when_unset() {
