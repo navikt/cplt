@@ -9348,8 +9348,7 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
         active_agent,
         cfg!(target_os = "linux"),
         std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some()
-            || cplt::sandbox::SECRET_SERVICE_SKIP.get()
-                == Some(&cplt::sandbox::SecretServiceSkip::SecretToolMissing),
+            || cplt::sandbox::SECRET_SERVICE_SKIP.get().is_some(),
         env_token.is_some()
             || matches!(
                 keychain_substitute,

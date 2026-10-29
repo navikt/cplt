@@ -2383,8 +2383,7 @@ pub fn secret_service_skip_reason(
         "deny.env strips COPILOT_GITHUB_TOKEN, so no lookup ran".into()
     } else {
         "no single account in ~/.copilot/config.json matching gh's github.com login (or gh \
-         is not logged in), or the `secret-tool` lookup found nothing (not installed in a \
-         trusted bin dir, keyring locked, or no stored item)"
+         is not logged in), or the `secret-tool` lookup found nothing"
             .into()
     }
 }
