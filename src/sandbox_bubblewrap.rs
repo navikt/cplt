@@ -93,6 +93,71 @@ pub(crate) const ENV_INNER_POLICY: &str = "__CPLT_BWRAP_POLICY_FD";
 /// Environment variable carrying the write end of the confirm pipe (a decimal
 /// fd number). The helper writes one byte to it just before `execve`-ing the
 /// agent so the parent knows the inner sandbox was applied.
+/// SPIKE #114: opt-in switch, socket path and proxy port for the netns bridge.
+pub(crate) const SPIKE_NETNS: &str = "CPLT_SPIKE_NETNS";
+pub(crate) const SPIKE_SOCK: &str = "__CPLT_SPIKE_SOCK";
+pub(crate) const SPIKE_PORT: &str = "__CPLT_SPIKE_PORT";
+
+/// SPIKE #114: copy bytes both ways between two streams.
+pub(crate) fn spike_splice<A, B>(a: A, b: B)
+where
+    A: Send + Sync + 'static,
+    B: Send + Sync + 'static,
+    for<'x> &'x A: std::io::Read + std::io::Write,
+    for<'x> &'x B: std::io::Read + std::io::Write,
+{
+    let a = std::sync::Arc::new(a);
+    let b = std::sync::Arc::new(b);
+    let (a2, b2) = (a.clone(), b.clone());
+    std::thread::spawn(move || {
+        let _ = std::io::copy(&mut &*a2, &mut &*b2);
+    });
+    let _ = std::io::copy(&mut &*b, &mut &*a);
+}
+
+/// SPIKE #114: in-netns forwarder. Binds before fork so "confirmed" means the
+/// egress path is listening; the child relays TCP -> host unix socket and dies
+/// with its parent (the helper, which becomes the agent on execve).
+fn spike_start_forwarder() -> bool {
+    let (Some(sock), Some(port)) = (
+        std::env::var_os(SPIKE_SOCK),
+        std::env::var(SPIKE_PORT)
+            .ok()
+            .and_then(|p| p.parse::<u16>().ok()),
+    ) else {
+        return true; // spike off
+    };
+    let t0 = std::time::Instant::now();
+    let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port)) else {
+        eprintln!("cplt-spike: forwarder bind 127.0.0.1:{port} failed");
+        return false;
+    };
+    // SAFETY: the helper is single-threaded pre-main; threads start only in
+    // the child after fork.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return false;
+    }
+    if pid == 0 {
+        unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
+        for conn in listener.incoming().flatten() {
+            let sock = sock.clone();
+            std::thread::spawn(move || {
+                if let Ok(up) = std::os::unix::net::UnixStream::connect(&sock) {
+                    spike_splice(conn, up);
+                }
+            });
+        }
+        unsafe { libc::_exit(0) };
+    }
+    drop(listener);
+    eprintln!(
+        "cplt-spike: forwarder pid {pid} up in {} us",
+        t0.elapsed().as_micros()
+    );
+    true
+}
+
 pub(crate) const ENV_CONFIRM_FD: &str = "__CPLT_BWRAP_CONFIRM_FD";
 
 /// A validated Bubblewrap execution wrapper, built during `prepare()`.
@@ -318,6 +383,10 @@ pub(crate) fn build_bwrap_args(
         "--unshare-user".to_string(),
         "--die-with-parent".to_string(),
     ]);
+    // SPIKE #114 (do not merge): opt-in netns. bwrap brings `lo` up itself.
+    if std::env::var_os(SPIKE_NETNS).is_some() {
+        args.push("--unshare-net".to_string());
+    }
 
     // ── Base filesystem: whole host root, read-only ──
     args.extend(["--ro-bind".to_string(), "/".to_string(), "/".to_string()]);
@@ -1448,6 +1517,12 @@ fn run_inner() {
         .iter()
         .map(|&port| NetRule { port })
         .collect();
+
+    if !spike_start_forwarder() {
+        return;
+    }
+    scrub_env(SPIKE_SOCK);
+    scrub_env(SPIKE_PORT);
 
     // Bind Landlock to in-namespace inodes and install seccomp. If this fails
     // we return without signalling success — never run the agent unsandboxed.

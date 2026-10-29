@@ -1917,6 +1917,26 @@ fn exec_bwrap(
         policy_read_fd.to_string(),
     );
     cmd.env(super::bubblewrap::ENV_CONFIRM_FD, write_fd.to_string());
+    // SPIKE #114: host side of the netns bridge, unix socket -> host proxy.
+    if std::env::var_os(super::bubblewrap::SPIKE_NETNS).is_some()
+        && let (Some(port), Some(dir)) = (sandbox.proxy_port, sandbox.scratch_dir.as_deref())
+    {
+        let path = dir.join("netns-proxy.sock");
+        let _ = std::fs::remove_file(&path);
+        if let Ok(l) = std::os::unix::net::UnixListener::bind(&path) {
+            std::thread::spawn(move || {
+                for c in l.incoming().flatten() {
+                    std::thread::spawn(move || {
+                        if let Ok(up) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+                            super::bubblewrap::spike_splice(c, up);
+                        }
+                    });
+                }
+            });
+            cmd.env(super::bubblewrap::SPIKE_SOCK, &path);
+            cmd.env(super::bubblewrap::SPIKE_PORT, port.to_string());
+        }
+    }
     // bwrap forwards inherited descriptors into the namespace, so the caller's
     // leak reaches the agent here too. The policy and confirm pipes are the
     // only two that are meant to: both are created CLOEXEC, the seal clears
