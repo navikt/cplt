@@ -77,6 +77,7 @@ pub(crate) mod bubblewrap_probe {
             },
             &plan.deny_masks,
             false,
+            config.netns,
         )
         .map(|_| ())
     }
@@ -127,8 +128,8 @@ pub use profile::{ReadDenies, generate_profile, generate_profile_with_playwright
 // Environment construction — already platform-agnostic.
 pub use env::{
     SandboxEnv, build_sandbox_env, copilot_sandbox_support_overridden, npmrc_explicitly_allowed,
-    npmrc_userconfig_override, npmrc_userconfig_stale_variants, playwright_mcp_sandbox_disabled,
-    playwright_sockets_dir_override,
+    npmrc_userconfig_override, npmrc_userconfig_stale_variants, otlp_vendor_auth_present,
+    playwright_mcp_sandbox_disabled, playwright_sockets_dir_override,
 };
 
 // The in-process PATH lookup. Re-exported (rather than opening the whole `exec`
@@ -250,6 +251,8 @@ pub struct SandboxConfig<'a> {
     /// `proxy.deny_dns` under `proxy.forced` (#653): close the resolver
     /// socket and the dnssd Mach services. macOS only.
     pub deny_dns: bool,
+    /// `proxy.netns` (#114): bwrap gets `--unshare-net`. Linux only.
+    pub netns: bool,
     /// `sandbox.deny_nested_git` (#576): deny creating a `.git` entry below a
     /// writable root. macOS only; Linux has no way to express it.
     pub deny_nested_git: bool,
@@ -425,6 +428,38 @@ impl PreparedSandbox {
     /// On Linux the host service files leave the Landlock rules and the
     /// session port joins the connect allowlist (#719), in both the direct
     /// and the bubblewrap rules.
+    /// `proxy.netns` (#114): run the agent in its own network namespace, or
+    /// say why not and how to fix it. The launch refuses on `Err`.
+    #[cfg(target_os = "linux")]
+    pub fn check_netns(&self) -> Result<(), String> {
+        const OFF: &str = "or set proxy.netns = false";
+        if self.bwrap_wrapper.as_ref().is_none_or(|w| !w.netns()) {
+            let fix = if bubblewrap::check_availability().is_none() {
+                format!("Install it ({})", crate::doctor::BWRAP_INSTALL_HINT)
+            } else {
+                crate::doctor::apparmor_fix()
+                    .unwrap_or_else(|| "Run `cplt doctor` to see what blocks it".to_string())
+            };
+            return Err(format!(
+                "proxy.netns needs Bubblewrap with a network namespace, and this run has \
+                 none. {fix}, {OFF}."
+            ));
+        }
+        if self.proxy_port.is_none() {
+            return Err(format!(
+                "proxy.netns needs the proxy: it is the only way out of the namespace. \
+                 Turn the proxy on, {OFF}."
+            ));
+        }
+        if self.scratch_dir.is_none() {
+            return Err(format!(
+                "proxy.netns needs the scratch dir for its proxy socket. \
+                 Set sandbox.scratch_dir = true, {OFF}."
+            ));
+        }
+        Ok(())
+    }
+
     pub fn add_opencode_v2(&mut self, session: crate::opencode_v2::Session) -> Result<(), String> {
         // File grants go before the denies, so every deny still wins.
         #[cfg(target_os = "macos")]
@@ -1926,6 +1961,13 @@ pub fn keychain_substitute(
                     None
                 })
             },
+            || {
+                let found = crate::git::trusted_binary("secret-tool").is_some();
+                if !found {
+                    let _ = SECRET_SERVICE_SKIP.set(SecretServiceSkip::SecretToolMissing);
+                }
+                found
+            },
             secret_tool_lookup,
         );
     }
@@ -2294,6 +2336,7 @@ pub(crate) fn secret_service_substitute(
     deny_env: &[String],
     enabled: bool,
     gh: impl FnOnce() -> Option<String>,
+    has_secret_tool: impl FnOnce() -> bool,
     lookup: impl FnOnce(&str) -> Option<String>,
 ) -> Option<crate::agent::KeychainSubstitute> {
     if !enabled || agent != Agent::Copilot {
@@ -2312,6 +2355,10 @@ pub(crate) fn secret_service_substitute(
     let CopilotConfigAccount::Selected(acct) = copilot_config_account(home) else {
         return None;
     };
+    // Before the gh comparison, so a Copilot-only login still hears it is missing (#901).
+    if !has_secret_tool() {
+        return None;
+    }
     if account_mismatch(gh().as_deref(), Some(&acct)).is_some() {
         return None;
     }
@@ -2374,8 +2421,7 @@ pub fn secret_service_skip_reason(
         "deny.env strips COPILOT_GITHUB_TOKEN, so no lookup ran".into()
     } else {
         "no single account in ~/.copilot/config.json matching gh's github.com login (or gh \
-         is not logged in), or the `secret-tool` lookup found nothing (not installed in a \
-         trusted bin dir, keyring locked, or no stored item)"
+         is not logged in), or the `secret-tool` lookup found nothing"
             .into()
     }
 }
@@ -2691,6 +2737,7 @@ fn mcp_wrapper(config: &SandboxConfig) -> (Result<(), String>, BwrapPlan) {
             },
             &plan.deny_masks,
             false,
+            config.netns,
         )
         .map(|_| ())
     };
@@ -3648,6 +3695,7 @@ fn prepare_impl(
     // disabled and fallback arms borrow and clone nothing.
     let mut bwrap_wrapper = bubblewrap::resolve(
         config.use_bubblewrap,
+        config.netns,
         &policy,
         bubblewrap::Overlays {
             read_only: &ro_protect,
@@ -3695,13 +3743,14 @@ fn prepare_impl(
                 read_only: &ro_protect,
                 pins: &pins,
             };
-            let rebuilt = bubblewrap::build_wrapper(&policy, overlays, &deny_masks, strict)
-                .map_err(|e| {
-                    format!(
-                        "Bubblewrap failed after cplt created the empty home Git config files \
+            let rebuilt =
+                bubblewrap::build_wrapper(&policy, overlays, &deny_masks, strict, config.netns)
+                    .map_err(|e| {
+                        format!(
+                            "Bubblewrap failed after cplt created the empty home Git config files \
                          it binds read-only: {e}. Not starting without that bind."
-                    )
-                })?;
+                        )
+                    })?;
             bwrap_wrapper = Some(rebuilt);
         }
     }
@@ -4403,6 +4452,7 @@ mod tests {
             allow_gpg_signing: false,
             deny_clipboard: false,
             deny_dns: false,
+            netns: false,
             deny_nested_git: false,
             refuse_cache_exec_links: false,
             refuse_unenforced: false,
@@ -5485,6 +5535,7 @@ mod tests {
             &[],
             bubblewrap::Overlays::default(),
             &bubblewrap::DenyMasks::default(),
+            false,
         );
         let state = crate::doctor::bubblewrap_state(None, false, &config, &[]);
         let launch = prepare(&config).expect("prepare");
@@ -7257,6 +7308,7 @@ mod account_tests {
             assert_eq!(acct, "https://github.com:alice");
             Some("gho_x\n".to_string())
         };
+        let yes = || true;
         let never = |_: &str| -> Option<String> { panic!("lookup must not run") };
         let vars = [
             ("COPILOT_GITHUB_TOKEN", None::<&str>),
@@ -7265,7 +7317,8 @@ mod account_tests {
         ];
         temp_env::with_vars(vars, || {
             // Happy path: token trimmed, set as COPILOT_GITHUB_TOKEN.
-            let sub = secret_service_substitute(Agent::Copilot, h, &[], true, alice, ok).unwrap();
+            let sub =
+                secret_service_substitute(Agent::Copilot, h, &[], true, alice, yes, ok).unwrap();
             assert_eq!(
                 sub.env_value(),
                 Some(("COPILOT_GITHUB_TOKEN", "gho_x".to_string()))
@@ -7274,25 +7327,46 @@ mod account_tests {
             assert!(!format!("{sub:?}{sub}").contains("gho_x"));
             // Off, other agent, denied var: no lookup.
             assert!(
-                secret_service_substitute(Agent::Copilot, h, &[], false, alice, never).is_none()
+                secret_service_substitute(Agent::Copilot, h, &[], false, alice, yes, never)
+                    .is_none()
             );
-            assert!(secret_service_substitute(Agent::Claude, h, &[], true, alice, never).is_none());
+            assert!(
+                secret_service_substitute(Agent::Claude, h, &[], true, alice, yes, never).is_none()
+            );
             let deny = ["COPILOT_GITHUB_TOKEN".to_string()];
             assert!(
-                secret_service_substitute(Agent::Copilot, h, &deny, true, alice, never).is_none()
+                secret_service_substitute(Agent::Copilot, h, &deny, true, alice, yes, never)
+                    .is_none()
             );
             // gh is someone else, or unknown: refused.
             let bob = || Some("bob".to_string());
-            assert!(secret_service_substitute(Agent::Copilot, h, &[], true, bob, never).is_none());
             assert!(
-                secret_service_substitute(Agent::Copilot, h, &[], true, || None, never).is_none()
+                secret_service_substitute(Agent::Copilot, h, &[], true, bob, yes, never).is_none()
+            );
+            assert!(
+                secret_service_substitute(Agent::Copilot, h, &[], true, || None, yes, never)
+                    .is_none()
+            );
+            // No gh login and no secret-tool: skipped before gh is asked.
+            assert!(
+                secret_service_substitute(
+                    Agent::Copilot,
+                    h,
+                    &[],
+                    true,
+                    || panic!("gh must not run"),
+                    || false,
+                    never
+                )
+                .is_none()
             );
             // Missing, locked or empty item: fallback.
             assert!(
-                secret_service_substitute(Agent::Copilot, h, &[], true, alice, |_| None).is_none()
+                secret_service_substitute(Agent::Copilot, h, &[], true, alice, yes, |_| None)
+                    .is_none()
             );
             assert!(
-                secret_service_substitute(Agent::Copilot, h, &[], true, alice, |_| Some(
+                secret_service_substitute(Agent::Copilot, h, &[], true, alice, yes, |_| Some(
                     " \n".into()
                 ))
                 .is_none()
@@ -7301,7 +7375,8 @@ mod account_tests {
         // An exported token wins: skip.
         temp_env::with_var("GH_TOKEN", Some("t"), || {
             assert!(
-                secret_service_substitute(Agent::Copilot, h, &[], true, alice, never).is_none()
+                secret_service_substitute(Agent::Copilot, h, &[], true, alice, yes, never)
+                    .is_none()
             );
         });
         // Ambiguous config: refused.
@@ -7312,7 +7387,8 @@ mod account_tests {
         .unwrap();
         temp_env::with_vars(vars, || {
             assert!(
-                secret_service_substitute(Agent::Copilot, h, &[], true, alice, never).is_none()
+                secret_service_substitute(Agent::Copilot, h, &[], true, alice, yes, never)
+                    .is_none()
             );
         });
     }

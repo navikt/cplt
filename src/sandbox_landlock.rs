@@ -3157,6 +3157,7 @@ mod tests {
             allow_gpg_signing: false,
             deny_clipboard: false,
             deny_dns: false,
+            netns: false,
             deny_nested_git: false,
             refuse_cache_exec_links: false,
             refuse_unenforced: false,

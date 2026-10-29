@@ -1917,6 +1917,26 @@ fn exec_bwrap(
         policy_read_fd.to_string(),
     );
     cmd.env(super::bubblewrap::ENV_CONFIRM_FD, write_fd.to_string());
+    // proxy.netns (#114): the host end of the bridge. `check_netns` checked both
+    // the scratch dir and the proxy.
+    if wrapper.netns()
+        && let (Some(port), Some(dir)) = (sandbox.proxy_port, sandbox.scratch_dir.as_deref())
+    {
+        match netns_bridge(&super::bubblewrap::netns_socket_path(dir), port) {
+            Ok(spec) => {
+                cmd.env(super::bubblewrap::ENV_NETNS, spec);
+            }
+            Err(e) => {
+                unsafe {
+                    libc::close(policy_read_fd);
+                    libc::close(policy_write_fd);
+                    libc::close(read_fd);
+                    libc::close(write_fd);
+                }
+                return bwrap_setup_failed(wrapper, &format!("proxy.netns bridge: {e}"));
+            }
+        }
+    }
     // bwrap forwards inherited descriptors into the namespace, so the caller's
     // leak reaches the agent here too. The policy and confirm pipes are the
     // only two that are meant to: both are created CLOEXEC, the seal clears
@@ -2016,6 +2036,28 @@ fn exec_bwrap(
     let code = forward_and_wait(child);
     restore_terminal_stop_signals();
     BwrapOutcome::Ran(code)
+}
+
+/// Listen on `sock` (mode 0600 in a 0700 dir) and splice each connection to
+/// the host proxy. Returns the relay spec for the helper.
+#[cfg(target_os = "linux")]
+fn netns_bridge(sock: &Path, port: u16) -> std::io::Result<String> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let dir = sock.parent().unwrap_or(sock);
+    std::fs::DirBuilder::new().mode(0o700).create(dir)?;
+    let listener = std::os::unix::net::UnixListener::bind(sock)?;
+    std::fs::set_permissions(sock, std::fs::Permissions::from_mode(0o600))?;
+    let live = std::sync::Arc::default();
+    std::thread::Builder::new().spawn(move || {
+        for conn in listener.incoming().flatten() {
+            super::bubblewrap::spawn_capped(&live, move || {
+                if let Ok(up) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+                    super::bubblewrap::splice(up, conn);
+                }
+            });
+        }
+    })?;
+    Ok(format!("{}:{port}", sock.display()))
 }
 
 /// Map a bwrap start-up failure to an outcome: hard error when bwrap was

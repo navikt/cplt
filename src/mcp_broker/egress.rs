@@ -1,8 +1,8 @@
 //! The child's own CONNECT proxy, allowing only its `egressHosts`.
 
 use std::io::{Error, ErrorKind, Write};
-use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::time::{Duration, Instant};
 
 use super::runtime::Log;
 
@@ -70,14 +70,39 @@ fn dial_public(host: &str) -> Result<TcpStream, Error> {
     if addrs.is_empty() {
         return Err(Error::other(NoPublicAddress));
     }
+    dial_each(addrs, DIAL_BUDGET, TcpStream::connect_timeout)
+        .map_err(|last| Error::new(last.kind(), format!("{host} ({last})")))
+}
+
+/// Total time for one upstream dial, across all of a host's addresses.
+/// Longer than [`EGRESS_TIMEOUT`]: on macOS a freshly built binary's first
+/// connects can stall for over 10 s while a network extension vets it (#917).
+const DIAL_BUDGET: Duration = Duration::from_secs(30);
+
+/// Try `addrs` in turn (IPv4 first) under one shared `budget`, so a dead
+/// address cannot use up the time for the rest. Errors with the last attempt.
+fn dial_each(
+    mut addrs: Vec<SocketAddr>,
+    budget: Duration,
+    connect: impl Fn(&SocketAddr, Duration) -> Result<TcpStream, Error>,
+) -> Result<TcpStream, Error> {
+    addrs.sort_by_key(SocketAddr::is_ipv6);
+    let deadline = Instant::now() + budget;
     let mut last = Error::other("unreachable");
     for a in &addrs {
-        match TcpStream::connect_timeout(a, EGRESS_TIMEOUT) {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(Error::new(
+                ErrorKind::TimedOut,
+                format!("{a}: dial budget spent"),
+            ));
+        }
+        match connect(a, left) {
             Ok(s) => return Ok(s),
             Err(e) => last = Error::new(e.kind(), format!("{a}: {e}")),
         }
     }
-    Err(Error::new(last.kind(), format!("{host} ({last})")))
+    Err(last)
 }
 
 /// [`egress_tunnel`] with the upstream dial injected, so a test can reach an
@@ -265,12 +290,11 @@ mod tests {
             return;
         }
         let hosts = vec!["example.org".to_string()];
-        // A refused port: bind, note the address, close.
-        let addr = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap();
-        let (line, _, log) = connect("example.org:443", &hosts, move |_| TcpStream::connect(addr));
+        // A refused port. Returned by the seam: a bound-then-closed port can
+        // be reused by a parallel test and accept.
+        let (line, _, log) = connect("example.org:443", &hosts, |_| {
+            Err(Error::from(ErrorKind::ConnectionRefused))
+        });
         assert_eq!(line, "HTTP/1.1 502 Bad Gateway");
         assert!(
             log.contains("connect failed") && !log.contains("DENIED"),
@@ -297,5 +321,32 @@ mod tests {
             log.contains("egress → DENIED evil.example.com is not in egressHosts"),
             "{log}"
         );
+    }
+
+    #[test]
+    fn a_dial_tries_ipv4_first_under_one_shared_budget() {
+        let v6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let v4: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let tried = std::cell::RefCell::new(vec![]);
+        let budget = Duration::from_millis(200);
+        let err = dial_each(vec![v6, v4], budget, |a, left| {
+            assert!(left <= budget, "{left:?}");
+            tried.borrow_mut().push(*a);
+            std::thread::sleep(budget / 2 + Duration::from_millis(10));
+            Err(Error::from(ErrorKind::TimedOut))
+        })
+        .unwrap_err();
+        assert_eq!(*tried.borrow(), vec![v4, v6]);
+        assert_eq!(err.kind(), ErrorKind::TimedOut);
+        // The budget is shared: once spent, later addresses are not tried.
+        tried.borrow_mut().clear();
+        let err = dial_each(vec![v4, v6], budget, |a, _| {
+            tried.borrow_mut().push(*a);
+            std::thread::sleep(budget + Duration::from_millis(10));
+            Err(Error::from(ErrorKind::ConnectionRefused))
+        })
+        .unwrap_err();
+        assert_eq!(*tried.borrow(), vec![v4]);
+        assert_eq!(err.kind(), ErrorKind::TimedOut, "{err}");
     }
 }
