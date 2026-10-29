@@ -331,6 +331,12 @@ fn profile_locked(
 /// keychain write (`security add-generic-password -U`, find, delete on a temp
 /// keychain). The only name reported was securityd's, used by the `security`
 /// helper; nais itself looked up none.
+/// Re-measured 2026-10-29 with nais 7.0.4 and a live login, through the real
+/// broker (debug cplt, fake agent driving `cplt mcp-stdio`): initialize,
+/// `tools/list`, `get_nais_context` and `execute_graphql` with
+/// `query { me { __typename } }`, so TLS to the Nais API ran. Again only
+/// `com.apple.SecurityServer`, from `security`; no `com.apple.trustd`. The
+/// token was valid, so the refresh path did not run here.
 pub(crate) const MCP_CHILD_MACH_SERVICES: &[&str] = &["com.apple.SecurityServer"];
 
 /// The Seatbelt profile for a brokered MCP server child (#849). It runs on
