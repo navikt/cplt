@@ -938,6 +938,7 @@ mod tests {
             with_proxy: true,
             proxy_forced: false,
             deny_dns: false,
+            netns: false,
             inject_github_token: false,
             github_mcp_proxy: true,
             mcp_broker: true,
