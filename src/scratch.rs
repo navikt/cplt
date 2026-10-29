@@ -94,7 +94,7 @@ impl PnpmShadowDir {
         // binary, a symlink into the store. Shadow the binary; `source`
         // stays the PATH entry so direct launches still map to the shadow.
         let pinned = pinned_pnpm_binary(home_dir, launch_dir)
-            .and_then(|binary| pnpm_shadow_source(home_dir, &binary).ok().flatten());
+            .and_then(|binary| pnpm_store_binary_source(home_dir, &binary).ok().flatten());
         let Some(source) =
             pinned.map_or_else(|| pnpm_shadow_source(home_dir, pnpm), |s| Ok(Some(s)))?
         else {
@@ -193,6 +193,15 @@ impl PnpmShadowDir {
     /// Copied pnpm executable used for direct `cplt exec -- pnpm` launches.
     pub fn binary(&self) -> PathBuf {
         self.path.join("pnpm")
+    }
+
+    /// The shadow to run for `cplt exec -- <requested>` resolved to `path`.
+    ///
+    /// Only for a command named `pnpm`: a multicall shim such as mise's can
+    /// serve `node` from the same inode the shadow was copied from.
+    pub fn binary_for(&self, requested: &str, path: &Path) -> Option<PathBuf> {
+        (Path::new(requested).file_name() == Some("pnpm".as_ref()) && self.shadows(path))
+            .then(|| self.binary())
     }
 
     /// Whether `path` names the source inode copied into this shadow.
@@ -296,7 +305,15 @@ pub fn pnpm_shadow_source(
     pnpm: &Path,
 ) -> Result<Option<PnpmShadowSource>, String> {
     let binary = pnpm_cmd_shim_target(home_dir, pnpm);
-    let binary = binary.as_deref().unwrap_or(pnpm);
+    pnpm_store_binary_source(home_dir, binary.as_deref().unwrap_or(pnpm))
+}
+
+/// [`pnpm_shadow_source`] for a path already known to be the binary, so no
+/// shim probe runs on it.
+fn pnpm_store_binary_source(
+    home_dir: &Path,
+    binary: &Path,
+) -> Result<Option<PnpmShadowSource>, String> {
     let roots: Vec<PathBuf> = pnpm_home_roots(home_dir)
         .into_iter()
         .filter_map(|root| std::fs::canonicalize(root.join("store")).ok())
@@ -1863,6 +1880,15 @@ mod tests {
         assert!(shadow.shadows(&pnpm));
         assert!(shadow.shadows(&links.join("pnpm")));
         assert!(!shadow.shadows(&shadow_path));
+        // A multicall shim (mise) serves pnpm and node from one inode.
+        let shims = home.path().join("shims");
+        std::fs::create_dir_all(&shims).unwrap();
+        std::os::unix::fs::symlink(&pnpm, shims.join("pnpm")).unwrap();
+        std::os::unix::fs::symlink(&pnpm, shims.join("node")).unwrap();
+        let via = |name: &str| shadow.binary_for(&shims.join(name).to_string_lossy(), &pnpm);
+        assert_eq!(via("pnpm"), Some(shadow_path.clone()));
+        assert_eq!(via("node"), None);
+        assert_eq!(shadow.binary_for("node", &pnpm), None);
         let session_path = shadow.path().to_path_buf();
         drop(shadow);
         assert!(!session_path.exists());

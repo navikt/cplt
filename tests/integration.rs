@@ -666,9 +666,10 @@ int main(int argc, char **argv) {
         fs::copy("/bin/echo", &tool).expect("copy a real binary into dist");
         fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).expect("chmod tool");
 
-        let shadow = cplt::scratch::PnpmShadowDir::create_if_needed(home.path(), &pnpm)
-            .expect("create pnpm shadow")
-            .expect("hardlinked pnpm must use a shadow");
+        let shadow =
+            cplt::scratch::PnpmShadowDir::create_if_needed(home.path(), &pnpm, home.path())
+                .expect("create pnpm shadow")
+                .expect("hardlinked pnpm must use a shadow");
         let extra_exec = vec![shadow.path().to_path_buf()];
         let mut opts = default_opts(project.path(), home.path());
         opts.extra_exec = &extra_exec;
