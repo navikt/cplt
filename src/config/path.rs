@@ -233,9 +233,10 @@ inject_github_token = true
 #   allow_tmp_exec = false
 # preset = "standard"
 #
-# Refuse to launch when a configured control cannot be enforced on this host,
-# e.g. deny.paths on Linux without bubblewrap. On for new configs; without
-# this line cplt warns and launches. Set to false to launch with the warning.
+# Linux: refuse to launch when a deny.paths entry cannot be enforced (no usable
+# bubblewrap, or a path under /proc, /dev, /sys or /tmp), or when Landlock is
+# below ABI v4 and no proxy is on. A missing deny path only warns. On for new
+# configs; without this line cplt warns and launches. false = warn and launch.
 refuse_unenforced = true
 #
 # Run sandbox-exec validation test on every launch (default: true).

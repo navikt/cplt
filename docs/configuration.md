@@ -911,15 +911,23 @@ The key is off by default, and it is set in your own config, never in `.cplt.tom
 
 ## Refusing deny paths this host cannot enforce (`sandbox.refuse_unenforced`)
 
-Linux only. Without Bubblewrap, Landlock cannot deny a path inside a directory the sandbox allows, so `deny.paths` and `--deny-path` are not enforced. Under Bubblewrap, a path below `/proc`, `/dev`, `/sys` or `/tmp` cannot be masked. With the key on, cplt refuses to launch in these cases and says how to fix it: install bubblewrap, or remove the path from `deny.paths`.
+Linux only. With the key on, cplt refuses to launch in these cases:
 
-`cplt config init` writes `refuse_unenforced = true`. A config without the key keeps the old behaviour: cplt warns and launches, and `cplt doctor` suggests setting the key. To keep launching with the warning:
+- `deny.paths` or `--deny-path` is set and Bubblewrap is not used. Landlock alone cannot deny a path inside a directory the sandbox allows. Bubblewrap can be missing, blocked (for example by AppArmor), or turned off with `sandbox.use_bubblewrap = false` or `--no-bubblewrap`. The error says which, and how to fix it.
+- Bubblewrap is used, but cannot mask a deny path: a path under `/proc`, `/dev`, `/sys` or `/tmp`, or a failure to create the mask file. The error names each path and the reason.
+- Landlock is below ABI v4 (kernel older than 6.7) and no proxy is configured, so outbound connections cannot be restricted.
+
+A deny path that does not exist denies nothing, so it only warns. Only a repository `.cplt.toml` can name such a path: entries in your own config and on the command line must exist when cplt loads them.
+
+`cplt check` and `--print-profile` refuse in the same cases as a launch.
+
+`cplt config init` writes `refuse_unenforced = true`. A config without the key keeps the old behaviour: cplt warns and launches. `cplt doctor` suggests the key when it would change something on this host. To keep launching with the warning:
 
 ```bash
 cplt config set sandbox.refuse_unenforced false
 ```
 
-Built-in protections that need Bubblewrap are not covered by this key. They still warn and launch.
+The key does not cover built-in protections that need Bubblewrap, or `sandbox.deny_nested_git` and `sandbox.deny_key_files_by_extension`. They still warn and launch.
 
 ## Symlinked cache-exec entries (`sandbox.refuse_cache_exec_links`)
 

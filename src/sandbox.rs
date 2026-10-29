@@ -3440,28 +3440,63 @@ pub(crate) fn proc_self_limit_text(advice: ProcAdvice) -> String {
     )
 }
 
-/// The #386 refusal. Names both ways forward: make the control enforceable,
-/// or opt out and launch with the warning.
+/// The #386 check: the configured deny paths this launch cannot enforce,
+/// each with its reason, as the refusal text. `None` when all are enforced.
+/// A path that does not exist denies nothing, so it never refuses; only a
+/// repo `.cplt.toml` can name one (global and CLI entries must exist at load).
 #[cfg(target_os = "linux")]
-fn unenforced_refusal(bwrap_active: bool, paths: &[String]) -> String {
-    let (why, fix) = if bwrap_active {
-        (
-            "could not be mount-masked by Bubblewrap",
-            "remove it from deny.paths (paths under /proc, /dev, /sys and /tmp cannot be \
-             masked)",
-        )
+fn unenforced_refusal(
+    config: &SandboxConfig,
+    bwrap_active: bool,
+    masks: &bubblewrap::DenyMasks,
+) -> Option<String> {
+    let mut lines = Vec::new();
+    for deny in config.extra_deny {
+        let shown = strip_control(&deny.display().to_string());
+        if deny.symlink_metadata().is_err() {
+            crate::ui::warn(&format!(
+                "deny path {shown} (from .cplt.toml) does not exist, so it denies nothing."
+            ));
+            continue;
+        }
+        let canon = deny.canonicalize().unwrap_or_else(|_| deny.clone());
+        let why = if !bwrap_active {
+            "Landlock alone cannot deny a subpath of an allowed directory".to_string()
+        } else if !masks.skipped().iter().any(|p| *p == canon || p == deny) {
+            continue;
+        } else if ["/proc", "/dev", "/sys", "/tmp"]
+            .iter()
+            .any(|r| canon.starts_with(r))
+        {
+            "Bubblewrap cannot mask a path under /proc, /dev, /sys or /tmp".to_string()
+        } else {
+            masks
+                .placeholder_error()
+                .unwrap_or("Bubblewrap could not mask it")
+                .to_string()
+        };
+        lines.push(format!("  {shown} (deny.paths or --deny-path): {why}"));
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    let fix = if bwrap_active {
+        "Remove the path from deny.paths.".to_string()
+    } else if config.use_bubblewrap == Some(false) {
+        "Remove sandbox.use_bubblewrap = false (or --no-bubblewrap) so Bubblewrap masks it."
+            .to_string()
+    } else if bubblewrap::check_availability().is_none() {
+        format!("Install bubblewrap: {}.", crate::doctor::BWRAP_INSTALL_HINT)
+    } else if let Some(fix) = crate::doctor::apparmor_fix() {
+        fix
     } else {
-        (
-            "cannot be enforced without Bubblewrap: Landlock cannot deny a subpath of an \
-             allowed directory",
-            "install bubblewrap (and check `cplt doctor`)",
-        )
+        "Bubblewrap is installed but not usable; run `cplt doctor` to see why.".to_string()
     };
-    format!(
-        "Refusing to launch: deny path(s) {} {why}. To fix, {fix}, or launch with the \
-         warning instead: cplt config set sandbox.refuse_unenforced false",
-        paths.join(", ")
-    )
+    Some(format!(
+        "Refusing to launch: these deny paths cannot be enforced on this host:\n{}\n{fix}\n\
+         Or launch with a warning instead: cplt config set sandbox.refuse_unenforced false",
+        lines.join("\n")
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -3810,29 +3845,27 @@ fn prepare_impl(
     // #386: a configured deny the backend cannot honour refuses the launch
     // when `sandbox.refuse_unenforced` is on (new configs); unset keeps the
     // warnings below. Built-in controls are not counted here.
-    if config.refuse_unenforced && !inspect_only {
-        let unenforced: Vec<String> = if bwrap_wrapper.is_some() {
-            deny_masks
-                .skipped()
-                .iter()
-                .filter(|p| {
-                    config
-                        .extra_deny
-                        .iter()
-                        .any(|d| d == *p || d.canonicalize().is_ok_and(|c| c == **p))
-                })
-                .map(|p| p.display().to_string())
-                .collect()
-        } else {
-            config
-                .extra_deny
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect()
-        };
-        if !unenforced.is_empty() {
-            return Err(unenforced_refusal(bwrap_wrapper.is_some(), &unenforced));
-        }
+    if config.refuse_unenforced
+        && let Some(refusal) = unenforced_refusal(config, bwrap_wrapper.is_some(), &deny_masks)
+    {
+        return Err(refusal);
+    }
+    // #386: Landlock below ABI v4 cannot filter TCP, so without the proxy the
+    // configured port/domain restriction would be dropped (the "UNRESTRICTED"
+    // warning in `sandbox_landlock`).
+    if config.refuse_unenforced
+        && policy.restrict_net_connect
+        && !policy.net_rules.iter().any(|r| r.port != 443)
+        && landlock_mod::check_availability().is_ok_and(|abi| abi < landlock::ABI::V4)
+    {
+        return Err(
+            "Refusing to launch: Landlock below ABI v4 (kernel < 6.7) cannot \
+             restrict outbound connections, and no proxy is configured, so the network \
+             restriction would not apply. Enable the proxy (--with-proxy) or upgrade to \
+             kernel 6.7+, or launch with a warning instead: \
+             cplt config set sandbox.refuse_unenforced false"
+                .to_string(),
+        );
     }
 
     if !config.extra_deny.is_empty() {
@@ -4930,6 +4963,7 @@ mod tests {
         let home = root.join("home");
         let project = root.join("project");
         let deny = [home.join("secret")];
+        std::fs::write(&deny[0], "x").unwrap();
         let mut config = test_config(&home, &[]);
         config.project_dir = &project;
         config.existing_home_tool_dirs = Some(&[]);
@@ -4940,8 +4974,43 @@ mod tests {
         let Err(error) = prepare(&config) else {
             panic!("an unenforceable deny path must refuse the launch");
         };
-        assert!(error.contains("install bubblewrap"), "{error}");
+        assert!(error.contains("sandbox.use_bubblewrap = false"), "{error}");
         assert!(error.contains("sandbox.refuse_unenforced false"), "{error}");
+        // `cplt check` / `--print-profile` refuse exactly when a launch does.
+        let Err(inspected) = prepare_with_pnpm_shadow(&config, None, true) else {
+            panic!("inspect must refuse like the launch");
+        };
+        assert_eq!(inspected, error);
+    }
+
+    /// #386: a deny path that does not exist (only a repo `.cplt.toml` can
+    /// name one) denies nothing, so it warns and never refuses.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_deny_path_never_refuses() {
+        let (_guard, root) = copilot_cache_tree();
+        let home = root.join("home");
+        let project = root.join("project");
+        let deny = [project.join("not-there")];
+        for bwrap in [Some(false), None] {
+            if bwrap.is_none() && bubblewrap::check_availability().is_none() {
+                continue;
+            }
+            let mut config = test_config(&home, &[]);
+            config.project_dir = &project;
+            config.existing_home_tool_dirs = Some(&[]);
+            config.extra_deny = &deny;
+            config.use_bubblewrap = bwrap;
+            config.refuse_unenforced = true;
+            let r = prepare(&config);
+            assert!(
+                r.as_ref()
+                    .err()
+                    .is_none_or(|e| !e.contains("refuse_unenforced")),
+                "{bwrap:?}: {:?}",
+                r.err()
+            );
+        }
     }
 
     /// The reproduced attack: a planted `~/.cache/ms-playwright` aimed at a

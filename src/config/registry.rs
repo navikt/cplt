@@ -435,7 +435,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: false,
         default_display: "false",
-        description: "Refuse to launch when a configured control cannot be enforced on this host, such as deny.paths on Linux without bubblewrap. On in new configs; without the key cplt warns and launches. Set it to false to launch with the warning (#386).",
+        description: "Linux only: refuse to launch when a deny.paths / --deny-path entry cannot be enforced (no usable bubblewrap, or a path under /proc, /dev, /sys or /tmp), or when Landlock is below ABI v4 and no proxy is configured. A deny path that does not exist only warns. On in new configs; without the key cplt warns and launches. Set it to false to launch with the warning (#386).",
     },
     ConfigKeyInfo {
         section: "sandbox",

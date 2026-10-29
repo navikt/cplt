@@ -1173,16 +1173,26 @@ pub fn proxy_forced_nudge(r: &crate::config::Resolved, can_force: bool) -> Optio
 }
 
 /// The nudge for a config from before `sandbox.refuse_unenforced` (#386).
-/// Linux only, where a deny path can go unenforced; shown while no layer set
-/// the key and deny paths are configured. Never changes anything.
+/// Shown only where it would change something on this host: a deny path
+/// that bubblewrap is not there to enforce, or one it cannot mask. Silent
+/// once the key is set either way. Never changes anything.
 #[must_use]
-pub fn refuse_unenforced_nudge(r: &crate::config::Resolved, linux: bool) -> Option<Finding> {
+pub fn refuse_unenforced_nudge(r: &crate::config::Resolved, bwrap: &Bubblewrap) -> Option<Finding> {
     let unset =
         r.bool_layer("sandbox", "refuse_unenforced") == Some(crate::config::ConfigLayer::Baseline);
-    (linux && unset && !r.deny_paths.is_empty()).then(|| {
+    let applies = match bwrap {
+        Bubblewrap::NotApplicable => false,
+        Bubblewrap::Usable(_) => r.deny_paths.iter().any(|p| {
+            ["/proc", "/dev", "/sys", "/tmp"]
+                .iter()
+                .any(|root| p.starts_with(root))
+        }),
+        _ => true,
+    };
+    (unset && applies && !r.deny_paths.is_empty()).then(|| {
         Finding::warning(
-            "A deny path that cannot be enforced on this host (no bubblewrap, or a path \
-             bubblewrap cannot mask) only warns, and the agent still launches. New configs \
+            "A deny path in your config is not enforced on this host (bubblewrap is not \
+             usable, or cannot mask the path). cplt warns and launches anyway. New configs \
              refuse the launch instead.",
             Some(
                 "cplt config set sandbox.refuse_unenforced true, or \
@@ -1214,22 +1224,27 @@ mod tests {
                 .merge(crate::config::CliFlags::default())
                 .unwrap()
         };
-        let deny = "[deny]\npaths = [\"/tmp\"]\n";
+        let usable = Bubblewrap::Usable(PathBuf::from("/usr/bin/bwrap"));
+        let deny = "[deny]\npaths = [\"/dev\"]\n";
         let old = r(deny);
         assert!(!old.refuse_unenforced);
-        assert!(refuse_unenforced_nudge(&old, true).is_some());
+        assert!(refuse_unenforced_nudge(&old, &Bubblewrap::NotInstalled).is_some());
         assert!(
-            refuse_unenforced_nudge(&old, false).is_none(),
-            "macOS enforces denies"
+            refuse_unenforced_nudge(&old, &usable).is_some(),
+            "/dev cannot be masked"
         );
-        assert!(
-            refuse_unenforced_nudge(&r(""), true).is_none(),
-            "no deny paths"
-        );
+        assert!(refuse_unenforced_nudge(&old, &Bubblewrap::NotApplicable).is_none());
+        let maskable = r(concat!(
+            "[deny]\npaths = [\"",
+            env!("CARGO_MANIFEST_DIR"),
+            "\"]\n"
+        ));
+        assert!(refuse_unenforced_nudge(&maskable, &usable).is_none());
+        assert!(refuse_unenforced_nudge(&r(""), &Bubblewrap::NotInstalled).is_none());
         let set = |v: bool| r(&format!("[sandbox]\nrefuse_unenforced = {v}\n{deny}"));
         assert!(set(true).refuse_unenforced);
-        assert!(refuse_unenforced_nudge(&set(true), true).is_none());
-        assert!(refuse_unenforced_nudge(&set(false), true).is_none());
+        assert!(refuse_unenforced_nudge(&set(true), &Bubblewrap::Disabled).is_none());
+        assert!(refuse_unenforced_nudge(&set(false), &Bubblewrap::Disabled).is_none());
     }
 
     #[test]
