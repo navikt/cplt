@@ -999,6 +999,7 @@ mod tests {
             keychain_substitute: Some(false),
             allow_build_credentials: false,
             allow_git_worktrees: false,
+            allow_git_config_write: true,
             worktree_walk_max_dirs: crate::worktrees::DEFAULT_WALK_MAX_DIRS,
             allow_msbuild: false,
             allow_tmp_exec: false,
