@@ -6835,7 +6835,10 @@ fn assemble_sandbox(
         .or_else(|| resolve_exec_binary("pnpm").ok());
     let pnpm_shadow_guard = pnpm
         .as_ref()
-        .map(|pnpm| scratch::PnpmShadowDir::create_if_needed(home_dir, pnpm))
+        .map(|pnpm| {
+            let launch_dir = std::env::current_dir().unwrap_or_else(|_| probe.project_dir.clone());
+            scratch::PnpmShadowDir::create_if_needed(home_dir, pnpm, &launch_dir)
+        })
         .transpose()
         .map_err(|error| anyhow::anyhow!("Cannot prepare pnpm executable: {error}"))?
         .flatten();
