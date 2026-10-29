@@ -667,9 +667,10 @@ int main(int argc, char **argv) {
         fs::copy("/bin/echo", &tool).expect("copy a real binary into dist");
         fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).expect("chmod tool");
 
-        let shadow = cplt::scratch::PnpmShadowDir::create_if_needed(home.path(), &pnpm)
-            .expect("create pnpm shadow")
-            .expect("hardlinked pnpm must use a shadow");
+        let shadow =
+            cplt::scratch::PnpmShadowDir::create_if_needed(home.path(), &pnpm, home.path())
+                .expect("create pnpm shadow")
+                .expect("hardlinked pnpm must use a shadow");
         let extra_exec = vec![shadow.path().to_path_buf()];
         let mut opts = default_opts(project.path(), home.path());
         opts.extra_exec = &extra_exec;
@@ -735,9 +736,10 @@ int main(int argc, char **argv) {
         fs::set_permissions(&standalone, fs::Permissions::from_mode(0o755))
             .expect("make standalone executable");
 
-        let shadow = cplt::scratch::PnpmShadowDir::create_if_needed(home.path(), &source)
-            .expect("create pnpm shadow")
-            .expect("hardlinked pnpm must use a shadow");
+        let shadow =
+            cplt::scratch::PnpmShadowDir::create_if_needed(home.path(), &source, home.path())
+                .expect("create pnpm shadow")
+                .expect("hardlinked pnpm must use a shadow");
         fs::remove_dir_all(&package_manager_store)
             .expect("reset package-manager-store for first-use sandbox test");
         let extra_exec = vec![shadow.path().to_path_buf(), standalone.clone()];

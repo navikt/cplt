@@ -1288,6 +1288,56 @@ fun main() {
     }
 
     #[test]
+    fn pnpm_runs_the_pinned_version_from_a_shadow_not_the_store() {
+        require_sandbox!();
+        use std::os::unix::fs::PermissionsExt;
+
+        // #890: pnpm 11 would spawn the pinned version from the store, which
+        // the sandbox will not execute. cplt shadows it instead.
+        let project = TempProject::scaffold_node();
+        fs::write(
+            project.path().join("package.json"),
+            r#"{"name":"p","packageManager":"pnpm@11.25.0"}"#,
+        )
+        .expect("pin pnpm");
+        let home = tempfile::Builder::new()
+            .prefix(".cplt-e2e-pnpm-pinned-home-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("create home");
+        let pnpm_home = home.path().join("Library/pnpm");
+        let exe = pnpm_home.join("store/v11/links/@pnpm/exe/11.25.0/abc/node_modules/@pnpm/exe");
+        fs::create_dir_all(&exe).expect("create pinned store dir");
+        let pinned = exe.join("pnpm");
+        fs::copy(env!("CARGO_BIN_EXE_cplt"), &pinned).expect("copy a real binary as pinned pnpm");
+        fs::set_permissions(&pinned, fs::Permissions::from_mode(0o755)).unwrap();
+        let pnpm = pnpm_home.join("pnpm");
+        fs::write(&pnpm, "#!/bin/sh\nprintf 'RESULT:global\\n'\n").expect("write global pnpm");
+        fs::set_permissions(&pnpm, fs::Permissions::from_mode(0o755)).unwrap();
+
+        for args in [
+            vec!["exec", "--", "pnpm", "--version"],
+            vec!["exec", "-c", "pnpm --version"],
+        ] {
+            let output = cplt_cmd()
+                .args(["--yes", "--no-validate", "--quiet"])
+                .args(["--project-dir", &project.canonical_path().to_string_lossy()])
+                .args(args)
+                .current_dir(project.path())
+                .env("HOME", home.path())
+                .env("PNPM_HOME", &pnpm_home)
+                .env("PATH", format!("{}:/usr/bin:/bin", pnpm_home.display()))
+                .output()
+                .expect("cplt should run pnpm");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains(&format!("cplt {}", env!("CARGO_PKG_VERSION"))),
+                "pnpm must run the pinned version's shadow.\nstdout: {stdout}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
     fn pnpm_home_binary_gets_an_exact_execute_grant() {
         require_sandbox!();
         use std::os::unix::fs::PermissionsExt;
