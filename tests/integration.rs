@@ -644,6 +644,63 @@ int main(int argc, char **argv) {
     }
 
     #[test]
+    fn real_profile_pnpm_shadow_dist_link_stays_non_executable() {
+        require_sandbox!();
+        let project = tempfile::Builder::new()
+            .prefix(".cplt-pnpm-project-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("create project");
+        let home = tempfile::Builder::new()
+            .prefix(".cplt-pnpm-home-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("create home");
+        let store = home
+            .path()
+            .join("Library/pnpm/store/v11/links/@/pnpm/11.0.0/abc");
+        let dist = store.join("dist");
+        fs::create_dir_all(&dist).expect("create store dist");
+        let pnpm = store.join("pnpm");
+        fs::copy(env!("CARGO_BIN_EXE_cplt"), &pnpm).expect("copy a real binary as fake pnpm");
+        fs::hard_link(&pnpm, store.join("alias")).expect("create store hardlink");
+        fs::write(dist.join("pnpm.mjs"), "asset-ok\n").expect("write dist asset");
+        let tool = dist.join("tool");
+        fs::copy("/bin/echo", &tool).expect("copy a real binary into dist");
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).expect("chmod tool");
+
+        let shadow = cplt::scratch::PnpmShadowDir::create_if_needed(home.path(), &pnpm)
+            .expect("create pnpm shadow")
+            .expect("hardlinked pnpm must use a shadow");
+        let extra_exec = vec![shadow.path().to_path_buf()];
+        let mut opts = default_opts(project.path(), home.path());
+        opts.extra_exec = &extra_exec;
+        let profile = write_real_profile(&opts);
+        let linked = shadow.path().join("dist");
+        let (asset, asset_ok) = run_sandboxed(
+            &profile,
+            &format!("cat '{}'", linked.join("pnpm.mjs").display()),
+        );
+        let (via_link, via_link_ok) = run_sandboxed(
+            &profile,
+            &format!("'{}' exec-ran", linked.join("tool").display()),
+        );
+        let (via_store, via_store_ok) =
+            run_sandboxed(&profile, &format!("'{}' exec-ran", tool.display()));
+        fs::remove_file(&profile).ok();
+        assert!(
+            asset_ok && asset.contains("asset-ok"),
+            "dist asset must be readable: {asset}"
+        );
+        assert!(
+            !via_link_ok && !via_link.contains("exec-ran"),
+            "a store binary must not run through the shadow dist link: {via_link}"
+        );
+        assert!(
+            !via_store_ok && !via_store.contains("exec-ran"),
+            "a store binary must not run from its store path: {via_store}"
+        );
+    }
+
+    #[test]
     fn real_profile_runs_pnpm_shadow_without_executing_the_store() {
         require_sandbox!();
         let project = tempfile::Builder::new()
@@ -668,7 +725,7 @@ int main(int argc, char **argv) {
         let new_alias = store.join("new-alias");
         let other = store.join("not-pnpm");
         let managed_pnpm = package_manager_store.join("v10/pnpm");
-        fs::write(&source, "#!/bin/sh\nprintf 'pnpm hardlink ran\\n'\n").expect("write fake pnpm");
+        fs::copy(env!("CARGO_BIN_EXE_cplt"), &source).expect("copy a real binary as fake pnpm");
         fs::write(&standalone, "#!/bin/sh\nprintf 'standalone ran\\n'\n")
             .expect("write standalone executable");
         fs::hard_link(&source, &pnpm).expect("create pnpm hardlink");
@@ -693,9 +750,9 @@ int main(int argc, char **argv) {
              chmod 755 '{managed_pnpm}' && '{managed_pnpm}' && \
              if ln '{standalone}' '{new_alias}'; then printf 'link:FAIL\n'; else printf 'link:OK\n'; fi && \
              '{standalone}' && \
-             PATH='{shadow}:/usr/bin:/bin' pnpm && \
+             PATH='{shadow}:/usr/bin:/bin' pnpm --version && \
              printf compromised > '{pnpm}' && \
-             PATH='{shadow}:/usr/bin:/bin' pnpm",
+             PATH='{shadow}:/usr/bin:/bin' pnpm --version",
             managed_dir = managed_pnpm.parent().unwrap().display(),
             managed_pnpm = managed_pnpm.display(),
             standalone = standalone.display(),
@@ -718,7 +775,9 @@ int main(int argc, char **argv) {
             "a read-only executable must not be linkable into the writable store: {output}"
         );
         assert_eq!(
-            output.matches("pnpm hardlink ran").count(),
+            output
+                .matches(&format!("cplt {}", env!("CARGO_PKG_VERSION")))
+                .count(),
             2,
             "mutating the store inode must not change the copied shadow: {output}"
         );

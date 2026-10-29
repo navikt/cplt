@@ -1168,15 +1168,20 @@ fun main() {
         fs::create_dir_all(&global).expect("create pnpm global dir");
         fs::create_dir_all(&links).expect("create pnpm store links");
         let pnpm = global.join("pnpm");
-        fs::write(&pnpm, "#!/bin/sh\nprintf 'RESULT:pnpm:%s\\n' \"$0\"\n")
-            .expect("write fake pnpm");
+        // A real binary: the shadow copies nothing but ELF or Mach-O.
+        fs::copy(env!("CARGO_BIN_EXE_cplt"), &pnpm).expect("copy fake pnpm");
         fs::set_permissions(&pnpm, fs::Permissions::from_mode(0o755))
             .expect("make fake pnpm executable");
         let store_pnpm = links.join("pnpm");
         fs::hard_link(&pnpm, &store_pnpm).expect("hardlink pnpm into store");
         let path = format!("{}:/usr/bin:/bin", global.display());
 
-        for args in [vec!["exec", "--", "pnpm"], vec!["exec", "-c", "pnpm"]] {
+        let version = format!("cplt {}", env!("CARGO_PKG_VERSION"));
+        for args in [
+            vec!["exec", "--", "pnpm", "--version"],
+            vec!["exec", "-c", "pnpm --version && command -v pnpm"],
+        ] {
+            let shell = args[1] == "-c";
             let output = cplt_cmd()
                 .args(["--yes", "--no-validate", "--quiet"])
                 .args(["--project-dir", &project.canonical_path().to_string_lossy()])
@@ -1192,8 +1197,10 @@ fun main() {
                 "pnpm should run through its shadow.\nstdout: {stdout}\nstderr: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
+            assert!(stdout.contains(&version), "{stdout}");
+            // The binary prints no path of its own; PATH lookup shows it.
             assert!(
-                stdout.contains("RESULT:pnpm:") && stdout.contains(".cplt-pnpm-shadow"),
+                !shell || stdout.contains(".cplt-pnpm-shadow"),
                 "pnpm must resolve to the cplt-owned shadow: {stdout}"
             );
         }
@@ -1202,7 +1209,7 @@ fun main() {
             let output = cplt_cmd()
                 .args(["--yes", "--no-validate", "--quiet"])
                 .args(["--project-dir", &project.canonical_path().to_string_lossy()])
-                .args(["exec", "--", &direct.to_string_lossy()])
+                .args(["exec", "--", &direct.to_string_lossy(), "--version"])
                 .current_dir(project.path())
                 .env("HOME", home.path())
                 .env("PATH", "/usr/bin:/bin")
@@ -1214,8 +1221,10 @@ fun main() {
                 "direct pnpm path should run through its shadow.\nstdout: {stdout}\nstderr: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
+            // The store path is non-executable, so success means the
+            // launch was mapped to the shadow.
             assert!(
-                stdout.contains(".cplt-pnpm-shadow"),
+                stdout.contains(&version),
                 "direct pnpm path must resolve to the cplt-owned shadow: {stdout}"
             );
         }
@@ -1238,11 +1247,7 @@ fun main() {
         fs::create_dir_all(&pinned_dir).expect("create package manager store");
 
         let pnpm = pnpm_home.join("pnpm");
-        fs::write(
-            &pnpm,
-            "#!/bin/sh\n\"$PNPM_HOME/package-manager-store/v10/pnpm\"\n",
-        )
-        .expect("write fake pnpm");
+        fs::copy(env!("CARGO_BIN_EXE_cplt"), &pnpm).expect("copy fake pnpm");
         fs::set_permissions(&pnpm, fs::Permissions::from_mode(0o755))
             .expect("make fake pnpm executable");
         fs::hard_link(&pnpm, links.join("pnpm")).expect("hardlink pnpm into custom store");
@@ -1255,7 +1260,11 @@ fun main() {
         let output = cplt_cmd()
             .args(["--yes", "--no-validate", "--quiet"])
             .args(["--project-dir", &project.canonical_path().to_string_lossy()])
-            .args(["exec", "-c", "pnpm"])
+            .args([
+                "exec",
+                "-c",
+                "pnpm --version && \"$PNPM_HOME/package-manager-store/v10/pnpm\"",
+            ])
             .current_dir(project.path())
             .env("HOME", home.path())
             .env("PNPM_HOME", &pnpm_home)
@@ -1267,6 +1276,10 @@ fun main() {
             output.status.success(),
             "custom pnpm should run its pinned package manager.\nstdout: {stdout}\nstderr: {}",
             String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains(&format!("cplt {}", env!("CARGO_PKG_VERSION"))),
+            "custom pnpm must run through its shadow: {stdout}"
         );
         assert!(
             stdout.contains("RESULT:pinned:OK"),

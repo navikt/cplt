@@ -9164,7 +9164,7 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     let doctor_pnpm = resolve_exec_binary("pnpm").ok();
     let doctor_pnpm_shadowed = doctor_pnpm
         .as_ref()
-        .is_some_and(|pnpm| scratch::pnpm_requires_shadow(&home_dir, pnpm).unwrap_or(false));
+        .is_some_and(|pnpm| matches!(scratch::pnpm_shadow_source(&home_dir, pnpm), Ok(Some(_))));
     let mut doctor_exec = resolved.allow_exec.clone();
     doctor_exec.extend(pnpm_exec_grants(
         &home_dir,
