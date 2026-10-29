@@ -458,6 +458,52 @@ fn probe_reason(raw: &str, home: &Path) -> String {
     )
 }
 
+/// xdg-dbus-proxy in a trusted dir, the one the broker runs (#849).
+#[must_use]
+pub fn dbus_proxy_installed() -> bool {
+    crate::git::trusted_binary("xdg-dbus-proxy").is_some()
+}
+
+/// A brokered MCP server whose login lives in the keychain gets the
+/// session bus only through xdg-dbus-proxy, filtered to the Secret Service
+/// (#849). `servers`: the ids of such specs; `found`: the proxy is in a
+/// trusted dir.
+#[must_use]
+pub fn dbus_proxy_finding(servers: &[String], found: bool) -> Option<Finding> {
+    (!servers.is_empty() && !found).then(|| {
+        Finding::warning(
+            format!(
+                "xdg-dbus-proxy is not installed: the brokered MCP server(s) {} get no session \
+                 bus, so they cannot read their keychain login.",
+                servers.join(", ")
+            ),
+            Some(
+                "install xdg-dbus-proxy from your distribution's packages, or run \
+                 `cplt doctor --fix`"
+                    .to_string(),
+            ),
+        )
+    })
+}
+
+/// bwrap before 0.8 has no `--disable-userns`, so a brokered MCP server
+/// child on Linux may create nested user namespaces (#849): more kernel
+/// surface, no host privilege. The child still starts. `servers`: the
+/// brokered spec ids; `supported`: [`crate::mcp_broker::bwrap_disables_userns`].
+#[must_use]
+pub fn disable_userns_finding(servers: &[String], supported: Option<bool>) -> Option<Finding> {
+    (!servers.is_empty() && supported == Some(false)).then(|| {
+        Finding::warning(
+            format!(
+                "bubblewrap is older than 0.8: the brokered MCP server(s) {} run without \
+                 --disable-userns, so they can create nested user namespaces.",
+                servers.join(", ")
+            ),
+            Some("upgrade bubblewrap to 0.8 or later".to_string()),
+        )
+    })
+}
+
 /// Auto-detect (`use_bubblewrap` unset) found no usable bubblewrap, so the
 /// launch runs Landlock + seccomp only and says so in one line nobody reads.
 /// `use_bubblewrap = true` has its own blocking finding; `false` was a choice.
@@ -1540,6 +1586,14 @@ mod tests {
 
     #[test]
     fn bubblewrap_finding_only_on_auto_detect_without_a_usable_bwrap() {
+        assert!(disable_userns_finding(&["nais".into()], Some(true)).is_none());
+        assert!(disable_userns_finding(&["nais".into()], None).is_none());
+        assert!(disable_userns_finding(&[], Some(false)).is_none());
+        assert!(disable_userns_finding(&["nais".into()], Some(false)).is_some());
+        assert!(dbus_proxy_finding(&[], false).is_none());
+        assert!(dbus_proxy_finding(&["nais".into()], true).is_none());
+        let f = dbus_proxy_finding(&["nais".into()], false).expect("missing proxy warns");
+        assert!(f.message.contains("nais"), "{}", f.message);
         let missing = Bubblewrap::NotInstalled;
         let f = bubblewrap_finding(&missing, None, None).expect("not installed warns");
         assert_eq!(f.level, Level::Warning);

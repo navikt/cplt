@@ -444,8 +444,8 @@ jobs:
           fi
           bwrap --unshare-user --unshare-pid --ro-bind / / --proc /proc --dev /dev --tmpfs /tmp /bin/true
 
-      - name: Install a session bus
-        run: sudo apt-get install -y dbus
+      - name: Install a session bus and xdg-dbus-proxy
+        run: sudo apt-get install -y dbus xdg-dbus-proxy
 
       - name: Run the MCP broker e2e under a real session bus
         env:
@@ -457,8 +457,10 @@ jobs:
           sed "s|<listen>.*</listen>|<listen>unix:path=$HOME/cplt-ci-session-bus</listen>|" \
             /usr/share/dbus-1/session.conf > "$RUNNER_TEMP/session.conf"
           cargo build --test mcp_broker
+          cargo test --lib --no-run
           dbus-run-session --config-file="$RUNNER_TEMP/session.conf" -- \
-            sh -c 'echo "bus: $DBUS_SESSION_BUS_ADDRESS"; cargo test --test mcp_broker -- --nocapture'
+            sh -c 'echo "bus: $DBUS_SESSION_BUS_ADDRESS"; cargo test --test mcp_broker -- --nocapture \
+              && cargo test --lib keychain_child_reaches_only_the_secret_service -- --nocapture'
 
   # `cplt doctor --fix` (#841) on a stock 24.04 runner: the AppArmor userns
   # block is live, the fix runs through the runner's passwordless sudo in a

@@ -21,24 +21,55 @@ fn e2e_mcp_broker_filters_tools_and_refuses_calls() {
     }
     let home = home_temp_dir("mcp-broker");
     let home_path = std::fs::canonicalize(home.path()).unwrap();
-    let server = home_path.join("fake_mcp.py");
+    // Outside HOME: the Linux child's HOME is an empty tmpfs.
+    let server_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let server = std::fs::canonicalize(server_dir.path())
+        .unwrap()
+        .join("fake_mcp.py");
     std::fs::write(
         &server,
-        r#"import sys, json, os, socket
+        r#"import sys, json, os, socket, errno
 def probe(target):
     host, port = os.environ["HTTPS_PROXY"].rsplit(":", 1)
     s = socket.create_connection((host.split("//")[1], int(port)), timeout=5)
     s.sendall(("CONNECT " + target + " HTTP/1.1\r\nHost: " + target + "\r\n\r\n").encode())
     return s.recv(64).decode().split("\r\n")[0]
 def direct():
-    # Past the proxy, to an address: Seatbelt refuses with EPERM (#849).
+    # Past the proxy, to an address (#849): Seatbelt refuses with EPERM; in
+    # the Linux child's own network namespace there is no route.
     try:
         socket.create_connection(("1.1.1.1", 443), timeout=5).close()
         return "open"
     except PermissionError:
         return "blocked"
     except OSError as e:
+        if e.errno == errno.ENETUNREACH and sys.platform.startswith("linux"):
+            return "blocked"
         return "error " + str(e.errno)
+def home_write():
+    # The Linux child's root is read-only: EROFS outside its grants.
+    try:
+        open(os.path.join(os.environ["HOME"], "x"), "w").close()
+        return "open"
+    except OSError as e:
+        return errno.errorcode.get(e.errno, str(e.errno))
+def reach(path):
+    c = socket.socket(socket.AF_UNIX)
+    c.settimeout(2)
+    try:
+        c.connect(path)
+        return "open"
+    except OSError:
+        return "closed"
+def sandbox():
+    if not sys.platform.startswith("linux"):
+        return ""
+    home = os.environ["HOME"]
+    return ("|HOME:" + home_write() + "|HOMELS:" + ",".join(sorted(os.listdir(home)))
+            + "|XSOCK:" + reach(os.path.join(home, "x.sock"))
+            + "|NIX:" + reach("/nix/var/nix/daemon-socket/socket")
+            + "|TMP:" + ",".join(sorted(os.listdir("/tmp")))
+            + "|BUS:" + os.environ.get("DBUS_SESSION_BUS_ADDRESS", "none"))
 for line in sys.stdin:
     m = json.loads(line)
     if "id" not in m:
@@ -49,7 +80,7 @@ for line in sys.stdin:
     elif meth == "tools/list":
         r = {"tools": [{"name": "echo", "inputSchema": {}}, {"name": "delete_everything", "inputSchema": {}}]}
     elif meth == "tools/call" and m["params"]["name"] == "probe":
-        r = {"content": [{"type": "text", "text": "PROBE:" + probe("example.com:443") + "|" + probe("example.org:80") + "|DIRECT:" + direct()}]}
+        r = {"content": [{"type": "text", "text": "PROBE:" + probe("example.com:443") + "|" + probe("example.org:80") + "|DIRECT:" + direct() + sandbox()}]}
     elif meth == "tools/call":
         r = {"content": [{"type": "text", "text": "SERVER-RAN:" + m["params"]["name"]}]}
     else:
@@ -156,6 +187,11 @@ if sys.platform.startswith("linux"):
         ),
     )
     .unwrap();
+    // A socket in HOME, as Docker Desktop's: the host reaches it (the
+    // control), the Linux child must not.
+    let x_sock = home_path.join("x.sock");
+    let _x = std::os::unix::net::UnixListener::bind(&x_sock).unwrap();
+    std::os::unix::net::UnixStream::connect(&x_sock).expect("control: x.sock on the host");
     // A fake session bus in a runtime dir of our own: the broker must hide it.
     let fake_rt = home_path.join("runtime");
     std::fs::create_dir(&fake_rt).unwrap();
@@ -261,15 +297,24 @@ if sys.platform.startswith("linux"):
         }
         let probe = resp[4]["result"]["content"][0]["text"].as_str().unwrap();
         let (probe, direct) = probe.split_once("|DIRECT:").unwrap();
+        let (direct, sandbox) = direct.split_once('|').unwrap_or((direct, ""));
+        if cfg!(target_os = "linux") {
+            // An empty, read-only HOME (no grants for credential `none`), so
+            // no socket in it; no Nix daemon; a private /tmp holding only
+            // the egress socket; and no bus for a non-keychain server.
+            assert_eq!(
+                sandbox, "HOME:EROFS|HOMELS:|XSOCK:closed|NIX:closed|TMP:cplt-egress.sock|BUS:none",
+                "{stdout}"
+            );
+        }
         assert_eq!(
             probe, "PROBE:HTTP/1.1 403 Forbidden|HTTP/1.1 403 Forbidden",
             "{stdout}"
         );
-        // The child's own sandbox (#849): macOS only; Linux is not
-        // network-sandboxed yet (docs/design/mcp-host-broker.md).
-        if cfg!(target_os = "macos") {
-            assert_eq!(direct, "blocked", "{stdout}");
-        }
+        // The child's own sandbox (#849): the 403s above came back through
+        // the egress proxy (on Linux over the bound socket and the relay in
+        // the child's namespace), and a connect past it fails.
+        assert_eq!(direct, "blocked", "{stdout}");
         assert!(stderr.contains("egress → DENIED example.com"), "{stderr}");
         let agent = stdout
             .lines()

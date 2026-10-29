@@ -18,7 +18,7 @@ marked **(unverified)** were not checked against source or by running them.
 | D4 | Spec format | Built from standard MCP `server.json` fields; only what the spec lacks goes in a namespaced `_meta` extension (section 5.2). Any spec-compliant registry could feed cplt |
 | D5 | Clients | All, from phase 1: Copilot CLI (`--disable-mcp-server` + `--additional-mcp-config`), OpenCode (`OPENCODE_CONFIG_CONTENT`), pi where possible |
 | D6 | Local transport | stdio over a per-session Unix socket. Client entry: `command: cplt mcp-stdio <id>`, piped to the host child, after `src/worktree_broker.rs`. macOS first; Linux needs a bwrap bind (later). Remote kind (GitHub) keeps the HTTP proxy path |
-| D7 | Host child | Sandboxed on macOS since #849 (TCP only to its egress proxy, writes only to its temp and config dirs); unsandboxed on Linux. Phase 1 was unsandboxed, env cleared, egress pinned with `HTTPS_PROXY` to cplt's CONNECT proxy, allowed to the spec's hosts only. File profile later; it must allow writes to nais's config dir and the keyring (refresh rewrites both), and on Linux the D-Bus session socket (nais uses go-keyring) |
+| D7 | Host child | Sandboxed since #849: on macOS by Seatbelt, on Linux by bwrap with its own network namespace (TCP only to its egress proxy, writes only to its temp and config dirs). Phase 1 was unsandboxed, env cleared, egress pinned with `HTTPS_PROXY` to cplt's CONNECT proxy, allowed to the spec's hosts only. Both grant writes to nais's config dir (refresh rewrites it); macOS the login keychain file, Linux the D-Bus session socket (go-keyring) |
 | D8 | Tools | Read-only by default. Writes opted in per server with `nav-pilot mcp enable --tools`, written to the user's cplt config. New or unclassified tools refused until re-consent. Write tools off by default for brokered servers |
 | D9 | GraphQL | Broker refuses a `mutation` or `subscription` keyword, or more than one operation, with a simple check. File the nais/cli fix first (it checks only `Operations[0]`) |
 | D10 | Login | nav-pilot runs `nais login -n` / `gh auth login` on the host after a yes; with `--json` or no tty it only prints the command. Nais status: `nais auth print-access-token` |
@@ -369,7 +369,12 @@ Kept until a third server makes the shared model worth it (D15).
 ```
 
 Runs launch detection without starting a child. `credential_ok` uses the
-mechanism's status probe; no secret is printed.
+mechanism's status probe; no secret is printed. On Linux the probe runs in
+the server's own sandbox (bwrap, filtered bus, egress proxy), through a
+broker serving that one spec: the server can write `~/.config/nais`, and
+nais reads `config.yaml` there on every run, whose values set any flag
+(a planted `nais: false` turns the probe into a gcloud call). On macOS it
+still runs on the host.
 
 ### 5.6 Lifecycle
 
@@ -406,11 +411,26 @@ mechanism's status probe; no secret is printed.
   go-keyring's `security add-generic-password -U` on a temp keychain. Only
   the `security` helper looked up anything, and only securityd. securityd
   and the `bsd.sb` services still act for the child, so this contains the
-  nais workload; it is not a full jail for an arbitrary hostile binary. On Linux the control is
-  still **advisory**: the child gets only `HTTPS_PROXY`. A network
-  namespace cannot reach the proxy on the host's loopback, and the agent
-  sandbox has no namespace path to reuse (Landlock is port-based and cannot
-  pin to localhost, #114), so Linux is left open rather than half-done.
+  nais workload; it is not a full jail for an arbitrary hostile binary. On Linux this is **enforced** too (#849):
+  the broker runs `bwrap` (from the trusted dirs, never `PATH`) with
+  `--unshare-user/pid/ipc/uts/cgroup/net`, `--die-with-parent` and
+  `--new-session` (`child_bwrap_args` in `src/mcp_broker/runtime.rs`).
+  The fresh network namespace has only its own loopback, so a direct
+  connect fails with `ENETUNREACH`. A namespace cannot reach the proxy on
+  the host's loopback, so the broker also serves each egress proxy as a
+  0600 unix socket in its socket dir and bwrap binds that socket alone
+  into the namespace at `/tmp/cplt-egress.sock`. Inside, bwrap starts
+  cplt again with `__CPLT_MCP_EGRESS_RELAY` set, which an `.init_array`
+  constructor dispatches before `main` (as bwrap's re-entry helper is).
+  That relay listens on `127.0.0.1:<egress port>`
+  (the port `HTTPS_PROXY` names), relays each connection to that socket,
+  and then runs the server. On the host each unix connection goes on to
+  the TCP egress proxy, which makes the decision. With no `egressHosts`
+  there is no listener and no socket, so no TCP at all. Name lookups do
+  not work in the namespace either; the proxy resolves names. Fails
+  closed: without bwrap the child is not spawned, and if bwrap cannot
+  build the namespaces, or the relay cannot listen, it exits before the
+  server starts.
 - **Files (macOS):** reads are open (the child holds the host login anyway,
   and its egress is pinned). Writes go only to its temp dir and the
   mechanism's `write_dirs` under `HOME`: for `nais-keychain`,
@@ -424,10 +444,61 @@ mechanism's status probe; no secret is printed.
   `~/Library/Keychains/login.keychain-db` and its `.sb-*` siblings; without
   it `security` exits 161 and the refresh is lost (measured 2026-10-25). Measured 2026-10-25: `nais auth
   print-access-token -n` exits 0 under the profile (network opened for the
-  check) with no file or keychain denials. On Linux, files are still
-  unrestricted.
-- The child is trusted code acting on attacker-chosen arguments; on Linux
-  that residual is unchanged.
+  check) with no file or keychain denials.
+- **Files (Linux):** `--ro-bind / /`, so reads are open as on macOS and
+  every write outside the grants fails with `EROFS`. Granted: a private
+  tmpfs `/tmp` (`TMPDIR=/tmp`), the mechanism's `linux_write_dirs` under
+  `XDG_CONFIG_HOME` (default `~/.config`; for `nais-keychain`,
+  `~/.config/nais`, created 0700 if missing) bound writable, with
+  `XDG_CONFIG_HOME` set to that resolved dir, and fresh `/proc` and
+  `/dev`. `HOME` is an empty tmpfs, remounted read-only, with only the
+  mechanism's grants bound back: its `linux_write_dirs` and its
+  `linux_read_paths` (for `nais-keychain`, none: found by reading nais/cli
+  for `alpha mcp serve` and `auth print-access-token -n`, see
+  `src/mcp_broker/credential.rs`). That hides sockets in `HOME`, such as
+  Docker Desktop's `~/.docker/desktop/docker.sock`. A `HOME` under `/tmp`
+  or `/run` is private already; `HOME=/` refuses the child. cplt itself
+  (the relay) is bound in at `/run/cplt-relay`, since it may live in
+  `HOME`. `/run`, and `XDG_RUNTIME_DIR` if it lives elsewhere, are private
+  tmpfs, which hides the system bus, a docker socket and the rest of the
+  host's runtime sockets, and so are `/nix/var/nix/daemon-socket` and
+  `/nix/var/nix/gc-socket` where they exist: the Nix daemon builds as a
+  trusted user (root) and fetches through fixed-output derivations, past
+  the egress proxy. bwrap 0.8 and later also gets `--disable-userns`; on
+  older bwrap (Ubuntu 22.04 ships 0.6) the child starts without it and
+  `cplt doctor` warns, as it adds kernel surface, not host privilege. On NixOS `/run/current-system` is restored as a
+  symlink to its store path, so `/run/current-system/sw/bin` still
+  resolves. Unix sockets elsewhere under the read-only root (under
+  `/var`, say) stay connectable, and copies of `HOME` elsewhere in the
+  root (btrfs snapshots, a second bind mount) stay readable: hiding
+  `HOME`, and the XDG config and data dirs outside it, is a denylist.
+- **Session bus (Linux):** never the host bus itself. The unfiltered user
+  bus reaches `systemd --user` (`StartTransientUnit`) and D-Bus
+  activation, which is host exec. For a `keychain` mechanism the broker
+  runs `xdg-dbus-proxy` (trusted dirs only, never `PATH`) on a socket in
+  its 0700 session dir, as Flatpak does: `--filter
+  --talk=org.freedesktop.secrets`, nothing else. go-keyring makes every
+  call to the Secret Service (open session, search, unlock, the prompt
+  objects and their signals, get secret); the proxy itself passes the bus
+  driver's `Hello`, `AddMatch` and similar. bwrap binds that socket alone
+  at `/run/cplt-bus`, and the child gets
+  `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/cplt-bus`. A call to any other
+  name, `org.freedesktop.systemd1` included, or `StartServiceByName` for
+  one, is refused by the proxy (`tests: keychain_child_reaches_only_the_secret_service`).
+  The proxy's `--fd` pipe is bwrap's `--sync-fd`, so it exits with the
+  child. The host bus is the first `unix:path=` socket in
+  `DBUS_SESSION_BUS_ADDRESS` (or `$XDG_RUNTIME_DIR/bus` when that is
+  unset); an abstract or TCP address is out of reach. With no host bus,
+  or without xdg-dbus-proxy (one `FAIL` line in the broker log; `cplt
+  doctor` warns and `--fix` installs it), the child gets no bus and no
+  `DBUS_SESSION_BUS_ADDRESS`, and nais reports it is not logged in. Other
+  mechanisms never get a bus. Residual: anything the Secret Service
+  serves the user is reachable through that one name. With gnome-keyring
+  that is every unlocked item in the login collection (other apps'
+  passwords and tokens), plus gnome-keyring's internal interface on the
+  same name; with KeePassXC, every entry in the groups its Secret Service
+  integration exposes.
+- The child is trusted code acting on attacker-chosen arguments.
 - **Stderr:** to the broker log (`--proxy-log`, and the terminal at
   `--proxy-log-level all`), at most 64 lines of 512 bytes per child, every
   run of 20 or more token characters replaced by `[redacted]`. The child's
@@ -554,8 +625,8 @@ Attacker: the sandboxed agent or content steering it.
 | Spec asks for something dangerous (arbitrary command, secret in a header, host-exec tool) | Invariants at load (5.3); command must match the credential mechanism |
 | Agent connects to the socket | Intended; it can only pick a declared id |
 | Secret path leaks (remote kind) | Per-session, loopback, never logged; 128-bit, constant-time compare (`src/github_mcp.rs:208-220`) |
-| SSRF | Remote: pinned upstream, no redirects, https only (`src/github_mcp.rs:34`, `:377-391`). Child: egress pinned to `egressHosts` via the proxy, enforced by Seatbelt on macOS, advisory on Linux (5.7) |
-| Host-exec through the child | Env cleared, egress pinned, read-only tools. macOS: child profile limits network to the proxy and writes to its own dirs. Linux: unsandboxed child |
+| SSRF | Remote: pinned upstream, no redirects, https only (`src/github_mcp.rs:34`, `:377-391`). Child: egress pinned to `egressHosts` via the proxy, enforced by Seatbelt on macOS and by a bwrap network namespace on Linux (5.7) |
+| Host-exec through the child | Env cleared, egress pinned, read-only tools. macOS: child profile limits network to the proxy and writes to its own dirs. Linux: bwrap child with no network but the proxy, a read-only root, and a session bus filtered to `org.freedesktop.secrets` |
 | Agent reads the credential directly (Linux) | Without active bubblewrap, Secret Service is reachable over D-Bus (SECURITY.md:1589-1606); see section 7 |
 | Header injection | Control bytes refused, auth and `X-MCP-*` stripped (`src/github_mcp.rs:225-250`) |
 | JSON-RPC smuggling | Every message parsed; batch arrays rejected; protocol version checked |
