@@ -1,7 +1,9 @@
 # Design: a generic MCP host broker
 
-Status: phase 1 implemented (#824, #834), revised 2026-10-23 with the
-owner's decisions (section 0). Where this text and the code differ, the code
+Status: phases 1 and 1b shipped, plus the child sandbox on macOS (#862) and
+Linux (#873). Section 11 lists what shipped.
+Roadmap: [#912](https://github.com/navikt/cplt/issues/912). Revised
+2026-10-23 with the owner's decisions (section 0), updated 2026-10-28. Where this text and the code differ, the code
 and [SECURITY.md](../../SECURITY.md) describe what ships.
 Refs [#821](https://github.com/navikt/cplt/issues/821), [#807](https://github.com/navikt/cplt/pull/807), [#797](https://github.com/navikt/cplt/issues/797), [#820](https://github.com/navikt/cplt/issues/820).
 
@@ -16,10 +18,10 @@ marked **(unverified)** were not checked against source or by running them.
 | D2 | Invariants | Credential never enters the sandbox; pinned upstream or command; read-only by default; `host-exec` never brokered. cplt rejects a spec that breaks one |
 | D3 | Compiled-in knowledge | cplt keeps a hand-kept table of **credential mechanisms** only (gh token; nais keychain via `nais alpha mcp serve`). Tool policy is never compiled in |
 | D4 | Spec format | Built from standard MCP `server.json` fields; only what the spec lacks goes in a namespaced `_meta` extension (section 5.2). Any spec-compliant registry could feed cplt |
-| D5 | Clients | All, from phase 1: Copilot CLI (`--disable-mcp-server` + `--additional-mcp-config`), OpenCode (`OPENCODE_CONFIG_CONTENT`), pi where possible |
+| D5 | Clients | All, from phase 1: Copilot CLI (`--disable-mcp-server` + `--additional-mcp-config`), OpenCode (`OPENCODE_CONFIG_CONTENT`). pi is out of scope (owner, 2026-10-28) |
 | D6 | Local transport | stdio over a per-session Unix socket. Client entry: `command: cplt mcp-stdio <id>`, piped to the host child, after `src/worktree_broker.rs`. macOS first; Linux needs a bwrap bind (later). Remote kind (GitHub) keeps the HTTP proxy path |
 | D7 | Host child | Sandboxed since #849: on macOS by Seatbelt, on Linux by bwrap with its own network namespace (TCP only to its egress proxy, writes only to its temp and config dirs). Phase 1 was unsandboxed, env cleared, egress pinned with `HTTPS_PROXY` to cplt's CONNECT proxy, allowed to the spec's hosts only. Both grant writes to nais's config dir (refresh rewrites it); macOS the login keychain file, Linux the D-Bus session socket (go-keyring) |
-| D8 | Tools | Read-only by default. Writes opted in per server with `nav-pilot mcp enable --tools`, written to the user's cplt config. New or unclassified tools refused until re-consent. Write tools off by default for brokered servers |
+| D8 | Tools | Read-only by default. Writes opted in per server with `nav-pilot mcp enable --tools`, written to the user's cplt config. New or unclassified tools refused until re-consent. Write tools off by default for brokered servers. Enforced at spec load: a tool in `tools.allow` that `tools.classes` marks `write` or `external` is refused unless the spec sets `writeConsent` (`src/mcp_broker/spec.rs`) |
 | D9 | GraphQL | Broker refuses a `mutation` or `subscription` keyword, or more than one operation, with a simple check. File the nais/cli fix first (it checks only `Operations[0]`) |
 | D10 | Login | nav-pilot runs `nais login -n` / `gh auth login` on the host after a yes; with `--json` or no tty it only prints the command. Nais status: `nais auth print-access-token` |
 | D11 | Without cplt | `mcp list` PATH `direct` says "no read-only guarantee"; nav-pilot warns or refuses on enabling `execute_graphql` outside cplt. A gh login mid-session needs a restart; the error says so. The kind A part may change once #820 lands (section 8) |
@@ -64,8 +66,7 @@ the client's own permission prompts.
 
 Clients: Copilot CLI and OpenCode (the `nav-pilot mcp enable --client`
 targets, navikt/copilot `cli/nav-pilot/internal/cli/mcp_cmd.go:135-137`),
-and pi where it can host MCP **(unverified: pi has no built-in MCP client
-as far as checked)**. Claude Code and VS Code appear as comparisons.
+pi is out of scope (D5). Claude Code and VS Code appear as comparisons.
 
 ### 2.1 Today's journeys
 
@@ -393,8 +394,9 @@ still runs on the host.
 - **Env:** cleared, then `HOME`, `PATH` (trusted dirs), `LANG`, `TMPDIR`
   (host), and `HTTPS_PROXY`/`HTTP_PROXY` pointing at cplt's CONNECT proxy.
 - **Egress:** the proxy allows the child only `egressHosts`. Phase 1 uses
-  a separate policy for the child's proxy connections **(open: one proxy
-  with per-client policy, or a second listener)**.
+  a listener of its own per server (`egress_port` in `src/mcp_broker/runtime.rs`),
+  apart from the agent's proxy. A host outside `egressHosts` gets 403; a
+  failed dial gets 502, or 504 on a timeout, not DENIED (#876).
   On macOS this is **enforced** (#849): the child runs under
   `sandbox-exec` with `mcp_child_profile` (`src/sandbox_profile.rs`),
   built from the agent profile's header and process rules plus a network
@@ -647,20 +649,26 @@ Not in phase 1 (D15). When a third server arrives:
 
 ## 11. Phases
 
-| Phase | Scope | Exit |
-|-------|-------|------|
-| 1 | Nais (#821) in OpenCode, Copilot CLI and pi where possible: spec schema v1 and loader, `nais-keychain` mechanism, `cplt mcp-stdio` over a Unix socket (macOS), host child with cleared env and egress pin, read allowlist, GraphQL check, `cplt mcp status --json`, mirrored errors. nav-pilot: `_meta` fields in the registry, spec writing, login after a yes, `mcp list` LOGIN and PATH | Nais works under cplt on macOS in both clients with no keychain grant; mutations and multi-op documents refused |
-| 1b | Linux: bwrap bind for the socket; Secret Service; require bubblewrap's bus masks or warn about the D-Bus exposure | Linux e2e |
-| 2 | GitHub on the shared model, when a third server arrives | #807 tests unchanged |
-| 3 | Child file profile | nais measured under it |
-| 4 | Figma OAuth in the broker | — |
+| Phase | Scope | Exit | Status |
+|-------|-------|------|--------|
+| 1 | Nais (#821) in OpenCode and Copilot CLI: spec schema v1 and loader, `nais-keychain` mechanism, `cplt mcp-stdio` over a Unix socket (macOS), host child with cleared env and egress pin, read allowlist, GraphQL check, `cplt mcp status --json`, mirrored errors. nav-pilot: `_meta` fields in the registry, spec writing, login after a yes, `mcp list` LOGIN and PATH | Nais works under cplt on macOS in both clients with no keychain grant; mutations and multi-op documents refused | Shipped (#825, fixes up to #846, #863) |
+| 1b | Linux: bwrap bind for the socket; Secret Service; require bubblewrap's bus masks or warn about the D-Bus exposure | Linux e2e | Shipped (#838) |
+| 2 | GitHub on the shared model, when a third server arrives | #807 tests unchanged | Deferred (#909) |
+| 3 | Child sandbox: network and file profile | nais measured under it | Shipped: macOS (#862), Linux (#873) |
+| 4 | Figma OAuth in the broker | — | Planned (#910) |
 
 ## 12. Still open
 
-- How the child's proxy egress is told apart from the agent's (one proxy
-  with per-client policy, or a second listener).
-- Nais egress hosts (measure in phase 1).
-- pi: whether it can host MCP at all, and how cplt overlays it.
+Decided:
+
+- The child's egress has its own listener per server (5.7).
+- Nais egress hosts are measured; they live in the spec's `egressHosts`.
+- pi is out of scope (D5).
+- GitHub moves to the shared model only with a third server (#909).
+- D8 is enforced through `tools.allow` and `writeConsent` (6.1).
+
+Open:
+
 - Exact extension key name (`io.github.navikt/broker`), and whether the
   registry should serve it directly in `server.json` `_meta` or nav-pilot
   should build it from the response `_meta`.
@@ -668,11 +676,5 @@ Not in phase 1 (D15). When a third server arrives:
 
 ## 13. Issues to file
 
-- nais/cli: check every operation in `execute_graphql`, not only `Operations[0]`, and traverse named fragments in `checkForSecrets` and `calculateQueryDepth` (file first, D9).
-- navikt/cplt: phase 1 broker for Nais (spec loader v1, `nais-keychain`, `cplt mcp-stdio`, child env and egress pin, tool allowlist, GraphQL check, mirrored errors), superseding the plan in #821.
-- navikt/cplt: `cplt mcp status --json`.
-- navikt/cplt: Copilot CLI overlay with `--disable-mcp-server` and `--additional-mcp-config`.
-- navikt/cplt: Linux socket bind and Secret Service for the broker.
-- navikt/cplt: child file profile (later).
-- navikt/copilot: broker `_meta` extension in the registry (`credential`, `command`, `egressHosts`, `login`), Nais `packages`/`command` entry, docs for the extension.
-- navikt/copilot: nav-pilot writes broker specs, `enable --tools` write consent, login after a yes, `mcp list` LOGIN and PATH, warn or refuse `execute_graphql` without cplt.
+All filed or done. Open work is tracked in
+[#912](https://github.com/navikt/cplt/issues/912).
