@@ -5763,7 +5763,6 @@ fn env_sanitized_injects_hardening_vars() {
         None,
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
 
     let npm = env
@@ -5820,7 +5819,6 @@ fn env_claude_injects_autoupdater_and_suppresses_copilot_vars() {
         None,
         None,
         cplt::agent::Agent::Claude,
-        false,
     );
 
     // Auto-update disabled (no --no-auto-update flag exists for Claude Code)
@@ -5854,7 +5852,6 @@ fn env_opencode_redirects_claude_config_dir() {
         None,
         None,
         cplt::agent::Agent::OpenCode,
-        false,
     );
 
     let found = env.vars.iter().find(|(k, _)| k == "CLAUDE_CONFIG_DIR");
@@ -5879,7 +5876,6 @@ fn env_opencode_claude_config_dir_respects_xdg_state_home() {
         None,
         None,
         cplt::agent::Agent::OpenCode,
-        false,
     );
 
     let found = env.vars.iter().find(|(k, _)| k == "CLAUDE_CONFIG_DIR");
@@ -5902,7 +5898,6 @@ fn env_opencode_claude_config_dir_respects_user_override() {
         None,
         None,
         cplt::agent::Agent::OpenCode,
-        false,
     );
 
     let matches: Vec<_> = env
@@ -5927,7 +5922,6 @@ fn env_opencode_claude_config_dir_empty_is_treated_as_unset() {
         None,
         None,
         cplt::agent::Agent::OpenCode,
-        false,
     );
 
     let matches: Vec<_> = env
@@ -5946,7 +5940,7 @@ fn env_opencode_claude_config_dir_empty_is_treated_as_unset() {
 fn env_claude_config_dir_not_injected_for_other_agents() {
     for agent in [cplt::agent::Agent::Copilot, cplt::agent::Agent::Claude] {
         let parent = make_env(&[("HOME", "/fake/test"), ("PATH", "/usr/bin")]);
-        let env = build_sandbox_env(&parent, &[], false, &[], None, None, agent, false);
+        let env = build_sandbox_env(&parent, &[], false, &[], None, None, agent);
         assert!(
             !env.vars.iter().any(|(k, _)| k == "CLAUDE_CONFIG_DIR"),
             "CLAUDE_CONFIG_DIR redirect must not be injected for {agent:?}"
@@ -5965,7 +5959,6 @@ fn env_sanitized_injects_telemetry_opt_out_vars() {
         None,
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
 
     for (name, expected) in &[
@@ -5994,7 +5987,6 @@ fn env_sanitized_telemetry_opt_out_can_be_disabled() {
         None,
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
 
     for name in &[
@@ -6035,7 +6027,6 @@ fn env_sanitized_lifecycle_opt_out_skips_npm_yarn() {
         None,
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
 
     assert!(
@@ -6072,7 +6063,6 @@ fn env_inherit_injects_hardening_vars() {
         None,
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
 
     assert!(!env.clear_first, "inherit mode should not clear env");
@@ -6103,7 +6093,6 @@ fn env_pass_env_preserves_user_override() {
         None,
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
 
     let npm: Vec<_> = env
@@ -6137,7 +6126,6 @@ fn env_inherit_pass_env_preserves_user_override() {
         None,
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
 
     // In inherit mode with --pass-env, the user's value is inherited
@@ -6161,7 +6149,6 @@ fn env_sanitized_clears_first() {
         None,
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
 
     assert!(env.clear_first, "sanitized mode should clear env first");
@@ -6192,7 +6179,6 @@ fn env_lang_prefix_does_not_leak_langchain_keys() {
         None,
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
 
     // LANG and LANGUAGE should pass through (explicit allowlist)
@@ -6239,7 +6225,6 @@ fn env_yarn_prefix_does_not_bypass_hardening() {
         None,
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
 
     // YARN_ENABLE_SCRIPTS must be overridden to "false" by hardening
@@ -6298,7 +6283,6 @@ fn env_prefix_denies_secret_suffixes() {
         None,
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
 
     // Safe config vars must pass through
@@ -6369,7 +6353,6 @@ fn env_yarn_npm_auth_ident_is_stripped() {
         None,
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
 
     assert!(
@@ -6401,7 +6384,6 @@ fn env_explicit_allowlist_bypasses_suffix_deny() {
         None,
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
 
     assert!(
@@ -6439,7 +6421,6 @@ fn env_otel_prefix_passthrough_and_secret_suffix_strip() {
         None,
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
 
     assert!(
@@ -6483,7 +6464,6 @@ fn env_otel_passes_through_for_opencode_agent() {
         None,
         None,
         cplt::agent::Agent::OpenCode,
-        false,
     );
 
     for var in [
@@ -7182,7 +7162,6 @@ fn env_git_signing_disabled_by_default() {
         None,
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
     let get = |name: &str| {
         env.vars
@@ -7208,7 +7187,6 @@ fn env_git_signing_enabled_skips_signing_vars() {
         None,
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
     let get = |name: &str| {
         env.vars
@@ -7247,7 +7225,6 @@ fn env_gpg_tty_passed_through() {
         None,
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
     let get = |name: &str| {
         env.vars
@@ -7589,7 +7566,6 @@ fn playwright_socket_dir_respects_explicit_pass_env_value() {
         Some(scratch),
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
     assert_eq!(
         env.vars
@@ -7766,7 +7742,6 @@ fn env_scratch_dir_sets_tmpdir_vars() {
         Some(scratch),
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
 
     let tmpdir = env.vars.iter().find(|(k, _)| k == "TMPDIR");
@@ -7808,7 +7783,6 @@ fn env_scratch_dir_no_duplicate_tmpdir() {
         Some(scratch),
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
 
     let tmpdir_count = env.vars.iter().filter(|(k, _)| k == "TMPDIR").count();
@@ -7828,7 +7802,6 @@ fn env_scratch_dir_respects_pass_env_override() {
         Some(scratch),
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
 
     let tmpdir = env.vars.iter().find(|(k, _)| k == "TMPDIR");
@@ -7854,7 +7827,6 @@ fn env_no_scratch_dir_passes_system_tmpdir() {
         None,
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
 
     let tmpdir = env.vars.iter().find(|(k, _)| k == "TMPDIR");
@@ -7882,7 +7854,6 @@ fn env_scratch_dir_injects_java_tool_options() {
         Some(scratch),
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
 
     let jto = env.vars.iter().find(|(k, _)| k == "JAVA_TOOL_OPTIONS");
@@ -7919,7 +7890,6 @@ fn env_scratch_dir_appends_to_existing_java_tool_options() {
         Some(scratch),
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
 
     let jto = env.vars.iter().find(|(k, _)| k == "JAVA_TOOL_OPTIONS");
@@ -7948,7 +7918,6 @@ fn env_scratch_dir_java_tool_options_respects_pass_env() {
         Some(scratch),
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
 
     let jto = env.vars.iter().find(|(k, _)| k == "JAVA_TOOL_OPTIONS");
@@ -7971,7 +7940,6 @@ fn env_no_scratch_dir_no_java_tool_options_injected() {
         None,
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
 
     let jto = env.vars.iter().find(|(k, _)| k == "JAVA_TOOL_OPTIONS");
@@ -7995,7 +7963,6 @@ fn env_scratch_dir_no_jansi_tmpdir_env_var() {
         Some(scratch),
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
 
     let jansi = env.vars.iter().find(|(k, _)| k == "JANSI_TMPDIR");
@@ -8022,7 +7989,6 @@ fn env_injects_gradle_macos_sandbox_off() {
         Some(scratch),
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
 
     let gradle = env.vars.iter().find(|(k, _)| k == "GRADLE_MACOS_SANDBOX");
@@ -8047,7 +8013,6 @@ fn env_gradle_macos_sandbox_respects_pass_env() {
         Some(scratch),
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
 
     let gradle = env.vars.iter().find(|(k, _)| k == "GRADLE_MACOS_SANDBOX");
@@ -8075,7 +8040,6 @@ fn env_injects_dotnet_do_not_use_msbuild_server() {
         None,
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
 
     let dotnet = env
@@ -8104,7 +8068,6 @@ fn env_dotnet_do_not_use_msbuild_server_respects_pass_env() {
         None,
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
 
     let dotnet = env
@@ -8132,7 +8095,6 @@ fn env_goflags_passes_through() {
         None,
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
     let goflags = env.vars.iter().find(|(k, _)| k == "GOFLAGS");
     assert_eq!(goflags.map(|(_, v)| v.as_str()), Some("-buildvcs=false"));
@@ -8159,7 +8121,6 @@ fn env_node_options_strips_require() {
         None,
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
     let node_opts = env.vars.iter().find(|(k, _)| k == "NODE_OPTIONS");
     assert!(node_opts.is_some());
@@ -8180,7 +8141,6 @@ fn env_node_options_strips_loader() {
         None,
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
     let node_opts = env.vars.iter().find(|(k, _)| k == "NODE_OPTIONS");
     assert!(node_opts.is_some());
@@ -8204,7 +8164,6 @@ fn env_node_options_strips_import() {
         None,
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
     let node_opts = env.vars.iter().find(|(k, _)| k == "NODE_OPTIONS");
     assert!(node_opts.is_some());
@@ -8225,7 +8184,6 @@ fn env_node_options_removes_entirely_if_only_dangerous() {
         None,
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
     let node_opts = env.vars.iter().find(|(k, _)| k == "NODE_OPTIONS");
     assert!(
@@ -8251,7 +8209,6 @@ fn env_node_options_preserves_safe_flags() {
         None,
         None,
         cplt::agent::Agent::Copilot,
-        false,
     );
     let node_opts = env.vars.iter().find(|(k, _)| k == "NODE_OPTIONS");
     assert!(node_opts.is_some());
@@ -11557,7 +11514,6 @@ fn jto_with_proxy(proxy_port: Option<u16>) -> Option<String> {
         Some(scratch),
         proxy_port,
         cplt::agent::Agent::Copilot,
-        false,
     );
     env.vars
         .iter()
@@ -11619,7 +11575,6 @@ fn env_proxy_properties_injected_without_scratch_dir() {
         None,
         Some(4711),
         cplt::agent::Agent::Copilot,
-        false,
     );
     let val = &env
         .vars
@@ -11643,7 +11598,6 @@ fn env_pass_env_java_tool_options_still_suppresses_proxy_injection() {
         Some(std::path::Path::new("/scratch/s")),
         Some(4711),
         cplt::agent::Agent::Copilot,
-        false,
     );
     let jto = env.vars.iter().find(|(k, _)| k == "JAVA_TOOL_OPTIONS");
     assert_eq!(jto.unwrap().1, "-Xmx1g");

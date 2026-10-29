@@ -358,9 +358,6 @@ pub struct PreparedSandbox {
     extra_env: Vec<(String, String)>,
     /// An OpenCode v2 session (#710): no gh handover via OPENCODE_AUTH_CONTENT.
     opencode_v2: bool,
-    /// `sandbox.strip_otlp_vendor_auth` (#878), set with
-    /// [`Self::set_strip_otlp_vendor_auth`].
-    strip_otlp_vendor_auth: bool,
     /// The rules `precomputed` was built from, kept so an OpenCode v2 session
     /// can take files out of them (#719).
     #[cfg(target_os = "linux")]
@@ -397,11 +394,6 @@ impl PreparedSandbox {
     /// roots, or the variable would name a directory the agent cannot use.
     pub fn set_worktree_root(&mut self, root: Option<&Path>) {
         self.worktree_root = root.map(Path::to_path_buf);
-    }
-
-    /// Also strip vendor auth headers from OTLP headers (#878).
-    pub fn set_strip_otlp_vendor_auth(&mut self, on: bool) {
-        self.strip_otlp_vendor_auth = on;
     }
 
     /// Set `vars` on the child last, after the sandbox environment (#732).
@@ -2532,7 +2524,6 @@ fn prepare_impl(
         worktree_socket: None,
         extra_env: Vec::new(),
         opencode_v2: false,
-        strip_otlp_vendor_auth: false,
     })
 }
 
@@ -3868,7 +3859,6 @@ fn prepare_impl(
         worktree_socket: None,
         extra_env: Vec::new(),
         opencode_v2: false,
-        strip_otlp_vendor_auth: false,
         policy,
         precomputed,
         bwrap_wrapper,

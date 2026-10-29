@@ -920,6 +920,9 @@ impl Resolved {
         if self.allow_gpg_signing {
             disabled.push(HardeningCategory::GitSigning);
         }
+        if !self.strip_otlp_vendor_auth {
+            disabled.push(HardeningCategory::OtlpVendorAuth);
+        }
         disabled
     }
 

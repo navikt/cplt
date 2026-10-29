@@ -2538,7 +2538,13 @@ fn otlp_vendor_auth_nudge(
 ) -> Option<cplt::doctor::Finding> {
     let unset = resolved.bool_layer("sandbox", "strip_otlp_vendor_auth")
         == Some(config::ConfigLayer::Baseline);
-    (unset && sandbox::otlp_vendor_auth_present(env)).then(|| {
+    // Inherit mode and --pass-env keep the raw value either way: nothing to suggest.
+    let env: Vec<_> = env
+        .iter()
+        .filter(|(k, _)| !resolved.pass_env.contains(k))
+        .cloned()
+        .collect();
+    (unset && !resolved.inherit_env && sandbox::otlp_vendor_auth_present(&env)).then(|| {
         cplt::doctor::Finding::warning(
             "an OTEL_EXPORTER_OTLP_*HEADERS vendor auth header (x-honeycomb-team, api-key, \
              x-api-key, dd-api-key) reaches the sandbox. New configs strip it.",
@@ -7198,7 +7204,6 @@ fn assemble_sandbox(
         sandbox::prepare_with_pnpm_shadow(&sandbox_config, pnpm_shadow_path, opts.inspect_only)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     prepared.set_worktree_root(opts.repos.worktree_root);
-    prepared.set_strip_otlp_vendor_auth(resolved.strip_otlp_vendor_auth);
     prepared.set_worktree_socket(
         worktree_broker
             .as_ref()
@@ -16313,6 +16318,14 @@ mod tests {
         assert!(otlp_vendor_auth_nudge(&fresh, &env).is_none());
         let off = resolve("[sandbox]\nstrip_otlp_vendor_auth = false\n");
         assert!(otlp_vendor_auth_nudge(&off, &env).is_none());
+        let pass = resolve("[sandbox]\npass_env = [\"OTEL_EXPORTER_OTLP_HEADERS\"]\n");
+        assert!(otlp_vendor_auth_nudge(&pass, &env).is_none());
+        let inherit = resolve("[sandbox]\ninherit_env = true\n");
+        assert!(otlp_vendor_auth_nudge(&inherit, &env).is_none());
+        // The key drives the hardening category build_sandbox_env reads.
+        let cat = cplt::sandbox::HardeningCategory::OtlpVendorAuth;
+        assert!(old.disabled_hardening_categories().contains(&cat));
+        assert!(!fresh.disabled_hardening_categories().contains(&cat));
     }
 
     #[test]
