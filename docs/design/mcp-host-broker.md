@@ -651,7 +651,7 @@ Not in phase 1 (D15). When a third server arrives:
 
 | Phase | Scope | Exit | Status |
 |-------|-------|------|--------|
-| 1 | Nais (#821) in OpenCode, Copilot CLI: spec schema v1 and loader, `nais-keychain` mechanism, `cplt mcp-stdio` over a Unix socket (macOS), host child with cleared env and egress pin, read allowlist, GraphQL check, `cplt mcp status --json`, mirrored errors. nav-pilot: `_meta` fields in the registry, spec writing, login after a yes, `mcp list` LOGIN and PATH | Nais works under cplt on macOS in both clients with no keychain grant; mutations and multi-op documents refused | Shipped (#825, fixes up to #846, #863) |
+| 1 | Nais (#821) in OpenCode and Copilot CLI: spec schema v1 and loader, `nais-keychain` mechanism, `cplt mcp-stdio` over a Unix socket (macOS), host child with cleared env and egress pin, read allowlist, GraphQL check, `cplt mcp status --json`, mirrored errors. nav-pilot: `_meta` fields in the registry, spec writing, login after a yes, `mcp list` LOGIN and PATH | Nais works under cplt on macOS in both clients with no keychain grant; mutations and multi-op documents refused | Shipped (#825, fixes up to #846, #863) |
 | 1b | Linux: bwrap bind for the socket; Secret Service; require bubblewrap's bus masks or warn about the D-Bus exposure | Linux e2e | Shipped (#838) |
 | 2 | GitHub on the shared model, when a third server arrives | #807 tests unchanged | Deferred (#909) |
 | 3 | Child sandbox: network and file profile | nais measured under it | Shipped: macOS (#862), Linux (#873) |
