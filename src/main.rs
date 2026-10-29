@@ -9347,7 +9347,8 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     let keyring = doctor::linux_keyring_finding(
         active_agent,
         cfg!(target_os = "linux"),
-        std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some(),
+        std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some()
+            || cplt::sandbox::SECRET_SERVICE_SKIP.get().is_some(),
         env_token.is_some()
             || matches!(
                 keychain_substitute,

@@ -1923,6 +1923,13 @@ pub fn keychain_substitute(
                     None
                 })
             },
+            || {
+                let found = crate::git::trusted_binary("secret-tool").is_some();
+                if !found {
+                    let _ = SECRET_SERVICE_SKIP.set(SecretServiceSkip::SecretToolMissing);
+                }
+                found
+            },
             secret_tool_lookup,
         );
     }
@@ -2291,6 +2298,7 @@ pub(crate) fn secret_service_substitute(
     deny_env: &[String],
     enabled: bool,
     gh: impl FnOnce() -> Option<String>,
+    has_secret_tool: impl FnOnce() -> bool,
     lookup: impl FnOnce(&str) -> Option<String>,
 ) -> Option<crate::agent::KeychainSubstitute> {
     if !enabled || agent != Agent::Copilot {
@@ -2309,6 +2317,10 @@ pub(crate) fn secret_service_substitute(
     let CopilotConfigAccount::Selected(acct) = copilot_config_account(home) else {
         return None;
     };
+    // Before the gh comparison, so a Copilot-only login still hears it is missing (#901).
+    if !has_secret_tool() {
+        return None;
+    }
     if account_mismatch(gh().as_deref(), Some(&acct)).is_some() {
         return None;
     }
@@ -2371,8 +2383,7 @@ pub fn secret_service_skip_reason(
         "deny.env strips COPILOT_GITHUB_TOKEN, so no lookup ran".into()
     } else {
         "no single account in ~/.copilot/config.json matching gh's github.com login (or gh \
-         is not logged in), or the `secret-tool` lookup found nothing (not installed in a \
-         trusted bin dir, keyring locked, or no stored item)"
+         is not logged in), or the `secret-tool` lookup found nothing"
             .into()
     }
 }
@@ -7109,6 +7120,7 @@ mod account_tests {
             assert_eq!(acct, "https://github.com:alice");
             Some("gho_x\n".to_string())
         };
+        let yes = || true;
         let never = |_: &str| -> Option<String> { panic!("lookup must not run") };
         let vars = [
             ("COPILOT_GITHUB_TOKEN", None::<&str>),
@@ -7117,7 +7129,8 @@ mod account_tests {
         ];
         temp_env::with_vars(vars, || {
             // Happy path: token trimmed, set as COPILOT_GITHUB_TOKEN.
-            let sub = secret_service_substitute(Agent::Copilot, h, &[], true, alice, ok).unwrap();
+            let sub =
+                secret_service_substitute(Agent::Copilot, h, &[], true, alice, yes, ok).unwrap();
             assert_eq!(
                 sub.env_value(),
                 Some(("COPILOT_GITHUB_TOKEN", "gho_x".to_string()))
@@ -7126,25 +7139,46 @@ mod account_tests {
             assert!(!format!("{sub:?}{sub}").contains("gho_x"));
             // Off, other agent, denied var: no lookup.
             assert!(
-                secret_service_substitute(Agent::Copilot, h, &[], false, alice, never).is_none()
+                secret_service_substitute(Agent::Copilot, h, &[], false, alice, yes, never)
+                    .is_none()
             );
-            assert!(secret_service_substitute(Agent::Claude, h, &[], true, alice, never).is_none());
+            assert!(
+                secret_service_substitute(Agent::Claude, h, &[], true, alice, yes, never).is_none()
+            );
             let deny = ["COPILOT_GITHUB_TOKEN".to_string()];
             assert!(
-                secret_service_substitute(Agent::Copilot, h, &deny, true, alice, never).is_none()
+                secret_service_substitute(Agent::Copilot, h, &deny, true, alice, yes, never)
+                    .is_none()
             );
             // gh is someone else, or unknown: refused.
             let bob = || Some("bob".to_string());
-            assert!(secret_service_substitute(Agent::Copilot, h, &[], true, bob, never).is_none());
             assert!(
-                secret_service_substitute(Agent::Copilot, h, &[], true, || None, never).is_none()
+                secret_service_substitute(Agent::Copilot, h, &[], true, bob, yes, never).is_none()
+            );
+            assert!(
+                secret_service_substitute(Agent::Copilot, h, &[], true, || None, yes, never)
+                    .is_none()
+            );
+            // No gh login and no secret-tool: skipped before gh is asked.
+            assert!(
+                secret_service_substitute(
+                    Agent::Copilot,
+                    h,
+                    &[],
+                    true,
+                    || panic!("gh must not run"),
+                    || false,
+                    never
+                )
+                .is_none()
             );
             // Missing, locked or empty item: fallback.
             assert!(
-                secret_service_substitute(Agent::Copilot, h, &[], true, alice, |_| None).is_none()
+                secret_service_substitute(Agent::Copilot, h, &[], true, alice, yes, |_| None)
+                    .is_none()
             );
             assert!(
-                secret_service_substitute(Agent::Copilot, h, &[], true, alice, |_| Some(
+                secret_service_substitute(Agent::Copilot, h, &[], true, alice, yes, |_| Some(
                     " \n".into()
                 ))
                 .is_none()
@@ -7153,7 +7187,8 @@ mod account_tests {
         // An exported token wins: skip.
         temp_env::with_var("GH_TOKEN", Some("t"), || {
             assert!(
-                secret_service_substitute(Agent::Copilot, h, &[], true, alice, never).is_none()
+                secret_service_substitute(Agent::Copilot, h, &[], true, alice, yes, never)
+                    .is_none()
             );
         });
         // Ambiguous config: refused.
@@ -7164,7 +7199,8 @@ mod account_tests {
         .unwrap();
         temp_env::with_vars(vars, || {
             assert!(
-                secret_service_substitute(Agent::Copilot, h, &[], true, alice, never).is_none()
+                secret_service_substitute(Agent::Copilot, h, &[], true, alice, yes, never)
+                    .is_none()
             );
         });
     }
