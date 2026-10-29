@@ -722,6 +722,9 @@ pub struct SandboxConfig {
     /// macOS only). See `sandbox_profile::emit_nested_gitdir_denies` (#576).
     pub deny_nested_git: Option<bool>,
     pub refuse_cache_exec_links: Option<bool>,
+    /// Refuse a launch whose configured controls cannot be enforced here
+    /// (#386). `config init` writes `true`; unset keeps the warning.
+    pub refuse_unenforced: Option<bool>,
     /// Deny key files (`*.pem`, `*.key`, `*.keystore`, ...) by extension, not
     /// only files named exactly `.pem` (default: false, macOS only). See
     /// `SENSITIVE_KEY_FILE_EXTENSION_PATTERNS`.
@@ -1039,6 +1042,7 @@ pub struct Resolved {
     pub gradle_init: bool,
     pub deny_nested_git: bool,
     pub refuse_cache_exec_links: bool,
+    pub refuse_unenforced: bool,
     pub deny_key_files_by_extension: bool,
     pub protect_pnpm_config: bool,
     pub refuse_invalid_repo_config: bool,

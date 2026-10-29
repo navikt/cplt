@@ -982,6 +982,7 @@ mod tests {
             deny_clipboard: false,
             deny_nested_git: false,
             refuse_cache_exec_links: false,
+            refuse_unenforced: false,
             deny_key_files_by_extension: false,
             protect_pnpm_config: false,
             refuse_invalid_repo_config: false,

@@ -213,6 +213,9 @@ pub fn repo_key_rejection_reason(key_info: &ConfigKeyInfo) -> &'static str {
             "a repo must not be able to make cplt write into its own AGENTS.md"
         }
         ("sandbox", "audit") => "controls local CLI output, not project sandbox policy",
+        ("sandbox", "refuse_unenforced") => {
+            "depends on what this host can enforce, not project policy"
+        }
         ("sandbox", "use_bubblewrap") => {
             "depends on bwrap being installed locally, not project policy"
         }

@@ -497,6 +497,7 @@ mod macos_tests {
             deny_dns: false,
             deny_nested_git: false,
             refuse_cache_exec_links: false,
+            refuse_unenforced: false,
             deny_key_files_by_extension: false,
             protect_pnpm_config: false,
             deny_copilot_dir_exec: false,

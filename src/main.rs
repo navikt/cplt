@@ -7283,6 +7283,7 @@ fn build_sandbox_config<'a>(
         deny_dns: resolved.deny_dns && resolved.proxy_forced,
         deny_nested_git: resolved.deny_nested_git,
         refuse_cache_exec_links: resolved.refuse_cache_exec_links,
+        refuse_unenforced: resolved.refuse_unenforced,
         deny_key_files_by_extension: resolved.deny_key_files_by_extension,
         protect_pnpm_config: resolved.protect_pnpm_config,
         deny_copilot_dir_exec: resolved.deny_copilot_dir_exec,
@@ -9144,6 +9145,10 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     #[cfg(not(target_os = "linux"))]
     let can_force = true;
     findings.extend(doctor::proxy_forced_nudge(&resolved, can_force));
+    findings.extend(doctor::refuse_unenforced_nudge(
+        &resolved,
+        cfg!(target_os = "linux"),
+    ));
     findings.extend(config_findings(
         &resolved,
         active_agent,
@@ -13471,6 +13476,7 @@ mod tests {
             deny_dns: false,
             deny_nested_git: false,
             refuse_cache_exec_links: false,
+            refuse_unenforced: false,
             deny_key_files_by_extension: true,
             protect_pnpm_config: false,
             deny_copilot_dir_exec: false,

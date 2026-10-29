@@ -257,6 +257,9 @@ pub struct SandboxConfig<'a> {
     /// through a symlink inside `~/.cache` rather than grant its target with a
     /// warning. Linux only; see [`validate_cache_exec_dirs`].
     pub refuse_cache_exec_links: bool,
+    /// `sandbox.refuse_unenforced` (#386): refuse a launch whose configured
+    /// deny paths this host cannot enforce, instead of warning. Linux only.
+    pub refuse_unenforced: bool,
     /// `sandbox.deny_key_files_by_extension`: deny key files by extension
     /// ([`SENSITIVE_KEY_FILE_EXTENSION_PATTERNS`]), not only files named exactly `.pem`.
     /// macOS only; Linux has no name-pattern denies.
@@ -3437,6 +3440,30 @@ pub(crate) fn proc_self_limit_text(advice: ProcAdvice) -> String {
     )
 }
 
+/// The #386 refusal. Names both ways forward: make the control enforceable,
+/// or opt out and launch with the warning.
+#[cfg(target_os = "linux")]
+fn unenforced_refusal(bwrap_active: bool, paths: &[String]) -> String {
+    let (why, fix) = if bwrap_active {
+        (
+            "could not be mount-masked by Bubblewrap",
+            "remove it from deny.paths (paths under /proc, /dev, /sys and /tmp cannot be \
+             masked)",
+        )
+    } else {
+        (
+            "cannot be enforced without Bubblewrap: Landlock cannot deny a subpath of an \
+             allowed directory",
+            "install bubblewrap (and check `cplt doctor`)",
+        )
+    };
+    format!(
+        "Refusing to launch: deny path(s) {} {why}. To fix, {fix}, or launch with the \
+         warning instead: cplt config set sandbox.refuse_unenforced false",
+        paths.join(", ")
+    )
+}
+
 #[cfg(target_os = "linux")]
 fn prepare_impl(
     config: &SandboxConfig,
@@ -3779,6 +3806,34 @@ fn prepare_impl(
         bwrap_wrapper.is_some().then_some(&deny_masks),
         deny_masks.socket_mask_count(),
     );
+
+    // #386: a configured deny the backend cannot honour refuses the launch
+    // when `sandbox.refuse_unenforced` is on (new configs); unset keeps the
+    // warnings below. Built-in controls are not counted here.
+    if config.refuse_unenforced && !inspect_only {
+        let unenforced: Vec<String> = if bwrap_wrapper.is_some() {
+            deny_masks
+                .skipped()
+                .iter()
+                .filter(|p| {
+                    config
+                        .extra_deny
+                        .iter()
+                        .any(|d| d == *p || d.canonicalize().is_ok_and(|c| c == **p))
+                })
+                .map(|p| p.display().to_string())
+                .collect()
+        } else {
+            config
+                .extra_deny
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect()
+        };
+        if !unenforced.is_empty() {
+            return Err(unenforced_refusal(bwrap_wrapper.is_some(), &unenforced));
+        }
+    }
 
     if !config.extra_deny.is_empty() {
         if bwrap_wrapper.is_some() {
@@ -4317,6 +4372,7 @@ mod tests {
             deny_dns: false,
             deny_nested_git: false,
             refuse_cache_exec_links: false,
+            refuse_unenforced: false,
             deny_key_files_by_extension: false,
             protect_pnpm_config: false,
             deny_copilot_dir_exec: false,
@@ -4863,6 +4919,29 @@ mod tests {
             let why = cache_exec_target_refusal(&config, &rules, target, &cache);
             assert!(why.is_none(), "{}: {why:?}", target.display());
         }
+    }
+
+    /// #386: without bubblewrap a configured deny path refuses the launch
+    /// when `refuse_unenforced` is on, naming both fixes; off, it launches.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unenforced_deny_path_refuses_only_when_opted_in() {
+        let (_guard, root) = copilot_cache_tree();
+        let home = root.join("home");
+        let project = root.join("project");
+        let deny = [home.join("secret")];
+        let mut config = test_config(&home, &[]);
+        config.project_dir = &project;
+        config.existing_home_tool_dirs = Some(&[]);
+        config.extra_deny = &deny;
+        config.use_bubblewrap = Some(false);
+        assert!(prepare(&config).is_ok(), "unset keeps today's warning");
+        config.refuse_unenforced = true;
+        let Err(error) = prepare(&config) else {
+            panic!("an unenforceable deny path must refuse the launch");
+        };
+        assert!(error.contains("install bubblewrap"), "{error}");
+        assert!(error.contains("sandbox.refuse_unenforced false"), "{error}");
     }
 
     /// The reproduced attack: a planted `~/.cache/ms-playwright` aimed at a

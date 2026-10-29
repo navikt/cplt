@@ -233,6 +233,11 @@ inject_github_token = true
 #   allow_tmp_exec = false
 # preset = "standard"
 #
+# Refuse to launch when a configured control cannot be enforced on this host,
+# e.g. deny.paths on Linux without bubblewrap. On for new configs; without
+# this line cplt warns and launches. Set to false to launch with the warning.
+refuse_unenforced = true
+#
 # Run sandbox-exec validation test on every launch (default: true).
 # Disable to save ~200ms startup if you trust your config.
 # validate = true
@@ -752,6 +757,9 @@ mod tests {
         // New configs start with forced proxy on (#822); a missing key stays off.
         assert_eq!(config.proxy.forced, Some(true));
         assert_eq!(Config::default().proxy.forced, None);
+        // #386: new configs refuse what they cannot enforce; unset warns.
+        assert_eq!(config.sandbox.refuse_unenforced, Some(true));
+        assert_eq!(Config::default().sandbox.refuse_unenforced, None);
     }
 
     #[test]

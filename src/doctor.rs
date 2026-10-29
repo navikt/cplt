@@ -1172,6 +1172,28 @@ pub fn proxy_forced_nudge(r: &crate::config::Resolved, can_force: bool) -> Optio
     })
 }
 
+/// The nudge for a config from before `sandbox.refuse_unenforced` (#386).
+/// Linux only, where a deny path can go unenforced; shown while no layer set
+/// the key and deny paths are configured. Never changes anything.
+#[must_use]
+pub fn refuse_unenforced_nudge(r: &crate::config::Resolved, linux: bool) -> Option<Finding> {
+    let unset =
+        r.bool_layer("sandbox", "refuse_unenforced") == Some(crate::config::ConfigLayer::Baseline);
+    (linux && unset && !r.deny_paths.is_empty()).then(|| {
+        Finding::warning(
+            "A deny path that cannot be enforced on this host (no bubblewrap, or a path \
+             bubblewrap cannot mask) only warns, and the agent still launches. New configs \
+             refuse the launch instead.",
+            Some(
+                "cplt config set sandbox.refuse_unenforced true, or \
+                 `cplt config set sandbox.refuse_unenforced false` to keep the warning and \
+                 silence this"
+                    .to_string(),
+            ),
+        )
+    })
+}
+
 /// Exit non-zero iff something is blocking — the contract the old doctor had
 /// for its "critical" checks.
 #[must_use]
@@ -1183,6 +1205,32 @@ pub fn exit_nonzero(findings: &[Finding]) -> bool {
 mod tests {
     use super::*;
     use crate::sandbox::{FsAccess, FsRule};
+
+    #[test]
+    fn refuse_unenforced_nudge_only_when_unset() {
+        let r = |toml: &str| {
+            toml::from_str::<crate::config::Config>(toml)
+                .unwrap()
+                .merge(crate::config::CliFlags::default())
+                .unwrap()
+        };
+        let deny = "[deny]\npaths = [\"/tmp\"]\n";
+        let old = r(deny);
+        assert!(!old.refuse_unenforced);
+        assert!(refuse_unenforced_nudge(&old, true).is_some());
+        assert!(
+            refuse_unenforced_nudge(&old, false).is_none(),
+            "macOS enforces denies"
+        );
+        assert!(
+            refuse_unenforced_nudge(&r(""), true).is_none(),
+            "no deny paths"
+        );
+        let set = |v: bool| r(&format!("[sandbox]\nrefuse_unenforced = {v}\n{deny}"));
+        assert!(set(true).refuse_unenforced);
+        assert!(refuse_unenforced_nudge(&set(true), true).is_none());
+        assert!(refuse_unenforced_nudge(&set(false), true).is_none());
+    }
 
     #[test]
     fn proxy_forced_nudge_only_when_unset() {
