@@ -799,6 +799,7 @@ The settings below are machine-specific or local CLI preferences, so `.cplt.toml
 | `sandbox.refuse_invalid_repo_config` | decides how a repo's own broken config is treated, so the repo cannot set it; see [Refusing an invalid `.cplt.toml`](#refusing-an-invalid-cplttoml-sandboxrefuse_invalid_repo_config) |
 | `sandbox.skip_untrusted_opencode_config` | decides what an untrusted repo may configure, so the repo cannot set it; see [OpenCode project config in untrusted repositories](#opencode-project-config-in-untrusted-repositories-sandboxskip_untrusted_opencode_config) |
 | `sandbox.deny_copilot_dir_exec` | a staged hardening switch, see [No execute on `~/.copilot`](#no-execute-on-copilot-sandboxdeny_copilot_dir_exec) |
+| `sandbox.allow_copilot_host_persistence` | decides what the sandbox may leave behind for host sessions, so the repo cannot set it; see [Copilot agents and saved approvals](#copilot-agents-and-saved-approvals-sandboxallow_copilot_host_persistence) |
 | `sandbox.inherit_env` | too dangerous for repo config, it would affect every team member |
 | `sandbox.allow_build_credentials` | hands the agent the user's own registry tokens from `$HOME`, and a repo cannot grant home paths |
 | `allow.exec` | exec paths differ per machine, and a repo must not be able to make one of its own trees executable |
@@ -1038,6 +1039,16 @@ Two set-ups keep some execute, and the launch warns about each instead of stayin
 - **Copilot is installed inside `~/.copilot`.** Copilot's install directory is always granted execute, or Copilot could not start. That directory and everything below it stay executable; the rest of `~/.copilot` does not. The warning names the directory.
 
 It has no effect on macOS, where the profile is unchanged and the launch warns that the key was ignored. The trace was done on Linux only.
+
+## Copilot agents and saved approvals (`sandbox.allow_copilot_host_persistence`)
+
+Copilot loads `~/.copilot/agents/` and `~/.copilot/permissions-config.json` in every later session, including sessions outside cplt. A custom agent there can start a command when you select it, and a saved approval lets a tool run without asking ([#906](https://github.com/navikt/cplt/issues/906)). New configs deny the sandbox write access to both:
+
+```bash
+cplt config set sandbox.allow_copilot_host_persistence false
+```
+
+With the key off, saving a tool approval inside cplt fails for that session, and you add custom agents from a shell outside cplt. cplt also warns after the session when Copilot trusted a new folder. A config without the key keeps both writable, and `cplt doctor` suggests the change. Set the key to `true` to keep them writable and silence that. On Linux the deny needs bubblewrap and only covers paths that already exist. See [SECURITY.md](../SECURITY.md).
 
 ## Other keys
 

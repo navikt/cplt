@@ -500,6 +500,7 @@ mod macos_tests {
             deny_key_files_by_extension: false,
             protect_pnpm_config: false,
             deny_copilot_dir_exec: false,
+            allow_copilot_host_persistence: false,
             allow_jvm_attach: false,
             allow_msbuild: false,
             allow_docker: false,

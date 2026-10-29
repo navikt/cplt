@@ -1172,6 +1172,30 @@ pub fn proxy_forced_nudge(r: &crate::config::Resolved, can_force: bool) -> Optio
     })
 }
 
+/// The nudge for an install from before Copilot's `agents/` and
+/// `permissions-config.json` were denied for new configs (#906). Shown only
+/// while no layer sets `sandbox.allow_copilot_host_persistence`.
+#[must_use]
+pub fn copilot_persistence_nudge(
+    r: &crate::config::Resolved,
+    agent: crate::agent::Agent,
+) -> Option<Finding> {
+    let unset = r.bool_layer("sandbox", "allow_copilot_host_persistence")
+        == Some(crate::config::ConfigLayer::Baseline);
+    (agent == crate::agent::Agent::Copilot && unset).then(|| {
+        Finding::warning(
+            "The sandbox can write ~/.copilot/agents/ and permissions-config.json. A custom \
+             agent there can run a command when a later host session selects it, and saved \
+             approvals skip prompts there. New configs deny both (see SECURITY.md).",
+            Some(
+                "cplt config set sandbox.allow_copilot_host_persistence false, or set it to \
+                 true to keep them writable and silence this"
+                    .to_string(),
+            ),
+        )
+    })
+}
+
 /// Exit non-zero iff something is blocking — the contract the old doctor had
 /// for its "critical" checks.
 #[must_use]
@@ -1183,6 +1207,29 @@ pub fn exit_nonzero(findings: &[Finding]) -> bool {
 mod tests {
     use super::*;
     use crate::sandbox::{FsAccess, FsRule};
+
+    #[test]
+    fn copilot_persistence_nudge_only_when_unset() {
+        use crate::agent::Agent;
+        let r = |toml: &str| {
+            toml::from_str::<crate::config::Config>(toml)
+                .unwrap()
+                .merge(crate::config::CliFlags::default())
+                .unwrap()
+        };
+        let old = r("");
+        assert!(
+            old.allow_copilot_host_persistence,
+            "unset keeps today's behaviour"
+        );
+        assert!(copilot_persistence_nudge(&old, Agent::Copilot).is_some());
+        assert!(copilot_persistence_nudge(&old, Agent::Claude).is_none());
+        let new = r(&crate::config::default_config_contents());
+        assert!(!new.allow_copilot_host_persistence);
+        assert!(copilot_persistence_nudge(&new, Agent::Copilot).is_none());
+        let kept = r("[sandbox]\nallow_copilot_host_persistence = true\n");
+        assert!(copilot_persistence_nudge(&kept, Agent::Copilot).is_none());
+    }
 
     #[test]
     fn proxy_forced_nudge_only_when_unset() {

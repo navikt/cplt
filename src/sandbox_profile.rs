@@ -286,7 +286,12 @@ fn profile_locked(
     // Same reason, and the fix for the same bug one tree over: keeps the
     // agent's own auto-executing config unwritable even when a user
     // `allow.write` covers the whole config dir.
-    emit_host_persistence_denies(&mut sb, config.agent, config.agent_dirs);
+    emit_host_persistence_denies(
+        &mut sb,
+        config.agent,
+        config.agent_dirs,
+        config.allow_copilot_host_persistence,
+    );
     // Same reason: keeps exec-allowed DOTNET_ROOT subtrees non-writable even
     // when a user allow.write covers them (write-then-exec).
     emit_dotnet_exec_denies(&mut sb, config.dotnet_root);
@@ -1358,8 +1363,13 @@ fn emit_protected(sb: &mut String, base: &str, p: &Protected) {
 ///
 /// macOS only — Landlock cannot deny a subpath within an allowed dir, so on
 /// Linux the bubblewrap read-only overlay carries this (see SECURITY.md).
-fn emit_host_persistence_denies(sb: &mut String, agent: Agent, agent_dirs: &[AgentDir]) {
-    let paths = agent.host_persistence_paths(agent_dirs);
+fn emit_host_persistence_denies(
+    sb: &mut String,
+    agent: Agent,
+    agent_dirs: &[AgentDir],
+    allow_copilot_persistence: bool,
+) {
+    let paths = agent.host_persistence_paths_with(agent_dirs, allow_copilot_persistence);
     let exec_only: Vec<&AgentDir> = agent_dirs
         .iter()
         .filter(|d| !d.write && d.process_exec)
@@ -4933,6 +4943,7 @@ mod tests {
             deny_key_files_by_extension: false,
             protect_pnpm_config: false,
             deny_copilot_dir_exec: false,
+            allow_copilot_host_persistence: false,
             allow_jvm_attach: false,
             allow_msbuild: false,
             allow_docker: false,

@@ -479,6 +479,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "sandbox",
+        key: "allow_copilot_host_persistence",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "true (false in new configs)",
+        description: "Copilot only: keep ~/.copilot/agents/ and ~/.copilot/permissions-config.json writable inside the sandbox. A custom agent there can start an MCP server command when a later host session selects it, and saved tool approvals skip prompts in later host sessions (#906). Set false to deny both writes: saving a tool approval inside cplt then fails for that session, and you add custom agents from a host shell.",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
         key: "allow_docker",
         value_type: ConfigValueType::Bool,
         dangerous: true,
@@ -1198,6 +1206,14 @@ bool_keys! {
         config = |c: &Config| c.sandbox.deny_copilot_dir_exec,
         baseline = |_: PresetBaseline| false,
         resolved = |r: &Resolved| r.deny_copilot_dir_exec;
+
+    /// Unset keeps today's writable paths (#906); `cplt config init` writes
+    /// false, so new configs get the deny.
+    allow_copilot_host_persistence, "sandbox", "allow_copilot_host_persistence",
+        cli = |_: &CliFlags| FeatureToggle::UseDefault,
+        config = |c: &Config| c.sandbox.allow_copilot_host_persistence,
+        baseline = |_: PresetBaseline| true,
+        resolved = |r: &Resolved| r.allow_copilot_host_persistence;
 
     allow_docker, "sandbox", "allow_docker",
         cli = |c: &CliFlags| c.allow_docker,

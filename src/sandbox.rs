@@ -268,6 +268,9 @@ pub struct SandboxConfig<'a> {
     /// in `agent_dirs` before this config is built; the flag is here so the
     /// Linux launch can warn about what Landlock unions back in.
     pub deny_copilot_dir_exec: bool,
+    /// `sandbox.allow_copilot_host_persistence` (#906): keep
+    /// [`crate::agent::COPILOT_PERSISTENCE_OPT_OUT`] writable.
+    pub allow_copilot_host_persistence: bool,
     /// Allow JVM Attach API unix sockets in /tmp (.java_pid* pattern only).
     pub allow_jvm_attach: bool,
     /// Allow MSBuild worker-node unix sockets in /tmp (MSBuild<pid> pattern only).
@@ -3061,7 +3064,11 @@ fn ro_protect_paths(
     // empty file, which changes what the agent reads at startup. That is not a
     // change to make untested, and this is a macOS host. Documented in
     // SECURITY.md instead of half-done.
-    ro_protect.extend(config.agent.host_persistence_paths(config.agent_dirs));
+    ro_protect.extend(
+        config
+            .agent
+            .host_persistence_paths_with(config.agent_dirs, config.allow_copilot_host_persistence),
+    );
 
     // H-13/H-05: an agent's exec-only grant that sits inside a writable tree.
     // macOS denies the write for exactly these dirs in
@@ -4320,6 +4327,7 @@ mod tests {
             deny_key_files_by_extension: false,
             protect_pnpm_config: false,
             deny_copilot_dir_exec: false,
+            allow_copilot_host_persistence: false,
             allow_jvm_attach: false,
             allow_msbuild: false,
             allow_docker: false,

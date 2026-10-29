@@ -1826,7 +1826,21 @@ impl Agent {
             // session. Copilot's in-session authoring surface is `agents/` and
             // `instructions/`, and both stay writable. Claude Code's is
             // `skills/` itself, which is why that default is still open.
+            //
+            // #906 corrected that for `agents/`: an agent's frontmatter
+            // `mcp-servers` command runs when the agent is selected (observed
+            // on CLI 1.0.104), so a planted `agents/*.agent.md` is a host
+            // command, not prompt content. `permissions-config.json` holds
+            // saved tool approvals (`commands` with a `:*` prefix, `write`)
+            // that skip prompts in later host sessions. Both are
+            // [`COPILOT_PERSISTENCE_OPT_OUT`]: denied for new configs, and kept
+            // writable while `sandbox.allow_copilot_host_persistence` is on
+            // (an unset key in an existing config). `config.json` stays
+            // writable: it holds `firstLaunchAt`, UI flags and login state, so
+            // the launch compares `trustedFolders` before and after instead.
             Agent::Copilot => &[
+                "agents",
+                "permissions-config.json",
                 "settings.json",
                 "hooks",
                 "mcp-config.json",
@@ -1922,6 +1936,22 @@ impl Agent {
     /// so joining them onto a subdirectory only produces paths that never
     /// exist (`~/.pi/agent/sessions/npm`).
     pub fn host_persistence_paths(&self, dirs: &[AgentDir]) -> Vec<PathBuf> {
+        self.host_persistence_paths_with(dirs, false)
+    }
+
+    /// [`Agent::host_persistence_paths`], minus [`COPILOT_PERSISTENCE_OPT_OUT`]
+    /// when `sandbox.allow_copilot_host_persistence` is on (#906). This is what
+    /// both backends call.
+    pub fn host_persistence_paths_with(
+        &self,
+        dirs: &[AgentDir],
+        allow_copilot_persistence: bool,
+    ) -> Vec<PathBuf> {
+        let skip: &[&str] = if allow_copilot_persistence && *self == Agent::Copilot {
+            COPILOT_PERSISTENCE_OPT_OUT
+        } else {
+            &[]
+        };
         dirs.iter()
             .filter(|d| {
                 !dirs
@@ -1931,6 +1961,7 @@ impl Agent {
             .flat_map(|d| {
                 self.host_persistence_denies()
                     .iter()
+                    .filter(|sub| !skip.contains(sub))
                     .map(|sub| d.path.join(sub))
             })
             .collect()
@@ -3154,6 +3185,29 @@ fn dsh_home(home: &Path) -> PathBuf {
     } else {
         std::env::current_dir().map_or(expanded.clone(), |cwd| cwd.join(&expanded))
     }
+}
+
+/// The Copilot [`Agent::host_persistence_denies`] entries that
+/// `sandbox.allow_copilot_host_persistence` keeps writable (#906).
+pub const COPILOT_PERSISTENCE_OPT_OUT: &[&str] = &["agents", "permissions-config.json"];
+
+/// The `trustedFolders` entries of Copilot's `config.json`, or empty when the
+/// file is missing or not JSON. The launch reads it before and after a session
+/// and warns about new entries (#906): the file also holds login and UI state,
+/// so it is not denied.
+#[must_use]
+pub fn copilot_trusted_folders(home: &Path) -> Vec<String> {
+    std::fs::read_to_string(home.join(".copilot/config.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| {
+            v.get("trustedFolders")?.as_array().map(|a| {
+                a.iter()
+                    .filter_map(|e| e.as_str().map(str::to_string))
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
 }
 
 /// `sandbox.deny_copilot_dir_exec` (#324): withdraw execve from `~/.copilot`.
@@ -4546,6 +4600,37 @@ mod tests {
         assert!(!Agent::OpenCode.needs_keychain());
     }
 
+    /// #906: the opt-in keeps exactly `agents/` and `permissions-config.json`
+    /// writable, for Copilot only, and `config.json` is never denied.
+    #[test]
+    fn copilot_persistence_opt_out_drops_only_its_two_entries() {
+        let home = Path::new("/home/u");
+        let dirs = Agent::Copilot.config_dirs(home);
+        let strict = Agent::Copilot.host_persistence_paths_with(&dirs, false);
+        let kept = Agent::Copilot.host_persistence_paths_with(&dirs, true);
+        let root = home.join(".copilot");
+        for sub in COPILOT_PERSISTENCE_OPT_OUT {
+            assert!(strict.contains(&root.join(sub)), "{sub} denied by default");
+            assert!(!kept.contains(&root.join(sub)), "{sub} kept writable");
+        }
+        assert_eq!(strict.len() - kept.len(), COPILOT_PERSISTENCE_OPT_OUT.len());
+        assert!(!strict.contains(&root.join("config.json")));
+        assert_eq!(strict, Agent::Copilot.host_persistence_paths(&dirs));
+    }
+
+    #[test]
+    fn copilot_trusted_folders_reads_the_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(copilot_trusted_folders(tmp.path()).is_empty());
+        std::fs::create_dir(tmp.path().join(".copilot")).unwrap();
+        std::fs::write(
+            tmp.path().join(".copilot/config.json"),
+            r#"{"firstLaunchAt":"x","trustedFolders":["/a","/b"]}"#,
+        )
+        .unwrap();
+        assert_eq!(copilot_trusted_folders(tmp.path()), ["/a", "/b"]);
+    }
+
     #[test]
     fn host_persistence_denies_per_agent() {
         assert_eq!(
@@ -4580,6 +4665,8 @@ mod tests {
         assert_eq!(
             Agent::Copilot.host_persistence_denies(),
             [
+                "agents",
+                "permissions-config.json",
                 "settings.json",
                 "hooks",
                 "mcp-config.json",
