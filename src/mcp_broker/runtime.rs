@@ -681,7 +681,13 @@ pub(crate) fn serve(shared: &Shared, stream: UnixStream) {
     // Client → server.
     while let Some(line) = read_line(&mut reader, MAX_MESSAGE) {
         let action = match pending.lock() {
-            Ok(mut p) => on_client(&line, spec, &mut p),
+            Ok(mut p) => {
+                let a = on_client(&line, spec, &mut p);
+                if let Some(text) = p.1.take() {
+                    shared.log.line(&spec.id, &text);
+                }
+                a
+            }
             Err(_) => break,
         };
         match action {

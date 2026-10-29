@@ -100,8 +100,14 @@ pub fn on_client(line: &str, spec: &Spec, pending: &mut Pending) -> Action {
         // for an id not in flight has nothing to cancel.
         if method == "notifications/cancelled" {
             let req = msg.pointer("/params/requestId").map(Value::to_string);
-            if req.and_then(|r| pending.0.remove(&r)).is_none() {
+            let Some((_, sent, tool)) = req.and_then(|r| pending.0.remove(&r)) else {
                 return Action::Drop;
+            };
+            if let Some(tool) = tool {
+                pending.1 = Some(format!(
+                    "tools/call {tool} → CANCELLED {}ms",
+                    sent.elapsed().as_millis()
+                ));
             }
         }
         return if CLIENT_NOTIFICATIONS.contains(&method) {
@@ -252,8 +258,12 @@ pub fn on_server(line: &str, spec: &Spec, pending: &mut Pending) -> Action {
         return Action::Drop;
     };
     if let Some(tool) = tool {
-        let outcome = if let Some(code) = obj.get("error").and_then(|e| e.get("code")) {
-            format!("FAIL {code}")
+        // Only an integer code reaches the log: the value is the server's.
+        let outcome = if let Some(e) = obj.get("error") {
+            match e.get("code").and_then(Value::as_i64) {
+                Some(code) => format!("FAIL {code}"),
+                None => "FAIL invalid error code".into(),
+            }
         } else if obj.get("result").and_then(|r| r.get("isError")) == Some(&Value::Bool(true)) {
             "FAIL tool error".into()
         } else {
@@ -495,7 +505,28 @@ mod tests {
             denied.starts_with("tools/call → DENIED tool \"delete_app\""),
             "{denied}"
         );
-        for l in [&allowed, &failed, &denied] {
+        // A non-integer code is the server's content: not copied.
+        on_client(&call(4, "get_nais_context"), &s, &mut p);
+        on_server(
+            r#"{"jsonrpc":"2.0","id":4,"error":{"code":{"token":"s3cr3t-res"}}}"#,
+            &s,
+            &mut p,
+        );
+        let odd = p.1.take().unwrap();
+        assert!(odd.contains("→ FAIL invalid error code "), "{odd}");
+        // A cancelled call still leaves its line.
+        on_client(&call(5, "get_nais_context"), &s, &mut p);
+        on_client(
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":5}}"#,
+            &s,
+            &mut p,
+        );
+        let cancelled = p.1.take().unwrap();
+        assert!(
+            cancelled.starts_with("tools/call get_nais_context → CANCELLED "),
+            "{cancelled}"
+        );
+        for l in [&allowed, &failed, &denied, &odd, &cancelled] {
             assert!(!l.contains("s3cr3t"), "{l}");
         }
         // Other methods leave no audit line.
