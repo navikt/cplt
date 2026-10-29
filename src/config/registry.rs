@@ -72,7 +72,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: false,
         default_display: "false",
-        description: "Linux with Bubblewrap only: run the agent in its own network namespace. The only way out is the cplt proxy, so direct TCP, UDP and DNS are blocked by the kernel. Refuses the launch if the namespace cannot be set up. No effect on macOS.",
+        description: "Linux with Bubblewrap only: run the agent in its own network namespace. The only way out is the cplt proxy, so direct TCP, UDP and DNS are blocked by the kernel. Needs the proxy and the scratch dir; refuses the launch if the namespace cannot be set up. allow.localhost and allow_localhost_any have no effect under it, since host loopback is out of reach. No effect on macOS.",
     },
     ConfigKeyInfo {
         section: "proxy",

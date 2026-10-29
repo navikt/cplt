@@ -6831,6 +6831,14 @@ fn assemble_sandbox(
              UDP DNS there. See docs/known-impacts.md for what stays open.",
         );
     }
+    #[cfg(target_os = "linux")]
+    if resolved.netns && (!resolved.allow_localhost.is_empty() || resolved.allow_localhost_any) {
+        ui::warn(
+            "allow.localhost and allow_localhost_any have no effect under proxy.netns: the \
+             agent's 127.0.0.1 is its own namespace, so host loopback services stay out of \
+             reach. Turn proxy.netns off for a run that needs them.",
+        );
+    }
     #[cfg(not(target_os = "linux"))]
     if resolved.netns {
         ui::warn(
@@ -7168,9 +7176,7 @@ fn assemble_sandbox(
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     #[cfg(target_os = "linux")]
     if resolved.netns {
-        prepared
-            .enable_netns()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        prepared.check_netns().map_err(|e| anyhow::anyhow!("{e}"))?;
     }
     prepared.set_worktree_root(opts.repos.worktree_root);
     prepared.set_worktree_socket(
@@ -7294,6 +7300,7 @@ fn build_sandbox_config<'a>(
         allow_gpg_signing: resolved.allow_gpg_signing,
         deny_clipboard: resolved.deny_clipboard,
         deny_dns: resolved.deny_dns && resolved.proxy_forced,
+        netns: resolved.netns,
         deny_nested_git: resolved.deny_nested_git,
         refuse_cache_exec_links: resolved.refuse_cache_exec_links,
         deny_key_files_by_extension: resolved.deny_key_files_by_extension,
@@ -13482,6 +13489,7 @@ mod tests {
             allow_gpg_signing: false,
             deny_clipboard: false,
             deny_dns: false,
+            netns: false,
             deny_nested_git: false,
             refuse_cache_exec_links: false,
             deny_key_files_by_extension: true,

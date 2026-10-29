@@ -1917,8 +1917,8 @@ fn exec_bwrap(
         policy_read_fd.to_string(),
     );
     cmd.env(super::bubblewrap::ENV_CONFIRM_FD, write_fd.to_string());
-    // proxy.netns (#114): the host end of the bridge. `enable_netns` checked
-    // the scratch dir; without a proxy there is nothing to bridge to.
+    // proxy.netns (#114): the host end of the bridge. `check_netns` checked both
+    // the scratch dir and the proxy.
     if wrapper.netns()
         && let (Some(port), Some(dir)) = (sandbox.proxy_port, sandbox.scratch_dir.as_deref())
     {
@@ -2047,15 +2047,16 @@ fn netns_bridge(sock: &Path, port: u16) -> std::io::Result<String> {
     std::fs::DirBuilder::new().mode(0o700).create(dir)?;
     let listener = std::os::unix::net::UnixListener::bind(sock)?;
     std::fs::set_permissions(sock, std::fs::Permissions::from_mode(0o600))?;
-    std::thread::spawn(move || {
+    let live = std::sync::Arc::default();
+    std::thread::Builder::new().spawn(move || {
         for conn in listener.incoming().flatten() {
-            std::thread::spawn(move || {
+            super::bubblewrap::spawn_capped(&live, move || {
                 if let Ok(up) = std::net::TcpStream::connect(("127.0.0.1", port)) {
                     super::bubblewrap::splice(up, conn);
                 }
             });
         }
-    });
+    })?;
     Ok(format!("{}:{port}", sock.display()))
 }
 

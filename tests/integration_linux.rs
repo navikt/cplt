@@ -2947,6 +2947,57 @@ print('CONNECTED')
         cmd
     }
 
+    /// proxy.netns fails closed: without bubblewrap, the proxy or the scratch
+    /// dir the launch refuses, naming the fix, and the agent never runs.
+    #[test]
+    fn netns_refuses_without_what_it_needs() {
+        require_landlock!();
+        let project = create_test_project();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("c.toml");
+        for (extra_cfg, flag, want) in [
+            ("", "--no-bubblewrap", "proxy.netns needs Bubblewrap"),
+            ("", "--no-proxy", "proxy.netns needs the proxy"),
+            (
+                "[sandbox]\nscratch_dir = false\n",
+                "--use-bubblewrap",
+                "needs the scratch dir",
+            ),
+        ] {
+            if flag != "--no-bubblewrap" && !bwrap_available() {
+                continue;
+            }
+            fs::write(&cfg, format!("[proxy]\nnetns = true\n{extra_cfg}")).unwrap();
+            let out = cplt_cmd()
+                .args([
+                    "--yes",
+                    "--no-validate",
+                    "--quiet",
+                    "--agent",
+                    "shell",
+                    flag,
+                ])
+                .arg("--project-dir")
+                .arg(project.path())
+                .args(["--", "-c", "echo AGENT_RAN"])
+                .env("CPLT_CONFIG", &cfg)
+                .output()
+                .unwrap();
+            let all = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(!out.status.success(), "{flag}: must refuse: {all}");
+            assert!(!all.contains("AGENT_RAN"), "{flag}: agent ran: {all}");
+            assert!(all.contains(want), "{flag}: want {want:?}: {all}");
+            assert!(
+                all.contains("proxy.netns = false"),
+                "{flag}: no fix named: {all}"
+            );
+        }
+    }
+
     /// CONNECT reaches the host proxy through the bridge; a direct TCP
     /// connect (even to a loopback port the policy allows), DNS and UDP have
     /// no route at all.

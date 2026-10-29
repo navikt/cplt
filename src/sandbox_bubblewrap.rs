@@ -122,39 +122,16 @@ pub(crate) fn splice(tcp: std::net::TcpStream, unix: std::os::unix::net::UnixStr
     let (Ok(mut tcp_r), Ok(mut unix_w)) = (tcp.try_clone(), unix.try_clone()) else {
         return;
     };
-    std::thread::spawn(move || {
+    let spawned = std::thread::Builder::new().spawn(move || {
         let _ = std::io::copy(&mut tcp_r, &mut unix_w);
         let _ = unix_w.shutdown(Shutdown::Write);
     });
+    if spawned.is_err() {
+        return;
+    }
     let (mut tcp_w, mut unix_r) = (tcp, unix);
     let _ = std::io::copy(&mut unix_r, &mut tcp_w);
     let _ = tcp_w.shutdown(Shutdown::Write);
-}
-
-/// Turn on `proxy.netns` for this wrapper, or say why it cannot be.
-///
-/// Probes the real args plus `--unshare-net`, so a host that cannot create
-/// the namespace refuses here, before anything is spawned. Strict from now
-/// on: a spawn failure must not fall back to a run without the namespace.
-#[allow(clippy::disallowed_methods)] // bwrap_path comes from trusted_binary("bwrap")
-pub(crate) fn enable_netns(w: &mut BubblewrapWrapper) -> Result<(), String> {
-    if w.netns() {
-        return Ok(());
-    }
-    let out = Command::new(&w.bwrap_path)
-        .args(&w.bwrap_args)
-        .args(["--unshare-net", "--", "/bin/true"])
-        .output()
-        .map_err(|e| format!("cannot run bwrap: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "bwrap cannot create a network namespace here: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    w.bwrap_args.push("--unshare-net".to_string());
-    w.strict = true;
-    Ok(())
 }
 
 /// Start the relay if the parent asked for one. Returns `false` on failure;
@@ -187,19 +164,62 @@ fn start_netns_relay() -> bool {
         return false;
     }
     // SAFETY: single-threaded pre-main, see above.
+    // The relay writes one byte once its own Landlock domain is in force; the
+    // agent waits for it, so it never runs beside an unconfined relay.
+    let mut sync = [0i32; 2];
+    if unsafe { libc::pipe2(sync.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return false;
+    }
     let agent = unsafe { libc::fork() };
     if agent < 0 {
         return false;
     }
     if agent == 0 {
         // The agent: `listener` is CLOEXEC and goes away at execve.
-        return true;
+        unsafe { libc::close(sync[1]) };
+        let mut b = [0u8; 1];
+        let n = loop {
+            let n = unsafe { libc::read(sync[0], b.as_mut_ptr().cast(), 1) };
+            if n >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                break n;
+            }
+        };
+        unsafe { libc::close(sync[0]) };
+        if n != 1 {
+            eprintln!("cplt: proxy.netns: the relay could not confine itself");
+        }
+        return n == 1;
     }
-    run_relay(listener, &sock, agent)
+    unsafe { libc::close(sync[0]) };
+    run_relay(listener, &sock, agent, sync[1])
+}
+
+/// Connections bridged at once, per side; more are dropped.
+pub(crate) const MAX_BRIDGED: usize = 512;
+
+/// Run `f` on its own thread unless [`MAX_BRIDGED`] already run. A thread
+/// that cannot be spawned, or one over the cap, drops its connection.
+pub(crate) fn spawn_capped(
+    live: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    f: impl FnOnce() + Send + 'static,
+) {
+    use std::sync::atomic::Ordering::SeqCst;
+    if live.fetch_add(1, SeqCst) >= MAX_BRIDGED {
+        live.fetch_sub(1, SeqCst);
+        return;
+    }
+    let held = live.clone();
+    let spawned = std::thread::Builder::new().spawn(move || {
+        f();
+        held.fetch_sub(1, SeqCst);
+    });
+    if spawned.is_err() {
+        live.fetch_sub(1, SeqCst);
+    }
 }
 
 /// The relay's whole life. Never returns.
-fn run_relay(listener: std::net::TcpListener, sock: &Path, agent: libc::pid_t) -> ! {
+fn run_relay(listener: std::net::TcpListener, sock: &Path, agent: libc::pid_t, sync: i32) -> ! {
     // The agent's terminal signals are its own; the relay ends when its
     // children do. Not dumpable: no ptrace, no /proc/<pid>/mem.
     unsafe {
@@ -227,23 +247,26 @@ fn run_relay(listener: std::net::TcpListener, sock: &Path, agent: libc::pid_t) -
     };
     if landlock_mod::apply_landlock_and_seccomp_now(&[(rule, None)], &[], true, true, None).is_err()
     {
-        // Without its own sandbox the relay serves nothing; the agent then
-        // has no network, which is the safe side.
+        // Closing `sync` unwritten stops the agent before it starts.
         drop(listener);
+        unsafe { libc::close(sync) };
     } else {
         let sock = sock.to_path_buf();
-        std::thread::spawn(move || {
+        let live = std::sync::Arc::default();
+        let _ = std::thread::Builder::new().spawn(move || {
             for conn in listener.incoming().flatten() {
                 let sock = sock.clone();
-                // ponytail: a thread per connection, a pool if agents ever
-                // open thousands at once.
-                std::thread::spawn(move || {
+                spawn_capped(&live, move || {
                     if let Ok(up) = std::os::unix::net::UnixStream::connect(&sock) {
                         splice(conn, up);
                     }
                 });
             }
         });
+        unsafe {
+            libc::write(sync, [1u8].as_ptr().cast(), 1);
+            libc::close(sync);
+        }
     }
     let mut code = 1;
     loop {
@@ -369,6 +392,7 @@ pub(crate) fn test_functionality(
     fs_rules: &[FsRule],
     overlays: Overlays<'_>,
     deny_masks: &DenyMasks,
+    netns: bool,
 ) -> Result<(), String> {
     #[cfg(test)]
     if FAIL_PROBE.get() {
@@ -378,6 +402,9 @@ pub(crate) fn test_functionality(
     #[cfg(test)]
     if FAIL_PROBE_ON.with_borrow(|on| on.as_ref().is_some_and(|a| args.contains(a))) {
         return Err("bwrap test failed: bwrap: forced by test".to_string());
+    }
+    if netns {
+        args.push("--unshare-net".to_string());
     }
     args.push("--".to_string());
     args.push("/bin/true".to_string());
@@ -1351,6 +1378,7 @@ pub(crate) fn rename_pin_paths(write_roots: &[&Path], git_dirs: &[&Path]) -> Vec
 /// build a wrapper — never on the disabled or fallback paths.
 pub(crate) fn resolve(
     use_bubblewrap: Option<bool>,
+    netns: bool,
     policy: &LandlockPolicy,
     overlays: Overlays<'_>,
     deny_masks: &DenyMasks,
@@ -1365,7 +1393,7 @@ pub(crate) fn resolve(
     }
     match use_bubblewrap {
         Some(false) => Ok(None),
-        Some(true) => build_wrapper(policy, overlays, deny_masks, true)
+        Some(true) => build_wrapper(policy, overlays, deny_masks, true, netns)
             .map(Some)
             .map_err(|e| {
                 format!(
@@ -1373,7 +1401,7 @@ pub(crate) fn resolve(
                  Install bubblewrap or remove --use-bubblewrap."
                 )
             }),
-        None => match build_wrapper(policy, overlays, deny_masks, false) {
+        None => match build_wrapper(policy, overlays, deny_masks, false, netns) {
             Ok(wrapper) => Ok(Some(wrapper)),
             Err(e) => {
                 if e.starts_with("bwrap test failed") {
@@ -1393,6 +1421,7 @@ pub(crate) fn build_wrapper(
     overlays: Overlays<'_>,
     deny_masks: &DenyMasks,
     strict: bool,
+    netns: bool,
 ) -> Result<BubblewrapWrapper, String> {
     let bwrap_path = check_availability().ok_or_else(|| {
         format!(
@@ -1401,15 +1430,19 @@ pub(crate) fn build_wrapper(
         )
     })?;
     let bind_rules = mount_rules(policy);
-    test_functionality(&bwrap_path, &bind_rules, overlays, deny_masks)?;
-    let bwrap_args = build_bwrap_args(&bind_rules, overlays, deny_masks);
+    test_functionality(&bwrap_path, &bind_rules, overlays, deny_masks, netns)?;
+    let mut bwrap_args = build_bwrap_args(&bind_rules, overlays, deny_masks);
+    if netns {
+        bwrap_args.push("--unshare-net".to_string());
+    }
     Ok(BubblewrapWrapper {
         bwrap_path,
         bwrap_args,
         fs_rules: policy.fs_rules.clone(),
         net_rules: policy.net_rules.clone(),
         restrict_net_connect: policy.restrict_net_connect,
-        strict,
+        // proxy.netns: a spawn failure must not fall back to the shared network.
+        strict: strict || netns,
         deny_mask_count: deny_masks.mask_count(),
         socket_mask_count: deny_masks.socket_mask_count(),
         proc_limited_on_fallback: false,
@@ -1980,8 +2013,13 @@ mod tests {
         for linked in [intermediate, final_link] {
             let policy = test_policy(vec![nofollow_rule(&linked)], None);
             for mode in [None, Some(true)] {
-                let Err(e) = resolve(mode, &policy, Overlays::default(), &DenyMasks::default())
-                else {
+                let Err(e) = resolve(
+                    mode,
+                    false,
+                    &policy,
+                    Overlays::default(),
+                    &DenyMasks::default(),
+                ) else {
                     panic!("{mode:?}: {} was not refused", linked.display());
                 };
                 assert!(e.contains("a symlink appeared"), "{mode:?}: {e}");
@@ -1989,6 +2027,7 @@ mod tests {
             assert!(
                 resolve(
                     Some(false),
+                    false,
                     &policy,
                     Overlays::default(),
                     &DenyMasks::default()
@@ -2319,6 +2358,7 @@ mod tests {
         assert!(
             resolve(
                 Some(false),
+                false,
                 &test_policy(vec![], None),
                 Overlays::default(),
                 &DenyMasks::default()

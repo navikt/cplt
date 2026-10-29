@@ -77,6 +77,7 @@ pub(crate) mod bubblewrap_probe {
             },
             &plan.deny_masks,
             false,
+            config.netns,
         )
         .map(|_| ())
     }
@@ -250,6 +251,8 @@ pub struct SandboxConfig<'a> {
     /// `proxy.deny_dns` under `proxy.forced` (#653): close the resolver
     /// socket and the dnssd Mach services. macOS only.
     pub deny_dns: bool,
+    /// `proxy.netns` (#114): bwrap gets `--unshare-net`. Linux only.
+    pub netns: bool,
     /// `sandbox.deny_nested_git` (#576): deny creating a `.git` entry below a
     /// writable root. macOS only; Linux has no way to express it.
     pub deny_nested_git: bool,
@@ -425,29 +428,33 @@ impl PreparedSandbox {
     /// `proxy.netns` (#114): run the agent in its own network namespace, or
     /// say why not and how to fix it. The launch refuses on `Err`.
     #[cfg(target_os = "linux")]
-    pub fn enable_netns(&mut self) -> Result<(), String> {
+    pub fn check_netns(&self) -> Result<(), String> {
         const OFF: &str = "or set proxy.netns = false";
-        let Some(w) = &mut self.bwrap_wrapper else {
+        if self.bwrap_wrapper.as_ref().is_none_or(|w| !w.netns()) {
             let fix = if bubblewrap::check_availability().is_none() {
                 format!("Install it ({})", crate::doctor::BWRAP_INSTALL_HINT)
             } else {
-                "Run `cplt doctor` to see what blocks it".to_string()
+                crate::doctor::apparmor_fix()
+                    .unwrap_or_else(|| "Run `cplt doctor` to see what blocks it".to_string())
             };
             return Err(format!(
-                "proxy.netns needs Bubblewrap, and it is not wrapping this run. {fix}, {OFF}."
+                "proxy.netns needs Bubblewrap with a network namespace, and this run has \
+                 none. {fix}, {OFF}."
             ));
-        };
-        if self.proxy_port.is_some() && self.scratch_dir.is_none() {
+        }
+        if self.proxy_port.is_none() {
+            return Err(format!(
+                "proxy.netns needs the proxy: it is the only way out of the namespace. \
+                 Turn the proxy on, {OFF}."
+            ));
+        }
+        if self.scratch_dir.is_none() {
             return Err(format!(
                 "proxy.netns needs the scratch dir for its proxy socket. \
                  Set sandbox.scratch_dir = true, {OFF}."
             ));
         }
-        bubblewrap::enable_netns(w).map_err(|e| {
-            let fix = crate::doctor::apparmor_fix()
-                .unwrap_or_else(|| "Run `cplt doctor` to see what blocks it".to_string());
-            format!("proxy.netns: {e}. {fix}, {OFF}.")
-        })
+        Ok(())
     }
 
     pub fn add_opencode_v2(&mut self, session: crate::opencode_v2::Session) -> Result<(), String> {
@@ -2716,6 +2723,7 @@ fn mcp_wrapper(config: &SandboxConfig) -> (Result<(), String>, BwrapPlan) {
             },
             &plan.deny_masks,
             false,
+            config.netns,
         )
         .map(|_| ())
     };
@@ -3614,6 +3622,7 @@ fn prepare_impl(
     // disabled and fallback arms borrow and clone nothing.
     let mut bwrap_wrapper = bubblewrap::resolve(
         config.use_bubblewrap,
+        config.netns,
         &policy,
         bubblewrap::Overlays {
             read_only: &ro_protect,
@@ -3661,13 +3670,14 @@ fn prepare_impl(
                 read_only: &ro_protect,
                 pins: &pins,
             };
-            let rebuilt = bubblewrap::build_wrapper(&policy, overlays, &deny_masks, strict)
-                .map_err(|e| {
-                    format!(
-                        "Bubblewrap failed after cplt created the empty home Git config files \
+            let rebuilt =
+                bubblewrap::build_wrapper(&policy, overlays, &deny_masks, strict, config.netns)
+                    .map_err(|e| {
+                        format!(
+                            "Bubblewrap failed after cplt created the empty home Git config files \
                          it binds read-only: {e}. Not starting without that bind."
-                    )
-                })?;
+                        )
+                    })?;
             bwrap_wrapper = Some(rebuilt);
         }
     }
@@ -4343,6 +4353,7 @@ mod tests {
             allow_gpg_signing: false,
             deny_clipboard: false,
             deny_dns: false,
+            netns: false,
             deny_nested_git: false,
             refuse_cache_exec_links: false,
             deny_key_files_by_extension: false,
@@ -5365,6 +5376,7 @@ mod tests {
             &[],
             bubblewrap::Overlays::default(),
             &bubblewrap::DenyMasks::default(),
+            false,
         );
         let state = crate::doctor::bubblewrap_state(None, false, &config, &[]);
         let launch = prepare(&config).expect("prepare");
