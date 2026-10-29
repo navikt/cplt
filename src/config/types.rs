@@ -505,6 +505,9 @@ pub struct ProxyConfig {
     /// macOS: close the system resolver to the agent under `forced` (#653),
     /// so a name can only be looked up by the proxy (default: false).
     pub deny_dns: Option<bool>,
+    /// Linux + bubblewrap: run the agent in its own network namespace whose
+    /// only way out is the proxy (default: false, #114).
+    pub netns: Option<bool>,
     /// Put the real GitHub token back in at the proxy and give the sandbox a
     /// placeholder (default: false, #820).
     pub inject_github_token: Option<bool>,
@@ -967,6 +970,8 @@ pub struct Resolved {
     pub proxy_forced: bool,
     /// `proxy.deny_dns` (#653), raw. Only takes effect with `proxy_forced`.
     pub deny_dns: bool,
+    /// `proxy.netns` (#114), raw. Linux + bubblewrap only.
+    pub netns: bool,
     /// Proxy-side GitHub token injection (#820).
     pub inject_github_token: bool,
     pub proxy_port: u16,

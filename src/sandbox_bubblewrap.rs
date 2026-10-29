@@ -95,6 +95,172 @@ pub(crate) const ENV_INNER_POLICY: &str = "__CPLT_BWRAP_POLICY_FD";
 /// agent so the parent knows the inner sandbox was applied.
 pub(crate) const ENV_CONFIRM_FD: &str = "__CPLT_BWRAP_CONFIRM_FD";
 
+// ── proxy.netns (#114): the agent's only way out is the proxy ──
+//
+// bwrap runs with `--unshare-net` (it brings `lo` up itself). The parent
+// listens on a unix socket in the scratch dir and splices each connection to
+// the host proxy; inside the namespace the helper forks a relay that listens
+// on `127.0.0.1:<proxy_port>` and splices to that socket. So `HTTPS_PROXY`
+// stays as it is, and every other address has no route.
+//
+// The relay is the agent's *parent*, not its child: it sets itself as child
+// subreaper, waits until every process below it is gone, then exits with the
+// agent's status. An agent that double-forks and exits keeps its network,
+// and the session ends when it does today.
+
+/// `<socket path>:<port>` for the in-namespace relay. Scrubbed before execve.
+pub(crate) const ENV_NETNS: &str = "__CPLT_BWRAP_NETNS";
+
+/// Where the host end of the bridge listens, inside the session's scratch dir.
+pub(crate) fn netns_socket_path(scratch: &Path) -> PathBuf {
+    scratch.join("netns").join("proxy.sock")
+}
+
+/// Copy bytes both ways; each direction half-closes its peer on EOF.
+pub(crate) fn splice(tcp: std::net::TcpStream, unix: std::os::unix::net::UnixStream) {
+    use std::net::Shutdown;
+    let (Ok(mut tcp_r), Ok(mut unix_w)) = (tcp.try_clone(), unix.try_clone()) else {
+        return;
+    };
+    std::thread::spawn(move || {
+        let _ = std::io::copy(&mut tcp_r, &mut unix_w);
+        let _ = unix_w.shutdown(Shutdown::Write);
+    });
+    let (mut tcp_w, mut unix_r) = (tcp, unix);
+    let _ = std::io::copy(&mut unix_r, &mut tcp_w);
+    let _ = tcp_w.shutdown(Shutdown::Write);
+}
+
+/// Turn on `proxy.netns` for this wrapper, or say why it cannot be.
+///
+/// Probes the real args plus `--unshare-net`, so a host that cannot create
+/// the namespace refuses here, before anything is spawned. Strict from now
+/// on: a spawn failure must not fall back to a run without the namespace.
+#[allow(clippy::disallowed_methods)] // bwrap_path comes from trusted_binary("bwrap")
+pub(crate) fn enable_netns(w: &mut BubblewrapWrapper) -> Result<(), String> {
+    if w.netns() {
+        return Ok(());
+    }
+    let out = Command::new(&w.bwrap_path)
+        .args(&w.bwrap_args)
+        .args(["--unshare-net", "--", "/bin/true"])
+        .output()
+        .map_err(|e| format!("cannot run bwrap: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "bwrap cannot create a network namespace here: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    w.bwrap_args.push("--unshare-net".to_string());
+    w.strict = true;
+    Ok(())
+}
+
+/// Start the relay if the parent asked for one. Returns `false` on failure;
+/// the caller then exits without confirming, so the agent never starts.
+///
+/// Runs pre-`main()` and single-threaded: threads start only in the relay,
+/// after the fork. The listener is bound before the fork, so the agent's
+/// confirm byte also means the relay is listening.
+fn start_netns_relay() -> bool {
+    let Some(spec) = std::env::var_os(ENV_NETNS) else {
+        return true;
+    };
+    scrub_env(ENV_NETNS);
+    let spec = spec.to_string_lossy().into_owned();
+    let Some((sock, port)) = spec
+        .rsplit_once(':')
+        .and_then(|(s, p)| Some((PathBuf::from(s), p.parse::<u16>().ok()?)))
+    else {
+        return false;
+    };
+    let listener = match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("cplt: proxy.netns: cannot listen on 127.0.0.1:{port}: {e}");
+            return false;
+        }
+    };
+    // Set before the fork, so no orphan of the agent can slip past it.
+    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) } != 0 {
+        return false;
+    }
+    // SAFETY: single-threaded pre-main, see above.
+    let agent = unsafe { libc::fork() };
+    if agent < 0 {
+        return false;
+    }
+    if agent == 0 {
+        // The agent: `listener` is CLOEXEC and goes away at execve.
+        return true;
+    }
+    run_relay(listener, &sock, agent)
+}
+
+/// The relay's whole life. Never returns.
+fn run_relay(listener: std::net::TcpListener, sock: &Path, agent: libc::pid_t) -> ! {
+    // The agent's terminal signals are its own; the relay ends when its
+    // children do. Not dumpable: no ptrace, no /proc/<pid>/mem.
+    unsafe {
+        for sig in [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM, libc::SIGHUP] {
+            libc::signal(sig, libc::SIG_IGN);
+        }
+        libc::prctl(libc::PR_SET_DUMPABLE, 0);
+        if let Some(fd) = std::env::var_os(ENV_CONFIRM_FD)
+            .and_then(|v| v.to_str().and_then(|s| s.parse::<i32>().ok()))
+        {
+            libc::close(fd);
+        }
+    }
+    // Own Landlock domain: no filesystem access but the socket's directory,
+    // no TCP connect at all. Same seccomp filter as the agent.
+    let dir = sock.parent().unwrap_or(sock).to_path_buf();
+    let rule = FsRule {
+        path: dir,
+        access: FsAccess {
+            read: true,
+            write: true,
+            ..Default::default()
+        },
+        nofollow: false,
+    };
+    if landlock_mod::apply_landlock_and_seccomp_now(&[(rule, None)], &[], true, true, None).is_err()
+    {
+        // Without its own sandbox the relay serves nothing; the agent then
+        // has no network, which is the safe side.
+        drop(listener);
+    } else {
+        let sock = sock.to_path_buf();
+        std::thread::spawn(move || {
+            for conn in listener.incoming().flatten() {
+                let sock = sock.clone();
+                // ponytail: a thread per connection, a pool if agents ever
+                // open thousands at once.
+                std::thread::spawn(move || {
+                    if let Ok(up) = std::os::unix::net::UnixStream::connect(&sock) {
+                        splice(conn, up);
+                    }
+                });
+            }
+        });
+    }
+    let mut code = 1;
+    loop {
+        let mut status = 0;
+        let pid = unsafe { libc::waitpid(-1, &raw mut status, 0) };
+        if pid == agent {
+            code = if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status)
+            } else {
+                128 + libc::WTERMSIG(status)
+            };
+        } else if pid < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            unsafe { libc::_exit(code) };
+        }
+    }
+}
+
 /// A validated Bubblewrap execution wrapper, built during `prepare()`.
 #[derive(Clone)]
 pub(crate) struct BubblewrapWrapper {
@@ -133,6 +299,13 @@ pub(crate) struct BubblewrapWrapper {
     /// `AGENTS.md` rule, which the helper opens with the same link and
     /// file-type checks as the fork-based path.
     pub plain_file: Option<usize>,
+}
+
+impl BubblewrapWrapper {
+    /// Whether `proxy.netns` (#114) put this run in its own network namespace.
+    pub(crate) fn netns(&self) -> bool {
+        self.bwrap_args.iter().any(|a| a == "--unshare-net")
+    }
 }
 
 /// Check if bubblewrap is available on this system.
@@ -1448,6 +1621,11 @@ fn run_inner() {
         .iter()
         .map(|&port| NetRule { port })
         .collect();
+
+    // proxy.netns: fork the relay first; only the agent comes back here.
+    if !start_netns_relay() {
+        return;
+    }
 
     // Bind Landlock to in-namespace inodes and install seccomp. If this fails
     // we return without signalling success — never run the agent unsandboxed.

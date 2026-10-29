@@ -68,6 +68,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "proxy",
+        key: "netns",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "false",
+        description: "Linux with Bubblewrap only: run the agent in its own network namespace. The only way out is the cplt proxy, so direct TCP, UDP and DNS are blocked by the kernel. Refuses the launch if the namespace cannot be set up. No effect on macOS.",
+    },
+    ConfigKeyInfo {
+        section: "proxy",
         key: "inject_github_token",
         value_type: ConfigValueType::Bool,
         dangerous: false,
@@ -999,6 +1007,13 @@ bool_keys! {
         config = |c: &Config| c.proxy.deny_dns,
         baseline = |_: PresetBaseline| false,
         resolved = |r: &Resolved| r.deny_dns;
+
+    /// Config-only (#114). Linux + bubblewrap only.
+    netns, "proxy", "netns",
+        cli = |_: &CliFlags| FeatureToggle::UseDefault,
+        config = |c: &Config| c.proxy.netns,
+        baseline = |_: PresetBaseline| false,
+        resolved = |r: &Resolved| r.netns;
 
     inject_github_token, "proxy", "inject_github_token",
         cli = |c: &CliFlags| c.inject_github_token,

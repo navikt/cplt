@@ -807,6 +807,7 @@ The settings below are machine-specific or local CLI preferences, so `.cplt.toml
 | `proxy.enabled` | local proxy preference |
 | `proxy.forced` | forcing all egress through the proxy is a local security preference, not project policy |
 | `proxy.deny_dns` | closing DNS is a local security preference that goes with `proxy.forced` |
+| `proxy.netns` | a network namespace depends on this host's Bubblewrap and kernel; see [Network namespace](proxy.md#network-namespace-linux-proxynetns) |
 | `proxy.port` | port conflicts are machine-specific |
 | `proxy.log_file` | local log path |
 | `proxy.log_level` | local verbosity preference |

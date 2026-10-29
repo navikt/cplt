@@ -422,6 +422,34 @@ impl PreparedSandbox {
     /// On Linux the host service files leave the Landlock rules and the
     /// session port joins the connect allowlist (#719), in both the direct
     /// and the bubblewrap rules.
+    /// `proxy.netns` (#114): run the agent in its own network namespace, or
+    /// say why not and how to fix it. The launch refuses on `Err`.
+    #[cfg(target_os = "linux")]
+    pub fn enable_netns(&mut self) -> Result<(), String> {
+        const OFF: &str = "or set proxy.netns = false";
+        let Some(w) = &mut self.bwrap_wrapper else {
+            let fix = if bubblewrap::check_availability().is_none() {
+                format!("Install it ({})", crate::doctor::BWRAP_INSTALL_HINT)
+            } else {
+                "Run `cplt doctor` to see what blocks it".to_string()
+            };
+            return Err(format!(
+                "proxy.netns needs Bubblewrap, and it is not wrapping this run. {fix}, {OFF}."
+            ));
+        };
+        if self.proxy_port.is_some() && self.scratch_dir.is_none() {
+            return Err(format!(
+                "proxy.netns needs the scratch dir for its proxy socket. \
+                 Set sandbox.scratch_dir = true, {OFF}."
+            ));
+        }
+        bubblewrap::enable_netns(w).map_err(|e| {
+            let fix = crate::doctor::apparmor_fix()
+                .unwrap_or_else(|| "Run `cplt doctor` to see what blocks it".to_string());
+            format!("proxy.netns: {e}. {fix}, {OFF}.")
+        })
+    }
+
     pub fn add_opencode_v2(&mut self, session: crate::opencode_v2::Session) -> Result<(), String> {
         // File grants go before the denies, so every deny still wins.
         #[cfg(target_os = "macos")]

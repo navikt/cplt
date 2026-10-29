@@ -6831,6 +6831,13 @@ fn assemble_sandbox(
              UDP DNS there. See docs/known-impacts.md for what stays open.",
         );
     }
+    #[cfg(not(target_os = "linux"))]
+    if resolved.netns {
+        ui::warn(
+            "proxy.netns has no effect on macOS: Seatbelt already pins the agent's \
+             network to the proxy.",
+        );
+    }
     #[cfg(target_os = "macos")]
     if resolved.allow_rootless_docker && !resolved.allow_docker {
         ui::warn(
@@ -7159,6 +7166,12 @@ fn assemble_sandbox(
     let mut prepared =
         sandbox::prepare_with_pnpm_shadow(&sandbox_config, pnpm_shadow_path, opts.inspect_only)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+    #[cfg(target_os = "linux")]
+    if resolved.netns {
+        prepared
+            .enable_netns()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
     prepared.set_worktree_root(opts.repos.worktree_root);
     prepared.set_worktree_socket(
         worktree_broker
