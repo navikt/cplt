@@ -286,7 +286,12 @@ fn profile_locked(
     // Same reason, and the fix for the same bug one tree over: keeps the
     // agent's own auto-executing config unwritable even when a user
     // `allow.write` covers the whole config dir.
-    emit_host_persistence_denies(&mut sb, config.agent, config.agent_dirs);
+    emit_host_persistence_denies(
+        &mut sb,
+        config.agent,
+        config.agent_dirs,
+        config.allow_copilot_host_persistence,
+    );
     // Same reason: keeps exec-allowed DOTNET_ROOT subtrees non-writable even
     // when a user allow.write covers them (write-then-exec).
     emit_dotnet_exec_denies(&mut sb, config.dotnet_root);
@@ -318,6 +323,22 @@ fn profile_locked(
     sb
 }
 
+/// Mach services the MCP child may look up beyond bsd.sb's (#911).
+/// Measured 2026-10-28 with nais 7.0.3 under this profile with the allow
+/// replaced by `(allow mach-lookup (with report))` and `log stream
+/// --predicate 'sender == "Sandbox"'`: startup, `tools/list`,
+/// `get_nais_context`, `nais auth print-access-token -n`, and go-keyring's
+/// keychain write (`security add-generic-password -U`, find, delete on a temp
+/// keychain). The only name reported was securityd's, used by the `security`
+/// helper; nais itself looked up none.
+/// Re-measured 2026-10-29 with nais 7.0.4 and a live login, through the real
+/// broker (debug cplt, fake agent driving `cplt mcp-stdio`): initialize,
+/// `tools/list`, `get_nais_context` and `execute_graphql` with
+/// `query { me { __typename } }`, so TLS to the Nais API ran. Again only
+/// `com.apple.SecurityServer`, from `security`; no `com.apple.trustd`. The
+/// token was valid, so the refresh path did not run here.
+pub(crate) const MCP_CHILD_MACH_SERVICES: &[&str] = &["com.apple.SecurityServer"];
+
 /// The Seatbelt profile for a brokered MCP server child (#849). It runs on
 /// the host with the user's own login, so reads stay open (its credential
 /// file, the keychain via securityd, the system); what it loses is the
@@ -325,9 +346,6 @@ fn profile_locked(
 /// its egress proxy, through the same proxy-forced rules as the agent
 /// (no port means no TCP at all). Writes go only to `write_dirs`, which the
 /// caller canonicalizes; an SBPL-unsafe path is an error, never dropped.
-pub(crate) const NSURLSESSIOND_DENY: &str =
-    r#"(deny mach-lookup (global-name "com.apple.nsurlsessiond"))"#;
-
 pub(crate) fn mcp_child_profile(
     home: &Path,
     write_dirs: &[PathBuf],
@@ -343,11 +361,13 @@ pub(crate) fn mcp_child_profile(
     emit_process_rules(&mut sb);
     sbpl!(sb, ";; Reads: open. The child holds the host login anyway.");
     sbpl!(sb, "(allow file-read*)");
-    sbpl!(sb, ";; Mach IPC (Keychain via securityd, DNS)");
-    sbpl!(sb, "(allow mach-lookup)");
-    // nsurlsessiond fetches URLs for its caller from its own process, past
-    // the egress rule below. Last match wins, so this deny must follow.
-    sbpl!(sb, "{NSURLSESSIOND_DENY}");
+    // Only the Mach services a real `nais alpha mcp serve` looked up (#911),
+    // not every service: one that acts for its caller (nsurlsessiond) would
+    // be a way around the network rules. bsd.sb's own allows still apply.
+    sbpl!(sb, ";; Mach IPC: measured services only");
+    for name in MCP_CHILD_MACH_SERVICES {
+        sbpl!(sb, "(allow mach-lookup (global-name \"{name}\"))");
+    }
     // `security add-generic-password` (go-keyring's refresh) posts this.
     sbpl!(
         sb,
@@ -645,6 +665,43 @@ fn emit_sensitive_project_denies(
         }
         sbpl!(sb);
     }
+
+    // The writable roots themselves (#923). A deny names a path under the
+    // root, so `mv <root> <other writable dir>/x && ln -s .../x <root>` moved
+    // every protected file out from under it: the grant covers the root's own
+    // literal, so the symlink can be created where the root was. There is no
+    // directory between a root and its direct-child denies to pin instead.
+    // Cost: the agent cannot rename or rmdir a granted root (`rm -rf` of its
+    // contents still works). `git gc`, `checkout` and `worktree add` never
+    // touch the root's own name.
+    sbpl!(
+        sb,
+        ";; Writable roots — no rename/unlink of the root itself"
+    );
+    // Directory grants only: a file has no protected descendants, and an
+    // `allow.write` file must stay replaceable by atomic rename. A missing
+    // grant is pinned, since it may be created as a directory.
+    for root in roots.iter().filter(|r| !Path::new(r.as_str()).is_file()) {
+        sbpl!(sb, "(deny file-write-unlink (literal \"{root}\"))");
+    }
+    // The same for the writable home tool dirs that carry denies (#923).
+    // None of these tools removes or renames its own root: Gradle's cleanup,
+    // `dotnet nuget locals --clear` and Kotlin/Native work inside them.
+    // mise's data dir is left out: `mise implode` removes it (residual).
+    for dir in HOME_DENY_ROOTS {
+        sbpl!(sb, "(deny file-write-unlink (literal \"{home}/{dir}\"))");
+    }
+    // A symlinked one (`~/.m2 -> ~/maven-cache`) is granted at its target,
+    // which Seatbelt matches, so the target is pinned too.
+    for d in active_tool_dirs(Path::new(home), tool_dirs) {
+        let named = HOME_DENY_ROOTS
+            .iter()
+            .any(|dir| d.path == Path::new(home).join(dir));
+        if let Some(t) = d.target.filter(|t| named && validate_sbpl_path(t).is_ok()) {
+            sbpl!(sb, "(deny file-write-unlink (literal \"{}\"))", t.display());
+        }
+    }
+    sbpl!(sb);
 
     // Sensitive project files — deny read AND write of .env*, .pem, .key etc.
     // Read deny: prevents exfiltration of secrets via HTTPS.
@@ -1358,8 +1415,13 @@ fn emit_protected(sb: &mut String, base: &str, p: &Protected) {
 ///
 /// macOS only — Landlock cannot deny a subpath within an allowed dir, so on
 /// Linux the bubblewrap read-only overlay carries this (see SECURITY.md).
-fn emit_host_persistence_denies(sb: &mut String, agent: Agent, agent_dirs: &[AgentDir]) {
-    let paths = agent.host_persistence_paths(agent_dirs);
+fn emit_host_persistence_denies(
+    sb: &mut String,
+    agent: Agent,
+    agent_dirs: &[AgentDir],
+    allow_copilot_persistence: bool,
+) {
+    let paths = agent.host_persistence_paths_with(agent_dirs, allow_copilot_persistence);
     let exec_only: Vec<&AgentDir> = agent_dirs
         .iter()
         .filter(|d| !d.write && d.process_exec)
@@ -1398,10 +1460,38 @@ fn emit_host_persistence_denies(sb: &mut String, agent: Agent, agent_dirs: &[Age
         let p = parent.display();
         sbpl!(sb, "(deny file-write-unlink (literal \"{p}\"))");
     }
+    // The same pin for the writable dir the denies above are joined onto
+    // (#923): `mv ~/.copilot <project>/.x && ln -s <project>/.x ~/.copilot`
+    // moved every deny out from under its path, since the rules name
+    // `~/.copilot/...` and the files now live elsewhere. No agent renames
+    // its own home dir. A file grant (`~/.claude.json`) is left alone: the
+    // agent replaces it by rename, and the denies joined onto it are inert.
+    if !agent.host_persistence_denies().is_empty() {
+        for d in agent
+            .host_persistence_roots(agent_dirs)
+            // A file grant is never pinned, even before it exists (#923
+            // review): Claude's first save of `~/.claude.json` is a rename.
+            .filter(|d| d.write && !d.is_file)
+        {
+            let p = d.path.display();
+            sbpl!(sb, "(deny file-write-unlink (literal \"{p}\"))");
+        }
+    }
     if wrote_header {
         sbpl!(sb);
     }
 }
+
+/// Home tool dirs that hold write-denies and are granted writable, pinned
+/// against rename in [`emit_sensitive_project_denies`] (#923).
+const HOME_DENY_ROOTS: &[&str] = &[
+    "Library/Caches",
+    ".cache",
+    ".m2",
+    ".gradle",
+    ".nuget",
+    ".konan",
+];
 
 fn emit_git_persistence_denies(
     sb: &mut String,
@@ -3964,11 +4054,19 @@ mod mcp_child_profile_tests {
     }
 
     #[test]
-    fn nsurlsessiond_is_denied_after_the_mach_allow() {
-        let p = mcp_child_profile(Path::new("/Users/u"), &[], false, Some(4242)).unwrap();
-        let allow = p.find("(allow mach-lookup)").unwrap();
-        let deny = p.find(super::NSURLSESSIOND_DENY).expect("deny present");
-        assert!(deny > allow, "deny must follow the allow (last match wins)");
+    fn mach_lookup_allows_exactly_the_measured_names() {
+        let p = mcp_child_profile(Path::new("/Users/u"), &[], true, Some(1)).unwrap();
+        assert!(!p.contains("(allow mach-lookup)"), "{p}");
+        let allows: Vec<&str> = p
+            .lines()
+            .filter(|l| l.contains("mach-lookup"))
+            .filter(|l| !l.starts_with(";;"))
+            .collect();
+        assert_eq!(
+            allows,
+            ["(allow mach-lookup (global-name \"com.apple.SecurityServer\"))"],
+            "{p}"
+        );
     }
 
     #[test]
@@ -4228,13 +4326,8 @@ mod tests {
                 );
                 assert!(p.contains(&rule), "missing rename pin {rule}");
             }
-            assert!(
-                !p.contains(&format!(
-                    "(deny file-write-unlink (literal \"{}\"))",
-                    local.display()
-                )),
-                "the grant's root itself is not pinned"
-            );
+            // The grant's root itself is pinned by the writable-root pin
+            // (#923), not by the shim rule.
         });
     }
 
@@ -4543,7 +4636,10 @@ mod tests {
                 .find(r#"(deny file-read* (subpath "/Users/test/.ssh"))"#)
                 .expect("the blanket ~/.ssh deny must still be emitted");
             assert!(
-                !p[deny..].contains(r#"(literal "/Users/test/.ssh")"#),
+                !p[deny..]
+                    .lines()
+                    .any(|l| l.starts_with("(allow")
+                        && l.contains(r#"(literal "/Users/test/.ssh")"#)),
                 "a directory grant must produce no post-deny re-allow:\n{p}"
             );
         }
@@ -4936,6 +5032,7 @@ mod tests {
             deny_key_files_by_extension: false,
             protect_pnpm_config: false,
             deny_copilot_dir_exec: false,
+            allow_copilot_host_persistence: false,
             allow_jvm_attach: false,
             allow_msbuild: false,
             allow_docker: false,
@@ -6849,7 +6946,37 @@ mod tests {
                     // So skip this depth and keep climbing, never stop early.
                     let mut sibling = segs[..depth - 1].to_vec();
                     sibling.push(PROBE.to_string());
-                    if !allowed(&rules, &sibling, CREATE) {
+                    // Or anywhere else writable, when the old name can then be
+                    // recreated as a symlink: `mv ~/.copilot <project>/.x &&
+                    // ln -s <project>/.x ~/.copilot` reaches the same files
+                    // (#923). An agent dir's own grant covers its literal path.
+                    // The system temp roots are root-owned: Unix permissions,
+                    // which this walk does not model, stop their rename.
+                    let anc = format!("/{}", segs[..depth].join("/"));
+                    let elsewhere = !["/private/var/folders", "/private/tmp"]
+                        .contains(&anc.as_str())
+                        && allowed(&rules, &segs[..depth], CREATE)
+                        && rules.iter().any(|r| {
+                            r.allow && r.pat.tail == Tail::OrDeeper && {
+                                let mut dest: Vec<String> = r
+                                    .pat
+                                    .segs
+                                    .iter()
+                                    .filter_map(|s| match s {
+                                        Seg::Lit(l) => Some(l.clone()),
+                                        _ => None,
+                                    })
+                                    .collect();
+                                // Not into itself: rename(2) refuses that.
+                                dest.len() == r.pat.segs.len()
+                                    && !dest.starts_with(&segs[..depth])
+                                    && {
+                                        dest.push(PROBE.to_string());
+                                        allowed(&rules, &dest, CREATE)
+                                    }
+                            }
+                        });
+                    if !allowed(&rules, &sibling, CREATE) && !elsewhere {
                         continue;
                     }
                     // A position the rule already wildcards is no escape: the
@@ -6905,6 +7032,77 @@ mod tests {
         /// `emit_host_persistence_denies`.
         const KNOWN_UNFIXED: &[(&str, &str, &str)] = &[];
 
+        /// Ancestors left unpinned on purpose, with the reason (#923). A move
+        /// of the whole dir plus a symlink back still escapes their denies.
+        ///
+        /// mise's data dir: `mise implode` removes it, so a pin would break
+        /// that command inside the sandbox.
+        ///
+        /// `~/.claude.json`: a file grant, so the entries joined onto it name
+        /// paths that cannot exist, and Claude saves it by rename.
+        const RESIDUAL_ROOTS: &[&str] =
+            &["/Users/test/.local/share/mise", "/Users/test/.claude.json"];
+
+        /// #923 review: a missing `~/.claude.json` is still a file grant and is
+        /// not pinned, while `~/.claude` is.
+        #[test]
+        fn agent_root_pin_skips_a_missing_file_grant() {
+            let profile = representative_profile(crate::agent::Agent::Claude);
+            assert!(!Path::new("/Users/test/.claude.json").exists());
+            assert!(
+                !profile
+                    .contains("(deny file-write-unlink (literal \"/Users/test/.claude.json\"))")
+            );
+            assert!(profile.contains("(deny file-write-unlink (literal \"/Users/test/.claude\"))"));
+        }
+
+        /// #923 review: a symlinked tool root is pinned at its target too,
+        /// a dotted agent dir is pinned, a file grant is not, and an
+        /// `allow.write` file stays replaceable while a missing root is pinned.
+        #[test]
+        fn root_pins_follow_grant_kind_and_symlinks() {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path().canonicalize().unwrap();
+            let project = home.join("app");
+            std::fs::create_dir_all(home.join("maven-cache")).unwrap();
+            std::fs::create_dir_all(home.join("copilot.state")).unwrap();
+            std::fs::create_dir_all(&project).unwrap();
+            std::os::unix::fs::symlink(home.join("maven-cache"), home.join(".m2")).unwrap();
+            std::fs::write(project.join("result.json"), "{}").unwrap();
+            let tool_dirs: Vec<_> = crate::sandbox::policy::HOME_TOOL_DIRS
+                .iter()
+                .map(|d| d.resolve(&home, &[]))
+                .collect();
+            let dir = |path: PathBuf, is_file: bool| AgentDir {
+                is_file,
+                path,
+                write: true,
+                map_exec: false,
+                process_exec: false,
+                write_files: vec![],
+                create_dirs: vec![],
+                via: vec![],
+            };
+            let dirs = [
+                dir(home.join("copilot.state"), false),
+                dir(home.join("missing.json"), true),
+            ];
+            let extra_write = [project.join("result.json"), home.join("later")];
+            let mut opts = test_options(&project, &home);
+            opts.agent = crate::agent::Agent::Copilot;
+            opts.agent_dirs = &dirs;
+            opts.extra_write = &extra_write;
+            opts.existing_home_tool_dirs = Some(&tool_dirs);
+            let p = generate_profile(&opts, &[]);
+            let pin = |d: &Path| format!("(deny file-write-unlink (literal \"{}\"))", d.display());
+            for d in ["maven-cache", "copilot.state", "later"] {
+                assert!(p.contains(&pin(&home.join(d))), "{d} must be pinned:\n{p}");
+            }
+            for d in [home.join("missing.json"), project.join("result.json")] {
+                assert!(!p.contains(&pin(&d)), "{} must not be pinned", d.display());
+            }
+        }
+
         /// The invariant, over every agent: the write-deny set is
         /// agent-conditional (the Copilot cache rules exist for Copilot only,
         /// and each agent contributes its own host-persistence denies), so one
@@ -6918,6 +7116,9 @@ mod tests {
                     let name = format!("{agent:?}");
                     let profile = representative_profile(agent);
                     for (denied, ancestor, rule) in violations(&profile) {
+                        if RESIDUAL_ROOTS.contains(&ancestor.as_str()) {
+                            continue;
+                        }
                         let key = (name.clone(), denied.clone(), ancestor.clone());
                         if KNOWN_UNFIXED
                             .iter()
@@ -7056,18 +7257,6 @@ mod tests {
                 "nested named_root ancestor {pinned} must be pinned against rename:\n{profile}"
             );
         }
-        // Neither the outer project root, a sibling outside the project, nor an
-        // outer named root itself gets a nested-root unlink pin.
-        for not_pinned in [
-            "/projects/tilleggsstonader",
-            "/projects/other-repo",
-            "/work/outer",
-        ] {
-            let rule = format!("(deny file-write-unlink (literal \"{not_pinned}\"))");
-            assert!(
-                !profile.contains(&rule),
-                "{not_pinned} is not a nested root inside an outer writable tree:\n{profile}"
-            );
-        }
+        // Every named root itself is pinned too, by the writable-root pin (#923).
     }
 }

@@ -5147,6 +5147,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             copilot_install_dir: copilot_install_dir.as_deref(),
             electron_app_dir: electron_app_dir.as_deref(),
             pnpm_candidate: None,
+            launch_dir: Some(&launch_dir),
             inspect_only: cli.print_profile || mcp_status.is_some(),
             opencode_v2,
             mcp: mcp_status.is_none().then_some(&mcp_found),
@@ -5523,6 +5524,11 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             cplt::sandbox::cplt_state_file(&home_dir, "opencode-snapshot-clean"),
         )
     });
+    // #906: config.json stays writable (login and UI state), so a trust entry
+    // the session added is reported instead of denied.
+    let trusted_before = (active_agent == agent::Agent::Copilot
+        && !resolved.allow_copilot_host_persistence)
+        .then(|| agent::copilot_trusted_folders(&home_dir));
     let audit_mode = audit::AuditMode::for_run(audit_enabled, cli.observe_domains);
     let (exit_code, snapshot, settled) = audit::run(
         &project_dir,
@@ -5561,6 +5567,20 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     );
     if let Some((own, before)) = &v2_model {
         cplt::opencode_v2::save_model(own, &home_dir, before.as_deref());
+    }
+    if let Some(before) = trusted_before {
+        for added in agent::copilot_trusted_folders(&home_dir)
+            .iter()
+            .filter(|f| !before.contains(f))
+        {
+            let added = sanitize_terminal_text(added);
+            ui::warn(&format!(
+                "Copilot now trusts {added}: this session added it to \
+                 ~/.copilot/config.json trustedFolders, so host sessions there skip the \
+                 trust prompt. Remove it from that file if you did not choose \
+                 \"remember this folder\"."
+            ));
+        }
     }
     cplt::opencode_v2::save_tui(&v2_tui);
     if let Some(stores) = opencode_stores {
@@ -6671,6 +6691,9 @@ struct AssemblyOptions<'a> {
     electron_app_dir: Option<&'a Path>,
     /// A pnpm path explicitly requested by `cplt exec`, if any.
     pnpm_candidate: Option<&'a Path>,
+    /// Where the child starts; pnpm's `packageManager` pin is looked up from
+    /// here. `None` falls back to the invocation directory.
+    launch_dir: Option<&'a Path>,
     /// The sandbox is only printed or checked, never launched
     /// (`--print-profile`, `cplt check`), so preparing it must not write to
     /// the host (#553).
@@ -6816,7 +6839,13 @@ fn assemble_sandbox(
         .or_else(|| resolve_exec_binary("pnpm").ok());
     let pnpm_shadow_guard = pnpm
         .as_ref()
-        .map(|pnpm| scratch::PnpmShadowDir::create_if_needed(home_dir, pnpm))
+        .map(|pnpm| {
+            let launch_dir = opts.launch_dir.map_or_else(
+                || std::env::current_dir().unwrap_or_else(|_| probe.project_dir.clone()),
+                Path::to_path_buf,
+            );
+            scratch::PnpmShadowDir::create_if_needed(home_dir, pnpm, &launch_dir)
+        })
         .transpose()
         .map_err(|error| anyhow::anyhow!("Cannot prepare pnpm executable: {error}"))?
         .flatten();
@@ -7352,6 +7381,7 @@ fn build_sandbox_config<'a>(
         deny_key_files_by_extension: resolved.deny_key_files_by_extension,
         protect_pnpm_config: resolved.protect_pnpm_config,
         deny_copilot_dir_exec: resolved.deny_copilot_dir_exec,
+        allow_copilot_host_persistence: resolved.allow_copilot_host_persistence,
         allow_jvm_attach: resolved.allow_jvm_attach,
         allow_msbuild: resolved.allow_msbuild,
         allow_docker: resolved.allow_docker,
@@ -7392,6 +7422,7 @@ fn prepare_shell_sandbox(
             copilot_install_dir: None,
             electron_app_dir: None,
             pnpm_candidate: None,
+            launch_dir: None,
             // `cplt check` only reports on the policy.
             inspect_only: true,
             opencode_v2: false,
@@ -7570,6 +7601,7 @@ fn run_exec_command(
                 copilot_install_dir: None,
                 electron_app_dir: None,
                 pnpm_candidate,
+                launch_dir: Some(&launch_dir),
                 inspect_only: cli.print_profile,
                 opencode_v2: false,
                 mcp: None,
@@ -7601,13 +7633,10 @@ fn run_exec_command(
             resolved.gh_guard.enabled,
             resolved.git_guard.enabled,
         );
-        let bin = pnpm_shadow_guard.as_ref().map_or(bin.clone(), |shadow| {
-            if shadow.shadows(&bin) {
-                shadow.binary()
-            } else {
-                bin
-            }
-        });
+        let bin = pnpm_shadow_guard
+            .as_ref()
+            .and_then(|shadow| shadow.binary_for(&cmd[0], &bin))
+            .unwrap_or(bin);
         // Only the binary the user named: a guard shim or pnpm shadow is
         // cplt's own file and is run by the path cplt chose for it.
         let bin = match requested_path.as_deref() {
@@ -9146,7 +9175,7 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     let doctor_pnpm = resolve_exec_binary("pnpm").ok();
     let doctor_pnpm_shadowed = doctor_pnpm
         .as_ref()
-        .is_some_and(|pnpm| scratch::pnpm_requires_shadow(&home_dir, pnpm).unwrap_or(false));
+        .is_some_and(|pnpm| matches!(scratch::pnpm_shadow_source(&home_dir, pnpm), Ok(Some(_))));
     let mut doctor_exec = resolved.allow_exec.clone();
     doctor_exec.extend(pnpm_exec_grants(
         &home_dir,
@@ -9218,6 +9247,7 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     #[cfg(not(target_os = "linux"))]
     let can_force = true;
     findings.extend(doctor::proxy_forced_nudge(&resolved, can_force));
+    findings.extend(doctor::copilot_persistence_nudge(&resolved, active_agent));
     findings.extend(config_findings(
         &resolved,
         active_agent,
@@ -13564,6 +13594,7 @@ mod tests {
             deny_key_files_by_extension: true,
             protect_pnpm_config: false,
             deny_copilot_dir_exec: false,
+            allow_copilot_host_persistence: false,
             allow_jvm_attach: false,
             allow_msbuild: false,
             allow_docker: false,

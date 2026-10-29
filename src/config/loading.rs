@@ -502,6 +502,7 @@ impl Config {
         let refuse_invalid_repo_config = bools.refuse_invalid_repo_config;
         let skip_untrusted_opencode_config = bools.skip_untrusted_opencode_config;
         let deny_copilot_dir_exec = bools.deny_copilot_dir_exec;
+        let allow_copilot_host_persistence = bools.allow_copilot_host_persistence;
 
         let allow_docker = bools.allow_docker;
         let allow_rootless_docker = bools.allow_rootless_docker;
@@ -699,6 +700,7 @@ impl Config {
             refuse_invalid_repo_config,
             skip_untrusted_opencode_config,
             deny_copilot_dir_exec,
+            allow_copilot_host_persistence,
             allow_docker,
             allow_rootless_docker,
             allow_tmp_exec,
@@ -2945,6 +2947,7 @@ validate = false
 
         let agent_dirs = vec![
             crate::agent::AgentDir {
+                is_file: false,
                 path: home.join(".pi/agent"),
                 write: true,
                 map_exec: false,
@@ -2954,6 +2957,7 @@ validate = false
                 via: vec![],
             },
             crate::agent::AgentDir {
+                is_file: false,
                 path: home.join(".pi/agent/bin"),
                 write: false,
                 map_exec: false,
@@ -3070,6 +3074,7 @@ validate = false
         let bin = home.join(".pi/agent/bin");
         assert!(!bin.exists(), "the fixture must leave the bin dir absent");
         let agent_dirs = vec![crate::agent::AgentDir {
+            is_file: false,
             path: bin.clone(),
             write: false,
             map_exec: false,
@@ -3106,6 +3111,7 @@ validate = false
     fn exec_tool_dir_warning_scopes_the_linux_sentence_to_where_it_is_true() {
         let home = PathBuf::from("/home/u");
         let copilot = crate::agent::AgentDir {
+            is_file: false,
             path: home.join(".copilot"),
             write: true,
             map_exec: true,
@@ -4484,6 +4490,14 @@ mod precedence {
                 cli_off: None,
                 get: |r| r.deny_copilot_dir_exec,
                 default: false,
+                preset: None,
+            },
+            Ladder {
+                key: "sandbox.allow_copilot_host_persistence",
+                cli_on: None,
+                cli_off: None,
+                get: |r| r.allow_copilot_host_persistence,
+                default: true,
                 preset: None,
             },
             Ladder {

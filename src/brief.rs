@@ -990,6 +990,7 @@ mod tests {
             refuse_invalid_repo_config: false,
             skip_untrusted_opencode_config: false,
             deny_copilot_dir_exec: false,
+            allow_copilot_host_persistence: false,
             allow_jvm_attach: false,
             gradle_init: false,
             allow_docker: false,

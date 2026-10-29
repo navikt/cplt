@@ -611,7 +611,13 @@ pub(crate) fn serve(shared: &Shared, stream: UnixStream) {
                     log.line(&spec.id, &format!("FAIL not logged in on the host.{fix}"));
                 }
                 let action = match pending.lock() {
-                    Ok(mut p) => on_server(&line, &spec, &mut p),
+                    Ok(mut p) => {
+                        let a = on_server(&line, &spec, &mut p);
+                        if let Some(text) = p.1.take() {
+                            log.line(&spec.id, &text);
+                        }
+                        a
+                    }
                     Err(_) => break,
                 };
                 match action {
@@ -675,7 +681,13 @@ pub(crate) fn serve(shared: &Shared, stream: UnixStream) {
     // Client → server.
     while let Some(line) = read_line(&mut reader, MAX_MESSAGE) {
         let action = match pending.lock() {
-            Ok(mut p) => on_client(&line, spec, &mut p),
+            Ok(mut p) => {
+                let a = on_client(&line, spec, &mut p);
+                if let Some(text) = p.1.take() {
+                    shared.log.line(&spec.id, &text);
+                }
+                a
+            }
             Err(_) => break,
         };
         match action {
@@ -830,8 +842,15 @@ mod tests {
         }
         let _cleanup = Cleanup(kc, &home);
         assert!(made.status.success(), "create-keychain failed");
-        let add = |keychain: bool, acct: &str| {
+        let add = |keychain: bool, acct: &str, drop: Option<&str>| {
             let profile = crate::sandbox::mcp_child_profile(&home, &[], keychain, None).unwrap();
+            let profile = match drop {
+                Some(rule) => {
+                    assert!(profile.contains(rule), "{rule} not in profile");
+                    profile.replace(rule, "")
+                }
+                None => profile,
+            };
             Command::new("/usr/bin/sandbox-exec")
                 .args(["-p", &profile, "--", "/usr/bin/security"])
                 .args([
@@ -851,15 +870,21 @@ mod tests {
                 .status
                 .success()
         };
-        let denied = !add(false, "t0");
-        let allowed = add(true, "t1");
+        let denied = !add(false, "t0", None);
+        let allowed = add(true, "t1", None);
         assert!(denied, "control: keychain=false still wrote the keychain");
         assert!(allowed, "keychain=true could not write the keychain");
+        // #911: the measured Mach list is load-bearing. Drop any one name
+        // and the same write fails.
+        for name in crate::sandbox::MCP_CHILD_MACH_SERVICES {
+            let rule = format!("(allow mach-lookup (global-name \"{name}\"))\n");
+            assert!(!add(true, "t2", Some(&rule)), "write passed without {name}");
+        }
     }
 
     /// The kernel, not the profile text: the child cannot look up
-    /// nsurlsessiond, which would fetch URLs past the egress rule. The
-    /// control is the same profile without the deny.
+    /// nsurlsessiond, which would fetch URLs past the egress rule. It is
+    /// not on the measured Mach list (#911); the control adds a blanket allow.
     #[cfg(target_os = "macos")]
     #[test]
     #[allow(clippy::disallowed_methods)] // fixed /usr/bin paths
@@ -885,10 +910,8 @@ mod tests {
                 .unwrap()
                 .success()
         };
-        let control = profile.replace(
-            r#"(deny mach-lookup (global-name "com.apple.nsurlsessiond"))"#,
-            "",
-        );
+        // Control: the blanket allow #911 replaced.
+        let control = format!("{profile}(allow mach-lookup)\n");
         assert!(reach(&control), "control: nsurlsessiond unreachable");
         assert!(!reach(&profile), "child looked up nsurlsessiond");
     }

@@ -349,6 +349,60 @@ echo AGENT_COMPLETED
     }
 
     #[test]
+    fn pnpm_shadow_dist_link_stays_non_executable() {
+        require_landlock!();
+        use std::os::unix::fs::PermissionsExt;
+
+        let project = create_test_project();
+        let home = tempfile::Builder::new()
+            .prefix(".cplt-pnpm-home-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("create fake home");
+        let pnpm_home = home.path().join(".local/share/pnpm");
+        let store = pnpm_home.join("store/v11/links/@/pnpm/11.0.0/abc");
+        let dist = store.join("dist");
+        fs::create_dir_all(&dist).expect("create store dist");
+        let store_pnpm = store.join("pnpm");
+        fs::copy(env!("CARGO_BIN_EXE_cplt"), &store_pnpm).expect("copy a real binary as pnpm");
+        fs::set_permissions(&store_pnpm, fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&store_pnpm, pnpm_home.join("pnpm"))
+            .expect("link pnpm into PNPM_HOME");
+        fs::write(dist.join("pnpm.mjs"), "asset:OK\n").unwrap();
+        let tool = dist.join("tool");
+        fs::copy("/bin/echo", &tool).expect("copy a real binary into dist");
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let script = format!(
+            "d=\"$(dirname \"$(command -v pnpm)\")/dist\"; cat \"$d/pnpm.mjs\"; \
+             if \"$d/tool\" x; then printf 'link:FAIL\\n'; else printf 'link:OK\\n'; fi; \
+             if '{tool}' x; then printf 'store:FAIL\\n'; else printf 'store:OK\\n'; fi",
+            tool = tool.display(),
+        );
+        let project_dir = project.path().to_string_lossy().into_owned();
+        let output = cplt_cmd()
+            .args([
+                "--yes",
+                "--no-validate",
+                "--quiet",
+                "--agent",
+                "shell",
+                "--project-dir",
+                &project_dir,
+                "--",
+                "-c",
+                &script,
+            ])
+            .env("HOME", home.path())
+            .env("PATH", format!("{}:/usr/bin:/bin", pnpm_home.display()))
+            .output()
+            .expect("run cplt");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("asset:OK"), "{stdout}");
+        assert!(stdout.contains("link:OK"), "{stdout}");
+        assert!(stdout.contains("store:OK"), "{stdout}");
+    }
+
+    #[test]
     fn pnpm_store_is_non_executable_but_shadow_and_version_store_run() {
         require_landlock!();
         use std::os::unix::fs::PermissionsExt;
@@ -368,7 +422,8 @@ echo AGENT_COMPLETED
         let store_pnpm = store.join("pnpm");
         let new_alias = store.join("new-alias");
         let managed_pnpm = package_manager_store.join("pnpm");
-        fs::write(&source, "#!/bin/sh\nprintf 'shadow:OK\\n'\n").expect("write pnpm");
+        // A real binary: the shadow copies nothing but ELF or Mach-O.
+        fs::copy(env!("CARGO_BIN_EXE_cplt"), &source).expect("copy a real binary as fake pnpm");
         fs::write(&standalone, "#!/bin/sh\nprintf 'standalone:OK\\n'\n")
             .expect("write standalone executable");
         fs::hard_link(&source, &store_pnpm).expect("hardlink pnpm into store");
@@ -382,7 +437,7 @@ echo AGENT_COMPLETED
              if ln '{standalone}' '{new_alias}'; then printf 'link:FAIL\\n'; else printf 'link:OK\\n'; fi; \
              '{standalone}'; \
              if '{store_pnpm}'; then printf 'store:FAIL\\n'; else printf 'store:OK\\n'; fi; \
-             '{managed_pnpm}'; pnpm",
+             '{managed_pnpm}'; pnpm --version",
             store_pnpm = store_pnpm.display(),
             standalone = standalone.display(),
             new_alias = new_alias.display(),
@@ -417,7 +472,10 @@ echo AGENT_COMPLETED
         assert!(stdout.contains("standalone:OK"), "{stdout}");
         assert!(stdout.contains("store:OK"), "{stdout}");
         assert!(stdout.contains("managed:OK"), "{stdout}");
-        assert!(stdout.contains("shadow:OK"), "{stdout}");
+        assert!(
+            stdout.contains(&format!("cplt {}", env!("CARGO_PKG_VERSION"))),
+            "{stdout}"
+        );
     }
 
     /// Create a fake HOME with populated sensitive directories for hermetic testing.

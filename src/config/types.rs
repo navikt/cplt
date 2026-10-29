@@ -748,6 +748,9 @@ pub struct SandboxConfig {
     pub skip_untrusted_opencode_config: Option<bool>,
     /// Withdraw execve from `~/.copilot` (default: false, Linux only, #324).
     pub deny_copilot_dir_exec: Option<bool>,
+    /// Keep `~/.copilot/agents/` and `permissions-config.json` writable
+    /// (default: true for an unset key, false in new configs, #906).
+    pub allow_copilot_host_persistence: Option<bool>,
     /// Allow Docker/Colima/OrbStack access inside the sandbox (default: false).
     /// DANGEROUS: Docker can mount any host path via container volumes, completely
     /// bypassing sandbox filesystem restrictions. Only enable if you trust the
@@ -1062,6 +1065,7 @@ pub struct Resolved {
     pub refuse_invalid_repo_config: bool,
     pub skip_untrusted_opencode_config: bool,
     pub deny_copilot_dir_exec: bool,
+    pub allow_copilot_host_persistence: bool,
     pub allow_docker: bool,
     pub allow_rootless_docker: bool,
     pub allow_tmp_exec: bool,

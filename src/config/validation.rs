@@ -323,6 +323,17 @@ pub fn validate_config(toml_text: &str) -> Vec<ConfigDiagnostic> {
                     .to_string(),
             });
         }
+        if sandbox
+            .get("allow_copilot_host_persistence")
+            .and_then(toml::Value::as_bool)
+            == Some(true)
+        {
+            diagnostics.push(ConfigDiagnostic {
+                level: DiagnosticLevel::Warning,
+                message: "sandbox.allow_copilot_host_persistence = true lets the agent write Copilot custom agents and saved tool approvals that later host sessions load (DANGEROUS)"
+                    .to_string(),
+            });
+        }
         if sandbox.get("allow_browser").and_then(toml::Value::as_bool) == Some(true) {
             diagnostics.push(ConfigDiagnostic {
                 level: DiagnosticLevel::Warning,
