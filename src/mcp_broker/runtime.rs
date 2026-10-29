@@ -1868,6 +1868,38 @@ mod tests {
         .unwrap()
     }
 
+    /// #930: the macOS probe's command is the child's: sandbox-exec with
+    /// `mcp_child_profile` for this server and its egress port, the probe
+    /// args in place of the server's.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_macos_probe_runs_under_the_child_profile() {
+        let b = cat_broker();
+        let server = b.shared.servers.values().next().unwrap();
+        let (cmd, _) = child_command(&b.shared, server, Some(&["-n", "x"])).unwrap();
+        assert_eq!(cmd.get_program(), "/usr/bin/sandbox-exec");
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_str().unwrap()).collect();
+        let profile = crate::sandbox::mcp_child_profile(
+            &b.shared.home,
+            &[std::env::temp_dir()]
+                .into_iter()
+                .chain(
+                    server
+                        .spec
+                        .credential
+                        .write_dirs
+                        .iter()
+                        .map(|d| b.shared.home.join(d)),
+                )
+                .map(|d| resolve_existing_prefix(&d))
+                .collect::<Vec<_>>(),
+            server.spec.credential.keychain,
+            server.egress_port,
+        )
+        .unwrap();
+        assert_eq!(args, ["-p", profile.as_str(), "--", "/bin/cat", "-n", "x"]);
+    }
+
     fn connect(b: &Broker) -> (UnixStream, BufReader<UnixStream>) {
         let mut s = UnixStream::connect(b.socket()).unwrap();
         writeln!(s, "io.github.nais/nais-mcp").unwrap();
