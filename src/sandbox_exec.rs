@@ -2026,7 +2026,12 @@ fn bwrap_setup_failed(
     detail: &str,
 ) -> BwrapOutcome {
     if wrapper.strict {
-        ui::error(&format!("Bubblewrap requested but {detail}."));
+        // Strict comes from --use-bubblewrap, the MCP broker, or
+        // sandbox.allow_git_config_write = false (#386); name all three.
+        ui::error(&format!(
+            "Bubblewrap is required (--use-bubblewrap, sandbox.mcp_broker, or \
+             sandbox.allow_git_config_write = false) but {detail}."
+        ));
         BwrapOutcome::Ran(1)
     } else {
         BwrapOutcome::Fallback(detail.to_string())

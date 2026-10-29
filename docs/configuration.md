@@ -475,6 +475,13 @@ cplt config set sandbox.allow_git_config_write true
 
 User config only; `.cplt.toml` cannot set it.
 
+The bind also covers a `.git` pointer file (worktrees, `--separate-git-dir`) and
+every `config.worktree`. Only files that exist at launch are bound, so a
+repository created in the session (`git init`, `git clone`) stays writable.
+Nested repositories are found by a bounded scan (three levels, 20 000
+directories), as for `.git/hooks`. A hard link to `.git/config` from the
+writable tree fails with `EXDEV`, because the bound file is its own mount.
+
 ## Worktrees for sub-agents (`sandbox.allow_git_worktrees`)
 
 Off by default, macOS only, since 2026.09.24-164900-53d4462. When on, cplt

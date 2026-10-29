@@ -1176,9 +1176,10 @@ pub fn proxy_forced_nudge(r: &crate::config::Resolved, can_force: bool) -> Optio
 /// for new configs (#386). Shown only while no layer sets
 /// `sandbox.allow_git_config_write`; setting it either way silences it.
 #[must_use]
-pub fn git_config_write_nudge(r: &crate::config::Resolved) -> Option<Finding> {
+pub fn git_config_write_nudge(r: &crate::config::Resolved, bwrap_usable: bool) -> Option<Finding> {
+    // Never suggest what would refuse every launch.
     let layer = r.bool_layer("sandbox", "allow_git_config_write");
-    (layer == Some(crate::config::ConfigLayer::Baseline)).then(|| {
+    (bwrap_usable && layer == Some(crate::config::ConfigLayer::Baseline)).then(|| {
         Finding::warning(
             "The agent can write .git/config, so it can set core.hooksPath or \
              core.fsmonitor, which run unsandboxed on your next git command. New configs \
@@ -1218,11 +1219,15 @@ mod tests {
             old.allow_git_config_write,
             "an existing config keeps today's behaviour"
         );
-        assert!(git_config_write_nudge(&old).is_some());
+        assert!(git_config_write_nudge(&old, true).is_some());
+        assert!(git_config_write_nudge(&old, false).is_none());
         let new = r(&crate::config::default_config_contents());
         assert!(!new.allow_git_config_write, "new configs deny the write");
-        assert!(git_config_write_nudge(&new).is_none());
-        assert!(git_config_write_nudge(&r("[sandbox]\nallow_git_config_write = true\n")).is_none());
+        assert!(git_config_write_nudge(&new, true).is_none());
+        assert!(
+            git_config_write_nudge(&r("[sandbox]\nallow_git_config_write = true\n"), true)
+                .is_none()
+        );
     }
 
     #[test]

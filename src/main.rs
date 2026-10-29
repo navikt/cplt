@@ -9145,8 +9145,6 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     #[cfg(not(target_os = "linux"))]
     let can_force = true;
     findings.extend(doctor::proxy_forced_nudge(&resolved, can_force));
-    #[cfg(target_os = "linux")]
-    findings.extend(doctor::git_config_write_nudge(&resolved));
     findings.extend(config_findings(
         &resolved,
         active_agent,
@@ -9163,6 +9161,11 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
         &sandbox_config,
         &launch_grants,
     );
+    #[cfg(target_os = "linux")]
+    findings.extend(doctor::git_config_write_nudge(
+        &resolved,
+        matches!(bubblewrap, doctor::Bubblewrap::Usable(_)),
+    ));
     #[cfg(target_os = "macos")]
     {
         if Path::new("/usr/bin/sandbox-exec").exists() {

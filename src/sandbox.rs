@@ -3032,7 +3032,7 @@ fn pin_paths(
 #[cfg(target_os = "linux")]
 const GIT_CONFIG_NEEDS_BWRAP: &str = "sandbox.allow_git_config_write = false needs \
      Bubblewrap to make .git/config read-only, and Bubblewrap is not in use. Run \
-     `cplt doctor` to see why, or set `cplt config set sandbox.allow_git_config_write \
+     `cplt doctor` to see why, or run `cplt config set sandbox.allow_git_config_write \
      true` to let the agent write .git/config.";
 
 #[cfg(target_os = "linux")]
@@ -3059,9 +3059,29 @@ fn ro_protect_paths(
     // git writes `config.lock` beside it and renames it over; the rename onto
     // a bind fails with EBUSY and git removes the lock itself, so no stale
     // lock is left. Missing paths are skipped like every other entry.
+    //
+    // Also bound: a `.git` gitdir pointer file (a worktree or `--separate-git-dir`
+    // checkout), which would otherwise repoint the repository at a gitdir the
+    // agent wrote, and every `config.worktree`, which git reads with
+    // `extensions.worktreeConfig`. Only files that exist at launch are covered.
     if !config.allow_git_config_write {
-        ro_protect.extend(write_roots.iter().map(|r| r.join(".git").join("config")));
-        ro_protect.extend(git_dirs.iter().map(|d| d.join("config")));
+        for root in &write_roots {
+            let dot_git = root.join(".git");
+            if dot_git.is_file() {
+                ro_protect.push(dot_git.clone());
+            }
+            ro_protect.push(dot_git.join("config"));
+            ro_protect.push(dot_git.join("config.worktree"));
+        }
+        for dir in &git_dirs {
+            ro_protect.push(dir.join("config"));
+            ro_protect.push(dir.join("config.worktree"));
+            if let Ok(entries) = std::fs::read_dir(dir.join("worktrees")) {
+                ro_protect.extend(entries.flatten().map(|e| e.path().join("config.worktree")));
+            }
+        }
+        ro_protect.sort();
+        ro_protect.dedup();
     }
 
     // #237: same class, different tree — the agent's own config dir is granted
