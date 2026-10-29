@@ -365,7 +365,8 @@ echo AGENT_COMPLETED
         let store_pnpm = store.join("pnpm");
         fs::copy(env!("CARGO_BIN_EXE_cplt"), &store_pnpm).expect("copy a real binary as pnpm");
         fs::set_permissions(&store_pnpm, fs::Permissions::from_mode(0o755)).unwrap();
-        fs::hard_link(&store_pnpm, pnpm_home.join("pnpm")).expect("link pnpm into PNPM_HOME");
+        std::os::unix::fs::symlink(&store_pnpm, pnpm_home.join("pnpm"))
+            .expect("link pnpm into PNPM_HOME");
         fs::write(dist.join("pnpm.mjs"), "asset:OK\n").unwrap();
         let tool = dist.join("tool");
         fs::copy("/bin/echo", &tool).expect("copy a real binary into dist");
