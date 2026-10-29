@@ -126,6 +126,7 @@ fn java_tool_options(scratch_dir: Option<&Path>, proxy_port: Option<u16>) -> Opt
 /// - `proxy_port`: if Some, JVM proxy system properties pointing at
 ///   `127.0.0.1:<port>` are injected into `JAVA_TOOL_OPTIONS`.
 /// - `agent`: which agent is being sandboxed — Copilot-specific env vars are suppressed for other agents.
+#[allow(clippy::too_many_arguments)]
 pub fn build_sandbox_env(
     parent_env: &[(String, String)],
     extra_pass_env: &[String],
@@ -134,6 +135,7 @@ pub fn build_sandbox_env(
     scratch_dir: Option<&Path>,
     proxy_port: Option<u16>,
     agent: Agent,
+    strip_vendor_auth: bool,
 ) -> SandboxEnv {
     let mut env = SandboxEnv {
         vars: Vec::new(),
@@ -188,7 +190,7 @@ pub fn build_sandbox_env(
                     let val = if extra_pass_env.iter().any(|p| p == key) {
                         val.clone()
                     } else {
-                        redact_otlp_auth(key, val)
+                        redact_otlp_auth(key, val, strip_vendor_auth)
                     };
                     env.vars.push((key.clone(), val));
                 }
@@ -837,7 +839,9 @@ fn strip_dangerous_node_flags(value: &str) -> String {
 /// Drop the `Authorization` pair from an OTLP headers value (#878). The other
 /// headers pass through so the exporter keeps working; the bearer token does not
 /// reach the sandbox. Never fails: a value without the pair is returned as is.
-fn redact_otlp_auth(key: &str, val: &str) -> String {
+/// `vendor` also drops the known vendor auth headers
+/// (`sandbox.strip_otlp_vendor_auth`, on for new configs).
+fn redact_otlp_auth(key: &str, val: &str, vendor: bool) -> String {
     let is_headers = key == "OTEL_EXPORTER_OTLP_HEADERS"
         || ["TRACES", "METRICS", "LOGS"]
             .iter()
@@ -851,10 +855,25 @@ fn redact_otlp_auth(key: &str, val: &str) -> String {
                 .split('=')
                 .next()
                 .map(|k| crate::agent::percent_decode(k.trim()))
-                .is_some_and(|k| k.trim().eq_ignore_ascii_case("authorization"))
+                .is_some_and(|k| {
+                    let k = k.trim();
+                    k.eq_ignore_ascii_case("authorization")
+                        || (vendor
+                            && ["x-honeycomb-team", "api-key", "x-api-key", "dd-api-key"]
+                                .iter()
+                                .any(|v| k.eq_ignore_ascii_case(v)))
+                })
         })
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// Whether `parent_env` has an OTLP vendor auth header that only
+/// `sandbox.strip_otlp_vendor_auth` would strip (#878), for the nudge.
+pub fn otlp_vendor_auth_present(parent_env: &[(String, String)]) -> bool {
+    parent_env
+        .iter()
+        .any(|(k, v)| redact_otlp_auth(k, v, true) != redact_otlp_auth(k, v, false))
 }
 
 #[cfg(test)]
@@ -862,24 +881,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn otlp_vendor_headers_stripped_only_when_on() {
+        let key = "OTEL_EXPORTER_OTLP_HEADERS";
+        let raw = "x-honeycomb-team=h, API-KEY=a,%78-api-key=b,dd-api-key=d,x=y";
+        assert_eq!(redact_otlp_auth(key, raw, false), raw);
+        assert_eq!(redact_otlp_auth(key, raw, true), "x=y");
+        let parent = vec![(key.to_string(), raw.to_string())];
+        assert!(otlp_vendor_auth_present(&parent));
+        assert!(!otlp_vendor_auth_present(&[(
+            key.to_string(),
+            "x=y".to_string()
+        )]));
+        let get = |e: &SandboxEnv| e.vars.iter().find(|(k, _)| k == key).unwrap().1.clone();
+        let env = build_sandbox_env(&parent, &[], false, &[], None, None, Agent::Shell, true);
+        assert_eq!(get(&env), "x=y");
+        let pass = [key.to_string()];
+        let env = build_sandbox_env(&parent, &pass, false, &[], None, None, Agent::Shell, true);
+        assert_eq!(get(&env), raw, "--pass-env keeps the raw value");
+    }
+
+    #[test]
     fn otlp_headers_drop_only_authorization() {
         assert_eq!(
             redact_otlp_auth(
                 "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
-                "x-team=a, authorization=Bearer t,b=c"
+                "x-team=a, authorization=Bearer t,b=c",
+                false
             ),
             "x-team=a,b=c"
         );
         assert_eq!(
-            redact_otlp_auth("OTEL_EXPORTER_OTLP_HEADERS", "%41uthorization=t,x=y"),
+            redact_otlp_auth("OTEL_EXPORTER_OTLP_HEADERS", "%41uthorization=t,x=y", false),
             "x=y"
         );
         assert_eq!(
-            redact_otlp_auth("OTEL_EXPORTER_OTLP_HEADERS", "Authorization=x"),
+            redact_otlp_auth("OTEL_EXPORTER_OTLP_HEADERS", "Authorization=x", false),
             ""
         );
         assert_eq!(
-            redact_otlp_auth("OTEL_SERVICE_NAME", "Authorization=x"),
+            redact_otlp_auth("OTEL_SERVICE_NAME", "Authorization=x", false),
             "Authorization=x"
         );
 
@@ -887,10 +927,10 @@ mod tests {
         let raw = "Authorization=Bearer t,x=y";
         let parent = vec![(key.to_string(), raw.to_string())];
         let get = |e: &SandboxEnv| e.vars.iter().find(|(k, _)| k == key).unwrap().1.clone();
-        let env = build_sandbox_env(&parent, &[], false, &[], None, None, Agent::Shell);
+        let env = build_sandbox_env(&parent, &[], false, &[], None, None, Agent::Shell, false);
         assert_eq!(get(&env), "x=y");
         let pass = [key.to_string()];
-        let env = build_sandbox_env(&parent, &pass, false, &[], None, None, Agent::Shell);
+        let env = build_sandbox_env(&parent, &pass, false, &[], None, None, Agent::Shell, true);
         assert_eq!(get(&env), raw, "--pass-env keeps the full value");
     }
 
@@ -949,6 +989,7 @@ mod tests {
             None,
             None,
             Agent::Shell,
+            false,
         );
         assert!(
             !asked.remove.iter().any(|v| v == "SSH_AUTH_SOCK"),
@@ -962,7 +1003,7 @@ mod tests {
         );
 
         // Without the explicit ask, inherit mode strips it exactly as before.
-        let not_asked = build_sandbox_env(&parent, &[], true, &[], None, None, Agent::Shell);
+        let not_asked = build_sandbox_env(&parent, &[], true, &[], None, None, Agent::Shell, false);
         assert!(
             not_asked.remove.iter().any(|v| v == "SSH_AUTH_SOCK"),
             "the default is unchanged: {:?}",
@@ -1170,7 +1211,7 @@ mod tests {
     #[test]
     fn claude_injects_additional_directories_claude_md_unless_overridden_or_denied() {
         const VAR: &str = "CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD";
-        let env = build_sandbox_env(&[], &[], false, &[], None, None, Agent::Claude);
+        let env = build_sandbox_env(&[], &[], false, &[], None, None, Agent::Claude, false);
         assert_eq!(
             env.vars
                 .iter()
@@ -1180,12 +1221,14 @@ mod tests {
         );
 
         // Non-Claude agents do not get the variable injected.
-        let copilot_env = build_sandbox_env(&[], &[], false, &[], None, None, Agent::Copilot);
+        let copilot_env =
+            build_sandbox_env(&[], &[], false, &[], None, None, Agent::Copilot, false);
         assert!(!copilot_env.vars.iter().any(|(k, _)| k == VAR));
 
         // Explicit user value (e.g. "0") is preserved.
         let parent = vec![(VAR.to_string(), "0".to_string())];
-        let env_override = build_sandbox_env(&parent, &[], false, &[], None, None, Agent::Claude);
+        let env_override =
+            build_sandbox_env(&parent, &[], false, &[], None, None, Agent::Claude, false);
         assert_eq!(
             env_override
                 .vars

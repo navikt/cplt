@@ -677,6 +677,7 @@ impl Config {
             no_validate,
             github_mcp_proxy: bools.github_mcp_proxy,
             mcp_broker: bools.mcp_broker,
+            strip_otlp_vendor_auth: bools.strip_otlp_vendor_auth,
             brief,
             agents_md,
             pass_env,
@@ -4272,6 +4273,14 @@ mod precedence {
                 cli_off: None,
                 get: |r| r.mcp_broker,
                 default: true,
+                preset: None,
+            },
+            Ladder {
+                key: "sandbox.strip_otlp_vendor_auth",
+                cli_on: None,
+                cli_off: None,
+                get: |r| r.strip_otlp_vendor_auth,
+                default: false,
                 preset: None,
             },
             Ladder {

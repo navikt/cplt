@@ -2529,6 +2529,28 @@ fn inject_github_token_nudge(resolved: &config::Resolved) -> Option<cplt::doctor
     })
 }
 
+/// #878: vendor OTLP auth headers are stripped for new configs only. Nudge an
+/// older config, and only when such a header is actually set. Setting the key
+/// either way silences it.
+fn otlp_vendor_auth_nudge(
+    resolved: &config::Resolved,
+    env: &[(String, String)],
+) -> Option<cplt::doctor::Finding> {
+    let unset = resolved.bool_layer("sandbox", "strip_otlp_vendor_auth")
+        == Some(config::ConfigLayer::Baseline);
+    (unset && sandbox::otlp_vendor_auth_present(env)).then(|| {
+        cplt::doctor::Finding::warning(
+            "an OTEL_EXPORTER_OTLP_*HEADERS vendor auth header (x-honeycomb-team, api-key, \
+             x-api-key, dd-api-key) reaches the sandbox. New configs strip it.",
+            Some(
+                "cplt config set sandbox.strip_otlp_vendor_auth true, or `false` to keep it \
+                 and silence this"
+                    .to_string(),
+            ),
+        )
+    })
+}
+
 fn config_findings(
     resolved: &config::Resolved,
     agent: agent::Agent,
@@ -2571,6 +2593,10 @@ fn config_findings(
         out.push(Finding::warning(note, Some(fix)));
     }
     out.extend(inject_github_token_nudge(resolved));
+    out.extend(otlp_vendor_auth_nudge(
+        resolved,
+        &std::env::vars().collect::<Vec<_>>(),
+    ));
     if resolved.localhost_any_ignored {
         out.push(Finding::warning(
             "allow_localhost_any is set, but proxy.forced overrides it: it opens no localhost \
@@ -5126,6 +5152,18 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     if !resolved.quiet && !cli.print_profile && mcp_status.is_none() {
         warn_unlinked_child_repos(&home_dir, &project_dir, &repo_paths);
         note_forced_proxy(&home_dir, &project_dir, resolved.proxy_forced);
+        // Once per project, not every launch (#878).
+        let n = otlp_vendor_auth_nudge(&resolved, &std::env::vars().collect::<Vec<_>>());
+        let line = n.map(|n| format!("{} Fix: {}", n.message, n.fix.unwrap_or_default()));
+        if cplt::launch_state::changed(
+            &home_dir,
+            &project_dir,
+            "otlp-vendor-auth",
+            line.as_deref().unwrap_or(""),
+        ) && let Some(line) = &line
+        {
+            ui::warn(line);
+        }
     }
     // `cplt mcp status`: the same specs, judged by this launch's final policy.
     if let Some(json) = mcp_status {
@@ -7160,6 +7198,7 @@ fn assemble_sandbox(
         sandbox::prepare_with_pnpm_shadow(&sandbox_config, pnpm_shadow_path, opts.inspect_only)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     prepared.set_worktree_root(opts.repos.worktree_root);
+    prepared.set_strip_otlp_vendor_auth(resolved.strip_otlp_vendor_auth);
     prepared.set_worktree_socket(
         worktree_broker
             .as_ref()
@@ -8111,7 +8150,14 @@ fn run_check_command(
         ) {
             println!("\nNote: {note}");
         }
-        if let Some(n) = inject_github_token_nudge(&resolved) {
+        let env: Vec<_> = std::env::vars().collect();
+        for n in [
+            inject_github_token_nudge(&resolved),
+            otlp_vendor_auth_nudge(&resolved, &env),
+        ]
+        .into_iter()
+        .flatten()
+        {
             println!("\nNote: {} Fix: {}", n.message, n.fix.unwrap_or_default());
         }
         // Claude only: for Copilot this would run `gh auth token`.
@@ -16243,6 +16289,30 @@ mod tests {
         let fresh = resolve(&config::default_config_contents());
         assert!(fresh.inject_github_token);
         assert!(inject_github_token_nudge(&fresh).is_none());
+    }
+
+    /// #878: nudge only an unset key, and only when a vendor header is set.
+    #[test]
+    fn otlp_vendor_auth_nudge_only_when_unset_and_present() {
+        let resolve = |toml: &str| {
+            toml::from_str::<config::Config>(toml)
+                .unwrap()
+                .merge(config::CliFlags::default())
+                .unwrap()
+        };
+        let env = [(
+            "OTEL_EXPORTER_OTLP_HEADERS".to_string(),
+            "x-honeycomb-team=k".to_string(),
+        )];
+        let old = resolve("");
+        assert!(!old.strip_otlp_vendor_auth);
+        assert!(otlp_vendor_auth_nudge(&old, &env).is_some());
+        assert!(otlp_vendor_auth_nudge(&old, &[]).is_none());
+        let fresh = resolve(&config::default_config_contents());
+        assert!(fresh.strip_otlp_vendor_auth);
+        assert!(otlp_vendor_auth_nudge(&fresh, &env).is_none());
+        let off = resolve("[sandbox]\nstrip_otlp_vendor_auth = false\n");
+        assert!(otlp_vendor_auth_nudge(&off, &env).is_none());
     }
 
     #[test]

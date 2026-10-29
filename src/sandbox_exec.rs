@@ -177,6 +177,7 @@ fn configure_command(
     // The Keychain substitute this run resolved. A `GhToken` one already puts
     // gh's token in the child, so neither channel below runs `gh` again.
     keychain_substitute: Option<&crate::agent::KeychainSubstitute>,
+    strip_otlp_vendor_auth: bool,
 ) {
     for arg in copilot_args {
         cmd.arg(arg);
@@ -194,6 +195,7 @@ fn configure_command(
         scratch_dir,
         proxy_port,
         agent,
+        strip_otlp_vendor_auth,
     );
 
     if sandbox_env.clear_first {
@@ -1511,6 +1513,7 @@ pub fn exec(
         sandbox.worktree_root.as_deref(),
         sandbox.worktree_socket.as_deref(),
         sandbox.keychain_substitute.as_ref(),
+        sandbox.strip_otlp_vendor_auth,
     );
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
@@ -1660,6 +1663,7 @@ pub fn exec(
         sandbox.worktree_root.as_deref(),
         sandbox.worktree_socket.as_deref(),
         sandbox.keychain_substitute.as_ref(),
+        sandbox.strip_otlp_vendor_auth,
     );
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
@@ -1903,6 +1907,7 @@ fn exec_bwrap(
         sandbox.worktree_root.as_deref(),
         sandbox.worktree_socket.as_deref(),
         sandbox.keychain_substitute.as_ref(),
+        sandbox.strip_otlp_vendor_auth,
     );
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
     apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
