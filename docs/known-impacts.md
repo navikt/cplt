@@ -17,10 +17,11 @@ in PATH. Check the selected path with `cplt doctor --verbose`, then launch
 
 ## Branch tracking is silently dropped
 
-**macOS only.** `.git/config` is write-denied there (it is a `core.hooksPath`
-and `url.*.insteadOf` vector). Landlock cannot deny a file inside a writable
-directory, so on Linux the file stays writable and branch tracking is recorded
-normally — the whole of this section applies to macOS sessions.
+`.git/config` is write-denied on macOS (it is a `core.hooksPath` and
+`url.*.insteadOf` vector), and on Linux when `sandbox.allow_git_config_write =
+false`, which new configs set. On Linux the error reads `Device or resource
+busy` instead of `Operation not permitted`. A Linux config without the key
+keeps the file writable, and branch tracking is recorded normally there.
 
 The commands that record branch tracking write to that file, and git treats the
 failure as non-fatal: it prints the error, prints a success line that is
@@ -1021,9 +1022,9 @@ Some git operations are blocked to prevent persistence attacks that would surviv
 | `git checkout/merge/rebase/branch` | ✅ Works     | Branch operations work normally                                   |
 | `git fetch/pull/push` (HTTPS)      | ✅ Works, except a default-branch push | Port 443 allowed, `gh auth git-credential` provides credentials. The git guard refuses pushes to `main`/`master` and every force push, see [Git workflow](#git-workflow-commit--push) |
 | `git fetch/pull/push` (SSH)        | ❌ No key on macOS | SSH agent socket and `~/.ssh` denied, so authentication fails; use HTTPS. The network path is open on 443 (`ssh.github.com:443`), see [SSH over port 443](#ssh-over-port-443). On Linux only `SSH_AUTH_SOCK` is withheld |
-| `git config` (local)               | ❌ Blocked on macOS | `.git/config` is write-protected on macOS, which prevents `url.*.insteadOf` hijacking. Applies to the project, to every named repository (`--repo-dir`), to every `allow.write` grant, and to any repository nested under one. Landlock cannot deny a file inside a writable root, so it stays writable on Linux |
+| `git config` (local)               | ❌ Blocked on macOS | `.git/config` is write-protected on macOS, which prevents `url.*.insteadOf` hijacking. Applies to the project, to every named repository (`--repo-dir`), to every `allow.write` grant, and to any repository nested under one. Blocked on Linux too with `sandbox.allow_git_config_write = false` (new configs, needs Bubblewrap) |
 | `git config --global`              | ❌ Blocked   | Git config and `~/.gitignore_global` are read-only                 |
-| `git remote set-url`               | ❌ Blocked on macOS | Writes to `.git/config`, which stays writable on Linux |
+| `git remote set-url`               | ❌ Blocked on macOS | Writes to `.git/config`; on Linux blocked only with `sandbox.allow_git_config_write = false` |
 | `git submodule add`                | ❌ Blocked on macOS | `.gitmodules` is write-protected on macOS. Writable on Linux, same Landlock limit (supply chain vector) |
 | Creating git hooks                 | ❌ Blocked   | `.git/hooks/` is write-protected in the project, in every named repository (`--repo-dir`), in every `allow.write` grant, and in any repository nested under one, hooks run unsandboxed. On Linux this needs the Bubblewrap layer, and nested repositories are found by a bounded scan: three levels down, 20 000 directories in total, symlinks not followed. A repository deeper than that, past the cap, bare, or a nested worktree/submodule stays writable there. See [security.md](security.md) |
 | `git init` / `git clone`           | ❌ Blocked on macOS | Both write `.git/config` and `.git/hooks/`, which are protected anywhere under a writable root. Clone outside the sandbox, then point cplt at the result. Writable on Linux, same Landlock limit |

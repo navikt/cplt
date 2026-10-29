@@ -305,6 +305,10 @@ pub struct SandboxConfig<'a> {
     /// - `Some(false)`: Never use bwrap (Landlock+seccomp only)
     /// - `None`: Auto-detect and use if available (graceful degradation)
     pub use_bubblewrap: Option<bool>,
+    /// `sandbox.allow_git_config_write` (#386). Linux only: `false` binds
+    /// every `<gitdir>/config` read-only and refuses to launch without
+    /// bubblewrap. macOS denies the write either way.
+    pub allow_git_config_write: bool,
 }
 
 /// A validated, platform-specific sandbox ready for execution.
@@ -3023,6 +3027,14 @@ fn pin_paths(
     pins
 }
 
+/// The refusal when `.git/config` must be read-only but bubblewrap does not
+/// wrap the run (#386).
+#[cfg(target_os = "linux")]
+const GIT_CONFIG_NEEDS_BWRAP: &str = "sandbox.allow_git_config_write = false needs \
+     Bubblewrap to make .git/config read-only, and Bubblewrap is not in use. Run \
+     `cplt doctor` to see why, or set `cplt config set sandbox.allow_git_config_write \
+     true` to let the agent write .git/config.";
+
 #[cfg(target_os = "linux")]
 fn ro_protect_paths(
     config: &SandboxConfig,
@@ -3043,6 +3055,14 @@ fn ro_protect_paths(
     // with an any-depth regex, and bubblewrap needs the paths named.
     write_roots.extend(nested_repos.iter().map(PathBuf::as_path));
     let mut ro_protect = bubblewrap::git_persistence_paths(&write_roots, &git_dirs);
+    // #386: `.git/config` read-only, as on macOS, unless the user opted in.
+    // git writes `config.lock` beside it and renames it over; the rename onto
+    // a bind fails with EBUSY and git removes the lock itself, so no stale
+    // lock is left. Missing paths are skipped like every other entry.
+    if !config.allow_git_config_write {
+        ro_protect.extend(write_roots.iter().map(|r| r.join(".git").join("config")));
+        ro_protect.extend(git_dirs.iter().map(|d| d.join("config")));
+    }
 
     // #237: same class, different tree — the agent's own config dir is granted
     // writable, and some files in it auto-execute on the host the next time the
@@ -3606,6 +3626,15 @@ fn prepare_impl(
             &policy.fs_rules,
             &mcp_bus_endpoints(),
         )?;
+    }
+
+    // #386: only bubblewrap can make `.git/config` read-only. Strict, so a
+    // spawn-time bwrap failure stops the run instead of falling back.
+    if !config.allow_git_config_write {
+        let Some(w) = bwrap_wrapper.as_mut() else {
+            return Err(GIT_CONFIG_NEEDS_BWRAP.to_string());
+        };
+        w.strict = true;
     }
 
     // #553: a home Git config file a link points at inside a writable tree,
@@ -4331,6 +4360,7 @@ mod tests {
             allow_cache_exec_any: false,
             allow_browser: false,
             use_bubblewrap: None,
+            allow_git_config_write: true,
         }
     }
 

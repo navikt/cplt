@@ -4090,13 +4090,13 @@ pub const PROTECTED_IN_GITDIR: &[Protected] = &[
         nested: true,
         why: "core.hooksPath / url.insteadOf / include.path all redirect trust",
         linux: LinuxCoverage::Gap(
-            "deliberate, not an oversight. A read-only bind here breaks `git config \
-             user.email` (without which the next commit fails), `git remote add` and \
-             `git push -u`; worse, git rewrites config through `.git/config.lock` + \
-             rename, so a denied write can leave a stale lock that blocks the user's \
-             next out-of-sandbox git. RESIDUAL: because config stays writable on \
-             Linux, `core.hooksPath` can still redirect hooks away from the \
-             read-only `hooks` bind. See SECURITY.md.",
+            "opt-in, not in this table. `sandbox.allow_git_config_write = false` \
+             (written by `cplt config init`) adds a read-only bind in \
+             `ro_protect_paths`; a config without the key keeps it writable so \
+             in-session `git config` and `git remote` work. git removes its \
+             `config.lock` when the rename fails, so no stale lock is left. \
+             RESIDUAL where writable: `core.hooksPath` can redirect hooks away \
+             from the read-only `hooks` bind. See SECURITY.md.",
         ),
     },
     // git reads `commondir` for ANY gitdir, not just worktrees, and its contents

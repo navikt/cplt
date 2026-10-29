@@ -3716,6 +3716,64 @@ print('CONNECTED')
         );
     }
 
+    /// #386: `sandbox.allow_git_config_write = false` binds `.git/config`
+    /// read-only, leaves no stale `config.lock`, and refuses to launch without
+    /// bubblewrap. `true` keeps in-session `git config` working.
+    #[test]
+    fn git_config_write_is_denied_unless_opted_in() {
+        require_bwrap!();
+        let home = home_outside_tmp(".cplt-e2e-gitconfig-home-");
+        let run = |allow: bool, flags: &[&str]| {
+            let dir = create_deny_project();
+            let project = dir.path().canonicalize().unwrap();
+            assert!(
+                crate::common::git_cmd(&project)
+                    .args(["init", "--quiet"])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let cfg = home.path().join(format!("cplt-{allow}.toml"));
+            fs::write(
+                &cfg,
+                format!("[sandbox]\nallow_git_config_write = {allow}\n"),
+            )
+            .unwrap();
+            let (code, stdout, stderr) = run_sandboxed_home_with_flags_env(
+                &project,
+                home.path(),
+                flags,
+                &[("CPLT_CONFIG", &cfg)],
+                "git config user.email e2e@example.com && echo CONFIG-WRITTEN \
+                 || echo CONFIG-DENIED",
+            );
+            let config = fs::read_to_string(project.join(".git/config")).unwrap();
+            let lock = project.join(".git/config.lock").exists();
+            (code, stdout, stderr, config, lock, dir)
+        };
+
+        let (code, stdout, stderr, config, lock, _d) = run(false, &["--use-bubblewrap"]);
+        assert!(
+            code == 0 && stdout.contains("CONFIG-DENIED") && !config.contains("e2e@") && !lock,
+            "code: {code}, stdout: {stdout}, stderr: {stderr}, lock: {lock}"
+        );
+
+        let (code, stdout, stderr, config, _, _d) = run(true, &["--use-bubblewrap"]);
+        assert!(
+            code == 0 && stdout.contains("CONFIG-WRITTEN") && config.contains("e2e@"),
+            "code: {code}, stdout: {stdout}, stderr: {stderr}"
+        );
+
+        let (code, stdout, stderr, config, _, _d) = run(false, &["--no-bubblewrap"]);
+        assert!(
+            code != 0
+                && stderr.contains("allow_git_config_write")
+                && !stdout.contains("CONFIG-")
+                && !config.contains("e2e@"),
+            "code: {code}, stdout: {stdout}, stderr: {stderr}"
+        );
+    }
+
     #[test]
     fn bwrap_nested_repo_dir_pins_repo_and_intermediate_ancestor_against_rename() {
         // A nested `--repo-dir` inside the writable project directory must stay

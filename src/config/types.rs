@@ -783,6 +783,10 @@ pub struct SandboxConfig {
     /// User config only (global or local): `.cplt.toml` cannot propose it,
     /// because it grants a new executable tree outside the checkout.
     pub allow_git_worktrees: Option<bool>,
+    /// Linux: let the agent write `.git/config` (#386). Unset keeps the old
+    /// behaviour (writable); new configs write `false`, which re-binds it
+    /// read-only under bubblewrap. macOS always denies the write.
+    pub allow_git_config_write: Option<bool>,
     /// How many directories the worktree-link walk visits before it stops and
     /// fails the launch (default: 100000). Only read with
     /// `allow_git_worktrees` on.
@@ -1059,6 +1063,9 @@ pub struct Resolved {
     pub allow_build_credentials: bool,
     /// `sandbox.allow_git_worktrees` (#531), default false.
     pub allow_git_worktrees: bool,
+    /// `sandbox.allow_git_config_write` (#386). Baseline `true`, so an
+    /// existing config keeps a writable `.git/config` on Linux.
+    pub allow_git_config_write: bool,
     /// `sandbox.worktree_walk_max_dirs`, default
     /// [`crate::worktrees::DEFAULT_WALK_MAX_DIRS`].
     pub worktree_walk_max_dirs: usize,

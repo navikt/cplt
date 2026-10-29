@@ -7298,6 +7298,7 @@ fn build_sandbox_config<'a>(
         allow_browser: resolved.allow_browser,
         keychain_substitute,
         use_bubblewrap: resolved.use_bubblewrap,
+        allow_git_config_write: resolved.allow_git_config_write,
     }
 }
 
@@ -9144,6 +9145,8 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     #[cfg(not(target_os = "linux"))]
     let can_force = true;
     findings.extend(doctor::proxy_forced_nudge(&resolved, can_force));
+    #[cfg(target_os = "linux")]
+    findings.extend(doctor::git_config_write_nudge(&resolved));
     findings.extend(config_findings(
         &resolved,
         active_agent,
@@ -13486,6 +13489,7 @@ mod tests {
             allow_browser: false,
             keychain_substitute: None,
             use_bubblewrap: None,
+            allow_git_config_write: true,
         };
         let denies = sandbox::ReadDenies::from_config(&base_cfg);
 

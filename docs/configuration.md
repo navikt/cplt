@@ -456,6 +456,25 @@ For a monorepo of many small repositories, name only the ones the agent will
 open pull requests against. Every named root widens what `gh` may write to, and
 the gh guard is the thing standing between an agent and the wrong repository.
 
+## Writing `.git/config` on Linux (`sandbox.allow_git_config_write`)
+
+macOS always denies writes to `.git/config`. A written `.git/config` can set
+`core.hooksPath`, `core.fsmonitor` or a `filter.*.clean` command, and those run
+unsandboxed on your next `git` command.
+
+On Linux the key decides. `cplt config init` writes
+`allow_git_config_write = false`: cplt binds every `.git/config` under a
+writable root read-only, and in-session `git config` and `git remote` fail. This
+needs Bubblewrap. Without it, cplt refuses to launch and says why. A config
+without the key keeps the old behaviour (writable), and `cplt doctor` suggests
+setting it. To let the agent write the file:
+
+```bash
+cplt config set sandbox.allow_git_config_write true
+```
+
+User config only; `.cplt.toml` cannot set it.
+
 ## Worktrees for sub-agents (`sandbox.allow_git_worktrees`)
 
 Off by default, macOS only, since 2026.09.24-164900-53d4462. When on, cplt
