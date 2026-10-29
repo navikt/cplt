@@ -262,6 +262,23 @@ impl Broker {
     pub fn specs(&self) -> impl Iterator<Item = &Spec> {
         self.shared.servers.values().map(|s| &s.spec)
     }
+
+    /// Run `args` with server `id`'s program, in the server's own sandbox
+    /// and environment, egress through its proxy: the credential probe.
+    /// stdin is closed at once; stdout and stderr are not read.
+    pub(crate) fn spawn_probe(&self, id: &str, args: &[&str]) -> std::io::Result<Child> {
+        let server = self
+            .shared
+            .servers
+            .get(id)
+            .ok_or_else(|| std::io::Error::other("no such server"))?;
+        let mut child = spawn_child_with(&self.shared, server, Some(args))?;
+        drop(child.stdin.take());
+        if let Some(mut out) = child.stdout.take() {
+            std::thread::spawn(move || std::io::copy(&mut out, &mut std::io::sink()));
+        }
+        Ok(child)
+    }
 }
 
 /// Linux (#834): a private 0700 dir under `/tmp` for the one socket.
@@ -375,11 +392,21 @@ pub(crate) fn write_line(w: &Mutex<impl Write>, line: &str) -> bool {
 }
 
 pub(crate) fn spawn_child(shared: &Shared, server: &Server) -> std::io::Result<Child> {
+    spawn_child_with(shared, server, None)
+}
+
+/// [`spawn_child`] with `args` in place of the spec's own arguments: the
+/// credential probe, run in the same sandbox as the server.
+fn spawn_child_with(
+    shared: &Shared,
+    server: &Server,
+    args: Option<&[&str]>,
+) -> std::io::Result<Child> {
     let spec = &server.spec;
     // No egress hosts, no listener: port 0 cannot be connected to, so every
     // proxied request fails at once instead of going out direct.
     let proxy = format!("http://127.0.0.1:{}", server.egress_port.unwrap_or(0));
-    let (mut cmd, setup) = child_command(shared, server)?;
+    let (mut cmd, setup) = child_command(shared, server, args)?;
     host_env(&mut cmd, &shared.home, spec.credential.keychain);
     for k in &setup.unset {
         cmd.env_remove(k);
@@ -497,10 +524,18 @@ fn resolve_existing_prefix(path: &Path) -> PathBuf {
 /// On Linux it runs under bwrap with its own network namespace, see
 /// [`linux_child_command`]. Nowhere does it run unsandboxed.
 #[allow(clippy::disallowed_methods)] // resolved in the trusted dirs at load; sandbox-exec is fixed
-fn child_command(shared: &Shared, server: &Server) -> std::io::Result<(Command, ChildSetup)> {
+fn child_command(
+    shared: &Shared,
+    server: &Server,
+    args: Option<&[&str]>,
+) -> std::io::Result<(Command, ChildSetup)> {
     let (spec, home, egress) = (&server.spec, shared.home.as_path(), server.egress_port);
+    let args: Vec<String> = match args {
+        Some(a) => a.iter().map(|a| (*a).to_string()).collect(),
+        None => spec.command[1..].to_vec(),
+    };
     if cfg!(target_os = "linux") {
-        return linux_child_command(shared, server);
+        return linux_child_command(shared, server, &args);
     }
     if !cfg!(target_os = "macos") {
         return Err(std::io::Error::other(
@@ -522,7 +557,7 @@ fn child_command(shared: &Shared, server: &Server) -> std::io::Result<(Command, 
         .arg(profile)
         .arg("--")
         .arg(&spec.program)
-        .args(&spec.command[1..]);
+        .args(&args);
     Ok((cmd, ChildSetup::default()))
 }
 
@@ -546,7 +581,11 @@ const CHILD_BUS_SOCKET: &str = "/run/cplt-bus";
 /// falls back, when bwrap is missing; when bwrap cannot build the
 /// namespaces it exits before the server starts.
 #[allow(clippy::disallowed_methods)] // bwrap from the trusted dirs; cplt is this binary
-fn linux_child_command(shared: &Shared, server: &Server) -> std::io::Result<(Command, ChildSetup)> {
+fn linux_child_command(
+    shared: &Shared,
+    server: &Server,
+    args: &[String],
+) -> std::io::Result<(Command, ChildSetup)> {
     let spec = &server.spec;
     #[cfg(target_os = "linux")]
     let bwrap = crate::sandbox::bubblewrap_probe::check_availability();
@@ -603,7 +642,7 @@ fn linux_child_command(shared: &Shared, server: &Server) -> std::io::Result<(Com
         setup.unset.push("DBUS_SESSION_BUS_ADDRESS");
     }
     let mut argv = vec![spec.program.to_string_lossy().into_owned()];
-    argv.extend(spec.command[1..].iter().cloned());
+    argv.extend(args.iter().cloned());
     let relay = serde_json::json!([server.egress_port.unwrap_or(0), argv]).to_string();
     setup.env.extend([
         (RELAY_ENV, relay.into()),

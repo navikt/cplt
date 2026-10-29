@@ -105,7 +105,38 @@ pub fn credential_ok(spec: &Spec) -> (Option<bool>, Option<&'static str>) {
     let Some(args) = spec.credential.probe else {
         return (None, None);
     };
+    if cfg!(target_os = "linux") {
+        return sandboxed_probe(spec, args, PROBE_TIMEOUT);
+    }
     probe(&spec.program, args, spec.credential.keychain, PROBE_TIMEOUT)
+}
+
+/// Linux: the probe in the server's own sandbox (#849). The server can write
+/// its config dir, and nais reads `config.yaml` there on every run: its
+/// values set any flag, so a planted `nais: false` would turn the probe into
+/// a gcloud call. Run on the host, the probe would act on what the
+/// sandboxed server wrote. Here it gets the same bwrap namespace, filtered
+/// bus and egress proxy, through a broker serving this one spec.
+fn sandboxed_probe(
+    spec: &Spec,
+    args: &[&str],
+    timeout: Duration,
+) -> (Option<bool>, Option<&'static str>) {
+    let Some(home) = std::env::var_os("HOME") else {
+        return (None, Some("HOME is not set"));
+    };
+    let log = super::Log {
+        level: crate::proxy::ProxyLogLevel::None,
+        file: None,
+    };
+    let Ok(broker) = super::Broker::start(vec![spec.clone()], std::path::Path::new(&home), log)
+    else {
+        return (None, Some("cannot start the probe's sandbox"));
+    };
+    let Ok(child) = broker.spawn_probe(&spec.id, args) else {
+        return (None, Some("cannot run the probe"));
+    };
+    wait(child, timeout)
 }
 
 fn probe(
@@ -124,7 +155,7 @@ fn probe(
     };
     super::runtime::host_env(&mut cmd, std::path::Path::new(&home), keychain);
     cmd.current_dir("/");
-    let Ok(mut child) = cmd
+    let Ok(child) = cmd
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -133,6 +164,11 @@ fn probe(
     else {
         return (None, Some("cannot run the probe"));
     };
+    wait(child, timeout)
+}
+
+/// The probe's answer: its exit status, or unknown past `timeout`.
+fn wait(mut child: std::process::Child, timeout: Duration) -> (Option<bool>, Option<&'static str>) {
     let start = Instant::now();
     loop {
         if let Ok(Some(status)) = child.try_wait() {
@@ -178,6 +214,32 @@ mod tests {
             probe(&nais, &["auth", "print-access-token"], true, long)
         });
         assert_eq!(gcloud, (Some(false), None), "the fake must tell them apart");
+    }
+
+    /// #849: on Linux the probe runs in the server's sandbox, so it sees
+    /// the child's empty, read-only HOME (when HOME is not under /tmp),
+    /// never the host's, and acts on nothing the host keeps there.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_linux_probe_runs_in_the_servers_sandbox() {
+        if crate::sandbox::bubblewrap_probe::check_availability().is_none() {
+            return;
+        }
+        let mut spec = super::super::test_util::check(super::super::test_util::base()).unwrap();
+        spec.program = "/bin/sh".into();
+        // Not under /tmp, whose HOME is private anyway.
+        let home = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        std::fs::write(home.path().join("host-file"), "").unwrap();
+        // Inside: only the nais config dir, and read-only; the host file is
+        // the control.
+        let script = r#"[ "$(ls -A "$HOME")" = .config ] || exit 2; ! : > "$HOME/x" 2>/dev/null"#;
+        let got = crate::with_env_lock_no_xdg(|| {
+            temp_env::with_var("HOME", Some(home.path()), || {
+                sandboxed_probe(&spec, &["-c", script], Duration::from_secs(30))
+            })
+        });
+        assert_eq!(got, (Some(true), None));
+        assert!(!home.path().join("x").exists());
     }
 
     #[test]
