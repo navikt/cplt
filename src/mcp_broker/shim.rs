@@ -51,9 +51,17 @@ pub(crate) fn pump(from: &mut impl std::io::Read, to: &mut impl Write) {
     }
 }
 
+/// How long the unix side may stay silent once the TCP side has ended, so a
+/// peer that never closes cannot hold a connection slot forever.
+const HALF_CLOSED_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Both ways between a TCP and a unix stream until each side ends: the
 /// egress hop on either side of the Linux child's network namespace (#849).
 pub(crate) fn pipe(tcp: TcpStream, unix: UnixStream) {
+    pipe_idle(tcp, unix, HALF_CLOSED_IDLE);
+}
+
+fn pipe_idle(tcp: TcpStream, unix: UnixStream, idle: std::time::Duration) {
     let (Ok(mut t), Ok(mut u)) = (tcp.try_clone(), unix.try_clone()) else {
         return;
     };
@@ -64,6 +72,10 @@ pub(crate) fn pipe(tcp: TcpStream, unix: UnixStream) {
     let (mut t, mut u) = (tcp, unix);
     pump(&mut t, &mut u);
     let _ = u.shutdown(Shutdown::Write);
+    // The TCP side is done (the proxy closed, or its deadline fired): the
+    // unix peer still gets to finish a half-closed stream, but an idle read
+    // now ends the back pump instead of blocking forever.
+    let _ = u.set_read_timeout(Some(idle));
     let _ = back.join();
 }
 
@@ -148,6 +160,21 @@ fn run_egress_relay(port: u16, argv: &[String]) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// A unix peer that keeps its write half open after the TCP side has
+    /// closed no longer pins the pipe (and its connection permit).
+    #[test]
+    fn pipe_ends_when_the_unix_peer_idles_after_tcp_closes() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let tcp = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        drop(l.accept().unwrap().0); // the proxy closes at once
+        let (ours, _peer) = UnixStream::pair().unwrap(); // _peer stays open
+        let t0 = std::time::Instant::now();
+        pipe_idle(tcp, ours, std::time::Duration::from_millis(200));
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5));
+    }
+
     use super::relay;
 
     #[test]
