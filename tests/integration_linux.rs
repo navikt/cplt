@@ -3845,7 +3845,12 @@ print('CONNECTED')
             "(git config e2e.shared 1) 2>/dev/null && echo SHARED-WRITTEN || echo SHARED-DENIED; \
              (git config --worktree e2e.wt 1) 2>/dev/null && echo WT-WRITTEN || echo WT-DENIED; \
              (echo 'gitdir: /tmp/evil' > .git) 2>/dev/null && echo POINTER-WRITTEN \
-             || echo POINTER-DENIED",
+             || echo POINTER-DENIED; \
+             common=$(git rev-parse --git-common-dir); \
+             (mv \"$common/worktrees/wt\" \"$common/worktrees/wt2\") 2>/dev/null \
+             && echo WT-MOVED || echo WT-PINNED; \
+             (mv \"$common/worktrees\" \"$common/wtx\") 2>/dev/null \
+             && echo WTS-MOVED || echo WTS-PINNED",
         );
         let shared = fs::read_to_string(main.join(".git/config")).unwrap();
         assert!(
@@ -3853,6 +3858,8 @@ print('CONNECTED')
                 && stdout.contains("SHARED-DENIED")
                 && stdout.contains("WT-DENIED")
                 && stdout.contains("POINTER-DENIED")
+                && stdout.contains("WT-PINNED")
+                && stdout.contains("WTS-PINNED")
                 && !shared.contains("e2e")
                 && fs::read_to_string(wt.join(".git")).unwrap() == pointer,
             "code: {code}, stdout: {stdout}, stderr: {stderr}"

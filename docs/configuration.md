@@ -481,6 +481,10 @@ repository created in the session (`git init`, `git clone`) stays writable.
 Nested repositories are found by a bounded scan (three levels, 20 000
 directories), as for `.git/hooks`. A hard link to `.git/config` from the
 writable tree fails with `EXDEV`, because the bound file is its own mount.
+With `extensions.worktreeConfig` on, a `config.worktree` that does not exist at
+launch is not bound, so the agent can create one. Linked worktree directories
+under `.git/worktrees` are pinned, so `git worktree remove` and `prune` fail in
+the session.
 
 ## Worktrees for sub-agents (`sandbox.allow_git_worktrees`)
 

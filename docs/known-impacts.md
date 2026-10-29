@@ -97,7 +97,10 @@ gh pr create -R <owner>/<repo> --head my-branch
 ```
 
 On macOS this applies to every writable root, the launch repository included,
-not only to repositories named with `--repo-dir`. Tracked in
+not only to repositories named with `--repo-dir`. On Linux it applies with
+`sandbox.allow_git_config_write = false`, to the same roots, but a nested
+repository is covered only if the bounded scan finds it (three levels down,
+20 000 directories in total). Tracked in
 [#402](https://github.com/navikt/cplt/issues/402), which also covers whether
 the guard should intercept these forms and fail loudly instead.
 

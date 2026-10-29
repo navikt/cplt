@@ -2965,6 +2965,16 @@ fn pin_paths(
     // walk-aroundable by `mv .git g2 && mkdir .git`.
     write_roots.extend(nested_repos.iter().map(PathBuf::as_path));
     let mut pins = bubblewrap::rename_pin_paths(&write_roots, &git_dirs);
+    // #386: the ancestors of the `config.worktree` binds in `ro_protect_paths`.
+    if !config.allow_git_config_write {
+        for dir in &git_dirs {
+            let linked = linked_worktree_dirs(dir);
+            if !linked.is_empty() {
+                pins.push(dir.join("worktrees"));
+            }
+            pins.extend(linked);
+        }
+    }
     // GHSA-8qmv-wxp3-526v, Linux half. A read-only bind pins a path's content,
     // not its name: `~/.cache/copilot` sits inside the writable `~/.cache`
     // grant, so moving it aside left `pkg` writable under a name no bind
@@ -3035,6 +3045,18 @@ const GIT_CONFIG_NEEDS_BWRAP: &str = "sandbox.allow_git_config_write = false nee
      `cplt doctor` to see why, or run `cplt config set sandbox.allow_git_config_write \
      true` to let the agent write .git/config.";
 
+/// `<gitdir>/worktrees/<name>` for each linked worktree (#386). Its
+/// `config.worktree` is bound read-only, and both it and `worktrees/` are
+/// rename-pinned so `mv .git/worktrees/wt …` cannot walk around the bind.
+/// Kept here rather than as a `PROTECTED_IN_GITDIR` row because it applies
+/// only with `sandbox.allow_git_config_write = false`; macOS already denies it.
+#[cfg(target_os = "linux")]
+fn linked_worktree_dirs(git_dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(git_dir.join("worktrees"))
+        .map(|it| it.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default()
+}
+
 #[cfg(target_os = "linux")]
 fn ro_protect_paths(
     config: &SandboxConfig,
@@ -3076,9 +3098,11 @@ fn ro_protect_paths(
         for dir in &git_dirs {
             ro_protect.push(dir.join("config"));
             ro_protect.push(dir.join("config.worktree"));
-            if let Ok(entries) = std::fs::read_dir(dir.join("worktrees")) {
-                ro_protect.extend(entries.flatten().map(|e| e.path().join("config.worktree")));
-            }
+            ro_protect.extend(
+                linked_worktree_dirs(dir)
+                    .into_iter()
+                    .map(|w| w.join("config.worktree")),
+            );
         }
         ro_protect.sort();
         ro_protect.dedup();
