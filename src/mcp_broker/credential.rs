@@ -232,13 +232,38 @@ mod tests {
         std::fs::write(home.path().join("host-file"), "").unwrap();
         // Inside: only the nais config dir, and read-only; the host file is
         // the control.
-        let script = r#"[ "$(ls -A "$HOME")" = .config ] || exit 2; ! : > "$HOME/x" 2>/dev/null"#;
+        let script = r#"echo "HOME=$HOME ls=$(ls -A "$HOME" | tr '\n' ' ')" >&2; [ "$(ls -A "$HOME")" = .config ] || exit 2; ! : > "$HOME/x" 2>/dev/null"#;
         let got = crate::with_env_lock_no_xdg(|| {
             temp_env::with_var("HOME", Some(home.path()), || {
                 sandboxed_probe(&spec, &["-c", script], Duration::from_secs(30))
             })
         });
-        assert_eq!(got, (Some(true), None));
+        if got != (Some(true), None) {
+            // The same run, its stderr kept: what the child saw.
+            let log = tempfile::NamedTempFile::new().unwrap();
+            let b = super::super::Broker::start(
+                vec![spec.clone()],
+                home.path(),
+                super::super::Log {
+                    level: crate::proxy::ProxyLogLevel::None,
+                    file: Some(log.path().to_path_buf()),
+                },
+            )
+            .unwrap();
+            let r = crate::with_env_lock_no_xdg(|| {
+                temp_env::with_var("HOME", Some(home.path()), || {
+                    wait(
+                        b.spawn_probe(&spec.id, &["-c", script]).unwrap(),
+                        Duration::from_secs(30),
+                    )
+                })
+            });
+            std::thread::sleep(Duration::from_millis(500));
+            panic!(
+                "{got:?} {r:?}: {}",
+                std::fs::read_to_string(log.path()).unwrap_or_default()
+            );
+        }
         assert!(!home.path().join("x").exists());
     }
 
