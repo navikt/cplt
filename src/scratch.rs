@@ -371,8 +371,11 @@ fn open_no_symlinks(path: &Path) -> std::io::Result<std::fs::File> {
 /// `store/v*/links/@pnpm/exe/<version>/<hash>/node_modules/@pnpm/exe/pnpm`.
 pub fn pinned_pnpm_binary(home_dir: &Path, launch_dir: &Path) -> Option<PathBuf> {
     let pin = launch_dir.ancestors().find_map(|dir| {
-        let manifest = std::fs::read(dir.join("package.json")).ok()?;
-        let manifest: serde_json::Value = serde_json::from_slice(&manifest).ok()?;
+        // Read before the sandbox exists: refuse a FIFO or device and cap
+        // the size, so a planted `package.json` cannot hang every launch.
+        let manifest =
+            crate::untrusted::read_regular_following(&dir.join("package.json"), 1 << 20).ok()??;
+        let manifest: serde_json::Value = serde_json::from_str(&manifest).ok()?;
         Some(manifest.get("packageManager")?.as_str()?.to_owned())
     })?;
     let version = pin.strip_prefix("pnpm@")?.split('+').next()?;
@@ -1805,6 +1808,23 @@ mod tests {
         // Never copy a pinned file that is not a binary.
         std::fs::write(pinned.join("pnpm"), b"#!/bin/sh\n").unwrap();
         assert_eq!(shadow_bytes("pnpm@11.25.0"), b"\xcf\xfa\xed\xfeglobal");
+    }
+
+    #[test]
+    fn pinned_pnpm_ignores_a_fifo_or_device_package_json() {
+        let home = tempfile::tempdir().unwrap();
+        let fifo = home.path().join("fifo");
+        std::fs::create_dir_all(&fifo).unwrap();
+        let c = std::ffi::CString::new(fifo.join("package.json").as_os_str().as_encoded_bytes())
+            .unwrap();
+        // SAFETY: `c` is a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let zero = home.path().join("zero");
+        std::fs::create_dir_all(&zero).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", zero.join("package.json")).unwrap();
+        for dir in [&fifo, &zero] {
+            assert_eq!(pinned_pnpm_binary(home.path(), dir), None);
+        }
     }
 
     #[test]
