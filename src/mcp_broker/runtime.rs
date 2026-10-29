@@ -616,32 +616,13 @@ fn linux_child_command(
     }
     let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
     let mut setup = ChildSetup::default();
-    let mut bus = None;
-    if spec.credential.keychain {
-        let addr = std::env::var("DBUS_SESSION_BUS_ADDRESS").ok();
-        match pick_session_bus(addr.as_deref(), runtime.as_deref(), is_socket) {
-            None => shared.log.line(
-                &spec.id,
-                "FAIL no session bus on the host, so no keychain login for the server",
-            ),
-            Some(real) => match start_bus_proxy(&real, &server.bus_socket) {
-                Ok(sync) => {
-                    setup.sync = Some(sync);
-                    bus = Some(server.bus_socket.as_path());
-                }
-                Err(e) => shared.log.line(
-                    &spec.id,
-                    &format!("FAIL no session bus for the server, so no keychain login: {e}"),
-                ),
-            },
-        }
-    }
-    if bus.is_some() {
-        let addr = format!("unix:path={CHILD_BUS_SOCKET}");
-        setup.env.push(("DBUS_SESSION_BUS_ADDRESS", addr.into()));
-    } else {
-        setup.unset.push("DBUS_SESSION_BUS_ADDRESS");
-    }
+    let bus = child_bus(
+        shared,
+        server,
+        runtime.as_deref(),
+        crate::git::trusted_binary("xdg-dbus-proxy"),
+        &mut setup,
+    );
     let mut argv = vec![spec.program.to_string_lossy().into_owned()];
     argv.extend(args.iter().cloned());
     let relay = serde_json::json!([server.egress_port.unwrap_or(0), argv]).to_string();
@@ -710,6 +691,47 @@ fn linux_child_command(
     Ok((cmd, setup))
 }
 
+/// The filtered session bus for a `keychain` mechanism: where it listens,
+/// with `setup` pointing the child at it; else `None`, with the bus address
+/// unset. Never the host bus itself: no `proxy` (xdg-dbus-proxy from the
+/// trusted dirs), or one that does not start, is no bus.
+fn child_bus<'a>(
+    shared: &Shared,
+    server: &'a Server,
+    runtime: Option<&Path>,
+    proxy: Option<PathBuf>,
+    setup: &mut ChildSetup,
+) -> Option<&'a Path> {
+    let spec = &server.spec;
+    let mut bus = None;
+    if spec.credential.keychain {
+        let addr = std::env::var("DBUS_SESSION_BUS_ADDRESS").ok();
+        match pick_session_bus(addr.as_deref(), runtime, is_socket) {
+            None => shared.log.line(
+                &spec.id,
+                "FAIL no session bus on the host, so no keychain login for the server",
+            ),
+            Some(real) => match start_bus_proxy(proxy, &real, &server.bus_socket) {
+                Ok(sync) => {
+                    setup.sync = Some(sync);
+                    bus = Some(server.bus_socket.as_path());
+                }
+                Err(e) => shared.log.line(
+                    &spec.id,
+                    &format!("FAIL no session bus for the server, so no keychain login: {e}"),
+                ),
+            },
+        }
+    }
+    if bus.is_some() {
+        let addr = format!("unix:path={CHILD_BUS_SOCKET}");
+        setup.env.push(("DBUS_SESSION_BUS_ADDRESS", addr.into()));
+    } else {
+        setup.unset.push("DBUS_SESSION_BUS_ADDRESS");
+    }
+    bus
+}
+
 fn is_socket(p: &Path) -> bool {
     use std::os::unix::fs::FileTypeExt;
     std::fs::metadata(p).is_ok_and(|m| m.file_type().is_socket())
@@ -759,8 +781,12 @@ const BUS_TALK: &[&str] = &["--talk=org.freedesktop.secrets"];
 /// `--fd` is the write end of a pipe: it writes one byte when it listens,
 /// and exits once the read end, returned here, is closed.
 #[allow(clippy::disallowed_methods)] // from crate::git::trusted_binary
-fn start_bus_proxy(real: &Path, socket: &Path) -> std::io::Result<std::io::PipeReader> {
-    let proxy = crate::git::trusted_binary("xdg-dbus-proxy").ok_or_else(|| {
+fn start_bus_proxy(
+    proxy: Option<PathBuf>,
+    real: &Path,
+    socket: &Path,
+) -> std::io::Result<std::io::PipeReader> {
+    let proxy = proxy.ok_or_else(|| {
         std::io::Error::other("xdg-dbus-proxy is not installed in the trusted dirs")
     })?;
     let _ = std::fs::remove_file(socket);
@@ -1287,6 +1313,33 @@ mod tests {
                 .iter()
                 .any(|a| a == "--bind" || a == CHILD_EGRESS_SOCKET || a == CHILD_BUS_SOCKET)
         );
+    }
+
+    /// #849: a keychain server whose host has a session bus but no
+    /// xdg-dbus-proxy gets no bus at all, never the host's own.
+    #[test]
+    fn no_dbus_proxy_no_bus() {
+        let b = cat_broker();
+        let server = &b.shared.servers["io.github.nais/nais-mcp"];
+        assert!(server.spec.credential.keychain);
+        let dir = tempfile::tempdir().unwrap();
+        let host_bus = dir.path().join("bus");
+        let _l = std::os::unix::net::UnixListener::bind(&host_bus).unwrap();
+        let addr = format!("unix:path={}", host_bus.display());
+        let mut setup = ChildSetup::default();
+        let bus = temp_env::with_var("DBUS_SESSION_BUS_ADDRESS", Some(&addr), || {
+            child_bus(&b.shared, server, None, None, &mut setup)
+        });
+        assert_eq!(bus, None);
+        assert_eq!(setup.unset, ["DBUS_SESSION_BUS_ADDRESS"]);
+        assert!(setup.env.is_empty() && setup.sync.is_none());
+        assert!(!server.bus_socket.exists());
+        // bwrap then binds no bus socket.
+        let s = strings(child_bwrap_args(&ChildMounts {
+            bus,
+            ..ChildMounts::default()
+        }));
+        assert!(!s.iter().any(|a| a == CHILD_BUS_SOCKET), "{s:?}");
     }
 
     #[test]
