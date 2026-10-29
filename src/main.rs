@@ -2351,6 +2351,17 @@ fn gh_exec_token_replacement(
         && stored_token()
 }
 
+/// #933: on Linux, Copilot with no reachable token asks for `/login`, which
+/// cannot open a browser from the sandbox. Only when `inject_token` would help:
+/// gh_guard on, a scratch dir, and `inject_token` not set yet.
+fn linux_login_hint_applies(resolved: &config::Resolved, linux: bool, has_token: bool) -> bool {
+    linux
+        && !has_token
+        && resolved.gh_guard.enabled
+        && resolved.scratch_dir
+        && !resolved.gh_guard.inject_token
+}
+
 fn copilot_stored_token_handover(
     resolved: &config::Resolved,
     substitute: Option<&agent::KeychainSubstitute>,
@@ -7127,6 +7138,30 @@ fn assemble_sandbox(
             "Copilot gets no keyring login: {}",
             skip.reason(home_dir)
         ));
+    }
+    let env_token = active_agent
+        .keychain_substitute_env_vars()
+        .iter()
+        .filter(|v| !resolved.deny_env.iter().any(|d| d == **v))
+        .any(|v| std::env::var(v).is_ok_and(|t| !t.trim().is_empty()));
+    if !resolved.quiet
+        && active_agent == agent::Agent::Copilot
+        && linux_login_hint_applies(
+            resolved,
+            cfg!(target_os = "linux"),
+            keychain_substitute.is_some()
+                || keyring_moot
+                || env_token
+                // Those already printed their own fix; say it once.
+                || cplt::sandbox::SECRET_TOOL_TIMED_OUT.load(std::sync::atomic::Ordering::Relaxed)
+                || cplt::sandbox::SECRET_SERVICE_SKIP.get().is_some(),
+        )
+    {
+        ui::warn(
+            "Copilot has no GitHub token here, and /login cannot open a browser in the sandbox. \
+             Run `gh auth login` on the host, then `cplt config set gh_guard.inject_token true \
+             --force` (the token is then visible to every process in the sandbox)",
+        );
     }
 
     let mut extra_exec = resolved.allow_exec.clone();
@@ -16087,6 +16122,29 @@ mod tests {
         assert!(
             inject_token_deprecation_line(&policy(true, true), false).is_none(),
             "Linux still needs it"
+        );
+    }
+
+    /// #933: the Linux /login hint fires only when no token is reachable and
+    /// `inject_token` is off but usable.
+    #[test]
+    fn linux_login_hint_fires_only_when_user_must_act() {
+        let mut r = config::Config::default()
+            .merge(config::CliFlags::default())
+            .unwrap();
+        r.gh_guard.enabled = true;
+        r.scratch_dir = true;
+        r.gh_guard.inject_token = false;
+        assert!(linux_login_hint_applies(&r, true, false));
+        assert!(!linux_login_hint_applies(&r, false, false), "macOS");
+        assert!(!linux_login_hint_applies(&r, true, true), "token reachable");
+        r.gh_guard.inject_token = true;
+        assert!(!linux_login_hint_applies(&r, true, false), "already on");
+        r.gh_guard.inject_token = false;
+        r.gh_guard.enabled = false;
+        assert!(
+            !linux_login_hint_applies(&r, true, false),
+            "fix would not work"
         );
     }
 
