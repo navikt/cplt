@@ -812,6 +812,73 @@ int main(int argc, char **argv) {
         );
     }
 
+    /// pnpm's `pnpm setup` rc block must not put `$PNPM_HOME/bin` ahead of
+    /// the shadow: cplt appends it so the block finds it already present.
+    #[test]
+    fn pnpm_rc_block_keeps_the_shadow_first() {
+        require_sandbox!();
+        use std::os::unix::fs::PermissionsExt;
+
+        let project = tempfile::Builder::new()
+            .prefix(".cplt-pnpm-project-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("create project");
+        let home = tempfile::Builder::new()
+            .prefix(".cplt-pnpm-home-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("create fake home");
+        let pnpm_home = home.path().join("Library/pnpm");
+        let store = pnpm_home.join("store/v11/links/@/pnpm/11.0.0/abc");
+        fs::create_dir_all(&store).expect("create store");
+        fs::create_dir_all(pnpm_home.join("bin")).expect("create launcher dir");
+        let store_pnpm = store.join("pnpm");
+        fs::copy(env!("CARGO_BIN_EXE_cplt"), &store_pnpm).expect("copy a real binary as pnpm");
+        fs::set_permissions(&store_pnpm, fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&store_pnpm, pnpm_home.join("pnpm"))
+            .expect("link pnpm into PNPM_HOME");
+        let launcher = pnpm_home.join("bin/pnpm");
+        fs::write(
+            &launcher,
+            format!("#!/bin/sh\n# cmd-shim-target={}\n", store_pnpm.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let script = format!(
+            "PNPM_HOME='{}'; case \":$PATH:\" in *\":$PNPM_HOME/bin:\"*) ;; \
+             *) export PATH=\"$PNPM_HOME/bin:$PATH\";; esac; echo \"${{PATH%%:*}}\"; command -v pnpm",
+            pnpm_home.display(),
+        );
+        let project_dir = project.path().to_string_lossy().into_owned();
+        let output = cplt_cmd()
+            .args([
+                "--yes",
+                "--no-validate",
+                "--quiet",
+                "--agent",
+                "shell",
+                "--project-dir",
+                &project_dir,
+                "--",
+                "-c",
+                &script,
+            ])
+            .env("HOME", home.path())
+            .env("PATH", format!("{}:/usr/bin:/bin", pnpm_home.display()))
+            .output()
+            .expect("run cplt");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.lines().next() != Some(&*pnpm_home.join("bin").to_string_lossy())
+                && stdout
+                    .lines()
+                    .nth(1)
+                    .is_some_and(|l| l.contains(".cplt-pnpm-shadow")),
+            "the shadow must stay first on PATH and win: {stdout} {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     /// A unique, grep-safe token embedded in the render probe document.
     ///
     /// Alphanumeric only so it survives DOM serialization verbatim and cannot
