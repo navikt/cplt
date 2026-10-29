@@ -5147,6 +5147,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             copilot_install_dir: copilot_install_dir.as_deref(),
             electron_app_dir: electron_app_dir.as_deref(),
             pnpm_candidate: None,
+            launch_dir: Some(&launch_dir),
             inspect_only: cli.print_profile || mcp_status.is_some(),
             opencode_v2,
             mcp: mcp_status.is_none().then_some(&mcp_found),
@@ -6690,6 +6691,9 @@ struct AssemblyOptions<'a> {
     electron_app_dir: Option<&'a Path>,
     /// A pnpm path explicitly requested by `cplt exec`, if any.
     pnpm_candidate: Option<&'a Path>,
+    /// Where the child starts; pnpm's `packageManager` pin is looked up from
+    /// here. `None` falls back to the invocation directory.
+    launch_dir: Option<&'a Path>,
     /// The sandbox is only printed or checked, never launched
     /// (`--print-profile`, `cplt check`), so preparing it must not write to
     /// the host (#553).
@@ -6836,7 +6840,10 @@ fn assemble_sandbox(
     let pnpm_shadow_guard = pnpm
         .as_ref()
         .map(|pnpm| {
-            let launch_dir = std::env::current_dir().unwrap_or_else(|_| probe.project_dir.clone());
+            let launch_dir = opts.launch_dir.map_or_else(
+                || std::env::current_dir().unwrap_or_else(|_| probe.project_dir.clone()),
+                Path::to_path_buf,
+            );
             scratch::PnpmShadowDir::create_if_needed(home_dir, pnpm, &launch_dir)
         })
         .transpose()
@@ -7413,6 +7420,7 @@ fn prepare_shell_sandbox(
             copilot_install_dir: None,
             electron_app_dir: None,
             pnpm_candidate: None,
+            launch_dir: None,
             // `cplt check` only reports on the policy.
             inspect_only: true,
             opencode_v2: false,
@@ -7591,6 +7599,7 @@ fn run_exec_command(
                 copilot_install_dir: None,
                 electron_app_dir: None,
                 pnpm_candidate,
+                launch_dir: Some(&launch_dir),
                 inspect_only: cli.print_profile,
                 opencode_v2: false,
                 mcp: None,
@@ -7622,13 +7631,10 @@ fn run_exec_command(
             resolved.gh_guard.enabled,
             resolved.git_guard.enabled,
         );
-        let bin = pnpm_shadow_guard.as_ref().map_or(bin.clone(), |shadow| {
-            if shadow.shadows(&bin) {
-                shadow.binary()
-            } else {
-                bin
-            }
-        });
+        let bin = pnpm_shadow_guard
+            .as_ref()
+            .and_then(|shadow| shadow.binary_for(&cmd[0], &bin))
+            .unwrap_or(bin);
         // Only the binary the user named: a guard shim or pnpm shadow is
         // cplt's own file and is run by the path cplt chose for it.
         let bin = match requested_path.as_deref() {
