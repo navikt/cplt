@@ -3712,6 +3712,80 @@ int main(int argc, char **argv) {
         );
     }
 
+    /// #923, for every writable root: the project and a tool dir can no longer
+    /// be moved aside and symlinked back, which took every deny under them
+    /// along. Ordinary git work in the project still succeeds.
+    #[test]
+    fn real_profile_pins_writable_roots_against_move_and_symlink() {
+        require_sandbox!();
+        let temp_home = tempfile::tempdir().unwrap();
+        let home = fs::canonicalize(temp_home.path()).unwrap();
+        let project = home.join("proj");
+        let other = home.join("other");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        fs::create_dir_all(home.join(".m2")).unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&project)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ]);
+
+        let extra_write = [other.clone()];
+        let mut opts = default_opts(&project, &home);
+        opts.extra_write = &extra_write;
+        let profile = write_real_profile(&opts);
+
+        let attack = |root: &Path, planted: &str| {
+            let moved = other.join("x");
+            let cmd = format!(
+                "mv '{r}' '{m}' 2>&1; echo MV:$?; ln -s '{m}' '{r}' 2>&1; \
+                 echo evil > '{r}/{planted}' 2>&1",
+                r = root.display(),
+                m = moved.display()
+            );
+            let (out, _) = run_sandboxed(&profile, &cmd);
+            assert!(
+                !out.contains("MV:0") && !moved.exists(),
+                "{} moved: {out}",
+                root.display()
+            );
+            assert!(!root.join(planted).exists(), "{planted} planted: {out}");
+        };
+        attack(&project, ".git/hooks/pre-commit");
+        attack(&home.join(".m2"), "settings.xml");
+
+        let work = format!(
+            "export HOME='{h}' GIT_CONFIG_NOSYSTEM=1; cd '{p}' && git checkout -q -b feat && git -c user.name=t -c user.email=t@t \
+             commit -q --allow-empty -m two && git gc -q && \
+             git worktree add -q '{o}/wt' && echo GIT:OK",
+            h = home.display(),
+            p = project.display(),
+            o = other.display()
+        );
+        let (out, _) = run_sandboxed(&profile, &work);
+        fs::remove_file(&profile).ok();
+        assert!(out.contains("GIT:OK"), "git work must still succeed: {out}");
+    }
+
     /// OpenCode's managed tools in `~/.cache/opencode/bin` are executable,
     /// the rest of `~/.cache/opencode` is not, and `bin` stays unwritable
     /// (#537: the broad `~/.cache` exec deny used to win over the bin allow).

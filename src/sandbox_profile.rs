@@ -651,6 +651,30 @@ fn emit_sensitive_project_denies(
         sbpl!(sb);
     }
 
+    // The writable roots themselves (#923). A deny names a path under the
+    // root, so `mv <root> <other writable dir>/x && ln -s .../x <root>` moved
+    // every protected file out from under it: the grant covers the root's own
+    // literal, so the symlink can be created where the root was. There is no
+    // directory between a root and its direct-child denies to pin instead.
+    // Cost: the agent cannot rename or rmdir a granted root (`rm -rf` of its
+    // contents still works). `git gc`, `checkout` and `worktree add` never
+    // touch the root's own name.
+    sbpl!(
+        sb,
+        ";; Writable roots — no rename/unlink of the root itself"
+    );
+    for root in &roots {
+        sbpl!(sb, "(deny file-write-unlink (literal \"{root}\"))");
+    }
+    // The same for the writable home tool dirs that carry denies (#923).
+    // None of these tools removes or renames its own root: Gradle's cleanup,
+    // `dotnet nuget locals --clear` and Kotlin/Native work inside them.
+    // mise's data dir is left out: `mise implode` removes it (residual).
+    for dir in HOME_DENY_ROOTS {
+        sbpl!(sb, "(deny file-write-unlink (literal \"{home}/{dir}\"))");
+    }
+    sbpl!(sb);
+
     // Sensitive project files — deny read AND write of .env*, .pem, .key etc.
     // Read deny: prevents exfiltration of secrets via HTTPS.
     // Write deny: prevents deletion/overwrite of secrets (rm, truncate).
@@ -1417,7 +1441,9 @@ fn emit_host_persistence_denies(
     if !agent.host_persistence_denies().is_empty() {
         for d in agent
             .host_persistence_roots(agent_dirs)
-            .filter(|d| d.write && !d.path.is_file())
+            // A file grant is never pinned, even before it exists (#923
+            // review): Claude's first save of `~/.claude.json` is a rename.
+            .filter(|d| d.write && d.path.extension().is_none() && !d.path.is_file())
         {
             let p = d.path.display();
             sbpl!(sb, "(deny file-write-unlink (literal \"{p}\"))");
@@ -1427,6 +1453,17 @@ fn emit_host_persistence_denies(
         sbpl!(sb);
     }
 }
+
+/// Home tool dirs that hold write-denies and are granted writable, pinned
+/// against rename in [`emit_sensitive_project_denies`] (#923).
+const HOME_DENY_ROOTS: &[&str] = &[
+    "Library/Caches",
+    ".cache",
+    ".m2",
+    ".gradle",
+    ".nuget",
+    ".konan",
+];
 
 fn emit_git_persistence_denies(
     sb: &mut String,
@@ -4253,13 +4290,8 @@ mod tests {
                 );
                 assert!(p.contains(&rule), "missing rename pin {rule}");
             }
-            assert!(
-                !p.contains(&format!(
-                    "(deny file-write-unlink (literal \"{}\"))",
-                    local.display()
-                )),
-                "the grant's root itself is not pinned"
-            );
+            // The grant's root itself is pinned by the writable-root pin
+            // (#923), not by the shim rule.
         });
     }
 
@@ -4568,7 +4600,10 @@ mod tests {
                 .find(r#"(deny file-read* (subpath "/Users/test/.ssh"))"#)
                 .expect("the blanket ~/.ssh deny must still be emitted");
             assert!(
-                !p[deny..].contains(r#"(literal "/Users/test/.ssh")"#),
+                !p[deny..]
+                    .lines()
+                    .any(|l| l.starts_with("(allow")
+                        && l.contains(r#"(literal "/Users/test/.ssh")"#)),
                 "a directory grant must produce no post-deny re-allow:\n{p}"
             );
         }
@@ -6857,12 +6892,7 @@ mod tests {
 
         /// Every denied path in `profile` with a renameable ancestor, as
         /// `(denied path, renameable ancestor, rule text)`.
-        ///
-        /// `cross` lists ancestors that are also checked for a move to any
-        /// writable destination followed by a symlink back (#923). It is the
-        /// agent's config roots only: other writable roots (the project, tool
-        /// dirs) have the same shape and are not modelled here yet.
-        fn violations(profile: &str, cross: &[String]) -> Vec<(String, String, String)> {
+        fn violations(profile: &str) -> Vec<(String, String, String)> {
             let rules = parse_rules(profile);
             let mut out: Vec<(String, String, String)> = Vec::new();
             for rule in rules.iter().filter(|r| !r.allow && r.op == "file-write*") {
@@ -6880,7 +6910,11 @@ mod tests {
                     // recreated as a symlink: `mv ~/.copilot <project>/.x &&
                     // ln -s <project>/.x ~/.copilot` reaches the same files
                     // (#923). An agent dir's own grant covers its literal path.
-                    let elsewhere = cross.contains(&format!("/{}", segs[..depth].join("/")))
+                    // The system temp roots are root-owned: Unix permissions,
+                    // which this walk does not model, stop their rename.
+                    let anc = format!("/{}", segs[..depth].join("/"));
+                    let elsewhere = !["/private/var/folders", "/private/tmp"]
+                        .contains(&anc.as_str())
                         && allowed(&rules, &segs[..depth], CREATE)
                         && rules.iter().any(|r| {
                             r.allow && r.pat.tail == Tail::OrDeeper && {
@@ -6893,10 +6927,13 @@ mod tests {
                                         _ => None,
                                     })
                                     .collect();
-                                dest.len() == r.pat.segs.len() && {
-                                    dest.push(PROBE.to_string());
-                                    allowed(&rules, &dest, CREATE)
-                                }
+                                // Not into itself: rename(2) refuses that.
+                                dest.len() == r.pat.segs.len()
+                                    && !dest.starts_with(&segs[..depth])
+                                    && {
+                                        dest.push(PROBE.to_string());
+                                        allowed(&rules, &dest, CREATE)
+                                    }
                             }
                         });
                     if !allowed(&rules, &sibling, CREATE) && !elsewhere {
@@ -6955,6 +6992,30 @@ mod tests {
         /// `emit_host_persistence_denies`.
         const KNOWN_UNFIXED: &[(&str, &str, &str)] = &[];
 
+        /// Ancestors left unpinned on purpose, with the reason (#923). A move
+        /// of the whole dir plus a symlink back still escapes their denies.
+        ///
+        /// mise's data dir: `mise implode` removes it, so a pin would break
+        /// that command inside the sandbox.
+        ///
+        /// `~/.claude.json`: a file grant, so the entries joined onto it name
+        /// paths that cannot exist, and Claude saves it by rename.
+        const RESIDUAL_ROOTS: &[&str] =
+            &["/Users/test/.local/share/mise", "/Users/test/.claude.json"];
+
+        /// #923 review: a missing `~/.claude.json` is still a file grant and is
+        /// not pinned, while `~/.claude` is.
+        #[test]
+        fn agent_root_pin_skips_a_missing_file_grant() {
+            let profile = representative_profile(crate::agent::Agent::Claude);
+            assert!(!Path::new("/Users/test/.claude.json").exists());
+            assert!(
+                !profile
+                    .contains("(deny file-write-unlink (literal \"/Users/test/.claude.json\"))")
+            );
+            assert!(profile.contains("(deny file-write-unlink (literal \"/Users/test/.claude\"))"));
+        }
+
         /// The invariant, over every agent: the write-deny set is
         /// agent-conditional (the Copilot cache rules exist for Copilot only,
         /// and each agent contributes its own host-persistence denies), so one
@@ -6967,12 +7028,10 @@ mod tests {
                 for &agent in crate::agent::Agent::ALL {
                     let name = format!("{agent:?}");
                     let profile = representative_profile(agent);
-                    let dirs = agent.config_dirs(Path::new("/Users/test"));
-                    let cross: Vec<String> = agent
-                        .host_persistence_roots(&dirs)
-                        .map(|d| d.path.display().to_string())
-                        .collect();
-                    for (denied, ancestor, rule) in violations(&profile, &cross) {
+                    for (denied, ancestor, rule) in violations(&profile) {
+                        if RESIDUAL_ROOTS.contains(&ancestor.as_str()) {
+                            continue;
+                        }
                         let key = (name.clone(), denied.clone(), ancestor.clone());
                         if KNOWN_UNFIXED
                             .iter()
@@ -7025,7 +7084,7 @@ mod tests {
             // `$HOME` spellings sit under the writable temp dir here, which a
             // real project and home do not.
             let targets = [dots.join("ssh/.ssh"), dots.join("git/.gitconfig")];
-            let found: Vec<_> = violations(&profile, &[])
+            let found: Vec<_> = violations(&profile)
                 .into_iter()
                 .filter(|(denied, _, _)| targets.iter().any(|t| Path::new(denied).starts_with(t)))
                 .collect();
@@ -7041,15 +7100,15 @@ mod tests {
 (allow file-write* (subpath \"/w\"))
 (deny file-write* (subpath \"/w/keep/pkg\"))
 ";
-            let found = violations(profile, &[]);
+            let found = violations(profile);
             assert_eq!(found.len(), 1, "expected exactly one violation: {found:?}");
             assert_eq!(found[0].1, "/w/keep", "{found:?}");
 
             let pinned = format!("{profile}(deny file-write-unlink (literal \"/w/keep\"))\n");
             assert!(
-                violations(&pinned, &[]).is_empty(),
+                violations(&pinned).is_empty(),
                 "the pin must clear it: {:?}",
-                violations(&pinned, &[])
+                violations(&pinned)
             );
         }
     }
@@ -7111,18 +7170,6 @@ mod tests {
                 "nested named_root ancestor {pinned} must be pinned against rename:\n{profile}"
             );
         }
-        // Neither the outer project root, a sibling outside the project, nor an
-        // outer named root itself gets a nested-root unlink pin.
-        for not_pinned in [
-            "/projects/tilleggsstonader",
-            "/projects/other-repo",
-            "/work/outer",
-        ] {
-            let rule = format!("(deny file-write-unlink (literal \"{not_pinned}\"))");
-            assert!(
-                !profile.contains(&rule),
-                "{not_pinned} is not a nested root inside an outer writable tree:\n{profile}"
-            );
-        }
+        // Every named root itself is pinned too, by the writable-root pin (#923).
     }
 }

@@ -3642,10 +3642,23 @@ fn prepare_impl(
         let made = create_missing_home_config(config, inspect_only);
         if inspect_only && !made.is_empty() {
             use std::fmt::Write as _;
-            profile_text
-                .push_str("## Would create empty at launch (home Git config link targets, #553)\n");
-            for p in &made {
-                let _ = writeln!(profile_text, "  {}", p.display());
+            let (agents, git): (Vec<_>, Vec<_>) =
+                made.iter().partition(|p| p.ends_with(".copilot/agents"));
+            if !git.is_empty() {
+                profile_text.push_str(
+                    "## Would create empty at launch (home Git config link targets, #553)\n",
+                );
+                for p in &git {
+                    let _ = writeln!(profile_text, "  {}", p.display());
+                }
+            }
+            if !agents.is_empty() {
+                profile_text.push_str(
+                    "## Would create empty at launch (Copilot agents dir for its bind, #906)\n",
+                );
+                for p in &agents {
+                    let _ = writeln!(profile_text, "  {}", p.display());
+                }
             }
             profile_text.push('\n');
         } else if !made.is_empty() {
