@@ -10207,6 +10207,7 @@ allow_browser = false
 keychain_substitute = false
 allow_build_credentials = false
 allow_git_worktrees = false
+allow_git_config_write = true
 worktree_walk_max_dirs = 100000
 git_push_prevention = false
 
