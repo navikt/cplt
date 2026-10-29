@@ -369,7 +369,12 @@ Kept until a third server makes the shared model worth it (D15).
 ```
 
 Runs launch detection without starting a child. `credential_ok` uses the
-mechanism's status probe; no secret is printed.
+mechanism's status probe; no secret is printed. On Linux the probe runs in
+the server's own sandbox (bwrap, filtered bus, egress proxy), through a
+broker serving that one spec: the server can write `~/.config/nais`, and
+nais reads `config.yaml` there on every run, whose values set any flag
+(a planted `nais: false` turns the probe into a gcloud call). On macOS it
+still runs on the host.
 
 ### 5.6 Lifecycle
 
@@ -441,12 +446,25 @@ mechanism's status probe; no secret is printed.
   `XDG_CONFIG_HOME` (default `~/.config`; for `nais-keychain`,
   `~/.config/nais`, created 0700 if missing) bound writable, with
   `XDG_CONFIG_HOME` set to that resolved dir, and fresh `/proc` and
-  `/dev`. `/run`, and `XDG_RUNTIME_DIR` if it lives elsewhere, are private
+  `/dev`. `HOME` is an empty tmpfs, remounted read-only, with only the
+  mechanism's grants bound back: its `linux_write_dirs` and its
+  `linux_read_paths` (for `nais-keychain`, none: found by reading nais/cli
+  for `alpha mcp serve` and `auth print-access-token -n`, see
+  `src/mcp_broker/credential.rs`). That hides sockets in `HOME`, such as
+  Docker Desktop's `~/.docker/desktop/docker.sock`. A `HOME` under `/tmp`
+  or `/run` is private already; `HOME=/` refuses the child. cplt itself
+  (the relay) is bound in at `/run/cplt-relay`, since it may live in
+  `HOME`. `/run`, and `XDG_RUNTIME_DIR` if it lives elsewhere, are private
   tmpfs, which hides the system bus, a docker socket and the rest of the
-  host's runtime sockets. On NixOS `/run/current-system` is restored as a
+  host's runtime sockets, and so are `/nix/var/nix/daemon-socket` and
+  `/nix/var/nix/gc-socket` where they exist: the Nix daemon builds as a
+  trusted user (root) and fetches through fixed-output derivations, past
+  the egress proxy. bwrap 0.8 and later also gets `--disable-userns`; on
+  older bwrap (Ubuntu 22.04 ships 0.6) the child starts without it and
+  `cplt doctor` warns, as it adds kernel surface, not host privilege. On NixOS `/run/current-system` is restored as a
   symlink to its store path, so `/run/current-system/sw/bin` still
-  resolves. Unix sockets elsewhere under the read-only root (in `HOME`,
-  say) stay connectable.
+  resolves. Unix sockets elsewhere under the read-only root (under
+  `/var`, say) stay connectable.
 - **Session bus (Linux):** never the host bus itself. The unfiltered user
   bus reaches `systemd --user` (`StartTransientUnit`) and D-Bus
   activation, which is host exec. For a `keychain` mechanism the broker
@@ -468,8 +486,11 @@ mechanism's status probe; no secret is printed.
   doctor` warns and `--fix` installs it), the child gets no bus and no
   `DBUS_SESSION_BUS_ADDRESS`, and nais reports it is not logged in. Other
   mechanisms never get a bus. Residual: anything the Secret Service
-  serves the user, every item of the login collection included, is
-  reachable through that one name.
+  serves the user is reachable through that one name. With gnome-keyring
+  that is every unlocked item in the login collection (other apps'
+  passwords and tokens), plus gnome-keyring's internal interface on the
+  same name; with KeePassXC, every entry in the groups its Secret Service
+  integration exposes.
 - The child is trusted code acting on attacker-chosen arguments.
 - **Stderr:** to the broker log (`--proxy-log`, and the terminal at
   `--proxy-log-level all`), at most 64 lines of 512 bytes per child, every
