@@ -8909,6 +8909,12 @@ fn kernel_release() -> String {
 /// Degrades rather than errors: when the launch cannot even resolve (bad
 /// config, unsafe root), that is the one blocking finding and the header
 /// still prints.
+/// Whether doctor should warn that `bin` is missing from the launch PATH.
+/// Exact strings, as pnpm's rc block compares them: `bin/` is not `bin`.
+fn pnpm_bin_missing_from_path(launch_path: &[PathBuf], bin: &Path, shadowed: bool) -> bool {
+    !shadowed && !launch_path.iter().any(|p| p.as_os_str() == bin.as_os_str())
+}
+
 fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     use cplt::doctor::{self, Finding, Level};
 
@@ -8966,7 +8972,7 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
         active_agent,
         unapproved_proposals,
         repo_trusted: _,
-        launch_dir: _,
+        launch_dir,
         configured_quiet,
     } = ctx;
     // `doctor` reports the policy a launch would build, so it has to carry the
@@ -9188,14 +9194,18 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     doctor_exec.dedup();
     // pnpm's rc block prepends `$PNPM_HOME/bin` when it is missing from PATH,
     // and its launcher then runs the store binary instead of the shadow.
+    // A shadow, from the PATH pnpm or a pinned one, gets `$PNPM_HOME/bin`
+    // appended at launch, so only an unshadowed launch needs it on PATH.
+    let pnpm_will_shadow = doctor_pnpm_shadowed
+        || (doctor_pnpm.is_some() && scratch::pinned_pnpm_shadow_applies(&home_dir, &launch_dir));
     let launch_path: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
-    for root in scratch::pnpm_home_roots(&home_dir) {
+    let env_home = std::env::var_os("HOME").map(PathBuf::from);
+    for root in scratch::pnpm_path_roots(&home_dir, env_home.as_deref()) {
         let bin = root.join("bin");
         if scratch::pnpm_cmd_shim_target(&home_dir, &bin.join("pnpm")).is_some()
-            && !doctor_pnpm_shadowed
-            && !launch_path.contains(&bin)
+            && pnpm_bin_missing_from_path(&launch_path, &bin, pnpm_will_shadow)
         {
             findings.push(Finding::warning(
                 format!(
@@ -12947,6 +12957,23 @@ fn mcp_status_clients(
         None | Some(agent::Agent::Copilot) => &["copilot"],
         Some(agent::Agent::OpenCode) if opencode => &["opencode"],
         _ => &[],
+    }
+}
+
+#[cfg(test)]
+mod pnpm_doctor_tests {
+    use super::*;
+
+    #[test]
+    fn pnpm_bin_warning_needs_exact_entry_and_no_shadow() {
+        let bin = PathBuf::from("/h/Library/pnpm/bin");
+        let on = vec![PathBuf::from("/usr/bin"), bin.clone()];
+        let slashed = vec![PathBuf::from("/h/Library/pnpm/bin/")];
+        assert!(!pnpm_bin_missing_from_path(&on, &bin, false));
+        assert!(pnpm_bin_missing_from_path(&slashed, &bin, false));
+        assert!(pnpm_bin_missing_from_path(&[], &bin, false));
+        // A shadow (PATH or pinned, #890) gets the dir appended at launch.
+        assert!(!pnpm_bin_missing_from_path(&[], &bin, true));
     }
 }
 
