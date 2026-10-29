@@ -734,9 +734,10 @@ int main(int argc, char **argv) {
         fs::set_permissions(&standalone, fs::Permissions::from_mode(0o755))
             .expect("make standalone executable");
 
-        let shadow = cplt::scratch::PnpmShadowDir::create_if_needed(home.path(), &source)
-            .expect("create pnpm shadow")
-            .expect("hardlinked pnpm must use a shadow");
+        let shadow =
+            cplt::scratch::PnpmShadowDir::create_if_needed(home.path(), &source, home.path())
+                .expect("create pnpm shadow")
+                .expect("hardlinked pnpm must use a shadow");
         fs::remove_dir_all(&package_manager_store)
             .expect("reset package-manager-store for first-use sandbox test");
         let extra_exec = vec![shadow.path().to_path_buf(), standalone.clone()];

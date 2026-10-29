@@ -80,12 +80,24 @@ pub struct PnpmShadowDir {
 
 impl PnpmShadowDir {
     /// Copy `pnpm` when it shares an inode with a pnpm store hardlink.
-    pub fn create_if_needed(home_dir: &Path, pnpm: &Path) -> Result<Option<Self>, String> {
+    ///
+    /// When `launch_dir` pins another exact pnpm version that is already in
+    /// the store, shadow that binary instead (#890). pnpm 11 would otherwise
+    /// switch by spawning it straight from the non-executable store.
+    pub fn create_if_needed(
+        home_dir: &Path,
+        pnpm: &Path,
+        launch_dir: &Path,
+    ) -> Result<Option<Self>, String> {
         ensure_pnpm_package_manager_stores(home_dir)?;
         // pnpm 11 puts a `/bin/sh` launcher on PATH that execs the real
         // binary, a symlink into the store. Shadow the binary; `source`
         // stays the PATH entry so direct launches still map to the shadow.
-        let Some(source) = pnpm_shadow_source(home_dir, pnpm)? else {
+        let pinned = pinned_pnpm_binary(home_dir, launch_dir)
+            .and_then(|binary| pnpm_shadow_source(home_dir, &binary).ok().flatten());
+        let Some(source) =
+            pinned.map_or_else(|| pnpm_shadow_source(home_dir, pnpm), |s| Ok(Some(s)))?
+        else {
             return Ok(None);
         };
         use std::os::unix::fs::MetadataExt;
@@ -351,6 +363,48 @@ fn open_no_symlinks(path: &Path) -> std::io::Result<std::fs::File> {
             .custom_flags(libc::O_NOFOLLOW_ANY | libc::O_NONBLOCK)
             .open(path)
     }
+}
+
+/// The store binary of the exact pnpm version pinned by the nearest
+/// `package.json` with a `packageManager` field, if pnpm already put it in
+/// the store. pnpm 11 switches to that binary in place, from
+/// `store/v*/links/@pnpm/exe/<version>/<hash>/node_modules/@pnpm/exe/pnpm`.
+pub fn pinned_pnpm_binary(home_dir: &Path, launch_dir: &Path) -> Option<PathBuf> {
+    let pin = launch_dir.ancestors().find_map(|dir| {
+        let manifest = std::fs::read(dir.join("package.json")).ok()?;
+        let manifest: serde_json::Value = serde_json::from_slice(&manifest).ok()?;
+        Some(manifest.get("packageManager")?.as_str()?.to_owned())
+    })?;
+    let version = pin.strip_prefix("pnpm@")?.split('+').next()?;
+    // An exact version is one path component, never `..` or a separator.
+    if !version.starts_with(|c: char| c.is_ascii_digit())
+        || !version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+    {
+        return None;
+    }
+    for root in pnpm_home_roots(home_dir) {
+        let Ok(stores) = std::fs::read_dir(root.join("store")) else {
+            continue;
+        };
+        for store in stores.flatten() {
+            let Ok(hashes) = std::fs::read_dir(store.path().join("links/@pnpm/exe").join(version))
+            else {
+                continue;
+            };
+            let mut hashes: Vec<PathBuf> = hashes.flatten().map(|hash| hash.path()).collect();
+            hashes.sort();
+            if let Some(binary) = hashes
+                .into_iter()
+                .map(|hash| hash.join("node_modules/@pnpm/exe/pnpm"))
+                .find(|binary| binary.is_file())
+            {
+                return Some(binary);
+            }
+        }
+    }
+    None
 }
 
 /// The binary a pnpm cmd-shim launcher execs, when it lies in a pnpm home.
@@ -1688,7 +1742,7 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let shadow = PnpmShadowDir::create_if_needed(home.path(), &launcher)
+        let shadow = PnpmShadowDir::create_if_needed(home.path(), &launcher, home.path())
             .unwrap()
             .expect("a launcher into the store needs a shadow");
         assert_eq!(std::fs::read(shadow.binary()).unwrap(), b"\xcf\xfa\xed\xfe");
@@ -1701,6 +1755,56 @@ mod tests {
             exe.join("dist/pnpm.mjs").exists(),
             "cleanup must not follow dist"
         );
+    }
+
+    #[test]
+    fn pnpm_shadow_uses_the_version_the_project_pins() {
+        // #890: pnpm 11 switches to a pinned version by spawning it from the
+        // store. Shadow that version so no switch is needed.
+        let home = tempfile::tempdir().unwrap();
+        let links = home.path().join("Library/pnpm/store/v11/links");
+        let global = links.join("@pnpm/exe/11.26.0/aaaa/node_modules/@pnpm/exe");
+        let pinned = links.join("@pnpm/exe/11.25.0/bbbb/node_modules/@pnpm/exe");
+        for dir in [&global, &pinned.join("dist")] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(global.join("pnpm"), b"\xcf\xfa\xed\xfeglobal").unwrap();
+        std::fs::write(pinned.join("pnpm"), b"\xcf\xfa\xed\xfepinned").unwrap();
+        let project = home.path().join("project");
+        std::fs::create_dir_all(project.join("sub")).unwrap();
+        let shadow_bytes = |pin: &str| {
+            std::fs::write(
+                project.join("package.json"),
+                format!(r#"{{"packageManager":"{pin}"}}"#),
+            )
+            .unwrap();
+            let shadow = PnpmShadowDir::create_if_needed(
+                home.path(),
+                &global.join("pnpm"),
+                &project.join("sub"),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(shadow.shadows(&global.join("pnpm")));
+            std::fs::read(shadow.binary()).unwrap()
+        };
+
+        assert_eq!(
+            shadow_bytes("pnpm@11.25.0+sha512.abc"),
+            b"\xcf\xfa\xed\xfepinned"
+        );
+        // Not in the store, a range, another tool, or a path: keep PATH pnpm.
+        for pin in [
+            "pnpm@11.24.0",
+            "pnpm@^11",
+            "yarn@11.25.0",
+            "pnpm@../../../x",
+        ] {
+            assert_eq!(shadow_bytes(pin), b"\xcf\xfa\xed\xfeglobal", "{pin}");
+        }
+        // Never copy a pinned file that is not a binary.
+        std::fs::write(pinned.join("pnpm"), b"#!/bin/sh\n").unwrap();
+        assert_eq!(shadow_bytes("pnpm@11.25.0"), b"\xcf\xfa\xed\xfeglobal");
     }
 
     #[test]
@@ -1719,7 +1823,7 @@ mod tests {
         std::fs::set_permissions(&pnpm, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::hard_link(&pnpm, links.join("pnpm")).unwrap();
 
-        let shadow = PnpmShadowDir::create_if_needed(home.path(), &pnpm)
+        let shadow = PnpmShadowDir::create_if_needed(home.path(), &pnpm, home.path())
             .unwrap()
             .expect("hardlinked pnpm needs a shadow");
         let shadow_path = shadow.binary();
@@ -1756,7 +1860,7 @@ mod tests {
         std::fs::set_permissions(&pnpm, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         assert!(
-            PnpmShadowDir::create_if_needed(home.path(), &pnpm)
+            PnpmShadowDir::create_if_needed(home.path(), &pnpm, home.path())
                 .unwrap()
                 .is_some()
         );
@@ -1809,7 +1913,7 @@ mod tests {
         std::fs::write(&pnpm, b"-----BEGIN OPENSSH PRIVATE KEY-----\n").unwrap();
 
         assert!(
-            PnpmShadowDir::create_if_needed(home.path(), &pnpm)
+            PnpmShadowDir::create_if_needed(home.path(), &pnpm, home.path())
                 .unwrap()
                 .is_none(),
             "a non-binary store file must never be copied into a shadow"
@@ -1855,7 +1959,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            PnpmShadowDir::create_if_needed(home.path(), &launcher)
+            PnpmShadowDir::create_if_needed(home.path(), &launcher, home.path())
                 .expect("the launch must proceed")
                 .is_none()
         );
@@ -1871,7 +1975,7 @@ mod tests {
         std::fs::set_permissions(&pnpm, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         assert!(
-            PnpmShadowDir::create_if_needed(home.path(), &pnpm)
+            PnpmShadowDir::create_if_needed(home.path(), &pnpm, home.path())
                 .unwrap()
                 .is_none()
         );
@@ -1894,7 +1998,7 @@ mod tests {
         std::fs::set_permissions(&pnpm, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::hard_link(&pnpm, links.join("pnpm")).unwrap();
 
-        let err = PnpmShadowDir::create_if_needed(home.path(), &pnpm)
+        let err = PnpmShadowDir::create_if_needed(home.path(), &pnpm, home.path())
             .expect_err("a symlinked shadow base must be rejected");
         assert!(err.contains("is a symlink"));
         assert!(
