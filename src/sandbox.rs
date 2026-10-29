@@ -271,6 +271,9 @@ pub struct SandboxConfig<'a> {
     /// in `agent_dirs` before this config is built; the flag is here so the
     /// Linux launch can warn about what Landlock unions back in.
     pub deny_copilot_dir_exec: bool,
+    /// `sandbox.allow_copilot_host_persistence` (#906): keep
+    /// [`crate::agent::COPILOT_PERSISTENCE_OPT_OUT`] writable.
+    pub allow_copilot_host_persistence: bool,
     /// Allow JVM Attach API unix sockets in /tmp (.java_pid* pattern only).
     pub allow_jvm_attach: bool,
     /// Allow MSBuild worker-node unix sockets in /tmp (MSBuild<pid> pattern only).
@@ -308,6 +311,10 @@ pub struct SandboxConfig<'a> {
     /// - `Some(false)`: Never use bwrap (Landlock+seccomp only)
     /// - `None`: Auto-detect and use if available (graceful degradation)
     pub use_bubblewrap: Option<bool>,
+    /// `sandbox.allow_git_config_write` (#386). Linux only: `false` binds
+    /// every `<gitdir>/config` read-only and refuses to launch without
+    /// bubblewrap. macOS denies the write either way.
+    pub allow_git_config_write: bool,
 }
 
 /// A validated, platform-specific sandbox ready for execution.
@@ -2002,7 +2009,7 @@ pub fn gh_configured() -> bool {
 /// summary to say why the grant stayed.
 pub static ACCOUNT_MISMATCH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-const COPILOT_CONFIG_LIMIT: u64 = 64 * 1024;
+pub(crate) const COPILOT_CONFIG_LIMIT: u64 = 64 * 1024;
 
 /// Selected Copilot account from `~/.copilot/config.json`, shaped `<host>:<login>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3008,6 +3015,16 @@ fn pin_paths(
     // walk-aroundable by `mv .git g2 && mkdir .git`.
     write_roots.extend(nested_repos.iter().map(PathBuf::as_path));
     let mut pins = bubblewrap::rename_pin_paths(&write_roots, &git_dirs);
+    // #386: the ancestors of the `config.worktree` binds in `ro_protect_paths`.
+    if !config.allow_git_config_write {
+        for dir in &git_dirs {
+            let linked = linked_worktree_dirs(dir);
+            if !linked.is_empty() {
+                pins.push(dir.join("worktrees"));
+            }
+            pins.extend(linked);
+        }
+    }
     // GHSA-8qmv-wxp3-526v, Linux half. A read-only bind pins a path's content,
     // not its name: `~/.cache/copilot` sits inside the writable `~/.cache`
     // grant, so moving it aside left `pkg` writable under a name no bind
@@ -3070,6 +3087,26 @@ fn pin_paths(
     pins
 }
 
+/// The refusal when `.git/config` must be read-only but bubblewrap does not
+/// wrap the run (#386).
+#[cfg(target_os = "linux")]
+const GIT_CONFIG_NEEDS_BWRAP: &str = "sandbox.allow_git_config_write = false needs \
+     Bubblewrap to make .git/config read-only, and Bubblewrap is not in use. Run \
+     `cplt doctor` to see why, or run `cplt config set sandbox.allow_git_config_write \
+     true` to let the agent write .git/config.";
+
+/// `<gitdir>/worktrees/<name>` for each linked worktree (#386). Its
+/// `config.worktree` is bound read-only, and both it and `worktrees/` are
+/// rename-pinned so `mv .git/worktrees/wt …` cannot walk around the bind.
+/// Kept here rather than as a `PROTECTED_IN_GITDIR` row because it applies
+/// only with `sandbox.allow_git_config_write = false`; macOS already denies it.
+#[cfg(target_os = "linux")]
+fn linked_worktree_dirs(git_dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(git_dir.join("worktrees"))
+        .map(|it| it.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default()
+}
+
 #[cfg(target_os = "linux")]
 fn ro_protect_paths(
     config: &SandboxConfig,
@@ -3090,6 +3127,36 @@ fn ro_protect_paths(
     // with an any-depth regex, and bubblewrap needs the paths named.
     write_roots.extend(nested_repos.iter().map(PathBuf::as_path));
     let mut ro_protect = bubblewrap::git_persistence_paths(&write_roots, &git_dirs);
+    // #386: `.git/config` read-only, as on macOS, unless the user opted in.
+    // git writes `config.lock` beside it and renames it over; the rename onto
+    // a bind fails with EBUSY and git removes the lock itself, so no stale
+    // lock is left. Missing paths are skipped like every other entry.
+    //
+    // Also bound: a `.git` gitdir pointer file (a worktree or `--separate-git-dir`
+    // checkout), which would otherwise repoint the repository at a gitdir the
+    // agent wrote, and every `config.worktree`, which git reads with
+    // `extensions.worktreeConfig`. Only files that exist at launch are covered.
+    if !config.allow_git_config_write {
+        for root in &write_roots {
+            let dot_git = root.join(".git");
+            if dot_git.is_file() {
+                ro_protect.push(dot_git.clone());
+            }
+            ro_protect.push(dot_git.join("config"));
+            ro_protect.push(dot_git.join("config.worktree"));
+        }
+        for dir in &git_dirs {
+            ro_protect.push(dir.join("config"));
+            ro_protect.push(dir.join("config.worktree"));
+            ro_protect.extend(
+                linked_worktree_dirs(dir)
+                    .into_iter()
+                    .map(|w| w.join("config.worktree")),
+            );
+        }
+        ro_protect.sort();
+        ro_protect.dedup();
+    }
 
     // #237: same class, different tree — the agent's own config dir is granted
     // writable, and some files in it auto-execute on the host the next time the
@@ -3108,7 +3175,11 @@ fn ro_protect_paths(
     // empty file, which changes what the agent reads at startup. That is not a
     // change to make untested, and this is a macOS host. Documented in
     // SECURITY.md instead of half-done.
-    ro_protect.extend(config.agent.host_persistence_paths(config.agent_dirs));
+    ro_protect.extend(
+        config
+            .agent
+            .host_persistence_paths_with(config.agent_dirs, config.allow_copilot_host_persistence),
+    );
 
     // H-13/H-05: an agent's exec-only grant that sits inside a writable tree.
     // macOS denies the write for exactly these dirs in
@@ -3218,6 +3289,20 @@ fn unmasked_credential_warnings(
 #[cfg(target_os = "linux")]
 fn create_missing_home_config(config: &SandboxConfig, inspect_only: bool) -> Vec<PathBuf> {
     let mut made = Vec::new();
+    // #906: an empty `~/.copilot/agents`, so its read-only bind holds on a
+    // fresh install. Not `policy.precreate_dirs`: that runs in `precompute()`,
+    // after the overlay set is built. `permissions-config.json` is not
+    // created (an empty file is not valid JSON), so that deny stays nominal
+    // until Copilot first writes it.
+    let agents = config.home_dir.join(".copilot/agents");
+    if config.agent == crate::agent::Agent::Copilot
+        && !config.allow_copilot_host_persistence
+        && config.home_dir.join(".copilot").is_dir()
+        && std::fs::symlink_metadata(&agents).is_err()
+        && (inspect_only || std::fs::create_dir(&agents).is_ok())
+    {
+        made.push(agents);
+    }
     for planned in plan_missing_home_config_targets(config) {
         let result = planned.and_then(|(dir, file)| {
             if inspect_only {
@@ -3235,8 +3320,9 @@ fn create_missing_home_config(config: &SandboxConfig, inspect_only: bool) -> Vec
             )),
         }
     }
-    if !inspect_only && !made.is_empty() {
-        let list: Vec<String> = made.iter().map(|p| p.display().to_string()).collect();
+    let git_made = made.iter().filter(|p| !p.ends_with(".copilot/agents"));
+    if !inspect_only && git_made.clone().next().is_some() {
+        let list: Vec<String> = git_made.map(|p| p.display().to_string()).collect();
         ui::info(&format!(
             "Created empty {} so Bubblewrap can bind it read-only: git or yarn on the \
              host reads it through your home config symlink, and it sits in a writable \
@@ -3656,6 +3742,15 @@ fn prepare_impl(
         )?;
     }
 
+    // #386: only bubblewrap can make `.git/config` read-only. Strict, so a
+    // spawn-time bwrap failure stops the run instead of falling back.
+    if !config.allow_git_config_write {
+        let Some(w) = bwrap_wrapper.as_mut() else {
+            return Err(GIT_CONFIG_NEEDS_BWRAP.to_string());
+        };
+        w.strict = true;
+    }
+
     // #553: a home Git config file a link points at inside a writable tree,
     // but which does not exist yet, gets no bind, so the agent could create
     // it. Only once Bubblewrap has passed its probe and will wrap this run:
@@ -3668,10 +3763,23 @@ fn prepare_impl(
         let made = create_missing_home_config(config, inspect_only);
         if inspect_only && !made.is_empty() {
             use std::fmt::Write as _;
-            profile_text
-                .push_str("## Would create empty at launch (home Git config link targets, #553)\n");
-            for p in &made {
-                let _ = writeln!(profile_text, "  {}", p.display());
+            let (agents, git): (Vec<_>, Vec<_>) =
+                made.iter().partition(|p| p.ends_with(".copilot/agents"));
+            if !git.is_empty() {
+                profile_text.push_str(
+                    "## Would create empty at launch (home Git config link targets, #553)\n",
+                );
+                for p in &git {
+                    let _ = writeln!(profile_text, "  {}", p.display());
+                }
+            }
+            if !agents.is_empty() {
+                profile_text.push_str(
+                    "## Would create empty at launch (Copilot agents dir for its bind, #906)\n",
+                );
+                for p in &agents {
+                    let _ = writeln!(profile_text, "  {}", p.display());
+                }
             }
             profile_text.push('\n');
         } else if !made.is_empty() {
@@ -4370,6 +4478,7 @@ mod tests {
             deny_key_files_by_extension: false,
             protect_pnpm_config: false,
             deny_copilot_dir_exec: false,
+            allow_copilot_host_persistence: false,
             allow_jvm_attach: false,
             allow_msbuild: false,
             allow_docker: false,
@@ -4381,6 +4490,7 @@ mod tests {
             allow_cache_exec_any: false,
             allow_browser: false,
             use_bubblewrap: None,
+            allow_git_config_write: true,
         }
     }
 
@@ -4650,6 +4760,7 @@ mod tests {
         let claude = home.path().join(".claude");
         std::fs::create_dir(&claude).unwrap();
         let dirs = [AgentDir {
+            is_file: false,
             path: claude.clone(),
             write: true,
             map_exec: false,
@@ -4683,6 +4794,7 @@ mod tests {
         // root grant and the plain-file rule stay, the index still on it.
         let home = Path::new("/h");
         let hook = AgentDir {
+            is_file: false,
             path: PathBuf::from("/x/gate.py"),
             write: false,
             map_exec: false,
@@ -4692,6 +4804,7 @@ mod tests {
             via: vec![],
         };
         let root = AgentDir {
+            is_file: false,
             path: home.join(".claude"),
             write: true,
             ..hook.clone()
@@ -4761,6 +4874,7 @@ mod tests {
     fn exec_grant_over_an_agent_data_dir_is_refused() {
         let home = Path::new("/fake/test");
         let agent_dirs = [AgentDir {
+            is_file: false,
             path: home.join(".local/share/opencode"),
             write: true,
             map_exec: false,
@@ -5845,6 +5959,7 @@ mod tests {
     fn exec_grant_over_a_writable_agent_file_is_refused() {
         let home = Path::new("/fake/test");
         let agent_dirs = [AgentDir {
+            is_file: false,
             path: home.join(".config/opencode"),
             write: false,
             map_exec: false,

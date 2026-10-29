@@ -681,6 +681,7 @@ fn opencode_extra_config_grants(
             continue;
         }
         out.push(AgentDir {
+            is_file: real.is_file(),
             path: real,
             write: false,
             map_exec: false,
@@ -833,6 +834,7 @@ fn plugin_dir_grants(dirs: Vec<PathBuf>, home: &Path, writable: &[PathBuf]) -> V
         }
         // ponytail: native `.node` addons need file-map-executable, which is not granted.
         out.push(AgentDir {
+            is_file: false,
             path: real,
             write: false,
             map_exec: false,
@@ -1001,6 +1003,7 @@ fn script_grants(
             continue;
         }
         out.push(AgentDir {
+            is_file: false,
             path: real,
             write: false,
             map_exec: false,
@@ -1826,7 +1829,21 @@ impl Agent {
             // session. Copilot's in-session authoring surface is `agents/` and
             // `instructions/`, and both stay writable. Claude Code's is
             // `skills/` itself, which is why that default is still open.
+            //
+            // #906 corrected that for `agents/`: an agent's frontmatter
+            // `mcp-servers` command runs when the agent is selected (observed
+            // on CLI 1.0.104), so a planted `agents/*.agent.md` is a host
+            // command, not prompt content. `permissions-config.json` holds
+            // saved tool approvals (`commands` with a `:*` prefix, `write`)
+            // that skip prompts in later host sessions. Both are
+            // [`COPILOT_PERSISTENCE_OPT_OUT`]: denied for new configs, and kept
+            // writable while `sandbox.allow_copilot_host_persistence` is on
+            // (an unset key in an existing config). `config.json` stays
+            // writable: it holds `firstLaunchAt`, UI flags and login state, so
+            // the launch compares `trustedFolders` before and after instead.
             Agent::Copilot => &[
+                "agents",
+                "permissions-config.json",
                 "settings.json",
                 "hooks",
                 "mcp-config.json",
@@ -1922,15 +1939,41 @@ impl Agent {
     /// so joining them onto a subdirectory only produces paths that never
     /// exist (`~/.pi/agent/sessions/npm`).
     pub fn host_persistence_paths(&self, dirs: &[AgentDir]) -> Vec<PathBuf> {
-        dirs.iter()
-            .filter(|d| {
-                !dirs
-                    .iter()
-                    .any(|other| other.path != d.path && d.path.starts_with(&other.path))
-            })
+        self.host_persistence_paths_with(dirs, false)
+    }
+
+    /// [`Agent::host_persistence_paths`], minus [`COPILOT_PERSISTENCE_OPT_OUT`]
+    /// when `sandbox.allow_copilot_host_persistence` is on (#906). This is what
+    /// both backends call.
+    /// The grants [`Agent::host_persistence_denies`] are joined onto: every
+    /// top-level dir, meaning one not nested inside another of the agent's
+    /// grants.
+    pub fn host_persistence_roots<'a>(
+        &self,
+        dirs: &'a [AgentDir],
+    ) -> impl Iterator<Item = &'a AgentDir> {
+        dirs.iter().filter(move |d| {
+            !dirs
+                .iter()
+                .any(|other| other.path != d.path && d.path.starts_with(&other.path))
+        })
+    }
+
+    pub fn host_persistence_paths_with(
+        &self,
+        dirs: &[AgentDir],
+        allow_copilot_persistence: bool,
+    ) -> Vec<PathBuf> {
+        let skip: &[&str] = if allow_copilot_persistence && *self == Agent::Copilot {
+            COPILOT_PERSISTENCE_OPT_OUT
+        } else {
+            &[]
+        };
+        self.host_persistence_roots(dirs)
             .flat_map(|d| {
                 self.host_persistence_denies()
                     .iter()
+                    .filter(|sub| !skip.contains(sub))
                     .map(|sub| d.path.join(sub))
             })
             .collect()
@@ -2074,6 +2117,7 @@ impl Agent {
     /// vacuously. Renaming `fish` to `fishX` here left the whole suite green.
     fn shell_config_dirs(shell_name: &str, config_base: &Path, data_base: &Path) -> Vec<AgentDir> {
         let writable = |path: PathBuf| AgentDir {
+            is_file: false,
             path,
             write: true,
             map_exec: false,
@@ -2127,6 +2171,7 @@ impl Agent {
                 dirs.insert(
                     0,
                     AgentDir {
+                        is_file: false,
                         path: root,
                         write: true,
                         map_exec: true,
@@ -2198,6 +2243,7 @@ impl Agent {
                     scripts.insert(
                         0,
                         AgentDir {
+                            is_file: false,
                             path: custom,
                             write: false,
                             map_exec: false,
@@ -2211,6 +2257,7 @@ impl Agent {
 
                 let mut dirs = vec![
                     AgentDir {
+                        is_file: false,
                         path: config_dir,
                         write: false,
                         map_exec: false,
@@ -2221,6 +2268,7 @@ impl Agent {
                         via: vec![],
                     },
                     AgentDir {
+                        is_file: false,
                         path: data_dir,
                         write: true,
                         map_exec: false,
@@ -2230,6 +2278,7 @@ impl Agent {
                         via: vec![],
                     },
                     AgentDir {
+                        is_file: false,
                         path: state_dir,
                         write: true,
                         map_exec: false,
@@ -2239,6 +2288,7 @@ impl Agent {
                         via: vec![],
                     },
                     AgentDir {
+                        is_file: false,
                         path: cache_dir.clone(),
                         write: true,
                         map_exec: false,
@@ -2248,6 +2298,7 @@ impl Agent {
                         via: vec![],
                     },
                     AgentDir {
+                        is_file: false,
                         // OpenCode downloads managed tool binaries (rg, fd, etc.) here
                         path: cache_dir.join("bin"),
                         write: false,
@@ -2266,6 +2317,7 @@ impl Agent {
                 // and runtime/session data under ~/.gemini/antigravity-cli.
                 vec![
                     AgentDir {
+                        is_file: false,
                         path: home.join(".gemini/config"),
                         write: true,
                         map_exec: false,
@@ -2275,6 +2327,7 @@ impl Agent {
                         via: vec![],
                     },
                     AgentDir {
+                        is_file: false,
                         path: home.join(".gemini/antigravity-cli"),
                         write: true,
                         map_exec: false,
@@ -2326,6 +2379,7 @@ impl Agent {
                 // docs/known-impacts.md.
                 let agent = home.join(".pi/agent");
                 let writable = |path: PathBuf| AgentDir {
+                    is_file: false,
                     path,
                     write: true,
                     map_exec: false,
@@ -2336,6 +2390,7 @@ impl Agent {
                 };
                 vec![
                     AgentDir {
+                        is_file: false,
                         path: agent.clone(),
                         write: false,
                         map_exec: false,
@@ -2383,6 +2438,7 @@ impl Agent {
                     writable(agent.join("tools")),
                     writable(agent.join("tmp")),
                     AgentDir {
+                        is_file: false,
                         path: agent.join("bin"),
                         write: false,
                         map_exec: false,
@@ -2408,6 +2464,7 @@ impl Agent {
                     dirs.insert(
                         0,
                         AgentDir {
+                            is_file: false,
                             path: root,
                             write: true,
                             map_exec: false,
@@ -2426,6 +2483,7 @@ impl Agent {
                 // (Seatbelt subpath / Landlock PathBeneath both match a file).
                 let mut dirs = vec![
                     AgentDir {
+                        is_file: false,
                         path: home.join(".claude"),
                         write: true,
                         map_exec: false,
@@ -2435,6 +2493,7 @@ impl Agent {
                         via: vec![],
                     },
                     AgentDir {
+                        is_file: true,
                         path: home.join(".claude.json"),
                         write: true,
                         map_exec: false,
@@ -2502,6 +2561,7 @@ impl Agent {
                     crate::opencode_v2::xdg_base("XDG_STATE_HOME", home, ".local/state");
                 vec![
                     AgentDir {
+                        is_file: false,
                         path: config_base.join("goose"),
                         write: false,
                         map_exec: false,
@@ -2511,6 +2571,7 @@ impl Agent {
                         via: vec![],
                     },
                     AgentDir {
+                        is_file: false,
                         path: data_base.join("goose"),
                         write: true,
                         map_exec: false,
@@ -2520,6 +2581,7 @@ impl Agent {
                         via: vec![],
                     },
                     AgentDir {
+                        is_file: false,
                         path: state_base.join("goose"),
                         write: true,
                         map_exec: false,
@@ -2546,6 +2608,7 @@ impl Agent {
                 // writable set, with no error naming the cause ("No silent
                 // grants"). Mirrors `CLAUDE_CONFIG_DIR` above.
                 vec![AgentDir {
+                    is_file: false,
                     path: dsh_home(home),
                     write: true,
                     map_exec: false,
@@ -3118,6 +3181,10 @@ pub struct AgentDir {
     /// dropped when any of these sits in a writable tree, since the agent could
     /// swap that link for one to any file it wants read. Empty otherwise.
     pub via: Vec<PathBuf>,
+    /// The grant names a file (`~/.claude.json`), not a directory, whether
+    /// or not it exists yet. A file grant is never pinned against rename:
+    /// the agent saves it by an atomic rename (#923).
+    pub is_file: bool,
 }
 
 /// The root `dsh` will resolve for its Harness home, mirroring the harness's
@@ -3154,6 +3221,34 @@ fn dsh_home(home: &Path) -> PathBuf {
     } else {
         std::env::current_dir().map_or(expanded.clone(), |cwd| cwd.join(&expanded))
     }
+}
+
+/// The Copilot [`Agent::host_persistence_denies`] entries that
+/// `sandbox.allow_copilot_host_persistence` keeps writable (#906).
+pub const COPILOT_PERSISTENCE_OPT_OUT: &[&str] = &["agents", "permissions-config.json"];
+
+/// The `trustedFolders` entries of Copilot's `config.json`, or empty when the
+/// file is missing or not JSON. The launch reads it before and after a session
+/// and warns about new entries (#906): the file also holds login and UI state,
+/// so it is not denied.
+#[must_use]
+pub fn copilot_trusted_folders(home: &Path) -> Vec<String> {
+    // Agent-writable: no FIFO hang, symlink follow or unbounded read.
+    crate::untrusted::read_untrusted(
+        &home.join(".copilot/config.json"),
+        crate::sandbox::COPILOT_CONFIG_LIMIT,
+    )
+    .ok()
+    .flatten()
+    .and_then(|s| serde_json::from_str::<serde_json::Value>(&strip_jsonc(&s)).ok())
+    .and_then(|v| {
+        v.get("trustedFolders")?.as_array().map(|a| {
+            a.iter()
+                .filter_map(|e| e.as_str().map(str::to_string))
+                .collect()
+        })
+    })
+    .unwrap_or_default()
 }
 
 /// `sandbox.deny_copilot_dir_exec` (#324): withdraw execve from `~/.copilot`.
@@ -4206,6 +4301,7 @@ mod tests {
 
     fn agent_dir(path: PathBuf) -> AgentDir {
         AgentDir {
+            is_file: false,
             path,
             write: true,
             map_exec: false,
@@ -4546,6 +4642,62 @@ mod tests {
         assert!(!Agent::OpenCode.needs_keychain());
     }
 
+    /// #906: the opt-in keeps exactly `agents/` and `permissions-config.json`
+    /// writable, for Copilot only, and `config.json` is never denied.
+    #[test]
+    fn copilot_persistence_opt_out_drops_only_its_two_entries() {
+        let home = Path::new("/home/u");
+        let dirs = Agent::Copilot.config_dirs(home);
+        let strict = Agent::Copilot.host_persistence_paths_with(&dirs, false);
+        let kept = Agent::Copilot.host_persistence_paths_with(&dirs, true);
+        let root = home.join(".copilot");
+        for sub in COPILOT_PERSISTENCE_OPT_OUT {
+            assert!(strict.contains(&root.join(sub)), "{sub} denied by default");
+            assert!(!kept.contains(&root.join(sub)), "{sub} kept writable");
+        }
+        assert_eq!(strict.len() - kept.len(), COPILOT_PERSISTENCE_OPT_OUT.len());
+        assert!(!strict.contains(&root.join("config.json")));
+        assert_eq!(strict, Agent::Copilot.host_persistence_paths(&dirs));
+    }
+
+    #[test]
+    fn copilot_trusted_folders_reads_the_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(copilot_trusted_folders(tmp.path()).is_empty());
+        std::fs::create_dir(tmp.path().join(".copilot")).unwrap();
+        std::fs::write(
+            tmp.path().join(".copilot/config.json"),
+            // The header Copilot CLI 1.0.104 writes.
+            "// User settings belong in settings.json.\n// This file is managed \
+             automatically.\n{\"firstLaunchAt\":\"x\",\"trustedFolders\":[\"/a\",\"/b\"]}\n",
+        )
+        .unwrap();
+        assert_eq!(copilot_trusted_folders(tmp.path()), ["/a", "/b"]);
+    }
+
+    #[test]
+    fn copilot_trusted_folders_refuses_untrusted_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".copilot");
+        std::fs::create_dir(&dir).unwrap();
+        let cfg = dir.join("config.json");
+        let real = tmp.path().join("real.json");
+        std::fs::write(&real, "{\"trustedFolders\":[\"/a\"]}").unwrap();
+        std::os::unix::fs::symlink(&real, &cfg).unwrap();
+        assert!(copilot_trusted_folders(tmp.path()).is_empty(), "symlink");
+        std::fs::remove_file(&cfg).unwrap();
+        let c = std::ffi::CString::new(cfg.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(copilot_trusted_folders(tmp.path()).is_empty(), "fifo");
+        std::fs::remove_file(&cfg).unwrap();
+        let big = usize::try_from(crate::sandbox::COPILOT_CONFIG_LIMIT).unwrap() + 1;
+        let mut body = "{\"trustedFolders\":[\"/a\"]}".to_string();
+        body.push_str(&" ".repeat(big));
+        std::fs::write(&cfg, body).unwrap();
+        assert!(copilot_trusted_folders(tmp.path()).is_empty(), "oversized");
+    }
+
     #[test]
     fn host_persistence_denies_per_agent() {
         assert_eq!(
@@ -4580,6 +4732,8 @@ mod tests {
         assert_eq!(
             Agent::Copilot.host_persistence_denies(),
             [
+                "agents",
+                "permissions-config.json",
                 "settings.json",
                 "hooks",
                 "mcp-config.json",
@@ -6549,6 +6703,7 @@ mod tests {
             std::fs::write(f, "").unwrap();
         }
         let grant = |p: &Path| AgentDir {
+            is_file: false,
             path: p.to_path_buf(),
             write: false,
             map_exec: false,

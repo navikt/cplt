@@ -349,6 +349,60 @@ echo AGENT_COMPLETED
     }
 
     #[test]
+    fn pnpm_shadow_dist_link_stays_non_executable() {
+        require_landlock!();
+        use std::os::unix::fs::PermissionsExt;
+
+        let project = create_test_project();
+        let home = tempfile::Builder::new()
+            .prefix(".cplt-pnpm-home-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("create fake home");
+        let pnpm_home = home.path().join(".local/share/pnpm");
+        let store = pnpm_home.join("store/v11/links/@/pnpm/11.0.0/abc");
+        let dist = store.join("dist");
+        fs::create_dir_all(&dist).expect("create store dist");
+        let store_pnpm = store.join("pnpm");
+        fs::copy(env!("CARGO_BIN_EXE_cplt"), &store_pnpm).expect("copy a real binary as pnpm");
+        fs::set_permissions(&store_pnpm, fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&store_pnpm, pnpm_home.join("pnpm"))
+            .expect("link pnpm into PNPM_HOME");
+        fs::write(dist.join("pnpm.mjs"), "asset:OK\n").unwrap();
+        let tool = dist.join("tool");
+        fs::copy("/bin/echo", &tool).expect("copy a real binary into dist");
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let script = format!(
+            "d=\"$(dirname \"$(command -v pnpm)\")/dist\"; cat \"$d/pnpm.mjs\"; \
+             if \"$d/tool\" x; then printf 'link:FAIL\\n'; else printf 'link:OK\\n'; fi; \
+             if '{tool}' x; then printf 'store:FAIL\\n'; else printf 'store:OK\\n'; fi",
+            tool = tool.display(),
+        );
+        let project_dir = project.path().to_string_lossy().into_owned();
+        let output = cplt_cmd()
+            .args([
+                "--yes",
+                "--no-validate",
+                "--quiet",
+                "--agent",
+                "shell",
+                "--project-dir",
+                &project_dir,
+                "--",
+                "-c",
+                &script,
+            ])
+            .env("HOME", home.path())
+            .env("PATH", format!("{}:/usr/bin:/bin", pnpm_home.display()))
+            .output()
+            .expect("run cplt");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("asset:OK"), "{stdout}");
+        assert!(stdout.contains("link:OK"), "{stdout}");
+        assert!(stdout.contains("store:OK"), "{stdout}");
+    }
+
+    #[test]
     fn pnpm_store_is_non_executable_but_shadow_and_version_store_run() {
         require_landlock!();
         use std::os::unix::fs::PermissionsExt;
@@ -368,7 +422,8 @@ echo AGENT_COMPLETED
         let store_pnpm = store.join("pnpm");
         let new_alias = store.join("new-alias");
         let managed_pnpm = package_manager_store.join("pnpm");
-        fs::write(&source, "#!/bin/sh\nprintf 'shadow:OK\\n'\n").expect("write pnpm");
+        // A real binary: the shadow copies nothing but ELF or Mach-O.
+        fs::copy(env!("CARGO_BIN_EXE_cplt"), &source).expect("copy a real binary as fake pnpm");
         fs::write(&standalone, "#!/bin/sh\nprintf 'standalone:OK\\n'\n")
             .expect("write standalone executable");
         fs::hard_link(&source, &store_pnpm).expect("hardlink pnpm into store");
@@ -382,7 +437,7 @@ echo AGENT_COMPLETED
              if ln '{standalone}' '{new_alias}'; then printf 'link:FAIL\\n'; else printf 'link:OK\\n'; fi; \
              '{standalone}'; \
              if '{store_pnpm}'; then printf 'store:FAIL\\n'; else printf 'store:OK\\n'; fi; \
-             '{managed_pnpm}'; pnpm",
+             '{managed_pnpm}'; pnpm --version",
             store_pnpm = store_pnpm.display(),
             standalone = standalone.display(),
             new_alias = new_alias.display(),
@@ -417,7 +472,10 @@ echo AGENT_COMPLETED
         assert!(stdout.contains("standalone:OK"), "{stdout}");
         assert!(stdout.contains("store:OK"), "{stdout}");
         assert!(stdout.contains("managed:OK"), "{stdout}");
-        assert!(stdout.contains("shadow:OK"), "{stdout}");
+        assert!(
+            stdout.contains(&format!("cplt {}", env!("CARGO_PKG_VERSION"))),
+            "{stdout}"
+        );
     }
 
     /// Create a fake HOME with populated sensitive directories for hermetic testing.
@@ -3913,6 +3971,179 @@ print('CONNECTED')
                 && stdout.contains("COMMIT-MSG-OK")
                 && !git_dir.join("remotes/origin").exists()
                 && !git_dir.join("branches/origin").exists(),
+            "code: {code}, stdout: {stdout}, stderr: {stderr}"
+        );
+    }
+
+    /// #386: `sandbox.allow_git_config_write = false` binds `.git/config`
+    /// read-only, leaves no stale `config.lock`, and refuses to launch without
+    /// bubblewrap. `true` keeps in-session `git config` working.
+    #[test]
+    fn git_config_write_is_denied_unless_opted_in() {
+        require_bwrap!();
+        let home = home_outside_tmp(".cplt-e2e-gitconfig-home-");
+        let run = |allow: bool, flags: &[&str]| {
+            let dir = create_deny_project();
+            let project = dir.path().canonicalize().unwrap();
+            assert!(
+                crate::common::git_cmd(&project)
+                    .args(["init", "--quiet"])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let cfg = home.path().join(format!("cplt-{allow}.toml"));
+            fs::write(
+                &cfg,
+                format!("[sandbox]\nallow_git_config_write = {allow}\n"),
+            )
+            .unwrap();
+            let (code, stdout, stderr) = run_sandboxed_home_with_flags_env(
+                &project,
+                home.path(),
+                flags,
+                &[("CPLT_CONFIG", &cfg)],
+                "git config user.email e2e@example.com && echo CONFIG-WRITTEN \
+                 || echo CONFIG-DENIED; \
+                 (ln .git/config .git/cfg-link && echo '[core] hooksPath = /x' >> .git/cfg-link) \
+                 2>/dev/null && echo LINK-MADE || echo LINK-DENIED; \
+                 echo hi > f.txt && git add f.txt \
+                 && git -c user.name=e2e -c user.email=c@example.com commit -qm m \
+                 && echo COMMIT-OK",
+            );
+            let config = fs::read_to_string(project.join(".git/config")).unwrap();
+            let lock = project.join(".git/config.lock").exists();
+            (code, stdout, stderr, config, lock, dir)
+        };
+
+        let (code, stdout, stderr, config, lock, _d) = run(false, &["--use-bubblewrap"]);
+        assert!(
+            code == 0
+                && stdout.contains("CONFIG-DENIED")
+                && stdout.contains("LINK-DENIED")
+                && stdout.contains("COMMIT-OK")
+                && !config.contains("e2e@")
+                && !config.contains("hooksPath")
+                && !lock,
+            "code: {code}, stdout: {stdout}, stderr: {stderr}, lock: {lock}"
+        );
+
+        let (code, stdout, stderr, config, _, _d) = run(true, &["--use-bubblewrap"]);
+        assert!(
+            code == 0 && stdout.contains("CONFIG-WRITTEN") && config.contains("e2e@"),
+            "code: {code}, stdout: {stdout}, stderr: {stderr}"
+        );
+
+        let (code, stdout, stderr, config, _, _d) = run(false, &["--no-bubblewrap"]);
+        assert!(
+            code != 0
+                && stderr.contains("allow_git_config_write")
+                && !stdout.contains("CONFIG-")
+                && !config.contains("e2e@"),
+            "code: {code}, stdout: {stdout}, stderr: {stderr}"
+        );
+    }
+
+    /// Runs `script` in `project` with `sandbox.allow_git_config_write = false`
+    /// under bubblewrap, with a fake HOME.
+    fn run_git_config_denied(project: &Path, script: &str) -> (i32, String, String) {
+        let home = home_outside_tmp(".cplt-e2e-gitconfig-home-");
+        let cfg = home.path().join("cplt.toml");
+        fs::write(&cfg, "[sandbox]\nallow_git_config_write = false\n").unwrap();
+        run_sandboxed_home_with_flags_env(
+            project,
+            home.path(),
+            &["--use-bubblewrap"],
+            &[("CPLT_CONFIG", &cfg)],
+            script,
+        )
+    }
+
+    fn git_ok(dir: &Path, args: &[&str]) {
+        assert!(
+            crate::common::git_cmd(dir)
+                .args(args)
+                .status()
+                .unwrap()
+                .success(),
+            "git {args:?}"
+        );
+    }
+
+    /// #386: in a linked worktree the `.git` pointer file, the shared config
+    /// and the worktree's `config.worktree` are all read-only.
+    #[test]
+    fn git_config_write_denied_in_a_worktree_project() {
+        require_bwrap!();
+        let dir = create_deny_project();
+        let main = dir.path().canonicalize().unwrap().join("main");
+        fs::create_dir_all(&main).unwrap();
+        git_ok(&main, &["init", "--quiet"]);
+        git_ok(
+            &main,
+            &[
+                "-c",
+                "user.name=e",
+                "-c",
+                "user.email=e@example.com",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "i",
+            ],
+        );
+        git_ok(&main, &["config", "extensions.worktreeConfig", "true"]);
+        let wt = dir.path().canonicalize().unwrap().join("wt");
+        git_ok(&main, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+        git_ok(&wt, &["config", "--worktree", "seed.key", "1"]);
+        let pointer = fs::read_to_string(wt.join(".git")).unwrap();
+
+        let (code, stdout, stderr) = run_git_config_denied(
+            &wt,
+            "(git config e2e.shared 1) 2>/dev/null && echo SHARED-WRITTEN || echo SHARED-DENIED; \
+             (git config --worktree e2e.wt 1) 2>/dev/null && echo WT-WRITTEN || echo WT-DENIED; \
+             (echo 'gitdir: /tmp/evil' > .git) 2>/dev/null && echo POINTER-WRITTEN \
+             || echo POINTER-DENIED; \
+             common=$(git rev-parse --git-common-dir); \
+             (mv \"$common/worktrees/wt\" \"$common/worktrees/wt2\") 2>/dev/null \
+             && echo WT-MOVED || echo WT-PINNED; \
+             (mv \"$common/worktrees\" \"$common/wtx\") 2>/dev/null \
+             && echo WTS-MOVED || echo WTS-PINNED",
+        );
+        let shared = fs::read_to_string(main.join(".git/config")).unwrap();
+        assert!(
+            code == 0
+                && stdout.contains("SHARED-DENIED")
+                && stdout.contains("WT-DENIED")
+                && stdout.contains("POINTER-DENIED")
+                && stdout.contains("WT-PINNED")
+                && stdout.contains("WTS-PINNED")
+                && !shared.contains("e2e")
+                && fs::read_to_string(wt.join(".git")).unwrap() == pointer,
+            "code: {code}, stdout: {stdout}, stderr: {stderr}"
+        );
+    }
+
+    /// #386: a repository nested in the project gets the same bind.
+    #[test]
+    fn git_config_write_denied_in_a_nested_repo() {
+        require_bwrap!();
+        let dir = create_deny_project();
+        let project = dir.path().canonicalize().unwrap();
+        git_ok(&project, &["init", "--quiet"]);
+        let inner = project.join("packages/inner");
+        fs::create_dir_all(&inner).unwrap();
+        git_ok(&inner, &["init", "--quiet"]);
+
+        let (code, stdout, stderr) = run_git_config_denied(
+            &project,
+            "(git -C packages/inner config e2e.nested 1) 2>/dev/null && echo NESTED-WRITTEN \
+             || echo NESTED-DENIED",
+        );
+        let config = fs::read_to_string(inner.join(".git/config")).unwrap();
+        assert!(
+            code == 0 && stdout.contains("NESTED-DENIED") && !config.contains("e2e"),
             "code: {code}, stdout: {stdout}, stderr: {stderr}"
         );
     }

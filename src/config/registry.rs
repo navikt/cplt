@@ -495,6 +495,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "sandbox",
+        key: "allow_copilot_host_persistence",
+        value_type: ConfigValueType::Bool,
+        dangerous: true,
+        default_display: "true (false in new configs)",
+        description: "Copilot only: keep ~/.copilot/agents/ and ~/.copilot/permissions-config.json writable inside the sandbox. A custom agent there can start an MCP server command when a later host session selects it, and saved tool approvals skip prompts in later host sessions (#906). Set false to deny both writes: saving a tool approval inside cplt then fails for that session, and you add custom agents from a host shell.",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
         key: "allow_docker",
         value_type: ConfigValueType::Bool,
         dangerous: true,
@@ -556,6 +564,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         dangerous: false,
         default_display: "false",
         description: "Grant read, write and execute on a cplt-owned directory for this repository's sub-agent worktrees (~/.cplt-worktrees/<id>, exported as CPLT_WORKTREE_ROOT). When CPLT_WORKTREE_SOCKET is set, create worktrees with `cplt worktree add <name> <ref>` under the session read policy; protected files must match the launch checkout and HEAD. An unavailable broker warns without removing the managed root. Worktrees and branches persist after the session. macOS only. User config only; .cplt.toml cannot propose it.",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
+        key: "allow_git_config_write",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "true",
+        description: "Linux: let the agent write .git/config, so in-session `git config` and `git remote` work. A written .git/config can set core.hooksPath or core.fsmonitor, which run unsandboxed on your next git command. New configs set it to false: .git/config is then bound read-only, and the launch refuses without bubblewrap. Unset keeps it writable. macOS always denies the write. User config only.",
     },
     ConfigKeyInfo {
         section: "sandbox",
@@ -1229,6 +1245,14 @@ bool_keys! {
         baseline = |_: PresetBaseline| false,
         resolved = |r: &Resolved| r.deny_copilot_dir_exec;
 
+    /// Unset keeps today's writable paths (#906); `cplt config init` writes
+    /// false, so new configs get the deny.
+    allow_copilot_host_persistence, "sandbox", "allow_copilot_host_persistence",
+        cli = |_: &CliFlags| FeatureToggle::UseDefault,
+        config = |c: &Config| c.sandbox.allow_copilot_host_persistence,
+        baseline = |_: PresetBaseline| true,
+        resolved = |r: &Resolved| r.allow_copilot_host_persistence;
+
     allow_docker, "sandbox", "allow_docker",
         cli = |c: &CliFlags| c.allow_docker,
         config = |c: &Config| c.sandbox.allow_docker,
@@ -1278,6 +1302,14 @@ bool_keys! {
         config = |c: &Config| c.sandbox.allow_git_worktrees,
         baseline = |_: PresetBaseline| false,
         resolved = |r: &Resolved| r.allow_git_worktrees;
+
+    /// Config-only (#386). Baseline `true` keeps existing Linux configs as
+    /// they were; `cplt config init` writes `false`.
+    allow_git_config_write, "sandbox", "allow_git_config_write",
+        cli = |_: &CliFlags| FeatureToggle::UseDefault,
+        config = |c: &Config| c.sandbox.allow_git_config_write,
+        baseline = |_: PresetBaseline| true,
+        resolved = |r: &Resolved| r.allow_git_config_write;
 
     /// The config layer folds in the deprecated `sandbox.gh_proxy` spelling.
     gh_guard_enabled, "gh_guard", "enabled",

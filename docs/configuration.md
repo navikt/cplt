@@ -456,6 +456,36 @@ For a monorepo of many small repositories, name only the ones the agent will
 open pull requests against. Every named root widens what `gh` may write to, and
 the gh guard is the thing standing between an agent and the wrong repository.
 
+## Writing `.git/config` on Linux (`sandbox.allow_git_config_write`)
+
+macOS always denies writes to `.git/config`. A written `.git/config` can set
+`core.hooksPath`, `core.fsmonitor` or a `filter.*.clean` command, and those run
+unsandboxed on your next `git` command.
+
+On Linux the key decides. `cplt config init` writes
+`allow_git_config_write = false`: cplt binds every `.git/config` under a
+writable root read-only, and in-session `git config` and `git remote` fail. This
+needs Bubblewrap. Without it, cplt refuses to launch and says why. A config
+without the key keeps the old behaviour (writable), and `cplt doctor` suggests
+setting it. To let the agent write the file:
+
+```bash
+cplt config set sandbox.allow_git_config_write true
+```
+
+User config only; `.cplt.toml` cannot set it.
+
+The bind also covers a `.git` pointer file (worktrees, `--separate-git-dir`) and
+every `config.worktree`. Only files that exist at launch are bound, so a
+repository created in the session (`git init`, `git clone`) stays writable.
+Nested repositories are found by a bounded scan (three levels, 20 000
+directories), as for `.git/hooks`. A hard link to `.git/config` from the
+writable tree fails with `EXDEV`, because the bound file is its own mount.
+With `extensions.worktreeConfig` on, a `config.worktree` that does not exist at
+launch is not bound, so the agent can create one. Linked worktree directories
+under `.git/worktrees` are pinned, so `git worktree remove` and `prune` fail in
+the session.
+
 ## Worktrees for sub-agents (`sandbox.allow_git_worktrees`)
 
 Off by default, macOS only, since 2026.09.24-164900-53d4462. When on, cplt
@@ -799,6 +829,7 @@ The settings below are machine-specific or local CLI preferences, so `.cplt.toml
 | `sandbox.refuse_invalid_repo_config` | decides how a repo's own broken config is treated, so the repo cannot set it; see [Refusing an invalid `.cplt.toml`](#refusing-an-invalid-cplttoml-sandboxrefuse_invalid_repo_config) |
 | `sandbox.skip_untrusted_opencode_config` | decides what an untrusted repo may configure, so the repo cannot set it; see [OpenCode project config in untrusted repositories](#opencode-project-config-in-untrusted-repositories-sandboxskip_untrusted_opencode_config) |
 | `sandbox.deny_copilot_dir_exec` | a staged hardening switch, see [No execute on `~/.copilot`](#no-execute-on-copilot-sandboxdeny_copilot_dir_exec) |
+| `sandbox.allow_copilot_host_persistence` | decides what the sandbox may leave behind for host sessions, so the repo cannot set it; see [Copilot agents and saved approvals](#copilot-agents-and-saved-approvals-sandboxallow_copilot_host_persistence) |
 | `sandbox.inherit_env` | too dangerous for repo config, it would affect every team member |
 | `sandbox.allow_build_credentials` | hands the agent the user's own registry tokens from `$HOME`, and a repo cannot grant home paths |
 | `allow.exec` | exec paths differ per machine, and a repo must not be able to make one of its own trees executable |
@@ -1039,6 +1070,16 @@ Two set-ups keep some execute, and the launch warns about each instead of stayin
 - **Copilot is installed inside `~/.copilot`.** Copilot's install directory is always granted execute, or Copilot could not start. That directory and everything below it stay executable; the rest of `~/.copilot` does not. The warning names the directory.
 
 It has no effect on macOS, where the profile is unchanged and the launch warns that the key was ignored. The trace was done on Linux only.
+
+## Copilot agents and saved approvals (`sandbox.allow_copilot_host_persistence`)
+
+Copilot loads `~/.copilot/agents/` and `~/.copilot/permissions-config.json` in every later session, including sessions outside cplt. A custom agent there can start a command when you select it, and a saved approval lets a tool run without asking ([#906](https://github.com/navikt/cplt/issues/906)). New configs deny the sandbox write access to both:
+
+```bash
+cplt config set sandbox.allow_copilot_host_persistence false
+```
+
+With the key off, saving a tool approval inside cplt fails for that session, and you add custom agents from a shell outside cplt. cplt also warns after the session when Copilot trusted a new folder. A config without the key keeps both writable, and `cplt doctor` suggests the change. Set the key to `true` (`cplt config set --force sandbox.allow_copilot_host_persistence true`) to keep them writable and silence that. On Linux the deny needs bubblewrap and only covers paths that already exist. See [SECURITY.md](../SECURITY.md).
 
 ## Other keys
 

@@ -842,6 +842,7 @@ fn landlock_policy_device_files_have_ioctl() {
         deny_key_files_by_extension: false,
         protect_pnpm_config: false,
         deny_copilot_dir_exec: false,
+        allow_copilot_host_persistence: false,
         allow_jvm_attach: false,
         allow_msbuild: false,
         allow_docker: false,
@@ -853,6 +854,7 @@ fn landlock_policy_device_files_have_ioctl() {
         allow_cache_exec_any: false,
         allow_browser: false,
         use_bubblewrap: None,
+        allow_git_config_write: true,
         keychain_substitute: None,
     });
 
@@ -1125,13 +1127,19 @@ fn profile_denies_writes_at_a_symlinked_home_git_config_target() {
             dir.display()
         );
     }
-    for dir in [&project, &named, &other, &root] {
+    // The writable roots themselves are pinned (#923); the dir above them is not.
+    for dir in [&project, &named, &other] {
         assert!(
-            !p.contains(&unlink(dir)),
-            "{} is a writable root or above one and must stay movable:\n{p}",
+            p.contains(&unlink(dir)),
+            "{} is a writable root:\n{p}",
             dir.display()
         );
     }
+    assert!(
+        !p.contains(&unlink(&root)),
+        "{} is above a writable root and must stay movable:\n{p}",
+        root.display()
+    );
 }
 
 /// `~/.config` links into the project and has no `git` directory yet. A deny
@@ -2043,7 +2051,7 @@ fn host_persistence_denies_survive_a_later_user_allow_write() {
     }
 }
 
-/// Copilot's eight host-persistence denies.
+/// Copilot's ten host-persistence denies (#906 added agents/ and permissions-config.json).
 ///
 /// `~/.copilot` is granted write for the session store, the permissions file
 /// and the logs Copilot rewrites every run, so the persistence guard has to be
@@ -2073,6 +2081,8 @@ fn copilot_execution_bearing_paths_are_write_denied_and_survive_a_user_allow() {
         .rfind("(allow file-write* (subpath \"/Users/test/.copilot\"))")
         .expect("user allow.write must be emitted");
     for sub in [
+        "agents",
+        "permissions-config.json",
         "settings.json",
         "hooks",
         "mcp-config.json",
@@ -2099,17 +2109,30 @@ fn copilot_execution_bearing_paths_are_write_denied_and_survive_a_user_allow() {
         "the CLI's own mutable state must not be caught by the persistence denies"
     );
 
-    // Copilot's in-session authoring surface stays writable: the deny is on
-    // skills/, which arrives by install, not on the directories a session
-    // legitimately writes.
-    for sub in ["agents", "instructions"] {
+    // instructions/ is prompt content and stays writable.
+    assert!(
+        !p.contains("(deny file-write* (subpath \"/Users/test/.copilot/instructions\"))"),
+        "instructions/ is authored in-session and must stay writable"
+    );
+
+    // #906: the opt-in keeps agents/ and permissions-config.json writable.
+    let kept = generate_profile(
+        &SandboxConfig {
+            agent_dirs: &agent_dirs,
+            allow_copilot_host_persistence: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    for sub in ["agents", "permissions-config.json"] {
         assert!(
-            !p.contains(&format!(
+            !kept.contains(&format!(
                 "(deny file-write* (subpath \"/Users/test/.copilot/{sub}\"))"
             )),
-            "{sub}/ is authored in-session and must stay writable"
+            "{sub} stays writable with allow_copilot_host_persistence"
         );
     }
+    assert!(kept.contains("(deny file-write* (subpath \"/Users/test/.copilot/skills\"))"));
 }
 
 /// fish's auto-executing files are write-denied in BOTH granted dirs, and
@@ -2131,6 +2154,7 @@ fn fish_startup_files_are_write_denied_in_both_granted_dirs() {
     // is the profile, not the XDG resolution.
     let agent_dirs = ["/Users/test/.config/fish", "/Users/test/.local/share/fish"].map(|p| {
         cplt::agent::AgentDir {
+            is_file: false,
             path: std::path::PathBuf::from(p),
             write: true,
             map_exec: false,
@@ -2808,6 +2832,7 @@ fn base_profile_options() -> SandboxConfig<'static> {
         deny_key_files_by_extension: false,
         protect_pnpm_config: false,
         deny_copilot_dir_exec: false,
+        allow_copilot_host_persistence: false,
         allow_jvm_attach: false,
         allow_msbuild: false,
         allow_docker: false,
@@ -2820,6 +2845,7 @@ fn base_profile_options() -> SandboxConfig<'static> {
         allow_browser: false,
         keychain_substitute: None,
         use_bubblewrap: None,
+        allow_git_config_write: true,
     }
 }
 
@@ -4420,6 +4446,7 @@ fn allow_localhost_any_affects_both_backends() {
         deny_key_files_by_extension: false,
         protect_pnpm_config: false,
         deny_copilot_dir_exec: false,
+        allow_copilot_host_persistence: false,
         allow_jvm_attach: false,
         allow_msbuild: false,
         allow_docker: false,
@@ -4431,6 +4458,7 @@ fn allow_localhost_any_affects_both_backends() {
         allow_cache_exec_any: false,
         allow_browser: false,
         use_bubblewrap: None,
+        allow_git_config_write: true,
         keychain_substitute: None,
     });
     assert!(
@@ -4494,6 +4522,7 @@ fn config_options_parity_across_backends() {
         deny_key_files_by_extension: false,
         protect_pnpm_config: false,
         deny_copilot_dir_exec: false,
+        allow_copilot_host_persistence: false,
         allow_jvm_attach: true,
         allow_msbuild: false,
         allow_docker: false,
@@ -4505,6 +4534,7 @@ fn config_options_parity_across_backends() {
         allow_cache_exec_any: false,
         allow_browser: false,
         use_bubblewrap: None,
+        allow_git_config_write: true,
         keychain_substitute: None,
     };
 
@@ -9867,6 +9897,7 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
 
     let agent_dirs = vec![
         AgentDir {
+            is_file: false,
             path: config_dir.clone(),
             write: false,
             map_exec: false,
@@ -9876,6 +9907,7 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
             via: vec![],
         },
         AgentDir {
+            is_file: false,
             path: data_dir.clone(),
             write: true,
             map_exec: false,
@@ -9885,6 +9917,7 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
             via: vec![],
         },
         AgentDir {
+            is_file: false,
             path: state_dir.clone(),
             write: true,
             map_exec: false,
@@ -9894,6 +9927,7 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
             via: vec![],
         },
         AgentDir {
+            is_file: false,
             path: cache_dir.clone(),
             write: true,
             map_exec: false,
@@ -9903,6 +9937,7 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
             via: vec![],
         },
         AgentDir {
+            is_file: false,
             path: cache_dir.join("bin"),
             write: false,
             map_exec: false,
@@ -10202,6 +10237,7 @@ protect_pnpm_config = false
 refuse_invalid_repo_config = false
 skip_untrusted_opencode_config = false
 deny_copilot_dir_exec = false
+allow_copilot_host_persistence = true
 allow_docker = false
 allow_rootless_docker = false
 allow_cache_exec = []
@@ -10210,6 +10246,7 @@ allow_browser = false
 keychain_substitute = false
 allow_build_credentials = false
 allow_git_worktrees = false
+allow_git_config_write = true
 worktree_walk_max_dirs = 100000
 git_push_prevention = false
 
@@ -10688,6 +10725,7 @@ fn landlock_relocated_cargo_bin_is_exec_only_and_registry_is_precreated() {
         deny_key_files_by_extension: false,
         protect_pnpm_config: false,
         deny_copilot_dir_exec: false,
+        allow_copilot_host_persistence: false,
         allow_jvm_attach: false,
         allow_msbuild: false,
         allow_docker: false,
@@ -10699,6 +10737,7 @@ fn landlock_relocated_cargo_bin_is_exec_only_and_registry_is_precreated() {
         allow_cache_exec_any: false,
         allow_browser: false,
         use_bubblewrap: None,
+        allow_git_config_write: true,
         keychain_substitute: None,
     });
     let rule = |p: &str| {

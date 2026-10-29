@@ -233,6 +233,12 @@ inject_github_token = true
 #   allow_tmp_exec = false
 # preset = "standard"
 #
+# Copilot: deny writes to ~/.copilot/agents/ and permissions-config.json, which
+# a later host session loads (#906). Saving a tool approval inside cplt then
+# fails; do it from a host shell. Off for new configs; without this line the
+# default is true (writable).
+allow_copilot_host_persistence = false
+#
 # Run sandbox-exec validation test on every launch (default: true).
 # Disable to save ~200ms startup if you trust your config.
 # validate = true
@@ -389,6 +395,13 @@ strip_otlp_vendor_auth = true
 # exported as CPLT_WORKTREE_ROOT. Worktrees and branches there persist after the
 # session; cplt never removes them. macOS only. Global or local config only.
 # allow_git_worktrees = false
+#
+# Linux: let the agent write .git/config (in-session `git config`, `git remote`).
+# A written .git/config can set core.hooksPath or core.fsmonitor, which run
+# unsandboxed on your next git command. Off for new configs: .git/config is
+# bound read-only, and the launch refuses without bubblewrap. Without this line
+# it stays writable. macOS always denies the write.
+allow_git_config_write = false
 #
 # Suppress the startup configuration summary and non-essential messages.
 # Errors and warnings are always shown. Useful once you've reviewed the
@@ -757,6 +770,12 @@ mod tests {
         // New configs start with forced proxy on (#822); a missing key stays off.
         assert_eq!(config.proxy.forced, Some(true));
         assert_eq!(Config::default().proxy.forced, None);
+        // #906: new configs deny Copilot's agents/ and saved approvals.
+        assert_eq!(config.sandbox.allow_copilot_host_persistence, Some(false));
+        assert_eq!(
+            Config::default().sandbox.allow_copilot_host_persistence,
+            None
+        );
         // #878: vendor OTLP auth headers stripped for new configs only.
         assert_eq!(config.sandbox.strip_otlp_vendor_auth, Some(true));
         assert_eq!(Config::default().sandbox.strip_otlp_vendor_auth, None);

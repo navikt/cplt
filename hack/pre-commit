@@ -1,16 +1,18 @@
 #!/bin/sh
 set -e
 
-# Use the toolchain pinned in mise.toml (the one CI uses), not rustup's
-# default: newer clippy releases add lints the tree does not pass yet.
-if [ -z "${RUSTUP_TOOLCHAIN:-}" ] && command -v rustup >/dev/null 2>&1; then
-    pin=$(sed -n 's/^rust = "\(.*\)"$/\1/p' "$(git rev-parse --show-toplevel)/mise.toml" 2>/dev/null || true)
-    if [ -n "$pin" ]; then export RUSTUP_TOOLCHAIN="$pin"; fi
+# Run on rustup's toolchain pinned in rust-toolchain.toml (the one CI uses).
+# A Rust earlier on PATH (Homebrew's, say) ignores the pin, and newer clippy
+# releases add lints the tree does not pass yet, so never fall back to it.
+rustup=$(command -v rustup || echo "${CARGO_HOME:-$HOME/.cargo}/bin/rustup")
+if [ ! -x "$rustup" ]; then
+    echo "pre-commit: rustup not found. Install it (https://rustup.rs) so the checks run on the pinned toolchain." >&2
+    exit 1
 fi
+pin=$(sed -n 's/^channel = "\(.*\)"$/\1/p' "$(git rev-parse --show-toplevel)/rust-toolchain.toml")
+cargo() { "$rustup" run "$pin" cargo "$@"; }
 
-# A Rust earlier on PATH (Homebrew's, say) ignores RUSTUP_TOOLCHAIN and
-# rust-toolchain.toml, so put the pinned toolchain's bin dir first.
-if bin=$(rustup which cargo 2>/dev/null); then PATH="$(dirname "$bin"):$PATH"; fi
+echo "Using $("$rustup" run "$pin" rustc --version)"
 
 echo "Running cargo fmt --check..."
 cargo fmt -- --check || {

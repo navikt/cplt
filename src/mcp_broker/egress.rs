@@ -332,7 +332,6 @@ mod tests {
         let err = dial_each(vec![v6, v4], budget, |a, left| {
             assert!(left <= budget, "{left:?}");
             tried.borrow_mut().push(*a);
-            std::thread::sleep(budget / 2 + Duration::from_millis(10));
             Err(Error::from(ErrorKind::TimedOut))
         })
         .unwrap_err();

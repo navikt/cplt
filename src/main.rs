@@ -5523,6 +5523,11 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             cplt::sandbox::cplt_state_file(&home_dir, "opencode-snapshot-clean"),
         )
     });
+    // #906: config.json stays writable (login and UI state), so a trust entry
+    // the session added is reported instead of denied.
+    let trusted_before = (active_agent == agent::Agent::Copilot
+        && !resolved.allow_copilot_host_persistence)
+        .then(|| agent::copilot_trusted_folders(&home_dir));
     let audit_mode = audit::AuditMode::for_run(audit_enabled, cli.observe_domains);
     let (exit_code, snapshot, settled) = audit::run(
         &project_dir,
@@ -5561,6 +5566,20 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     );
     if let Some((own, before)) = &v2_model {
         cplt::opencode_v2::save_model(own, &home_dir, before.as_deref());
+    }
+    if let Some(before) = trusted_before {
+        for added in agent::copilot_trusted_folders(&home_dir)
+            .iter()
+            .filter(|f| !before.contains(f))
+        {
+            let added = sanitize_terminal_text(added);
+            ui::warn(&format!(
+                "Copilot now trusts {added}: this session added it to \
+                 ~/.copilot/config.json trustedFolders, so host sessions there skip the \
+                 trust prompt. Remove it from that file if you did not choose \
+                 \"remember this folder\"."
+            ));
+        }
     }
     cplt::opencode_v2::save_tui(&v2_tui);
     if let Some(stores) = opencode_stores {
@@ -7350,6 +7369,7 @@ fn build_sandbox_config<'a>(
         deny_key_files_by_extension: resolved.deny_key_files_by_extension,
         protect_pnpm_config: resolved.protect_pnpm_config,
         deny_copilot_dir_exec: resolved.deny_copilot_dir_exec,
+        allow_copilot_host_persistence: resolved.allow_copilot_host_persistence,
         allow_jvm_attach: resolved.allow_jvm_attach,
         allow_msbuild: resolved.allow_msbuild,
         allow_docker: resolved.allow_docker,
@@ -7362,6 +7382,7 @@ fn build_sandbox_config<'a>(
         allow_browser: resolved.allow_browser,
         keychain_substitute,
         use_bubblewrap: resolved.use_bubblewrap,
+        allow_git_config_write: resolved.allow_git_config_write,
     }
 }
 
@@ -9143,7 +9164,7 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     let doctor_pnpm = resolve_exec_binary("pnpm").ok();
     let doctor_pnpm_shadowed = doctor_pnpm
         .as_ref()
-        .is_some_and(|pnpm| scratch::pnpm_requires_shadow(&home_dir, pnpm).unwrap_or(false));
+        .is_some_and(|pnpm| matches!(scratch::pnpm_shadow_source(&home_dir, pnpm), Ok(Some(_))));
     let mut doctor_exec = resolved.allow_exec.clone();
     doctor_exec.extend(pnpm_exec_grants(
         &home_dir,
@@ -9215,6 +9236,7 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     #[cfg(not(target_os = "linux"))]
     let can_force = true;
     findings.extend(doctor::proxy_forced_nudge(&resolved, can_force));
+    findings.extend(doctor::copilot_persistence_nudge(&resolved, active_agent));
     findings.extend(config_findings(
         &resolved,
         active_agent,
@@ -9231,6 +9253,11 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
         &sandbox_config,
         &launch_grants,
     );
+    #[cfg(target_os = "linux")]
+    findings.extend(doctor::git_config_write_nudge(
+        &resolved,
+        matches!(bubblewrap, doctor::Bubblewrap::Usable(_)),
+    ));
     #[cfg(target_os = "macos")]
     {
         if Path::new("/usr/bin/sandbox-exec").exists() {
@@ -13576,6 +13603,7 @@ mod tests {
             deny_key_files_by_extension: true,
             protect_pnpm_config: false,
             deny_copilot_dir_exec: false,
+            allow_copilot_host_persistence: false,
             allow_jvm_attach: false,
             allow_msbuild: false,
             allow_docker: false,
@@ -13588,6 +13616,7 @@ mod tests {
             allow_browser: false,
             keychain_substitute: None,
             use_bubblewrap: None,
+            allow_git_config_write: true,
         };
         let denies = sandbox::ReadDenies::from_config(&base_cfg);
 

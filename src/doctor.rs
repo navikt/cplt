@@ -1218,6 +1218,53 @@ pub fn proxy_forced_nudge(r: &crate::config::Resolved, can_force: bool) -> Optio
     })
 }
 
+/// The nudge for an install from before Copilot's `agents/` and
+/// `permissions-config.json` were denied for new configs (#906). Shown only
+/// while no layer sets `sandbox.allow_copilot_host_persistence`.
+#[must_use]
+pub fn copilot_persistence_nudge(
+    r: &crate::config::Resolved,
+    agent: crate::agent::Agent,
+) -> Option<Finding> {
+    let unset = r.bool_layer("sandbox", "allow_copilot_host_persistence")
+        == Some(crate::config::ConfigLayer::Baseline);
+    (agent == crate::agent::Agent::Copilot && unset).then(|| {
+        Finding::warning(
+            "The sandbox can write ~/.copilot/agents/ and permissions-config.json. A custom \
+             agent there can run a command when a later host session selects it, and saved \
+             approvals skip prompts there. New configs deny both (see SECURITY.md).",
+            Some(
+                "cplt config set sandbox.allow_copilot_host_persistence false, or \
+                 `cplt config set --force sandbox.allow_copilot_host_persistence true` to \
+                 keep them writable and silence this"
+                    .to_string(),
+            ),
+        )
+    })
+}
+
+/// The Linux nudge for a config from before `.git/config` became read-only
+/// for new configs (#386). Shown only while no layer sets
+/// `sandbox.allow_git_config_write`; setting it either way silences it.
+#[must_use]
+pub fn git_config_write_nudge(r: &crate::config::Resolved, bwrap_usable: bool) -> Option<Finding> {
+    // Never suggest what would refuse every launch.
+    let layer = r.bool_layer("sandbox", "allow_git_config_write");
+    (bwrap_usable && layer == Some(crate::config::ConfigLayer::Baseline)).then(|| {
+        Finding::warning(
+            "The agent can write .git/config, so it can set core.hooksPath or \
+             core.fsmonitor, which run unsandboxed on your next git command. New configs \
+             make it read-only (needs Bubblewrap); in-session `git config` and `git remote` \
+             then fail.",
+            Some(
+                "cplt config set sandbox.allow_git_config_write false, or set it to true to \
+                 keep it writable and silence this"
+                    .to_string(),
+            ),
+        )
+    })
+}
+
 /// Exit non-zero iff something is blocking — the contract the old doctor had
 /// for its "critical" checks.
 #[must_use]
@@ -1229,6 +1276,53 @@ pub fn exit_nonzero(findings: &[Finding]) -> bool {
 mod tests {
     use super::*;
     use crate::sandbox::{FsAccess, FsRule};
+
+    #[test]
+    fn copilot_persistence_nudge_only_when_unset() {
+        use crate::agent::Agent;
+        let r = |toml: &str| {
+            toml::from_str::<crate::config::Config>(toml)
+                .unwrap()
+                .merge(crate::config::CliFlags::default())
+                .unwrap()
+        };
+        let old = r("");
+        assert!(
+            old.allow_copilot_host_persistence,
+            "unset keeps today's behaviour"
+        );
+        assert!(copilot_persistence_nudge(&old, Agent::Copilot).is_some());
+        assert!(copilot_persistence_nudge(&old, Agent::Claude).is_none());
+        let new = r(&crate::config::default_config_contents());
+        assert!(!new.allow_copilot_host_persistence);
+        assert!(copilot_persistence_nudge(&new, Agent::Copilot).is_none());
+        let kept = r("[sandbox]\nallow_copilot_host_persistence = true\n");
+        assert!(copilot_persistence_nudge(&kept, Agent::Copilot).is_none());
+    }
+
+    #[test]
+    fn git_config_write_nudge_only_when_unset() {
+        let r = |toml: &str| {
+            toml::from_str::<crate::config::Config>(toml)
+                .unwrap()
+                .merge(crate::config::CliFlags::default())
+                .unwrap()
+        };
+        let old = r("");
+        assert!(
+            old.allow_git_config_write,
+            "an existing config keeps today's behaviour"
+        );
+        assert!(git_config_write_nudge(&old, true).is_some());
+        assert!(git_config_write_nudge(&old, false).is_none());
+        let new = r(&crate::config::default_config_contents());
+        assert!(!new.allow_git_config_write, "new configs deny the write");
+        assert!(git_config_write_nudge(&new, true).is_none());
+        assert!(
+            git_config_write_nudge(&r("[sandbox]\nallow_git_config_write = true\n"), true)
+                .is_none()
+        );
+    }
 
     #[test]
     fn proxy_forced_nudge_only_when_unset() {

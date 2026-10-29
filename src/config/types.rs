@@ -745,6 +745,9 @@ pub struct SandboxConfig {
     pub skip_untrusted_opencode_config: Option<bool>,
     /// Withdraw execve from `~/.copilot` (default: false, Linux only, #324).
     pub deny_copilot_dir_exec: Option<bool>,
+    /// Keep `~/.copilot/agents/` and `permissions-config.json` writable
+    /// (default: true for an unset key, false in new configs, #906).
+    pub allow_copilot_host_persistence: Option<bool>,
     /// Allow Docker/Colima/OrbStack access inside the sandbox (default: false).
     /// DANGEROUS: Docker can mount any host path via container volumes, completely
     /// bypassing sandbox filesystem restrictions. Only enable if you trust the
@@ -790,6 +793,10 @@ pub struct SandboxConfig {
     /// User config only (global or local): `.cplt.toml` cannot propose it,
     /// because it grants a new executable tree outside the checkout.
     pub allow_git_worktrees: Option<bool>,
+    /// Linux: let the agent write `.git/config` (#386). Unset keeps the old
+    /// behaviour (writable); new configs write `false`, which re-binds it
+    /// read-only under bubblewrap. macOS always denies the write.
+    pub allow_git_config_write: Option<bool>,
     /// How many directories the worktree-link walk visits before it stops and
     /// fails the launch (default: 100000). Only read with
     /// `allow_git_worktrees` on.
@@ -1054,6 +1061,7 @@ pub struct Resolved {
     pub refuse_invalid_repo_config: bool,
     pub skip_untrusted_opencode_config: bool,
     pub deny_copilot_dir_exec: bool,
+    pub allow_copilot_host_persistence: bool,
     pub allow_docker: bool,
     pub allow_rootless_docker: bool,
     pub allow_tmp_exec: bool,
@@ -1069,6 +1077,9 @@ pub struct Resolved {
     pub allow_build_credentials: bool,
     /// `sandbox.allow_git_worktrees` (#531), default false.
     pub allow_git_worktrees: bool,
+    /// `sandbox.allow_git_config_write` (#386). Baseline `true`, so an
+    /// existing config keeps a writable `.git/config` on Linux.
+    pub allow_git_config_write: bool,
     /// `sandbox.worktree_walk_max_dirs`, default
     /// [`crate::worktrees::DEFAULT_WALK_MAX_DIRS`].
     pub worktree_walk_max_dirs: usize,
