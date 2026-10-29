@@ -256,6 +256,11 @@ allow_copilot_host_persistence = false
 # host behind cplt's tool policy (default: true; macOS only).
 # mcp_broker = true
 #
+# Strip vendor auth headers (x-honeycomb-team, api-key, x-api-key, dd-api-key)
+# from OTEL_EXPORTER_OTLP_*HEADERS, like Authorization; --pass-env keeps the
+# raw value. On for new configs; without this line the default is false.
+strip_otlp_vendor_auth = true
+#
 # EXPERIMENTAL (unstable, may be removed): also inject the managed cplt sandbox
 # block into the project's AGENTS.md on every launch (default: false). Requires
 # brief = true, and writes into your repo — review and commit it yourself.
@@ -764,6 +769,9 @@ mod tests {
             Config::default().sandbox.allow_copilot_host_persistence,
             None
         );
+        // #878: vendor OTLP auth headers stripped for new configs only.
+        assert_eq!(config.sandbox.strip_otlp_vendor_auth, Some(true));
+        assert_eq!(Config::default().sandbox.strip_otlp_vendor_auth, None);
     }
 
     #[test]

@@ -648,6 +648,7 @@ impl Config {
             repo_private_domains: Vec::new(),
             proxy_forced,
             deny_dns: bools.deny_dns,
+            netns: bools.netns,
             inject_github_token: bools.inject_github_token,
             proxy_port,
             blocked_domains,
@@ -678,6 +679,7 @@ impl Config {
             no_validate,
             github_mcp_proxy: bools.github_mcp_proxy,
             mcp_broker: bools.mcp_broker,
+            strip_otlp_vendor_auth: bools.strip_otlp_vendor_auth,
             brief,
             agents_md,
             pass_env,
@@ -920,6 +922,9 @@ impl Resolved {
         }
         if self.allow_gpg_signing {
             disabled.push(HardeningCategory::GitSigning);
+        }
+        if !self.strip_otlp_vendor_auth {
+            disabled.push(HardeningCategory::OtlpVendorAuth);
         }
         disabled
     }
@@ -4243,6 +4248,14 @@ mod precedence {
                 preset: None,
             },
             Ladder {
+                key: "proxy.netns",
+                cli_on: None,
+                cli_off: None,
+                get: |r| r.netns,
+                default: false,
+                preset: None,
+            },
+            Ladder {
                 key: "proxy.default_allowlist",
                 cli_on: Some(|c| c.default_allowlist = FeatureToggle::ForceOn),
                 cli_off: Some(|c| c.default_allowlist = FeatureToggle::ForceOff),
@@ -4274,6 +4287,14 @@ mod precedence {
                 cli_off: None,
                 get: |r| r.mcp_broker,
                 default: true,
+                preset: None,
+            },
+            Ladder {
+                key: "sandbox.strip_otlp_vendor_auth",
+                cli_on: None,
+                cli_off: None,
+                get: |r| r.strip_otlp_vendor_auth,
+                default: false,
                 preset: None,
             },
             Ladder {

@@ -68,6 +68,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "proxy",
+        key: "netns",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "false",
+        description: "Linux with Bubblewrap only: run the agent in its own network namespace. The only way out is the cplt proxy, so direct TCP, UDP and DNS are blocked by the kernel. Needs the proxy and the scratch dir; refuses the launch if the namespace cannot be set up. allow.localhost and allow_localhost_any have no effect under it, since host loopback is out of reach. No effect on macOS.",
+    },
+    ConfigKeyInfo {
+        section: "proxy",
         key: "inject_github_token",
         value_type: ConfigValueType::Bool,
         dangerous: false,
@@ -268,6 +276,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         dangerous: false,
         default_display: "true",
         description: "Run the local MCP servers that have a broker spec in ~/.config/cplt/mcp/ (written by nav-pilot) on the host, behind cplt's tool policy, instead of inside the sandbox. macOS only. Turn one off for a run with --no-mcp-broker <id>.",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
+        key: "strip_otlp_vendor_auth",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "false",
+        description: "Also strip x-honeycomb-team, api-key, x-api-key and dd-api-key from OTEL_EXPORTER_OTLP_*HEADERS, like Authorization. --pass-env keeps the raw value. Written as true by `cplt config init`.",
     },
     ConfigKeyInfo {
         section: "sandbox",
@@ -1008,6 +1024,13 @@ bool_keys! {
         baseline = |_: PresetBaseline| false,
         resolved = |r: &Resolved| r.deny_dns;
 
+    /// Config-only (#114). Linux + bubblewrap only.
+    netns, "proxy", "netns",
+        cli = |_: &CliFlags| FeatureToggle::UseDefault,
+        config = |c: &Config| c.proxy.netns,
+        baseline = |_: PresetBaseline| false,
+        resolved = |r: &Resolved| r.netns;
+
     inject_github_token, "proxy", "inject_github_token",
         cli = |c: &CliFlags| c.inject_github_token,
         config = |c: &Config| c.proxy.inject_github_token,
@@ -1040,6 +1063,13 @@ bool_keys! {
         config = |c: &Config| c.sandbox.mcp_broker,
         baseline = |_: PresetBaseline| true,
         resolved = |r: &Resolved| r.mcp_broker;
+
+    /// Config-only (#878). Seeded true by `cplt config init`.
+    strip_otlp_vendor_auth, "sandbox", "strip_otlp_vendor_auth",
+        cli = |_: &CliFlags| FeatureToggle::UseDefault,
+        config = |c: &Config| c.sandbox.strip_otlp_vendor_auth,
+        baseline = |_: PresetBaseline| false,
+        resolved = |r: &Resolved| r.strip_otlp_vendor_auth;
 
     brief, "sandbox", "brief",
         cli = |c: &CliFlags| c.brief,

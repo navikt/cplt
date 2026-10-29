@@ -203,7 +203,7 @@ jobs:
           Maintainer: Nav <navikt@nav.no>
           Section: devel
           Priority: optional
-          Recommends: bubblewrap
+          Recommends: bubblewrap, libsecret-tools
           Homepage: https://github.com/navikt/cplt
           Description: Sandbox wrapper for GitHub Copilot CLI
            cplt confines the Copilot CLI with Landlock LSM and seccomp-BPF on

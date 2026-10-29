@@ -137,7 +137,25 @@ forced = true
 **Platform asymmetry.** Enforcement is not equal on the two platforms:
 
 - **macOS (Seatbelt):** the profile pins egress to `localhost:<proxy_port>`. There is no direct-network path for connections. DNS lookups through the system resolver (mDNSResponder) still leave the machine outside the proxy.
-- **Linux (Landlock):** Landlock is port-based and cannot pin to localhost. Proxy-forced drops the `:443` rule and allows only the proxy port, which blocks direct `:443` to any host, but a narrow `evil.com:<proxy_port>` channel remains reachable if a remote host happens to answer on that exact port. Landlock itself gates **TCP only**, since its UDP support lands at ABI v10 and cplt handles TCP connect alone, but in this mode the seccomp rule above closes UDP, raw, SCTP and DCCP on any kernel, so the residual is the proxy-port channel rather than open UDP. Closing that residual requires a network namespace and is tracked in [#114](https://github.com/navikt/cplt/issues/114). Until then, treat Linux proxy-forced as "no direct TCP `:443` bypass and no non-TCP egress" rather than "no egress except the proxy".
+- **Linux (Landlock):** Landlock is port-based and cannot pin to localhost. Proxy-forced drops the `:443` rule and allows only the proxy port, which blocks direct `:443` to any host, but a narrow `evil.com:<proxy_port>` channel remains reachable if a remote host happens to answer on that exact port. Landlock itself gates **TCP only**, since its UDP support lands at ABI v10 and cplt handles TCP connect alone, but in this mode the seccomp rule above closes UDP, raw, SCTP and DCCP on any kernel, so the residual is the proxy-port channel rather than open UDP. `proxy.netns` closes that residual, see [Network namespace](#network-namespace-linux-proxynetns). Without it, treat Linux proxy-forced as "no direct TCP `:443` bypass and no non-TCP egress" rather than "no egress except the proxy".
+
+### Network namespace (Linux, `proxy.netns`)
+
+Opt-in, Linux with Bubblewrap only ([#114](https://github.com/navikt/cplt/issues/114)):
+
+```bash
+cplt config set proxy.netns true
+```
+
+The agent then runs in its own network namespace that holds only loopback. `HTTPS_PROXY` stays `http://127.0.0.1:<proxy_port>`: a relay inside the namespace listens there and passes each connection to the proxy through a unix socket in the session's scratch dir. Nothing else has a route, so the kernel blocks direct TCP to any host and port, the host's loopback services, UDP and DNS, on top of what proxy-forced does. It works with or without `proxy.forced`.
+
+- **DNS goes through the proxy.** The proxy resolves the host name in each `CONNECT` request, with its SSRF guard. A tool that resolves names itself before connecting, or that ignores `HTTPS_PROXY`, has no network.
+- **Fails closed.** If Bubblewrap is missing or cannot create the namespace, the proxy is off, or `sandbox.scratch_dir` is off, cplt refuses to launch and says what to fix. It never runs on the shared network instead.
+- **Host loopback is out of reach.** `allow.localhost` (`--allow-localhost`) and `allow_localhost_any` have no effect: the agent's `127.0.0.1` is its own namespace. cplt warns when they are set. Turn `proxy.netns` off for a run that needs a host service.
+- **Needs the proxy.** With the proxy off there is no way out, so cplt refuses instead of starting an agent with no network.
+- **VM sockets are not covered.** `AF_VSOCK` is not a network namespace object. Inside a VM guest, the agent can still reach the hypervisor host over vsock.
+- **IPv4 only.** The relay listens on `127.0.0.1`; `[::1]` is not bridged.
+- **macOS:** no effect. Seatbelt already pins egress to `localhost:<proxy_port>`.
 
 **Fail-closed behavior:**
 

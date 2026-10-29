@@ -2931,6 +2931,207 @@ print('CONNECTED')
         run_sandboxed_with_flags(project_dir, &["--use-bubblewrap"], script)
     }
 
+    // ── proxy.netns (#114) ─────────────────────────────────────────
+
+    /// A `cplt` running `script` with `proxy.netns = true` under bubblewrap.
+    /// HOME is the suite's scratch HOME (`cplt_cmd`), never the real one.
+    fn netns_cmd(project: &Path, cfg: &Path, extra: &[&str], script: &str) -> Command {
+        fs::write(cfg, "[proxy]\nnetns = true\n").unwrap();
+        let mut cmd = cplt_cmd();
+        cmd.args(["--yes", "--no-validate", "--quiet", "--agent", "shell"])
+            .args(["--use-bubblewrap", "--with-proxy", "--project-dir"])
+            .arg(project)
+            .args(extra)
+            .args(["--", "-c", script])
+            .env("CPLT_CONFIG", cfg);
+        cmd
+    }
+
+    /// proxy.netns fails closed: without bubblewrap, the proxy or the scratch
+    /// dir the launch refuses, naming the fix, and the agent never runs.
+    #[test]
+    fn netns_refuses_without_what_it_needs() {
+        require_landlock!();
+        let project = create_test_project();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("c.toml");
+        for (extra_cfg, flag, want) in [
+            ("", "--no-bubblewrap", "proxy.netns needs Bubblewrap"),
+            ("", "--no-proxy", "proxy.netns needs the proxy"),
+            (
+                "[sandbox]\nscratch_dir = false\n",
+                "--use-bubblewrap",
+                "needs the scratch dir",
+            ),
+        ] {
+            if flag != "--no-bubblewrap" && !bwrap_available() {
+                continue;
+            }
+            fs::write(&cfg, format!("[proxy]\nnetns = true\n{extra_cfg}")).unwrap();
+            let out = cplt_cmd()
+                .args([
+                    "--yes",
+                    "--no-validate",
+                    "--quiet",
+                    "--agent",
+                    "shell",
+                    flag,
+                ])
+                .arg("--project-dir")
+                .arg(project.path())
+                .args(["--", "-c", "echo AGENT_RAN"])
+                .env("CPLT_CONFIG", &cfg)
+                .output()
+                .unwrap();
+            let all = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(!out.status.success(), "{flag}: must refuse: {all}");
+            assert!(!all.contains("AGENT_RAN"), "{flag}: agent ran: {all}");
+            assert!(all.contains(want), "{flag}: want {want:?}: {all}");
+            assert!(
+                all.contains("proxy.netns = false"),
+                "{flag}: no fix named: {all}"
+            );
+        }
+    }
+
+    /// CONNECT reaches the host proxy through the bridge; a direct TCP
+    /// connect (even to a loopback port the policy allows), DNS and UDP have
+    /// no route at all.
+    #[test]
+    fn netns_only_the_proxy_gets_out() {
+        require_bwrap!();
+        require_curl!();
+        let project = create_test_project();
+        let cfg = tempfile::tempdir().unwrap();
+        let (port, _server) = start_http_echo_server();
+        let script = format!(
+            "curl -s -m 10 -o /dev/null -w 'CONNECT=%{{http_connect}}\\n' https://cplt-netns.invalid/; \
+             (exec 3<>/dev/tcp/127.0.0.1/{port}) 2>&1 && echo LOOPBACK=OPEN; \
+             (exec 3<>/dev/tcp/1.1.1.1/443) 2>&1 && echo DIRECT=OPEN; \
+             (echo x > /dev/udp/8.8.8.8/53) 2>&1 && echo UDP=OPEN; \
+             getent hosts example.com >/dev/null && echo DNS=OPEN; echo END"
+        );
+        // /dev/tcp and /dev/udp are bash, and the shell agent runs sh.
+        let probe = project.path().join("probe.sh");
+        fs::write(&probe, script).unwrap();
+        let port_s = port.to_string();
+        let out = netns_cmd(
+            project.path(),
+            &cfg.path().join("c.toml"),
+            &["--allow-localhost", &port_s],
+            &format!("bash {}", probe.display()),
+        )
+        .output()
+        .unwrap();
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(all.contains("END"), "the session must run: {all}");
+        assert!(
+            all.lines()
+                .any(|l| l.starts_with("CONNECT=") && l != "CONNECT=000"),
+            "the proxy must answer CONNECT through the bridge: {all}"
+        );
+        for open in ["LOOPBACK=OPEN", "DIRECT=OPEN", "UDP=OPEN", "DNS=OPEN"] {
+            assert!(
+                !all.contains(open),
+                "{open}: the netns must block it: {all}"
+            );
+        }
+        assert!(
+            all.contains("unreachable"),
+            "a direct connect must fail for want of a route, not a policy: {all}"
+        );
+    }
+
+    /// Every process below `root` (via `/proc/<pid>/stat`, which a
+    /// non-dumpable process still exposes).
+    fn descendants(root: u32) -> Vec<u32> {
+        let parent = |pid: u32| -> Option<u32> {
+            let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            stat.rsplit_once(')')?
+                .1
+                .split_whitespace()
+                .nth(1)?
+                .parse()
+                .ok()
+        };
+        let all: Vec<u32> = fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str()?.parse().ok())
+            .collect();
+        let mut found = vec![root];
+        let mut i = 0;
+        while i < found.len() {
+            let p = found[i];
+            found.extend(all.iter().filter(|&&c| parent(c) == Some(p)));
+            i += 1;
+        }
+        found.remove(0);
+        found
+    }
+
+    fn wait_gone(pids: &[u32]) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let left: Vec<_> = pids
+                .iter()
+                .filter(|p| Path::new(&format!("/proc/{p}")).exists())
+                .collect();
+            if left.is_empty() {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "left running: {left:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+
+    /// The relay (bwrap, its init, the relay, the agent) goes away after a
+    /// normal exit and after `kill -9` of the cplt parent.
+    #[test]
+    fn netns_teardown_leaves_no_process() {
+        use std::io::BufRead as _;
+        require_bwrap!();
+        let project = create_test_project();
+        let cfg = tempfile::tempdir().unwrap();
+        for kill in [false, true] {
+            let script = if kill {
+                "echo READY; sleep 60"
+            } else {
+                "echo READY; sleep 2"
+            };
+            let mut child = netns_cmd(project.path(), &cfg.path().join("c.toml"), &[], script)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(child.stdout.take().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert_eq!(line.trim(), "READY", "kill={kill}");
+            let below = descendants(child.id());
+            // bwrap, its pid 1, the relay and the agent at least.
+            assert!(below.len() >= 4, "kill={kill}: {below:?}");
+            if kill {
+                child.kill().unwrap();
+            }
+            let status = child.wait().unwrap();
+            assert!(kill || status.success(), "normal exit: {status:?}");
+            wait_gone(&below);
+        }
+    }
+
     #[test]
     fn bwrap_auto_detect_default_runs() {
         require_landlock!();
