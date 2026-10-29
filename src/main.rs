@@ -2351,6 +2351,59 @@ fn gh_exec_token_replacement(
         && stored_token()
 }
 
+const LOGIN_HINT_FIX: &str = "`gh auth login` on the host, then `cplt config set \
+     gh_guard.inject_token true --force` (the token is then visible to every process in the sandbox)";
+
+/// #933: the one launch line for a Linux Copilot that may end at `/login`,
+/// which cannot complete from the sandbox (no browser; the device-code URL
+/// fails too). Only where `inject_token` works (gh_guard on, a scratch dir).
+/// `token`: a substitute or a usable token variable. `handover`: the gh
+/// wrapper serves a token gh actually returned. A saved Copilot login (`config.json`) may still
+/// work, so then the line is hedged, naming `skip` when one was recorded.
+fn linux_login_hint(
+    resolved: &config::Resolved,
+    home: &Path,
+    linux: bool,
+    token: bool,
+    handover: bool,
+    gh_logged_in: bool,
+    skip: Option<String>,
+) -> Option<String> {
+    // deny.env stripping all three names leaves inject_token nothing to fill.
+    let injectable = ["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"]
+        .iter()
+        .any(|v| !resolved.deny_env.iter().any(|d| d == v));
+    if !linux || !resolved.gh_guard.enabled || !resolved.scratch_dir || token || !injectable {
+        return None;
+    }
+    if resolved.gh_guard.inject_token {
+        return (!gh_logged_in).then(|| {
+            "gh_guard.inject_token is on but gh is not logged in on the host; run `gh auth login`"
+                .to_string()
+        });
+    }
+    // The opt-out for users whose native keyring access works.
+    if !cplt::sandbox::keychain_substitute_enabled(
+        agent::Agent::Copilot,
+        resolved.keychain_substitute,
+    ) {
+        return None;
+    }
+    if cplt::sandbox::copilot_has_native_login(home) {
+        let why = skip.map(|s| format!(" ({s})")).unwrap_or_default();
+        return Some(format!(
+            "cplt could not pass Copilot's saved login to the sandbox{why}. If Copilot asks for \
+             /login, run {LOGIN_HINT_FIX}"
+        ));
+    }
+    (!handover).then(|| {
+        format!(
+            "Copilot has no GitHub token here, and /login cannot complete in the sandbox. \
+             Run {LOGIN_HINT_FIX}"
+        )
+    })
+}
+
 fn copilot_stored_token_handover(
     resolved: &config::Resolved,
     substitute: Option<&agent::KeychainSubstitute>,
@@ -7119,8 +7172,32 @@ fn assemble_sandbox(
              login. Unlock the keyring at login, or set gh_guard.inject_token = true --force",
         );
     }
+    let env_token = active_agent
+        .keychain_substitute_env_vars()
+        .iter()
+        .filter(|v| !resolved.deny_env.iter().any(|d| d == **v))
+        .any(|v| std::env::var(v).is_ok_and(|t| !t.trim().is_empty()));
+    let timed_out = cplt::sandbox::SECRET_TOOL_TIMED_OUT.load(std::sync::atomic::Ordering::Relaxed);
+    // The timeout line already names inject_token; say it once.
+    let login_hint = (!resolved.quiet && active_agent == agent::Agent::Copilot && !timed_out)
+        .then(|| {
+            linux_login_hint(
+                resolved,
+                home_dir,
+                cfg!(target_os = "linux"),
+                keychain_substitute.is_some() || env_token,
+                // Same cached probe the token cache runs when keyring_moot holds.
+                keyring_moot && discover::stored_gh_token_available(),
+                cplt::sandbox::gh_configured(),
+                cplt::sandbox::SECRET_SERVICE_SKIP
+                    .get()
+                    .map(|s| s.reason(home_dir)),
+            )
+        })
+        .flatten();
     if !resolved.quiet
         && !keyring_moot
+        && login_hint.is_none()
         && let Some(skip) = cplt::sandbox::SECRET_SERVICE_SKIP.get()
     {
         ui::warn(&format!(
@@ -7128,7 +7205,9 @@ fn assemble_sandbox(
             skip.reason(home_dir)
         ));
     }
-
+    if let Some(hint) = login_hint {
+        ui::warn(&hint);
+    }
     let mut extra_exec = resolved.allow_exec.clone();
     extra_exec.extend(pnpm_exec_grants(
         home_dir,
@@ -16108,6 +16187,82 @@ mod tests {
         assert!(
             inject_token_deprecation_line(&policy(true, true), false).is_none(),
             "Linux still needs it"
+        );
+    }
+
+    /// #933: which launch line, if any, a Linux Copilot gets about `/login`.
+    #[test]
+    fn linux_login_hint_composition() {
+        let home = tempfile::tempdir().unwrap();
+        let mut r = config::Config::default()
+            .merge(config::CliFlags::default())
+            .unwrap();
+        r.gh_guard.enabled = true;
+        r.scratch_dir = true;
+        r.gh_guard.inject_token = false;
+        let h = |r: &config::Resolved, linux, token, handover, gh, skip: Option<&str>| {
+            linux_login_hint(
+                r,
+                home.path(),
+                linux,
+                token,
+                handover,
+                gh,
+                skip.map(Into::into),
+            )
+        };
+        // No config.json: flat text.
+        let flat = h(&r, true, false, false, false, None).unwrap();
+        assert!(flat.starts_with("Copilot has no GitHub token"), "{flat}");
+        assert!(flat.contains("visible to every process"));
+        assert!(h(&r, false, false, false, false, None).is_none(), "macOS");
+        assert!(
+            h(&r, true, true, false, false, None).is_none(),
+            "token reachable"
+        );
+        assert!(
+            h(&r, true, false, true, false, None).is_none(),
+            "gh handover"
+        );
+        r.deny_env = vec!["GH_TOKEN".into(), "GITHUB_TOKEN".into()];
+        assert!(
+            h(&r, true, false, false, false, None).is_some(),
+            "one name left"
+        );
+        r.deny_env.push("COPILOT_GITHUB_TOKEN".into());
+        assert!(
+            h(&r, true, false, false, false, None).is_none(),
+            "nothing to inject into"
+        );
+        r.deny_env.clear();
+        // config.json records a login, no hosts.yml: hedged, with the skip.
+        std::fs::create_dir(home.path().join(".copilot")).unwrap();
+        std::fs::write(
+            home.path().join(".copilot/config.json"),
+            r#"{"lastLoggedInUser":{"host":"https://github.com","login":"alice"}}"#,
+        )
+        .unwrap();
+        let hedged = h(&r, true, false, true, false, Some("why")).unwrap();
+        assert!(
+            hedged.starts_with("cplt could not pass Copilot's saved login to the sandbox (why)."),
+            "{hedged}"
+        );
+        r.keychain_substitute = Some(false);
+        assert!(h(&r, true, false, false, false, None).is_none(), "opt-out");
+        r.gh_guard.inject_token = true;
+        assert!(
+            h(&r, true, false, false, true, None).is_none(),
+            "on and gh logged in"
+        );
+        assert!(
+            h(&r, true, false, false, false, None)
+                .unwrap()
+                .contains("not logged in on the host")
+        );
+        r.gh_guard.enabled = false;
+        assert!(
+            h(&r, true, false, false, false, None).is_none(),
+            "fix would not work"
         );
     }
 

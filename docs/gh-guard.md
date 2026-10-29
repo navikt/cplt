@@ -281,6 +281,20 @@ reads. Native login depends on the backend and agent version; a vault prompt
 alone does not establish the cause. Use `inject_token` or a manually supplied,
 session-only token rather than plaintext storage. See [Linux keyring access](known-impacts.md#linux-keyring-access-depends-on-the-backend-and-agent-version).
 
+### Copilot asks for `/login` on Linux
+
+`/login` cannot complete from inside the sandbox: there is no browser, and
+the device-code URL fails too. Sign in on the host with `gh auth login`, then
+run `cplt config set gh_guard.inject_token true --force`. The token is then
+visible to every process in the sandbox.
+
+cplt prints this fix once at launch when `gh_guard` is on, the scratch dir is
+on, `quiet` is off, `sandbox.keychain_substitute` is not `false`, and no token
+is reachable. If `~/.copilot/config.json` records a login, the line is hedged:
+cplt could not pass that login to the sandbox, and it names the reason when it
+knows it. With `inject_token` already on but gh not logged in on the host, cplt
+says to run `gh auth login`.
+
 `inject_token` requires `gh_guard.enabled`: the injection is part of installing
 the gh wrapper, which the guard owns. With the guard off it does nothing, and
 on Linux cplt says so at launch rather than leaving a key that reads as true and
