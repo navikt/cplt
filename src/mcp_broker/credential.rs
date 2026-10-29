@@ -98,6 +98,10 @@ impl Serialize for Credential {
     }
 }
 
+/// For status display only (`cplt mcp status`): never gate a launch, a
+/// login or any other decision on it. The server can write the dir the
+/// probe reads, so it can make the answer come out either way.
+///
 /// The mechanism's status probe, without printing anything it outputs:
 /// whether the login is usable, `None` when unknown, with a note saying why
 /// it is unknown. `(None, None)` when the mechanism has no probe.
@@ -223,6 +227,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn the_linux_probe_runs_in_the_servers_sandbox() {
         if crate::sandbox::bubblewrap_probe::check_availability().is_none() {
+            assert!(
+                std::env::var("CPLT_TEST_REQUIRE_SANDBOX").as_deref() != Ok("1"),
+                "sandbox required by CPLT_TEST_REQUIRE_SANDBOX but bwrap is unavailable"
+            );
             return;
         }
         let mut spec = super::super::test_util::check(super::super::test_util::base()).unwrap();
