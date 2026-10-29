@@ -2358,7 +2358,7 @@ const LOGIN_HINT_FIX: &str = "`gh auth login` on the host, then `cplt config set
 /// which cannot complete from the sandbox (no browser; the device-code URL
 /// fails too). Only where `inject_token` works (gh_guard on, a scratch dir).
 /// `token`: a substitute or a usable token variable. `handover`: the gh
-/// wrapper serves a token. A saved Copilot login (`config.json`) may still
+/// wrapper serves a token gh actually returned. A saved Copilot login (`config.json`) may still
 /// work, so then the line is hedged, naming `skip` when one was recorded.
 fn linux_login_hint(
     resolved: &config::Resolved,
@@ -2369,7 +2369,11 @@ fn linux_login_hint(
     gh_logged_in: bool,
     skip: Option<String>,
 ) -> Option<String> {
-    if !linux || !resolved.gh_guard.enabled || !resolved.scratch_dir || token {
+    // deny.env stripping all three names leaves inject_token nothing to fill.
+    let injectable = ["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"]
+        .iter()
+        .any(|v| !resolved.deny_env.iter().any(|d| d == v));
+    if !linux || !resolved.gh_guard.enabled || !resolved.scratch_dir || token || !injectable {
         return None;
     }
     if resolved.gh_guard.inject_token {
@@ -7182,7 +7186,8 @@ fn assemble_sandbox(
                 home_dir,
                 cfg!(target_os = "linux"),
                 keychain_substitute.is_some() || env_token,
-                keyring_moot,
+                // Same cached probe the token cache runs when keyring_moot holds.
+                keyring_moot && discover::stored_gh_token_available(),
                 cplt::sandbox::gh_configured(),
                 cplt::sandbox::SECRET_SERVICE_SKIP
                     .get()
@@ -16198,6 +16203,17 @@ mod tests {
             h(&r, true, false, true, false, None).is_none(),
             "gh handover"
         );
+        r.deny_env = vec!["GH_TOKEN".into(), "GITHUB_TOKEN".into()];
+        assert!(
+            h(&r, true, false, false, false, None).is_some(),
+            "one name left"
+        );
+        r.deny_env.push("COPILOT_GITHUB_TOKEN".into());
+        assert!(
+            h(&r, true, false, false, false, None).is_none(),
+            "nothing to inject into"
+        );
+        r.deny_env.clear();
         // config.json records a login, no hosts.yml: hedged, with the skip.
         std::fs::create_dir(home.path().join(".copilot")).unwrap();
         std::fs::write(
