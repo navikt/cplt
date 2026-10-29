@@ -75,6 +75,8 @@ pub struct PnpmShadowDir {
     inode: u64,
     source_device: u64,
     source_inode: u64,
+    store_device: u64,
+    store_inode: u64,
     _lock: std::fs::File,
 }
 
@@ -103,6 +105,10 @@ impl PnpmShadowDir {
         use std::os::unix::fs::MetadataExt;
         let entry = std::fs::metadata(pnpm)
             .map_err(|e| format!("Cannot inspect pnpm executable {}: {e}", pnpm.display()))?;
+        let store = source
+            .file
+            .metadata()
+            .map_err(|e| format!("Cannot inspect pnpm store binary: {e}"))?;
 
         let base = home_dir.join(PNPM_SHADOW_BASE);
         match base.symlink_metadata() {
@@ -181,6 +187,8 @@ impl PnpmShadowDir {
             inode: identity.1,
             source_device: entry.dev(),
             source_inode: entry.ino(),
+            store_device: store.dev(),
+            store_inode: store.ino(),
             _lock: session_lock,
         }))
     }
@@ -197,11 +205,21 @@ impl PnpmShadowDir {
 
     /// The shadow to run for `cplt exec -- <requested>` resolved to `path`.
     ///
-    /// Only for a command named `pnpm`: a multicall shim such as mise's can
-    /// serve `node` from the same inode the shadow was copied from.
+    /// A command named `pnpm` that resolves to the PATH entry, or any name
+    /// (an alias such as `pn`) that resolves to the store binary the shadow
+    /// copies. A multicall shim such as mise's serves `node` from the PATH
+    /// entry's inode, so other names on that inode keep their own binary.
     pub fn binary_for(&self, requested: &str, path: &Path) -> Option<PathBuf> {
-        (Path::new(requested).file_name() == Some("pnpm".as_ref()) && self.shadows(path))
-            .then(|| self.binary())
+        use std::os::unix::fs::MetadataExt;
+
+        let is_store = std::fs::metadata(path).is_ok_and(|metadata| {
+            metadata.is_file()
+                && metadata.dev() == self.store_device
+                && metadata.ino() == self.store_inode
+        });
+        (is_store
+            || Path::new(requested).file_name() == Some("pnpm".as_ref()) && self.shadows(path))
+        .then(|| self.binary())
     }
 
     /// Whether `path` names the source inode copied into this shadow.
@@ -1822,6 +1840,28 @@ mod tests {
         ] {
             assert_eq!(shadow_bytes(pin), b"\xcf\xfa\xed\xfeglobal", "{pin}");
         }
+        // A multicall shim (mise) serves pnpm and node from one inode; an
+        // alias such as `pn` names the pinned store binary itself.
+        std::fs::write(
+            project.join("package.json"),
+            r#"{"packageManager":"pnpm@11.25.0"}"#,
+        )
+        .unwrap();
+        let mise = home.path().join("mise");
+        std::fs::write(&mise, b"\xcf\xfa\xed\xfemise").unwrap();
+        let shadow = PnpmShadowDir::create_if_needed(home.path(), &mise, &project)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            shadow.binary_for("shims/pnpm", &mise),
+            Some(shadow.binary())
+        );
+        assert_eq!(shadow.binary_for("shims/node", &mise), None);
+        assert_eq!(
+            shadow.binary_for("pn", &pinned.join("pnpm")),
+            Some(shadow.binary())
+        );
+        drop(shadow);
         // Never copy a pinned file that is not a binary.
         std::fs::write(pinned.join("pnpm"), b"#!/bin/sh\n").unwrap();
         assert_eq!(shadow_bytes("pnpm@11.25.0"), b"\xcf\xfa\xed\xfeglobal");
@@ -1880,15 +1920,11 @@ mod tests {
         assert!(shadow.shadows(&pnpm));
         assert!(shadow.shadows(&links.join("pnpm")));
         assert!(!shadow.shadows(&shadow_path));
-        // A multicall shim (mise) serves pnpm and node from one inode.
-        let shims = home.path().join("shims");
-        std::fs::create_dir_all(&shims).unwrap();
-        std::os::unix::fs::symlink(&pnpm, shims.join("pnpm")).unwrap();
-        std::os::unix::fs::symlink(&pnpm, shims.join("node")).unwrap();
-        let via = |name: &str| shadow.binary_for(&shims.join(name).to_string_lossy(), &pnpm);
-        assert_eq!(via("pnpm"), Some(shadow_path.clone()));
-        assert_eq!(via("node"), None);
-        assert_eq!(shadow.binary_for("node", &pnpm), None);
+        // An alias to the store binary still runs the shadow.
+        assert_eq!(
+            shadow.binary_for("pn", &links.join("pnpm")),
+            Some(shadow_path.clone())
+        );
         let session_path = shadow.path().to_path_buf();
         drop(shadow);
         assert!(!session_path.exists());
