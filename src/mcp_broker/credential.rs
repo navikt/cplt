@@ -272,32 +272,46 @@ mod tests {
             );
             return;
         }
-        let mut spec = super::super::test_util::check(super::super::test_util::base()).unwrap();
-        spec.program = "/bin/sh".into();
+        use std::os::unix::fs::PermissionsExt;
         // Not under the temp dir, which the profile lets the child write.
         let home = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
         let home_path = home.path().canonicalize().unwrap();
         let config = home_path.join("Library/Application Support/nais");
         std::fs::create_dir_all(&config).unwrap();
         std::fs::write(config.join("config.yaml"), "nais: false\n").unwrap();
-        let escaped = home_path.join("escaped");
-        // The stand-in nais: `nais: false` in config.yaml means "run gcloud".
-        let script = r#"grep -q 'nais: false' "$HOME/Library/Application Support/nais/config.yaml" || exit 2; : > "$HOME/escaped""#;
+        let (seen, escaped) = (config.join("seen"), home_path.join("escaped"));
+        // The stand-in nais ignores argv: `nais: false` in config.yaml means
+        // "run gcloud", which writes outside the config dir. `seen`, inside
+        // it, shows the script got as far as that write.
+        let nais = home_path.join("nais");
+        let staging = home_path.join("nais.staging");
+        std::fs::write(
+            &staging,
+            "#!/bin/sh\nd=\"$HOME/Library/Application Support/nais\"\n\
+             grep -q 'nais: false' \"$d/config.yaml\" || exit 2\n\
+             : > \"$d/seen\"\n: > \"$HOME/escaped\"\n",
+        )
+        .unwrap();
+        // `cp`, not a direct write: see the ETXTBSY note in agent.rs.
+        let copied = Command::new("/bin/cp").arg(&staging).arg(&nais).status();
+        assert!(copied.unwrap().success());
+        std::fs::set_permissions(&nais, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut spec = super::super::test_util::check(super::super::test_util::base()).unwrap();
+        spec.program = nais.clone();
         let got = crate::with_env_lock_no_xdg(|| {
-            temp_env::with_var("HOME", Some(&home_path), || {
-                sandboxed_probe(&spec, &["-c", script], Duration::from_secs(30))
-            })
+            temp_env::with_var("HOME", Some(&home_path), || credential_ok(&spec))
         });
+        assert!(seen.exists(), "the probe never reached the planted path");
         assert_eq!(got, (Some(false), None), "the planted path was not refused");
         assert!(
             !escaped.exists(),
-            "the sandboxed probe wrote outside its dirs"
+            "the probe wrote outside the server's dirs"
         );
         // Control: the same probe on the host follows the planted value.
-        let sh = std::path::Path::new("/bin/sh");
+        let args = spec.credential.probe.unwrap();
         let host = crate::with_env_lock_no_xdg(|| {
             temp_env::with_var("HOME", Some(&home_path), || {
-                probe(sh, &["-c", script], false, Duration::from_secs(30))
+                probe(&nais, args, false, Duration::from_secs(30))
             })
         });
         assert_eq!(
@@ -311,9 +325,9 @@ mod tests {
     #[test]
     fn no_home_no_probe() {
         // Without HOME the probe would run with cplt's whole env and cwd.
-        let sh = std::path::Path::new("/bin/sh");
+        let spec = super::super::test_util::check(super::super::test_util::base()).unwrap();
         let r = temp_env::with_var_unset("HOME", || {
-            probe(sh, &["-c", "exit 0"], false, Duration::from_secs(30))
+            sandboxed_probe(&spec, &["-c", "exit 0"], Duration::from_secs(30))
         });
         assert_eq!(r, (None, Some("HOME is not set")));
     }

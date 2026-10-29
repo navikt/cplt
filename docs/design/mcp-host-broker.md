@@ -369,7 +369,7 @@ Kept until a third server makes the shared model worth it (D15).
  "rejected": [{"file": "…/mcp/x.json", "reason": "…", "fix": "…"}]}
 ```
 
-Runs launch detection without starting a child. `credential_ok` uses the
+Runs launch detection without starting the server. `credential_ok` uses the
 mechanism's status probe; no secret is printed. The probe runs in the
 server's own sandbox, through a broker serving that one spec: on Linux
 bwrap, filtered bus and egress proxy; on macOS `mcp_child_profile` and
