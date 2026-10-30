@@ -81,7 +81,8 @@ pub struct PnpmShadowDir {
 }
 
 impl PnpmShadowDir {
-    /// Copy `pnpm` when it shares an inode with a pnpm store hardlink.
+    /// Copy `pnpm` when it shares an inode with a pnpm store hardlink, or is
+    /// a launcher whose target lies in a pnpm home (#936).
     ///
     /// When `launch_dir` pins another exact pnpm version that is already in
     /// the store, shadow that binary instead (#890). pnpm 11 would otherwise
@@ -315,7 +316,7 @@ pub struct PnpmShadowSource {
 
 /// The binary pnpm must run from a read-only shadow, or `None` if it runs
 /// from its own inode. Follows a pnpm 11 cmd-shim launcher to the binary it
-/// execs. The binary lives in the sandbox-writable store, so it is opened
+/// execs. The binary can live in the sandbox-writable store, so it is opened
 /// without following a symlink in any component, checked on that fd, and
 /// refused unless it is a Mach-O or ELF executable.
 pub fn pnpm_shadow_source(
@@ -2085,6 +2086,52 @@ mod tests {
         // SAFETY: `c` is NUL-terminated.
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
         assert!(pnpm_cmd_shim_target_in(&fifo, &[dir.path().to_path_buf()]).is_none());
+    }
+
+    #[test]
+    fn pnpm_global_shadow_links_the_sibling_dist() {
+        // #936: @pnpm/exe 12 ships `dist/` without `pnpm.mjs`. The shadow
+        // links the global binary's own `dist`, whatever it holds, and a
+        // missing `dist` does not fail the shadow.
+        use std::os::unix::fs::PermissionsExt;
+
+        for dist_files in [
+            Some(&["pnpm.mjs", "node_modules/x"][..]),
+            Some(&["node_modules/x", "node-gyp-bin/x"][..]),
+            None,
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let root = home.path().join("Library/pnpm");
+            let exe = root.join("global/v11/557a16cc/node_modules/@pnpm/exe");
+            std::fs::create_dir_all(&exe).unwrap();
+            std::fs::create_dir_all(root.join("bin")).unwrap();
+            let binary = exe.join("pnpm");
+            std::fs::write(&binary, b"\xcf\xfa\xed\xfe").unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            for file in dist_files.unwrap_or_default() {
+                let path = exe.join("dist").join(file);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, b"").unwrap();
+            }
+            let shim = root.join("bin/pnpm");
+            std::fs::write(
+                &shim,
+                format!("#!/bin/sh\n# cmd-shim-target={}\n", binary.display()),
+            )
+            .unwrap();
+
+            let shadow = PnpmShadowDir::create_if_needed(home.path(), &shim, home.path())
+                .unwrap()
+                .expect("a global pnpm behind a shim needs a shadow");
+            let link = std::fs::read_link(shadow.path().join("dist")).ok();
+            assert_eq!(
+                link,
+                dist_files.map(|_| std::fs::canonicalize(exe.join("dist")).unwrap())
+            );
+            for file in dist_files.unwrap_or_default() {
+                assert!(shadow.path().join("dist").join(file).exists());
+            }
+        }
     }
 
     #[test]
