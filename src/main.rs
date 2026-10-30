@@ -1247,6 +1247,35 @@ enum ConfigAction {
         local: bool,
     },
 
+    /// Remove a config value. Same as `config set <KEY> [VALUES...] --unset`.
+    ///
+    /// For array keys with values: removes those elements. Without values,
+    /// or for scalar keys: removes the whole key, reverting to the default.
+    /// Example: cplt config unset allow.exec "~/Library/pnpm/global"
+    /// Example: cplt config unset sandbox.quiet
+    Unset {
+        /// Config key in section.key format (e.g., allow.read, sandbox.quiet)
+        key: String,
+
+        /// Array elements to remove (omit to remove the whole key)
+        #[arg(value_name = "VALUE")]
+        values: Vec<String>,
+
+        /// Remove from the repo-local .cplt.toml.
+        #[arg(long, short = 'r', conflicts_with = "global")]
+        repo: bool,
+
+        /// Remove from the global config (~/.config/cplt/config.toml).
+        /// This is the default behavior.
+        #[arg(long, short = 'g', conflicts_with = "repo")]
+        global: bool,
+
+        /// Remove from this project's per-repo user config
+        /// (~/.config/cplt/local/<hash>.toml).
+        #[arg(long, short = 'l', conflicts_with_all = ["repo", "global"])]
+        local: bool,
+    },
+
     /// Print an agent's effective network hosts (built-in plus hosts detected on this machine).
     ///
     /// Agent hosts (model, auth, telemetry) stay reachable under a user
@@ -9980,6 +10009,17 @@ fn run_config_command(action: ConfigAction) -> ExitCode {
         } => {
             let values: Vec<&str> = values.iter().map(String::as_str).collect();
             run_config_set(&key, &values, append, unset, force, repo, local)
+        }
+        ConfigAction::Unset {
+            key,
+            values,
+            repo,
+            global: _,
+            local,
+        } => {
+            // Unset never needs --force: security_confirmation skips removals.
+            let values: Vec<&str> = values.iter().map(String::as_str).collect();
+            run_config_set(&key, &values, false, true, false, repo, local)
         }
         ConfigAction::Explain { key } => run_config_explain(key.as_deref()),
         ConfigAction::Hosts { agent, json } => run_config_hosts(&agent, json),

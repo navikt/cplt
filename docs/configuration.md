@@ -870,6 +870,7 @@ An unknown name is an error rather than a silent no-op, so a typo cannot leave t
 cplt config set allow.read ~/Desktop --unset     # remove one element
 cplt config set allow.read --unset               # remove entire key
 cplt config set sandbox.quiet --unset            # revert to default
+cplt config unset allow.read ~/Desktop           # same as set ... --unset
 ```
 
 ### Inspecting config
