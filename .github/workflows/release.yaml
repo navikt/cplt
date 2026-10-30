@@ -7,8 +7,19 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Only runs that can publish share the cancelling group, so a newer release
+# still supersedes an older one. The gate matches the `version` job's `if`:
+# a successful CI on a push to this repository. Every other run (cancelled or
+# failed CI, a fork PR from a branch named main, #357) gets its own group: it
+# can neither cancel a real release nor be cancelled (#935 shipped nothing
+# because the cancelled CI's run cancelled the real one).
 concurrency:
-  group: release
+  group: >-
+    release-${{ (github.event_name != 'workflow_run' ||
+    (github.event.workflow_run.conclusion == 'success' &&
+    github.event.workflow_run.event == 'push' &&
+    github.event.workflow_run.head_repository.full_name == github.repository))
+    && 'publish' || github.run_id }}
   cancel-in-progress: true
 
 permissions:
