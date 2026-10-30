@@ -812,6 +812,67 @@ int main(int argc, char **argv) {
         );
     }
 
+    /// #936: pnpm 12 installs `@pnpm/exe/pnpm` under `global/` as a plain
+    /// file with no store alias. The shim's target must still get a shadow
+    /// that runs, while the original stays non-executable.
+    #[test]
+    fn real_profile_shadows_a_plain_global_pnpm_behind_a_shim() {
+        require_sandbox!();
+        let project = tempfile::Builder::new()
+            .prefix(".cplt-pnpm-project-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("create project");
+        let home = tempfile::Builder::new()
+            .prefix(".cplt-pnpm-home-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("create home");
+        let root = home.path().join("Library/pnpm");
+        let binary = root.join("global/v11/557a16cc/node_modules/@pnpm/exe/pnpm");
+        fs::create_dir_all(binary.parent().unwrap()).expect("create global dir");
+        fs::create_dir_all(root.join("bin")).expect("create bin dir");
+        fs::copy(env!("CARGO_BIN_EXE_cplt"), &binary).expect("copy a real binary as fake pnpm");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).expect("chmod pnpm");
+        let shim = root.join("bin/pnpm");
+        fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\nbasedir=$(dirname \"$0\")\n\
+                 exec \"$basedir/../global/v11/557a16cc/node_modules/@pnpm/exe/pnpm\" \"$@\"\n\
+                 exit $?\n# cmd-shim-target={}\n",
+                binary.display()
+            ),
+        )
+        .expect("write shim");
+        fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).expect("chmod shim");
+
+        let shadow =
+            cplt::scratch::PnpmShadowDir::create_if_needed(home.path(), &shim, home.path())
+                .expect("create pnpm shadow")
+                .expect("a plain global pnpm behind a shim must use a shadow");
+        let extra_exec = vec![shadow.path().to_path_buf()];
+        let mut opts = default_opts(project.path(), home.path());
+        opts.extra_exec = &extra_exec;
+        let profile = write_real_profile(&opts);
+        let (output, success) = run_sandboxed(
+            &profile,
+            &format!(
+                "PATH='{}:/usr/bin:/bin' pnpm --version",
+                shadow.path().display()
+            ),
+        );
+        let (direct_output, direct_success) =
+            run_sandboxed(&profile, &format!("'{}' --version", binary.display()));
+        fs::remove_file(&profile).ok();
+        assert!(
+            success && output.contains(&format!("cplt {}", env!("CARGO_PKG_VERSION"))),
+            "the shadow must run: {output}"
+        );
+        assert!(
+            !direct_success,
+            "the global binary must stay non-executable: {direct_output}"
+        );
+    }
+
     /// pnpm's `pnpm setup` rc block must not put `$PNPM_HOME/bin` ahead of
     /// the shadow: cplt appends it so the block finds it already present.
     #[test]

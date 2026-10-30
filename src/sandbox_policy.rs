@@ -2218,7 +2218,8 @@ pub const APP_DIRS: &[AppDir] = &[
         application: "pnpm",
         // A recursive execute grant here would also make the writable `store/`
         // executable under Landlock. The resolved pnpm binary gets an exact
-        // file grant, or a read-only shadow when it is hardlinked into store.
+        // file grant, or a read-only shadow when it is hardlinked into store
+        // or is the target of a `bin/pnpm` launcher.
         process_exec: &[],
         map_exec: &[],
         // Config/Preference resolve to ~/.config/pnpm (or $XDG_CONFIG_HOME/pnpm)
@@ -2605,7 +2606,7 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
     },
     // pnpm global dir ($PNPM_HOME): read-only and non-executable as a tree.
     // The resolved pnpm executable gets an exact file grant, or a read-only
-    // shadow when it is hardlinked into store. The content-addressable store
+    // shadow when it is hardlinked into store or a launcher target. The store
     // one level down stays writable for ordinary `pnpm install`.
     // macOS-native path not following conventions set out by AppDirs.
     HomeToolDir {
