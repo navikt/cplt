@@ -448,7 +448,8 @@ pub fn pinned_pnpm_binary(home_dir: &Path, launch_dir: &Path) -> Option<PathBuf>
 /// The binary a pnpm cmd-shim launcher execs, when it lies in a pnpm home.
 ///
 /// pnpm writes `$PNPM_HOME/bin/pnpm` as a small `/bin/sh` script ending in
-/// `# cmd-shim-target=<path>`. Anything else returns `None`.
+/// `# cmd-shim-target=<path>`, absolute or relative to the shim. Anything
+/// else returns `None`.
 pub fn pnpm_cmd_shim_target(home_dir: &Path, pnpm: &Path) -> Option<PathBuf> {
     let roots: Vec<PathBuf> = pnpm_home_roots(home_dir)
         .into_iter()
@@ -467,7 +468,10 @@ fn pnpm_cmd_shim_target_in(pnpm: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
         .lines()
         .find_map(|line| line.strip_prefix("# cmd-shim-target="))
         .map(PathBuf::from)?;
-    let target = std::fs::canonicalize(target).ok()?;
+    // A shim inside a relocatable root, such as the default PNPM_HOME, names
+    // its target relative to the shim's real directory (#936).
+    let shim_dir = std::fs::canonicalize(pnpm).ok()?.parent()?.to_path_buf();
+    let target = std::fs::canonicalize(shim_dir.join(target)).ok()?;
     (target.is_file() && roots.iter().any(|root| target.starts_with(root))).then_some(target)
 }
 
@@ -2022,6 +2026,38 @@ mod tests {
                 .is_none(),
             "a non-binary store file must never be copied into a shadow"
         );
+    }
+
+    #[test]
+    fn pnpm_cmd_shim_relative_target_resolves_against_shim_dir() {
+        // The `@pnpm/exe` layout in the default PNPM_HOME gets a relocatable
+        // shim: `exec "$basedir/../global/..."` and a relative marker (#936).
+        let home = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(home.path())
+            .unwrap()
+            .join("Library/pnpm");
+        let rel = "../global/v11/abc123/node_modules/@pnpm/exe/pnpm";
+        let binary = root.join("bin").join(rel);
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::write(&binary, b"\xcf\xfa\xed\xfe").unwrap();
+        let shim = root.join("bin/pnpm");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\nbasedir=$(dirname \"$0\")\nexec \"$basedir/{rel}\" \"$@\"\nexit $?\n# cmd-shim-target={rel}\n"
+            ),
+        )
+        .unwrap();
+        let roots = [root.clone()];
+        assert_eq!(
+            pnpm_cmd_shim_target_in(&shim, &roots),
+            Some(std::fs::canonicalize(&binary).unwrap())
+        );
+        // A relative target that climbs out of every pnpm root stays refused.
+        std::fs::write(home.path().join("outside"), b"x").unwrap();
+        std::fs::write(&shim, "#!/bin/sh\n# cmd-shim-target=../../../outside\n").unwrap();
+        assert!(pnpm_cmd_shim_target_in(&shim, &roots).is_none());
     }
 
     #[test]
