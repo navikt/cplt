@@ -3873,6 +3873,14 @@ mod e2e_tests {
         let fake_home = make_config_home("unset-unknown");
         let out = config_unset_global(&fake_home, &["allow.nonsense"]);
         assert!(!out.status.success());
+        // Errors name the form the user typed, not `set --unset`.
+        let out = config_unset_global(&fake_home, &["sandbox.quiet", "true"]);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success());
+        assert!(
+            err.contains("config unset takes a value only for array keys"),
+            "{err}"
+        );
         let _ = std::fs::remove_dir_all(&fake_home);
     }
 
