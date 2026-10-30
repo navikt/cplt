@@ -330,7 +330,11 @@ pub fn pnpm_shadow_source(
     // keeps read-only and non-executable outside `package-manager-store/`.
     // pnpm can install it as a plain file with no store alias, under
     // `global/v11/<hash>/...` (#936), so shadow it like a store binary.
-    pnpm_shadow_source_in(&binary, &[], true)
+    let roots: Vec<PathBuf> = pnpm_home_roots(home_dir)
+        .into_iter()
+        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .collect();
+    pnpm_shadow_source_in(&binary, &roots, true)
 }
 
 /// [`pnpm_shadow_source`] for a path already known to be the binary, so no
@@ -346,8 +350,11 @@ fn pnpm_store_binary_source(
     pnpm_shadow_source_in(binary, &roots, false)
 }
 
-/// `in_pnpm_home` skips the store-alias check for a path the caller already
-/// confined to a pnpm home (a cmd-shim target). Every other check still runs.
+/// With `in_pnpm_home`, `roots` are canonical pnpm homes and the opened path
+/// only has to lie inside one, not alias the store (a cmd-shim target).
+/// Containment is checked on the path opened with no symlink in any
+/// component, so a link swapped into the writable store after the shim
+/// check cannot steer the copy outside the roots. Every other check runs.
 fn pnpm_shadow_source_in(
     binary: &Path,
     roots: &[PathBuf],
@@ -362,7 +369,12 @@ fn pnpm_shadow_source_in(
     let meta = file
         .metadata()
         .map_err(|e| format!("Cannot inspect pnpm executable {}: {e}", path.display()))?;
-    if !meta.is_file() || !(in_pnpm_home || pnpm_has_store_alias_in(&path, &meta, roots)) {
+    let contained = if in_pnpm_home {
+        roots.iter().any(|root| path.starts_with(root))
+    } else {
+        pnpm_has_store_alias_in(&path, &meta, roots)
+    };
+    if !meta.is_file() || !contained {
         return Ok(None);
     }
     let mut magic = [0u8; 4];
@@ -2184,6 +2196,23 @@ mod tests {
         // store alias: the relaxed check is for the shim target only.
         assert!(pnpm_shadow_source(home.path(), &binary).unwrap().is_none());
         assert!(pnpm_shadow_source(home.path(), &outside).unwrap().is_none());
+
+        // A target that passed the shim check but was swapped for a link out
+        // of the roots before the open must not be copied.
+        let roots = [std::fs::canonicalize(&root).unwrap()];
+        let swapped = root.join("store/swapped");
+        std::fs::create_dir_all(root.join("store")).unwrap();
+        std::os::unix::fs::symlink(&outside, &swapped).unwrap();
+        assert!(
+            pnpm_shadow_source_in(&swapped, &roots, true)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            pnpm_shadow_source_in(&binary, &roots, true)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
