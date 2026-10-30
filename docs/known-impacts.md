@@ -1457,6 +1457,23 @@ Adding `~/.npmrc` to the default read grant is not an option either. That hands 
 
 yarn 1 is one case of a wider Linux behaviour. Landlock does not mediate `stat(2)`, `access(2)` or `faccessat(2)`, so a file the sandbox denies still exists and `access(path, R_OK)` says it is readable. Only the `open(2)` fails, with `EACCES`. A tool that checks a file before reading it believes the check and then fails on the open. On macOS, Seatbelt denies the check as well, so the same tool treats the file as absent. This holds under Bubblewrap too for `~/.npmrc`, `~/.yarnrc` and any other path that is simply never granted, since Bubblewrap leaves an unmasked path alone. It does not hold for a `deny.paths`/`--deny-path` target or a masked credential-directory entry: Bubblewrap binds a mode-000 placeholder over those, so `stat` sees that empty, unreadable file and `access(R_OK)` correctly fails instead of lying. The fix here is the same as above: grant the file with `allow.read`, or point the tool at a path that does not exist. See [SECURITY.md](../SECURITY.md#platform-enforcement-comparison) and [#389](https://github.com/navikt/cplt/issues/389).
 
+## vitest with jsdom fails on a package.json above the project
+
+On macOS, `vitest` with `environment: 'jsdom'` can pass every test and then exit 1:
+
+```
+Error: EPERM: operation not permitted, open '/Users/you/package.json'
+MISSING DEPENDENCY  Cannot find dependency 'jsdom'
+```
+
+This only happens when a `package.json` exists in a directory above the project, often a stray `~/package.json`. vitest's install check resolves `jsdom` from the project's parent directory and walks up from there. cplt allows `stat` above the project but denies reading file contents there, so the `open` fails with `EPERM` and vitest reports it as a missing dependency. Without cplt the same thing happens with `EACCES` when an ancestor `package.json` is unreadable. It was seen with vitest 5.0.5.
+
+cplt does not allow these reads on purpose, since that would expose files outside the project. Use one of these:
+
+- remove the stray `package.json` above the project;
+- allow that one file: `cplt --allow-read <parent>/package.json`;
+- skip the check: `VITEST_SKIP_INSTALL_CHECKS=1`.
+
 ## Cloud credential directories
 
 The following directories are **entirely blocked**, with no read, write, or execute:
