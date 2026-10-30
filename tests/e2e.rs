@@ -3805,6 +3805,85 @@ mod e2e_tests {
         let _ = std::fs::remove_dir_all(&fake_home);
     }
 
+    fn config_unset_global(home: &Path, args: &[&str]) -> std::process::Output {
+        cplt_cmd()
+            .args(["config", "unset"])
+            .args(args)
+            .env("HOME", home.to_str().unwrap())
+            .env_remove("CPLT_CONFIG")
+            .output()
+            .expect("should run")
+    }
+
+    /// #936: `config unset` mirrors `config set --unset`.
+    #[test]
+    fn e2e_config_unset_removes_array_element() {
+        let fake_home = make_config_home("unset-elem");
+        let out = config_set_global(
+            &fake_home,
+            &[
+                "allow.exec",
+                "~/Library/pnpm/global",
+                "/opt/keep",
+                "--force",
+            ],
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let out = config_unset_global(&fake_home, &["allow.exec", "~/Library/pnpm/global"]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let content = std::fs::read_to_string(fake_home.join(".config/cplt/config.toml")).unwrap();
+        assert!(content.contains("/opt/keep"), "kept entry gone: {content}");
+        assert!(
+            !content.contains("pnpm"),
+            "removed entry remains: {content}"
+        );
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
+    fn e2e_config_unset_removes_whole_key() {
+        let fake_home = make_config_home("unset-key");
+        let out = config_set_global(&fake_home, &["allow.localhost", "5432", "8099"]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let out = config_unset_global(&fake_home, &["allow.localhost"]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let content = std::fs::read_to_string(fake_home.join(".config/cplt/config.toml")).unwrap();
+        assert!(!content.contains("localhost"), "key remains: {content}");
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
+    fn e2e_config_unset_unknown_key_fails() {
+        let fake_home = make_config_home("unset-unknown");
+        let out = config_unset_global(&fake_home, &["allow.nonsense"]);
+        assert!(!out.status.success());
+        // Errors name the form the user typed, not `set --unset`.
+        let out = config_unset_global(&fake_home, &["sandbox.quiet", "true"]);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success());
+        assert!(
+            err.contains("config unset takes a value only for array keys"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
     #[test]
     fn e2e_config_set_unset_duplicate_values_is_silent() {
         let fake_home = make_config_home("set-unset-dup");

@@ -1247,6 +1247,35 @@ enum ConfigAction {
         local: bool,
     },
 
+    /// Remove a config value. Same as `config set <KEY> [VALUES...] --unset`.
+    ///
+    /// For array keys with values: removes those elements. Without values,
+    /// or for scalar keys: removes the whole key, reverting to the default.
+    /// Example: cplt config unset allow.exec "~/Library/pnpm/global"
+    /// Example: cplt config unset sandbox.quiet
+    Unset {
+        /// Config key in section.key format (e.g., allow.read, sandbox.quiet)
+        key: String,
+
+        /// Array elements to remove (omit to remove the whole key)
+        #[arg(value_name = "VALUE")]
+        values: Vec<String>,
+
+        /// Remove from the repo-local .cplt.toml.
+        #[arg(long, short = 'r', conflicts_with = "global")]
+        repo: bool,
+
+        /// Remove from the global config (~/.config/cplt/config.toml).
+        /// This is the default behavior.
+        #[arg(long, short = 'g', conflicts_with = "repo")]
+        global: bool,
+
+        /// Remove from this project's per-repo user config
+        /// (~/.config/cplt/local/<hash>.toml).
+        #[arg(long, short = 'l', conflicts_with_all = ["repo", "global"])]
+        local: bool,
+    },
+
     /// Print an agent's effective network hosts (built-in plus hosts detected on this machine).
     ///
     /// Agent hosts (model, auth, telemetry) stay reachable under a user
@@ -9981,6 +10010,17 @@ fn run_config_command(action: ConfigAction) -> ExitCode {
             let values: Vec<&str> = values.iter().map(String::as_str).collect();
             run_config_set(&key, &values, append, unset, force, repo, local)
         }
+        ConfigAction::Unset {
+            key,
+            values,
+            repo,
+            global: _,
+            local,
+        } => {
+            // Unset never needs --force: security_confirmation skips removals.
+            let values: Vec<&str> = values.iter().map(String::as_str).collect();
+            run_config_set_via(&key, &values, false, true, false, repo, local, true)
+        }
         ConfigAction::Explain { key } => run_config_explain(key.as_deref()),
         ConfigAction::Hosts { agent, json } => run_config_hosts(&agent, json),
         ConfigAction::Local(LocalAction::List) => run_config_local_list(),
@@ -10403,6 +10443,21 @@ fn run_config_set(
     repo: bool,
     local: bool,
 ) -> ExitCode {
+    run_config_set_via(key, values, append, unset, force, repo, local, false)
+}
+
+/// `via_unset`: the user typed `config unset`, so messages name that form.
+#[allow(clippy::too_many_arguments)]
+fn run_config_set_via(
+    key: &str,
+    values: &[&str],
+    append: bool,
+    unset: bool,
+    force: bool,
+    repo: bool,
+    local: bool,
+    via_unset: bool,
+) -> ExitCode {
     let key_info = match config::lookup_key(key) {
         Ok(info) => info,
         Err(e) => {
@@ -10420,7 +10475,11 @@ fn run_config_set(
         return ExitCode::FAILURE;
     }
     if unset && !values.is_empty() && !key_info.value_type.is_array() {
-        ui::error("--unset does not take a value (except for array keys)");
+        ui::error(if via_unset {
+            "config unset takes a value only for array keys"
+        } else {
+            "--unset does not take a value (except for array keys)"
+        });
         return ExitCode::FAILURE;
     }
     if unset && append {
@@ -10706,6 +10765,13 @@ fn run_config_set(
     // shape as `cplt link --unlink`: one candidate is named, several are all
     // named, and neither removes anything.
     let scope = if local { "--local " } else { "" };
+    let remove_cmd = |v: &str| {
+        if via_unset {
+            format!("cplt config unset {scope}{key} {v}")
+        } else {
+            format!("cplt config set {scope}{key} {v} --unset")
+        }
+    };
     let stored = config::array_entries_in_doc(&doc, op.key_info);
     for val in &missing {
         // No origin reader: these are config entries, not linked repositories,
@@ -10714,13 +10780,14 @@ fn run_config_set(
             cplt::link::Unlink::NoMatch => String::new(),
             cplt::link::Unlink::Remove(entry) => format!(
                 "\n  One entry has that name:\n    {entry}\n  \
-                 Remove that one:\n    cplt config set {scope}{key} {} --unset",
-                sh_quote(&entry)
+                 Remove that one:\n    {}",
+                remove_cmd(&sh_quote(&entry))
             ),
             cplt::link::Unlink::Several(many) => format!(
                 "\n  More than one entry has that name, so cplt is not picking one:\n    {}\n  \
-                 Remove the one you mean:\n    cplt config set {scope}{key} <VALUE> --unset",
-                many.join("\n    ")
+                 Remove the one you mean:\n    {}",
+                many.join("\n    "),
+                remove_cmd("<VALUE>")
             ),
         };
         ui::warn(&format!("{key}: {val} is not set, nothing removed{hint}"));
