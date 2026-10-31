@@ -353,7 +353,8 @@ impl Bubblewrap {
 ///
 /// Still not probed: the pnpm shadow dir (the launch copies pnpm into a fresh
 /// directory under `~/.cplt-pnpm-shadow` and grants it read+execute; doctor
-/// will not copy files for a diagnosis), and, if the scratch dir cannot be
+/// will not copy files for a diagnosis; `run_doctor` names the copy's source
+/// or warns when none is coming, #944), and, if the scratch dir cannot be
 /// created here, the scratch bind and file masks.
 ///
 /// `grants` come from [`crate::sandbox::launch_grants`], validated once by the

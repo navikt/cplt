@@ -2433,6 +2433,11 @@ fn linux_login_hint(
     })
 }
 
+/// [`linux_login_hint`] as a doctor warning (#933).
+fn doctor_login_finding(hint: Option<String>) -> Option<cplt::doctor::Finding> {
+    hint.map(|message| cplt::doctor::Finding::warning(message, None))
+}
+
 fn copilot_stored_token_handover(
     resolved: &config::Resolved,
     substitute: Option<&agent::KeychainSubstitute>,
@@ -9018,6 +9023,70 @@ fn pnpm_bin_missing_from_path<'a>(
     (!shadowed && !bins.iter().any(on_path)).then(|| bins.first())?
 }
 
+/// What doctor says about the PATH pnpm (#944): an `ok` line naming where
+/// the sandbox copy comes from, or a warning when a pnpm launcher execs a
+/// target under a pnpm home that gets no copy, so pnpm will fail. A pnpm of
+/// any other kind gets nothing. Reads only files cplt reads at launch.
+fn doctor_pnpm_state(
+    home_dir: &Path,
+    pnpm: &Path,
+    shadowed: bool,
+    pinned: bool,
+) -> Option<Result<String, cplt::doctor::Finding>> {
+    let target = scratch::pnpm_cmd_shim_target(home_dir, pnpm);
+    let kind = if pinned {
+        "the packageManager pin"
+    } else if !shadowed {
+        let target = target?;
+        // A JS launcher hands the target to node, which only reads it.
+        if launcher_runs_through_interpreter(pnpm, &target) {
+            return None;
+        }
+        return Some(Err(cplt::doctor::Finding::warning(
+            format!(
+                "pnpm's launcher runs {}, which the sandbox keeps non-executable and cplt cannot copy, so pnpm will fail in the sandbox.",
+                // The path comes from an agent-writable launcher.
+                sanitize_terminal_text(&doctor_tilde(&target.display().to_string(), home_dir))
+            ),
+            Some(
+                "report a cplt bug with the `cplt doctor` output; until then, install pnpm outside $PNPM_HOME (for example with Homebrew)"
+                    .to_string(),
+            ),
+        )));
+    } else if target.as_ref().is_some_and(|t| {
+        scratch::pnpm_home_roots(home_dir)
+            .iter()
+            .filter_map(|root| std::fs::canonicalize(root.join("store")).ok())
+            .any(|store| t.starts_with(store))
+    }) || target.is_none()
+    {
+        "the store binary"
+    } else {
+        "the global binary"
+    };
+    Some(Ok(format!("pnpm: sandbox copy of {kind}")))
+}
+
+/// Whether a cmd-shim launcher passes `target` as an argument to another
+/// program (`exec "$basedir/node" "$basedir/../pnpm.mjs"`), so the target
+/// is only read, rather than exec'ing it directly.
+fn launcher_runs_through_interpreter(launcher: &Path, target: &Path) -> bool {
+    let Some(name) = target.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let Ok(Some(script)) = cplt::untrusted::read_regular_following(launcher, 4096) else {
+        return false;
+    };
+    script
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("exec "))
+        .any(|args| {
+            let mut words = args.split_whitespace();
+            words.next().is_some_and(|program| !program.contains(name))
+                && words.any(|word| word.contains(name))
+        })
+}
+
 /// `cplt doctor`. Findings first; the inventory only under `--verbose`.
 ///
 /// Built from the launch's own resolution (`resolve_context`, `HostProbe`,
@@ -9297,6 +9366,8 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     let doctor_pnpm_shadowed = doctor_pnpm
         .as_ref()
         .is_some_and(|pnpm| matches!(scratch::pnpm_shadow_source(&home_dir, pnpm), Ok(Some(_))));
+    let doctor_pinned =
+        doctor_pnpm.is_some() && scratch::pinned_pnpm_shadow_applies(&home_dir, &launch_dir);
     let mut doctor_exec = resolved.allow_exec.clone();
     doctor_exec.extend(pnpm_exec_grants(
         &home_dir,
@@ -9307,12 +9378,19 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     ));
     doctor_exec.sort();
     doctor_exec.dedup();
+    match doctor_pnpm
+        .as_deref()
+        .and_then(|pnpm| doctor_pnpm_state(&home_dir, pnpm, doctor_pnpm_shadowed, doctor_pinned))
+    {
+        Some(Ok(line)) => ok.push(line),
+        Some(Err(finding)) => findings.push(finding),
+        None => {}
+    }
     // pnpm's rc block prepends `$PNPM_HOME/bin` when it is missing from PATH,
     // and its launcher then runs the store binary instead of the shadow.
     // A shadow, from the PATH pnpm or a pinned one, gets `$PNPM_HOME/bin`
     // appended at launch, so only an unshadowed launch needs it on PATH.
-    let pnpm_will_shadow = doctor_pnpm_shadowed
-        || (doctor_pnpm.is_some() && scratch::pinned_pnpm_shadow_applies(&home_dir, &launch_dir));
+    let pnpm_will_shadow = doctor_pnpm_shadowed || doctor_pinned;
     let launch_path: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
@@ -9657,6 +9735,26 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
             &home_dir,
         ),
     );
+    // #933: the launch's `/login` line, unless the keyring finding already
+    // names the same fix. Same inputs as the launch, no new probe.
+    if keyring.is_none() && active_agent == agent::Agent::Copilot {
+        findings.extend(doctor_login_finding(linux_login_hint(
+            &resolved,
+            &home_dir,
+            cfg!(target_os = "linux"),
+            keychain_substitute.is_some() || env_token.is_some(),
+            copilot_stored_token_handover(
+                &resolved,
+                keychain_substitute.as_ref(),
+                auth.gh_cli_auth,
+                cplt::sandbox::copilot_has_native_login(&home_dir),
+            ) && auth.gh_cli_auth,
+            cplt::sandbox::gh_configured(),
+            cplt::sandbox::SECRET_SERVICE_SKIP
+                .get()
+                .map(|s| s.reason(&home_dir)),
+        )));
+    }
     // A recorded skip has one specific fix: lead with it, not a clause in the fix.
     findings.extend(keyring.map(|mut f| {
         if let Some(skip) = cplt::sandbox::SECRET_SERVICE_SKIP.get() {
@@ -13122,6 +13220,136 @@ fn mcp_status_clients(
 mod pnpm_doctor_tests {
     use super::*;
 
+    /// A `pnpm setup` home: `$PNPM_HOME/bin/pnpm`, a cmd-shim launcher
+    /// pointing at `target` (relative to `bin/`, as pnpm writes it).
+    fn pnpm_home_with_launcher(target: &str, body: &[u8]) -> (tempfile::TempDir, PathBuf) {
+        pnpm_home_with_exec(target, body, "")
+    }
+
+    /// `program` is the interpreter cmd-shim puts before the target, if any.
+    fn pnpm_home_with_exec(
+        target: &str,
+        body: &[u8],
+        program: &str,
+    ) -> (tempfile::TempDir, PathBuf) {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("Library/pnpm");
+        let file = root.join(target);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::write(&file, body).unwrap();
+        let launcher = root.join("bin/pnpm");
+        std::fs::write(
+            &launcher,
+            format!(
+                "#!/bin/sh\nexec {program}\"$basedir/../{target}\" \"$@\"\n# cmd-shim-target=../{target}\n"
+            ),
+        )
+        .unwrap();
+        (home, launcher)
+    }
+
+    const MACHO: &[u8] = b"\xcf\xfa\xed\xfe";
+
+    fn state(home: &Path, pnpm: &Path) -> Option<Result<String, cplt::doctor::Finding>> {
+        // Doctor's home_dir is canonical, as macOS's /var temp dir is not.
+        let home = std::fs::canonicalize(home).unwrap();
+        let shadowed = matches!(scratch::pnpm_shadow_source(&home, pnpm), Ok(Some(_)));
+        let pinned = scratch::pinned_pnpm_shadow_applies(&home, &home);
+        doctor_pnpm_state(&home, pnpm, shadowed, pinned)
+    }
+
+    #[test]
+    fn doctor_names_the_global_binary_a_pnpm_setup_launcher_runs() {
+        let (home, launcher) =
+            pnpm_home_with_launcher("global/v11/557a/node_modules/@pnpm/exe/pnpm", MACHO);
+        assert_eq!(
+            state(home.path(), &launcher),
+            Some(Ok("pnpm: sandbox copy of the global binary".to_string()))
+        );
+    }
+
+    #[test]
+    fn doctor_names_the_store_binary_a_launcher_runs() {
+        let (home, launcher) = pnpm_home_with_launcher(
+            "store/v11/links/@pnpm/exe/11.5.1/6d9e/node_modules/@pnpm/exe/pnpm",
+            MACHO,
+        );
+        assert_eq!(
+            state(home.path(), &launcher),
+            Some(Ok("pnpm: sandbox copy of the store binary".to_string()))
+        );
+    }
+
+    #[test]
+    fn doctor_names_the_packagemanager_pin() {
+        let (home, launcher) = pnpm_home_with_launcher(
+            "store/v11/links/@pnpm/exe/11.5.1/6d9e/node_modules/@pnpm/exe/pnpm",
+            MACHO,
+        );
+        std::fs::write(
+            home.path().join("package.json"),
+            r#"{"packageManager":"pnpm@11.5.1"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            state(home.path(), &launcher),
+            Some(Ok(
+                "pnpm: sandbox copy of the packageManager pin".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn doctor_warns_when_a_launcher_target_gets_no_copy() {
+        let (home, launcher) = pnpm_home_with_launcher(
+            "global/v11/557a/node_modules/@pnpm/exe/pnpm",
+            b"not a binary",
+        );
+        let Some(Err(finding)) = state(home.path(), &launcher) else {
+            panic!("expected a warning");
+        };
+        assert_eq!(
+            finding.message,
+            "pnpm's launcher runs ~/Library/pnpm/global/v11/557a/node_modules/@pnpm/exe/pnpm, which the sandbox keeps non-executable and cplt cannot copy, so pnpm will fail in the sandbox."
+        );
+        let fix = finding.fix.unwrap();
+        assert!(
+            fix.contains("`cplt doctor`")
+                && fix.contains("install pnpm outside $PNPM_HOME (for example with Homebrew)"),
+            "{fix}"
+        );
+        assert!(!fix.contains("allow.exec"), "{fix}");
+    }
+
+    /// A shebang script exec'd directly needs exec permission too, and a
+    /// control character in the agent-writable path is not printed raw.
+    #[test]
+    fn doctor_warns_for_a_script_the_launcher_execs_directly() {
+        let (home, launcher) = pnpm_home_with_launcher(
+            "global/v11/557a/node_modules/pnpm/bin/pnpm\x1b[31m.mjs",
+            b"#!/usr/bin/env node\n",
+        );
+        let Some(Err(finding)) = state(home.path(), &launcher) else {
+            panic!("expected a warning");
+        };
+        assert!(!finding.message.contains('\x1b'), "{}", finding.message);
+        assert!(finding.message.contains("pnpm will fail"));
+    }
+
+    #[test]
+    fn doctor_is_silent_for_a_js_launcher_and_an_unknown_pnpm() {
+        let (home, launcher) = pnpm_home_with_exec(
+            "store/v11/links/@/pnpm/11.5.1/abc/node_modules/pnpm/bin/pnpm.mjs",
+            b"#!/usr/bin/env node\n",
+            "\"$basedir/node\"  ",
+        );
+        assert_eq!(state(home.path(), &launcher), None);
+        let other = home.path().join("pnpm");
+        std::fs::write(&other, MACHO).unwrap();
+        assert_eq!(state(home.path(), &other), None);
+    }
+
     #[test]
     fn pnpm_bin_warning_needs_exact_entry_and_no_shadow() {
         let bin = PathBuf::from("/h/Library/pnpm/bin");
@@ -16316,6 +16544,27 @@ mod tests {
             inject_token_deprecation_line(&policy(true, true), false).is_none(),
             "Linux still needs it"
         );
+    }
+
+    /// #933: doctor names the `/login` dead end, as the launch does.
+    #[test]
+    fn doctor_names_the_linux_login_dead_end() {
+        let home = tempfile::tempdir().unwrap();
+        let mut r = config::Config::default()
+            .merge(config::CliFlags::default())
+            .unwrap();
+        r.gh_guard.enabled = true;
+        r.scratch_dir = true;
+        r.gh_guard.inject_token = false;
+        let hint = linux_login_hint(&r, home.path(), true, false, false, false, None);
+        let finding = doctor_login_finding(hint).expect("a Linux Copilot with no token");
+        assert_eq!(finding.level, cplt::doctor::Level::Warning);
+        assert!(
+            finding.message.contains("/login cannot complete"),
+            "{}",
+            finding.message
+        );
+        assert!(doctor_login_finding(None).is_none());
     }
 
     /// #933: which launch line, if any, a Linux Copilot gets about `/login`.
