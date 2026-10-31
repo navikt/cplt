@@ -1466,7 +1466,7 @@ Error: EPERM: operation not permitted, open '/Users/you/package.json'
 MISSING DEPENDENCY  Cannot find dependency 'jsdom'
 ```
 
-This only happens when a `package.json` exists in a directory above the project, often a stray `~/package.json`. vitest's install check resolves `jsdom` from the project's parent directory and walks up from there. cplt allows `stat` above the project but denies reading file contents there, so the `open` fails with `EPERM` and vitest reports it as a missing dependency. Without cplt the same thing happens with `EACCES` when an ancestor `package.json` is unreadable. It was seen with vitest 5.0.5.
+This only happens when a `package.json` exists in a directory above the project, often a stray `~/package.json`. vitest's install check resolves `jsdom` from the project's parent directory and walks up from there. cplt allows `stat` above the project but denies reading file contents there, so the `open` fails with `EPERM` and vitest reports it as a missing dependency. Without cplt the same thing happens with `EACCES` when an ancestor `package.json` is unreadable. It was seen with vitest 5.0.5; the upstream bug is [vitest#11804](https://github.com/vitest-dev/vitest/issues/11804).
 
 cplt does not allow these reads on purpose, since that would expose files outside the project. Use one of these:
 
