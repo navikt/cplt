@@ -679,3 +679,204 @@ Open:
 
 All filed or done. Open work is tracked in
 [#912](https://github.com/navikt/cplt/issues/912).
+
+## 14. Remote servers with OAuth (#910)
+
+Status: proposal, 2026-10-31. Phase 4 in section 11. Consumers: Figma's
+remote MCP and the Nav MCP gateway (navikt/copilot#2083, phase 1 #2085).
+The gateway is an MCP-spec OAuth 2.1 authorization server: protected-resource
+metadata (RFC 9728) per route, the route URL as the RFC 8707 `resource`,
+PKCE S256, CIMD preferred with DCR as the fallback, and rotating refresh
+tokens. Claims about the MCP spec (2026-07-28 authorization and
+client-registration pages) and about Figma are marked **(unverified)**
+where this document has not checked them against the source.
+
+### 14.1 What the broker does today
+
+- The loader refuses any non-empty `remotes[]`
+  (`src/mcp_broker/spec.rs:166-174`), and every spec needs a `command`
+  (`spec.rs:211-213`). Mechanisms are `nais-keychain` and `none`
+  (`src/mcp_broker/credential.rs:41-75`); `gh-token` is refused there and
+  served by the built-in GitHub MCP proxy (`credential.rs:78-84`).
+- Policy (`tools.allow`, `classes`, `writeConsent`, `argChecks`) is checked
+  at load (`spec.rs:239-275`) and on every message
+  (`src/mcp_broker/policy.rs:60`, `:148`, `:239`). It does not care what
+  the upstream is.
+- The broker speaks stdio JSON-RPC lines, protocol versions 2025-06-18 and
+  2025-11-25 only (`src/mcp_broker/mod.rs:31`). 2026-07-28 is not accepted
+  yet; a remote kind that negotiates it needs that list extended.
+- cplt stores no credential of its own. `nais-keychain` is ambient: nais
+  reads its own keychain item (`credential.rs:42-44`). There is no keychain
+  or Secret Service write path in cplt today.
+- The GitHub proxy runs the upstream leg through the system `curl` from the
+  trusted dirs, with token and request on stdin (`src/github_mcp.rs:16-19`,
+  `:206-212`). Its comment "cplt has no TLS stack" is stale: `rustls` is a
+  dependency since #820 (`Cargo.toml:17`), used by the proxy's TLS
+  termination.
+- Auth errors are mirrored as `FAIL not logged in on the host. Fix: <login>`
+  (`src/mcp_broker/runtime.rs:1135-1143`, detection in `policy.rs:292-317`).
+
+### 14.2 Spec schema
+
+A `remote` kind is a spec with one `remotes[]` entry of type
+`streamable-http` and `credential: "oauth"`, and no `command`:
+
+```json
+{
+  "name": "com.figma/figma-mcp",
+  "remotes": [{"type": "streamable-http", "url": "https://mcp.figma.com/mcp"}],
+  "_meta": {"io.github.navikt/broker": {
+    "v": 2,
+    "credential": "oauth",
+    "oauth": {"issuer": "https://api.figma.com", "scopes": ["mcp:read"]},
+    "egressHosts": ["mcp.figma.com", "api.figma.com"],
+    "tools": {"allow": ["get_design_context"], "classes": {}}
+  }}
+}
+```
+
+(Figma's URL, issuer and scope names are placeholders **(unverified)**.)
+
+New invariants, enforced at load:
+
+1. `credential: oauth` requires exactly one remote, `https`, port 443, and
+   no `command`; every other mechanism still refuses `remotes[]`.
+2. The remote's host and `oauth.issuer`'s host are both in `egressHosts`.
+   Discovery that leads anywhere else fails (14.7).
+3. No `headers` with values, no `clientSecret`, no token in the spec
+   (invariants 2 and 6 unchanged). The client identity is not a spec field;
+   it comes from cplt (14.3).
+4. `tools.allow`, `classes`, `writeConsent` and `argChecks` are unchanged.
+
+`v` goes to 2. A cplt that reads only `[1]` rejects the spec with "upgrade
+cplt", which `cplt mcp status --json` already lets nav-pilot predict
+(`mod.rs:21-23`).
+
+### 14.3 Client identity
+
+| Option | For | Against |
+|--------|-----|---------|
+| CIMD: `client_id` is an HTTPS URL to a JSON document Nav hosts | One identity for every server, no registration state, the gateway already prefers it. The authorization server shows the domain at consent | Needs a stable Nav domain; servers that lack CIMD support need a fallback |
+| Pre-registered client id per server | Works with any server that registers clients by hand | One registration per server and per vendor; a public client id is no secret anyway |
+| DCR | Works with Figma today **(unverified)** | A fresh client per user and machine, state to keep, no stable identity to allowlist |
+
+Recommendation: **CIMD, with DCR as the fallback**, in that order, and a
+pre-registered id only if a server supports neither. The document is
+`https://cplt.nav.no/oauth/client.json` **(proposed host; needs an owner
+decision)**, served as a static file from a repository Nav controls, with
+`redirect_uris` `http://127.0.0.1/callback` and `http://localhost/callback`
+(loopback, any port per RFC 8252 7.3), `token_endpoint_auth_method: none`,
+`grant_types` `authorization_code` and `refresh_token`. The document is
+public; it holds no secret. cplt compiles the URL in (D3: a mechanism is a
+cplt row), so a spec cannot pick a different client. The DCR registration
+result (a `client_id`) is stored with the tokens and reused.
+
+### 14.4 Login on the host
+
+`nav-pilot mcp enable <id>` asks first (D10), writes the spec, then runs
+`cplt mcp login <id>` on the host. With `--json` or no tty it only prints
+that command. Login never runs inside a session: `cplt mcp login` refuses
+when `CPLT_MCP_SOCKET` (`mod.rs:27`) or another cplt session marker is set.
+
+1. Fetch the remote URL without a token; read `WWW-Authenticate`
+   `resource_metadata`, else the well-known PRM path (RFC 9728).
+2. Fetch PRM. Its `resource` must equal the spec URL, and its
+   `authorization_servers` must contain `oauth.issuer`. Fetch that issuer's
+   metadata (RFC 8414, then OpenID discovery); its `issuer` must equal
+   `oauth.issuer` byte for byte.
+3. Pick CIMD if the metadata says `client_id_metadata_document_supported`,
+   else DCR at `registration_endpoint`, else fail with one line naming the
+   server.
+4. Bind a listener on `127.0.0.1:0`, build the request with PKCE S256,
+   `state`, `resource=<spec URL>` (RFC 8707) and the spec's scopes, and open
+   the browser (`open` on macOS, `xdg-open` on Linux) or print the URL.
+5. Accept one callback with matching `state` (and `iss` per RFC 9207 when
+   the metadata advertises it), then close the listener. Timeout 5 minutes.
+6. Exchange the code with the verifier and `resource`. Store the result.
+
+Every request in 1-6 goes only to `egressHosts`, https, no redirects
+followed, with the same private-address refusal as the child's egress
+(`src/mcp_broker/egress.rs:12-38`, `:64-68`).
+
+### 14.5 Token storage and refresh
+
+Tokens live in the OS store, owned by cplt alone: the macOS login keychain
+(generic password, service `cplt-mcp`, account the server id) and the Linux
+Secret Service, through a Rust keyring library (a new dependency; cplt has
+none today, 14.1). nav-pilot never reads them. One writer matters because
+refresh tokens rotate: two writers would race and lose the newest one.
+
+Outside every sandbox grant: on macOS the agent's profile has no keychain
+access for this item **(to check: the agent profile's securityd rules)**;
+on Linux the broker already requires bwrap with every bus socket masked
+(section 7, SECURITY.md "MCP host broker: where it runs"). A remote server
+has no child, so no child gets a bus either.
+
+The broker refreshes on its own: before expiry, and once on a 401. It
+writes the rotated refresh token before using the new access token. When
+the refresh token is rejected (`invalid_grant`), the broker deletes the
+item and every call fails with the re-login line (14.6). Nothing retries in
+a loop.
+
+### 14.6 The proxy leg, audit and errors
+
+The client entry stays `cplt mcp-stdio <id>` (D6). The broker reads each
+line, applies the same `on_client` and `on_server` checks
+(`policy.rs:60`, `:239`), and instead of writing to a child's stdin sends
+it as a streamable-HTTP POST to the pinned URL with `Authorization: Bearer`
+and `MCP-Protocol-Version`, and turns JSON or SSE responses back into lines.
+The `Mcp-Session-Id` header is kept per connection. The HTTPS leg uses the
+GitHub proxy's pattern: system `curl` from the trusted dirs, token and
+request on stdin, `-q`, no redirects (`src/github_mcp.rs:16-19`). A
+long-lived SSE GET stream for server-initiated messages is not opened,
+since the broker drops those anyway (SECURITY.md, "Brokered local MCP
+servers").
+
+Compared with the GitHub proxy (SECURITY.md, "GitHub MCP for OpenCode
+v2"): both hold the credential on the host and pin one upstream. The
+GitHub proxy is an HTTP endpoint on the proxy port and forwards whole
+requests; this is the stdio broker, so the JSON-RPC policy (tool allowlist,
+filtered `tools/list`, argument checks, in-flight cap) applies, which the
+GitHub proxy does not have.
+
+Audit: unchanged from #907, one line per `tools/call` with id, tool,
+outcome and duration, no arguments or results. One extra line per refresh
+(`oauth refresh ok` or `FAIL oauth refresh: <error code>`), never a token.
+
+Errors: a 401 after one refresh, or `invalid_grant`, gives the agent a
+JSON-RPC error and the terminal one line, once per session (output
+policy: act now):
+`figma-mcp: login expired. Fix: nav-pilot mcp enable com.figma/figma-mcp`.
+
+### 14.7 Threats
+
+| Threat | Mitigation |
+|--------|------------|
+| PRM points at another authorization server | `issuer` must equal the spec's `oauth.issuer`, whose host is in `egressHosts`. The spec is written by nav-pilot from the registry, outside the sandbox |
+| Malicious authorization server or redirect | No redirects followed in discovery or exchange; https only; private addresses refused; `state`, PKCE and `iss` checked; the callback listener takes one request and closes |
+| Token theft from the sandbox | Tokens never enter the sandbox: not in env, config, the socket's messages or logs. The agent can only make calls through the broker's policy, which is the same exposure as nais today |
+| Token theft on the host | Same as any keychain item the user owns. Tokens are bound by `resource` to one route (gateway); a stolen gateway token reaches one server |
+| Consent phishing with CIMD and a loopback redirect | Anyone can send a user an authorization link naming Nav's `client_id` with a loopback redirect, and the consent screen shows Nav's domain. The code only reaches a listener on the victim's machine, but a local process could race for the port. The MCP spec names this risk **(unverified wording)**. The gateway should show the client domain and requested route at consent; Figma's screen is outside Nav's control |
+| Upstream used to exfiltrate | The broker reaches only the spec's URL; `egressHosts` pins discovery. The agent's own allowlist is not changed |
+| Agent triggers a login | `cplt mcp login` refuses inside a session; the broker never opens a browser |
+
+### 14.8 Phases and open questions
+
+| Option | For | Against |
+|--------|-----|---------|
+| Figma first | A real user need (#910's acceptance); works on DCR alone | Figma's DCR, scopes and redirect rules are unverified; a vendor we cannot change; a session id and SSE quirks to learn on a third party |
+| Gateway first | Nav controls both ends: CIMD, `resource`, rotation and audit can be tested end to end; one client serves every team route | Waits for #2085; no user value until a route exists |
+
+Recommendation: **gateway first**, against #2085's dev deployment, with
+CIMD only. Figma follows as a second step that adds DCR. Both share
+14.2-14.6; only client registration differs.
+
+Open:
+
+- The CIMD host (`cplt.nav.no` or a path on an existing Nav domain), and
+  who owns it.
+- The Rust keyring library, and whether the macOS agent profile can reach a
+  `cplt-mcp` keychain item today (must be denied).
+- Whether scopes come from the spec or from PRM `scopes_supported`.
+- Whether 2026-07-28 is needed for these servers or 2025-11-25 suffices.
+- Whether Figma supports CIMD or only DCR **(unverified)**.
