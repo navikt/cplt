@@ -1472,7 +1472,7 @@ cplt does not allow these reads on purpose, since that would expose files outsid
 
 - remove the stray `package.json` above the project;
 - allow that one file: `cplt --allow-read <parent>/package.json`;
-- skip the check: `VITEST_SKIP_INSTALL_CHECKS=1`.
+- skip the check: `cplt exec -- env VITEST_SKIP_INSTALL_CHECKS=1 pnpm vitest run`. cplt filters the variable out of the environment it inherits, so set it inside the sandbox like this, or pass it with `--pass-env VITEST_SKIP_INSTALL_CHECKS`.
 
 ## Cloud credential directories
 
