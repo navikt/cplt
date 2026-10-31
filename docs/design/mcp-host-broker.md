@@ -741,8 +741,9 @@ New invariants, enforced at load:
 
 1. `credential: oauth` requires exactly one remote, `https`, port 443, and
    no `command`; every other mechanism still refuses `remotes[]`.
-2. The remote's host and `oauth.issuer`'s host are both in `egressHosts`.
-   Discovery that leads anywhere else fails (14.7).
+2. The remote's host and `oauth.issuer`'s host are both in `egressHosts`,
+   and `oauth.issuer` is chosen by the user (specs come only from the user
+   config dir). Discovery that leads anywhere else fails (14.7).
 3. No `headers` with values, no `clientSecret`, no token in the spec
    (invariants 2 and 6 unchanged). The client identity is not a spec field;
    it comes from cplt (14.3).
@@ -764,8 +765,8 @@ Recommendation: **CIMD, with DCR as the fallback**, in that order, and a
 pre-registered id only if a server supports neither. The document is
 `https://cplt.nav.no/oauth/client.json` **(proposed host; needs an owner
 decision)**, served as a static file from a repository Nav controls, with
-`redirect_uris` `http://127.0.0.1/callback` and `http://localhost/callback`
-(loopback, any port per RFC 8252 7.3), `token_endpoint_auth_method: none`,
+`redirect_uris` `http://127.0.0.1/callback` (loopback, any port per
+RFC 8252 7.3), `token_endpoint_auth_method: none`,
 `grant_types` `authorization_code` and `refresh_token`. The document is
 public; it holds no secret. cplt compiles the URL in (D3: a mechanism is a
 cplt row), so a spec cannot pick a different client. The DCR registration
@@ -790,8 +791,9 @@ when `CPLT_MCP_SOCKET` (`mod.rs:27`) or another cplt session marker is set.
 4. Bind a listener on `127.0.0.1:0`, build the request with PKCE S256,
    `state`, `resource=<spec URL>` (RFC 8707) and the spec's scopes, and open
    the browser (`open` on macOS, `xdg-open` on Linux) or print the URL.
-5. Accept one callback with matching `state` (and `iss` per RFC 9207 when
-   the metadata advertises it), then close the listener. Timeout 5 minutes.
+5. The listener accepts only `GET /callback` with matching `state` (and `iss`
+   per RFC 9207 when the metadata advertises it), ignores other requests and
+   stays open until match or timeout. Timeout 5 minutes.
 6. Exchange the code with the verifier and `resource`. Store the result.
 
 Every request in 1-6 goes only to `egressHosts`, https, no redirects
@@ -800,23 +802,24 @@ followed, with the same private-address refusal as the child's egress
 
 ### 14.5 Token storage and refresh
 
-Tokens live in the OS store, owned by cplt alone: the macOS login keychain
-(generic password, service `cplt-mcp`, account the server id) and the Linux
-Secret Service, through a Rust keyring library (a new dependency; cplt has
-none today, 14.1). nav-pilot never reads them. One writer matters because
-refresh tokens rotate: two writers would race and lose the newest one.
+Tokens live in a file under cplt's state dir (`cplt_state_dir`,
+`~/.config/cplt`, which the agent sandbox denies: `DENIED_DOTFILES`), mode
+0600, on both systems; the keyring dependency is no longer needed. Storing
+tokens in the OS keychain or Secret Service, or encrypting with a key kept
+there, is not acceptable: the macOS agent sandbox profile grants read/write
+on `~/Library/Keychains` when the agent needs the keychain
+(`src/sandbox_profile.rs:934-944`), so a token in the login keychain is
+readable by the agent. Residual risk: any process running as the user outside
+the sandbox can read the file, same as other CLI token files. nav-pilot
+never reads them.
 
-Outside every sandbox grant: on macOS the agent's profile has no keychain
-access for this item **(to check: the agent profile's securityd rules)**;
-on Linux the broker already requires bwrap with every bus socket masked
-(section 7, SECURITY.md "MCP host broker: where it runs"). A remote server
-has no child, so no child gets a bus either.
-
-The broker refreshes on its own: before expiry, and once on a 401. It
-writes the rotated refresh token before using the new access token. When
-the refresh token is rejected (`invalid_grant`), the broker deletes the
-item and every call fails with the re-login line (14.6). Nothing retries in
-a loop.
+Several cplt sessions share one token file. Refresh runs under an `flock`
+on `<state dir>/oauth-<id>.lock`. The broker re-reads the file under the lock
+before refreshing (before expiry, and once on a 401), and writes the rotated
+refresh token before using the new access token. On `invalid_grant`, it
+re-reads the file under the lock and deletes it only if the stored refresh
+token equals the rejected one; every call then fails with the re-login line
+(14.6). Nothing retries in a loop.
 
 ### 14.6 The proxy leg, audit and errors
 
@@ -825,7 +828,10 @@ line, applies the same `on_client` and `on_server` checks
 (`policy.rs:60`, `:239`), and instead of writing to a child's stdin sends
 it as a streamable-HTTP POST to the pinned URL with `Authorization: Bearer`
 and `MCP-Protocol-Version`, and turns JSON or SSE responses back into lines.
-The `Mcp-Session-Id` header is kept per connection. The HTTPS leg uses the
+Before sending a token, the broker only sends it to the spec's remote URL.
+A JWT access token whose `aud` does not match the remote URL is not sent
+(opaque tokens: rely on RFC 8707 at the AS, residual risk noted). The
+`Mcp-Session-Id` header is kept per connection. The HTTPS leg uses the
 GitHub proxy's pattern: system `curl` from the trusted dirs, token and
 request on stdin, `-q`, no redirects (`src/github_mcp.rs:16-19`). A
 long-lived SSE GET stream for server-initiated messages is not opened,
