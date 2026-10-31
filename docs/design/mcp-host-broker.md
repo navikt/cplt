@@ -763,8 +763,8 @@ cplt", which `cplt mcp status --json` already lets nav-pilot predict
 
 Recommendation: **CIMD, with DCR as the fallback**, in that order, and a
 pre-registered id only if a server supports neither. The document is
-`https://cplt.nav.no/oauth/client.json` **(proposed host; needs an owner
-decision)**, served as a static file from a repository Nav controls, with
+`https://ki-utvikling.nav.no/cplt/oauth-client.json` (owner decision
+2026-10-31), served as a static file by navikt/copilot's my-copilot app, with
 `redirect_uris` `http://127.0.0.1/callback` (loopback, any port per
 RFC 8252 7.3), `token_endpoint_auth_method: none`,
 `grant_types` `authorization_code` and `refresh_token`. The document is
@@ -879,10 +879,6 @@ CIMD only. Figma follows as a second step that adds DCR. Both share
 
 Open:
 
-- The CIMD host (`cplt.nav.no` or a path on an existing Nav domain), and
-  who owns it.
-- The Rust keyring library, and whether the macOS agent profile can reach a
-  `cplt-mcp` keychain item today (must be denied).
 - Whether scopes come from the spec or from PRM `scopes_supported`.
 - Whether 2026-07-28 is needed for these servers or 2025-11-25 suffices.
 - Whether Figma supports CIMD or only DCR **(unverified)**.
