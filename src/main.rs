@@ -9018,6 +9018,61 @@ fn pnpm_bin_missing_from_path<'a>(
     (!shadowed && !bins.iter().any(on_path)).then(|| bins.first())?
 }
 
+/// What doctor says about the PATH pnpm (#944): an `ok` line naming where
+/// the sandbox copy comes from, or a warning when a pnpm launcher execs a
+/// target under a pnpm home that gets no copy, so pnpm will fail. A pnpm of
+/// any other kind gets nothing. Reads only files cplt reads at launch.
+fn doctor_pnpm_state(
+    home_dir: &Path,
+    pnpm: &Path,
+    launch_dir: &Path,
+) -> Option<Result<String, cplt::doctor::Finding>> {
+    let target = scratch::pnpm_cmd_shim_target(home_dir, pnpm);
+    let kind = if scratch::pinned_pnpm_shadow_applies(home_dir, launch_dir) {
+        "the packageManager pin"
+    } else if !matches!(scratch::pnpm_shadow_source(home_dir, pnpm), Ok(Some(_))) {
+        let target = target?;
+        // A node script (`pnpm.mjs`) is only read by node and needs no copy.
+        if starts_with_shebang(&target) {
+            return None;
+        }
+        return Some(Err(cplt::doctor::Finding::warning(
+            format!(
+                "pnpm's launcher runs {}, which the sandbox keeps non-executable and cplt cannot copy, so pnpm will fail in the sandbox.",
+                doctor_tilde(&target.display().to_string(), home_dir)
+            ),
+            Some(
+                "report a cplt bug with the `cplt doctor` output; until then, use a Homebrew pnpm"
+                    .to_string(),
+            ),
+        )));
+    } else if target.as_ref().is_some_and(|t| {
+        scratch::pnpm_home_roots(home_dir)
+            .iter()
+            .filter_map(|root| std::fs::canonicalize(root.join("store")).ok())
+            .any(|store| t.starts_with(store))
+    }) || target.is_none()
+    {
+        "the store binary"
+    } else {
+        "the global binary"
+    };
+    Some(Ok(format!("pnpm: sandbox copy of {kind}")))
+}
+
+/// Whether `path` starts with `#!`. Opened non-blocking: it can sit in the
+/// sandbox-writable store, where a FIFO could be swapped in.
+fn starts_with_shebang(path: &Path) -> bool {
+    use std::os::unix::fs::{FileExt, OpenOptionsExt};
+    let mut magic = [0u8; 2];
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .and_then(|f| f.read_exact_at(&mut magic, 0))
+        .is_ok_and(|()| &magic == b"#!")
+}
+
 /// `cplt doctor`. Findings first; the inventory only under `--verbose`.
 ///
 /// Built from the launch's own resolution (`resolve_context`, `HostProbe`,
@@ -9307,6 +9362,14 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     ));
     doctor_exec.sort();
     doctor_exec.dedup();
+    match doctor_pnpm
+        .as_deref()
+        .and_then(|pnpm| doctor_pnpm_state(&home_dir, pnpm, &launch_dir))
+    {
+        Some(Ok(line)) => ok.push(line),
+        Some(Err(finding)) => findings.push(finding),
+        None => {}
+    }
     // pnpm's rc block prepends `$PNPM_HOME/bin` when it is missing from PATH,
     // and its launcher then runs the store binary instead of the shadow.
     // A shadow, from the PATH pnpm or a pinned one, gets `$PNPM_HOME/bin`
@@ -13121,6 +13184,108 @@ fn mcp_status_clients(
 #[cfg(test)]
 mod pnpm_doctor_tests {
     use super::*;
+
+    /// A `pnpm setup` home: `$PNPM_HOME/bin/pnpm`, a cmd-shim launcher
+    /// pointing at `target` (relative to `bin/`, as pnpm writes it).
+    fn pnpm_home_with_launcher(target: &str, body: &[u8]) -> (tempfile::TempDir, PathBuf) {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("Library/pnpm");
+        let file = root.join(target);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::write(&file, body).unwrap();
+        let launcher = root.join("bin/pnpm");
+        std::fs::write(
+            &launcher,
+            format!(
+                "#!/bin/sh\nexec \"$basedir/../{target}\" \"$@\"\n# cmd-shim-target=../{target}\n"
+            ),
+        )
+        .unwrap();
+        (home, launcher)
+    }
+
+    const MACHO: &[u8] = b"\xcf\xfa\xed\xfe";
+
+    fn state(home: &Path, pnpm: &Path) -> Option<Result<String, cplt::doctor::Finding>> {
+        // Doctor's home_dir is canonical, as macOS's /var temp dir is not.
+        let home = std::fs::canonicalize(home).unwrap();
+        doctor_pnpm_state(&home, pnpm, &home)
+    }
+
+    #[test]
+    fn doctor_names_the_global_binary_a_pnpm_setup_launcher_runs() {
+        let (home, launcher) =
+            pnpm_home_with_launcher("global/v11/557a/node_modules/@pnpm/exe/pnpm", MACHO);
+        assert_eq!(
+            state(home.path(), &launcher),
+            Some(Ok("pnpm: sandbox copy of the global binary".to_string()))
+        );
+    }
+
+    #[test]
+    fn doctor_names_the_store_binary_a_launcher_runs() {
+        let (home, launcher) = pnpm_home_with_launcher(
+            "store/v11/links/@pnpm/exe/11.5.1/6d9e/node_modules/@pnpm/exe/pnpm",
+            MACHO,
+        );
+        assert_eq!(
+            state(home.path(), &launcher),
+            Some(Ok("pnpm: sandbox copy of the store binary".to_string()))
+        );
+    }
+
+    #[test]
+    fn doctor_names_the_packagemanager_pin() {
+        let (home, launcher) = pnpm_home_with_launcher(
+            "store/v11/links/@pnpm/exe/11.5.1/6d9e/node_modules/@pnpm/exe/pnpm",
+            MACHO,
+        );
+        std::fs::write(
+            home.path().join("package.json"),
+            r#"{"packageManager":"pnpm@11.5.1"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            state(home.path(), &launcher),
+            Some(Ok(
+                "pnpm: sandbox copy of the packageManager pin".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn doctor_warns_when_a_launcher_target_gets_no_copy() {
+        let (home, launcher) = pnpm_home_with_launcher(
+            "global/v11/557a/node_modules/@pnpm/exe/pnpm",
+            b"not a binary",
+        );
+        let Some(Err(finding)) = state(home.path(), &launcher) else {
+            panic!("expected a warning");
+        };
+        assert_eq!(
+            finding.message,
+            "pnpm's launcher runs ~/Library/pnpm/global/v11/557a/node_modules/@pnpm/exe/pnpm, which the sandbox keeps non-executable and cplt cannot copy, so pnpm will fail in the sandbox."
+        );
+        let fix = finding.fix.unwrap();
+        assert!(
+            fix.contains("`cplt doctor`") && fix.contains("Homebrew pnpm"),
+            "{fix}"
+        );
+        assert!(!fix.contains("allow.exec"), "{fix}");
+    }
+
+    #[test]
+    fn doctor_is_silent_for_a_js_launcher_and_an_unknown_pnpm() {
+        let (home, launcher) = pnpm_home_with_launcher(
+            "store/v11/links/@/pnpm/11.5.1/abc/node_modules/pnpm/bin/pnpm.mjs",
+            b"#!/usr/bin/env node\n",
+        );
+        assert_eq!(state(home.path(), &launcher), None);
+        let other = home.path().join("pnpm");
+        std::fs::write(&other, MACHO).unwrap();
+        assert_eq!(state(home.path(), &other), None);
+    }
 
     #[test]
     fn pnpm_bin_warning_needs_exact_entry_and_no_shadow() {
