@@ -694,8 +694,8 @@ where this document has not checked them against the source.
 ### 14.1 What the broker does today
 
 - The loader refuses any non-empty `remotes[]`
-  (`src/mcp_broker/spec.rs:166-174`), and every spec needs a `command`
-  (`spec.rs:211-213`). Mechanisms are `nais-keychain` and `none`
+  (`src/mcp_broker/spec.rs:174-181`), and every spec needs a `command`
+  (`spec.rs:216-218`). Mechanisms are `nais-keychain` and `none`
   (`src/mcp_broker/credential.rs:41-75`); `gh-token` is refused there and
   served by the built-in GitHub MCP proxy (`credential.rs:78-84`).
 - Policy (`tools.allow`, `classes`, `writeConsent`, `argChecks`) is checked
@@ -768,55 +768,69 @@ pre-registered id only if a server supports neither. The document is
 `redirect_uris` `http://127.0.0.1/callback` (loopback, any port per
 RFC 8252 7.3), `token_endpoint_auth_method: none`,
 `grant_types` `authorization_code` and `refresh_token`. The document is
-public; it holds no secret. cplt compiles the URL in (D3: a mechanism is a
-cplt row), so a spec cannot pick a different client. The DCR registration
-result (a `client_id`) is stored with the tokens and reused.
+public; it holds no secret. Document integrity: `CODEOWNERS` + required review
+on that path; the gateway refuses any non-loopback `redirect_uri` for this
+`client_id` regardless of document contents; alert on document change. cplt
+compiles the URL in (D3: a mechanism is a cplt row), so a spec cannot pick a
+different client. The DCR registration result (a `client_id`) is stored with
+the tokens and reused.
 
 ### 14.4 Login on the host
 
 `nav-pilot mcp enable <id>` asks first (D10), writes the spec, then runs
 `cplt mcp login <id>` on the host. With `--json` or no tty it only prints
 that command. Login never runs inside a session: `cplt mcp login` refuses
-when `CPLT_MCP_SOCKET` (`mod.rs:27`) or another cplt session marker is set.
+when detected in a sandbox by something the agent cannot forge, not env
+(`CPLT_MCP_SOCKET`, `src/mcp_broker/mod.rs:29`, is no security boundary).
 
 1. Fetch the remote URL without a token; read `WWW-Authenticate`
    `resource_metadata`, else the well-known PRM path (RFC 9728).
-2. Fetch PRM. Its `resource` must equal the spec URL, and its
-   `authorization_servers` must contain `oauth.issuer`. Fetch that issuer's
-   metadata (RFC 8414, then OpenID discovery); its `issuer` must equal
-   `oauth.issuer` byte for byte.
+2. Fetch PRM. Its `resource` may be an origin per RFC 9728; accept equal or
+   a same-origin prefix of the spec URL. Its `authorization_servers` must
+   contain `oauth.issuer`. Fetch that issuer's metadata (RFC 8414, then
+   OpenID discovery); its `issuer` must equal `oauth.issuer` byte for byte.
 3. Pick CIMD if the metadata says `client_id_metadata_document_supported`,
    else DCR at `registration_endpoint`, else fail with one line naming the
    server.
-4. Bind a listener on `127.0.0.1:0`, build the request with PKCE S256,
-   `state`, `resource=<spec URL>` (RFC 8707) and the spec's scopes, and open
-   the browser (`open` on macOS, `xdg-open` on Linux) or print the URL.
-5. The listener accepts only `GET /callback` with matching `state` (and `iss`
-   per RFC 9207 when the metadata advertises it), ignores other requests and
-   stays open until match or timeout. Timeout 5 minutes.
+4. Bind a listener on `127.0.0.1:0`. Because macOS `ps` exposes the `open` URL
+   (`(allow sysctl-read)`, `src/sandbox_profile.rs:1144`), use a random path
+   segment in the callback URL (`http://127.0.0.1:<port>/callback/<random>`).
+   Build the request with PKCE S256, `state`, `resource=<spec URL>` (RFC 8707)
+   and the spec's scopes, and open the browser (`open` on macOS, `xdg-open` on
+   Linux) or print the URL.
+5. The listener accepts only the first `GET /callback/<random>` request
+   matching path and `state` (and `iss` per RFC 9207 when the metadata
+   advertises it), ignores other requests, and closes immediately after match
+   or timeout (5 minutes). PKCE keeps process snooping of the auth URL down to
+   login DoS.
 6. Exchange the code with the verifier and `resource`. Store the result.
 
 Every request in 1-6 goes only to `egressHosts`, https, no redirects
-followed, with the same private-address refusal as the child's egress
-(`src/mcp_broker/egress.rs:12-38`, `:64-68`).
+followed. Because `curl` re-resolves, the private-address claim would be false
+without pinning (`egress.rs` `dial_public` filters then dials,
+`src/mcp_broker/egress.rs:64-75`). Fix: cplt resolves, filters with
+`is_private_ip`, and passes `curl --resolve host:443:ip --proto =https --max-redirs 0`.
 
 ### 14.5 Token storage and refresh
 
 Tokens live in a file under cplt's state dir (`cplt_state_dir`,
 `~/.config/cplt`, which the agent sandbox denies: `DENIED_DOTFILES`), mode
-0600, on both systems; the keyring dependency is no longer needed. Storing
-tokens in the OS keychain or Secret Service, or encrypting with a key kept
-there, is not acceptable: the macOS agent sandbox profile grants read/write
-on `~/Library/Keychains` when the agent needs the keychain
-(`src/sandbox_profile.rs:934-944`), so a token in the login keychain is
+0600, on both systems; the keyring dependency is no longer needed. Token and
+lock file names (`oauth-<mapped_id>.json`, `oauth-<mapped_id>.lock`) use the
+same `__` id mapping as spec files (`src/mcp_broker/spec.rs:134`) and reject
+`..` segments. Storing tokens in the OS keychain or Secret Service, or
+encrypting with a key kept there, is not acceptable: the macOS agent sandbox
+profile grants read/write on `~/Library/Keychains` when the agent needs the
+keychain (`src/sandbox_profile.rs:934-944`), so a token in the login keychain is
 readable by the agent. Residual risk: any process running as the user outside
 the sandbox can read the file, same as other CLI token files. nav-pilot
 never reads them.
 
 Several cplt sessions share one token file. Refresh runs under an `flock`
-on `<state dir>/oauth-<id>.lock`. The broker re-reads the file under the lock
-before refreshing (before expiry, and once on a 401), and writes the rotated
-refresh token before using the new access token. On `invalid_grant`, it
+on `<state dir>/oauth-<mapped_id>.lock`. The broker re-reads the file under the
+lock before refreshing (before expiry, and on a 401 capped to once per 30 s
+per id), and writes the rotated refresh token via temp file + atomic rename
+under the lock before using the new access token. On `invalid_grant`, it
 re-reads the file under the lock and deletes it only if the stored refresh
 token equals the rejected one; every call then fails with the re-login line
 (14.6). Nothing retries in a loop.
@@ -864,7 +878,7 @@ policy: act now):
 | Token theft on the host | Same as any keychain item the user owns. Tokens are bound by `resource` to one route (gateway); a stolen gateway token reaches one server |
 | Consent phishing with CIMD and a loopback redirect | Anyone can send a user an authorization link naming Nav's `client_id` with a loopback redirect, and the consent screen shows Nav's domain. The code only reaches a listener on the victim's machine, but a local process could race for the port. The MCP spec names this risk **(unverified wording)**. The gateway should show the client domain and requested route at consent; Figma's screen is outside Nav's control |
 | Upstream used to exfiltrate | The broker reaches only the spec's URL; `egressHosts` pins discovery. The agent's own allowlist is not changed |
-| Agent triggers a login | `cplt mcp login` refuses inside a session; the broker never opens a browser |
+| Agent triggers a login | The agent can run the OAuth flow itself (sandbox allows loopback bind/inbound, `src/sandbox_profile.rs:3975-3976`; Linux shares host netns), using Nav's public CIMD `client_id` and its own loopback redirect, then ask the user to click a link. Env-based refusal (`CPLT_MCP_SOCKET`, `src/mcp_broker/mod.rs:29`) is no boundary. Owner decision 2026-10-31: (a) the gateway shows consent for this `client_id` only after the user enters a short code that cplt prints in the terminal; (b) while an oauth spec is loaded, cplt adds the AS host and token endpoint to the agent's proxy blocklist; (c) detect sandbox by something the agent cannot forge, not env; residual: macOS without forced proxy can still reach the AS directly, mitigated by (a). nav-pilot tells users cplt opens the browser itself and never asks them to click an agent-shown link |
 
 ### 14.8 Phases and open questions
 
