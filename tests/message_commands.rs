@@ -1,9 +1,11 @@
 //! Verifies that every `cplt <subcommand> ...` command named in user-facing strings
 //! under `src/` exists in the build and that referenced flags are valid.
 //!
+//! Only commands quoted in backticks are checked, which is how cplt's
+//! messages quote a command. A `cplt <sub>` written without backticks is not
+//! seen; quote it to have it checked.
+//!
 //! See GitHub issue navikt/cplt#942.
-
-#![allow(clippy::disallowed_methods)]
 
 mod common;
 
@@ -326,7 +328,12 @@ pub fn check_command(
 ) -> Result<(), String> {
     let help_text = get_help_output(&cmd.subwords, cache)?;
     for flag in &cmd.flags {
-        if !help_text.contains(flag) {
+        // Whole-token match: `--force` must not pass on `--force-x`, `--no-force`
+        // or a mention inside another option's description.
+        let listed = help_text
+            .split(|c: char| c.is_whitespace() || c == ',' || c == '=' || c == '[' || c == ']')
+            .any(|tok| tok == flag);
+        if !listed {
             return Err(format!(
                 "Command `{}` in {}:{} specifies flag `{}` which was not found in `cplt {} --help`",
                 cmd.raw,
@@ -357,6 +364,20 @@ fn control_synthetic_command_reported() {
         err.contains("frobnicate"),
         "error message should name frobnicate: {err}"
     );
+}
+
+#[test]
+fn control_flag_prefix_is_not_a_match() {
+    // `--forc` is a prefix of `--force`, which `cplt config set --help` lists.
+    let mut cache = HashMap::new();
+    let synthetic = ExtractedCommand {
+        file: "synthetic.rs".to_string(),
+        line: 1,
+        raw: "cplt config set --forc".to_string(),
+        subwords: vec!["config".to_string(), "set".to_string()],
+        flags: vec!["--forc".to_string()],
+    };
+    assert!(check_command(&synthetic, &mut cache).is_err());
 }
 
 #[test]
