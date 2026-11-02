@@ -408,6 +408,8 @@ maven.google.com  dl.google.com      # Google Maven repository (Android)
 
 The base covers `services.gradle.org` and `release-assets.githubusercontent.com`. For Copilot, the wrapper download succeeds out-of-the-box because `github.com` is on Copilot's infrastructure list. For non-Copilot agents, the intermediate redirect through `github.com` is still blocked by default (`github.com` is too broad to grant every agent by default); if `./gradlew` has to fetch a distribution inside the sandbox with those agents, add `github.com` to `allowed_domains`, or run the wrapper once outside cplt so the distribution is already in `~/.gradle/wrapper/dists`.
 
+`proxy.golang.org` serves most module zips itself, but some redirect to `storage.googleapis.com` ([golang/go#52908](https://github.com/golang/go/issues/52908)). That host is far too broad to grant by default. If `go mod download` fails on such a redirect, add `storage.googleapis.com` to `allowed_domains`, or set `GOFLAGS=-mod=mod` with a module cache filled outside cplt.
+
 Each agent adds its own endpoints on top of that shared registry base:
 
 - **Copilot:** GitHub Copilot infrastructure, above.
