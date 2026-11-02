@@ -411,7 +411,7 @@ expect_cache_refused() {
   diagnostic=$(gh auth token 2>&1)
   status=$?
   [ "$status" = 1 ] || exit 54
-  [ "$diagnostic" = "⚠️ BLOCKED by sandbox: 'gh auth token'. No cached token available. To allow it, run \`cplt config set gh_guard.block_auth_token false\`." ] || exit 55
+  [ "$diagnostic" = "⚠️ BLOCKED by sandbox: 'gh auth token'. No cached token available. \`gh_guard.block_auth_token = false\` would let it print the host token, readable by every process in the sandbox; see docs/known-impacts.md." ] || exit 55
 }
 if [ "$EXPECT_DENIED" = 1 ]; then
   [ -z "$__CPLT_GH_TOKEN_DIR" ] || exit 44

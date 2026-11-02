@@ -6082,7 +6082,8 @@ fn serve_cached_gh_token() -> ExitCode {
     let Some(tmpdir) = gh_token_cache_dir() else {
         eprintln!(
             "⚠️ BLOCKED by sandbox: 'gh auth token'. No cached token available. \
-             To allow it, run `cplt config set gh_guard.block_auth_token false`."
+             `gh_guard.block_auth_token = false` would let it print the host token, \
+             readable by every process in the sandbox; see docs/known-impacts.md."
         );
         return ExitCode::FAILURE;
     };
@@ -6101,7 +6102,8 @@ fn serve_cached_gh_token() -> ExitCode {
         _ => {
             eprintln!(
                 "⚠️ BLOCKED by sandbox: 'gh auth token'. No cached token available. \
-                 To allow it, run `cplt config set gh_guard.block_auth_token false`."
+                 `gh_guard.block_auth_token = false` would let it print the host token, \
+                 readable by every process in the sandbox; see docs/known-impacts.md."
             );
             ExitCode::FAILURE
         }
