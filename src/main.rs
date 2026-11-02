@@ -31,9 +31,10 @@ const LONG_VERSION: &str = match option_env!("CPLT_LONG_VERSION") {
 /// Apple Seatbelt (SBPL) via sandbox-exec. On Linux it is Landlock LSM plus
 /// seccomp-BPF, needing kernel 5.13+, or 6.7+ for full network filtering.
 ///
-/// cplt sandboxes GitHub Copilot CLI, OpenCode, Antigravity CLI, Pi, and
-/// Claude Code. It auto-detects Copilot, OpenCode, and Antigravity from PATH.
-/// Pick Pi or Claude Code with --agent, which also overrides the detected agent
+/// cplt sandboxes GitHub Copilot CLI, OpenCode, Antigravity CLI (`agy`), Pi,
+/// Claude Code, Goose, DeepSeek Harness (`dsh`), and Shell. It auto-detects
+/// Copilot, OpenCode, and Antigravity from PATH (in that order). Other agents
+/// are selected with `--agent <NAME>`, which also overrides the detected agent
 /// at any time.
 ///
 /// Save your defaults in ~/.config/cplt/config.toml to stop passing flags every
@@ -764,10 +765,9 @@ actually on screen, then turn it back off."
 enum Command {
     /// Manage cplt configuration.
     ///
-    /// cplt reads config from `~/.config/cplt/config.toml` by default
-    /// (override with `CPLT_CONFIG`). `config.toml`, `trust/`, `local/` and
-    /// `update/` stay in `~/.config/cplt` even when `XDG_CONFIG_HOME` is set;
-    /// launch state and markers follow `XDG_CONFIG_HOME`.
+    /// cplt reads config from `~/.config/cplt/config.toml` by default, or
+    /// `$XDG_CONFIG_HOME/cplt/config.toml` when `config.toml` or `trust/` exists
+    /// there (override with `CPLT_CONFIG=/path/to/config.toml`).
     ///
     /// Use `cplt config explain` to learn what each key does, `show` to see the
     /// merged result, `set` to save values, and `validate` to catch typos early.
@@ -918,6 +918,30 @@ QUICK START:
         fix: bool,
     },
 
+    /// Create a worktree through the managed-worktree broker (#531).
+    ///
+    /// Inside a cplt session with `sandbox.allow_git_worktrees` on,
+    /// `cplt worktree add <name> <ref>` creates a detached worktree under
+    /// `$CPLT_WORKTREE_ROOT` and prints its path. The parent makes the checkout
+    /// under the session read policy, with filters refused and hooks disabled, and publishes it
+    /// only once the tree is validated. A branch is a separate step:
+    /// `git -C <path> switch -c <branch>`.
+    Worktree {
+        #[command(subcommand)]
+        action: WorktreeAction,
+    },
+
+    /// Brokered MCP servers (#824): `cplt mcp status [--json]`.
+    Mcp {
+        #[command(subcommand)]
+        action: McpAction,
+    },
+
+    /// Inside a session: pipe stdio to the brokered MCP server `<id>`. Client
+    /// configs get this as the server's command; it is not run by hand.
+    #[command(name = "mcp-stdio", hide = true)]
+    McpStdio { id: String },
+
     /// Verify & explain sandbox enforcement.
     ///
     /// Runs probes inside the REAL resolved sandbox and proxy, the same policy
@@ -945,31 +969,6 @@ NOTE:
   Probes reflect cplt's resolved policy. A passing network probe means only
   that cplt is not blocking the target. It does not mean the host is up, or
   that an arbitrary agent action behaves the same way.")]
-    /// Create a worktree through the managed-worktree broker (#531).
-    ///
-    /// Inside a cplt session with `sandbox.allow_git_worktrees` on,
-    /// `cplt worktree add <name> <ref>` creates a detached worktree under
-    /// `$CPLT_WORKTREE_ROOT` and prints its path. The parent makes the checkout
-    /// under the session read policy, with filters refused and hooks disabled, and publishes it
-    /// only once the tree is validated. A branch is a separate step:
-    /// `git -C <path> switch -c <branch>`.
-    Worktree {
-        #[command(subcommand)]
-        action: WorktreeAction,
-    },
-
-    /// Brokered MCP servers (#824): `cplt mcp status [--json]`.
-    Mcp {
-        #[command(subcommand)]
-        action: McpAction,
-    },
-
-    /// Inside a session: pipe stdio to the brokered MCP server `<id>`. Client
-    /// configs get this as the server's command; it is not run by hand.
-    #[command(name = "mcp-stdio", hide = true)]
-    McpStdio { id: String },
-
-    /// Probe what the sandbox allows, such as `cplt check path PATH`.
     Check {
         #[command(subcommand)]
         target: Option<CheckTarget>,
@@ -2508,7 +2507,7 @@ fn warn_inject_token_without_guard(resolved: &config::Resolved) {
              guard owns. Either turn the guard on to use it, with `cplt config set \
              gh_guard.enabled true`, or remove the key so the config stops claiming \
              something that is not happening: `cplt config set gh_guard.inject_token \
-             false`, or `cplt config set gh_guard.inject_token --unset` to drop the line \
+             false`, or `cplt config unset gh_guard.inject_token` to drop the line \
              entirely.",
         );
     }
@@ -2658,7 +2657,7 @@ fn config_findings(
             "gh_guard.inject_token is set but gh_guard.enabled is false, so no token is injected.",
             Some(
                 "turn the guard on with `cplt config set gh_guard.enabled true`, or remove the \
-                 key with `cplt config set gh_guard.inject_token --unset`"
+                 key with `cplt config unset gh_guard.inject_token`"
                     .to_string(),
             ),
         ));
@@ -2674,7 +2673,7 @@ fn config_findings(
             if inert {
                 continue;
             }
-            "cplt config set gh_guard.inject_token --unset".to_string()
+            "cplt config unset gh_guard.inject_token".to_string()
         } else {
             // "<VAR> passed to <agent>: …"
             let var = note.split(' ').next().unwrap_or_default();
@@ -3787,15 +3786,15 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                     } else {
                         bail!(
                             "No supported AI coding agent found in PATH. \
-                             Install one of:\n\
-                             [cplt]   Copilot CLI: brew install --cask copilot-cli\n\
-                             [cplt]   OpenCode:    npm i -g opencode-ai\n\
-                             [cplt]   Antigravity: https://antigravity.google/docs/cli-getting-started\n\
-                             [cplt]   Pi:          npm i -g @earendil-works/pi-coding-agent\n\
-                             [cplt]   Claude Code: npm i -g @anthropic-ai/claude-code\n\
-                             [cplt]   goose:       brew install block-goose-cli\n\
-                             [cplt]   DSH:         put the DeepSeek Harness `dsh` launcher in PATH\n\
-                             [cplt] Or specify explicitly: cplt --agent copilot|opencode|antigravity|pi|claude|goose|dsh|shell"
+                             Install one of:\n  \
+                               Copilot CLI: brew install --cask copilot-cli\n  \
+                               OpenCode:    npm i -g opencode-ai\n  \
+                               Antigravity: https://antigravity.google/docs/cli-getting-started\n  \
+                               Pi:          npm i -g @earendil-works/pi-coding-agent\n  \
+                               Claude Code: npm i -g @anthropic-ai/claude-code\n  \
+                               goose:       brew install block-goose-cli\n  \
+                               DSH:         put the DeepSeek Harness `dsh` launcher in PATH\n\
+                             Or specify explicitly: cplt --agent copilot|opencode|antigravity|agy|pi|claude|goose|dsh|shell"
                         );
                     }
                 }
@@ -3861,25 +3860,18 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             ));
         }
 
-        // Warn if Copilot-only flags are used with a non-Copilot agent
-        let copilot_flags_used: Vec<&str> = [
-            cli.resume.as_ref().map(|_| "--resume"),
-            if cli.continue_session {
-                Some("--continue")
-            } else {
-                None
-            },
-            if cli.remote { Some("--remote") } else { None },
-            cli.session_name.as_ref().map(|_| "--name"),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        if !copilot_flags_used.is_empty() {
+        // Warn if unsupported session flags are used with this agent
+        let dropped_flags = active_agent.dropped_session_flags(
+            cli.resume.as_deref(),
+            cli.continue_session,
+            cli.session_name.as_deref(),
+            cli.remote,
+        );
+        if !dropped_flags.is_empty() {
             ui::warn(&format!(
-                "Ignoring Copilot-only flags for {}: {}",
+                "Ignoring unsupported session flags for {}: {}",
                 active_agent.display_name(),
-                copilot_flags_used.join(", ")
+                dropped_flags.join(", ")
             ));
         }
     }
@@ -4497,12 +4489,9 @@ fn start_proxy_if_enabled(
     if allowlist_decision.force_proxy_on {
         resolved.with_proxy = true;
         ui::warn(
-            "observe-domains: no allowlist enforced; every allowed CONNECT is recorded \
+            "observe-domains: allowlist enforcement disabled for this run \
+             (overrides strict/configured allowlists); recording all allowed CONNECTs \
              (blocklists, port policy and private-address checks still apply)",
-        );
-        ui::warn(
-            "observe-domains: this run does NOT enforce an allowlist \
-             (overrides --preset strict / --default-allowlist / configured allowlist)",
         );
     }
 
@@ -6091,7 +6080,11 @@ fn is_gh_auth_token_request(args: &[String]) -> bool {
 /// Returns ExitCode::SUCCESS if token found, FAILURE otherwise.
 fn serve_cached_gh_token() -> ExitCode {
     let Some(tmpdir) = gh_token_cache_dir() else {
-        eprintln!("⚠️ BLOCKED by sandbox: 'gh auth token'. No cached token available.");
+        eprintln!(
+            "⚠️ BLOCKED by sandbox: 'gh auth token'. No cached token available. \
+             `gh_guard.block_auth_token = false` would let it print the host token, \
+             readable by every process in the sandbox; see docs/known-impacts.md."
+        );
         return ExitCode::FAILURE;
     };
 
@@ -6107,7 +6100,11 @@ fn serve_cached_gh_token() -> ExitCode {
             ExitCode::SUCCESS
         }
         _ => {
-            eprintln!("⚠️ BLOCKED by sandbox: 'gh auth token'. No cached token available.");
+            eprintln!(
+                "⚠️ BLOCKED by sandbox: 'gh auth token'. No cached token available. \
+                 `gh_guard.block_auth_token = false` would let it print the host token, \
+                 readable by every process in the sandbox; see docs/known-impacts.md."
+            );
             ExitCode::FAILURE
         }
     }
@@ -7203,7 +7200,7 @@ fn assemble_sandbox(
     {
         ui::warn(
             "secret-tool did not answer within 1 s (keyring locked?): Copilot gets no keyring \
-             login. Unlock the keyring at login, or set gh_guard.inject_token = true --force",
+             login. Unlock the keyring at login, or run `cplt config set gh_guard.inject_token true --force`",
         );
     }
     let env_token = active_agent

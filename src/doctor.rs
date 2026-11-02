@@ -985,7 +985,7 @@ pub fn copilot_own_sandbox_finding(
              it off for the session because it cannot start inside cplt's: shell commands run \
              with cplt as the only boundary.",
             Some(
-                "nothing to change; see known-impacts.md, \"Copilot CLI's own command sandbox\""
+                "no action needed; see docs/known-impacts.md (\"Copilot CLI's own command sandbox\")"
                     .to_string(),
             ),
         )

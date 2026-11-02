@@ -669,7 +669,7 @@ These translate into the agent's own session flags, so you do not need a `--` se
 
 ¹ Neither OpenCode nor Antigravity has an interactive session picker, so a bare `--resume` means "continue last session". Claude Code has one, so it maps straight across.
 
-`--remote` and `--name` are Copilot-only. Pi and shell mode get no translation at all, so all four flags are dropped for them. Auto-resume is a separate mechanism: when you invoke cplt with no pass-through args and no session flags, it appends `--resume` for you, and that applies to Copilot only.
+`--remote` is Copilot-only, and `--name` reaches Copilot and goose only. Pi, DSH and shell mode get no translation at all, so all four flags are dropped for them. cplt warns about each flag it drops. Auto-resume is a separate mechanism: when you invoke cplt with no pass-through args and no session flags, it appends `--resume` for you, and that applies to Copilot only.
 
 Combine them with sandbox flags and `--` pass-through args:
 
