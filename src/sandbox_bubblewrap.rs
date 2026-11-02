@@ -363,8 +363,9 @@ pub(crate) struct Overlays<'a> {
     /// its *name* cannot be renamed or removed ([`rename_pin_paths`]).
     pub pins: &'a [PathBuf],
     /// Directories in `read_only` that get an empty read-only tmpfs when they
-    /// do not exist (`sandbox.mask_missing_deny_paths`), so the agent cannot
-    /// create them. Empty unless the key is on.
+    /// do not exist (`sandbox.mask_missing_deny_paths`), plus missing
+    /// `config.worktree` files masked with `--ro-bind /dev/null <path>`, so the
+    /// agent cannot create them. Empty unless the key is on.
     pub mask_missing: &'a [PathBuf],
 }
 
@@ -700,13 +701,7 @@ pub(crate) fn build_bwrap_args(
         .iter()
         .filter(|p| is_absent_under_real_dir(p) && bound_writable.iter().any(|w| p.starts_with(w)))
     {
-        let p = path.to_string_lossy().into_owned();
-        args.extend([
-            "--tmpfs".to_string(),
-            p.clone(),
-            "--remount-ro".to_string(),
-            p,
-        ]);
+        emit_missing_mask(&mut args, path);
     }
 
     // ── Deny-path masks — emitted last so they shadow every earlier bind ──
@@ -798,13 +793,7 @@ pub(crate) fn build_bwrap_args(
         .iter()
         .filter(|p| under_writable_rebind(p) && is_absent_under_real_dir(p))
     {
-        let p = path.to_string_lossy().into_owned();
-        args.extend([
-            "--tmpfs".to_string(),
-            p.clone(),
-            "--remount-ro".to_string(),
-            p,
-        ]);
+        emit_missing_mask(&mut args, path);
     }
     if let Some(placeholder) = &deny_masks.placeholder {
         let ph = placeholder.to_string_lossy().into_owned();
@@ -821,6 +810,23 @@ pub(crate) fn build_bwrap_args(
     }
 
     args
+}
+
+/// Mask a missing path from [`Overlays::mask_missing`]: `--ro-bind /dev/null
+/// <path>` for `config.worktree` (bwrap creates the empty mountpoint file on
+/// the host), or an empty read-only tmpfs for a missing directory.
+fn emit_missing_mask(args: &mut Vec<String>, path: &Path) {
+    let p = path.to_string_lossy().into_owned();
+    if path.file_name() == Some(std::ffi::OsStr::new("config.worktree")) {
+        args.extend(["--ro-bind".to_string(), "/dev/null".to_string(), p]);
+    } else {
+        args.extend([
+            "--tmpfs".to_string(),
+            p.clone(),
+            "--remount-ro".to_string(),
+            p,
+        ]);
+    }
 }
 
 /// Whether `path` is a missing `.git/remotes` or `.git/branches` directory
@@ -3918,6 +3924,156 @@ mod tests {
         assert!(
             !on.iter().any(|a| *a == s(&orphan)),
             "a missing parent must not be created by a mask: {on:?}"
+        );
+    }
+
+    #[test]
+    fn mask_missing_worktree_config_key_off_is_byte_identical() {
+        let base = non_tmp_tempdir();
+        let root = base.path().canonicalize().unwrap();
+        let home = root.join("home");
+        let repo = root.join("repo");
+        let git = repo.join(".git");
+        let wt = git.join("worktrees/wt");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(
+            git.join("config"),
+            "[extensions]\n\tworktreeConfig = true\n",
+        )
+        .unwrap();
+
+        let mut config = crate::sandbox::tests::test_config(&home, &[]);
+        config.project_dir = &repo;
+        config.git_common_dir = Some(&git);
+        config.allow_git_config_write = false;
+        config.mask_missing_deny_paths = false;
+
+        let ro = crate::sandbox::ro_protect_paths(&config, &[], &[]);
+        let pins = crate::sandbox::pin_paths(&config, &[], &[]);
+        let masks = crate::sandbox::missing_dir_masks(&config, false);
+        assert!(masks.is_empty());
+
+        let rules = [writable_rule(&repo.to_string_lossy())];
+        let baseline = build_bwrap_args(
+            &rules,
+            Overlays {
+                read_only: &ro,
+                pins: &pins,
+                mask_missing: &[],
+            },
+            &DenyMasks::default(),
+        );
+        let key_off = build_bwrap_args(
+            &rules,
+            Overlays {
+                read_only: &ro,
+                pins: &pins,
+                mask_missing: &masks,
+            },
+            &DenyMasks::default(),
+        );
+        assert_eq!(key_off, baseline);
+    }
+
+    #[test]
+    fn mask_missing_worktree_config_binds_dev_null_when_enabled() {
+        let base = non_tmp_tempdir();
+        let root = base.path().canonicalize().unwrap();
+        let home = root.join("home");
+        let repo = root.join("repo");
+        let git = repo.join(".git");
+        let wt_missing = git.join("worktrees/wt_missing");
+        let wt_existing = git.join("worktrees/wt_existing");
+        let orphan_cw = git.join("worktrees/missing_parent/config.worktree");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&wt_missing).unwrap();
+        std::fs::create_dir_all(&wt_existing).unwrap();
+        std::fs::write(
+            git.join("config"),
+            "[extensions]\n\tworktreeConfig = true\n",
+        )
+        .unwrap();
+        std::fs::write(wt_existing.join("config.worktree"), "[core]\n").unwrap();
+
+        let mut config = crate::sandbox::tests::test_config(&home, &[]);
+        config.project_dir = &repo;
+        config.git_common_dir = Some(&git);
+        config.allow_git_config_write = false;
+        config.mask_missing_deny_paths = true;
+
+        let ro = crate::sandbox::ro_protect_paths(&config, &[], &[]);
+        let pins = crate::sandbox::pin_paths(&config, &[], &[]);
+        let mut masks = crate::sandbox::missing_dir_masks(&config, false);
+        masks.push(orphan_cw.clone());
+
+        let rules = [writable_rule(&repo.to_string_lossy())];
+        let args = build_bwrap_args(
+            &rules,
+            Overlays {
+                read_only: &ro,
+                pins: &pins,
+                mask_missing: &masks,
+            },
+            &DenyMasks::default(),
+        );
+        let s = |p: &Path| p.to_string_lossy().into_owned();
+        let dev_null_bound = |p: &Path| {
+            args.windows(3)
+                .any(|w| w == ["--ro-bind", "/dev/null", &s(p)])
+        };
+        let root_cw = git.join("config.worktree");
+        let wt_missing_cw = wt_missing.join("config.worktree");
+        let wt_existing_cw = wt_existing.join("config.worktree");
+
+        assert!(dev_null_bound(&root_cw), "{args:?}");
+        assert!(dev_null_bound(&wt_missing_cw), "{args:?}");
+        assert!(!dev_null_bound(&wt_existing_cw), "{args:?}");
+        assert!(
+            args.windows(3)
+                .any(|w| w == ["--ro-bind", &s(&wt_existing_cw), &s(&wt_existing_cw)]),
+            "{args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| *a == s(&orphan_cw)),
+            "missing parent must be skipped: {args:?}"
+        );
+    }
+
+    #[test]
+    fn mask_missing_worktree_config_absent_emits_no_mask() {
+        let base = non_tmp_tempdir();
+        let root = base.path().canonicalize().unwrap();
+        let home = root.join("home");
+        let repo = root.join("repo");
+        let git = repo.join(".git");
+        let wt = git.join("worktrees/wt");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(git.join("config"), "[core]\n\tbare = false\n").unwrap();
+
+        let mut config = crate::sandbox::tests::test_config(&home, &[]);
+        config.project_dir = &repo;
+        config.git_common_dir = Some(&git);
+        config.allow_git_config_write = false;
+        config.mask_missing_deny_paths = true;
+
+        let ro = crate::sandbox::ro_protect_paths(&config, &[], &[]);
+        let pins = crate::sandbox::pin_paths(&config, &[], &[]);
+        let masks = crate::sandbox::missing_dir_masks(&config, false);
+        let rules = [writable_rule(&repo.to_string_lossy())];
+        let args = build_bwrap_args(
+            &rules,
+            Overlays {
+                read_only: &ro,
+                pins: &pins,
+                mask_missing: &masks,
+            },
+            &DenyMasks::default(),
+        );
+        assert!(
+            !args.iter().any(|a| a.ends_with("config.worktree")),
+            "worktreeConfig absent must emit no mask: {args:?}"
         );
     }
 
