@@ -139,6 +139,10 @@ impl SettingsApp {
                 if self.scope == Scope::Repository && repo_key_target(key).is_none() {
                     return false;
                 }
+                // Global-only (#950): the local layer never applies it.
+                if self.scope == Scope::Local && (key.section, key.key) == ("gh_guard", "hosts") {
+                    return false;
+                }
                 let needle = self.filter.to_ascii_lowercase();
                 needle.is_empty()
                     || format!("{}.{} {}", key.section, key.key, key.description)
@@ -1410,6 +1414,27 @@ mod tests {
 
         assert!(app.pending.is_empty(), "nothing may be staged globally");
         assert!(app.status.contains("Local"), "{}", app.status);
+    }
+
+    /// `gh_guard.hosts` is global-only: Local scope neither shows it nor
+    /// accepts a document carrying it.
+    #[test]
+    fn local_scope_hides_and_refuses_gh_hosts() {
+        let mut app = test_app("");
+        app.scope = Scope::Local;
+        assert!(
+            !app.visible_keys()
+                .iter()
+                .any(|k| (k.section, k.key) == ("gh_guard", "hosts"))
+        );
+        app.scope = Scope::Global;
+        assert!(
+            app.visible_keys()
+                .iter()
+                .any(|k| (k.section, k.key) == ("gh_guard", "hosts"))
+        );
+        let doc: toml_edit::DocumentMut = "[gh_guard]\nhosts = [\"x.ghe.com\"]\n".parse().unwrap();
+        assert!(crate::config::validate_local_document(&doc).is_err());
     }
 
     #[test]

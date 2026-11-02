@@ -357,6 +357,15 @@ fn reject_relative_paths(config: &Config, display: &str) -> Result<(), ConfigErr
 /// [`Config`] ignores unknown tables, and the loader strips it for real.
 pub fn validate_local_document(doc: &toml_edit::DocumentMut) -> Result<(), ConfigError> {
     super::editing::validate_global_document(doc)?;
+    // Global-only: the loader drops it from a local file, so writing it there
+    // would be a setting that silently does nothing.
+    if doc.get("gh_guard").and_then(|t| t.get("hosts")).is_some() {
+        return Err(ConfigError::Validation(
+            "gh_guard.hosts is global-only and cannot be set in local config. \
+             Set it globally: cplt config set gh_guard.hosts <HOST>"
+                .to_string(),
+        ));
+    }
     reject_relative_paths(&Config::parse(&doc.to_string())?, "local config")
 }
 

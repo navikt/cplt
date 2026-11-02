@@ -92,7 +92,35 @@ fn github_token_allowed_for(args: &[&str], pin: Option<&str>, hosts: &[String]) 
     {
         return false;
     }
-    true
+    // gh honours an explicit selector over `GH_REPO`: a host-qualified `-R`
+    // or a URL argument decides where the request goes, so a destination off
+    // github.com gets no github.com token, whatever was pinned.
+    let not_github = |h: &str| {
+        !h.eq_ignore_ascii_case(DEFAULT_GH_HOST) && !h.eq_ignore_ascii_case("api.github.com")
+    };
+    let repo_flag_host = parse_command(args)
+        .and_then(|cmd| cmd.repo_flag)
+        .and_then(|r| {
+            let r = r
+                .split_once("://")
+                .map_or(r.as_str(), |(_, rest)| rest)
+                .to_string();
+            (r.matches('/').count() >= 2).then(|| r.split('/').next().unwrap_or("").to_string())
+        });
+    if repo_flag_host.is_some_and(|h| not_github(&h)) {
+        return false;
+    }
+    !args.iter().any(|arg| {
+        let Some(rest) = arg
+            .strip_prefix("https://")
+            .or_else(|| arg.strip_prefix("http://"))
+        else {
+            return false;
+        };
+        let authority = rest.split('/').next().unwrap_or(rest);
+        let host = authority.rsplit('@').next().unwrap_or(authority);
+        not_github(host.split(':').next().unwrap_or(host))
+    })
 }
 
 fn host_allowed(host: &str, hosts: &[String]) -> bool {
@@ -1505,9 +1533,18 @@ pub fn is_repo_in_scope(
             };
             let path = endpoint.split(['?', '#']).next().unwrap_or(endpoint);
             let decoded = decode_api_path(path)?;
-            // The path names no host: the request goes to `--hostname`, else
-            // github.com (`GH_HOST` is scrubbed on every exec).
-            let host = cmd.hostname.as_deref().unwrap_or(DEFAULT_GH_HOST);
+            // An absolute URL (only `https://api.github.com/` passes above)
+            // decides the host whatever `--hostname` says. A bare path goes to
+            // `--hostname`, else github.com (`GH_HOST` is scrubbed on every exec).
+            let host = if cmd
+                .api_endpoint
+                .as_deref()
+                .is_some_and(|e| e.contains("://"))
+            {
+                DEFAULT_GH_HOST
+            } else {
+                cmd.hostname.as_deref().unwrap_or(DEFAULT_GH_HOST)
+            };
             if let Some(endpoint_repo) = extract_repo_from_api_path(endpoint) {
                 return scope_member(scope, &member_name(host, &endpoint_repo));
             }
@@ -6014,6 +6051,16 @@ mod tests {
             in_scope(&["pr", "create", "-R", "example.ghe.com/x/y"]).as_deref(),
             Some("example.ghe.com/x/y")
         );
+        // An absolute URL decides the host, whatever --hostname says.
+        assert_eq!(
+            in_scope(&[
+                "api",
+                "--hostname",
+                "example.ghe.com",
+                "https://api.github.com/repos/x/y/issues"
+            ]),
+            None
+        );
         // A relative read resolves to the cwd's member; --hostname must agree.
         let cmd = parse_command(&["api", "--hostname", "github.com", "pulls/1"]).unwrap();
         assert_eq!(
@@ -6140,6 +6187,21 @@ mod tests {
         assert!(ok(&["pr", "list"], Some("github.com/o/r")));
         assert!(!ok(&["pr", "list"], Some("example.ghe.com/o/r")));
         assert!(!ok(&["api", "--hostname", "example.ghe.com", "user"], None));
+        // gh honours an explicit -R or URL over the pin.
+        assert!(!ok(
+            &["pr", "view", "1", "-R", "example.ghe.com/other/repo"],
+            Some("github.com/o/r")
+        ));
+        assert!(!ok(
+            &["pr", "view", "https://example.ghe.com/x/y/pull/1"],
+            Some("github.com/o/r")
+        ));
+        assert!(ok(
+            &["pr", "view", "1", "-R", "o/r"],
+            Some("github.com/o/r")
+        ));
+        assert!(ok(&["pr", "view", "https://github.com/o/r/pull/1"], None));
+        assert!(ok(&["api", "https://api.github.com/repos/o/r"], None));
         // Its host is on stdin: the helper entry marks it instead.
         assert!(ok(&["auth", "git-credential", "get"], None));
         // Default list: unchanged, every exec gets the token.
