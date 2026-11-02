@@ -77,8 +77,8 @@ pub fn gh_hosts() -> &'static [String] {
 ///
 /// `gh` sends `GH_TOKEN` to github.com and to every `*.ghe.com` tenant, so it
 /// must not ride along to a command aimed at another configured host: a
-/// non-github.com pin, a `--hostname` naming one, or `auth git-credential`
-/// (whose host arrives on stdin) while a `*.ghe.com` host is configured.
+/// non-github.com pin or a `--hostname` naming one. `auth git-credential`, whose
+/// host arrives on stdin, is marked by [`FOREIGN_CREDENTIAL_ENV`] instead.
 /// With `gh_guard.hosts` unset every exec gets the token, as before.
 #[must_use]
 pub fn github_token_allowed(args: &[&str], pin: Option<&str>) -> bool {
@@ -92,10 +92,7 @@ fn github_token_allowed_for(args: &[&str], pin: Option<&str>, hosts: &[String]) 
     {
         return false;
     }
-    let mut positional = args.iter().copied().filter(|a| !a.starts_with('-'));
-    let credential =
-        positional.next() == Some("auth") && positional.next() == Some("git-credential");
-    !(credential && hosts.iter().any(|h| h.ends_with(".ghe.com")))
+    true
 }
 
 fn host_allowed(host: &str, hosts: &[String]) -> bool {
@@ -119,6 +116,23 @@ fn split_member(member: &str) -> (&str, &str) {
         _ => (DEFAULT_GH_HOST, member),
     }
 }
+
+/// The host of an approved `GH_REPO` pin.
+#[must_use]
+pub fn pin_host(pin: &str) -> &str {
+    split_member(pin.strip_prefix("github.com/").unwrap_or(pin)).0
+}
+
+/// Whether `gh_guard.hosts` is set to anything but the default.
+#[must_use]
+pub fn hosts_configured() -> bool {
+    gh_hosts() != [DEFAULT_GH_HOST]
+}
+
+/// Env var a credential-helper entry for a non-github.com host sets, so the
+/// gate withholds the github.com token from that call only. Setting it can
+/// only take the token away, so the agent gains nothing by forging it.
+pub const FOREIGN_CREDENTIAL_ENV: &str = "CPLT_GH_FOREIGN_CREDENTIAL";
 
 /// The host of an approved `GH_REPO` pin, when it is a configured host other
 /// than github.com. The caller then pins `GH_HOST` to it too, so a bare
@@ -2257,6 +2271,17 @@ fn gate_with_scope_resolver(
         };
     }
 
+    // gh keeps the last `--hostname`; a check reading another one would
+    // approve one host and let gh, and the github.com token, go to another.
+    // Nothing needs two, so refuse rather than pick.
+    if requested_hostnames(args).len() > 1 {
+        return Err(Refusal {
+            headline: "'gh' was given --hostname more than once.".to_string(),
+            guidance: "Pass a single --hostname.".to_string(),
+            agent_note: &[RESTRICTED, NOTE],
+        });
+    }
+
     // The GraphQL check names repositories as `owner/name`, without a host,
     // so it is only sound against github.com.
     if cmd.command == "api"
@@ -2797,16 +2822,23 @@ pub fn check_merge_protection(
     )))
 }
 
-fn requested_hostname<'a>(args: &'a [&str]) -> Option<&'a str> {
+/// Every `--hostname` value, in order. gh (pflag) keeps the LAST one.
+fn requested_hostnames<'a>(args: &'a [&str]) -> Vec<&'a str> {
+    let mut found = Vec::new();
     for (index, arg) in args.iter().enumerate() {
         if let Some(hostname) = arg.strip_prefix("--hostname=") {
-            return Some(hostname);
-        }
-        if *arg == "--hostname" {
-            return args.get(index + 1).copied().or(Some(""));
+            found.push(hostname);
+        } else if *arg == "--hostname" {
+            found.push(args.get(index + 1).copied().unwrap_or(""));
         }
     }
-    None
+    found
+}
+
+/// The `--hostname` gh will use: the last one, as pflag reads it. The gate
+/// refuses a repeated flag outright, so this is only ever the single value.
+fn requested_hostname<'a>(args: &'a [&str]) -> Option<&'a str> {
+    requested_hostnames(args).last().copied()
 }
 
 fn github_api_endpoint_path(endpoint: &str) -> Result<&str, ()> {
@@ -6012,6 +6044,62 @@ mod tests {
         );
     }
 
+    /// gh keeps the last `--hostname`; the gate read the first. A repeat is
+    /// refused in every spelling and order.
+    #[test]
+    fn repeated_hostname_is_refused() {
+        for args in [
+            &[
+                "api",
+                "--hostname",
+                "github.com",
+                "--hostname",
+                "evil.ghe.com",
+                "repos/o/r",
+            ][..],
+            &[
+                "api",
+                "--hostname",
+                "evil.ghe.com",
+                "--hostname",
+                "github.com",
+                "repos/o/r",
+            ],
+            &[
+                "api",
+                "--hostname=github.com",
+                "--hostname",
+                "evil.ghe.com",
+                "repos/o/r",
+            ],
+            &[
+                "api",
+                "--hostname",
+                "evil.ghe.com",
+                "--hostname=github.com",
+                "user",
+            ],
+            &[
+                "pr",
+                "list",
+                "--hostname=github.com",
+                "--hostname=github.com",
+            ],
+        ] {
+            let refusal = gate_with_repo_scope(args, &GatePolicy::default(), &["o/r".into()], None)
+                .unwrap_err();
+            assert!(
+                refusal.headline.contains("more than once"),
+                "{args:?}: {refusal}"
+            );
+        }
+        assert_eq!(
+            requested_hostname(&["--hostname", "a", "--hostname=b"]),
+            Some("b"),
+            "last wins, as in pflag"
+        );
+    }
+
     #[test]
     fn graphql_is_refused_on_another_host() {
         let refusal = gate_with_repo_scope(
@@ -6052,14 +6140,10 @@ mod tests {
         assert!(ok(&["pr", "list"], Some("github.com/o/r")));
         assert!(!ok(&["pr", "list"], Some("example.ghe.com/o/r")));
         assert!(!ok(&["api", "--hostname", "example.ghe.com", "user"], None));
-        assert!(!ok(&["auth", "git-credential", "get"], None));
+        // Its host is on stdin: the helper entry marks it instead.
+        assert!(ok(&["auth", "git-credential", "get"], None));
         // Default list: unchanged, every exec gets the token.
         let github = vec!["github.com".to_string()];
-        assert!(github_token_allowed_for(
-            &["auth", "git-credential", "get"],
-            None,
-            &github
-        ));
         assert!(github_token_allowed_for(
             &["api", "--hostname", "example.ghe.com", "user"],
             None,

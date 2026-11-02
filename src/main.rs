@@ -6050,14 +6050,19 @@ fn exec_real(
     command.env_remove("GH_REPO");
     if let Some(repo) = repo_scope {
         command.env("GH_REPO", repo);
-        // A pin on a configured non-github.com host also pins the host, so a
-        // bare `-R owner/repo` or `gh api` path cannot land on another one.
-        if let Some(host) = gh_proxy::foreign_pin_host(repo) {
-            command.env("GH_HOST", host);
+        // With `gh_guard.hosts` set, every pin also pins its host, so a bare
+        // `-R owner/repo` or `gh api` path cannot land on another one (gh's
+        // default host is the only one logged in, which may be a GHE host).
+        // Unset, the env stays as it always was.
+        if gh_proxy::hosts_configured() {
+            command.env("GH_HOST", gh_proxy::pin_host(repo));
         }
     }
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let foreign_credential = std::env::var_os(gh_proxy::FOREIGN_CREDENTIAL_ENV).is_some();
+    command.env_remove(gh_proxy::FOREIGN_CREDENTIAL_ENV);
     if name == "gh"
+        && !foreign_credential
         && gh_proxy::github_token_allowed(&arg_refs, repo_scope)
         && let Some(token) = exec_gh_token()
     {

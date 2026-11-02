@@ -102,8 +102,10 @@ The key is global-only. `cplt config set --local` refuses it, and a local or
 With a host added:
 
 - remotes on it join the scope as `host/owner/repo`, and `GH_REPO` and
-  `GH_HOST` are pinned to that repository and host;
-- `--hostname` may name any listed host;
+  `GH_HOST` are pinned to that repository and host (with the key set,
+  `GH_HOST` is pinned for github.com repositories too);
+- `--hostname` may name any listed host, once: a repeated `--hostname` is
+  refused;
 - `gh api` paths are checked on the host they go to: `--hostname`, else
   github.com. Name the host with `--hostname` for a `/repos/` call on it.
   Absolute `https://` endpoints are still limited to `https://api.github.com`;
