@@ -100,29 +100,29 @@ fn github_token_allowed_for(args: &[&str], pin: Option<&str>, hosts: &[String]) 
     // `*.ghe.com` destination can therefore receive the github.com token by
     // mistake. A URL in a body or notes on any other host is just text.
     let not_github = |h: &str| h.to_ascii_lowercase().ends_with(".ghe.com");
-    let repo_flag_host = parse_command(args)
-        .and_then(|cmd| cmd.repo_flag)
-        .and_then(|r| {
-            let r = r
-                .split_once("://")
-                .map_or(r.as_str(), |(_, rest)| rest)
-                .to_string();
-            (r.matches('/').count() >= 2).then(|| r.split('/').next().unwrap_or("").to_string())
-        });
-    if repo_flag_host.is_some_and(|h| not_github(&h)) {
-        return false;
+    // Go's url.Parse lowercases the scheme, so `HTTPS://` is a URL too.
+    fn http_rest(arg: &str) -> Option<&str> {
+        let (scheme, rest) = arg.split_once("://")?;
+        (scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http"))
+            .then_some(rest)
     }
-    !args.iter().any(|arg| {
-        let Some(rest) = arg
-            .strip_prefix("https://")
-            .or_else(|| arg.strip_prefix("http://"))
-        else {
+    // The host part: before the first `/` or `:`, after any `user@`. Covers
+    // URL authorities, `HOST/owner/repo` and scp `git@HOST:owner/repo`; a
+    // bare `owner/repo` yields `owner`, which is never a `*.ghe.com` host.
+    let host_of = |rest: &str| -> String {
+        let end = rest.find(['/', ':']).unwrap_or(rest.len());
+        let head = &rest[..end];
+        head.rsplit('@').next().unwrap_or(head).to_string()
+    };
+    if let Some(r) = parse_command(args).and_then(|cmd| cmd.repo_flag) {
+        let rest = r.split_once("://").map_or(r.as_str(), |(_, rest)| rest);
+        if not_github(&host_of(rest)) {
             return false;
-        };
-        let authority = rest.split('/').next().unwrap_or(rest);
-        let host = authority.rsplit('@').next().unwrap_or(authority);
-        not_github(host.split(':').next().unwrap_or(host))
-    })
+        }
+    }
+    !args
+        .iter()
+        .any(|arg| http_rest(arg).is_some_and(|rest| not_github(&host_of(rest))))
 }
 
 fn host_allowed(host: &str, hosts: &[String]) -> bool {
@@ -6206,6 +6206,13 @@ mod tests {
         assert!(ok(&["api", "https://api.github.com/repos/o/r"], None));
         assert!(ok(
             &["pr", "comment", "1", "--body", "https://ci.example/run/1"],
+            None
+        ));
+        assert!(!ok(&["pr", "view", "HTTPS://x.ghe.com/o/r/pull/1"], None));
+        assert!(!ok(&["pr", "view", "Http://x.ghe.com/o/r/pull/1"], None));
+        assert!(!ok(&["pr", "view", "1", "-R", "git@x.ghe.com:o/r"], None));
+        assert!(!ok(
+            &["pr", "view", "1", "-R", "https://x.ghe.com/o/r"],
             None
         ));
         assert!(ok(
