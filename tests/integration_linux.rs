@@ -5355,7 +5355,7 @@ print('CONNECTED')
                         "key on: {marker} in a masked missing extensions/: {stdout}"
                     );
                 }
-                let left = fs::read_dir(&ext).map(|d| d.count()).unwrap_or(0);
+                let left = fs::read_dir(&ext).map(Iterator::count).unwrap_or(0);
                 assert_eq!(left, 0, "nothing may reach the host extensions/");
             } else {
                 assert!(
