@@ -1498,6 +1498,53 @@ impl Agent {
         args
     }
 
+    /// Return the list of session-management flags passed by the user that are
+    /// not supported (and therefore dropped) by this agent.
+    pub fn dropped_session_flags(
+        &self,
+        resume: Option<&str>,
+        continue_session: bool,
+        session_name: Option<&str>,
+        remote: bool,
+    ) -> Vec<&'static str> {
+        let mut dropped = Vec::new();
+        match self {
+            Agent::Copilot => {}
+            Agent::OpenCode | Agent::Antigravity | Agent::Claude => {
+                if remote {
+                    dropped.push("--remote");
+                }
+                if session_name.is_some() {
+                    dropped.push("--name");
+                }
+            }
+            Agent::Goose => {
+                if remote {
+                    dropped.push("--remote");
+                }
+                let selector = resume.filter(|s| !s.is_empty());
+                if session_name.is_some() && selector.is_some() {
+                    dropped.push("--name");
+                }
+            }
+            Agent::Dsh | Agent::Pi | Agent::Shell => {
+                if remote {
+                    dropped.push("--remote");
+                }
+                if resume.is_some() {
+                    dropped.push("--resume");
+                }
+                if continue_session {
+                    dropped.push("--continue");
+                }
+                if session_name.is_some() {
+                    dropped.push("--name");
+                }
+            }
+        }
+        dropped
+    }
+
     /// Additional workspace roots (`--repo-dir` / `sandbox.repo_dirs`) translated
     /// into the agent's native multi-root workspace flags.
     ///
@@ -4645,6 +4692,48 @@ mod tests {
                     .session_args(Some("id"), true, Some("name"), true)
                     .is_empty(),
                 "{agent:?} should not translate any session flags"
+            );
+        }
+    }
+
+    #[test]
+    fn dropped_session_flags_accuracy() {
+        // Copilot drops nothing
+        assert!(
+            Agent::Copilot
+                .dropped_session_flags(Some("id"), true, Some("name"), true)
+                .is_empty()
+        );
+
+        // OpenCode, Antigravity, Claude keep resume and continue, drop remote and name
+        for agent in [Agent::OpenCode, Agent::Antigravity, Agent::Claude] {
+            assert!(
+                agent
+                    .dropped_session_flags(Some("id"), true, None, false)
+                    .is_empty()
+            );
+            assert_eq!(
+                agent.dropped_session_flags(None, false, Some("n"), true),
+                vec!["--remote", "--name"]
+            );
+        }
+
+        // Goose keeps resume, continue, and name (when no ID selector), drops remote
+        assert_eq!(
+            Agent::Goose.dropped_session_flags(None, true, Some("task"), true),
+            vec!["--remote"]
+        );
+        // Goose drops name when resume ID is given
+        assert_eq!(
+            Agent::Goose.dropped_session_flags(Some("id"), false, Some("task"), false),
+            vec!["--name"]
+        );
+
+        // Pi, Dsh, Shell drop everything passed
+        for agent in [Agent::Pi, Agent::Dsh, Agent::Shell] {
+            assert_eq!(
+                agent.dropped_session_flags(Some("id"), true, Some("name"), true),
+                vec!["--remote", "--resume", "--continue", "--name"]
             );
         }
     }
