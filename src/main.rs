@@ -767,7 +767,8 @@ enum Command {
     ///
     /// cplt reads config from `~/.config/cplt/config.toml` by default, or
     /// `$XDG_CONFIG_HOME/cplt/config.toml` when `config.toml` or `trust/` exists
-    /// there (override with `CPLT_CONFIG=/path/to/config.toml`).
+    /// there; an empty XDG directory falls back to `~/.config/cplt`, so isolate
+    /// harnesses with `CPLT_CONFIG=/path/to/config.toml`.
     ///
     /// Use `cplt config explain` to learn what each key does, `show` to see the
     /// merged result, `set` to save values, and `validate` to catch typos early.
