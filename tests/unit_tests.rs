@@ -10276,6 +10276,7 @@ inject_token = false
 unknown_command = "warn"
 allow_api_write = false
 allow_pr_merge = false
+hosts = ["github.com"]
 
 [git_guard]
 enabled = false

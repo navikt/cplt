@@ -73,6 +73,7 @@ inject_token = false        # no effect on macOS; Linux Copilot may need it
 unknown_command = "block"   # block|allow unrecognized gh commands
 allow_api_write = false     # allow gh api write (POST/PUT/PATCH) to current repo (opt-in)
 allow_pr_merge = false      # allow gh pr merge into a ruleset-protected branch (opt-in)
+hosts = ["github.com"]      # GitHub hosts whose remotes are scoped; global config only
 
 [git_guard]
 enabled = true              # intercept git push, request-pull, send-pack
@@ -81,6 +82,44 @@ prevent_push = true         # treat push/request-pull as violations
 prevent_force_push = true   # block force push, even where a plain push is allowed
 ```
 </details>
+
+### GitHub Enterprise hosts
+
+By default the guard scopes only `github.com` remotes. A checkout cloned from
+another host, such as `https://example.ghe.com/owner/repo`, gets no scope, and
+scope-checked commands are refused. Add the host to `gh_guard.hosts` in your
+global config:
+
+```bash
+cplt config set gh_guard.hosts github.com,example.ghe.com
+```
+
+List `github.com` too if you still use it. Entries are bare hostnames: no
+`https://`, path, port or wildcard. `cplt config set` refuses anything else.
+The key is global-only. `cplt config set --local` refuses it, and a local or
+`.cplt.toml` file cannot set it.
+
+With a host added:
+
+- remotes on it join the scope as `host/owner/repo`, and `GH_REPO` and
+  `GH_HOST` are pinned to that repository and host (with the key set,
+  `GH_HOST` is pinned for github.com repositories too);
+- `--hostname` may name any listed host, once: a repeated `--hostname` is
+  refused;
+- `gh api` paths are checked on the host they go to: `--hostname`, else
+  github.com. Name the host with `--hostname` for a `/repos/` call on it.
+  Absolute `https://` endpoints are still limited to `https://api.github.com`;
+- git's HTTPS credential helper is routed through the guard for every listed
+  host;
+- the cached github.com token is not handed to a command aimed at another
+  listed host.
+
+`gh api graphql` and `allow_pr_merge` still work on github.com only. On other
+hosts they are refused.
+
+The guard does not open the network. The host must also be reachable through
+the proxy: under strict networking, add it to `allowed_domains`. cplt does
+not add it for you.
 
 ### Backward compatibility
 

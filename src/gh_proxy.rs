@@ -49,6 +49,129 @@ pub struct ParsedCommand {
     pub has_input_flags: bool,
     /// For `gh api`: the endpoint path (e.g., "/repos/owner/repo/pulls").
     pub api_endpoint: Option<String>,
+    /// The `--hostname` value, if present. Qualifies a `gh api` `/repos/` path
+    /// with the host the request goes to.
+    pub hostname: Option<String>,
+}
+
+/// The host a scope member is on when its name carries none.
+pub const DEFAULT_GH_HOST: &str = "github.com";
+
+static GH_HOSTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// Set the GitHub hosts the guard accepts (`gh_guard.hosts`), lowercased. Once
+/// per process: the launch sets it from the resolved global config, `gh-gate`
+/// from the flags baked into its wrapper. A later call is ignored.
+// ponytail: process-global, so a test cannot change it; the pure `_for`
+// helpers take the list instead.
+pub fn set_gh_hosts(hosts: &[String]) {
+    let _ = GH_HOSTS.set(hosts.iter().map(|h| h.to_ascii_lowercase()).collect());
+}
+
+/// The GitHub hosts the guard accepts; `["github.com"]` unless configured.
+pub fn gh_hosts() -> &'static [String] {
+    GH_HOSTS.get_or_init(|| vec![DEFAULT_GH_HOST.to_string()])
+}
+
+/// Whether the github.com token cplt cached may go to this approved `gh` exec.
+///
+/// `gh` sends `GH_TOKEN` to github.com and to every `*.ghe.com` tenant, so it
+/// must not ride along to a command aimed at another configured host: a
+/// non-github.com pin or a `--hostname` naming one. `auth git-credential`, whose
+/// host arrives on stdin, is marked by [`FOREIGN_CREDENTIAL_ENV`] instead.
+/// With `gh_guard.hosts` unset every exec gets the token, as before.
+#[must_use]
+pub fn github_token_allowed(args: &[&str], pin: Option<&str>) -> bool {
+    github_token_allowed_for(args, pin, gh_hosts())
+}
+
+fn github_token_allowed_for(args: &[&str], pin: Option<&str>, hosts: &[String]) -> bool {
+    let foreign = |h: &str| host_allowed(h, hosts) && !h.eq_ignore_ascii_case(DEFAULT_GH_HOST);
+    if pin.and_then(foreign_pin_host).is_some_and(foreign)
+        || requested_hostname(args).is_some_and(foreign)
+    {
+        return false;
+    }
+    // gh honours an explicit selector over `GH_REPO`: a host-qualified `-R`
+    // or a URL argument decides where the request goes, so a destination off
+    // github.com gets no github.com token, whatever was pinned.
+    // Mirrors go-gh `tokenForHost`: GH_TOKEN reaches github.com, `*.github.com`,
+    // localhost and `*.ghe.com` tenants; GHES uses GH_ENTERPRISE_TOKEN. Only a
+    // `*.ghe.com` destination can therefore receive the github.com token by
+    // mistake. A URL in a body or notes on any other host is just text.
+    let not_github = |h: &str| h.to_ascii_lowercase().ends_with(".ghe.com");
+    // Go's url.Parse lowercases the scheme, so `HTTPS://` is a URL too.
+    fn http_rest(arg: &str) -> Option<&str> {
+        let (scheme, rest) = arg.split_once("://")?;
+        (scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http"))
+            .then_some(rest)
+    }
+    // The host part: before the first `/`, after the last `@`, before a `:`. Covers
+    // URL authorities, `HOST/owner/repo` and scp `git@HOST:owner/repo`; a
+    // bare `owner/repo` yields `owner`, which is never a `*.ghe.com` host.
+    let host_of = |rest: &str| -> String {
+        let head = rest.split('/').next().unwrap_or(rest);
+        let head = head.rsplit('@').next().unwrap_or(head);
+        head.split(':').next().unwrap_or(head).to_string()
+    };
+    if let Some(r) = parse_command(args).and_then(|cmd| cmd.repo_flag) {
+        let rest = r.split_once("://").map_or(r.as_str(), |(_, rest)| rest);
+        if not_github(&host_of(rest)) {
+            return false;
+        }
+    }
+    !args
+        .iter()
+        .any(|arg| http_rest(arg).is_some_and(|rest| not_github(&host_of(rest))))
+}
+
+fn host_allowed(host: &str, hosts: &[String]) -> bool {
+    hosts.iter().any(|h| h.eq_ignore_ascii_case(host))
+}
+
+/// A scope member's name: `owner/repo` on github.com, the spelling members have
+/// always had, and `host/owner/repo` on any other host.
+fn member_name(host: &str, repo: &str) -> String {
+    if host.eq_ignore_ascii_case(DEFAULT_GH_HOST) {
+        repo.to_string()
+    } else {
+        format!("{}/{repo}", host.to_ascii_lowercase())
+    }
+}
+
+/// `(host, owner/repo)` of a scope member, the inverse of [`member_name`].
+fn split_member(member: &str) -> (&str, &str) {
+    match member.split_once('/') {
+        Some((host, repo)) if repo.contains('/') => (host, repo),
+        _ => (DEFAULT_GH_HOST, member),
+    }
+}
+
+/// The host of an approved `GH_REPO` pin.
+#[must_use]
+pub fn pin_host(pin: &str) -> &str {
+    split_member(pin.strip_prefix("github.com/").unwrap_or(pin)).0
+}
+
+/// Whether `gh_guard.hosts` is set to anything but the default.
+#[must_use]
+pub fn hosts_configured() -> bool {
+    gh_hosts() != [DEFAULT_GH_HOST]
+}
+
+/// Env var a credential-helper entry for a non-github.com host sets, so the
+/// gate withholds the github.com token from that call only. Setting it can
+/// only take the token away, so the agent gains nothing by forging it.
+pub const FOREIGN_CREDENTIAL_ENV: &str = "CPLT_GH_FOREIGN_CREDENTIAL";
+
+/// The host of an approved `GH_REPO` pin, when it is a configured host other
+/// than github.com. The caller then pins `GH_HOST` to it too, so a bare
+/// `-R owner/repo` or a `gh api` path resolves on the host the gate checked,
+/// and does not hand that host the github.com token.
+#[must_use]
+pub fn foreign_pin_host(pin: &str) -> Option<&str> {
+    let (host, _) = split_member(pin.strip_prefix("github.com/").unwrap_or(pin));
+    (!host.eq_ignore_ascii_case(DEFAULT_GH_HOST)).then_some(host)
 }
 
 /// Static policy entry mapping (command, subcommand) to a decision.
@@ -1143,6 +1266,7 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
             method,
             has_input_flags,
             api_endpoint,
+            hostname: requested_hostname(args).map(str::to_string),
         });
     }
 
@@ -1207,6 +1331,7 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
         method: None,
         has_input_flags: false,
         api_endpoint: None,
+        hostname: requested_hostname(args).map(str::to_string),
     })
 }
 
@@ -1410,8 +1535,20 @@ pub fn is_repo_in_scope(
             };
             let path = endpoint.split(['?', '#']).next().unwrap_or(endpoint);
             let decoded = decode_api_path(path)?;
+            // An absolute URL (only `https://api.github.com/` passes above)
+            // decides the host whatever `--hostname` says. A bare path goes to
+            // `--hostname`, else github.com (`GH_HOST` is scrubbed on every exec).
+            let host = if cmd
+                .api_endpoint
+                .as_deref()
+                .is_some_and(|e| e.contains("://"))
+            {
+                DEFAULT_GH_HOST
+            } else {
+                cmd.hostname.as_deref().unwrap_or(DEFAULT_GH_HOST)
+            };
             if let Some(endpoint_repo) = extract_repo_from_api_path(endpoint) {
-                return scope_member(scope, &endpoint_repo);
+                return scope_member(scope, &member_name(host, &endpoint_repo));
             }
             // Write operations (input flags or non-GET method) require an explicit
             // /repos/{owner}/{repo}/... path — no relative-path fallback.
@@ -1434,7 +1571,13 @@ pub fn is_repo_in_scope(
             {
                 // Relative read endpoint — gh CLI resolves to the invocation cwd's
                 // repo, which must still be a member of the immutable startup scope.
-                return invocation_repo.and_then(|repo| scope_member(scope, repo));
+                // The pin sets `GH_HOST` to a non-github.com member's host,
+                // which `--hostname` overrides: the two must agree.
+                return invocation_repo
+                    .and_then(|repo| scope_member(scope, repo))
+                    .filter(|member| {
+                        cmd.hostname.is_none() || split_member(member).0.eq_ignore_ascii_case(host)
+                    });
             }
             // Absolute non-repo endpoint (e.g., /orgs/..., /user/...) — not in scope.
             return None;
@@ -1732,55 +1875,44 @@ pub fn detect_current_repo(real_git: &Path, project_dir: &Path) -> Result<String
         .ok_or_else(|| "local origin is not a supported GitHub repository URL".to_string())
 }
 
-/// Parse owner/repo from a git remote URL.
-///
-/// Handles:
-/// - `https://github.com/owner/repo.git`
-/// - `https://github.com/owner/repo`
-/// - `git@github.com:owner/repo.git`
-/// - `ssh://git@github.com/owner/repo.git`
+/// Parse the scope member name from a git remote URL on a configured host.
 fn parse_repo_from_url(url: &str) -> Option<String> {
-    // SSH shorthand: git@github.com:owner/repo.git
-    if let Some(rest) = url.strip_prefix("git@github.com:") {
-        let repo = rest.trim_end_matches(".git");
-        if repo.contains('/') {
-            return Some(repo.to_string());
-        }
+    parse_repo_from_url_for(url, gh_hosts())
+}
+
+/// The scope member a remote URL names (see [`member_name`]), when its host is
+/// one of `hosts`.
+///
+/// Handles, for each host:
+/// - `https://HOST/owner/repo(.git)`, with optional userinfo and port
+/// - `http://HOST/owner/repo(.git)`
+/// - `git@HOST:owner/repo(.git)`
+/// - `ssh://git@HOST/owner/repo(.git)`
+fn parse_repo_from_url_for(url: &str, hosts: &[String]) -> Option<String> {
+    let (host, path) = if let Some(rest) = url.strip_prefix("https://") {
+        // Anchor the host check to the URL *authority* (the segment before the
+        // first '/'), so a crafted path such as
+        //   https://evil.example/@github.com/owner/repo.git
+        // is NOT mis-parsed as a GitHub URL. Embedded credentials
+        // (https://x-access-token:TOKEN@github.com/...) and a port are stripped.
+        let (authority, rest) = rest.split_once('/').unwrap_or((rest, ""));
+        let host = authority.rsplit('@').next().unwrap_or(authority);
+        (host.split(':').next().unwrap_or(host), rest)
+    } else if let Some(rest) = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("ssh://git@"))
+    {
+        rest.split_once('/')?
+    } else {
+        url.strip_prefix("git@")?.split_once(':')?
+    };
+    if !host_allowed(host, hosts) {
+        return None;
     }
-
-    // HTTPS or SSH URL
-    // Look for github.com in the path
-    let path = url
-        .strip_prefix("https://github.com/")
-        .or_else(|| {
-            // HTTPS with embedded credentials:
-            //   https://x-access-token:TOKEN@github.com/owner/repo.git
-            // Anchor the host check to the URL *authority* (the segment before the
-            // first '/'), so a crafted path such as
-            //   https://evil.example/@github.com/owner/repo.git
-            // is NOT mis-parsed as a GitHub URL.
-            let after_scheme = url.strip_prefix("https://")?;
-            let (authority, rest) = match after_scheme.split_once('/') {
-                Some((a, r)) => (a, r),
-                None => (after_scheme, ""),
-            };
-            // Strip any userinfo (user:token@) and an optional :port.
-            let host = authority
-                .rsplit('@')
-                .next()
-                .unwrap_or(authority)
-                .split(':')
-                .next()
-                .unwrap_or(authority);
-            (host == "github.com").then_some(rest)
-        })
-        .or_else(|| url.strip_prefix("ssh://git@github.com/"))
-        .or_else(|| url.strip_prefix("http://github.com/"))?;
-
     let repo = path.trim_end_matches(".git");
     // Should have exactly one slash: owner/repo
     if repo.matches('/').count() == 1 && !repo.starts_with('/') && !repo.ends_with('/') {
-        Some(repo.to_string())
+        Some(member_name(host, repo))
     } else {
         None
     }
@@ -1853,12 +1985,23 @@ pub fn generate_wrapper_script(
     } else {
         "--no-allow-pr-merge"
     };
+    // Only a configured list reaches the wrapper, so with `gh_guard.hosts`
+    // unset the script is byte-identical to one written before the key existed.
+    let hosts_flag: String = if policy.hosts == [DEFAULT_GH_HOST] {
+        String::new()
+    } else {
+        policy
+            .hosts
+            .iter()
+            .map(|host| format!(" --gh-host {}", shell_escape(host)))
+            .collect()
+    };
     format!(
         r#"#!/bin/sh
 # cplt gh proxy — blocks destructive gh operations in sandboxed agents.
 # This wrapper is auto-generated. Do not edit.
 
-exec {cplt_escaped} gh-gate --real-gh {gh_escaped} {repo_scope_flag} {real_git_flag} {mode_flag} {scope_flag} {auth_flag} {unknown_flag} {api_write_flag} {pr_merge_flag} -- "$@"
+exec {cplt_escaped} gh-gate --real-gh {gh_escaped} {repo_scope_flag} {real_git_flag} {mode_flag} {scope_flag} {auth_flag} {unknown_flag} {api_write_flag} {pr_merge_flag}{hosts_flag} -- "$@"
 "#
     )
 }
@@ -2167,6 +2310,33 @@ fn gate_with_scope_resolver(
         };
     }
 
+    // gh keeps the last `--hostname`; a check reading another one would
+    // approve one host and let gh, and the github.com token, go to another.
+    // Nothing needs two, so refuse rather than pick.
+    if requested_hostnames(args).len() > 1 {
+        return Err(Refusal {
+            headline: "'gh' was given --hostname more than once.".to_string(),
+            guidance: "Pass a single --hostname.".to_string(),
+            agent_note: &[RESTRICTED, NOTE],
+        });
+    }
+
+    // The GraphQL check names repositories as `owner/name`, without a host,
+    // so it is only sound against github.com.
+    if cmd.command == "api"
+        && cmd.api_endpoint.as_deref() == Some("graphql")
+        && let Some(hostname) = cmd.hostname.as_deref()
+        && !hostname.eq_ignore_ascii_case(DEFAULT_GH_HOST)
+    {
+        return Err(Refusal {
+            headline: format!(
+                "'gh api graphql' is only supported on github.com, not '{hostname}'."
+            ),
+            guidance: String::new(),
+            agent_note: &[RESTRICTED, NOTE],
+        });
+    }
+
     if policy.scope_check {
         if cmd.command == "api"
             && let Some(endpoint) = cmd.api_endpoint.as_deref()
@@ -2180,14 +2350,17 @@ fn gate_with_scope_resolver(
             });
         }
 
+        let hosts = gh_hosts();
         if let Some(hostname) = requested_hostname(args)
-            && hostname != "github.com"
+            && !host_allowed(hostname, hosts)
         {
             return Err(Refusal {
                 headline: format!(
-                    "'gh {} {}' targets GitHub host '{hostname}', outside the approved host 'github.com'.",
+                    "'gh {} {}' targets GitHub host '{hostname}', outside the approved {} '{}'.",
                     cmd.command,
-                    cmd.subcommand.as_deref().unwrap_or("")
+                    cmd.subcommand.as_deref().unwrap_or(""),
+                    if hosts.len() == 1 { "host" } else { "hosts" },
+                    hosts.join(", ")
                 ),
                 guidance: String::new(),
                 agent_note: &[RESTRICTED, NOTE],
@@ -2403,7 +2576,10 @@ pub fn graphql_target_refusal(reason: &str) -> Refusal {
 
 fn approval_from_scope(repo_scope: Option<String>) -> GateApproval {
     GateApproval {
-        repo_scope: repo_scope.map(|repo| format!("github.com/{repo}")),
+        repo_scope: repo_scope.map(|member| {
+            let (host, repo) = split_member(&member);
+            format!("{host}/{repo}")
+        }),
         check_merge_protection: false,
         graphql_targets: Vec::new(),
     }
@@ -2595,7 +2771,11 @@ pub fn check_merge_protection(
     let Some(repo) = repo else {
         return Err(refuse("no repository was pinned for the merge".into()));
     };
-    let repo = repo.strip_prefix("github.com/").unwrap_or(repo);
+    let Some(repo) = repo.strip_prefix("github.com/") else {
+        return Err(refuse(format!(
+            "{repo} is not on github.com; the protection check reads github.com rulesets only"
+        )));
+    };
     let merge = parse_merge_args(args).map_err(refuse)?;
     // gh refuses `-R` without a selector, so a bare `gh pr merge` is looked up
     // without it: the caller runs every lookup with `GH_REPO` pinned to `repo`,
@@ -2681,16 +2861,23 @@ pub fn check_merge_protection(
     )))
 }
 
-fn requested_hostname<'a>(args: &'a [&str]) -> Option<&'a str> {
+/// Every `--hostname` value, in order. gh (pflag) keeps the LAST one.
+fn requested_hostnames<'a>(args: &'a [&str]) -> Vec<&'a str> {
+    let mut found = Vec::new();
     for (index, arg) in args.iter().enumerate() {
         if let Some(hostname) = arg.strip_prefix("--hostname=") {
-            return Some(hostname);
-        }
-        if *arg == "--hostname" {
-            return args.get(index + 1).copied().or(Some(""));
+            found.push(hostname);
+        } else if *arg == "--hostname" {
+            found.push(args.get(index + 1).copied().unwrap_or(""));
         }
     }
-    None
+    found
+}
+
+/// The `--hostname` gh will use: the last one, as pflag reads it. The gate
+/// refuses a repeated flag outright, so this is only ever the single value.
+fn requested_hostname<'a>(args: &'a [&str]) -> Option<&'a str> {
+    requested_hostnames(args).last().copied()
 }
 
 fn github_api_endpoint_path(endpoint: &str) -> Result<&str, ()> {
@@ -4734,9 +4921,11 @@ fn record_remote_head(project_dir: &Path, remote: &str, branch: &str) {
 
 /// `default_branch` of `owner/name` from the GitHub API, via the trusted `gh`.
 ///
-/// `--hostname github.com` for the reason `gh auth token` carries it: `GH_HOST`
-/// must not steer the question to another host.
-fn gh_default_branch(repo: &str, timeout: std::time::Duration) -> Option<String> {
+/// `--hostname` (the member's host, github.com by default) for the reason
+/// `gh auth token` carries it: `GH_HOST` must not steer the question to
+/// another host.
+fn gh_default_branch(member: &str, timeout: std::time::Duration) -> Option<String> {
+    let (host, repo) = split_member(member);
     // parse_repo_from_url guarantees one slash; keep the path to plain name
     // characters so nothing else reaches the API path.
     if repo.contains("..")
@@ -4750,14 +4939,7 @@ fn gh_default_branch(repo: &str, timeout: std::time::Duration) -> Option<String>
     let path = format!("repos/{repo}");
     let out = crate::discover::probe_output(
         &gh,
-        &[
-            "api",
-            "--hostname",
-            "github.com",
-            &path,
-            "--jq",
-            ".default_branch",
-        ],
+        &["api", "--hostname", host, &path, "--jq", ".default_branch"],
         timeout,
     )?;
     let branch = out.trim();
@@ -5286,6 +5468,7 @@ mod tests {
                 method: None,
                 has_input_flags: false,
                 api_endpoint: None,
+                hostname: None,
             };
             let result = evaluate(&parsed);
             assert_eq!(
@@ -5315,6 +5498,7 @@ mod tests {
                 method: None,
                 has_input_flags: false,
                 api_endpoint: None,
+                hostname: None,
             };
             let result = evaluate(&parsed);
             assert_eq!(
@@ -5342,6 +5526,7 @@ mod tests {
                 method: None,
                 has_input_flags: false,
                 api_endpoint: None,
+                hostname: None,
             };
             let result = evaluate(&parsed);
             assert_eq!(
@@ -5361,6 +5546,7 @@ mod tests {
             method: None,
             has_input_flags: false,
             api_endpoint: None,
+            hostname: None,
         };
         let result = evaluate(&parsed);
         assert_eq!(result.decision, Decision::Unknown);
@@ -5377,6 +5563,7 @@ mod tests {
             method: None,
             has_input_flags: false,
             api_endpoint: None,
+            hostname: None,
         };
         assert_eq!(evaluate(&parsed).decision, Decision::Allow);
 
@@ -5398,6 +5585,7 @@ mod tests {
             method: None,
             has_input_flags: false,
             api_endpoint: None,
+            hostname: None,
         };
         assert_eq!(evaluate(&parsed).decision, Decision::Allow);
 
@@ -5409,6 +5597,7 @@ mod tests {
             method: None,
             has_input_flags: false,
             api_endpoint: None,
+            hostname: None,
         };
         assert_eq!(evaluate(&parsed).decision, Decision::Block);
     }
@@ -5422,6 +5611,7 @@ mod tests {
             method: None,
             has_input_flags: false,
             api_endpoint: None,
+            hostname: None,
         };
         assert_eq!(evaluate(&parsed).decision, Decision::ScopeCheck);
 
@@ -5432,6 +5622,7 @@ mod tests {
             method: Some("GET".to_string()),
             has_input_flags: false,
             api_endpoint: None,
+            hostname: None,
         };
         assert_eq!(evaluate(&parsed).decision, Decision::ScopeCheck);
     }
@@ -5445,6 +5636,7 @@ mod tests {
             method: Some("POST".to_string()),
             has_input_flags: false,
             api_endpoint: None,
+            hostname: None,
         };
         assert_eq!(evaluate(&parsed).decision, Decision::Block);
     }
@@ -5458,6 +5650,7 @@ mod tests {
             method: None,
             has_input_flags: true,
             api_endpoint: None,
+            hostname: None,
         };
         assert_eq!(evaluate(&parsed).decision, Decision::Block);
     }
@@ -5473,6 +5666,7 @@ mod tests {
             method: None,
             has_input_flags: false,
             api_endpoint: None,
+            hostname: None,
         };
         assert!(in_scope(&cmd, "navikt/cplt", Some("navikt/cplt")));
         assert!(!in_scope(&cmd, "navikt/cplt", Some("evil-org/other-repo")));
@@ -5488,6 +5682,7 @@ mod tests {
             method: None,
             has_input_flags: false,
             api_endpoint: None,
+            hostname: None,
         };
         assert!(in_scope(&cmd, "navikt/cplt", None));
     }
@@ -5501,6 +5696,7 @@ mod tests {
             method: None,
             has_input_flags: false,
             api_endpoint: None,
+            hostname: None,
         };
         assert!(!in_scope(&cmd, "navikt/cplt", None));
     }
@@ -5514,6 +5710,7 @@ mod tests {
             method: None,
             has_input_flags: false,
             api_endpoint: None,
+            hostname: None,
         };
         assert!(in_scope(&cmd, "navikt/cplt", None));
     }
@@ -5528,6 +5725,7 @@ mod tests {
             method: None,
             has_input_flags: false,
             api_endpoint: None,
+            hostname: None,
         };
         assert!(!in_scope(&cmd, "navikt/cplt", None));
         let cmd = ParsedCommand {
@@ -5535,6 +5733,7 @@ mod tests {
             subcommand: None,
             repo_flag: None,
             api_endpoint: Some("repos/navikt/cplt.git/pulls".to_string()),
+            hostname: None,
             ..cmd
         };
         assert!(!in_scope(&cmd, "navikt/cplt", None));
@@ -5551,6 +5750,7 @@ mod tests {
             method: None,
             has_input_flags: false,
             api_endpoint: Some("/repos/other/repo/pulls".to_string()),
+            hostname: None,
         };
         assert!(!in_scope(&cmd, "navikt/cplt", None));
     }
@@ -5564,6 +5764,7 @@ mod tests {
             method: None,
             has_input_flags: false,
             api_endpoint: Some("/repos/navikt/cplt/pulls".to_string()),
+            hostname: None,
         };
         assert!(in_scope(&cmd, "navikt/cplt", None));
     }
@@ -5578,6 +5779,7 @@ mod tests {
             method: None,
             has_input_flags: false,
             api_endpoint: Some("/user".to_string()),
+            hostname: None,
         };
         assert!(!in_scope(&cmd, "navikt/cplt", None));
     }
@@ -5591,6 +5793,7 @@ mod tests {
             method: None,
             has_input_flags: false,
             api_endpoint: Some("/orgs/navikt/members".to_string()),
+            hostname: None,
         };
         assert!(!in_scope(&cmd, "navikt/cplt", None));
     }
@@ -5605,6 +5808,7 @@ mod tests {
             method: None,
             has_input_flags: false,
             api_endpoint: Some("pulls/67/comments".to_string()),
+            hostname: None,
         };
         assert!(in_scope(&cmd, "navikt/cplt", Some("navikt/cplt")));
     }
@@ -5618,6 +5822,7 @@ mod tests {
             method: None,
             has_input_flags: false,
             api_endpoint: Some("pulls?state=open".to_string()),
+            hostname: None,
         };
         assert!(in_scope(&cmd, "navikt/cplt", Some("navikt/cplt")));
     }
@@ -5632,6 +5837,7 @@ mod tests {
             method: None,
             has_input_flags: false,
             api_endpoint: Some("/repos/navikt/cplt/pulls".to_string()),
+            hostname: None,
         };
         assert!(!in_scope(&cmd, "navikt/cplt", None));
     }
@@ -5728,6 +5934,334 @@ mod tests {
             parse_repo_from_url("https://github.com/navikt/x@evil.example/cplt.git"),
             None
         );
+    }
+
+    // ── gh_guard.hosts (#950) ──
+
+    fn ghe_hosts() -> Vec<String> {
+        vec!["github.com".to_string(), "example.ghe.com".to_string()]
+    }
+
+    /// With the key unset the wrapper is the exact script written before
+    /// `gh_guard.hosts` existed: no new flag, not even a space.
+    #[test]
+    fn wrapper_script_is_unchanged_with_hosts_unset() {
+        let script = generate_wrapper_script(
+            "/usr/bin/gh",
+            &["navikt/cplt".to_string()],
+            Some("/usr/bin/git"),
+            "/usr/local/bin/cplt",
+            &crate::config::GhGuardPolicy::default(),
+        );
+        assert_eq!(
+            script,
+            "#!/bin/sh\n\
+             # cplt gh proxy — blocks destructive gh operations in sandboxed agents.\n\
+             # This wrapper is auto-generated. Do not edit.\n\
+             \n\
+             exec '/usr/local/bin/cplt' gh-gate --real-gh '/usr/bin/gh' --repo-scope 'navikt/cplt' \
+             --real-git '/usr/bin/git' --mode=block --scope-check --block-auth-token \
+             --unknown-command=block --no-allow-api-write --no-allow-pr-merge -- \"$@\"\n"
+        );
+    }
+
+    #[test]
+    fn wrapper_script_bakes_in_configured_hosts() {
+        let policy = crate::config::GhGuardPolicy {
+            hosts: ghe_hosts(),
+            ..Default::default()
+        };
+        let script = generate_wrapper_script("/usr/bin/gh", &[], None, "/c", &policy);
+        assert!(
+            script.contains(
+                "--no-allow-pr-merge --gh-host 'github.com' --gh-host 'example.ghe.com' -- \"$@\""
+            ),
+            "{script}"
+        );
+    }
+
+    #[test]
+    fn parse_repo_on_a_configured_host_is_host_qualified() {
+        let hosts = ghe_hosts();
+        for url in [
+            "https://example.ghe.com/o/r.git",
+            "https://EXAMPLE.ghe.com/o/r",
+            "https://x-access-token:t@example.ghe.com/o/r.git",
+            "git@example.ghe.com:o/r.git",
+            "ssh://git@example.ghe.com/o/r.git",
+        ] {
+            assert_eq!(
+                parse_repo_from_url_for(url, &hosts).as_deref(),
+                Some("example.ghe.com/o/r"),
+                "{url}"
+            );
+        }
+        // github.com keeps its bare spelling, so existing scopes do not change.
+        assert_eq!(
+            parse_repo_from_url_for("git@github.com:o/r.git", &hosts).as_deref(),
+            Some("o/r")
+        );
+        // Unlisted hosts, and a listed host only in the path, stay out.
+        for url in [
+            "https://other.ghe.com/o/r.git",
+            "https://evil.example/@example.ghe.com/o/r.git",
+            "git@example.ghe.com.evil:o/r.git",
+        ] {
+            assert_eq!(parse_repo_from_url_for(url, &hosts), None, "{url}");
+        }
+        // The default list does not see the GHE host at all.
+        assert_eq!(
+            parse_repo_from_url_for(
+                "https://example.ghe.com/o/r.git",
+                &["github.com".to_string()]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn ghe_member_pins_its_own_host() {
+        let approval = approval_from_scope(Some("example.ghe.com/o/r".to_string()));
+        assert_eq!(approval.repo_scope.as_deref(), Some("example.ghe.com/o/r"));
+        assert_eq!(
+            foreign_pin_host("example.ghe.com/o/r"),
+            Some("example.ghe.com")
+        );
+        assert_eq!(foreign_pin_host("github.com/o/r"), None);
+    }
+
+    /// A `/repos/` path is checked on the host the request goes to, so the same
+    /// `owner/repo` on github.com and on a GHE host are different repositories.
+    #[test]
+    fn api_path_scope_is_checked_on_the_requested_host() {
+        let scope = vec!["o/r".to_string(), "example.ghe.com/x/y".to_string()];
+        let in_scope =
+            |args: &[&str]| is_repo_in_scope(&parse_command(args).unwrap(), &scope, None);
+        assert_eq!(in_scope(&["api", "repos/o/r"]).as_deref(), Some("o/r"));
+        assert_eq!(
+            in_scope(&["api", "--hostname", "example.ghe.com", "repos/x/y"]).as_deref(),
+            Some("example.ghe.com/x/y")
+        );
+        // github.com's o/r is not example.ghe.com's o/r, and the other way round.
+        assert_eq!(
+            in_scope(&["api", "--hostname", "example.ghe.com", "repos/o/r"]),
+            None
+        );
+        assert_eq!(in_scope(&["api", "repos/x/y"]), None);
+        // -R names the host explicitly.
+        assert_eq!(
+            in_scope(&["pr", "create", "-R", "example.ghe.com/x/y"]).as_deref(),
+            Some("example.ghe.com/x/y")
+        );
+        // An absolute URL decides the host, whatever --hostname says.
+        assert_eq!(
+            in_scope(&[
+                "api",
+                "--hostname",
+                "example.ghe.com",
+                "https://api.github.com/repos/x/y/issues"
+            ]),
+            None
+        );
+        // A relative read resolves to the cwd's member; --hostname must agree.
+        let cmd = parse_command(&["api", "--hostname", "github.com", "pulls/1"]).unwrap();
+        assert_eq!(
+            is_repo_in_scope(&cmd, &scope, Some("example.ghe.com/x/y")),
+            None
+        );
+    }
+
+    #[test]
+    fn hostname_gate_reads_the_host_list() {
+        let hosts = ghe_hosts();
+        assert!(host_allowed("example.ghe.com", &hosts));
+        assert!(host_allowed("Example.GHE.com", &hosts));
+        assert!(!host_allowed("other.ghe.com", &hosts));
+        // With the key unset (this process), a GHE host is still refused.
+        let refusal = gate_with_repo_scope(
+            &["pr", "list", "--hostname", "example.ghe.com"],
+            &GatePolicy::default(),
+            &["o/r".to_string()],
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            refusal
+                .headline
+                .contains("outside the approved host 'github.com'"),
+            "{refusal}"
+        );
+    }
+
+    /// gh keeps the last `--hostname`; the gate read the first. A repeat is
+    /// refused in every spelling and order.
+    #[test]
+    fn repeated_hostname_is_refused() {
+        for args in [
+            &[
+                "api",
+                "--hostname",
+                "github.com",
+                "--hostname",
+                "evil.ghe.com",
+                "repos/o/r",
+            ][..],
+            &[
+                "api",
+                "--hostname",
+                "evil.ghe.com",
+                "--hostname",
+                "github.com",
+                "repos/o/r",
+            ],
+            &[
+                "api",
+                "--hostname=github.com",
+                "--hostname",
+                "evil.ghe.com",
+                "repos/o/r",
+            ],
+            &[
+                "api",
+                "--hostname",
+                "evil.ghe.com",
+                "--hostname=github.com",
+                "user",
+            ],
+            &[
+                "pr",
+                "list",
+                "--hostname=github.com",
+                "--hostname=github.com",
+            ],
+        ] {
+            let refusal = gate_with_repo_scope(args, &GatePolicy::default(), &["o/r".into()], None)
+                .unwrap_err();
+            assert!(
+                refusal.headline.contains("more than once"),
+                "{args:?}: {refusal}"
+            );
+        }
+        assert_eq!(
+            requested_hostname(&["--hostname", "a", "--hostname=b"]),
+            Some("b"),
+            "last wins, as in pflag"
+        );
+    }
+
+    #[test]
+    fn graphql_is_refused_on_another_host() {
+        let refusal = gate_with_repo_scope(
+            &[
+                "api",
+                "graphql",
+                "--hostname",
+                "example.ghe.com",
+                "-f",
+                "query={viewer{login}}",
+            ],
+            &GatePolicy::default(),
+            &["example.ghe.com/o/r".to_string()],
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            refusal.headline.contains("only supported on github.com"),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn merge_protection_refuses_a_ghe_repository() {
+        let refusal = check_merge_protection(
+            &["pr", "merge", "1"],
+            Some("example.ghe.com/o/r"),
+            &mut |_| panic!("no lookup for a non-github.com repository"),
+        )
+        .unwrap_err();
+        assert!(refusal.guidance.contains("not on github.com"), "{refusal}");
+    }
+
+    #[test]
+    fn github_token_stays_off_other_hosts() {
+        let hosts = ghe_hosts();
+        let ok = |args: &[&str], pin| github_token_allowed_for(args, pin, &hosts);
+        assert!(ok(&["pr", "list"], Some("github.com/o/r")));
+        assert!(!ok(&["pr", "list"], Some("example.ghe.com/o/r")));
+        assert!(!ok(&["api", "--hostname", "example.ghe.com", "user"], None));
+        // gh honours an explicit -R or URL over the pin.
+        assert!(!ok(
+            &["pr", "view", "1", "-R", "example.ghe.com/other/repo"],
+            Some("github.com/o/r")
+        ));
+        assert!(!ok(
+            &["pr", "view", "https://example.ghe.com/x/y/pull/1"],
+            Some("github.com/o/r")
+        ));
+        assert!(ok(
+            &["pr", "view", "1", "-R", "o/r"],
+            Some("github.com/o/r")
+        ));
+        assert!(ok(&["pr", "view", "https://github.com/o/r/pull/1"], None));
+        assert!(ok(&["api", "https://api.github.com/repos/o/r"], None));
+        assert!(ok(
+            &["pr", "comment", "1", "--body", "https://ci.example/run/1"],
+            None
+        ));
+        assert!(!ok(&["pr", "view", "HTTPS://x.ghe.com/o/r/pull/1"], None));
+        assert!(!ok(
+            &["pr", "view", "https://a:b@x.ghe.com/o/r/pull/1"],
+            None
+        ));
+        assert!(!ok(
+            &["pr", "view", "1", "-R", "https://u:pw@x.ghe.com/o/r"],
+            None
+        ));
+        assert!(!ok(
+            &["pr", "view", "https://x.ghe.com:443/o/r/pull/1"],
+            None
+        ));
+        assert!(!ok(&["pr", "view", "Http://x.ghe.com/o/r/pull/1"], None));
+        assert!(!ok(&["pr", "view", "1", "-R", "git@x.ghe.com:o/r"], None));
+        assert!(!ok(
+            &["pr", "view", "1", "-R", "https://x.ghe.com/o/r"],
+            None
+        ));
+        assert!(ok(
+            &["pr", "view", "https://www.github.com/o/r/pull/1"],
+            None
+        ));
+        let github = vec!["github.com".to_string()];
+        assert!(github_token_allowed_for(
+            &[
+                "release",
+                "create",
+                "v1",
+                "--notes",
+                "https://jira.example/X-1"
+            ],
+            None,
+            &github
+        ));
+        assert!(!github_token_allowed_for(
+            &["pr", "view", "1", "-R", "x.ghe.com/o/r"],
+            None,
+            &github
+        ));
+        assert!(!github_token_allowed_for(
+            &["pr", "view", "https://x.ghe.com/o/r/pull/1"],
+            None,
+            &github
+        ));
+        // Its host is on stdin: the helper entry marks it instead.
+        assert!(ok(&["auth", "git-credential", "get"], None));
+        // Default list: unchanged, every exec gets the token.
+        let github = vec!["github.com".to_string()];
+        assert!(github_token_allowed_for(
+            &["api", "--hostname", "example.ghe.com", "user"],
+            None,
+            &github
+        ));
     }
 
     // ── wrapper script test ──
@@ -5903,6 +6437,7 @@ mod tests {
             method: Some("POST".to_string()),
             has_input_flags: false,
             api_endpoint: Some("repos/navikt/cplt/pulls/comments/123/replies".to_string()),
+            hostname: None,
         };
         // Default policy: write should be blocked
         assert_eq!(
@@ -5927,6 +6462,7 @@ mod tests {
             method: None,
             has_input_flags: true,
             api_endpoint: Some("repos/navikt/cplt/pulls/comments/123/replies".to_string()),
+            hostname: None,
         };
         assert_eq!(
             evaluate_with_policy(&cmd, false).decision,
@@ -6009,6 +6545,7 @@ mod tests {
             method: Some("POST".to_string()),
             has_input_flags: false,
             api_endpoint: Some("graphql".to_string()),
+            hostname: None,
         };
         assert_eq!(
             evaluate_with_policy(&cmd, true).decision,
@@ -6026,6 +6563,7 @@ mod tests {
             method: Some("DELETE".to_string()),
             has_input_flags: false,
             api_endpoint: Some("repos/navikt/cplt/issues/1/labels/bug".to_string()),
+            hostname: None,
         };
         assert_eq!(
             evaluate_with_policy(&cmd, true).decision,
@@ -6052,6 +6590,7 @@ mod tests {
                 method: Some("POST".to_string()),
                 has_input_flags: true,
                 api_endpoint: Some(endpoint.to_string()),
+                hostname: None,
             };
             assert!(
                 !in_scope(&cmd, "navikt/cplt", None),
@@ -6071,6 +6610,7 @@ mod tests {
             method: None,
             has_input_flags: false,
             api_endpoint: None,
+            hostname: None,
         };
         assert_eq!(evaluate(&list).decision, Decision::Allow);
 
@@ -6081,6 +6621,7 @@ mod tests {
             method: None,
             has_input_flags: false,
             api_endpoint: None,
+            hostname: None,
         };
         assert_eq!(evaluate(&edit).decision, Decision::Block);
     }
@@ -8968,6 +9509,7 @@ mod tests {
                 method: Some("POST".to_string()),
                 has_input_flags: false,
                 api_endpoint: Some(ep.to_string()),
+                hostname: None,
             };
             assert_eq!(
                 evaluate_with_policy(&cmd, true).decision,
@@ -8994,6 +9536,7 @@ mod tests {
             method: None,
             has_input_flags: false,
             api_endpoint: Some(ep.to_string()),
+            hostname: None,
         };
         for ep in [
             "graphq%6C",

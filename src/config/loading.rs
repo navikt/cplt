@@ -567,6 +567,13 @@ impl Config {
                 .unwrap_or(UnknownCommandPolicy::Block),
             allow_api_write: bools.gh_allow_api_write,
             allow_pr_merge: bools.gh_allow_pr_merge,
+            hosts: match &self.gh_guard.hosts {
+                Some(hosts) => {
+                    super::validation::validate_gh_hosts(hosts)?;
+                    hosts.iter().map(|h| h.to_ascii_lowercase()).collect()
+                }
+                None => vec![crate::gh_proxy::DEFAULT_GH_HOST.to_string()],
+            },
         };
 
         // An `allow_push` rule that names neither a remote nor any branch
@@ -4209,6 +4216,21 @@ mod precedence {
         /// A preset that moves this key off its default, and the value it moves
         /// it to. `None` for a key no preset controls.
         preset: Option<(Preset, bool)>,
+    }
+
+    #[test]
+    fn gh_hosts_resolve_lowercased_and_default_to_github() {
+        let r = Config::default().merge(CliFlags::default()).unwrap();
+        assert_eq!(r.gh_guard.hosts, ["github.com"]);
+        let c: Config =
+            toml::from_str("[gh_guard]\nhosts = [\"github.com\", \"X.GHE.com\"]\n").unwrap();
+        let r = c.merge(CliFlags::default()).unwrap();
+        assert_eq!(r.gh_guard.hosts, ["github.com", "x.ghe.com"]);
+        // A hand-edited bad entry fails the launch rather than matching nothing.
+        let c: Config = toml::from_str("[gh_guard]\nhosts = [\"https://x.ghe.com\"]\n").unwrap();
+        assert!(c.merge(CliFlags::default()).is_err());
+        let c: Config = toml::from_str("[gh_guard]\nhosts = []\n").unwrap();
+        assert!(c.merge(CliFlags::default()).is_err());
     }
 
     fn toml_for(key: &str, value: bool) -> String {
