@@ -880,7 +880,7 @@ policy: act now):
 | Threat | Mitigation |
 |--------|------------|
 | PRM points at another authorization server | `issuer` must equal the spec's `oauth.issuer`, whose host is in `egressHosts`. The spec is written by nav-pilot from the registry, outside the sandbox |
-| Malicious authorization server or redirect | No redirects followed in discovery or exchange; https only; private addresses refused; `state`, PKCE and `iss` checked; the callback listener takes one request and closes |
+| Malicious authorization server or redirect | No redirects followed in discovery or exchange; https only for every remote host (the callback is plain http on loopback, RFC 8252 7.3); private addresses refused; `state`, PKCE and `iss` checked; the callback listener takes one request and closes |
 | Token theft from the sandbox | Tokens never enter the sandbox: not in env, config, the socket's messages or logs. The agent can only make calls through the broker's policy, which is the same exposure as nais today |
 | Token theft on the host | Same as any keychain item the user owns. Tokens are bound by `resource` to one route (gateway); a stolen gateway token reaches one server |
 | Consent phishing with CIMD and a loopback redirect | Anyone can send a user an authorization link naming Nav's `client_id` with a loopback redirect, and the consent screen shows Nav's domain. The code only reaches a listener on the victim's machine, but a local process could race for the port. The MCP spec names this risk **(unverified wording)**. The gateway should show the client domain and requested route at consent; Figma's screen is outside Nav's control |
