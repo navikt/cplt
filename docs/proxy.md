@@ -393,9 +393,10 @@ services.gradle.org                  # Gradle wrapper distribution metadata
 packages.confluent.io                # Kafka clients, Avro serdes
 jitpack.io                           # Maven artifacts built from git tags
 npm.pkg.github.com                   # GitHub Packages (npm)
+pkg-npm.githubusercontent.com        # where its tarballs redirect
 maven.pkg.github.com                 # GitHub Packages (Maven)
+github-registry-files.githubusercontent.com  # where its jars redirect
 proxy.golang.org  sum.golang.org     # Go modules and checksum database
-objects.githubusercontent.com        # GitHub release assets, Git LFS
 release-assets.githubusercontent.com # GitHub release asset downloads
 codeload.github.com                  # GitHub archive/tarball downloads
 raw.githubusercontent.com            # Raw repository files

@@ -59,16 +59,16 @@ pub const PACKAGE_REGISTRY_DOMAINS: &[&str] = &[
     // JitPack builds Maven/Gradle artifacts straight from git tags — the usual
     // home for forks and libraries that were never published to Central.
     "jitpack.io",
-    // GitHub Packages npm registry; downloads may redirect to *.githubusercontent.com (checked 2026-11-02).
+    // GitHub Packages npm registry; tarballs 302 to pkg-npm.githubusercontent.com (checked 2026-11-02).
     "npm.pkg.github.com",
-    // GitHub Packages Maven registry; downloads may redirect to *.githubusercontent.com (checked 2026-11-02).
+    "pkg-npm.githubusercontent.com",
+    // GitHub Packages Maven registry; jars 302 to github-registry-files.githubusercontent.com (checked 2026-11-02).
     "maven.pkg.github.com",
+    "github-registry-files.githubusercontent.com",
     // Go module mirror; serves module info and zip archives directly without redirect (checked 2026-11-02).
     "proxy.golang.org",
     // Go module checksum database; direct responses without redirect (checked 2026-11-02).
     "sum.golang.org",
-    // GitHub release assets and Git LFS blob storage host (checked 2026-11-02).
-    "objects.githubusercontent.com",
     // GitHub release asset downloads destination (releases/download 302 target, checked 2026-11-02).
     "release-assets.githubusercontent.com",
     // GitHub archive/tarball download host (archive/refs/tags 302 target, checked 2026-11-02).
@@ -6125,8 +6125,8 @@ mod tests {
     #[test]
     fn copilot_default_allowed_domains_matches_issue_52() {
         let domains = Agent::Copilot.default_allowed_domains();
-        // 6 GitHub Copilot infra domains + 25 package registries = 31.
-        assert_eq!(domains.len(), 31, "copilot list: infra + registries");
+        // 6 GitHub Copilot infra domains + 26 package registries = 32.
+        assert_eq!(domains.len(), 32, "copilot list: infra + registries");
         // GitHub Copilot infrastructure (bare forms of the issue's wildcards).
         for d in [
             "githubcopilot.com",
@@ -6156,7 +6156,8 @@ mod tests {
             "maven.pkg.github.com",
             "proxy.golang.org",
             "sum.golang.org",
-            "objects.githubusercontent.com",
+            "pkg-npm.githubusercontent.com",
+            "github-registry-files.githubusercontent.com",
             "release-assets.githubusercontent.com",
             "codeload.github.com",
             "raw.githubusercontent.com",
@@ -6610,10 +6611,10 @@ mod tests {
     #[test]
     fn pi_and_shell_get_registry_base_only() {
         // Pi's infra is not yet documented; Shell is not an AI agent. Both get
-        // only the shared package-registry base (25 domains).
+        // only the shared package-registry base (26 domains).
         for agent in [Agent::Pi, Agent::Shell] {
             let domains = agent.default_allowed_domains();
-            assert_eq!(domains.len(), 25, "{agent:?} gets registry base only");
+            assert_eq!(domains.len(), 26, "{agent:?} gets registry base only");
             assert!(domains.contains(&"registry.npmjs.org"));
             assert!(
                 !domains.contains(&"githubcopilot.com"),
