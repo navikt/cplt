@@ -1155,15 +1155,18 @@ The config file lives at `~/.config/cplt/config.toml`, or `$XDG_CONFIG_HOME/cplt
 
 Pointing `XDG_CONFIG_HOME` at an empty scratch directory does **not** isolate cplt. cplt uses `$XDG_CONFIG_HOME/cplt` only when that directory already contains `config.toml` or `trust/`. An empty directory falls back to `~/.config/cplt`, so commands like `cplt config set` write to the real user config whenever `HOME` is real ([#943](https://github.com/navikt/cplt/issues/943)).
 
-To isolate cplt completely in tests, scripts, and harnesses:
+To isolate cplt in tests, scripts, and harnesses:
 
-1. Set `CPLT_CONFIG=/tmp/scratch/config.toml` (or `/dev/null/nonexistent` to run with built-in defaults without a file).
-2. Set `HOME` and all `XDG_*` directories (`XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`) to scratch paths.
+1. Start from a clean environment (`env -i`), so agent-specific variables such as `CLAUDE_CONFIG_DIR` or `COPILOT_HOME` do not point the agent back at your real config.
+2. Set `CPLT_CONFIG` to a file in a scratch directory, or to `/dev/null/nonexistent` to run with built-in defaults and no file.
+3. Set `HOME` and every `XDG_*` directory (`XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`) to scratch paths.
+
+Keep the scratch directory outside the project and outside `/tmp`: a sandboxed agent can write both, and could change the config or its `trust/` and `local/` files before the next launch.
 
 Which paths follow `CPLT_CONFIG`:
 
-- **Follows `CPLT_CONFIG`:** `config.toml` and its directory, which also stores per-repo overrides in `local/` and approvals in `trust/`.
-- **Does not follow `CPLT_CONFIG` ([#830](https://github.com/navikt/cplt/issues/830)):** runtime state files do not consult `CPLT_CONFIG`. Launch fingerprints (`launch/`), update staging (`update/`), `host-fix-declined`, `copilot-extracted`, and `opencode-*` files follow `$XDG_CONFIG_HOME/cplt`, falling back to `~/.config/cplt`. Setting `HOME` and `XDG_*` to scratch paths ensures these runtime files are isolated as well.
+- **Follows `CPLT_CONFIG`:** `config.toml` and its directory, which also holds per-repo overrides in `local/`, approvals in `trust/` and the blocklist cache in `subscriptions/`.
+- **Does not follow `CPLT_CONFIG` ([#830](https://github.com/navikt/cplt/issues/830)):** runtime state such as launch fingerprints, update staging and one-off markers. These live in `$XDG_CONFIG_HOME/cplt` or `~/.config/cplt`, depending on the file and on which copy already exists. A scratch `HOME` and `XDG_CONFIG_HOME` cover both.
 
 `cplt config init` writes a commented starter template to `config.toml`. It covers `[proxy]`, `[proxy.subscriptions]`, `[allow]`, `[deny]`, `[sandbox]`, `[gh_guard]`, and `[git_guard]`, with every key documented inline. Two keys are set: `proxy.forced = true` ([#822](https://github.com/navikt/cplt/issues/822)), left commented out on Linux below Landlock ABI 4, where forced mode cannot launch, and `sandbox.strip_otlp_vendor_auth = true` ([#878](https://github.com/navikt/cplt/issues/878)). Every other key is commented out. An existing config is never changed: without the keys both stay off, and `cplt doctor` suggests them. Run it and read the result rather than copying a snippet from here, since the template is generated from `src/config/path.rs` and moves with the code:
 
