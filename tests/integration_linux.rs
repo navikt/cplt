@@ -5365,4 +5365,73 @@ print('CONNECTED')
             }
         }
     }
+
+    /// `sandbox.mask_missing_deny_paths`: when `sandbox.allow_git_config_write
+    /// = false` and `.git/config` enables `extensions.worktreeConfig`, a
+    /// `config.worktree` that does not exist at launch (in the root gitdir or
+    /// a linked worktree) is masked with `--ro-bind /dev/null <path>`, so the
+    /// agent cannot create or write it inside the sandbox.
+    #[test]
+    fn mask_missing_deny_paths_blocks_creating_a_missing_config_worktree() {
+        require_bwrap!();
+        let dir = create_deny_project();
+        let main = dir.path().canonicalize().unwrap().join("main");
+        fs::create_dir_all(&main).unwrap();
+        git_ok(&main, &["init", "--quiet"]);
+        git_ok(
+            &main,
+            &[
+                "-c",
+                "user.name=e",
+                "-c",
+                "user.email=e@example.com",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "i",
+            ],
+        );
+        git_ok(&main, &["config", "extensions.worktreeConfig", "true"]);
+        let wt = dir.path().canonicalize().unwrap().join("wt");
+        git_ok(&main, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+        let root_cw = main.join(".git/config.worktree");
+        let wt_cw = main.join(".git/worktrees/wt/config.worktree");
+        assert!(!root_cw.exists() && !wt_cw.exists());
+
+        let home = home_outside_tmp(".cplt-e2e-gitconfig-home-");
+        let cfg = home.path().join("cplt.toml");
+        fs::write(
+            &cfg,
+            "[sandbox]\nallow_git_config_write = false\nmask_missing_deny_paths = true\n",
+        )
+        .unwrap();
+        let script = format!(
+            "(git config --worktree core.hooksPath /tmp/evil) 2>/dev/null \
+             && echo GIT_WT_OK || echo GIT_WT_DENIED; \
+             (echo '[core]' > {}) 2>/dev/null \
+             && echo DIRECT_WT_OK || echo DIRECT_WT_DENIED; \
+             (echo '[core]' > {}) 2>/dev/null \
+             && echo DIRECT_ROOT_OK || echo DIRECT_ROOT_DENIED",
+            wt_cw.display(),
+            root_cw.display(),
+        );
+        let (code, stdout, stderr) = run_sandboxed_home_with_flags_env(
+            &wt,
+            home.path(),
+            &["--use-bubblewrap"],
+            &[("CPLT_CONFIG", &cfg)],
+            &script,
+        );
+        assert!(
+            code == 0
+                && stdout.contains("GIT_WT_DENIED")
+                && stdout.contains("DIRECT_WT_DENIED")
+                && stdout.contains("DIRECT_ROOT_DENIED")
+                && !stdout.contains("_OK"),
+            "code: {code}, stdout: {stdout}, stderr: {stderr}"
+        );
+        assert_eq!(fs::read_to_string(&wt_cw).unwrap_or_default(), "");
+        assert_eq!(fs::read_to_string(&root_cw).unwrap_or_default(), "");
+    }
 }

@@ -3030,7 +3030,7 @@ fn unix_sockets_unrestricted(probe_failed: bool) -> String {
 /// on. Shared so `ro_protect_paths` and `pin_paths` cannot drift apart — a
 /// gitdir missing from the pin set silently re-opens the rename walk-around
 /// that the read-only binds depend on being closed.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 fn git_roots<'a>(
     config: &'a SandboxConfig,
     extra_git_dirs: &'a [PathBuf],
@@ -3142,7 +3142,7 @@ const GIT_CONFIG_NEEDS_BWRAP: &str = "sandbox.allow_git_config_write = false nee
 /// rename-pinned so `mv .git/worktrees/wt …` cannot walk around the bind.
 /// Kept here rather than as a `PROTECTED_IN_GITDIR` row because it applies
 /// only with `sandbox.allow_git_config_write = false`; macOS already denies it.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 fn linked_worktree_dirs(git_dir: &Path) -> Vec<PathBuf> {
     std::fs::read_dir(git_dir.join("worktrees"))
         .map(|it| it.flatten().map(|e| e.path()).collect())
@@ -3177,7 +3177,10 @@ fn ro_protect_paths(
     // Also bound: a `.git` gitdir pointer file (a worktree or `--separate-git-dir`
     // checkout), which would otherwise repoint the repository at a gitdir the
     // agent wrote, and every `config.worktree`, which git reads with
-    // `extensions.worktreeConfig`. Only files that exist at launch are covered.
+    // `extensions.worktreeConfig`. Only files that exist at launch are covered
+    // here; with `sandbox.mask_missing_deny_paths` on and `extensions.worktreeConfig`
+    // enabled in the gitdir's `config`, [`missing_dir_masks`] masks missing
+    // `config.worktree` candidates with `/dev/null`.
     if !config.allow_git_config_write {
         for root in &write_roots {
             let dot_git = root.join(".git");
@@ -3215,10 +3218,14 @@ fn ro_protect_paths(
     // hands the directory entries to `build_bwrap_args`, which mounts an empty
     // read-only tmpfs there: `mkdir` fails with EEXIST and a write inside with
     // EROFS. The agent sees an empty directory instead of none, and bwrap
-    // leaves the empty mountpoint directory on the host. Still open: a missing
-    // *file* entry (`settings.json`, `hooks.json`), which would need a
-    // placeholder file that the agent then reads as an empty config, and a
-    // path whose parent is missing (see `is_absent_under_real_dir`; the launch warns). SECURITY.md.
+    // leaves the empty mountpoint directory on the host. Missing
+    // `config.worktree` files (when `extensions.worktreeConfig` is set and
+    // `allow_git_config_write` is false) are masked the same way with
+    // `--ro-bind /dev/null <path>`. Still open: a missing agent config *file*
+    // entry (`settings.json`, `hooks.json`), which would need a placeholder
+    // file that the agent then reads as an empty config, and a path whose
+    // parent is missing (see `is_absent_under_real_dir`; the launch warns).
+    // SECURITY.md.
     ro_protect.extend(
         config
             .agent
@@ -3496,15 +3503,136 @@ fn bwrap_plan(
     }
 }
 
+/// Cap on `<gitdir>/config` reads (`untrusted::read_untrusted`): the project
+/// and linked worktree dirs are agent-writable.
+#[cfg(any(target_os = "linux", test))]
+const GIT_CONFIG_LIMIT: u64 = 64 * 1024;
+
+#[cfg(any(target_os = "linux", test))]
+fn strip_git_config_comment(s: &str) -> &str {
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (i, b) in s.bytes().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match b {
+            b'\\' if in_quotes => escaped = true,
+            b'"' => in_quotes = !in_quotes,
+            b'#' | b';' if !in_quotes => return &s[..i],
+            _ => {}
+        }
+    }
+    s
+}
+
+/// Whether a git config file text enables `extensions.worktreeConfig`.
+///
+/// Parsed leniently and case-insensitively: `[extensions]` (without a
+/// subsection) followed by `worktreeConfig` as a bare boolean or set to
+/// `true` / `yes` / `on` / non-zero integer. Later entries in the file
+/// override earlier ones, matching git.
+#[cfg(any(target_os = "linux", test))]
+fn parse_worktree_config(text: &str) -> bool {
+    let mut in_extensions = false;
+    let mut enabled = false;
+    for raw_line in text.lines() {
+        let mut line = strip_git_config_comment(raw_line).trim();
+        while let Some(rest) = line.strip_prefix('[') {
+            let Some((header, after)) = rest.split_once(']') else {
+                break;
+            };
+            in_extensions = header.trim().eq_ignore_ascii_case("extensions");
+            line = after.trim();
+        }
+        if !in_extensions || line.is_empty() {
+            continue;
+        }
+        let (key, val) = match line.split_once('=') {
+            Some((k, v)) => (k.trim(), Some(v.trim().trim_matches('"').trim())),
+            None => (line, None),
+        };
+        if key.eq_ignore_ascii_case("worktreeconfig") {
+            enabled = match val {
+                None => true,
+                Some(v) => {
+                    v.eq_ignore_ascii_case("true")
+                        || v.eq_ignore_ascii_case("yes")
+                        || v.eq_ignore_ascii_case("on")
+                        || v.parse::<i64>().is_ok_and(|n| n != 0)
+                }
+            };
+        }
+    }
+    enabled
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn git_config_enables_worktree_config(git_dir: &Path) -> bool {
+    git_dir.symlink_metadata().is_ok_and(|m| m.is_dir())
+        && crate::untrusted::read_untrusted(&git_dir.join("config"), GIT_CONFIG_LIMIT)
+            .ok()
+            .flatten()
+            .is_some_and(|text| parse_worktree_config(&text))
+}
+
+/// `config.worktree` candidates (root gitdir and each existing linked worktree
+/// dir) for gitdirs whose `config` enables `extensions.worktreeConfig`.
+#[cfg(any(target_os = "linux", test))]
+fn missing_worktree_config_masks(write_roots: &[&Path], git_dirs: &[&Path]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for dir in write_roots
+        .iter()
+        .map(|r| r.join(".git"))
+        .chain(git_dirs.iter().map(|d| d.to_path_buf()))
+    {
+        if !git_config_enables_worktree_config(&dir) {
+            continue;
+        }
+        out.push(crate::config::canonicalize_deepest(
+            &dir.join("config.worktree"),
+        ));
+        if dir
+            .join("worktrees")
+            .symlink_metadata()
+            .is_ok_and(|m| m.is_dir())
+        {
+            for wt in linked_worktree_dirs(&dir) {
+                if wt.symlink_metadata().is_ok_and(|m| m.is_dir()) {
+                    out.push(crate::config::canonicalize_deepest(
+                        &wt.join("config.worktree"),
+                    ));
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// The agent's host-persistence directories that `build_bwrap_args` masks
-/// with an empty read-only tmpfs when they are missing
+/// with an empty read-only tmpfs when they are missing, plus missing
+/// `config.worktree` candidates masked with `/dev/null` when
+/// `allow_git_config_write` is false and `extensions.worktreeConfig` is set
 /// (`sandbox.mask_missing_deny_paths`). Empty while the key is off.
-#[cfg(target_os = "linux")]
 ///
 /// Empty with `inspect_only` (`--print-profile`, `cplt check`, the doctor
-/// probe): bwrap creates each masked mountpoint directory on the host, and an
-/// inspection must not write to HOME.
+/// probe): bwrap creates each masked mountpoint on the host, and an
+/// inspection must not write to HOME or the project.
+#[cfg(any(target_os = "linux", test))]
 fn missing_dir_masks(config: &SandboxConfig, inspect_only: bool) -> Vec<PathBuf> {
+    missing_dir_masks_with(config, &[], &[], inspect_only)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn missing_dir_masks_with(
+    config: &SandboxConfig,
+    extra_git_dirs: &[PathBuf],
+    nested_repos: &[PathBuf],
+    inspect_only: bool,
+) -> Vec<PathBuf> {
     if inspect_only || !config.mask_missing_deny_paths {
         return Vec::new();
     }
@@ -3512,7 +3640,7 @@ fn missing_dir_masks(config: &SandboxConfig, inspect_only: bool) -> Vec<PathBuf>
     // against are canonical: an agent root reached through `XDG_*`,
     // `CLAUDE_CONFIG_DIR` or a symlinked `~/.copilot` would otherwise never
     // match and the mask would be skipped.
-    config
+    let mut masks: Vec<PathBuf> = config
         .agent
         .host_persistence_paths_with(config.agent_dirs, config.allow_copilot_host_persistence)
         .into_iter()
@@ -3522,13 +3650,20 @@ fn missing_dir_masks(config: &SandboxConfig, inspect_only: bool) -> Vec<PathBuf>
                 .is_some_and(|n| !crate::agent::HOST_PERSISTENCE_FILES.contains(&n))
         })
         .map(|p| crate::config::canonicalize_deepest(&p))
-        .collect()
+        .collect();
+    if !config.allow_git_config_write {
+        let (mut write_roots, mut git_dirs) = git_roots(config, extra_git_dirs);
+        write_roots.extend(nested_repos.iter().map(PathBuf::as_path));
+        git_dirs.extend(config.named_root_git_dirs.iter().map(PathBuf::as_path));
+        masks.extend(missing_worktree_config_masks(&write_roots, &git_dirs));
+    }
+    masks
 }
 
 /// The masks [`missing_dir_masks`] asked for that the wrapper did not
 /// emit: still missing at launch, but with a missing parent or outside every
 /// writable bind. Said once at launch rather than skipped silently.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 fn unmasked_missing_dirs(masks: &[PathBuf], bwrap_args: &[String]) -> Vec<PathBuf> {
     masks
         .iter()
@@ -3538,6 +3673,9 @@ fn unmasked_missing_dirs(masks: &[PathBuf], bwrap_args: &[String]) -> Vec<PathBu
             !bwrap_args
                 .windows(2)
                 .any(|w| w[0] == "--tmpfs" && w[1] == s.as_ref())
+                && !bwrap_args
+                    .windows(3)
+                    .any(|w| w[0] == "--ro-bind" && w[1] == "/dev/null" && w[2] == s.as_ref())
         })
         .cloned()
         .collect()
@@ -3885,6 +4023,7 @@ fn prepare_impl(
     // `resolve()` only clones `fs_rules`/`net_rules` on the arms that actually
     // build a wrapper (explicit-on, or auto-detect with bwrap available) — the
     // disabled and fallback arms borrow and clone nothing.
+    let mask_missing = missing_dir_masks_with(config, extra_git_dirs, &nested_repos, inspect_only);
     let mut bwrap_wrapper = bubblewrap::resolve(
         config.use_bubblewrap,
         config.netns,
@@ -3892,12 +4031,12 @@ fn prepare_impl(
         bubblewrap::Overlays {
             read_only: &ro_protect,
             pins: &pins,
-            mask_missing: &missing_dir_masks(config, inspect_only),
+            mask_missing: &mask_missing,
         },
         &deny_masks,
     )?;
     if let Some(w) = &bwrap_wrapper {
-        for p in unmasked_missing_dirs(&missing_dir_masks(config, inspect_only), &w.bwrap_args) {
+        for p in unmasked_missing_dirs(&mask_missing, &w.bwrap_args) {
             ui::warn(&format!(
                 "sandbox.mask_missing_deny_paths: {} is missing and could not be masked \
                  (its parent is missing or outside the writable grant), so the agent may \
@@ -3967,7 +4106,7 @@ fn prepare_impl(
             let overlays = bubblewrap::Overlays {
                 read_only: &ro_protect,
                 pins: &pins,
-                mask_missing: &missing_dir_masks(config, inspect_only),
+                mask_missing: &mask_missing,
             };
             let rebuilt =
                 bubblewrap::build_wrapper(&policy, overlays, &deny_masks, strict, config.netns)
@@ -4652,7 +4791,6 @@ mod tests {
     /// An inspection (`--print-profile`, `cplt check`, the doctor probe) gets
     /// no missing-dir masks, because bwrap would create their mountpoints in
     /// HOME. A launch with the key on gets them, fish's `conf.d` included.
-    #[cfg(target_os = "linux")]
     #[test]
     fn missing_dir_masks_are_empty_when_inspecting() {
         let home = tempfile::tempdir().unwrap();
@@ -4673,7 +4811,109 @@ mod tests {
         assert!(missing_dir_masks(&config, false).is_empty());
     }
 
-    fn test_config<'a>(home_dir: &'a Path, grants: &'a [PathBuf]) -> SandboxConfig<'a> {
+    #[test]
+    fn missing_dir_masks_worktree_config_candidates_and_untrusted_config() {
+        let base = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(base.path()).unwrap();
+        let home = root.join("home");
+        let project = root.join("repo");
+        let git = project.join(".git");
+        let wt = git.join("worktrees/wt");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        // A non-directory entry under `worktrees/` is not a worktree parent.
+        std::fs::write(git.join("worktrees/not_a_dir"), "").unwrap();
+
+        let mut config = test_config(&home, &[]);
+        config.project_dir = &project;
+        config.allow_git_config_write = false;
+        config.mask_missing_deny_paths = true;
+
+        // `worktreeConfig` absent: no `config.worktree` candidate.
+        std::fs::write(git.join("config"), "[core]\n\tbare = false\n").unwrap();
+        assert!(
+            !missing_dir_masks(&config, false)
+                .iter()
+                .any(|p| p.ends_with("config.worktree"))
+        );
+
+        // Enabled (case-insensitive section/key, comments, bare boolean, override).
+        for (cfg_text, expected) in [
+            ("[Extensions]\n\tWorktreeConfig = TRUE ; comment\n", true),
+            ("[ extensions ] worktreeConfig\n", true),
+            ("[extensions]\nworktreeConfig = 1\n", true),
+            (
+                "[extensions]\nworktreeConfig = true\nworktreeConfig = false\n",
+                false,
+            ),
+            ("[extensions \"sub\"]\nworktreeConfig = true\n", false),
+        ] {
+            std::fs::write(git.join("config"), cfg_text).unwrap();
+            assert_eq!(
+                git_config_enables_worktree_config(&git),
+                expected,
+                "{cfg_text}"
+            );
+        }
+
+        std::fs::write(
+            git.join("config"),
+            "[extensions]\n\tworktreeConfig = true\n",
+        )
+        .unwrap();
+        let masks = missing_dir_masks(&config, false);
+        let root_cw = git.join("config.worktree");
+        let wt_cw = wt.join("config.worktree");
+        assert!(masks.contains(&root_cw), "{masks:?}");
+        assert!(masks.contains(&wt_cw), "{masks:?}");
+        assert!(
+            !masks
+                .iter()
+                .any(|p| p == &git.join("worktrees/not_a_dir/config.worktree")),
+            "{masks:?}"
+        );
+
+        // Key off, inspect_only, or allow_git_config_write = true: no mask.
+        config.mask_missing_deny_paths = false;
+        assert!(missing_dir_masks(&config, false).is_empty());
+        config.mask_missing_deny_paths = true;
+        assert!(missing_dir_masks(&config, true).is_empty());
+        config.allow_git_config_write = true;
+        assert!(
+            !missing_dir_masks(&config, false)
+                .iter()
+                .any(|p| p.ends_with("config.worktree"))
+        );
+
+        // `unmasked_missing_dirs` recognizes `--ro-bind /dev/null <path>`.
+        let cw_str = root_cw.to_string_lossy().into_owned();
+        let args = vec!["--ro-bind".to_string(), "/dev/null".to_string(), cw_str];
+        assert!(unmasked_missing_dirs(&[root_cw], &args).is_empty());
+
+        // Symlink, FIFO and oversize `.git/config` are refused (`read_untrusted`).
+        let real_cfg = root.join("outside_config");
+        std::fs::write(&real_cfg, "[extensions]\nworktreeConfig = true\n").unwrap();
+        std::fs::remove_file(git.join("config")).unwrap();
+        std::os::unix::fs::symlink(&real_cfg, git.join("config")).unwrap();
+        assert!(!git_config_enables_worktree_config(&git));
+
+        std::fs::remove_file(git.join("config")).unwrap();
+        crate::untrusted::tests::mkfifo(&git.join("config"));
+        let git_cl = git.clone();
+        assert!(!crate::untrusted::tests::bounded(move || {
+            git_config_enables_worktree_config(&git_cl)
+        }));
+
+        std::fs::remove_file(git.join("config")).unwrap();
+        let oversize = format!(
+            "[extensions]\nworktreeConfig = true\n# {}",
+            "x".repeat(usize::try_from(GIT_CONFIG_LIMIT).unwrap())
+        );
+        std::fs::write(git.join("config"), oversize).unwrap();
+        assert!(!git_config_enables_worktree_config(&git));
+    }
+
+    pub(super) fn test_config<'a>(home_dir: &'a Path, grants: &'a [PathBuf]) -> SandboxConfig<'a> {
         SandboxConfig {
             project_dir: Path::new("/project"),
             home_dir,
