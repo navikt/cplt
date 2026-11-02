@@ -3793,7 +3793,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                                Pi:          npm i -g @earendil-works/pi-coding-agent\n  \
                                Claude Code: npm i -g @anthropic-ai/claude-code\n  \
                                goose:       brew install block-goose-cli\n  \
-                               DSH:         put the DeepSeek Harness `dsh` launcher in PATH\n  \
+                               DSH:         put the DeepSeek Harness `dsh` launcher in PATH\n\
                              Or specify explicitly: cplt --agent copilot|opencode|antigravity|agy|pi|claude|goose|dsh|shell"
                         );
                     }
@@ -6080,8 +6080,9 @@ fn is_gh_auth_token_request(args: &[String]) -> bool {
 /// Returns ExitCode::SUCCESS if token found, FAILURE otherwise.
 fn serve_cached_gh_token() -> ExitCode {
     let Some(tmpdir) = gh_token_cache_dir() else {
-        ui::error(
-            "BLOCKED by sandbox: 'gh auth token'. No cached token available. Run 'gh auth login' on the host, then restart cplt.",
+        eprintln!(
+            "⚠️ BLOCKED by sandbox: 'gh auth token'. No cached token available. \
+             To allow it, run `cplt config set gh_guard.block_auth_token false`."
         );
         return ExitCode::FAILURE;
     };
@@ -6098,8 +6099,9 @@ fn serve_cached_gh_token() -> ExitCode {
             ExitCode::SUCCESS
         }
         _ => {
-            ui::error(
-                "BLOCKED by sandbox: 'gh auth token'. No cached token available. Run 'gh auth login' on the host, then restart cplt.",
+            eprintln!(
+                "⚠️ BLOCKED by sandbox: 'gh auth token'. No cached token available. \
+                 To allow it, run `cplt config set gh_guard.block_auth_token false`."
             );
             ExitCode::FAILURE
         }

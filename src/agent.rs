@@ -1522,8 +1522,10 @@ impl Agent {
                 if remote {
                     dropped.push("--remote");
                 }
+                // Mirrors `session_args`: `--resume=ID` wins over `--name`,
+                // and `--name ""` is never emitted.
                 let selector = resume.filter(|s| !s.is_empty());
-                if session_name.is_some() && selector.is_some() {
+                if session_name.is_some_and(|n| n.is_empty() || selector.is_some()) {
                     dropped.push("--name");
                 }
             }
@@ -4693,6 +4695,30 @@ mod tests {
                     .is_empty(),
                 "{agent:?} should not translate any session flags"
             );
+        }
+    }
+
+    /// Ties the warning to the translation: a single session flag is reported
+    /// dropped exactly when `session_args` emits nothing for it.
+    #[test]
+    fn dropped_session_flags_match_session_args() {
+        type Case = (Option<&'static str>, bool, Option<&'static str>, bool);
+        let cases: [Case; 6] = [
+            (Some("id"), false, None, false),
+            (Some(""), false, None, false),
+            (None, true, None, false),
+            (None, false, Some("n"), false),
+            (None, false, Some(""), false),
+            (None, false, None, true),
+        ];
+        for agent in Agent::ALL {
+            for (r, c, n, rem) in cases {
+                assert_eq!(
+                    !agent.dropped_session_flags(r, c, n, rem).is_empty(),
+                    agent.session_args(r, c, n, rem).is_empty(),
+                    "{agent:?} {r:?} {c} {n:?} {rem}"
+                );
+            }
         }
     }
 
