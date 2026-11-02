@@ -2115,7 +2115,11 @@ impl Agent {
     /// Without this, the fish branch was asserted nowhere: CI's `$SHELL` is bash,
     /// so `config_dirs` returned an empty vec and every loop over it passed
     /// vacuously. Renaming `fish` to `fishX` here left the whole suite green.
-    fn shell_config_dirs(shell_name: &str, config_base: &Path, data_base: &Path) -> Vec<AgentDir> {
+    pub(crate) fn shell_config_dirs(
+        shell_name: &str,
+        config_base: &Path,
+        data_base: &Path,
+    ) -> Vec<AgentDir> {
         let writable = |path: PathBuf| AgentDir {
             is_file: false,
             path,

@@ -10254,6 +10254,7 @@ refuse_invalid_repo_config = false
 skip_untrusted_opencode_config = false
 deny_copilot_dir_exec = false
 allow_copilot_host_persistence = true
+mask_missing_deny_paths = true
 allow_docker = false
 allow_rootless_docker = false
 allow_cache_exec = []

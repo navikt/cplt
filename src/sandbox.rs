@@ -74,7 +74,7 @@ pub(crate) mod bubblewrap_probe {
             super::bubblewrap::Overlays {
                 read_only: &plan.ro_protect,
                 pins: &plan.pins,
-                mask_missing: &super::missing_dir_masks(config),
+                mask_missing: &super::missing_dir_masks(config, true),
             },
             &plan.deny_masks,
             false,
@@ -2779,7 +2779,7 @@ fn mcp_wrapper(config: &SandboxConfig) -> (Result<(), String>, BwrapPlan) {
             bubblewrap::Overlays {
                 read_only: &plan.ro_protect,
                 pins: &plan.pins,
-                mask_missing: &missing_dir_masks(config),
+                mask_missing: &missing_dir_masks(config, true),
             },
             &plan.deny_masks,
             false,
@@ -3500,8 +3500,12 @@ fn bwrap_plan(
 /// with an empty read-only tmpfs when they are missing
 /// (`sandbox.mask_missing_deny_paths`). Empty while the key is off.
 #[cfg(target_os = "linux")]
-fn missing_dir_masks(config: &SandboxConfig) -> Vec<PathBuf> {
-    if !config.mask_missing_deny_paths {
+///
+/// Empty with `inspect_only` (`--print-profile`, `cplt check`, the doctor
+/// probe): bwrap creates each masked mountpoint directory on the host, and an
+/// inspection must not write to HOME.
+fn missing_dir_masks(config: &SandboxConfig, inspect_only: bool) -> Vec<PathBuf> {
+    if inspect_only || !config.mask_missing_deny_paths {
         return Vec::new();
     }
     // Resolved, because the writable binds `build_bwrap_args` compares
@@ -3888,12 +3892,12 @@ fn prepare_impl(
         bubblewrap::Overlays {
             read_only: &ro_protect,
             pins: &pins,
-            mask_missing: &missing_dir_masks(config),
+            mask_missing: &missing_dir_masks(config, inspect_only),
         },
         &deny_masks,
     )?;
     if let Some(w) = &bwrap_wrapper {
-        for p in unmasked_missing_dirs(&missing_dir_masks(config), &w.bwrap_args) {
+        for p in unmasked_missing_dirs(&missing_dir_masks(config, inspect_only), &w.bwrap_args) {
             ui::warn(&format!(
                 "sandbox.mask_missing_deny_paths: {} is missing and could not be masked \
                  (its parent is missing or outside the writable grant), so the agent may \
@@ -3963,7 +3967,7 @@ fn prepare_impl(
             let overlays = bubblewrap::Overlays {
                 read_only: &ro_protect,
                 pins: &pins,
-                mask_missing: &missing_dir_masks(config),
+                mask_missing: &missing_dir_masks(config, inspect_only),
             };
             let rebuilt =
                 bubblewrap::build_wrapper(&policy, overlays, &deny_masks, strict, config.netns)
@@ -4643,6 +4647,30 @@ mod tests {
             validate_playwright_socket_capability(Some(&path)).unwrap_err(),
             "Playwright socket dir does not exist"
         );
+    }
+
+    /// An inspection (`--print-profile`, `cplt check`, the doctor probe) gets
+    /// no missing-dir masks, because bwrap would create their mountpoints in
+    /// HOME. A launch with the key on gets them, fish's `conf.d` included.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_dir_masks_are_empty_when_inspecting() {
+        let home = tempfile::tempdir().unwrap();
+        let dirs = Agent::shell_config_dirs(
+            "fish",
+            &home.path().join(".config"),
+            &home.path().join(".local/share"),
+        );
+        let mut config = test_config(home.path(), &[]);
+        config.agent = Agent::Shell;
+        config.agent_dirs = &dirs;
+        config.mask_missing_deny_paths = true;
+        let launch = missing_dir_masks(&config, false);
+        assert!(launch.iter().any(|p| p.ends_with("conf.d")), "{launch:?}");
+        assert!(!launch.iter().any(|p| p.ends_with("config.fish")));
+        assert!(missing_dir_masks(&config, true).is_empty());
+        config.mask_missing_deny_paths = false;
+        assert!(missing_dir_masks(&config, false).is_empty());
     }
 
     fn test_config<'a>(home_dir: &'a Path, grants: &'a [PathBuf]) -> SandboxConfig<'a> {
