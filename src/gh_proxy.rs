@@ -95,9 +95,11 @@ fn github_token_allowed_for(args: &[&str], pin: Option<&str>, hosts: &[String]) 
     // gh honours an explicit selector over `GH_REPO`: a host-qualified `-R`
     // or a URL argument decides where the request goes, so a destination off
     // github.com gets no github.com token, whatever was pinned.
-    let not_github = |h: &str| {
-        !h.eq_ignore_ascii_case(DEFAULT_GH_HOST) && !h.eq_ignore_ascii_case("api.github.com")
-    };
+    // Mirrors go-gh `tokenForHost`: GH_TOKEN reaches github.com, `*.github.com`,
+    // localhost and `*.ghe.com` tenants; GHES uses GH_ENTERPRISE_TOKEN. Only a
+    // `*.ghe.com` destination can therefore receive the github.com token by
+    // mistake. A URL in a body or notes on any other host is just text.
+    let not_github = |h: &str| h.to_ascii_lowercase().ends_with(".ghe.com");
     let repo_flag_host = parse_command(args)
         .and_then(|cmd| cmd.repo_flag)
         .and_then(|r| {
@@ -6202,6 +6204,36 @@ mod tests {
         ));
         assert!(ok(&["pr", "view", "https://github.com/o/r/pull/1"], None));
         assert!(ok(&["api", "https://api.github.com/repos/o/r"], None));
+        assert!(ok(
+            &["pr", "comment", "1", "--body", "https://ci.example/run/1"],
+            None
+        ));
+        assert!(ok(
+            &["pr", "view", "https://www.github.com/o/r/pull/1"],
+            None
+        ));
+        let github = vec!["github.com".to_string()];
+        assert!(github_token_allowed_for(
+            &[
+                "release",
+                "create",
+                "v1",
+                "--notes",
+                "https://jira.example/X-1"
+            ],
+            None,
+            &github
+        ));
+        assert!(!github_token_allowed_for(
+            &["pr", "view", "1", "-R", "x.ghe.com/o/r"],
+            None,
+            &github
+        ));
+        assert!(!github_token_allowed_for(
+            &["pr", "view", "https://x.ghe.com/o/r/pull/1"],
+            None,
+            &github
+        ));
         // Its host is on stdin: the helper entry marks it instead.
         assert!(ok(&["auth", "git-credential", "get"], None));
         // Default list: unchanged, every exec gets the token.
