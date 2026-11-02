@@ -3043,6 +3043,32 @@ fn git_roots<'a>(
     (write_roots, git_dirs)
 }
 
+/// Every git directory (`<write_root>/.git` and `git_dirs`) for a launch.
+#[cfg(any(target_os = "linux", test))]
+fn all_git_dirs<'a>(write_roots: &'a [&'a Path], git_dirs: &'a [&'a Path]) -> Vec<PathBuf> {
+    write_roots
+        .iter()
+        .map(|r| r.join(".git"))
+        .chain(git_dirs.iter().map(|d| d.to_path_buf()))
+        .collect()
+}
+
+/// The worktrees directory (`<gitdir>/worktrees`) and each linked worktree
+/// directory (`<gitdir>/worktrees/<name>`) under `write_roots` and `git_dirs`
+/// that must be rename-pinned when `allow_git_config_write` is false (#386).
+#[cfg(any(target_os = "linux", test))]
+fn linked_worktree_pin_paths(write_roots: &[&Path], git_dirs: &[&Path]) -> Vec<PathBuf> {
+    let mut pins = Vec::new();
+    for dir in all_git_dirs(write_roots, git_dirs) {
+        let linked = linked_worktree_dirs(&dir);
+        if !linked.is_empty() {
+            pins.push(dir.join("worktrees"));
+        }
+        pins.extend(linked);
+    }
+    pins
+}
+
 /// Paths bind-mounted read-write onto themselves so they become mountpoints and
 /// can no longer be renamed or removed. See `bubblewrap::rename_pin_paths`.
 #[cfg(target_os = "linux")]
@@ -3059,13 +3085,7 @@ fn pin_paths(
     let mut pins = bubblewrap::rename_pin_paths(&write_roots, &git_dirs);
     // #386: the ancestors of the `config.worktree` binds in `ro_protect_paths`.
     if !config.allow_git_config_write {
-        for dir in &git_dirs {
-            let linked = linked_worktree_dirs(dir);
-            if !linked.is_empty() {
-                pins.push(dir.join("worktrees"));
-            }
-            pins.extend(linked);
-        }
+        pins.extend(linked_worktree_pin_paths(&write_roots, &git_dirs));
     }
     // GHSA-8qmv-wxp3-526v, Linux half. A read-only bind pins a path's content,
     // not its name: `~/.cache/copilot` sits inside the writable `~/.cache`
@@ -3185,16 +3205,14 @@ fn ro_protect_paths(
         for root in &write_roots {
             let dot_git = root.join(".git");
             if dot_git.is_file() {
-                ro_protect.push(dot_git.clone());
+                ro_protect.push(dot_git);
             }
-            ro_protect.push(dot_git.join("config"));
-            ro_protect.push(dot_git.join("config.worktree"));
         }
-        for dir in &git_dirs {
+        for dir in all_git_dirs(&write_roots, &git_dirs) {
             ro_protect.push(dir.join("config"));
             ro_protect.push(dir.join("config.worktree"));
             ro_protect.extend(
-                linked_worktree_dirs(dir)
+                linked_worktree_dirs(&dir)
                     .into_iter()
                     .map(|w| w.join("config.worktree")),
             );
@@ -3570,11 +3588,16 @@ fn parse_worktree_config(text: &str) -> bool {
 
 #[cfg(any(target_os = "linux", test))]
 fn git_config_enables_worktree_config(git_dir: &Path) -> bool {
-    git_dir.symlink_metadata().is_ok_and(|m| m.is_dir())
-        && crate::untrusted::read_untrusted(&git_dir.join("config"), GIT_CONFIG_LIMIT)
-            .ok()
-            .flatten()
-            .is_some_and(|text| parse_worktree_config(&text))
+    if !git_dir.symlink_metadata().is_ok_and(|m| m.is_dir()) {
+        return false;
+    }
+    let config = git_dir.join("config");
+    match crate::untrusted::read_untrusted(&config, GIT_CONFIG_LIMIT) {
+        Ok(Some(text)) => parse_worktree_config(&text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        // Oversize, symlink, FIFO or unreadable: fail closed when `config` exists.
+        Ok(None) | Err(_) => config.symlink_metadata().is_ok(),
+    }
 }
 
 /// `config.worktree` candidates (root gitdir and each existing linked worktree
@@ -3582,11 +3605,7 @@ fn git_config_enables_worktree_config(git_dir: &Path) -> bool {
 #[cfg(any(target_os = "linux", test))]
 fn missing_worktree_config_masks(write_roots: &[&Path], git_dirs: &[&Path]) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    for dir in write_roots
-        .iter()
-        .map(|r| r.join(".git"))
-        .chain(git_dirs.iter().map(|d| d.to_path_buf()))
-    {
+    for dir in all_git_dirs(write_roots, git_dirs) {
         if !git_config_enables_worktree_config(&dir) {
             continue;
         }
@@ -3623,7 +3642,7 @@ fn missing_worktree_config_masks(write_roots: &[&Path], git_dirs: &[&Path]) -> V
 /// inspection must not write to HOME or the project.
 #[cfg(any(target_os = "linux", test))]
 fn missing_dir_masks(config: &SandboxConfig, inspect_only: bool) -> Vec<PathBuf> {
-    missing_dir_masks_with(config, &[], &[], inspect_only)
+    missing_dir_masks_with(config, &launch_git_dirs(config), &[], inspect_only)
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -3652,9 +3671,8 @@ fn missing_dir_masks_with(
         .map(|p| crate::config::canonicalize_deepest(&p))
         .collect();
     if !config.allow_git_config_write {
-        let (mut write_roots, mut git_dirs) = git_roots(config, extra_git_dirs);
+        let (mut write_roots, git_dirs) = git_roots(config, extra_git_dirs);
         write_roots.extend(nested_repos.iter().map(PathBuf::as_path));
-        git_dirs.extend(config.named_root_git_dirs.iter().map(PathBuf::as_path));
         masks.extend(missing_worktree_config_masks(&write_roots, &git_dirs));
     }
     masks
@@ -4873,6 +4891,22 @@ mod tests {
             "{masks:?}"
         );
 
+        // Main-worktree launch (`git_common_dir = None`): `pin_paths`,
+        // `ro_protect_paths` and `missing_dir_masks` all cover `.git/worktrees/wt`.
+        assert!(config.git_common_dir.is_none());
+        let (write_roots, git_dirs) = super::git_roots(&config, &[]);
+        let wt_pins = super::linked_worktree_pin_paths(&write_roots, &git_dirs);
+        assert!(wt_pins.contains(&git.join("worktrees")), "{wt_pins:?}");
+        assert!(wt_pins.contains(&wt), "{wt_pins:?}");
+        #[cfg(target_os = "linux")]
+        {
+            let pins = super::pin_paths(&config, &[], &[]);
+            assert!(pins.contains(&git.join("worktrees")), "{pins:?}");
+            assert!(pins.contains(&wt), "{pins:?}");
+            let ro = super::ro_protect_paths(&config, &[], &[]);
+            assert!(ro.contains(&wt_cw), "{ro:?}");
+        }
+
         // Key off, inspect_only, or allow_git_config_write = true: no mask.
         config.mask_missing_deny_paths = false;
         assert!(missing_dir_masks(&config, false).is_empty());
@@ -4884,33 +4918,43 @@ mod tests {
                 .iter()
                 .any(|p| p.ends_with("config.worktree"))
         );
+        config.allow_git_config_write = false;
 
         // `unmasked_missing_dirs` recognizes `--ro-bind /dev/null <path>`.
         let cw_str = root_cw.to_string_lossy().into_owned();
         let args = vec!["--ro-bind".to_string(), "/dev/null".to_string(), cw_str];
-        assert!(unmasked_missing_dirs(&[root_cw], &args).is_empty());
+        assert!(unmasked_missing_dirs(std::slice::from_ref(&root_cw), &args).is_empty());
 
-        // Symlink, FIFO and oversize `.git/config` are refused (`read_untrusted`).
-        let real_cfg = root.join("outside_config");
-        std::fs::write(&real_cfg, "[extensions]\nworktreeConfig = true\n").unwrap();
+        // Missing `.git/config`: not enabled.
         std::fs::remove_file(git.join("config")).unwrap();
-        std::os::unix::fs::symlink(&real_cfg, git.join("config")).unwrap();
         assert!(!git_config_enables_worktree_config(&git));
+
+        // Symlink, FIFO and oversize `.git/config` are not read (`read_untrusted`),
+        // and fail closed (treated as enabled so `config.worktree` stays masked).
+        let real_cfg = root.join("outside_config");
+        std::fs::write(&real_cfg, "[core]\nbare = false\n").unwrap();
+        std::os::unix::fs::symlink(&real_cfg, git.join("config")).unwrap();
+        assert!(git_config_enables_worktree_config(&git));
 
         std::fs::remove_file(git.join("config")).unwrap();
         crate::untrusted::tests::mkfifo(&git.join("config"));
         let git_cl = git.clone();
-        assert!(!crate::untrusted::tests::bounded(move || {
+        assert!(crate::untrusted::tests::bounded(move || {
             git_config_enables_worktree_config(&git_cl)
         }));
 
         std::fs::remove_file(git.join("config")).unwrap();
         let oversize = format!(
-            "[extensions]\nworktreeConfig = true\n# {}",
+            "[core]\nbare = false\n# {}",
             "x".repeat(usize::try_from(GIT_CONFIG_LIMIT).unwrap())
         );
         std::fs::write(git.join("config"), oversize).unwrap();
-        assert!(!git_config_enables_worktree_config(&git));
+        assert!(git_config_enables_worktree_config(&git));
+        let masks = missing_dir_masks(&config, false);
+        assert!(
+            masks.contains(&root_cw) && masks.contains(&wt_cw),
+            "{masks:?}"
+        );
     }
 
     pub(super) fn test_config<'a>(home_dir: &'a Path, grants: &'a [PathBuf]) -> SandboxConfig<'a> {

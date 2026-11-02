@@ -5434,4 +5434,44 @@ print('CONNECTED')
         assert_eq!(fs::read_to_string(&wt_cw).unwrap_or_default(), "");
         assert_eq!(fs::read_to_string(&root_cw).unwrap_or_default(), "");
     }
+
+    #[test]
+    fn git_config_write_denied_pins_linked_worktrees_on_main_repo_launch() {
+        require_bwrap!();
+        let dir = create_deny_project();
+        let main = dir.path().canonicalize().unwrap().join("main");
+        fs::create_dir_all(&main).unwrap();
+        git_ok(&main, &["init", "--quiet"]);
+        git_ok(
+            &main,
+            &[
+                "-c",
+                "user.name=e",
+                "-c",
+                "user.email=e@example.com",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "i",
+            ],
+        );
+        let wt = dir.path().canonicalize().unwrap().join("wt");
+        git_ok(&main, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+
+        let (code, stdout, stderr) = run_git_config_denied(
+            &main,
+            "(mv .git/worktrees/wt .git/worktrees/wt2) 2>/dev/null \
+             && echo WT_MOVED || echo WT_PINNED; \
+             (mv .git/worktrees .git/wtx) 2>/dev/null \
+             && echo WTS_MOVED || echo WTS_PINNED",
+        );
+        assert!(
+            code == 0
+                && stdout.contains("WT_PINNED")
+                && stdout.contains("WTS_PINNED")
+                && !stdout.contains("_MOVED"),
+            "code: {code}, stdout: {stdout}, stderr: {stderr}"
+        );
+    }
 }
