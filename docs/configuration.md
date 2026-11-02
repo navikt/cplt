@@ -831,6 +831,7 @@ The settings below are machine-specific or local CLI preferences, so `.cplt.toml
 | `sandbox.skip_untrusted_opencode_config` | decides what an untrusted repo may configure, so the repo cannot set it; see [OpenCode project config in untrusted repositories](#opencode-project-config-in-untrusted-repositories-sandboxskip_untrusted_opencode_config) |
 | `sandbox.deny_copilot_dir_exec` | a staged hardening switch, see [No execute on `~/.copilot`](#no-execute-on-copilot-sandboxdeny_copilot_dir_exec) |
 | `sandbox.allow_copilot_host_persistence` | decides what the sandbox may leave behind for host sessions, so the repo cannot set it; see [Copilot agents and saved approvals](#copilot-agents-and-saved-approvals-sandboxallow_copilot_host_persistence) |
+| `sandbox.mask_missing_deny_paths` | decides what the sandbox may leave behind for host sessions, so the repo cannot set it; see [Missing host-persistence directories on Linux](#missing-host-persistence-directories-on-linux-sandboxmask_missing_deny_paths) |
 | `sandbox.inherit_env` | too dangerous for repo config, it would affect every team member |
 | `sandbox.allow_build_credentials` | hands the agent the user's own registry tokens from `$HOME`, and a repo cannot grant home paths |
 | `allow.exec` | exec paths differ per machine, and a repo must not be able to make one of its own trees executable |
@@ -1102,6 +1103,16 @@ cplt config set sandbox.allow_copilot_host_persistence false
 ```
 
 With the key off, saving a tool approval inside cplt fails for that session, and you add custom agents from a shell outside cplt. cplt also warns after the session when Copilot trusted a new folder. A config without the key keeps both writable, and `cplt doctor` suggests the change. Set the key to `true` (`cplt config set --force sandbox.allow_copilot_host_persistence true`) to keep them writable and silence that. On Linux the deny needs bubblewrap and only covers paths that already exist. See [SECURITY.md](../SECURITY.md).
+
+## Missing host-persistence directories on Linux (`sandbox.mask_missing_deny_paths`)
+
+On Linux, the agent's host-persistence denies (Copilot's `agents/` and `extensions/`, Pi's `extensions/`, `npm/`, `git/`, `skills/`, Claude's `plugins/`) are read-only bubblewrap mounts, and bubblewrap cannot mount a path that does not exist. When the directory is missing at launch, the agent can create it, and a later host session loads what it put there. New configs close that:
+
+```bash
+cplt config set sandbox.mask_missing_deny_paths true
+```
+
+With the key on, a missing directory gets an empty read-only mount, so creating it or writing inside it fails. The agent sees an empty directory where there was none, and bubblewrap leaves that empty directory on disk. It is masked only when its parent directory exists, so cplt never creates a parent in your home directory. Missing files (`settings.json`, `hooks.json`) are not masked. A config without the key keeps today's behaviour, and `cplt doctor` suggests the change; set the key to `false` to silence that. The key needs bubblewrap and has no effect on macOS, which denies these paths whether they exist or not. See [known impacts](known-impacts.md#linux-missing-host-persistence-directories-appear-empty).
 
 ## Other keys
 

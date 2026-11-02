@@ -74,6 +74,7 @@ pub(crate) mod bubblewrap_probe {
             super::bubblewrap::Overlays {
                 read_only: &plan.ro_protect,
                 pins: &plan.pins,
+                mask_missing: &super::missing_dir_masks(config),
             },
             &plan.deny_masks,
             false,
@@ -311,6 +312,9 @@ pub struct SandboxConfig<'a> {
     /// `sandbox.allow_copilot_host_persistence` (#906): keep
     /// [`crate::agent::COPILOT_PERSISTENCE_OPT_OUT`] writable.
     pub allow_copilot_host_persistence: bool,
+    /// `sandbox.mask_missing_deny_paths`: on Linux, mask a missing
+    /// host-persistence directory with an empty read-only mount.
+    pub mask_missing_deny_paths: bool,
     /// Allow JVM Attach API unix sockets in /tmp (.java_pid* pattern only).
     pub allow_jvm_attach: bool,
     /// Allow MSBuild worker-node unix sockets in /tmp (MSBuild<pid> pattern only).
@@ -2775,6 +2779,7 @@ fn mcp_wrapper(config: &SandboxConfig) -> (Result<(), String>, BwrapPlan) {
             bubblewrap::Overlays {
                 read_only: &plan.ro_protect,
                 pins: &plan.pins,
+                mask_missing: &missing_dir_masks(config),
             },
             &plan.deny_masks,
             false,
@@ -3202,16 +3207,18 @@ fn ro_protect_paths(
     // an allowed tree, so the bwrap read-only overlay is the only mechanism here
     // — WITHOUT bwrap this is unenforced on Linux.
     //
-    // KNOWN GAP: even with bwrap, `build_bwrap_args` skips a path that does not
-    // exist, because bwrap cannot bind a missing source. `.git/hooks` rarely
-    // hits this (`git init` creates it) but `extensions/` does not exist until
-    // the first extension is installed, so that deny is nominal in the common
-    // case. Masking a missing path with the `deny_masks` machinery (a `--tmpfs`
-    // over a directory, a mode-000 placeholder `--ro-bind` over a file) would
-    // close it, but it also makes the path *appear to exist* as an empty dir or
-    // empty file, which changes what the agent reads at startup. That is not a
-    // change to make untested, and this is a macOS host. Documented in
-    // SECURITY.md instead of half-done.
+    // A path that does not exist cannot be `--ro-bind`ed (bwrap needs a
+    // source). `extensions/` or `~/.copilot/agents/` often does not exist yet,
+    // so for an unset `sandbox.mask_missing_deny_paths` (existing configs) that
+    // deny is nominal: the agent can create the directory and a later host
+    // session loads it. With the key on (new configs), [`missing_dir_masks`]
+    // hands the directory entries to `build_bwrap_args`, which mounts an empty
+    // read-only tmpfs there: `mkdir` fails with EEXIST and a write inside with
+    // EROFS. The agent sees an empty directory instead of none, and bwrap
+    // leaves the empty mountpoint directory on the host. Still open: a missing
+    // *file* entry (`settings.json`, `hooks.json`), which would need a
+    // placeholder file that the agent then reads as an empty config, and a
+    // path whose parent is missing (see `masks_missing_dir`). SECURITY.md.
     ro_protect.extend(
         config
             .agent
@@ -3487,6 +3494,25 @@ fn bwrap_plan(
         pins,
         deny_masks,
     }
+}
+
+/// The agent's host-persistence directories that `build_bwrap_args` masks
+/// with an empty read-only tmpfs when they are missing
+/// (`sandbox.mask_missing_deny_paths`). Empty while the key is off.
+#[cfg(target_os = "linux")]
+fn missing_dir_masks(config: &SandboxConfig) -> Vec<PathBuf> {
+    if !config.mask_missing_deny_paths {
+        return Vec::new();
+    }
+    config
+        .agent
+        .host_persistence_paths_with(config.agent_dirs, config.allow_copilot_host_persistence)
+        .into_iter()
+        // ponytail: the entries are fixed names, and every directory entry has
+        // no extension while every file entry has one. A new extensionless file
+        // entry would be masked as a directory; add a dir/file flag then.
+        .filter(|p| p.extension().is_none())
+        .collect()
 }
 
 /// The read-only binds and the rename pins. Built again after #553 creates
@@ -3838,6 +3864,7 @@ fn prepare_impl(
         bubblewrap::Overlays {
             read_only: &ro_protect,
             pins: &pins,
+            mask_missing: &missing_dir_masks(config),
         },
         &deny_masks,
     )?;
@@ -3902,6 +3929,7 @@ fn prepare_impl(
             let overlays = bubblewrap::Overlays {
                 read_only: &ro_protect,
                 pins: &pins,
+                mask_missing: &missing_dir_masks(config),
             };
             let rebuilt =
                 bubblewrap::build_wrapper(&policy, overlays, &deny_masks, strict, config.netns)
@@ -4628,6 +4656,7 @@ mod tests {
             protect_pnpm_config: false,
             deny_copilot_dir_exec: false,
             allow_copilot_host_persistence: false,
+            mask_missing_deny_paths: false,
             allow_jvm_attach: false,
             allow_msbuild: false,
             allow_docker: false,

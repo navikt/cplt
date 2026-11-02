@@ -1308,6 +1308,29 @@ pub fn copilot_persistence_nudge(
     })
 }
 
+/// The Linux nudge for a config from before a missing host-persistence
+/// directory was masked for new configs. Shown only while no layer sets
+/// `sandbox.mask_missing_deny_paths`; setting it either way silences it.
+#[must_use]
+pub fn mask_missing_deny_paths_nudge(
+    r: &crate::config::Resolved,
+    bwrap_usable: bool,
+) -> Option<Finding> {
+    let layer = r.bool_layer("sandbox", "mask_missing_deny_paths");
+    (bwrap_usable && layer == Some(crate::config::ConfigLayer::Baseline)).then(|| {
+        Finding::warning(
+            "A host-persistence directory that does not exist yet (~/.copilot/agents/, Pi's \
+             extensions/) is not protected: the agent can create it, and a later host session \
+             loads it. New configs mount an empty read-only directory there.",
+            Some(
+                "cplt config set sandbox.mask_missing_deny_paths true, or set it to false to \
+                 keep today's behaviour and silence this"
+                    .to_string(),
+            ),
+        )
+    })
+}
+
 /// The Linux nudge for a config from before `.git/config` became read-only
 /// for new configs (#386). Shown only while no layer sets
 /// `sandbox.allow_git_config_write`; setting it either way silences it.
@@ -1395,6 +1418,28 @@ mod tests {
         assert!(copilot_persistence_nudge(&new, Agent::Copilot).is_none());
         let kept = r("[sandbox]\nallow_copilot_host_persistence = true\n");
         assert!(copilot_persistence_nudge(&kept, Agent::Copilot).is_none());
+    }
+
+    #[test]
+    fn mask_missing_deny_paths_nudge_only_when_unset() {
+        let r = |toml: &str| {
+            toml::from_str::<crate::config::Config>(toml)
+                .unwrap()
+                .merge(crate::config::CliFlags::default())
+                .unwrap()
+        };
+        let old = r("");
+        assert!(
+            !old.mask_missing_deny_paths,
+            "unset keeps today's behaviour"
+        );
+        assert!(mask_missing_deny_paths_nudge(&old, true).is_some());
+        assert!(mask_missing_deny_paths_nudge(&old, false).is_none());
+        let new = r(&crate::config::default_config_contents());
+        assert!(new.mask_missing_deny_paths);
+        assert!(mask_missing_deny_paths_nudge(&new, true).is_none());
+        let off = r("[sandbox]\nmask_missing_deny_paths = false\n");
+        assert!(mask_missing_deny_paths_nudge(&off, true).is_none());
     }
 
     #[test]

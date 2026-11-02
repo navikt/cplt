@@ -245,6 +245,12 @@ refuse_unenforced = true
 # default is true (writable).
 allow_copilot_host_persistence = false
 #
+# Linux: when an agent's host-persistence directory (~/.copilot/agents/, Pi's
+# extensions/) does not exist yet, mount an empty read-only directory there so
+# the agent cannot create it. The agent sees an empty directory. On for new
+# configs; without this line a missing directory is left creatable.
+mask_missing_deny_paths = true
+#
 # Run sandbox-exec validation test on every launch (default: true).
 # Disable to save ~200ms startup if you trust your config.
 # validate = true
@@ -785,6 +791,9 @@ mod tests {
             Config::default().sandbox.allow_copilot_host_persistence,
             None
         );
+        // New configs mask a missing host-persistence dir; unset leaves it.
+        assert_eq!(config.sandbox.mask_missing_deny_paths, Some(true));
+        assert_eq!(Config::default().sandbox.mask_missing_deny_paths, None);
         // #878: vendor OTLP auth headers stripped for new configs only.
         assert_eq!(config.sandbox.strip_otlp_vendor_auth, Some(true));
         assert_eq!(Config::default().sandbox.strip_otlp_vendor_auth, None);

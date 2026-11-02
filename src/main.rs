@@ -7495,6 +7495,7 @@ fn build_sandbox_config<'a>(
         protect_pnpm_config: resolved.protect_pnpm_config,
         deny_copilot_dir_exec: resolved.deny_copilot_dir_exec,
         allow_copilot_host_persistence: resolved.allow_copilot_host_persistence,
+        mask_missing_deny_paths: resolved.mask_missing_deny_paths,
         allow_jvm_attach: resolved.allow_jvm_attach,
         allow_msbuild: resolved.allow_msbuild,
         allow_docker: resolved.allow_docker,
@@ -9502,6 +9503,11 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
     ));
     #[cfg(target_os = "linux")]
     findings.extend(doctor::git_config_write_nudge(
+        &resolved,
+        matches!(bubblewrap, doctor::Bubblewrap::Usable(_)),
+    ));
+    #[cfg(target_os = "linux")]
+    findings.extend(doctor::mask_missing_deny_paths_nudge(
         &resolved,
         matches!(bubblewrap, doctor::Bubblewrap::Usable(_)),
     ));
@@ -14080,6 +14086,7 @@ mod tests {
             protect_pnpm_config: false,
             deny_copilot_dir_exec: false,
             allow_copilot_host_persistence: false,
+            mask_missing_deny_paths: false,
             allow_jvm_attach: false,
             allow_msbuild: false,
             allow_docker: false,

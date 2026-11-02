@@ -503,6 +503,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "sandbox",
+        key: "mask_missing_deny_paths",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "false (true in new configs)",
+        description: "Linux only: when an agent's host-persistence directory (for example ~/.copilot/agents/ or Pi's extensions/) does not exist at launch, mount an empty read-only directory there, so the agent cannot create it for a later host session to load. The agent sees an empty directory instead of a missing one. No effect on macOS, which denies the path whether or not it exists.",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
         key: "allow_copilot_host_persistence",
         value_type: ConfigValueType::Bool,
         dangerous: true,
@@ -1268,6 +1276,14 @@ bool_keys! {
         config = |c: &Config| c.sandbox.allow_copilot_host_persistence,
         baseline = |_: PresetBaseline| true,
         resolved = |r: &Resolved| r.allow_copilot_host_persistence;
+
+    /// Unset keeps today's behaviour (a missing deny dir is not masked);
+    /// `cplt config init` writes true.
+    mask_missing_deny_paths, "sandbox", "mask_missing_deny_paths",
+        cli = |_: &CliFlags| FeatureToggle::UseDefault,
+        config = |c: &Config| c.sandbox.mask_missing_deny_paths,
+        baseline = |_: PresetBaseline| false,
+        resolved = |r: &Resolved| r.mask_missing_deny_paths;
 
     allow_docker, "sandbox", "allow_docker",
         cli = |c: &CliFlags| c.allow_docker,

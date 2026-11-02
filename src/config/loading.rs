@@ -503,6 +503,7 @@ impl Config {
         let skip_untrusted_opencode_config = bools.skip_untrusted_opencode_config;
         let deny_copilot_dir_exec = bools.deny_copilot_dir_exec;
         let allow_copilot_host_persistence = bools.allow_copilot_host_persistence;
+        let mask_missing_deny_paths = bools.mask_missing_deny_paths;
 
         let allow_docker = bools.allow_docker;
         let allow_rootless_docker = bools.allow_rootless_docker;
@@ -701,6 +702,7 @@ impl Config {
             skip_untrusted_opencode_config,
             deny_copilot_dir_exec,
             allow_copilot_host_persistence,
+            mask_missing_deny_paths,
             allow_docker,
             allow_rootless_docker,
             allow_tmp_exec,
@@ -4498,6 +4500,14 @@ mod precedence {
                 cli_off: None,
                 get: |r| r.allow_copilot_host_persistence,
                 default: true,
+                preset: None,
+            },
+            Ladder {
+                key: "sandbox.mask_missing_deny_paths",
+                cli_on: None,
+                cli_off: None,
+                get: |r| r.mask_missing_deny_paths,
+                default: false,
                 preset: None,
             },
             Ladder {

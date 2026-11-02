@@ -5294,4 +5294,75 @@ print('CONNECTED')
             );
         }
     }
+
+    /// `sandbox.mask_missing_deny_paths`: with Pi's `extensions/` absent at
+    /// launch, the key on mounts an empty read-only dir there, so it cannot be
+    /// created and nothing can be written inside it; off, the agent can create
+    /// it as before. HOME is a temp dir, never the real one.
+    #[test]
+    fn mask_missing_deny_paths_blocks_creating_a_missing_extensions_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        require_bwrap!();
+        for on in [true, false] {
+            let home = tempdir_outside_tmp();
+            let h = home.path();
+            let pi = h.join(".local/bin/pi");
+            fs::create_dir_all(pi.parent().unwrap()).unwrap();
+            fs::write(&pi, "#!/bin/sh\necho FAKE_PI_RAN\nexec /bin/sh \"$@\"\n").unwrap();
+            fs::set_permissions(&pi, fs::Permissions::from_mode(0o755)).unwrap();
+            let ext = h.join(".pi/agent/extensions");
+            fs::create_dir_all(ext.parent().unwrap()).unwrap();
+            let cfg = tempfile::tempdir().unwrap();
+            let cfg_file = cfg.path().join("config.toml");
+            fs::write(
+                &cfg_file,
+                format!("[sandbox]\nmask_missing_deny_paths = {on}\n"),
+            )
+            .unwrap();
+            let project = create_test_project();
+            let e = ext.display();
+            let script = format!(
+                "mkdir {e} 2>/dev/null && echo MKDIR_OK; \
+                 (echo x > {e}/evil.js) 2>/dev/null && echo WRITE_OK; \
+                 mkdir {e}/sub 2>/dev/null && echo SUBDIR_OK; true"
+            );
+            let path = format!(
+                "{}:{}",
+                h.join(".local/bin").display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+            let out = cplt_cmd()
+                .args(["--yes", "--no-validate", "--quiet", "--use-bubblewrap"])
+                .args(["--agent", "pi", "--project-dir"])
+                .arg(project.path())
+                .args(["--", "-c", &script])
+                .env("HOME", h)
+                .env("PATH", path)
+                .env("CPLT_CONFIG", &cfg_file)
+                .env_remove("XDG_CONFIG_HOME")
+                .output()
+                .expect("Failed to execute cplt");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stdout.contains("FAKE_PI_RAN"),
+                "the stand-in pi did not run (on={on})\nstdout: {stdout}\nstderr: {stderr}"
+            );
+            if on {
+                for marker in ["MKDIR_OK", "WRITE_OK", "SUBDIR_OK"] {
+                    assert!(
+                        !stdout.contains(marker),
+                        "key on: {marker} in a masked missing extensions/: {stdout}"
+                    );
+                }
+                let left = fs::read_dir(&ext).map(|d| d.count()).unwrap_or(0);
+                assert_eq!(left, 0, "nothing may reach the host extensions/");
+            } else {
+                assert!(
+                    stdout.contains("MKDIR_OK"),
+                    "key off keeps today's behaviour: {stdout}\nstderr: {stderr}"
+                );
+            }
+        }
+    }
 }
