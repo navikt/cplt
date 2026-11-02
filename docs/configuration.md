@@ -708,6 +708,20 @@ cplt --allow-localhost-any --allow-docker --allow-jvm-attach \
 
 `cplt config explain` tells you what a key does and how to set it.
 
+### GitHub Enterprise hosts
+
+The gh guard scopes only `github.com` remotes unless `gh_guard.hosts` (default
+`["github.com"]`) names more. Set it in the global config, with bare
+hostnames:
+
+```bash
+cplt config set gh_guard.hosts github.com,example.ghe.com
+```
+
+It is global-only: `--local` and `.cplt.toml` cannot set it. The host must
+also be reachable through the proxy, so under strict networking add it to
+`allowed_domains` as well. See [gh guard](gh-guard.md#github-enterprise-hosts).
+
 ### Letting the agent merge its own pull requests
 
 The gh guard refuses `gh pr merge`. `gh_guard.allow_pr_merge` (default `false`)

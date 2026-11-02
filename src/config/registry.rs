@@ -683,6 +683,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         default_display: "false",
         description: "Allow 'gh pr merge' of the account's own PRs, in scope, into a branch where an active ruleset the account cannot bypass requires an approving review that a new push dismisses. '--admin' is always refused.",
     },
+    ConfigKeyInfo {
+        section: "gh_guard",
+        key: "hosts",
+        value_type: ConfigValueType::StrArray,
+        dangerous: false,
+        default_display: "[\"github.com\"]",
+        description: "GitHub hostnames whose remotes the gh guard scopes, e.g. [\"github.com\", \"example.ghe.com\"]. Bare hostnames only. Global config only. The host must also be reachable through the proxy (allowed_domains under strict networking); cplt does not add it.",
+    },
     // [git_guard]
     ConfigKeyInfo {
         section: "git_guard",

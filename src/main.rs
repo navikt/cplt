@@ -1069,6 +1069,11 @@ NOTE:
         #[arg(long, default_value_t = false)]
         allow_pr_merge: bool,
 
+        /// GitHub host the guard accepts (`gh_guard.hosts`). Repeatable;
+        /// github.com when none is given.
+        #[arg(long = "gh-host")]
+        gh_host: Vec<String>,
+
         /// Block `gh pr merge` (override for --allow-pr-merge).
         #[arg(long, conflicts_with = "allow_pr_merge")]
         no_allow_pr_merge: bool,
@@ -3347,6 +3352,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         Ok(r) => r,
         Err(e) => bail!("{e}"),
     };
+    gh_proxy::set_gh_hosts(&resolved.gh_guard.hosts);
     resolved.allow_write_state = cli_allow_write_state;
     // `.cplt.toml`'s deny.env extends this list later; dedup here too for
     // launches without one.
@@ -4834,6 +4840,7 @@ fn resolve_config_only() -> anyhow::Result<config::Resolved> {
     let resolved = config
         .merge(config::CliFlags::default())
         .context("resolving configuration")?;
+    gh_proxy::set_gh_hosts(&resolved.gh_guard.hosts);
     Ok(resolved)
 }
 
@@ -5013,8 +5020,12 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
                 no_allow_api_write,
                 allow_pr_merge,
                 no_allow_pr_merge,
+                gh_host,
                 args,
             } => {
+                if !gh_host.is_empty() {
+                    gh_proxy::set_gh_hosts(&gh_host);
+                }
                 let policy = gh_proxy::GatePolicy {
                     mode: match mode.as_str() {
                         "warn" => config::EnforcementMode::Warn,
@@ -6039,8 +6050,15 @@ fn exec_real(
     command.env_remove("GH_REPO");
     if let Some(repo) = repo_scope {
         command.env("GH_REPO", repo);
+        // A pin on a configured non-github.com host also pins the host, so a
+        // bare `-R owner/repo` or `gh api` path cannot land on another one.
+        if let Some(host) = gh_proxy::foreign_pin_host(repo) {
+            command.env("GH_HOST", host);
+        }
     }
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     if name == "gh"
+        && gh_proxy::github_token_allowed(&arg_refs, repo_scope)
         && let Some(token) = exec_gh_token()
     {
         command.env("GH_TOKEN", token);
@@ -10614,6 +10632,16 @@ fn run_config_set_via(
                 values.join(" ")
             }
         ));
+        return ExitCode::FAILURE;
+    }
+
+    // `gh_guard.hosts` is global-only: a per-checkout list would widen which
+    // hosts the gh guard scopes for one repository's sessions.
+    if local && key == "gh_guard.hosts" {
+        ui::error(
+            "gh_guard.hosts is machine-wide only, not per-project.\n  \
+             Use: cplt config set gh_guard.hosts <HOST>",
+        );
         return ExitCode::FAILURE;
     }
 

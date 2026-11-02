@@ -1055,27 +1055,38 @@ fn route_github_credentials_through_gh_guard(cmd: &mut Command, inherit_env: boo
         None if inherit_env => std::env::var("GIT_CONFIG_COUNT").ok(),
         None => None,
     };
-    for (k, v) in github_credential_helper_config(current.as_deref()) {
+    for (k, v) in github_credential_helper_config(current.as_deref(), crate::gh_proxy::gh_hosts()) {
         cmd.env(k, v);
     }
 }
 
-/// The env vars that append the `credential.https://github.com.helper`
-/// entry after `existing_count` config overrides. An unparsable count is
-/// left alone (git would reject it anyway) and nothing is added.
-fn github_credential_helper_config(existing_count: Option<&str>) -> Vec<(String, String)> {
-    const KEY: &str = "credential.https://github.com.helper";
+/// The env vars that append a `credential.https://<host>.helper` entry for
+/// each `gh_guard.hosts` host (github.com alone by default) after
+/// `existing_count` config overrides. An unparsable count is left alone (git
+/// would reject it anyway) and nothing is added.
+fn github_credential_helper_config(
+    existing_count: Option<&str>,
+    hosts: &[String],
+) -> Vec<(String, String)> {
     let Ok(n) = existing_count.map_or(Ok(0), |c| c.trim().parse::<usize>()) else {
         return Vec::new();
     };
-    vec![
-        (format!("GIT_CONFIG_KEY_{n}"), KEY.to_string()),
-        (
-            format!("GIT_CONFIG_VALUE_{n}"),
+    let mut env = Vec::new();
+    for (i, host) in hosts.iter().enumerate() {
+        env.push((
+            format!("GIT_CONFIG_KEY_{}", n + i),
+            format!("credential.https://{host}.helper"),
+        ));
+        env.push((
+            format!("GIT_CONFIG_VALUE_{}", n + i),
             "!gh auth git-credential".to_string(),
-        ),
-        ("GIT_CONFIG_COUNT".to_string(), (n + 1).to_string()),
-    ]
+        ));
+    }
+    env.push((
+        "GIT_CONFIG_COUNT".to_string(),
+        (n + hosts.len()).to_string(),
+    ));
+    env
 }
 
 fn prepend_path(cmd: &mut Command, prefixes: &[&Path]) {
@@ -2733,7 +2744,8 @@ echo gho_stored_fixture"#,
     /// follows the same GH_TOKEN deny and env-token rules as the serve cache.
     #[test]
     fn github_credential_helper_appends_after_existing_overrides() {
-        let env = github_credential_helper_config(Some("2"));
+        let github = vec!["github.com".to_string()];
+        let env = github_credential_helper_config(Some("2"), &github);
         let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
         assert_eq!(get("GIT_CONFIG_COUNT"), Some("3"));
         assert_eq!(
@@ -2751,13 +2763,32 @@ echo gho_stored_fixture"#,
             "existing entries untouched"
         );
 
-        let fresh = github_credential_helper_config(None);
+        let fresh = github_credential_helper_config(None, &github);
         assert!(fresh.contains(&("GIT_CONFIG_COUNT".into(), "1".into())));
         assert!(fresh.contains(&(
             "GIT_CONFIG_KEY_0".into(),
             "credential.https://github.com.helper".into()
         )));
-        assert!(github_credential_helper_config(Some("x")).is_empty());
+        assert!(github_credential_helper_config(Some("x"), &github).is_empty());
+    }
+
+    /// Every `gh_guard.hosts` host gets the helper, so a push to a GHE remote
+    /// goes through the gh guard too (#950).
+    #[test]
+    fn github_credential_helper_covers_every_configured_host() {
+        let hosts = vec!["github.com".to_string(), "example.ghe.com".to_string()];
+        let env = github_credential_helper_config(Some("1"), &hosts);
+        let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("GIT_CONFIG_COUNT"), Some("3"));
+        assert_eq!(
+            get("GIT_CONFIG_KEY_1"),
+            Some("credential.https://github.com.helper")
+        );
+        assert_eq!(
+            get("GIT_CONFIG_KEY_2"),
+            Some("credential.https://example.ghe.com.helper")
+        );
+        assert_eq!(get("GIT_CONFIG_VALUE_2"), Some("!gh auth git-credential"));
     }
 
     #[test]

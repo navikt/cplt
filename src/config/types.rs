@@ -445,6 +445,10 @@ pub struct GhGuardConfig {
     /// into a branch whose rulesets require an approving review that a new push dismisses
     /// (default: false). `--admin` is always refused.
     pub allow_pr_merge: Option<bool>,
+    /// GitHub hostnames whose remotes the guard scopes (default:
+    /// `["github.com"]`), e.g. a GHE.com or GHES host. Global config only: a
+    /// per-checkout file must not widen which hosts the agent can reach.
+    pub hosts: Option<Vec<String>>,
 }
 
 /// `[git_guard]` — git command prevention for sandboxed agents.
@@ -853,6 +857,9 @@ pub struct GhGuardPolicy {
     /// Allow `gh pr merge` under the ruleset condition in
     /// `gh_proxy::check_merge_protection`.
     pub allow_pr_merge: bool,
+    /// GitHub hosts whose remotes the guard scopes (`gh_guard.hosts`),
+    /// lowercased. Global config only.
+    pub hosts: Vec<String>,
 }
 
 impl Default for GhGuardPolicy {
@@ -866,6 +873,7 @@ impl Default for GhGuardPolicy {
             unknown_command: UnknownCommandPolicy::Block,
             allow_api_write: false,
             allow_pr_merge: false,
+            hosts: vec![crate::gh_proxy::DEFAULT_GH_HOST.to_string()],
         }
     }
 }

@@ -13,6 +13,45 @@
 use super::registry::CONFIG_KEYS;
 use super::types::{Config, Preset};
 
+/// Refuse a `gh_guard.hosts` entry that is not a bare hostname.
+///
+/// The host is compared against remote URLs and `--hostname`, passed to `gh`
+/// and to git's credential config: a scheme, path, port, wildcard or space
+/// would match nothing, or something other than what the user wrote.
+pub fn validate_gh_host(host: &str) -> Result<(), super::error::ConfigError> {
+    let bare = !host.is_empty()
+        && host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        });
+    if bare {
+        return Ok(());
+    }
+    Err(super::error::ConfigError::Validation(format!(
+        "gh_guard.hosts entry '{host}' is not a bare hostname. Give the host alone, \
+         with no scheme, path, port, wildcard or whitespace, e.g. \
+         `example.ghe.com` for `https://example.ghe.com/owner/repo`"
+    )))
+}
+
+/// Refuse a `gh_guard.hosts` list that names no host or an invalid one. An
+/// empty list would read as "unset" downstream and quietly mean github.com.
+pub fn validate_gh_hosts(hosts: &[String]) -> Result<(), super::error::ConfigError> {
+    if hosts.is_empty() {
+        return Err(super::error::ConfigError::Validation(
+            "gh_guard.hosts is empty. Name at least one host, or unset the key \
+             for the default [\"github.com\"]"
+                .to_string(),
+        ));
+    }
+    hosts.iter().try_for_each(|h| validate_gh_host(h))
+}
+
 // ── Config validation (unknown key detection) ────────────────────────
 
 /// Top-level scalar keys that are valid but not TOML sections.
@@ -463,6 +502,53 @@ fn value_type_name(v: &toml::Value) -> &'static str {
 mod tests {
     use super::*;
     use crate::config::path::default_config_contents;
+
+    #[test]
+    fn gh_hosts_accept_bare_hostnames_only() {
+        for ok in [
+            "github.com",
+            "example.ghe.com",
+            "GHES.Corp.example",
+            "a-b.example",
+        ] {
+            assert!(validate_gh_host(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            "https://example.ghe.com",
+            "example.ghe.com/owner",
+            "example.ghe.com:443",
+            "*.ghe.com",
+            "example .ghe.com",
+            " example.ghe.com",
+            "example..com",
+            "-x.example",
+            "git@example.ghe.com",
+        ] {
+            let err = validate_gh_host(bad).unwrap_err().to_string();
+            assert!(err.contains("not a bare hostname"), "{bad}: {err}");
+        }
+        assert!(
+            validate_gh_hosts(&[]).is_err(),
+            "an empty list would mean github.com"
+        );
+    }
+
+    /// The same refusal reaches `cplt config set`, both the plain and the
+    /// `--append` writer.
+    #[test]
+    fn config_set_refuses_a_bad_gh_host() {
+        let key = crate::config::lookup_key("gh_guard.hosts").unwrap();
+        let mut doc = toml_edit::DocumentMut::new();
+        assert!(crate::config::set_value_in_doc(&mut doc, key, "https://x.ghe.com").is_err());
+        assert!(crate::config::append_value_in_doc(&mut doc, key, "x.ghe.com:443").is_err());
+        crate::config::set_value_in_doc(&mut doc, key, "github.com,x.ghe.com").unwrap();
+        assert!(
+            doc.to_string()
+                .contains(r#"hosts = ["github.com", "x.ghe.com"]"#),
+            "{doc}"
+        );
+    }
 
     #[test]
     fn validate_valid_config_no_diagnostics() {

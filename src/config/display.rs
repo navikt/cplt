@@ -947,6 +947,14 @@ fn guard_lines(global: &Config, local: Option<&Config>) -> Vec<String> {
                 c.gh_guard.allow_pr_merge.is_some()
             )
         ),
+        format!(
+            "    hosts                 = {:?}{}",
+            c.gh_guard
+                .hosts
+                .clone()
+                .unwrap_or_else(|| vec![crate::gh_proxy::DEFAULT_GH_HOST.to_string()]),
+            src("gh_guard", "hosts", c.gh_guard.hosts.is_some())
+        ),
         String::new(),
         "  [git_guard]".to_string(),
         format!(
@@ -1031,6 +1039,7 @@ mod tests {
                 ("proxy.upstream", _) => "proxy.example.com:3128",
                 ("shell.skip", _) => "goose",
                 ("deny.env", _) => "MY_SECRET",
+                ("gh_guard.hosts", _) => "example.ghe.com",
                 (_, ConfigValueType::Bool) => "false",
                 (_, ConfigValueType::U16 | ConfigValueType::U16Array) => "8080",
                 (_, ConfigValueType::U64) => "1",

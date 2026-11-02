@@ -75,6 +75,9 @@ fn parse_value_for_key(
             // Comma-separated: "path1,path2" or single "path1"
             let mut arr = toml_edit::Array::new();
             for item in value.split(',') {
+                if is_gh_hosts_key(key_info) {
+                    super::validation::validate_gh_host(item.trim())?;
+                }
                 arr.push(item.trim());
             }
             Ok(toml_edit::Value::Array(arr))
@@ -84,6 +87,10 @@ fn parse_value_for_key(
             key_info.section, key_info.key
         ))),
     }
+}
+
+fn is_gh_hosts_key(key_info: &ConfigKeyInfo) -> bool {
+    (key_info.section, key_info.key) == ("gh_guard", "hosts")
 }
 
 /// Parse a single element value for appending to an array.
@@ -117,6 +124,9 @@ fn parse_element_for_key(
                      cplt config set {}.{} <VALUE>",
                     key_info.section, key_info.key
                 )));
+            }
+            if is_gh_hosts_key(key_info) {
+                super::validation::validate_gh_host(value)?;
             }
             // A `*` in a domain matches nothing: matching is exact host plus
             // subdomains, with no glob syntax (#481). For a file, cplt warns

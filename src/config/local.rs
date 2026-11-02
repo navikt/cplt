@@ -199,7 +199,7 @@ pub(super) fn parse_local(
         return Ok(None);
     }
 
-    let (config, unknown_keys) = super::validation::deserialize_collecting_unknowns(
+    let (mut config, unknown_keys) = super::validation::deserialize_collecting_unknowns(
         &toml::to_string(&root).map_err(|_| {
             ConfigError::Validation(format!(
                 "{display}: local config is not representable as TOML"
@@ -219,6 +219,16 @@ pub(super) fn parse_local(
     }
 
     reject_relative_paths(&config, &display)?;
+
+    // `gh_guard.hosts` is global-only: a per-checkout file must not widen the
+    // hosts the gh guard scopes. The overlay never reads it; say so rather
+    // than drop it without a word.
+    if config.gh_guard.hosts.take().is_some() {
+        ui::warn(&format!(
+            "gh_guard.hosts in {display} is ignored: it is global-only. Set it in \
+             your global config instead:\n  cplt config set gh_guard.hosts <HOST>"
+        ));
+    }
 
     Ok(Some(config))
 }
@@ -572,6 +582,8 @@ impl Config {
                     unknown_command: _,
                     allow_api_write: _,
                     allow_pr_merge: _,
+                    // Global-only: never taken from the local layer.
+                    hosts: _,
                 },
             git_guard:
                 super::types::GitGuardConfig {
@@ -718,6 +730,22 @@ mod tests {
 
     fn parse(raw: &str) -> Result<Option<Config>, ConfigError> {
         parse_local(raw, Path::new("/tmp/local.toml"), None, None)
+    }
+
+    /// `gh_guard.hosts` is global-only: a local file's list is dropped (with a
+    /// warning) and the overlay keeps the global one.
+    #[test]
+    fn local_layer_cannot_set_gh_hosts() {
+        let local = parse("[gh_guard]\nhosts = [\"evil.example\"]\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(local.gh_guard.hosts, None);
+        let global: Config = toml::from_str("[gh_guard]\nhosts = [\"x.ghe.com\"]\n").unwrap();
+        let raw_local: Config = toml::from_str("[gh_guard]\nhosts = [\"evil.example\"]\n").unwrap();
+        assert_eq!(
+            global.overlay(&raw_local).gh_guard.hosts,
+            Some(vec!["x.ghe.com".to_string()])
+        );
     }
 
     #[test]

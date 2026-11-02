@@ -656,6 +656,8 @@ fn candidates(dotted: &str, ty: cplt::config::ConfigValueType, s: &Scratch) -> V
         "deny.env" => vec!["CPLT_GOLDEN".into()],
         // Agent names: `shell.skip` refuses anything cplt does not shim.
         "shell.skip" => vec!["goose".into()],
+        // Bare hostnames only.
+        "gh_guard.hosts" => vec!["example.ghe.com".into()],
         _ => match ty {
             // Both sides. `sandbox.scratch_dir = false` takes both guards to
             // `inactive` and `proxy.enabled = false` removes the proxy — the
