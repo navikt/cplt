@@ -106,13 +106,13 @@ fn github_token_allowed_for(args: &[&str], pin: Option<&str>, hosts: &[String]) 
         (scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http"))
             .then_some(rest)
     }
-    // The host part: before the first `/` or `:`, after any `user@`. Covers
+    // The host part: before the first `/`, after the last `@`, before a `:`. Covers
     // URL authorities, `HOST/owner/repo` and scp `git@HOST:owner/repo`; a
     // bare `owner/repo` yields `owner`, which is never a `*.ghe.com` host.
     let host_of = |rest: &str| -> String {
-        let end = rest.find(['/', ':']).unwrap_or(rest.len());
-        let head = &rest[..end];
-        head.rsplit('@').next().unwrap_or(head).to_string()
+        let head = rest.split('/').next().unwrap_or(rest);
+        let head = head.rsplit('@').next().unwrap_or(head);
+        head.split(':').next().unwrap_or(head).to_string()
     };
     if let Some(r) = parse_command(args).and_then(|cmd| cmd.repo_flag) {
         let rest = r.split_once("://").map_or(r.as_str(), |(_, rest)| rest);
@@ -6209,6 +6209,18 @@ mod tests {
             None
         ));
         assert!(!ok(&["pr", "view", "HTTPS://x.ghe.com/o/r/pull/1"], None));
+        assert!(!ok(
+            &["pr", "view", "https://a:b@x.ghe.com/o/r/pull/1"],
+            None
+        ));
+        assert!(!ok(
+            &["pr", "view", "1", "-R", "https://u:pw@x.ghe.com/o/r"],
+            None
+        ));
+        assert!(!ok(
+            &["pr", "view", "https://x.ghe.com:443/o/r/pull/1"],
+            None
+        ));
         assert!(!ok(&["pr", "view", "Http://x.ghe.com/o/r/pull/1"], None));
         assert!(!ok(&["pr", "view", "1", "-R", "git@x.ghe.com:o/r"], None));
         assert!(!ok(
