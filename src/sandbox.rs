@@ -3218,7 +3218,7 @@ fn ro_protect_paths(
     // leaves the empty mountpoint directory on the host. Still open: a missing
     // *file* entry (`settings.json`, `hooks.json`), which would need a
     // placeholder file that the agent then reads as an empty config, and a
-    // path whose parent is missing (see `masks_missing_dir`). SECURITY.md.
+    // path whose parent is missing (see `is_absent_under_real_dir`; the launch warns). SECURITY.md.
     ro_protect.extend(
         config
             .agent
@@ -3504,14 +3504,38 @@ fn missing_dir_masks(config: &SandboxConfig) -> Vec<PathBuf> {
     if !config.mask_missing_deny_paths {
         return Vec::new();
     }
+    // Resolved, because the writable binds `build_bwrap_args` compares
+    // against are canonical: an agent root reached through `XDG_*`,
+    // `CLAUDE_CONFIG_DIR` or a symlinked `~/.copilot` would otherwise never
+    // match and the mask would be skipped.
     config
         .agent
         .host_persistence_paths_with(config.agent_dirs, config.allow_copilot_host_persistence)
         .into_iter()
-        // ponytail: the entries are fixed names, and every directory entry has
-        // no extension while every file entry has one. A new extensionless file
-        // entry would be masked as a directory; add a dir/file flag then.
-        .filter(|p| p.extension().is_none())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| !crate::agent::HOST_PERSISTENCE_FILES.contains(&n))
+        })
+        .map(|p| crate::config::canonicalize_deepest(&p))
+        .collect()
+}
+
+/// The masks [`missing_dir_masks`] asked for that the wrapper did not
+/// emit: still missing at launch, but with a missing parent or outside every
+/// writable bind. Said once at launch rather than skipped silently.
+#[cfg(target_os = "linux")]
+fn unmasked_missing_dirs(masks: &[PathBuf], bwrap_args: &[String]) -> Vec<PathBuf> {
+    masks
+        .iter()
+        .filter(|p| p.symlink_metadata().is_err())
+        .filter(|p| {
+            let s = p.to_string_lossy();
+            !bwrap_args
+                .windows(2)
+                .any(|w| w[0] == "--tmpfs" && w[1] == s.as_ref())
+        })
+        .cloned()
         .collect()
 }
 
@@ -3868,6 +3892,16 @@ fn prepare_impl(
         },
         &deny_masks,
     )?;
+    if let Some(w) = &bwrap_wrapper {
+        for p in unmasked_missing_dirs(&missing_dir_masks(config), &w.bwrap_args) {
+            ui::warn(&format!(
+                "sandbox.mask_missing_deny_paths: {} is missing and could not be masked \
+                 (its parent is missing or outside the writable grant), so the agent may \
+                 create it",
+                p.display()
+            ));
+        }
+    }
 
     // #834: the launch checked this before starting the broker
     // (`mcp_broker_refusal`); this is the backstop. Strict, so a spawn-time

@@ -1067,7 +1067,7 @@ empty read-only directory. Inside the sandbox:
 - bubblewrap leaves the empty directory on disk after the session. Later
   launches bind it read-only like any existing directory.
 
-A directory whose parent is missing, and a missing file such as
+A directory whose parent is missing (cplt warns at launch), and a missing file such as
 `settings.json`, are not masked. Recovery: `cplt config set
 sandbox.mask_missing_deny_paths false`.
 

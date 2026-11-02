@@ -679,7 +679,7 @@ pub(crate) fn build_bwrap_args(
         if path.exists() {
             let path_str = path.to_string_lossy().into_owned();
             args.extend(["--ro-bind".to_string(), path_str.clone(), path_str]);
-        } else if masks_missing_dir(path, overlays.mask_missing)
+        } else if is_missing_gitdir_dir_overlay(path)
             && bound_writable.iter().any(|w| path.starts_with(w))
         {
             let path_str = path.to_string_lossy().into_owned();
@@ -690,6 +690,23 @@ pub(crate) fn build_bwrap_args(
                 path_str,
             ]);
         }
+    }
+
+    // ── Missing host-persistence dirs (`sandbox.mask_missing_deny_paths`) ──
+    // The paths arrive canonical, so the bind check compares like with like,
+    // and a resolved parent outside every writable bind is never mkdir'ed.
+    for path in overlays
+        .mask_missing
+        .iter()
+        .filter(|p| is_absent_under_real_dir(p) && bound_writable.iter().any(|w| p.starts_with(w)))
+    {
+        let p = path.to_string_lossy().into_owned();
+        args.extend([
+            "--tmpfs".to_string(),
+            p.clone(),
+            "--remount-ro".to_string(),
+            p,
+        ]);
     }
 
     // ── Deny-path masks — emitted last so they shadow every earlier bind ──
@@ -766,7 +783,7 @@ pub(crate) fn build_bwrap_args(
         if path.exists() {
             let p = path.to_string_lossy().into_owned();
             args.extend(["--ro-bind".to_string(), p.clone(), p]);
-        } else if masks_missing_dir(path, overlays.mask_missing) && under_writable_rebind(path) {
+        } else if is_missing_gitdir_dir_overlay(path) && under_writable_rebind(path) {
             let p = path.to_string_lossy().into_owned();
             args.extend([
                 "--tmpfs".to_string(),
@@ -775,6 +792,19 @@ pub(crate) fn build_bwrap_args(
                 p,
             ]);
         }
+    }
+    for path in overlays
+        .mask_missing
+        .iter()
+        .filter(|p| under_writable_rebind(p) && is_absent_under_real_dir(p))
+    {
+        let p = path.to_string_lossy().into_owned();
+        args.extend([
+            "--tmpfs".to_string(),
+            p.clone(),
+            "--remount-ro".to_string(),
+            p,
+        ]);
     }
     if let Some(placeholder) = &deny_masks.placeholder {
         let ph = placeholder.to_string_lossy().into_owned();
@@ -822,24 +852,14 @@ fn is_missing_gitdir_dir_overlay(path: &Path) -> bool {
     ) && is_absent_under_real_dir(path)
 }
 
-/// Whether a missing `read_only` path gets an empty read-only tmpfs: a
-/// `.git/remotes` or `.git/branches` (#747), or a directory the caller listed
-/// in `mask_missing` (`sandbox.mask_missing_deny_paths`).
-///
-/// The parent must already exist as a real directory. A missing parent is not
-/// masked: bwrap would `mkdir -p` it on the host through the writable bind,
-/// leaving a new directory in the user's HOME (for example a whole
-/// `~/.pi/agent/` for an agent never run outside cplt). The agent can then
-/// create the parent and the deny path inside it, which is today's behaviour;
-/// the agent's own root is created by cplt or the agent's first host run in
-/// the usual case, so this is rare.
-fn masks_missing_dir(path: &Path, mask_missing: &[PathBuf]) -> bool {
-    is_missing_gitdir_dir_overlay(path)
-        || (mask_missing.iter().any(|m| m == path) && is_absent_under_real_dir(path))
-}
-
 /// `path` is truly absent (not even a broken symlink, over which bwrap cannot
 /// create a directory mount point) and its parent is a real directory.
+///
+/// For `sandbox.mask_missing_deny_paths` the parent check is what keeps a mask
+/// from creating anything new in HOME: with a missing parent, bwrap would
+/// `mkdir -p` it on the host through the writable bind. Such a path is
+/// skipped and the launch warns. The caller hands canonical paths, so a
+/// symlinked parent is already resolved here.
 fn is_absent_under_real_dir(path: &Path) -> bool {
     if path.symlink_metadata().is_ok() {
         return false;

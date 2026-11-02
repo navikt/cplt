@@ -3227,6 +3227,23 @@ fn dsh_home(home: &Path) -> PathBuf {
 /// `sandbox.allow_copilot_host_persistence` keeps writable (#906).
 pub const COPILOT_PERSISTENCE_OPT_OUT: &[&str] = &["agents", "permissions-config.json"];
 
+/// The [`Agent::host_persistence_denies`] entries that are files. Every other
+/// entry is a directory, which `sandbox.mask_missing_deny_paths` masks with an
+/// empty read-only mount on Linux when it is missing. A name is not enough to
+/// tell: fish's `conf.d` is a directory.
+pub const HOST_PERSISTENCE_FILES: &[&str] = &[
+    "config.fish",
+    "cordis.patch.yml",
+    "hooks.json",
+    "lsp-config.json",
+    "mcp-config.json",
+    "mcp_config.json",
+    "permissions-config.json",
+    "settings.json",
+    "statusline.sh",
+    "trust.json",
+];
+
 /// The `trustedFolders` entries of Copilot's `config.json`, or empty when the
 /// file is missing or not JSON. The launch reads it before and after a session
 /// and warns about new entries (#906): the file also holds login and UI state,
@@ -4696,6 +4713,40 @@ mod tests {
         body.push_str(&" ".repeat(big));
         std::fs::write(&cfg, body).unwrap();
         assert!(copilot_trusted_folders(tmp.path()).is_empty(), "oversized");
+    }
+
+    /// Every entry is classified on purpose: a new file entry must be added to
+    /// [`HOST_PERSISTENCE_FILES`], or Linux would mask it as a directory.
+    #[test]
+    fn host_persistence_entries_classify_as_file_or_dir() {
+        const DIRS: &[&str] = &[
+            "agents",
+            "bin",
+            "completions",
+            "conf.d",
+            "extensions",
+            "functions",
+            "git",
+            "hooks",
+            "installed-plugins",
+            "npm",
+            "pkg",
+            "plugins",
+            "skills",
+            "vendor_completions.d",
+            "vendor_conf.d",
+            "vendor_functions.d",
+        ];
+        for agent in ALL_AGENTS {
+            for e in agent.host_persistence_denies() {
+                let file = HOST_PERSISTENCE_FILES.contains(e);
+                assert!(
+                    file != DIRS.contains(e),
+                    "{agent:?}: {e} must be in exactly one of HOST_PERSISTENCE_FILES and DIRS"
+                );
+            }
+        }
+        assert!(!HOST_PERSISTENCE_FILES.contains(&"conf.d"));
     }
 
     #[test]

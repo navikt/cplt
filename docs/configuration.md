@@ -1106,13 +1106,13 @@ With the key off, saving a tool approval inside cplt fails for that session, and
 
 ## Missing host-persistence directories on Linux (`sandbox.mask_missing_deny_paths`)
 
-On Linux, the agent's host-persistence denies (Copilot's `agents/` and `extensions/`, Pi's `extensions/`, `npm/`, `git/`, `skills/`, Claude's `plugins/`) are read-only bubblewrap mounts, and bubblewrap cannot mount a path that does not exist. When the directory is missing at launch, the agent can create it, and a later host session loads what it put there. New configs close that:
+On Linux, the agent's host-persistence denies (Copilot's `agents/` and `extensions/`, Pi's `extensions/`, `npm/`, `git/`, `skills/`, Claude's `plugins/`, the shell's fish `conf.d/`, `functions/` and `vendor_*.d/`) are read-only bubblewrap mounts, and bubblewrap cannot mount a path that does not exist. When the directory is missing at launch, the agent can create it, and a later host session loads what it put there. New configs close that:
 
 ```bash
 cplt config set sandbox.mask_missing_deny_paths true
 ```
 
-With the key on, a missing directory gets an empty read-only mount, so creating it or writing inside it fails. The agent sees an empty directory where there was none, and bubblewrap leaves that empty directory on disk. It is masked only when its parent directory exists, so cplt never creates a parent in your home directory. Missing files (`settings.json`, `hooks.json`) are not masked. A config without the key keeps today's behaviour, and `cplt doctor` suggests the change; set the key to `false` to silence that. The key needs bubblewrap and has no effect on macOS, which denies these paths whether they exist or not. See [known impacts](known-impacts.md#linux-missing-host-persistence-directories-appear-empty).
+With the key on, a missing directory gets an empty read-only mount, so creating it or writing inside it fails. The agent sees an empty directory where there was none, and bubblewrap leaves that empty directory on disk. It is masked only when its parent directory exists and lies inside a writable grant, after symlinks and `XDG_*` or `CLAUDE_CONFIG_DIR` roots are resolved, so cplt never creates a parent in your home directory. A directory that cannot be masked gets a launch warning naming it. Missing files (`settings.json`, `hooks.json`) are not masked. A config without the key keeps today's behaviour, and `cplt doctor` suggests the change; set the key to `false` to silence that. The key needs bubblewrap and has no effect on macOS, which denies these paths whether they exist or not. See [known impacts](known-impacts.md#linux-missing-host-persistence-directories-appear-empty).
 
 ## Other keys
 
