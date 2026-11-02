@@ -686,7 +686,7 @@ Status: proposal, 2026-10-31. Phase 4 in section 11. Consumers: Figma's
 remote MCP and the Nav MCP gateway (navikt/copilot#2083, phase 1 #2085).
 The gateway is an MCP-spec OAuth 2.1 authorization server: protected-resource
 metadata (RFC 9728) per route, the route URL as the RFC 8707 `resource`,
-PKCE S256, CIMD preferred with DCR as the fallback, and rotating refresh
+PKCE S256, CIMD only in the pilot (DCR later), and rotating refresh
 tokens. Claims about the MCP spec (2026-07-28 authorization and
 client-registration pages) and about Figma are marked **(unverified)**
 where this document has not checked them against the source.
@@ -761,19 +761,25 @@ cplt", which `cplt mcp status --json` already lets nav-pilot predict
 | Pre-registered client id per server | Works with any server that registers clients by hand | One registration per server and per vendor; a public client id is no secret anyway |
 | DCR | Works with Figma today **(unverified)** | A fresh client per user and machine, state to keep, no stable identity to allowlist |
 
-Recommendation: **CIMD, with DCR as the fallback**, in that order, and a
-pre-registered id only if a server supports neither. The document is
+Recommendation: **CIMD only in the pilot** (owner decision 2026-11-02). DCR
+comes after the pilot, with a per-IP cap and expiry of unused clients, when
+OpenCode needs it. The first remote is the Nav MCP gateway; Figma comes second. The document is
 `https://ki-utvikling.nav.no/cplt/oauth-client.json` (owner decision
 2026-10-31), served as a static file by navikt/copilot's my-copilot app, with
-`redirect_uris` `http://127.0.0.1/callback` (loopback, any port per
-RFC 8252 7.3), `token_endpoint_auth_method: none`,
+`redirect_uris` `http://127.0.0.1:<P>/callback`, where `<P>` is one fixed
+port compiled into cplt, `token_endpoint_auth_method: none`,
 `grant_types` `authorization_code` and `refresh_token`. The document is
 public; it holds no secret. Document integrity: `CODEOWNERS` + required review
 on that path; the gateway refuses any non-loopback `redirect_uri` for this
 `client_id` regardless of document contents; alert on document change. cplt
 compiles the URL in (D3: a mechanism is a cplt row), so a spec cannot pick a
-different client. The DCR registration result (a `client_id`) is stored with
-the tokens and reused.
+different client. The fixed port is the login guard (owner decision 2026-11-02, replacing
+the 2026-10-31 terminal-code guard): the host broker binds `127.0.0.1:<P>`
+before the sandbox starts and holds it for the whole session, so an agent
+cannot listen on the only redirect the gateway accepts. If `<P>` is taken at
+start, cplt refuses OAuth remotes for that session with one line naming the
+port. A short code stays as UX text only: cplt prints it, the consent page
+shows it, so the user can tell the login is theirs.
 
 ### 14.4 Login on the host
 
@@ -790,16 +796,17 @@ when detected in a sandbox by something the agent cannot forge, not env
    contain `oauth.issuer`. Fetch that issuer's metadata (RFC 8414, then
    OpenID discovery); its `issuer` must equal `oauth.issuer` byte for byte.
 3. Pick CIMD if the metadata says `client_id_metadata_document_supported`,
-   else DCR at `registration_endpoint`, else fail with one line naming the
-   server.
-4. Bind a listener on `127.0.0.1:0`. Because macOS `ps` exposes the `open` URL
-   (`(allow sysctl-read)`, `src/sandbox_profile.rs:1144`), use a random path
-   segment in the callback URL (`http://127.0.0.1:<port>/callback/<random>`).
-   Build the request with PKCE S256, `state`, `resource=<spec URL>` (RFC 8707)
+   else fail with one line naming the server. DCR at `registration_endpoint`
+   comes after the pilot.
+4. Use the listener the broker already holds on `127.0.0.1:<P>`. The
+   redirect path is exactly `/callback`, matching the CIMD document; the
+   random segment is dropped (the gateway would reject it). macOS `ps` exposes
+   the `open` URL (`(allow sysctl-read)`, `src/sandbox_profile.rs:1144`), but
+   `state` and PKCE keep that to login DoS. Build the request with PKCE S256, `state`, `resource=<spec URL>` (RFC 8707)
    and the spec's scopes, and open the browser (`open` on macOS, `xdg-open` on
    Linux) or print the URL.
-5. The listener accepts only the first `GET /callback/<random>` request
-   matching path and `state` (and `iss` per RFC 9207 when the metadata
+5. The listener accepts only the first `GET /callback` request matching
+   `state` (and `iss` per RFC 9207 when the metadata
    advertises it), ignores other requests, and closes immediately after match
    or timeout (5 minutes). PKCE keeps process snooping of the auth URL down to
    login DoS.
@@ -878,7 +885,7 @@ policy: act now):
 | Token theft on the host | Same as any keychain item the user owns. Tokens are bound by `resource` to one route (gateway); a stolen gateway token reaches one server |
 | Consent phishing with CIMD and a loopback redirect | Anyone can send a user an authorization link naming Nav's `client_id` with a loopback redirect, and the consent screen shows Nav's domain. The code only reaches a listener on the victim's machine, but a local process could race for the port. The MCP spec names this risk **(unverified wording)**. The gateway should show the client domain and requested route at consent; Figma's screen is outside Nav's control |
 | Upstream used to exfiltrate | The broker reaches only the spec's URL; `egressHosts` pins discovery. The agent's own allowlist is not changed |
-| Agent triggers a login | The agent can run the OAuth flow itself (sandbox allows loopback bind/inbound, `src/sandbox_profile.rs:3975-3976`; Linux shares host netns), using Nav's public CIMD `client_id` and its own loopback redirect, then ask the user to click a link. Env-based refusal (`CPLT_MCP_SOCKET`, `src/mcp_broker/mod.rs:29`) is no boundary. Owner decision 2026-10-31: (a) the gateway shows consent for this `client_id` only after the user enters a short code that cplt prints in the terminal; (b) while an oauth spec is loaded, cplt adds the AS host and token endpoint to the agent's proxy blocklist; (c) detect sandbox by something the agent cannot forge, not env; residual: macOS without forced proxy can still reach the AS directly, mitigated by (a). nav-pilot tells users cplt opens the browser itself and never asks them to click an agent-shown link |
+| Agent triggers a login | The agent can run the OAuth flow itself (sandbox allows loopback bind/inbound, `src/sandbox_profile.rs:3975-3976`; Linux shares host netns), using Nav's public CIMD `client_id` and its own loopback redirect, then ask the user to click a link. Env-based refusal (`CPLT_MCP_SOCKET`, `src/mcp_broker/mod.rs:29`) is no boundary. Owner decision 2026-11-02 (replaces the 2026-10-31 terminal-code guard): (a) the CIMD document lists only `http://127.0.0.1:<P>/callback`, and the host broker holds that port before the sandbox starts, so the agent cannot receive the code; a short code is shown as UX text only; (b) while an oauth spec is loaded, cplt adds the AS host and token endpoint to the agent's proxy blocklist; (c) detect sandbox by something the agent cannot forge, not env; residual: macOS without forced proxy can still reach the AS directly, mitigated by (a), since the code can only reach the broker's listener. nav-pilot tells users cplt opens the browser itself and never asks them to click an agent-shown link |
 
 ### 14.8 Phases and open questions
 
