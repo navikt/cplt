@@ -45,12 +45,10 @@ pub const PACKAGE_REGISTRY_DOMAINS: &[&str] = &[
     // kotlin-gradle-plugin 2.0.0). Without it a `plugins {}` block resolves
     // the marker and then fails on the jar. Not a subdomain of the entry
     // above, so it needs its own line.
-    //
-    // The Gradle wrapper download is deliberately NOT covered:
-    // services.gradle.org redirects to github.com release downloads and then
-    // to release-assets.githubusercontent.com, and granting all of github.com
-    // to every agent is too broad for this base.
     "plugins-artifacts.gradle.org",
+    // Gradle wrapper distribution host (checked 2026-11-02: 307 -> github.com -> release-assets.githubusercontent.com;
+    // covered for Copilot via its infra list; non-Copilot agents still need github.com allowed as github.com itself is too broad for this base).
+    "services.gradle.org",
     "crates.io",
     "static.crates.io",
     "pypi.org",
@@ -61,6 +59,32 @@ pub const PACKAGE_REGISTRY_DOMAINS: &[&str] = &[
     // JitPack builds Maven/Gradle artifacts straight from git tags — the usual
     // home for forks and libraries that were never published to Central.
     "jitpack.io",
+    // GitHub Packages npm registry; tarballs 302 to pkg-npm.githubusercontent.com (checked 2026-11-02).
+    "npm.pkg.github.com",
+    "pkg-npm.githubusercontent.com",
+    // GitHub Packages Maven registry; jars 302 to github-registry-files.githubusercontent.com (checked 2026-11-02).
+    "maven.pkg.github.com",
+    "github-registry-files.githubusercontent.com",
+    // Go module mirror; serves module info and zip archives directly without redirect (checked 2026-11-02).
+    "proxy.golang.org",
+    // Go module checksum database; direct responses without redirect (checked 2026-11-02).
+    "sum.golang.org",
+    // GitHub release asset downloads destination (releases/download 302 target, checked 2026-11-02).
+    "release-assets.githubusercontent.com",
+    // GitHub archive/tarball download host (archive/refs/tags 302 target, checked 2026-11-02).
+    "codeload.github.com",
+    // Raw file content from GitHub repositories; direct 200 without redirect (checked 2026-11-02).
+    "raw.githubusercontent.com",
+    // Node.js release index and binary distributions; direct 200 via Cloudflare (checked 2026-11-02).
+    "nodejs.org",
+    // GitHub Container Registry for OCI images and packages; answers 405 on root (checked 2026-11-02).
+    "ghcr.io",
+    // GitHub Container Registry layer/blob storage redirect host (checked 2026-11-02).
+    "pkg-containers.githubusercontent.com",
+    // Google Maven repository for Android dependencies; 301 redirects to dl.google.com (checked 2026-11-02).
+    "maven.google.com",
+    // Google download host; direct 200 destination for Google Maven artifacts (checked 2026-11-02).
+    "dl.google.com",
 ];
 
 /// GitHub Copilot infrastructure domains (issue #52). These are the endpoints
@@ -162,14 +186,14 @@ const ANTIGRAVITY_DOMAINS: &[&str] = &["antigravity.google"];
 /// - `statsig.anthropic.com` — the docs attribute feature-flag fetches to
 ///   `api.anthropic.com`, and the binary carries no statsig host either.
 ///
-/// Deliberately left out, all documented but none on the path to a working
-/// terminal session: `storage.googleapis.com` (plugin metadata — far too broad
-/// a host to grant by default), `raw.githubusercontent.com` (`/release-notes`),
-/// `formulae.brew.sh` (Homebrew update check), the two Datadog intake hosts
-/// (optional telemetry, which is what `blocked-domains.txt` exists to strip)
-/// and `*.claudeusercontent.com` (Claude in Chrome and artifacts, neither of
-/// which is a CLI-under-cplt path). `registry.npmjs.org` is already in
-/// `PACKAGE_REGISTRY_DOMAINS`.
+/// Deliberately left out of Claude's own infra list, all documented but none
+/// on the path to a working terminal session: `storage.googleapis.com` (plugin
+/// metadata — far too broad a host to grant by default), `formulae.brew.sh`
+/// (Homebrew update check), the two Datadog intake hosts (optional telemetry,
+/// which is what `blocked-domains.txt` exists to strip) and
+/// `*.claudeusercontent.com` (Claude in Chrome and artifacts, neither of which
+/// is a CLI-under-cplt path). `registry.npmjs.org` and
+/// `raw.githubusercontent.com` are covered by `PACKAGE_REGISTRY_DOMAINS`.
 const ANTHROPIC_DOMAINS: &[&str] = &[
     "api.anthropic.com",
     "console.anthropic.com",
@@ -6101,8 +6125,8 @@ mod tests {
     #[test]
     fn copilot_default_allowed_domains_matches_issue_52() {
         let domains = Agent::Copilot.default_allowed_domains();
-        // 6 GitHub Copilot infra domains + 11 package registries = 17.
-        assert_eq!(domains.len(), 17, "copilot list: infra + registries");
+        // 6 GitHub Copilot infra domains + 26 package registries = 32.
+        assert_eq!(domains.len(), 32, "copilot list: infra + registries");
         // GitHub Copilot infrastructure (bare forms of the issue's wildcards).
         for d in [
             "githubcopilot.com",
@@ -6121,12 +6145,27 @@ mod tests {
             "repo.maven.apache.org",
             "plugins.gradle.org",
             "plugins-artifacts.gradle.org",
+            "services.gradle.org",
             "crates.io",
             "static.crates.io",
             "pypi.org",
             "files.pythonhosted.org",
             "packages.confluent.io",
             "jitpack.io",
+            "npm.pkg.github.com",
+            "maven.pkg.github.com",
+            "proxy.golang.org",
+            "sum.golang.org",
+            "pkg-npm.githubusercontent.com",
+            "github-registry-files.githubusercontent.com",
+            "release-assets.githubusercontent.com",
+            "codeload.github.com",
+            "raw.githubusercontent.com",
+            "nodejs.org",
+            "ghcr.io",
+            "pkg-containers.githubusercontent.com",
+            "maven.google.com",
+            "dl.google.com",
         ] {
             assert!(domains.contains(&d), "copilot list must include {d}");
         }
@@ -6572,10 +6611,10 @@ mod tests {
     #[test]
     fn pi_and_shell_get_registry_base_only() {
         // Pi's infra is not yet documented; Shell is not an AI agent. Both get
-        // only the shared package-registry base (11 domains).
+        // only the shared package-registry base (26 domains).
         for agent in [Agent::Pi, Agent::Shell] {
             let domains = agent.default_allowed_domains();
-            assert_eq!(domains.len(), 11, "{agent:?} gets registry base only");
+            assert_eq!(domains.len(), 26, "{agent:?} gets registry base only");
             assert!(domains.contains(&"registry.npmjs.org"));
             assert!(
                 !domains.contains(&"githubcopilot.com"),
