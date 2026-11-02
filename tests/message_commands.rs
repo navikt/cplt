@@ -83,17 +83,37 @@ pub fn parse_command(file: &str, line: usize, raw: &str) -> Option<ExtractedComm
     if tokens.is_empty() || tokens[0] != "cplt" {
         return None;
     }
+    // Walk the subcommand path. Options before or between subcommands are
+    // skipped with their value (`cplt --agent {a} check` resolves to `check`),
+    // so a leading option cannot hide the subcommand from the check.
     let mut subwords = Vec::new();
-    for &t in &tokens[1..] {
-        let t_clean = t.trim_matches(|c| c == '"' || c == '\'');
+    let mut i = 1;
+    while i < tokens.len() {
+        let t_clean = tokens[i].trim_matches(|c| c == '"' || c == '\'');
+        if t_clean == "--" {
+            break;
+        }
+        if t_clean.starts_with('-') {
+            // ponytail: assumes the word after an option is its value; a
+            // boolean option followed by a subcommand then goes unchecked
+            // (a miss, never a false failure). Read clap metadata if that matters.
+            let takes_value = !t_clean.contains('=')
+                && tokens
+                    .get(i + 1)
+                    .is_some_and(|n| !n.trim_matches(|c| c == '"' || c == '\'').starts_with('-'));
+            i += if takes_value { 2 } else { 1 };
+            continue;
+        }
         if is_placeholder_or_arg(t_clean) {
             break;
         }
         subwords.push(t_clean.to_string());
+        i += 1;
     }
 
+    // Flags after a standalone `--` belong to the child command, not cplt.
     let mut flags = Vec::new();
-    for &t in &tokens[1..] {
+    for &t in tokens[1..].iter().take_while(|t| **t != "--") {
         let t_clean = t.trim_matches(|c| {
             c == '['
                 || c == ']'
@@ -326,12 +346,24 @@ pub fn check_command(
     cmd: &ExtractedCommand,
     cache: &mut HashMap<Vec<String>, Result<String, String>>,
 ) -> Result<(), String> {
-    let help_text = get_help_output(&cmd.subwords, cache)?;
+    // A flag may sit before the subcommand (`cplt --agent x check`), so the
+    // top-level option listing counts too.
+    let help_text = format!(
+        "{}\n{}",
+        get_help_output(&cmd.subwords, cache)?,
+        get_help_output(&[], cache)?
+    );
     for flag in &cmd.flags {
-        // Whole-token match: `--force` must not pass on `--force-x`, `--no-force`
-        // or a mention inside another option's description.
+        // Whole-token match against the option listing only: `--verb` must not
+        // pass on `--verbose`, nor a flag named in prose or a description.
         let listed = help_text
-            .split(|c: char| c.is_whitespace() || c == ',' || c == '=' || c == '[' || c == ']')
+            .lines()
+            .map(str::trim_start)
+            .filter(|l| l.starts_with('-'))
+            .map(|l| l.split("  ").next().unwrap_or(l))
+            .flat_map(|l| {
+                l.split(|c: char| c.is_whitespace() || c == ',' || c == '=' || c == '[' || c == ']')
+            })
             .any(|tok| tok == flag);
         if !listed {
             return Err(format!(
@@ -378,6 +410,21 @@ fn control_flag_prefix_is_not_a_match() {
         flags: vec!["--forc".to_string()],
     };
     assert!(check_command(&synthetic, &mut cache).is_err());
+}
+
+#[test]
+fn control_leading_option_does_not_hide_subcommand() {
+    let cmd =
+        parse_command("synthetic.rs", 1, "cplt --agent {requested} frobnicate").expect("parsed");
+    assert_eq!(cmd.subwords, vec!["frobnicate".to_string()]);
+    let mut cache = HashMap::new();
+    assert!(check_command(&cmd, &mut cache).is_err());
+}
+
+#[test]
+fn control_passthrough_flags_are_ignored() {
+    let cmd = parse_command("synthetic.rs", 1, "cplt exec -- node --version").expect("parsed");
+    assert!(cmd.flags.is_empty(), "{:?}", cmd.flags);
 }
 
 #[test]
