@@ -21,6 +21,8 @@ Point `CPLT_CONFIG` at another file to use it instead of the default location:
 CPLT_CONFIG=/path/to/custom.toml cplt -- --version
 ```
 
+To isolate cplt in tests, scripts, and harnesses, set `CPLT_CONFIG` alongside scratch `HOME` and `XDG_*` paths; see [Isolating cplt in tests and harnesses](#isolating-cplt-in-tests-and-harnesses).
+
 `CPLT_CONFIG` replaces the whole config file, `[sandbox]` keys included, so it
 can widen the sandbox in ways a repo's `.cplt.toml` never can. Because a shell
 that auto-loads repository environment (direnv, mise) can set it just by you
@@ -1147,7 +1149,23 @@ Keys not covered in a section above. `cplt config explain <key>` prints the same
 
 ## Configuration file
 
-The config file lives at `~/.config/cplt/config.toml`. `cplt config init` writes a commented starter template there. It covers `[proxy]`, `[proxy.subscriptions]`, `[allow]`, `[deny]`, `[sandbox]`, `[gh_guard]`, and `[git_guard]`, with every key documented inline. Two keys are set: `proxy.forced = true` ([#822](https://github.com/navikt/cplt/issues/822)), left commented out on Linux below Landlock ABI 4, where forced mode cannot launch, and `sandbox.strip_otlp_vendor_auth = true` ([#878](https://github.com/navikt/cplt/issues/878)). Every other key is commented out. An existing config is never changed: without the keys both stay off, and `cplt doctor` suggests them. Run it and read the result rather than copying a snippet from here, since the template is generated from `src/config/path.rs` and moves with the code:
+The config file lives at `~/.config/cplt/config.toml`, or `$XDG_CONFIG_HOME/cplt/config.toml` when `config.toml` or `trust/` already exists there ([#851](https://github.com/navikt/cplt/issues/851)).
+
+### Isolating cplt in tests and harnesses
+
+Pointing `XDG_CONFIG_HOME` at an empty scratch directory does **not** isolate cplt. cplt uses `$XDG_CONFIG_HOME/cplt` only when that directory already contains `config.toml` or `trust/`. An empty directory falls back to `~/.config/cplt`, so commands like `cplt config set` write to the real user config whenever `HOME` is real ([#943](https://github.com/navikt/cplt/issues/943)).
+
+To isolate cplt completely in tests, scripts, and harnesses:
+
+1. Set `CPLT_CONFIG=/tmp/scratch/config.toml` (or `/dev/null/nonexistent` to run with built-in defaults without a file).
+2. Set `HOME` and all `XDG_*` directories (`XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`) to scratch paths.
+
+Which paths follow `CPLT_CONFIG`:
+
+- **Follows `CPLT_CONFIG`:** `config.toml` and its directory, which also stores per-repo overrides in `local/` and approvals in `trust/`.
+- **Does not follow `CPLT_CONFIG` ([#830](https://github.com/navikt/cplt/issues/830)):** runtime state files do not consult `CPLT_CONFIG`. Launch fingerprints (`launch/`), update staging (`update/`), `host-fix-declined`, `copilot-extracted`, and `opencode-*` files follow `$XDG_CONFIG_HOME/cplt`, falling back to `~/.config/cplt`. Setting `HOME` and `XDG_*` to scratch paths ensures these runtime files are isolated as well.
+
+`cplt config init` writes a commented starter template to `config.toml`. It covers `[proxy]`, `[proxy.subscriptions]`, `[allow]`, `[deny]`, `[sandbox]`, `[gh_guard]`, and `[git_guard]`, with every key documented inline. Two keys are set: `proxy.forced = true` ([#822](https://github.com/navikt/cplt/issues/822)), left commented out on Linux below Landlock ABI 4, where forced mode cannot launch, and `sandbox.strip_otlp_vendor_auth = true` ([#878](https://github.com/navikt/cplt/issues/878)). Every other key is commented out. An existing config is never changed: without the keys both stay off, and `cplt doctor` suggests them. Run it and read the result rather than copying a snippet from here, since the template is generated from `src/config/path.rs` and moves with the code:
 
 ```bash
 cplt config init
