@@ -81,7 +81,7 @@ run = "sh hack/quiet-test.sh --test network_audit"
 
 [tasks."test:e2e"]
 description = "Run E2E tests — macOS only, sandbox-safe"
-run = "sh hack/quiet-test.sh --test e2e"
+run = "sh hack/quiet-test.sh --test e2e --test message_commands"
 
 [tasks."test:e2e-projects"]
 description = "Run E2E project scaffold tests — macOS only, sandbox-safe"
