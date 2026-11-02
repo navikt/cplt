@@ -74,6 +74,7 @@ pub(crate) mod bubblewrap_probe {
             super::bubblewrap::Overlays {
                 read_only: &plan.ro_protect,
                 pins: &plan.pins,
+                mask_missing: &super::missing_dir_masks(config, true),
             },
             &plan.deny_masks,
             false,
@@ -311,6 +312,9 @@ pub struct SandboxConfig<'a> {
     /// `sandbox.allow_copilot_host_persistence` (#906): keep
     /// [`crate::agent::COPILOT_PERSISTENCE_OPT_OUT`] writable.
     pub allow_copilot_host_persistence: bool,
+    /// `sandbox.mask_missing_deny_paths`: on Linux, mask a missing
+    /// host-persistence directory with an empty read-only mount.
+    pub mask_missing_deny_paths: bool,
     /// Allow JVM Attach API unix sockets in /tmp (.java_pid* pattern only).
     pub allow_jvm_attach: bool,
     /// Allow MSBuild worker-node unix sockets in /tmp (MSBuild<pid> pattern only).
@@ -2775,6 +2779,7 @@ fn mcp_wrapper(config: &SandboxConfig) -> (Result<(), String>, BwrapPlan) {
             bubblewrap::Overlays {
                 read_only: &plan.ro_protect,
                 pins: &plan.pins,
+                mask_missing: &missing_dir_masks(config, true),
             },
             &plan.deny_masks,
             false,
@@ -3202,16 +3207,18 @@ fn ro_protect_paths(
     // an allowed tree, so the bwrap read-only overlay is the only mechanism here
     // — WITHOUT bwrap this is unenforced on Linux.
     //
-    // KNOWN GAP: even with bwrap, `build_bwrap_args` skips a path that does not
-    // exist, because bwrap cannot bind a missing source. `.git/hooks` rarely
-    // hits this (`git init` creates it) but `extensions/` does not exist until
-    // the first extension is installed, so that deny is nominal in the common
-    // case. Masking a missing path with the `deny_masks` machinery (a `--tmpfs`
-    // over a directory, a mode-000 placeholder `--ro-bind` over a file) would
-    // close it, but it also makes the path *appear to exist* as an empty dir or
-    // empty file, which changes what the agent reads at startup. That is not a
-    // change to make untested, and this is a macOS host. Documented in
-    // SECURITY.md instead of half-done.
+    // A path that does not exist cannot be `--ro-bind`ed (bwrap needs a
+    // source). `extensions/` or `~/.copilot/agents/` often does not exist yet,
+    // so for an unset `sandbox.mask_missing_deny_paths` (existing configs) that
+    // deny is nominal: the agent can create the directory and a later host
+    // session loads it. With the key on (new configs), [`missing_dir_masks`]
+    // hands the directory entries to `build_bwrap_args`, which mounts an empty
+    // read-only tmpfs there: `mkdir` fails with EEXIST and a write inside with
+    // EROFS. The agent sees an empty directory instead of none, and bwrap
+    // leaves the empty mountpoint directory on the host. Still open: a missing
+    // *file* entry (`settings.json`, `hooks.json`), which would need a
+    // placeholder file that the agent then reads as an empty config, and a
+    // path whose parent is missing (see `is_absent_under_real_dir`; the launch warns). SECURITY.md.
     ro_protect.extend(
         config
             .agent
@@ -3487,6 +3494,53 @@ fn bwrap_plan(
         pins,
         deny_masks,
     }
+}
+
+/// The agent's host-persistence directories that `build_bwrap_args` masks
+/// with an empty read-only tmpfs when they are missing
+/// (`sandbox.mask_missing_deny_paths`). Empty while the key is off.
+#[cfg(target_os = "linux")]
+///
+/// Empty with `inspect_only` (`--print-profile`, `cplt check`, the doctor
+/// probe): bwrap creates each masked mountpoint directory on the host, and an
+/// inspection must not write to HOME.
+fn missing_dir_masks(config: &SandboxConfig, inspect_only: bool) -> Vec<PathBuf> {
+    if inspect_only || !config.mask_missing_deny_paths {
+        return Vec::new();
+    }
+    // Resolved, because the writable binds `build_bwrap_args` compares
+    // against are canonical: an agent root reached through `XDG_*`,
+    // `CLAUDE_CONFIG_DIR` or a symlinked `~/.copilot` would otherwise never
+    // match and the mask would be skipped.
+    config
+        .agent
+        .host_persistence_paths_with(config.agent_dirs, config.allow_copilot_host_persistence)
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| !crate::agent::HOST_PERSISTENCE_FILES.contains(&n))
+        })
+        .map(|p| crate::config::canonicalize_deepest(&p))
+        .collect()
+}
+
+/// The masks [`missing_dir_masks`] asked for that the wrapper did not
+/// emit: still missing at launch, but with a missing parent or outside every
+/// writable bind. Said once at launch rather than skipped silently.
+#[cfg(target_os = "linux")]
+fn unmasked_missing_dirs(masks: &[PathBuf], bwrap_args: &[String]) -> Vec<PathBuf> {
+    masks
+        .iter()
+        .filter(|p| p.symlink_metadata().is_err())
+        .filter(|p| {
+            let s = p.to_string_lossy();
+            !bwrap_args
+                .windows(2)
+                .any(|w| w[0] == "--tmpfs" && w[1] == s.as_ref())
+        })
+        .cloned()
+        .collect()
 }
 
 /// The read-only binds and the rename pins. Built again after #553 creates
@@ -3838,9 +3892,20 @@ fn prepare_impl(
         bubblewrap::Overlays {
             read_only: &ro_protect,
             pins: &pins,
+            mask_missing: &missing_dir_masks(config, inspect_only),
         },
         &deny_masks,
     )?;
+    if let Some(w) = &bwrap_wrapper {
+        for p in unmasked_missing_dirs(&missing_dir_masks(config, inspect_only), &w.bwrap_args) {
+            ui::warn(&format!(
+                "sandbox.mask_missing_deny_paths: {} is missing and could not be masked \
+                 (its parent is missing or outside the writable grant), so the agent may \
+                 create it",
+                p.display()
+            ));
+        }
+    }
 
     // #834: the launch checked this before starting the broker
     // (`mcp_broker_refusal`); this is the backstop. Strict, so a spawn-time
@@ -3902,6 +3967,7 @@ fn prepare_impl(
             let overlays = bubblewrap::Overlays {
                 read_only: &ro_protect,
                 pins: &pins,
+                mask_missing: &missing_dir_masks(config, inspect_only),
             };
             let rebuilt =
                 bubblewrap::build_wrapper(&policy, overlays, &deny_masks, strict, config.netns)
@@ -4583,6 +4649,30 @@ mod tests {
         );
     }
 
+    /// An inspection (`--print-profile`, `cplt check`, the doctor probe) gets
+    /// no missing-dir masks, because bwrap would create their mountpoints in
+    /// HOME. A launch with the key on gets them, fish's `conf.d` included.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_dir_masks_are_empty_when_inspecting() {
+        let home = tempfile::tempdir().unwrap();
+        let dirs = Agent::shell_config_dirs(
+            "fish",
+            &home.path().join(".config"),
+            &home.path().join(".local/share"),
+        );
+        let mut config = test_config(home.path(), &[]);
+        config.agent = Agent::Shell;
+        config.agent_dirs = &dirs;
+        config.mask_missing_deny_paths = true;
+        let launch = missing_dir_masks(&config, false);
+        assert!(launch.iter().any(|p| p.ends_with("conf.d")), "{launch:?}");
+        assert!(!launch.iter().any(|p| p.ends_with("config.fish")));
+        assert!(missing_dir_masks(&config, true).is_empty());
+        config.mask_missing_deny_paths = false;
+        assert!(missing_dir_masks(&config, false).is_empty());
+    }
+
     fn test_config<'a>(home_dir: &'a Path, grants: &'a [PathBuf]) -> SandboxConfig<'a> {
         SandboxConfig {
             project_dir: Path::new("/project"),
@@ -4628,6 +4718,7 @@ mod tests {
             protect_pnpm_config: false,
             deny_copilot_dir_exec: false,
             allow_copilot_host_persistence: false,
+            mask_missing_deny_paths: false,
             allow_jvm_attach: false,
             allow_msbuild: false,
             allow_docker: false,

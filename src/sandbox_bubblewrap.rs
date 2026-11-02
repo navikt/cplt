@@ -362,6 +362,10 @@ pub(crate) struct Overlays<'a> {
     /// Bound read-WRITE onto themselves, so the path becomes a mountpoint and
     /// its *name* cannot be renamed or removed ([`rename_pin_paths`]).
     pub pins: &'a [PathBuf],
+    /// Directories in `read_only` that get an empty read-only tmpfs when they
+    /// do not exist (`sandbox.mask_missing_deny_paths`), so the agent cannot
+    /// create them. Empty unless the key is on.
+    pub mask_missing: &'a [PathBuf],
 }
 
 #[cfg(test)]
@@ -688,6 +692,23 @@ pub(crate) fn build_bwrap_args(
         }
     }
 
+    // ── Missing host-persistence dirs (`sandbox.mask_missing_deny_paths`) ──
+    // The paths arrive canonical, so the bind check compares like with like,
+    // and a resolved parent outside every writable bind is never mkdir'ed.
+    for path in overlays
+        .mask_missing
+        .iter()
+        .filter(|p| is_absent_under_real_dir(p) && bound_writable.iter().any(|w| p.starts_with(w)))
+    {
+        let p = path.to_string_lossy().into_owned();
+        args.extend([
+            "--tmpfs".to_string(),
+            p.clone(),
+            "--remount-ro".to_string(),
+            p,
+        ]);
+    }
+
     // ── Deny-path masks — emitted last so they shadow every earlier bind ──
     if let Some(placeholder) = &deny_masks.placeholder {
         let ph = placeholder.to_string_lossy().into_owned();
@@ -772,6 +793,19 @@ pub(crate) fn build_bwrap_args(
             ]);
         }
     }
+    for path in overlays
+        .mask_missing
+        .iter()
+        .filter(|p| under_writable_rebind(p) && is_absent_under_real_dir(p))
+    {
+        let p = path.to_string_lossy().into_owned();
+        args.extend([
+            "--tmpfs".to_string(),
+            p.clone(),
+            "--remount-ro".to_string(),
+            p,
+        ]);
+    }
     if let Some(placeholder) = &deny_masks.placeholder {
         let ph = placeholder.to_string_lossy().into_owned();
         for file in deny_masks.files.iter().filter(|f| under_rebind(f)) {
@@ -812,12 +846,21 @@ pub(crate) fn build_bwrap_args(
 /// - Its parent exists on the host as a real directory (not a missing `.git` in
 ///   a non-git project or a worktree `.git` pointer file).
 fn is_missing_gitdir_dir_overlay(path: &Path) -> bool {
-    if !matches!(
+    matches!(
         path.file_name().and_then(|n| n.to_str()),
         Some("remotes" | "branches")
-    ) {
-        return false;
-    }
+    ) && is_absent_under_real_dir(path)
+}
+
+/// `path` is truly absent (not even a broken symlink, over which bwrap cannot
+/// create a directory mount point) and its parent is a real directory.
+///
+/// For `sandbox.mask_missing_deny_paths` the parent check is what keeps a mask
+/// from creating anything new in HOME: with a missing parent, bwrap would
+/// `mkdir -p` it on the host through the writable bind. Such a path is
+/// skipped and the launch warns. The caller hands canonical paths, so a
+/// symlinked parent is already resolved here.
+fn is_absent_under_real_dir(path: &Path) -> bool {
     if path.symlink_metadata().is_ok() {
         return false;
     }
@@ -2386,6 +2429,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &[],
+                mask_missing: &[],
             },
             &DenyMasks::default(),
         );
@@ -2431,6 +2475,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &[],
+                mask_missing: &[],
             },
             &DenyMasks::default(),
         );
@@ -2510,6 +2555,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &pins,
+                mask_missing: &[],
             },
             &DenyMasks::default(),
         );
@@ -2590,6 +2636,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &pins,
+                mask_missing: &[],
             },
             &DenyMasks::default(),
         );
@@ -2812,6 +2859,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &[],
+                mask_missing: &[],
             },
             &DenyMasks::default(),
         );
@@ -2928,6 +2976,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &[],
+                mask_missing: &[],
             },
             &DenyMasks::default(),
         );
@@ -2964,6 +3013,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &[],
+                mask_missing: &[],
             },
             &DenyMasks::default(),
         );
@@ -3018,6 +3068,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &[],
+                mask_missing: &[],
             },
             &DenyMasks::default(),
         );
@@ -3081,6 +3132,7 @@ mod tests {
             Overlays {
                 read_only: &ro,
                 pins: &[],
+                mask_missing: &[],
             },
             &masks,
         );
@@ -3708,6 +3760,7 @@ mod tests {
         let overlays = Overlays {
             read_only: std::slice::from_ref(&ro),
             pins: &[],
+            mask_missing: &[],
         };
         let args = build_bwrap_args(&rules, overlays, &masks);
         let s = |p: &Path| p.to_string_lossy().into_owned();
@@ -3752,6 +3805,7 @@ mod tests {
         let overlays = Overlays {
             read_only: &overlays_vec,
             pins: &[],
+            mask_missing: &[],
         };
         let args = build_bwrap_args(&rules, overlays, &DenyMasks::default());
         let s = |p: &Path| p.to_string_lossy().into_owned();
@@ -3807,6 +3861,63 @@ mod tests {
         assert!(
             tmpfs_pos > rebind_pos,
             "phase-3 read-only tmpfs on .git/remotes must follow the writable rebind: {rebind_args:?}"
+        );
+    }
+
+    /// `sandbox.mask_missing_deny_paths`: a missing directory listed in
+    /// `mask_missing` gets an empty read-only tmpfs; with the list empty (key
+    /// off) it is skipped as before. An existing one is still `--ro-bind`ed, and
+    /// one whose parent is missing is never masked.
+    #[test]
+    fn mask_missing_masks_absent_persistence_dir_only_when_listed() {
+        let base = non_tmp_tempdir();
+        let home = base.path().canonicalize().unwrap();
+        let copilot = home.join(".copilot");
+        std::fs::create_dir_all(copilot.join("hooks")).unwrap();
+        let agents = copilot.join("agents");
+        let hooks = copilot.join("hooks");
+        let orphan = home.join(".pi/agent/extensions");
+        let ro = vec![agents.clone(), hooks.clone(), orphan.clone()];
+        let rules = [writable_rule(&home.to_string_lossy())];
+        let s = |p: &Path| p.to_string_lossy().into_owned();
+        let tmpfs = |args: &[String], p: &Path| {
+            args.windows(4)
+                .any(|w| w == ["--tmpfs", &s(p), "--remount-ro", &s(p)])
+        };
+
+        let off = build_bwrap_args(
+            &rules,
+            Overlays {
+                read_only: &ro,
+                pins: &[],
+                mask_missing: &[],
+            },
+            &DenyMasks::default(),
+        );
+        assert!(!tmpfs(&off, &agents), "key off keeps today's argv: {off:?}");
+
+        let on = build_bwrap_args(
+            &rules,
+            Overlays {
+                read_only: &ro,
+                pins: &[],
+                mask_missing: &ro,
+            },
+            &DenyMasks::default(),
+        );
+        assert!(
+            tmpfs(&on, &agents),
+            "missing agents/ must be masked: {on:?}"
+        );
+        assert!(
+            on.windows(3)
+                .any(|w| w == ["--ro-bind", &s(&hooks), &s(&hooks)]),
+            "an existing dir stays a read-only bind: {on:?}"
+        );
+        assert!(!tmpfs(&on, &hooks));
+        assert!(
+            !on.iter().any(|a| *a == s(&orphan)),
+            "a missing parent must not be created by a mask: {on:?}"
         );
     }
 

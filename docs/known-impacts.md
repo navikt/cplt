@@ -1052,6 +1052,25 @@ Some git operations are blocked to prevent persistence attacks that would surviv
 
 **Commit signing:** `~/.ssh` and `~/.gnupg` are blocked, so GPG/SSH signing would fail. Rather than open private key directories, cplt injects `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_N`/`GIT_CONFIG_VALUE_N` env vars that disable `commit.gpgsign` and `tag.gpgsign` inside the sandbox. Commits made by Copilot are unsigned, which is expected since users typically re-sign on merge or squash. Use `--allow-gpg-signing` to override this (see [GPG signing](#gpg-commit-signing)).
 
+## Linux: missing host-persistence directories appear empty
+
+With `sandbox.mask_missing_deny_paths = true` (set by `cplt config init` for
+new configs), an agent host-persistence directory that does not exist at launch,
+such as `~/.copilot/agents/` or Pi's `~/.pi/agent/extensions/`, is mounted as an
+empty read-only directory. Inside the sandbox:
+
+- The directory exists and is empty. A tool that treats "missing" and "empty"
+  differently sees "empty".
+- `mkdir` on it fails with `File exists`, and creating anything inside fails
+  with `Read-only file system`. Install extensions, plugins or custom agents
+  from a shell outside cplt.
+- bubblewrap leaves the empty directory on disk after the session. Later
+  launches bind it read-only like any existing directory.
+
+A directory whose parent is missing (cplt warns at launch), and a missing file such as
+`settings.json`, are not masked. Recovery: `cplt config set
+sandbox.mask_missing_deny_paths false`.
+
 ## Linux: fewer home config files are readable (behaviour change)
 
 Linux used to grant a longer list of home config files than macOS. Both platforms now grant the same list, and Linux lost these:
