@@ -5395,8 +5395,9 @@ print('CONNECTED')
         git_ok(&main, &["config", "extensions.worktreeConfig", "true"]);
         let wt = dir.path().canonicalize().unwrap().join("wt");
         git_ok(&main, &["worktree", "add", "-q", wt.to_str().unwrap()]);
-        let root_cw = main.join(".git/config.worktree");
-        let wt_cw = main.join(".git/worktrees/wt/config.worktree");
+        let main_git = main.join(".git");
+        let root_cw = main_git.join("config.worktree");
+        let wt_cw = main_git.join("worktrees/wt/config.worktree");
         assert!(!root_cw.exists() && !wt_cw.exists());
 
         let home = home_outside_tmp(".cplt-e2e-gitconfig-home-");
@@ -5419,7 +5420,11 @@ print('CONNECTED')
         let (code, stdout, stderr) = run_sandboxed_home_with_flags_env(
             &wt,
             home.path(),
-            &["--use-bubblewrap"],
+            &[
+                "--use-bubblewrap",
+                "--allow-write",
+                main_git.to_str().unwrap(),
+            ],
             &[("CPLT_CONFIG", &cfg)],
             &script,
         );
@@ -5431,8 +5436,8 @@ print('CONNECTED')
                 && !stdout.contains("_OK"),
             "code: {code}, stdout: {stdout}, stderr: {stderr}"
         );
-        assert_eq!(fs::read_to_string(&wt_cw).unwrap_or_default(), "");
-        assert_eq!(fs::read_to_string(&root_cw).unwrap_or_default(), "");
+        assert_eq!(fs::read_to_string(&wt_cw).unwrap(), "");
+        assert_eq!(fs::read_to_string(&root_cw).unwrap(), "");
     }
 
     #[test]
@@ -5473,5 +5478,8 @@ print('CONNECTED')
                 && !stdout.contains("_MOVED"),
             "code: {code}, stdout: {stdout}, stderr: {stderr}"
         );
+        assert!(main.join(".git/worktrees/wt").is_dir());
+        assert!(!main.join(".git/worktrees/wt2").exists());
+        assert!(!main.join(".git/wtx").exists());
     }
 }

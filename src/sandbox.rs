@@ -3556,6 +3556,16 @@ fn parse_worktree_config(text: &str) -> bool {
     let mut in_extensions = false;
     let mut enabled = false;
     for raw_line in text.lines() {
+        if !raw_line
+            .trim_end()
+            .bytes()
+            .rev()
+            .take_while(|&b| b == b'\\')
+            .count()
+            .is_multiple_of(2)
+        {
+            return true;
+        }
         let mut line = strip_git_config_comment(raw_line).trim();
         while let Some(rest) = line.strip_prefix('[') {
             let Some((header, after)) = rest.split_once(']') else {
@@ -4855,11 +4865,19 @@ mod tests {
                 .any(|p| p.ends_with("config.worktree"))
         );
 
-        // Enabled (case-insensitive section/key, comments, bare boolean, override).
+        // Enabled (case-insensitive section/key, comments, bare boolean, override,
+        // and fail-closed on unescaped trailing backslash continuation).
         for (cfg_text, expected) in [
             ("[Extensions]\n\tWorktreeConfig = TRUE ; comment\n", true),
             ("[ extensions ] worktreeConfig\n", true),
             ("[extensions]\nworktreeConfig = 1\n", true),
+            ("[extensions]\nworktreeConfig = tr\\\nue\n", true),
+            ("[extensions]\nworktreeConfig = tr\\   \nue\n", true),
+            ("[exten\\\nsions]\nworktreeConfig = false\n", true),
+            (
+                "[extensions]\nother = \"a\\\\\"\nworktreeConfig = false\n",
+                false,
+            ),
             (
                 "[extensions]\nworktreeConfig = true\nworktreeConfig = false\n",
                 false,
