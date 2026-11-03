@@ -1439,10 +1439,15 @@ fn create_default_copilot_pkg_dir(config: &SandboxConfig) -> Result<(), String> 
         if std::fs::symlink_metadata(dir).is_ok() {
             continue;
         }
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(dir)
-            .map_err(|e| fail(dir, e))?;
+        match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+            // A concurrent launch created it between the check and the call.
+            // Accept only a real directory: a symlink planted in that window
+            // still fails the launch.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::AlreadyExists
+                    && std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) => {}
+            r => r.map_err(|e| fail(dir, e))?,
+        }
     }
     Ok(())
 }
