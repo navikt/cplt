@@ -782,7 +782,7 @@ fn install_command_wrappers(
 
     // Install gh wrapper (only if gh_proxy enabled)
     if gh_guard.enabled
-        && let Some(real_gh) = which_binary("gh")
+        && let Some(real_gh) = which_real_gh()
     {
         // Once per process: `cplt check` launches one sandbox per probe, and
         // the same repository gives the same answer each time (#673).
@@ -1158,6 +1158,25 @@ fn with_pnpm_home_dirs(mut paths: Vec<PathBuf>, roots: &[PathBuf]) -> Vec<PathBu
 /// with `EACCES`. Deliberately the same predicate as the trusted-directory
 /// lookup — [`crate::git::is_executable_file`], an `X_OK` check, not a
 /// mode-bit test — so the two resolvers cannot disagree about what counts.
+/// The `gh` the wrapper execs: the first on PATH that is not a mise/asdf shim,
+/// or the binary such a shim resolves to. The wrapper sits first on PATH, so
+/// a shim run from it finds the wrapper again and mise aborts with "shim
+/// fallback recursion detected". An unresolvable shim (a tool mise no longer
+/// has active) is skipped for the next `gh` on PATH.
+fn which_real_gh() -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_var)
+        .map(|dir| dir.join("gh"))
+        .filter(|p| crate::git::is_executable_file(p))
+        .find_map(|p| {
+            if crate::agent::is_mise_shim(&p) {
+                crate::agent::resolve_mise_shim(&p, "gh")
+            } else {
+                Some(p)
+            }
+        })
+}
+
 pub(crate) fn which_binary(name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     std::env::split_paths(&path_var)
