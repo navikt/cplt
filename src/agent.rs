@@ -3597,7 +3597,7 @@ pub(crate) fn is_mise_shim(candidate: &Path) -> bool {
     candidate
         .parent()
         .and_then(Path::to_str)
-        .is_some_and(|dir| dir.contains("/mise/shims") || dir.contains("asdf/shims"))
+        .is_some_and(|dir| dir.contains("mise/shims") || dir.contains("asdf/shims"))
 }
 
 /// Detect if a candidate path (before canonicalization) is a mise or asdf shim.
@@ -6880,6 +6880,7 @@ mod tests {
     fn is_mise_shim_matches_shim_dirs_only() {
         assert!(is_mise_shim(Path::new("/h/.local/share/mise/shims/gh")));
         assert!(is_mise_shim(Path::new("/h/.asdf/shims/gh")));
+        assert!(is_mise_shim(Path::new("/h/.mise/shims/gh")));
         assert!(!is_mise_shim(Path::new("/opt/homebrew/bin/gh")));
     }
 

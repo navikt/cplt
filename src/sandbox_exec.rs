@@ -1174,7 +1174,7 @@ pub(crate) fn which_binary(name: &str) -> Option<PathBuf> {
 /// for mise's ubi layout (`installs/gh/<ver>/<asset>/bin/gh`).
 fn which_real_gh() -> Option<PathBuf> {
     which_real_gh_in(&std::env::var_os("PATH")?, |p| {
-        crate::agent::resolve_mise_shim(p, "gh")
+        crate::agent::resolve_mise_shim(p, "gh").filter(|gh| crate::git::is_executable_file(gh))
     })
 }
 
