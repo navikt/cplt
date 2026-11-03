@@ -3592,6 +3592,14 @@ pub fn validate_copilot_keychain_substitute(
     Ok(())
 }
 
+/// Whether `candidate` sits in a mise or asdf shims directory.
+pub(crate) fn is_mise_shim(candidate: &Path) -> bool {
+    candidate
+        .parent()
+        .and_then(Path::to_str)
+        .is_some_and(|dir| dir.contains("mise/shims") || dir.contains("asdf/shims"))
+}
+
 /// Detect if a candidate path (before canonicalization) is a mise or asdf shim.
 ///
 /// Mise shims are symlinks to the mise binary in a shims directory. When run
@@ -3600,17 +3608,8 @@ pub fn validate_copilot_keychain_substitute(
 /// "No version is set for command <name>". We resolve the real binary path
 /// to bypass mise's version resolution entirely.
 #[allow(clippy::disallowed_methods)] // mise/asdf already resolved by git::trusted_binary, never PATH
-fn resolve_mise_shim(candidate: &Path, binary_name: &str) -> Option<PathBuf> {
-    let dir = candidate.parent()?;
-    let dir_str = dir.to_str()?;
-
-    // Check if the candidate is in a known shims directory
-    let is_shim_dir = dir_str.ends_with("/mise/shims")
-        || dir_str.contains("/mise/shims")
-        || dir_str.ends_with("/asdf/shims")
-        || dir_str.contains("/asdf/shims");
-
-    if !is_shim_dir {
+pub(crate) fn resolve_mise_shim(candidate: &Path, binary_name: &str) -> Option<PathBuf> {
+    if !is_mise_shim(candidate) {
         return None;
     }
 
@@ -6875,6 +6874,14 @@ mod tests {
         // A path not in a shims directory should return None immediately
         let candidate = Path::new("/usr/local/bin/copilot");
         assert!(resolve_mise_shim(candidate, "copilot").is_none());
+    }
+
+    #[test]
+    fn is_mise_shim_matches_shim_dirs_only() {
+        assert!(is_mise_shim(Path::new("/h/.local/share/mise/shims/gh")));
+        assert!(is_mise_shim(Path::new("/h/.asdf/shims/gh")));
+        assert!(is_mise_shim(Path::new("/h/.mise/shims/gh")));
+        assert!(!is_mise_shim(Path::new("/opt/homebrew/bin/gh")));
     }
 
     #[test]

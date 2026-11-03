@@ -782,7 +782,7 @@ fn install_command_wrappers(
 
     // Install gh wrapper (only if gh_proxy enabled)
     if gh_guard.enabled
-        && let Some(real_gh) = which_binary("gh")
+        && let Some(real_gh) = which_real_gh()
     {
         // Once per process: `cplt check` launches one sandbox per probe, and
         // the same repository gives the same answer each time (#673).
@@ -1163,6 +1163,35 @@ pub(crate) fn which_binary(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&path_var)
         .map(|dir| dir.join(name))
         .find(|p| crate::git::is_executable_file(p))
+}
+
+/// The `gh` the wrapper execs: the first on PATH that is not a mise/asdf shim,
+/// or the binary such a shim resolves to. The wrapper sits first on PATH, so
+/// a shim run from it finds the wrapper again and mise aborts with "shim
+/// fallback recursion detected". An unresolvable shim (a tool mise no longer
+/// has active) is skipped for the next `gh` on PATH. That relies on mise's
+/// installs-dir fallback in `resolve_mise_shim` not finding gh, which holds
+/// for mise's ubi layout (`installs/gh/<ver>/<asset>/bin/gh`).
+fn which_real_gh() -> Option<PathBuf> {
+    which_real_gh_in(&std::env::var_os("PATH")?, |p| {
+        crate::agent::resolve_mise_shim(p, "gh").filter(|gh| crate::git::is_executable_file(gh))
+    })
+}
+
+fn which_real_gh_in(
+    path_var: &std::ffi::OsStr,
+    resolve_shim: impl Fn(&Path) -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    std::env::split_paths(path_var)
+        .map(|dir| dir.join("gh"))
+        .filter(|p| crate::git::is_executable_file(p))
+        .find_map(|p| {
+            if crate::agent::is_mise_shim(&p) {
+                resolve_shim(&p)
+            } else {
+                Some(p)
+            }
+        })
 }
 
 /// Ignore SIGTTOU/SIGTTIN — copilot (Node.js) may manipulate terminal
@@ -3464,5 +3493,41 @@ mod bwrap_policy_transfer_tests {
 
         assert_eq!(result, Ok(()));
         assert_eq!(drained, expected);
+    }
+}
+
+#[cfg(test)]
+mod which_real_gh_tests {
+    use super::which_real_gh_in;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+
+    fn exe(dir: &std::path::Path) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let p = dir.join("gh");
+        std::fs::write(&p, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    #[test]
+    fn shim_resolves_or_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shim = exe(&tmp.path().join("mise/shims"));
+        let real = exe(&tmp.path().join("brew/bin"));
+        let path = std::env::join_paths([shim.parent().unwrap(), real.parent().unwrap()]).unwrap();
+
+        assert_eq!(which_real_gh_in(&path, |_| None), Some(real.clone()));
+        let behind = PathBuf::from("/x/installs/gh/1/bin/gh");
+        assert_eq!(
+            which_real_gh_in(&path, |_| Some(behind.clone())),
+            Some(behind)
+        );
+
+        let only_real = std::env::join_paths([real.parent().unwrap()]).unwrap();
+        assert_eq!(
+            which_real_gh_in(&only_real, |_| panic!("not a shim")),
+            Some(real)
+        );
     }
 }
