@@ -807,13 +807,15 @@ and the port guard (14.3) is what stops an agent-run login.
    separate login socket in the broker's socket dir, mode 0600, never the
    stdio socket. The sandbox is never granted it: no macOS network-outbound
    rule (only `mcp_socket` is granted, `src/sandbox_profile.rs:228`), and bwrap
-   binds in only the stdio socket (`src/sandbox_landlock.rs:1037`). The broker
-   that binds `<P>` writes `<state dir>/oauth-login.sock`, mode 0600, naming
-   its login socket, and answers an identification handshake on it. Login
-   refuses with one line naming the port when that file is missing or the
-   handshake fails, so it never hands off to an unknown holder. The state dir
-   falls under the same rule as the token path (14.5): if the session policy
-   makes it writable, cplt refuses the oauth remote. The
+   binds in only the stdio socket (`src/sandbox_landlock.rs:1037`). Login finds
+   it through `<P>`, not a file: it connects to `127.0.0.1:<P>`, and the
+   holder answers a cplt handshake naming its login socket. `<P>` is held by
+   a process that started before any agent, so login trusts no file in a dir
+   a session might grant. The answer on `<P>` only names the socket; it cannot
+   start a login, and the login socket stays ungranted. Login refuses with one
+   line naming the port when the handshake fails. The broker builds the
+   authorization URL itself; login never opens a URL the handoff peer did not
+   build. The
    redirect path is exactly `/callback`, matching the CIMD document; the
    random segment is dropped (the gateway would reject it). macOS `ps` exposes
    the `open` URL (`(allow sysctl-read)`, `src/sandbox_profile.rs:1144`), but
