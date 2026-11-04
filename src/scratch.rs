@@ -1205,7 +1205,22 @@ impl Drop for ScratchDir {
             remove_prepared_dir(&self.path, "scratch dir");
             return;
         }
-        remove_all_except(&self.path, &kept);
+        // Re-open the root fd-relative and re-check it is still ours.
+        let root = open_dir_nofollow(&self.path).ok().filter(|f| {
+            use std::os::unix::fs::MetadataExt;
+            f.metadata()
+                .is_ok_and(|m| m.dev() == self.device && m.ino() == self.inode)
+        });
+        let Some(root) = root else {
+            ui::warn("Warning: refusing to cleanup replaced scratch dir");
+            return;
+        };
+        let keep: Vec<Vec<std::ffi::OsString>> = kept
+            .iter()
+            .filter_map(|k| k.strip_prefix(&self.path).ok())
+            .map(|rel| rel.iter().map(ToOwned::to_owned).collect())
+            .collect();
+        remove_all_except_at(&root, &keep);
         for file in GH_TOKEN_FILES {
             if self.path.join(file).symlink_metadata().is_ok() {
                 ui::error(&format!(
@@ -1353,39 +1368,110 @@ fn has_initialized_submodule(dir: &Path) -> bool {
         })
 }
 
-/// Delete everything under `dir` except the `keep` paths and the directories
-/// leading to them. Never follows a symlink: links are removed, not entered.
-fn remove_all_except(dir: &Path, keep: &[PathBuf]) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if keep.contains(&path) {
+/// Delete everything under the open directory `dir` except the `keep` paths
+/// (relative component lists) and the directories leading to them.
+///
+/// Fully fd-relative, like [`chmod_subdirs_at`]: children are listed through
+/// the fd, entered with `openat(O_DIRECTORY|O_NOFOLLOW)` and removed with
+/// `unlinkat`. A sandboxed process that swaps a directory for a symlink
+/// mid-walk gets its symlink unlinked; the walk never leaves scratch.
+fn remove_all_except_at(dir: &std::fs::File, keep: &[Vec<std::ffi::OsString>]) {
+    use std::os::unix::ffi::OsStrExt;
+    for name in list_dir_at(dir) {
+        let os = std::ffi::OsStr::from_bytes(name.to_bytes());
+        let below: Vec<Vec<std::ffi::OsString>> = keep
+            .iter()
+            .filter(|k| k.first().is_some_and(|c| c == os))
+            .map(|k| k[1..].to_vec())
+            .collect();
+        if below.iter().any(Vec::is_empty) {
             continue;
         }
-        let Ok(ft) = entry.file_type() else { continue };
-        let result = if ft.is_dir() && keep.iter().any(|k| k.starts_with(&path)) {
-            // Same repair as `remove_owned_dir`: the agent may have left it 0500.
-            if let Ok(d) = open_dir_nofollow(&path) {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = d.metadata().map_or(0o700, |m| m.permissions().mode()) | 0o700;
-                let _ = d.set_permissions(std::fs::Permissions::from_mode(mode));
-            }
-            remove_all_except(&path, keep);
-            Ok(())
-        } else if ft.is_dir() {
-            remove_tree(&path)
+        if below.is_empty() {
+            remove_at(dir, &name);
+        } else if let Some(child) = open_subdir_at(dir, &name) {
+            remove_all_except_at(&child, &below);
         } else {
-            std::fs::remove_file(&path)
-        };
-        if let Err(e) = result {
-            ui::warn(&format!(
-                "Warning: cannot cleanup {}: {e}",
-                crate::audit::escape_path(&path.to_string_lossy())
-            ));
+            // No longer a directory: whatever is there now is not ours to keep.
+            remove_at(dir, &name);
         }
     }
+}
+
+/// Open `name` under `dir` as a directory without following a symlink, and
+/// give the owner rwx so its entries can be removed.
+fn open_subdir_at(dir: &std::fs::File, name: &std::ffi::CStr) -> Option<std::fs::File> {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    // SAFETY: plain openat on a valid dir fd and NUL-terminated name.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: `fd` is a fresh descriptor this File now owns.
+    let child = unsafe { std::fs::File::from_raw_fd(fd) };
+    if let Ok(meta) = child.metadata() {
+        let mode = meta.permissions().mode() | 0o700;
+        let _ = child.set_permissions(std::fs::Permissions::from_mode(mode));
+    }
+    Some(child)
+}
+
+/// Remove `name` under `dir`, recursing fd-relative into a real directory.
+fn remove_at(dir: &std::fs::File, name: &std::ffi::CStr) {
+    use std::os::unix::io::AsRawFd;
+    let rc = if let Some(child) = open_subdir_at(dir, name) {
+        for sub in list_dir_at(&child) {
+            remove_at(&child, &sub);
+        }
+        drop(child);
+        // SAFETY: plain unlinkat; AT_REMOVEDIR fails on a swapped-in symlink.
+        unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) }
+    } else {
+        // SAFETY: unlinkat without flags removes a link, never its target.
+        unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) }
+    };
+    if rc != 0 {
+        let e = std::io::Error::last_os_error();
+        ui::warn(&format!(
+            "Warning: cannot cleanup scratch entry {}: {e}",
+            crate::audit::escape_path(&name.to_string_lossy())
+        ));
+    }
+}
+
+/// Names in `dir`, read through the fd (never a path).
+fn list_dir_at(dir: &std::fs::File) -> Vec<std::ffi::CString> {
+    use std::os::unix::io::AsRawFd;
+    // fdopendir takes ownership of the fd it gets, so hand it a dup.
+    let dup = unsafe { libc::dup(dir.as_raw_fd()) };
+    if dup < 0 {
+        return Vec::new();
+    }
+    let stream = unsafe { libc::fdopendir(dup) };
+    if stream.is_null() {
+        unsafe { libc::close(dup) };
+        return Vec::new();
+    }
+    let mut names = Vec::new();
+    loop {
+        let ent = unsafe { libc::readdir(stream) };
+        if ent.is_null() {
+            break;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
+        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            names.push(name.to_owned());
+        }
+    }
+    unsafe { libc::closedir(stream) };
+    names
 }
 
 /// Generate a random session ID using /dev/urandom.
@@ -1653,29 +1739,7 @@ fn chmod_subdirs_at(dir: &std::fs::File) {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::io::{AsRawFd, FromRawFd};
 
-    // fdopendir takes ownership of the fd it gets, so hand it a dup.
-    let dup = unsafe { libc::dup(dir.as_raw_fd()) };
-    if dup < 0 {
-        return;
-    }
-    let stream = unsafe { libc::fdopendir(dup) };
-    if stream.is_null() {
-        unsafe { libc::close(dup) };
-        return;
-    }
-    let mut names = Vec::new();
-    loop {
-        let ent = unsafe { libc::readdir(stream) };
-        if ent.is_null() {
-            break;
-        }
-        let name = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
-        if name.to_bytes() != b"." && name.to_bytes() != b".." {
-            names.push(name.to_owned());
-        }
-    }
-    unsafe { libc::closedir(stream) };
-
+    let names = list_dir_at(dir);
     for name in names {
         let fd = unsafe {
             libc::openat(
@@ -2076,6 +2140,33 @@ mod tests {
         assert!(has_initialized_submodule(&wt));
         drop(scratch);
         assert!(sub.join("edit").exists());
+    }
+
+    /// Symlinks below the root, including one standing where a kept
+    /// worktree's ancestor dir was, are unlinked and never entered.
+    #[test]
+    fn selective_sweep_never_follows_symlinks_below_root() {
+        let base = tempfile::tempdir().unwrap();
+        let outside = base.path().join("outside");
+        std::fs::create_dir_all(outside.join("wt")).unwrap();
+        std::fs::write(outside.join("precious"), "x").unwrap();
+        let root = base.path().join("root");
+        std::fs::create_dir_all(root.join("a/wt")).unwrap();
+        std::fs::write(root.join("a/wt/work"), "w").unwrap();
+        std::fs::write(root.join("a/junk"), "j").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("a/b")).unwrap();
+        // Was a kept worktree's ancestor; swapped for a link to outside.
+        std::os::unix::fs::symlink(&outside, root.join("swapped")).unwrap();
+        let keep: Vec<Vec<std::ffi::OsString>> = vec![
+            vec!["a".into(), "wt".into()],
+            vec!["swapped".into(), "wt".into()],
+        ];
+        remove_all_except_at(&open_dir_nofollow(&root).unwrap(), &keep);
+        assert!(root.join("a/wt/work").exists());
+        assert!(!root.join("a/junk").exists());
+        assert!(root.join("a/b").symlink_metadata().is_err());
+        assert!(root.join("swapped").symlink_metadata().is_err());
+        assert!(outside.join("precious").exists() && outside.join("wt").exists());
     }
 
     #[test]
