@@ -1553,19 +1553,31 @@ fn git_gate_worktree_add_into_managed_root_only() {
     let repo = temp_repo("navikt/cplt");
     let root = repo.path().join("wt-root");
     std::fs::create_dir(&root).unwrap();
-    let run = |args: &[&str], push: bool| {
-        cplt_cmd()
-            .args(["git-gate", "--real-git", "/usr/bin/true", "--mode=block"])
+    let facts = format!("--repo-facts={{\"worktree_root\":\"{}\"}}", root.display());
+    let run_with = |args: &[&str], push: bool, baked: bool| {
+        let mut cmd = cplt_cmd();
+        if baked {
+            cmd.arg("git-gate").arg(&facts);
+        } else {
+            cmd.arg("git-gate");
+        }
+        cmd.args(["--real-git", "/usr/bin/true", "--mode=block"])
             .arg(format!("--prevent-push={push}"))
             .arg(format!("--prevent-force-push={push}"))
             .arg("--")
             .args(args)
-            .env("CPLT_WORKTREE_ROOT", &root)
+            // The env var is the agent's to rewrite; only the baked root counts.
+            .env("CPLT_WORKTREE_ROOT", repo.path())
             .current_dir(repo.path())
             .status()
             .unwrap()
             .success()
     };
+    let run = |args: &[&str], push: bool| run_with(args, push, true);
+    assert!(
+        !run_with(&["worktree", "add", "wt-root/a"], true, false),
+        "an env-only root must not be honoured"
+    );
     assert!(run(&["worktree", "add", "wt-root/a", "-b", "a"], true));
     assert!(run(&["-C", "wt-root", "worktree", "add", "-q", "b"], true));
     assert!(!run(&["worktree", "add", "wt-root"], true), "root itself");

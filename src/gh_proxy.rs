@@ -3560,7 +3560,9 @@ pub fn gate_git(
     // sandbox `git worktree add` either stops halfway on a protected file
     // (`.cplt.toml`, `.github/hooks`), leaving a partial directory, or lands in
     // the session scratch dir, which is deleted at exit with any uncommitted work.
-    if is_worktree_add(args) && !worktree_add_target_in_managed_root(args) {
+    if is_worktree_add(args)
+        && !worktree_add_target_in_managed_root(args, &repo_facts.worktree_root)
+    {
         let hint = if std::env::var_os(crate::worktree_broker::SOCKET_ENV).is_some() {
             "Use `cplt worktree add <name> <ref>`, or `git worktree add \"$CPLT_WORKTREE_ROOT/<name>\"`."
         } else if cfg!(target_os = "macos") {
@@ -4115,10 +4117,10 @@ fn is_worktree_add(args: &[&str]) -> bool {
 ///
 /// Conservative: an unknown option, a `..` below the deepest existing ancestor,
 /// or anything that cannot be resolved counts as outside.
-fn worktree_add_target_in_managed_root(args: &[&str]) -> bool {
-    let Some(root) = std::env::var_os("CPLT_WORKTREE_ROOT") else {
+fn worktree_add_target_in_managed_root(args: &[&str], root: &str) -> bool {
+    if root.is_empty() {
         return false;
-    };
+    }
     let Ok(root) = std::fs::canonicalize(root) else {
         return false;
     };
@@ -4682,6 +4684,11 @@ pub struct RepoFacts {
     /// level by construction.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub named: Vec<RepoFacts>,
+    /// The session's managed worktree root (`$CPLT_WORKTREE_ROOT`), the only
+    /// place `git worktree add` may target (#962). Baked into the wrapper:
+    /// the agent can set the env var to anything.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub worktree_root: String,
 }
 
 impl RepoFacts {
@@ -5412,6 +5419,7 @@ pub fn generate_git_wrapper_script(
     // repository with no recorded `refs/remotes/*/HEAD` still has one.
     let repo_facts_flag = if repo_facts.default_branches.is_empty()
         && repo_facts.named.is_empty()
+        && repo_facts.worktree_root.is_empty()
         && repo_facts.git_common_dir.is_empty()
     {
         String::new()

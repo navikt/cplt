@@ -269,7 +269,8 @@ plumbing (`cat-file`, `rev-parse`, `ls-files`, `pack-objects`, `gc`, and so on).
 **`git worktree add` is refused unless it targets `$CPLT_WORKTREE_ROOT`**,
 whatever the push settings. Elsewhere in the sandbox it either stops halfway on
 a protected file (`.cplt.toml`, `.github/hooks`) or lands in the session scratch
-dir, which is deleted at exit. A path strictly inside the managed root (macOS,
+dir, which is deleted at exit. A path strictly inside the managed root, as baked into the wrapper at launch
+(the agent's env var is not consulted), (macOS,
 `sandbox.allow_git_worktrees`) is allowed, resolved against the working
 directory and any `-C`, with symlinks followed; an unknown option or a `..`
 the guard can't resolve is refused. Otherwise use `cplt worktree add <name>
@@ -280,7 +281,8 @@ Warn mode prints the refusal and runs the command.
 **Aliases set for one command are refused**, also with push prevention off:
 `git -c alias.w='worktree add' w ../x` would expand inside git after the guard
 has decided. This covers `-c`, `--config-env` and `GIT_CONFIG_PARAMETERS` /
-`GIT_CONFIG_KEY_<n>`; aliases in a config file are unaffected.
+`GIT_CONFIG_KEY_<n>`; aliases in a config file are unaffected, including one named via
+`GIT_CONFIG_GLOBAL` or `-c include.path`.
 
 **Default-deny while push prevention is active.** An unrecognized subcommand is
 blocked, not passed through, whenever `prevent_push` is on. An agent can define
