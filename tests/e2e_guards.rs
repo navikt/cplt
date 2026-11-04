@@ -1549,6 +1549,42 @@ fn git_gate_refuses_worktree_add_and_warn_mode_passes() {
 }
 
 #[test]
+fn git_gate_worktree_add_into_managed_root_only() {
+    let repo = temp_repo("navikt/cplt");
+    let root = repo.path().join("wt-root");
+    std::fs::create_dir(&root).unwrap();
+    let run = |args: &[&str], push: bool| {
+        cplt_cmd()
+            .args(["git-gate", "--real-git", "/usr/bin/true", "--mode=block"])
+            .arg(format!("--prevent-push={push}"))
+            .arg(format!("--prevent-force-push={push}"))
+            .arg("--")
+            .args(args)
+            .env("CPLT_WORKTREE_ROOT", &root)
+            .current_dir(repo.path())
+            .status()
+            .unwrap()
+            .success()
+    };
+    assert!(run(&["worktree", "add", "wt-root/a", "-b", "a"], true));
+    assert!(run(&["-C", "wt-root", "worktree", "add", "-q", "b"], true));
+    assert!(!run(&["worktree", "add", "wt-root"], true), "root itself");
+    assert!(!run(&["worktree", "add", "wt-root/../x"], true), "dotdot");
+    assert!(!run(&["worktree", "add", "x"], true), "project tree");
+    assert!(
+        !run(&["worktree", "add", "--bogus", "wt-root/a"], true),
+        "unknown option"
+    );
+    // An alias for one command would expand past the guard, push prevention or not.
+    assert!(!run(&["-c", "alias.w=worktree add", "w", "x"], false));
+    assert!(!run(
+        &["-c", "user.name=a", "-calias.w=worktree add", "w", "x"],
+        false
+    ));
+    assert!(run(&["-c", "user.name=a", "status"], false));
+}
+
+#[test]
 fn git_gate_allows_status() {
     let (_, _, ok) = git_gate(&["status"], true, true);
     assert!(ok, "git status should always be allowed");
