@@ -763,11 +763,7 @@ pub fn command(project_dir: &Path, args: &[&str]) -> Option<Command> {
                 return None;
             }
             None => {
-                crate::ui::warn(&format!(
-                    "git config probe timed out after {}s; refusing to run git in {}",
-                    CONFIG_PROBE_TIMEOUT.as_secs(),
-                    project_dir.display()
-                ));
+                crate::ui::warn(&probe_timeout_message(project_dir));
                 return None;
             }
         }
@@ -820,6 +816,15 @@ pub fn project_root(dir: &Path) -> Result<PathBuf, Option<String>> {
 #[must_use]
 pub fn repo_defines_content_filter(project_dir: &Path) -> bool {
     content_filter_probe(project_dir).unwrap_or(true)
+}
+
+/// The directory can be agent-named: escape it before it reaches the terminal.
+fn probe_timeout_message(dir: &Path) -> String {
+    format!(
+        "git config probe timed out after {}s; refusing to run git in {}",
+        CONFIG_PROBE_TIMEOUT.as_secs(),
+        crate::audit::escape_path(&dir.to_string_lossy())
+    )
 }
 
 /// [`repo_defines_content_filter`], with `None` when the probe timed out, so
@@ -922,6 +927,13 @@ mod tests {
         assert_eq!(content_filter_probe(dir.path()), None);
         assert!(repo_defines_content_filter(dir.path()));
         assert!(command(dir.path(), &["status"]).is_none());
+    }
+
+    #[test]
+    fn probe_timeout_message_escapes_control_chars() {
+        let msg = probe_timeout_message(Path::new("/s/\x1b[2Jwt"));
+        assert!(!msg.contains('\x1b'));
+        assert!(msg.contains("\\u{1b}[2Jwt"));
     }
 
     #[test]

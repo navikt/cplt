@@ -1208,13 +1208,18 @@ impl Drop for ScratchDir {
             .create_new(true)
             .open(self.path.join(KEPT_MARKER));
         for wt in &kept {
-            ui::warn(&format!(
-                "Kept a git worktree with uncommitted changes: {}\n  \
-                 Commit or copy what you need, then delete it and run `git worktree prune` in the repository.",
-                wt.display()
-            ));
+            ui::warn(&kept_message(wt));
         }
     }
+}
+
+/// Worktree names are agent-chosen: escape them before they reach the terminal.
+fn kept_message(wt: &Path) -> String {
+    format!(
+        "Kept a git worktree with uncommitted changes: {}\n  \
+         Commit or copy what you need, then delete it and run `git worktree prune` in the repository.",
+        crate::audit::escape_path(&wt.to_string_lossy())
+    )
 }
 
 /// Marks a scratch dir kept at exit because it holds a dirty worktree (#963).
@@ -1319,7 +1324,10 @@ fn remove_all_except(dir: &Path, keep: &[PathBuf]) {
             std::fs::remove_file(&path)
         };
         if let Err(e) = result {
-            ui::warn(&format!("Warning: cannot cleanup {}: {e}", path.display()));
+            ui::warn(&format!(
+                "Warning: cannot cleanup {}: {e}",
+                crate::audit::escape_path(&path.to_string_lossy())
+            ));
         }
     }
 }
@@ -1876,6 +1884,12 @@ mod tests {
         age(&s, STALE_AGE + Duration::from_secs(60));
         ScratchDir::gc_stale(&home);
         assert!(!s.exists(), "marker without a worktree is collected");
+    }
+
+    #[test]
+    fn kept_message_escapes_control_chars() {
+        let msg = kept_message(Path::new("/s/\x1b]0;x\x07wt"));
+        assert!(!msg.contains('\x1b') && !msg.contains('\x07'));
     }
 
     /// A FIFO planted in the worktree's admin dir cannot hang exit; the
