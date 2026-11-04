@@ -779,8 +779,8 @@ before the sandbox starts and holds it for the whole session, so an agent
 cannot listen on the only redirect the gateway accepts. If `<P>` is taken at
 start, that session's broker does not serve logins. Only login is refused or
 handed off (14.4); token use works in every session, since the token file is
-shared. The guard still holds: the holder is a cplt broker that bound `<P>`
-before any agent started. A short code stays as UX text only: cplt prints it, the consent page
+shared. The guard holds for any holder that took `<P>` before the session
+started, since no agent was running then. A short code stays as UX text only: cplt prints it, the consent page
 shows it, so the user can tell the login is theirs.
 
 ### 14.4 Login on the host
@@ -802,9 +802,18 @@ and the port guard (14.3) is what stops an agent-run login.
    comes after the pilot.
 4. Who owns `127.0.0.1:<P>`: if the port is free, login binds it itself.
    If a running broker holds it (the broker lives in the session process,
-   `src/main.rs:7332`), login hands the flow to that broker over its socket
-   and acts as a client; the broker runs steps 4-6 and stores the token. Any
-   other holder: login refuses with one line naming the port. The
+   `src/main.rs:7332`), login hands the flow to that broker and acts as a
+   client; the broker runs steps 4-6 and stores the token. The handoff uses a
+   separate login socket in the broker's socket dir, mode 0600, never the
+   stdio socket. The sandbox is never granted it: no macOS network-outbound
+   rule (only `mcp_socket` is granted, `src/sandbox_profile.rs:228`), and bwrap
+   binds in only the stdio socket (`src/sandbox_landlock.rs:1037`). The broker
+   that binds `<P>` writes `<state dir>/oauth-login.sock`, mode 0600, naming
+   its login socket, and answers an identification handshake on it. Login
+   refuses with one line naming the port when that file is missing or the
+   handshake fails, so it never hands off to an unknown holder. The state dir
+   falls under the same rule as the token path (14.5): if the session policy
+   makes it writable, cplt refuses the oauth remote. The
    redirect path is exactly `/callback`, matching the CIMD document; the
    random segment is dropped (the gateway would reject it). macOS `ps` exposes
    the `open` URL (`(allow sysctl-read)`, `src/sandbox_profile.rs:1144`), but
@@ -896,6 +905,7 @@ policy: act now):
 | Token theft on the host | Same as any keychain item the user owns. Tokens are bound by `resource` to one route (gateway); a stolen gateway token reaches one server |
 | Consent phishing with CIMD and a loopback redirect | Anyone can send a user an authorization link naming Nav's `client_id` with a loopback redirect, and the consent screen shows Nav's domain. The code only reaches a listener on the victim's machine, but a local process could race for the port. The MCP spec names this risk **(unverified wording)**. The gateway should show the client domain and requested route at consent; Figma's screen is outside Nav's control |
 | Upstream used to exfiltrate | The broker reaches only the spec's URL; `egressHosts` pins discovery. The agent's own allowlist is not changed |
+| Agent starts a login over the stdio socket | The stdio socket is reachable from the sandbox (`src/mcp_broker/runtime.rs:262-264`, handshake at 1054-1061). A login request on it is refused with DENIED; login is only served on the 0600 login socket the sandbox is never granted (14.4), so D10 holds |
 | Agent triggers a login | The agent can run the OAuth flow itself (sandbox allows loopback bind/inbound, `src/sandbox_profile.rs:3975-3976`; Linux shares host netns), using Nav's public CIMD `client_id` and its own loopback redirect, then ask the user to click a link. Env-based refusal (`CPLT_MCP_SOCKET`, `src/mcp_broker/mod.rs:29`) is no boundary. Owner decision 2026-11-02 (replaces the 2026-10-31 terminal-code guard): (a) the CIMD document lists only `http://127.0.0.1:<P>/callback`, and the host broker holds that port before the sandbox starts, so the agent cannot receive the code; a short code is shown as UX text only; (b) while an oauth spec is loaded, cplt adds the AS host and token endpoint to the agent's proxy blocklist, and `cplt mcp login` binds `<P>` itself or hands off to that broker; (c) no sandbox detection: env is forgeable and no other signal is verified; residual: macOS without forced proxy can still reach the AS directly, mitigated by (a), since the code can only reach the broker's listener. nav-pilot tells users cplt opens the browser itself and never asks them to click an agent-shown link |
 
 ### 14.8 Phases and open questions
