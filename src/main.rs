@@ -9944,6 +9944,10 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
         ok.push(format!("tools: {}", tool_names.join(" ")));
     }
 
+    // Suggestions only: they would crowd out the problems in the short view.
+    if !verbose {
+        findings.retain(|f| f.level != doctor::Level::Info);
+    }
     print!("{}", doctor::render(&findings, &ok, !verbose, &home_dir));
 
     if verbose {

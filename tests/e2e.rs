@@ -671,6 +671,20 @@ mod e2e_tests {
             stdout.lines().count() <= 25,
             "default view stays short (the inventory is --verbose).\nstdout: {stdout}"
         );
+        // Info findings (the sandbox.brief suggestion) are --verbose only.
+        assert!(
+            !stdout.contains("sandbox.brief"),
+            "info findings stay out of the default view.\nstdout: {stdout}"
+        );
+        let verbose = cplt_cmd()
+            .args(["--agent", "shell", "doctor", "--verbose"])
+            .current_dir(project_dir())
+            .output()
+            .expect("binary should run");
+        assert!(
+            String::from_utf8_lossy(&verbose.stdout).contains("sandbox.brief"),
+            "--verbose shows the brief suggestion"
+        );
         // Inventory sections stay out of the default view.
         for cut in [
             "Tool dirs",
