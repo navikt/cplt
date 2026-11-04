@@ -23,6 +23,8 @@ pub enum Level {
     Blocking,
     /// Something will fail mid-session, or a protection is silently off.
     Warning,
+    /// A suggestion: nothing fails and no protection is off.
+    Info,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +48,15 @@ impl Finding {
     pub fn warning(message: impl Into<String>, fix: Option<String>) -> Self {
         Self {
             level: Level::Warning,
+            message: message.into(),
+            fix,
+        }
+    }
+
+    #[must_use]
+    pub fn info(message: impl Into<String>, fix: Option<String>) -> Self {
+        Self {
+            level: Level::Info,
             message: message.into(),
             fix,
         }
@@ -1037,12 +1048,16 @@ pub fn render(findings: &[Finding], ok: &[String], verbose_hint: bool, home: &Pa
         .iter()
         .filter(|f| f.level == Level::Blocking)
         .count();
-    let warnings = findings.len() - blocking;
+    let warnings = findings
+        .iter()
+        .filter(|f| f.level == Level::Warning)
+        .count();
 
     for f in findings {
         let (sym, color) = match f.level {
             Level::Blocking => ("✗", RED),
             Level::Warning => ("⚠", YELLOW),
+            Level::Info => ("ℹ", RESET),
         };
         let _ = writeln!(
             out,
@@ -1331,6 +1346,23 @@ pub fn mask_missing_deny_paths_nudge(
     })
 }
 
+/// The nudge for a config from before the brief was on for new configs
+/// (#967). Shown only while no layer sets `sandbox.brief`.
+#[must_use]
+pub fn brief_nudge(r: &crate::config::Resolved) -> Option<Finding> {
+    (r.bool_layer("sandbox", "brief") == Some(crate::config::ConfigLayer::Baseline)).then(|| {
+        Finding::info(
+            "The agent is not told what the sandbox allows, so it learns by hitting denials. \
+             New configs write a per-session brief and load it into Copilot and OpenCode.",
+            Some(
+                "cplt config set sandbox.brief true, or set it to false to keep today's \
+                 behaviour and silence this"
+                    .to_string(),
+            ),
+        )
+    })
+}
+
 /// The Linux nudge for a config from before `.git/config` became read-only
 /// for new configs (#386). Shown only while no layer sets
 /// `sandbox.allow_git_config_write`; setting it either way silences it.
@@ -1418,6 +1450,32 @@ mod tests {
         assert!(copilot_persistence_nudge(&new, Agent::Copilot).is_none());
         let kept = r("[sandbox]\nallow_copilot_host_persistence = true\n");
         assert!(copilot_persistence_nudge(&kept, Agent::Copilot).is_none());
+    }
+
+    #[test]
+    fn brief_on_for_new_configs_and_nudged_only_when_unset() {
+        let r = |toml: &str| {
+            toml::from_str::<crate::config::Config>(toml)
+                .unwrap()
+                .merge(crate::config::CliFlags::default())
+                .unwrap()
+        };
+        let old = r("");
+        assert!(
+            !old.brief,
+            "an existing config without the key keeps the brief off"
+        );
+        let nudge = brief_nudge(&old).expect("unset key is nudged");
+        assert_eq!(nudge.level, Level::Info);
+        let out = render(&[nudge], &[], false, Path::new("/h"));
+        assert!(
+            out.contains("No problems found"),
+            "info is not a warning: {out}"
+        );
+        let new = r(&crate::config::default_config_contents());
+        assert!(new.brief, "cplt config init turns the brief on");
+        assert!(brief_nudge(&new).is_none());
+        assert!(brief_nudge(&r("[sandbox]\nbrief = false\n")).is_none());
     }
 
     #[test]

@@ -17,9 +17,10 @@
 //!
 //! Implements design issue #148 (agent-facing sandbox policy exposure).
 //!
-//! EXPERIMENTAL: both layers are off by default and unstable. Nothing else in
-//! cplt reads what they emit, so the wording and the AGENTS.md markers may
-//! change, or the feature may be removed.
+//! The session brief is on in configs written by `cplt config init` (#967)
+//! and reaches Copilot and OpenCode through their own instruction channels
+//! ([`delivery_env`]). The AGENTS.md layer stays EXPERIMENTAL: off by default,
+//! and its wording and markers may change.
 
 use std::path::Path;
 
@@ -320,13 +321,16 @@ pub fn generate_session_brief(facts: &BriefFacts) -> String {
             out,
             "## Worktrees\n\n\
              Worktrees for parallel work belong under `$CPLT_WORKTREE_ROOT` ({root}). \
+             Never create one under `$TMPDIR` (deleted when the session ends, with any \
+             uncommitted work) or inside the project tree. \
              Only when `$CPLT_WORKTREE_SOCKET` is set, use \
              `cplt worktree add <name> <ref>`, which prints the path. Otherwise ask the user \
              to prepare worktrees outside cplt. The broker reads local refs only. A local \
              branch `<ref>` is checked out on that branch, unless another worktree has it; \
              `cplt worktree add <name> <ref> -b <new-branch>` creates a new branch at `<ref>`; \
-             a tag or commit is checked out detached. Prefer `cplt worktree add` over plain \
-             `git worktree add`, which runs git directly without cplt's checks. You have read, \
+             a tag or commit is checked out detached. Prefer `cplt worktree add`, and never \
+             run plain `git worktree add` outside `$CPLT_WORKTREE_ROOT`: it runs git directly \
+             without cplt's checks. You have read, \
              write and execute there, and not in other repositories' roots. It belongs to this repository \
              only. Worktrees and branches you create persist after the session; cplt never \
              removes them. The end-of-session audit does not cover them. Do not run \
@@ -635,7 +639,14 @@ pub fn write_session_brief(
     facts: &BriefFacts,
 ) -> std::io::Result<std::path::PathBuf> {
     let path = scratch_dir.join(BRIEF_MD);
-    std::fs::write(&path, generate_session_brief(facts))?;
+    let brief = generate_session_brief(facts);
+    std::fs::write(&path, &brief)?;
+    // Copilot's copy, for `COPILOT_CUSTOM_INSTRUCTIONS_DIRS` (#967).
+    let copilot = scratch_dir.join(COPILOT_DIR).join(COPILOT_FILE);
+    if let Some(parent) = copilot.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&copilot, &brief)?;
     // Written second, and its failure does NOT take the prose down with it: the
     // Markdown is already on disk by the time this runs, and the environment
     // variables are set per file that exists, so a missing JSON costs the agent
@@ -652,6 +663,74 @@ pub fn write_session_brief(
 /// environment variables and the AGENTS.md block cannot drift.
 pub const BRIEF_MD: &str = "CPLT_BRIEF.md";
 pub const BRIEF_JSON: &str = "CPLT_BRIEF.json";
+
+/// Copilot reads `.github/instructions/*.instructions.md` under each directory
+/// in `COPILOT_CUSTOM_INSTRUCTIONS_DIRS`; a bare `AGENTS.md` there is not
+/// loaded (checked against Copilot CLI 1.0.105). So the brief gets a copy at
+/// that spelling in a directory of its own.
+pub const COPILOT_DIR: &str = "cplt-instructions";
+const COPILOT_FILE: &str = ".github/instructions/cplt-sandbox.instructions.md";
+
+/// The variable, and its new value, that makes `agent` load the brief through
+/// its own instruction channel (#967). `current` is the value the child would
+/// otherwise get: it is extended, never replaced, so nav-pilot's or the user's
+/// own instruction dirs and OpenCode config survive. `Ok(None)` when the agent
+/// has no channel cplt can use (Claude Code and the rest read `$CPLT_BRIEF`
+/// only if told to; docs/configuration.md states the gap) or the brief was not
+/// written. `Err` when the existing value cannot be extended; the caller warns.
+pub fn delivery_env(
+    agent: Agent,
+    scratch_dir: &Path,
+    current: impl Fn(&str) -> Option<String>,
+) -> Result<Option<(&'static str, String)>, String> {
+    match agent {
+        Agent::Copilot => {
+            const VAR: &str = "COPILOT_CUSTOM_INSTRUCTIONS_DIRS";
+            let dir = scratch_dir.join(COPILOT_DIR);
+            if !dir.join(COPILOT_FILE).is_file() {
+                return Ok(None);
+            }
+            let dir = dir.display().to_string();
+            if dir.contains(',') {
+                return Err(format!(
+                    "{VAR} is comma-separated and the scratch path holds a comma"
+                ));
+            }
+            let value = match current(VAR).filter(|v| !v.is_empty()) {
+                Some(v) if v.split(',').any(|d| d == dir) => v,
+                Some(v) => format!("{v},{dir}"),
+                None => dir,
+            };
+            Ok(Some((VAR, value)))
+        }
+        Agent::OpenCode => {
+            const VAR: &str = "OPENCODE_CONFIG_CONTENT";
+            let brief = scratch_dir.join(BRIEF_MD);
+            if !brief.is_file() {
+                return Ok(None);
+            }
+            let mut config: serde_json::Value = match current(VAR).filter(|v| !v.trim().is_empty())
+            {
+                Some(v) => serde_json::from_str(&v).map_err(|_| format!("{VAR} is not JSON"))?,
+                None => serde_json::json!({}),
+            };
+            let obj = config
+                .as_object_mut()
+                .ok_or(format!("{VAR} is not a JSON object"))?;
+            let list = obj
+                .entry("instructions")
+                .or_insert_with(|| serde_json::json!([]))
+                .as_array_mut()
+                .ok_or(format!("{VAR} has an `instructions` that is not a list"))?;
+            let path = serde_json::Value::from(brief.display().to_string());
+            if !list.contains(&path) {
+                list.push(path);
+            }
+            Ok(Some((VAR, config.to_string())))
+        }
+        _ => Ok(None),
+    }
+}
 
 /// The persistent managed block content for AGENTS.md.
 ///
@@ -2079,5 +2158,76 @@ mod tests {
 
         let raw = std::fs::read(&path).unwrap();
         assert_eq!(raw, vec![0xff, 0xfe, 0x00, 0xff], "file must be untouched");
+    }
+
+    /// #967: with the brief written, Copilot gets its instructions dir and
+    /// OpenCode an `instructions` entry, each added to what the child already
+    /// has; with no brief, neither; other agents never.
+    #[test]
+    fn delivery_env_per_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scratch = tmp.path();
+        let none = |_: &str| None;
+        for agent in [Agent::Copilot, Agent::OpenCode, Agent::Claude] {
+            assert_eq!(
+                delivery_env(agent, scratch, none),
+                Ok(None),
+                "brief off: {agent:?}"
+            );
+        }
+
+        let resolved = base_resolved();
+        let facts = BriefFacts::capture(&resolved, Agent::Copilot, home(), &[], false);
+        write_session_brief(scratch, &facts).unwrap();
+        let md = scratch.join(BRIEF_MD);
+        let copy = scratch.join(COPILOT_DIR).join(COPILOT_FILE);
+        assert_eq!(std::fs::read(&copy).unwrap(), std::fs::read(&md).unwrap());
+
+        let dir = scratch.join(COPILOT_DIR).display().to_string();
+        let (var, v) = delivery_env(Agent::Copilot, scratch, none)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (var, v.as_str()),
+            ("COPILOT_CUSTOM_INSTRUCTIONS_DIRS", dir.as_str())
+        );
+        let user = |_: &str| Some("/nav-pilot/instructions".to_string());
+        let (_, v) = delivery_env(Agent::Copilot, scratch, user)
+            .unwrap()
+            .unwrap();
+        assert_eq!(v, format!("/nav-pilot/instructions,{dir}"));
+
+        let (var, v) = delivery_env(Agent::OpenCode, scratch, none)
+            .unwrap()
+            .unwrap();
+        assert_eq!(var, "OPENCODE_CONFIG_CONTENT");
+        let v: serde_json::Value = serde_json::from_str(&v).unwrap();
+        assert_eq!(
+            v["instructions"],
+            serde_json::json!([md.display().to_string()])
+        );
+        let user = |_: &str| Some(r#"{"mcp":{"x":1},"instructions":["a.md"]}"#.to_string());
+        let (_, v) = delivery_env(Agent::OpenCode, scratch, user)
+            .unwrap()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&v).unwrap();
+        assert_eq!(v["mcp"]["x"], 1);
+        assert_eq!(
+            v["instructions"],
+            serde_json::json!(["a.md", md.display().to_string()])
+        );
+        let blank = |_: &str| Some("  ".to_string());
+        let (_, v) = delivery_env(Agent::OpenCode, scratch, blank)
+            .unwrap()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&v).unwrap();
+        assert_eq!(
+            v["instructions"],
+            serde_json::json!([md.display().to_string()])
+        );
+        let bad = |_: &str| Some("[1]".to_string());
+        assert!(delivery_env(Agent::OpenCode, scratch, bad).is_err());
+
+        assert_eq!(delivery_env(Agent::Claude, scratch, none), Ok(None));
     }
 }

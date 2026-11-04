@@ -139,6 +139,35 @@ fn apply_session_env(
     );
 }
 
+/// Point the agent's own instruction channel at the session brief (#967),
+/// after the session env so it extends whatever value the child would get.
+fn apply_brief_delivery(
+    cmd: &mut Command,
+    sandbox: &super::PreparedSandbox,
+    deny_env: &[String],
+    inherit_env: bool,
+) {
+    let Some(scratch) = sandbox.scratch_dir.as_deref() else {
+        return;
+    };
+    let current = |k: &str| match cmd.get_envs().find(|(n, _)| *n == k) {
+        Some((_, v)) => v.and_then(|v| v.to_str()).map(String::from),
+        None => inherit_env.then(|| std::env::var(k).ok()).flatten(),
+    };
+    match crate::brief::delivery_env(sandbox.agent, scratch, current) {
+        Ok(Some((var, _))) if deny_env.iter().any(|d| d == var) => crate::ui::warn(&format!(
+            "deny.env names {var}: the agent is not pointed at the sandbox brief ($CPLT_BRIEF)."
+        )),
+        Ok(Some((var, value))) => {
+            cmd.env(var, value);
+        }
+        Ok(None) => {}
+        Err(e) => crate::ui::warn(&format!(
+            "{e}: the agent is not pointed at the sandbox brief ($CPLT_BRIEF)."
+        )),
+    }
+}
+
 /// Configure environment, proxy, and common args on a sandboxed Command.
 ///
 /// Both macOS (Seatbelt) and Linux (Landlock) paths call this to apply the
@@ -1613,6 +1642,7 @@ pub fn exec(
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
     apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
+    apply_brief_delivery(&mut cmd, sandbox, deny_env, inherit_env);
     apply_pnpm_store(&mut cmd, sandbox, launch_dir);
     apply_puppeteer_cache(&mut cmd, sandbox, launch_dir, extra_pass_env);
     // Last env step: no real GitHub token may be set after it (#820).
@@ -1762,6 +1792,7 @@ pub fn exec(
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
     apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
+    apply_brief_delivery(&mut cmd, sandbox, deny_env, inherit_env);
     apply_pnpm_store(&mut cmd, sandbox, launch_dir);
     apply_puppeteer_cache(&mut cmd, sandbox, launch_dir, extra_pass_env);
     // Last env step: no real GitHub token may be set after it (#820).
@@ -2004,6 +2035,7 @@ fn exec_bwrap(
     );
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
     apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
+    apply_brief_delivery(&mut cmd, sandbox, deny_env, inherit_env);
     apply_pnpm_store(&mut cmd, sandbox, launch_dir);
     apply_puppeteer_cache(&mut cmd, sandbox, launch_dir, extra_pass_env);
     // Last env step: no real GitHub token may be set after it (#820).
