@@ -1584,6 +1584,11 @@ fn git_gate_worktree_add_into_managed_root_only() {
     assert!(!run(&["worktree", "add", "wt-root/../x"], true), "dotdot");
     assert!(!run(&["worktree", "add", "x"], true), "project tree");
     assert!(
+        !run(&["worktree", "--", "add", "x"], true),
+        "separator before add"
+    );
+    assert!(run(&["worktree", "--", "add", "wt-root/c"], true));
+    assert!(
         !run(&["worktree", "add", "--bogus", "wt-root/a"], true),
         "unknown option"
     );

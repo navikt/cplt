@@ -4108,8 +4108,16 @@ pub fn gate_git(
 
 /// `git [globals] worktree add ...`.
 fn is_worktree_add(args: &[&str]) -> bool {
-    git_subcommand_index(args)
-        .is_some_and(|i| args.get(i) == Some(&"worktree") && args.get(i + 1) == Some(&"add"))
+    worktree_add_index(args).is_some()
+}
+
+/// Index of `add` in `git [globals] worktree [-- or options] add ...`.
+/// Anything dash-led between `worktree` and the verb is skipped, so
+/// `git worktree -- add` can't slip past (git versions differ on accepting it).
+fn worktree_add_index(args: &[&str]) -> Option<usize> {
+    let i = git_subcommand_index(args).filter(|&i| args[i] == "worktree")?;
+    let j = (i + 1..args.len()).find(|&j| !args[j].starts_with('-'))?;
+    (args[j] == "add").then_some(j)
 }
 
 /// Whether a `git worktree add` lands strictly inside `$CPLT_WORKTREE_ROOT`,
@@ -4144,7 +4152,10 @@ fn worktree_add_target_in_managed_root(args: &[&str], root: &str) -> bool {
             g += 1;
         }
     }
-    let mut rest = args[i + 2..].iter();
+    let Some(add) = worktree_add_index(args) else {
+        return false;
+    };
+    let mut rest = args[add + 1..].iter();
     let mut path = None;
     while let Some(a) = rest.next() {
         match *a {
@@ -6781,6 +6792,8 @@ mod tests {
             &["worktree", "add"],
             &["-C", "x", "worktree", "add", "y"],
             &["-c", "user.name=a", "worktree", "add", "y"],
+            &["worktree", "--", "add", "../wt", "main"],
+            &["-C", "x", "worktree", "--", "add", "y"],
         ] {
             let err = gate(args).expect_err(&format!("{args:?} must be refused"));
             assert!(err.guidance.contains("cplt worktree add"), "{err:?}");
