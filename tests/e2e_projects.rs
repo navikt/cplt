@@ -1806,7 +1806,8 @@ else
     echo "RESULT:git_rebase:FAIL"
 fi
 
-# Destination must be inside the project dir — nothing outside it is writable.
+# The git guard refuses a worktree in the project tree (#962); only
+# $CPLT_WORKTREE_ROOT is accepted, covered by the managed-root tests.
 if git worktree add -q -b wtbranch "{project_path}/wt" >/dev/null 2>&1; then
     echo "RESULT:git_worktree_add:OK"
 else
@@ -2184,12 +2185,12 @@ if git reflog >/dev/null 2>&1; then echo "RESULT:git_reflog:OK"; else echo "RESU
             "git_checkout",
             "git_stash",
             "git_rebase",
-            "git_worktree_add",
             "git_gc",
             "git_reflog",
         ] {
             assert_result_ok(&stdout, &stderr, op);
         }
+        assert_result_fail(&stdout, "git_worktree_add");
     }
 
     /// The persistence denies must reach the gitdirs nested inside `.git`.

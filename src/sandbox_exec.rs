@@ -422,6 +422,7 @@ fn configure_command(
             git_guard,
             quiet,
             pnpm_shadow_dir,
+            worktree_root,
         );
         if gh_guard.enabled && scratch.join("bin").join("gh").is_file() {
             route_github_credentials_through_gh_guard(cmd, inherit_env);
@@ -733,6 +734,7 @@ fn install_command_wrappers(
     git_guard: &crate::config::GitGuardPolicy,
     quiet: bool,
     pnpm_shadow_dir: Option<&Path>,
+    worktree_root: Option<&Path>,
 ) {
     use std::os::unix::fs::PermissionsExt;
 
@@ -925,8 +927,12 @@ fn install_command_wrappers(
         // A missing symref is asked of the remote only when the policy needs
         // the default branch (check.rs `for_launch` decides the same way).
         let ask_remote = git_guard.enabled && git_guard.protect_default_branch_only;
-        let (repo_facts, has_remotes) =
+        let (mut repo_facts, has_remotes) =
             crate::gh_proxy::session_repo_facts(project_dir, repo_dirs, ask_remote);
+        // Baked, not read from the agent's env, which it can rewrite (#962).
+        if let Some(root) = worktree_root {
+            repo_facts.worktree_root = root.to_string_lossy().into_owned();
+        }
         // Two conditions narrow this to the case the operator can act on.
         // `!quiet`, because `cplt exec` defaults to quiet and its stderr must
         // stay clean for pipes (`e2e_exec_no_output_contamination`) — the same

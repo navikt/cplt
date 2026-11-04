@@ -3177,10 +3177,18 @@ const SENSITIVE_CONFIG_PREFIXES: &[&str] = &[
 /// Scans the space-separated form (`-c k=v`, `--config-env k=ENV`), the attached
 /// short form (`-ck=v`), and the `=`-attached long form (`--config-env=k=ENV`).
 fn injected_sensitive_config_key(args: &[&str]) -> Option<(&'static str, String)> {
+    injected_config_key(args, SENSITIVE_CONFIG_PREFIXES)
+}
+
+fn env_injected_sensitive_config_key(vars: &[(String, String)]) -> Option<String> {
+    env_injected_config_key(vars, SENSITIVE_CONFIG_PREFIXES)
+}
+
+fn injected_config_key(args: &[&str], prefixes: &[&str]) -> Option<(&'static str, String)> {
     let sensitive = |kv: &str| -> Option<String> {
         let key = kv.split('=').next().unwrap_or(kv);
         let lower = key.to_ascii_lowercase();
-        SENSITIVE_CONFIG_PREFIXES
+        prefixes
             .iter()
             .any(|p| lower.starts_with(p))
             .then(|| key.to_string())
@@ -3242,10 +3250,10 @@ fn injected_sensitive_config_key(args: &[&str]) -> Option<(&'static str, String)
 /// single-quoted-and-escaped, and a parser that disagrees with git's about an
 /// exotic spelling would be a bypass. Every `=`-bearing token is treated as a
 /// key, so a quoting trick can only ever produce *more* matches, never fewer.
-fn env_injected_sensitive_config_key(vars: &[(String, String)]) -> Option<String> {
+fn env_injected_config_key(vars: &[(String, String)], prefixes: &[&str]) -> Option<String> {
     let sensitive = |key: &str| -> Option<String> {
         let lower = key.trim_matches(['\'', '"', ' ']).to_ascii_lowercase();
-        SENSITIVE_CONFIG_PREFIXES
+        prefixes
             .iter()
             .any(|p| lower.starts_with(p))
             .then_some(lower)
@@ -3548,6 +3556,52 @@ pub fn gate_git(
     real_git: Option<&Path>,
     repo_facts: &RepoFacts,
 ) -> Result<(), Refusal> {
+    // Refused before git runs, whatever the push settings (#962): inside the
+    // sandbox `git worktree add` either stops halfway on a protected file
+    // (`.cplt.toml`, `.github/hooks`), leaving a partial directory, or lands in
+    // the session scratch dir, which is deleted at exit with any uncommitted work.
+    if is_worktree_add(args)
+        && !worktree_add_target_in_managed_root(args, &repo_facts.worktree_root)
+    {
+        let hint = if std::env::var_os(crate::worktree_broker::SOCKET_ENV).is_some() {
+            "Use `cplt worktree add <name> <ref>`, or `git worktree add \"$CPLT_WORKTREE_ROOT/<name>\"`."
+        } else if cfg!(target_os = "macos") {
+            "Prepare worktrees outside cplt (the managed `cplt worktree add` is not enabled for this session)."
+        } else {
+            "Prepare worktrees outside cplt (the managed `cplt worktree add` is macOS-only)."
+        };
+        return Err(Refusal {
+            headline: "'git worktree add' is not allowed in this environment.".to_string(),
+            guidance: format!(
+                "Plain `git worktree add` can't check out protected files in the sandbox, and work in the session scratch dir is deleted at exit. {hint}"
+            ),
+            agent_note: &[NOTE],
+        });
+    }
+
+    // An alias defined for one command expands inside git after this guard has
+    // decided, so `git -c alias.w='worktree add' w ../x` would skip the check
+    // above. Refused whatever the push settings; with push prevention on, the
+    // block below refuses it along with the other sensitive keys.
+    let alias = |k: &str| k.to_ascii_lowercase().starts_with("alias.");
+    let globals = &args[..git_subcommand_index(args).unwrap_or(args.len())];
+    if !prevent_push
+        && !prevent_force_push
+        && let Some(key) = injected_config_key(globals, &["alias."])
+            .map(|(_, k)| k)
+            .or_else(|| env_injected_config_key(&std::env::vars().collect::<Vec<_>>(), &["alias."]))
+            .filter(|k| alias(k))
+    {
+        return Err(Refusal {
+            headline: format!("Command-line alias '{key}' is not allowed in this environment."),
+            guidance:
+                "An alias set for one command expands inside git after the guard has decided.\n\
+                       Run the command it stands for directly."
+                    .to_string(),
+            agent_note: &[NOTE],
+        });
+    }
+
     // If push prevention is entirely disabled, allow everything
     if !prevent_push && !prevent_force_push {
         return Ok(());
@@ -4052,6 +4106,102 @@ pub fn gate_git(
     Ok(())
 }
 
+/// `git [globals] worktree add ...`.
+fn is_worktree_add(args: &[&str]) -> bool {
+    worktree_add_index(args).is_some()
+}
+
+/// Index of `add` in `git [globals] worktree [-- or options] add ...`.
+/// Anything dash-led between `worktree` and the verb is skipped, so
+/// `git worktree -- add` can't slip past (git versions differ on accepting it).
+fn worktree_add_index(args: &[&str]) -> Option<usize> {
+    let i = git_subcommand_index(args).filter(|&i| args[i] == "worktree")?;
+    let j = (i + 1..args.len()).find(|&j| !args[j].starts_with('-'))?;
+    (args[j] == "add").then_some(j)
+}
+
+/// Whether a `git worktree add` lands strictly inside `$CPLT_WORKTREE_ROOT`,
+/// which is writable, survives the session and has its links checked at exit.
+///
+/// Conservative: an unknown option, a `..` below the deepest existing ancestor,
+/// or anything that cannot be resolved counts as outside.
+fn worktree_add_target_in_managed_root(args: &[&str], root: &str) -> bool {
+    if root.is_empty() {
+        return false;
+    }
+    let Ok(root) = std::fs::canonicalize(root) else {
+        return false;
+    };
+    let Some(i) = git_subcommand_index(args) else {
+        return false;
+    };
+    let Ok(mut cwd) = std::env::current_dir() else {
+        return false;
+    };
+    let mut g = 0;
+    while g < i {
+        if args[g] == "-C" {
+            let Some(d) = args.get(g + 1) else {
+                return false;
+            };
+            cwd = cwd.join(d);
+            g += 2;
+        } else if crate::git::VALUE_TAKING_GLOBALS.contains(&args[g]) {
+            g += 2;
+        } else {
+            g += 1;
+        }
+    }
+    let Some(add) = worktree_add_index(args) else {
+        return false;
+    };
+    let mut rest = args[add + 1..].iter();
+    let mut path = None;
+    while let Some(a) = rest.next() {
+        match *a {
+            "-b" | "-B" | "--reason" => {
+                rest.next();
+            }
+            "-f" | "--force" | "--detach" | "-d" | "--checkout" | "--no-checkout" | "--lock"
+            | "-q" | "--quiet" | "--track" | "--no-track" | "--guess-remote"
+            | "--no-guess-remote" | "--orphan" => {}
+            "--" => {
+                path = rest.next();
+                break;
+            }
+            a if a.starts_with('-') => return false,
+            _ => {
+                path = Some(a);
+                break;
+            }
+        }
+    }
+    let Some(path) = path else { return false };
+    let target = cwd.join(path);
+    // The target need not exist: canonicalize the deepest existing ancestor
+    // and refuse `..` or `.` in what follows.
+    let mut base = target.as_path();
+    let mut tail = Vec::new();
+    let resolved = loop {
+        if let Ok(c) = std::fs::canonicalize(base) {
+            break c;
+        }
+        let (Some(parent), Some(name)) = (base.parent(), base.file_name()) else {
+            return false;
+        };
+        tail.push(name);
+        base = parent;
+    };
+    let mut full = resolved;
+    for name in tail.iter().rev() {
+        if *name == ".." || *name == "." {
+            return false;
+        }
+        full.push(name);
+    }
+    full.starts_with(&root) && full != root
+}
+
 /// Branch names protected under `protect_default_branch_only` regardless of what
 /// the repository's real default branch turns out to be.
 ///
@@ -4545,6 +4695,11 @@ pub struct RepoFacts {
     /// level by construction.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub named: Vec<RepoFacts>,
+    /// The session's managed worktree root (`$CPLT_WORKTREE_ROOT`), the only
+    /// place `git worktree add` may target (#962). Baked into the wrapper:
+    /// the agent can set the env var to anything.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub worktree_root: String,
 }
 
 impl RepoFacts {
@@ -5275,6 +5430,7 @@ pub fn generate_git_wrapper_script(
     // repository with no recorded `refs/remotes/*/HEAD` still has one.
     let repo_facts_flag = if repo_facts.default_branches.is_empty()
         && repo_facts.named.is_empty()
+        && repo_facts.worktree_root.is_empty()
         && repo_facts.git_common_dir.is_empty()
     {
         String::new()
@@ -6627,6 +6783,30 @@ mod tests {
     }
 
     // ── git gate tests ──
+
+    #[test]
+    fn git_worktree_add_is_refused() {
+        let gate = |a: &[&str]| gate_git(a, false, false, false, &[], None, &RepoFacts::default());
+        for args in [
+            &["worktree", "add", "../x", "main"][..],
+            &["worktree", "add"],
+            &["-C", "x", "worktree", "add", "y"],
+            &["-c", "user.name=a", "worktree", "add", "y"],
+            &["worktree", "--", "add", "../wt", "main"],
+            &["-C", "x", "worktree", "--", "add", "y"],
+        ] {
+            let err = gate(args).expect_err(&format!("{args:?} must be refused"));
+            assert!(err.guidance.contains("cplt worktree add"), "{err:?}");
+        }
+        for args in [
+            &["worktree", "list"][..],
+            &["worktree", "prune"],
+            &["worktree", "remove", "x"],
+            &["add", "worktree"],
+        ] {
+            assert!(gate(args).is_ok(), "{args:?} must be allowed");
+        }
+    }
 
     #[test]
     fn git_push_is_blocked() {
@@ -8633,7 +8813,7 @@ mod tests {
             )
             .is_err()
         );
-        // Not blocked when push prevention is disabled
+        // Still refused with push prevention off: it could hide `worktree add` (#962).
         assert!(
             gate_git(
                 &["-c", "alias.p=push", "p"],
@@ -8644,7 +8824,7 @@ mod tests {
                 None,
                 &RepoFacts::default()
             )
-            .is_ok()
+            .is_err()
         );
     }
 
