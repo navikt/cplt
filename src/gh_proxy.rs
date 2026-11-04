@@ -3548,6 +3548,27 @@ pub fn gate_git(
     real_git: Option<&Path>,
     repo_facts: &RepoFacts,
 ) -> Result<(), Refusal> {
+    // Refused before git runs, whatever the push settings (#962): inside the
+    // sandbox `git worktree add` either stops halfway on a protected file
+    // (`.cplt.toml`, `.github/hooks`), leaving a partial directory, or lands in
+    // the session scratch dir, which is deleted at exit with any uncommitted work.
+    if is_worktree_add(args) {
+        let hint = if std::env::var_os(crate::worktree_broker::SOCKET_ENV).is_some() {
+            "Use `cplt worktree add <name> <ref>` instead."
+        } else if cfg!(target_os = "macos") {
+            "Prepare worktrees outside cplt (the managed `cplt worktree add` is not enabled for this session)."
+        } else {
+            "Prepare worktrees outside cplt (the managed `cplt worktree add` is macOS-only)."
+        };
+        return Err(Refusal {
+            headline: "'git worktree add' is not allowed in this environment.".to_string(),
+            guidance: format!(
+                "Plain `git worktree add` can't check out protected files in the sandbox, and work in the session scratch dir is deleted at exit. {hint}"
+            ),
+            agent_note: &[NOTE],
+        });
+    }
+
     // If push prevention is entirely disabled, allow everything
     if !prevent_push && !prevent_force_push {
         return Ok(());
@@ -4050,6 +4071,12 @@ pub fn gate_git(
     }
 
     Ok(())
+}
+
+/// `git [globals] worktree add ...`.
+fn is_worktree_add(args: &[&str]) -> bool {
+    git_subcommand_index(args)
+        .is_some_and(|i| args.get(i) == Some(&"worktree") && args.get(i + 1) == Some(&"add"))
 }
 
 /// Branch names protected under `protect_default_branch_only` regardless of what
@@ -6627,6 +6654,28 @@ mod tests {
     }
 
     // ── git gate tests ──
+
+    #[test]
+    fn git_worktree_add_is_refused() {
+        let gate = |a: &[&str]| gate_git(a, false, false, false, &[], None, &RepoFacts::default());
+        for args in [
+            &["worktree", "add", "../x", "main"][..],
+            &["worktree", "add"],
+            &["-C", "x", "worktree", "add", "y"],
+            &["-c", "user.name=a", "worktree", "add", "y"],
+        ] {
+            let err = gate(args).expect_err(&format!("{args:?} must be refused"));
+            assert!(err.guidance.contains("cplt worktree add"), "{err:?}");
+        }
+        for args in [
+            &["worktree", "list"][..],
+            &["worktree", "prune"],
+            &["worktree", "remove", "x"],
+            &["add", "worktree"],
+        ] {
+            assert!(gate(args).is_ok(), "{args:?} must be allowed");
+        }
+    }
 
     #[test]
     fn git_push_is_blocked() {

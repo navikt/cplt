@@ -1538,6 +1538,17 @@ fn gh_gate_refuses_git_suffix_as_other_repo() {
 // ============================================================
 
 #[test]
+fn git_gate_refuses_worktree_add_and_warn_mode_passes() {
+    let (_, stderr, ok) = git_gate(&["-C", ".", "worktree", "add", "../wt", "main"], true, true);
+    assert!(!ok, "git worktree add should be refused");
+    assert!(stderr.contains("cplt worktree add"), "{stderr}");
+    let (_, _, ok) = git_gate_with_mode(&["worktree", "add", "../wt"], true, true, "warn");
+    assert!(ok, "warn mode should pass git worktree add through");
+    let (_, _, ok) = git_gate(&["worktree", "list"], true, true);
+    assert!(ok, "git worktree list should be allowed");
+}
+
+#[test]
 fn git_gate_allows_status() {
     let (_, _, ok) = git_gate(&["status"], true, true);
     assert!(ok, "git status should always be allowed");

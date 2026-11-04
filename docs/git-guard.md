@@ -266,6 +266,14 @@ remote-read subcommands: `status`, `log`, `show`, `diff`, `blame`, `bisect`,
 plumbing (`cat-file`, `rev-parse`, `ls-files`, `pack-objects`, `gc`, and so on).
 `src/gh_proxy.rs` holds the full list.
 
+**`git worktree add` is refused**, whatever the push settings. In the sandbox
+it either stops halfway on a protected file (`.cplt.toml`, `.github/hooks`) or
+lands in the session scratch dir, which is deleted at exit. Use
+`cplt worktree add <name> <ref>` when `CPLT_WORKTREE_SOCKET` is set (macOS,
+managed worktrees enabled); otherwise prepare worktrees outside cplt. Other
+`git worktree` subcommands (`list`, `prune`, `remove`, ...) are allowed. Warn
+mode prints the refusal and runs the command.
+
 **Default-deny while push prevention is active.** An unrecognized subcommand is
 blocked, not passed through, whenever `prevent_push` is on. An agent can define
 an alias that resolves to a blocked subcommand, and git expands aliases inside
