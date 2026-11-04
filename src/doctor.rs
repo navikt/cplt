@@ -23,6 +23,8 @@ pub enum Level {
     Blocking,
     /// Something will fail mid-session, or a protection is silently off.
     Warning,
+    /// A suggestion: nothing fails and no protection is off.
+    Info,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +48,15 @@ impl Finding {
     pub fn warning(message: impl Into<String>, fix: Option<String>) -> Self {
         Self {
             level: Level::Warning,
+            message: message.into(),
+            fix,
+        }
+    }
+
+    #[must_use]
+    pub fn info(message: impl Into<String>, fix: Option<String>) -> Self {
+        Self {
+            level: Level::Info,
             message: message.into(),
             fix,
         }
@@ -1037,12 +1048,16 @@ pub fn render(findings: &[Finding], ok: &[String], verbose_hint: bool, home: &Pa
         .iter()
         .filter(|f| f.level == Level::Blocking)
         .count();
-    let warnings = findings.len() - blocking;
+    let warnings = findings
+        .iter()
+        .filter(|f| f.level == Level::Warning)
+        .count();
 
     for f in findings {
         let (sym, color) = match f.level {
             Level::Blocking => ("✗", RED),
             Level::Warning => ("⚠", YELLOW),
+            Level::Info => ("ℹ", RESET),
         };
         let _ = writeln!(
             out,
@@ -1336,7 +1351,7 @@ pub fn mask_missing_deny_paths_nudge(
 #[must_use]
 pub fn brief_nudge(r: &crate::config::Resolved) -> Option<Finding> {
     (r.bool_layer("sandbox", "brief") == Some(crate::config::ConfigLayer::Baseline)).then(|| {
-        Finding::warning(
+        Finding::info(
             "The agent is not told what the sandbox allows, so it learns by hitting denials. \
              New configs write a per-session brief and load it into Copilot and OpenCode.",
             Some(
@@ -1450,7 +1465,13 @@ mod tests {
             !old.brief,
             "an existing config without the key keeps the brief off"
         );
-        assert!(brief_nudge(&old).is_some());
+        let nudge = brief_nudge(&old).expect("unset key is nudged");
+        assert_eq!(nudge.level, Level::Info);
+        let out = render(&[nudge], &[], false, Path::new("/h"));
+        assert!(
+            out.contains("No problems found"),
+            "info is not a warning: {out}"
+        );
         let new = r(&crate::config::default_config_contents());
         assert!(new.brief, "cplt config init turns the brief on");
         assert!(brief_nudge(&new).is_none());
