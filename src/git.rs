@@ -551,6 +551,9 @@ const CONTENT_FREE_SUBCOMMANDS: &[&str] = &[
     "remote",
     "ls-remote",
     "symbolic-ref",
+    "show-ref",
+    "check-ref-format",
+    "update-ref",
 ];
 
 /// Inherited environment variables that would undo [`CONFIG_OVERRIDES`] or
