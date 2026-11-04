@@ -1165,3 +1165,21 @@ fn a_failed_dash_b_request_leaves_no_branch() {
     assert!(fx.add_b("wt2", "no-such-ref", "early").is_err());
     assert!(!fx.has_branch("early"));
 }
+
+#[test]
+fn ambiguity_does_not_depend_on_git_warnings_and_full_names_resolve() {
+    let fx = Fixture::new(&tracked_files());
+    assert!(common::git_ok(fx.project.path(), &["branch", "dup"]));
+    assert!(common::git_ok(fx.project.path(), &["tag", "dup"]));
+    // A localized or silenced warning must not turn this into a detached tag.
+    assert!(common::git_ok(
+        fx.project.path(),
+        &["config", "core.warnAmbiguousRefs", "false"]
+    ));
+    let err = fx.add("wt1", "dup").expect_err("ambiguous");
+    assert!(err.contains("ambiguous"), "{err}");
+    let wt = PathBuf::from(fx.add("wt2", "refs/heads/dup").expect("full name"));
+    assert_eq!(head_branch(&wt), "refs/heads/dup");
+    let wt = PathBuf::from(fx.add("wt3", "refs/tags/dup").expect("tag"));
+    assert_eq!(head_branch(&wt), "", "a tag is detached");
+}

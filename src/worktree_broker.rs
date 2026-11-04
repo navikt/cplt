@@ -579,21 +579,31 @@ fn local_branch(
     reference: &str,
     budget: &Budget<'_>,
 ) -> Result<Option<String>, String> {
-    let out = run_bounded(
-        common_command(ctx, &["rev-parse", "--symbolic-full-name", reference])?,
-        budget,
-    )?;
-    if String::from_utf8_lossy(&out.stderr).contains("ambiguous") {
-        return Err(format!(
-            "ref {:?} is ambiguous; name it in full, such as refs/tags/{0} or a commit id",
-            truncate(reference, 64)
-        ));
+    // Ref existence, not git's localized ambiguity warning, decides.
+    let exists = |full: &str| -> Result<bool, String> {
+        let out = run_bounded(
+            common_command(ctx, &["show-ref", "--verify", "--quiet", full])?,
+            budget,
+        )?;
+        match out.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err("cannot check the repository's refs".into()),
+        }
+    };
+    if let Some(branch) = reference.strip_prefix("refs/heads/") {
+        return Ok(exists(reference)?.then(|| branch.to_string()));
     }
-    let full = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    Ok(full
-        .strip_prefix("refs/heads/")
-        .filter(|b| reference == full || reference == *b)
-        .map(str::to_string))
+    let branch = exists(&format!("refs/heads/{reference}"))?;
+    let other = exists(&format!("refs/tags/{reference}"))? || exists(&format!("refs/{reference}"))?;
+    match (branch, other) {
+        (true, true) => Err(format!(
+            "ref {:?} is ambiguous; name it in full, such as refs/heads/{0} or refs/tags/{0}",
+            truncate(reference, 64)
+        )),
+        (true, false) => Ok(Some(reference.to_string())),
+        _ => Ok(None),
+    }
 }
 
 /// Git's rule: one branch is checked out in at most one worktree.
