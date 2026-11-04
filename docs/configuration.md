@@ -502,12 +502,18 @@ cplt config set --local sandbox.allow_git_worktrees true   # this checkout only
 Inside the sandbox, create a worktree with the managed command:
 
 ```bash
-cplt worktree add <name> <ref>                         # detached at <ref>; prints the path
-git -C "$CPLT_WORKTREE_ROOT/<name>" switch -c <branch>  # only if you want a branch
+cplt worktree add <name> <branch>                 # on an existing local branch; prints the path
+cplt worktree add <name> <ref> -b <new-branch>    # on a new branch created at <ref>
+cplt worktree add <name> <tag-or-commit>          # detached at <ref>
 ```
 
 `cplt worktree add` checks out `<ref>` (a branch, tag or commit in the local
-repository) with HEAD detached. The broker runs Git under the session's read
+repository). A local branch is checked out on that branch; like `git worktree
+add`, it refuses a branch that another worktree already has checked out. `-b`
+creates a new branch at `<ref>` and refuses a name that exists. A tag, commit or
+remote-tracking branch is checked out with HEAD detached, and an ambiguous name
+(a branch and a tag with the same name) is refused. A refused or failed request
+leaves no branch and no worktree behind. The broker runs Git under the session's read
 policy, checks the private checkout, and publishes it atomically. It:
 
 - never fetches from a remote and never runs a hook, a filter driver or a

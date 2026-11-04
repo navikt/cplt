@@ -83,7 +83,25 @@ impl Fixture {
     }
 
     fn add(&self, name: &str, reference: &str) -> Result<String, String> {
-        with_home(self.home.path(), || add(&self.ctx(), name, reference))
+        with_home(self.home.path(), || add(&self.ctx(), name, reference, None))
+    }
+
+    fn add_b(&self, name: &str, reference: &str, branch: &str) -> Result<String, String> {
+        with_home(self.home.path(), || {
+            add(&self.ctx(), name, reference, Some(branch))
+        })
+    }
+
+    fn has_branch(&self, branch: &str) -> bool {
+        common::git_ok(
+            self.project.path(),
+            &[
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ],
+        )
     }
 
     fn base(&self) -> PathBuf {
@@ -186,7 +204,7 @@ fn filesystem_protected_aliases_are_refused_but_ordinary_unicode_is_allowed() {
         let ctx = with_home(fx.home.path(), || fx.ctx());
         write_files(fx.project.path(), &[(path, "payload\n")]);
         commit_all(fx.project.path());
-        let err = add(&ctx, "alias", "HEAD").unwrap_err();
+        let err = add(&ctx, "alias", "HEAD", None).unwrap_err();
         assert!(
             err.contains("protected filesystem name is an alias"),
             "{path}: {err}"
@@ -198,7 +216,7 @@ fn filesystem_protected_aliases_are_refused_but_ordinary_unicode_is_allowed() {
     let ctx = with_home(fx.home.path(), || fx.ctx());
     write_files(fx.project.path(), &[("blåbær/日本語.txt", "allowed\n")]);
     commit_all(fx.project.path());
-    add(&ctx, "unicode", "HEAD").unwrap();
+    add(&ctx, "unicode", "HEAD", None).unwrap();
     assert_eq!(
         std::fs::read_to_string(fx.root.join("unicode/blåbær/日本語.txt")).unwrap(),
         "allowed\n"
@@ -247,7 +265,7 @@ fn local_protected_config_and_ignored_dependencies_are_not_part_of_the_snapshot(
         ],
     );
     let ctx = with_home(fx.home.path(), || fx.ctx());
-    add(&ctx, "clean", "HEAD").unwrap();
+    add(&ctx, "clean", "HEAD", None).unwrap();
     assert!(!fx.root.join("clean/.claude/settings.local.json").exists());
     assert!(!fx.root.join("clean/node_modules").exists());
 }
@@ -312,7 +330,7 @@ fn protected_content_is_frozen_before_refs_can_move() {
         let ctx = with_home(fx.home.path(), || fx.ctx());
         write_files(fx.project.path(), &[(path, body)]);
         commit_all(fx.project.path());
-        let err = add(&ctx, "wt1", "HEAD").expect_err(label);
+        let err = add(&ctx, "wt1", "HEAD", None).expect_err(label);
         assert!(
             err.contains("protected config differs from launch HEAD"),
             "{label}: {err}"
@@ -335,7 +353,7 @@ fn deleting_or_changing_the_mode_of_protected_content_is_refused() {
         }
         commit_all(fx.project.path());
         assert!(
-            add(&ctx, "wt1", "HEAD")
+            add(&ctx, "wt1", "HEAD", None)
                 .unwrap_err()
                 .contains("protected config differs")
         );
@@ -348,7 +366,7 @@ fn ordinary_new_files_are_allowed_with_original_protected_content() {
     let ctx = with_home(fx.home.path(), || fx.ctx());
     write_files(fx.project.path(), &[("new.txt", "ordinary\n")]);
     commit_all(fx.project.path());
-    add(&ctx, "wt1", "HEAD").unwrap();
+    add(&ctx, "wt1", "HEAD", None).unwrap();
     for (path, body) in tracked_files()
         .into_iter()
         .chain([("new.txt", "ordinary\n")])
@@ -387,13 +405,13 @@ fn baseline_uses_the_linked_launch_head_not_the_common_head() {
         .output()
         .unwrap();
     let sha = String::from_utf8(head.stdout).unwrap();
-    add(&ctx, "linked", sha.trim()).unwrap();
+    add(&ctx, "linked", sha.trim(), None).unwrap();
     assert_eq!(
         std::fs::read_to_string(fx.root.join("linked/.cplt.toml")).unwrap(),
         "[deny]\npaths = []\n"
     );
     assert!(
-        add(&ctx, "common", "HEAD")
+        add(&ctx, "common", "HEAD", None)
             .unwrap_err()
             .contains("protected config differs")
     );
@@ -409,7 +427,7 @@ fn symlink_ancestors_of_protected_paths_fail_closed() {
         symlink("safe", target).unwrap();
         commit_all(fx.project.path());
         assert!(
-            add(&ctx, "wt1", "HEAD")
+            add(&ctx, "wt1", "HEAD", None)
                 .unwrap_err()
                 .contains("protected config must be a regular tracked file")
         );
@@ -428,7 +446,7 @@ fn attributes_cannot_transform_unchanged_protected_blobs() {
         &[(".gitattributes", ".github/hooks/pre.sh ident\n")],
     );
     commit_all(fx.project.path());
-    let err = add(&ctx, "wt1", "HEAD").unwrap_err();
+    let err = add(&ctx, "wt1", "HEAD", None).unwrap_err();
     assert!(
         err.contains("protected checkout bytes differ from launch HEAD"),
         "{err}"
@@ -700,7 +718,7 @@ fn an_unknown_ref_creates_nothing() {
 fn requests_fail_closed_until_the_session_read_policy_is_installed() {
     let fx = Fixture::new(&tracked_files());
     let ctx = Context::new(fx.project.path(), &fx.common, &fx.root).unwrap();
-    let err = add(&ctx, "wt1", "HEAD").unwrap_err();
+    let err = add(&ctx, "wt1", "HEAD", None).unwrap_err();
     assert!(
         err.contains("session read policy is not installed"),
         "{err}"
@@ -780,7 +798,7 @@ fn replaced_launch_commondir_cannot_select_a_fake_filter_repository() {
         format!("{}\n", fake.path().join(".git").display()),
     )
     .unwrap();
-    with_home(fx.home.path(), || add(&ctx, "wt1", "HEAD")).expect("pinned common repository");
+    with_home(fx.home.path(), || add(&ctx, "wt1", "HEAD", None)).expect("pinned common repository");
     assert_eq!(
         std::fs::read_to_string(fx.root.join("wt1/src/a.txt")).unwrap(),
         "alpha\n"
@@ -828,7 +846,7 @@ fn common_filter_added_after_preflight_never_executes() {
                 std::thread::sleep(Duration::from_millis(1));
             }
         });
-        let result = add(&fx.ctx(), "wt1", "HEAD");
+        let result = add(&fx.ctx(), "wt1", "HEAD", None);
         writer.join().unwrap();
         result
     });
@@ -862,7 +880,7 @@ fn a_symlink_or_fifo_worktrees_namespace_is_never_followed() {
         // other tests can hold it for longer than the bound (#827).
         let (result, elapsed) = with_home(fx.home.path(), || {
             let started = Instant::now();
-            (add(&fx.ctx(), "wt1", "HEAD"), started.elapsed())
+            (add(&fx.ctx(), "wt1", "HEAD", None), started.elapsed())
         });
         assert!(result.is_err());
         assert!(elapsed < Duration::from_secs(5), "add took {elapsed:?}");
@@ -1062,4 +1080,88 @@ fn send(socket: &Path, line: &[u8]) -> String {
     let mut reply = String::new();
     BufReader::new(&stream).read_line(&mut reply).unwrap();
     reply
+}
+
+fn head_branch(wt: &Path) -> String {
+    let out = common::git_cmd(wt)
+        .args(["symbolic-ref", "--quiet", "HEAD"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
+fn an_existing_local_branch_is_checked_out_not_detached() {
+    let fx = Fixture::new(&tracked_files());
+    assert!(common::git_ok(fx.project.path(), &["branch", "feature"]));
+    let wt = PathBuf::from(fx.add("wt1", "feature").expect("add"));
+    assert_eq!(head_branch(&wt), "refs/heads/feature");
+    let status = common::git_cmd(&wt)
+        .args(["status", "--porcelain"])
+        .output()
+        .unwrap();
+    assert!(status.stdout.is_empty(), "clean checkout: {status:?}");
+}
+
+#[test]
+fn a_branch_checked_out_elsewhere_is_refused() {
+    let fx = Fixture::new(&tracked_files());
+    let current = head_branch(fx.project.path());
+    let branch = current.strip_prefix("refs/heads/").unwrap();
+    let err = fx.add("wt1", branch).expect_err("busy branch");
+    assert!(err.contains("already checked out"), "{err}");
+    assert!(fx.admin_entries().is_empty());
+    assert!(!fx.root.join("wt1").exists());
+}
+
+#[test]
+fn an_ambiguous_branch_and_tag_name_is_refused() {
+    let fx = Fixture::new(&tracked_files());
+    assert!(common::git_ok(fx.project.path(), &["branch", "dup"]));
+    assert!(common::git_ok(fx.project.path(), &["tag", "dup"]));
+    let err = fx.add("wt1", "dup").expect_err("ambiguous");
+    assert!(err.contains("ambiguous"), "{err}");
+    assert!(fx.admin_entries().is_empty());
+}
+
+#[test]
+fn dash_b_creates_a_new_branch_at_the_ref() {
+    let fx = Fixture::new(&tracked_files());
+    let wt = PathBuf::from(fx.add_b("wt1", "HEAD", "topic/new").expect("add"));
+    assert_eq!(head_branch(&wt), "refs/heads/topic/new");
+    let head = |dir: &Path| {
+        let out = common::git_cmd(dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_eq!(head(&wt), head(fx.project.path()));
+}
+
+#[test]
+fn dash_b_refuses_an_existing_or_invalid_branch() {
+    let fx = Fixture::new(&tracked_files());
+    assert!(common::git_ok(fx.project.path(), &["branch", "taken"]));
+    let err = fx.add_b("wt1", "HEAD", "taken").expect_err("exists");
+    assert!(err.contains("already exists"), "{err}");
+    for bad in ["-x", "a..b", "a/.b", "a.lock", "a b", "HEAD@{1}"] {
+        assert!(fx.add_b("wt1", "HEAD", bad).is_err(), "{bad}");
+        assert!(!fx.has_branch(bad), "{bad}");
+    }
+    assert!(fx.admin_entries().is_empty());
+    assert!(!fx.root.join("wt1").exists());
+}
+
+#[test]
+fn a_failed_dash_b_request_leaves_no_branch() {
+    let fx = Fixture::new(&tracked_files());
+    // Publication fails after the branch is created: the name is taken.
+    std::fs::create_dir(fx.root.join("wt1")).unwrap();
+    assert!(fx.add_b("wt1", "HEAD", "late").is_err());
+    assert!(!fx.has_branch("late"), "the created branch is rolled back");
+    assert!(fx.admin_entries().is_empty());
+    // A refused request before checkout leaves none either.
+    assert!(fx.add_b("wt2", "no-such-ref", "early").is_err());
+    assert!(!fx.has_branch("early"));
 }

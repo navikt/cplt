@@ -922,11 +922,12 @@ QUICK START:
     /// Create a worktree through the managed-worktree broker (#531).
     ///
     /// Inside a cplt session with `sandbox.allow_git_worktrees` on,
-    /// `cplt worktree add <name> <ref>` creates a detached worktree under
-    /// `$CPLT_WORKTREE_ROOT` and prints its path. The parent makes the checkout
-    /// under the session read policy, with filters refused and hooks disabled, and publishes it
-    /// only once the tree is validated. A branch is a separate step:
-    /// `git -C <path> switch -c <branch>`.
+    /// `cplt worktree add <name> <ref> [-b <new-branch>]` creates a worktree
+    /// under `$CPLT_WORKTREE_ROOT` and prints its path. A local branch `<ref>`
+    /// is checked out; `-b` creates a new branch at `<ref>`; anything else is
+    /// checked out detached. The parent makes the checkout under the session
+    /// read policy, with filters refused and hooks disabled, and publishes it
+    /// only once the tree is validated.
     Worktree {
         #[command(subcommand)]
         action: WorktreeAction,
@@ -1338,12 +1339,18 @@ enum McpAction {
 
 #[derive(Subcommand)]
 enum WorktreeAction {
-    /// Create a detached worktree `<name>` at commit `<ref>`.
+    /// Create a worktree `<name>` at `<ref>`.
+    ///
+    /// A local branch is checked out on that branch, unless another worktree
+    /// has it. A tag or commit is checked out detached.
     Add {
         /// Directory name under `$CPLT_WORKTREE_ROOT`: letters, digits, `.`, `_`, `-`.
         name: String,
         /// Branch, tag or commit to check out.
         reference: String,
+        /// Create this new branch at `<ref>` and check it out. Refused if it exists.
+        #[arg(short = 'b', value_name = "NEW_BRANCH")]
+        branch: Option<String>,
     },
 }
 
@@ -4908,10 +4915,19 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     #[allow(clippy::collapsible_if)]
     if matches!(&cli.command, Some(Command::Worktree { .. })) {
         if let Some(Command::Worktree {
-            action: WorktreeAction::Add { name, reference },
+            action:
+                WorktreeAction::Add {
+                    name,
+                    reference,
+                    branch,
+                },
         }) = cli.command.take()
         {
-            return Ok(cplt::worktree_broker::run_client(&name, &reference));
+            return Ok(cplt::worktree_broker::run_client(
+                &name,
+                &reference,
+                branch.as_deref(),
+            ));
         }
     }
     // `mcp status` reads specs exactly as a launch from here would, so it

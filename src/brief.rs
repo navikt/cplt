@@ -322,9 +322,10 @@ pub fn generate_session_brief(facts: &BriefFacts) -> String {
              Worktrees for parallel work belong under `$CPLT_WORKTREE_ROOT` ({root}). \
              Only when `$CPLT_WORKTREE_SOCKET` is set, use \
              `cplt worktree add <name> <ref>`, which prints the path. Otherwise ask the user \
-             to prepare worktrees outside cplt. The broker checks out `<ref>` \
-             detached, from local refs only; for a branch run \
-             `git -C <path> switch -c <branch>`. Prefer `cplt worktree add` over plain \
+             to prepare worktrees outside cplt. The broker reads local refs only. A local \
+             branch `<ref>` is checked out on that branch, unless another worktree has it; \
+             `cplt worktree add <name> <ref> -b <new-branch>` creates a new branch at `<ref>`; \
+             a tag or commit is checked out detached. Prefer `cplt worktree add` over plain \
              `git worktree add`, which runs git directly without cplt's checks. You have read, \
              write and execute there, and not in other repositories' roots. It belongs to this repository \
              only. Worktrees and branches you create persist after the session; cplt never \

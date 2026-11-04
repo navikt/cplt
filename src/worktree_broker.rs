@@ -74,6 +74,9 @@ struct Request {
     name: String,
     #[serde(rename = "ref")]
     reference: String,
+    /// `-b`: a new branch to create at `ref` (#966).
+    #[serde(default)]
+    branch: Option<String>,
 }
 
 /// The reply: exactly one of `path` (on success) or `error`.
@@ -273,9 +276,15 @@ fn serve(listener: &UnixListener, ctx: &Context, stop: &AtomicBool) {
 fn handle(ctx: &Context, stream: UnixStream, stop: &AtomicBool) {
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-    let response = match read_request(&stream, stop)
-        .and_then(|r| add_with_budget(ctx, &r.name, &r.reference, &Budget::new(stop)))
-    {
+    let response = match read_request(&stream, stop).and_then(|r| {
+        add_with_budget(
+            ctx,
+            &r.name,
+            &r.reference,
+            r.branch.as_deref(),
+            &Budget::new(stop),
+        )
+    }) {
         Ok(path) => Response {
             ok: true,
             path: Some(path),
@@ -334,23 +343,42 @@ fn read_request(stream: &UnixStream, stop: &AtomicBool) -> Result<Request, Strin
     Ok(req)
 }
 
-/// Create the worktree `name` at commit `reference`, detached, in the root.
+/// Create the worktree `name` at commit `reference` in the root (#966): on
+/// `new_branch` when given (created at `reference`), on `reference` itself when
+/// it names a local branch, otherwise detached.
 ///
 /// Every step runs in order, and the first failure rolls back what this call
-/// created. Checkout never reads agent-controlled config or linked admin files.
-/// Shared admin writes are exclusive and descriptor-relative, never truncating.
-pub fn add(ctx: &Context, name: &str, reference: &str) -> Result<String, String> {
-    add_with_budget(ctx, name, reference, &Budget::new(&AtomicBool::new(false)))
+/// created, a new branch included. Checkout never reads agent-controlled config
+/// or linked admin files. Shared admin writes are exclusive and
+/// descriptor-relative, never truncating.
+pub fn add(
+    ctx: &Context,
+    name: &str,
+    reference: &str,
+    new_branch: Option<&str>,
+) -> Result<String, String> {
+    add_with_budget(
+        ctx,
+        name,
+        reference,
+        new_branch,
+        &Budget::new(&AtomicBool::new(false)),
+    )
 }
 
 fn add_with_budget(
     ctx: &Context,
     name: &str,
     reference: &str,
+    new_branch: Option<&str>,
     budget: &Budget<'_>,
 ) -> Result<String, String> {
     validate_name(name)?;
     validate_reference(reference)?;
+    if let Some(branch) = new_branch {
+        validate_reference(branch)
+            .map_err(|_| format!("invalid branch name {:?}", truncate(branch, 64)))?;
+    }
     ctx.read_policy
         .get()
         .ok_or("worktree broker session read policy is not installed")?;
@@ -359,6 +387,16 @@ fn add_with_budget(
     check_identity(&ctx.objects, &ctx.objects_fd)?;
     refuse_filters(ctx, budget)?;
     let sha = resolve_commit(ctx, reference, budget)?;
+    let branch = match new_branch {
+        Some(branch) => {
+            check_new_branch(ctx, branch, budget)?;
+            Some(branch.to_string())
+        }
+        None => local_branch(ctx, reference, budget)?,
+    };
+    if let Some(branch) = &branch {
+        refuse_busy_branch(ctx, branch, budget)?;
+    }
     let tree = protected_tree(
         run_bounded(
             common_command(ctx, &["ls-tree", "-r", "-z", "--full-tree", &sha])?,
@@ -387,9 +425,19 @@ fn add_with_budget(
     verify_protected_checkout(ctx, &private, &job.worktree, budget)?;
     check_identity(&ctx.common, &ctx.common_fd)?;
     budget.check()?;
+    // Created last before the admin entry, and deleted again on any failure
+    // below, so a refused request leaves no ref behind.
+    let created = match new_branch {
+        Some(branch) => Some(CreatedBranch::create(ctx, branch, &sha, budget)?),
+        None => None,
+    };
     job.admin = Some(Admin::create(ctx)?);
     let admin = job.admin.as_ref().unwrap();
-    admin.write("HEAD", format!("{sha}\n").as_bytes())?;
+    let head = match &branch {
+        Some(branch) => format!("ref: refs/heads/{branch}\n"),
+        None => format!("{sha}\n"),
+    };
+    admin.write("HEAD", head.as_bytes())?;
     admin.write("commondir", b"../..\n")?;
     admin.write(
         "gitdir",
@@ -438,12 +486,140 @@ fn add_with_budget(
     budget.check()?;
     publish(&staging, name, &ctx.root)?;
     job.published = true;
+    if let Some(created) = &created {
+        created.keep.set(true);
+    }
     Ok(job
         .final_git
         .parent()
         .unwrap_or(&ctx.root)
         .display()
         .to_string())
+}
+
+/// A branch this request created, deleted again unless the request publishes.
+struct CreatedBranch<'a> {
+    ctx: &'a Context,
+    full: String,
+    sha: String,
+    keep: std::cell::Cell<bool>,
+}
+
+impl<'a> CreatedBranch<'a> {
+    /// Create-only: an empty old value makes git refuse if the ref exists, so
+    /// a branch made since the earlier check is never moved.
+    fn create(
+        ctx: &'a Context,
+        branch: &str,
+        sha: &str,
+        budget: &Budget<'_>,
+    ) -> Result<Self, String> {
+        let full = format!("refs/heads/{branch}");
+        let out = run_bounded(
+            common_command(
+                ctx,
+                &["update-ref", "-m", "cplt worktree add", &full, sha, ""],
+            )?,
+            budget,
+        )?;
+        if !out.status.success() {
+            return Err(format!(
+                "cannot create branch {branch:?}: {}",
+                truncate(String::from_utf8_lossy(&out.stderr).trim(), 200)
+            ));
+        }
+        Ok(Self {
+            ctx,
+            full,
+            sha: sha.to_string(),
+            keep: std::cell::Cell::new(false),
+        })
+    }
+}
+
+impl Drop for CreatedBranch<'_> {
+    fn drop(&mut self) {
+        if self.keep.get() {
+            return;
+        }
+        // Deletes only while the ref still points where this request put it.
+        let stop = AtomicBool::new(false);
+        if let Ok(cmd) = common_command(self.ctx, &["update-ref", "-d", &self.full, &self.sha]) {
+            let _ = run_bounded(cmd, &Budget::new(&stop));
+        }
+    }
+}
+
+/// `branch` must be a valid branch name by git's rules and must not exist.
+fn check_new_branch(ctx: &Context, branch: &str, budget: &Budget<'_>) -> Result<(), String> {
+    let full = format!("refs/heads/{branch}");
+    let valid = run_bounded(common_command(ctx, &["check-ref-format", &full])?, budget)?;
+    if !valid.status.success() {
+        return Err(format!("invalid branch name {:?}", truncate(branch, 64)));
+    }
+    let exists = run_bounded(
+        common_command(ctx, &["show-ref", "--verify", "--quiet", &full])?,
+        budget,
+    )?;
+    match exists.status.code() {
+        Some(0) => Err(format!(
+            "branch {:?} already exists; pass it as <ref> without -b to check it out",
+            truncate(branch, 64)
+        )),
+        Some(1) => Ok(()),
+        _ => Err("cannot check whether the branch exists".into()),
+    }
+}
+
+/// The local branch `reference` names, or `None` for a tag, commit or remote
+/// branch, which are checked out detached. An ambiguous name is refused rather
+/// than guessed.
+fn local_branch(
+    ctx: &Context,
+    reference: &str,
+    budget: &Budget<'_>,
+) -> Result<Option<String>, String> {
+    let out = run_bounded(
+        common_command(ctx, &["rev-parse", "--symbolic-full-name", reference])?,
+        budget,
+    )?;
+    if String::from_utf8_lossy(&out.stderr).contains("ambiguous") {
+        return Err(format!(
+            "ref {:?} is ambiguous; name it in full, such as refs/tags/{0} or a commit id",
+            truncate(reference, 64)
+        ));
+    }
+    let full = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    Ok(full
+        .strip_prefix("refs/heads/")
+        .filter(|b| reference == full || reference == *b)
+        .map(str::to_string))
+}
+
+/// Git's rule: one branch is checked out in at most one worktree.
+fn refuse_busy_branch(ctx: &Context, branch: &str, budget: &Budget<'_>) -> Result<(), String> {
+    let out = run_bounded(
+        common_command(ctx, &["worktree", "list", "--porcelain"])?,
+        budget,
+    )?;
+    if !out.status.success() {
+        return Err("cannot list the repository's worktrees".into());
+    }
+    let wanted = format!("branch refs/heads/{branch}");
+    let mut path = "";
+    let listing = String::from_utf8_lossy(&out.stdout);
+    for line in listing.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            path = p;
+        } else if line == wanted {
+            return Err(format!(
+                "branch {:?} is already checked out at {}; use -b <new-branch> or another ref",
+                truncate(branch, 64),
+                truncate(path, 200)
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// What one request has created so far, and the cleanup owed if it fails.
@@ -1488,7 +1664,7 @@ fn truncate(s: &str, max: usize) -> String {
 /// The socket comes from [`SOCKET_ENV`], which the launcher sets after
 /// filtering the environment, so a value inherited from the parent cannot point
 /// the client elsewhere.
-pub fn run_client(name: &str, reference: &str) -> ExitCode {
+pub fn run_client(name: &str, reference: &str, branch: Option<&str>) -> ExitCode {
     let Some(socket) = std::env::var_os(SOCKET_ENV).filter(|s| !s.is_empty()) else {
         eprintln!(
             "cplt worktree: not available here. It needs a cplt session with \
@@ -1510,6 +1686,7 @@ pub fn run_client(name: &str, reference: &str) -> ExitCode {
         "op": "add",
         "name": name,
         "ref": reference,
+        "branch": branch,
     })) else {
         eprintln!("cplt worktree: cannot encode the request");
         return ExitCode::FAILURE;
