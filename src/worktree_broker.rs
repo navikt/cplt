@@ -389,6 +389,8 @@ fn add_with_budget(
     let sha = resolve_commit(ctx, reference, budget)?;
     let branch = match new_branch {
         Some(branch) => {
+            // Same ambiguity refusal as without -b: never branch from a guess.
+            local_branch(ctx, reference, budget)?;
             check_new_branch(ctx, branch, budget)?;
             Some(branch.to_string())
         }
@@ -515,6 +517,14 @@ impl<'a> CreatedBranch<'a> {
         budget: &Budget<'_>,
     ) -> Result<Self, String> {
         let full = format!("refs/heads/{branch}");
+        // The guard exists before git runs: a deadline or cancellation can
+        // end the wait after the ref is already written.
+        let guard = Self {
+            ctx,
+            full: full.clone(),
+            sha: sha.to_string(),
+            keep: std::cell::Cell::new(false),
+        };
         let out = run_bounded(
             common_command(
                 ctx,
@@ -523,17 +533,14 @@ impl<'a> CreatedBranch<'a> {
             budget,
         )?;
         if !out.status.success() {
+            // Git refused the create, so the ref, if any, is not ours to delete.
+            guard.keep.set(true);
             return Err(format!(
                 "cannot create branch {branch:?}: {}",
                 truncate(String::from_utf8_lossy(&out.stderr).trim(), 200)
             ));
         }
-        Ok(Self {
-            ctx,
-            full,
-            sha: sha.to_string(),
-            keep: std::cell::Cell::new(false),
-        })
+        Ok(guard)
     }
 }
 
@@ -606,26 +613,41 @@ fn local_branch(
     }
 }
 
-/// Git's rule: one branch is checked out in at most one worktree.
+/// Git's rule: a branch is busy while any worktree has it as HEAD or is
+/// rebasing or bisecting it (git's `find_shared_symref`).
+///
+/// Reads the admin files directly rather than running `git worktree list`:
+/// no subprocess, no content-filter probe, and the rebase and bisect states
+/// the porcelain listing does not show. The files are agent-writable, so each
+/// is read without following a symlink and with a size cap.
 fn refuse_busy_branch(ctx: &Context, branch: &str, budget: &Budget<'_>) -> Result<(), String> {
-    let out = run_bounded(
-        common_command(ctx, &["worktree", "list", "--porcelain"])?,
-        budget,
-    )?;
-    if !out.status.success() {
-        return Err("cannot list the repository's worktrees".into());
+    let full = format!("refs/heads/{branch}");
+    let mut admins = vec![ctx.common.clone()];
+    if let Ok(entries) = std::fs::read_dir(ctx.common.join("worktrees")) {
+        for entry in entries.flatten() {
+            admins.push(entry.path());
+        }
     }
-    let wanted = format!("branch refs/heads/{branch}");
-    let mut path = "";
-    let listing = String::from_utf8_lossy(&out.stdout);
-    for line in listing.lines() {
-        if let Some(p) = line.strip_prefix("worktree ") {
-            path = p;
-        } else if line == wanted {
+    for admin in admins {
+        budget.check()?;
+        let read = |rel: &str| {
+            crate::untrusted::read_untrusted(&admin.join(rel), 4096)
+                .ok()
+                .flatten()
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default()
+        };
+        let busy = read("HEAD").strip_prefix("ref: ") == Some(full.as_str())
+            || read("rebase-merge/head-name") == full
+            || read("rebase-apply/head-name") == full
+            || read("BISECT_START") == branch
+            || read("BISECT_START") == full;
+        if busy {
             return Err(format!(
-                "branch {:?} is already checked out at {}; use -b <new-branch> or another ref",
+                "branch {:?} is checked out, or being rebased or bisected, in another \
+                 worktree ({}); use -b <new-branch> or another ref",
                 truncate(branch, 64),
-                truncate(path, 200)
+                truncate(&admin.display().to_string(), 200)
             ));
         }
     }

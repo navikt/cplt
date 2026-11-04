@@ -1109,7 +1109,7 @@ fn a_branch_checked_out_elsewhere_is_refused() {
     let current = head_branch(fx.project.path());
     let branch = current.strip_prefix("refs/heads/").unwrap();
     let err = fx.add("wt1", branch).expect_err("busy branch");
-    assert!(err.contains("already checked out"), "{err}");
+    assert!(err.contains("is checked out"), "{err}");
     assert!(fx.admin_entries().is_empty());
     assert!(!fx.root.join("wt1").exists());
 }
@@ -1182,4 +1182,37 @@ fn ambiguity_does_not_depend_on_git_warnings_and_full_names_resolve() {
     assert_eq!(head_branch(&wt), "refs/heads/dup");
     let wt = PathBuf::from(fx.add("wt3", "refs/tags/dup").expect("tag"));
     assert_eq!(head_branch(&wt), "", "a tag is detached");
+}
+
+#[test]
+fn dash_b_from_an_ambiguous_ref_is_refused() {
+    let fx = Fixture::new(&tracked_files());
+    assert!(common::git_ok(fx.project.path(), &["branch", "dup"]));
+    assert!(common::git_ok(fx.project.path(), &["tag", "dup"]));
+    let err = fx
+        .add_b("wt1", "dup", "topic")
+        .expect_err("ambiguous source");
+    assert!(err.contains("ambiguous"), "{err}");
+    assert!(!fx.has_branch("topic"));
+}
+
+#[test]
+fn a_branch_being_rebased_or_bisected_elsewhere_is_refused() {
+    let fx = Fixture::new(&tracked_files());
+    assert!(common::git_ok(fx.project.path(), &["branch", "reb"]));
+    assert!(common::git_ok(fx.project.path(), &["branch", "bis"]));
+    let admin = fx.common.join("worktrees/other");
+    std::fs::create_dir_all(admin.join("rebase-merge")).unwrap();
+    std::fs::write(
+        admin.join("HEAD"),
+        "0000000000000000000000000000000000000000\n",
+    )
+    .unwrap();
+    std::fs::write(admin.join("rebase-merge/head-name"), "refs/heads/reb\n").unwrap();
+    std::fs::write(admin.join("BISECT_START"), "bis\n").unwrap();
+    for branch in ["reb", "bis"] {
+        let err = fx.add("wt1", branch).expect_err(branch);
+        assert!(err.contains("rebased or bisected"), "{err}");
+    }
+    assert!(!fx.root.join("wt1").exists());
 }
