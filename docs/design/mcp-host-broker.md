@@ -656,7 +656,7 @@ Not in phase 1 (D15). When a third server arrives:
 | 1b | Linux: bwrap bind for the socket; Secret Service; require bubblewrap's bus masks or warn about the D-Bus exposure | Linux e2e | Shipped (#838) |
 | 2 | GitHub on the shared model, when a third server arrives | #807 tests unchanged | Deferred (#909) |
 | 3 | Child sandbox: network and file profile | nais measured under it | Shipped: macOS (#862), Linux (#873) |
-| 4 | Figma OAuth in the broker | — | Planned (#910) |
+| 4 | OAuth in the broker: Nav gateway first, CIMD only (14.3, 14.8) | — | Planned (#910) |
 
 ## 12. Still open
 
@@ -777,32 +777,38 @@ different client. The fixed port is the login guard (owner decision 2026-11-02, 
 the 2026-10-31 terminal-code guard): the host broker binds `127.0.0.1:<P>`
 before the sandbox starts and holds it for the whole session, so an agent
 cannot listen on the only redirect the gateway accepts. If `<P>` is taken at
-start, cplt refuses OAuth remotes for that session with one line naming the
-port. A short code stays as UX text only: cplt prints it, the consent page
+start, that session's broker does not serve logins. Only login is refused or
+handed off (14.4); token use works in every session, since the token file is
+shared. The guard still holds: the holder is a cplt broker that bound `<P>`
+before any agent started. A short code stays as UX text only: cplt prints it, the consent page
 shows it, so the user can tell the login is theirs.
 
 ### 14.4 Login on the host
 
 `nav-pilot mcp enable <id>` asks first (D10), writes the spec, then runs
 `cplt mcp login <id>` on the host. With `--json` or no tty it only prints
-that command. Login never runs inside a session: `cplt mcp login` refuses
-when detected in a sandbox by something the agent cannot forge, not env
-(`CPLT_MCP_SOCKET`, `src/mcp_broker/mod.rs:29`, is no security boundary).
+that command. `cplt mcp login` is its own host process. It does not try to detect a
+sandbox: env (`CPLT_MCP_SOCKET`, `src/mcp_broker/mod.rs:29`) is no boundary,
+and the port guard (14.3) is what stops an agent-run login.
 
 1. Fetch the remote URL without a token; read `WWW-Authenticate`
    `resource_metadata`, else the well-known PRM path (RFC 9728).
 2. Fetch PRM. Its `resource` may be an origin per RFC 9728; accept equal or
-   a same-origin prefix of the spec URL. Its `authorization_servers` must
+   a same-origin prefix of the spec URL. Call this value `R`. Its `authorization_servers` must
    contain `oauth.issuer`. Fetch that issuer's metadata (RFC 8414, then
    OpenID discovery); its `issuer` must equal `oauth.issuer` byte for byte.
 3. Pick CIMD if the metadata says `client_id_metadata_document_supported`,
    else fail with one line naming the server. DCR at `registration_endpoint`
    comes after the pilot.
-4. Use the listener the broker already holds on `127.0.0.1:<P>`. The
+4. Who owns `127.0.0.1:<P>`: if the port is free, login binds it itself.
+   If a running broker holds it (the broker lives in the session process,
+   `src/main.rs:7332`), login hands the flow to that broker over its socket
+   and acts as a client; the broker runs steps 4-6 and stores the token. Any
+   other holder: login refuses with one line naming the port. The
    redirect path is exactly `/callback`, matching the CIMD document; the
    random segment is dropped (the gateway would reject it). macOS `ps` exposes
    the `open` URL (`(allow sysctl-read)`, `src/sandbox_profile.rs:1144`), but
-   `state` and PKCE keep that to login DoS. Build the request with PKCE S256, `state`, `resource=<spec URL>` (RFC 8707)
+   `state` and PKCE keep that to login DoS. Build the request with PKCE S256, `state`, `resource=R` (RFC 8707)
    and the spec's scopes, and open the browser (`open` on macOS, `xdg-open` on
    Linux) or print the URL.
 5. The listener accepts only the first `GET /callback` request matching
@@ -810,7 +816,7 @@ when detected in a sandbox by something the agent cannot forge, not env
    advertises it), ignores other requests, and closes immediately after match
    or timeout (5 minutes). PKCE keeps process snooping of the auth URL down to
    login DoS.
-6. Exchange the code with the verifier and `resource`. Store the result.
+6. Exchange the code with the verifier and `resource=R`. Store the result.
 
 Every request in 1-6 goes only to `egressHosts`, https, no redirects
 followed. Because `curl` re-resolves, the private-address claim would be false
@@ -822,7 +828,11 @@ without pinning (`egress.rs` `dial_public` filters then dials,
 
 Tokens live in a file under cplt's state dir (`cplt_state_dir`,
 `~/.config/cplt`, which the agent sandbox denies: `DENIED_DOTFILES`), mode
-0600, on both systems; the keyring dependency is no longer needed. Token and
+0600, on both systems, with no keyring dependency. That deny is not enough
+alone: a file grant inside a denied dotfile dir, or a Linux grant of `~`,
+opens it (`src/brief.rs:598-612`). cplt refuses the oauth remote, and never
+writes a token, when the session policy makes the token path readable or
+writable. This is like the `drop_writable` check for specs, but stricter. Token and
 lock file names (`oauth-<mapped_id>.json`, `oauth-<mapped_id>.lock`) use the
 same `__` id mapping as spec files (`src/mcp_broker/spec.rs:134`) and reject
 `..` segments. Storing tokens in the OS keychain or Secret Service, or
@@ -850,8 +860,9 @@ line, applies the same `on_client` and `on_server` checks
 it as a streamable-HTTP POST to the pinned URL with `Authorization: Bearer`
 and `MCP-Protocol-Version`, and turns JSON or SSE responses back into lines.
 Before sending a token, the broker only sends it to the spec's remote URL.
-A JWT access token whose `aud` does not match the remote URL is not sent
-(opaque tokens: rely on RFC 8707 at the AS, residual risk noted). The
+MCP treats tokens as opaque, so the `aud` check is optional: if the token is
+a JWT with an `aud` that is not `R`, it is not sent. Otherwise rely on RFC 8707
+at the AS (residual risk noted). The
 `Mcp-Session-Id` header is kept per connection. The HTTPS leg uses the
 GitHub proxy's pattern: system `curl` from the trusted dirs, token and
 request on stdin, `-q`, no redirects (`src/github_mcp.rs:16-19`). A
@@ -885,7 +896,7 @@ policy: act now):
 | Token theft on the host | Same as any keychain item the user owns. Tokens are bound by `resource` to one route (gateway); a stolen gateway token reaches one server |
 | Consent phishing with CIMD and a loopback redirect | Anyone can send a user an authorization link naming Nav's `client_id` with a loopback redirect, and the consent screen shows Nav's domain. The code only reaches a listener on the victim's machine, but a local process could race for the port. The MCP spec names this risk **(unverified wording)**. The gateway should show the client domain and requested route at consent; Figma's screen is outside Nav's control |
 | Upstream used to exfiltrate | The broker reaches only the spec's URL; `egressHosts` pins discovery. The agent's own allowlist is not changed |
-| Agent triggers a login | The agent can run the OAuth flow itself (sandbox allows loopback bind/inbound, `src/sandbox_profile.rs:3975-3976`; Linux shares host netns), using Nav's public CIMD `client_id` and its own loopback redirect, then ask the user to click a link. Env-based refusal (`CPLT_MCP_SOCKET`, `src/mcp_broker/mod.rs:29`) is no boundary. Owner decision 2026-11-02 (replaces the 2026-10-31 terminal-code guard): (a) the CIMD document lists only `http://127.0.0.1:<P>/callback`, and the host broker holds that port before the sandbox starts, so the agent cannot receive the code; a short code is shown as UX text only; (b) while an oauth spec is loaded, cplt adds the AS host and token endpoint to the agent's proxy blocklist; (c) detect sandbox by something the agent cannot forge, not env; residual: macOS without forced proxy can still reach the AS directly, mitigated by (a), since the code can only reach the broker's listener. nav-pilot tells users cplt opens the browser itself and never asks them to click an agent-shown link |
+| Agent triggers a login | The agent can run the OAuth flow itself (sandbox allows loopback bind/inbound, `src/sandbox_profile.rs:3975-3976`; Linux shares host netns), using Nav's public CIMD `client_id` and its own loopback redirect, then ask the user to click a link. Env-based refusal (`CPLT_MCP_SOCKET`, `src/mcp_broker/mod.rs:29`) is no boundary. Owner decision 2026-11-02 (replaces the 2026-10-31 terminal-code guard): (a) the CIMD document lists only `http://127.0.0.1:<P>/callback`, and the host broker holds that port before the sandbox starts, so the agent cannot receive the code; a short code is shown as UX text only; (b) while an oauth spec is loaded, cplt adds the AS host and token endpoint to the agent's proxy blocklist, and `cplt mcp login` binds `<P>` itself or hands off to that broker; (c) no sandbox detection: env is forgeable and no other signal is verified; residual: macOS without forced proxy can still reach the AS directly, mitigated by (a), since the code can only reach the broker's listener. nav-pilot tells users cplt opens the browser itself and never asks them to click an agent-shown link |
 
 ### 14.8 Phases and open questions
 
