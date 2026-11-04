@@ -1328,6 +1328,29 @@ fn worktree_dirty(dir: &Path) -> bool {
     )
     .and_then(|c| crate::discover::bounded_stdout(c, WORKTREE_STATUS_TIMEOUT))
     .is_none_or(|out| !out.is_empty())
+        || has_initialized_submodule(dir)
+}
+
+/// Any gitlink in the index with a `.git` at its path. Edits inside a
+/// submodule are invisible to `--ignore-submodules=dirty`, and git is never
+/// run inside one, so an initialized submodule keeps the worktree. Failure
+/// to list the index counts as yes.
+fn has_initialized_submodule(dir: &Path) -> bool {
+    let Some(out) = crate::git::command(dir, &["ls-files", "--stage", "-z"])
+        .and_then(|c| crate::discover::bounded_stdout(c, WORKTREE_STATUS_TIMEOUT))
+    else {
+        return true;
+    };
+    out.split(|b| *b == 0)
+        .filter_map(|rec| rec.strip_prefix(b"160000 "))
+        .filter_map(|rec| rec.iter().position(|b| *b == b'\t').map(|i| &rec[i + 1..]))
+        .any(|path| {
+            use std::os::unix::ffi::OsStrExt;
+            dir.join(std::ffi::OsStr::from_bytes(path))
+                .join(".git")
+                .symlink_metadata()
+                .is_ok()
+        })
 }
 
 /// Delete everything under `dir` except the `keep` paths and the directories
@@ -2031,6 +2054,28 @@ mod tests {
         assert!(worktree_dirty(&wt));
         drop(scratch);
         assert!(sub.exists());
+    }
+
+    /// Edits inside an initialized submodule at the recorded commit keep the
+    /// worktree, without git running inside the submodule.
+    #[test]
+    fn edits_inside_initialized_submodule_are_kept() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let repo = repo_with_commit(&home, "");
+        let scratch = ScratchDir::create(&home).unwrap();
+        let wt = scratch.path().join("wt");
+        git(&repo, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+        let sub = wt.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        git(&sub, &["init", "-q"]);
+        git(&sub, &["commit", "-q", "--allow-empty", "-m", "s"]);
+        git(&wt, &["add", "sub"]);
+        git(&wt, &["commit", "-qm", "gitlink"]);
+        std::fs::write(sub.join("edit"), "work").unwrap();
+        assert!(has_initialized_submodule(&wt));
+        drop(scratch);
+        assert!(sub.join("edit").exists());
     }
 
     #[test]
