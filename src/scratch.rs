@@ -1967,7 +1967,7 @@ mod tests {
             .unwrap()
             .status
             .success();
-        assert!(ok, "git {args:?}");
+        assert!(ok, "git {} failed", args[0]);
     }
 
     /// #963: a dirty linked worktree in scratch survives exit, a clean one and
