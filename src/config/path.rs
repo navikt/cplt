@@ -255,10 +255,11 @@ mask_missing_deny_paths = true
 # Disable to save ~200ms startup if you trust your config.
 # validate = true
 #
-# EXPERIMENTAL (unstable, may be removed): write the per-session agent-facing
-# sandbox brief to the scratch dir as CPLT_BRIEF.md (default: false). Never
-# touches the project directory.
-# brief = false
+# Write the per-session agent-facing sandbox brief to the scratch dir as
+# CPLT_BRIEF.md, and load it into Copilot and OpenCode as instructions. Never
+# touches the project directory. On for new configs; without this line the
+# default is false.
+brief = true
 #
 # OpenCode: route a GitHub MCP entry (api.githubcopilot.com/mcp) through a
 # host-side read-only proxy holding your gh login (default: true).

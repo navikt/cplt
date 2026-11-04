@@ -722,7 +722,7 @@ pub fn display_config(loaded: Option<&LoadedConfig>, local: Option<&LoadedConfig
     // same defect as a key that reports the wrong value.
     let brief = c.sandbox.brief.unwrap_or(false);
     println!(
-        "{blue}[cplt]{nc}    brief                 = {}{} {dim}(experimental){nc}",
+        "{blue}[cplt]{nc}    brief                 = {}{}",
         brief,
         src("sandbox", "brief", c.sandbox.brief.is_some())
     );

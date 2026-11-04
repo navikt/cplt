@@ -584,9 +584,9 @@ actually on screen, then turn it back off."
     #[arg(long)]
     no_validate: bool,
 
-    /// EXPERIMENTAL. Write the agent-facing sandbox brief to the scratch dir
-    /// (`CPLT_BRIEF.md`). Off by default, unstable, and may be removed in a
-    /// future release. Also the gate for --agents-md.
+    /// Write the agent-facing sandbox brief to the scratch dir
+    /// (`CPLT_BRIEF.md`) and point Copilot and OpenCode at it. On in configs
+    /// written by `cplt config init`. Also the gate for --agents-md.
     #[arg(long, conflicts_with = "no_brief")]
     brief: bool,
 
@@ -9547,6 +9547,7 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
         &resolved,
         matches!(bubblewrap, doctor::Bubblewrap::Usable(_)),
     ));
+    findings.extend(doctor::brief_nudge(&resolved));
     #[cfg(target_os = "linux")]
     findings.extend(doctor::mask_missing_deny_paths_nudge(
         &resolved,

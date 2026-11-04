@@ -1327,23 +1327,21 @@ Not covered yet: gh's `hosts.yml` stays readable, so a token stored there (Linux
 without a keyring, or insecure storage) is still reachable; and the agent can
 still use the token through the proxy against the GitHub hosts above.
 
-## Agent sandbox brief (`sandbox.brief`, `sandbox.agents_md`) — EXPERIMENTAL
+## Agent sandbox brief (`sandbox.brief`, `sandbox.agents_md`)
 
-> **EXPERIMENTAL.** Both keys, and the `--brief` / `--no-brief` /
-> `--agents-md` / `--no-agents-md` flags, are
-> unstable: their names, defaults and output are not covered by any stability
-> guarantee and may change or be removed in a future release. Don't build
-> tooling on the brief's wording or on the AGENTS.md block's markers.
+> `sandbox.agents_md` and its `--agents-md` / `--no-agents-md` flags are
+> **EXPERIMENTAL**: their output may change or be removed. Don't build tooling
+> on the AGENTS.md block's markers.
 
 An agent inside the sandbox has no way of knowing it is sandboxed: it hits
 `EPERM`, assumes a bug, and retries. cplt can hand it the answer up front, in
-two layers. Both are off by default — cplt writing files that an agent then
-reads is a behaviour change, so you ask for it. Running `cplt check` from
-outside the sandbox reports the same policy either way, and is what to reach
-for when you have not opted in.
+two layers. Running `cplt check` from outside the sandbox reports the same
+policy either way.
 
-**`sandbox.brief` (default `false`)** — writes two files into the per-session
-scratch directory (the one `$TMPDIR` points at inside the sandbox):
+**`sandbox.brief`** — on in configs written by `cplt config init` (#967); a
+config without the key keeps it off, and `cplt doctor` suggests setting it
+either way. It writes two files into the per-session scratch directory (the one
+`$TMPDIR` points at inside the sandbox):
 
 | File | For | Named by |
 | --- | --- | --- |
@@ -1369,6 +1367,19 @@ set of facts, so they cannot describe different sessions.
 
 Turn it on for one run with `--brief`, or for good with
 `cplt config set sandbox.brief true`.
+
+A file the agent never opens does nothing, so cplt also loads the brief through
+the agent's own instruction channel. Each value is extended, never replaced:
+your own or nav-pilot's settings stay.
+
+| Agent | How the brief is loaded |
+| --- | --- |
+| Copilot | `COPILOT_CUSTOM_INSTRUCTIONS_DIRS` gets the scratch dir's `cplt-instructions/`, which holds a copy at `.github/instructions/cplt-sandbox.instructions.md` |
+| OpenCode (v1 and v2) | `OPENCODE_CONFIG_CONTENT` gets `CPLT_BRIEF.md` added to its `instructions` list |
+| Claude Code, Antigravity, Pi, Goose, dsh, shell | **Gap:** not loaded. cplt knows no channel it can extend without rewriting your arguments or files. The agent sees `$CPLT_BRIEF` only if something tells it to read it, for example a line in your own `CLAUDE.md` |
+
+If `deny.env` names the variable, or an existing `OPENCODE_CONFIG_CONTENT` is
+not a JSON object, cplt warns at launch and leaves the variable as it was.
 
 There is nothing about the brief that only works for some projects, so if you
 want your agents to have it, turn it on in your global config. Turning it on is
@@ -1398,7 +1409,7 @@ writes into your repository, so it is a second opt-in on top of the first:
   repo untouched.
 - Skipped outside a git work tree, and skipped with a warning if the file
   somehow ends up with more than one marker pair.
-- It requires `sandbox.brief` as well. With the brief off — the default — the
+- It requires `sandbox.brief` as well. With the brief off, the
   AGENTS.md block is never written, whatever `agents_md` says.
 
 Turn both on for one run, or globally:
