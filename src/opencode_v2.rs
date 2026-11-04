@@ -111,6 +111,18 @@ pub fn snapshot_root(home: &Path) -> PathBuf {
     xdg_base("XDG_DATA_HOME", home, ".local/share").join("opencode/snapshot")
 }
 
+/// `MISE_CONFIG_DIR` and `MISE_STATE_DIR` at the host's, unless already set.
+fn mise_dirs(config_base: &Path, state_base: &Path) -> Vec<(String, String)> {
+    [
+        ("MISE_CONFIG_DIR", config_base.join("mise")),
+        ("MISE_STATE_DIR", state_base.join("mise")),
+    ]
+    .into_iter()
+    .filter(|(var, _)| std::env::var_os(var).is_none())
+    .map(|(var, dir)| (var.into(), dir.display().to_string()))
+    .collect()
+}
+
 /// Set up the session under `scratch` and return its env and profile tail.
 pub fn prepare(scratch: &Path, home: &Path, launch_dir: &Path) -> Result<Session, String> {
     let config_base = xdg_base("XDG_CONFIG_HOME", home, ".config");
@@ -163,6 +175,11 @@ pub fn prepare(scratch: &Path, home: &Path, launch_dir: &Path) -> Result<Session
         ("no_proxy".into(), "localhost,127.0.0.1,::1".into()),
     ];
     env.extend(explicit.map(|f| ("OPENCODE_CONFIG".into(), f.display().to_string())));
+    // The XDG relocation above is for OpenCode; mise follows the same
+    // variables, so without these it loses its global config and trust state
+    // and refuses host-trusted project configs. Both dirs keep the access the
+    // mise app-dir grants give them; pinning them grants nothing new.
+    env.extend(mise_dirs(&config_base, &state_base));
     let files = [
         user_oc.join("service.json"),
         config_base.join("opencode/service.json"),
@@ -1362,6 +1379,8 @@ mod tests {
                 ("XDG_STATE_HOME", None),
                 ("OPENCODE_CONFIG", None),
                 ("OPENCODE_CONFIG_DIR", None),
+                ("MISE_CONFIG_DIR", None),
+                ("MISE_STATE_DIR", None),
             ],
             || prepare(tmp.path(), tmp.path(), &tmp.path().join("src/repo")).unwrap(),
         );
@@ -1374,6 +1393,14 @@ mod tests {
         assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
         let env: std::collections::HashMap<_, _> = s.env.into_iter().collect();
         assert!(env["XDG_STATE_HOME"].ends_with("opencode-v2/state"));
+        assert_eq!(
+            env["MISE_STATE_DIR"],
+            tmp.path().join(".local/state/mise").display().to_string()
+        );
+        assert_eq!(
+            env["MISE_CONFIG_DIR"],
+            tmp.path().join(".config/mise").display().to_string()
+        );
         assert_eq!(env["OPENCODE_DISABLE_MODELS_FETCH"], "1");
         assert!(!env.contains_key("OPENCODE_CONFIG"), "no user config");
         assert_eq!(u64::from(s.port), port);
