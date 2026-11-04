@@ -709,7 +709,8 @@ pub fn delivery_env(
             if !brief.is_file() {
                 return Ok(None);
             }
-            let mut config: serde_json::Value = match current(VAR) {
+            let mut config: serde_json::Value = match current(VAR).filter(|v| !v.trim().is_empty())
+            {
                 Some(v) => serde_json::from_str(&v).map_err(|_| format!("{VAR} is not JSON"))?,
                 None => serde_json::json!({}),
             };
@@ -2214,6 +2215,15 @@ mod tests {
         assert_eq!(
             v["instructions"],
             serde_json::json!(["a.md", md.display().to_string()])
+        );
+        let blank = |_: &str| Some("  ".to_string());
+        let (_, v) = delivery_env(Agent::OpenCode, scratch, blank)
+            .unwrap()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&v).unwrap();
+        assert_eq!(
+            v["instructions"],
+            serde_json::json!([md.display().to_string()])
         );
         let bad = |_: &str| Some("[1]".to_string());
         assert!(delivery_env(Agent::OpenCode, scratch, bad).is_err());
