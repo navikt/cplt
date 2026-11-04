@@ -994,10 +994,13 @@ fn gc_stale_session_dirs(base: &Path) {
         }
 
         // Kept at exit for a dirty worktree (#963): the user removes it.
+        // Honoured only while a linked worktree is still there, so a planted
+        // or outlived marker does not keep the dir forever.
         if path
             .join(KEPT_MARKER)
             .symlink_metadata()
             .is_ok_and(|m| m.is_file())
+            && !linked_worktrees(&path).is_empty()
         {
             continue;
         }
@@ -1200,7 +1203,10 @@ impl Drop for ScratchDir {
         remove_all_except(&self.path, &kept);
         // Written after the sweep, so a marker the agent planted is gone and
         // this one is ours. `gc_stale_session_dirs` leaves the dir alone.
-        let _ = std::fs::write(self.path.join(KEPT_MARKER), "");
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(self.path.join(KEPT_MARKER));
         for wt in &kept {
             ui::warn(&format!(
                 "Kept a git worktree with uncommitted changes: {}\n  \
@@ -1220,6 +1226,7 @@ const KEPT_MARKER: &str = ".cplt-kept-worktree";
 /// deleted as before.
 const WORKTREE_SCAN_DEPTH: usize = 4;
 const WORKTREE_SCAN_ENTRIES: usize = 20_000;
+const WORKTREE_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Linked git worktrees under `scratch` that hold uncommitted work: tracked
 /// changes or untracked, non-ignored files.
@@ -1231,6 +1238,13 @@ const WORKTREE_SCAN_ENTRIES: usize = 20_000;
 /// cannot be determined the worktree is kept: losing work is worse than a
 /// leftover directory.
 fn dirty_worktrees(scratch: &Path) -> Vec<PathBuf> {
+    let mut found = linked_worktrees(scratch);
+    found.retain(|wt| worktree_dirty(wt));
+    found
+}
+
+/// Every linked worktree under `scratch`, within the walk bounds.
+fn linked_worktrees(scratch: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let mut budget = WORKTREE_SCAN_ENTRIES;
     let mut stack = vec![(scratch.to_path_buf(), 0usize)];
@@ -1250,9 +1264,7 @@ fn dirty_worktrees(scratch: &Path) -> Vec<PathBuf> {
             }
             let path = entry.path();
             if is_linked_worktree(&path, scratch) {
-                if worktree_dirty(&path) {
-                    found.push(path);
-                }
+                found.push(path);
             } else if depth + 1 < WORKTREE_SCAN_DEPTH && entry.file_name() != ".git" {
                 stack.push((path, depth + 1));
             }
@@ -1279,17 +1291,11 @@ fn is_linked_worktree(dir: &Path, scratch: &Path) -> bool {
 }
 
 fn worktree_dirty(dir: &Path) -> bool {
-    let out = crate::git::command(dir, &["status", "--porcelain", "--untracked-files=normal"])
-        .and_then(|mut c| {
-            c.stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .output()
-                .ok()
-        });
-    match out {
-        Some(o) if o.status.success() => !o.stdout.is_empty(),
-        _ => true,
-    }
+    // Bounded: the agent can plant a FIFO where git reads its admin files,
+    // and exit must not hang. Timeout or failure counts as dirty (kept).
+    crate::git::command(dir, &["status", "--porcelain", "--untracked-files=normal"])
+        .and_then(|c| crate::discover::bounded_stdout(c, WORKTREE_STATUS_TIMEOUT))
+        .is_none_or(|out| !out.is_empty())
 }
 
 /// Delete everything under `dir` except the `keep` paths and the directories
@@ -1864,6 +1870,32 @@ mod tests {
         age(&s, STALE_AGE + Duration::from_secs(60));
         ScratchDir::gc_stale(&home);
         assert!(dirty.join("new").exists(), "orphan cleanup keeps it");
+
+        // Once the user removes the worktree, the marker no longer holds.
+        std::fs::remove_dir_all(s.join("nested")).unwrap();
+        age(&s, STALE_AGE + Duration::from_secs(60));
+        ScratchDir::gc_stale(&home);
+        assert!(!s.exists(), "marker without a worktree is collected");
+    }
+
+    /// A FIFO planted in the worktree's admin dir cannot hang exit; the
+    /// worktree is kept because its status is unknown.
+    #[test]
+    fn hung_worktree_status_times_out_and_keeps() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let admin = home.join("fake/.git/worktrees/x");
+        std::fs::create_dir_all(&admin).unwrap();
+        crate::untrusted::tests::mkfifo(&admin.join("commondir"));
+        crate::untrusted::tests::mkfifo(&admin.join("HEAD"));
+        let scratch = ScratchDir::create(&home).unwrap();
+        let wt = scratch.path().join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+        let start = std::time::Instant::now();
+        drop(scratch);
+        assert!(start.elapsed() < Duration::from_secs(20));
+        assert!(wt.exists(), "unknown status keeps the worktree");
     }
 
     /// A failed lock leaves no marker, so later launches skip the dir.

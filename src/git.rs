@@ -812,18 +812,38 @@ pub fn repo_defines_content_filter(project_dir: &Path) -> bool {
     };
     let mut cmd = Command::new(git);
     harden(&mut cmd);
-    let Ok(out) = cmd
+    let Ok(mut child) = cmd
         .args(["config", "--list", "--show-scope", "--includes", "-z"])
         .current_dir(project_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
+        .spawn()
     else {
         return false;
     };
-    if !out.status.success() {
+    // Bounded: an agent-written repo can plant a FIFO where git reads its
+    // config (#963). A probe that does not finish refuses, like a found filter.
+    let Some(mut stdout) = child.stdout.take() else {
+        return true;
+    };
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut stdout, &mut buf).map(|_| buf)
+    });
+    let Some(status) = crate::audit::wait_timeout(&mut child, CONFIG_PROBE_TIMEOUT) else {
+        return true;
+    };
+    if !status.success() {
         return false;
     }
+    let Ok(Ok(stdout)) = reader.join() else {
+        return true;
+    };
+    let out = std::process::Output {
+        status,
+        stdout,
+        stderr: Vec::new(),
+    };
     // `-z` output is a flat NUL-separated stream of alternating fields:
     // scope NUL "key\nvalue" NUL scope NUL "key\nvalue" NUL ...
     // A valueless key has no newline; `split_once` yielding None handles it.
@@ -840,6 +860,8 @@ pub fn repo_defines_content_filter(project_dir: &Path) -> bool {
     }
     false
 }
+
+const CONFIG_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// `filter.<name>.clean` / `filter.<name>.process` — the two filter stages git
 /// runs while comparing the working tree. `smudge` is checkout-only and cannot
