@@ -5354,6 +5354,10 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
                 host_reaches,
             );
         }
+        // mise's dirs are a convenience, not required: deny.env drops them.
+        session
+            .env
+            .retain(|(k, _)| !(k.starts_with("MISE_") && resolved.deny_env.contains(k)));
         if let Some((name, _)) = session
             .env
             .iter()
