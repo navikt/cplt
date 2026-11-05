@@ -3645,8 +3645,9 @@ pub fn gate_git(
                      so the guard would authorize against different configuration than the push runs under."
                 )
             } else {
-                "Unset GIT_CONFIG_PARAMETERS and GIT_CONFIG_KEY_<n>, configure the remote in the\n\
-                 repository, and push to it by name. They set configuration like `git -c`, so the\n\
+                "Before starting cplt, unset GIT_CONFIG_PARAMETERS, or the whole numbered block\n\
+                 (GIT_CONFIG_COUNT and every GIT_CONFIG_KEY_<n> and GIT_CONFIG_VALUE_<n>). Configure\n\
+                 the remote in the repository and push to it by name. These set configuration like `git -c`, so the\n\
                  guard would authorize against different configuration than the push runs under."
                     .to_string()
             },
