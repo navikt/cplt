@@ -11707,6 +11707,15 @@ fn add_proposed_repo(path: &Path, identity: &str) -> Result<bool, String> {
     let dir = path.parent().ok_or("no parent directory")?;
     let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(|e| e.to_string())?;
     std::io::Write::write_all(&mut tmp, doc.to_string().as_bytes()).map_err(|e| e.to_string())?;
+    // NamedTempFile is 0600; keep the file's mode, or 0644 for a new file.
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = std::fs::symlink_metadata(path)
+        .ok()
+        .filter(std::fs::Metadata::is_file)
+        .map_or(0o644, |m| m.permissions().mode() & 0o7777);
+    tmp.as_file()
+        .set_permissions(std::fs::Permissions::from_mode(mode))
+        .map_err(|e| e.to_string())?;
     tmp.persist(path).map_err(|e| e.to_string())?;
     Ok(true)
 }

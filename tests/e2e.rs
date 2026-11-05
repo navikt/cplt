@@ -6289,8 +6289,12 @@ paths = [
         );
         assert!(!std::fs::read_to_string(&toml).unwrap().contains("repos"));
 
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&toml, std::fs::Permissions::from_mode(0o640)).unwrap();
         let err = link(&["--propose"]);
         assert!(err.contains("Commit it"), "{err}");
+        let mode = std::fs::metadata(&toml).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o640, "the rewrite keeps the file's mode");
         link(&["--propose"]);
         let text = std::fs::read_to_string(&toml).unwrap();
         assert!(
