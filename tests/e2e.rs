@@ -6452,6 +6452,93 @@ paths = [
         let _ = std::fs::remove_dir_all(&parent);
     }
 
+    /// #977 + #982: an approved proposal whose repository is not on disk is
+    /// reported at launch, in `cplt trust` and in `cplt doctor`; a later clone
+    /// beside the project is picked up; and a commit adding a repository marks
+    /// which one is new.
+    #[test]
+    fn e2e_unlinked_proposed_repo_is_reported_and_new_ones_marked() {
+        require_sandbox!();
+        let (repo, config_file) =
+            make_trust_repo("propose-late", "[propose]\nrepos = [\"navikt/e2e-late\"]\n");
+        let out = trust_cmd(&repo, &config_file)
+            .args(["trust", "accept", "repos"])
+            .output()
+            .expect("accept runs");
+        assert!(out.status.success(), "{out:?}");
+
+        let run = |args: &[&str]| {
+            let out = trust_cmd(&repo, &config_file)
+                .args(args)
+                .output()
+                .expect("runs");
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        };
+        let launch = || {
+            run(&[
+                "--agent",
+                "shell",
+                "--yes",
+                "--no-validate",
+                "--",
+                "-c",
+                "true",
+            ])
+        };
+
+        let shown = run(&["trust"]);
+        assert!(
+            shown.contains("navikt/e2e-late: not linked, not found"),
+            "{shown}"
+        );
+        let out = launch();
+        assert!(
+            out.contains("navikt/e2e-late is proposed by .cplt.toml but not linked. Clone it, then run: cplt trust accept repos"),
+            "{out}"
+        );
+        let doctor = run(&["doctor", "--agent", "shell"]);
+        assert!(doctor.contains("navikt/e2e-late is proposed"), "{doctor}");
+
+        // Cloned later, beside the project.
+        let late = repo.parent().expect("parent").join("e2e-late");
+        std::fs::create_dir_all(&late).expect("mkdir");
+        git_cmd(&late)
+            .args(["init", "--quiet"])
+            .output()
+            .expect("git init");
+        let out = launch();
+        assert!(
+            out.contains("navikt/e2e-late found at ")
+                && out.contains("/e2e-late. Link it: cplt trust accept repos"),
+            "{out}"
+        );
+        assert!(run(&["trust"]).contains("not linked, found at"));
+
+        // A commit adds a repository: the new one is marked.
+        std::fs::write(
+            repo.join(".cplt.toml"),
+            "[propose]\nrepos = [\"navikt/e2e-late\", \"navikt/e2e-later\"]\n",
+        )
+        .expect("write");
+        git_cmd(&repo)
+            .args(["-c", "commit.gpgSign=false", "commit", "-qam", "add"])
+            .output()
+            .expect("commit");
+        let shown = run(&["trust"]);
+        assert!(
+            shown.contains("+ navikt/e2e-later: not linked, not found (new since last approval)"),
+            "{shown}"
+        );
+        assert!(shown.contains("• navikt/e2e-late:"), "{shown}");
+
+        let _ = std::fs::remove_dir_all(repo.parent().expect("parent"));
+        let _ = std::fs::remove_dir_all(config_file.parent().expect("cfg dir"));
+    }
+
     /// The user linked it first; the project happens to propose the same
     /// repository. Approving must not take ownership of a root the user
     /// created, because revoking would then delete it (#496 review).
