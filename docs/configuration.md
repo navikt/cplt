@@ -255,6 +255,10 @@ machine decides where those repositories live. A committed `.cplt.toml` cannot
 point cplt at a directory of its choosing — the most it can do is put a name in
 front of you.
 
+`cplt link --propose <owner>/<name>` links the repository for you and adds it
+to `[propose] repos`, creating `.cplt.toml` if needed and keeping the rest of
+the file as it was. Commit the file to share it.
+
 **What approving grants is not small.** Each repository it links becomes a
 *named repository* — the same thing `--repo-dir` and `sandbox.repo_dirs` name,
 with the same grant: read, write **and execute** on that whole tree, the same
