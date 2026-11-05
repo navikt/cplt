@@ -3460,7 +3460,9 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                 let verdict = trust::verdict(entry.as_ref(), &project_dir, &loaded);
                 // A retired approval kept only for its linked repos is Current
                 // with no keys: it approves nothing, so it trusts nothing.
-                repo_trusted = !trust::granted_keys(entry.as_ref(), verdict).is_empty();
+                repo_trusted =
+                    !trust::granted_keys(entry.as_ref(), verdict, &loaded.config.propose)
+                        .is_empty();
                 let proposes_nothing =
                     repo_config::proposed_keys(&loaded.config.propose).is_empty();
                 let nothing_proposed = !loaded.propose_dropped && proposes_nothing;
@@ -3535,10 +3537,22 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                             let (msg, hint) = approval_outlived(&t.accepted.linked);
                             ui::warn(&format!("{msg} {hint}"));
                         }
-                        (_, trust::Verdict::Status(trust::ApprovalStatus::Changed)) => {
-                            ui::warn(
-                                ".cplt.toml permissions changed since the last approval. Re-approve with `cplt trust accept`",
-                            );
+                        // Only the keys whose value changed are pending (#1002);
+                        // a change that leaves nothing pending is not news.
+                        (Some(t), trust::Verdict::Status(trust::ApprovalStatus::Changed)) => {
+                            let granted = trust::approved_for(t, &loaded.config.propose);
+                            let pending: Vec<&str> =
+                                repo_config::proposed_keys(&loaded.config.propose)
+                                    .into_iter()
+                                    .filter(|k| !granted.iter().any(|g| g == k))
+                                    .collect();
+                            if !pending.is_empty() {
+                                ui::warn(&format!(
+                                    ".cplt.toml permissions changed since the last approval: {}. \
+                                     Re-approve with `cplt trust accept`",
+                                    pending.join(", ")
+                                ));
+                            }
                         }
                         // No trust entry: the "Untrusted .cplt.toml" notice
                         // below lists what is pending, so nothing to add here.
@@ -3551,13 +3565,14 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                         &unlinked_repos,
                         entry.as_ref(),
                         verdict,
+                        &loaded.config.propose,
                     ) {
                         ui::warn(&message);
                     }
                 }
                 // A legacy empty stored hash is STALE (see approval_is_stale).
                 // Only a current approval bound to this repository grants keys.
-                trust::granted_keys(entry.as_ref(), verdict)
+                trust::granted_keys(entry.as_ref(), verdict, &loaded.config.propose)
             };
 
             let approved_refs: Vec<&str> = approved_keys
@@ -9895,6 +9910,7 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
                         &unlinked,
                         entry.as_ref(),
                         verdict,
+                        &loaded.config.propose,
                     )
                 })
                 .unwrap_or_default(),
@@ -11910,7 +11926,7 @@ fn trust_state(
     entry: Option<&trust::TrustEntry>,
 ) -> TrustState {
     let verdict = trust::verdict(entry, project_dir, loaded);
-    let granted = trust::granted_keys(entry, verdict);
+    let granted = trust::granted_keys(entry, verdict, &loaded.config.propose);
     let proposed: Vec<(&'static str, bool)> = repo_config::proposed_keys(&loaded.config.propose)
         .into_iter()
         .map(|key| (key, granted.iter().any(|g| g == key)))
@@ -11950,13 +11966,13 @@ fn trust_state(
                     }
                 ),
             ),
-            (_, trust::Verdict::Status(trust::ApprovalStatus::Changed)) => (
-                "changed",
-                ".cplt.toml permissions changed since the last approval.".to_string(),
-            ),
             _ if pending == 0 => (
                 "approved",
                 "Every proposed permission is approved.".to_string(),
+            ),
+            (_, trust::Verdict::Status(trust::ApprovalStatus::Changed)) => (
+                "changed",
+                ".cplt.toml permissions changed since the last approval.".to_string(),
             ),
             (None, _) => (
                 "pending",
@@ -12245,13 +12261,15 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
             if blocked.is_none() {
                 println!("{blue}[cplt]{nc}  {yellow}  {hint}{nc}");
             }
-        } else if hash_mismatch && (!proposed.is_empty() || loaded.propose_dropped) {
+        } else if hash_mismatch && (has_pending || loaded.propose_dropped) {
             // A foreign entry in front of a checkout that proposes nothing has
             // nothing to re-approve (#560); the line below says what it is.
+            // Unchanged keys stay approved (#1002), so a change that leaves
+            // nothing pending says nothing here.
             println!("{blue}[cplt]{nc}  {red}⚠ Permissions have changed since last approval!{nc}");
             if blocked.is_none() {
                 println!(
-                    "{blue}[cplt]{nc}  {red}  Run `cplt trust accept --all` to re-approve.{nc}"
+                    "{blue}[cplt]{nc}  {red}  Run `cplt trust accept` to review the pending keys.{nc}"
                 );
             }
         }
@@ -12359,9 +12377,10 @@ fn unlinked_proposed_repos_messages(
     unlinked: &[String],
     entry: Option<&trust::TrustEntry>,
     verdict: trust::Verdict,
+    propose: &repo_config::ProposeSection,
 ) -> Vec<String> {
     if unlinked.is_empty()
-        || !trust::granted_keys(entry, verdict)
+        || !trust::granted_keys(entry, verdict, propose)
             .iter()
             .any(|k| k == "repos")
     {
@@ -12832,20 +12851,15 @@ fn trust_accept(
         return ExitCode::FAILURE;
     }
 
-    // Only carry existing approvals forward when they were granted at THIS checkout
-    // for THESE exact proposal values. Otherwise the accepted set becomes exactly
-    // the keys approved now: a partial accept must never silently renew a stale
-    // approval whose value changed underneath it (SECURITY.md, "reapproval").
-    // Split the two reasons an approval stops applying, because they are not the
-    // same event and the message must not claim the wrong one. A legacy entry
-    // (empty stored hash) predates value pinning, so nothing "changed" — it was
-    // never recorded. `approval_is_stale` treats both as stale, correctly.
+    // Only carry existing approvals forward when they were granted at THIS checkout,
+    // and only the keys whose value is unchanged since they were approved
+    // (#1002): a partial accept must never silently renew a stale approval
+    // whose value changed underneath it (SECURITY.md, "reapproval"). A legacy
+    // entry (no per-key hashes) carries all its keys only while the whole
+    // proposal is unchanged, as before, and is rewritten per key below.
     let stored_hash_is_legacy = stored
         .as_ref()
-        .is_some_and(|t| t.accepted.content_hash.is_empty());
-    let hash_mismatch = stored
-        .as_ref()
-        .is_some_and(|t| trust::approval_is_stale(&t.accepted.content_hash, &current_hash));
+        .is_some_and(|t| t.accepted.content_hash.is_empty() && t.accepted.key_hashes.is_empty());
     // Kept regardless of hash staleness, unlike the approved keys: a stale hash
     // means "re-review the values", not "those roots stopped existing". Bound
     // to the checkout the same way approvals are, so a foreign entry's roots are
@@ -12856,32 +12870,53 @@ fn trust_accept(
         .map(|t| t.accepted.linked.clone())
         .unwrap_or_default();
 
-    let carried = stored.clone().filter(|t| {
-        trust::approved_path_matches(t, project_dir)
-            && !trust::approval_is_stale(&t.accepted.content_hash, &current_hash)
-    });
+    let carried = stored
+        .clone()
+        .filter(|t| trust::approved_path_matches(t, project_dir))
+        .map(|mut t| {
+            let keys = trust::approved_for(&t, &loaded.config.propose);
+            trust::pin_keys(&mut t.accepted, keys, &loaded.config.propose);
+            t
+        });
+    // Approved keys that no longer apply: their value changed, or they are no
+    // longer proposed. Named, so a user approving something else learns they
+    // lapsed.
+    let lapsed: Vec<&str> = stored
+        .as_ref()
+        .filter(|t| trust::approved_path_matches(t, project_dir))
+        .map(|t| {
+            t.accepted
+                .keys
+                .iter()
+                .map(String::as_str)
+                .filter(|k| {
+                    !carried
+                        .as_ref()
+                        .is_some_and(|c| trust::is_key_approved(c, k))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
-    // Say so in every branch. Accepting explicit keys after a value change drops
-    // the other approvals, and a user told only "Approved 1 permission(s)" would
-    // otherwise discover that at the next launch.
-    if hash_mismatch {
-        let reason = if stored_hash_is_legacy {
-            "The previous approval predates value pinning, so it cannot be matched against \
-these proposal values"
+    if stored_hash_is_legacy || !lapsed.is_empty() {
+        if stored_hash_is_legacy {
+            println!(
+                "{}[cplt]{} The previous approval predates value pinning, so it cannot be \
+matched against these proposal values. Only the keys approved now are kept.",
+                ui::stdout_color(ui::YELLOW),
+                ui::stdout_color(ui::RESET),
+            );
         } else {
-            "Proposal values have changed since the last approval, so the previous approvals \
-no longer apply"
-        };
-        println!(
-            "{}[cplt]{} {reason}. Only the keys approved now are kept.",
-            ui::stdout_color(ui::YELLOW),
-            ui::stdout_color(ui::RESET),
-        );
+            println!(
+                "{}[cplt]{} These keys changed or were removed since the last approval, so they are no longer approved: {}.",
+                ui::stdout_color(ui::YELLOW),
+                ui::stdout_color(ui::RESET),
+                lapsed.join(", "),
+            );
+        }
         // Which repository changed (#982): the grant is a whole tree.
-        if let Some(before) = stored
-            .as_ref()
-            .filter(|t| trust::approved_path_matches(t, project_dir))
-            .and_then(|t| t.accepted.repos.as_deref())
+        if lapsed.contains(&"repos")
+            && let Some(before) = stored.as_ref().and_then(|t| t.accepted.repos.as_deref())
         {
             let (added, removed) = trust::repos_diff(before, &loaded.config.propose.repos);
             for r in added {
@@ -13046,16 +13081,12 @@ no longer apply"
     }
     entry.repo = trust::approved_identity(project_dir, &remote);
 
-    // Add new keys (don't duplicate)
-    for key in &keys_to_accept {
-        if !entry.accepted.keys.contains(key) {
-            entry.accepted.keys.push(key.clone());
-        }
-    }
-    entry.accepted.keys.sort_unstable();
+    // Pin each key to its current value (#1002). `entry.accepted.keys` holds
+    // only carried keys, which already match, so every key written matches.
+    let mut keys = entry.accepted.keys.clone();
+    keys.extend(keys_to_accept.iter().cloned());
+    trust::pin_keys(&mut entry.accepted, keys, &loaded.config.propose);
     entry.accepted.approved_at = trust::now_iso8601();
-    // Pin content hash so changes to proposal values invalidate approval
-    entry.accepted.content_hash = current_hash;
 
     // `repos` is not a value the launch applies — approving it performs the
     // linking, here. Done before the entry is saved, so a failure to resolve
@@ -18127,6 +18158,7 @@ mod tests {
             let granted = trust::granted_keys(
                 entry.as_ref(),
                 trust::verdict(entry.as_ref(), &dir, &loaded),
+                &loaded.config.propose,
             );
             for (key, approved) in &st.proposed {
                 assert_eq!(*approved, granted.iter().any(|g| g == key), "{name}: {key}");
