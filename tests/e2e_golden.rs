@@ -320,17 +320,14 @@ fn golden_local_layer_is_named_by_launch_show_and_get() {
         &["config", "set", "--local", "proxy.port", &port],
     );
     assert!(status.success(), "set --local should succeed:\n{stderr}");
-    let local = local_file(&home);
-    let local_str = local.to_string_lossy().into_owned();
+    let local_str = local_file(&home).to_string_lossy().into_owned();
 
-    // 1. The launch names the file it read.
+    // 1. The launch says a local layer applied (#1007: not the hashed path).
     let (_, stderr, ok) = launch_agent(&home, repo.path());
     assert!(ok, "a launch with a local layer must succeed:\n{stderr}");
     assert!(
-        stderr.contains(&format!("Local:    {local_str}")),
-        "the launch must name the local config file on its own summary row — \
-         the path appearing in some other line (a warning that it was ignored, \
-         say) is the defect, not the fix:\n{stderr}"
+        stderr.contains("Local:    per-project config applied (cplt config path --local)"),
+        "the launch must report the local layer on its own summary row:\n{stderr}"
     );
     // ...and the value is in force, not merely mentioned.
     assert!(
@@ -1611,5 +1608,38 @@ fn golden_doctor_reports_launch_refusals_and_ignored_repo_keys() {
             "doctor must print `{want}`:\n{out}{err}"
         );
     }
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// #1005: a user with no config gets one pointer to `cplt config init`, not
+/// the per-key "New configs" nudges meant for an existing config, which
+/// still get them.
+#[test]
+fn golden_doctor_new_user_gets_one_config_init_pointer() {
+    let home = make_config_home("golden-doctor-new-user");
+    let repo = temp_repo("navikt/probe");
+
+    let (out, err, _) = launch(&home, repo.path(), &["--with-proxy", "doctor"]);
+    assert!(
+        out.contains("No cplt config yet"),
+        "a new user must be pointed at `cplt config init`:\n{out}{err}"
+    );
+    assert!(
+        !out.contains("New configs"),
+        "a new user must not get the existing-config nudges:\n{out}{err}"
+    );
+
+    let cfg = home.join(".config/cplt");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(cfg.join("config.toml"), "# an older config\n").unwrap();
+    let (out, err, _) = launch(&home, repo.path(), &["--with-proxy", "doctor"]);
+    assert!(
+        !out.contains("No cplt config yet"),
+        "an existing config must not be told it has none:\n{out}{err}"
+    );
+    assert!(
+        out.contains("proxy.inject_github_token is not set"),
+        "an existing config keeps its nudge as a warning:\n{out}{err}"
+    );
     let _ = std::fs::remove_dir_all(&home);
 }

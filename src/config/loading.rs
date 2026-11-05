@@ -1650,7 +1650,9 @@ impl Resolved {
         if full || changed || (!self.yes && !confirm.confirmed) {
             confirm.shown = tty;
             if changed {
-                let names = confirm.changed_fields(home_dir, project_dir);
+                // #1007: "table" is the whole table, printed in full right below.
+                let mut names = confirm.changed_fields(home_dir, project_dir);
+                names.retain(|n| n != "table");
                 if !names.is_empty() {
                     eprintln!(
                         "{blue}[cplt]{nc} Changed since last launch: {}",

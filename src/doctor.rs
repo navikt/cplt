@@ -1385,6 +1385,17 @@ pub fn git_config_write_nudge(r: &crate::config::Resolved, bwrap_usable: bool) -
     })
 }
 
+/// #1005: with no user config, the per-key "new configs" nudges would all
+/// fire on day one. One pointer to `cplt config init` replaces them.
+#[must_use]
+pub fn no_user_config_finding() -> Finding {
+    Finding::warning(
+        "No cplt config yet, so cplt runs with the older defaults. `cplt config init` \
+         writes a config with the secure defaults.",
+        Some("cplt config init".to_string()),
+    )
+}
+
 /// Exit non-zero iff something is blocking — the contract the old doctor had
 /// for its "critical" checks.
 #[must_use]
