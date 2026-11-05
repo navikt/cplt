@@ -6259,6 +6259,101 @@ paths = [
         let _ = std::fs::remove_dir_all(config_file.parent().expect("cfg dir"));
     }
 
+    /// #981: `cplt link --propose` links, then records the identity in
+    /// `[propose] repos`, keeping what the file already said and never
+    /// listing an identity twice. A plain link only prints the hint.
+    #[test]
+    fn e2e_link_propose_adds_identity_to_cplt_toml() {
+        let project = temp_repo("navikt/e2e-prop-a");
+        let lib = temp_repo("navikt/e2e-prop-b");
+        let cfg = tempfile::tempdir().unwrap();
+        let config_file = cfg.path().join("config.toml");
+        let toml = project.path().join(".cplt.toml");
+        std::fs::write(&toml, "# keep me\n[deny]\ngh_guard = true\n").unwrap();
+        let link = |extra: &[&str]| {
+            let mut args = vec!["link", "navikt/e2e-prop-b", lib.path().to_str().unwrap()];
+            args.extend_from_slice(extra);
+            let out = trust_cmd(project.path(), &config_file)
+                .args(&args)
+                .output()
+                .expect("link runs");
+            let err = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(out.status.success(), "{err}");
+            err
+        };
+
+        let err = link(&[]);
+        assert!(
+            err.contains("cplt link --propose navikt/e2e-prop-b"),
+            "{err}"
+        );
+        assert!(!std::fs::read_to_string(&toml).unwrap().contains("repos"));
+
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&toml, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let err = link(&["--propose"]);
+        assert!(err.contains("Commit it"), "{err}");
+        let mode = std::fs::metadata(&toml).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o640, "the rewrite keeps the file's mode");
+        link(&["--propose"]);
+        let text = std::fs::read_to_string(&toml).unwrap();
+        assert!(
+            text.starts_with("# keep me\n[deny]\ngh_guard = true\n"),
+            "{text}"
+        );
+        assert_eq!(text.matches("navikt/e2e-prop-b").count(), 1, "{text}");
+        assert!(
+            text.contains("[propose]\nrepos = [\"navikt/e2e-prop-b\"]"),
+            "{text}"
+        );
+    }
+
+    /// #981: `--propose` refuses a `.cplt.toml` that is a symlink or a FIFO,
+    /// and writes nothing through it.
+    #[test]
+    fn e2e_link_propose_refuses_symlink_and_fifo() {
+        let project = temp_repo("navikt/e2e-prop-c");
+        let lib = temp_repo("navikt/e2e-prop-d");
+        let cfg = tempfile::tempdir().unwrap();
+        let config_file = cfg.path().join("config.toml");
+        let outside = cfg.path().join("outside.toml");
+        std::fs::write(&outside, "# outside\n").unwrap();
+        let toml = project.path().join(".cplt.toml");
+        let run = || {
+            trust_cmd(project.path(), &config_file)
+                .args([
+                    "link",
+                    "navikt/e2e-prop-d",
+                    lib.path().to_str().unwrap(),
+                    "--propose",
+                ])
+                .output()
+                .expect("link runs")
+        };
+
+        std::os::unix::fs::symlink(&outside, &toml).unwrap();
+        let out = run();
+        assert!(!out.status.success(), "symlink accepted");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "# outside\n");
+        assert!(
+            std::fs::symlink_metadata(&toml)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        std::fs::remove_file(&toml).unwrap();
+        let fifo = std::ffi::CString::new(toml.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+        let out = run();
+        assert!(!out.status.success(), "fifo accepted");
+        assert!(
+            !std::fs::read_to_string(&outside)
+                .unwrap()
+                .contains("e2e-prop-d")
+        );
+    }
+
     /// #491, the whole loop: a repository proposes another repository by name,
     /// approving resolves and links it, and revoking removes exactly what the
     /// approval created — never a root the user added themselves.

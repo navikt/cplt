@@ -852,8 +852,14 @@ QUICK START:
         dir: Option<PathBuf>,
 
         /// Remove the link instead of adding it.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "propose")]
         unlink: bool,
+
+        /// Also add the repository to `[propose] repos` in this repository's
+        /// `.cplt.toml`, so teammates get it offered by `cplt trust accept
+        /// repos`. Commit the file afterwards.
+        #[arg(long)]
+        propose: bool,
     },
 
     /// Manage per-repo trust for .cplt.toml permissions.
@@ -1380,7 +1386,8 @@ enum TrustAction {
     ///
     /// Example: cplt trust accept allow_jvm_attach allow_docker
     Accept {
-        /// Permission keys to approve (e.g. allow_jvm_attach, allow_docker).
+        /// Permission keys to approve (e.g. allow_jvm_attach, allow_docker,
+        /// or `repos` for the repositories listed in `[propose] repos`).
         /// Without arguments, shows pending permissions and prompts for confirmation.
         keys: Vec<String>,
 
@@ -5049,7 +5056,12 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             },
             Command::Update { check, force } => run_update(check, force),
             Command::UpdateLists => run_update_lists(),
-            Command::Link { repo, dir, unlink } => run_link_command(&repo, dir.as_deref(), unlink),
+            Command::Link {
+                repo,
+                dir,
+                unlink,
+                propose,
+            } => run_link_command(&repo, dir.as_deref(), unlink, propose),
             Command::Trust { action } => run_trust_command(action),
             Command::Init {
                 write,
@@ -11551,7 +11563,7 @@ fn warn_agent_writable_list_files(
 /// every launch, it is refused if it stops being a git toplevel or acquires a
 /// symlinked leaf, and `cplt config set --local sandbox.repo_dirs` manages the
 /// same list. What this command adds is the identity check.
-fn run_link_command(repo: &str, dir: Option<&Path>, unlink: bool) -> ExitCode {
+fn run_link_command(repo: &str, dir: Option<&Path>, unlink: bool, propose: bool) -> ExitCode {
     let Some(project_dir) = detect_project_root() else {
         ui::error(NOT_A_REPOSITORY);
         return ExitCode::FAILURE;
@@ -11629,12 +11641,83 @@ fn run_link_command(repo: &str, dir: Option<&Path>, unlink: bool) -> ExitCode {
         false,
         true,
     );
-    if code == ExitCode::SUCCESS {
-        // Verified above, so the launch can skip reading it again (#980).
-        // Best effort: without it the launch reads the origin once.
-        let _ = config::set_linked_identity(&project_dir, &entry, Some(repo));
+    if code != ExitCode::SUCCESS {
+        return code;
+    }
+    // Verified above, so the launch can skip reading it again (#980).
+    // Best effort: without it the launch reads the origin once.
+    let _ = config::set_linked_identity(&project_dir, &entry, Some(repo));
+    if !propose {
+        eprintln!(
+            "  {}Share it with the team: cplt link --propose {repo}{}",
+            ui::color(ui::DIM),
+            ui::color(ui::RESET)
+        );
+        return code;
+    }
+    let path = project_dir.join(cplt::repo_config::REPO_CONFIG_FILE);
+    match add_proposed_repo(&path, repo) {
+        Ok(true) => ui::info(&format!(
+            "Added {repo} to [propose] repos in {}. Commit it so teammates are offered it.",
+            cplt::repo_config::REPO_CONFIG_FILE
+        )),
+        Ok(false) => ui::info(&format!(
+            "{repo} is already in [propose] repos in {}.",
+            cplt::repo_config::REPO_CONFIG_FILE
+        )),
+        Err(e) => {
+            ui::error(&format!("Could not update {}: {e}", path.display()));
+            return ExitCode::FAILURE;
+        }
     }
     code
+}
+
+/// Append `identity` to `[propose] repos` in `path`, creating the file or
+/// section if missing and keeping the rest of the document as written.
+/// Returns whether it was added (false: already listed).
+///
+/// `.cplt.toml` is repository content the agent can write, so it is read with
+/// `read_untrusted`: no symlink, FIFO or oversized file is followed.
+fn add_proposed_repo(path: &Path, identity: &str) -> Result<bool, String> {
+    let text = match cplt::untrusted::read_untrusted(path, 1024 * 1024) {
+        Ok(Some(t)) => t,
+        Ok(None) => return Err("not a regular file of at most 1 MiB (symlinks are refused)".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| format!("{e}"))?;
+    let propose = doc
+        .entry("propose")
+        .or_insert_with(toml_edit::table)
+        .as_table_like_mut()
+        .ok_or("[propose] is not a table")?;
+    let repos = propose
+        .entry("repos")
+        .or_insert_with(|| toml_edit::value(toml_edit::Array::new()))
+        .as_array_mut()
+        .ok_or("[propose] repos is not an array")?;
+    if repos.iter().any(|v| v.as_str() == Some(identity)) {
+        return Ok(false);
+    }
+    repos.push(identity);
+    // Write a sibling temp file and rename it over the target: rename replaces
+    // a symlink planted after the read instead of following it, so the write
+    // cannot be redirected outside the repository.
+    let dir = path.parent().ok_or("no parent directory")?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(|e| e.to_string())?;
+    std::io::Write::write_all(&mut tmp, doc.to_string().as_bytes()).map_err(|e| e.to_string())?;
+    // NamedTempFile is 0600; keep the file's mode, or 0644 for a new file.
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = std::fs::symlink_metadata(path)
+        .ok()
+        .filter(std::fs::Metadata::is_file)
+        .map_or(0o644, |m| m.permissions().mode() & 0o7777);
+    tmp.as_file()
+        .set_permissions(std::fs::Permissions::from_mode(mode))
+        .map_err(|e| e.to_string())?;
+    tmp.persist(path).map_err(|e| e.to_string())?;
+    Ok(true)
 }
 
 /// Remove the named root that is `identity`.
