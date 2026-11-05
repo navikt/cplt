@@ -6676,6 +6676,15 @@ paths = [
         let (_, roots) = run(&["config", "get", "sandbox.repo_dirs"]);
         assert!(roots.contains("e2e-part"), "{roots}");
 
+        // An uncommitted edit drops `[propose]`; that is not a removal.
+        std::fs::write(repo.join(".cplt.toml"), "# wip\n").expect("write");
+        let (_, shown) = run(&["trust"]);
+        assert!(!shown.contains("removed since last approval"), "{shown}");
+        git_cmd(&repo)
+            .args(["checkout", "--", ".cplt.toml"])
+            .output()
+            .expect("restore");
+
         let (ok, out) = run(&["link", "--unlink", "navikt/e2e-part"]);
         assert!(ok, "{out}");
         let (_, shown) = run(&["trust"]);

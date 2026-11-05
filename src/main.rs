@@ -12165,7 +12165,8 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
 
     // A `repos` proposal dropped entirely still has removals to report (#993):
     // with nothing proposed, the lines are only the `-` ones.
-    if !st.proposed.iter().any(|&(k, _)| k == "repos") {
+    // Not while an uncommitted edit drops `[propose]`: nothing was removed.
+    if !loaded.propose_dropped && !st.proposed.iter().any(|&(k, _)| k == "repos") {
         for line in proposed_repo_lines(project_dir, loaded, trust_entry.as_ref()) {
             println!("{blue}[cplt]{nc}    repos: {line}");
         }
