@@ -11650,7 +11650,9 @@ fn run_link_command(repo: &str, dir: Option<&Path>, unlink: bool, propose: bool)
     if !propose {
         // The explicit directory too: without it `--propose` resolves only
         // siblings and the forge folder, and fails for a checkout elsewhere.
-        let dir_arg = dir.map(|d| format!(" {}", d.display())).unwrap_or_default();
+        let dir_arg = dir
+            .map(|d| format!(" {}", sh_quote(&d.display().to_string())))
+            .unwrap_or_default();
         eprintln!(
             "  {}Share it with the team: cplt link --propose {repo}{dir_arg}{}",
             ui::color(ui::DIM),

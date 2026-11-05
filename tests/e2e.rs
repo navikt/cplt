@@ -6285,7 +6285,7 @@ paths = [
         let err = link(&[]);
         assert!(
             err.contains(&format!(
-                "cplt link --propose navikt/e2e-prop-b {}",
+                "cplt link --propose navikt/e2e-prop-b '{}'",
                 lib.path().display()
             )),
             "the hint keeps the explicit directory: {err}"
@@ -6321,6 +6321,30 @@ paths = [
         assert!(
             text.contains("[propose]\nrepos = [\"navikt/e2e-prop-b\"]"),
             "{text}"
+        );
+    }
+
+    /// #994: the hint's directory is shell-quoted, so it pastes as one argument.
+    #[test]
+    fn e2e_link_hint_quotes_directory() {
+        let project = temp_repo("navikt/e2e-prop-g");
+        let lib = temp_repo("navikt/e2e-prop-h");
+        let cfg = tempfile::tempdir().unwrap();
+        let config_file = cfg.path().join("config.toml");
+        let spaced = cfg.path().join("lib dir");
+        std::fs::rename(lib.path(), &spaced).unwrap();
+        let out = trust_cmd(project.path(), &config_file)
+            .args(["link", "navikt/e2e-prop-h", spaced.to_str().unwrap()])
+            .output()
+            .expect("link runs");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{err}");
+        assert!(
+            err.contains(&format!(
+                "cplt link --propose navikt/e2e-prop-h '{}'",
+                spaced.display()
+            )),
+            "{err}"
         );
     }
 
