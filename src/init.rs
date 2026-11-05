@@ -19,6 +19,10 @@ pub struct InitOptions {
     pub merge: bool,
     /// Output only the TOML (no decoration/ecosystem info).
     pub quiet: bool,
+    /// `owner/name` identities this checkout linked (`[linked]` in its local
+    /// config), suggested as `[propose] repos` so a teammate's first launch
+    /// offers the same roots (#990). Recorded at link time: no git spawn.
+    pub linked_repos: Vec<String>,
 }
 
 /// Result of running the init command.
@@ -54,9 +58,12 @@ pub fn run_init(project_dir: &Path, report: &DetectionReport, opts: &InitOptions
             Ok(c) => c,
             Err(e) => return InitResult::WriteFailed(config_path, e),
         };
-        merge_toml(&existing, report)
+        // merge_toml rebuilds the file and does not carry `repos`; keep them.
+        let mut repos = existing_propose_repos(&existing);
+        repos.extend(opts.linked_repos.iter().cloned());
+        with_propose_repos(merge_toml(&existing, report), &repos)
     } else {
-        generate_toml(report)
+        with_propose_repos(generate_toml(report), &opts.linked_repos)
     };
 
     if opts.write {
@@ -77,6 +84,55 @@ pub fn run_init(project_dir: &Path, report: &DetectionReport, opts: &InitOptions
         toml,
         path: config_path,
         written: false,
+    }
+}
+
+/// `[propose] repos` from an existing `.cplt.toml`, tolerant of anything malformed.
+fn existing_propose_repos(raw: &str) -> Vec<String> {
+    raw.parse::<toml::Table>()
+        .ok()
+        .and_then(|t| t.get("propose")?.get("repos")?.as_array().cloned())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Add `repos = [...]` to the `[propose]` table of generated TOML, creating the
+/// table when detection proposed nothing else. Keys must precede the
+/// `[propose.*]` sub-tables, so it goes right under the header.
+fn with_propose_repos(toml: String, repos: &[String]) -> String {
+    // `[linked]` records "" for a root with no origin; identities compare
+    // case-insensitively, so keep one spelling per repository.
+    let mut kept: Vec<&str> = Vec::new();
+    for r in repos.iter().map(|r| r.trim()).filter(|r| !r.is_empty()) {
+        if !kept.iter().any(|k| crate::gh_proxy::repos_match(k, r)) {
+            kept.push(r);
+        }
+    }
+    let repos: BTreeSet<&str> = kept.into_iter().collect();
+    if repos.is_empty() {
+        return toml;
+    }
+    let mut line = String::from("# Repositories linked in this checkout (cplt link)\n");
+    write_string_array(&mut line, "repos", &repos);
+    if let Some(i) = toml
+        .find("[propose]\n")
+        .filter(|&i| i == 0 || toml[..i].ends_with('\n'))
+    {
+        let at = i + "[propose]\n".len();
+        format!("{}{line}{}", &toml[..at], &toml[at..])
+    } else {
+        let sep = if toml.is_empty() || toml.ends_with("\n\n") {
+            ""
+        } else if toml.ends_with('\n') {
+            "\n"
+        } else {
+            "\n\n"
+        };
+        format!("{toml}{sep}[propose]\n{line}")
     }
 }
 
@@ -1100,6 +1156,7 @@ mod tests {
                 force: false,
                 merge: false,
                 quiet: false,
+                linked_repos: vec![],
             },
         );
         assert!(matches!(result, InitResult::NothingDetected));
@@ -1118,6 +1175,7 @@ mod tests {
                 force: false,
                 merge: false,
                 quiet: false,
+                linked_repos: vec![],
             },
         );
         match result {
@@ -1139,6 +1197,7 @@ mod tests {
                 force: false,
                 merge: false,
                 quiet: false,
+                linked_repos: vec![],
             },
         );
         match result {
@@ -1166,6 +1225,7 @@ mod tests {
                 force: false,
                 merge: false,
                 quiet: false,
+                linked_repos: vec![],
             },
         );
         assert!(matches!(result, InitResult::AlreadyExists(_)));
@@ -1185,6 +1245,7 @@ mod tests {
                 force: true,
                 merge: false,
                 quiet: false,
+                linked_repos: vec![],
             },
         );
         assert!(matches!(
@@ -1662,6 +1723,7 @@ git_push_prevention = true
                 force: false,
                 merge: true,
                 quiet: false,
+                linked_repos: vec![],
             },
         );
         match result {
@@ -1714,6 +1776,7 @@ git_push_prevention = true
                 force: false,
                 merge: false,
                 quiet: false,
+                linked_repos: vec![],
             },
         );
         assert!(matches!(result, InitResult::AlreadyExists(_)));
@@ -1741,6 +1804,7 @@ git_push_prevention = true
             force,
             merge,
             quiet: false,
+            linked_repos: vec![],
         };
         match run_init(dir, &report, &opts) {
             InitResult::WriteFailed(_, e) => e.to_string(),
@@ -1802,5 +1866,60 @@ git_push_prevention = true
         // Without O_NONBLOCK this open would block until a writer appeared.
         let e = init_refusal(dir.path(), false, true);
         assert!(e.contains("not a regular file"), "{e}");
+    }
+
+    fn init_with_links(dir: &Path, merge: bool, linked: &[&str]) -> String {
+        let report = crate::detect::detect_project(dir);
+        let opts = InitOptions {
+            write: false,
+            force: false,
+            merge,
+            quiet: false,
+            linked_repos: linked.iter().map(|s| (*s).to_string()).collect(),
+        };
+        match run_init(dir, &report, &opts) {
+            InitResult::Generated { toml, written, .. } => {
+                assert!(!written, "a preview must not write");
+                toml
+            }
+            _ => panic!("expected Generated"),
+        }
+    }
+
+    /// #990: linked repositories become `[propose] repos`, the result parses as
+    /// a `.cplt.toml`, and `--merge` keeps repos the file already proposes.
+    #[test]
+    fn init_suggests_linked_repos_as_propose_repos() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
+
+        let toml = init_with_links(dir.path(), false, &["acme/libb", "acme/liba"]);
+        let parsed: crate::repo_config::RepoConfig = toml::from_str(&toml).expect(&toml);
+        assert_eq!(parsed.propose.repos, ["acme/liba", "acme/libb"], "{toml}");
+        assert!(!dir.path().join(".cplt.toml").exists());
+
+        // Alongside other proposals: repos must land in [propose], not a sub-table.
+        std::fs::write(dir.path().join("compose.yaml"), "services: {}\n").unwrap();
+        let toml = init_with_links(dir.path(), false, &["acme/liba"]);
+        let parsed: crate::repo_config::RepoConfig = toml::from_str(&toml).expect(&toml);
+        assert_eq!(parsed.propose.repos, ["acme/liba"], "{toml}");
+
+        std::fs::write(
+            dir.path().join(".cplt.toml"),
+            "[propose]\nrepos = [\"acme/old\"]\n",
+        )
+        .unwrap();
+        let toml = init_with_links(dir.path(), true, &["acme/liba"]);
+        let parsed: crate::repo_config::RepoConfig = toml::from_str(&toml).expect(&toml);
+        assert_eq!(parsed.propose.repos, ["acme/liba", "acme/old"], "{toml}");
+
+        assert!(!init_with_links(dir.path(), false, &[]).contains("repos ="));
+
+        // An unresolved root ("") is never suggested, and case variants dedupe.
+        std::fs::remove_file(dir.path().join(".cplt.toml")).unwrap();
+        assert!(!init_with_links(dir.path(), false, &[""]).contains("repos ="));
+        let toml = init_with_links(dir.path(), false, &["", "Acme/LibA", "acme/liba"]);
+        let parsed: crate::repo_config::RepoConfig = toml::from_str(&toml).expect(&toml);
+        assert_eq!(parsed.propose.repos.len(), 1, "{toml}");
     }
 }

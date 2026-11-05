@@ -11323,6 +11323,20 @@ fn run_config_explain(key: Option<&str>) -> ExitCode {
     }
 }
 
+/// The identities `cplt link` recorded for roots still in this checkout's
+/// `sandbox.repo_dirs`. Read from the local config only: no git spawn.
+fn linked_repo_identities(project_dir: &Path) -> Vec<String> {
+    let Some(local) = config::load_local(project_dir).ok().flatten() else {
+        return Vec::new();
+    };
+    let roots = local.config.sandbox.repo_dirs.as_slice();
+    config::linked_identities(&local.raw)
+        .into_iter()
+        .filter(|(entry, _)| roots.contains(entry))
+        .map(|(_, identity)| identity)
+        .collect()
+}
+
 fn run_init_command(write: bool, force: bool, merge: bool, quiet: bool) -> ExitCode {
     let project_dir = detect_project_root()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
@@ -11332,6 +11346,7 @@ fn run_init_command(write: bool, force: bool, merge: bool, quiet: bool) -> ExitC
         force,
         merge,
         quiet,
+        linked_repos: linked_repo_identities(&project_dir),
     };
 
     // Detect once, use for both display and generation (monorepo-aware)
@@ -11429,6 +11444,7 @@ fn run_init_global_command(write: bool, force: bool, quiet: bool) -> ExitCode {
         force,
         merge: false,
         quiet,
+        linked_repos: Vec::new(),
     };
 
     let result = cplt::init::run_init_global(&config_path, &report, &opts);
