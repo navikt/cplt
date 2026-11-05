@@ -104,7 +104,15 @@ fn existing_propose_repos(raw: &str) -> Vec<String> {
 /// table when detection proposed nothing else. Keys must precede the
 /// `[propose.*]` sub-tables, so it goes right under the header.
 fn with_propose_repos(toml: String, repos: &[String]) -> String {
-    let repos: BTreeSet<&str> = repos.iter().map(String::as_str).collect();
+    // `[linked]` records "" for a root with no origin; identities compare
+    // case-insensitively, so keep one spelling per repository.
+    let mut kept: Vec<&str> = Vec::new();
+    for r in repos.iter().map(|r| r.trim()).filter(|r| !r.is_empty()) {
+        if !kept.iter().any(|k| crate::gh_proxy::repos_match(k, r)) {
+            kept.push(r);
+        }
+    }
+    let repos: BTreeSet<&str> = kept.into_iter().collect();
     if repos.is_empty() {
         return toml;
     }
@@ -1906,5 +1914,12 @@ git_push_prevention = true
         assert_eq!(parsed.propose.repos, ["acme/liba", "acme/old"], "{toml}");
 
         assert!(!init_with_links(dir.path(), false, &[]).contains("repos ="));
+
+        // An unresolved root ("") is never suggested, and case variants dedupe.
+        std::fs::remove_file(dir.path().join(".cplt.toml")).unwrap();
+        assert!(!init_with_links(dir.path(), false, &[""]).contains("repos ="));
+        let toml = init_with_links(dir.path(), false, &["", "Acme/LibA", "acme/liba"]);
+        let parsed: crate::repo_config::RepoConfig = toml::from_str(&toml).expect(&toml);
+        assert_eq!(parsed.propose.repos.len(), 1, "{toml}");
     }
 }
