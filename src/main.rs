@@ -9620,9 +9620,8 @@ fn run_doctor(cli: &Cli, verbose: bool, fix: bool) -> ExitCode {
             matches!(bubblewrap, doctor::Bubblewrap::Usable(_)),
         ));
     }
-    if has_config {
-        findings.extend(doctor::brief_nudge(&resolved));
-    }
+    // Not one of the five: Info, so --verbose only, and harmless for a new user.
+    findings.extend(doctor::brief_nudge(&resolved));
     #[cfg(target_os = "macos")]
     {
         if Path::new("/usr/bin/sandbox-exec").exists() {
