@@ -12229,12 +12229,32 @@ fn clone_command(identity: &str, dest: &Path) -> (Option<PathBuf>, Vec<String>) 
     (cplt::git::trusted_git().map(Path::to_path_buf), args)
 }
 
+/// The process that runs a clone, in `cwd` (the launch repository's parent,
+/// not the agent-writable project) with `PATH` pinned to the trusted bin dirs.
+///
+/// `gh repo clone` execs `git` by `PATH` lookup and has no trusted-path mode,
+/// so resolving `gh` itself covers only the first hop: an inherited `PATH`
+/// with a project-relative entry would hand the second hop, unsandboxed and
+/// with the user's credentials, to whatever the project put there. The git
+/// fallback goes through `git::command`, the hardened choke point.
+fn clone_process(bin: &Path, args: &[String], cwd: &Path) -> Option<std::process::Command> {
+    let mut cmd = if bin.file_name().is_some_and(|n| n == "gh") {
+        #[allow(clippy::disallowed_methods)] // `bin` is already a resolved trusted path
+        let mut c = std::process::Command::new(bin);
+        c.args(args).current_dir(cwd);
+        c
+    } else {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        cplt::git::command(cwd, &args)?
+    };
+    cmd.env("PATH", cplt::git::TRUSTED_BIN_DIRS.join(":"));
+    Some(cmd)
+}
+
 /// Run a clone and report a failure. Split out so a test can hand it a fake
 /// binary: the real one comes only from the trusted directories.
-fn run_clone(bin: &Path, args: &[String]) -> bool {
-    #[allow(clippy::disallowed_methods)] // `bin` is already a resolved trusted path
-    let status = std::process::Command::new(bin).args(args).status();
-    match status {
+fn run_clone(mut cmd: std::process::Command) -> bool {
+    match cmd.status() {
         Ok(s) if s.success() => true,
         Ok(s) => {
             ui::error(&format!("Clone failed ({s}). Nothing was linked."));
@@ -12242,8 +12262,7 @@ fn run_clone(bin: &Path, args: &[String]) -> bool {
         }
         Err(e) => {
             ui::error(&format!(
-                "Could not run {}: {e}. Nothing was linked.",
-                bin.display()
+                "Could not run the clone: {e}. Nothing was linked."
             ));
             false
         }
@@ -12263,16 +12282,23 @@ fn offer_clone(project_dir: &Path, identity: &str) -> Option<cplt::link::Candida
     let name = identity.split_once('/')?.1;
     let dest = project_dir.parent()?.join(name);
     let (bin, args) = clone_command(identity, &dest);
+    let mut shown_args = args.clone();
+    if let Some(last) = shown_args.last_mut() {
+        *last = sh_quote(last);
+    }
     let shown = format!(
         "{} {}",
         bin.as_deref()
             .and_then(Path::file_name)
             .map_or("git".into(), |n| n.to_string_lossy()),
-        args.join(" ")
+        shown_args.join(" ")
     );
     let interactive = std::io::stdin().is_terminal();
-    if dest.exists() || bin.is_none() || !interactive {
-        if dest.exists() {
+    // Not `exists()`: that follows a symlink, and a dangling one is still
+    // something cplt must not clone through.
+    let occupied = std::fs::symlink_metadata(&dest).is_ok();
+    if occupied || bin.is_none() || !interactive {
+        if occupied {
             eprintln!(
                 "  {} exists but is not {identity}, so cplt will not clone into it.",
                 dest.display()
@@ -12291,7 +12317,11 @@ fn offer_clone(project_dir: &Path, identity: &str) -> Option<cplt::link::Candida
     if !cplt::host_fix::consents(read.map(|_| answer.as_str())) {
         return None;
     }
-    if !run_clone(bin.as_deref()?, &args) {
+    if !run_clone(clone_process(
+        bin.as_deref()?,
+        &args,
+        project_dir.parent()?,
+    )?) {
         return None;
     }
     match cplt::link::verify_named(&dest, project_dir, identity) {
@@ -12637,7 +12667,7 @@ no longer apply"
             {
                 let mut entry = carried.unwrap_or_default();
                 let fresh = link_proposed_repos(project_dir, &unlinked_yet, &entry.accepted.linked);
-                report_linked_count(unlinked_yet.len(), &fresh.not_linked);
+                report_linked_count(loaded.config.propose.repos.len(), &fresh.not_linked);
                 entry.accepted.linked = merge_linked(entry.accepted.linked.clone(), fresh.linked);
                 if let Err(e) = trust::save_trust(project_dir, &entry) {
                     ui::error(&format!("Failed to save trust: {e}"));
@@ -14027,12 +14057,14 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("tempdir");
         let log = dir.path().join("args");
-        let write_fake = |name: &str, exit: i32| {
-            let bin = dir.path().join(name);
+        let write_fake = |sub: &str, exit: i32| {
+            let d = dir.path().join(sub);
+            std::fs::create_dir_all(&d).expect("mkdir");
+            let bin = d.join("gh");
             std::fs::write(
                 &bin,
                 format!(
-                    "#!/bin/sh\necho \"$@\" > '{}'\nexit {exit}\n",
+                    "#!/bin/sh\necho \"$PATH|$(pwd)|$@\" > '{}'\nexit {exit}\n",
                     log.display()
                 ),
             )
@@ -14045,10 +14077,30 @@ mod tests {
         assert!(args.iter().any(|a| a.contains("acme/libb")), "{args:?}");
         assert!(args.last().is_some_and(|a| a.ends_with("libb")), "{args:?}");
 
-        assert!(super::run_clone(&write_fake("gh-ok", 0), &args));
+        let run = |sub: &str, exit: i32| {
+            let cmd =
+                super::clone_process(&write_fake(sub, exit), &args, dir.path()).expect("command");
+            super::run_clone(cmd)
+        };
+        assert!(run("ok", 0));
         let got = std::fs::read_to_string(&log).expect("fake ran");
-        assert!(got.contains("acme/libb"), "{got}");
-        assert!(!super::run_clone(&write_fake("gh-fail", 1), &args));
+        let mut fields = got.trim_end().splitn(3, '|');
+        assert_eq!(
+            fields.next(),
+            Some(cplt::git::TRUSTED_BIN_DIRS.join(":").as_str()),
+            "gh must not see the inherited PATH: {got}"
+        );
+        let cwd = std::fs::canonicalize(dir.path()).expect("canon");
+        assert_eq!(
+            fields.next().map(std::path::PathBuf::from),
+            Some(cwd),
+            "{got}"
+        );
+        assert!(
+            fields.next().is_some_and(|a| a.contains("acme/libb")),
+            "{got}"
+        );
+        assert!(!run("fail", 1));
     }
 
     /// The record of what an approval linked is the only way `trust revoke

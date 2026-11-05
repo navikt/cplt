@@ -165,6 +165,9 @@ pub fn is_valid_identity(identity: &str) -> bool {
     };
     [owner, name].iter().all(|part| {
         !part.is_empty()
+            // A leading `-` would reach `gh repo clone` as a flag. GitHub
+            // forbids it in owner and repository names anyway.
+            && !part.starts_with('-')
             && *part != "."
             && *part != ".."
             && part
@@ -692,6 +695,8 @@ mod tests {
             "..",
             "nav ikt/cplt",
             "navikt/./cplt",
+            "-u/x",
+            "navikt/--upload-pack=x",
             // Two components, and one of them walks up. `name_candidates` joins
             // the name onto the parent directory, so this is the shape that
             // reaches `parent.join("..")` — and it is the one the earlier list
