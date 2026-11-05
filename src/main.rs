@@ -3378,6 +3378,9 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
     // grant. `repos` in particular is opaque as a bare key name.
     let mut repo_propose = repo_config::ProposeSection::default();
     let mut repo_trusted = false;
+    // Set when `cplt trust accept` would refuse here (a live approval bound to
+    // another checkout), so the launch must not point at it (#980).
+    let mut approve_hint: Option<String> = Some("cplt trust accept --all".to_string());
     match repo_config::load_repo_config(&project_dir) {
         Ok(Some(loaded)) => {
             if !resolved.quiet {
@@ -3413,29 +3416,47 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                     false,
                 ));
             }
-            if loaded.propose_dropped && !resolved.quiet {
-                // Said plainly, because the alternative is a session that quietly
-                // lacks a permission the file asks for and a developer who reads
-                // the file and believes it applies.
-                // "Commit it" is wrong advice in a directory that is not a git
-                // repository at all, and that case reaches here too — the
-                // working-tree load does not require git. `explain()` already
-                // distinguishes the two, so let it say which one this is.
-                let why = match repo_config::repo_config_state(&project_dir) {
-                    repo_config::RepoConfigState::NotAGitRepo { .. } => {
-                        "This is not a git repository, so the permissions .cplt.toml asks \
-                         for are ignored: cplt grants only what a commit contains."
-                    }
-                    _ => {
-                        "This .cplt.toml is not committed, so the permissions it asks for \
-                         are ignored. Commit it to propose them."
-                    }
-                };
-                ui::warn(&format!(
-                    "{why} Its [deny] keys apply either way, and so does a [propose] key \
-                     that only tightens."
-                ));
-            }
+            // An uncommitted file's dropped [propose] is explained once, by
+            // `warn_repo_config_discrepancy` below (#984).
+
+            // Proposed repos this checkout's local config does not link yet.
+            // Empty means `repos` is satisfied: approving it would add no root.
+            let unlinked_repos = if loaded.propose_dropped || loaded.config.propose.repos.is_empty()
+            {
+                Vec::new()
+            } else {
+                let (dirs, recorded) = local_cfg.as_ref().map_or_else(
+                    || (&[][..], std::collections::BTreeMap::default()),
+                    |l| {
+                        (
+                            &l.config.sandbox.repo_dirs[..],
+                            config::linked_identities(&l.raw),
+                        )
+                    },
+                );
+                cplt::link::unlinked_proposed_repos(
+                    &loaded.config.propose.repos,
+                    dirs,
+                    &recorded,
+                    |dir| {
+                        cplt::git::trusted_git()
+                            .and_then(|git| cplt::gh_proxy::detect_current_repo(git, dir).ok())
+                    },
+                    // Backfill for a legacy entry. Best effort: never fails a launch.
+                    |entry, id| {
+                        let _ = config::set_linked_identity(&project_dir, entry, Some(id));
+                    },
+                )
+            };
+            let link_hint = (!unlinked_repos.is_empty()).then(|| {
+                unlinked_repos
+                    .iter()
+                    .map(|r| format!("`cplt link {r}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            });
+            let only_satisfied_repos = unlinked_repos.is_empty()
+                && repo_config::proposed_keys(&loaded.config.propose) == ["repos"];
 
             // Determine approved keys
             let approved_keys: Vec<String> = if cli.accept_repo_config {
@@ -3475,6 +3496,13 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                         // the content hash matches too). The approval is bound to
                         // the local repository: a matching fingerprint presented
                         // from a DIFFERENT one is NOT auto-trusted.
+                        // Everything proposed is already linked here: nothing
+                        // to approve, so nothing to say (#980).
+                        (
+                            Some(_),
+                            trust::Verdict::Foreign
+                            | trust::Verdict::Status(trust::ApprovalStatus::Changed),
+                        ) if !loaded.propose_dropped && only_satisfied_repos => {}
                         (Some(t), trust::Verdict::Foreign) => {
                             let current_hash = trust::proposal_content_hash(&loaded.config.propose);
                             let status = trust::approval_status(t, &current_hash, nothing_proposed);
@@ -3485,14 +3513,36 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                             };
                             // Nothing proposed: there is nothing to re-approve,
                             // and pointing at accept would repeat #560.
-                            let hint = if !nothing_proposed {
-                                " Re-approve with `cplt trust accept`."
+                            let orphaned = trust::approval_is_orphaned(t);
+                            // `trust accept` refuses a live foreign entry, so
+                            // point at what works instead (#980).
+                            if !orphaned {
+                                approve_hint =
+                                    link_hint.as_ref().map(|l| format!("{l} (for repos)"));
+                            }
+                            let hint = if !nothing_proposed && orphaned {
+                                " Re-approve with `cplt trust accept`.".to_string()
+                            } else if !nothing_proposed {
+                                let link = link_hint.as_ref().map_or(String::new(), |l| {
+                                    format!(" Link the proposed repositories here with {l}.")
+                                });
+                                let rest = if only_satisfied_repos
+                                    || repo_config::proposed_keys(&loaded.config.propose)
+                                        .iter()
+                                        .all(|k| *k == "repos")
+                                {
+                                    ""
+                                } else {
+                                    " To approve the rest here, run `cplt trust revoke --all` \
+                                     first; that also removes the approval in that repository."
+                                };
+                                format!("{link}{rest}")
                             } else if status != trust::ApprovalStatus::Current
                                 && trust::approval_is_orphaned(t)
                             {
-                                " `cplt trust accept --all` removes it."
+                                " `cplt trust accept --all` removes it.".to_string()
                             } else {
-                                ""
+                                String::new()
                             };
                             ui::warn(&format!(
                                 ".cplt.toml for this remote was approved in a different \
@@ -3525,6 +3575,12 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                 .collect();
             unapproved_proposals =
                 resolved.apply_repo_config(&loaded.config, &loaded.dir, &approved_refs);
+            // A satisfied `repos` is not pending. This only edits the warning
+            // list: the grant was decided above and the roots come from the
+            // local config either way, so it can never widen access.
+            if unlinked_repos.is_empty() {
+                unapproved_proposals.retain(|k| k != "repos");
+            }
             repo_propose = loaded.config.propose.clone();
         }
         Ok(None) => {} // No .cplt.toml in HEAD — warn_repo_config_discrepancy explains why
@@ -3737,11 +3793,13 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                 None => eprintln!("  {}○{} {key}", ui::color(ui::YELLOW), ui::color(ui::RESET)),
             }
         }
-        eprintln!(
-            "  {}Approve:{} cplt trust accept --all",
-            ui::color(ui::DIM),
-            ui::color(ui::RESET),
-        );
+        if let Some(hint) = &approve_hint {
+            eprintln!(
+                "  {}Approve:{} {hint}",
+                ui::color(ui::DIM),
+                ui::color(ui::RESET),
+            );
+        }
     }
 
     if !resolved.quiet && ui::verbose() {
@@ -11559,15 +11617,22 @@ fn run_link_command(repo: &str, dir: Option<&Path>, unlink: bool) -> ExitCode {
             ui::color(ui::RESET)
         );
     }
-    run_config_set(
+    let entry = found.dir.to_string_lossy();
+    let code = run_config_set(
         "sandbox.repo_dirs",
-        &[&found.dir.to_string_lossy()],
+        &[&entry],
         false,
         false,
         false,
         false,
         true,
-    )
+    );
+    if code == ExitCode::SUCCESS {
+        // Verified above, so the launch can skip reading it again (#980).
+        // Best effort: without it the launch reads the origin once.
+        let _ = config::set_linked_identity(&project_dir, &entry, Some(repo));
+    }
+    code
 }
 
 /// Remove the named root that is `identity`.
@@ -11606,15 +11671,18 @@ fn unlink_by_identity(project_dir: &Path, identity: &str) -> ExitCode {
     };
 
     match cplt::link::choose_unlink(&linked, identity, read_identity) {
-        cplt::link::Unlink::Remove(entry) => run_config_set(
-            "sandbox.repo_dirs",
-            &[entry.as_str()],
-            false,
-            true,
-            false,
-            false,
-            true,
-        ),
+        cplt::link::Unlink::Remove(entry) => {
+            let _ = config::set_linked_identity(project_dir, &entry, None);
+            run_config_set(
+                "sandbox.repo_dirs",
+                &[entry.as_str()],
+                false,
+                true,
+                false,
+                false,
+                true,
+            )
+        }
         cplt::link::Unlink::NoMatch => {
             // The recorded list, not a pointer at another command: the user is
             // here because they do not know what is linked.
@@ -12074,6 +12142,7 @@ fn link_proposed_repos(project_dir: &Path, repos: &[String]) -> Vec<trust::Linke
                     // it. Claiming it would make `trust revoke repos` delete a
                     // root the user linked by hand (#496 review).
                     println!("  • {identity} → {path} (already linked; left as yours)");
+                    let _ = config::set_linked_identity(project_dir, &path, Some(identity));
                     continue;
                 } else if run_config_set(
                     "sandbox.repo_dirs",
@@ -12089,6 +12158,7 @@ fn link_proposed_repos(project_dir: &Path, repos: &[String]) -> Vec<trust::Linke
                     // not: an approval must not claim a grant that is not there.
                     continue;
                 }
+                let _ = config::set_linked_identity(project_dir, &path, Some(identity));
                 linked.push(trust::LinkedRepo {
                     identity: identity.clone(),
                     path,
@@ -12161,6 +12231,7 @@ fn unlink_approved_repos(project_dir: &Path, linked: &[trust::LinkedRepo]) {
             path: entry.clone(),
         };
         println!("  • unlinking {} ({})", repo.identity, repo.path);
+        let _ = config::set_linked_identity(project_dir, &repo.path, None);
         run_config_set(
             "sandbox.repo_dirs",
             &[repo.path.as_str()],

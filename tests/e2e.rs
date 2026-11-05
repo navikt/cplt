@@ -6433,6 +6433,229 @@ paths = [
         let _ = std::fs::remove_dir_all(&model);
     }
 
+    fn make_origin_repo(dir: &Path, identity: &str) {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).expect("mkdir");
+        let url = format!("git@github.com:{identity}.git");
+        for args in [
+            vec!["init", "--quiet"],
+            vec!["remote", "add", "origin", url.as_str()],
+        ] {
+            let out = git_cmd(dir).args(&args).output().expect("git runs");
+            assert!(out.status.success(), "git {args:?} failed");
+        }
+    }
+
+    fn launch_stderr(repo: &Path, config_file: &Path) -> String {
+        let out = trust_cmd(repo, config_file)
+            .args([
+                "--agent",
+                "shell",
+                "--yes",
+                "--no-validate",
+                "--",
+                "-c",
+                "true",
+            ])
+            .output()
+            .expect("run");
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "launch failed:\n{stderr}");
+        stderr
+    }
+
+    /// #984/#980: a `repos` proposal whose repositories are all linked in this
+    /// checkout's local config is satisfied and not nagged about. Satisfied
+    /// grants nothing: no trust approval is recorded and no root is added.
+    #[test]
+    fn e2e_propose_repos_satisfied_by_existing_links_is_quiet_and_grants_nothing() {
+        require_sandbox!();
+        let (repo, config_file) = make_trust_repo(
+            "propose-satisfied",
+            "[propose]\nrepos = [\"navikt/e2e-sat-a\", \"navikt/e2e-sat-b\"]\n",
+        );
+        let _ = std::fs::remove_dir_all(config_file.parent().expect("cfg dir").join("trust"));
+        let parent = repo.parent().expect("parent").to_path_buf();
+        make_origin_repo(&parent.join("e2e-sat-a"), "navikt/e2e-sat-a");
+        make_origin_repo(&parent.join("e2e-sat-b"), "navikt/e2e-sat-b");
+        let link = |r: &str| {
+            let out = trust_cmd(&repo, &config_file)
+                .args(["link", r])
+                .output()
+                .expect("link runs");
+            assert!(out.status.success(), "link {r} failed");
+        };
+
+        let local_raw = || {
+            let dir = config_file.parent().expect("cfg dir").join("local");
+            std::fs::read_dir(&dir)
+                .expect("local dir")
+                .map(|e| std::fs::read_to_string(e.expect("entry").path()).expect("read"))
+                .collect::<String>()
+        };
+
+        // Partly linked: still pending, and named. `cplt link` records the
+        // verified identity, so the launch need not read it again.
+        link("navikt/e2e-sat-a");
+        assert!(
+            local_raw().contains("= \"navikt/e2e-sat-a\""),
+            "{}",
+            local_raw()
+        );
+        let stderr = launch_stderr(&repo, &config_file);
+        assert!(stderr.contains("unapproved permission"), "{stderr}");
+
+        // Fully linked, the second one the legacy way (no recorded identity):
+        // satisfied, and the launch backfills the identity.
+        let b = std::fs::canonicalize(parent.join("e2e-sat-b")).expect("canon");
+        let out = trust_cmd(&repo, &config_file)
+            .args([
+                "config",
+                "set",
+                "--local",
+                "sandbox.repo_dirs",
+                b.to_str().unwrap(),
+            ])
+            .output()
+            .expect("set runs");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!local_raw().contains("navikt/e2e-sat-b"), "{}", local_raw());
+        let stderr = launch_stderr(&repo, &config_file);
+        assert!(!stderr.contains("unapproved permission"), "{stderr}");
+        assert!(!stderr.contains("Untrusted .cplt.toml"), "{stderr}");
+        assert!(
+            !stderr.contains("ignored ("),
+            "[linked] must not warn: {stderr}"
+        );
+        assert!(
+            local_raw().contains("= \"navikt/e2e-sat-b\""),
+            "{}",
+            local_raw()
+        );
+
+        // Never widens: the trust store still approves nothing, and the roots
+        // are exactly the two the user linked.
+        let out = trust_cmd(&repo, &config_file)
+            .args(["trust", "show", "--json"])
+            .output()
+            .expect("trust show");
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+        assert_ne!(v["state"], "approved", "{v}");
+        let out = trust_cmd(&repo, &config_file)
+            .args(["config", "get", "sandbox.repo_dirs"])
+            .output()
+            .expect("get runs");
+        let roots = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(roots.matches("e2e-sat-").count(), 2, "{roots}");
+
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// #980 review: an approved checkout that later proposes one more
+    /// repository the user already linked is satisfied, not "changed".
+    #[test]
+    fn e2e_changed_repos_proposal_already_linked_is_quiet() {
+        require_sandbox!();
+        let (repo, config_file) = make_trust_repo(
+            "propose-changed",
+            "[propose]\nrepos = [\"navikt/e2e-chg-a\"]\n",
+        );
+        let _ = std::fs::remove_dir_all(config_file.parent().expect("cfg dir").join("trust"));
+        let parent = repo.parent().expect("parent").to_path_buf();
+        make_origin_repo(&parent.join("e2e-chg-a"), "navikt/e2e-chg-a");
+        make_origin_repo(&parent.join("e2e-chg-b"), "navikt/e2e-chg-b");
+        let run = |args: &[&str]| {
+            let out = trust_cmd(&repo, &config_file)
+                .args(args)
+                .output()
+                .expect("runs");
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["trust", "accept", "repos"]);
+        run(&["link", "navikt/e2e-chg-b"]);
+        std::fs::write(
+            repo.join(".cplt.toml"),
+            "[propose]\nrepos = [\"navikt/e2e-chg-a\", \"navikt/e2e-chg-b\"]\n",
+        )
+        .unwrap();
+        git_cmd(&repo)
+            .args(["-c", "commit.gpgSign=false", "commit", "-qam", "more"])
+            .output()
+            .expect("commit");
+
+        let stderr = launch_stderr(&repo, &config_file);
+        assert!(
+            !stderr.contains("changed since the last approval"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("unapproved permission"), "{stderr}");
+
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// #980: in a second checkout of an approved repository, `trust accept`
+    /// refuses, so the launch must suggest `cplt link`, not accept.
+    #[test]
+    fn e2e_second_checkout_launch_suggests_link_not_accept() {
+        require_sandbox!();
+        let (repo, config_file) = make_trust_repo(
+            "propose-second",
+            "[propose]\nrepos = [\"navikt/e2e-sec-lib\"]\n",
+        );
+        let _ = std::fs::remove_dir_all(config_file.parent().expect("cfg dir").join("trust"));
+        let parent = repo.parent().expect("parent").to_path_buf();
+        make_origin_repo(&parent.join("e2e-sec-lib"), "navikt/e2e-sec-lib");
+        let origin = "git@github.com:navikt/e2e-sec-app.git";
+        git_cmd(&repo)
+            .args(["remote", "add", "origin", origin])
+            .output()
+            .expect("remote");
+        let out = trust_cmd(&repo, &config_file)
+            .args(["trust", "accept", "repos"])
+            .output()
+            .expect("accept runs");
+        assert!(out.status.success(), "accept failed");
+
+        let second = parent.join("repo-2");
+        let _ = std::fs::remove_dir_all(&second);
+        let out = git_cmd(&parent)
+            .args(["clone", "--quiet", repo.to_str().unwrap(), "repo-2"])
+            .output()
+            .expect("clone");
+        assert!(out.status.success(), "clone failed");
+        git_cmd(&second)
+            .args(["remote", "set-url", "origin", origin])
+            .output()
+            .expect("set-url");
+
+        let stderr = launch_stderr(&second, &config_file);
+        assert!(
+            stderr.contains("`cplt link navikt/e2e-sec-lib`"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("cplt trust accept"), "{stderr}");
+
+        // After linking, the proposal is satisfied here too.
+        let out = trust_cmd(&second, &config_file)
+            .args(["link", "navikt/e2e-sec-lib"])
+            .output()
+            .expect("link runs");
+        assert!(out.status.success(), "link failed");
+        let stderr = launch_stderr(&second, &config_file);
+        assert!(!stderr.contains("unapproved permission"), "{stderr}");
+        assert!(!stderr.contains("different repository"), "{stderr}");
+
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
     /// `--accept-repo-config` approves for one run and persists nothing.
     /// Linking a repository is persistent, so it is the one proposal the flag
     /// cannot approve.
@@ -7353,8 +7576,13 @@ paths = [
             "an uncommitted proposal must not be granted by the flag:\n{stderr}"
         );
         assert!(
-            stderr.contains("not committed, so the permissions it asks for are ignored"),
+            stderr.contains("exists in the working tree but not in git HEAD"),
             "and the run must say why it was ignored:\n{stderr}"
+        );
+        // #984: once, not twice.
+        assert!(
+            !stderr.contains("not committed, so the permissions it asks for are ignored"),
+            "the uncommitted notice must be printed once:\n{stderr}"
         );
 
         let _ = std::fs::remove_dir_all(&repo);
