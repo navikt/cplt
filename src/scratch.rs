@@ -993,6 +993,18 @@ fn gc_stale_session_dirs(base: &Path) {
             }
         }
 
+        // Kept at exit for a dirty worktree (#963): the user removes it.
+        // Honoured only while a linked worktree is still there, so a planted
+        // or outlived marker does not keep the dir forever.
+        if path
+            .join(KEPT_MARKER)
+            .symlink_metadata()
+            .is_ok_and(|m| m.is_file())
+            && !linked_worktrees(&path).is_empty()
+        {
+            continue;
+        }
+
         // Check age via directory modification time
         let Ok(modified) = metadata.modified() else {
             continue;
@@ -1183,8 +1195,283 @@ impl Drop for SessionSocketDir {
 
 impl Drop for ScratchDir {
     fn drop(&mut self) {
-        remove_owned_dir(&self.path, self.device, self.inode, "scratch dir");
+        // Identity and permission checks first: nothing below may run on a
+        // root the agent swapped for a symlink or another directory.
+        if !prepare_owned_dir(&self.path, self.device, self.inode, "scratch dir") {
+            return;
+        }
+        let kept = dirty_worktrees(&self.path);
+        if kept.is_empty() {
+            remove_prepared_dir(&self.path, "scratch dir");
+            return;
+        }
+        // Re-open the root fd-relative and re-check it is still ours.
+        let root = open_dir_nofollow(&self.path).ok().filter(|f| {
+            use std::os::unix::fs::MetadataExt;
+            f.metadata()
+                .is_ok_and(|m| m.dev() == self.device && m.ino() == self.inode)
+        });
+        let Some(root) = root else {
+            ui::warn("Warning: refusing to cleanup replaced scratch dir");
+            return;
+        };
+        let keep: Vec<Vec<std::ffi::OsString>> = kept
+            .iter()
+            .filter_map(|k| k.strip_prefix(&self.path).ok())
+            .map(|rel| rel.iter().map(ToOwned::to_owned).collect())
+            .collect();
+        remove_all_except_at(&root, &keep);
+        for file in GH_TOKEN_FILES {
+            if self.path.join(file).symlink_metadata().is_ok() {
+                ui::error(&format!(
+                    "cannot delete the gh token cache {}; delete it by hand",
+                    crate::audit::escape_path(&self.path.join(file).to_string_lossy())
+                ));
+            }
+        }
+        // Written after the sweep, so a marker the agent planted is gone and
+        // this one is ours. `gc_stale_session_dirs` leaves the dir alone.
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(self.path.join(KEPT_MARKER));
+        for wt in &kept {
+            ui::warn(&kept_message(wt));
+        }
     }
+}
+
+/// Worktree names are agent-chosen: escape them before they reach the terminal.
+fn kept_message(wt: &Path) -> String {
+    format!(
+        "Kept a git worktree with uncommitted changes: {}\n  \
+         Commit or copy what you need, then delete it and run `git worktree prune` in the repository.",
+        crate::audit::escape_path(&wt.to_string_lossy())
+    )
+}
+
+/// Marks a scratch dir kept at exit because it holds a dirty worktree (#963).
+/// Orphan cleanup skips it: the user deletes it after recovering the work.
+const KEPT_MARKER: &str = ".cplt-kept-worktree";
+
+/// Walk bounds for [`dirty_worktrees`]. The tree is agent-written, so the walk
+/// must terminate however deep or wide it is. A worktree past the bounds is
+/// deleted as before.
+const WORKTREE_SCAN_DEPTH: usize = 4;
+const WORKTREE_SCAN_ENTRIES: usize = 20_000;
+const WORKTREE_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Linked git worktrees under `scratch` that hold uncommitted work: tracked
+/// changes or untracked, non-ignored files.
+///
+/// Everything here is agent-written. The walk never follows a symlink, `.git`
+/// must be a plain file naming a gitdir in some repository's
+/// `.git/worktrees/<id>` outside scratch, and status runs through
+/// [`crate::git::command`] (no hooks, fsmonitor or repo filters). When status
+/// cannot be determined the worktree is kept: losing work is worse than a
+/// leftover directory.
+fn dirty_worktrees(scratch: &Path) -> Vec<PathBuf> {
+    let mut found = linked_worktrees(scratch);
+    found.retain(|wt| worktree_dirty(wt));
+    found
+}
+
+/// Every linked worktree under `scratch`, within the walk bounds.
+fn linked_worktrees(scratch: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut budget = WORKTREE_SCAN_ENTRIES;
+    let mut stack = vec![(scratch.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if budget == 0 {
+                return found;
+            }
+            budget -= 1;
+            // `DirEntry::file_type` does not follow symlinks.
+            let Ok(ft) = entry.file_type() else { continue };
+            if !ft.is_dir() || ft.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if is_linked_worktree(&path, scratch) {
+                found.push(path.clone());
+            }
+            // Clean worktrees are walked too: a dirty one can sit below.
+            if depth + 1 < WORKTREE_SCAN_DEPTH && entry.file_name() != ".git" {
+                stack.push((path, depth + 1));
+            }
+        }
+    }
+    found
+}
+
+fn is_linked_worktree(dir: &Path, scratch: &Path) -> bool {
+    let Ok(Some(text)) = crate::untrusted::read_untrusted(&dir.join(".git"), 4096) else {
+        return false;
+    };
+    let Some(gitdir) = text.trim_end().strip_prefix("gitdir: ") else {
+        return false;
+    };
+    let Ok(gitdir) = std::fs::canonicalize(dir.join(gitdir)) else {
+        return false;
+    };
+    let in_worktrees = gitdir
+        .parent()
+        .is_some_and(|p| p.file_name() == Some(std::ffi::OsStr::new("worktrees")));
+    let scratch = std::fs::canonicalize(scratch).unwrap_or_else(|_| scratch.to_path_buf());
+    in_worktrees && !gitdir.starts_with(scratch)
+}
+
+fn worktree_dirty(dir: &Path) -> bool {
+    // Bounded: the agent can plant a FIFO where git reads its admin files,
+    // and exit must not hang. Timeout or failure counts as dirty (kept).
+    // `--ignore-submodules=dirty` beats the hardening's `ignoreSubmodules=all`,
+    // so a submodule checked out at a different commit counts. Not `none`:
+    // that runs status inside each submodule, whose config was never probed
+    // for content filters.
+    crate::git::command(
+        dir,
+        &[
+            "status",
+            "--porcelain",
+            "--untracked-files=normal",
+            "--ignore-submodules=dirty",
+        ],
+    )
+    .and_then(|c| crate::discover::bounded_stdout(c, WORKTREE_STATUS_TIMEOUT))
+    .is_none_or(|out| !out.is_empty())
+        || has_initialized_submodule(dir)
+}
+
+/// Any gitlink in the index with a `.git` at its path. Edits inside a
+/// submodule are invisible to `--ignore-submodules=dirty`, and git is never
+/// run inside one, so an initialized submodule keeps the worktree. Failure
+/// to list the index counts as yes.
+fn has_initialized_submodule(dir: &Path) -> bool {
+    let Some(out) = crate::git::command(dir, &["ls-files", "--stage", "-z"])
+        .and_then(|c| crate::discover::bounded_stdout(c, WORKTREE_STATUS_TIMEOUT))
+    else {
+        return true;
+    };
+    out.split(|b| *b == 0)
+        .filter_map(|rec| rec.strip_prefix(b"160000 "))
+        .filter_map(|rec| rec.iter().position(|b| *b == b'\t').map(|i| &rec[i + 1..]))
+        .any(|path| {
+            use std::os::unix::ffi::OsStrExt;
+            dir.join(std::ffi::OsStr::from_bytes(path))
+                .join(".git")
+                .symlink_metadata()
+                .is_ok()
+        })
+}
+
+/// Delete everything under the open directory `dir` except the `keep` paths
+/// (relative component lists) and the directories leading to them.
+///
+/// Fully fd-relative, like [`chmod_subdirs_at`]: children are listed through
+/// the fd, entered with `openat(O_DIRECTORY|O_NOFOLLOW)` and removed with
+/// `unlinkat`. A sandboxed process that swaps a directory for a symlink
+/// mid-walk gets its symlink unlinked; the walk never leaves scratch.
+fn remove_all_except_at(dir: &std::fs::File, keep: &[Vec<std::ffi::OsString>]) {
+    use std::os::unix::ffi::OsStrExt;
+    for name in list_dir_at(dir) {
+        let os = std::ffi::OsStr::from_bytes(name.to_bytes());
+        let below: Vec<Vec<std::ffi::OsString>> = keep
+            .iter()
+            .filter(|k| k.first().is_some_and(|c| c == os))
+            .map(|k| k[1..].to_vec())
+            .collect();
+        if below.iter().any(Vec::is_empty) {
+            continue;
+        }
+        if below.is_empty() {
+            remove_at(dir, &name);
+        } else if let Some(child) = open_subdir_at(dir, &name) {
+            remove_all_except_at(&child, &below);
+        } else {
+            // No longer a directory: whatever is there now is not ours to keep.
+            remove_at(dir, &name);
+        }
+    }
+}
+
+/// Open `name` under `dir` as a directory without following a symlink, and
+/// give the owner rwx so its entries can be removed.
+fn open_subdir_at(dir: &std::fs::File, name: &std::ffi::CStr) -> Option<std::fs::File> {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    // SAFETY: plain openat on a valid dir fd and NUL-terminated name.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: `fd` is a fresh descriptor this File now owns.
+    let child = unsafe { std::fs::File::from_raw_fd(fd) };
+    if let Ok(meta) = child.metadata() {
+        let mode = meta.permissions().mode() | 0o700;
+        let _ = child.set_permissions(std::fs::Permissions::from_mode(mode));
+    }
+    Some(child)
+}
+
+/// Remove `name` under `dir`, recursing fd-relative into a real directory.
+fn remove_at(dir: &std::fs::File, name: &std::ffi::CStr) {
+    use std::os::unix::io::AsRawFd;
+    let rc = if let Some(child) = open_subdir_at(dir, name) {
+        for sub in list_dir_at(&child) {
+            remove_at(&child, &sub);
+        }
+        drop(child);
+        // SAFETY: plain unlinkat; AT_REMOVEDIR fails on a swapped-in symlink.
+        unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) }
+    } else {
+        // SAFETY: unlinkat without flags removes a link, never its target.
+        unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) }
+    };
+    if rc != 0 {
+        let e = std::io::Error::last_os_error();
+        ui::warn(&format!(
+            "Warning: cannot cleanup scratch entry {}: {e}",
+            crate::audit::escape_path(&name.to_string_lossy())
+        ));
+    }
+}
+
+/// Names in `dir`, read through the fd (never a path).
+fn list_dir_at(dir: &std::fs::File) -> Vec<std::ffi::CString> {
+    use std::os::unix::io::AsRawFd;
+    // fdopendir takes ownership of the fd it gets, so hand it a dup.
+    let dup = unsafe { libc::dup(dir.as_raw_fd()) };
+    if dup < 0 {
+        return Vec::new();
+    }
+    let stream = unsafe { libc::fdopendir(dup) };
+    if stream.is_null() {
+        unsafe { libc::close(dup) };
+        return Vec::new();
+    }
+    let mut names = Vec::new();
+    loop {
+        let ent = unsafe { libc::readdir(stream) };
+        if ent.is_null() {
+            break;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
+        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            names.push(name.to_owned());
+        }
+    }
+    unsafe { libc::closedir(stream) };
+    names
 }
 
 /// Generate a random session ID using /dev/urandom.
@@ -1354,18 +1641,35 @@ pub(crate) fn remove_owned_dir(
     expected_inode: u64,
     label: &str,
 ) {
+    if prepare_owned_dir(path, expected_device, expected_inode, label) {
+        remove_prepared_dir(path, label);
+    }
+}
+
+fn remove_prepared_dir(path: &Path, label: &str) {
+    if let Err(error) = remove_tree(path) {
+        ui::warn(&format!(
+            "Warning: cannot cleanup {label} {}: {error}",
+            path.display()
+        ));
+    }
+}
+
+/// True when `path` is still the directory we created (same device and
+/// inode, not a symlink) and has been made 0700 so cleanup can proceed.
+fn prepare_owned_dir(path: &Path, expected_device: u64, expected_inode: u64, label: &str) -> bool {
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::io::AsRawFd;
 
     let metadata = match path.symlink_metadata() {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
         Err(error) => {
             ui::warn(&format!(
                 "Warning: cannot inspect {label} {} during cleanup: {error}",
                 path.display()
             ));
-            return;
+            return false;
         }
     };
     if metadata.file_type().is_symlink()
@@ -1377,24 +1681,24 @@ pub(crate) fn remove_owned_dir(
             "Warning: refusing to cleanup replaced {label} {}",
             path.display()
         ));
-        return;
+        return false;
     }
     let Ok(dir_file) = open_dir_nofollow(path) else {
         ui::warn(&format!(
             "Warning: cannot open {label} {} during cleanup",
             path.display()
         ));
-        return;
+        return false;
     };
     let Ok(fd_meta) = dir_file.metadata() else {
-        return;
+        return false;
     };
     if fd_meta.dev() != expected_device || fd_meta.ino() != expected_inode {
         ui::warn(&format!(
             "Warning: refusing to cleanup replaced {label} {}",
             path.display()
         ));
-        return;
+        return false;
     }
     if unsafe { libc::fchmod(dir_file.as_raw_fd(), 0o700) } != 0 {
         let error = std::io::Error::last_os_error();
@@ -1402,15 +1706,9 @@ pub(crate) fn remove_owned_dir(
             "Warning: cannot make {label} {} removable during cleanup: {error}",
             path.display()
         ));
-        return;
+        return false;
     }
-    drop(dir_file);
-    if let Err(error) = remove_tree(path) {
-        ui::warn(&format!(
-            "Warning: cannot cleanup {label} {}: {error}",
-            path.display()
-        ));
-    }
+    true
 }
 
 /// `remove_dir_all`, retrying once after giving the owner rwx on every real
@@ -1441,29 +1739,7 @@ fn chmod_subdirs_at(dir: &std::fs::File) {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::io::{AsRawFd, FromRawFd};
 
-    // fdopendir takes ownership of the fd it gets, so hand it a dup.
-    let dup = unsafe { libc::dup(dir.as_raw_fd()) };
-    if dup < 0 {
-        return;
-    }
-    let stream = unsafe { libc::fdopendir(dup) };
-    if stream.is_null() {
-        unsafe { libc::close(dup) };
-        return;
-    }
-    let mut names = Vec::new();
-    loop {
-        let ent = unsafe { libc::readdir(stream) };
-        if ent.is_null() {
-            break;
-        }
-        let name = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
-        if name.to_bytes() != b"." && name.to_bytes() != b".." {
-            names.push(name.to_owned());
-        }
-    }
-    unsafe { libc::closedir(stream) };
-
+    let names = list_dir_at(dir);
     for name in names {
         let fd = unsafe {
             libc::openat(
@@ -1670,6 +1946,253 @@ mod tests {
         let live_path = live.path().to_path_buf();
         drop(live);
         assert!(!live_path.exists(), "Drop removes the session dir");
+    }
+
+    #[allow(clippy::disallowed_methods)] // test fixture; trusted_git is absolute
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new(crate::git::trusted_git().unwrap())
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {} failed", args[0]);
+    }
+
+    /// #963: a dirty linked worktree in scratch survives exit, a clean one and
+    /// a symlinked `.git` do not, the token cache is deleted, and the next
+    /// launch's orphan cleanup leaves the kept dir alone.
+    #[test]
+    fn exit_keeps_only_dirty_worktrees() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let repo = home.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        std::fs::write(repo.join("a"), "a").unwrap();
+        git(&repo, &["add", "a"]);
+        git(&repo, &["commit", "-qm", "a"]);
+
+        let scratch = ScratchDir::create(&home).unwrap();
+        let s = scratch.path().to_path_buf();
+        let dirty = s.join("nested/dirty");
+        let clean = s.join("clean");
+        git(&repo, &["worktree", "add", "-q", dirty.to_str().unwrap()]);
+        git(&repo, &["worktree", "add", "-q", clean.to_str().unwrap()]);
+        std::fs::write(dirty.join("new"), "work").unwrap();
+        // A `.git` symlink to the dirty worktree's gitfile is not a worktree.
+        let linked = s.join("linked");
+        std::fs::create_dir(&linked).unwrap();
+        std::os::unix::fs::symlink(dirty.join(".git"), linked.join(".git")).unwrap();
+        std::fs::write(s.join(".gh-exec-token"), "secret").unwrap();
+        std::fs::write(s.join("other"), "x").unwrap();
+
+        drop(scratch);
+        assert!(dirty.join("new").exists(), "dirty worktree kept");
+        assert!(!clean.exists(), "clean worktree deleted");
+        assert!(!linked.exists(), "symlinked .git ignored");
+        assert!(!s.join(".gh-exec-token").exists(), "token deleted");
+        assert!(!s.join("other").exists());
+        assert!(s.join(KEPT_MARKER).is_file());
+
+        age(&s, STALE_AGE + Duration::from_secs(60));
+        ScratchDir::gc_stale(&home);
+        assert!(dirty.join("new").exists(), "orphan cleanup keeps it");
+
+        // Once the user removes the worktree, the marker no longer holds.
+        std::fs::remove_dir_all(s.join("nested")).unwrap();
+        age(&s, STALE_AGE + Duration::from_secs(60));
+        ScratchDir::gc_stale(&home);
+        assert!(!s.exists(), "marker without a worktree is collected");
+    }
+
+    fn repo_with_commit(home: &Path, gitignore: &str) -> PathBuf {
+        let repo = home.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        std::fs::write(repo.join(".gitignore"), gitignore).unwrap();
+        git(&repo, &["add", ".gitignore"]);
+        git(&repo, &["commit", "-qm", "a"]);
+        repo
+    }
+
+    /// A scratch root swapped for a symlink is not cleaned, even when the
+    /// target holds a dirty worktree: nothing outside scratch is deleted.
+    #[test]
+    fn swapped_root_is_never_cleaned() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let repo = repo_with_commit(&home, "");
+        let target = home.join("target");
+        std::fs::create_dir(&target).unwrap();
+        git(
+            &repo,
+            &["worktree", "add", "-q", target.join("wt").to_str().unwrap()],
+        );
+        std::fs::write(target.join("wt/new"), "work").unwrap();
+        std::fs::write(target.join("precious"), "x").unwrap();
+        let scratch = ScratchDir::create(&home).unwrap();
+        let s = scratch.path().to_path_buf();
+        std::fs::rename(&s, home.join("moved")).unwrap();
+        std::os::unix::fs::symlink(&target, &s).unwrap();
+        drop(scratch);
+        assert!(target.join("precious").exists());
+        assert!(target.join("wt/new").exists());
+    }
+
+    /// A root left 0500 is repaired before the selective sweep, so the
+    /// token cache still goes and the kept marker is written.
+    #[test]
+    fn read_only_root_still_loses_its_token() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let repo = repo_with_commit(&home, "");
+        let scratch = ScratchDir::create(&home).unwrap();
+        let s = scratch.path().to_path_buf();
+        git(
+            &repo,
+            &["worktree", "add", "-q", s.join("wt").to_str().unwrap()],
+        );
+        std::fs::write(s.join("wt/new"), "work").unwrap();
+        std::fs::write(s.join(".gh-token"), "secret").unwrap();
+        std::fs::set_permissions(&s, std::fs::Permissions::from_mode(0o500)).unwrap();
+        drop(scratch);
+        assert!(!s.join(".gh-token").exists());
+        assert!(s.join(KEPT_MARKER).is_file());
+        assert!(s.join("wt/new").exists());
+    }
+
+    /// A dirty worktree below a clean one (in its ignored build dir) is found.
+    #[test]
+    fn dirty_worktree_inside_clean_one_is_kept() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let repo = repo_with_commit(&home, "build/\n");
+        let scratch = ScratchDir::create(&home).unwrap();
+        let s = scratch.path().to_path_buf();
+        let outer = s.join("outer");
+        let inner = outer.join("build/inner");
+        git(&repo, &["worktree", "add", "-q", outer.to_str().unwrap()]);
+        git(&repo, &["worktree", "add", "-q", inner.to_str().unwrap()]);
+        std::fs::write(inner.join("new"), "work").unwrap();
+        drop(scratch);
+        assert!(inner.join("new").exists());
+    }
+
+    /// A submodule checked out at another commit counts as uncommitted work,
+    /// despite the hardening's `diff.ignoreSubmodules=all`.
+    #[test]
+    fn submodule_change_counts_as_dirty() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let repo = repo_with_commit(&home, "");
+        let fake = "1111111111111111111111111111111111111111";
+        git(
+            &repo,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{fake},sub"),
+            ],
+        );
+        git(&repo, &["commit", "-qm", "gitlink"]);
+        let scratch = ScratchDir::create(&home).unwrap();
+        let wt = scratch.path().join("wt");
+        git(&repo, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+        let sub = wt.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        git(&sub, &["init", "-q"]);
+        git(&sub, &["commit", "-q", "--allow-empty", "-m", "s"]);
+        assert!(worktree_dirty(&wt));
+        drop(scratch);
+        assert!(sub.exists());
+    }
+
+    /// Edits inside an initialized submodule at the recorded commit keep the
+    /// worktree, without git running inside the submodule.
+    #[test]
+    fn edits_inside_initialized_submodule_are_kept() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let repo = repo_with_commit(&home, "");
+        let scratch = ScratchDir::create(&home).unwrap();
+        let wt = scratch.path().join("wt");
+        git(&repo, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+        let sub = wt.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        git(&sub, &["init", "-q"]);
+        git(&sub, &["commit", "-q", "--allow-empty", "-m", "s"]);
+        git(&wt, &["add", "sub"]);
+        git(&wt, &["commit", "-qm", "gitlink"]);
+        std::fs::write(sub.join("edit"), "work").unwrap();
+        assert!(has_initialized_submodule(&wt));
+        drop(scratch);
+        assert!(sub.join("edit").exists());
+    }
+
+    /// Symlinks below the root, including one standing where a kept
+    /// worktree's ancestor dir was, are unlinked and never entered.
+    #[test]
+    fn selective_sweep_never_follows_symlinks_below_root() {
+        let base = tempfile::tempdir().unwrap();
+        let outside = base.path().join("outside");
+        std::fs::create_dir_all(outside.join("wt")).unwrap();
+        std::fs::write(outside.join("precious"), "x").unwrap();
+        let root = base.path().join("root");
+        std::fs::create_dir_all(root.join("a/wt")).unwrap();
+        std::fs::write(root.join("a/wt/work"), "w").unwrap();
+        std::fs::write(root.join("a/junk"), "j").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("a/b")).unwrap();
+        // Was a kept worktree's ancestor; swapped for a link to outside.
+        std::os::unix::fs::symlink(&outside, root.join("swapped")).unwrap();
+        let keep: Vec<Vec<std::ffi::OsString>> = vec![
+            vec!["a".into(), "wt".into()],
+            vec!["swapped".into(), "wt".into()],
+        ];
+        remove_all_except_at(&open_dir_nofollow(&root).unwrap(), &keep);
+        assert!(root.join("a/wt/work").exists());
+        assert!(!root.join("a/junk").exists());
+        assert!(root.join("a/b").symlink_metadata().is_err());
+        assert!(root.join("swapped").symlink_metadata().is_err());
+        assert!(outside.join("precious").exists() && outside.join("wt").exists());
+    }
+
+    #[test]
+    fn kept_message_escapes_control_chars() {
+        let msg = kept_message(Path::new("/s/\x1b]0;x\x07wt"));
+        assert!(!msg.contains('\x1b') && !msg.contains('\x07'));
+    }
+
+    /// A FIFO planted in the worktree's admin dir cannot hang exit; the
+    /// worktree is kept because its status is unknown.
+    #[test]
+    fn hung_worktree_status_times_out_and_keeps() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let admin = home.join("fake/.git/worktrees/x");
+        std::fs::create_dir_all(&admin).unwrap();
+        crate::untrusted::tests::mkfifo(&admin.join("commondir"));
+        crate::untrusted::tests::mkfifo(&admin.join("HEAD"));
+        let scratch = ScratchDir::create(&home).unwrap();
+        let wt = scratch.path().join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+        let start = std::time::Instant::now();
+        drop(scratch);
+        assert!(start.elapsed() < Duration::from_secs(20));
+        assert!(wt.exists(), "unknown status keeps the worktree");
     }
 
     /// A failed lock leaves no marker, so later launches skip the dir.

@@ -755,9 +755,18 @@ pub fn command(project_dir: &Path, args: &[&str]) -> Option<Command> {
         ));
         return None;
     }
-    if reads_worktree_content(args) && repo_defines_content_filter(project_dir) {
-        warn_refused_once();
-        return None;
+    if reads_worktree_content(args) {
+        match content_filter_probe(project_dir) {
+            Some(false) => {}
+            Some(true) => {
+                warn_refused_once();
+                return None;
+            }
+            None => {
+                crate::ui::warn(&probe_timeout_message(project_dir));
+                return None;
+            }
+        }
     }
     let mut cmd = Command::new(trusted_git()?);
     harden(&mut cmd);
@@ -805,25 +814,56 @@ pub fn project_root(dir: &Path) -> Result<PathBuf, Option<String>> {
 /// no repo config to fear in that case, and the caller's own git call will fail
 /// on its own terms.
 #[must_use]
-#[allow(clippy::disallowed_methods)] // git resolved by trusted_git() immediately above
 pub fn repo_defines_content_filter(project_dir: &Path) -> bool {
+    content_filter_probe(project_dir).unwrap_or(true)
+}
+
+/// The directory can be agent-named: escape it before it reaches the terminal.
+fn probe_timeout_message(dir: &Path) -> String {
+    format!(
+        "git config probe timed out after {}s; refusing to run git in {}",
+        CONFIG_PROBE_TIMEOUT.as_secs(),
+        crate::audit::escape_path(&dir.to_string_lossy())
+    )
+}
+
+/// [`repo_defines_content_filter`], with `None` when the probe timed out, so
+/// the caller can say so instead of claiming a filter exists.
+#[allow(clippy::disallowed_methods)] // git resolved by trusted_git() immediately above
+fn content_filter_probe(project_dir: &Path) -> Option<bool> {
     let Some(git) = trusted_git() else {
-        return false;
+        return Some(false);
     };
     let mut cmd = Command::new(git);
     harden(&mut cmd);
-    let Ok(out) = cmd
+    let Ok(mut child) = cmd
         .args(["config", "--list", "--show-scope", "--includes", "-z"])
         .current_dir(project_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
+        .spawn()
     else {
-        return false;
+        return Some(false);
     };
-    if !out.status.success() {
-        return false;
+    // Bounded: an agent-written repo can plant a FIFO where git reads its
+    // config (#963). A probe that does not finish refuses, like a found filter.
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut stdout, &mut buf).map(|_| buf)
+    });
+    let status = crate::audit::wait_timeout(&mut child, CONFIG_PROBE_TIMEOUT)?;
+    if !status.success() {
+        return Some(false);
     }
+    let Ok(Ok(stdout)) = reader.join() else {
+        return None;
+    };
+    let out = std::process::Output {
+        status,
+        stdout,
+        stderr: Vec::new(),
+    };
     // `-z` output is a flat NUL-separated stream of alternating fields:
     // scope NUL "key\nvalue" NUL scope NUL "key\nvalue" NUL ...
     // A valueless key has no newline; `split_once` yielding None handles it.
@@ -835,11 +875,13 @@ pub fn repo_defines_content_filter(project_dir: &Path) -> bool {
         }
         let key = entry.split_once('\n').map_or(entry, |(k, _)| k);
         if is_content_filter_key(key) {
-            return true;
+            return Some(true);
         }
     }
-    false
+    Some(false)
 }
+
+const CONFIG_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// `filter.<name>.clean` / `filter.<name>.process` — the two filter stages git
 /// runs while comparing the working tree. `smudge` is checkout-only and cannot
@@ -872,6 +914,27 @@ fn warn_refused_once() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A FIFO as the repo config times the probe out (`None`), which
+    /// `command` reports as a timeout, not as a content filter.
+    #[test]
+    fn config_probe_timeout_is_not_a_content_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git/refs")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".git/objects")).unwrap();
+        std::fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        crate::untrusted::tests::mkfifo(&dir.path().join(".git/config"));
+        assert_eq!(content_filter_probe(dir.path()), None);
+        assert!(repo_defines_content_filter(dir.path()));
+        assert!(command(dir.path(), &["status"]).is_none());
+    }
+
+    #[test]
+    fn probe_timeout_message_escapes_control_chars() {
+        let msg = probe_timeout_message(Path::new("/s/\x1b[2Jwt"));
+        assert!(!msg.contains('\x1b'));
+        assert!(msg.contains("\\u{1b}[2Jwt"));
+    }
 
     #[test]
     fn project_root_reports_gits_reason_outside_a_repo() {
