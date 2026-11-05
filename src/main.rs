@@ -2254,6 +2254,25 @@ fn deny_unknown(config: &repo_config::RepoConfig) -> String {
         .join(", deny.")
 }
 
+/// The proposed `repos` that no `sandbox.repo_dirs` entry in this checkout's
+/// local config already is, matched by origin (#980). Display-only: an empty
+/// result silences the nag, it never adds a root.
+fn unlinked_proposed_repos(
+    proposed: &[String],
+    linked_dirs: &[String],
+    identity_of: impl Fn(&Path) -> Option<String>,
+) -> Vec<String> {
+    let linked: Vec<String> = linked_dirs
+        .iter()
+        .filter_map(|d| identity_of(&config::expand_tilde(d)))
+        .collect();
+    proposed
+        .iter()
+        .filter(|r| !linked.iter().any(|l| gh_proxy::repos_match(l, r)))
+        .cloned()
+        .collect()
+}
+
 /// The one line that says a repo's `[propose]` is waiting for approval. Also
 /// printed by a `--quiet` agent launch: quiet hides chatter, not the fact that
 /// the repo's permissions are not applied (#673).
@@ -3378,6 +3397,9 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
     // grant. `repos` in particular is opaque as a bare key name.
     let mut repo_propose = repo_config::ProposeSection::default();
     let mut repo_trusted = false;
+    // Set when `cplt trust accept` would refuse here (a live approval bound to
+    // another checkout), so the launch must not point at it (#980).
+    let mut approve_hint: Option<String> = Some("cplt trust accept --all".to_string());
     match repo_config::load_repo_config(&project_dir) {
         Ok(Some(loaded)) => {
             if !resolved.quiet {
@@ -3413,29 +3435,35 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                     false,
                 ));
             }
-            if loaded.propose_dropped && !resolved.quiet {
-                // Said plainly, because the alternative is a session that quietly
-                // lacks a permission the file asks for and a developer who reads
-                // the file and believes it applies.
-                // "Commit it" is wrong advice in a directory that is not a git
-                // repository at all, and that case reaches here too — the
-                // working-tree load does not require git. `explain()` already
-                // distinguishes the two, so let it say which one this is.
-                let why = match repo_config::repo_config_state(&project_dir) {
-                    repo_config::RepoConfigState::NotAGitRepo { .. } => {
-                        "This is not a git repository, so the permissions .cplt.toml asks \
-                         for are ignored: cplt grants only what a commit contains."
-                    }
-                    _ => {
-                        "This .cplt.toml is not committed, so the permissions it asks for \
-                         are ignored. Commit it to propose them."
-                    }
-                };
-                ui::warn(&format!(
-                    "{why} Its [deny] keys apply either way, and so does a [propose] key \
-                     that only tightens."
-                ));
-            }
+            // An uncommitted file's dropped [propose] is explained once, by
+            // `warn_repo_config_discrepancy` below (#984).
+
+            // Proposed repos this checkout's local config does not link yet.
+            // Empty means `repos` is satisfied: approving it would add no root.
+            let unlinked_repos = if loaded.propose_dropped || loaded.config.propose.repos.is_empty()
+            {
+                Vec::new()
+            } else {
+                unlinked_proposed_repos(
+                    &loaded.config.propose.repos,
+                    local_cfg
+                        .as_ref()
+                        .map_or(&[][..], |l| &l.config.sandbox.repo_dirs),
+                    |dir| {
+                        cplt::git::trusted_git()
+                            .and_then(|git| cplt::gh_proxy::detect_current_repo(git, dir).ok())
+                    },
+                )
+            };
+            let link_hint = (!unlinked_repos.is_empty()).then(|| {
+                unlinked_repos
+                    .iter()
+                    .map(|r| format!("`cplt link {r}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            });
+            let only_satisfied_repos = unlinked_repos.is_empty()
+                && repo_config::proposed_keys(&loaded.config.propose) == ["repos"];
 
             // Determine approved keys
             let approved_keys: Vec<String> = if cli.accept_repo_config {
@@ -3475,6 +3503,10 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                         // the content hash matches too). The approval is bound to
                         // the local repository: a matching fingerprint presented
                         // from a DIFFERENT one is NOT auto-trusted.
+                        // Everything proposed is already linked here: nothing
+                        // to approve, so nothing to say (#980).
+                        (Some(_), trust::Verdict::Foreign)
+                            if !loaded.propose_dropped && only_satisfied_repos => {}
                         (Some(t), trust::Verdict::Foreign) => {
                             let current_hash = trust::proposal_content_hash(&loaded.config.propose);
                             let status = trust::approval_status(t, &current_hash, nothing_proposed);
@@ -3485,14 +3517,36 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                             };
                             // Nothing proposed: there is nothing to re-approve,
                             // and pointing at accept would repeat #560.
-                            let hint = if !nothing_proposed {
-                                " Re-approve with `cplt trust accept`."
+                            let orphaned = trust::approval_is_orphaned(t);
+                            // `trust accept` refuses a live foreign entry, so
+                            // point at what works instead (#980).
+                            if !orphaned {
+                                approve_hint =
+                                    link_hint.as_ref().map(|l| format!("{l} (for repos)"));
+                            }
+                            let hint = if !nothing_proposed && orphaned {
+                                " Re-approve with `cplt trust accept`.".to_string()
+                            } else if !nothing_proposed {
+                                let link = link_hint.as_ref().map_or(String::new(), |l| {
+                                    format!(" Link the proposed repositories here with {l}.")
+                                });
+                                let rest = if only_satisfied_repos
+                                    || repo_config::proposed_keys(&loaded.config.propose)
+                                        .iter()
+                                        .all(|k| *k == "repos")
+                                {
+                                    ""
+                                } else {
+                                    " To approve the rest here, run `cplt trust revoke --all` \
+                                     first; that also removes the approval in that repository."
+                                };
+                                format!("{link}{rest}")
                             } else if status != trust::ApprovalStatus::Current
                                 && trust::approval_is_orphaned(t)
                             {
-                                " `cplt trust accept --all` removes it."
+                                " `cplt trust accept --all` removes it.".to_string()
                             } else {
-                                ""
+                                String::new()
                             };
                             ui::warn(&format!(
                                 ".cplt.toml for this remote was approved in a different \
@@ -3525,6 +3579,12 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                 .collect();
             unapproved_proposals =
                 resolved.apply_repo_config(&loaded.config, &loaded.dir, &approved_refs);
+            // A satisfied `repos` is not pending. This only edits the warning
+            // list: the grant was decided above and the roots come from the
+            // local config either way, so it can never widen access.
+            if unlinked_repos.is_empty() {
+                unapproved_proposals.retain(|k| k != "repos");
+            }
             repo_propose = loaded.config.propose.clone();
         }
         Ok(None) => {} // No .cplt.toml in HEAD — warn_repo_config_discrepancy explains why
@@ -3737,11 +3797,13 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                 None => eprintln!("  {}○{} {key}", ui::color(ui::YELLOW), ui::color(ui::RESET)),
             }
         }
-        eprintln!(
-            "  {}Approve:{} cplt trust accept --all",
-            ui::color(ui::DIM),
-            ui::color(ui::RESET),
-        );
+        if let Some(hint) = &approve_hint {
+            eprintln!(
+                "  {}Approve:{} {hint}",
+                ui::color(ui::DIM),
+                ui::color(ui::RESET),
+            );
+        }
     }
 
     if !resolved.quiet && ui::verbose() {
