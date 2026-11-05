@@ -6298,7 +6298,7 @@ paths = [
         assert!(err.contains("Commit it"), "{err}");
         let mode = std::fs::metadata(&toml).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode, 0o640, "the rewrite keeps the file's mode");
-        assert!(!err.contains("approve it again"), "{err}");
+        assert!(!err.contains("approve them again"), "{err}");
         link(&["--propose"]);
         // Same identity in another case: not a second entry.
         let out = trust_cmd(project.path(), &config_file)
@@ -6351,7 +6351,7 @@ paths = [
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(out.status.success(), "{err}");
         assert!(
-            err.contains("approve it again: cplt trust accept --all"),
+            err.contains("approve them again: cplt trust accept --all"),
             "{err}"
         );
 

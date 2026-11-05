@@ -11669,7 +11669,7 @@ fn run_link_command(repo: &str, dir: Option<&Path>, unlink: bool, propose: bool)
             // longer matches.
             if others {
                 eprintln!(
-                    "  {}The proposal changed, so approve it again: cplt trust accept --all{}",
+                    "  {}If you approved this repository's other proposals, approve them again: cplt trust accept --all{}",
                     ui::color(ui::DIM),
                     ui::color(ui::RESET)
                 );
