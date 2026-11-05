@@ -14,6 +14,20 @@
 //! `~/.config/cplt/config.toml` too, and leaving it in place would make
 //! `deserialize_collecting_unknowns` warn "unknown key" on every launch.
 //!
+//! A second extra table, `[linked]`, maps a `sandbox.repo_dirs` entry (as
+//! written) to the `owner/name` that was verified when it was linked:
+//!
+//! ```toml
+//! [linked]
+//! "/Users/you/src/libb" = "acme/libb"
+//! ```
+//!
+//! It is stripped like `[local]` and grants nothing: the roots are
+//! `sandbox.repo_dirs`, and `[linked]` only lets the launch tell, without a git
+//! spawn, whether a `[propose] repos` is already satisfied (#980). Older cplt
+//! versions ignore the table with an unknown-key warning. A missing entry is
+//! read from the directory's origin once and recorded.
+//!
 //! This module owns both ends of the file: the loader, and the `[local]`
 //! header `cplt config set --local` stamps on it. Keeping them together is
 //! deliberate — the recorded `remote` is compared after normalization at load
@@ -166,6 +180,7 @@ pub(super) fn parse_local(
         })?;
 
     // Strip the header before the body is deserialized (see module docs).
+    root.remove(LINKED_TABLE);
     let header: LocalHeader = match root.remove("local") {
         Some(value) => value.try_into().map_err(|source| ConfigError::TomlParse {
             path: display.clone(),
@@ -367,6 +382,73 @@ pub fn validate_local_document(doc: &toml_edit::DocumentMut) -> Result<(), Confi
         ));
     }
     reject_relative_paths(&Config::parse(&doc.to_string())?, "local config")
+}
+
+/// The `[linked]` table name (see module docs).
+const LINKED_TABLE: &str = "linked";
+
+/// `[linked]` from a local config's raw text: entry → `owner/name`. Tolerant:
+/// anything malformed is skipped, because it only decides a warning.
+#[must_use]
+pub fn linked_identities(raw: &str) -> std::collections::BTreeMap<String, String> {
+    raw.parse::<toml::Table>()
+        .ok()
+        .and_then(|mut t| t.remove(LINKED_TABLE))
+        .and_then(|v| v.try_into::<toml::Table>().ok())
+        .map(|t| {
+            t.into_iter()
+                .filter_map(|(k, v)| Some((k, v.as_str()?.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Record (`Some`) or forget (`None`) the verified identity of the
+/// `sandbox.repo_dirs` entry `entry` in `project_dir`'s local config. Edits
+/// only `[linked]`, and only in an existing file: it does not stamp the
+/// `[local]` header, so it can never re-adopt a file the remote tripwire
+/// stopped.
+pub fn set_linked_identity(
+    project_dir: &Path,
+    entry: &str,
+    identity: Option<&str>,
+) -> Result<(), ConfigError> {
+    let Some(path) = local_path(project_dir) else {
+        return Ok(());
+    };
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if super::error::is_absent(&e, &path) => return Ok(()),
+        Err(source) => return Err(ConfigError::Read { path, source }),
+    };
+    let mut doc =
+        raw.parse::<toml_edit::DocumentMut>()
+            .map_err(|source| ConfigError::TomlEditParse {
+                path: path.display().to_string(),
+                source,
+            })?;
+    if !doc.get(LINKED_TABLE).is_some_and(toml_edit::Item::is_table) {
+        doc.insert(
+            LINKED_TABLE,
+            toml_edit::Item::Table(toml_edit::Table::new()),
+        );
+    }
+    let table = doc[LINKED_TABLE]
+        .as_table_mut()
+        .expect("table inserted above");
+    match identity {
+        Some(id) => {
+            table.insert(entry, toml_edit::value(id));
+        }
+        None => {
+            table.remove(entry);
+        }
+    }
+    // Read from whichever root has it, written to the resolved one (#851).
+    super::editing::write_document_atomically(
+        &local_write_path(project_dir).ok_or(ConfigError::NoHome)?,
+        &doc,
+    )
 }
 
 /// Stamp the `[local]` header onto a document about to be written.

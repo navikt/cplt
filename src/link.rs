@@ -478,9 +478,78 @@ pub fn choose_unlink(
     }
 }
 
+/// The proposed `repos` that no `sandbox.repo_dirs` entry in this checkout's
+/// local config already is (#980). Display-only: an empty result means the
+/// proposal is satisfied and silences the nag. It never adds a root.
+///
+/// `recorded` is the local config's `[linked]` table, written when `cplt link`
+/// or `trust accept repos` verified the entry, so the common case spawns no git.
+/// A legacy entry without one has its origin read once by `identity_of`, and
+/// the result is handed to `record`.
+pub fn unlinked_proposed_repos(
+    proposed: &[String],
+    linked_dirs: &[String],
+    recorded: &std::collections::BTreeMap<String, String>,
+    identity_of: impl Fn(&Path) -> Option<String>,
+    mut record: impl FnMut(&str, &str),
+) -> Vec<String> {
+    let mut unlinked: Vec<String> = proposed.to_vec();
+    for entry in linked_dirs {
+        if unlinked.is_empty() {
+            break;
+        }
+        let id = if let Some(id) = recorded.get(entry) {
+            id.clone()
+        } else {
+            let Some(id) = identity_of(&crate::config::expand_tilde(entry)) else {
+                continue;
+            };
+            record(entry, &id);
+            id
+        };
+        unlinked.retain(|r| !crate::gh_proxy::repos_match(&id, r));
+    }
+    unlinked
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recorded_identities_need_no_origin_read() {
+        let recorded = [("/s/libb".to_string(), "acme/libb".to_string())].into();
+        let reads = std::cell::Cell::new(0);
+        let left = unlinked_proposed_repos(
+            &["acme/libb".to_string()],
+            &["/s/libb".to_string()],
+            &recorded,
+            |_| {
+                reads.set(reads.get() + 1);
+                None
+            },
+            |_, _| panic!("nothing to backfill"),
+        );
+        assert!(left.is_empty());
+        assert_eq!(reads.get(), 0, "a recorded entry must not spawn git");
+    }
+
+    #[test]
+    fn legacy_entry_is_read_once_and_backfilled() {
+        let mut backfilled = Vec::new();
+        let left = unlinked_proposed_repos(
+            &["acme/libb".to_string(), "acme/libc".to_string()],
+            &["/s/libb".to_string()],
+            &std::collections::BTreeMap::new(),
+            |_| Some("acme/libb".to_string()),
+            |e, id| backfilled.push((e.to_string(), id.to_string())),
+        );
+        assert_eq!(left, ["acme/libc"]);
+        assert_eq!(
+            backfilled,
+            [("/s/libb".to_string(), "acme/libb".to_string())]
+        );
+    }
 
     /// A repository at `dir` whose origin is `identity`, using the real git so
     /// the tests exercise the same reader the resolver does.

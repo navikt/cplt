@@ -29,9 +29,9 @@ pub use editing::{
 pub use error::{ConfigError, IN_SANDBOX_HINT, is_absent};
 pub use loading::exec_tool_dir_warning;
 pub use local::{
-    is_local_path_key, list_local, load_local, local_dir, local_path, local_write_path,
-    parse_local_doc, resolve_path_entry, resolve_path_entry_for_removal, stamp_local_header,
-    validate_local_document,
+    is_local_path_key, linked_identities, list_local, load_local, local_dir, local_path,
+    local_write_path, parse_local_doc, resolve_path_entry, resolve_path_entry_for_removal,
+    set_linked_identity, stamp_local_header, validate_local_document,
 };
 pub(crate) use path::MAXSYMLINKS;
 pub use path::canonicalize_deepest;

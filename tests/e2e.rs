@@ -6486,16 +6486,56 @@ paths = [
             assert!(out.status.success(), "link {r} failed");
         };
 
-        // Partly linked: still pending, and named.
+        let local_raw = || {
+            let dir = config_file.parent().expect("cfg dir").join("local");
+            std::fs::read_dir(&dir)
+                .expect("local dir")
+                .map(|e| std::fs::read_to_string(e.expect("entry").path()).expect("read"))
+                .collect::<String>()
+        };
+
+        // Partly linked: still pending, and named. `cplt link` records the
+        // verified identity, so the launch need not read it again.
         link("navikt/e2e-sat-a");
+        assert!(
+            local_raw().contains("= \"navikt/e2e-sat-a\""),
+            "{}",
+            local_raw()
+        );
         let stderr = launch_stderr(&repo, &config_file);
         assert!(stderr.contains("unapproved permission"), "{stderr}");
 
-        // Fully linked: satisfied.
-        link("navikt/e2e-sat-b");
+        // Fully linked, the second one the legacy way (no recorded identity):
+        // satisfied, and the launch backfills the identity.
+        let b = std::fs::canonicalize(parent.join("e2e-sat-b")).expect("canon");
+        let out = trust_cmd(&repo, &config_file)
+            .args([
+                "config",
+                "set",
+                "--local",
+                "sandbox.repo_dirs",
+                b.to_str().unwrap(),
+            ])
+            .output()
+            .expect("set runs");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!local_raw().contains("navikt/e2e-sat-b"), "{}", local_raw());
         let stderr = launch_stderr(&repo, &config_file);
         assert!(!stderr.contains("unapproved permission"), "{stderr}");
         assert!(!stderr.contains("Untrusted .cplt.toml"), "{stderr}");
+        assert!(
+            !stderr.contains("ignored ("),
+            "[linked] must not warn: {stderr}"
+        );
+        assert!(
+            local_raw().contains("= \"navikt/e2e-sat-b\""),
+            "{}",
+            local_raw()
+        );
 
         // Never widens: the trust store still approves nothing, and the roots
         // are exactly the two the user linked.

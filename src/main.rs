@@ -2254,25 +2254,6 @@ fn deny_unknown(config: &repo_config::RepoConfig) -> String {
         .join(", deny.")
 }
 
-/// The proposed `repos` that no `sandbox.repo_dirs` entry in this checkout's
-/// local config already is, matched by origin (#980). Display-only: an empty
-/// result silences the nag, it never adds a root.
-fn unlinked_proposed_repos(
-    proposed: &[String],
-    linked_dirs: &[String],
-    identity_of: impl Fn(&Path) -> Option<String>,
-) -> Vec<String> {
-    let linked: Vec<String> = linked_dirs
-        .iter()
-        .filter_map(|d| identity_of(&config::expand_tilde(d)))
-        .collect();
-    proposed
-        .iter()
-        .filter(|r| !linked.iter().any(|l| gh_proxy::repos_match(l, r)))
-        .cloned()
-        .collect()
-}
-
 /// The one line that says a repo's `[propose]` is waiting for approval. Also
 /// printed by a `--quiet` agent launch: quiet hides chatter, not the fact that
 /// the repo's permissions are not applied (#673).
@@ -3444,14 +3425,26 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             {
                 Vec::new()
             } else {
-                unlinked_proposed_repos(
+                let (dirs, recorded) = local_cfg.as_ref().map_or_else(
+                    || (&[][..], std::collections::BTreeMap::default()),
+                    |l| {
+                        (
+                            &l.config.sandbox.repo_dirs[..],
+                            config::linked_identities(&l.raw),
+                        )
+                    },
+                );
+                cplt::link::unlinked_proposed_repos(
                     &loaded.config.propose.repos,
-                    local_cfg
-                        .as_ref()
-                        .map_or(&[][..], |l| &l.config.sandbox.repo_dirs),
+                    dirs,
+                    &recorded,
                     |dir| {
                         cplt::git::trusted_git()
                             .and_then(|git| cplt::gh_proxy::detect_current_repo(git, dir).ok())
+                    },
+                    // Backfill for a legacy entry. Best effort: never fails a launch.
+                    |entry, id| {
+                        let _ = config::set_linked_identity(&project_dir, entry, Some(id));
                     },
                 )
             };
@@ -11621,15 +11614,22 @@ fn run_link_command(repo: &str, dir: Option<&Path>, unlink: bool) -> ExitCode {
             ui::color(ui::RESET)
         );
     }
-    run_config_set(
+    let entry = found.dir.to_string_lossy();
+    let code = run_config_set(
         "sandbox.repo_dirs",
-        &[&found.dir.to_string_lossy()],
+        &[&entry],
         false,
         false,
         false,
         false,
         true,
-    )
+    );
+    if code == ExitCode::SUCCESS {
+        // Verified above, so the launch can skip reading it again (#980).
+        // Best effort: without it the launch reads the origin once.
+        let _ = config::set_linked_identity(&project_dir, &entry, Some(repo));
+    }
+    code
 }
 
 /// Remove the named root that is `identity`.
@@ -11668,15 +11668,18 @@ fn unlink_by_identity(project_dir: &Path, identity: &str) -> ExitCode {
     };
 
     match cplt::link::choose_unlink(&linked, identity, read_identity) {
-        cplt::link::Unlink::Remove(entry) => run_config_set(
-            "sandbox.repo_dirs",
-            &[entry.as_str()],
-            false,
-            true,
-            false,
-            false,
-            true,
-        ),
+        cplt::link::Unlink::Remove(entry) => {
+            let _ = config::set_linked_identity(project_dir, &entry, None);
+            run_config_set(
+                "sandbox.repo_dirs",
+                &[entry.as_str()],
+                false,
+                true,
+                false,
+                false,
+                true,
+            )
+        }
         cplt::link::Unlink::NoMatch => {
             // The recorded list, not a pointer at another command: the user is
             // here because they do not know what is linked.
@@ -12136,6 +12139,7 @@ fn link_proposed_repos(project_dir: &Path, repos: &[String]) -> Vec<trust::Linke
                     // it. Claiming it would make `trust revoke repos` delete a
                     // root the user linked by hand (#496 review).
                     println!("  • {identity} → {path} (already linked; left as yours)");
+                    let _ = config::set_linked_identity(project_dir, &path, Some(identity));
                     continue;
                 } else if run_config_set(
                     "sandbox.repo_dirs",
@@ -12151,6 +12155,7 @@ fn link_proposed_repos(project_dir: &Path, repos: &[String]) -> Vec<trust::Linke
                     // not: an approval must not claim a grant that is not there.
                     continue;
                 }
+                let _ = config::set_linked_identity(project_dir, &path, Some(identity));
                 linked.push(trust::LinkedRepo {
                     identity: identity.clone(),
                     path,
@@ -12223,6 +12228,7 @@ fn unlink_approved_repos(project_dir: &Path, linked: &[trust::LinkedRepo]) {
             path: entry.clone(),
         };
         println!("  • unlinking {} ({})", repo.identity, repo.path);
+        let _ = config::set_linked_identity(project_dir, &repo.path, None);
         run_config_set(
             "sandbox.repo_dirs",
             &[repo.path.as_str()],
