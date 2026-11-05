@@ -2621,7 +2621,7 @@ fn inject_github_token_nudge(resolved: &config::Resolved) -> Option<cplt::doctor
     let unset =
         resolved.bool_layer("proxy", "inject_github_token") == Some(config::ConfigLayer::Baseline);
     (unset && resolved.with_proxy).then(|| {
-        cplt::doctor::Finding::warning(
+        cplt::doctor::Finding::info(
             "proxy.inject_github_token is not set, so the agent gets your real GitHub token. \
              New configs turn it on: the agent gets a placeholder and the proxy adds the token \
              for GitHub hosts only.",
@@ -3805,10 +3805,9 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         // Only when a local file was actually APPLIED. A missing one, or one
         // whose recorded remote no longer matches, leaves `local_cfg` None and
         // must not claim a layer that did nothing.
-        if local_cfg.is_some()
-            && let Some(lp) = config::local_path(&project_dir)
-        {
-            ui::info(&format!("Local:    {}", lp.display()));
+        if local_cfg.is_some() && config::local_path(&project_dir).is_some() {
+            // #1007: the hashed path is noise; name the command that shows it.
+            ui::info("Local:    per-project config applied (cplt config path --local)");
         }
     }
 

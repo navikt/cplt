@@ -320,17 +320,14 @@ fn golden_local_layer_is_named_by_launch_show_and_get() {
         &["config", "set", "--local", "proxy.port", &port],
     );
     assert!(status.success(), "set --local should succeed:\n{stderr}");
-    let local = local_file(&home);
-    let local_str = local.to_string_lossy().into_owned();
+    let local_str = local_file(&home).to_string_lossy().into_owned();
 
-    // 1. The launch names the file it read.
+    // 1. The launch says a local layer applied (#1007: not the hashed path).
     let (_, stderr, ok) = launch_agent(&home, repo.path());
     assert!(ok, "a launch with a local layer must succeed:\n{stderr}");
     assert!(
-        stderr.contains(&format!("Local:    {local_str}")),
-        "the launch must name the local config file on its own summary row — \
-         the path appearing in some other line (a warning that it was ignored, \
-         say) is the defect, not the fix:\n{stderr}"
+        stderr.contains("Local:    per-project config applied (cplt config path --local)"),
+        "the launch must report the local layer on its own summary row:\n{stderr}"
     );
     // ...and the value is in force, not merely mentioned.
     assert!(

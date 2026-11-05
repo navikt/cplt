@@ -3638,11 +3638,18 @@ pub fn gate_git(
                 "Config injected through the environment ({key}=…) is not allowed while push \
                  prevention is active."
             ),
-            guidance: "GIT_CONFIG_PARAMETERS and GIT_CONFIG_KEY_<n> set the same configuration as\n\
-                       `git -c`, which is refused here for the same reason: the guard would authorize\n\
-                       against different configuration than the push actually runs under.\n\
-                       Unset the variable, configure the remote in the repository, and push to it by name."
-                .to_string(),
+            // #1006: GIT_CONFIG_GLOBAL/SYSTEM is a whole config file, not `-c`.
+            guidance: if key == "GIT_CONFIG_GLOBAL" || key == "GIT_CONFIG_SYSTEM" {
+                format!(
+                    "Unset {key}, or start cplt without it. It swaps in a different git config file,\n\
+                     so the guard would authorize against different configuration than the push runs under."
+                )
+            } else {
+                "Unset GIT_CONFIG_PARAMETERS and GIT_CONFIG_KEY_<n>, configure the remote in the\n\
+                 repository, and push to it by name. They set configuration like `git -c`, so the\n\
+                 guard would authorize against different configuration than the push runs under."
+                    .to_string()
+            },
             agent_note: &[NOTE],
         });
     }
