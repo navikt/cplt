@@ -5,6 +5,19 @@ Seatbelt (SBPL) and Linux Landlock plus seccomp-BPF and optional bubblewrap,
 with an HTTP CONNECT proxy in front of outbound traffic. It wraps Copilot,
 OpenCode, Antigravity, Pi, Claude Code, and a plain shell.
 
+## Product direction: the sandbox for teams
+
+Secure, trustworthy sharing of cplt config between team members is one of the
+project's primary differentiators. A team commits `.cplt.toml` (including
+`[propose] repos`), and each member approves it once through the trust store,
+instead of everyone hand-configuring their own sandbox.
+
+So treat the team-sharing flow (`.cplt.toml`, `cplt trust`, `cplt link`,
+launch hints) as first-class work, not polish for later. Judge a change from a
+teammate's first launch on a fresh clone: is the next step obvious and
+copy-pasteable? Never trade away the security model to get there: identities,
+never paths; nothing granted before approval; trust pinned to the file's hash.
+
 ## Build and test
 
 Always run `mise run check` at the end of a coding session.
