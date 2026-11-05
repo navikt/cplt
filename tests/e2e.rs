@@ -7490,8 +7490,13 @@ paths = [
             "an uncommitted proposal must not be granted by the flag:\n{stderr}"
         );
         assert!(
-            stderr.contains("not committed, so the permissions it asks for are ignored"),
+            stderr.contains("exists in the working tree but not in git HEAD"),
             "and the run must say why it was ignored:\n{stderr}"
+        );
+        // #984: once, not twice.
+        assert!(
+            !stderr.contains("not committed, so the permissions it asks for are ignored"),
+            "the uncommitted notice must be printed once:\n{stderr}"
         );
 
         let _ = std::fs::remove_dir_all(&repo);
