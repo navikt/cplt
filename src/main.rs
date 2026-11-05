@@ -3546,7 +3546,14 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                                     .into_iter()
                                     .filter(|k| !granted.iter().any(|g| g == k))
                                     .collect();
-                            if !pending.is_empty() {
+                            // An uncommitted file's proposals are dropped, so
+                            // nothing lists as pending, yet the approval does not
+                            // apply: say so, as before #1002.
+                            if loaded.propose_dropped {
+                                ui::warn(
+                                    ".cplt.toml permissions changed since the last approval. Re-approve with `cplt trust accept`",
+                                );
+                            } else if !pending.is_empty() {
                                 ui::warn(&format!(
                                     ".cplt.toml permissions changed since the last approval: {}. \
                                      Re-approve with `cplt trust accept`",
