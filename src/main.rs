@@ -11352,7 +11352,8 @@ fn run_init_command(write: bool, force: bool, merge: bool, quiet: bool) -> ExitC
     // Detect once, use for both display and generation (monorepo-aware)
     let report = cplt::detect::detect_project_recursive(&project_dir);
 
-    if report.detections.is_empty() && report.workspace_members.is_empty() {
+    let nothing_detected = report.detections.is_empty() && report.workspace_members.is_empty();
+    if nothing_detected && !opts.has_linked_repos() {
         if !quiet {
             eprintln!("No project tooling detected in {}", project_dir.display());
             eprintln!("Nothing to generate.");
@@ -11361,7 +11362,7 @@ fn run_init_command(write: bool, force: bool, merge: bool, quiet: bool) -> ExitC
     }
 
     // Show ecosystem report unless quiet
-    if !quiet {
+    if !quiet && !nothing_detected {
         print!("{}", cplt::init::format_report(&report));
     }
 
