@@ -12242,6 +12242,9 @@ fn clone_process(bin: &Path, args: &[String], cwd: &Path) -> Option<std::process
         #[allow(clippy::disallowed_methods)] // `bin` is already a resolved trusted path
         let mut c = std::process::Command::new(bin);
         c.args(args).current_dir(cwd);
+        // The git gh spawns would otherwise take GIT_EXEC_PATH, GIT_SSH_COMMAND,
+        // GIT_ASKPASS and the like from the environment cplt was started in.
+        cplt::git::clear_git_env(&mut c);
         c
     } else {
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -12322,6 +12325,8 @@ fn offer_clone(project_dir: &Path, identity: &str) -> Option<cplt::link::Candida
         &args,
         project_dir.parent()?,
     )?) {
+        eprintln!("  To clone it by hand, then approve again:");
+        eprintln!("    {shown} && cplt trust accept repos");
         return None;
     }
     match cplt::link::verify_named(&dest, project_dir, identity) {
