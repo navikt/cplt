@@ -12163,6 +12163,14 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
         }
     }
 
+    // A `repos` proposal dropped entirely still has removals to report (#993):
+    // with nothing proposed, the lines are only the `-` ones.
+    if !st.proposed.iter().any(|&(k, _)| k == "repos") {
+        for line in proposed_repo_lines(project_dir, loaded, trust_entry.as_ref()) {
+            println!("{blue}[cplt]{nc}    repos: {line}");
+        }
+    }
+
     // Show actionable hint for unapproved permissions
     let has_pending = !proposed.is_empty() && !all_approved;
 
@@ -14318,6 +14326,17 @@ mod tests {
         let (_, args) = super::clone_command("acme/libb", &dest);
         assert!(args.iter().any(|a| a.contains("acme/libb")), "{args:?}");
         assert!(args.last().is_some_and(|a| a.ends_with("libb")), "{args:?}");
+
+        // #992: the git that gh spawns must not inherit GIT_* from cplt's caller.
+        let probe =
+            super::clone_process(&write_fake("probe", 0), &args, dir.path()).expect("command");
+        let envs: Vec<_> = probe.get_envs().collect();
+        for name in ["GIT_SSH_COMMAND", "GIT_ASKPASS", "GIT_EXEC_PATH", "GIT_DIR"] {
+            assert!(
+                envs.contains(&(std::ffi::OsStr::new(name), None)),
+                "{name} must be cleared: {envs:?}"
+            );
+        }
 
         let run = |sub: &str, exit: i32| {
             let cmd =

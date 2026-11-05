@@ -530,7 +530,10 @@ pub fn retire_outlived(entry: TrustEntry, current_hash: &str) -> Option<TrustEnt
 pub fn sibling_checkout(project_dir: &Path, identity: &str) -> Option<PathBuf> {
     let name = identity.rsplit('/').next().unwrap_or(identity);
     let dir = project_dir.parent()?.join(name);
-    (dir != project_dir && dir.join(".git").exists()).then_some(dir)
+    // `symlink_metadata`, not `exists`: a symlinked sibling or `.git` would
+    // point the report at a tree somewhere else (#993).
+    let real = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| !m.is_symlink());
+    (dir != project_dir && real(&dir) && real(&dir.join(".git"))).then_some(dir)
 }
 
 /// Repositories in `now` but not in `before`, and the reverse (#982).
@@ -686,6 +689,23 @@ mod tests {
         );
         assert_eq!(sibling_checkout(&project, "acme/plain"), None, "no .git");
         assert_eq!(sibling_checkout(&project, "acme/libb"), None);
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(tmp.path().join("libc"), tmp.path().join("linked")).unwrap();
+            assert_eq!(
+                sibling_checkout(&project, "acme/linked"),
+                None,
+                "symlinked dir"
+            );
+            std::fs::create_dir_all(tmp.path().join("fake")).unwrap();
+            std::os::unix::fs::symlink(tmp.path().join("libc/.git"), tmp.path().join("fake/.git"))
+                .unwrap();
+            assert_eq!(
+                sibling_checkout(&project, "acme/fake"),
+                None,
+                "symlinked .git"
+            );
+        }
         assert_eq!(
             sibling_checkout(&project, "acme/app"),
             None,

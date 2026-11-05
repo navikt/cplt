@@ -6634,6 +6634,88 @@ paths = [
         let _ = std::fs::remove_dir_all(config_file.parent().expect("cfg dir"));
     }
 
+    /// #993: `cplt link --unlink` on an approved repo is reported as not
+    /// linked and a bare `trust accept` leaves it unlinked; a partial approval
+    /// after a commit drops `repos` keeps the old list, so `cplt trust` still
+    /// names the removed repository.
+    #[test]
+    fn e2e_unlink_and_partial_approval_keep_the_repos_record() {
+        require_sandbox!();
+        let (repo, config_file) = make_trust_repo(
+            "propose-partial",
+            "[propose]\nallow_localhost_any = true\nrepos = [\"navikt/e2e-part\"]\n",
+        );
+        let part = repo.parent().expect("parent").join("e2e-part");
+        std::fs::create_dir_all(&part).expect("mkdir");
+        for args in [
+            vec!["init", "--quiet"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:navikt/e2e-part.git",
+            ],
+        ] {
+            let out = git_cmd(&part).args(&args).output().expect("git runs");
+            assert!(out.status.success(), "git {args:?} failed");
+        }
+        let run = |args: &[&str]| {
+            let out = trust_cmd(&repo, &config_file)
+                .args(args)
+                .output()
+                .expect("runs");
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            (out.status.success(), text)
+        };
+        let (ok, out) = run(&["trust", "accept", "--all"]);
+        assert!(ok, "{out}");
+        let (_, roots) = run(&["config", "get", "sandbox.repo_dirs"]);
+        assert!(roots.contains("e2e-part"), "{roots}");
+
+        let (ok, out) = run(&["link", "--unlink", "navikt/e2e-part"]);
+        assert!(ok, "{out}");
+        let (_, shown) = run(&["trust"]);
+        assert!(
+            shown.contains("navikt/e2e-part: not linked, found at"),
+            "{shown}"
+        );
+        let (_, out) = run(&["trust", "accept"]);
+        let (_, roots) = run(&["config", "get", "sandbox.repo_dirs"]);
+        assert!(
+            !roots.contains("e2e-part"),
+            "a bare accept must not undo --unlink: {out}\n{roots}"
+        );
+
+        // The commit drops `repos`; approving the remaining key keeps the record.
+        std::fs::write(
+            repo.join(".cplt.toml"),
+            "[propose]\nallow_localhost_any = true\n",
+        )
+        .expect("write");
+        git_cmd(&repo)
+            .args(["-c", "commit.gpgSign=false", "commit", "-qam", "drop"])
+            .output()
+            .expect("commit");
+        let (ok, out) = run(&["trust", "accept", "allow_localhost_any"]);
+        assert!(ok, "{out}");
+        assert!(
+            out.contains("- navikt/e2e-part (repos: removed since last approval)"),
+            "{out}"
+        );
+        let (_, shown) = run(&["trust"]);
+        assert!(
+            shown.contains("repos: - navikt/e2e-part (removed since last approval)"),
+            "{shown}"
+        );
+
+        let _ = std::fs::remove_dir_all(repo.parent().expect("parent"));
+        let _ = std::fs::remove_dir_all(config_file.parent().expect("cfg dir"));
+    }
+
     /// The user linked it first; the project happens to propose the same
     /// repository. Approving must not take ownership of a root the user
     /// created, because revoking would then delete it (#496 review).
