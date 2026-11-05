@@ -16,7 +16,7 @@ So treat the team-sharing flow (`.cplt.toml`, `cplt trust`, `cplt link`,
 launch hints) as first-class work, not polish for later. Judge a change from a
 teammate's first launch on a fresh clone: is the next step obvious and
 copy-pasteable? Never trade away the security model to get there: identities,
-never paths; nothing granted before approval; trust pinned to the file's hash.
+never paths; nothing granted before approval; approval pinned to a hash of the proposal and bound to the checkout.
 
 ## Build and test
 
