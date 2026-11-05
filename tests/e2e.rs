@@ -6729,6 +6729,48 @@ paths = [
         stderr
     }
 
+    /// #990: `cplt init` suggests the checkout's linked repositories as
+    /// `[propose] repos`, from the identities `cplt link` recorded, and the
+    /// preview leaves `.cplt.toml` alone. HOME and the config dir are scratch.
+    #[test]
+    fn e2e_init_suggests_linked_repos() {
+        require_sandbox!();
+        let (repo, config_file) = make_trust_repo("init-linked", "");
+        std::fs::write(repo.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        let parent = repo.parent().expect("parent").to_path_buf();
+        make_origin_repo(&parent.join("e2e-init-a"), "navikt/e2e-init-a");
+        let out = trust_cmd(&repo, &config_file)
+            .args(["link", "navikt/e2e-init-a"])
+            .output()
+            .expect("link runs");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let out = trust_cmd(&repo, &config_file)
+            .args(["init", "--quiet"])
+            .output()
+            .expect("init runs");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            stdout.contains("[propose]\n# Repositories linked in this checkout (cplt link)\nrepos = [\"navikt/e2e-init-a\"]"),
+            "{stdout}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join(".cplt.toml")).unwrap(),
+            ""
+        );
+
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
     /// #984/#980: a `repos` proposal whose repositories are all linked in this
     /// checkout's local config is satisfied and not nagged about. Satisfied
     /// grants nothing: no trust approval is recorded and no root is added.
